@@ -6,15 +6,25 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  assertValidSchemaVersionPolicy,
   describeRecordListStore,
+  describeVersionedRecordListStore,
   FileLockTimeoutError,
   inspectRecordListBytes,
+  inspectVersionedRecordListBytes,
   keepQuarantineCopy,
   type QuarantineFs,
+  readStoreRecordSchemaVersion,
   StateFileUnreadableError,
   quarantineUnreadable,
+  readBoundedStoreBytes,
+  readOrQuarantineVersionedRecordList,
+  STORE_FILE_MAX_BYTES,
+  StateFileUnknownVersionError,
+  StateFileUnreadableReadOnlyError,
   withFileLock,
   writeJsonAtomically,
+  type VersionedRecordParseResult,
 } from './file-store.js';
 
 /** An explicit one-way latch: the test decides when the holder may proceed. */
@@ -1143,6 +1153,30 @@ describe('restore', () => {
     expect(await snapshot()).toEqual(before);
   });
 
+  it('refuses an unknown-version current store and leaves bytes and directory listing unchanged', async () => {
+    const versioned = describeVersionedRecordListStore('x.json', (raw) => {
+      const versionCheck = readStoreRecordSchemaVersion(raw, { writerVersion: 1, acceptedVersions: [1] });
+      if (versionCheck.status !== 'ok') {
+        return versionCheck;
+      }
+      return typeof (raw as { id?: unknown }).id === 'string'
+        ? { status: 'ok', record: raw as { id: string }, schemaVersion: versionCheck.schemaVersion }
+        : { status: 'invalid' };
+    });
+    const currentBytes = Buffer.from(JSON.stringify([{ id: 'existing', schemaVersion: 2 }]));
+    await fs.writeFile(filePath, currentBytes);
+    const before = await snapshot();
+    const dirBefore = await fs.readdir(stateDir);
+    const currentSha = createHash('sha256').update(currentBytes).digest('hex');
+    const outcome = await versioned.restore({ stateDir, candidate, expectedCurrentSha256: currentSha });
+    expect(outcome).toEqual({
+      status: 'refused',
+      reason: 'x.json has an unsupported schemaVersion; state restore replaces only a missing or unreadable store',
+    });
+    expect(await snapshot()).toEqual(before);
+    expect(await fs.readdir(stateDir)).toEqual(dirBefore);
+  });
+
   it('refuses an invalid candidate', async () => {
     await fs.writeFile(filePath, currentGarbage);
     const before = await snapshot();
@@ -1225,5 +1259,497 @@ describe('restore', () => {
     });
     expect(await snapshot()).toEqual(before);
     await expect(fs.stat(filePath)).rejects.toThrow();
+  });
+});
+
+describe('assertValidSchemaVersionPolicy', () => {
+  it('refuses a writer bumped without a reader that accepts it', () => {
+    expect(() =>
+      assertValidSchemaVersionPolicy('s.json', { writerVersion: 2, acceptedVersions: [1] }),
+    ).toThrow(/bumps schemaVersion only together with a reader that accepts it/);
+  });
+
+  it('refuses a reader that dropped the previous version', () => {
+    expect(() =>
+      assertValidSchemaVersionPolicy('s.json', { writerVersion: 2, acceptedVersions: [2] }),
+    ).toThrow(/reader must still accept previous schemaVersion 1/);
+  });
+
+  it('accepts a policy whose reader accepts the writer and the previous version', () => {
+    const policy = assertValidSchemaVersionPolicy('s.json', { writerVersion: 2, acceptedVersions: [1, 2] });
+    expect(policy.writerVersion).toBe(2);
+  });
+
+  it('refuses a non-positive or non-integer writerVersion', () => {
+    expect(() => assertValidSchemaVersionPolicy('s.json', { writerVersion: 0, acceptedVersions: [0] })).toThrow(
+      /writerVersion must be a positive integer/,
+    );
+    expect(() => assertValidSchemaVersionPolicy('s.json', { writerVersion: 1.5, acceptedVersions: [1.5] })).toThrow(
+      /writerVersion must be a positive integer/,
+    );
+  });
+});
+
+describe('readStoreRecordSchemaVersion', () => {
+  const policy = { writerVersion: 1 as const, acceptedVersions: [1] };
+
+  it('reads an absent schemaVersion as 1', () => {
+    expect(readStoreRecordSchemaVersion({ id: 'x' }, policy)).toEqual({ status: 'ok', schemaVersion: 1 });
+  });
+
+  it('accepts an accepted integer schemaVersion', () => {
+    expect(readStoreRecordSchemaVersion({ schemaVersion: 1 }, policy)).toEqual({ status: 'ok', schemaVersion: 1 });
+  });
+
+  it.each([2, 0, -1, '1', null, { v: 1 }])('refuses %p as unknown-version', (bad: unknown) => {
+    expect(readStoreRecordSchemaVersion({ schemaVersion: bad }, policy)).toEqual({ status: 'unknown-version' });
+  });
+
+  it('reports non-objects as invalid', () => {
+    expect(readStoreRecordSchemaVersion(null, policy)).toEqual({ status: 'invalid' });
+    expect(readStoreRecordSchemaVersion([], policy)).toEqual({ status: 'invalid' });
+    expect(readStoreRecordSchemaVersion('x', policy)).toEqual({ status: 'invalid' });
+  });
+
+  it('reports a getter property as invalid without invoking it', () => {
+    let invoked = false;
+    const raw: Record<string, unknown> = {};
+    Object.defineProperty(raw, 'schemaVersion', {
+      enumerable: true,
+      get: () => {
+        invoked = true;
+        return 1;
+      },
+    });
+    expect(readStoreRecordSchemaVersion(raw, policy)).toEqual({ status: 'invalid' });
+    expect(invoked).toBe(false);
+  });
+});
+
+describe('inspectVersionedRecordListBytes', () => {
+  const policy = { writerVersion: 1 as const, acceptedVersions: [1] };
+  const parseRecord = (raw: unknown): VersionedRecordParseResult<{ id: string }> => {
+    const versionCheck = readStoreRecordSchemaVersion(raw, policy);
+    if (versionCheck.status !== 'ok') {
+      return versionCheck;
+    }
+    const id = (raw as { id?: unknown }).id;
+    return typeof id === 'string'
+      ? { status: 'ok', record: { id }, schemaVersion: versionCheck.schemaVersion }
+      : { status: 'invalid' };
+  };
+  const multiPolicy = { writerVersion: 2 as const, acceptedVersions: [1, 2] };
+  const parseMulti = (raw: unknown): VersionedRecordParseResult<{ id: string }> => {
+    const versionCheck = readStoreRecordSchemaVersion(raw, multiPolicy);
+    if (versionCheck.status !== 'ok') {
+      return versionCheck;
+    }
+    const id = (raw as { id?: unknown }).id;
+    return typeof id === 'string'
+      ? { status: 'ok', record: { id }, schemaVersion: versionCheck.schemaVersion }
+      : { status: 'invalid' };
+  };
+
+  it('collects unique schemaVersions sorted ascending', () => {
+    const bytes = Buffer.from(
+      JSON.stringify([{ id: 'a', schemaVersion: 2 }, { id: 'b' }, { id: 'c', schemaVersion: 1 }]),
+    );
+    const result = inspectVersionedRecordListBytes(bytes, parseMulti);
+    expect(result).toEqual({
+      status: 'ok',
+      records: [{ id: 'a' }, { id: 'b' }, { id: 'c' }],
+      schemaVersions: [1, 2],
+    });
+  });
+
+  it('reports non-JSON bytes', () => {
+    expect(inspectVersionedRecordListBytes(Buffer.from('{ not json'), parseRecord)).toEqual({
+      status: 'unreadable',
+      detail: 'not valid JSON',
+      recordIndex: null,
+    });
+  });
+
+  it('rejects a non-array document', () => {
+    expect(inspectVersionedRecordListBytes(Buffer.from('{}'), parseRecord)).toEqual({
+      status: 'unreadable',
+      detail: 'expects a record list',
+      recordIndex: null,
+    });
+  });
+
+  it('returns unknown-version for the bad element even when an earlier element was invalid', () => {
+    const bytes = Buffer.from(JSON.stringify([{ bogus: true }, { id: 'b', schemaVersion: 2 }]));
+    const result = inspectVersionedRecordListBytes(bytes, parseRecord);
+    expect(result).toEqual({
+      status: 'unknown-version',
+      detail: 'record 1 has an unsupported schemaVersion (unknown-schema-version)',
+      recordIndex: 1,
+    });
+  });
+
+  it('returns unreadable for the first invalid element when no element has an unknown version', () => {
+    const bytes = Buffer.from(JSON.stringify([{ bogus: true }, { id: 'b' }]));
+    const result = inspectVersionedRecordListBytes(bytes, parseRecord);
+    expect(result).toEqual({
+      status: 'unreadable',
+      detail: 'record 0 failed validation',
+      recordIndex: 0,
+    });
+  });
+
+  it('never echoes an unknown schemaVersion value in the detail', () => {
+    const bytes = Buffer.from(JSON.stringify([{ id: 'a', schemaVersion: 'CANARY-secret-version' }]));
+    const result = inspectVersionedRecordListBytes(bytes, parseRecord);
+    expect(result.status).toBe('unknown-version');
+    if (result.status === 'unknown-version') {
+      expect(result.detail).not.toContain('CANARY');
+      expect(result.recordIndex).toBe(0);
+    }
+  });
+});
+
+describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => {
+  let tempDir: string;
+  let filePath: string;
+  const policy = { writerVersion: 1 as const, acceptedVersions: [1] };
+  const parseRecord = (raw: unknown): VersionedRecordParseResult<{ id: string }> => {
+    const versionCheck = readStoreRecordSchemaVersion(raw, policy);
+    if (versionCheck.status !== 'ok') {
+      return versionCheck;
+    }
+    const id = (raw as { id?: unknown }).id;
+    return typeof id === 'string'
+      ? { status: 'ok', record: { id }, schemaVersion: versionCheck.schemaVersion }
+      : { status: 'invalid' };
+  };
+  const sha12 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+  const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-bounded-store-'));
+    filePath = path.join(tempDir, 'store.json');
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('returns missing for ENOENT, not-regular-file for live and dangling symlinks without reading the target, and too-large above STORE_FILE_MAX_BYTES', async () => {
+    expect(STORE_FILE_MAX_BYTES).toBe(8 * 1024 * 1024);
+    expect(await readBoundedStoreBytes(filePath)).toEqual({ status: 'missing' });
+
+    const outside = path.join(tempDir, 'outside.txt');
+    await fs.writeFile(outside, 'secret');
+    await fs.symlink(outside, filePath);
+    const openSpy = vi.spyOn(fs, 'open');
+    expect(await readBoundedStoreBytes(filePath)).toEqual({ status: 'not-regular-file' });
+    await fs.unlink(filePath);
+    await fs.symlink(path.join(tempDir, 'nowhere.txt'), filePath);
+    expect(await readBoundedStoreBytes(filePath)).toEqual({ status: 'not-regular-file' });
+    expect(openSpy).not.toHaveBeenCalled();
+    openSpy.mockRestore();
+
+    await fs.unlink(filePath);
+    await fs.mkdir(filePath);
+    expect(await readBoundedStoreBytes(filePath)).toEqual({ status: 'not-regular-file' });
+    await fs.rmdir(filePath);
+
+    await fs.writeFile(filePath, Buffer.alloc(STORE_FILE_MAX_BYTES + 1, 0x20));
+    expect(await readBoundedStoreBytes(filePath)).toEqual({ status: 'too-large' });
+    await fs.writeFile(filePath, Buffer.alloc(STORE_FILE_MAX_BYTES, 0x20));
+    expect(await readBoundedStoreBytes(filePath)).toMatchObject({ status: 'ok' });
+    expect(await readBoundedStoreBytes(filePath, 0)).toEqual({ status: 'too-large' });
+  });
+
+  it('returns too-large when a file grows past maxBytes while being read', async () => {
+    await fs.writeFile(filePath, Buffer.alloc(100, 0x20));
+    // The stat calls report a small file; the bytes actually read exceed the cap.
+    vi.spyOn(fs, 'lstat').mockResolvedValue({
+      isSymbolicLink: () => false,
+      isFile: () => true,
+      size: 1,
+    } as unknown as Awaited<ReturnType<typeof fs.lstat>>);
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await realOpen(...args);
+      return new Proxy(handle, {
+        get(target, key) {
+          if (key === 'stat') {
+            return async () => ({ isFile: () => true, size: 1 });
+          }
+          const value = Reflect.get(target, key) as unknown;
+          return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+        },
+      });
+    });
+    expect(await readBoundedStoreBytes(filePath, 10)).toEqual({ status: 'too-large' });
+  });
+
+  it('re-reads under the store lock and skips quarantine when a concurrent writer repairs the file before lock acquisition', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const release = createLatch();
+    const held = withFileLock(`${filePath}.lock`, () => release.promise);
+    await sleep(50);
+    const reading = readOrQuarantineVersionedRecordList({ filePath, parseRecord, lockTimeoutMs: 5_000 });
+    await sleep(100);
+    await fs.writeFile(filePath, JSON.stringify([{ id: 'repaired', schemaVersion: 1 }]));
+    release.resolve();
+    await held;
+    expect(await reading).toEqual([{ id: 'repaired' }]);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+  });
+
+  it('names the quarantine copy from the bytes re-read under the store lock when corrupt bytes change before lock acquisition', async () => {
+    const bytesA = Buffer.from('{ corrupt A');
+    const bytesB = Buffer.from('{ corrupt B, different');
+    await fs.writeFile(filePath, bytesA);
+    const release = createLatch();
+    const held = withFileLock(`${filePath}.lock`, () => release.promise);
+    await sleep(50);
+    const reading = readOrQuarantineVersionedRecordList({ filePath, parseRecord, lockTimeoutMs: 5_000 });
+    const settled = reading.catch((error: unknown) => error);
+    await sleep(100);
+    await fs.writeFile(filePath, bytesB);
+    release.resolve();
+    await held;
+    const error = await settled;
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const quarantinePath = (error as StateFileUnreadableError).quarantinePath;
+    expect(quarantinePath).not.toBeNull();
+    expect(path.basename(quarantinePath!)).toContain(sha12(bytesB));
+    expect(path.basename(quarantinePath!)).not.toContain(sha12(bytesA));
+    expect(await fs.readFile(quarantinePath!)).toEqual(bytesB);
+    // The store stays in place so later reads still fail closed.
+    expect(await fs.readFile(filePath)).toEqual(bytesB);
+  });
+
+  it('says no quarantine was attempted when the store becomes a symlink while the reader waits for the lock', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const outside = path.join(tempDir, 'outside.txt');
+    await fs.writeFile(outside, '{ not json');
+    const release = createLatch();
+    const held = withFileLock(`${filePath}.lock`, () => release.promise);
+    await sleep(50);
+    const reading = readOrQuarantineVersionedRecordList({ filePath, parseRecord, lockTimeoutMs: 5_000 });
+    const settled = reading.catch((error: unknown) => error);
+    await sleep(100);
+    await fs.unlink(filePath);
+    await fs.symlink(outside, filePath);
+    release.resolve();
+    await held;
+    const error = await settled;
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.quarantinePath).toBeNull();
+    expect(unreadable.message).toContain('no quarantine was attempted');
+    expect(unreadable.message).not.toContain('could not be copied');
+    expect(unreadable.message).not.toContain('repair it by hand');
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+  });
+
+  it('quarantines when lockHeld is true without deadlocking on the already-held store lock', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const error = await withFileLock(`${filePath}.lock`, () =>
+      readOrQuarantineVersionedRecordList({ filePath, parseRecord, lockHeld: true, lockTimeoutMs: 200 }).catch(
+        (thrown: unknown) => thrown,
+      ),
+    );
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    expect((error as StateFileUnreadableError).quarantinePath).not.toBeNull();
+  });
+
+  it('refuses with StateFileUnreadableError (FileLockTimeoutError as cause) within lockTimeoutMs when the store lock is held on an unreadable read, leaving the store unchanged', async () => {
+    const bytes = Buffer.from('{ not json');
+    await fs.writeFile(filePath, bytes);
+    const release = createLatch();
+    const held = withFileLock(`${filePath}.lock`, () => release.promise);
+    await sleep(50);
+    const started = Date.now();
+    const error = await readOrQuarantineVersionedRecordList({
+      filePath,
+      parseRecord,
+      lockTimeoutMs: 100,
+    }).catch((thrown: unknown) => thrown);
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.quarantinePath).toBeNull();
+    expect(unreadable.cause).toBeInstanceOf(FileLockTimeoutError);
+    // Quarantine was never attempted on a lock-side refusal, so the message
+    // must not claim the bytes could not be copied nor advise a manual repair.
+    expect(unreadable.message).not.toContain('could not be copied');
+    expect(unreadable.message).not.toContain('repair it by hand');
+    expect(unreadable.message).toContain('no quarantine was attempted');
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(await fs.readFile(filePath)).toEqual(bytes);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    release.resolve();
+    await held;
+  });
+
+  it('maps an unwritable state directory to StateFileUnreadableError with quarantinePath null and the original errno as cause', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      if (String(args[1]) === 'wx') {
+        throw Object.assign(new Error(`EACCES: permission denied, open '${String(args[0])}'`), {
+          code: 'EACCES',
+          path: args[0],
+        }) as NodeJS.ErrnoException;
+      }
+      return realOpen(...args);
+    });
+
+    const error = await readOrQuarantineVersionedRecordList({ filePath, parseRecord }).catch(
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.quarantinePath).toBeNull();
+    expect((unreadable.cause as NodeJS.ErrnoException).code).toBe('EACCES');
+    expect(unreadable.message).not.toContain('could not be copied');
+    expect(unreadable.message).not.toContain('repair it by hand');
+    expect(unreadable.message).toContain('no quarantine was attempted');
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    expect(await fs.readFile(filePath)).toEqual(Buffer.from('{ not json'));
+  });
+
+  it('echoes neither the lock path nor the store path in a lock-side refusal message, keeping the original error as cause', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const lockPath = `${filePath}.lock`;
+    const original = Object.assign(new Error(`EACCES: permission denied, open '${lockPath}'`), {
+      code: 'EACCES',
+      path: lockPath,
+    }) as NodeJS.ErrnoException;
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      if (String(args[1]) === 'wx') {
+        throw original;
+      }
+      return realOpen(...args);
+    });
+
+    const error = await readOrQuarantineVersionedRecordList({ filePath, parseRecord }).catch(
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.cause).toBe(original);
+    expect(unreadable.message).not.toContain(lockPath);
+    expect(unreadable.message).not.toContain(filePath);
+    expect(unreadable.message).not.toContain(tempDir);
+    expect(unreadable.message).toContain('EACCES');
+  });
+
+  it('refuses a symlinked store directly without taking the store lock', async () => {
+    const outside = path.join(tempDir, 'outside.txt');
+    await fs.writeFile(outside, '{ not json');
+    await fs.symlink(outside, filePath);
+    const openSpy = vi.spyOn(fs, 'open');
+
+    const error = await readOrQuarantineVersionedRecordList({ filePath, parseRecord }).catch(
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.quarantinePath).toBeNull();
+    expect(unreadable.detail).toBe('not a regular file');
+
+    const wxCalls = openSpy.mock.calls.filter(
+      (call) => call[0] === `${filePath}.lock` && String(call[1]) === 'wx',
+    );
+    expect(wxCalls).toHaveLength(0);
+  });
+
+  it('propagates a transient EIO on open unchanged and quarantines nothing', async () => {
+    const bytes = Buffer.from('{ not json');
+    await fs.writeFile(filePath, bytes);
+    const eio = Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }) as NodeJS.ErrnoException;
+
+    vi.spyOn(fs, 'open').mockRejectedValueOnce(eio);
+
+    await expect(readOrQuarantineVersionedRecordList({ filePath, parseRecord })).rejects.toBe(eio);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    expect(await fs.readFile(filePath)).toEqual(bytes);
+  });
+
+  it('propagates a transient EIO on the fd read unchanged and quarantines nothing', async () => {
+    const bytes = Buffer.from('{ not json');
+    await fs.writeFile(filePath, bytes);
+    const eio = Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }) as NodeJS.ErrnoException;
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await realOpen(...args);
+      return new Proxy(handle, {
+        get(target, key) {
+          if (key === 'read') {
+            return async () => {
+              throw eio;
+            };
+          }
+          const value = Reflect.get(target, key) as unknown;
+          return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+        },
+      });
+    });
+
+    await expect(readOrQuarantineVersionedRecordList({ filePath, parseRecord })).rejects.toBe(eio);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    expect(await fs.readFile(filePath)).toEqual(bytes);
+  });
+
+  it('returns records on a healthy read without creating a lock file, and keeps unknown-version and read-only outcomes', async () => {
+    const openSpy = vi.spyOn(fs, 'open');
+    expect(await readOrQuarantineVersionedRecordList({ filePath, parseRecord })).toEqual([]);
+    await fs.writeFile(filePath, JSON.stringify([{ id: 'a', schemaVersion: 1 }]));
+    expect(await readOrQuarantineVersionedRecordList({ filePath, parseRecord })).toEqual([{ id: 'a' }]);
+
+    // A healthy read must never take the store lock: withFileLock would call
+    // fs.open(lockPath, 'wx'), briefly creating a lock file. Assert none did.
+    const wxCalls = openSpy.mock.calls.filter(
+      (call) => call[0] === `${filePath}.lock` && String(call[1]) === 'wx',
+    );
+    expect(wxCalls).toHaveLength(0);
+    await expect(fs.stat(`${filePath}.lock`)).rejects.toThrow();
+
+    await fs.writeFile(filePath, JSON.stringify([{ id: 'a', schemaVersion: 2 }]));
+    await expect(readOrQuarantineVersionedRecordList({ filePath, parseRecord })).rejects.toBeInstanceOf(
+      StateFileUnknownVersionError,
+    );
+
+    await fs.writeFile(filePath, '{ not json');
+    await expect(
+      readOrQuarantineVersionedRecordList({ filePath, parseRecord, readOnly: true }),
+    ).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    await expect(fs.stat(`${filePath}.lock`)).rejects.toThrow();
+  });
+
+  it('refuses a symlinked or oversized store with no quarantine copy and a null quarantinePath', async () => {
+    const outside = path.join(tempDir, 'outside.txt');
+    await fs.writeFile(outside, '{ not json');
+    await fs.symlink(outside, filePath);
+    const symlinked = await readOrQuarantineVersionedRecordList({ filePath, parseRecord }).catch(
+      (error: unknown) => error,
+    );
+    expect(symlinked).toBeInstanceOf(StateFileUnreadableError);
+    expect((symlinked as StateFileUnreadableError).quarantinePath).toBeNull();
+    expect((symlinked as StateFileUnreadableError).detail).toBe('not a regular file');
+    // Quarantine was never attempted for a refused symlink, so the message
+    // must not claim the bytes could not be copied nor advise a manual repair.
+    expect((symlinked as StateFileUnreadableError).message).not.toContain('could not be copied');
+    expect((symlinked as StateFileUnreadableError).message).not.toContain('repair it by hand');
+    expect((symlinked as StateFileUnreadableError).message).toContain('no quarantine was attempted');
+    await fs.unlink(filePath);
+
+    await fs.writeFile(filePath, Buffer.alloc(STORE_FILE_MAX_BYTES + 1, 0x20));
+    const oversized = await readOrQuarantineVersionedRecordList({ filePath, parseRecord }).catch(
+      (error: unknown) => error,
+    );
+    expect(oversized).toBeInstanceOf(StateFileUnreadableError);
+    expect((oversized as StateFileUnreadableError).quarantinePath).toBeNull();
+    expect((oversized as StateFileUnreadableError).detail).toContain('bytes');
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
   });
 });

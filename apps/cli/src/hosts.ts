@@ -18,12 +18,15 @@
  * runner is never silently undeclared.
  */
 
+import { readFile } from "node:fs/promises";
+
 import {
   createNodeDoctorExecutor,
   diffInstallationText,
   draftHost,
   hostProbeSpecFromDraft,
   hostProbesHaveFailure,
+  parseHostDescriptor,
   probeHost,
   readHashOf,
   readInstallationFile,
@@ -33,6 +36,7 @@ import {
   writeInstallation,
   type HostDraftCandidate,
   type HostDraftInput,
+  type HostDescriptor,
   type HostProbeExecutor,
   type HostRunnerDraft,
   type InstallationFileRead,
@@ -51,7 +55,10 @@ import {
   AttemptRepositoryAdapter,
   CAPACITY_RELEASE_STATES,
   ExecutionJournalAdapter,
+  ManageDaemonSchedulerUseCase,
   resolveInstallationHostForRole,
+  SystemdUserSchedulerAdapter,
+  type DaemonSchedulerPort,
 } from "@fleet/work-execution";
 
 import { formatDoctorLine, type CliIo } from "./index.js";
@@ -74,6 +81,8 @@ export interface HostsCliOptions {
    * refuses the write.
    */
   readonly confirm?: (question: string) => Promise<boolean>;
+  /** Daemon scheduler port; the systemd user adapter composes when omitted. */
+  readonly scheduler?: DaemonSchedulerPort;
 }
 
 const HOSTS_HELP = `Usage: fleet-v2 hosts <subcommand> [flags]
@@ -85,16 +94,22 @@ A schema version 1 file is converted to v2 on the first write.
 
   list                         print one line per configured host
   add <name> [--ssh <alias>] [--port <n>] [--worktree-root <path>]
-                               [--role <role>]... [--yes]
+                               [--from-descriptor <file>] [--role <role>]... [--yes]
                                draft a new host; the default role is
                                lane-runner, and without --ssh the host is
-                               local
+                               local. With --from-descriptor the file carries
+                               the port, worktree root, tool and capabilities.
   edit <name> [--ssh <alias>] [--port <n>] [--worktree-root <path>]
                                [--role <role>]... [--yes]
                                change an existing host; flags left out keep
                                the entry's current values
   remove <name> [--yes]        remove a host; refuses the orchestrator host,
                                the last lane-runner and a host with live work
+  daemon install|show|uninstall --scheduler systemd [--apply]
+                               render the daemon tick's user-scope scheduler
+                               units (systemd service and timer); install
+                               prints the enable and linger commands, and
+                               --apply writes or removes the unit files
 
 Roles: orchestrator, lane-runner, verifier. hosts add/edit keep one
 lane-runner role: adding or editing a host with the lane-runner role moves that
@@ -126,7 +141,7 @@ const CONVERSION_ISOLATION_FLOOR: RunnerCapabilityDeclaration = {
 /** Which flags each subcommand accepts; anything else is a usage error. */
 const SUBCOMMAND_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
   list: new Set([]),
-  add: new Set(["ssh", "port", "worktree-root", "role", "yes"]),
+  add: new Set(["ssh", "port", "worktree-root", "from-descriptor", "role", "yes"]),
   edit: new Set(["ssh", "port", "worktree-root", "role", "yes"]),
   remove: new Set(["yes"]),
 };
@@ -137,6 +152,7 @@ interface HostsArgs {
   readonly sshAlias?: string;
   readonly port?: number;
   readonly worktreeRoot?: string;
+  readonly fromDescriptor?: string;
   readonly roles: readonly HostRole[];
   readonly yes: boolean;
 }
@@ -169,6 +185,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
     sshAlias?: string;
     port?: number;
     worktreeRoot?: string;
+    fromDescriptor?: string;
     roles: HostRole[];
     yes: boolean;
   } = { subcommand, roles: [], yes: false };
@@ -232,6 +249,8 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
         };
       }
       args.port = Number(value);
+    } else if (flag === "from-descriptor") {
+      args.fromDescriptor = value;
     } else {
       const segments = value.split(",");
       const roles: HostRole[] = [];
@@ -546,8 +565,51 @@ async function writeHost(
     );
     return 2;
   }
-  if (mode === "add" && args.worktreeRoot === undefined) {
-    io.stderr(`hosts add requires --worktree-root <path>\n${HOSTS_HELP}\n`);
+  // The descriptor path: the file carries the port, worktree root, runner
+  // and capabilities; the operator still supplies the alias and the roles.
+  let descriptor: HostDescriptor | undefined;
+  if (args.fromDescriptor !== undefined) {
+    if (args.port !== undefined || args.worktreeRoot !== undefined) {
+      io.stderr(
+        `hosts add --from-descriptor: the descriptor carries the worktree root and the port; --worktree-root and --port cannot be given with it\n${HOSTS_HELP}\n`,
+      );
+      return 2;
+    }
+    let text: string;
+    try {
+      text = await readFile(args.fromDescriptor, "utf8");
+    } catch {
+      io.stderr(
+        // The operator-supplied path can be a credential path; nothing from it appears here.
+        "hosts add --from-descriptor: the host descriptor file could not be read\n",
+      );
+      return 1;
+    }
+    let descriptorValue: unknown;
+    try {
+      descriptorValue = JSON.parse(text);
+    } catch {
+      io.stderr(
+        "hosts add --from-descriptor: the descriptor file is not JSON\n",
+      );
+      return 1;
+    }
+    const parsed = parseHostDescriptor(descriptorValue);
+    if (!parsed.ok) {
+      io.stderr("the descriptor is refused:\n");
+      printErrors(io, parsed.errors);
+      return 1;
+    }
+    descriptor = parsed.descriptor;
+  }
+  if (
+    mode === "add" &&
+    args.worktreeRoot === undefined &&
+    descriptor === undefined
+  ) {
+    io.stderr(
+      `hosts add requires --worktree-root <path> or --from-descriptor <file>\n${HOSTS_HELP}\n`,
+    );
     return 2;
   }
   const state = await readInstallationState(file);
@@ -589,11 +651,18 @@ async function writeHost(
   }
 
   const roles = args.roles.length > 0 ? args.roles : undefined;
-  const runner = runnerDraftFor(
-    existing,
-    args.port,
-    converting && mode === "add",
-  );
+  const runner: HostRunnerDraft | undefined =
+    descriptor !== undefined
+      ? {
+          kind: "opencode",
+          port: descriptor.port,
+          ...(descriptor.capabilities !== undefined
+            ? { capabilities: descriptor.capabilities }
+            : converting && mode === "add"
+              ? { capabilities: CONVERSION_ISOLATION_FLOOR }
+              : {}),
+        }
+      : runnerDraftFor(existing, args.port, converting && mode === "add");
   const input: HostDraftInput = {
     name,
     transport:
@@ -603,7 +672,8 @@ async function writeHost(
       : existing?.transport === "ssh" && existing.sshAlias !== undefined
         ? { sshAlias: existing.sshAlias }
         : {}),
-    worktreeRoot: args.worktreeRoot ?? existing?.worktreeRoot ?? "",
+    worktreeRoot:
+      descriptor?.worktreeRoot ?? args.worktreeRoot ?? existing?.worktreeRoot ?? "",
     ...(existing?.tmpDir !== undefined ? { tmpDir: existing.tmpDir } : {}),
     roles: roles ?? [...(existing?.roles ?? ["lane-runner"])],
     ...(runner !== undefined ? { runner } : {}),
@@ -674,6 +744,31 @@ async function writeHost(
   if (hostProbesHaveFailure(lines)) {
     io.stderr("refused: a probe reported FAIL; nothing was written\n");
     return 1;
+  }
+  // The probe beats the descriptor's claim: the only claim the probe can
+  // measure is the runner tool's version, and the file carries no version
+  // field, so the claim is never written. Neither value is printed — the
+  // descriptor's value is untrusted file content, the measured one already
+  // sits on the probe line above.
+  if (descriptor !== undefined) {
+    const versionLine = lines.find((line) => line.check === "version-opencode");
+    if (versionLine !== undefined) {
+      if (versionLine.status === "UNKNOWN") {
+        io.stdout(
+          "the descriptor's claimed opencode version could not be measured; the claim is not written\n",
+        );
+      } else if (versionLine.status === "PASS") {
+        const prefix = "opencode: version ";
+        if (versionLine.detail.startsWith(prefix)) {
+          const measured = versionLine.detail.slice(prefix.length);
+          if (measured !== descriptor.tools[0].version) {
+            io.stdout(
+              "the descriptor's claimed opencode version does not match the measured one; the measured version stands\n",
+            );
+          }
+        }
+      }
+    }
   }
   if (movedFrom.length > 0) {
     io.stdout(
@@ -835,12 +930,169 @@ async function listHosts(file: string, io: CliIo): Promise<number> {
   return 0;
 }
 
+type DaemonAction = "install" | "show" | "uninstall";
+
+interface DaemonCommandArgs {
+  readonly action: DaemonAction;
+  readonly apply: boolean;
+}
+
+type ParsedDaemonArgs =
+  | { readonly ok: true; readonly help: true }
+  | { readonly ok: true; readonly help: false; readonly args: DaemonCommandArgs }
+  | { readonly ok: false; readonly error: string };
+
+/**
+ * Parse one `hosts daemon` invocation. `--scheduler` is required and must be
+ * `systemd`; `--apply` is refused on show. Every problem is a usage message.
+ */
+function parseDaemonArgs(tokens: readonly string[]): ParsedDaemonArgs {
+  if (isHelpToken(tokens[0] ?? "")) {
+    return { ok: true, help: true };
+  }
+  const action = tokens[0];
+  if (action !== "install" && action !== "show" && action !== "uninstall") {
+    return {
+      ok: false,
+      error: `Unknown hosts daemon action: ${action === undefined ? "(none)" : action}\n${HOSTS_HELP}`,
+    };
+  }
+  let scheduler: string | undefined;
+  let apply = false;
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (isHelpToken(token)) {
+      return { ok: true, help: true };
+    }
+    const body = token.startsWith("--") ? token.slice(2) : "";
+    const separator = body.indexOf("=");
+    const flag = separator === -1 ? body : body.slice(0, separator);
+    const inlineValue =
+      separator === -1 ? undefined : body.slice(separator + 1);
+    if (flag === "apply") {
+      if (inlineValue !== undefined) {
+        return { ok: false, error: `--apply takes no value\n${HOSTS_HELP}` };
+      }
+      apply = true;
+      continue;
+    }
+    if (flag === "scheduler") {
+      let value = inlineValue;
+      if (value === undefined) {
+        const next = tokens[index + 1];
+        if (next === undefined || next.startsWith("--")) {
+          return {
+            ok: false,
+            error: `--scheduler requires a value\n${HOSTS_HELP}`,
+          };
+        }
+        value = next;
+        index += 1;
+      }
+      scheduler = value;
+      continue;
+    }
+    return {
+      ok: false,
+      error: `Unknown hosts daemon option: --${flag}\n${HOSTS_HELP}`,
+    };
+  }
+  if (scheduler === undefined) {
+    return {
+      ok: false,
+      error: `hosts daemon requires --scheduler <name>\n${HOSTS_HELP}`,
+    };
+  }
+  if (scheduler !== "systemd") {
+    return {
+      ok: false,
+      error: `hosts daemon --scheduler must be systemd\n${HOSTS_HELP}`,
+    };
+  }
+  if (action === "show" && apply) {
+    return {
+      ok: false,
+      error: `hosts daemon show does not take --apply\n${HOSTS_HELP}`,
+    };
+  }
+  return { ok: true, help: false, args: { action, apply } };
+}
+
+/**
+ * `fleet-v2 hosts daemon <action>`: install/show/uninstall the daemon tick's
+ * user-scope scheduler units. The installation file resolves exactly as the
+ * other hosts commands; its path is never printed. A missing, unreadable,
+ * invalid, v1 or daemon-less file is exit 1; usage problems are exit 2.
+ */
+async function daemonCommand(
+  argv: readonly string[],
+  io: CliIo,
+  options: HostsCliOptions,
+): Promise<number> {
+  const parsed = parseDaemonArgs(argv);
+  if (!parsed.ok) {
+    io.stderr(`${parsed.error}\n`);
+    return 2;
+  }
+  if (parsed.help) {
+    io.stdout(`${HOSTS_HELP}\n`);
+    return 0;
+  }
+  const args = parsed.args;
+  const file =
+    options.installationFile ??
+    resolveInstallationFile(undefined, process.env, process.cwd());
+  const state = await readInstallationState(file);
+  if (state.status === "absent") {
+    io.stderr("installation: absent\n");
+    return 1;
+  }
+  if (state.status === "unreadable") {
+    io.stderr("installation: unreadable\n");
+    return 1;
+  }
+  if (state.status === "invalid") {
+    printErrors(io, state.errors);
+    return 1;
+  }
+  if (state.status === "v1") {
+    io.stderr("installation.daemon: schema version 1 has no daemon section\n");
+    return 1;
+  }
+  const daemon = state.installation.daemon;
+  if (daemon === undefined) {
+    io.stderr("installation.daemon: absent\n");
+    return 1;
+  }
+  const scheduler =
+    options.scheduler ??
+    new SystemdUserSchedulerAdapter({ unitDir: daemon.unitDir });
+  const useCase = new ManageDaemonSchedulerUseCase({ scheduler });
+  const result = await useCase.execute({
+    action: args.action,
+    apply: args.apply,
+    daemon,
+  });
+  for (const unit of result.units) {
+    io.stdout(`${unit.key} ${unit.code}\n`);
+  }
+  if (result.operatorLines !== null) {
+    for (const line of result.operatorLines) {
+      io.stdout(`${line}\n`);
+    }
+  }
+  return result.units.some((unit) => unit.code === "unreadable") ? 1 : 0;
+}
+
 /** `fleet-v2 hosts <subcommand>`; exit codes: 0 written/listed, 1 refused, 2 usage. */
 export async function hostsCommand(
   argv: readonly string[],
   io: CliIo,
   options: HostsCliOptions = {},
 ): Promise<number> {
+  if (argv[0] === "daemon") {
+    return daemonCommand(argv.slice(1), io, options);
+  }
   const parsed = parseHostsArgs(argv);
   if (!parsed.ok) {
     io.stderr(`${parsed.error}\n`);

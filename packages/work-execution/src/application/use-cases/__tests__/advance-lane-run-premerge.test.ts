@@ -16,6 +16,7 @@ import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
+import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type { AcceptanceReceiptsResult } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type {
@@ -186,7 +187,7 @@ interface Harness {
   readonly grantRequests: readonly ConductorForgeGrantRequest[];
   readonly forgeRequests: readonly ExecuteAuthorizedForgeActionRequest[];
   readonly receiptRequests: readonly { attemptId: string; candidateHeadSha: string; kind: string }[];
-  readonly autoMergeCalls: { readonly count: number };
+  readonly enqueueCalls: { readonly count: number };
   readonly deps: AdvanceLaneRunDependencies;
   setReceiptAnswer(answer: FindLatestReceiptOfKindResult | 'throw'): void;
   setForgeAnswer(answer: ExecuteAuthorizedForgeActionResult | 'throw'): void;
@@ -205,7 +206,7 @@ async function makeHarness(
   const grantRequests: ConductorForgeGrantRequest[] = [];
   const forgeRequests: ExecuteAuthorizedForgeActionRequest[] = [];
   const receiptRequests: { attemptId: string; candidateHeadSha: string; kind: string }[] = [];
-  const autoMergeCalls = { count: 0 };
+  const enqueueCalls = { count: 0 };
   let receiptAnswer: FindLatestReceiptOfKindResult | 'throw' = {
     outcome: 'not-found',
   };
@@ -271,7 +272,10 @@ async function makeHarness(
           receiptAnswer !== 'throw' &&
           receiptAnswer.outcome === 'found' &&
           receiptAnswer.receipt.kind === 'pre-merge' &&
-          receiptAnswer.receipt.verdict === 'failed'
+          // RV3: only a receipt with a blocking finding blocks the receipts
+          // assessment; a minor-only failed receipt passes (like the evidence
+          // decider does).
+          decideConductorReviewOutcome(receiptAnswer.receipt).outcome === 'failed'
         ) {
           return { outcome: 'rejected', reason: 'review-blocker' };
         }
@@ -326,29 +330,29 @@ async function makeHarness(
           mergeState: 'clean',
           headSha: COMMIT,
           headRef: BRANCH,
-          baseRef: 'main',
+          isCrossRepository: false,
+          headRepositoryOwner: 'owner-example',          baseRef: 'main',
           mergedAtIso: null,
           closedAtIso: null,
           mergeCommitSha: null,
         },
       }),
       isConfigured: () => true,
+      listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }),
     },
     ciState: {
       readHeadCiState: async (request) => ({ headSha: request.headSha, state: 'passed', reason: 'read' }),
     },
-    autoMergeAttempt: {
-      autoMergeAttempt: async (request) => {
-        autoMergeCalls.count += 1;
-        return {
-          outcome: 'merged',
-          attemptId: request.attemptId,
-          headSha: COMMIT,
-          pullRequestNumber: 7,
-          decisionRevision: 'policy:autoMerge@example',
-        };
+    // KS7b: the merge hand-off is the queue's; a counted enqueue refuses, so a
+    // test that reaches it sees the call and nothing else.
+    enqueueMerge: {
+      enqueue: async () => {
+        enqueueCalls.count += 1;
+        return { outcome: 'refused', reason: 'invalid-head' };
       },
     },
+    mergeQueue: { listMergeEntries: async () => [] },
+    forgeRepository: { owner: 'owner-example', repo: 'repo-example' },
   };
 
   return {
@@ -358,7 +362,7 @@ async function makeHarness(
     grantRequests,
     forgeRequests,
     receiptRequests,
-    autoMergeCalls,
+    enqueueCalls,
     deps,
     setReceiptAnswer: (answer) => {
       receiptAnswer = answer;
@@ -498,7 +502,7 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
     expect(second).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
     expect(harness.forgeRequests).toHaveLength(1);
     expect(harness.grantRequests).toHaveLength(1);
-    expect(harness.autoMergeCalls.count).toBe(0);
+    expect(harness.enqueueCalls.count).toBe(0);
   });
 
   it('test 2: once the receipt passes, the reconcile posts success under a NEW action id and appends one premerge-success result', async () => {
@@ -553,6 +557,41 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries.some((entry) => entry.kind === 'result' && entry.key === premergeKey() && entry.reasonCode === 'premerge-failure')).toBe(true);
     expect(JSON.stringify(entries)).not.toContain('untrusted reviewer prose');
+  });
+
+  it('RV3: a minor-only failed pre-merge receipt releases the hold and posts success', async () => {
+    const harness = await mergingHarness();
+    harness.setReceiptAnswer(
+      failedReceipt([
+        { findingId: 'finding-1', severity: 'minor', summary: 'a carried minor', filePath: 'src/ex.ts', line: 4 },
+        { findingId: 'finding-2', severity: 'nit', summary: 'a carried nit', filePath: null, line: null },
+      ]),
+    );
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'premerge',
+      key: premergeKey(),
+      result: 'completed',
+      reasonCode: 'premerge-success',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]!.status).toEqual({
+      context: 'premerge',
+      state: 'success',
+      description: 'pre-merge receipt recorded',
+    });
+  });
+
+  it('RV3: a zero-finding failed pre-merge receipt is an unparseable verdict and parks ambiguous pre-merge, posting nothing', async () => {
+    const harness = await mergingHarness();
+    harness.setReceiptAnswer(failedReceipt([]));
+    // The decider reads the severity-derived pre-merge fact (`unknown`) and
+    // parks `ambiguous pre-merge` before any grant or forge call.
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'pre-merge' });
+    expect(harness.forgeRequests).toEqual([]);
+    expect(harness.grantRequests).toEqual([]);
   });
 
   it('a failed receipt for another head or of another kind authorises no grant and no post', async () => {
@@ -618,7 +657,7 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
     expect(entries.some((entry) => entry.kind === 'result' && entry.key === premergeKey(OTHER_HEAD12) && entry.outcome === 'overtaken' && entry.reasonCode === 'premerge-overtaken')).toBe(true);
   });
 
-  it('test 7: after premerge success on a Tier 2 pass with auto-merge off, the next advance parks owner-merge and never calls autoMergeAttempt', async () => {
+  it('test 7: after premerge success on a Tier 2 pass with auto-merge off, the next advance parks owner-merge and never enqueues the PR', async () => {
     const harness = await mergingHarness();
     harness.setReceiptAnswer(passedReceipt());
     const first = await advance(harness);
@@ -629,10 +668,10 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
       result: 'completed',
       reasonCode: 'premerge-success',
     });
-    expect(harness.autoMergeCalls.count).toBe(0);
+    expect(harness.enqueueCalls.count).toBe(0);
     const second = await advance(harness);
     expect(second).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
-    expect(harness.autoMergeCalls.count).toBe(0);
+    expect(harness.enqueueCalls.count).toBe(0);
     expect(harness.forgeRequests).toHaveLength(1);
   });
 

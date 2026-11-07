@@ -1,9 +1,9 @@
 import { randomBytes } from 'node:crypto';
 
 import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
-import type { FindingSeverity, ReviewFindingRecord } from '../../domain/evidence-records.js';
+import type { FindingSeverity, ReviewFindingRecord, ReviewUnknownReason } from '../../domain/evidence-records.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
-import type { ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
+import type { ReviewTransportDiagnostic, ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
 import type { ReviewRunnerRoute } from './ReviewTransportRouter.js';
 import { runSpawnOutcome, DEFAULT_MAX_BUFFER_BYTES } from './spawn-run.js';
@@ -14,20 +14,121 @@ import { runSpawnOutcome, DEFAULT_MAX_BUFFER_BYTES } from './spawn-run.js';
  * `ReviewTransportError`; the router throws it for seat and tool refusals, and
  * `IndependentReviewAdapter` maps any other throw to `transport-failed`.
  */
+/**
+ * True when `error` carries a timeout shape: an `AbortError` name, an
+ * `ETIMEDOUT` code, or a timeout phrase in its message. A throwing getter is
+ * a non-timeout, never a crash. Defined beside the transport error it
+ * classifies and re-exported here for the adapter's callers.
+ */
+export function isTimeoutError(error: unknown): boolean {
+  try {
+    if (typeof error !== 'object' || error === null || Array.isArray(error)) {
+      return false;
+    }
+    const candidate = error as { readonly name?: unknown; readonly code?: unknown; readonly message?: unknown };
+    if (candidate.name === 'AbortError' || candidate.code === 'ETIMEDOUT') {
+      return true;
+    }
+    return typeof candidate.message === 'string' && /timed?\s*out|timeout/i.test(candidate.message);
+  } catch {
+    return false;
+  }
+}
+
 export class ReviewTransportError extends Error {
   readonly code: ReviewUnavailableCode;
+  /** The bounded transport diagnostic (RV4); absent when the failure carried none. */
+  readonly diagnostic?: ReviewTransportDiagnostic;
 
-  constructor(message: string, code: ReviewUnavailableCode) {
+  constructor(message: string, code: ReviewUnavailableCode, diagnostic?: ReviewTransportDiagnostic) {
     super(message);
     this.name = 'ReviewTransportError';
     this.code = code;
+    if (diagnostic !== undefined) {
+      this.diagnostic = diagnostic;
+    }
   }
+}
+
+/** The bound on stderr that leaves the transport (RV4): 2048 bytes. */
+export const MAX_TRANSPORT_STDERR_BYTES = 2048;
+
+/** A data read that never throws: a throwing getter reads as `null`. */
+function safeRead<T>(read: () => T): T | null {
+  try {
+    return read();
+  } catch {
+    return null;
+  }
+}
+
+/** Cap a string at `maxBytes` UTF-8 bytes without throwing. */
+function capUtf8Bytes(text: string, maxBytes: number): string {
+  try {
+    if (Buffer.byteLength(text, 'utf8') <= maxBytes) {
+      return text;
+    }
+    return Buffer.from(text, 'utf8').subarray(0, maxBytes).toString('utf8');
+  } catch {
+    return text.slice(0, maxBytes);
+  }
+}
+
+/** The bounded diagnostic of a spawn result; a throwing getter reads as null. */
+function spawnDiagnosticOf(result: OcmReviewTransportSpawnResult): ReviewTransportDiagnostic {
+  const exitCode = safeRead(() => result.exitCode);
+  const timedOut = safeRead(() => result.timedOut === true) === true;
+  const stderr = safeRead(() => result.stderr);
+  const stdout = safeRead(() => result.stdout);
+  // A missing or non-string field reads as null (RV4 round 1): the spawn
+  // result shape is not trusted, so only a real string is capped or trimmed.
+  return {
+    exitCode: exitCode ?? null,
+    timedOut,
+    stderr: typeof stderr === 'string' ? capUtf8Bytes(stderr, MAX_TRANSPORT_STDERR_BYTES) : null,
+    stdoutEmpty: typeof stdout === 'string' ? stdout.trim() === '' : null,
+  };
+}
+
+/**
+ * The diagnostic of a failure that carried no spawn result (a spawn that
+ * threw, or a refusal before any spawn): no exit code, the timeout shape, the
+ * error class name (never the message), and no stdout reading. Never throws.
+ */
+export function transportFailureDiagnostic(error: unknown): ReviewTransportDiagnostic {
+  // The thrown message is never copied: it may carry a secret or a path, and
+  // this package has no screen. Only the error class name travels.
+  const name = safeRead(() => {
+    const named = (error as { readonly name?: unknown } | null)?.name;
+    return typeof named === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(named) ? named : 'Error';
+  });
+  return {
+    exitCode: null,
+    timedOut: isTimeoutError(error),
+    stderr: capUtf8Bytes(`${name ?? 'Error'}: spawn threw`, MAX_TRANSPORT_STDERR_BYTES),
+    stdoutEmpty: null,
+  };
+}
+
+/** The timed-out classification of a spawn result, read without throwing. */
+function spawnTimedOut(result: OcmReviewTransportSpawnResult): boolean {
+  if (safeRead(() => result.timedOut === true) === true) {
+    return true;
+  }
+  const exitCode = safeRead(() => result.exitCode);
+  const stderr = safeRead(() => result.stderr);
+  if (exitCode === null && typeof stderr === 'string') {
+    return /timed?\s*out|timeout/i.test(stderr);
+  }
+  return false;
 }
 
 export interface OcmReviewTransportSpawnResult {
   readonly exitCode: number | null;
   readonly stdout: string;
   readonly stderr: string;
+  /** Set only when the spawn ended because its wall-clock budget ran out. */
+  readonly timedOut?: boolean;
 }
 
 export type OcmReviewTransportSpawn = (
@@ -80,11 +181,10 @@ export const READ_ONLY_REVIEW_TOOLS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * The shell commands the lane server's `reviewer` agent may already run, so a
- * strictly read-only shell command is read-only proof by design. The proof
- * grammar below is an allow-list, never a deny-list: read-only commands can
- * still write or execute, so anything not shaped exactly like the forms here
- * is refused.
+ * The shell commands the lane server's `reviewer` agent may already run. This
+ * allow-list is a defence-in-depth filter of what a reviewer may run, **never**
+ * a read-only proof: even a command accepted here voids the review's
+ * read-only verification, because the review prompt forbids every shell call.
  */
 export const READ_ONLY_REVIEW_SHELL_COMMANDS: ReadonlySet<string> = new Set([
   'git',
@@ -321,11 +421,13 @@ function isReadOnlyListCommand(command: string, words: readonly string[]): boole
 }
 
 /**
- * True only for a shell command the lane server's `reviewer` agent may run as
- * read-only proof: `git diff|log|show|status`, `grep`, `rg`, `sed -n`, `cat`,
- * `ls` and `wc` in the strict shapes above. Pure and fail-closed: anything
- * unparsable, over-long, carrying a shell metacharacter, an assignment, an
- * unknown flag or an unsafe path is refused.
+ * True only for a shell command the lane server's `reviewer` agent may run:
+ * `git diff|log|show|status`, `grep`, `rg`, `sed -n`, `cat`, `ls` and `wc` in
+ * the strict shapes above. Pure and fail-closed: anything unparsable,
+ * over-long, carrying a shell metacharacter, an assignment, an unknown flag
+ * or an unsafe path is refused. This is a defence-in-depth filter of what a
+ * reviewer may run, never a read-only proof: even a command accepted here
+ * voids the review's read-only verification.
  */
 export function isReadOnlyReviewCommand(command: unknown): boolean {
   if (typeof command !== 'string') {
@@ -379,31 +481,6 @@ export function isReadOnlyReviewCommand(command: unknown): boolean {
   }
 }
 
-/**
- * The shell command a bash/shell tool event carries, read from the PART's
- * input placements only (`part.input.command` and `part.state.input.command`);
- * null when no placement holds one or when the placements disagree. An
- * event-level `input` is never read, so a passing placement cannot hide a
- * failing one.
- */
-function extractShellCommand(record: Record<string, unknown>): string | null {
-  const part = isPlainRecord(record.part) ? record.part : null;
-  if (part === null) {
-    return null;
-  }
-  const state = isPlainRecord(part.state) ? part.state : null;
-  const commands: string[] = [];
-  for (const input of [part.input, state?.input]) {
-    if (isPlainRecord(input) && typeof input.command === 'string') {
-      commands.push(input.command);
-    }
-  }
-  if (commands.length === 0) {
-    return null;
-  }
-  return commands.every((command) => command === commands[0]) ? commands[0] : null;
-}
-
 /** Recognised event types for review runner stream. Any unrecognised event voids read-only. */
 export const RECOGNISED_EVENT_TYPES: ReadonlySet<string> = new Set([
   'step_start',
@@ -438,8 +515,90 @@ export const REVIEWER_ENV_ALLOWLIST: readonly string[] = [
   'SSH_AUTH_SOCK',
 ];
 
-const VERDICT_PATTERN = /^VERDICT: (PASS|FAIL)$/;
-const FINDING_PATTERN = /^FINDING: (blocker|major|minor|nit) (\S+?)(?::(\d+))? (.+)$/;
+const VERDICT_PATTERN = /^VERDICT: (PASS|FAIL|FIX FIRST)$/;
+const FINDING_PATTERN = /^FINDING: ([A-Za-z][\w-]*) (\S+?)(?::(\d+))? (.+)$/i;
+
+/**
+ * RV3: reviewer severity words that are not the four declared ones but mean
+ * one of them. Anything else is not guessed at: a finding with an unrecognised
+ * severity makes the whole reply unparseable (never silently dropped).
+ */
+const SEVERITY_SYNONYMS: Readonly<Record<string, FindingSeverity>> = {
+  blocker: 'blocker',
+  major: 'major',
+  minor: 'minor',
+  nit: 'nit',
+  critical: 'blocker',
+  severe: 'blocker',
+  high: 'major',
+  medium: 'major',
+  low: 'minor',
+  info: 'nit',
+  trivial: 'nit',
+};
+
+function normalizeSeverity(word: string): FindingSeverity | null {
+  const key = word.toLowerCase();
+  return Object.prototype.hasOwnProperty.call(SEVERITY_SYNONYMS, key) ? (SEVERITY_SYNONYMS[key] as FindingSeverity) : null;
+}
+
+const FILE_REFERENCE = /[\w./-]+\.\w+:\d+/;
+const LIST_OR_NUMBER_MARKER = /^(?:[-*+•>]\s+|\d+[.)]\s+)/;
+const SEVERITY_TOKEN_SKELETONS: ReadonlySet<string> = new Set([
+  'blocker', 'critical', 'major', 'high', 'severe', 'medium', 'minor', 'low', 'nit', 'info', 'trivial',
+]);
+/** Cyrillic and Greek letters that render like ASCII ones, folded before a severity-word check. */
+const LOOKALIKES: Readonly<Record<string, string>> = {
+  'а': 'a', 'с': 'c', 'е': 'e', 'о': 'o', 'р': 'p', 'х': 'x', 'у': 'y', 'і': 'i', 'ј': 'j', 'к': 'k', 'м': 'm', 'н': 'h', 'т': 't', 'ѕ': 's', 'ԁ': 'd', 'ɡ': 'g', 'ӏ': 'l', 'ᴎ': 'n',
+  'α': 'a', 'ε': 'e', 'ι': 'i', 'ο': 'o', 'ρ': 'p', 'ν': 'v', 'κ': 'k', 'τ': 't', 'η': 'n', 'μ': 'm', 'β': 'b', 'χ': 'x', 'υ': 'u',
+};
+
+/** Every markdown emphasis or code character anywhere in the line is removed, whitespace collapsed, then trimmed. */
+function normaliseFindingLine(line: string): string {
+  return line.replace(/[*_`~]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/** True when `token` (punctuation trimmed) is a severity word, spelled with ASCII or look-alike letters. */
+function isSeverityToken(token: string): boolean {
+  const bare = token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  const folded = [...bare.toLowerCase()].map((ch) => LOOKALIKES[ch] ?? ch).join('');
+  return SEVERITY_TOKEN_SKELETONS.has(folded) || folded === 'sev' || folded === 'severity';
+}
+
+/**
+ * RV3 (Luna rounds 2-3): true when a line that no finding pattern fully parsed
+ * still looks like a finding, so the whole reply is refused rather than the
+ * line skipped. The line is normalised first (markdown characters removed
+ * everywhere, so `maj**or**` is `major`). It is finding-shaped only when it
+ * starts with `FINDING`, or with a list or number marker followed by a
+ * severity word as the first word, or (no marker) carries a `path:line`
+ * reference after a leading severity word. A `path:line` reference alone never
+ * makes prose finding-shaped.
+ */
+function looksLikeUnparsedFinding(trimmedLine: string): boolean {
+  // Every shape check runs on the normalised line. A bare `*` bullet is the
+  // one marker normalisation would erase, so it is read first.
+  const normalised = normaliseFindingLine(trimmedLine);
+  const starBullet = /^\*\s+/.exec(trimmedLine);
+  const marker = starBullet ?? LIST_OR_NUMBER_MARKER.exec(normalised);
+  const body = marker === null ? normalised : normaliseFindingLine(starBullet !== null ? trimmedLine.slice(marker[0].length) : normalised.slice(marker[0].length));
+  if (/^FINDING\b/i.test(body) || /^FINDING\b/i.test(normalised)) {
+    return true;
+  }
+  const firstWord = body.split(' ')[0] ?? '';
+  if (isSeverityToken(firstWord)) {
+    return marker !== null || FILE_REFERENCE.test(trimmedLine);
+  }
+  // The numbered shape: `N. path:line - severity. summary`.
+  const afterTarget = /^\S+ [-–—] (\S+)/.exec(body);
+  return marker !== null && afterTarget !== null && isSeverityToken(afterTarget[1] ?? '');
+}
+
+/** The findings parsed from a reply, and whether any finding line carried an unrecognised severity. */
+interface ParsedFindingLines {
+  readonly findings: ReviewFindingRecord[];
+  readonly invalid: boolean;
+}
 export const MAX_RAW_OUTPUT_LENGTH = 20000;
 
 /** Default wall-clock budget for one review run when the caller gives no timeout. */
@@ -558,6 +717,31 @@ export const REVIEW_CHECKLIST: string = [
 /** Byte cap for the diff embedded in a kind review prompt. */
 export const MAX_OCM_EMBEDDED_DIFF_BYTES = 120_000;
 
+/** The fixed reason a review is refused because the diff under review could not be read. */
+export const DIFF_UNAVAILABLE_REASON = 'diff-unavailable';
+/** The fixed reason a review is refused because the diff under review exceeded the embedding limit. */
+export const DIFF_TRUNCATED_REASON = 'diff-truncated';
+
+export type DiffEmbedding =
+  | { readonly kind: 'embedded'; readonly diff: string }
+  | { readonly kind: 'refused'; readonly reason: string };
+
+/**
+ * Pure classification of a read diff before a review is sent. A throw, a
+ * null, a non-string or a blank read means the change could not be seen; a
+ * diff over the embedding cap means the review would judge only part of the
+ * change. Either way the review is refused (`unknown`), never sent.
+ */
+export function classifyDiffForEmbedding(diff: string | null): DiffEmbedding {
+  if (typeof diff !== 'string' || diff.trim() === '') {
+    return { kind: 'refused', reason: DIFF_UNAVAILABLE_REASON };
+  }
+  if (Buffer.byteLength(diff, 'utf8') > MAX_OCM_EMBEDDED_DIFF_BYTES) {
+    return { kind: 'refused', reason: DIFF_TRUNCATED_REASON };
+  }
+  return { kind: 'embedded', diff };
+}
+
 export function buildReviewPrompt(
   request: RunIndependentReviewRequest,
   nonce: string,
@@ -667,17 +851,157 @@ function buildKindReviewPrompt(
 export interface ParsedReviewReply {
   readonly result: EvidenceResultValue;
   readonly findings: ReviewFindingRecord[];
+  /** Fixed cause code when `result === 'unknown'`; absent otherwise. */
+  readonly unknownReason?: ReviewUnknownReason;
+}
+
+/** Bound on how many findings one reply may contribute. */
+export const MAX_PARSED_FINDINGS = 1000;
+/** Bound on one finding line; a longer line is skipped, never parsed. */
+export const MAX_FINDING_LINE_LENGTH = 8192;
+
+/**
+ * The untrusted-block markers the prompt wraps lane-written text in. An echoed
+ * block (the reviewer repeating the diff or brief it was given) is data, so
+ * neither its markers nor its body may ever contribute a finding.
+ */
+const UNTRUSTED_OPEN_PATTERN = /^<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="[^"]*">>>$/;
+
+/**
+ * Every line of `text` that is not inside an echoed `<<<UNTRUSTED ...>>>`
+ * block (open marker to its matching close, or to EOF when it never closes)
+ * or inside a fenced diff block. Linear over the line count; the scan never
+ * backtracks.
+ */
+export function stripUntrustedEchoBlocks(text: string): string {
+  return scanUntrustedEchoBlocks(text).stripped;
+}
+
+/**
+ * The stripped text plus whether an untrusted block or diff fence was opened
+ * and never closed. An unclosed block is a malformed answer: callers refuse it
+ * (no verdict is read) rather than trusting whatever the strip left.
+ */
+function scanUntrustedEchoBlocks(text: string): { readonly stripped: string; readonly unclosed: boolean } {
+  const kept: string[] = [];
+  let openNonce: string | null = null;
+  let fenceToken: string | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (openNonce !== null) {
+      if (line.trim() === `<<<END UNTRUSTED nonce=${openNonce}>>>`) {
+        openNonce = null;
+      }
+      continue;
+    }
+    if (fenceToken !== null) {
+      if (line.trim() === fenceToken) {
+        fenceToken = null;
+      }
+      continue;
+    }
+    const openMatch = UNTRUSTED_OPEN_PATTERN.exec(line.trim());
+    if (openMatch !== null) {
+      openNonce = openMatch[1] ?? null;
+      continue;
+    }
+    const fenceMatch = /^(```|~~~)diff\s*$/.exec(line.trim());
+    if (fenceMatch !== null) {
+      fenceToken = fenceMatch[1] ?? null;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { stripped: kept.join('\n'), unclosed: openNonce !== null || fenceToken !== null };
+}
+
+/**
+ * One numbered finding line (`N. \`path:line\` — **severity**. summary` and
+ * its documented variants: em/en/ASCII dash, bolded or plain severity, `. `,
+ * `: ` or whitespace before the summary, chained extra backticked paths joined
+ * by `, `, `, and ` or ` and `). Null when the line carries no numbered
+ * finding. Linear: no nested quantifiers, no backtracking.
+ */
+function parseNumberedFindingLine(trimmedLine: string): {
+  readonly firstTarget: string;
+  readonly extraTargets: string;
+  readonly severity: FindingSeverity | null;
+  readonly summaryText: string;
+} | null {
+  const prefixMatch = /^(\d+)\.\s+(.*)$/.exec(trimmedLine);
+  if (prefixMatch === null) {
+    return null;
+  }
+  const remainder = prefixMatch[2] ?? '';
+  if (!remainder.startsWith('`')) {
+    return null;
+  }
+  const firstMatch = /^`([^`\s]+)`/.exec(remainder);
+  if (firstMatch === null) {
+    return null;
+  }
+  const firstTarget = firstMatch[1] ?? '';
+  let index = firstMatch[0].length;
+  let extraTargets = '';
+  for (;;) {
+    const chainMatch = /^(?:\s*,\s*|\s*,\s+and\s+|\s+and\s+)`([^`\s]+)`/.exec(remainder.slice(index));
+    if (chainMatch === null) {
+      break;
+    }
+    extraTargets += chainMatch[0];
+    index += chainMatch[0].length;
+  }
+  const tail = remainder.slice(index);
+  const tailMatch = /^\s+(?:—|–|-)\s+(?:\*\*([A-Za-z][\w-]*)\*\*|(blocker|major|minor|nit|critical|high))(?:\.\s+|:\s+|\s+)(.+)$/i.exec(tail);
+  if (tailMatch === null) {
+    return null;
+  }
+  return {
+    firstTarget,
+    extraTargets: extraTargets.trim(),
+    severity: normalizeSeverity(tailMatch[1] ?? tailMatch[2] ?? ''),
+    summaryText: tailMatch[3] ?? '',
+  };
+}
+
+/** The target `path[:line]` (a `-` is no file; a line range keeps its first number), split into filePath and line. */
+function targetOf(firstTarget: string): { readonly filePath: string | null; readonly line: number | null } {
+  const match = /^(.+?)(?::(\d+)(?:[-–]\d+)?)?$/.exec(firstTarget);
+  const rawPath = match?.[1] ?? '';
+  const filePath = rawPath === '-' ? null : rawPath;
+  const rawLine = match?.[2];
+  const parsedLine = rawLine === undefined ? null : Number.parseInt(rawLine, 10);
+  const line =
+    parsedLine !== null && Number.isSafeInteger(parsedLine) && parsedLine >= 1 ? parsedLine : null;
+  return { filePath, line };
 }
 
 /** Every finding line of `text`, numbered in order. */
-function parseFindingLines(text: string): ReviewFindingRecord[] {
+function parseFindingLines(text: string): ParsedFindingLines {
   const findings: ReviewFindingRecord[] = [];
-  for (const rawLine of text.split(/\r?\n/)) {
-    const findingMatch = FINDING_PATTERN.exec(rawLine.trim());
+  let invalid = false;
+  // Echoed untrusted blocks (a repeated diff or brief) and fenced diff blocks
+  // are data the reviewer was handed, never its findings: they are stripped
+  // before any line is parsed.
+  const stripped = stripUntrustedEchoBlocks(text);
+  for (const rawLine of stripped.split(/\r?\n/)) {
+    if (findings.length >= MAX_PARSED_FINDINGS) {
+      break;
+    }
+    // A pathological single line stays bounded: overlong lines are skipped.
+    if (rawLine.length > MAX_FINDING_LINE_LENGTH) {
+      continue;
+    }
+    const trimmedLine = rawLine.trim();
+    const findingMatch = FINDING_PATTERN.exec(trimmedLine);
     if (findingMatch !== null) {
+      const findingSeverity = normalizeSeverity(findingMatch[1]);
+      if (findingSeverity === null) {
+        invalid = true;
+        continue;
+      }
       findings.push({
         findingId: `review-${findings.length + 1}`,
-        severity: findingMatch[1] as FindingSeverity,
+        severity: findingSeverity,
         summary: findingMatch[4].trim(),
         filePath: findingMatch[2] === '-' ? null : findingMatch[2],
         line: findingMatch[3] === undefined ? null : Number.parseInt(findingMatch[3], 10),
@@ -685,33 +1009,98 @@ function parseFindingLines(text: string): ReviewFindingRecord[] {
         dispositionReason: null,
         dispositionEvidenceRef: null,
       });
+      continue;
+    }
+    const numbered = parseNumberedFindingLine(trimmedLine);
+    if (numbered !== null) {
+      if (numbered.severity === null) {
+        invalid = true;
+        continue;
+      }
+      const { filePath, line } = targetOf(numbered.firstTarget);
+      const summary =
+        numbered.extraTargets === ''
+          ? numbered.summaryText.trim()
+          : `${numbered.extraTargets} — ${numbered.summaryText.trim()}`;
+      findings.push({
+        findingId: `review-${findings.length + 1}`,
+        severity: numbered.severity,
+        summary,
+        filePath,
+        line,
+        state: 'unresolved',
+        dispositionReason: null,
+        dispositionEvidenceRef: null,
+      });
+      continue;
+    }
+    if (looksLikeUnparsedFinding(trimmedLine)) {
+      invalid = true;
     }
   }
-  return findings;
+  return { findings, invalid };
 }
 
-/** The verdict on the last non-empty line of `verdictText`, or null when that line carries none. */
+/**
+ * The verdict on the last non-empty line of the whole joined answer, or null
+ * when that line carries none. The argument is always the whole answer (every
+ * text part joined in order), never a single part or a pre-extracted verdict
+ * snippet.
+ */
 function lastLineVerdict(verdictText: string): 'PASS' | 'FAIL' | null {
-  const lastNonEmptyLine = verdictText
+  // Echoed untrusted blocks and fenced diffs are data, never the reviewer's
+  // verdict; an unclosed one swallows to EOF, so no verdict line remains.
+  const scanned = scanUntrustedEchoBlocks(verdictText);
+  if (scanned.unclosed) {
+    return null;
+  }
+  const lastNonEmptyLine = scanned.stripped
     .split(/\r?\n/)
     .reverse()
     .find((line) => line.trim() !== '');
   if (lastNonEmptyLine === undefined) {
     return null;
   }
-  const verdictMatch = VERDICT_PATTERN.exec(lastNonEmptyLine);
-  return verdictMatch === null ? null : (verdictMatch[1] as 'PASS' | 'FAIL');
+  // Only trailing horizontal whitespace is dropped: an indented quote
+  // (`    VERDICT: PASS`) is not a verdict line and stays null.
+  const lastLine = lastNonEmptyLine.replace(/[ \t]+$/, '');
+  const verdictMatch = VERDICT_PATTERN.exec(lastLine);
+  if (verdictMatch === null) {
+    return null;
+  }
+  // `FIX FIRST` is the reviewer's fail verdict: it maps to FAIL.
+  return verdictMatch[1] === 'PASS' ? 'PASS' : 'FAIL';
 }
 
-/** Findings from every line of `text`; the verdict only from the last non-empty line of `verdictText`. */
-export function parseReviewReply(text: string, verdictText: string): ParsedReviewReply {
-  const findings = parseFindingLines(text);
-  const verdict = lastLineVerdict(verdictText);
+/**
+ * Findings and verdict both come from `text`, the whole answer (every text
+ * part joined in order): one path for every answer shape. The verdict is the
+ * last non-empty line of the text left after untrusted blocks are stripped;
+ * an unclosed block or fence anywhere makes the answer unparseable. The
+ * second parameter (`_ignoredVerdictText`) has no effect on the parse; it is
+ * kept only so existing callers compile.
+ */
+export function parseReviewReply(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
+  if (typeof text !== 'string') {
+    return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+  }
+  const parsedLines = parseFindingLines(text);
+  const findings = parsedLines.findings;
+  if (parsedLines.invalid) {
+    // RV3: a finding with an unrecognised severity refuses the whole reply.
+    return { result: 'unknown', findings, unknownReason: 'unparseable-verdict' };
+  }
+  const verdict = lastLineVerdict(text);
   let result: EvidenceResultValue = 'unknown';
   if (verdict === 'PASS') {
     result = findings.some((f) => f.severity === 'blocker') ? 'fail' : 'pass';
   } else if (verdict === 'FAIL') {
     result = 'fail';
+  }
+  if (result === 'unknown') {
+    const unknownReason: ReviewUnknownReason =
+      text.trim() === '' ? 'empty' : 'unparseable-verdict';
+    return { result, findings, unknownReason };
   }
   return { result, findings };
 }
@@ -721,16 +1110,35 @@ export function parseReviewReply(text: string, verdictText: string): ParsedRevie
  * PASS with any blocker or major finding is a fail, a FAIL with zero findings
  * is unknown (the run parks ambiguous rather than starting a fix round
  * without findings), and a missing verdict is unknown. Manual reviews keep
- * `parseReviewReply` unchanged.
+ * `parseReviewReply` unchanged. The second parameter
+ * (`_ignoredVerdictText`) has no effect; it is kept only so existing callers
+ * compile.
  */
-export function parseReviewReplyStrict(text: string, verdictText: string): ParsedReviewReply {
-  const findings = parseFindingLines(text);
-  const verdict = lastLineVerdict(verdictText);
+export function parseReviewReplyStrict(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
+  if (typeof text !== 'string') {
+    return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+  }
+  const parsedLines = parseFindingLines(text);
+  const findings = parsedLines.findings;
+  if (parsedLines.invalid) {
+    // RV3: a finding with an unrecognised severity refuses the whole reply.
+    return { result: 'unknown', findings, unknownReason: 'unparseable-verdict' };
+  }
+  const verdict = lastLineVerdict(text);
   let result: EvidenceResultValue = 'unknown';
   if (verdict === 'PASS') {
     result = findings.some((f) => f.severity === 'blocker' || f.severity === 'major') ? 'fail' : 'pass';
   } else if (verdict === 'FAIL' && findings.length > 0) {
     result = 'fail';
+  }
+  if (result === 'unknown') {
+    const unknownReason: ReviewUnknownReason =
+      text.trim() === ''
+        ? 'empty'
+        : verdict === null
+          ? 'unparseable-verdict'
+          : 'no-findings-on-fail';
+    return { result, findings, unknownReason };
   }
   return { result, findings };
 }
@@ -794,10 +1202,12 @@ export async function defaultSpawn(
     maxBufferBytes: DEFAULT_MAX_BUFFER_BYTES,
     killGraceMs: REVIEW_KILL_GRACE_MS,
   });
+  const timedOut = outcome.error !== undefined && /timed?\s*out|timeout/i.test(outcome.error);
   return {
     exitCode: outcome.exitCode,
     stdout: outcome.stdout,
     stderr: outcome.stderr !== '' ? outcome.stderr : outcome.error ?? '',
+    ...(timedOut ? { timedOut: true } : {}),
   };
 }
 
@@ -849,29 +1259,91 @@ export function createOcmReviewTransport(
       );
     }
 
-    // 4. Build argv and sanitized environment. A kind review embeds the
+    // 4. RV4: before the review, prove the worktree is idle with
+    // `ocm-run --wait --dir <dir>` under the review budget. `--wait` exits 0
+    // when idle (two reads) and 75 when a session still runs past
+    // `OCM_WAIT_MAX`; a cut-short wait (a timeout) writes no review intent, so
+    // the next pass can dispatch. Exit 75 or `timedOut` is `seat-busy`; any
+    // other non-zero exit, an unreadable exit code or a thrown spawn is the
+    // existing `transport`/`timeout` code. None of these spawn the review.
+    const timeoutMs = options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+    const reviewEnv = buildReviewerEnv(options);
+    const waitSpawnFn = options.spawn ?? defaultSpawn;
+    let waitResult: OcmReviewTransportSpawnResult;
+    try {
+      waitResult = await waitSpawnFn(options.ocmRunBin, ['--wait', '--dir', dir], {
+        ...reviewEnv,
+        OCM_WAIT_MAX: String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+      }, { timeoutMs });
+    } catch (error) {
+      // RV4: a thrown spawn always classifies as `timeout` or `transport`. Its
+      // message is never passed through — it may carry a secret or a path —
+      // and a typed ReviewTransportError thrown by the spawn is classified like
+      // any other throw, never rethrown with its own code or message.
+      throw new ReviewTransportError(
+        'reviewer process failed',
+        isTimeoutError(error) ? 'timeout' : 'transport',
+        transportFailureDiagnostic(error),
+      );
+    }
+    const waitExitCode = safeRead(() => waitResult.exitCode);
+    if (waitExitCode === 75 || safeRead(() => waitResult.timedOut === true) === true) {
+      throw new ReviewTransportError('review seat busy', 'seat-busy', spawnDiagnosticOf(waitResult));
+    }
+    if (waitExitCode !== 0) {
+      const waitTimedOut = spawnTimedOut(waitResult);
+      throw new ReviewTransportError(
+        `reviewer process failed with exit code ${String(waitExitCode)}`,
+        waitTimedOut ? 'timeout' : 'transport',
+        spawnDiagnosticOf(waitResult),
+      );
+    }
+
+    // 5. Build argv and sanitized environment. A kind review embeds the
     // base..head diff read after the pre-review head read, so the reviewer
     // does not need a shell to see the change.
     const nonce = (options.makeNonce ?? defaultNonce)();
     let embeddedDiff: string | null = null;
-    let diffUnavailable = false;
-    if (request.kind !== undefined && options.baseCommit !== undefined && options.readDiff !== undefined) {
-      // A failed diff read never aborts the review: the prompt carries the
-      // "diff not available" note next to the tools sentence and the tools
-      // still work against the candidate head.
-      let diff: string | null = null;
-      try {
-        const read = await options.readDiff(options.baseCommit, request.candidateHeadSha);
-        if (typeof read === 'string' && read.trim() !== '') {
-          diff = read;
-        }
-      } catch {
-        diff = null;
+    if (request.kind !== undefined) {
+      // F68: a kind review with no diff source is refused exactly like an
+      // unreadable diff: a review that cannot see the change can still answer
+      // PASS, so the transport refuses before the prompt and the spawn.
+      if (options.baseCommit === undefined || options.readDiff === undefined) {
+        const afterMissing = await options.readHead(dir);
+        return {
+          rawOutput: DIFF_UNAVAILABLE_REASON,
+          readOnlyVerified:
+            before === request.candidateHeadSha && afterMissing === request.candidateHeadSha,
+          result: 'unknown',
+          findings: [],
+          completedAtIso: new Date().toISOString(),
+        };
       }
-      embeddedDiff = diff;
-      diffUnavailable = diff === null;
+      // A thrown read is a missing diff: classify the read result uniformly.
+      let read: string | null = null;
+      try {
+        read = await options.readDiff(options.baseCommit, request.candidateHeadSha);
+      } catch {
+        read = null;
+      }
+      const embedding = classifyDiffForEmbedding(read);
+      if (embedding.kind === 'refused') {
+        // F68: a review that cannot see the change is never a pass. The
+        // transport refuses here instead of sending a review that could pass
+        // without the diff. `unknown` is the outcome the callers treat as
+        // not-accepted, and the fixed reason travels as the raw output.
+        const after = await options.readHead(dir);
+        return {
+          rawOutput: embedding.reason,
+          readOnlyVerified: before === request.candidateHeadSha && after === request.candidateHeadSha,
+          result: 'unknown',
+          findings: [],
+          completedAtIso: new Date().toISOString(),
+        };
+      }
+      embeddedDiff = embedding.diff;
     }
-    const prompt = buildReviewPrompt(request, nonce, embeddedDiff, diffUnavailable);
+    const prompt = buildReviewPrompt(request, nonce, embeddedDiff);
     const argv: string[] = [
       '--dir',
       dir,
@@ -884,26 +1356,49 @@ export function createOcmReviewTransport(
       'json',
       prompt,
     ];
-    const env = buildReviewerEnv(options);
-
-    // 5. Spawn runner process; non-zero or null exit throws
+    // 6. Spawn runner process; non-zero or null exit throws
     const spawnFn = options.spawn ?? defaultSpawn;
-    const spawnResult = await spawnFn(options.ocmRunBin, argv, env, {
-      timeoutMs: options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
-    });
-    if (spawnResult.exitCode !== 0) {
+    let spawnResult: OcmReviewTransportSpawnResult;
+    try {
+      spawnResult = await spawnFn(options.ocmRunBin, argv, reviewEnv, {
+        timeoutMs,
+      });
+    } catch (error) {
+      // Every throw from the review spawn is classified: a timeout shape is a
+      // `timeout`, anything else a `transport` failure. A typed
+      // ReviewTransportError thrown by the spawn does not travel as-is — its
+      // message could expose a secret or a path, and its code would bypass the
+      // thrown-spawn classification; the fixed message travels instead.
       throw new ReviewTransportError(
-        `reviewer process failed with exit code ${String(spawnResult.exitCode)}: ${spawnResult.stderr || spawnResult.stdout}`,
-        'transport-failed',
+        'reviewer process failed',
+        isTimeoutError(error) ? 'timeout' : 'transport',
+        transportFailureDiagnostic(error),
+      );
+    }
+    const spawnExitCode = safeRead(() => spawnResult.exitCode);
+    if (spawnExitCode !== 0) {
+      const timedOut = spawnTimedOut(spawnResult);
+      const diagnostic = spawnDiagnosticOf(spawnResult);
+      if (spawnExitCode === 75 && !timedOut) {
+        // RV4: an exit 75 from the review spawn that is not a timeout means the
+        // worktree is busy too. The fixed message carries no stderr and no path.
+        throw new ReviewTransportError('review seat busy', 'seat-busy', diagnostic);
+      }
+      throw new ReviewTransportError(
+        `reviewer process failed with exit code ${String(spawnExitCode)}`,
+        timedOut ? 'timeout' : 'transport',
+        diagnostic,
       );
     }
 
-    // 6. Parse stdout JSON lines for text and tool parts
+    // 7. Parse stdout JSON lines for text and tool parts
+    // A missing or non-string stdout reads as empty; the parse loop never throws.
+    const spawnStdout = safeRead(() => spawnResult.stdout);
     let readOnlyVoided = false;
     let hasStepStart = false;
     const textParts: string[] = [];
     const toolNames: string[] = [];
-    for (const rawLine of spawnResult.stdout.split(/\r?\n/)) {
+    for (const rawLine of (typeof spawnStdout === 'string' ? spawnStdout : '').split(/\r?\n/)) {
       const line = rawLine.trim();
       if (line === '') continue;
       let parsed: unknown;
@@ -943,17 +1438,11 @@ export function createOcmReviewTransport(
           readOnlyVoided = true;
         } else {
           toolNames.push(toolName);
-          if (READ_ONLY_REVIEW_TOOLS.has(toolName)) {
-            // already read-only proof
-          } else if (toolName === 'bash' || toolName === 'shell') {
-            // The lane server's reviewer agent denies bash except a read-only
-            // command list, so a strictly read-only command is proof by
-            // design; anything else (or no readable command) voids.
-            const command = extractShellCommand(parsed);
-            if (command === null || !isReadOnlyReviewCommand(command)) {
-              readOnlyVoided = true;
-            }
-          } else {
+          // F68: the prompt voids any shell call whatever the command, so no
+          // command is read: the four read-only tools keep the proof and every
+          // other tool (bash and shell included, `git status` included, an
+          // unreadable command included) voids it.
+          if (!READ_ONLY_REVIEW_TOOLS.has(toolName)) {
             readOnlyVoided = true;
           }
         }
@@ -965,7 +1454,7 @@ export function createOcmReviewTransport(
       }
     }
 
-    // 7. Verify head after review and compute readOnlyVerified
+    // 8. Verify head after review and compute readOnlyVerified
     const after = await options.readHead(dir);
     const readOnlyVerified =
       !readOnlyVoided &&
@@ -973,15 +1462,14 @@ export function createOcmReviewTransport(
       before === request.candidateHeadSha &&
       after === request.candidateHeadSha;
 
-    // 8. Parse verdict, findings, and rawOutput
+    // 9. Parse verdict, findings, and rawOutput
     // Each text part is a whole message part; a part that does not end in a newline must not glue its last line onto the next part's first.
     const finalText = textParts.join('\n');
-    const lastText = textParts.at(-1) ?? '';
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.
-    const { result, findings } =
+    const { result, findings, unknownReason } =
       request.kind !== undefined
-        ? parseReviewReplyStrict(finalText, lastText)
-        : parseReviewReply(finalText, lastText);
+        ? parseReviewReplyStrict(finalText)
+        : parseReviewReply(finalText);
 
     const rawOutput =
       finalText.length > MAX_RAW_OUTPUT_LENGTH ? finalText.slice(-MAX_RAW_OUTPUT_LENGTH) : finalText;
@@ -992,6 +1480,7 @@ export function createOcmReviewTransport(
       result,
       findings,
       completedAtIso: new Date().toISOString(),
+      ...(unknownReason !== undefined ? { unknownReason } : {}),
     };
   };
 }

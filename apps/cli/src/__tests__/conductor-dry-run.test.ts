@@ -473,20 +473,22 @@ describe('conductor run --dry-run (K7-8)', () => {
     expect(result.code).toBe(0);
     const would = wouldLines(result.stdout);
     expect(would.map((line) => line.would)).toEqual([
-      'dispatch', 'collect', 'gate', 'brief-check', 'code-review', 'accept', 'open-pr', 'premerge', 'merge',
+      'dispatch', 'collect', 'gate', 'brief-check', 'code-review', 'accept', 'open-pr', 'premerge', 'merge-enqueue',
     ]);
     expect(would[0]).toMatchObject({ key: `${RUN_ID}/r0/dispatch/0/a1`, result: 'completed', reasonCode: 'dispatch-started' });
-    expect(would[1]).toMatchObject({ key: `${RUN_ID}/r0/collect/0`, result: 'completed', reasonCode: 'collected' });
+    expect(would[1]).toMatchObject({ key: `${RUN_ID}/r0/collect/0/a1`, result: 'completed', reasonCode: 'collected' });
     expect(would[2]).toMatchObject({ key: `${RUN_ID}/r0/gate/0@dddddddddddd`, result: 'completed', reasonCode: 'gate-passed' });
     expect(would[3]).toMatchObject({ key: `${RUN_ID}/r0/brief-check/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });
     expect(would[4]).toMatchObject({ key: `${RUN_ID}/r0/code-review/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });
     // K6-8: the seeded run then accepts the head, opens the PR through the
-    // conductor grant, posts the premerge success (the merge hold) and merges
-    // it through the auto-merge fake.
+    // conductor grant, posts the premerge success (the merge hold) and hands it
+    // to the merge queue fake.
     expect(would[5]).toMatchObject({ key: `${RUN_ID}/r0/accept/0@dddddddddddd`, result: 'completed', reasonCode: 'accepted' });
     expect(would[6]).toMatchObject({ key: `${RUN_ID}/r0/open-pr/0@dddddddddddd`, result: 'completed', reasonCode: 'pr-opened' });
     expect(would[7]).toMatchObject({ key: `${RUN_ID}/r0/premerge@dddddddddddd`, result: 'completed', reasonCode: 'premerge-success' });
-    expect(would[8]).toMatchObject({ key: `${RUN_ID}/r0/merge/0@dddddddddddd`, result: 'completed', reasonCode: 'merged' });
+    // KS7b: the hand-off is two-way. The dry-run queue merges at once and the
+    // forge then reads the PR merged, so the run ends with the intent still open.
+    expect(would[8]).toMatchObject({ would: 'merge-enqueue', key: `${RUN_ID}/r0/merge-enqueue@dddddddddddd`, result: null, reasonCode: null });
     // The entered states the driver would enter, in order: dispatch, run,
     // collect, gate, both reviews, then the K6 acceptance → PR → CI → merge
     // window, all the way to merged.
@@ -521,22 +523,28 @@ describe('conductor run --dry-run (K7-8)', () => {
     // accepted, the PR opened, the run merged.
     const acted = allSteps.filter((step) => step.outcome === 'acted');
     expect(acted.map((step) => step.step)).toEqual(
-      expect.arrayContaining(['accept', 'open-pr', 'premerge', 'merge']),
+      expect.arrayContaining(['accept', 'open-pr', 'premerge']),
     );
     expect(acted.map((step) => step.reasonCode)).toEqual(
-      expect.arrayContaining(['accepted', 'pr-opened', 'premerge-success', 'merged']),
+      expect.arrayContaining(['accepted', 'pr-opened', 'premerge-success']),
     );
+    // KS7b: the merge hand-off waits on the queue (no result), then the forge
+    // reads the PR merged and the run ends.
+    expect(allSteps.some((step) => step.outcome === 'waiting' && step.reason === 'merge-train')).toBe(true);
 
-    // Each review opened the evidence assessment and then issued its request,
-    // in that order, under a minted request id the act journalled first.
+    // Each review first inspects the worktree through the runner (RV4), then
+    // opens the evidence assessment and issues its request, under a minted
+    // request id the act journalled first.
     const fakes = capturedFakes.current as DryRunFakes | null;
     expect(fakes).not.toBeNull();
     const calls = fakes!.recorder.calls;
     const ports = calls.map((call) => call.port);
     const gateIndex = ports.indexOf('gate');
-    expect(ports.slice(gateIndex + 1, gateIndex + 5)).toEqual([
+    expect(ports.slice(gateIndex + 1, gateIndex + 7)).toEqual([
+      'runnerForAttempt',
       'reviewAssessment',
       'reviewRequest',
+      'runnerForAttempt',
       'reviewAssessment',
       'reviewRequest',
     ]);
@@ -554,6 +562,8 @@ describe('conductor run --dry-run (K7-8)', () => {
     expect(ports.slice(ports.lastIndexOf('reviewRequest') + 1)).toEqual([
       'acceptanceAssessment',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+      // RV3: open-pr reads the pre-merge receipt to carry its minors into Challenge this.
+      'findLatestReceiptOfKind',
       'acceptanceAssessment',
       'conductorForgeGrant', 'executeForgeAction',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',
@@ -563,7 +573,7 @@ describe('conductor run --dry-run (K7-8)', () => {
       'acceptanceAssessment',
       'conductorForgeGrant', 'executeForgeAction',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',
-      'autoMergeAttempt',
+      'enqueueMerge',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',
     ]);
 

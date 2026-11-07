@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import { LaneRun } from '../entities/LaneRun.js';
 import { LANE_RUN_MAX_PARK_ORDINAL } from '../lane-run-keys.js';
-import { LANE_RUN_PARK_REASONS } from '../lane-run-records.js';
+import { LANE_RUN_PARK_REASONS, LANE_RUN_SCHEMA_VERSION } from '../lane-run-records.js';
+import { readLaneRunRecord } from '../entities/LaneRun.js';
+import type { LaneRunParkFindingView } from '../park-findings-view.js';
 import {
   LANE_RUN_RESUMABLE_STATES,
   LANE_RUN_STATES,
@@ -25,6 +27,14 @@ const VALID_PARKED = {
   qualifier: 'dispatch',
   parkedFrom: 'running',
   questionId: null,
+};
+
+const VALID_FINDING = {
+  findingId: 'finding-1',
+  severity: 'blocker',
+  summary: 'a bounded summary',
+  filePath: 'src/a.ts',
+  line: 3,
 };
 
 const VALID_LEASE = { holderId: 'lease-example-1', fence: 1, leaseUntilIso: '2026-10-27T10:00:00Z' };
@@ -130,12 +140,58 @@ describe('LaneRun.create', () => {
     if (!result.success) return;
     expect(result.value.toRecord()).toEqual(withBase);
 
-    // baseBranch also round-trips on a record that has no branchName at all.
+    // baseBranch also round-trips on a record that has no branchName at all (CB1),
+    // and schemaVersion stays absent when the key is absent (Q5a).
     const legacyWithBase = { ...VALID, baseBranch: 'chain/example' };
     const legacy = LaneRun.create(legacyWithBase);
     expect(legacy.success).toBe(true);
     if (!legacy.success) return;
     expect(legacy.value.toRecord()).toEqual(legacyWithBase);
+    expect(Object.hasOwn(legacy.value.toRecord(), 'schemaVersion')).toBe(false);
+  });
+
+  it('round-trips an explicit schemaVersion 1 and refuses schemaVersion 2 by default (Q5a)', () => {
+    const withSchema = { ...VALID, schemaVersion: 1 };
+    const result = LaneRun.create(withSchema);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.toRecord()).toEqual(withSchema);
+
+    const refused = LaneRun.create({ ...VALID, schemaVersion: 2 });
+    expect(refused.success).toBe(false);
+    if (refused.success) return;
+    expect(refused.error.message).toBe('LaneRun schemaVersion is not supported');
+  });
+
+  it('refuses a future schemaVersion with the schema message before the unknown-key check (Q5a)', () => {
+    const result = LaneRun.create({ ...VALID, schemaVersion: 99, unknownFutureField: 'x' });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.message).toBe('LaneRun schemaVersion is not supported');
+  });
+
+  it('refuses a hostile schemaVersion key shape with the schema message (Q5a)', () => {
+    // An enumerable getter is never run: the descriptor's read value is undefined,
+    // but the key is present, so the schema read refuses the shape before any
+    // field check.
+    const getterRecord: Record<string, unknown> = { ...VALID };
+    Object.defineProperty(getterRecord, 'schemaVersion', {
+      get() {
+        throw new Error('the reader must never run an accessor');
+      },
+      enumerable: true,
+    });
+    const inputs: unknown[] = [
+      { ...VALID, schemaVersion: undefined },
+      { ...VALID, schemaVersion: null },
+      getterRecord,
+    ];
+    for (const input of inputs) {
+      const result = LaneRun.create(input);
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.error.message).toBe('LaneRun schemaVersion is not supported');
+    }
   });
 
   it.each(['release', null])('refuses %j as baseBranch with the fixed message (CB1)', (baseBranch) => {
@@ -215,9 +271,78 @@ describe('LaneRun.create', () => {
     expect(second.cursors).toEqual({ 'first-pass': 0, fix: null, review: null });
   });
 
+  it('stores a deep copy of parked findings and entries so mutating input leaves stored findings unchanged', () => {
+    const inputFinding = {
+      findingId: 'finding-1',
+      severity: 'blocker' as LaneRunParkFindingView['severity'],
+      summary: 'clean and bounded summary',
+      filePath: 'src/a.ts',
+      line: 12,
+    };
+    const inputFindings: LaneRunParkFindingView[] = [inputFinding];
+    const created = LaneRun.create({
+      ...VALID,
+      parked: {
+        reason: 'blocker-after-round-2',
+        qualifier: null,
+        parkedFrom: 'gating',
+        questionId: null,
+        findings: inputFindings,
+      },
+      parkCount: 1,
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    inputFindings.push({
+      findingId: 'finding-2',
+      severity: 'major',
+      summary: 'second finding',
+      filePath: 'src/b.ts',
+      line: 20,
+    });
+    inputFinding.summary += '\u2028';
+
+    const stored = created.value.toRecord();
+    expect(stored.parked?.findings).toEqual([
+      {
+        findingId: 'finding-1',
+        severity: 'blocker',
+        summary: 'clean and bounded summary',
+        filePath: 'src/a.ts',
+        line: 12,
+      },
+    ]);
+    expect(created.value.getParked()?.findings).toEqual([
+      {
+        findingId: 'finding-1',
+        severity: 'blocker',
+        summary: 'clean and bounded summary',
+        filePath: 'src/a.ts',
+        line: 12,
+      },
+    ]);
+    expect(Object.isFrozen(stored.parked?.findings?.[0])).toBe(true);
+    expect(Object.isFrozen(created.value.getParked()?.findings?.[0])).toBe(true);
+  });
+
   it.each([
     [{ ...VALID, parkCount: LANE_RUN_MAX_PARK_ORDINAL }],
     [{ ...VALID, parked: { ...VALID_PARKED, questionId: 'question-example-1' }, parkCount: 1 }],
+    [
+      {
+        ...VALID,
+        parked: { ...VALID_PARKED, findings: null },
+        parkCount: 1,
+      },
+    ],
+    [
+      {
+        ...VALID,
+        parked: { ...VALID_PARKED, findings: [VALID_FINDING, { ...VALID_FINDING, findingId: 'finding-2' }] },
+        parkCount: 1,
+      },
+    ],
   ])('accepts valid boundary record %j', (input) => {
     const result = LaneRun.create(input);
     expect(result.success).toBe(true);
@@ -307,6 +432,62 @@ describe('LaneRun.create', () => {
     ],
     [{ ...VALID, revision: 0 }, 'LaneRun revision must be a positive integer'],
     [{ ...VALID, runPolicyRevision: '  ' }, 'LaneRun runPolicyRevision must be a non-empty id of at most 256 bytes'],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: 'nope' }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      {
+        ...VALID,
+        parked: { ...VALID_PARKED, findings: [VALID_FINDING, VALID_FINDING, VALID_FINDING, VALID_FINDING, VALID_FINDING, VALID_FINDING] },
+        parkCount: 1,
+      },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, findingId: 'bad/id' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, findingId: 'f'.repeat(129) }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, summary: 's'.repeat(161) }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, summary: fakeSecretShape() }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, summary: 'bad\u180E' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, filePath: '/etc/passwd' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, filePath: '../outside.ts' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, filePath: 'src\\a.ts' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, severity: 'critical' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, line: -1 }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, extra: true }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
   ])('refuses with the fixed message %j', (input, message) => {
     const result = LaneRun.create(input);
     expect(result.success).toBe(false);
@@ -386,6 +567,123 @@ describe('LaneRun.create', () => {
       if (result.success) return;
       expect(result.error.message).not.toContain('boom');
     }
+  });
+});
+
+describe('readLaneRunRecord', () => {
+  it('stamps schemaVersion 1 on a record that omits the key', () => {
+    const read = readLaneRunRecord(VALID);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.record.version).toBe(1);
+    expect(Object.hasOwn(read.record, 'schemaVersion')).toBe(true);
+    expect(read.record.schemaVersion).toBe(1);
+    expect(LANE_RUN_SCHEMA_VERSION).toBe(1);
+  });
+
+  it('round-trips every field through the versioned reader', () => {
+    const read = readLaneRunRecord(VALID);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    const { schemaVersion, ...rest } = read.record;
+    expect(schemaVersion).toBe(1);
+    expect(rest).toEqual(VALID);
+  });
+
+  it('accepts schemaVersion 2 under { currentVersion: 2 } on a version 1 record', () => {
+    const read = readLaneRunRecord({ ...VALID, schemaVersion: 2 }, { currentVersion: 2 });
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.record.version).toBe(1);
+    expect(read.record.schemaVersion).toBe(2);
+  });
+
+  it('refuses an aggregate version 2 as malformed even with an accepted schemaVersion', () => {
+    const read = readLaneRunRecord({ ...VALID, version: 2, schemaVersion: 2 }, { currentVersion: 2 });
+    expect(read).toEqual({ ok: false, reason: 'malformed' });
+    const created = LaneRun.create({ ...VALID, version: 2 });
+    expect(created.success).toBe(false);
+    if (created.success) return;
+    expect(created.error.message).toBe('LaneRun version must be 1');
+  });
+
+  it('reads the accepted window under { currentVersion: 3 }', () => {
+    expect(readLaneRunRecord({ ...VALID, schemaVersion: 2 }, { currentVersion: 3 })).toEqual({
+      ok: true,
+      record: { ...VALID, schemaVersion: 2 },
+    });
+    expect(readLaneRunRecord({ ...VALID, schemaVersion: 3 }, { currentVersion: 3 })).toEqual({
+      ok: true,
+      record: { ...VALID, schemaVersion: 3 },
+    });
+    expect(readLaneRunRecord(VALID, { currentVersion: 3 })).toEqual({ ok: false, reason: 'unknown-schema-version' });
+    expect(readLaneRunRecord({ ...VALID, schemaVersion: 1 }, { currentVersion: 3 })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+    expect(readLaneRunRecord({ ...VALID, schemaVersion: 4 }, { currentVersion: 3 })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+  });
+
+  it('stores the cursors snapshot that was validated, never a second read (fix round 1)', () => {
+    // A proxy whose getOwnPropertyDescriptor answers the valid snapshot on the
+    // first read (one call per role: first-pass, fix, review) and an invalid
+    // one (review: 1000) on any later read. The stored record must carry the
+    // validated values; if the body ever re-read recordInput.cursors, the
+    // second snapshot's 1000 would leak into the record.
+    const validCursors = { 'first-pass': 0, fix: null, review: null };
+    const secondReadCursors = { 'first-pass': 0, fix: null, review: 1000 };
+    let descriptorCalls = 0;
+    const cursorsProxy = new Proxy(
+      {},
+      {
+        ownKeys() {
+          return ['first-pass', 'fix', 'review'];
+        },
+        getOwnPropertyDescriptor(_target, key) {
+          descriptorCalls += 1;
+          const snapshot = descriptorCalls <= 3 ? validCursors : secondReadCursors;
+          return { configurable: true, enumerable: true, writable: true, value: Reflect.get(snapshot, key) };
+        },
+      },
+    );
+    const read = readLaneRunRecord({ ...VALID, cursors: cursorsProxy });
+    expect(descriptorCalls).toBeGreaterThanOrEqual(3);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.record.cursors).toEqual(validCursors);
+  });
+
+  it('never throws on hostile input and never echoes a refused value', () => {
+    const getterRecord: Record<string, unknown> = { ...VALID };
+    Object.defineProperty(getterRecord, 'version', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    const throwingProxy = new Proxy({ ...VALID }, {
+      ownKeys() {
+        throw new Error('boom');
+      },
+    });
+    const inputs: unknown[] = [getterRecord, throwingProxy, null, [], 'x', 42, new Date()];
+    for (const input of inputs) {
+      const read = readLaneRunRecord(input);
+      expect(read.ok).toBe(false);
+      if (read.ok) return;
+      expect(['malformed', 'unknown-schema-version']).toContain(read.reason);
+    }
+  });
+
+  it('keeps the secret-shaped field message and never echoes the value', () => {
+    const result = LaneRun.create({ ...VALID, workOrderId: `gh${'p_'}${'A'.repeat(30)}` });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.message).toBe('LaneRun workOrderId contains a secret-shaped value and was refused');
+    expect(result.error.message).not.toContain(fakeSecretShape());
   });
 });
 

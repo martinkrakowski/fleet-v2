@@ -1,0 +1,628 @@
+[
+  {
+    "method": "GET",
+    "path": "/v1/attempts",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/attempts/[id]",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/attempts/[id]/acceptance",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/attempts/[id]/artifacts",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/attempts/[id]/cancel-prepared",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/attempts/[id]/fix",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/attempts/[id]/journal",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/attempts/[id]/notes",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/attempts/[id]/reconcile",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/attempts/[id]/stop",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/attention",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/authorizations/[id]/consume",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/authorizations/resolve",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/briefs/preview",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/capabilities",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/changes",
+    "envelope": "stream"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/coordination",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/decisions",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/findings/[id]/disposition",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/forge",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/heads/[sha]/assessment",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/heads/[sha]/evidence",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/knowledge/[id]/disposition",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/knowledge/[id]/publish",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/knowledge/[id]/reuse",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/knowledge/[id]/supersede",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/knowledge/checks",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/knowledge/proposals",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/knowledge/selections",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/observations",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/owner-items/[id]/resolution",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/orchestrators",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/orchestrators",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/orchestrators/[id]/heartbeat",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/orchestrators/[id]/retire",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/projects",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/projects",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/projects/[id]",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "PATCH",
+    "path": "/v1/projects/[id]",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/projects/[id]/probe",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/projects/[id]/retire",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/projects/unregistered",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/questions",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/questions",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/questions/[id]",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/questions/[id]/acknowledgement",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/questions/[id]/answers",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/questions/expire",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/questions/sync",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/relays",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/relays/[id]/acknowledgement",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/reviews",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/reviews/[id]/receipt",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/runs",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/runs/[id]",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/runs/[id]/journal",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/runs/[id]/stop",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/runs/halt",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/runs/journal",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/runs/passes",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/snapshots",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/snapshots/[section]",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/telemetry/status",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/threads/[id]/permissions",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/threads/[id]/permissions",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/threads/[id]/permissions/[requestId]/verdict",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/verifications",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/verifications/[id]/receipt",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/work-orders",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "GET",
+    "path": "/v1/work-orders/[id]",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  }
+]

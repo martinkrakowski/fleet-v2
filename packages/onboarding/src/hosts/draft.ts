@@ -298,11 +298,46 @@ export type ApplyHostDraftResult =
 export type ApplyHostDraftMode = 'add' | 'edit';
 
 /**
+ * In `edit` mode carry the contract fields the draft does not manage over to
+ * the drafted entry: `container`, `roleAliases` and `runner.tunnelOffset`.
+ * Every other field is the draft's: one the draft omits is dropped, so an
+ * edit that moves a host to `local` does not keep the old `sshAlias`. A role
+ * alias survives only while the drafted host is an ssh host that still holds
+ * that role, and a tunnel offset only while the drafted host has a runner.
+ * In `add` mode there is no existing entry, so nothing is carried.
+ */
+function mergeDraftedHost(
+  existing: HostSection,
+  drafted: HostSection,
+): HostSection {
+  const aliases: Partial<Record<HostRole, string>> = {};
+  if (drafted.transport === 'ssh' && existing.roleAliases !== undefined) {
+    for (const role of drafted.roles) {
+      const alias = existing.roleAliases[role];
+      if (alias !== undefined) {
+        aliases[role] = alias;
+      }
+    }
+  }
+  const tunnelOffset = existing.runner?.tunnelOffset;
+  return {
+    ...drafted,
+    ...(existing.container !== undefined ? { container: existing.container } : {}),
+    ...(Object.keys(aliases).length > 0 ? { roleAliases: aliases } : {}),
+    ...(drafted.runner !== undefined && tunnelOffset !== undefined
+      ? { runner: { ...drafted.runner, tunnelOffset } }
+      : {}),
+  };
+}
+
+/**
  * Apply one draft to a copy of the current installation value and return the
  * candidate file. The current value is never mutated: the candidate is a new
  * object whose `hosts` record is the current one plus the drafted entry. In
  * `add` mode a name already in the file is refused with `reason: "exists"`;
- * in `edit` mode a name that is not there is refused with `reason: "missing"`.
+ * in `edit` mode a name that is not there is refused with `reason: "missing"`
+ * and the contract fields the draft does not manage survive from the existing
+ * entry.
  * A file of schema version 1 carries no hosts and converting one is a mapping
  * step of its own (the conversion forces the isolation acknowledgement), so
  * it is refused here rather than half-done.
@@ -343,6 +378,15 @@ export function applyHostDraft(
   }
   return {
     ok: true,
-    candidate: { ...base, hosts: { ...base.hosts, [draft.name]: draft.host } },
+    candidate: {
+      ...base,
+      hosts: {
+        ...base.hosts,
+        [draft.name]:
+          mode === 'edit'
+            ? mergeDraftedHost(base.hosts[draft.name], draft.host)
+            : draft.host,
+      },
+    },
   };
 }

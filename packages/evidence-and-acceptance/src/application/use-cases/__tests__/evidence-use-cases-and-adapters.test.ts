@@ -25,7 +25,11 @@ import type {
   IndependentReviewPort,
   RunIndependentReviewRequest,
 } from '../../ports/out/IndependentReviewPort.out-port.js';
-import type { VerificationExecutorPort } from '../../ports/out/VerificationExecutorPort.out-port.js';
+import type {
+  ExecuteVerificationCheckReceipt,
+  ExecuteVerificationCheckResult,
+  VerificationExecutorPort,
+} from '../../ports/out/VerificationExecutorPort.out-port.js';
 import type {
   AssessHeadAcceptanceRequest,
   AssessHeadAcceptanceResult,
@@ -1176,7 +1180,7 @@ describe('AssessHeadAcceptanceUseCase', () => {
       throw new Error('expected a blocked assessment');
     }
     expect(result.blockers).toEqual([
-      "review by 'openrouter/poolside/laguna-s-2.1' failed for this head (receipt 'rr-1')",
+      "review by 'openrouter/poolside/laguna-s-2.1' failed for this head with no findings (unparseable-verdict, receipt 'rr-1')",
     ]);
   });
 
@@ -1194,7 +1198,10 @@ describe('AssessHeadAcceptanceUseCase', () => {
     if (blocked.outcome !== 'blocked') {
       throw new Error('expected a blocked assessment');
     }
-    expect(blocked.blockers).toEqual(["finding 'f-1' is unresolved"]);
+    expect(blocked.blockers).toEqual([
+      "review by 'openrouter/poolside/laguna-s-2.1' failed for this head (receipt 'rr-1')",
+      "finding 'f-1' is unresolved",
+    ]);
 
     const dispositionUseCase = new RecordFindingDispositionUseCase({ repo });
     await dispositionUseCase.recordFindingDisposition({
@@ -1236,7 +1243,10 @@ describe('AssessHeadAcceptanceUseCase', () => {
     if (result.outcome !== 'blocked') {
       throw new Error('expected a blocked assessment');
     }
-    expect(result.blockers).toEqual(["finding 'f-2' is unresolved"]);
+    expect(result.blockers).toEqual([
+      "review by 'openrouter/poolside/laguna-s-2.1' failed for this head (receipt 'rr-1')",
+      "finding 'f-2' is unresolved",
+    ]);
   });
 
   it('blocks while forge CI has not passed', async () => {
@@ -1477,6 +1487,15 @@ describe('EvidenceArchiveAdapter', () => {
   });
 });
 
+function assertCompleted(
+  result: ExecuteVerificationCheckResult,
+): asserts result is ExecuteVerificationCheckReceipt {
+  expect(result.outcome).toBe('completed');
+  if (result.outcome !== 'completed') {
+    throw new Error(`expected completed check, got ${result.outcome}`);
+  }
+}
+
 describe('VerificationExecutorAdapter', () => {
   it('delegates to the configured check transport', async () => {
     const adapter = new VerificationExecutorAdapter({
@@ -1513,6 +1532,7 @@ describe('VerificationExecutorAdapter', () => {
       procedureName: 'unit-tests',
     });
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.exitCode).toBeNull();
     expect(result.outputSummary).toContain('no allow-listed verification command');
@@ -1539,9 +1559,11 @@ describe('VerificationExecutorAdapter', () => {
       procedureName: 'unit-tests',
     });
 
+    assertCompleted(passed);
     expect(passed.result).toBe('pass');
     expect(passed.exitCode).toBe(0);
     expect(passed.outputSummary).toContain('all good');
+    assertCompleted(failed);
     expect(failed.result).toBe('fail');
     expect(failed.exitCode).toBe(2);
     expect(failed.outputSummary).toContain('boom');
@@ -1707,7 +1729,8 @@ describe('IndependentReviewAdapter', () => {
     expect(failing).toEqual({
       outcome: 'unavailable',
       reason: 'reviewer seat timed out',
-      code: 'transport-failed',
+      code: 'timeout',
+      diagnostic: { exitCode: null, timedOut: true, stderr: 'Error: spawn threw', stdoutEmpty: null },
     });
   });
 

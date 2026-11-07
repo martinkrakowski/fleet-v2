@@ -167,6 +167,25 @@ describe('ListLaneRunsUseCase (VZ2)', () => {
     });
   });
 
+  it('rejects extra keys and throwing getters on ListLaneRunsRequest without throwing', async () => {
+    const { useCase } = makeHarness();
+    await expect(useCase.listLaneRuns({ nowIso: NOW, extra: 'x' } as never)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'invalid-request',
+    });
+    const hostile = { nowIso: NOW };
+    Object.defineProperty(hostile, 'nowIso', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    await expect(useCase.listLaneRuns(hostile as never)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'invalid-request',
+    });
+  });
+
   it('lists only the live run with its slot, package keys and admission', async () => {
     const h = makeHarness();
     await h.laneRunRepository.create(runRecord());

@@ -1,20 +1,56 @@
 /** The `act prepare` and `act dispatch` steps of AdvanceLaneRunUseCase (AL-1). */
-import type { AdvanceLaneRunRefusal, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import type { DispatchAttemptResult } from '../../ports/in/DispatchAttemptPort.in-port.js';
 import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
-import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
+import {
+  DEFAULT_DISPATCH_STAGGER_MS,
+  dispatchEndpointFactsOf,
+  dispatchEndpointKey,
+} from '../../../domain/dispatch-stagger.js';
+import type { LaneRunDecision, LaneRunFacts } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunCursorsRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { implementerRoleFor } from '../../../domain/lane-run-transitions.js';
-import { seatMatchesAssignment, seatSelectionRecord } from '../../../domain/seat-selection.js';
-import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
+import { seatMatchesAssignment, seatSelectionRecord, pickNextSeat, seatOutcomeOfStopReason } from '../../../domain/seat-selection.js';
+import type { SeatFailureOutcome, NextSeatResult } from '../../../domain/seat-selection.js';
+import type { SeatPlanRole } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
+import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
+import { parseStopReason, MODEL_REFUSAL_CLASSES } from '../../../domain/value-objects/StopReason.vo.js';
 import { conductedRunnerOf } from './conducted-host.js';
-import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, saveOrRefuse } from './step-context.js';
+import type { AdvanceStepContext, AdvanceStepRefusal, GatheredLaneRunFacts } from './step-context.js';
+import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, refusedResult, saveOrRefuse } from './step-context.js';
 import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { performFixPrepare } from './review-fix.js';
 import { parkSpentOneWayKey } from './merge.js';
+import { isDirtyWorktreeDetail, lastDispatchLeftDirtyWorktree } from './dirty-handover.js';
+
+function latestAttemptRecordOf(gathered: GatheredLaneRunFacts): AttemptRecord | null {
+  for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
+    const candidate = gathered.attemptRecords[index];
+    if (candidate !== null) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function reconcilePendingRecoveryOrPark(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  source: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+  state: LaneRunStateValue,
+): Promise<AdvanceLaneRunResult | null> {
+  if (await hasIncompleteWorktreeRecovery(ctx, source.id)) {
+    const reconciled = await reconcileCancelledWorktreeRecovery(ctx, record, source, request);
+    if (!reconciled) {
+      return performPark(ctx, record, 'step-refused', 'prepare', state, request);
+    }
+  }
+  return null;
+}
 
 /**
  * The `act prepare` decision (K4-5): a fresh round-0 attempt on the selected
@@ -35,31 +71,40 @@ export async function performPrepare(ctx: AdvanceStepContext,
     return ceiling;
   }
   const nowIso = request.nowIso;
-  const refuse = async (reasonCode: LaneRunResultReasonCode): Promise<AdvanceLaneRunResult> => {
+  const refuse = async (reasonCode: LaneRunResultReasonCode, detail?: string | null): Promise<AdvanceLaneRunResult> => {
     const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
     if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
+      return refusedResult(intentRefusal);
     }
-    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode);
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode, detail ?? null);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+    return {
+      outcome: 'acted',
+      step: decision.step,
+      key: decision.key,
+      result: 'refused',
+      reasonCode,
+      ...(detail ? { detail } : {}),
+    };
   };
 
-  if (decision.round !== 0) {
-    return performFixPrepare(ctx, record, gathered, decision, request, refuse);
-  }
-  let source: AttemptRecord | null = null;
-  for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
-    const candidate = gathered.attemptRecords[index];
-    if (candidate !== null) {
-      source = candidate;
-      break;
-    }
-  }
+  const source = latestAttemptRecordOf(gathered);
   if (source === null) {
     return refuse('no-frozen-brief');
+  }
+  // GB3: the source attempt may carry an incomplete worktree recovery — a
+  // crash after the recovery's cancel but before its completing journal entry
+  // leaves the attempt `cancelled` with the intent still open. Reconcile the
+  // recovery before another seat is prepared; an unreconcilable recovery
+  // parks instead of advancing over unfinished side effects.
+  const recoveryPark = await reconcilePendingRecoveryOrPark(ctx, record, source, request, gathered.facts.state);
+  if (recoveryPark !== null) {
+    return recoveryPark;
+  }
+  if (decision.round !== 0) {
+    return performFixPrepare(ctx, record, gathered, decision, request, refuse);
   }
   const planResult = SeatPlan.create(source.seatPlan);
   const seat =
@@ -76,7 +121,7 @@ export async function performPrepare(ctx: AdvanceStepContext,
   const attemptId = 'attempt-' + ctx.deps.newUlid();
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, attemptId);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   // The next attempt keeps the run's host identity (seam register: a conducted
   // attempt always carries its runner host); the session fields stay null and
@@ -123,7 +168,7 @@ export async function performPrepare(ctx: AdvanceStepContext,
     if (error instanceof AttemptRevisionConflictError) {
       const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'attempt-exists');
       if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
+        return refusedResult(resultRefusal);
       }
       return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'attempt-exists' };
     }
@@ -144,7 +189,7 @@ export async function performPrepare(ctx: AdvanceStepContext,
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', 'prepared');
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'prepared' };
 }
@@ -278,6 +323,344 @@ export function fixSeatForDispatch(
   return { kind: 'seat', seat: selection, ...(overrideVariant !== undefined ? { overrideVariant } : {}) };
 }
 
+function isWorktreePathValid(worktreePath: unknown): worktreePath is string {
+  if (typeof worktreePath !== 'string' || !worktreePath.startsWith('/') || worktreePath === '/' || worktreePath.includes('\0')) {
+    return false;
+  }
+  if (worktreePath.includes('//') || worktreePath.endsWith('/')) {
+    return false;
+  }
+  const segments = worktreePath.split('/');
+  return !segments.includes('.') && !segments.includes('..') && segments.slice(1).every((s) => s !== '');
+}
+
+function isAttemptIdValid(attemptId: unknown): attemptId is string {
+  if (typeof attemptId !== 'string' || attemptId.includes('/') || attemptId.includes('\\') || attemptId.includes('\0') || attemptId.includes('..')) {
+    return false;
+  }
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(attemptId);
+}
+
+/**
+ * GB3: the recorded worktree path and attempt id are untrusted data
+ * (`AttemptRecord` stores both as plain strings), so both are validated before
+ * the deterministic patch path is constructed from them: an absolute, already
+ * normalized worktree path (no `.` or `..` segments, no empty segments beyond
+ * the leading slash, no NUL) and an attempt id that is safe as a file-name
+ * fragment. A refused pair means no patch path is ever built.
+ */
+export function worktreeRecoveryPatchInputsValid(worktreePath: unknown, attemptId: unknown): boolean {
+  return isWorktreePathValid(worktreePath) && isAttemptIdValid(attemptId);
+}
+
+/**
+ * GB3: true when the execution journal holds a durable recovery intent for the
+ * attempt that its completing entry does not close. An incomplete recovery must
+ * never cancel-and-advance: the side effects (preserve, reset, cancel) may be
+ * unfinished, so the run parks instead.
+ */
+async function hasIncompleteWorktreeRecovery(ctx: AdvanceStepContext, attemptId: string): Promise<boolean> {
+  if (ctx.deps.executionJournal.appendJournalEntry === undefined) {
+    return false;
+  }
+  const entries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(attemptId);
+  let sawIntent = false;
+  let sawCompleted = false;
+  for (const entry of entries) {
+    if (entry.action !== 'dispatch' || entry.detail === null || !entry.detail.startsWith('preserved uncommitted edits:')) {
+      continue;
+    }
+    if (entry.status === 'completed') {
+      sawCompleted = true;
+    } else {
+      sawIntent = true;
+    }
+  }
+  return sawIntent && !sawCompleted;
+}
+
+function canAttemptWorktreeRecovery(
+  recovery: AdvanceStepContext['deps']['worktreeRecovery'],
+  cancel: unknown,
+  append: unknown,
+  latest: AttemptRecord,
+): boolean {
+  if (recovery?.preserveWorktreeEdits === undefined || recovery.resetWorktreeToHead === undefined || cancel === undefined || append === undefined) {
+    return false;
+  }
+  if (latest.state !== 'intent-recorded' || latest.worktreePath === null) {
+    return false;
+  }
+  return worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id);
+}
+
+/**
+ * GB3: preserve the refused attempt's uncommitted edits as a patch outside the
+ * worktree, reset the worktree to its head, cancel the never-dispatched
+ * attempt, and journal the patch path. The durable recovery intent — including
+ * the deterministic patch path — is journaled BEFORE any side effect, so the
+ * patch path stays discoverable even when the process crashes mid-recovery; an
+ * earlier intent without its completing entry means a crash left recovery
+ * unfinished, and that run parks instead of re-running destructive steps. True
+ * only when every step succeeded; any failure keeps today's park.
+ */
+async function recoverUncommittedWorktree(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+): Promise<boolean> {
+  const recovery = ctx.deps.worktreeRecovery;
+  const preserveWorktreeEdits = recovery?.preserveWorktreeEdits?.bind(recovery);
+  const resetWorktreeToHead = recovery?.resetWorktreeToHead?.bind(recovery);
+  const cancel = ctx.deps.cancelPreparedAttempt;
+  const append = ctx.deps.executionJournal.appendJournalEntry?.bind(ctx.deps.executionJournal);
+  if (!canAttemptWorktreeRecovery(recovery, cancel, append, latest)) {
+    return false;
+  }
+  const recordedHost = conductedRunnerOf(latest);
+  if (
+    recordedHost === null ||
+    latest.worktreePath === null ||
+    preserveWorktreeEdits === undefined ||
+    resetWorktreeToHead === undefined ||
+    cancel === undefined ||
+    append === undefined
+  ) {
+    return false;
+  }
+  try {
+    const priorEntries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(latest.id);
+    const priorIntent = priorEntries.find(
+      (entry) =>
+        entry.action === 'dispatch' &&
+        entry.detail !== null &&
+        entry.detail.startsWith('preserved uncommitted edits:'),
+    );
+    if (priorIntent !== undefined) {
+      return priorIntent.status === 'completed';
+    }
+    const patchPath = latest.worktreePath + '.' + latest.id + '.patch';
+    await append({
+      id: latest.id + ':dispatch:' + String(priorEntries.length + 1),
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      action: 'dispatch',
+      baseCommit: latest.baseCommit,
+      recordedAtIso: request.nowIso,
+      status: 'intent-recorded',
+      sessionId: null,
+      detail: 'preserved uncommitted edits: ' + patchPath,
+    });
+    const preserved = await preserveWorktreeEdits({ worktreePath: latest.worktreePath, patchPath, recordedHost });
+    if (preserved.outcome !== 'preserved') {
+      return false;
+    }
+    const reset = await resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost });
+    if (reset.outcome !== 'reset') {
+      return false;
+    }
+    const cancelled = await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso: request.nowIso });
+    if (cancelled.outcome !== 'cancelled') {
+      return false;
+    }
+    await append({
+      id: latest.id + ':dispatch:' + String(priorEntries.length + 2),
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      action: 'dispatch',
+      baseCommit: latest.baseCommit,
+      recordedAtIso: request.nowIso,
+      status: 'completed',
+      sessionId: null,
+      detail: 'preserved uncommitted edits: ' + patchPath,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function recoveryInputsValid(
+  recovery: AdvanceStepContext['deps']['worktreeRecovery'],
+  latest: AttemptRecord,
+  append: unknown,
+): boolean {
+  if (recovery?.preserveWorktreeEdits === undefined || recovery.resetWorktreeToHead === undefined || append === undefined) {
+    return false;
+  }
+  if (latest.state !== 'cancelled' || latest.worktreePath === null) {
+    return false;
+  }
+  return worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id);
+}
+
+/**
+ * GB3: reconcile a crashed recovery whose attempt is already `cancelled` —
+ * the crash landed after the cancel but before the recovery's completing
+ * journal entry, so the intent is open while the next advance would otherwise
+ * prepare the next seat over an unreconciled recovery. The preserve and reset
+ * side effects may already have run, so the reconcile does not re-run them
+ * blindly: a `destination-exists` preserve proves the patch survived the
+ * crash and the reset already ran, so the reconcile only closes the intent.
+ */
+async function reconcileCancelledWorktreeRecovery(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+): Promise<boolean> {
+  const recovery = ctx.deps.worktreeRecovery;
+  const preserveWorktreeEdits = recovery?.preserveWorktreeEdits?.bind(recovery);
+  const resetWorktreeToHead = recovery?.resetWorktreeToHead?.bind(recovery);
+  const append = ctx.deps.executionJournal.appendJournalEntry?.bind(ctx.deps.executionJournal);
+  if (!recoveryInputsValid(recovery, latest, append)) {
+    return false;
+  }
+  const recordedHost = conductedRunnerOf(latest);
+  if (
+    recordedHost === null ||
+    latest.worktreePath === null ||
+    recovery === undefined ||
+    preserveWorktreeEdits === undefined ||
+    resetWorktreeToHead === undefined ||
+    append === undefined
+  ) {
+    return false;
+  }
+  const patchPath = latest.worktreePath + '.' + latest.id + '.patch';
+  try {
+    const preserved = await preserveWorktreeEdits(
+      { worktreePath: latest.worktreePath, patchPath, recordedHost },
+    );
+    // A saved patch proves the first recovery reached its reset, because the
+    // cancel only follows a successful reset. Never reset again: anything in the
+    // worktree now is newer than that patch and is in no saved file.
+    const savedEarlier = preserved.outcome === 'refused' && preserved.reason === 'destination-exists';
+    if (!savedEarlier) {
+      if (preserved.outcome !== 'preserved') {
+        return false;
+      }
+      const reset = await resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost });
+      if (reset.outcome !== 'reset') {
+        return false;
+      }
+    }
+    const priorEntries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(latest.id);
+    await append({
+      id: latest.id + ':dispatch:' + String(priorEntries.length + 1),
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      action: 'dispatch',
+      baseCommit: latest.baseCommit,
+      recordedAtIso: request.nowIso,
+      status: 'completed',
+      sessionId: null,
+      detail: 'preserved uncommitted edits: ' + patchPath,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * G11a: the seat-advance detail token of a failed dispatch, or null when no
+ * advance may be recorded (fail closed). The failed turn's own plan, role and
+ * seat index and its stored stop reason decide; the reviewer-family block
+ * uses the installation-configured `sameModelFamily` comparator. A plan the
+ * attempt does not carry, a non-implementer
+ * role, an out-of-plan seat index or a stop reason that maps to no failure
+ * outcome each record nothing — the run keeps its pre-G11a behaviour. An
+ * unbound comparator fails closed: the failure records its outcome with no
+ * next seat, so the facts never re-derive one from the history.
+ * The token is a fixed `next-seat-<outcome>-<index>` code naming the failure
+ * outcome, or `next-seat-<outcome>-none` when no seat is allowed — both the
+ * failure outcome and the selected next seat in one fixed code (validated by
+ * the journal's token pattern), never free text, so replay of the spent key
+ * can never record a second move.
+ */
+function seatAdvanceDetail(
+  ctx: AdvanceStepContext,
+  failed: AttemptRecord,
+  storedStopReason: unknown,
+): string | null {
+  const selection = failed.seatSelection ?? null;
+  const role: SeatPlanRole | null = selection?.role ?? null;
+  if (role !== 'first-pass' && role !== 'fix') {
+    return null;
+  }
+  const planResult = SeatPlan.create(failed.seatPlan);
+  const plan = planResult.success && planResult.value !== undefined ? planResult.value : null;
+  if (plan === null || selection === null || typeof selection.seatIndex !== 'number') {
+    return null;
+  }
+  const outcome: SeatFailureOutcome | null = seatOutcomeOfStopReason(parseStopReason(storedStopReason));
+  const sameFamily = ctx.deps.sameModelFamily;
+  if (outcome === null) {
+    return 'next-seat-none';
+  }
+  if (sameFamily === undefined) {
+    // Fail closed: without the configured family comparator no seat may be
+    // picked, and leaving the advance unrecorded would let the facts re-derive
+    // one from the history. The failure records its outcome with no next
+    // seat, so the run parks for the owner instead of moving.
+    return 'next-seat-' + outcome + '-none';
+  }
+  // A model-refusal stop keeps the failed model out of the rest of the lane
+  // (the same rule selectSeat applies over history), so the failed seat and
+  // any seat on its model are blocked. Reviewer independence (rule 9) is
+  // composed on top: a seat sharing a model family with any review seat of
+  // the frozen plan is blocked, exactly what `seatPlanFamilyConflicts`
+  // refuses a plan for.
+  const refusedModel = MODEL_REFUSAL_CLASSES.includes(parseStopReason(storedStopReason))
+    ? (selection.model ?? '').trim()
+    : null;
+  const reviewerModels = plan.getSeats('review').map((seat) => seat.model);
+  const chosen = pickNextSeat(plan, role, selection.seatIndex, outcome, (seat) =>
+    (refusedModel !== null && seat.model.trim() === refusedModel) ||
+    reviewerModels.some((model) => sameFamily(seat.model, model)),
+  );
+  return seatAdvanceTokenOf(chosen, outcome);
+}
+
+/** The fixed detail token of a pick: `next-seat-<outcome>-<index>`, or `next-seat-<outcome>-none` when no seat is allowed. */
+function seatAdvanceTokenOf(chosen: NextSeatResult, outcome: SeatFailureOutcome): string {
+  return chosen.ok
+    ? 'next-seat-' + outcome + '-' + String(chosen.seatIndex)
+    : 'next-seat-' + outcome + '-none';
+}
+
+/**
+ * GB3a: cancel a refused fix attempt so the dirty worktree is handed over to
+ * the next fix seat unchanged. Cancelling is the ONLY side effect; the
+ * worktree is never preserved, reset or deleted. True only when the cancel
+ * landed; any other outcome (unwired, refused or throwing) is false.
+ */
+async function handOverDirtyWorktree(ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+): Promise<boolean> {
+  const cancel = ctx.deps.cancelPreparedAttempt;
+  if (cancel === undefined) {
+    return false;
+  }
+  try {
+    const cancelled = await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso: request.nowIso });
+    return cancelled.outcome === 'cancelled';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when a refused dispatch's attempt hands a dirty worktree over to the
+ * next seat unchanged: a fix attempt, or a round-0 pivot seat (an initial
+ * attempt with a prior — a seat pivot prepared after an earlier seat failed).
+ * The very first attempt (`priorAttemptId === null`) keeps GB3 recovery.
+ */
+function handsOverDirtyWorktree(latest: AttemptRecord): boolean {
+  return latest.kind === 'fix' || (latest.kind === 'initial' && latest.priorAttemptId !== null);
+}
+
 /**
  * The `act dispatch` decision (K4-5): start the prepared attempt through
  * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
@@ -306,13 +689,9 @@ export async function performDispatch(ctx: AdvanceStepContext,
   if (latest === null || latest.state !== 'intent-recorded') {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
-  if (facts.attempt !== null && facts.attempt.dispatchResult === 'not-started') {
-    const cancel = ctx.deps.cancelPreparedAttempt;
-    if (cancel === undefined) {
-      return { outcome: 'not-wired', step: decision.step };
-    }
-    await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso });
-    return { outcome: 'waiting', reason: 'dispatch-pending' };
+  const notStarted = await cancelNotStartedAttempt(ctx, record, latest, facts, decision, request, nowIso);
+  if (notStarted !== null) {
+    return notStarted;
   }
   // The dispatch key is one-way (KF-10): an intent already recorded for this
   // key is never re-sent. A spent key parks step-refused dispatch without
@@ -324,11 +703,8 @@ export async function performDispatch(ctx: AdvanceStepContext,
     return spent;
   }
   const manifest = await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
-  const stepLimit = manifestPositiveInteger(manifest, 'stepLimit');
-  const timeLimitSeconds = manifestTimeLimitSeconds(manifest);
-  const expectedArtifacts = manifestExpectedArtifacts(manifest);
-  const briefPackagePath = latest.briefPackagePath;
-  const briefDigest = latest.briefDigest;
+  const { stepLimit, timeLimitSeconds, expectedArtifacts, briefPackagePath, briefDigest } =
+    dispatchInputsOf(latest, manifest);
   const inputsReadable =
     stepLimit !== null &&
     timeLimitSeconds !== null &&
@@ -343,32 +719,578 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // sets one) never dispatches: it refuses and parks with a fixed detail,
   // never a guessed or inherited seat field.
   const fixSeat = fixSeatForDispatch(latest, manifest);
+  // CO13: the endpoint stagger is asked only when this dispatch can start a
+  // session (mirroring the global gate), so a refused fix seat or unreadable
+  // inputs report their own refusal at once instead of waiting first.
+  const endpointCheck = await endpointStaggerWaitOf(
+    ctx, record, latest, request, fixSeat.kind !== 'refused' && inputsReadable,
+  );
+  if (endpointCheck.kind === 'wait') {
+    return endpointCheck.result;
+  }
+  // CO13: the endpoint grant holds a start at once; every path that contacts
+  // no runner (the global gate waits, the intent or the raise is refused, the
+  // runner refuses, or anything throws before the runner call) releases it,
+  // so a start that never happened never delays a later one.
+  const contact = { runnerContacted: false };
+  try {
+    return await dispatchPastEndpointGate(ctx, record, gathered, decision, request, {
+      dispatch, latest, manifest, fixSeat, contact,
+    });
+  } finally {
+    if (endpointCheck.kind === 'grant' && !contact.runnerContacted) {
+      request.startGate?.releaseStartForEndpoint?.(request.runId);
+    }
+  }
+}
+
+/** The dispatch after the endpoint gate granted (or had nothing to enforce). */
+async function dispatchPastEndpointGate(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'act' }>,
+  request: AdvanceLaneRunRequest,
+  past: {
+    readonly dispatch: NonNullable<AdvanceStepContext['deps']['dispatchAttempt']>;
+    readonly latest: AttemptRecord;
+    readonly manifest: Record<string, unknown> | null;
+    readonly fixSeat: FixSeatForDispatch;
+    readonly contact: { runnerContacted: boolean };
+  },
+): Promise<AdvanceLaneRunResult> {
+  const facts = gathered.facts;
+  const nowIso = request.nowIso;
+  const { dispatch, latest, manifest, fixSeat, contact } = past;
+  const { stepLimit, timeLimitSeconds, expectedArtifacts, briefPackagePath, briefDigest } =
+    dispatchInputsOf(latest, manifest);
+  const inputsReadable =
+    stepLimit !== null &&
+    timeLimitSeconds !== null &&
+    expectedArtifacts !== null &&
+    briefPackagePath !== null &&
+    briefDigest !== null;
+  const staggered = startGateWaitOf(request, fixSeat, inputsReadable);
+  if (staggered !== null) {
+    return staggered;
+  }
+  const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
+  if (intentRefusal !== null) {
+    return refusedResult(intentRefusal);
+  }
+  if (fixSeat.kind === 'refused') {
+    return refusedSeatResult(ctx, record, facts, decision, request, fixSeat);
+  }
+  if (!inputsReadable) {
+    return unreadableInputsPark(ctx, record, facts, decision, request);
+  }
+  const raise = await raiseRoundAndCursor(ctx, record, facts, decision, request);
+  if (raise.refusal !== null) {
+    return raise.refusal;
+  }
+  record = raise.record;
+  const seatOverride = seatOverrideFor(latest, fixSeat, nowIso, timeLimitSeconds);
+  // GB3a/GB3c: a fix dispatch or a round-0 pivot dispatch following a
+  // dirty-worktree refusal carries the handed-over worktree as-is, so the
+  // next seat's uncommitted work is accepted instead of refused again.
+  const handover = await dirtyHandoverRequested(ctx, latest, record);
+  // CO13: from here a runner may be contacted, so the held endpoint start
+  // stands — even when the call throws (the safe direction).
+  contact.runnerContacted = true;
+  const dispatched = await dispatch.dispatchAttempt({
+    attemptId: latest.id,
+    workOrderId: record.workOrderId,
+    worktreePath: latest.worktreePath,
+    briefPackagePath,
+    briefDigest,
+    baseCommit: latest.baseCommit,
+    stepLimit,
+    timeLimitSeconds,
+    expectedArtifacts,
+    nowIso,
+    ...optionalDispatchFields(seatOverride, handover, ctx.deps.installationSchemaVersion),
+  });
+  if (dispatched.outcome === 'started' || dispatched.outcome === 'blocked' || dispatched.outcome === 'unknown') {
+    return dispatchedOutcomeResult(ctx, facts, decision, request, dispatched);
+  }
+  // CO13: a runner refusal started no session, so the held endpoint start is
+  // released and delays no later start.
+  contact.runnerContacted = false;
+  // Refused: a runner refusal saved with its stop reason (S1) pivots through
+  // seat-failed; anything else parks for the owner (the key is spent). A
+  // refused FIX dispatch recovers in the same round after resume: the round
+  // is already raised here, so the decider re-reads the parked attempt as
+  // still this round's and the next advance cancels it and prepares again
+  // at that round (KF-17).
+  const stored = await ctx.deps.attemptRepo.findAttemptById(latest.id);
+  const reasonCode = refusedDispatchReasonCode(stored);
+  // KF-16: the refused result journals a fixed detail code derived from the
+  // refusal text, for the dispatch-refused park and the runner-refused pivot
+  // alike. G11a: a runner refusal is the provider-outcome boundary — the
+  // failure's one move (the next seat, or that no seat is allowed) is
+  // recorded on THIS key's final result, so replay of the spent key cannot
+  // select or record a second move.
+  const advanceDetail = refusedAdvanceDetailOf(ctx, latest, stored, reasonCode);
+  const resultRefusal = await appendRunResult(
+    ctx, request, decision.key, 'refused', reasonCode,
+    advanceDetail ?? dispatchRefusalDetail(dispatched.reason),
+  );
+  if (resultRefusal !== null) {
+    return refusedResult(resultRefusal);
+  }
+  // GB3a/GB3c: a refused dispatch whose attempt is a fix seat or a round-0
+  // pivot seat and whose detail is a dirty-worktree detail cancels the attempt
+  // and hands the worktree UNCHANGED to the next seat — nothing is preserved,
+  // reset or deleted. If the cancel does not land (unwired, refused or
+  // throwing) the run parks at the bottom; such an attempt never reaches
+  // `recoverUncommittedWorktree`. First-pass attempts keep today's GB3
+  // recovery exactly: preserve the edits as a patch outside the worktree, reset
+  // the worktree to its head, cancel the attempt, and journal the patch path.
+  // The spent refusal key is already recorded above. Success returns acted
+  // without parking so the next advance prepares the next seat.
+  const detail = dispatchRefusalDetail(dispatched.reason);
+  return handoverOrRecovery(ctx, record, latest, request, { detail, reasonCode }, decision, facts.state);
+}
+
+function dispatchInputsOf(
+  latest: AttemptRecord,
+  manifest: Record<string, unknown> | null,
+): {
+  stepLimit: number | null;
+  timeLimitSeconds: number | null;
+  expectedArtifacts: readonly string[] | null;
+  briefPackagePath: string | null;
+  briefDigest: string | null;
+} {
+  return {
+    stepLimit: manifestPositiveInteger(manifest, 'stepLimit'),
+    timeLimitSeconds: manifestTimeLimitSeconds(manifest),
+    expectedArtifacts: manifestExpectedArtifacts(manifest),
+    briefPackagePath: latest.briefPackagePath,
+    briefDigest: latest.briefDigest,
+  };
+}
+
+function seatOverrideFor(
+  latest: AttemptRecord,
+  fixSeat: FixSeatForDispatch,
+  nowIso: string,
+  timeLimitSeconds: number,
+): AttemptSeatOverrideRecord | null {
+  let seatForOverride: AttemptSeatSelectionRecord | null;
+  if (latest.kind === 'initial' && latest.priorAttemptId !== null) {
+    seatForOverride = latest.seatSelection ?? null;
+  } else if (fixSeat.kind === 'seat') {
+    seatForOverride = fixSeat.seat;
+  } else {
+    seatForOverride = null;
+  }
+  if (seatForOverride === null) {
+    return null;
+  }
+  return {
+    model: seatForOverride.model,
+    ...(seatForOverride.agent !== null ? { agent: seatForOverride.agent } : {}),
+    ...(seatForOverride.variant !== null ? { variant: seatForOverride.variant } : {}),
+    ...(fixSeat.kind === 'seat' && fixSeat.overrideVariant !== undefined ? { variant: fixSeat.overrideVariant } : {}),
+    reason:
+      latest.kind === 'fix'
+        ? 'fix seat ' + seatForOverride.seatId
+        : 'seat-plan pivot to ' + seatForOverride.seatId,
+    setBy: 'conductor',
+    expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
+  };
+}
+
+function dispatchOutcomeReasonCode(
+  outcome: 'started' | 'blocked' | 'unknown',
+): 'dispatch-started' | 'dispatch-blocked' | 'dispatch-unknown' {
+  if (outcome === 'started') {
+    return 'dispatch-started';
+  }
+  if (outcome === 'blocked') {
+    return 'dispatch-blocked';
+  }
+  return 'dispatch-unknown';
+}
+
+function refusedDispatchReasonCode(
+  stored: AttemptRecord | null,
+): 'runner-refused' | 'dispatch-refused' {
+  if (stored !== null && stored.state === 'cancelled') {
+    return 'runner-refused';
+  }
+  return 'dispatch-refused';
+}
+
+/** The optional fields of a dispatch request, each present only when it has a value. */
+function optionalDispatchFields<TSeatOverride, TVersion>(
+  seatOverride: TSeatOverride | null,
+  handover: boolean,
+  installationSchemaVersion: TVersion | undefined,
+): { seatOverride?: TSeatOverride; allowUncommittedHandover?: true; installationSchemaVersion?: TVersion } {
+  const fields: { seatOverride?: TSeatOverride; allowUncommittedHandover?: true; installationSchemaVersion?: TVersion } = {};
+  if (seatOverride !== null) {
+    fields.seatOverride = seatOverride;
+  }
+  if (handover) {
+    fields.allowUncommittedHandover = true;
+  }
+  if (installationSchemaVersion !== undefined) {
+    fields.installationSchemaVersion = installationSchemaVersion;
+  }
+  return fields;
+}
+
+/** A refused dispatch's journalled detail and reason code. */
+interface DispatchRefusal {
+  readonly detail: string;
+  readonly reasonCode: 'runner-refused' | 'dispatch-refused';
+}
+
+async function handoverOrRecovery(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+  refusal: DispatchRefusal,
+  decision: Extract<LaneRunDecision, { kind: 'act' }>,
+  state: LaneRunStateValue,
+): Promise<AdvanceLaneRunResult> {
+  const { detail, reasonCode } = refusal;
+  if (reasonCode === 'dispatch-refused') {
+    if (handsOverDirtyWorktree(latest)) {
+      if (isDirtyWorktreeDetail(detail) && (await handOverDirtyWorktree(ctx, latest, request))) {
+        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+      }
+    } else if (detail === 'worktree-uncommitted') {
+      const recovered = await recoverUncommittedWorktree(ctx, record, latest, request);
+      if (recovered) {
+        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+      }
+    }
+  }
+  if (reasonCode === 'runner-refused') {
+    const conductRefusal = await conductDispatching(ctx, state, request);
+    if (conductRefusal !== null) {
+      return refusedResult(conductRefusal);
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+  }
+  return performPark(ctx, record, 'step-refused', 'dispatch', state, request);
+}
+
+/** The `dispatching` conduct entry after a dispatch, unless the run is already in it. */
+export async function conductDispatching(ctx: AdvanceStepContext,
+  state: LaneRunStateValue,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceStepRefusal | null> {
+  if (state === 'dispatching') {
+    return null;
+  }
+  const appended = await appendConduct(ctx, request, 'dispatching');
+  return appended.ok ? null : appended;
+}
+
+/** The start-gate wait before the one-way intent: a crash during it spends no key. */
+function startGateWaitOf(
+  request: AdvanceLaneRunRequest,
+  fixSeat: FixSeatForDispatch,
+  inputsReadable: boolean,
+): AdvanceLaneRunResult | null {
   if (fixSeat.kind !== 'refused' && inputsReadable && request.startGate !== undefined) {
     // The wait sits before the one-way intent, so a crash during the wait spends no key.
     if (!request.startGate.tryStart(request.runId, request.nowIso).ok) {
       return { outcome: 'waiting', reason: 'session-stagger' };
     }
   }
-  const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
-  if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+  return null;
+}
+
+/**
+ * CO13: the per-runner-endpoint dispatch stagger check, before the one-way
+ * dispatch intent. A denied start is a wait — never a refusal and never a
+ * spent key. No gate, no endpoint-scoped method, no endpoint identity, or a
+ * dispatch that cannot start a session (`canStart` false: a refused fix seat
+ * or unreadable inputs) means nothing to enforce. A granted start is held by
+ * the gate; the caller releases it when no runner is contacted.
+ */
+type EndpointStaggerCheck =
+  | { readonly kind: 'wait'; readonly result: AdvanceLaneRunResult }
+  | { readonly kind: 'grant' }
+  | { readonly kind: 'none' };
+
+async function endpointStaggerWaitOf(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+  canStart: boolean,
+): Promise<EndpointStaggerCheck> {
+  const gate = request.startGate;
+  if (!canStart || gate === undefined || gate.tryStartForEndpoint === undefined) {
+    return { kind: 'none' };
   }
-  if (fixSeat.kind === 'refused') {
-    const resultRefusal = await appendRunResult(
-      ctx, request, decision.key, 'refused', 'dispatch-refused', fixSeat.detail,
-    );
-    if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+  const endpoint = dispatchEndpointFactsOf(latest.runner);
+  if (endpoint === null) {
+    return { kind: 'none' };
+  }
+  const endpointKey = dispatchEndpointKey(endpoint);
+  const seed = await endpointStartSeedOf(ctx, latest, request.nowIso, endpointKey);
+  const decision = gate.tryStartForEndpoint(request.runId, request.nowIso, endpointKey, seed.lastStartIso);
+  if (decision.ok) {
+    return { kind: 'grant' };
+  }
+  await journalDispatchStaggerWait(ctx, record, latest, request, {
+    endpointKey,
+    retryAfterMs: decision.retryAfterMs,
+    undated: seed.undated,
+  });
+  return { kind: 'wait', result: { outcome: 'waiting', reason: 'session-stagger' } };
+}
+
+/** The attempt states that mean a session was started (or may have been). */
+const STARTED_ATTEMPT_STATES: ReadonlySet<string> = new Set([
+  'dispatching',
+  'running',
+  'reconciling',
+  'blocked',
+  'ended',
+  'collected',
+]);
+
+/**
+ * True when the attempt started (or may have started) a session. An
+ * `intent-recorded` attempt never started. A `cancelled` attempt can still
+ * have started one (it keeps the runner and session it was given), so it
+ * counts when a session is recorded; without a session it never started.
+ */
+function attemptStartedSession(attempt: AttemptRecord): boolean {
+  if (attempt.state === 'cancelled') {
+    return attempt.sessionId !== null;
+  }
+  return STARTED_ATTEMPT_STATES.has(attempt.state);
+}
+
+/** The wait-entry detail prefix, and the suffix that marks a wait on an undated start. */
+const STAGGER_WAIT_PREFIX = 'dispatch stagger wait:';
+const UNDATED_WAIT_SUFFIX = ', last start undated';
+
+/**
+ * CO13: the durable seed for one endpoint, as a valid ISO string or null —
+ * never a malformed timestamp. A started attempt's `updatedAtIso` is never
+ * earlier than its start, so the measured gap is never shorter than the true
+ * one — the safe direction. A started attempt whose `updatedAtIso` cannot be
+ * dated has an unknown start: it is treated as starting when THIS attempt
+ * first waited on an undated start (its journaled undated wait entry), or now
+ * when there is none yet. That waits one full interval from the moment the
+ * undated start was first seen — and then grants, so one corrupt record never
+ * blocks the endpoint for ever. Without a journal to remember that moment the
+ * undated record seeds nothing (the global session-start spacing still
+ * applies).
+ */
+async function endpointStartSeedOf(
+  ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+  nowIso: string,
+  endpointKey: string,
+): Promise<{ readonly lastStartIso: string | null; readonly undated: boolean }> {
+  const attempts = await ctx.deps.attemptRepo.listAllAttempts();
+  let latestMs: number | null = null;
+  let undated = false;
+  for (const attempt of attempts) {
+    if (attempt.runner === null || attempt.runner === undefined || !attemptStartedSession(attempt)) {
+      continue;
     }
-    return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
-  }
-  if (!inputsReadable) {
-    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'dispatch-inputs-unreadable');
-    if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+    if (dispatchEndpointKey(dispatchEndpointFactsOf(attempt.runner)) !== endpointKey) {
+      continue;
     }
-    return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
+    const ms = Date.parse(attempt.updatedAtIso);
+    if (!Number.isFinite(ms)) {
+      undated = true;
+    } else if (latestMs === null || ms > latestMs) {
+      latestMs = ms;
+    }
   }
+  const undatedMs = undated ? await undatedStartSeenMs(ctx, latest, nowIso) : null;
+  if (undatedMs !== null && (latestMs === null || undatedMs > latestMs)) {
+    latestMs = undatedMs;
+  }
+  return {
+    lastStartIso: latestMs === null ? null : new Date(latestMs).toISOString(),
+    undated: undatedMs !== null,
+  };
+}
+
+/**
+ * When this attempt first saw an undated start on its endpoint: the recorded
+ * time of its undated wait entry, else now (the first sighting, journaled by
+ * the wait that follows). The sighting is capped at one default interval
+ * after this attempt's own `updatedAtIso` (stable while it waits: a wait
+ * writes no attempt record), so even a journal whose reads or appends keep
+ * failing cannot push the sighting forward for ever — the wait ends by then
+ * plus one interval. Null when no journal can remember the sighting, or when
+ * the cap cannot be dated and no sighting is recorded: the undated record
+ * then seeds nothing (the global session-start spacing still applies).
+ */
+async function undatedStartSeenMs(
+  ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+  nowIso: string,
+): Promise<number | null> {
+  const journal = ctx.deps.executionJournal;
+  if (journal.appendJournalEntry === undefined) {
+    return null;
+  }
+  let seenMs = NaN;
+  try {
+    const prior = await journal.listJournalEntriesForAttempt(latest.id);
+    const seen = prior.find((entry) => isStaggerWaitEntry(entry, true));
+    seenMs = seen === undefined ? NaN : Date.parse(seen.recordedAtIso);
+  } catch {
+    // A failing journal read never fails the wait: the sighting is now, capped below.
+  }
+  if (Number.isFinite(seenMs)) {
+    return seenMs;
+  }
+  const nowMs = Date.parse(nowIso);
+  const capMs = Date.parse(latest.updatedAtIso) + DEFAULT_DISPATCH_STAGGER_MS;
+  if (!Number.isFinite(nowMs) || !Number.isFinite(capMs)) {
+    return null;
+  }
+  return Math.min(nowMs, capMs);
+}
+
+/** True for this lane's dispatch stagger wait entry of the given kind (undated or not). */
+function isStaggerWaitEntry(
+  entry: { readonly action: string; readonly detail: string | null },
+  undated: boolean,
+): boolean {
+  if (entry.action !== 'dispatch' || entry.detail === null || !entry.detail.startsWith(STAGGER_WAIT_PREFIX)) {
+    return false;
+  }
+  return entry.detail.endsWith(UNDATED_WAIT_SUFFIX) === undated;
+}
+
+/**
+ * CO13: journal one wait reason per attempt and kind (a dated wait, a wait on
+ * an undated start), naming the endpoint and the retry delay in ids and codes
+ * only. The undated kind's recorded time is what bounds that wait (see
+ * `endpointStartSeedOf`). The `refused` status is deliberate: a non-`refused`
+ * `dispatch` entry makes `dispatchEverJournalled` true, and that would make the
+ * reconcile path believe a runner was contacted. A failing read or append must
+ * never fail the wait: catch it, ignore it and let the wait stand.
+ */
+async function journalDispatchStaggerWait(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+  wait: { readonly endpointKey: string; readonly retryAfterMs: number; readonly undated: boolean },
+): Promise<void> {
+  const journal = ctx.deps.executionJournal;
+  if (journal.appendJournalEntry === undefined) {
+    return;
+  }
+  try {
+    const prior = await journal.listJournalEntriesForAttempt(latest.id);
+    if (prior.some((entry) => isStaggerWaitEntry(entry, wait.undated))) {
+      return;
+    }
+    await journal.appendJournalEntry({
+      id: `${latest.id}:dispatch:${prior.length + 1}`,
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      action: 'dispatch',
+      baseCommit: latest.baseCommit,
+      recordedAtIso: request.nowIso,
+      status: 'refused',
+      sessionId: null,
+      detail: `${STAGGER_WAIT_PREFIX} endpoint ${wait.endpointKey}, retry after ${wait.retryAfterMs} ms${
+        wait.undated ? UNDATED_WAIT_SUFFIX : ''
+      }`,
+    });
+  } catch {
+    // The wait stands even when the journal read or append fails; the reason
+    // is then only in the conductor pass trace.
+  }
+}
+
+/** A fix attempt's refused fix seat: journal the fixed refusal, then park. */
+async function refusedSeatResult(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  facts: LaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'act' }>,
+  request: AdvanceLaneRunRequest,
+  fixSeat: Extract<FixSeatForDispatch, { kind: 'refused' }>,
+): Promise<AdvanceLaneRunResult> {
+  const resultRefusal = await appendRunResult(
+    ctx, request, decision.key, 'refused', 'dispatch-refused', fixSeat.detail,
+  );
+  if (resultRefusal !== null) {
+    return refusedResult(resultRefusal);
+  }
+  return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
+}
+
+/** Dispatch inputs the attempt cannot name: journal the refusal, then park. */
+async function unreadableInputsPark(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  facts: LaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'act' }>,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'dispatch-inputs-unreadable');
+  if (resultRefusal !== null) {
+    return refusedResult(resultRefusal);
+  }
+  return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
+}
+
+/**
+ * An attempt whose dispatch never started and whose reconcile cancel has not
+ * landed is cancelled here instead of re-sending the one-way key (GB3, KF-10).
+ */
+async function cancelNotStartedAttempt(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  facts: LaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'act' }>,
+  request: AdvanceLaneRunRequest,
+  nowIso: string,
+): Promise<AdvanceLaneRunResult | null> {
+  if (facts.attempt !== null && facts.attempt.dispatchResult === 'not-started') {
+    const cancel = ctx.deps.cancelPreparedAttempt;
+    if (cancel === undefined) {
+      return { outcome: 'not-wired', step: decision.step };
+    }
+    // GB3: an attempt with an incomplete worktree recovery (a durable recovery
+    // intent without its completing journal entry) must not cancel-and-advance
+    // here: the preserve/reset/cancel side effects may be unfinished. Park, and
+    // the run stays parked until recovery is durably complete or an owner acts.
+    if (await hasIncompleteWorktreeRecovery(ctx, latest.id)) {
+      return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
+    }
+    await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso });
+    return { outcome: 'waiting', reason: 'dispatch-pending' };
+  }
+  return null;
+}
+
+/**
+ * Raise the record's round and the seat's cursor before dispatch, unless the
+ * decision already matches what the record holds.
+ */
+async function raiseRoundAndCursor(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  facts: LaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'act' }>,
+  request: AdvanceLaneRunRequest,
+): Promise<{ record: LaneRunRecord; refusal: AdvanceLaneRunResult | null }> {
   const role = implementerRoleFor(decision.round, facts.state);
   const roundRaised = decision.round > record.round;
   if (roundRaised || record.cursors[role] !== decision.seatIndex) {
@@ -388,107 +1310,62 @@ export async function performDispatch(ctx: AdvanceStepContext,
     if (!saved.ok) {
       // The pending intent is reconciled by K4-7 as never started; the
       // dispatch is never called on a refused save.
-      return { outcome: 'refused', reason: saved.reason };
+      return { record, refusal: { outcome: 'refused', reason: saved.reason } };
     }
     // Later writes in this advance (a park) must chain on the saved revision.
-    record = saved.record ?? record;
+    return { record: saved.record ?? record, refusal: null };
   }
-  const seatForOverride: AttemptSeatSelectionRecord | null =
-    latest.kind === 'initial' && latest.priorAttemptId !== null
-      ? (latest.seatSelection ?? null)
-      : fixSeat.kind === 'seat'
-        ? fixSeat.seat
-        : null;
-  const seatOverride: AttemptSeatOverrideRecord | null =
-    seatForOverride === null
-      ? null
-      : {
-          model: seatForOverride.model,
-          ...(seatForOverride.agent !== null ? { agent: seatForOverride.agent } : {}),
-          ...(seatForOverride.variant !== null ? { variant: seatForOverride.variant } : {}),
-          ...(fixSeat.kind === 'seat' && fixSeat.overrideVariant !== undefined ? { variant: fixSeat.overrideVariant } : {}),
-          reason:
-            latest.kind === 'fix'
-              ? 'fix seat ' + seatForOverride.seatId
-              : 'seat-plan pivot to ' + seatForOverride.seatId,
-          setBy: 'conductor',
-          expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
-        };
-  const dispatched = await dispatch.dispatchAttempt({
-    attemptId: latest.id,
-    workOrderId: record.workOrderId,
-    worktreePath: latest.worktreePath,
-    briefPackagePath,
-    briefDigest,
-    baseCommit: latest.baseCommit,
-    stepLimit,
-    timeLimitSeconds,
-    expectedArtifacts,
-    nowIso,
-    ...(seatOverride !== null ? { seatOverride } : {}),
-    ...(ctx.deps.installationSchemaVersion !== undefined
-      ? { installationSchemaVersion: ctx.deps.installationSchemaVersion }
-      : {}),
-  });
-  if (dispatched.outcome === 'started' || dispatched.outcome === 'blocked' || dispatched.outcome === 'unknown') {
-    let reasonCode: LaneRunResultReasonCode;
-    if (dispatched.outcome === 'started') {
-      reasonCode = 'dispatch-started';
-    } else if (dispatched.outcome === 'blocked') {
-      reasonCode = 'dispatch-blocked';
-    } else {
-      reasonCode = 'dispatch-unknown';
-    }
-    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode);
-    if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
-    }
-    const conductRefusal = await conductDispatching(ctx, facts.state, request);
-    if (conductRefusal !== null) {
-      return { outcome: 'refused', reason: conductRefusal };
-    }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
-  }
-  // Refused: a runner refusal saved with its stop reason (S1) pivots through
-  // seat-failed; anything else parks for the owner (the key is spent). A
-  // refused FIX dispatch recovers in the same round after resume: the round
-  // is already raised here, so the decider re-reads the parked attempt as
-  // still this round's and the next advance cancels it and prepares again
-  // at that round (KF-17).
-  const stored = await ctx.deps.attemptRepo.findAttemptById(latest.id);
-  let reasonCode: LaneRunResultReasonCode;
-  if (stored !== null && stored.state === 'cancelled') {
-    reasonCode = 'runner-refused';
-  } else {
-    reasonCode = 'dispatch-refused';
-  }
-  // KF-16: the refused result journals a fixed detail code derived from the
-  // refusal text, for the dispatch-refused park and the runner-refused pivot
-  // alike.
-  const resultRefusal = await appendRunResult(
-    ctx, request, decision.key, 'refused', reasonCode, dispatchRefusalDetail(dispatched.reason),
-  );
-  if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
-  }
-  if (reasonCode === 'runner-refused') {
-    const conductRefusal = await conductDispatching(ctx, facts.state, request);
-    if (conductRefusal !== null) {
-      return { outcome: 'refused', reason: conductRefusal };
-    }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
-  }
-  return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
+  return { record, refusal: null };
 }
 
-/** The `dispatching` conduct entry after a dispatch, unless the run is already in it. */
-export async function conductDispatching(ctx: AdvanceStepContext,
-  state: LaneRunStateValue,
+/** A started, blocked or unknown dispatch journals its completed result, then conducts. */
+async function dispatchedOutcomeResult(
+  ctx: AdvanceStepContext,
+  facts: LaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'act' }>,
   request: AdvanceLaneRunRequest,
-): Promise<AdvanceLaneRunRefusal | null> {
-  if (state === 'dispatching') {
-    return null;
+  dispatched: Extract<DispatchAttemptResult, { outcome: 'started' | 'blocked' | 'unknown' }>,
+): Promise<AdvanceLaneRunResult> {
+  const reasonCode = dispatchOutcomeReasonCode(dispatched.outcome);
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode);
+  if (resultRefusal !== null) {
+    return refusedResult(resultRefusal);
   }
-  const appended = await appendConduct(ctx, request, 'dispatching');
-  return appended.ok ? null : appended.reason;
+  const conductRefusal = await conductDispatching(ctx, facts.state, request);
+  if (conductRefusal !== null) {
+    return refusedResult(conductRefusal);
+  }
+  return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
+}
+
+/**
+ * GB3a/GB3c: a fix dispatch or a round-0 pivot dispatch following a
+ * dirty-worktree refusal carries the handed-over worktree as-is, so the
+ * next seat's uncommitted work is accepted instead of refused again.
+ */
+async function dirtyHandoverRequested(
+  ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+  record: LaneRunRecord,
+): Promise<boolean> {
+  return handsOverDirtyWorktree(latest) &&
+    lastDispatchLeftDirtyWorktree(await ctx.deps.runJournal.listForRun(record.runId), record.runId);
+}
+
+/**
+ * KF-16, G11a: a runner refusal is the provider-outcome boundary — the
+ * failure's one move (the next seat, or that no seat is allowed) is recorded
+ * on THIS key's final result, so replay of the spent key cannot select or
+ * record a second move. Any other refusal carries no advance detail.
+ */
+function refusedAdvanceDetailOf(
+  ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+  stored: AttemptRecord | null,
+  reasonCode: 'runner-refused' | 'dispatch-refused',
+): string | null {
+  if (reasonCode === 'runner-refused') {
+    return seatAdvanceDetail(ctx, latest, stored?.stopReason);
+  }
+  return null;
 }

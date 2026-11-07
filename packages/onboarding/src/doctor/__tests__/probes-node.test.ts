@@ -5,7 +5,7 @@
  * credential file's contents — fileMode only stats.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,6 +15,7 @@ import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
 import type { SeatModel } from '@fleet/installation';
 
+import { GH_BINARY_CANDIDATES } from '../gh-binary.js';
 import type {
   DoctorCommandExecutor,
   DoctorCommandRunOptions,
@@ -324,6 +325,142 @@ describe('createNodeDoctorProbes', () => {
     expect(local.calls.map((call) => call.argv)).toEqual(
       BUILT_IN_TOOLS.map((tool) => [...tool.detect.argv]),
     );
+  });
+
+  it('resolves gh from injected ghBinaryCandidates via real filesystem checks', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'gh-probes-'));
+    try {
+      const executablePath = join(tempDir, 'gh-exec');
+      writeFileSync(executablePath, '#!/bin/sh\n');
+      chmodSync(executablePath, 0o755);
+      const candidates = [executablePath, '/nonexistent/gh'];
+      const probes = createNodeDoctorProbes({ ghBinaryCandidates: candidates });
+      await expect(probes.ghBinary!()).resolves.toEqual({ resolved: executablePath, candidates });
+
+      const nonExecutablePath = join(tempDir, 'gh-noexec');
+      writeFileSync(nonExecutablePath, '#!/bin/sh\n');
+      chmodSync(nonExecutablePath, 0o644);
+      const probes2 = createNodeDoctorProbes({ ghBinaryCandidates: [nonExecutablePath] });
+      await expect(probes2.ghBinary!()).resolves.toEqual({
+        resolved: undefined,
+        candidates: [nonExecutablePath],
+      });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('defaults gh binary candidates to the fixed reviewed list', async () => {
+    const probes = createNodeDoctorProbes();
+    const result = await probes.ghBinary!();
+    expect(result?.candidates).toEqual(GH_BINARY_CANDIDATES);
+  });
+
+  it('probes the server with two curl runs and parses the listed models', async () => {
+    const local = fakeExecutor(({ argv }) =>
+      argv.some((arg) => arg.endsWith('/api/model'))
+        ? {
+            exitCode: 0,
+            signal: null,
+            stdout: '{"data":{"models":{"acme/alpha-1":{"variants":["high"]}}}}',
+            stderr: '',
+          }
+        : { exitCode: 0, signal: null, stdout: '200', stderr: '' },
+    );
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor });
+    await expect(probes.serverProbe('local', 4096)).resolves.toEqual({
+      outcome: 'pass',
+      reason: 'the opencode server on 127.0.0.1:4096 answered',
+      models: ['acme/alpha-1', 'acme/alpha-1#high'],
+    });
+    expect(local.calls.map((call) => call.argv)).toEqual([
+      [
+        'curl',
+        '-sS',
+        '--max-time',
+        '5',
+        '--noproxy',
+        '127.0.0.1,localhost',
+        '-o',
+        '/dev/null',
+        '-w',
+        '%{http_code}',
+        'http://127.0.0.1:4096/api/info',
+      ],
+      ['curl', '-sS', '--max-time', '5', '--noproxy', '127.0.0.1,localhost', 'http://127.0.0.1:4096/api/model'],
+    ]);
+  });
+
+  it('bypasses any proxy for loopback (--noproxy 127.0.0.1,localhost, no glob for a remote shell) in every loopback curl probe', async () => {
+    const local = fakeExecutor(({ argv }) =>
+      argv.some((arg) => arg.endsWith('/api/model'))
+        ? { exitCode: 0, signal: null, stdout: '{"data":{"models":{}}}', stderr: '' }
+        : { exitCode: 0, signal: null, stdout: '200', stderr: '' },
+    );
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor });
+    await probes.serverProbe('local', 4096);
+
+    expect(local.calls).toHaveLength(2);
+    for (const call of local.calls) {
+      const noproxyIndex = call.argv.indexOf('--noproxy');
+      expect(noproxyIndex).toBeGreaterThan(-1);
+      expect(call.argv[noproxyIndex + 1]).toBe('127.0.0.1,localhost');
+    }
+  });
+
+  it('sends the server probe argv over ssh without a tunnel or credential', async () => {
+    const ssh = fakeExecutor(({ argv }) =>
+      argv.some((arg) => arg.endsWith('/api/model'))
+        ? { exitCode: 0, signal: null, stdout: '{"data":{"models":{}}}', stderr: '' }
+        : { exitCode: 0, signal: null, stdout: '200', stderr: '' },
+    );
+    const probes = createNodeDoctorProbes({ localExecutor: ssh.executor });
+    await expect(probes.serverProbe('lane-host', 4166)).resolves.toEqual({
+      outcome: 'pass',
+      reason: 'the opencode server on 127.0.0.1:4166 answered',
+    });
+    expect(ssh.calls[0]?.argv).toEqual([
+      'ssh',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=10',
+      'lane-host',
+      '--',
+      'curl',
+      '-sS',
+      '--max-time',
+      '5',
+      '--noproxy',
+      '127.0.0.1,localhost',
+      '-o',
+      '/dev/null',
+      '-w',
+      '%{http_code}',
+      'http://127.0.0.1:4166/api/info',
+    ]);
+  });
+
+  it('maps a non-zero exit and a spawn error to UNKNOWN without printing a body', async () => {
+    const down = fakeExecutor({ exitCode: 7, stdout: '', stderr: '' });
+    const downProbes = createNodeDoctorProbes({ localExecutor: down.executor });
+    await expect(downProbes.serverProbe('local', 4096)).resolves.toEqual({
+      outcome: 'unknown',
+      reason: 'the opencode server on 127.0.0.1:4096 did not answer',
+    });
+
+    const erroring = fakeExecutor({
+      exitCode: null,
+      signal: null,
+      stdout: '',
+      stderr: '',
+      error: 'spawn ENOENT',
+    });
+    const errorProbes = createNodeDoctorProbes({ localExecutor: erroring.executor });
+    await expect(errorProbes.serverProbe('local', 4096)).resolves.toEqual({
+      outcome: 'unknown',
+      reason: 'the server probe could not be run',
+    });
   });
 });
 

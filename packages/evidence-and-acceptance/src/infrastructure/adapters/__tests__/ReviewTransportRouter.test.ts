@@ -319,8 +319,12 @@ describe('ReviewTransportRouter', () => {
 
     const result = await router(BASE_REQUEST);
 
-    expect(recorded).toHaveLength(1);
-    const { file, args, env } = recorded[0];
+    // The idle `--wait` spawn comes first, then the review spawn (RV4).
+    expect(recorded).toHaveLength(2);
+    expect(recorded[0].args.slice(0, 2)).toEqual(['--wait', '--dir']);
+    expect(recorded[0].args[2]).toBe('/srv/fleet/worktrees/att-1');
+    expect(recorded[0].env.OCM_REMOTE_PORT).toBe('46000');
+    const { file, args, env } = recorded[1];
     expect(file).toBe('/bundled/bin/ocm-run');
     expect(args.slice(0, -1)).toEqual([
       '--dir',
@@ -339,6 +343,81 @@ describe('ReviewTransportRouter', () => {
 
     expect(result.result).toBe('pass');
     expect(result.readOnlyVerified).toBe(true);
+  });
+
+  it('an opencode kind review embeds the location diff', async () => {
+    const diffCalls: Array<readonly [string, string]> = [];
+    const location: ReviewLocation = {
+      ...fixtureLocation(
+        { kind: 'installation', remotePort: 46000, remoteHost: '' },
+        BASE_REQUEST.candidateHeadSha,
+      ),
+      readDiff: async (fromSha, toSha) => {
+        diffCalls.push([fromSha, toSha] as const);
+        return 'diff --git a/f b/f\n+added line\n';
+      },
+    };
+    const kindRequest: RunIndependentReviewRequest = {
+      ...BASE_REQUEST,
+      kind: 'brief-check',
+      briefText: 'Do the thing.',
+    };
+    const prompts: string[] = [];
+    const fakeSpawn: OcmReviewTransportSpawn = async (_file, args) => {
+      prompts.push(args[args.length - 1]);
+      return { exitCode: 0, stdout: PASS_FIXTURE, stderr: '' };
+    };
+    const router = createReviewTransportRouter({
+      seats: SEATS,
+      chains: CHAINS,
+      locate: async () => location,
+      ocmRunBin: '/bundled/bin/ocm-run',
+      ocmSpawn: fakeSpawn,
+      makeNonce: () => 'a'.repeat(32),
+    });
+
+    const result = await router(kindRequest);
+
+    expect(diffCalls).toEqual([['base-sha', kindRequest.candidateHeadSha]]);
+    // `--wait` pushes the dir; the review prompt is the second call (RV4).
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain('<<<UNTRUSTED nonce=' + 'a'.repeat(32) + ' label="diff">>>');
+    expect(prompts[1]).toContain('+added line');
+    expect(result.result).toBe('pass');
+  });
+
+  it('an opencode kind review whose location diff is null is not a pass', async () => {
+    const location: ReviewLocation = {
+      ...fixtureLocation(
+        { kind: 'installation', remotePort: 46000, remoteHost: '' },
+        BASE_REQUEST.candidateHeadSha,
+      ),
+      readDiff: async () => null,
+    };
+    const kindRequest: RunIndependentReviewRequest = {
+      ...BASE_REQUEST,
+      kind: 'brief-check',
+      briefText: 'Do the thing.',
+    };
+    let spawnCalls = 0;
+    const fakeSpawn: OcmReviewTransportSpawn = async () => {
+      spawnCalls += 1;
+      return { exitCode: 0, stdout: PASS_FIXTURE, stderr: '' };
+    };
+    const router = createReviewTransportRouter({
+      seats: SEATS,
+      chains: CHAINS,
+      locate: async () => location,
+      ocmRunBin: '/bundled/bin/ocm-run',
+      ocmSpawn: fakeSpawn,
+    });
+
+    const result = await router(kindRequest);
+
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('diff-unavailable');
+    // Only the idle `--wait` ran; the review itself never spawned (RV4).
+    expect(spawnCalls).toBe(1);
   });
 
   it('installation ssh route uses the configured host even when process.env.OCM_HOST leaks', async () => {

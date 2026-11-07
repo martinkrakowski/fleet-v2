@@ -4,6 +4,7 @@ import { LaneRun } from '../entities/LaneRun.js';
 import type { LaneRunRecord } from '../lane-run-records.js';
 import type { LaneRunJournalEntryRecord } from '../lane-run-journal.js';
 import { laneRunConductEntry, laneRunIntentEntry } from '../lane-run-step-facts.js';
+import { laneRunStopKey, laneRunStopForceKey } from '../lane-run-keys.js';
 import { buildLaneRunStepKey } from '../lane-run-keys.js';
 import type { LaneRunKeyResult } from '../lane-run-keys.js';
 import type { CapacityReservationRecord } from '../execution-records.js';
@@ -12,7 +13,7 @@ import {
   deriveReservationSeries,
   deriveSessionStartMarks,
 } from '../conductor-schedule.js';
-import type { ConductorScheduleFacts } from '../conductor-schedule.js';
+import type { ConductorScheduleFacts, ConductorScheduleRow } from '../conductor-schedule.js';
 import { readConductorPassTrace } from '../conductor-pass-trace.js';
 
 const RUN_A = 'run-01JB0000000000000000000000';
@@ -83,6 +84,17 @@ function mustBuild(result: LaneRunKeyResult): string {
     throw new Error('unreachable: key builder');
   }
   return result.key;
+}
+
+/** A stop intent entry: the keyed control intent with its stop mode stamped. */
+function stopIntentEntry(
+  entryId: string,
+  runId: string,
+  key: string,
+  mode: 'graceful' | 'force',
+  nowIso: string,
+): LaneRunJournalEntryRecord {
+  return { ...laneRunIntentEntry(entryId, runId, key, null, nowIso), mode };
 }
 
 function runIdOf(rows: ReadonlyArray<{ readonly runId: string }>): string[] {
@@ -180,22 +192,25 @@ describe('deriveConductorSchedule', () => {
     ]);
   });
 
-  it('lists package overlaps between rows of the same repository', () => {
+  it('lists owned-file overlaps between rows of the same repository, not sibling files', () => {
     const runs = [
       runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1' }),
       runRecord({ runId: RUN_B, attemptIds: ['a2'], workOrderId: 'wo-2' }),
       runRecord({ runId: RUN_C, attemptIds: ['a3'], workOrderId: 'wo-3' }),
+      runRecord({ runId: RUN_D, attemptIds: ['a4'], workOrderId: 'wo-4' }),
     ];
     const workOrders = new Map([
-      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a/x.ts'] }],
-      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a/y.ts'] }],
+      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a/src'] }],
+      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a/src/adapters'] }],
       ['wo-3', { repository: 'other/repo', ownedPaths: ['packages/a'] }],
+      ['wo-4', { repository: 'acme/repo', ownedPaths: ['packages/a/test'] }],
     ]);
     const schedule = deriveConductorSchedule(facts({ runs, workOrders }), NOW);
     const overlapsOf = (runId: string) => schedule.rows.find((row) => row.runId === runId)?.overlapsWith;
     expect(overlapsOf(RUN_A)).toEqual([RUN_B]);
     expect(overlapsOf(RUN_B)).toEqual([RUN_A]);
     expect(overlapsOf(RUN_C)).toEqual([]);
+    expect(overlapsOf(RUN_D)).toEqual([]);
   });
 
   it('flags an unreadable work order with a package-overlap wait', () => {
@@ -219,8 +234,83 @@ describe('deriveConductorSchedule', () => {
     expect(schedule.rows.find((row) => row.runId === RUN_B)?.admissionWait).toBe('package-overlap');
   });
 
-  it('omits caps when no trace is recorded', () => {
-    const run = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1' });
+  it('declares revision, stopMode and stopRequestedAtIso as required row fields', () => {
+    const row = deriveConductorSchedule(facts({ runs: [runRecord({ runId: RUN_A, attemptIds: ['a1'] })] }), NOW).rows[0]!;
+    // Required at the type level (fails typecheck on an optional field) and present at runtime.
+    const typed: { revision: number; stopMode: unknown; stopRequestedAtIso: unknown } = row;
+    expect(Object.keys(typed)).toEqual(expect.arrayContaining(['revision', 'stopMode', 'stopRequestedAtIso']));
+    expect(typeof row.revision).toBe('number');
+    const incomplete: ConductorScheduleRow = {
+      ...row,
+      // @ts-expect-error revision is required on a schedule row
+      revision: undefined,
+    };
+    expect(incomplete.runId).toBe(row.runId);
+  });
+
+  it('projects revision, stop facts and stop parks on each row', () => {
+    const run = runRecord({ runId: RUN_A, attemptIds: ['a1'] });
+    // No stop entry: nulls, with the record's revision carried through.
+    const none = deriveConductorSchedule(facts({ runs: [run] }), NOW);
+    expect(none.rows[0]).toMatchObject({ revision: 1, stopMode: null, stopRequestedAtIso: null });
+
+    // A graceful @web stop intent: stopMode graceful with its request time.
+    const gracefulAt = '2026-10-27T09:00:00.000Z';
+    const withGraceful = deriveConductorSchedule(
+      facts({
+        runs: [run],
+        journals: new Map([
+          [RUN_A, [stopIntentEntry('e1', RUN_A, mustBuild(laneRunStopKey(RUN_A, 'web')), 'graceful', gracefulAt)]],
+        ]),
+      }),
+      NOW,
+    );
+    expect(withGraceful.rows[0]).toMatchObject({ stopMode: 'graceful', stopRequestedAtIso: gracefulAt });
+
+    // Escalation to forced: the strongest mode wins and the request time stays the first intent's.
+    const forcedAt = '2026-10-27T09:30:00.000Z';
+    const withForced = deriveConductorSchedule(
+      facts({
+        runs: [run],
+        journals: new Map([
+          [
+            RUN_A,
+            [
+              stopIntentEntry('e1', RUN_A, mustBuild(laneRunStopKey(RUN_A, 'web')), 'graceful', gracefulAt),
+              stopIntentEntry('e2', RUN_A, mustBuild(laneRunStopForceKey(RUN_A, 'web')), 'force', forcedAt),
+            ],
+          ],
+        ]),
+      }),
+      NOW,
+    );
+    expect(withForced.rows[0]).toMatchObject({ stopMode: 'force', stopRequestedAtIso: gracefulAt });
+
+    // Parked runs keep their park projection, qualifier included.
+    const unconfirmed = runRecord({
+      runId: RUN_B,
+      attemptIds: ['a2'],
+      parked: { reason: 'stop-unconfirmed', qualifier: null, parkedFrom: 'running', questionId: null },
+      parkCount: 1,
+    });
+    const refused = runRecord({
+      runId: RUN_C,
+      attemptIds: ['a3'],
+      parked: { reason: 'stop-refused', qualifier: 'runner-refused', parkedFrom: 'running', questionId: null },
+      parkCount: 1,
+    });
+    const parked = deriveConductorSchedule(facts({ runs: [unconfirmed, refused] }), NOW);
+    expect(parked.rows.find((row) => row.runId === RUN_B)?.park).toEqual({
+      reason: 'stop-unconfirmed',
+      qualifier: null,
+    });
+    expect(parked.rows.find((row) => row.runId === RUN_C)?.park).toEqual({
+      reason: 'stop-refused',
+      qualifier: 'runner-refused',
+    });
+  });
+
+  it('omits caps when no trace is recorded', () => {    const run = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1' });
     const workOrders = new Map([['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a'] }]]);
     const schedule = deriveConductorSchedule(facts({ runs: [run], workOrders }), NOW);
     expect(schedule.caps).toBeNull();
@@ -370,12 +460,12 @@ describe('deriveConductorSchedule', () => {
     expect(schedule.queues).toEqual([]);
   });
 
-  it('two runs sharing a package on different bases still overlap and wait', () => {
+  it('two runs whose owned files overlap on different bases still overlap and wait', () => {
     const active = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1', baseBranch: 'chain/a' });
     const waiting = runRecord({ runId: RUN_B, attemptIds: ['a2'], workOrderId: 'wo-2', baseBranch: 'main' });
     const workOrders = new Map([
-      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a'] }],
-      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a'] }],
+      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a/src'] }],
+      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a/src/adapters'] }],
     ]);
     const schedule = deriveConductorSchedule(
       facts({ runs: [active, waiting], reservations: [reservation({ attemptId: 'a1' })], workOrders }),
@@ -383,6 +473,21 @@ describe('deriveConductorSchedule', () => {
     );
     expect(schedule.rows.find((row) => row.runId === RUN_A)?.overlapsWith).toEqual([RUN_B]);
     expect(schedule.rows.find((row) => row.runId === RUN_B)?.admissionWait).toBe('package-overlap');
+  });
+
+  it('rows of one package with disjoint files do not overlap or wait', () => {
+    const active = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1' });
+    const waiting = runRecord({ runId: RUN_B, attemptIds: ['a2'], workOrderId: 'wo-2' });
+    const workOrders = new Map([
+      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a/src'] }],
+      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a/test'] }],
+    ]);
+    const schedule = deriveConductorSchedule(
+      facts({ runs: [active, waiting], reservations: [reservation({ attemptId: 'a1' })], workOrders }),
+      NOW,
+    );
+    expect(schedule.rows.find((row) => row.runId === RUN_A)?.overlapsWith).toEqual([]);
+    expect(schedule.rows.find((row) => row.runId === RUN_B)?.admissionWait).toBeNull();
   });
 });
 
@@ -402,7 +507,7 @@ describe('deriveSessionStartMarks', () => {
       buildLaneRunStepKey({ runId: RUN_A, round: 0, step: 'code-review', seatIndex: 0, attemptOrdinal: null, head12: 'fedcba987654', retry: null }),
     );
     const collectKey = mustBuild(
-      buildLaneRunStepKey({ runId: RUN_A, round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: null, head12: null, retry: null }),
+      buildLaneRunStepKey({ runId: RUN_A, round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null, retry: null }),
     );
     return [
       laneRunIntentEntry('e1', RUN_A, dispatchKey, null, T0),

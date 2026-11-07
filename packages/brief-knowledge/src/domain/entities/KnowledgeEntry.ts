@@ -13,12 +13,17 @@
 import { containsSecretShape } from '@fleet/shared';
 import type {
   KnowledgeCheckRecord,
+  KnowledgeClaimKind,
   KnowledgeEntryRecord,
   KnowledgeReuseRecord,
 } from '../knowledge-records.js';
 import {
+  DEFAULT_KNOWLEDGE_CLAIM_KIND,
+  KNOWLEDGE_CLAIM_KINDS,
   KNOWLEDGE_TRIAGE_FLAGS,
+  MAX_FAILED_CLAIM_TEXT_CHARS,
   MAX_OVERRIDE_REASON_CHARS,
+  isKnowledgeClaimKind,
   isKnowledgeTriageFlag,
 } from '../knowledge-records.js';
 import type { KnowledgeDispositionValue } from '../value-objects/KnowledgeDisposition.vo.js';
@@ -34,24 +39,14 @@ export class KnowledgeEntry {
   }
 
   static fromRecord(record: KnowledgeEntryRecord): KnowledgeEntry {
-    if (typeof record.id !== 'string' || record.id.trim().length === 0) {
-      throw new Error('KnowledgeEntry requires a non-empty id');
-    }
-    if (typeof record.version !== 'string' || record.version.trim().length === 0) {
-      throw new Error('KnowledgeEntry requires a non-empty version');
-    }
-    if (typeof record.projectId !== 'string' || record.projectId.trim().length === 0) {
-      throw new Error('KnowledgeEntry requires a non-empty projectId');
-    }
-    if (typeof record.sourceAttemptId !== 'string' || record.sourceAttemptId.trim().length === 0) {
-      throw new Error('KnowledgeEntry requires a non-empty sourceAttemptId');
-    }
-    if (typeof record.sourceCommitSha !== 'string' || record.sourceCommitSha.trim().length === 0) {
-      throw new Error('KnowledgeEntry requires a non-empty sourceCommitSha');
-    }
-    if (typeof record.claimText !== 'string' || record.claimText.trim().length === 0) {
-      throw new Error('KnowledgeEntry requires a non-empty claimText');
-    }
+    assertRequiredStringField(record.id, 'id');
+    assertRequiredStringField(record.version, 'version');
+    assertRequiredStringField(record.projectId, 'projectId');
+    assertRequiredStringField(record.sourceAttemptId, 'sourceAttemptId');
+    assertRequiredStringField(record.sourceCommitSha, 'sourceCommitSha');
+    assertRequiredStringField(record.claimText, 'claimText');
+    const claimKind = resolveClaimKind(record);
+    assertFailedClaimTextWithinCap(record, claimKind);
     if (!Array.isArray(record.pathPrefixes) || !record.pathPrefixes.every((entry) => typeof entry === 'string')) {
       throw new Error('KnowledgeEntry requires string pathPrefixes');
     }
@@ -66,21 +61,9 @@ export class KnowledgeEntry {
     if (!verification.success) {
       throw new Error(`KnowledgeEntry has an invalid verification: ${String(record.verification)}`);
     }
-    if (record.checkerId !== null && (typeof record.checkerId !== 'string' || record.checkerId.trim().length === 0)) {
-      throw new Error('KnowledgeEntry checkerId must be null or a non-empty string');
-    }
-    if (
-      record.dispositionReason !== null &&
-      (typeof record.dispositionReason !== 'string' || record.dispositionReason.trim().length === 0)
-    ) {
-      throw new Error('KnowledgeEntry dispositionReason must be null or a non-empty string');
-    }
-    if (
-      record.supersededById !== null &&
-      (typeof record.supersededById !== 'string' || record.supersededById.trim().length === 0)
-    ) {
-      throw new Error('KnowledgeEntry supersededById must be null or a non-empty string');
-    }
+    assertNullableNonEmptyStringField(record.checkerId, 'checkerId');
+    assertNullableNonEmptyStringField(record.dispositionReason, 'dispositionReason');
+    assertNullableNonEmptyStringField(record.supersededById, 'supersededById');
     // Triage fields are optional so records written before triage existed
     // load unchanged; when present each must be individually well formed.
     // Refusal, never redaction: a credential-shaped reason never persists.
@@ -95,14 +78,7 @@ export class KnowledgeEntry {
     if (record.disposition === 'superseded' && record.supersededById === null) {
       throw new Error('A superseded entry must link the newer entry that replaced it');
     }
-    if (record.disposition === 'accepted') {
-      if (record.verification !== 'supported') {
-        throw new Error('An accepted keeper requires supported verification');
-      }
-      if (record.checkerId === null || record.checkerId.trim().length === 0) {
-        throw new Error('An accepted keeper requires a checker identity');
-      }
-    }
+    assertAcceptedKeeper(record);
     if (!Array.isArray(record.checks)) {
       throw new Error('KnowledgeEntry requires a checks array');
     }
@@ -112,24 +88,12 @@ export class KnowledgeEntry {
     if (!Number.isInteger(record.revision) || record.revision < 0) {
       throw new Error('KnowledgeEntry requires a non-negative integer revision');
     }
-    if (typeof record.createdAtIso !== 'string' || record.createdAtIso.trim().length === 0) {
-      throw new Error('KnowledgeEntry requires a non-empty createdAtIso');
-    }
-    if (typeof record.updatedAtIso !== 'string' || record.updatedAtIso.trim().length === 0) {
-      throw new Error('KnowledgeEntry requires a non-empty updatedAtIso');
-    }
+    assertRequiredStringField(record.createdAtIso, 'createdAtIso');
+    assertRequiredStringField(record.updatedAtIso, 'updatedAtIso');
     const checks = record.checks.map((check) => KnowledgeCheck.fromRecord(check).toRecord());
-    for (const check of checks) {
-      if (check.entryId !== record.id) {
-        throw new Error(`KnowledgeCheck ${check.id} does not belong to entry ${record.id}`);
-      }
-    }
+    assertJournalEntriesBelongToEntry(checks, record.id, 'KnowledgeCheck');
     const reuses = record.reuses.map((reuse) => KnowledgeReuse.fromRecord(reuse).toRecord());
-    for (const reuse of reuses) {
-      if (reuse.entryId !== record.id) {
-        throw new Error(`KnowledgeReuse ${reuse.id} does not belong to entry ${record.id}`);
-      }
-    }
+    assertJournalEntriesBelongToEntry(reuses, record.id, 'KnowledgeReuse');
     return new KnowledgeEntry({ ...record, pathPrefixes: [...record.pathPrefixes], checks, reuses });
   }
 
@@ -159,6 +123,16 @@ export class KnowledgeEntry {
 
   getCheckerId(): string | null {
     return this.record.checkerId;
+  }
+
+  /** The kind this claim asserts; an entry written before kinds existed reads as `fact`. */
+  getClaimKind(): KnowledgeClaimKind {
+    return this.record.claimKind ?? DEFAULT_KNOWLEDGE_CLAIM_KIND;
+  }
+
+  /** True for an approach that was tried and disproved. */
+  isFailedClaim(): boolean {
+    return this.getClaimKind() === 'failed';
   }
 
   getChecks(): readonly KnowledgeCheckRecord[] {
@@ -339,5 +313,81 @@ function validateOverrideReasonShape(value: string, label: string): void {
   }
   if (containsSecretShape(value)) {
     throw new Error(`${label} must not contain a credential shape`);
+  }
+}
+
+/**
+ * Resolve a record's claim kind: an unknown kind is refused; an absent one
+ * reads as the default.
+ */
+function resolveClaimKind(record: KnowledgeEntryRecord): KnowledgeClaimKind {
+  if (record.claimKind !== undefined && !isKnowledgeClaimKind(record.claimKind)) {
+    throw new Error(
+      `KnowledgeEntry claimKind must be one of ${KNOWLEDGE_CLAIM_KINDS.join(', ')}`,
+    );
+  }
+  return record.claimKind ?? DEFAULT_KNOWLEDGE_CLAIM_KIND;
+}
+
+/** A failed claim's text is bounded by the failed-claim cap. */
+function assertFailedClaimTextWithinCap(
+  record: KnowledgeEntryRecord,
+  claimKind: KnowledgeClaimKind,
+): void {
+  if (claimKind === 'failed' && record.claimText.length > MAX_FAILED_CLAIM_TEXT_CHARS) {
+    throw new Error(
+      `KnowledgeEntry claimText must be at most ${MAX_FAILED_CLAIM_TEXT_CHARS} characters for a failed claim`,
+    );
+  }
+}
+
+/**
+ * A required record field is a non-empty string. Anything else is refused
+ * with the field's name in the message.
+ */
+function assertRequiredStringField(value: string, field: string): void {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`KnowledgeEntry requires a non-empty ${field}`);
+  }
+}
+
+/**
+ * An optional record field is null or a non-empty string. Anything else is
+ * refused with the field's name in the message.
+ */
+function assertNullableNonEmptyStringField(value: string | null, field: string): void {
+  if (value !== null && (typeof value !== 'string' || value.trim().length === 0)) {
+    throw new Error(`KnowledgeEntry ${field} must be null or a non-empty string`);
+  }
+}
+
+/**
+ * An accepted entry is a keeper: it carries supported verification and a
+ * checker identity. Anything else is refused.
+ */
+function assertAcceptedKeeper(record: KnowledgeEntryRecord): void {
+  if (record.disposition === 'accepted') {
+    if (record.verification !== 'supported') {
+      throw new Error('An accepted keeper requires supported verification');
+    }
+    if (record.checkerId === null || record.checkerId.trim().length === 0) {
+      throw new Error('An accepted keeper requires a checker identity');
+    }
+  }
+}
+
+/**
+ * Every journal entry belongs to exactly one entry: a check or a reuse
+ * recorded under another entry's id is refused.
+ */
+function assertJournalEntriesBelongToEntry(
+  entries: readonly { id: string; entryId: string }[],
+  entryId: string,
+  label: string,
+): void {
+  for (const entry of entries) {
+    if (entry.entryId !== entryId) {
+      throw new Error(`${label} ${entry.id} does not belong to entry ${entryId}`);
+    }
   }
 }

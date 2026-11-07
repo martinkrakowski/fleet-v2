@@ -1,20 +1,24 @@
 import { isAbsolute } from 'node:path';
 
-import { isValidHostName } from '@fleet/shared';
+import { containsSecretShape, isValidHostName } from '@fleet/shared';
 
 import { AGY_SECURITY_TEXT_VERSION } from './agy-security.js';
 
 import type {
   AutoMergePolicy,
+  BoardPolicySection,
   ChainStep,
   ChainTrigger,
   ChainsSection,
   ConductorPolicy,
+  ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
   ConductorReaperRepairs,
+  ConductorReaperWorktreePolicy,
   CostClass,
   CoverageReaderName,
   CoverageUnitKind,
+  DaemonSection,
   DecisionConsumers,
   DecisionsSectionV2,
   FallbackSeat,
@@ -26,7 +30,12 @@ import type {
   HostRole,
   HostSection,
   HostRunnerSection,
+  HostTransport,
   LiveTailPolicy,
+  MergeDaemonSection,
+  MergePolicySection,
+  MergeRepositoryPolicy,
+  MergeVetoPolicy,
   PolicySection,
   ProcedureCoverage,
   ReviewerSection,
@@ -45,187 +54,86 @@ import type {
   WorktreeSection,
 } from './types.js';
 
-import { CONDUCTOR_MINUTE_BOUNDS, CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
+import {
+  BOARD_BOUNDS,
+  CONDUCTOR_MINUTE_BOUNDS,
+  CONDUCTOR_REAPER_DISK_BOUNDS,
+  CONDUCTOR_REAPER_WORKTREE_BOUNDS,
+  DEFAULT_MERGE_DAEMON_POLICY,
+  MERGE_POLICY_BOUNDS,
+  parseMergeRepositoryKey,
+} from './policy.js';
+import { readOwnDataProperty } from './policy-read.js';
+import {
+  AGY_ACKNOWLEDGEMENT_KEYS,
+  AGY_HOST_RUNNER_KEYS,
+  AGY_ONLY_RUNNER_KEYS,
+  ANSWER_FILE_DECISIONS_KEYS,
+  AUTO_MERGE_KEYS,
+  BOARD_KEYS,
+  CAPABILITY_KEYS,
+  CHAIN_KEYS,
+  CHAIN_STEP_KEYS,
+  CLAIM_TRIAGE_CONSUMER_KEYS,
+  CONDUCTOR_KEYS,
+  CONDUCTOR_REAPER_DISK_KEYS,
+  CONDUCTOR_REAPER_KEYS,
+  CONDUCTOR_REAPER_REPAIR_KINDS,
+  CONDUCTOR_REAPER_WORKTREE_KEYS,
+  DAEMON_KEYS,
+  DECISION_CONSUMERS_KEYS,
+  FORBIDDEN_ROUTE_KEYS,
+  FORGE_KEYS,
+  GATE_SLOT_KEYS,
+  GITHUB_FORGE_KEYS,
+  GIT_SHELF_KEYS,
+  HOST_KEYS,
+  HOST_ROLES,
+  JEV_DECISIONS_KEYS,
+  KNOWLEDGE_RANKING_CONSUMER_KEYS,
+  LIVE_TAIL_KEYS,
+  LOCAL_SHELF_KEYS,
+  MERGE_KEYS,
+  MERGE_REPO_KEYS,
+  MERGE_VETO_KEYS,
+  NO_DECISIONS_KEYS,
+  NO_FORGE_KEYS,
+  POLICY_DAEMON_KEYS,
+  POLICY_KEYS,
+  PROCEDURE_COVERAGE_KEYS,
+  PROCEDURE_KEYS,
+  RUNNER_KEYS,
+  SEAT_KEYS,
+  SHELF_KEYS,
+  V1_ROOT_KEYS,
+  V2_ROOT_KEYS,
+  V2_SEAT_KEYS,
+  V2_VERIFICATION_KEYS,
+  VERIFICATION_KEYS,
+  WAVES_KEYS,
+  WORKTREE_KEYS,
+} from './keys.js';
+
+export { POLICY_KEYS };
 import { readTelemetryPolicyBlock } from './telemetry-policy.js';
 import { readSeatsPolicyBlock } from './seats-policy.js';
 
 export type ParseResult =
-  | { ok: true; installation: FleetInstallation }
+  | { ok: true; installation: FleetInstallation; warnings?: string[] }
   | { ok: false; errors: string[] };
 
 type JsonObject = { readonly [key: string]: unknown };
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
-const V1_ROOT_KEYS: readonly string[] = [
-  'schemaVersion',
-  'runner',
-  'worktree',
-  'verification',
-  'forge',
-  'reviewer',
-  'waves',
-  'shelf',
-];
-const V2_ROOT_KEYS: readonly string[] = [
-  'schemaVersion',
-  'hosts',
-  'tools',
-  'seats',
-  'chains',
-  'policy',
-  'shelf',
-  'forge',
-  'verification',
-  'waves',
-  'decisions',
-];
-const RUNNER_KEYS: readonly string[] = [
-  'agent',
-  'model',
-  'variant',
-  'remotePort',
-  'host',
-  'ocmRunBin',
-  'fallbackChain',
-];
-const WORKTREE_KEYS: readonly string[] = ['sshHost'];
-const VERIFICATION_KEYS: readonly string[] = ['sshHost', 'procedures'];
-const V2_VERIFICATION_KEYS: readonly string[] = ['procedures'];
-const PROCEDURE_KEYS: readonly string[] = ['command', 'args', 'coverage'];
-const PROCEDURE_COVERAGE_KEYS: readonly string[] = [
-  'reader',
-  'unitKind',
-  'minUnits',
-];
 const READER_UNIT_KINDS: Readonly<Record<CoverageReaderName, CoverageUnitKind>> = {
   'vitest-summary': 'tests',
   'hexagen-lint-json': 'files',
   'eslint-json': 'files',
 };
-const FORGE_KEYS: readonly string[] = ['owner', 'repo'];
-const SEAT_KEYS: readonly string[] = ['agent', 'model', 'variant'];
-const WAVES_KEYS: readonly string[] = [
-  'baseUrl',
-  'tokenFile',
-  'caFile',
-  'ownerPublicKey',
-];
-const SHELF_KEYS: readonly string[] = ['baseUrl', 'keyFile'];
-const HOST_KEYS: readonly string[] = [
-  'transport',
-  'sshAlias',
-  'worktreeRoot',
-  'tmpDir',
-  'roles',
-  'runner',
-];
-const HOST_RUNNER_KEYS: readonly string[] = [
-  'kind',
-  'port',
-  'authFile',
-  'capabilities',
-  'maxLanes',
-  'gateSlot',
-];
-const GATE_SLOT_KEYS: readonly string[] = ['path', 'slots'];
-// An agy runner carries the mode and, for `full`, the security acknowledgement (D7).
-const AGY_HOST_RUNNER_KEYS: readonly string[] = [
-  ...HOST_RUNNER_KEYS,
-  'agyMode',
-  'agyAcknowledgement',
-];
-const AGY_ACKNOWLEDGEMENT_KEYS: readonly string[] = [
-  'textVersion',
-  'acceptedAt',
-];
-const CAPABILITY_KEYS: readonly string[] = [
-  'networkEgressRestricted',
-  'cpuAndMemoryLimited',
-  'processTreeTermination',
-  'filesystemScope',
-];
-const V2_SEAT_KEYS: readonly string[] = [
-  'id',
-  'tool',
-  'model',
-  'variant',
-  'agent',
-  'roles',
-  'costClass',
-  'health',
-];
-const CHAIN_KEYS: readonly (keyof ChainsSection)[] = [
-  'implementer',
-  'reviewer',
-  'high-risk-reviewer',
-  'fix',
-];
-const CHAIN_STEP_KEYS: readonly string[] = ['seatId', 'triggers'];
-const POLICY_KEYS: readonly string[] = [
-  'forbiddenRoutes',
-  'perLaneCostCeiling',
-  'useFreeSeats',
-  'liveTail',
-  'autoMerge',
-  'conductor',
-  'telemetry',
-  'seats',
-];
-const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
-const LIVE_TAIL_KEYS: readonly string[] = ['content'];
-const AUTO_MERGE_KEYS: readonly string[] = ['enabled', 'allowHighRisk', 'onBlocked'];
-const CONDUCTOR_KEYS: readonly string[] = ['enabled', 'stopGraceMinutes', 'reaper'];
-const CONDUCTOR_REAPER_KEYS: readonly string[] = [
-  'enabled',
-  'intervalMinutes',
-  'graceMinutes',
-  'staleStopMinutes',
-  'repairs',
-];
-const GIT_SHELF_KEYS: readonly string[] = [
-  'provider',
-  'repoDir',
-  'branch',
-  'pathPrefix',
-];
-const GITHUB_FORGE_KEYS: readonly string[] = ['mode', 'owner', 'repo'];
-const NO_DECISIONS_KEYS: readonly string[] = ['provider'];
-const JEV_DECISIONS_KEYS: readonly string[] = [
-  'provider',
-  'model',
-  'keyFile',
-  'minConfidence',
-  'monthlyBudgetUsd',
-  'assumedCostPerCallUsd',
-  'acknowledgeProseLeavesHost',
-  'disabledProjects',
-  'consumers',
-];
-const ANSWER_FILE_DECISIONS_KEYS: readonly string[] = [
-  'provider',
-  'answerFile',
-  'consumers',
-];
-// Per-consumer settings (K3): two known consumers, each with its own keys.
-const DECISION_CONSUMERS_KEYS: readonly (keyof DecisionConsumers)[] = [
-  'knowledge-ranking',
-  'claim-triage',
-];
-const KNOWLEDGE_RANKING_CONSUMER_KEYS: readonly string[] = [
-  'minConfidence',
-  'monthlyBudgetUsd',
-];
-const CLAIM_TRIAGE_CONSUMER_KEYS: readonly string[] = [
-  'minConfidence',
-  'monthlyBudgetUsd',
-  'acknowledgeCandidateClaimsLeaveHost',
-];
-
-const HOST_ROLES: readonly HostRole[] = [
-  'orchestrator',
-  'lane-runner',
-  'verifier',
-];
+// Credential shapes a daemon field never carries: the raw string is checked
+// (the value is never echoed), so a prefix anywhere in it refuses the path.
+const DAEMON_CREDENTIAL_PATTERN =
+  /ghp_|github_pat_|sk-|AKIA|PRIVATE KEY|xox[barps]-/;
 const SEAT_ROLES: readonly SeatRole[] = [
   'implementer',
   'reviewer',
@@ -242,6 +150,11 @@ const CHAIN_TRIGGERS: readonly ChainTrigger[] = [
 ];
 
 const PROCEDURE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+/** Container names share the procedure-name shape; see parseHostContainer. */
+const CONTAINER_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const MAX_CONTAINER_NAME_LENGTH = 64;
+/** The tunnel offset is bounded so a dial port stays far below 65535. */
+const MAX_TUNNEL_OFFSET = 1024;
 const FORBIDDEN_PROCEDURE_NAMES: ReadonlySet<string> = new Set([
   'constructor',
   'prototype',
@@ -442,6 +355,38 @@ function readOptionalAbsolutePath(
     return undefined;
   }
   return value.trim();
+}
+
+/**
+ * A daemon section path field: an absolute path that carries no whitespace or
+ * unit/shell metacharacters and no credential shape. Reuses
+ * `readRequiredAbsolutePath`; every message names only the field.
+ */
+function readRequiredDaemonPath(
+  record: JsonObject,
+  key: string,
+  fieldPath: string,
+  errors: string[],
+): string | undefined {
+  const raw = record[key];
+  const value = readRequiredAbsolutePath(record, key, fieldPath, errors);
+  if (value === undefined) {
+    return undefined;
+  }
+  // The credential check comes first so a value carrying both a credential
+  // shape and a refused character reports `refused`, never the milder shape
+  // error, and the credential prefix is never echoed either way.
+  if (typeof raw === 'string' && DAEMON_CREDENTIAL_PATTERN.test(raw)) {
+    errors.push(`${fieldPath}: refused`);
+    return undefined;
+  }
+  if (/\s/.test(value) || /["'`\\{}%*?]/.test(value)) {
+    errors.push(
+      `${fieldPath}: must be an absolute path with no spaces or quotes`,
+    );
+    return undefined;
+  }
+  return value;
 }
 
 function isCanonicalBase64Of32Bytes(value: string): boolean {
@@ -1078,6 +1023,70 @@ function parseGateSlot(
   return { path, slots };
 }
 
+/**
+ * Read one optional own property without ever running a getter. An accessor
+ * property is reported as `accessor`, never treated as an absent field, so
+ * the caller refuses it with a typed message instead of accepting the file.
+ */
+function readOptionalDataField(
+  record: JsonObject,
+  key: string,
+):
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'accessor' }
+  | { readonly kind: 'value'; readonly value: unknown } {
+  if (!Object.hasOwn(record, key)) {
+    return { kind: 'absent' };
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  if (descriptor === undefined || 'get' in descriptor || 'set' in descriptor) {
+    return { kind: 'accessor' };
+  }
+  return descriptor.value === undefined
+    ? { kind: 'absent' }
+    : { kind: 'value', value: descriptor.value };
+}
+
+/**
+ * The optional `hosts.<name>.runner.tunnelOffset` field: how far above
+ * `runner.port` the bundled runner program dials the server. The frozen
+ * `bin/ocm-run` dials `port + 1` and refuses a different `OCM_PORT`, so the
+ * file may only declare the offset that program implements; absent means 1.
+ */
+function parseRunnerTunnelOffset(
+  runner: JsonObject,
+  runnerPath: string,
+  errors: string[],
+): number | undefined {
+  const fieldPath = `${runnerPath}.tunnelOffset`;
+  // Read without running a getter; an accessor is refused, not absent.
+  const field = readOptionalDataField(runner, 'tunnelOffset');
+  if (field.kind === 'absent') {
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > MAX_TUNNEL_OFFSET
+  ) {
+    errors.push(`${fieldPath}: must be an integer from 0 to ${MAX_TUNNEL_OFFSET}`);
+    return undefined;
+  }
+  if (value !== 1) {
+    errors.push(
+      `${fieldPath}: must be 1 while the bundled runner program dials the server at port + 1`,
+    );
+    return undefined;
+  }
+  return value;
+}
+
 function parseHostRunner(
   runner: JsonObject,
   runnerPath: string,
@@ -1094,13 +1103,18 @@ function parseHostRunner(
   );
   // The agy-only fields are unknown keys on an opencode runner (D7).
   if (kind === 'opencode') {
-    for (const agyOnlyKey of ['agyMode', 'agyAcknowledgement']) {
+    for (const agyOnlyKey of AGY_ONLY_RUNNER_KEYS) {
       if (Object.hasOwn(runner, agyOnlyKey)) {
         errors.push(`${runnerPath}: unknown key`);
       }
     }
   }
   const port = readRequiredPort(runner, 'port', `${runnerPath}.port`, errors);
+  const tunnelOffset = parseRunnerTunnelOffset(
+    runner,
+    runnerPath,
+    errors,
+  );
   const authFile = readOptionalAbsolutePath(
     runner,
     'authFile',
@@ -1155,6 +1169,7 @@ function parseHostRunner(
   }
   const common = {
     port,
+    ...(tunnelOffset !== undefined ? { tunnelOffset } : {}),
     ...(authFile !== undefined ? { authFile } : {}),
     ...(capabilities !== undefined ? { capabilities } : {}),
     ...(maxLanes !== undefined ? { maxLanes } : {}),
@@ -1240,6 +1255,124 @@ export function isSafeSshHost(host: string): boolean {
   return SAFE_SSH_HOST_PATTERN.test(host);
 }
 
+/**
+ * The optional `hosts.<name>.container` field: a lowercase container name the
+ * host's runner runs in. A refused value never appears in the message.
+ */
+function parseHostContainer(
+  entry: JsonObject,
+  hostPath: string,
+  errors: string[],
+): string | undefined {
+  const fieldPath = `${hostPath}.container`;
+  // An accessor property is refused, never treated as an absent field.
+  const field = readOptionalDataField(entry, 'container');
+  if (field.kind === 'absent') {
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (typeof value !== 'string' || !isNonEmptyString(value)) {
+    errors.push(`${fieldPath}: must be a non-empty string`);
+    return undefined;
+  }
+  if (value !== value.trim()) {
+    errors.push(`${fieldPath}: must not have leading or trailing whitespace`);
+    return undefined;
+  }
+  const name = value;
+  if (name.length > MAX_CONTAINER_NAME_LENGTH) {
+    errors.push(`${fieldPath}: must be at most 64 characters`);
+    return undefined;
+  }
+  // The credential check comes first, so a value carrying both a secret
+  // shape and a bad identifier shape reports the credential refusal and
+  // never the shape refusal.
+  if (containsSecretShape(name)) {
+    errors.push(`${fieldPath}: must not contain secret-shaped text`);
+    return undefined;
+  }
+  if (!CONTAINER_NAME_PATTERN.test(name)) {
+    errors.push(
+      `${fieldPath}: must be a lowercase container name matching ^[a-z0-9][a-z0-9-]*$`,
+    );
+    return undefined;
+  }
+  return name;
+}
+
+/**
+ * The optional `hosts.<name>.roleAliases` map: one ssh alias per held role
+ * that overrides the host's own alias for that role. Only an ssh host may
+ * declare it, only held roles may appear as keys, and every value must pass
+ * the loader's own safe-host rule. A refused value never appears in the
+ * message.
+ */
+function parseHostRoleAliases(
+  entry: JsonObject,
+  hostPath: string,
+  transport: HostTransport | undefined,
+  roles: readonly HostRole[] | undefined,
+  errors: string[],
+): Partial<Record<HostRole, string>> | undefined {
+  const fieldPath = `${hostPath}.roleAliases`;
+  // An accessor property is refused, never treated as an absent field.
+  const field = readOptionalDataField(entry, 'roleAliases');
+  if (field.kind === 'absent') {
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (!isJsonObject(value)) {
+    errors.push(`${fieldPath}: must be an object`);
+    return undefined;
+  }
+  if (transport === 'local') {
+    // A local host has no alias to override.
+    errors.push(`${fieldPath}: must be absent when transport is "local"`);
+    return undefined;
+  }
+  if (roles === undefined) {
+    // The roles field already carried its own refusal; do not add more.
+    return undefined;
+  }
+  const aliases: Partial<Record<HostRole, string>> = {};
+  for (const key of Object.keys(value)) {
+    if (!HOST_ROLES.includes(key as HostRole)) {
+      // The key is operator input and never appears in the message.
+      errors.push(`${fieldPath}: every key must be a known host role`);
+      continue;
+    }
+    if (!roles.includes(key as HostRole)) {
+      errors.push(`${fieldPath}.${key}: the host does not hold that role`);
+      continue;
+    }
+    // Read through the record's own data property so a getter never runs.
+    const rawAlias = readOwnDataProperty(value, key);
+    if (!isNonEmptyString(rawAlias)) {
+      errors.push(`${fieldPath}.${key}: must be a non-empty string`);
+      continue;
+    }
+    // Validated as supplied: a padded alias is refused, never trimmed.
+    const alias = rawAlias;
+    if (!isSafeSshHost(alias)) {
+      // The value never appears in the message: an alias is operator input.
+      errors.push(
+        `${fieldPath}.${key}: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option`,
+      );
+      continue;
+    }
+    aliases[key as HostRole] = alias;
+  }
+  return Object.keys(aliases).length > 0 ? aliases : undefined;
+}
+
 function parseHost(
   entry: JsonObject,
   hostPath: string,
@@ -1284,6 +1417,7 @@ function parseHost(
     `${hostPath}.worktreeRoot`,
     errors,
   );
+  const container = parseHostContainer(entry, hostPath, errors);
   const tmpDir = readOptionalAbsolutePath(
     entry,
     'tmpDir',
@@ -1295,6 +1429,13 @@ function parseHost(
     hostPath,
     HOST_ROLES,
     'must be a known host role',
+    errors,
+  );
+  const roleAliases = parseHostRoleAliases(
+    entry,
+    hostPath,
+    transport,
+    roles,
     errors,
   );
   let runner: HostRunnerSection | undefined;
@@ -1323,6 +1464,8 @@ function parseHost(
   return {
     transport,
     ...(sshAlias !== undefined ? { sshAlias } : {}),
+    ...(container !== undefined ? { container } : {}),
+    ...(roleAliases !== undefined ? { roleAliases } : {}),
     worktreeRoot,
     ...(tmpDir !== undefined ? { tmpDir } : {}),
     roles,
@@ -1378,10 +1521,13 @@ function parseV2Hosts(
     }
     // Every host with a runner takes part in the dial-port rule, whatever the
     // runner kind: a local host dials its own `port`, an ssh host the
-    // `port + 1` forward. Two equal dial ports would race for one server.
+    // `port + tunnelOffset` forward (the offset the bundled runner program
+    // implements; absent means 1). Two equal dial ports would race for one
+    // server.
     if (host.runner !== undefined) {
+      const offset = host.runner.tunnelOffset ?? 1;
       const dialPort =
-        host.transport === 'local' ? host.runner.port : host.runner.port + 1;
+        host.transport === 'local' ? host.runner.port : host.runner.port + offset;
       if (dialPort > 65535) {
         // An ssh host on 65535 would need forward port 65536, which cannot be bound.
         errors.push(
@@ -1646,6 +1792,7 @@ function parseV2Chains(
 function parseV2Policy(
   value: JsonObject,
   errors: string[],
+  warnings: string[],
 ): PolicySection | undefined {
   if (!Object.hasOwn(value, 'policy')) {
     return undefined;
@@ -1716,8 +1863,11 @@ function parseV2Policy(
   const liveTail = parseLiveTailPolicy(section, errors);
   const autoMerge = parseAutoMergePolicy(section, errors);
   const conductor = parseConductorPolicy(section, errors);
+  const board = parseBoardPolicy(section, errors);
   const telemetry = parsePolicyBlock(section, 'telemetry', readTelemetryPolicyBlock, errors);
   const seats: SeatsPolicy | undefined = parsePolicyBlock(section, 'seats', readSeatsPolicyBlock, errors);
+  const merge = parseMergePolicy(section, errors);
+  const daemon = parseMergeDaemonPolicy(section, errors, warnings);
   return {
     ...(forbiddenRoutes !== undefined ? { forbiddenRoutes } : {}),
     ...(perLaneCostCeiling !== undefined ? { perLaneCostCeiling } : {}),
@@ -1725,8 +1875,11 @@ function parseV2Policy(
     ...(liveTail !== undefined ? { liveTail } : {}),
     ...(autoMerge !== undefined ? { autoMerge } : {}),
     ...(conductor !== undefined ? { conductor } : {}),
+    ...(board !== undefined ? { board } : {}),
     ...(telemetry !== undefined ? { telemetry } : {}),
     ...(seats !== undefined ? { seats } : {}),
+    ...(merge !== undefined ? { merge } : {}),
+    ...(daemon !== undefined ? { daemon } : {}),
   };
 }
 
@@ -1874,7 +2027,7 @@ function parseConductorRepairs(
     if (!Object.hasOwn(value, kind)) {
       continue;
     }
-    const flag = value[kind];
+    const flag = readOwnDataProperty(value, kind);
     if (typeof flag !== 'boolean') {
       errors.push(`policy.conductor.reaper.repairs.${kind}: must be a boolean`);
       continue;
@@ -1882,6 +2035,116 @@ function parseConductorRepairs(
     repairs[kind] = flag;
   }
   return repairs;
+}
+
+function readConductorReaperNumber(
+  record: JsonObject,
+  field: string,
+  path: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, field)) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(record as Record<string, unknown>, field);
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < bounds.min ||
+    value > bounds.max
+  ) {
+    errors.push(`${path}.${field}: must be an integer ${bounds.min}..${bounds.max}`);
+    return undefined;
+  }
+  return value;
+}
+
+function parseConductorWorktrees(
+  reaper: JsonObject,
+  errors: string[],
+): ConductorReaperWorktreePolicy | undefined {
+  if (!Object.hasOwn(reaper, 'worktrees')) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(reaper as Record<string, unknown>, 'worktrees');
+  if (!isJsonObject(value)) {
+    errors.push('policy.conductor.reaper.worktrees: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(
+    value,
+    CONDUCTOR_REAPER_WORKTREE_KEYS,
+    'policy.conductor.reaper.worktrees',
+    errors,
+  );
+  const retentionHours = readConductorReaperNumber(
+    value,
+    'retentionHours',
+    'policy.conductor.reaper.worktrees',
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.retentionHours,
+    errors,
+  );
+  const maxRemovalsPerPass = readConductorReaperNumber(
+    value,
+    'maxRemovalsPerPass',
+    'policy.conductor.reaper.worktrees',
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.maxRemovalsPerPass,
+    errors,
+  );
+  const passBudgetSeconds = readConductorReaperNumber(
+    value,
+    'passBudgetSeconds',
+    'policy.conductor.reaper.worktrees',
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.passBudgetSeconds,
+    errors,
+  );
+  return {
+    ...(retentionHours !== undefined ? { retentionHours } : {}),
+    ...(maxRemovalsPerPass !== undefined ? { maxRemovalsPerPass } : {}),
+    ...(passBudgetSeconds !== undefined ? { passBudgetSeconds } : {}),
+  };
+}
+
+function parseConductorDisk(
+  reaper: JsonObject,
+  errors: string[],
+): ConductorReaperDiskPolicy | undefined {
+  if (!Object.hasOwn(reaper, 'disk')) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(reaper as Record<string, unknown>, 'disk');
+  if (!isJsonObject(value)) {
+    errors.push('policy.conductor.reaper.disk: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(
+    value,
+    CONDUCTOR_REAPER_DISK_KEYS,
+    'policy.conductor.reaper.disk',
+    errors,
+  );
+  const minFreePercent = readConductorReaperNumber(
+    value,
+    'minFreePercent',
+    'policy.conductor.reaper.disk',
+    CONDUCTOR_REAPER_DISK_BOUNDS.minFreePercent,
+    errors,
+  );
+  const clearFreePercent = readConductorReaperNumber(
+    value,
+    'clearFreePercent',
+    'policy.conductor.reaper.disk',
+    CONDUCTOR_REAPER_DISK_BOUNDS.clearFreePercent,
+    errors,
+  );
+  if ((minFreePercent ?? 15) >= (clearFreePercent ?? 20)) {
+    errors.push('policy.conductor.reaper.disk: minFreePercent must be less than clearFreePercent');
+  }
+  return {
+    ...(minFreePercent !== undefined ? { minFreePercent } : {}),
+    ...(clearFreePercent !== undefined ? { clearFreePercent } : {}),
+  };
 }
 
 function parseConductorReaper(
@@ -1921,6 +2184,8 @@ function parseConductorReaper(
     errors,
   );
   const repairs = parseConductorRepairs(value, errors);
+  const worktrees = parseConductorWorktrees(value, errors);
+  const disk = parseConductorDisk(value, errors);
   if (errors.length !== before || enabled === undefined) {
     return undefined;
   }
@@ -1930,6 +2195,8 @@ function parseConductorReaper(
     ...(graceMinutes !== undefined ? { graceMinutes } : {}),
     ...(staleStopMinutes !== undefined ? { staleStopMinutes } : {}),
     ...(repairs !== undefined ? { repairs } : {}),
+    ...(worktrees !== undefined ? { worktrees } : {}),
+    ...(disk !== undefined ? { disk } : {}),
   };
 }
 
@@ -1963,6 +2230,443 @@ function parseConductorPolicy(
     enabled,
     ...(stopGraceMinutes !== undefined ? { stopGraceMinutes } : {}),
     ...(reaper !== undefined ? { reaper } : {}),
+  };
+}
+
+function readBoardMinutes(
+  record: JsonObject,
+  field: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, field)) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(record as Record<string, unknown>, field);
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < bounds.min ||
+    value > bounds.max
+  ) {
+    errors.push(`policy.board.${field}: must be an integer ${bounds.min}..${bounds.max}`);
+    return undefined;
+  }
+  return value;
+}
+
+function parseBoardPolicy(
+  section: JsonObject,
+  errors: string[],
+): BoardPolicySection | undefined {
+  if (!Object.hasOwn(section, 'board')) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(section as Record<string, unknown>, 'board');
+  if (!isJsonObject(value)) {
+    errors.push('policy.board: must be an object');
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, BOARD_KEYS, 'policy.board', errors);
+  const forgeStaleMinutes = readBoardMinutes(
+    value,
+    'forgeStaleMinutes',
+    BOARD_BOUNDS.forgeStaleMinutes,
+    errors,
+  );
+  const declarationTtlMinutes = readBoardMinutes(
+    value,
+    'declarationTtlMinutes',
+    BOARD_BOUNDS.declarationTtlMinutes,
+    errors,
+  );
+  const doneWindowDays = readBoardMinutes(
+    value,
+    'doneWindowDays',
+    BOARD_BOUNDS.doneWindowDays,
+    errors,
+  );
+  const forgeSyncMinutes = readBoardMinutes(
+    value,
+    'forgeSyncMinutes',
+    BOARD_BOUNDS.forgeSyncMinutes,
+    errors,
+  );
+  if (errors.length !== before) {
+    return undefined;
+  }
+  return {
+    ...(forgeStaleMinutes !== undefined ? { forgeStaleMinutes } : {}),
+    ...(declarationTtlMinutes !== undefined ? { declarationTtlMinutes } : {}),
+    ...(doneWindowDays !== undefined ? { doneWindowDays } : {}),
+    ...(forgeSyncMinutes !== undefined ? { forgeSyncMinutes } : {}),
+  };
+}
+
+function mergeRepositoryPath(key: string, index: number): string {
+  const readable = parseMergeRepositoryKey(key) !== undefined && !containsSecretShape(key);
+  const label = readable ? JSON.stringify(key) : `#${index}`;
+  return `policy.merge.repos[${label}]`;
+}
+
+function readMergeText(
+  record: JsonObject,
+  field: string,
+  path: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): string | undefined {
+  const value = record[field];
+  if (typeof value !== 'string') {
+    errors.push(`${path}.${field}: must be a string`);
+    return undefined;
+  }
+  if (containsSecretShape(value)) {
+    errors.push(`${path}.${field}: must not contain secret-shaped text`);
+    return undefined;
+  }
+  if (value.length < bounds.min || value.length > bounds.max || value.trim() === '') {
+    errors.push(
+      `${path}.${field}: must be a non-blank string of ${bounds.min} to ${bounds.max} characters`,
+    );
+    return undefined;
+  }
+  return value;
+}
+
+function readMergeBoolean(
+  record: JsonObject,
+  field: string,
+  path: string,
+  errors: string[],
+): boolean | undefined {
+  const value = record[field];
+  if (typeof value !== 'boolean') {
+    errors.push(`${path}.${field}: must be a boolean`);
+    return undefined;
+  }
+  return value;
+}
+
+function readMergeInteger(
+  record: JsonObject,
+  field: string,
+  path: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): number | undefined {
+  const value = record[field];
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < bounds.min ||
+    value > bounds.max
+  ) {
+    errors.push(`${path}.${field}: must be an integer between ${bounds.min} and ${bounds.max}`);
+    return undefined;
+  }
+  return value;
+}
+
+function readMergeRequiredContexts(
+  record: JsonObject,
+  path: string,
+  errors: string[],
+): readonly string[] | undefined {
+  const value = record.requiredContexts;
+  const bounds = MERGE_POLICY_BOUNDS.requiredContexts;
+  const lengths = MERGE_POLICY_BOUNDS.requiredContextLength;
+  const field = `${path}.requiredContexts`;
+  if (!Array.isArray(value)) {
+    errors.push(`${field}: must be an array`);
+    return undefined;
+  }
+  if (value.length < bounds.min || value.length > bounds.max) {
+    errors.push(`${field}: must hold ${bounds.min} to ${bounds.max} entries`);
+    return undefined;
+  }
+  const contexts: string[] = [];
+  let valid = true;
+  for (let index = 0; index < value.length; index += 1) {
+    const entry: unknown = readOwnDataProperty(
+      value as unknown as Record<string, unknown>,
+      String(index),
+    );
+    if (typeof entry !== 'string') {
+      errors.push(`${field}[${index}]: must be a string`);
+      valid = false;
+    } else if (containsSecretShape(entry)) {
+      errors.push(`${field}[${index}]: must not contain secret-shaped text`);
+      valid = false;
+    } else if (entry.length < lengths.min || entry.length > lengths.max || entry.trim() === '') {
+      errors.push(
+        `${field}[${index}]: must be a non-blank string of ${lengths.min} to ${lengths.max} characters`,
+      );
+      valid = false;
+    } else if (contexts.includes(entry)) {
+      errors.push(`${field}[${index}]: must be unique`);
+      valid = false;
+    } else {
+      contexts.push(entry);
+    }
+  }
+  return valid ? contexts : undefined;
+}
+
+function parseMergeVeto(
+  record: JsonObject,
+  path: string,
+  errors: string[],
+): MergeVetoPolicy | undefined {
+  const value = record.veto;
+  const field = `${path}.veto`;
+  if (!isJsonObject(value)) {
+    errors.push(`${field}: must be an object`);
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, MERGE_VETO_KEYS, field, errors);
+  let mode: MergeVetoPolicy['mode'];
+  if (Object.hasOwn(value, 'mode')) {
+    const candidate = value.mode;
+    if (candidate !== 'off' && candidate !== 'shadow' && candidate !== 'live') {
+      errors.push(`${field}.mode: must be one of off, shadow, live`);
+    } else {
+      mode = candidate;
+    }
+  }
+  let holdConfidence: number | undefined;
+  if (Object.hasOwn(value, 'holdConfidence')) {
+    const candidate = value.holdConfidence;
+    const bounds = MERGE_POLICY_BOUNDS.holdConfidence;
+    if (
+      typeof candidate !== 'number' ||
+      !Number.isFinite(candidate) ||
+      candidate < bounds.min ||
+      candidate > bounds.max
+    ) {
+      errors.push(`${field}.holdConfidence: must be a number between ${bounds.min} and ${bounds.max}`);
+    } else {
+      holdConfidence = candidate;
+    }
+  }
+  if (errors.length !== before) {
+    return undefined;
+  }
+  return {
+    ...(mode !== undefined ? { mode } : {}),
+    ...(holdConfidence !== undefined ? { holdConfidence } : {}),
+  };
+}
+
+type MergeRepositoryFields = {
+  readonly [K in keyof Omit<Required<MergeRepositoryPolicy>, 'projectId'>]:
+    | Required<MergeRepositoryPolicy>[K]
+    | undefined;
+};
+
+function ifPresent<T>(entry: JsonObject, field: string, read: () => T): T | undefined {
+  return Object.hasOwn(entry, field) ? read() : undefined;
+}
+
+function checkMergeRepositoryKey(key: string, path: string, errors: string[]): void {
+  if (parseMergeRepositoryKey(key) === undefined) {
+    errors.push(`${path}: key must be <owner>/<repo>`);
+  } else if (containsSecretShape(key)) {
+    errors.push(`${path}: key must not contain secret-shaped text`);
+  }
+}
+
+function readMergeProjectId(entry: JsonObject, path: string, errors: string[]): string | undefined {
+  if (!Object.hasOwn(entry, 'projectId')) {
+    errors.push(`${path}.projectId: required`);
+    return undefined;
+  }
+  return readMergeText(entry, 'projectId', path, MERGE_POLICY_BOUNDS.projectIdLength, errors);
+}
+
+function buildMergeRepositoryPolicy(
+  projectId: string,
+  fields: MergeRepositoryFields,
+): MergeRepositoryPolicy {
+  const { shadow, unattended, requiredContexts, updateBranch } = fields;
+  const { macosProcedure, maxAttempts, checksGraceMinutes, veto } = fields;
+  return {
+    projectId,
+    ...(shadow !== undefined ? { shadow } : {}),
+    ...(unattended !== undefined ? { unattended } : {}),
+    ...(requiredContexts !== undefined ? { requiredContexts } : {}),
+    ...(updateBranch !== undefined ? { updateBranch } : {}),
+    ...(macosProcedure !== undefined ? { macosProcedure } : {}),
+    ...(maxAttempts !== undefined ? { maxAttempts } : {}),
+    ...(checksGraceMinutes !== undefined ? { checksGraceMinutes } : {}),
+    ...(veto !== undefined ? { veto } : {}),
+  };
+}
+
+function parseMergeRepository(
+  key: string,
+  index: number,
+  entry: unknown,
+  errors: string[],
+): MergeRepositoryPolicy | undefined {
+  const path = mergeRepositoryPath(key, index);
+  const before = errors.length;
+  checkMergeRepositoryKey(key, path, errors);
+  if (!isJsonObject(entry)) {
+    errors.push(`${path}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(entry, MERGE_REPO_KEYS, path, errors);
+  const projectId = readMergeProjectId(entry, path, errors);
+  const fields: MergeRepositoryFields = {
+    shadow: ifPresent(entry, 'shadow', () => readMergeBoolean(entry, 'shadow', path, errors)),
+    unattended: ifPresent(entry, 'unattended', () =>
+      readMergeBoolean(entry, 'unattended', path, errors),
+    ),
+    requiredContexts: ifPresent(entry, 'requiredContexts', () =>
+      readMergeRequiredContexts(entry, path, errors),
+    ),
+    updateBranch: ifPresent(entry, 'updateBranch', () =>
+      readMergeBoolean(entry, 'updateBranch', path, errors),
+    ),
+    macosProcedure: ifPresent(entry, 'macosProcedure', () =>
+      readMergeText(entry, 'macosProcedure', path, MERGE_POLICY_BOUNDS.macosProcedureLength, errors),
+    ),
+    maxAttempts: ifPresent(entry, 'maxAttempts', () =>
+      readMergeInteger(entry, 'maxAttempts', path, MERGE_POLICY_BOUNDS.maxAttempts, errors),
+    ),
+    checksGraceMinutes: ifPresent(entry, 'checksGraceMinutes', () =>
+      readMergeInteger(
+        entry,
+        'checksGraceMinutes',
+        path,
+        MERGE_POLICY_BOUNDS.checksGraceMinutes,
+        errors,
+      ),
+    ),
+    veto: ifPresent(entry, 'veto', () => parseMergeVeto(entry, path, errors)),
+  };
+  if (errors.length !== before || projectId === undefined) {
+    return undefined;
+  }
+  return buildMergeRepositoryPolicy(projectId, fields);
+}
+
+function readMergeRepos(
+  written: unknown,
+  errors: string[],
+): Record<string, MergeRepositoryPolicy> | undefined {
+  if (!isJsonObject(written)) {
+    errors.push('policy.merge.repos: must be an object');
+    return undefined;
+  }
+  if (Object.keys(written).length > MERGE_POLICY_BOUNDS.repositories.max) {
+    errors.push(`policy.merge.repos: at most ${MERGE_POLICY_BOUNDS.repositories.max} entries`);
+    return undefined;
+  }
+  const repos: Record<string, MergeRepositoryPolicy> = {};
+  let index = 0;
+  for (const key of Object.keys(written)) {
+    const entry = parseMergeRepository(key, index, written[key], errors);
+    if (entry !== undefined) {
+      repos[key] = entry;
+    }
+    index += 1;
+  }
+  return repos;
+}
+
+function parseMergePolicy(
+  section: JsonObject,
+  errors: string[],
+): MergePolicySection | undefined {
+  if (!Object.hasOwn(section, 'merge')) {
+    return undefined;
+  }
+  const value = section.merge;
+  if (!isJsonObject(value)) {
+    errors.push('policy.merge: must be an object');
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, MERGE_KEYS, 'policy.merge', errors);
+  const repos = ifPresent(value, 'repos', () => readMergeRepos(value.repos, errors));
+  if (errors.length !== before) {
+    return undefined;
+  }
+  return repos !== undefined ? { repos } : {};
+}
+
+function parseMergeDaemonPolicy(
+  section: JsonObject,
+  errors: string[],
+  warnings: string[],
+): MergeDaemonSection | undefined {
+  if (!Object.hasOwn(section, 'daemon')) {
+    return undefined;
+  }
+  const value = section.daemon;
+  if (!isJsonObject(value)) {
+    errors.push('policy.daemon: must be an object');
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, POLICY_DAEMON_KEYS, 'policy.daemon', errors);
+  const read = (field: 'intervalSeconds' | 'budgetSeconds' | 'settleSeconds'): number | undefined =>
+    Object.hasOwn(value, field)
+      ? readMergeInteger(value, field, 'policy.daemon', MERGE_POLICY_BOUNDS[field], errors)
+      : undefined;
+  const intervalSeconds = read('intervalSeconds');
+  const budgetSeconds = read('budgetSeconds');
+  const settleSeconds = read('settleSeconds');
+  // PT1a: like `chainRefresh`, a bad `stallAfterMinutes` is a warning, never an error: it gates
+  // only the stall attention, so it must not stop the installation from loading or the merge
+  // pass from running. The raw value is kept so a write round-trips the operator's own text;
+  // the resolver reads the default (30). The warning names the key and a code, never the value.
+  const stallAfterMinutes: unknown = Object.hasOwn(value, 'stallAfterMinutes')
+    ? value.stallAfterMinutes
+    : undefined;
+  const stallBounds = MERGE_POLICY_BOUNDS.stallAfterMinutes;
+  if (
+    Object.hasOwn(value, 'stallAfterMinutes') &&
+    !(
+      typeof stallAfterMinutes === 'number' &&
+      Number.isInteger(stallAfterMinutes) &&
+      stallAfterMinutes >= stallBounds.min &&
+      stallAfterMinutes <= stallBounds.max
+    )
+  ) {
+    warnings.push('policy.daemon.stallAfterMinutes: stall-after-minutes-invalid');
+  }
+  // CO8a: an unknown or `live` `chainRefresh` is a warning, never an error:
+  // the file still parses and the raw value round-trips so the operator sees
+  // and fixes their own text. The warning names the key and the reason code
+  // only, never the value.
+  if (Object.hasOwn(value, 'chainRefresh') && value.chainRefresh !== 'shadow') {
+    warnings.push('policy.daemon.chainRefresh: chain-refresh-mode-invalid');
+  }
+  if (
+    errors.length === before &&
+    (budgetSeconds ?? DEFAULT_MERGE_DAEMON_POLICY.budgetSeconds) >=
+      (intervalSeconds ?? DEFAULT_MERGE_DAEMON_POLICY.intervalSeconds)
+  ) {
+    errors.push('policy.daemon.budgetSeconds: must be less than intervalSeconds');
+  }
+  if (errors.length !== before) {
+    return undefined;
+  }
+  return {
+    ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
+    ...(budgetSeconds !== undefined ? { budgetSeconds } : {}),
+    ...(settleSeconds !== undefined ? { settleSeconds } : {}),
+    ...(Object.hasOwn(value, 'stallAfterMinutes')
+      ? { stallAfterMinutes: stallAfterMinutes as MergeDaemonSection['stallAfterMinutes'] }
+      : {}),
+    ...(Object.hasOwn(value, 'chainRefresh')
+      ? { chainRefresh: value.chainRefresh as MergeDaemonSection['chainRefresh'] }
+      : {}),
   };
 }
 
@@ -2002,7 +2706,7 @@ function parseV2Shelf(
   }
   const provider = section.provider;
   if (provider === 'local') {
-    collectUnknownKeys(section, ['provider'], 'shelf', errors);
+    collectUnknownKeys(section, LOCAL_SHELF_KEYS, 'shelf', errors);
     return { provider: 'local' };
   }
   if (provider === 'git') {
@@ -2061,7 +2765,7 @@ function parseV2Forge(
   }
   const mode = section.mode;
   if (mode === 'none') {
-    collectUnknownKeys(section, ['mode'], 'forge', errors);
+    collectUnknownKeys(section, NO_FORGE_KEYS, 'forge', errors);
     return { mode: 'none' };
   }
   if (mode === 'github') {
@@ -2391,6 +3095,66 @@ function parseV2Decisions(
   return undefined;
 }
 
+/**
+ * Parse the optional v2 `daemon` section: five required absolute paths with no
+ * whitespace, shell/unit metacharacters or credential shapes (CO6). Unknown
+ * keys are refused; messages name only the field, never a value.
+ */
+function parseV2Daemon(
+  value: JsonObject,
+  errors: string[],
+): DaemonSection | undefined {
+  if (!Object.hasOwn(value, 'daemon')) {
+    return undefined;
+  }
+  const section = value.daemon;
+  if (!isJsonObject(section)) {
+    errors.push('daemon: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(section, DAEMON_KEYS, 'daemon', errors);
+  const nodePath = readRequiredDaemonPath(
+    section,
+    'nodePath',
+    'daemon.nodePath',
+    errors,
+  );
+  const cliPath = readRequiredDaemonPath(
+    section,
+    'cliPath',
+    'daemon.cliPath',
+    errors,
+  );
+  const stateDir = readRequiredDaemonPath(
+    section,
+    'stateDir',
+    'daemon.stateDir',
+    errors,
+  );
+  const unitDir = readRequiredDaemonPath(
+    section,
+    'unitDir',
+    'daemon.unitDir',
+    errors,
+  );
+  const installationFile = readRequiredDaemonPath(
+    section,
+    'installationFile',
+    'daemon.installationFile',
+    errors,
+  );
+  if (
+    nodePath === undefined ||
+    cliPath === undefined ||
+    stateDir === undefined ||
+    unitDir === undefined ||
+    installationFile === undefined
+  ) {
+    return undefined;
+  }
+  return { nodePath, cliPath, stateDir, unitDir, installationFile };
+}
+
 function parseV2Verification(
   value: JsonObject,
   errors: string[],
@@ -2427,14 +3191,20 @@ function parseV2Verification(
  * D6) hold.
  */
 export function parseInstallation(value: unknown): ParseResult {
-  if (!isJsonObject(value)) {
-    return { ok: false, errors: ['installation: must be an object'] };
+  try {
+    if (!isJsonObject(value)) {
+      return { ok: false, errors: ['installation: must be an object'] };
+    }
+    // Read the discriminator through the record's own data property so a
+    // getter never runs.
+    const version = readOwnDataProperty(value, 'schemaVersion');
+    if (version === 2) {
+      return parseInstallationV2(value);
+    }
+    return parseInstallationV1(value);
+  } catch {
+    return { ok: false, errors: ['installation: unreadable'] };
   }
-  const version = value.schemaVersion;
-  if (version === 2) {
-    return parseInstallationV2(value);
-  }
-  return parseInstallationV1(value);
 }
 
 function parseInstallationV1(value: JsonObject): ParseResult {
@@ -2444,7 +3214,7 @@ function parseInstallationV1(value: JsonObject): ParseResult {
   if (!Object.hasOwn(value, 'schemaVersion')) {
     errors.push('schemaVersion: required');
   } else {
-    const version = value.schemaVersion;
+    const version = readOwnDataProperty(value, 'schemaVersion');
     if (
       typeof version !== 'number' ||
       !Number.isInteger(version) ||
@@ -2493,6 +3263,7 @@ function parseInstallationV1(value: JsonObject): ParseResult {
 
 function parseInstallationV2(value: JsonObject): ParseResult {
   const errors: string[] = [];
+  const warnings: string[] = [];
   collectUnknownKeys(value, V2_ROOT_KEYS, 'installation', errors);
 
   const hosts = parseV2Hosts(value, errors);
@@ -2500,12 +3271,13 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   const seats = parseV2Seats(value, errors);
   const knownSeatIds = new Set<string>((seats ?? []).map((seat) => seat.id));
   const chains = parseV2Chains(value, knownSeatIds, errors);
-  const policy = parseV2Policy(value, errors);
+  const policy = parseV2Policy(value, errors, warnings);
   const shelf = parseV2Shelf(value, errors);
   const forge = parseV2Forge(value, errors);
   const verification = parseV2Verification(value, errors);
   const waves = parseWavesSection(value, errors);
   const decisions = parseV2Decisions(value, errors);
+  const daemon = parseV2Daemon(value, errors);
 
   if (errors.length > 0) {
     return { ok: false, errors };
@@ -2545,5 +3317,8 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   if (decisions !== undefined) {
     installation.decisions = decisions;
   }
-  return { ok: true, installation };
+  if (daemon !== undefined) {
+    installation.daemon = daemon;
+  }
+  return { ok: true, installation, ...(warnings.length > 0 ? { warnings } : {}) };
 }

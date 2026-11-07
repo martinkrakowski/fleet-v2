@@ -41,6 +41,10 @@ import type {
 import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
+import type { StallAttentionPort } from '../ports/out/StallAttentionPort.out-port.js';
+import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+import { stalledRunsOf } from '../../domain/stall-attention.js';
+import { DEFAULT_STALL_THRESHOLDS } from '../../domain/stall-rules.js';
 import { ConductorDriverLeaseKeeper, holdConductorLease } from './conductor-driver-lease-keeper.js';
 
 export interface RunConductorPassDependencies {
@@ -70,6 +74,16 @@ export interface RunConductorPassDependencies {
    * this class has always been; nothing changes until an operator opts in.
    */
   readonly passConcurrency?: number;
+  /**
+   * PT1a: raise one `stall:<runId>` attention item per run parked longer than
+   * `stallAfterMinutes`, refresh it on later passes and clear it when the run
+   * leaves `parked`. Absent: the pass raises and clears nothing.
+   */
+  readonly stallAttention?: StallAttentionPort;
+  /** PT1a: reads the stalled run's project id for its attention item; a run whose work order is unreadable raises nothing. */
+  readonly workOrderRepo?: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'>;
+  /** PT1a: `policy.daemon.stallAfterMinutes`; absent reads as the default (30). */
+  readonly stallAfterMinutes?: number;
 }
 
 const DEFAULT_DISPATCH_STAGGER_MS = 20_000;
@@ -294,7 +308,63 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
           (step) => step.outcome === 'entered' || step.outcome === 'repaired' || step.outcome === 'acted',
         ),
     );
+    await this.reconcileStallAttention();
     return { outcome: 'completed', halted: control.sawHalted(), progressed, runs: reports, attention };
+  }
+
+  /**
+   * PT1a: one attention item per stalled run, refreshed every pass and cleared
+   * when the run no longer stalls (resumed, ended or its park reset). Reads the
+   * runs again after the advances, so a run this pass resumed clears at once.
+   * Failure-tolerant like the park notice: a refused call, an unreadable store
+   * or a throw never changes the pass, and the next pass converges. A run
+   * whose project cannot be read raises nothing and keeps any open item.
+   */
+  private async reconcileStallAttention(): Promise<void> {
+    const port = this.deps.stallAttention;
+    const workOrderRepo = this.deps.workOrderRepo;
+    if (port === undefined || workOrderRepo === undefined) {
+      return;
+    }
+    try {
+      const records = await this.deps.runRepo.list();
+      const journals = await journalsForRuns(
+        this.deps.runJournal,
+        records.map((record) => record.runId),
+      );
+      const stalled = stalledRunsOf({
+        records,
+        journals,
+        stallAfterMinutes: this.deps.stallAfterMinutes ?? DEFAULT_STALL_THRESHOLDS.parkedMinutes,
+        nowIso: this.nowIso(),
+      });
+      const stalledIds = new Set<string>();
+      for (const view of stalled) {
+        stalledIds.add(view.runId);
+        const workOrder = await workOrderRepo.findWorkOrderById(view.workOrderId);
+        if (workOrder === null) {
+          continue;
+        }
+        await port.raiseStallAttention({
+          projectId: workOrder.projectId,
+          workOrderId: view.workOrderId,
+          runId: view.runId,
+          parkClass: view.parkClass,
+          ageMinutes: view.ageMinutes,
+        });
+      }
+      const open = await port.listOpenStallAttention();
+      if (open.outcome !== 'found') {
+        return;
+      }
+      for (const item of open.items) {
+        if (!stalledIds.has(item.runId)) {
+          await port.clearStallAttention(item);
+        }
+      }
+    } catch {
+      // Swallowed on purpose: stall attention is advisory and the next pass repeats it.
+    }
   }
 
   async releaseLeases(request: RunConductorPassRequest): Promise<{ readonly released: number }> {

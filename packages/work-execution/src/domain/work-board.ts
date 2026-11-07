@@ -7,10 +7,10 @@
  */
 
 import {
-  BOARD_GATING_OWNER_ITEM_KINDS,
   BOARD_SOURCES,
   DEFAULT_BOARD_POLICY,
   formatLaneRef,
+  isPlainText,
   parseTimeMs,
   WORK_BOARD_SCHEMA_VERSION,
 } from './work-board-facts.js';
@@ -20,20 +20,19 @@ import type {
   BoardFacts,
   BoardMergeFact,
   BoardOptions,
-  BoardOwnerItemFact,
-  BoardOwnerItemKind,
   BoardPlanFact,
+  BoardPlannedLaneFact,
   BoardPlannedLaneStatus,
   BoardPolicy,
   BoardPullRequestLinkFact,
-  BoardQuestionFact,
   BoardRunFact,
   BoardSource,
   BoardWorkOrderFact,
   LaneRef,
   SourceReading,
 } from './work-board-facts.js';
-import { planTextError } from './lane-plan-sidecar.js';
+import { deriveOwnerEntries } from './owner-entries.js';
+import type { BoardOwnerEntry } from './owner-entries.js';
 import {
   boardStepText,
   laneBadges,
@@ -74,6 +73,67 @@ export interface BoardOwnerReason {
   readonly sinceIso: string;
 }
 
+/** Why a queued or waiting lane cannot start (work-board plan §3.6, plus `cycle-in-records`, WB2c). */
+export type WaitReason =
+  | 'after-not-done' | 'after-unresolved' | 'after-dropped'
+  | 'package-occupied' | 'shared-file-held' | 'exclusive-order'
+  | 'owner-decision' | 'project-lane-cap' | 'capacity' | 'seat' | 'brief'
+  | 'cycle-in-records';
+
+export type GuardState = 'blocked' | 'unknown' | 'clear';
+
+export type BoardLaneColumn =
+  | 'done' | 'in-flight' | 'queued' | 'waiting' | 'dropped' | 'deferred' | 'unresolved' | 'not-read';
+
+/** The subject lane as the board sees it now (waits-for plan §3.1). */
+export interface LaneGlance {
+  readonly ref: LaneRef;
+  readonly label: string;
+  readonly column: BoardLaneColumn;
+  readonly step?: string;
+  readonly pr?: { readonly repository: string; readonly number: number; readonly state: 'open' | 'closed' | 'merged';
+                  readonly asOfIso?: string; readonly stale: boolean };
+  readonly declared?: { readonly atIso: string; readonly lapsed: boolean };
+  readonly waitingOn?: { readonly itemId: string; readonly itemKind: 'merge' | 'decision' | 'secret'; readonly subject: string };
+}
+
+/** Exactly one subject per row (waits-for plan §3.1). */
+export type WaitSubject =
+  | { readonly kind: 'lane'; readonly lane: LaneGlance }
+  | { readonly kind: 'package'; readonly name: string; readonly heldBy: LaneGlance | null }
+  | { readonly kind: 'shared-file'; readonly path: string; readonly heldBy: LaneGlance }
+  | { readonly kind: 'project-slots'; readonly projectId: string; readonly held: number; readonly cap: number }
+  | { readonly kind: 'capacity'; readonly held: number; readonly budget: number }
+  | { readonly kind: 'seat'; readonly role: string | null }
+  | { readonly kind: 'brief'; readonly path: string; readonly sha256?: string; readonly readAtIso?: string; readonly lastFailedAtIso?: string }
+  | { readonly kind: 'owner-item'; readonly itemId: string; readonly itemKind: 'merge' | 'decision' | 'secret';
+      readonly subject: string; readonly sinceIso: string }
+  | { readonly kind: 'plan-decision'; readonly projectId: string; readonly planId: string; readonly decisionId: string }
+  | { readonly kind: 'plan'; readonly projectId: string; readonly planId: string }
+  | { readonly kind: 'cycle'; readonly path: LaneRef[] };
+
+/** What would change this row; its text is rendered once, in the domain. */
+export type ClearedBy =
+  | { readonly kind: 'done'; readonly subject: LaneRef }
+  | { readonly kind: 'holder-ends'; readonly lane: LaneRef; readonly what: 'package' | 'shared-file' }
+  | { readonly kind: 'owner'; readonly itemId: string }
+  | { readonly kind: 'release'; readonly what: 'project-slot' | 'capacity' }
+  | { readonly kind: 'record'; readonly what: 'seat-probe' | 'brief-read' | 'forge-sync' | 'plan-import' | 'declaration-renewal' }
+  | { readonly kind: 'edit'; readonly what: 'after' | 'exclusive-order' }
+  | { readonly kind: 'read'; readonly source: BoardSource }
+  | { readonly kind: 'integrity'; readonly what: 'cycle' };
+
+/** One row of `waitsOn` (waits-for plan §3.1). */
+export interface WaitGuard {
+  readonly reason: WaitReason;
+  readonly state: GuardState;
+  readonly subject: WaitSubject;
+  readonly clearedBy: ClearedBy;
+  readonly clearedByText: string;
+  readonly sources: readonly SourceReading[];
+  readonly unreadBeside: readonly BoardSource[];
+}
+
 export interface BoardLaneCard {
   readonly key: string;                       // formatLaneRef(ref)
   readonly ref: LaneRef;
@@ -99,21 +159,11 @@ export interface BoardLaneCard {
   readonly pullRequests: readonly BoardPrStatus[];
   readonly reviewCounts: BoardReviewCounts | null;
   readonly badges: readonly BoardBadge[];
-}
-
-/** One entry of the deduplicated owner-items list (plan §3.1 identity rule). */
-export interface BoardOwnerEntry {
-  readonly origin: 'owner-item' | 'question';
-  readonly id: string;
-  readonly projectId: string | null;          // null for a question
-  readonly kind: BoardOwnerItemKind;
-  readonly subject: string | null;            // an item's subject, a question's title
-  readonly sinceIso: string;
-  readonly gating: boolean;                   // a gating kind (a question is a decision)
-  readonly gatesLanes: readonly string[];     // card keys where it is the Waiting reason; sorted
-  readonly namesLanes: readonly string[];     // card keys named in blocks or refs; sorted
-  readonly placement: 'lane-reason' | 'own-card';
-  readonly questionIds: readonly string[];    // questions folded into this item; sorted
+  /** The wait guards, only for queued and waiting cards (WB2b); empty otherwise. */
+  readonly waitsOn: readonly WaitGuard[];
+  readonly waitCounts: { readonly blocked: number; readonly unknown: number; readonly clear: number };
+  readonly firstBlocker: WaitGuard | null;
+  readonly summary: string;
 }
 
 export type BoardDoneEntry =
@@ -205,6 +255,10 @@ interface Card {
   round: number | null;
   reviewCounts: BoardReviewCounts | null;
   badges: BoardBadge[];
+  waitsOn: WaitGuard[];
+  waitCounts: { blocked: number; unknown: number; clear: number };
+  firstBlocker: WaitGuard | null;
+  summary: string;
 }
 
 function stringAsc(a: string, b: string): number {
@@ -256,18 +310,8 @@ function resolveLaneRef(ref: LaneRef, facts: BoardFacts): LaneRef {
   return ref;
 }
 
-/**
- * The plain-text rule the board applies to its own display text: a work-order
- * lane id becomes a card label, and a question title becomes a subject, only
- * when it passes the plan sidecar's plain-text rule (`planTextError`).
- */
-const BOARD_TEXT_MAX_BYTES = 1024;
 /** The label of a plan-lane card whose lane id, matched to no imported lane, is not plain text. */
 const UNNAMED_PLAN_LANE_LABEL = 'Unnamed plan lane';
-
-export function isPlainText(text: string): boolean {
-  return planTextError('text', text, BOARD_TEXT_MAX_BYTES) === null;
-}
 
 function makeCard(ref: LaneRef, facts: BoardFacts): Card {
   const isPlan = ref.kind === 'plan';
@@ -327,6 +371,10 @@ function makeCard(ref: LaneRef, facts: BoardFacts): Card {
     round: null,
     reviewCounts: null,
     badges: [],
+    waitsOn: [],
+    waitCounts: { blocked: 0, unknown: 0, clear: 0 },
+    firstBlocker: null,
+    summary: '',
   };
 }
 
@@ -452,166 +500,6 @@ function buildCards(facts: BoardFacts): Card[] {
   return cards;
 }
 
-interface EntryDraft {
-  origin: 'owner-item' | 'question';
-  id: string;
-  projectId: string | null;
-  kind: BoardOwnerItemKind;
-  subject: string | null;
-  sinceIso: string;
-  gating: boolean;
-  namesLanes: Set<string>;
-  gatesLanes: Set<string>;
-  questionIds: Set<string>;
-}
-
-function parseLaneBlockRef(text: string, projectId: string): LaneRef | null {
-  const parts = text.split('/');
-  if (parts.length === 2) {
-    return { kind: 'plan', projectId, planId: parts[0], laneId: parts[1] };
-  }
-  if (parts.length === 3) {
-    return { kind: 'plan', projectId: parts[0], planId: parts[1], laneId: parts[2] };
-  }
-  return null;
-}
-
-function isClosedQuestion(question: BoardQuestionFact): boolean {
-  if (question.state !== 'answered' && question.state !== 'acknowledged') return false;
-  const answer = question.answer;
-  if (!answer) return false;
-  if (answer.shape === 'accept') return true;
-  if (answer.shape === 'answer' && (answer.hasOption || answer.hasText)) return true;
-  return false;
-}
-
-function draftForItem(item: BoardOwnerItemFact, cardByKey: Map<string, Card>, facts: BoardFacts): EntryDraft {
-  const gating = (BOARD_GATING_OWNER_ITEM_KINDS as readonly BoardOwnerItemKind[]).includes(item.kind);
-  const names = new Set<string>();
-  const gates = new Set<string>();
-  const addLane = (ref: LaneRef, fromBlock: boolean): void => {
-    const key = formatLaneRef(resolveLaneRef(ref, facts));
-    if (!cardByKey.has(key)) return;
-    names.add(key);
-    if (fromBlock && gating) gates.add(key);
-  };
-
-  for (const ref of item.refs) {
-    if (ref.kind === 'lane') {
-      addLane({ kind: 'plan', projectId: item.projectId, planId: ref.planId, laneId: ref.laneId }, false);
-    } else if (ref.kind === 'work-order') {
-      addLane({ kind: 'work-order', projectId: item.projectId, workOrderId: ref.id }, false);
-    }
-  }
-  for (const block of item.blocks) {
-    if (block.kind === 'lane') {
-      const parsed = parseLaneBlockRef(block.ref, item.projectId);
-      if (parsed) addLane(parsed, true);
-    } else if (block.kind === 'work-order') {
-      addLane({ kind: 'work-order', projectId: item.projectId, workOrderId: block.ref }, true);
-    }
-  }
-
-  const questionIds = new Set<string>();
-  for (const ref of item.refs) {
-    if (ref.kind === 'question') questionIds.add(ref.id);
-  }
-
-  return {
-    origin: 'owner-item',
-    id: item.itemId,
-    projectId: item.projectId,
-    kind: item.kind,
-    subject: item.subject,
-    sinceIso: item.createdAtIso,
-    gating,
-    namesLanes: names,
-    gatesLanes: gates,
-    questionIds,
-  };
-}
-
-function draftForQuestion(question: BoardQuestionFact, cardByKey: Map<string, Card>, facts: BoardFacts): EntryDraft {
-  const names = new Set<string>();
-  const gates = new Set<string>();
-  const addLane = (ref: LaneRef): void => {
-    const key = formatLaneRef(resolveLaneRef(ref, facts));
-    if (!cardByKey.has(key)) return;
-    names.add(key);
-    gates.add(key);
-  };
-  for (const block of question.blocks) {
-    if (block.kind === 'lane') {
-      const parts = block.ref.split('/');
-      if (parts.length === 3) {
-        addLane({ kind: 'plan', projectId: parts[0], planId: parts[1], laneId: parts[2] });
-      }
-    } else if (block.kind === 'work-order') {
-      addLane({ kind: 'work-order', projectId: '', workOrderId: block.ref });
-    }
-  }
-  return {
-    origin: 'question',
-    id: question.questionId,
-    projectId: null,
-    kind: 'decision',
-    subject: isPlainText(question.title) ? question.title : 'Owner question',
-    sinceIso: question.askedAtIso,
-    gating: true,
-    namesLanes: names,
-    gatesLanes: gates,
-    questionIds: new Set<string>(),
-  };
-}
-
-function buildEntries(facts: BoardFacts, cardByKey: Map<string, Card>): EntryDraft[] {
-  const referenced = new Set<string>();
-  for (const item of facts.ownerItems) {
-    for (const ref of item.refs) {
-      if (ref.kind === 'question') referenced.add(ref.id);
-    }
-  }
-
-  const drafts: EntryDraft[] = [];
-  const seen = new Set<string>();
-  for (const item of facts.ownerItems) {
-    if (seen.has(item.itemId)) continue;
-    seen.add(item.itemId);
-    if (item.state !== 'open') continue;
-    drafts.push(draftForItem(item, cardByKey, facts));
-  }
-  for (const question of facts.questions) {
-    if (referenced.has(question.questionId)) continue;
-    if (isClosedQuestion(question)) continue;
-    drafts.push(draftForQuestion(question, cardByKey, facts));
-  }
-  return drafts;
-}
-
-function finalizeEntry(draft: EntryDraft, cardByKey: Map<string, Card>): BoardOwnerEntry {
-  const gatesLanes = [...draft.gatesLanes]
-    .filter((key) => {
-      const card = cardByKey.get(key);
-      return card !== undefined && card.done === null;
-    })
-    .sort(stringAsc);
-  const namesLanes = [...draft.namesLanes].sort(stringAsc);
-  const questionIds = [...draft.questionIds].sort(stringAsc);
-  return {
-    origin: draft.origin,
-    id: draft.id,
-    projectId: draft.projectId,
-    kind: draft.kind,
-    subject: draft.subject,
-    sinceIso: draft.sinceIso,
-    gating: draft.gating,
-    gatesLanes,
-    namesLanes,
-    placement: gatesLanes.length > 0 ? 'lane-reason' : 'own-card',
-    questionIds,
-  };
-}
-
 function reasonKindOf(entry: BoardOwnerEntry): 'merge' | 'decision' | 'secret' {
   if (entry.kind === 'merge' || entry.kind === 'secret') return entry.kind;
   return 'decision';
@@ -717,6 +605,374 @@ function gatherReadings(facts: BoardFacts, forgeRepos: readonly string[] = []): 
   return readings;
 }
 
+// --- WB2b: the wait guards of the queued and waiting cards (work-board plan §3.6, §3.7; waits-for §3.1, §3.2). ---
+
+const WAIT_REASON_ORDER: readonly WaitReason[] = [
+  'after-not-done', 'after-unresolved', 'after-dropped',
+  'package-occupied', 'shared-file-held', 'exclusive-order', 'owner-decision',
+  'project-lane-cap', 'capacity', 'seat', 'brief', 'cycle-in-records',
+];
+
+function waitReasonRank(reason: WaitReason): number {
+  const index = WAIT_REASON_ORDER.indexOf(reason);
+  return index === -1 ? WAIT_REASON_ORDER.length : index;
+}
+
+function readingOf(readings: readonly SourceReading[], source: BoardSource, repository: string | null = null): SourceReading | null {
+  return readings.find((r) => r.source === source && (r.repository ?? null) === repository) ?? null;
+}
+
+function unreadBesideOf(sources: readonly SourceReading[]): BoardSource[] {
+  const names: BoardSource[] = [];
+  for (const reading of sources) {
+    if (reading.status === 'not-read' && !names.includes(reading.source)) names.push(reading.source);
+  }
+  return names;
+}
+
+function makeRow(
+  reason: WaitReason,
+  state: GuardState,
+  subject: WaitSubject,
+  clearedBy: ClearedBy,
+  clearedByText: string,
+  sources: readonly SourceReading[],
+): WaitGuard {
+  return { reason, state, subject, clearedBy, clearedByText, sources, unreadBeside: unreadBesideOf(sources) };
+}
+
+function latestDeclarationBadge(badges: readonly BoardBadge[]): Extract<BoardBadge, { kind: 'declaration' }> | null {
+  let best: Extract<BoardBadge, { kind: 'declaration' }> | null = null;
+  for (const badge of badges) {
+    if (badge.kind !== 'declaration') continue;
+    if (best === null || compareIsoDesc(badge.declaredAtIso, best.declaredAtIso) > 0) best = badge;
+  }
+  return best;
+}
+
+function glanceOf(card: Card): LaneGlance {
+  const endedPr = card.pullRequests.find((pr): pr is BoardPrStatus & { state: 'open' | 'closed' | 'merged' } =>
+    pr.state === 'open' || pr.state === 'closed' || pr.state === 'merged');
+  const declaration = latestDeclarationBadge(card.badges);
+  const waiting = card.waitingOn[0];
+  return {
+    ref: card.ref,
+    label: card.label,
+    column: card.placement,
+    ...(card.stepText !== null ? { step: card.stepText } : {}),
+    ...(endedPr === undefined ? {} : {
+      pr: {
+        repository: endedPr.repository,
+        number: endedPr.number,
+        state: endedPr.state,
+        ...(endedPr.asOfIso === null ? {} : { asOfIso: endedPr.asOfIso }),
+        stale: endedPr.stale,
+      },
+    }),
+    ...(declaration === null ? {} : { declared: { atIso: declaration.declaredAtIso, lapsed: declaration.lapsed } }),
+    ...(waiting === undefined ? {} : {
+      waitingOn: { itemId: waiting.id, itemKind: waiting.kind, subject: waiting.subject ?? waiting.id },
+    }),
+  };
+}
+
+interface WaitsCardContext {
+  readonly byKey: ReadonlyMap<string, Card>;
+  readonly facts: BoardFacts;
+  readonly readings: readonly SourceReading[];
+}
+
+function plannedLaneOf(card: Card, facts: BoardFacts): { readonly plan: BoardPlanFact; readonly lane: BoardPlannedLaneFact } | null {
+  const ref = card.ref;
+  if (card.planId === null || ref.kind !== 'plan') return null;
+  const plan = facts.plans.find((p) => p.projectId === ref.projectId && p.planId === ref.planId);
+  if (plan === undefined) return null;
+  const lane = plan.lanes.find((l) => l.laneId === ref.laneId || l.aliases.includes(ref.laneId));
+  if (lane === undefined) return null;
+  return { plan, lane };
+}
+
+function plansSources(ctx: WaitsCardContext): SourceReading[] {
+  const reading = readingOf(ctx.readings, 'plans');
+  return reading === null ? [] : [reading];
+}
+
+function forgeUnreadSuffix(forgeReadings: readonly SourceReading[]): string {
+  const unread = forgeReadings.find((r) => r.status !== 'read');
+  if (unread === undefined) return '';
+  return unread.readAtIso === null ? '; forge not read' : '; forge not read since ' + unread.readAtIso;
+}
+
+/** The clearedByText of a done-predecessor row; the forge suffix belongs on blocked rows only. */
+function clearedTextForDone(glance: LaneGlance, forgeReadings: readonly SourceReading[]): string {
+  const suffix = forgeUnreadSuffix(forgeReadings);
+  if (suffix !== '') return glance.label + ' is done' + suffix;
+  return glance.label + ' is done (merged, or recorded done without a PR)';
+}
+
+function mergeAndWorkOrderSources(ctx: WaitsCardContext, predecessorCard: Card | undefined): SourceReading[] {
+  const sources: SourceReading[] = [];
+  const merges = readingOf(ctx.readings, 'merge-records');
+  const workOrders = readingOf(ctx.readings, 'work-orders');
+  if (merges !== null) sources.push(merges);
+  if (workOrders !== null) sources.push(workOrders);
+  const repositories = new Set((predecessorCard?.links ?? []).map((link) => link.repository));
+  for (const repository of repositories) {
+    const forge = readingOf(ctx.readings, 'forge-observation', repository);
+    if (forge !== null) sources.push(forge);
+  }
+  return sources;
+}
+
+/**
+ * One row for one not-done predecessor (reason `after-not-done` or
+ * `exclusive-order`): clear when it is done, unknown when a deciding store
+ * was not read and nothing read blocks, blocked otherwise (§3.7).
+ */
+function notDoneRow(
+  reason: 'after-not-done' | 'exclusive-order',
+  glance: LaneGlance,
+  predecessorRef: LaneRef,
+  ctx: WaitsCardContext,
+  predecessorCard: Card | undefined,
+  withForge: boolean,
+): WaitGuard {
+  const sources = mergeAndWorkOrderSources(ctx, withForge ? predecessorCard : undefined);
+  const merges = readingOf(ctx.readings, 'merge-records');
+  const workOrders = readingOf(ctx.readings, 'work-orders');
+  const forgeReadings = withForge
+    ? sources.filter((r) => r.source === 'forge-observation')
+    : [];
+  if (predecessorCard !== undefined && predecessorCard.done !== null) {
+    return makeRow(reason, 'clear', { kind: 'lane', lane: glance }, { kind: 'done', subject: predecessorRef },
+      clearedTextForDone(glance, []), sources);
+  }
+  if (merges === null || merges.status !== 'read' || workOrders === null || workOrders.status !== 'read') {
+    return makeRow(reason, 'unknown', { kind: 'lane', lane: glance }, { kind: 'done', subject: predecessorRef },
+      'reading merge records and work orders would decide it', sources);
+  }
+  return makeRow(reason, 'blocked', { kind: 'lane', lane: glance }, { kind: 'done', subject: predecessorRef },
+    clearedTextForDone(glance, forgeReadings), sources);
+}
+
+function afterDroppedRow(glance: LaneGlance, ctx: WaitsCardContext): WaitGuard {
+  // A dropped predecessor reads as dropped in the glance, whatever its card's placement (a merge record would place it in done).
+  const droppedGlance: LaneGlance = { ...glance, column: 'dropped' };
+  return makeRow('after-dropped', 'blocked', { kind: 'lane', lane: droppedGlance }, { kind: 'edit', what: 'after' },
+    "edit this lane's after and re-import the plan", plansSources(ctx));
+}
+
+function afterRowsFor(lane: BoardPlannedLaneFact, ctx: WaitsCardContext): WaitGuard[] {
+  const rows: WaitGuard[] = [];
+  for (const entry of lane.after) {
+    const predecessorPlan = ctx.facts.plans.find((p) => p.projectId === entry.projectId && p.planId === entry.planId);
+    const predecessorLane = predecessorPlan?.lanes.find(
+      (l) => l.laneId === entry.laneId || l.aliases.includes(entry.laneId),
+    );
+    if (predecessorPlan === undefined || predecessorLane === undefined) {
+      rows.push(makeRow('after-unresolved', 'blocked',
+        { kind: 'plan', projectId: entry.projectId, planId: entry.planId },
+        { kind: 'record', what: 'plan-import' },
+        'import plan ' + entry.planId + ' for project ' + entry.projectId,
+        plansSources(ctx)));
+      continue;
+    }
+    const predecessorRef: LaneRef = { kind: 'plan', projectId: entry.projectId, planId: entry.planId, laneId: predecessorLane.laneId };
+    const predecessorCard = ctx.byKey.get(formatLaneRef(predecessorRef));
+    const glance: LaneGlance = predecessorCard === undefined
+      ? { ref: predecessorRef, label: predecessorLane.laneId, column: 'unresolved' }
+      : glanceOf(predecessorCard);
+    // A dropped predecessor is never done for its dependants: the dropped
+    // status is checked before the merge record so it always reads as
+    // `after-dropped` (§3.6).
+    if (predecessorLane.status === 'dropped') {
+      rows.push(afterDroppedRow(glance, ctx));
+      continue;
+    }
+    if (predecessorCard !== undefined && predecessorCard.done !== null) {
+      rows.push(notDoneRow('after-not-done', glance, predecessorRef, ctx, predecessorCard, true));
+      continue;
+    }
+    rows.push(notDoneRow('after-not-done', glance, predecessorRef, ctx, predecessorCard, true));
+  }
+  return rows;
+}
+
+function exclusiveOrderRowsFor(plan: BoardPlanFact, lane: BoardPlannedLaneFact, ctx: WaitsCardContext): WaitGuard[] {
+  const rows: WaitGuard[] = [];
+  for (const entry of plan.exclusiveOrder) {
+    const selfIndex = entry.lanes.findIndex((id) => id === lane.laneId || lane.aliases.includes(id));
+    if (selfIndex <= 0) continue;
+    for (const earlierId of entry.lanes.slice(0, selfIndex)) {
+      const earlierLane = plan.lanes.find((l) => l.laneId === earlierId || l.aliases.includes(earlierId));
+      if (earlierLane === undefined) continue;
+      const earlierRef: LaneRef = { kind: 'plan', projectId: plan.projectId, planId: plan.planId, laneId: earlierLane.laneId };
+      const earlierCard = ctx.byKey.get(formatLaneRef(earlierRef));
+      const glance: LaneGlance = earlierCard === undefined
+        ? { ref: earlierRef, label: earlierLane.laneId, column: 'unresolved' }
+        : glanceOf(earlierCard);
+      // Same ordering as `after`: dropped beats a merge record (§3.6).
+      if (earlierLane.status === 'dropped') {
+        rows.push(afterDroppedRow(glance, ctx));
+        continue;
+      }
+      if (earlierCard !== undefined && earlierCard.done !== null) {
+        rows.push(notDoneRow('exclusive-order', glance, earlierRef, ctx, earlierCard, false));
+        continue;
+      }
+      rows.push(notDoneRow('exclusive-order', glance, earlierRef, ctx, earlierCard, false));
+    }
+  }
+  return rows;
+}
+
+function ownerItemRowsFor(card: Card, ctx: WaitsCardContext): WaitGuard[] {
+  const sources: SourceReading[] = [];
+  for (const source of ['owner-items', 'questions'] as const) {
+    const reading = readingOf(ctx.readings, source);
+    if (reading !== null) sources.push(reading);
+  }
+  return card.waitingOn.map((reason) => {
+    const subjectText = reason.subject ?? reason.id;
+    let clearedByText: string;
+    if (reason.kind === 'merge') {
+      const item = ctx.facts.ownerItems.find((i) => i.itemId === reason.id);
+      const prRef = item?.refs.find((ref) => ref.kind === 'pr');
+      clearedByText = prRef !== undefined ? 'owner merges PR #' + String(prRef.number) : 'owner merges ' + subjectText;
+    } else if (reason.kind === 'secret') {
+      clearedByText = 'owner records the secret';
+    } else {
+      clearedByText = 'owner decides ' + subjectText;
+    }
+    return makeRow('owner-decision', 'blocked',
+      { kind: 'owner-item', itemId: reason.id, itemKind: reason.kind, subject: subjectText, sinceIso: reason.sinceIso },
+      { kind: 'owner', itemId: reason.id }, clearedByText, sources);
+  });
+}
+
+function planDecisionRowsFor(plan: BoardPlanFact, lane: BoardPlannedLaneFact, ctx: WaitsCardContext): WaitGuard[] {
+  const rows: WaitGuard[] = [];
+  const sources = plansSources(ctx);
+  for (const decisionId of lane.decisions) {
+    const decision = plan.decisions.find((d) => d.id === decisionId);
+    if (decision === undefined || decision.state !== 'open') continue;
+    rows.push(makeRow('owner-decision', 'blocked',
+      { kind: 'plan-decision', projectId: plan.projectId, planId: plan.planId, decisionId },
+      { kind: 'record', what: 'plan-import' }, 'owner decides ' + decisionId, sources));
+  }
+  return rows;
+}
+
+function seatRow(): WaitGuard {
+  return makeRow('seat', 'unknown', { kind: 'seat', role: null }, { kind: 'record', what: 'seat-probe' },
+    'a seat probe is recorded (none exists yet; A-S or S1)', []);
+}
+
+/** The per-row name used by the summary line (waits-for plan §3.2). */
+function nameOf(row: WaitGuard, facts: BoardFacts): string {
+  const subject = row.subject;
+  switch (row.reason) {
+    case 'after-not-done':
+    case 'exclusive-order': {
+      if (subject.kind !== 'lane') return row.reason;
+      let text = 'after ' + subject.lane.label + ' (' + subject.lane.column + ')';
+      if (subject.lane.step !== undefined) text += ', ' + subject.lane.step;
+      return text;
+    }
+    case 'after-unresolved':
+      return subject.kind === 'plan'
+        ? 'after ' + subject.projectId + '/' + subject.planId + ': predecessor plan not imported'
+        : row.reason;
+    case 'after-dropped':
+      return subject.kind === 'lane' ? 'after ' + subject.lane.label + ': predecessor dropped' : row.reason;
+    case 'owner-decision': {
+      if (subject.kind === 'owner-item') {
+        if (subject.itemKind === 'merge') {
+          const item = facts.ownerItems.find((i) => i.itemId === subject.itemId);
+          const prRef = item?.refs.find((ref) => ref.kind === 'pr');
+          return prRef !== undefined ? 'merge PR #' + String(prRef.number) : 'merge ' + subject.subject;
+        }
+        if (subject.itemKind === 'secret') return 'secret ' + subject.subject;
+        return 'decision ' + subject.subject;
+      }
+      return subject.kind === 'plan-decision' ? 'decision ' + subject.decisionId : row.reason;
+    }
+    case 'seat':
+      return 'seat not checked';
+    default:
+      return row.reason;
+  }
+}
+
+/** Names joined by "; "; three or more blocked rows name the first two and then "and n more". */
+function nameList(rows: readonly WaitGuard[], facts: BoardFacts): string {
+  const names = rows.map((row) => nameOf(row, facts));
+  if (names.length >= 3) {
+    return names[0] + '; ' + names[1] + ' and ' + String(names.length - 2) + ' more';
+  }
+  return names.join('; ');
+}
+
+function renderSummary(card: Card, rows: readonly WaitGuard[], facts: BoardFacts): string {
+  const blocked = rows.filter((row) => row.state === 'blocked');
+  const unknown = rows.filter((row) => row.state === 'unknown');
+  const ownerRows = blocked.filter((row): row is WaitGuard & { subject: Extract<WaitSubject, { kind: 'owner-item' }> } =>
+    row.reason === 'owner-decision' && row.subject.kind === 'owner-item');
+  if (card.placement === 'waiting' && ownerRows.length > 0) {
+    const parts = ownerRows.map((row) => nameOf(row, facts) + ' (since ' + row.subject.sinceIso + ')');
+    let text = 'Waiting on you: ' + parts.join(', ') + '.';
+    const ownerSet: ReadonlySet<WaitGuard> = new Set(ownerRows);
+    const others = blocked.filter((row) => !ownerSet.has(row));
+    if (others.length > 0) text += ' Also blocked by ' + String(others.length) + ': ' + nameList(others, facts) + '.';
+    return text;
+  }
+  if (blocked.length > 0) {
+    let text = 'Blocked by ' + String(blocked.length) + ': ' + nameList(blocked, facts) + '.';
+    if (unknown.length > 0) {
+      text += ' Unknown ' + String(unknown.length) + ': ' + unknown.map((row) => nameOf(row, facts)).join('; ') + '.';
+    }
+    return text;
+  }
+  if (unknown.length > 0) {
+    return 'Nothing blocks it but unchecked guards: ' + unknown.map((row) => nameOf(row, facts)).join('; ') + '.';
+  }
+  return 'Nothing blocks it but unchecked guards.';
+}
+
+interface CardWaits {
+  readonly rows: readonly WaitGuard[];
+  readonly counts: { readonly blocked: number; readonly unknown: number; readonly clear: number };
+  readonly firstBlocker: WaitGuard | null;
+  readonly summary: string;
+}
+
+/**
+ * The wait guards of one card (WB2b, part 1): the guards that need only the
+ * card graph, the owner entries and the plan facts. Pure; never throws.
+ */
+function computeWaits(card: Card, ctx: WaitsCardContext): CardWaits {
+  if (card.placement !== 'queued' && card.placement !== 'waiting') {
+    return { rows: [], counts: { blocked: 0, unknown: 0, clear: 0 }, firstBlocker: null, summary: '' };
+  }
+  const planned = plannedLaneOf(card, ctx.facts);
+  const itemRows = ownerItemRowsFor(card, ctx);
+  const dependencyRows = planned === null ? [] : [
+    ...afterRowsFor(planned.lane, ctx),
+    ...exclusiveOrderRowsFor(planned.plan, planned.lane, ctx),
+  ];
+  const decisionRows = planned === null ? [] : planDecisionRowsFor(planned.plan, planned.lane, ctx);
+  const byState = (state: GuardState): WaitGuard[] =>
+    [...dependencyRows, ...decisionRows, seatRow()]
+      .filter((row) => row.state === state)
+      .sort((a, b) => waitReasonRank(a.reason) - waitReasonRank(b.reason));
+  // Rule 1: on a Waiting lane the gating owner items come first, in item creation order.
+  const rows = [...itemRows, ...byState('blocked'), ...byState('unknown'), ...byState('clear')];
+  const counts = { blocked: 0, unknown: 0, clear: 0 };
+  for (const row of rows) counts[row.state] += 1;
+  const firstBlocker = rows[0] !== undefined && rows[0].state === 'blocked' ? rows[0] : null;
+  return { rows, counts, firstBlocker, summary: renderSummary(card, rows, ctx.facts) };
+}
+
 function toLane(card: Card): BoardLaneCard {
   return {
     key: card.key,
@@ -741,6 +997,10 @@ function toLane(card: Card): BoardLaneCard {
     pullRequests: card.pullRequests,
     reviewCounts: card.reviewCounts,
     badges: card.badges,
+    waitsOn: card.waitsOn,
+    waitCounts: card.waitCounts,
+    firstBlocker: card.firstBlocker,
+    summary: card.summary,
   };
 }
 
@@ -875,7 +1135,6 @@ function entryOrderCompare(a: BoardOwnerEntry, b: BoardOwnerEntry): number {
 
 function computeBoard(facts: BoardFacts, readAtIso: string, sinceIso: string | null, policy: BoardPolicy): WorkBoard {
   const cards = buildCards(facts);
-  const cardByKey = new Map(cards.map((c) => [c.key, c]));
 
   const forgeRepos: string[] = [];
   {
@@ -891,8 +1150,12 @@ function computeBoard(facts: BoardFacts, readAtIso: string, sinceIso: string | n
   }
   const readings = gatherReadings(facts, forgeRepos);
 
-  const drafts = buildEntries(facts, cardByKey);
-  const entries = drafts.map((d) => finalizeEntry(d, cardByKey));
+  const entries: BoardOwnerEntry[] = [...deriveOwnerEntries(
+    facts.ownerItems,
+    facts.questions,
+    cards.map((c) => ({ key: c.key, done: c.done !== null })),
+    (ref) => formatLaneRef(resolveLaneRef(ref, facts)),
+  )];
   const reasonsByKey = collectReasons(entries);
 
   const conflictLikes: BoardLinkConflictLike[] = facts.linkConflicts.map((conflict) => ({
@@ -946,6 +1209,17 @@ function computeBoard(facts: BoardFacts, readAtIso: string, sinceIso: string | n
       policy,
     });
     card.notRead = cardNotRead(card, readings);
+  }
+
+  // WB2b: the wait guards need every card fully built (predecessor glances read placement and step).
+  const cardsByKey = new Map(cards.map((card) => [card.key, card] as const));
+  const waitsContext: WaitsCardContext = { byKey: cardsByKey, facts, readings };
+  for (const card of cards) {
+    const waits = computeWaits(card, waitsContext);
+    card.waitsOn = [...waits.rows];
+    card.waitCounts = waits.counts;
+    card.firstBlocker = waits.firstBlocker;
+    card.summary = waits.summary;
   }
 
   const lanes = cards.map(toLane).sort((a, b) => a.key.localeCompare(b.key));

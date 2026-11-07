@@ -6,14 +6,14 @@
  * unrelated action.
  */
 
-import type { ForgeActionKind } from '../../../domain/coordination-keys.js';
+import type { AuthorizedActionKind } from '../../../domain/coordination-keys.js';
 
 export interface ResolveActionAuthorizationRequest {
   readonly actionId: string;
   readonly projectId: string;
   readonly workOrderId: string;
   readonly attemptId: string;
-  readonly actionKind: ForgeActionKind;
+  readonly actionKind: AuthorizedActionKind;
   readonly expectedHeadSha: string;
   readonly policyRevision: string;
 }
@@ -26,7 +26,7 @@ export type ResolveActionAuthorizationResult =
 export interface ConsumeActionAuthorizationRequest {
   readonly authorizationGrantId: string;
   readonly actionId: string;
-  readonly actionKind: ForgeActionKind;
+  readonly actionKind: AuthorizedActionKind;
   /**
    * Head the grant was scoped to at resolve time. Optional because the
    * resolving runtime retains the coordinates and scopes the consumption
@@ -54,4 +54,29 @@ export interface ActionAuthorizationPort {
   consumeActionAuthorization(
     request: ConsumeActionAuthorizationRequest,
   ): Promise<ConsumeActionAuthorizationResult>;
+
+  /**
+   * C2': the scoped, one-way owner approval for removing one attempt's
+   * unsealed worktree. Approved only through a signed owner decision on a
+   * coordination request bound to the exact attempt, head and worktree-path
+   * scope, consumed once via the authorization store. Pending or absent
+   * authority blocks; an unreadable authorization answers unknown.
+   */
+  authorizeUnsealedWorktreeRemoval?(
+    request: AuthorizeUnsealedWorktreeRemovalRequest,
+  ): Promise<AuthorizeUnsealedWorktreeRemovalResult>;
 }
+
+export interface AuthorizeUnsealedWorktreeRemovalRequest {
+  readonly projectId: string;
+  readonly runId: string;
+  readonly attemptId: string;
+  readonly worktreePath: string;
+  readonly expectedHeadSha: string;
+  readonly nowIso: string;
+}
+
+export type AuthorizeUnsealedWorktreeRemovalResult =
+  | { readonly outcome: 'approved'; readonly approvalReference: string }
+  | { readonly outcome: 'blocked'; readonly reason: string }
+  | { readonly outcome: 'unknown'; readonly reason: string };

@@ -9,7 +9,7 @@ import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunStopEffect } from '../../../domain/lane-run-transitions.js';
 import type { RunStopEffect, RunStopOutcome } from '../../../domain/lane-run-transitions.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendConduct, appendRunIntent, appendRunResult, performPark, releaseWorkOrderAtEnd } from './step-context.js';
+import { appendConduct, appendRunIntent, appendRunResult, performPark, refusedResult, releaseWorkOrderAtEnd } from './step-context.js';
 
 /** Map a StopAttempt port result onto the domain's RunStopOutcome; a refusal re-reads the attempt for its kind. */
 export async function runStopOutcomeOf(
@@ -62,7 +62,7 @@ export async function performStop(ctx: AdvanceStepContext,
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   const result = await stop.stopAttempt({ attemptId: latest.id, nowIso: request.nowIso });
   const mapped = await runStopOutcomeOf(result, latest.id, ctx.deps.attemptRepo);
@@ -73,20 +73,20 @@ export async function performStop(ctx: AdvanceStepContext,
   if (mapped.outcome === 'terminated' || mapped.outcome === 'cancelled') {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', 'stop-timeout');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-timeout' };
   }
   if (mapped.outcome === 'still-running' || mapped.outcome === 'unknown') {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', 'stop-unconfirmed');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-unconfirmed' };
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', null);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return performPark(ctx, record, 'stop-refused', effect.run === 'parked' ? effect.qualifier : null, gathered.facts.state, request);
 }
@@ -103,21 +103,21 @@ export async function finishForceStop(ctx: AdvanceStepContext,
     const reasonCode = effect.capacity === 'held' ? 'stop-force-slot-held' : 'stop-force';
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     // Before the terminal conduct entry: a crash between the two leaves a
     // non-terminal run the next pass re-ends (the release is idempotent).
     await releaseWorkOrderAtEnd(ctx, record, 'stopped', request);
     const appended = await appendConduct(ctx, request, 'stopped');
     if (!appended.ok) {
-      return { outcome: 'refused', reason: appended.reason };
+      return refusedResult(appended);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
   }
   if (effect.reason === 'stop-unconfirmed') {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', 'stop-unconfirmed');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     if (record.parked === null) {
       return performPark(ctx, record, 'stop-unconfirmed', null, gathered.facts.state, request);
@@ -126,7 +126,7 @@ export async function finishForceStop(ctx: AdvanceStepContext,
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', null);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return performPark(ctx, record, 'stop-refused', effect.qualifier, gathered.facts.state, request);
 }
@@ -145,7 +145,7 @@ export async function performCancel(ctx: AdvanceStepContext,
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, decision.attemptId);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   const cancelled = await cancel.cancelPreparedAttempt({
     attemptId: decision.attemptId,
@@ -174,7 +174,7 @@ export async function performCancel(ctx: AdvanceStepContext,
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, outcome, reasonCode);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: 'stop', key: decision.key, result: outcome, reasonCode };
 }

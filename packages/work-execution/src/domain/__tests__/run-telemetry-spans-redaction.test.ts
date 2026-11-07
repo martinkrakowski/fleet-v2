@@ -65,13 +65,13 @@ function stepKey(step: string, round: number, seatIndex = 0, attemptOrdinal: num
 
 const PREPARE_0_KEY = stepKey('prepare', 0, 0, 1);
 const DISPATCH_0_KEY = stepKey('dispatch', 0, 0, 1);
-const COLLECT_0_KEY = stepKey('collect', 0);
+const COLLECT_0_KEY = stepKey('collect', 0, 0, 1);
 const GATE_0_KEY = stepKey('gate', 0, 0, null, HEAD12);
 const BRIEF_CHECK_0_KEY = stepKey('brief-check', 0, 0, null, HEAD12);
 const CODE_REVIEW_0_KEY = stepKey('code-review', 0, 0, null, HEAD12);
 const PREPARE_1_KEY = stepKey('prepare', 1, 0, 1);
 const DISPATCH_1_KEY = stepKey('dispatch', 1, 0, 1);
-const COLLECT_1_KEY = stepKey('collect', 1);
+const COLLECT_1_KEY = stepKey('collect', 1, 0, 1);
 const PARK_1_KEY = stepKey('park', 1);
 const ACCEPT_KEY = stepKey('accept', 0, 0, null, HEAD12);
 const OPEN_PR_KEY = stepKey('open-pr', 0, 0, null, HEAD12);

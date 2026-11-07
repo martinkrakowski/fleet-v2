@@ -84,6 +84,86 @@ async function remove(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
 
+describe("writeInstallation keeps policy through a hosts edit (IW1)", () => {
+  it("keeps policy.merge and policy.daemon when a host is added", async () => {
+    const dir = await tempDir();
+    const file = join(dir, "fleet.json");
+    const policy = {
+      merge: {
+        repos: {
+          "example-owner/example-repo": {
+            projectId: "example-project",
+            shadow: true,
+            requiredContexts: ["gate"],
+            veto: { mode: "live", holdConfidence: 0.7 },
+          },
+        },
+      },
+      daemon: { intervalSeconds: 90, budgetSeconds: 60, settleSeconds: 30, chainRefresh: "shadow" },
+    };
+    try {
+      await writeFile(file, `${JSON.stringify({ ...baseFile, policy }, null, 2)}\n`);
+      const read = await readInstallationFile(file);
+      if (read.status !== "read") {
+        throw new Error("the fixture file must be readable");
+      }
+      const applied = applyHostDraft(read.value, verifierDraft, "add");
+      if (!applied.ok) {
+        throw new Error(applied.errors.join("; "));
+      }
+      const result = await writeInstallation({
+        file,
+        candidate: applied.candidate,
+        expectedHash: read.hash,
+      });
+      expect(result.status).toBe("written");
+      const after = JSON.parse(await readFile(file, "utf8")) as {
+        hosts: Record<string, unknown>;
+        policy?: unknown;
+      };
+      expect(Object.keys(after.hosts)).toContain("verifymac");
+      expect(after.policy).toEqual(policy);
+    } finally {
+      await remove(dir);
+    }
+  });
+
+  it("keeps an invalid policy.daemon.chainRefresh value through a hosts edit (CO8a)", async () => {
+    const dir = await tempDir();
+    const file = join(dir, "fleet.json");
+    const policy = {
+      daemon: { intervalSeconds: 90, budgetSeconds: 60, settleSeconds: 30, chainRefresh: "livee" },
+    };
+    try {
+      await writeFile(file, `${JSON.stringify({ ...baseFile, policy }, null, 2)}\n`);
+      const read = await readInstallationFile(file);
+      if (read.status !== "read") {
+        throw new Error("the fixture file must be readable");
+      }
+      const applied = applyHostDraft(read.value, verifierDraft, "add");
+      if (!applied.ok) {
+        throw new Error(applied.errors.join("; "));
+      }
+      const result = await writeInstallation({
+        file,
+        candidate: applied.candidate,
+        expectedHash: read.hash,
+      });
+      expect(result.status).toBe("written");
+      const after = JSON.parse(await readFile(file, "utf8")) as {
+        hosts: Record<string, unknown>;
+        policy?: unknown;
+      };
+      expect(Object.keys(after.hosts)).toContain("verifymac");
+      expect(after.policy).toEqual(policy);
+      // The raw value is never echoed in the write path's errors either.
+      expect(JSON.stringify(result)).not.toContain("livee");
+    } finally {
+      await remove(dir);
+    }
+  });
+});
+
 describe("readInstallationFile", () => {
   it("reports an absent file as absent, so a first write can hash it", async () => {
     const dir = await tempDir();

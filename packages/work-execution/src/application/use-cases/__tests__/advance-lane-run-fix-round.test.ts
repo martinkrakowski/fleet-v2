@@ -13,6 +13,10 @@ import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
 import { dispatchRefusalDetail, fixSeatForDispatch } from '../advance-lane-run/prepare-dispatch.js';
+import { performFixPrepare } from '../advance-lane-run/review-fix.js';
+import { appendRunIntent, appendRunResult } from '../advance-lane-run/step-context.js';
+import type { AdvanceStepContext, GatheredLaneRunFacts } from '../advance-lane-run/step-context.js';
+import type { AdvanceLaneRunRequest } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
@@ -32,12 +36,16 @@ import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { SessionStartGate } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type {
+  FindLatestReceiptOfKindRequest,
+  FindLatestReceiptOfKindResult,
   FindReviewReceiptRequest,
   FindReviewReceiptResult,
   ReviewRequest,
   ReviewRequestFinding,
   ReviewRequestResult,
 } from '../../ports/out/ReviewRequestPort.out-port.js';
+import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
+import type { HeadCiStateRead, ReadHeadCiStateRequest } from '../../ports/out/CiStatePort.out-port.js';
 import type {
   PrepareFixAttemptRequest,
   PrepareFixAttemptResult,
@@ -69,6 +77,7 @@ import type {
   RecordGateReceiptsRequest,
   RecordGateReceiptsResult,
 } from '../../ports/out/GateReceiptPort.out-port.js';
+import type { ReadGateFailingFileResult } from '../../ports/out/GateFailingFilePort.out-port.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -286,6 +295,23 @@ function reviewKey(step: 'brief-check' | 'code-review', seatIndex: number, head1
   return built.key;
 }
 
+function acceptKeyAt(head12: string): string {
+  const built = buildLaneRunStepKey({
+    runId: RUN_ID,
+    round: 0,
+    step: 'accept',
+    seatIndex: 0,
+    attemptOrdinal: null,
+    head12,
+    retry: null,
+  });
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error('fixture must build an accept key');
+  }
+  return built.key;
+}
+
 function attemptStepKey(step: 'prepare' | 'dispatch', round: number, seatIndex: number, attemptOrdinal: number): string {
   const built = buildLaneRunStepKey({
     runId: RUN_ID,
@@ -328,6 +354,23 @@ function gateKey(): string {
   return built.key;
 }
 
+function ciKey(head12: string = HEAD12_A, retry: number | null = null): string {
+  const built = buildLaneRunStepKey({
+    runId: RUN_ID,
+    round: 0,
+    step: 'ci',
+    seatIndex: 0,
+    attemptOrdinal: null,
+    head12,
+    retry,
+  });
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error('fixture must build a ci key');
+  }
+  return built.key;
+}
+
 interface Harness {
   readonly runRepo: LaneRunRepositoryAdapter;
   readonly runJournal: LaneRunJournalAdapter;
@@ -338,9 +381,13 @@ interface Harness {
   readonly briefRequests: PrepareBriefPackageUseCaseRequest[];
   readonly dispatchRequests: DispatchAttemptRequest[];
   readonly cancelRequests: CancelPreparedAttemptRequest[];
+  /** Every park notice request sent through the recording parkNotice fake, in order. */
+  readonly parkNoticeRequests: LaneRunParkRequest[];
   readonly gateRequests: readonly EvaluateAttemptGateRequest[];
   readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
+  /** Every `readHeadCiState` call's arguments, in call order (GB4). */
+  readonly ciRequests: readonly ReadHeadCiStateRequest[];
   /** Every `readBriefFile` call's arguments, in call order. */
   readonly briefFileReads: readonly { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[];
   /** Every `readBriefManifest` call's arguments, in call order. */
@@ -356,12 +403,14 @@ interface Harness {
   setChangedPaths(paths: readonly string[] | null): void;
   setChangedPathsError(message: string | null): void;
   setFindReceiptAnswer(answer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult>): void;
+  setFindLatestReceiptAnswer(answer: (request: FindLatestReceiptOfKindRequest) => Promise<FindLatestReceiptOfKindResult>): void;
   setFixAnswer(answer: (request: PrepareFixAttemptRequest) => Promise<PrepareFixAttemptResult>): void;
   setBriefAnswer(answer: (request: PrepareBriefPackageUseCaseRequest) => Promise<PrepareBriefPackageResult>): void;
   setDispatchAnswer(answer: (request: DispatchAttemptRequest) => Promise<DispatchAttemptResult>): void;
   setSameFamily(fn: SameModelFamily): void;
   setJournalBaseline(length: number): void;
   setGateAnswer(answer: EvaluateAttemptGateResult): void;
+  setCiAnswer(answer: HeadCiStateRead): void;
   setReviewAssessmentAnswer(answer: OpenReviewAssessmentResult): void;
   markAttemptCancelled(attemptId: string, stopReason: AttemptRecord['stopReason']): Promise<void>;
 }
@@ -373,6 +422,11 @@ interface HarnessOptions {
   readonly wireGate?: boolean;
   readonly wireReviewAssessment?: boolean;
   readonly wireGateReceipts?: boolean;
+  readonly wireParkNotice?: boolean;
+  /** PT1a: the answer of the wired gate failing-file read; absent leaves the port unwired. */
+  readonly gateFailingFile?: ReadGateFailingFileResult;
+  /** PT1a: the work order's owned paths; absent keeps the fixture's. */
+  readonly ownedPaths?: readonly string[];
 }
 
 async function makeHarness(
@@ -389,9 +443,11 @@ async function makeHarness(
   const briefRequests: PrepareBriefPackageUseCaseRequest[] = [];
   const dispatchRequests: DispatchAttemptRequest[] = [];
   const cancelRequests: CancelPreparedAttemptRequest[] = [];
+  const parkNoticeRequests: LaneRunParkRequest[] = [];
   const gateRequests: EvaluateAttemptGateRequest[] = [];
   const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
+  const ciRequests: ReadHeadCiStateRequest[] = [];
   const briefFileReads: { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
   const briefManifestReads: { worktreePath: string; manifestPath: string | undefined; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
   const changedPathReads: { worktreePath: string; baseCommit: string; headCommit: string; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
@@ -405,6 +461,9 @@ async function makeHarness(
   let sameFamilyImpl: SameModelFamily = (left, right) => left === right;
   let gateAnswer: EvaluateAttemptGateResult = { verdict: 'passed' };
   let reviewAssessmentAnswer: OpenReviewAssessmentResult = { outcome: 'open' };
+  // GB4: the CI read answers the prior's collected head by default; every
+  // existing test is in the fixing/ready states and never reads the port.
+  let ciAnswer: HeadCiStateRead = { headSha: COMMIT_A, state: 'passed', reason: 'read' };
   const reviewAnswer: (request: ReviewRequest) => Promise<ReviewRequestResult> = async (request) => ({
     outcome: 'receipt',
     receipt: {
@@ -418,6 +477,9 @@ async function makeHarness(
     },
   });
   let findReceiptAnswer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult> = async () => ({
+    outcome: 'not-found',
+  });
+  let findLatestReceiptAnswer: (request: FindLatestReceiptOfKindRequest) => Promise<FindLatestReceiptOfKindResult> = async () => ({
     outcome: 'not-found',
   });
   let prepareAnswer: (request: PrepareFixAttemptRequest) => Promise<PrepareFixAttemptResult> = async (request) => ({
@@ -529,7 +591,8 @@ async function makeHarness(
     newUlid: makeUlidMinter(),
     sameModelFamily: (left, right) => sameFamilyImpl(left, right),
     workOrderRepo: {
-      findWorkOrderById: async () => WORK_ORDER,
+      findWorkOrderById: async () =>
+        options.ownedPaths === undefined ? WORK_ORDER : { ...WORK_ORDER, ownedPaths: [...options.ownedPaths] },
     },
     ...(options.wireReviewRequest === false
       ? {}
@@ -540,7 +603,7 @@ async function makeHarness(
               return reviewAnswer(request);
             },
             findReviewReceipt: async (request) => findReceiptAnswer(request),
-            findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }),
+            findLatestReceiptOfKind: async (request) => findLatestReceiptAnswer(request),
           },
         }),
     ...(options.wirePrepareFix === false
@@ -630,6 +693,35 @@ async function makeHarness(
           },
         }
       : {}),
+    ...(options.gateFailingFile !== undefined
+      ? {
+          gateFailingFile: {
+            readGateFailingFile: async () => options.gateFailingFile as ReadGateFailingFileResult,
+          },
+        }
+      : {}),
+    ...(options.wireParkNotice === true
+      ? {
+          parkNotice: {
+            recordParkAttention: async (request) => {
+              parkNoticeRequests.push(request);
+              return { outcome: 'recorded', item: {}, revision: 1 };
+            },
+            askParkQuestion: async (request) => {
+              parkNoticeRequests.push(request);
+              return { outcome: 'recorded', question: { questionId: 'q-park' } };
+            },
+            findParkQuestion: async () => ({ outcome: 'not-found' }),
+          },
+        }
+      : {}),
+    // GB4: the recording CI read; the fact reader answers the exact head.
+    ciState: {
+      readHeadCiState: async (request) => {
+        ciRequests.push(request);
+        return ciAnswer;
+      },
+    },
   };
 
   return {
@@ -642,9 +734,11 @@ async function makeHarness(
     briefRequests,
     dispatchRequests,
     cancelRequests,
+    parkNoticeRequests,
     gateRequests,
     reviewOpenRequests,
     gateReceiptRequests,
+    ciRequests,
     briefFileReads,
     briefManifestReads,
     changedPathReads,
@@ -670,6 +764,9 @@ async function makeHarness(
     setFindReceiptAnswer: (answer) => {
       findReceiptAnswer = answer;
     },
+    setFindLatestReceiptAnswer: (answer) => {
+      findLatestReceiptAnswer = answer;
+    },
     setFixAnswer: (answer) => {
       prepareAnswer = answer;
     },
@@ -687,6 +784,9 @@ async function makeHarness(
     },
     setGateAnswer: (answer) => {
       gateAnswer = answer;
+    },
+    setCiAnswer: (answer) => {
+      ciAnswer = answer;
     },
     setReviewAssessmentAnswer: (answer) => {
       reviewAssessmentAnswer = answer;
@@ -740,8 +840,9 @@ async function appendResult(
   outcome: LaneRunJournalOutcome,
   reasonCode: LaneRunResultReasonCode,
   recordedAtIso: string,
+  detail: string | null = null,
 ): Promise<void> {
-  const entry = laneRunResultEntry(harness.deps.newUlid(), RUN_ID, key, outcome, reasonCode, recordedAtIso);
+  const entry = laneRunResultEntry(harness.deps.newUlid(), RUN_ID, key, outcome, reasonCode, recordedAtIso, detail);
   const appended = await harness.runJournal.append(entry);
   expect(appended.outcome).toBe('appended');
 }
@@ -879,6 +980,229 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(results[0]).toMatchObject({ outcome: 'completed', reasonCode: 'prepared' });
   });
 
+  it('AR1 MX5a: a review-blocked acceptance rejection enters fixing and the fix prepare carries the finding summary', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    // The failed brief-check receipt at the head, then the code-review pass,
+    // then the rejected accept with the review-findings detail (the run MX5a
+    // journal). The brief-check receipt carries one blocking finding (RV3).
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-failed', NOW);
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    await appendIntent(harness, codeKey, null, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-passed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    // The brief-check receipt, read by the brief-check intent's minted request
+    // id, is failed with one blocking (major) finding.
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-' + request.requestId,
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [
+          { findingId: 'finding-1', severity: 'major', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+        ],
+      },
+    }));
+
+    harness.setChangedPaths(['src/ex.ts']);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared' });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[major] src/ex.ts:4 — tighten the guard']);
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const acceptIntents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey);
+    expect(acceptIntents).toHaveLength(1);
+  });
+
+  it('F61: a pre-AR1 null-detail acceptance rejection enters fixing and the fix prepare carries the finding summary', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    // The MX5a journal with a null detail on the accept result (pre-AR1). The
+    // brief-check receipt at the head carries one blocking finding (RV3).
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-failed', NOW);
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    await appendIntent(harness, codeKey, null, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-passed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW);
+    // F61: the classification wires the receipts-only assessment; the full
+    // acceptance read is never used by the accept step.
+    Object.assign(harness.deps, {
+      acceptanceAssessment: {
+        assessHeadAcceptance: async () => {
+          throw new Error('assessHeadAcceptance is not used by the accept step');
+        },
+        assessHeadReceipts: async () =>
+          ({
+            outcome: 'rejected' as const,
+            reason: 'blocked',
+            blockerDetails: [{ kind: 'other' as const, text: 'blocked' }],
+          }),
+      },
+    });
+    // The review evidence at the head, for both receipt kinds: the brief-check
+    // receipt is failed with one blocking (major) finding (RV3); code-review
+    // has none.
+    harness.setFindLatestReceiptAnswer(async (request) =>
+      request.kind === 'brief-check'
+        ? {
+            outcome: 'found' as const,
+            receipt: {
+              receiptId: 'rcpt-brief-1',
+              requestId: null,
+              kind: 'brief-check' as const,
+              reviewerModel: 'review-model-1',
+              candidateHeadSha: COMMIT_A,
+              verdict: 'failed' as const,
+              findings: [
+                { findingId: 'finding-1', severity: 'major' as const, summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+              ],
+            },
+          }
+        : { outcome: 'not-found' as const },
+    );
+    // The handover reads the failed brief-check receipt by the intent's minted
+    // request id.
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-' + request.requestId,
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [
+          { findingId: 'finding-1', severity: 'major', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+        ],
+      },
+    }));
+
+    harness.setChangedPaths(['src/ex.ts']);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared' });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[major] src/ex.ts:4 — tighten the guard']);
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const acceptIntents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey);
+    expect(acceptIntents).toHaveLength(1);
+  });
+
+  it('AR1 MX7 (RV3): a minor-only brief-check receipt is never a fix source — the prepare refuses prepare-no-review-findings', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    // The MX7 journal: the GB1 minor-only brief-check pass, the code-review
+    // pass, then the accept rejected with the review-findings detail.
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    await appendIntent(harness, codeKey, null, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-passed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    // The brief-check receipt is failed with one minor finding — under RV3
+    // that receipt is a pass whose minor is carried, so it is never a fix
+    // source and no review-failed candidate remains at the head.
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-' + request.requestId,
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [
+          { findingId: 'finding-1', severity: 'minor', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+        ],
+      },
+    }));
+
+    harness.setChangedPaths(['src/ex.ts']);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+      detail: 'prepare-no-review-findings',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+  });
+
+  it('AR1 MX7: the receipt is found by kind at the head when the request id misses, and the prepare still hands the blocking finding over (RV3)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-failed', NOW);
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    await appendIntent(harness, codeKey, null, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-passed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    // The discriminating case: the receipt does NOT live under the
+    // brief-check intent's minted request id, only under its kind at that head.
+    harness.setFindReceiptAnswer(async () => ({ outcome: 'not-found' }));
+    harness.setFindLatestReceiptAnswer(async (request) =>
+      request.kind === 'brief-check'
+        ? {
+            outcome: 'found' as const,
+            receipt: {
+              receiptId: 'rcpt-brief-latest',
+              requestId: null,
+              kind: 'brief-check' as const,
+              reviewerModel: 'review-model-1',
+              candidateHeadSha: COMMIT_A,
+              verdict: 'failed' as const,
+              findings: [
+                { findingId: 'finding-1', severity: 'major' as const, summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+              ],
+            },
+          }
+        : { outcome: 'not-found' as const },
+    );
+
+    harness.setChangedPaths(['src/ex.ts']);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[major] src/ex.ts:4 — tighten the guard']);
+  });
+
   it('b) a gate-failed with no recorded failed check refuses prepare-refused rather than a bare reason code (KF-21b)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await seedGateFailure(harness);
@@ -942,6 +1266,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(1, 0, 2),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-nothing-to-fix',
     });
     expect(harness.fixRequests).toHaveLength(0);
     const record = await harness.runRepo.get(RUN_ID);
@@ -962,6 +1287,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(1, 0, 2),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-fix-refused',
     });
 
     const record = await harness.runRepo.get(RUN_ID);
@@ -1032,6 +1358,177 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(record?.parked?.reason).toBe('blocker-after-round-2');
     expect(record?.round).toBe(2);
     expect(harness.fixRequests).toHaveLength(0);
+  });
+
+  it('f1) PT1a: the round-2 review failure parks with class blocker on the record', async () => {
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, { ...collectedAttempt(), id: 'attempt-example-3' }],
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.class).toBe('blocker');
+  });
+
+  async function gateFailureInRound2(gateFailingFile?: ReadGateFailingFileResult): Promise<Harness> {
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, { ...collectedAttempt(), id: 'attempt-example-3' }],
+      gateFailingFile === undefined ? {} : { gateFailingFile, ownedPaths: ['packages/example/src'] },
+    );
+    const key = gateKey();
+    await appendIntent(harness, key, null, NOW);
+    await appendResult(harness, key, 'completed', 'gate-failed', NOW);
+    await conduct(harness, 'gating', NOW);
+    return harness;
+  }
+
+  it('f1b) PT1a: a round-2 gate failure whose failing file is outside the owned paths parks gate-outside-owned', async () => {
+    const harness = await gateFailureInRound2({ outcome: 'found', failingFile: 'packages/other/src/outside.test.ts' });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.parkedFrom).toBe('gating');
+    expect(record?.parked?.class).toBe('gate-outside-owned');
+  });
+
+  it('f1c) PT1a: a gate failure inside the owned paths, with no file, or with an unreadable receipt parks other, never a guess', async () => {
+    for (const answer of [
+      { outcome: 'found', failingFile: 'packages/example/src/inside.test.ts' },
+      { outcome: 'found', failingFile: null },
+      { outcome: 'unavailable' },
+      undefined,
+    ] as const) {
+      const harness = await gateFailureInRound2(answer);
+      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+      const record = await harness.runRepo.get(RUN_ID);
+      expect(record?.parked?.class).toBe('other');
+    }
+  });
+
+  it('f2) a blocker-after-round-2 park carries the bounded findings in the notice request', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFindLatestReceiptAnswer(async () => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-latest',
+        requestId: null,
+        kind: 'code-review',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [blockerFinding(), blockerFinding(), blockerFinding()],
+      },
+    }));
+
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const parkRequest = harness.parkNoticeRequests.find((request) => request.reason === 'blocker-after-round-2');
+    expect(parkRequest?.findings).toHaveLength(3);
+    expect(parkRequest?.findings?.[0]).toEqual({
+      findingId: 'finding-1',
+      severity: 'blocker',
+      summary: 'blocks the acceptance check',
+      filePath: 'src/ex.ts',
+      line: 4,
+    });
+  });
+
+  it('f3) a blocker-after-round-2 park falls back to the journal minted request id when the kind lookup misses; an unwired reviewRequest carries none', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const notFound = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(notFound, [blockerFinding()]);
+    await advance(notFound);
+    // RV3: the kind lookup missed, but the review intent's minted request id
+    // still finds the failed receipt — the causing findings are carried.
+    const notFoundRequest = notFound.parkNoticeRequests.find((request) => request.reason === 'blocker-after-round-2');
+    expect(notFoundRequest?.findings).toEqual([
+      { findingId: 'finding-1', severity: 'blocker', summary: 'blocks the acceptance check', filePath: 'src/ex.ts', line: 4 },
+    ]);
+
+    const unwired = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true, wireReviewRequest: false },
+    );
+    await seedReviewFailure(unwired, [blockerFinding()]);
+    await advance(unwired);
+    const unwiredRequest = unwired.parkNoticeRequests.find((request) => request.reason === 'blocker-after-round-2');
+    expect(unwiredRequest?.findings).toBeUndefined();
+  });
+
+  it('f4) a blocker-after-round-2 park from a zero-finding failed review receipt stores no findings at all, never [] (RV3)', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(harness, []);
+    harness.setFindLatestReceiptAnswer(async () => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-latest',
+        requestId: null,
+        kind: 'code-review',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [],
+      },
+    }));
+
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.findings).toBeUndefined();
+  });
+
+  it('f5) a blocker-after-round-2 park stores null when the receipt read throws', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFindLatestReceiptAnswer(async () => {
+      throw new Error('store down');
+    });
+
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.findings).toBeNull();
+  });
+
+  it('f6) a blocker-after-round-2 park stores null when the receipt lookup is unavailable', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFindLatestReceiptAnswer(async () => ({
+      outcome: 'unavailable',
+      reason: 'unreadable',
+    }));
+
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.findings).toBeNull();
   });
 
   it('g) journals the prepare intent before the port call', async () => {
@@ -1124,6 +1621,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(1, 0, 2),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-brief-rejected',
     });
     expect(harness.fixRequests).toHaveLength(0);
     const record = await harness.runRepo.get(RUN_ID);
@@ -1133,7 +1631,12 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
   });
 
   it('k) refuses prepare-refused when the prior manifest is unusable or incomplete', async () => {
-    for (const manifest of [null, JSON.stringify({ stepLimit: 100 })]) {
+    // A tampered manifest never matches the prior's recorded digest, so the
+    // digest check refuses first; a missing manifest read refuses unreadable.
+    for (const [manifest, detail] of [
+      [null, 'prepare-brief-unreadable'],
+      [JSON.stringify({ stepLimit: 100 }), 'prepare-brief-digest-mismatch'],
+    ] as const) {
       const harness = await makeHarness(runRecord(), [collectedAttempt()]);
       await seedReviewFailure(harness, [blockerFinding()]);
       harness.setManifest(manifest);
@@ -1145,6 +1648,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
         key: prepareKey(1, 0, 2),
         result: 'refused',
         reasonCode: 'prepare-refused',
+        detail,
       });
       expect(harness.fixRequests).toHaveLength(0);
       expect(harness.briefRequests).toHaveLength(0);
@@ -1167,6 +1671,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(1, 0, 2),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-brief-digest-mismatch',
     });
 
     expect(await advance(refused)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'prepare' });
@@ -1214,6 +1719,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(1, 0, 2),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-no-recorded-host',
     });
     expect(withoutHost.briefRequests).toHaveLength(0);
     expect(withoutHost.fixRequests).toHaveLength(0);
@@ -1497,6 +2003,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(1, 0, 2),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-brief-digest-mismatch',
     });
     expect(harness.fixRequests).toHaveLength(0);
     expect(harness.briefRequests).toHaveLength(0);
@@ -1518,6 +2025,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(1, 0, 2),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-brief-unreadable',
     });
     expect(harness.fixRequests).toHaveLength(0);
     expect(harness.briefRequests).toHaveLength(0);
@@ -1540,6 +2048,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(1, 0, 2),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-brief-unreadable',
     });
     expect(harness.fixRequests).toHaveLength(0);
     expect(harness.briefRequests).toHaveLength(0);
@@ -1559,6 +2068,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(1, 0, 2),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-brief-read-failed',
     });
     expect(harness.fixRequests).toHaveLength(0);
     expect(harness.briefRequests).toHaveLength(0);
@@ -1595,6 +2105,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       key: prepareKey(2, 1, 3),
       result: 'refused',
       reasonCode: 'prepare-refused',
+      detail: 'prepare-no-original-brief',
     });
     expect(harness.fixRequests).toHaveLength(0);
     expect(harness.briefRequests).toHaveLength(0);
@@ -1673,6 +2184,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     const briefCount = harness.briefRequests.length;
     expect(await advance(harness)).toEqual({
       outcome: 'acted', step: 'prepare', key: prepareKey(1, 1, 3), result: 'refused', reasonCode: 'prepare-refused',
+      detail: 'prepare-brief-digest-mismatch',
     });
     expect(harness.fixRequests).toHaveLength(1);
     expect(harness.briefRequests).toHaveLength(briefCount);
@@ -1706,6 +2218,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     // `priorAttemptId` does not name the prior: the prepare refuses.
     expect(await advance(harness)).toEqual({
       outcome: 'acted', step: 'prepare', key: prepareKey(1, 0, 3), result: 'refused', reasonCode: 'prepare-refused',
+      detail: 'prepare-brief-digest-mismatch',
     });
     expect(harness.fixRequests).toHaveLength(0);
     expect(harness.briefRequests).toHaveLength(0);
@@ -1768,7 +2281,9 @@ describe('AdvanceLaneRunUseCase fix-round prepare scopes review findings (KF-33a
       reasonCode: 'prepared',
     });
     expect(harness.fixRequests[0]?.numberedFixes).toEqual([
-      '[major] ' + WORKTREE + '/src/ex.ts:4 — blocks the acceptance check',
+      // PF1: the absolute worktree spelling is normalised to the
+      // repository-relative path before the brief renders.
+      '[major] src/ex.ts:4 — blocks the acceptance check',
     ]);
   });
 
@@ -1881,6 +2396,608 @@ describe('AdvanceLaneRunUseCase fix-round prepare scopes review findings (KF-33a
       { worktreePath: WORKTREE, baseCommit: COMMIT_A, headCommit: '1'.repeat(40), recordedHost: CONDUCTED_RUNNER },
     ]);
     expect(harness.fixRequests[0]?.priorAttemptId).toBe('attempt-example-2');
+  });
+});
+
+describe('AdvanceLaneRunUseCase fix-round prepare refusal details (MX7)', () => {
+  /** The detail of the prepare key's single result entry, after one advance. */
+  async function refusedPrepareDetailOf(harness: Harness): Promise<string | null> {
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', result: 'refused', reasonCode: 'prepare-refused' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const results = entries.filter(
+      (entry) => entry.kind === 'result' && entry.key === (result as { key: string }).key,
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ outcome: 'refused', reasonCode: 'prepare-refused' });
+    return (results[0]!.detail as string | null) ?? null;
+  }
+
+  it('AR1 without changed paths fails closed: the fix prepare hands the minor-only brief-check receipt behind the review-findings rejection', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    // The MX7 journal: the GB1 minor-only brief-check pass, the code-review
+    // pass, then the accept rejected with the review-findings detail.
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    await appendIntent(harness, codeKey, null, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-passed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    // The brief-check receipt is failed with one minor finding — the
+    // unresolved finding the acceptance rejection named.
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-' + request.requestId,
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [
+          { findingId: 'finding-1', severity: 'minor', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+        ],
+      },
+    }));
+
+    // no changed paths: summaries carry no disposition, so the walk refuses instead of guessing scope
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-scope-unavailable');
+  });
+
+
+  it('prepare-round-out-of-range: a round-3 prepare decision refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    const ctx: AdvanceStepContext = { deps: harness.deps };
+    const request: AdvanceLaneRunRequest = {
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    };
+    // The key's round part only goes up to 2, so a round-3 decision carries
+    // the round-2 key shape; the refusal is journalled under that key.
+    const outOfRangeKey = prepareKey(2, 0, 2);
+    const decision = {
+      kind: 'act' as const,
+      step: 'prepare' as const,
+      key: outOfRangeKey,
+      round: 3,
+      seatIndex: 0,
+      head12: null,
+      retry: null,
+    };
+    const refuse = async (reasonCode: LaneRunResultReasonCode, detail: string | null = null) => {
+      const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
+      expect(intentRefusal).toBeNull();
+      const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode, detail);
+      expect(resultRefusal).toBeNull();
+      return {
+        outcome: 'acted' as const,
+        step: decision.step,
+        key: decision.key,
+        result: 'refused' as const,
+        reasonCode,
+        ...(detail ? { detail } : {}),
+      };
+    };
+    const gathered = { facts: { state: 'fixing' } } as unknown as GatheredLaneRunFacts;
+    const record = (await harness.runRepo.get(RUN_ID))!;
+    const result = await performFixPrepare(ctx, record, gathered, decision, request, refuse);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: outOfRangeKey,
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+      detail: 'prepare-round-out-of-range',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === outOfRangeKey);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'prepare-refused',
+      detail: 'prepare-round-out-of-range',
+    });
+  });
+
+  it('prepare-no-head: a prior whose head is not a commit id refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [
+      { ...collectedAttempt(), artifacts: { headCommit: 'not-a-commit', commitsSinceBase: [], collectedArtifactPaths: [], notes: 'present' } },
+    ]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-head');
+  });
+
+  it('prepare-no-failure-source: a fixing run with no failure entry refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'fixing', NOW);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-failure-source');
+  });
+
+  it('prepare-no-review-findings: a review-findings rejection with no receipt carrying findings refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    await appendIntent(harness, briefKey, 'review-' + harness.deps.newUlid(), NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    harness.setChangedPaths(['src/ex.ts']);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-review-findings');
+  });
+
+  it('the newest failed receipt is all out of scope and an older one has an in-scope finding: the prepare refuses no-in-scope-findings', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    const codeRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, codeKey, codeRequestId, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-failed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+
+    harness.setChangedPaths(['src/ex.ts']);
+    harness.setFindReceiptAnswer(async (request) => {
+      if (request.requestId === codeRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + codeRequestId,
+            requestId: codeRequestId,
+            kind: 'code-review',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'failed',
+            findings: [
+              { findingId: 'finding-out-1', severity: 'blocker', summary: 'already marked out of scope', filePath: 'src/ex.ts', line: 4, state: 'out-of-scope' },
+              { findingId: 'finding-out-2', severity: 'major', summary: 'path not changed', filePath: 'src/other.ts', line: 10 },
+            ],
+          },
+        };
+      }
+      if (request.requestId === briefRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + briefRequestId,
+            requestId: briefRequestId,
+            kind: 'brief-check',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'failed',
+            findings: [
+              { findingId: 'finding-in-1', severity: 'minor', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+            ],
+          },
+        };
+      }
+      return { outcome: 'not-found' };
+    });
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'no-in-scope-findings',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+  });
+
+  it('a newer passed receipt with only out-of-scope findings does not decide: the older failed receipt with an in-scope finding is handed over', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-failed', NOW);
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    const codeRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, codeKey, codeRequestId, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+
+    harness.setChangedPaths(['src/ex.ts']);
+    harness.setFindReceiptAnswer(async (request) => {
+      if (request.requestId === codeRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + codeRequestId,
+            requestId: codeRequestId,
+            kind: 'code-review',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'passed',
+            findings: [
+              { findingId: 'finding-pass-out', severity: 'minor', summary: 'path not changed', filePath: 'src/other.ts', line: 10 },
+            ],
+          },
+        };
+      }
+      if (request.requestId === briefRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + briefRequestId,
+            requestId: briefRequestId,
+            kind: 'brief-check',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'failed',
+            findings: [
+              { findingId: 'finding-in-1', severity: 'major', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+            ],
+          },
+        };
+      }
+      return { outcome: 'not-found' };
+    });
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[major] src/ex.ts:4 — tighten the guard']);
+  });
+
+  it('no failed receipt has an in-scope finding: the prepare refuses no-in-scope-findings', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    const codeRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, codeKey, codeRequestId, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-failed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+
+    harness.setChangedPaths(['src/ex.ts']);
+    harness.setFindReceiptAnswer(async (request) => {
+      if (request.requestId === codeRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + codeRequestId,
+            requestId: codeRequestId,
+            kind: 'code-review',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'failed',
+            findings: [
+              { findingId: 'finding-code-out', severity: 'blocker', summary: 'path not changed', filePath: 'src/other.ts', line: 10 },
+            ],
+          },
+        };
+      }
+      if (request.requestId === briefRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + briefRequestId,
+            requestId: briefRequestId,
+            kind: 'brief-check',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'failed',
+            findings: [
+              { findingId: 'finding-brief-out', severity: 'minor', summary: 'already out of scope', filePath: 'src/ex.ts', line: 4, state: 'out-of-scope' },
+            ],
+          },
+        };
+      }
+      return { outcome: 'not-found' };
+    });
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'no-in-scope-findings',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
+  });
+
+  it('prepare-no-review-request: a review failure whose intent has no minted request id refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    const key = reviewKey('code-review', 0, HEAD12_A);
+    await appendIntent(harness, key, null, NOW);
+    await appendResult(harness, key, 'completed', 'review-failed', NOW);
+    await conduct(harness, 'fixing', NOW);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-review-request');
+  });
+
+  it('prepare-review-receipt-unavailable: a review receipt the port cannot find refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFindReceiptAnswer(async () => ({ outcome: 'not-found' }));
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-review-receipt-unavailable');
+  });
+
+  it('prepare-no-brief-package: a prior without a brief package path refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [{ ...collectedAttempt(), briefPackagePath: null }]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-brief-package');
+  });
+
+  it('prepare-no-recorded-host: a prior without a recorded host refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [{ ...collectedAttempt(), runner: null }]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-recorded-host');
+  });
+
+  it('prepare-brief-read-failed: a throwing brief read refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setBriefFileError('boom');
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-brief-read-failed');
+  });
+
+  it('prepare-brief-unreadable: a missing prose read refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setProse(null);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-brief-unreadable');
+  });
+
+  it('prepare-brief-digest-mismatch: untrusted on-disk prose refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setProse('# tampered prose\n');
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-brief-digest-mismatch');
+  });
+
+  it('prepare-manifest-unreadable: a trusted disk state whose manifest is not a JSON object refuses with its own token', async () => {
+    const manifestJson = '"not an object"';
+    const proseText = '# handover on disk\n';
+    const cancelled: AttemptRecord = {
+      ...buildFixAttempt(
+        { fixAttemptId: 'attempt-cancelled', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-example-1', numberedFixes: [] },
+        0,
+      ),
+      state: 'cancelled',
+      outcome: 'stopped',
+      briefDigest: simpleDeterministicHexDigest(proseText + '\n' + manifestJson),
+    };
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-cancelled'] }),
+      [collectedAttempt(), cancelled],
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setProse(proseText);
+    harness.setManifest(manifestJson);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-manifest-unreadable');
+  });
+
+  it('prepare-gate-journal-unreadable: an unreadable gate journal refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedGateFailure(harness);
+    // Driven through performFixPrepare directly: the unreadable journal must
+    // be caught INSIDE the prepare, never escaping the advance.
+    (
+      harness.executionJournal as unknown as { listJournalEntriesForAttempt: () => Promise<never> }
+    ).listJournalEntriesForAttempt = async () => {
+      throw new Error('unreadable');
+    };
+    const ctx: AdvanceStepContext = { deps: harness.deps };
+    const request: AdvanceLaneRunRequest = {
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    };
+    const decision = {
+      kind: 'act' as const,
+      step: 'prepare' as const,
+      key: prepareKey(1, 0, 2),
+      round: 1,
+      seatIndex: 0,
+      head12: null,
+      retry: null,
+    };
+    const refuse = async (reasonCode: LaneRunResultReasonCode, detail: string | null = null) => {
+      const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
+      expect(intentRefusal).toBeNull();
+      const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode, detail);
+      expect(resultRefusal).toBeNull();
+      return {
+        outcome: 'acted' as const,
+        step: decision.step,
+        key: decision.key,
+        result: 'refused' as const,
+        reasonCode,
+        ...(detail ? { detail } : {}),
+      };
+    };
+    const gathered = { facts: { state: 'fixing' }, attemptRecords: [collectedAttempt()] } as unknown as GatheredLaneRunFacts;
+    const record = (await harness.runRepo.get(RUN_ID))!;
+    const result = await performFixPrepare(ctx, record, gathered, decision, request, refuse);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'prepare-refused',
+      detail: 'prepare-gate-journal-unreadable',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === prepareKey(1, 0, 2));
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'prepare-refused',
+      detail: 'prepare-gate-journal-unreadable',
+    });
+  });
+
+  it('prepare-no-gate-checks: a gate-failed with no failed check refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedGateFailure(harness);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-gate-checks');
+  });
+
+  it('prepare-acceptance-spec-invalid: a frozen manifest without a usable acceptance spec refuses with its own token', async () => {
+    // A tampered manifest cannot reach the spec check (the digest refuses
+    // first), so the trusted cancelled-handover path carries the incomplete
+    // manifest onto the disk.
+    const manifestJson = JSON.stringify({ stepLimit: 100 });
+    const cancelled: AttemptRecord = {
+      ...buildFixAttempt(
+        { fixAttemptId: 'attempt-cancelled', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-example-1', numberedFixes: [] },
+        0,
+      ),
+      state: 'cancelled',
+      outcome: 'stopped',
+      briefDigest: simpleDeterministicHexDigest(DEFAULT_PROSE + '\n' + manifestJson),
+    };
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-cancelled'] }),
+      [collectedAttempt(), cancelled],
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setManifest(manifestJson);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-acceptance-spec-invalid');
+  });
+
+  it('prepare-no-original-brief: a fix prior whose prose has no original-brief marker refuses with its own token', async () => {
+    const harness = await makeHarness(
+      runRecord({ round: 1, attemptIds: ['attempt-example-1', 'attempt-fix-prior'] }),
+      [collectedAttempt()],
+    );
+    const fixPrior: AttemptRecord = {
+      ...buildFixAttempt(
+        { fixAttemptId: 'attempt-fix-prior', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-example-1', numberedFixes: [] },
+        0,
+      ),
+      state: 'collected',
+      briefDigest: simpleDeterministicHexDigest(DEFAULT_PROSE + '\n' + FULL_MANIFEST_JSON),
+      artifacts: { headCommit: COMMIT_A, commitsSinceBase: [COMMIT_A], collectedArtifactPaths: [], notes: 'present' },
+    };
+    await harness.attemptRepo.saveAttempt(fixPrior);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', key: prepareKey(2, 1, 3), result: 'refused', reasonCode: 'prepare-refused' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === prepareKey(2, 1, 3));
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ outcome: 'refused', reasonCode: 'prepare-refused', detail: 'prepare-no-original-brief' });
+  });
+
+  it('prepare-nothing-to-fix: a receipt with only nit findings refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      { findingId: 'finding-1', severity: 'nit', summary: 'nit only', filePath: 'src/ex.ts', line: 4 },
+    ]);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-nothing-to-fix');
+  });
+
+  it('prepare-handover-invalid-finding-path: a major finding escaping the worktree reports the real render refusal (PF1)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      { findingId: 'finding-1', severity: 'major', summary: 'escapes the worktree', filePath: '../escape.ts', line: 4 },
+    ]);
+    harness.setChangedPaths(['../escape.ts']);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-handover-invalid-finding-path');
+  });
+
+  it('a major finding on a Nitro dynamic-route path prepares (PF1)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      {
+        findingId: 'finding-1',
+        severity: 'major',
+        summary: 'validate the route input',
+        filePath: 'apps/api/server/routes/v1/threads/[id]/permissions/index.post.ts',
+        line: 30,
+      },
+    ]);
+    harness.setChangedPaths(['apps/api/server/routes/v1/threads/[id]/permissions/index.post.ts']);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual([
+      '[major] apps/api/server/routes/v1/threads/[id]/permissions/index.post.ts:30 — validate the route input',
+    ]);
+  });
+
+  it('prepare-brief-request-incomplete: a manifest missing a required request field refuses with its own token', async () => {
+    // A tampered manifest cannot reach the brief request (the digest refuses
+    // first), so the trusted cancelled-handover path carries the incomplete
+    // manifest onto the disk, with a handover prose the original brief is
+    // extracted from.
+    const manifest = JSON.parse(FULL_MANIFEST_JSON) as Record<string, unknown>;
+    delete manifest.repository;
+    const manifestJson = JSON.stringify(manifest);
+    const handoverProse =
+      '# Handover\n\n1. fix the thing\n\n' +
+      `${ORIGINAL_BRIEF_MARKER}\n\n## Original brief (task reference; the numbered items above take priority)\n\n${DEFAULT_PROSE}`;
+    const cancelled: AttemptRecord = {
+      ...buildFixAttempt(
+        { fixAttemptId: 'attempt-cancelled', workOrderId: 'wo-example-1', priorAttemptId: 'attempt-example-1', numberedFixes: [] },
+        0,
+      ),
+      state: 'cancelled',
+      outcome: 'stopped',
+      briefDigest: simpleDeterministicHexDigest(handoverProse + '\n' + manifestJson),
+    };
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-cancelled'] }),
+      [collectedAttempt(), cancelled],
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setProse(handoverProse);
+    harness.setManifest(manifestJson);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-brief-request-incomplete');
+  });
+
+  it('prepare-brief-rejected: a rejected brief placement refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setBriefAnswer(async () => ({ outcome: 'rejected', reason: 'example' }));
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-brief-rejected');
+  });
+
+  it('prepare-fix-refused: a refused fix attempt port refuses with its own token', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFixAnswer(async () => ({ outcome: 'refused', reason: 'example' }));
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-fix-refused');
   });
 });
 
@@ -2235,35 +3352,422 @@ describe('KF-20: the gate and the review open the evidence assessment with the m
     expect(await advance(harness)).toMatchObject({
       outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-passed',
     });
-    expect(harness.reviewOpenRequests).toHaveLength(1);
-    expect(harness.reviewOpenRequests[0]).toMatchObject({
-      attemptId: 'attempt-fix-1',
-      candidateHeadSha: COMMIT_A,
-      policyRevision: 'policy-example-1',
-      implementerModel: 'fix-model-1',
-      requiredChecks: ['check-1'],
-    });
-    expect(harness.gateReceiptRequests).toHaveLength(1);
-
-    // The brief-check opens the SAME assessment: the same implementerModel,
-    // head and policy — never a `head-mismatch` refusal.
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
-    const reviewAct = await advance(harness);
-    expect(reviewAct).toMatchObject({
-      outcome: 'acted', step: 'brief-check', result: 'completed', reasonCode: 'review-passed',
-    });
+    // The gate act starts the brief-check review beside the gate (KS6): the
+    // in-flight review opens its assessment with the same implementer model,
+    // head and policy as the gate's own receipt-recording open — never a
+    // `head-mismatch` refusal — and its receipt is recorded before the
+    // gate's result entry.
     expect(harness.reviewOpenRequests).toHaveLength(2);
-    const [gateOpen, reviewOpen] = harness.reviewOpenRequests;
-    expect(reviewOpen!.implementerModel).toBe(gateOpen!.implementerModel);
-    expect(reviewOpen).toMatchObject({
-      attemptId: 'attempt-fix-1',
-      candidateHeadSha: COMMIT_A,
-      policyRevision: 'policy-example-1',
-      implementerModel: 'fix-model-1',
-      requiredChecks: ['check-1'],
-    });
-    // The review is requested, not refused `assessment-unavailable`.
+    for (const open of harness.reviewOpenRequests) {
+      expect(open).toMatchObject({
+        attemptId: 'attempt-fix-1',
+        candidateHeadSha: COMMIT_A,
+        policyRevision: 'policy-example-1',
+        implementerModel: 'fix-model-1',
+        requiredChecks: ['check-1'],
+      });
+    }
+    expect(harness.gateReceiptRequests).toHaveLength(1);
+    // The review is requested beside the gate, not refused `assessment-unavailable`.
     expect(harness.reviewRequests).toHaveLength(1);
     expect(harness.reviewRequests[0]).toMatchObject({ kind: 'brief-check', implementerModel: 'fix-model-1' });
+
+    // The recorded receipt is read: the brief-check state opens no second
+    // assessment and requests no second review.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+    expect(harness.reviewOpenRequests).toHaveLength(2);
+    expect(harness.reviewRequests).toHaveLength(1);
+  });
+});
+
+describe('AdvanceLaneRunUseCase CI-red fix round (GB4)', () => {
+  /** A watching-ci run whose CI read failed at the collected head; the next advance is the `act ci` step. */
+  async function seedCiRed(harness: Harness): Promise<void> {
+    // The run watched CI at an ACCEPTED head: the accept result carries the
+    // head the facts read (the decider's head-change guard needs it).
+    const accept = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, accept, null, NOW);
+    await appendResult(harness, accept, 'completed', 'accepted', NOW);
+    harness.setCiAnswer({ headSha: COMMIT_A, state: 'failed', reason: 'read' });
+    await conduct(harness, 'watching-ci', NOW);
+  }
+
+  it('a CI-red open-PR run acts the keyed ci step, records the failure and prepares its fix round without parking', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    await seedCiRed(harness);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: ciKey(),
+      result: 'refused',
+      reasonCode: 'ci-failed',
+    });
+    // Exactly one intent and one result under the ci key; the CI read went to the exact head.
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())[0]).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'ci-failed',
+    });
+    expect(harness.ciRequests).toEqual([{ headSha: COMMIT_A }]);
+
+    // The fix round is prepared, never parked `step-refused`.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+  });
+
+  it('the CI fix handover names the ci-failed reason and no gate check', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    await seedCiRed(harness);
+    await advance(harness);
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed' });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown;
+    expect(prose).toContain('[gate] ci-failed');
+    expect(prose).not.toContain('[gate] command');
+  });
+
+  it('a crash after the ci intent reconciles it: one intent, one result, no second intent', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    await appendIntent(harness, ciKey(), null, NOW);
+    await seedCiRed(harness);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: ciKey(),
+      result: 'refused',
+      reasonCode: 'ci-failed',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+  });
+
+  it('a pending ci intent whose head no longer matches the facts is overtaken, never journalled ci-failed', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    const HEAD12_STALE = 'b'.repeat(12);
+    const staleKey = ciKey(HEAD12_STALE);
+    await appendIntent(harness, staleKey, null, NOW);
+    await seedCiRed(harness);
+
+    // The stale intent is reconciled as overtaken under its own key — no ci-failed under it.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: staleKey,
+      result: 'overtaken',
+      reasonCode: 'ci-overtaken',
+    });
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === staleKey)).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === staleKey)).toHaveLength(1);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'ci-failed')).toBe(false);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+
+    // The resolved pending intent lets the decider issue a fresh ci act at the current head.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: ciKey(),
+      result: 'refused',
+      reasonCode: 'ci-failed',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+  });
+
+  it('a crash after the ci intent followed by a CI pass resolves the pending intent and reaches merging', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    const accept = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, accept, null, NOW);
+    await appendResult(harness, accept, 'completed', 'accepted', NOW);
+    await appendIntent(harness, ciKey(), null, NOW);
+    harness.setCiAnswer({ headSha: COMMIT_A, state: 'passed', reason: 'read' });
+    await conduct(harness, 'watching-ci', NOW);
+
+    // The reconcile resolves the pending intent as overtaken — never ci-failed.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: ciKey(),
+      result: 'overtaken',
+      reasonCode: 'ci-overtaken',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'ci-failed')).toBe(false);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+
+    // With the intent resolved, the normal watching-ci → merging transition proceeds.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merging' });
+  });
+
+  it('a crash after the ci result resumes only the transition to fixing', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    const accept = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, accept, null, NOW);
+    await appendResult(harness, accept, 'completed', 'accepted', NOW);
+    await appendIntent(harness, ciKey(), null, NOW);
+    await appendResult(harness, ciKey(), 'refused', 'ci-failed', NOW);
+    await conduct(harness, 'watching-ci', NOW);
+    harness.setCiAnswer({ headSha: COMMIT_A, state: 'failed', reason: 'read' });
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+  });
+
+  it('a CI failure after an overtaken intent journals under a new retry key, enters fixing, and prepares its fix round', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    const accept = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, accept, null, NOW);
+    await appendResult(harness, accept, 'completed', 'accepted', NOW);
+    await appendIntent(harness, ciKey(), null, NOW);
+    harness.setCiAnswer({ headSha: COMMIT_A, state: 'passed', reason: 'read' });
+    await conduct(harness, 'watching-ci', NOW);
+
+    // 1. Pending intent is reconciled as overtaken because CI passed.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: ciKey(),
+      result: 'overtaken',
+      reasonCode: 'ci-overtaken',
+    });
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())[0]).toMatchObject({
+      outcome: 'overtaken',
+      reasonCode: 'ci-overtaken',
+    });
+
+    // 2. Later, CI fails at the same head (a failed rerun).
+    harness.setCiAnswer({ headSha: COMMIT_A, state: 'failed', reason: 'read' });
+
+    const retryKey = ciKey(HEAD12_A, 1);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: retryKey,
+      result: 'refused',
+      reasonCode: 'ci-failed',
+    });
+
+    // The ci-failed result is journalled under the fresh retry key.
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === retryKey)).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === retryKey)).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === retryKey)[0]).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'ci-failed',
+    });
+
+    // 3. The run has entered fixing; the next prepare succeeds with the CI failure source, not prepare-no-failure-source.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+    const prose = harness.briefRequests[0]!.proseMarkdown;
+    expect(prose).toContain('[gate] ci-failed');
+    expect(prose).not.toContain('[gate] command');
+  });
+
+  it('d) a gate failure with a failed brief-check receipt at the same head carries the findings beside the gate deltas', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    // The failed brief-check receipt is recorded at the same head the gate
+    // failed: its findings join the gate's failed checks in the fix brief.
+    await seedReviewFailure(harness, [blockerFinding()], 'brief-check');
+    await seedGateFailure(harness);
+    await harness.executionJournal.appendJournalEntry({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':0',
+      attemptId: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      action: 'accept',
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed',
+      sessionId: null,
+      detail: JSON.stringify({
+        predicate: 'command 1',
+        kind: 'command',
+        verdict: 'fail',
+        exitCode: 1,
+        durationMs: 10,
+        detail: 'gate detail text that must never appear',
+      }),
+    });
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown!;
+    expect(prose).toContain('[blocker] src/ex.ts:4 — blocks the acceptance check');
+    expect(prose).toContain('[gate] command 1 — fail, exit 1');
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual([
+      '[blocker] src/ex.ts:4 — blocks the acceptance check',
+      '[gate] command 1 — fail, exit 1',
+    ]);
+  });
+
+  it('d2) a gate failure with a pending review intent whose receipt is recorded carries the findings beside the gate deltas', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    // The brief-check outcome was unknown: its intent stays without a result
+    // (K5-4b), yet its receipt is already recorded at the same head the gate
+    // failed. The gate-failure fix scan reads the pending intent's receipt too.
+    const gateKeyStr = gateKey();
+    await appendIntent(harness, gateKeyStr, null, NOW);
+    await appendIntent(harness, reviewKey('brief-check', 0, HEAD12_A), 'review-' + harness.deps.newUlid(), NOW);
+    await appendResult(harness, gateKeyStr, 'completed', 'gate-failed', NOW);
+    await conduct(harness, 'fixing', NOW);
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-' + request.requestId,
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [blockerFinding()],
+      },
+    }));
+    await harness.executionJournal.appendJournalEntry({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':0',
+      attemptId: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      action: 'accept',
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed',
+      sessionId: null,
+      detail: JSON.stringify({
+        predicate: 'command 1',
+        kind: 'command',
+        verdict: 'fail',
+        exitCode: 1,
+        durationMs: 10,
+        detail: 'gate detail text that must never appear',
+      }),
+    });
+
+    const ctx: AdvanceStepContext = { deps: harness.deps };
+    const request: AdvanceLaneRunRequest = {
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    };
+    const decision = {
+      kind: 'act' as const,
+      step: 'prepare' as const,
+      key: prepareKey(1, 0, 2),
+      round: 1,
+      seatIndex: 0,
+      head12: null,
+      retry: null,
+    };
+    const refuse = async (reasonCode: LaneRunResultReasonCode, detail: string | null = null) => {
+      const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
+      expect(intentRefusal).toBeNull();
+      const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode, detail);
+      expect(resultRefusal).toBeNull();
+      return {
+        outcome: 'acted' as const,
+        step: decision.step,
+        key: decision.key,
+        result: 'refused' as const,
+        reasonCode,
+        ...(detail ? { detail } : {}),
+      };
+    };
+    const gathered = { facts: { state: 'fixing' }, attemptRecords: [collectedAttempt()] } as unknown as GatheredLaneRunFacts;
+    const record = (await harness.runRepo.get(RUN_ID))!;
+    // The prepare fake asserts the intent precedes the port call: set the
+    // journal baseline to the current length (the act appends exactly one
+    // intent before the fake runs).
+    harness.setJournalBaseline((await harness.runJournal.listForRun(RUN_ID)).length);
+    const result = await performFixPrepare(ctx, record, gathered, decision, request, refuse);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown!;
+    expect(prose).toContain('[blocker] src/ex.ts:4 — blocks the acceptance check');
+    expect(prose).toContain('[gate] command 1 — fail, exit 1');
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual([
+      '[blocker] src/ex.ts:4 — blocks the acceptance check',
+      '[gate] command 1 — fail, exit 1',
+    ]);
+  });
+
+  it('e) a gate failure with no review receipt keeps today’s brief exactly', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedGateFailure(harness);
+    await harness.executionJournal.appendJournalEntry({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':0',
+      attemptId: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      action: 'accept',
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed',
+      sessionId: null,
+      detail: JSON.stringify({
+        predicate: 'command 1',
+        kind: 'command',
+        verdict: 'fail',
+        exitCode: 1,
+        durationMs: 10,
+        detail: 'gate detail text that must never appear',
+      }),
+    });
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown!;
+    expect(prose).toContain('[gate] command 1 — fail, exit 1');
+    expect(prose).not.toContain('[blocker]');
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[gate] command 1 — fail, exit 1']);
   });
 });

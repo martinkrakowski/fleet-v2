@@ -21,12 +21,13 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
-import { composeCoordination } from './composition/coordination.js';
+import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
 import { composeKnowledge } from './composition/knowledge.js';
 import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
 import { composeExecution } from './composition/work-execution.js';
 import { composeConductor } from './composition/conductor.js';
+import { composeDaemon, type ComposedDaemon } from './composition/daemon.js';
 import { composeTelemetry, type TelemetryConfiguredState, type TelemetryPolicyView } from './composition/telemetry.js';
 
 import {
@@ -47,13 +48,19 @@ import {
   ConductorForgeGrantAdapter,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
+  ExplainAttemptUseCase,
   ExecutionJournalAdapter,
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  MergeGrantAdapter,
+  MergeRecordRepositoryAdapter,
   ForgeReadAdapter,
+  GhForgeMergeReadAdapter,
   InspectAttemptUseCase,
+  InspectMergeReadinessUseCase,
   InspectWorkOrderUseCase,
+  InventoryRelaunchUseCase,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
   OpencodeApiUsageAdapter,
@@ -80,6 +87,7 @@ import {
   resolveInstallationForgeMode,
   resolveRoleExecutors,
   resolveRunnerCapabilityProfile,
+  sha256HexDigest,
   ConductorDriverLeaseAdapter,
   ConductorHaltAdapter,
   InspectLaneRunsUseCase,
@@ -95,14 +103,23 @@ import {
   type AttemptRecord,
   type ExecutionRunnerHost,
   type EvaluateAttemptGatePort,
+  type EnqueueMergeUseCase,
+  type ListMergeQueueUseCase,
+  type ImportTrainStateUseCase,
+  type LegacyTrainStateReadAdapter,
+  type MergeQueueRepositoryAdapter,
   type ForgeActionDelegate,
   type GhInvocationResult,
   type SubprocessRunner,
   type CommandExecutorPort,
   type AcceptanceReceiptReadAdapter,
+  type GateFailingFileAdapter,
+  type ListStalledRunsUseCase,
+  type StallAttentionAdapter,
   type ExportRunTelemetryUseCase,
   type TelemetryDispositionAdapter,
   type TelemetryResourceInput,
+  type RunTelemetryMarkPort,
 } from '@fleet/work-execution';
 
 import {
@@ -197,6 +214,16 @@ export interface FleetCliRuntimeOptions {
    * Defaults to the real `loadInstallation()`; tests inject a temp file.
    */
   readonly loadInstallationForAutoMerge?: () => LoadResult;
+  /**
+   * Fresh installation loader for the daemon's merge-policy binding (DT10b).
+   * Takes precedence over `installation`; tests inject a temp file and the
+   * `daemon` command injects an already-loaded (possibly invalid) result.
+   */
+  readonly loadInstallationForMergePolicy?: () => LoadResult;
+  /** The daemon clock (tests only); production reads the system clock. */
+  readonly daemonNow?: () => string;
+  /** The daemon wake-settle sleep (tests only); production waits with a timer. */
+  readonly daemonSleep?: (ms: number) => Promise<void>;
   /** Agent, model and variant handed to the live runner subprocess. */
   readonly runnerAgent?: string;
   readonly runnerModel?: string;
@@ -226,7 +253,10 @@ export interface FleetCliRuntimeOptions {
    * reviewed subprocess runner shared with the forge action adapter; tests
    * inject a stub transport here.
    */
-  readonly forgeGhRunner?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  readonly forgeGhRunner?: (
+    args: readonly string[],
+    timeoutMs?: number,
+  ) => Promise<GhInvocationResult>;
   /**
    * Absolute gh locations overriding the fixed defaults (tests only).
    * Production always resolves the reviewed GitHub CLI from
@@ -445,6 +475,31 @@ function isExecutableRegularFile(path: string): boolean {
   }
 }
 
+/** Normal one-call timeout for a `gh` subprocess; the subprocess is killed on expiry. */
+const GH_SUBPROCESS_TIMEOUT_MS = 30_000;
+
+/**
+ * Build the child environment for a GitHub CLI subprocess. When `env` sets
+ * `GH_CONFIG_DIR`, ambient token credentials (which gh prefers over hosts.yml)
+ * are stripped so the configured identity authenticates the child.
+ */
+export function buildGhChildEnvironment(
+  ambient: NodeJS.ProcessEnv = process.env,
+  env?: Record<string, string>,
+): NodeJS.ProcessEnv | undefined {
+  if (env === undefined) {
+    return undefined;
+  }
+  const child: NodeJS.ProcessEnv = { ...ambient, ...env };
+  if ('GH_CONFIG_DIR' in env) {
+    delete child.GH_TOKEN;
+    delete child.GITHUB_TOKEN;
+    delete child.GH_ENTERPRISE_TOKEN;
+    delete child.GITHUB_ENTERPRISE_TOKEN;
+  }
+  return child;
+}
+
 /**
  * Run the reviewed GitHub CLI subprocess for the forge adapter. The binary is
  * resolved from fixed absolute locations (S4036), never through PATH; when
@@ -452,18 +507,33 @@ function isExecutableRegularFile(path: string): boolean {
  * unreadable (fail closed, as a missing binary does today). A completed
  * invocation resolves with its exit code and captured output; a spawn failure
  * rejects so the adapter reports the outcome as ambiguous for reconciliation
- * instead of guessing.
+ * instead of guessing. `env` (when provided) is merged over the inherited
+ * environment, with ambient tokens stripped when `GH_CONFIG_DIR` is set; the
+ * value is never logged. A timeout that kills the subprocess also rejects: an
+ * expired write may have reached the forge, so the adapters report it ambiguous,
+ * never as proof of success.
  */
-function runGhSubprocess(
+export function runGhSubprocess(
   args: readonly string[],
   candidates: readonly string[] = GH_BINARY_CANDIDATES,
+  env?: Record<string, string>,
+  timeoutMs?: number,
 ): Promise<GhInvocationResult> {
   const ghBinary = resolveGhBinary(candidates, isExecutableRegularFile);
   if (ghBinary === undefined) {
     return Promise.reject(new Error('gh not found in fixed locations'));
   }
+  const executionOptions: {
+    encoding: 'utf8';
+    env?: NodeJS.ProcessEnv;
+    timeout?: number;
+  } = { encoding: 'utf8', timeout: timeoutMs ?? GH_SUBPROCESS_TIMEOUT_MS };
+  const childEnv = buildGhChildEnvironment(process.env, env);
+  if (childEnv !== undefined) {
+    executionOptions.env = childEnv;
+  }
   return new Promise((resolve, reject) => {
-    execFile(ghBinary, [...applyGhEnvironmentOverrides(args)], { encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile(ghBinary, [...applyGhEnvironmentOverrides(args)], executionOptions, (error, stdout, stderr) => {
       if (error === null) {
         resolve({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
         return;
@@ -566,6 +636,8 @@ function runGitCommand(args: readonly string[]): Promise<string> {
 export interface FleetCliRuntime {
   /** The parsed installation the runtime was composed with, if any. */
   readonly installation?: FleetInstallation;
+  /** DT10b: the daemon stores, tick and status use cases, pause port and forge probe. */
+  readonly daemon: ComposedDaemon;
   readonly coordination: {
     readonly projectProfileRepository: ProjectProfileRepositoryAdapter;
     readonly coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
@@ -647,6 +719,7 @@ export interface FleetCliRuntime {
     readonly workOrderRepository: WorkOrderRepositoryAdapter;
     readonly attemptRepository: AttemptRepositoryAdapter;
     readonly executionJournal: ExecutionJournalAdapter;
+    readonly mergeRecordRepository: MergeRecordRepositoryAdapter;
     readonly workspace: WorkspaceAdapter;
     readonly runner: ExecutionRunnerAdapter;
     /** H9b1: resolves the runner for an attempt's recorded host. */
@@ -668,6 +741,7 @@ export interface FleetCliRuntime {
     readonly briefKnowledge: BriefKnowledgeAdapter;
     readonly executionObservation: ExecutionObservationAdapter;
     readonly forgeAction: ForgeActionAdapter;
+    readonly mergeGrant: MergeGrantAdapter;
     /** Read-only PR state (AM4b-2); bound in forge mode `github` only. */
     readonly forgeRead: ForgeReadAdapter;
     readonly registerWorkOrder: RegisterWorkOrderUseCase;
@@ -677,6 +751,7 @@ export interface FleetCliRuntime {
     /** KF-36b-2: the read-only stale work-order listing; built beside closeWorkOrder from the same stores. */
     readonly listStaleWorkOrders: ListStaleWorkOrdersUseCase;
     readonly inspectAttempt: InspectAttemptUseCase;
+    readonly explainAttempt: ExplainAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
     readonly reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
     readonly dispatchAttempt: DispatchAttemptUseCase;
@@ -694,6 +769,16 @@ export interface FleetCliRuntime {
     readonly autoMergeAttempt: AutoMergeAttemptUseCase;
     readonly probeProject: ProbeProjectUseCase;
     readonly listUnregisteredProjects: ListUnregisteredProjectsUseCase;
+    readonly mergeQueueRepository: MergeQueueRepositoryAdapter;
+    readonly enqueueMerge: EnqueueMergeUseCase;
+    readonly listMergeQueue: ListMergeQueueUseCase;
+    readonly importTrainState: ImportTrainStateUseCase;
+    /** CO32: the read-only shell train state reader behind the cutover shadow report. */
+    readonly legacyTrainState: LegacyTrainStateReadAdapter;
+    /** CO25: the read-only merge readiness check for one pull request. */
+    readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
+    /** CO26: the read-only relaunch inventory per lane host. */
+    readonly inventoryRelaunch: InventoryRelaunchUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -702,6 +787,14 @@ export interface FleetCliRuntime {
     readonly halt: ConductorHaltAdapter;
     readonly requestLaneRunStop: RequestLaneRunStopUseCase;
     readonly inspectLaneRuns: InspectLaneRunsUseCase;
+    /** PT1a (SN3): the runs parked past `policy.daemon.stallAfterMinutes`, for `conductor status --stalled`. */
+    readonly listStalledRuns: ListStalledRunsUseCase;
+    /** PT1a (SN2): raises, refreshes and clears one `stall:<runId>` attention item per stalled run. */
+    readonly stallAttention: StallAttentionAdapter;
+    /** PT1a: the failing gate file a verification receipt recorded, read to class a gate park. */
+    readonly gateFailingFile: GateFailingFileAdapter;
+    /** PT1a: `policy.daemon.stallAfterMinutes` as resolved at composition. */
+    readonly stallAfterMinutes: number;
     readonly listLaneRuns: ListLaneRunsUseCase;
     /** VZ5b: the recorded conductor passes newest first (conductor schedule --passes). */
     readonly listConductorPasses: ListConductorPassesUseCase;
@@ -752,6 +845,24 @@ export interface FleetCliRuntime {
     readonly resource: TelemetryResourceInput;
     /** The redaction canary values of the real state directory's records (OT4b-3). */
     readonly canaryValues: () => Promise<readonly string[]>;
+    /**
+     * The driver's mark port (OT5): the no-op mark when telemetry is
+     * unconfigured, else the driver exporter's `mark`. The driver calls this
+     * after every advanced run's pass; it never throws.
+     */
+    readonly mark: RunTelemetryMarkPort;
+    /**
+     * Starts the driver's background exporter (OT5); null when telemetry is
+     * unconfigured. The driver calls it after its tunnel opens, never on the
+     * dry-run path.
+     */
+    readonly startExporter: (() => void) | null;
+    /**
+     * Stops the background exporter (OT5); null when telemetry is
+     * unconfigured. The driver awaits it in its `finally` against a 2 s
+     * unref'd timer, so the exit is delayed by at most 2 s.
+     */
+    readonly stopExporter: (() => Promise<void>) | null;
   };
 }
 
@@ -833,14 +944,22 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const ownerPublicKey =
     options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
 
+  // CO24f: the authorization resolve binds owner grants to the attempt that
+  // resolves them, and validates that attempt through the execution stack's
+  // attempt store. The execution stack composes after the coordination stack,
+  // so the root fills the deferred reader in once the repositories exist;
+  // until then every read reports absence, which fails closed.
+  const attemptFactsRead = new DeferredAttemptFactsRead();
+
   const {
     coordination,
     coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
     profileRead,
     probeRecord,
     executorForHostName,
-  } = composeCoordination({ stateDir, ownerPublicKey, options });
+  } = composeCoordination({ stateDir, ownerPublicKey, options, attemptFactsRead });
 
   const { knowledge } = composeKnowledge({ stateDir, options });
 
@@ -878,6 +997,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     opencodeUsage,
     briefAuthoring,
     forgeAction,
+    mergeGrant,
   } = composeExecutionHosts({
     stateDir,
     options,
@@ -902,6 +1022,25 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     readGitHead,
     headRouteForExecutor,
     runGitCommand,
+    issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
+  });
+
+  // CO24f: the attempt facts live behind the execution stack's repositories,
+  // composed above; the deferred reader now resolves them through both.
+  attemptFactsRead.setDelegate({
+    findAttemptFactsById: async (attemptId) => {
+      const attempt = await attemptRepository.findAttemptById(attemptId);
+      if (attempt === null) {
+        return null;
+      }
+      const workOrder = await workOrderRepository.findWorkOrderById(attempt.workOrderId);
+      return {
+        attemptId,
+        projectId: workOrder?.projectId ?? null,
+        collectedHeadSha: attempt.artifacts?.headCommit ?? null,
+      };
+    },
   });
 
   const { execution } = composeExecution({
@@ -921,6 +1060,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     attemptLookup,
     forgeRead,
     issuePolicyForgeGrantUseCase,
+    mergeGrant,
     profileRead,
     probeRecord,
     executorForHostName,
@@ -946,11 +1086,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     profileRead,
     coordination,
+    attemptArtifact,
+    coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
     autoMergeLoad,
     installation: options?.installation,
     workOrderRepository,
     attemptRepository,
+    forgeRead,
     executionJournal,
     workspace,
     runnerForAttempt,
@@ -976,6 +1119,18 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runJournal: conductor.laneRunJournal,
   });
 
+  // CO26: the read-only relaunch inventory reads the same lane-run stores the
+  // conductor composes, beside closeWorkOrder / listStaleWorkOrders.
+  const inventoryRelaunch = new InventoryRelaunchUseCase({
+    runRepo: conductor.laneRunRepository,
+    attemptRepo: attemptRepository,
+    workspace,
+    halt: conductor.halt,
+    driverLease: conductor.driverLease,
+    runnerForAttempt,
+    computeDigest: sha256HexDigest,
+  });
+
   const { telemetry } = composeTelemetry({
     stateDir,
     policy: resolveTelemetryPolicy(options?.installation?.policy),
@@ -991,12 +1146,56 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const tunnelTarget = resolveRunnerTunnelTarget(runnerHost, { runnerRemoteHost, runnerRemotePort });
   const runnerTunnel = new RunnerTunnelAdapter(tunnelTarget);
 
+  // CO25: the merge-readiness forge read (DT5) behind the same reviewed gh
+  // subprocess as the other forge reads. Without forge mode github the
+  // adapter stays unconfigured, so a readiness check answers unknown instead
+  // of reaching for a forge the installation forbids.
+  const mergeForgeRead =
+    forgeMode === 'github'
+      ? new GhForgeMergeReadAdapter({
+          runGh: (args, timeoutMs) =>
+            (
+              options?.forgeGhRunner ??
+              ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
+                runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
+            )(args, timeoutMs),
+        })
+      : new GhForgeMergeReadAdapter();
+  const inspectMergeReadiness = new InspectMergeReadinessUseCase({
+    mergeRead: mergeForgeRead,
+    nowIso: () => new Date().toISOString(),
+  });
+
+  // DT10b: the daemon stack (merge pass, tick, status, pause, forge probe).
+  const daemon = composeDaemon({
+    stateDir,
+    options,
+    installationModel,
+    forgeMode,
+    mergeForgeRead,
+    mergeQueueRepository: execution.mergeQueueRepository,
+    chainBranchRead: execution.forgeAction,
+    evidence,
+    conductor,
+    runGh: (args, timeoutMs) =>
+      (
+        options?.forgeGhRunner ??
+        ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
+          runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
+      )(args, timeoutMs),
+    chainAttention: {
+      recordAttentionItem: (body, actor) => coordination.recordAttentionItem.recordAttentionItem(body, actor),
+      clearAttentionItem: (request, via, actor) => coordination.clearAttentionItem.clearAttentionItem(request, via, actor),
+    },
+  });
+
   return {
     installation: options?.installation,
+    daemon,
     coordination,
     knowledge,
     evidence,
-    execution: { ...execution, closeWorkOrder, listStaleWorkOrders },
+    execution: { ...execution, closeWorkOrder, listStaleWorkOrders, inspectMergeReadiness, inventoryRelaunch },
     conductor,
     runnerTunnel,
     telemetry,

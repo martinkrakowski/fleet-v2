@@ -10,7 +10,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
@@ -81,6 +81,37 @@ export interface ConductedFixtureOptions {
    * `maxConcurrentLanes` to 2. Default: false — today's single-run shape.
    */
   readonly secondRun?: boolean;
+  /**
+   * R4a: when true, the gh stub makes the FIRST `gh pr create` invocation
+   * return without a parseable pull-request number (exit 0, "Created pull
+   * request!"), so the conductor journals `forge-ambiguous` and the run parks
+   * `ambiguous open-pr` — the real-world case where gh opened the PR but its
+   * response did not report a number. Later PR-creates answer normally.
+   */
+  readonly failPrCreateOnce?: boolean;
+  /**
+   * R4a: when true, the fake `pr view` read answers not-found until the first
+   * PR-create invocation has been seen, then answers unavailable for the
+   * next two reads (the degraded read right after the unreported create, so
+   * the reconcile fails closed and the run parks), then answers the recorded
+   * open PR — the PR appears only once the create ran. Used with
+   * `failPrCreateOnce` to drive a run into the parked `ambiguous open-pr`
+   * recovery scenario.
+   */
+  readonly prViewOpenAfterCreate?: boolean;
+  /**
+   * R4a: when true, the fake `pr checks` read answers a pending bucket, so a
+   * run that reached watching-ci rests there at a pass boundary (the
+   * scenario's CI is still running) instead of running on to the merge
+   * within one pass.
+   */
+  readonly ciChecksPending?: boolean;
+  /**
+   * KS7b: when true the installation turns `policy.autoMerge` on, so a run that
+   * reaches `merging` hands its PR to the merge queue instead of parking for the
+   * owner's merge.
+   */
+  readonly autoMerge?: boolean;
 }
 
 export interface CliRunResult {
@@ -162,6 +193,18 @@ export interface ConductedFixture extends E2eFixture {
    * `stop()` restores the mode.
    */
   readonly makeFixPlacementFail: () => Promise<void>;
+  /**
+   * KS7b: the fake forge now reads the run's PR as merged (the merge queue's pass
+   * merged it). Later `pr view` reads answer MERGED at the worktree head.
+   */
+  readonly markPullRequestMerged: () => Promise<void>;
+  /**
+   * KS7b: rewrite the merge queue's one entry for this run as the daemon's merge
+   * pass would leave it: `merged`, or `dropped` / `parked` with a reason.
+   */
+  readonly settleQueueEntry: (
+    settled: { readonly state: 'merged' } | { readonly state: 'dropped' | 'parked'; readonly reason: string },
+  ) => Promise<void>;
   /** A runtime rebuilt over the current installation FILE (scenario 3). */
   readonly rebuildRuntime: () => Promise<FleetCliRuntime>;
   /** Kill the fake lanes, tear the tunnel and sshd down, restore PATH. */
@@ -228,6 +271,7 @@ function buildConductedInstallation(
   seatAgent: string,
   laneAuthFile: string,
   maxLanes: number,
+  autoMerge = false,
 ): FleetInstallationV2 {
   return {
     schemaVersion: 2,
@@ -282,7 +326,10 @@ function buildConductedInstallation(
       implementer: [{ seatId: 'implementer' }],
       reviewer: [{ seatId: 'reviewer' }],
     },
-    policy: { conductor: { enabled: true } },
+    policy: {
+      conductor: { enabled: true },
+      ...(autoMerge ? { autoMerge: { enabled: true, allowHighRisk: false, onBlocked: 'hold' as const } } : {}),
+    },
     forge: { mode: 'github', owner: 'example-owner', repo: 'example-repo' },
     shelf: { provider: 'local' },
     verification: { procedures: { gate: { command: 'true', args: [] } } },
@@ -295,7 +342,20 @@ function buildConductedInstallation(
 }
 
 /** The stub `gh` binary on PATH: records one flattened argv line per call, then prints the example PR URL. */
-function ghStubScript(argvLog: string, statusDir: string): string {
+function ghStubScript(
+  argvLog: string,
+  statusDir: string,
+  options: {
+    /** R4a: the first PR-create answers without a number (ambiguous), later ones normally. */
+    readonly failPrCreateOnce?: boolean;
+    /** R4a: touched by every PR-create, so the fake `pr view` can flip to the open PR. */
+    readonly prCreateMarkerFile?: string;
+    /** R4a: the "already failed" marker for the once-only ambiguous create. */
+    readonly prCreateCountFile?: string;
+  } = {},
+): string {
+  const failOnce = options.failPrCreateOnce === true && options.prCreateCountFile !== undefined;
+  const marker = options.prCreateMarkerFile === undefined ? null : options.prCreateMarkerFile;
   return [
     '#!/bin/sh',
     // One line per call: a `--body` carries newlines, so the ARGUMENTS are
@@ -323,6 +383,25 @@ function ghStubScript(argvLog: string, statusDir: string): string {
     `      printf '%s\\n' "$state" >> ${sq(statusDir)}/status."$sha"`,
     '    fi',
     '    exit 0',
+    '    ;;',
+    'esac',
+    // R4a: a PR-create that reports no pull-request number (the gh stub's
+    // "Created pull request!" with no URL) makes the conductor journal
+    // `forge-ambiguous`; the marker file tells the fake `pr view` read that
+    // the PR now exists (touched before the ambiguous branch, so the once-only
+    // failure still records that a create ran).
+    'case " $* " in',
+    '  *" pr create "*)',
+    ...(marker === null ? [] : [`    : > ${sq(marker)}`]),
+    ...(failOnce
+      ? [
+          `    if [ ! -f ${sq(options.prCreateCountFile!)} ]; then`,
+          `      printf '%s\\n' '1' > ${sq(options.prCreateCountFile!)}`,
+          '      printf \'%s\\n\' \'Created pull request!\'',
+          '      exit 0',
+          '    fi',
+        ]
+      : []),
     '    ;;',
     'esac',
     `if [ -n "$sha" ] && [ -f ${sq(statusDir)}/status."$sha" ]; then`,
@@ -437,29 +516,77 @@ function fakeOpencodeWrapperScript(
  * (PC-4's stub plus the `pr view` snapshot and the compare read): an open PR
  * number 7 at the worktree head whose merge state is clean, CI buckets that
  * pass, and zero unresolved review threads.
+ * R4a: when `prViewOpenAfterCreate` is set (with `prCreateMarkerFile`), the
+ * `pr view` read answers not-found until the first PR-create invocation has
+ * touched the marker file. The two reads right after that create — the
+ * facts read and the reconcile's own read of the same pass — answer
+ * unavailable: gh is degraded just after it opened the PR without reporting
+ * its number, so `reconcilePrPush` journals `ambiguous`/`forge-ambiguous`
+ * and G3b parks `ambiguous open-pr` instead of adopting the PR at once.
+ * From the third read on (the parked facts reads and the resume's re-read)
+ * the recorded open PR answers, so the resume adopts it.
  */
-function makeForgeGhRunner(head: () => string, branchName: string) {
+function makeForgeGhRunner(
+  head: () => string,
+  branchName: string,
+  options: {
+    readonly prViewOpenAfterCreate?: boolean;
+    readonly prCreateMarkerFile?: string;
+    /** R4a: when true, `pr checks` answers a pending bucket, so a run in watching-ci rests there. */
+    readonly ciChecksPending?: boolean;
+    /** KS7b: once this file exists, `pr view` answers the PR as merged. */
+    readonly prMergedMarkerFile?: string;
+  } = {},
+) {
   const calls: string[][] = [];
+  const flipToOpen = options.prViewOpenAfterCreate === true && options.prCreateMarkerFile !== undefined;
+  let postCreateReads = 0;
   const forgeGhRunner = async (args: readonly string[]) => {
     calls.push([...args]);
     if (args[0] === 'pr' && args[1] === 'view') {
+      if (flipToOpen && !existsSync(options.prCreateMarkerFile!)) {
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: `no pull requests found for branch "${branchName}"`,
+        };
+      }
+      if (flipToOpen) {
+        postCreateReads += 1;
+        if (postCreateReads <= 2) {
+          return {
+            exitCode: 1,
+            stdout: '',
+            stderr: `gh pr view failed for branch "${branchName}" (transient after the unreported create)`,
+          };
+        }
+      }
+      const merged = options.prMergedMarkerFile !== undefined && existsSync(options.prMergedMarkerFile);
       return {
         exitCode: 0,
         stdout: JSON.stringify({
           number: 7,
-          state: 'OPEN',
+          state: merged ? 'MERGED' : 'OPEN',
           headRefOid: head(),
           headRefName: branchName,
           baseRefName: 'main',
-          mergedAt: null,
+          mergedAt: merged ? '2026-11-06T10:00:00Z' : null,
           closedAt: null,
-          mergeCommit: null,
+          mergeCommit: merged ? { oid: head() } : null,
           mergeStateStatus: 'CLEAN',
+          isCrossRepository: false,
+          headRepositoryOwner: { id: 'MDQ6VXNlcjE=', login: 'example-owner', name: 'Example Owner' },
         }),
         stderr: '',
       };
     }
     if (args[0] === 'pr' && args[1] === 'checks') {
+      // R4a: `ciChecksPending` keeps the checks running (`bucket: pending`),
+      // so a run that reached watching-ci rests there at a pass boundary
+      // instead of running on to the merge within one pass.
+      if (options.ciChecksPending === true) {
+        return { exitCode: 0, stdout: '[{"bucket":"pending"}]', stderr: '' };
+      }
       return { exitCode: 0, stdout: '[{"bucket":"pass"}]', stderr: '' };
     }
     if (args[0] === 'api' && args[1] === 'graphql') {
@@ -497,6 +624,12 @@ function makeReviewSpawn(verdicts: readonly ('PASS' | 'FAIL')[]) {
   let index = 0;
   const reviewSpawn = async (file: string, args: readonly string[]) => {
     calls.push({ file, args });
+    // RV4: the transport probes the seat with `ocm-run --wait --dir` before it
+    // dispatches a review. Real ocm-run exits 0 when nothing runs there; the
+    // probe is not a review, so it consumes no verdict.
+    if (args[0] === '--wait') {
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
     const verdict = verdicts[index] ?? 'PASS';
     index += 1;
     const text = verdict === 'FAIL' ? REVIEW_FAIL_TEXT : REVIEW_PASS_TEXT;
@@ -552,6 +685,12 @@ export async function startConductedFixture(
   // KS7a-2: the `gh` stub records posted commit-status states here, one file
   // per head sha, and answers status reads of that sha from them.
   const ghStatusDir = path.join(dir, 'gh-status');
+  // R4a: the gh stub touches this marker after the first PR-create (so the
+  // fake `pr view` flips to the open PR) and uses the count file to make the
+  // ambiguous create happen exactly once.
+  const ghPrCreateMarker = path.join(dir, 'pr-created.marker');
+  const prMergedMarker = path.join(dir, 'pr-merged.marker');
+  const ghPrCreateCount = path.join(dir, 'pr-create.count');
   const laneScriptPath = path.join(dir, 'lane-commit.sh');
 
   // PATH layering: prepend ONLY this fixture's two dirs; the real PATH stays
@@ -633,7 +772,11 @@ export async function startConductedFixture(
       await fs.writeFile(target, body, 'utf8');
       await fs.chmod(target, 0o700);
     };
-    await writeTool('gh', ghStubScript(ghArgvLog, ghStatusDir));
+    await writeTool('gh', ghStubScript(ghArgvLog, ghStatusDir, {
+      ...(options?.failPrCreateOnce === true
+        ? { failPrCreateOnce: true, prCreateMarkerFile: ghPrCreateMarker, prCreateCountFile: ghPrCreateCount }
+        : {}),
+    }));
     await writeTool('ocm-run', ocmRunWrapperScript(realOcmRunBin, ocmRunArgvLog, ocmRunEnvLog, ocmRunStderrLog));
     if (options?.committingLane === true) {
       // E2E-FIX: the brief-capture directory is created before any lane runs,
@@ -701,6 +844,7 @@ export async function startConductedFixture(
       seatAgent,
       laneAuthFile,
       options?.secondRun === true ? 2 : 1,
+      options?.autoMerge === true,
     );
     const written = writeInstallationV2(installation);
     const parsed = parseInstallation(JSON.parse(written));
@@ -720,7 +864,13 @@ export async function startConductedFixture(
     const attemptId2 = 'attempt-' + idChars(97202611, 26);
 
     // --- runtime ----------------------------------------------------------
-    const gh = makeForgeGhRunner(() => readWorktreeHead(worktreeRoot, baseCommit), `fleet/${runId}`);
+    const gh = makeForgeGhRunner(() => readWorktreeHead(worktreeRoot, baseCommit), `fleet/${runId}`, {
+      ...(options?.prViewOpenAfterCreate === true
+        ? { prViewOpenAfterCreate: true, prCreateMarkerFile: ghPrCreateMarker }
+        : {}),
+      ...(options?.ciChecksPending === true ? { ciChecksPending: true } : {}),
+      prMergedMarkerFile: prMergedMarker,
+    });
     const review = makeReviewSpawn(options?.reviewVerdicts ?? []);
     const buildRuntime = (installationForRuntime: FleetInstallationV2): FleetCliRuntime => {
       return createFleetCliRuntime({
@@ -1047,6 +1197,30 @@ export async function startConductedFixture(
       failedBriefPath = briefPath;
     };
 
+    const markPullRequestMerged = async (): Promise<void> => {
+      await fs.writeFile(prMergedMarker, 'merged\n', 'utf8');
+    };
+
+    const settleQueueEntry: ConductedFixture['settleQueueEntry'] = async (settled) => {
+      const queueFile = path.join(e2e.stateDir, 'merge-queue.json');
+      const records = JSON.parse(await fs.readFile(queueFile, 'utf8')) as Record<string, unknown>[];
+      const mine = records.filter((record) => record['runId'] === runId);
+      if (mine.length !== 1) {
+        throw new Error(`settleQueueEntry expects exactly one queue entry for the run, found ${mine.length}`);
+      }
+      const entry = mine[0]!;
+      entry['revision'] = (entry['revision'] as number) + 1;
+      entry['state'] = settled.state;
+      if (settled.state === 'merged') {
+        entry['reason'] = null;
+        entry['mergeCommitOid'] = String(entry['headOid']);
+        entry['mergedAtIso'] = '2026-11-06T10:00:00.000Z';
+      } else {
+        entry['reason'] = settled.reason;
+      }
+      await fs.writeFile(queueFile, JSON.stringify(records), 'utf8');
+    };
+
     return {
       ...e2e,
       get runtime() {
@@ -1082,6 +1256,8 @@ export async function startConductedFixture(
       runPass,
       recordAcceptanceReceipts,
       makeFixPlacementFail,
+      markPullRequestMerged,
+      settleQueueEntry,
       rebuildRuntime,
       stop,
     };

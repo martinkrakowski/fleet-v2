@@ -110,6 +110,8 @@ const STEP_SPAN_KINDS: Readonly<Record<LaneRunKeyStep, TelemetrySpanKind>> = Obj
   push: 'TOOL',
   merge: 'TOOL',
   premerge: 'TOOL',
+  'merge-enqueue': 'TOOL',
+  ci: 'GUARDRAIL', // GB4: a CI check is a guardrail, like the gate
 });
 
 /** The steps whose span hangs under the round span; the rest hang under the root (plan §3.1). */
@@ -387,35 +389,51 @@ function isTerminal(lastConduct: LaneRunJournalEntryRecord | null): boolean {
   return lastState !== null && (LANE_RUN_TERMINAL_STATES as readonly string[]).includes(lastState);
 }
 
-/** The dispatch-key group whose intent minted the attempt, with its round and seat. */
+/** The dispatch-key group whose intent minted the attempt, with its round, seat and attempt ordinal. */
 function findDispatchGroup(
   groups: readonly KeyGroup[],
   attemptId: string,
-): { group: KeyGroup; round: number; seatIndex: number } | null {
+): { group: KeyGroup; round: number; seatIndex: number; attemptOrdinal: number | null } | null {
   for (const group of groups) {
     const parsed = parseLaneRunKey(group.key);
     if (parsed?.kind !== 'step' || parsed?.step !== 'dispatch') {
       continue;
     }
     if (group.intent?.mintedId === attemptId) {
-      return { group, round: parsed.round, seatIndex: parsed.seatIndex };
+      return { group, round: parsed.round, seatIndex: parsed.seatIndex, attemptOrdinal: parsed.attemptOrdinal };
     }
   }
   return null;
 }
 
-/** The collect-key group of the same (round, seat). */
-function findCollectGroup(groups: readonly KeyGroup[], round: number, seatIndex: number): KeyGroup | null {
+/**
+ * The collect-key group of the same (round, seat, attempt ordinal) (CX8). A legacy ordinal-less collect key
+ * of the same (round, seat) is used only when no collect key carries this attempt's ordinal, and only when
+ * its intent was recorded at or after this attempt's dispatch result: an earlier legacy collect belongs to
+ * an earlier attempt of the same seat.
+ */
+function findCollectGroup(
+  groups: readonly KeyGroup[],
+  round: number,
+  seatIndex: number,
+  attemptOrdinal: number | null,
+  dispatchEndIso: string,
+): KeyGroup | null {
+  let legacy: KeyGroup | null = null;
   for (const group of groups) {
     const parsed = parseLaneRunKey(group.key);
-    if (parsed?.kind !== 'step' || parsed?.step !== 'collect') {
+    if (parsed?.kind !== 'step' || parsed?.step !== 'collect' || parsed.round !== round || parsed.seatIndex !== seatIndex) {
       continue;
     }
-    if (parsed.round === round && parsed.seatIndex === seatIndex) {
+    if (parsed.attemptOrdinal === attemptOrdinal) {
       return group;
     }
+    const legacyStartIso = group.intent?.recordedAtIso ?? null;
+    if (parsed.attemptOrdinal === null && legacy === null && legacyStartIso !== null && legacyStartIso >= dispatchEndIso) {
+      legacy = group;
+    }
   }
-  return null;
+  return legacy;
 }
 
 /** Fold a built step span's window into the round's aggregate. */
@@ -464,7 +482,7 @@ function buildStepSpan(
   // A premerge step key never builds a step span: it parses as kind
   // 'premerge' (never kind 'step'), so this guard is unreachable at runtime
   // and only keeps the span name within the fixed span-name union.
-  if (parsed.step === 'premerge') {
+  if (parsed.step === 'premerge' || parsed.step === 'merge-enqueue') {
     return;
   }
   const final = finalResultOf(group.results);
@@ -700,7 +718,13 @@ function buildAttemptSpans(
     if (dispatchFinal === null) {
       continue;
     }
-    const collect = findCollectGroup(groups, dispatch.round, dispatch.seatIndex);
+    const collect = findCollectGroup(
+      groups,
+      dispatch.round,
+      dispatch.seatIndex,
+      dispatch.attemptOrdinal,
+      dispatchFinal.recordedAtIso,
+    );
     if (collect === null) {
       continue;
     }

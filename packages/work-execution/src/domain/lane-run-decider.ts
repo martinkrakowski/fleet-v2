@@ -11,6 +11,7 @@
 
 import {
   buildLaneRunStepKey,
+  laneRunMergeEnqueueKey,
   laneRunPremergeKey,
   LANE_RUN_MAX_RETRY,
 } from './lane-run-keys.js';
@@ -33,10 +34,198 @@ import {
   LANE_RUN_STEP_OF_STATE,
 } from './lane-run-transitions.js';
 import type { LaneRunFailureCause, RunStopMode } from './lane-run-transitions.js';
+import type { LaneRunMergeEnqueueFact } from './lane-run-step-facts.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import { SEAT_TRIGGER_CLASSES } from './value-objects/StopReason.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
+
+/**
+ * The fixed unknown-reason codes a review journal detail may carry (RV2/RV3):
+ * only declared lowercase tokens pass `sanitizeJournalDetail`; reviewer prose,
+ * paths and secrets never reach the journal.
+ */
+const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([
+  'empty', 'unparseable-verdict', 'no-findings-on-fail',
+]);
+
+const REVIEW_DETAIL_CODE_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+/**
+ * The fixed cause code of an unknown review answer (RV3): the value only when
+ * it is a declared lowercase reason-code token with no secret shape; `null`
+ * when the value is explicitly null; `'unparseable-verdict'` when it is absent
+ * or not a declared token. Never throws, never copies free text.
+ */
+export function sanitizeJournalDetail(unknownReason: unknown): string | null {
+  if (unknownReason === null) {
+    return null;
+  }
+  if (typeof unknownReason !== 'string') {
+    return 'unparseable-verdict';
+  }
+  return REVIEW_DETAIL_CODES.has(unknownReason) && REVIEW_DETAIL_CODE_PATTERN.test(unknownReason)
+    ? unknownReason
+    : 'unparseable-verdict';
+}
+
+/** One `minor`/`nit` finding a passed review carries forward (RV3). */
+export interface ConductorReviewCarriedMinor {
+  readonly findingId: string;
+  readonly severity: 'minor' | 'nit';
+  readonly filePath: string | null;
+  readonly line: number | null;
+}
+
+/**
+ * The severity-derived outcome of one review receipt (RV3). `passed` carries
+ * the receipt's non-blocking findings; `failed` and `unknown` never carry any.
+ */
+export type ConductorReviewOutcomeDecision =
+  | { readonly outcome: 'passed'; readonly reasonCode: 'review-passed'; readonly detail: 'minor-only-findings' | null; readonly carriedMinors: readonly ConductorReviewCarriedMinor[] }
+  | { readonly outcome: 'failed'; readonly reasonCode: 'review-failed'; readonly detail: null; readonly carriedMinors: readonly [] }
+  | { readonly outcome: 'unknown'; readonly reasonCode: 'review-unknown'; readonly detail: string | null; readonly carriedMinors: readonly [] };
+
+/** A value is a plain object (prototype `Object.prototype` or `null`). */
+function isPlainRecordObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/** The receiver's own data property `key`, read without running any accessor. */
+function ownProp(source: unknown, key: string): unknown {
+  try {
+    if (typeof source !== 'object' || source === null) {
+      return undefined;
+    }
+    return Object.getOwnPropertyDescriptor(source, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+const SEVERITY_VALUES: readonly string[] = ['blocker', 'major', 'minor', 'nit'];
+const CARRIED_MINORS_MAX = 50;
+
+const UNKNOWN_PASSED: ConductorReviewOutcomeDecision = Object.freeze({
+  outcome: 'unknown',
+  reasonCode: 'review-unknown',
+  detail: 'unparseable-verdict',
+  carriedMinors: Object.freeze([]),
+}) as ConductorReviewOutcomeDecision;
+const FAILED_DECISION: ConductorReviewOutcomeDecision = Object.freeze({
+  outcome: 'failed',
+  reasonCode: 'review-failed',
+  detail: null,
+  carriedMinors: Object.freeze([]),
+}) as ConductorReviewOutcomeDecision;
+
+/**
+ * The pure conductor review-outcome decider (RV3). Total over any runtime
+ * input: it never throws and fails closed to `unknown` (`unparseable-verdict`)
+ * on malformed receipts — a non-plain object, a non-dense `findings` array, a
+ * non-plain finding, an unknown `verdict` or severity, or an unverified
+ * receipt.
+ *
+ * 1. Malformed input or unknown enums → `unknown` / `unparseable-verdict`.
+ * 2. `readOnlyVerified === false` or `verdict === 'unknown'` → `unknown` with
+ *    `sanitizeJournalDetail(unknownReason)` — unknown stays unknown even when
+ *    the findings are minor-only (req (e)).
+ * 3. Any `blocker`/`major` finding → `failed` (req (a)), whatever the verdict
+ *    word.
+ * 4. `verdict === 'failed'` with zero findings → `unknown`
+ *    (`sanitizeJournalDetail(unknownReason) ?? 'unparseable-verdict'`, req (c)).
+ * 5. Otherwise → `passed`, carrying every `minor`/`nit` finding, with the
+ *    detail `minor-only-findings` when any is carried (req (b)).
+ */
+export function decideConductorReviewOutcome(input: unknown): ConductorReviewOutcomeDecision {
+  try {
+    if (!isPlainRecordObject(input)) {
+      return UNKNOWN_PASSED;
+    }
+    const verdict = ownProp(input, 'verdict');
+    if (verdict !== 'passed' && verdict !== 'failed' && verdict !== 'unknown') {
+      return UNKNOWN_PASSED;
+    }
+    const findings = ownProp(input, 'findings');
+    if (!Array.isArray(findings)) {
+      return UNKNOWN_PASSED;
+    }
+    for (let index = 0; index < findings.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(findings, index)) {
+        return UNKNOWN_PASSED;
+      }
+      const finding = findings[index];
+      if (!isPlainRecordObject(finding)) {
+        return UNKNOWN_PASSED;
+      }
+      const severity = ownProp(finding, 'severity');
+      if (typeof severity !== 'string' || !SEVERITY_VALUES.includes(severity)) {
+        return UNKNOWN_PASSED;
+      }
+    }
+    const verified = ownProp(input, 'readOnlyVerified');
+    if (verified === false) {
+      const reason = ownProp(input, 'unknownReason');
+      return {
+        outcome: 'unknown',
+        reasonCode: 'review-unknown',
+        detail: reason === undefined ? null : sanitizeJournalDetail(reason),
+        carriedMinors: Object.freeze([]),
+      };
+    }
+    if (verdict === 'unknown') {
+      const reason = ownProp(input, 'unknownReason');
+      return {
+        outcome: 'unknown',
+        reasonCode: 'review-unknown',
+        detail: reason === undefined ? null : sanitizeJournalDetail(reason),
+        carriedMinors: Object.freeze([]),
+      };
+    }
+    const blocking = findings.some((finding) => {
+      const severity = ownProp(finding, 'severity');
+      return severity === 'blocker' || severity === 'major';
+    });
+    if (blocking) {
+      return FAILED_DECISION;
+    }
+    if (verdict === 'failed' && findings.length === 0) {
+      const detail = sanitizeJournalDetail(ownProp(input, 'unknownReason')) ?? 'unparseable-verdict';
+      return { outcome: 'unknown', reasonCode: 'review-unknown', detail, carriedMinors: Object.freeze([]) };
+    }
+    const carriedMinors: ConductorReviewCarriedMinor[] = [];
+    for (const finding of findings) {
+      const severity = ownProp(finding, 'severity');
+      if (severity !== 'minor' && severity !== 'nit') {
+        continue;
+      }
+      if (carriedMinors.length >= CARRIED_MINORS_MAX) {
+        break;
+      }
+      const findingId = ownProp(finding, 'findingId');
+      const filePath = ownProp(finding, 'filePath');
+      const line = ownProp(finding, 'line');
+      carriedMinors.push({
+        findingId: typeof findingId === 'string' ? findingId : '',
+        severity,
+        filePath: typeof filePath === 'string' ? filePath : null,
+        line: typeof line === 'number' && Number.isSafeInteger(line) && line >= 0 ? line : null,
+      });
+    }
+    return {
+      outcome: 'passed',
+      reasonCode: 'review-passed',
+      detail: carriedMinors.length > 0 ? 'minor-only-findings' : null,
+      carriedMinors: Object.freeze(carriedMinors),
+    };
+  } catch {
+    return UNKNOWN_PASSED;
+  }
+}
 
 /** Minimum wait after a congested gate result before the gate is re-run (KF-30c2). */
 export const GATE_CONGESTION_BACKOFF_MS = 60_000;
@@ -136,24 +325,34 @@ export interface LaneRunFacts {
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   /** KS7a-2: the latest final `premerge` journal result at `head12` (the merging hold's post). */
   readonly premergePost: 'none' | 'success' | 'failure' | 'refused';
+  /** KS7b: what the merge queue made of the run's enqueued head at (round, `head12`), from the journal. */
+  readonly mergeEnqueue: LaneRunMergeEnqueueFact;
   /** `AssessHeadAcceptance` at `head12` (K6). */
   readonly acceptance: 'none' | 'accepted' | 'rejected' | 'unknown';
   /**
-   * The accept retry ordinal at `head12` (KF-23): non-null only when the latest
-   * accept result at the head is `acceptance-rejected` and the run has since
-   * been resumed back to `accepting` (a `parked` conduct after that result);
-   * its value is the number of accept intents already journalled at this head
-   * (1 → retry 1, …). Accept is not one-way, so the retry is keyed.
+   * The accept retry ordinal at `head12` (KF-23). The decider no longer retries
+   * accept: a rejected assessment is terminal at its head, so the retry ordinal
+   * never drives an accept act. It is kept because `LANE_RUN_MAX_RETRY` and the
+   * journal shape still record it.
    */
   readonly acceptanceRetry: number | null;
+  /**
+   * Why the head's acceptance was rejected; set only when `acceptance === 'rejected'`
+   * (AR1). `review-findings` means every blocker is kind `other` with a failed
+   * brief-check or code-review receipt carrying findings at the head; absent reads
+   * as `other`.
+   */
+  readonly acceptanceRejection?: 'review-findings' | 'other';
   /** `CiStatePort` at `head12` (PC/K6). */
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
+  /** GB4: a final `ci` result with reason `ci-failed` is already recorded at this head in this round; absent reads as false. */
+  readonly ciFailureRecorded?: boolean;
   /** The run's PR as the forge reports it (K6, AM4b); `containsLaneHead` is true when the PR head is, or contains as an ancestor, the collected lane head (CT-2a). */
   readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
   /** The step whose latest result in this round at this head was a refusal (K1b). */
   readonly refusedStep: LaneRunKeyStep | null;
-  /** Unreadable door or behind-ness reads true; `trainFree` and `policyGrant` per §3.6/AM4a (K6). */
-  readonly merge: { readonly oneWayDoor: boolean; readonly branchBehind: boolean; readonly trainFree: boolean; readonly policyGrant: boolean };
+  /** An unreadable door reads true; `policyGrant` per AM4a (K6). KS7b: the branch and the train belong to the merge queue. */
+  readonly merge: { readonly oneWayDoor: boolean; readonly policyGrant: boolean };
 }
 
 const PHASE_OF_ATTEMPT_STATE: Record<AttemptStateValue, LaneRunAttemptPhase> = {
@@ -211,6 +410,94 @@ const WAIT_FACTS_INCONSISTENT: LaneRunDecision = { kind: 'wait', reason: 'facts-
  */
 function mergedPrCarriesLaneHead(pr: NonNullable<LaneRunFacts['pr']>, laneHead12: string | null): boolean {
   return pr.head12 === laneHead12 || pr.containsLaneHead;
+}
+
+/**
+ * G3b0 (R4a): a settled open-pr park leaves to `watching-ci` by itself.
+ * A run parked `ambiguous open-pr` whose resume adopted exactly one open PR
+ * (the resume saved `record.prNumber` and settled the spent key, so no
+ * intent is pending) is only waiting on CI for an already-open PR: G3b
+ * below would wait on it forever, and the `opening-pr` parkedFrom exit
+ * would decide `open-pr` again on the spent key. The PR fact the parked
+ * read gathered must still name an open PR at the lane head; anything
+ * else — no PR fact, another head, a closed or merged PR — keeps the park.
+ * A recorded stop keeps it too, so the stop rules below decide.
+ * Total; never throws.
+ */
+function laneRunSettledOpenPrDecision(record: LaneRunRecord, facts: LaneRunFacts): LaneRunDecision | null {
+  if (facts.state !== 'parked' || record.parked === null || facts.pendingIntent !== null || facts.stopMode !== null) {
+    return null;
+  }
+  if (record.parked.reason !== 'ambiguous' || record.parked.qualifier !== 'open-pr' || record.prNumber === null) {
+    return null;
+  }
+  const pr = facts.pr;
+  if (pr === null || pr.state !== 'open' || pr.head12 !== facts.head12) {
+    return null;
+  }
+  return { kind: 'enter', to: 'watching-ci' };
+}
+
+/**
+ * G3f (R4c): a merged PR that carries the lane head ends the run from an
+ * eligible waiting state — a park (for every reason, without an open owner
+ * question or a live attempt), `awaiting-premerge`, `watching-ci` or
+ * `merging` — by itself. An unread intent shadows the rule unless its step is
+ * `premerge` or `merge-enqueue` (a pending queue hand-off must not hide the merge the queue made); any other unread intent reconciles first. An
+ * ambiguous intent cannot shadow it. Under a halt nothing changes (the halt
+ * rules decide, as today), and a merged PR that does not carry the lane head
+ * is left to the existing rules. Total; never throws.
+ */
+function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): LaneRunDecision | null {
+  if (facts.halted) {
+    return null;
+  }
+  // 1. An unread intent shadows the rule unless its step is premerge.
+  // An unread merge intent reconciles first, as before.
+  if (
+    facts.pendingIntent !== null &&
+    facts.pendingIntent.reconciliation === 'unread' &&
+    facts.pendingIntent.step !== 'premerge' &&
+    facts.pendingIntent.step !== 'merge-enqueue'
+  ) {
+    return null;
+  }
+  if (facts.pr === null || facts.pr.state !== 'merged') {
+    return null;
+  }
+  if (!mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
+    return null;
+  }
+  // 2. A park with an open owner question (non-null questionId) returns null, so
+  // no owner question is left behind. The owner-merge park is the exception:
+  // its question asks for this merge, so the merge answers it (CT-2a). A merged
+  // PR that carries the lane head answers any other park reason.
+  if (
+    record.parked !== null &&
+    record.parked.reason !== 'owner-merge' &&
+    record.parked.questionId !== null
+  ) {
+    return null;
+  }
+  // 3. A parked run whose latest attempt is still live returns null.
+  if (facts.state === 'parked' && facts.attempt !== null) {
+    const live =
+      facts.attempt.phase === 'dispatching' ||
+      facts.attempt.phase === 'running' ||
+      facts.attempt.phase === 'blocked';
+    if (live) {
+      return null;
+    }
+  }
+  if (
+    facts.state === 'parked' ||
+    facts.state === 'awaiting-premerge' ||
+    facts.state === 'watching-ci' ||
+    facts.state === 'merging'
+  ) {
+    return { kind: 'enter', to: 'merged' };
+  }
+  return null;
 }
 
 /**
@@ -518,7 +805,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       ) {
         return dispatchOrPrepare(record.round, attempt, facts.implementerSeat);
       }
-      if (!facts.implementerSeat.ok || facts.roundSeatIndexes.includes(facts.implementerSeat.seatIndex)) {
+      if (!facts.implementerSeat.ok) {
         return park('seat-plan-exhausted', null);
       }
       return prepareAct(record.round, facts.implementerSeat.seatIndex);
@@ -536,7 +823,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
           seatIndex: attempt.seatIndex,
           head12: null,
           retry: null,
-          attemptOrdinal: null,
+          attemptOrdinal: record.attemptIds.indexOf(attempt.attemptId) + 1,
         });
       }
       if (attempt.collection.commits === 0) {
@@ -669,19 +956,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return park('ambiguous', 'accept');
       }
       if (facts.acceptance === 'rejected') {
-        if (facts.acceptanceRetry !== null && facts.acceptanceRetry <= LANE_RUN_MAX_RETRY) {
-          const attempt = facts.attempt;
-          if (attempt === null) {
-            return WAIT_FACTS_INCONSISTENT;
+        // AR1: a review-blocked acceptance rejection is terminal at this head;
+        // the run goes to a fix round instead of retrying the accept act.
+        if (facts.acceptanceRejection === 'review-findings') {
+          const outcome = afterLaneRunFailure(record.round, 'code-review');
+          if (outcome.kind === 'enter') {
+            return enter(outcome.to);
           }
-          return act({
-            step: 'accept',
-            round: attempt.round,
-            seatIndex: attempt.seatIndex,
-            head12: facts.head12,
-            retry: facts.acceptanceRetry,
-            attemptOrdinal: null,
-          });
         }
         return park('acceptance-rejected', null);
       }
@@ -741,6 +1022,12 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     };
 
     const watchingCiRules = (): LaneRunDecision => {
+      // GB4: the CI failure is already journalled under the `ci` key (a
+      // crash between the result and the transition): resume only the
+      // transition, never the key.
+      if (facts.ciFailureRecorded === true) {
+        return enter('fixing');
+      }
       if (facts.ci === 'pending') {
         return wait('ci-pending');
       }
@@ -750,7 +1037,15 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.ci === 'passed') {
         return enter('merging');
       }
-      return afterFailure(record.round, 'ci');
+      const outcome = afterFailure(record.round, 'ci');
+      if (outcome.kind === 'park') {
+        return park(outcome.reason, null);
+      }
+      const attempt = facts.attempt;
+      if (attempt === null) {
+        return WAIT_FACTS_INCONSISTENT;
+      }
+      return act({ step: 'ci', round: record.round, seatIndex: attempt.seatIndex, head12: facts.head12, retry: null, attemptOrdinal: null });
     };
 
     const mergingRules = (): LaneRunDecision => {
@@ -766,9 +1061,6 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.merge.oneWayDoor) {
         return park('one-way-door', null);
       }
-      if (facts.merge.branchBehind) {
-        return park('branch-behind', null);
-      }
       // KS7a-2 (D20): the `premerge` post is the merge hold, read before the
       // policy-grant park and the merge tail; null falls through to them.
       const premerge = laneRunPremergeDecision(record, facts);
@@ -778,21 +1070,39 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (!facts.merge.policyGrant) {
         return park('owner-merge', null);
       }
-      if (!facts.merge.trainFree) {
-        return wait('merge-train');
+      // KS7b: the merge is the daemon queue's. A drop maps back to the run
+      // here; an unknown queue state is read as a wait by the reconcile and
+      // never as a merge (only a merged PR enters `merged`).
+      switch (facts.mergeEnqueue) {
+        case 'merged':
+          // The queue merged the head but the forge read does not say so yet.
+          return WAIT_FACTS_INCONSISTENT;
+        case 'dropped-fixable':
+          return afterFailure(record.round, 'merge-queue');
+        case 'held':
+          return park('owner-merge', null);
+        case 'stuck':
+          return park('step-refused', 'merge-enqueue');
+        default:
+          break;
       }
       const attempt = facts.attempt;
-      if (attempt === null) {
+      if (attempt === null || facts.head12 === null) {
         return WAIT_FACTS_INCONSISTENT;
       }
-      return act({
-        step: 'merge',
-        round: attempt.round,
+      const enqueueKey = laneRunMergeEnqueueKey(record.runId, record.round, facts.head12);
+      if (!enqueueKey.ok) {
+        return WAIT_FACTS_INCONSISTENT;
+      }
+      return {
+        kind: 'act',
+        step: 'merge-enqueue',
+        key: enqueueKey.key,
+        round: record.round,
         seatIndex: attempt.seatIndex,
         head12: facts.head12,
         retry: null,
-        attemptOrdinal: null,
-      });
+      };
     };
 
     // G1: terminal states.
@@ -805,19 +1115,35 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return WAIT_FACTS_INCONSISTENT;
     }
 
+    // G3f (R4c): a merged PR carrying the lane head ends the run from an
+    // eligible waiting state. An unread intent shadows it unless its step is
+    // premerge; a park with an open owner question, or a parked run with a live
+    // attempt returns null. Under a halt it decides nothing.
+    const mergedPr = laneRunMergedPrDecision(record, facts);
+    if (mergedPr !== null) {
+      return mergedPr;
+    }
+
     // G3a: an unread intent without a result is reconciled first, in any state —
     // except under a halt, where a collect or gate reconcile would re-run its act
     // body (an edit-only commit, a collect, a gate on the lane host; §3.7): the
     // halt rules' decision (G4b/G6) applies instead. Prepare, dispatch, stop and
     // cancel reconciles stay as they are under halt (read-only or record-only).
     if (facts.pendingIntent !== null && facts.pendingIntent.reconciliation === 'unread') {
-      if (facts.halted && (facts.pendingIntent.step === 'collect' || facts.pendingIntent.step === 'gate' || facts.pendingIntent.step === 'premerge')) {
+      if (facts.halted && (facts.pendingIntent.step === 'collect' || facts.pendingIntent.step === 'gate' || facts.pendingIntent.step === 'premerge' || facts.pendingIntent.step === 'merge-enqueue')) {
         if (facts.state === 'parked') {
           return wait('parked');
         }
         return park('halted', null);
       }
       return { kind: 'reconcile', step: facts.pendingIntent.step, key: facts.pendingIntent.key };
+    }
+
+    // G3b0 (R4a): a settled open-pr park leaves by itself; G3b below would
+    // wait on it forever.
+    const settledOpenPr = laneRunSettledOpenPrDecision(record, facts);
+    if (settledOpenPr !== null) {
+      return settledOpenPr;
     }
 
     // G3b / G3c: an ambiguous intent parks (or waits, when already parked).
@@ -834,22 +1160,6 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return enter('merged');
       }
       return park('ambiguous', 'merge');
-    }
-
-    // G3e: the owner-merge park leaves by itself once its PR merges with the
-    // lane head (CT-2a). It sits here, ahead of the stop rules G4a and GD1, so
-    // a landed merge ends `merged` and never `stopped` even with a stop
-    // recorded on the park (§3.9.1). A merged PR that neither equals nor
-    // contains the lane head keeps the park for the owner (no park → park).
-    if (
-      facts.state === 'parked' &&
-      record.parked !== null &&
-      record.parked.reason === 'owner-merge' &&
-      facts.pr !== null &&
-      facts.pr.state === 'merged' &&
-      mergedPrCarriesLaneHead(facts.pr, facts.head12)
-    ) {
-      return enter('merged');
     }
 
     // G4a: a force stop with nothing to stop ends the run.
@@ -947,7 +1257,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return stopAct(facts.attempt, wait('stop-unconfirmed'));
     }
 
-    // G4i / GD1–GD6 (§3.9.1): a graceful stop drains the run's live attempt.
+    // G4i / GD1–GD7 (§3.9.1): a graceful stop drains the run's live attempt.
     if (facts.stopMode === 'graceful') {
       const phase = facts.attempt === null ? null : facts.attempt.phase;
       const live = phase === 'dispatching' || phase === 'running' || phase === 'blocked';
@@ -956,15 +1266,16 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       const drainGate: Exclude<LaneRunFacts['gate'], 'congested'> =
         facts.gate === 'congested' ? 'unknown' : facts.gate;
       const drainContinues = laneRunDrainContinues(facts.state, drainGate);
-      const drainWait = (): LaneRunDecision => {
+      // The stop's grace has passed when the stop's time is missing or unparseable:
+      // an unknown stop time cannot be inside a grace window (GD7).
+      const gracePassed = (): boolean => {
         if (facts.stopRequestedAtIso === null || Number.isNaN(Date.parse(facts.stopRequestedAtIso))) {
-          return wait('stop-grace-exceeded');
+          return true;
         }
-        if (now >= Date.parse(facts.stopRequestedAtIso) + facts.stopGraceMinutes * 60_000) {
-          return wait('stop-grace-exceeded');
-        }
-        return wait('stop-draining');
+        return now >= Date.parse(facts.stopRequestedAtIso) + facts.stopGraceMinutes * 60_000;
       };
+      const drainWait = (): LaneRunDecision =>
+        gracePassed() ? wait('stop-grace-exceeded') : wait('stop-draining');
       // GD1: nothing live left to drain ends the run.
       if ((phase === null || !live) && !drainContinues) {
         return enter('stopped');
@@ -976,6 +1287,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       // GD3: a live attempt outside the drain states waits on the drain.
       if (live && !drainContinues) {
         return drainWait();
+      }
+      // GD7 (§3.9.1, F90): a drain state with no live attempt whose stop grace has
+      // passed ends the run, instead of running the state's own rules again and
+      // again. Inside the grace the drain still gets its chance to finish collect
+      // or gate. A live attempt keeps today's behaviour (GD3).
+      if (!live && drainContinues && gracePassed()) {
+        return enter('stopped');
       }
       // GD4: inside the drain states the state rules apply, with GD5 and GD6.
       let decision: LaneRunDecision;

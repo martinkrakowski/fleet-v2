@@ -5,9 +5,16 @@ import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { LaneRunFacts } from '../../../domain/lane-run-decider.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
-import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalOutcome, LaneRunJournalRefusal } from '../../../domain/lane-run-journal.js';
 import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
+import type { FindLatestReceiptOfKindResult } from '../../ports/out/ReviewRequestPort.out-port.js';
+import type { LaneRunParkFindingView } from '../../../domain/park-findings-view.js';
+import { causingParkFindingsView } from '../../../domain/park-findings-view.js';
+import { classifyPark } from '../../../domain/park-class.js';
+import { decideConductorReviewOutcome, } from '../../../domain/lane-run-decider.js';
+import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import { resolveLaneRunProvenance } from '../../../domain/lane-run-records.js';
 import { canEnterLaneRunState, workOrderReleaseFor } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { workOrderHoldFacts } from '../work-order-hold-facts.js';
@@ -19,7 +26,28 @@ export interface AdvanceStepContext {
 
 export type WriteOutcome =
   | { readonly ok: true; readonly record?: LaneRunRecord }
-  | { readonly ok: false; readonly reason: AdvanceLaneRunRefusal };
+  | { readonly ok: false; readonly reason: AdvanceLaneRunRefusal;
+      readonly journalRefusal?: LaneRunJournalRefusal; readonly detail?: string | null };
+
+/**
+ * A refusal an advance step returns: the coarse port reason plus, when the
+ * refusal came from the journal, the journal's typed refusal and its detail.
+ */
+export interface AdvanceStepRefusal {
+  readonly reason: AdvanceLaneRunRefusal;
+  readonly journalRefusal?: LaneRunJournalRefusal;
+  readonly detail?: string | null;
+}
+
+/** Build the port's `refused` result from a step refusal, carrying the journal's reason and detail only when known. */
+export function refusedResult(refusal: AdvanceStepRefusal): AdvanceLaneRunResult {
+  return {
+    outcome: 'refused',
+    reason: refusal.reason,
+    ...(refusal.journalRefusal !== undefined ? { journalRefusal: refusal.journalRefusal } : {}),
+    ...(refusal.detail !== undefined ? { detail: refusal.detail } : {}),
+  };
+}
 
 /**
  * One advance's facts plus what its decision hooks need. Kept per call, never on
@@ -41,7 +69,12 @@ export async function performEnter(ctx: AdvanceStepContext,
   to: LaneRunStateValue,
   request: AdvanceLaneRunRequest,
 ): Promise<AdvanceLaneRunResult> {
-  if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null)) {
+  const settledOpenPr =
+    record.parked !== null &&
+    record.parked.reason === 'ambiguous' &&
+    record.parked.qualifier === 'open-pr' &&
+    record.prNumber !== null;
+  if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null, settledOpenPr, resolveLaneRunProvenance(record))) {
     return { outcome: 'refused', reason: 'illegal-transition' };
   }
   if (to === 'merged' || to === 'stopped') {
@@ -51,7 +84,7 @@ export async function performEnter(ctx: AdvanceStepContext,
   }
   const appended = await appendConduct(ctx, request, to);
   if (!appended.ok) {
-    return { outcome: 'refused', reason: appended.reason };
+    return refusedResult(appended);
   }
   if (record.parked !== null) {
     const saved = await saveOrRefuse(ctx,
@@ -107,13 +140,18 @@ export async function raiseParkNotice(
     if (workOrder === null) {
       return;
     }
+    const parkedFindings = record.parked?.findings;
     const parkRequest: LaneRunParkRequest = {
       key,
       projectId: workOrder.projectId,
       workOrderId: record.workOrderId,
       runId: record.runId,
       reason,
+      parkCount: record.parkCount,
       ...(qualifier === null ? {} : { qualifier }),
+      ...(reason === 'blocker-after-round-2' && parkedFindings !== undefined && parkedFindings !== null && parkedFindings.length > 0
+        ? { findings: parkedFindings }
+        : {}),
     };
     await parkNotice.recordParkAttention(parkRequest);
     if (OWNER_QUESTION_REASONS.includes(reason)) {
@@ -214,6 +252,161 @@ export async function releaseWorkOrderAtEnd(ctx: AdvanceStepContext,
   }
 }
 
+/**
+ * The bounded findings snapshot of a finding-caused park (`blocker-after-
+ * round-2` or `acceptance-rejected`), read once at park time and frozen on
+ * the parked record (GB2 correction 2, RV3 req (d)). The review kinds are
+ * ordered by `parkedFrom` and the attempts are walked newest-first to the
+ * latest collected head; the first review receipt whose severity outcome is
+ * `failed` supplies the causing blocking findings through
+ * `causingParkFindingsView` (guaranteed non-empty when a blocking receipt is
+ * found).
+ *
+ * `null` means the findings could not be read at park time (unwired deps, a
+ * missing attempt or head, an `unavailable` receipt lookup, or a read throw):
+ * unread stays `null`, never `[]`. `undefined` means every lookup succeeded
+ * and no failing review receipt exists at the head (e.g. a gate-caused park):
+ * `findings` is omitted, never `[]`. Never throws.
+ */
+async function blockerFindingsFor(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  parkedFrom: LaneRunStateValue,
+): Promise<readonly LaneRunParkFindingView[] | null | undefined> {
+  const reviewRequest = ctx.deps.reviewRequest;
+  const attemptRepo = ctx.deps.attemptRepo;
+  if (reviewRequest === undefined || attemptRepo === undefined) {
+    return null;
+  }
+  // The latest attempt with a collected head, newest first.
+  let head: string | undefined;
+  let attemptId: string | undefined;
+  for (let index = record.attemptIds.length - 1; index >= 0; index -= 1) {
+    const id = record.attemptIds[index];
+    if (id === undefined) {
+      continue;
+    }
+    try {
+      const attempt = await attemptRepo.findAttemptById(id);
+      const candidateHead = attempt?.artifacts?.headCommit;
+      if (attempt !== null && candidateHead !== undefined) {
+        head = candidateHead;
+        attemptId = id;
+        break;
+      }
+    } catch {
+      return null;
+    }
+  }
+  if (attemptId === undefined || head === undefined) {
+    return null;
+  }
+  const kinds: readonly ('brief-check' | 'code-review' | 'pre-merge')[] =
+    parkedFrom === 'brief-check'
+      ? ['brief-check', 'code-review', 'pre-merge']
+      : parkedFrom === 'awaiting-premerge' || parkedFrom === 'merging'
+        ? ['pre-merge', 'code-review', 'brief-check']
+        : ['code-review', 'brief-check', 'pre-merge'];
+  let sawUnavailableOrThrow = false;
+  for (const kind of kinds) {
+    let found: FindLatestReceiptOfKindResult;
+    try {
+      found = await reviewRequest.findLatestReceiptOfKind({ attemptId, candidateHeadSha: head, kind });
+    } catch {
+      sawUnavailableOrThrow = true;
+      continue;
+    }
+    if (found.outcome === 'unavailable') {
+      sawUnavailableOrThrow = true;
+      continue;
+    }
+    if (found.outcome === 'found' && decideConductorReviewOutcome(found.receipt).outcome === 'failed') {
+      const caused = causingParkFindingsView(found.receipt.findings);
+      return caused.length > 0 ? caused : null;
+    }
+    // RV3: a `not-found` receipt of a review kind falls back to the latest
+    // journal intent's minted request id before the kind is given up.
+    if (found.outcome === 'not-found' && (kind === 'code-review' || kind === 'brief-check')) {
+      try {
+        const entries = await ctx.deps.runJournal.listForRun(record.runId);
+        let mintedId: string | null = null;
+        for (let index = entries.length - 1; index >= 0; index -= 1) {
+          const entry = entries[index]!;
+          if (entry.kind !== 'intent' || entry.runId !== record.runId || entry.key === null) {
+            continue;
+          }
+          const parsed = parseLaneRunKey(entry.key);
+          if (parsed === null || parsed.kind !== 'step' || parsed.step !== kind) {
+            continue;
+          }
+          mintedId = entry.mintedId;
+          break;
+        }
+        if (mintedId !== null) {
+          const byRequest = await reviewRequest.findReviewReceipt({
+            attemptId,
+            requestId: mintedId,
+            candidateHeadSha: head,
+          });
+          if (
+            byRequest.outcome === 'found' &&
+            decideConductorReviewOutcome(byRequest.receipt).outcome === 'failed'
+          ) {
+            const caused = causingParkFindingsView(byRequest.receipt.findings);
+            return caused.length > 0 ? caused : null;
+          }
+          if (byRequest.outcome === 'unavailable') {
+            sawUnavailableOrThrow = true;
+          }
+        }
+      } catch {
+        sawUnavailableOrThrow = true;
+      }
+    }
+  }
+  return sawUnavailableOrThrow ? null : undefined;
+}
+
+/**
+ * PT1a: the gate-park evidence `classifyPark` reads: the screened file the
+ * failing gate check named at the latest collected head, and the work order's
+ * owned paths. Each part is `null` when it cannot be read (unwired port, no
+ * collected head, a throw): unknown stays unknown. Never throws.
+ */
+async function gateParkEvidence(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+): Promise<{ readonly gateFailingFile: string | null; readonly ownedPaths: readonly string[] | null }> {
+  const none = { gateFailingFile: null, ownedPaths: null };
+  const reader = ctx.deps.gateFailingFile;
+  const workOrderRepo = ctx.deps.workOrderRepo;
+  if (reader === undefined || workOrderRepo === undefined) {
+    return none;
+  }
+  try {
+    for (let index = record.attemptIds.length - 1; index >= 0; index -= 1) {
+      const id = record.attemptIds[index];
+      if (id === undefined) {
+        continue;
+      }
+      const attempt = await ctx.deps.attemptRepo.findAttemptById(id);
+      const head = attempt?.artifacts?.headCommit;
+      if (attempt === null || head === undefined) {
+        continue;
+      }
+      const read = await reader.readGateFailingFile({ attemptId: id, headSha: head });
+      const workOrder = await workOrderRepo.findWorkOrderById(record.workOrderId);
+      return {
+        gateFailingFile: read.outcome === 'found' ? read.failingFile : null,
+        ownedPaths: workOrder === null ? null : [...workOrder.ownedPaths],
+      };
+    }
+    return none;
+  } catch {
+    return none;
+  }
+}
+
 export async function performPark(ctx: AdvanceStepContext,
   record: LaneRunRecord,
   reason: LaneRunParkReason,
@@ -221,9 +414,37 @@ export async function performPark(ctx: AdvanceStepContext,
   parkedFrom: LaneRunStateValue,
   request: AdvanceLaneRunRequest,
 ): Promise<AdvanceLaneRunResult> {
+  // RV3 (req d): a park caused by review findings carries the non-empty
+  // bounded findings that caused it; `findings: []` is refused at the domain
+  // boundary, so only `null` (unread) or a non-empty snapshot is attached,
+  // and a park with no failing review receipt omits `findings`.
+  const findings =
+    reason === 'blocker-after-round-2' || reason === 'acceptance-rejected'
+      ? await blockerFindingsFor(ctx, record, parkedFrom)
+      : undefined;
+  // PT1a: the park's class, from data held at this point; ids and codes only.
+  const gateEvidence =
+    reason === 'blocker-after-round-2' && parkedFrom === 'gating'
+      ? await gateParkEvidence(ctx, record)
+      : { gateFailingFile: null, ownedPaths: null };
+  const parkClass = classifyPark({
+    reason,
+    qualifier,
+    parkedFrom,
+    findingSeverities: Array.isArray(findings) ? findings.map((finding) => finding.severity) : null,
+    gateFailingFile: gateEvidence.gateFailingFile,
+    ownedPaths: gateEvidence.ownedPaths,
+  });
   const parkedRecord: LaneRunRecord = {
     ...record,
-    parked: { reason, qualifier, parkedFrom, questionId: null },
+    parked: {
+      reason,
+      qualifier,
+      parkedFrom,
+      questionId: null,
+      class: parkClass,
+      ...(findings === null || (findings !== undefined && findings.length > 0) ? { findings } : {}),
+    },
     parkCount: record.parkCount + 1,
     revision: record.revision + 1,
   };
@@ -233,7 +454,7 @@ export async function performPark(ctx: AdvanceStepContext,
   }
   const appended = await appendConduct(ctx, request, 'parked');
   if (!appended.ok) {
-    return { outcome: 'refused', reason: appended.reason };
+    return refusedResult(appended);
   }
   await raiseParkNotice(ctx, saved.record ?? parkedRecord, reason, qualifier, request);
   return { outcome: 'parked', reason, qualifier };
@@ -255,11 +476,12 @@ export async function appendRunIntent(ctx: AdvanceStepContext,
   request: AdvanceLaneRunRequest,
   key: string,
   mintedId: string | null,
-): Promise<AdvanceLaneRunRefusal | null> {
+): Promise<AdvanceStepRefusal | null> {
   const appended = await ctx.deps.runJournal.append(
     laneRunIntentEntry(ctx.deps.newUlid(), request.runId, key, mintedId, request.nowIso),
   );
-  return appended.outcome === 'appended' ? null : 'journal-refused';
+  return appended.outcome === 'appended' ? null
+    : { reason: 'journal-refused', journalRefusal: appended.reason, detail: appended.detail };
 }
 
 export async function appendRunResult(ctx: AdvanceStepContext,
@@ -268,11 +490,12 @@ export async function appendRunResult(ctx: AdvanceStepContext,
   outcome: LaneRunJournalOutcome,
   reasonCode: LaneRunResultReasonCode | null,
   detail: string | null = null,
-): Promise<AdvanceLaneRunRefusal | null> {
+): Promise<AdvanceStepRefusal | null> {
   const appended = await ctx.deps.runJournal.append(
     laneRunResultEntry(ctx.deps.newUlid(), request.runId, key, outcome, reasonCode, request.nowIso, detail),
   );
-  return appended.outcome === 'appended' ? null : 'journal-refused';
+  return appended.outcome === 'appended' ? null
+    : { reason: 'journal-refused', journalRefusal: appended.reason, detail: appended.detail };
 }
 
 /** The minted id of a key's intent, or null when the key has no intent. */
@@ -293,7 +516,8 @@ export async function appendConduct(ctx: AdvanceStepContext,
   const appended = await ctx.deps.runJournal.append(
     laneRunConductEntry(ctx.deps.newUlid(), request.runId, state, request.nowIso),
   );
-  return appended.outcome === 'appended' ? { ok: true } : { ok: false, reason: 'journal-refused' };
+  return appended.outcome === 'appended' ? { ok: true }
+    : { ok: false, reason: 'journal-refused', journalRefusal: appended.reason, detail: appended.detail };
 }
 
 export async function saveOrRefuse(ctx: AdvanceStepContext, next: LaneRunRecord, request: AdvanceLaneRunRequest): Promise<WriteOutcome> {

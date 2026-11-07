@@ -3,6 +3,7 @@
  * consumer-side adapters from the shared root inputs; called by the CLI
  * composition root.
  */
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 import { withFileLock, writeJsonAtomically } from '../file-store.js';
@@ -22,14 +23,25 @@ import {
   CommitEditOnlyAttemptUseCase,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
+  ExplainAttemptUseCase,
+  EnqueueMergeUseCase,
   ExecutionObservationAdapter,
   GatePredicateAdapter,
+  GateReceiptReuseAdapter,
   ProcessTreeTerminationAdapter,
+  ImportLanePlanUseCase,
+  ImportTrainStateUseCase,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
+  LanePlanRepositoryAdapter,
+  MergeRecordRepositoryAdapter,
+  LegacyTrainStateReadAdapter,
+  ListMergeQueueUseCase,
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
+  MergeGrantAdapter,
+  MergeQueueRepositoryAdapter,
   PolicyMergeGrantAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
@@ -43,6 +55,8 @@ import {
   consumptionId,
   forgeActionScope,
   observationEventKind,
+  readGateDeclaredEnvironmentDigest,
+  readGateToolchainVersions,
   sha256HexDigest,
   type AgyRunnerAdapter,
   type AttemptArtifactAdapter,
@@ -83,7 +97,7 @@ import {
 
 import type { FleetCliRuntime, FleetCliRuntimeOptions } from '../composition.js';
 import type { readJsonRecord } from '../composition.js';
-import { readAcceptanceForAttempt } from '@fleet/work-execution';
+import { canonicalLanePlanSidecarJson, readAcceptanceForAttempt } from '@fleet/work-execution';
 
 /** Grant-to-attempt binding persisted for cross-process forge execution. */
 interface AuthorizationCoordinates {
@@ -108,6 +122,8 @@ export interface ComposeExecutionInput {
   readonly attemptLookup: { inspectAttempt?: InspectAttemptUseCase };
   readonly forgeRead: ForgeReadAdapter;
   readonly issuePolicyForgeGrantUseCase: IssuePolicyForgeGrantUseCase;
+  /** The merge-pass grant adapter (DT6b), constructed by the host composition. */
+  readonly mergeGrant: MergeGrantAdapter;
   readonly profileRead: ProjectProfileReadPort;
   readonly probeRecord: ProjectProbeRecordAdapter;
   readonly executorForHostName: (name: string) => ExecutorForRecordedHostResult;
@@ -149,6 +165,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     attemptLookup,
     forgeRead,
     issuePolicyForgeGrantUseCase,
+    mergeGrant,
     profileRead,
     probeRecord,
     executorForHostName,
@@ -340,6 +357,8 @@ export function composeExecution(input: ComposeExecutionInput) {
         projectId: request.projectId,
         actionScope: forgeActionScope(request.actionKind),
         expectedHeadSha: request.expectedHeadSha,
+        // CO24e: the grant records the attempt it is resolved for, durably.
+        attemptId: request.attemptId,
       });
       if (result.outcome === 'authorized') {
         resolveCoordinates.set(result.grantId, {
@@ -390,8 +409,7 @@ export function composeExecution(input: ComposeExecutionInput) {
         };
       }
       // Coordinates recorded at resolve time bind the grant to its attempt;
-      // a fresh process reloads them from disk before falling back to the
-      // head-matching scan over all recorded attempts.
+      // a fresh process reloads them from disk.
       if (
         !resolveCoordinates.has(request.authorizationGrantId) &&
         authorizationCoordinatesPath !== undefined
@@ -411,17 +429,25 @@ export function composeExecution(input: ComposeExecutionInput) {
         }
       }
       const coordinates = resolveCoordinates.get(request.authorizationGrantId);
-      const boundAttempt =
-        coordinates === undefined
-          ? null
-          : await attemptRepository.findAttemptById(coordinates.attemptId);
+      // The grant record names its attempt (CO24e: written at issue, at request
+      // time or at the first resolve); the resolve-time coordinates are the
+      // fallback. A legacy grant carries neither: the request's own attempt is
+      // then the only candidate (CO24d), validated at the head below. No
+      // attempt is ever picked by head alone.
+      const resolvedAttemptId = grant.grantAttemptId ?? grant.policyGrant?.attemptId ?? coordinates?.attemptId;
+      if (resolvedAttemptId !== undefined) {
+        if (request.attemptId !== undefined && request.attemptId !== resolvedAttemptId) {
+          return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
+        }
+      } else if (typeof request.attemptId !== 'string') {
+        return { outcome: 'refused', reason: 'grant-attempt-unresolved' };
+      }
+      const boundAttemptId = resolvedAttemptId ?? request.attemptId;
       const attempt =
-        boundAttempt !== null && boundAttempt.artifacts?.headCommit === request.expectedHeadSha
-          ? boundAttempt
-          : (await attemptRepository.listAllAttempts()).find(
-              (candidate) => candidate.artifacts?.headCommit === request.expectedHeadSha,
-            );
-      if (attempt === undefined) {
+        typeof boundAttemptId === 'string'
+          ? await attemptRepository.findAttemptById(boundAttemptId)
+          : null;
+      if (attempt === null || attempt.artifacts?.headCommit !== request.expectedHeadSha) {
         return {
           outcome: 'refused',
           reason:
@@ -490,6 +516,11 @@ export function composeExecution(input: ComposeExecutionInput) {
     allowedSeats,
     gatePredicates: new GatePredicateAdapter({
       executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+      receiptReuse: {
+        port: new GateReceiptReuseAdapter({ stateDir }),
+        toolchainVersions: readGateToolchainVersions,
+        declaredEnvironmentDigest: readGateDeclaredEnvironmentDigest,
+      },
     }),
     journal: executionJournal,
     computeDigest: sha256HexDigest,
@@ -499,10 +530,30 @@ export function composeExecution(input: ComposeExecutionInput) {
   // process tree on its recorded host (a legacy record is refused by the adapter).
   const processTreeTermination = new ProcessTreeTerminationAdapter({ executorForHost });
 
+  const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
+  const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository });
+  const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
+  const legacyTrainState = new LegacyTrainStateReadAdapter();
+  const importTrainState = new ImportTrainStateUseCase({
+    legacyState: legacyTrainState,
+    queue: mergeQueueRepository,
+    mintUlid: () => newUlid(),
+    nowIso: () => new Date().toISOString(),
+  });
+
+  // WB4a: the lane-plan store — one adapter is both stores (in-memory when
+  // stateDir is omitted, lane-plans.json otherwise). Its change signal
+  // defaults to a no-op, exactly as the work-order adapter's does.
+  const lanePlanRepository = new LanePlanRepositoryAdapter({ stateDir });
+  // WB5b: a completed merge saves its record (merge-records.json) beside the
+  // other work-execution stores; without it `merge-pr` refuses.
+  const mergeRecordRepository = new MergeRecordRepositoryAdapter({ stateDir });
+
   const execution = {
     workOrderRepository,
     attemptRepository,
     executionJournal,
+    mergeRecordRepository,
     workspace,
     runner,
     runnerForAttempt,
@@ -519,6 +570,9 @@ export function composeExecution(input: ComposeExecutionInput) {
     briefKnowledge,
     executionObservation,
     forgeAction,
+    // DT6b: the merge-pass grant adapter sits beside forgeAction on the
+    // runtime type; the attempt-less variant grants a CLI-enqueued entry.
+    mergeGrant,
     forgeRead,
     probeProject: new ProbeProjectUseCase({
       profileRead,
@@ -539,6 +593,13 @@ export function composeExecution(input: ComposeExecutionInput) {
     registerWorkOrder: new RegisterWorkOrderUseCase({
       workOrderRepo: workOrderRepository,
       profileRead,
+      lanePlanRepo: lanePlanRepository,
+    }),
+    importLanePlan: new ImportLanePlanUseCase({
+      lanePlanRepo: lanePlanRepository,
+      computeDigest: (sidecar) =>
+        createHash('sha256').update(canonicalLanePlanSidecarJson(sidecar)).digest('hex'),
+      nowIso: () => new Date().toISOString(),
     }),
     inspectWorkOrder: new InspectWorkOrderUseCase({
       workOrderRepo: workOrderRepository,
@@ -548,6 +609,11 @@ export function composeExecution(input: ComposeExecutionInput) {
     inspectAttempt: new InspectAttemptUseCase({
       attemptRepo: attemptRepository,
       runnerForAttempt,
+    }),
+    explainAttempt: new ExplainAttemptUseCase({
+      attemptRepo: attemptRepository,
+      journal: executionJournal,
+      acceptanceEvidence,
     }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,
@@ -612,6 +678,11 @@ export function composeExecution(input: ComposeExecutionInput) {
       attemptRepo: attemptRepository,
       journal: executionJournal,
     }),
+    mergeQueueRepository,
+    enqueueMerge,
+    listMergeQueue,
+    importTrainState,
+    legacyTrainState,
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,
@@ -633,6 +704,11 @@ export function composeExecution(input: ComposeExecutionInput) {
       // owner-decision resolution acceptance uses.
       ownerDecisionPort: ownerDecision,
       attemptOwnerDecisionPort: attemptOwnerDecision,
+      lanePlanRepo: lanePlanRepository,
+      mergeRecordRepo: mergeRecordRepository,
+      // WB5b2: the merge verifies a pull-request number no typed journal
+      // entry confirms through the installation's read-only forge read.
+      forgeRead,
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
     }),

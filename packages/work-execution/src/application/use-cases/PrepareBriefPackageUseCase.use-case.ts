@@ -22,7 +22,7 @@ import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isPlanSecretShaped } from '../../domain/lane-plan-sidecar.js';
-import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
+import { AcceptanceSpec, isAcceptanceSpecShellError } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type {
   BriefContextDecision,
   PrepareBriefPackagePort,
@@ -235,7 +235,7 @@ function validateBriefFields(request: PrepareBriefPackageRequest): string | null
  */
 function validatePathsAndSpec(
   request: PrepareBriefPackageRequest,
-): { readonly reason: string } | {
+): { readonly reason: string; readonly reasonClass?: 'acceptance-spec-shell' } | {
   readonly allowedPathPrefixes: readonly string[];
   readonly acceptanceSpec: AcceptanceSpec;
 } {
@@ -265,7 +265,11 @@ function validatePathsAndSpec(
   }
   const acceptanceSpec = AcceptanceSpec.create(request.acceptanceSpec);
   if (!acceptanceSpec.success || acceptanceSpec.value === undefined) {
-    return { reason: acceptanceSpec.error?.message ?? 'acceptanceSpec is invalid' };
+    const message = acceptanceSpec.error?.message ?? 'acceptanceSpec is invalid';
+    if (isAcceptanceSpecShellError(message)) {
+      return { reason: message, reasonClass: 'acceptance-spec-shell' };
+    }
+    return { reason: message };
   }
   if (allowedPathPrefixes.length === 0) {
     return {
@@ -347,6 +351,35 @@ function validatePlacement(
   return { worktreePath };
 }
 
+/** Whether `value` is a well-shaped context decision with the declared fields. */
+function isContextDecisionObject(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    isNonEmpty(record.proposalId) &&
+    isNonEmpty(record.knowledgeEntryId) &&
+    isNonEmpty(record.version) &&
+    typeof record.proposedBecause === 'string' &&
+    typeof record.accepted === 'boolean' &&
+    typeof record.decisionBecause === 'string'
+  );
+}
+
+/** Why `contextDecisions` is unusable, or null when it is a valid array of decisions (the contract requires it). */
+function contextDecisionsError(value: unknown): string | null {
+  if (!Array.isArray(value)) {
+    return 'contextDecisions must be an array of context decisions';
+  }
+  for (const decision of value) {
+    if (!isContextDecisionObject(decision)) {
+      return 'contextDecisions must be an array of context decisions';
+    }
+  }
+  return null;
+}
+
 /**
  * The reviewer must be named and differ from the implementer model, an
  * optional seat plan is validated, pr notes are validated when present, and
@@ -376,6 +409,9 @@ function validateReviewerAndPlan(
       return { reason: notesError };
     }
   }
+  if (contextDecisionsError(request.contextDecisions) !== null) {
+    return { reason: 'contextDecisions must be an array of context decisions' };
+  }
   const decisions = request.contextDecisions ?? [];
   if (decisions.some((decision) => !isNonEmpty(decision.decisionBecause))) {
     return { reason: 'Every context decision must record decisionBecause' };
@@ -385,7 +421,7 @@ function validateReviewerAndPlan(
 
 /** Everything a prepare would write or freeze, or the reason it would refuse. */
 type BuiltBriefPackage =
-  | { readonly reason: string }
+  | { readonly reason: string; readonly reasonClass?: 'acceptance-spec-shell' }
   | {
       readonly authored: Extract<AuthoredBriefResult, { readonly outcome: 'authored' }>;
       readonly attemptId: string;
@@ -446,7 +482,10 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     }
     const pathsCheck = validatePathsAndSpec(request);
     if ('reason' in pathsCheck) {
-      return { reason: pathsCheck.reason };
+      return {
+        reason: pathsCheck.reason,
+        ...(pathsCheck.reasonClass !== undefined ? { reasonClass: pathsCheck.reasonClass } : {}),
+      };
     }
     const placementCheck = validatePlacement(request, deps.worktreePath, forPreview);
     if ('reason' in placementCheck) {
@@ -569,7 +608,11 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
 
     const built = await this.build(request, this.deps);
     if ('reason' in built) {
-      return { outcome: 'rejected', reason: built.reason };
+      return {
+        outcome: 'rejected',
+        reason: built.reason,
+        ...(built.reasonClass !== undefined ? { reasonClass: built.reasonClass } : {}),
+      };
     }
 
     const placed = await this.deps.artifactPort.placeFrozenBrief({
@@ -621,7 +664,11 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     // fixed reasons when forPreview is set.
     const built = await this.build(request, this.deps, true);
     if ('reason' in built) {
-      return { outcome: 'rejected', reason: redactRequestPaths(built.reason, request, this.deps) };
+      return {
+        outcome: 'rejected',
+        reason: redactRequestPaths(built.reason, request, this.deps),
+        ...(built.reasonClass !== undefined ? { reasonClass: built.reasonClass } : {}),
+      };
     }
 
     const compute = this.deps.computeDigest ?? simpleDeterministicHexDigest;

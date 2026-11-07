@@ -20,7 +20,10 @@ import * as path from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import type { DoctorProbes } from "@fleet/onboarding";
+import {
+  GH_BINARY_CANDIDATES,
+  type DoctorProbes,
+} from "@fleet/onboarding";
 import {
   isFleetInstallationV2,
   parseInstallation,
@@ -487,10 +490,15 @@ function fakeProbes(
     worktreeRootWritable: async () => true,
     ocmRunBinary: async () => ({ path: "/repo/bin/ocm-run", sha256: "c".repeat(64) }),
     expectedOcmRunHash: async () => "c".repeat(64),
+    ghBinary: async () => ({
+      resolved: "/usr/bin/gh",
+      candidates: GH_BINARY_CANDIDATES,
+    }),
     seatProbe: async () => {
       calls?.push("seatProbe");
       return outcome;
     },
+    serverProbe: async () => ({ outcome: "pass", reason: "the opencode server answered" }),
   };
 }
 

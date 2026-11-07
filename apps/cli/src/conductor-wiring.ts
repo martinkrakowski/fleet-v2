@@ -118,6 +118,11 @@ function buildConductorDriver(parts: {
   readonly dispatchStaggerMs?: number;
   /** KF-34b: how many live runs one pass advances concurrently; absent = 1. */
   readonly passConcurrency?: number;
+  /** PT1a: the stall attention wiring; absent in the dry-run driver, which raises nothing. */
+  readonly stall?: Pick<
+    ConstructorParameters<typeof RunConductorPassUseCase>[0],
+    'stallAttention' | 'workOrderRepo' | 'stallAfterMinutes'
+  >;
 }): ConductorDriver {
   const pass = new RunConductorPassUseCase({
     driverLease: parts.driverLease,
@@ -128,6 +133,7 @@ function buildConductorDriver(parts: {
     advance: parts.advance,
     ...(parts.dispatchStaggerMs === undefined ? {} : { dispatchStaggerMs: parts.dispatchStaggerMs }),
     ...(parts.passConcurrency === undefined ? {} : { passConcurrency: parts.passConcurrency }),
+    ...(parts.stall === undefined ? {} : parts.stall),
   });
   return {
     pass,
@@ -151,6 +157,24 @@ export function conductorGateOf(runtime: FleetCliRuntime): FleetCliRuntime['exec
   return runtime.execution.attemptGate;
 }
 
+/**
+ * The forge repository the merge queue keys its entries by (KS7b): the installation's
+ * GitHub owner and repo, v1 or v2. Absent for forge mode `none` or no forge section, so the
+ * `merge-enqueue` step stays `not-wired` rather than guessing a repository.
+ */
+function forgeRepositoryOf(
+  installation: FleetCliRuntime['installation'],
+): { readonly owner: string; readonly repo: string } | undefined {
+  const forge = installation?.forge;
+  if (forge === undefined) {
+    return undefined;
+  }
+  if ('mode' in forge) {
+    return forge.mode === 'github' ? { owner: forge.owner, repo: forge.repo } : undefined;
+  }
+  return { owner: forge.owner, repo: forge.repo };
+}
+
 export function buildLiveConductorDriver(
   runtime: FleetCliRuntime,
   options: { readonly maxActiveRuns: number; readonly passConcurrency?: number; readonly stateDir?: string },
@@ -171,7 +195,9 @@ export function buildLiveConductorDriver(
     attemptRepo: execution.attemptRepository,
     executionJournal: execution.executionJournal,
     maxActiveRuns: options.maxActiveRuns,
+    profileRead: conductor.profileRead,
     candidateHosts: laneRunnerCandidateHosts(runtime.installation),
+    forgeRead: execution.forgeRead,
     newReservationId: () => 'res-' + conductor.newUlid(),
   });
   // One cancel use case serves the advance's G4e cancel and start's abandon.
@@ -193,6 +219,7 @@ export function buildLiveConductorDriver(
     perLaneCostCeiling: runtime.installation?.policy?.perLaneCostCeiling,
     dispatchAttempt: execution.dispatchAttempt,
     cancelPreparedAttempt,
+    worktreeRecovery: execution.workspace,
     installationSchemaVersion: runtime.installation?.schemaVersion,
     stopAttempt: execution.stopAttempt,
     collectAttemptArtifacts: execution.collectAttemptArtifacts,
@@ -202,6 +229,7 @@ export function buildLiveConductorDriver(
     reviewRequest: conductor.reviewRequest,
     reviewAssessment: conductor.reviewAssessment,
     gateReceipts: conductor.gateReceipts,
+    gateFailingFile: conductor.gateFailingFile,
     sameModelFamily: (left, right) =>
       isSameModelFamily(underlyingModelFamily(left), underlyingModelFamily(right)),
     workOrderRepo: execution.workOrderRepository,
@@ -216,13 +244,16 @@ export function buildLiveConductorDriver(
     forgeAncestry: execution.forgeRead,
     conductorForgeGrant: conductor.conductorForgeGrant,
     executeForgeAction: execution.executeAuthorizedForgeAction,
-    autoMergeAttempt: execution.autoMergeAttempt,
+    enqueueMerge: execution.enqueueMerge,
+    mergeQueue: execution.mergeQueueRepository,
+    forgeRepository: forgeRepositoryOf(runtime.installation),
     parkNotice: conductor.parkNotice,
     autoMergeEnabled: conductor.autoMergeEnabled,
   });
   const start = new StartLaneRunUseCase({
     workOrderRepo: execution.workOrderRepository,
     profileRead: conductor.profileRead,
+    halt: conductor.halt,
     capacity: admission,
     executionJournal: execution.executionJournal,
     workspace: execution.workspace,
@@ -254,6 +285,11 @@ export function buildLiveConductorDriver(
       runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
       dispatchStaggerMs: LIVE_DISPATCH_STAGGER_MS,
       ...(options.passConcurrency === undefined ? {} : { passConcurrency: options.passConcurrency }),
+      stall: {
+        stallAttention: conductor.stallAttention,
+        workOrderRepo: execution.workOrderRepository,
+        stallAfterMinutes: conductor.stallAfterMinutes,
+      },
     }),
     passTrace,
   };
@@ -293,6 +329,8 @@ export function buildDryRunConductorDriver(
     runRepo: stores.runRepo,
     runJournal: stores.runJournal,
     newUlid,
+    forgeRead: fakes.forgeRead,
+    attemptRepo: stores.attemptRepo,
   });
   const advance = new AdvanceLaneRunUseCase({
     runRepo: stores.runRepo,
@@ -325,7 +363,9 @@ export function buildDryRunConductorDriver(
     forgeRead: fakes.forgeRead,
     conductorForgeGrant: fakes.conductorForgeGrant,
     executeForgeAction: fakes.executeForgeAction,
-    autoMergeAttempt: fakes.autoMergeAttempt,
+    enqueueMerge: fakes.enqueueMerge,
+    mergeQueue: fakes.mergeQueue,
+    forgeRepository: fakes.forgeRepository,
     parkNotice: fakes.parkNotice,
     autoMergeEnabled: true,
   });

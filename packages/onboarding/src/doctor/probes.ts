@@ -16,6 +16,17 @@ export interface SeatProbeResult {
   readonly reason: string;
 }
 
+/** What one opencode server probe found. */
+export interface ServerProbeResult {
+  readonly outcome: 'pass' | 'fail' | 'unknown';
+  readonly reason: string;
+  /**
+   * The model ids the server lists: `id` for each model and `id#variant`
+   * for each of its variants. Absent when the list could not be read.
+   */
+  readonly models?: readonly string[];
+}
+
 /** Every side effect the doctor performs, injected by the caller. */
 export interface DoctorProbes {
   /** Whether the named host is reachable (an ssh alias or `local`). */
@@ -41,6 +52,20 @@ export interface DoctorProbes {
   ocmRunBinary(): Promise<{ path: string; sha256: string } | undefined>;
   /** The expected `ocm-run` sha256 from `scripts/ocm-run-hash.txt`. */
   expectedOcmRunHash(): Promise<string | undefined>;
+  /**
+   * The reviewed `gh` binary resolution: the first fixed candidate path that
+   * is an executable regular file, plus the full candidate list. `undefined`
+   * when the probe itself could not run.
+   */
+  ghBinary(): Promise<
+    { resolved: string | undefined; candidates: readonly string[] } | undefined
+  >;
+  /**
+   * The opencode server on the host's own loopback port: does it answer, and
+   * which models does it list? The probe asks the server on the host that
+   * runs it — never through a tunnel, and never with a credential.
+   */
+  serverProbe(host: string, port: number): Promise<ServerProbeResult>;
   /** The one-step probe of a seat: model, variant, agent. */
   seatProbe(seat: SeatModel): Promise<SeatProbeResult>;
 }

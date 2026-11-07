@@ -523,3 +523,111 @@ describe('apps/api runtime wiring', () => {
     });
   });
 });
+
+describe('CO24d: the API composition binds a grant to its resolved attempt', () => {
+  type ConsumeResult = { outcome: string; actionId?: string; reason?: string };
+  type AuthPort = {
+    consumeActionAuthorization: (req: {
+      authorizationGrantId: string;
+      actionId: string;
+      actionKind: 'push-and-open-pr' | 'merge-pr';
+      expectedHeadSha?: string;
+      attemptId?: unknown;
+    }) => Promise<ConsumeResult>;
+  };
+
+  async function setup(...grantIds: string[]) {
+    const stateDir = mkdtempSync(join(tmpdir(), 'fleet-api-co24d-'));
+    const headH = makeHeadH();
+    writeFileSync(
+      join(stateDir, 'authorization-coordinates.json'),
+      JSON.stringify(
+        Object.fromEntries(grantIds.map((id) => [id, { attemptId: 'att-A', expectedHeadSha: headH }])),
+      ),
+      'utf8',
+    );
+    configureFleetApiRuntime({ stateDir });
+    const operator = getOperatorComposition();
+    const work = workComposition();
+    const reqRepo = (operator.recordAuthorizationConsumption as unknown as {
+      deps: {
+        requestRepo: {
+          saveRequest: (r: CoordinationRequestRecord) => Promise<void>;
+          findRequestByGrantId: (id: string) => Promise<CoordinationRequestRecord | null>;
+        };
+      };
+    }).deps.requestRepo;
+    for (const id of grantIds) {
+      await reqRepo.saveRequest(makeApprovedGrant(id, forgeActionScope('push-and-open-pr'), headH));
+    }
+    const authPort = (work.executeAuthorizedForgeAction as unknown as { deps: { authorizationPort: AuthPort } })
+      .deps.authorizationPort;
+    return { stateDir, headH, reqRepo, authPort };
+  }
+
+  it('refuses a request naming attempt B for a grant resolved for attempt A, and records nothing', async () => {
+    const { stateDir, headH, reqRepo, authPort } = await setup('grant-co24d-1');
+    try {
+      const result = await authPort.consumeActionAuthorization({
+        authorizationGrantId: 'grant-co24d-1',
+        actionId: 'action-co24d-1',
+        actionKind: 'push-and-open-pr',
+        expectedHeadSha: headH,
+        attemptId: 'att-B',
+      });
+      expect(result).toEqual({ outcome: 'refused', reason: 'grant-attempt-mismatch' });
+      const grant = await reqRepo.findRequestByGrantId('grant-co24d-1');
+      expect(grant?.consumptions).toHaveLength(0);
+      expect(grant?.state).toBe('approved');
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+      configureFleetApiRuntime(null);
+    }
+  });
+
+  it('refuses a wrong-typed attempt id', async () => {
+    const { stateDir, headH, reqRepo, authPort } = await setup('grant-co24d-2');
+    try {
+      const result = await authPort.consumeActionAuthorization({
+        authorizationGrantId: 'grant-co24d-2',
+        actionId: 'action-co24d-2',
+        actionKind: 'push-and-open-pr',
+        expectedHeadSha: headH,
+        attemptId: 42,
+      });
+      // The reason pins the branch: the adapter's request validation refuses a wrong-typed id before any delegate runs.
+      expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+      expect((await reqRepo.findRequestByGrantId('grant-co24d-2'))?.consumptions).toHaveLength(0);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+      configureFleetApiRuntime(null);
+    }
+  });
+
+  it('consumes for the matching attempt and for an absent attempt (the resolved one is used)', async () => {
+    const { stateDir, headH, reqRepo, authPort } = await setup('grant-co24d-ok-1', 'grant-co24d-ok-2');
+    try {
+      const matching = await authPort.consumeActionAuthorization({
+        authorizationGrantId: 'grant-co24d-ok-1',
+        actionId: 'action-co24d-ok-1',
+        actionKind: 'push-and-open-pr',
+        expectedHeadSha: headH,
+        attemptId: 'att-A',
+      });
+      expect(matching).toEqual({ outcome: 'consumed', actionId: 'action-co24d-ok-1' });
+      const absent = await authPort.consumeActionAuthorization({
+        authorizationGrantId: 'grant-co24d-ok-2',
+        actionId: 'action-co24d-ok-2',
+        actionKind: 'push-and-open-pr',
+        expectedHeadSha: headH,
+      });
+      expect(absent).toEqual({ outcome: 'consumed', actionId: 'action-co24d-ok-2' });
+      for (const id of ['grant-co24d-ok-1', 'grant-co24d-ok-2']) {
+        expect((await reqRepo.findRequestByGrantId(id))?.consumptions[0]?.attemptId).toBe('att-A');
+      }
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+      configureFleetApiRuntime(null);
+    }
+  });
+});

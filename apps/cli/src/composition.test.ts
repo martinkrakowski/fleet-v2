@@ -5,10 +5,13 @@ import {
   consumptionId,
   observationEventKind,
   assessmentIdForAttempt,
+  buildGhChildEnvironment,
 } from './composition.js';
+import { buildMergeGhChildEnv, composeExecutionHosts } from './composition/work-execution-hosts.js';
+import { composeEvidence } from './composition/evidence.js';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
-import { nextAttemptRevision } from '@fleet/work-execution';
+import { ForgeActionAdapter, nextAttemptRevision } from '@fleet/work-execution';
 
 function makeHeadH(): string {
   return '1111111111111111111111111111111111111111';
@@ -128,6 +131,17 @@ describe('apps/cli composition', () => {
     });
   });
 
+  describe('WB5b: the merge path saves a merge record', () => {
+    it('the composed forge use case is wired with the merge-record and lane-plan stores', () => {
+      const rt = createFleetCliRuntime();
+      const forgeDeps = (rt.execution.executeAuthorizedForgeAction as unknown as {
+        deps?: { mergeRecordRepo?: unknown; lanePlanRepo?: unknown };
+      }).deps;
+      expect(forgeDeps?.mergeRecordRepo).toBeDefined();
+      expect(forgeDeps?.lanePlanRepo).toBeDefined();
+    });
+  });
+
   describe('H7: end-to-end grant action scope check at consumption', () => {
     it('a grant for push-and-open-pr at head H cannot be consumed for merge-pr at H', async () => {
       const rt = createFleetCliRuntime();
@@ -172,12 +186,49 @@ describe('apps/cli composition', () => {
         forgeDeps.acceptedReceiptByHead[headH] = 'receipt-e2e-1';
       }
 
+      // WB5b2: the typed completed entry confirms number 7, so the request reaches
+      // the grant check this test is about.
+      await rt.execution.executionJournal.appendJournalEntry({
+        id: 'forge:action-open:completed:1',
+        attemptId,
+        workOrderId,
+        action: 'forge',
+        status: 'completed',
+        baseCommit: headH,
+        recordedAtIso: '2026-10-15T09:00:00Z',
+        sessionId: null,
+        detail: null,
+        pullRequest: { repository: 'org/repo', number: 7 },
+      });
+      (rt.execution.executeAuthorizedForgeAction as unknown as {
+        deps: { forgePort: { boundRepository?: unknown } };
+      }).deps.forgePort.boundRepository = () => ({ owner: 'org', repo: 'repo' });
+      (rt.execution.executeAuthorizedForgeAction as unknown as { deps: { forgeRead?: unknown } }).deps.forgeRead = {
+        readPullRequest: async () => ({
+          outcome: 'found',
+          pullRequest: {
+            number: 7,
+            state: 'open',
+            mergeState: 'clean',
+            headSha: headH,
+            headRef: 'feat/lane-cli-test',
+            isCrossRepository: false,
+            headRepositoryOwner: 'org',
+baseRef: 'main',
+            mergedAtIso: null,
+            closedAtIso: null,
+            mergeCommitSha: null,
+          },
+        }),
+      };
+
       // Attempt to execute merge-pr at head H using the push grant
       const mergeResult = await rt.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction({
         actionId: 'action-merge-1',
         attemptId,
         workOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: headH,
         authorizationGrantId: grantId,
       });
@@ -243,6 +294,7 @@ describe('apps/cli composition', () => {
         attemptId,
         workOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: headH,
         authorizationGrantId: grantId,
       });
@@ -294,6 +346,7 @@ describe('apps/cli composition', () => {
         attemptId,
         workOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: headH,
         authorizationGrantId: grantId,
       });
@@ -563,5 +616,263 @@ describe('apps/cli composition', () => {
       await rt.coordination.coordinationRequestRepository.findRequestByGrantId(grantId);
     expect(grant?.consumptions).toHaveLength(0);
     });
+  });
+
+  describe('DT6a finding 1: child environment strips ambient gh credentials on merge path', () => {
+    it('buildMergeGhChildEnv removes ambient tokens and sets GH_CONFIG_DIR', () => {
+      const parentEnv: NodeJS.ProcessEnv = {
+        PATH: '/usr/local/bin:/usr/bin',
+        GH_CONFIG_DIR: '/inherited/config',
+        GH_TOKEN: 'ambient-tok-a',
+        GITHUB_TOKEN: 'ambient-tok-b',
+        GH_ENTERPRISE_TOKEN: 'ambient-tok-c',
+        GITHUB_ENTERPRISE_TOKEN: 'ambient-tok-d',
+        CUSTOM_VAR: 'preserved-value',
+      };
+      const child = buildMergeGhChildEnv('/state/gh/merge', parentEnv);
+
+      expect(child.GH_CONFIG_DIR).toBe('/state/gh/merge');
+      expect(child.GH_CONFIG_DIR).not.toBe(parentEnv.GH_CONFIG_DIR);
+      expect(child.GH_TOKEN).toBeUndefined();
+      expect(child.GITHUB_TOKEN).toBeUndefined();
+      expect(child.GH_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(child.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(child.PATH).toBe('/usr/local/bin:/usr/bin');
+      expect(child.CUSTOM_VAR).toBe('preserved-value');
+    });
+
+    it('buildGhChildEnvironment strips ambient tokens when GH_CONFIG_DIR is present', () => {
+      const parentEnv: NodeJS.ProcessEnv = {
+        PATH: '/usr/bin',
+        GH_CONFIG_DIR: '/inherited/config',
+        GH_TOKEN: 'ambient-token-1',
+        GITHUB_TOKEN: 'ambient-token-2',
+        GH_ENTERPRISE_TOKEN: 'ambient-token-3',
+        GITHUB_ENTERPRISE_TOKEN: 'ambient-token-4',
+      };
+      const child = buildGhChildEnvironment(parentEnv, { GH_CONFIG_DIR: '/state/gh/premerge' });
+
+      expect(child).toBeDefined();
+      expect(child?.GH_CONFIG_DIR).toBe('/state/gh/premerge');
+      expect(child?.GH_CONFIG_DIR).not.toBe(parentEnv.GH_CONFIG_DIR);
+      expect(child?.GH_TOKEN).toBeUndefined();
+      expect(child?.GITHUB_TOKEN).toBeUndefined();
+      expect(child?.GH_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(child?.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(child?.PATH).toBe('/usr/bin');
+    });
+  });
+
+  describe('DT6a finding 4: timeoutMs is threaded through forgeGhRunner closure to runGhSubprocess', () => {
+    it('passes timeoutMs from forgeRead to runGhSubprocess in composeEvidence', async () => {
+      const calls: Array<{ args: readonly string[]; timeoutMs?: number }> = [];
+      const dummyRunGhSubprocess = async (
+        args: readonly string[],
+        _candidates?: readonly string[],
+        _env?: Record<string, string>,
+        timeoutMs?: number,
+      ) => {
+        calls.push({ args, timeoutMs });
+        return { exitCode: 0, stdout: JSON.stringify({ state: 'OPEN', headRefOid: 'a'.repeat(40) }), stderr: '' };
+      };
+
+      const { forgeRead } = composeEvidence({
+        roleExecutors: {
+          worktree: {} as never,
+          orchestrator: {} as never,
+          verifier: {} as never,
+        },
+        forgeMode: 'github',
+        installationModel: {
+          forge: { mode: 'github', owner: 'fleet', repo: 'fleet-v2' },
+        } as never,
+        coordination: {} as never,
+        runGhSubprocess: dummyRunGhSubprocess,
+      });
+
+      await forgeRead.readPullRequest({
+        ref: { kind: 'number', number: 42 },
+        timeoutMs: 7500,
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].timeoutMs).toBe(7500);
+    });
+  });
+
+  describe('DT6a fix round 3 finding 1: merge-path reads use per-kind identity through real runner closure', () => {
+    it('sets GH_CONFIG_DIR and strips ambient tokens for merge-pr and post-status reads, leaving forgeRead unchanged', async () => {
+      const calls: Array<{
+        args: readonly string[];
+        env?: Record<string, string>;
+        timeoutMs?: number;
+      }> = [];
+
+      const dummyRunGhSubprocess = async (
+        args: readonly string[],
+        _candidates?: readonly string[],
+        env?: Record<string, string>,
+        timeoutMs?: number,
+      ) => {
+        calls.push({ args, env, timeoutMs });
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            number: 101,
+            state: 'OPEN',
+            headRefOid: makeHeadH(),
+            headRefName: 'feature-branch',
+            baseRefName: 'main',
+            mergedAt: null,
+            closedAt: null,
+            mergeCommit: null,
+            mergeStateStatus: 'CLEAN',
+            isCrossRepository: false,
+            headRepositoryOwner: { login: 'org' },
+          }),
+          stderr: '',
+        };
+      };
+
+      const { forgeRead } = composeEvidence({
+        roleExecutors: {
+          worktree: {} as never,
+          orchestrator: {} as never,
+          verifier: {} as never,
+        },
+        forgeMode: 'github',
+        installationModel: {
+          forge: { mode: 'github', owner: 'fleet', repo: 'fleet-v2' },
+        } as never,
+        coordination: {} as never,
+        runGhSubprocess: dummyRunGhSubprocess,
+      });
+
+      const { forgeAction } = composeExecutionHosts({
+        options: {
+          env: {
+            FLEET_GH_CONFIG_MERGE: '/state/gh/merger-identity',
+            FLEET_GH_CONFIG_PREMERGE: '/state/gh/premerge-identity',
+            GH_TOKEN: 'ambient-token-secret',
+            GITHUB_TOKEN: 'ambient-github-token',
+            GH_ENTERPRISE_TOKEN: 'ambient-ent-token',
+            GITHUB_ENTERPRISE_TOKEN: 'ambient-ent-gh-token',
+          },
+        },
+        roleExecutors: {
+          worktree: {} as never,
+          orchestrator: {} as never,
+          verifier: {} as never,
+        },
+        reviewLocatorRef: { locator: undefined },
+        runnerProfile: undefined as never,
+        executorForHostName: () => ({ ok: false, reason: 'none' }),
+        runGhSubprocess: dummyRunGhSubprocess,
+        ghBinaryCandidates: ['/usr/bin/gh'],
+        forgeRead,
+        forgeGithubSection: { mode: 'github', owner: 'fleet', repo: 'fleet-v2' },
+        forgeActionOverrides: () => ({}),
+        readGitHeadOverSsh: async () => makeHeadH(),
+        readGitHeadLocally: async () => makeHeadH(),
+        readGitHead: async () => makeHeadH(),
+        headRouteForExecutor: () => ({ route: 'local' }),
+        runGitCommand: async () => '',
+      });
+
+      // 1. merge-pr read path: runs gh pr view using merger identity
+      const mergeResult = await forgeAction.performMergeForgeAction({
+        kind: 'merge-pr',
+        actionId: 'act-merge-read-test',
+        repository: { owner: 'fleet', repo: 'fleet-v2' },
+        pullRequestNumber: 101,
+        branchName: 'feature-branch',
+        expectedHeadSha: makeHeadH(),
+        deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+      });
+      expect(mergeResult.outcome).toBe('executed');
+
+      const mergePrViewCall = calls.find(
+        (c) => c.args[0] === 'pr' && c.args[1] === 'view' && c.args[2] === '101',
+      );
+      expect(mergePrViewCall).toBeDefined();
+      expect(mergePrViewCall?.env?.GH_CONFIG_DIR).toBe('/state/gh/merger-identity');
+      expect(mergePrViewCall?.env?.GH_TOKEN).toBeUndefined();
+      expect(mergePrViewCall?.env?.GITHUB_TOKEN).toBeUndefined();
+      expect(mergePrViewCall?.env?.GH_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(mergePrViewCall?.env?.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+
+      // 2. post-status read path: runs gh pr view using premerge identity
+      calls.length = 0;
+      const statusResult = await forgeAction.performMergeForgeAction({
+        kind: 'post-status',
+        actionId: 'act-status-read-test',
+        repository: { owner: 'fleet', repo: 'fleet-v2' },
+        pullRequestNumber: 101,
+        branchName: 'feature-branch',
+        expectedHeadSha: makeHeadH(),
+        deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+        status: {
+          context: 'premerge',
+          state: 'success',
+          description: 'pre-merge receipt recorded',
+        },
+      });
+      expect(statusResult.outcome).toBe('executed');
+
+      const statusPrViewCall = calls.find(
+        (c) => c.args[0] === 'pr' && c.args[1] === 'view' && c.args[2] === '101',
+      );
+      expect(statusPrViewCall).toBeDefined();
+      expect(statusPrViewCall?.env?.GH_CONFIG_DIR).toBe('/state/gh/premerge-identity');
+      expect(statusPrViewCall?.env?.GH_TOKEN).toBeUndefined();
+      expect(statusPrViewCall?.env?.GITHUB_TOKEN).toBeUndefined();
+
+      // 3. Shared forgeRead: unchanged for other callers (no GH_CONFIG_DIR, env undefined)
+      calls.length = 0;
+      await forgeRead.readPullRequest({
+        ref: { kind: 'number', number: 101 },
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].env).toBeUndefined();
+    });
+  });
+
+  describe('DT6a fix round 3 finding 2: refuse non-positive or non-integer pullRequestNumber before any call', () => {
+    it.each([0, -1, 1.5, NaN])(
+      'refuses merge action when pullRequestNumber is %s before any gh call',
+      async (invalidPrNumber) => {
+        let ghCalled = false;
+        const dummyRunGh = async () => {
+          ghCalled = true;
+          return { exitCode: 0, stdout: '', stderr: '' };
+        };
+
+        const adapter = new ForgeActionAdapter(
+          { runGh: dummyRunGh },
+          undefined,
+          {
+            mergeGhConfigDir: '/state/gh/merge',
+            premergeGhConfigDir: '/state/gh/premerge',
+          },
+        );
+
+        const result = await adapter.performMergeForgeAction({
+          kind: 'merge-pr',
+          actionId: 'act-invalid-pr-number',
+          repository: { owner: 'fleet', repo: 'fleet-v2' },
+          pullRequestNumber: invalidPrNumber,
+          branchName: 'feature/dt6a-fix',
+          expectedHeadSha: makeHeadH(),
+          deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+        });
+
+        expect(result.outcome).toBe('refused');
+        if (result.outcome === 'refused') {
+          expect(result.reason).toContain(`Invalid pull request number: ${invalidPrNumber}`);
+          expect(result.refusalKind).toBe('other');
+        }
+        expect(ghCalled).toBe(false);
+      },
+    );
   });
 });

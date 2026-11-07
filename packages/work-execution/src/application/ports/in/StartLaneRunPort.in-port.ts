@@ -11,6 +11,7 @@
 
 import type { LaneRunTier } from '../../../domain/lane-run-records.js';
 import type { PrepareBriefPackageRequest } from './PrepareBriefPackagePort.in-port.js';
+import type { LaneRunAdmissionBlockers } from '../out/LaneRunAdmissionPort.out-port.js';
 
 export interface StartLaneRunRequest {
   /** 'run-' + ULID; the same id on a retry. */
@@ -37,9 +38,15 @@ export type StartLaneRunResult =
       readonly hostName: string;
       readonly worktreePath: string;
     }
-  /** Nothing was written: no reservation is held. */
+  /**
+   * Nothing was written: no reservation is held. This call itself acquired
+   * no reservation, though a reservation held by an earlier incomplete start
+   * may remain held and `abandonStart` releases it. The conductor's halt
+   * marker reads halted or unreadable; checked before any write, so nothing
+   * was written.
+   */
   | { readonly outcome: 'refused'; readonly reason: StartLaneRunRefusal }
-  | { readonly outcome: 'no-capacity' }
+  | { readonly outcome: 'no-capacity'; readonly blockedBy?: LaneRunAdmissionBlockers }
   /**
    * A step after the reserve did not finish: the reservation stays held;
    * retry with the same ids, or abandon.
@@ -66,7 +73,8 @@ export type StartLaneRunRefusal =
   | 'no-host'
   | 'no-review-route'
   | 'reserve-refused'
-  | 'base-branch-missing';
+  | 'base-branch-missing'
+  | 'halted';
 
 export interface AbandonStartRequest {
   readonly runId: string;

@@ -4,8 +4,8 @@
  * implementer's and bind its result to the reviewed head.
  */
 
-import type { ReviewKind, ReviewReceiptRecord } from '../../../domain/evidence-records.js';
-import type { ReviewUnavailableCode } from '../out/IndependentReviewPort.out-port.js';
+import type { ReceiptSubject, ReviewKind, ReviewReceiptRecord } from '../../../domain/evidence-records.js';
+import type { ReviewTransportDiagnostic, ReviewUnavailableCode } from '../out/IndependentReviewPort.out-port.js';
 
 export interface RequestIndependentReviewRequest {
   readonly assessmentId: string;
@@ -23,6 +23,11 @@ export interface RequestIndependentReviewRequest {
   readonly requestId?: string;
   /** The frozen brief; only meaningful with `kind` (a brief-check review answers against it). */
   readonly briefText?: string;
+  /**
+   * What the review is about. Absent reads as the attempt (`attemptId` at
+   * `candidateHeadSha`); a `chain` subject is a combined pre-merge review.
+   */
+  readonly subject?: ReceiptSubject;
 }
 
 export const REVIEW_REJECTIONS = [
@@ -44,6 +49,8 @@ export type RequestIndependentReviewResult =
       readonly code?: ReviewUnavailableCode | 'not-read-only' | 'invalid-receipt';
       /** Set exactly when the request carried a requestId. */
       readonly rejection?: ReviewRejection;
+      /** The bounded transport diagnostic (RV4); set exactly when the request carried a requestId. */
+      readonly diagnostic?: ReviewTransportDiagnostic;
     };
 
 export interface RequestIndependentReviewPort {

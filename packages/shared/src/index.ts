@@ -48,7 +48,23 @@ export type { DecisionCallReceipt } from './decisions/receipt.js';
 export { budgetAllows } from './decisions/budget.js';
 export type { BudgetInput, BudgetDecision } from './decisions/budget.js';
 
+export { postJevDecision } from './decisions/client.js';
+export type {
+  JevDecisionClientRequest,
+  JevDecisionClientResult,
+  JevDecisionReceipt,
+} from './decisions/client.js';
+
 export { isValidHostName } from './host-name.js';
 
 export { SEAT_BILLINGS, billingOf } from './billing.js';
 export type { SeatBilling } from './billing.js';
+
+export { readPlainRecord } from './plain-record.js';
+export type {
+  PlainFieldSchema,
+  PlainRecordSchema,
+  PlainRecordFailureReason,
+  PlainRecordRead,
+} from './plain-record.js';
+export { MAX_SCHEMA_FIELDS, MAX_DEPTH } from './plain-record.js';

@@ -27,6 +27,8 @@ import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJ
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import type { DispatchAttemptRequest, DispatchAttemptResult } from '../../ports/in/DispatchAttemptPort.in-port.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -137,21 +139,35 @@ interface Harness {
   readonly verifyCalls: Record<string, unknown>[];
   readonly admissionCalls: unknown[];
   readonly reconcileCalls: unknown[];
+  readonly dispatchRequests: DispatchAttemptRequest[];
   readonly deps: AdvanceLaneRunDependencies;
   setManifestVerdict(verdict: ManifestVerdict | 'throw'): void;
+  /** Serve a verified frozen brief (prose + manifest) to the frozen-manifest reads. */
+  setFrozenBrief(prose: string, manifestJson: string): void;
+  /** Make the dispatch port refuse, storing the attempt cancelled with `stopReason`. */
+  setDispatchRefusal(stopReason: string, reason: string): void;
+  setSameFamily(fn: (left: string, right: string) => boolean): void;
+  /** Name the attempts that hold an active capacity reservation (the admission fact). */
+  setReservedAttemptIds(ids: readonly string[]): void;
 }
 
 async function makeHarness(
   record: LaneRunRecord,
   attempt: AttemptRecord | null,
-): Promise<Harness> {
-  const runRepo = new LaneRunRepositoryAdapter();
+  options: { readonly sameFamily?: boolean } = {},
+): Promise<Harness> {  const runRepo = new LaneRunRepositoryAdapter();
   const runJournal = new LaneRunJournalAdapter();
   const attemptRepo = new AttemptRepositoryAdapter();
   const verifyCalls: Record<string, unknown>[] = [];
   const admissionCalls: unknown[] = [];
   const reconcileCalls: unknown[] = [];
+  const dispatchRequests: DispatchAttemptRequest[] = [];
   let manifestVerdict: ManifestVerdict | 'throw' = { outcome: 'missing' };
+  let frozenProse: string | null = null;
+  let frozenManifestJson: string | null = null;
+  let dispatchRefusal: { readonly stopReason: string; readonly reason: string } | null = null;
+  let sameFamilyImpl: (left: string, right: string) => boolean = (left, right) => left === right;
+  let reservedAttemptIds: readonly string[] = [];
   const created = await runRepo.create(record);
   expect(created.outcome).toBe('saved');
   const leased = await runRepo.acquireLease(record.runId, {
@@ -169,11 +185,32 @@ async function makeHarness(
     runJournal,
     attemptRepo,
     executionJournal: {
-      listActiveReservations: async () => [],
+      listActiveReservations: async () =>
+        reservedAttemptIds.map((attemptId) => ({
+          id: 'res-' + attemptId,
+          attemptId,
+          hostId: 'lane-host-example',
+          slotIndex: 0,
+          held: true,
+          seatTool: 'opencode' as const,
+          reservedAtIso: NOW,
+          releasedAtIso: null,
+        })),
       listJournalEntriesForAttempt: async () => [],
     },
     artifactPort: {
-      readBriefManifest: undefined,
+      readBriefFile: async () => {
+        if (frozenProse === null) {
+          throw new Error('no frozen brief prose served');
+        }
+        return frozenProse;
+      },
+      readBriefManifest: async () => {
+        if (frozenManifestJson === null) {
+          throw new Error('no frozen brief manifest served');
+        }
+        return frozenManifestJson;
+      },
       verifyArtifactManifest: async (request) => {
         verifyCalls.push({ ...request });
         if (manifestVerdict === 'throw') {
@@ -194,6 +231,35 @@ async function makeHarness(
         return { outcome: 'admitted' };
       },
     },
+    sameModelFamily: options.sameFamily === true
+      ? (left, right) => sameFamilyImpl(left, right)
+      : undefined,
+    dispatchAttempt: {
+      dispatchAttempt: async (request) => {
+        dispatchRequests.push(request);
+        if (dispatchRefusal === null) {
+          return {
+            outcome: 'started',
+            attempt: attemptFixture({ id: request.attemptId }),
+            sessionId: 'session-example-1',
+          } as DispatchAttemptResult;
+        }
+        // The runner-refusal pipeline stores the attempt cancelled with its
+        // stop reason before the conductor sees the refusal.
+        const existing = await attemptRepo.findAttemptById(request.attemptId);
+        if (existing !== null) {
+          await attemptRepo.saveAttempt({
+            ...existing,
+            state: 'cancelled',
+            outcome: 'stopped',
+            stopReason: dispatchRefusal.stopReason as AttemptRecord['stopReason'],
+            revision: (existing.revision ?? 0) + 1,
+            updatedAtIso: LATER,
+          });
+        }
+        return { outcome: 'refused', reason: dispatchRefusal.reason };
+      },
+    },
     newUlid: makeUlidMinter(),
   };
   return {
@@ -203,9 +269,23 @@ async function makeHarness(
     verifyCalls,
     admissionCalls,
     reconcileCalls,
+    dispatchRequests,
     deps,
     setManifestVerdict: (verdict) => {
       manifestVerdict = verdict;
+    },
+    setFrozenBrief: (prose, manifestJson) => {
+      frozenProse = prose;
+      frozenManifestJson = manifestJson;
+    },
+    setDispatchRefusal: (stopReason, reason) => {
+      dispatchRefusal = { stopReason, reason };
+    },
+    setSameFamily: (fn) => {
+      sameFamilyImpl = fn;
+    },
+    setReservedAttemptIds: (ids) => {
+      reservedAttemptIds = ids;
     },
   };
 }
@@ -335,6 +415,7 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
       qualifier: null,
       parkedFrom: 'collecting',
       questionId: null,
+      class: 'other',
     });
     expect(after?.parkCount).toBe(1);
     expect(after?.revision).toBe(2);
@@ -483,5 +564,135 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     expect(await harness.runJournal.listForRun(RUN_ID)).toHaveLength(1);
     const after = await harness.runRepo.get(RUN_ID);
     expect(after?.revision).toBe(1);
+  });
+
+  /** G11a: the frozen brief serving a verified manifest with the limits dispatch needs. */
+  const G11A_PROSE = '# Task\n\nFail on the first-pass seat.\n';
+  const G11A_MANIFEST = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+
+  function g11aAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
+    return attemptFixture({
+      briefDigest: simpleDeterministicHexDigest(G11A_PROSE + '\n' + G11A_MANIFEST),
+      ...overrides,
+    });
+  }
+
+  /** The run's journalled advance tokens (`next-seat-…` details), in journal order. */
+  async function g11aAdvanceTokens(harness: Harness): Promise<string[]> {
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    return entries
+      .filter((entry) => entry.kind === 'result' && entry.detail?.startsWith('next-seat-'))
+      .map((entry) => entry.detail as string);
+  }
+
+  it('G11a test 11: a refused dispatch records exactly one final result whose detail names the next seat', async () => {
+    const harness = await makeHarness(runRecord(), g11aAttempt(), { sameFamily: true });
+    harness.setFrozenBrief(G11A_PROSE, G11A_MANIFEST);
+    harness.setDispatchRefusal('rate-limited', 'HTTP 429 Too Many Requests');
+    harness.setReservedAttemptIds(['attempt-example-1']);
+    await conduct(harness, 'seat-failed', NOW);
+    const result = await advance(harness);
+    expect(result).toMatchObject({
+      outcome: 'acted',
+      step: 'dispatch',
+      result: 'refused',
+      reasonCode: 'runner-refused',
+    });
+    // One move per failure, journalled: the spent dispatch key carries the
+    // advance token; no second result can ever be appended to it.
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-rate-limited-1']);
+  });
+
+  it('G11a test 12: the recorded advance, not a re-derivation, picks the next prepare seat', async () => {
+    const harness = await makeHarness(runRecord(), g11aAttempt(), { sameFamily: true });
+    harness.setFrozenBrief(G11A_PROSE, G11A_MANIFEST);
+    harness.setDispatchRefusal('rate-limited', 'HTTP 429 Too Many Requests');
+    harness.setReservedAttemptIds(['attempt-example-1']);
+    await conduct(harness, 'seat-failed', NOW);
+    await advance(harness);
+    // Second advance: the cancelled attempt enters seat-failed; third advance:
+    // seat-failed prepares at the RECORDED seat (the decider never re-picks).
+    await advance(harness);
+    const prepared = await advance(harness);
+    expect(prepared).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared' });
+    const attempts = await Promise.all(
+      (await harness.runRepo.get(RUN_ID))?.attemptIds.map((id) => harness.attemptRepo.findAttemptById(id)) ?? [],
+    );
+    const latest = attempts[attempts.length - 1];
+    expect(latest?.seatSelection?.seatIndex).toBe(1);
+    expect(latest?.seatSelection?.role).toBe('first-pass');
+    // Replay of the failure records no second move.
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-rate-limited-1']);
+  });
+
+  it('G11a test 13: an exhausted plan records next-seat-none and parks seat-plan-exhausted', async () => {
+    const single = {
+      version: 1 as const,
+      'first-pass': [{ id: 'fp-1', model: 'model-example-1', tool: 'opencode' }],
+      fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
+      review: [],
+    };
+    const attempt = g11aAttempt({ seatPlan: single });
+    const harness = await makeHarness(runRecord(), attempt, { sameFamily: true });
+    harness.setFrozenBrief(G11A_PROSE, G11A_MANIFEST);
+    harness.setDispatchRefusal('rate-limited', 'HTTP 429 Too Many Requests');
+    harness.setReservedAttemptIds(['attempt-example-1']);
+    await conduct(harness, 'seat-failed', NOW);
+    await advance(harness);
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-rate-limited-none']);
+    // The exhausted round parks; no independent re-selection happens.
+    await advance(harness);
+    const parked = await advance(harness);
+    expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
+  });
+
+  it('G11a test 14: an unbound family comparator fails closed and records no next seat', async () => {
+    const harness = await makeHarness(runRecord(), g11aAttempt());
+    harness.setFrozenBrief(G11A_PROSE, G11A_MANIFEST);
+    harness.setDispatchRefusal('rate-limited', 'HTTP 429 Too Many Requests');
+    harness.setReservedAttemptIds(['attempt-example-1']);
+    // No family comparator is wired: the failure still records its outcome,
+    // but with no next seat — the history fallback must never derive one.
+    await conduct(harness, 'seat-failed', NOW);
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', result: 'refused', reasonCode: 'runner-refused' });
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-rate-limited-none']);
+    // Fail closed: the exhausted advance parks the run; no independent
+    // re-selection happens.
+    await advance(harness);
+    const parked = await advance(harness);
+    expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
+  });
+
+  it('G11a test 15: an unmapped stop reason records next-seat-none and fails closed', async () => {
+    const harness = await makeHarness(runRecord(), g11aAttempt(), { sameFamily: true });
+    harness.setFrozenBrief(G11A_PROSE, G11A_MANIFEST);
+    harness.setDispatchRefusal('unknown', 'Unknown runner refusal');
+    harness.setReservedAttemptIds(['attempt-example-1']);
+    await conduct(harness, 'seat-failed', NOW);
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', result: 'refused', reasonCode: 'runner-refused' });
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-none']);
+    await advance(harness);
+    const parked = await advance(harness);
+    expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
+  });
+
+  it('G11a test 16: an unbound family comparator fails closed when recorded advance is absent and reviewer seats exist', async () => {
+    const withReview = {
+      ...SEAT_PLAN,
+      review: [{ id: 'rev-1', model: 'model-reviewer-1', tool: 'opencode' }],
+    };
+    const harness = await makeHarness(runRecord(), g11aAttempt({ state: 'cancelled', seatPlan: withReview }));
+    await conduct(harness, 'seat-failed', NOW);
+    const parked = await advance(harness);
+    expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
+  });
+
+  it('G11a test 17: a cancelled attempt with no reviewer seats moves to the next seat without a family comparator', async () => {
+    const harness = await makeHarness(runRecord(), g11aAttempt({ state: 'cancelled' }));
+    await conduct(harness, 'seat-failed', NOW);
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared' });
   });
 });

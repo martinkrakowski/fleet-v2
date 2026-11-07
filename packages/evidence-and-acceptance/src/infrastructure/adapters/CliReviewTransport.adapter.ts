@@ -27,6 +27,7 @@ import {
   parseReviewReplyStrict,
   REVIEW_CHECKLIST,
   REVIEW_REPLY_CONTRACT,
+  ReviewTransportError,
 } from './OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from './ReviewTransportRouter.js';
 import { runSpawnOutcome } from './spawn-run.js';
@@ -396,11 +397,16 @@ export function createCliReviewTransport(
       const leftovers = await readdir(cwd);
       const scratchUntouched = leftovers.length === 0;
 
-      // 7. Non-zero exit is a failed review
+      // 7. Non-zero exit is a failed review; a timeout-shaped failure is a
+      // `timeout`, anything else a `transport` failure.
       if (outcome.exitCode !== 0) {
         const code = String(outcome.exitCode);
         const detail = outcome.stderr || outcome.error || '';
-        throw new Error(`reviewer CLI failed with exit code ${code}: ${detail}`);
+        const timedOut = outcome.error !== undefined && /timed?\s*out|timeout/i.test(outcome.error);
+        throw new ReviewTransportError(
+          `reviewer CLI failed with exit code ${code}: ${detail}`,
+          timedOut ? 'timeout' : 'transport',
+        );
       }
 
       // 8. An empty or one-line answer is a failed review, never a pass.
@@ -416,7 +422,7 @@ export function createCliReviewTransport(
       // A clean review with no findings is exactly one line, the verdict
       // (KF-14d: grok answers a bare `VERDICT: PASS`); only a one-line answer
       // that is not a verdict is the failed review the guard exists for.
-      if (nonBlankLines.length < 2 && !/^VERDICT: (PASS|FAIL)$/.test(nonBlankLines[0].trim())) {
+      if (nonBlankLines.length < 2 && !/^VERDICT: (PASS|FAIL|FIX FIRST)$/.test(nonBlankLines[0].trim())) {
         throw new Error('reviewer CLI returned a one-line response');
       }
 
@@ -447,6 +453,7 @@ export function createCliReviewTransport(
         result: parsed.result,
         findings: parsed.findings,
         completedAtIso: new Date().toISOString(),
+        ...(parsed.unknownReason !== undefined ? { unknownReason: parsed.unknownReason } : {}),
       };
     } finally {
       await rm(scratch, { recursive: true, force: true });

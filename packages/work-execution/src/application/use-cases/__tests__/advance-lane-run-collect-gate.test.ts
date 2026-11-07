@@ -53,6 +53,15 @@ import type {
   RecordGateReceiptsResult,
 } from '../../ports/out/GateReceiptPort.out-port.js';
 import type { GatePredicatePort, EvaluateGatePredicatesResult } from '../../ports/out/GatePredicatePort.out-port.js';
+import type { ReviewRequest, ReviewRequestResult } from '../../ports/out/ReviewRequestPort.out-port.js';
+import type {
+  DispatchAttemptRequest,
+  DispatchAttemptResult,
+} from '../../ports/in/DispatchAttemptPort.in-port.js';
+import type {
+  CancelPreparedAttemptRequest,
+  CancelPreparedAttemptResult,
+} from '../../ports/in/CancelPreparedAttemptPort.in-port.js';
 import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
 import { RequestAttemptAcceptanceUseCase } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
@@ -103,6 +112,12 @@ const SEAT_PLAN = {
   ],
   fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
   review: [],
+};
+
+/** A seat plan with one review seat, so a brief-check can start beside the gate. */
+const SEAT_PLAN_WITH_REVIEW = {
+  ...SEAT_PLAN,
+  review: [{ id: 'rv-1', model: 'reviewer-example-1', tool: 'opencode' }],
 };
 
 const SEAT_SELECTION = {
@@ -227,7 +242,7 @@ function makeUlidMinter(): () => string {
 
 function stepKey(parts: {
   readonly round: number;
-  readonly step: 'dispatch' | 'stop' | 'collect' | 'gate' | 'prepare';
+  readonly step: 'dispatch' | 'stop' | 'collect' | 'gate' | 'prepare' | 'brief-check' | 'code-review';
   readonly seatIndex: number;
   readonly attemptOrdinal: number | null;
   readonly head12: string | null;
@@ -274,11 +289,35 @@ function retryStopKey(retry: number): string {
 }
 
 function collectKey(): string {
-  return stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: null, head12: null });
+  return stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null });
 }
 
 function gateKey(): string {
   return stepKey({ round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
+}
+
+/** The brief-check key the in-flight start builds: the same shape the brief-check state uses. */
+function briefCheckKey(): string {
+  return stepKey({ round: 0, step: 'brief-check', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
+}
+
+/** The code-review key the in-flight start builds: the same shape the code-review state uses. */
+function codeReviewKey(): string {
+  return stepKey({ round: 0, step: 'code-review', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
+}
+
+/** Reserve capacity for one prepared attempt, like the conductor's admission. */
+async function admit(harness: Harness, attemptId: string): Promise<void> {
+  await harness.executionJournal.saveCapacityReservation({
+    id: harness.deps.newUlid(),
+    attemptId,
+    hostId: 'host-example-1',
+    slotIndex: 0,
+    held: true,
+    seatTool: 'opencode',
+    reservedAtIso: NOW,
+    releasedAtIso: null,
+  });
 }
 
 function activeAnswer(attempt: AttemptRecord): ReconcileAttemptResult {
@@ -307,6 +346,7 @@ interface Harness {
   readonly callOrder: string[];
   readonly deps: AdvanceLaneRunDependencies;
   readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
+  readonly reviewRequests: readonly ReviewRequest[];
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
   /** The harness's work-order store (KF-36a-2); seeded with a copy of the fixture. */
   readonly workOrders: Map<string, WorkOrderRecord>;
@@ -331,6 +371,8 @@ interface HarnessOptions {
   readonly wireGate?: boolean;
   readonly wireReviewAssessment?: boolean;
   readonly wireGateReceipts?: boolean;
+  /** Wire the KS6 brief-check fake: it records the request and answers a passed receipt. */
+  readonly wireReviewRequest?: boolean;
   /** Wire the KF-36a `workOrderRelease` fake over the harness's work-order map. */
   readonly wireWorkOrderRelease?: boolean;
 }
@@ -350,6 +392,7 @@ async function makeHarness(
   const gateRequests: EvaluateAttemptGateRequest[] = [];
   const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
+  const reviewRequests: ReviewRequest[] = [];
   const callOrder: string[] = [];
   // KF-36a-2: a per-harness work-order store, seeded with a copy of the fixture
   // (never the fixture itself — the release fake writes only into this map).
@@ -499,6 +542,30 @@ async function makeHarness(
           },
         }
       : {}),
+    ...(options.wireReviewRequest === true
+      ? {
+          sameModelFamily: (left: string, right: string) => left === right,
+          reviewRequest: {
+            requestReview: async (request: ReviewRequest): Promise<ReviewRequestResult> => {
+              reviewRequests.push(request);
+              return {
+                outcome: 'receipt',
+                receipt: {
+                  receiptId: 'rcpt-' + request.requestId,
+                  requestId: request.requestId,
+                  kind: request.kind,
+                  reviewerModel: request.reviewerModel,
+                  candidateHeadSha: request.candidateHeadSha,
+                  verdict: 'passed',
+                  findings: [],
+                },
+              };
+            },
+            findReviewReceipt: async () => ({ outcome: 'not-found' }) as const,
+            findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }) as const,
+          },
+        }
+      : {}),
     ...(options.wireGateReceipts === true
       ? {
           gateReceipts: {
@@ -520,6 +587,7 @@ async function makeHarness(
     commitRequests,
     gateRequests,
     reviewOpenRequests,
+    reviewRequests,
     gateReceiptRequests,
     workOrders,
     callOrder,
@@ -756,6 +824,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       qualifier: null,
       parkedFrom: 'running',
       questionId: null,
+      class: 'other',
     });
     expect(afterRunning?.parkCount).toBe(1);
 
@@ -781,6 +850,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       qualifier: 'attempt-terminal',
       parkedFrom: 'running',
       questionId: null,
+      class: 'other',
     });
   });
 
@@ -2023,5 +2093,236 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
       state: 'stopped',
       revision: 2,
     });
+  });
+
+  it('test 18 (F87): a refused pivot dispatch hands the dirty worktree over and the re-prepared a3 collects under its ordinal key', async () => {
+    // a1's journal, as an old (pre-F87) journal has it: its collect sits under
+    // the legacy ordinal-less key r0/collect/0. Seat 0 fails, the next seat is
+    // prepared as a2, and a2's dispatch is refused with a dirty worktree — the
+    // GB3c round-0 handover cancels a2 and re-prepares seat 0 as a3 in the
+    // same round. Before the fix a3's collect reused r0/collect/0 and the
+    // journal refused it duplicate-key forever.
+    const WORKTREE_REFUSAL = 'Worktree ' + WORKTREE + ' has uncommitted changes: src/ex.ts';
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1'] }),
+      [endedAttempt()],
+    );
+    const dispatch1 = stepKey({ round: 0, step: 'dispatch', seatIndex: 0, attemptOrdinal: 1, head12: null });
+    await appendIntent(harness, dispatch1, 'attempt-example-1', NOW);
+    await appendResult(harness, dispatch1, 'completed', 'dispatch-started', NOW);
+    const legacyCollect = `${RUN_ID}/r0/collect/0`;
+    await appendIntent(harness, legacyCollect, 'attempt-example-1', NOW);
+    await appendResult(harness, legacyCollect, 'completed', 'collected', NOW);
+    await conduct(harness, 'seat-failed', NOW);
+
+    // Wire the pivot dispatch path the collect-gate harness leaves unwired:
+    // the first dispatch refuses with a dirty worktree, later ones start.
+    const dispatchRequests: DispatchAttemptRequest[] = [];
+    let refuseDispatch = true;
+    Object.assign(harness.deps, {
+      dispatchAttempt: {
+        dispatchAttempt: async (request: DispatchAttemptRequest): Promise<DispatchAttemptResult> => {
+          dispatchRequests.push(request);
+          if (refuseDispatch) {
+            return { outcome: 'refused', reason: WORKTREE_REFUSAL };
+          }
+          const attempt = await harness.attemptRepo.findAttemptById(request.attemptId);
+          return {
+            outcome: 'started',
+            attempt: attempt ?? attemptFixture({ id: request.attemptId }),
+            sessionId: 'session-' + request.attemptId,
+          };
+        },
+      },
+      cancelPreparedAttempt: {
+        cancelPreparedAttempt: async (request: CancelPreparedAttemptRequest): Promise<CancelPreparedAttemptResult> => {
+          const existing = await harness.attemptRepo.findAttemptById(request.attemptId);
+          if (existing === null || existing.state !== 'intent-recorded') {
+            return { outcome: 'refused', reason: 'not-prepared' };
+          }
+          const cancelled: AttemptRecord = {
+            ...existing,
+            revision: (existing.revision ?? 0) + 1,
+            state: 'cancelled',
+            outcome: 'stopped',
+            updatedAtIso: request.nowIso,
+          };
+          await harness.attemptRepo.saveAttempt(cancelled);
+          await harness.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
+          return { outcome: 'cancelled', attempt: cancelled, capacity: 'released' };
+        },
+      },
+    });
+
+    // Advance 1: seat 0 failed, so the decider prepares the next first-pass
+    // seat as a2 (r0/prepare/1/a2).
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: `${RUN_ID}/r0/prepare/1/a2`,
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    const attempt2 = (await harness.runRepo.get(RUN_ID))?.attemptIds[1] ?? null;
+    expect(typeof attempt2).toBe('string');
+    await admit(harness, attempt2 as string);
+    // Advance 2: a2's dispatch is refused with a dirty worktree; the round-0
+    // pivot handover cancels a2 and hands the worktree over unchanged.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key: `${RUN_ID}/r0/dispatch/1/a2`,
+      result: 'refused',
+      reasonCode: 'dispatch-refused',
+    });
+    expect((await harness.attemptRepo.findAttemptById(attempt2 as string))?.state).toBe('cancelled');
+    expect(dispatchRequests[0]?.allowUncommittedHandover).toBeUndefined();
+    refuseDispatch = false;
+
+    // Advance 3: the handover re-prepares seat 0 in the same round as a3.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: `${RUN_ID}/r0/prepare/0/a3`,
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    const attempt3 = (await harness.runRepo.get(RUN_ID))?.attemptIds[2] ?? null;
+    expect(typeof attempt3).toBe('string');
+    await admit(harness, attempt3 as string);
+    // Advance 4: a3 dispatches on the handed-over worktree.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key: `${RUN_ID}/r0/dispatch/0/a3`,
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    expect(dispatchRequests[1]?.allowUncommittedHandover).toBe(true);
+    const stored3 = await harness.attemptRepo.findAttemptById(attempt3 as string);
+    expect(stored3).not.toBeNull();
+    await harness.attemptRepo.saveAttempt({
+      ...stored3!,
+      revision: (stored3!.revision ?? 0) + 1,
+      state: 'ended',
+      sessionId: 'session-example-3',
+      completionReceipt: receipt({ attemptId: attempt3 as string, sessionId: 'session-example-3' }),
+    });
+    await conduct(harness, 'collecting', LATER);
+
+    // a3's collect must carry its ordinal: journalled under r0/collect/0/a3,
+    // never the legacy key.
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'collect',
+      key: `${RUN_ID}/r0/collect/0/a3`,
+      result: 'completed',
+      reasonCode: 'collected',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries).toContainEqual(
+      expect.objectContaining({ kind: 'intent', key: `${RUN_ID}/r0/collect/0/a3` }),
+    );
+    expect(entries).toContainEqual(
+      expect.objectContaining({ kind: 'intent', key: legacyCollect }),
+    );
+  });
+
+  it('test 19 (F87): a refused collect intent carries the journal refusal and its detail', async () => {
+    const ended = endedAttempt();
+    const harness = await makeHarness(runRecord(), [ended]);
+    await conduct(harness, 'collecting', NOW);
+    // The collect key is already spent (an intent with a final result), so it is
+    // not a pending intent: the decider still acts, and the collect's own intent
+    // append is refused duplicate-key.
+    await appendIntent(harness, collectKey(), 'attempt-example-1', NOW);
+    await appendResult(harness, collectKey(), 'completed', 'collected', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'journal-refused',
+      journalRefusal: 'duplicate-key',
+      detail: null,
+    });
+  });
+
+  it('test 20 (KS6): the gate act starts only the brief-check review beside the gate; code-review is not started', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
+    const harness = await makeHarness(runRecord(), [collected], { wireReviewRequest: true, wireReviewAssessment: true });
+    await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['command 1'] }));
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    // Only the brief-check went out beside the gate, on the sealed diff (the collected head).
+    expect(harness.reviewRequests).toEqual([
+      expect.objectContaining({ kind: 'brief-check', candidateHeadSha: COMMIT }),
+    ]);
+    // The journal holds the gate intent, then the brief-check intent and
+    // result, then the gate's result; no code-review entry exists.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const gateIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === gateKey());
+    const briefIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === briefCheckKey());
+    const briefResultIndex = entries.findIndex((entry) => entry.kind === 'result' && entry.key === briefCheckKey());
+    const codeIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === codeReviewKey());
+    const codeResultIndex = entries.findIndex((entry) => entry.kind === 'result' && entry.key === codeReviewKey());
+    const gateResultIndex = entries.findIndex((entry) => entry.kind === 'result' && entry.key === gateKey());
+    expect(gateIntentIndex).toBeGreaterThanOrEqual(0);
+    expect(briefIntentIndex).toBeGreaterThan(gateIntentIndex);
+    expect(briefResultIndex).toBeGreaterThan(briefIntentIndex);
+    expect(codeIntentIndex).toBe(-1);
+    expect(codeResultIndex).toBe(-1);
+    expect(gateResultIndex).toBeGreaterThan(briefResultIndex);
+    expect(entries[briefIntentIndex]).toMatchObject({ kind: 'intent', mintedId: expect.stringMatching(/^review-/) });
+    expect(entries[briefResultIndex]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'review-passed' });
+    expect(entries[gateResultIndex]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'gate-passed' });
+  });
+
+  it('test 21 (KS6): the brief-check state reads the recorded receipt; the code-review state still requests its own review', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
+    const harness = await makeHarness(runRecord(), [collected], { wireReviewRequest: true, wireReviewAssessment: true });
+    await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['command 1'] }));
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'gate', reasonCode: 'gate-passed' });
+    // The gate's verdict is consumed only after the review's receipt is recorded: the next advance enters brief-check.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+    // The recorded receipt is read: the brief-check state requests no second review.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
+    expect(harness.reviewRequests).toHaveLength(1);
+    // The code-review was not in flight: its own state requests it.
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'code-review' });
+    expect(harness.reviewRequests).toHaveLength(2);
+    expect(harness.reviewRequests[1]).toMatchObject({ kind: 'code-review' });
+  });
+
+  it('test 22 (KS6): without the review wiring the gate act behaves exactly as before', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
+    const harness = await makeHarness(runRecord(), [collected], { wireReviewAssessment: true });
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    expect(harness.gateRequests).toEqual([{ attemptId: 'attempt-example-1', candidateHeadSha: COMMIT }]);
+    expect(harness.reviewRequests).toHaveLength(0);
+    // No brief-check intent or result was appended: the review never started.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind !== 'conduct' && entry.key === briefCheckKey())).toBe(false);
   });
 });

@@ -15,6 +15,7 @@ import type { LanesData } from "./live";
 import type { QuestionSummary } from "../questions/summary";
 import { STATE_ORDER, kpiScopeNote, summary, woOf } from "./derive";
 import { NOT_CONFIGURED_REASON, useAutoRefresh } from "./use-auto-refresh";
+import { useChangeSignals } from "./use-change-signals";
 import { LanesKpiRow } from "./components/lanes-kpi-row";
 import { LanesToolbar } from "./components/lanes-toolbar";
 import { LaneRow } from "./components/lane-row";
@@ -30,6 +31,7 @@ export function LanesClient({
   questions: QuestionSummary;
 }) {
   useAutoRefresh(data.source, data.fallbackReason);
+  useChangeSignals();
   const [showEnded, setShowEnded] = useState(true);
   const [stateFilter, setStateFilter] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -86,7 +88,7 @@ export function LanesClient({
       />
       <p className={styles.meta}>
         {data.source === "api"
-          ? `Recorded state, not runner observations · read ${data.observedAtIso} · refreshes every 30 s`
+          ? `Recorded state, not runner observations · read ${data.observedAtIso} · refreshes on change signals · 30 s poll as fallback`
           : `Sample data, not this station · read ${data.observedAtIso}${
               data.fallbackReason !== NOT_CONFIGURED_REASON
                 ? " · the API did not answer; retrying every 30 s"

@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1.7
 #
-# One image for staging (deploy/staging). Built on the target's amd64 node from
-# `git archive HEAD`. The web container runs `next start`; the API container
-# runs the Nitro bundle.
+# One image for staging, built by build-image.yml. The web container runs
+# `next start`; the API container runs the Nitro bundle.
 
 FROM node:22-bookworm-slim AS build
 WORKDIR /app

@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 
 import { ChangeFeed } from "./changes/change-feed";
 import { StateWriteWatcher } from "./changes/state-write-watcher";
+import { SnapshotProjectionStore } from "./snapshots/snapshot-projection";
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from "./gh-binary";
 import { withFileLock, writeJsonAtomically } from "./file-store";
@@ -258,6 +259,7 @@ export async function persistAuthorizationCoordinatesToState(
 let runtimeConfigured = false;
 let changeFeed: ChangeFeed | null = null;
 let watcher: StateWriteWatcher | null = null;
+let snapshotProjectionStore: SnapshotProjectionStore | null = null;
 
 /**
  * Stores whose saves emit change signals; watched so a foreign (CLI) write
@@ -280,6 +282,10 @@ export function isFleetApiRuntimeConfigured(): boolean {
 
 export function getChangeFeed(): ChangeFeed | null {
   return changeFeed;
+}
+
+export function getSnapshotProjectionStore(): SnapshotProjectionStore | null {
+  return snapshotProjectionStore;
 }
 
 /**
@@ -356,6 +362,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
 
   if (options === null) {
     runtimeConfigured = false;
+    snapshotProjectionStore = null;
     configureWorkComposition(null);
     configureEvidenceUseCases(null);
     configureKnowledgeComposition(null);
@@ -365,6 +372,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   }
 
   runtimeConfigured = true;
+  snapshotProjectionStore = new SnapshotProjectionStore();
 
   const stateDir = options?.stateDir;
   const ownerPublicKey = options?.ownerPublicKey;
@@ -580,6 +588,8 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           projectId: request.projectId,
           actionScope: forgeActionScope(request.actionKind),
           expectedHeadSha: request.expectedHeadSha,
+          // CO24e: the grant records the attempt it is resolved for, durably.
+          attemptId: request.attemptId,
         });
         if (result.outcome === "blocked") {
           return { outcome: "blocked", reason: result.reason };
@@ -623,13 +633,19 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
             reason: `No in-process authorization resolve recorded grant ${request.authorizationGrantId}`,
           };
         }
+        // The grant is bound to the attempt resolved for it. A request that
+        // names an attempt must name that one; a wrong-typed id is a mismatch
+        // too. The caller's id is never preferred over the resolved one.
+        if (request.attemptId !== undefined && request.attemptId !== coordinates.attemptId) {
+          return { outcome: "refused", reason: "grant-attempt-mismatch" };
+        }
         const result =
           await operator.recordAuthorizationConsumption.recordAuthorizationConsumption({
             consumptionId: consumptionId(request.actionId),
             grantId: request.authorizationGrantId,
             actionId: request.actionId,
             actionScope: forgeActionScope(request.actionKind),
-            attemptId: request.attemptId ?? coordinates.attemptId,
+            attemptId: coordinates.attemptId,
             expectedHeadSha: request.expectedHeadSha ?? coordinates.expectedHeadSha,
           });
         if (result.outcome === "consumed") {
@@ -689,5 +705,5 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   configureKnowledgeComposition(knowledge);
   configureEvidenceUseCases(evidence);
   configureWorkComposition(work);
-  configureTelemetryReadComposition({ stateDir });
+  configureTelemetryReadComposition({ stateDir, installation });
 }

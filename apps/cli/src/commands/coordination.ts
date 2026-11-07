@@ -32,6 +32,7 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
         expectedHeadSha: strOrNull(p, 'expectedHeadSha'),
         proposalDigest: str(p, 'proposalDigest'),
         policyRevision: str(p, 'policyRevision'),
+        ...(optStr(p, 'attemptId') !== undefined ? { attemptId: str(p, 'attemptId') } : {}),
         nowIso: optStr(p, 'nowIso'),
       }),
     'resolve-auth': async (p, rt) =>
@@ -40,6 +41,7 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
         actionScope: str(p, 'actionScope'),
         expectedHeadSha: str(p, 'expectedHeadSha'),
         authorizationGrantId: optStr(p, 'authorizationGrantId'),
+        ...(optStr(p, 'attemptId') !== undefined ? { attemptId: str(p, 'attemptId') } : {}),
       }),
     'consume-auth': async (p, rt) =>
       rt.coordination.recordAuthorizationConsumption.recordAuthorizationConsumption({

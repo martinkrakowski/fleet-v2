@@ -10,14 +10,16 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '../../../domain/execution-records.js';
+import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
-import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type {
   AcceptanceAssessmentResult,
   AcceptanceReceiptsResult,
 } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
+import type { ReviewRequestFinding } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type {
   ConductorForgeGrantRequest,
   ConductorForgeGrantResult,
@@ -34,6 +36,7 @@ import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import { ResumeLaneRunUseCase } from '../ResumeLaneRunUseCase.use-case.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -263,7 +266,8 @@ function openPullRequestAtHead(number: number): ReadPullRequestResult {
       mergeState: 'clean',
       headSha: COMMIT,
       headRef: 'wt-example-1',
-      baseRef: 'main',
+      isCrossRepository: false,
+      headRepositoryOwner: 'example-owner',      baseRef: 'main',
       mergedAtIso: null,
       closedAtIso: null,
       mergeCommitSha: null,
@@ -421,6 +425,7 @@ async function makeHarness(
               return forgeReadAnswer;
             },
             isConfigured: () => true,
+            listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }),
           },
         }),
   };
@@ -746,7 +751,8 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
         mergeState: 'clean',
         headSha: MOVED_COMMIT,
         headRef: 'wt-example-1',
-        baseRef: 'main',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'main',
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
@@ -825,7 +831,8 @@ describe('AdvanceLaneRunUseCase push act (K6-6)', () => {
         mergeState: 'clean',
         headSha: MOVED_COMMIT,
         headRef: 'wt-example-1',
-        baseRef: 'main',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'main',
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
@@ -879,7 +886,8 @@ describe('AdvanceLaneRunUseCase push act (K6-6)', () => {
         mergeState: 'clean',
         headSha: MOVED_COMMIT,
         headRef: 'wt-example-1',
-        baseRef: 'main',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'main',
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
@@ -915,7 +923,8 @@ describe('AdvanceLaneRunUseCase push act (K6-6)', () => {
         mergeState: 'clean',
         headSha: MOVED_COMMIT,
         headRef: 'wt-example-1',
-        baseRef: 'main',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'main',
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
@@ -961,7 +970,8 @@ describe('AdvanceLaneRunUseCase push act (K6-6)', () => {
         mergeState: 'clean',
         headSha: MOVED_COMMIT,
         headRef: 'wt-example-1',
-        baseRef: 'main',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'main',
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
@@ -1047,7 +1057,8 @@ describe('AdvanceLaneRunUseCase recorded branch (KF-5b)', () => {
         mergeState: 'clean',
         headSha: MOVED_COMMIT,
         headRef: 'wt-example-1',
-        baseRef: 'main',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'main',
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
@@ -1091,5 +1102,570 @@ describe('AdvanceLaneRunUseCase recorded branch (KF-5b)', () => {
         (request) => request.ref.kind === 'branch' && request.ref.branchName === 'wt-example-1',
       ),
     ).toBe(true);
+  });
+});
+
+describe('R4a: the parked open-pr recovery', () => {
+  const RESUME_CLI_KEY = `${RUN_ID}/park/1/resume@cli`;
+  const RESUME_ENTRY = '01JB0000000000000000000099';
+
+  function parkedOpenPrRecord(overrides: Record<string, unknown> = {}): LaneRunRecord {
+    return runRecord({
+      parked: { reason: 'ambiguous', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null },
+      parkCount: 1,
+      branchName: `fleet/${RUN_ID}`,
+      ...overrides,
+    });
+  }
+
+  function parkedBranchBehindRecord(): LaneRunRecord {
+    return runRecord({
+      parked: { reason: 'branch-behind', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: 1,
+      prNumber: 7,
+      branchName: `fleet/${RUN_ID}`,
+    });
+  }
+
+  function openPrBranchRef(): { kind: 'branch'; branchName: string } {
+    return { kind: 'branch', branchName: `fleet/${RUN_ID}` };
+  }
+
+  /** Whether a journal key is an open-pr step intent (R4a). */
+  function isOpenPrIntentKey(key: string | null): boolean {
+    if (key === null) {
+      return false;
+    }
+    const parsed = parseLaneRunKey(key);
+    return parsed !== null && parsed.kind === 'step' && parsed.step === 'open-pr';
+  }
+
+  /** The spent open-pr intent with its ambiguous forge result, optionally settled. */
+  async function seedSpentOpenPrKey(harness: Harness, settled: boolean): Promise<void> {
+    await appendIntent(harness, openPrKey(), null, NOW);
+    await appendResult(harness, openPrKey(), 'ambiguous', 'forge-ambiguous', NOW);
+    if (settled) {
+      await appendResult(harness, openPrKey(), 'reconciled', 'pr-opened', NOW);
+    }
+  }
+
+  function resumeOf(
+    harness: Harness,
+    wire: { forgeRead?: boolean; attemptRepo?: boolean; attemptRepoOverride?: Pick<AttemptRepositoryPort, 'findAttemptById'> } = {},
+  ): ResumeLaneRunUseCase {
+    let attemptRepo: Pick<AttemptRepositoryPort, 'findAttemptById'> | undefined = harness.attemptRepo;
+    if (wire.attemptRepoOverride !== undefined) {
+      attemptRepo = wire.attemptRepoOverride;
+    }
+    if (wire.attemptRepo === false) {
+      attemptRepo = undefined;
+    }
+    return new ResumeLaneRunUseCase({
+      runRepo: harness.runRepo,
+      runJournal: harness.runJournal,
+      newUlid: harness.deps.newUlid,
+      ...(wire.forgeRead === false ? {} : { forgeRead: harness.deps.forgeRead }),
+      ...(attemptRepo === undefined ? {} : { attemptRepo }),
+    });
+  }
+
+  it('a run parked ambiguous open-pr reads its PR by branch while parked and stays parked', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord(), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.forgeReadRequests[0]?.ref).toEqual(openPrBranchRef());
+  });
+
+  it('a branch-behind park reads its PR by branch while parked and stays parked', async () => {
+    const harness = await makeHarness(parkedBranchBehindRecord(), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.forgeReadRequests[0]?.ref).toEqual(openPrBranchRef());
+  });
+
+  it('the settled open-pr park leaves to watching-ci with no second open-pr intent', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord({ prNumber: 7 }), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, true);
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'watching-ci' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked).toBeNull();
+    expect(record?.prNumber).toBe(7);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const openPrIntents = entries.filter(
+      (entry) => entry.kind === 'intent' && isOpenPrIntentKey(entry.key),
+    );
+    expect(openPrIntents).toHaveLength(1);
+    expect(entries.some((entry) => entry.kind === 'conduct' && entry.state === 'watching-ci')).toBe(true);
+  });
+
+  it('the settled park stays parked while the spent key is unsettled', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord({ prNumber: 7 }), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect((await harness.runRepo.get(RUN_ID))?.parked).not.toBeNull();
+  });
+
+  it('a resume of the open case adopts exactly one matching PR and journals reconciled and prNumber together', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord(), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    const resume = resumeOf(harness);
+    expect(await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW })).toEqual({
+      outcome: 'resume-recorded',
+      runId: RUN_ID,
+      to: 'opening-pr',
+      key: RESUME_CLI_KEY,
+    });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'resumed', to: 'watching-ci', key: RESUME_CLI_KEY });
+    expect(harness.forgeReadRequests[harness.forgeReadRequests.length - 1]?.ref).toEqual(openPrBranchRef());
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBe(7);
+    expect(record?.parked).toEqual({ reason: 'ambiguous', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null });
+    expect(record?.revision).toBe(2);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(
+      entries.some(
+        (entry) => entry.kind === 'result' && entry.key === openPrKey() && entry.outcome === 'reconciled' && entry.reasonCode === 'pr-opened',
+      ),
+    ).toBe(true);
+    expect(
+      entries.some(
+        (entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY && entry.outcome === 'reconciled' && entry.reasonCode === 'resumed',
+      ),
+    ).toBe(true);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'watching-ci' });
+    const after = await harness.runJournal.listForRun(RUN_ID);
+    expect(after.filter((entry) => entry.kind === 'intent' && isOpenPrIntentKey(entry.key))).toHaveLength(1);
+  });
+
+  it('a resume whose read shows another base, not-found, unreadable or a throw writes nothing and stays parked', async () => {
+    const movedBase = {
+      outcome: 'found' as const,
+      pullRequest: {
+        number: 7,
+        state: 'open' as const,
+        mergeState: 'clean' as const,
+        headSha: COMMIT,
+        headRef: `fleet/${RUN_ID}`,
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'chain/other',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    };
+    const cases: Array<{ answer: ReadPullRequestResult | 'throw' }> = [
+      { answer: movedBase },
+      { answer: { outcome: 'not-found' } },
+      { answer: { outcome: 'unavailable', reason: 'gh pr view failed (exit 1)' } },
+      { answer: 'throw' },
+    ];
+    for (const { answer } of cases) {
+      const harness = await makeHarness(parkedOpenPrRecord(), [collectedAttempt()], { wireForgeRead: true });
+      await conduct(harness, 'parked', NOW);
+      await seedSpentOpenPrKey(harness, false);
+      const resume = resumeOf(harness);
+      await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+      harness.setForgeReadAnswer(answer);
+      expect(
+        await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+      ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+      const record = await harness.runRepo.get(RUN_ID);
+      expect(record?.prNumber).toBeNull();
+      expect(record?.parked).not.toBeNull();
+      const resumeResults = (await harness.runJournal.listForRun(RUN_ID)).filter(
+        (entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY,
+      );
+      expect(resumeResults).toHaveLength(1);
+      expect(resumeResults[0]).toMatchObject({ outcome: 'ambiguous', reasonCode: 'forge-ambiguous' });
+    }
+  });
+
+  it('a head changed between the facts read and the resume write stays parked with prNumber null', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord(), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    const resume = resumeOf(harness);
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'open',
+        mergeState: 'clean',
+        headSha: MOVED_COMMIT,
+        headRef: `fleet/${RUN_ID}`,
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBeNull();
+    expect(record?.parked).not.toBeNull();
+  });
+
+  it('a PR head sharing the first 12 characters but differing later is refused without adoption', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord(), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    const resume = resumeOf(harness);
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'open',
+        mergeState: 'clean',
+        headSha: 'a'.repeat(12) + 'b'.repeat(28),
+        headRef: `fleet/${RUN_ID}`,
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBeNull();
+    expect(record?.parked).not.toBeNull();
+  });
+
+  it('a crash after the prNumber write repairs without a second save', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord({ prNumber: 7 }), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    const resume = resumeOf(harness);
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    const before = await harness.runRepo.get(RUN_ID);
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'resumed', to: 'watching-ci', key: RESUME_CLI_KEY });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBe(7);
+    expect(record?.revision).toBe(before?.revision);
+    expect(record?.parked).not.toBeNull();
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'watching-ci' });
+  });
+
+  it('a crash after the spent-key result but before the resume-key result repairs without a second save', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord({ prNumber: 7 }), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, true);
+    const resume = resumeOf(harness);
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    const before = await harness.runRepo.get(RUN_ID);
+    const spentResultsBefore = (await harness.runJournal.listForKey(openPrKey())).filter(
+      (entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous',
+    );
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'resumed', to: 'watching-ci', key: RESUME_CLI_KEY });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBe(7);
+    expect(record?.revision).toBe(before?.revision);
+    expect(record?.parked).not.toBeNull();
+    const spentResultsAfter = (await harness.runJournal.listForKey(openPrKey())).filter(
+      (entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous',
+    );
+    expect(spentResultsAfter).toHaveLength(spentResultsBefore.length);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(
+      entries.some(
+        (entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY && entry.outcome === 'reconciled' && entry.reasonCode === 'resumed',
+      ),
+    ).toBe(true);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'watching-ci' });
+  });
+
+  it('a crash-repair whose spent key settled refused or completed without pr-opened adopts nothing', async () => {
+    for (const [outcome, reasonCode] of [
+      ['refused', 'forge-refused'],
+      ['completed', 'accepted'],
+    ] as const) {
+      const harness = await makeHarness(parkedOpenPrRecord({ prNumber: 7 }), [collectedAttempt()], { wireForgeRead: true });
+      await conduct(harness, 'parked', NOW);
+      await appendIntent(harness, openPrKey(), null, NOW);
+      await appendResult(harness, openPrKey(), 'ambiguous', 'forge-ambiguous', NOW);
+      await appendResult(harness, openPrKey(), outcome, reasonCode, NOW);
+      const resume = resumeOf(harness);
+      await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+      harness.setForgeReadAnswer(openPullRequestAtHead(7));
+      expect(
+        await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+      ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+      const record = await harness.runRepo.get(RUN_ID);
+      expect(record?.prNumber).toBe(7);
+      expect(record?.parked).not.toBeNull();
+      const spentResults = (await harness.runJournal.listForKey(openPrKey())).filter(
+        (entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous',
+      );
+      expect(spentResults).toHaveLength(1);
+      expect(spentResults[0]).toMatchObject({ outcome, reasonCode });
+      const resumeResults = (await harness.runJournal.listForRun(RUN_ID)).filter(
+        (entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY,
+      );
+      expect(resumeResults).toHaveLength(1);
+      expect(resumeResults[0]).toMatchObject({ outcome: 'ambiguous', reasonCode: 'forge-ambiguous' });
+    }
+  });
+
+  it('a repository error reading the attempt fails closed with forge-ambiguous, never a rejection', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord(), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    const resume = resumeOf(harness, {
+      attemptRepoOverride: {
+        findAttemptById: async () => {
+          throw new Error('attempt repository unavailable');
+        },
+      },
+    });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    await expect(
+      resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).resolves.toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBeNull();
+    expect(record?.parked).not.toBeNull();
+    expect(harness.forgeReadRequests).toHaveLength(0);
+  });
+
+  it('a malformed collected head fails closed with forge-ambiguous without a forge read', async () => {
+    const harness = await makeHarness(
+      parkedOpenPrRecord(),
+      [collectedAttempt({ artifacts: { ...COLLECTED_ARTIFACTS, headCommit: 'nothex' } })],
+      { wireForgeRead: true },
+    );
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    const resume = resumeOf(harness);
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    await expect(
+      resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).resolves.toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBeNull();
+    expect(record?.parked).not.toBeNull();
+    expect(harness.forgeReadRequests).toHaveLength(0);
+  });
+
+  it('a resume of the open case without a wired forge read stays parked', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord(), [collectedAttempt()], { wireForgeRead: false });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    const resume = resumeOf(harness, { forgeRead: false, attemptRepo: false });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBeNull();
+    expect(record?.parked).not.toBeNull();
+  });
+
+  it('a stop pending still wins for the open case', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord(), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    const resume = resumeOf(harness);
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    await harness.runJournal.append({
+      ...laneRunIntentEntry(harness.deps.newUlid(), RUN_ID, `${RUN_ID}/stop@cli`, null, LATER),
+      mode: 'graceful',
+      expectedRevision: 2,
+    });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'stop-pending' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBeNull();
+    expect(record?.parked).not.toBeNull();
+    const resumeResults = (await harness.runJournal.listForRun(RUN_ID)).filter(
+      (entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY,
+    );
+    expect(resumeResults).toHaveLength(1);
+    expect(resumeResults[0]).toMatchObject({ outcome: 'refused', reasonCode: 'stop-pending' });
+  });
+});
+
+describe('AdvanceLaneRunUseCase carried minors in the open-pr body (GB1)', () => {
+  const MINOR_ONLY_FINDINGS = [
+    { findingId: 'f-1', severity: 'minor' as const, summary: 'a minor note', filePath: 'src/ex.ts', line: 4 },
+    { findingId: 'f-2', severity: 'nit' as const, summary: 'a nit', filePath: null, line: null },
+  ];
+
+  function briefCheckKey(): string {
+    const built = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'brief-check',
+      seatIndex: 0,
+      attemptOrdinal: null,
+      head12: HEAD12,
+      retry: null,
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      throw new Error('fixture must build a brief-check key');
+    }
+    return built.key;
+  }
+
+  async function appendResultWithDetail(
+    harness: Harness,
+    key: string,
+    reasonCode: Parameters<typeof laneRunResultEntry>[4],
+    detail: string | null,
+  ): Promise<void> {
+    const entry = laneRunResultEntry(harness.deps.newUlid(), RUN_ID, key, 'completed', reasonCode, NOW, detail);
+    const appended = await harness.runJournal.append(entry);
+    expect(appended.outcome).toBe('appended');
+  }
+
+  /** Seed the brief-check intent (with its minted request id) and its final result at the accepted head. */
+  async function seedBriefCheckResult(harness: Harness, reasonCode: Parameters<typeof laneRunResultEntry>[4], detail: string | null): Promise<void> {
+    await appendIntent(harness, briefCheckKey(), 'review-seeded-1', NOW);
+    await appendResultWithDetail(harness, briefCheckKey(), reasonCode, detail);
+  }
+
+  type AnyFinding = ReviewRequestFinding;
+
+  function wireReviewReceipt(
+    harness: Harness,
+    answer: (request: { requestId: string }) => 'found' | 'unavailable' | 'throw',
+    findings: readonly AnyFinding[] = MINOR_ONLY_FINDINGS,
+  ): void {
+    Object.assign(harness.deps, {
+      reviewRequest: {
+        requestReview: async () => {
+          throw new Error('never re-requested');
+        },
+        findReviewReceipt: async (request: { requestId: string }) => {
+          if (answer(request) === 'throw') {
+            throw new Error('receipt read exploded');
+          }
+          if (answer(request) === 'unavailable') {
+            return { outcome: 'unavailable', reason: 'unreadable' } as const;
+          }
+          return {
+            outcome: 'found',
+            receipt: {
+              receiptId: 'rcpt-1',
+              requestId: request.requestId,
+              kind: 'brief-check',
+              reviewerModel: 'review-model-1',
+              candidateHeadSha: COMMIT,
+              verdict: 'failed',
+              findings,
+            },
+          } as const;
+        },
+        findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }) as const,
+      },
+    });
+  }
+
+  it('the matching override receipt carries its minor and nit lines into the Challenge section, and the PR opens', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, () => 'found');
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    expect(harness.forgeRequests).toHaveLength(1);
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain(CHALLENGE_THIS);
+    expect(body).toContain('- [minor] src/ex.ts:4');
+    expect(body).toContain('- [nit] (no path)');
+    // The finding summary text never reaches the body.
+    expect(body).not.toContain('a minor note');
+  });
+
+  it('a non-override brief-check result (no minor-only detail) carries no lines and the PR still opens', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', null);
+    wireReviewReceipt(harness, () => 'found');
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain(CHALLENGE_THIS);
+    expect(body).not.toContain('- [minor]');
+    expect(body).not.toContain('- [nit]');
+  });
+
+  it('a receipt read for another request id carries no lines and the PR still opens', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, (request) => (request.requestId === 'review-other' ? 'found' : 'unavailable'), [
+      { findingId: 'f-1', severity: 'minor' as const, summary: 'a minor note', filePath: 'src/ex.ts', line: 4 },
+    ]);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    expect(harness.forgeRequests[0]!.body).not.toContain('- [minor]');
+  });
+
+  it('a throwing receipt read contributes no lines and does not prevent opening the PR', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, () => 'throw');
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain(CHALLENGE_THIS);
+    expect(body).not.toContain('- [minor]');
+    expect(body).not.toContain('- [nit]');
+  });
+
+  it('a receipt mixing a blocker with a minor carries only the minor (display keeps to minor and nit)', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, () => 'found', [
+      { findingId: 'f-1', severity: 'minor' as const, summary: 'a minor note', filePath: 'src/ex.ts', line: 4 },
+      { findingId: 'f-2', severity: 'blocker' as const, summary: 'a blocker', filePath: 'src/bad.ts', line: 1 },
+    ]);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain('- [minor] src/ex.ts:4');
+    expect(body).not.toContain('src/bad.ts');
+  });
+
+  it('a receipt carries a minor whose filePath is app/[id]/page.tsx: the PR still opens and its body omits the minor', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, () => 'found', [
+      { findingId: 'f-1', severity: 'minor' as const, summary: 'bracket path', filePath: 'app/[id]/page.tsx', line: 12 },
+    ]);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    expect(harness.forgeRequests).toHaveLength(1);
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain(CHALLENGE_THIS);
+    expect(body).not.toContain('app/[id]/page.tsx');
+    expect(body).not.toContain('- [minor]');
   });
 });

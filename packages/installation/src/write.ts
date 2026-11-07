@@ -6,19 +6,75 @@
  */
 
 import { copyDecisions } from './decision-consumers.js';
-import { CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
-import { TELEMETRY_POLICY_KEYS } from './telemetry-policy.js';
-import { SEATS_POLICY_KEYS } from './seats-policy.js';
+import {
+  AGY_ACKNOWLEDGEMENT_KEYS,
+  AGY_HOST_RUNNER_KEYS,
+  AUTO_MERGE_KEYS,
+  BOARD_KEYS,
+  CAPABILITY_KEYS,
+  CHAIN_KEYS,
+  CHAIN_STEP_KEYS,
+  CONDUCTOR_KEYS,
+  CONDUCTOR_REAPER_DISK_KEYS,
+  CONDUCTOR_REAPER_KEYS,
+  CONDUCTOR_REAPER_REPAIR_KINDS,
+  CONDUCTOR_REAPER_WORKTREE_KEYS,
+  DAEMON_KEYS,
+  FORBIDDEN_ROUTE_KEYS,
+  GATE_SLOT_KEYS,
+  GITHUB_FORGE_KEYS,
+  GIT_SHELF_KEYS,
+  HOST_KEYS,
+  HOST_ROLES,
+  HOST_RUNNER_KEYS,
+  LIVE_TAIL_KEYS,
+  LOCAL_SHELF_KEYS,
+  MERGE_KEYS,
+  MERGE_REPO_KEYS,
+  MERGE_VETO_KEYS,
+  NO_FORGE_KEYS,
+  POLICY_DAEMON_KEYS,
+  POLICY_KEYS,
+  PROCEDURE_COVERAGE_KEYS,
+  PROCEDURE_KEYS,
+  SEATS_POLICY_KEYS,
+  TELEMETRY_POLICY_KEYS,
+  V2_ROOT_KEYS,
+  V2_SEAT_KEYS,
+  V2_VERIFICATION_KEYS,
+  WAVES_KEYS,
+} from './keys.js';
+import { isPlainRecord, readOwnDataProperty } from './policy-read.js';
 import type {
+  AgyAcknowledgement,
+  AutoMergePolicy,
+  BoardPolicySection,
   ChainsSection,
+  ConductorPolicy,
+  ConductorReaperDiskPolicy,
+  ConductorReaperPolicy,
+  ConductorReaperWorktreePolicy,
+  DaemonSection,
   DecisionsSectionV2,
   FleetInstallation,
   FleetInstallationV2,
+  ForbiddenRouteRule,
   ForgeSectionV2,
+  GateSlotSection,
+  HostRunnerSection,
   HostSection,
+  LiveTailPolicy,
+  MergeDaemonSection,
+  MergePolicySection,
+  MergeRepositoryPolicy,
+  MergeVetoPolicy,
   PolicySection,
+  ProcedureCoverage,
+  RunnerCapabilityDeclaration,
   SeatSection,
+  SeatsPolicy,
   ShelfSectionV2,
+  TelemetryPolicy,
   VerificationProcedure,
   VerificationProceduresSection,
   WavesSection,
@@ -31,39 +87,26 @@ import type {
 export function isFleetInstallationV2(
   installation: FleetInstallation,
 ): installation is FleetInstallationV2 {
-  return installation.schemaVersion === 2;
+  return isPlainRecord(installation) && readOwnDataProperty(installation, 'schemaVersion') === 2;
 }
 
 /** Serialize a v2 installation as pretty JSON with a stable key order. */
 export function writeInstallationV2(installation: FleetInstallationV2): string {
-  const document: Record<string, unknown> = { schemaVersion: 2 };
-  document.hosts = serializeHosts(installation.hosts);
-  if (installation.tools !== undefined) {
-    document.tools = [...installation.tools];
-  }
-  if (installation.seats !== undefined) {
-    document.seats = installation.seats.map(serializeSeat);
-  }
-  if (installation.chains !== undefined) {
-    document.chains = serializeChains(installation.chains);
-  }
-  if (installation.policy !== undefined) {
-    document.policy = serializePolicy(installation.policy);
-  }
-  if (installation.shelf !== undefined) {
-    document.shelf = serializeShelf(installation.shelf);
-  }
-  // Forge is required in a v2 file (D6); the writer always emits the mode.
-  document.forge = serializeForge(installation.forge);
-  if (installation.verification !== undefined) {
-    document.verification = serializeVerification(installation.verification);
-  }
-  if (installation.waves !== undefined) {
-    document.waves = serializeWaves(installation.waves);
-  }
-  if (installation.decisions !== undefined) {
-    document.decisions = serializeDecisions(installation.decisions);
-  }
+  const document = serializeByKeys(installation, V2_ROOT_KEYS, {
+    schemaVersion: () => 2,
+    hosts: (hosts) => serializeHosts(hosts as Readonly<Record<string, HostSection>>),
+    tools: (tools) => [...(tools as readonly string[])],
+    seats: (seats) => (seats as readonly SeatSection[]).map(serializeSeat),
+    chains: (chains) => serializeChains(chains as ChainsSection),
+    policy: (policy) => serializePolicy(policy as PolicySection),
+    shelf: (shelf) => serializeShelf(shelf as ShelfSectionV2),
+    forge: (forge) => serializeForge(forge as ForgeSectionV2),
+    verification: (verification) =>
+      serializeVerification(verification as VerificationProceduresSection),
+    waves: (waves) => serializeByKeys(waves as WavesSection, WAVES_KEYS),
+    decisions: (decisions) => serializeDecisions(decisions as DecisionsSectionV2),
+    daemon: (daemon) => serializeByKeys(daemon as DaemonSection, DAEMON_KEYS),
+  });
   return `${JSON.stringify(document, null, 2)}\n`;
 }
 
@@ -72,244 +115,209 @@ function compareCodeUnits(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-function serializeHosts(
-  hosts: Readonly<Record<string, HostSection>>,
+/**
+ * Write the present keys of one block in the given canonical order. Reads only
+ * own data properties, so a getter never runs; an accessor property is skipped
+ * like an absent field. Arrays are shallow-copied, plain records re-created
+ * from their own data properties, and nested blocks go through `overrides`.
+ */
+function serializeByKeys(
+  block: object,
+  keys: readonly string[],
+  overrides?: Readonly<Record<string, (value: unknown) => unknown>>,
 ): Record<string, unknown> {
+  const record = block as Readonly<Record<string, unknown>>;
   const out: Record<string, unknown> = {};
-  for (const name of [...Object.keys(hosts)].sort(compareCodeUnits)) {
-    out[name] = serializeHost(hosts[name]);
-  }
-  return out;
-}
-
-function serializeHost(host: HostSection): Record<string, unknown> {
-  const out: Record<string, unknown> = { transport: host.transport };
-  if (host.sshAlias !== undefined) {
-    out.sshAlias = host.sshAlias;
-  }
-  out.worktreeRoot = host.worktreeRoot;
-  if (host.tmpDir !== undefined) {
-    out.tmpDir = host.tmpDir;
-  }
-  out.roles = [...host.roles];
-  if (host.runner !== undefined) {
-    const runner: Record<string, unknown> = {
-      kind: host.runner.kind,
-      port: host.runner.port,
-    };
-    if (host.runner.authFile !== undefined) {
-      runner.authFile = host.runner.authFile;
-    }
-    if (host.runner.capabilities !== undefined) {
-      const capabilities = host.runner.capabilities;
-      // Field by field: a `source` on the input never reaches the file.
-      runner.capabilities = {
-        networkEgressRestricted: capabilities.networkEgressRestricted,
-        cpuAndMemoryLimited: capabilities.cpuAndMemoryLimited,
-        processTreeTermination: capabilities.processTreeTermination,
-        filesystemScope: capabilities.filesystemScope,
-      };
-    }
-    if (host.runner.maxLanes !== undefined) {
-      runner.maxLanes = host.runner.maxLanes;
-    }
-    if (host.runner.gateSlot !== undefined) {
-      runner.gateSlot = {
-        path: host.runner.gateSlot.path,
-        slots: host.runner.gateSlot.slots,
-      };
-    }
-    if (host.runner.kind === 'agy') {
-      runner.agyMode = host.runner.agyMode;
-      if (host.runner.agyAcknowledgement !== undefined) {
-        runner.agyAcknowledgement = {
-          textVersion: host.runner.agyAcknowledgement.textVersion,
-          acceptedAt: host.runner.agyAcknowledgement.acceptedAt,
-        };
-      }
-    }
-    out.runner = runner;
-  }
-  return out;
-}
-
-function serializeSeat(seat: SeatSection): Record<string, unknown> {
-  const out: Record<string, unknown> = {
-    id: seat.id,
-    tool: seat.tool,
-    model: seat.model,
-  };
-  if (seat.variant !== undefined) {
-    out.variant = seat.variant;
-  }
-  if (seat.agent !== undefined) {
-    out.agent = seat.agent;
-  }
-  out.roles = [...seat.roles];
-  out.costClass = seat.costClass;
-  if (seat.health !== undefined) {
-    out.health = seat.health;
-  }
-  return out;
-}
-
-function serializeChains(chains: ChainsSection): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const role of ['implementer', 'fix', 'reviewer', 'high-risk-reviewer'] as const) {
-    const steps = chains[role];
-    if (steps === undefined) {
+  for (const key of keys) {
+    const value = readOwnDataProperty(record, key);
+    if (value === undefined) {
       continue;
     }
-    out[role] = steps.map((step) => {
-      const stepOut: Record<string, unknown> = { seatId: step.seatId };
-      if (step.triggers !== undefined) {
-        stepOut.triggers = [...step.triggers];
-      }
-      return stepOut;
-    });
-  }
-  return out;
-}
-
-function serializePolicy(policy: PolicySection): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  if (policy.forbiddenRoutes !== undefined) {
-    out.forbiddenRoutes = policy.forbiddenRoutes.map((route) => ({
-      tool: route.tool,
-      modelPattern: route.modelPattern,
-    }));
-  }
-  if (policy.perLaneCostCeiling !== undefined) {
-    out.perLaneCostCeiling = policy.perLaneCostCeiling;
-  }
-  if (policy.useFreeSeats !== undefined) {
-    out.useFreeSeats = policy.useFreeSeats;
-  }
-  if (policy.liveTail !== undefined) {
-    out.liveTail = { content: policy.liveTail.content };
-  }
-  if (policy.autoMerge !== undefined) {
-    out.autoMerge = {
-      enabled: policy.autoMerge.enabled,
-      allowHighRisk: policy.autoMerge.allowHighRisk,
-      onBlocked: policy.autoMerge.onBlocked,
-    };
-  }
-  if (policy.conductor !== undefined) {
-    const conductor: Record<string, unknown> = { enabled: policy.conductor.enabled };
-    if (policy.conductor.stopGraceMinutes !== undefined) {
-      conductor.stopGraceMinutes = policy.conductor.stopGraceMinutes;
-    }
-    if (policy.conductor.reaper !== undefined) {
-      const reaper: Record<string, unknown> = { enabled: policy.conductor.reaper.enabled };
-      if (policy.conductor.reaper.intervalMinutes !== undefined) {
-        reaper.intervalMinutes = policy.conductor.reaper.intervalMinutes;
-      }
-      if (policy.conductor.reaper.graceMinutes !== undefined) {
-        reaper.graceMinutes = policy.conductor.reaper.graceMinutes;
-      }
-      if (policy.conductor.reaper.staleStopMinutes !== undefined) {
-        reaper.staleStopMinutes = policy.conductor.reaper.staleStopMinutes;
-      }
-      if (policy.conductor.reaper.repairs !== undefined) {
-        const repairs: Record<string, unknown> = {};
-        for (const kind of CONDUCTOR_REAPER_REPAIR_KINDS) {
-          if (policy.conductor.reaper.repairs[kind] !== undefined) {
-            repairs[kind] = policy.conductor.reaper.repairs[kind];
-          }
-        }
-        reaper.repairs = repairs;
-      }
-      conductor.reaper = reaper;
-    }
-    out.conductor = conductor;
-  }
-  if (policy.telemetry !== undefined) {
-    out.telemetry = serializePolicyBlock(policy.telemetry, TELEMETRY_POLICY_KEYS);
-  }
-  if (policy.seats !== undefined) {
-    out.seats = serializePolicyBlock(policy.seats, SEATS_POLICY_KEYS);
-  }
-  return out;
-}
-
-/**
- * A policy block's present keys in the given order; arrays and plain objects are copied one level deep.
- */
-function serializePolicyBlock(block: object, keys: readonly string[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  const source = block as Readonly<Record<string, unknown>>;
-  for (const key of keys) {
-    const value = source[key];
-    if (Array.isArray(value)) {
+    const override = overrides?.[key];
+    if (override !== undefined) {
+      out[key] = override(value);
+    } else if (Array.isArray(value)) {
       out[key] = [...value];
     } else if (typeof value === 'object' && value !== null) {
-      out[key] = { ...value };
-    } else if (value !== undefined) {
+      out[key] = Object.fromEntries(
+        Object.keys(value as Record<string, unknown>).map((entryKey) => [
+          entryKey,
+          readOwnDataProperty(value as Record<string, unknown>, entryKey),
+        ]),
+      );
+    } else {
       out[key] = value;
     }
   }
   return out;
 }
 
-function serializeShelf(shelf: ShelfSectionV2): Record<string, unknown> {
-  if (shelf.provider === 'local') {
-    return { provider: 'local' };
+function serializeHosts(
+  hosts: Readonly<Record<string, HostSection>>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const name of [...Object.keys(hosts)].sort(compareCodeUnits)) {
+    const host = readOwnDataProperty(hosts, name);
+    if (host !== undefined) {
+      out[name] = serializeHost(host as HostSection);
+    }
   }
-  return {
-    provider: 'git',
-    repoDir: shelf.repoDir,
-    branch: shelf.branch,
-    pathPrefix: shelf.pathPrefix,
-  };
+  return out;
+}
+
+function serializeHost(host: HostSection): Record<string, unknown> {
+  return serializeByKeys(host, HOST_KEYS, {
+    roleAliases: (roleAliases) => serializeByKeys(roleAliases as object, HOST_ROLES),
+    runner: (runner) => serializeHostRunner(runner as HostRunnerSection),
+  });
+}
+
+function serializeHostRunner(runner: HostRunnerSection): Record<string, unknown> {
+  // The discriminator goes through the own-data-property reader too: a getter
+  // never runs, and an accessor or absent kind falls to the default (opencode)
+  // branch like any other field rather than throwing.
+  const kind = readOwnDataProperty(runner as unknown as Readonly<Record<string, unknown>>, 'kind');
+  const keys = kind === 'agy' ? AGY_HOST_RUNNER_KEYS : HOST_RUNNER_KEYS;
+  return serializeByKeys(runner, keys, {
+    capabilities: (capabilities) =>
+      serializeByKeys(capabilities as RunnerCapabilityDeclaration, CAPABILITY_KEYS),
+    gateSlot: (gateSlot) => serializeByKeys(gateSlot as GateSlotSection, GATE_SLOT_KEYS),
+    agyAcknowledgement: (acknowledgement) =>
+      serializeByKeys(acknowledgement as AgyAcknowledgement, AGY_ACKNOWLEDGEMENT_KEYS),
+  });
+}
+
+function serializeSeat(seat: SeatSection): Record<string, unknown> {
+  return serializeByKeys(seat, V2_SEAT_KEYS);
+}
+
+function serializeChains(chains: ChainsSection): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const role of CHAIN_KEYS) {
+    const steps = chains[role];
+    if (steps === undefined) {
+      continue;
+    }
+    out[role] = steps.map((step) => serializeByKeys(step, CHAIN_STEP_KEYS));
+  }
+  return out;
+}
+
+function serializePolicy(policy: PolicySection): Record<string, unknown> {
+  return serializeByKeys(policy, POLICY_KEYS, {
+    forbiddenRoutes: (routes) =>
+      (routes as readonly ForbiddenRouteRule[]).map((route) =>
+        serializeByKeys(route, FORBIDDEN_ROUTE_KEYS),
+      ),
+    liveTail: (liveTail) => serializeByKeys(liveTail as LiveTailPolicy, LIVE_TAIL_KEYS),
+    autoMerge: (autoMerge) => serializeByKeys(autoMerge as AutoMergePolicy, AUTO_MERGE_KEYS),
+    conductor: (conductor) => serializeConductorPolicy(conductor as ConductorPolicy),
+    board: (board) => serializeByKeys(board as BoardPolicySection, BOARD_KEYS),
+    telemetry: (telemetry) =>
+      serializeByKeys(telemetry as TelemetryPolicy, TELEMETRY_POLICY_KEYS),
+    seats: (seats) => serializeByKeys(seats as SeatsPolicy, SEATS_POLICY_KEYS),
+    merge: (merge) => serializeMergePolicy(merge as MergePolicySection),
+    daemon: (daemon) => serializeByKeys(daemon as MergeDaemonSection, POLICY_DAEMON_KEYS),
+  });
+}
+
+function serializeMergePolicy(merge: MergePolicySection): Record<string, unknown> {
+  return serializeByKeys(merge, MERGE_KEYS, {
+    repos: (repos) => serializeMergeRepos(repos as Readonly<Record<string, MergeRepositoryPolicy>>),
+  });
+}
+
+function serializeMergeRepos(
+  repos: Readonly<Record<string, MergeRepositoryPolicy>>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(repos)) {
+    const repo = readOwnDataProperty(repos, key);
+    if (repo === undefined) {
+      continue;
+    }
+    out[key] = serializeMergeRepository(repo as MergeRepositoryPolicy);
+  }
+  return out;
+}
+
+function serializeMergeRepository(repo: MergeRepositoryPolicy): Record<string, unknown> {
+  return serializeByKeys(repo, MERGE_REPO_KEYS, {
+    veto: (veto) => serializeByKeys(veto as MergeVetoPolicy, MERGE_VETO_KEYS),
+  });
+}
+
+function serializeConductorPolicy(
+  conductor: NonNullable<PolicySection['conductor']>,
+): Record<string, unknown> {
+  return serializeByKeys(conductor, CONDUCTOR_KEYS, {
+    reaper: (reaper) => serializeConductorReaper(reaper as ConductorReaperPolicy),
+  });
+}
+
+function serializeConductorReaper(
+  reaper: NonNullable<NonNullable<PolicySection['conductor']>['reaper']>,
+): Record<string, unknown> {
+  return serializeByKeys(reaper, CONDUCTOR_REAPER_KEYS, {
+    repairs: (repairs) => {
+      const out: Record<string, unknown> = {};
+      const written = repairs as Record<string, unknown>;
+      for (const kind of CONDUCTOR_REAPER_REPAIR_KINDS) {
+        const flag = readOwnDataProperty(written, kind);
+        if (flag !== undefined) {
+          out[kind] = flag;
+        }
+      }
+      return out;
+    },
+    worktrees: (worktrees) =>
+      serializeByKeys(worktrees as ConductorReaperWorktreePolicy, CONDUCTOR_REAPER_WORKTREE_KEYS),
+    disk: (disk) =>
+      serializeByKeys(disk as ConductorReaperDiskPolicy, CONDUCTOR_REAPER_DISK_KEYS),
+  });
+}
+
+function serializeShelf(shelf: ShelfSectionV2): Record<string, unknown> {
+  // Read the discriminator through the own-data-property reader so an accessor
+  // never runs; an unreadable provider falls to the default branch.
+  return readOwnDataProperty(shelf as unknown as Readonly<Record<string, unknown>>, 'provider') === 'local'
+    ? serializeByKeys(shelf, LOCAL_SHELF_KEYS)
+    : serializeByKeys(shelf, GIT_SHELF_KEYS);
 }
 
 function serializeForge(forge: ForgeSectionV2): Record<string, unknown> {
-  if (forge.mode === 'none') {
-    return { mode: 'none' };
-  }
-  return { mode: 'github', owner: forge.owner, repo: forge.repo };
+  return readOwnDataProperty(forge as unknown as Readonly<Record<string, unknown>>, 'mode') === 'none'
+    ? serializeByKeys(forge, NO_FORGE_KEYS)
+    : serializeByKeys(forge, GITHUB_FORGE_KEYS);
 }
 
 function serializeVerification(
   verification: VerificationProceduresSection,
 ): Record<string, unknown> {
-  const procedures: Record<string, unknown> = {};
-  const record: Readonly<Record<string, VerificationProcedure>> = verification.procedures;
-  for (const name of [...Object.keys(record)].sort(compareCodeUnits)) {
-    const procedure = record[name];
-    const out: Record<string, unknown> = { command: procedure.command };
-    if (procedure.args !== undefined) {
-      out.args = [...procedure.args];
+  return serializeByKeys(verification, V2_VERIFICATION_KEYS, {
+    procedures: (procedures) =>
+      serializeProcedures(procedures as Readonly<Record<string, VerificationProcedure>>),
+  });
+}
+
+function serializeProcedures(
+  procedures: Readonly<Record<string, VerificationProcedure>>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const name of [...Object.keys(procedures)].sort(compareCodeUnits)) {
+    const procedure = readOwnDataProperty(procedures, name);
+    if (procedure === undefined) {
+      continue;
     }
-    if (procedure.coverage !== undefined) {
-      out.coverage = {
-        reader: procedure.coverage.reader,
-        unitKind: procedure.coverage.unitKind,
-        minUnits: procedure.coverage.minUnits,
-      };
-    }
-    procedures[name] = out;
+    out[name] = serializeByKeys(procedure as VerificationProcedure, PROCEDURE_KEYS, {
+      coverage: (coverage) =>
+        serializeByKeys(coverage as ProcedureCoverage, PROCEDURE_COVERAGE_KEYS),
+    });
   }
-  return { procedures };
+  return out;
 }
 
 function serializeDecisions(decisions: DecisionsSectionV2): Record<string, unknown> {
   // The same field-by-field copy the model uses; written in the same key order.
   return { ...copyDecisions(decisions) };
-}
-
-
-function serializeWaves(waves: WavesSection): Record<string, unknown> {
-  const out: Record<string, unknown> = {
-    baseUrl: waves.baseUrl,
-    tokenFile: waves.tokenFile,
-  };
-  if (waves.caFile !== undefined) {
-    out.caFile = waves.caFile;
-  }
-  if (waves.ownerPublicKey !== undefined) {
-    out.ownerPublicKey = waves.ownerPublicKey;
-  }
-  return out;
 }

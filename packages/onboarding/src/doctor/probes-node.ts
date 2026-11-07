@@ -9,7 +9,7 @@
  */
 
 import { execFile as execFileCallback } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,7 +18,8 @@ import { promisify } from 'node:util';
 import type { SeatModel } from '@fleet/installation';
 import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
-import type { DoctorProbes, SeatProbeResult } from './probes.js';
+import { GH_BINARY_CANDIDATES } from './gh-binary.js';
+import type { DoctorProbes, SeatProbeResult, ServerProbeResult } from './probes.js';
 
 const execFileAsync = promisify(execFileCallback);
 
@@ -136,6 +137,11 @@ export interface NodeDoctorProbesDeps {
   readonly seatTimeoutMs?: number;
   /** The worktree root `worktreeRootWritable` tests (`.` when omitted). */
   readonly worktreeRoot?: string;
+  /**
+   * Candidate absolute paths probed for the reviewed `gh` binary. Defaults
+   * to `GH_BINARY_CANDIDATES`; injectable for tests and embedders.
+   */
+  readonly ghBinaryCandidates?: readonly string[];
 }
 
 /** Walk up from this module to the repository root that owns `bin/ocm-run`. */
@@ -242,6 +248,33 @@ export function seatProbeArgv(seat: SeatModel, template: readonly string[]): str
     }
   }
   return argv;
+}
+
+/**
+ * The model ids an opencode server lists: `id` for each model and
+ * `id#variant` for each of its variants. `undefined` when the answer is not
+ * a readable model list.
+ */
+export function serverModelIds(stdout: string): readonly string[] | undefined {
+  const opencode = BUILT_IN_TOOLS.find((tool) => tool.id === 'opencode');
+  if (opencode?.models === undefined) {
+    return undefined;
+  }
+  const parsed = opencode.models.parse(stdout);
+  if (parsed === 'unknown' || 'source' in parsed) {
+    return undefined;
+  }
+  if (parsed.length === 0) {
+    return undefined;
+  }
+  const ids: string[] = [];
+  for (const model of parsed) {
+    ids.push(model.id);
+    for (const variant of model.variants ?? []) {
+      ids.push(`${model.id}#${variant}`);
+    }
+  }
+  return ids;
 }
 
 /**
@@ -361,6 +394,86 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
       }
       const hash = firstField(text);
       return hash !== undefined && /^[0-9a-f]{64}$/.test(hash) ? hash : undefined;
+    },
+
+    async ghBinary() {
+      const candidates = deps.ghBinaryCandidates ?? GH_BINARY_CANDIDATES;
+      try {
+        for (const candidate of candidates) {
+          if (existsSync(candidate)) {
+            const stats = statSync(candidate);
+            if (stats.isFile() && (stats.mode & 0o111) !== 0) {
+              return { resolved: candidate, candidates };
+            }
+          }
+        }
+        return { resolved: undefined, candidates };
+      } catch {
+        return undefined;
+      }
+    },
+
+    async serverProbe(host, port): Promise<ServerProbeResult> {
+      const info = await runOnHost(
+        executors,
+        host,
+        [
+          'curl',
+          '-sS',
+          '--max-time',
+          '5',
+          '--noproxy',
+          '127.0.0.1,localhost',
+          '-o',
+          '/dev/null',
+          '-w',
+          '%{http_code}',
+          `http://127.0.0.1:${port}/api/info`,
+        ],
+      );
+      if (info.error !== undefined) {
+        return { outcome: 'unknown', reason: 'the server probe could not be run' };
+      }
+      if (info.exitCode !== 0) {
+        return {
+          outcome: 'unknown',
+          reason: `the opencode server on 127.0.0.1:${port} did not answer`,
+        };
+      }
+      const code = info.stdout.trim();
+      if (code === '401' || code === '403') {
+        // The doctor never reads a credential; an authenticated server is
+        // unknown, never a pass.
+        return {
+          outcome: 'unknown',
+          reason: `the opencode server on 127.0.0.1:${port} requires authentication`,
+        };
+      }
+      if (code !== '200') {
+        return {
+          outcome: 'fail',
+          reason: `the opencode server on 127.0.0.1:${port} answered HTTP ${code}`,
+        };
+      }
+      const listed = await runOnHost(
+        executors,
+        host,
+        [
+          'curl',
+          '-sS',
+          '--max-time',
+          '5',
+          '--noproxy',
+          '127.0.0.1,localhost',
+          `http://127.0.0.1:${port}/api/model`,
+        ],
+      );
+      const reason = `the opencode server on 127.0.0.1:${port} answered`;
+      if (listed.error !== undefined || listed.exitCode !== 0) {
+        return { outcome: 'pass', reason };
+      }
+      const models = serverModelIds(listed.stdout);
+      return models === undefined ? { outcome: 'pass', reason } : { outcome: 'pass', reason, models };
     },
 
     async seatProbe(seat: SeatModel): Promise<SeatProbeResult> {

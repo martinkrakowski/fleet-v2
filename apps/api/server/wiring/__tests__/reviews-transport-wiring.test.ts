@@ -323,8 +323,10 @@ describe("POST /v1/reviews review transport wiring", () => {
 
       expect(response.status).toBe(200);
       expect(response.envelope.result?.outcome).toBe("reviewed");
-      expect(calls).toHaveLength(1);
-      const call = calls[0];
+      // RV4: the idle --wait probe is spawned first, then the review.
+      expect(calls).toHaveLength(2);
+      expect(calls[0].args.slice(0, 3)).toEqual(["--wait", "--dir", repoDir]);
+      const call = calls[1];
       expect(call.args).toContain("--dir");
       expect(call.args[call.args.indexOf("--dir") + 1]).toBe(repoDir);
       expect(call.args).toContain("-m");
@@ -354,8 +356,8 @@ describe("POST /v1/reviews review transport wiring", () => {
       const response = await callReviews(reviewRequest({ candidateHeadSha: head }));
 
       expect(response.envelope.result?.outcome).toBe("reviewed");
-      expect(calls).toHaveLength(1);
-      expect(calls[0].env.OCM_HOST).toBe("");
+      expect(calls).toHaveLength(2);
+      expect(calls[1].env.OCM_HOST).toBe("");
     } finally {
       if (previous === undefined) {
         delete process.env.OCM_HOST;

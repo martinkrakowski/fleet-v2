@@ -14,6 +14,7 @@ import type { ParsedLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
 import type { LaneRunKeyStep } from './lane-run-records.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
+import type { SeatFailureOutcome } from './seat-selection.js';
 
 /** The conductor's result reason codes (K4); each matches LANE_RUN_JOURNAL_REASON_CODE_PATTERN. Stored data: version with the journal. */
 export const LANE_RUN_RESULT_REASON_CODES = [
@@ -27,12 +28,18 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'gate-passed', 'gate-failed', 'gate-unknown', 'reconciled',
   'review-passed', 'review-failed', 'review-no-receipt', 'review-refused', 'review-unknown',
   'assessment-unavailable', 'review-seat-unavailable',
+  'seat-busy', 'review-superseded',
   'resumed', 'run-stopped', 'stale-revision', 'not-parked', 'stop-pending', 'one-way-door', 'fix-no-progress',
   'accepted', 'acceptance-rejected', 'acceptance-unknown', 'pr-opened',
   'pushed', 'forge-refused', 'forge-ambiguous', 'grant-refused', 'merged', 'merge-not-merged', 'merge-waiting',
   'merge-off', 'notice-recorded', 'notice-refused', 'no-in-scope-findings',
   'gate-congested', // KF-30c2: a gate run that exhausted the gate-slot wait limit; the conductor may retry it
   'premerge-success', 'premerge-failure', 'premerge-overtaken', // KS7a-2: the merge hold's `premerge` commit status
+  // KS7b: the `merge-enqueue` step's final results. The detail of `merge-dropped` / `merge-held` names the
+  // queue's reason token; a pending (queued) entry has no result at all.
+  'merge-dropped', 'merge-held', 'merge-enqueue-refused', 'merge-overtaken',
+  'ci-failed', // GB4: the keyed `ci` step's refusal of the exact head's CI read
+  'ci-overtaken', // GB4 fix rounds 1-2: a pending `ci` intent whose head/round moved, or whose CI has since passed
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 
@@ -294,8 +301,129 @@ export function laneRunPremergePost(
   return post;
 }
 
-/** The step of the run's latest final step-key result when its outcome is 'refused' and its round is `round`; else null. */
-export function laneRunRefusedStep(entries: readonly LaneRunJournalEntryRecord[], runId: string, round: number): LaneRunKeyStep | null {
+/** What the merge queue made of the run's enqueued head, read from the journal (KS7b). */
+export type LaneRunMergeEnqueueFact = 'none' | 'merged' | 'dropped-fixable' | 'held' | 'stuck';
+
+/** The queue drop reasons that a fix round can answer: the head conflicts, fails its checks or the macOS verify. */
+export const LANE_RUN_MERGE_DROP_FIXABLE = ['conflict', 'checks', 'macos'] as const;
+
+/**
+ * KS7b: the latest final result of the run's `merge-enqueue` key at (`round`, `head12`)
+ * (`<runId>/r<round>/merge-enqueue@<head12>`), as the merging rules read it. `merged` →
+ * `merged`; `merge-dropped` with detail conflict, checks or macos → `dropped-fixable`;
+ * `merge-held` → `held`; any other final result (a refusal, another drop reason, an
+ * unknown detail) → `stuck`; no final result, a moved head or another round → `none`.
+ * The last such result wins. Pure; never throws.
+ */
+export function laneRunMergeEnqueueFact(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  round: number,
+  head12: string | null,
+): LaneRunMergeEnqueueFact {
+  if (typeof head12 !== 'string' || !PREMERGE_HEAD12_PATTERN.test(head12)) {
+    return 'none';
+  }
+  let fact: LaneRunMergeEnqueueFact = 'none';
+  for (const entry of entries) {
+    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'merge-enqueue' || parsed.head12 !== head12 || parsed.round !== round) {
+      continue;
+    }
+    if (entry.outcome === 'overtaken') {
+      continue;
+    }
+    if (entry.reasonCode === 'merged') {
+      fact = 'merged';
+    } else if (entry.reasonCode === 'merge-held') {
+      fact = 'held';
+    } else if (
+      entry.reasonCode === 'merge-dropped' &&
+      (LANE_RUN_MERGE_DROP_FIXABLE as readonly (string | null)[]).includes(entry.detail)
+    ) {
+      fact = 'dropped-fixable';
+    } else {
+      fact = 'stuck';
+    }
+  }
+  return fact;
+}
+
+/**
+ * A recorded seat advance (G11a): the `next-seat-<outcome>-<index>` or
+ * `next-seat-<outcome>-none` detail token of a failed turn's final result,
+ * or `none` when the journal holds no such token for the round. The outcome
+ * is the failure outcome the result recorded (`rate-limited`, `timeout` or
+ * `provider-error`).
+ */
+export type LaneRunRecordedSeatAdvance =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'seat'; readonly seatIndex: number; readonly outcome: SeatFailureOutcome }
+  | { readonly kind: 'exhausted'; readonly outcome: SeatFailureOutcome | null };
+
+/** The failure outcomes a recorded advance may name. */
+const SEAT_ADVANCE_OUTCOMES: readonly SeatFailureOutcome[] = ['rate-limited', 'timeout', 'provider-error'];
+
+/** Parse a recorded advance's detail token; anything else reads `none`. */
+function parseSeatAdvanceDetail(detail: string | null): LaneRunRecordedSeatAdvance {
+  if (detail === null || !detail.startsWith('next-seat-')) {
+    return { kind: 'none' };
+  }
+  const rest = detail.slice('next-seat-'.length);
+  if (rest === 'none') {
+    return { kind: 'exhausted', outcome: null };
+  }
+  for (const outcome of SEAT_ADVANCE_OUTCOMES) {
+    if (!rest.startsWith(outcome + '-')) {
+      continue;
+    }
+    const tail = rest.slice(outcome.length + 1);
+    if (tail === 'none') {
+      return { kind: 'exhausted', outcome };
+    }
+    if (/^[0-9]+$/.test(tail)) {
+      return { kind: 'seat', seatIndex: Number(tail), outcome };
+    }
+  }
+  return { kind: 'none' };
+}
+
+/**
+ * The latest recorded seat advance for `round` (G11a): the LAST final
+ * `refused` result of a step key at that round whose detail is a
+ * `next-seat-` token. Journal order decides, so a later failure's advance
+ * supersedes an earlier one and no other reader may re-derive the seat
+ * independently. A run id that is not a run id, or no token, reads `none`.
+ */
+export function laneRunRecordedSeatAdvance(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  round: number,
+): LaneRunRecordedSeatAdvance {
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+    return { kind: 'none' };
+  }
+  let latest: LaneRunRecordedSeatAdvance = { kind: 'none' };
+  for (const entry of entries) {
+    if (entry.kind !== 'result' || entry.outcome !== 'refused' || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = entry.key === null ? null : parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.runId !== runId || parsed.round !== round) {
+      continue;
+    }
+    const advance = parseSeatAdvanceDetail(entry.detail);
+    if (advance.kind !== 'none') {
+      latest = advance;
+    }
+  }
+  return latest;
+}
+
+/** The step of the run's latest final step-key result when its outcome is 'refused' and its round is `round`; else null. */export function laneRunRefusedStep(entries: readonly LaneRunJournalEntryRecord[], runId: string, round: number): LaneRunKeyStep | null {
   if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
     return null;
   }
@@ -318,6 +446,36 @@ export function laneRunRefusedStep(entries: readonly LaneRunJournalEntryRecord[]
     return null;
   }
   return parsed.step;
+}
+
+/**
+ * GB4: true when this run has a final `ci` result with reason `ci-failed`
+ * at `head12` in `round` — the CI failure is already journalled and only the
+ * transition to `fixing` is left. Pure; never throws.
+ */
+export function laneRunCiFailureRecorded(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  round: number,
+  head12: string | null,
+): boolean {
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId) || head12 === null) {
+    return false;
+  }
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.runId !== runId) {
+      continue;
+    }
+    if (parsed.step === 'ci' && entry.reasonCode === 'ci-failed' && parsed.round === round && parsed.head12 === head12) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** The dispatch intent time of an attempt (its recordedAtIso), or null. */

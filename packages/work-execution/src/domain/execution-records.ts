@@ -10,6 +10,15 @@ import type { AttemptOutcomeValue } from './value-objects/AttemptOutcome.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { SeatPlanProps, SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { BaseBranchValue } from './base-branch.js';
+import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
+import { pullRequestRefError } from './lane-plan-sidecar.js';
+
+/** Record schema version for stored attempt records on disk (Q5a, D6); absent reads as 1. */
+export const ATTEMPT_RECORD_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
+/** Record schema version for stored capacity reservations on disk (Q5a, D6); absent reads as 1. */
+export const CAPACITY_RESERVATION_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
+/** Record schema version for stored action-journal entries on disk (Q5a, D6); absent reads as 1. */
+export const ACTION_JOURNAL_ENTRY_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
 
 /**
  * Completion receipt bound to the attempt and the runner session. A runner
@@ -198,6 +207,12 @@ export interface AttemptUsageRecord {
   readonly sessionId: string | null;
   readonly steps: number | null;
   readonly wallSeconds: number | null;
+  /**
+   * The lane's run time rounded up to whole minutes (`runnerMinutesOf`).
+   * Absent on usage records written before the field existed; `null` when no
+   * wall time was measured.
+   */
+  readonly runnerMinutes?: number | null;
   readonly tokensInput: number | null;
   readonly tokensOutput: number | null;
   readonly tokensReasoning: number | null;
@@ -207,6 +222,15 @@ export interface AttemptUsageRecord {
   readonly model: string | null;
   readonly agent: string | null;
   readonly reason: string | null;
+}
+
+/** The usage record's runner-minutes value: whole minutes from `wallSeconds`. */
+export function runnerMinutesOf(wallSeconds: number | null): number | null {
+  if (wallSeconds === null) {
+    return null;
+  }
+  const minutes = Math.ceil(wallSeconds / 60);
+  return Number.isSafeInteger(minutes) ? minutes : null;
 }
 
 /**
@@ -277,6 +301,8 @@ export interface SeatObservationRecord {
 
 /** Serializable record of one dispatch or one fresh fix session. */
 export interface AttemptRecord {
+  /** Record schema version on disk (Q5a, D6); absent reads as 1. */
+  readonly schemaVersion?: number;
   readonly id: string;
   readonly workOrderId: string;
   readonly kind: AttemptKind;
@@ -334,6 +360,8 @@ export interface AttemptRecord {
 
 /** One physical slot held for one attempt until the attempt ends. */
 export interface CapacityReservationRecord {
+  /** Record schema version on disk (Q5a, D6); absent reads as 1. */
+  readonly schemaVersion?: number;
   readonly id: string;
   readonly attemptId: string;
   readonly hostId: string;
@@ -362,12 +390,30 @@ export interface CapacityReservationRecord {
    * busy-worktree check.
    */
   readonly worktreePath?: string | null;
+  /**
+   * The work order the reservation was made for (CG2). Records persisted
+   * before the field existed read as absent, and absent still fails closed
+   * in admission: the attempt's own record is the other source.
+   */
+  readonly workOrderId?: string | null;
   readonly reservedAtIso: string;
   readonly releasedAtIso: string | null;
 }
 
+/**
+ * The pull request a forge action produced or acted on, typed so merge and PR
+ * producers never parse free-text `detail` fields. Permitted only on `forge`
+ * journal entries.
+ */
+export interface ActionJournalPullRequestRef {
+  readonly repository: string;
+  readonly number: number;
+}
+
 /** Journal entry: intent is durable before the subprocess runs. */
 export interface ActionJournalEntryRecord {
+  /** Record schema version on disk (Q5a, D6); absent reads as 1. */
+  readonly schemaVersion?: number;
   readonly id: string;
   readonly attemptId: string;
   readonly workOrderId: string;
@@ -389,4 +435,73 @@ export interface ActionJournalEntryRecord {
    * `policy:conductor@<rev>` for a policy grant. Absent means an owner grant.
    */
   readonly authorizedBy?: string;
+  /**
+   * The pull request the forge action produced or acted on (WB5b), typed so
+   * merge and PR producers never parse free-text `detail`. Present only on
+   * `forge` entries.
+   */
+  readonly pullRequest?: ActionJournalPullRequestRef;
+}
+
+/** The exact own keys a typed journal pull-request reference may carry. */
+const JOURNAL_PULL_REQUEST_KEYS: ReadonlySet<string> = new Set(['repository', 'number']);
+
+/** The upper bound of a pull-request number, shared with the merge record's bound. */
+const MAX_JOURNAL_PULL_REQUEST_NUMBER = 999_999_999;
+
+export type JournalPullRequestRead =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'valid'; readonly ref: ActionJournalPullRequestRef }
+  | { readonly kind: 'invalid' };
+
+/**
+ * Read the optional typed `pullRequest` field of an action-journal entry.
+ * Absent stays absent; a value on a non-`forge` entry, any non-plain shape, a
+ * getter, an extra or missing key, a malformed repository or number, or an
+ * out-of-range number is `invalid` — never a throw, never a getter invocation.
+ */
+export function readJournalPullRequestRef(
+  action: ActionJournalEntryRecord['action'],
+  value: unknown,
+): JournalPullRequestRead {
+  if (value === undefined) {
+    return { kind: 'absent' };
+  }
+  if (action !== 'forge') {
+    return { kind: 'invalid' };
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { kind: 'invalid' };
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return { kind: 'invalid' };
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== JOURNAL_PULL_REQUEST_KEYS.size) {
+    return { kind: 'invalid' };
+  }
+  // Values are copied through their own descriptors, so no getter ever runs.
+  const copy: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (typeof key !== 'string' || !JOURNAL_PULL_REQUEST_KEYS.has(key)) {
+      return { kind: 'invalid' };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      return { kind: 'invalid' };
+    }
+    copy[key] = descriptor.value;
+  }
+  if (pullRequestRefError('pullRequest', copy) !== null) {
+    return { kind: 'invalid' };
+  }
+  const number = copy.number;
+  if (!Number.isSafeInteger(number) || (number as number) > MAX_JOURNAL_PULL_REQUEST_NUMBER) {
+    return { kind: 'invalid' };
+  }
+  return {
+    kind: 'valid',
+    ref: Object.freeze({ repository: copy.repository as string, number: number as number }),
+  };
 }

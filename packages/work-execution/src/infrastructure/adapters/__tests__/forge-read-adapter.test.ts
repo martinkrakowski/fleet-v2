@@ -28,6 +28,8 @@ const MERGED_FIXTURE = JSON.stringify({
   mergeCommit: { oid: '3fe9fac07688024ae64dc5a3da66010e4418d628' },
   mergedAt: '2026-10-25T20:12:08Z',
   mergeStateStatus: 'CLEAN',
+  isCrossRepository: false,
+  headRepositoryOwner: { login: 'example-owner' },
   number: 202,
   state: 'MERGED',
 });
@@ -40,6 +42,8 @@ const OPEN_FIXTURE = JSON.stringify({
   mergeCommit: null,
   mergedAt: null,
   mergeStateStatus: 'BEHIND',
+  isCrossRepository: false,
+  headRepositoryOwner: { login: 'example-owner' },
   number: 259,
   state: 'OPEN',
 });
@@ -52,6 +56,8 @@ const CLOSED_UNMERGED_FIXTURE = JSON.stringify({
   mergeCommit: null,
   mergedAt: null,
   mergeStateStatus: 'BLOCKED',
+  isCrossRepository: false,
+  headRepositoryOwner: { login: 'example-owner' },
   number: 259,
   state: 'CLOSED',
 });
@@ -97,6 +103,8 @@ describe('ForgeReadAdapter.readPullRequest', () => {
         mergedAtIso: '2026-10-25T20:12:08.000Z',
         closedAtIso: '2026-10-25T20:12:08.000Z',
         mergeCommitSha: '3fe9fac07688024ae64dc5a3da66010e4418d628',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',
       },
     });
     expect(calls).toEqual([
@@ -124,6 +132,8 @@ describe('ForgeReadAdapter.readPullRequest', () => {
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',
       },
     });
     expect(calls[0]).toEqual([
@@ -135,6 +145,65 @@ describe('ForgeReadAdapter.readPullRequest', () => {
       '--json',
       PULL_REQUEST_VIEW_FIELDS,
     ]);
+  });
+
+  it('a branch read parses the snapshot baseRef from a recorded payload (R4a)', async () => {
+    const payload = JSON.stringify({
+      baseRefName: 'chain/x',
+      closedAt: null,
+      headRefName: 'feat/example-chain',
+      headRefOid: '8e136fe0e0cc916b9d3485eaafe653e3143d9d63',
+      mergeCommit: null,
+      mergedAt: null,
+      mergeStateStatus: 'CLEAN',
+      number: 311,
+      isCrossRepository: false,
+      headRepositoryOwner: { login: 'example-owner' },
+      state: 'OPEN',
+    });
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: payload, stderr: '' });
+    const result = await makeAdapter({ runGh }).readPullRequest({
+      ref: { kind: 'branch', branchName: 'feat/example-chain' },
+    });
+
+    expect(result).toEqual({
+      outcome: 'found',
+      pullRequest: expect.objectContaining({ baseRef: 'chain/x', number: 311, state: 'open' }),
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('parses a fork PR with isCrossRepository true and a head owner login (WB5b3)', async () => {
+    const payload = JSON.stringify({
+      ...JSON.parse(OPEN_FIXTURE),
+      isCrossRepository: true,
+      headRepositoryOwner: { login: 'fork-owner' },
+    });
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: payload, stderr: '' });
+    const result = await makeAdapter({ runGh }).readPullRequest({
+      ref: { kind: 'number', number: 259 },
+    });
+
+    expect(result).toEqual({
+      outcome: 'found',
+      pullRequest: expect.objectContaining({
+        isCrossRepository: true,
+        headRepositoryOwner: 'fork-owner',
+      }),
+    });
+  });
+
+  it('a branch read with two open PRs reads unavailable from a recorded failure body (R4a)', async () => {
+    const { runGh } = makeRunGh({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'multiple pull requests match for branch "feat/example-chain"',
+    });
+    const result = await makeAdapter({ runGh }).readPullRequest({
+      ref: { kind: 'branch', branchName: 'feat/example-chain' },
+    });
+
+    expect(result.outcome).toBe('unavailable');
   });
 
   it('reads a closed-unmerged PR with closedAt set and mergedAt null', async () => {
@@ -295,6 +364,29 @@ describe('ForgeReadAdapter.readPullRequest', () => {
     ],
     ['merged without mergedAt', JSON.stringify({ ...JSON.parse(MERGED_FIXTURE), mergedAt: null }), null],
     [
+      'missing isCrossRepository',
+      JSON.stringify((() => {
+        const rest = JSON.parse(OPEN_FIXTURE) as Record<string, unknown>;
+        delete rest.isCrossRepository;
+        return rest;
+      })()),
+      null,
+    ],
+    [
+      'missing headRepositoryOwner',
+      JSON.stringify((() => {
+        const rest = JSON.parse(OPEN_FIXTURE) as Record<string, unknown>;
+        delete rest.headRepositoryOwner;
+        return rest;
+      })()),
+      null,
+    ],
+    [
+      'headRepositoryOwner without a login',
+      JSON.stringify({ ...JSON.parse(OPEN_FIXTURE), headRepositoryOwner: { name: 'No Login' } }),
+      null,
+    ],
+    [
       'open with mergedAt',
       JSON.stringify({ ...JSON.parse(OPEN_FIXTURE), mergedAt: '2026-10-25T20:12:08Z' }),
       null,
@@ -410,6 +502,17 @@ describe('ForgeReadAdapter.readPullRequest', () => {
       '--json',
       PULL_REQUEST_VIEW_FIELDS,
     ]);
+  });
+
+  it('passes effectiveTimeoutMs to runGh when timeoutMs is provided on the request', async () => {
+    const timeouts: Array<number | undefined> = [];
+    const runGh = async (_args: readonly string[], timeoutMs?: number) => {
+      timeouts.push(timeoutMs);
+      return { exitCode: 0, stdout: OPEN_FIXTURE, stderr: '' };
+    };
+    const adapter = makeAdapter({ runGh, timeoutMs: 30000 });
+    await adapter.readPullRequest({ ref: { kind: 'number', number: 259 }, timeoutMs: 5000 });
+    expect(timeouts).toEqual([5000]);
   });
 });
 

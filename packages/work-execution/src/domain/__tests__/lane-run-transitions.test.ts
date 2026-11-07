@@ -65,7 +65,7 @@ const PARKED_ONE_WAY = { reason: 'one-way-door', qualifier: null, parkedFrom: 'g
 const PARKED_HALTED = { reason: 'halted', qualifier: null, parkedFrom: 'gating', questionId: null };
 
 const EXPECTED_EXITS: Record<LaneRunStateValue, readonly LaneRunStateValue[]> = {
-  ready: ['dispatching'],
+  ready: ['dispatching', 'collecting'],
   dispatching: ['running', 'seat-failed'],
   running: ['collecting', 'seat-failed'],
   'seat-failed': ['dispatching'],
@@ -74,11 +74,11 @@ const EXPECTED_EXITS: Record<LaneRunStateValue, readonly LaneRunStateValue[]> = 
   'brief-check': ['code-review', 'fixing'],
   'code-review': ['accepting', 'fixing'],
   fixing: ['dispatching'],
-  accepting: ['awaiting-premerge', 'opening-pr', 'pushing'],
-  'awaiting-premerge': ['opening-pr', 'pushing', 'fixing', 'gating'],
+  accepting: ['awaiting-premerge', 'opening-pr', 'pushing', 'fixing'],
+  'awaiting-premerge': ['opening-pr', 'pushing', 'fixing', 'gating', 'merged'],
   'opening-pr': ['watching-ci', 'gating'],
   pushing: ['watching-ci', 'gating'],
-  'watching-ci': ['merging', 'fixing', 'gating'],
+  'watching-ci': ['merging', 'fixing', 'gating', 'merged'],
   merging: ['merged', 'fixing', 'watching-ci', 'gating'],
   merged: [],
   stopped: [],
@@ -96,7 +96,7 @@ const FALSE_EXIT: Record<LaneRunStateValue, LaneRunStateValue> = {
   'code-review': 'gating',
   fixing: 'running',
   accepting: 'gating',
-  'awaiting-premerge': 'merged',
+  'awaiting-premerge': 'collecting',
   'opening-pr': 'merging',
   pushing: 'merging',
   'watching-ci': 'pushing',
@@ -110,7 +110,11 @@ describe('LaneRun exits', () => {
   it.each(LANE_RUN_STATES)('%s exits match the table and each listed exit is legal', (state) => {
     expect(LANE_RUN_EXITS[state]).toEqual(EXPECTED_EXITS[state]);
     for (const exit of LANE_RUN_EXITS[state]) {
-      expect(canEnterLaneRunState(state, exit)).toBe(true);
+      // `ready → collecting` is the adopted run's entry only (CO28); every other exit needs no provenance.
+      expect(canEnterLaneRunState(state, exit, null, false, 'adopted')).toBe(true);
+      if (!(state === 'ready' && exit === 'collecting')) {
+        expect(canEnterLaneRunState(state, exit)).toBe(true);
+      }
     }
     expect(canEnterLaneRunState(state, FALSE_EXIT[state])).toBe(false);
   });
@@ -136,6 +140,14 @@ describe('LaneRun exits', () => {
     expect(canEnterLaneRunState('parked', 'merging', 'gating')).toBe(false);
     expect(canEnterLaneRunState('parked', 'gating')).toBe(false);
     expect(canEnterLaneRunState('parked', 'stopped')).toBe(true);
+  });
+
+  it('a settled open-pr park may enter watching-ci (R4a)', () => {
+    expect(canEnterLaneRunState('parked', 'watching-ci', 'opening-pr', true)).toBe(true);
+    expect(canEnterLaneRunState('parked', 'watching-ci', 'opening-pr')).toBe(false);
+    expect(canEnterLaneRunState('parked', 'gating', 'opening-pr', true)).toBe(false);
+    expect(canEnterLaneRunState('parked', 'opening-pr', 'opening-pr', true)).toBe(true);
+    expect(canEnterLaneRunState('parked', 'merged', 'opening-pr')).toBe(true);
   });
 
   it('the owner-merge park enters merged by itself (CT-2a)', () => {
@@ -480,6 +492,11 @@ describe('speed-plan rows (KS1: D19, D20, D22, D24)', () => {
     for (const prNumber of [null, 7]) {
       expect(canEnterLaneRunState('accepting', afterLaneRunAcceptance(2, prNumber, 'merging'))).toBe(true);
     }
+  });
+
+  it('AR1: the review-blocked acceptance rejection leaves accepting into fixing', () => {
+    expect(LANE_RUN_EXITS.accepting).toContain('fixing');
+    expect(canEnterLaneRunState('accepting', 'fixing')).toBe(true);
   });
 
   it('merge hold: Tier 1 is released at once; Tier 2 follows its receipt at the head; unknown tier or receipt parks', () => {

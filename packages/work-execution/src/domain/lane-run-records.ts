@@ -10,8 +10,15 @@
 import type { SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { BaseBranchValue } from './base-branch.js';
+import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
+import type { LaneRunParkFindingView } from './park-findings-view.js';
+import { copyParkFindings } from './park-findings-view.js';
+import type { LaneRunParkClass } from './park-class.js';
 
 export const LANE_RUN_RECORD_VERSION = 1 as const;
+
+/** Record schema version for lane-run records on disk (Q5a, D6). */
+export const LANE_RUN_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
 
 /** Tier 0 has no lane (fleet policy), so a run is Tier 1 or Tier 2. Tier 2 waits in awaiting-premerge. */
 export const LANE_RUN_TIERS = [1, 2] as const;
@@ -32,7 +39,7 @@ export const LANE_RUN_ID_PATTERN = /^run-[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
  */
 export const LANE_RUN_KEY_STEPS = [
   'prepare', 'dispatch', 'stop', 'collect', 'gate', 'brief-check', 'code-review', 'pre-merge',
-  'accept', 'open-pr', 'push', 'merge', 'premerge', 'park', 'reconcile',
+  'accept', 'open-pr', 'push', 'merge', 'premerge', 'merge-enqueue', 'ci', 'park', 'reconcile',
 ] as const;
 export type LaneRunKeyStep = (typeof LANE_RUN_KEY_STEPS)[number];
 
@@ -43,15 +50,23 @@ export const LANE_RUN_ONE_WAY_STEPS = ['prepare', 'dispatch', 'open-pr', 'push',
 export const LANE_RUN_KEY_HEAD_RULE = {
   prepare: 'absent', dispatch: 'absent', stop: 'absent', collect: 'absent',
   gate: 'required', 'brief-check': 'required', 'code-review': 'required', 'pre-merge': 'required',
-  accept: 'required', 'open-pr': 'required', push: 'required', merge: 'required', premerge: 'required', park: 'absent',
+  accept: 'required', 'open-pr': 'required', push: 'required', merge: 'required', premerge: 'required', 'merge-enqueue': 'required', ci: 'required', park: 'absent',
   reconcile: 'absent',
 } as const satisfies Record<LaneRunKeyStep, 'required' | 'absent'>;
 
-/** Whether a step key carries `/a<n>`. */
+/**
+ * Whether a step key carries `/a<n>`.
+ *
+ * The two tables' rules: `collect` keys never carry `@<head12>` (`collect` stays
+ * `'absent'` in LANE_RUN_KEY_HEAD_RULE), but since F87 they must carry the collected
+ * attempt's ordinal: `<runId>/r<round>/collect/<seatIndex>/a<n>` (n 1..32). The legacy
+ * ordinal-less form `<runId>/r<round>/collect/<seatIndex>` is still *read* by the
+ * parser for journals written before this change, but is no longer buildable.
+ */
 export const LANE_RUN_KEY_ATTEMPT_RULE = {
-  prepare: 'required', dispatch: 'required', stop: 'absent', collect: 'absent',
+  prepare: 'required', dispatch: 'required', stop: 'absent', collect: 'required',
   gate: 'absent', 'brief-check': 'absent', 'code-review': 'absent', 'pre-merge': 'absent',
-  accept: 'absent', 'open-pr': 'absent', push: 'absent', merge: 'absent', premerge: 'absent', park: 'absent',
+  accept: 'absent', 'open-pr': 'absent', push: 'absent', merge: 'absent', premerge: 'absent', 'merge-enqueue': 'absent', ci: 'absent', park: 'absent',
   reconcile: 'absent',
 } as const satisfies Record<LaneRunKeyStep, 'required' | 'absent'>;
 
@@ -102,6 +117,35 @@ export interface LaneRunParkRecord {
   readonly parkedFrom: LaneRunStateValue;
   /** The keyed owner question, once asked; null when none is (e.g. stop-unconfirmed, halted). */
   readonly questionId: string | null;
+  /**
+   * The bounded findings snapshot of the failed code review at the parked head,
+   * frozen when the park is raised so repair and every retry reuse the same
+   * snapshot (GB2 correction 2); absent on records written before GB2 and for
+   * non-blocker parks.
+   */
+  readonly findings?: readonly LaneRunParkFindingView[] | null;
+  /**
+   * PT1a: why the run is parked, set when the park is raised (`classifyPark`); absent on records
+   * written before PT1a, which read as `other` through `parkClassOf`.
+   */
+  readonly class?: LaneRunParkClass;
+}
+
+/**
+ * Fresh plain park record; findings (when present) is a fresh array of fresh,
+ * frozen finding objects.
+ */
+export function copyParkRecord(parked: LaneRunParkRecord | null): LaneRunParkRecord | null {
+  if (parked === null) {
+    return null;
+  }
+  if (parked.findings === undefined) {
+    return { ...parked };
+  }
+  return {
+    ...parked,
+    findings: copyParkFindings(parked.findings),
+  };
 }
 
 /** The driver's lease on this run (K3 takes and renews it by CAS with a fencing revision). */
@@ -113,6 +157,42 @@ export interface LaneRunLeaseRecord {
 
 /** The seat index each role last used in this run; null before its first use (D8). */
 export type LaneRunCursorsRecord = { readonly [role in SeatPlanRole]: number | null };
+
+/**
+ * How a run came to be (CO28, D-R8): `started` runs are created by `conductor start` and enter
+ * `dispatching`; `adopted` runs are created by `AdoptLane` from a verified save or a clean commit and
+ * enter `collecting`. A record without the field reads as `started`; any other present value is refused.
+ */
+export const LANE_RUN_PROVENANCES = ['started', 'adopted'] as const;
+export type LaneRunProvenance = (typeof LANE_RUN_PROVENANCES)[number];
+
+/** Classify a value as a declared provenance; anything else is `undefined`, never a default. */
+export function parseLaneRunProvenance(value: unknown): LaneRunProvenance | undefined {
+  return value === 'started' || value === 'adopted' ? value : undefined;
+}
+
+/**
+ * The provenance of a stored run (D-R8): absent or `undefined` reads as `started`; a declared value reads as
+ * itself; anything else (null, empty, unknown string, number, a non-record, a throwing getter) is `unknown`.
+ * Own property only, so an inherited `provenance` never labels a record. Total: never throws.
+ */
+export function resolveLaneRunProvenance(record: unknown): LaneRunProvenance | 'unknown' {
+  try {
+    if (typeof record !== 'object' || record === null || Array.isArray(record)) {
+      return 'unknown';
+    }
+    if (!Object.hasOwn(record, 'provenance')) {
+      return 'started';
+    }
+    const value: unknown = (record as { readonly provenance?: unknown }).provenance;
+    if (value === undefined) {
+      return 'started';
+    }
+    return parseLaneRunProvenance(value) ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
 
 /** Serializable snapshot of the LaneRun aggregate (version 1). */
 export interface LaneRunRecord {
@@ -149,4 +229,11 @@ export interface LaneRunRecord {
    * `resolveLaneRunBaseBranch`, which treats an absent value as `main`.
    */
   readonly baseBranch?: BaseBranchValue;
+  /**
+   * How the run was created (CO28, D-R8). Absent on every record written before CO28 and read as
+   * `started` through `resolveLaneRunProvenance`; an adopted run entered `collecting` without a dispatch.
+   */
+  readonly provenance?: LaneRunProvenance;
+  /** Record schema version on disk (Q5a, D6); absent reads as 1. */
+  readonly schemaVersion?: number;
 }

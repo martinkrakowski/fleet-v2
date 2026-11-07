@@ -8,7 +8,10 @@
  * refused/rejected/blocked/unknown, 2 usage): the halt marker is set or
  * lifted, a stop is recorded as a keyed journal intent the driver obeys, a
  * resume is recorded for a parked run. Nothing there takes a run lease or
- * dispatches anything.
+ * dispatches anything; stop and resume refuse with `driver-lease-live` and exit 1 while a live driver lease is
+ * held (a lapsed or absent lease allows the call). The lease check and the
+ * record are one atomic step under the lease store's lock, so a passing
+ * `conductor run --live` cannot take the lease between them.
  *
  * `conductor start` reserves capacity, prepares the run's worktree at the
  * reserved path and places the brief there, then records the first attempt
@@ -42,7 +45,9 @@ import {
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
   WorkOrderRepositoryAdapter,
+  isLeaseLapsed,
   type LaneRunJournalEntryRecord,
+  type ConductorDriverLeaseRecord,
   type RunConductorPassResult,
   type ConductorRunReport,
   type AdvanceLaneRunResult,
@@ -50,11 +55,16 @@ import {
   type ConductorScheduleRow,
   type ConductorPassTraceInput,
   type ConductorPassTracePort,
+  type RunTelemetryMarkPort,
+  type WorkOrderRecord,
+  CRASHED_START_NOTICE_MINUTES,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
-import type { CliIo } from './index.js';
+import { openChangeWakeReader, resolveWakeConfig, type ChangeWakeReader } from './conductor-wake.js';
 import { buildLiveConductorDriver, buildDryRunConductorDriver, type ConductorDriver, type DryRunStores } from './conductor-wiring.js';
+import { withFileLock } from './file-store.js';
+import type { CliIo } from './index.js';
 import type { RunnerTunnelPort } from './runner-tunnel.js';
 
 export interface ConductorCliOptions {
@@ -79,9 +89,14 @@ export interface ConductorCliOptions {
    * runtime's `RunnerTunnelAdapter`.
    */
   readonly tunnel?: RunnerTunnelPort;
+  /** An injected change-feed reader (tests); null means "no reader". */
+  readonly wakeReader?: ChangeWakeReader | null;
+  /** The opener seam; production uses `openChangeWakeReader`. */
+  readonly openWakeReader?: (config: { readonly baseUrl: string; readonly token: string }) => Promise<ChangeWakeReader | null>;
 }
 
 export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
+       fleet-v2 conductor status --stalled
        fleet-v2 conductor schedule [--json] [--passes]
        fleet-v2 conductor halt [--lift]
        fleet-v2 conductor stop <runId> [--force] [--revision <n>]
@@ -89,7 +104,12 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>] [--max-active-runs <n>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
-       fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes]
+       fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes] [--force-unsealed]
+
+conductor status --stalled lists the runs parked longer than
+policy.daemon.stallAfterMinutes (default 30) as run id, park class, age in
+minutes and work order, oldest first; it is the view of the same stall rule
+that raises the conductor's stall:<runId> attention items.
 
 Read-only status of one lane run (or every run) with its projected state,
 the halt marker and the driver lease; a kill-switch halt the driver checks
@@ -97,14 +117,22 @@ before any external action (halt --lift clears it); halt never stops a running
 lane; a stop recorded as a keyed run-journal intent — stop is graceful by
 default, --force stops the running lane now; a resume recorded for a parked
 run. The driver obeys the records; nothing here dispatches, and the CLI
-never takes a run lease. conductor schedule is a read-only view of the live
-runs grouped by base branch, in creation order within each, with their held slots, package keys and the admission
+never takes a run lease. stop and resume refuse with reason
+driver-lease-live (exit 1) while another process holds a live driver
+lease; a lapsed or absent lease allows the call; the check and the record
+are one atomic step under the lease store's lock. conductor schedule is a
+read-only view of the live runs grouped by base branch, in creation order
+within each, with their held slots, package keys and the admission
 count; --json prints the whole view. conductor reap --worktrees removes the clean
 worktree of every finished lane run (terminal run, terminal work order,
 every attempt cancelled or collected, no held reservation) on explicit
 request: --dry-run lists the candidates and removes nothing, and without it
 --yes is required; the branch fleet/<runId> is kept — no branch, run record
-or evidence is removed. conductor reap --sessions lists and, on request,
+or evidence is removed. Since C2' the removal is gated on the attempt's
+sealed artifact manifest: an uncollected or tampered worktree is refused.
+--force-unsealed (with --worktrees only) removes an uncollected or tampered
+worktree only through a scoped, one-way owner approval consumed from the
+coordination store; every clean, unlocked and idle check still runs. conductor reap --sessions lists and, on request,
 aborts sessions with no live attempt: worktrees whose every attempt is
 finished (cancelled, collected or ended) and none holds a reservation, but
 where the runner still reports a running session; --dry-run lists them and
@@ -123,7 +151,9 @@ would do; it reaches no host, needs neither --live nor
 policy.conductor.enabled, and never writes the real state. conductor start
 reserves capacity and prepares a worktree on a lane host; it needs
 policy.conductor.enabled and a state directory, and dispatches nothing.
-start --abandon works while the conductor is disabled.
+start --abandon works while the conductor is disabled. The status document
+also lists the reservations a crashed start left held, and conductor start
+raises one attention item per crashed start.
 
 Each subcommand prints one JSON document on stdout (conductor run prints one
 JSON line per pass; conductor schedule without --json prints text lines and,
@@ -147,6 +177,7 @@ function revisionOf(value: string | undefined): number | 'invalid' | 'absent' {
 interface ControlOptions {
   readonly force: boolean;
   readonly lift: boolean;
+  readonly stalled: boolean;
   readonly revision: number | undefined;
   readonly positionals: readonly string[];
 }
@@ -160,6 +191,7 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
   const positionals: string[] = [];
   let force = false;
   let lift = false;
+  let stalled = false;
   let revision: number | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]!;
@@ -177,6 +209,14 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
         return null;
       }
       lift = true;
+      continue;
+    }
+    if (token === '--stalled') {
+      if (stalled) {
+        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      stalled = true;
       continue;
     }
     if (token === '--revision' || token.startsWith('--revision=')) {
@@ -206,17 +246,17 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
     io.stderr(`conductor takes at most one run id\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { force, lift, revision, positionals };
+  return { force, lift, stalled, revision, positionals };
 }
 
 /** What each subcommand accepts; anything else is a usage error, never silently ignored. */
 const SUBCOMMAND_SHAPE: Readonly<
-  Record<string, { readonly force: boolean; readonly lift: boolean; readonly revision: boolean; readonly runId: 'none' | 'optional' | 'required'; readonly writes: boolean }>
+  Record<string, { readonly force: boolean; readonly lift: boolean; readonly stalled: boolean; readonly revision: boolean; readonly runId: 'none' | 'optional' | 'required'; readonly writes: boolean }>
 > = {
-  status: { force: false, lift: false, revision: false, runId: 'optional', writes: false },
-  halt: { force: false, lift: true, revision: false, runId: 'none', writes: true },
-  stop: { force: true, lift: false, revision: true, runId: 'required', writes: true },
-  resume: { force: false, lift: false, revision: true, runId: 'required', writes: true },
+  status: { force: false, lift: false, stalled: true, revision: false, runId: 'optional', writes: false },
+  halt: { force: false, lift: true, stalled: false, revision: false, runId: 'none', writes: true },
+  stop: { force: true, lift: false, stalled: false, revision: true, runId: 'required', writes: true },
+  resume: { force: false, lift: false, stalled: false, revision: true, runId: 'required', writes: true },
 };
 
 /** The exit code of a control result, read from its outcome; text is never parsed. */
@@ -225,6 +265,50 @@ function exitFor(result: { readonly outcome: string }): number {
     return 1;
   }
   return 0;
+}
+
+/** The driver lease store's file name (`ConductorDriverLeaseAdapter` default); its lock is `<stateDir>/<fileName>.lock`. */
+const DRIVER_LEASE_FILE_NAME = 'conductor-driver-lease.json';
+
+/**
+ * True when a live driver lease is held: a lease record exists and is not
+ * lapsed at `nowIso`. Read-only — the CLI never takes the lease. An
+ * unreadable lease fails closed: the driver may hold it.
+ */
+async function liveDriverLeaseHeld(runtime: FleetCliRuntime, nowIso: string): Promise<boolean> {
+  let lease: ConductorDriverLeaseRecord | null = null;
+  try {
+    lease = await runtime.conductor.driverLease.read();
+  } catch {
+    return true;
+  }
+  return lease !== null && !isLeaseLapsed(lease, nowIso);
+}
+
+/**
+ * Record a control intent under the driver lease store's exclusive lock,
+ * refusing when a live driver lease is held at `nowIso`. The check and the
+ * record run under the same lock the driver's acquire/renew/release run
+ * under, so `conductor run --live` cannot take the lease between them: a
+ * stop or resume never lands while a live lease is held. An unreadable lease
+ * or an un-lockable store fails closed.
+ */
+async function recordUnderDriverLeaseGuard<T>(
+  runtime: FleetCliRuntime,
+  stateDir: string,
+  nowIso: string,
+  record: () => Promise<T>,
+): Promise<{ readonly refused: true } | { readonly refused: false; readonly result: T }> {
+  try {
+    return await withFileLock(join(stateDir, `${DRIVER_LEASE_FILE_NAME}.lock`), async () => {
+      if (await liveDriverLeaseHeld(runtime, nowIso)) {
+        return { refused: true } as const;
+      }
+      return { refused: false, result: await record() };
+    });
+  } catch {
+    return { refused: true } as const;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +530,74 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
   return { maxActiveRuns: 1, ...flags, abandon, dryRun, live };
 }
 
+/** How the crashed-start scan went: the caller, not the helper, tells the operator. */
+type CrashedStartScan = 'complete' | 'incomplete' | 'failed';
+
+/**
+ * AD-2: raise one stored attention item per crashed start the status view
+ * reports that has been held for at least CRASHED_START_NOTICE_MINUTES, except
+ * the attempt a retry continues (`skipAttemptId`). A younger candidate may be a
+ * live start still preparing, so it raises nothing. The body is exactly the five
+ * keys of `RecordAttentionItemBody`. Best-effort: a refusal or throw never fails
+ * a start. It prints nothing; it returns how the scan went.
+ */
+async function raiseCrashedStartNotices(
+  runtime: FleetCliRuntime,
+  nowIso: string,
+  skipAttemptId: string | undefined,
+): Promise<CrashedStartScan> {
+  let result: Awaited<ReturnType<FleetCliRuntime['conductor']['inspectLaneRuns']['inspectLaneRuns']>>;
+  try {
+    result = await runtime.conductor.inspectLaneRuns.inspectLaneRuns({ nowIso });
+  } catch {
+    return 'failed';
+  }
+  if (result.outcome !== 'listed') {
+    return 'complete';
+  }
+  for (const crashed of result.crashedStarts) {
+    if (crashed.attemptId === skipAttemptId || crashed.workOrderId === null) {
+      continue;
+    }
+    if (crashed.heldMinutes === null || crashed.heldMinutes < CRASHED_START_NOTICE_MINUTES) {
+      continue;
+    }
+    let workOrder: WorkOrderRecord | null;
+    try {
+      workOrder = await runtime.execution.workOrderRepository.findWorkOrderById(crashed.workOrderId);
+    } catch {
+      continue;
+    }
+    if (workOrder === null) {
+      continue;
+    }
+    const body = {
+      projectId: workOrder.projectId,
+      kind: 'crashed-start',
+      subject: { kind: 'attempt', ref: crashed.attemptId },
+      workOrderId: crashed.workOrderId,
+      summary: `A lane start crashed and left capacity slot ${crashed.slotIndex} held for attempt ${crashed.attemptId}.`,
+    };
+    try {
+      await runtime.coordination.recordAttentionItem.recordAttentionItem(body, 'conductor');
+    } catch {
+      // A notice never fails a start.
+    }
+  }
+  return result.crashedStartsIncomplete === true ? 'incomplete' : 'complete';
+}
+
+/** The operator's line for a scan that did not check every held reservation, or null when it did. */
+function crashedStartScanWarning(command: string, scan: CrashedStartScan): string | null {
+  if (scan === 'incomplete') {
+    return `conductor ${command}: the crashed-start scan was incomplete; some held reservations were not checked\n`;
+  }
+  if (scan === 'failed') {
+    return `conductor ${command}: the crashed-start scan failed; held reservations were not checked\n`;
+  }
+  return null;
+}
+
 /**
  * `conductor start` (K7-D7): reserve capacity, prepare the run's worktree at
  * the reserved path, place the brief, record the first attempt and the run.
@@ -531,6 +683,15 @@ async function startCommand(
   if (driver.start === null) {
     io.stderr(`conductor start has no start port in this driver\n${CONDUCTOR_HELP}\n`);
     return 2;
+  }
+  // AD-2: surface crashed-start reservations as attention items. The flags
+  // and the brief are validated above; the scan writes stored items, so it
+  // must not run before a usage error. Best-effort; a retry with the same
+  // attempt id continues the crashed start, so it raises nothing for it. The
+  // `--abandon` path returned earlier and raises nothing.
+  const scanWarning = crashedStartScanWarning('start', await raiseCrashedStartNotices(runtime, nowIsoOf(options), flags.attemptId));
+  if (scanWarning !== null) {
+    io.stderr(scanWarning);
   }
   const result = await driver.start.startLaneRun({
     runId,
@@ -723,6 +884,96 @@ function readRunFlags(argv: readonly string[], io: CliIo): RunFlags | null {
 }
 
 /**
+ * OT5: marks one advanced run for telemetry export. Telemetry is off the
+ * lane's critical path: a throwing mark adapter never fails a pass, and a
+ * lost mark only delays the next export.
+ */
+function markRunQuietly(mark: RunTelemetryMarkPort | undefined, runId: string): void {
+  try {
+    mark?.mark({ kind: 'run', runId });
+  } catch {
+    // a lost mark delays only the next export (plan §3.3)
+  }
+}
+
+/**
+ * OT5: stops the driver's background exporter within the 2 s stop race of plan
+ * §3.5 (line 202). The timer is unref()'d and cleared when the exporter's own
+ * stop settles first; synchronous throws and rejected stop promises are
+ * absorbed, so the driver's exit is delayed by at most 2 s.
+ */
+async function stopTelemetryExporter(runtime: FleetCliRuntime): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => resolve(), 2_000);
+    timer.unref();
+  });
+  try {
+    await Promise.race([runtime.telemetry.stopExporter?.() ?? Promise.resolve(), timeout]);
+  } catch {
+    // absorbed: telemetry never changes an exit code
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/** The interrupt marker `resolveWakeReader` returns when the stop signal ends the opener wait. */
+const WAKE_OPENER_INTERRUPTED = 'wake-opener-interrupted';
+
+/**
+ * K9: build the change-feed wake reader for a live run. An injected reader
+ * wins; otherwise the environment must configure both the API base URL and a
+ * wake-token file, and the opener must succeed — a reader that cannot open
+ * prints one line and leaves the driver polling. The opener wait races the
+ * stop signal: an API that never answers must not hold the run hostage, so an
+ * interrupt ends the wait (and the production opener's fetch); the caller stops
+ * the tunnel and the `finally` stops the exporter and closes the reader.
+ */
+async function resolveWakeReader(
+  io: CliIo,
+  options: ConductorCliOptions,
+  signal: AbortSignal,
+): Promise<ChangeWakeReader | undefined | typeof WAKE_OPENER_INTERRUPTED> {
+  if (options.wakeReader !== undefined) {
+    return options.wakeReader ?? undefined;
+  }
+  const config = resolveWakeConfig(process.env);
+  if (config === null) {
+    return undefined;
+  }
+  const opener =
+    options.openWakeReader ?? ((open: { readonly baseUrl: string; readonly token: string }) => openChangeWakeReader({ ...open, signal }));
+  let onAbort: (() => void) | null = null;
+  const interrupted = new Promise<typeof WAKE_OPENER_INTERRUPTED>((resolve) => {
+    onAbort = () => resolve(WAKE_OPENER_INTERRUPTED);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    // The opener's promise is settled into a value before racing, so a later
+    // rejection can never surface as an unhandled rejection after the race.
+    const openerPromise = opener(config).then(
+      (reader): ChangeWakeReader | null => reader,
+      (): ChangeWakeReader | null => null,
+    );
+    const raced = await Promise.race([openerPromise.then((reader) => ({ reader })), interrupted]);
+    if (raced === WAKE_OPENER_INTERRUPTED) {
+      return WAKE_OPENER_INTERRUPTED;
+    }
+    if (raced.reader === null) {
+      io.stderr('conductor run: the change feed is unavailable; polling\n');
+      return undefined;
+    }
+    return raced.reader;
+  } finally {
+    if (onAbort !== null) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
+/**
  * `conductor run --live`: the driver. One pass at a time under the state
  * directory's driver lease, polling with back-off from 30 seconds to 2 minutes,
  * with a 10-second floor while a run waits in watching-ci or merging (D31),
@@ -774,6 +1025,7 @@ async function runCommand(
   // interrupt during the startup wait stops the tunnel child too.
   const tunnel = options.tunnel ?? runtime.runnerTunnel;
   const controller = new AbortController();
+  let wake: ChangeWakeReader | undefined;
   const signal = options.stopSignal ?? controller.signal;
   const onSignal = (): void => {
     controller.abort();
@@ -809,6 +1061,27 @@ async function runCommand(
       io.stderr(`${RUNNER_TUNNEL_FAILED_MESSAGE}\n`);
       return 1;
     }
+    // OT5: start the background exporter once the tunnel is up; it drains
+    // marks off the critical path. Never throws, but the isolation test proves
+    // a throwing start cannot affect the run.
+    try {
+      runtime.telemetry.startExporter?.();
+    } catch {
+      // a lost exporter delays only the next export
+    }
+    // K9: open the change-feed wake reader (when configured) so a signal ends
+    // the between-passes sleep; a reader that cannot open never prevents
+    // polling, and the stop signal ends the opener wait itself (an API that
+    // never answers cannot hold the run hostage).
+    const opened = await resolveWakeReader(io, options, signal);
+    if (opened === WAKE_OPENER_INTERRUPTED) {
+      // Same contract as the tunnel startup race: an interrupt ends the opener
+      // wait, and the owned tunnel is stopped here too — the poll loop never
+      // starts, so its tunnel-release path would otherwise be skipped.
+      await tunnel.stop();
+      return 0;
+    }
+    wake = opened;
     const holderId = 'driver-' + runtime.conductor.newUlid();
     const seenAttention = new Set<string>();
     return await pollConductorPasses({
@@ -818,6 +1091,7 @@ async function runCommand(
       sleep: options.sleep ?? defaultSleep,
       stopSignal: signal,
       once: flags.once,
+      wake,
       releaseTunnel: () => tunnel.release(),
       eachPass: async (pass, result, nowIso) => {
         io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
@@ -833,6 +1107,14 @@ async function runCommand(
           runs: result.runs,
           attention: result.attention,
         });
+        // OT5: mark every advanced run after its pass has journalled its result
+        // (only advanced passes journalled results; the exporter re-reads the
+        // records, so the root is emitted whenever the run is already terminal).
+        for (const report of result.runs) {
+          if (report.outcome === 'advanced') {
+            markRunQuietly(runtime.telemetry.mark, report.runId);
+          }
+        }
         for (const item of result.attention) {
           const key = `${item.runId}:${item.kind}`;
           if (seenAttention.has(key)) {
@@ -852,6 +1134,10 @@ async function runCommand(
       process.removeListener('SIGINT', onSignal);
       process.removeListener('SIGTERM', onSignal);
     }
+    // OT5: stop the background exporter within the 2 s stop race (plan §3.5).
+    await stopTelemetryExporter(runtime);
+    // K9: close the change-feed reader after the poll loop; idempotent.
+    wake?.close();
   }
 }
 
@@ -885,6 +1171,47 @@ async function recordPassTrace(
 }
 
 /**
+ * The between-passes sleep of the poll loop. K9: a change signal ends the sleep
+ * early, so the next pass runs at once; a stream that closes without a signal
+ * keeps the back-off for the rest of this sleep.
+ */
+async function sleepBetweenPasses(options: {
+  readonly delayMs: number;
+  readonly signal: AbortSignal;
+  readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  readonly wake: ChangeWakeReader | undefined;
+}): Promise<void> {
+  const { signal, wake } = options;
+  let sleepSettled = false;
+  const iteration = new AbortController();
+  const onStop = (): void => iteration.abort();
+  signal.addEventListener('abort', onStop, { once: true });
+  if (signal.aborted) {
+    iteration.abort();
+  }
+  try {
+    const slept = options.sleep(options.delayMs, iteration.signal).then(() => {
+      sleepSettled = true;
+    });
+    if (wake === undefined) {
+      await slept;
+      return;
+    }
+    const arrived = await Promise.race([
+      slept.then(() => false),
+      wake.waitForSignal(iteration.signal),
+    ]);
+    if (!arrived && !sleepSettled) {
+      // The stream closed without a signal: keep the back-off.
+      await slept;
+    }
+  } finally {
+    signal.removeEventListener('abort', onStop);
+    iteration.abort(); // ends a pending sleep timer and a pending waiter
+  }
+}
+
+/**
  * The shared poll loop of `conductor run`: one pass at a time under the
  * driver lease, printing one line per pass through `eachPass`, polling with
  * back-off from 30 seconds to 2 minutes, with a 10-second floor while a run
@@ -898,6 +1225,11 @@ async function pollConductorPasses(options: {
   readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   readonly stopSignal?: AbortSignal;
   readonly once: boolean;
+  /**
+   * K9: the change-feed wake reader; when present its signal ends the
+   * between-passes sleep early.
+   */
+  readonly wake?: ChangeWakeReader;
   /**
    * KF-35: releases the driver's runner tunnel after `releaseLeases`, leaving
    * the forward running: detached lanes still talk to the server through it.
@@ -938,7 +1270,13 @@ async function pollConductorPasses(options: {
       if (result.outcome !== 'refused') {
         previousDelay = nextPollDelayMs(previousDelay, result.progressed);
       }
-      await options.sleep(pollSleepMs(previousDelay ?? MIN_POLL_MS, result), signal);
+      const delayMs = pollSleepMs(previousDelay ?? MIN_POLL_MS, result);
+      await sleepBetweenPasses({
+        delayMs,
+        signal,
+        sleep: options.sleep,
+        wake: options.wake,
+      });
       if (signal.aborted) {
         break;
       }
@@ -1031,6 +1369,8 @@ function printDryRunAppendedLines(io: CliIo, appended: readonly LaneRunJournalEn
         step = parsed.step;
       } else if (parsed !== null && parsed.kind === 'premerge') {
         step = 'premerge';
+      } else if (parsed !== null && parsed.kind === 'merge-enqueue') {
+        step = 'merge-enqueue';
       }
       const result = resultsByKey.get(entry.key);
       io.stdout(
@@ -1156,6 +1496,7 @@ interface ReapFlags {
   readonly sessions: boolean;
   readonly dryRun: boolean;
   readonly yes: boolean;
+  readonly forceUnsealed: boolean;
 }
 
 /**
@@ -1168,6 +1509,7 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
   let sessions = false;
   let dryRun = false;
   let yes = false;
+  let forceUnsealed = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]!;
     if (token === '--worktrees') {
@@ -1202,14 +1544,28 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
       yes = true;
       continue;
     }
+    if (token === '--force-unsealed') {
+      // C2': given at most once; a secret-shaped or path-shaped token is
+      // never echoed, so the message names the flag, not the argv value.
+      if (forceUnsealed) {
+        io.stderr(`conductor reap: --force-unsealed given more than once\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      forceUnsealed = true;
+      continue;
+    }
     if (token.startsWith('--')) {
-      io.stderr(`Unknown conductor reap flag: ${token}\n${CONDUCTOR_HELP}\n`);
+      io.stderr(`conductor reap: unknown or unsupported flag\n${CONDUCTOR_HELP}\n`);
       return null;
     }
     io.stderr(`conductor reap takes no positional arguments\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { worktrees, sessions, dryRun, yes };
+  if (forceUnsealed && sessions) {
+    io.stderr(`conductor reap: --force-unsealed applies only to --worktrees\n${CONDUCTOR_HELP}\n`);
+    return null;
+  }
+  return { worktrees, sessions, dryRun, yes, forceUnsealed };
 }
 
 /**
@@ -1273,9 +1629,14 @@ async function reapCommand(
   }
   const result = await runtime.conductor.reapLaneWorktrees.reapLaneWorktrees({
     dryRun: flags.dryRun,
+    forceUnsealed: flags.forceUnsealed,
     nowIso: nowIsoOf(options),
   });
   io.stdout(`${JSON.stringify(result)}\n`);
+  // A refused or unknown top-level outcome is a failure too (C2').
+  if (result.outcome !== 'reaped') {
+    return 1;
+  }
   // Refusals and unknowns both land in `refused`; a failed post-removal
   // journal append lands in `journalFailed`. Nothing refused, unknown or
   // un-journalled exits 0.
@@ -1431,6 +1792,179 @@ async function scheduleCommand(
   return 0;
 }
 
+/** True when the conductor help text was requested by subcommand or flag. */
+function conductorHelpRequested(subcommand: string, argv: readonly string[]): boolean {
+  return subcommand === 'help' || subcommand === '--help' || subcommand === '-h' || argv[1] === '--help' || argv[1] === '-h';
+}
+
+/**
+ * The exit code of a usage error for a record-only control subcommand, or
+ * null when the shape accepts what the caller supplied. Checks misplaced
+ * flags, unwanted run ids and the durable state directory a writing
+ * subcommand needs.
+ */
+function controlUsageExit(
+  subcommand: string,
+  shape: (typeof SUBCOMMAND_SHAPE)[string] | undefined,
+  parsed: ControlOptions,
+  stateDir: string | undefined,
+  io: CliIo,
+): number | null {
+  if (shape === undefined) {
+    return null;
+  }
+  const misplaced =
+    (parsed.force && !shape.force ? '--force' : null) ??
+    (parsed.lift && !shape.lift ? '--lift' : null) ??
+    (parsed.stalled && !shape.stalled ? '--stalled' : null) ??
+    (parsed.revision !== undefined && !shape.revision ? '--revision' : null);
+  if (misplaced !== null) {
+    io.stderr(`conductor ${subcommand} does not take ${misplaced}\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  if (parsed.stalled && parsed.positionals.length > 0) {
+    io.stderr(`conductor ${subcommand} --stalled takes no run id\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  if (shape.runId === 'none' && parsed.positionals.length > 0) {
+    io.stderr(`conductor ${subcommand} takes no run id\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  // A halt, stop or resume is a record the driver obeys later: in-memory stores would report success for a
+  // record that vanishes when this process exits (a halt that is no kill switch).
+  if (shape.writes && stateDir === undefined) {
+    io.stderr(`conductor ${subcommand} needs a durable state directory (--state-dir or FLEET_STATE_DIR)\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  return null;
+}
+
+/** `conductor status --stalled`: the runs parked past the stall threshold, oldest first, as one JSON document. */
+async function conductorStalledExit(
+  conductor: FleetCliRuntime['conductor'],
+  io: CliIo,
+  nowIso: string,
+): Promise<number> {
+  const result = await conductor.listStalledRuns.listStalledRuns({ nowIso });
+  io.stdout(`${JSON.stringify(result)}\n`);
+  return exitFor(result);
+}
+
+/** `conductor status`: one JSON document describing lane runs. */
+async function conductorStatusExit(
+  conductor: FleetCliRuntime['conductor'],
+  io: CliIo,
+  nowIso: string,
+  runId: string | undefined,
+): Promise<number> {
+  const result = await conductor.inspectLaneRuns.inspectLaneRuns({
+    nowIso,
+    ...(runId !== undefined ? { runId } : {}),
+  });
+  // The status document carries `crashedStarts` only; an incomplete scan is told on stderr, not as an extra field.
+  if (result.outcome === 'listed' && result.crashedStartsIncomplete === true) {
+    io.stdout(`${JSON.stringify(result, (key: string, value: unknown) => (key === 'crashedStartsIncomplete' ? undefined : value))}\n`);
+    io.stderr(crashedStartScanWarning('status', 'incomplete') ?? '');
+    return exitFor(result);
+  }
+  io.stdout(`${JSON.stringify(result)}\n`);
+  return exitFor(result);
+}
+
+/** `conductor halt`: records the halt intent, or its lift with `--lift`. */
+async function conductorHaltExit(
+  conductor: FleetCliRuntime['conductor'],
+  io: CliIo,
+  nowIso: string,
+  lift: boolean,
+): Promise<number> {
+  const result = await conductor.halt.set({ halted: !lift, nowIso });
+  const printed =
+    result.outcome === 'refused'
+      ? result
+      : {
+          outcome: 'recorded',
+          halted: result.record.halted,
+          changed: result.outcome === 'changed',
+        };
+  io.stdout(`${JSON.stringify(printed)}\n`);
+  return result.outcome === 'refused' ? 1 : 0;
+}
+
+/**
+ * Shared atomic lease-check and record flow for run control subcommands (`stop`
+ * and `resume`), refusing while a live driver lease is held.
+ */
+async function guardedRunControlExit<T extends { readonly outcome: string }>(
+  subcommand: 'stop' | 'resume',
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  nowIso: string,
+  parsed: ControlOptions,
+  stateDir: string | undefined,
+  record: (runId: string) => Promise<T>,
+): Promise<number> {
+  const runId = parsed.positionals[0];
+  if (runId === undefined) {
+    io.stderr(`conductor ${subcommand} requires a run id\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  // `controlUsageExit` already demanded a durable state directory above; the
+  // guard re-checks so the lease lock path is never built from `undefined`.
+  if (stateDir === undefined) {
+    io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'driver-lease-live' })}\n`);
+    return 1;
+  }
+  const guarded = await recordUnderDriverLeaseGuard(runtime, stateDir, nowIso, async () => record(runId));
+  if (guarded.refused) {
+    io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'driver-lease-live' })}\n`);
+    return 1;
+  }
+  io.stdout(`${JSON.stringify(guarded.result)}\n`);
+  return exitFor(guarded.result);
+}
+
+/** `conductor stop`: records a stop intent for a run, refusing while a live driver lease is held. */
+async function conductorStopExit(
+  conductor: FleetCliRuntime['conductor'],
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  nowIso: string,
+  parsed: ControlOptions,
+  stateDir: string | undefined,
+): Promise<number> {
+  return await guardedRunControlExit('stop', io, runtime, nowIso, parsed, stateDir, async (runId) =>
+    conductor.requestLaneRunStop.requestLaneRunStop({
+      runId,
+      mode: parsed.force ? 'force' : 'graceful',
+      via: 'cli',
+      entryId: conductor.newUlid(),
+      nowIso,
+      ...(parsed.revision !== undefined ? { expectedRevision: parsed.revision } : {}),
+    }),
+  );
+}
+
+/** `conductor resume`: records a resume request for a run, refusing while a live driver lease is held. */
+async function conductorResumeExit(
+  conductor: FleetCliRuntime['conductor'],
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  nowIso: string,
+  parsed: ControlOptions,
+  stateDir: string | undefined,
+): Promise<number> {
+  return await guardedRunControlExit('resume', io, runtime, nowIso, parsed, stateDir, async (runId) =>
+    conductor.resumeLaneRun.requestResume({
+      runId,
+      via: 'cli',
+      entryId: conductor.newUlid(),
+      nowIso,
+      ...(parsed.revision !== undefined ? { expectedRevision: parsed.revision } : {}),
+    }),
+  );
+}
+
 /** `fleet-v2 conductor <subcommand>` dispatch. */
 export async function conductorCommand(
   argv: readonly string[],
@@ -1445,7 +1979,7 @@ export async function conductorCommand(
   if (subcommand === 'schedule') {
     return await scheduleCommand(argv.slice(1), io, runtime, options);
   }
-  if (subcommand === 'help' || subcommand === '--help' || subcommand === '-h' || argv[1] === '--help' || argv[1] === '-h') {
+  if (conductorHelpRequested(subcommand, argv)) {
     io.stdout(`${CONDUCTOR_HELP}\n`);
     return 0;
   }
@@ -1464,86 +1998,25 @@ export async function conductorCommand(
   if (parsed === null) {
     return 2;
   }
-  const { force, lift, revision, positionals } = parsed;
   const shape = SUBCOMMAND_SHAPE[subcommand];
-  if (shape !== undefined) {
-    const misplaced =
-      (force && !shape.force ? '--force' : null) ??
-      (lift && !shape.lift ? '--lift' : null) ??
-      (revision !== undefined && !shape.revision ? '--revision' : null);
-    if (misplaced !== null) {
-      io.stderr(`conductor ${subcommand} does not take ${misplaced}\n${CONDUCTOR_HELP}\n`);
-      return 2;
-    }
-    if (shape.runId === 'none' && positionals.length > 0) {
-      io.stderr(`conductor ${subcommand} takes no run id\n${CONDUCTOR_HELP}\n`);
-      return 2;
-    }
-    // A halt, stop or resume is a record the driver obeys later: in-memory stores would report success for a
-    // record that vanishes when this process exits (a halt that is no kill switch).
-    if (shape.writes && options.stateDir === undefined) {
-      io.stderr(`conductor ${subcommand} needs a durable state directory (--state-dir or FLEET_STATE_DIR)\n${CONDUCTOR_HELP}\n`);
-      return 2;
-    }
+  const usageExit = controlUsageExit(subcommand, shape, parsed, options.stateDir, io);
+  if (usageExit !== null) {
+    return usageExit;
   }
   const nowIso = options.now !== undefined ? options.now() : new Date().toISOString();
   const conductor = runtime.conductor;
   switch (subcommand) {
-    case 'status': {
-      const runId = positionals[0];
-      const result = await conductor.inspectLaneRuns.inspectLaneRuns({
-        nowIso,
-        ...(runId !== undefined ? { runId } : {}),
-      });
-      io.stdout(`${JSON.stringify(result)}\n`);
-      return exitFor(result);
-    }
-    case 'halt': {
-      const result = await conductor.halt.set({ halted: !lift, nowIso });
-      const printed =
-        result.outcome === 'refused'
-          ? result
-          : {
-              outcome: 'recorded',
-              halted: result.record.halted,
-              changed: result.outcome === 'changed',
-            };
-      io.stdout(`${JSON.stringify(printed)}\n`);
-      return result.outcome === 'refused' ? 1 : 0;
-    }
-    case 'stop': {
-      const runId = positionals[0];
-      if (runId === undefined) {
-        io.stderr(`conductor stop requires a run id\n${CONDUCTOR_HELP}\n`);
-        return 2;
+    case 'status':
+      if (parsed.stalled) {
+        return await conductorStalledExit(conductor, io, nowIso);
       }
-      const result = await conductor.requestLaneRunStop.requestLaneRunStop({
-        runId,
-        mode: force ? 'force' : 'graceful',
-        via: 'cli',
-        entryId: conductor.newUlid(),
-        nowIso,
-        ...(revision !== undefined ? { expectedRevision: revision } : {}),
-      });
-      io.stdout(`${JSON.stringify(result)}\n`);
-      return exitFor(result);
-    }
-    case 'resume': {
-      const runId = positionals[0];
-      if (runId === undefined) {
-        io.stderr(`conductor resume requires a run id\n${CONDUCTOR_HELP}\n`);
-        return 2;
-      }
-      const result = await conductor.resumeLaneRun.requestResume({
-        runId,
-        via: 'cli',
-        entryId: conductor.newUlid(),
-        nowIso,
-        ...(revision !== undefined ? { expectedRevision: revision } : {}),
-      });
-      io.stdout(`${JSON.stringify(result)}\n`);
-      return exitFor(result);
-    }
+      return await conductorStatusExit(conductor, io, nowIso, parsed.positionals[0]);
+    case 'halt':
+      return await conductorHaltExit(conductor, io, nowIso, parsed.lift);
+    case 'stop':
+      return await conductorStopExit(conductor, io, runtime, nowIso, parsed, options.stateDir);
+    case 'resume':
+      return await conductorResumeExit(conductor, io, runtime, nowIso, parsed, options.stateDir);
     default:
       io.stderr(`Unknown conductor subcommand: ${subcommand === '' ? '(none)' : subcommand}\n${CONDUCTOR_HELP}\n`);
       return 2;

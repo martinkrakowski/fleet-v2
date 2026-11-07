@@ -5,7 +5,7 @@
  * is in-process only and never sent to a client.
  */
 
-export type ChangeSignalKind = 'attempt' | 'capacity' | 'work-order';
+export type ChangeSignalKind = 'attempt' | 'capacity' | 'work-order' | 'plan' | 'merge';
 export interface ChangeSignal {
   readonly kind: ChangeSignalKind;
   readonly id: string;

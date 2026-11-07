@@ -22,7 +22,11 @@ import * as path from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import type { DoctorCommandExecutor, DoctorProbes } from "@fleet/onboarding";
+import {
+  GH_BINARY_CANDIDATES,
+  type DoctorCommandExecutor,
+  type DoctorProbes,
+} from "@fleet/onboarding";
 import { parseInstallation } from "@fleet/installation";
 
 import { runCli, type CliIo } from "../index.js";
@@ -112,7 +116,12 @@ function passingDoctorProbes(): DoctorProbes {
       sha256: "c".repeat(64),
     }),
     expectedOcmRunHash: async () => "c".repeat(64),
+    ghBinary: async () => ({
+      resolved: "/usr/bin/gh",
+      candidates: GH_BINARY_CANDIDATES,
+    }),
     seatProbe: async () => ({ outcome: "pass", reason: "answered" }),
+    serverProbe: async () => ({ outcome: "pass", reason: "the opencode server answered" }),
   };
 }
 

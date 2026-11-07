@@ -167,6 +167,12 @@ export interface GateSlotSection {
 /** The fields a host runner carries regardless of its kind. */
 interface HostRunnerCommon {
   readonly port: number;
+  /**
+   * The offset the bundled runner program adds to `port` when it dials the
+   * server over an ssh tunnel. The frozen `bin/ocm-run` dials `port + 1`, so
+   * the loader only accepts the offset that program implements; absent means 1.
+   */
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly capabilities?: RunnerCapabilityDeclaration;
   readonly maxLanes?: number;
@@ -191,6 +197,14 @@ export type HostRunnerSection = OpencodeHostRunnerSection | AgyHostRunnerSection
 export interface HostSection {
   readonly transport: HostTransport;
   readonly sshAlias?: string;
+  /** Optional lowercase container name the host's runner runs in. */
+  readonly container?: string;
+  /**
+   * Per-role ssh alias overrides: `roleAliases[role]` wins over `sshAlias`
+   * for that role. Only roles the host holds may appear, and only on an ssh
+   * host.
+   */
+  readonly roleAliases?: Readonly<Partial<Record<HostRole, string>>>;
   readonly worktreeRoot: string;
   readonly tmpDir?: string;
   readonly roles: readonly HostRole[];
@@ -260,19 +274,34 @@ export interface AutoMergePolicy {
 }
 
 /**
- * Reaper finding kinds that have a repair (conductor plan §3.9.2, D14). The first four are
- * record-only; `orphan-session` aborts a session and is destructive. `driverless-run` and
- * `orphan-worktree` are report-only and have no repair (D15: no worktree removal).
+ * Reaper finding kinds that have a repair (conductor plan §3.9.2, D14, §3.10.4). The first four
+ * are record-only; `merged-worktree` removes a merged worktree and `orphan-session` aborts a
+ * session — both destructive and opt-in (D17, D14). `driverless-run` and `orphan-worktree` are
+ * report-only and have no repair (D15: no worktree removal).
  */
 export type ConductorReaperRepairKind =
   | 'dead-attempt'
   | 'leaked-slot'
   | 'stale-stop'
   | 'stale-attention'
+  | 'merged-worktree'
   | 'orphan-session';
 
 /** Per-kind repair opt-ins as written in the file; an absent kind is off. */
 export type ConductorReaperRepairs = Readonly<Partial<Record<ConductorReaperRepairKind, boolean>>>;
+
+/** The v2 `policy.conductor.reaper.worktrees` block as written (§3.10.4); absent fields default. */
+export interface ConductorReaperWorktreePolicy {
+  readonly retentionHours?: number;
+  readonly maxRemovalsPerPass?: number;
+  readonly passBudgetSeconds?: number;
+}
+
+/** The v2 `policy.conductor.reaper.disk` block as written (§3.10.4, §3.10.6); absent fields default. */
+export interface ConductorReaperDiskPolicy {
+  readonly minFreePercent?: number;
+  readonly clearFreePercent?: number;
+}
 
 /** The v2 `policy.conductor.reaper` section as written; only `enabled` is required. */
 export interface ConductorReaperPolicy {
@@ -281,6 +310,8 @@ export interface ConductorReaperPolicy {
   readonly graceMinutes?: number;
   readonly staleStopMinutes?: number;
   readonly repairs?: ConductorReaperRepairs;
+  readonly worktrees?: ConductorReaperWorktreePolicy;
+  readonly disk?: ConductorReaperDiskPolicy;
 }
 
 /**
@@ -327,6 +358,19 @@ export interface ResolvedTelemetryPolicy {
   readonly salt: string | null;
 }
 
+/** The effective `policy.conductor.reaper.worktrees` block: every field present (§3.10.4). */
+export interface ResolvedConductorReaperWorktreePolicy {
+  readonly retentionHours: number;
+  readonly maxRemovalsPerPass: number;
+  readonly passBudgetSeconds: number;
+}
+
+/** The effective `policy.conductor.reaper.disk` block: every field present (§3.10.4). */
+export interface ResolvedConductorReaperDiskPolicy {
+  readonly minFreePercent: number;
+  readonly clearFreePercent: number;
+}
+
 /** The effective reaper policy: every field present. */
 export interface ResolvedConductorReaperPolicy {
   readonly enabled: boolean;
@@ -334,6 +378,8 @@ export interface ResolvedConductorReaperPolicy {
   readonly graceMinutes: number;
   readonly staleStopMinutes: number;
   readonly repairs: Readonly<Record<ConductorReaperRepairKind, boolean>>;
+  readonly worktrees: ResolvedConductorReaperWorktreePolicy;
+  readonly disk: ResolvedConductorReaperDiskPolicy;
 }
 
 /** The effective conductor policy: every field present (`resolveConductorPolicy`). */
@@ -365,6 +411,102 @@ export interface ResolvedSeatsPolicy {
   readonly observationCooldownMinutes: number;
 }
 
+/** The v2 `policy.board` section (WB6p). Every field optional; absent or
+ * malformed anywhere is the whole default (work-board plan D3, D6, §3.4). */
+export interface BoardPolicySection {
+  readonly forgeStaleMinutes?: number;
+  readonly declarationTtlMinutes?: number;
+  readonly doneWindowDays?: number;
+  readonly forgeSyncMinutes?: number;
+}
+
+export type MergeVetoMode = 'off' | 'shadow' | 'live';
+
+/** The `veto` block of a `policy.merge.repos` entry. Every field optional. */
+export interface MergeVetoPolicy {
+  readonly mode?: MergeVetoMode;
+  readonly holdConfidence?: number;
+}
+
+/** One `policy.merge.repos["<owner>/<repo>"]` entry as written; `projectId` is required. */
+export interface MergeRepositoryPolicy {
+  readonly projectId?: string;
+  readonly shadow?: boolean;
+  readonly unattended?: boolean;
+  readonly requiredContexts?: readonly string[];
+  readonly updateBranch?: boolean;
+  readonly macosProcedure?: string;
+  readonly maxAttempts?: number;
+  readonly checksGraceMinutes?: number;
+  readonly veto?: MergeVetoPolicy;
+}
+
+/** The v2 `policy.merge` section as written; read it through `resolveMergePolicy`. */
+export interface MergePolicySection {
+  readonly repos?: Readonly<Record<string, MergeRepositoryPolicy>>;
+}
+
+/** The v2 `policy.daemon` section as written; read it through `resolveMergePolicy`. */
+export interface MergeDaemonSection {
+  readonly intervalSeconds?: number;
+  readonly budgetSeconds?: number;
+  readonly settleSeconds?: number;
+  /**
+   * Chain refresh mode as written. Only `shadow` is valid; `live` and any
+   * unknown value load with a `chain-refresh-mode-invalid` warning and are
+   * kept verbatim so a write round-trips the operator's own text.
+   */
+  readonly chainRefresh?: 'shadow' | 'live' | (string & {});
+  /**
+   * PT1a: minutes a run may sit parked before the conductor raises its stall attention; 1..1440,
+   * default 30. As written: a value outside that range or not an integer loads with a
+   * `stall-after-minutes-invalid` warning, is kept verbatim for a round trip and resolves to 30.
+   */
+  readonly stallAfterMinutes?: number | (string & {}) | boolean | null;
+}
+
+/** A merge repository policy with every default applied (`resolveMergePolicy`). */
+export interface ResolvedMergeRepositoryPolicy {
+  readonly owner: string;
+  readonly repo: string;
+  /** `<owner>/<repo>`. */
+  readonly repositoryKey: string;
+  readonly projectId: string;
+  readonly shadow: boolean;
+  readonly unattended: boolean;
+  readonly requiredContexts: readonly string[];
+  readonly updateBranch: boolean;
+  /** Null means none. */
+  readonly macosProcedure: string | null;
+  readonly maxAttempts: number;
+  readonly checksGraceMinutes: number;
+  readonly veto: { readonly mode: MergeVetoMode; readonly holdConfidence: number };
+}
+
+/** The daemon tick settings with every default applied (`resolveMergePolicy`). */
+export interface ResolvedMergeDaemonPolicy {
+  readonly intervalSeconds: number;
+  readonly budgetSeconds: number;
+  readonly settleSeconds: number;
+  /**
+   * The effective chain-refresh mode: `shadow` when written `shadow` or absent,
+   * `invalid` when written `live` or anything unknown. Never `live`.
+   */
+  readonly chainRefresh: 'shadow' | 'invalid';
+  /** PT1a: the stall threshold in minutes with the default (30) applied. */
+  readonly stallAfterMinutes: number;
+}
+
+/** The result of `resolveMergePolicy`: the normalized sections at their revision, or a refusal code. */
+export type MergePolicyRead =
+  | {
+      readonly outcome: 'resolved';
+      readonly policyRevision: string;
+      readonly repositories: readonly ResolvedMergeRepositoryPolicy[];
+      readonly daemon: ResolvedMergeDaemonPolicy;
+    }
+  | { readonly outcome: 'invalid'; readonly reason: string };
+
 /**
  * The v2 `policy` section: shape only. The rules are enforced by the loader
  * itself through `validateSeatPolicy` (lane O5) on every v2 file.
@@ -380,10 +522,16 @@ export interface PolicySection {
   readonly autoMerge?: AutoMergePolicy;
   /** Absent means off (`DEFAULT_CONDUCTOR_POLICY`); read it through `resolveConductorPolicy`. */
   readonly conductor?: ConductorPolicy;
+  /** Absent means the plan defaults (`DEFAULT_BOARD_POLICY`); read it through `resolveBoardPolicy`. */
+  readonly board?: BoardPolicySection;
   /** Absent means off (`DEFAULT_TELEMETRY_POLICY`); read it through `resolveTelemetryPolicy`. */
   readonly telemetry?: TelemetryPolicy;
   /** Absent means no rotation, 60-minute cooling, observations off (`DEFAULT_SEATS_POLICY`); read it through `resolveSeatsPolicy`. */
   readonly seats?: SeatsPolicy;
+  /** Absent means no merge repository is configured; read it through `resolveMergePolicy`. */
+  readonly merge?: MergePolicySection;
+  /** Absent means the D-DT9 defaults 60 / 45 / 20; read it through `resolveMergePolicy`. */
+  readonly daemon?: MergeDaemonSection;
 }
 
 /** The v2 `shelf` section with the local provider (D1, default). */
@@ -480,6 +628,15 @@ export type DecisionsSectionV2 =
   | JevDecisionsSection
   | AnswerFileDecisionsSection;
 
+/** The optional v2 `daemon` section: paths for the user-scope scheduler units. */
+export interface DaemonSection {
+  readonly nodePath: string;
+  readonly cliPath: string;
+  readonly stateDir: string;
+  readonly unitDir: string;
+  readonly installationFile: string;
+}
+
 /** The v2 file shape (plan section 1). */
 export interface FleetInstallationV2 {
   readonly schemaVersion: 2;
@@ -498,6 +655,7 @@ export interface FleetInstallationV2 {
   readonly verification?: VerificationProceduresSection;
   readonly waves?: WavesSection;
   readonly decisions?: DecisionsSectionV2;
+  readonly daemon?: DaemonSection;
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +679,7 @@ export interface DerivedRunnerCapabilities {
 export interface OpencodeHostRunnerModel {
   readonly kind: 'opencode';
   readonly port?: number;
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
@@ -531,6 +690,7 @@ export interface OpencodeHostRunnerModel {
 export interface AgyHostRunnerModel {
   readonly kind: 'agy';
   readonly port?: number;
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
@@ -549,6 +709,8 @@ export type HostRunnerModel = OpencodeHostRunnerModel | AgyHostRunnerModel;
 export interface HostModel {
   readonly transport: HostTransport;
   readonly sshAlias?: string;
+  readonly container?: string;
+  readonly roleAliases?: Readonly<Partial<Record<HostRole, string>>>;
   readonly worktreeRoot?: string;
   readonly tmpDir?: string;
   readonly roles: readonly HostRole[];
@@ -589,6 +751,7 @@ export interface FleetInstallationModel {
   readonly verification?: VerificationProceduresSection;
   readonly waves?: WavesSection;
   readonly decisions?: DecisionsSectionV2;
+  readonly daemon?: DaemonSection;
 }
 
 // ---------------------------------------------------------------------------
@@ -632,4 +795,6 @@ export interface FleetInstallation {
   readonly policy?: PolicySection;
   /** v2: decision provider configuration (D3). Never set in v1. */
   readonly decisions?: DecisionsSectionV2;
+  /** v2: the daemon tick's user-scope scheduler unit paths. Never set in v1. */
+  readonly daemon?: DaemonSection;
 }

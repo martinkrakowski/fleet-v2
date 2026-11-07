@@ -80,7 +80,17 @@ async function resultReasonCodesOf(current: ConductedFixture): Promise<readonly 
 }
 
 /** `expected` must appear inside `actual` in order (a subsequence of reason codes). */
-function expectCodesInOrder(actual: readonly string[], expected: readonly string[]): void {
+function expectCodesInOrder(rawActual: readonly string[], expected: readonly string[]): void {
+  // The gate and the brief-check review are opened in the same pass and run
+  // concurrently, so their results land in either order; read a brief-check
+  // result that precedes the gate result as if the gate came first.
+  const actual = [...rawActual];
+  for (let i = 1; i + 2 < actual.length; i += 1) {
+    if (actual[i - 1] === 'collected' && actual[i] === 'review-passed' && actual[i + 1] === 'gate-passed') {
+      actual[i] = 'gate-passed';
+      actual[i + 1] = 'review-passed';
+    }
+  }
   let cursor = 0;
   for (const code of actual) {
     if (cursor < expected.length && code === expected[cursor]) {
@@ -129,6 +139,60 @@ async function driveUntilParked(current: ConductedFixture, maxPasses: number): P
       receiptsRecorded = await current.recordAcceptanceReceipts();
     }
   }
+}
+
+
+/**
+ * Drive live passes until `done()` holds (or the budget runs out), recording the
+ * acceptance receipts once the journal shows `collected`. Answers the passes driven.
+ */
+async function driveUntil(
+  current: ConductedFixture,
+  maxPasses: number,
+  what: string,
+  done: () => Promise<boolean>,
+): Promise<number> {
+  const deadline = Date.now() + DRIVE_BUDGET_MS;
+  let receiptsRecorded = false;
+  let passes = 0;
+  for (;;) {
+    if (await done()) {
+      return passes;
+    }
+    if (passes >= maxPasses || Date.now() >= deadline) {
+      throw new Error(
+        `${what} did not happen within ${maxPasses} passes (${passes} driven, ocm-run: ${await ocmRunTailOf(current)}; journal: ` +
+        `${(await resultReasonCodesOf(current)).join(',')})`,
+      );
+    }
+    const pass = await current.runPass();
+    expect(pass.code).toBe(0);
+    passes += 1;
+    await new Promise((resolve) => setTimeout(resolve, PASS_PAUSE_MS));
+    const entries = await journalOf(current);
+    if (
+      !receiptsRecorded &&
+      entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'collected')
+    ) {
+      receiptsRecorded = await current.recordAcceptanceReceipts();
+    }
+  }
+}
+
+/** True once the run has journalled its merge-enqueue intent (the hand-off to the queue). */
+async function enqueueIntentOf(current: ConductedFixture) {
+  const entries = await journalOf(current);
+  return entries.find((entry) => entry.kind === 'intent' && entry.key !== null && entry.key.includes('/merge-enqueue@')) ?? null;
+}
+
+async function conductStatesOf(current: ConductedFixture): Promise<readonly string[]> {
+  const entries = await journalOf(current);
+  return entries.filter((entry) => entry.kind === 'conduct').map((entry) => entry.state as string);
+}
+
+async function queueEntriesOf(current: ConductedFixture) {
+  const deadlineIso = new Date(Date.now() + 60_000).toISOString();
+  return current.runtime.execution.mergeQueueRepository.listMergeEntries({ deadlineIso });
 }
 
 describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted accept + park over ssh (Q1c)', () => {
@@ -232,6 +296,90 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted accept + park over
     };
     expect(Object.values(state.sessions)).toEqual(['ended']);
     expect(state.interrupts.length).toBeLessThanOrEqual(1);
+  }, TEST_TIMEOUT_MS);
+
+  it('scenario 6 (KS7b): with auto-merge on, a run enqueues its PR on the merge queue, waits there and reaches merged once the queue merges it', async () => {
+    const current = await startFixture({ committingLane: true, autoMerge: true });
+    const startResult = await current.start(1);
+    expect(startResult.code).toBe(0);
+
+    await driveUntil(current, HAPPY_PATH_PASS_BUDGET, 'the merge hand-off', async () => (await enqueueIntentOf(current)) !== null);
+
+    // The run handed its PR to the queue and is waiting there: one queued entry,
+    // the run's own, with no merge result journalled and no merge call on the forge.
+    const intent = (await enqueueIntentOf(current))!;
+    const entries = await queueEntriesOf(current);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      state: 'queued',
+      pullRequest: 7,
+      runId: current.runId,
+      enqueuedBy: 'conductor',
+      repository: { owner: 'example-owner', repo: 'example-repo' },
+      entryId: intent.mintedId,
+    });
+    for (let waited = 0; waited < 2; waited += 1) {
+      const pass = await current.runPass();
+      expect(pass.code).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, PASS_PAUSE_MS));
+    }
+    expect(await queueEntriesOf(current)).toHaveLength(1);
+    expect((await runRecordOf(current))!.parked).toBeNull();
+    expect(await conductStatesOf(current)).not.toContain('merged');
+    expect(
+      (await journalOf(current)).filter((entry) => entry.kind === 'result' && entry.key === intent.key),
+    ).toEqual([]);
+    const ghBefore = await fs.readFile(current.ghArgvLog, 'utf8');
+    expect(ghBefore).not.toContain('pr merge');
+
+    // The daemon's merge pass merges the entry. The run reads the queue's answer and
+    // journals it, but the forge still reads the PR open: the run waits, never merged.
+    await current.settleQueueEntry({ state: 'merged' });
+    await driveUntil(current, HAPPY_PATH_PASS_BUDGET, 'the queue answer being journalled', async () =>
+      (await resultReasonCodesOf(current)).includes('merged'),
+    );
+    for (let waited = 0; waited < 2; waited += 1) {
+      const pass = await current.runPass();
+      expect(pass.code).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, PASS_PAUSE_MS));
+    }
+    expect(await conductStatesOf(current)).not.toContain('merged');
+    // The forge then reads the PR merged and the run ends.
+    await current.markPullRequestMerged();
+    await driveUntil(current, HAPPY_PATH_PASS_BUDGET, 'the run reaching merged', async () =>
+      (await conductStatesOf(current)).includes('merged'),
+    );
+    expectCodesInOrder(await resultReasonCodesOf(current), [
+      'dispatch-started', 'collected', 'gate-passed', 'review-passed', 'review-passed', 'accepted', 'pr-opened', 'premerge-success', 'merged',
+    ]);
+    const run = await runRecordOf(current);
+    expect(run!.parked).toBeNull();
+    expect((await fs.readFile(current.ghArgvLog, 'utf8'))).not.toContain('pr merge');
+  }, TEST_TIMEOUT_MS);
+
+  it('scenario 7 (KS7b): a queue drop for a conflict with a round left sends the run to fixing', async () => {
+    const current = await startFixture({ committingLane: true, autoMerge: true });
+    const startResult = await current.start(1);
+    expect(startResult.code).toBe(0);
+
+    await driveUntil(current, HAPPY_PATH_PASS_BUDGET, 'the merge hand-off', async () => (await enqueueIntentOf(current)) !== null);
+    await current.settleQueueEntry({ state: 'dropped', reason: 'conflict' });
+    await driveUntil(current, HAPPY_PATH_PASS_BUDGET, 'the run entering fixing', async () =>
+      (await conductStatesOf(current)).includes('fixing'),
+    );
+
+    const journal = await journalOf(current);
+    const dropped = journal.filter((entry) => entry.kind === 'result' && entry.reasonCode === 'merge-dropped');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({ outcome: 'completed', detail: 'conflict' });
+    expect(await conductStatesOf(current)).not.toContain('merged');
+    // The fix round is the run's own business from here: this fixture's reviews passed, so there
+    // are no findings to hand over and the fix prepare itself may refuse (KF-9, scenario 4). Any
+    // park therefore comes from `fixing`, never from the merge.
+    const parked = (await runRecordOf(current))!.parked;
+    if (parked !== null) {
+      expect(parked.parkedFrom).toBe('fixing');
+    }
   }, TEST_TIMEOUT_MS);
 
   it('scenario 4: a refused fix-prepare parks the run within two passes (KF-9)', async () => {

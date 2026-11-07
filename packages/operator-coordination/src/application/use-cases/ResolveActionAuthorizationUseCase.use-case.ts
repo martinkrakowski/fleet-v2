@@ -14,6 +14,7 @@
  */
 
 import { isPolicyGrantRecord } from '../../domain/policy-grants.js';
+import { GRANT_RECORD_VERSION, isReleaseActionScope } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type {
@@ -22,11 +23,15 @@ import type {
   ResolveActionAuthorizationResult,
 } from '../ports/in/ResolveActionAuthorizationPort.in-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import { CoordinationRequestRevisionConflictError } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { AttemptFactsReadPort } from '../ports/out/AttemptFactsReadPort.out-port.js';
 import type { DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
 
 export interface ResolveActionAuthorizationDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
   readonly decisionTransport?: DecisionTransportPort;
+  /** CO24f: reads the attempt facts a first bind validates against; binding fails closed without it. */
+  readonly attemptFactsRead?: AttemptFactsReadPort;
 }
 
 function isFilled(value: unknown): value is string {
@@ -102,8 +107,28 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         }, not ${request.actionScope.trim()} at ${request.expectedHeadSha.trim()}`,
       );
     }
+    const mergeGrant = candidate.getMergeGrant();
+    if (mergeGrant !== null) {
+      const targetRepo = this.resolveTargetRepository(request);
+      const targetPr = this.resolveTargetPullRequest(request);
+      if (
+        targetRepo === null ||
+        targetPr === null ||
+        mergeGrant.repository.owner !== targetRepo.owner ||
+        mergeGrant.repository.repo !== targetRepo.repo ||
+        mergeGrant.pullRequestNumber !== targetPr
+      ) {
+        return blocked(
+          `grant ${grantId} authorizes ${mergeGrant.repository.owner}/${mergeGrant.repository.repo} pull request ${mergeGrant.pullRequestNumber}`,
+        );
+      }
+    }
     if (candidate.getConsumptions().length > 0) {
       return blocked(`grant ${grantId} is already consumed by another action`);
+    }
+    const attemptBlock = await this.bindAttempt(candidate, refreshed, request, grantId);
+    if (attemptBlock !== null) {
+      return attemptBlock;
     }
     return {
       outcome: 'authorized',
@@ -132,7 +157,8 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         candidate.projectId === request.projectId.trim() &&
         candidate.actionScope === request.actionScope.trim() &&
         candidate.expectedHeadSha === head &&
-        !isPolicyGrantRecord(candidate),
+        !isPolicyGrantRecord(candidate) &&
+        this.matchesMergeGrantCoordinates(candidate, request),
     );
     const approved = matching.filter((candidate) => candidate.state === 'approved');
     const preferred =
@@ -140,6 +166,104 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         ? approved
         : matching.filter((candidate) => candidate.state === 'awaiting-decision');
     return preferred.length > 0 ? preferred[preferred.length - 1] : null;
+  }
+
+  /**
+   * CO24e: a grant is bound to one attempt. A resolve that names an attempt must name the
+   * grant's recorded one; an owner grant that records none is bound to the first attempt
+   * that resolves it, durably, so a later consumption by another attempt at the same head
+   * is refused. A version-2 record without an attempt, and an unusable attempt id, block.
+   * A merge grant is attempt-less by design (DT6b) and is never bound.
+   *
+   * CO24g: a resolve that names no attempt cannot authorize an owner grant. An unbound one
+   * refuses (`attempt-required`) without binding or consuming, and an already-bound one also
+   * refuses, because every caller that resolves a bound owner grant passes its attempt and no
+   * anonymous path is needed. Policy grants keep their own recorded attempt and are resolved
+   * only by their id, so they stay unaffected. Two grant kinds are attempt-less by design and
+   * are exempt by kind, never by a missing attemptId: a merge grant (DT6b), anchored by
+   * repository, pull request and head, and a release grant (CO14), anchored by its
+   * `release:<action>` scope, exact head and one deterministic consumption.
+   */
+  private async bindAttempt(
+    candidate: CoordinationRequest,
+    record: CoordinationRequestRecord,
+    request: ResolveActionAuthorizationRequest,
+    grantId: string,
+  ): Promise<ResolveActionAuthorizationResult | null> {
+    if (candidate.isMissingRecordedAttempt()) {
+      return blocked('grant-attempt-unrecorded');
+    }
+    // DT6b: a merge grant is anchored by repository, pull request and head, never by an
+    // attempt; it resolves unbound and is never bound.
+    if (candidate.getMergeGrant() !== null) {
+      return null;
+    }
+    // CO24g: an unbound release grant is attempt-less by design (cutover row CO14). It is
+    // anchored by its exact `release:<action>` scope (only `release:install`,
+    // `release:swap` or `release:rollback`) and exact head, and consumed once
+    // by its deterministic action id, so it resolves with or without an attempt
+    // coordinate and is never bound to a work attempt. A bound release grant is held
+    // to its attempt and falls through to the normal checks. The gate is the grant's
+    // recorded scope — the grant kind — never the absence of an attemptId, and
+    // never an arbitrary `release:*` prefix.
+    if (isReleaseActionScope(candidate.getActionScope()) && candidate.getBoundAttemptId() === null) {
+      return null;
+    }
+    if (request.attemptId === undefined) {
+      // A policy grant carries its own recorded attempt and resolves only by its id, so it
+      // is unaffected by the attempt-required default. Every other grant — an owner grant,
+      // bound or not — refuses without the attempt coordinate.
+      if (candidate.getPolicyGrant() !== null) {
+        return null;
+      }
+      return blocked('attempt-required');
+    }
+    if (!isFilled(request.attemptId)) {
+      return blocked('grant-attempt-invalid');
+    }
+    const supplied = request.attemptId.trim();
+    const bound = candidate.getBoundAttemptId();
+    if (bound !== null) {
+      return bound === supplied ? null : blocked('grant-attempt-mismatch');
+    }
+    // CO24f: an unbound owner grant binds only an attempt that exists, belongs
+    // to the grant's project and was collected at the requested head, read
+    // through the attempt-facts port. Anything else refuses without binding,
+    // so a wrong attempt can never attach to — or kill — the grant.
+    const facts = await (this.deps?.attemptFactsRead?.findAttemptFactsById(supplied) ?? null);
+    if (facts === null) {
+      return blocked('grant-attempt-unknown');
+    }
+    if (facts.projectId === null || facts.projectId !== record.projectId) {
+      return blocked('grant-attempt-foreign');
+    }
+    if (facts.collectedHeadSha === null) {
+      return blocked('grant-attempt-uncollected');
+    }
+    if (facts.collectedHeadSha !== request.expectedHeadSha.trim()) {
+      return blocked('grant-attempt-head-mismatch');
+    }
+    let binding: CoordinationRequestRecord;
+    try {
+      binding = CoordinationRequest.fromRecord({
+        ...record,
+        grantRecordVersion: GRANT_RECORD_VERSION,
+        grantAttemptId: supplied,
+        revision: candidate.nextRevision(),
+        updatedAtIso: new Date().toISOString(),
+      }).toRecord();
+    } catch {
+      return blocked('grant-attempt-invalid');
+    }
+    try {
+      await (this.deps?.requestRepo.saveRequest(binding) ?? Promise.resolve());
+    } catch (error: unknown) {
+      if (error instanceof CoordinationRequestRevisionConflictError) {
+        return blocked(`grant ${grantId} moved while it was being bound to an attempt`);
+      }
+      throw error;
+    }
+    return null;
   }
 
   /** A pending request may have an answer recorded since it was last read. */
@@ -173,5 +297,46 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     };
     await (this.deps?.requestRepo.saveRequest(refreshed) ?? Promise.resolve());
     return refreshed;
+  }
+
+  private resolveTargetRepository(
+    request: ResolveActionAuthorizationRequest,
+  ): { owner: string; repo: string } | null {
+    if (typeof request.repository === 'object' && request.repository !== null) {
+      const { owner, repo } = request.repository as { owner?: unknown; repo?: unknown };
+      if (typeof owner === 'string' && typeof repo === 'string' && owner.trim() && repo.trim()) {
+        return { owner: owner.trim(), repo: repo.trim() };
+      }
+    } else if (typeof request.repository === 'string') {
+      const parts = request.repository.trim().split('/');
+      if (parts.length === 2 && parts[0].trim() && parts[1].trim()) {
+        return { owner: parts[0].trim(), repo: parts[1].trim() };
+      }
+    }
+    return null;
+  }
+
+  private resolveTargetPullRequest(request: ResolveActionAuthorizationRequest): number | null {
+    const pr = request.pullRequestNumber;
+    return typeof pr === 'number' && Number.isSafeInteger(pr) && pr > 0 ? pr : null;
+  }
+
+  private matchesMergeGrantCoordinates(
+    record: CoordinationRequestRecord,
+    request: ResolveActionAuthorizationRequest,
+  ): boolean {
+    if (record.mergeGrant === undefined) {
+      return true;
+    }
+    const targetRepo = this.resolveTargetRepository(request);
+    const targetPr = this.resolveTargetPullRequest(request);
+    if (targetRepo === null || targetPr === null) {
+      return false;
+    }
+    return (
+      record.mergeGrant.repository.owner === targetRepo.owner &&
+      record.mergeGrant.repository.repo === targetRepo.repo &&
+      record.mergeGrant.pullRequestNumber === targetPr
+    );
   }
 }

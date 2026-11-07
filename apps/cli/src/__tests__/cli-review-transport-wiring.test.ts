@@ -269,8 +269,11 @@ describe('independent review transport wiring (RW2)', () => {
     expect(result.receipt.readOnlyVerified).toBe(true);
     expect(result.receipt.result).toBe('pass');
 
-    expect(spawnCalls).toHaveLength(1);
-    const call = spawnCalls[0];
+    // RV4: the idle `--wait` spawn comes first, then the review spawn.
+    expect(spawnCalls).toHaveLength(2);
+    expect(spawnCalls[0].args.slice(0, 3)).toEqual(['--wait', '--dir', repo.repoDir]);
+    expect(Object.keys(spawnCalls[0].env).some((name) => name.endsWith("_WAIT_MAX"))).toBe(true);
+    const call = spawnCalls[1];
     expect(call.args[call.args.indexOf('--dir') + 1]).toBe(repo.repoDir);
     expect(call.args[call.args.indexOf('--agent') + 1]).toBe('example-agent');
     expect(call.args[call.args.indexOf('-m') + 1]).toBe(REVIEWER_MODEL);
@@ -288,9 +291,10 @@ describe('independent review transport wiring (RW2)', () => {
       const invocation = await cli(runtime, reviewRequest({ candidateHeadSha: repo.head }));
 
       expect(invocation.code).toBe(0);
-      expect(spawnCalls).toHaveLength(1);
-      expect(spawnCalls[0].env.OCM_HOST).toBe('');
-      expect(spawnCalls[0].env.OCM_REMOTE_PORT).toBe('46000');
+      // RV4: the idle `--wait` spawn runs first; the review spawn carries the env.
+      expect(spawnCalls).toHaveLength(2);
+      expect(spawnCalls[1].env.OCM_HOST).toBe('');
+      expect(spawnCalls[1].env.OCM_REMOTE_PORT).toBe('46000');
     } finally {
       if (savedHost !== undefined) {
         process.env.OCM_HOST = savedHost;
@@ -303,6 +307,40 @@ describe('independent review transport wiring (RW2)', () => {
         delete process.env.OCM_REMOTE_PORT;
       }
     }
+  });
+
+  it('a busy worktree rejects seat-busy and never spawns the review (RV4)', async () => {
+    const busySpawnCalls: SpawnCall[] = [];
+    const { runtime, repo } = await setup({
+      reviewSpawn: async (file, args, env) => {
+        busySpawnCalls.push({ file, args, env });
+        return {
+          exitCode: 75,
+          stdout: '',
+          stderr: 'still running in /tmp/review-dir',
+        };
+      },
+    });
+    const invocation = await cli(
+      runtime,
+      reviewRequest({ candidateHeadSha: repo.head, requestId: 'req-busy', kind: 'code-review' }),
+    );
+
+    expect(invocation.code).toBe(1);
+    const result = jsonOf<{
+      outcome: string;
+      code?: string;
+      reason: string;
+      diagnostic?: { exitCode: number | null; stderr: string | null };
+    }>(invocation);
+    expect(result.outcome).toBe('rejected');
+    expect(result.code).toBe('seat-busy');
+    // The fixed message never carries stderr or the worktree path.
+    expect(result.reason).toBe('review seat busy');
+    expect(result.diagnostic?.exitCode).toBe(75);
+    // Only the idle `--wait` spawned; the review itself never ran.
+    expect(busySpawnCalls).toHaveLength(1);
+    expect(busySpawnCalls[0].args.slice(0, 2)).toEqual(['--wait', '--dir']);
   });
 
   it('reports no independent review transport when the installation has no reviewer seat', async () => {

@@ -322,6 +322,7 @@ async function checkSeats(
   const seatLines: DoctorLine[] = [];
   for await (const doctorLine of runDoctor(loadResult, probes, {
     probeSeats: true,
+    probeServers: false,
     env: process.env,
   })) {
     if (doctorLine.scope !== "seat") {

@@ -22,6 +22,7 @@ import {
   InspectOutstandingCoordinationUseCase,
   InspectProjectProfileUseCase,
   InstallationReferenceAdapter,
+  IssueMergeGrantUseCase,
   IssuePolicyForgeGrantUseCase,
   ListAttentionItemsUseCase,
   ListOwnerQuestionsUseCase,
@@ -45,6 +46,8 @@ import {
   SyncOneWayOwnerQuestionsUseCase,
   UpdateProjectProfileUseCase,
   type AttentionClock,
+  type AttemptFactsReadPort,
+  type AttemptFactsRecord,
   type OwnerQuestionClock,
 } from '@fleet/operator-coordination';
 import {
@@ -56,10 +59,37 @@ import {
 
 import type { FleetCliRuntimeOptions } from '../composition.js';
 
+/**
+ * CO24f: the attempt-facts reader the authorization resolve binds grants
+ * against. The execution stack composes after the coordination stack, so the
+ * composition root supplies this deferred reader and fills its delegate once
+ * the attempt repository exists; until then every read reports absence, which
+ * fails closed.
+ */
+export class DeferredAttemptFactsRead implements AttemptFactsReadPort {
+  private delegate?: AttemptFactsReadPort;
+
+  setDelegate(delegate: AttemptFactsReadPort): void {
+    this.delegate = delegate;
+  }
+
+  findAttemptFactsById(attemptId: string): Promise<AttemptFactsRecord | null> {
+    return this.delegate?.findAttemptFactsById(attemptId) ?? Promise.resolve(null);
+  }
+}
+
 export interface ComposeCoordinationInput {
   readonly stateDir?: string;
   readonly ownerPublicKey?: string;
   readonly options?: FleetCliRuntimeOptions;
+  /**
+   * CO24f: the attempt-facts reader the authorization resolve binds grants
+   * against. The execution stack composes after this one, so the composition
+   * root supplies a deferred reader and fills its delegate once the attempt
+   * repository exists; until then every read reports absence, which fails
+   * closed.
+   */
+  readonly attemptFactsRead?: AttemptFactsReadPort;
 }
 
 export function composeCoordination(input: ComposeCoordinationInput) {
@@ -137,6 +167,7 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase({
       requestRepo: coordinationRequestRepository,
       decisionTransport,
+      ...(input.attemptFactsRead !== undefined ? { attemptFactsRead: input.attemptFactsRead } : {}),
     }),
     // One-way doors are answered by the coordination request's own
     // authorization rule, through the application layer: the evidence context
@@ -221,6 +252,17 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     ids: { newRequestId: newUlid, newGrantId: newUlid },
   });
 
+  // DT6b: the attempt-less merge-grant use case over the same shared
+  // coordination request store; the merge-pass MergeGrantAdapter delegates to
+  // it through this root. The clock and ids are the root's own, as for every
+  // composition here.
+  const issueMergeGrantUseCase = new IssueMergeGrantUseCase({
+    requestRepo: coordinationRequestRepository,
+    clock: { nowIso: () => new Date().toISOString() },
+    ids: { newRequestId: newUlid, newGrantId: newUlid },
+    profileRepo: projectProfileRepository,
+  });
+
   // --- project profiles and probes (P6b) --------------------------------------
   // The execution context reads profiles and records probe receipts through
   // the operator-coordination use cases, bound here (same delegate pattern as
@@ -245,6 +287,7 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     coordination,
     coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
     profileRead,
     probeRecord,
     executorForHostName,

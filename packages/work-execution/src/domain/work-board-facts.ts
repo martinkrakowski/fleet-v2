@@ -14,6 +14,7 @@ import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunParkReason } from './lane-run-records.js';
+import { planTextError } from './lane-plan-sidecar.js';
 
 export const WORK_BOARD_SCHEMA_VERSION = 1 as const;
 
@@ -323,4 +324,15 @@ export function sameLaneRef(left: LaneRef, right: LaneRef): boolean {
 export function parseTimeMs(value: string): number | null {
   const ms = Date.parse(value);
   return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * The plain-text rule the board applies to its own display text: a work-order
+ * lane id becomes a card label, and a question title becomes a subject, only
+ * when it passes the plan sidecar's plain-text rule (`planTextError`).
+ */
+export const BOARD_TEXT_MAX_BYTES = 1024;
+
+export function isPlainText(text: string): boolean {
+  return planTextError('text', text, BOARD_TEXT_MAX_BYTES) === null;
 }

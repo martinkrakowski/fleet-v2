@@ -111,9 +111,31 @@ function fakeProbes(
       calls.push('expectedOcmRunHash');
       return 'aa'.repeat(32);
     },
+    ghBinary: async () => {
+      calls.push('ghBinary');
+      return {
+        resolved: '/usr/bin/gh',
+        candidates: ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'],
+      };
+    },
     seatProbe: async (seat) => {
       calls.push(`seatProbe:${seat.id}`);
       return ALL_SEATS_PASS;
+    },
+    serverProbe: async (host, port) => {
+      calls.push(`serverProbe:${host}:${port}`);
+      return {
+        outcome: 'pass',
+        reason: `the opencode server on 127.0.0.1:${port} answered`,
+        models: [
+          'm',
+          'm1',
+          'm2',
+          'acme/alpha-1',
+          'acme/alpha-2',
+          'nvidia/acme/beta-2',
+        ],
+      };
     },
     ...overrides,
   };
@@ -615,8 +637,14 @@ describe('runDoctor', () => {
       expectedOcmRunHash: async () => {
         throw new Error('hash exploded');
       },
+      ghBinary: async () => {
+        throw new Error('gh exploded');
+      },
       seatProbe: async () => {
         throw new Error('seat exploded');
+      },
+      serverProbe: async () => {
+        throw new Error('server exploded');
       },
     };
     const { probes } = fakeProbes(throwing);
@@ -656,7 +684,57 @@ describe('runDoctor', () => {
     expect(firstIndex('host')).toBeLessThan(firstIndex('tool'));
     expect(firstIndex('tool')).toBeLessThan(firstIndex('credential'));
     expect(firstIndex('credential')).toBeLessThan(firstIndex('runner-binary'));
-    expect(firstIndex('runner-binary')).toBeLessThan(firstIndex('seat'));
+    expect(firstIndex('runner-binary')).toBeLessThan(firstIndex('gh-binary'));
+    expect(firstIndex('gh-binary')).toBeLessThan(firstIndex('seat'));
+  });
+});
+
+describe('runDoctor gh-binary check', () => {
+  const GH_CANDIDATES = ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'];
+
+  it('reports PASS naming the resolved path when a candidate resolves', async () => {
+    const { probes } = fakeProbes({
+      ghBinary: async () => ({ resolved: '/usr/bin/gh', candidates: GH_CANDIDATES }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(lines.filter((line) => line.scope === 'gh-binary')).toEqual([
+      {
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'resolved',
+        status: 'PASS',
+        detail: '/usr/bin/gh',
+      },
+    ]);
+    expect(doctorExitCode(lines)).toBe(0);
+  });
+
+  it('reports FAIL naming all candidate paths when none resolves', async () => {
+    const { probes } = fakeProbes({
+      ghBinary: async () => ({ resolved: undefined, candidates: GH_CANDIDATES }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    const ghLine = lines.find((line) => line.scope === 'gh-binary');
+    expect(ghLine).toMatchObject({ subject: 'gh', check: 'resolved', status: 'FAIL' });
+    for (const candidate of GH_CANDIDATES) {
+      expect(ghLine?.detail).toContain(candidate);
+    }
+    expect(doctorExitCode(lines)).toBe(1);
+  });
+
+  it('reports UNKNOWN when the probe fails to run', async () => {
+    const { probes } = fakeProbes({ ghBinary: async () => undefined });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'resolved',
+        status: 'UNKNOWN',
+        detail: 'gh resolution probe failed',
+      }),
+    );
+    expect(doctorExitCode(lines)).toBe(1);
   });
 });
 
@@ -819,5 +897,179 @@ describe('runDoctor auto-merge line (AM5-2)', () => {
       detail:
         'auto-merge: on, allowHighRisk false, onBlocked hold, revision 1cbf028644d3',
     });
+  });
+});
+
+describe('runDoctor server probes (P1)', () => {
+  it('reports one PASS server-answers line per opencode host naming the port; a host without a runner gets none', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'impl', tool: 'opencode', model: 'm', roles: ['implementer'], costClass: 'free' },
+      ],
+    });
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes);
+
+    const serverLines = lines.filter((line) => line.check === 'server-answers');
+    expect(serverLines).toEqual([
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'server-answers',
+        status: 'PASS',
+        detail: 'the opencode server on 127.0.0.1:4096 answered',
+      },
+    ]);
+    expect(calls).toContain('serverProbe:local:4096');
+    expect(calls.some((call) => call.startsWith('serverProbe:verifier-host'))).toBe(false);
+  });
+
+  it('maps probe outcomes fail and a throwing probe onto FAIL and UNKNOWN', async () => {
+    const model = sampleModel();
+    const failing = fakeProbes({
+      serverProbe: async () => ({ outcome: 'fail', reason: 'the opencode server on 127.0.0.1:4096 answered HTTP 500' }),
+    });
+    const failLines = await collect(loadedResult(model), failing.probes);
+    expect(failLines).toContainEqual(
+      expect.objectContaining({
+        scope: 'host',
+        subject: 'main',
+        check: 'server-answers',
+        status: 'FAIL',
+        detail: 'the opencode server on 127.0.0.1:4096 answered HTTP 500',
+      }),
+    );
+
+    const throwing = fakeProbes({
+      serverProbe: async () => {
+        throw new Error('server exploded');
+      },
+    });
+    const unknownLines = await collect(loadedResult(model), throwing.probes);
+    expect(unknownLines).toContainEqual(
+      expect.objectContaining({
+        scope: 'host',
+        subject: 'main',
+        check: 'server-answers',
+        status: 'UNKNOWN',
+        detail: 'the server probe failed',
+      }),
+    );
+  });
+
+  it('reports PASS model-listed when the servers list every opencode seat', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'impl', tool: 'opencode', model: 'acme/alpha-1', roles: ['implementer'], costClass: 'free' },
+        {
+          id: 'rev',
+          tool: 'opencode',
+          model: 'nvidia/acme/beta-2',
+          variant: 'high',
+          roles: ['reviewer'],
+          costClass: 'paid',
+        },
+      ],
+    });
+    const { probes } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes);
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        scope: 'installation',
+        subject: 'seats',
+        check: 'model-listed',
+        status: 'PASS',
+        detail: 'the opencode server lists all 2 opencode seat(s)',
+      }),
+    );
+    expect(doctorExitCode(lines)).toBe(0);
+  });
+
+  it('reports FAIL naming the seat model the servers do not list', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'impl', tool: 'opencode', model: 'acme/alpha-1', roles: ['implementer'], costClass: 'free' },
+        { id: 'rev', tool: 'opencode', model: 'acme/gone-9', roles: ['reviewer'], costClass: 'paid' },
+      ],
+    });
+    const { probes } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes);
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        scope: 'installation',
+        subject: 'seats',
+        check: 'model-listed',
+        status: 'FAIL',
+        detail: 'the opencode server does not list acme/gone-9',
+      }),
+    );
+  });
+
+  it('reports UNKNOWN model-listed when no server listed any model', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'impl', tool: 'opencode', model: 'm', roles: ['implementer'], costClass: 'free' },
+      ],
+    });
+    const { probes } = fakeProbes({
+      serverProbe: async (_host, port) => ({
+        outcome: 'pass',
+        reason: `the opencode server on 127.0.0.1:${port} answered`,
+      }),
+    });
+    const lines = await collect(loadedResult(model), probes);
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        scope: 'installation',
+        subject: 'seats',
+        check: 'model-listed',
+        status: 'UNKNOWN',
+        detail: 'no opencode server listed its models; the seats could not be checked',
+      }),
+    );
+  });
+
+  it('emits no model-listed line when the installation names no opencode seat', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'agy1', tool: 'agy', model: 'a-model', roles: ['implementer'] },
+      ],
+    });
+    const { probes } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes);
+    expect(lines.filter((line) => line.check === 'model-listed')).toEqual([]);
+  });
+
+  it('skips server probe and omits model-listed when probeServers is false', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'impl', tool: 'opencode', model: 'acme/alpha-1', roles: ['implementer'], costClass: 'free' },
+      ],
+    });
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes, {
+      probeSeats: true,
+      probeServers: false,
+    });
+
+    expect(calls.some((call) => call.startsWith('serverProbe:'))).toBe(false);
+    expect(lines.filter((line) => line.check === 'server-answers')).toEqual([]);
+    expect(lines.filter((line) => line.check === 'model-listed')).toEqual([]);
+  });
+
+  it('probes servers and emits model-listed by default when probeServers is omitted', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'impl', tool: 'opencode', model: 'acme/alpha-1', roles: ['implementer'], costClass: 'free' },
+      ],
+    });
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes, {
+      probeSeats: true,
+    });
+
+    expect(calls).toContain('serverProbe:local:4096');
+    expect(lines.filter((line) => line.check === 'server-answers')).toHaveLength(1);
+    expect(lines.filter((line) => line.check === 'model-listed')).toHaveLength(1);
   });
 });

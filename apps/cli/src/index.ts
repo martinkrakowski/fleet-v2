@@ -45,7 +45,10 @@ import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
+import { daemonCommand, daemonHelpRequested, DAEMON_HELP, type DaemonCliOptions } from './daemon.js';
 import { telemetryCommand, type TelemetryCliOptions } from './telemetry.js';
+import { killallCommand, type KillallCliOptions } from './commands/killall.js';
+import { reportCommand, type ReportCliOptions } from './report.js';
 import {
   CliUsageError,
   NON_ZERO_OUTCOMES,
@@ -63,6 +66,11 @@ import { evidenceCommands } from './commands/evidence.js';
 import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
+import { mergeCommands } from './merge.js';
+import { relaunchCommands } from './relaunch.js';
+import { releaseCommands } from './release.js';
+import { cutoverCommands } from './commands/cutover.js';
+import { tuiCommand } from './tui/command.js';
 
 export { resolveRunnerSettings };
 
@@ -96,7 +104,10 @@ function isPerLineResult(result: unknown): result is CliPerLineResult {
   return (
     typeof result === 'object' &&
     result !== null &&
-    Array.isArray((result as { lines?: unknown }).lines)
+    Array.isArray((result as { lines?: unknown }).lines) &&
+    (result as { lines: readonly unknown[] }).lines.every(
+      (line) => typeof line === 'string',
+    )
   );
 }
 
@@ -259,6 +270,10 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   knowledge: knowledgeCommands,
   coordination: coordinationCommands,
   questions: questionsCommands,
+  merge: mergeCommands,
+  relaunch: relaunchCommands,
+  release: releaseCommands,
+  cutover: cutoverCommands,
 };
 
 // ---------------------------------------------------------------------------
@@ -273,6 +288,11 @@ export interface DoctorCliOptions {
   readonly loadResult?: LoadResult;
   /** Probe implementation; the node probes compose one when omitted. */
   readonly probes?: DoctorProbes;
+  /**
+   * Candidate absolute paths probed for the reviewed `gh` binary when
+   * node probes are composed (tests only).
+   */
+  readonly ghBinaryCandidates?: readonly string[];
   /**
    * Argv executor for `doctor --host` (the host probe subset and the
    * leftover-forward check); the node doctor executor composes when omitted.
@@ -535,7 +555,13 @@ export async function doctorCommand(
     const executor = options.hostProbeExecutor ?? createNodeDoctorExecutor();
     return doctorHostCommand(host, loadResult, io, json, executor);
   }
-  const probes = options.probes ?? createNodeDoctorProbes();
+  const probes =
+    options.probes ??
+    createNodeDoctorProbes(
+      options.ghBinaryCandidates !== undefined
+        ? { ghBinaryCandidates: options.ghBinaryCandidates }
+        : undefined,
+    );
   const lines: DoctorLine[] = [];
   for await (const doctorLine of runDoctor(loadResult, probes, {
     probeSeats,
@@ -616,7 +642,8 @@ doctor prints one check per line (JSON documents with --json). Without
 doctor --host <name> prints only that host's probe subset.
 
 The hosts group manages the installation file's named hosts: list, add,
-edit and remove, each write confirmed and compare-and-swapped.
+edit and remove, each write confirmed and compare-and-swapped, and shows or
+installs the user-scope daemon scheduler units from the daemon section.
 
 The seats group lists the installation file's seats, checks them with the
 loader and the doctor's seat probes (seats list, seats check), and shows or
@@ -635,7 +662,9 @@ flag); run 'fleet-v2 init --help' for its flags.
 state check reads every JSON state store under the state directory and reports
 ok, missing, unreadable or invalid record per file; it never writes. state
 restore replaces a missing or unreadable store from a quarantine copy after
-confirmation; it is CLI only.
+confirmation; it is CLI only. state compact removes finished attempt, journal
+and reservation records no live run references, keeps the last five
+pre-compaction copies in quarantine and checks the stores before and after.
 
 A seat plan lists ordered seats per role (first-pass, fix, review). brief
 prepare --seatPlanFromInstallation builds it from the installation's chains;
@@ -649,20 +678,45 @@ The telemetry group exports run telemetry spans (a run, a work order or a
 time window) to the collector route, or prints them with a dry run, and shows
 the configuration status. Run 'fleet-v2 telemetry --help'.
 
+The killall group stops every running lane, pauses the merge train and sets the
+killall halt marker; --lift clears the pause then the marker. Run
+'fleet-v2 killall --help'.
+
+The cutover group reports the shadow comparison of the fleet-v2 merge queue
+against the shell train's recorded queue for one repository (read-only, ids and
+codes only). Run 'fleet-v2 cutover --help'.
+The report group prints the weekly run-journal service report (read-only, one
+JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
+
+The relaunch group reports what a relaunch would find, read-only: relaunch
+inventory lists, per lane host, the registered clones' worktrees, the runner's
+state per worktree directory, the conductor's status and each lane's
+population (conducted, attempt-recorded, unrecorded). It writes nothing,
+journals nothing and mutates no worktree.
+
+The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
+
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
-  hosts list|add|edit|remove
+  hosts list|add|edit|remove|daemon
   seats list|check|free-tier [status|on|off] [--yes]
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
-  state check|restore
+  state check|restore|compact
   conductor status|halt|stop|resume|start|run
+  daemon tick|status|pause|resume
   telemetry export|status
+  killall [--lift]
+  report weekly
+  relaunch inventory [--host <name>]
+  release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
+  cutover shadow report --repository owner/repo --legacy-state-dir <path>
+  tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
-  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared
+  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared|explain
   forge execute
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
@@ -700,6 +754,9 @@ export async function runCli(
   conductorOptions?: ConductorCliOptions,
   policyOptions?: PolicyCliOptions,
   telemetryOptions?: TelemetryCliOptions,
+  reportOptions?: ReportCliOptions,
+  killallOptions?: KillallCliOptions,
+  daemonOptions?: DaemonCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -749,6 +806,44 @@ export async function runCli(
       io.stdout(`${QUESTIONS_HELP}\n`);
       return 0;
     }
+    // `killall` halts active lane workers and pauses the train directly
+    // through its state-backed stores; it never composes the runtime or
+    // loads the installation.
+    if (group === 'killall') {
+      return await killallCommand(restArgv.slice(1), io, {
+        ...killallOptions,
+        stateDir: killallOptions?.stateDir ?? stateDir,
+      });
+    }
+    // The daemon group answers help before anything is loaded, and resolves its
+    // own runtime so an invalid installation file never reaches the generic
+    // "installation invalid (<file>)" refusal (which echoes a path) and never
+    // blocks `daemon pause` / `daemon resume`: the merge policy is simply unknown.
+    if (group === 'daemon') {
+      if (daemonHelpRequested(restArgv.slice(1))) {
+        io.stdout(`${DAEMON_HELP}\n`);
+        return 0;
+      }
+      let daemonRuntime: FleetCliRuntime;
+      if (runtime !== undefined) {
+        daemonRuntime = runtime;
+      } else {
+        const loadResult = loadInstallation();
+        daemonRuntime = createFleetCliRuntime(
+          loadResult.status === 'invalid'
+            ? { stateDir, loadInstallationForMergePolicy: () => loadResult }
+            : {
+                stateDir,
+                installation: loadResult.installation,
+                loadInstallationForMergePolicy: () => loadInstallation(),
+              },
+        );
+      }
+      return await daemonCommand(restArgv.slice(1), io, daemonRuntime, {
+        ...daemonOptions,
+        stateDir: daemonOptions?.stateDir ?? stateDir,
+      });
+    }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.
     let activeRuntime: FleetCliRuntime;
@@ -782,6 +877,12 @@ export async function runCli(
     if (group === 'telemetry') {
       return await telemetryCommand(restArgv.slice(1), io, activeRuntime, telemetryOptions ?? {});
     }
+    if (group === 'report') {
+      return await reportCommand(restArgv.slice(1), io, activeRuntime, reportOptions ?? {});
+    }
+    if (group === 'tui') {
+      return await tuiCommand(restArgv.slice(1), io, activeRuntime);
+    }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);
       return 0;
@@ -812,7 +913,8 @@ export async function runCli(
     // positional id; every other group keeps the strict flags-only shape.
     const allowPositional =
       (group === 'questions' && QUESTIONS_POSITIONAL_SUBCOMMANDS.has(subcommand)) ||
-      (group === 'knowledge' && subcommand === 'candidates');
+      (group === 'knowledge' && subcommand === 'candidates') ||
+      (group === 'cutover' && subcommand === 'shadow');
     const payload = parseFlags(rest, { allowPositional });
     const result = await handler(payload, activeRuntime);
     // Line-oriented outputs (`knowledge candidates`, `decisions report`)

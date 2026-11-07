@@ -7,26 +7,44 @@
  */
 
 import type {
+  CrashedStartView,
   InspectLaneRunsPort,
   InspectLaneRunsRequest,
   InspectLaneRunsResult,
   LaneRunStatusView,
 } from '../ports/in/InspectLaneRunsPort.in-port.js';
+import { CRASHED_START_GRACE_MINUTES } from '../ports/in/InspectLaneRunsPort.in-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
+import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
+import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
 import type { LaneRunLeaseRecord, LaneRunRecord } from '../../domain/lane-run-records.js';
+import type { AttemptRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
+import type { LaneRunParkFindingView } from '../../domain/park-findings-view.js';
+import { boundedFindingsView, causingParkFindingsView } from '../../domain/park-findings-view.js';
+import { decideConductorReviewOutcome } from '../../domain/lane-run-decider.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { laneRunJournalPendingIntent, laneRunJournalState, laneRunJournalStopFacts } from '../../domain/lane-run-journal.js';
+import { parseLaneRunKey } from '../../domain/lane-run-keys.js';
 import { resolveLaneRunBaseBranch } from '../../domain/base-branch.js';
 import { isLeaseLapsed } from '../../domain/lane-run-lease.js';
+
+/** Code-unit string order (a deterministic sort for ids). */
+const byCodeUnit = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
 
 export interface InspectLaneRunsDependencies {
   readonly runRepo: Pick<LaneRunRepositoryPort, 'get' | 'list'>;
   readonly runJournal: Pick<LaneRunJournalPort, 'listForRun'>;
   readonly halt: Pick<ConductorHaltPort, 'read'>;
   readonly driverLease: Pick<ConductorDriverLeasePort, 'read'>;
+  /** Read the parked head's latest code-review receipt (GB2); optional so unwired callers keep today's shape. */
+  readonly attemptRepo?: Pick<AttemptRepositoryPort, 'findAttemptById'>;
+  readonly reviewReceipts?: Pick<ReviewRequestPort, 'findLatestReceiptOfKind'>;
+  /** Read the held capacity reservations (AD-2); optional so unwired callers keep today's shape. */
+  readonly executionJournal?: Pick<ExecutionJournalPort, 'listActiveReservations'>;
 }
 
 /** A run lease record with its lapsed flag; null stays null. */
@@ -42,10 +60,154 @@ function leaseView(lease: LaneRunLeaseRecord | null, nowIso: string): LaneRunSta
   };
 }
 
+/** Fallback receipt read when the parked record does not carry a saved snapshot. */
+async function fallbackReviewFindings(
+  deps: InspectLaneRunsDependencies,
+  record: LaneRunRecord,
+): Promise<readonly LaneRunParkFindingView[]> {
+  const attemptRepo = deps.attemptRepo;
+  const reviewReceipts = deps.reviewReceipts;
+  if (attemptRepo === undefined || reviewReceipts === undefined) {
+    return [];
+  }
+  const attemptId = record.attemptIds.length === 0 ? null : record.attemptIds[record.attemptIds.length - 1];
+  if (attemptId === null) {
+    return [];
+  }
+  try {
+    const attempt = await attemptRepo.findAttemptById(attemptId);
+    const head = attempt?.artifacts?.headCommit;
+    if (attempt === null || head === undefined) {
+      return [];
+    }
+    // RV3: the kinds are ordered by the park's `parkedFrom`, and a receipt
+    // counts only when its severity outcome is `failed` (an unresolved
+    // blocking finding); its causing findings are bounded through
+    // `causingParkFindingsView`, so colon-scoped ids project as stored.
+    const parkedFrom = record.parked?.parkedFrom;
+    const kinds: readonly ('code-review' | 'brief-check' | 'pre-merge')[] =
+      parkedFrom === 'brief-check'
+        ? ['brief-check', 'code-review', 'pre-merge']
+        : parkedFrom === 'awaiting-premerge' || parkedFrom === 'merging'
+          ? ['pre-merge', 'code-review', 'brief-check']
+          : ['code-review', 'brief-check', 'pre-merge'];
+    for (const kind of kinds) {
+      const found = await reviewReceipts.findLatestReceiptOfKind({ attemptId, candidateHeadSha: head, kind });
+      if (found.outcome === 'unavailable') {
+        return [];
+      }
+      if (found.outcome === 'found' && decideConductorReviewOutcome(found.receipt).outcome === 'failed') {
+        return causingParkFindingsView(found.receipt.findings);
+      }
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The bounded findings of the parked head's failed review (RV3): `null` when
+ * not a blocker park. A stored snapshot that is null, absent or EMPTY is an
+ * unpopulated snapshot and falls back to the receipts — a finding-caused park
+ * record never legitimately carries `[]` (req (d)).
+ */
+async function blockedReviewFindings(
+  deps: InspectLaneRunsDependencies,
+  record: LaneRunRecord,
+): Promise<readonly LaneRunParkFindingView[] | null> {
+  const parked = record.parked;
+  if (parked === null || parked.reason !== 'blocker-after-round-2') {
+    return null;
+  }
+  if (parked.findings === undefined || parked.findings === null || parked.findings.length === 0) {
+    return fallbackReviewFindings(deps, record);
+  }
+  return boundedFindingsView(parked.findings);
+}
+
+/**
+ * The run's result entries on the park's qualifier step, in journal order:
+ * same run id, a parsable step key naming the qualifier, and never an
+ * `ambiguous` outcome. The park's qualifier is never matched against a result
+ * of another step.
+ */
+function qualifierResultEntries(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  qualifier: string,
+): { entry: LaneRunJournalEntryRecord; head12: string | null }[] {
+  const matched: { entry: LaneRunJournalEntryRecord; head12: string | null }[] = [];
+  for (const entry of entries) {
+    if (entry.kind !== 'result' || entry.runId !== runId || entry.outcome === 'ambiguous') {
+      continue;
+    }
+    const parsed = entry.key === null ? null : parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.step !== qualifier) {
+      continue;
+    }
+    matched.push({ entry, head12: parsed.head12 });
+  }
+  return matched;
+}
+
+/**
+ * The usable refusal detail among the latest head's qualifier results, or
+ * null. Older heads are never consulted: a head whose gate result carries no
+ * detail reports its own `gate-` reason code instead of an earlier head's
+ * detail.
+ */
+function latestHeadRefusalDetail(
+  matched: readonly { entry: LaneRunJournalEntryRecord; head12: string | null }[],
+): string | null {
+  if (matched.length === 0) {
+    return null;
+  }
+  const latestHead = matched[matched.length - 1]!.head12;
+  const ofHead = matched.filter((candidate) => candidate.head12 === latestHead);
+  for (let index = ofHead.length - 1; index >= 0; index -= 1) {
+    const detail = ofHead[index]!.entry.detail;
+    // GB3c: a result whose detail is null or a `next-seat-` seat-advance token
+    // does not express the refusal that parked the run.
+    if (detail !== null && !detail.startsWith('next-seat-')) {
+      return detail;
+    }
+  }
+  for (let index = ofHead.length - 1; index >= 0; index -= 1) {
+    const reasonCode = ofHead[index]!.entry.reasonCode;
+    if (reasonCode !== null && reasonCode.startsWith('gate-')) {
+      return reasonCode;
+    }
+  }
+  return null;
+}
+
+/**
+ * The fixed refusal detail of a `step-refused` park (GB3a): the cause comes
+ * from the latest head's results on the park's qualifier step — the newest
+ * usable detail there, else that head's newest `gate-` reason code — or null
+ * when the latest head expresses no cause. An older head's detail is never
+ * reported.
+ */
+function parkRefusalDetailOf(record: LaneRunRecord, entries: readonly LaneRunJournalEntryRecord[]): string | null {
+  const parked = record.parked;
+  if (parked === null || parked.reason !== 'step-refused' || parked.qualifier === null) {
+    return null;
+  }
+  return latestHeadRefusalDetail(qualifierResultEntries(entries, record.runId, parked.qualifier));
+}
+
 /** The status view of one run from its record and journal. */
-function statusViewOf(record: LaneRunRecord, entries: readonly LaneRunJournalEntryRecord[], nowIso: string): LaneRunStatusView {
+async function statusViewOf(
+  deps: InspectLaneRunsDependencies,
+  record: LaneRunRecord,
+  entries: readonly LaneRunJournalEntryRecord[],
+  nowIso: string,
+): Promise<LaneRunStatusView> {
   const stopFacts = laneRunJournalStopFacts(entries, record.runId);
   const pendingIntent = laneRunJournalPendingIntent(entries, record.runId);
+  const reviewFindings = await blockedReviewFindings(deps, record);
+  const parkDetail = parkRefusalDetailOf(record, entries);
   return {
     runId: record.runId,
     workOrderId: record.workOrderId,
@@ -56,6 +218,8 @@ function statusViewOf(record: LaneRunRecord, entries: readonly LaneRunJournalEnt
     round: record.round,
     revision: record.revision,
     parked: record.parked,
+    reviewFindings,
+    ...(parkDetail !== null ? { parkDetail } : {}),
     parkCount: record.parkCount,
     stopMode: stopFacts.stopMode,
     stopRequestedAtIso: stopFacts.stopRequestedAtIso,
@@ -65,6 +229,71 @@ function statusViewOf(record: LaneRunRecord, entries: readonly LaneRunJournalEnt
     prNumber: record.prNumber,
     lease: leaseView(record.lease, nowIso),
   };
+}
+
+/**
+ * The crashed starts among the held reservations (AD-2): a held reservation
+ * whose attempt id no run lists, held for at least
+ * `CRASHED_START_GRACE_MINUTES`, whose attempt is absent or still
+ * `intent-recorded`. Read-only and best-effort: a missing dependency or an
+ * unparseable time reports nothing; a throwing reservations read or a
+ * throwing attempt read reports an empty array with `incomplete: true`, so
+ * the caller knows the array may be missing crashed starts rather than
+ * reading an empty array as "none". The result is sorted by attempt id so
+ * the output is deterministic.
+ */
+async function crashedStartsOf(
+  deps: InspectLaneRunsDependencies,
+  allRuns: readonly LaneRunRecord[],
+  nowIso: string,
+): Promise<{ views: readonly CrashedStartView[]; incomplete: boolean }> {
+  if (deps.executionJournal === undefined || deps.attemptRepo === undefined) {
+    return { views: [], incomplete: false };
+  }
+  const nowMs = Date.parse(nowIso);
+  if (!Number.isFinite(nowMs)) {
+    return { views: [], incomplete: false };
+  }
+  let reservations: readonly CapacityReservationRecord[];
+  try {
+    reservations = await deps.executionJournal.listActiveReservations();
+  } catch {
+    return { views: [], incomplete: true };
+  }
+  const attemptIdsListedByRuns = new Set(allRuns.flatMap((run) => run.attemptIds));
+  const views: CrashedStartView[] = [];
+  let incomplete = false;
+  for (const reservation of reservations) {
+    if (attemptIdsListedByRuns.has(reservation.attemptId)) {
+      continue;
+    }
+    const reservedMs = Date.parse(reservation.reservedAtIso);
+    if (!Number.isFinite(reservedMs)) {
+      continue;
+    }
+    if (nowMs - reservedMs < CRASHED_START_GRACE_MINUTES * 60_000) {
+      continue;
+    }
+    let attempt: AttemptRecord | null;
+    try {
+      attempt = await deps.attemptRepo.findAttemptById(reservation.attemptId);
+    } catch {
+      incomplete = true;
+      continue;
+    }
+    if (attempt !== null && attempt.state !== 'intent-recorded') {
+      continue;
+    }
+    views.push({
+      attemptId: reservation.attemptId,
+      workOrderId: attempt?.workOrderId ?? reservation.workOrderId ?? null,
+      hostName: reservation.hostName ?? null,
+      slotIndex: reservation.slotIndex,
+      reservedAtIso: reservation.reservedAtIso,
+      heldMinutes: Math.floor((nowMs - reservedMs) / 60_000),
+    });
+  }
+  return { views: views.sort((left, right) => byCodeUnit(left.attemptId, right.attemptId)), incomplete };
 }
 
 export class InspectLaneRunsUseCase implements InspectLaneRunsPort {
@@ -97,11 +326,26 @@ export class InspectLaneRunsUseCase implements InspectLaneRunsPort {
       lapsed: isLeaseLapsed(driver, request.nowIso),
     };
 
+    const runs = await Promise.all(
+      known.map((record, index) => statusViewOf(this.deps, record, journals[index], request.nowIso)),
+    );
+
+    // AD-2: the crashed starts are computed over *all* runs, even when one
+    // run id was asked for (a run lists its attempt ids regardless of the
+    // requested view).
+    const crashed = await crashedStartsOf(
+      this.deps,
+      request.runId === undefined ? known : await this.deps.runRepo.list(),
+      request.nowIso,
+    );
+
     return {
       outcome: 'listed',
       halt: halt.state,
       driver: driverLease,
-      runs: known.map((record, index) => statusViewOf(record, journals[index], request.nowIso)),
+      runs,
+      crashedStarts: crashed.views,
+      ...(crashed.incomplete ? { crashedStartsIncomplete: true } : {}),
     };
   }
 }

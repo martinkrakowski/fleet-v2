@@ -24,6 +24,7 @@ import type { ConductorPassTracePort } from '../ports/out/ConductorPassTracePort
 import { deriveConductorSchedule, deriveSessionStartMarks } from '../../domain/conductor-schedule.js';
 import type { ConductorPassTraceRead } from '../../domain/conductor-pass-trace.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { readPlainRecordWithOptionalKeys } from '../../domain/plain-record-reads.js';
 import { journalsForRuns } from './run-journal-reads.js';
 
 export interface ListLaneRunsDependencies {
@@ -65,12 +66,14 @@ export class ListLaneRunsUseCase implements ListLaneRunsPort {
     if (!this.deps) {
       throw new Error('Not implemented: ListLaneRunsUseCase');
     }
-    const isPlainObject =
-      typeof request === 'object' &&
-      request !== null &&
-      (Object.getPrototypeOf(request) === Object.prototype ||
-        Object.getPrototypeOf(request) === null);
-    if (!isPlainObject || !isZonedIsoDateTime(request.nowIso)) {
+    try {
+      const snapshot = readPlainRecordWithOptionalKeys(request, ['nowIso'], []);
+      if (snapshot === null || typeof snapshot.nowIso !== 'string' || !isZonedIsoDateTime(snapshot.nowIso)) {
+        return { outcome: 'rejected', reason: 'invalid-request' };
+      }
+    } catch {
+      // Null, primitives, arrays, extra keys and throwing getters are typed
+      // refusals, never exceptions.
       return { outcome: 'rejected', reason: 'invalid-request' };
     }
 

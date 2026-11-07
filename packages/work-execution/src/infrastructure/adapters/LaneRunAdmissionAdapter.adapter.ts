@@ -24,8 +24,14 @@ import { laneRunJournalState } from '../../domain/lane-run-journal.js';
 import { LANE_RUN_TERMINAL_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
-import { laneRunPackagesOverlap } from '../../domain/lane-run-packages.js';
-import type { LaneRunAdmissionPort, LaneRunAdmissionRequest, LaneRunAdmissionResult } from '../../application/ports/out/LaneRunAdmissionPort.out-port.js';
+import { laneRunOwnedPathsOverlap } from '../../domain/lane-run-packages.js';
+import type { ForgeReadPort } from '../../application/ports/out/ForgeReadPort.out-port.js';
+import type {
+  LaneRunAdmissionBlockers,
+  LaneRunAdmissionPort,
+  LaneRunAdmissionRequest,
+  LaneRunAdmissionResult,
+} from '../../application/ports/out/LaneRunAdmissionPort.out-port.js';
 import type { ExecutionJournalPort } from '../../application/ports/out/ExecutionJournalPort.out-port.js';
 import type {
   ReserveExecutionCapacityHost,
@@ -42,6 +48,7 @@ import type { AttemptRepositoryPort } from '../../application/ports/out/AttemptR
 import type { LaneRunJournalPort } from '../../application/ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../../application/ports/out/LaneRunRepositoryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../../application/ports/out/WorkOrderRepositoryPort.out-port.js';
+import type { ProjectProfileReadPort } from '../../application/ports/out/ProjectProfileReadPort.out-port.js';
 
 export interface LaneRunAdmissionAdapterOptions {
   readonly reserve: ReserveExecutionCapacityPort;
@@ -55,8 +62,12 @@ export interface LaneRunAdmissionAdapterOptions {
   >;
   /** K7-D5: `conductor run --max-active-runs <n>`, default 1 at the CLI. */
   readonly maxActiveRuns: number;
+  /** AD-1: the project profile read; the project's lane cap comes from it. */
+  readonly profileRead?: Pick<ProjectProfileReadPort, 'readProjectProfile'>;
   /** The installation's lane-runner hosts (K7-D7: the reserve chooses host and path). */
   readonly candidateHosts?: readonly ReserveExecutionCapacityCandidateHost[];
+  /** KS5: read whether a parked run's PR has merged; absent reads fail closed (the run keeps blocking). */
+  readonly forgeRead?: Pick<ForgeReadPort, 'readPullRequest'>;
   readonly newReservationId: () => string;
 }
 
@@ -70,13 +81,18 @@ interface ActiveRun {
   readonly state: LaneRunStateValue;
 }
 
+interface InFlightReservation {
+  readonly attemptId: string;
+  readonly workOrderId: string | null;
+}
+
 export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunStartCapacityPort {
   constructor(private readonly options: LaneRunAdmissionAdapterOptions) {}
 
   async reserveFirst(request: LaneRunFirstReservationRequest): Promise<LaneRunFirstReservationResult> {
-    const blocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
-    if (blocked) {
-      return { outcome: 'no-capacity' };
+    const verdict = await this.admissionVerdict(request.workOrderId, request.attemptId);
+    if (verdict.blocked) {
+      return { outcome: 'no-capacity', blockedBy: verdict.blockers };
     }
     const candidateHosts = this.options.candidateHosts ?? [];
     if (candidateHosts.length === 0) {
@@ -109,9 +125,9 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       // retries). A re-check that throws must not leave the reservation
       // held (a duplicate on the next pass parks the run), so the attempt's
       // reservation is released before the throw propagates.
-      let stillBlocked: boolean;
+      let stillBlocked: { blocked: boolean; blockers: LaneRunAdmissionBlockers };
       try {
-        stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
+        stillBlocked = await this.admissionVerdict(request.workOrderId, request.attemptId);
       } catch (error) {
         await this.options.executionJournal.releaseCapacityReservation(
           request.attemptId,
@@ -119,12 +135,12 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         );
         throw error;
       }
-      if (stillBlocked) {
+      if (stillBlocked.blocked) {
         await this.options.executionJournal.releaseCapacityReservation(
           request.attemptId,
           request.nowIso,
         );
-        return { outcome: 'no-capacity' };
+        return { outcome: 'no-capacity', blockedBy: stillBlocked.blockers };
       }
     }
     return this.firstReservationResultOf(reserved, request);
@@ -136,9 +152,9 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
     if (run === undefined) {
       return { outcome: 'refused', reason: 'run-missing' };
     }
-    const blocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
-    if (blocked) {
-      return { outcome: 'no-capacity' };
+    const verdict = await this.admissionVerdict(request.workOrderId, request.attemptId);
+    if (verdict.blocked) {
+      return { outcome: 'no-capacity', blockedBy: verdict.blockers };
     }
     const pinnedHost = await this.pinnedHostNameOf(run);
     if (pinnedHost === null) {
@@ -200,9 +216,9 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       // A re-check that throws must not leave the reservation held (a
       // duplicate on the next pass parks the run), so the attempt's
       // reservation is released before the throw propagates.
-      let stillBlocked: boolean;
+      let stillBlocked: { blocked: boolean; blockers: LaneRunAdmissionBlockers };
       try {
-        stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
+        stillBlocked = await this.admissionVerdict(request.workOrderId, request.attemptId);
       } catch (error) {
         await this.options.executionJournal.releaseCapacityReservation(
           request.attemptId,
@@ -210,12 +226,12 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         );
         throw error;
       }
-      if (stillBlocked) {
+      if (stillBlocked.blocked) {
         await this.options.executionJournal.releaseCapacityReservation(
           request.attemptId,
           request.nowIso,
         );
-        return { outcome: 'no-capacity' };
+        return { outcome: 'no-capacity', blockedBy: stillBlocked.blockers };
       }
       return { outcome: 'admitted' };
     }
@@ -268,13 +284,17 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
   }
 
   /**
-   * Global cap first, then package-busy (K7-D5). Active runs hold a
-   * reservation for one of their attempts and are not terminal; the run
-   * that lists `excludeAttemptId` is excluded. Work orders are read with
-   * `Promise.all`; an unreadable work order counts as overlapping (fail
-   * closed).
+   * Global cap first, then owned-file overlap (K7-D5, KS5). Active runs hold
+   * a reservation for one of their attempts and are not terminal; the run
+   * that lists `excludeAttemptId` is excluded. A parked run whose PR has
+   * merged stays in the cap count but is dropped from the overlap candidates.
+   * Work orders are read with `Promise.all`; an unreadable work order counts
+   * as overlapping (fail closed) and names its run or attempt.
    */
-  private async admissionBlocked(workOrderId: string, excludeAttemptId: string): Promise<boolean> {
+  private async admissionVerdict(
+    workOrderId: string,
+    excludeAttemptId: string,
+  ): Promise<{ blocked: boolean; blockers: LaneRunAdmissionBlockers }> {
     const [runs, heldReservations] = await Promise.all([
       this.options.runRepo.list(),
       this.options.executionJournal.listActiveReservations(),
@@ -285,7 +305,96 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         heldByAttempt.set(reservation.attemptId, reservation);
       }
     }
-    const active: ActiveRun[] = [];
+    const active = await this.collectActiveRuns(runs, heldByAttempt, excludeAttemptId);
+    const inFlight = await this.collectInFlightReservations(heldReservations, runs, excludeAttemptId);
+    if (active.length + inFlight.length >= this.options.maxActiveRuns) {
+      return {
+        blocked: true,
+        blockers: {
+          runIds: [...new Set(active.map((entry) => entry.run.runId))].sort((left, right) => left.localeCompare(right)),
+          attemptIds: [...new Set(inFlight.map((entry) => entry.attemptId))].sort((left, right) => left.localeCompare(right)),
+        },
+      };
+    }
+    const thisOrder = await this.options.workOrderRepo.findWorkOrderById(workOrderId);
+    if (thisOrder === null) {
+      return { blocked: true, blockers: { runIds: [], attemptIds: [] } };
+    }
+    const capVerdict = await this.projectCapVerdict(thisOrder, active, inFlight);
+    if (capVerdict.blocked) {
+      return capVerdict;
+    }
+    const candidates: ActiveRun[] = [];
+    for (const entry of active) {
+      if (entry.state === 'parked' && (await this.parkedPrMergedOf(entry.run))) {
+        continue;
+      }
+      candidates.push(entry);
+    }
+    const blockers = await this.overlapBlockersOf(candidates, inFlight, thisOrder);
+    return { blocked: blockers.runIds.length > 0 || blockers.attemptIds.length > 0, blockers };
+  }
+
+  /**
+   * AD-1: the project lane cap. `maxConcurrentLanes` is how many lanes the
+   * project may hold at once; a profile that declares none caps nothing. The
+   * count is the project's active runs plus the project's in-flight
+   * reservations; a work order that cannot be read counts (fail closed),
+   * like the owned-path overlap check. The request's own attempt is already
+   * excluded from `active` and `inFlight`, so a run's later attempt never
+   * counts against itself.
+   */
+  private async projectCapVerdict(
+    thisOrder: { readonly projectId: string },
+    active: readonly ActiveRun[],
+    inFlight: readonly InFlightReservation[],
+  ): Promise<{ blocked: boolean; blockers: LaneRunAdmissionBlockers }> {
+    const notBlocked = { blocked: false, blockers: { runIds: [], attemptIds: [] } };
+    const profileRead = this.options.profileRead;
+    if (profileRead === undefined) {
+      return notBlocked;
+    }
+    const profile = await profileRead.readProjectProfile(thisOrder.projectId);
+    const cap = profile?.maxConcurrentLanes;
+    if (cap === undefined || cap === null) {
+      return notBlocked;
+    }
+    const runIds: string[] = [];
+    for (const entry of active) {
+      const order = await this.options.workOrderRepo.findWorkOrderById(entry.run.workOrderId);
+      if (order === null || order.projectId === thisOrder.projectId) {
+        runIds.push(entry.run.runId);
+      }
+    }
+    const attemptIds: string[] = [];
+    for (const entry of inFlight) {
+      if (entry.workOrderId === null) {
+        attemptIds.push(entry.attemptId);
+        continue;
+      }
+      const order = await this.options.workOrderRepo.findWorkOrderById(entry.workOrderId);
+      if (order === null || order.projectId === thisOrder.projectId) {
+        attemptIds.push(entry.attemptId);
+      }
+    }
+    if (runIds.length + attemptIds.length < cap) {
+      return notBlocked;
+    }
+    return {
+      blocked: true,
+      blockers: {
+        runIds: [...new Set(runIds)].sort((left, right) => left.localeCompare(right)),
+        attemptIds: [...new Set(attemptIds)].sort((left, right) => left.localeCompare(right)),
+      },
+    };
+  }
+
+  /** Non-terminal runs holding a reservation for one of their attempts, excluding `excludeAttemptId`. */
+  private async collectActiveRuns(
+    runs: readonly LaneRunRecord[],
+    heldByAttempt: ReadonlyMap<string, CapacityReservationRecord>,
+    excludeAttemptId: string,
+  ): Promise<ActiveRun[]> {
     const considered = runs.filter(
       (run) =>
         !run.attemptIds.includes(excludeAttemptId) &&
@@ -300,17 +409,23 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
             considered.map(async (run) => [run.runId, await this.options.runJournal.listForRun(run.runId)] as const),
           ),
         );
+    const active: ActiveRun[] = [];
     for (const run of considered) {
       const state = laneRunJournalState(entriesByRun.get(run.runId) ?? [], run.runId);
       if (!isTerminalRunState(state)) {
         active.push({ run, state });
       }
     }
-    // In-flight starts: held capacity reservations that belong to no lane run
-    // yet (a start that reserved and has not created its run) count as active
-    // runs, and as busy for their work order's package when it can be read; an
-    // unreadable work order counts as busy (fail closed).
-    const inFlight: { readonly workOrderId: string | null }[] = [];
+    return active;
+  }
+
+  /** In-flight starts: held reservations whose attempt no run lists, with their work order id when readable. */
+  private async collectInFlightReservations(
+    heldReservations: readonly CapacityReservationRecord[],
+    runs: readonly LaneRunRecord[],
+    excludeAttemptId: string,
+  ): Promise<InFlightReservation[]> {
+    const inFlight: InFlightReservation[] = [];
     for (const reservation of heldReservations) {
       if (reservation.attemptId === excludeAttemptId) {
         continue;
@@ -320,28 +435,54 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         continue;
       }
       const attempt = await this.options.attemptRepo.findAttemptById(reservation.attemptId);
-      inFlight.push({ workOrderId: attempt?.workOrderId ?? null });
+      inFlight.push({ attemptId: reservation.attemptId, workOrderId: attempt?.workOrderId ?? reservation.workOrderId ?? null });
     }
-    if (active.length + inFlight.length >= this.options.maxActiveRuns) {
-      return true;
+    return inFlight;
+  }
+
+  /** Whether a parked run's PR has merged; fail closed otherwise (the run keeps blocking). */
+  private async parkedPrMergedOf(run: LaneRunRecord): Promise<boolean> {
+    if (run.prNumber === null || this.options.forgeRead === undefined) {
+      return false;
     }
-    const thisOrder = await this.options.workOrderRepo.findWorkOrderById(workOrderId);
-    if (thisOrder === null) {
-      return true;
+    try {
+      const read = await this.options.forgeRead.readPullRequest({ ref: { kind: 'number', number: run.prNumber } });
+      return read.outcome === 'found' && read.pullRequest.state === 'merged';
+    } catch {
+      return false;
     }
-    const workOrders = await Promise.all([
-      ...active.map((activeRun) =>
-        this.options.workOrderRepo.findWorkOrderById(activeRun.run.workOrderId),
-      ),
-      ...inFlight.map((inflight) =>
-        inflight.workOrderId === null
+  }
+
+  /** The runs and in-flight attempts whose work order overlaps `thisOrder`, sorted, deduped. */
+  private async overlapBlockersOf(
+    candidates: readonly ActiveRun[],
+    inFlight: readonly InFlightReservation[],
+    thisOrder: { readonly repository: string; readonly ownedPaths: readonly string[] },
+  ): Promise<LaneRunAdmissionBlockers> {
+    const sources: { readonly kind: 'run' | 'flight'; readonly id: string; readonly workOrderId: string | null }[] = [
+      ...candidates.map((entry) => ({ kind: 'run' as const, id: entry.run.runId, workOrderId: entry.run.workOrderId })),
+      ...inFlight.map((entry) => ({ kind: 'flight' as const, id: entry.attemptId, workOrderId: entry.workOrderId })),
+    ];
+    const orders = await Promise.all(
+      sources.map((source) =>
+        source.workOrderId === null
           ? Promise.resolve(null)
-          : this.options.workOrderRepo.findWorkOrderById(inflight.workOrderId),
+          : this.options.workOrderRepo.findWorkOrderById(source.workOrderId),
       ),
-    ]);
-    return workOrders.some(
-      (other) => other === null || laneRunPackagesOverlap(other, thisOrder),
     );
+    const runIds: string[] = [];
+    const attemptIds: string[] = [];
+    for (let index = 0; index < sources.length; index += 1) {
+      const other = orders[index];
+      if (other === null || laneRunOwnedPathsOverlap(other, thisOrder)) {
+        if (sources[index].kind === 'run') {
+          runIds.push(sources[index].id);
+        } else {
+          attemptIds.push(sources[index].id);
+        }
+      }
+    }
+    return { runIds: [...new Set(runIds)].sort((left, right) => left.localeCompare(right)), attemptIds: [...new Set(attemptIds)].sort((left, right) => left.localeCompare(right)) };
   }
 
   /**

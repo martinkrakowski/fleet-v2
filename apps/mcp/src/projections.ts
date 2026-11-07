@@ -302,7 +302,9 @@ export function projectWorkOrder(result: unknown): WorkOrderResultProjection {
           risk: asString(workOrder.risk),
           state: asString(workOrder.state),
           revision: asNumber(workOrder.revision),
-          prerequisiteWorkOrderIds: stringList(workOrder.prerequisiteWorkOrderIds),
+          prerequisiteWorkOrderIds: stringList(
+            workOrder.prerequisiteWorkOrderIds,
+          ),
           createdAtIso: asString(workOrder.createdAtIso),
           updatedAtIso: asString(workOrder.updatedAtIso),
         }
@@ -389,10 +391,15 @@ export interface HeadEvidenceAssessmentProjection {
 }
 
 export type HeadEvidenceProjection =
-  | { readonly outcome: "found"; readonly assessment: HeadEvidenceAssessmentProjection }
+  | {
+      readonly outcome: "found";
+      readonly assessment: HeadEvidenceAssessmentProjection;
+    }
   | { readonly outcome: string; readonly assessment: null };
 
-function projectVerificationReceipt(value: unknown): HeadVerificationProjection {
+function projectVerificationReceipt(
+  value: unknown,
+): HeadVerificationProjection {
   const receipt = asRecord(value);
   return {
     id: asString(receipt?.id),
@@ -452,7 +459,10 @@ function projectReviewReceipt(value: unknown): HeadReviewProjection {
 export function projectHeadEvidence(result: unknown): HeadEvidenceProjection {
   const record = asRecord(result);
   if (record?.outcome !== "found") {
-    return { outcome: asString(record?.outcome) ?? "unknown", assessment: null };
+    return {
+      outcome: asString(record?.outcome) ?? "unknown",
+      assessment: null,
+    };
   }
   const assessment = asRecord(record.assessment);
   const verification = Array.isArray(assessment?.verificationReceipts)
@@ -584,7 +594,9 @@ export function projectQuestion(value: unknown): QuestionProjection {
 }
 
 /** Project the question-list result: `{ questions: [projectQuestion(…)] }`. */
-export function projectQuestionList(result: unknown): { questions: QuestionProjection[] } {
+export function projectQuestionList(result: unknown): {
+  questions: QuestionProjection[];
+} {
   const record = asRecord(result);
   const questions = Array.isArray(record?.questions) ? record.questions : [];
   return { questions: questions.map(projectQuestion) };
@@ -595,7 +607,9 @@ export type QuestionResultProjection =
   | { readonly outcome: string; readonly question: null };
 
 /** Project the single-question result. Non-found outcomes carry no question text. */
-export function projectQuestionResult(result: unknown): QuestionResultProjection {
+export function projectQuestionResult(
+  result: unknown,
+): QuestionResultProjection {
   const record = asRecord(result);
   if (record?.outcome !== "found") {
     return { outcome: asString(record?.outcome) ?? "unknown", question: null };
@@ -619,9 +633,10 @@ export interface ProjectProfileSummaryProjection {
  * `designatedDispatcherHost`, `clones`, `gateProcedures`,
  * `defaultAllowedPathPrefixes`, `runnerCapabilities` and `lastProbe`.
  */
-export function projectProjectList(
-  result: unknown,
-): { outcome: string | null; profiles: ProjectProfileSummaryProjection[] } {
+export function projectProjectList(result: unknown): {
+  outcome: string | null;
+  profiles: ProjectProfileSummaryProjection[];
+} {
   const record = asRecord(result);
   const profiles = Array.isArray(record?.profiles) ? record.profiles : [];
   return {
@@ -645,4 +660,442 @@ export function projectProjectList(
       ];
     }),
   };
+}
+
+export interface LaneRunRowProjection {
+  readonly runId: string | null;
+  readonly baseBranch: string | null;
+  readonly workOrderId: string | null;
+  readonly tier: string | null;
+  readonly state: string | null;
+  readonly round: number | null;
+  readonly placement: string | null;
+  readonly pendingStep: {
+    readonly step: string | null;
+    readonly reconciliation: string | null;
+  } | null;
+  readonly park: { readonly reason: string | null } | null;
+  readonly leaseLapsed: boolean | null;
+  readonly workOrderUnreadable: boolean | null;
+  readonly overlapsWith: string[];
+  readonly slot: { readonly slotIndex: number | null } | null;
+  readonly admissionWait: string | null;
+}
+
+export interface LaneRunQueueProjection {
+  readonly baseBranch: string | null;
+  readonly runIds: string[];
+}
+
+export interface SessionStartMarkProjection {
+  readonly runId: string | null;
+  readonly step: string | null;
+  readonly recordedAtIso: string | null;
+  readonly gapMs: number | null;
+  readonly underStagger: boolean | null;
+}
+
+export interface ConductorSummaryProjection {
+  readonly observedAtIso: string | null;
+  readonly halt: string | null;
+  readonly driverLeaseLapsed: boolean | null;
+  readonly admission: {
+    readonly active: number | null;
+    readonly inFlight: number | null;
+    readonly maxActiveRuns: number | null;
+  } | null;
+  readonly caps: {
+    readonly maxActiveRuns: number | null;
+    readonly passConcurrency: number | null;
+    readonly dispatchStaggerMs: number | null;
+    readonly recordedAtIso: string | null;
+  } | null;
+  readonly trace: string | null;
+}
+
+export type LaneRunListProjection =
+  | {
+      readonly outcome: "listed";
+      readonly observedAtIso: string | null;
+      readonly halt: string | null;
+      readonly driverLeaseLapsed: boolean | null;
+      readonly admission: ConductorSummaryProjection["admission"];
+      readonly caps: ConductorSummaryProjection["caps"];
+      readonly trace: string | null;
+      readonly truncated: boolean | null;
+      readonly rows: LaneRunRowProjection[];
+      readonly queues: LaneRunQueueProjection[];
+      readonly sessionStarts: SessionStartMarkProjection[];
+    }
+  | { readonly outcome: string };
+
+/** Project one conductor-schedule row. Dropped: hostName, packageKeys, park qualifier, any other field. */
+function projectLaneRunRow(value: unknown): LaneRunRowProjection | null {
+  const row = asRecord(value);
+  if (!row) {
+    return null;
+  }
+  const pendingStep = asRecord(row.pendingStep);
+  const park = asRecord(row.park);
+  const slot = asRecord(row.slot);
+  return {
+    runId: asString(row.runId),
+    baseBranch: asString(row.baseBranch),
+    workOrderId: asString(row.workOrderId),
+    tier: asString(row.tier),
+    state: asString(row.state),
+    round: asNumber(row.round),
+    placement: asString(row.placement),
+    pendingStep: pendingStep
+      ? {
+          step: asString(pendingStep.step),
+          reconciliation: asString(pendingStep.reconciliation),
+        }
+      : null,
+    park: park ? { reason: asString(park.reason) } : null,
+    leaseLapsed: asBoolean(row.leaseLapsed),
+    workOrderUnreadable: asBoolean(row.workOrderUnreadable),
+    overlapsWith: stringList(row.overlapsWith),
+    slot: slot ? { slotIndex: asNumber(slot.slotIndex) } : null,
+    admissionWait: asString(row.admissionWait),
+  };
+}
+
+/** The schedule summary both the lane-run list and the conductor status carry. */
+function projectConductorSummary(
+  schedule: Record<string, unknown> | null | undefined,
+): ConductorSummaryProjection {
+  const admission = asRecord(schedule?.admission);
+  const caps = asRecord(schedule?.caps);
+  return {
+    observedAtIso: asString(schedule?.observedAtIso),
+    halt: asString(schedule?.halt),
+    driverLeaseLapsed: asBoolean(schedule?.driverLeaseLapsed),
+    admission: admission
+      ? {
+          active: asNumber(admission.active),
+          inFlight: asNumber(admission.inFlight),
+          maxActiveRuns: asNumber(admission.maxActiveRuns),
+        }
+      : null,
+    caps: caps
+      ? {
+          maxActiveRuns: asNumber(caps.maxActiveRuns),
+          passConcurrency: asNumber(caps.passConcurrency),
+          dispatchStaggerMs: asNumber(caps.dispatchStaggerMs),
+          recordedAtIso: asString(caps.recordedAtIso),
+        }
+      : null,
+    trace: asString(schedule?.trace),
+  };
+}
+
+/** Project the lane-run-list result. Dropped: hostName (rows and hosts), packageKeys, park qualifier, any other field. */
+export function projectLaneRunList(result: unknown): LaneRunListProjection {
+  const record = asRecord(result);
+  if (record?.outcome !== "listed") {
+    return { outcome: asString(record?.outcome) ?? "unknown" };
+  }
+  const schedule = asRecord(record.schedule);
+  const rows = Array.isArray(schedule?.rows) ? schedule.rows : [];
+  const queues = Array.isArray(schedule?.queues) ? schedule.queues : [];
+  const sessionStarts = Array.isArray(schedule?.sessionStarts)
+    ? schedule.sessionStarts
+    : [];
+  return {
+    outcome: "listed",
+    ...projectConductorSummary(schedule),
+    truncated: asBoolean(record.truncated),
+    rows: rows.flatMap((raw) => {
+      const projected = projectLaneRunRow(raw);
+      return projected ? [projected] : [];
+    }),
+    queues: queues.flatMap((raw) => {
+      const queue = asRecord(raw);
+      if (!queue) {
+        return [];
+      }
+      return [
+        {
+          baseBranch: asString(queue.baseBranch),
+          runIds: stringList(queue.runIds),
+        },
+      ];
+    }),
+    sessionStarts: sessionStarts.flatMap((raw) => {
+      const mark = asRecord(raw);
+      if (!mark) {
+        return [];
+      }
+      return [
+        {
+          runId: asString(mark.runId),
+          step: asString(mark.step),
+          recordedAtIso: asString(mark.recordedAtIso),
+          gapMs: asNumber(mark.gapMs),
+          underStagger: asBoolean(mark.underStagger),
+        },
+      ];
+    }),
+  };
+}
+
+/** Count occurrences of non-empty keys: `["a", "a", "b"]` → `{ a: 2, b: 1 }`. */
+function tally(keys: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const key of keys) {
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
+}
+
+export type ConductorStatusProjection =
+  | (ConductorSummaryProjection & {
+      readonly outcome: "listed";
+      readonly liveRuns: number;
+      readonly byState: Record<string, number>;
+      readonly byPlacement: Record<string, number>;
+      readonly byPark: Record<string, number>;
+      readonly byAdmissionWait: Record<string, number>;
+    })
+  | { readonly outcome: string };
+
+/** Project the conductor-status result. Dropped: hostName (rows and hosts), packageKeys, park qualifier, any other field. */
+export function projectConductorStatus(
+  result: unknown,
+): ConductorStatusProjection {
+  const record = asRecord(result);
+  if (record?.outcome !== "listed") {
+    return { outcome: asString(record?.outcome) ?? "unknown" };
+  }
+  const schedule = asRecord(record.schedule);
+  const rows = Array.isArray(schedule?.rows) ? schedule.rows : [];
+  const liveRows = rows.flatMap((raw) => {
+    const row = asRecord(raw);
+    return row ? [row] : [];
+  });
+  return {
+    outcome: "listed",
+    ...projectConductorSummary(schedule),
+    liveRuns: liveRows.length,
+    byState: tally(liveRows.map((row) => asString(row.state) ?? "unknown")),
+    byPlacement: tally(
+      liveRows.map((row) => asString(row.placement) ?? "unknown"),
+    ),
+    byPark: tally(
+      liveRows.flatMap((row) => {
+        const reason = asString(asRecord(row.park)?.reason);
+        return reason === null ? [] : [reason];
+      }),
+    ),
+    byAdmissionWait: tally(
+      liveRows.flatMap((row) => {
+        const wait = asString(row.admissionWait);
+        return wait === null ? [] : [wait];
+      }),
+    ),
+  };
+}
+
+export interface TelemetryStatusProjection {
+  readonly outcome: string | null;
+  readonly enabled: boolean | null;
+  readonly saltFingerprint: string | null;
+  readonly recordedSaltFingerprint: string | null;
+  readonly fingerprintMatch: boolean | null;
+  readonly schemaVersion: number | null;
+  readonly hashPrefix: string | null;
+  readonly route: string | null;
+  readonly lastExportAtIso: string | null;
+  readonly spans: Record<string, number>;
+  readonly counters: Record<string, number>;
+}
+
+/** An 8-hex fingerprint; anything else is not a fingerprint. */
+const FINGERPRINT_PATTERN = /^[0-9a-f]{8}$/;
+
+function asFingerprint(value: unknown): string | null {
+  const text = asString(value);
+  return text !== null && FINGERPRINT_PATTERN.test(text) ? text : null;
+}
+
+/** Keep only entries whose value is a finite number; a non-object becomes {}. */
+function countMap(value: unknown): Record<string, number> {
+  const record = asRecord(value);
+  if (record === null) {
+    return {};
+  }
+  const counts: Record<string, number> = {};
+  for (const [key, item] of Object.entries(record)) {
+    if (typeof item === "number" && Number.isFinite(item)) {
+      counts[key] = item;
+    }
+  }
+  return counts;
+}
+
+/**
+ * Project the telemetry-status result (MX8). Allow-list only: endpoint, token,
+ * salt, projectName, host names and any future field never cross. A fingerprint
+ * that is not 8 lowercase hex becomes null; spans/counters keep only finite
+ * numbers; a missing object becomes {}. Never throws.
+ */
+export function projectTelemetryStatus(
+  result: unknown,
+): TelemetryStatusProjection {
+  const record = asRecord(result);
+  return {
+    outcome: asString(record?.outcome),
+    enabled: asBoolean(record?.enabled),
+    saltFingerprint: asFingerprint(record?.saltFingerprint),
+    recordedSaltFingerprint: asFingerprint(record?.recordedSaltFingerprint),
+    fingerprintMatch: asBoolean(record?.fingerprintMatch),
+    schemaVersion: asNumber(record?.schemaVersion),
+    hashPrefix: asString(record?.hashPrefix),
+    route: asString(record?.route),
+    lastExportAtIso: asString(record?.lastExportAtIso),
+    spans: countMap(record?.spans),
+    counters: countMap(record?.counters),
+  };
+}
+
+/** A hex digest: 64 lowercase hex digits. */
+const HEX64_PATTERN = /^[0-9a-f]{64}$/;
+
+function asHexDigest(value: unknown): string | null {
+  const text = asString(value);
+  return text !== null && HEX64_PATTERN.test(text) ? text : null;
+}
+
+export interface BriefPreviewSeatProjection {
+  readonly id: string | null;
+  readonly model: string | null;
+  readonly tool: string | null;
+  readonly variant: string | null;
+  readonly agent: string | null;
+  readonly on: string[];
+}
+
+function projectPreviewSeat(value: unknown): BriefPreviewSeatProjection {
+  const seat = asRecord(value);
+  return {
+    id: asString(seat?.id),
+    model: asString(seat?.model),
+    tool: asString(seat?.tool),
+    variant: asString(seat?.variant),
+    agent: asString(seat?.agent),
+    on: stringList(seat?.on),
+  };
+}
+
+function projectPreviewSeatList(value: unknown): BriefPreviewSeatProjection[] {
+  return Array.isArray(value) ? value.map(projectPreviewSeat) : [];
+}
+
+export type BriefPreviewProjection =
+  | {
+      readonly outcome: "previewed";
+      readonly preview: {
+        readonly attemptId: string | null;
+        readonly briefDigest: string | null;
+        readonly modelAssignment: {
+          readonly model: string | null;
+          readonly variant: string | null;
+          readonly seatTool: string | null;
+        };
+        readonly seatPlan:
+          | {
+              readonly version: number | null;
+              readonly "first-pass": BriefPreviewSeatProjection[];
+              readonly fix: BriefPreviewSeatProjection[];
+              readonly review: BriefPreviewSeatProjection[];
+            }
+          | null;
+        readonly acceptance: {
+          readonly commitRequired: boolean | null;
+          readonly diffCheck: boolean | null;
+          readonly commandCount: number | null;
+          readonly commandDigests: string[];
+        };
+        readonly prNotesPresent: boolean | null;
+        readonly selectedKnowledgeVersions: readonly {
+          readonly knowledgeEntryId: string | null;
+          readonly version: string | null;
+        }[];
+      };
+    }
+  | {
+      readonly outcome: "rejected";
+      readonly reasonClass: "acceptance-spec-shell" | null;
+      readonly reason: string | null;
+    }
+  | { readonly outcome: string };
+
+/**
+ * Project the brief-preview result (MX7; plan §3.7): the acceptance spec
+ * appears only as flags, a command count and one digest per command — never an
+ * argv element, an owned path, an allowed path prefix, an expected-artifact
+ * path or the worktree path. Dropped: every other field, including any argv
+ * element, owned path, prefix, artifact path or worktree path, and a digest
+ * that is not 64 hex digits.
+ */
+export function projectBriefPreview(result: unknown): BriefPreviewProjection {
+  const record = asRecord(result);
+  if (record?.outcome === "previewed") {
+    const preview = asRecord(record.preview);
+    const modelAssignment = asRecord(preview?.modelAssignment);
+    const seatPlan = asRecord(preview?.seatPlan);
+    const acceptance = asRecord(preview?.acceptance);
+    const selected = Array.isArray(preview?.selectedKnowledgeVersions)
+      ? preview.selectedKnowledgeVersions
+      : [];
+    return {
+      outcome: "previewed",
+      preview: {
+        attemptId: asString(preview?.attemptId),
+        briefDigest: asHexDigest(preview?.briefDigest),
+        modelAssignment: {
+          model: asString(modelAssignment?.model),
+          variant: asString(modelAssignment?.variant),
+          seatTool: asString(modelAssignment?.seatTool),
+        },
+        seatPlan: seatPlan
+          ? {
+              version: asNumber(seatPlan.version),
+              "first-pass": projectPreviewSeatList(seatPlan["first-pass"]),
+              fix: projectPreviewSeatList(seatPlan.fix),
+              review: projectPreviewSeatList(seatPlan.review),
+            }
+          : null,
+        acceptance: {
+          commitRequired: asBoolean(acceptance?.commitRequired),
+          diffCheck: asBoolean(acceptance?.diffCheck),
+          commandCount: asNumber(acceptance?.commandCount),
+          commandDigests: stringList(acceptance?.commandDigests).filter(
+            (digest) => HEX64_PATTERN.test(digest),
+          ),
+        },
+        prNotesPresent: asBoolean(preview?.prNotesPresent),
+        selectedKnowledgeVersions: selected.map((entry) => {
+          const knowledge = asRecord(entry);
+          return {
+            knowledgeEntryId: asString(knowledge?.knowledgeEntryId),
+            version: asString(knowledge?.version),
+          };
+        }),
+      },
+    };
+  }
+  if (record?.outcome === "rejected") {
+    const reason = asString(record.reason);
+    return {
+      outcome: "rejected",
+      reasonClass:
+        record.reasonClass === "acceptance-spec-shell"
+          ? "acceptance-spec-shell"
+          : null,
+      reason: reason !== null ? reason.slice(0, 500) : null,
+    };
+  }
+  return { outcome: asString(record?.outcome) ?? "unknown" };
 }

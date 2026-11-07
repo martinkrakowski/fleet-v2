@@ -16,15 +16,67 @@ export type LaneRunReviewKind = 'brief-check' | 'code-review' | 'pre-merge';
 
 const NONE_FACT: LaneRunReviewFact = Object.freeze({ verdict: 'none', seatIndex: null, retries: 0 });
 
+/** The final reason codes that are not a second verdict (RV4). */
+const SKIPPED_REVIEW_FINAL_REASONS: ReadonlySet<string> = new Set(['seat-busy', 'review-superseded']);
+
+/** The key's final result (any non-ambiguous outcome) reason code; `undefined` when it has none. */
+function finalReasonCodeOf(
+  entries: readonly LaneRunJournalEntryRecord[],
+  key: string,
+): string | null | undefined {
+  let reason: string | null | undefined = undefined;
+  for (const entry of entries) {
+    if (entry.kind === 'result' && entry.key === key && entry.outcome !== 'ambiguous') {
+      reason = entry.reasonCode;
+    }
+  }
+  return reason;
+}
+
+/**
+ * True when a review intent is ignored by the review fact (RV4): its final
+ * reason is `seat-busy` or `review-superseded` (not a second verdict), or it
+ * predates the latest `resumed` result with detail `review-retry` (an older
+ * generation superseded by a resume). Read-only over the journal; never throws.
+ */
+export function laneRunReviewIntentIgnored(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  key: string,
+  recordedAtIso: string,
+): boolean {
+  const finalReason = finalReasonCodeOf(entries, key);
+  if (finalReason !== undefined && finalReason !== null && SKIPPED_REVIEW_FINAL_REASONS.has(finalReason)) {
+    return true;
+  }
+  let latestBoundaryIso: string | null = null;
+  for (const entry of entries) {
+    if (
+      entry.kind === 'result' &&
+      entry.runId === runId &&
+      entry.reasonCode === 'resumed' &&
+      entry.detail === 'review-retry'
+    ) {
+      if (latestBoundaryIso === null || entry.recordedAtIso > latestBoundaryIso) {
+        latestBoundaryIso = entry.recordedAtIso;
+      }
+    }
+  }
+  return latestBoundaryIso !== null && recordedAtIso < latestBoundaryIso;
+}
+
 /**
  * The review fact for `kind` at `head12` (plan §3.4): `head12 === null` → `none`.
- * Considers the run's step intents of exactly `kind` at `head12`; the LATEST such
+ * Considers the run's step intents of exactly `kind` at `head12`, ignoring an
+ * intent whose final reason is `seat-busy`/`review-superseded` or that predates
+ * the latest `resumed`/`review-retry` generation boundary; the LATEST remaining
  * intent (journal order) decides — no final result → `pending`; a final
  * `review-passed` → `passed`; `review-failed` → `failed`; `review-no-receipt` →
  * `no-receipt`; any other final (`review-refused`, `review-unknown`,
- * `assessment-unavailable`, anything else) → `unknown`; no such intent → `none`.
- * `seatIndex` is that intent's seat; `retries` counts the intents for that seat at
- * that head that carry a `retry` segment.
+ * `assessment-unavailable`, anything else) → `unknown`; no remaining intent →
+ * `none`. `seatIndex` is that intent's seat; `retries` is how many remaining
+ * intents are not the earliest one, so the first real review of a generation
+ * counts as 0 even when its key had to use `/retryN`.
  */
 export function laneRunReviewFact(
   entries: readonly LaneRunJournalEntryRecord[],
@@ -36,7 +88,7 @@ export function laneRunReviewFact(
     return NONE_FACT;
   }
 
-  const matching: Array<{ readonly key: string; readonly seatIndex: number; readonly retry: number | null }> = [];
+  const matching: Array<{ readonly key: string; readonly seatIndex: number }> = [];
   for (const entry of entries) {
     if (entry.kind !== 'intent' || entry.runId !== runId || entry.key === null) {
       continue;
@@ -48,7 +100,10 @@ export function laneRunReviewFact(
     if (parsed.step !== kind || parsed.head12 !== head12) {
       continue;
     }
-    matching.push({ key: entry.key, seatIndex: parsed.seatIndex, retry: parsed.retry });
+    if (laneRunReviewIntentIgnored(entries, runId, entry.key, entry.recordedAtIso)) {
+      continue;
+    }
+    matching.push({ key: entry.key, seatIndex: parsed.seatIndex });
   }
   if (matching.length === 0) {
     return NONE_FACT;
@@ -56,12 +111,7 @@ export function laneRunReviewFact(
 
   const latest = matching[matching.length - 1]!;
 
-  let finalReasonCode: string | null | undefined = undefined;
-  for (const entry of entries) {
-    if (entry.kind === 'result' && entry.key === latest.key && entry.outcome !== 'ambiguous') {
-      finalReasonCode = entry.reasonCode;
-    }
-  }
+  const finalReasonCode = finalReasonCodeOf(entries, latest.key);
 
   let verdict: LaneRunReviewFact['verdict'];
   // No final result is pending; a final result with no reason code is still final, and unknown.
@@ -77,12 +127,7 @@ export function laneRunReviewFact(
     verdict = 'unknown';
   }
 
-  let retries = 0;
-  for (const match of matching) {
-    if (match.seatIndex === latest.seatIndex && match.retry !== null) {
-      retries += 1;
-    }
-  }
+  const retries = matching.length - 1;
 
   return Object.freeze({ verdict, seatIndex: latest.seatIndex, retries });
 }

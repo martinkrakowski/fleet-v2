@@ -23,7 +23,12 @@ export interface ListOwnerItemsEntry {
   readonly gatedBlocks: readonly OwnerItemBlockRecord[];
 }
 
-export interface ListOwnerItemsResult { readonly items: readonly ListOwnerItemsEntry[]; }
+export const LIST_OWNER_ITEMS_LIMIT = 200;
+export type ListOwnerItemsRefusalCode = 'request';
+export type ListOwnerItemsResult =
+  | { readonly outcome: 'listed'; readonly items: readonly ListOwnerItemsEntry[]; readonly truncated: boolean }
+  | { readonly outcome: 'refused'; readonly code: ListOwnerItemsRefusalCode; readonly reason: string }
+  | { readonly outcome: 'unknown'; readonly reason: string };
 
 export interface ListOwnerItemsPort {
   listOwnerItems(request?: ListOwnerItemsRequest): Promise<ListOwnerItemsResult>;

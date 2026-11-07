@@ -15,6 +15,7 @@ import {
   ExecutionRunnerAdapter,
   ExecutorForHost,
   ForgeActionAdapter,
+  MergeGrantAdapter,
   OpencodeApiUsageAdapter,
   RunnerForAttemptAdapter,
   RunnerSelectorAdapter,
@@ -31,6 +32,10 @@ import {
   forgeActionPushesBranch,
 } from '@fleet/work-execution';
 import type { FleetInstallationModel } from '@fleet/installation';
+import type {
+  IssueMergeGrantUseCase,
+  IssuePolicyForgeGrantUseCase,
+} from '@fleet/operator-coordination';
 
 import type { FleetCliRuntimeOptions } from '../composition.js';
 import type {
@@ -60,6 +65,8 @@ export interface ComposeExecutionHostsInput {
   readonly runGhSubprocess: (
     args: readonly string[],
     candidates?: readonly string[],
+    env?: Record<string, string>,
+    timeoutMs?: number,
   ) => Promise<GhInvocationResult>;
   readonly ghBinaryCandidates: readonly string[];
   readonly forgeRead: ForgeReadAdapter;
@@ -73,6 +80,10 @@ export interface ComposeExecutionHostsInput {
   readonly readGitHead: typeof readGitHead;
   readonly headRouteForExecutor: typeof headRouteForExecutor;
   readonly runGitCommand: (args: readonly string[]) => Promise<string>;
+  /** The policy grant issuer behind the attempt-bound merge grant (DT6b). */
+  readonly issuePolicyForgeGrantUseCase?: IssuePolicyForgeGrantUseCase;
+  /** The attempt-less merge grant issuer (DT6b). */
+  readonly issueMergeGrantUseCase?: IssueMergeGrantUseCase;
 }
 
 export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
@@ -100,6 +111,8 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     readGitHead,
     headRouteForExecutor,
     runGitCommand,
+    issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
   } = input;
 
   // --- work-execution ---------------------------------------------------------
@@ -126,9 +139,16 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
       ...(runnerRemoteHost !== undefined ? { remoteHost: runnerRemoteHost } : {}),
     },
   });
+  // C2': the artifact adapter is built before the workspace adapter so the
+  // removal's fail-closed manifest gate reads through the same executors.
+  const attemptArtifact = new AttemptArtifactAdapter({
+    executor: roleExecutors.worktree,
+    executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+  });
   const workspace = new WorkspaceAdapter({
     executor: roleExecutors.worktree,
     executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+    checkArtifactManifest: (request) => attemptArtifact.checkArtifactManifestForRemoval(request),
   });
   // Wraps the reviewed `ocm-run` runner subprocess. The bundled repository
   // script is the default; the worktree locator is resolved from the recorded
@@ -214,10 +234,6 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     hosts: installationModel?.hosts,
     implementedRunnerKinds: agyRunner === undefined ? ['opencode'] : ['opencode', 'agy'],
   });
-  const attemptArtifact = new AttemptArtifactAdapter({
-    executor: roleExecutors.worktree,
-    executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
-  });
   // KF-15b: the usage read asks the opencode server that ran the session
   // (`ocm-run --usage`) over the route a review of the same attempt dials: the
   // installation host's alias, port and auth file, or the legacy environment
@@ -254,8 +270,20 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
   // a moved branch head is never pushed or merged on stale readiness.
   const forgeAction = new ForgeActionAdapter(
     {
-    runGh: (args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates),
-    verifyCurrentHeadSha: async (branchName, request) => {
+      // The merge-pass path routes per-kind gh identities (D-DT8): the
+      // premerge poster's config dir for post-status, the merger's for
+      // merge-pr and update-branch. Config dir values are never logged.
+      // Ambient token credentials are stripped so GH_CONFIG_DIR authenticates.
+      runGh: (args, ghConfigDir, timeoutMs) =>
+        runGhSubprocess(
+          args,
+          ghBinaryCandidates,
+          ghConfigDir === undefined
+            ? undefined
+            : buildMergeGhChildEnv(ghConfigDir, (options?.env as NodeJS.ProcessEnv) ?? process.env),
+          timeoutMs,
+        ),
+      verifyCurrentHeadSha: async (branchName, request) => {
       const attempt = await attemptRepository.findAttemptById(request.attemptId);
       if (attempt === null) {
         throw new Error(`No attempt is recorded for ${request.attemptId}`);
@@ -370,7 +398,28 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     ...forgeActionOverrides(options?.forgeActionDelegate),
     },
     forgeRead,
+    {
+      premergeGhConfigDir:
+        (options?.env ?? process.env).FLEET_GH_CONFIG_PREMERGE?.trim() || undefined,
+      mergeGhConfigDir:
+        (options?.env ?? process.env).FLEET_GH_CONFIG_MERGE?.trim() || undefined,
+    },
   );
+
+  // DT6b: the merge-pass grant adapter over the coordination use cases — the
+  // attempt-bound variant routes to the policy grant issuer and the attempt-less
+  // variant to the merge grant issuer. Both delegates are optional so host
+  // tests that only exercise forge adapters can omit the coordination stack; an
+  // unbound delegate answers refused with 'not-configured'. Never log a grant
+  // identifier or config value.
+  const mergeGrant = new MergeGrantAdapter({
+    ...(issuePolicyForgeGrantUseCase !== undefined
+      ? { issuePolicyForgeGrant: issuePolicyForgeGrantUseCase }
+      : {}),
+    ...(issueMergeGrantUseCase !== undefined
+      ? { issueMergeGrant: issueMergeGrantUseCase }
+      : {}),
+  });
 
   return {
     workOrderRepository,
@@ -386,5 +435,33 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     opencodeUsage,
     briefAuthoring,
     forgeAction,
+    mergeGrant,
   };
 }
+
+/**
+ * Build the child environment for a merge-path gh invocation. GH_CONFIG_DIR
+ * is set explicitly, and ambient token credentials (which gh would prefer over
+ * hosts.yml in GH_CONFIG_DIR) are stripped so the configured identity is
+ * always the one that authenticates the call.
+ */
+export function buildMergeGhChildEnv(
+  ghConfigDir: string,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const child: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (
+      value !== undefined &&
+      key !== 'GH_TOKEN' &&
+      key !== 'GITHUB_TOKEN' &&
+      key !== 'GH_ENTERPRISE_TOKEN' &&
+      key !== 'GITHUB_ENTERPRISE_TOKEN'
+    ) {
+      child[key] = value;
+    }
+  }
+  child.GH_CONFIG_DIR = ghConfigDir;
+  return child;
+}
+

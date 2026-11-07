@@ -6,6 +6,8 @@
  * show. Each command is an argv array; no shell string.
  */
 
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+
 export type GateCoverageReader = 'vitest-summary' | 'hexagen-lint-json' | 'eslint-json';
 export type GateCoverageUnitKind = 'tests' | 'files' | 'checks';
 
@@ -33,12 +35,39 @@ export interface AcceptanceSpecProps {
   readonly commands: readonly GateCommand[];
 }
 
+/**
+ * The name a command predicate carries in results and journals: its position
+ * and its argv joined, cut to 120 characters. An argv with secret-shaped text
+ * (before or after the cut) is never echoed: the name says it was withheld.
+ * The gate adapter and the gate use case share this one function so the names
+ * they compare always agree.
+ */
+export function gateCommandPredicateName(argv: readonly string[], index: number): string {
+  const prefix = 'command ' + String(index + 1) + ': ';
+  const joined = argv.join(' ');
+  const cut = (prefix + joined).slice(0, 120);
+  const shaped = (text: string): boolean =>
+    containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
+  if (shaped(joined) || shaped(cut)) {
+    return prefix + '[argv withheld: secret-shaped text]';
+  }
+  return cut;
+}
+
 export const MAX_GATE_COMMANDS = 20;
 export const MAX_GATE_ARGV_ENTRIES = 64;
 export const MAX_GATE_ARG_CHARACTERS = 4096;
 
 /** Guards against a pasted shell string (word splitting), not a sandbox: env, interpreters with -c/-e and package scripts still reach a shell. */
 const SHELL_BASENAMES: readonly string[] = ['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh'];
+
+export const ACCEPTANCE_SHELL_STRING_TAIL = 'looks like a shell string; give each argument its own argv entry';
+export const ACCEPTANCE_SHELL_RUN_TAIL = 'must not run a shell';
+
+/** True exactly for the two fixed, value-free shell rejections of a command. */
+export function isAcceptanceSpecShellError(message: string): boolean {
+  return message.endsWith(ACCEPTANCE_SHELL_STRING_TAIL) || message.endsWith(ACCEPTANCE_SHELL_RUN_TAIL);
+}
 
 function coverageError(value: unknown, n: number): string | null {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -97,11 +126,11 @@ function commandError(value: unknown, n: number): string | null {
     return `AcceptanceSpec command ${n} argv[0] must name a program`;
   }
   if (argv.length === 1 && program.includes(' ')) {
-    return `AcceptanceSpec command ${n} looks like a shell string; give each argument its own argv entry`;
+    return `AcceptanceSpec command ${n} ${ACCEPTANCE_SHELL_STRING_TAIL}`;
   }
   const lastSegment = program.slice(program.lastIndexOf('/') + 1);
   if (SHELL_BASENAMES.indexOf(lastSegment) !== -1) {
-    return `AcceptanceSpec command ${n} must not run a shell`;
+    return `AcceptanceSpec command ${n} ${ACCEPTANCE_SHELL_RUN_TAIL}`;
   }
   if (record.coverage !== undefined) {
     return coverageError(record.coverage, n);

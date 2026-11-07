@@ -77,6 +77,7 @@ function baseEntry(
     detail: null,
     grantId: null,
     state: null,
+    schemaVersion: 1,
     ...overrides,
   };
 }

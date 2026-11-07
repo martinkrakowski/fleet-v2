@@ -2,7 +2,7 @@
 // production attention recorder. The unit suite covers the sink contract with
 // a fake; this covers the production path: the legacy-id overlap refusal
 // through the composed runtime records a work-execution attention item.
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
@@ -16,8 +16,7 @@ const tempStateDirs: string[] = [];
 
 afterAll(() => {
   for (const dir of tempStateDirs) {
-    // The directories are removed by the callers; this is a safety net only.
-    void dir;
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

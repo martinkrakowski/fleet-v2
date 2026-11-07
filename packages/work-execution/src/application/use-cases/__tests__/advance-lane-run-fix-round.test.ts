@@ -2281,7 +2281,9 @@ describe('AdvanceLaneRunUseCase fix-round prepare scopes review findings (KF-33a
       reasonCode: 'prepared',
     });
     expect(harness.fixRequests[0]?.numberedFixes).toEqual([
-      '[major] ' + WORKTREE + '/src/ex.ts:4 — blocks the acceptance check',
+      // PF1: the absolute worktree spelling is normalised to the
+      // repository-relative path before the brief renders.
+      '[major] src/ex.ts:4 — blocks the acceptance check',
     ]);
   });
 
@@ -2918,6 +2920,40 @@ describe('AdvanceLaneRunUseCase fix-round prepare refusal details (MX7)', () => 
       { findingId: 'finding-1', severity: 'nit', summary: 'nit only', filePath: 'src/ex.ts', line: 4 },
     ]);
     expect(await refusedPrepareDetailOf(harness)).toBe('prepare-nothing-to-fix');
+  });
+
+  it('prepare-handover-invalid-finding-path: a major finding escaping the worktree reports the real render refusal (PF1)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      { findingId: 'finding-1', severity: 'major', summary: 'escapes the worktree', filePath: '../escape.ts', line: 4 },
+    ]);
+    harness.setChangedPaths(['../escape.ts']);
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-handover-invalid-finding-path');
+  });
+
+  it('a major finding on a Nitro dynamic-route path prepares (PF1)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedReviewFailure(harness, [
+      {
+        findingId: 'finding-1',
+        severity: 'major',
+        summary: 'validate the route input',
+        filePath: 'apps/api/server/routes/v1/threads/[id]/permissions/index.post.ts',
+        line: 30,
+      },
+    ]);
+    harness.setChangedPaths(['apps/api/server/routes/v1/threads/[id]/permissions/index.post.ts']);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual([
+      '[major] apps/api/server/routes/v1/threads/[id]/permissions/index.post.ts:30 — validate the route input',
+    ]);
   });
 
   it('prepare-brief-request-incomplete: a manifest missing a required request field refuses with its own token', async () => {

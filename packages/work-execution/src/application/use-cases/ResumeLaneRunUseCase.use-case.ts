@@ -347,8 +347,14 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
 
     // A resume whose save landed before a crash: the record is already
     // unparked, so every pending intent is settled as reconciled and the exit
-    // is already complete.
+    // is already complete. An ambiguous step intent the interrupted resume
+    // left open is still abandoned first, so the resumed run never carries it
+    // (the next advance would otherwise park the run again).
     if (record.parked === null) {
+      const crashKey = (pending[0]?.key ?? null) as string | null;
+      if (!(await this.abandonAmbiguousPendingIntent(request.runId, facts.pendingIntent, request.nowIso))) {
+        return { outcome: 'refused', key: crashKey, reason: 'journal-refused' };
+      }
       for (const intent of pending) {
         await this.appendResult(request.runId, intent.key as string, 'reconciled', 'resumed', request.nowIso);
       }

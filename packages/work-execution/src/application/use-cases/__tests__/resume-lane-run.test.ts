@@ -646,6 +646,45 @@ describe('ResumeLaneRunUseCase PT1b3a ambiguous intent', () => {
     expect((await saveCrash.repo.get(RUN_ID))?.parked).toBeNull();
   });
 
+  it('PT1b3a: crash-finish path on an already-unparked record abandons the ambiguous gate intent before settling resume requests', async () => {
+    const fx = await seededAmbiguousGate();
+    await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    // An older interrupted resume already landed its save: the record is
+    // unparked while the ambiguous gate intent is still open.
+    expect(
+      await fx.repo.save(
+        runRecord({
+          parked: null,
+          parkCount: 1,
+          revision: 3,
+          lease: { holderId: HOLDER, fence: 1, leaseUntilIso: LEASE_UNTIL },
+        }),
+        { holderId: HOLDER, fence: 1, nowIso: NOW },
+      ),
+    ).toMatchObject({ outcome: 'saved' });
+
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'none' });
+
+    const entries = await fx.journal.listForRun(RUN_ID);
+    const finals = finalResultsOf(entries, GATE_KEY);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toBeNull();
+    const abandonedAt = entries.indexOf(finals[0]!);
+    const resumeResultAt = entries.findIndex(
+      (entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY && entry.reasonCode === 'resumed',
+    );
+    expect(resumeResultAt).toBeGreaterThan(abandonedAt);
+
+    // A retry never double-writes: the key keeps exactly one final result.
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: LATER }),
+    ).toEqual({ outcome: 'none' });
+    expect(finalResultsOf(await fx.journal.listForRun(RUN_ID), GATE_KEY)).toHaveLength(1);
+  });
+
   it('PT1b3a: stop recorded after resume on ambiguous gate park refuses resume as stop-pending without abandoning until advance stops', async () => {
     const fx = await seededAmbiguousGate();
     await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });

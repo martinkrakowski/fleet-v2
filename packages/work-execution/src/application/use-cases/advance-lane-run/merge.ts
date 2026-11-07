@@ -6,7 +6,7 @@ import type { CiStatePort } from '../../ports/out/CiStatePort.out-port.js';
 import type { ConductorForgeGrantResult } from '../../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ForgeReadPort, PullRequestRef, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
 import type { ForgeAncestryPort } from '../../ports/out/ForgeAncestryPort.out-port.js';
-import type { ReviewRequestPort, FindReviewReceiptResult } from '../../ports/out/ReviewRequestPort.out-port.js';
+import type { ReviewRequestPort, FindReviewReceiptResult, FindLatestReceiptOfKindResult } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import { resolveLaneRunBaseBranch } from '../../../domain/base-branch.js';
@@ -15,6 +15,7 @@ import type { LaneRunPrBodyFrozen, LaneRunCarriedMinor, RenderPrBodyResult } fro
 import { renderPrBody } from '../../../domain/lane-run-pr-body.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
+import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
@@ -212,10 +213,11 @@ function acceptanceRejectionOf(
 
 /**
  * F61: whether the review evidence at the exact head names review work — a
- * found `brief-check` or `code-review` receipt whose verdict is `failed`, or
- * that carries at least one finding (an unresolved review finding). A missing
- * port, a `not-found`/`unavailable` receipt or a throwing lookup contributes
- * nothing; a throwing lookup skips that kind, like `reviewFindingsDetailOf`.
+ * found `brief-check` or `code-review` receipt whose severity outcome is
+ * `failed` (an unresolved blocking finding, RV3). A minor-only receipt is a
+ * pass and never names review work. A missing port, a `not-found`/
+ * `unavailable` receipt or a throwing lookup contributes nothing; a throwing
+ * lookup skips that kind.
  */
 async function reviewFindingsAtHead(
   ctx: AdvanceStepContext,
@@ -229,7 +231,7 @@ async function reviewFindingsAtHead(
   for (const kind of ['brief-check', 'code-review'] as const) {
     try {
       const found = await reviewRequest.findLatestReceiptOfKind({ attemptId, candidateHeadSha: headSha, kind });
-      if (found.outcome === 'found' && (found.receipt.verdict === 'failed' || found.receipt.findings.length > 0)) {
+      if (found.outcome === 'found' && decideConductorReviewOutcome(found.receipt).outcome === 'failed') {
         return true;
       }
     } catch {
@@ -330,7 +332,11 @@ function pullRequestRefOf(record: LaneRunRecord, latest: AttemptRecord): PullReq
   return branchRefOf(record, latest);
 }
 
-/** The pre-merge receipt fact (D3): the receipt's verdict; unreadable → unknown, absent → none. */
+/**
+ * The pre-merge receipt fact (D3, RV3): the receipt's severity-derived
+ * outcome; unreadable → unknown, absent → none. A minor-only `failed`
+ * receipt reads `passed`; a 0-finding `failed` receipt reads `unknown`.
+ */
 async function preMergeFactOf(
   port: ReviewRequestPort,
   attemptId: string,
@@ -339,7 +345,8 @@ async function preMergeFactOf(
   try {
     const read = await port.findLatestReceiptOfKind({ attemptId, candidateHeadSha: headSha, kind: 'pre-merge' });
     if (read.outcome === 'found') {
-      return read.receipt.verdict === 'passed' ? 'passed' : read.receipt.verdict === 'failed' ? 'failed' : 'unknown';
+      const outcome = decideConductorReviewOutcome(read.receipt).outcome;
+      return outcome;
     }
     return read.outcome === 'not-found' ? 'none' : 'unknown';
   } catch {
@@ -560,7 +567,7 @@ async function reviewFindingsDetailOf(
   for (const kind of ['brief-check', 'code-review'] as const) {
     try {
       const found = await reviewRequest.findLatestReceiptOfKind({ attemptId, candidateHeadSha: headSha, kind });
-      if (found.outcome === 'found' && found.receipt.verdict === 'failed' && found.receipt.findings.length > 0) {
+      if (found.outcome === 'found' && decideConductorReviewOutcome(found.receipt).outcome === 'failed') {
         return 'review-findings';
       }
     } catch {
@@ -709,11 +716,16 @@ function frozenPrNotesOf(manifest: Record<string, unknown> | null): LaneRunPrBod
 }
 
 /**
- * GB1: the run's latest brief-check intent key at the accepted head, or null.
- * Read from the journal entries in reverse; only step keys of `brief-check`
- * whose head12 matches the accepted head count.
+ * GB1/RV3: the run's latest review-step intent key (`step`: `brief-check` or
+ * `code-review`) at the accepted head, or null. Read from the journal entries
+ * in reverse; only step keys of exactly `step` whose head12 matches the
+ * accepted head count.
  */
-function latestBriefCheckIntentKeyOf(entries: readonly LaneRunJournalEntryRecord[], headSha: string): string | null {
+function latestReviewStepIntentKeyOf(
+  entries: readonly LaneRunJournalEntryRecord[],
+  step: 'brief-check' | 'code-review',
+  headSha: string,
+): string | null {
   const head12 = head12Of(headSha);
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index]!;
@@ -721,7 +733,7 @@ function latestBriefCheckIntentKeyOf(entries: readonly LaneRunJournalEntryRecord
       continue;
     }
     const parsed = parseLaneRunKey(entry.key);
-    if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'brief-check' || parsed.head12 !== head12) {
+    if (parsed === null || parsed.kind !== 'step' || parsed.step !== step || parsed.head12 !== head12) {
       continue;
     }
     return entry.key;
@@ -757,11 +769,16 @@ function carriedMinorsOfReceipt(receipt: {
 }
 
 /**
- * GB1: the minors the open-PR body carries from the minors-only brief-check
- * override receipt at the accepted head. Display only: a missing read, no
- * intent, no override result, no request id, an absent dep, a non-found or
- * throwing receipt read contributes no lines — the PR still opens.
+ * GB1/RV3: the minors the open-PR body carries from the passing review
+ * receipts at the accepted head — the minor-only override receipts of
+ * `brief-check` and `code-review`, plus the latest `pre-merge` receipt when
+ * its severity outcome is `passed` at the head. Display only and bounded at
+ * `CARRIED_MINORS_MAX` items: a missing read, no intent, no override result,
+ * no request id, an absent dep, a non-found or throwing receipt read
+ * contributes no lines — the PR still opens.
  */
+const CARRIED_MINORS_MAX = 50;
+
 async function carriedMinorsOf(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -778,33 +795,62 @@ async function carriedMinorsOf(
   } catch {
     return [];
   }
-  const key = latestBriefCheckIntentKeyOf(entries, headSha);
-  if (key === null || !hasMinorOnlyOverrideResult(entries, key)) {
-    return [];
+  const carried: LaneRunCarriedMinor[] = [];
+  // The minor-only override receipts of the two review steps: the key carries
+  // minors only when its final journal result is the override itself —
+  // `review-passed` with the fixed detail `minor-only-findings`.
+  for (const step of ['brief-check', 'code-review'] as const) {
+    if (carried.length >= CARRIED_MINORS_MAX) {
+      break;
+    }
+    const key = latestReviewStepIntentKeyOf(entries, step, headSha);
+    if (key === null || !hasMinorOnlyOverrideResult(entries, key)) {
+      continue;
+    }
+    let requestId: string | null;
+    try {
+      requestId = await intentMintedIdOf(ctx, key);
+    } catch {
+      continue;
+    }
+    let found: FindReviewReceiptResult | FindLatestReceiptOfKindResult;
+    try {
+      found =
+        requestId === null
+          ? await port.findLatestReceiptOfKind({ attemptId: latest.id, candidateHeadSha: headSha, kind: step })
+          : await port.findReviewReceipt({
+              attemptId: latest.id,
+              requestId,
+              candidateHeadSha: headSha,
+            });
+    } catch {
+      continue;
+    }
+    if (found.outcome === 'found') {
+      carried.push(...carriedMinorsOfReceipt(found.receipt));
+    }
   }
-  let requestId: string | null;
-  try {
-    requestId = await intentMintedIdOf(ctx, key);
-  } catch {
-    return [];
+  // The pre-merge receipt at the exact head: when its severity outcome is
+  // `passed`, its minors join the Challenge section too.
+  if (carried.length < CARRIED_MINORS_MAX) {
+    try {
+      const preMerge = await port.findLatestReceiptOfKind({
+        attemptId: latest.id,
+        candidateHeadSha: headSha,
+        kind: 'pre-merge',
+      });
+      if (
+        preMerge.outcome === 'found' &&
+        preMerge.receipt.candidateHeadSha === headSha &&
+        decideConductorReviewOutcome(preMerge.receipt).outcome === 'passed'
+      ) {
+        carried.push(...carriedMinorsOfReceipt(preMerge.receipt));
+      }
+    } catch {
+      // Display only: an unavailable pre-merge receipt contributes no lines.
+    }
   }
-  if (requestId === null) {
-    return [];
-  }
-  let found: FindReviewReceiptResult;
-  try {
-    found = await port.findReviewReceipt({
-      attemptId: latest.id,
-      requestId,
-      candidateHeadSha: headSha,
-    });
-  } catch {
-    return [];
-  }
-  if (found.outcome !== 'found') {
-    return [];
-  }
-  return carriedMinorsOfReceipt(found.receipt);
+  return carried.slice(0, CARRIED_MINORS_MAX);
 }
 
 /** The open-pr/push act pre-checks (K6-6): the wiring and the collected head. */

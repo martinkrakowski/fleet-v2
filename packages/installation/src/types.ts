@@ -451,6 +451,18 @@ export interface MergeDaemonSection {
   readonly intervalSeconds?: number;
   readonly budgetSeconds?: number;
   readonly settleSeconds?: number;
+  /**
+   * Chain refresh mode as written. Only `shadow` is valid; `live` and any
+   * unknown value load with a `chain-refresh-mode-invalid` warning and are
+   * kept verbatim so a write round-trips the operator's own text.
+   */
+  readonly chainRefresh?: 'shadow' | 'live' | (string & {});
+  /**
+   * PT1a: minutes a run may sit parked before the conductor raises its stall attention; 1..1440,
+   * default 30. As written: a value outside that range or not an integer loads with a
+   * `stall-after-minutes-invalid` warning, is kept verbatim for a round trip and resolves to 30.
+   */
+  readonly stallAfterMinutes?: number | (string & {}) | boolean | null;
 }
 
 /** A merge repository policy with every default applied (`resolveMergePolicy`). */
@@ -476,6 +488,13 @@ export interface ResolvedMergeDaemonPolicy {
   readonly intervalSeconds: number;
   readonly budgetSeconds: number;
   readonly settleSeconds: number;
+  /**
+   * The effective chain-refresh mode: `shadow` when written `shadow` or absent,
+   * `invalid` when written `live` or anything unknown. Never `live`.
+   */
+  readonly chainRefresh: 'shadow' | 'invalid';
+  /** PT1a: the stall threshold in minutes with the default (30) applied. */
+  readonly stallAfterMinutes: number;
 }
 
 /** The result of `resolveMergePolicy`: the normalized sections at their revision, or a refusal code. */

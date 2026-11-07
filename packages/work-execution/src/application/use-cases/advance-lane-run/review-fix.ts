@@ -4,7 +4,6 @@ import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in
 import type { PrepareFixAttemptRequest, PrepareFixAttemptResult } from '../../ports/in/PrepareFixAttemptPort.in-port.js';
 import type { PrepareBriefPackageResult } from '../../ports/in/PrepareBriefPackagePort.in-port.js';
 import type { PrepareBriefPackageUseCaseRequest } from '../PrepareBriefPackageUseCase.use-case.js';
-import { REVIEW_UNKNOWN_REASONS } from '@fleet/evidence-and-acceptance';
 import type {
   FindReviewReceiptResult,
   ReviewRequestFinding,
@@ -16,12 +15,15 @@ import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../
 import type { HandoverFinding, RenderHandoverBriefInput } from '../../../domain/lane-run-handover.js';
 import { originalBriefOf, renderHandoverBrief } from '../../../domain/lane-run-handover.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
-import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
-import { laneRunReviewFact } from '../../../domain/lane-run-review-facts.js';
+import { laneRunReviewFact, laneRunReviewIntentIgnored } from '../../../domain/lane-run-review-facts.js';
 import { buildLaneRunStepKey, head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import type { ParsedLaneRunKey } from '../../../domain/lane-run-keys.js';
+import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision, LaneRunReviewFact, LaneRunSeatFact } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
+import type { AbortWorktreeRunResult, WorktreeRunState } from '../../../application/ports/out/ExecutionRunnerPort.out-port.js';
+import type { RunnerForAttemptResult } from '../../../application/ports/out/RunnerForAttemptPort.out-port.js';
 import { partitionFindingsByScope } from '../../../domain/review-finding-scope.js';
 import { historyEntryOf, selectReviewSeat } from '../../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
@@ -192,50 +194,34 @@ function pendingReview(decision: ActDecision): AdvanceLaneRunResult {
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'review-unknown' };
 }
 
-/** The journal result for a receipt verdict (K5-4a mapping, reused by the review reconcile). */
-function reviewResultOfVerdict(verdict: ReviewVerdict): { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode } {
-  if (verdict === 'passed') {
-    return { result: 'completed', reasonCode: 'review-passed' };
-  }
-  return { result: 'completed', reasonCode: verdict === 'failed' ? 'review-failed' : 'review-unknown' };
-}
-
-/** The fixed cause codes of an unknown review answer; only these may journal. */
-const REVIEW_UNKNOWN_REASON_CODES: ReadonlySet<string> = new Set(REVIEW_UNKNOWN_REASONS);
-
 /**
- * The fixed cause code of an unknown receipt (`empty`, `unparseable-verdict`,
- * `no-findings-on-fail`): the code only when the verdict is unknown and the
- * code is one of the declared tokens that also matches the run-journal
- * pattern. Reviewer prose, paths and secrets never reach the journal; a
- * pass/fail receipt or an undeclared token is null.
+ * RV3: the journal result of one receipt, derived from its severity outcome
+ * (`decideConductorReviewOutcome`) instead of the raw verdict word:
+ *
+ * - `passed` (a `pass` receipt, or a `fail` receipt whose remaining in-scope
+ *   findings are only `minor`/`nit`) journals `review-passed` with the
+ *   decision's detail (`minor-only-findings` when findings are carried).
+ * - `unknown` (a `verdict: 'unknown'` receipt, or a `failed` receipt with zero
+ *   findings — the RV2 `no-findings-on-fail` shape) journals `review-unknown`
+ *   with the sanitized reason code, so the decider retries once and parks
+ *   `ambiguous` — never `fixing`, never `passed`.
+ * - `failed` (an unresolved `blocker`/`major` finding, whatever the verdict
+ *   word) journals `review-failed` (the scope disposition may still convert
+ *   it in `performReview`).
  */
-function unknownReceiptDetailOf(receipt: {
+function reviewResultOfReceiptDecision(receipt: {
   readonly verdict: ReviewVerdict;
   readonly unknownReason?: string | null;
-}): string | null {
-  return receipt.verdict === 'unknown' &&
-    typeof receipt.unknownReason === 'string' &&
-    REVIEW_UNKNOWN_REASON_CODES.has(receipt.unknownReason) &&
-    LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(receipt.unknownReason)
-    ? receipt.unknownReason
-    : null;
-}
-
-/** The journal result for a review port outcome; null when nothing is established. */
-function reviewResultOf(
-  outcome: ReviewRequestResult,
-): { readonly result: 'completed' | 'refused'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null } | null {
-  switch (outcome.outcome) {
-    case 'unknown':
-      return null;
-    case 'no-receipt':
-      return { result: 'completed', reasonCode: 'review-no-receipt', detail: outcome.detail };
-    case 'refused':
-      return { result: 'refused', reasonCode: 'review-refused', detail: outcome.detail };
-    default:
-      return { ...reviewResultOfVerdict(outcome.receipt.verdict), detail: unknownReceiptDetailOf(outcome.receipt) };
+  readonly findings: readonly ReviewRequestFinding[];
+}): { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null } {
+  const decision = decideConductorReviewOutcome(receipt);
+  if (decision.outcome === 'passed') {
+    return { result: 'completed', reasonCode: 'review-passed', detail: decision.detail };
   }
+  if (decision.outcome === 'unknown') {
+    return { result: 'completed', reasonCode: 'review-unknown', detail: decision.detail };
+  }
+  return { result: 'completed', reasonCode: 'review-failed', detail: null };
 }
 
 /**
@@ -285,90 +271,34 @@ async function recordOutOfScopeFindings(
   }
 }
 
-const MINOR_ONLY_SEVERITIES: readonly string[] = ['minor', 'nit'];
-
 /**
- * GB1: a minors-only failed brief-check receipt does not block the run. True
- * exactly when the kind is `brief-check`, the receipt verdict is `failed`, the
- * receipt has at least one finding, and every finding's severity is `minor`
- * or `nit`. Any blocker or major finding, zero findings, or another kind keeps
- * the plain `review-failed` mapping (fail closed).
- */
-function isMinorOnlyBriefCheckReceipt(
-  kind: ReviewKind,
-  receipt: { readonly verdict: ReviewVerdict; readonly findings: readonly ReviewRequestFinding[] },
-): boolean {
-  if (kind !== 'brief-check' || receipt.verdict !== 'failed' || receipt.findings.length === 0) {
-    return false;
-  }
-  return receipt.findings.every((finding) => MINOR_ONLY_SEVERITIES.includes(finding.severity));
-}
-
-/** The minor-only override: the same shape the plain mapping carries, with the fixed detail token. */
-const MINOR_ONLY_OVERRIDE = {
-  result: 'completed',
-  reasonCode: 'review-passed',
-  detail: 'minor-only-findings',
-} as const;
-
-/**
- * GB1: when the resolved mapping is still `review-failed` for a receipt, the
- * minors-only brief-check override applies on top of it. The scope disposition
- * runs first: an `out-of-scope-findings` result is never touched, and neither
- * is any non-`review-failed` mapping.
- */
-function minorOnlyOverrideOf(
-  step: ReviewKind,
-  outcome: ReviewRequestResult,
-  resolved: { readonly result: 'completed' | 'refused'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null },
-): typeof resolved {
-  if (resolved.reasonCode !== 'review-failed' || outcome.outcome !== 'receipt') {
-    return resolved;
-  }
-  if (!isMinorOnlyBriefCheckReceipt(step, outcome.receipt)) {
-    return resolved;
-  }
-  return { ...MINOR_ONLY_OVERRIDE };
-}
-
-/**
- * GB1: the reconcile's answer mapping with the minors-only brief-check
- * override applied. The detail stays null unless the override applies, so the
- * fixed token only ever marks a minors-only override receipt.
- */
-function reconciledReviewOf(
-  step: ReviewKind,
-  receipt: { readonly verdict: ReviewVerdict; readonly unknownReason?: string | null; readonly findings: readonly ReviewRequestFinding[] },
-  mapped: { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode },
-): { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null } {
-  if (mapped.reasonCode === 'review-failed' && step === 'brief-check' && isMinorOnlyBriefCheckReceipt(step, receipt)) {
-    return { ...MINOR_ONLY_OVERRIDE };
-  }
-  return { ...mapped, detail: unknownReceiptDetailOf(receipt) };
-}
-
-/**
- * KF-33b2: a failed receipt with findings is checked against the lane's
- * changed set before it fails the run. An unknown changed set or no
- * out-of-scope finding leaves the mapping unchanged. With out-of-scope
- * findings the dispositions are recorded through the port: a mixed review
- * keeps `review-failed` (some findings are this lane's); when every finding
- * is out of scope, only an answering `recorded` journals `review-passed`
- * with the fixed detail `out-of-scope-findings` — a `refused` recording
- * keeps `review-failed` (fail closed). The detail is a fixed token; reviewer
- * text is never copied into the journal.
+ * KF-33b2 (RV3): a severity-`failed` receipt is checked against the lane's
+ * changed set before it fails the run — over its BLOCKING (`blocker`/`major`)
+ * findings only; the receipt's `minor`/`nit` findings never block and are
+ * never dispositioned. An unknown changed set or no out-of-scope blocking
+ * finding leaves the `review-failed` mapping unchanged. When every blocking
+ * finding is out of scope and the dispositions are recorded through the port,
+ * the receipt journals `review-passed` with the fixed detail
+ * `minor-only-findings` when in-scope minors remain on the receipt, else
+ * `out-of-scope-findings` — a `refused` recording keeps `review-failed` (fail
+ * closed). The detail is a fixed token; reviewer text is never copied into the
+ * journal. A minor-only receipt never reaches this helper at all: it is
+ * already `review-passed` and `recordOutOfScope` is never called for it.
  */
 async function reviewScopeDispositionOf(
   ctx: AdvanceStepContext,
   gathered: GatheredLaneRunFacts,
   latest: AttemptRecord,
   head: string,
-  findings: readonly ReviewRequestFinding[],
+  receipt: { readonly findings: readonly ReviewRequestFinding[] },
   mapped: { readonly result: 'completed' | 'refused'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null },
 ): Promise<typeof mapped> {
+  const blocking = receipt.findings.filter(
+    (finding) => finding.severity === 'blocker' || finding.severity === 'major',
+  );
   const changed = await changedPathsOf(ctx, gathered, latest, head);
   const partition = partitionFindingsByScope(
-    findings.map((finding) => ({ findingId: finding.findingId, filePath: finding.filePath })),
+    blocking.map((finding) => ({ findingId: finding.findingId, filePath: finding.filePath })),
     changed,
     latest.worktreePath,
   );
@@ -381,12 +311,20 @@ async function reviewScopeDispositionOf(
     head,
     partition.outOfScope.map((finding) => finding.findingId),
   );
-  if (partition.outOfScope.length < findings.length) {
+  if (partition.outOfScope.length < blocking.length) {
     return mapped;
   }
-  return recorded
-    ? { result: 'completed', reasonCode: 'review-passed', detail: 'out-of-scope-findings' }
-    : mapped;
+  if (!recorded) {
+    return mapped;
+  }
+  const remainingMinors = receipt.findings.filter(
+    (finding) => finding.severity === 'minor' || finding.severity === 'nit',
+  ).length;
+  return {
+    result: 'completed',
+    reasonCode: 'review-passed',
+    detail: remainingMinors > 0 ? 'minor-only-findings' : 'out-of-scope-findings',
+  };
 }
 
 interface ReviewInputs {
@@ -437,6 +375,37 @@ async function reviewInputsOf(
 }
 
 /**
+ * RV4: the lowest free review retry key for a parsed review step — `null`
+ * (no `/retry` segment) first, then `/retry1`..`/retry9` — that has no
+ * intent in `entries`. `null` when all ten keys are taken. Pure; never throws.
+ */
+function nextFreeReviewRetryKey(
+  entries: readonly LaneRunJournalEntryRecord[],
+  parsed: Extract<ParsedLaneRunKey, { readonly kind: 'step' }>,
+): string | null {
+  const retries: Array<number | null> = [null, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  for (const retry of retries) {
+    const built = buildLaneRunStepKey({
+      runId: parsed.runId,
+      round: parsed.round,
+      step: parsed.step,
+      seatIndex: parsed.seatIndex,
+      attemptOrdinal: parsed.attemptOrdinal,
+      head12: parsed.head12,
+      retry,
+    });
+    if (!built.ok) {
+      continue;
+    }
+    const taken = entries.some((entry) => entry.kind === 'intent' && entry.key === built.key);
+    if (!taken) {
+      return built.key;
+    }
+  }
+  return null;
+}
+
+/**
  * The `act brief-check` and `act code-review` steps (K5, plan §3.3, §3.4):
  * one review through `ReviewRequestPort` under a journalled request id, after
  * opening the evidence assessment through `ReviewAssessmentPort` with the
@@ -468,8 +437,96 @@ export async function performReview(
       return { outcome: 'waiting', reason: 'session-stagger' };
     }
   }
+
+  // RV4: pick the review key before any write. A journal read throw is
+  // facts-inconsistent and writes nothing. If the decider's base key already
+  // has an intent this generation must skip (a seat-busy or superseded review,
+  // or one predating the latest review-retry resume), open the lowest free
+  // retry key; when all ten keys are taken, wait `review-pending` and write
+  // nothing — never park.
+  let key = decision.key;
+  try {
+    const entries = await ctx.deps.runJournal.listForRun(record.runId);
+    const existingIntent = entries.find(
+      (entry) => entry.kind === 'intent' && entry.key === decision.key,
+    );
+    if (
+      existingIntent !== undefined &&
+      laneRunReviewIntentIgnored(entries, record.runId, decision.key, existingIntent.recordedAtIso)
+    ) {
+      const parsed = parseLaneRunKey(decision.key);
+      if (parsed === null || parsed.kind !== 'step') {
+        return { outcome: 'waiting', reason: 'facts-inconsistent' };
+      }
+      const next = nextFreeReviewRetryKey(entries, parsed);
+      if (next === null) {
+        return { outcome: 'waiting', reason: 'review-pending' };
+      }
+      key = next;
+    }
+  } catch {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+
+  // RV4: resolve the recorded runner and inspect the worktree before the
+  // intent. A missing runnerForAttempt or a runner without inspectWorktreeRun
+  // skips the inspection (the transport --wait covers busy state). An unknown
+  // status is facts-inconsistent and does not abort or dispatch; a running
+  // session whose id equals the collected attempt's session is aborted by
+  // directory (the commit is already on latest.artifacts), and any non-aborted
+  // outcome waits `review-pending` with nothing written. A different session id
+  // is not aborted.
+  const runnerForAttempt = ctx.deps.runnerForAttempt;
+  if (runnerForAttempt !== undefined) {
+    let resolved: RunnerForAttemptResult;
+    try {
+      resolved = runnerForAttempt.runnerForAttempt({ runner: latest.runner ?? null });
+    } catch {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    if (resolved.ok && resolved.runner.inspectWorktreeRun !== undefined) {
+      let inspected: WorktreeRunState;
+      try {
+        inspected = await resolved.runner.inspectWorktreeRun({
+          attemptId: latest.id,
+          worktreePath: latest.worktreePath,
+          runner: latest.runner ?? null,
+        });
+      } catch {
+        return { outcome: 'waiting', reason: 'facts-inconsistent' };
+      }
+      if (inspected.state === 'unknown') {
+        return { outcome: 'waiting', reason: 'facts-inconsistent' };
+      }
+      if (
+        inspected.state === 'running' &&
+        latest.sessionId !== null &&
+        inspected.sessionId === latest.sessionId
+      ) {
+        if (resolved.runner.abortWorktreeRun === undefined) {
+          return { outcome: 'waiting', reason: 'review-pending' };
+        }
+        let aborted: AbortWorktreeRunResult;
+        try {
+          aborted = await resolved.runner.abortWorktreeRun({
+            attemptId: latest.id,
+            worktreePath: latest.worktreePath,
+            runner: latest.runner ?? null,
+            gracePeriodSeconds: 10,
+          });
+        } catch {
+          return { outcome: 'waiting', reason: 'review-pending' };
+        }
+        if (aborted.outcome !== 'aborted') {
+          return { outcome: 'waiting', reason: 'review-pending' };
+        }
+      }
+    }
+  }
+
+  const reviewDecision = key === decision.key ? decision : { ...decision, key };
   const requestId = 'review-' + ctx.deps.newUlid();
-  const intentRefusal = await appendRunIntent(ctx, request, decision.key, requestId);
+  const intentRefusal = await appendRunIntent(ctx, request, reviewDecision.key, requestId);
   if (intentRefusal !== null) {
     return refusedResult(intentRefusal);
   }
@@ -481,11 +538,11 @@ export async function performReview(
   // read) keeps today's unavailable refusal.
   const frozen = await readFrozenBriefVerified(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
   if (frozen.kind === 'unverified') {
-    return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
+    return finishReview(ctx, request, reviewDecision, 'refused', 'assessment-unavailable');
   }
   const requiredChecks = manifestAcceptanceChecks(frozen.kind === 'verified' ? frozen.manifest : null);
   if (requiredChecks === null) {
-    return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
+    return finishReview(ctx, request, reviewDecision, 'refused', 'assessment-unavailable');
   }
   const opened = await ctx.deps.reviewAssessment!.openReviewAssessment({
     attemptId: latest.id,
@@ -496,7 +553,7 @@ export async function performReview(
     requiredChecks,
   });
   if (opened.outcome !== 'open') {
-    return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
+    return finishReview(ctx, request, reviewDecision, 'refused', 'assessment-unavailable');
   }
   const briefText = decision.step === 'brief-check' && frozen.kind === 'verified' ? frozen.prose : undefined;
   let outcome: ReviewRequestResult;
@@ -514,22 +571,36 @@ export async function performReview(
       nowIso: request.nowIso,
     });
   } catch {
-    return pendingReview(decision);
+    return pendingReview(reviewDecision);
   }
-  const mapped = reviewResultOf(outcome);
+  // RV3: the receipt's severity outcome decides the journal result, whatever
+  // the raw verdict word. A severity-`failed` receipt (an unresolved
+  // blocker/major finding) is scoped before it fails the run; a passed or
+  // unknown receipt never records any out-of-scope disposition.
+  let mapped:
+    | { readonly result: 'completed' | 'refused'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null }
+    | null = null;
+  if (outcome.outcome === 'receipt') {
+    mapped = reviewResultOfReceiptDecision(outcome.receipt);
+  } else if (outcome.outcome === 'no-receipt') {
+    // RV4: a seat-busy rejection journals `completed` / `seat-busy` with the
+    // same detail — never `review-no-receipt` — so the decider treats it as
+    // no second verdict (no retry budget spent).
+    mapped =
+      outcome.detail === 'seat-busy'
+        ? { result: 'completed', reasonCode: 'seat-busy', detail: 'seat-busy' }
+        : { result: 'completed', reasonCode: 'review-no-receipt', detail: outcome.detail };
+  } else if (outcome.outcome === 'refused') {
+    mapped = { result: 'refused', reasonCode: 'review-refused', detail: outcome.detail };
+  }
   if (mapped === null) {
-    return pendingReview(decision);
+    return pendingReview(reviewDecision);
   }
-  // KF-33b2: a failed receipt with findings is scoped before it fails the
-  // run; everything else keeps its plain mapping.
   const resolved =
-    outcome.outcome === 'receipt' && outcome.receipt.verdict === 'failed' && outcome.receipt.findings.length > 0
-      ? await reviewScopeDispositionOf(ctx, gathered, latest, head, outcome.receipt.findings, mapped)
+    outcome.outcome === 'receipt' && mapped.reasonCode === 'review-failed'
+      ? await reviewScopeDispositionOf(ctx, gathered, latest, head, outcome.receipt, mapped)
       : mapped;
-  // GB1: after the scope disposition, a still-failed minors-only brief-check
-  // receipt journals `review-passed` with the fixed detail instead.
-  const override = minorOnlyOverrideOf(decision.step as ReviewKind, outcome, resolved);
-  return finishReview(ctx, request, decision, override.result, override.reasonCode, override.detail);
+  return finishReview(ctx, request, reviewDecision, resolved.result, resolved.reasonCode, resolved.detail);
 }
 
 /**
@@ -661,10 +732,9 @@ export async function reconcileReview(
     found = { outcome: 'unavailable', reason: 'unreadable' };
   }
   if (found.outcome === 'found') {
-    const mapped = reviewResultOfVerdict(found.receipt.verdict);
-    // GB1: a minors-only failed brief-check receipt reconciles review-passed
-    // with the fixed detail, before the result entry is appended.
-    const resolved = reconciledReviewOf(parsed.step as ReviewKind, found.receipt, mapped);
+    // RV3: the receipt's severity outcome decides the reconciled result,
+    // identically to `performReview`'s mapping (keyed idempotence).
+    const resolved = reviewResultOfReceiptDecision(found.receipt);
     const resultRefusal = await appendRunResult(ctx, request, decision.key, resolved.result, resolved.reasonCode, resolved.detail);
     if (resultRefusal !== null) {
       return refusedResult(resultRefusal);
@@ -689,18 +759,18 @@ export async function reconcileReview(
 
 /**
  * AR1/MX7: every final `brief-check`/`code-review` result key of this run at
- * `head12`, latest first (journal order) — any final reason code, so both a
- * `review-failed` result and a GB1 `review-passed` with the
- * `minor-only-findings` detail are candidates. Which candidate actually
- * carries the unresolved findings is decided by its receipt, not by the
- * journal result alone.
+ * `head12`, latest first (journal order), with its final reason code. Which
+ * candidate actually carries the unresolved findings is decided by its
+ * receipt, and RV3 only `review-failed` results (an unresolved blocking
+ * finding) are fix sources: a `review-passed` minor-only result never sends a
+ * fix round.
  */
 function reviewResultKeysAtHead(
   entries: readonly LaneRunJournalEntryRecord[],
   runId: string,
   head12: string,
-): { readonly key: string; readonly step: ReviewKind }[] {
-  const candidates: { key: string; step: ReviewKind }[] = [];
+): { readonly key: string; readonly step: ReviewKind; readonly reasonCode: string | null }[] {
+  const candidates: { key: string; step: ReviewKind; reasonCode: string | null }[] = [];
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index]!;
     if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
@@ -713,7 +783,7 @@ function reviewResultKeysAtHead(
     if (parsed.step !== 'brief-check' && parsed.step !== 'code-review') {
       continue;
     }
-    candidates.push({ key: entry.key, step: parsed.step });
+    candidates.push({ key: entry.key, step: parsed.step, reasonCode: entry.reasonCode });
   }
   return candidates;
 }
@@ -1183,19 +1253,31 @@ async function acceptHeadReviewFindings(
   }
   let inScope: readonly ReviewRequestFinding[] | null = null;
   for (const candidate of reviewResultKeysAtHead(entries, shared.record.runId, acceptHead12)) {
+    // RV3: only `review-failed` results (an unresolved blocking finding) are
+    // fix sources; a minor-only `review-passed` result never sends a fix
+    // round, so its key is skipped before its receipt is even read.
+    if (candidate.reasonCode !== 'review-failed') {
+      continue;
+    }
     const found = await candidateReceiptOf(shared.ctx, prior, candidate);
     if (found === null || found.findings.length === 0) {
       continue;
     }
-    const candidateInScope = inScopeFindingsOf(found.findings, changed, prior.worktreePath);
+    // Only blocking findings populate the fix round; minors are carried, never
+    // fixed here.
+    const blocking = found.findings.filter(
+      (finding) => finding.severity === 'blocker' || finding.severity === 'major',
+    );
+    if (blocking.length === 0) {
+      continue;
+    }
+    const candidateInScope = inScopeFindingsOf(blocking, changed, prior.worktreePath);
     if (candidateInScope.length > 0) {
       inScope = candidateInScope;
       break;
     }
-    // The newest FAILED receipt decides: with no in-scope finding, refuse
-    // rather than reach back to an older one. A passed receipt (GB1
-    // minor-only findings) is used only when it has an in-scope finding,
-    // else skipped.
+    // The newest FAILED receipt decides: with no in-scope blocking finding,
+    // refuse rather than reach back to an older one.
     if (found.verdict === 'failed') {
       return { status: 'refused', result: await shared.refuse('no-in-scope-findings') };
     }
@@ -1230,8 +1312,12 @@ async function keyedReviewFindings(
   if (found.outcome !== 'found') {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-review-receipt-unavailable') };
   }
-  const inScope = inScopeFindingsOf(found.receipt.findings, changed, prior.worktreePath);
-  if (found.receipt.findings.length > 0 && inScope.length === 0) {
+  // RV3: only the receipt's blocking findings populate the fix round.
+  const blocking = found.receipt.findings.filter(
+    (finding) => finding.severity === 'blocker' || finding.severity === 'major',
+  );
+  const inScope = inScopeFindingsOf(blocking, changed, prior.worktreePath);
+  if (blocking.length > 0 && inScope.length === 0) {
     return { status: 'refused', result: await shared.refuse('no-in-scope-findings') };
   }
   return { status: 'ok', value: handoverFindingsOf({ findings: inScope }) };
@@ -1439,6 +1525,28 @@ interface FixRenderInput {
 }
 
 /**
+ * PF1: the brief now refuses absolute finding paths, but a reviewer may spell
+ * a changed file with the absolute worktree prefix (the scope rule already
+ * normalises that spelling). Strip the prior attempt's worktree prefix before
+ * rendering so such a finding still hands over — as the repository-relative
+ * path — while every other absolute path refuses at the render.
+ */
+function relativeWorktreeFindingsOf(
+  findings: readonly HandoverFinding[],
+  worktreePath: string,
+): readonly HandoverFinding[] {
+  if (worktreePath === '' || !findings.some((finding) => finding.filePath?.startsWith(worktreePath + '/') === true)) {
+    return findings;
+  }
+  return findings.map((finding) => {
+    if (finding.filePath === null || !finding.filePath.startsWith(worktreePath + '/')) {
+      return finding;
+    }
+    return { ...finding, filePath: finding.filePath.slice(worktreePath.length + 1) };
+  });
+}
+
+/**
  * Steps 16–17: the handover note flag (GB3a) and the rendered brief
  * (KF-5b). A brief that does not render, or renders no numbered fix,
  * refuses.
@@ -1467,14 +1575,25 @@ async function fixRenderHandoverStep(
     branchName,
     head12: input.head,
     source: input.failure.source === 'review' ? 'review' : 'gate',
-    findings: input.findings,
+    findings: relativeWorktreeFindingsOf(input.findings, input.prior.worktreePath),
     gateReasonCodes: input.failure.source === 'review' ? [] : [input.failure.reasonCode],
     gatePredicates: input.gatePredicates,
     proofCommands: input.proofCommands,
     originalBrief: input.originalBrief,
     ...(handover ? { uncommittedHandover: true } : {}),
   } satisfies RenderHandoverBriefInput);
-  if (!brief.ok || brief.numberedFixes.length === 0) {
+  if (!brief.ok) {
+    // PF1: `nothing-to-fix` keeps its own token; any other render refusal
+    // reports the real reason as `prepare-handover-<reason>` — built only
+    // from the closed reason union, never from free text, so the path is
+    // never echoed into the detail.
+    const detail =
+      brief.reason === 'nothing-to-fix'
+        ? 'prepare-nothing-to-fix'
+        : `prepare-handover-${brief.reason}`;
+    return { status: 'refused', result: await shared.refuse('prepare-refused', detail) };
+  }
+  if (brief.numberedFixes.length === 0) {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-nothing-to-fix') };
   }
   return { status: 'ok', value: { briefText: brief.text, numberedFixes: brief.numberedFixes } };

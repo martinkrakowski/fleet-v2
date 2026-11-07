@@ -9,6 +9,7 @@
 
 import {
   type EvidenceAssessmentRecord,
+  type EvidenceArchivePort,
   type EvidenceResultValue,
   type FindingDispositionRecord,
   type InspectAcceptanceEvidencePort,
@@ -23,6 +24,7 @@ import {
   type ReviewKind,
   type ReviewReceiptRecord,
   type ReviewRejection,
+  type ReviewTransportDiagnostic,
   type ReviewUnavailableCode,
   type ReviewUnknownReason,
   assessmentIdForAttempt,
@@ -46,6 +48,7 @@ import type {
 } from '../../application/ports/out/ReviewRequestPort.out-port.js';
 import { parseChainName } from '../../domain/chain-records.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
+import { screenTransportText } from '../../domain/review-transport-screen.js';
 
 /** The only codes that may reach a run-journal `detail`: the evidence context's unavailable codes plus the two post-run rejections. */
 const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([...REVIEW_UNAVAILABLE_CODES, 'not-read-only', 'invalid-receipt']);
@@ -185,6 +188,12 @@ export interface ReviewRequestDelegates {
   readonly inspectAcceptanceEvidence?: InspectAcceptanceEvidencePort['inspectAcceptanceEvidence'];
   /** KF-33b2: the evidence context's disposition recorder, one id per call. */
   readonly recordFindingDisposition?: RecordFindingDispositionPort['recordFindingDisposition'];
+  /**
+   * RV4: archive a screened transport diagnostic under `review-transport-<requestId>`
+   * when a rejected review carried one. Optional: absent skips the archive and the
+   * typed outcome is returned unchanged; an archive failure is swallowed.
+   */
+  readonly archiveEvidence?: EvidenceArchivePort['archiveEvidence'];
 }
 
 function isNonEmptyTrimmed(value: unknown): boolean {
@@ -319,8 +328,10 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
 }
 
 /**
- * True when `findings` is a dense array of plain objects: a sparse array, a
- * non-array or a hole is invalid transport output, never a summary.
+ * True when `findings` is a dense array of plain objects whose every finding
+ * carries one of the four declared severities: a sparse array, a non-array, a
+ * hole or a corrupt severity is invalid transport output, never a summary
+ * (RV3: a corrupt severity never maps to a verdict).
  */
 function findingsAreDense(findings: unknown): boolean {
   try {
@@ -333,6 +344,15 @@ function findingsAreDense(findings: unknown): boolean {
       }
       const finding = findings[index];
       if (!isPlainObject(finding)) {
+        return false;
+      }
+      const severity = (finding as { severity?: unknown }).severity;
+      if (
+        severity !== 'blocker' &&
+        severity !== 'major' &&
+        severity !== 'minor' &&
+        severity !== 'nit'
+      ) {
         return false;
       }
     }
@@ -361,7 +381,9 @@ function receiptOfKindSummaryOf(
     kind,
     reviewerModel: receipt.reviewerModel,
     candidateHeadSha: receipt.candidateHeadSha,
-    verdict: mapVerdict(receipt.result),
+    // RV3: an unverified stored receipt never maps to a verdict; it reads
+    // `unknown` so every downstream decider keeps it unknown (fail closed).
+    verdict: receipt.readOnlyVerified === true ? mapVerdict(receipt.result) : 'unknown',
     findings: receipt.findings.map((finding) => ({
       findingId: finding.findingId,
       severity: finding.severity,
@@ -431,6 +453,39 @@ type AssessmentRead =
 
 export class ReviewRequestAdapter implements ReviewRequestPort {
   constructor(private readonly delegates: ReviewRequestDelegates = {}) {}
+
+  /**
+   * RV4: screen the transport diagnostic's stderr and archive it under
+   * `review-transport-<requestId>`. The content is JSON of only `exitCode`,
+   * `timedOut`, `stdoutEmpty` and the screened stderr (or `null`): no path
+   * except the `[path]` token and no secret text. An archive failure is
+   * swallowed; the review outcome is unchanged.
+   */
+  private async archiveTransportDiagnostic(
+    requestId: string,
+    candidateHeadSha: string,
+    diagnostic: ReviewTransportDiagnostic,
+  ): Promise<void> {
+    const archive = this.delegates.archiveEvidence;
+    if (archive === undefined) {
+      return;
+    }
+    const screenedStderr = diagnostic.stderr === null ? null : screenTransportText(diagnostic.stderr);
+    try {
+      await archive({
+        artifactId: 'review-transport-' + requestId,
+        candidateHeadSha,
+        content: JSON.stringify({
+          exitCode: diagnostic.exitCode,
+          timedOut: diagnostic.timedOut,
+          stdoutEmpty: diagnostic.stdoutEmpty,
+          stderr: screenedStderr,
+        }),
+      });
+    } catch {
+      // Swallowed: an archive miss never changes the review outcome.
+    }
+  }
 
   /** The attempt's assessment through the inspection delegate: the one read both receipt lookups share. */
   private async readAssessmentOf(attemptId: string): Promise<AssessmentRead> {
@@ -512,6 +567,9 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         ? { outcome: 'unknown', reason: 'receipt-mismatch' }
         : { outcome: 'receipt', receipt: summary };
     }
+    if (result.outcome === 'rejected' && result.code !== undefined && result.diagnostic !== undefined) {
+      await this.archiveTransportDiagnostic(requestId, chain.integrationHeadSha, result.diagnostic);
+    }
     return mapRejection(result.rejection, result.code);
   }
 
@@ -577,6 +635,9 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       return summary === null
         ? { outcome: 'unknown', reason: 'receipt-mismatch' }
         : { outcome: 'receipt', receipt: summary };
+    }
+    if (result.outcome === 'rejected' && result.code !== undefined && result.diagnostic !== undefined) {
+      await this.archiveTransportDiagnostic(request.requestId, request.candidateHeadSha, result.diagnostic);
     }
     return mapRejection(result.rejection, result.code);
   }

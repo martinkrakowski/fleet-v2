@@ -47,7 +47,7 @@ import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.o
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord, ActionJournalEntryRecord } from '../../domain/execution-records.js';
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
-import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
+import { isSameModelFamily, screenFailingFile, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
 import { AcceptanceSpec, gateCommandPredicateName } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
@@ -259,6 +259,9 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
     return null;
   }
   const cause = record.cause === undefined ? undefined : record.cause;
+  // PT1a: a stored failing file is screened again; an unusable one reads as null, never echoed.
+  const failingFile =
+    record.failingFile === undefined ? undefined : screenFailingFile(record.failingFile);
   return {
     name: record.predicate,
     kind: record.kind,
@@ -267,6 +270,7 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
     durationMs: record.durationMs,
     detail: record.detail,
     ...(cause === undefined ? {} : { cause }),
+    ...(failingFile === undefined ? {} : { failingFile }),
   };
 }
 
@@ -1083,6 +1087,9 @@ export class RequestAttemptAcceptanceUseCase
     }
     if (result.cause !== undefined) {
       detailObject.cause = result.cause;
+    }
+    if (result.failingFile !== undefined) {
+      detailObject.failingFile = result.failingFile;
     }
     return {
       id: gateRunPrefix(id, candidateHeadSha, gateRun) + String(predicateIndex),

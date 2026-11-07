@@ -22,6 +22,7 @@ import {
   DAEMON_MAX_BUDGET_SECONDS,
   DAEMON_REPO_DIGEST_PATTERN,
   DAEMON_TICK_ID_PATTERN,
+  chainRefreshJobId,
   computeCallBudget,
   computeTickDeadlineIso,
   decideDaemonJobLease,
@@ -58,6 +59,7 @@ import {
   orderMergeQueue,
   type MergeQueueEntryRecord,
 } from '../../domain/merge-queue-records.js';
+import type { ChainAttentionPort, RaiseChainAttentionResult } from '../ports/out/ChainAttentionPort.out-port.js';
 import type { DaemonJobPort, DaemonJobPassRequest } from '../ports/out/DaemonJobPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
@@ -74,6 +76,7 @@ import type {
   RunDaemonTickResult,
 } from '../ports/in/RunDaemonTickPort.in-port.js';
 import type { RunMergePassPort, RunMergePassResult } from '../ports/in/RunMergePassPort.in-port.js';
+import type { RefreshChainsPort, RefreshChainsResult } from '../ports/in/RefreshChainsPort.in-port.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
@@ -98,6 +101,18 @@ export interface RunDaemonTickDependencies {
   /** Reads back the journal entries the merge passes appended, for the projection (plan §3.1). */
   readonly journal: Pick<LaneRunJournalPort, 'listForKey'>;
   readonly mergePass: RunMergePassPort;
+  /** The chain-refresh use case; absent registers no chain-refresh job (lane CO8). */
+  readonly chainRefresh?: RefreshChainsPort;
+  /**
+   * The effective chain-refresh mode (CO8a): `shadow` runs the chain-refresh
+   * job as before; `invalid` registers a job that is skipped with the typed
+   * outcome `chain-refresh-mode-invalid` after raising one policy-level
+   * attention item — a failed raise refuses the job instead. Absent means
+   * `shadow` (and no chain-refresh job without `chainRefresh`).
+   */
+  readonly chainRefreshMode?: 'shadow' | 'invalid';
+  /** Raises the channel-level attention item when `chainRefreshMode` is `invalid`. */
+  readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
   /** The tick clock; production real time, tests a fake. Absent means the system clock. */
   readonly now?: () => string;
   /** The tick sleep, awaited for the wake settle delay. Absent means a `setTimeout` promise. */
@@ -108,6 +123,16 @@ export interface RunDaemonTickDependencies {
 
 export interface DaemonJobRegistryDependencies {
   readonly mergePass: RunMergePassPort;
+  /** The chain-refresh use case; absent registers no chain-refresh job (lane CO8). */
+  readonly chainRefresh?: RefreshChainsPort;
+  /**
+   * The effective chain-refresh mode (CO8a); see `RunDaemonTickDependencies`.
+   * `invalid` registers the skipped-with-attention job (refused when the
+   * attention raise fails), never a live one.
+   */
+  readonly chainRefreshMode?: 'shadow' | 'invalid';
+  /** Raises the policy-level attention item when `chainRefreshMode` is `invalid`. */
+  readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
 }
 
 /** One journal key a merge pass reported as journalled, with the queue entry it acts on. */
@@ -354,11 +379,107 @@ class MergePassJob implements DaemonJobPort {
   }
 }
 
+/** CO8's pass result → the DaemonJobOutcome the tick records; a malformed result is refused. */
+function toChainRefreshJobOutcome(result: RefreshChainsResult): DaemonJobOutcome {
+  if (!isRecord(result)) {
+    return { outcome: 'refused', reasonCode: 'chain-refresh-malformed' };
+  }
+  switch (result.outcome) {
+    case 'completed':
+      return { outcome: 'completed', progressed: Array.isArray(result.chains) && result.chains.length > 0 };
+    case 'budget-exhausted':
+      return { outcome: 'budget-exhausted', progressed: false };
+    case 'skipped':
+      return {
+        outcome: 'skipped',
+        reasonCode: isSafeReasonCode(result.reasonCode) ? result.reasonCode : 'job-skipped',
+      };
+    case 'refused':
+      return {
+        outcome: 'refused',
+        reasonCode: isSafeReasonCode(result.reasonCode) ? result.reasonCode : 'job-failed',
+      };
+    default:
+      return { outcome: 'refused', reasonCode: 'chain-refresh-malformed' };
+  }
+}
+
+/** One chain-refresh job instance: wraps the refresh use case for one repository (lane CO8). */
+class ChainRefreshJob implements DaemonJobPort {
+  constructor(
+    private readonly repository: DaemonRepositoryRef,
+    private readonly refresh: RefreshChainsPort,
+    readonly jobId: string,
+    readonly leaseScope: string,
+  ) {}
+
+  async pass(request: DaemonJobPassRequest): Promise<DaemonJobOutcome> {
+    const result = await this.refresh.runRefreshChains({
+      repository: { owner: this.repository.owner, repo: this.repository.repo },
+      projectId: this.repository.projectId,
+      nowIso: request.nowIso,
+      deadlineIso: request.deadlineIso,
+    });
+    return toChainRefreshJobOutcome(result);
+  }
+}
+
+/**
+ * CO8a: one chain-refresh job instance when `policy.daemon.chainRefresh` is
+ * `invalid`. The job never touches the forge: it raises one policy-level
+ * attention item naming the key (refreshed on a repeat, never duplicated) and
+ * is skipped with the typed outcome `chain-refresh-mode-invalid`. The merge
+ * pass and every other job run normally regardless. A failed raise (refused
+ * or throwing) refuses the job, so the tick exits non-zero and the operator is
+ * alerted that the invalid mode was not surfaced.
+ */
+class ChainRefreshInvalidJob implements DaemonJobPort {
+  constructor(
+    private readonly repository: DaemonRepositoryRef,
+    private readonly attention: Pick<ChainAttentionPort, 'raiseChainAttention'> | undefined,
+    readonly jobId: string,
+    readonly leaseScope: string,
+  ) {}
+
+  async pass(_request: DaemonJobPassRequest): Promise<DaemonJobOutcome> {
+    const attention = this.attention;
+    if (attention === undefined) {
+      // Without the attention store no notification is possible: refuse rather
+      // than report a harmless skip.
+      return { outcome: 'refused', reasonCode: 'chain-refresh-attention-unavailable' };
+    }
+    let raised: RaiseChainAttentionResult;
+    try {
+      raised = await attention.raiseChainAttention({
+        projectId: this.repository.projectId,
+        repository: { owner: this.repository.owner, repo: this.repository.repo },
+        kind: 'chain-refresh-mode-invalid',
+      });
+    } catch {
+      // A throwing raise means the operator was not notified: refuse the job so
+      // the tick reports it and exits non-zero.
+      return { outcome: 'refused', reasonCode: 'chain-refresh-attention-failed' };
+    }
+    if (raised.outcome !== 'raised' && raised.outcome !== 'refreshed' && raised.outcome !== 'reopened') {
+      // The store refused the raise: refuse the job so the operator learns the
+      // invalid mode was not surfaced.
+      return { outcome: 'refused', reasonCode: 'chain-refresh-attention-refused' };
+    }
+    return { outcome: 'skipped', reasonCode: 'chain-refresh-mode-invalid' };
+  }
+}
+
 /** The registry that expands the configured repositories into one merge-pass job instance each. */
 export class DaemonJobRegistry {
   constructor(private readonly deps: DaemonJobRegistryDependencies) {}
 
-  /** One merge-pass job instance per valid repository, in request order; a repeated digest keeps the first. */
+  /**
+   * One merge-pass job instance per valid repository, in request order; a repeated
+   * digest keeps the first. When the chain-refresh mode is `invalid`, one skipped
+   * chain-refresh job instance (CO8a) per valid repository follows the merge-pass
+   * jobs; otherwise, when the chain-refresh use case is present, one real
+   * chain-refresh job instance per valid repository follows them.
+   */
   instances(repositories: readonly DaemonRepositoryRef[]): readonly DaemonJobPort[] {
     const instances: DaemonJobPort[] = [];
     const seen = new Set<string>();
@@ -372,6 +493,35 @@ export class DaemonJobRegistry {
       }
       seen.add(repository.repoDigest);
       instances.push(new MergePassJob(repository, this.deps.mergePass, parsed.jobId, parsed.leaseScope));
+    }
+    if (this.deps.chainRefreshMode === 'invalid') {
+      const refreshSeen = new Set<string>();
+      for (const repository of repositories) {
+        if (!isUsableRepository(repository) || refreshSeen.has(repository.repoDigest)) {
+          continue;
+        }
+        const parsed = parseDaemonJobId(chainRefreshJobId(repository.repoDigest));
+        if (parsed === null || parsed.kind !== 'chain-refresh') {
+          continue;
+        }
+        refreshSeen.add(repository.repoDigest);
+        instances.push(
+          new ChainRefreshInvalidJob(repository, this.deps.chainAttention, parsed.jobId, parsed.leaseScope),
+        );
+      }
+    } else if (this.deps.chainRefresh !== undefined) {
+      const refreshSeen = new Set<string>();
+      for (const repository of repositories) {
+        if (!isUsableRepository(repository) || refreshSeen.has(repository.repoDigest)) {
+          continue;
+        }
+        const parsed = parseDaemonJobId(chainRefreshJobId(repository.repoDigest));
+        if (parsed === null || parsed.kind !== 'chain-refresh') {
+          continue;
+        }
+        refreshSeen.add(repository.repoDigest);
+        instances.push(new ChainRefreshJob(repository, this.deps.chainRefresh, parsed.jobId, parsed.leaseScope));
+      }
     }
     return instances;
   }
@@ -565,7 +715,12 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       state: { budgetSpent: false },
     };
 
-    const jobs = new DaemonJobRegistry({ mergePass: this.deps.mergePass }).instances(request.repositories);
+    const jobs = new DaemonJobRegistry({
+      mergePass: this.deps.mergePass,
+      ...(this.deps.chainRefresh !== undefined ? { chainRefresh: this.deps.chainRefresh } : {}),
+      ...(this.deps.chainRefreshMode !== undefined ? { chainRefreshMode: this.deps.chainRefreshMode } : {}),
+      ...(this.deps.chainAttention !== undefined ? { chainAttention: this.deps.chainAttention } : {}),
+    }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
     await this.settle(ctx, plan.settleDelayMs);
     if (plan.paused) {

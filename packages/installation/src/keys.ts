@@ -410,4 +410,6 @@ export const POLICY_DAEMON_KEYS: readonly string[] = freezeKeys<MergeDaemonSecti
   'intervalSeconds',
   'budgetSeconds',
   'settleSeconds',
+  'chainRefresh',
+  'stallAfterMinutes',
 ]);

@@ -118,6 +118,11 @@ function buildConductorDriver(parts: {
   readonly dispatchStaggerMs?: number;
   /** KF-34b: how many live runs one pass advances concurrently; absent = 1. */
   readonly passConcurrency?: number;
+  /** PT1a: the stall attention wiring; absent in the dry-run driver, which raises nothing. */
+  readonly stall?: Pick<
+    ConstructorParameters<typeof RunConductorPassUseCase>[0],
+    'stallAttention' | 'workOrderRepo' | 'stallAfterMinutes'
+  >;
 }): ConductorDriver {
   const pass = new RunConductorPassUseCase({
     driverLease: parts.driverLease,
@@ -128,6 +133,7 @@ function buildConductorDriver(parts: {
     advance: parts.advance,
     ...(parts.dispatchStaggerMs === undefined ? {} : { dispatchStaggerMs: parts.dispatchStaggerMs }),
     ...(parts.passConcurrency === undefined ? {} : { passConcurrency: parts.passConcurrency }),
+    ...(parts.stall === undefined ? {} : parts.stall),
   });
   return {
     pass,
@@ -223,6 +229,7 @@ export function buildLiveConductorDriver(
     reviewRequest: conductor.reviewRequest,
     reviewAssessment: conductor.reviewAssessment,
     gateReceipts: conductor.gateReceipts,
+    gateFailingFile: conductor.gateFailingFile,
     sameModelFamily: (left, right) =>
       isSameModelFamily(underlyingModelFamily(left), underlyingModelFamily(right)),
     workOrderRepo: execution.workOrderRepository,
@@ -278,6 +285,11 @@ export function buildLiveConductorDriver(
       runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
       dispatchStaggerMs: LIVE_DISPATCH_STAGGER_MS,
       ...(options.passConcurrency === undefined ? {} : { passConcurrency: options.passConcurrency }),
+      stall: {
+        stallAttention: conductor.stallAttention,
+        workOrderRepo: execution.workOrderRepository,
+        stallAfterMinutes: conductor.stallAfterMinutes,
+      },
     }),
     passTrace,
   };

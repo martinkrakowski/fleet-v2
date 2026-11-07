@@ -14,6 +14,8 @@ import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { laneRunConductEntry, laneRunIntentEntry } from '../../../domain/lane-run-step-facts.js';
 import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
+import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
+import { LANE_RUN_ONE_WAY_STEPS } from '../../../domain/lane-run-records.js';
 import type { LaneRunParkRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
@@ -451,5 +453,73 @@ describe('ResumeLaneRunUseCase applyPendingResume', () => {
       reasonCode: 'not-parked',
     });
     expect((await fx.repo.get(RUN_ID))?.parked).toBeNull();
+  });
+
+  it('RV4: a review-seat-unavailable resume supersedes pending review intents and marks the resumed result review-retry', async () => {
+    const keyBuilt = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'brief-check',
+      seatIndex: 0,
+      attemptOrdinal: null,
+      head12: '0123456789ab',
+      retry: null,
+    });
+    expect(keyBuilt.ok).toBe(true);
+    const reviewKey = keyBuilt.ok ? keyBuilt.key : '';
+
+    const repo = new LaneRunRepositoryAdapter();
+    const journal = new LaneRunJournalAdapter();
+    const park: LaneRunParkRecord = {
+      reason: 'review-seat-unavailable',
+      qualifier: null,
+      parkedFrom: 'brief-check',
+      questionId: null,
+    };
+    const record = runRecord();
+    expect(await repo.create(record)).toEqual({ outcome: 'saved', record });
+    await repo.acquireLease(RUN_ID, {
+      holderId: HOLDER,
+      observedFence: 0,
+      leaseUntilIso: LEASE_UNTIL,
+      nowIso: NOW,
+    });
+    expect(
+      await repo.save(
+        runRecord({
+          parked: park,
+          parkCount: 1,
+          revision: 2,
+          lease: { holderId: HOLDER, fence: 1, leaseUntilIso: LEASE_UNTIL },
+        }),
+        { holderId: HOLDER, fence: 1, nowIso: NOW },
+      ),
+    ).toMatchObject({ outcome: 'saved' });
+    await journal.append(laneRunConductEntry(ENTRY_5, RUN_ID, 'parked', NOW));
+    // A pending brief-check intent of the parked run, with no final result.
+    await journal.append(laneRunIntentEntry('01JB00000000000000000000AA', RUN_ID, reviewKey, 'review-order-pending', NOW));
+
+    const resume = new ResumeLaneRunUseCase({ runRepo: repo, runJournal: journal, newUlid: ulidMinter() });
+    expect(
+      await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW }),
+    ).toEqual({ outcome: 'resume-recorded', runId: RUN_ID, to: 'brief-check', key: RESUME_CLI_KEY });
+    expect(
+      await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toMatchObject({ outcome: 'resumed', to: 'brief-check', key: RESUME_CLI_KEY });
+
+    const entries = await journal.listForRun(RUN_ID);
+    const reviewResults = entries.filter((entry) => entry.kind === 'result' && entry.key === reviewKey);
+    expect(reviewResults).toHaveLength(1);
+    expect(reviewResults[0]).toMatchObject({ outcome: 'reconciled', reasonCode: 'review-superseded' });
+    const resumeResult = entries.find((entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY);
+    expect(resumeResult).toMatchObject({ reasonCode: 'resumed', detail: 'review-retry' });
+
+    // Review steps stay two-way (never one-way) and the journal never gained a
+    // request-digest field (RV4 robustness 8).
+    expect((LANE_RUN_ONE_WAY_STEPS as readonly string[]).includes('brief-check')).toBe(false);
+    expect((LANE_RUN_ONE_WAY_STEPS as readonly string[]).includes('code-review')).toBe(false);
+    for (const entry of entries) {
+      expect(Object.hasOwn(entry, 'requestDigest')).toBe(false);
+    }
   });
 });

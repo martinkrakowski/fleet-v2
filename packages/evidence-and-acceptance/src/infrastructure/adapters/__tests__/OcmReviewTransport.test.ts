@@ -92,10 +92,10 @@ describe('OcmReviewTransport', () => {
     expect(spawnCalled).toBe(false);
   });
 
-  it('a brief-check request without the brief throws before spawn', async () => {
-    let spawnCalled = false;
+  it('a brief-check request without the brief throws after the idle wait and before the review', async () => {
+    let spawnCalls = 0;
     const fakeSpawn: OcmReviewTransportSpawn = async () => {
-      spawnCalled = true;
+      spawnCalls += 1;
       return { exitCode: 0, stdout: '', stderr: '' };
     };
 
@@ -118,7 +118,9 @@ describe('OcmReviewTransport', () => {
       message: 'a brief-check review requires the brief text',
       code: 'transport-failed',
     });
-    expect(spawnCalled).toBe(false);
+    // The transport is invoked twice by this test; each invocation ran only
+    // the idle `--wait` spawn, never the review.
+    expect(spawnCalls).toBe(2);
   });
 
   it('a route of kind none without a code is route-unresolved', async () => {
@@ -280,9 +282,19 @@ describe('OcmReviewTransport', () => {
       spawn: fakeSpawn,
     });
 
-    await expect(transport(baseRequest)).rejects.toThrow(
-      /reviewer process failed with exit code 1: daemon failed to start runner session/,
+    const rejection = await transport(baseRequest).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(ReviewTransportError);
+    // The message carries the exit code but never stderr (RV4).
+    expect((rejection as ReviewTransportError).message).toBe(
+      'reviewer process failed with exit code 1',
     );
+    expect((rejection as ReviewTransportError).code).toBe('transport');
+    expect((rejection as ReviewTransportError).diagnostic).toMatchObject({
+      exitCode: 1,
+      timedOut: false,
+      stderr: 'daemon failed to start runner session',
+      stdoutEmpty: true,
+    });
   });
 
   it('only read/grep tools + VERDICT: PASS → pass, readOnlyVerified true', async () => {
@@ -490,7 +502,8 @@ describe('OcmReviewTransport', () => {
         },
       });
       const result = await transport(kind === undefined ? baseRequest : ({ ...baseRequest, kind, briefText: 'b' } as never));
-      expect(spawnCalls).toBe(1);
+      // Idle `--wait`, then the review.
+      expect(spawnCalls).toBe(2);
       expect(result.result).toBe('unknown');
       expect(result.unknownReason).toBe('unparseable-verdict');
       expect(result.findings).toEqual([]);
@@ -1358,6 +1371,8 @@ describe('OcmReviewTransport', () => {
     });
 
     it('two transport calls without makeNonce embed different nonces', async () => {
+      // Each call spawns `--wait` first (its last arg is the dir), then the
+      // review; the review prompts are the odd-indexed entries.
       const prompts: string[] = [];
       const fakeSpawn: OcmReviewTransportSpawn = async (_file, args) => {
         prompts.push(args[args.length - 1]);
@@ -1381,10 +1396,11 @@ describe('OcmReviewTransport', () => {
       await transport(baseRequest);
       await transport(baseRequest);
 
-      expect(prompts).toHaveLength(2);
-      expect(extractPromptNonce(prompts[0])).not.toBe(extractPromptNonce(prompts[1]));
+      const reviewPrompts = prompts.filter((_prompt, index) => index % 2 === 1);
+      expect(reviewPrompts).toHaveLength(2);
+      expect(extractPromptNonce(reviewPrompts[0])).not.toBe(extractPromptNonce(reviewPrompts[1]));
       // The default nonce is randomBytes(16): exactly 32 lowercase hex characters (Fable minor).
-      expect(extractPromptNonce(prompts[0])).toMatch(/^[0-9a-f]{32}$/);
+      expect(extractPromptNonce(reviewPrompts[0])).toMatch(/^[0-9a-f]{32}$/);
     });
 
     // Verdict parsing is unchanged and stays covered by the tests above:
@@ -1498,7 +1514,7 @@ describe('OcmReviewTransport', () => {
       expect(env.OPENCODE_AUTH_FILE).toBeUndefined();
     });
 
-    it('forwards the review timeout budget to the spawn', async () => {
+    it('forwards the review timeout budget to the wait and the review spawn', async () => {
       const received: Array<{ timeoutMs?: number }> = [];
       const fakeSpawn: OcmReviewTransportSpawn = async (_file, _args, _env, options) => {
         received.push(options ?? {});
@@ -1524,8 +1540,13 @@ describe('OcmReviewTransport', () => {
       await makeTransport(1234)(baseRequest);
       await makeTransport()(baseRequest);
 
+      // Each transport call spawns `--wait` then the review, both under the
+      // same timeout budget.
+      expect(received).toHaveLength(4);
       expect(received[0]).toEqual({ timeoutMs: 1234 });
-      expect(received[1]).toEqual({ timeoutMs: DEFAULT_REVIEW_TIMEOUT_MS });
+      expect(received[1]).toEqual({ timeoutMs: 1234 });
+      expect(received[2]).toEqual({ timeoutMs: DEFAULT_REVIEW_TIMEOUT_MS });
+      expect(received[3]).toEqual({ timeoutMs: DEFAULT_REVIEW_TIMEOUT_MS });
     });
 
     it('a timeout (null exit code) rejects and surfaces as unavailable through the adapter', async () => {
@@ -1923,9 +1944,10 @@ describe('OcmReviewTransport', () => {
       const result = await transport(kindRequest);
 
       expect(diffCalls).toEqual([['base-sha-1', baseRequest.candidateHeadSha]]);
-      expect(prompts).toHaveLength(1);
-      expect(prompts[0]).toContain('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
-      expect(prompts[0]).toContain('+added line');
+      // `--wait` (dir) then the review prompt.
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
+      expect(prompts[1]).toContain('+added line');
       expect(result.readOnlyVerified).toBe(true);
     });
 
@@ -2071,8 +2093,8 @@ describe('OcmReviewTransport', () => {
       expect(result.readOnlyVerified).toBe(false);
     });
 
-    it('a throwing readDiff gives a non-pass with the diff-unavailable reason and never spawns', async () => {
-      let spawnCalled = false;
+    it('a throwing readDiff gives a non-pass with the diff-unavailable reason and never spawns the review', async () => {
+      let spawnCalls = 0;
       const transport = createOcmReviewTransport({
         ocmRunBin: '/test/ocm-run',
         remotePort: 4096,
@@ -2081,7 +2103,7 @@ describe('OcmReviewTransport', () => {
         resolveReviewDir: async () => '/tmp/review-dir',
         readHead: async () => baseRequest.candidateHeadSha,
         spawn: async () => {
-          spawnCalled = true;
+          spawnCalls += 1;
           return { exitCode: 0, stdout: '', stderr: '' };
         },
         baseCommit: 'base-sha-1',
@@ -2096,12 +2118,13 @@ describe('OcmReviewTransport', () => {
       expect(result.result).toBe('unknown');
       expect(result.rawOutput).toBe('diff-unavailable');
       expect(result.findings).toEqual([]);
-      expect(spawnCalled).toBe(false);
+      // Only the idle `--wait` ran; the review itself never spawned.
+      expect(spawnCalls).toBe(1);
     });
 
     it('a null or blank diff gives a non-pass with the diff-unavailable reason', async () => {
       for (const unreadable of [null, '', '   ']) {
-        let spawnCalled = false;
+        let spawnCalls = 0;
         const transport = createOcmReviewTransport({
           ocmRunBin: '/test/ocm-run',
           remotePort: 4096,
@@ -2110,7 +2133,7 @@ describe('OcmReviewTransport', () => {
           resolveReviewDir: async () => '/tmp/review-dir',
           readHead: async () => baseRequest.candidateHeadSha,
           spawn: async () => {
-            spawnCalled = true;
+            spawnCalls += 1;
             return { exitCode: 0, stdout: '', stderr: '' };
           },
           baseCommit: 'base-sha-1',
@@ -2122,12 +2145,12 @@ describe('OcmReviewTransport', () => {
 
         expect(result.result).toBe('unknown');
         expect(result.rawOutput).toBe('diff-unavailable');
-        expect(spawnCalled).toBe(false);
+        expect(spawnCalls).toBe(1);
       }
     });
 
-    it('an oversized diff gives a non-pass with the diff-truncated reason and never spawns', async () => {
-      let spawnCalled = false;
+    it('an oversized diff gives a non-pass with the diff-truncated reason and never spawns the review', async () => {
+      let spawnCalls = 0;
       const transport = createOcmReviewTransport({
         ocmRunBin: '/test/ocm-run',
         remotePort: 4096,
@@ -2136,7 +2159,7 @@ describe('OcmReviewTransport', () => {
         resolveReviewDir: async () => '/tmp/review-dir',
         readHead: async () => baseRequest.candidateHeadSha,
         spawn: async () => {
-          spawnCalled = true;
+          spawnCalls += 1;
           return { exitCode: 0, stdout: '', stderr: '' };
         },
         baseCommit: 'base-sha-1',
@@ -2148,12 +2171,12 @@ describe('OcmReviewTransport', () => {
 
       expect(result.result).toBe('unknown');
       expect(result.rawOutput).toBe('diff-truncated');
-      expect(spawnCalled).toBe(false);
+      expect(spawnCalls).toBe(1);
     });
 
     it('a kind review with no readDiff or no baseCommit is refused with diff-unavailable', async () => {
       for (const missing of [{ baseCommit: 'base-sha-1' }, { readDiff: async () => 'diff text' }]) {
-        let spawnCalled = false;
+        let spawnCalls = 0;
         const transport = createOcmReviewTransport({
           ocmRunBin: '/test/ocm-run',
           remotePort: 4096,
@@ -2162,7 +2185,7 @@ describe('OcmReviewTransport', () => {
           resolveReviewDir: async () => '/tmp/review-dir',
           readHead: async () => baseRequest.candidateHeadSha,
           spawn: async () => {
-            spawnCalled = true;
+            spawnCalls += 1;
             return { exitCode: 0, stdout: '', stderr: '' };
           },
           ...missing,
@@ -2173,7 +2196,7 @@ describe('OcmReviewTransport', () => {
 
         expect(result.result).toBe('unknown');
         expect(result.rawOutput).toBe('diff-unavailable');
-        expect(spawnCalled).toBe(false);
+        expect(spawnCalls).toBe(1);
       }
     });
 
@@ -2601,11 +2624,19 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
       { exitCode: null, stdout: '', stderr: '', timedOut: true },
       { exitCode: null, stdout: '', stderr: 'command exceeded its 1234ms timeout' },
     ] as OcmReviewTransportSpawnResult[]) {
-      const transport = makeTransport('', async () => spawnResult);
+      // The idle `--wait` runs first (exit 0); the review then times out.
+      let spawnCalls = 0;
+      const transport = makeTransport('', async () => {
+        spawnCalls += 1;
+        return spawnCalls === 1 ? { exitCode: 0, stdout: '', stderr: '' } : spawnResult;
+      });
       const rejection = await transport(kindRequest).catch((error: unknown) => error);
       expect(rejection).toBeInstanceOf(ReviewTransportError);
       expect((rejection as ReviewTransportError).code).toBe('timeout');
 
+      // The adapter re-invokes the transport; reset the idleness count so the
+      // `--wait` of that invocation is idle again.
+      spawnCalls = 0;
       const adapter = new IndependentReviewAdapter({ runReview: transport });
       const result = await adapter.runIndependentReview(kindRequest);
       expect(result.outcome).toBe('unavailable');
@@ -2723,5 +2754,308 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     const transported = await makeTransport(jsonText(huge))(kindRequest);
     expect(transported.rawOutput.length).toBeLessThanOrEqual(MAX_RAW_OUTPUT_LENGTH);
     expect(transported.findings).toHaveLength(MAX_PARSED_FINDINGS);
+  });
+});
+
+describe('RV3 Luna round 1: unrecognised finding severities', () => {
+  it('maps critical to blocker and high to major on FINDING and numbered lines', () => {
+    const text = [
+      'FINDING: critical src/a.ts:3 data loss',
+      'FINDING: HIGH src/b.ts:4 wrong result',
+      '1. `src/c.ts:5` - **critical**. unsafe',
+      '2. `src/d.ts:6` - high: broken',
+      'VERDICT: PASS',
+    ].join('\n');
+    const parsed = parseReviewReplyStrict(text);
+    expect(parsed.findings.map((entry) => entry.severity)).toEqual(['blocker', 'major', 'blocker', 'major']);
+    expect(parsed.result).toBe('fail');
+  });
+
+  it('an unrecognised severity refuses the whole reply as unparseable-verdict, never dropping the finding', () => {
+    for (const reply of [
+      'FINDING: catastrophic src/a.ts:3 data loss\nVERDICT: PASS',
+      '1. `src/a.ts:3` - **showstopper**. data loss\nVERDICT: PASS',
+    ]) {
+      for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
+        const parsed = parse(reply);
+        expect(parsed.result).toBe('unknown');
+        expect(parsed.unknownReason).toBe('unparseable-verdict');
+      }
+    }
+  });
+  it('Luna round 2: finding-shaped lines that do not fully parse refuse the whole reply', () => {
+    for (const line of [
+      'FINDING:  Critical: src/a.ts:3 data loss',
+      'sev: critical src/a.ts:3 data loss',
+      '**Critical**: src/a.ts:3 data loss',
+      '- _major_ src/a.ts:3 wrong result',
+      '- \u0441ritical src/a.ts:3 data loss',
+      '1. `src/a.ts:3` - \u0441r\u0456t\u0456c\u0430l. data loss',
+      '- maj**or** src/a.ts:3 unsafe',
+      '**-** major src/a.ts:3 data loss',
+      '* major src/a.ts:3 data loss',
+      '- `critical` src/a.ts:3 data loss',
+      '1) Major: src/a.ts:3 wrong result',
+    ]) {
+      for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
+        const parsed = parse(`${line}\nVERDICT: PASS`);
+        expect(parsed.result, line).toBe('unknown');
+        expect(parsed.unknownReason, line).toBe('unparseable-verdict');
+      }
+    }
+  });
+
+  it('Luna round 2: a clean PASS reply and ordinary severity prose still pass', () => {
+    for (const text of [
+      'Looks good.\nVERDICT: PASS',
+      'There are no major issues and the risk is high only in theory.\nVERDICT: PASS',
+      'Résumé of the change: all fine, see src/a.ts for details.\nVERDICT: PASS',
+      'I inspected src/a.ts:3; no major issue was found.\nVERDICT: PASS',
+      '- no major issues in src/a.ts:3\n- confidence in the change is high\nVERDICT: PASS',
+      'Review of the diff against the brief: every step is covered and the tests assert the new behaviour.\n\nVERDICT: PASS',
+    ]) {
+      const parsed = parseReviewReplyStrict(text);
+      expect(parsed.result, text).toBe('pass');
+      expect(parsed.findings).toEqual([]);
+    }
+  });
+});
+
+describe('RV4: busy worktree transport (seat-busy)', () => {
+  const request: RunIndependentReviewRequest = {
+    attemptId: 'att-busy',
+    candidateHeadSha: 'sha-busy-head',
+    implementerModel: 'provider-a/implementer',
+    reviewerModel: 'provider-b/reviewer',
+  };
+
+  const PASS_JSON = '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+
+  const makeTransport = (spawn: OcmReviewTransportSpawn, timeoutMs?: number) =>
+    createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: request.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => request.candidateHeadSha,
+      spawn,
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    });
+
+  it('a free seat spawns --wait then the review', async () => {
+    const calls: Array<{ args: readonly string[]; env: Record<string, string> }> = [];
+    const transport = makeTransport(async (_file, args, env) => {
+      calls.push({ args, env });
+      return { exitCode: 0, stdout: PASS_JSON, stderr: '' };
+    }, 1234);
+
+    const result = await transport(request);
+
+    expect(result.result).toBe('pass');
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.args[0]).toBe('--wait');
+    expect(calls[0]!.args[1]).toBe('--dir');
+    expect(calls[0]!.args[2]).toBe('/tmp/review-dir');
+    // OCM_WAIT_MAX is the review budget in whole seconds, at least 1. It is
+    // read off the captured spawn env record, not the process environment, so
+    // the access is not an env-shaped read for check-turbo-env.
+    const { OCM_WAIT_MAX } = calls[0]!.env;
+    expect(OCM_WAIT_MAX).toBe('2');
+    // The review spawn carries the review argv, never --wait.
+    expect(calls[1]!.args[0]).toBe('--dir');
+    expect(calls[1]!.args).not.toContain('--wait');
+  });
+
+  it('exit 75 and a wait timeout spawn only --wait and reject with seat-busy and a diagnostic', async () => {
+    const busySpawns: OcmReviewTransportSpawnResult[] = [
+      { exitCode: 75, stdout: 'session still running', stderr: 'still busy in /tmp/review-dir' },
+      { exitCode: null, stdout: '', stderr: '', timedOut: true },
+    ];
+    for (const busy of busySpawns) {
+      let spawnCalls = 0;
+      const transport = makeTransport(async () => {
+        spawnCalls += 1;
+        return busy;
+      });
+
+      const rejection = await transport(request).catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(ReviewTransportError);
+      expect((rejection as ReviewTransportError).code).toBe('seat-busy');
+      // The message is the fixed text: no stderr, no directory, no session id.
+      expect((rejection as ReviewTransportError).message).toBe('review seat busy');
+      expect((rejection as ReviewTransportError).diagnostic).toMatchObject({
+        exitCode: busy.exitCode,
+        timedOut: busy.timedOut === true,
+      });
+      // Only the --wait spawn ran; the review never spawned.
+      expect(spawnCalls).toBe(1);
+    }
+  });
+
+  it('review busy path does not spawn git', async () => {
+    const seen: Array<{ file: string; args: readonly string[] }> = [];
+    const transport = makeTransport(async (file, args) => {
+      seen.push({ file, args });
+      return { exitCode: 75, stdout: '', stderr: '' };
+    });
+
+    await transport(request).catch(() => undefined);
+
+    expect(seen.length).toBeGreaterThan(0);
+    for (const call of seen) {
+      expect(call.file).toBe('/test/ocm-run');
+      expect(call.args[0]).toBe('--wait');
+      expect(call.args).not.toContain('git');
+    }
+  });
+
+  it('seat-busy refuses a hostile spawn result without throwing', async () => {
+    const hostile = {
+      exitCode: 75,
+      get stdout() {
+        throw new Error('stdout getter boom');
+      },
+      get stderr() {
+        throw new Error('stderr getter boom');
+      },
+    } as unknown as OcmReviewTransportSpawnResult;
+    const transport = makeTransport(async () => hostile);
+
+    const rejection = await transport(request).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(ReviewTransportError);
+    expect((rejection as ReviewTransportError).code).toBe('seat-busy');
+    // A throwing getter reads as null, never '' or false.
+    expect((rejection as ReviewTransportError).diagnostic).toEqual({
+      exitCode: 75,
+      timedOut: false,
+      stderr: null,
+      stdoutEmpty: null,
+    });
+
+    const adapter = new IndependentReviewAdapter({ runReview: transport });
+    const result = await adapter.runIndependentReview(request);
+    expect(result.outcome).toBe('unavailable');
+    if (result.outcome === 'unavailable') {
+      expect(result.code).toBe('seat-busy');
+      expect(result.diagnostic).toEqual({
+        exitCode: 75,
+        timedOut: false,
+        stderr: null,
+        stdoutEmpty: null,
+      });
+    }
+  });
+
+  it('seat-busy refuses a sparse spawn result with null diagnostics (missing fields)', async () => {
+    // RV4 round 1: the spawn result shape is not trusted — a missing or
+    // non-string stdout/stderr reads as null, never a throw.
+    const sparse = { exitCode: 75 } as unknown as OcmReviewTransportSpawnResult;
+    const transport = makeTransport(async () => sparse);
+
+    const rejection = await transport(request).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(ReviewTransportError);
+    expect((rejection as ReviewTransportError).code).toBe('seat-busy');
+    expect((rejection as ReviewTransportError).diagnostic).toEqual({
+      exitCode: 75,
+      timedOut: false,
+      stderr: null,
+      stdoutEmpty: null,
+    });
+  });
+
+  it('a thrown spawn error carries no stderr and no path in its message', async () => {
+    const SECRET = 'ghp_' + 'a'.repeat(36);
+    const throwingSpawn: OcmReviewTransportSpawn = async () => {
+      throw new Error(`${SECRET} spawned at /tmp/secret-dir/review`);
+    };
+
+    // Both catch sites (the --wait spawn and the review spawn) classify a
+    // thrown error without passing its message through.
+    for (const throwing of [
+      throwingSpawn,
+      (async (_file: string, args: readonly string[]) => {
+        if (args[0] === '--wait') {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        return throwingSpawn('', [], {});
+      }) as OcmReviewTransportSpawn,
+    ]) {
+      const transport = makeTransport(throwing);
+      const rejection = await transport(request).catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(ReviewTransportError);
+      expect((rejection as ReviewTransportError).message).toBe('reviewer process failed');
+      expect((rejection as ReviewTransportError).message).not.toContain(SECRET);
+      expect((rejection as ReviewTransportError).message).not.toContain('/tmp');
+      expect(JSON.stringify(rejection)).not.toContain(SECRET);
+    }
+  });
+
+  it('a thrown ReviewTransportError is classified like any other spawned throw', async () => {
+    const SECRET = 'ghp_' + 'a'.repeat(36);
+    const typedSpawn: OcmReviewTransportSpawn = async () => {
+      throw new ReviewTransportError(`typed ${SECRET} at /tmp/typed-dir`, 'seat-busy');
+    };
+
+    // Both catch sites (the --wait spawn and the review spawn) classify a
+    // thrown typed error too: the fixed message travels, the thrown code and
+    // message never do — so a secret or path in the thrown message cannot
+    // leak and a seat-busy code cannot bypass the thrown-spawn classification.
+    for (const throwing of [
+      typedSpawn,
+      (async (_file: string, args: readonly string[]) => {
+        if (args[0] === '--wait') {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        return typedSpawn('', [], {});
+      }) as OcmReviewTransportSpawn,
+    ]) {
+      const transport = makeTransport(throwing);
+      const rejection = await transport(request).catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(ReviewTransportError);
+      expect((rejection as ReviewTransportError).message).toBe('reviewer process failed');
+      expect((rejection as ReviewTransportError).message).not.toContain(SECRET);
+      expect((rejection as ReviewTransportError).message).not.toContain('/tmp');
+      expect((rejection as ReviewTransportError).code).toBe('transport');
+      expect(JSON.stringify(rejection)).not.toContain(SECRET);
+    }
+  });
+
+  it('wait is cut at the review timeout and the next pass can dispatch', async () => {
+    let calls = 0;
+    const transport = makeTransport(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { exitCode: null, stdout: '', stderr: '', timedOut: true };
+      }
+      return { exitCode: 0, stdout: PASS_JSON, stderr: '' };
+    });
+
+    // First pass: the cut-short wait rejects seat-busy and writes no review.
+    const first = await transport(request).catch((error: unknown) => error);
+    expect((first as ReviewTransportError).code).toBe('seat-busy');
+    expect(calls).toBe(1);
+
+    // Next pass: the idle wait lets the review dispatch.
+    const second = await transport(request);
+    expect(second.result).toBe('pass');
+    expect(calls).toBe(3);
+  });
+
+  it('transport error stderr is capped at 2 KiB', async () => {
+    const hugeStderr = 'x'.repeat(8192) + ' /secret/path';
+    const transport = makeTransport(async () => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: hugeStderr,
+    }));
+
+    const rejection = await transport(request).catch((error: unknown) => error);
+    expect((rejection as ReviewTransportError).code).toBe('transport');
+    const diagnostic = (rejection as ReviewTransportError).diagnostic;
+    expect(diagnostic?.stderr).toBeDefined();
+    expect(Buffer.byteLength(diagnostic?.stderr ?? '', 'utf8')).toBeLessThanOrEqual(2048);
+    // The cap keeps the leading bytes, not the tail.
+    expect(diagnostic?.stderr).toMatch(/^x{2048}$/);
   });
 });

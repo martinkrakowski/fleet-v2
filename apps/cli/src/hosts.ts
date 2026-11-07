@@ -27,11 +27,13 @@ import {
   hostProbeSpecFromDraft,
   hostProbesHaveFailure,
   parseHostDescriptor,
+  planHostRename,
   probeHost,
   readHashOf,
   readInstallationFile,
   renderInstallationDiff,
   serialiseInstallationCandidate,
+  sha256Of,
   validateHostDraft,
   writeInstallation,
   type HostDraftCandidate,
@@ -39,19 +41,21 @@ import {
   type HostDescriptor,
   type HostProbeExecutor,
   type HostRunnerDraft,
-  hasSecretShape,
-  redactSecrets,
-  sanitizeToken,
-  screenHostName,
   type InstallationFileRead,
+  type PlanHostRenameReason,
 } from "@fleet/onboarding";
 
-export { hasSecretShape, sanitizeToken };
 import {
+  HOST_NAME_SECRET_REFUSAL,
+  HOST_NAME_TOO_LONG,
+  MAX_HOST_NAME_ARGUMENT_LENGTH,
+  hostNameHasSecretShape,
   isSafeSshHost,
   isValidHostName,
   parseInstallation,
   resolveInstallationFile,
+  screenErrorLine,
+  screenHostKey,
   type FleetInstallation,
   type HostRole,
   type HostSection,
@@ -118,6 +122,9 @@ A schema version 1 file is converted to v2 on the first write.
                                the entry's current values
   remove <name> [--yes]        remove a host; refuses the orchestrator host,
                                the last lane-runner and a host with live work
+  rename <old> <new> [--yes]  renames one host key, prints the screened
+                               current key, works when the loader refuses
+                               that key, keeps the entry
   daemon install|show|uninstall --scheduler systemd [--apply]
                                render the daemon tick's user-scope scheduler
                                units (systemd service and timer); install
@@ -130,8 +137,8 @@ role from the host that holds it. Multi-host dispatch lands with H10; until
 then exactly one host runs lanes.
 
 Exit codes: 0 written (or listed), 1 refused — a probe FAIL, a loader
-refusal, a changed or locked file, live work on remove — 2 usage error.
-There is no --force.`;
+refusal, a secret-shaped host name, a changed or locked file, live work on
+remove — 2 usage error. There is no --force.`;
 
 const HOST_ROLES: readonly HostRole[] = [
   "orchestrator",
@@ -177,11 +184,13 @@ const SUBCOMMAND_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
     "yes",
   ]),
   remove: new Set(["yes"]),
+  rename: new Set(["yes"]),
 };
 
 interface HostsArgs {
   readonly subcommand: string;
   readonly name?: string;
+  readonly newName?: string;
   readonly sshAlias?: string;
   readonly port?: number;
   readonly worktreeRoot?: string;
@@ -219,12 +228,13 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
   if (allowed === undefined) {
     return {
       ok: false,
-      error: `Unknown hosts subcommand: ${subcommand === "" ? "(none)" : sanitizeToken(subcommand)}\n${HOSTS_HELP}`,
+      error: `Unknown hosts subcommand: ${subcommand === "" ? "(none)" : subcommand}\n${HOSTS_HELP}`,
     };
   }
   const args: {
     subcommand: string;
     name?: string;
+    newName?: string;
     sshAlias?: string;
     port?: number;
     worktreeRoot?: string;
@@ -242,13 +252,19 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
       return { ok: true, help: true, args: emptyArgs };
     }
     if (!token.startsWith("--") || token === "--") {
-      if (args.name !== undefined) {
+      if (args.name === undefined) {
+        args.name = token;
+      } else if (subcommand === "rename" && args.newName === undefined) {
+        args.newName = token;
+      } else {
         return {
           ok: false,
-          error: `Unexpected argument: ${sanitizeToken(token)}\n${HOSTS_HELP}`,
+          error:
+            subcommand === "rename"
+              ? `hosts rename: unexpected extra argument\n${HOSTS_HELP}`
+              : `Unexpected argument: ${token}\n${HOSTS_HELP}`,
         };
       }
-      args.name = token;
       continue;
     }
     const body = token.slice(2);
@@ -259,7 +275,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
     if (!allowed.has(flag)) {
       return {
         ok: false,
-        error: `Unknown hosts ${sanitizeToken(subcommand)} option: --${sanitizeToken(flag)}\n${HOSTS_HELP}`,
+        error: `Unknown hosts ${subcommand} option: --${flag}\n${HOSTS_HELP}`,
       };
     }
     if (flag === "yes") {
@@ -437,21 +453,17 @@ export async function readInstallationState(file: string): Promise<InstallationS
       };
 }
 
-/**
- * Loader error lines interpolate host-map keys into their paths; every
- * `hosts.<key>` segment goes through `screenHostName`, and any secret-shaped
- * span left in the line is redacted, so a key never reaches the terminal raw.
- */
-export function screenErrorLine(error: string): string {
-  return redactSecrets(error).replace(
-    /hosts\.([^\s.:[\]]+)/g,
-    (_match, key: string) => `hosts.${screenHostName(key)}`,
-  );
-}
-
-export function printErrors(io: CliIo, errors: readonly string[]): void {
+export function printErrors(
+  out: CliIo,
+  errors: readonly string[],
+  keys: readonly string[] = [],
+): void {
   for (const error of errors) {
-    io.stderr(`${screenErrorLine(error)}\n`);
+    // Every line is screened again here, however its producer built it: a
+    // line carrying secret-shaped text is withheld whole, and a known host
+    // key — including a long opaque token run — is replaced by its screened
+    // code (HN1 fix round 2, finding 1).
+    out.stderr(`${screenHostsLine(error, keys)}\n`);
   }
 }
 
@@ -701,13 +713,13 @@ function droppedRoleAliasesBetween(
 }
 
 /** The default confirmation: one stdin line, only an explicit y/yes writes. */
-export function confirmFromStdin(io: CliIo): (question: string) => Promise<boolean> {
+export function confirmFromStdin(out: CliIo): (question: string) => Promise<boolean> {
   return (question) =>
     new Promise<boolean>((resolve) => {
-      io.stdout(`${question} `);
+      out.stdout(`${question} `);
       const stdin = process.stdin;
       if (stdin.readableEnded) {
-        io.stdout("\n");
+        out.stdout("\n");
         resolve(false);
         return;
       }
@@ -798,9 +810,230 @@ function runnerDraftFor(
   return { kind: "opencode", ...common };
 }
 
+/**
+ * Every host key the diff could carry, from both sides: the candidate's hosts
+ * and the current file's. The current text is parsed defensively — an invalid
+ * or absent file contributes no keys, and its loader errors are screened by
+ * `printErrors` instead.
+ */
+function currentHostKeys(currentText: string): readonly string[] {
+  try {
+    const parsed: unknown = JSON.parse(currentText);
+    return Object.keys(hostsOf(parsed) ?? {});
+  } catch {
+    return [];
+  }
+}
+
+/** Replace every occurrence of a withheld key with its screened code. */
+function screenHostKeysIn(
+  text: string,
+  keys: readonly string[],
+): string {
+  let screened = text;
+  for (const key of keys) {
+    const code = screenHostKey(key);
+    if (code !== key) {
+      screened = screened.split(key).join(code);
+    }
+  }
+  return screened;
+}
+
+/**
+ * The ONE screen every line the hosts command prints passes, on stdout and
+ * stderr alike: every known host key is replaced by its screened code — which
+ * withholds a secret-shaped key and a long opaque token run alike — then
+ * every residual TOKEN-SHAPE run is put through the same test, and a line
+ * still carrying secret-shaped text withholds the whole line (HN1 fix round
+ * 2, finding 1). A line carrying no known key is still screened for secrets.
+ */
+function screenHostsLine(line: string, keys: readonly string[]): string {
+  return screenErrorLine(screenTokenRunsIn(screenHostKeysIn(line, keys)));
+}
+
+const LONG_TOKEN_RUN = /[A-Za-z0-9]{20,}/g;
+
+/**
+ * The line-level TOKEN-SHAPE rule (HN1b fix round 2, finding 1): every
+ * alphanumeric run of every printed line — wherever the text came from:
+ * file, argv, descriptor, computed — is handed to `screenHostKey` itself, so
+ * the replacement decision is the same long-token (or secret-shape) test the
+ * host-key screen makes and the two cannot drift. Ordinary values — hostnames
+ * like `solstice.lan`, paths, ports, role names, subcommand words — carry no
+ * run long enough to be token-shaped and pass through untouched.
+ */
+function screenTokenRunsIn(line: string): string {
+  return line.replace(LONG_TOKEN_RUN, (run) => screenHostKey(run));
+}
+
+/**
+ * Every text a line must never carry: each key, the value of a `--flag=value`
+ * argument, and every long opaque run inside either (a token embedded in a
+ * path or an `alias@token` pair). Longest first, so a key that contains a
+ * shorter one is replaced whole.
+ */
+function screenKeyTexts(keys: readonly string[]): readonly string[] {
+  const texts = new Set<string>();
+  for (const key of keys) {
+    if (typeof key !== "string" || key === "") {
+      continue;
+    }
+    const candidates = [key];
+    if (key.startsWith("--") && key.includes("=")) {
+      candidates.push(key.slice(key.indexOf("=") + 1));
+    }
+    for (const candidate of candidates) {
+      if (candidate === "") {
+        continue;
+      }
+      texts.add(candidate);
+      for (const run of candidate.match(LONG_TOKEN_RUN) ?? []) {
+        texts.add(run);
+      }
+    }
+  }
+  return [...texts].sort((a, b) => b.length - a.length);
+}
+
+/** Screen one line body; a withheld line keeps its own terminator. */
+function screenHostsText(text: string, keys: readonly string[]): string {
+  const terminated = text.endsWith("\n");
+  const body = terminated ? text.slice(0, -1) : text;
+  return `${screenHostsLine(body, keys)}${terminated ? "\n" : ""}`;
+}
+
+/** The hosts command's output: raw streams reach the operator only through it. */
+export interface ScreenedHostsIo extends CliIo {
+  /** The same screen for text that does not travel through stdout or stderr. */
+  readonly screen: (text: string) => string;
+  /**
+   * Add strings a subcommand read later (a descriptor file's keys and string
+   * leaves) to the screen's keys; every line printed afterwards is screened
+   * against them too (HN1b fix round 1).
+   */
+  readonly addKeys: (keys: readonly string[]) => void;
+  /**
+   * Write one line that carries our own write digest: the text before and
+   * after the digest passes the one line screen; the branded digest — and
+   * only it — is written through unscreened (HN1b fix round 2, finding 2).
+   */
+  readonly stdoutDigest: (
+    before: string,
+    digest: WriteDigest,
+    after: string,
+  ) => void;
+}
+
+declare const writeDigestBrand: unique symbol;
+
+/**
+ * A sha256 digest our own code computed for an installation write — the
+ * write receipt's digest, or the rename request's digest. It is the ONE kind
+ * of value the hosts screen writes through unscreened: it is not operator
+ * input, not file content and not a secret, and the frozen hosts-command
+ * contract prints both digests in full. Every other 64-hex value — from a
+ * config field, argv or the file — is still withheld by the token-shape
+ * screen (HN1b fix round 2, finding 2: no general "64-hex is fine" rule).
+ */
+export type WriteDigest = string & {
+  readonly [writeDigestBrand]: "sha256";
+};
+
+/**
+ * The ONE output wrapper of the hosts command. Every line written through it,
+ * on stdout and stderr alike, is split on `\n` (newlines kept) and passes the
+ * one hosts line screen with `keys`: every host key of the installation file
+ * and every argv token. A known key — a secret-shaped one or a long opaque
+ * token run — is replaced by its screened code, and a line still carrying
+ * secret-shaped text is withheld whole. `hostsCommand` wraps once; handlers
+ * and helpers get only the wrapped io, so no print site can forget the screen.
+ */
+export function screenedHostsIo(
+  io: CliIo,
+  keys: readonly string[],
+): ScreenedHostsIo {
+  const known: string[] = [...keys];
+  let texts = screenKeyTexts(known);
+  const addKeys = (added: readonly string[]): void => {
+    known.push(...added);
+    texts = screenKeyTexts(known);
+  };
+  const screen = (text: string): string =>
+    text
+      .split(/(?<=\n)/)
+      .map((piece) => screenHostsText(piece, texts))
+      .join("");
+  return {
+    screen,
+    addKeys,
+    stdoutDigest: (before, digest, after) => {
+      io.stdout(screenHostsText(before, texts));
+      io.stdout(digest);
+      io.stdout(screenHostsText(after, texts));
+    },
+    stdout: (text) => {
+      for (const piece of text.split(/(?<=\n)/)) {
+        io.stdout(screenHostsText(piece, texts));
+      }
+    },
+    stderr: (text) => {
+      for (const piece of text.split(/(?<=\n)/)) {
+        io.stderr(screenHostsText(piece, texts));
+      }
+    },
+  };
+}
+
+/**
+ * Every object key AND every string leaf of the installation file (HN1b fix
+ * round 1): host keys and any key under one, plus the string values the file
+ * carries — an `sshAlias`, a worktree root, a capability name — so a long
+ * opaque token run inside a value is screened like one inside a key. The walk
+ * is bounded (depth 8, at most 2000 visited nodes) and never throws: a walk
+ * that hits the bound returns what it has collected and continues.
+ */
+const INSTALLATION_WALK_MAX_DEPTH = 8;
+const INSTALLATION_WALK_MAX_NODES = 2000;
+
+function installationKeys(value: unknown): readonly string[] {
+  const found: string[] = [];
+  let visited = 0;
+  const pending: Array<{ node: unknown; depth: number }> = [
+    { node: value, depth: 0 },
+  ];
+  while (pending.length > 0 && visited < INSTALLATION_WALK_MAX_NODES) {
+    const { node, depth } = pending.pop() as { node: unknown; depth: number };
+    visited += 1;
+    if (depth > INSTALLATION_WALK_MAX_DEPTH) {
+      continue;
+    }
+    if (typeof node === "string") {
+      found.push(node);
+      continue;
+    }
+    if (typeof node !== "object" || node === null) {
+      continue;
+    }
+    let entries: readonly unknown[];
+    try {
+      entries = Array.isArray(node)
+        ? node
+        : Object.values(node as Record<string, unknown>);
+    } catch {
+      // An exotic object that refuses enumeration: keep what we have.
+      continue;
+    }
+    for (const entry of entries) {
+      pending.push({ node: entry, depth: depth + 1 });
+    }
+  }
+  return found;
+}
+
 /** Diff the file as it sits against the candidate as the write would put it. */
 export function printDiff(
-  io: CliIo,
+  out: CliIo,
   currentText: string,
   candidate: HostDraftCandidate,
 ): void {
@@ -810,7 +1043,21 @@ export function printDiff(
       serialiseInstallationCandidate(candidate),
     ),
   );
-  io.stdout(diff === "" ? "no changes\n" : `${diff}\n`);
+  if (diff === "") {
+    out.stdout("no changes\n");
+    return;
+  }
+  // Every host key on either side is screened the same way, for edit and for
+  // remove alike, and each line passes the one hosts screen (HN1 fix round
+  // 1, finding 2; round 2, finding 1).
+  const keys = [
+    ...new Set([...Object.keys(candidate.hosts), ...currentHostKeys(currentText)]),
+  ];
+  const screened = diff
+    .split("\n")
+    .map((line) => screenHostsLine(line, keys))
+    .join("\n");
+  out.stdout(`${screened}\n`);
 }
 
 /** Probe, diff, confirm, then the compare-and-swap write. */
@@ -819,15 +1066,15 @@ export async function confirmAndWrite(
   read: InstallationFileRead,
   candidate: HostDraftCandidate,
   args: { readonly yes: boolean },
-  io: CliIo,
+  out: CliIo,
   options: { readonly confirm?: (question: string) => Promise<boolean> },
 ): Promise<number> {
   const currentText = read.status === "read" ? read.text : "";
-  printDiff(io, currentText, candidate);
+  printDiff(out, currentText, candidate);
   if (!args.yes) {
-    const confirm = options.confirm ?? confirmFromStdin(io);
+    const confirm = options.confirm ?? confirmFromStdin(out);
     if (!(await confirm(`write ${file} with this change? [y/N]`))) {
-      io.stderr("not confirmed; nothing was written\n");
+      out.stderr("not confirmed; nothing was written\n");
       return 1;
     }
   }
@@ -837,38 +1084,65 @@ export async function confirmAndWrite(
     expectedHash: readHashOf(read),
   });
   if (result.status === "refused") {
-    printErrors(io, result.errors);
-    io.stderr("nothing was written\n");
+    printErrors(out, result.errors);
+    out.stderr("nothing was written\n");
     return 1;
   }
-  io.stdout(`written ${file} (sha256 ${result.hash})\n`);
+  printWriteReceipt(out, file, result.hash as WriteDigest);
   return 0;
+}
+
+/**
+ * The write receipt. Through the hosts wrapper the branded digest — and only
+ * it — travels unscreened, while the path and the fixed words around it pass
+ * the one line screen. A caller whose io has no wrapper (seats, policy) has
+ * no screen to bypass and prints the line as before.
+ */
+function printWriteReceipt(
+  out: CliIo,
+  file: string,
+  digest: WriteDigest,
+): void {
+  const wrapped = out as Partial<ScreenedHostsIo>;
+  if (typeof wrapped.stdoutDigest === "function") {
+    wrapped.stdoutDigest(`written ${file} (sha256 `, digest, ")\n");
+    return;
+  }
+  out.stdout(`written ${file} (sha256 ${digest})\n`);
 }
 
 async function writeHost(
   mode: "add" | "edit",
   args: HostsArgs,
   file: string,
-  io: CliIo,
+  out: ScreenedHostsIo,
   options: HostsCliOptions,
 ): Promise<number> {
   const name = args.name;
   if (name === undefined || name.trim() === "") {
-    io.stderr(`hosts ${mode} requires a host name\n${HOSTS_HELP}\n`);
+    out.stderr(`hosts ${mode} requires a host name\n${HOSTS_HELP}\n`);
     return 2;
+  }
+  if (name.length > MAX_HOST_NAME_ARGUMENT_LENGTH) {
+    out.stderr(`${HOST_NAME_TOO_LONG}\n`);
+    return 1;
+  }
+  if (hostNameHasSecretShape(name)) {
+    out.stderr(`${HOST_NAME_SECRET_REFUSAL}\n`);
+    return 1;
   }
   if (!isValidHostName(name)) {
     // The same rule the loader applies to v2 host-map keys, refused at the
     // boundary before anything is drafted.
-    io.stderr(
-      `hosts ${mode}: that name is not a valid host name (identifier-shaped, no '..')\n${HOSTS_HELP}\n`,
+    out.stderr(
+      `hosts ${mode}: '${screenHostKey(name)}' is not a valid host name (identifier-shaped, no '..')\n${HOSTS_HELP}\n`,
     );
     return 2;
   }
   if (args.sshAlias !== undefined && !isSafeSshHost(args.sshAlias)) {
     // The value never appears in the message: an alias is operator input.
-    io.stderr(
-      `hosts.${screenHostName(name)}.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option\n${HOSTS_HELP}\n`,
+    out.stderr(
+      `hosts.${screenHostKey(name)}.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option\n${HOSTS_HELP}\n`,
     );
     return 2;
   }
@@ -877,7 +1151,7 @@ async function writeHost(
   let descriptor: HostDescriptor | undefined;
   if (args.fromDescriptor !== undefined) {
     if (args.port !== undefined || args.worktreeRoot !== undefined) {
-      io.stderr(
+      out.stderr(
         `hosts add --from-descriptor: the descriptor carries the worktree root and the port; --worktree-root and --port cannot be given with it\n${HOSTS_HELP}\n`,
       );
       return 2;
@@ -886,7 +1160,7 @@ async function writeHost(
     try {
       text = await readFile(args.fromDescriptor, "utf8");
     } catch {
-      io.stderr(
+      out.stderr(
         // The operator-supplied path can be a credential path; nothing from it appears here.
         "hosts add --from-descriptor: the host descriptor file could not be read\n",
       );
@@ -896,15 +1170,18 @@ async function writeHost(
     try {
       descriptorValue = JSON.parse(text);
     } catch {
-      io.stderr(
+      out.stderr(
         "hosts add --from-descriptor: the descriptor file is not JSON\n",
       );
       return 1;
     }
+    // The descriptor's keys and string leaves join the screen before any
+    // error or echo can carry one of its values (HN1b fix round 1).
+    out.addKeys(installationKeys(descriptorValue));
     const parsed = parseHostDescriptor(descriptorValue);
     if (!parsed.ok) {
-      io.stderr("the descriptor is refused:\n");
-      printErrors(io, parsed.errors);
+      out.stderr("the descriptor is refused:\n");
+      printErrors(out, parsed.errors);
       return 1;
     }
     descriptor = parsed.descriptor;
@@ -914,26 +1191,26 @@ async function writeHost(
     args.worktreeRoot === undefined &&
     descriptor === undefined
   ) {
-    io.stderr(
+    out.stderr(
       `hosts add requires --worktree-root <path> or --from-descriptor <file>\n${HOSTS_HELP}\n`,
     );
     return 2;
   }
   const state = await readInstallationState(file);
   if (state.status === "unreadable") {
-    io.stderr(`${file}: could not be read (${state.reason})\n`);
+    out.stderr(`${file}: could not be read (${state.reason})\n`);
     return 1;
   }
   if (state.status === "invalid") {
-    io.stderr(
+    out.stderr(
       `the installation file is invalid; fix it by hand before changing hosts:\n`,
     );
-    printErrors(io, state.errors);
+    printErrors(out, state.errors);
     return 1;
   }
   const converting = state.status === "v1";
   if (converting && mode === "add") {
-    io.stdout(
+    out.stdout(
       "converting the schema version 1 file to version 2: the v1 runner, worktree, reviewer and shelf sections do not carry over, and neither do their seats — add seats with init or by hand before the next dispatch\n",
     );
   }
@@ -941,8 +1218,8 @@ async function writeHost(
     state.status === "v2" ? state.installation.hosts?.[name] : undefined;
   if (mode === "edit" && existing === undefined) {
     // The engine reports the same fact for a v1 or absent file; name it here.
-    io.stderr(
-      `hosts.${screenHostName(name)}: not in the installation file; adding is a separate mode\n`,
+    out.stderr(
+      `hosts.${screenHostKey(name)}: not in the installation file; adding is a separate mode\n`,
     );
     return 1;
   }
@@ -951,8 +1228,8 @@ async function writeHost(
     args.sshAlias !== undefined &&
     existing?.transport === "local"
   ) {
-    io.stderr(
-      `hosts.${screenHostName(name)}: the entry's transport is local; --ssh changes an ssh host's alias\n`,
+    out.stderr(
+      `hosts.${screenHostKey(name)}: the entry's transport is local; --ssh changes an ssh host's alias\n`,
     );
     return 2;
   }
@@ -1009,7 +1286,13 @@ async function writeHost(
   };
   const drafted = draftHost(input);
   if (!drafted.ok) {
-    printErrors(io, drafted.errors);
+    // The draft errors name the host being drafted; its key is screened here
+    // too, so a key the screen withholds (secret-shaped or a long opaque
+    // token run) never reaches the operator (HN1 fix round 2, finding 1).
+    printErrors(out, drafted.errors, [
+      name,
+      ...currentHostKeys(state.read.status === "read" ? state.read.text : ""),
+    ]);
     return 1;
   }
   const draft = drafted.draft;
@@ -1024,7 +1307,7 @@ async function writeHost(
   if (draft.host.roles.includes("lane-runner")) {
     const moved = moveLaneRunnerRole(current, name);
     if (moved.refused !== undefined) {
-      io.stderr(
+      out.stderr(
         "hosts: the installation's host map carries an accessor property; nothing was written\n",
       );
       return 1;
@@ -1035,11 +1318,25 @@ async function writeHost(
 
   const validated = validateHostDraft(current, draft, mode);
   if (!validated.ok) {
-    io.stderr("the loader refuses this change:\n");
-    printErrors(io, validated.errors);
+    out.stderr("the loader refuses this change:\n");
+    printErrors(
+      out,
+      validated.errors,
+      validated.candidate === undefined
+        ? [name]
+        : [
+            ...new Set([
+              ...Object.keys(validated.candidate.hosts),
+              name,
+              ...currentHostKeys(
+                state.read.status === "read" ? state.read.text : "",
+              ),
+            ]),
+          ],
+    );
     if (validated.candidate !== undefined) {
       printDiff(
-        io,
+        out,
         state.read.status === "read" ? state.read.text : "",
         validated.candidate,
       );
@@ -1058,17 +1355,14 @@ async function writeHost(
     laneRunnerName !== undefined
       ? validated.installation.hosts?.[laneRunnerName]
       : undefined;
-  // The probe lines are printed: they carry the screened host name, never a
-  // raw one (the name is used only as a label there).
   const spec = {
     ...hostProbeSpecFromDraft(draft),
-    name: screenHostName(draft.name),
     ...(draft.host.roles.includes("verifier") &&
     laneRunnerName !== undefined &&
     laneRunnerHost !== undefined
       ? {
           laneRunnerWorktreeRoot: {
-            hostName: screenHostName(laneRunnerName),
+            hostName: laneRunnerName,
             worktreeRoot: laneRunnerHost.worktreeRoot,
           },
         }
@@ -1077,10 +1371,12 @@ async function writeHost(
   const executor = options.probeExecutor ?? createNodeDoctorExecutor();
   const lines = await probeHost(spec, executor);
   for (const line of lines) {
-    io.stdout(`${formatDoctorLine(line)}\n`);
+    // The probe lines name the host; a key the screen withholds is never
+    // echoed (HN1 fix round 1, finding 1).
+    out.stdout(`${screenHostsLine(formatDoctorLine(line), [name])}\n`);
   }
   if (hostProbesHaveFailure(lines)) {
-    io.stderr("refused: a probe reported FAIL; nothing was written\n");
+    out.stderr("refused: a probe reported FAIL; nothing was written\n");
     return 1;
   }
   // The probe beats the descriptor's claim: the only claim the probe can
@@ -1092,7 +1388,7 @@ async function writeHost(
     const versionLine = lines.find((line) => line.check === "version-opencode");
     if (versionLine !== undefined) {
       if (versionLine.status === "UNKNOWN") {
-        io.stdout(
+        out.stdout(
           "the descriptor's claimed opencode version could not be measured; the claim is not written\n",
         );
       } else if (versionLine.status === "PASS") {
@@ -1100,7 +1396,7 @@ async function writeHost(
         if (versionLine.detail.startsWith(prefix)) {
           const measured = versionLine.detail.slice(prefix.length);
           if (measured !== descriptor.tools[0].version) {
-            io.stdout(
+            out.stdout(
               "the descriptor's claimed opencode version does not match the measured one; the measured version stands\n",
             );
           }
@@ -1109,8 +1405,10 @@ async function writeHost(
     }
   }
   if (movedFrom.length > 0) {
-    io.stdout(
-      `lanes now run on ${screenHostName(name)} (the lane-runner role moved from ${movedFrom.map(screenHostName).join(", ")})\n`,
+    out.stdout(
+      `lanes now run on ${screenHostKey(name)} (the lane-runner role moved from ${movedFrom
+        .map((key) => screenHostKey(key))
+        .join(", ")})\n`,
     );
   }
   // An edit that removes a role (or a host) can silently drop the role alias
@@ -1121,44 +1419,44 @@ async function writeHost(
     validated.installation.hosts,
   );
   if (args.yes && dropped.length > 0) {
-    io.stdout(
+    out.stdout(
       `dropped role alias: ${dropped
-        .map((d) => `hosts.${screenHostName(d.hostName)}.roleAliases.${d.role}`)
+        .map((d) => `hosts.${screenHostKey(d.hostName)}.roleAliases.${d.role}`)
         .join(", ")}\n`,
     );
   }
-  return confirmAndWrite(file, state.read, candidate, args, io, options);
+  return confirmAndWrite(file, state.read, candidate, args, out, options);
 }
 
 async function removeHost(
   args: HostsArgs,
   file: string,
-  io: CliIo,
+  out: CliIo,
   options: HostsCliOptions,
 ): Promise<number> {
   const name = args.name;
   if (name === undefined || name.trim() === "") {
-    io.stderr(`hosts remove requires a host name\n${HOSTS_HELP}\n`);
+    out.stderr(`hosts remove requires a host name\n${HOSTS_HELP}\n`);
     return 2;
   }
   const state = await readInstallationState(file);
   if (state.status === "unreadable") {
-    io.stderr(`${file}: could not be read (${state.reason})\n`);
+    out.stderr(`${file}: could not be read (${state.reason})\n`);
     return 1;
   }
   if (state.status === "absent") {
-    io.stderr("no installation file; there is no host to remove\n");
+    out.stderr("no installation file; there is no host to remove\n");
     return 1;
   }
   if (state.status === "invalid") {
-    io.stderr(
+    out.stderr(
       "the installation file is invalid; fix it by hand before changing hosts:\n",
     );
-    printErrors(io, state.errors);
+    printErrors(out, state.errors);
     return 1;
   }
   if (state.status === "v1") {
-    io.stderr(
+    out.stderr(
       "the installation file is schema version 1 and has no named hosts; the first hosts add converts it\n",
     );
     return 1;
@@ -1166,12 +1464,12 @@ async function removeHost(
   const hosts = state.installation.hosts ?? {};
   const host = Object.hasOwn(hosts, name) ? hosts[name] : undefined;
   if (host === undefined) {
-    io.stderr(`hosts.${screenHostName(name)}: not in the installation file\n`);
+    out.stderr(`hosts.${screenHostKey(name)}: not in the installation file\n`);
     return 1;
   }
   if (host.roles.includes("orchestrator")) {
-    io.stderr(
-      `hosts.${screenHostName(name)} holds the orchestrator role, and an installation needs exactly one orchestrator host; move the role to another host first (hosts edit)\n`,
+    out.stderr(
+      `hosts.${screenHostKey(name)} holds the orchestrator role, and an installation needs exactly one orchestrator host; move the role to another host first (hosts edit)\n`,
     );
     return 1;
   }
@@ -1180,8 +1478,8 @@ async function removeHost(
       hostName !== name && entry.roles.includes("lane-runner"),
   );
   if (host.roles.includes("lane-runner") && otherLaneRunner === undefined) {
-    io.stderr(
-      `hosts.${screenHostName(name)} is the last lane-runner host; move the lane-runner role to another host before removing it\n`,
+    out.stderr(
+      `hosts.${screenHostKey(name)} is the last lane-runner host; move the lane-runner role to another host before removing it\n`,
     );
     return 1;
   }
@@ -1197,26 +1495,32 @@ async function removeHost(
   );
   if (liveAttempts.length > 0) {
     for (const attempt of liveAttempts) {
-      io.stderr(`attempt ${attempt.id} is ${attempt.state} on ${screenHostName(name)}\n`);
+      out.stderr(
+        `${screenHostsLine(`attempt ${attempt.id} is ${attempt.state} on ${name}`, [name])}\n`,
+      );
     }
-    io.stderr(`hosts.${screenHostName(name)} has live work; nothing was removed\n`);
+    out.stderr(
+      `${screenHostsLine(`hosts.${name} has live work; nothing was removed`, [name])}\n`,
+    );
     return 1;
   }
   const reservations = await journal.listActiveReservations(name);
   if (reservations.length > 0) {
     for (const reservation of reservations) {
-      io.stderr(
-        `reservation ${reservation.id} holds a slot for attempt ${reservation.attemptId} on ${screenHostName(name)}\n`,
+      out.stderr(
+        `${screenHostsLine(`reservation ${reservation.id} holds a slot for attempt ${reservation.attemptId} on ${name}`, [name])}\n`,
       );
     }
-    io.stderr(`hosts.${screenHostName(name)} has live work; nothing was removed\n`);
+    out.stderr(
+      `${screenHostsLine(`hosts.${name} has live work; nothing was removed`, [name])}\n`,
+    );
     return 1;
   }
 
   if (host.runner !== undefined && host.transport === "ssh") {
     const forwardPort =
       host.runner.port + (host.runner.tunnelOffset ?? 1);
-    io.stdout(
+    out.stdout(
       `note: a leftover ssh -f -N forward for this host may still listen on 127.0.0.1:${forwardPort}; find it with pgrep -f 'ssh .*-L 127.0.0.1:${forwardPort}' and kill the pid\n`,
     );
   }
@@ -1232,30 +1536,136 @@ async function removeHost(
     host.transport === "ssh" &&
     Object.values(remaining).every((entry) => entry.transport !== "ssh")
   ) {
-    io.stdout(
+    out.stdout(
       "the installation is single-machine again: no host is reached over ssh\n",
     );
   }
-  return confirmAndWrite(file, state.read, candidate, args, io, options);
+  return confirmAndWrite(file, state.read, candidate, args, out, options);
 }
 
-async function listHosts(file: string, io: CliIo): Promise<number> {
+/** The one stderr line for a rename refusal reason; never echoes a name. */
+function renameRefusalLine(reason: PlanHostRenameReason): string {
+  switch (reason) {
+    case "name-too-long":
+      return HOST_NAME_TOO_LONG;
+    case "secret-new-name":
+      return HOST_NAME_SECRET_REFUSAL;
+    case "invalid-new-name":
+      return "hosts rename: the new host name is not a valid host name";
+    case "same-name":
+      return "hosts rename: the new name is the same as the current name";
+    case "missing":
+      return "hosts rename: no host has that name";
+    case "exists":
+      return "hosts rename: the new name is already a host";
+    case "not-v2":
+      return "installation: not a schema version 2 file";
+    case "hosts-not-object":
+    case "not-object":
+      return "installation: invalid";
+    case "unreadable":
+      return "installation: unreadable";
+  }
+}
+
+/**
+ * `fleet-v2 hosts rename <old> <new>`: rewrite one host key through the
+ * compare-and-swap write, so a key the loader refuses for secret-shaped text
+ * can be renamed. It reads the raw file (no parse), plans the rename on the
+ * value, confirms, and writes under `<file>.lock`. The old key is never
+ * echoed: only `host:<12 hex>` of it appears.
+ */
+async function renameHost(
+  args: HostsArgs,
+  file: string,
+  out: CliIo,
+  options: HostsCliOptions,
+): Promise<number> {
+  const oldName = args.name;
+  const newName = args.newName;
+  if (oldName === undefined || newName === undefined) {
+    out.stderr(
+      `hosts rename requires the current name and the new name\n${HOSTS_HELP}\n`,
+    );
+    return 2;
+  }
+  const read = await readInstallationFile(file);
+  if (read.status === "unreadable") {
+    out.stderr("installation: unreadable\n");
+    return 1;
+  }
+  if (read.status === "absent") {
+    out.stderr("installation: absent\n");
+    return 1;
+  }
+  if (read.value === undefined) {
+    out.stderr("installation: invalid\n");
+    return 1;
+  }
+  const planned = planHostRename(read.value, oldName, newName);
+  if (!planned.ok) {
+    out.stderr(
+      `${screenHostsLine(renameRefusalLine(planned.reason), [oldName])}\n`,
+    );
+    return 1;
+  }
+  const screened = `host:${sha256Of(oldName).slice(0, 12)}`;
+  const digest = sha256Of(
+    JSON.stringify({ expectedHash: read.hash, newName, oldName }),
+  );
+  if (!args.yes) {
+    const confirm = options.confirm ?? confirmFromStdin(out);
+    if (!(await confirm(
+        `rename host ${screened} to ${screenHostKey(newName)}? [y/N]`,
+      ))) {
+      out.stderr("not confirmed; nothing was written\n");
+      return 1;
+    }
+  }
+  const result = await writeInstallation({
+    file,
+    candidate: planned.candidate,
+    expectedHash: read.hash,
+  });
+  if (result.status === "refused") {
+    out.stderr(`installation: ${result.reason}\n`);
+    return 1;
+  }
+  // Our own digest of our own rename request — not operator input, not file
+  // content — written through the same branded path as the write receipt,
+  // which the frozen hosts-command contract prints in full (F96-8).
+  const wrapped = out as Partial<ScreenedHostsIo>;
+  if (typeof wrapped.stdoutDigest === "function") {
+    wrapped.stdoutDigest(
+      `renamed host ${screened} to ${screenHostKey(newName)} request:`,
+      digest as WriteDigest,
+      "\n",
+    );
+  } else {
+    out.stdout(
+      `renamed host ${screened} to ${screenHostKey(newName)} request:${digest}\n`,
+    );
+  }
+  return 0;
+}
+
+async function listHosts(file: string, out: CliIo): Promise<number> {
   const state = await readInstallationState(file);
   if (state.status === "unreadable") {
-    io.stderr(`${file}: could not be read (${state.reason})\n`);
+    out.stderr(`${file}: could not be read (${state.reason})\n`);
     return 1;
   }
   if (state.status === "invalid") {
-    io.stderr("the installation file is invalid; fix it by hand:\n");
-    printErrors(io, state.errors);
+    out.stderr("the installation file is invalid; fix it by hand:\n");
+    printErrors(out, state.errors);
     return 1;
   }
   if (state.status === "absent") {
-    io.stdout("no installation file\n");
+    out.stdout("no installation file\n");
     return 0;
   }
   if (state.status === "v1") {
-    io.stdout(
+    out.stdout(
       "the installation file is schema version 1; it has no named hosts, and the first hosts add converts it to version 2\n",
     );
     return 0;
@@ -1263,27 +1673,31 @@ async function listHosts(file: string, io: CliIo): Promise<number> {
   const hosts = state.installation.hosts ?? {};
   const names = [...Object.keys(hosts)].sort((a, b) => a.localeCompare(b));
   if (names.length === 0) {
-    io.stdout("no hosts are configured\n");
+    out.stdout("no hosts are configured\n");
     return 0;
   }
   for (const name of names) {
     const host = hosts[name];
     const parts = [
-      screenHostName(name),
+      // Every line passes the one hosts screen: the raw key is replaced by
+      // its screened code there, so a secret-shaped key or a long opaque
+      // token run is never echoed, even from a file that parsed (HN1 fix
+      // round 1, finding 1; round 2, finding 1).
+      name,
       host.transport,
       ...(host.sshAlias !== undefined
-        ? [`alias ${redactSecrets(host.sshAlias)}`]
+        ? [`alias ${host.sshAlias}`]
         : []),
       `roles: ${host.roles.join(", ")}`,
-      `worktree-root: ${redactSecrets(host.worktreeRoot)}`,
+      `worktree-root: ${host.worktreeRoot}`,
       ...(host.tmpDir !== undefined
-        ? [`tmp-dir: ${redactSecrets(host.tmpDir)}`]
+        ? [`tmp-dir: ${host.tmpDir}`]
         : []),
       ...(host.runner !== undefined
         ? [`runner: ${host.runner.kind}, port ${host.runner.port}`]
         : []),
     ];
-    io.stdout(`${parts.join("  ")}\n`);
+    out.stdout(`${screenHostsLine(parts.join("  "), names)}\n`);
   }
   return 0;
 }
@@ -1291,7 +1705,7 @@ async function listHosts(file: string, io: CliIo): Promise<number> {
 /**
  * The refusal when a role resolves to more than one host: plain operator text
  * naming the role and telling the operator how to proceed. Host names pass
- * through `sanitizeToken`; the role name is a fixed enum value.
+ * through the one host-key screen; the role name is a fixed enum value.
  */
 export function formatRoleAmbiguousRefusal(
   role: HostRole,
@@ -1299,7 +1713,7 @@ export function formatRoleAmbiguousRefusal(
 ): string {
   const suffix =
     hostNames !== undefined && hostNames.length > 0
-      ? ` (${hostNames.map(screenHostName).join(", ")})`
+      ? ` (${hostNames.map((key) => screenHostKey(key)).join(", ")})`
       : "";
   return `hosts: role '${role}' is held by more than one host${suffix}; name the host explicitly (fleet-v2 hosts show <name>)`;
 }
@@ -1313,38 +1727,36 @@ export function formatRoleAmbiguousRefusal(
 async function showHosts(
   args: HostsArgs,
   file: string,
-  io: CliIo,
+  out: ScreenedHostsIo,
 ): Promise<number> {
   let state: InstallationState;
   try {
     state = await readInstallationState(file);
   } catch {
-    io.stderr("installation: unknown (unreadable)\n");
+    out.stderr("installation: unknown (unreadable)\n");
     return 1;
   }
   if (state.status === "unreadable") {
-    io.stderr("installation: unknown (unreadable)\n");
+    out.stderr("installation: unknown (unreadable)\n");
     return 1;
   }
   if (state.status === "absent") {
-    io.stderr("installation: absent\n");
+    out.stderr("installation: absent\n");
     return 1;
   }
   if (state.status === "v1") {
-    io.stderr("installation.hosts: schema version 1 has no hosts section\n");
+    out.stderr("installation.hosts: schema version 1 has no hosts section\n");
     return 1;
   }
   if (state.status === "invalid") {
-    io.stderr("the installation file is invalid; fix it by hand:\n");
-    for (const error of state.errors) {
-      io.stderr(`${sanitizeToken(error)}\n`);
-    }
+    out.stderr("the installation file is invalid; fix it by hand:\n");
+    printErrors(out, state.errors);
     return 1;
   }
   const hosts = state.installation.hosts ?? {};
   const names = [...Object.keys(hosts)].sort((a, b) => a.localeCompare(b));
   if (names.length > 256) {
-    io.stderr("hosts show: host count exceeds maximum (256)\n");
+    out.stderr("hosts show: host count exceeds maximum (256)\n");
     return 1;
   }
   if (args.showRole !== undefined) {
@@ -1354,41 +1766,41 @@ async function showHosts(
       return Array.isArray(host?.roles) && host.roles.includes(role);
     });
     if (holding.length === 0) {
-      io.stderr(`hosts: no host holds the ${role} role\n`);
+      out.stderr(`hosts: no host holds the ${role} role\n`);
       return 1;
     }
     if (holding.length > 1) {
-      io.stderr(`${formatRoleAmbiguousRefusal(role, holding)}\n`);
+      out.stderr(`${formatRoleAmbiguousRefusal(role, holding)}\n`);
       return 1;
     }
-    return printHostTable(io, [holding[0] as string], hosts);
+    return printHostTable(out, [holding[0] as string], hosts);
   }
   if (args.name !== undefined) {
     if (!isValidHostName(args.name)) {
       // The operator-supplied name never appears in the message.
-      io.stderr(
+      out.stderr(
         `hosts show: that name is not a valid host name (identifier-shaped, no '..')\n${HOSTS_HELP}\n`,
       );
       return 2;
     }
     if (!Object.hasOwn(hosts, args.name)) {
-      io.stderr(
-        `hosts.${screenHostName(args.name)}: not in the installation file\n`,
+      out.stderr(
+        `hosts.${screenHostKey(args.name)}: not in the installation file\n`,
       );
       return 1;
     }
-    return printHostTable(io, [args.name], hosts);
+    return printHostTable(out, [args.name], hosts);
   }
   if (names.length === 0) {
-    io.stdout("no hosts are configured\n");
+    out.stdout("no hosts are configured\n");
     return 0;
   }
-  return printHostTable(io, names, hosts);
+  return printHostTable(out, names, hosts);
 }
 
 /** The hosts show table: one aligned row per named host, in that order. */
 function printHostTable(
-  io: CliIo,
+  out: ScreenedHostsIo,
   names: readonly string[],
   hosts: Readonly<Record<string, HostSection>>,
 ): number {
@@ -1402,16 +1814,15 @@ function printHostTable(
         : host.transport === "ssh"
           ? String(runner.port + tunnelOffset)
           : String(runner.port);
-    const alias = sanitizeToken(host.sshAlias ?? "-");
-    const container = sanitizeToken(host.container ?? "-");
-    const roleAliases = sanitizeToken(
+    const alias = host.sshAlias ?? "-";
+    const container = host.container ?? "-";
+    const roleAliases =
       host.roleAliases === undefined ||
       Object.keys(host.roleAliases).length === 0
         ? "-"
         : Object.entries(host.roleAliases)
             .map(([role, alias]) => `${role}=${alias}`)
-            .join(", "),
-    );
+            .join(", ");
     return {
       name,
       transport: host.transport,
@@ -1453,9 +1864,9 @@ function printHostTable(
     "DIAL_PORT".padEnd(widths.dialPort),
     "AUTH".padEnd(widths.auth),
   ].join("  ");
-  io.stdout(`${header}\n`);
+  out.stdout(`${header}\n`);
   for (const row of rows) {
-    io.stdout(
+    out.stdout(
       [
         row.name.padEnd(widths.name),
         row.transport.padEnd(widths.transport),
@@ -1497,7 +1908,7 @@ function parseDaemonArgs(tokens: readonly string[]): ParsedDaemonArgs {
   if (action !== "install" && action !== "show" && action !== "uninstall") {
     return {
       ok: false,
-      error: `Unknown hosts daemon action: ${action === undefined ? "(none)" : sanitizeToken(action)}\n${HOSTS_HELP}`,
+      error: `Unknown hosts daemon action: ${action === undefined ? "(none)" : action}\n${HOSTS_HELP}`,
     };
   }
   let scheduler: string | undefined;
@@ -1537,7 +1948,7 @@ function parseDaemonArgs(tokens: readonly string[]): ParsedDaemonArgs {
     }
     return {
       ok: false,
-      error: `Unknown hosts daemon option: --${sanitizeToken(flag)}\n${HOSTS_HELP}`,
+      error: `Unknown hosts daemon option: --${flag}\n${HOSTS_HELP}`,
     };
   }
   if (scheduler === undefined) {
@@ -1569,42 +1980,40 @@ function parseDaemonArgs(tokens: readonly string[]): ParsedDaemonArgs {
  */
 async function daemonCommand(
   argv: readonly string[],
-  io: CliIo,
+  file: string,
+  out: ScreenedHostsIo,
   options: HostsCliOptions,
 ): Promise<number> {
   const parsed = parseDaemonArgs(argv);
   if (!parsed.ok) {
-    io.stderr(`${parsed.error}\n`);
+    out.stderr(`${parsed.error}\n`);
     return 2;
   }
   if (parsed.help) {
-    io.stdout(`${HOSTS_HELP}\n`);
+    out.stdout(`${HOSTS_HELP}\n`);
     return 0;
   }
   const args = parsed.args;
-  const file =
-    options.installationFile ??
-    resolveInstallationFile(undefined, process.env, process.cwd());
   const state = await readInstallationState(file);
   if (state.status === "absent") {
-    io.stderr("installation: absent\n");
+    out.stderr("installation: absent\n");
     return 1;
   }
   if (state.status === "unreadable") {
-    io.stderr("installation: unreadable\n");
+    out.stderr("installation: unreadable\n");
     return 1;
   }
   if (state.status === "invalid") {
-    printErrors(io, state.errors);
+    printErrors(out, state.errors);
     return 1;
   }
   if (state.status === "v1") {
-    io.stderr("installation.daemon: schema version 1 has no daemon section\n");
+    out.stderr("installation.daemon: schema version 1 has no daemon section\n");
     return 1;
   }
   const daemon = state.installation.daemon;
   if (daemon === undefined) {
-    io.stderr("installation.daemon: absent\n");
+    out.stderr("installation.daemon: absent\n");
     return 1;
   }
   const scheduler =
@@ -1617,21 +2026,46 @@ async function daemonCommand(
     daemon,
   });
   for (const unit of result.units) {
-    io.stdout(`${unit.key} ${unit.code}\n`);
+    out.stdout(`${unit.key} ${unit.code}\n`);
   }
   if (result.operatorLines !== null) {
     for (const line of result.operatorLines) {
-      io.stdout(`${line}\n`);
+      out.stdout(`${line}\n`);
     }
   }
   return result.units.some((unit) => unit.code === "unreadable") ? 1 : 0;
 }
 
-/** `fleet-v2 hosts <subcommand>`; exit codes: 0 written/listed, 1 refused, 2 usage. */
+/**
+ * The one tag an escaped error is named by: `error.code` when it is an
+ * upper-case identifier, else `error.name` when it is an `*Error` name, else
+ * `unknown`. A non-Error has no tag at all.
+ */
+function errorTag(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return "unknown";
+  }
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === "string" && /^[A-Z][A-Z0-9_]{0,40}$/.test(code)) {
+    return code;
+  }
+  if (/^[A-Za-z]{1,60}Error$/.test(error.name)) {
+    return error.name;
+  }
+  return "unknown";
+}
+
+/**
+ * `fleet-v2 hosts <subcommand>`; exit codes: 0 written/listed, 1 refused, 2
+ * usage. No thrown error escapes the screened io (HN1b fix a): the file read
+ * is guarded before the installation keys are known — it reports a tag-only
+ * line — and every later throw is caught and reported as exactly one screened
+ * line, never a stack and never a raw non-Error value.
+ */
 export async function hostsCommand(
   argv: readonly string[],
-  io: CliIo,
-  options: HostsCliOptions = {},
+  rawIo: CliIo,
+  hostsOptions: HostsCliOptions = {},
 ): Promise<number> {
   // Runtime guard: a malformed argv or hostile options object is a typed
   // refusal, never a throw. Tokens and token count are bounded; every token
@@ -1649,50 +2083,81 @@ export async function hostsCommand(
         return 2;
       }
     }
-    if (typeof io?.stdout !== "function" || typeof io?.stderr !== "function") {
-      return 1;
-    }
     if (
-      options !== null &&
-      typeof options === "object" &&
-      Object.getPrototypeOf(options) !== Object.prototype &&
-      Object.getPrototypeOf(options) !== null
+      hostsOptions !== null &&
+      typeof hostsOptions === "object" &&
+      Object.getPrototypeOf(hostsOptions) !== Object.prototype &&
+      Object.getPrototypeOf(hostsOptions) !== null
     ) {
       return 1;
     }
+  } catch {
+    return 1;
+  }
+  const out = screenedHostsIo(rawIo, [...argv]);
+  let file: string;
+  let read: Awaited<ReturnType<typeof readInstallationFile>>;
+  try {
+    file =
+      hostsOptions.installationFile ??
+      resolveInstallationFile(undefined, process.env, process.cwd());
+    read = await readInstallationFile(file);
+  } catch (error: unknown) {
+    out.stderr(`error: ${errorTag(error)}\n`);
+    return 1;
+  }
+  if (read.status === "read") {
+    out.addKeys(installationKeys(read.value));
+  }
+  try {
+    // The confirmation question reaches an injected gate without passing the
+    // wrapped stdout, so it is screened here with the same screen.
+    const injectedConfirm = hostsOptions.confirm;
+    const options: HostsCliOptions =
+      injectedConfirm === undefined
+        ? hostsOptions
+        : {
+            ...hostsOptions,
+            confirm: (question) => injectedConfirm(out.screen(question)),
+          };
     if (argv[0] === "daemon") {
-      return await daemonCommand(argv.slice(1), io, options);
+      return await daemonCommand(argv.slice(1), file, out, options);
     }
     const parsed = parseHostsArgs(argv);
     if (!parsed.ok) {
-      io.stderr(`${parsed.error}\n`);
+      out.stderr(`${parsed.error}\n`);
       return 2;
     }
     if (parsed.help) {
-      io.stdout(`${HOSTS_HELP}\n`);
+      out.stdout(`${HOSTS_HELP}\n`);
       return 0;
     }
     const args = parsed.args;
-    const file =
-      options.installationFile ??
-      resolveInstallationFile(undefined, process.env, process.cwd());
     if (args.subcommand === "list") {
-      return listHosts(file, io);
+      return await listHosts(file, out);
     }
     if (args.subcommand === "show") {
-      return showHosts(args, file, io);
+      return await showHosts(args, file, out);
     }
     if (args.subcommand === "remove") {
-      return removeHost(args, file, io, options);
+      return await removeHost(args, file, out, options);
+    }
+    if (args.subcommand === "rename") {
+      return await renameHost(args, file, out, options);
     }
     return await writeHost(
       args.subcommand === "edit" ? "edit" : "add",
       args,
       file,
-      io,
+      out,
       options,
     );
-  } catch {
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      out.stderr(`error: ${errorTag(error)}: ${error.message.split("\n")[0]}\n`);
+    } else {
+      out.stderr("error: unknown\n");
+    }
     return 1;
   }
 }

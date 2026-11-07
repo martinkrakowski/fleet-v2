@@ -45,6 +45,8 @@ import type {
 } from '../lane-run-records.js';
 import { copyParkRecord } from '../lane-run-records.js';
 import type { LaneRunParkFindingView } from '../park-findings-view.js';
+import { parseParkClass } from '../park-class.js';
+import type { LaneRunParkClass } from '../park-class.js';
 import { copyParkFindings, parkFindingsSnapshotOf } from '../park-findings-view.js';
 import { LANE_RUN_RESUMABLE_STATES } from '../value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../value-objects/LaneRunState.vo.js';
@@ -84,7 +86,7 @@ const REQUIRED_RECORD_KEYS: readonly string[] = [
 const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'provenance', 'schemaVersion'];
 
 const PARKED_REQUIRED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
-const PARKED_OPTIONAL_KEYS: readonly string[] = ['findings'];
+const PARKED_OPTIONAL_KEYS: readonly string[] = ['findings', 'class'];
 const LEASE_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
 
 export class LaneRun {
@@ -588,6 +590,9 @@ function parkedSnapshotError(snapshot: Record<string, unknown> | null): string |
       return findingsError;
     }
   }
+  if (snapshot.class !== undefined && parseParkClass(snapshot.class) === undefined) {
+    return 'LaneRun parked class is not a known park class';
+  }
   const reason = snapshot.reason;
   if (typeof reason !== 'string' || !LANE_RUN_PARK_REASONS.includes(reason as LaneRunParkReason)) {
     return 'LaneRun parked reason is not a known park reason';
@@ -647,6 +652,7 @@ function buildParkedRecord(snapshot: Record<string, unknown>): LaneRunParkRecord
     parkedFrom: snapshot.parkedFrom as LaneRunStateValue,
     questionId: snapshot.questionId as string | null,
     ...(findings !== undefined ? { findings } : {}),
+    ...(snapshot.class !== undefined ? { class: snapshot.class as LaneRunParkClass } : {}),
   });
 }
 

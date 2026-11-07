@@ -319,8 +319,12 @@ describe('ReviewTransportRouter', () => {
 
     const result = await router(BASE_REQUEST);
 
-    expect(recorded).toHaveLength(1);
-    const { file, args, env } = recorded[0];
+    // The idle `--wait` spawn comes first, then the review spawn (RV4).
+    expect(recorded).toHaveLength(2);
+    expect(recorded[0].args.slice(0, 2)).toEqual(['--wait', '--dir']);
+    expect(recorded[0].args[2]).toBe('/srv/fleet/worktrees/att-1');
+    expect(recorded[0].env.OCM_REMOTE_PORT).toBe('46000');
+    const { file, args, env } = recorded[1];
     expect(file).toBe('/bundled/bin/ocm-run');
     expect(args.slice(0, -1)).toEqual([
       '--dir',
@@ -375,9 +379,10 @@ describe('ReviewTransportRouter', () => {
     const result = await router(kindRequest);
 
     expect(diffCalls).toEqual([['base-sha', kindRequest.candidateHeadSha]]);
-    expect(prompts).toHaveLength(1);
-    expect(prompts[0]).toContain('<<<UNTRUSTED nonce=' + 'a'.repeat(32) + ' label="diff">>>');
-    expect(prompts[0]).toContain('+added line');
+    // `--wait` pushes the dir; the review prompt is the second call (RV4).
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain('<<<UNTRUSTED nonce=' + 'a'.repeat(32) + ' label="diff">>>');
+    expect(prompts[1]).toContain('+added line');
     expect(result.result).toBe('pass');
   });
 
@@ -394,9 +399,9 @@ describe('ReviewTransportRouter', () => {
       kind: 'brief-check',
       briefText: 'Do the thing.',
     };
-    let spawnCalled = false;
+    let spawnCalls = 0;
     const fakeSpawn: OcmReviewTransportSpawn = async () => {
-      spawnCalled = true;
+      spawnCalls += 1;
       return { exitCode: 0, stdout: PASS_FIXTURE, stderr: '' };
     };
     const router = createReviewTransportRouter({
@@ -411,7 +416,8 @@ describe('ReviewTransportRouter', () => {
 
     expect(result.result).toBe('unknown');
     expect(result.rawOutput).toBe('diff-unavailable');
-    expect(spawnCalled).toBe(false);
+    // Only the idle `--wait` ran; the review itself never spawned (RV4).
+    expect(spawnCalls).toBe(1);
   });
 
   it('installation ssh route uses the configured host even when process.env.OCM_HOST leaks', async () => {

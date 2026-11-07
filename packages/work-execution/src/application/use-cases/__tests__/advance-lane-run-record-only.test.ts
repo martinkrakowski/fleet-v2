@@ -415,6 +415,7 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
       qualifier: null,
       parkedFrom: 'collecting',
       questionId: null,
+      class: 'other',
     });
     expect(after?.parkCount).toBe(1);
     expect(after?.revision).toBe(2);

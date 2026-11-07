@@ -22,10 +22,9 @@ import {
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import type { ReviewTally } from '../../domain/review-selection.js';
 import {
-  isFullyDispositioned,
+  decideReviewReceiptOutcome,
   latestReceiptPerReviewer,
-  satisfiesFullyDispositionedReviewPassGate,
-  satisfiesReviewPassGate,
+  reviewKindOf,
   tallyReviews,
 } from '../../domain/review-selection.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
@@ -188,6 +187,19 @@ function selectReviewEvidence(assessment: EvidenceAssessmentRecord): {
  * also applies to a failed `pre-merge` receipt; harmless today (no
  * dispositions are recorded for pre-merge) — a work-execution change (KF-33b4).
  */
+/**
+ * The review blockers of the assessment (RV3): every receipt in
+ * `selection.latest` is judged by its severity-derived outcome
+ * (`decideReviewReceiptOutcome`).
+ *
+ * - `fail` (an unresolved `blocker`/`major` finding, whatever the raw verdict
+ *   word) blocks acceptance.
+ * - A 0-finding `fail` receipt is `unknown` (`unparseable-verdict`): it blocks
+ *   as a `review-missing` kind, never as a pass and never as a fixable fail.
+ * - `pass` (including a minor-only `fail` receipt, whose `minor`/`nit`
+ *   findings are carried, never dispositioned) adds zero blockers, and a
+ *   `pass` of kind `code-review` (default) satisfies the passing gate.
+ */
 function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly AcceptanceBlocker[] {
   const selection = selectReviewEvidence(assessment);
   if (selection.reviews.length === 0) {
@@ -205,28 +217,35 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly A
       .filter((disposition) => disposition.state === 'out-of-scope')
       .map((disposition) => disposition.findingId),
   );
+  let passing = false;
   for (const receipt of selection.latest) {
-    if (
-      receipt.result === 'fail' &&
-      !isFullyDispositioned(receipt, outOfScopeResolvedFindingIds, unresolvedFindingIds)
-    ) {
+    const decision = decideReviewReceiptOutcome(receipt, outOfScopeResolvedFindingIds, unresolvedFindingIds);
+    if (decision.outcome === 'fail') {
       blockers.push(
         acceptanceBlocker(
           'other',
           `review by '${receipt.reviewerModel}' failed for this head (receipt '${receipt.id}')`,
         ),
       );
+      continue;
+    }
+    if (decision.outcome === 'unknown') {
+      // RV3 (c): a stored `fail` receipt with zero findings is an
+      // unparseable verdict, never a pass and never a fixable fail.
+      if (receipt.result === 'fail' && receipt.findings.length === 0) {
+        blockers.push(
+          acceptanceBlocker(
+            'review-missing',
+            `review by '${receipt.reviewerModel}' failed for this head with no findings (unparseable-verdict, receipt '${receipt.id}')`,
+          ),
+        );
+      }
+      continue;
+    }
+    if (reviewKindOf(receipt) === 'code-review') {
+      passing = true;
     }
   }
-  const passing = selection.latest.some(
-    (receipt) =>
-      satisfiesReviewPassGate(receipt) ||
-      satisfiesFullyDispositionedReviewPassGate(
-        receipt,
-        outOfScopeResolvedFindingIds,
-        unresolvedFindingIds,
-      ),
-  );
   if (!passing && blockers.length === 0) {
     return [acceptanceBlocker('review-missing', 'no read-only independent review passed for this candidate head')];
   }
@@ -279,18 +298,27 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
     if (!this.deps) {
       throw new Error(NOT_IMPLEMENTED);
     }
-    // A configured runtime still refuses a missing request object instead of
-    // inventing one; the HTTP boundary always supplies an object body, and an
-    // empty object body flows into the validation below as a rejection.
-    if (typeof request !== 'object' || request === null) {
-      throw new Error(NOT_IMPLEMENTED);
+    // A configured runtime never throws on a malformed request (F96): the
+    // fields are read through own data properties only (an accessor or a
+    // throwing getter reads as absent), and anything that is not a plain
+    // request object is a typed rejection, never a throw.
+    const requestRecord = request as unknown;
+    if (typeof requestRecord !== 'object' || requestRecord === null || Array.isArray(requestRecord)) {
+      return { outcome: 'rejected', reason: 'Acceptance requires a plain request object' };
     }
+    const readField = (key: string): unknown => {
+      try {
+        return Object.getOwnPropertyDescriptor(requestRecord, key)?.value;
+      } catch {
+        return undefined;
+      }
+    };
     const deps = this.deps;
 
     // Owner decision references are never a request field: a caller that
     // supplies them is naming the doors it is judged against, which is refused
     // rather than honoured.
-    if ('ownerDecisionReferences' in (request as unknown as Record<string, unknown>)) {
+    if (readField('ownerDecisionReferences') !== undefined) {
       return {
         outcome: 'rejected',
         reason:
@@ -298,10 +326,14 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       };
     }
 
+    const requestAssessmentId = readField('assessmentId');
+    const requestCandidateHeadSha = readField('candidateHeadSha');
+    const requestPolicyRevision = readField('policyRevision');
+    const requestNowIso = readField('nowIso');
     if (
-      !isNonEmptyTrimmedString(request.assessmentId) ||
-      !isNonEmptyTrimmedString(request.candidateHeadSha) ||
-      !isNonEmptyTrimmedString(request.policyRevision)
+      !isNonEmptyTrimmedString(requestAssessmentId) ||
+      !isNonEmptyTrimmedString(requestCandidateHeadSha) ||
+      !isNonEmptyTrimmedString(requestPolicyRevision)
     ) {
       return {
         outcome: 'rejected',
@@ -309,11 +341,11 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       };
     }
 
-    let assessment = await deps.repo.findAssessmentById(request.assessmentId);
+    let assessment = await deps.repo.findAssessmentById(requestAssessmentId as string);
     if (assessment === null) {
       return { outcome: 'rejected', reason: 'Assessment not found' };
     }
-    const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
+    const nowIso = isNonEmptyTrimmedString(requestNowIso) ? (requestNowIso as string) : new Date().toISOString();
 
     if (assessment.state === 'stale') {
       return { outcome: 'stale', reason: 'Assessment is stale and cannot be accepted' };
@@ -327,8 +359,8 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
 
     // A changed head or policy revision invalidates the evidence collected so
     // far; it never carries over as acceptance.
-    const policyChanged = assessment.policyRevision !== request.policyRevision;
-    if (assessment.candidateHeadSha !== request.candidateHeadSha || policyChanged) {
+    const policyChanged = assessment.policyRevision !== (requestPolicyRevision as string);
+    if (assessment.candidateHeadSha !== (requestCandidateHeadSha as string) || policyChanged) {
       if (assessment.state === 'accepted') {
         return {
           outcome: 'rejected',
@@ -392,6 +424,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
           receiptsId: `rcp-${assessment.id}-${assessment.candidateHeadSha.slice(0, 8)}`,
           candidateHeadSha: assessment.candidateHeadSha,
           reviewTally: reviewTallyFor(assessment),
+          carriedMinors: EvidenceAssessment.fromRecord(assessment).carriedMinorFindings(),
         };
       }
       return {
@@ -400,6 +433,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
         candidateHeadSha: assessment.candidateHeadSha,
         assessment,
         reviewTally: reviewTallyFor(assessment),
+        carriedMinors: EvidenceAssessment.fromRecord(assessment).carriedMinorFindings(),
       };
     }
 
@@ -475,6 +509,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
         receiptsId: `rcp-${assessment.id}-${assessment.candidateHeadSha.slice(0, 8)}`,
         candidateHeadSha: assessment.candidateHeadSha,
         reviewTally: reviewTallyFor(assessment),
+        carriedMinors: EvidenceAssessment.fromRecord(assessment).carriedMinorFindings(),
       };
     }
 
@@ -489,6 +524,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       candidateHeadSha: assessment.candidateHeadSha,
       assessment: accepted,
       reviewTally: reviewTallyFor(accepted),
+      carriedMinors: aggregate.carriedMinorFindings(),
     };
   }
 

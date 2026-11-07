@@ -194,6 +194,8 @@ function expectedMergeGrantRecord(): CoordinationRequestRecord {
       attemptId: 'attempt-example-a',
       acceptanceReceiptId: 'receipt-example-a',
     },
+    grantRecordVersion: 2,
+    grantAttemptId: 'attempt-example-a',
   };
 }
 
@@ -792,6 +794,8 @@ describe('ResolveActionAuthorizationUseCase no-id resolve', () => {
     await repository.saveRequest(policyGrantRecord());
     await repository.saveRequest(
       ownerGrantRecord({
+        grantRecordVersion: 2,
+        grantAttemptId: 'attempt-example-a',
         createdAtIso: '2026-10-27T09:59:30.000Z',
         updatedAtIso: '2026-10-27T09:59:30.000Z',
       }),
@@ -802,6 +806,7 @@ describe('ResolveActionAuthorizationUseCase no-id resolve', () => {
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',
       expectedHeadSha: HA,
+      attemptId: 'attempt-example-a',
     });
     expect(resolved).toMatchObject({ outcome: 'authorized', grantId: 'grant-owner' });
   });

@@ -500,10 +500,10 @@ async function runRemovalGitRead(
 }
 
 /**
- * C2': the executor the removal's activity reads run through: every `git -C`
+ * C2': the executor the activity and size reads run through: every `git -C`
  * argv is rewritten onto the hardened read prefix, and every other subprocess
- * call is bounded. Only the removal path uses this wrapper, so
- * `inspectWorktreeForRemoval` and `removeLaneWorktree` keep their argv.
+ * call is bounded. `inspectWorktreeForRemoval` and `removeWorktree` run
+ * through it; `removeLaneWorktree` keeps its legacy argv.
  */
 function removalActivityExecutor(executor: CommandExecutorPort): CommandExecutorPort {
   return {
@@ -1001,18 +1001,45 @@ export async function writeAndVerifyPatch(
   return 'preserved';
 }
 
-function isValidInspectRequest(request: InspectWorktreeForRemovalRequest): boolean {
-  const { repositoryRoot, worktreePath, defaultRef } = request;
-  if (!isAbsoluteNormalisedPath(repositoryRoot) || !isAbsoluteNormalisedPath(worktreePath)) {
-    return false;
+/**
+ * A bounded, typed absolute path: a string of at most 4096 characters that is
+ * absolute and normalised. Anything else is not a path.
+ */
+function isBoundedAbsolutePath(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 4096 && isAbsoluteNormalisedPath(value);
+}
+
+/**
+ * C2': the validated request of one `inspectWorktreeForRemoval`. The request
+ * is snapshotted without running any getter, so a null, a primitive or a
+ * throwing getter reads as null (the caller answers `invalid-request`). The
+ * ref is bounded and can never read as an option (`--upload-pack=...`).
+ */
+function snapshotInspectRequest(request: unknown): InspectWorktreeForRemovalRequest | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(request);
+  } catch {
+    return null;
   }
-  if (typeof defaultRef !== 'string' || defaultRef === '') {
-    return false;
+  if (snap === null) {
+    return null;
   }
-  if (/\s/.test(defaultRef) || defaultRef.includes('\0')) {
-    return false;
+  const { repositoryRoot, worktreePath, defaultRef } = snap;
+  if (!isBoundedAbsolutePath(repositoryRoot) || !isBoundedAbsolutePath(worktreePath)) {
+    return null;
   }
-  return true;
+  if (
+    typeof defaultRef !== 'string' ||
+    defaultRef.length === 0 ||
+    defaultRef.length > 256 ||
+    defaultRef.startsWith('-') ||
+    /\s/.test(defaultRef) ||
+    defaultRef.includes('\0')
+  ) {
+    return null;
+  }
+  return snap as unknown as InspectWorktreeForRemovalRequest;
 }
 
 function parseWorktreeStatusCounts(stdout: string): WorktreeStatusCounts {
@@ -2355,19 +2382,25 @@ export class WorkspaceAdapter implements WorkspacePort {
    * prunes, removes, locks or fetches anything, and it never scans a host.
    */
   async listWorktrees(request: ListWorktreesRequest): Promise<ListWorktreesResult> {
-    if (!isAbsoluteNormalisedPath(request.repositoryRoot)) {
+    // C2': a descriptor-safe snapshot; a null, a primitive or a throwing
+    // getter is a typed answer with no executor call.
+    let snap: Record<string, unknown> | null;
+    try {
+      snap = snapshotPlainDataRecord(request);
+    } catch {
+      return { outcome: 'unknown', reason: 'invalid-request' };
+    }
+    const repositoryRoot = snap?.['repositoryRoot'];
+    if (snap === null || !isBoundedAbsolutePath(repositoryRoot)) {
       return { outcome: 'unknown', reason: 'invalid-request' };
     }
     let executor: CommandExecutorPort;
     try {
-      executor = this.executorFor(request.recordedHost);
+      executor = this.executorFor(snap['recordedHost'] as AttemptRunnerRecord | null | undefined);
     } catch {
       return { outcome: 'unknown', reason: 'no executor for the read' };
     }
-    const run = await executor.run(
-      ['git', '-C', request.repositoryRoot, 'worktree', 'list', '--porcelain'],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
+    const run = await runRemovalGitRead(executor, repositoryRoot, ['worktree', 'list', '--porcelain']);
     if (run.exitCode === null || run.error !== undefined) {
       return { outcome: 'unknown', reason: 'git worktree list did not report an exit code' };
     }
@@ -2392,25 +2425,42 @@ export class WorkspaceAdapter implements WorkspacePort {
     request: InspectWorktreeForRemovalRequest,
   ): Promise<InspectWorktreeForRemovalResult> {
     // 1. Validate before any command runs (no executor call on a bad request).
-    if (!isValidInspectRequest(request)) {
+    const snapshotted = snapshotInspectRequest(request);
+    if (snapshotted === null) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
-    const { repositoryRoot, worktreePath, defaultRef } = request;
+    const { repositoryRoot, worktreePath, defaultRef } = snapshotted;
 
     // 2. The read runs on the recorded host's executor; an unresolvable host
     //    is unknown — nothing is known to have been read.
     let executor: CommandExecutorPort;
     try {
-      executor = this.executorFor(request.recordedHost);
+      executor = this.executorFor(snapshotted.recordedHost);
     } catch {
       return { outcome: 'unknown', reason: 'no executor for the read' };
     }
 
+    try {
+      return await this.inspectListedWorktree(executor, repositoryRoot, worktreePath, defaultRef);
+    } catch {
+      return { outcome: 'unknown', reason: 'worktree inspection failed' };
+    }
+  }
+
+  /**
+   * Steps 3–11 of `inspectWorktreeForRemoval` on a resolved executor. Every
+   * git read runs hardened (no network, no lazy fetch, no hooks, no
+   * fsmonitor, bounded output); the outer try/catch stays in
+   * `inspectWorktreeForRemoval` and answers `unknown` on any throw.
+   */
+  private async inspectListedWorktree(
+    executor: CommandExecutorPort,
+    repositoryRoot: string,
+    worktreePath: string,
+    defaultRef: string,
+  ): Promise<InspectWorktreeForRemovalResult> {
     // 3. List the clone's worktrees.
-    const listRun = await executor.run(
-      ['git', '-C', repositoryRoot, 'worktree', 'list', '--porcelain'],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
+    const listRun = await runRemovalGitRead(executor, repositoryRoot, ['worktree', 'list', '--porcelain']);
     if (listRun.exitCode === null || listRun.error !== undefined) {
       return { outcome: 'unknown', reason: 'git worktree list did not report an exit code' };
     }
@@ -2436,22 +2486,22 @@ export class WorkspaceAdapter implements WorkspacePort {
     const headOnDefault = await this.readHeadOnDefault(executor, worktreePath, head, defaultRef);
 
     // 8. Status counts.
-    const statusResult = await this.readWorktreeStatus(executor, worktreePath);
+    const statusResult = await this.readWorktreeStatus(executor, worktreePath, true);
     if (statusResult.outcome === 'unknown') {
       return statusResult;
     }
 
     // 9. In-progress operations.
-    const inProgressResult = await this.readInProgressOperations(executor, worktreePath);
+    const inProgressResult = await this.readInProgressOperations(executor, worktreePath, true);
     if (inProgressResult.outcome === 'unknown') {
       return inProgressResult;
     }
 
     // 10. Last activity.
-    const lastActivity = await this.readLastActivity(executor, worktreePath);
+    const lastActivity = await this.readLastActivity(removalActivityExecutor(executor), worktreePath);
 
     // 11. Size (budgeted; a failure is null, never a guess).
-    const sizeBytes = await this.readWorktreeSize(executor, worktreePath);
+    const sizeBytes = await this.readWorktreeSize(removalActivityExecutor(executor), worktreePath);
 
     return {
       outcome: 'inspected',
@@ -2505,11 +2555,14 @@ export class WorkspaceAdapter implements WorkspacePort {
     head: string | null,
     defaultRef: string,
   ): Promise<boolean | null> {
-    if (head === null) return null;
-    const mergeBaseRun = await executor.run(
-      ['git', '-C', worktreePath, 'merge-base', '--is-ancestor', head, defaultRef],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
+    if (head === null || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head)) return null;
+    const mergeBaseRun = await runRemovalGitRead(executor, worktreePath, [
+      'merge-base',
+      '--is-ancestor',
+      head,
+      defaultRef,
+    ]);
+    if (mergeBaseRun.error !== undefined || mergeBaseRun.exitCode === null) return null;
     if (mergeBaseRun.exitCode === 0) return true;
     if (mergeBaseRun.exitCode === 1) return false;
     return null;

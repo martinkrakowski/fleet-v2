@@ -16,6 +16,7 @@ import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
+import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type { AcceptanceReceiptsResult } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type {
@@ -271,7 +272,10 @@ async function makeHarness(
           receiptAnswer !== 'throw' &&
           receiptAnswer.outcome === 'found' &&
           receiptAnswer.receipt.kind === 'pre-merge' &&
-          receiptAnswer.receipt.verdict === 'failed'
+          // RV3: only a receipt with a blocking finding blocks the receipts
+          // assessment; a minor-only failed receipt passes (like the evidence
+          // decider does).
+          decideConductorReviewOutcome(receiptAnswer.receipt).outcome === 'failed'
         ) {
           return { outcome: 'rejected', reason: 'review-blocker' };
         }
@@ -326,7 +330,8 @@ async function makeHarness(
           mergeState: 'clean',
           headSha: COMMIT,
           headRef: BRANCH,
-          baseRef: 'main',
+          isCrossRepository: false,
+          headRepositoryOwner: 'owner-example',          baseRef: 'main',
           mergedAtIso: null,
           closedAtIso: null,
           mergeCommitSha: null,
@@ -552,6 +557,41 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries.some((entry) => entry.kind === 'result' && entry.key === premergeKey() && entry.reasonCode === 'premerge-failure')).toBe(true);
     expect(JSON.stringify(entries)).not.toContain('untrusted reviewer prose');
+  });
+
+  it('RV3: a minor-only failed pre-merge receipt releases the hold and posts success', async () => {
+    const harness = await mergingHarness();
+    harness.setReceiptAnswer(
+      failedReceipt([
+        { findingId: 'finding-1', severity: 'minor', summary: 'a carried minor', filePath: 'src/ex.ts', line: 4 },
+        { findingId: 'finding-2', severity: 'nit', summary: 'a carried nit', filePath: null, line: null },
+      ]),
+    );
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'premerge',
+      key: premergeKey(),
+      result: 'completed',
+      reasonCode: 'premerge-success',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]!.status).toEqual({
+      context: 'premerge',
+      state: 'success',
+      description: 'pre-merge receipt recorded',
+    });
+  });
+
+  it('RV3: a zero-finding failed pre-merge receipt is an unparseable verdict and parks ambiguous pre-merge, posting nothing', async () => {
+    const harness = await mergingHarness();
+    harness.setReceiptAnswer(failedReceipt([]));
+    // The decider reads the severity-derived pre-merge fact (`unknown`) and
+    // parks `ambiguous pre-merge` before any grant or forge call.
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'pre-merge' });
+    expect(harness.forgeRequests).toEqual([]);
+    expect(harness.grantRequests).toEqual([]);
   });
 
   it('a failed receipt for another head or of another kind authorises no grant and no post', async () => {

@@ -588,6 +588,8 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           projectId: request.projectId,
           actionScope: forgeActionScope(request.actionKind),
           expectedHeadSha: request.expectedHeadSha,
+          // CO24e: the grant records the attempt it is resolved for, durably.
+          attemptId: request.attemptId,
         });
         if (result.outcome === "blocked") {
           return { outcome: "blocked", reason: result.reason };
@@ -631,13 +633,19 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
             reason: `No in-process authorization resolve recorded grant ${request.authorizationGrantId}`,
           };
         }
+        // The grant is bound to the attempt resolved for it. A request that
+        // names an attempt must name that one; a wrong-typed id is a mismatch
+        // too. The caller's id is never preferred over the resolved one.
+        if (request.attemptId !== undefined && request.attemptId !== coordinates.attemptId) {
+          return { outcome: "refused", reason: "grant-attempt-mismatch" };
+        }
         const result =
           await operator.recordAuthorizationConsumption.recordAuthorizationConsumption({
             consumptionId: consumptionId(request.actionId),
             grantId: request.authorizationGrantId,
             actionId: request.actionId,
             actionScope: forgeActionScope(request.actionKind),
-            attemptId: request.attemptId ?? coordinates.attemptId,
+            attemptId: coordinates.attemptId,
             expectedHeadSha: request.expectedHeadSha ?? coordinates.expectedHeadSha,
           });
         if (result.outcome === "consumed") {

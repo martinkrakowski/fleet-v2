@@ -85,8 +85,7 @@ describe('MergeRecordRepositoryAdapter', () => {
       expect(onDisk).toEqual([{ ...mergeRecord(), schemaVersion: 1 }]);
     });
 
-    it('keeps one record per (repository, number) key and a second key beside it', async () => {
-      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+    it('keeps one record per (repository, number) key and a second key beside it', async () => {      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
       await store.saveMergeRecord(mergeRecord());
       await store.saveMergeRecord(mergeRecord({ number: 8 }));
       await store.saveMergeRecord(mergeRecord({ repository: 'acme/other' }));
@@ -134,14 +133,25 @@ describe('MergeRecordRepositoryAdapter', () => {
       const upgraded = await store.saveMergeRecord(
         fleetRecord({ firstSeenAtIso: '2026-11-05T13:00:00.000Z' }),
       );
-      expect(upgraded).toEqual({ outcome: 'merger-upgraded', record: mergeRecord({ merger: 'fleet' }) });
-      expect(await store.findMergeRecord('acme/app', 7)).toEqual(mergeRecord({ merger: 'fleet' }));
+      expect(upgraded).toEqual({
+        outcome: 'merger-upgraded',
+        record: mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      });
+      expect(await store.findMergeRecord('acme/app', 7)).toEqual(
+        mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      );
 
       const afterUpgrade = await readBytes();
       const downgrade = await store.saveMergeRecord(mergeRecord());
       const again = await store.saveMergeRecord(fleetRecord());
-      expect(downgrade).toEqual({ outcome: 'unchanged', record: mergeRecord({ merger: 'fleet' }) });
-      expect(again).toEqual({ outcome: 'unchanged', record: mergeRecord({ merger: 'fleet' }) });
+      expect(downgrade).toEqual({
+        outcome: 'unchanged',
+        record: mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      });
+      expect(again).toEqual({
+        outcome: 'unchanged',
+        record: mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      });
       expect(await readBytes()).toBe(afterUpgrade);
     });
 
@@ -169,6 +179,23 @@ describe('MergeRecordRepositoryAdapter', () => {
       expect(JSON.parse(before)).toEqual([stored]);
     });
 
+    it('loads a pre-WB5b fleet-forge-action record without actionRef but refuses a new one (WB5b)', async () => {
+      const legacy: Record<string, unknown> = { ...mergeRecord(), source: 'fleet-forge-action', merger: 'fleet' };
+      delete legacy.actionRef;
+      await fs.writeFile(target, JSON.stringify([legacy]));
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+
+      expect(parseVersionedMergeRecordStateRecord(asRuntimeInput(legacy))).toMatchObject({ status: 'ok' });
+      expect(await store.findMergeRecord('acme/app', 7)).toEqual(legacy);
+      expect(await store.listMergeRecords()).toEqual([legacy]);
+
+      // A new incoming fleet-forge-action record without (or with a blank)
+      // actionRef is refused by the creation rule, never written.
+      expect(await store.saveMergeRecord(asRuntimeInput(legacy))).toEqual(REFUSED);
+      expect(await store.saveMergeRecord(asRuntimeInput({ ...legacy, actionRef: '  ' }))).toEqual(REFUSED);
+      expect(await store.listMergeRecords()).toEqual([legacy]);
+    });
+
     it('accepts a stored forge-observation/fleet record: the upgraded shape is a valid stored record', async () => {
       await fs.writeFile(target, JSON.stringify([mergeRecord({ merger: 'fleet' })]));
       const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
@@ -185,9 +212,13 @@ describe('MergeRecordRepositoryAdapter', () => {
       expect((await store.saveMergeRecord(mergeRecord())).outcome).toBe('unchanged');
       expect((await store.saveMergeRecord(mergeRecord({ headSha: HEAD_B }))).outcome).toBe('integrity-conflict');
       expect((await store.saveMergeRecord(fleetRecord())).outcome).toBe('merger-upgraded');
-      expect(await store.findMergeRecord('acme/app', 7)).toEqual(mergeRecord({ merger: 'fleet' }));
+      expect(await store.findMergeRecord('acme/app', 7)).toEqual(
+        mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      );
       expect(await store.findMergeRecord('acme/app', 9)).toBeNull();
-      expect(await store.listMergeRecords()).toEqual([mergeRecord({ merger: 'fleet' })]);
+      expect(await store.listMergeRecords()).toEqual([
+        mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      ]);
     });
 
     it('a read-only store refuses every write and writes nothing', async () => {
@@ -201,6 +232,51 @@ describe('MergeRecordRepositoryAdapter', () => {
       const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir, readOnly: true });
       await expect(store.listMergeRecords()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
       await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    });
+  });
+
+  describe('canonical repository case (WB5b3)', () => {
+    it('finds a stored mixed-case record by a lower-case lookup, and never rewrites the stored record', async () => {
+      // The stored record is written through the store's own serialiser in the
+      // pre-WB5b3 mixed-case shape, never hand-typed JSON.
+      const writer = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      const mixed = mergeRecord({ repository: 'Acme/App' });
+      expect(await writer.saveMergeRecord(asRuntimeInput(mixed))).toEqual({
+        outcome: 'created',
+        record: mixed,
+      });
+
+      const reader = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      expect(await reader.findMergeRecord('acme/app', 7)).toEqual(mixed);
+      expect(await reader.findMergeRecord('ACME/APP', 7)).toEqual(mixed);
+      // The stored file keeps the case it was written with.
+      const onDisk = JSON.parse(await readBytes()) as Array<Record<string, unknown>>;
+      expect(onDisk).toEqual([{ ...mixed, schemaVersion: 1 }]);
+    });
+
+    it('decides a second sighting in another case as the same record, not a new record or an integrity conflict', async () => {
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      const first = mergeRecord({ repository: 'Acme/App' });
+      expect(await store.saveMergeRecord(asRuntimeInput(first))).toEqual({
+        outcome: 'created',
+        record: first,
+      });
+      const second = mergeRecord({ repository: 'ACME/APP', headSha: HEAD_A });
+      expect(await store.saveMergeRecord(asRuntimeInput(second))).toEqual({
+        outcome: 'unchanged',
+        record: first,
+      });
+      expect(await store.listMergeRecords()).toEqual([first]);
+    });
+
+    it('still conflicts correctly for the same PR in another case when the head differs', async () => {
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      const first = mergeRecord({ repository: 'Acme/App' });
+      await store.saveMergeRecord(asRuntimeInput(first));
+      const conflicting = mergeRecord({ repository: 'acme/app', headSha: HEAD_B });
+      const result = await store.saveMergeRecord(asRuntimeInput(conflicting));
+      expect(result.outcome).toBe('integrity-conflict');
+      expect(await store.listMergeRecords()).toEqual([first]);
     });
   });
 

@@ -14,7 +14,15 @@
 
 import { isAbsolute } from 'node:path';
 
-import { isSafeSshHost, isValidHostName } from '@fleet/installation';
+import {
+  HOST_NAME_SECRET_REFUSAL,
+  HOST_NAME_TOO_LONG,
+  MAX_HOST_NAME_ARGUMENT_LENGTH,
+  hostNameHasSecretShape,
+  isSafeSshHost,
+  isValidHostName,
+  redactSecretShapes,
+} from '@fleet/installation';
 import type {
   AgyAcknowledgement,
   GateSlotSection,
@@ -309,6 +317,25 @@ function buildHostRunner(
 }
 
 /**
+ * Copy one own data property by descriptor, never by assignment: an own
+ * `"__proto__"` data property assigned onto a fresh `{}` triggers the
+ * inherited setter and is dropped, so a key the unknown-root-key check must
+ * see disappears. A null-prototype target plus `defineProperty` keeps it.
+ */
+function copyOwnDataProperty(
+  target: Record<string, unknown>,
+  key: string,
+  value: unknown,
+): void {
+  Object.defineProperty(target, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/**
  * Draft one host entry from collected answers.
  *
  * Refused here, before any probe runs: an input that is not plain data, an
@@ -323,84 +350,55 @@ function buildHostRunner(
 export function draftHost(rawInput: unknown): HostDraftResult {
   // Hostile runtime input is refused, never run: no getter is invoked and
   // nothing throws, whatever the caller hands over.
+  const notObject: HostDraftResult = {
+    ok: false,
+    errors: ['hosts: host draft is not an object'],
+  };
+  if (!isPlainRecord(rawInput)) {
+    return notObject;
+  }
+  let nameDescriptor: PropertyDescriptor | undefined;
+  try {
+    nameDescriptor = Object.getOwnPropertyDescriptor(rawInput, 'name');
+  } catch {
+    return notObject;
+  }
+  if (
+    nameDescriptor !== undefined &&
+    (nameDescriptor.get !== undefined || nameDescriptor.set !== undefined)
+  ) {
+    return { ok: false, errors: ['hosts: host name is unreadable'] };
+  }
   const fields = copyOwnData(rawInput);
   if (fields === undefined) {
-    return {
-      ok: false,
-      errors: ['hosts: the host description must be plain data'],
-    };
+    return notObject;
   }
-  const name = fields.name;
-  if (typeof name !== 'string' || name === '') {
+  const name = nameDescriptor?.value;
+  if (typeof name !== 'string') {
+    return notObject;
+  }
+  if (name === '') {
     return {
       ok: false,
       errors: ['hosts: the host name must be a non-empty string'],
     };
   }
+  if (name.length > MAX_HOST_NAME_ARGUMENT_LENGTH) {
+    return { ok: false, errors: [HOST_NAME_TOO_LONG] };
+  }
+  if (hostNameHasSecretShape(name)) {
+    return { ok: false, errors: [HOST_NAME_SECRET_REFUSAL] };
+  }
   return validateHostFields(fields, name);
 }
-
-/**
- * The secret shapes a hosts refusal or table must never echo, rebuilt from
- * string fragments so no literal in this file matches the shapes itself
- * (the repo's own diff gate refuses a file whose source text looks like a
- * secret). The set mirrors the shared registry's six legacy shapes and all
- * seventeen canonical lane-diff shapes; the shared package is not a declared
- * dependency of the CLI, so the mirror lives here.
- */
-const SECRET_SHAPES: readonly RegExp[] = [
-  // Every pattern is global: `sanitizeToken` must replace every match in one
-  // rendered field, not only the first, so several secret-shaped values in
-  // one value cannot leave the later ones visible.
-  new RegExp(["-----BEGIN [A-Z ]*PRIVATE KEY-----"].join(""), "g"),
-  new RegExp(["\\bgh[pousr]_[A-Za-z0-9]{20,}\\b"].join(""), "g"),
-  new RegExp(["\\bsk-[A-Za-z0-9_-]{20,}\\b"].join(""), "g"),
-  new RegExp(["\\bAKIA[0-9A-Z]{16}\\b"].join(""), "g"),
-  new RegExp(["\\bxox[abprs]-[A-Za-z0-9-]{10,}\\b"].join(""), "g"),
-  new RegExp([
-    "\\beyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b",
-  ].join(""), "g"),
-  new RegExp(["AKIA[0-9A-Z]{16}"].join(""), "g"),
-  new RegExp(["gh[pousr]_[A-Za-z0-9]{20,}"].join(""), "g"),
-  new RegExp(["github_pat_[A-Za-z0-9_]{20,}"].join(""), "g"),
-  new RegExp(["BEGIN [A-Z ]*PRIVATE KEY"].join(""), "g"),
-  new RegExp(["ya29\\.[A-Za-z0-9_-]{20,}"].join(""), "g"),
-  new RegExp(["AIza[0-9A-Za-z_-]{30,}"].join(""), "g"),
-  new RegExp(["sk-or-v1-[0-9a-f]{20,}"].join(""), "g"),
-  new RegExp(["xox[abpr]-[A-Za-z0-9-]{10,}"].join(""), "g"),
-  new RegExp([
-    "eyJ[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}",
-  ].join(""), "g"),
-  new RegExp(["ssh-(rsa|ed25519|dss|ecdsa) AAAA[A-Za-z0-9+/]{20,}"].join(""), "g"),
-  new RegExp([
-    "OPENCODE_SERVER_PASSWORD[ \\t\\v\\f\\r]*=[ \\t\\v\\f\\r]*[^ \\t\\v\\f\\r]+",
-  ].join(""), "g"),
-  new RegExp(["antigravity", "oauth", "token"].join("-"), "g"),
-  new RegExp([
-    "\\/home\\/[a-z]+\\/.(",
-    "ssh|config\\/gh|gemini|aws|docker\\/config\\.json)",
-  ].join(""), "g"),
-  new RegExp([
-    "[Pp]assword[ \\t\\v\\f\\r]*[:=][ \\t\\v\\f\\r]*[\"'][^\"']{6,}[\"']",
-  ].join(""), "g"),
-  new RegExp([
-    "[Tt]oken[ \\t\\v\\f\\r]*[:=][ \\t\\v\\f\\r]*[\"'][A-Za-z0-9_./+=-]{16,}[\"']",
-  ].join(""), "g"),
-  new RegExp([
-    "https?:\\/\\/[^/:@ \\t\\v\\f\\r]+:[^/@ \\t\\v\\f\\r]{6,}@",
-  ].join(""), "g"),
-];
 
 /** The filesystem separators `sanitizeToken` also strips. */
 const SEPARATORS = /[\\/\\]/g;
 
 /** True when `text` contains a secret shape or a filesystem separator. */
 export function hasSecretShape(text: string): boolean {
-  return [...SECRET_SHAPES, SEPARATORS].some((pattern) => {
-    // Global patterns are stateful across `test` calls; each test starts clean.
-    pattern.lastIndex = 0;
-    return pattern.test(text);
-  });
+  SEPARATORS.lastIndex = 0;
+  return hostNameHasSecretShape(text) || SEPARATORS.test(text);
 }
 
 /** Replace every secret-shaped span and separator in `text` with `<redacted>`. */
@@ -410,11 +408,7 @@ export function sanitizeToken(text: string): string {
 
 /** Replace every secret-shaped span in `text` (separators stay) with `<redacted>`. */
 export function redactSecrets(text: string): string {
-  let out = text;
-  for (const pattern of SECRET_SHAPES) {
-    out = out.replace(pattern, '<redacted>');
-  }
-  return out;
+  return redactSecretShapes(text, '<redacted>');
 }
 
 
@@ -858,4 +852,127 @@ export function applyHostDraft(
       hosts: hostsRecord,
     },
   };
+}
+
+/** Why a rename cannot be planned; no reason string contains either name. */
+export type PlanHostRenameReason =
+  | 'not-object'
+  | 'unreadable'
+  | 'not-v2'
+  | 'hosts-not-object'
+  | 'same-name'
+  | 'secret-new-name'
+  | 'invalid-new-name'
+  | 'name-too-long'
+  | 'missing'
+  | 'exists';
+
+/** A planned rename, or the reason there is no candidate. */
+export type PlanHostRenameResult =
+  | { readonly ok: true; readonly candidate: HostDraftCandidate }
+  | { readonly ok: false; readonly reason: PlanHostRenameReason };
+
+/**
+ * Plan one host-key rename: a new v2 root with the old entry moved to the new
+ * key, unchanged, and every other own data property copied by descriptor. It
+ * never mutates the input and never walks a host entry. Accessors on the root
+ * or on a host entry are `unreadable`; the getter is never called.
+ */
+export function planHostRename(
+  value: unknown,
+  oldName: string,
+  newName: string,
+): PlanHostRenameResult {
+  if (typeof oldName !== 'string' || typeof newName !== 'string') {
+    return { ok: false, reason: 'not-object' };
+  }
+  if (
+    oldName.length > MAX_HOST_NAME_ARGUMENT_LENGTH ||
+    newName.length > MAX_HOST_NAME_ARGUMENT_LENGTH
+  ) {
+    return { ok: false, reason: 'name-too-long' };
+  }
+  if (oldName === newName) {
+    return { ok: false, reason: 'same-name' };
+  }
+  if (hostNameHasSecretShape(newName)) {
+    return { ok: false, reason: 'secret-new-name' };
+  }
+  if (!isValidHostName(newName)) {
+    return { ok: false, reason: 'invalid-new-name' };
+  }
+  if (!isPlainRecord(value)) {
+    return { ok: false, reason: 'not-object' };
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (
+      descriptor !== undefined &&
+      (descriptor.get !== undefined || descriptor.set !== undefined)
+    ) {
+      return { ok: false, reason: 'unreadable' };
+    }
+  }
+  if (record.schemaVersion !== 2) {
+    return { ok: false, reason: 'not-v2' };
+  }
+  const hosts = record.hosts;
+  // `hosts` must be a plain object too: a class instance carries behaviour a
+  // rename must not inherit, and its own entries are refused with the root
+  // (HN1 fix round 2).
+  if (!isPlainRecord(hosts)) {
+    return { ok: false, reason: 'hosts-not-object' };
+  }
+  const hostsRecord = hosts as Record<string, unknown>;
+  if (!Object.hasOwn(hostsRecord, oldName)) {
+    return { ok: false, reason: 'missing' };
+  }
+  if (Object.hasOwn(hostsRecord, newName)) {
+    return { ok: false, reason: 'exists' };
+  }
+  const oldEntryDescriptor = Object.getOwnPropertyDescriptor(hostsRecord, oldName);
+  if (
+    oldEntryDescriptor === undefined ||
+    oldEntryDescriptor.get !== undefined ||
+    oldEntryDescriptor.set !== undefined
+  ) {
+    return { ok: false, reason: 'unreadable' };
+  }
+  const newHosts: Record<string, unknown> = Object.create(
+    null,
+  ) as Record<string, unknown>;
+  for (const key of Object.keys(hostsRecord)) {
+    const descriptor = Object.getOwnPropertyDescriptor(hostsRecord, key);
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return { ok: false, reason: 'unreadable' };
+    }
+    if (key !== oldName) {
+      copyOwnDataProperty(newHosts, key, descriptor.value);
+    }
+  }
+  copyOwnDataProperty(newHosts, newName, oldEntryDescriptor.value);
+  const newRoot: Record<string, unknown> = Object.create(
+    null,
+  ) as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (key === 'hosts') {
+      continue;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return { ok: false, reason: 'unreadable' };
+    }
+    copyOwnDataProperty(newRoot, key, descriptor.value);
+  }
+  newRoot.hosts = newHosts;
+  return { ok: true, candidate: newRoot as HostDraftCandidate };
 }

@@ -12,6 +12,11 @@ import type { DaemonEventProjectionPort } from '../../ports/out/DaemonEventProje
 import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { ForgeMergeReadPort } from '../../ports/out/ForgeMergeReadPort.out-port.js';
+import type {
+  ChainAttentionCommand,
+  ChainAttentionPort,
+  RaiseChainAttentionResult,
+} from '../../ports/out/ChainAttentionPort.out-port.js';
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import {
@@ -181,6 +186,20 @@ class FakeJournal implements Pick<LaneRunJournalPort, 'listForKey'> {
   }
 }
 
+class FakeTickAttention implements Pick<ChainAttentionPort, 'raiseChainAttention'> {
+  readonly raises: ChainAttentionCommand[] = [];
+  result: RaiseChainAttentionResult = { outcome: 'raised', reasonCode: null };
+  throwOnRaise = false;
+
+  async raiseChainAttention(command: ChainAttentionCommand): Promise<RaiseChainAttentionResult> {
+    this.raises.push(command);
+    if (this.throwOnRaise) {
+      throw new Error('attention store exploded');
+    }
+    return this.result;
+  }
+}
+
 class FakeMergePass implements RunMergePassPort {
   readonly requests: RunMergePassRequest[] = [];
   result: RunMergePassResult = { outcome: 'completed', reasonCode: null, entries: [] };
@@ -217,6 +236,8 @@ function makeHarness(overrides: {
   readonly mergePassResult?: RunMergePassResult;
   readonly queueEntries?: readonly MergeQueueEntryRecord[];
   readonly newUlid?: () => string;
+  readonly chainRefreshMode?: 'shadow' | 'invalid';
+  readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
 } = {}): Harness {
   const status = new FakeStatus();
   if (overrides.previousStatus !== undefined) {
@@ -261,6 +282,8 @@ function makeHarness(overrides: {
         ulidSequence += 1;
         return '0' + String(ulidSequence).padStart(25, '0');
       }),
+    ...(overrides.chainRefreshMode !== undefined ? { chainRefreshMode: overrides.chainRefreshMode } : {}),
+    ...(overrides.chainAttention !== undefined ? { chainAttention: overrides.chainAttention } : {}),
   };
   const useCase = new RunDaemonTickUseCase(deps);
   const run = (requestOverrides: Partial<RunDaemonTickRequest> = {}) =>
@@ -1106,5 +1129,47 @@ describe('RunDaemonTickUseCase (DT10b): interval, settle and input bounds', () =
       outcome: 'refused',
       reasonCode: 'invalid-job-filter',
     });
+  });
+});
+
+describe('RunDaemonTickUseCase invalid chain-refresh mode (CO8a)', () => {
+  it('runs the merge pass, skips chain refresh with the typed outcome and exits 0 when attention is raised', async () => {
+    const attention = new FakeTickAttention();
+    const h = makeHarness({ chainRefreshMode: 'invalid', chainAttention: attention });
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.exitCode).toBe(0);
+    expect(result.status?.jobs.map((job) => job.jobId)).toEqual([
+      `merge-pass:${DIGEST_A}`,
+      `chain-refresh:${DIGEST_A}`,
+    ]);
+    expect(result.status?.jobs[0]).toMatchObject({ outcome: 'completed' });
+    expect(result.status?.jobs[1]).toMatchObject({ outcome: 'skipped', reasonCode: 'chain-refresh-mode-invalid' });
+    expect(attention.raises).toHaveLength(1);
+  });
+
+  it('exits 1 and records the chain-refresh job refused when the attention store refuses the raise', async () => {
+    const attention = new FakeTickAttention();
+    attention.result = { outcome: 'refused', reasonCode: 'store-unreadable' };
+    const h = makeHarness({ chainRefreshMode: 'invalid', chainAttention: attention });
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.status?.jobs[0]).toMatchObject({ outcome: 'completed' });
+    expect(result.status?.jobs[1]).toMatchObject({ outcome: 'refused', reasonCode: 'chain-refresh-attention-refused' });
+  });
+
+  it('exits 1 and records the chain-refresh job refused when the attention raise throws', async () => {
+    const attention = new FakeTickAttention();
+    attention.throwOnRaise = true;
+    const h = makeHarness({ chainRefreshMode: 'invalid', chainAttention: attention });
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.status?.jobs[1]).toMatchObject({ outcome: 'refused', reasonCode: 'chain-refresh-attention-failed' });
   });
 });

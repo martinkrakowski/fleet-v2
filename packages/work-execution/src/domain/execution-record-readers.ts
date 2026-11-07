@@ -20,7 +20,9 @@ import {
   ATTEMPT_RECORD_SCHEMA_VERSION,
   CAPACITY_RESERVATION_SCHEMA_VERSION,
   parseSeatTool,
+  readJournalPullRequestRef,
   type ActionJournalEntryRecord,
+  type ActionJournalPullRequestRef,
   type AttemptKind,
   type AttemptRecord,
   type AttemptRunnerRecord,
@@ -829,6 +831,7 @@ interface JournalOptionalFields {
   stopReason?: StopReasonValue;
   observedSessionIds?: readonly string[];
   authorizedBy?: string;
+  pullRequest?: ActionJournalPullRequestRef;
 }
 
 function applyJournalOptionalFields(snap: Record<string, unknown>): JournalOptionalFields {
@@ -842,6 +845,16 @@ function applyJournalOptionalFields(snap: Record<string, unknown>): JournalOptio
   }
   if (snap.authorizedBy !== undefined) {
     out.authorizedBy = requiredString(snap, 'authorizedBy');
+  }
+  // The typed pull-request reference (WB5b): a value on a non-`forge` entry,
+  // a getter, a sparse array, an extra key, or a malformed repository or
+  // number is malformed; a valid value is copied into a fresh frozen object.
+  const pullRequest = readJournalPullRequestRef(snap.action as ActionJournalEntryRecord['action'], snap.pullRequest);
+  if (pullRequest.kind === 'invalid') {
+    malformed();
+  }
+  if (pullRequest.kind === 'valid') {
+    out.pullRequest = pullRequest.ref;
   }
   return out;
 }

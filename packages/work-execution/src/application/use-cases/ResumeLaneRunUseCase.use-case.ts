@@ -162,11 +162,46 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     outcome: LaneRunJournalOutcome,
     reasonCode: LaneRunResultReasonCode,
     nowIso: string,
+    detail: string | null = null,
   ): Promise<boolean> {
     const appended = await this.deps.runJournal.append(
-      laneRunResultEntry(this.deps.newUlid(), runId, key, outcome, reasonCode, nowIso),
+      laneRunResultEntry(this.deps.newUlid(), runId, key, outcome, reasonCode, nowIso, detail),
     );
     return appended.outcome === 'appended';
+  }
+
+  /**
+   * RV4: settle every `brief-check`/`code-review` intent of this run that has
+   * no final result as `reconciled` / `review-superseded`, so the next advance
+   * sees verdict `none` and performReview opens the next free key. Never
+   * throws; an append failure is ignored (the journal guard still protects).
+   */
+  private async supersedePendingReviewIntents(record: LaneRunRecord, nowIso: string): Promise<void> {
+    const entries = await this.deps.runJournal.listForRun(record.runId);
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      if (entry.kind !== 'intent' || entry.runId !== record.runId || entry.key === null) {
+        continue;
+      }
+      const parsed = parseLaneRunKey(entry.key);
+      if (parsed === null || parsed.kind !== 'step') {
+        continue;
+      }
+      if (parsed.step !== 'brief-check' && parsed.step !== 'code-review') {
+        continue;
+      }
+      if (seen.has(entry.key)) {
+        continue;
+      }
+      seen.add(entry.key);
+      const keyEntries = await this.deps.runJournal.listForKey(entry.key);
+      const hasFinal = keyEntries.some(
+        (candidate) => candidate.kind === 'result' && candidate.outcome !== 'ambiguous',
+      );
+      if (!hasFinal) {
+        await this.appendResult(record.runId, entry.key, 'reconciled', 'review-superseded', nowIso);
+      }
+    }
   }
 
   async requestResume(request: RequestResumeRequest): Promise<RequestResumeResult> {
@@ -245,6 +280,23 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return this.settleAmbiguousOpenPrPark(record, firstPendingKey, facts.pendingIntent, facts.state, facts.stopMode, request);
     }
 
+    // RV4: a resume from a review-seat-unavailable park, or from an ambiguous
+    // review park, starts a NEW review generation: every pending brief-check and
+    // code-review intent of this run is settled `review-superseded`, and the
+    // resume result carries detail `review-retry`. The open-pr branch above was
+    // already handled, so this never enters it.
+    const reviewResume =
+      record.parked.reason === 'review-seat-unavailable' ||
+      (record.parked.reason === 'ambiguous' &&
+        (record.parked.qualifier === 'brief-check' ||
+          record.parked.qualifier === 'code-review' ||
+          record.parked.parkedFrom === 'brief-check' ||
+          record.parked.parkedFrom === 'code-review'));
+    const resumeDetail = reviewResume ? 'review-retry' : null;
+    if (reviewResume) {
+      await this.supersedePendingReviewIntents(record, request.nowIso);
+    }
+
     // The conduct landed but the save did not (a crash, or a refused save): the journal already left the
     // park for its parked-from state while the record is still parked. Finish that exit here, so the
     // intent is settled as resumed and never refused as not-parked ahead of the repair.
@@ -262,7 +314,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       if (finished.outcome !== 'saved') {
         return { outcome: 'refused', key: firstPendingKey, reason: 'save-refused' };
       }
-      if (!(await this.appendResult(request.runId, firstPendingKey, 'reconciled', 'resumed', request.nowIso))) {
+      if (!(await this.appendResult(request.runId, firstPendingKey, 'reconciled', 'resumed', request.nowIso, resumeDetail))) {
         return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
       }
       for (const intent of pending.slice(1)) {
@@ -303,7 +355,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return { outcome: 'refused', key: firstKey, reason: 'save-refused' };
     }
 
-    if (!(await this.appendResult(request.runId, firstKey, 'completed', 'resumed', request.nowIso))) {
+    if (!(await this.appendResult(request.runId, firstKey, 'completed', 'resumed', request.nowIso, resumeDetail))) {
       return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
     }
 

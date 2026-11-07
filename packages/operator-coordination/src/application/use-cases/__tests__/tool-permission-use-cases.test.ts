@@ -447,6 +447,20 @@ describe('GiveToolPermissionVerdictUseCase', () => {
     expect(repo.find('req-expired')?.state).toBe('expired');
   });
 
+  it('a verdict exactly at the deadline is expired, never recorded', async () => {
+    const deadlineIso = '2030-01-01T00:00:00.000Z';
+    const repo = new PermissionRequestRepositoryAdapter();
+    repo.record(pendingRecord({ requestId: 'req-at-deadline', deadlineAtIso: deadlineIso }));
+    const uc = new GiveToolPermissionVerdictUseCase({
+      repository: repo,
+      clock: fixedClock(),
+      now: () => Date.parse(deadlineIso),
+    });
+    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-at-deadline', 'actor');
+    expect(result).toEqual({ outcome: 'expired' });
+    expect(repo.find('req-at-deadline')?.state).toBe('expired');
+  });
+
   it('F3: a verdict for a different threadId is unknown, never allowed', async () => {
     const repo = new PermissionRequestRepositoryAdapter();
     repo.record(pendingRecord({ requestId: 'req-t1', threadId: 'thread-A' }));

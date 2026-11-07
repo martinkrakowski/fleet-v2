@@ -125,7 +125,7 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
       };
     }
 
-    if (this.now() > Date.parse(record.deadlineAtIso)) {
+    if (this.now() >= Date.parse(record.deadlineAtIso)) {
       this.repository.expire(requestId, 'timed-out', this.clock.nowIso());
       return { outcome: 'expired' };
     }

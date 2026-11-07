@@ -129,8 +129,10 @@ describe("requiredScope", () => {
   it("maps the run-control family to operate (A-C)", () => {
     expect(requiredScope("POST", "/v1/runs/halt")).toBe("operate");
     expect(requiredScope("POST", "/v1/runs/run-01J00000000000000000000000/stop")).toBe("operate");
-    // The GETs stay null: /v1/runs reads are read-scoped, /v1/runs/:id does not exist yet.
-    expect(requiredScope("GET", "/v1/runs/halt")).toBeNull();
+    // Since A-R the detail GET pattern /v1/runs/:id captures the four-segment
+    // path; the use case's run-id validation turns it into a 400. There is no
+    // GET route for the five-segment stop path, so it stays unmapped.
+    expect(requiredScope("GET", "/v1/runs/halt")).toBe("read");
     expect(requiredScope("GET", "/v1/runs/run-01J00000000000000000000000/stop")).toBeNull();
   });
 

@@ -326,6 +326,12 @@ type RunsEnvelope = {
     };
     sessionStarts: ReadonlyArray<unknown>;
     truncated: boolean;
+    runs: ReadonlyArray<{
+      runId: string;
+      state: string;
+      lease: { holderId: string | null } | null;
+    }>;
+    runsTruncated: boolean;
   };
 };
 
@@ -362,13 +368,21 @@ describe("GET /v1/runs", () => {
     });
     expect(envelope.result.sessionStarts).toHaveLength(1);
 
-    // b. Redaction: no secret or transport detail in the raw response.
+    // c. The A-R board cards: every run (terminal ones included), sorted by
+    // runId, with the sanitized lease holder.
+    expect(envelope.result.runs.map((card) => card.runId)).toEqual([RUN_0, RUN_1, RUN_2]);
+    expect(envelope.result.runs[0]?.state).toBe("running");
+    expect(envelope.result.runs[0]?.lease?.holderId).toBe("driver-secret-1");
+    expect(envelope.result.runs[2]?.state).toBe("stopped");
+    expect(envelope.result.runsTruncated).toBe(false);
+
+    // d. Redaction: no secret/transport detail and no path in the raw
+    // response. The board card's lease holder is a sanitized identifier, so
+    // the value may appear, but never the secret-shaped or path-bearing ones.
     for (const secret of [
       "alias-secret",
       "4166",
       "/srv/wt/att-1",
-      "driver-secret-1",
-      "holderId",
       "sshAlias",
       "transport",
       "worktreePath",

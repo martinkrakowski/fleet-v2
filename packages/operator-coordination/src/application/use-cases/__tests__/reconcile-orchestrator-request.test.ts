@@ -139,7 +139,11 @@ class FakeJournalDelegate {
       }
       if (
         this.entries.some(
-          (stored) => stored.key === key && stored.kind === 'result' && stored.outcome !== 'ambiguous',
+          (stored) =>
+            stored.key === key &&
+            stored.kind === 'result' &&
+            stored.outcome !== 'ambiguous' &&
+            !(stored.outcome === 'not-started' && key.startsWith('request/')),
         )
       ) {
         return { outcome: 'refused', reason: 'result-after-final', detail: null };
@@ -656,6 +660,197 @@ describe('ReconcileOrchestratorRequestUseCase', () => {
         attemptId: 'attempt-recovered-1',
         journalKey: `request/${ID}`,
       });
+    }
+  });
+
+  it('a retry after a recorded result applies the recorded link id, not the one from the retry body', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    // The writer crashed between the journal result and its save: the result
+    // is in the journal, the request is still claimed. The retry carries a
+    // different link id; the recorded one must win.
+    env.journal.entries.push({
+      version: 1,
+      entryId: '01JB0000000000000000000005',
+      kind: 'result',
+      key: `request/${ID}`,
+      outcome: 'completed',
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: 'attempt-recorded-1',
+    });
+
+    const retry = await env.useCase.execute('record-result', {
+      requestId: ID,
+      orchestratorId: ORCH,
+      expectedRevision: 2,
+      fence: 1,
+      outcome: 'completed',
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: 'attempt-retry-9',
+    });
+    expect(retry).toEqual({ outcome: 'unchanged', requestId: ID });
+
+    const stored = await env.requestRepo.get(ID);
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('dispatched');
+      expect(stored.request.linked).toEqual({
+        attemptId: 'attempt-recorded-1',
+        journalKey: `request/${ID}`,
+      });
+    }
+  });
+
+  it('a retry after a recorded refusal applies the recorded reason kind, not the one from the retry body', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    env.journal.entries.push({
+      version: 1,
+      entryId: '01JB0000000000000000000006',
+      kind: 'result',
+      key: `request/${ID}`,
+      outcome: 'refused',
+      reasonCode: 'busy',
+      reasonKind: 'seat-unavailable',
+      linkedId: null,
+    });
+
+    const retry = await env.useCase.execute('record-result', {
+      requestId: ID,
+      orchestratorId: ORCH,
+      expectedRevision: 2,
+      fence: 1,
+      outcome: 'refused',
+      reasonCode: 'busy',
+      reasonKind: 'policy',
+      linkedId: null,
+    });
+    expect(retry).toEqual({ outcome: 'unchanged', requestId: ID });
+
+    const stored = await env.requestRepo.get(ID);
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('refused');
+      expect(stored.request.reason?.reasonKind).toBe('seat-unavailable');
+    }
+  });
+
+  it('claim recovery treats a recorded not-started result as non-final and a later result completes', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    env.journal.entries.push({
+      version: 1,
+      entryId: '01JB0000000000000000000007',
+      kind: 'result',
+      key: `request/${ID}`,
+      outcome: 'not-started',
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: null,
+    });
+
+    // not-started never moves the request, so recovery reports neither
+    // digest-failed nor a completion: the request is still claimed by this
+    // orchestrator and reconciles.
+    const recovered = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    expect(recovered).toEqual({ outcome: 'reconcile', requestId: ID, revision: 2, fence: 1 });
+
+    // A later final result is still allowed and moves the request.
+    const completed = await env.useCase.execute('record-result', {
+      requestId: ID,
+      orchestratorId: ORCH,
+      expectedRevision: 2,
+      fence: 1,
+      outcome: 'completed',
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: 'attempt-example-2',
+    });
+    expect(completed).toEqual({ outcome: 'result-recorded', requestId: ID });
+
+    const stored = await env.requestRepo.get(ID);
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('dispatched');
+      expect(stored.request.linked).toEqual({
+        attemptId: 'attempt-example-2',
+        journalKey: `request/${ID}`,
+      });
+    }
+  });
+
+  it('claim recovery applies a recorded completion after the retained claim lease expires', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    env.journal.entries.push({
+      version: 1,
+      entryId: '01JB0000000000000000000008',
+      kind: 'result',
+      key: `request/${ID}`,
+      outcome: 'completed',
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: 'attempt-recovered-1',
+    });
+
+    // The claim lease (10:02:00) lapsed; the session lease (10:05:00) is live.
+    env.clock.set('2026-10-27T10:03:00.000Z');
+
+    const result = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    expect(result).toEqual({ outcome: 'already-dispatched', requestId: ID });
+
+    const stored = await env.requestRepo.get(ID);
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('dispatched');
+      expect(stored.request.linked).toEqual({
+        attemptId: 'attempt-recovered-1',
+        journalKey: `request/${ID}`,
+      });
+    }
+  });
+
+  it('claim recovery applies a recorded refusal after the retained claim lease expires', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    env.journal.entries.push({
+      version: 1,
+      entryId: '01JB0000000000000000000009',
+      kind: 'result',
+      key: `request/${ID}`,
+      outcome: 'refused',
+      reasonCode: 'busy',
+      reasonKind: 'seat-unavailable',
+      linkedId: null,
+    });
+
+    env.clock.set('2026-10-27T10:03:00.000Z');
+
+    const result = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    expect(result).toEqual({ outcome: 'already-refused', requestId: ID });
+
+    const stored = await env.requestRepo.get(ID);
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('refused');
+      expect(stored.request.reason?.reasonKind).toBe('seat-unavailable');
     }
   });
 });

@@ -83,6 +83,15 @@ const RESULT_OUTCOMES = ['completed', 'refused', 'not-started', 'ambiguous'] as 
 const REASON_CODE_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 const ID_MAX_BYTES = 256;
 
+/**
+ * A result that closes the request channel: only `completed` and `refused`
+ * move the request. `not-started` and `ambiguous` leave it unmoved, so a
+ * later final result is still allowed (fix round 2, item 2).
+ */
+function isFinalResultEntry(entry: OrchestratorRequestJournalEntry): boolean {
+  return entry.kind === 'result' && (entry.outcome === 'completed' || entry.outcome === 'refused');
+}
+
 type ReconcileAction = 'claim' | 'record-intent' | 'record-result';
 
 function isValidId(value: unknown): boolean {
@@ -281,7 +290,7 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
       return unknown('digest-failed', requestId);
     }
 
-    const finalResult = entries.find((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous');
+    const finalResult = entries.find(isFinalResultEntry);
     if (finalResult !== undefined) {
       const intent = entries.find((entry) => entry.kind === 'intent');
       if (
@@ -532,7 +541,7 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
       return unknown('digest-failed', requestId);
     }
 
-    const finalResult = entries.find((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous');
+    const finalResult = entries.find(isFinalResultEntry);
     if (finalResult !== undefined) {
       if (finalResult.outcome === outcome && finalResult.reasonCode === reasonCode) {
         if (
@@ -540,10 +549,18 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
           record.state !== 'dispatched' &&
           record.state !== 'refused'
         ) {
+          // A retry may carry a different link id or reason kind than the
+          // result that was recorded; the journal fields are the only ones
+          // recovery may apply (fix round 2, item 1).
           const applied = await this.applyResultTransition(
             record,
             { orchestratorId, expectedRevision, fence },
-            { outcome, reasonCode, reasonKind, linkedId },
+            {
+              outcome: finalResult.outcome as 'completed' | 'refused',
+              reasonCode: finalResult.reasonCode,
+              reasonKind: finalResult.reasonKind,
+              linkedId: finalResult.linkedId,
+            },
             requestId,
           );
           if (!applied.ok) {
@@ -694,6 +711,7 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
         holder,
         { reasonKind: finalResult.reasonKind, detail: null },
         this.nowIso(),
+        true, // the recorded result is authoritative even after the lease lapsed
       );
     } else {
       // The recorded link id is the only one recovery may apply: the request
@@ -710,6 +728,7 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
         holder,
         { [linkKey]: linkValue, journalKey: JOURNAL_KEY_PREFIX + requestId },
         this.nowIso(),
+        true, // the recorded result is authoritative even after the lease lapsed
       );
     }
     if (!transition.success) {

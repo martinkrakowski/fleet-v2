@@ -393,6 +393,36 @@ describe('prepareLaneRunJournalAppend', () => {
     });
   });
 
+  it('allows not-started results on a request key and then a final result', () => {
+    const intentEntry = intent(REQUEST_KEY);
+    const notStarted1 = result(REQUEST_KEY, 'not-started');
+    const notStarted2 = result(REQUEST_KEY, 'not-started');
+    const final = result(REQUEST_KEY, 'completed');
+    const after = result(REQUEST_KEY, 'refused');
+
+    expect(prepareLaneRunJournalAppend([intentEntry], notStarted1).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, notStarted1], notStarted2).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, notStarted1, notStarted2], final).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, notStarted1, notStarted2, final], after)).toEqual({
+      ok: false,
+      reason: 'result-after-final',
+      detail: null,
+    });
+  });
+
+  it('still treats not-started as final on a step key', () => {
+    const intentEntry = intent(STEP_KEY);
+    const notStarted = result(STEP_KEY, 'not-started');
+    const after = result(STEP_KEY, 'completed');
+
+    expect(prepareLaneRunJournalAppend([intentEntry], notStarted).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, notStarted], after)).toEqual({
+      ok: false,
+      reason: 'result-after-final',
+      detail: null,
+    });
+  });
+
   it('refuses a result whose runId differs from its intent', () => {
     const decision = prepareLaneRunJournalAppend([intent(REQUEST_KEY)], result(REQUEST_KEY, 'completed', { runId: RUN_ID }));
     expect(decision).toEqual({

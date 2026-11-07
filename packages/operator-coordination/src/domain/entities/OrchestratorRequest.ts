@@ -484,18 +484,26 @@ export class OrchestratorRequest {
 
   /**
    * Mark the request dispatched with a link to the journal record. The link
-   * is validated by rule o; the claim is kept.
+   * is validated by rule o; the claim is kept. When `skipLeaseCheck` is
+   * true the claim lease is not required to be live — recovery of an already
+   * recorded final result applies it even after the retained lease lapsed
+   * (fix round 2, item 3).
    */
-  complete(holder: unknown, linked: unknown, nowIso: string): OrchestratorRequestResult {
+  complete(holder: unknown, linked: unknown, nowIso: string, skipLeaseCheck = false): OrchestratorRequestResult {
     try {
-      return this.completeUnchecked(holder, linked, nowIso);
+      return this.completeUnchecked(holder, linked, nowIso, skipLeaseCheck);
     } catch {
       return unreadableInputResult();
     }
   }
 
-  private completeUnchecked(holder: unknown, linked: unknown, nowIso: string): OrchestratorRequestResult {
-    const holderCheck = this.holderError('complete', ['claimed', 'cancel-requested'], holder, nowIso);
+  private completeUnchecked(
+    holder: unknown,
+    linked: unknown,
+    nowIso: string,
+    skipLeaseCheck: boolean,
+  ): OrchestratorRequestResult {
+    const holderCheck = this.holderError('complete', ['claimed', 'cancel-requested'], holder, nowIso, skipLeaseCheck);
     if (holderCheck !== null) {
       return refusal(holderCheck.message, holderCheck.code);
     }
@@ -512,18 +520,26 @@ export class OrchestratorRequest {
   }
 
   /**
-   * Refuse the request with a typed reason; the claim is kept.
+   * Refuse the request with a typed reason; the claim is kept. When
+   * `skipLeaseCheck` is true the claim lease is not required to be live —
+   * recovery of an already recorded final result applies it even after the
+   * retained lease lapsed (fix round 2, item 3).
    */
-  refuse(holder: unknown, reason: unknown, nowIso: string): OrchestratorRequestResult {
+  refuse(holder: unknown, reason: unknown, nowIso: string, skipLeaseCheck = false): OrchestratorRequestResult {
     try {
-      return this.refuseUnchecked(holder, reason, nowIso);
+      return this.refuseUnchecked(holder, reason, nowIso, skipLeaseCheck);
     } catch {
       return unreadableInputResult();
     }
   }
 
-  private refuseUnchecked(holder: unknown, reason: unknown, nowIso: string): OrchestratorRequestResult {
-    const holderCheck = this.holderError('refuse', ['claimed', 'cancel-requested'], holder, nowIso);
+  private refuseUnchecked(
+    holder: unknown,
+    reason: unknown,
+    nowIso: string,
+    skipLeaseCheck: boolean,
+  ): OrchestratorRequestResult {
+    const holderCheck = this.holderError('refuse', ['claimed', 'cancel-requested'], holder, nowIso, skipLeaseCheck);
     if (holderCheck !== null) {
       return refusal(holderCheck.message, holderCheck.code);
     }
@@ -695,12 +711,16 @@ export class OrchestratorRequest {
   /**
    * The five fence checks, in order: now valid, holder shape, revision,
    * state, holder id and fence, lease. Returns a fixed failure or null.
+   * `skipLeaseCheck` drops only the lease check — recovery of a recorded
+   * final result applies it after the retained lease lapsed (fix round 2,
+   * item 3).
    */
   private holderError(
     verb: string,
     allowedStates: readonly OrchestratorRequestState[],
     holder: unknown,
     nowIso: unknown,
+    skipLeaseCheck = false,
   ): { message: string; code: OrchestratorRequestRefusalCode } | null {
     if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
       return { message: 'OrchestratorRequest now must be a valid timestamp', code: 'invalid' };
@@ -723,7 +743,7 @@ export class OrchestratorRequest {
     ) {
       return { message: 'OrchestratorRequest caller does not hold the current claim', code: 'holder' };
     }
-    if (Date.parse(nowIso) >= Date.parse(claim.leaseUntilIso)) {
+    if (!skipLeaseCheck && Date.parse(nowIso) >= Date.parse(claim.leaseUntilIso)) {
       return { message: 'OrchestratorRequest claim lease has expired', code: 'lease' };
     }
     return null;

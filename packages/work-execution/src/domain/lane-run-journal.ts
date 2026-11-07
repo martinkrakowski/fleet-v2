@@ -36,7 +36,9 @@ export type LaneRunJournalEntryKind = (typeof LANE_RUN_JOURNAL_ENTRY_KINDS)[numb
 
 /**
  * A result's outcome. `ambiguous` is the only non-final outcome: a key may collect any number of
- * `ambiguous` results, then at most one final result, and nothing after it.
+ * `ambiguous` results, then at most one final result, and nothing after it. The request channel
+ * (O2c) additionally treats `not-started` as non-final: it does not move the request, so a later
+ * final result is still allowed there.
  */
 export const LANE_RUN_JOURNAL_OUTCOMES = [
   'completed', 'refused', 'not-started', 'cancelled-unstarted', 'reconciled', 'overtaken', 'dry-run',
@@ -713,11 +715,25 @@ function resultRefusal(
     return { ok: false, reason: 'invalid-entry', detail: 'LaneRunJournal result runId must equal its intent\'s' };
   }
   for (const existingEntry of existing) {
-    if (existingEntry.kind === 'result' && existingEntry.key === entry.key && existingEntry.outcome !== 'ambiguous') {
+    if (existingEntry.kind === 'result' && existingEntry.key === entry.key && isClosedByFinalResult(existingEntry)) {
       return { ok: false, reason: 'result-after-final', detail: null };
     }
   }
   return null;
+}
+
+/** Whether an existing result closes its key: every outcome except `ambiguous`, and except
+ *  `not-started` on the request channel (O2c), where a not-started result does not move the
+ *  request and a later final result is still allowed. */
+function isClosedByFinalResult(entry: LaneRunJournalEntryRecord): boolean {
+  if (entry.outcome === 'ambiguous') {
+    return false;
+  }
+  if (entry.outcome === 'not-started') {
+    const parsed = parseLaneRunKey(entry.key);
+    return parsed?.kind !== 'request';
+  }
+  return true;
 }
 
 export interface LaneRunJournalStopFacts {

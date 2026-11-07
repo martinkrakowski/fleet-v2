@@ -460,12 +460,17 @@ describe('relaunch plan (production composition)', () => {
   });
 
   // Per corrupted state file: what the commands answer, and whether the plan may store its one record.
+  // CO29a-ro2: unknown stays unknown — every corrupt file here leaves both commands unable to tell
+  // the state, so nothing is planned and the only allowed write (relaunch-plans.json) never happens.
   // - lane-runs.json, attempts.json: the inventory refuses (exit 1) and the plan is unknown, nothing stored.
   // - work-orders.json: only the plan reads it; the plan is unknown, nothing stored.
-  // - conductor-halt.json: an unreadable marker reads as a halt; the plan is still made (halted: true recorded),
-  //   which is its one allowed write (relaunch-plans.json), so only that file may differ.
-  // - conductor-driver-lease.json: the read-only lease adapter reads unreadable bytes as an absent lease (package
-  //   behaviour, outside this lane), so the plan is made too. The answer is not pinned here, only the absence of a write.
+  // - project-profiles.json: the read-only profile listing never quarantines; the inventory refuses
+  //   (no clone list) and the plan is unknown, nothing stored.
+  // - conductor-halt.json: the inventory answers unknown (halt-unreadable); the plan is unknown, nothing stored.
+  // - conductor-driver-lease.json: the read-only lease read throws the typed unreadable error; the
+  //   inventory answers unknown (lease-unreadable) and the plan is unknown, nothing stored.
+  // - lane-plans.json: only the plan reads it; the inventory still answers inventoried, the plan is
+  //   unknown, nothing stored.
   interface InventoryAnswer {
     readonly outcome?: string;
     readonly conductor?: { readonly halted?: boolean; readonly driverLease?: string };
@@ -478,12 +483,10 @@ describe('relaunch plan (production composition)', () => {
     { file: 'lane-runs.json', inventory: (a, code) => code !== 0 && a.outcome !== 'inventoried', planOutcome: 'unknown' },
     { file: 'attempts.json', inventory: (a, code) => code !== 0 && a.outcome !== 'inventoried', planOutcome: 'unknown' },
     { file: 'work-orders.json', inventory: (a, code) => a.outcome === 'inventoried' && code === 0, planOutcome: 'unknown' },
-    {
-      file: 'conductor-halt.json',
-      inventory: (a) => a.outcome === 'inventoried' && a.conductor?.halted === true,
-      planOutcome: 'planned',
-    },
-    { file: 'conductor-driver-lease.json', inventory: (a) => a.outcome === 'inventoried', planOutcome: 'planned' },
+    { file: 'project-profiles.json', inventory: (a, code) => code !== 0 && a.outcome !== 'inventoried', planOutcome: 'unknown' },
+    { file: 'conductor-halt.json', inventory: (a, code) => code !== 0 && a.outcome === 'unknown', planOutcome: 'unknown' },
+    { file: 'conductor-driver-lease.json', inventory: (a, code) => code !== 0 && a.outcome === 'unknown', planOutcome: 'unknown' },
+    { file: 'lane-plans.json', inventory: (a, code) => a.outcome === 'inventoried' && code === 0, planOutcome: 'unknown' },
   ];
 
   it.each(unreadableCases)(
@@ -522,13 +525,69 @@ describe('relaunch plan (production composition)', () => {
     },
   );
 
+  // CO29a-ro2: a missing halt marker and driver lease are known absence, not
+  // unreadable bytes: both files absent, the plan is still made.
+  it('plans normally with no conductor-halt.json and no conductor-driver-lease.json at all', async () => {
+    const fx = await seededFixture();
+    await expect(fs.stat(path.join(fx.stateDir, 'conductor-halt.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.stat(path.join(fx.stateDir, 'conductor-driver-lease.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    const inventoryIo = capture();
+    const inventoryCode = await runCli(['relaunch', 'inventory'], inventoryIo, fx.runtime);
+    expect(inventoryCode).toBe(0);
+    const inventoryAnswer = JSON.parse(inventoryIo.out.join('')) as {
+      outcome: string;
+      conductor: { halted: boolean; driverLease: string };
+    };
+    expect(inventoryAnswer.outcome).toBe('inventoried');
+    expect(inventoryAnswer.conductor).toMatchObject({ halted: false, driverLease: 'absent' });
+
+    const result = await plan(fx.runtime);
+    expect(result.code).toBe(0);
+    expect(result.result.outcome).toBe('planned');
+  });
+
+  // CO29a-ro2: a REAL filesystem read error through the production path. Each
+  // conductor file is replaced by a DIRECTORY of the same name, so the adapter's
+  // read fails with EISDIR (no port mock): both commands must answer unknown,
+  // store no plan and change no byte of the state or the worktrees.
+  const directoryCases = ['conductor-halt.json', 'conductor-driver-lease.json'] as const;
+  it.each(directoryCases)(
+    'answers unknown on a real EISDIR read error with %s replaced by a directory',
+    async (file) => {
+      const fx = await seededFixture();
+      await fs.rm(path.join(fx.stateDir, file), { force: true });
+      await fs.mkdir(path.join(fx.stateDir, file));
+      const stateBefore = await snapshotStateWithHashes(fx.stateDir);
+      const worktreesBefore = await snapshotStateWithHashes(fx.worktreeRoot);
+
+      const inventoryIo = capture();
+      const inventoryCode = await runCli(['relaunch', 'inventory'], inventoryIo, fx.runtime);
+      const inventoryAnswer = JSON.parse(inventoryIo.out.join('')) as InventoryAnswer;
+      expect(inventoryCode).not.toBe(0);
+      expect(inventoryAnswer.outcome).toBe('unknown');
+      expect(await snapshotStateWithHashes(fx.stateDir)).toEqual(stateBefore);
+      expect(await snapshotStateWithHashes(fx.worktreeRoot)).toEqual(worktreesBefore);
+
+      const result = await plan(fx.runtime);
+      expect(result.code).toBe(1);
+      expect(result.result.outcome).toBe('unknown');
+      await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await snapshotStateWithHashes(fx.stateDir)).toEqual(stateBefore);
+      expect(await snapshotStateWithHashes(fx.worktreeRoot)).toEqual(worktreesBefore);
+    },
+  );
+
   it('exits 1 with unknown when the profile records cannot be read', async () => {
     const fx = await fixture([]);
+    // CO29a-ro2: the relaunch commands read profiles through the read-only
+    // listing, so the stub replaces that one.
     const unreadable = {
       ...fx.runtime,
       coordination: {
         ...fx.runtime.coordination,
-        listProjectProfiles: {
+        listProjectProfilesReadOnly: {
           listProjectProfiles: async () => {
             throw new Error(`cannot read ${fx.stateDir}`);
           },
@@ -544,7 +603,9 @@ describe('relaunch plan (production composition)', () => {
       ...fx.runtime,
       coordination: {
         ...fx.runtime.coordination,
-        listProjectProfiles: { listProjectProfiles: async () => ({ outcome: 'rejected', reason: 'store unreadable' }) },
+        listProjectProfilesReadOnly: {
+          listProjectProfiles: async () => ({ outcome: 'rejected', reason: 'store unreadable' }),
+        },
       },
     } as unknown as FleetCliRuntime;
     expect((await plan(rejected)).result).toEqual({ outcome: 'unknown', reasons: ['profile-records-unreadable'] });

@@ -32,8 +32,12 @@ export type ConductorSchedulePlacement = 'running' | 'waiting' | 'parked' | 'hal
 
 export interface ConductorScheduleFacts {
   readonly halt: ConductorScheduleHalt;
-  /** The driver lease record, or null when none was ever taken. */
-  readonly driverLease: LaneRunLeaseRecord | null;
+  /**
+   * The driver lease record, null when none was ever taken, or 'unreadable'
+   * when the lease file could not be read: the lease state is unknown, and an
+   * unknown lease is never treated as "no lease held".
+   */
+  readonly driverLease: LaneRunLeaseRecord | null | 'unreadable';
   /** Every run record (terminal ones too); any order. */
   readonly runs: readonly LaneRunRecord[];
   /** Journal entries by run id; a missing id reads as []. */
@@ -508,7 +512,12 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
   return {
     observedAtIso: nowIso,
     halt,
-    driverLeaseLapsed: driverLease === null ? null : isLeaseLapsed(driverLease, nowIso),
+    // An 'unreadable' lease is the conservative unknown branch here: like "no
+    // lease recorded" it projects null (unknown), never false ("no lease
+    // held") and never true (lapsed) — an unreadable lease must not read as a
+    // decision that the lease is free.
+    driverLeaseLapsed:
+      driverLease === null || driverLease === 'unreadable' ? null : isLeaseLapsed(driverLease, nowIso),
     rows,
     queues,
     hosts,

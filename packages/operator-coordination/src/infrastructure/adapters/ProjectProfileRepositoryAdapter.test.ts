@@ -5,6 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { ProjectProfileRecord } from '../../domain/coordination-records.js';
 import { ProjectProfileRevisionConflictError } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
+import {
+  ReadOnlyStateStoreError,
+  StateFileUnreadableError,
+  StateFileUnreadableReadOnlyError,
+} from './file-store.js';
 import { ProjectProfileRepositoryAdapter } from './ProjectProfileRepositoryAdapter.adapter.js';
 
 describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () => {
@@ -199,5 +204,47 @@ describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () =>
       { id: 'proj-a', status: 'active' },
       { id: 'proj-z', status: 'retired' },
     ]);
+  });
+});
+
+// CO29a-ro2: the relaunch commands read profiles through a read-only
+// repository instance: an unreadable store file is never quarantined there.
+describe('ProjectProfileRepositoryAdapter readOnly', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-proj-profile-readonly-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('read-only throws the typed unreadable error and writes nothing on a corrupt store file', async () => {
+    const garbage = '{ not json CANARY-bytes';
+    const file = path.join(tempDir, 'project-profiles.json');
+    await fs.writeFile(file, garbage, 'utf8');
+
+    const readOnly = new ProjectProfileRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+    await expect(readOnly.listProfiles()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+    expect(await fs.readFile(file, 'utf8')).toBe(garbage);
+    await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readOnly.saveProfile({} as ProjectProfileRecord)).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
+    expect(await fs.readFile(file, 'utf8')).toBe(garbage);
+  });
+
+  it('read-only reads a missing store file as an empty list', async () => {
+    const readOnly = new ProjectProfileRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+    await expect(readOnly.listProfiles()).resolves.toEqual([]);
+  });
+
+  it('the default reader still quarantines a corrupt store file', async () => {
+    const garbage = '{ not json CANARY-bytes';
+    await fs.writeFile(path.join(tempDir, 'project-profiles.json'), garbage, 'utf8');
+    const writable = new ProjectProfileRepositoryAdapter({ stateDir: tempDir });
+    await expect(writable.listProfiles()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const copies = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(copies).toHaveLength(1);
+    expect(await fs.readFile(path.join(tempDir, 'quarantine', copies[0]), 'utf8')).toBe(garbage);
   });
 });

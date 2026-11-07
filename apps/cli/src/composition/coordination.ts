@@ -98,6 +98,19 @@ export function composeCoordination(input: ComposeCoordinationInput) {
   // --- operator-coordination -------------------------------------------------
 
   const projectProfileRepository = new ProjectProfileRepositoryAdapter({ stateDir });
+  // CO29a-ro2: the relaunch commands' profile listing is read-only: over a
+  // state directory it is a second repository instance over the same state
+  // file whose reader never quarantines — an unreadable
+  // `project-profiles.json` throws the typed
+  // `StateFileUnreadableReadOnlyError`, which the relaunch commands map to
+  // their unreadable outcomes. Without a state directory every store is
+  // in-memory and nothing can be corrupt, so the writable repository itself
+  // serves the relaunch commands. Every other command keeps the writable
+  // repository's quarantining reader as before.
+  const relaunchProfileRepository =
+    stateDir === undefined
+      ? projectProfileRepository
+      : new ProjectProfileRepositoryAdapter({ stateDir, readOnly: true });
   const coordinationRequestRepository = new CoordinationRequestRepositoryAdapter({ stateDir });
   // Owner-recorded decision answers, one `<requestId>.json` per request. An
   // absent or grantless answer stays `awaiting-decision`; nothing is upgraded.
@@ -155,6 +168,9 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     }),
     retireProjectProfile: new RetireProjectProfileUseCase({ profileRepo: projectProfileRepository }),
     listProjectProfiles: new ListProjectProfilesUseCase({ profileRepo: projectProfileRepository }),
+    // CO29a-ro2: only the relaunch commands read profiles through this
+    // read-only listing; every other consumer uses `listProjectProfiles`.
+    listProjectProfilesReadOnly: new ListProjectProfilesUseCase({ profileRepo: relaunchProfileRepository }),
     inspectProjectProfile: new InspectProjectProfileUseCase({ profileRepo: projectProfileRepository }),
     recordProjectProbe: new RecordProjectProbeUseCase({ profileRepo: projectProfileRepository }),
     inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase({

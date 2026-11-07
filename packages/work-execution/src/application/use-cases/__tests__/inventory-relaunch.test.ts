@@ -751,31 +751,147 @@ describe('InventoryRelaunchUseCase', () => {
     });
   });
 
-  it('reads a throwing halt marker as halted and a throwing lease as unknown', async () => {
+  // CO29a-ro2: any read failure that is not genuine absence (ENOENT) makes
+  // the whole inventory answer `unknown` — a throwing halt or lease read is
+  // never guessed as halted or left `inventoried` with an unknown lease.
+  it('answers unknown with both reason codes when the halt and lease reads throw non-absence errors', async () => {
     const useCase = new InventoryRelaunchUseCase({
       runRepo: { list: async () => [] },
       attemptRepo: { listAllAttempts: async () => [] },
       workspace: { listWorktrees: async () => ({ outcome: 'listed', worktrees: [] }) },
       halt: {
         async read() {
-          throw new Error('unreadable');
+          throw Object.assign(new Error('unreadable halt'), { code: 'EACCES' });
         },
       },
       driverLease: {
         async read() {
-          throw new Error('unreadable');
+          throw Object.assign(new Error('unreadable lease'), { code: 'EACCES' });
+        },
+      },
+      computeDigest: () => 'a'.repeat(64),
+    });
+    await expect(useCase.inventoryRelaunch({ nowIso: NOW, hostName: null, clones: [] })).resolves.toEqual({
+      outcome: 'unknown',
+      reasons: ['halt-unreadable', 'lease-unreadable'],
+    });
+  });
+
+  it('answers unknown with halt-unreadable when only the halt read throws an EACCES-style error', async () => {
+    const useCase = new InventoryRelaunchUseCase({
+      runRepo: { list: async () => [] },
+      attemptRepo: { listAllAttempts: async () => [] },
+      workspace: { listWorktrees: async () => ({ outcome: 'listed', worktrees: [] }) },
+      halt: {
+        async read() {
+          throw Object.assign(new Error('unreadable halt'), { code: 'EACCES' });
+        },
+      },
+      driverLease: { read: async () => null },
+      computeDigest: () => 'a'.repeat(64),
+    });
+    await expect(useCase.inventoryRelaunch({ nowIso: NOW, hostName: null, clones: [] })).resolves.toEqual({
+      outcome: 'unknown',
+      reasons: ['halt-unreadable'],
+    });
+  });
+
+  it('answers unknown with lease-unreadable when only the lease read throws an EACCES-style error', async () => {
+    const useCase = new InventoryRelaunchUseCase({
+      runRepo: { list: async () => [] },
+      attemptRepo: { listAllAttempts: async () => [] },
+      workspace: { listWorktrees: async () => ({ outcome: 'listed', worktrees: [] }) },
+      halt: { read: async () => ({ state: 'clear' as const, record: null }) },
+      driverLease: {
+        async read() {
+          throw Object.assign(new Error('unreadable lease'), { code: 'EACCES' });
+        },
+      },
+      computeDigest: () => 'a'.repeat(64),
+    });
+    await expect(useCase.inventoryRelaunch({ nowIso: NOW, hostName: null, clones: [] })).resolves.toEqual({
+      outcome: 'unknown',
+      reasons: ['lease-unreadable'],
+    });
+  });
+
+  it('plans normally when the halt and lease reads report genuine absence (ENOENT)', async () => {
+    const useCase = new InventoryRelaunchUseCase({
+      runRepo: { list: async () => [] },
+      attemptRepo: { listAllAttempts: async () => [] },
+      workspace: { listWorktrees: async () => ({ outcome: 'listed', worktrees: [] }) },
+      halt: {
+        async read() {
+          throw Object.assign(new Error('absent marker'), { code: 'ENOENT' });
+        },
+      },
+      driverLease: {
+        async read() {
+          throw Object.assign(new Error('absent lease'), { code: 'ENOENT' });
         },
       },
       computeDigest: () => 'a'.repeat(64),
     });
     const result = await useCase.inventoryRelaunch({ nowIso: NOW, hostName: null, clones: [] });
     if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
-    expect(result.conductor).toEqual({ halted: true, driverLease: 'unknown', runCount: 0 });
-    expect(result.riskFlags).toEqual([
-      { code: 'conductor-halted', count: 1 },
-      { code: 'driver-lease-unknown', count: 1 },
-    ]);
+    expect(result.conductor).toEqual({ halted: false, driverLease: 'absent', runCount: 0 });
+    expect(result.riskFlags).toEqual([]);
   });
+
+  // CO29a-ro2: an unreadable halt marker or driver lease is never a value.
+  it('answers unknown with halt-unreadable when the halt marker reads unreadable', async () => {
+    const useCase = new InventoryRelaunchUseCase({
+      runRepo: { list: async () => [] },
+      attemptRepo: { listAllAttempts: async () => [] },
+      workspace: { listWorktrees: async () => ({ outcome: 'listed', worktrees: [] }) },
+      halt: { read: async () => ({ state: 'unreadable' as const }) },
+      driverLease: { read: async () => null },
+      computeDigest: () => 'a'.repeat(64),
+    });
+    await expect(useCase.inventoryRelaunch({ nowIso: NOW, hostName: null, clones: [] })).resolves.toEqual({
+      outcome: 'unknown',
+      reasons: ['halt-unreadable'],
+    });
+  });
+
+  it('answers unknown with lease-unreadable when the lease read throws the typed unreadable error', async () => {
+    const useCase = new InventoryRelaunchUseCase({
+      runRepo: { list: async () => [] },
+      attemptRepo: { listAllAttempts: async () => [] },
+      workspace: { listWorktrees: async () => ({ outcome: 'listed', worktrees: [] }) },
+      halt: { read: async () => ({ state: 'clear' as const, record: null }) },
+      driverLease: {
+        async read() {
+          throw Object.assign(new Error('unreadable lease'), { name: 'StateFileUnreadableReadOnlyError' });
+        },
+      },
+      computeDigest: () => 'a'.repeat(64),
+    });
+    await expect(useCase.inventoryRelaunch({ nowIso: NOW, hostName: null, clones: [] })).resolves.toEqual({
+      outcome: 'unknown',
+      reasons: ['lease-unreadable'],
+    });
+  });
+
+  it('answers unknown with both reason codes when halt and lease are both unreadable', async () => {
+    const useCase = new InventoryRelaunchUseCase({
+      runRepo: { list: async () => [] },
+      attemptRepo: { listAllAttempts: async () => [] },
+      workspace: { listWorktrees: async () => ({ outcome: 'listed', worktrees: [] }) },
+      halt: { read: async () => ({ state: 'unreadable' as const }) },
+      driverLease: {
+        async read() {
+          throw Object.assign(new Error('unreadable lease'), { name: 'StateFileUnreadableError' });
+        },
+      },
+      computeDigest: () => 'a'.repeat(64),
+    });
+    await expect(useCase.inventoryRelaunch({ nowIso: NOW, hostName: null, clones: [] })).resolves.toEqual({
+      outcome: 'unknown',
+      reasons: ['halt-unreadable', 'lease-unreadable'],
+    });
+  });
+
   it('keeps a conducted claim the branch disproved when the runner reports its own session running there', async () => {
     const h = harness({
       runs: [{ ...RUN, attemptIds: ['attempt-1'] }],

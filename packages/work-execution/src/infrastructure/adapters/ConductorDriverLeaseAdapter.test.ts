@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ReadOnlyStateStoreError, StateFileUnreadableError } from './file-store.js';
+import { ReadOnlyStateStoreError, StateFileUnreadableError, StateFileUnreadableReadOnlyError } from './file-store.js';
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -196,13 +196,15 @@ describe('ConductorDriverLeaseAdapter read-only mode', () => {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('read-only leaves a malformed marker untouched and reads null while the default quarantines', async () => {
+  it('read-only leaves a malformed marker untouched and refuses it as unreadable while the default quarantines', async () => {
     const garbage = '{ not json CANARY-bytes';
     const file = path.join(tempDir, 'conductor-driver-lease.json');
     await fs.writeFile(file, garbage, 'utf8');
 
+    // CO29a-ro2: unreadable bytes are never a value: the read-only read
+    // throws the typed unreadable error and touches nothing on disk.
     const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
-    expect(await readonlyAdapter.read()).toBeNull();
+    await expect(readonlyAdapter.read()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
     expect(await fs.readFile(file, 'utf8')).toBe(garbage);
     await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
       code: 'ENOENT',

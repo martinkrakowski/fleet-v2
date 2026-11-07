@@ -393,6 +393,11 @@ describe('deriveConductorSchedule', () => {
     expect(withDriverLease.driverLeaseLapsed).toBe(true);
   });
 
+  it('projects an unreadable driver lease as unknown: driverLeaseLapsed null, never false or true', () => {
+    const schedule = deriveConductorSchedule(facts({ driverLease: 'unreadable' }), NOW);
+    expect(schedule.driverLeaseLapsed).toBeNull();
+  });
+
   it('redacts secret-shaped reservation and lease fields from the output', () => {
     const run = runRecord({
       runId: RUN_A,

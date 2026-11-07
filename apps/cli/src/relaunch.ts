@@ -12,6 +12,7 @@
 
 import { optStr, type CommandHandler, type Payload } from './commands/payload.js';
 import type { FleetCliRuntime } from './composition.js';
+import type { ListProjectProfilesUseCase } from '@fleet/operator-coordination';
 import type {
   AttemptRunnerRecord,
   InventoryRelaunchResult,
@@ -47,14 +48,26 @@ const UNREADABLE: InventoryRelaunchResult = { outcome: 'refused', reason: 'recor
 const PROFILES_UNREADABLE: PlanRelaunchResult = { outcome: 'unknown', reasons: ['profile-records-unreadable'] };
 
 /**
+ * CO29a-ro2: the production composition exposes a read-only profile listing
+ * (`listProjectProfilesReadOnly`) that never quarantines an unreadable
+ * `project-profiles.json`; the relaunch commands prefer it. Hand-rolled test
+ * runtimes carry only the writable listing, so it is the fallback.
+ */
+type RelaunchCoordination = FleetCliRuntime['coordination'] & {
+  readonly listProjectProfilesReadOnly?: ListProjectProfilesUseCase;
+};
+
+/**
  * D18: only the clones of active project profiles are read; never a host-wide
  * scan. An unreadable profile listing is not "no clones": it is null, and the
  * caller refuses rather than reporting zero hosts.
  */
 async function activeClones(hostName: string | null, rt: FleetCliRuntime): Promise<RelaunchCloneRef[] | null> {
-  let profiles: Awaited<ReturnType<FleetCliRuntime['coordination']['listProjectProfiles']['listProjectProfiles']>>;
+  const coordination = rt.coordination as RelaunchCoordination;
+  const lister = coordination.listProjectProfilesReadOnly ?? coordination.listProjectProfiles;
+  let profiles: Awaited<ReturnType<typeof lister.listProjectProfiles>>;
   try {
-    profiles = await rt.coordination.listProjectProfiles.listProjectProfiles({ status: 'active' });
+    profiles = await lister.listProjectProfiles({ status: 'active' });
   } catch {
     return null;
   }

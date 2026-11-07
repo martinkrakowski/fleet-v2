@@ -39,7 +39,7 @@ export interface ApplyPendingResumeRequest {
 export type ApplyPendingResumeResult =
   | { readonly outcome: 'none' }
   | { readonly outcome: 'resumed'; readonly to: LaneRunStateValue; readonly key: string }
-  | { readonly outcome: 'refused'; readonly key: string | null; readonly reason: LaneRunResumeRefusal | 'save-refused' | 'journal-refused' | 'run-not-found' | 'forge-ambiguous' };
+  | { readonly outcome: 'refused'; readonly key: string | null; readonly reason: LaneRunResumeRefusal | 'save-refused' | 'journal-refused' | 'invalid-request' | 'run-not-found' | 'forge-ambiguous' };
 
 export interface ResumeLaneRunPort {
   requestResume(request: RequestResumeRequest): Promise<RequestResumeResult>;

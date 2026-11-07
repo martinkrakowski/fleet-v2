@@ -6,6 +6,7 @@
 # relative weights. 0-second runs are recorded as 1.
 # <path> <linux-seconds> <macos-seconds>
 tests/agy-round.test.sh 3 3
+tests/agy-run-ephemeral-home.test.sh 1 1
 tests/agy-run.test.sh 17 17
 tests/check-duplication.test.sh 1 1
 tests/e2e-ssh-fixture.test.sh 1 1

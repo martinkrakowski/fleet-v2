@@ -1089,7 +1089,7 @@ async function writeHost(
   if (movedFrom.length > 0) {
     out.stdout(
       `lanes now run on ${screenHostKey(name)} (the lane-runner role moved from ${movedFrom
-        .map(screenHostKey)
+        .map((key) => screenHostKey(key))
         .join(", ")})\n`,
     );
   }

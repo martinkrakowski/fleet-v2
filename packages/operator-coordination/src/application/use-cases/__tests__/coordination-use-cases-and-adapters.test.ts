@@ -1331,6 +1331,7 @@ describe('RequestScopedDecisionUseCase', () => {
     expectedHeadSha: 'abc123',
     proposalDigest: 'digest-1',
     policyRevision: 'policy-7',
+    attemptId: 'att-1',
     nowIso: NOW_ISO,
   };
 

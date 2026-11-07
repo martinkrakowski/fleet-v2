@@ -40,6 +40,7 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
       expectedHeadSha: '1111111111111111111111111111111111111111',
       proposalDigest: 'digest-1',
       policyRevision: 'pol-1',
+      attemptId: 'att-new-1',
     });
 
     expect(result.outcome).toBe('requested');
@@ -83,6 +84,7 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
       expectedHeadSha: '2222222222222222222222222222222222222222',
       proposalDigest: 'digest-new',
       policyRevision: 'pol-2',
+      attemptId: 'att-dup-1',
     });
 
     expect(result.outcome).toBe('rejected');

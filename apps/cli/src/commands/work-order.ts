@@ -29,6 +29,16 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       ) {
         throw new CliUsageError('work-order register --base-branch needs a branch');
       }
+      // A given --brief-request-ref or --intent-id must carry a value the same way.
+      if (
+        Object.hasOwn(p, 'briefRequestRef') &&
+        (typeof p.briefRequestRef !== 'string' || p.briefRequestRef.trim() === '')
+      ) {
+        throw new CliUsageError('work-order register --brief-request-ref needs a brief request reference');
+      }
+      if (Object.hasOwn(p, 'intentId') && (typeof p.intentId !== 'string' || p.intentId.trim() === '')) {
+        throw new CliUsageError('work-order register --intent-id needs an intent id');
+      }
       return rt.execution.registerWorkOrder.registerWorkOrder({
         workOrderId: str(p, 'workOrderId'),
         projectId: str(p, 'projectId'),
@@ -45,6 +55,22 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
             ? undefined
             : enumOf(p, 'risk', WORK_ORDER_RISKS, 'work-order register --risk'),
         supersedesWorkOrderId: optStr(p, 'supersedesWorkOrderId'),
+        briefRequestRef: optStr(p, 'briefRequestRef'),
+        intentId: optStr(p, 'intentId'),
+        nowIso: optStr(p, 'nowIso'),
+      });
+    },
+    held: async (p, rt) => {
+      // A given --project-id or --now-iso must carry a value: a bare flag parses as `true`, and an
+      // empty --project-id would widen the listing to every project.
+      if (Object.hasOwn(p, 'projectId') && (typeof p.projectId !== 'string' || p.projectId.trim() === '')) {
+        throw new CliUsageError('work-order held --project-id needs a project id');
+      }
+      if (Object.hasOwn(p, 'nowIso') && (typeof p.nowIso !== 'string' || p.nowIso.trim() === '')) {
+        throw new CliUsageError('work-order held --now-iso needs an ISO timestamp');
+      }
+      return rt.execution.listHeldWorkOrders.listHeldWorkOrders({
+        projectId: optStr(p, 'projectId'),
         nowIso: optStr(p, 'nowIso'),
       });
     },

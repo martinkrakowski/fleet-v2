@@ -464,3 +464,75 @@ describe("hosts: the confirmation prompt never carries a token", () => {
     expect(leakedWindows(`${stdout}${stderr}`, [T, T2])).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// String values read from the files are screened too (HN1b fix round 1)
+// ---------------------------------------------------------------------------
+
+describe("hosts: string values read from the files are screened", () => {
+  it("list screens a 36-character token in sshAlias", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const hosts = baseHosts(path.join(dir, "worktrees"));
+    (hosts.lanehost as Record<string, unknown>).sshAlias = T;
+    writeFileSync(
+      file,
+      `${JSON.stringify({ schemaVersion: 2, forge: { mode: "none" }, hosts }, null, 2)}\n`,
+      "utf8",
+    );
+    const { code, stdout, stderr } = await run(["list"], file, "prompt-y");
+    expect(code).toBe(0);
+    expect(leakedWindows(`${stdout}\n${stderr}`, [T])).toEqual([]);
+  });
+
+  it("list screens a 36-character token in worktreeRoot", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const hosts = baseHosts(path.join(dir, "worktrees"));
+    (hosts.lanehost as Record<string, unknown>).worktreeRoot = `${path.join(dir, "worktrees")}/${T}`;
+    writeFileSync(
+      file,
+      `${JSON.stringify({ schemaVersion: 2, forge: { mode: "none" }, hosts }, null, 2)}\n`,
+      "utf8",
+    );
+    const { code, stdout, stderr } = await run(["list"], file, "prompt-y");
+    expect(code).toBe(0);
+    expect(leakedWindows(`${stdout}\n${stderr}`, [T])).toEqual([]);
+  });
+
+  it("add --from-descriptor screens a 36-character token in a descriptor field", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const root = path.join(dir, "worktrees");
+    writeFileSync(
+      file,
+      `${JSON.stringify(
+        { schemaVersion: 2, forge: { mode: "none" }, hosts: baseHosts(root) },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const descriptor = path.join(dir, "descriptor.json");
+    writeFileSync(
+      descriptor,
+      `${JSON.stringify(
+        {
+          port: 4170,
+          worktreeRoot: `${root}/${T}`,
+          tools: [{ name: "opencode", version: "1.0.0" }],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const { code, stdout, stderr } = await run(
+      ["add", "newhost", "--from-descriptor", descriptor, ...VERIFIER],
+      file,
+      "yes-flag",
+    );
+    expect([0, 1, 2]).toContain(code);
+    expect(leakedWindows(`${stdout}\n${stderr}`, [T])).toEqual([]);
+  });
+});

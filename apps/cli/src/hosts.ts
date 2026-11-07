@@ -603,6 +603,12 @@ function screenHostsText(text: string, keys: readonly string[]): string {
 export interface ScreenedHostsIo extends CliIo {
   /** The same screen for text that does not travel through stdout or stderr. */
   readonly screen: (text: string) => string;
+  /**
+   * Add strings a subcommand read later (a descriptor file's keys and string
+   * leaves) to the screen's keys; every line printed afterwards is screened
+   * against them too (HN1b fix round 1).
+   */
+  readonly addKeys: (keys: readonly string[]) => void;
 }
 
 /**
@@ -618,7 +624,12 @@ export function screenedHostsIo(
   io: CliIo,
   keys: readonly string[],
 ): ScreenedHostsIo {
-  const texts = screenKeyTexts(keys);
+  const known: string[] = [...keys];
+  let texts = screenKeyTexts(known);
+  const addKeys = (added: readonly string[]): void => {
+    known.push(...added);
+    texts = screenKeyTexts(known);
+  };
   const screen = (text: string): string =>
     text
       .split(/(?<=\n)/)
@@ -626,6 +637,7 @@ export function screenedHostsIo(
       .join("");
   return {
     screen,
+    addKeys,
     stdout: (text) => {
       for (const piece of text.split(/(?<=\n)/)) {
         io.stdout(screenHostsText(piece, texts));
@@ -639,14 +651,50 @@ export function screenedHostsIo(
   };
 }
 
-/** Every object key of the installation file: host keys and any key under one. */
-function installationKeys(value: unknown, depth = 0): readonly string[] {
-  if (depth > 8 || typeof value !== "object" || value === null) {
-    return [];
+/**
+ * Every object key AND every string leaf of the installation file (HN1b fix
+ * round 1): host keys and any key under one, plus the string values the file
+ * carries — an `sshAlias`, a worktree root, a capability name — so a long
+ * opaque token run inside a value is screened like one inside a key. The walk
+ * is bounded (depth 8, at most 2000 visited nodes) and never throws: a walk
+ * that hits the bound returns what it has collected and continues.
+ */
+const INSTALLATION_WALK_MAX_DEPTH = 8;
+const INSTALLATION_WALK_MAX_NODES = 2000;
+
+function installationKeys(value: unknown): readonly string[] {
+  const found: string[] = [];
+  let visited = 0;
+  const pending: Array<{ node: unknown; depth: number }> = [
+    { node: value, depth: 0 },
+  ];
+  while (pending.length > 0 && visited < INSTALLATION_WALK_MAX_NODES) {
+    const { node, depth } = pending.pop() as { node: unknown; depth: number };
+    visited += 1;
+    if (depth > INSTALLATION_WALK_MAX_DEPTH) {
+      continue;
+    }
+    if (typeof node === "string") {
+      found.push(node);
+      continue;
+    }
+    if (typeof node !== "object" || node === null) {
+      continue;
+    }
+    let entries: readonly unknown[];
+    try {
+      entries = Array.isArray(node)
+        ? node
+        : Object.values(node as Record<string, unknown>);
+    } catch {
+      // An exotic object that refuses enumeration: keep what we have.
+      continue;
+    }
+    for (const entry of entries) {
+      pending.push({ node: entry, depth: depth + 1 });
+    }
   }
-  const entries = Array.isArray(value) ? value : Object.values(value);
-  const own = Array.isArray(value) ? [] : Object.keys(value);
-  return [...own, ...entries.flatMap((entry) => installationKeys(entry, depth + 1))];
+  return found;
 }
 
 /** Diff the file as it sits against the candidate as the write would put it. */
@@ -714,7 +762,7 @@ async function writeHost(
   mode: "add" | "edit",
   args: HostsArgs,
   file: string,
-  out: CliIo,
+  out: ScreenedHostsIo,
   options: HostsCliOptions,
 ): Promise<number> {
   const name = args.name;
@@ -774,6 +822,9 @@ async function writeHost(
       );
       return 1;
     }
+    // The descriptor's keys and string leaves join the screen before any
+    // error or echo can carry one of its values (HN1b fix round 1).
+    out.addKeys(installationKeys(descriptorValue));
     const parsed = parseHostDescriptor(descriptorValue);
     if (!parsed.ok) {
       out.stderr("the descriptor is refused:\n");
@@ -1335,7 +1386,7 @@ function parseDaemonArgs(tokens: readonly string[]): ParsedDaemonArgs {
 async function daemonCommand(
   argv: readonly string[],
   file: string,
-  out: CliIo,
+  out: ScreenedHostsIo,
   options: HostsCliOptions,
 ): Promise<number> {
   const parsed = parseDaemonArgs(argv);

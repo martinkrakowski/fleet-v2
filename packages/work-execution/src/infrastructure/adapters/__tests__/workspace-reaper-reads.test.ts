@@ -148,8 +148,157 @@ describe('worktree listing and removal-fact reads over a fake executor', () => {
       ],
     });
     expect(calls.map((call) => call.argv)).toEqual([
-      ['git', '-C', CLONE, 'worktree', 'list', '--porcelain'],
+      [
+        'env',
+        'GIT_ALLOW_PROTOCOL=none',
+        'GIT_NO_LAZY_FETCH=1',
+        'GIT_TERMINAL_PROMPT=0',
+        'git',
+        '--no-optional-locks',
+        '-c',
+        'core.hooksPath=/dev/null',
+        '-c',
+        'core.fsmonitor=false',
+        '-c',
+        'protocol.allow=never',
+        '-C',
+        CLONE,
+        'worktree',
+        'list',
+        '--porcelain',
+      ],
     ]);
+  });
+
+  it('refuses or answers unknown without throwing on null, primitive, throwing-getter, oversized-path, and dash-prefixed defaultRef inputs', async () => {
+    const { executor, calls } = fakeExecutor();
+    const adapter = new WorkspaceAdapter({ executorForRecordedHost: executorForRecordedHost(executor) });
+    const oversized = `/${'a'.repeat(4096)}`;
+    const throwingGetter = (field: string): unknown =>
+      Object.defineProperty({}, field, {
+        enumerable: true,
+        get() {
+          throw new Error('getter exploded');
+        },
+      });
+
+    const listInputs: unknown[] = [
+      null,
+      undefined,
+      42,
+      'path',
+      [],
+      throwingGetter('repositoryRoot'),
+      { recordedHost: RECORDED_HOST },
+      { repositoryRoot: 7, recordedHost: RECORDED_HOST },
+      listRequest({ repositoryRoot: oversized }),
+    ];
+    for (const input of listInputs) {
+      await expect(adapter.listWorktrees(input as never)).resolves.toEqual({
+        outcome: 'unknown',
+        reason: 'invalid-request',
+      });
+    }
+
+    const inspectInputs: unknown[] = [
+      null,
+      undefined,
+      42,
+      'path',
+      [],
+      throwingGetter('worktreePath'),
+      { repositoryRoot: CLONE, defaultRef: DEFAULT_REF },
+      inspectRequest({ repositoryRoot: oversized }),
+      inspectRequest({ worktreePath: oversized }),
+      inspectRequest({ defaultRef: '--upload-pack=evil' }),
+      inspectRequest({ defaultRef: '-x' }),
+      inspectRequest({ defaultRef: '' }),
+      inspectRequest({ defaultRef: 'origin/main with space' }),
+      inspectRequest({ defaultRef: 'a'.repeat(257) }),
+      inspectRequest({ defaultRef: 7 as never }),
+    ];
+    for (const input of inspectInputs) {
+      await expect(adapter.inspectWorktreeForRemoval(input as never)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('answers unknown, never throws, when a git read rejects inside listWorktrees or inspectWorktreeForRemoval', async () => {
+    const throwing: CommandExecutorPort = {
+      run: async () => {
+        throw new Error('spawn exploded');
+      },
+    };
+    const adapter = new WorkspaceAdapter({ executorForRecordedHost: executorForRecordedHost(throwing) });
+    await expect(adapter.listWorktrees(listRequest())).resolves.toEqual({
+      outcome: 'unknown',
+      reason: 'git worktree list did not report an exit code',
+    });
+    await expect(adapter.inspectWorktreeForRemoval(inspectRequest())).resolves.toEqual({
+      outcome: 'unknown',
+      reason: 'git worktree list did not report an exit code',
+    });
+  });
+
+  it('runs every git read in listWorktrees and inspectWorktreeForRemoval with network, lazy-fetch, hooks, and fsmonitor disabled and bounded maxBufferBytes', async () => {
+    const { executor, calls } = fakeExecutor({
+      [LIST_MARKER]: { stdout: worktreeListWith() },
+      [PWD_MARKER]: { stdout: `${CLONE}\n` },
+      [MERGE_BASE_MARKER]: { exitCode: 0 },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      [REFLOG_MARKER]: { stdout: '2026-01-01T00:00:00+00:00\n' },
+      [INDEX_PATH_MARKER]: { stdout: `${WORKTREE}/.git/index\n` },
+      [FIND_MARKER]: { stdout: '1767225600\n' },
+      [STAT_GNU_MARKER]: { stdout: '1767225600\n' },
+      [DU_MARKER]: { stdout: `8\t${WORKTREE}\n` },
+    });
+    const adapter = new WorkspaceAdapter({ executorForRecordedHost: executorForRecordedHost(executor) });
+    const listed = await adapter.listWorktrees(listRequest());
+    expect(listed.outcome).toBe('listed');
+    const inspected = await adapter.inspectWorktreeForRemoval(inspectRequest());
+    expect(inspected.outcome).toBe('inspected');
+
+    const hardenedPrefix = [
+      'env',
+      'GIT_ALLOW_PROTOCOL=none',
+      'GIT_NO_LAZY_FETCH=1',
+      'GIT_TERMINAL_PROMPT=0',
+      'git',
+      '--no-optional-locks',
+      '-c',
+      'core.hooksPath=/dev/null',
+      '-c',
+      'core.fsmonitor=false',
+      '-c',
+      'protocol.allow=never',
+    ];
+    const gitCalls = calls.filter((call) => call.argv.includes('git'));
+    // list (x2: list + inspect), merge-base, status, git-dir, reflog, index path.
+    expect(gitCalls.length).toBeGreaterThanOrEqual(7);
+    for (const call of gitCalls) {
+      expect(call.argv.slice(0, hardenedPrefix.length)).toEqual(hardenedPrefix);
+      expect(call.options?.maxBufferBytes).toBe(1_048_576);
+    }
+    const subcommands = gitCalls.map((call) => call.argv.slice(hardenedPrefix.length + 2).join(' '));
+    expect(subcommands).toEqual(
+      expect.arrayContaining([
+        'worktree list --porcelain',
+        `merge-base --is-ancestor ${HEAD} ${DEFAULT_REF}`,
+        'status --porcelain --untracked-files=all',
+        'rev-parse --git-dir',
+        'reflog show -1 --date=iso-strict --format=%gD HEAD',
+        'rev-parse --git-path index',
+      ]),
+    );
+    // The activity and size reads are bounded as well.
+    for (const call of calls.filter((entry) => entry.argv[0] === 'du' || entry.argv[0] === 'find')) {
+      expect(call.options?.maxBufferBytes).toBe(1_048_576);
+    }
   });
 
   it('listWorktrees answers unknown when git exits 128', async () => {

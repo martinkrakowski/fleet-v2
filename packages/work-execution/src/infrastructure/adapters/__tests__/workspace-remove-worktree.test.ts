@@ -907,6 +907,23 @@ describe('removeWorktree manifest gate and hardening (C2\')', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('refuses invalid-request without throwing when manifest.kind is an unknown enum value', async () => {
+    for (const kind of ['bypass', '', 'Sealed', 'force-unsealed ', 7, null, undefined]) {
+      const { result, calls } = await removeWith(
+        CLEAN_CANNED,
+        makeRequest({ manifest: { kind: kind as never } as unknown as RemoveWorktreeManifestCheck }),
+      );
+      expect(result, String(kind)).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+      expect(calls, String(kind)).toHaveLength(0);
+    }
+    const { result, calls } = await removeWith(
+      CLEAN_CANNED,
+      makeRequest({ manifest: { kind: 'bypass' as never } as RemoveWorktreeManifestCheck }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(calls).toHaveLength(0);
+  });
+
   it('refuses oversized paths and fields before running any command and sets maxBufferBytes on subprocess reads', async () => {
     const oversized = makeRequest({
       worktreePath: `/srv/fleet/worktrees/${'w'.repeat(5000)}`,

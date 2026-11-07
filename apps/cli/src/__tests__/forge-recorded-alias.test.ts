@@ -402,6 +402,8 @@ describe('forge head verification resolves the recorded host through the helper'
             mergedAt: null,
             number: 7,
             state: 'OPEN',
+            isCrossRepository: false,
+            headRepositoryOwner: { login: 'example-owner' },
           }),
           stderr: '',
         };

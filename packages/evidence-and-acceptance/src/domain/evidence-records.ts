@@ -23,6 +23,12 @@ export interface VerificationReceiptRecord {
   readonly exitCode: number | null;
   // Optional; records written before V1 have none.
   readonly coverage?: CheckCoverage;
+  /**
+   * PT1a: the repo-relative file a failing check names, screened (`screenFailingFile`); null when
+   * the check failed and no file could be determined. Absent on passing checks and on records
+   * written before PT1a.
+   */
+  readonly failingFile?: string | null;
   readonly evidenceRef: string;
   readonly policyRevision: string;
   readonly completedAtIso: string;
@@ -34,6 +40,36 @@ export type FindingSeverity = 'blocker' | 'major' | 'minor' | 'nit';
 /** The review kinds of the conductor plan §3.3; a receipt without one reads as `code-review` (§3.4). */
 export const REVIEW_KINDS = ['brief-check', 'code-review', 'pre-merge'] as const;
 export type ReviewKind = (typeof REVIEW_KINDS)[number];
+
+/**
+ * The fixed cause codes of an `unknown` review answer (RV2): an empty reply, a
+ * reply without a parseable verdict, and a FAIL / FIX FIRST verdict with zero
+ * findings. The code is a fixed token, never reviewer text.
+ */
+export const REVIEW_UNKNOWN_REASONS = [
+  'empty',
+  'unparseable-verdict',
+  'no-findings-on-fail',
+] as const;
+export type ReviewUnknownReason = (typeof REVIEW_UNKNOWN_REASONS)[number];
+
+/**
+ * The accepted chain-name set of work-execution's base-branch.ts `CHAIN_PATTERN` (the chain name after `chain/`), mirrored
+ * locally (contexts never import across): one or more lowercase alphanumeric
+ * segments joined by single dashes, and `chain/` + the name stays within the
+ * chain domain's 200-character base-branch cap (so the name caps at 194).
+ */
+const CHAIN_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const CHAIN_NAME_MAX_LENGTH = 194;
+
+export function isValidChainName(value: unknown): boolean {
+  return (
+    typeof value === 'string' &&
+    value.length >= 1 &&
+    value.length <= CHAIN_NAME_MAX_LENGTH &&
+    CHAIN_NAME_PATTERN.test(value)
+  );
+}
 
 /** What a receipt is about: an attempt at one head, a chain at its integration head, or a brief package at its base commit. */
 export const RECEIPT_SUBJECT_KINDS = ['attempt', 'chain', 'brief'] as const;
@@ -86,6 +122,8 @@ export interface ReviewReceiptRecord {
   readonly requestId?: string;
   /** What the receipt is about; absent on receipts recorded before subjects, read as the attempt (`receiptSubjectOf`). */
   readonly subject?: ReceiptSubject;
+  /** Fixed cause code when `result === 'unknown'`; absent on pass/fail and pre-RV2 receipts. */
+  readonly unknownReason?: ReviewUnknownReason;
 }
 
 /** Serializable record of one fix or evidence-backed refutation of a finding. */

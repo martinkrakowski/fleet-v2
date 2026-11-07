@@ -9,6 +9,7 @@
 
 import {
   type EvidenceAssessmentRecord,
+  type EvidenceArchivePort,
   type EvidenceResultValue,
   type FindingDispositionRecord,
   type InspectAcceptanceEvidencePort,
@@ -16,13 +17,16 @@ import {
   REVIEW_KINDS,
   REVIEW_REQUEST_ID_PATTERN,
   REVIEW_UNAVAILABLE_CODES,
+  REVIEW_UNKNOWN_REASONS,
   type RecordFindingDispositionPort,
   type RequestIndependentReviewPort,
   type RequestIndependentReviewResult,
   type ReviewKind,
   type ReviewReceiptRecord,
   type ReviewRejection,
+  type ReviewTransportDiagnostic,
   type ReviewUnavailableCode,
+  type ReviewUnknownReason,
   assessmentIdForAttempt,
   assessmentIdForChain,
   attemptIdForChain,
@@ -44,9 +48,12 @@ import type {
 } from '../../application/ports/out/ReviewRequestPort.out-port.js';
 import { parseChainName } from '../../domain/chain-records.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
+import { screenTransportText } from '../../domain/review-transport-screen.js';
 
 /** The only codes that may reach a run-journal `detail`: the evidence context's unavailable codes plus the two post-run rejections. */
 const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([...REVIEW_UNAVAILABLE_CODES, 'not-read-only', 'invalid-receipt']);
+/** The fixed cause codes of an unknown review answer; only these travel onto a summary. */
+const REVIEW_UNKNOWN_REASON_CODES: ReadonlySet<string> = new Set(REVIEW_UNKNOWN_REASONS);
 
 const HEAD_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
@@ -181,6 +188,12 @@ export interface ReviewRequestDelegates {
   readonly inspectAcceptanceEvidence?: InspectAcceptanceEvidencePort['inspectAcceptanceEvidence'];
   /** KF-33b2: the evidence context's disposition recorder, one id per call. */
   readonly recordFindingDisposition?: RecordFindingDispositionPort['recordFindingDisposition'];
+  /**
+   * RV4: archive a screened transport diagnostic under `review-transport-<requestId>`
+   * when a rejected review carried one. Optional: absent skips the archive and the
+   * typed outcome is returned unchanged; an archive failure is swallowed.
+   */
+  readonly archiveEvidence?: EvidenceArchivePort['archiveEvidence'];
 }
 
 function isNonEmptyTrimmed(value: unknown): boolean {
@@ -191,38 +204,117 @@ function isReviewKind(value: unknown): boolean {
   return typeof value === 'string' && REVIEW_KIND_VALUES.includes(value);
 }
 
+/**
+ * Snapshot of the named optional own data fields, read once. An accessor (or a
+ * failing descriptor read) makes the whole snapshot null: a hostile request is
+ * an invalid request, and no getter ever runs.
+ */
+function snapshotOptionalFields(request: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    const read = ownProperty(request, key);
+    if (read === 'unreadable') {
+      return null;
+    }
+    if (read !== undefined) {
+      out[key] = read.value;
+    }
+  }
+  return out;
+}
+
+/** True when `value` is a non-empty dense array whose every index holds a non-blank string (holes are checked by index; `every` skips them). */
+function isDenseNonEmptyStringArray(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (!(index in value) || !isNonEmptyTrimmed(value[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** True for a plain object (prototype Object.prototype or null). */
+function isPlainObject(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 /** A brief longer than 64 KiB is a refusal, never a truncated forward. */
 function briefTextByteLength(briefText: string): number {
   return Buffer.byteLength(briefText, 'utf8');
 }
 
+/**
+ * True when `request` is a plain object whose named fields are the expected
+ * strings: every check is guarded (a null, a non-object, a wrong-typed field,
+ * a sparse array, a throwing getter), so validation never throws. The
+ * patterns are tested only on verified strings — `.test` never coerces.
+ */
+function requestFieldsAreValid(
+  request: unknown,
+  fields: readonly { readonly key: string; readonly kind: 'requestId' | 'head' | 'nonEmpty' | 'reviewKind' }[],
+): boolean {
+  try {
+    if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+      return false;
+    }
+    for (const field of fields) {
+      const value = Object.getOwnPropertyDescriptor(request, field.key)?.value;
+      if (field.kind === 'requestId') {
+        if (typeof value !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(value)) {
+          return false;
+        }
+      } else if (field.kind === 'head') {
+        if (typeof value !== 'string' || !HEAD_PATTERN.test(value)) {
+          return false;
+        }
+      } else if (field.kind === 'reviewKind') {
+        if (!isReviewKind(value)) {
+          return false;
+        }
+      } else if (!isNonEmptyTrimmed(value)) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isValidReviewRequest(request: ReviewRequest): boolean {
-  return (
-    REVIEW_REQUEST_ID_PATTERN.test(request.requestId) &&
-    isReviewKind(request.kind) &&
-    isNonEmptyTrimmed(request.attemptId) &&
-    isNonEmptyTrimmed(request.projectId) &&
-    isNonEmptyTrimmed(request.policyRevision) &&
-    isNonEmptyTrimmed(request.implementerModel) &&
-    isNonEmptyTrimmed(request.reviewerModel) &&
-    HEAD_PATTERN.test(request.candidateHeadSha)
-  );
+  return requestFieldsAreValid(request, [
+    { key: 'requestId', kind: 'requestId' },
+    { key: 'kind', kind: 'reviewKind' },
+    { key: 'attemptId', kind: 'nonEmpty' },
+    { key: 'projectId', kind: 'nonEmpty' },
+    { key: 'policyRevision', kind: 'nonEmpty' },
+    { key: 'implementerModel', kind: 'nonEmpty' },
+    { key: 'reviewerModel', kind: 'nonEmpty' },
+    { key: 'candidateHeadSha', kind: 'head' },
+  ]);
 }
 
 function isValidFindReceiptRequest(request: FindReviewReceiptRequest): boolean {
-  return (
-    REVIEW_REQUEST_ID_PATTERN.test(request.requestId) &&
-    isNonEmptyTrimmed(request.attemptId) &&
-    HEAD_PATTERN.test(request.candidateHeadSha)
-  );
+  return requestFieldsAreValid(request, [
+    { key: 'requestId', kind: 'requestId' },
+    { key: 'attemptId', kind: 'nonEmpty' },
+    { key: 'candidateHeadSha', kind: 'head' },
+  ]);
 }
 
 function isValidFindLatestReceiptOfKindRequest(request: FindLatestReceiptOfKindRequest): boolean {
-  return (
-    isNonEmptyTrimmed(request.attemptId) &&
-    HEAD_PATTERN.test(request.candidateHeadSha) &&
-    isReviewKind(request.kind)
-  );
+  return requestFieldsAreValid(request, [
+    { key: 'attemptId', kind: 'nonEmpty' },
+    { key: 'kind', kind: 'reviewKind' },
+    { key: 'candidateHeadSha', kind: 'head' },
+  ]);
 }
 
 function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
@@ -236,21 +328,62 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
 }
 
 /**
+ * True when `findings` is a dense array of plain objects whose every finding
+ * carries one of the four declared severities: a sparse array, a non-array, a
+ * hole or a corrupt severity is invalid transport output, never a summary
+ * (RV3: a corrupt severity never maps to a verdict).
+ */
+function findingsAreDense(findings: unknown): boolean {
+  try {
+    if (!Array.isArray(findings)) {
+      return false;
+    }
+    for (let index = 0; index < findings.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(findings, index)) {
+        return false;
+      }
+      const finding = findings[index];
+      if (!isPlainObject(finding)) {
+        return false;
+      }
+      const severity = (finding as { severity?: unknown }).severity;
+      if (
+        severity !== 'blocker' &&
+        severity !== 'major' &&
+        severity !== 'minor' &&
+        severity !== 'nit'
+      ) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * One shared summary builder used by requestReview and findReviewReceipt. The kind and request id are the
- * values the caller has already matched on the receipt; nothing is defaulted here.
+ * values the caller has already matched on the receipt; nothing is defaulted here. Null when the
+ * receipt's findings are not a dense array of plain objects: the caller treats that as a mismatch.
  */
 function receiptOfKindSummaryOf(
   receipt: ReviewReceiptRecord,
   kind: ReviewReceiptSummary['kind'],
   requestId: string | null,
-): ReviewReceiptOfKind {
+): ReviewReceiptOfKind | null {
+  if (!findingsAreDense(receipt.findings)) {
+    return null;
+  }
   return {
     receiptId: receipt.id,
     requestId,
     kind,
     reviewerModel: receipt.reviewerModel,
     candidateHeadSha: receipt.candidateHeadSha,
-    verdict: mapVerdict(receipt.result),
+    // RV3: an unverified stored receipt never maps to a verdict; it reads
+    // `unknown` so every downstream decider keeps it unknown (fail closed).
+    verdict: receipt.readOnlyVerified === true ? mapVerdict(receipt.result) : 'unknown',
     findings: receipt.findings.map((finding) => ({
       findingId: finding.findingId,
       severity: finding.severity,
@@ -258,6 +391,15 @@ function receiptOfKindSummaryOf(
       filePath: finding.filePath,
       line: finding.line,
     })),
+    // The fixed cause code travels only on an unknown receipt whose code is
+    // one of the declared tokens and a journal-legal lowercase code; the key
+    // is omitted otherwise, so existing assertions without it stay identical.
+    ...(receipt.result === 'unknown' &&
+    typeof receipt.unknownReason === 'string' &&
+    REVIEW_UNKNOWN_REASON_CODES.has(receipt.unknownReason) &&
+    LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(receipt.unknownReason)
+      ? { unknownReason: receipt.unknownReason as ReviewUnknownReason }
+      : {}),
   };
 }
 
@@ -265,8 +407,9 @@ function summaryOf(
   receipt: ReviewReceiptRecord,
   kind: ReviewReceiptSummary['kind'],
   requestId: string,
-): ReviewReceiptSummary {
-  return { ...receiptOfKindSummaryOf(receipt, kind, requestId), requestId };
+): ReviewReceiptSummary | null {
+  const ofKind = receiptOfKindSummaryOf(receipt, kind, requestId);
+  return ofKind === null ? null : { ...ofKind, requestId };
 }
 
 function mapRejection(
@@ -311,6 +454,39 @@ type AssessmentRead =
 export class ReviewRequestAdapter implements ReviewRequestPort {
   constructor(private readonly delegates: ReviewRequestDelegates = {}) {}
 
+  /**
+   * RV4: screen the transport diagnostic's stderr and archive it under
+   * `review-transport-<requestId>`. The content is JSON of only `exitCode`,
+   * `timedOut`, `stdoutEmpty` and the screened stderr (or `null`): no path
+   * except the `[path]` token and no secret text. An archive failure is
+   * swallowed; the review outcome is unchanged.
+   */
+  private async archiveTransportDiagnostic(
+    requestId: string,
+    candidateHeadSha: string,
+    diagnostic: ReviewTransportDiagnostic,
+  ): Promise<void> {
+    const archive = this.delegates.archiveEvidence;
+    if (archive === undefined) {
+      return;
+    }
+    const screenedStderr = diagnostic.stderr === null ? null : screenTransportText(diagnostic.stderr);
+    try {
+      await archive({
+        artifactId: 'review-transport-' + requestId,
+        candidateHeadSha,
+        content: JSON.stringify({
+          exitCode: diagnostic.exitCode,
+          timedOut: diagnostic.timedOut,
+          stdoutEmpty: diagnostic.stdoutEmpty,
+          stderr: screenedStderr,
+        }),
+      });
+    } catch {
+      // Swallowed: an archive miss never changes the review outcome.
+    }
+  }
+
   /** The attempt's assessment through the inspection delegate: the one read both receipt lookups share. */
   private async readAssessmentOf(attemptId: string): Promise<AssessmentRead> {
     if (!this.delegates.inspectAcceptanceEvidence) {
@@ -336,13 +512,24 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
    * maps its outcome, with a receipt for any other subject treated as unknown.
    */
   private async requestChainReview(request: ReviewRequest, chain: ChainSubject): Promise<ReviewRequestResult> {
-    const diffSummary = request.diffSummary;
+    // Every field is snapshotted once from own data properties: a throwing
+    // getter is an invalid request, never an exception.
+    const optional = snapshotOptionalFields(request, ['diffSummary', 'nowIso']);
+    const requestId = ownValue(request, 'requestId');
+    const policyRevision = ownValue(request, 'policyRevision');
+    const implementerModel = ownValue(request, 'implementerModel');
+    const reviewerModel = ownValue(request, 'reviewerModel');
+    const diffSummary = optional?.diffSummary;
+    const nowIso = optional?.nowIso;
     if (
-      request.kind !== 'pre-merge' ||
-      !REVIEW_REQUEST_ID_PATTERN.test(request.requestId) ||
-      !isNonEmptyTrimmed(request.policyRevision) ||
-      !isNonEmptyTrimmed(request.implementerModel) ||
-      !isNonEmptyTrimmed(request.reviewerModel) ||
+      optional === null ||
+      ownValue(request, 'kind') !== 'pre-merge' ||
+      typeof requestId !== 'string' ||
+      !REVIEW_REQUEST_ID_PATTERN.test(requestId) ||
+      !isNonEmptyTrimmed(policyRevision) ||
+      !isNonEmptyTrimmed(implementerModel) ||
+      !isNonEmptyTrimmed(reviewerModel) ||
+      (nowIso !== undefined && typeof nowIso !== 'string') ||
       (diffSummary !== undefined &&
         (typeof diffSummary !== 'string' || Buffer.byteLength(diffSummary, 'utf8') > DIFF_SUMMARY_MAX_BYTES))
     ) {
@@ -358,24 +545,30 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         projectId: chain.projectId,
         attemptId: attemptIdForChain(chain.projectId, chain.chainName),
         candidateHeadSha: chain.integrationHeadSha,
-        policyRevision: request.policyRevision,
-        implementerModel: request.implementerModel,
-        reviewerModel: request.reviewerModel,
+        policyRevision: policyRevision as string,
+        implementerModel: implementerModel as string,
+        reviewerModel: reviewerModel as string,
         kind: 'pre-merge',
-        requestId: request.requestId,
+        requestId,
         subject: evidenceChainSubject(chain),
         ...(diffSummary !== undefined ? { diffSummary } : {}),
-        ...(request.nowIso !== undefined ? { nowIso: request.nowIso } : {}),
+        ...(nowIso !== undefined ? { nowIso } : {}),
       });
     } catch {
       return { outcome: 'unknown', reason: 'delegate-failed' };
     }
     if (result.outcome === 'reviewed') {
       const receipt = result.receipt;
-      if (receipt.requestId !== request.requestId || !isChainReceiptOf(receipt, chain)) {
+      if (receipt.requestId !== requestId || !isChainReceiptOf(receipt, chain)) {
         return { outcome: 'unknown', reason: 'receipt-mismatch' };
       }
-      return { outcome: 'receipt', receipt: summaryOf(receipt, 'pre-merge', request.requestId) };
+      const summary = summaryOf(receipt, 'pre-merge', requestId);
+      return summary === null
+        ? { outcome: 'unknown', reason: 'receipt-mismatch' }
+        : { outcome: 'receipt', receipt: summary };
+    }
+    if (result.outcome === 'rejected' && result.code !== undefined && result.diagnostic !== undefined) {
+      await this.archiveTransportDiagnostic(requestId, chain.integrationHeadSha, result.diagnostic);
     }
     return mapRejection(result.rejection, result.code);
   }
@@ -391,11 +584,15 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (subject.kind === 'chain') {
       return this.requestChainReview(request, subject.chain);
     }
+    const optional = snapshotOptionalFields(request, ['briefText', 'nowIso']);
+    const briefText = optional?.briefText;
+    const nowIso = optional?.nowIso;
     if (
+      optional === null ||
       !isValidReviewRequest(request) ||
-      (request.briefText !== undefined &&
-        (typeof request.briefText !== 'string' ||
-          briefTextByteLength(request.briefText) > BRIEF_TEXT_MAX_BYTES))
+      (nowIso !== undefined && typeof nowIso !== 'string') ||
+      (briefText !== undefined &&
+        (typeof briefText !== 'string' || briefTextByteLength(briefText) > BRIEF_TEXT_MAX_BYTES))
     ) {
       return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
@@ -418,10 +615,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         requestId: request.requestId,
         // The frozen brief flows through only for a brief-check, so any other
         // kind's transport call carries exactly the fields it carried before.
-        ...(kind === 'brief-check' && request.briefText !== undefined
-          ? { briefText: request.briefText }
-          : {}),
-        ...(request.nowIso !== undefined ? { nowIso: request.nowIso } : {}),
+        ...(kind === 'brief-check' && briefText !== undefined ? { briefText: briefText as string } : {}),
+        ...(nowIso !== undefined ? { nowIso } : {}),
       });
     } catch {
       return { outcome: 'unknown', reason: 'delegate-failed' };
@@ -436,7 +631,13 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       ) {
         return { outcome: 'unknown', reason: 'receipt-mismatch' };
       }
-      return { outcome: 'receipt', receipt: summaryOf(receipt, kind, request.requestId) };
+      const summary = summaryOf(receipt, kind, request.requestId);
+      return summary === null
+        ? { outcome: 'unknown', reason: 'receipt-mismatch' }
+        : { outcome: 'receipt', receipt: summary };
+    }
+    if (result.outcome === 'rejected' && result.code !== undefined && result.diagnostic !== undefined) {
+      await this.archiveTransportDiagnostic(request.requestId, request.candidateHeadSha, result.diagnostic);
     }
     return mapRejection(result.rejection, result.code);
   }
@@ -471,9 +672,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     ) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
-    return { outcome: 'found', receipt: summaryOf(only, only.kind, request.requestId) };
+    const summary = summaryOf(only, only.kind, request.requestId);
+    return summary === null
+      ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+      : { outcome: 'found', receipt: summary };
   }
-
   /** The chain's receipt for one request id, from the chain's own assessment; another kind, head or subject is a mismatch. */
   private async findChainReceipt(request: FindReviewReceiptRequest, chain: ChainSubject): Promise<FindReviewReceiptResult> {
     if (!REVIEW_REQUEST_ID_PATTERN.test(request.requestId)) {
@@ -491,7 +694,10 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (matches.length > 1 || !isChainReceiptOf(only, chain)) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
-    return { outcome: 'found', receipt: summaryOf(only, 'pre-merge', request.requestId) };
+    const summary = summaryOf(only, 'pre-merge', request.requestId);
+    return summary === null
+      ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+      : { outcome: 'found', receipt: summary };
   }
 
   private async findLatestChainReceiptOfKind(
@@ -515,7 +721,10 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         latest = candidate;
       }
     }
-    return { outcome: 'found', receipt: receiptOfKindSummaryOf(latest, 'pre-merge', latest.requestId ?? null) };
+    const latestSummary = receiptOfKindSummaryOf(latest, 'pre-merge', latest.requestId ?? null);
+    return latestSummary === null
+      ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+      : { outcome: 'found', receipt: latestSummary };
   }
 
   async findLatestReceiptOfKind(
@@ -554,9 +763,12 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         latest = candidate;
       }
     }
-    return {
+    const finalSummary = receiptOfKindSummaryOf(latest, latest.kind, latest.requestId ?? null);
+    return finalSummary === null
+      ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+      : {
       outcome: 'found',
-      receipt: receiptOfKindSummaryOf(latest, latest.kind, latest.requestId ?? null),
+      receipt: finalSummary,
     };
   }
 
@@ -568,12 +780,24 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
    */
   async recordOutOfScope(request: RecordOutOfScopeRequest): Promise<RecordOutOfScopeResult> {
     const delegate = this.delegates.recordFindingDisposition;
-    if (
-      delegate === undefined ||
-      !HEAD_PATTERN.test(request.candidateHeadSha) ||
-      request.findingIds.length === 0 ||
-      request.findingIds.some((findingId) => !isNonEmptyTrimmed(findingId))
-    ) {
+    // Runtime input never throws: a null, a non-object, a wrong-typed field,
+    // a sparse array or a throwing getter is a refusal, never a crash.
+    let valid = false;
+    try {
+      valid =
+        delegate !== undefined &&
+        typeof request === 'object' &&
+        request !== null &&
+        !Array.isArray(request) &&
+        typeof request.attemptId === 'string' &&
+        isNonEmptyTrimmed(request.attemptId) &&
+        typeof request.candidateHeadSha === 'string' &&
+        HEAD_PATTERN.test(request.candidateHeadSha) &&
+        isDenseNonEmptyStringArray(request.findingIds);
+    } catch {
+      valid = false;
+    }
+    if (!valid) {
       return { outcome: 'refused' };
     }
     const evidenceRef = 'scope:' + request.candidateHeadSha.slice(0, 12);
@@ -591,7 +815,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         recordedAtIso,
       };
       try {
-        const answered = await delegate({ assessmentId: disposition.assessmentId, disposition });
+        const answered = await delegate!({ assessmentId: disposition.assessmentId, disposition });
         if (answered.outcome !== 'recorded') {
           return { outcome: 'refused' };
         }

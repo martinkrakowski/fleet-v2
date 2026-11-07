@@ -26,7 +26,9 @@ import {
   laneRunResultEntry,
   type LaneRunResultReasonCode,
 } from '../../../domain/lane-run-step-facts.js';
-import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import { laneRunJournalPendingIntent, laneRunJournalState } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import type { ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
 import type { ReconcileAttemptResult } from '../../ports/in/ReconcileAttemptPort.in-port.js';
 import type {
   StopAttemptRequest,
@@ -824,6 +826,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       qualifier: null,
       parkedFrom: 'running',
       questionId: null,
+      class: 'other',
     });
     expect(afterRunning?.parkCount).toBe(1);
 
@@ -849,6 +852,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       qualifier: 'attempt-terminal',
       parkedFrom: 'running',
       questionId: null,
+      class: 'other',
     });
   });
 
@@ -2322,5 +2326,181 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
     // No brief-check intent or result was appended: the review never started.
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries.some((entry) => entry.kind !== 'conduct' && entry.key === briefCheckKey())).toBe(false);
+  });
+});
+
+const AMBIGUOUS_GATE_PARK = {
+  reason: 'ambiguous',
+  qualifier: 'gate',
+  parkedFrom: 'gating',
+  questionId: null,
+} as const;
+
+/** HN1's shape: parked `ambiguous` at gate over an open, ambiguous gate intent, the work order released through the harness store. */
+async function parkedAmbiguousGateHarness(): Promise<Harness> {
+  const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+  const harness = await makeHarness(runRecord({ parked: AMBIGUOUS_GATE_PARK, parkCount: 1 }), [collected], {
+    wireWorkOrderRelease: true,
+  });
+  await conduct(harness, 'gating', NOW);
+  await appendIntent(harness, gateKey(), null, NOW);
+  await appendResult(harness, gateKey(), 'ambiguous', 'gate-unknown', NOW);
+  await conduct(harness, 'parked', NOW);
+  return harness;
+}
+
+function finalResultsOn(entries: readonly LaneRunJournalEntryRecord[], key: string): readonly LaneRunJournalEntryRecord[] {
+  return entries.filter((entry) => entry.kind === 'result' && entry.key === key && entry.outcome !== 'ambiguous');
+}
+
+describe('AdvanceLaneRunUseCase abandons an ambiguous pending intent on a recorded stop (PT1b3a / F171)', () => {
+  it('PT1b3a: force stop on parked ambiguous gate run abandons pending gate intent, enters stopped, and releases work order', async () => {
+    const harness = await parkedAmbiguousGateHarness();
+    await appendStopIntent(harness, 'force', NOW);
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'stopped' });
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const finals = finalResultsOn(entries, gateKey());
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toBeNull();
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('stopped');
+    expect(entries.indexOf(finals[0]!)).toBeLessThan(entries.length - 1);
+    expect((await harness.runRepo.get(RUN_ID))?.parked).toBeNull();
+    expect(harness.workOrders.get('wo-example-1')).toMatchObject({ state: 'stopped', revision: 2, updatedAtIso: LATER });
+    expect(harness.gateRequests).toHaveLength(0);
+    expect(harness.stopRequests).toHaveLength(0);
+  });
+
+  it('PT1b3a: a graceful stop on a parked ambiguous gate run abandons the intent and enters stopped', async () => {
+    const harness = await parkedAmbiguousGateHarness();
+    await appendStopIntent(harness, 'graceful', NOW);
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'stopped' });
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(finalResultsOn(entries, gateKey())).toHaveLength(1);
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('stopped');
+  });
+
+  it('PT1b3a: replay after crash between intent-abandoned-by-operator result and stopped conduct never double-writes', async () => {
+    const harness = await parkedAmbiguousGateHarness();
+    await appendStopIntent(harness, 'force', NOW);
+
+    let armed = true;
+    const crashing: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      runJournal: {
+        append: async (entry) => {
+          if (armed && entry.kind === 'conduct' && entry.state === 'stopped') {
+            armed = false;
+            return { outcome: 'refused', reason: 'invalid-entry', detail: null };
+          }
+          return harness.runJournal.append(entry);
+        },
+        listForRun: (runId) => harness.runJournal.listForRun(runId),
+        listForKey: (key) => harness.runJournal.listForKey(key),
+      },
+    };
+    const crashed = await new AdvanceLaneRunUseCase(crashing).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(crashed).toMatchObject({ outcome: 'refused', reason: 'journal-refused' });
+    expect(finalResultsOn(await harness.runJournal.listForRun(RUN_ID), gateKey())).toHaveLength(1);
+    expect(laneRunJournalState(await harness.runJournal.listForRun(RUN_ID), RUN_ID)).toBe('parked');
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'stopped' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(finalResultsOn(entries, gateKey())).toHaveLength(1);
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('stopped');
+    expect(harness.workOrders.get('wo-example-1')).toMatchObject({ state: 'stopped', revision: 2 });
+  });
+
+  it('PT1b3a: non-ambiguous parked run stop path is unchanged and makes no abandon result write', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+    const harness = await makeHarness(
+      runRecord({ parked: { reason: 'halted', qualifier: null, parkedFrom: 'gating', questionId: null }, parkCount: 1 }),
+      [collected],
+      { wireWorkOrderRelease: true },
+    );
+    await conduct(harness, 'gating', NOW);
+    await conduct(harness, 'parked', NOW);
+    await appendStopIntent(harness, 'force', NOW);
+
+    const keyReads: string[] = [];
+    const appended: LaneRunJournalEntryRecord[] = [];
+    const spied: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      runJournal: {
+        append: async (entry) => {
+          appended.push(entry);
+          return harness.runJournal.append(entry);
+        },
+        listForRun: (runId) => harness.runJournal.listForRun(runId),
+        listForKey: (key) => {
+          keyReads.push(key);
+          return harness.runJournal.listForKey(key);
+        },
+      },
+    };
+    const result = await new AdvanceLaneRunUseCase(spied).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+
+    expect(result).toEqual({ outcome: 'entered', state: 'stopped' });
+    expect(keyReads).toEqual([]);
+    expect(appended).toHaveLength(1);
+    expect(appended[0]).toMatchObject({ kind: 'conduct', state: 'stopped' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.reasonCode === 'intent-abandoned-by-operator')).toBe(false);
+  });
+
+  it('PT1b3a: G3f merged PR carrying lane head still enters merged even with ambiguous pending intent and stop recorded', async () => {
+    const harness = await parkedAmbiguousGateHarness();
+    await appendStopIntent(harness, 'force', NOW);
+    const mergedRead: ReadPullRequestResult = {
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'merged',
+        mergeState: 'clean',
+        headSha: COMMIT,
+        headRef: 'wt-example-1',
+        isCrossRepository: false,
+        headRepositoryOwner: 'owner-example',
+        baseRef: 'main',
+        mergedAtIso: LATER,
+        closedAtIso: null,
+        mergeCommitSha: COMMIT,
+      },
+    };
+    const withForge: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      forgeRead: {
+        readPullRequest: async () => mergedRead,
+        isConfigured: () => true,
+        listOpenPullRequestsByBase: async () => ({ outcome: 'unavailable' as const, reason: 'not-used' }),
+      },
+    };
+
+    const result = await new AdvanceLaneRunUseCase(withForge).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+
+    expect(result).toEqual({ outcome: 'entered', state: 'merged' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(finalResultsOn(entries, gateKey())).toHaveLength(0);
+    expect(entries.some((entry) => entry.reasonCode === 'intent-abandoned-by-operator')).toBe(false);
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('merged');
   });
 });

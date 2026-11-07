@@ -8,6 +8,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 
 import { containsSecretShape } from '@fleet/shared';
 
@@ -25,10 +26,31 @@ import type { RunnerForAttemptPort } from '../../ports/out/RunnerForAttemptPort.
 import type { ReconcileAttemptPort, ReconcileAttemptResult } from '../../ports/in/ReconcileAttemptPort.in-port.js';
 import type { ReaperFindingRepositoryPort, ReaperFindingStoreRecord } from '../../ports/out/ReaperFindingRepositoryPort.out-port.js';
 import type {
+  ForgeReadPort,
+  ReadPullRequestRequest,
+  ReadPullRequestResult,
+} from '../../ports/out/ForgeReadPort.out-port.js';
+import type {
+  InspectWorktreeForRemovalRequest,
+  InspectWorktreeForRemovalResult,
+  ListWorktreesRequest,
+  ListWorktreesResult,
+  ListedWorktree,
+  ReadFilesystemSpaceRequest,
+  ReadFilesystemSpaceResult,
+  WorktreeRemovalFacts,
+  WorkspacePort,
+} from '../../ports/out/WorkspacePort.out-port.js';
+import type {
   ReapZombiesRequest,
   ReapZombiesResult,
 } from '../../ports/in/ReapZombiesPort.in-port.js';
-import { ReapZombiesUseCase, type ReaperAttentionPort } from '../ReapZombiesUseCase.use-case.js';
+import {
+  ReapZombiesUseCase,
+  type ReaperAttentionPort,
+  type ReaperProjectProfileView,
+  type ReaperProjectProfilesPort,
+} from '../ReapZombiesUseCase.use-case.js';
 import { InMemoryReaperFindingRepositoryAdapter } from '../../../infrastructure/adapters/InMemoryReaperFindingRepositoryAdapter.adapter.js';
 import { REAPER_FINDING_SCHEMA_VERSION } from '../../../domain/reaper-findings.js';
 
@@ -38,6 +60,15 @@ const YOUNG = '2026-11-06T11:59:30.000Z'; // 30 s before NOW: young
 const WORKTREE = '/tmp/worktree-example-1';
 const COMMIT = 'a'.repeat(40);
 const PROJECT = 'proj-1';
+
+// KW4a fixtures: one registered clone, its one linked worktree, its host.
+const HOST_NAME = 'host-1';
+const CLONE = '/srv/clone';
+const ROOT = '/srv/clone/.worktrees';
+const WT_PATH = '/srv/clone/.worktrees/wt-a';
+const OLD = '2026-11-04T12:00:00.000Z'; // over the 24 h retention before NOW: quiet
+const LATER = '2026-11-06T12:10:00.000Z'; // past the grace after NOW
+const DISK_POLICY = { graceMinutes: 5, minFreePercent: 15, clearFreePercent: 20 };
 
 const POLICY = { graceMinutes: 5, repairs: { 'dead-attempt': true } };
 
@@ -134,6 +165,7 @@ function makeRunner(): ExecutionRunnerPort & { inspectCalls: RunnerSessionRef[] 
       return Promise.resolve(SESSION_GONE);
     },
     stopSession: () => Promise.reject(new Error('not used')),
+    inspectWorktreeRun: () => Promise.resolve({ state: 'idle' }),
   };
 }
 
@@ -236,6 +268,194 @@ const JOURNAL: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJourna
   listJournalEntriesForAttempt: () => Promise.resolve([]),
 };
 
+// ---------------------------------------------------------------------------
+// KW4a fakes: the workspace, profile and forge reads of the gathering.
+// ---------------------------------------------------------------------------
+
+/** The 12-hex digest the tests use for a subject; matches the D1 shape. */
+function testDigest(text: string): string {
+  return createHash('sha256').update(text).digest('hex').slice(0, 12);
+}
+
+/** The subject of the fixture worktree, computable before a pass runs. */
+function subjectOfFixtureWorktree(): string {
+  return testDigest(`${HOST_NAME}\u0000${PROJECT}\u0000${CLONE}\u0000${WT_PATH}`);
+}
+
+/** The host digest of the fixture host (D1). */
+function subjectOfFixtureHost(): string {
+  return testDigest(`host\u0000${HOST_NAME}`);
+}
+
+function removalFacts(overrides: Partial<WorktreeRemovalFacts> = {}): WorktreeRemovalFacts {
+  return {
+    path: WT_PATH,
+    head: COMMIT,
+    branch: 'fleet/merged-branch',
+    detached: false,
+    headOnDefault: true,
+    status: { tracked: 0, untracked: 0, unmerged: 0 },
+    locked: false,
+    inProgressOperations: [],
+    lastActivity: { iso: OLD, unknown: false },
+    sizeBytes: 4096,
+    ...overrides,
+  };
+}
+
+function listedWorktree(path: string, overrides: Partial<ListedWorktree> = {}): ListedWorktree {
+  return { path, head: COMMIT, branch: 'fleet/branch', locked: false, prunable: false, ...overrides };
+}
+
+interface WorkspaceFake {
+  /** Every method name called, in order, read or write. */
+  calls: string[];
+  /** Every request of the three read methods, in order. */
+  requests: { list?: ListWorktreesRequest; inspect?: InspectWorktreeForRemovalRequest; space?: ReadFilesystemSpaceRequest }[];
+  /** The forbidden write methods' call names; must stay empty for a report-only pass. */
+  forbidden: string[];
+  listWorktreesCount: number;
+}
+
+interface WorkspaceOptions {
+  /** The listed entries; a sparse array or malformed entries exercise the robustness bar. */
+  entries?: readonly (ListedWorktree | null | undefined)[];
+  /** The inspection answer, resolved fresh on every read. */
+  facts?: () => WorktreeRemovalFacts;
+  /** Throwing overrides for each read. */
+  throwList?: boolean;
+  throwInspect?: boolean;
+  throwSpace?: boolean;
+  /** Answer overrides: an `unknown` inspection or a filesystem answer. */
+  inspectAnswer?: () => InspectWorktreeForRemovalResult;
+  spaceAnswer?: (request: ReadFilesystemSpaceRequest) => ReadFilesystemSpaceResult;
+}
+
+/**
+ * The read-only workspace fake. Only the three read methods are implemented;
+ * the forbidden write methods are recorded if ever called and must stay
+ * untouched by a report-only pass.
+ */
+function makeWorkspace(options: WorkspaceOptions = {}): WorkspacePort & WorkspaceFake {
+  const entries = options.entries ?? [listedWorktree(WT_PATH)];
+  const facts = options.facts ?? removalFacts;
+  const fake = {
+    calls: [],
+    requests: [],
+    forbidden: [],
+    listWorktreesCount: 0,
+    listWorktrees: (request: ListWorktreesRequest) => {
+      fake.calls.push('listWorktrees');
+      fake.requests.push({ list: request });
+      fake.listWorktreesCount += 1;
+      if (options.throwList) {
+        return Promise.reject(new Error('list failed'));
+      }
+      // Holes and malformed entries are handed over as-is: the pass must skip
+      // them without throwing (the robustness bar).
+      return Promise.resolve({ outcome: 'listed', worktrees: entries as unknown as readonly ListedWorktree[] } satisfies ListWorktreesResult);
+    },
+    inspectWorktreeForRemoval: (request: InspectWorktreeForRemovalRequest) => {
+      fake.calls.push('inspectWorktreeForRemoval');
+      fake.requests.push({ inspect: request });
+      if (options.throwInspect) {
+        return Promise.reject(new Error('inspect failed'));
+      }
+      if (options.inspectAnswer !== undefined) {
+        return Promise.resolve(options.inspectAnswer());
+      }
+      return Promise.resolve({ outcome: 'inspected', facts: facts() } satisfies InspectWorktreeForRemovalResult);
+    },
+    readFilesystemSpace: (request: ReadFilesystemSpaceRequest) => {
+      fake.calls.push('readFilesystemSpace');
+      fake.requests.push({ space: request });
+      if (options.throwSpace) {
+        return Promise.reject(new Error('space failed'));
+      }
+      if (options.spaceAnswer !== undefined) {
+        return Promise.resolve(options.spaceAnswer(request));
+      }
+      return Promise.resolve({ outcome: 'read', freeBytes: 200, totalBytes: 1000 } satisfies ReadFilesystemSpaceResult);
+    },
+  } as unknown as WorkspacePort & WorkspaceFake;
+  const writes: [keyof WorkspacePort, string][] = [
+    ['removeWorktree', 'removeWorktree'],
+    ['removeLaneWorktree', 'removeLaneWorktree'],
+    ['commitLaneOutput', 'commitLaneOutput'],
+    ['resetWorktreeToHead', 'resetWorktreeToHead'],
+    ['prepareLaneWorktree', 'prepareLaneWorktree'],
+    ['preserveWorktreeEdits', 'preserveWorktreeEdits'],
+  ];
+  for (const [key, name] of writes) {
+    Object.defineProperty(fake, key, {
+      enumerable: true,
+      value: () => {
+        fake.forbidden.push(name);
+        return Promise.reject(new Error('a report-only pass must never call a write method'));
+      },
+    });
+  }
+  return fake;
+}
+
+function profileView(overrides: Partial<ReaperProjectProfileView> = {}): ReaperProjectProfileView {
+  return {
+    projectId: PROJECT,
+    status: 'active',
+    defaultBranch: 'main',
+    clones: { [HOST_NAME]: { path: CLONE, worktreeRoot: ROOT } },
+    ...overrides,
+  };
+}
+
+function makeProfiles(profiles: readonly ReaperProjectProfileView[]): ReaperProjectProfilesPort & { calls: number } {
+  const fake: ReaperProjectProfilesPort & { calls: number } = {
+    calls: 0,
+    listProjectProfiles: (request: { readonly status?: 'active' | 'retired' }) => {
+      fake.calls += 1;
+      if (request.status === undefined) {
+        return Promise.reject(new Error('status required'));
+      }
+      return Promise.resolve({ outcome: 'listed', profiles });
+    },
+  };
+  return fake;
+}
+
+function mergedPrSnapshot(): ReadPullRequestResult {
+  return {
+    outcome: 'found',
+    pullRequest: {
+      number: 1,
+      state: 'merged',
+      mergeState: 'clean',
+      headSha: COMMIT,
+      headRef: 'fleet/merged-branch',
+      isCrossRepository: false,
+      headRepositoryOwner: 'example-owner',      baseRef: 'main',
+      mergedAtIso: OLD,
+      closedAtIso: null,
+      mergeCommitSha: COMMIT,
+    },
+  };
+}
+
+function makeForgeRead(answer: () => ReadPullRequestResult = mergedPrSnapshot, throwRead = false): ForgeReadPort & { requests: ReadPullRequestRequest[] } {
+  const fake: ForgeReadPort & { requests: ReadPullRequestRequest[] } = {
+    requests: [],
+    readPullRequest: (request: ReadPullRequestRequest) => {
+      fake.requests.push(request);
+      if (throwRead) {
+        return Promise.reject(new Error('forge failed'));
+      }
+      return Promise.resolve(answer());
+    },
+    listOpenPullRequestsByBase: () => Promise.resolve({ outcome: 'unavailable', reason: 'not used' }),
+    isConfigured: () => true,
+  };
+  return fake;
+}
+
 interface Harness {
   attempts: AttemptRecord[];
   reservations: CapacityReservationRecord[];
@@ -254,6 +474,11 @@ interface Harness {
   reaperFindings?: ReaperFindingRepositoryPort;
   attemptRepo?: AttemptRepositoryPort;
   runnerForAttempt?: RunnerForAttemptPort;
+  /** KW4a: the optional gathering dependencies; absent means the gathering does not run. */
+  workspace?: WorkspacePort;
+  profiles?: ReaperProjectProfilesPort;
+  forgeRead?: ForgeReadPort & { requests: ReadPullRequestRequest[] };
+  computeDigest?: (text: string) => string;
 }
 
 function build(harness: Harness): ReapZombiesUseCase {
@@ -282,6 +507,10 @@ function build(harness: Harness): ReapZombiesUseCase {
     attention: harness.attentionPort,
     reaperFindings: harness.reaperFindings ?? harness.store,
     newId: harness.newIdOverride ?? newId,
+    ...(harness.workspace === undefined ? {} : { workspace: harness.workspace }),
+    ...(harness.profiles === undefined ? {} : { profiles: harness.profiles }),
+    ...(harness.forgeRead === undefined ? {} : { forgeRead: harness.forgeRead }),
+    ...(harness.computeDigest === undefined ? {} : { computeDigest: harness.computeDigest }),
   });
 }
 
@@ -293,7 +522,7 @@ function request(overrides: Partial<ReapZombiesRequest> = {}): ReapZombiesReques
 async function seedOpenFinding(
   store: ReaperFindingRepositoryPort,
   subject: string,
-  kind: 'dead-attempt' | 'leaked-slot' | 'stale-attention' = 'dead-attempt',
+  kind: 'dead-attempt' | 'leaked-slot' | 'stale-attention' | 'merged-worktree' | 'disk-pressure' = 'dead-attempt',
 ): Promise<ReaperFindingStoreRecord> {
   const upsert = await store.upsertFinding(
     {
@@ -328,7 +557,23 @@ function baseHarness(overrides: Partial<Harness> = {}): Harness {
     runner: makeRunner(),
     attention,
     attentionPort: makeAttention(attention, overrides.attentionItems ?? []),
+    computeDigest: testDigest,
     ...overrides,
+  };
+}
+
+/**
+ * A base harness with the KW4a gathering wired: one active profile, one clone,
+ * one clean merged worktree and a forge that reads a merged PR for its branch.
+ */
+function gatherHarness(overrides: Partial<Harness> & { workspace?: WorkspacePort } = {}): Harness {
+  const base = baseHarness(overrides);
+  return {
+    ...base,
+    workspace: overrides.workspace ?? makeWorkspace(),
+    profiles: overrides.profiles ?? makeProfiles([profileView()]),
+    forgeRead: overrides.forgeRead ?? makeForgeRead(),
+    computeDigest: testDigest,
   };
 }
 
@@ -951,5 +1196,415 @@ describe('reap zombies', () => {
     const result = await runPass(harness, { policy });
     expect(result).toMatchObject({ outcome: 'refused', reason: 'request-invalid' });
     expect(harness.journal.state.appendCalls).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // KW4a: the worktree and disk gathering — report only.
+  // -------------------------------------------------------------------------
+
+  it('reports a merged worktree with its size and never removes it', async () => {
+    const workspace = makeWorkspace();
+    const harness = gatherHarness({ workspace });
+    const first = await runPass(harness);
+    const second = await runPass(harness, { nowIso: LATER });
+    expect(second.outcome).toBe('completed');
+    const finding = second.findings.find((entry) => entry.kind === 'merged-worktree');
+    expect(finding).toBeDefined();
+    expect(finding?.action).toBe('report'); // report only, even though the condition holds
+    expect(finding?.subject).toMatch(/^[0-9a-f]{12}$/);
+    expect(second.worktrees).toEqual([
+      { subject: finding?.subject, report: 'merged-worktree', evidence: 'merged-pr', sizeBytes: 4096 },
+    ]);
+    // The first sighting waits; only the second, past the grace, reports.
+    expect(first.findings.find((entry) => entry.kind === 'merged-worktree')?.action).toBe('wait');
+    // Never removes: no write method of the workspace port was called and no journal intent was written.
+    expect(workspace.forbidden).toEqual([]);
+    expect(harness.journal.state.appendCalls).toEqual([]);
+  });
+
+  it('reports a busy worktree and suppresses the merged-worktree finding for that subject', async () => {
+    const holder = { facts: removalFacts({ inProgressOperations: ['rebase-merge'] }) };
+    const workspace = makeWorkspace({ facts: () => holder.facts });
+    const harness = gatherHarness({ workspace });
+    await runPass(harness);
+    const second = await runPass(harness, { nowIso: LATER });
+    const subject = subjectOfFixtureWorktree();
+    expect(second.findings.find((entry) => entry.subject === subject && entry.kind === 'merged-worktree')).toBeUndefined();
+    expect(second.worktrees).toEqual([
+      { subject, report: 'worktree-busy', evidence: 'unknown', sizeBytes: 4096 },
+    ]);
+    // The busy subject never reaches the forge either.
+    expect(harness.forgeRead?.requests).toEqual([]);
+  });
+
+  it('keeps one finding id for a worktree subject across passes', async () => {
+    const harness = gatherHarness();
+    const first = await runPass(harness);
+    const second = await runPass(harness, { nowIso: LATER });
+    const firstId = first.findings.find((entry) => entry.kind === 'merged-worktree')?.findingId;
+    const secondId = second.findings.find((entry) => entry.kind === 'merged-worktree')?.findingId;
+    expect(firstId).toBeDefined();
+    expect(secondId).toBe(firstId);
+  });
+
+  it('raises one worktree-busy attention item and refreshes it on the next pass', async () => {
+    const workspace = makeWorkspace({ facts: () => removalFacts({ inProgressOperations: ['MERGE_HEAD'] }) });
+    const harness = gatherHarness({ workspace });
+    const first = await runPass(harness);
+    const second = await runPass(harness, { nowIso: LATER });
+    const subject = subjectOfFixtureWorktree();
+    expect(first.attention).toEqual([{ kind: 'worktree-busy', subject, outcome: 'raised' }]);
+    expect(second.attention).toEqual([{ kind: 'worktree-busy', subject, outcome: 'refreshed' }]);
+    expect(harness.attention.recorded).toHaveLength(2);
+    for (const { body } of harness.attention.recorded) {
+      expect(body.kind).toBe('worktree-busy');
+      expect(body.subject).toEqual({ kind: 'worktree', ref: subject });
+    }
+  });
+
+  it('clears the worktree-busy attention item when the worktree is no longer busy', async () => {
+    const holder = { facts: removalFacts({ inProgressOperations: ['MERGE_HEAD'] }) };
+    const workspace = makeWorkspace({ facts: () => holder.facts });
+    const subject = subjectOfFixtureWorktree();
+    // The open item the first pass raised is what the second pass sees.
+    const attentionItems = [
+      {
+        kind: 'worktree-busy',
+        subject: { kind: 'worktree', ref: subject },
+        state: 'open',
+        summary: 'Reaper report worktree-busy for worktree ' + subject,
+      },
+    ];
+    const harness = gatherHarness({ workspace, attentionItems });
+    await runPass(harness);
+    holder.facts = removalFacts();
+    await runPass(harness, { nowIso: LATER });
+    expect(harness.attention.cleared).toHaveLength(1);
+    expect(harness.attention.cleared[0]?.request).toMatchObject({
+      action: 'resolve',
+      projectId: PROJECT,
+      kind: 'worktree-busy',
+      subject: { kind: 'worktree', ref: subject },
+      reason: 'stale',
+    });
+  });
+
+  it('reports disk pressure on the second sighting and keeps the item open between the thresholds', async () => {
+    const holder = { freeBytes: 100, totalBytes: 1000 }; // 10 %: below the 15 % minimum
+    const workspace = makeWorkspace({ spaceAnswer: () => ({ outcome: 'read', freeBytes: holder.freeBytes, totalBytes: holder.totalBytes }) });
+    const harness = gatherHarness({ workspace });
+    const subject = subjectOfFixtureHost();
+    const first = await runPass(harness, { policy: DISK_POLICY });
+    expect(first.findings.find((entry) => entry.kind === 'disk-pressure')?.action).toBe('wait');
+    const second = await runPass(harness, { nowIso: LATER, policy: DISK_POLICY });
+    const finding = second.findings.find((entry) => entry.kind === 'disk-pressure');
+    expect(finding).toMatchObject({ subject, action: 'report' });
+    expect(second.attention.filter((entry) => entry.kind === 'disk-pressure')).toEqual([
+      { kind: 'disk-pressure', subject, outcome: 'raised' },
+    ]);
+    expect(harness.attention.recorded.find((entry) => entry.body.kind === 'disk-pressure')?.body.subject).toEqual({ kind: 'host', ref: subject });
+    // Between the thresholds: 17 % is above the 15 % min but below the 20 % clear.
+    holder.freeBytes = 170;
+    await runPass(harness, { nowIso: '2026-11-06T12:20:00.000Z', policy: DISK_POLICY });
+    // The finding stays open and its item stays open: no close, no clear.
+    expect((await harness.store.listOpenFindings()).some((record) => record.finding.kind === 'disk-pressure')).toBe(true);
+    expect(harness.attention.cleared).toEqual([]);
+  });
+
+  it('closes the disk-pressure finding only above the clear threshold', async () => {
+    const holder = { freeBytes: 100, totalBytes: 1000 };
+    const workspace = makeWorkspace({ spaceAnswer: () => ({ outcome: 'read', freeBytes: holder.freeBytes, totalBytes: holder.totalBytes }) });
+    const harness = gatherHarness({ workspace });
+    const subject = subjectOfFixtureHost();
+    await runPass(harness, { policy: DISK_POLICY });
+    await runPass(harness, { nowIso: LATER, policy: DISK_POLICY });
+    // At the clear threshold exactly (20 %): not strictly above, so it stays open.
+    holder.freeBytes = 200;
+    await runPass(harness, { nowIso: '2026-11-06T12:20:00.000Z', policy: DISK_POLICY });
+    expect((await harness.store.listOpenFindings()).some((record) => record.finding.kind === 'disk-pressure')).toBe(true);
+    expect(harness.attention.cleared).toEqual([]);
+    // Above it (25 %): the finding closes and its attention item is cleared.
+    holder.freeBytes = 250;
+    await runPass(harness, { nowIso: '2026-11-06T12:30:00.000Z', policy: DISK_POLICY });
+    expect((await harness.store.listOpenFindings()).some((record) => record.finding.kind === 'disk-pressure')).toBe(false);
+    expect(harness.attention.cleared).toHaveLength(1);
+    expect(harness.attention.cleared[0]?.request).toMatchObject({
+      action: 'resolve',
+      projectId: PROJECT,
+      kind: 'disk-pressure',
+      subject: { kind: 'host', ref: subject },
+      reason: 'stale',
+    });
+  });
+
+  it('never repairs a merged-worktree even when the policy opts the repair in', async () => {
+    const workspace = makeWorkspace();
+    const harness = gatherHarness({ workspace });
+    const policy = { graceMinutes: 5, repairs: { 'merged-worktree': true, 'dead-attempt': true } as const };
+    await runPass(harness, { policy });
+    const second = await runPass(harness, { nowIso: LATER, policy });
+    const finding = second.findings.find((entry) => entry.kind === 'merged-worktree');
+    expect(finding?.action).toBe('report'); // KW4b' owns the repair; this lane is report only
+    expect(second.repairs).toEqual([]);
+    expect(workspace.forbidden).toEqual([]);
+    expect(harness.journal.state.appendCalls).toEqual([]);
+  });
+
+  it('leaves an open merged-worktree finding open when the worktree read failed', async () => {
+    const subject = subjectOfFixtureWorktree();
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, subject, 'merged-worktree');
+    const workspace = makeWorkspace({ throwInspect: true });
+    const harness = gatherHarness({ workspace, store });
+    const result = await runPass(harness, { policy: DISK_POLICY });
+    expect(result.unknown).toContainEqual({ subject, kind: 'merged-worktree', reason: 'worktree-unreadable' });
+    expect(result.findings.find((entry) => entry.kind === 'merged-worktree')).toBeUndefined();
+    // A failed read never closes anything: the finding stays open.
+    expect((await store.listOpenFindings())).toHaveLength(1);
+  });
+
+  it('refuses a null request, a missing field, a wrong-typed field, a sparse array, an unknown enum value and a throwing getter without throwing', async () => {
+    // Request-level cases.
+    const useCase = build(baseHarness());
+    await expect(useCase.reapZombies(null as unknown as ReapZombiesRequest)).resolves.toMatchObject({ outcome: 'refused', reason: 'request-invalid' });
+    await expect(useCase.reapZombies({ nowIso: NOW } as unknown as ReapZombiesRequest)).resolves.toMatchObject({ outcome: 'refused', reason: 'request-invalid' });
+    await expect(useCase.reapZombies({ projectId: 42, nowIso: NOW } as unknown as ReapZombiesRequest)).resolves.toMatchObject({ outcome: 'refused', reason: 'request-invalid' });
+    await expect(useCase.reapZombies({ projectId: PROJECT, nowIso: NOW, policy: { graceMinutes: 'x' } } as unknown as ReapZombiesRequest)).resolves.toMatchObject({ outcome: 'refused', reason: 'request-invalid' });
+    // Worktree-level cases: the gathering skips malformed reads, never throws.
+    const sparse: ListedWorktree[] = new Array(4);
+    sparse[1] = listedWorktree(WT_PATH);
+    sparse[2] = { ...listedWorktree(ROOT + '/wt-b'), branch: 42 as unknown as string }; // a branch that is a number
+    sparse[3] = { ...listedWorktree(ROOT + '/wt-c'), path: 7 as unknown as string }; // a non-string path
+    const workspace = makeWorkspace({ entries: sparse });
+    const cloneWithThrowingGetter: Record<string, { readonly path: string; readonly worktreeRoot: string }> = {
+      [HOST_NAME]: { path: CLONE, worktreeRoot: ROOT },
+    };
+    Object.defineProperty(cloneWithThrowingGetter, 'host-2', {
+      enumerable: true,
+      get() {
+        throw new Error('clone getter exploded');
+      },
+    });
+    const profiles = makeProfiles([profileView({ clones: cloneWithThrowingGetter })]);
+    const harness = gatherHarness({ workspace, profiles });
+    const result = await runPass(harness, { policy: DISK_POLICY });
+    expect(result.outcome).toBe('completed');
+    // The hole and the non-string path were skipped without throwing; the two
+    // string paths (including the one whose listed branch is a number) were inspected.
+    expect(workspace.requests.filter((entry) => entry.inspect !== undefined)).toHaveLength(2);
+    // Both are first sightings: they wait, none reports or repairs.
+    for (const finding of result.findings.filter((entry) => entry.kind === 'merged-worktree')) {
+      expect(finding.action).toBe('wait');
+    }
+  });
+
+  it('bounds every outbound read and leaves the rest of the pass to the next pass', async () => {
+    // More than 64 subjects: the subjects past the cap are pass-cap unknowns and are not inspected.
+    const many = Array.from({ length: 70 }, (_, index) => listedWorktree(`${ROOT}/wt-${index}`));
+    const cappedWorkspace = makeWorkspace({ entries: many });
+    const cappedHarness = gatherHarness({ workspace: cappedWorkspace });
+    const cappedResult = await runPass(cappedHarness, { policy: DISK_POLICY });
+    const capUnknowns = cappedResult.unknown.filter((entry) => entry.reason === 'pass-cap' && entry.kind === 'merged-worktree');
+    expect(capUnknowns.length).toBe(70 - 64);
+    expect(cappedResult.findings.length).toBeLessThanOrEqual(64);
+    expect(cappedWorkspace.requests.filter((entry) => entry.inspect !== undefined)).toHaveLength(64);
+
+    // More than 16 clones: only the first 16 are read.
+    const cloneProfiles = [
+      profileView({
+        clones: Object.fromEntries(
+          Array.from({ length: 20 }, (_, index) => [`host-${index}`, { path: `/srv/clone-${index}`, worktreeRoot: `/srv/clone-${index}/.worktrees` }]),
+        ),
+      }),
+    ];
+    const cloneWorkspace = makeWorkspace({ entries: [] });
+    const cloneHarness = gatherHarness({ workspace: cloneWorkspace, profiles: makeProfiles(cloneProfiles) });
+    await runPass(cloneHarness, { policy: DISK_POLICY });
+    expect(cloneWorkspace.listWorktreesCount).toBe(16);
+
+    // The forge read is bounded.
+    const forgeHarness = gatherHarness();
+    await runPass(forgeHarness, { policy: DISK_POLICY });
+    for (const read of forgeHarness.forgeRead?.requests ?? []) {
+      expect(read.timeoutMs).toBe(5000);
+      expect(read.ref).toEqual({ kind: 'branch', branchName: 'fleet/merged-branch' });
+    }
+  });
+
+  it('records a worktree finding once and reuses its id and its attention item across passes', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    // Aged sighting: the pass sees the second sighting, so the finding reports
+    // and its attention item is raised in the first pass, refreshed in the second.
+    await seedOpenFinding(store, subjectOfFixtureWorktree(), 'merged-worktree');
+    const harness = gatherHarness({ store });
+    const first = await runPass(harness);
+    const second = await runPass(harness, { nowIso: LATER });
+    const firstId = first.findings.find((entry) => entry.kind === 'merged-worktree')?.findingId;
+    const secondId = second.findings.find((entry) => entry.kind === 'merged-worktree')?.findingId;
+    expect(firstId).toBeDefined();
+    expect(secondId).toBe(firstId);
+    expect(first.attention[0]?.outcome).toBe('raised');
+    expect(second.attention[0]?.outcome).toBe('refreshed');
+    // No second action: this lane performs no one-way intent, so nothing was journalled.
+    expect(harness.journal.state.appendCalls).toEqual([]);
+    expect(harness.journal.state.entries.size).toBe(0);
+  });
+
+  it('reports an unreadable read as unknown and never as empty, zero or a pass', async () => {
+    const subject = subjectOfFixtureWorktree();
+    const hostSubject = subjectOfFixtureHost();
+    // A throwing list: the clone contributes nothing and no finding is built.
+    const listHarness = gatherHarness({ workspace: makeWorkspace({ throwList: true }) });
+    const listResult = await runPass(listHarness, { policy: DISK_POLICY });
+    expect(listResult.unknown).toContainEqual({ subject: '', reason: 'worktree-list-unreadable' });
+    expect(listResult.findings.find((entry) => entry.kind === 'merged-worktree')).toBeUndefined();
+    expect(listResult.worktrees).toEqual([]);
+    // A throwing inspection: the subject is an unknown, never a half-read finding.
+    const inspectHarness = gatherHarness({ workspace: makeWorkspace({ throwInspect: true }) });
+    const inspectResult = await runPass(inspectHarness, { policy: DISK_POLICY });
+    expect(inspectResult.unknown).toContainEqual({ subject, kind: 'merged-worktree', reason: 'worktree-unreadable' });
+    expect(inspectResult.findings.find((entry) => entry.kind === 'merged-worktree')).toBeUndefined();
+    // A throwing disk read: the host is an unknown, never a zero reading.
+    const diskHarness = gatherHarness({ workspace: makeWorkspace({ throwSpace: true }) });
+    const diskResult = await runPass(diskHarness, { policy: DISK_POLICY });
+    expect(diskResult.unknown).toContainEqual({ subject: hostSubject, kind: 'disk-pressure', reason: 'disk-unreadable' });
+    expect(diskResult.findings.find((entry) => entry.kind === 'disk-pressure')).toBeUndefined();
+    // A throwing forge read: the evidence stays unknown, never a finding.
+    const forgeHarness = gatherHarness({ forgeRead: makeForgeRead(mergedPrSnapshot, true) });
+    const forgeResult = await runPass(forgeHarness, { policy: DISK_POLICY });
+    expect(forgeResult.unknown.some((entry) => entry.reason === 'forge-unreadable')).toBe(true);
+    expect(forgeResult.findings.find((entry) => entry.kind === 'merged-worktree')).toBeUndefined();
+  });
+
+  it('echoes no path and no secret-shaped text in the result, the attention summary or the finding subject', async () => {
+    const workspace = makeWorkspace({ facts: () => removalFacts({ inProgressOperations: ['MERGE_HEAD'] }) });
+    const harness = gatherHarness({ workspace });
+    const result = await runPass(harness, { policy: DISK_POLICY });
+    const serialized = JSON.stringify(result);
+    for (const forbidden of [WT_PATH, ROOT, CLONE]) {
+      expect(serialized.includes(forbidden)).toBe(false);
+    }
+    for (const { body } of harness.attention.recorded) {
+      const summary = String(body.summary);
+      expect(summary.length).toBeLessThanOrEqual(1024);
+      expect(summary.includes(WT_PATH)).toBe(false);
+      expect(summary.includes('/')).toBe(false);
+      expect(containsSecretShape(summary)).toBe(false);
+    }
+    for (const finding of result.findings) {
+      expect(finding.subject).toMatch(/^[0-9a-f]{12}$/);
+    }
+  });
+
+  it('calls only the read methods of the workspace port and never a removal, a hook or a fetch', async () => {
+    const workspace = makeWorkspace();
+    const harness = gatherHarness({ workspace });
+    await runPass(harness, { policy: DISK_POLICY });
+    for (const call of workspace.calls) {
+      expect(['listWorktrees', 'inspectWorktreeForRemoval', 'readFilesystemSpace']).toContain(call);
+    }
+    expect(workspace.forbidden).toEqual([]);
+    // The git reads never write, run hooks or reach the network: the fake only
+    // ever answered the three read methods, in that fixed set.
+    expect(new Set(workspace.calls)).toEqual(new Set(['listWorktrees', 'inspectWorktreeForRemoval', 'readFilesystemSpace']));
+  });
+
+  it('bounds the subjects, the unknowns and the summary length of one pass', async () => {
+    const many = Array.from({ length: 70 }, (_, index) => listedWorktree(`${ROOT}/wt-${index}`));
+    const workspace = makeWorkspace({ entries: many });
+    const harness = gatherHarness({ workspace });
+    const result = await runPass(harness, { policy: DISK_POLICY });
+    // At most 64 subjects were inspected and classified.
+    expect(result.findings.length).toBeLessThanOrEqual(64);
+    // The bounded unknown reasons stay under the 64-item cap.
+    for (const reason of new Set(result.unknown.map((entry) => entry.reason))) {
+      expect(result.unknown.filter((entry) => entry.reason === reason).length).toBeLessThanOrEqual(64);
+    }
+    // At most 16 clones are read and every summary stays within the cap.
+    expect(workspace.listWorktreesCount).toBe(1);
+    for (const { body } of harness.attention.recorded) {
+      expect(String(body.summary).length).toBeLessThanOrEqual(1024);
+    }
+  });
+
+  it('writes no journal intent for a worktree subject, so there is no one-way action to replay', async () => {
+    const harness = gatherHarness();
+    await runPass(harness);
+    await runPass(harness, { nowIso: LATER });
+    expect(harness.journal.state.appendCalls).toEqual([]);
+    expect(harness.journal.state.entries.size).toBe(0);
+  });
+  it('skips a retired profile even when the port returns it despite the active filter', async () => {
+    const retiredClone = { path: '/srv/retired', worktreeRoot: '/srv/retired/.worktrees' };
+    const workspace = makeWorkspace();
+    const profiles = makeProfiles([
+      profileView({ status: 'retired', clones: { 'host-retired': retiredClone } }),
+    ]);
+    const harness = gatherHarness({ workspace, profiles });
+    await runPass(harness);
+    expect(workspace.calls).toEqual([]);
+  });
+
+  it('records findings and attention under the request project and never scans another project clone', async () => {
+    const workspace = makeWorkspace();
+    const profiles = makeProfiles([
+      profileView(),
+      profileView({ projectId: 'proj-2', clones: { 'host-2': { path: '/srv/other', worktreeRoot: '/srv/other/.worktrees' } } }),
+    ]);
+    const harness = gatherHarness({ workspace, profiles });
+    await runPass(harness);
+    const roots = workspace.requests.flatMap((entry) => (entry.list === undefined ? [] : [entry.list.repositoryRoot]));
+    expect(roots).toEqual([CLONE]);
+    const spaces = workspace.requests.flatMap((entry) => (entry.space === undefined ? [] : [entry.space.path]));
+    expect(spaces).toEqual([ROOT]);
+  });
+
+  it('measures every clone on a host and reports the worst filesystem', async () => {
+    const second = { path: '/srv/clone2', worktreeRoot: '/srv/clone2/.worktrees' };
+    const workspace = makeWorkspace({
+      spaceAnswer: (req) => ({ outcome: 'read', freeBytes: req.path === second.worktreeRoot ? 100 : 200, totalBytes: 1000 }),
+    });
+    const profiles = makeProfiles([
+      profileView({ clones: { [HOST_NAME]: { path: CLONE, worktreeRoot: ROOT } } }),
+      profileView({ clones: { [HOST_NAME]: second } }),
+    ]);
+    const harness = gatherHarness({ workspace, profiles });
+    await runPass(harness, { policy: DISK_POLICY });
+    const result = await runPass(harness, { nowIso: LATER, policy: DISK_POLICY });
+    const spaces = workspace.requests.flatMap((entry) => (entry.space === undefined ? [] : [entry.space.path]));
+    expect(spaces).toContain(second.worktreeRoot);
+    expect(result.findings.find((entry) => entry.kind === 'disk-pressure')).toMatchObject({ subject: subjectOfFixtureHost(), action: 'report' });
+  });
+
+  it('uses the default clear threshold of 20 without reporting it as unordered', async () => {
+    const subject = subjectOfFixtureHost();
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, subject, 'disk-pressure');
+    const workspace = makeWorkspace({ spaceAnswer: () => ({ outcome: 'read', freeBytes: 250, totalBytes: 1000 }) });
+    const harness = gatherHarness({ workspace, store });
+    const result = await runPass(harness, { policy: { graceMinutes: 5, minFreePercent: 15 } });
+    expect(result.unknown.some((entry) => entry.reason === 'disk-thresholds-unordered')).toBe(false);
+    expect((await store.listOpenFindings()).some((record) => record.finding.kind === 'disk-pressure')).toBe(false);
+  });
+  it('leaves a host disk status unknown when one of its clones cannot be read', async () => {
+    const subject = subjectOfFixtureHost();
+    const second = { path: '/srv/clone2', worktreeRoot: '/srv/clone2/.worktrees' };
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, subject, 'disk-pressure');
+    const workspace = makeWorkspace({
+      spaceAnswer: (req) => (req.path === second.worktreeRoot
+        ? ({ outcome: 'unknown', reason: 'read-failed' } as unknown as ReadFilesystemSpaceResult)
+        : { outcome: 'read', freeBytes: 100, totalBytes: 1000 }),
+    });
+    const profiles = makeProfiles([
+      profileView({ clones: { [HOST_NAME]: { path: CLONE, worktreeRoot: ROOT } } }),
+      profileView({ clones: { [HOST_NAME]: second } }),
+    ]);
+    const harness = gatherHarness({ workspace, profiles, store });
+    const result = await runPass(harness, { policy: DISK_POLICY });
+    expect(result.unknown).toContainEqual({ subject, kind: 'disk-pressure', reason: 'disk-unreadable' });
+    expect(result.findings.some((entry) => entry.kind === 'disk-pressure')).toBe(false);
+    expect((await store.listOpenFindings()).some((record) => record.finding.kind === 'disk-pressure')).toBe(true);
+    expect(harness.attention.cleared).toEqual([]);
   });
 });

@@ -68,6 +68,7 @@ import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
 import { mergeCommands } from './merge.js';
 import { relaunchCommands } from './relaunch.js';
+import { releaseCommands } from './release.js';
 import { cutoverCommands } from './commands/cutover.js';
 import { tuiCommand } from './tui/command.js';
 
@@ -271,6 +272,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   questions: questionsCommands,
   merge: mergeCommands,
   relaunch: relaunchCommands,
+  release: releaseCommands,
   cutover: cutoverCommands,
 };
 
@@ -640,8 +642,9 @@ doctor prints one check per line (JSON documents with --json). Without
 doctor --host <name> prints only that host's probe subset.
 
 The hosts group manages the installation file's named hosts: list, add,
-edit and remove, each write confirmed and compare-and-swapped, and shows or
-installs the user-scope daemon scheduler units from the daemon section.
+edit, remove and rename, each write confirmed and compare-and-swapped, and
+shows or installs the user-scope daemon scheduler units from the daemon
+section.
 
 The seats group lists the installation file's seats, checks them with the
 loader and the doctor's seat probes (seats list, seats check), and shows or
@@ -697,7 +700,7 @@ The tui group opens the shared terminal shell: screens are read in-process from 
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
-  hosts list|add|edit|remove|daemon
+  hosts list|add|edit|remove|rename|daemon|show
   seats list|check|free-tier [status|on|off] [--yes]
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire
@@ -709,6 +712,7 @@ Commands:
   killall [--lift]
   report weekly
   relaunch inventory [--host <name>]
+  release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
   tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]

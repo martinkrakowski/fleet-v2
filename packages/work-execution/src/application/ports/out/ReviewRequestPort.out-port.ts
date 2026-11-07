@@ -1,6 +1,6 @@
 // ReviewRequestPort: the conductor's review step (plan §3.3, §3.4, §3.5). A review of one kind at one exact head under a request id the conductor journalled first; the receipt of a request id is what reconcile reads. No receipt is not a verdict.
 
-import type { ReviewKind } from '@fleet/evidence-and-acceptance';
+import type { ReviewKind, ReviewUnknownReason } from '@fleet/evidence-and-acceptance';
 
 /** The kinds a request may name: the stored review kinds plus `brief-verify` (the manifest contract), which is refused at runtime until the brief subject is implemented. */
 export type ReviewRequestKind = ReviewKind | 'brief-verify';
@@ -60,6 +60,8 @@ export interface ReviewReceiptSummary {
   readonly candidateHeadSha: string;
   readonly verdict: ReviewVerdict;
   readonly findings: readonly ReviewRequestFinding[];
+  /** Fixed cause code when `verdict === 'unknown'`; absent otherwise. */
+  readonly unknownReason?: ReviewUnknownReason;
 }
 
 export const REVIEW_REQUEST_REFUSALS = [

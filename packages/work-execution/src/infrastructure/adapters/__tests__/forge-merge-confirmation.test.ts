@@ -43,11 +43,13 @@ interface SnapshotOverride {
 
 function makeRunGh(result: { exitCode: number; stdout: string; stderr: string }) {
   const calls: string[][] = [];
-  const runGh = async (args: readonly string[]) => {
+  const timeouts: (number | undefined)[] = [];
+  const runGh = async (args: readonly string[], _ghConfigDir?: string, timeoutMs?: number) => {
     calls.push([...args]);
+    timeouts.push(timeoutMs);
     return result;
   };
-  return { calls, runGh };
+  return { calls, timeouts, runGh };
 }
 
 function makeReadPort(result: ReadPullRequestResult | { throw: true }) {
@@ -75,7 +77,8 @@ function foundSnapshot(overrides: SnapshotOverride = {}): ReadPullRequestResult 
       mergeState: 'clean',
       headSha: overrides.headSha ?? HEAD_SHA,
       headRef: BRANCH,
-      baseRef: 'main',
+      isCrossRepository: false,
+      headRepositoryOwner: 'acme',      baseRef: 'main',
       mergedAtIso: overrides.state === 'open' ? null : '2026-10-26T10:00:00.000Z',
       closedAtIso: null,
       mergeCommitSha: overrides.state === 'open' ? null : HEAD_SHA,
@@ -203,6 +206,33 @@ describe('ForgeActionAdapter merge confirmation after a non-zero gh exit', () =>
     expect(JSON.stringify(result)).not.toContain('HTTP 403');
   });
 
+  it('merges the resolved pull request number, pinned to the expected head, in the bound repository (WB5b2)', async () => {
+    const { runGh, calls } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+    const adapter = new ForgeActionAdapter({
+      runGh,
+      verifyCurrentHeadSha: async () => HEAD_SHA,
+      repository: { owner: 'acme', repo: 'app' },
+    });
+
+    const result = await adapter.performForgeAction({ ...forgeActionRequest(), pullRequestNumber: 42 });
+
+    expect(result).toEqual({ outcome: 'executed', headSha: HEAD_SHA });
+    expect(calls).toEqual([
+      ['pr', 'merge', '-R', 'acme/app', '42', '--match-head-commit', HEAD_SHA, '--merge'],
+    ]);
+    expect(calls[0]).not.toContain(BRANCH);
+  });
+
+  it('exposes the bound repository, and none when the adapter is unbound (WB5b2)', () => {
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+    expect(new ForgeActionAdapter({ runGh, repository: { owner: 'acme', repo: 'app' } }).boundRepository()).toEqual({
+      owner: 'acme',
+      repo: 'app',
+    });
+    expect(new ForgeActionAdapter({ runGh }).boundRepository()).toBeUndefined();
+    expect(new ForgeActionAdapter().boundRepository()).toBeUndefined();
+  });
+
   it('reports executed on exit 0 without ever reading the pull request', async () => {
     const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
     const { readCalls, port } = makeReadPort(foundSnapshot());
@@ -216,5 +246,140 @@ describe('ForgeActionAdapter merge confirmation after a non-zero gh exit', () =>
     expect(result).toEqual({ outcome: 'executed', headSha: HEAD_SHA });
     expect(calls).toHaveLength(1);
     expect(readCalls).toHaveLength(0);
+  });
+});
+
+describe('ForgeActionAdapter.findOpenPullRequestsByHead (legacy PR lookup)', () => {
+  const BOUND = { owner: 'acme', repo: 'app' };
+  const OWN_PR = (number: number, sha: string, owner: string, ref = BRANCH): unknown => ({
+    number,
+    head: { sha, ref, repo: { owner: { login: owner } } },
+  });
+
+  it('qualifies the head with the repository owner and ignores a fork PR of the same branch name', async () => {
+    const { runGh, calls } = makeRunGh({
+      exitCode: 0,
+      stdout: JSON.stringify([
+        OWN_PR(7, HEAD_SHA, 'acme'),
+        OWN_PR(8, HEAD_SHA, 'a-fork-owner'),
+        OWN_PR(9, HEAD_SHA, 'acme', 'feat/other'),
+      ]),
+      stderr: '',
+    });
+    const adapter = new ForgeActionAdapter({ runGh, repository: BOUND });
+
+    const result = await adapter.findOpenPullRequestsByHead({
+      repository: 'acme/app',
+      branchName: BRANCH,
+    });
+
+    expect(result).toEqual({ outcome: 'read', pullRequests: [{ number: 7, headSha: HEAD_SHA }] });
+    expect(calls).toHaveLength(1);
+    const args = JSON.stringify(calls[0]);
+    expect(args).toContain('head=acme%3Afeat%2Fexample-lane');
+    expect(args).toContain('state=open');
+  });
+
+  it('reports unreadable on a gh failure, a non-JSON answer and a throwing runGh, never an empty list', async () => {
+    for (const runGh of [
+      makeRunGh({ exitCode: 1, stdout: '', stderr: 'boom' }).runGh,
+      makeRunGh({ exitCode: 0, stdout: 'not json', stderr: '' }).runGh,
+      async () => {
+        throw new Error('spawn failed');
+      },
+    ]) {
+      const adapter = new ForgeActionAdapter({ runGh, repository: BOUND });
+      const result = await adapter.findOpenPullRequestsByHead({
+        repository: 'acme/app',
+        branchName: BRANCH,
+      });
+      expect(result.outcome).toBe('unreadable');
+    }
+  });
+
+  it('refuses when no repository is bound, and never runs gh', async () => {
+    const { runGh, calls } = makeRunGh({ exitCode: 0, stdout: '[]', stderr: '' });
+    const adapter = new ForgeActionAdapter({ runGh });
+
+    const result = await adapter.findOpenPullRequestsByHead({
+      repository: 'acme/app',
+      branchName: BRANCH,
+    });
+
+    expect(result).toEqual({ outcome: 'unreadable', reason: 'legacy-pr-lookup-unbound-repository' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses a query for a repository other than the bound one, and never runs gh', async () => {
+    const { runGh, calls } = makeRunGh({ exitCode: 0, stdout: '[]', stderr: '' });
+    const adapter = new ForgeActionAdapter({ runGh, repository: BOUND });
+
+    const result = await adapter.findOpenPullRequestsByHead({
+      repository: 'other-owner/app',
+      branchName: BRANCH,
+    });
+
+    expect(result).toEqual({ outcome: 'unreadable', reason: 'legacy-pr-lookup-repository-mismatch' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('bounds the lookup to 15 seconds and treats a full page as an incomplete list (WB5b2)', async () => {
+    const one = makeRunGh({ exitCode: 0, stdout: JSON.stringify([OWN_PR(7, HEAD_SHA, 'acme')]), stderr: '' });
+    const adapter = new ForgeActionAdapter({ runGh: one.runGh, repository: BOUND });
+    await adapter.findOpenPullRequestsByHead({ repository: 'acme/app', branchName: BRANCH });
+    expect(one.timeouts).toEqual([15_000]);
+
+    const page = (count: number): string =>
+      JSON.stringify(Array.from({ length: count }, (_, index) => OWN_PR(index + 1, HEAD_SHA, 'acme')));
+    const full = makeRunGh({ exitCode: 0, stdout: page(20), stderr: '' });
+    const fullResult = await new ForgeActionAdapter({
+      runGh: full.runGh,
+      repository: BOUND,
+    }).findOpenPullRequestsByHead({ repository: 'acme/app', branchName: BRANCH });
+    expect(fullResult).toEqual({
+      outcome: 'unreadable',
+      reason: 'the pull request lookup answer was not a complete list',
+    });
+
+    const short = makeRunGh({ exitCode: 0, stdout: page(19), stderr: '' });
+    const shortResult = await new ForgeActionAdapter({
+      runGh: short.runGh,
+      repository: BOUND,
+    }).findOpenPullRequestsByHead({ repository: 'acme/app', branchName: BRANCH });
+    expect(shortResult.outcome).toBe('read');
+  });
+
+  it('screens the bound owner and repo with the repository pattern before they reach the endpoint, and never runs gh (WB5b2)', async () => {
+    // The Kelvin sign lower-cases to a plain k, so the case-insensitive bound
+    // comparison alone lets this owner through.
+    const { runGh, calls } = makeRunGh({ exitCode: 0, stdout: '[]', stderr: '' });
+    for (const bound of [
+      { owner: 'acme-\u212A', repo: 'app' },
+      { owner: 'acme', repo: 'ap\u212Ap' },
+    ]) {
+      const adapter = new ForgeActionAdapter({ runGh, repository: bound });
+      const result = await adapter.findOpenPullRequestsByHead({
+        repository: `${bound.owner.toLowerCase().replace('\u212a', 'k')}/${bound.repo.toLowerCase().replace('\u212a', 'k')}`,
+        branchName: BRANCH,
+      });
+      expect(result.outcome).toBe('unreadable');
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  it('measures the response in bytes: a multibyte answer over the cap is refused', async () => {
+    const entry = { ...(OWN_PR(7, HEAD_SHA, 'acme') as object), pad: '\u00e9'.repeat(140_000) };
+    const stdout = JSON.stringify([entry]);
+    expect(stdout.length).toBeLessThan(262_144);
+    expect(Buffer.byteLength(stdout, 'utf8')).toBeGreaterThan(262_144);
+    const { runGh } = makeRunGh({ exitCode: 0, stdout, stderr: '' });
+    const adapter = new ForgeActionAdapter({ runGh, repository: BOUND });
+
+    const result = await adapter.findOpenPullRequestsByHead({
+      repository: 'acme/app',
+      branchName: BRANCH,
+    });
+
+    expect(result.outcome).toBe('unreadable');
   });
 });

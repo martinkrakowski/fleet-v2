@@ -1,0 +1,11 @@
+1. `packages/work-execution/src/application/ports/out/ReviewRequestPort.out-port.ts:6` — **major**. The required `ReviewRequestKind` remains `ReviewKind`; `brief-verify` is placed in a separate `ReviewRequestedKind` that `ReviewRequest.kind` does not use. A typed `brief-verify` request therefore cannot be expressed by this port, contrary to the declared contract.
+
+2. `packages/work-execution/src/application/ports/out/ChainRepositoryPort.out-port.ts:65` and `packages/work-execution/src/application/ports/out/ForgeReadPort.out-port.ts:78` — **major**. Both new required capabilities are optional methods. A conforming port implementation can typecheck without supporting pinning or open-PR listing; the use case then discovers the missing capability only at runtime. Failing case: a binding implements the existing methods but omits either new method.
+
+3. `packages/work-execution/src/application/use-cases/ReviewChainUseCase.use-case.ts:886` — **major**. The open-PR read does not pass a timeout derived from the command deadline. With a short deadline and a slow forge call, the call can continue past the budget; the use case only notices after it returns. This violates the brief’s deadline-guard requirement.
+
+4. `packages/evidence-and-acceptance/src/domain/evidence-records.ts:218` — **major**. `receiptSubjectOf` checks that the required fields for a kind are present, but permits fields belonging to other kinds to also be non-null. For example, a chain subject with a non-null `attemptId` is accepted; downstream chain-receipt checks can treat that malformed stored subject as a valid chain receipt.
+
+5. `packages/work-execution/src/application/use-cases/ReviewChainUseCase.use-case.ts:489` — **minor**. `aggregateLinkReceipts` returns an unfrozen success result, despite the requirement that every output be frozen. Failing case: any valid non-empty links input.
+
+VERDICT: FIX FIRST

@@ -722,6 +722,8 @@ export const MERGE_POLICY_BOUNDS = Object.freeze({
   intervalSeconds: Object.freeze({ min: 10, max: 3600 }),
   budgetSeconds: Object.freeze({ min: 5, max: 600 }),
   settleSeconds: Object.freeze({ min: 0, max: 600 }),
+  stallAfterMinutes: Object.freeze({ min: 1, max: 1440 }),
+  autoResumeMax: Object.freeze({ min: 0, max: 32 }),
 });
 
 /** The defaults of an absent `policy.daemon` (D-DT9). */
@@ -729,6 +731,9 @@ export const DEFAULT_MERGE_DAEMON_POLICY: ResolvedMergeDaemonPolicy = Object.fre
   intervalSeconds: 60,
   budgetSeconds: 45,
   settleSeconds: 20,
+  chainRefresh: 'shadow',
+  stallAfterMinutes: 30,
+  autoResumeMax: 2,
 });
 
 /**
@@ -1057,8 +1062,28 @@ function readDaemonSection(
     MERGE_POLICY_BOUNDS.settleSeconds,
     defaults.settleSeconds,
   );
+  // PT1a: resolves, never refuses (like `chainRefresh`): a missing, out-of-range or non-integer
+  // value reads as the default, so a typo in this optional key can never stop the merge policy.
+  const stallAfterMinutes =
+    (Object.hasOwn(block, 'stallAfterMinutes')
+      ? readBoundedInteger(readOwnDataProperty(block, 'stallAfterMinutes'), MERGE_POLICY_BOUNDS.stallAfterMinutes)
+      : undefined) ?? defaults.stallAfterMinutes;
+  // PT1b1, fix round 1: resolves, never refuses, exactly like `stallAfterMinutes` — but an
+  // invalid written value is fail-closed: it reads as `0` (never auto-resume), never as the
+  // permissive default, so a restrictive operator intent can never widen into permissiveness.
+  // An absent key still reads as the default.
+  const autoResumeMax = Object.hasOwn(block, 'autoResumeMax')
+    ? (readBoundedInteger(readOwnDataProperty(block, 'autoResumeMax'), MERGE_POLICY_BOUNDS.autoResumeMax) ?? 0)
+    : defaults.autoResumeMax;
   if (!intervalSeconds.ok || !budgetSeconds.ok || !settleSeconds.ok) {
     return DAEMON_INVALID;
+  }
+  // The chain-refresh mode resolves, never refuses: `shadow` (written or
+  // absent) is valid, and `live` or any unknown value becomes `invalid` so a
+  // typo in this optional key can never stop the whole merge policy (CO8a).
+  let chainRefresh: 'shadow' | 'invalid' = 'shadow';
+  if (Object.hasOwn(block, 'chainRefresh')) {
+    chainRefresh = readOwnDataProperty(block, 'chainRefresh') === 'shadow' ? 'shadow' : 'invalid';
   }
   if (budgetSeconds.value >= intervalSeconds.value) {
     return DAEMON_INVALID;
@@ -1068,6 +1093,9 @@ function readDaemonSection(
       intervalSeconds: intervalSeconds.value,
       budgetSeconds: budgetSeconds.value,
       settleSeconds: settleSeconds.value,
+      chainRefresh,
+      stallAfterMinutes,
+      autoResumeMax,
     }),
   );
 }
@@ -1096,9 +1124,13 @@ function compareRepositoryKeys(
  * configuration and an absent `policy.daemon` is the D-DT9 defaults; anything malformed anywhere
  * in either section (wrong type, unknown key or enum, out-of-range number, bad repository key,
  * missing `projectId`, empty or sparse `requiredContexts`, secret-shaped text, more than 256
- * repositories) refuses the whole section. Never salvages a field, never substitutes a default for
- * a written value, never throws and never runs a getter. `reason` is a code, never a value.
- * Repositories come back sorted by `repositoryKey`; `requiredContexts` keep their written order.
+ * repositories) refuses the whole section. `policy.daemon.chainRefresh` is never a refusal: only
+ * `shadow` (or absent) is `shadow`; `live` and any unknown value resolve to `invalid` (CO8a).
+ * `policy.daemon.autoResumeMax` is likewise never a refusal, but an invalid written value
+ * resolves fail-closed to `0` (never auto-resume), never to the permissive default.
+ * Never salvages a field, never substitutes a default for a written value, never throws and never
+ * runs a getter. `reason` is a code, never a value. Repositories come back sorted by
+ * `repositoryKey`; `requiredContexts` keep their written order.
  */
 export function resolveMergePolicy(policy: PolicySection | undefined): MergePolicyRead {
   try {
@@ -1129,6 +1161,11 @@ export function resolveMergePolicy(policy: PolicySection | undefined): MergePoli
  * `intervalSeconds`, `settleSeconds`) then `merge.repos` keyed by `repositoryKey` in ascending
  * order, each entry with its keys in alphabetical order and `requiredContexts` sorted ascending,
  * no whitespace. Pass the resolved sections so an absent block hashes as its default.
+ * `daemon.stallAfterMinutes` is excluded for the same reason (it gates only the stall attention),
+ * and `daemon.autoResumeMax` likewise (it gates only the auto-resume budget).
+ * `daemon.chainRefresh` is deliberately excluded: it only gates the chain-refresh job, not the
+ * merge policy, so adding it here would change the revision for every existing installation even
+ * when the key is absent and defaults to `shadow`.
  */
 export function canonicalMergePolicyJson(input: {
   readonly repositories: readonly ResolvedMergeRepositoryPolicy[];

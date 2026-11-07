@@ -43,25 +43,34 @@ import { dirname, join, resolve } from 'node:path';
 
 import type {
   ChainIntentCommand,
+  ChainListCommand,
+  ChainListResult,
   ChainOutcomeCommand,
   ChainReadCommand,
   ChainRecordDecision,
   ChainRecordRead,
+  ChainRefreshIntentCommand,
+  ChainRefreshOutcomeCommand,
   ChainRepositoryPort,
   ChainReviewPinCommand,
   ChainReviewPinDecision,
 } from '../../application/ports/out/ChainRepositoryPort.out-port.js';
 import {
+  CHAIN_REFRESH_TERMINAL_OUTCOMES,
   applyChainOutcome,
+  applyChainRefreshIntent,
+  applyChainRefreshOutcome,
   applyChainReviewPin,
   isChainActionKey,
+  isChainCommitSha,
   isChainReasonCode,
+  isChainRefreshKey,
   parseChainName,
   parseChainRepository,
   readChainRecord,
   reviewPinOf,
 } from '../../domain/chain-records.js';
-import type { ChainRecord, ChainRepositoryRef, ChainReviewPin } from '../../domain/chain-records.js';
+import type { ChainRecord, ChainRefreshTerminalOutcome, ChainRepositoryRef, ChainReviewPin } from '../../domain/chain-records.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 
 export interface ChainRepositoryAdapterOptions {
@@ -156,11 +165,17 @@ function freshDeadline(value: unknown): 'ok' | 'invalid-deadline' | 'deadline-ex
   return Date.parse(value) > Date.now() ? 'ok' : 'deadline-expired';
 }
 
+/** The list result one section answers: records, or a fixed refusal reason. */
+type ListResult =
+  | { readonly ok: true; readonly records: readonly ChainRecord[] }
+  | { readonly ok: false; readonly reason: string };
+
 /** Storage seen from inside the exclusive section. */
 interface Section {
   read(id: ChainIdentity): Promise<ChainRecordRead>;
   count(): Promise<number>;
   write(record: ChainRecord, id: ChainIdentity): Promise<void>;
+  list(repository: ChainRepositoryRef): Promise<ListResult>;
 }
 
 class StoreUnavailableError extends Error {}
@@ -347,6 +362,88 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
     }
   }
 
+  /** List the chain records of one repository under the exclusive store lock; bounded by count and size. */
+  async listChains(command: ChainListCommand): Promise<ChainListResult> {
+    try {
+      const deadline = freshDeadline(own(command, 'deadlineIso'));
+      if (deadline !== 'ok') return { status: 'unreadable', reason: deadline };
+      const repository = parseChainRepository(own(command, 'repository'));
+      if (repository === undefined) return { status: 'unreadable', reason: 'invalid-request' };
+      const listed = await this.exclusive(own(command, 'deadlineIso') as string, (section) => section.list(repository));
+      return listed.ok ? { status: 'ok', records: listed.records } : { status: 'unreadable', reason: listed.reason };
+    } catch {
+      return { status: 'unreadable', reason: 'store-unavailable' };
+    }
+  }
+
+  /** Record the keyed chain-refresh intent by CAS on the revision; written once per key. */
+  async recordChainRefreshIntent(command: ChainRefreshIntentCommand): Promise<ChainRecordDecision> {
+    try {
+      const deadline = freshDeadline(own(command, 'deadlineIso'));
+      if (deadline !== 'ok') return refused(deadline);
+      const id = identityOf(own(command, 'repository'), own(command, 'chainName'));
+      const key = own(command, 'key');
+      const mainSha = own(command, 'mainSha');
+      const expectedRevision = own(command, 'expectedRevision');
+      const atIso = own(command, 'atIso');
+      if (id === undefined || !isChainRefreshKey(key) || !isChainCommitSha(mainSha)) return refused('invalid-request');
+      if (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+        return refused('invalid-request');
+      }
+      if (!isZonedIsoDateTime(atIso)) return refused('invalid-request');
+      if (this.readOnly) return refused('read-only');
+      return await this.exclusive(own(command, 'deadlineIso') as string, async (section) => {
+        const current = await section.read(id);
+        if (current.status === 'unreadable') return refused('record-unreadable');
+        if (current.status === 'not-found') return refused('chain-not-found');
+        if (current.record.refresh?.key === key) return { outcome: 'already-recorded' } as const;
+        if (current.record.revision !== expectedRevision) return refused('stale-revision');
+        if (current.record.state !== 'started') return refused('invalid-record');
+        const next = applyChainRefreshIntent(current.record, { key, mainSha, atIso });
+        const check = readChainRecord(next);
+        if (!check.ok) return refused('invalid-record');
+        await section.write(check.record, id);
+        return { outcome: 'recorded' } as const;
+      });
+    } catch (error) {
+      return this.refusalFor(error);
+    }
+  }
+
+  /** Record the chain-refresh outcome by CAS; sets, clears or keeps the conflict mark. */
+  async recordChainRefreshOutcome(command: ChainRefreshOutcomeCommand): Promise<ChainRecordDecision> {
+    try {
+      const deadline = freshDeadline(own(command, 'deadlineIso'));
+      if (deadline !== 'ok') return refused(deadline);
+      const id = identityOf(own(command, 'repository'), own(command, 'chainName'));
+      const key = own(command, 'key');
+      const outcome = own(command, 'outcome');
+      const expectedRevision = own(command, 'expectedRevision');
+      const atIso = own(command, 'atIso');
+      if (id === undefined || !isChainRefreshKey(key)) return refused('invalid-request');
+      if (!CHAIN_REFRESH_TERMINAL_OUTCOMES.includes(outcome as ChainRefreshTerminalOutcome)) return refused('invalid-request');
+      if (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+        return refused('invalid-request');
+      }
+      if (!isZonedIsoDateTime(atIso)) return refused('invalid-request');
+      if (this.readOnly) return refused('read-only');
+      return await this.exclusive(own(command, 'deadlineIso') as string, async (section) => {
+        const current = await section.read(id);
+        if (current.status === 'unreadable') return refused('record-unreadable');
+        if (current.status === 'not-found') return refused('chain-not-found');
+        if (current.record.refresh?.key !== key) return refused('action-key-mismatch');
+        if (current.record.revision !== expectedRevision) return refused('stale-revision');
+        const next = applyChainRefreshOutcome(current.record, outcome as ChainRefreshTerminalOutcome, atIso);
+        const check = readChainRecord(next);
+        if (!check.ok) return refused('invalid-record');
+        await section.write(check.record, id);
+        return { outcome: 'recorded' } as const;
+      });
+    } catch (error) {
+      return this.refusalFor(error);
+    }
+  }
+
   // ---------- exclusive section ----------
 
   private refusalFor(error: unknown): ChainRecordDecision {
@@ -355,10 +452,10 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
     return refused('internal-error');
   }
 
-  private async exclusive(
+  private async exclusive<T>(
     deadlineIso: string,
-    run: (section: Section) => Promise<ChainRecordDecision>,
-  ): Promise<ChainRecordDecision> {
+    run: (section: Section) => Promise<T>,
+  ): Promise<T> {
     if (!this.persistent) {
       const result = this.memoryTail.then(() => run(this.memorySection()));
       this.memoryTail = result.catch(() => undefined);
@@ -368,7 +465,7 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
     const timeoutMs = Math.min(this.lockTimeoutMs, remaining);
     const decided = await this.withChainsDir(true, async (dir) => {
       return this.withStoreLock(join(dir, LOCK_FILE), timeoutMs, async () => {
-        if (freshDeadline(deadlineIso) !== 'ok') return refused('deadline-expired');
+        if (freshDeadline(deadlineIso) !== 'ok') throw new StoreUnavailableError();
         await this.removeOrphanTemps(dir);
         return run(this.fileSection(dir));
       });
@@ -423,6 +520,15 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
       count: async () => this.memory.size,
       write: async (record, id) => {
         this.memory.set(id.key, record);
+      },
+      list: async (repository) => {
+        const records: ChainRecord[] = [];
+        for (const record of this.memory.values()) {
+          if (record.repository.owner === repository.owner && record.repository.repo === repository.repo) {
+            records.push(record);
+          }
+        }
+        return records.length > CHAIN_RECORD_MAX_COUNT ? { ok: false, reason: 'record-limit' } : { ok: true, records };
       },
     };
   }
@@ -521,46 +627,106 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
       read: (id) => this.readFile(dir, id),
       count: async () => (await fs.readdir(dir)).filter((name) => name.endsWith('.json')).length,
       write: (record, id) => this.writeFile(dir, id, record),
+      list: async (repository) => {
+        // Bound the scan itself: entries read and record files opened, whichever repository
+        // they belong to; past either cap the listing is refused, never truncated.
+        const names: string[] = [];
+        let entries = 0;
+        try {
+          const handle = await fs.opendir(dir);
+          try {
+            for await (const entry of handle) {
+              entries += 1;
+              if (entries > CHAIN_RECORD_MAX_COUNT * 2) {
+                return { ok: false, reason: 'record-limit' };
+              }
+              if (entry.name.endsWith('.json')) {
+                names.push(entry.name);
+                if (names.length > CHAIN_RECORD_MAX_COUNT) {
+                  return { ok: false, reason: 'record-limit' };
+                }
+              }
+            }
+          } finally {
+            await handle.close().catch(() => undefined);
+          }
+        } catch {
+          return { ok: false, reason: 'store-unavailable' };
+        }
+        const records: ChainRecord[] = [];
+        for (const name of names) {
+          const read = await this.readRecordFile(join(dir, name));
+          if (read === 'not-found') {
+            continue;
+          }
+          if ('ok' in read) {
+            return { ok: false, reason: read.reason };
+          }
+          if (read.repository.owner === repository.owner && read.repository.repo === repository.repo) {
+            records.push(read);
+            if (records.length > CHAIN_RECORD_MAX_COUNT) {
+              return { ok: false, reason: 'record-limit' };
+            }
+          }
+        }
+        return { ok: true, records };
+      },
     };
   }
 
   private async readFile(dir: string, id: ChainIdentity): Promise<ChainRecordRead> {
-    const target = join(dir, `${id.key}.json`);
+    const read = await this.readRecordFile(join(dir, `${id.key}.json`));
+    if (read === 'not-found') {
+      return { status: 'not-found' };
+    }
+    if ('ok' in read) {
+      return unreadable(read.reason);
+    }
+    if (
+      read.repository.owner !== id.repository.owner ||
+      read.repository.repo !== id.repository.repo ||
+      read.chainName !== id.chainName
+    ) {
+      return unreadable('identity-mismatch');
+    }
+    return { status: 'ok', record: read };
+  }
+
+  /**
+   * Open and decode one stored record file without any identity expectation:
+   * `ChainRecord` when well formed, `'not-found'` when absent, a fixed refusal
+   * otherwise. Size-bounded by `CHAIN_RECORD_MAX_BYTES`.
+   */
+  private async readRecordFile(
+    target: string,
+  ): Promise<ChainRecord | 'not-found' | { readonly ok: false; readonly reason: string }> {
     let handle: fs.FileHandle;
     try {
       handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     } catch (error) {
       const code = errorCode(error);
-      if (code === 'ENOENT') return { status: 'not-found' };
-      if (code === 'ELOOP') return unreadable('symlink-refused');
-      return unreadable('store-unavailable');
+      if (code === 'ENOENT') return 'not-found';
+      if (code === 'ELOOP') return { ok: false, reason: 'symlink-refused' };
+      return { ok: false, reason: 'store-unavailable' };
     }
     try {
       const stat = await handle.stat();
-      if (!stat.isFile()) return unreadable('not-a-regular-file');
-      if (stat.size > CHAIN_RECORD_MAX_BYTES) return unreadable('record-too-large');
+      if (!stat.isFile()) return { ok: false, reason: 'not-a-regular-file' };
+      if (stat.size > CHAIN_RECORD_MAX_BYTES) return { ok: false, reason: 'record-too-large' };
       const buffer = Buffer.alloc(CHAIN_RECORD_MAX_BYTES + 1);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      if (bytesRead > CHAIN_RECORD_MAX_BYTES) return unreadable('record-too-large');
+      if (bytesRead > CHAIN_RECORD_MAX_BYTES) return { ok: false, reason: 'record-too-large' };
       let parsed: unknown;
       try {
         parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead)));
       } catch {
-        return unreadable('not-valid-json');
+        return { ok: false, reason: 'not-valid-json' };
       }
       const decoded = readChainRecord(parsed);
-      if (!decoded.ok) return unreadable(decoded.reason);
-      const record = decoded.record;
-      if (
-        record.repository.owner !== id.repository.owner ||
-        record.repository.repo !== id.repository.repo ||
-        record.chainName !== id.chainName
-      ) {
-        return unreadable('identity-mismatch');
-      }
-      return { status: 'ok', record };
+      if (!decoded.ok) return { ok: false, reason: decoded.reason };
+      return decoded.record;
     } catch {
-      return unreadable('store-unavailable');
+      return { ok: false, reason: 'store-unavailable' };
     } finally {
       await handle.close().catch(() => undefined);
     }

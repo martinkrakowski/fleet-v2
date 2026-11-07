@@ -20,6 +20,7 @@ import {
 import { CoordinationRequestRepositoryAdapter } from './CoordinationRequestRepositoryAdapter.adapter.js';
 import { AttentionItemRepositoryAdapter } from './AttentionItemRepositoryAdapter.adapter.js';
 import { OwnerItemRepositoryAdapter } from './OwnerItemRepositoryAdapter.adapter.js';
+import { OrchestratorRequestRepositoryAdapter } from './OrchestratorRequestRepositoryAdapter.adapter.js';
 import { OrchestratorSessionRepositoryAdapter } from './OrchestratorSessionRepositoryAdapter.adapter.js';
 import { OwnerQuestionRepositoryAdapter } from './OwnerQuestionRepositoryAdapter.adapter.js';
 import { ProjectProfileRepositoryAdapter } from './ProjectProfileRepositoryAdapter.adapter.js';
@@ -159,6 +160,27 @@ function openedItem(overrides: Partial<OwnerItemRecord> = {}): OwnerItemRecord {
   return { ...opened.value.toRecord(), ...overrides };
 }
 
+function orchestratorRequestRecord(requestId: string): unknown {
+  return {
+    requestId,
+    revision: 1,
+    kind: 'dispatch-attempt',
+    projectId: 'example-project',
+    target: { attemptId: 'attempt-example-1' },
+    requestedBy: { via: 'web', sessionId: 'session-example-1' },
+    createdAtIso: '2026-10-27T10:00:00.000Z',
+    expiresAtIso: '2026-10-27T10:30:00.000Z',
+    updatedAtIso: '2026-10-27T10:00:00.000Z',
+    state: 'queued',
+    fence: 0,
+    claimCount: 0,
+    claim: null,
+    deferredUntilIso: null,
+    reason: null,
+    linked: null,
+  };
+}
+
 const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
   'project-profiles.json': [profileRecord(), { ...profileRecord(), projectId: 'proj-2' }],
   'coordination-requests.json': [requestRecord(), { ...requestRecord(), id: 'req-2' }],
@@ -188,6 +210,10 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       }),
     },
   ],
+  'orchestrator-requests.json': [
+    orchestratorRequestRecord('01JB0000000000000000000000'),
+    orchestratorRequestRecord('01JB0000000000000000000001'),
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -199,6 +225,7 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
   'orchestrators.json': (stateDir) => new OrchestratorSessionRepositoryAdapter({ stateDir }).list(),
   'owner-items.json': (stateDir) => new OwnerItemRepositoryAdapter({ stateDir }).list(),
   'attention-items.json': (stateDir) => new AttentionItemRepositoryAdapter({ stateDir }).list(),
+  'orchestrator-requests.json': (stateDir) => new OrchestratorRequestRepositoryAdapter({ stateDir }).list(),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -251,15 +278,30 @@ describe('operator-coordination state file descriptors match the store readers',
   it.each(CASES)('$basename / $kind', async ({ basename, bytes, inspect, read, expectedOk }) => {
     await fs.writeFile(path.join(tempDir, basename), bytes);
     const inspection = inspect(bytes);
-    const outcome = await read(tempDir).then(
-      () => 'resolved',
-      (error: unknown) => error,
-    );
+    let thrown: unknown = null;
+    let outcome: unknown = undefined;
+    try {
+      outcome = await read(tempDir);
+    } catch (error: unknown) {
+      thrown = error;
+    }
     if (inspection.status === 'ok') {
-      expect(outcome).toBe('resolved');
+      expect(thrown).toBeNull();
+      expect(outcome).not.toBeInstanceOf(Error);
     } else {
-      expect(outcome).toBeInstanceOf(StateFileUnreadableError);
-      expect((outcome as StateFileUnreadableError).detail).toBe(inspection.detail);
+      expect(expectedOk).toBe(false);
+      if (thrown !== null) {
+        // Most readers throw the typed unreadable error with the same detail.
+        expect(thrown).toBeInstanceOf(StateFileUnreadableError);
+        expect((thrown as StateFileUnreadableError).detail).toBe(inspection.detail);
+      } else {
+        // The orchestrator-requests reader reports an unreadable store as an
+        // `unknown` outcome, never a thrown error.
+        expect(typeof outcome === 'object' && outcome !== null && 'outcome' in outcome).toBe(true);
+        const unknownOutcome = outcome as { outcome: string; code?: string };
+        expect(unknownOutcome.outcome).toBe('unknown');
+        expect(unknownOutcome.code).toBe('unreadable-store');
+      }
     }
     expect(expectedOk).toBe(inspection.status === 'ok');
   });
@@ -272,6 +314,7 @@ describe('operator-coordination state file descriptors match the store readers',
       'orchestrators.json',
       'owner-items.json',
       'attention-items.json',
+      'orchestrator-requests.json',
     ]);
   });
 

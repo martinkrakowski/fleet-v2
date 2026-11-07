@@ -22,7 +22,10 @@ import type { PlainRecordSchema } from '@fleet/shared';
 
 import {
   decideMergeRecord,
+  MERGE_RECORD_LIMITS,
+  MERGE_RECORD_MERGERS,
   MERGE_RECORD_SCHEMA_VERSION,
+  MERGE_RECORD_SOURCES,
   MergeRecord,
   type MergeRecordOutcome,
   type MergeRecordRecord,
@@ -36,10 +39,8 @@ import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import {
   assertStoreWritable,
   assertValidSchemaVersionPolicy,
-  inspectVersionedRecordListBytes,
+  readOrQuarantineVersionedRecordList,
   readStoreRecordSchemaVersion,
-  rejectUnreadableStateFile,
-  StateFileUnknownVersionError,
   withFileLock,
   writeJsonAtomically,
   type VersionedRecordParseResult,
@@ -55,14 +56,18 @@ export const MERGE_RECORD_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy(
 });
 
 const MERGE_RECORD_SCHEMA = {
-  repository: { kind: 'string', maxLength: 200 },
-  number: { kind: 'integer', min: 1, max: 999_999_999 },
-  headSha: { kind: 'string', maxLength: 64 },
-  mergedAtIso: { kind: 'string', maxLength: 40 },
-  firstSeenAtIso: { kind: 'string', maxLength: 40 },
-  source: { kind: 'literal', values: ['forge-observation', 'fleet-forge-action'] },
-  merger: { kind: 'literal', values: ['unknown', 'fleet'] },
-  actionRef: { kind: 'string', maxLength: 200, optional: true },
+  repository: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxRepositoryLength },
+  number: {
+    kind: 'integer',
+    min: MERGE_RECORD_LIMITS.minPullRequestNumber,
+    max: MERGE_RECORD_LIMITS.maxPullRequestNumber,
+  },
+  headSha: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxHeadShaLength },
+  mergedAtIso: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxIsoTimestampLength },
+  firstSeenAtIso: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxIsoTimestampLength },
+  source: { kind: 'literal', values: MERGE_RECORD_SOURCES },
+  merger: { kind: 'literal', values: MERGE_RECORD_MERGERS },
+  actionRef: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxActionRefLength, optional: true },
 } as const satisfies PlainRecordSchema;
 
 export interface MergeRecordRepositoryAdapterOptions {
@@ -85,8 +90,17 @@ function isCanonicalIso(value: unknown): boolean {
   }
 }
 
-function mergeRecordKey(repository: string, number: number): string {
-  return `${repository}#${number}`;
+/**
+ * The ASCII lower-case of a repository string: GitHub owner and repository
+ * names are ASCII, so only ASCII letters ever change case.
+ */
+function asciiLowerRepository(text: string): string {
+  return text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+/** `<repository>#<number>` on the canonical key: the store key of a merge record (one per key), ASCII-lower-cased so a pre-WB5b3 mixed-case stored record is still found (WB5b3). */
+export function mergeRecordKey(repository: string, number: number): string {
+  return `${asciiLowerRepository(repository)}#${number}`;
 }
 
 /** The runtime snapshot of a record under the store's own bounds, or null when it cannot be read. */
@@ -115,7 +129,10 @@ export function parseVersionedMergeRecordStateRecord(raw: unknown): VersionedRec
   if (fields === null) {
     return { status: 'invalid' };
   }
-  const result = MergeRecord.create(fields);
+  // A stored record loads through `fromStored`: a pre-`actionRef`
+  // `fleet-forge-action` record still loads, while a corrupt record or a
+  // `fleet-forge-action`/`unknown` pair still fails closed.
+  const result = MergeRecord.fromStored(fields);
   if (!result.success) {
     return { status: 'invalid' };
   }
@@ -141,8 +158,8 @@ type MergeRecordDecided =
 
 /**
  * One decision through the domain. A stored record is loaded through
- * `MergeRecord.create` first, so a stored record the domain refuses to load is
- * never decided against. Never throws.
+ * `MergeRecord.fromStored` first, so a stored record the domain refuses to
+ * load is never decided against. Never throws.
  */
 function decideAgainstStored(
   stored: MergeRecordRecord | undefined,
@@ -151,7 +168,7 @@ function decideAgainstStored(
   try {
     let storedRecord: MergeRecordRecord | null = null;
     if (stored !== undefined) {
-      const loaded = MergeRecord.create(stored);
+      const loaded = MergeRecord.fromStored(stored);
       if (!loaded.success) {
         return { kind: 'refused' };
       }
@@ -211,7 +228,10 @@ export class MergeRecordRepositoryAdapter implements MergeRecordRepositoryPort {
 
   private async safeStat(target: string): Promise<ChangeSignal['before']> {
     try {
-      const stat = await fs.stat(target);
+      const stat = await fs.lstat(target);
+      if (!stat.isFile()) {
+        return null;
+      }
       return { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
     } catch {
       return null;
@@ -271,7 +291,7 @@ export class MergeRecordRepositoryAdapter implements MergeRecordRepositoryPort {
       lockPath,
       async (): Promise<MergeRecordSaveOutcome> => {
         before = await this.safeStat(target);
-        const records = await this.readRecordsFromDisk(target);
+        const records = await this.readRecordsFromDisk(target, true);
         const decided = decideAgainstStored(records.get(key), incoming);
         if (decided.kind === 'refused') {
           return REFUSED;
@@ -317,34 +337,17 @@ export class MergeRecordRepositoryAdapter implements MergeRecordRepositoryPort {
     return [...records.values()];
   }
 
-  private async readRecordsFromDisk(target: string): Promise<Map<string, MergeRecordRecord>> {
+  private async readRecordsFromDisk(target: string, lockHeld = false): Promise<Map<string, MergeRecordRecord>> {
     const map = new Map<string, MergeRecordRecord>();
-    let buffer: Buffer;
-    try {
-      buffer = await fs.readFile(target);
-    } catch (error: unknown) {
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
-      ) {
-        return map;
-      }
-      throw error;
-    }
-    const readOnly = this.options?.readOnly === true;
-    const inspection = inspectVersionedRecordListBytes(buffer, parseVersionedMergeRecordStateRecord);
-    if (inspection.status === 'unknown-version') {
-      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
-    }
-    if (inspection.status === 'unreadable') {
-      return rejectUnreadableStateFile(target, inspection.detail, buffer, readOnly);
-    }
-    const listError = mergeRecordListError(inspection.records);
-    if (listError !== undefined) {
-      return rejectUnreadableStateFile(target, listError, buffer, readOnly);
-    }
-    for (const item of inspection.records) {
+    const records = await readOrQuarantineVersionedRecordList({
+      filePath: target,
+      parseRecord: parseVersionedMergeRecordStateRecord,
+      findListError: mergeRecordListError,
+      readOnly: this.options?.readOnly === true,
+      lockHeld,
+      lockTimeoutMs: MERGE_RECORD_LOCK_TIMEOUT_MS,
+    });
+    for (const item of records) {
       map.set(mergeRecordKey(item.repository, item.number), item);
     }
     return map;

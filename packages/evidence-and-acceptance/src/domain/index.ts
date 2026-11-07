@@ -5,6 +5,7 @@ export * from "./assessment-id.js";
 export * from "./check-coverage.js";
 export * from "./entities/index.js";
 export * from "./evidence-records.js";
+export * from "./failing-file.js";
 export * from "./placeholder-evidence.js";
 export * from "./review-selection.js";
 export * from "./untrusted-input.js";

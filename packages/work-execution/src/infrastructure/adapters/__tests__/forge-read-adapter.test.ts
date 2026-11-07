@@ -28,6 +28,8 @@ const MERGED_FIXTURE = JSON.stringify({
   mergeCommit: { oid: '3fe9fac07688024ae64dc5a3da66010e4418d628' },
   mergedAt: '2026-10-25T20:12:08Z',
   mergeStateStatus: 'CLEAN',
+  isCrossRepository: false,
+  headRepositoryOwner: { login: 'example-owner' },
   number: 202,
   state: 'MERGED',
 });
@@ -40,6 +42,8 @@ const OPEN_FIXTURE = JSON.stringify({
   mergeCommit: null,
   mergedAt: null,
   mergeStateStatus: 'BEHIND',
+  isCrossRepository: false,
+  headRepositoryOwner: { login: 'example-owner' },
   number: 259,
   state: 'OPEN',
 });
@@ -52,6 +56,8 @@ const CLOSED_UNMERGED_FIXTURE = JSON.stringify({
   mergeCommit: null,
   mergedAt: null,
   mergeStateStatus: 'BLOCKED',
+  isCrossRepository: false,
+  headRepositoryOwner: { login: 'example-owner' },
   number: 259,
   state: 'CLOSED',
 });
@@ -97,6 +103,8 @@ describe('ForgeReadAdapter.readPullRequest', () => {
         mergedAtIso: '2026-10-25T20:12:08.000Z',
         closedAtIso: '2026-10-25T20:12:08.000Z',
         mergeCommitSha: '3fe9fac07688024ae64dc5a3da66010e4418d628',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',
       },
     });
     expect(calls).toEqual([
@@ -124,6 +132,8 @@ describe('ForgeReadAdapter.readPullRequest', () => {
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',
       },
     });
     expect(calls[0]).toEqual([
@@ -147,6 +157,8 @@ describe('ForgeReadAdapter.readPullRequest', () => {
       mergedAt: null,
       mergeStateStatus: 'CLEAN',
       number: 311,
+      isCrossRepository: false,
+      headRepositoryOwner: { login: 'example-owner' },
       state: 'OPEN',
     });
     const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: payload, stderr: '' });
@@ -159,6 +171,26 @@ describe('ForgeReadAdapter.readPullRequest', () => {
       pullRequest: expect.objectContaining({ baseRef: 'chain/x', number: 311, state: 'open' }),
     });
     expect(calls).toHaveLength(1);
+  });
+
+  it('parses a fork PR with isCrossRepository true and a head owner login (WB5b3)', async () => {
+    const payload = JSON.stringify({
+      ...JSON.parse(OPEN_FIXTURE),
+      isCrossRepository: true,
+      headRepositoryOwner: { login: 'fork-owner' },
+    });
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: payload, stderr: '' });
+    const result = await makeAdapter({ runGh }).readPullRequest({
+      ref: { kind: 'number', number: 259 },
+    });
+
+    expect(result).toEqual({
+      outcome: 'found',
+      pullRequest: expect.objectContaining({
+        isCrossRepository: true,
+        headRepositoryOwner: 'fork-owner',
+      }),
+    });
   });
 
   it('a branch read with two open PRs reads unavailable from a recorded failure body (R4a)', async () => {
@@ -331,6 +363,29 @@ describe('ForgeReadAdapter.readPullRequest', () => {
       'short',
     ],
     ['merged without mergedAt', JSON.stringify({ ...JSON.parse(MERGED_FIXTURE), mergedAt: null }), null],
+    [
+      'missing isCrossRepository',
+      JSON.stringify((() => {
+        const rest = JSON.parse(OPEN_FIXTURE) as Record<string, unknown>;
+        delete rest.isCrossRepository;
+        return rest;
+      })()),
+      null,
+    ],
+    [
+      'missing headRepositoryOwner',
+      JSON.stringify((() => {
+        const rest = JSON.parse(OPEN_FIXTURE) as Record<string, unknown>;
+        delete rest.headRepositoryOwner;
+        return rest;
+      })()),
+      null,
+    ],
+    [
+      'headRepositoryOwner without a login',
+      JSON.stringify({ ...JSON.parse(OPEN_FIXTURE), headRepositoryOwner: { name: 'No Login' } }),
+      null,
+    ],
     [
       'open with mergedAt',
       JSON.stringify({ ...JSON.parse(OPEN_FIXTURE), mergedAt: '2026-10-25T20:12:08Z' }),
@@ -600,6 +655,220 @@ describe('ForgeReadAdapter.containsCommit (CT-2b)', () => {
       outcome: 'unavailable',
       reason: 'forge repository is not configured or not valid',
     });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('ForgeReadAdapter.readPullRequestChangedFiles', () => {
+  const secretShaped = ['ghp', '_', 'x'.repeat(36)].join('');
+
+  function filesStdout(paths: readonly string[], changedFiles?: number): string {
+    return JSON.stringify({
+      files: paths.map((path) => ({ path, additions: 1, deletions: 0 })),
+      changedFiles: changedFiles ?? paths.length,
+    });
+  }
+
+  function adapterFor(stdout: string, exitCode = 0) {
+    const calls: (readonly string[])[] = [];
+    const adapter = new ForgeReadAdapter({
+      owner: 'acme',
+      repo: 'fleet',
+      runGh: async (args) => {
+        calls.push(args);
+        return { exitCode, stdout, stderr: '' };
+      },
+    });
+    return { adapter, calls };
+  }
+
+  it('reads PR changed files exclusively via gh pr view without spawning git', async () => {
+    const { adapter, calls } = adapterFor(filesStdout(['packages/b/src/y.ts', 'packages/a/src/x.ts', 'packages/a/src/x.ts']));
+    const result = await adapter.readPullRequestChangedFiles({
+      pullRequestNumber: 42,
+      repository: { owner: 'acme', repo: 'fleet' },
+    });
+    expect(result).toEqual({ outcome: 'found', files: ['packages/a/src/x.ts', 'packages/b/src/y.ts'] });
+    expect(calls).toEqual([['pr', 'view', '42', '-R', 'acme/fleet', '--json', 'files,changedFiles']]);
+    expect(calls.every((args) => args[0] === 'pr')).toBe(true);
+  });
+
+  it('falls back to the configured repository', async () => {
+    const { adapter, calls } = adapterFor(filesStdout(['a.ts']));
+    expect(await adapter.readPullRequestChangedFiles({ pullRequestNumber: 7 })).toEqual({
+      outcome: 'found',
+      files: ['a.ts'],
+    });
+    expect(calls[0]).toEqual(['pr', 'view', '7', '-R', 'acme/fleet', '--json', 'files,changedFiles']);
+  });
+
+  it('enforces 100-file and 4-MiB stdout bounds on PR changed files and verifies changedFiles', async () => {
+    const make = (count: number) => Array.from({ length: count }, (_, index) => `packages/p/file-${index}.ts`);
+    const atBound = adapterFor(filesStdout(make(99)));
+    const found = await atBound.adapter.readPullRequestChangedFiles({ pullRequestNumber: 1 });
+    expect(found.outcome === 'found' && found.files.length).toBe(99);
+    const at100 = adapterFor(filesStdout(make(100)));
+    expect(await at100.adapter.readPullRequestChangedFiles({ pullRequestNumber: 1 })).toEqual({
+      outcome: 'unknown',
+      reason: 'too-many-files',
+    });
+    const overReported = adapterFor(filesStdout(make(50), 150));
+    expect(await overReported.adapter.readPullRequestChangedFiles({ pullRequestNumber: 1 })).toEqual({
+      outcome: 'unknown',
+      reason: 'too-many-files',
+    });
+    const huge = adapterFor(`${' '.repeat(4_194_305)}${filesStdout(['a.ts'])}`);
+    expect(await huge.adapter.readPullRequestChangedFiles({ pullRequestNumber: 1 })).toEqual({
+      outcome: 'unknown',
+      reason: 'files-too-large',
+    });
+  });
+
+  it.each([
+    ['traversal', '../secret'],
+    ['absolute', '/etc/passwd'],
+    ['trailing slash', 'packages/a/'],
+    ['control character', 'packages/a\u0007b.ts'],
+    ['leading whitespace', ' packages/a.ts'],
+    ['double slash', 'packages//a.ts'],
+    ['dot segment', 'packages/./a.ts'],
+    ['secret-shaped', `packages/${secretShaped}.ts`],
+    ['over-long', `packages/${'a'.repeat(520)}.ts`],
+  ])('never drops an unscreened path (%s): the whole read is unreadable', async (_name, bad) => {
+    const { adapter } = adapterFor(filesStdout(['packages/ok.ts', bad]));
+    const result = await adapter.readPullRequestChangedFiles({ pullRequestNumber: 3 });
+    expect(result).toEqual({ outcome: 'unknown', reason: 'unreadable-files' });
+    expect(JSON.stringify(result)).not.toContain(secretShaped);
+  });
+
+  it('reads a non-zero exit, malformed JSON, missing changedFiles and a missing or sparse files array as unknown', async () => {
+    expect(await adapterFor('', 1).adapter.readPullRequestChangedFiles({ pullRequestNumber: 3 })).toEqual({
+      outcome: 'unknown',
+      reason: 'files-failed',
+    });
+    for (const stdout of [
+      '{ not json',
+      '{}',
+      '[]',
+      '{"files":{}}',
+      '{"files":[null]}',
+      '{"files":[{"path":3}]}',
+      '{"files":[{"path":"a.ts"}]}',
+      '{"files":[{"path":"a.ts"}],"changedFiles":"1"}',
+      '{"files":[{"path":"a.ts"}],"changedFiles":-1}',
+    ]) {
+      expect(await adapterFor(stdout).adapter.readPullRequestChangedFiles({ pullRequestNumber: 3 })).toEqual({
+        outcome: 'unknown',
+        reason: 'unreadable-files',
+      });
+    }
+  });
+
+  it('reads an empty files array with changedFiles: 0 as found with no files, never as unknown', async () => {
+    expect(await adapterFor('{"files":[],"changedFiles":0}').adapter.readPullRequestChangedFiles({ pullRequestNumber: 3 })).toEqual({
+      outcome: 'found',
+      files: [],
+    });
+  });
+
+  it('reads an inconsistent forge count as unknown: changedFiles smaller than the returned files', async () => {
+    expect(
+      await adapterFor('{"files":[{"path":"packages/other/file.ts"}],"changedFiles":0}').adapter.readPullRequestChangedFiles(
+        { pullRequestNumber: 3 },
+      ),
+    ).toEqual({ outcome: 'unknown', reason: 'too-many-files' });
+  });
+
+  it('reads an inconsistent forge count as unknown: changedFiles larger than the returned files', async () => {
+    expect(
+      await adapterFor('{"files":[{"path":"a.ts"},{"path":"b.ts"}],"changedFiles":3}').adapter.readPullRequestChangedFiles(
+        { pullRequestNumber: 3 },
+      ),
+    ).toEqual({ outcome: 'unknown', reason: 'too-many-files' });
+  });
+
+  it('returns files-timed-out without calling gh when timeoutMs is not positive', async () => {
+    const { adapter, calls } = adapterFor(filesStdout(['a.ts']));
+    expect(await adapter.readPullRequestChangedFiles({ pullRequestNumber: 3, timeoutMs: 0 })).toEqual({
+      outcome: 'unknown',
+      reason: 'files-timed-out',
+    });
+    expect(await adapter.readPullRequestChangedFiles({ pullRequestNumber: 3, timeoutMs: -5 })).toEqual({
+      outcome: 'unknown',
+      reason: 'files-timed-out',
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it('returns files-timed-out when gh exceeds timeoutMs', async () => {
+    const adapter = new ForgeReadAdapter({
+      owner: 'acme',
+      repo: 'fleet',
+      runGh: () => new Promise<GhInvocationResult>(() => undefined),
+    });
+    expect(await adapter.readPullRequestChangedFiles({ pullRequestNumber: 3, timeoutMs: 20 })).toEqual({
+      outcome: 'unknown',
+      reason: 'files-timed-out',
+    });
+  });
+
+  it('reads a thrown runner as files-failed and an unconfigured adapter as unknown', async () => {
+    const throwing = new ForgeReadAdapter({
+      owner: 'acme',
+      repo: 'fleet',
+      runGh: async () => {
+        throw new Error('boom');
+      },
+    });
+    expect(await throwing.readPullRequestChangedFiles({ pullRequestNumber: 3 })).toEqual({
+      outcome: 'unknown',
+      reason: 'files-failed',
+    });
+    expect(await new ForgeReadAdapter().readPullRequestChangedFiles({ pullRequestNumber: 3 })).toEqual({
+      outcome: 'unknown',
+      reason: 'forge-not-configured',
+    });
+    expect(
+      await new ForgeReadAdapter({ owner: 'acme', repo: 'fleet' }).readPullRequestChangedFiles({
+        pullRequestNumber: 3,
+        repository: { owner: 'acme', repo: 'fleet' },
+      }),
+    ).toEqual({ outcome: 'unknown', reason: 'forge-not-configured' });
+    const { adapter, calls } = adapterFor(filesStdout(['a.ts']));
+    expect(
+      await adapter.readPullRequestChangedFiles({ pullRequestNumber: 3, repository: { owner: 'bad owner', repo: 'x' } }),
+    ).toEqual({ outcome: 'unknown', reason: 'invalid-repository' });
+    expect(calls).toEqual([]);
+  });
+
+  it('returns invalid-request unknown on malformed runtime requests and throwing getters', async () => {
+    const { adapter, calls } = adapterFor(filesStdout(['a.ts']));
+    const throwingGetter = {
+      get pullRequestNumber(): number {
+        throw new Error('hostile getter');
+      },
+    };
+    const requests: unknown[] = [
+      null,
+      7,
+      'text',
+      [],
+      {},
+      { pullRequestNumber: 0 },
+      { pullRequestNumber: 1.5 },
+      { pullRequestNumber: '42' },
+      { pullRequestNumber: 1_000_000_000 },
+      { pullRequestNumber: 3, unknownKey: true },
+      { pullRequestNumber: 3, timeoutMs: Number.NaN },
+      { pullRequestNumber: 3, timeoutMs: '20' },
+      throwingGetter,
+    ];
+    for (const request of requests) {
+      expect(await adapter.readPullRequestChangedFiles(request as never)).toEqual({
+        outcome: 'unknown',
+        reason: 'invalid-request',
+      });
+    }
     expect(calls).toEqual([]);
   });
 });

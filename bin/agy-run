@@ -56,7 +56,9 @@
 # Exit: 0 the lane ended with a non-empty response; 1 agy is missing, the dir does not qualify, the
 # run produced no response (an empty response is never a clean result), or agy failed; 2 usage;
 # 3 (--status) a lane is running; 4 agy reported a model or agent error (its exit 3, AGY_ERROR on
-# stderr); 5 denied actions with AGY_DENIED_IS_FAILURE=1; 75 refused, or --wait gave up while a lane
+# stderr); 5 denied actions with AGY_DENIED_IS_FAILURE=1; 75 refused, --wait gave up while a lane
+# still runs. 6: the run completed but the lane's own settings broke the rule afterwards
+# (trustedWorkspaces empty, no read_url), including a seeded settings file that was removed
 # still runs; 129/130/143 when stopped by HUP/INT/TERM.
 
 set -u
@@ -66,6 +68,13 @@ usage() {
 Usage: agy-run [--status|--wait|--abort|--check|--detach] --dir <worktree> --model <model>
                [--effort low|medium|high|xhigh|max] [--agent <name>] [--mode accept-edits|auto|plan|full]
                [--isolation-declared] [--sandbox] [--timeout <duration, default 45m>] [--brief <path inside --dir, default .lane/brief.md>]
+               [--ephemeral-home]
+--ephemeral-home gives the lane its own throwaway HOME, so agy's state dir, settings and
+install tree are per-run and the host's own agy home is never written. It is removed when the
+run ends. agy's sign-in AND its settings file are seeded into it from AGY_SEED_HOME, and the lane's
+own settings are re-checked against the operator's rule (trustedWorkspaces empty, no read_url) when
+the run ends: a lane that widens them exits 75. It cannot be combined with --detach, because a
+detached lane outlives this script and nothing would clean the home up.
 --mode full additionally requires --isolation-declared and is the only mode that passes
 --dangerously-skip-permissions to agy (as agy's --mode auto plus that one flag).
 The prompt is fixed: agy reads the brief and carries out its WORK ORDER. No prompt text is accepted.
@@ -90,6 +99,8 @@ agymode=accept-edits
 isolation=0
 widen=0
 sandbox=${AGY_SANDBOX:-0}
+ephemeral=${AGY_EPHEMERAL_HOME:-0}
+case $ephemeral in 0 | 1) ;; *) echo "agy-run: AGY_EPHEMERAL_HOME must be 0 or 1" >&2; exit 2 ;; esac
 timeout=45m
 brief=.lane/brief.md
 
@@ -113,6 +124,7 @@ while [ "$#" -gt 0 ]; do
     --mode=*) agymode=${1#--mode=} ;;
     --isolation-declared) isolation=1 ;;
     --sandbox) sandbox=1 ;;
+    --ephemeral-home) ephemeral=1 ;;
     --timeout) need "$@"; timeout=$2; shift ;;
     --timeout=*) timeout=${1#--timeout=} ;;
     --brief) need "$@"; brief=$2; shift ;;
@@ -129,6 +141,10 @@ done
 case "$agymode" in accept-edits | auto | plan | full) ;; *) die_usage "--mode must be accept-edits, auto, plan or full" ;; esac
 # The permission-widening flag belongs to the `full` pair and to nothing else, whichever order it came in.
 if [ "$widen" = 1 ] && { [ "$agymode" != full ] || [ "$isolation" != 1 ]; }; then refuse_permissions; fi
+if [ "$ephemeral" = 1 ] && [ "$detach" = 1 ]; then
+  echo "agy-run: --ephemeral-home cannot be combined with --detach: a detached lane outlives this script, so nothing would remove its throwaway home" >&2
+  exit 2
+fi
 if [ "$agymode" = full ] && [ "$isolation" != 1 ]; then
   die_usage "--mode full requires --isolation-declared: the isolation floor and the acknowledgement are declared for this host, never assumed here"
 fi
@@ -176,6 +192,9 @@ sha256_str() {
 }
 
 STATE=''
+lane_home=''
+home_base=''
+seeded_settings=0
 RUN_DIR=''
 lock=''
 out=''
@@ -486,6 +505,89 @@ if ! ( umask 077; set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agym
   exit 75
 fi
 
+# --ephemeral-home: the lane gets its own throwaway HOME, so agy's state dir, settings and install
+# tree are per-run and this host's own agy home is never written. 2026-11-07: agy re-creates its
+# install dir as the lane user on every run, which voided a hardened container's pins each time; a
+# per-run home removes the thing that drifts instead of loosening the check that caught it.
+if [ "$ephemeral" = 1 ]; then
+  home_base=${AGY_HOME_BASE:-${STATE%/}/agy-run/homes}
+  case $home_base in
+    /*) ;;
+    *) echo "agy-run: AGY_HOME_BASE must be an absolute path" >&2; rm -f "$lock"; exit 2 ;;
+  esac
+  if [ -L "$home_base" ]; then
+    echo "agy-run: $home_base is a symlink; refusing to use it" >&2; rm -f "$lock"; exit 2
+  fi
+  # -L catches only the last component, so a symlinked ANCESTOR could put the base somewhere else
+  # (Luna, 2026-11-07). Resolve the deepest EXISTING ancestor BEFORE creating anything: checking after
+  # mkdir -p would already have created the base through the symlink.
+  hb_anc=$home_base
+  while [ ! -d "$hb_anc" ]; do
+    hb_parent=$(dirname "$hb_anc")
+    [ "$hb_parent" = "$hb_anc" ] && break
+    hb_anc=$hb_parent
+  done
+  hb_anc_real=$(cd "$hb_anc" 2>/dev/null && pwd -P) || { echo "agy-run: could not resolve $hb_anc" >&2; rm -f "$lock"; exit 1; }
+  if [ "$hb_anc_real" != "$hb_anc" ]; then
+    echo "agy-run: $hb_anc resolves to $hb_anc_real (a symlinked ancestor of $home_base); refusing to use it" >&2; rm -f "$lock"; exit 2
+  fi
+  ( umask 077; mkdir -p "$home_base" ) 2>/dev/null || { echo "agy-run: could not create $home_base" >&2; rm -f "$lock"; exit 1; }
+  home_base_real=$(cd "$home_base" 2>/dev/null && pwd -P) || { echo "agy-run: could not resolve $home_base" >&2; rm -f "$lock"; exit 1; }
+  if [ "$home_base_real" != "$home_base" ]; then
+    echo "agy-run: $home_base resolves to $home_base_real (a symlinked ancestor); refusing to use it" >&2; rm -f "$lock"; exit 2
+  fi
+  # A dangling symlink is invisible to -e, and mkdir -p would follow it: the seeded sign-in would
+  # land outside the base and cleanup would refuse to remove it (Luna, 2026-11-07).
+  lane_home=$home_base/$run_hash.$$
+  if [ -e "$lane_home" ] || [ -L "$lane_home" ]; then
+    echo "agy-run: $lane_home already exists; refusing to reuse a lane home" >&2; rm -f "$lock"; exit 1
+  fi
+  # A run killed with SIGKILL cannot clean up, so its home (with the seeded sign-in) is left behind.
+  # Sweep those here: only plain directories directly under the base, only when the pid in the name
+  # is no longer alive, and never this run's own.
+  for stale in "$home_base"/*.[0-9]*; do
+    [ -d "$stale" ] || continue
+    [ -L "$stale" ] && continue
+    [ "$stale" = "$lane_home" ] && continue
+    # The name must be one of ours: 64 hex characters, a dot, then the pid. Without the prefix check
+    # an unrelated `anything.999999` under the base would be swept (Luna, 2026-11-07).
+    stale_name=${stale##*/}
+    stale_pid=${stale_name##*.}
+    stale_hash=${stale_name%.*}
+    case $stale_pid in ''|*[!0-9]*) continue ;; esac
+    case $stale_hash in *[!0-9a-f]*) continue ;; esac
+    [ "${#stale_hash}" = 64 ] || continue
+    # A pid that has been reused leaves a stale home behind rather than removing a live one, which is
+    # the safe direction.
+
+    kill -0 "$stale_pid" 2>/dev/null && continue
+    rm -rf "$stale"
+  done
+  ( umask 077; mkdir -p "$lane_home/.gemini/antigravity-cli" "$lane_home/.config" ) 2>/dev/null \
+    || { echo "agy-run: could not create the lane home $lane_home" >&2; rm -f "$lock"; exit 1; }
+  # Only the sign-in is seeded. Nothing else is copied: agy makes what it needs, and whatever it
+  # writes dies with this home. The token is read, never printed.
+  seed_home=${AGY_SEED_HOME:-$HOME/.gemini/antigravity-cli}
+  if [ -f "$seed_home/antigravity-oauth-token" ] && [ ! -L "$seed_home/antigravity-oauth-token" ]; then
+    ( umask 077; cat "$seed_home/antigravity-oauth-token" > "$lane_home/.gemini/antigravity-cli/antigravity-oauth-token" ) 2>/dev/null \
+      || { echo "agy-run: could not seed agy's sign-in into the lane home" >&2; rm -rf "$lane_home"; rm -f "$lock"; exit 1; }
+  else
+    echo "agy-run: no agy sign-in to seed at $seed_home/antigravity-oauth-token (or it is a symlink)." >&2
+    echo "agy-run: refusing: a lane home without a sign-in would either fail or run under an identity nobody chose." >&2
+    rm -rf "$lane_home"; rm -f "$lock"; exit 1
+  fi
+  # The settings file is seeded too, from the host's own, which the operator's dispatch-time check
+  # has just declared within the rule (trustedWorkspaces empty, no read_url). The lane therefore
+  # STARTS compliant, and check_lane_settings re-checks the lane's own copy when the run ends:
+  # without that, a per-run home would leave the host's file unwritten and its rule checking a file
+  # no lane ever used.
+  if [ -f "$seed_home/settings.json" ] && [ ! -L "$seed_home/settings.json" ]; then
+    ( umask 077; cat "$seed_home/settings.json" > "$lane_home/.gemini/antigravity-cli/settings.json" ) 2>/dev/null \
+      || { echo "agy-run: could not seed agy's settings into the lane home" >&2; rm -rf "$lane_home"; rm -f "$lock"; exit 1; }
+    seeded_settings=1
+  fi
+fi
+
 before=$(g -C "$dir" rev-parse HEAD 2>/dev/null || echo none)
 tmp=$(mk_run_tmp) || exit 1
 printf '%s\n' "$before" > "$tmp"
@@ -529,6 +631,55 @@ finish_run() { # $1: exit status to report; writes last in RUN_DIR via mktemp+mv
   rm -f "$lock"
 }
 
+# NOTE on `trustedWorkspaces` (Luna, 2026-11-07, held): the operator's guard treats a MISSING key and
+# `null` as empty (`s.get("trustedWorkspaces") not in (None, [])`), and this check mirrors it byte for
+# byte on purpose. Requiring exactly `[]` here would refuse runs the operator's own pre-dispatch check
+# passes, and two rules that disagree are worse than one that is loose. Change both or neither.
+# The operator's guard rule, byte for byte: a JSON object, `trustedWorkspaces` empty, and the raw
+# text free of `read_url`. Applied to the LANE's settings when the run ends, so a lane that widens
+# its own permissions is a failed run and not a silent one. No python3 is a failure, never a pass.
+settings_rule_ok() { # $1: the settings file
+  # A symlink here would be judged by its target, so it is a failure, not a pass (Luna, 2026-11-07).
+  [ -L "$1" ] && { echo "the lane's settings file is a symlink"; return 1; }
+  # Absence: when a file was SEEDED, something removed it, and a lane could do that to hide what it
+  # did during the run, so that is a failure. With nothing to seed there is no rule to check.
+  if [ ! -f "$1" ]; then
+    [ "$seeded_settings" = 1 ] && { echo "the seeded settings file is gone"; return 1; }
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo "no python3 to check the lane's settings"; return 1; }
+  python3 -I -c '
+import json, sys
+p = sys.argv[1]
+text = open(p, encoding="utf-8").read()
+s = json.loads(text)
+if not isinstance(s, dict): sys.exit("settings.json is not a JSON object")
+if s.get("trustedWorkspaces") not in (None, []): sys.exit("trustedWorkspaces is not empty")
+if "read_url" in text: sys.exit("read_url appears in settings.json")
+' "$1"
+}
+
+# Bound: this runs after the lane's own process has exited, so it cannot catch a process that
+# lingers and rewrites the file afterwards. That case is what the operator's own check catches with
+# "no lane process left" before and after every round; it is not covered here.
+check_lane_settings() { # 0 within the rule or not applicable; 1 the lane widened its own settings
+  [ "$ephemeral" = 1 ] && [ -n "$lane_home" ] || return 0
+  cls_why=$(settings_rule_ok "$lane_home/.gemini/antigravity-cli/settings.json" 2>&1) && return 0
+  echo "agy-run: the lane's own agy settings BREAK the rule after the run: ${cls_why:-unreadable}" >&2
+  echo "agy-run: a lane may not widen its own permissions (trustedWorkspaces empty, no read_url); this run is a failure and the owner looks" >&2
+  return 1
+}
+
+clean_lane_home() { # removes the throwaway home, never the worktree; a no-op without --ephemeral-home
+  [ "$ephemeral" = 1 ] || return 0
+  [ -n "$lane_home" ] && [ -n "$home_base" ] || return 0
+  [ -L "$lane_home" ] && { echo "agy-run: $lane_home is a symlink; leaving it alone" >&2; return 0; }
+  case $lane_home in
+    "$home_base"/?*) rm -rf "$lane_home" ;;
+    *) echo "agy-run: refusing to remove $lane_home: it is not under $home_base" >&2 ;;
+  esac
+}
+
 stop_run() { # $1: exit status
   trap '' INT TERM HUP
   if [ "$detach" = 1 ]; then
@@ -544,6 +695,8 @@ stop_run() { # $1: exit status
     echo "agy-run: stopped; the lane in $dir was stopped with it" >&2
   fi
   cat "$err" >&2
+  check_lane_settings || true
+  clean_lane_home
   finish_run "$1"
   exit "$1"
 }
@@ -555,6 +708,9 @@ trap 'stop_run 129' HUP
 # ignores HUP, so it survives the end of the ssh session that started it.
 if [ "$detach" = 1 ]; then
   ( trap '' HUP; cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
+elif [ "$ephemeral" = 1 ]; then
+  ( cd "$dir" && exec env HOME="$lane_home" XDG_CONFIG_HOME="$lane_home/.config" \
+      AGY_HOME="$lane_home/.gemini/antigravity-cli" "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 else
   ( cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 fi
@@ -602,7 +758,11 @@ case "$flat" in
     echo "agy-run: agy DENIED itself these actions (headless mode cannot ask): $names" >&2
     echo "agy-run: an allow rule for them belongs in agy's settings on this host, scoped to the worktree root; that is an owner change" >&2
     cid=$(printf '%s' "$flat" | sed -n 's/.*"conversation_id":"\([^"]*\)".*/\1/p')
-    agyhome=${AGY_HOME:-$HOME/.gemini/antigravity-cli}
+    if [ "$ephemeral" = 1 ] && [ -n "$lane_home" ]; then
+      agyhome=$lane_home/.gemini/antigravity-cli
+    else
+      agyhome=${AGY_HOME:-$HOME/.gemini/antigravity-cli}
+    fi
     if [ -n "$cid" ] && ls "$agyhome/conversations/$cid".db* >/dev/null 2>&1; then
       targets=$(cat "$agyhome/conversations/$cid".db* 2>/dev/null | LC_ALL=C grep -ao 'denied permission for [a-z_]*([^)]*)' | sed 's/^denied permission for //' | sort -u)
       if [ -n "$targets" ]; then
@@ -613,6 +773,12 @@ case "$flat" in
     [ "$status" = 0 ] && [ "${AGY_DENIED_IS_FAILURE:-0}" = 1 ] && status=5
     ;;
 esac
+# A lane that widened its own settings COMPLETED and then failed policy, which is not a refusal:
+# callers need to tell those apart, so it has its own code (6).
+if ! check_lane_settings; then
+  [ "$status" = 0 ] && status=6
+fi
+clean_lane_home
 finish_run "$status"
 echo "agy-run: ended after $(( $(date +%s) - start )) s with exit $status (model $model, mode $agymode, HEAD before: $before, out: $out)" >&2
 exit "$status"

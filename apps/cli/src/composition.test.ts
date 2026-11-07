@@ -131,6 +131,17 @@ describe('apps/cli composition', () => {
     });
   });
 
+  describe('WB5b: the merge path saves a merge record', () => {
+    it('the composed forge use case is wired with the merge-record and lane-plan stores', () => {
+      const rt = createFleetCliRuntime();
+      const forgeDeps = (rt.execution.executeAuthorizedForgeAction as unknown as {
+        deps?: { mergeRecordRepo?: unknown; lanePlanRepo?: unknown };
+      }).deps;
+      expect(forgeDeps?.mergeRecordRepo).toBeDefined();
+      expect(forgeDeps?.lanePlanRepo).toBeDefined();
+    });
+  });
+
   describe('H7: end-to-end grant action scope check at consumption', () => {
     it('a grant for push-and-open-pr at head H cannot be consumed for merge-pr at H', async () => {
       const rt = createFleetCliRuntime();
@@ -175,12 +186,49 @@ describe('apps/cli composition', () => {
         forgeDeps.acceptedReceiptByHead[headH] = 'receipt-e2e-1';
       }
 
+      // WB5b2: the typed completed entry confirms number 7, so the request reaches
+      // the grant check this test is about.
+      await rt.execution.executionJournal.appendJournalEntry({
+        id: 'forge:action-open:completed:1',
+        attemptId,
+        workOrderId,
+        action: 'forge',
+        status: 'completed',
+        baseCommit: headH,
+        recordedAtIso: '2026-10-15T09:00:00Z',
+        sessionId: null,
+        detail: null,
+        pullRequest: { repository: 'org/repo', number: 7 },
+      });
+      (rt.execution.executeAuthorizedForgeAction as unknown as {
+        deps: { forgePort: { boundRepository?: unknown } };
+      }).deps.forgePort.boundRepository = () => ({ owner: 'org', repo: 'repo' });
+      (rt.execution.executeAuthorizedForgeAction as unknown as { deps: { forgeRead?: unknown } }).deps.forgeRead = {
+        readPullRequest: async () => ({
+          outcome: 'found',
+          pullRequest: {
+            number: 7,
+            state: 'open',
+            mergeState: 'clean',
+            headSha: headH,
+            headRef: 'feat/lane-cli-test',
+            isCrossRepository: false,
+            headRepositoryOwner: 'org',
+baseRef: 'main',
+            mergedAtIso: null,
+            closedAtIso: null,
+            mergeCommitSha: null,
+          },
+        }),
+      };
+
       // Attempt to execute merge-pr at head H using the push grant
       const mergeResult = await rt.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction({
         actionId: 'action-merge-1',
         attemptId,
         workOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: headH,
         authorizationGrantId: grantId,
       });
@@ -246,6 +294,7 @@ describe('apps/cli composition', () => {
         attemptId,
         workOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: headH,
         authorizationGrantId: grantId,
       });
@@ -297,6 +346,7 @@ describe('apps/cli composition', () => {
         attemptId,
         workOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: headH,
         authorizationGrantId: grantId,
       });
@@ -677,6 +727,8 @@ describe('apps/cli composition', () => {
             closedAt: null,
             mergeCommit: null,
             mergeStateStatus: 'CLEAN',
+            isCrossRepository: false,
+            headRepositoryOwner: { login: 'org' },
           }),
           stderr: '',
         };

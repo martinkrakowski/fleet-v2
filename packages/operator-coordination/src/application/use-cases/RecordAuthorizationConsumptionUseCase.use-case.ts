@@ -15,6 +15,7 @@ import type {
 } from '../../domain/coordination-records.js';
 import { AuthorizationConsumption } from '../../domain/entities/AuthorizationConsumption.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
+import { isReleaseActionScope } from '../../domain/coordination-records.js';
 import type {
   RecordAuthorizationConsumptionPort,
   RecordAuthorizationConsumptionRequest,
@@ -37,6 +38,20 @@ const REQUIRED_TEXT_FIELDS = [
 
 function refused(reason: string): RecordAuthorizationConsumptionResult {
   return { outcome: 'refused', reason };
+}
+
+/** The refusal for a grant that already authorized an action: the same action, or a second one. */
+function alreadyAuthorizedMessage(grantId: string, existingActionId: string, requestedActionId: string): string {
+  return existingActionId === requestedActionId
+    ? `grant ${grantId} already authorized action ${existingActionId}`
+    : `grant ${grantId} already authorized action ${existingActionId} and never a second action`;
+}
+
+/** The supplied clock instant when it is non-blank text, else the current instant. */
+function consumedAtOf(request: RecordAuthorizationConsumptionRequest): string {
+  return typeof request.nowIso === 'string' && request.nowIso.trim().length > 0
+    ? request.nowIso
+    : new Date().toISOString();
 }
 
 export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizationConsumptionPort {
@@ -74,11 +89,7 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     if (existing !== undefined) {
       // One grant, one action: a second, unrelated action is never authorized,
       // and the same action is never recorded twice.
-      return refused(
-        existing.actionId === request.actionId.trim()
-          ? `grant ${grantId} already authorized action ${existing.actionId}`
-          : `grant ${grantId} already authorized action ${existing.actionId} and never a second action`,
-      );
+      return refused(alreadyAuthorizedMessage(grantId, existing.actionId, request.actionId.trim()));
     }
     if (recorded.state !== 'approved') {
       return refused(`grant ${grantId} is ${recorded.state}, which authorizes no action`);
@@ -94,12 +105,26 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
         `grant ${grantId} was recorded for commit ${recorded.expectedHeadSha ?? 'none'}, not ${request.expectedHeadSha.trim()}`,
       );
     }
+    // A grant that records an attempt, owner or policy, authorizes no other
+    // (CO24e). A version-2 record without one authorizes nothing. A legacy grant
+    // records no attempt and keeps the composition's own binding (CO24d) until
+    // it expires. Both checks run before anything is recorded. A release grant
+    // (CO14, CO24g) is attempt-less by design: only the three exact release
+    // scopes (`release:install`, `release:swap`, `release:rollback`) are
+    // exempt, each anchored by its scope and exact head and consumed once, so
+    // the consumption records the deterministic action id as its attempt
+    // coordinate; an unknown `release:*` scope is an owner grant and stays
+    // under the recorded-attempt check.
     const aggregate = CoordinationRequest.fromRecord(recorded);
+    if (!isReleaseActionScope(recorded.actionScope) && aggregate.isMissingRecordedAttempt()) {
+      return refused('grant-attempt-unrecorded');
+    }
+    const boundAttemptId = aggregate.getBoundAttemptId();
+    if (boundAttemptId !== null && boundAttemptId !== request.attemptId.trim()) {
+      return refused('grant-attempt-mismatch');
+    }
     // The composition root supplies the clock; no authority depends on it here.
-    const consumedAtIso =
-      typeof request.nowIso === 'string' && request.nowIso.trim().length > 0
-        ? request.nowIso
-        : new Date().toISOString();
+    const consumedAtIso = consumedAtOf(request);
     const consumption: AuthorizationConsumptionRecord = AuthorizationConsumption.fromRecord({
       consumptionId: request.consumptionId.trim(),
       grantId,

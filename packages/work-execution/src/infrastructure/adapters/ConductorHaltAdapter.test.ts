@@ -90,6 +90,47 @@ describe.each(['memory', 'file'] as const)('ConductorHaltAdapter (%s)', (mode) =
     const result = await adapter.set({ halted: true, nowIso: '2026-10-27T12:00:00+02:00' });
     expect(result.outcome === 'changed' && result.record.changedAtIso).toBe('2026-10-27T10:00:00.000Z');
   });
+
+  it('refuses null, sparse array, extra fields, wrong types, and throwing getters on set without throwing', async () => {
+    // null and primitives are not plain records.
+    expect(await adapter.set(null as unknown as { halted: boolean; nowIso: string })).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+    });
+    expect(await adapter.set('halted' as unknown as { halted: boolean; nowIso: string })).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+    });
+    // A sparse array: length keys beyond the allowed two, holes included.
+    const sparse = new Array(2);
+    sparse[0] = true;
+    expect(await adapter.set(sparse as unknown as { halted: boolean; nowIso: string })).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+    });
+    // An extra field is refused even with both required fields valid.
+    expect(
+      await adapter.set({ halted: true, nowIso: NOW, extra: 'x' } as unknown as { halted: boolean; nowIso: string }),
+    ).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    // A wrong halted type and an oversized nowIso are refused.
+    expect(
+      await adapter.set({ halted: 'yes', nowIso: NOW } as unknown as { halted: boolean; nowIso: string }),
+    ).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(await adapter.set({ halted: true, nowIso: `2026-10-27T10:00:00.000Z${'0'.repeat(60)}` })).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+    });
+    // A throwing getter never runs: the snapshot refuses the record instead.
+    const hostile = {
+      get halted(): boolean {
+        throw new Error('getter must never run');
+      },
+      nowIso: NOW,
+    };
+    expect(await adapter.set(hostile)).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    // Nothing was written anywhere.
+    expect(await adapter.read()).toEqual({ state: 'clear', record: null });
+  });
 });
 
 describe('ConductorHaltAdapter file shape, unreadable marker and file names', () => {

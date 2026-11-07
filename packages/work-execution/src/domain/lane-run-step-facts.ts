@@ -16,6 +16,9 @@ import type { LaneRunKeyStep } from './lane-run-records.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { SeatFailureOutcome } from './seat-selection.js';
 
+/** The fixed reason code of the result that closes an ambiguous pending intent an operator stop or resume abandoned (F171). */
+export const LANE_RUN_INTENT_ABANDONED_REASON_CODE = 'intent-abandoned-by-operator' as const;
+
 /** The conductor's result reason codes (K4); each matches LANE_RUN_JOURNAL_REASON_CODE_PATTERN. Stored data: version with the journal. */
 export const LANE_RUN_RESULT_REASON_CODES = [
   'prepared', 'prepare-refused', 'prepare-fix-round-not-built', 'no-frozen-brief', 'seat-missing',
@@ -28,6 +31,7 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'gate-passed', 'gate-failed', 'gate-unknown', 'reconciled',
   'review-passed', 'review-failed', 'review-no-receipt', 'review-refused', 'review-unknown',
   'assessment-unavailable', 'review-seat-unavailable',
+  'seat-busy', 'review-superseded',
   'resumed', 'run-stopped', 'stale-revision', 'not-parked', 'stop-pending', 'one-way-door', 'fix-no-progress',
   'accepted', 'acceptance-rejected', 'acceptance-unknown', 'pr-opened',
   'pushed', 'forge-refused', 'forge-ambiguous', 'grant-refused', 'merged', 'merge-not-merged', 'merge-waiting',
@@ -39,6 +43,7 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'merge-dropped', 'merge-held', 'merge-enqueue-refused', 'merge-overtaken',
   'ci-failed', // GB4: the keyed `ci` step's refusal of the exact head's CI read
   'ci-overtaken', // GB4 fix rounds 1-2: a pending `ci` intent whose head/round moved, or whose CI has since passed
+  LANE_RUN_INTENT_ABANDONED_REASON_CODE, // F171: an operator stop or resume closed an ambiguous pending intent
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 
@@ -287,6 +292,9 @@ export function laneRunPremergePost(
     }
     const parsed = parseLaneRunKey(entry.key);
     if (parsed === null || parsed.kind !== 'premerge' || parsed.head12 !== head12) {
+      continue;
+    }
+    if (entry.reasonCode === LANE_RUN_INTENT_ABANDONED_REASON_CODE) {
       continue;
     }
     if (entry.reasonCode === 'premerge-success') {

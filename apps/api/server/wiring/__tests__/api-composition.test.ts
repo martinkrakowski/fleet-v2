@@ -47,7 +47,6 @@ import {
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
   ReserveExecutionCapacityUseCase,
-  StopAttemptUseCase,
 } from "@fleet/work-execution/use-cases";
 
 import {
@@ -599,6 +598,28 @@ describe("configured compositions execute real operations", () => {
     });
     expect(decided.outcome).toBe("requested");
 
+    // CO24f: the real API composition refuses a forge action decision with no
+    // attempt, and one whose attempt carries a bidi override, as typed rejections.
+    const forgeDecision = {
+      projectId: PROFILE_REQUEST.projectId,
+      kind: "action-decision",
+      actionScope: "forge:merge-pr",
+      proposalDigest: "digest-forge",
+      policyRevision: PROFILE_REQUEST.policyRevision,
+      expectedHeadSha: VERIFICATION_REQUEST.candidateHeadSha,
+    };
+    const forgeNoAttempt = await operator.requestScopedDecision.execute({
+      ...forgeDecision,
+      requestId: "req-forge-no-attempt",
+    });
+    expect(forgeNoAttempt.outcome).toBe("rejected");
+    const forgeBidiAttempt = await operator.requestScopedDecision.execute({
+      ...forgeDecision,
+      requestId: "req-forge-bidi-attempt",
+      attemptId: "att\u202eevil",
+    });
+    expect(forgeBidiAttempt.outcome).toBe("rejected");
+
     const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization({
       projectId: PROFILE_REQUEST.projectId,
       actionScope: `${WORK_ORDER_REQUEST.workOrderId}/merge-pr`,
@@ -850,7 +871,13 @@ describe("composition type surface", () => {
     expect(work.reserveExecutionCapacity).toBeInstanceOf(ReserveExecutionCapacityUseCase);
     expect(work.dispatchAttempt).toBeInstanceOf(DispatchAttemptUseCase);
     expect(work.reconcileAttempt).toBeInstanceOf(ReconcileAttemptUseCase);
-    expect(work.stopAttempt).toBeInstanceOf(StopAttemptUseCase);
+    // A-C: stopAttempt is guarded, so its run-owned refusal wrapper reports
+    // the guard's shape rather than the use case class itself.
+    expect(typeof work.stopAttempt.execute).toBe("function");
+    expect(typeof work.stopAttempt.stopAttempt).toBe("function");
+    expect(typeof work.setConductorHalt.set).toBe("function");
+    expect(typeof work.requestLaneRunStop.requestLaneRunStop).toBe("function");
+    expect(typeof work.runControlLimiter.run).toBe("function");
     expect(work.collectAttemptArtifacts).toBeInstanceOf(CollectAttemptArtifactsUseCase);
     expect(typeof work.prepareFixAttempt.execute).toBe("function");
     expect(work.requestAttemptAcceptance).toBeInstanceOf(RequestAttemptAcceptanceUseCase);

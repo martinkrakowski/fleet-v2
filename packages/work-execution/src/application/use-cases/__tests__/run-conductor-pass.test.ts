@@ -10,6 +10,10 @@ import { describe, expect, it } from 'vitest';
 
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
+import { laneRunJournalPendingIntent, laneRunJournalState } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
+import { WorkOrderRepositoryAdapter } from '../../../infrastructure/adapters/WorkOrderRepositoryAdapter.adapter.js';
+import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunParkRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LeaseRenewRequest } from '../../../domain/lane-run-lease.js';
@@ -1354,6 +1358,338 @@ describe('RunConductorPassUseCase real advance (KF-34a2)', () => {
       throw new Error('expected an advanced run 2 report');
     }
     expect(run2Report.steps.some((step) => step.outcome === 'acted' && step.step === 'stop')).toBe(true);  });
+});
+
+describe('RunConductorPassUseCase ambiguous intent stop and resume (PT1b3a / HN1)', () => {
+  const COMMIT = '0123456789abcdef0123456789abcdef01234567';
+  const HEAD12 = '0123456789ab';
+  const GATE_KEY = `${RUN_ID}/r0/gate/0@${HEAD12}`;
+  const STOP_KEY = `${RUN_ID}/r0/stop/0`;
+  const RESUME_KEY = `${RUN_ID}/park/1/resume@cli`;
+  const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
+  const BRIEF_PROSE = '# Task\n\nExample lane brief.\n';
+  const FROZEN_MANIFEST_JSON = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+  const BRIEF_DIGEST = simpleDeterministicHexDigest(BRIEF_PROSE + '\n' + FROZEN_MANIFEST_JSON);
+  const RUNNER: AttemptRunnerRecord = {
+    kind: 'opencode',
+    remotePort: 4166,
+    host: 'lane-alias-example',
+    hostName: 'lane-host-example',
+    agent: null,
+    model: null,
+    variant: null,
+  };
+  const SEAT_PLAN = {
+    version: 1 as const,
+    'first-pass': [{ id: 'fp-1', model: 'model-example-1', tool: 'opencode' }],
+    fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
+    review: [],
+  };
+  const GATE_PARK: LaneRunParkRecord = { reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating', questionId: null };
+  const STOP_PARK: LaneRunParkRecord = { reason: 'ambiguous', qualifier: 'stop', parkedFrom: 'running', questionId: null };
+
+  function attempt(overrides: Partial<AttemptRecord>): AttemptRecord {
+    return {
+      id: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: WORKTREE,
+      baseCommit: COMMIT,
+      state: 'collected',
+      outcome: null,
+      briefDigest: BRIEF_DIGEST,
+      briefPackagePath: '.lane/brief-package',
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: null,
+      runner: RUNNER,
+      seatPlan: SEAT_PLAN,
+      seatSelection: { role: 'first-pass', seatIndex: 0, seatId: 'fp-1', model: 'model-example-1', tool: 'opencode', variant: null, agent: null },
+      stopReason: 'none',
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+      ...overrides,
+    };
+  }
+
+  const COLLECTED = attempt({
+    state: 'collected',
+    artifacts: { headCommit: COMMIT, commitsSinceBase: [COMMIT], collectedArtifactPaths: [], notes: 'present' },
+  });
+  const RUNNING = attempt({ state: 'running', sessionId: 'session-example-1', dispatchedTimeLimitSeconds: 2700 });
+
+  function stepKeyOf(step: 'dispatch' | 'stop', attemptOrdinal: number | null): string {
+    const built = buildLaneRunStepKey({ runId: RUN_ID, round: 0, step, seatIndex: 0, attemptOrdinal, head12: null, retry: null });
+    if (!built.ok) {
+      throw new Error('fixture must build a step key');
+    }
+    return built.key;
+  }
+
+  interface Hn1 {
+    readonly runRepo: LaneRunRepositoryAdapter;
+    readonly journal: LaneRunJournalAdapter;
+    readonly workOrderRepo: WorkOrderRepositoryAdapter;
+    readonly driverLease: ConductorDriverLeaseAdapter;
+    readonly halt: ConductorHaltAdapter;
+    readonly ulid: () => string;
+    readonly advanceDeps: AdvanceLaneRunDependencies;
+  }
+
+  /** HN1's exact shape (or its running twin): a run parked `ambiguous` over an open, ambiguous pending intent. */
+  async function hn1(shape: 'gate' | 'stop'): Promise<Hn1> {
+    const runRepo = new LaneRunRepositoryAdapter();
+    const journal = new LaneRunJournalAdapter();
+    const attemptRepo = new AttemptRepositoryAdapter();
+    const executionJournal = new ExecutionJournalAdapter();
+    const workOrderRepo = new WorkOrderRepositoryAdapter();
+    const ulid = freshUlidFactory();
+    await workOrderRepo.saveWorkOrder({
+      id: 'wo-example-1',
+      projectId: 'project-example-1',
+      taskId: 'task-example-1',
+      laneId: 'lane-example-1',
+      repository: 'repo-example-1',
+      baseCommit: COMMIT,
+      ownedPaths: ['src'],
+      policyRevision: 'policy-example-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    expect((await runRepo.create(runRecord())).outcome).toBe('saved');
+    expect(
+      (await runRepo.acquireLease(RUN_ID, { holderId: HOLDER, observedFence: 0, leaseUntilIso: LEASE_UNTIL, nowIso: NOW })).outcome,
+    ).toBe('saved');
+    expect(
+      (
+        await runRepo.save(
+          runRecord({
+            parked: shape === 'gate' ? GATE_PARK : STOP_PARK,
+            parkCount: 1,
+            revision: 2,
+            lease: { holderId: HOLDER, fence: 1, leaseUntilIso: LEASE_UNTIL },
+          }),
+          { holderId: HOLDER, fence: 1, nowIso: NOW },
+        )
+      ).outcome,
+    ).toBe('saved');
+    await attemptRepo.saveAttempt(shape === 'gate' ? COLLECTED : RUNNING);
+    await executionJournal.saveCapacityReservation({
+      id: ulid(),
+      attemptId: 'attempt-example-1',
+      hostId: 'host-example-1',
+      slotIndex: 0,
+      held: false,
+      seatTool: 'opencode',
+      reservedAtIso: NOW,
+      releasedAtIso: NOW,
+    });
+    const entries =
+      shape === 'gate'
+        ? [
+            laneRunConductEntry(ulid(), RUN_ID, 'gating', NOW),
+            laneRunIntentEntry(ulid(), RUN_ID, GATE_KEY, null, NOW),
+            laneRunResultEntry(ulid(), RUN_ID, GATE_KEY, 'ambiguous', 'gate-unknown', NOW),
+            laneRunConductEntry(ulid(), RUN_ID, 'parked', NOW),
+          ]
+        : [
+            laneRunConductEntry(ulid(), RUN_ID, 'running', NOW),
+            laneRunIntentEntry(ulid(), RUN_ID, stepKeyOf('dispatch', 1), 'attempt-example-1', NOW),
+            laneRunResultEntry(ulid(), RUN_ID, stepKeyOf('dispatch', 1), 'completed', 'dispatch-started', NOW),
+            laneRunIntentEntry(ulid(), RUN_ID, STOP_KEY, null, NOW),
+            laneRunResultEntry(ulid(), RUN_ID, STOP_KEY, 'ambiguous', 'stop-unconfirmed', NOW),
+            laneRunConductEntry(ulid(), RUN_ID, 'parked', NOW),
+          ];
+    for (const entry of entries) {
+      expect((await journal.append(entry)).outcome).toBe('appended');
+    }
+    const advanceDeps: AdvanceLaneRunDependencies = {
+      runRepo,
+      runJournal: journal,
+      attemptRepo,
+      executionJournal,
+      artifactPort: {
+        readBriefManifest: async () => FROZEN_MANIFEST_JSON,
+        readBriefFile: async () => BRIEF_PROSE,
+        verifyArtifactManifest: async () => ({ outcome: 'sealed' }) as never,
+      },
+      reconcileAttempt: { reconcileAttempt: async () => ({ outcome: 'refused', reason: 'not-found' }) },
+      admission: { admit: async () => ({ outcome: 'admitted' }) },
+      workOrderRepo,
+      workOrderRelease: workOrderRepo,
+      newUlid: ulid,
+    };
+    return { runRepo, journal, workOrderRepo, driverLease: new ConductorDriverLeaseAdapter(), halt: new ConductorHaltAdapter(), ulid, advanceDeps };
+  }
+
+  /** A journal that refuses the first conduct entry for `state`, as a crash would; every other call passes through. */
+  function crashOnConduct(journal: LaneRunJournalAdapter, state: string): LaneRunJournalPort {
+    let armed = true;
+    return {
+      append: async (entry) => {
+        if (armed && entry.kind === 'conduct' && entry.state === state) {
+          armed = false;
+          return { outcome: 'refused', reason: 'invalid-entry', detail: null };
+        }
+        return journal.append(entry);
+      },
+      listForRun: (runId) => journal.listForRun(runId),
+      listForKey: (key) => journal.listForKey(key),
+    };
+  }
+
+  function passOf(h: Hn1, journals: { advance?: LaneRunJournalPort; resume?: LaneRunJournalPort } = {}): RunConductorPassUseCase {
+    return new RunConductorPassUseCase({
+      driverLease: h.driverLease,
+      runRepo: h.runRepo,
+      runJournal: h.journal,
+      halt: h.halt,
+      resume: new ResumeLaneRunUseCase({ runRepo: h.runRepo, runJournal: journals.resume ?? h.journal, newUlid: h.ulid }),
+      advance: new AdvanceLaneRunUseCase({ ...h.advanceDeps, runJournal: journals.advance ?? h.journal }),
+      now: () => NOW,
+    });
+  }
+
+  async function recordStop(h: Hn1): Promise<void> {
+    const stop = new RequestLaneRunStopUseCase({ runRepo: h.runRepo, runJournal: h.journal });
+    expect(await stop.requestLaneRunStop({ runId: RUN_ID, mode: 'force', via: 'cli', entryId: ENTRY_1, nowIso: NOW })).toMatchObject({
+      outcome: 'stop-recorded',
+    });
+  }
+
+  async function recordResume(h: Hn1): Promise<void> {
+    const resume = new ResumeLaneRunUseCase({ runRepo: h.runRepo, runJournal: h.journal, newUlid: h.ulid });
+    expect(await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW })).toMatchObject({
+      outcome: 'resume-recorded',
+      key: RESUME_KEY,
+    });
+  }
+
+  function stepsOf(result: RunConductorPassResult): readonly AdvanceLaneRunResult[] {
+    if (result.outcome !== 'completed') {
+      throw new Error('expected a completed pass, got ' + JSON.stringify(result));
+    }
+    const run = result.runs.find((report) => report.runId === RUN_ID);
+    if (run === undefined || run.outcome !== 'advanced') {
+      throw new Error('expected an advanced run report');
+    }
+    return run.steps;
+  }
+
+  const finalsOf = (entries: readonly LaneRunJournalEntryRecord[], key: string): readonly LaneRunJournalEntryRecord[] =>
+    entries.filter((entry) => entry.kind === 'result' && entry.key === key && entry.outcome !== 'ambiguous');
+
+  it('HN1 stop-force: a recorded force stop abandons the ambiguous gate intent, stops the run and releases the work order', async () => {
+    const h = await hn1('gate');
+    expect(laneRunJournalPendingIntent(await h.journal.listForRun(RUN_ID), RUN_ID)).toEqual({
+      key: GATE_KEY,
+      step: 'gate',
+      reconciliation: 'ambiguous',
+    });
+    await recordStop(h);
+
+    const result = await passOf(h).runPass({ holderId: HOLDER, nowIso: NOW });
+
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(stepsOf(result)).toEqual([{ outcome: 'entered', state: 'stopped' }, { outcome: 'done' }]);
+    const entries = await h.journal.listForRun(RUN_ID);
+    const finals = finalsOf(entries, GATE_KEY);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toBeNull();
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('stopped');
+    expect((await h.runRepo.get(RUN_ID))?.parked).toBeNull();
+    expect((await h.workOrderRepo.findWorkOrderById('wo-example-1'))?.state).toBe('stopped');
+  });
+
+  it('HN1 resume: a recorded resume abandons the ambiguous gate intent, conducts to gating and re-parks without a duplicate-key write', async () => {
+    const h = await hn1('gate');
+    await recordResume(h);
+
+    const result = await passOf(h).runPass({ holderId: HOLDER, nowIso: NOW });
+
+    const steps = stepsOf(result);
+    expect(steps.some((step) => step.outcome === 'refused')).toBe(false);
+    expect(steps[0]).toMatchObject({ outcome: 'parked', reason: 'ambiguous', qualifier: 'gate' });
+    const entries = await h.journal.listForRun(RUN_ID);
+    const finals = finalsOf(entries, GATE_KEY);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toBeNull();
+    const abandonedAt = entries.indexOf(finals[0]!);
+    const gatingAt = entries.findIndex((entry) => entry.kind === 'conduct' && entry.state === 'gating' && entries.indexOf(entry) > abandonedAt);
+    expect(gatingAt).toBeGreaterThan(abandonedAt);
+    expect(entries.find((entry) => entry.kind === 'result' && entry.key === RESUME_KEY)).toMatchObject({
+      outcome: 'completed',
+      reasonCode: 'resumed',
+    });
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === GATE_KEY)).toHaveLength(1);
+  });
+
+  it('HN1-shape ambiguous stop intent in running resumes and stays running', async () => {
+    const h = await hn1('stop');
+    await recordResume(h);
+
+    const result = await passOf(h).runPass({ holderId: HOLDER, nowIso: NOW });
+
+    expect(stepsOf(result)).toEqual([{ outcome: 'waiting', reason: 'lane-running' }]);
+    const entries = await h.journal.listForRun(RUN_ID);
+    const finals = finalsOf(entries, STOP_KEY);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toBeNull();
+    expect((await h.runRepo.get(RUN_ID))?.parked).toBeNull();
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('running');
+  });
+
+  it('Crash replay idempotence through real driver pass: a crash after the abandon result on a stop completes the stop on the next pass', async () => {
+    const h = await hn1('gate');
+    await recordStop(h);
+
+    const crashed = await passOf(h, { advance: crashOnConduct(h.journal, 'stopped') }).runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(stepsOf(crashed)).toEqual([expect.objectContaining({ outcome: 'refused', reason: 'journal-refused' })]);
+    const afterCrash = await h.journal.listForRun(RUN_ID);
+    expect(finalsOf(afterCrash, GATE_KEY)).toHaveLength(1);
+    expect(laneRunJournalState(afterCrash, RUN_ID)).toBe('parked');
+
+    const second = await passOf(h).runPass({ holderId: HOLDER, nowIso: SOON });
+    expect(stepsOf(second)).toEqual([{ outcome: 'entered', state: 'stopped' }, { outcome: 'done' }]);
+    const entries = await h.journal.listForRun(RUN_ID);
+    const finals = finalsOf(entries, GATE_KEY);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('stopped');
+    expect((await h.workOrderRepo.findWorkOrderById('wo-example-1'))?.state).toBe('stopped');
+  });
+
+  it('Crash replay idempotence through real driver pass: a crash after the abandon result on a resume finishes the resume on the next pass', async () => {
+    const h = await hn1('gate');
+    await recordResume(h);
+
+    const crashed = await passOf(h, { resume: crashOnConduct(h.journal, 'gating') }).runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(crashed).toMatchObject({ outcome: 'completed' });
+    const afterCrash = await h.journal.listForRun(RUN_ID);
+    expect(finalsOf(afterCrash, GATE_KEY)).toHaveLength(1);
+    expect(laneRunJournalState(afterCrash, RUN_ID)).toBe('parked');
+    expect((await h.runRepo.get(RUN_ID))?.parked).toEqual(GATE_PARK);
+
+    const second = await passOf(h).runPass({ holderId: HOLDER, nowIso: SOON });
+    expect(stepsOf(second).some((step) => step.outcome === 'refused')).toBe(false);
+    const entries = await h.journal.listForRun(RUN_ID);
+    const finals = finalsOf(entries, GATE_KEY);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(entries.find((entry) => entry.kind === 'result' && entry.key === RESUME_KEY)).toMatchObject({
+      outcome: 'completed',
+      reasonCode: 'resumed',
+    });
+    expect(entries.some((entry) => entry.kind === 'conduct' && entry.state === 'gating')).toBe(true);
+  });
 });
 
 /** A deferred for the KF-34b pool tests: resolve-only, no real timer. */

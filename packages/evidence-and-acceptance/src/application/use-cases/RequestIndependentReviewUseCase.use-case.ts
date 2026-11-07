@@ -15,6 +15,7 @@ import {
   REVIEW_REQUEST_ID_PATTERN,
   assessmentIdForChain,
   attemptIdForChain,
+  isValidChainName,
   receiptSubjectOf,
 } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
@@ -27,7 +28,7 @@ import {
   type EvidenceAssessmentRepositoryPort,
 } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
-import type { IndependentReviewPort, ReviewUnavailableCode } from '../ports/out/IndependentReviewPort.out-port.js';
+import type { IndependentReviewPort, ReviewTransportDiagnostic, ReviewUnavailableCode } from '../ports/out/IndependentReviewPort.out-port.js';
 import type { EvidenceSeatPolicyPort } from '../ports/out/EvidenceSeatPolicyPort.out-port.js';
 import type {
   RequestIndependentReviewPort,
@@ -66,9 +67,16 @@ function rejectedFor(
   rejection: ReviewRejection,
   reason: string,
   code?: ReviewUnavailableCode | 'not-read-only' | 'invalid-receipt',
+  diagnostic?: ReviewTransportDiagnostic,
 ): RequestIndependentReviewResult {
   return request.requestId !== undefined
-    ? { outcome: 'rejected', reason, rejection, ...(code !== undefined ? { code } : {}) }
+    ? {
+        outcome: 'rejected',
+        reason,
+        rejection,
+        ...(code !== undefined ? { code } : {}),
+        ...(diagnostic !== undefined ? { diagnostic } : {}),
+      }
     : { outcome: 'rejected', reason };
 }
 
@@ -129,7 +137,12 @@ function chainSubjectOf(request: RequestIndependentReviewRequest): ReceiptSubjec
   if (subject.kind === 'attempt') {
     return subject.projectId === request.projectId && subject.attemptId === request.attemptId ? undefined : 'invalid';
   }
-  if (subject.kind !== 'chain' || subject.chainName === null || subject.integrationHeadSha === null) {
+  if (
+    subject.kind !== 'chain' ||
+    subject.chainName === null ||
+    subject.integrationHeadSha === null ||
+    !isValidChainName(subject.chainName)
+  ) {
     return 'invalid';
   }
   if (
@@ -383,7 +396,7 @@ async function unavailableRejection(
   deps: RequestIndependentReviewDependencies,
   request: RequestIndependentReviewRequest,
   existing: EvidenceAssessmentRecord,
-  run: { readonly reason: string; readonly code: ReviewUnavailableCode },
+  run: { readonly reason: string; readonly code: ReviewUnavailableCode; readonly diagnostic?: ReviewTransportDiagnostic },
   nowIso: string,
 ): Promise<RequestIndependentReviewResult> {
   try {
@@ -395,11 +408,11 @@ async function unavailableRejection(
     });
   } catch (error) {
     if (error instanceof EvidenceAssessmentRevisionConflictError) {
-      return rejectedFor(request, 'review-unavailable', run.reason, run.code);
+      return rejectedFor(request, 'review-unavailable', run.reason, run.code, run.diagnostic);
     }
     throw error;
   }
-  return rejectedFor(request, 'review-unavailable', run.reason, run.code);
+  return rejectedFor(request, 'review-unavailable', run.reason, run.code, run.diagnostic);
 }
 
 /** The receipt record a completed review would store; findings are stored unresolved. */
@@ -415,6 +428,12 @@ function receiptCandidateOf(
   const requestIdFields: Partial<ReviewReceiptRecord> =
     request.requestId !== undefined ? { requestId: request.requestId } : {};
   const subjectFields: Partial<ReviewReceiptRecord> = chain !== undefined ? { subject: chain } : {};
+  // RV2: the fixed cause code of an unknown answer travels onto the stored
+  // receipt; the key is omitted on pass/fail so stored receipts stay identical.
+  const unknownReasonFields: Partial<ReviewReceiptRecord> =
+    run.result === 'unknown' && run.unknownReason !== undefined
+      ? { unknownReason: run.unknownReason }
+      : {};
   const receiptId =
     request.requestId !== undefined
       ? 'rr-' + request.assessmentId + '-' + request.candidateHeadSha.slice(0, 8) + '-' + request.requestId
@@ -446,6 +465,7 @@ function receiptCandidateOf(
     ...kindFields,
     ...requestIdFields,
     ...subjectFields,
+    ...unknownReasonFields,
   };
 }
 

@@ -8,7 +8,7 @@
 // 2 s stop race, and no unhandled rejection is reported. A final
 // real-composition case runs the composed export over a corrupt assessments
 // file and asserts the state directory gains nothing outside the disposition
-// store and no quarantine copy.
+// store and the orchestrator session store, and no quarantine copy.
 import { createHash, createHmac } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
@@ -565,7 +565,12 @@ describe('conductor telemetry isolation (OT5, plan §3.7)', () => {
     });
 
     expect(result.code).toBe(0);
-    expect(result.stderr).toEqual([]);
+    // O9: exactly the register line (with the registered id) and the retire line.
+    expect(result.stderr).toHaveLength(2);
+    const registerDocument = JSON.parse(result.stderr[0]!) as { orchestrator: string; orchestratorId?: string };
+    expect(registerDocument.orchestrator).toBe('registered');
+    expect(registerDocument.orchestratorId).toMatch(/^orch-/);
+    expect(JSON.parse(result.stderr[1]!)).toEqual({ orchestrator: 'retired' });
     expect(result.stdout).toHaveLength(1);
     expect(JSON.parse(result.stdout[0]!)).toMatchObject({ pass: 1, outcome: 'completed' });
     const journalEntries = await runtime.conductor.laneRunJournal.listForRun(RUN_ID);
@@ -620,7 +625,7 @@ describe('conductor telemetry isolation (OT5, plan §3.7)', () => {
     });
   }
 
-  it('real composition: a corrupt assessments file yields a read-error export and no state change outside the disposition store', async () => {
+  it('real composition: a corrupt assessments file yields a read-error export and no state change outside the disposition store and the orchestrator session store', async () => {
     const dir = tempStateDir();
 
     // A minimal v2 installation whose telemetry policy has a valid salt; the
@@ -784,8 +789,10 @@ describe('conductor telemetry isolation (OT5, plan §3.7)', () => {
 
     const after = await snapshot(dir);
     const changedKeys = Object.keys(after).filter((key) => after[key] !== before[key]);
+    // O9: the live run also registers one orchestrator session, so orchestrators.json
+    // legitimately appears beside the disposition store.
     for (const key of changedKeys) {
-      expect(key).toBe('telemetry-dispositions.json');
+      expect(['telemetry-dispositions.json', 'orchestrators.json']).toContain(key);
     }
     expect(after['quarantine/']).toBeUndefined();
     expect(Object.keys(after).some((key) => key.startsWith('quarantine'))).toBe(false);

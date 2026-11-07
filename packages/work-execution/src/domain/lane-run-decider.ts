@@ -40,11 +40,201 @@ import { SEAT_TRIGGER_CLASSES } from './value-objects/StopReason.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
 
+/**
+ * The fixed unknown-reason codes a review journal detail may carry (RV2/RV3):
+ * only declared lowercase tokens pass `sanitizeJournalDetail`; reviewer prose,
+ * paths and secrets never reach the journal.
+ */
+const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([
+  'empty', 'unparseable-verdict', 'no-findings-on-fail',
+]);
+
+const REVIEW_DETAIL_CODE_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+/**
+ * The fixed cause code of an unknown review answer (RV3): the value only when
+ * it is a declared lowercase reason-code token with no secret shape; `null`
+ * when the value is explicitly null; `'unparseable-verdict'` when it is absent
+ * or not a declared token. Never throws, never copies free text.
+ */
+export function sanitizeJournalDetail(unknownReason: unknown): string | null {
+  if (unknownReason === null) {
+    return null;
+  }
+  if (typeof unknownReason !== 'string') {
+    return 'unparseable-verdict';
+  }
+  return REVIEW_DETAIL_CODES.has(unknownReason) && REVIEW_DETAIL_CODE_PATTERN.test(unknownReason)
+    ? unknownReason
+    : 'unparseable-verdict';
+}
+
+/** One `minor`/`nit` finding a passed review carries forward (RV3). */
+export interface ConductorReviewCarriedMinor {
+  readonly findingId: string;
+  readonly severity: 'minor' | 'nit';
+  readonly filePath: string | null;
+  readonly line: number | null;
+}
+
+/**
+ * The severity-derived outcome of one review receipt (RV3). `passed` carries
+ * the receipt's non-blocking findings; `failed` and `unknown` never carry any.
+ */
+export type ConductorReviewOutcomeDecision =
+  | { readonly outcome: 'passed'; readonly reasonCode: 'review-passed'; readonly detail: 'minor-only-findings' | null; readonly carriedMinors: readonly ConductorReviewCarriedMinor[] }
+  | { readonly outcome: 'failed'; readonly reasonCode: 'review-failed'; readonly detail: null; readonly carriedMinors: readonly [] }
+  | { readonly outcome: 'unknown'; readonly reasonCode: 'review-unknown'; readonly detail: string | null; readonly carriedMinors: readonly [] };
+
+/** A value is a plain object (prototype `Object.prototype` or `null`). */
+function isPlainRecordObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/** The receiver's own data property `key`, read without running any accessor. */
+function ownProp(source: unknown, key: string): unknown {
+  try {
+    if (typeof source !== 'object' || source === null) {
+      return undefined;
+    }
+    return Object.getOwnPropertyDescriptor(source, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+const SEVERITY_VALUES: readonly string[] = ['blocker', 'major', 'minor', 'nit'];
+const CARRIED_MINORS_MAX = 50;
+
+const UNKNOWN_PASSED: ConductorReviewOutcomeDecision = Object.freeze({
+  outcome: 'unknown',
+  reasonCode: 'review-unknown',
+  detail: 'unparseable-verdict',
+  carriedMinors: Object.freeze([]),
+}) as ConductorReviewOutcomeDecision;
+const FAILED_DECISION: ConductorReviewOutcomeDecision = Object.freeze({
+  outcome: 'failed',
+  reasonCode: 'review-failed',
+  detail: null,
+  carriedMinors: Object.freeze([]),
+}) as ConductorReviewOutcomeDecision;
+
+/**
+ * The pure conductor review-outcome decider (RV3). Total over any runtime
+ * input: it never throws and fails closed to `unknown` (`unparseable-verdict`)
+ * on malformed receipts — a non-plain object, a non-dense `findings` array, a
+ * non-plain finding, an unknown `verdict` or severity, or an unverified
+ * receipt.
+ *
+ * 1. Malformed input or unknown enums → `unknown` / `unparseable-verdict`.
+ * 2. `readOnlyVerified === false` or `verdict === 'unknown'` → `unknown` with
+ *    `sanitizeJournalDetail(unknownReason)` — unknown stays unknown even when
+ *    the findings are minor-only (req (e)).
+ * 3. Any `blocker`/`major` finding → `failed` (req (a)), whatever the verdict
+ *    word.
+ * 4. `verdict === 'failed'` with zero findings → `unknown`
+ *    (`sanitizeJournalDetail(unknownReason) ?? 'unparseable-verdict'`, req (c)).
+ * 5. Otherwise → `passed`, carrying every `minor`/`nit` finding, with the
+ *    detail `minor-only-findings` when any is carried (req (b)).
+ */
+export function decideConductorReviewOutcome(input: unknown): ConductorReviewOutcomeDecision {
+  try {
+    if (!isPlainRecordObject(input)) {
+      return UNKNOWN_PASSED;
+    }
+    const verdict = ownProp(input, 'verdict');
+    if (verdict !== 'passed' && verdict !== 'failed' && verdict !== 'unknown') {
+      return UNKNOWN_PASSED;
+    }
+    const findings = ownProp(input, 'findings');
+    if (!Array.isArray(findings)) {
+      return UNKNOWN_PASSED;
+    }
+    for (let index = 0; index < findings.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(findings, index)) {
+        return UNKNOWN_PASSED;
+      }
+      const finding = findings[index];
+      if (!isPlainRecordObject(finding)) {
+        return UNKNOWN_PASSED;
+      }
+      const severity = ownProp(finding, 'severity');
+      if (typeof severity !== 'string' || !SEVERITY_VALUES.includes(severity)) {
+        return UNKNOWN_PASSED;
+      }
+    }
+    const verified = ownProp(input, 'readOnlyVerified');
+    if (verified === false) {
+      const reason = ownProp(input, 'unknownReason');
+      return {
+        outcome: 'unknown',
+        reasonCode: 'review-unknown',
+        detail: reason === undefined ? null : sanitizeJournalDetail(reason),
+        carriedMinors: Object.freeze([]),
+      };
+    }
+    if (verdict === 'unknown') {
+      const reason = ownProp(input, 'unknownReason');
+      return {
+        outcome: 'unknown',
+        reasonCode: 'review-unknown',
+        detail: reason === undefined ? null : sanitizeJournalDetail(reason),
+        carriedMinors: Object.freeze([]),
+      };
+    }
+    const blocking = findings.some((finding) => {
+      const severity = ownProp(finding, 'severity');
+      return severity === 'blocker' || severity === 'major';
+    });
+    if (blocking) {
+      return FAILED_DECISION;
+    }
+    if (verdict === 'failed' && findings.length === 0) {
+      const detail = sanitizeJournalDetail(ownProp(input, 'unknownReason')) ?? 'unparseable-verdict';
+      return { outcome: 'unknown', reasonCode: 'review-unknown', detail, carriedMinors: Object.freeze([]) };
+    }
+    const carriedMinors: ConductorReviewCarriedMinor[] = [];
+    for (const finding of findings) {
+      const severity = ownProp(finding, 'severity');
+      if (severity !== 'minor' && severity !== 'nit') {
+        continue;
+      }
+      if (carriedMinors.length >= CARRIED_MINORS_MAX) {
+        break;
+      }
+      const findingId = ownProp(finding, 'findingId');
+      const filePath = ownProp(finding, 'filePath');
+      const line = ownProp(finding, 'line');
+      carriedMinors.push({
+        findingId: typeof findingId === 'string' ? findingId : '',
+        severity,
+        filePath: typeof filePath === 'string' ? filePath : null,
+        line: typeof line === 'number' && Number.isSafeInteger(line) && line >= 0 ? line : null,
+      });
+    }
+    return {
+      outcome: 'passed',
+      reasonCode: 'review-passed',
+      detail: carriedMinors.length > 0 ? 'minor-only-findings' : null,
+      carriedMinors: Object.freeze(carriedMinors),
+    };
+  } catch {
+    return UNKNOWN_PASSED;
+  }
+}
+
 /** Minimum wait after a congested gate result before the gate is re-run (KF-30c2). */
 export const GATE_CONGESTION_BACKOFF_MS = 60_000;
 
 /** Maximum gate retry runs beyond run 0 (KF-30c2); below LANE_RUN_MAX_RETRY. */
 export const GATE_CONGESTION_MAX_RETRIES = 6;
+
+/** PT1d: passes with no free review seat before parking `review-seat-unavailable`. */
+export const REVIEW_SEAT_UNAVAILABLE_MAX_PASSES = 6;
 
 /** A seat the caller chose with selectSeat / selectReviewSeat (S1a), or none eligible. */
 export type LaneRunSeatFact = { readonly ok: true; readonly seatIndex: number } | { readonly ok: false };
@@ -115,6 +305,13 @@ export interface LaneRunFacts {
    * supply `{ ok: false }` when that seat is unavailable; it never moves to another seat.
    */
   readonly reviewSeat: LaneRunSeatFact;
+  /**
+   * PT1d: passes already taken, for the review kind whose rules are running,
+   * with no free review seat. Absent parks `review-seat-unavailable`; when
+   * present and below `REVIEW_SEAT_UNAVAILABLE_MAX_PASSES`, the step waits.
+   * The driver records it. This decider only reads it.
+   */
+  readonly reviewSeatUnavailablePasses?: number;
   /** Implementer seat indexes already dispatched in `record.round` (K4). */
   readonly roundSeatIndexes: readonly number[];
   /** The run's latest attempt; null before the first prepare (K4). */
@@ -195,7 +392,8 @@ export type LaneRunWaitReason =
   | 'review-pending' | 'premerge-pending' | 'ci-pending' | 'ci-unknown' | 'merge-train' | 'parked'
   | 'session-stagger'
   | 'stop-unconfirmed' | 'facts-inconsistent' | 'stop-draining' | 'stop-grace-exceeded'
-  | 'gate-congested';
+  | 'gate-congested'
+  | 'review-seat-unavailable';
 
 export type LaneRunDecision =
   | { readonly kind: 'act'; readonly step: LaneRunKeyStep; readonly key: string; readonly round: number;
@@ -492,11 +690,25 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return park(outcome.reason, null);
     };
 
+    const reviewSeatUnavailableDecision = (): LaneRunDecision => {
+      const passes = facts.reviewSeatUnavailablePasses;
+      if (passes === undefined) {
+        return park('review-seat-unavailable', null);
+      }
+      if (typeof passes !== 'number' || !Number.isSafeInteger(passes) || passes < 0) {
+        return WAIT_FACTS_INCONSISTENT;
+      }
+      if (passes >= REVIEW_SEAT_UNAVAILABLE_MAX_PASSES) {
+        return park('review-seat-unavailable', null);
+      }
+      return wait('review-seat-unavailable');
+    };
+
     const reviewRules = (kind: 'brief-check' | 'code-review'): LaneRunDecision => {
       const review = kind === 'brief-check' ? facts.briefCheck : facts.codeReview;
       if (review.verdict === 'none') {
         if (!facts.reviewSeat.ok) {
-          return park('review-seat-unavailable', null);
+          return reviewSeatUnavailableDecision();
         }
         return act({
           step: kind,
@@ -531,7 +743,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
             attemptOrdinal: null,
           });
         }
-        return park('review-seat-unavailable', null);
+        return reviewSeatUnavailableDecision();
       }
       if (review.verdict === 'unknown') {
         // A review whose verdict the conductor could not read is not a verdict on

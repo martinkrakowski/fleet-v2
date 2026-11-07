@@ -89,6 +89,7 @@ export class GateReceiptAdapter implements GateReceiptPort {
         result: resultOf(receipt.result),
         exitCode: receipt.exitCode,
         ...(receipt.coverage !== undefined ? { coverage: receipt.coverage } : {}),
+        ...(receipt.failingFile !== undefined ? { failingFile: receipt.failingFile } : {}),
         evidenceRef: request.evidenceRef,
         policyRevision: request.policyRevision,
         completedAtIso: request.completedAtIso,

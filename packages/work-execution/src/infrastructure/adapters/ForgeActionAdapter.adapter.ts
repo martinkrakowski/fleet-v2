@@ -19,6 +19,8 @@ import type {
   ForgeActionPort,
   ForgeActionRequest,
   ForgeActionResult,
+  OpenPullRequestByHead,
+  OpenPullRequestsByHeadResult,
 } from '../../application/ports/out/ForgeActionPort.out-port.js';
 import type {
   MergeBranchHeadRequest,
@@ -27,6 +29,7 @@ import type {
   MergeForgeActionRequest,
   MergeForgeActionResult,
   MergeForgeCreateBranchRequest,
+  MergeForgeMergeMainIntoBranchRequest,
 } from '../../application/ports/out/MergeForgeActionPort.out-port.js';
 import type {
   ForgeReadPort,
@@ -152,8 +155,11 @@ const NORMAL_FORGE_TIMEOUT_MS = 30_000;
 /** A call with less than this much budget left is not started (plan §3.1). */
 const MIN_REMAINING_TO_START_MS = 2_000;
 
-/** A merge-pass request that is bound to a pull request (every kind but create-branch). */
-type MergePullRequestRequest = Exclude<MergeForgeActionRequest, { readonly kind: 'create-branch' }>;
+/** A merge-pass request that is bound to a pull request (every kind but create-branch and merge-main-into-branch). */
+type MergePullRequestRequest = Exclude<
+  MergeForgeActionRequest,
+  { readonly kind: 'create-branch' } | { readonly kind: 'merge-main-into-branch' }
+>;
 
 /** One own data property, read without running a getter; undefined for anything else. */
 function ownData(source: unknown, key: string): unknown {
@@ -192,6 +198,37 @@ function snapshotCreateBranchRequest(request: object): MergeForgeCreateBranchReq
   return copy as unknown as MergeForgeCreateBranchRequest;
 }
 
+/** Bounds for the legacy open-pull-request head lookup. */
+const PR_HEAD_LOOKUP_TIMEOUT_MS = 15_000;
+const PR_HEAD_LOOKUP_PAGE = 20;
+const MAX_PR_LOOKUP_BODY_BYTES = 262_144;
+
+/**
+ * A plain copy of a merge-main-into-branch request's own data properties; absent
+ * keys stay absent.
+ */
+function snapshotMergeMainIntoBranchRequest(request: object): MergeForgeMergeMainIntoBranchRequest {
+  const repository = ownData(request, 'repository');
+  const copy: Record<string, unknown> = {
+    kind: 'merge-main-into-branch',
+    actionId: ownData(request, 'actionId'),
+    repository:
+      typeof repository === 'object' && repository !== null
+        ? { owner: ownData(repository, 'owner'), repo: ownData(repository, 'repo') }
+        : repository,
+    branchName: ownData(request, 'branchName'),
+    sourceBranch: ownData(request, 'sourceBranch'),
+    expectedHeadSha: ownData(request, 'expectedHeadSha'),
+    deadlineIso: ownData(request, 'deadlineIso'),
+  };
+  for (const key of ['pullRequestNumber', 'status']) {
+    if (Object.getOwnPropertyDescriptor(request, key) !== undefined) {
+      copy[key] = ownData(request, key) ?? true;
+    }
+  }
+  return copy as unknown as MergeForgeMergeMainIntoBranchRequest;
+}
+
 /** The largest ref body a branch-head read parses. */
 const MAX_REF_BODY_CHARS = 65_536;
 
@@ -212,6 +249,104 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
 
   isConfigured(): boolean {
     return this.delegate !== undefined && this.delegate.runGh !== undefined;
+  }
+
+  /** The bound repository `gh` runs in, when the installation configured one (WB5b2). */
+  boundRepository(): ForgeRepositoryRef | undefined {
+    return this.delegate?.repository;
+  }
+
+  /**
+   * Read-only lookup of the open pull requests for `<owner>:<branch>` in the
+   * bound repository (WB5b legacy PR-number lookup). The head is always
+   * qualified with the repository's owner and every result's head repository
+   * owner is re-checked, so a fork's branch of the same name never matches.
+   * One bounded `gh api` read; any failure is `unreadable`, never empty.
+   */
+  async findOpenPullRequestsByHead(query: {
+    readonly repository: string;
+    readonly branchName: string;
+  }): Promise<OpenPullRequestsByHeadResult> {
+    const runGh = this.delegate?.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'unreadable', reason: 'no gh subprocess is configured' };
+    }
+    const parts = query.repository.split('/');
+    const owner = parts[0] ?? '';
+    const repo = parts[1] ?? '';
+    const namePattern = /^[A-Za-z0-9_.-]{1,100}$/;
+    if (parts.length !== 2 || !namePattern.test(owner) || !namePattern.test(repo)) {
+      return { outcome: 'unreadable', reason: 'the repository is not owner/repo' };
+    }
+    // The head owner always comes from the bound repository, never from the
+    // query: an unbound adapter refuses, and a query for another repository
+    // refuses.
+    const bound = this.delegate?.repository;
+    if (bound === undefined) {
+      return { outcome: 'unreadable', reason: 'legacy-pr-lookup-unbound-repository' };
+    }
+    if (
+      bound.owner.toLowerCase() !== owner.toLowerCase() ||
+      bound.repo.toLowerCase() !== repo.toLowerCase()
+    ) {
+      return { outcome: 'unreadable', reason: 'legacy-pr-lookup-repository-mismatch' };
+    }
+    if (!isSafeBranchName(query.branchName)) {
+      return { outcome: 'unreadable', reason: 'the branch name is not safe' };
+    }
+    // The bound owner and repo reach the endpoint path and the head filter, so
+    // they are screened like the post-status path screens them (WB5b2).
+    if (!REPOSITORY_PATTERN.test(bound.owner) || !REPOSITORY_PATTERN.test(bound.repo)) {
+      return { outcome: 'unreadable', reason: 'the bound repository owner or repo is invalid' };
+    }
+    const headFilter = encodeURIComponent(`${bound.owner}:${query.branchName}`);
+    const args = [
+      'api',
+      `repos/${bound.owner}/${bound.repo}/pulls?head=${headFilter}&state=open&per_page=${PR_HEAD_LOOKUP_PAGE}`,
+    ];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args, undefined, PR_HEAD_LOOKUP_TIMEOUT_MS);
+    } catch {
+      return { outcome: 'unreadable', reason: 'the pull request lookup could not complete' };
+    }
+    if (gh.exitCode !== 0 || typeof gh.stdout !== 'string' || Buffer.byteLength(gh.stdout, 'utf8') > MAX_PR_LOOKUP_BODY_BYTES) {
+      return { outcome: 'unreadable', reason: 'the pull request lookup failed' };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(gh.stdout);
+    } catch {
+      return { outcome: 'unreadable', reason: 'the pull request lookup answer was not JSON' };
+    }
+    if (!Array.isArray(parsed) || parsed.length >= PR_HEAD_LOOKUP_PAGE) {
+      // A full page may hide more matches: never guess from a truncated list.
+      return { outcome: 'unreadable', reason: 'the pull request lookup answer was not a complete list' };
+    }
+    const pullRequests: OpenPullRequestByHead[] = [];
+    for (const item of parsed as unknown[]) {
+      const record = item as {
+        number?: unknown;
+        head?: { sha?: unknown; ref?: unknown; repo?: { owner?: { login?: unknown } | null } | null } | null;
+      } | null;
+      const number = record?.number;
+      const sha = record?.head?.sha;
+      const login = record?.head?.repo?.owner?.login;
+      if (
+        typeof number !== 'number' ||
+        !Number.isSafeInteger(number) ||
+        number < 1 ||
+        typeof sha !== 'string' ||
+        record?.head?.ref !== query.branchName ||
+        typeof login !== 'string' ||
+        login.toLowerCase() !== bound.owner.toLowerCase()
+      ) {
+        // A malformed, fork-headed or other-branch entry is ignored.
+        continue;
+      }
+      pullRequests.push({ number, headSha: sha });
+    }
+    return { outcome: 'read', pullRequests };
   }
 
   async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
@@ -541,11 +676,14 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     request: ForgeActionRequest,
   ): Promise<ForgeActionResult> {
     // The merge is pinned to the expected head; a moved PR head cannot match.
+    // The resolved number is what is merged (WB5b2), so the merged pull request
+    // and the recorded one are the same object; only a caller that resolved no
+    // number falls back to the branch.
     const args = [
       'pr',
       'merge',
       ...this.repositoryArgs(),
-      request.branchName,
+      request.pullRequestNumber !== undefined ? String(request.pullRequestNumber) : request.branchName,
       '--match-head-commit',
       request.expectedHeadSha,
       '--merge',
@@ -638,6 +776,16 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
         return this.mergeRefusedOther('invalid request');
       }
       return this.performCreateBranch(snapshot);
+    }
+    if (ownData(rawRequest, 'kind') === 'merge-main-into-branch') {
+      // The refresh kind is read through its own data properties once; no getter runs twice or throws.
+      let snapshot: MergeForgeMergeMainIntoBranchRequest;
+      try {
+        snapshot = snapshotMergeMainIntoBranchRequest(rawRequest);
+      } catch {
+        return this.mergeRefusedOther('invalid request');
+      }
+      return this.performMergeMainIntoBranch(snapshot);
     }
     const kind = ownData(rawRequest, 'kind');
     if (kind !== 'merge-pr' && kind !== 'update-branch' && kind !== 'post-status') {
@@ -1179,6 +1327,134 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     return { outcome: 'ambiguous', reason: 'create-branch failed and the branch could not be read back' };
   }
 
+  // --- merge-main-into-branch (lane CO8): merge main into chain/<name> ---
+
+  private async performMergeMainIntoBranch(request: MergeForgeMergeMainIntoBranchRequest): Promise<MergeForgeActionResult> {
+    const refusal = this.mergeMainIntoBranchValidationRefusal(request);
+    if (refusal !== null) {
+      return refusal;
+    }
+    if (this.mergeConfigDir() === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    return this.runMergeMainIntoBranch(request);
+  }
+
+  /** Validation for merge-main-into-branch: fixed reasons only, no input value echoed. */
+  private mergeMainIntoBranchValidationRefusal(request: MergeForgeMergeMainIntoBranchRequest): MergeForgeActionResult | null {
+    if ('pullRequestNumber' in request) {
+      return this.mergeRefusedOther('merge-main-into-branch carries no pull request');
+    }
+    if ('status' in request) {
+      return this.mergeRefusedOther('status is only valid for post-status');
+    }
+    if (typeof request.actionId !== 'string' || request.actionId.length === 0 || request.actionId.length > 256) {
+      return this.mergeRefusedOther('Invalid action id');
+    }
+    if (typeof request.deadlineIso !== 'string' || !Number.isFinite(Date.parse(request.deadlineIso))) {
+      return this.mergeRefusedOther('unparseable deadline');
+    }
+    if (!this.isValidRepositoryRef(request.repository)) {
+      return this.mergeRefusedOther('Invalid repository owner or repo');
+    }
+    if (!this.isChainBranch(request.branchName)) {
+      return this.mergeRefusedOther('merge-main-into-branch merges only a chain branch');
+    }
+    if (request.sourceBranch !== 'main') {
+      return this.mergeRefusedOther('merge-main-into-branch merges only from main');
+    }
+    if (typeof request.expectedHeadSha !== 'string' || !HEX_40_PATTERN.test(request.expectedHeadSha)) {
+      return this.mergeRefusedOther('Invalid expected head SHA');
+    }
+    return null;
+  }
+
+  private async runMergeMainIntoBranch(request: MergeForgeMergeMainIntoBranchRequest): Promise<MergeForgeActionResult> {
+    const configDir = this.mergeConfigDir();
+    if (configDir === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    const runGh = this.delegate?.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'ambiguous', reason: 'no gh subprocess is configured' };
+    }
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return this.mergeRefusedOther(budget.reason);
+    }
+    const args = [
+      'api',
+      '--method',
+      'POST',
+      `repos/${request.repository.owner}/${request.repository.repo}/merges`,
+      '-f',
+      `base=${request.branchName}`,
+      '-f',
+      'head=main',
+    ];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args, configDir, budget.timeoutMs);
+    } catch {
+      return { outcome: 'ambiguous', reason: 'gh api merge-main-into-branch could not complete' };
+    }
+    if (gh.exitCode !== 0) {
+      return this.reconcileMergeMainRefusal(gh, request);
+    }
+    const trimmed = gh.stdout.trim();
+    if (trimmed.length === 0) {
+      // HTTP 204: the branch is already up to date with main (no merge needed).
+      return { outcome: 'already-applied' };
+    }
+    if (trimmed.length > MAX_REF_BODY_CHARS) {
+      return { outcome: 'ambiguous', reason: 'merge response body too large' };
+    }
+    try {
+      const body: unknown = JSON.parse(trimmed);
+      if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+        return { outcome: 'ambiguous', reason: 'merge response was not a JSON object' };
+      }
+      const sha = (body as { readonly sha?: unknown }).sha;
+      if (typeof sha !== 'string' || !HEX_40_PATTERN.test(sha)) {
+        return { outcome: 'ambiguous', reason: 'merge response carried no usable commit sha' };
+      }
+      return { outcome: 'executed', headSha: sha };
+    } catch {
+      return { outcome: 'ambiguous', reason: 'merge response was not parseable JSON' };
+    }
+  }
+
+  /**
+   * A non-zero merge exit: a conflict is a refusal of kind conflict; a 404 is
+   * confirmed against the branch head (absent → branch-gone; unreadable →
+   * ambiguous); permission and protection are refusals; anything else is
+   * ambiguous, never a guess.
+   */
+  private async reconcileMergeMainRefusal(
+    gh: GhInvocationResult,
+    request: MergeForgeMergeMainIntoBranchRequest,
+  ): Promise<MergeForgeActionResult> {
+    if (/HTTP 404|Not Found/i.test(`${gh.stderr}\n${gh.stdout}`)) {
+      const head = await this.readMergeBranchHead({
+        repository: request.repository,
+        branchName: request.branchName,
+        deadlineIso: request.deadlineIso,
+      });
+      if (head.outcome === 'not-found') {
+        return { outcome: 'branch-gone' };
+      }
+      return { outcome: 'ambiguous', reason: 'merge refused and the branch could not be confirmed absent' };
+    }
+    const refusalKind = classifyGhRefusal(gh.stderr, gh.stdout);
+    if (refusalKind === 'conflict') {
+      return { outcome: 'refused', reason: 'merge into the chain branch conflicts with main', refusalKind: 'conflict' };
+    }
+    if (refusalKind === 'permission' || refusalKind === 'protection') {
+      return { outcome: 'refused', reason: 'merge into the chain branch was refused', refusalKind };
+    }
+    return { outcome: 'ambiguous', reason: 'gh api merge-main-into-branch failed with an unrecognised answer' };
+  }
+
   async readMergeBranchHead(request: MergeBranchHeadRequest): Promise<MergeBranchHeadResult> {
     if (typeof request !== 'object' || request === null) {
       return { outcome: 'unavailable', reason: 'invalid request' };
@@ -1189,7 +1465,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     if (typeof deadlineIso !== 'string' || !Number.isFinite(Date.parse(deadlineIso))) {
       return { outcome: 'unavailable', reason: 'unparseable deadline' };
     }
-    if (!this.isValidRepositoryRef(repository) || !this.isChainBranch(branchName)) {
+    if (!this.isValidRepositoryRef(repository) || (!this.isChainBranch(branchName) && branchName !== 'main')) {
       return { outcome: 'unavailable', reason: 'invalid request' };
     }
     return this.readBranchHead({

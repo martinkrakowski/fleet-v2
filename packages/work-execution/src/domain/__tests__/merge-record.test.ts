@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { decideMergeRecord, MergeRecord } from '../entities/MergeRecord.js';
+import {
+  decideMergeRecord,
+  MERGE_RECORD_LIMITS,
+  MergeRecord,
+} from '../entities/MergeRecord.js';
 import type { MergeRecordRecord } from '../entities/MergeRecord.js';
 
 /**
@@ -274,12 +278,18 @@ describe('decideMergeRecord', () => {
   });
 
   it('upgrades merger from unknown to fleet exactly once', () => {
-    const fleet = { ...VALID, source: 'fleet-forge-action', merger: 'fleet' };
+    const fleet = {
+      ...VALID,
+      source: 'fleet-forge-action',
+      merger: 'fleet',
+      actionRef: 'forge:act-1:completed:2',
+    };
     const first = decideMergeRecord(VALID, fleet);
     expect(first.success).toBe(true);
     if (!first.success) return;
     expect(first.outcome).toBe('upgrade-merger');
     expect(first.record.merger).toBe('fleet');
+    expect(first.record.actionRef).toBe('forge:act-1:completed:2');
     expect(first.finding).toBeNull();
 
     const second = decideMergeRecord(first.record, fleet);
@@ -289,7 +299,7 @@ describe('decideMergeRecord', () => {
     expect(second.record.merger).toBe('fleet');
   });
 
-  it('changes only merger on the upgrade', () => {
+  it('changes only merger and the incoming actionRef on the upgrade', () => {
     const fleet = {
       ...VALID,
       source: 'fleet-forge-action',
@@ -301,27 +311,35 @@ describe('decideMergeRecord', () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.outcome).toBe('upgrade-merger');
-    expect(result.record).toEqual({ ...VALID, merger: 'fleet' });
+    expect(result.record).toEqual({ ...VALID, merger: 'fleet', actionRef: 'action-1' });
     expect(result.record.source).toBe('forge-observation');
     expect(result.record.firstSeenAtIso).toBe(VALID.firstSeenAtIso);
-    expect(result.record.actionRef).toBeUndefined();
   });
 
   it('reloads a persisted upgraded forge-observation record', () => {
     // The upgrade persists the stored `forge-observation` record with only
-    // `merger` moved to `fleet`; that persisted record must reload through the
-    // entity and round-trip.
-    const fleetSighting = { ...VALID, source: 'fleet-forge-action', merger: 'fleet' };
+    // `merger` moved to `fleet` and the incoming `actionRef` kept; that
+    // persisted record must reload through the entity and round-trip.
+    const fleetSighting = {
+      ...VALID,
+      source: 'fleet-forge-action',
+      merger: 'fleet',
+      actionRef: 'forge:act-1:completed:2',
+    };
     const decided = decideMergeRecord(VALID, fleetSighting);
     expect(decided.success).toBe(true);
     if (!decided.success) return;
     expect(decided.outcome).toBe('upgrade-merger');
-    expect(decided.record).toEqual({ ...VALID, merger: 'fleet' });
+    expect(decided.record).toEqual({ ...VALID, merger: 'fleet', actionRef: 'forge:act-1:completed:2' });
 
     const reloaded = MergeRecord.create(decided.record);
     expect(reloaded.success).toBe(true);
     if (!reloaded.success) return;
-    expect(reloaded.value.toRecord()).toEqual({ ...VALID, merger: 'fleet' });
+    expect(reloaded.value.toRecord()).toEqual({
+      ...VALID,
+      merger: 'fleet',
+      actionRef: 'forge:act-1:completed:2',
+    });
   });
 
   it('never downgrades merger from fleet to unknown', () => {
@@ -374,7 +392,12 @@ describe('decideMergeRecord', () => {
   });
 
   it('freezes the upgraded record', () => {
-    const result = decideMergeRecord(VALID, { ...VALID, source: 'fleet-forge-action', merger: 'fleet' });
+    const result = decideMergeRecord(VALID, {
+      ...VALID,
+      source: 'fleet-forge-action',
+      merger: 'fleet',
+      actionRef: 'forge:act-1:completed:2',
+    });
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.outcome).toBe('upgrade-merger');
@@ -389,5 +412,136 @@ describe('decideMergeRecord', () => {
   it('refuses an unreadable incoming record with a typed reason', () => {
     expect(decideError(VALID, null)).toBe('MergeRecord incoming record could not be read');
     expect(decideError(VALID, {})).toBe('MergeRecord incoming record could not be read');
+  });
+});
+
+describe('MERGE_RECORD_LIMITS', () => {
+  it('exports MERGE_RECORD_LIMITS matching MergeRecord.create and decideMergeRecord field bounds', () => {
+    expect(MERGE_RECORD_LIMITS).toEqual({
+      maxRepositoryLength: 200,
+      minPullRequestNumber: 1,
+      maxPullRequestNumber: 999_999_999,
+      maxHeadShaLength: 64,
+      maxIsoTimestampLength: 32,
+      maxActionRefLength: 128,
+    });
+
+    const make = (overrides: Partial<MergeRecordRecord> = {}): MergeRecordRecord => ({ ...VALID, ...overrides });
+
+    // actionRef: 128 accepted, 129 refused (create and decide both).
+    const actionRef128 = make({ actionRef: 'x'.repeat(MERGE_RECORD_LIMITS.maxActionRefLength) });
+    expect(MergeRecord.create(actionRef128).success).toBe(true);
+    expect(decideMergeRecord(VALID, actionRef128).success).toBe(true);
+
+    const actionRef129 = { ...actionRef128, actionRef: 'x'.repeat(MERGE_RECORD_LIMITS.maxActionRefLength + 1) };
+    expect(MergeRecord.create(actionRef129).success).toBe(false);
+    expect(decideMergeRecord(VALID, actionRef129).success).toBe(false);
+
+    // repository: 200 accepted, 201 refused.
+    const repository200 = make({ repository: 'r'.repeat(MERGE_RECORD_LIMITS.maxRepositoryLength) });
+    expect(MergeRecord.create(repository200).success).toBe(true);
+    const repository201 = make({ repository: 'r'.repeat(MERGE_RECORD_LIMITS.maxRepositoryLength + 1) });
+    expect(MergeRecord.create(repository201).success).toBe(false);
+
+    // number: 1 and 999_999_999 accepted, 0 and 1_000_000_000 refused.
+    for (const accepted of [MERGE_RECORD_LIMITS.minPullRequestNumber, MERGE_RECORD_LIMITS.maxPullRequestNumber]) {
+      const record = make({ number: accepted });
+      expect(MergeRecord.create(record).success).toBe(true);
+      expect(decideMergeRecord(null, record).success).toBe(true);
+    }
+    for (const refused of [0, 1_000_000_000]) {
+      const record = make({ number: refused });
+      expect(MergeRecord.create(record).success).toBe(false);
+      expect(decideMergeRecord(null, record).success).toBe(false);
+    }
+  });
+});
+
+describe('MergeRecord.fromStored and the actionRef creation rule (WB5b)', () => {
+  const fleetWithoutRef = {
+    ...VALID,
+    source: 'fleet-forge-action' as const,
+    merger: 'fleet' as const,
+  };
+
+  it('refuses a new fleet-forge-action record without, blank or whitespace-only actionRef', () => {
+    expect(createError(fleetWithoutRef)).toBe('MergeRecord fleet-forge-action requires actionRef');
+    expect(createError({ ...fleetWithoutRef, actionRef: '' })).toBe(
+      'MergeRecord actionRef: must be plain text of at most 128 characters',
+    );
+    expect(createError({ ...fleetWithoutRef, actionRef: '   ' })).toBe(
+      'MergeRecord actionRef: must be plain text of at most 128 characters',
+    );
+    // A forge-observation record still needs no actionRef.
+    expect(MergeRecord.create(VALID).success).toBe(true);
+  });
+
+  it('loads a pre-WB5b stored fleet-forge-action record without actionRef through fromStored', () => {
+    const result = MergeRecord.fromStored(fleetWithoutRef);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.toRecord()).toEqual(fleetWithoutRef);
+  });
+
+  it('fromStored still refuses a fleet-forge-action record with an unknown merger', () => {
+    const result = MergeRecord.fromStored({ ...fleetWithoutRef, merger: 'unknown' });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.message).toBe('MergeRecord source and merger disagree');
+  });
+
+  it('fromStored refuses unreadable input without throwing', () => {
+    expect(MergeRecord.fromStored(null).success).toBe(false);
+    expect(MergeRecord.fromStored([]).success).toBe(false);
+    const sparse = new Array(2) as unknown as Record<string, unknown>;
+    sparse.repository = VALID.repository;
+    expect(MergeRecord.fromStored(sparse).success).toBe(false);
+    const withGetter = Object.defineProperty(structuredClone(VALID), 'headSha', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(MergeRecord.fromStored(withGetter).success).toBe(false);
+  });
+
+  it('decideMergeRecord refuses an incoming fleet-forge-action record without actionRef', () => {
+    expect(decideError(null, fleetWithoutRef)).toBe('MergeRecord fleet-forge-action requires actionRef');
+    expect(decideError(VALID, fleetWithoutRef)).toBe('MergeRecord fleet-forge-action requires actionRef');
+  });
+
+  it('decideMergeRecord accepts a legacy stored fleet-forge-action record without actionRef', () => {
+    const incoming = { ...VALID, headSha: 'cd'.repeat(20) };
+    const result = decideMergeRecord(fleetWithoutRef, incoming);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    // The stored fleet record keeps its merger; a differing later read of an
+    // unknown-merger observation is an integrity finding, not an overwrite.
+    expect(result.outcome).toBe('integrity-conflict');
+    expect(result.record.merger).toBe('fleet');
+    expect(result.record.actionRef).toBeUndefined();
+  });
+
+  it('refuses null, sparse-array, unknown-enum, missing/blank fleet-forge-action actionRef, and throwing-getter inputs on create, fromStored, and decideMergeRecord', () => {
+    const throwingGetter = Object.defineProperty(structuredClone(VALID), 'repository', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    for (const input of [null, new Array(3), { ...VALID, source: 'weird' }]) {
+      expect(MergeRecord.create(input).success).toBe(false);
+      expect(MergeRecord.fromStored(input).success).toBe(false);
+      expect(decideMergeRecord(null, input).success).toBe(false);
+    }
+    expect(MergeRecord.create(throwingGetter).success).toBe(false);
+    expect(MergeRecord.fromStored(throwingGetter).success).toBe(false);
+    expect(decideMergeRecord(null, throwingGetter).success).toBe(false);
+    expect(decideMergeRecord(throwingGetter, VALID).success).toBe(false);
+    expect(
+      decideMergeRecord(null, { ...fleetWithoutRef, actionRef: ' ' }).success,
+    ).toBe(false);
   });
 });

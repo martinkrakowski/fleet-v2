@@ -3,8 +3,14 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { containsSecretShape } from '@fleet/shared';
+
 import { deriveInstallationModel } from '../model.js';
-import { parseInstallation } from '../parse.js';
+import {
+  HOST_NAME_SECRET_REFUSAL,
+  isValidHostName,
+  parseInstallation,
+} from '../parse.js';
 
 /** A minimal valid v2 file: one host with both required roles and a runner. */
 const validV2 = {
@@ -1343,5 +1349,93 @@ describe('parseInstallation v2 daemon', () => {
       ok: false,
       errors: ['installation: unknown key'],
     });
+  });
+});
+
+describe('parseInstallation v2 secret-shaped host keys', () => {
+  const githubToken = `ghp_${'a'.repeat(20)}`;
+  const awsKey = `AKIA${'A'.repeat(16)}`;
+  const slackToken = `xoxb-${'a'.repeat(10)}`;
+  const apiKey = `sk-${'a'.repeat(20)}`;
+
+  const fakes: ReadonlyArray<{ readonly label: string; readonly value: string }> = [
+    { label: 'github-token', value: githubToken },
+    { label: 'aws-access-key', value: awsKey },
+    { label: 'slack-token', value: slackToken },
+    { label: 'openai-style-key', value: apiKey },
+  ];
+
+  it.each(fakes)(
+    'refuses a secret-shaped host key with the rename refusal and does not echo it ($label)',
+    ({ value }) => {
+      const result = parseInstallation({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          [value]: {
+            transport: 'local',
+            worktreeRoot: '/srv/fleet/worktrees',
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46000 },
+          },
+        },
+      });
+      expect(result).toEqual({
+        ok: false,
+        errors: [
+          HOST_NAME_SECRET_REFUSAL,
+          'hosts: exactly one host must hold the orchestrator role',
+          'hosts: at least one host must hold the lane-runner role',
+        ],
+      });
+      if (!result.ok) {
+        expect(JSON.stringify(result.errors)).not.toContain(value);
+      }
+      expect(isValidHostName(value)).toBe(true);
+      expect(containsSecretShape(value)).toBe(true);
+    },
+  );
+
+  /**
+   * HN1 fix round 1, finding 1: a host key the loader accepts but the
+   * withholding screen flags never reaches an error line.
+   */
+  it('withholds a long opaque token-run key from a malformed entry error', () => {
+    const key = 'x.abcdefghijklmnopqrstuvwxyz0123456789';
+    expect(isValidHostName(key)).toBe(true);
+    const result = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        [key]: 'not-an-object',
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toContain(
+        'hosts.<host key withheld>: must be an object',
+      );
+      // No window of twenty characters or more of the key appears anywhere.
+      for (let start = 0; start < key.length; start += 1) {
+        for (let end = start + 20; end <= key.length; end += 1) {
+          expect(JSON.stringify(result.errors)).not.toContain(
+            key.slice(start, end),
+          );
+        }
+      }
+    }
+  });
+
+  it('echoes an ordinary host key unchanged in a malformed entry error', () => {
+    const result = parseInstallation({
+      ...validV2,
+      hosts: { ...validV2.hosts, 'lane-host-2': 'not-an-object' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toContain(
+        'hosts.lane-host-2: must be an object',
+      );
+    }
   });
 });

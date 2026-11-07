@@ -172,12 +172,40 @@ describe('fleet-v2 questions command group', () => {
         expectedHeadSha: null,
         proposalDigest: `merge attempt for ${requestId}`,
         policyRevision: POLICY_REVISION,
+        attemptId: `att-${requestId}`,
       }),
     ]);
     expect(decision.code).toBe(0);
   };
 
   const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it('request-decision refuses a forge action decision without an attempt, and a bidi attempt, as typed rejections (CO24f)', async () => {
+    const base = {
+      projectId: PROJECT_ID,
+      kind: 'action-decision',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: null,
+      proposalDigest: 'merge attempt',
+      policyRevision: POLICY_REVISION,
+    };
+    const missing = await cli([
+      'coordination',
+      'request-decision',
+      '--json',
+      JSON.stringify({ ...base, requestId: 'req-no-attempt' }),
+    ]);
+    expect(missing.code).toBe(1);
+    expect(jsonOf<{ outcome: string }>(missing).outcome).toBe('rejected');
+    const bidi = await cli([
+      'coordination',
+      'request-decision',
+      '--json',
+      JSON.stringify({ ...base, requestId: 'req-bidi-attempt', attemptId: 'att\u202eevil' }),
+    ]);
+    expect(bidi.code).toBe(1);
+    expect(jsonOf<{ outcome: string }>(bidi).outcome).toBe('rejected');
+  });
 
   it('ask records a question the clock stamped, and list and show read it back', async () => {
     const asked = await cli(['questions', 'ask', '--file', writeQuestionFile('ask.json', twoWayQuestion('q-1'))]);

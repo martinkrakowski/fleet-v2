@@ -21,6 +21,7 @@ import {
   ACTION_JOURNAL_ENTRY_SCHEMA_VERSION,
   CAPACITY_RESERVATION_SCHEMA_VERSION,
   parseSeatTool,
+  readJournalPullRequestRef,
 } from '../../domain/execution-records.js';
 import type {
   CapacityReservationClaim,
@@ -34,11 +35,12 @@ import type {
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import {
+  assertStoreWritable,
   assertValidSchemaVersionPolicy,
   FileLockTimeoutError,
   inspectVersionedRecordListBytes,
-  quarantineUnreadable,
   readStoreRecordSchemaVersion,
+  rejectUnreadableStateFile,
   StateFileUnreadableError,
   StateFileUnknownVersionError,
   withFileLock,
@@ -65,12 +67,28 @@ export interface ExecutionJournalAdapterOptions {
   readonly stateDir?: string;
   /** Emitter for post-save change signals; defaults to a no-op adapter. */
   readonly changeSignal?: ChangeSignalPort;
+  /**
+   * Read-only: an unreadable file is a read error with no quarantine copy
+   * (`StateFileUnreadableReadOnlyError`), and every write throws
+   * `ReadOnlyStateStoreError`.
+   */
+  readonly readOnly?: boolean;
 }
 
 function isActionJournalEntryRecord(value: unknown): value is ActionJournalEntryRecord {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
-  return typeof candidate.id === 'string' && typeof candidate.attemptId === 'string';
+  if (typeof candidate.id !== 'string' || typeof candidate.attemptId !== 'string') return false;
+  // The typed pull-request reference (WB5b) must be a valid forge-only
+  // (repository, number) pair; any malformed value fails closed.
+  try {
+    if (readJournalPullRequestRef(candidate.action as ActionJournalEntryRecord['action'], candidate.pullRequest).kind === 'invalid') {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 function isCapacityReservationRecord(value: unknown): value is CapacityReservationRecord {
@@ -303,6 +321,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   }
 
   async appendJournalEntry(entry: ActionJournalEntryRecord): Promise<void> {
+    assertStoreWritable(this.options?.readOnly === true, 'ExecutionJournalAdapter');
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       const duplicate = this.inMemoryJournalEntries.some((existing) => existing.id === entry.id);
@@ -342,6 +361,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   }
 
   async saveCapacityReservation(reservation: CapacityReservationRecord): Promise<void> {
+    assertStoreWritable(this.options?.readOnly === true, 'ExecutionJournalAdapter');
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       refuseSupersedingReservation(this.inMemoryReservationsById, reservation);
@@ -387,6 +407,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   async reserveCapacityAtomically(
     request: ReserveCapacityAtomicallyRequest,
   ): Promise<ReserveCapacityAtomicallyResult> {
+    assertStoreWritable(this.options?.readOnly === true, 'ExecutionJournalAdapter');
     /** Busy-worktree verdict, decided under the lock when a check is supplied. */
     const busyUnderLock = async (
       held: readonly CapacityReservationRecord[],
@@ -541,6 +562,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   }
 
   async releaseCapacityReservation(attemptId: string, releasedAtIso: string): Promise<boolean> {
+    assertStoreWritable(this.options?.readOnly === true, 'ExecutionJournalAdapter');
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       const held = [...this.inMemoryReservationsById.values()].find(
@@ -598,6 +620,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   async releaseCapacityReservationIfUnchanged(
     rawRequest: ReleaseCapacityReservationIfUnchangedRequest,
   ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
+    assertStoreWritable(this.options?.readOnly === true, 'ExecutionJournalAdapter');
     try {
       const validated = validateFencedReleaseRequest(rawRequest);
       if (validated !== null) {
@@ -767,7 +790,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       throw new StateFileUnknownVersionError(target, inspection.recordIndex);
     }
     if (inspection.status === 'unreadable') {
-      return quarantineUnreadable(target, inspection.detail, buffer);
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
     }
     return [...inspection.records];
   }
@@ -792,7 +815,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       throw new StateFileUnknownVersionError(target, inspection.recordIndex);
     }
     if (inspection.status === 'unreadable') {
-      return quarantineUnreadable(target, inspection.detail, buffer);
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
     }
     for (const item of inspection.records) {
       map.set(item.id, item);

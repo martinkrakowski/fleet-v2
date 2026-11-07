@@ -10,10 +10,28 @@
  * conductor driver lease. Without a durable state directory the coordination
  * store is empty, so an apply is always refused. The commands only return the
  * typed result; they never print a path, the root, the source or a grant id.
+ *
+ * CO14c: the release runs only on the served root. The served root is read
+ * LEXICALLY from the configured `daemon.cliPath` (the `<root>` in
+ * `<root>/current/...`), never from the filesystem, and it never depends on
+ * whether the entry point exists. `--root` must exist and `realpath(--root)`
+ * must equal `realpath(configured root)`; any realpath failure refuses with
+ * `release-root-state-dir-unknown`. Only a first `release install --apply`
+ * may create the (absent) configured root, as a real directory with no
+ * symlink anywhere in the created path, under the driver lease of the served
+ * state directory, and it re-verifies the equality inside that same lock.
+ * The check-then-use window is closed by resolving once and using only the
+ * resolved path: after verification the command operates on the canonical
+ * real path alone, so a later symlink swap of `--root` cannot redirect a
+ * write outside the served root.
  */
 
+import { lstat, mkdir, realpath } from 'node:fs/promises';
+
+import type { FleetInstallation } from '@fleet/installation';
 import {
   ActionAuthorizationAdapter,
+  ConductorDriverLeaseAdapter,
   LocalExecutor,
   ManageReleaseUseCase,
   ReleaseStoreAdapter,
@@ -22,6 +40,7 @@ import {
   type ActionAuthorizationPort,
   type CommandExecutorPort,
   type ConductorDriverLeasePort,
+  type ConductorDriverLeaseRecord,
   type ManageReleaseRequest,
   type ManageReleaseResult,
   type ReleaseAction,
@@ -94,13 +113,238 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
   });
 }
 
+/** How long the first-install creation holds the served driver lease; well inside a lease maximum. */
+const INSTALL_LOCK_MS = 60_000;
+const INSTALL_LOCK_HOLDER = 'release-install';
+
+/**
+ * CO14c: the release root facts of the served root, read LEXICALLY from the
+ * installation: the configured root is the `<root>` in `<root>/current/...`
+ * of `daemon.cliPath`, and `daemon.stateDir` is the state directory of the
+ * driver that serves it. Pure: no filesystem or environment access. Null when
+ * the root cannot be determined at all — no daemon section, no entry point
+ * path, an entry point that is not an absolute path without `.` or `..`
+ * segments, no `current` segment, or no state directory — and the release
+ * refuses `release-root-state-dir-unknown`. It never depends on whether the
+ * entry point exists.
+ */
+export function servedRootFacts(installation: FleetInstallation | undefined): {
+  readonly configuredRoot: string;
+  readonly stateDir: string;
+} | null {
+  const daemon = installation?.daemon;
+  const stateDir = daemon?.stateDir;
+  if (typeof stateDir !== 'string' || stateDir.trim() === '') {
+    return null;
+  }
+  const cliPath = daemon?.cliPath;
+  if (typeof cliPath !== 'string') {
+    return null;
+  }
+  const cliSegments = plainAbsoluteSegments(cliPath);
+  if (cliSegments === null) {
+    return null;
+  }
+  const currentAt = cliSegments.indexOf('current');
+  if (currentAt < 1) {
+    return null;
+  }
+  return { configuredRoot: `/${cliSegments.slice(0, currentAt).join('/')}`, stateDir };
+}
+
+/** The segments of an absolute path with no `.`, `..` or empty segment; null otherwise. */
+function plainAbsoluteSegments(value: string): string[] | null {
+  if (!value.startsWith('/')) {
+    return null;
+  }
+  const segments = value.slice(1).split('/');
+  return segments.every((segment) => segment !== '' && segment !== '.' && segment !== '..') ? segments : null;
+}
+
+type RootResolution =
+  | { readonly outcome: 'verified'; readonly root: string }
+  | { readonly outcome: 'refused' };
+
+const ROOT_REFUSED: RootResolution = { outcome: 'refused' };
+
+/**
+ * CO14c rules 2–5: resolve `--root` against the served root.
+ *
+ * Rule 2: any `realpath` failure — on `--root` or on the configured root —
+ * refuses, except the configured root's ENOENT, which is the first-install
+ * state, not an unknown one. Rule 3: `--root` must exist and
+ * `realpath(--root)` must equal `realpath(configured root)`; a symlinked root
+ * is fine only when it resolves to the configured root. Rule 4: when the
+ * configured root does not exist yet, only `release install --apply` may
+ * create it — a real directory, `mkdir -p` with no symlink anywhere in the
+ * created path, under the driver lease of the served state directory (the
+ * install lock), and it re-verifies rule 3 inside that same lock before the
+ * root is used. Rule 5: the check-then-use window is closed by resolving
+ * once and using only the resolved path — the verified canonical real path is
+ * the only root the command uses afterwards, so a symlink swapped in after
+ * the check cannot redirect a write outside the served root.
+ */
+export async function resolveVerifiedRoot(
+  root: string,
+  facts: { readonly configuredRoot: string; readonly stateDir: string },
+  options: {
+    /** True only for `install --apply`: the configured root may be created. */
+    readonly createIfAbsent: boolean;
+    /** The driver lease of the served state directory; the install lock. */
+    readonly lease: ConductorDriverLeasePort;
+    readonly nowIso: () => string;
+  },
+): Promise<RootResolution> {
+  const realConfigured = await realpathOrNull(facts.configuredRoot);
+  if (realConfigured === null) {
+    const stat = await lstatOrNull(facts.configuredRoot);
+    if (stat !== null || !options.createIfAbsent) {
+      // A dangling link or another realpath failure is never a first install;
+      // an absent configured root is accepted only where creation is allowed.
+      return ROOT_REFUSED;
+    }
+    return createServedRoot(root, facts, options);
+  }
+  return verifiedEqualRoot(root, realConfigured);
+}
+
+/** Rule 3: `--root` must exist and resolve to the same real path as the configured root. */
+async function verifiedEqualRoot(root: string, realConfigured: string): Promise<RootResolution> {
+  const realRoot = await realpathOrNull(root);
+  if (realRoot === null || realRoot !== realConfigured) {
+    return ROOT_REFUSED;
+  }
+  return { outcome: 'verified', root: realConfigured };
+}
+
+/**
+ * Rule 4: create the absent configured root as a real directory under the
+ * install lock, then re-verify rule 3 inside that same lock. The lock is the
+ * driver lease of the served state directory: acquire is by CAS on the fence,
+ * so a concurrent install (or a live driver) cannot hold it twice, and the
+ * creation and the re-verification both happen between acquire and release.
+ */
+async function createServedRoot(
+  root: string,
+  facts: { readonly configuredRoot: string },
+  options: { readonly lease: ConductorDriverLeasePort; readonly nowIso: () => string },
+): Promise<RootResolution> {
+  let observed: ConductorDriverLeaseRecord | null = null;
+  try {
+    observed = await options.lease.read();
+  } catch {
+    return ROOT_REFUSED;
+  }
+  const nowIso = options.nowIso();
+  let acquired: { readonly fence: number };
+  try {
+    const taken = await options.lease.acquire({
+      holderId: INSTALL_LOCK_HOLDER,
+      observedFence: observed?.fence ?? 0,
+      leaseUntilIso: new Date(Date.parse(nowIso) + INSTALL_LOCK_MS).toISOString(),
+      nowIso,
+    });
+    if (taken.outcome !== 'ok') {
+      // Another holder may have created the root meanwhile: re-verify once,
+      // outside the lock, and accept only a now-existing equal root.
+      const realConfigured = await realpathOrNull(facts.configuredRoot);
+      if (realConfigured === null) {
+        return ROOT_REFUSED;
+      }
+      return verifiedEqualRoot(root, realConfigured);
+    }
+    acquired = { fence: taken.lease.fence };
+  } catch {
+    return ROOT_REFUSED;
+  }
+  try {
+    if (!(await mkdirRealDirectory(facts.configuredRoot))) {
+      return ROOT_REFUSED;
+    }
+    // Rule 4: the equality is re-verified inside the same lock, before use.
+    const realConfigured = await realpathOrNull(facts.configuredRoot);
+    if (realConfigured === null) {
+      return ROOT_REFUSED;
+    }
+    return await verifiedEqualRoot(root, realConfigured);
+  } finally {
+    // Best effort: the lease lapses on its own within the lock window.
+    await options.lease
+      .release({ holderId: INSTALL_LOCK_HOLDER, fence: acquired.fence, nowIso: options.nowIso() })
+      .catch(() => undefined);
+  }
+}
+
+/**
+ * `mkdir -p` that never follows or creates a symlink: each missing component
+ * is created with a non-recursive mkdir, and an existing component must be a
+ * real directory (an lstat, so a symlink component refuses even when its
+ * target is a directory).
+ */
+async function mkdirRealDirectory(directory: string): Promise<boolean> {
+  const segments = plainAbsoluteSegments(directory);
+  if (segments === null) {
+    return false;
+  }
+  let current = '';
+  for (const segment of segments) {
+    current = `${current}/${segment}`;
+    const stat = await lstatOrNull(current);
+    if (stat !== null) {
+      if (!stat.isDirectory()) {
+        return false;
+      }
+      continue;
+    }
+    try {
+      await mkdir(current);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function realpathOrNull(target: string): Promise<string | null> {
+  try {
+    return await realpath(target);
+  } catch {
+    return null;
+  }
+}
+
+async function lstatOrNull(target: string): Promise<Awaited<ReturnType<typeof lstat>> | null> {
+  try {
+    return await lstat(target);
+  } catch {
+    // An unreadable directory entry is treated as absent here; the mkdir that
+    // follows (or the realpath re-check) refuses when the path is not usable.
+    return null;
+  }
+}
+
 function releaseHandler(action: ReleaseAction): CommandHandler {
   return async (payload, rt) => {
     if (Object.hasOwn(payload, 'action')) {
       throw new CliUsageError('Unknown release option: --action');
     }
+    const request = parseRequest({ ...payload, action });
+    // CO14c: the release runs only on the served root. The root is verified
+    // here, at the CLI boundary, before the use case sees any path.
+    const facts = servedRootFacts(rt.installation);
+    if (facts === null) {
+      return { outcome: 'refused', reason: 'release-root-state-dir-unknown' };
+    }
+    const verified = await resolveVerifiedRoot(request.root, facts, {
+      createIfAbsent: request.action === 'install' && request.apply,
+      lease: new ConductorDriverLeaseAdapter({ stateDir: facts.stateDir }),
+      nowIso: () => new Date().toISOString(),
+    });
+    if (verified.outcome !== 'verified') {
+      return { outcome: 'refused', reason: 'release-root-state-dir-unknown' };
+    }
     return manageReleaseFromPayload(
-      { ...payload, action },
+      { ...payload, action, root: verified.root },
       {
         lease: rt.conductor.driverLease,
         authorization: releaseAuthorization(rt),

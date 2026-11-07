@@ -34,6 +34,7 @@ export interface ManageReleaseRequest {
 
 export type ManageReleaseRefusal =
   | 'invalid-request'
+  | 'release-root-state-dir-unknown'
   | 'authority-required'
   | 'authority-refused'
   | 'authority-unknown'

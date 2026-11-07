@@ -6,8 +6,12 @@
  * store adapter reads an empty store and nothing touches the filesystem.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
 
+import { loadInstallation, type FleetInstallation } from '@fleet/installation';
 import type {
   ActionAuthorizationPort,
   CommandExecutorPort,
@@ -67,6 +71,22 @@ function deps(lease: ConductorDriverLeaseRecord | null = null): {
 
 const installPayload = { action: 'install', root: ROOT, sha: SHA, source: SOURCE };
 
+const createdDirs: string[] = [];
+afterEach(() => {
+  for (const directory of createdDirs.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+/** Load a v2 installation file that must be valid; the test fails loudly otherwise. */
+function loadValidInstallation(file: string): FleetInstallation {
+  const loaded = loadInstallation({ file });
+  if (loaded.status !== 'loaded') {
+    throw new Error(`expected a valid installation file: ${loaded.status}`);
+  }
+  return loaded.installation;
+}
+
 describe('release command', () => {
   it('install without apply returns the plan and runs no command', async () => {
     const d = deps();
@@ -111,11 +131,43 @@ describe('release command', () => {
   });
 
   it('the registered release group refuses apply on a runtime with no recorded grant', async () => {
-    const rt = createFleetCliRuntime();
+    // CO14c: the command runs only on the served root, so the runtime carries
+    // an installation whose daemon entry point runs from the root's `current`,
+    // and the root exists.
+    const root = mkdtempSync(path.join(tmpdir(), 'fleet-release-co14-'));
+    createdDirs.push(root);
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-release-co14-state-'));
+    createdDirs.push(stateDir);
+    const installationFile = path.join(stateDir, 'fleet.json');
+    writeFileSync(
+      installationFile,
+      JSON.stringify({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          lane: {
+            transport: 'local',
+            worktreeRoot: path.join(stateDir, 'worktrees'),
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46003 },
+          },
+        },
+        daemon: {
+          nodePath: '/usr/bin/node',
+          cliPath: `${root}/current/apps/cli/dist/bin.js`,
+          stateDir,
+          unitDir: path.join(stateDir, 'units'),
+          installationFile,
+        },
+      }),
+      'utf8',
+    );
+    const loaded = loadValidInstallation(installationFile);
+    const rt = createFleetCliRuntime({ stateDir, installation: loaded });
     const out: string[] = [];
     const err: string[] = [];
     const code = await runCli(
-      ['release', 'install', '--root', ROOT, '--sha', SHA, '--source', SOURCE, '--project', PROJECT, '--apply'],
+      ['release', 'install', '--root', root, '--sha', SHA, '--source', SOURCE, '--project', PROJECT, '--apply'],
       { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
       rt,
     );

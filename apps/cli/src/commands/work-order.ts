@@ -61,16 +61,13 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       });
     },
     held: async (p, rt) => {
-      // A given --project-id or --now-iso must carry a value: a bare flag parses as `true`, and an
-      // empty --project-id would widen the listing to every project.
-      if (Object.hasOwn(p, 'projectId') && (typeof p.projectId !== 'string' || p.projectId.trim() === '')) {
-        throw new CliUsageError('work-order held --project-id needs a project id');
+      if (Object.hasOwn(p, 'projectId')) {
+        throw new CliUsageError('work-order held does not accept --project-id');
       }
       if (Object.hasOwn(p, 'nowIso') && (typeof p.nowIso !== 'string' || p.nowIso.trim() === '')) {
         throw new CliUsageError('work-order held --now-iso needs an ISO timestamp');
       }
       return rt.execution.listHeldWorkOrders.listHeldWorkOrders({
-        projectId: optStr(p, 'projectId'),
         nowIso: optStr(p, 'nowIso'),
       });
     },

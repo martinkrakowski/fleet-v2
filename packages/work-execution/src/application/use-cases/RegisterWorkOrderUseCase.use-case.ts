@@ -93,6 +93,10 @@ export interface RegisterWorkOrderDependencies {
   /** Budget of the whole open-pull-request check (default 30000, clamped to 1..120000). */
   readonly overlapCheckBudgetMs?: number;
   readonly maxOpenPullRequestsChecked?: number;
+  /** Optional sink for attention codes recorded during registration (ids and codes only). */
+  readonly recordAttentionCode?: (code: string) => Promise<void> | void;
+  readonly recordAttention?: (code: string) => Promise<void> | void;
+  readonly recordAttentionItem?: (body: unknown, actor: string) => Promise<unknown>;
 }
 
 const DEFAULT_OVERLAP_CHECK_BUDGET_MS = 30_000;
@@ -719,7 +723,31 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     const blockerId = blocker.kind === 'open-pr' ? String(blocker.pullRequestNumber) : blocker.workOrderId;
     let held = false;
     const heldRepo = this.deps?.heldWorkOrderRepo;
-    if (heldRepo !== undefined) {
+    const isLegacyActiveId =
+      blocker.kind === 'active-work-order' && !ID_TOKEN_PATTERN.test(blockerId);
+
+    if (isLegacyActiveId) {
+      try {
+        if (this.deps?.recordAttentionCode !== undefined) {
+          await this.deps.recordAttentionCode('hold-skipped-invalid-blocker-id');
+        } else if (this.deps?.recordAttention !== undefined) {
+          await this.deps.recordAttention('hold-skipped-invalid-blocker-id');
+        } else if (this.deps?.recordAttentionItem !== undefined) {
+          await this.deps.recordAttentionItem(
+            {
+              projectId: context.snapshot.projectId,
+              kind: 'hold-skipped-invalid-blocker-id',
+              subject: { kind: 'work-order', ref: context.workOrderId },
+              workOrderId: context.workOrderId,
+              summary: 'hold-skipped-invalid-blocker-id',
+            },
+            'work-execution',
+          );
+        }
+      } catch {
+        // Attention recording failure does not block or throw
+      }
+    } else if (heldRepo !== undefined) {
       const record: HeldWorkOrderRecord = {
         version: 1,
         stage: 'intent',
@@ -727,7 +755,6 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
         workOrderId: context.workOrderId,
         requestDigest: context.requestDigest,
         briefRequestRef: context.briefRequestRef,
-        request: context.snapshot,
         blockerKind,
         blockerId,
         pathCode,

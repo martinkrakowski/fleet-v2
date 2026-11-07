@@ -662,8 +662,11 @@ describe('ForgeReadAdapter.containsCommit (CT-2b)', () => {
 describe('ForgeReadAdapter.readPullRequestChangedFiles', () => {
   const secretShaped = ['ghp', '_', 'x'.repeat(36)].join('');
 
-  function filesStdout(paths: readonly string[]): string {
-    return JSON.stringify({ files: paths.map((path) => ({ path, additions: 1, deletions: 0 })) });
+  function filesStdout(paths: readonly string[], changedFiles?: number): string {
+    return JSON.stringify({
+      files: paths.map((path) => ({ path, additions: 1, deletions: 0 })),
+      changedFiles: changedFiles ?? paths.length,
+    });
   }
 
   function adapterFor(stdout: string, exitCode = 0) {
@@ -686,7 +689,7 @@ describe('ForgeReadAdapter.readPullRequestChangedFiles', () => {
       repository: { owner: 'acme', repo: 'fleet' },
     });
     expect(result).toEqual({ outcome: 'found', files: ['packages/a/src/x.ts', 'packages/b/src/y.ts'] });
-    expect(calls).toEqual([['pr', 'view', '42', '-R', 'acme/fleet', '--json', 'files']]);
+    expect(calls).toEqual([['pr', 'view', '42', '-R', 'acme/fleet', '--json', 'files,changedFiles']]);
     expect(calls.every((args) => args[0] === 'pr')).toBe(true);
   });
 
@@ -696,16 +699,21 @@ describe('ForgeReadAdapter.readPullRequestChangedFiles', () => {
       outcome: 'found',
       files: ['a.ts'],
     });
-    expect(calls[0]).toEqual(['pr', 'view', '7', '-R', 'acme/fleet', '--json', 'files']);
+    expect(calls[0]).toEqual(['pr', 'view', '7', '-R', 'acme/fleet', '--json', 'files,changedFiles']);
   });
 
-  it('enforces 3000-file and 4-MiB stdout bounds on PR changed files', async () => {
+  it('enforces 100-file and 4-MiB stdout bounds on PR changed files and verifies changedFiles', async () => {
     const make = (count: number) => Array.from({ length: count }, (_, index) => `packages/p/file-${index}.ts`);
-    const atBound = adapterFor(filesStdout(make(3000)));
+    const atBound = adapterFor(filesStdout(make(99)));
     const found = await atBound.adapter.readPullRequestChangedFiles({ pullRequestNumber: 1 });
-    expect(found.outcome === 'found' && found.files.length).toBe(3000);
-    const over = adapterFor(filesStdout(make(3001)));
-    expect(await over.adapter.readPullRequestChangedFiles({ pullRequestNumber: 1 })).toEqual({
+    expect(found.outcome === 'found' && found.files.length).toBe(99);
+    const at100 = adapterFor(filesStdout(make(100)));
+    expect(await at100.adapter.readPullRequestChangedFiles({ pullRequestNumber: 1 })).toEqual({
+      outcome: 'unknown',
+      reason: 'too-many-files',
+    });
+    const overReported = adapterFor(filesStdout(make(50), 150));
+    expect(await overReported.adapter.readPullRequestChangedFiles({ pullRequestNumber: 1 })).toEqual({
       outcome: 'unknown',
       reason: 'too-many-files',
     });
@@ -733,12 +741,22 @@ describe('ForgeReadAdapter.readPullRequestChangedFiles', () => {
     expect(JSON.stringify(result)).not.toContain(secretShaped);
   });
 
-  it('reads a non-zero exit, malformed JSON and a missing or sparse files array as unknown', async () => {
+  it('reads a non-zero exit, malformed JSON, missing changedFiles and a missing or sparse files array as unknown', async () => {
     expect(await adapterFor('', 1).adapter.readPullRequestChangedFiles({ pullRequestNumber: 3 })).toEqual({
       outcome: 'unknown',
       reason: 'files-failed',
     });
-    for (const stdout of ['{ not json', '{}', '[]', '{"files":{}}', '{"files":[null]}', '{"files":[{"path":3}]}']) {
+    for (const stdout of [
+      '{ not json',
+      '{}',
+      '[]',
+      '{"files":{}}',
+      '{"files":[null]}',
+      '{"files":[{"path":3}]}',
+      '{"files":[{"path":"a.ts"}]}',
+      '{"files":[{"path":"a.ts"}],"changedFiles":"1"}',
+      '{"files":[{"path":"a.ts"}],"changedFiles":-1}',
+    ]) {
       expect(await adapterFor(stdout).adapter.readPullRequestChangedFiles({ pullRequestNumber: 3 })).toEqual({
         outcome: 'unknown',
         reason: 'unreadable-files',
@@ -746,8 +764,8 @@ describe('ForgeReadAdapter.readPullRequestChangedFiles', () => {
     }
   });
 
-  it('reads an empty files array as found with no files, never as unknown', async () => {
-    expect(await adapterFor('{"files":[]}').adapter.readPullRequestChangedFiles({ pullRequestNumber: 3 })).toEqual({
+  it('reads an empty files array with changedFiles: 0 as found with no files, never as unknown', async () => {
+    expect(await adapterFor('{"files":[],"changedFiles":0}').adapter.readPullRequestChangedFiles({ pullRequestNumber: 3 })).toEqual({
       outcome: 'found',
       files: [],
     });

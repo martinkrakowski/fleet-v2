@@ -33,19 +33,18 @@ const REQUEST: HeldWorkOrderRequestSnapshot = {
   prerequisiteWorkOrderIds: [],
 };
 
-function intentRecord(overrides: Partial<HeldWorkOrderRecord> & { request?: HeldWorkOrderRequestSnapshot } = {}): HeldWorkOrderRecord {
+function intentRecord(overrides: Partial<HeldWorkOrderRecord> = {}): HeldWorkOrderRecord {
   const workOrderId = overrides.workOrderId ?? 'wo-1';
-  const request = overrides.request ?? REQUEST;
   const briefRequestRef = overrides.briefRequestRef === undefined ? 'brief-req-01' : overrides.briefRequestRef;
-  const requestDigest = computeRegisterWorkOrderRequestDigest(workOrderId, request, briefRequestRef);
+  const requestDigest =
+    overrides.requestDigest ?? computeRegisterWorkOrderRequestDigest(workOrderId, REQUEST, briefRequestRef);
   return {
     version: 1,
     stage: 'intent',
-    intentId: `hold-${requestDigest.slice(0, 24)}`,
+    intentId: overrides.intentId ?? `hold-${requestDigest.slice(0, 24)}`,
     workOrderId,
     requestDigest,
     briefRequestRef,
-    request,
     blockerKind: 'open-pr',
     blockerId: '42',
     pathCode: overlapPathCode('packages/a/src'),
@@ -76,21 +75,30 @@ describe('validateHeldWorkOrderRecord', () => {
   it('accepts a valid record and rejects a tampered digest, path code or secret-shaped field', () => {
     const record = intentRecord();
     expect(validateHeldWorkOrderRecord(record)).toEqual(record);
-    expect(validateHeldWorkOrderRecord({ ...record, requestDigest: 'a'.repeat(64) })).toBeNull();
+    expect(validateHeldWorkOrderRecord({ ...record, requestDigest: 'not-hex' })).toBeNull();
     expect(validateHeldWorkOrderRecord({ ...record, pathCode: 'path-xyz' })).toBeNull();
     expect(validateHeldWorkOrderRecord({ ...record, heldAtIso: '2026-11-07' })).toBeNull();
     expect(validateHeldWorkOrderRecord({ ...record, blockerKind: 'open-pr', blockerId: '0' })).toBeNull();
     expect(validateHeldWorkOrderRecord({ ...record, extra: true })).toBeNull();
-    expect(validateHeldWorkOrderRecord({ ...record, request: { ...REQUEST, ownedPaths: ['../escape'] } })).toBeNull();
+    expect(validateHeldWorkOrderRecord({ ...record, request: REQUEST })).toBeNull();
     expect(validateHeldWorkOrderRecord(null)).toBeNull();
     expect(validateHeldWorkOrderRecord('text')).toBeNull();
   });
 
-  it('refuses a sparse ownedPaths array and a getter without throwing', () => {
+  it('a held record serialised to JSON contains no owned path string and no taskId or laneId value', () => {
     const record = intentRecord();
-    const sparse = new Array<string>(2);
-    sparse[0] = 'packages/a/src';
-    expect(validateHeldWorkOrderRecord({ ...record, request: { ...REQUEST, ownedPaths: sparse } })).toBeNull();
+    const json = JSON.stringify(record);
+    expect(json).not.toContain('packages/a/src');
+    expect(json).not.toContain('task-1');
+    expect(json).not.toContain('lane-1');
+    expect(json).not.toContain('ownedPaths');
+    expect(json).not.toContain('taskId');
+    expect(json).not.toContain('laneId');
+    expect(json).not.toContain('policyRevision');
+  });
+
+  it('refuses a getter without throwing', () => {
+    const record = intentRecord();
     const hostile = { ...record };
     Object.defineProperty(hostile, 'workOrderId', {
       enumerable: true,
@@ -178,7 +186,9 @@ describe('HeldWorkOrderRepositoryAdapter', () => {
     const otherWorkOrder = intentRecord({ workOrderId: 'wo-2', intentId: record.intentId });
     expect(await adapter.recordHoldIntent(otherWorkOrder)).toEqual({ outcome: 'refused', reason: 'intent-digest-mismatch' });
 
-    const mutated = intentRecord({ request: { ...REQUEST, ownedPaths: ['packages/b'] } });
+    const mutated = intentRecord({
+      requestDigest: computeRegisterWorkOrderRequestDigest('wo-1', { ...REQUEST, ownedPaths: ['packages/b'] }, 'brief-req-01'),
+    });
     expect(mutated.requestDigest).not.toBe(record.requestDigest);
     expect(await adapter.recordHoldIntent(mutated)).toEqual({ outcome: 'refused', reason: 'intent-digest-mismatch' });
 
@@ -203,13 +213,15 @@ describe('HeldWorkOrderRepositoryAdapter', () => {
     const record = intentRecord();
     await adapter.recordHoldIntent(record);
     await adapter.completeHoldIntent({ intentId: record.intentId, workOrderId: 'wo-1', requestDigest: record.requestDigest });
-    const mutated = intentRecord({ request: { ...REQUEST, taskId: 'task-2' } });
+    const mutated = intentRecord({
+      requestDigest: computeRegisterWorkOrderRequestDigest('wo-1', { ...REQUEST, taskId: 'task-2' }, 'brief-req-01'),
+    });
     expect(await adapter.recordHoldIntent(mutated)).toEqual({ outcome: 'refused', reason: 'held-request-mismatch' });
   });
 
   it('refuses an invalid or settled record as invalid-record', async () => {
     const adapter = new HeldWorkOrderRepositoryAdapter({ stateDir });
-    expect(await adapter.recordHoldIntent({ ...intentRecord(), requestDigest: 'a'.repeat(64) })).toEqual({
+    expect(await adapter.recordHoldIntent({ ...intentRecord(), requestDigest: 'not-hex' })).toEqual({
       outcome: 'refused',
       reason: 'invalid-record',
     });
@@ -226,7 +238,7 @@ describe('HeldWorkOrderRepositoryAdapter', () => {
     const cases: string[] = [
       '{ not json',
       '{}',
-      JSON.stringify([{ ...record, schemaVersion: 1, requestDigest: 'f'.repeat(64) }]),
+      JSON.stringify([{ ...record, schemaVersion: 1, requestDigest: 'not-hex' }]),
       JSON.stringify([{ ...record, schemaVersion: 1 }, { ...record, schemaVersion: 1 }]),
       JSON.stringify([{ ...record, schemaVersion: 2 }]),
     ];

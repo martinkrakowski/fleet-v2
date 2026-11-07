@@ -12,13 +12,12 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 import type { PlanRef, WorkOrderRisk } from './execution-records.js';
-import { WORK_ORDER_RISKS } from './execution-records.js';
 import { isCanonicalIso } from './lane-activity-records.js';
 import { isSharedAppendPath } from './lane-run-packages.js';
-import { readExactPlainRecord, snapshotPlainDataRecord } from './plain-record-reads.js';
+import { readExactPlainRecord } from './plain-record-reads.js';
 import { validateWorktreeRelativePath } from './worktree-path.js';
 
-export const MAX_PULL_REQUEST_CHANGED_FILES = 3000;
+export const MAX_PULL_REQUEST_CHANGED_FILES = 100;
 export const MAX_REPO_REL_PATH_LENGTH = 512;
 export const MAX_OWNED_PATHS = 256;
 export const MAX_PREREQUISITE_WORK_ORDER_IDS = 128;
@@ -199,13 +198,15 @@ export function overlapPathCode(normalizedRepoPath: string, digestFn: DigestFn =
   return `path-${digestFn(normalizedRepoPath).slice(0, 12)}`;
 }
 
-/** Exact match, or one path nested underneath the other; a shared append path never overlaps. */
+/** Exact match, or one path nested underneath the other; shared-append exemption applies only when both paths are the same file. */
 export function pathsOverlap(leftNormalized: string, rightNormalized: string): boolean {
-  if (isSharedAppendPath(leftNormalized) || isSharedAppendPath(rightNormalized)) {
+  if (leftNormalized === rightNormalized && isSharedAppendPath(leftNormalized)) {
     return false;
   }
+  if (leftNormalized === rightNormalized) {
+    return true;
+  }
   return (
-    leftNormalized === rightNormalized ||
     leftNormalized.startsWith(`${rightNormalized}/`) ||
     rightNormalized.startsWith(`${leftNormalized}/`)
   );
@@ -289,7 +290,6 @@ export interface HeldWorkOrderRecord {
   readonly workOrderId: string;
   readonly requestDigest: string;
   readonly briefRequestRef: string | null;
-  readonly request: HeldWorkOrderRequestSnapshot;
   readonly blockerKind: OverlapBlockerKind;
   readonly blockerId: string;
   readonly pathCode: string;
@@ -335,28 +335,11 @@ const RECORD_KEYS = [
   'workOrderId',
   'requestDigest',
   'briefRequestRef',
-  'request',
   'blockerKind',
   'blockerId',
   'pathCode',
   'heldAtIso',
 ] as const;
-const REQUEST_REQUIRED_KEYS = [
-  'projectId',
-  'taskId',
-  'laneId',
-  'repository',
-  'baseCommit',
-  'ownedPaths',
-  'policyRevision',
-  'risk',
-  'baseBranch',
-  'prerequisiteWorkOrderIds',
-] as const;
-const REQUEST_OPTIONAL_KEYS = ['planRef', 'supersedesWorkOrderId'] as const;
-const PLAN_REF_KEYS = ['projectId', 'planId', 'laneId'] as const;
-const HELD_BASE_BRANCH_PATTERN = /^(?:main|chain\/[a-z0-9]+(?:-[a-z0-9]+)*)$/;
-
 function isBoundedPlainString(value: unknown, maxLength: number): value is string {
   return (
     typeof value === 'string' &&
@@ -391,95 +374,6 @@ export function readDenseUnknownArray(value: unknown, max: number): readonly unk
   return out;
 }
 
-function readHeldPlanRef(value: unknown): PlanRef | null {
-  const record = readExactPlainRecord(value, PLAN_REF_KEYS);
-  if (
-    record === null ||
-    !isBoundedPlainString(record.projectId, MAX_HELD_ID_LENGTH) ||
-    !isBoundedPlainString(record.planId, MAX_HELD_ID_LENGTH) ||
-    !isBoundedPlainString(record.laneId, MAX_HELD_ID_LENGTH)
-  ) {
-    return null;
-  }
-  return { projectId: record.projectId, planId: record.planId, laneId: record.laneId };
-}
-
-function readHeldRequest(value: unknown): HeldWorkOrderRequestSnapshot | null {
-  const snapshot = snapshotPlainDataRecord(value);
-  if (snapshot === null) {
-    return null;
-  }
-  const keys = Object.keys(snapshot);
-  const allowed: readonly string[] = [...REQUEST_REQUIRED_KEYS, ...REQUEST_OPTIONAL_KEYS];
-  if (keys.some((key) => !allowed.includes(key)) || REQUEST_REQUIRED_KEYS.some((key) => !keys.includes(key))) {
-    return null;
-  }
-  for (const key of ['projectId', 'taskId', 'laneId', 'baseCommit', 'policyRevision'] as const) {
-    if (!isBoundedPlainString(snapshot[key], MAX_HELD_ID_LENGTH)) {
-      return null;
-    }
-  }
-  const risk = snapshot.risk;
-  if (typeof risk !== 'string' || !(WORK_ORDER_RISKS as readonly string[]).includes(risk)) {
-    return null;
-  }
-  const baseBranch = snapshot.baseBranch;
-  if (typeof baseBranch !== 'string' || baseBranch.length > 200 || !HELD_BASE_BRANCH_PATTERN.test(baseBranch)) {
-    return null;
-  }
-  if (!isBoundedPlainString(snapshot.repository, MAX_REPOSITORY_LENGTH)) {
-    return null;
-  }
-  const ownedRaw = readDenseUnknownArray(snapshot.ownedPaths, MAX_OWNED_PATHS);
-  const prerequisitesRaw = readDenseUnknownArray(snapshot.prerequisiteWorkOrderIds, MAX_PREREQUISITE_WORK_ORDER_IDS);
-  if (ownedRaw === null || prerequisitesRaw === null || ownedRaw.length === 0) {
-    return null;
-  }
-  const ownedPaths: string[] = [];
-  for (const entry of ownedRaw) {
-    const screened = screenRepoRelativePath(entry);
-    if (screened === null || screened !== entry) {
-      return null;
-    }
-    ownedPaths.push(screened);
-  }
-  const prerequisiteWorkOrderIds: string[] = [];
-  for (const entry of prerequisitesRaw) {
-    if (!isBoundedPlainString(entry, MAX_HELD_ID_LENGTH)) {
-      return null;
-    }
-    prerequisiteWorkOrderIds.push(entry);
-  }
-  const out: {
-    -readonly [K in keyof HeldWorkOrderRequestSnapshot]: HeldWorkOrderRequestSnapshot[K];
-  } = {
-    projectId: snapshot.projectId as string,
-    taskId: snapshot.taskId as string,
-    laneId: snapshot.laneId as string,
-    repository: snapshot.repository,
-    baseCommit: snapshot.baseCommit as string,
-    ownedPaths,
-    policyRevision: snapshot.policyRevision as string,
-    risk: risk as WorkOrderRisk,
-    baseBranch,
-    prerequisiteWorkOrderIds,
-  };
-  if (Object.hasOwn(snapshot, 'planRef')) {
-    const planRef = readHeldPlanRef(snapshot.planRef);
-    if (planRef === null) {
-      return null;
-    }
-    out.planRef = planRef;
-  }
-  if (Object.hasOwn(snapshot, 'supersedesWorkOrderId')) {
-    if (!isBoundedPlainString(snapshot.supersedesWorkOrderId, MAX_HELD_ID_LENGTH)) {
-      return null;
-    }
-    out.supersedesWorkOrderId = snapshot.supersedesWorkOrderId;
-  }
-  return out;
-}
-
 function isValidBlocker(kind: unknown, id: unknown): kind is OverlapBlockerKind {
   if (kind === 'active-work-order') {
     return isBoundedPlainString(id, MAX_HELD_ID_LENGTH) && ID_TOKEN_PATTERN.test(id);
@@ -494,10 +388,9 @@ function isValidBlocker(kind: unknown, id: unknown): kind is OverlapBlockerKind 
 }
 
 /**
- * A held record read strictly (own data properties only, dense arrays, screened
- * paths and tokens, no secret shape anywhere) whose stored digest is the digest
- * of its own request: a tampered digest is unreadable, never trusted. `null`
- * when anything is off. Never throws.
+ * A held record read strictly (own data properties only, screened paths and tokens,
+ * no secret shape anywhere). Ids and codes only; never stores ownedPaths, taskId,
+ * laneId, policyRevision or free text. `null` when anything is off. Never throws.
  */
 export function validateHeldWorkOrderRecord(value: unknown): HeldWorkOrderRecord | null {
   try {
@@ -514,7 +407,7 @@ export function validateHeldWorkOrderRecord(value: unknown): HeldWorkOrderRecord
     if (typeof intentId !== 'string' || !HOLD_INTENT_ID_PATTERN.test(intentId) || containsAnySecretPattern(intentId)) {
       return null;
     }
-    if (!isBoundedPlainString(workOrderId, MAX_HELD_ID_LENGTH)) {
+    if (!isBoundedPlainString(workOrderId, MAX_HELD_ID_LENGTH) || !ID_TOKEN_PATTERN.test(workOrderId)) {
       return null;
     }
     if (typeof requestDigest !== 'string' || !HEX_SHA256_PATTERN.test(requestDigest)) {
@@ -536,13 +429,6 @@ export function validateHeldWorkOrderRecord(value: unknown): HeldWorkOrderRecord
     if (typeof blockerId !== 'string' || !isValidBlocker(blockerKind, blockerId)) {
       return null;
     }
-    const request = readHeldRequest(record.request);
-    if (request === null) {
-      return null;
-    }
-    if (computeRegisterWorkOrderRequestDigest(workOrderId, request, screenedRef) !== requestDigest) {
-      return null;
-    }
     return {
       version: 1,
       stage,
@@ -550,7 +436,6 @@ export function validateHeldWorkOrderRecord(value: unknown): HeldWorkOrderRecord
       workOrderId,
       requestDigest,
       briefRequestRef: screenedRef,
-      request,
       blockerKind: blockerKind as OverlapBlockerKind,
       blockerId,
       pathCode,

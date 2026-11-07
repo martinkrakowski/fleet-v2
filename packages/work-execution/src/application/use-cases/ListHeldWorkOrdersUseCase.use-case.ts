@@ -9,7 +9,6 @@
 import {
   MAX_HELD_WORK_ORDERS,
   computeHeldAgeMinutes,
-  containsAnySecretPattern,
 } from '../../domain/held-work-order.js';
 import { isCanonicalIso } from '../../domain/lane-activity-records.js';
 import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
@@ -25,7 +24,6 @@ export interface ListHeldWorkOrdersDependencies {
   readonly heldRepo: HeldWorkOrderRepositoryPort;
 }
 
-const MAX_PROJECT_ID_LENGTH = 128;
 const INVALID_REQUEST: ListHeldWorkOrdersResult = { outcome: 'refused', reason: 'invalid-request' };
 const UNREADABLE: ListHeldWorkOrdersResult = { outcome: 'refused', reason: 'unreadable' };
 
@@ -40,24 +38,11 @@ export class ListHeldWorkOrdersUseCase implements ListHeldWorkOrdersPort {
     if (!this.deps) {
       throw new Error('Not implemented: ListHeldWorkOrdersUseCase');
     }
-    let projectId: string | undefined;
     let nowMs = Date.now();
     if (request !== undefined) {
       const snapshot = snapshotPlainDataRecord(request);
-      if (snapshot === null || Object.keys(snapshot).some((key) => key !== 'projectId' && key !== 'nowIso')) {
+      if (snapshot === null || Object.keys(snapshot).some((key) => key !== 'nowIso')) {
         return INVALID_REQUEST;
-      }
-      const requestedProjectId: unknown = snapshot.projectId;
-      if (requestedProjectId !== undefined) {
-        if (
-          typeof requestedProjectId !== 'string' ||
-          requestedProjectId.trim() === '' ||
-          requestedProjectId.length > MAX_PROJECT_ID_LENGTH ||
-          containsAnySecretPattern(requestedProjectId)
-        ) {
-          return INVALID_REQUEST;
-        }
-        projectId = requestedProjectId;
       }
       const requestedNowIso: unknown = snapshot.nowIso;
       if (requestedNowIso !== undefined) {
@@ -79,7 +64,7 @@ export class ListHeldWorkOrdersUseCase implements ListHeldWorkOrdersPort {
     }
     const rows: { readonly heldMs: number; readonly summary: HeldWorkOrderSummary }[] = [];
     for (const record of listed.records) {
-      if (record.stage !== 'held' || (projectId !== undefined && record.request.projectId !== projectId)) {
+      if (record.stage !== 'held') {
         continue;
       }
       const ageMinutes = computeHeldAgeMinutes(record.heldAtIso, nowMs);

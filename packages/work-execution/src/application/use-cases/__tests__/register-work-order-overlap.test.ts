@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { ActionJournalEntryRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { overlapPathCode } from '../../../domain/held-work-order.js';
+import { ForgeReadAdapter } from '../../../infrastructure/adapters/ForgeReadAdapter.adapter.js';
 import { HeldWorkOrderRepositoryAdapter } from '../../../infrastructure/adapters/HeldWorkOrderRepositoryAdapter.adapter.js';
 import { WorkOrderRepositoryAdapter } from '../../../infrastructure/adapters/WorkOrderRepositoryAdapter.adapter.js';
 import type {
@@ -224,6 +225,52 @@ describe('RegisterWorkOrderUseCase open-PR overlap', () => {
     expect(await heldWorkOrderRepo.listHeldWorkOrders()).toEqual({ outcome: 'ok', records: [] });
   });
 
+  it('a PR with changedFiles: 150 and 100 files, none overlapping, refuses overlap-unknown', async () => {
+    const files = Array.from({ length: 100 }, (_, i) => ({ path: `packages/other/file-${i}.ts` }));
+    const forge = new ForgeReadAdapter({
+      owner: 'acme',
+      repo: 'fleet',
+      runGh: async (args) => {
+        if (args[0] === 'api') {
+          return { exitCode: 0, stdout: JSON.stringify({ number: 42, head: { sha: HEAD }, base: { ref: 'main' } }), stderr: '' };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ files, changedFiles: 150 }),
+          stderr: '',
+        };
+      },
+    });
+    const { useCase, saved, heldWorkOrderRepo } = setup({ forgeRead: forge });
+    const result = await useCase.registerWorkOrder(request({ ownedPaths: ['packages/a/src'] }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'overlap-unknown' });
+    expect(saved).toEqual([]);
+    expect(await heldWorkOrderRepo.listHeldWorkOrders()).toEqual({ outcome: 'ok', records: [] });
+  });
+
+  it('a PR with changedFiles missing refuses overlap-unknown', async () => {
+    const files = [{ path: 'packages/other/file.ts' }];
+    const forge = new ForgeReadAdapter({
+      owner: 'acme',
+      repo: 'fleet',
+      runGh: async (args) => {
+        if (args[0] === 'api') {
+          return { exitCode: 0, stdout: JSON.stringify({ number: 42, head: { sha: HEAD }, base: { ref: 'main' } }), stderr: '' };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ files }),
+          stderr: '',
+        };
+      },
+    });
+    const { useCase, saved, heldWorkOrderRepo } = setup({ forgeRead: forge });
+    const result = await useCase.registerWorkOrder(request({ ownedPaths: ['packages/a/src'] }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'overlap-unknown' });
+    expect(saved).toEqual([]);
+    expect(await heldWorkOrderRepo.listHeldWorkOrders()).toEqual({ outcome: 'ok', records: [] });
+  });
+
   it('refuses overlap-unknown for a repository that is not an owner/repo coordinate or a forge without the file read', async () => {
     const { forge } = fakeForge({});
     const first = setup({ forgeRead: forge });
@@ -350,6 +397,111 @@ describe('RegisterWorkOrderUseCase active work-order overlap', () => {
       blockerId: 'wo@block',
       held: true,
     });
+  });
+
+  it('a held record serialised to JSON contains no owned path string and no taskId or laneId value', async () => {
+    const state = setup();
+    await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a', ownedPaths: ['packages/a/src/x.ts'] }));
+    const refused = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', taskId: 'task-99', laneId: 'lane-88', ownedPaths: ['packages/a/src/x.ts'] }),
+    );
+    expect(refused).toMatchObject({ outcome: 'refused', reason: 'active-work-order-overlap', held: true });
+    const held = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(held.outcome).toBe('ok');
+    if (held.outcome === 'ok') {
+      const record = held.records[0];
+      const json = JSON.stringify(record);
+      expect(json).not.toContain('packages/a/src/x.ts');
+      expect(json).not.toContain('task-99');
+      expect(json).not.toContain('lane-88');
+      expect(json).not.toContain('ownedPaths');
+      expect(json).not.toContain('taskId');
+      expect(json).not.toContain('laneId');
+      expect(json).not.toContain('policyRevision');
+    }
+  });
+
+  it('an active packages/a vs new packages/a/src/index.ts refuses', async () => {
+    const state = setup();
+    expect(
+      await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a', ownedPaths: ['packages/a'] })),
+    ).toMatchObject({ outcome: 'registered' });
+    const refused = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', ownedPaths: ['packages/a/src/index.ts'] }),
+    );
+    expect(refused).toMatchObject({
+      outcome: 'refused',
+      reason: 'active-work-order-overlap',
+      blockerKind: 'active-work-order',
+      blockerId: 'wo-a',
+    });
+  });
+
+  it('the reverse direction (active packages/a/src/index.ts vs new packages/a) refuses', async () => {
+    const state = setup();
+    expect(
+      await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a', ownedPaths: ['packages/a/src/index.ts'] })),
+    ).toMatchObject({ outcome: 'registered' });
+    const refused = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', ownedPaths: ['packages/a'] }),
+    );
+    expect(refused).toMatchObject({
+      outcome: 'refused',
+      reason: 'active-work-order-overlap',
+      blockerKind: 'active-work-order',
+      blockerId: 'wo-a',
+    });
+  });
+
+  it('the existing exemption (the identical shared-append file) is unchanged', async () => {
+    const state = setup();
+    expect(
+      await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a', ownedPaths: ['packages/a/src/index.ts'] })),
+    ).toMatchObject({ outcome: 'registered' });
+    const second = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', ownedPaths: ['packages/a/src/index.ts'] }),
+    );
+    expect(second).toMatchObject({
+      outcome: 'registered',
+    });
+  });
+
+  it('an active order with id "legacy id!" vs an overlapping new order gives active-work-order-overlap, and no held record is written', async () => {
+    const attentionCodes: string[] = [];
+    const state = setup({
+      recordAttentionCode: (code) => {
+        attentionCodes.push(code);
+      },
+    });
+    await state.workOrderRepo.saveWorkOrder({
+      id: 'legacy id!',
+      projectId: 'proj-1',
+      taskId: 'task-legacy',
+      laneId: 'lane-legacy',
+      repository: 'acme/fleet',
+      baseCommit: '1111111111111111111111111111111111111111',
+      ownedPaths: ['packages/a/src'],
+      policyRevision: 'rev-1',
+      risk: 'high',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: '2026-11-07T08:00:00.000Z',
+      updatedAtIso: '2026-11-07T08:00:00.000Z',
+    });
+
+    const result = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', ownedPaths: ['packages/a/src'] }),
+    );
+    expect(result).toMatchObject({
+      outcome: 'refused',
+      reason: 'active-work-order-overlap',
+      blockerKind: 'active-work-order',
+      blockerId: 'legacy id!',
+      held: false,
+    });
+    expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual({ outcome: 'ok', records: [] });
+    expect(attentionCodes).toEqual(['hold-skipped-invalid-blocker-id']);
   });
 
   it('is held: false without a held store', async () => {
@@ -535,7 +687,7 @@ describe('ListHeldWorkOrdersUseCase', () => {
     });
   });
 
-  it('refuses malformed requests, filters by project, skips unsettled intents and sorts oldest first', async () => {
+  it('refuses malformed requests, skips unsettled intents and sorts oldest first', async () => {
     const state = setup();
     await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a' }));
     await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-z', nowIso: '2026-11-07T09:00:00.000Z' }));
@@ -548,11 +700,7 @@ describe('ListHeldWorkOrdersUseCase', () => {
         { workOrderId: 'wo-z', blockerKind: 'active-work-order', blockerId: 'wo-a', ageMinutes: 60 },
       ],
     });
-    expect(await state.listHeld.listHeldWorkOrders({ projectId: 'other', nowIso: '2026-11-07T10:00:00.000Z' })).toEqual({
-      outcome: 'listed',
-      held: [],
-    });
-    const bad: unknown[] = [null, 5, { extra: 1 }, { projectId: '' }, { projectId: 5 }, { nowIso: 'yesterday' }];
+    const bad: unknown[] = [null, 5, { extra: 1 }, { projectId: '' }, { projectId: 'other' }, { nowIso: 'yesterday' }];
     for (const input of bad) {
       expect(await state.listHeld.listHeldWorkOrders(input as never)).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     }

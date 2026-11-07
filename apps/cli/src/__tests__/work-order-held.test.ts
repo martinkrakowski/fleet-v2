@@ -2,7 +2,7 @@
 // open pull request and keeps the registration as held; `work-order held` lists
 // it by ids and codes only. Driven through the real runCli, a state directory
 // and a fake gh runner behind the GitHub forge mode.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
@@ -73,14 +73,18 @@ function makeRuntime(forge: FakeForge): { runtime: FleetCliRuntime; stateDir: st
           .join('\n');
         return { exitCode: 0, stdout, stderr: '' };
       }
-      if (args[0] === 'pr' && args[1] === 'view' && args.includes('files')) {
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('files,changedFiles')) {
         if (forge.failFiles) {
           return { exitCode: 1, stdout: '', stderr: 'boom' };
         }
         const number = Number(args[2]);
+        const paths = forge.files[number] ?? [];
         return {
           exitCode: 0,
-          stdout: JSON.stringify({ files: (forge.files[number] ?? []).map((file) => ({ path: file })) }),
+          stdout: JSON.stringify({
+            files: paths.map((file) => ({ path: file })),
+            changedFiles: paths.length,
+          }),
           stderr: '',
         };
       }
@@ -182,13 +186,13 @@ describe('work-order held (PT1ca)', () => {
       expect(text).not.toContain('packages/');
       expect(text).not.toContain('x.ts');
     }
-    expect(forge.calls.some((args) => args.join(' ') === 'pr view 42 -R acme/fleet --json files')).toBe(true);
+    expect(forge.calls.some((args) => args.join(' ') === 'pr view 42 -R acme/fleet --json files,changedFiles')).toBe(true);
     expect((await cli(runtime, ['work-order', 'inspect', '--work-order-id', 'wo-held-1'])).out).toContain('not-found');
   });
 
   it('re-registers an overlap-refused request idempotently without duplicating held state', async () => {
     const forge = newForge({ openPullRequests: [42], files: { 42: ['packages/example-held/src/x.ts'] } });
-    const { runtime } = makeRuntime(forge);
+    const { runtime, stateDir } = makeRuntime(forge);
     await registerProfile(runtime);
     const first = await register(runtime, 'wo-held-1', 'packages/example-held', ['--brief-request-ref', 'brief-req-01', '--now-iso', T0]);
     const again = await register(runtime, 'wo-held-1', 'packages/example-held', ['--brief-request-ref', 'brief-req-01', '--now-iso', T1]);
@@ -203,10 +207,15 @@ describe('work-order held (PT1ca)', () => {
     });
     expect(listed.out).not.toContain('packages/');
 
+    const heldJson = readFileSync(path.join(stateDir, 'held-work-orders.json'), 'utf8');
+    expect(heldJson).not.toContain('packages/');
+    expect(heldJson).not.toContain('taskId');
+    expect(heldJson).not.toContain('laneId');
+    expect(heldJson).not.toContain('ownedPaths');
+    expect(heldJson).not.toContain('policyRevision');
+
     const byProject = await cli(runtime, ['work-order', 'held', '--project-id', 'example-project', '--now-iso', T2]);
-    expect(JSON.parse(byProject.out)).toMatchObject({ held: [{ workOrderId: 'wo-held-1' }] });
-    const otherProject = await cli(runtime, ['work-order', 'held', '--project-id', 'nobody', '--now-iso', T2]);
-    expect(JSON.parse(otherProject.out)).toEqual({ outcome: 'listed', held: [] });
+    expect(byProject.code).toBe(2);
 
     const mutated = await register(runtime, 'wo-held-1', 'packages/example-held', ['--brief-request-ref', 'brief-req-02', '--now-iso', T1]);
     expect(mutated.code).toBe(1);
@@ -293,14 +302,14 @@ describe('work-order held (PT1ca)', () => {
     expect(refused.out + refused.err).not.toContain(secret);
   });
 
-  it('exits 2 on a bare --brief-request-ref, --intent-id, --project-id or --now-iso', async () => {
+  it('exits 2 on a bare --brief-request-ref, --intent-id, or --now-iso, and rejects --project-id', async () => {
     const { runtime } = makeRuntime(newForge());
     await registerProfile(runtime);
     expect((await register(runtime, 'wo-usage-1', 'packages/example-usage', ['--brief-request-ref'])).code).toBe(2);
     expect((await register(runtime, 'wo-usage-1', 'packages/example-usage', ['--intent-id', '  '])).code).toBe(2);
     const bareProject = await cli(runtime, ['work-order', 'held', '--project-id']);
     expect(bareProject.code).toBe(2);
-    expect(bareProject.err).toContain('work-order held --project-id needs a project id');
+    expect(bareProject.err).toContain('work-order held does not accept --project-id');
     const bareNow = await cli(runtime, ['work-order', 'held', '--now-iso']);
     expect(bareNow.code).toBe(2);
     expect(bareNow.err).toContain('work-order held --now-iso needs an ISO timestamp');

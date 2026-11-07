@@ -8,7 +8,6 @@
 import type { OverlapBlockerKind } from '../../../domain/held-work-order.js';
 
 export interface ListHeldWorkOrdersRequest {
-  readonly projectId?: string;
   readonly nowIso?: string;
 }
 

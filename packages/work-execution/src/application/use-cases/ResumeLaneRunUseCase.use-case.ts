@@ -347,8 +347,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     if (snapshot === null) {
       return { outcome: 'refused', key: null, reason: 'invalid-request' };
     }
-    const { runId, lease, nowIso } = snapshot;
-    const { holderId, fence } = lease;
+    const { runId, nowIso } = snapshot;
 
     const record = await this.deps.runRepo.get(runId);
     if (record === null) {
@@ -362,24 +361,11 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
 
     const facts = await this.resumeFacts(record);
 
-    // A resume whose save landed before a crash: the record is already
-    // unparked, so every pending intent is settled as reconciled and the exit
-    // is already complete. An ambiguous step intent the interrupted resume
-    // left open is still abandoned first, so the resumed run never carries it
-    // (the next advance would otherwise park the run again).
     if (record.parked === null) {
-      const crashKey = (pending[0]?.key ?? null) as string | null;
-      if (!(await this.abandonAmbiguousPendingIntent(runId, facts.pendingIntent, nowIso))) {
-        return { outcome: 'refused', key: crashKey, reason: 'journal-refused' };
-      }
-      for (const intent of pending) {
-        await this.appendResult(runId, intent.key as string, 'reconciled', 'resumed', nowIso);
-      }
-      return { outcome: 'none' };
+      return this.settleAlreadyUnparkedResume(pending, facts.pendingIntent, snapshot);
     }
 
-    const first = pending[0];
-    const firstPendingKey = first.key as string;
+    const firstPendingKey = pending[0].key as string;
 
     // R4a: the open case of an `ambiguous open-pr` park intercepts the
     // crash-finish and the resume check below (both would leave the park
@@ -393,52 +379,153 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return this.settleAmbiguousOpenPrPark(record, firstPendingKey, facts.pendingIntent, facts.state, facts.stopMode, snapshot);
     }
 
-    // RV4: a resume from a review-seat-unavailable park, or from an ambiguous
-    // review park, starts a NEW review generation: every pending brief-check and
-    // code-review intent of this run is settled `review-superseded`, and the
-    // resume result carries detail `review-retry`. The open-pr branch above was
-    // already handled, so this never enters it.
-    const reviewResume =
-      record.parked.reason === 'review-seat-unavailable' ||
-      (record.parked.reason === 'ambiguous' &&
-        (record.parked.qualifier === 'brief-check' ||
-          record.parked.qualifier === 'code-review' ||
-          record.parked.parkedFrom === 'brief-check' ||
-          record.parked.parkedFrom === 'code-review'));
-    const resumeDetail = reviewResume ? 'review-retry' : null;
-    if (reviewResume) {
-      await this.supersedePendingReviewIntents(record, nowIso);
-    }
+    const resumeDetail = await this.prepareResumeDetail(record, record.parked, nowIso);
 
-    // The conduct landed but the save did not (a crash, or a refused save): the journal already left the
-    // park for its parked-from state while the record is still parked. Finish that exit here, so the
-    // intent is settled as resumed and never refused as not-parked ahead of the repair.
     if (facts.state === record.parked.parkedFrom) {
-      // A stop recorded since still wins: the resume is refused, and AdvanceLaneRun's park-exit repair
-      // and stop handling settle the run, exactly as for a refused save without a stop.
-      if (facts.stopMode !== null) {
-        await this.appendResult(runId, firstPendingKey, 'refused', 'stop-pending', nowIso);
-        return { outcome: 'refused', key: firstPendingKey, reason: 'stop-pending' };
-      }
-      if (!(await this.abandonAmbiguousPendingIntent(runId, facts.pendingIntent, nowIso))) {
-        return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
-      }
-      const finished = await this.deps.runRepo.save(
-        { ...record, parked: null, revision: record.revision + 1 },
-        { holderId, fence, nowIso },
+      return this.finishConductedResumeExit(
+        record,
+        record.parked.parkedFrom,
+        pending,
+        facts,
+        resumeDetail,
+        snapshot,
       );
-      if (finished.outcome !== 'saved') {
-        return { outcome: 'refused', key: firstPendingKey, reason: 'save-refused' };
-      }
-      if (!(await this.appendResult(runId, firstPendingKey, 'reconciled', 'resumed', nowIso, resumeDetail))) {
-        return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
-      }
-      for (const intent of pending.slice(1)) {
-        await this.appendResult(runId, intent.key as string, 'refused', 'not-parked', nowIso);
-      }
-      return { outcome: 'resumed', to: record.parked.parkedFrom, key: firstPendingKey };
     }
 
+    return this.conductAndSaveResume(record, pending, facts, resumeDetail, snapshot);
+  }
+
+  /**
+   * A resume whose save landed before a crash: the record is already
+   * unparked, so every pending intent is settled as reconciled and the exit
+   * is already complete. An ambiguous step intent the interrupted resume
+   * left open is still abandoned first, so the resumed run never carries it
+   * (the next advance would otherwise park the run again).
+   */
+  private async settleAlreadyUnparkedResume(
+    pending: readonly LaneRunJournalEntryRecord[],
+    pendingIntent: LaneRunJournalPendingIntent | null,
+    snapshot: ApplyPendingResumeRequest,
+  ): Promise<ApplyPendingResumeResult> {
+    const { runId, nowIso } = snapshot;
+    const crashKey = (pending[0]?.key ?? null) as string | null;
+    if (!(await this.abandonAmbiguousPendingIntent(runId, pendingIntent, nowIso))) {
+      return { outcome: 'refused', key: crashKey, reason: 'journal-refused' };
+    }
+    for (const intent of pending) {
+      await this.appendResult(runId, intent.key as string, 'reconciled', 'resumed', nowIso);
+    }
+    return { outcome: 'none' };
+  }
+
+  /**
+   * RV4: whether a parked run's resume starts a new review generation (from a
+   * review-seat-unavailable park or an ambiguous brief-check/code-review park).
+   */
+  private isReviewResumePark(parked: NonNullable<LaneRunRecord['parked']>): boolean {
+    if (parked.reason === 'review-seat-unavailable') {
+      return true;
+    }
+    if (parked.reason !== 'ambiguous') {
+      return false;
+    }
+    return (
+      parked.qualifier === 'brief-check' ||
+      parked.qualifier === 'code-review' ||
+      parked.parkedFrom === 'brief-check' ||
+      parked.parkedFrom === 'code-review'
+    );
+  }
+
+  /**
+   * RV4: a resume from a review-seat-unavailable park, or from an ambiguous
+   * review park, starts a NEW review generation: every pending brief-check and
+   * code-review intent of this run is settled `review-superseded`, and the
+   * resume result carries detail `review-retry`. The open-pr branch was
+   * already handled, so this never enters it.
+   */
+  private async prepareResumeDetail(
+    record: LaneRunRecord,
+    parked: NonNullable<LaneRunRecord['parked']>,
+    nowIso: string,
+  ): Promise<'review-retry' | null> {
+    if (!this.isReviewResumePark(parked)) {
+      return null;
+    }
+    await this.supersedePendingReviewIntents(record, nowIso);
+    return 'review-retry';
+  }
+
+  /**
+   * Any other pending intent for the same park: the run has left it, so it
+   * is refused as not-parked.
+   */
+  private async refuseRemainingPendingResumes(
+    runId: string,
+    pending: readonly LaneRunJournalEntryRecord[],
+    nowIso: string,
+  ): Promise<void> {
+    for (const intent of pending.slice(1)) {
+      await this.appendResult(runId, intent.key as string, 'refused', 'not-parked', nowIso);
+    }
+  }
+
+  /**
+   * The conduct landed but the save did not (a crash, or a refused save): the
+   * journal already left the park for its parked-from state while the record
+   * is still parked. Finish that exit here, so the intent is settled as
+   * resumed and never refused as not-parked ahead of the repair.
+   */
+  private async finishConductedResumeExit(
+    record: LaneRunRecord,
+    parkedFrom: LaneRunStateValue,
+    pending: readonly LaneRunJournalEntryRecord[],
+    facts: ResumeFacts,
+    resumeDetail: 'review-retry' | null,
+    snapshot: ApplyPendingResumeRequest,
+  ): Promise<ApplyPendingResumeResult> {
+    const { runId, lease, nowIso } = snapshot;
+    const { holderId, fence } = lease;
+    const firstPendingKey = pending[0].key as string;
+    // A stop recorded since still wins: the resume is refused, and AdvanceLaneRun's park-exit repair
+    // and stop handling settle the run, exactly as for a refused save without a stop.
+    if (facts.stopMode !== null) {
+      await this.appendResult(runId, firstPendingKey, 'refused', 'stop-pending', nowIso);
+      return { outcome: 'refused', key: firstPendingKey, reason: 'stop-pending' };
+    }
+    if (!(await this.abandonAmbiguousPendingIntent(runId, facts.pendingIntent, nowIso))) {
+      return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
+    }
+    const finished = await this.deps.runRepo.save(
+      { ...record, parked: null, revision: record.revision + 1 },
+      { holderId, fence, nowIso },
+    );
+    if (finished.outcome !== 'saved') {
+      return { outcome: 'refused', key: firstPendingKey, reason: 'save-refused' };
+    }
+    if (!(await this.appendResult(runId, firstPendingKey, 'reconciled', 'resumed', nowIso, resumeDetail))) {
+      return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
+    }
+    await this.refuseRemainingPendingResumes(runId, pending, nowIso);
+    return { outcome: 'resumed', to: parkedFrom, key: firstPendingKey };
+  }
+
+  /**
+   * Apply a checked parked resume: abandon any ambiguous pending step intent,
+   * journal the conduct entry to the target state, save the unparked record
+   * under the driver's lease, settle the winning resume intent as completed,
+   * and refuse any later pending resume intents for the same park.
+   */
+  private async conductAndSaveResume(
+    record: LaneRunRecord,
+    pending: readonly LaneRunJournalEntryRecord[],
+    facts: ResumeFacts,
+    resumeDetail: 'review-retry' | null,
+    snapshot: ApplyPendingResumeRequest,
+  ): Promise<ApplyPendingResumeResult> {
+    const { runId, lease, nowIso } = snapshot;
+    const { holderId, fence } = lease;
+    const first = pending[0];
     const check = checkLaneRunResume({
       record,
       state: facts.state,
@@ -479,11 +566,7 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
     }
 
-    // Any other pending intent for the same park: the run has left it, so it
-    // is refused as not-parked.
-    for (const intent of pending.slice(1)) {
-      await this.appendResult(runId, intent.key as string, 'refused', 'not-parked', nowIso);
-    }
+    await this.refuseRemainingPendingResumes(runId, pending, nowIso);
     return { outcome: 'resumed', to: check.to, key: firstKey };
   }
 

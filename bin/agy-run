@@ -56,7 +56,9 @@
 # Exit: 0 the lane ended with a non-empty response; 1 agy is missing, the dir does not qualify, the
 # run produced no response (an empty response is never a clean result), or agy failed; 2 usage;
 # 3 (--status) a lane is running; 4 agy reported a model or agent error (its exit 3, AGY_ERROR on
-# stderr); 5 denied actions with AGY_DENIED_IS_FAILURE=1; 75 refused, or --wait gave up while a lane
+# stderr); 5 denied actions with AGY_DENIED_IS_FAILURE=1; 75 refused, --wait gave up while a lane
+# still runs, or the lane's own settings broke the rule after the run (trustedWorkspaces empty,
+# no read_url)
 # still runs; 129/130/143 when stopped by HUP/INT/TERM.
 
 set -u
@@ -69,8 +71,10 @@ Usage: agy-run [--status|--wait|--abort|--check|--detach] --dir <worktree> --mod
                [--ephemeral-home]
 --ephemeral-home gives the lane its own throwaway HOME, so agy's state dir, settings and
 install tree are per-run and the host's own agy home is never written. It is removed when the
-run ends. Only agy's OAuth token is seeded into it; it cannot be combined with --detach,
-because a detached lane outlives this script and nothing would clean the home up.
+run ends. agy's sign-in AND its settings file are seeded into it from AGY_SEED_HOME, and the lane's
+own settings are re-checked against the operator's rule (trustedWorkspaces empty, no read_url) when
+the run ends: a lane that widens them exits 75. It cannot be combined with --detach, because a
+detached lane outlives this script and nothing would clean the home up.
 --mode full additionally requires --isolation-declared and is the only mode that passes
 --dangerously-skip-permissions to agy (as agy's --mode auto plus that one flag).
 The prompt is fixed: agy reads the brief and carries out its WORK ORDER. No prompt text is accepted.
@@ -529,6 +533,15 @@ if [ "$ephemeral" = 1 ]; then
   else
     echo "agy-run: no agy sign-in at \$AGY_SEED_HOME/antigravity-oauth-token; the lane home carries none and agy may refuse to run" >&2
   fi
+  # The settings file is seeded too, from the host's own, which the operator's dispatch-time check
+  # has just declared within the rule (trustedWorkspaces empty, no read_url). The lane therefore
+  # STARTS compliant, and check_lane_settings re-checks the lane's own copy when the run ends:
+  # without that, a per-run home would leave the host's file unwritten and its rule checking a file
+  # no lane ever used.
+  if [ -f "$seed_home/settings.json" ] && [ ! -L "$seed_home/settings.json" ]; then
+    ( umask 077; cat "$seed_home/settings.json" > "$lane_home/.gemini/antigravity-cli/settings.json" ) 2>/dev/null \
+      || { echo "agy-run: could not seed agy's settings into the lane home" >&2; rm -rf "$lane_home"; rm -f "$lock"; exit 1; }
+  fi
 fi
 
 before=$(g -C "$dir" rev-parse HEAD 2>/dev/null || echo none)
@@ -574,6 +587,31 @@ finish_run() { # $1: exit status to report; writes last in RUN_DIR via mktemp+mv
   rm -f "$lock"
 }
 
+# The operator's guard rule, byte for byte: a JSON object, `trustedWorkspaces` empty, and the raw
+# text free of `read_url`. Applied to the LANE's settings when the run ends, so a lane that widens
+# its own permissions is a failed run and not a silent one. No python3 is a failure, never a pass.
+settings_rule_ok() { # $1: the settings file
+  [ -f "$1" ] || return 0
+  command -v python3 >/dev/null 2>&1 || { echo "no python3 to check the lane's settings"; return 1; }
+  python3 -I -c '
+import json, sys
+p = sys.argv[1]
+text = open(p, encoding="utf-8").read()
+s = json.loads(text)
+if not isinstance(s, dict): sys.exit("settings.json is not a JSON object")
+if s.get("trustedWorkspaces") not in (None, []): sys.exit("trustedWorkspaces is not empty")
+if "read_url" in text: sys.exit("read_url appears in settings.json")
+' "$1"
+}
+
+check_lane_settings() { # 0 within the rule or not applicable; 1 the lane widened its own settings
+  [ "$ephemeral" = 1 ] && [ -n "$lane_home" ] || return 0
+  cls_why=$(settings_rule_ok "$lane_home/.gemini/antigravity-cli/settings.json" 2>&1) && return 0
+  echo "agy-run: the lane's own agy settings BREAK the rule after the run: ${cls_why:-unreadable}" >&2
+  echo "agy-run: a lane may not widen its own permissions (trustedWorkspaces empty, no read_url); this run is a failure and the owner looks" >&2
+  return 1
+}
+
 clean_lane_home() { # removes the throwaway home, never the worktree; a no-op without --ephemeral-home
   [ "$ephemeral" = 1 ] || return 0
   [ -n "$lane_home" ] && [ -n "$home_base" ] || return 0
@@ -599,6 +637,7 @@ stop_run() { # $1: exit status
     echo "agy-run: stopped; the lane in $dir was stopped with it" >&2
   fi
   cat "$err" >&2
+  check_lane_settings || true
   clean_lane_home
   finish_run "$1"
   exit "$1"
@@ -675,6 +714,10 @@ case "$flat" in
     [ "$status" = 0 ] && [ "${AGY_DENIED_IS_FAILURE:-0}" = 1 ] && status=5
     ;;
 esac
+# A lane that widened its own settings is a failed run, whatever else it produced (75: refused).
+if ! check_lane_settings; then
+  [ "$status" = 0 ] && status=75
+fi
 clean_lane_home
 finish_run "$status"
 echo "agy-run: ended after $(( $(date +%s) - start )) s with exit $status (model $model, mode $agymode, HEAD before: $before, out: $out)" >&2

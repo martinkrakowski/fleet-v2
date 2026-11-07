@@ -109,5 +109,41 @@ rm -f "$BASE"
 env AGY_HOME_BASE="relative/path" AGY_SEED_HOME="$SEED" "$RUNSH" "$SCRIPT" --ephemeral-home --dir "$WT" --model m > "$T/o" 2> "$T/e"; echo $? > "$T/rc"
 check 'a relative base is refused' '[ "$(rc)" = 2 ] && grep -q "absolute path" "$T/e"'
 
+# The operator's settings rule follows the lane: seeded in, re-checked after the run (Phase 0 of the
+# parallel cut-over). A lane that widens its own settings is a failed run, not a silent one.
+printf '{"trustedWorkspaces": [], "model": "seeded"}\n' > "$SEED/settings.json"
+cat > "$T/bin/agy" <<FAKE
+#!/bin/sh
+cp "\$HOME/.gemini/antigravity-cli/settings.json" "$T/settings.seen" 2>/dev/null
+case "\$(cat "$T/settings-mode" 2>/dev/null)" in
+  widen) printf '{"trustedWorkspaces": ["/srv"]}\\n' > "\$HOME/.gemini/antigravity-cli/settings.json" ;;
+  readurl) printf '{"trustedWorkspaces": [], "tools": {"read_url": true}}\\n' > "\$HOME/.gemini/antigravity-cli/settings.json" ;;
+  notobject) printf '[]\\n' > "\$HOME/.gemini/antigravity-cli/settings.json" ;;
+  gone) rm -f "\$HOME/.gemini/antigravity-cli/settings.json" ;;
+esac
+printf '{"conversation_id":"c9","status":"SUCCESS","response":"ok","usage":{"total_tokens":1}}'
+FAKE
+chmod +x "$T/bin/agy"
+
+rm -f "$T/settings-mode"; run --ephemeral-home --dir "$WT" --model m
+check 'the lane home is seeded with the host settings' '[ "$(cat "$T/settings.seen" 2>/dev/null)" = "$(cat "$SEED/settings.json")" ]'
+check 'settings within the rule leave the run at 0' '[ "$(rc)" = 0 ]'
+
+echo widen > "$T/settings-mode"; run --ephemeral-home --dir "$WT" --model m
+check 'a lane that fills trustedWorkspaces fails the run (75)' '[ "$(rc)" = 75 ] && grep -q "trustedWorkspaces is not empty" "$T/e"'
+check 'the failure says a lane may not widen its own permissions' 'grep -q "may not widen its own permissions" "$T/e"'
+
+echo readurl > "$T/settings-mode"; run --ephemeral-home --dir "$WT" --model m
+check 'a lane that adds read_url fails the run (75)' '[ "$(rc)" = 75 ] && grep -q "read_url appears in settings.json" "$T/e"'
+
+echo notobject > "$T/settings-mode"; run --ephemeral-home --dir "$WT" --model m
+check 'settings that stop being a JSON object fail the run (75)' '[ "$(rc)" = 75 ] && grep -q "not a JSON object" "$T/e"'
+
+echo gone > "$T/settings-mode"; run --ephemeral-home --dir "$WT" --model m
+check 'a lane that deletes its settings is not a failure' '[ "$(rc)" = 0 ]'
+
+rm -f "$T/settings-mode"
+check 'the lane home is still removed after a settings failure' '[ -z "$(ls -A "$BASE" 2>/dev/null)" ]'
+
 printf '1..%s\n' "$n"
 [ "$fails" = 0 ]

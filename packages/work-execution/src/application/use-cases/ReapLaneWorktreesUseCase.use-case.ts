@@ -27,9 +27,20 @@
 import { LANE_DIFF_SECRET_PATTERNS, containsSecretShape } from '@fleet/shared';
 import type { ActionJournalEntryRecord, AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../domain/execution-records.js';
 import { attemptManifestCoordinates } from '../../domain/artifact-manifest.js';
+import { readLaneRunRecord } from '../../domain/entities/LaneRun.js';
+import { WorkOrder } from '../../domain/entities/WorkOrder.js';
+import {
+  readActionJournalEntryRecord,
+  readAttemptRecord,
+  readCapacityReservationRecord,
+} from '../../domain/execution-record-readers.js';
 import { isCalendarDateTime, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
-import { laneRunJournalState, type LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
-import type { LaneRunRecord } from '../../domain/lane-run-records.js';
+import {
+  laneRunJournalState,
+  readLaneRunJournalEntry,
+  type LaneRunJournalEntryRecord,
+} from '../../domain/lane-run-journal.js';
+import { LANE_RUN_ID_PATTERN, type LaneRunRecord } from '../../domain/lane-run-records.js';
 import { LANE_RUN_TERMINAL_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
@@ -90,6 +101,40 @@ const DEFAULT_STORE_CALL_TIMEOUT_MS = 15_000;
 
 /** The largest number of runs one reap pass scans; more is a refusal. */
 const MAX_RUNS_PER_REAP = 4_096;
+
+/** The largest number of attempts one work order may list before its runs are refused. */
+const MAX_ATTEMPTS_PER_WORK_ORDER = 4_096;
+
+/** The largest run-journal entry list one run may carry before it is refused. */
+const MAX_RUN_JOURNAL_ENTRIES = 4_096;
+
+/** The largest action-journal entry list one attempt may carry before its run is refused. */
+const MAX_ATTEMPT_JOURNAL_ENTRIES = 4_096;
+
+/** The largest reservation list one reap pass reads. */
+const MAX_RESERVATIONS_PER_REAP = 4_096;
+
+/** The longest filesystem path a stored or answered record may carry. */
+const MAX_PATH_CHARS = 4_096;
+
+/** A git object id as the workspace answers it. */
+const COMMIT_HEX_RE = /^[0-9a-f]{40,64}$/;
+
+/** Every refusal `WorkspacePort.removeWorktree` declares; any other reason is unknown. */
+const DECLARED_REMOVE_REFUSALS: ReadonlySet<string> = new Set([
+  'invalid-request',
+  'path-refused',
+  'not-a-linked-worktree',
+  'head-moved',
+  'branch-mismatch',
+  'detached',
+  'dirty',
+  'locked',
+  'busy',
+  'git-refused',
+  'artifacts not collected',
+  'artifacts changed since collection',
+]);
 
 const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -212,7 +257,8 @@ export class ReapLaneWorktreesUseCase implements ReapLaneWorktreesPort {
     try {
       return await this.reap(this.deps, validation.snap as unknown as ReapLaneWorktreesRequest);
     } catch {
-      return { outcome: 'refused', reason: 'invalid-request' };
+      // The request was validated above, so no failure after it is an invalid request.
+      return { outcome: 'unknown', reason: 'store-unreadable' };
     }
   }
 
@@ -222,27 +268,71 @@ export class ReapLaneWorktreesUseCase implements ReapLaneWorktreesPort {
   ): Promise<ReapLaneWorktreesResult> {
     const dryRun = request.dryRun;
     const forceUnsealed = request.forceUnsealed === true;
-    const nowIso = request.nowIso ?? deps.now?.() ?? new Date().toISOString();
+    let nowIso: string;
+    try {
+      const clock: unknown = request.nowIso ?? deps.now?.() ?? new Date().toISOString();
+      if (typeof clock !== 'string' || clock.length > 64 || !isCalendarDateTime(clock)) {
+        return { outcome: 'unknown', reason: 'store-unreadable' };
+      }
+      nowIso = clock;
+    } catch {
+      return { outcome: 'unknown', reason: 'store-unreadable' };
+    }
     const budget = deps.storeCallTimeoutMs ?? DEFAULT_STORE_CALL_TIMEOUT_MS;
 
     // Top-level reads are deadline-guarded and fail closed: an unreadable
     // store is `unknown`, never an empty scan.
+    const refused: { readonly runId: string; readonly reason: string }[] = [];
     let runs: LaneRunRecord[];
     try {
-      const listed = await withBudget(deps.runRepo.list(), budget);
+      const listed: unknown = await withBudget(deps.runRepo.list(), budget);
       if (!Array.isArray(listed)) {
         return { outcome: 'unknown', reason: 'store-unreadable' };
       }
-      if (listed.length > MAX_RUNS_PER_REAP) {
+      const listedLength = Object.getOwnPropertyDescriptor(listed, 'length')?.value as unknown;
+      if (typeof listedLength !== 'number' || !Number.isSafeInteger(listedLength) || listedLength < 0) {
+        return { outcome: 'unknown', reason: 'store-unreadable' };
+      }
+      if (listedLength > MAX_RUNS_PER_REAP) {
         return { outcome: 'refused', reason: 'invalid-request' };
       }
-      runs = listed.filter(
-        (run, index) => Object.hasOwn(listed, index) && isRecordObject(run),
-      ) as LaneRunRecord[];
+      // A run whose record is malformed but whose id is readable is refused
+      // `record-malformed` and the scan goes on; a duplicate run id is
+      // ambiguous, so every record of it is refused. An entry with no
+      // readable run id leaves the list unidentifiable.
+      const validByRunId = new Map<string, LaneRunRecord>();
+      const malformedRunIds = new Set<string>();
+      for (let index = 0; index < listedLength; index += 1) {
+        if (!Object.hasOwn(listed, index)) {
+          continue;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(listed, index);
+        if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+          return { outcome: 'unknown', reason: 'store-unreadable' };
+        }
+        const validated = readLaneRunRecord(descriptor.value);
+        if (validated.ok) {
+          if (validByRunId.has(validated.record.runId)) {
+            malformedRunIds.add(validated.record.runId);
+          } else {
+            validByRunId.set(validated.record.runId, validated.record);
+          }
+          continue;
+        }
+        const runId = readSafeRunId(descriptor.value);
+        if (runId === null) {
+          return { outcome: 'unknown', reason: 'store-unreadable' };
+        }
+        malformedRunIds.add(runId);
+      }
+      runs = [...validByRunId.values()].filter((run) => !malformedRunIds.has(run.runId));
+      for (const runId of malformedRunIds) {
+        refused.push({ runId, reason: 'record-malformed' });
+      }
     } catch {
       return { outcome: 'unknown', reason: 'store-unreadable' };
     }
-    let entriesByRun: ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>;
+    let entriesByRun: ReadonlyMap<string, unknown>;
     try {
       entriesByRun = await withBudget(
         journalsForRuns(deps.runJournal, runs.map((run) => run.runId)),
@@ -256,79 +346,86 @@ export class ReapLaneWorktreesUseCase implements ReapLaneWorktreesPort {
     }
     let heldAttemptIds: ReadonlySet<string>;
     try {
-      const reservations = await withBudget(deps.executionJournal.listActiveReservations(), budget);
-      if (!Array.isArray(reservations)) {
+      const reservations: unknown = await withBudget(deps.executionJournal.listActiveReservations(), budget);
+      const dense = readDenseArray(reservations, MAX_RESERVATIONS_PER_REAP);
+      if (dense.kind !== 'ok') {
         return { outcome: 'unknown', reason: 'store-unreadable' };
       }
-      heldAttemptIds = new Set(
-        reservations
-          .filter((reservation, index) => Object.hasOwn(reservations, index) && isRecordObject(reservation))
-          .filter((reservation) => (reservation as { held?: unknown }).held === true)
-          .map((reservation) => (reservation as { attemptId?: unknown }).attemptId)
-          .filter((attemptId): attemptId is string => typeof attemptId === 'string'),
-      );
+      const held = new Set<string>();
+      for (const item of dense.items) {
+        const read = readCapacityReservationRecord(item);
+        if (!read.ok) {
+          return { outcome: 'unknown', reason: 'store-unreadable' };
+        }
+        if (read.record.held) {
+          held.add(read.record.attemptId);
+        }
+      }
+      heldAttemptIds = held;
     } catch {
       return { outcome: 'unknown', reason: 'store-unreadable' };
     }
 
     const removed: { readonly runId: string; readonly branchTip: string | null }[] = [];
     const alreadyRemoved: { readonly runId: string }[] = [];
-    const refused: { readonly runId: string; readonly reason: string }[] = [];
     const skipped: { readonly runId: string; readonly reason: string }[] = [];
     const journalFailed: ReapWorktreeJournalFailureEntry[] = [];
 
-    const workOrderCache = new Map<string, WorkOrderRecord | null>();
-    const attemptsCache = new Map<string, readonly AttemptRecord[]>();
-    const findWorkOrder = async (workOrderId: string): Promise<WorkOrderRecord | null> => {
-      const cached = workOrderCache.get(workOrderId);
-      if (cached !== undefined) {
-        return cached;
+    const workOrderCache = new Map<string, unknown>();
+    const attemptsCache = new Map<string, unknown>();
+    const findWorkOrder = async (workOrderId: string): Promise<unknown> => {
+      if (workOrderCache.has(workOrderId)) {
+        return workOrderCache.get(workOrderId);
       }
-      const record = await withBudget(deps.workOrderRepo.findWorkOrderById(workOrderId), budget);
+      const record: unknown = await withBudget(deps.workOrderRepo.findWorkOrderById(workOrderId), budget);
       workOrderCache.set(workOrderId, record);
       return record;
     };
-    const listAttempts = async (workOrderId: string): Promise<readonly AttemptRecord[]> => {
-      const cached = attemptsCache.get(workOrderId);
-      if (cached !== undefined) {
-        return cached;
+    const listAttempts = async (workOrderId: string): Promise<unknown> => {
+      if (attemptsCache.has(workOrderId)) {
+        return attemptsCache.get(workOrderId);
       }
-      const records = await withBudget(deps.attemptRepo.listAttemptsByWorkOrder(workOrderId), budget);
+      const records: unknown = await withBudget(deps.attemptRepo.listAttemptsByWorkOrder(workOrderId), budget);
       attemptsCache.set(workOrderId, records);
       return records;
     };
 
     for (const run of runs) {
-      const evaluation = await evaluateRunCandidate({
-        deps,
-        run,
-        heldAttemptIds,
-        findWorkOrder,
-        listAttempts,
-        entriesByRun,
-        budget,
-        skipped,
-        refused,
-      });
-      if (evaluation.outcome !== 'candidate') {
-        continue;
+      try {
+        const evaluation = await evaluateRunCandidate({
+          deps,
+          run,
+          heldAttemptIds,
+          findWorkOrder,
+          listAttempts,
+          entriesByRun,
+          budget,
+          skipped,
+          refused,
+        });
+        if (evaluation.outcome !== 'candidate') {
+          continue;
+        }
+        await reapCandidateWorktree({
+          deps,
+          run,
+          latestAttempt: evaluation.latestAttempt,
+          workOrder: evaluation.workOrder,
+          clone: evaluation.clone,
+          recordedHost: evaluation.recordedHost,
+          dryRun,
+          forceUnsealed,
+          nowIso,
+          budget,
+          removed,
+          alreadyRemoved,
+          refused,
+          journalFailed,
+        });
+      } catch {
+        // No single run may abort the pass or discard what the others reported.
+        refused.push({ runId: run.runId, reason: 'unknown' });
       }
-      await reapCandidateWorktree({
-        deps,
-        run,
-        latestAttempt: evaluation.latestAttempt,
-        workOrder: evaluation.workOrder,
-        clone: evaluation.clone,
-        recordedHost: evaluation.recordedHost,
-        dryRun,
-        forceUnsealed,
-        nowIso,
-        budget,
-        removed,
-        alreadyRemoved,
-        refused,
-        journalFailed,
-      });
     }
 
     const byRunId = (a: { readonly runId: string }, b: { readonly runId: string }): number =>
@@ -350,6 +447,197 @@ function isRecordObject(value: unknown): value is Record<string, unknown> {
   }
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** A bounded identifier: no path separator, control character or secret shape. Never throws. */
+function isSafeIdentifier(value: unknown, maxLen = 256): value is string {
+  return (
+    typeof value === 'string' &&
+    value.trim().length > 0 &&
+    value.length <= maxLen &&
+    !value.includes('/') &&
+    !value.includes('\\') &&
+    !hasControlCharacter(value) &&
+    !containsSecretShape(value) &&
+    !LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(value))
+  );
+}
+
+/** A bounded absolute path with no NUL. Never throws. */
+function isSafeAbsolutePath(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.startsWith('/') &&
+    value.length <= MAX_PATH_CHARS &&
+    !value.includes('\0')
+  );
+}
+
+type DenseArrayRead =
+  | { readonly kind: 'ok'; readonly items: readonly unknown[] }
+  | { readonly kind: 'not-array' }
+  | { readonly kind: 'malformed' };
+
+/**
+ * The elements of a dense array read through own data descriptors, so no
+ * getter runs. A sparse hole, an accessor, an extra array property, a length
+ * past `maxLen` or a throwing Proxy trap is `malformed`; a non-array is
+ * `not-array`. Never throws.
+ */
+function readDenseArray(value: unknown, maxLen: number): DenseArrayRead {
+  try {
+    if (!Array.isArray(value)) {
+      return { kind: 'not-array' };
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    if (
+      lengthDescriptor === undefined ||
+      lengthDescriptor.get !== undefined ||
+      lengthDescriptor.set !== undefined
+    ) {
+      return { kind: 'malformed' };
+    }
+    const length: unknown = lengthDescriptor.value;
+    if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || length > maxLen) {
+      return { kind: 'malformed' };
+    }
+    if (Reflect.ownKeys(value).length !== length + 1) {
+      return { kind: 'malformed' };
+    }
+    const items: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, index);
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined
+      ) {
+        return { kind: 'malformed' };
+      }
+      items.push(descriptor.value);
+    }
+    return { kind: 'ok', items };
+  } catch {
+    return { kind: 'malformed' };
+  }
+}
+
+/** The run id of a record that failed validation, only when it is a well-formed run id. */
+function readSafeRunId(raw: unknown): string | null {
+  try {
+    if (!isRecordObject(raw)) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(raw, 'runId');
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined ||
+      typeof descriptor.value !== 'string' ||
+      !LANE_RUN_ID_PATTERN.test(descriptor.value)
+    ) {
+      return null;
+    }
+    return descriptor.value;
+  } catch {
+    return null;
+  }
+}
+
+/** A fresh, validated work order whose id is the one asked for; null on anything malformed. */
+function readValidWorkOrder(raw: unknown, expectedId: string): WorkOrderRecord | null {
+  try {
+    const snap = snapshotPlainDataRecord(raw);
+    if (
+      snap === null ||
+      snap['id'] !== expectedId ||
+      !isSafeIdentifier(snap['projectId']) ||
+      readDenseArray(snap['ownedPaths'], 4_096).kind !== 'ok' ||
+      readDenseArray(snap['prerequisiteWorkOrderIds'], 4_096).kind !== 'ok'
+    ) {
+      return null;
+    }
+    return WorkOrder.fromRecord(snap as unknown as WorkOrderRecord).toRecord();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A fresh, validated attempt of the work order asked for; null on anything
+ * malformed. Partial or corrupt manifest coordinates are malformed: they are
+ * never read as sealed and never as uncollected.
+ */
+function readValidAttemptForWorkOrder(raw: unknown, expectedWorkOrderId: string): AttemptRecord | null {
+  try {
+    const parsed = readAttemptRecord(raw);
+    if (!parsed.ok) {
+      return null;
+    }
+    const record = parsed.record;
+    if (record.workOrderId !== expectedWorkOrderId || !isSafeAbsolutePath(record.worktreePath)) {
+      return null;
+    }
+    const artifacts = record.artifacts;
+    if (
+      artifacts !== null &&
+      (artifacts.manifestPath !== undefined || artifacts.manifestSha256 !== undefined) &&
+      attemptManifestCoordinates(artifacts).kind !== 'sealed'
+    ) {
+      return null;
+    }
+    return record;
+  } catch {
+    return null;
+  }
+}
+
+type ProfileCloneRead =
+  | { readonly kind: 'clone'; readonly clone: CloneRecord }
+  | { readonly kind: 'no-clone' }
+  | { readonly kind: 'malformed' };
+
+/** The clone a profile records for a host: none for a null profile or an absent host, malformed otherwise. */
+function readProfileClone(rawProfile: unknown, hostName: string): ProfileCloneRead {
+  if (rawProfile === null) {
+    return { kind: 'no-clone' };
+  }
+  try {
+    const profileSnap = snapshotPlainDataRecord(rawProfile);
+    if (profileSnap === null) {
+      return { kind: 'malformed' };
+    }
+    const clonesSnap = snapshotPlainDataRecord(profileSnap['clones']);
+    if (clonesSnap === null) {
+      return { kind: 'malformed' };
+    }
+    if (!Object.hasOwn(clonesSnap, hostName) || clonesSnap[hostName] === undefined) {
+      return { kind: 'no-clone' };
+    }
+    const cloneSnap = snapshotPlainDataRecord(clonesSnap[hostName]);
+    if (
+      cloneSnap === null ||
+      !isSafeAbsolutePath(cloneSnap['path']) ||
+      !isSafeAbsolutePath(cloneSnap['worktreeRoot'])
+    ) {
+      return { kind: 'malformed' };
+    }
+    return { kind: 'clone', clone: { path: cloneSnap['path'], worktreeRoot: cloneSnap['worktreeRoot'] } };
+  } catch {
+    return { kind: 'malformed' };
+  }
 }
 
 /** The result of validating a reap request: the validated snapshot or a refusal. */
@@ -409,9 +697,10 @@ interface EvaluateRunCandidateParams {
   readonly deps: ReapLaneWorktreesDependencies;
   readonly run: LaneRunRecord;
   readonly heldAttemptIds: ReadonlySet<string>;
-  readonly findWorkOrder: (workOrderId: string) => Promise<WorkOrderRecord | null>;
-  readonly listAttempts: (workOrderId: string) => Promise<readonly AttemptRecord[]>;
-  readonly entriesByRun: ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>;
+  /** The raw repository answer: every record is validated per run. */
+  readonly findWorkOrder: (workOrderId: string) => Promise<unknown>;
+  readonly listAttempts: (workOrderId: string) => Promise<unknown>;
+  readonly entriesByRun: ReadonlyMap<string, unknown>;
   readonly budget: number;
   readonly skipped: { readonly runId: string; readonly reason: string }[];
   readonly refused: { readonly runId: string; readonly reason: string }[];
@@ -438,38 +727,77 @@ async function evaluateRunCandidate(
     skipped,
     refused,
   } = params;
-  const state = laneRunJournalState(entriesByRun.get(run.runId) ?? [], run.runId);
+  const rawEntries = entriesByRun.has(run.runId) ? entriesByRun.get(run.runId) : [];
+  if (!Array.isArray(rawEntries)) {
+    refused.push({ runId: run.runId, reason: 'unknown' });
+    return { outcome: 'refused' };
+  }
+  const denseEntries = readDenseArray(rawEntries, MAX_RUN_JOURNAL_ENTRIES);
+  if (denseEntries.kind !== 'ok') {
+    refused.push({ runId: run.runId, reason: 'record-malformed' });
+    return { outcome: 'refused' };
+  }
+  const runJournalEntries: LaneRunJournalEntryRecord[] = [];
+  for (const item of denseEntries.items) {
+    const entryRead = readLaneRunJournalEntry(item);
+    if (!entryRead.ok) {
+      refused.push({ runId: run.runId, reason: 'record-malformed' });
+      return { outcome: 'refused' };
+    }
+    runJournalEntries.push(entryRead.entry);
+  }
+  const state = laneRunJournalState(runJournalEntries, run.runId);
   if (!isTerminalRun(state)) {
     skipped.push({ runId: run.runId, reason: 'run-not-terminal' });
     return { outcome: 'skipped' };
   }
 
-  let workOrder: WorkOrderRecord | null;
+  let rawWorkOrder: unknown;
   try {
-    workOrder = await findWorkOrder(run.workOrderId);
+    rawWorkOrder = await findWorkOrder(run.workOrderId);
   } catch {
     refused.push({ runId: run.runId, reason: 'unknown' });
     return { outcome: 'refused' };
   }
-  if (workOrder === null || !isTerminalWorkOrder(workOrder.state)) {
+  if (rawWorkOrder === null) {
+    skipped.push({ runId: run.runId, reason: 'work-order-active' });
+    return { outcome: 'skipped' };
+  }
+  const workOrder = readValidWorkOrder(rawWorkOrder, run.workOrderId);
+  if (workOrder === null) {
+    refused.push({ runId: run.runId, reason: 'record-malformed' });
+    return { outcome: 'refused' };
+  }
+  if (!isTerminalWorkOrder(workOrder.state)) {
     skipped.push({ runId: run.runId, reason: 'work-order-active' });
     return { outcome: 'skipped' };
   }
 
   // The run's attempts: every id the run records, in the run's own order.
-  let attemptRecords: readonly AttemptRecord[];
+  // Every attempt the work order lists is validated, not only the run's own:
+  // fix attempts share the worktree, so a corrupt sibling is never bypassed.
+  let rawAttempts: unknown;
   try {
-    attemptRecords = await listAttempts(run.workOrderId);
-    if (!Array.isArray(attemptRecords)) {
-      refused.push({ runId: run.runId, reason: 'unknown' });
-      return { outcome: 'refused' };
-    }
+    rawAttempts = await listAttempts(run.workOrderId);
   } catch {
     refused.push({ runId: run.runId, reason: 'unknown' });
     return { outcome: 'refused' };
   }
+  const denseAttempts = readDenseArray(rawAttempts, MAX_ATTEMPTS_PER_WORK_ORDER);
+  if (denseAttempts.kind !== 'ok') {
+    refused.push({ runId: run.runId, reason: denseAttempts.kind === 'not-array' ? 'unknown' : 'record-malformed' });
+    return { outcome: 'refused' };
+  }
   const runAttempts: AttemptRecord[] = [];
-  const attemptsById = new Map(attemptRecords.map((attempt) => [attempt.id, attempt]));
+  const attemptsById = new Map<string, AttemptRecord>();
+  for (const item of denseAttempts.items) {
+    const attempt = readValidAttemptForWorkOrder(item, run.workOrderId);
+    if (attempt === null || attemptsById.has(attempt.id)) {
+      refused.push({ runId: run.runId, reason: 'record-malformed' });
+      return { outcome: 'refused' };
+    }
+    attemptsById.set(attempt.id, attempt);
+  }
   let missingAttempt = false;
   for (const attemptId of run.attemptIds) {
     const attempt = attemptsById.get(attemptId);
@@ -510,20 +838,24 @@ async function evaluateRunCandidate(
     refused.push({ runId: run.runId, reason: 'not-configured' });
     return { outcome: 'refused' };
   }
-  let profile: Awaited<ReturnType<ProjectProfileReadPort['readProjectProfile']>>;
+  let profile: unknown;
   try {
     profile = await withBudget(deps.profileRead.readProjectProfile(workOrder.projectId), budget);
   } catch {
     refused.push({ runId: run.runId, reason: 'unknown' });
     return { outcome: 'refused' };
   }
-  const clone = profile?.clones[recordedHost.hostName ?? ''];
-  if (clone === undefined) {
+  const cloneRead = readProfileClone(profile, recordedHost.hostName ?? '');
+  if (cloneRead.kind === 'no-clone') {
     skipped.push({ runId: run.runId, reason: 'no-clone' });
     return { outcome: 'skipped' };
   }
+  if (cloneRead.kind === 'malformed') {
+    refused.push({ runId: run.runId, reason: 'record-malformed' });
+    return { outcome: 'refused' };
+  }
 
-  return { outcome: 'candidate', latestAttempt, workOrder, clone, recordedHost };
+  return { outcome: 'candidate', latestAttempt, workOrder, clone: cloneRead.clone, recordedHost };
 }
 
 interface ReapCandidateWorktreeParams {
@@ -576,19 +908,31 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
 
   // Keyed idempotence first: a repeat reap of an already-reaped attempt is
   // `alreadyRemoved`, never a second removal and never a manifest refusal.
-  let priorEntries: readonly ActionJournalEntryRecord[];
+  let rawPrior: unknown;
   try {
-    priorEntries = await withBudget(
+    rawPrior = await withBudget(
       deps.executionJournal.listJournalEntriesForAttempt(latestAttempt.id),
       budget,
     );
-    if (!Array.isArray(priorEntries)) {
-      refused.push({ runId: run.runId, reason: 'unknown' });
-      return;
-    }
   } catch {
     refused.push({ runId: run.runId, reason: 'unknown' });
     return;
+  }
+  const densePrior = readDenseArray(rawPrior, MAX_ATTEMPT_JOURNAL_ENTRIES);
+  if (densePrior.kind !== 'ok') {
+    refused.push({ runId: run.runId, reason: densePrior.kind === 'not-array' ? 'unknown' : 'record-malformed' });
+    return;
+  }
+  // A malformed journal entry could be a completed removal or an intent this
+  // reap cannot see: refuse before any inspection, approval or removal.
+  const priorEntries: ActionJournalEntryRecord[] = [];
+  for (const item of densePrior.items) {
+    const entryRead = readActionJournalEntryRecord(item);
+    if (!entryRead.ok) {
+      refused.push({ runId: run.runId, reason: 'record-malformed' });
+      return;
+    }
+    priorEntries.push(entryRead.record);
   }
   const completedMarker = removalCompletedMarker(run.runId);
   if (
@@ -615,10 +959,10 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
   }
 
   // The facts, read under the caller's hold; an unreadable read is unknown.
-  let inspect: InspectRemovalResult;
+  let rawInspect: unknown;
   try {
-    inspect = await withBudget(
-      workspace.inspectWorktreeForRemoval({
+    rawInspect = await withBudget(
+      workspace.inspectWorktreeForRemoval.call(workspace, {
         repositoryRoot: clone.path,
         worktreePath: latestAttempt.worktreePath,
         defaultRef: 'origin/main',
@@ -630,17 +974,14 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
     refused.push({ runId: run.runId, reason: 'unknown' });
     return;
   }
-  if (inspect.outcome === 'unknown') {
+  const inspect = readInspectResult(rawInspect);
+  if (inspect.kind === 'unknown') {
     refused.push({ runId: run.runId, reason: 'unknown' });
     return;
   }
-  if (inspect.outcome === 'refused') {
-    if (inspect.reason === 'not-a-linked-worktree') {
-      // Not listed at all: the worktree is already gone.
-      alreadyRemoved.push({ runId: run.runId });
-    } else {
-      refused.push({ runId: run.runId, reason: 'unknown' });
-    }
+  if (inspect.kind === 'not-a-linked-worktree') {
+    // Not listed at all: the worktree is already gone.
+    alreadyRemoved.push({ runId: run.runId });
     return;
   }
   const facts = inspect.facts;
@@ -701,7 +1042,7 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
         refused.push({ runId: run.runId, reason: 'unknown' });
         return;
       }
-      let verdict: Awaited<ReturnType<typeof check>>;
+      let rawVerdict: unknown;
       const request: VerifyArtifactManifestRequest = {
         attemptId: latestAttempt.id,
         worktreePath: latestAttempt.worktreePath,
@@ -710,19 +1051,21 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
         recordedHost,
       };
       try {
-        verdict = await withBudget(check.call(deps.attemptArtifact as object, request), budget);
+        rawVerdict = await withBudget(check.call(deps.attemptArtifact as object, request), budget);
       } catch {
         refused.push({ runId: run.runId, reason: 'unknown' });
         return;
       }
-      if (verdict.outcome === 'sealed') {
+      const verdictOutcome = readOutcomeOf(rawVerdict);
+      if (verdictOutcome === 'sealed') {
         manifest = {
           kind: 'sealed',
           attemptId: latestAttempt.id,
           manifestPath: coords.manifestPath,
           expectedManifestSha256: coords.expectedManifestSha256,
         };
-      } else if (verdict.outcome === 'unknown') {
+      } else if (verdictOutcome !== 'missing' && verdictOutcome !== 'mismatch') {
+        // An unreadable, unknown or unrecognised verdict is never a reason to ask for approval.
         refused.push({ runId: run.runId, reason: 'unknown' });
         return;
       } else {
@@ -757,9 +1100,9 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
 
   // The call keeps the workspace as its receiver: extracting the method
   // would lose `this`, and the adapter reads `this.options`.
-  let result: RemoveWorktreeResultCall;
+  let rawResult: unknown;
   try {
-    result = await withBudget(
+    rawResult = await withBudget(
       workspace.removeWorktree.call(workspace, {
         repositoryRoot: clone.path,
         worktreeRoot: clone.worktreeRoot,
@@ -778,7 +1121,8 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
     refused.push({ runId: run.runId, reason: 'unknown' });
     return;
   }
-  if (result.outcome === 'removed') {
+  const result = readRemoveResult(rawResult);
+  if (result.kind === 'removed') {
     const failureReason = await recordRemovalJournalEntry(
       deps,
       latestAttempt,
@@ -797,12 +1141,123 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
       });
     }
     removed.push({ runId: run.runId, branchTip: result.branchTip });
-  } else if (result.outcome === 'refused') {
+  } else if (result.kind === 'refused') {
     refused.push({ runId: run.runId, reason: result.reason });
   } else {
-    // `partial` or `unknown`: the worktree may or may not be removed.
-    // Reported as refused so the exit code says unresolved.
+    // `partial`, `unknown` or an unrecognised answer: the worktree may or may
+    // not be removed. Reported as refused so the exit code says unresolved.
     refused.push({ runId: run.runId, reason: 'unknown' });
+  }
+}
+
+/** The `outcome` of an adapter answer, or null when it is not a readable plain record. */
+function readOutcomeOf(raw: unknown): unknown {
+  try {
+    const snap = snapshotPlainDataRecord(raw);
+    return snap === null ? null : snap['outcome'];
+  } catch {
+    return null;
+  }
+}
+
+type ValidatedRemovalFacts = {
+  readonly head: string | null;
+  readonly branch: string | null;
+  readonly status: { readonly tracked: number; readonly untracked: number; readonly unmerged: number };
+  readonly locked: boolean;
+  readonly inProgressOperations: readonly unknown[];
+  readonly lastActivity: { readonly iso: string | null; readonly unknown: boolean };
+};
+
+type InspectRead =
+  | { readonly kind: 'inspected'; readonly facts: ValidatedRemovalFacts }
+  | { readonly kind: 'not-a-linked-worktree' }
+  | { readonly kind: 'unknown' };
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * The inspection answer as validated facts. Anything but a well-formed
+ * `inspected` answer, or a `not-a-linked-worktree` refusal, is `unknown`:
+ * a hostile or malformed answer is never read as clean, idle or empty.
+ */
+function readInspectResult(raw: unknown): InspectRead {
+  try {
+    const snap = snapshotPlainDataRecord(raw);
+    if (snap === null) {
+      return { kind: 'unknown' };
+    }
+    if (snap['outcome'] === 'refused') {
+      return snap['reason'] === 'not-a-linked-worktree'
+        ? { kind: 'not-a-linked-worktree' }
+        : { kind: 'unknown' };
+    }
+    if (snap['outcome'] !== 'inspected') {
+      return { kind: 'unknown' };
+    }
+    const facts = snapshotPlainDataRecord(snap['facts']);
+    const status = facts === null ? null : snapshotPlainDataRecord(facts['status']);
+    const lastActivity = facts === null ? null : snapshotPlainDataRecord(facts['lastActivity']);
+    if (facts === null || status === null || lastActivity === null) {
+      return { kind: 'unknown' };
+    }
+    const operations = readDenseArray(facts['inProgressOperations'], 4_096);
+    const { head, branch, locked } = facts;
+    const { tracked, untracked, unmerged } = status;
+    const { iso, unknown } = lastActivity;
+    if (
+      operations.kind !== 'ok' ||
+      typeof locked !== 'boolean' ||
+      (branch !== null && typeof branch !== 'string') ||
+      (head !== null && (typeof head !== 'string' || !COMMIT_HEX_RE.test(head))) ||
+      !isNonNegativeSafeInteger(tracked) ||
+      !isNonNegativeSafeInteger(untracked) ||
+      !isNonNegativeSafeInteger(unmerged) ||
+      typeof unknown !== 'boolean' ||
+      (iso !== null && typeof iso !== 'string')
+    ) {
+      return { kind: 'unknown' };
+    }
+    return {
+      kind: 'inspected',
+      facts: {
+        head: head as string | null,
+        branch: branch as string | null,
+        status: { tracked, untracked, unmerged },
+        locked,
+        inProgressOperations: operations.items,
+        lastActivity: { iso: iso as string | null, unknown },
+      },
+    };
+  } catch {
+    return { kind: 'unknown' };
+  }
+}
+
+type RemoveRead =
+  | { readonly kind: 'removed'; readonly branchTip: string }
+  | { readonly kind: 'refused'; readonly reason: string }
+  | { readonly kind: 'unknown' };
+
+/** The removal answer: only a declared refusal or a removal with a real tip is reported as such. */
+function readRemoveResult(raw: unknown): RemoveRead {
+  try {
+    const snap = snapshotPlainDataRecord(raw);
+    if (snap === null) {
+      return { kind: 'unknown' };
+    }
+    const { outcome, branchTip, reason } = snap;
+    if (outcome === 'removed' && typeof branchTip === 'string' && COMMIT_HEX_RE.test(branchTip)) {
+      return { kind: 'removed', branchTip };
+    }
+    if (outcome === 'refused' && typeof reason === 'string' && DECLARED_REMOVE_REFUSALS.has(reason)) {
+      return { kind: 'refused', reason };
+    }
+    return { kind: 'unknown' };
+  } catch {
+    return { kind: 'unknown' };
   }
 }
 
@@ -861,10 +1316,6 @@ async function worktreeRunnerLiveness(
 
 /** The manifest coordinates handed to `removeWorktree` (mirrors the port type). */
 type RemoveWorktreeManifestInput = Parameters<NonNullable<WorkspacePort['removeWorktree']>>[0]['manifest'];
-type InspectRemovalResult = Awaited<
-  ReturnType<NonNullable<WorkspacePort['inspectWorktreeForRemoval']>>
->;
-type RemoveWorktreeResultCall = Awaited<ReturnType<NonNullable<WorkspacePort['removeWorktree']>>>;
 
 type UnsealedAuthorizationOutcome =
   | {
@@ -954,9 +1405,9 @@ async function authorizeUnsealedRemoval(
       return { outcome: 'refused', reason: 'unknown' };
     }
   }
-  let answer: Awaited<ReturnType<NonNullable<typeof authorize>>>;
+  let rawAnswer: unknown;
   try {
-    answer = await withBudget(
+    rawAnswer = await withBudget(
       authorize.call(deps.actionAuthorization as object, {
         projectId: workOrder.projectId,
         runId: run.runId,
@@ -970,10 +1421,20 @@ async function authorizeUnsealedRemoval(
   } catch {
     return { outcome: 'refused', reason: 'unknown' };
   }
-  if (answer.outcome === 'blocked') {
+  let answer: Record<string, unknown> | null;
+  try {
+    answer = snapshotPlainDataRecord(rawAnswer);
+  } catch {
+    answer = null;
+  }
+  if (answer === null) {
+    return { outcome: 'refused', reason: 'unknown' };
+  }
+  if (answer['outcome'] === 'blocked') {
     return { outcome: 'refused', reason: 'unapproved-force-unsealed' };
   }
-  if (answer.outcome === 'unknown') {
+  const approvalReference = answer['approvalReference'];
+  if (answer['outcome'] !== 'approved' || !isSafeIdentifier(approvalReference)) {
     return { outcome: 'refused', reason: 'unknown' };
   }
   return {
@@ -981,9 +1442,9 @@ async function authorizeUnsealedRemoval(
     manifest: {
       kind: 'force-unsealed',
       attemptId: latestAttempt.id,
-      approvalReference: answer.approvalReference,
+      approvalReference,
     },
-    approvalReference: answer.approvalReference,
+    approvalReference,
   };
 }
 
@@ -1010,25 +1471,31 @@ async function recordRemovalJournalEntry(
     `branch ${branchForRun(runId)} kept at ${branchTip}` +
     (approvalReference !== undefined ? `; approvalRef=${approvalReference}` : '');
   try {
-    const priorEntries = await withBudget(
+    const rawEntries: unknown = await withBudget(
       deps.executionJournal.listJournalEntriesForAttempt(attempt.id),
       budget,
     );
-    const listed = Array.isArray(priorEntries) ? priorEntries : [];
+    const dense = readDenseArray(rawEntries, MAX_ATTEMPT_JOURNAL_ENTRIES);
+    if (dense.kind !== 'ok') {
+      throw new Error('journal entries unreadable');
+    }
+    const listed: Record<string, unknown>[] = [];
+    for (const item of dense.items) {
+      const snap = snapshotPlainDataRecord(item);
+      if (snap === null) {
+        throw new Error('journal entries unreadable');
+      }
+      listed.push(snap);
+    }
     const intentPrefix = unsealedIntentPrefix(attempt.id);
     // Intent entries never consume a sequence number, so the completed id
     // stays `${attempt.id}:collect:${nonIntentCount + 1}` — `1` for a plain
     // sealed removal. A retry that would collide falls back to a keyed id.
     const nonIntentCount = listed.filter(
-      (entry) =>
-        !(
-          isRecordObject(entry) &&
-          typeof entry['id'] === 'string' &&
-          entry['id'].startsWith(intentPrefix)
-        ),
+      (entry) => !(typeof entry['id'] === 'string' && entry['id'].startsWith(intentPrefix)),
     ).length;
     let id = `${attempt.id}:collect:${nonIntentCount + 1}`;
-    if (listed.some((entry) => isRecordObject(entry) && entry['id'] === id)) {
+    if (listed.some((entry) => entry['id'] === id)) {
       id = `${attempt.id}:collect:completed:${runId}`;
     }
     await withBudget(

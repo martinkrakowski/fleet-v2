@@ -565,7 +565,7 @@ describe("hosts: the line-level token-shape screen and the write receipt", () =>
 
   it("an add that writes prints the receipt with the digest intact", async () => {
     const { file, root } = fixture("plain");
-    const { code, stdout, stderr } = await run(
+    const { code, stdout } = await run(
       ["add", "newhost", "--worktree-root", root, ...VERIFIER],
       file,
       "yes-flag",

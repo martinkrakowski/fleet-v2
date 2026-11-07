@@ -1302,46 +1302,238 @@ function scanStreamReadOnly(rawStdout: string): { readonly readOnlyVoided: boole
   return { readOnlyVoided, hasStepStart };
 }
 
+function unknownReviewResult(
+  rawOutput: string,
+  readOnlyVerified: boolean,
+  unknownReason?: ReviewUnknownReason,
+): IndependentReviewTransportResult {
+  return {
+    rawOutput,
+    readOnlyVerified,
+    result: 'unknown',
+    findings: [],
+    completedAtIso: new Date().toISOString(),
+    ...(unknownReason !== undefined ? { unknownReason } : {}),
+  };
+}
+
+// 0-2. Configuration and request checks. A `none` route refuses before any
+// work (KF-14a): the route's code is the fixed reason; an absent code (an
+// older locator) is route-unresolved. The reviewer model must match
+// options.model and no option may start with '-'.
+function assertReviewerConfiguration(
+  options: OcmReviewTransportOptions,
+  request: RunIndependentReviewRequest,
+): void {
+  if (options.route !== undefined && options.route.kind === 'none') {
+    throw new ReviewTransportError(options.route.reason, options.route.code ?? 'route-unresolved');
+  }
+  if (request.reviewerModel !== options.model) {
+    throw new ReviewTransportError(
+      `reviewer model mismatch: request specified "${request.reviewerModel}" but transport configured for "${options.model}"`,
+      'transport-failed',
+    );
+  }
+  const dashChecked: Array<readonly [string, string]> = [
+    ['model', options.model],
+    ['agent', options.agent],
+  ];
+  if (options.variant !== undefined) {
+    dashChecked.push(['variant', options.variant]);
+  }
+  for (const [label, value] of dashChecked) {
+    if (value.startsWith('-') || value.trim().startsWith('-')) {
+      throw new ReviewTransportError(`invalid ${label}: "${value}" starts with "-"`, 'transport-failed');
+    }
+  }
+}
+
+// 3. Resolve the review directory and reject a missing, non-string, blank or
+// dash-leading path.
+async function resolveReviewDirectory(
+  options: OcmReviewTransportOptions,
+  request: RunIndependentReviewRequest,
+): Promise<string> {
+  const dir = await options.resolveReviewDir(request);
+  if (dir === null || typeof dir !== 'string' || dir.trim() === '') {
+    throw new ReviewTransportError(`failed to resolve review directory for attempt ${request.attemptId}`, 'transport-failed');
+  }
+  if (dir.startsWith('-') || dir.trim().startsWith('-')) {
+    throw new ReviewTransportError(`invalid review directory: "${dir}" starts with "-"`, 'transport-failed');
+  }
+  return dir;
+}
+
+// Every spawn throw is classified: a timeout shape is a `timeout`, anything
+// else a `transport` failure. The message is never passed through — it may
+// carry a secret or a path — and a typed ReviewTransportError thrown by the
+// spawn does not travel as-is; the fixed message travels instead.
+function throwClassifiedSpawnFailure(error: unknown): never {
+  throw new ReviewTransportError(
+    'reviewer process failed',
+    isTimeoutError(error) ? 'timeout' : 'transport',
+    transportFailureDiagnostic(error),
+  );
+}
+
+// 4. RV4: before the review, prove the worktree is idle with
+// `ocm-run --wait --dir <dir>` under the review budget. `--wait` exits 0
+// when idle (two reads) and 75 when a session still runs past
+// `OCM_WAIT_MAX`; a cut-short wait (a timeout) writes no review intent, so
+// the next pass can dispatch. Exit 75 or `timedOut` is `seat-busy`; any
+// other non-zero exit, an unreadable exit code or a thrown spawn is the
+// existing `transport`/`timeout` code. None of these spawn the review.
+async function awaitIdleReviewSeat(
+  spawnFn: NonNullable<OcmReviewTransportOptions['spawn']>,
+  options: OcmReviewTransportOptions,
+  dir: string,
+  timeoutMs: number,
+  reviewEnv: Record<string, string>,
+): Promise<void> {
+  let waitResult: OcmReviewTransportSpawnResult;
+  try {
+    waitResult = await spawnFn(options.ocmRunBin, ['--wait', '--dir', dir], {
+      ...reviewEnv,
+      OCM_WAIT_MAX: String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+    }, { timeoutMs });
+  } catch (error) {
+    throwClassifiedSpawnFailure(error);
+  }
+  const waitExitCode = safeRead(() => waitResult.exitCode);
+  if (waitExitCode === 75 || safeRead(() => waitResult.timedOut === true) === true) {
+    throw new ReviewTransportError('review seat busy', 'seat-busy', spawnDiagnosticOf(waitResult));
+  }
+  if (waitExitCode !== 0) {
+    const waitTimedOut = spawnTimedOut(waitResult);
+    throw new ReviewTransportError(
+      `reviewer process failed with exit code ${String(waitExitCode)}`,
+      waitTimedOut ? 'timeout' : 'transport',
+      spawnDiagnosticOf(waitResult),
+    );
+  }
+}
+
+// The head is still the candidate head after (or without) a review when both
+// the pre-review and post-review reads equal it.
+async function headStillCandidate(
+  options: OcmReviewTransportOptions,
+  dir: string,
+  before: unknown,
+  request: RunIndependentReviewRequest,
+): Promise<boolean> {
+  const after = await options.readHead(dir);
+  return before === request.candidateHeadSha && after === request.candidateHeadSha;
+}
+
+type PreparedKindReview =
+  | { readonly kind: 'ready'; readonly embeddedDiff: string | null }
+  | { readonly kind: 'refused'; readonly outcome: IndependentReviewTransportResult };
+
+// 5. A kind review embeds the base..head diff read after the pre-review head
+// read, so the reviewer does not need a shell to see the change. F68: a kind
+// review with no diff source is refused exactly like an unreadable diff — a
+// review that cannot see the change can still answer PASS, so the transport
+// refuses before the prompt and the spawn, and `unknown` is the outcome the
+// callers treat as not-accepted; the fixed reason travels as the raw output.
+async function prepareKindReview(
+  options: OcmReviewTransportOptions,
+  request: RunIndependentReviewRequest,
+  dir: string,
+  before: unknown,
+): Promise<PreparedKindReview> {
+  if (request.kind === undefined) {
+    return { kind: 'ready', embeddedDiff: null };
+  }
+  if (options.baseCommit === undefined || options.readDiff === undefined) {
+    return {
+      kind: 'refused',
+      outcome: unknownReviewResult(
+        DIFF_UNAVAILABLE_REASON,
+        await headStillCandidate(options, dir, before, request),
+      ),
+    };
+  }
+  // A thrown read is a missing diff: classify the read result uniformly.
+  let read: string | null = null;
+  try {
+    read = await options.readDiff(options.baseCommit, request.candidateHeadSha);
+  } catch {
+    read = null;
+  }
+  const embedding = classifyDiffForEmbedding(read);
+  if (embedding.kind === 'refused') {
+    return {
+      kind: 'refused',
+      outcome: unknownReviewResult(
+        embedding.reason,
+        await headStillCandidate(options, dir, before, request),
+      ),
+    };
+  }
+  return { kind: 'ready', embeddedDiff: embedding.diff };
+}
+
+// 6. Spawn the runner process; a non-zero or null exit throws. An exit 75
+// that is not a timeout means the worktree is busy too (RV4); the fixed
+// message carries no stderr and no path.
+async function spawnReviewProcess(
+  spawnFn: NonNullable<OcmReviewTransportOptions['spawn']>,
+  options: OcmReviewTransportOptions,
+  argv: string[],
+  reviewEnv: Record<string, string>,
+  timeoutMs: number,
+): Promise<OcmReviewTransportSpawnResult> {
+  let spawnResult: OcmReviewTransportSpawnResult;
+  try {
+    spawnResult = await spawnFn(options.ocmRunBin, argv, reviewEnv, { timeoutMs });
+  } catch (error) {
+    throwClassifiedSpawnFailure(error);
+  }
+  const spawnExitCode = safeRead(() => spawnResult.exitCode);
+  if (spawnExitCode !== 0) {
+    const timedOut = spawnTimedOut(spawnResult);
+    const diagnostic = spawnDiagnosticOf(spawnResult);
+    if (spawnExitCode === 75 && !timedOut) {
+      throw new ReviewTransportError('review seat busy', 'seat-busy', diagnostic);
+    }
+    throw new ReviewTransportError(
+      `reviewer process failed with exit code ${String(spawnExitCode)}`,
+      timedOut ? 'timeout' : 'transport',
+      diagnostic,
+    );
+  }
+  return spawnResult;
+}
+
+// 5b. Build argv. A variant is optional; the prompt travels last as `--format json`.
+function buildReviewArgv(
+  options: OcmReviewTransportOptions,
+  dir: string,
+  prompt: string,
+): string[] {
+  return [
+    '--dir',
+    dir,
+    '--agent',
+    options.agent,
+    '-m',
+    options.model,
+    ...(options.variant ? ['--variant', options.variant] : []),
+    '--format',
+    'json',
+    prompt,
+  ];
+}
+
 export function createOcmReviewTransport(
   options: OcmReviewTransportOptions,
 ): (request: RunIndependentReviewRequest) => Promise<IndependentReviewTransportResult> {
   return async (request: RunIndependentReviewRequest): Promise<IndependentReviewTransportResult> => {
-    // 0. A `none` route refuses before any work (KF-14a): the route's code is
-    // the fixed reason; an absent code (an older locator) is route-unresolved.
-    if (options.route !== undefined && options.route.kind === 'none') {
-      throw new ReviewTransportError(options.route.reason, options.route.code ?? 'route-unresolved');
-    }
-
-    // 1. Verify reviewer model matches options.model
-    if (request.reviewerModel !== options.model) {
-      throw new ReviewTransportError(
-        `reviewer model mismatch: request specified "${request.reviewerModel}" but transport configured for "${options.model}"`,
-        'transport-failed',
-      );
-    }
-
-    // 2. Reject options starting with '-'
-    if (options.model.startsWith('-') || options.model.trim().startsWith('-')) {
-      throw new ReviewTransportError(`invalid model: "${options.model}" starts with "-"`, 'transport-failed');
-    }
-    if (options.agent.startsWith('-') || options.agent.trim().startsWith('-')) {
-      throw new ReviewTransportError(`invalid agent: "${options.agent}" starts with "-"`, 'transport-failed');
-    }
-    if (
-      options.variant !== undefined &&
-      (options.variant.startsWith('-') || options.variant.trim().startsWith('-'))
-    ) {
-      throw new ReviewTransportError(`invalid variant: "${options.variant}" starts with "-"`, 'transport-failed');
-    }
+    // 0-2. Configuration and request checks.
+    assertReviewerConfiguration(options, request);
 
     // 3. Resolve review directory and verify before head
-    const dir = await options.resolveReviewDir(request);
-    if (dir === null || typeof dir !== 'string' || dir.trim() === '') {
-      throw new ReviewTransportError(`failed to resolve review directory for attempt ${request.attemptId}`, 'transport-failed');
-    }
-    if (dir.startsWith('-') || dir.trim().startsWith('-')) {
-      throw new ReviewTransportError(`invalid review directory: "${dir}" starts with "-"`, 'transport-failed');
-    }
+    const dir = await resolveReviewDirectory(options, request);
     const before = await options.readHead(dir);
     if (before !== request.candidateHeadSha) {
       throw new ReviewTransportError(
@@ -1350,137 +1542,24 @@ export function createOcmReviewTransport(
       );
     }
 
-    // 4. RV4: before the review, prove the worktree is idle with
-    // `ocm-run --wait --dir <dir>` under the review budget. `--wait` exits 0
-    // when idle (two reads) and 75 when a session still runs past
-    // `OCM_WAIT_MAX`; a cut-short wait (a timeout) writes no review intent, so
-    // the next pass can dispatch. Exit 75 or `timedOut` is `seat-busy`; any
-    // other non-zero exit, an unreadable exit code or a thrown spawn is the
-    // existing `transport`/`timeout` code. None of these spawn the review.
+    // 4. RV4: prove the worktree is idle before the review.
     const timeoutMs = options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     const reviewEnv = buildReviewerEnv(options);
-    const waitSpawnFn = options.spawn ?? defaultSpawn;
-    let waitResult: OcmReviewTransportSpawnResult;
-    try {
-      waitResult = await waitSpawnFn(options.ocmRunBin, ['--wait', '--dir', dir], {
-        ...reviewEnv,
-        OCM_WAIT_MAX: String(Math.max(1, Math.ceil(timeoutMs / 1000))),
-      }, { timeoutMs });
-    } catch (error) {
-      // RV4: a thrown spawn always classifies as `timeout` or `transport`. Its
-      // message is never passed through — it may carry a secret or a path —
-      // and a typed ReviewTransportError thrown by the spawn is classified like
-      // any other throw, never rethrown with its own code or message.
-      throw new ReviewTransportError(
-        'reviewer process failed',
-        isTimeoutError(error) ? 'timeout' : 'transport',
-        transportFailureDiagnostic(error),
-      );
-    }
-    const waitExitCode = safeRead(() => waitResult.exitCode);
-    if (waitExitCode === 75 || safeRead(() => waitResult.timedOut === true) === true) {
-      throw new ReviewTransportError('review seat busy', 'seat-busy', spawnDiagnosticOf(waitResult));
-    }
-    if (waitExitCode !== 0) {
-      const waitTimedOut = spawnTimedOut(waitResult);
-      throw new ReviewTransportError(
-        `reviewer process failed with exit code ${String(waitExitCode)}`,
-        waitTimedOut ? 'timeout' : 'transport',
-        spawnDiagnosticOf(waitResult),
-      );
-    }
-
-    // 5. Build argv and sanitized environment. A kind review embeds the
-    // base..head diff read after the pre-review head read, so the reviewer
-    // does not need a shell to see the change.
-    const nonce = (options.makeNonce ?? defaultNonce)();
-    let embeddedDiff: string | null = null;
-    if (request.kind !== undefined) {
-      // F68: a kind review with no diff source is refused exactly like an
-      // unreadable diff: a review that cannot see the change can still answer
-      // PASS, so the transport refuses before the prompt and the spawn.
-      if (options.baseCommit === undefined || options.readDiff === undefined) {
-        const afterMissing = await options.readHead(dir);
-        return {
-          rawOutput: DIFF_UNAVAILABLE_REASON,
-          readOnlyVerified:
-            before === request.candidateHeadSha && afterMissing === request.candidateHeadSha,
-          result: 'unknown',
-          findings: [],
-          completedAtIso: new Date().toISOString(),
-        };
-      }
-      // A thrown read is a missing diff: classify the read result uniformly.
-      let read: string | null = null;
-      try {
-        read = await options.readDiff(options.baseCommit, request.candidateHeadSha);
-      } catch {
-        read = null;
-      }
-      const embedding = classifyDiffForEmbedding(read);
-      if (embedding.kind === 'refused') {
-        // F68: a review that cannot see the change is never a pass. The
-        // transport refuses here instead of sending a review that could pass
-        // without the diff. `unknown` is the outcome the callers treat as
-        // not-accepted, and the fixed reason travels as the raw output.
-        const after = await options.readHead(dir);
-        return {
-          rawOutput: embedding.reason,
-          readOnlyVerified: before === request.candidateHeadSha && after === request.candidateHeadSha,
-          result: 'unknown',
-          findings: [],
-          completedAtIso: new Date().toISOString(),
-        };
-      }
-      embeddedDiff = embedding.diff;
-    }
-    const prompt = buildReviewPrompt(request, nonce, embeddedDiff);
-    const argv: string[] = [
-      '--dir',
-      dir,
-      '--agent',
-      options.agent,
-      '-m',
-      options.model,
-      ...(options.variant ? ['--variant', options.variant] : []),
-      '--format',
-      'json',
-      prompt,
-    ];
-    // 6. Spawn runner process; non-zero or null exit throws
     const spawnFn = options.spawn ?? defaultSpawn;
-    let spawnResult: OcmReviewTransportSpawnResult;
-    try {
-      spawnResult = await spawnFn(options.ocmRunBin, argv, reviewEnv, {
-        timeoutMs,
-      });
-    } catch (error) {
-      // Every throw from the review spawn is classified: a timeout shape is a
-      // `timeout`, anything else a `transport` failure. A typed
-      // ReviewTransportError thrown by the spawn does not travel as-is — its
-      // message could expose a secret or a path, and its code would bypass the
-      // thrown-spawn classification; the fixed message travels instead.
-      throw new ReviewTransportError(
-        'reviewer process failed',
-        isTimeoutError(error) ? 'timeout' : 'transport',
-        transportFailureDiagnostic(error),
-      );
+    await awaitIdleReviewSeat(spawnFn, options, dir, timeoutMs, reviewEnv);
+
+    // 5. Embed the diff for a kind review, or refuse; then build argv and the
+    // sanitized environment.
+    const prepared = await prepareKindReview(options, request, dir, before);
+    if (prepared.kind === 'refused') {
+      return prepared.outcome;
     }
-    const spawnExitCode = safeRead(() => spawnResult.exitCode);
-    if (spawnExitCode !== 0) {
-      const timedOut = spawnTimedOut(spawnResult);
-      const diagnostic = spawnDiagnosticOf(spawnResult);
-      if (spawnExitCode === 75 && !timedOut) {
-        // RV4: an exit 75 from the review spawn that is not a timeout means the
-        // worktree is busy too. The fixed message carries no stderr and no path.
-        throw new ReviewTransportError('review seat busy', 'seat-busy', diagnostic);
-      }
-      throw new ReviewTransportError(
-        `reviewer process failed with exit code ${String(spawnExitCode)}`,
-        timedOut ? 'timeout' : 'transport',
-        diagnostic,
-      );
-    }
+    const nonce = (options.makeNonce ?? defaultNonce)();
+    const prompt = buildReviewPrompt(request, nonce, prepared.embeddedDiff);
+    const argv = buildReviewArgv(options, dir, prompt);
+
+    // 6. Spawn runner process; non-zero or null exit throws
+    const spawnResult = await spawnReviewProcess(spawnFn, options, argv, reviewEnv, timeoutMs);
 
     // 7. Scan stdout for the read-only proof; a missing or non-string stdout reads as empty.
     const spawnStdout = safeRead(() => spawnResult.stdout);
@@ -1499,14 +1578,7 @@ export function createOcmReviewTransport(
     // grammar; every violation is unknown (`stream-grammar`) with no verdict read.
     const stream = validateReviewStream(rawStdout);
     if (!stream.ok) {
-      return {
-        rawOutput: 'stream-grammar',
-        readOnlyVerified,
-        result: 'unknown',
-        findings: [],
-        unknownReason: 'stream-grammar',
-        completedAtIso: new Date().toISOString(),
-      };
+      return unknownReviewResult('stream-grammar', readOnlyVerified, 'stream-grammar');
     }
     const finalText = stream.verdictText;
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.

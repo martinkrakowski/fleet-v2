@@ -362,8 +362,36 @@ export class PlanRelaunchUseCase implements PlanRelaunchPort {
     };
     const budgetExhausted: PlanRelaunchResult = { outcome: 'refused', reason: 'budget-exhausted' };
 
+    // 1–2. The inventory and the records the join needs.
+    const gathered = await this.readInputs(validated, exhausted, budgetExhausted);
+    if (!gathered.ok) return gathered.result;
+
+    // 3. Join, order and admit.
+    const drafted = joinLanes(gathered.inputs.read.rows, validated.clones, gathered.inputs.runs, gathered.inputs.attempts, gathered.inputs.workOrders);
+    if (drafted === null) return { outcome: 'refused', reason: 'invalid-request' };
+    deriveDependencies(drafted, gathered.inputs.lanePlans);
+    const ordering = topologicalOrder(drafted);
+    if (!ordering.ok) return { outcome: 'refused', reason: 'dependency-cycle' };
+    const ordered = ordering.lanes;
+    assignWaves(ordered, validated.maxActiveRuns);
+    const staggers = assignStaggers(ordered, validated.dispatchStaggerMs);
+
+    // 4. Digest the plan and store it by digest.
+    const built = buildPlanRecord(deps, validated, gathered.inputs.read.conductor, ordered, staggers);
+    if (built === null) return { outcome: 'refused', reason: 'digest-mismatch' };
+    return this.storePlan(deps, built, exhausted, budgetExhausted);
+  }
+
+  /** Steps 1–2: the inventory (fail-closed on unknowns and limits) and the four record lists. */
+  private async readInputs(
+    validated: ValidatedRequest,
+    exhausted: () => boolean,
+    budgetExhausted: PlanRelaunchResult,
+  ): Promise<{ readonly ok: true; readonly inputs: RelaunchInputs } | { readonly ok: false; readonly result: PlanRelaunchResult }> {
+    const deps = this.deps as PlanRelaunchDependencies;
+
     // 1. The inventory: the population, the runner state and the conductor.
-    if (exhausted()) return budgetExhausted;
+    if (exhausted()) return { ok: false, result: budgetExhausted };
     let inventoried: unknown;
     try {
       inventoried = await deps.inventory.inventoryRelaunch({
@@ -372,125 +400,143 @@ export class PlanRelaunchUseCase implements PlanRelaunchPort {
         clones: validated.clones,
       });
     } catch {
-      return { outcome: 'unknown', reasons: ['inventory-records-unreadable'] };
+      return { ok: false, result: { outcome: 'unknown', reasons: ['inventory-records-unreadable'] } };
     }
     const outcome = own(inventoried, 'outcome');
     if (outcome === 'refused') {
       return own(inventoried, 'reason') === 'invalid-request'
-        ? { outcome: 'refused', reason: 'invalid-request' }
-        : { outcome: 'unknown', reasons: ['inventory-records-unreadable'] };
+        ? { ok: false, result: { outcome: 'refused', reason: 'invalid-request' } }
+        : { ok: false, result: { outcome: 'unknown', reasons: ['inventory-records-unreadable'] } };
     }
-    if (outcome !== 'inventoried') return { outcome: 'unknown', reasons: ['inventory-records-unreadable'] };
+    if (outcome !== 'inventoried') {
+      return { ok: false, result: { outcome: 'unknown', reasons: ['inventory-records-unreadable'] } };
+    }
     const read = readInventory(inventoried);
-    if (read === null) return { outcome: 'unknown', reasons: ['inventory-records-unreadable'] };
-    if (read.unknown.length > 0) return { outcome: 'unknown', reasons: read.unknown };
-    if (read.hosts.length > MAX_HOSTS || read.rows.length > MAX_LANES) return { outcome: 'refused', reason: 'limit-exceeded' };
+    if (read === null) return { ok: false, result: { outcome: 'unknown', reasons: ['inventory-records-unreadable'] } };
+    if (read.unknown.length > 0) return { ok: false, result: { outcome: 'unknown', reasons: read.unknown } };
+    if (read.hosts.length > MAX_HOSTS || read.rows.length > MAX_LANES) {
+      return { ok: false, result: { outcome: 'refused', reason: 'limit-exceeded' } };
+    }
 
     // 2. The records the join needs. A store that cannot be read is unknown.
     let runs: readonly LaneRunRecord[];
     let attempts: readonly AttemptRecord[];
     let workOrders: readonly WorkOrderRecord[];
     let lanePlans: readonly LanePlanRecord[];
-    if (exhausted()) return budgetExhausted;
+    if (exhausted()) return { ok: false, result: budgetExhausted };
     try {
       runs = await deps.runRepo.list();
     } catch {
-      return { outcome: 'unknown', reasons: ['store-read-failed'] };
+      return { ok: false, result: { outcome: 'unknown', reasons: ['store-read-failed'] } };
     }
-    if (exhausted()) return budgetExhausted;
+    if (exhausted()) return { ok: false, result: budgetExhausted };
     try {
       attempts = await deps.attemptRepo.listAllAttempts();
     } catch {
-      return { outcome: 'unknown', reasons: ['store-read-failed'] };
+      return { ok: false, result: { outcome: 'unknown', reasons: ['store-read-failed'] } };
     }
-    if (exhausted()) return budgetExhausted;
+    if (exhausted()) return { ok: false, result: budgetExhausted };
     try {
       workOrders = await deps.workOrderRepo.listWorkOrdersByProject();
     } catch {
-      return { outcome: 'unknown', reasons: ['store-read-failed'] };
+      return { ok: false, result: { outcome: 'unknown', reasons: ['store-read-failed'] } };
     }
-    if (exhausted()) return budgetExhausted;
+    if (exhausted()) return { ok: false, result: budgetExhausted };
     try {
       lanePlans = await deps.lanePlanRepo.listLanePlans();
     } catch {
-      return { outcome: 'unknown', reasons: ['store-read-failed'] };
+      return { ok: false, result: { outcome: 'unknown', reasons: ['store-read-failed'] } };
     }
+    return { ok: true, inputs: { read, runs, attempts, workOrders, lanePlans } };
+  }
 
-    // 3. Join, order and admit.
-    const drafted = joinLanes(read.rows, validated.clones, runs, attempts, workOrders);
-    if (drafted === null) return { outcome: 'refused', reason: 'invalid-request' };
-    deriveDependencies(drafted, lanePlans);
-    const ordering = topologicalOrder(drafted);
-    if (!ordering.ok) return { outcome: 'refused', reason: 'dependency-cycle' };
-    const ordered = ordering.lanes;
-    assignWaves(ordered, validated.maxActiveRuns);
-    const staggers = assignStaggers(ordered, validated.dispatchStaggerMs);
-
-    // 4. Digest the plan and store it by digest.
-    const draftBody = {
-      schemaVersion: RELAUNCH_PLAN_SCHEMA_VERSION,
-      hostFilter: validated.hostName,
-      maxActiveRuns: validated.maxActiveRuns,
-      dispatchStaggerMs: validated.dispatchStaggerMs,
-      conductor: read.conductor,
-      lanes: ordered.map((lane) => ({
-        laneId: lane.laneId,
-        hostName: lane.hostName,
-        projectId: lane.projectId,
-        population: lane.population,
-        runnerState: lane.runnerState,
-        runId: lane.row.runId,
-        attemptId: lane.row.attemptId,
-        workOrderId: lane.workOrderId,
-        baseBranch: lane.baseBranch,
-        chainHead: lane.chainHead,
-        dependsOnLaneIds: lane.dependsOn,
-        admissionWave: lane.wave,
-        dispatchEndpointKey: staggers.get(lane.laneId)?.endpoint ?? null,
-        staggerOffsetMs: staggers.get(lane.laneId)?.offsetMs ?? null,
-        stepCodes: relaunchStepCodesFor(lane.population, lane.runnerState),
-      })),
-    };
-    const planDigest = deps.computeDigest(canonicalRelaunchPlanBodyJson(draftBody));
-    const requestDigest = deps.computeDigest(
-      JSON.stringify({
-        version: 1,
-        hostName: validated.hostName,
-        maxActiveRuns: validated.maxActiveRuns,
-        dispatchStaggerMs: validated.dispatchStaggerMs,
-        clones: validated.clones
-          .map((clone) => ({ projectId: clone.projectId, hostName: clone.hostName }))
-          .sort((a, b) => byCodeUnit(a.hostName, b.hostName) || byCodeUnit(a.projectId, b.projectId)),
-      }),
-    );
-    if (!SHA256_HEX.test(planDigest) || !SHA256_HEX.test(requestDigest)) {
-      return { outcome: 'refused', reason: 'digest-mismatch' };
-    }
-    const lanes: RelaunchPlannedLane[] = draftBody.lanes.map(({ stepCodes, ...lane }) => ({
-      ...lane,
-      steps: stepCodes.map((step: RelaunchStepCode) => ({ step, idempotencyKey: relaunchStepKey(planDigest, lane.laneId, step) })),
-    }));
-    const plan: RelaunchPlanRecord = {
-      schemaVersion: RELAUNCH_PLAN_SCHEMA_VERSION,
-      planDigest,
-      requestDigest,
-      createdAtIso: validated.nowIso,
-      hostFilter: validated.hostName,
-      maxActiveRuns: validated.maxActiveRuns,
-      dispatchStaggerMs: validated.dispatchStaggerMs,
-      conductor: read.conductor,
-      lanes,
-    };
-
+  /** Step 4: store the built plan by digest; any save refusal maps onto the port's refusal reasons. */
+  private async storePlan(
+    deps: PlanRelaunchDependencies,
+    plan: RelaunchPlanRecord,
+    exhausted: () => boolean,
+    budgetExhausted: PlanRelaunchResult,
+  ): Promise<PlanRelaunchResult> {
     if (exhausted()) return budgetExhausted;
     try {
       const saved = await deps.planRepo.save(plan);
       if (saved.outcome === 'refused') return { outcome: 'refused', reason: mapSaveRefusal(saved.reason) };
-      return { outcome: 'planned', planDigest, reused: saved.outcome === 'unchanged', plan: saved.plan };
+      return { outcome: 'planned', planDigest: plan.planDigest, reused: saved.outcome === 'unchanged', plan: saved.plan };
     } catch {
       return { outcome: 'refused', reason: 'store-unreadable' };
     }
   }
+}
+
+/** Everything steps 1–2 gather before the join. */
+interface RelaunchInputs {
+  readonly read: InventoryRead;
+  readonly runs: readonly LaneRunRecord[];
+  readonly attempts: readonly AttemptRecord[];
+  readonly workOrders: readonly WorkOrderRecord[];
+  readonly lanePlans: readonly LanePlanRecord[];
+}
+
+/** Digests the drafted lanes into the stored plan record; null when a digest is not a SHA-256 hex digest. */
+function buildPlanRecord(
+  deps: PlanRelaunchDependencies,
+  validated: ValidatedRequest,
+  conductor: RelaunchPlanRecord['conductor'],
+  ordered: readonly DraftLane[],
+  staggers: Map<string, { readonly endpoint: string; readonly offsetMs: number }>,
+): RelaunchPlanRecord | null {
+  const draftBody = {
+    schemaVersion: RELAUNCH_PLAN_SCHEMA_VERSION,
+    hostFilter: validated.hostName,
+    maxActiveRuns: validated.maxActiveRuns,
+    dispatchStaggerMs: validated.dispatchStaggerMs,
+    conductor,
+    lanes: ordered.map((lane) => ({
+      laneId: lane.laneId,
+      hostName: lane.hostName,
+      projectId: lane.projectId,
+      population: lane.population,
+      runnerState: lane.runnerState,
+      runId: lane.row.runId,
+      attemptId: lane.row.attemptId,
+      workOrderId: lane.workOrderId,
+      baseBranch: lane.baseBranch,
+      chainHead: lane.chainHead,
+      dependsOnLaneIds: lane.dependsOn,
+      admissionWave: lane.wave,
+      dispatchEndpointKey: staggers.get(lane.laneId)?.endpoint ?? null,
+      staggerOffsetMs: staggers.get(lane.laneId)?.offsetMs ?? null,
+      stepCodes: relaunchStepCodesFor(lane.population, lane.runnerState),
+    })),
+  };
+  const planDigest = deps.computeDigest(canonicalRelaunchPlanBodyJson(draftBody));
+  const requestDigest = deps.computeDigest(
+    JSON.stringify({
+      version: 1,
+      hostName: validated.hostName,
+      maxActiveRuns: validated.maxActiveRuns,
+      dispatchStaggerMs: validated.dispatchStaggerMs,
+      clones: validated.clones
+        .map((clone) => ({ projectId: clone.projectId, hostName: clone.hostName }))
+        .sort((a, b) => byCodeUnit(a.hostName, b.hostName) || byCodeUnit(a.projectId, b.projectId)),
+    }),
+  );
+  if (!SHA256_HEX.test(planDigest) || !SHA256_HEX.test(requestDigest)) return null;
+  const lanes: RelaunchPlannedLane[] = draftBody.lanes.map(({ stepCodes, ...lane }) => ({
+    ...lane,
+    steps: stepCodes.map((step: RelaunchStepCode) => ({ step, idempotencyKey: relaunchStepKey(planDigest, lane.laneId, step) })),
+  }));
+  return {
+    schemaVersion: RELAUNCH_PLAN_SCHEMA_VERSION,
+    planDigest,
+    requestDigest,
+    createdAtIso: validated.nowIso,
+    hostFilter: validated.hostName,
+    maxActiveRuns: validated.maxActiveRuns,
+    dispatchStaggerMs: validated.dispatchStaggerMs,
+    conductor,
+    lanes,
+  };
 }
 
 function mapSaveRefusal(reason: string): PlanRelaunchRefusalReason {

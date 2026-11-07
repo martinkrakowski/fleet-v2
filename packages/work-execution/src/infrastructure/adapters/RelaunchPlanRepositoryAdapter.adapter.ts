@@ -313,11 +313,23 @@ function parseStoredPlan(raw: unknown): VersionedRecordParseResult<RelaunchPlanR
   if (versionCheck.status !== 'ok') return versionCheck;
   const plan = readRelaunchPlanRecord(raw, true);
   if (plan === null) return { status: 'invalid' };
+  // A stored record whose body no longer hashes to its digest is corrupt: never readable.
+  if (!digestMatches(plan)) return { status: 'invalid' };
   return { status: 'ok', record: plan, schemaVersion: versionCheck.schemaVersion };
 }
 
 function sha256Hex(textToHash: string): string {
   return createHash('sha256').update(textToHash).digest('hex');
+}
+
+/** Whether a record's body still hashes to the digest it claims (and is keyed by). */
+function digestMatches(record: RelaunchPlanRecord): boolean {
+  return sha256Hex(canonicalRelaunchPlanBodyJson(record)) === record.planDigest;
+}
+
+/** A fresh plain copy: mutating a returned record must never change the stored one. */
+function deepCopy<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 type StoreRead =
@@ -380,9 +392,9 @@ export class RelaunchPlanRepositoryAdapter implements RelaunchPlanRepositoryPort
         const decision = decideSave([...this.inMemoryPlans.values()], read);
         if (decision.kind === 'refused') return { outcome: 'refused', reason: decision.reason };
         if (decision.kind === 'unchanged') {
-          return { outcome: 'unchanged', planDigest: decision.stored.planDigest, plan: decision.stored };
+          return { outcome: 'unchanged', planDigest: decision.stored.planDigest, plan: deepCopy(decision.stored) };
         }
-        this.inMemoryPlans.set(read.planDigest, read);
+        this.inMemoryPlans.set(read.planDigest, deepCopy(read));
         return { outcome: 'saved', planDigest: read.planDigest, plan: read };
       }
       return await withFileLock(`${target}.lock`, async (): Promise<SaveRelaunchPlanResult> => {
@@ -413,7 +425,8 @@ export class RelaunchPlanRepositoryAdapter implements RelaunchPlanRepositoryPort
     try {
       if (this.target === null) {
         const held = this.inMemoryPlans.get(planDigest);
-        return held === undefined ? { outcome: 'absent' } : { outcome: 'found', plan: held };
+        // A record whose body no longer hashes to its digest is corrupt: never handed out as found.
+        return held === undefined || !digestMatches(held) ? { outcome: 'absent' } : { outcome: 'found', plan: deepCopy(held) };
       }
       const current = await this.readFromDisk(this.target);
       if (current.status === 'unknown-version') return { outcome: 'unreadable', reason: 'unknown-version' };

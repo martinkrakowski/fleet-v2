@@ -386,6 +386,46 @@ describe('RelaunchPlanRepositoryAdapter', () => {
     expect(await fs.readdir(dir)).toEqual(['custom-plans.json']);
   });
 
+  it('never reports a stored plan whose body no longer hashes to its digest as found', async () => {
+    const dir = await tempDir();
+    const plan = makePlan();
+    const tampered = clone(plan);
+    (tampered.lanes[1] as { admissionWave: number }).admissionWave = 2;
+    await fs.writeFile(path.join(dir, 'relaunch-plans.json'), JSON.stringify([tampered]), 'utf8');
+    expect(await new RelaunchPlanRepositoryAdapter({ stateDir: dir }).findByDigest(plan.planDigest)).toEqual({
+      outcome: 'unreadable',
+      reason: 'unreadable',
+    });
+
+    const memory = new RelaunchPlanRepositoryAdapter();
+    expect((await memory.save(plan)).outcome).toBe('saved');
+    const held = (
+      memory as unknown as { inMemoryPlans: Map<string, RelaunchPlanRecord> }
+    ).inMemoryPlans.get(plan.planDigest) as RelaunchPlanRecord;
+    (held.lanes[1] as { admissionWave: number }).admissionWave = 2;
+    expect(await memory.findByDigest(plan.planDigest)).toEqual({ outcome: 'absent' });
+  });
+
+  it('hands out copies, so mutating a returned plan never changes the stored one', async () => {
+    const adapter = new RelaunchPlanRepositoryAdapter();
+    const plan = makePlan();
+    const saved = await adapter.save(plan);
+    if (saved.outcome !== 'saved') throw new Error('expected saved');
+    (saved.plan.lanes[0].steps[0] as { idempotencyKey: string }).idempotencyKey = 'mutated';
+    const found = await adapter.findByDigest(plan.planDigest);
+    if (found.outcome !== 'found') throw new Error('expected found');
+    expect(found.plan.lanes[0].steps[0].idempotencyKey).toBe(relaunchStepKey(plan.planDigest, 'lane-a', 'save'));
+
+    const replay = await adapter.save(plan);
+    if (replay.outcome !== 'unchanged') throw new Error('expected unchanged');
+    expect(replay.plan.lanes[0]).toEqual(found.plan.lanes[0]);
+    (replay.plan.lanes[0].steps[0] as { idempotencyKey: string }).idempotencyKey = 'mutated-again';
+    expect((await adapter.findByDigest(plan.planDigest)).outcome === 'found');
+    const after = await adapter.findByDigest(plan.planDigest);
+    if (after.outcome !== 'found') throw new Error('expected found');
+    expect(after.plan.lanes[0].steps[0].idempotencyKey).toBe(relaunchStepKey(plan.planDigest, 'lane-a', 'save'));
+  });
+
   it('writes ids, digests and codes only', async () => {
     const dir = await tempDir();
     await new RelaunchPlanRepositoryAdapter({ stateDir: dir }).save(makePlan());

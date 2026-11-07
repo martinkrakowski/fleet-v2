@@ -33,6 +33,8 @@ import { resolveE2eDir, startE2eFixture, type E2eFixture } from './fixture.js';
 const ID_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 const WORK_ORDER_ID = 'wo-example-1';
 const WORK_ORDER_ID2 = 'wo-example-2';
+/** PT1ca: work orders name the forge coordinates (owner/repo of the installation's forge), which the open-PR overlap check parses. */
+export const FORGE_REPOSITORY = 'example-owner/example-repo';
 const PROJECT_ID = 'project-example-1';
 const TASK_ID = 'task-example-1';
 const TASK_ID2 = 'task-example-2';
@@ -198,6 +200,14 @@ export interface ConductedFixture extends E2eFixture {
    * merged it). Later `pr view` reads answer MERGED at the worktree head.
    */
   readonly markPullRequestMerged: () => Promise<void>;
+  /**
+   * PT1ca: set the fake forge's open pull requests (number to changed file
+   * paths). The fixture starts with none; registration reads this list through
+   * the production forge read port.
+   */
+  readonly setOpenPullRequests: (pullRequests: Readonly<Record<number, readonly string[]>>) => void;
+  /** PT1ca: run one CLI command (e.g. `work-order held`) over the current runtime. */
+  readonly runCommand: (argv: readonly string[]) => Promise<CliRunResult>;
   /**
    * KS7b: rewrite the merge queue's one entry for this run as the daemon's merge
    * pass would leave it: `merged`, or `dropped` / `parked` with a reason.
@@ -536,13 +546,43 @@ function makeForgeGhRunner(
     readonly ciChecksPending?: boolean;
     /** KS7b: once this file exists, `pr view` answers the PR as merged. */
     readonly prMergedMarkerFile?: string;
+    /**
+     * PT1ca: the fake forge's open pull requests against the base branch, as
+     * number to changed file paths. EMPTY by default; registration still reads
+     * it through the production ForgeReadAdapter (list + changed files), so
+     * the overlap check is never skipped.
+     */
+    readonly openPullRequests?: Map<number, readonly string[]>;
   } = {},
 ) {
   const calls: string[][] = [];
+  const openPullRequests = options.openPullRequests ?? new Map<number, readonly string[]>();
   const flipToOpen = options.prViewOpenAfterCreate === true && options.prCreateMarkerFile !== undefined;
   let postCreateReads = 0;
   const forgeGhRunner = async (args: readonly string[]) => {
     calls.push([...args]);
+    // PT1ca: the open-PR list read (`gh api --paginate .../pulls?state=open&base=... --jq ...`),
+    // one jq-shaped JSON object per line, as the adapter parses it.
+    if (
+      args[0] === 'api' &&
+      args[1] === '--paginate' &&
+      typeof args[2] === 'string' &&
+      args[2].includes('/pulls?state=open')
+    ) {
+      const stdout = [...openPullRequests.keys()]
+        .map((number) => JSON.stringify({ number, head: { sha: 'f'.repeat(40) }, base: { ref: 'main' } }))
+        .join('\n');
+      return { exitCode: 0, stdout, stderr: '' };
+    }
+    // PT1ca: one open PR's changed files (`gh pr view N --json files,changedFiles`).
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('files,changedFiles')) {
+      const paths = openPullRequests.get(Number(args[2])) ?? [];
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ files: paths.map((file) => ({ path: file })), changedFiles: paths.length }),
+        stderr: '',
+      };
+    }
     if (args[0] === 'pr' && args[1] === 'view') {
       if (flipToOpen && !existsSync(options.prCreateMarkerFile!)) {
         return {
@@ -864,12 +904,14 @@ export async function startConductedFixture(
     const attemptId2 = 'attempt-' + idChars(97202611, 26);
 
     // --- runtime ----------------------------------------------------------
+    const openPullRequests = new Map<number, readonly string[]>();
     const gh = makeForgeGhRunner(() => readWorktreeHead(worktreeRoot, baseCommit), `fleet/${runId}`, {
       ...(options?.prViewOpenAfterCreate === true
         ? { prViewOpenAfterCreate: true, prCreateMarkerFile: ghPrCreateMarker }
         : {}),
       ...(options?.ciChecksPending === true ? { ciChecksPending: true } : {}),
       prMergedMarkerFile: prMergedMarker,
+      openPullRequests,
     });
     const review = makeReviewSpawn(options?.reviewVerdicts ?? []);
     const buildRuntime = (installationForRuntime: FleetInstallationV2): FleetCliRuntime => {
@@ -921,7 +963,7 @@ export async function startConductedFixture(
       projectId: PROJECT_ID,
       taskId: TASK_ID,
       laneId: LANE_ID,
-      repository: bareRepo,
+      repository: FORGE_REPOSITORY,
       baseCommit,
       policyRevision: POLICY_REVISION,
       ownedPaths: ['packages/example'],
@@ -935,7 +977,7 @@ export async function startConductedFixture(
         projectId: PROJECT_ID,
         taskId: TASK_ID2,
         laneId: LANE_ID2,
-        repository: bareRepo,
+        repository: FORGE_REPOSITORY,
         baseCommit,
         policyRevision: POLICY_REVISION,
         ownedPaths: ['packages/second'],
@@ -1197,6 +1239,29 @@ export async function startConductedFixture(
       failedBriefPath = briefPath;
     };
 
+    const setOpenPullRequests: ConductedFixture['setOpenPullRequests'] = (pullRequests) => {
+      openPullRequests.clear();
+      for (const [number, files] of Object.entries(pullRequests)) {
+        openPullRequests.set(Number(number), files);
+      }
+    };
+
+    const runCommand = async (argv: readonly string[]): Promise<CliRunResult> => {
+      const code = await runCli(
+        [...argv],
+        io,
+        currentRuntime,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { stateDir: e2e.stateDir },
+      );
+      return { code, ...takeOutput() };
+    };
+
     const markPullRequestMerged = async (): Promise<void> => {
       await fs.writeFile(prMergedMarker, 'merged\n', 'utf8');
     };
@@ -1257,6 +1322,8 @@ export async function startConductedFixture(
       recordAcceptanceReceipts,
       makeFixPlacementFail,
       markPullRequestMerged,
+      setOpenPullRequests,
+      runCommand,
       settleQueueEntry,
       rebuildRuntime,
       stop,

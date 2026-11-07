@@ -262,6 +262,9 @@ async function recordGateReceiptsGuarded(
         ...(commandResults[index]!.coverage !== undefined
           ? { coverage: commandResults[index]!.coverage }
           : {}),
+        ...(commandResults[index]!.failingFile !== undefined
+          ? { failingFile: commandResults[index]!.failingFile }
+          : {}),
       })),
     });
   // A recorded answer counts only when every check got its receipt.

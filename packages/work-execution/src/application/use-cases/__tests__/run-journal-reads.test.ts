@@ -353,6 +353,8 @@ describe('LaneRunBoardReads.readBoard', () => {
       parkedFrom: 'running',
       questionId: '01JB0000000000000000000009',
       findingCount: 1,
+      // A record written before PT1a has no stored class and reads as `other`.
+      class: 'other',
     });
     // No finding filePath or summary crosses the wire.
     expect(JSON.stringify(result)).not.toContain('packages/a/x.ts');

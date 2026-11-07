@@ -853,4 +853,193 @@ describe('ReconcileOrchestratorRequestUseCase', () => {
       expect(stored.request.reason?.reasonKind).toBe('seat-unavailable');
     }
   });
+
+  it('a journal result exists, the claim is swept to queued, reconcile runs -> the request is terminal with the recorded result', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    env.journal.entries.push({
+      version: 1,
+      entryId: '01JB0000000000000000000010',
+      kind: 'result',
+      key: `request/${ID}`,
+      outcome: 'completed',
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: 'attempt-recovered-queued-1',
+    });
+
+    // Advance clock past claim lease and sweep the claim to queued
+    env.clock.set('2026-10-27T10:03:00.000Z');
+    const loaded = await env.requestRepo.get(ID);
+    expect(loaded.outcome).toBe('found');
+    if (loaded.outcome === 'found') {
+      const entity = OrchestratorRequest.create(loaded.request);
+      expect(entity.success).toBe(true);
+      if (entity.success) {
+        const swept = entity.value.expireLapsedClaim('2026-10-27T10:03:00.000Z');
+        expect(swept.success).toBe(true);
+        if (swept.success) {
+          expect(swept.value.getState()).toBe('queued');
+          expect(swept.value.toRecord().claim).toBeNull();
+          await env.requestRepo.save(swept.value.toRecord(), loaded.request.revision);
+        }
+      }
+    }
+
+    const result = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 3 });
+    expect(result).toEqual({ outcome: 'already-dispatched', requestId: ID });
+
+    const stored = await env.requestRepo.get(ID);
+    expect(stored.outcome).toBe('found');
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('dispatched');
+      expect(stored.request.linked).toEqual({
+        attemptId: 'attempt-recovered-queued-1',
+        journalKey: `request/${ID}`,
+      });
+    }
+  });
+
+  it('a journal result exists, the claim is swept to stalled, reconcile runs -> the request is terminal with the recorded result', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    // Claim 1
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    // Advance clock and sweep claim 1 to queued (claimCount = 1, fence = 1)
+    env.clock.set('2026-10-27T10:02:15.000Z');
+    const loaded1 = await env.requestRepo.get(ID);
+    expect(loaded1.outcome).toBe('found');
+    if (loaded1.outcome === 'found') {
+      const entity1 = OrchestratorRequest.create(loaded1.request);
+      expect(entity1.success).toBe(true);
+      if (entity1.success) {
+        const swept1 = entity1.value.expireLapsedClaim('2026-10-27T10:02:15.000Z');
+        expect(swept1.success).toBe(true);
+        if (swept1.success) {
+          expect(swept1.value.getState()).toBe('queued');
+          await env.requestRepo.save(swept1.value.toRecord(), loaded1.request.revision);
+        }
+      }
+    }
+
+    // Advance clock slightly and claim a second time (claimCount = 1, fence = 2, revision = 4, lease until 10:04:20)
+    env.clock.set('2026-10-27T10:02:20.000Z');
+    const claim2 = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 3 });
+    expect(claim2.outcome).toBe('reconcile');
+
+    // Advance clock past claim 2's lease (10:04:20) but before session lease (10:05:00)
+    env.clock.set('2026-10-27T10:04:30.000Z');
+    const loaded2 = await env.requestRepo.get(ID);
+    expect(loaded2.outcome).toBe('found');
+    if (loaded2.outcome === 'found') {
+      const entity2 = OrchestratorRequest.create(loaded2.request);
+      expect(entity2.success).toBe(true);
+      if (entity2.success) {
+        const swept2 = entity2.value.expireLapsedClaim('2026-10-27T10:04:30.000Z');
+        expect(swept2.success).toBe(true);
+        if (swept2.success) {
+          expect(swept2.value.getState()).toBe('stalled');
+          expect(swept2.value.toRecord().claim).toBeNull();
+          await env.requestRepo.save(swept2.value.toRecord(), loaded2.request.revision);
+        }
+      }
+    }
+
+    env.journal.entries.push({
+      version: 1,
+      entryId: '01JB0000000000000000000011',
+      kind: 'result',
+      key: `request/${ID}`,
+      outcome: 'refused',
+      reasonCode: 'busy',
+      reasonKind: 'seat-unavailable',
+      linkedId: null,
+    });
+
+    const result = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 5 });
+    expect(result).toEqual({ outcome: 'already-refused', requestId: ID });
+
+    const stored = await env.requestRepo.get(ID);
+    expect(stored.outcome).toBe('found');
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('refused');
+      expect(stored.request.reason?.reasonKind).toBe('seat-unavailable');
+    }
+  });
+
+  it('record-result succeeds, then the same call is retried -> unchanged', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    const recordCall = {
+      requestId: ID,
+      orchestratorId: ORCH,
+      expectedRevision: 2,
+      fence: 1,
+      outcome: 'completed' as const,
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: 'attempt-success-1',
+    };
+
+    const first = await env.useCase.execute('record-result', recordCall);
+    expect(first).toEqual({ outcome: 'result-recorded', requestId: ID });
+
+    // Request is now terminal ('dispatched')
+    const stored = await env.requestRepo.get(ID);
+    expect(stored.outcome).toBe('found');
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('dispatched');
+    }
+
+    // Retrying the exact same call answers unchanged
+    const retried = await env.useCase.execute('record-result', recordCall);
+    expect(retried).toEqual({ outcome: 'unchanged', requestId: ID });
+  });
+
+  it('retried with a DIFFERENT result -> a typed conflict, never unchanged', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    const recordCall = {
+      requestId: ID,
+      orchestratorId: ORCH,
+      expectedRevision: 2,
+      fence: 1,
+      outcome: 'completed' as const,
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: 'attempt-success-1',
+    };
+
+    const first = await env.useCase.execute('record-result', recordCall);
+    expect(first).toEqual({ outcome: 'result-recorded', requestId: ID });
+
+    // Retrying with a different outcome/result is a typed conflict ('result-after-final'), never unchanged
+    const retriedDifferent = await env.useCase.execute('record-result', {
+      ...recordCall,
+      outcome: 'refused',
+      reasonCode: 'busy',
+      reasonKind: 'seat-unavailable',
+      linkedId: null,
+    });
+    expect(retriedDifferent).toEqual({
+      outcome: 'refused',
+      code: 'result-after-final',
+      requestId: ID,
+    });
+  });
 });

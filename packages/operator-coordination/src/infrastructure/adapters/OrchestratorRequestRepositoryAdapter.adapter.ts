@@ -779,7 +779,14 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
       return { action: 'write' };
     }
     if ((ORCHESTRATOR_REQUEST_TERMINAL_STATES as readonly string[]).includes(existing.state)) {
-      return { action: 'refused', code: 'terminal-state' };
+      if (
+        existing.state === 'stalled' &&
+        (validated.state === 'dispatched' || validated.state === 'refused')
+      ) {
+        // A recorded result can reconcile a swept claim that reached stalled state.
+      } else {
+        return { action: 'refused', code: 'terminal-state' };
+      }
     }
     if (
       existing.kind !== validated.kind ||

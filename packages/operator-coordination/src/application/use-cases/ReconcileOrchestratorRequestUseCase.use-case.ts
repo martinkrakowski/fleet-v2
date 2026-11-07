@@ -307,7 +307,7 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
       if (record.state === 'refused') {
         return { outcome: 'already-refused', requestId };
       }
-      const reconciled = await this.reconcileFinalTransition(record, finalResult, requestId);
+      const reconciled = await this.reconcileFinalTransition(record, finalResult, requestId, intent.digest);
       if (!reconciled.ok) {
         return reconciled.result;
       }
@@ -520,11 +520,6 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
       return refused('policy', requestId);
     }
 
-    const holder = this.holderCheck(record, orchestratorId, expectedRevision, fence, requestId);
-    if (!holder.ok) {
-      return holder.result;
-    }
-
     const journalRead = await deps.journal.read(JOURNAL_KEY_PREFIX + requestId);
     if (journalRead.outcome === 'unknown') {
       return unknown('unreadable-journal', requestId);
@@ -552,16 +547,11 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
           // A retry may carry a different link id or reason kind than the
           // result that was recorded; the journal fields are the only ones
           // recovery may apply (fix round 2, item 1).
-          const applied = await this.applyResultTransition(
+          const applied = await this.reconcileFinalTransition(
             record,
-            { orchestratorId, expectedRevision, fence },
-            {
-              outcome: finalResult.outcome as 'completed' | 'refused',
-              reasonCode: finalResult.reasonCode,
-              reasonKind: finalResult.reasonKind,
-              linkedId: finalResult.linkedId,
-            },
+            finalResult,
             requestId,
+            intent.digest,
           );
           if (!applied.ok) {
             return applied.result;
@@ -570,6 +560,11 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
         return { outcome: 'unchanged', requestId };
       }
       return refused('result-after-final', requestId);
+    }
+
+    const holder = this.holderCheck(record, orchestratorId, expectedRevision, fence, requestId);
+    if (!holder.ok) {
+      return holder.result;
     }
 
     const appended = await deps.journal.appendResult(JOURNAL_KEY_PREFIX + requestId, {
@@ -681,24 +676,16 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
     record: OrchestratorRequestRecord,
     finalResult: OrchestratorRequestJournalEntry,
     requestId: string,
+    intentDigest: string,
   ): Promise<
     | { ok: true; outcome: 'already-dispatched' | 'already-refused' }
     | { ok: false; result: ReconcileOrchestratorRequestResult }
   > {
-    const claim = record.claim;
-    if (claim === null) {
-      return { ok: false, result: unknown('digest-failed', requestId) };
-    }
     const entityResult = OrchestratorRequest.create(record);
     if (!entityResult.success) {
       return { ok: false, result: unknown('unreadable-request', requestId) };
     }
-    const holder = {
-      orchestratorId: claim.orchestratorId,
-      fence: claim.fence,
-      expectedRevision: record.revision,
-    };
-    let transition: OrchestratorRequestResult;
+    let resultPayload: Record<string, unknown>;
     if (finalResult.outcome === 'refused') {
       // The recorded reason kind is the only one recovery may apply: the
       // journal result's reason code is a token, not a reason kind, and
@@ -707,12 +694,10 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
       if (finalResult.reasonKind === null) {
         return { ok: false, result: unknown('digest-failed', requestId) };
       }
-      transition = entityResult.value.refuse(
-        holder,
-        { reasonKind: finalResult.reasonKind, detail: null },
-        this.nowIso(),
-        true, // the recorded result is authoritative even after the lease lapsed
-      );
+      resultPayload = {
+        outcome: 'refused',
+        reason: { reasonKind: finalResult.reasonKind, detail: null },
+      };
     } else {
       // The recorded link id is the only one recovery may apply: the request
       // target names the *requested* object, not the id the action minted
@@ -724,13 +709,16 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
         return { ok: false, result: unknown('digest-failed', requestId) };
       }
       const linkKey = ORCHESTRATOR_REQUEST_LINK_KEY[record.kind];
-      transition = entityResult.value.complete(
-        holder,
-        { [linkKey]: linkValue, journalKey: JOURNAL_KEY_PREFIX + requestId },
-        this.nowIso(),
-        true, // the recorded result is authoritative even after the lease lapsed
-      );
+      resultPayload = {
+        outcome: 'completed',
+        linked: { [linkKey]: linkValue, journalKey: JOURNAL_KEY_PREFIX + requestId },
+      };
     }
+    const transition = entityResult.value.applyRecordedResult(
+      resultPayload,
+      { requestId, fence: record.fence, digest: intentDigest },
+      this.nowIso(),
+    );
     if (!transition.success) {
       return { ok: false, result: this.mapTransitionRefusal(transition.code, requestId) };
     }

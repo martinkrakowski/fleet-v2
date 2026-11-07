@@ -469,6 +469,8 @@ describe('relaunch plan (production composition)', () => {
   // - conductor-halt.json: the inventory answers unknown (halt-unreadable); the plan is unknown, nothing stored.
   // - conductor-driver-lease.json: the read-only lease read throws the typed unreadable error; the
   //   inventory answers unknown (lease-unreadable) and the plan is unknown, nothing stored.
+  // - lane-plans.json: only the plan reads it; the inventory still answers inventoried, the plan is
+  //   unknown, nothing stored.
   interface InventoryAnswer {
     readonly outcome?: string;
     readonly conductor?: { readonly halted?: boolean; readonly driverLease?: string };
@@ -484,6 +486,7 @@ describe('relaunch plan (production composition)', () => {
     { file: 'project-profiles.json', inventory: (a, code) => code !== 0 && a.outcome !== 'inventoried', planOutcome: 'unknown' },
     { file: 'conductor-halt.json', inventory: (a, code) => code !== 0 && a.outcome === 'unknown', planOutcome: 'unknown' },
     { file: 'conductor-driver-lease.json', inventory: (a, code) => code !== 0 && a.outcome === 'unknown', planOutcome: 'unknown' },
+    { file: 'lane-plans.json', inventory: (a, code) => a.outcome === 'inventoried' && code === 0, planOutcome: 'unknown' },
   ];
 
   it.each(unreadableCases)(

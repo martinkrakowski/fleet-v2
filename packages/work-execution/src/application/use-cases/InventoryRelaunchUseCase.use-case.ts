@@ -153,16 +153,13 @@ function increment(counts: Map<string, number>, key: string, by = 1): void {
 }
 
 /**
- * The typed unreadable state-file errors, recognised by their stable `name`
- * so the application layer stays free of infrastructure imports. A read-only
- * store read throws `StateFileUnreadableReadOnlyError`; a writable one throws
- * `StateFileUnreadableError` after quarantining.
+ * Genuine absence (ENOENT) is known absence, not an unreadable file: the halt
+ * marker and driver lease adapters return their own absence values for a
+ * missing file, so an ENOENT escaping a read is treated the same way. Any
+ * other read failure (EACCES, EIO, EISDIR, …) means the state cannot be told.
  */
-function isUnreadableStateError(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    (error.name === 'StateFileUnreadableError' || error.name === 'StateFileUnreadableReadOnlyError')
-  );
+function isEnoent(error: unknown): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT';
 }
 
 /** The listing facts of the requested clones, per host. */
@@ -530,8 +527,15 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
         halted = isConductorHalted(state);
         if (state.state === 'unreadable') unknownReasons.push('halt-unreadable');
       }
-    } catch {
-      halted = true;
+    } catch (error: unknown) {
+      // CO29a-ro2: any read failure other than genuine absence (ENOENT, a
+      // missing marker) means the halt state cannot be told, so the whole
+      // inventory answers `unknown`; it is never guessed as halted.
+      if (isEnoent(error)) {
+        halted = false;
+      } else {
+        unknownReasons.push('halt-unreadable');
+      }
     }
     let driverLease: RelaunchConductorStatus['driverLease'] = 'unknown';
     try {
@@ -540,8 +544,16 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
         driverLease = lease === null ? 'absent' : isLeaseLapsed(lease, nowIso) ? 'lapsed' : 'live';
       }
     } catch (error: unknown) {
-      driverLease = 'unknown';
-      if (isUnreadableStateError(error)) unknownReasons.push('lease-unreadable');
+      // CO29a-ro2: any read failure other than genuine absence (ENOENT, a
+      // missing lease file) means the lease state cannot be told, so the
+      // whole inventory answers `unknown`; it is never left `inventoried`
+      // with only the lease flagged.
+      if (isEnoent(error)) {
+        driverLease = 'absent';
+      } else {
+        driverLease = 'unknown';
+        unknownReasons.push('lease-unreadable');
+      }
     }
     return { conductor: { halted, driverLease, runCount }, unknownReasons };
   }

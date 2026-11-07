@@ -71,7 +71,7 @@ function makeAssessment(withReceipt: boolean): EvidenceAssessmentRecord {
 }
 
 describe('conductor review transport diagnostic archive wiring (RV4)', () => {
-  it('the composed review-request adapter archives a screened seat-busy diagnostic under the request id', async () => {
+  it('transport error archive redacts secrets and paths: the composed review-request adapter archives a screened seat-busy diagnostic under the request id', async () => {
     // The production path: composeConductor builds ReviewRequestAdapter over
     // the runtime's evidence context, with archiveEvidence bound to the real
     // EvidenceArchiveAdapter. Only the review transport use case is replaced

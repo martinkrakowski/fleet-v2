@@ -61,6 +61,9 @@ import {
   InspectMergeReadinessUseCase,
   InspectWorkOrderUseCase,
   InventoryRelaunchUseCase,
+  PlanRelaunchUseCase,
+  RelaunchPlanRepositoryAdapter,
+  type LanePlanRepositoryAdapter,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
   OpencodeApiUsageAdapter,
@@ -779,6 +782,12 @@ export interface FleetCliRuntime {
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
     /** CO26: the read-only relaunch inventory per lane host. */
     readonly inventoryRelaunch: InventoryRelaunchUseCase;
+    /** CO29a: the lane-plan store (shared with `planRelaunch`). */
+    readonly lanePlanRepository: LanePlanRepositoryAdapter;
+    /** CO29a: the immutable relaunch plan store, keyed by canonical plan digest. */
+    readonly relaunchPlanRepository: RelaunchPlanRepositoryAdapter;
+    /** CO29a: build and store the ordered relaunch plan (read-only over the inventory and records). */
+    readonly planRelaunch: PlanRelaunchUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -1131,6 +1140,20 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     computeDigest: sha256HexDigest,
   });
 
+  // CO29a: the ordered relaunch plan reads the inventory and the same record
+  // stores, and stores one immutable plan by digest (relaunch-plans.json).
+  const relaunchPlanRepository = new RelaunchPlanRepositoryAdapter({ stateDir });
+  const planRelaunch = new PlanRelaunchUseCase({
+    inventory: inventoryRelaunch,
+    runRepo: conductor.laneRunRepository,
+    attemptRepo: attemptRepository,
+    workOrderRepo: workOrderRepository,
+    lanePlanRepo: execution.lanePlanRepository,
+    planRepo: relaunchPlanRepository,
+    computeDigest: sha256HexDigest,
+    clock: () => new Date().toISOString(),
+  });
+
   const { telemetry } = composeTelemetry({
     stateDir,
     policy: resolveTelemetryPolicy(options?.installation?.policy),
@@ -1195,7 +1218,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     coordination,
     knowledge,
     evidence,
-    execution: { ...execution, closeWorkOrder, listStaleWorkOrders, inspectMergeReadiness, inventoryRelaunch },
+    execution: {
+      ...execution,
+      closeWorkOrder,
+      listStaleWorkOrders,
+      inspectMergeReadiness,
+      inventoryRelaunch,
+      relaunchPlanRepository,
+      planRelaunch,
+    },
     conductor,
     runnerTunnel,
     telemetry,

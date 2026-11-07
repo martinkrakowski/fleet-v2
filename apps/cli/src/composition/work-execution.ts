@@ -554,6 +554,8 @@ export function composeExecution(input: ComposeExecutionInput) {
     attemptRepository,
     executionJournal,
     mergeRecordRepository,
+    // CO29a: the relaunch plan reads the lane-plan store the work-board import writes.
+    lanePlanRepository,
     workspace,
     runner,
     runnerForAttempt,

@@ -335,6 +335,23 @@ describe('RegisterWorkOrderUseCase active work-order overlap', () => {
     });
   });
 
+  it('holds an overlapping registration when the active blocker id contains @ (wo@block)', async () => {
+    const state = setup();
+    expect(
+      await state.useCase.registerWorkOrder(request({ workOrderId: 'wo@block', ownedPaths: ['packages/a/src/x.ts'] })),
+    ).toMatchObject({ outcome: 'registered' });
+    const refused = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', ownedPaths: ['packages/a/src/x.ts'] }),
+    );
+    expect(refused).toMatchObject({
+      outcome: 'refused',
+      reason: 'active-work-order-overlap',
+      blockerKind: 'active-work-order',
+      blockerId: 'wo@block',
+      held: true,
+    });
+  });
+
   it('is held: false without a held store', async () => {
     const workOrderRepo = new WorkOrderRepositoryAdapter();
     const useCase = new RegisterWorkOrderUseCase({ workOrderRepo });
@@ -466,8 +483,8 @@ describe('RegisterWorkOrderUseCase total input validation', () => {
       reason: 'Missing required work order fields: taskId',
     });
     expect(await useCase.registerWorkOrder(request({ risk: 'low' as never }))).toEqual({
-      outcome: 'rejected',
-      reason: "Work order risk must be 'standard' or 'high'",
+      outcome: 'refused',
+      reason: 'invalid-request',
     });
     expect(await useCase.registerWorkOrder(request({ baseBranch: 'release' }))).toEqual({
       outcome: 'rejected',

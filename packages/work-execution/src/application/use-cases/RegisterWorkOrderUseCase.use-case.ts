@@ -26,6 +26,7 @@ import {
 } from '../../domain/base-branch.js';
 import {
   HOLD_INTENT_ID_PATTERN,
+  ID_TOKEN_PATTERN,
   MAX_OPEN_PRS_FOR_OVERLAP_CHECK,
   MAX_OWNED_PATHS,
   MAX_PREREQUISITE_WORK_ORDER_IDS,
@@ -99,7 +100,6 @@ const MAX_OVERLAP_CHECK_BUDGET_MS = 120_000;
 const MAX_ID_LENGTH = 128;
 const MAX_REPOSITORY_LENGTH = 256;
 const MAX_TIMESTAMP_LENGTH = 64;
-const ID_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
 
 const REQUEST_KEYS: readonly string[] = [
   'workOrderId',
@@ -335,7 +335,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     const risk =
       request.risk === undefined ? DEFAULT_WORK_ORDER_RISK : parseWorkOrderRisk(request.risk);
     if (risk === undefined) {
-      return { outcome: 'rejected', reason: "Work order risk must be 'standard' or 'high'" };
+      return INVALID_REQUEST;
     }
 
     // CB1: the base branch is decided before any store access; an unparsable

@@ -29,6 +29,7 @@ export const MAX_PULL_REQUEST_NUMBER = 999_999_999;
 /** An id or digest token only: rejects `/`, `\`, spaces, `.` and `..` by construction of the first character. */
 export const BRIEF_REQUEST_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 export const HOLD_INTENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+export const ID_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
 export const PATH_CODE_PATTERN = /^path-[0-9a-f]{12}$/;
 export const HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -481,7 +482,7 @@ function readHeldRequest(value: unknown): HeldWorkOrderRequestSnapshot | null {
 
 function isValidBlocker(kind: unknown, id: unknown): kind is OverlapBlockerKind {
   if (kind === 'active-work-order') {
-    return isBoundedPlainString(id, MAX_HELD_ID_LENGTH) && BRIEF_REQUEST_REF_PATTERN.test(id);
+    return isBoundedPlainString(id, MAX_HELD_ID_LENGTH) && ID_TOKEN_PATTERN.test(id);
   }
   if (kind === 'open-pr') {
     if (typeof id !== 'string' || !/^[1-9][0-9]{0,8}$/.test(id)) {

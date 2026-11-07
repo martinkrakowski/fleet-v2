@@ -755,6 +755,7 @@ describe('Fleet CLI workflow', () => {
         expectedHeadSha: laneHead,
         proposalDigest: `merge ${ATTEMPT_ID} at ${laneHead}`,
         policyRevision: POLICY_REVISION,
+        attemptId: ATTEMPT_ID,
       }),
     ]);
     expect(decision.code).toBe(0);
@@ -913,6 +914,7 @@ describe('Fleet CLI workflow', () => {
         expectedHeadSha: laneHead,
         proposalDigest: `open a pull request for ${ATTEMPT_ID}`,
         policyRevision: POLICY_REVISION,
+        attemptId: ATTEMPT_ID,
       }),
     ]);
     expect(decision.code).toBe(0);
@@ -1872,6 +1874,7 @@ describe('Fleet CLI workflow', () => {
         expectedHeadSha: mpLaneHead,
         proposalDigest: `merge ${mpAttemptId} at ${mpLaneHead}`,
         policyRevision: POLICY_REVISION,
+        attemptId: mpAttemptId,
       }),
     ]);
     expect(decision.code).toBe(0);

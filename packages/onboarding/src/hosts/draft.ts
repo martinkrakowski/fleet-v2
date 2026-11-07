@@ -516,7 +516,10 @@ export function planHostRename(
     return { ok: false, reason: 'not-v2' };
   }
   const hosts = record.hosts;
-  if (hosts === null || typeof hosts !== 'object' || Array.isArray(hosts)) {
+  // `hosts` must be a plain object too: a class instance carries behaviour a
+  // rename must not inherit, and its own entries are refused with the root
+  // (HN1 fix round 2).
+  if (!isPlainObject(hosts)) {
     return { ok: false, reason: 'hosts-not-object' };
   }
   const hostsRecord = hosts as Record<string, unknown>;

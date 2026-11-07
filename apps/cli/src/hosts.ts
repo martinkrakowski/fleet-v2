@@ -345,12 +345,17 @@ export async function readInstallationState(file: string): Promise<InstallationS
       };
 }
 
-export function printErrors(io: CliIo, errors: readonly string[]): void {
+export function printErrors(
+  io: CliIo,
+  errors: readonly string[],
+  keys: readonly string[] = [],
+): void {
   for (const error of errors) {
     // Every line is screened again here, however its producer built it: a
-    // line carrying secret-shaped text is withheld whole (HN1 fix round 1,
-    // finding 1).
-    io.stderr(`${screenErrorLine(error)}\n`);
+    // line carrying secret-shaped text is withheld whole, and a known host
+    // key — including a long opaque token run — is replaced by its screened
+    // code (HN1 fix round 2, finding 1).
+    io.stderr(`${screenHostsLine(error, keys)}\n`);
   }
 }
 
@@ -545,6 +550,17 @@ function screenHostKeysIn(
   return screened;
 }
 
+/**
+ * The ONE screen every line the hosts command prints passes, on stdout and
+ * stderr alike: every known host key is replaced by its screened code — which
+ * withholds a secret-shaped key and a long opaque token run alike — and any
+ * residual secret-shaped text withholds the whole line (HN1 fix round 2,
+ * finding 1). A line carrying no known key is still screened for secrets.
+ */
+function screenHostsLine(line: string, keys: readonly string[]): string {
+  return screenErrorLine(screenHostKeysIn(line, keys));
+}
+
 /** Diff the file as it sits against the candidate as the write would put it. */
 export function printDiff(
   io: CliIo,
@@ -562,14 +578,14 @@ export function printDiff(
     return;
   }
   // Every host key on either side is screened the same way, for edit and for
-  // remove alike, and each line passes the error-line screen (HN1 fix round
-  // 1, finding 2).
+  // remove alike, and each line passes the one hosts screen (HN1 fix round
+  // 1, finding 2; round 2, finding 1).
   const keys = [
     ...new Set([...Object.keys(candidate.hosts), ...currentHostKeys(currentText)]),
   ];
-  const screened = screenHostKeysIn(diff, keys)
+  const screened = diff
     .split("\n")
-    .map(screenErrorLine)
+    .map((line) => screenHostsLine(line, keys))
     .join("\n");
   io.stdout(`${screened}\n`);
 }
@@ -756,7 +772,13 @@ async function writeHost(
   };
   const drafted = draftHost(input);
   if (!drafted.ok) {
-    printErrors(io, drafted.errors);
+    // The draft errors name the host being drafted; its key is screened here
+    // too, so a key the screen withholds (secret-shaped or a long opaque
+    // token run) never reaches the operator (HN1 fix round 2, finding 1).
+    printErrors(io, drafted.errors, [
+      name,
+      ...currentHostKeys(state.read.status === "read" ? state.read.text : ""),
+    ]);
     return 1;
   }
   const draft = drafted.draft;
@@ -777,7 +799,21 @@ async function writeHost(
   const validated = validateHostDraft(current, draft, mode);
   if (!validated.ok) {
     io.stderr("the loader refuses this change:\n");
-    printErrors(io, validated.errors);
+    printErrors(
+      io,
+      validated.errors,
+      validated.candidate === undefined
+        ? [name]
+        : [
+            ...new Set([
+              ...Object.keys(validated.candidate.hosts),
+              name,
+              ...currentHostKeys(
+                state.read.status === "read" ? state.read.text : "",
+              ),
+            ]),
+          ],
+    );
     if (validated.candidate !== undefined) {
       printDiff(
         io,
@@ -817,7 +853,7 @@ async function writeHost(
   for (const line of lines) {
     // The probe lines name the host; a key the screen withholds is never
     // echoed (HN1 fix round 1, finding 1).
-    io.stdout(`${screenHostKeysIn(formatDoctorLine(line), [name])}\n`);
+    io.stdout(`${screenHostsLine(formatDoctorLine(line), [name])}\n`);
   }
   if (hostProbesHaveFailure(lines)) {
     io.stderr("refused: a probe reported FAIL; nothing was written\n");
@@ -925,19 +961,25 @@ async function removeHost(
   );
   if (liveAttempts.length > 0) {
     for (const attempt of liveAttempts) {
-      io.stderr(`attempt ${attempt.id} is ${attempt.state} on ${screenHostKey(name)}\n`);
+      io.stderr(
+        `${screenHostsLine(`attempt ${attempt.id} is ${attempt.state} on ${name}`, [name])}\n`,
+      );
     }
-    io.stderr(`hosts.${screenHostKey(name)} has live work; nothing was removed\n`);
+    io.stderr(
+      `${screenHostsLine(`hosts.${name} has live work; nothing was removed`, [name])}\n`,
+    );
     return 1;
   }
   const reservations = await journal.listActiveReservations(name);
   if (reservations.length > 0) {
     for (const reservation of reservations) {
       io.stderr(
-        `reservation ${reservation.id} holds a slot for attempt ${reservation.attemptId} on ${screenHostKey(name)}\n`,
+        `${screenHostsLine(`reservation ${reservation.id} holds a slot for attempt ${reservation.attemptId} on ${name}`, [name])}\n`,
       );
     }
-    io.stderr(`hosts.${screenHostKey(name)} has live work; nothing was removed\n`);
+    io.stderr(
+      `${screenHostsLine(`hosts.${name} has live work; nothing was removed`, [name])}\n`,
+    );
     return 1;
   }
 
@@ -1026,7 +1068,9 @@ async function renameHost(
   }
   const planned = planHostRename(read.value, oldName, newName);
   if (!planned.ok) {
-    io.stderr(`${renameRefusalLine(planned.reason)}\n`);
+    io.stderr(
+      `${screenHostsLine(renameRefusalLine(planned.reason), [oldName])}\n`,
+    );
     return 1;
   }
   const screened = `host:${sha256Of(oldName).slice(0, 12)}`;
@@ -1083,9 +1127,11 @@ async function listHosts(file: string, io: CliIo): Promise<number> {
   for (const name of names) {
     const host = hosts[name];
     const parts = [
-      // A key the screen withholds is never echoed, even from a file that
-      // parsed (HN1 fix round 1, finding 1).
-      screenHostKey(name),
+      // Every line passes the one hosts screen: the raw key is replaced by
+      // its screened code there, so a secret-shaped key or a long opaque
+      // token run is never echoed, even from a file that parsed (HN1 fix
+      // round 1, finding 1; round 2, finding 1).
+      name,
       host.transport,
       ...(host.sshAlias !== undefined ? [`alias ${host.sshAlias}`] : []),
       `roles: ${host.roles.join(", ")}`,
@@ -1095,7 +1141,7 @@ async function listHosts(file: string, io: CliIo): Promise<number> {
         ? [`runner: ${host.runner.kind}, port ${host.runner.port}`]
         : []),
     ];
-    io.stdout(`${parts.join("  ")}\n`);
+    io.stdout(`${screenHostsLine(parts.join("  "), names)}\n`);
   }
   return 0;
 }

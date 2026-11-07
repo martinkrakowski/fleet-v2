@@ -590,4 +590,25 @@ describe('planHostRename', () => {
       reason: 'not-object',
     });
   });
+
+  /** HN1 fix round 2, finding 2: a class instance as `hosts` is refused too. */
+  it('planHostRename refuses a class instance hosts map with hosts-not-object and writes nothing', () => {
+    class HostsMap {
+      old = {
+        transport: 'local' as const,
+        worktreeRoot: '/srv/fleet/worktrees',
+        roles: ['lane-runner'],
+      };
+    }
+    const value: Record<string, unknown> = {
+      schemaVersion: 2,
+      hosts: new HostsMap(),
+    };
+    const result = planHostRename(value, 'old', 'new-host');
+    expect(result).toEqual({ ok: false, reason: 'hosts-not-object' });
+    // Nothing is written: the root and its hosts map are exactly as they were.
+    expect(Object.keys(value)).toEqual(['schemaVersion', 'hosts']);
+    expect(Object.getPrototypeOf(value.hosts as object)).toBe(HostsMap.prototype);
+    expect(Object.hasOwn(value.hosts as object, 'old')).toBe(true);
+  });
 });

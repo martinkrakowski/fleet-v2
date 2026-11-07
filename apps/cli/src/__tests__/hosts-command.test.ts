@@ -296,6 +296,28 @@ describe("fleet-v2 hosts list", () => {
 // ---------------------------------------------------------------------------
 
 describe("fleet-v2 hosts add", () => {
+  /** HN1 fix round 2, finding 1: no 20+ character window of a token-run key. */
+  const tokenRunKey = `Ab1${"xY9".repeat(11)}`;
+
+  function expectNoKeyWindow(printed: string): void {
+    for (let start = 0; start + 20 <= tokenRunKey.length; start++) {
+      expect(printed).not.toContain(tokenRunKey.slice(start, start + 20));
+    }
+  }
+
+  it("withholds a 36-character token-run key from an add draft error", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const { code, stdout, stderr } = await runHosts(
+      ["add", tokenRunKey, "--worktree-root", "relative/path", "--yes"],
+      file,
+    );
+    expect(code).toBe(1);
+    expect(stderr).toContain("worktreeRoot: must be an absolute path");
+    expectNoKeyWindow(stdout + stderr);
+  });
+
   it("writes a new host after the probe, diff and --yes", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
@@ -604,6 +626,43 @@ describe("fleet-v2 hosts add", () => {
 // ---------------------------------------------------------------------------
 
 describe("fleet-v2 hosts edit", () => {
+  /** HN1 fix round 2, finding 1: no 20+ character window of a token-run key. */
+  const tokenRunKey = `Ab1${"xY9".repeat(11)}`;
+
+  it("withholds a 36-character token-run key from an edit draft error", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "worktrees"),
+          roles: ["orchestrator"],
+        },
+        [tokenRunKey]: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "worktrees"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const before = readFileSync(file, "utf8");
+    const { code, stdout, stderr } = await runHosts(
+      ["edit", tokenRunKey, "--worktree-root", "relative/path", "--yes"],
+      file,
+    );
+    expect(code).toBe(1);
+    expect(stderr).toContain("worktreeRoot: must be an absolute path");
+    const printed = stdout + stderr;
+    for (let start = 0; start + 20 <= tokenRunKey.length; start++) {
+      expect(printed).not.toContain(tokenRunKey.slice(start, start + 20));
+    }
+    expect(readFileSync(file, "utf8")).toBe(before);
+  });
+
   it("changes the port and keeps what the flags leave out", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");

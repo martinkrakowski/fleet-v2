@@ -81,6 +81,16 @@ export interface LaneRunJournalEntryRecord {
   readonly schemaVersion?: number;
   /** A request intent's request digest (O2c); only on an intent; absent reads as null. */
   readonly digest?: string | null;
+  /**
+   * A result: the typed reason kind its transition recorded (O2c recovery);
+   * only on a result; absent reads as null.
+   */
+  readonly reasonKind?: string | null;
+  /**
+   * A result: the id its completed transition linked to (O2c recovery); only
+   * on a result; absent reads as null.
+   */
+  readonly linkedId?: string | null;
 }
 
 export type LaneRunJournalEntryRead =
@@ -112,12 +122,20 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
   if (!versionRead.ok) {
     return { ok: false, reason: versionRead.reason, error: 'LaneRunJournal schemaVersion is not supported' };
   }
-  const snapshot = readPlainRecordWithOptionalKeys(input, LEGACY_ENTRY_KEYS, ['detail', 'schemaVersion', 'digest']);
+  const snapshot = readPlainRecordWithOptionalKeys(input, LEGACY_ENTRY_KEYS, [
+    'detail',
+    'schemaVersion',
+    'digest',
+    'reasonKind',
+    'linkedId',
+  ]);
   if (snapshot === null) {
     return journalEntryBodyError('LaneRunJournal entry must be a record with exactly the entry keys');
   }
   const hasDetail = Object.hasOwn(snapshot, 'detail');
   const hasDigest = Object.hasOwn(snapshot, 'digest');
+  const hasReasonKind = Object.hasOwn(snapshot, 'reasonKind');
+  const hasLinkedId = Object.hasOwn(snapshot, 'linkedId');
   const headError = entryHeadError(snapshot);
   if (headError !== null) {
     return journalEntryBodyError(headError);
@@ -129,6 +147,14 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
   const digestError = entryDigestError(snapshot, hasDigest);
   if (digestError !== null) {
     return journalEntryBodyError(digestError);
+  }
+  const reasonKindError = entryReasonKindError(snapshot, hasReasonKind);
+  if (reasonKindError !== null) {
+    return journalEntryBodyError(reasonKindError);
+  }
+  const linkedIdError = entryLinkedIdError(snapshot, hasLinkedId);
+  if (linkedIdError !== null) {
+    return journalEntryBodyError(linkedIdError);
   }
   const kind = snapshot.kind as LaneRunJournalEntryKind;
   const parsedKey = kind === 'conduct' ? null : parseLaneRunKey(snapshot.key);
@@ -144,6 +170,8 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
     snapshot,
     hasDetail,
     hasDigest,
+    hasReasonKind,
+    hasLinkedId,
     versionRead.explicit ? versionRead.schemaVersion : null,
   );
   return { ok: true, entry, schemaVersion: versionRead.schemaVersion };
@@ -159,6 +187,8 @@ function buildJournalEntry(
   snapshot: Record<string, unknown>,
   hasDetail: boolean,
   hasDigest: boolean,
+  hasReasonKind: boolean,
+  hasLinkedId: boolean,
   schemaVersion: number | null,
 ): LaneRunJournalEntryRecord {
   return Object.freeze({
@@ -178,6 +208,8 @@ function buildJournalEntry(
     state: snapshot.state as LaneRunStateValue | null,
     ...(schemaVersion === null ? {} : { schemaVersion }),
     ...(hasDigest ? { digest: snapshot.digest as string | null } : {}),
+    ...(hasReasonKind ? { reasonKind: snapshot.reasonKind as string | null } : {}),
+    ...(hasLinkedId ? { linkedId: snapshot.linkedId as string | null } : {}),
   });
 }
 
@@ -449,6 +481,38 @@ function entryDigestError(snapshot: Record<string, unknown>, present: boolean): 
     return 'LaneRunJournal digest must be null or a 64-hex string on an intent and null elsewhere';
   }
   return null;
+}
+
+/** A result's recorded transition data (O2c): only on a result, null or a valid value. */
+function entryReasonKindError(snapshot: Record<string, unknown>, present: boolean): string | null {
+  if (!present) {
+    return null;
+  }
+  if (snapshot.kind !== 'result') {
+    return 'LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere';
+  }
+  const reasonKind = snapshot.reasonKind;
+  if (reasonKind === null) {
+    return null;
+  }
+  if (typeof reasonKind !== 'string' || !LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(reasonKind)) {
+    return 'LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere';
+  }
+  return null;
+}
+
+function entryLinkedIdError(snapshot: Record<string, unknown>, present: boolean): string | null {
+  if (!present) {
+    return null;
+  }
+  if (snapshot.kind !== 'result') {
+    return 'LaneRunJournal linkedId must be null except on a result';
+  }
+  const linkedId = snapshot.linkedId;
+  if (linkedId === null) {
+    return null;
+  }
+  return idError('linkedId', linkedId);
 }
 
 function entryGrantIdError(kind: LaneRunJournalEntryKind, grantId: unknown): string | null {

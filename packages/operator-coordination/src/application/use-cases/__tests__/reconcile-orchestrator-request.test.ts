@@ -545,4 +545,117 @@ describe('ReconcileOrchestratorRequestUseCase', () => {
     expect(result).toEqual({ outcome: 'refused', code: 'cancel-requested', requestId: ID });
     expect(env.journal.appends).toBe(0);
   });
+
+  it('a refused result without a reason kind is refused before any journal append', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    const result = await env.useCase.execute('record-result', {
+      requestId: ID,
+      orchestratorId: ORCH,
+      expectedRevision: 2,
+      fence: 1,
+      outcome: 'refused',
+      reasonCode: 'busy',
+      reasonKind: null,
+      linkedId: null,
+    });
+    expect(result).toEqual({ outcome: 'refused', code: 'invalid-request', requestId: null });
+    expect(env.journal.appends).toBe(1); // the intent only, never a final result
+
+    const stored = await env.requestRepo.get(ID);
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('claimed');
+    }
+  });
+
+  it('record-intent on a dispatched request is refused and writes nothing', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+    await env.useCase.execute('record-result', {
+      requestId: ID,
+      orchestratorId: ORCH,
+      expectedRevision: 2,
+      fence: 1,
+      outcome: 'completed',
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: 'attempt-dispatched-1',
+    });
+
+    const appends = env.journal.appends;
+    const result = await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+    expect(result).toEqual({ outcome: 'refused', code: 'holder', requestId: ID });
+    expect(env.journal.appends).toBe(appends);
+  });
+
+  it('claim recovery applies exactly the recorded refused reason kind', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    // A writer crashed between the journal result and its save: the result is
+    // in the journal, the request is still claimed.
+    env.journal.entries.push({
+      version: 1,
+      entryId: '01JB0000000000000000000003',
+      kind: 'result',
+      key: `request/${ID}`,
+      outcome: 'refused',
+      reasonCode: 'busy',
+      reasonKind: 'seat-unavailable',
+      linkedId: null,
+    });
+
+    const result = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    expect(result).toEqual({ outcome: 'already-refused', requestId: ID });
+
+    const stored = await env.requestRepo.get(ID);
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('refused');
+      expect(stored.request.reason?.reasonKind).toBe('seat-unavailable');
+    }
+  });
+
+  it('claim recovery applies the recorded link id and never invents one from the target', async () => {
+    await env.requestRepo.save(requestRecord('prepare-fix'), 0);
+    await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    await env.useCase.execute('record-intent', {
+      requestId: ID, orchestratorId: ORCH, expectedRevision: 2, fence: 1,
+    });
+
+    env.journal.entries.push({
+      version: 1,
+      entryId: '01JB0000000000000000000004',
+      kind: 'result',
+      key: `request/${ID}`,
+      outcome: 'completed',
+      reasonCode: null,
+      reasonKind: null,
+      linkedId: 'attempt-recovered-1',
+    });
+
+    const result = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 1 });
+    expect(result).toEqual({ outcome: 'already-dispatched', requestId: ID });
+
+    const stored = await env.requestRepo.get(ID);
+    if (stored.outcome === 'found') {
+      expect(stored.request.state).toBe('dispatched');
+      // The link id is the recorded one, not the target's attempt id.
+      expect(stored.request.linked).toEqual({
+        attemptId: 'attempt-recovered-1',
+        journalKey: `request/${ID}`,
+      });
+    }
+  });
 });

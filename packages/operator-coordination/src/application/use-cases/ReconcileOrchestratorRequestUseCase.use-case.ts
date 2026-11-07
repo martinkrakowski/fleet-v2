@@ -199,6 +199,12 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
         return false;
       }
     }
+    // A refused transition needs its typed reason kind: `refuse` rejects a
+    // null reason kind, so accepting one here would append a final result the
+    // request can never be moved by (fix round 1, item 1).
+    if (outcome === 'refused' && input.reasonKind === null) {
+      return false;
+    }
     if (outcome === 'completed') {
       if (!isValidId(input.linkedId)) {
         return false;
@@ -554,6 +560,11 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
       recordedAtIso: this.nowIso(),
       outcome,
       reasonCode,
+      // The result carries exactly what its transition needs, so a recovery
+      // reader applies the recorded transition without inventing a link or a
+      // reason kind (fix round 1, item 3).
+      reasonKind,
+      linkedId: outcome === 'completed' ? linkedId : null,
     });
     if (appended.outcome === 'appended') {
       if (outcome === 'completed' || outcome === 'refused') {
@@ -588,6 +599,13 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
   ): { ok: true } | { ok: false; result: ReconcileOrchestratorRequestResult } {
     if (record.state === 'cancel-requested') {
       return { ok: false, result: refused('cancel-requested', requestId) };
+    }
+    // Both journal actions operate only from `claimed`. Terminal transitions
+    // (`dispatched`, `refused`) retain the claim, so the state check — not
+    // only the cancel check — keeps a matching holder from appending to a
+    // request the journal has already closed (fix round 1, item 2).
+    if (record.state !== 'claimed') {
+      return { ok: false, result: refused('holder', requestId) };
     }
     const claim = record.claim;
     if (claim === null) {
@@ -665,22 +683,29 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
     };
     let transition: OrchestratorRequestResult;
     if (finalResult.outcome === 'refused') {
+      // The recorded reason kind is the only one recovery may apply: the
+      // journal result's reason code is a token, not a reason kind, and
+      // inventing one would move the request on a reason nobody recorded
+      // (fix round 1, item 3). A result without one is not recoverable.
+      if (finalResult.reasonKind === null) {
+        return { ok: false, result: unknown('digest-failed', requestId) };
+      }
       transition = entityResult.value.refuse(
         holder,
-        { reasonKind: finalResult.reasonCode ?? 'other', detail: null },
+        { reasonKind: finalResult.reasonKind, detail: null },
         this.nowIso(),
       );
     } else {
-      // Completion recovers only when the request's target already names the
-      // link id (resume, prepare-fix, request-review). A start-lane-run
-      // completion mints its run id during the action; only the acting
-      // orchestrator knows it, through record-result, so it is never invented
-      // here and the request is left untouched.
-      const linkKey = ORCHESTRATOR_REQUEST_LINK_KEY[record.kind];
-      const linkValue = (record.target as Record<string, unknown>)[linkKey];
+      // The recorded link id is the only one recovery may apply: the request
+      // target names the *requested* object, not the id the action minted
+      // (wrong for `prepare-fix`, absent for `start-lane-run`), so it is
+      // never invented here. A completion without its recorded link id is
+      // not recoverable.
+      const linkValue = finalResult.linkedId;
       if (typeof linkValue !== 'string' || linkValue.length === 0) {
         return { ok: false, result: unknown('digest-failed', requestId) };
       }
+      const linkKey = ORCHESTRATOR_REQUEST_LINK_KEY[record.kind];
       transition = entityResult.value.complete(
         holder,
         { [linkKey]: linkValue, journalKey: JOURNAL_KEY_PREFIX + requestId },

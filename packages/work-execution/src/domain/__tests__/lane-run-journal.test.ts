@@ -727,3 +727,45 @@ describe('digest (O2c)', () => {
     expect(decision.entry.digest).toBe(DIGEST_64);
   });
 });
+
+describe('result recovery fields (O2c fix round 1)', () => {
+  it('round-trips a reasonKind and a linkedId on a result', () => {
+    const entry = result(REQUEST_KEY, 'completed', { reasonKind: null, linkedId: 'run-example-1' });
+    const read = readLaneRunJournalEntry(entry);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.entry).toEqual(entry);
+    expect(read.entry.linkedId).toBe('run-example-1');
+  });
+
+  it('round-trips a refused result that carries its reason kind', () => {
+    const entry = result(REQUEST_KEY, 'refused', { reasonKind: 'seat-unavailable', linkedId: null });
+    const read = readLaneRunJournalEntry(entry);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.entry).toEqual(entry);
+    expect(read.entry.reasonKind).toBe('seat-unavailable');
+  });
+
+  it('refuses a reasonKind or a linkedId on an intent or conduct entry', () => {
+    const intentReason = readLaneRunJournalEntry(intent(REQUEST_KEY, { reasonKind: 'policy' }));
+    expect(intentReason.ok).toBe(false);
+    if (intentReason.ok) return;
+    expect(intentReason.error).toBe('LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere');
+
+    const intentLinked = readLaneRunJournalEntry(intent(REQUEST_KEY, { linkedId: 'run-example-1' }));
+    expect(intentLinked.ok).toBe(false);
+    if (intentLinked.ok) return;
+    expect(intentLinked.error).toBe('LaneRunJournal linkedId must be null except on a result');
+
+    const conductReason = readLaneRunJournalEntry(conduct('running', { reasonKind: 'policy' }));
+    expect(conductReason.ok).toBe(false);
+  });
+
+  it('refuses a result reasonKind that is not a lowercase token', () => {
+    const read = readLaneRunJournalEntry(result(REQUEST_KEY, 'refused', { reasonKind: 'Seat Unavailable!' }));
+    expect(read.ok).toBe(false);
+    if (read.ok) return;
+    expect(read.error).toBe('LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere');
+  });
+});

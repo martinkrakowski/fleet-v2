@@ -3,7 +3,8 @@
  * OrchestratorRequestJournalPort: the request channel's keyed journal read
  * under `request/<requestId>` (K1b). It is a narrow view over the shared
  * run-journal store: entries expose only fixed facts (entry id, kind, the
- * intent digest, outcome and reason code) and never paths, hosts or raw text.
+ * intent digest, outcome, reason code, and the recorded reason kind and link
+ * id a final result's recovery needs) and never paths, hosts or raw text.
  * A missing file reads as no entries; an unreadable journal is unknown, never
  * a thrown message. Appends run through the same K1b uniqueness guard as every
  * other journal write, so a duplicate intent is refused before it is written.
@@ -16,6 +17,10 @@ export interface OrchestratorRequestJournalEntry {
   readonly digest: string | null;
   readonly outcome: string | null;
   readonly reasonCode: string | null;
+  /** A result's recorded reason kind (recovery); null when absent or on an intent. */
+  readonly reasonKind: string | null;
+  /** A result's recorded link id (recovery); null when absent or on an intent. */
+  readonly linkedId: string | null;
 }
 
 export type ReadOrchestratorRequestJournalResult =
@@ -44,6 +49,8 @@ export interface OrchestratorRequestJournalPort {
       readonly recordedAtIso: string;
       readonly outcome: string;
       readonly reasonCode: string | null;
+      readonly reasonKind: string | null;
+      readonly linkedId: string | null;
     },
   ): Promise<AppendOrchestratorRequestJournalResult>;
 }

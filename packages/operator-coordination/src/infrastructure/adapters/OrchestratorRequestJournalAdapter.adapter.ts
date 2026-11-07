@@ -65,7 +65,7 @@ function baseEntry(params: {
 /** The minimal journal facts the use case reads; never a path or raw text. */
 function normalizeJournalEntry(raw: unknown): OrchestratorRequestJournalEntry {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    return { entryId: '', kind: 'intent', digest: null, outcome: null, reasonCode: null };
+    return { entryId: '', kind: 'intent', digest: null, outcome: null, reasonCode: null, reasonKind: null, linkedId: null };
   }
   const record = raw as Record<string, unknown>;
   return {
@@ -74,6 +74,8 @@ function normalizeJournalEntry(raw: unknown): OrchestratorRequestJournalEntry {
     digest: typeof record.digest === 'string' ? record.digest : null,
     outcome: typeof record.outcome === 'string' ? record.outcome : null,
     reasonCode: typeof record.reasonCode === 'string' ? record.reasonCode : null,
+    reasonKind: typeof record.reasonKind === 'string' ? record.reasonKind : null,
+    linkedId: typeof record.linkedId === 'string' ? record.linkedId : null,
   };
 }
 
@@ -106,12 +108,16 @@ export class OrchestratorRequestJournalAdapter implements OrchestratorRequestJou
       readonly recordedAtIso: string;
       readonly outcome: string;
       readonly reasonCode: string | null;
+      readonly reasonKind: string | null;
+      readonly linkedId: string | null;
     },
   ): Promise<AppendOrchestratorRequestJournalResult> {
     return this.append({
       ...baseEntry({ key, entryId: result.entryId, recordedAtIso: result.recordedAtIso, kind: 'result' }),
       outcome: result.outcome,
       reasonCode: result.reasonCode,
+      reasonKind: result.reasonKind,
+      linkedId: result.linkedId,
     });
   }
 

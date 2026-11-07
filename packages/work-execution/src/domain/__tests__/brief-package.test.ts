@@ -266,15 +266,33 @@ describe('computeBriefPackageDigest', () => {
   // `localeCompare`. These three checks pin why the comparator here is code-unit order instead:
   // `localeCompare` depends on the host locale and ICU version, so adopting it would let two
   // hosts digest the same package to two values. They fail if someone "fixes" the rule that way.
-  it('orders bound keys by code unit, which is not what localeCompare would do', () => {
-    // 'B' is code unit 66 and 'a' is 97, so code-unit order puts the uppercase key first, where
-    // every common locale collates case-insensitively and puts 'a' first. This pair is the whole
-    // difference, and asserting it on byCodeUnit alone is the point: asserting what localeCompare
-    // does with it would itself depend on the host's locale, which is the defect being avoided.
-    expect(['a', 'B'].sort(byCodeUnit)).toEqual(['B', 'a']);
-    expect(byCodeUnit('a', 'B')).toBeGreaterThan(0);
-    expect(byCodeUnit('B', 'a')).toBeLessThan(0);
-    expect(byCodeUnit('a', 'a')).toBe(0);
+  it('orders bound keys by code unit, a property no collator satisfies', () => {
+    // The property is stated against code units computed here, not against another comparator's
+    // output: asserting what localeCompare does would itself depend on the host locale, which is
+    // the defect being avoided. A locale-based comparator fails this because collation groups
+    // digits, punctuation, case and accents, and code units do not: '_' (95) after 'A' (65),
+    // 'B' (66) before 'a' (97), 'z' (122) before 'ä' (228). No single locale agrees on all three.
+    const pairs: ReadonlyArray<readonly [string, string]> = [
+      ['a', 'B'],
+      ['_', 'A'],
+      ['z', 'ä'],
+      ['0', 'A'],
+      ['a', 'a'],
+    ];
+    const sign = (value: number): number => (value < 0 ? -1 : value > 0 ? 1 : 0);
+    for (const [left, right] of pairs) {
+      expect({ left, right, order: sign(byCodeUnit(left, right)) }).toEqual({
+        left,
+        right,
+        order: sign(left.charCodeAt(0) - right.charCodeAt(0)),
+      });
+      // Antisymmetry, so a comparator that returned a constant could not pass. Asserted as a sum
+      // because negating a zero gives -0, and toBe is Object.is, which separates -0 from +0.
+      expect(sign(byCodeUnit(left, right)) + sign(byCodeUnit(right, left))).toBe(0);
+    }
+    // And the whole table sorts the same way as a sort by code unit does.
+    const keys = ['a', 'B', '_', 'ä', 'z', '0', 'A'];
+    expect([...keys].sort(byCodeUnit)).toEqual([...keys].sort((l, r) => l.charCodeAt(0) - r.charCodeAt(0)));
   });
 
   it('digests the same bounds to the same value whatever order they arrive in, for keys localeCompare would reorder', () => {

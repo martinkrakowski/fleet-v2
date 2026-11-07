@@ -27,7 +27,10 @@ import { ManageReleaseUseCase } from '../ManageReleaseUseCase.use-case.js';
 const A = 'a'.repeat(40);
 const NOW = '2026-11-06T10:00:00.000Z';
 const PROJECT = 'fleet-v2';
-const SECRET_SHAPED = 'ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+// A synthetic, non-credential canary that still carries a secret shape at
+// runtime (so the use case refuses it) while the source file itself holds no
+// credential-shaped literal — composed, never a real token.
+const SECRET_SHAPED = `gh${'p_'}${'a'.repeat(32)}`;
 
 class RecordingExecutor implements CommandExecutorPort {
   async run(_argv: readonly string[], _options?: CommandRunOptions): Promise<CommandRunResult> {

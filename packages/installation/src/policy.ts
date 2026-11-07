@@ -1068,11 +1068,13 @@ function readDaemonSection(
     (Object.hasOwn(block, 'stallAfterMinutes')
       ? readBoundedInteger(readOwnDataProperty(block, 'stallAfterMinutes'), MERGE_POLICY_BOUNDS.stallAfterMinutes)
       : undefined) ?? defaults.stallAfterMinutes;
-  // PT1b1: resolves, never refuses, exactly like `stallAfterMinutes`.
-  const autoResumeMax =
-    (Object.hasOwn(block, 'autoResumeMax')
-      ? readBoundedInteger(readOwnDataProperty(block, 'autoResumeMax'), MERGE_POLICY_BOUNDS.autoResumeMax)
-      : undefined) ?? defaults.autoResumeMax;
+  // PT1b1, fix round 1: resolves, never refuses, exactly like `stallAfterMinutes` — but an
+  // invalid written value is fail-closed: it reads as `0` (never auto-resume), never as the
+  // permissive default, so a restrictive operator intent can never widen into permissiveness.
+  // An absent key still reads as the default.
+  const autoResumeMax = Object.hasOwn(block, 'autoResumeMax')
+    ? (readBoundedInteger(readOwnDataProperty(block, 'autoResumeMax'), MERGE_POLICY_BOUNDS.autoResumeMax) ?? 0)
+    : defaults.autoResumeMax;
   if (!intervalSeconds.ok || !budgetSeconds.ok || !settleSeconds.ok) {
     return DAEMON_INVALID;
   }
@@ -1124,6 +1126,8 @@ function compareRepositoryKeys(
  * missing `projectId`, empty or sparse `requiredContexts`, secret-shaped text, more than 256
  * repositories) refuses the whole section. `policy.daemon.chainRefresh` is never a refusal: only
  * `shadow` (or absent) is `shadow`; `live` and any unknown value resolve to `invalid` (CO8a).
+ * `policy.daemon.autoResumeMax` is likewise never a refusal, but an invalid written value
+ * resolves fail-closed to `0` (never auto-resume), never to the permissive default.
  * Never salvages a field, never substitutes a default for a written value, never throws and never
  * runs a getter. `reason` is a code, never a value. Repositories come back sorted by
  * `repositoryKey`; `requiredContexts` keep their written order.

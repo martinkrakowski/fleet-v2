@@ -686,8 +686,8 @@ describe('the parsed installation', () => {
       ).toBe(value);
     }
     // Like stallAfterMinutes: a bad value is a warning naming the key and a code (never the
-    // value); the installation loads, the raw value is kept, and the policy resolves with the
-    // default, never refused.
+    // value); the installation loads, the raw value is kept, and the policy resolves fail-closed
+    // to `0` (never auto-resume), never refused and never the permissive default.
     for (const value of [-1, 33, 2.5, '2', null, true, 'plenty']) {
       const parsed = parsePolicy({ daemon: { autoResumeMax: value } });
       expect(parsed.ok).toBe(true);
@@ -697,7 +697,7 @@ describe('the parsed installation', () => {
         expect(parsed.installation.policy?.daemon).toMatchObject({ autoResumeMax: value });
       }
       const read = expectResolved(resolveMergePolicy(policyWith(undefined, { autoResumeMax: value })));
-      expect(read.daemon.autoResumeMax).toBe(2);
+      expect(read.daemon.autoResumeMax).toBe(0);
     }
     const valid = parsePolicy({ daemon: { autoResumeMax: 5 } });
     expect(valid.ok && (valid.warnings ?? [])).toEqual([]);

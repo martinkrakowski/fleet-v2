@@ -467,7 +467,8 @@ export interface MergeDaemonSection {
    * PT1b1: how many `resume@web` intents the conductor may write per pass for auto-resuming
    * `transport-busy` parks; 0..32, default 2. As written: a value outside that range or not an
    * integer loads with an `auto-resume-max-invalid` warning, is kept verbatim for a round trip
-   * and resolves to 2.
+   * and resolves fail-closed to `0` (never auto-resume); only an absent key resolves to the
+   * default 2.
    */
   readonly autoResumeMax?: number | (string & {}) | boolean | null;
 }

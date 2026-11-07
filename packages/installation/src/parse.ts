@@ -2735,7 +2735,8 @@ function parseMergeDaemonPolicy(
   }
   // PT1b1: like `stallAfterMinutes`, a bad `autoResumeMax` is a warning, never an error: it gates
   // only the auto-resume budget. The raw value is kept so a write round-trips the operator's own
-  // text; the resolver reads the default (2). The warning names the key and a code, never the value.
+  // text; the resolver reads `0` (fail-closed, never auto-resume). The warning names the key and
+  // a code, never the value.
   const autoResumeMax: unknown = Object.hasOwn(value, 'autoResumeMax')
     ? value.autoResumeMax
     : undefined;

@@ -49,7 +49,6 @@ const STALL_AFTER_RANGE = { min: 1, max: 1440 } as const;
 const DEFAULT_STALL_AFTER_MINUTES = 30;
 /** PT1b1: the auto-resume budget bounds mirror the installation policy's. */
 const AUTO_RESUME_RANGE = { min: 0, max: 32 } as const;
-const DEFAULT_AUTO_RESUME_MAX = 2;
 const REVISION_PATTERN = /^[0-9a-f]{12}$/;
 const VETO_MODES: ReadonlySet<string> = new Set(['off', 'shadow', 'live']);
 const REPOSITORY_KEYS: readonly string[] = [
@@ -312,9 +311,11 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
     ...(hasStallAfter
       ? { stallAfterMinutes: isIntegerInRange(stallAfterMinutes, STALL_AFTER_RANGE) ? stallAfterMinutes : DEFAULT_STALL_AFTER_MINUTES }
       : {}),
-    // PT1b1: never a refusal because of this key; an unusable value reads as the default.
+    // PT1b1, fix round 1: never a refusal because of this key, but an unusable written value is
+    // fail-closed: it reads as `0` (never auto-resume), never as the permissive default. An
+    // absent key reads no `autoResumeMax` at all.
     ...(hasAutoResume
-      ? { autoResumeMax: isIntegerInRange(autoResumeMax, AUTO_RESUME_RANGE) ? autoResumeMax : DEFAULT_AUTO_RESUME_MAX }
+      ? { autoResumeMax: isIntegerInRange(autoResumeMax, AUTO_RESUME_RANGE) ? autoResumeMax : 0 }
       : {}),
   });
 }

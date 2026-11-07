@@ -236,12 +236,12 @@ describe('daemon tick with a bad policy.daemon.stallAfterMinutes (PT1a)', () => 
 
 describe('daemon tick with a bad policy.daemon.autoResumeMax (PT1b1)', () => {
   for (const bad of [-1, 33, 2.5, 'soon']) {
-    it(`with autoResumeMax ${JSON.stringify(bad)} the tick runs, the merge policy resolves with the default 2 and nothing is refused`, async () => {
+    it(`with autoResumeMax ${JSON.stringify(bad)} the tick runs, the merge policy resolves fail-closed to 0 and nothing is refused`, async () => {
       const h = harness([REPO_A], {}, { daemon: { autoResumeMax: bad } });
       await enqueue(h.runtime, REPO_A);
 
       const answer = await h.runtime.daemon.mergePolicy.readMergePolicy();
-      expect(answer).toMatchObject({ outcome: 'known', daemon: { autoResumeMax: 2 } });
+      expect(answer).toMatchObject({ outcome: 'known', daemon: { autoResumeMax: 0 } });
 
       const result = await run(h.runtime, ['daemon', 'tick']);
       expect(result.code).toBe(0);
@@ -262,7 +262,7 @@ describe('daemon tick with a bad policy.daemon.autoResumeMax (PT1b1)', () => {
     expect(loaded.status).toBe('loaded');
     if (loaded.status === 'loaded') {
       expect(loaded.warnings).toEqual(['policy.daemon.autoResumeMax: auto-resume-max-invalid']);
-      expect(mergePolicySourceFromLoad(loaded)).toMatchObject({ outcome: 'resolved', daemon: { autoResumeMax: 2 } });
+      expect(mergePolicySourceFromLoad(loaded)).toMatchObject({ outcome: 'resolved', daemon: { autoResumeMax: 0 } });
     }
   });
 });

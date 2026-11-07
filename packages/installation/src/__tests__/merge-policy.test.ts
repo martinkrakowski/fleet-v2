@@ -110,6 +110,7 @@ const daemonDefaults: ResolvedMergeDaemonPolicy = {
   settleSeconds: 20,
   chainRefresh: 'shadow',
   stallAfterMinutes: 30,
+  autoResumeMax: 2,
 };
 
 describe('resolveMergePolicy', () => {
@@ -154,7 +155,7 @@ describe('resolveMergePolicy', () => {
       },
       repository({ owner: 'zeta', repo: 'last', repositoryKey: 'zeta/last', projectId: 'p-z' }),
     ]);
-    expect(read.daemon).toEqual({ intervalSeconds: 120, budgetSeconds: 100, settleSeconds: 0, chainRefresh: 'shadow', stallAfterMinutes: 30 });
+    expect(read.daemon).toEqual({ intervalSeconds: 120, budgetSeconds: 100, settleSeconds: 0, chainRefresh: 'shadow', stallAfterMinutes: 30, autoResumeMax: 2 });
 
     const boundary = expectResolved(
       resolveMergePolicy(
@@ -176,7 +177,7 @@ describe('resolveMergePolicy', () => {
       ),
     );
     expect(boundary.repositories[0].veto).toEqual({ mode: 'off', holdConfidence: 0 });
-    expect(boundary.daemon).toEqual({ intervalSeconds: 10, budgetSeconds: 5, settleSeconds: 20, chainRefresh: 'shadow', stallAfterMinutes: 30 });
+    expect(boundary.daemon).toEqual({ intervalSeconds: 10, budgetSeconds: 5, settleSeconds: 20, chainRefresh: 'shadow', stallAfterMinutes: 30, autoResumeMax: 2 });
   });
 
   const malformedMerge: readonly (readonly [string, unknown, string?])[] = [
@@ -515,7 +516,7 @@ describe('the parsed installation', () => {
     expect(model.policy?.daemon).toEqual(daemon);
 
     const read = expectResolved(resolveMergePolicy(model.policy));
-    expect(read.daemon).toEqual({ ...daemon, chainRefresh: 'shadow', stallAfterMinutes: 30 });
+    expect(read.daemon).toEqual({ ...daemon, chainRefresh: 'shadow', stallAfterMinutes: 30, autoResumeMax: 2 });
     expect(read.repositories.map((entry) => entry.repositoryKey)).toEqual([
       'example-owner/example-repo',
       'example-owner/other-repo',
@@ -670,6 +671,38 @@ describe('the parsed installation', () => {
     expect(valid.ok && (valid.warnings ?? [])).toEqual([]);
     const base = expectResolved(resolveMergePolicy(policyWith(undefined, {})));
     const changed = expectResolved(resolveMergePolicy(policyWith(undefined, { stallAfterMinutes: 90 })));
+    expect(changed.policyRevision).toBe(base.policyRevision);
+  });
+
+  it('PT1b1: policy.daemon.autoResumeMax defaults to 2, takes 0..32, reads anything else as 2 with a warning, and leaves the policy revision alone', () => {
+    expect(expectResolved(resolveMergePolicy(policyWith(undefined, {}))).daemon.autoResumeMax).toBe(2);
+    // `0` and `32` are valid bounds: `0` means never auto-resume.
+    for (const value of [0, 1, 2, 31, 32]) {
+      const parsed = parsePolicy({ daemon: { autoResumeMax: value } });
+      expect(parsed.ok).toBe(true);
+      expect(
+        expectResolved(resolveMergePolicy(policyWith(undefined, { autoResumeMax: value }))).daemon
+          .autoResumeMax,
+      ).toBe(value);
+    }
+    // Like stallAfterMinutes: a bad value is a warning naming the key and a code (never the
+    // value); the installation loads, the raw value is kept, and the policy resolves with the
+    // default, never refused.
+    for (const value of [-1, 33, 2.5, '2', null, true, 'plenty']) {
+      const parsed = parsePolicy({ daemon: { autoResumeMax: value } });
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        expect(parsed.warnings ?? []).toEqual(['policy.daemon.autoResumeMax: auto-resume-max-invalid']);
+        expect((parsed.warnings ?? []).join(' ')).not.toContain('plenty');
+        expect(parsed.installation.policy?.daemon).toMatchObject({ autoResumeMax: value });
+      }
+      const read = expectResolved(resolveMergePolicy(policyWith(undefined, { autoResumeMax: value })));
+      expect(read.daemon.autoResumeMax).toBe(2);
+    }
+    const valid = parsePolicy({ daemon: { autoResumeMax: 5 } });
+    expect(valid.ok && (valid.warnings ?? [])).toEqual([]);
+    const base = expectResolved(resolveMergePolicy(policyWith(undefined, {})));
+    const changed = expectResolved(resolveMergePolicy(policyWith(undefined, { autoResumeMax: 9 })));
     expect(changed.policyRevision).toBe(base.policyRevision);
   });
 

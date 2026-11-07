@@ -723,6 +723,7 @@ export const MERGE_POLICY_BOUNDS = Object.freeze({
   budgetSeconds: Object.freeze({ min: 5, max: 600 }),
   settleSeconds: Object.freeze({ min: 0, max: 600 }),
   stallAfterMinutes: Object.freeze({ min: 1, max: 1440 }),
+  autoResumeMax: Object.freeze({ min: 0, max: 32 }),
 });
 
 /** The defaults of an absent `policy.daemon` (D-DT9). */
@@ -732,6 +733,7 @@ export const DEFAULT_MERGE_DAEMON_POLICY: ResolvedMergeDaemonPolicy = Object.fre
   settleSeconds: 20,
   chainRefresh: 'shadow',
   stallAfterMinutes: 30,
+  autoResumeMax: 2,
 });
 
 /**
@@ -1066,6 +1068,11 @@ function readDaemonSection(
     (Object.hasOwn(block, 'stallAfterMinutes')
       ? readBoundedInteger(readOwnDataProperty(block, 'stallAfterMinutes'), MERGE_POLICY_BOUNDS.stallAfterMinutes)
       : undefined) ?? defaults.stallAfterMinutes;
+  // PT1b1: resolves, never refuses, exactly like `stallAfterMinutes`.
+  const autoResumeMax =
+    (Object.hasOwn(block, 'autoResumeMax')
+      ? readBoundedInteger(readOwnDataProperty(block, 'autoResumeMax'), MERGE_POLICY_BOUNDS.autoResumeMax)
+      : undefined) ?? defaults.autoResumeMax;
   if (!intervalSeconds.ok || !budgetSeconds.ok || !settleSeconds.ok) {
     return DAEMON_INVALID;
   }
@@ -1086,6 +1093,7 @@ function readDaemonSection(
       settleSeconds: settleSeconds.value,
       chainRefresh,
       stallAfterMinutes,
+      autoResumeMax,
     }),
   );
 }
@@ -1149,7 +1157,8 @@ export function resolveMergePolicy(policy: PolicySection | undefined): MergePoli
  * `intervalSeconds`, `settleSeconds`) then `merge.repos` keyed by `repositoryKey` in ascending
  * order, each entry with its keys in alphabetical order and `requiredContexts` sorted ascending,
  * no whitespace. Pass the resolved sections so an absent block hashes as its default.
- * `daemon.stallAfterMinutes` is excluded for the same reason (it gates only the stall attention).
+ * `daemon.stallAfterMinutes` is excluded for the same reason (it gates only the stall attention),
+ * and `daemon.autoResumeMax` likewise (it gates only the auto-resume budget).
  * `daemon.chainRefresh` is deliberately excluded: it only gates the chain-refresh job, not the
  * merge policy, so adding it here would change the revision for every existing installation even
  * when the key is absent and defaults to `shadow`.

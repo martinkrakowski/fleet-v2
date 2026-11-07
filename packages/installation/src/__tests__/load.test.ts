@@ -331,6 +331,32 @@ describe('loadInstallation', () => {
     expect(result.installation.policy?.daemon).toMatchObject({ stallAfterMinutes: 99999 });
   });
 
+  it('PT1b1: loads a file with a bad policy.daemon.autoResumeMax and reports a warning naming the key and code, never the value', () => {
+    const directory = makeTempDirectory();
+    const installation = {
+      schemaVersion: 2,
+      hosts: {
+        local: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      },
+      forge: { mode: 'none' },
+      policy: { daemon: { autoResumeMax: 99 } },
+    };
+    const file = writeInstallationFile(directory, `${JSON.stringify(installation, null, 2)}\n`);
+    const result = loadInstallation({ file, env: {} });
+    expect(result.status).toBe('loaded');
+    if (result.status !== 'loaded') {
+      return;
+    }
+    expect(result.warnings).toEqual(['policy.daemon.autoResumeMax: auto-resume-max-invalid']);
+    expect(result.warnings.join(' ')).not.toContain('99');
+    expect(result.installation.policy?.daemon).toMatchObject({ autoResumeMax: 99 });
+  });
+
   it('reports invalid JSON without echoing the file content', () => {
     const directory = makeTempDirectory();
     const file = writeInstallationFile(directory, '{ "schemaVersion": 1, "runner": SENTINEL');

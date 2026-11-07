@@ -101,6 +101,20 @@ describe('MergePolicyAdapter', () => {
     expect(absent.outcome === 'known' && 'stallAfterMinutes' in absent.daemon).toBe(false);
   });
 
+  it('PT1b1: autoResumeMax is accepted when valid and never a refusal when unusable: it reads as 2', async () => {
+    const daemon = { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: 20, chainRefresh: 'shadow' };
+    // A policy carrying `autoResumeMax: 2` round-trips through the adapter.
+    const valid = await adapterFor(() => resolved({ daemon: { ...daemon, autoResumeMax: 2 } })).readMergePolicy();
+    expect(valid).toMatchObject({ outcome: 'known', daemon: { autoResumeMax: 2 } });
+    for (const bad of [-1, 33, 2.5, '2', null, true]) {
+      // A bad `autoResumeMax` still returns the rest of the daemon settings with the default.
+      const answer = await adapterFor(() => resolved({ daemon: { ...daemon, autoResumeMax: bad } })).readMergePolicy();
+      expect(answer).toMatchObject({ outcome: 'known', daemon: { autoResumeMax: 2 } });
+    }
+    const absent = await adapterFor(() => resolved()).readMergePolicy();
+    expect(absent.outcome === 'known' && 'autoResumeMax' in absent.daemon).toBe(false);
+  });
+
   it('readMergePolicy answers known with zero repositories when none is configured', async () => {
     const answer = await adapterFor(() => resolved({ repositories: [] })).readMergePolicy();
     expect(answer).toMatchObject({ outcome: 'known', repositories: [] });

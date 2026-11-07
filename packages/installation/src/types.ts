@@ -463,6 +463,13 @@ export interface MergeDaemonSection {
    * `stall-after-minutes-invalid` warning, is kept verbatim for a round trip and resolves to 30.
    */
   readonly stallAfterMinutes?: number | (string & {}) | boolean | null;
+  /**
+   * PT1b1: how many `resume@web` intents the conductor may write per pass for auto-resuming
+   * `transport-busy` parks; 0..32, default 2. As written: a value outside that range or not an
+   * integer loads with an `auto-resume-max-invalid` warning, is kept verbatim for a round trip
+   * and resolves to 2.
+   */
+  readonly autoResumeMax?: number | (string & {}) | boolean | null;
 }
 
 /** A merge repository policy with every default applied (`resolveMergePolicy`). */
@@ -495,6 +502,8 @@ export interface ResolvedMergeDaemonPolicy {
   readonly chainRefresh: 'shadow' | 'invalid';
   /** PT1a: the stall threshold in minutes with the default (30) applied. */
   readonly stallAfterMinutes: number;
+  /** PT1b1: the auto-resume budget with the default (2) applied. */
+  readonly autoResumeMax: number;
 }
 
 /** The result of `resolveMergePolicy`: the normalized sections at their revision, or a refusal code. */

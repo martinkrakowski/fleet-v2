@@ -18,7 +18,7 @@ export type ReconcileOrchestratorRequestResult =
   | { readonly outcome: 'already-refused'; readonly requestId: string }
   | { readonly outcome: 'intent-recorded'; readonly requestId: string }
   | { readonly outcome: 'result-recorded'; readonly requestId: string }
-  | { readonly outcome: 'unchanged'; readonly requestId: string }
+  | { readonly outcome: 'unchanged'; readonly requestId: string; readonly code?: 'recorded-result-after-stall' }
   | { readonly outcome: 'refused'; readonly requestId: string | null; readonly code: string }
   | { readonly outcome: 'unknown'; readonly requestId: string | null; readonly code: string };
 

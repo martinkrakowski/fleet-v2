@@ -964,7 +964,7 @@ describe('ReconcileOrchestratorRequestUseCase', () => {
     });
 
     const result = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 5 });
-    expect(result).toEqual({ outcome: 'unchanged', requestId: ID });
+    expect(result).toEqual({ outcome: 'unchanged', requestId: ID, code: 'recorded-result-after-stall' });
 
     const stored = await env.requestRepo.get(ID);
     expect(stored.outcome).toBe('found');
@@ -1020,7 +1020,7 @@ describe('ReconcileOrchestratorRequestUseCase', () => {
     });
 
     const result = await env.useCase.execute('claim', { requestId: ID, orchestratorId: ORCH, expectedRevision: 5 });
-    expect(result).toEqual({ outcome: 'unchanged', requestId: ID });
+    expect(result).toEqual({ outcome: 'unchanged', requestId: ID, code: 'recorded-result-after-stall' });
 
     const stored = await env.requestRepo.get(ID);
     expect(stored.outcome).toBe('found');

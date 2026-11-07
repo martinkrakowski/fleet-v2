@@ -308,7 +308,8 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
         return { outcome: 'already-refused', requestId };
       }
       if (record.state === 'stalled') {
-        return { outcome: 'unchanged', requestId };
+        // Terminal stays terminal (O2c fix 2): a recorded result after a stall is reported, never applied.
+        return { outcome: 'unchanged', requestId, code: 'recorded-result-after-stall' };
       }
       const reconciled = await this.reconcileFinalTransition(record, finalResult, requestId, intent.digest);
       if (!reconciled.ok) {
@@ -560,6 +561,9 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
           if (!applied.ok) {
             return applied.result;
           }
+        }
+        if (record.state === 'stalled') {
+          return { outcome: 'unchanged', requestId, code: 'recorded-result-after-stall' };
         }
         return { outcome: 'unchanged', requestId };
       }

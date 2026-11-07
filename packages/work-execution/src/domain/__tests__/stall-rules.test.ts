@@ -74,19 +74,49 @@ describe('detectStalls', () => {
       expect(rulesOf(at)).toEqual([]);
     });
 
-    it('stays silent for a hand-owned run and for a run with an open PR', () => {
+    it('stays silent for a hand-owned run', () => {
       const handOwned = detectStalls(
         snapshot({ runs: [parkedRun({ handOwned: true })] }),
         DEFAULT_STALL_THRESHOLDS,
         NOW,
       );
       expect(rulesOf(handOwned)).toEqual([]);
+      const handOwnedWithPr = detectStalls(
+        snapshot({ runs: [parkedRun({ handOwned: true, prNumber: 42 })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(handOwnedWithPr)).toEqual([]);
+    });
+  });
+
+  describe('owned-park (PT1a)', () => {
+    it('fires for a run parked past the threshold with an open PR, carrying the PR number, and never as unowned-park', () => {
       const withPr = detectStalls(
         snapshot({ runs: [parkedRun({ prNumber: 42 })] }),
         DEFAULT_STALL_THRESHOLDS,
         NOW,
       );
-      expect(rulesOf(withPr)).toEqual([]);
+      expect(rulesOf(withPr)).toEqual(['owned-park']);
+      expect(withPr[0]?.key).toBe('owned-park:run-1');
+      expect(withPr[0]?.severity).toBe('digest');
+      expect(withPr[0]?.evidence).toEqual({
+        runId: 'run-1',
+        parkedAtIso: '2026-11-06T11:00:00.000Z',
+        minutes: 60,
+        prNumber: 42,
+      });
+    });
+
+    it('uses the same threshold: silent at it, silent without a PR number rule change for unowned-park', () => {
+      const at = detectStalls(
+        snapshot({ runs: [parkedRun({ prNumber: 42, parkedAtIso: '2026-11-06T11:30:00.000Z' })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(at)).toEqual([]);
+      const noPr = detectStalls(snapshot({ runs: [parkedRun()] }), DEFAULT_STALL_THRESHOLDS, NOW);
+      expect(rulesOf(noPr)).toEqual(['unowned-park']);
     });
   });
 

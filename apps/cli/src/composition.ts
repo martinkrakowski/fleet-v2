@@ -54,6 +54,7 @@ import {
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
   MergeGrantAdapter,
+  MergeRecordRepositoryAdapter,
   ForgeReadAdapter,
   GhForgeMergeReadAdapter,
   InspectAttemptUseCase,
@@ -112,6 +113,9 @@ import {
   type SubprocessRunner,
   type CommandExecutorPort,
   type AcceptanceReceiptReadAdapter,
+  type GateFailingFileAdapter,
+  type ListStalledRunsUseCase,
+  type StallAttentionAdapter,
   type ExportRunTelemetryUseCase,
   type TelemetryDispositionAdapter,
   type TelemetryResourceInput,
@@ -715,6 +719,7 @@ export interface FleetCliRuntime {
     readonly workOrderRepository: WorkOrderRepositoryAdapter;
     readonly attemptRepository: AttemptRepositoryAdapter;
     readonly executionJournal: ExecutionJournalAdapter;
+    readonly mergeRecordRepository: MergeRecordRepositoryAdapter;
     readonly workspace: WorkspaceAdapter;
     readonly runner: ExecutionRunnerAdapter;
     /** H9b1: resolves the runner for an attempt's recorded host. */
@@ -782,6 +787,14 @@ export interface FleetCliRuntime {
     readonly halt: ConductorHaltAdapter;
     readonly requestLaneRunStop: RequestLaneRunStopUseCase;
     readonly inspectLaneRuns: InspectLaneRunsUseCase;
+    /** PT1a (SN3): the runs parked past `policy.daemon.stallAfterMinutes`, for `conductor status --stalled`. */
+    readonly listStalledRuns: ListStalledRunsUseCase;
+    /** PT1a (SN2): raises, refreshes and clears one `stall:<runId>` attention item per stalled run. */
+    readonly stallAttention: StallAttentionAdapter;
+    /** PT1a: the failing gate file a verification receipt recorded, read to class a gate park. */
+    readonly gateFailingFile: GateFailingFileAdapter;
+    /** PT1a: `policy.daemon.stallAfterMinutes` as resolved at composition. */
+    readonly stallAfterMinutes: number;
     readonly listLaneRuns: ListLaneRunsUseCase;
     /** VZ5b: the recorded conductor passes newest first (conductor schedule --passes). */
     readonly listConductorPasses: ListConductorPassesUseCase;

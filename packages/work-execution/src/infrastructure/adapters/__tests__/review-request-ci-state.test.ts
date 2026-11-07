@@ -317,6 +317,76 @@ describe('ReviewRequestAdapter.requestReview', () => {
     });
   });
 
+  it('RV4: a seat-busy rejection archives a screened diagnostic under the request id and maps to no-receipt', async () => {
+    const secret = 'ghp_' + 'a'.repeat(36);
+    const diagnostic = {
+      exitCode: 75,
+      timedOut: false,
+      stderr: `${secret} /home/operator/secret.txt`,
+      stdoutEmpty: false,
+    };
+    const { requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'rejected',
+      reason: 'review seat busy',
+      rejection: 'review-unavailable',
+      code: 'seat-busy',
+      diagnostic,
+    });
+    const archived: Array<{ artifactId: string; candidateHeadSha: string; content: string }> = [];
+    const adapter = new ReviewRequestAdapter({
+      requestIndependentReview,
+      archiveEvidence: async (request) => {
+        archived.push(request);
+        return { evidenceRef: 'evidence://' + request.artifactId, digest: 'd' };
+      },
+    });
+
+    const result = await adapter.requestReview(makeReviewRequest());
+
+    expect(result).toEqual({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'seat-busy',
+    });
+    expect(archived).toHaveLength(1);
+    expect(archived[0]!.artifactId).toBe('review-transport-' + REQUEST_ID);
+    expect(archived[0]!.candidateHeadSha).toBe(HEAD);
+    const content = JSON.parse(archived[0]!.content) as Record<string, unknown>;
+    expect(content).toEqual({
+      exitCode: 75,
+      timedOut: false,
+      stdoutEmpty: false,
+      stderr: '[redacted] [path]',
+    });
+    // The archived content carries no secret match and no path except the [path] token.
+    expect(archived[0]!.content).not.toContain(secret);
+    expect(archived[0]!.content).not.toContain('/home/operator');
+  });
+
+  it('RV4: an archive failure is swallowed and the outcome is unchanged', async () => {
+    const { requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'rejected',
+      reason: 'review seat busy',
+      rejection: 'review-unavailable',
+      code: 'seat-busy',
+      diagnostic: { exitCode: 75, timedOut: false, stderr: null, stdoutEmpty: null },
+    });
+    const adapter = new ReviewRequestAdapter({
+      requestIndependentReview,
+      archiveEvidence: async () => {
+        throw new Error('archive boom');
+      },
+    });
+
+    const result = await adapter.requestReview(makeReviewRequest());
+
+    expect(result).toEqual({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'seat-busy',
+    });
+  });
+
   it('is unknown receipt-mismatch when the receipt answers another request id', async () => {
     const { requestIndependentReview } = makeRequestReviewFake({
       outcome: 'reviewed',

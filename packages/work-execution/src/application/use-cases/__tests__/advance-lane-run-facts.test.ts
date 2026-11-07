@@ -407,6 +407,7 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
       qualifier: null,
       parkedFrom: 'ready',
       questionId: null,
+      class: 'other',
     });
     expect(after?.parkCount).toBe(1);
     expect(after?.revision).toBe(2);
@@ -636,6 +637,7 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
       qualifier: 'dispatch',
       parkedFrom: 'ready',
       questionId: null,
+      class: 'step-refused',
     });
     expect(after?.parkCount).toBe(1);
     expect(after?.revision).toBe(2);
@@ -814,6 +816,7 @@ describe('AdvanceLaneRunUseCase conductor deadline (SEC-5c-2)', () => {
       qualifier: 'stop',
       parkedFrom: 'running',
       questionId: null,
+      class: 'other',
     });
   });
 });

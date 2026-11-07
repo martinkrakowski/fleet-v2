@@ -175,9 +175,22 @@ export class PullRequestLink {
   }
 }
 
-/** `<repository>#<number>`: the store key of a pull request (one link per key). */
+/**
+ * The ASCII lower-case of a repository string: GitHub owner and repository
+ * names are ASCII, so only ASCII letters ever change case.
+ */
+function asciiLowerRepository(text: string): string {
+  return text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+/** Whether two repository strings name the same repository on the canonical key. */
+function sameRepositoryKey(left: string, right: string): boolean {
+  return asciiLowerRepository(left) === asciiLowerRepository(right);
+}
+
+/** `<repository>#<number>` on the canonical key: the store key of a pull request (one link per key), ASCII-lower-cased so a pre-WB5b3 mixed-case stored link is still found (WB5b3). */
 export function pullRequestLinkKey(ref: PlanPullRequestRef): string {
-  return `${ref.repository}#${ref.number}`;
+  return `${asciiLowerRepository(ref.repository)}#${ref.number}`;
 }
 
 /**
@@ -193,7 +206,9 @@ export function decidePullRequestLink(
     return 'create';
   }
   const sameLane =
-    existing.repository === incoming.repository &&
+    // The repository comparison is on the canonical key (WB5b3): a stored
+    // mixed-case link and a lower-case sighting are the same pull request.
+    sameRepositoryKey(existing.repository, incoming.repository) &&
     existing.number === incoming.number &&
     existing.projectId === incoming.projectId &&
     existing.planId === incoming.planId &&
@@ -337,7 +352,7 @@ export function pullRequestLinkConflictKey(record: PullRequestLinkConflictRecord
   const lane = (lane: PullRequestLinkConflictLane): string =>
     `${lane.projectId}|${lane.planId ?? ''}|${lane.laneId}`;
   return [
-    record.repository,
+    asciiLowerRepository(record.repository),
     String(record.number),
     lane(record.linkedLane),
     lane(record.refusedLane),

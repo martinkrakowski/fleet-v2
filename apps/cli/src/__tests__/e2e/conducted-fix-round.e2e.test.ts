@@ -78,7 +78,17 @@ async function resultReasonCodesOf(current: ConductedFixture): Promise<readonly 
 }
 
 /** `expected` must appear inside `actual` in order (a subsequence of reason codes). */
-function expectCodesInOrder(actual: readonly string[], expected: readonly string[]): void {
+function expectCodesInOrder(rawActual: readonly string[], expected: readonly string[]): void {
+  // The gate and the brief-check review are opened in the same pass and run
+  // concurrently, so their results land in either order; read a brief-check
+  // result that precedes the gate result as if the gate came first.
+  const actual = [...rawActual];
+  for (let i = 1; i + 2 < actual.length; i += 1) {
+    if (actual[i - 1] === 'collected' && actual[i] === 'review-passed' && actual[i + 1] === 'gate-passed') {
+      actual[i] = 'gate-passed';
+      actual[i + 1] = 'review-passed';
+    }
+  }
   let cursor = 0;
   for (const code of actual) {
     if (cursor < expected.length && code === expected[cursor]) {

@@ -606,7 +606,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
   });
 
-  it('no-receipt retries the same seat once, then moves to the next seat, then parks when the plan is exhausted', async () => {
+  it('no-receipt retries the same seat once, moves to the next seat, waits while a pass counter is below the bound, and parks on the production path when the plan is exhausted', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
     harness.setReviewAnswer(async () => ({ outcome: 'no-receipt', reason: 'review-unavailable', detail: null }));
@@ -639,18 +639,17 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     // RV4 + PT1d: retries count every remaining review intent of the generation
     // (`remaining.length - 1`), so after the one budget retry on the first
     // seat the switched seat's no-receipt gets no second retry; with the seat
-    // plan exhausted the step waits review-seat-unavailable until
-    // reviewSeatUnavailablePasses reaches REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
-    // and only then parks.
-    const fourth = await advance(harness);
+    // plan exhausted the step waits review-seat-unavailable only while a
+    // present reviewSeatUnavailablePasses is below
+    // REVIEW_SEAT_UNAVAILABLE_MAX_PASSES, and parks on the production path
+    // (absent counter) or at the bound.
+    const fourth = await advance(harness, { reviewSeatUnavailablePasses: 0 });
     expect(fourth).toEqual({ outcome: 'waiting', reason: 'review-seat-unavailable' });
     const fifth = await advance(harness, {
       reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1,
     });
     expect(fifth).toEqual({ outcome: 'waiting', reason: 'review-seat-unavailable' });
-    const sixth = await advance(harness, {
-      reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
-    });
+    const sixth = await advance(harness);
     expect(sixth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
   });
 

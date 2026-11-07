@@ -307,8 +307,9 @@ export interface LaneRunFacts {
   readonly reviewSeat: LaneRunSeatFact;
   /**
    * PT1d: passes already taken, for the review kind whose rules are running,
-   * with no free review seat. Absent reads as 0. The driver records it.
-   * This decider only reads it.
+   * with no free review seat. Absent parks `review-seat-unavailable`; when
+   * present and below `REVIEW_SEAT_UNAVAILABLE_MAX_PASSES`, the step waits.
+   * The driver records it. This decider only reads it.
    */
   readonly reviewSeatUnavailablePasses?: number;
   /** Implementer seat indexes already dispatched in `record.round` (K4). */
@@ -692,7 +693,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     const reviewSeatUnavailableDecision = (): LaneRunDecision => {
       const passes = facts.reviewSeatUnavailablePasses;
       if (passes === undefined) {
-        return wait('review-seat-unavailable');
+        return park('review-seat-unavailable', null);
       }
       if (typeof passes !== 'number' || !Number.isSafeInteger(passes) || passes < 0) {
         return WAIT_FACTS_INCONSISTENT;

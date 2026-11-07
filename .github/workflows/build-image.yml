@@ -2,15 +2,19 @@
 #
 # fleet-v2 is a PUBLIC repository, so this runs on GitHub-hosted runners, never on the solstice
 # self-hosted pool: a pull request from a fork must not reach the owner's hosts. Every action is
-# pinned by commit. The image is linux/amd64 only: the one target is solstice's staging cluster,
-# and there is no production cluster for fleet-v2.
+# pinned by commit. The image is multi-platform: linux/amd64 for solstice's staging cluster and
+# linux/arm64 for the OCI production node (VM.Standard.A1.Flex, Ampere Altra), which serves
+# fleetcloud.dev. Each platform builds natively (hexagen-monaco's build-image.yml, same shape):
+# QEMU-emulated arm64 on a 2-CPU hosted runner can run for hours.
 #
-# - Pull requests build and scan with read-only permissions: no push, no signature.
-# - Only `main` gets packages:write and id-token:write: it pushes by digest, scans the pushed
-#   image, writes an SBOM, signs keyless (cosign, GitHub's OIDC) and attests the SBOM. The file
-#   name is part of the signing identity that platform's Kyverno policy accepts.
+# - Pull requests build and scan amd64 with read-only permissions: no push, no signature. arm64 is
+#   built and scanned at publish; an arm64-only build break therefore shows on main, not in the PR.
+# - Only `main` gets packages:write and id-token:write. `build` pushes one per-platform tag per
+#   architecture; `publish` joins them into a single multi-platform image, scans both platforms,
+#   writes an SBOM, signs keyless (cosign, GitHub's OIDC) and attests the SBOM. The file name is
+#   part of the signing identity that platform's Kyverno policy accepts.
 # - Deploys never come from CI: promote the digest from the job summary with a pull request to
-#   martinkrakowski/platform (apps/staging/fleet-v2).
+#   martinkrakowski/platform (apps/staging/fleet-v2, apps/production/fleet-v2).
 name: build-image
 on:
   pull_request:
@@ -27,7 +31,6 @@ defaults:
     shell: bash
 env:
   IMAGE: ghcr.io/martinkrakowski/fleet-v2
-  PLATFORMS: linux/amd64
 jobs:
   check:
     if: github.event_name == 'pull_request'
@@ -39,8 +42,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
-      - name: Build (no push)
-        run: docker buildx build --platform "$PLATFORMS" --load -t "scan-$GITHUB_RUN_ID" .
+      - name: Build the amd64 image (no push; arm64 is built and scanned at publish)
+        run: docker buildx build --platform linux/amd64 --load -t "scan-$GITHUB_RUN_ID" .
       - name: Scan the image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
@@ -52,13 +55,21 @@ jobs:
         if: always()
         run: docker image rm "scan-$GITHUB_RUN_ID" 2>/dev/null || true
 
-  publish:
+  build:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    # Each platform builds natively on GitHub's hosted runners (free for public repositories). Each
+    # leg pushes a per-platform tag; `publish` joins them into the one image that is scanned,
+    # signed and promoted.
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-24.04}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -69,47 +80,72 @@ jobs:
       - name: Keep the registry login inside this job's temp directory
         run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
       - name: Log in to GHCR with this job's own token
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-      - name: Build and push
+      - name: Build and push this platform
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          docker buildx build --platform "$PLATFORMS" --push --provenance=mode=max \
+          docker buildx build --platform "linux/$ARCH" --push --provenance=mode=max \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            -t "$IMAGE:sha-${GITHUB_SHA::12}" --metadata-file "$RUNNER_TEMP/meta.json" .
-          echo "DIGEST=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/meta.json")" >> "$GITHUB_ENV"
-      - name: Scan the pushed image
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
-        env:
-          TRIVY_USERNAME: ${{ github.actor }}
-          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          image-ref: ${{ env.IMAGE }}@${{ env.DIGEST }}
-          exit-code: "1"
-          severity: CRITICAL
-          ignore-unfixed: true
-      - name: SBOM
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c  # v0.24.3
-        with:
-          image: ${{ env.IMAGE }}@${{ env.DIGEST }}
-          format: spdx-json
-          output-file: ${{ runner.temp }}/sbom.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-          registry-username: ${{ github.actor }}
-          registry-password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Signature and SBOM attestation (keyless, this workflow's identity)
+            -t "$IMAGE:sha-${GITHUB_SHA::12}-$ARCH" .
+      - name: Log out and clean up
+        if: always()
         run: |
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          rm -rf "$DOCKER_CONFIG"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      # No checkout: every input comes from the registry. The signature identity Kyverno checks is
+      # this workflow file on main, not the runner.
+      - name: Keep the registry login inside this job's temp directory
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - name: Install cosign, syft and trivy (pinned, checksum-verified; the solstice builder's versions)
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sfL --proto '=https' --tlsv1.2 -o cosign https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-linux-amd64
+          echo "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71  cosign" | sha256sum -c -
+          curl -sfL --proto '=https' --tlsv1.2 -o syft.tgz https://github.com/anchore/syft/releases/download/v1.54.0/syft_1.54.0_linux_amd64.tar.gz
+          echo "54a87372498168b2d033e876fd41fa4e8035b872699e525a57046e1f2f09c860  syft.tgz" | sha256sum -c -
+          curl -sfL --proto '=https' --tlsv1.2 -o trivy.tgz https://github.com/aquasecurity/trivy/releases/download/v0.75.0/trivy_0.75.0_Linux-64bit.tar.gz
+          echo "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f  trivy.tgz" | sha256sum -c -
+          tar -xzf syft.tgz syft && tar -xzf trivy.tgz trivy
+          sudo install -m 755 cosign syft trivy /usr/local/bin/ && rm -f cosign syft syft.tgz trivy trivy.tgz
+      - name: Log in to GHCR with this job's own token
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Join both platforms into one image
+        run: |
+          tag="$IMAGE:sha-${GITHUB_SHA::12}"
+          docker buildx imagetools create -t "$tag" "$tag-amd64" "$tag-arm64"
+          echo "DIGEST=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)" >> "$GITHUB_ENV"
+      - name: Scan the pushed image, both platforms
+        run: |
+          for p in linux/amd64 linux/arm64; do
+            trivy image --platform "$p" --exit-code 1 --severity CRITICAL --ignore-unfixed --no-progress "$IMAGE@$DIGEST"
+          done
+      - name: SBOM, signature and SBOM attestation (keyless, this workflow's identity)
+        run: |
+          syft "$IMAGE@$DIGEST" -o spdx-json > "$RUNNER_TEMP/sbom.spdx.json"
           # Classic signature format until Kyverno 1.19's verification of cosign 3 bundles is proved.
           cosign sign --yes --new-bundle-format=false --use-signing-config=false "$IMAGE@$DIGEST"
           cosign attest --yes --new-bundle-format=false --use-signing-config=false --type spdxjson \
             --predicate "$RUNNER_TEMP/sbom.spdx.json" "$IMAGE@$DIGEST"
       - name: Record the digest for the promotion pull request
         run: |
-          echo "Promote with a platform pull request (apps/staging/fleet-v2): \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Promote with a platform pull request (apps/staging/fleet-v2, apps/production/fleet-v2): \`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
       - name: Log out and clean up
         if: always()
         run: |

@@ -25,7 +25,7 @@ import {
 } from '../../../domain/lane-run-keys.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LANE_RUN_STOP_KEY_MODES } from '../../../domain/lane-run-keys.js';
-import { StateFileUnknownVersionError } from '../../../infrastructure/adapters/file-store.js';
+import { StateFileUnknownVersionError, StateFileUnreadableReadOnlyError } from '../../../infrastructure/adapters/file-store.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
 import { ConductorDriverLeaseAdapter } from '../../../infrastructure/adapters/ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from '../../../infrastructure/adapters/ConductorHaltAdapter.adapter.js';
@@ -581,6 +581,52 @@ describe('LaneRunBoardReads.readRun', () => {
     const h = makeHarness();
     const result = await h.reads.readRun({ runId: RUN_ID, nowIso: NOW });
     expect(result).toEqual({ outcome: 'not-found', runId: RUN_ID });
+  });
+});
+
+describe('LaneRunBoardReads with an unreadable driver lease', () => {
+  it('projects a lease port that throws StateFileUnreadableReadOnlyError as unknown: driverLeaseLapsed null, nothing rejects', async () => {
+    const h = makeHarness({
+      driverLease: {
+        read: async () => {
+          throw new StateFileUnreadableReadOnlyError('conductor-driver-lease.json', 'invalid JSON');
+        },
+      },
+    });
+    await h.laneRunRepository.create(runRecord());
+
+    const board = await h.reads.readBoard({ nowIso: NOW });
+    expect(board.outcome).toBe('listed');
+    if (board.outcome !== 'listed') {
+      return;
+    }
+    expect(board.schedule.driverLeaseLapsed).toBeNull();
+
+    const detail = await h.reads.readRun({ runId: RUN_ID, nowIso: NOW });
+    expect(detail.outcome).toBe('listed');
+    if (detail.outcome !== 'listed') {
+      return;
+    }
+    expect(detail.driverLeaseLapsed).toBeNull();
+  });
+
+  it('still fails closed when the lease read throws any other error', async () => {
+    const h = makeHarness({
+      driverLease: {
+        read: async () => {
+          throw new Error('boom');
+        },
+      },
+    });
+    await h.laneRunRepository.create(runRecord());
+    await expect(h.reads.readBoard({ nowIso: NOW })).resolves.toEqual({
+      outcome: 'unknown',
+      reason: 'store-unreadable',
+    });
+    await expect(h.reads.readRun({ runId: RUN_ID, nowIso: NOW })).resolves.toEqual({
+      outcome: 'unknown',
+      reason: 'store-unreadable',
+    });
   });
 });
 

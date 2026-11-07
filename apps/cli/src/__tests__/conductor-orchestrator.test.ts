@@ -288,6 +288,39 @@ function makeMultiHostInstallation(conductorEnabled: boolean): FleetInstallation
   };
 }
 
+/**
+ * A sunrise-shaped host entry: the same fields the real installation files
+ * carry, so every edge-case fixture below is shaped like production, not a
+ * bare partial map.
+ */
+function sshHostFixture(name: string): Record<string, unknown> {
+  return {
+    transport: 'ssh',
+    sshAlias: name,
+    worktreeRoot: `/tmp/fleet-o9c-${name}-worktrees`,
+    roles: ['lane-runner'],
+    runner: { kind: 'opencode', port: 46000, capabilities: RUNNER_CAPABILITIES, maxLanes: 2 },
+  };
+}
+
+function localHostFixture(): Record<string, unknown> {
+  return {
+    transport: 'local',
+    worktreeRoot: '/tmp/fleet-o9c-local-worktrees',
+    roles: ['orchestrator', 'verifier'],
+  };
+}
+
+/** A v2 installation document carrying exactly these hosts, sunrise-shaped. */
+function installationWithHosts(hosts: Record<string, unknown>): FleetInstallation {
+  return {
+    schemaVersion: 2,
+    hosts,
+    forge: { mode: 'none' },
+    policy: { conductor: { enabled: true } },
+  } as FleetInstallation;
+}
+
 function runtimeOf(stateDir: string, installation: FleetInstallation): FleetCliRuntime {
   return createFleetCliRuntime({
     stateDir,
@@ -397,10 +430,11 @@ describe('o9c-multi-host: the local host is chosen among every host entry', () =
 
   it('o9c-order-independent: the local host is found wherever it sits in the host list', async () => {
     const repo = new FakeSessionRepository();
-    const installation = {
-      schemaVersion: 2,
-      hosts: { solstice: { transport: 'ssh' }, 'this-machine': { transport: 'local' }, other: { transport: 'ssh' } },
-    };
+    const installation = installationWithHosts({
+      solstice: sshHostFixture('solstice'),
+      'this-machine': localHostFixture(),
+      other: sshHostFixture('other'),
+    });
     const result = await registerConductorOrchestrator(makeRegisterInput(repo, { installation }));
     expect(result.code).toBe('registered');
     expect((await repo.snapshot())[0]!.session.host).toBe('this-machine');
@@ -408,10 +442,10 @@ describe('o9c-multi-host: the local host is chosen among every host entry', () =
 
   it('o9c-no-local-host: two ssh hosts are host-unknown and write nothing', async () => {
     const repo = new FakeSessionRepository();
-    const installation = {
-      schemaVersion: 2,
-      hosts: { solstice: { transport: 'ssh' }, equinox: { transport: 'ssh' } },
-    };
+    const installation = installationWithHosts({
+      solstice: sshHostFixture('solstice'),
+      equinox: sshHostFixture('equinox'),
+    });
     const result = await registerConductorOrchestrator(makeRegisterInput(repo, { installation }));
     expect(result).toEqual({ code: 'host-unknown', orchestratorId: null });
     expect(await repo.snapshot()).toEqual([]);
@@ -419,14 +453,10 @@ describe('o9c-multi-host: the local host is chosen among every host entry', () =
 
   it('o9c-two-local-hosts: two local hosts are host-unknown and write nothing', async () => {
     const repo = new FakeSessionRepository();
-    const installation = {
-      schemaVersion: 2,
-      hosts: {
-        solstice: { transport: 'ssh' },
-        'this-machine': { transport: 'local' },
-        'that-machine': { transport: 'local' },
-      },
-    };
+    const installation = installationWithHosts({
+      'this-machine': localHostFixture(),
+      'that-machine': localHostFixture(),
+    });
     const result = await registerConductorOrchestrator(makeRegisterInput(repo, { installation }));
     expect(result).toEqual({ code: 'host-unknown', orchestratorId: null });
     expect(await repo.snapshot()).toEqual([]);
@@ -443,10 +473,11 @@ describe('o9c-multi-host: the local host is chosen among every host entry', () =
       const repo = new FakeSessionRepository();
       const result = await registerConductorOrchestrator(
         makeRegisterInput(repo, {
-          installation: {
-            schemaVersion: 2,
-            hosts: { solstice: { transport: 'ssh' }, 'this-machine': { transport: 'local' }, broken },
-          },
+          installation: installationWithHosts({
+            solstice: sshHostFixture('solstice'),
+            'this-machine': localHostFixture(),
+            broken,
+          }),
         }),
       );
       expect(result).toEqual({ code: 'register-unknown', orchestratorId: null });

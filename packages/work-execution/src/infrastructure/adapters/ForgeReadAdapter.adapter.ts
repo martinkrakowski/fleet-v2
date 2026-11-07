@@ -559,10 +559,11 @@ function compareCodeUnits(left: string, right: string): number {
  * Pure parse of one `gh pr view --json files,changedFiles` stdout: a plain
  * object whose `files` is a dense array of fewer than 100 `{ path }` entries,
  * every path already screened and exactly as the forge named it, and
- * `changedFiles` is a non-negative integer at most `files.length`.
+ * `changedFiles` is a non-negative integer equal to `files.length`.
  * When `changedFiles` is missing or not a non-negative integer, or
- * `changedFiles > files.length`, or `files.length >= 100`, the read is
- * `unknown`; the result is deduplicated and sorted in code-unit order.
+ * `changedFiles !== files.length` (an inconsistent forge count is unknown,
+ * in either direction), or `files.length >= 100`, the read is `unknown`;
+ * the result is deduplicated and sorted in code-unit order.
  */
 export function parsePullRequestChangedFiles(stdout: string): ReadPullRequestChangedFilesResult {
   let parsed: unknown;
@@ -580,7 +581,7 @@ export function parsePullRequestChangedFiles(stdout: string): ReadPullRequestCha
   if (typeof changedFiles !== 'number' || !Number.isSafeInteger(changedFiles) || changedFiles < 0) {
     return unknownChangedFiles('unreadable-files');
   }
-  if (changedFiles > files.length || files.length >= MAX_PULL_REQUEST_CHANGED_FILES) {
+  if (changedFiles !== files.length || files.length >= MAX_PULL_REQUEST_CHANGED_FILES) {
     return unknownChangedFiles('too-many-files');
   }
   const paths = new Set<string>();

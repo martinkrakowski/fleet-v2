@@ -1118,6 +1118,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     attemptRepo: attemptRepository,
     executionJournal,
     computeDigest: sha256HexDigest,
+    // PT1ca fix 3: a hold skipped for an invalid blocker id is recorded as a
+    // work-execution attention item, through the same recorder the conductor
+    // and the daemon use.
+    recordAttentionItem: (body, actor) => coordination.recordAttentionItem.recordAttentionItem(body, actor),
     ...(forgeMode === 'github' ? { forgeRead } : {}),
   });
 

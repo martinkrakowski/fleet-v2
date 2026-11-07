@@ -248,6 +248,19 @@ describe('RegisterWorkOrderUseCase open-PR overlap', () => {
     expect(await heldWorkOrderRepo.listHeldWorkOrders()).toEqual({ outcome: 'ok', records: [] });
   });
 
+  it('a PR whose changedFiles equals the returned files, none overlapping, is found and admits', async () => {
+    const { forge, calls } = fakeForge({
+      list: { outcome: 'listed', pullRequests: [openPr(11)] },
+      files: { 11: { outcome: 'found', files: ['packages/other/x.ts', 'packages/other/y.ts'] } },
+    });
+    const { useCase, saved } = setup({ forgeRead: forge });
+    expect(await useCase.registerWorkOrder(request({ ownedPaths: ['packages/a/src'] }))).toMatchObject({
+      outcome: 'registered',
+    });
+    expect(saved).toHaveLength(1);
+    expect(calls.files).toEqual([11]);
+  });
+
   it('a PR with changedFiles missing refuses overlap-unknown', async () => {
     const files = [{ path: 'packages/other/file.ts' }];
     const forge = new ForgeReadAdapter({

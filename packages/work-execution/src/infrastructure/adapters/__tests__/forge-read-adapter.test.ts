@@ -771,6 +771,22 @@ describe('ForgeReadAdapter.readPullRequestChangedFiles', () => {
     });
   });
 
+  it('reads an inconsistent forge count as unknown: changedFiles smaller than the returned files', async () => {
+    expect(
+      await adapterFor('{"files":[{"path":"packages/other/file.ts"}],"changedFiles":0}').adapter.readPullRequestChangedFiles(
+        { pullRequestNumber: 3 },
+      ),
+    ).toEqual({ outcome: 'unknown', reason: 'too-many-files' });
+  });
+
+  it('reads an inconsistent forge count as unknown: changedFiles larger than the returned files', async () => {
+    expect(
+      await adapterFor('{"files":[{"path":"a.ts"},{"path":"b.ts"}],"changedFiles":3}').adapter.readPullRequestChangedFiles(
+        { pullRequestNumber: 3 },
+      ),
+    ).toEqual({ outcome: 'unknown', reason: 'too-many-files' });
+  });
+
   it('returns files-timed-out without calling gh when timeoutMs is not positive', async () => {
     const { adapter, calls } = adapterFor(filesStdout(['a.ts']));
     expect(await adapter.readPullRequestChangedFiles({ pullRequestNumber: 3, timeoutMs: 0 })).toEqual({

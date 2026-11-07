@@ -14,6 +14,7 @@ import {
   laneRunMergeEnqueueKey,
   laneRunPremergeKey,
   LANE_RUN_MAX_RETRY,
+  parseLaneRunKey,
 } from './lane-run-keys.js';
 import { LANE_RUN_KEY_HEAD_RULE } from './lane-run-records.js';
 import type {
@@ -233,6 +234,9 @@ export const GATE_CONGESTION_BACKOFF_MS = 60_000;
 /** Maximum gate retry runs beyond run 0 (KF-30c2); below LANE_RUN_MAX_RETRY. */
 export const GATE_CONGESTION_MAX_RETRIES = 6;
 
+/** Maximum automatic gate retries for an unknown (neither pass nor fail) read (GU1); below LANE_RUN_MAX_RETRY. */
+export const GATE_UNKNOWN_MAX_RETRIES = 1;
+
 /** PT1d: passes with no free review seat before parking `review-seat-unavailable`. */
 export const REVIEW_SEAT_UNAVAILABLE_MAX_PASSES = 6;
 
@@ -328,6 +332,12 @@ export interface LaneRunFacts {
    * is not a congestion. Non-null only when `gate === 'congested'`.
    */
   readonly gateCongestion: { readonly retry: number; readonly atIso: string } | null;
+  /**
+   * The unknown gate run at `head12` (GU1): the highest-retry gate intent whose
+   * final result is neither a pass, fail nor congestion, with its retry and
+   * whether an operator abandoned it. Non-null only when `gate === 'unknown'`.
+   */
+  readonly gateUnknown?: { readonly retry: number; readonly operatorAbandoned: boolean } | null;
   /** Receipts per (reviewer, kind) at `head12` (RW1) (PC/K5). */
   readonly briefCheck: LaneRunReviewFact;
   readonly codeReview: LaneRunReviewFact;
@@ -884,7 +894,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       // T6 (KF-30c2): a congested gate waits out the backoff, then re-runs
       // the gate under a retry key (same round, seat and head as the attempt),
       // bounded by GATE_CONGESTION_MAX_RETRIES; past the bound it parks
-      // `ambiguous` at the gate, exactly as an unknown gate parks today.
+      // `ambiguous` at the gate.
       if (facts.gate === 'congested') {
         const congestion = facts.gateCongestion;
         // Malformed congestion facts fail closed to the inconsistent-facts
@@ -918,6 +928,34 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return park('ambiguous', 'gate');
       }
       if (facts.gate === 'unknown') {
+        // GU1: an unknown gate (a read that returned neither pass nor fail) gets
+        // one fresh automatic read of the same head under a retry key. An
+        // operator-abandoned run is capped at LANE_RUN_MAX_RETRY instead, so a
+        // resume can grant one more key the same way. Past the bound it parks
+        // `ambiguous` at the gate.
+        const gateUnknown = facts.gateUnknown ?? null;
+        // Malformed unknown facts fail closed to the inconsistent-facts wait: a
+        // retry that is not a non-negative safe integer can neither bound the
+        // retries nor decide the cap.
+        if (gateUnknown === null || !Number.isSafeInteger(gateUnknown.retry) || gateUnknown.retry < 0) {
+          return WAIT_FACTS_INCONSISTENT;
+        }
+        const next = gateUnknown.retry + 1;
+        const cap = gateUnknown.operatorAbandoned ? LANE_RUN_MAX_RETRY : GATE_UNKNOWN_MAX_RETRIES;
+        if (next <= cap) {
+          const attempt = facts.attempt;
+          if (attempt === null) {
+            return WAIT_FACTS_INCONSISTENT;
+          }
+          return act({
+            step: 'gate',
+            round: attempt.round,
+            seatIndex: attempt.seatIndex,
+            head12: facts.head12,
+            retry: next,
+            attemptOrdinal: null,
+          });
+        }
         return park('ambiguous', 'gate');
       }
       if (facts.gate === 'passed') {
@@ -1171,10 +1209,40 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return settledOpenPr;
     }
 
-    // G3b / G3c: an ambiguous intent parks (or waits, when already parked).
+    // G3b / G3c: an ambiguous intent parks (or waits, when already parked); an
+    // ambiguous gate intent gets one fresh automatic read under a retry key
+    // instead (GU1), unless a stop or halt holds the run.
     if (facts.pendingIntent !== null && facts.pendingIntent.reconciliation === 'ambiguous') {
       if (facts.state === 'parked') {
         return wait('parked');
+      }
+      if (facts.pendingIntent.step === 'gate') {
+        if (facts.halted || facts.stopMode !== null) {
+          return park('ambiguous', 'gate');
+        }
+        const parsed = parseLaneRunKey(facts.pendingIntent.key);
+        if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'gate' || parsed.head12 !== facts.head12) {
+          return WAIT_FACTS_INCONSISTENT;
+        }
+        const retry = parsed.retry ?? 0;
+        if (!Number.isSafeInteger(retry) || retry < 0) {
+          return WAIT_FACTS_INCONSISTENT;
+        }
+        const attempt = facts.attempt;
+        if (attempt === null || attempt.round !== parsed.round || attempt.seatIndex !== parsed.seatIndex) {
+          return WAIT_FACTS_INCONSISTENT;
+        }
+        if (retry + 1 <= GATE_UNKNOWN_MAX_RETRIES) {
+          return act({
+            step: 'gate',
+            round: attempt.round,
+            seatIndex: attempt.seatIndex,
+            head12: facts.head12,
+            retry: retry + 1,
+            attemptOrdinal: null,
+          });
+        }
+        return park('ambiguous', 'gate');
       }
       return park('ambiguous', facts.pendingIntent.step);
     }

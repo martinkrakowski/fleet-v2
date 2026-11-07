@@ -280,6 +280,17 @@ const CASES: readonly LeakCase[] = [
   readCase("no subcommand with a token host key", "token-key", () => []),
   readCase("help with a token host key", "token-key", () => ["--help"]),
 
+  // show
+  readCase("show: token host key in the file", "token-key", () => ["show"]),
+  readCase("show: malformed entry under a token key", "malformed", () => ["show"], [T, T2]),
+  readCase("show: token host name that is a file key", "token-key", () => ["show", T]),
+  readCase("show: token host name that is absent", "plain", () => ["show", T]),
+  readCase("show: extra positional argument", "plain", () => ["show", "lanehost", T]),
+  readCase("show: token --role value", "plain", () => ["show", "--role", T]),
+  readCase("show: unknown flag named by a token", "plain", () => ["show", `--${T}`]),
+  readCase("show: token flag value", "plain", () => ["show", `--${T}=${T2}`], [T, T2]),
+  readCase("show: role lookup with a token host key in the file", "token-key", () => ["show", "--role", "lane-runner"]),
+
   // add
   writeCase("add: token host name", "plain", ({ root }) => ["add", T, "--worktree-root", root, ...VERIFIER]),
   writeCase("add: token host name that exists", "token-key", ({ root }) => ["add", T, "--worktree-root", root, ...VERIFIER]),
@@ -345,7 +356,7 @@ describe("hosts: no subcommand echoes a token in any position", () => {
       (match) => match[1],
     );
     expect(listed.sort()).toEqual(
-      ["add", "daemon", "edit", "list", "remove", "rename"].sort(),
+      ["add", "daemon", "edit", "list", "remove", "rename", "show"].sort(),
     );
     const covered = new Set(
       CASES.map((entry) => entry.name.split(":")[0].split(" ")[0]),

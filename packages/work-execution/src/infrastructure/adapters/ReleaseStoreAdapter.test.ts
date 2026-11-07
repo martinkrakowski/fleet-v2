@@ -292,41 +292,148 @@ describe('ReleaseStoreAdapter', () => {
     expect(await fs.readdir(real)).toEqual([]);
   });
 
-  // CO14c fix round 3: with write access to the root's parent, the root can be
-  // renamed away and replaced by a symlink between the check and the mkdirs.
-  // The re-check must report root-changed and remove only what this call made.
-  it('prepare re-verifies the root after the mkdirs and removes only its own staging dirs on a swap', async () => {
-    const other = path.join(tempDir, 'other');
+  // CO14c fix round 4: after a swap the staging paths resolve into an
+  // ATTACKER-CHOSEN directory, so cleanup must remove only names it can prove
+  // are the very directories this call created (dev/ino match), and it must
+  // report what it left. The swap target below is a DIFFERENT directory from
+  // the moved-away root.
+  interface SwapFixture {
+    readonly moved: string;
+    readonly target: string;
+    readonly rmdirCalls: string[];
+    /** A second mkdir that ran through the swapped-in target instead of failing. */
+    throughTarget: boolean;
+  }
+
+  /**
+   * The real filesystem, except the mkdir that creates the `.home` staging
+   * directory is preceded by the swap: the root is renamed to `moved`, a
+   * symlink replaces it at `root` pointing at `target`, and `plant` runs
+   * inside `target` before that second mkdir. The first staging mkdir (and
+   * the adapter's identity recording right after it) still happens on the
+   * real root, so the recorded dev/ino belongs to the moved-away directory.
+   */
+  async function swappingAdapter(plant?: (target: string, stagingName: string) => Promise<void>): Promise<{
+    adapter: ReleaseStoreAdapter;
+    fixture: SwapFixture;
+  }> {
+    const moved = path.join(tempDir, 'moved');
+    const target = path.join(tempDir, 'target');
+    const fixture: SwapFixture = { moved, target, rmdirCalls: [], throughTarget: false };
     let swapped = false;
-    // The real filesystem, except the mkdir that creates the staging directory
-    // is followed by the swap: the root is renamed to `other` and a symlink
-    // replaces it at `root`, so both later mkdirs run through the link.
     const swapping: typeof fs = {
       ...fs,
       mkdir: async (pathOrDir, options) => {
-        await fs.mkdir(pathOrDir as never, options);
         const dir = pathOrDir.toString();
-        if (!swapped && path.dirname(dir) === root && path.basename(dir).startsWith(`.staging-${A}-`)) {
+        const base = path.basename(dir);
+        if (!swapped && base.endsWith('.home') && base.startsWith(`.staging-${A}-`)) {
           swapped = true;
-          await fs.rename(root, other);
-          await fs.writeFile(path.join(other, 'sentinel.txt'), 'untouched');
-          await fs.symlink(other, root);
+          const stagingName = base.slice(0, -'.home'.length);
+          await fs.rename(root, moved);
+          await fs.writeFile(path.join(moved, 'sentinel.txt'), 'untouched');
+          await fs.symlink(target, root);
+          if (plant !== undefined) {
+            await plant(target, stagingName);
+          }
+        }
+        await fs.mkdir(pathOrDir as never, options);
+        if (swapped && base.endsWith('.home')) {
+          // The second mkdir landed inside the swapped-in target.
+          fixture.throughTarget = true;
         }
         return undefined;
       },
+      rmdir: async (pathOrDir) => {
+        fixture.rmdirCalls.push(pathOrDir.toString());
+        return fs.rmdir(pathOrDir as never);
+      },
     } as typeof fs;
-    const swappingAdapter = new ReleaseStoreAdapter(swapping);
+    return { adapter: new ReleaseStoreAdapter(swapping), fixture };
+  }
+
+  /** The staging names left in the moved-away root (this call's real directories). */
+  async function movedStagingNames(moved: string): Promise<string[]> {
+    return (await fs.readdir(moved)).filter((n) => n.startsWith('.staging-'));
+  }
+
+  it('prepare re-verifies the root after the mkdirs, removes only its own verified staging dirs, and reports leftovers on a swap', async () => {
+    // Nothing foreign exists in the swap target: leftovers must be empty.
+    const { adapter: swapped, fixture } = await swappingAdapter();
+    await fs.mkdir(fixture.target, { recursive: true });
+    await fs.writeFile(path.join(fixture.target, 'sentinel.txt'), 'untouched');
+    const before = (await fs.readdir(fixture.target)).slice().sort();
     await fs.mkdir(root, { recursive: true });
-    const result = await swappingAdapter.prepare({ root, sha: A });
-    expect(result).toEqual({ outcome: 'root-changed' });
-    // Neither staging directory remains, reached either way.
-    for (const name of (await fs.readdir(other)).filter((n) => n.startsWith('.staging-'))) {
-      expect(await lstatOrNullForTest(path.join(other, name))).toBeNull();
+    const result = await swapped.prepare({ root, sha: A });
+    if (result.outcome !== 'root-changed') {
+      throw new Error(`expected root-changed, got ${result.outcome}`);
+    }
+    expect(result.leftovers).toEqual([]);
+    // The cleanup loop is not vacuous: it attempted at least one rmdir.
+    expect(fixture.rmdirCalls.length).toBeGreaterThanOrEqual(1);
+    // Our empty staging directory stays behind in the moved-away root — the
+    // ruling accepts that — and nothing of ours is reachable at the root
+    // paths any more.
+    for (const name of await movedStagingNames(fixture.moved)) {
+      expect(await lstatOrNullForTest(path.join(fixture.moved, name))).toBe(true);
       expect(await lstatOrNullForTest(path.join(root, name))).toBeNull();
     }
-    // The swap is in place and nothing else in `other` was removed.
+    // The swap is in place and nothing else in the target was removed.
     expect((await fs.lstat(root)).isSymbolicLink()).toBe(true);
-    expect(await fs.readFile(path.join(other, 'sentinel.txt'), 'utf8')).toBe('untouched');
+    expect(await fs.readFile(path.join(fixture.target, 'sentinel.txt'), 'utf8')).toBe('untouched');
+    expect((await fs.readdir(fixture.target)).sort()).toEqual(before);
+  });
+
+  it('prepare never removes a non-empty planted .home in the swapped-in target and reports it as a leftover', async () => {
+    const { adapter: swapped, fixture } = await swappingAdapter(async (target, stagingName) => {
+      // A NON-EMPTY directory under our `.home` name, planted in the target.
+      const planted = path.join(target, `${stagingName}.home`);
+      await fs.mkdir(planted);
+      await fs.writeFile(path.join(planted, 'planted.txt'), 'not ours');
+    });
+    await fs.mkdir(fixture.target, { recursive: true });
+    await fs.writeFile(path.join(fixture.target, 'sentinel.txt'), 'untouched');
+    const before = (await fs.readdir(fixture.target)).slice().sort();
+    await fs.mkdir(root, { recursive: true });
+    const result = await swapped.prepare({ root, sha: A });
+    if (result.outcome !== 'root-changed') {
+      throw new Error(`expected root-changed, got ${result.outcome}`);
+    }
+    const stagingNames = await movedStagingNames(fixture.moved);
+    expect(stagingNames.length).toBeGreaterThanOrEqual(1);
+    const plantedPath = path.join(root, `${stagingNames[0]}.home`);
+    expect(result.leftovers).toEqual([plantedPath]);
+    // The planted directory and its content survive untouched.
+    expect(await fs.readFile(path.join(plantedPath, 'planted.txt'), 'utf8')).toBe('not ours');
+    expect(await fs.readFile(path.join(fixture.target, 'sentinel.txt'), 'utf8')).toBe('untouched');
+    // Nothing in the target was removed; the only new entry is the planted
+    // directory this call refused to touch.
+    const after = (await fs.readdir(fixture.target)).sort();
+    for (const entry of before) {
+      expect(after).toContain(entry);
+    }
+    expect(fixture.throughTarget).toBe(false);
+  });
+
+  it('prepare leaves an empty planted staging dir in the swapped-in target and reports it as a leftover', async () => {
+    const { adapter: swapped, fixture } = await swappingAdapter(async (target, stagingName) => {
+      // An EMPTY directory under exactly the name this call used, planted in the target.
+      await fs.mkdir(path.join(target, stagingName));
+    });
+    await fs.mkdir(fixture.target, { recursive: true });
+    await fs.mkdir(root, { recursive: true });
+    const result = await swapped.prepare({ root, sha: A });
+    if (result.outcome !== 'root-changed') {
+      throw new Error(`expected root-changed, got ${result.outcome}`);
+    }
+    const stagingNames = await movedStagingNames(fixture.moved);
+    expect(stagingNames.length).toBeGreaterThanOrEqual(1);
+    const plantedPath = path.join(root, stagingNames[0]);
+    // The planted name fails the dev/ino match, so it is left and reported.
+    expect(result.leftovers).toEqual([plantedPath]);
+    expect(await lstatOrNullForTest(plantedPath)).toBe(true);
+    // Our own empty `.home` (created through the target symlink) is still ours and removed.
+    expect(await lstatOrNullForTest(path.join(root, `${stagingNames[0]}.home`))).toBeNull();
+    expect((await fs.readdir(fixture.target)).sort()).toEqual([stagingNames[0]]);
   });
 
   it('prepare refuses when the root is a file rather than a directory', async () => {

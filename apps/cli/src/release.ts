@@ -252,7 +252,7 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
       }
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' };
     }
-    return manageReleaseFromPayload(
+    const result = await manageReleaseFromPayload(
       { ...payload, action, root: verified.root },
       {
         lease: rt.conductor.driverLease,
@@ -262,6 +262,8 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
         env: () => process.env, // the use case passes only a filtered allowlist to the git child
       },
     );
+    printLeftovers(result);
+    return result;
   };
 }
 
@@ -285,6 +287,22 @@ export async function manageReleaseFromPayload(
     env: deps.env,
   });
   return await useCase.manageRelease(request);
+}
+
+/**
+ * CO14c fix round 4: for the `release-root-changed` refusal the store reports
+ * the staging names it could not prove its own after a root swap, so the
+ * operator can clean them by hand. One line per leftover goes to stdout;
+ * these paths appear only in that human-readable output, never anywhere a
+ * machine reads the typed result. Exported for the CLI tests only.
+ */
+export function printLeftovers(result: ManageReleaseResult): void {
+  if (result.outcome !== 'refused' || result.reason !== 'release-root-changed' || result.leftovers === undefined) {
+    return;
+  }
+  for (const leftover of result.leftovers) {
+    process.stdout.write(`left in place (not ours to remove): ${leftover}\n`);
+  }
 }
 
 function parseRequest(payload: Payload): ManageReleaseRequest {

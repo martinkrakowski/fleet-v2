@@ -82,12 +82,13 @@ class FakeStore implements ReleaseStorePort {
   prepared = 0;
   discardUnreadable = false;
   rootChanged = false;
+  rootChangedLeftovers: string[] = [];
   readonly preparedIds: string[] = [];
 
   async prepare(input: { root: string; sha: string }): Promise<ReleaseStagingResult> {
     this.calls.push(`prepare ${input.sha}`);
     if (this.rootChanged) {
-      return { outcome: 'root-changed' };
+      return { outcome: 'root-changed', leftovers: this.rootChangedLeftovers };
     }
     this.prepared += 1;
     const buildId = `${input.sha}-${String(this.prepared).padStart(16, '0')}`;
@@ -1028,7 +1029,22 @@ describe('ManageReleaseUseCase', () => {
     store.rootChanged = true;
     const { useCase } = granted(INSTALL, F, { store });
     const result = await manage(useCase, applyRequest({ root: ROOT, source: SOURCE, sha: F }));
-    expect(result).toEqual({ outcome: 'refused', reason: 'release-root-changed' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-root-changed', leftovers: [] });
+  });
+
+  // CO14c fix round 4: the release-root-changed refusal carries the staging
+  // names the store left in place after a swap; no other refusal carries any.
+  it('a root-changed refusal carries the leftovers the store left in place', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4), build('e', 5)], E);
+    store.rootChanged = true;
+    store.rootChangedLeftovers = ['/srv/fleet-releases/.staging-left-over.home'];
+    const { useCase } = granted(INSTALL, F, { store });
+    const result = await manage(useCase, applyRequest({ root: ROOT, source: SOURCE, sha: F }));
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'release-root-changed',
+      leftovers: ['/srv/fleet-releases/.staging-left-over.home'],
+    });
   });
 
   // CO14c fix round 2: the store never creates the release root, so even an

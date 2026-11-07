@@ -72,7 +72,16 @@ export interface ManageReleaseApplied {
 }
 
 export type ManageReleaseResult =
-  | { readonly outcome: 'refused'; readonly reason: ManageReleaseRefusal }
+  | {
+      readonly outcome: 'refused';
+      readonly reason: ManageReleaseRefusal;
+      /**
+       * Only for the `release-root-changed` refusal: the staging-name paths the
+       * store could not prove its own (or could not remove) after a root swap,
+       * left in place for the operator. Never set for any other refusal.
+       */
+      readonly leftovers?: readonly string[];
+    }
   | ManageReleasePlan
   | ManageReleaseApplied;
 

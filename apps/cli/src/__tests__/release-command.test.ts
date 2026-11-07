@@ -24,7 +24,7 @@ import type {
 import { CliUsageError } from '../commands/payload.js';
 import { createFleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
-import { manageReleaseFromPayload, releaseAuthorization, releaseCommands } from '../release.js';
+import { manageReleaseFromPayload, printLeftovers, releaseAuthorization, releaseCommands } from '../release.js';
 
 const ROOT = '/nonexistent-fleet-release-root-co14';
 const SOURCE = '/nonexistent-fleet-v2-source-co14';
@@ -251,5 +251,25 @@ describe('release command', () => {
     }
     expect(results[2]).toEqual({ outcome: 'refused', reason: 'not-found' });
     expect(results[3]).toEqual({ outcome: 'refused', reason: 'not-found' });
+  });
+
+  // CO14c fix round 4: the release-root-changed refusal prints one line per
+  // leftover path for the operator; no other refusal prints any.
+  it('prints one line per leftover for the release-root-changed refusal only', () => {
+    const written: string[] = [];
+    const original = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      printLeftovers({ outcome: 'refused', reason: 'release-root-changed', leftovers: ['/srv/r/.staging-x.home'] });
+      printLeftovers({ outcome: 'refused', reason: 'authority-refused' });
+      printLeftovers({ outcome: 'refused', reason: 'release-root-changed', leftovers: [] });
+      printLeftovers({ outcome: 'refused', reason: 'release-root-changed' });
+    } finally {
+      process.stdout.write = original;
+    }
+    expect(written).toEqual(['left in place (not ours to remove): /srv/r/.staging-x.home\n']);
   });
 });

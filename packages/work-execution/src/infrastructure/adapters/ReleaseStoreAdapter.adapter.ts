@@ -17,7 +17,7 @@
  * never a path.
  */
 
-import { promises as fs, type Dirent, type Stats } from 'node:fs';
+import { promises as fs, type BigIntStats, type Dirent, type Stats } from 'node:fs';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
@@ -56,6 +56,15 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     if (!SHA_PATTERN.test(input.sha)) {
       return { outcome: 'unreadable' };
     }
+    // The dev/ino of exactly the two directories this call creates, recorded
+    // right after each mkdir. Cleanup removes a name only when it still is
+    // the very directory this call made; a swapped-in target keeps whatever
+    // an attacker planted under our names. Declared before the try so the
+    // failure path can still consult what was recorded.
+    const created = new Map<string, { readonly dev: bigint; readonly ino: bigint } | null>();
+    // The staging paths in creation order; filled only as each mkdir succeeds,
+    // so the failure path never names a directory this call did not create.
+    const stagingPaths: string[] = [];
     try {
       // The release root is never created here: it must already exist as a real
       // directory. Only directories inside an existing real root are created.
@@ -75,7 +84,11 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       const buildDir = stagingDir(input.root, buildId);
       // Not recursive: the mkdir fails when the name exists, so this run alone created it.
       await fs.mkdir(buildDir);
+      stagingPaths.push(buildDir);
+      created.set(buildDir, await stagingIdentity(fs, buildDir));
       await fs.mkdir(`${buildDir}.home`);
+      stagingPaths.push(`${buildDir}.home`);
+      created.set(`${buildDir}.home`, await stagingIdentity(fs, `${buildDir}.home`));
       // Re-verify after the mkdirs: someone with write access to the root's
       // parent can swap it for a symlink between the check and the mkdir.
       // This narrows the check-then-use window; it cannot close it.
@@ -90,13 +103,27 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
           !buildReal.startsWith(realRoot + path.sep) ||
           path.dirname(buildReal) !== realRoot
         ) {
-          return await discardStaging(buildDir, { outcome: 'root-changed' });
+          return await discardStaging(fs, created, stagingPaths);
         }
       } catch {
-        return await discardStaging(buildDir, { outcome: 'root-changed' });
+        return await discardStaging(fs, created, stagingPaths);
       }
       return { outcome: 'prepared', buildId, buildDir, archivePath: `${buildDir}.tar`, homeDir: `${buildDir}.home` };
     } catch {
+      // A failure after the first staging mkdir (for example a `.home` name an
+      // attacker planted in a swapped-in target, which makes the second mkdir
+      // fail with EEXIST) is a changed root, not a plain unreadable store:
+      // the staged names are reported, never removed unverified.
+      if (stagingPaths.length > 0) {
+        // The `.home` mkdir never succeeded here, so no identity was recorded
+        // for it: any name now sitting at that path is not proven ours. Let
+        // the cleanup look at it too, so it is reported and never removed.
+        const homePath = `${stagingPaths[0]}.home`;
+        if (!stagingPaths.includes(homePath)) {
+          stagingPaths.push(homePath);
+        }
+        return await discardStaging(fs, created, stagingPaths);
+      }
       return { outcome: 'unreadable' };
     }
   }
@@ -241,17 +268,89 @@ function stagingDir(root: string, buildId: string): string {
 }
 
 /**
+ * The identity of a staging directory this `prepare` just created, read with
+ * `{ bigint: true }` so large inode numbers compare exactly. Null — a failed
+ * lstat, a symlink or anything that is not a plain directory — means the name
+ * is not proven ours and cleanup must never remove it.
+ */
+async function stagingIdentity(
+  fsApi: typeof fs,
+  dir: string,
+): Promise<{ readonly dev: bigint; readonly ino: bigint } | null> {
+  try {
+    const stat = await fsApi.lstat(dir, { bigint: true });
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      return null;
+    }
+    return { dev: stat.dev, ino: stat.ino };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Remove exactly the two directories this `prepare` created, non-recursively
- * and with errors ignored: the caller sees `root-changed`, never a thrown
- * cleanup failure, and nothing beyond these two names is ever touched.
+ * and with errors reported rather than thrown: the caller sees `root-changed`
+ * with the names that could not be proven ours, never a thrown cleanup
+ * failure, and nothing beyond these two names is ever touched.
+ *
+ * ARCHITECTURE ASSERTION: this function performs only non-recursive `rmdir`
+ * calls, each guarded by a dev/ino identity match, and there is no `rm`, no
+ * `fs.rm` and no recursive removal anywhere in it.
  */
 async function discardStaging(
-  buildDir: string,
-  result: { readonly outcome: 'root-changed' },
-): Promise<{ readonly outcome: 'root-changed' }> {
-  await fs.rmdir(buildDir).catch(() => undefined);
-  await fs.rmdir(`${buildDir}.home`).catch(() => undefined);
-  return result;
+  fsApi: typeof fs,
+  created: ReadonlyMap<string, { readonly dev: bigint; readonly ino: bigint } | null>,
+  stagingPaths: readonly string[],
+): Promise<{ readonly outcome: 'root-changed'; readonly leftovers: readonly string[] }> {
+  const leftovers: string[] = [];
+  for (const dir of stagingPaths) {
+    const identity = created.get(dir) ?? null;
+    const stat = await lstatOrNullBigInt(fsApi, dir);
+    if (identity === null) {
+      // Never recorded (the mkdir or the recording lstat failed for it): the
+      // name at this path is not proven ours, so it is left alone and, when
+      // something is there at all, reported.
+      if (stat !== null) {
+        leftovers.push(dir);
+      }
+      continue;
+    }
+    if (stat === null) {
+      // Nothing at the path any more (already gone, or it never existed in
+      // the swapped-in root): nothing to remove, nothing to report.
+      continue;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== identity.dev || stat.ino !== identity.ino) {
+      // Not the very directory this call created (a planted name in a
+      // swapped-in target, a symlink, or the root moved again): never touch it.
+      leftovers.push(dir);
+      continue;
+    }
+    // Owner-accepted residual: the window between this final lstat and the
+    // rmdir below cannot be closed; a swap in that instant is part of the
+    // accepted risk, bounded by the name being ours and the rmdir being
+    // non-recursive.
+    try {
+      await fsApi.rmdir(dir);
+    } catch (error) {
+      if ((error as { code?: unknown }).code === 'ENOENT') {
+        continue;
+      }
+      // Non-empty, busy or otherwise unremovable: left alone and reported.
+      leftovers.push(dir);
+    }
+  }
+  return { outcome: 'root-changed', leftovers };
+}
+
+/** lstat with bigint identity fields, null when nothing exists at the path. */
+async function lstatOrNullBigInt(fsApi: typeof fs, target: string): Promise<BigIntStats | null> {
+  try {
+    return await fsApi.lstat(target, { bigint: true });
+  } catch {
+    return null;
+  }
 }
 
 function isBuildIdOf(buildId: unknown, sha: string): buildId is string {

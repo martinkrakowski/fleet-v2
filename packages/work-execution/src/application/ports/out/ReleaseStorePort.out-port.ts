@@ -46,8 +46,16 @@ export type ReleaseStagingResult =
       readonly homeDir: string;
     }
   | { readonly outcome: 'unreadable' }
-  /** The root was swapped for a symlink or moved between the check and the mkdirs; nothing this call created remains. */
-  | { readonly outcome: 'root-changed' };
+  /**
+   * The root was swapped for a symlink or moved between the check and the
+   * mkdirs. Only the two empty staging names this call created are ever
+   * cleaned, each non-recursively and only when it still is the very
+   * directory this call created (matched by dev and ino); `leftovers` lists
+   * the staging-name paths that were left in place because they were not
+   * proven ours or could not be removed. Nothing inside a swapped-in target
+   * beyond those two names is ever removed.
+   */
+  | { readonly outcome: 'root-changed'; readonly leftovers: readonly string[] };
 
 export interface ReleaseStorePort {
   /**

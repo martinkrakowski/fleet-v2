@@ -27,7 +27,10 @@
  * shell); the git step is a local read with no hooks and no network, and every
  * step runs on a filtered environment that never hands the operator's full
  * environment (tokens, credentials) to a child. Nothing is echoed from a command, and no result carries a path or a
- * grant id; an unfinished prune is reported, never smoothed over.
+ * grant id (the sole exception is the `release-root-changed` refusal, whose
+ * `leftovers` name the staging paths that were left in place after a root
+ * swap, so the operator can clean them by hand); an unfinished prune is
+ * reported, never smoothed over.
  */
 
 import { containsSecretShape } from '@fleet/shared';
@@ -172,7 +175,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (request.action === 'install' && !alreadyBuilt) {
       const built = await this.build(request, target);
       if (built !== null) {
-        return refuse(built);
+        return typeof built === 'string' ? refuse(built) : refuse(built.refusal, built.leftovers);
       }
       rebuilt = true;
     }
@@ -391,11 +394,14 @@ export class ManageReleaseUseCase implements ManageReleasePort {
   }
 
   /** null when the build is verified and in place; the refusal otherwise. Nothing is repointed here. */
-  private async build(request: ValidRequest, sha: string): Promise<ManageReleaseRefusal | null> {
+  private async build(
+    request: ValidRequest,
+    sha: string,
+  ): Promise<ManageReleaseRefusal | { readonly refusal: 'release-root-changed'; readonly leftovers: readonly string[] } | null> {
     const source = request.source as string;
     const staging = await this.deps.store.prepare({ root: request.root, sha });
     if (staging.outcome === 'root-changed') {
-      return 'release-root-changed';
+      return { refusal: 'release-root-changed', leftovers: staging.leftovers };
     }
     if (staging.outcome !== 'prepared') {
       return 'store-unreadable';
@@ -526,8 +532,11 @@ function grantCoordinates(
   return { actionKind, actionId: `${actionKind}-${target}` };
 }
 
-function refuse(reason: ManageReleaseRefusal): ManageReleaseResult {
-  return { outcome: 'refused', reason };
+function refuse(reason: ManageReleaseRefusal, leftovers?: readonly string[]): ManageReleaseResult {
+  // The leftovers travel only with the `release-root-changed` refusal, never with any other.
+  return reason === 'release-root-changed' && leftovers !== undefined
+    ? { outcome: 'refused', reason, leftovers }
+    : { outcome: 'refused', reason };
 }
 
 function compareBuilds(a: ReleaseBuildRecord, b: ReleaseBuildRecord): number {

@@ -39,7 +39,12 @@ import type {
   AuthorizeUnsealedWorktreeRemovalResult,
 } from '../../ports/out/ActionAuthorizationPort.out-port.js';
 import type { ArtifactManifestRemovalCheckResult } from '../../ports/out/AttemptArtifactPort.out-port.js';
-import { ReapLaneWorktreesUseCase } from '../ReapLaneWorktreesUseCase.use-case.js';
+import type { RunnerForAttemptPort } from '../../ports/out/RunnerForAttemptPort.out-port.js';
+import {
+  ReapLaneWorktreesDependencies,
+  ReapLaneWorktreesUseCase,
+  unsealedRemovalRequestDigest,
+} from '../ReapLaneWorktreesUseCase.use-case.js';
 import type { ReapLaneWorktreesResult } from '../../ports/in/ReapLaneWorktreesPort.in-port.js';
 
 const NOW = '2026-10-31T00:00:00.000Z';
@@ -304,8 +309,9 @@ function harness(options: {
   runRepoList?: () => Promise<unknown>;  storeCallTimeoutMs?: number;
   appendJournalEntry?: JournalFake['appendJournalEntry'];
   listAttemptsThrows?: boolean;
-} = {}): Harness {
-  const workOrders = new Map((options.workOrders ?? [makeWorkOrder('wo-a')]).map((r) => [r.id, r]));
+  runnerForAttempt?: RunnerForAttemptPort;
+  noRunnerForAttempt?: boolean;
+} = {}): Harness {  const workOrders = new Map((options.workOrders ?? [makeWorkOrder('wo-a')]).map((r) => [r.id, r]));
   const attempts = options.attempts ?? [];
   const runs = options.runs ?? [];
   const journalStates = options.journalStates ?? new Map<string, string>();
@@ -361,6 +367,11 @@ function harness(options: {
   const authorization =
     options.noActionAuthorization === true ? null : makeActionAuthorization(options.authorization);
 
+  const runnerForAttempt: RunnerForAttemptPort | undefined =
+    options.noRunnerForAttempt === true
+      ? undefined
+      : (options.runnerForAttempt ?? defaultRunnerForAttempt());
+
   const useCase = new ReapLaneWorktreesUseCase({
     workOrderRepo,
     attemptRepo,
@@ -373,10 +384,13 @@ function harness(options: {
       ? {}
       : { attemptArtifact: makeAttemptArtifact(options.attemptArtifact) }),
     ...(authorization !== null ? { actionAuthorization: authorization } : {}),
+    ...(runnerForAttempt === undefined
+      ? {}
+      : ({ runnerForAttempt } as { runnerForAttempt: RunnerForAttemptPort })),
     ...(options.storeCallTimeoutMs !== undefined
       ? { storeCallTimeoutMs: options.storeCallTimeoutMs }
       : {}),
-  });
+  } as ReapLaneWorktreesDependencies);
   return {
     useCase,
     workspace,
@@ -394,6 +408,20 @@ function reap(
   return h.useCase.reapLaneWorktrees(request as never) as Promise<
     Extract<ReapLaneWorktreesResult, { outcome: 'reaped' }>
   >;
+}
+
+/** The default fake runner: answers idle so fixtures stay eligible without the option. */
+function defaultRunnerForAttempt(): RunnerForAttemptPort {
+  return {
+    runnerForAttempt: () => ({
+      ok: true,
+      runner: {
+        async inspectWorktreeRun() {
+          return { state: 'idle' };
+        },
+      } as never,
+    }),
+  };
 }
 
 /** One terminal, eligible run: merged journal, merged work order, one collected attempt with a sealed manifest. */
@@ -499,7 +527,6 @@ describe('ReapLaneWorktreesUseCase', () => {
       journalFailed: [],
     });
     expect(h.removeCalls()).toHaveLength(0);
-    expect(h.inspectCalls()).toHaveLength(0);
     expect(h.journal.entries).toHaveLength(0);
   });
 
@@ -970,11 +997,272 @@ describe('ReapLaneWorktreesUseCase', () => {
       recordedAtIso: NOW,
       status: 'intent-recorded',
       sessionId: null,
-      detail: 'Authorizing unsealed worktree removal for attempt attempt-1',
+      detail:
+        `Authorizing unsealed worktree removal for attempt attempt-1 on branch fleet/${RUN_1}; ` +
+        `requestDigest=${unsealedRemovalRequestDigest({
+          attemptId: 'attempt-1',
+          expectedHeadSha: COMMIT,
+          projectId: 'project-a',
+          repositoryRoot: '/srv/fleet/clone',
+          runId: RUN_1,
+          worktreePath: WORKTREE,
+          worktreeRoot: '/srv/fleet/worktrees',
+        })}`,
     });
     const recovered = await reap(crashed, { dryRun: false, forceUnsealed: true });
     expect(recovered.removed).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
     expect(crashed.journal.entries.filter((entry) => entry.id === intentId)).toHaveLength(1);
+  });
+
+  it('refuses invalid-request on missing or wrong-typed dryRun in reapLaneWorktrees while keeping execute defaults', async () => {
+    let storeReads = 0;
+    const h = harness({
+      ...eligibleSeed(),
+      runRepoList: async () => {
+        storeReads += 1;
+        return [];
+      },
+    });
+    for (const bad of [{}, { dryRun: 'false' }, { dryRun: 0 }, { dryRun: undefined }, { dryRun: null }]) {
+      await expect(h.useCase.reapLaneWorktrees(bad as never)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+    }
+    expect(storeReads).toBe(0);
+    expect(h.removeCalls()).toHaveLength(0);
+    expect(h.journal.entries).toHaveLength(0);
+
+    // `execute` keeps its pinned defaults: only an explicit `dryRun: false` removes.
+    const defaults = harness(eligibleSeed());
+    await expect(defaults.useCase.execute({ dryRun: 'false' })).resolves.toMatchObject({
+      outcome: 'reaped',
+      dryRun: true,
+    });
+    await expect(defaults.useCase.execute(undefined)).resolves.toMatchObject({ outcome: 'reaped', dryRun: true });
+    const throwingGetter = {
+      get dryRun(): boolean {
+        throw new Error('getter exploded');
+      },
+    };
+    for (const bad of [7, 'x', [], { forceUnsealed: 'yes' }, { nowIso: 'nope' }, throwingGetter]) {
+      await expect(defaults.useCase.execute(bad)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+    }
+    expect(defaults.removeCalls()).toHaveLength(0);
+    await expect(defaults.useCase.execute({ dryRun: false })).resolves.toMatchObject({
+      outcome: 'reaped',
+      dryRun: false,
+      removed: [{ runId: RUN_1, branchTip: COMMIT }],
+    });
+  });
+
+  it('verifies the worktree runner is idle before consuming a force-unsealed approval or removing', async () => {
+    const runnerCalls: unknown[] = [];
+    const runnerFor = (
+      answer: () => Promise<unknown>,
+    ): RunnerForAttemptPort => ({
+      runnerForAttempt: () => ({
+        ok: true,
+        runner: {
+          async inspectWorktreeRun(this: unknown, ref: unknown) {
+            runnerCalls.push(ref);
+            return answer();
+          },
+        } as never,
+      }),
+    });
+    const unsealedSeed = () => ({
+      ...eligibleSeed(),
+      attempts: [attemptFixture('wo-a', 'attempt-1', { artifacts: null })],
+    });
+
+    const running = harness({
+      ...unsealedSeed(),
+      runnerForAttempt: runnerFor(async () => ({ state: 'running', sessionId: 'ses_active1' })),
+    });
+    const busy = await reap(running, { dryRun: false, forceUnsealed: true });
+    expect(busy.refused).toEqual([{ runId: RUN_1, reason: 'busy' }]);
+    expect(busy.removed).toEqual([]);
+    expect(running.authorization!.calls).toHaveLength(0);
+    expect(running.removeCalls()).toHaveLength(0);
+    expect(running.journal.entries).toHaveLength(0);
+    expect(runnerCalls[0]).toEqual({ attemptId: 'attempt-1', worktreePath: WORKTREE, runner: RECORDED_HOST });
+
+    const unprovable: [string, RunnerForAttemptPort][] = [
+      ['state unknown', runnerFor(async () => ({ state: 'unknown', reason: 'runner unreachable' }))],
+      ['an unexpected state', runnerFor(async () => ({ state: 'sleeping' }))],
+      ['a non-object answer', runnerFor(async () => 'idle')],
+      [
+        'a rejected inspect',
+        runnerFor(async () => {
+          throw new Error('inspect failed');
+        }),
+      ],
+      ['a host-missing selection', { runnerForAttempt: () => ({ ok: false, reason: 'host-missing' }) }],
+      [
+        'a throwing selection',
+        {
+          runnerForAttempt: () => {
+            throw new Error('resolver exploded');
+          },
+        },
+      ],
+      ['a runner without inspectWorktreeRun', { runnerForAttempt: () => ({ ok: true, runner: {} as never }) }],
+    ];
+    for (const [label, runnerForAttempt] of unprovable) {
+      const h = harness({ ...unsealedSeed(), runnerForAttempt });
+      const result = await reap(h, { dryRun: false, forceUnsealed: true });
+      expect(result.refused, label).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+      expect(result.removed, label).toEqual([]);
+      expect(h.authorization!.calls, label).toHaveLength(0);
+      expect(h.removeCalls(), label).toHaveLength(0);
+      expect(h.journal.entries, label).toHaveLength(0);
+    }
+
+    // A sealed removal without `forceUnsealed` is guarded too.
+    const sealedBusy = harness({
+      ...eligibleSeed(),
+      runnerForAttempt: runnerFor(async () => ({ state: 'running', sessionId: 'ses_active1' })),
+    });
+    const sealedResult = await reap(sealedBusy, { dryRun: false });
+    expect(sealedResult.refused).toEqual([{ runId: RUN_1, reason: 'busy' }]);
+    expect(sealedBusy.removeCalls()).toHaveLength(0);
+
+    // A runner that hangs past the budget is unknown, never idle.
+    const hung = harness({
+      ...unsealedSeed(),
+      storeCallTimeoutMs: 25,
+      runnerForAttempt: runnerFor(
+        () =>
+          new Promise(() => {
+            /* never settles */
+          }),
+      ),
+    });
+    const hungResult = await reap(hung, { dryRun: false, forceUnsealed: true });
+    expect(hungResult.refused).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+    expect(hung.removeCalls()).toHaveLength(0);
+
+    const idle = harness({
+      ...unsealedSeed(),
+      runnerForAttempt: runnerFor(async () => ({ state: 'idle' })),
+    });
+    const removed = await reap(idle, { dryRun: false, forceUnsealed: true });
+    expect(removed.removed).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
+    expect(removed.refused).toEqual([]);
+    expect(idle.authorization!.calls).toHaveLength(1);
+    expect(idle.removeCalls()).toHaveLength(1);
+  });
+
+  it('records the full request digest on a force-unsealed intent and refuses intent-digest-mismatch before any write when retried with a changed id or coordinate', async () => {
+    const unsealedSeed = () => ({
+      ...eligibleSeed(),
+      attempts: [attemptFixture('wo-a', 'attempt-1', { artifacts: null })],
+    });
+    // First pass: the intent is written, then the authorization crashes.
+    const first = harness(unsealedSeed());
+    first.authorization!.authorizeUnsealedWorktreeRemoval = async () => {
+      throw new Error('crashed after the intent was recorded');
+    };
+    const crashedResult = await reap(first, { dryRun: false, forceUnsealed: true });
+    expect(crashedResult.refused).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+    expect(first.journal.entries).toHaveLength(1);
+    const intent = first.journal.entries[0]!;
+    expect(intent).toMatchObject({ status: 'intent-recorded', action: 'collect' });
+    const digest = /requestDigest=([0-9a-f]{64})$/.exec(intent.detail ?? '')?.[1];
+    expect(digest).toBe(
+      unsealedRemovalRequestDigest({
+        attemptId: 'attempt-1',
+        expectedHeadSha: COMMIT,
+        projectId: 'project-a',
+        repositoryRoot: '/srv/fleet/clone',
+        runId: RUN_1,
+        worktreePath: WORKTREE,
+        worktreeRoot: '/srv/fleet/worktrees',
+      }),
+    );
+    expect(intent.detail).not.toContain(WORKTREE);
+    expect(intent.detail).not.toContain('/srv/fleet');
+
+    const otherHead = 'b'.repeat(40);
+    const otherPath = '/tmp/worktree-example-other';
+    const variants: [string, string, Parameters<typeof harness>[0]][] = [
+      [
+        'runId',
+        RUN_2,
+        {
+          runs: [runRecord(RUN_2, 'wo-a', { attemptIds: ['attempt-1'] })],
+          journalStates: new Map([[RUN_2, 'merged']]),
+          inspect: () => ({
+            outcome: 'inspected',
+            facts: cleanFacts({ branch: `fleet/${RUN_2}` }),
+          }),
+        },
+      ],
+      [
+        'projectId',
+        RUN_1,
+        {
+          workOrders: [makeWorkOrder('wo-a', { projectId: 'project-b' })],
+          profiles: [{ ...makeProfile(), projectId: 'project-b' }],
+        },
+      ],
+      [
+        'expectedHeadSha',
+        RUN_1,
+        {
+          inspect: () => ({ outcome: 'inspected', facts: cleanFacts({ head: otherHead }) }),
+        },
+      ],
+      [
+        'worktreePath',
+        RUN_1,
+        {
+          attempts: [attemptFixture('wo-a', 'attempt-1', { artifacts: null, worktreePath: otherPath })],
+          inspect: () => ({ outcome: 'inspected', facts: cleanFacts({ path: otherPath }) }),
+        },
+      ],
+    ];
+    for (const [label, runId, overrides] of variants) {
+      const retry = harness({ ...unsealedSeed(), ...overrides });
+      retry.journal.entries.push(...first.journal.entries);
+      const result = await reap(retry, { dryRun: false, forceUnsealed: true });
+      expect(result.refused, label).toEqual([{ runId, reason: 'intent-digest-mismatch' }]);
+      expect(result.removed, label).toEqual([]);
+      expect(retry.journal.entries, label).toHaveLength(1);
+      expect(retry.authorization!.calls, label).toHaveLength(0);
+      expect(retry.removeCalls(), label).toHaveLength(0);
+    }
+
+    // A prior intent that carries no digest at all, or a second intent entry, is a mismatch too.
+    const legacy = harness(unsealedSeed());
+    await legacy.journal.appendJournalEntry({
+      ...intent,
+      detail: `Authorizing unsealed worktree removal for attempt attempt-1 on branch fleet/${RUN_1}`,
+    });
+    const legacyResult = await reap(legacy, { dryRun: false, forceUnsealed: true });
+    expect(legacyResult.refused).toEqual([{ runId: RUN_1, reason: 'intent-digest-mismatch' }]);
+    expect(legacy.journal.entries).toHaveLength(1);
+    expect(legacy.authorization!.calls).toHaveLength(0);
+
+    const doubled = harness(unsealedSeed());
+    await doubled.journal.appendJournalEntry(intent);
+    await doubled.journal.appendJournalEntry({ ...intent, id: `attempt-1:collect:reap-unsealed-intent:${RUN_2}` });
+    const doubledResult = await reap(doubled, { dryRun: false, forceUnsealed: true });
+    expect(doubledResult.refused).toEqual([{ runId: RUN_1, reason: 'intent-digest-mismatch' }]);
+    expect(doubled.journal.entries).toHaveLength(2);
+    expect(doubled.removeCalls()).toHaveLength(0);
+
+    // The same request retried unchanged still completes, keeping the one intent entry.
+    const same = harness(unsealedSeed());
+    same.journal.entries.push(intent);
+    const completed = await reap(same, { dryRun: false, forceUnsealed: true });
+    expect(completed.removed).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
+    expect(same.journal.entries.map((entry) => entry.status)).toEqual(['intent-recorded', 'completed']);
+    expect(same.journal.entries[1]!.id).toBe('attempt-1:collect:1');
   });
 
   it('redacts secret-shaped and path-containing errors and omits worktree paths from journal entries and results', async () => {
@@ -1041,5 +1329,26 @@ describe('ReapLaneWorktreesUseCase', () => {
     };
     visit(useCaseDir);
     expect(offenders).toEqual([]);
+  });
+
+  it('refuses not-configured when runnerForAttempt is absent at runtime (untyped caller), removing nothing', async () => {
+    const h = harness({ ...eligibleSeed(), noRunnerForAttempt: true });
+    const result = await reap(h, { dryRun: false });
+    expect(result.refused).toEqual([{ runId: RUN_1, reason: 'not-configured' }]);
+    expect(result.removed).toEqual([]);
+    expect(h.removeCalls()).toHaveLength(0);
+    expect(h.authorization?.calls).toEqual([]);
+    expect(h.journal.entries).toHaveLength(0);
+  });
+
+  it('refuses not-configured when runnerForAttempt is a non-object without the method (untyped caller)', async () => {
+    const bogus = {} as unknown as RunnerForAttemptPort;
+    const h = harness({ ...eligibleSeed(), runnerForAttempt: bogus });
+    const result = await reap(h, { dryRun: false });
+    expect(result.refused).toEqual([{ runId: RUN_1, reason: 'not-configured' }]);
+    expect(result.removed).toEqual([]);
+    expect(h.removeCalls()).toHaveLength(0);
+    expect(h.authorization?.calls).toEqual([]);
+    expect(h.journal.entries).toHaveLength(0);
   });
 });

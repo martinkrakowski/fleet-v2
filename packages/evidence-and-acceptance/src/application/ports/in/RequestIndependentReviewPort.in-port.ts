@@ -5,7 +5,7 @@
  */
 
 import type { ReceiptSubject, ReviewKind, ReviewReceiptRecord } from '../../../domain/evidence-records.js';
-import type { ReviewUnavailableCode } from '../out/IndependentReviewPort.out-port.js';
+import type { ReviewTransportDiagnostic, ReviewUnavailableCode } from '../out/IndependentReviewPort.out-port.js';
 
 export interface RequestIndependentReviewRequest {
   readonly assessmentId: string;
@@ -49,6 +49,8 @@ export type RequestIndependentReviewResult =
       readonly code?: ReviewUnavailableCode | 'not-read-only' | 'invalid-receipt';
       /** Set exactly when the request carried a requestId. */
       readonly rejection?: ReviewRejection;
+      /** The bounded transport diagnostic (RV4); set exactly when the request carried a requestId. */
+      readonly diagnostic?: ReviewTransportDiagnostic;
     };
 
 export interface RequestIndependentReviewPort {

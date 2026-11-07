@@ -231,6 +231,65 @@ describe('conductor review and CI wiring (PC-4)', () => {
   });
 });
 
+describe('conductor review transport diagnostic archive wiring (RV4 round 1)', () => {
+  it('the composed review-request adapter archives a screened seat-busy diagnostic under the request id', async () => {
+    // The production path: composeConductor builds ReviewRequestAdapter over
+    // the runtime's evidence context, with archiveEvidence bound to the real
+    // EvidenceArchiveAdapter. Only the review transport use case is replaced
+    // (it would otherwise need a reviewer seat that spawns); the screen, the
+    // archive wiring and the outcome mapping are the composed ones.
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-rv4-archive-'));
+    try {
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+      const SECRET = 'ghp_' + 'a'.repeat(36);
+      vi.spyOn(runtime.evidence.requestIndependentReview, 'requestIndependentReview').mockResolvedValue(
+        {
+          outcome: 'rejected',
+          reason: 'review seat busy',
+          rejection: 'review-unavailable',
+          code: 'seat-busy',
+          diagnostic: {
+            exitCode: 75,
+            timedOut: false,
+            stderr: `${SECRET} /tmp/secret-dir/review-log.txt`,
+            stdoutEmpty: false,
+          },
+        } as never,
+      );
+      // Wrap (never replace) the composed archive so the real archive runs and
+      // the produced reference is captured.
+      const archive = runtime.evidence.evidenceArchive;
+      const realArchive = archive.archiveEvidence.bind(archive);
+      let archivedRef: string | null = null;
+      vi.spyOn(archive, 'archiveEvidence').mockImplementation(async (request) => {
+        const result = await realArchive(request);
+        archivedRef = result.evidenceRef;
+        return result;
+      });
+
+      await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment(false));
+      await expect(
+        runtime.conductor.reviewRequest.requestReview(makeReviewRequest(REQUEST_ID)),
+      ).resolves.toEqual({ outcome: 'no-receipt', reason: 'review-unavailable', detail: 'seat-busy' });
+
+      expect(archivedRef).not.toBeNull();
+      expect(archivedRef!.startsWith(`evidence://review-transport-${REQUEST_ID}@`)).toBe(true);
+      const content = await archive.readArchivedEvidence(archivedRef!);
+      expect(JSON.parse(content ?? '{}')).toEqual({
+        exitCode: 75,
+        timedOut: false,
+        stdoutEmpty: false,
+        stderr: '[redacted] [path]',
+      });
+      expect(content).not.toContain('ghp_');
+      expect(content).not.toContain('/tmp/secret-dir');
+    } finally {
+      vi.restoreAllMocks();
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+});
+
 describe('conductor review-assessment wiring (K5-6)', () => {
   /** A valid open request over the shared attempt and head. */
   function makeOpenRequest(head: string = HEAD) {

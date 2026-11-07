@@ -384,8 +384,8 @@ describe('extractSingleTrailingJsonFence', () => {
       '```json',
       '{"verdict":"FAIL","findings":[{"severity":"blocker","file":"src/a.ts","line":1,"summary":"s"}]}',
       '```',
-      '```',
     ].join('\n');
+    // Fable's true input (Luna, RV5 round-2 re-check): no extra closing fence after the FAIL block.
     expect(extractSingleTrailingJsonFence(fableInput)).toEqual({ kind: 'invalid' });
   });
 

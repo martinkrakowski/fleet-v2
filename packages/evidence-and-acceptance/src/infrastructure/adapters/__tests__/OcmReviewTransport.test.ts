@@ -318,6 +318,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"tool_use","part":{"tool":"glob"}}',
       '{"type":"tool_call","part":{"tool":"list"}}',
       '{"type":"text","part":{"text":"No regressions found.\\n```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -348,6 +349,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"tool","part":{"tool":"edit"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -375,6 +377,7 @@ describe('OcmReviewTransport', () => {
     const recordedFixture = [
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     let headReadCount = 0;
@@ -402,6 +405,31 @@ describe('OcmReviewTransport', () => {
     const result = await transport(baseRequest);
     expect(result.readOnlyVerified).toBe(false);
     expect(result.result).toBe('pass');
+  });
+
+  it('a stream with a valid trailing PASS block but no step_finish gives unknown (stream-incomplete)', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"text","part":{"text":"Reviewed.\\n```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+    ].join('\n');
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({ exitCode: 0, stdout: recordedFixture, stderr: '' });
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+    const result = await transport(baseRequest);
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-incomplete');
+  });
+
+  it('a plain-text answer (no stream events, another transport) still parses: the finish gate is stream-only', () => {
+    const plain = ['Reviewed the diff.', '```json', '{"verdict":"PASS","findings":[]}', '```'].join('\n');
+    expect(parseReviewReplyStrict(plain).result).toBe('pass');
   });
 
   it('no verdict → unknown', async () => {
@@ -494,6 +522,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"step_start"}',
       JSON.stringify({ type: 'text', part: { text: open } }),
       JSON.stringify({ type: 'text', part: { text: part2 } }),
+      '{"type":"step_finish"}',
     ].join('\n');
     for (const kind of [undefined, 'brief-check' as const]) {
       let spawnCalls = 0;
@@ -580,6 +609,7 @@ describe('OcmReviewTransport', () => {
           '{"type":"step_start"}',
           JSON.stringify({ type: 'text', part: { text: p1 } }),
           JSON.stringify({ type: 'text', part: { text: p2 } }),
+          '{"type":"step_finish"}',
         ].join('\n');
         const transport = createOcmReviewTransport({
           ocmRunBin: '/test/ocm-run',
@@ -620,6 +650,7 @@ describe('OcmReviewTransport', () => {
         const fixture = [
           '{"type":"step_start"}',
           ...parts.map((text) => JSON.stringify({ type: 'text', part: { text } })),
+          '{"type":"step_finish"}',
         ].join('\n');
         const transport = createOcmReviewTransport({
           ocmRunBin: '/test/ocm-run',
@@ -645,6 +676,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"text","part":{"text":"Earlier note: prose only, no json block."}}',
       '{"type":"text","part":{"text":"Found regressions.\\n' +
         '```json\\n{\\"verdict\\":\\"FAIL\\",\\"findings\\":[{\\"severity\\":\\"major\\",\\"file\\":\\"src/a.ts\\",\\"line\\":3,\\"summary\\":\\"The guard is missing.\\"}]}\\n```"}}',
+        '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -711,7 +743,7 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.result).toBe('unknown');
-    expect(result.rawOutput).toBe('');
+    expect(result.rawOutput).toBe('stream-incomplete');
     expect(result.findings).toEqual([]);
   });
 
@@ -719,6 +751,7 @@ describe('OcmReviewTransport', () => {
     const recordedFixture = [
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"FINDING: blocker src/security.ts:42 Hardcoded secret token in auth flow\\n```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[{\\"severity\\":\\"blocker\\",\\"file\\":\\"src/security.ts\\",\\"line\\":42,\\"summary\\":\\"Hardcoded secret token in auth flow\\"}]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -750,6 +783,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"FINDING: major src/a.ts:3 The guard is missing.\\n\\n' +
         '```json\\n{\\"verdict\\":\\"FAIL\\",\\"findings\\":[{\\"severity\\":\\"major\\",\\"file\\":\\"src/a.ts\\",\\"line\\":3,\\"summary\\":\\"The guard is missing.\\"}]}\\n```"}}',
+        '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -786,6 +820,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"FINDING: major src/a.ts:3 The guard is missing.\\n\\n' +
         '```json\\n{\\"verdict\\":\\"FAIL\\",\\"findings\\":[{\\"severity\\":\\"major\\",\\"file\\":\\"src/a.ts\\",\\"line\\":3,\\"summary\\":\\"The guard is missing.\\"}]}\\n```"}}',
+        '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -819,6 +854,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"FINDING: blocker src/b.ts:9 Data loss on retry.\\n' +
         '```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[{\\"severity\\":\\"blocker\\",\\"file\\":\\"src/b.ts\\",\\"line\\":9,\\"summary\\":\\"Data loss on retry.\\"}]}\\n```"}}',
+        '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -862,6 +898,7 @@ describe('OcmReviewTransport', () => {
             ]) + '\n',
         },
       }),
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -934,6 +971,7 @@ describe('OcmReviewTransport', () => {
       'corrupted json line {',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
       'random trailing log message',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -962,6 +1000,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"step_start"}',
       '{"type":"tool_use","part":{"type":"tool","name":"edit"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -990,6 +1029,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"step_start"}',
       '{"type":"tool_use","part":{"type":"tool","name":"read"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -1019,6 +1059,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"unexpected_debug_event","data":{"foo":"bar"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -1046,6 +1087,7 @@ describe('OcmReviewTransport', () => {
     const recordedFixture = [
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -1074,6 +1116,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"step_start"}',
       '{"type":"tool_use","part":{"type":"tool"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -1190,6 +1233,7 @@ describe('OcmReviewTransport', () => {
     const recordedFixture = [
       `{"type":"text","part":{"text":"${prefix}"}}`,
       '{"type":"text","part":{"text":"\\n```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -1255,6 +1299,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"type":"patch"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -1313,6 +1358,7 @@ describe('OcmReviewTransport', () => {
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"type":"snapshot"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+      '{"type":"step_finish"}',
     ].join('\n');
 
     const fakeSpawn: OcmReviewTransportSpawn = async () => ({
@@ -1814,7 +1860,8 @@ describe('OcmReviewTransport', () => {
         stdout:
           '{"type":"tool","part":{"tool":"read"}}\n' +
           '{"type":"text","part":{"text":"FINDING: major src/api.ts:11 Request without validation\\n' +
-          '```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[{\\"severity\\":\\"major\\",\\"file\\":\\"src/api.ts\\",\\"line\\":11,\\"summary\\":\\"Request without validation\\"}]}\\n```\\n"}}',
+          '```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[{\\"severity\\":\\"major\\",\\"file\\":\\"src/api.ts\\",\\"line\\":11,\\"summary\\":\\"Request without validation\\"}]}\\n```\\n"}}\n' +
+          '{"type":"step_finish"}',
         stderr: '',
       };
       const makeTransport = () =>
@@ -1952,7 +1999,8 @@ describe('OcmReviewTransport', () => {
         '{"type":"step_start","part":{"type":"step-start"}}\n' +
         '{"type":"tool","part":{"tool":"read"}}\n' +
         '{"type":"tool","part":{"tool":"bash","input":{"command":"git diff --stat HEAD~1..HEAD"}}}\n' +
-        '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}';
+        '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
+        '{"type":"step_finish"}';
       const { transport } = makeTransport(stdout);
       const result = await transport(kindRequest);
       expect(result.readOnlyVerified).toBe(false);
@@ -2321,7 +2369,8 @@ describe('OcmReviewTransport', () => {
             stdout:
               '{"type":"step_start","part":{"type":"step-start"}}\n' +
               '{"type":"tool","part":{"tool":"read"}}\n' +
-              '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
+              '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
+              '{"type":"step_finish"}',
             stderr: '',
           };
         },
@@ -2341,7 +2390,8 @@ describe('OcmReviewTransport', () => {
         '{"type":"step_start","part":{"type":"step-start"}}\n' +
         '{"type":"tool","part":{"tool":"read"}}\n' +
         '{"type":"tool","part":{"tool":"bash","input":{"command":"git status"}}}\n' +
-        '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}';
+        '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
+        '{"type":"step_finish"}';
       const { transport } = makeTransport(stdout);
       const result = await transport(kindRequest);
       expect(result.readOnlyVerified).toBe(false);
@@ -2382,6 +2432,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
       '{"type":"step_start","part":{"type":"step-start"}}',
       '{"type":"tool","part":{"tool":"read"}}',
       JSON.stringify({ type: 'text', part: { text } }),
+      '{"type":"step_finish"}',
     ].join('\n');
 
   /** The code of an unavailable review result; a completed result is a test bug. */
@@ -2988,8 +3039,8 @@ describe('structured review answers (RV5)', () => {
       '```json',
       '{"verdict":"FAIL","findings":[{"severity":"blocker","file":"src/x.ts","line":1,"summary":"s"}]}',
       '```',
-      '```',
     ].join('\n');
+    // Fable's true input (Luna, RV5 round-2 re-check): no extra closing fence after the FAIL block.
     for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
       const parsed = parse(input);
       expect(parsed.result).toBe('unknown');
@@ -3168,7 +3219,9 @@ describe('RV4: busy worktree transport (seat-busy)', () => {
     reviewerModel: 'provider-b/reviewer',
   };
 
-  const PASS_JSON = '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}';
+  const PASS_JSON =
+    '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
+    '{"type":"step_finish"}';
 
   const makeTransport = (spawn: OcmReviewTransportSpawn, timeoutMs?: number) =>
     createOcmReviewTransport({

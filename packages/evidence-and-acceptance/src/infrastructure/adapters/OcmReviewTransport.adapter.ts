@@ -1262,45 +1262,17 @@ export async function defaultSpawn(
   };
 }
 
-function hasEchoedPassBlock(text: string): boolean {
-  let insideUntrusted = false;
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (UNTRUSTED_OPEN_PATTERN.test(trimmed)) {
-      insideUntrusted = true;
-      continue;
-    }
-    if (insideUntrusted) {
-      if (trimmed.startsWith('<<<END UNTRUSTED')) {
-        insideUntrusted = false;
-      } else if (trimmed.includes('"PASS"') || trimmed.includes('VERDICT: PASS')) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-function isStreamCutBeforeFinish(
-  hasStepFinish: boolean,
-  textParts: readonly string[],
-): boolean {
-  if (hasStepFinish) {
-    return false;
-  }
-  for (const part of textParts) {
-    if (hasEchoedPassBlock(part)) {
-      return true;
-    }
-  }
-  if (textParts.length > 1) {
-    for (let i = 0; i < textParts.length - 1; i += 1) {
-      if (textParts[i]?.includes('"PASS"') || textParts[i]?.includes('VERDICT: PASS')) {
-        return true;
-      }
-    }
-  }
-  return false;
+/**
+ * RV5 (Fable, F157 hand fix): a stream-format answer is accepted only after the
+ * stream finished. Without a `step_finish` event the run was cut short, and no
+ * verdict is read from it, PASS or otherwise: the answer is `unknown`
+ * (`stream-incomplete`). Plain-text answers from other transports never come
+ * through here; they are parsed directly by parseReviewReplyStrict. Every
+ * step emits its own finish, so the test is that the LAST step started also
+ * finished: an earlier step's finish does not cover a step cut short.
+ */
+function isStreamCutBeforeFinish(hasStepFinish: boolean, lastStepOpen: boolean): boolean {
+  return !hasStepFinish || lastStepOpen;
 }
 
 export function createOcmReviewTransport(
@@ -1489,6 +1461,7 @@ export function createOcmReviewTransport(
     let readOnlyVoided = false;
     let hasStepStart = false;
     let hasStepFinish = false;
+    let lastStepOpen = false;
     const textParts: string[] = [];
     const toolNames: string[] = [];
     for (const rawLine of (typeof spawnStdout === 'string' ? spawnStdout : '').split(/\r?\n/)) {
@@ -1523,10 +1496,12 @@ export function createOcmReviewTransport(
 
       if (isStepStart(parsed)) {
         hasStepStart = true;
+        lastStepOpen = true;
       }
 
       if (isStepFinish(parsed)) {
         hasStepFinish = true;
+        lastStepOpen = false;
       }
 
       if (isToolEvent(parsed)) {
@@ -1560,7 +1535,7 @@ export function createOcmReviewTransport(
       after === request.candidateHeadSha;
 
     // 9. Parse verdict, findings, and rawOutput
-    if (isStreamCutBeforeFinish(hasStepFinish, textParts)) {
+    if (isStreamCutBeforeFinish(hasStepFinish, lastStepOpen)) {
       return {
         rawOutput: 'stream-incomplete',
         readOnlyVerified,

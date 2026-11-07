@@ -641,7 +641,8 @@ function makeReviewSpawn(verdicts: readonly ('PASS' | 'FAIL')[]) {
       exitCode: 0,
       stdout:
         REVIEW_STEP_START_LINE + '\n' +
-        JSON.stringify({ type: 'text', part: { type: 'text', text } }),
+        JSON.stringify({ type: 'text', part: { type: 'text', text } }) + '\n' +
+        '{"type":"step_finish"}',
       stderr: '',
     };
   };

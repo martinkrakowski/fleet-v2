@@ -63,7 +63,8 @@ const BASE_REQUEST: RunIndependentReviewRequest = {
 
 const PASS_FIXTURE =
   '{"type":"step_start","part":{"type":"step-start"}}\n' +
-  '{"type":"text","part":{"type":"text","text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}';
+  '{"type":"text","part":{"type":"text","text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
+  '{"type":"step_finish"}';
 
 describe('ReviewTransportRouter', () => {
   describe('reviewerChainSeatIds and hasReviewerSeat', () => {

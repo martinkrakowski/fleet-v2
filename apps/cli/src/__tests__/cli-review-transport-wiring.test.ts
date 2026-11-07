@@ -33,7 +33,8 @@ const REVIEWER_MODEL = 'example-provider/grok-4.7';
 
 const PASS_FIXTURE =
   '{"type":"step_start","part":{"type":"step-start"}}\n' +
-  '{"type":"text","part":{"type":"text","text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}';
+  '{"type":"text","part":{"type":"text","text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
+  '{"type":"step_finish"}';
 
 interface Invocation {
   readonly code: number;

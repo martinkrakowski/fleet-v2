@@ -209,7 +209,8 @@ function laneRun(): LaneRunRecord {
 function reviewStream(events: readonly string[]): string {
   return (
     '{"type":"step_start","part":{"type":"step-start"}}\n' +
-    events.map((text) => JSON.stringify({ type: 'text', part: { type: 'text', text } })).join('\n')
+    events.map((text) => JSON.stringify({ type: 'text', part: { type: 'text', text } })).join('\n') +
+    '\n{"type":"step_finish"}'
   );
 }
 

@@ -23,6 +23,24 @@ import {
 } from '../record-schema-version.js';
 import { snapshotPlainDataRecord } from '../plain-record-reads.js';
 
+/**
+ * Sort string keys by UTF-16 code unit, explicitly.
+ *
+ * Every sort in this file feeds the covering digest, so the order has to be the
+ * same on every machine for the same input. A bare `.sort()` already does this,
+ * but says nothing, and `String.prototype.localeCompare` — the comparator
+ * SonarCloud's typescript:S2871 suggests — would be WRONG here: it depends on
+ * the host locale and the ICU version, so two hosts could digest the same
+ * package to different values. This comparator is the bare sort's own rule,
+ * written down, and the digest tests pin it against a locale-sensitive pair.
+ */
+export function byCodeUnit(left: string, right: string): number {
+  if (left < right) {
+    return -1;
+  }
+  return left > right ? 1 : 0;
+}
+
 export const BRIEF_PACKAGE_SCHEMA_VERSION = 2 as const;
 export const BRIEF_PACKAGE_MAX_PROSE_BYTES = 65_536;
 export const BRIEF_PACKAGE_MAX_MANIFEST_BYTES = 262_144;
@@ -221,7 +239,7 @@ function validateLimitsInstance(value: unknown): { ok: true; limits: ExecutionLi
     return { ok: false, code: 'oversized' };
   }
   const sorted: Record<string, string> = {};
-  for (const key of keys.sort()) {
+  for (const key of [...keys].sort(byCodeUnit)) {
     if (key.trim().length === 0 || key.length > BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS) {
       return { ok: false, code: 'invalid-limits' };
     }
@@ -829,7 +847,7 @@ function canonicalizeBriefFrozenInputsUnchecked(
 
 function sortedCopy(record: Readonly<Record<string, string>>): Record<string, string> {
   const sorted: Record<string, string> = {};
-  for (const key of Object.keys(record).sort()) {
+  for (const key of Object.keys(record).sort(byCodeUnit)) {
     sorted[key] = record[key];
   }
   return sorted;
@@ -996,7 +1014,7 @@ function limitsFromPlain(
     return { ok: false, code: 'oversized' };
   }
   const sorted: Record<string, string> = {};
-  for (const key of keys.sort()) {
+  for (const key of [...keys].sort(byCodeUnit)) {
     if (key.trim().length === 0 || key.length > BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS) {
       return { ok: false, code: 'invalid-limits' };
     }

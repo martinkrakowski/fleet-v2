@@ -36,6 +36,7 @@ import {
   BRIEF_PACKAGE_MAX_DECISION_REFS,
   BRIEF_PACKAGE_MAX_PATH_CHARS,
   BriefPackage,
+  byCodeUnit,
 } from '../../domain/value-objects/BriefPackage.vo.js';
 import type {
   BriefContextDecision,
@@ -202,7 +203,7 @@ function validateFrozenInputs(
   // The bounds are sorted here once, so the manifest, the digest input and
   // the frozen `ExecutionLimits` all carry the same deterministic key order.
   const sortedBounds: Record<string, string> = {};
-  for (const key of Object.keys(boundsSnapshot).sort()) {
+  for (const key of Object.keys(boundsSnapshot).sort(byCodeUnit)) {
     if (key.trim().length === 0 || key.includes('\u0000') || key.length > BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS) {
       return {
         ok: false,

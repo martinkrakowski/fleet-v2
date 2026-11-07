@@ -13,6 +13,7 @@ import {
   BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS,
   BRIEF_PACKAGE_MAX_SCALAR_CHARS,
   BriefPackage,
+  byCodeUnit,
   canonicalizeBriefFrozenInputs,
   computeBriefPackageDigest,
   readBriefPackageManifest,
@@ -258,6 +259,46 @@ describe('computeBriefPackageDigest', () => {
     expect(second.ok).toBe(true);
     if (first.ok && second.ok) {
       expect(first.briefDigest).toBe(second.briefDigest);
+    }
+  });
+
+  // SonarCloud typescript:S2871 asks every `.sort()` for an explicit comparator and suggests
+  // `localeCompare`. These three checks pin why the comparator here is code-unit order instead:
+  // `localeCompare` depends on the host locale and ICU version, so adopting it would let two
+  // hosts digest the same package to two values. They fail if someone "fixes" the rule that way.
+  it('orders bound keys by code unit, which is not what localeCompare would do', () => {
+    // 'B' is code unit 66 and 'a' is 97, so code-unit order is uppercase first; every common
+    // locale collates case-insensitively and puts 'a' first. This pair is the whole difference.
+    expect(['a', 'B'].sort(byCodeUnit)).toEqual(['B', 'a']);
+    expect(['a', 'B'].sort((left, right) => left.localeCompare(right))).toEqual(['a', 'B']);
+    expect(byCodeUnit('a', 'a')).toBe(0);
+  });
+
+  it('digests the same bounds to the same value whatever order they arrive in, for keys localeCompare would reorder', () => {
+    const forward = computeBriefPackageDigest(
+      { prose: PROSE, frozenInputs: frozenInputs({ limits: limitsValue(40, 3600, { a: '1', B: '2' }) }) },
+      computeDigest,
+    );
+    const reverse = computeBriefPackageDigest(
+      { prose: PROSE, frozenInputs: frozenInputs({ limits: limitsValue(40, 3600, { B: '2', a: '1' }) }) },
+      computeDigest,
+    );
+    expect(forward.ok).toBe(true);
+    expect(reverse.ok).toBe(true);
+    if (forward.ok && reverse.ok) {
+      expect(forward.briefDigest).toBe(reverse.briefDigest);
+    }
+  });
+
+  it('canonicalizes bound keys into code-unit order, uppercase before lowercase', () => {
+    const canonical = canonicalizeBriefFrozenInputs(
+      frozenInputs({ limits: limitsValue(40, 3600, { a: '1', B: '2' }) }),
+    );
+    expect(canonical.ok).toBe(true);
+    if (canonical.ok && canonical.json !== null) {
+      // The canonical form is a JSON string, so its literal key order IS the digest input:
+      // 'B' before 'a'. Under localeCompare it would be the other way round.
+      expect(canonical.json.indexOf('"B"')).toBeLessThan(canonical.json.indexOf('"a"'));
     }
   });
 });

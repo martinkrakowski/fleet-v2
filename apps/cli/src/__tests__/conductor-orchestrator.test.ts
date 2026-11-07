@@ -13,10 +13,10 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { containsSecretShape } from '@fleet/shared';
-import type { FleetInstallation } from '@fleet/installation';
+import { parseInstallation, type FleetInstallation } from '@fleet/installation';
 import {
   OrchestratorSession,
   OrchestratorSessionRepositoryAdapter,
@@ -33,6 +33,7 @@ import {
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
+import type { RunnerTunnelPort } from '../runner-tunnel.js';
 import {
   heartbeatConductorOrchestrator,
   heartbeatOrReRegisterConductorOrchestrator,
@@ -253,6 +254,73 @@ function makeInstallation(conductorEnabled: boolean): FleetInstallation {
   };
 }
 
+const RUNNER_CAPABILITIES = {
+  networkEgressRestricted: true,
+  cpuAndMemoryLimited: true,
+  processTreeTermination: true,
+  filesystemScope: 'scoped-worktree',
+} as const;
+
+/**
+ * The real sunrise v2 shape: an ssh lane-runner host next to the local
+ * orchestrator host. Every registration test uses it; a one-host fixture hid
+ * F174.
+ */
+function makeMultiHostInstallation(conductorEnabled: boolean): FleetInstallation {
+  return {
+    schemaVersion: 2,
+    hosts: {
+      solstice: {
+        transport: 'ssh',
+        sshAlias: 'solstice',
+        worktreeRoot: '/tmp/fleet-o9c-solstice-worktrees',
+        roles: ['lane-runner'],
+        runner: { kind: 'opencode', port: 46000, capabilities: RUNNER_CAPABILITIES, maxLanes: 2 },
+      },
+      'this-machine': {
+        transport: 'local',
+        worktreeRoot: '/tmp/fleet-o9c-local-worktrees',
+        roles: ['orchestrator', 'verifier'],
+      },
+    },
+    forge: { mode: 'none' },
+    ...(conductorEnabled ? { policy: { conductor: { enabled: true } } } : {}),
+  };
+}
+
+/**
+ * A sunrise-shaped host entry: the same fields the real installation files
+ * carry, so every edge-case fixture below is shaped like production, not a
+ * bare partial map.
+ */
+function sshHostFixture(name: string): Record<string, unknown> {
+  return {
+    transport: 'ssh',
+    sshAlias: name,
+    worktreeRoot: `/tmp/fleet-o9c-${name}-worktrees`,
+    roles: ['lane-runner'],
+    runner: { kind: 'opencode', port: 46000, capabilities: RUNNER_CAPABILITIES, maxLanes: 2 },
+  };
+}
+
+function localHostFixture(): Record<string, unknown> {
+  return {
+    transport: 'local',
+    worktreeRoot: '/tmp/fleet-o9c-local-worktrees',
+    roles: ['orchestrator', 'verifier'],
+  };
+}
+
+/** A v2 installation document carrying exactly these hosts, sunrise-shaped. */
+function installationWithHosts(hosts: Record<string, unknown>): FleetInstallation {
+  return {
+    schemaVersion: 2,
+    hosts,
+    forge: { mode: 'none' },
+    policy: { conductor: { enabled: true } },
+  } as FleetInstallation;
+}
+
 function runtimeOf(stateDir: string, installation: FleetInstallation): FleetCliRuntime {
   return createFleetCliRuntime({
     stateDir,
@@ -266,6 +334,13 @@ function runtimeOf(stateDir: string, installation: FleetInstallation): FleetCliR
     env: {},
   });
 }
+
+/** The two-host installation has an ssh lane-runner host; no test may open a real forward to it. */
+const noTunnel: RunnerTunnelPort = {
+  ensureTunnel: async () => 'not-applicable',
+  stop: async () => {},
+  release: async () => {},
+};
 
 async function runConductorArgs(
   runtime: FleetCliRuntime,
@@ -283,7 +358,7 @@ async function runConductorArgs(
     undefined,
     undefined,
     undefined,
-    { now: () => NOW, stateDir } satisfies ConductorCliOptions,
+    { now: () => NOW, stateDir, tunnel: noTunnel } satisfies ConductorCliOptions,
   );
   return { code, stdout: io.outLines, stderr: io.errLines };
 }
@@ -332,6 +407,82 @@ describe('o9-runtime-input-refused: registerConductorOrchestrator input refusal'
     const result = await registerConductorOrchestrator(makeRegisterInput(repo, overrides));
     expect(result).toEqual({ code, orchestratorId: null });
     expect(await repo.snapshot()).toEqual([]);
+  });
+});
+
+describe('o9c-multi-host: the local host is chosen among every host entry', () => {
+  it('the multi-host fixture is a valid v2 installation', () => {
+    expect(parseInstallation(makeMultiHostInstallation(true)).ok).toBe(true);
+  });
+
+  it('o9c-two-host-registers-on-local: solstice (ssh) plus this-machine (local) registers a session on this-machine', async () => {
+    const repo = new FakeSessionRepository();
+    const result = await registerConductorOrchestrator(
+      makeRegisterInput(repo, { installation: makeMultiHostInstallation(true) }),
+    );
+    expect(result.code).toBe('registered');
+    expect(result.orchestratorId).toMatch(/^orch-/);
+    const rows = await repo.snapshot();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.session.host).toBe('this-machine');
+    expect(rows[0]!.session.status).toBe('active');
+  });
+
+  it('o9c-order-independent: the local host is found wherever it sits in the host list', async () => {
+    const repo = new FakeSessionRepository();
+    const installation = installationWithHosts({
+      solstice: sshHostFixture('solstice'),
+      'this-machine': localHostFixture(),
+      other: sshHostFixture('other'),
+    });
+    const result = await registerConductorOrchestrator(makeRegisterInput(repo, { installation }));
+    expect(result.code).toBe('registered');
+    expect((await repo.snapshot())[0]!.session.host).toBe('this-machine');
+  });
+
+  it('o9c-no-local-host: two ssh hosts are host-unknown and write nothing', async () => {
+    const repo = new FakeSessionRepository();
+    const installation = installationWithHosts({
+      solstice: sshHostFixture('solstice'),
+      equinox: sshHostFixture('equinox'),
+    });
+    const result = await registerConductorOrchestrator(makeRegisterInput(repo, { installation }));
+    expect(result).toEqual({ code: 'host-unknown', orchestratorId: null });
+    expect(await repo.snapshot()).toEqual([]);
+  });
+
+  it('o9c-two-local-hosts: two local hosts are host-unknown and write nothing', async () => {
+    const repo = new FakeSessionRepository();
+    const installation = installationWithHosts({
+      'this-machine': localHostFixture(),
+      'that-machine': localHostFixture(),
+    });
+    const result = await registerConductorOrchestrator(makeRegisterInput(repo, { installation }));
+    expect(result).toEqual({ code: 'host-unknown', orchestratorId: null });
+    expect(await repo.snapshot()).toEqual([]);
+  });
+
+  it('o9c-malformed-entry-among-hosts: a non-object or throwing host entry is register-unknown, never a throw', async () => {
+    const throwingEntry = {
+      get transport(): never {
+        throw new Error('transport-getter-threw');
+      },
+    };
+    const entries: readonly unknown[] = ['not-an-object', null, throwingEntry];
+    for (const broken of entries) {
+      const repo = new FakeSessionRepository();
+      const result = await registerConductorOrchestrator(
+        makeRegisterInput(repo, {
+          installation: installationWithHosts({
+            solstice: sshHostFixture('solstice'),
+            'this-machine': localHostFixture(),
+            broken,
+          }),
+        }),
+      );
+      expect(result).toEqual({ code: 'register-unknown', orchestratorId: null });
+      expect(await repo.snapshot()).toEqual([]);
+    }
   });
 });
 
@@ -755,12 +906,12 @@ async function seedAdapterSession(
 }
 
 describe('o9 live composition', () => {
-  async function registerProfile(runtime: FleetCliRuntime): Promise<void> {
+  async function registerProfile(runtime: FleetCliRuntime, dispatcherHost = 'local'): Promise<void> {
     const result = await runtime.coordination.registerProjectProfile.registerProjectProfile({
       projectId: 'project-example-1',
       displayName: 'Example Project',
       repository: 'repo-example-1',
-      designatedDispatcherHost: 'local',
+      designatedDispatcherHost: dispatcherHost,
       policyRevision: 'policy-example-1',
       maxConcurrentLanes: 2,
       runnerCapabilities: {},
@@ -827,6 +978,70 @@ describe('o9 live composition', () => {
     expect(sessions.filter((entry) => entry.session.cliKind === 'conductor')).toHaveLength(1);
     expect(sessions.filter((entry) => entry.session.host === 'local' && entry.session.status === 'active'))
       .toHaveLength(0);
+  });
+
+  it('o9c-multi-host-composition: on the two-host installation the first pass registers one active session and a second run adopts it', async () => {
+    const dir = tempStateDir();
+    const installation = makeMultiHostInstallation(true);
+    // A process killed before its exit retire leaves its session active. The
+    // retire write is dropped to model that, so the next run finds the session.
+    const dropRetire = (runtime: FleetCliRuntime): void => {
+      const repository = runtime.coordination.orchestratorSessionRepository;
+      const realSave = repository.save.bind(repository);
+      vi.spyOn(repository, 'save').mockImplementation(async (session, expectedRevision) => {
+        if (session.status === 'retired') {
+          const current = await repository.get(session.orchestratorId);
+          if (current !== null) {
+            return current;
+          }
+        }
+        return realSave(session, expectedRevision);
+      });
+    };
+    const firstRuntime = runtimeOf(dir, installation);
+    await registerProfile(firstRuntime, 'this-machine');
+    dropRetire(firstRuntime);
+
+    const first = await runLiveOnce(firstRuntime, dir);
+    expect(first.code).toBe(0);
+    expect(first.stderr.join('')).not.toContain('host-unknown');
+    const firstLine = first.stderr.find((line) => line.includes('"orchestrator":"registered"'));
+    expect(firstLine).toBeDefined();
+    const firstId = (JSON.parse(firstLine!) as { orchestratorId: string }).orchestratorId;
+
+    const adapter = new OrchestratorSessionRepositoryAdapter({ stateDir: dir });
+    const afterFirst = await adapter.list({ status: 'active' });
+    expect(afterFirst).toHaveLength(1);
+    expect(afterFirst[0]!.session.orchestratorId).toBe(firstId);
+    expect(afterFirst[0]!.session.host).toBe('this-machine');
+    // Exactly one session row in total: the first pass wrote nothing else, so a
+    // second run can only adopt this one session, never register a duplicate.
+    expect(await adapter.list()).toHaveLength(1);
+
+    const secondRuntime = runtimeOf(dir, installation);
+    dropRetire(secondRuntime);
+    const second = await runLiveOnce(secondRuntime, dir);
+    expect(second.code).toBe(0);
+    const secondLine = second.stderr.find((line) => line.includes('"orchestrator":"registered"'));
+    expect(secondLine).toBeDefined();
+    expect((JSON.parse(secondLine!) as { orchestratorId: string }).orchestratorId).toBe(firstId);
+
+    const afterSecond = await adapter.list();
+    expect(afterSecond).toHaveLength(1);
+    expect(afterSecond[0]!.session.status).toBe('active');
+    expect(afterSecond[0]!.session.orchestratorId).toBe(firstId);
+  });
+
+  it('o9c-multi-host-retires-on-exit: an ordinary two-host run registers, then retires its one session', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir, makeMultiHostInstallation(true));
+    await registerProfile(runtime, 'this-machine');
+    const result = await runLiveOnce(runtime, dir);
+    expect(result.code).toBe(0);
+    const sessions = await new OrchestratorSessionRepositoryAdapter({ stateDir: dir }).list();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]!.session.host).toBe('this-machine');
+    expect(sessions[0]!.session.status).toBe('retired');
   });
 
   it('dry-run writes no session; a disabled conductor writes no session', async () => {

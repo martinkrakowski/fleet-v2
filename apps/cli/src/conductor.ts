@@ -50,6 +50,7 @@ import {
   type ConductorDriverLeaseRecord,
   type RunConductorPassResult,
   type ConductorRunReport,
+  type ConductorAttentionItem,
   type AdvanceLaneRunResult,
   type ListLaneRunsResult,
   type ConductorScheduleRow,
@@ -66,6 +67,7 @@ import {
   heartbeatOrReRegisterConductorOrchestrator,
   pollDelayWhileRegistered,
   registerConductorOrchestrator,
+  type RegisterConductorOrchestratorResult,
   retireConductorOrchestrator,
 } from './conductor-orchestrator.js';
 import { openChangeWakeReader, resolveWakeConfig, type ChangeWakeReader } from './conductor-wake.js';
@@ -1197,13 +1199,7 @@ async function runCommand(
               // fresh 60 s timer.
               lastHeartbeatAtMs = Date.now();
             }
-            io.stderr(
-              `${JSON.stringify(
-                registration.code === 'registered'
-                  ? { orchestrator: registration.code, orchestratorId: registration.orchestratorId }
-                  : { orchestrator: registration.code },
-              )}\n`,
-            );
+            logRegistrationOutcome(io, registration);
           } else if (registeredOrchestratorId !== null) {
             await beatNow();
           }
@@ -1220,19 +1216,8 @@ async function runCommand(
         // OT5: mark every advanced run after its pass has journalled its result
         // (only advanced passes journalled results; the exporter re-reads the
         // records, so the root is emitted whenever the run is already terminal).
-        for (const report of result.runs) {
-          if (report.outcome === 'advanced') {
-            markRunQuietly(runtime.telemetry.mark, report.runId);
-          }
-        }
-        for (const item of result.attention) {
-          const key = `${item.runId}:${item.kind}`;
-          if (seenAttention.has(key)) {
-            continue;
-          }
-          seenAttention.add(key);
-          io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
-        }
+        markAdvancedRunsQuietly(runtime.telemetry.mark, result.runs);
+        reportNewAttention(io, seenAttention, result.attention);
         return { stop: false };
       },
     });
@@ -1287,6 +1272,56 @@ async function recordPassTrace(
     }
   } catch {
     io.stderr('conductor run: pass trace not recorded (write-failed)\n');
+  }
+}
+
+/**
+ * O9: one stderr line for a conductor registration outcome. `registered`
+ * carries the new session id; every other code names the refusal.
+ */
+function logRegistrationOutcome(
+  io: CliIo,
+  registration: RegisterConductorOrchestratorResult,
+): void {
+  io.stderr(
+    `${JSON.stringify(
+      registration.code === 'registered'
+        ? { orchestrator: registration.code, orchestratorId: registration.orchestratorId }
+        : { orchestrator: registration.code },
+    )}\n`,
+  );
+}
+
+/**
+ * OT5: mark every run whose pass advanced after that pass journalled its
+ * result. The exporter re-reads the records, so the root is emitted whenever
+ * the run is already terminal.
+ */
+function markAdvancedRunsQuietly(mark: RunTelemetryMarkPort | undefined, runs: readonly ConductorRunReport[]): void {
+  for (const report of runs) {
+    if (report.outcome === 'advanced') {
+      markRunQuietly(mark, report.runId);
+    }
+  }
+}
+
+/**
+ * K9: one stdout line per distinct attention item. An item already reported
+ * earlier in the run is never printed again; `seenAttention` carries the
+ * run's deduplication state.
+ */
+function reportNewAttention(
+  io: CliIo,
+  seenAttention: Set<string>,
+  attention: readonly ConductorAttentionItem[],
+): void {
+  for (const item of attention) {
+    const key = `${item.runId}:${item.kind}`;
+    if (seenAttention.has(key)) {
+      continue;
+    }
+    seenAttention.add(key);
+    io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
   }
 }
 

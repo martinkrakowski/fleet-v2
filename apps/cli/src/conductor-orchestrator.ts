@@ -150,7 +150,7 @@ async function registerConductorOrchestratorUnchecked(
   const projects = profiles
     .filter((profile) => profile.status === 'active')
     .map((profile) => profile.projectId)
-    .sort()
+    .sort((a, b) => a.localeCompare(b))
     .filter((projectId, index, all) => index === 0 || projectId !== all[index - 1]);
   if (projects.length > ORCHESTRATOR_SESSION_MAX_PROJECTS) {
     return { code: 'projects-over-cap', orchestratorId: null };

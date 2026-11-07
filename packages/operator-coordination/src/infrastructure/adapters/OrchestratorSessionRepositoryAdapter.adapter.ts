@@ -26,8 +26,12 @@ import { promises as fs } from "node:fs";
 import { join, resolve } from "node:path";
 
 import type { OrchestratorSessionRecord } from "../../domain/orchestrator-session-records.js";
-import { OrchestratorSession, isOrchestratorAttached, isOrchestratorTokenId } from "../../domain/entities/OrchestratorSession.js";
-import { ORCHESTRATOR_SESSION_LEASE_SECONDS } from "../../domain/entities/OrchestratorSession.js";
+import {
+  OrchestratorSession,
+  isOrchestratorAttached,
+  isOrchestratorTokenId,
+  ORCHESTRATOR_SESSION_LEASE_SECONDS,
+} from "../../domain/entities/OrchestratorSession.js";
 import { containsSecretShape } from "@fleet/shared";
 import {
   OrchestratorSessionIdentityAlreadyActiveError,

@@ -140,7 +140,8 @@ export function composeCoordination(input: ComposeCoordinationInput) {
   // The journal is a second file-backed LaneRunJournalAdapter on the same
   // stateDir, sharing `run-journal.json` with the conductor's own adapter
   // under the existing lock; without a stateDir both stay in memory.
-  const orchestratorSessionRepository = new OrchestratorSessionRepositoryAdapter({ stateDir });
+  // (The orchestrator session store itself is the O9 adapter declared above;
+  // the merge of origin/main had declared it twice.)
   const orchestratorRequestRepository = new OrchestratorRequestRepositoryAdapter({ stateDir });
   const runJournal = new LaneRunJournalAdapter({ stateDir });
   const orchestratorRequestJournal = new OrchestratorRequestJournalAdapter({

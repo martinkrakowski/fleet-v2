@@ -267,10 +267,13 @@ describe('computeBriefPackageDigest', () => {
   // `localeCompare` depends on the host locale and ICU version, so adopting it would let two
   // hosts digest the same package to two values. They fail if someone "fixes" the rule that way.
   it('orders bound keys by code unit, which is not what localeCompare would do', () => {
-    // 'B' is code unit 66 and 'a' is 97, so code-unit order is uppercase first; every common
-    // locale collates case-insensitively and puts 'a' first. This pair is the whole difference.
+    // 'B' is code unit 66 and 'a' is 97, so code-unit order puts the uppercase key first, where
+    // every common locale collates case-insensitively and puts 'a' first. This pair is the whole
+    // difference, and asserting it on byCodeUnit alone is the point: asserting what localeCompare
+    // does with it would itself depend on the host's locale, which is the defect being avoided.
     expect(['a', 'B'].sort(byCodeUnit)).toEqual(['B', 'a']);
-    expect(['a', 'B'].sort((left, right) => left.localeCompare(right))).toEqual(['a', 'B']);
+    expect(byCodeUnit('a', 'B')).toBeGreaterThan(0);
+    expect(byCodeUnit('B', 'a')).toBeLessThan(0);
     expect(byCodeUnit('a', 'a')).toBe(0);
   });
 

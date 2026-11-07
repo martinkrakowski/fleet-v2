@@ -207,7 +207,19 @@ export class ReapLaneWorktreesUseCase implements ReapLaneWorktreesPort {
     if (refusal !== null) {
       return { outcome: 'refused', reason: refusal };
     }
-    return this.reap(this.deps, request);
+    // The validated snapshot is what `reap` reads: a proxy can pass
+    // descriptor-based validation and still throw when its fields are read a
+    // second time, so the snapshot is authoritative and the original request
+    // is never read again.
+    try {
+      const snap = snapshotPlainDataRecord(request);
+      if (snap === null) {
+        return { outcome: 'refused', reason: 'invalid-request' };
+      }
+      return await this.reap(this.deps, snap as unknown as ReapLaneWorktreesRequest);
+    } catch {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
   }
 
   private async reap(
@@ -823,13 +835,20 @@ async function worktreeRunnerLiveness(
   } catch {
     return 'unknown';
   }
-  if (!isRecordObject(state)) {
+  // A hostile runner response can be a Proxy with a throwing
+  // `getPrototypeOf` trap or a throwing `state` getter, so the post-try reads
+  // are guarded too: a non-plain or unreadable state is `unknown`.
+  try {
+    if (!isRecordObject(state)) {
+      return 'unknown';
+    }
+    if (state['state'] === 'running') {
+      return 'busy';
+    }
+    return state['state'] === 'idle' ? 'idle' : 'unknown';
+  } catch {
     return 'unknown';
   }
-  if (state['state'] === 'running') {
-    return 'busy';
-  }
-  return state['state'] === 'idle' ? 'idle' : 'unknown';
 }
 
 /** The manifest coordinates handed to `removeWorktree` (mirrors the port type). */

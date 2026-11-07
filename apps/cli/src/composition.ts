@@ -178,6 +178,7 @@ import {
   ListOwnerQuestionsUseCase,
   ListProjectProfilesUseCase,
   ObservationPublicationAdapter,
+  OrchestratorSessionRepositoryAdapter,
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   PublishProjectObservationUseCase,
@@ -642,6 +643,7 @@ export interface FleetCliRuntime {
   readonly coordination: {
     readonly projectProfileRepository: ProjectProfileRepositoryAdapter;
     readonly coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
+    readonly orchestratorSessionRepository: OrchestratorSessionRepositoryAdapter;
     readonly decisionTransport: DecisionTransportAdapter;
     readonly observationPublication: ObservationPublicationAdapter;
     readonly relayTransport: RelayTransportAdapter;

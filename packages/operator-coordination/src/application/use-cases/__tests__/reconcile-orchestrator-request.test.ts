@@ -82,6 +82,10 @@ class FakeSessionRepo implements OrchestratorSessionRepositoryPort {
     return session === undefined ? null : { revision: 1, session };
   }
 
+  async registerOrAdoptSession(): Promise<never> {
+    throw new Error('not used');
+  }
+
   async save(): Promise<never> {
     throw new Error('not used');
   }

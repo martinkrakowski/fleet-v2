@@ -485,6 +485,38 @@ describe('grant attempt binding (CO24e)', () => {
       expect((await repo.findRequestByGrantId('grant-owner'))?.consumptions).toHaveLength(0);
     });
 
+    it('does not exempt an unknown release:* scope from the attempt-required default', async () => {
+      const UNKNOWN_RELEASE_SCOPE = 'release:promote';
+      await repo.saveRequest(releaseGrant({ actionScope: UNKNOWN_RELEASE_SCOPE }));
+      expect(
+        await resolver().resolveActionAuthorization({
+          projectId: 'project-1',
+          actionScope: UNKNOWN_RELEASE_SCOPE,
+          expectedHeadSha: HEAD,
+        }),
+      ).toEqual({ outcome: 'blocked', reason: 'attempt-required' });
+      const stored = await repo.findRequestByGrantId('grant-owner');
+      expect(stored).not.toHaveProperty('grantAttemptId');
+      expect(stored?.consumptions).toHaveLength(0);
+      expect(stored?.revision).toBe(1);
+    });
+
+    it('does not exempt an unknown release:* scope from the recorded-attempt consumption check', async () => {
+      const UNKNOWN_RELEASE_SCOPE = 'release:promote';
+      await repo.saveRequest(releaseGrant({ actionScope: UNKNOWN_RELEASE_SCOPE, grantRecordVersion: 2 }));
+      expect(
+        await consumer().recordAuthorizationConsumption({
+          consumptionId: `c-${ACTION_ID}`,
+          grantId: 'grant-owner',
+          actionId: ACTION_ID,
+          actionScope: UNKNOWN_RELEASE_SCOPE,
+          attemptId: ACTION_ID,
+          expectedHeadSha: HEAD,
+        }),
+      ).toEqual({ outcome: 'refused', reason: 'grant-attempt-unrecorded' });
+      expect((await repo.findRequestByGrantId('grant-owner'))?.consumptions).toHaveLength(0);
+    });
+
     it('consumes a release grant once for its deterministic action id', async () => {
       await repo.saveRequest(releaseGrant());
       const result = await consumer().recordAuthorizationConsumption({

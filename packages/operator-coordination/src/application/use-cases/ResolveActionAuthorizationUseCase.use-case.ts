@@ -199,10 +199,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       return null;
     }
     // CO24g: a release grant is attempt-less by design (cutover row CO14). It is
-    // anchored by its `release:<action>` scope and exact head, and consumed once
+    // anchored by its exact `release:<action>` scope (only `release:install`,
+    // `release:swap` or `release:rollback`) and exact head, and consumed once
     // by its deterministic action id, so it resolves with or without an attempt
     // coordinate and is never bound to a work attempt. The gate is the grant's
-    // recorded scope — the grant kind — never the absence of an attemptId.
+    // recorded scope — the grant kind — never the absence of an attemptId, and
+    // never an arbitrary `release:*` prefix.
     if (isReleaseActionScope(candidate.getActionScope())) {
       return null;
     }

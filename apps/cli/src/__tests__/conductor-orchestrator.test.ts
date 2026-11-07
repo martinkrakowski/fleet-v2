@@ -446,6 +446,54 @@ describe('o9 registerConductorOrchestrator store and retire behaviour', () => {
     expect(repo.snapshot().filter((entry) => entry.session.status === 'active')).toHaveLength(1);
   });
 
+  it('o9-retire-conflict-adopts-live-session: a conflicting retire adopts the live session and registers nothing', async () => {
+    class HeartbeatOnceAfterGetRepository extends FakeSessionRepository {
+      private beaten = false;
+      override async get(orchestratorId: string): Promise<StoredOrchestratorSession | null> {
+        const stale = await super.get(orchestratorId);
+        if (stale !== null && !this.beaten && stale.session.status === 'active') {
+          this.beaten = true;
+          await this.save(
+            { ...stale.session, lastHeartbeatIso: ATTACHED_HEARTBEAT, leaseUntilIso: ATTACHED_LEASE },
+            stale.revision,
+          );
+        }
+        return stale;
+      }
+    }
+    const repo = new HeartbeatOnceAfterGetRepository();
+    await seedSession(repo, { orchestratorId: 'orch-adopt-1' });
+    const result = await registerConductorOrchestrator(makeRegisterInput(repo));
+    expect(result).toEqual({ code: 'registered', orchestratorId: 'orch-adopt-1' });
+    const rows = repo.snapshot();
+    expect(rows.map((entry) => entry.session.orchestratorId)).toEqual(['orch-adopt-1']);
+    expect(rows[0]!.session.status).toBe('active');
+  });
+
+  it('o9-exhausted-heartbeat-retry-does-not-re-register: only a retired or missing session is replaced', async () => {
+    class ConflictingHeartbeatRepository extends FakeSessionRepository {
+      conflictSaves = false;
+      override async save(
+        session: OrchestratorSessionRecord,
+        expectedRevision: number,
+      ): Promise<StoredOrchestratorSession> {
+        if (this.conflictSaves) {
+          throw new OrchestratorSessionRevisionConflictError(session.orchestratorId, expectedRevision + 1, 'conflict');
+        }
+        return super.save(session, expectedRevision);
+      }
+    }
+    const repo = new ConflictingHeartbeatRepository();
+    const input = makeRegisterInput(repo);
+    const first = await registerConductorOrchestrator(input);
+    expect(first.code).toBe('registered');
+    repo.conflictSaves = true; // every heartbeat save conflicts: the retry runs out and is refused
+    const beat = await heartbeatOrReRegisterConductorOrchestrator(input, first.orchestratorId!, true);
+    expect(beat).toEqual({ code: 'heartbeat-refused', orchestratorId: first.orchestratorId, reRegistration: null });
+    repo.conflictSaves = false;
+    expect(repo.snapshot().filter((entry) => entry.session.status === 'active')).toHaveLength(1);
+  });
+
   it('o9-unreadable-store-is-unknown: an unreadable profile store and session store are both register-unknown', async () => {
     const repo = new FakeSessionRepository();
     const viaProfiles = await registerConductorOrchestrator(

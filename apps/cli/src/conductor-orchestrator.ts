@@ -204,6 +204,16 @@ async function registerConductorOrchestratorUnchecked(
         current.session.registeredByTokenId !== CONDUCTOR_TOKEN_ID ||
         isOrchestratorAttached(current.session, nowIso)
       ) {
+        // Heartbeated since the snapshot: it is live. Adopt it and register
+        // nothing, so two active conductor sessions never coexist.
+        if (
+          current !== null &&
+          current.session.status === 'active' &&
+          current.session.registeredByTokenId === CONDUCTOR_TOKEN_ID &&
+          isOrchestratorAttached(current.session, nowIso)
+        ) {
+          return { code: 'registered', orchestratorId: current.session.orchestratorId };
+        }
         continue;
       }
       // Compare-and-set on the revision just read: a heartbeat bumps the
@@ -222,7 +232,8 @@ async function registerConductorOrchestratorUnchecked(
         await input.sessionRepo.save(retiredSession.value.toRecord(), current.revision);
       } catch (saveError) {
         if (saveError instanceof OrchestratorSessionRevisionConflictError) {
-          continue; // heartbeat moved: the session is live, leave it
+          // Heartbeat moved: the session is live. Adopt it, register nothing.
+          return { code: 'registered', orchestratorId: current.session.orchestratorId };
         }
         throw saveError;
       }
@@ -298,6 +309,17 @@ export async function heartbeatOrReRegisterConductorOrchestrator(
 ): Promise<HeartbeatOrReRegisterResult> {
   const beat = await heartbeatConductorOrchestrator(input.sessionRepo, input.clock, orchestratorId);
   if (beat.code !== 'heartbeat-refused' || !canReRegister) {
+    return { code: beat.code, orchestratorId, reRegistration: null };
+  }
+  // Re-register only when the session is explicitly gone (missing or retired).
+  // Any other refusal (a retry that ran out, a store hiccup) stays a refusal:
+  // the session may still be live and a new one would duplicate it.
+  try {
+    const stored = await input.sessionRepo.get(orchestratorId);
+    if (stored !== null && stored.session.status !== 'retired') {
+      return { code: beat.code, orchestratorId, reRegistration: null };
+    }
+  } catch {
     return { code: beat.code, orchestratorId, reRegistration: null };
   }
   const registration = await registerConductorOrchestrator(input);

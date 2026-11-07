@@ -233,6 +233,9 @@ export const GATE_CONGESTION_BACKOFF_MS = 60_000;
 /** Maximum gate retry runs beyond run 0 (KF-30c2); below LANE_RUN_MAX_RETRY. */
 export const GATE_CONGESTION_MAX_RETRIES = 6;
 
+/** PT1d: passes with no free review seat before parking `review-seat-unavailable`. */
+export const REVIEW_SEAT_UNAVAILABLE_MAX_PASSES = 6;
+
 /** A seat the caller chose with selectSeat / selectReviewSeat (S1a), or none eligible. */
 export type LaneRunSeatFact = { readonly ok: true; readonly seatIndex: number } | { readonly ok: false };
 
@@ -302,6 +305,12 @@ export interface LaneRunFacts {
    * supply `{ ok: false }` when that seat is unavailable; it never moves to another seat.
    */
   readonly reviewSeat: LaneRunSeatFact;
+  /**
+   * PT1d: passes already taken, for the review kind whose rules are running,
+   * with no free review seat. Absent reads as 0. The driver records it.
+   * This decider only reads it.
+   */
+  readonly reviewSeatUnavailablePasses?: number;
   /** Implementer seat indexes already dispatched in `record.round` (K4). */
   readonly roundSeatIndexes: readonly number[];
   /** The run's latest attempt; null before the first prepare (K4). */
@@ -382,7 +391,8 @@ export type LaneRunWaitReason =
   | 'review-pending' | 'premerge-pending' | 'ci-pending' | 'ci-unknown' | 'merge-train' | 'parked'
   | 'session-stagger'
   | 'stop-unconfirmed' | 'facts-inconsistent' | 'stop-draining' | 'stop-grace-exceeded'
-  | 'gate-congested';
+  | 'gate-congested'
+  | 'review-seat-unavailable';
 
 export type LaneRunDecision =
   | { readonly kind: 'act'; readonly step: LaneRunKeyStep; readonly key: string; readonly round: number;
@@ -679,11 +689,25 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return park(outcome.reason, null);
     };
 
+    const reviewSeatUnavailableDecision = (): LaneRunDecision => {
+      const passes = facts.reviewSeatUnavailablePasses;
+      if (passes === undefined) {
+        return wait('review-seat-unavailable');
+      }
+      if (typeof passes !== 'number' || !Number.isSafeInteger(passes) || passes < 0) {
+        return WAIT_FACTS_INCONSISTENT;
+      }
+      if (passes >= REVIEW_SEAT_UNAVAILABLE_MAX_PASSES) {
+        return park('review-seat-unavailable', null);
+      }
+      return wait('review-seat-unavailable');
+    };
+
     const reviewRules = (kind: 'brief-check' | 'code-review'): LaneRunDecision => {
       const review = kind === 'brief-check' ? facts.briefCheck : facts.codeReview;
       if (review.verdict === 'none') {
         if (!facts.reviewSeat.ok) {
-          return park('review-seat-unavailable', null);
+          return reviewSeatUnavailableDecision();
         }
         return act({
           step: kind,
@@ -718,7 +742,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
             attemptOrdinal: null,
           });
         }
-        return park('review-seat-unavailable', null);
+        return reviewSeatUnavailableDecision();
       }
       if (review.verdict === 'unknown') {
         // A review whose verdict the conductor could not read is not a verdict on

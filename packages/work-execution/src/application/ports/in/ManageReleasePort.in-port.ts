@@ -70,7 +70,12 @@ export interface ManageReleaseApplied {
   readonly outcome: 'applied';
   readonly action: ReleaseAction;
   readonly target: string;
-  readonly current: string;
+  /**
+   * The `current` pointer after the apply. Install never moves it (the build
+   * is created while `current` stays where it was); swap and rollback repoint
+   * it to `target`, so `current` equals `target` for those actions.
+   */
+  readonly current: string | null;
   readonly kept: readonly string[];
   readonly pruned: readonly string[];
   /** `unreadable` means the retention cleanup did not complete; never a silent success. */

@@ -1,16 +1,17 @@
 /**
  * CO14b 4.1: a release install and swap end to end over a temporary root with
  * the real `ReleaseStoreAdapter`, the real `ConductorDriverLeaseAdapter`
- * (constructed with `{ stateDir }`) and the real release grant path (the same
- * `ActionAuthorizationPort` implementation CO14 resolves `release:install`
- * through — the real `ActionAuthorizationAdapter` over a real grant map). No
- * mocks of those three. The entry point driven is the same use case the CLI
- * calls (`ManageReleaseUseCase`).
+ * (constructed with `{ stateDir }`) and the real release grant path: the real
+ * `CoordinationRequestRepositoryAdapter`, `ResolveActionAuthorizationUseCase`
+ * and `RecordAuthorizationConsumptionUseCase`, wired through the same
+ * `ActionAuthorizationAdapter` delegation the CLI uses for `release:install`.
+ * No mocks of those. The entry point driven is the same use case the CLI calls
+ * (`ManageReleaseUseCase`).
  *
- * The robustness bar is part of the lane: the build call is deadline-guarded
- * and a cut-short build leaves resumable state; a crash between intent and
- * result reaches one consistent state; release git reads write nothing and
- * stay offline.
+ * Install creates the build and leaves `current` unmoved; swap repoints
+ * `current` atomically. A live driver lease in the root's state directory
+ * refuses the swap. A swap interrupted after the grant was consumed but before
+ * the repoint is resumed by the next pass.
  */
 
 import { promises as fs } from 'node:fs';
@@ -18,12 +19,24 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import {
+  CoordinationRequestRepositoryAdapter,
+  RecordAuthorizationConsumptionUseCase,
+  ResolveActionAuthorizationUseCase,
+  type CoordinationRequestRecord,
+} from '@fleet/operator-coordination';
+import {
+  consumptionId,
+  releaseActionScope,
+  sha256HexDigest,
+} from '@fleet/work-execution';
+
 import type {
   CommandExecutorPort,
   CommandRunOptions,
   CommandRunResult,
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
-import { ActionAuthorizationAdapter, type ActionAuthorizationGrantEntry } from '../ActionAuthorizationAdapter.adapter.js';
+import { ActionAuthorizationAdapter } from '../ActionAuthorizationAdapter.adapter.js';
 import { ConductorDriverLeaseAdapter } from '../ConductorDriverLeaseAdapter.adapter.js';
 import { ReleaseStoreAdapter } from '../ReleaseStoreAdapter.adapter.js';
 import { ManageReleaseUseCase } from '../../../application/use-cases/ManageReleaseUseCase.use-case.js';
@@ -58,20 +71,27 @@ class RecordingExecutor implements CommandExecutorPort {
   }
 }
 
+/** The root-scoped coordination scope the CLI builds for a release action. */
+function releaseScopeForRoot(actionScope: string, root: string): string {
+  return `${actionScope}@${sha256HexDigest(root)}`;
+}
+
 describe('release install and swap integration', () => {
   let tempDir: string;
   let root: string;
   let leaseStateDir: string;
+  let coordinationStateDir: string;
   let store: ReleaseStoreAdapter;
-  let grants: Map<string, ActionAuthorizationGrantEntry>;
+  let requestRepo: CoordinationRequestRepositoryAdapter;
   let executor: RecordingExecutor;
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-release-integration-test-'));
     root = path.join(tempDir, 'releases');
     leaseStateDir = path.join(tempDir, 'lease-state');
+    coordinationStateDir = path.join(tempDir, 'coordination-state');
     store = new ReleaseStoreAdapter();
-    grants = new Map<string, ActionAuthorizationGrantEntry>();
+    requestRepo = new CoordinationRequestRepositoryAdapter({ stateDir: coordinationStateDir });
     executor = new RecordingExecutor();
   });
 
@@ -98,18 +118,67 @@ describe('release install and swap integration', () => {
     return `2026-11-0${day}T09:00:00.000Z`;
   }
 
-  function seedGrants(): void {
-    grants.set('grant-install', {
-      expectedHeadSha: A,
-      kind: 'release-install',
-      root,
-      consumedByActionId: null,
-    });
-    grants.set('grant-swap', {
-      expectedHeadSha: B,
-      kind: 'release-swap',
-      root,
-      consumedByActionId: null,
+  /** Record a real approved owner grant: scope `release:<action>` bound to the root. */
+  async function recordGrant(kind: 'release-install' | 'release-swap', head: string, grantId: string): Promise<void> {
+    const actionScope = releaseScopeForRoot(releaseActionScope(kind) as string, root);
+    const record: CoordinationRequestRecord = {
+      id: `request-${grantId}`,
+      projectId: PROJECT,
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope,
+      expectedHeadSha: head,
+      proposalDigest: `digest-${grantId}`,
+      policyRevision: 'policy-7',
+      decisionRevision: 'decision-3',
+      grantId,
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    };
+    await requestRepo.saveRequest(record);
+  }
+
+  /** The real release grant path, wired exactly as the CLI wires it. */
+  function authorization() {
+    const resolve = new ResolveActionAuthorizationUseCase({ requestRepo });
+    const consume = new RecordAuthorizationConsumptionUseCase({ requestRepo });
+    return new ActionAuthorizationAdapter({
+      resolveGrant: async (request) => {
+        const actionScope = releaseActionScope(request.actionKind);
+        if (actionScope === null) {
+          return { outcome: 'blocked', reason: 'not a release action' };
+        }
+        const result = await resolve.execute({
+          projectId: request.projectId,
+          actionScope: releaseScopeForRoot(actionScope, request.root as string),
+          expectedHeadSha: request.expectedHeadSha,
+        });
+        return result.outcome === 'authorized'
+          ? { outcome: 'granted', authorizationGrantId: result.grantId, root: request.root }
+          : { outcome: 'blocked', reason: result.reason };
+      },
+      consumeGrant: async (request) => {
+        const actionScope = releaseActionScope(request.actionKind);
+        if (actionScope === null || request.expectedHeadSha === undefined) {
+          return { outcome: 'refused', reason: 'not a release grant consumption' };
+        }
+        const result = await consume.execute({
+          consumptionId: consumptionId(request.actionId),
+          grantId: request.authorizationGrantId,
+          actionId: request.actionId,
+          actionScope: releaseScopeForRoot(actionScope, request.root as string),
+          attemptId: request.attemptId ?? request.actionId,
+          expectedHeadSha: request.expectedHeadSha,
+        });
+        return result.outcome === 'consumed'
+          ? { outcome: 'consumed', actionId: request.actionId }
+          : { outcome: 'refused', reason: result.reason };
+      },
     });
   }
 
@@ -117,7 +186,7 @@ describe('release install and swap integration', () => {
     return new ManageReleaseUseCase({
       store,
       lease: new ConductorDriverLeaseAdapter({ stateDir: leaseStateDir }),
-      authorization: new ActionAuthorizationAdapter({ grants }),
+      authorization: authorization(),
       executor,
       nowIso: () => NOW,
       env: () => ({ PATH: '/usr/bin' }),
@@ -148,20 +217,23 @@ describe('release install and swap integration', () => {
     };
   }
 
-  it('release install creates the build and repoints current to it', async () => {
-    seedGrants();
+  it('release install creates the build and leaves current unmoved', async () => {
+    await recordGrant('release-install', A, 'grant-install');
     const result = await useCase().manageRelease(installRequest(A));
-    expect(result).toMatchObject({ outcome: 'applied', action: 'install', target: A, current: A });
+    expect(result).toMatchObject({ outcome: 'applied', action: 'install', target: A, current: null });
     await expect(fs.lstat(path.join(root, A))).resolves.toBeDefined();
-    expect(await fs.readlink(path.join(root, 'current'))).toBe(A);
+    // Install never moves `current`.
+    await expect(fs.lstat(path.join(root, 'current'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await store.list({ root })).toMatchObject({ outcome: 'read', current: null });
   });
 
   it('release swap repoints current atomically; the previous build and the current link survive', async () => {
     await verified('a', 1);
     await verified('b', 2);
-    seedGrants();
+    await recordGrant('release-install', A, 'grant-install');
+    await recordGrant('release-swap', B, 'grant-swap');
     const uc = useCase();
-    expect(await uc.manageRelease(installRequest(A))).toMatchObject({ outcome: 'applied', current: A });
+    expect(await uc.manageRelease(installRequest(A))).toMatchObject({ outcome: 'applied', current: null });
     expect(await uc.manageRelease(swapRequest(B))).toMatchObject({ outcome: 'applied', action: 'swap', current: B });
     expect(await fs.readlink(path.join(root, 'current'))).toBe(B);
     // The previous build survives and the store lists exactly one current.
@@ -170,25 +242,26 @@ describe('release install and swap integration', () => {
   });
 
   it('the release:install grant is consumed exactly once', async () => {
-    seedGrants();
+    await recordGrant('release-install', A, 'grant-install');
     const uc = useCase();
     expect(await uc.manageRelease(installRequest(A))).toMatchObject({ outcome: 'applied' });
-    expect(grants.get('grant-install')?.consumedByActionId).not.toBeNull();
+    const stored = (await requestRepo.findRequestByGrantId('grant-install')) as CoordinationRequestRecord;
+    expect(stored.consumptions).toHaveLength(1);
     // A second identical release is refused by the consumed grant, not re-authorised.
     const second = await uc.manageRelease(installRequest(A));
     expect(second).toEqual({ outcome: 'refused', reason: 'authority-refused' });
-    expect(grants.get('grant-install')?.consumedByActionId).not.toBeNull();
+    const again = (await requestRepo.findRequestByGrantId('grant-install')) as CoordinationRequestRecord;
+    expect(again.consumptions).toHaveLength(1);
   });
 
   it('a live driver lease in the root’s state directory refuses the swap', async () => {
     await verified('a', 1);
     await verified('b', 2);
-    seedGrants();
+    await recordGrant('release-install', A, 'grant-install');
+    await recordGrant('release-swap', B, 'grant-swap');
     const uc = useCase();
-    expect(await uc.manageRelease(installRequest(A))).toMatchObject({ outcome: 'applied', current: A });
+    expect(await uc.manageRelease(installRequest(A))).toMatchObject({ outcome: 'applied', current: null });
     const lease = new ConductorDriverLeaseAdapter({ stateDir: leaseStateDir });
-    // The install released its own lease (fence already advanced), so acquire
-    // with the observed fence the lease store currently holds.
     const current = await lease.read();
     expect(
       await lease.acquire({
@@ -202,11 +275,11 @@ describe('release install and swap integration', () => {
     const result = await uc.manageRelease(swapRequest(B));
 
     expect(result).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
-    expect(await fs.readlink(path.join(root, 'current'))).toBe(A);
+    await expect(fs.lstat(path.join(root, 'current'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('the release build call is deadline-guarded and a cut-short build leaves resumable state', async () => {
-    seedGrants();
+    await recordGrant('release-install', A, 'grant-install');
     const uc = useCase();
     // Cut the build short on the first attempt (the git step fails).
     executor.failFirst = 1;
@@ -224,35 +297,50 @@ describe('release install and swap integration', () => {
 
     // The next pass completes the build.
     const resumed = await uc.manageRelease(installRequest(A, '/src'));
-    expect(resumed).toMatchObject({ outcome: 'applied', current: A });
+    expect(resumed).toMatchObject({ outcome: 'applied', current: null });
     await expect(fs.lstat(path.join(root, A))).resolves.toBeDefined();
   });
 
-  it('a release swap survives a crash between intent and result and reaches one consistent state', async () => {
+  it('a release swap survives a crash after the grant is consumed but before the repoint', async () => {
     await verified('a', 1);
     await verified('b', 2);
-    seedGrants();
+    await recordGrant('release-install', A, 'grant-install');
+    await recordGrant('release-swap', B, 'grant-swap');
     const uc = useCase();
-    expect(await uc.manageRelease(installRequest(A))).toMatchObject({ outcome: 'applied', current: A });
-    // A crash between intent and result leaves the interrupted repoint's temp
-    // link behind (like an orphan). The next pass must reach one consistent state.
+    expect(await uc.manageRelease(installRequest(A))).toMatchObject({ outcome: 'applied', current: null });
+    // Consume the swap grant, then crash between intent and result: the temp
+    // link exists, `current` is unmoved, and the grant is already consumed.
+    const consume = new RecordAuthorizationConsumptionUseCase({ requestRepo });
+    const actionId = `release-swap-${B}`;
+    expect(
+      await consume.execute({
+        consumptionId: consumptionId(actionId),
+        grantId: 'grant-swap',
+        actionId,
+        actionScope: releaseScopeForRoot(releaseActionScope('release-swap') as string, root),
+        attemptId: actionId,
+        expectedHeadSha: B,
+      }),
+    ).toMatchObject({ outcome: 'consumed' });
     await fs.symlink(B, path.join(root, '.current.crashed.abcd1234.tmp'));
-    expect(await uc.manageRelease(swapRequest(B))).toMatchObject({ outcome: 'applied', current: B });
+
+    // The next pass resumes the interrupted repoint and reaches one consistent state.
+    const resumed = await uc.manageRelease(swapRequest(B));
+    expect(resumed).toMatchObject({ outcome: 'applied', action: 'swap', current: B });
     expect(await fs.readlink(path.join(root, 'current'))).toBe(B);
-    const listing = await store.list({ root });
-    expect(listing.outcome).toBe('read');
-    // One consistent current pointer, never two.
+    const stored = (await requestRepo.findRequestByGrantId('grant-swap')) as CoordinationRequestRecord;
+    expect(stored.consumptions).toHaveLength(1);
     const entries = await fs.readdir(root);
     expect(entries.filter((entry) => entry === 'current')).toHaveLength(1);
-    // The same swap key never repoints twice: the consumed grant refuses a
-    // second identical swap and current stays put.
+    expect(entries.filter((entry) => entry.endsWith('.tmp'))).toEqual([]);
+    // The consumed grant refuses a second identical swap and current stays put.
     const second = await uc.manageRelease(swapRequest(B));
     expect(second.outcome).toBe('refused');
     expect(await fs.readlink(path.join(root, 'current'))).toBe(B);
   });
 
   it('release git reads write nothing and stay offline', async () => {
-    seedGrants();
+    await recordGrant('release-install', A, 'grant-install');
     const uc = useCase();
     await uc.manageRelease(installRequest(A, '/src'));
     const gitStep = executor.runs[0];

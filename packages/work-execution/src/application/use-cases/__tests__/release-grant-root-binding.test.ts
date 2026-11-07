@@ -133,8 +133,8 @@ describe('release grant root binding', () => {
       projectId: PROJECT,
     });
 
-    expect(result).toMatchObject({ outcome: 'applied', action: 'install', target: A, current: A });
-    expect(await store.list({ root: rootA })).toMatchObject({ outcome: 'read', current: A });
+    expect(result).toMatchObject({ outcome: 'applied', action: 'install', target: A, current: null });
+    expect(await store.list({ root: rootA })).toMatchObject({ outcome: 'read', current: null });
     expect(grants.get('grant-1')?.consumedByActionId).not.toBeNull();
   });
 
@@ -164,7 +164,7 @@ describe('release grant root binding', () => {
     });
 
     expect(second.outcome).toBe('refused');
-    // The consumed grant was not re-authorised and current still points at A.
-    expect(await store.list({ root: rootA })).toMatchObject({ outcome: 'read', current: A });
+    // The consumed grant was not re-authorised and current is still unmoved.
+    expect(await store.list({ root: rootA })).toMatchObject({ outcome: 'read', current: null });
   });
 });

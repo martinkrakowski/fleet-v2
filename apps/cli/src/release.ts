@@ -105,9 +105,11 @@ function releaseScopeForRoot(actionScope: string, root: string | undefined): str
 
 /**
  * CO14b: the state directory of the driver that serves a release root. The
- * installation's `daemon.stateDir` is the driver state directory (the release
- * reads the lease of that directory, never the process-wide one). When none
- * is recorded the root's driver state directory cannot be determined and the
+ * release root names the driver: the installation's `daemon.stateDir` is the
+ * driver state directory (the release reads the lease of that directory, never
+ * the process-wide one). When the root cannot be bound — a root that is not an
+ * absolute release root, or an installation that records no driver state
+ * directory — the root's driver state directory cannot be determined and the
  * release refuses `release-root-state-dir-unknown`. Pure: no filesystem or
  * environment access.
  */
@@ -115,6 +117,9 @@ export function resolveReleaseRootStateDir(
   root: string,
   installation: FleetInstallation | undefined,
 ): string | null {
+  if (!isAbsolutePath(root)) {
+    return null;
+  }
   const stateDir = installation?.daemon?.stateDir;
   return typeof stateDir === 'string' && stateDir.trim() !== '' ? stateDir : null;
 }

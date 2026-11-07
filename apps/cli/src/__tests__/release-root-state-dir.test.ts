@@ -17,6 +17,7 @@ import type { FleetInstallation } from '@fleet/installation';
 
 import { createFleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
+import { resolveReleaseRootStateDir } from '../release.js';
 
 const SHA = 'a'.repeat(40);
 const PROJECT = 'fleet-v2';
@@ -128,5 +129,14 @@ describe('release root state directory binding', () => {
     const fromB = await runRelease(argv, withProcessStateA);
     expect(fromB.code).toBe(1);
     expect(JSON.parse(fromB.out.join(''))).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
+  });
+
+  it('resolveReleaseRootStateDir is root-aware: a non-absolute root binds no driver state directory', () => {
+    const installation = installationWithDriverStateDir(path.join(tempDir, 'state'));
+    expect(resolveReleaseRootStateDir('relative/root', installation)).toBeNull();
+    expect(resolveReleaseRootStateDir('', installation)).toBeNull();
+    expect(resolveReleaseRootStateDir('/a/../b', installation)).toBeNull();
+    expect(resolveReleaseRootStateDir(releaseRoot, installation)).toBe(path.join(tempDir, 'state'));
+    expect(resolveReleaseRootStateDir(releaseRoot, undefined)).toBeNull();
   });
 });

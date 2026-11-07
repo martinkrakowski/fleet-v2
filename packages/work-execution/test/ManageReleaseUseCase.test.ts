@@ -30,7 +30,11 @@ import type {
 import type {
   ReleaseBuildRecord,
   ReleaseStagingResult,
+  ReleaseStoreCompleteRepointResult,
+  ReleaseStoreIntendResult,
   ReleaseStoreListing,
+  ReleaseStoreOrphanCleanupResult,
+  ReleaseStorePendingRepointResult,
   ReleaseStorePort,
   ReleaseStorePruneResult,
   ReleaseStoreWriteResult,
@@ -147,6 +151,77 @@ class FakeStore implements ReleaseStorePort {
     this.builds = this.builds.filter((entry) => keepSet.has(entry.sha));
     this.removed.push(...removed);
     return { outcome: 'pruned', removed };
+  }
+
+  /** CO14b: pending repoint temp links (name -> sha). */
+  readonly tempLinks = new Map<string, string>();
+  tempCounter = 0;
+  cleanupUnreadable = false;
+  pendingUnreadable = false;
+  intendUnreadable = false;
+
+  async cleanupOrphanTmpLinks(input: { root: string }): Promise<ReleaseStoreOrphanCleanupResult> {
+    this.calls.push('cleanupOrphanTmpLinks');
+    if (this.cleanupUnreadable) {
+      return { outcome: 'unreadable' };
+    }
+    const removed = this.tempLinks.size;
+    this.tempLinks.clear();
+    return { outcome: 'cleaned', removed, findings: [] };
+  }
+
+  async pendingRepoint(input: { root: string }): Promise<ReleaseStorePendingRepointResult> {
+    this.calls.push('pendingRepoint');
+    if (this.pendingUnreadable) {
+      return { outcome: 'unreadable' };
+    }
+    const entries = [...this.tempLinks.entries()];
+    if (entries.length > 1) {
+      return { outcome: 'unreadable' };
+    }
+    return {
+      outcome: 'read',
+      pending: entries.length === 1 ? { tempLink: entries[0][0], sha: entries[0][1] } : null,
+    };
+  }
+
+  async intendRepoint(input: { root: string; sha: string }): Promise<ReleaseStoreIntendResult> {
+    this.calls.push(`intendRepoint ${input.sha}`);
+    if (this.intendUnreadable) {
+      return { outcome: 'unreadable' };
+    }
+    for (const [name, sha] of this.tempLinks) {
+      if (sha === input.sha) {
+        return { outcome: 'ready', tempLink: name, resumed: true };
+      }
+    }
+    this.tempLinks.clear();
+    const name = `.current.${this.tempCounter++}.tmp`;
+    this.tempLinks.set(name, input.sha);
+    return { outcome: 'ready', tempLink: name, resumed: false };
+  }
+
+  async completeRepoint(input: {
+    root: string;
+    tempLink: string;
+    fence?: () => Promise<boolean>;
+  }): Promise<ReleaseStoreCompleteRepointResult> {
+    this.calls.push(`completeRepoint ${input.tempLink}`);
+    if (!this.tempLinks.has(input.tempLink)) {
+      return { outcome: 'not-found' };
+    }
+    if (input.fence !== undefined && !(await input.fence())) {
+      return { outcome: 'fenced' };
+    }
+    this.current = this.tempLinks.get(input.tempLink) as string;
+    this.tempLinks.delete(input.tempLink);
+    return { outcome: 'ok' };
+  }
+
+  async discardRepointIntent(input: { root: string; tempLink: string }): Promise<ReleaseStoreWriteResult> {
+    this.calls.push(`discardRepointIntent ${input.tempLink}`);
+    this.tempLinks.delete(input.tempLink);
+    return { outcome: 'ok' };
   }
 
   async discard(input: { root: string; buildId: string }): Promise<ReleaseStoreWriteResult> {
@@ -565,14 +640,15 @@ describe('ManageReleaseUseCase', () => {
     expect(executor.runs).toEqual([]);
     const lapsed = granted(INSTALL, A, { lease: LAPSED_LEASE });
     expect((await manage(lapsed.useCase, applyRequest())).outcome).toBe('applied');
-    expect(lapsed.lease.events).toEqual([`acquire ${LAPSED_LEASE.fence}`, `renew ${LAPSED_LEASE.fence + 1}`, `release ${LAPSED_LEASE.fence + 1}`]);
+    // Install builds and never repoints, so it takes no driver lease.
+    expect(lapsed.lease.events).toEqual([]);
   });
 
-  it('refuses driver-lease-live when a driver starts during the build and repoints nothing', async () => {
+  it('a driver that takes the lease during an install build changes nothing: install builds and leaves current unmoved', async () => {
     const lease = new FakeLease(null);
     lease.reads = [null, LIVE_LEASE];
     const { useCase, store, executor } = granted(INSTALL, A, { lease });
-    expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
+    expect((await manage(useCase, applyRequest())).outcome).toBe('applied');
     expect(executor.runs).toHaveLength(4);
     expect(store.calls).not.toContain(`repoint ${A}`);
     expect(store.current).toBeNull();
@@ -655,10 +731,10 @@ describe('ManageReleaseUseCase', () => {
     const lease = new FakeLease(null);
     const made = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });
     const order: string[] = [];
-    const repoint = made.store.repoint.bind(made.store);
-    made.store.repoint = async (input) => {
+    const complete = made.store.completeRepoint.bind(made.store);
+    made.store.completeRepoint = async (input) => {
       order.push(`repoint while held=${lease.held !== null} fenced=${input.fence !== undefined}`);
-      return repoint(input);
+      return complete(input);
     };
     expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('applied');
     expect(order).toEqual(['repoint while held=true fenced=true']);
@@ -716,7 +792,7 @@ describe('ManageReleaseUseCase', () => {
       executor.failAt = failAt;
       const { useCase, store, authorization } = granted(INSTALL, A, { executor });
       expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed' });
-      expect(store.calls).toEqual([`prepare ${A}`, `discard ${A}`]);
+      expect(store.calls).toEqual(['cleanupOrphanTmpLinks', `prepare ${A}`, `discard ${A}`]);
       expect(store.current).toBeNull();
       expect(executor.runs).toHaveLength(failAt + 1);
       expect(authorization.consumes).toEqual([]);
@@ -728,7 +804,7 @@ describe('ManageReleaseUseCase', () => {
     store.entryMissing = true;
     const { useCase } = granted(INSTALL, A, { store });
     expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'verify-failed' });
-    expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `discard ${A}`]);
+    expect(store.calls).toEqual(['cleanupOrphanTmpLinks', `prepare ${A}`, `markVerified ${A}`, `discard ${A}`]);
     expect(store.current).toBeNull();
   });
 
@@ -781,20 +857,21 @@ describe('ManageReleaseUseCase', () => {
     expect(install.executor.runs).toEqual([]);
   });
 
-  it('install builds, verifies and repoints current', async () => {
+  it('install builds and verifies, leaving current unmoved', async () => {
     const { useCase, store, executor } = granted(INSTALL, A);
     const result = await manage(useCase, applyRequest());
     expect(result).toEqual({
       outcome: 'applied',
       action: 'install',
       target: A,
-      current: A,
+      current: null,
       kept: [A],
       pruned: [],
       pruneOutcome: 'pruned',
       rebuilt: true,
     });
-    expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `repoint ${A}`, 'prune 5']);
+    expect(store.calls).toEqual(['cleanupOrphanTmpLinks', `prepare ${A}`, `markVerified ${A}`]);
+    expect(store.current).toBeNull();
     const staging = `${ROOT}/.staging-${store.preparedIds[0]}`;
     expect(executor.runs.map((run) => run.argv)).toEqual([
       [
@@ -822,22 +899,30 @@ describe('ManageReleaseUseCase', () => {
     expect(executor.runs[2].options?.cwd).toBe(staging);
   });
 
-  it('install of an already built sha does not build twice', async () => {
+  it('install of an already built sha does not build twice and leaves current unmoved', async () => {
     const { useCase, store, executor } = granted(INSTALL, A, { store: new FakeStore([build('a', 1), build('b', 2)], B) });
     const result = await manage(useCase, applyRequest({ sha: A }));
-    expect(result).toMatchObject({ outcome: 'applied', target: A, current: A, rebuilt: false });
+    expect(result).toMatchObject({ outcome: 'applied', target: A, current: B, rebuilt: false });
     expect(executor.runs).toEqual([]);
-    expect(store.calls).toEqual([`repoint ${A}`, 'prune 5']);
+    expect(store.calls).toEqual(['cleanupOrphanTmpLinks']);
+    expect(store.current).toBe(B);
     expect(store.builds.filter((entry) => entry.sha === A)).toHaveLength(1);
   });
 
-  it('completes a crash between the build and the repoint on the next install', async () => {
-    const store = new FakeStore([build('a', 1)], null);
-    const { useCase, executor } = granted(INSTALL, A, { store });
-    const result = await manage(useCase, applyRequest({ sha: A }));
-    expect(result).toMatchObject({ outcome: 'applied', current: A, rebuilt: false });
+  it('a release swap survives a crash after the grant is consumed but before the repoint', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2)], B);
+    const made = granted(SWAP, A, { store });
+    // Simulate the state after a crash between grant consumption and the
+    // repoint rename: the grant is consumed and the pending temp link exists,
+    // but `current` still points at the old build.
+    store.tempLinks.set('.current.crashed.1234.tmp', A);
+    made.authorization.consumedBy = `release-swap-${A}`;
+    const result = await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }));
+    expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: A, current: A });
     expect(store.current).toBe(A);
-    expect(executor.runs).toEqual([]);
+    // The retry completes the interrupted repoint without consuming again.
+    expect(made.authorization.consumes).toEqual([]);
+    expect(store.tempLinks.size).toBe(0);
   });
 
   it('swap repoints current to a kept build', async () => {
@@ -845,6 +930,37 @@ describe('ManageReleaseUseCase', () => {
     const result = await manage(useCase, applyRequest({ action: 'swap', sha: A, source: null }));
     expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: A, current: A, rebuilt: false });
     expect(store.current).toBe(A);
+  });
+
+  it('a release swap cleans orphaned temp links left by interrupted repoints', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2)], B);
+    // A stale orphan temp link from an interrupted repoint to another build.
+    store.tempLinks.set('.current.stale.deadbeef.tmp', B);
+    const made = granted(SWAP, A, { store });
+    expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('applied');
+    expect(store.current).toBe(A);
+    expect(store.tempLinks.size).toBe(0);
+  });
+
+  it('an unreadable orphan cleanup is reported as release-unknown-state, never a pass', async () => {
+    const installStore = new FakeStore([build('a', 1)], null);
+    installStore.cleanupUnreadable = true;
+    const installed = granted(INSTALL, B, { store: installStore });
+    expect(await manage(installed.useCase, applyRequest({ sha: B }))).toEqual({
+      outcome: 'refused',
+      reason: 'release-unknown-state',
+    });
+    expect(installed.executor.runs).toEqual([]);
+
+    const swapStore = new FakeStore([build('a', 1), build('b', 2)], B);
+    swapStore.cleanupUnreadable = true;
+    const swapped = granted(SWAP, A, { store: swapStore });
+    expect(await manage(swapped.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'release-unknown-state',
+    });
+    expect(swapped.store.current).toBe(B);
+    expect(swapped.authorization.consumes).toEqual([]);
   });
 
   it('rollback repoints current to the previous kept build', async () => {
@@ -880,12 +996,12 @@ describe('ManageReleaseUseCase', () => {
     expect(result).toMatchObject({ outcome: 'applied', current: B, pruned: [C], kept: [A, B, D, E] });
     expect(store.removed).toEqual([C]);
 
-    const fresh = granted(INSTALL, F, { store: new FakeStore(builds, E) });
-    expect(await manage(fresh.useCase, applyRequest({ sha: F, keep: 2 }))).toMatchObject({
+    const installed = granted(INSTALL, F, { store: new FakeStore(builds, E) });
+    expect(await manage(installed.useCase, applyRequest({ sha: F, keep: 2 }))).toMatchObject({
       outcome: 'applied',
-      current: F,
-      kept: [E, F],
-      pruned: [A, B, C, D],
+      current: E,
+      kept: [A, B, C, D, E, F],
+      pruned: [],
     });
   });
 

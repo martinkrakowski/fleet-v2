@@ -36,7 +36,6 @@ import type { ReleaseActionKind } from '../../domain/coordination-keys.js';
 import { isLeaseLapsed, type ConductorDriverLeaseRecord } from '../../domain/lane-run-lease.js';
 import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import type {
-  ManageReleaseApplied,
   ManageReleasePlan,
   ManageReleasePort,
   ManageReleaseRefusal,
@@ -47,7 +46,7 @@ import type {
 import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
 import type { CommandExecutorPort, CommandRunOptions } from '../ports/out/CommandExecutorPort.out-port.js';
 import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
-import type { ReleaseBuildRecord, ReleaseStorePort, ReleaseStorePruneResult } from '../ports/out/ReleaseStorePort.out-port.js';
+import type { ReleaseBuildRecord, ReleaseStorePort } from '../ports/out/ReleaseStorePort.out-port.js';
 
 export interface ManageReleaseDependencies {
   readonly store: ReleaseStorePort;
@@ -146,7 +145,8 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         current,
         previous,
         kept,
-        wouldPrune: this.wouldPrune(builds, target, alreadyBuilt, request.keep),
+        // Install builds without repointing `current`, so it prunes nothing.
+        wouldPrune: request.action === 'install' ? [] : this.wouldPrune(builds, target, alreadyBuilt, request.keep),
         lease: live ? 'live' : 'free',
       };
       return plan;
@@ -157,43 +157,204 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     return this.apply(request, target, current, alreadyBuilt);
   }
 
-  /** The apply path: grant, build when needed, the fenced repoint, then prune. */
+  /** The apply path: install builds without moving `current`; swap/rollback repoint with crash recovery. */
   private async apply(
     request: ValidRequest,
     target: string,
     plannedCurrent: string | null,
     alreadyBuilt: boolean,
   ): Promise<ManageReleaseResult> {
+    if (request.action === 'install') {
+      return this.applyInstall(request, target, alreadyBuilt);
+    }
+    return this.applySwapLike(request, target, plannedCurrent);
+  }
+
+  /**
+   * Install: resolve the grant, clean orphaned temp links, build when the
+   * sha is not built yet, and leave `current` unmoved (CO14b). The build is
+   * verified and in place; nothing is repointed and nothing is pruned.
+   */
+  private async applyInstall(
+    request: ValidRequest,
+    target: string,
+    alreadyBuilt: boolean,
+  ): Promise<ManageReleaseResult> {
     const grant = await this.resolveGrant(request, target);
     if (typeof grant !== 'string') {
       return refuse(grant.refusal);
     }
+    const cleanup = await this.cleanupOrphans(request.root);
+    if (cleanup !== null) {
+      return refuse(cleanup);
+    }
     let rebuilt = false;
-    if (request.action === 'install' && !alreadyBuilt) {
+    if (!alreadyBuilt) {
       const built = await this.build(request, target);
       if (built !== null) {
         return refuse(built);
       }
       rebuilt = true;
     }
-    const repointed = await this.fencedRepoint(request, target, plannedCurrent, grant);
-    if ('refusal' in repointed) {
-      return refuse(repointed.refusal);
+    const consumed = await this.consumeGrant(request, target, grant);
+    if (consumed !== null) {
+      return refuse(consumed);
     }
-    const { pruned, kept } = repointed;
-    // An unfinished prune still reports what it did remove, so `kept` never lists a deleted build.
-    const removed = pruned.removed ?? [];
-    const applied: ManageReleaseApplied = {
+    const listing = await this.deps.store.list({ root: request.root });
+    if (listing.outcome !== 'read') {
+      return refuse('store-unreadable');
+    }
+    return {
       outcome: 'applied',
-      action: request.action,
+      action: 'install',
       target,
-      current: target,
-      kept: kept.filter((sha) => !removed.includes(sha)),
-      pruned: [...removed],
-      pruneOutcome: pruned.outcome === 'pruned' ? 'pruned' : 'unreadable',
+      current: listing.current,
+      kept: listing.builds.map((build) => build.sha),
+      pruned: [],
+      pruneOutcome: 'pruned',
       rebuilt,
     };
-    return applied;
+  }
+
+  /**
+   * Swap and rollback: repoint `current` only while this process holds the
+   * conductor driver lease, with crash recovery. A pending repoint (the temp
+   * symlink an interrupted repoint left) for the same target is resumed: the
+   * interrupted attempt already resolved and consumed the grant, so a blocked
+   * re-resolve means "already consumed by this operation" and the repoint is
+   * completed. A fresh repoint resolves the grant, records the pending temp
+   * link, consumes the grant, then renames the temp link to `current` behind
+   * the store's fence. An orphan-cleanup pass runs before a fresh repoint and
+   * surfaces an unreadable root as `release-unknown-state`.
+   */
+  private async applySwapLike(
+    request: ValidRequest,
+    target: string,
+    plannedCurrent: string | null,
+  ): Promise<ManageReleaseResult> {
+    const held = await this.acquireLease(request, target);
+    if (typeof held === 'string') {
+      return refuse(held);
+    }
+    try {
+      // Revalidate under the lease: another release may have repointed while
+      // this one resolved its grant or built, so the target must still be what
+      // the plan named against the same `current`.
+      const fresh = await this.deps.store.list({ root: request.root });
+      if (fresh.outcome !== 'read') {
+        return refuse('store-unreadable');
+      }
+      if (!stillTargets(request.action, fresh.builds, fresh.current, plannedCurrent, target)) {
+        return refuse('current-moved');
+      }
+      const pending = await this.deps.store.pendingRepoint({ root: request.root });
+      if (pending.outcome !== 'read') {
+        return refuse('store-unreadable');
+      }
+      const resumed = pending.pending !== null && pending.pending.sha === target;
+      // A resumed attempt keeps its own pending temp link (the interrupted
+      // repoint's intent); a fresh attempt cleans orphans before resolving.
+      if (!resumed) {
+        const cleanup = await this.cleanupOrphans(request.root);
+        if (cleanup !== null) {
+          return refuse(cleanup);
+        }
+      }
+      const grant = await this.resolveGrant(request, target);
+      if (typeof grant !== 'string') {
+        if (!resumed) {
+          return refuse(grant.refusal);
+        }
+        // Resumed: the interruption happened after the grant was consumed. Only
+        // unknown authority stops the completion; a blocked resolve means the
+        // grant is already consumed by this exact operation.
+        if (grant.refusal === 'authority-unknown') {
+          return refuse('authority-unknown');
+        }
+      }
+      let tempLink: string;
+      if (resumed) {
+        tempLink = (pending.pending as { readonly tempLink: string }).tempLink;
+        if (typeof grant === 'string') {
+          const consumed = await this.consumeGrant(request, target, grant);
+          if (consumed !== null) {
+            return refuse(consumed);
+          }
+        }
+      } else {
+        const intended = await this.deps.store.intendRepoint({ root: request.root, sha: target });
+        if (intended.outcome !== 'ready') {
+          return refuse('store-unreadable');
+        }
+        tempLink = intended.tempLink;
+        const consumed = await this.consumeGrant(request, target, grant as string);
+        if (consumed !== null) {
+          await this.discardRepointIntent(request.root, tempLink);
+          return refuse(consumed);
+        }
+      }
+      const repointed = await this.deps.store.completeRepoint({
+        root: request.root,
+        tempLink,
+        fence: () => this.stillHolds(held),
+      });
+      if (repointed.outcome !== 'ok') {
+        return refuse(repointRefusal(repointed.outcome));
+      }
+      // The repoint stands from here on: a prune that throws is an unfinished
+      // prune of an applied release, never a refusal a caller would retry.
+      const kept = fresh.builds.map((build) => build.sha);
+      try {
+        const pruned = await this.deps.store.prune({
+          root: request.root,
+          keep: request.keep,
+          fence: () => this.stillHolds(held),
+        });
+        const removed = pruned.removed ?? [];
+        return {
+          outcome: 'applied',
+          action: request.action,
+          target,
+          current: target,
+          kept: kept.filter((sha) => !removed.includes(sha)),
+          pruned: [...removed],
+          pruneOutcome: pruned.outcome === 'pruned' ? 'pruned' : 'unreadable',
+          rebuilt: false,
+        };
+      } catch {
+        return {
+          outcome: 'applied',
+          action: request.action,
+          target,
+          current: target,
+          kept,
+          pruned: [],
+          pruneOutcome: 'unreadable',
+          rebuilt: false,
+        };
+      }
+    } finally {
+      await this.releaseLease(held);
+    }
+  }
+
+  /** The orphan temp-link cleanup pass; an unreadable root is `release-unknown-state`. */
+  private async cleanupOrphans(root: string): Promise<ManageReleaseRefusal | null> {
+    try {
+      const cleaned = await this.deps.store.cleanupOrphanTmpLinks({ root });
+      return cleaned.outcome === 'cleaned' ? null : 'release-unknown-state';
+    } catch {
+      return 'release-unknown-state';
+    }
+  }
+
+  /** Best effort: an aborted fresh repoint removes its own temp link. */
+  private async discardRepointIntent(root: string, tempLink: string): Promise<void> {
+    try {
+      await this.deps.store.discardRepointIntent({ root, tempLink });
+    } catch {
+      // The temp link is orphan-shaped and a later cleanup pass removes it.
+    }
   }
 
   /** true when a driver holds an unexpired lease; null when the lease cannot be read. */
@@ -238,70 +399,6 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       return { refusal: resolved.outcome === 'blocked' ? 'authority-refused' : 'authority-unknown' };
     } catch {
       return { refusal: 'authority-unknown' };
-    }
-  }
-
-  /**
-   * Repoint `current` and prune only while this process holds the conductor
-   * driver lease: re-read it, acquire it by CAS, consume the grant, repoint
-   * behind the store's fence, prune, release. Another release needs the same
-   * lease to repoint, so no repoint can land between this prune's snapshot of
-   * `current` and its removals. The prune result when repointed; the refusal
-   * otherwise.
-   */
-  private async fencedRepoint(
-    request: ValidRequest,
-    target: string,
-    plannedCurrent: string | null,
-    grantId: string,
-  ): Promise<
-    | { readonly refusal: ManageReleaseRefusal }
-    | { readonly pruned: ReleaseStorePruneResult; readonly kept: readonly string[] }
-  > {
-    const held = await this.acquireLease(request, target);
-    if (typeof held === 'string') {
-      return { refusal: held };
-    }
-    try {
-      // Revalidate under the lease: another release may have repointed while
-      // this one resolved its grant or built, so the target must still be what
-      // the plan named against the same `current`.
-      const fresh = await this.deps.store.list({ root: request.root });
-      if (fresh.outcome !== 'read') {
-        return { refusal: 'store-unreadable' };
-      }
-      if (!stillTargets(request.action, fresh.builds, fresh.current, plannedCurrent, target)) {
-        return { refusal: 'current-moved' };
-      }
-      const kept = fresh.builds.map((build) => build.sha);
-      const consumed = await this.consumeGrant(request, target, grantId);
-      if (consumed !== null) {
-        return { refusal: consumed };
-      }
-      const repointed = await this.deps.store.repoint({
-        root: request.root,
-        sha: target,
-        fence: () => this.stillHolds(held),
-      });
-      if (repointed.outcome !== 'ok') {
-        return { refusal: repointRefusal(repointed.outcome) };
-      }
-      // The repoint stands from here on: a prune that throws is an unfinished
-      // prune of an applied release, never a refusal a caller would retry.
-      try {
-        return {
-          kept,
-          pruned: await this.deps.store.prune({
-            root: request.root,
-            keep: request.keep,
-            fence: () => this.stillHolds(held),
-          }),
-        };
-      } catch {
-        return { kept, pruned: { outcome: 'unreadable' } };
-      }
-    } finally {
-      await this.releaseLease(held);
     }
   }
 
@@ -508,11 +605,13 @@ function stillTargets(
   return builds.some((build) => build.sha === target);
 }
 
-function repointRefusal(outcome: 'fenced' | 'not-found' | 'not-verified' | 'unreadable'): ManageReleaseRefusal {
+function repointRefusal(outcome: 'fenced' | 'not-found' | 'unreadable'): ManageReleaseRefusal {
   if (outcome === 'fenced') {
     return 'driver-lease-live';
   }
-  return outcome === 'not-found' ? 'not-found' : 'store-unreadable';
+  // A missing or unreadable pending temp link is an unknown store state, never
+  // a plan-visible "not found": the swap's repoint cannot be completed.
+  return 'store-unreadable';
 }
 
 function allowlisted(

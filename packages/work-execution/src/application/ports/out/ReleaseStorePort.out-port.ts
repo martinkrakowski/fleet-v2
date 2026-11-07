@@ -44,6 +44,35 @@ export type ReleaseStoreOrphanCleanupResult =
   | { readonly outcome: 'cleaned'; readonly removed: number; readonly findings: readonly string[] }
   | { readonly outcome: 'unreadable' };
 
+/**
+ * CO14b: a pending repoint — the temp symlink an interrupted repoint left at
+ * `<root>/.current.<pid>.<hex>.tmp`. At most one pending repoint is readable;
+ * more than one is an ambiguous interrupted state, never resumable.
+ */
+export type ReleaseStorePendingRepointResult =
+  | {
+      readonly outcome: 'read';
+      readonly pending: { readonly tempLink: string; readonly sha: string } | null;
+    }
+  | { readonly outcome: 'unreadable' };
+
+/**
+ * CO14b: the outcome of recording a pending repoint by creating (or reusing)
+ * the temp symlink for the target. `resumed` is true when a pending temp link
+ * to the same target already existed, so the operation is a retry of an
+ * interrupted repoint rather than a fresh one.
+ */
+export type ReleaseStoreIntendResult =
+  | { readonly outcome: 'ready'; readonly tempLink: string; readonly resumed: boolean }
+  | { readonly outcome: 'unreadable' };
+
+/** CO14b: the outcome of completing a pending repoint by renaming the temp link to `current`. */
+export type ReleaseStoreCompleteRepointResult =
+  | { readonly outcome: 'ok' }
+  | { readonly outcome: 'fenced' }
+  | { readonly outcome: 'not-found' }
+  | { readonly outcome: 'unreadable' };
+
 /** A fresh staging directory created by this `prepare` call; the paths stay inside the application. */
 export type ReleaseStagingResult =
   | {
@@ -111,4 +140,32 @@ export interface ReleaseStorePort {
    * outside the root is ever read or removed. The pass is idempotent.
    */
   cleanupOrphanTmpLinks(input: { readonly root: string }): Promise<ReleaseStoreOrphanCleanupResult>;
+  /**
+   * CO14b: read the one pending repoint of the root, if any — a temp symlink
+   * an interrupted repoint left at `<root>/.current.*.tmp`. More than one
+   * pending temp link is an ambiguous interrupted state (`unreadable`), never
+   * silently resumed.
+   */
+  pendingRepoint(input: { readonly root: string }): Promise<ReleaseStorePendingRepointResult>;
+  /**
+   * CO14b: record a pending repoint. Creates the temp symlink
+   * `<root>/.current.*.tmp` pointing at `<sha>`, after removing any stale
+   * pending temp links that name a different target (they can only belong to a
+   * dead, interrupted repoint). When a pending temp link to the same target
+   * already exists it is reused and `resumed` is true.
+   */
+  intendRepoint(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStoreIntendResult>;
+  /**
+   * CO14b: complete a pending repoint by renaming its temp symlink to
+   * `current`. `fence` is awaited last, and only when it answers true does the
+   * one rename run. A false or throwing fence is `fenced` and the temp link is
+   * kept, so a later retry can resume the interrupted repoint.
+   */
+  completeRepoint(input: {
+    readonly root: string;
+    readonly tempLink: string;
+    readonly fence?: () => Promise<boolean>;
+  }): Promise<ReleaseStoreCompleteRepointResult>;
+  /** CO14b: remove a pending repoint's temp symlink (abort the intent). */
+  discardRepointIntent(input: { readonly root: string; readonly tempLink: string }): Promise<ReleaseStoreWriteResult>;
 }

@@ -23,8 +23,11 @@ import { randomBytes } from 'node:crypto';
 
 import type {
   ReleaseBuildRecord,
+  ReleaseStoreCompleteRepointResult,
+  ReleaseStoreIntendResult,
   ReleaseStoreListing,
   ReleaseStoreOrphanCleanupResult,
+  ReleaseStorePendingRepointResult,
   ReleaseStorePort,
   ReleaseStagingResult,
   ReleaseStorePruneResult,
@@ -208,14 +211,19 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
    * name matches the temp pattern are removed; `current`, build directories
    * and matching non-link entries are never removed (a matching non-link is
    * reported as a finding). An unreadable root, or a failed removal, is
-   * `unreadable`, never "no orphans" and never a pass. Idempotent: a second
+   * `unreadable`, never "no orphans" and never a pass. A root that does not
+   * exist at all is an empty first-install store. Idempotent: a second
    * pass over a clean root removes nothing.
    */
   async cleanupOrphanTmpLinks(input: { readonly root: string }): Promise<ReleaseStoreOrphanCleanupResult> {
     let entries: Dirent[];
     try {
       entries = await fs.readdir(input.root, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      // A root that is truly absent is a first-install store, never unreadable.
+      if (isErrno(error, 'ENOENT') && (await lstatOrNull(input.root)) === null) {
+        return { outcome: 'cleaned', removed: 0, findings: [] };
+      }
       return { outcome: 'unreadable' };
     }
     const doomed: string[] = [];
@@ -240,6 +248,156 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       }
     }
     return { outcome: 'cleaned', removed: doomed.length, findings };
+  }
+
+  /**
+   * CO14b: the one pending repoint of the root. A pending temp link is a
+   * symlink whose name matches the temp pattern and whose target is a sha
+   * inside the root. More than one is an ambiguous interrupted state.
+   */
+  async pendingRepoint(input: { readonly root: string }): Promise<ReleaseStorePendingRepointResult> {
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(input.root, { withFileTypes: true });
+    } catch (error) {
+      if (isErrno(error, 'ENOENT') && (await lstatOrNull(input.root)) === null) {
+        return { outcome: 'read', pending: null };
+      }
+      return { outcome: 'unreadable' };
+    }
+    let found: { readonly tempLink: string; readonly sha: string } | null = null;
+    for (const entry of entries) {
+      if (!ORPHAN_TMP_PATTERN.test(entry.name) || !entry.isSymbolicLink()) {
+        continue;
+      }
+      const link = path.join(input.root, entry.name);
+      let target: string;
+      try {
+        target = path.resolve(input.root, await fs.readlink(link));
+      } catch {
+        return { outcome: 'unreadable' };
+      }
+      const name = path.basename(target);
+      if (path.dirname(target) !== path.resolve(input.root) || !SHA_PATTERN.test(name)) {
+        return { outcome: 'unreadable' };
+      }
+      if (found !== null) {
+        return { outcome: 'unreadable' };
+      }
+      found = { tempLink: entry.name, sha: name };
+    }
+    return { outcome: 'read', pending: found };
+  }
+
+  /**
+   * CO14b: record a pending repoint for `<sha>`. Stale pending temp links that
+   * name another target are removed first (a repoint is driver-lease
+   * serialized, so a temp link for another target can only belong to a dead
+   * interrupted repoint). A pending temp link to the same target is reused and
+   * reported as `resumed`.
+   */
+  async intendRepoint(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStoreIntendResult> {
+    if (!SHA_PATTERN.test(input.sha)) {
+      return { outcome: 'unreadable' };
+    }
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(input.root, { withFileTypes: true });
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+    let sameTarget: string | null = null;
+    const stale: string[] = [];
+    for (const entry of entries) {
+      if (!ORPHAN_TMP_PATTERN.test(entry.name) || !entry.isSymbolicLink()) {
+        continue;
+      }
+      const link = path.join(input.root, entry.name);
+      let target: string;
+      try {
+        target = path.resolve(input.root, await fs.readlink(link));
+      } catch {
+        return { outcome: 'unreadable' };
+      }
+      const name = path.basename(target);
+      if (path.dirname(target) !== path.resolve(input.root) || !SHA_PATTERN.test(name)) {
+        return { outcome: 'unreadable' };
+      }
+      if (name === input.sha) {
+        if (sameTarget === null) {
+          sameTarget = entry.name;
+        }
+      } else {
+        stale.push(entry.name);
+      }
+    }
+    for (const name of stale) {
+      try {
+        await fs.unlink(path.join(input.root, name));
+      } catch {
+        return { outcome: 'unreadable' };
+      }
+    }
+    if (sameTarget !== null) {
+      return { outcome: 'ready', tempLink: sameTarget, resumed: true };
+    }
+    try {
+      const temp = path.join(input.root, `.${CURRENT_NAME}.${randomSuffix()}.tmp`);
+      await fs.symlink(input.sha, temp);
+      return { outcome: 'ready', tempLink: path.basename(temp), resumed: false };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  /**
+   * CO14b: complete a pending repoint. The temp symlink is renamed to
+   * `current` only after `fence` passes; nothing is awaited between the fence
+   * and the one rename. A false or throwing fence is `fenced` and the temp
+   * link is kept so a later retry can resume.
+   */
+  async completeRepoint(input: {
+    readonly root: string;
+    readonly tempLink: string;
+    readonly fence?: () => Promise<boolean>;
+  }): Promise<ReleaseStoreCompleteRepointResult> {
+    if (!ORPHAN_TMP_PATTERN.test(input.tempLink) || input.tempLink.includes('/') || input.tempLink.includes('\\')) {
+      return { outcome: 'not-found' };
+    }
+    try {
+      const temp = path.join(input.root, input.tempLink);
+      const stat = await lstatOrNull(temp);
+      if (stat === null || !stat.isSymbolicLink()) {
+        return { outcome: 'not-found' };
+      }
+      const existing = await lstatOrNull(path.join(input.root, CURRENT_NAME));
+      if (existing !== null && !existing.isSymbolicLink()) {
+        return { outcome: 'unreadable' };
+      }
+      if (input.fence !== undefined && !(await passesFence(input.fence))) {
+        return { outcome: 'fenced' };
+      }
+      // Nothing is awaited between the fence and this one atomic rename.
+      await fs.rename(temp, path.join(input.root, CURRENT_NAME));
+      return { outcome: 'ok' };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  /** CO14b: remove a pending repoint's temp symlink (abort the intent). */
+  async discardRepointIntent(input: { readonly root: string; readonly tempLink: string }): Promise<ReleaseStoreWriteResult> {
+    if (!ORPHAN_TMP_PATTERN.test(input.tempLink) || input.tempLink.includes('/') || input.tempLink.includes('\\')) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      await fs.unlink(path.join(input.root, input.tempLink));
+    } catch (error) {
+      if (!isErrno(error, 'ENOENT')) {
+        return { outcome: 'unreadable' };
+      }
+    }
+    return { outcome: 'ok' };
   }
 }
 

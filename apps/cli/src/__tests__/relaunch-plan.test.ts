@@ -548,6 +548,37 @@ describe('relaunch plan (production composition)', () => {
     expect(result.result.outcome).toBe('planned');
   });
 
+  // CO29a-ro2: a REAL filesystem read error through the production path. Each
+  // conductor file is replaced by a DIRECTORY of the same name, so the adapter's
+  // read fails with EISDIR (no port mock): both commands must answer unknown,
+  // store no plan and change no byte of the state or the worktrees.
+  const directoryCases = ['conductor-halt.json', 'conductor-driver-lease.json'] as const;
+  it.each(directoryCases)(
+    'answers unknown on a real EISDIR read error with %s replaced by a directory',
+    async (file) => {
+      const fx = await seededFixture();
+      await fs.rm(path.join(fx.stateDir, file), { force: true });
+      await fs.mkdir(path.join(fx.stateDir, file));
+      const stateBefore = await snapshotStateWithHashes(fx.stateDir);
+      const worktreesBefore = await snapshotStateWithHashes(fx.worktreeRoot);
+
+      const inventoryIo = capture();
+      const inventoryCode = await runCli(['relaunch', 'inventory'], inventoryIo, fx.runtime);
+      const inventoryAnswer = JSON.parse(inventoryIo.out.join('')) as InventoryAnswer;
+      expect(inventoryCode).not.toBe(0);
+      expect(inventoryAnswer.outcome).toBe('unknown');
+      expect(await snapshotStateWithHashes(fx.stateDir)).toEqual(stateBefore);
+      expect(await snapshotStateWithHashes(fx.worktreeRoot)).toEqual(worktreesBefore);
+
+      const result = await plan(fx.runtime);
+      expect(result.code).toBe(1);
+      expect(result.result.outcome).toBe('unknown');
+      await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await snapshotStateWithHashes(fx.stateDir)).toEqual(stateBefore);
+      expect(await snapshotStateWithHashes(fx.worktreeRoot)).toEqual(worktreesBefore);
+    },
+  );
+
   it('exits 1 with unknown when the profile records cannot be read', async () => {
     const fx = await fixture([]);
     // CO29a-ro2: the relaunch commands read profiles through the read-only

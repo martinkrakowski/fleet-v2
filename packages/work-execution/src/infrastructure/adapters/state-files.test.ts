@@ -556,6 +556,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'seat-tickets.json',
       'seat-observations.json',
       'merge-records.json',
+      'held-work-orders.json',
     ]);
   });
 });

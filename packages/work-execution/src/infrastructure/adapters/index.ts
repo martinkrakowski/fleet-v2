@@ -47,6 +47,7 @@ export * from "./GateSlotBudget.helper.js";
 export * from "./gh-refusal.js";
 export * from "./GhForgeMergeReadAdapter.adapter.js";
 export * from "./GitMirrorPatchIdentityAdapter.adapter.js";
+export * from "./HeldWorkOrderRepositoryAdapter.adapter.js";
 export * from "./InMemoryReaperFindingRepositoryAdapter.adapter.js";
 export * from "./InMemoryRunTelemetryMarkAdapter.adapter.js";
 export * from "./JevMergeVetoAdapter.adapter.js";

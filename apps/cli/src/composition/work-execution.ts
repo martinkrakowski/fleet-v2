@@ -28,6 +28,8 @@ import {
   ExecutionObservationAdapter,
   GatePredicateAdapter,
   GateReceiptReuseAdapter,
+  HeldWorkOrderRepositoryAdapter,
+  ListHeldWorkOrdersUseCase,
   ProcessTreeTerminationAdapter,
   ImportLanePlanUseCase,
   ImportTrainStateUseCase,
@@ -548,8 +550,15 @@ export function composeExecution(input: ComposeExecutionInput) {
   // WB5b: a completed merge saves its record (merge-records.json) beside the
   // other work-execution stores; without it `merge-pr` refuses.
   const mergeRecordRepository = new MergeRecordRepositoryAdapter({ stateDir });
+  // PT1ca: an overlap-refused registration is kept in held-work-orders.json
+  // (in memory without a stateDir) and listed by `work-order held`.
+  const heldWorkOrderRepository = new HeldWorkOrderRepositoryAdapter({ stateDir });
+  const listHeldWorkOrders = new ListHeldWorkOrdersUseCase({ heldRepo: heldWorkOrderRepository });
 
   const execution = {
+    lanePlanRepository,
+    heldWorkOrderRepository,
+    listHeldWorkOrders,
     workOrderRepository,
     attemptRepository,
     executionJournal,
@@ -594,6 +603,8 @@ export function composeExecution(input: ComposeExecutionInput) {
       workOrderRepo: workOrderRepository,
       profileRead,
       lanePlanRepo: lanePlanRepository,
+      heldWorkOrderRepo: heldWorkOrderRepository,
+      computeDigest: sha256HexDigest,
     }),
     importLanePlan: new ImportLanePlanUseCase({
       lanePlanRepo: lanePlanRepository,

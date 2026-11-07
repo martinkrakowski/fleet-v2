@@ -39,7 +39,12 @@ import type {
   AuthorizeUnsealedWorktreeRemovalResult,
 } from '../../ports/out/ActionAuthorizationPort.out-port.js';
 import type { ArtifactManifestRemovalCheckResult } from '../../ports/out/AttemptArtifactPort.out-port.js';
-import { ReapLaneWorktreesUseCase } from '../ReapLaneWorktreesUseCase.use-case.js';
+import type { RunnerForAttemptPort } from '../../ports/out/RunnerForAttemptPort.out-port.js';
+import {
+  ReapLaneWorktreesDependencies,
+  ReapLaneWorktreesUseCase,
+  unsealedRemovalRequestDigest,
+} from '../ReapLaneWorktreesUseCase.use-case.js';
 import type { ReapLaneWorktreesResult } from '../../ports/in/ReapLaneWorktreesPort.in-port.js';
 
 const NOW = '2026-10-31T00:00:00.000Z';
@@ -237,7 +242,7 @@ function makeWorkspace(
 }
 
 type AttemptArtifactFake =
-  | { readonly outcome: 'sealed' | 'missing' | 'unknown' }
+  | { readonly outcome: 'sealed' | 'missing' | 'unknown' | 'bogus' }
   | { readonly outcome: 'mismatch' };
 
 function makeAttemptArtifact(result: AttemptArtifactFake = { outcome: 'sealed' }) {
@@ -304,8 +309,14 @@ function harness(options: {
   runRepoList?: () => Promise<unknown>;  storeCallTimeoutMs?: number;
   appendJournalEntry?: JournalFake['appendJournalEntry'];
   listAttemptsThrows?: boolean;
-} = {}): Harness {
-  const workOrders = new Map((options.workOrders ?? [makeWorkOrder('wo-a')]).map((r) => [r.id, r]));
+  runnerForAttempt?: RunnerForAttemptPort;
+  noRunnerForAttempt?: boolean;
+  findWorkOrderById?: (id: string) => Promise<unknown>;
+  listAttemptsByWorkOrder?: (workOrderId: string) => Promise<unknown>;
+  listForRun?: (runId: string) => Promise<unknown>;
+  readProjectProfile?: (projectId: string) => Promise<unknown>;
+  listActiveReservations?: () => Promise<unknown>;
+} = {}): Harness {  const workOrders = new Map((options.workOrders ?? [makeWorkOrder('wo-a')]).map((r) => [r.id, r]));
   const attempts = options.attempts ?? [];
   const runs = options.runs ?? [];
   const journalStates = options.journalStates ?? new Map<string, string>();
@@ -313,6 +324,9 @@ function harness(options: {
 
   const workOrderRepo: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'> = {
     async findWorkOrderById(id) {
+      if (options.findWorkOrderById !== undefined) {
+        return (await options.findWorkOrderById(id)) as WorkOrderRecord | null;
+      }
       return workOrders.get(id) ?? null;
     },
   };
@@ -320,6 +334,9 @@ function harness(options: {
     async listAttemptsByWorkOrder(workOrderId) {
       if (options.listAttemptsThrows === true) {
         throw new Error('attempt store unreadable');
+      }
+      if (options.listAttemptsByWorkOrder !== undefined) {
+        return (await options.listAttemptsByWorkOrder(workOrderId)) as AttemptRecord[];
       }
       return attempts.filter((attempt) => attempt.workOrderId === workOrderId);
     },
@@ -329,6 +346,9 @@ function harness(options: {
   };
   const runJournal: Pick<LaneRunJournalPort, 'listForRun'> = {
     async listForRun(runId) {
+      if (options.listForRun !== undefined) {
+        return (await options.listForRun(runId)) as Awaited<ReturnType<LaneRunJournalPort['listForRun']>>;
+      }
       const state = journalStates.get(runId);
       return state === undefined
         ? []
@@ -337,6 +357,9 @@ function harness(options: {
   };
   const journal = makeExecutionJournal();
   journal.setReservations(options.reservations ?? []);
+  if (options.listActiveReservations !== undefined) {
+    journal.listActiveReservations = options.listActiveReservations as JournalFake['listActiveReservations'];
+  }
   if (options.appendJournalEntry !== undefined) {
     journal.appendJournalEntry = options.appendJournalEntry;
   }
@@ -346,6 +369,9 @@ function harness(options: {
       ? undefined
       : {
           async readProjectProfile(projectId) {
+            if (options.readProjectProfile !== undefined) {
+              return (await options.readProjectProfile(projectId)) as ProjectProfileView | null;
+            }
             return (profiles.find((profile) => profile?.projectId === projectId) ??
               null) as ProjectProfileView | null;
           },
@@ -361,6 +387,11 @@ function harness(options: {
   const authorization =
     options.noActionAuthorization === true ? null : makeActionAuthorization(options.authorization);
 
+  const runnerForAttempt: RunnerForAttemptPort | undefined =
+    options.noRunnerForAttempt === true
+      ? undefined
+      : (options.runnerForAttempt ?? defaultRunnerForAttempt());
+
   const useCase = new ReapLaneWorktreesUseCase({
     workOrderRepo,
     attemptRepo,
@@ -373,10 +404,13 @@ function harness(options: {
       ? {}
       : { attemptArtifact: makeAttemptArtifact(options.attemptArtifact) }),
     ...(authorization !== null ? { actionAuthorization: authorization } : {}),
+    ...(runnerForAttempt === undefined
+      ? {}
+      : ({ runnerForAttempt } as { runnerForAttempt: RunnerForAttemptPort })),
     ...(options.storeCallTimeoutMs !== undefined
       ? { storeCallTimeoutMs: options.storeCallTimeoutMs }
       : {}),
-  });
+  } as ReapLaneWorktreesDependencies);
   return {
     useCase,
     workspace,
@@ -394,6 +428,20 @@ function reap(
   return h.useCase.reapLaneWorktrees(request as never) as Promise<
     Extract<ReapLaneWorktreesResult, { outcome: 'reaped' }>
   >;
+}
+
+/** The default fake runner: answers idle so fixtures stay eligible without the option. */
+function defaultRunnerForAttempt(): RunnerForAttemptPort {
+  return {
+    runnerForAttempt: () => ({
+      ok: true,
+      runner: {
+        async inspectWorktreeRun() {
+          return { state: 'idle' };
+        },
+      } as never,
+    }),
+  };
 }
 
 /** One terminal, eligible run: merged journal, merged work order, one collected attempt with a sealed manifest. */
@@ -499,7 +547,6 @@ describe('ReapLaneWorktreesUseCase', () => {
       journalFailed: [],
     });
     expect(h.removeCalls()).toHaveLength(0);
-    expect(h.inspectCalls()).toHaveLength(0);
     expect(h.journal.entries).toHaveLength(0);
   });
 
@@ -970,11 +1017,272 @@ describe('ReapLaneWorktreesUseCase', () => {
       recordedAtIso: NOW,
       status: 'intent-recorded',
       sessionId: null,
-      detail: 'Authorizing unsealed worktree removal for attempt attempt-1',
+      detail:
+        `Authorizing unsealed worktree removal for attempt attempt-1 on branch fleet/${RUN_1}; ` +
+        `requestDigest=${unsealedRemovalRequestDigest({
+          attemptId: 'attempt-1',
+          expectedHeadSha: COMMIT,
+          projectId: 'project-a',
+          repositoryRoot: '/srv/fleet/clone',
+          runId: RUN_1,
+          worktreePath: WORKTREE,
+          worktreeRoot: '/srv/fleet/worktrees',
+        })}`,
     });
     const recovered = await reap(crashed, { dryRun: false, forceUnsealed: true });
     expect(recovered.removed).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
     expect(crashed.journal.entries.filter((entry) => entry.id === intentId)).toHaveLength(1);
+  });
+
+  it('refuses invalid-request on missing or wrong-typed dryRun in reapLaneWorktrees while keeping execute defaults', async () => {
+    let storeReads = 0;
+    const h = harness({
+      ...eligibleSeed(),
+      runRepoList: async () => {
+        storeReads += 1;
+        return [];
+      },
+    });
+    for (const bad of [{}, { dryRun: 'false' }, { dryRun: 0 }, { dryRun: undefined }, { dryRun: null }]) {
+      await expect(h.useCase.reapLaneWorktrees(bad as never)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+    }
+    expect(storeReads).toBe(0);
+    expect(h.removeCalls()).toHaveLength(0);
+    expect(h.journal.entries).toHaveLength(0);
+
+    // `execute` keeps its pinned defaults: only an explicit `dryRun: false` removes.
+    const defaults = harness(eligibleSeed());
+    await expect(defaults.useCase.execute({ dryRun: 'false' })).resolves.toMatchObject({
+      outcome: 'reaped',
+      dryRun: true,
+    });
+    await expect(defaults.useCase.execute(undefined)).resolves.toMatchObject({ outcome: 'reaped', dryRun: true });
+    const throwingGetter = {
+      get dryRun(): boolean {
+        throw new Error('getter exploded');
+      },
+    };
+    for (const bad of [7, 'x', [], { forceUnsealed: 'yes' }, { nowIso: 'nope' }, throwingGetter]) {
+      await expect(defaults.useCase.execute(bad)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+    }
+    expect(defaults.removeCalls()).toHaveLength(0);
+    await expect(defaults.useCase.execute({ dryRun: false })).resolves.toMatchObject({
+      outcome: 'reaped',
+      dryRun: false,
+      removed: [{ runId: RUN_1, branchTip: COMMIT }],
+    });
+  });
+
+  it('verifies the worktree runner is idle before consuming a force-unsealed approval or removing', async () => {
+    const runnerCalls: unknown[] = [];
+    const runnerFor = (
+      answer: () => Promise<unknown>,
+    ): RunnerForAttemptPort => ({
+      runnerForAttempt: () => ({
+        ok: true,
+        runner: {
+          async inspectWorktreeRun(this: unknown, ref: unknown) {
+            runnerCalls.push(ref);
+            return answer();
+          },
+        } as never,
+      }),
+    });
+    const unsealedSeed = () => ({
+      ...eligibleSeed(),
+      attempts: [attemptFixture('wo-a', 'attempt-1', { artifacts: null })],
+    });
+
+    const running = harness({
+      ...unsealedSeed(),
+      runnerForAttempt: runnerFor(async () => ({ state: 'running', sessionId: 'ses_active1' })),
+    });
+    const busy = await reap(running, { dryRun: false, forceUnsealed: true });
+    expect(busy.refused).toEqual([{ runId: RUN_1, reason: 'busy' }]);
+    expect(busy.removed).toEqual([]);
+    expect(running.authorization!.calls).toHaveLength(0);
+    expect(running.removeCalls()).toHaveLength(0);
+    expect(running.journal.entries).toHaveLength(0);
+    expect(runnerCalls[0]).toEqual({ attemptId: 'attempt-1', worktreePath: WORKTREE, runner: RECORDED_HOST });
+
+    const unprovable: [string, RunnerForAttemptPort][] = [
+      ['state unknown', runnerFor(async () => ({ state: 'unknown', reason: 'runner unreachable' }))],
+      ['an unexpected state', runnerFor(async () => ({ state: 'sleeping' }))],
+      ['a non-object answer', runnerFor(async () => 'idle')],
+      [
+        'a rejected inspect',
+        runnerFor(async () => {
+          throw new Error('inspect failed');
+        }),
+      ],
+      ['a host-missing selection', { runnerForAttempt: () => ({ ok: false, reason: 'host-missing' }) }],
+      [
+        'a throwing selection',
+        {
+          runnerForAttempt: () => {
+            throw new Error('resolver exploded');
+          },
+        },
+      ],
+      ['a runner without inspectWorktreeRun', { runnerForAttempt: () => ({ ok: true, runner: {} as never }) }],
+    ];
+    for (const [label, runnerForAttempt] of unprovable) {
+      const h = harness({ ...unsealedSeed(), runnerForAttempt });
+      const result = await reap(h, { dryRun: false, forceUnsealed: true });
+      expect(result.refused, label).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+      expect(result.removed, label).toEqual([]);
+      expect(h.authorization!.calls, label).toHaveLength(0);
+      expect(h.removeCalls(), label).toHaveLength(0);
+      expect(h.journal.entries, label).toHaveLength(0);
+    }
+
+    // A sealed removal without `forceUnsealed` is guarded too.
+    const sealedBusy = harness({
+      ...eligibleSeed(),
+      runnerForAttempt: runnerFor(async () => ({ state: 'running', sessionId: 'ses_active1' })),
+    });
+    const sealedResult = await reap(sealedBusy, { dryRun: false });
+    expect(sealedResult.refused).toEqual([{ runId: RUN_1, reason: 'busy' }]);
+    expect(sealedBusy.removeCalls()).toHaveLength(0);
+
+    // A runner that hangs past the budget is unknown, never idle.
+    const hung = harness({
+      ...unsealedSeed(),
+      storeCallTimeoutMs: 25,
+      runnerForAttempt: runnerFor(
+        () =>
+          new Promise(() => {
+            /* never settles */
+          }),
+      ),
+    });
+    const hungResult = await reap(hung, { dryRun: false, forceUnsealed: true });
+    expect(hungResult.refused).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+    expect(hung.removeCalls()).toHaveLength(0);
+
+    const idle = harness({
+      ...unsealedSeed(),
+      runnerForAttempt: runnerFor(async () => ({ state: 'idle' })),
+    });
+    const removed = await reap(idle, { dryRun: false, forceUnsealed: true });
+    expect(removed.removed).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
+    expect(removed.refused).toEqual([]);
+    expect(idle.authorization!.calls).toHaveLength(1);
+    expect(idle.removeCalls()).toHaveLength(1);
+  });
+
+  it('records the full request digest on a force-unsealed intent and refuses intent-digest-mismatch before any write when retried with a changed id or coordinate', async () => {
+    const unsealedSeed = () => ({
+      ...eligibleSeed(),
+      attempts: [attemptFixture('wo-a', 'attempt-1', { artifacts: null })],
+    });
+    // First pass: the intent is written, then the authorization crashes.
+    const first = harness(unsealedSeed());
+    first.authorization!.authorizeUnsealedWorktreeRemoval = async () => {
+      throw new Error('crashed after the intent was recorded');
+    };
+    const crashedResult = await reap(first, { dryRun: false, forceUnsealed: true });
+    expect(crashedResult.refused).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+    expect(first.journal.entries).toHaveLength(1);
+    const intent = first.journal.entries[0]!;
+    expect(intent).toMatchObject({ status: 'intent-recorded', action: 'collect' });
+    const digest = /requestDigest=([0-9a-f]{64})$/.exec(intent.detail ?? '')?.[1];
+    expect(digest).toBe(
+      unsealedRemovalRequestDigest({
+        attemptId: 'attempt-1',
+        expectedHeadSha: COMMIT,
+        projectId: 'project-a',
+        repositoryRoot: '/srv/fleet/clone',
+        runId: RUN_1,
+        worktreePath: WORKTREE,
+        worktreeRoot: '/srv/fleet/worktrees',
+      }),
+    );
+    expect(intent.detail).not.toContain(WORKTREE);
+    expect(intent.detail).not.toContain('/srv/fleet');
+
+    const otherHead = 'b'.repeat(40);
+    const otherPath = '/tmp/worktree-example-other';
+    const variants: [string, string, Parameters<typeof harness>[0]][] = [
+      [
+        'runId',
+        RUN_2,
+        {
+          runs: [runRecord(RUN_2, 'wo-a', { attemptIds: ['attempt-1'] })],
+          journalStates: new Map([[RUN_2, 'merged']]),
+          inspect: () => ({
+            outcome: 'inspected',
+            facts: cleanFacts({ branch: `fleet/${RUN_2}` }),
+          }),
+        },
+      ],
+      [
+        'projectId',
+        RUN_1,
+        {
+          workOrders: [makeWorkOrder('wo-a', { projectId: 'project-b' })],
+          profiles: [{ ...makeProfile(), projectId: 'project-b' }],
+        },
+      ],
+      [
+        'expectedHeadSha',
+        RUN_1,
+        {
+          inspect: () => ({ outcome: 'inspected', facts: cleanFacts({ head: otherHead }) }),
+        },
+      ],
+      [
+        'worktreePath',
+        RUN_1,
+        {
+          attempts: [attemptFixture('wo-a', 'attempt-1', { artifacts: null, worktreePath: otherPath })],
+          inspect: () => ({ outcome: 'inspected', facts: cleanFacts({ path: otherPath }) }),
+        },
+      ],
+    ];
+    for (const [label, runId, overrides] of variants) {
+      const retry = harness({ ...unsealedSeed(), ...overrides });
+      retry.journal.entries.push(...first.journal.entries);
+      const result = await reap(retry, { dryRun: false, forceUnsealed: true });
+      expect(result.refused, label).toEqual([{ runId, reason: 'intent-digest-mismatch' }]);
+      expect(result.removed, label).toEqual([]);
+      expect(retry.journal.entries, label).toHaveLength(1);
+      expect(retry.authorization!.calls, label).toHaveLength(0);
+      expect(retry.removeCalls(), label).toHaveLength(0);
+    }
+
+    // A prior intent that carries no digest at all, or a second intent entry, is a mismatch too.
+    const legacy = harness(unsealedSeed());
+    await legacy.journal.appendJournalEntry({
+      ...intent,
+      detail: `Authorizing unsealed worktree removal for attempt attempt-1 on branch fleet/${RUN_1}`,
+    });
+    const legacyResult = await reap(legacy, { dryRun: false, forceUnsealed: true });
+    expect(legacyResult.refused).toEqual([{ runId: RUN_1, reason: 'intent-digest-mismatch' }]);
+    expect(legacy.journal.entries).toHaveLength(1);
+    expect(legacy.authorization!.calls).toHaveLength(0);
+
+    const doubled = harness(unsealedSeed());
+    await doubled.journal.appendJournalEntry(intent);
+    await doubled.journal.appendJournalEntry({ ...intent, id: `attempt-1:collect:reap-unsealed-intent:${RUN_2}` });
+    const doubledResult = await reap(doubled, { dryRun: false, forceUnsealed: true });
+    expect(doubledResult.refused).toEqual([{ runId: RUN_1, reason: 'intent-digest-mismatch' }]);
+    expect(doubled.journal.entries).toHaveLength(2);
+    expect(doubled.removeCalls()).toHaveLength(0);
+
+    // The same request retried unchanged still completes, keeping the one intent entry.
+    const same = harness(unsealedSeed());
+    same.journal.entries.push(intent);
+    const completed = await reap(same, { dryRun: false, forceUnsealed: true });
+    expect(completed.removed).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
+    expect(same.journal.entries.map((entry) => entry.status)).toEqual(['intent-recorded', 'completed']);
+    expect(same.journal.entries[1]!.id).toBe('attempt-1:collect:1');
   });
 
   it('redacts secret-shaped and path-containing errors and omits worktree paths from journal entries and results', async () => {
@@ -1041,5 +1349,523 @@ describe('ReapLaneWorktreesUseCase', () => {
     };
     visit(useCaseDir);
     expect(offenders).toEqual([]);
+  });
+
+  it('refuses not-configured when runnerForAttempt is absent at runtime (untyped caller), removing nothing', async () => {
+    const h = harness({ ...eligibleSeed(), noRunnerForAttempt: true });
+    const result = await reap(h, { dryRun: false });
+    expect(result.refused).toEqual([{ runId: RUN_1, reason: 'not-configured' }]);
+    expect(result.removed).toEqual([]);
+    expect(h.removeCalls()).toHaveLength(0);
+    expect(h.authorization?.calls).toEqual([]);
+    expect(h.journal.entries).toHaveLength(0);
+  });
+
+  it('refuses not-configured when runnerForAttempt is a non-object without the method (untyped caller)', async () => {
+    const bogus = {} as unknown as RunnerForAttemptPort;
+    const h = harness({ ...eligibleSeed(), runnerForAttempt: bogus });
+    const result = await reap(h, { dryRun: false });
+    expect(result.refused).toEqual([{ runId: RUN_1, reason: 'not-configured' }]);
+    expect(result.removed).toEqual([]);
+    expect(h.removeCalls()).toHaveLength(0);
+    expect(h.authorization?.calls).toEqual([]);
+    expect(h.journal.entries).toHaveLength(0);
+  });
+
+  // --- C2q: a malformed record fails closed per run --------------------------
+
+  type HarnessOptions = NonNullable<Parameters<typeof harness>[0]>;
+
+  const WT_1 = '/tmp/wt-1';
+  const WT_2 = '/tmp/wt-2';
+
+  const pairInspect: InspectFake = (request) => ({
+    outcome: 'inspected',
+    facts: cleanFacts({
+      path: request.worktreePath,
+      branch: request.worktreePath === WT_1 ? `fleet/${RUN_1}` : `fleet/${RUN_2}`,
+    }),
+  });
+
+  /** RUN_1 on `wo-a` and RUN_2 on `wo-b`, both terminal; the second attempt is sealed unless given. */
+  function pairSeed(second?: AttemptRecord): HarnessOptions {
+    return {
+      workOrders: [makeWorkOrder('wo-a'), makeWorkOrder('wo-b')],
+      attempts: [
+        attemptFixture('wo-a', 'attempt-1', { worktreePath: WT_1, artifacts: sealedArtifacts() }),
+        second ?? attemptFixture('wo-b', 'attempt-2', { worktreePath: WT_2, artifacts: sealedArtifacts() }),
+      ],
+      runs: [
+        runRecord(RUN_1, 'wo-a', { attemptIds: ['attempt-1'] }),
+        runRecord(RUN_2, 'wo-b', { attemptIds: ['attempt-2'] }),
+      ],
+      journalStates: new Map([
+        [RUN_1, 'merged'],
+        [RUN_2, 'merged'],
+      ]),
+      inspect: pairInspect,
+    };
+  }
+
+  /** The attempt list per work order, with the given work orders' answers replaced by raw values. */
+  const attemptsOverride =
+    (seed: HarnessOptions, replaced: Record<string, unknown>) =>
+    async (workOrderId: string): Promise<unknown> =>
+      Object.hasOwn(replaced, workOrderId)
+        ? replaced[workOrderId]
+        : (seed.attempts ?? []).filter((attempt) => attempt.workOrderId === workOrderId);
+
+  const withThrowingGetter = (record: object, key: string): unknown => {
+    const copy = { ...record };
+    Object.defineProperty(copy, key, {
+      enumerable: true,
+      get(): never {
+        throw new Error('getter exploded');
+      },
+    });
+    return copy;
+  };
+
+  const omitKey = (record: object, key: string): unknown =>
+    Object.fromEntries(Object.entries(record).filter(([name]) => name !== key));
+
+  const sparseList = (): unknown[] => {
+    const sparse: unknown[] = [];
+    sparse.length = 1;
+    return sparse;
+  };
+
+  it('reaps a valid run and refuses a run whose attempt record is null with record-malformed on both live and dry runs, preserving all five report lists', async () => {
+    const seed = pairSeed();
+    const nullAttempts = attemptsOverride(seed, { 'wo-b': [null] });
+
+    const live = harness({ ...seed, listAttemptsByWorkOrder: nullAttempts });
+    await expect(reap(live, { dryRun: false })).resolves.toEqual({
+      outcome: 'reaped',
+      dryRun: false,
+      removed: [{ runId: RUN_1, branchTip: COMMIT }],
+      alreadyRemoved: [],
+      refused: [{ runId: RUN_2, reason: 'record-malformed' }],
+      skipped: [],
+      journalFailed: [],
+    });
+    expect(live.removeCalls().map((call) => call.worktreePath)).toEqual([WT_1]);
+    expect(live.inspectCalls().map((call) => call.worktreePath)).toEqual([WT_1]);
+
+    const dry = harness({ ...seed, listAttemptsByWorkOrder: nullAttempts });
+    await expect(reap(dry, { dryRun: true })).resolves.toEqual({
+      outcome: 'reaped',
+      dryRun: true,
+      removed: [{ runId: RUN_1, branchTip: null }],
+      alreadyRemoved: [],
+      refused: [{ runId: RUN_2, reason: 'record-malformed' }],
+      skipped: [],
+      journalFailed: [],
+    });
+    expect(dry.removeCalls()).toHaveLength(0);
+    expect(dry.inspectCalls()).toHaveLength(0);
+
+    // All five buckets are populated in one pass, each sorted by run id.
+    const ids = ['A', 'B', 'C', 'D', 'E', 'F'].map((suffix) => `run-01JB${'0'.repeat(21)}${suffix}`);
+    const wtOf = (index: number): string => `/tmp/wt-${index + 1}`;
+    const branchByPath = new Map(ids.map((id, index) => [wtOf(index), `fleet/${id}`]));
+    const six: HarnessOptions = {
+      workOrders: ids.map((_, index) => makeWorkOrder(`wo-${index + 1}`)),
+      attempts: ids.map((_, index) =>
+        attemptFixture(`wo-${index + 1}`, `attempt-${index + 1}`, {
+          worktreePath: wtOf(index),
+          artifacts: sealedArtifacts(),
+        }),
+      ),
+      runs: ids.map((id, index) => runRecord(id, `wo-${index + 1}`, { attemptIds: [`attempt-${index + 1}`] })),
+      journalStates: new Map(ids.map((id, index) => [id, index === 3 ? 'running' : 'merged'])),
+      inspect: (request) =>
+        request.worktreePath === wtOf(2)
+          ? { outcome: 'refused', reason: 'not-a-linked-worktree' }
+          : {
+              outcome: 'inspected',
+              facts: cleanFacts({ path: request.worktreePath, branch: branchByPath.get(request.worktreePath) ?? null }),
+            },
+      remove: (request) =>
+        request.worktreePath === wtOf(4)
+          ? { outcome: 'refused', reason: 'dirty' }
+          : { outcome: 'removed', branchTip: COMMIT },
+    };
+    const h = harness({
+      ...six,
+      listAttemptsByWorkOrder: attemptsOverride(six, { 'wo-6': [null] }),
+      appendJournalEntry: async (entry) => {
+        if (entry.attemptId === 'attempt-2') {
+          throw new Error('journal write failed');
+        }
+      },
+    });
+    await expect(reap(h, { dryRun: false })).resolves.toEqual({
+      outcome: 'reaped',
+      dryRun: false,
+      removed: [
+        { runId: ids[0], branchTip: COMMIT },
+        { runId: ids[1], branchTip: COMMIT },
+      ],
+      alreadyRemoved: [{ runId: ids[2] }],
+      refused: [
+        { runId: ids[4], reason: 'dirty' },
+        { runId: ids[5], reason: 'record-malformed' },
+      ],
+      skipped: [{ runId: ids[3], reason: 'run-not-terminal' }],
+      journalFailed: [{ runId: ids[1], attemptId: 'attempt-2', branchTip: COMMIT, reason: 'journal write failed' }],
+    });
+    expect(h.removeCalls().map((call) => call.worktreePath)).toEqual([wtOf(0), wtOf(1), wtOf(4)]);
+  });
+
+  it('refuses not-configured with forceUnsealed on unsealed artifacts when runnerForAttempt is absent or malformed at runtime, consuming no approval and removing nothing', async () => {
+    const unsealed = (): HarnessOptions => ({
+      ...eligibleSeed(),
+      attempts: [attemptFixture('wo-a', 'attempt-1', { artifacts: null })],
+    });
+    const variants: [string, Partial<HarnessOptions>][] = [
+      ['an absent port', { noRunnerForAttempt: true }],
+      ['an object without the method', { runnerForAttempt: {} as unknown as RunnerForAttemptPort }],
+      ['a string', { runnerForAttempt: 'not-a-port' as unknown as RunnerForAttemptPort }],
+    ];
+    for (const [label, variant] of variants) {
+      const h = harness({ ...unsealed(), ...variant });
+      const result = await reap(h, { dryRun: false, forceUnsealed: true });
+      expect(result.refused, label).toEqual([{ runId: RUN_1, reason: 'not-configured' }]);
+      expect(result.removed, label).toEqual([]);
+      expect(h.removeCalls(), label).toHaveLength(0);
+      expect(h.authorization!.calls, label).toHaveLength(0);
+      expect(h.journal.entries, label).toHaveLength(0);
+    }
+  });
+
+  it('refuses record-malformed per run without throwing on missing or wrong-typed fields, sparse arrays, unknown enum values, malformed manifest coordinates, and throwing getters across attempt, work-order, run, journal, and profile records, never treating a malformed record as idle or sealed', async () => {
+    // RUN_2's attempt is unsealed, so any accidental read as idle, uncollected
+    // or sealed would reach the authorization or the removal.
+    const valid2 = attemptFixture('wo-b', 'attempt-2', { worktreePath: WT_2, artifacts: null });
+    const seed = pairSeed(valid2);
+    const validRun2 = runRecord(RUN_2, 'wo-b', { attemptIds: ['attempt-2'] });
+    const conductEntry = (runId: string) => laneRunConductEntry('01JB0000000000000000000001', runId, 'merged', NOW);
+    const forAttempt2 = (list: unknown): ((h: Harness) => void) => {
+      return (h) => {
+        const original = h.journal.listJournalEntriesForAttempt;
+        h.journal.listJournalEntriesForAttempt = async (attemptId: string) =>
+          attemptId === 'attempt-2' ? (list as never) : original(attemptId);
+      };
+    };
+
+    const attemptLists: [string, unknown][] = [
+      ['a sparse attempt list', sparseList()],
+      ['a null sibling', [valid2, null]],
+      ['a duplicated attempt id', [valid2, valid2]],
+      ['a missing worktreePath', [omitKey(valid2, 'worktreePath')]],
+      ['a numeric worktreePath', [{ ...valid2, worktreePath: 42 }]],
+      ['a relative worktreePath', [{ ...valid2, worktreePath: 'relative/wt' }]],
+      ['an unknown attempt state', [{ ...valid2, state: 'sleeping' }]],
+      ['an unknown attempt outcome', [{ ...valid2, outcome: 'exploded' }]],
+      ['a malformed runner', [{ ...valid2, runner: { hostName: 5 } }]],
+      ['a throwing id', [withThrowingGetter(valid2, 'id')]],
+      ['a throwing state', [withThrowingGetter(valid2, 'state')]],
+      ['a throwing artifacts', [withThrowingGetter(valid2, 'artifacts')]],
+      ['a throwing runner', [withThrowingGetter(valid2, 'runner')]],
+      ['corrupt artifacts', [{ ...valid2, artifacts: 'corrupt' }]],
+      [
+        'a bad manifestPath',
+        [
+          {
+            ...valid2,
+            artifacts: {
+              headCommit: COMMIT,
+              commitsSinceBase: [],
+              collectedArtifactPaths: [],
+              notes: 'present',
+              manifestPath: 'bad-path',
+            },
+          },
+        ],
+      ],
+      ['a mismatched manifestSha256', [{ ...valid2, artifacts: { ...sealedArtifacts(), manifestSha256: 'b'.repeat(64) } }]],
+      [
+        'a partial manifest coordinate',
+        [{ ...valid2, artifacts: { ...sealedArtifacts(), manifestPath: undefined } }],
+      ],
+    ];
+    const cases: [string, Partial<HarnessOptions>, ((h: Harness) => void)?][] = attemptLists.map(
+      ([label, list]) => [label, { listAttemptsByWorkOrder: attemptsOverride(seed, { 'wo-b': list }) }],
+    );
+
+    const workOrderCase = (label: string, bad: unknown): void => {
+      cases.push([
+        label,
+        { findWorkOrderById: async (id) => (id === 'wo-b' ? bad : makeWorkOrder(id)) },
+      ]);
+    };
+    workOrderCase('an unknown work-order state', { ...makeWorkOrder('wo-b'), state: 'archived' });
+    workOrderCase('a throwing work-order state', withThrowingGetter(makeWorkOrder('wo-b'), 'state'));
+    workOrderCase('a work order without a projectId', omitKey(makeWorkOrder('wo-b'), 'projectId'));
+    workOrderCase('a work order with another id', makeWorkOrder('wo-other'));
+    workOrderCase('a work order with a sparse ownedPaths', { ...makeWorkOrder('wo-b'), ownedPaths: sparseList() });
+    workOrderCase('a work order that is not a record', 'merged');
+
+    const runCase = (label: string, bad: unknown): void => {
+      cases.push([label, { runs: [seed.runs![0]!, bad as LaneRunRecord] }]);
+    };
+    runCase('a run with a non-array attemptIds', { ...validRun2, attemptIds: 'not-an-array' });
+    runCase('a run with a throwing workOrderId', withThrowingGetter(validRun2, 'workOrderId'));
+    runCase('a run with an unknown tier', { ...validRun2, tier: 99 });
+
+    const runJournalCase = (label: string, list: unknown): void => {
+      cases.push([
+        label,
+        { listForRun: async (runId) => (runId === RUN_2 ? list : [conductEntry(runId)]) },
+      ]);
+    };
+    runJournalCase('a null run-journal entry', [null]);
+    runJournalCase('a throwing run-journal entry', [withThrowingGetter(conductEntry(RUN_2), 'kind')]);
+    runJournalCase('a sparse run journal', sparseList());
+
+    const profileCase = (label: string, bad: unknown): void => {
+      cases.push([
+        label,
+        {
+          workOrders: [makeWorkOrder('wo-a'), makeWorkOrder('wo-b', { projectId: 'project-b' })],
+          readProjectProfile: async (projectId) => (projectId === 'project-b' ? bad : makeProfile()),
+        },
+      ]);
+    };
+    profileCase('a profile without clones', {});
+    profileCase('a profile with null clones', { ...makeProfile(), projectId: 'project-b', clones: null });
+    profileCase('a profile with a numeric clone path', {
+      ...makeProfile(),
+      projectId: 'project-b',
+      clones: { 'lane-host': { path: 123, worktreeRoot: '/srv/wt' } },
+    });
+    profileCase('a profile that is not a record', 'profile');
+
+    cases.push(['a null action-journal entry', {}, forAttempt2([null])]);
+    cases.push([
+      'a throwing action-journal entry',
+      {},
+      forAttempt2([withThrowingGetter({ id: 'x', attemptId: 'attempt-2' }, 'id')]),
+    ]);
+    cases.push(['a sparse action journal', {}, forAttempt2(sparseList())]);
+
+    for (const [label, override, patch] of cases) {
+      const h = harness({ ...seed, ...override });
+      patch?.(h);
+      const result = await reap(h, { dryRun: false, forceUnsealed: true });
+      expect(result.removed, label).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
+      expect(result.refused, label).toEqual([{ runId: RUN_2, reason: 'record-malformed' }]);
+      expect(result.skipped, label).toEqual([]);
+      expect(result.alreadyRemoved, label).toEqual([]);
+      expect(h.authorization!.calls, label).toHaveLength(0);
+      expect(h.removeCalls().map((call) => call.worktreePath), label).toEqual([WT_1]);
+      expect(h.journal.entries.every((entry) => entry.attemptId === 'attempt-1'), label).toBe(true);
+    }
+  });
+
+  it('cuts short a hung per-run store or workspace call via storeCallTimeoutMs, refuses that run as unknown while reaping healthy runs, and completes cleanly on the next pass', async () => {
+    const seed = pairSeed();
+    let hang = true;
+    const h = harness({
+      ...seed,
+      storeCallTimeoutMs: 25,
+      listAttemptsByWorkOrder: async (workOrderId) => {
+        if (workOrderId === 'wo-b' && hang) {
+          await new Promise(() => {
+            /* never settles */
+          });
+        }
+        return (seed.attempts ?? []).filter((attempt) => attempt.workOrderId === workOrderId);
+      },
+    });
+    const first = await reap(h, { dryRun: false });
+    expect(first.removed).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
+    expect(first.refused).toEqual([{ runId: RUN_2, reason: 'unknown' }]);
+    expect(h.removeCalls().map((call) => call.worktreePath)).toEqual([WT_1]);
+
+    hang = false;
+    const second = await reap(h, { dryRun: false });
+    expect(second.alreadyRemoved).toEqual([{ runId: RUN_1 }]);
+    expect(second.removed).toEqual([{ runId: RUN_2, branchTip: COMMIT }]);
+    expect(second.refused).toEqual([]);
+  });
+
+  it('reports store-unreadable on corrupt top-level reservations or unidentifiable run-list entries and unknown on malformed workspace or artifact verdicts, never treating them as idle, sealed, or empty', async () => {
+    const corruptReservations: [string, unknown][] = [
+      ['a null reservation', [null]],
+      ['a non-boolean held', [{ id: 'r1', attemptId: 'attempt-1', held: 'yes' }]],
+      ['a sparse reservation list', sparseList()],
+      ['a non-array', { held: true }],
+    ];
+    for (const [label, listed] of corruptReservations) {
+      const h = harness({ ...eligibleSeed(), listActiveReservations: async () => listed });
+      await expect(reap(h, { dryRun: false }), label).resolves.toEqual({
+        outcome: 'unknown',
+        reason: 'store-unreadable',
+      });
+      expect(h.removeCalls(), label).toHaveLength(0);
+    }
+
+    const unidentifiable = harness({ ...eligibleSeed(), runRepoList: async () => [null] });
+    await expect(reap(unidentifiable, { dryRun: false })).resolves.toEqual({
+      outcome: 'unknown',
+      reason: 'store-unreadable',
+    });
+    expect(unidentifiable.removeCalls()).toHaveLength(0);
+
+    const unsealed = (): HarnessOptions => ({
+      ...eligibleSeed(),
+      attempts: [attemptFixture('wo-a', 'attempt-1', { artifacts: null })],
+    });
+    const badInspect: [string, unknown][] = [
+      ['null facts', { outcome: 'inspected', facts: null }],
+      ['a non-record answer', 'inspected'],
+      ['an unknown outcome', { outcome: 'bogus' }],
+      ['a refusal with another reason', { outcome: 'refused', reason: 'bogus' }],
+      ['a non-hex head', { outcome: 'inspected', facts: cleanFacts({ head: 'not-a-commit' }) }],
+      ['a negative count', { outcome: 'inspected', facts: cleanFacts({ status: { tracked: -1, untracked: 0, unmerged: 0 } }) }],
+      ['a non-boolean locked', { outcome: 'inspected', facts: { ...cleanFacts(), locked: 'no' } }],
+      ['sparse operations', { outcome: 'inspected', facts: { ...cleanFacts(), inProgressOperations: sparseList() } }],
+    ];
+    for (const [label, answer] of badInspect) {
+      const h = harness({ ...unsealed(), inspect: () => answer as never });
+      const result = await reap(h, { dryRun: false, forceUnsealed: true });
+      expect(result.refused, label).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+      expect(result.removed, label).toEqual([]);
+      expect(h.authorization!.calls, label).toHaveLength(0);
+      expect(h.removeCalls(), label).toHaveLength(0);
+    }
+
+    const bogusVerdict = harness({ ...eligibleSeed(), attemptArtifact: { outcome: 'bogus' } });
+    const verdictResult = await reap(bogusVerdict, { dryRun: false, forceUnsealed: true });
+    expect(verdictResult.refused).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+    expect(verdictResult.removed).toEqual([]);
+    expect(bogusVerdict.authorization!.calls).toHaveLength(0);
+    expect(bogusVerdict.removeCalls()).toHaveLength(0);
+    expect(bogusVerdict.journal.entries).toHaveLength(0);
+
+    const badAnswers: [string, unknown][] = [
+      ['an unknown outcome', { outcome: 'maybe' }],
+      ['a path-shaped reference', { outcome: 'approved', approvalReference: 'a/b' }],
+      ['a missing reference', { outcome: 'approved' }],
+      ['a non-record answer', 'approved'],
+    ];
+    for (const [label, answer] of badAnswers) {
+      const h = harness({ ...unsealed(), authorization: answer as never });
+      const result = await reap(h, { dryRun: false, forceUnsealed: true });
+      expect(result.refused, label).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+      expect(h.removeCalls(), label).toHaveLength(0);
+    }
+
+    const badRemovals: [string, unknown][] = [
+      ['a removal without a tip', { outcome: 'removed' }],
+      ['a removal with a non-hex tip', { outcome: 'removed', branchTip: 'tip' }],
+      ['an undeclared refusal', { outcome: 'refused', reason: 'made-up' }],
+      ['a partial removal', { outcome: 'partial', detail: 'directory-present' }],
+      ['a non-record answer', 'removed'],
+    ];
+    for (const [label, answer] of badRemovals) {
+      const h = harness({ ...eligibleSeed(), remove: () => answer as never });
+      const result = await reap(h, { dryRun: false });
+      expect(result.refused, label).toEqual([{ runId: RUN_1, reason: 'unknown' }]);
+      expect(result.removed, label).toEqual([]);
+      expect(h.journal.entries, label).toHaveLength(0);
+    }
+  });
+
+  it('omits paths and secret-shaped text from record-malformed and unknown refusals', async () => {
+    const leakedPath = '/srv/fleet/secret-worktree';
+    const tokenA = `gh${'p_'}${'x'.repeat(30)}`;
+    const tokenB = `ya${'29.'}${'x'.repeat(24)}`;
+    const leaky = `${leakedPath} ${tokenA} ${tokenB}`;
+    const valid2 = attemptFixture('wo-b', 'attempt-2', { worktreePath: WT_2, artifacts: null });
+    const seed = pairSeed(valid2);
+    const cases: [string, Partial<HarnessOptions>][] = [
+      [
+        'an attempt carrying the leak',
+        {
+          listAttemptsByWorkOrder: attemptsOverride(seed, {
+            'wo-b': [{ ...valid2, id: tokenA, worktreePath: leakedPath, notes: leaky }],
+          }),
+        },
+      ],
+      [
+        'a work order carrying the leak',
+        {
+          findWorkOrderById: async (id) =>
+            id === 'wo-b' ? { ...makeWorkOrder('wo-b'), projectId: tokenB, repository: leakedPath } : makeWorkOrder(id),
+        },
+      ],
+      [
+        'a run record carrying the leak',
+        { runs: [seed.runs![0]!, { runId: RUN_2, workOrderId: leaky, attemptIds: [tokenA] } as unknown as LaneRunRecord] },
+      ],
+      [
+        'an attempt store error carrying the leak',
+        {
+          listAttemptsByWorkOrder: async (workOrderId) => {
+            if (workOrderId === 'wo-b') {
+              throw new Error(leaky);
+            }
+            return (seed.attempts ?? []).filter((attempt) => attempt.workOrderId === workOrderId);
+          },
+        },
+      ],
+      [
+        'a workspace answer carrying the leak',
+        {
+          inspect: (request) =>
+            request.worktreePath === WT_2
+              ? ({ outcome: 'unknown', reason: leaky } as never)
+              : pairInspect(request),
+          remove: () => ({ outcome: 'refused', reason: leaky as never }),
+        },
+      ],
+      ['an authorization answer carrying the leak', { authorization: { outcome: 'approved', approvalReference: leaky } }],
+    ];
+    for (const [label, override] of cases) {
+      const h = harness({ ...seed, ...override });
+      const result = await reap(h, { dryRun: false, forceUnsealed: true });
+      const text = JSON.stringify(result) + JSON.stringify(h.journal.entries);
+      for (const forbidden of [leakedPath, tokenA, tokenB, 'secret-worktree']) {
+        expect(text, label).not.toContain(forbidden);
+      }
+    }
+    // The cases above refuse with reason codes only.
+    const h = harness({
+      ...seed,
+      listAttemptsByWorkOrder: attemptsOverride(seed, {
+        'wo-b': [{ ...valid2, id: tokenA, worktreePath: leakedPath }],
+      }),
+    });
+    const result = await reap(h, { dryRun: false });
+    expect(result.refused).toEqual([{ runId: RUN_2, reason: 'record-malformed' }]);
+  });
+
+  it('enforces size bounds on run lists, attempt lists, and attempt journal lists without throwing', async () => {
+    const oversized = (): unknown[] => new Array<unknown>(4_097).fill(null);
+
+    const runs = harness({ ...eligibleSeed(), runRepoList: async () => oversized() });
+    await expect(reap(runs, { dryRun: false })).resolves.toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(runs.removeCalls()).toHaveLength(0);
+
+    const seed = pairSeed();
+    const attempts = harness({
+      ...seed,
+      listAttemptsByWorkOrder: attemptsOverride(seed, { 'wo-b': oversized() }),
+    });
+    const attemptsResult = await reap(attempts, { dryRun: false });
+    expect(attemptsResult.removed).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
+    expect(attemptsResult.refused).toEqual([{ runId: RUN_2, reason: 'record-malformed' }]);
+
+    const journal = harness(seed);
+    const original = journal.journal.listJournalEntriesForAttempt;
+    journal.journal.listJournalEntriesForAttempt = async (attemptId: string) =>
+      attemptId === 'attempt-2' ? (oversized() as never) : original(attemptId);
+    const journalResult = await reap(journal, { dryRun: false });
+    expect(journalResult.removed).toEqual([{ runId: RUN_1, branchTip: COMMIT }]);
+    expect(journalResult.refused).toEqual([{ runId: RUN_2, reason: 'record-malformed' }]);
+    expect(journal.removeCalls().map((call) => call.worktreePath)).toEqual([WT_1]);
   });
 });

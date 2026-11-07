@@ -8,17 +8,24 @@
  * conflict and the help text.
  */
 
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type {
   DoctorCommandRunResult,
   HostProbeExecutor,
 } from "@fleet/onboarding";
-import { parseInstallation } from "@fleet/installation";
+import { sanitizeToken } from "@fleet/onboarding";
+import {
+  HOST_KEY_WITHHELD,
+  HOST_NAME_SECRET_REFUSAL,
+  isValidHostName,
+  parseInstallation,
+} from "@fleet/installation";
 import {
   AttemptRepositoryAdapter,
   ExecutionJournalAdapter,
@@ -28,6 +35,11 @@ import {
 } from "@fleet/work-execution";
 
 import { runCli, type CliIo } from "../index.js";
+import {
+  hostsCommand,
+  formatRoleAmbiguousRefusal,
+  moveLaneRunnerRole,
+} from "../hosts.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures and helpers
@@ -291,6 +303,28 @@ describe("fleet-v2 hosts list", () => {
 // ---------------------------------------------------------------------------
 
 describe("fleet-v2 hosts add", () => {
+  /** HN1 fix round 2, finding 1: no 20+ character window of a token-run key. */
+  const tokenRunKey = `Ab1${"xY9".repeat(11)}`;
+
+  function expectNoKeyWindow(printed: string): void {
+    for (let start = 0; start + 20 <= tokenRunKey.length; start++) {
+      expect(printed).not.toContain(tokenRunKey.slice(start, start + 20));
+    }
+  }
+
+  it("withholds a 36-character token-run key from an add draft error", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const { code, stdout, stderr } = await runHosts(
+      ["add", tokenRunKey, "--worktree-root", "relative/path", "--yes"],
+      file,
+    );
+    expect(code).toBe(1);
+    expect(stderr).toContain("worktreeRoot: must be an absolute path");
+    expectNoKeyWindow(stdout + stderr);
+  });
+
   it("writes a new host after the probe, diff and --yes", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
@@ -599,6 +633,43 @@ describe("fleet-v2 hosts add", () => {
 // ---------------------------------------------------------------------------
 
 describe("fleet-v2 hosts edit", () => {
+  /** HN1 fix round 2, finding 1: no 20+ character window of a token-run key. */
+  const tokenRunKey = `Ab1${"xY9".repeat(11)}`;
+
+  it("withholds a 36-character token-run key from an edit draft error", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "worktrees"),
+          roles: ["orchestrator"],
+        },
+        [tokenRunKey]: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "worktrees"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const before = readFileSync(file, "utf8");
+    const { code, stdout, stderr } = await runHosts(
+      ["edit", tokenRunKey, "--worktree-root", "relative/path", "--yes"],
+      file,
+    );
+    expect(code).toBe(1);
+    expect(stderr).toContain("worktreeRoot: must be an absolute path");
+    const printed = stdout + stderr;
+    for (let start = 0; start + 20 <= tokenRunKey.length; start++) {
+      expect(printed).not.toContain(tokenRunKey.slice(start, start + 20));
+    }
+    expect(readFileSync(file, "utf8")).toBe(before);
+  });
+
   it("changes the port and keeps what the flags leave out", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
@@ -942,5 +1013,1380 @@ describe("fleet-v2 hosts usage", () => {
     expect(badRole.stderr).toContain(
       "--role must be one of: orchestrator, lane-runner, verifier",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hosts show and the P2 host-draft fixes
+// ---------------------------------------------------------------------------
+
+describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
+  it("drops roleAliases['lane-runner'] on the stripped host when moving lane-runner so the loader accepts the write", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        oldhost: {
+          transport: "ssh",
+          sshAlias: "old",
+          worktreeRoot: path.join(dir, "oldhost"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: {
+            "lane-runner": "old-lr",
+            verifier: "old-v",
+          },
+          runner: { kind: "opencode", port: 4200 },
+        },
+      },
+    });
+    const added = await runHosts(
+      [
+        "add",
+        "newhost",
+        "--worktree-root",
+        path.join(dir, "newhost"),
+        "--role",
+        "lane-runner",
+        "--port",
+        "5000",
+        "--yes",
+      ],
+      file,
+    );
+    expect(added.code).toBe(0);
+    const reloaded = readFileSync(file, "utf8");
+    expect(reloaded).toContain('"verifier": "old-v"');
+    expect(reloaded).not.toContain("old-lr");
+    expect(() => readInstallationFile(file)).not.toThrow();
+    // The sole-key case: the whole roleAliases map drops off.
+    const soleDir = makeTempDir();
+    const soleFile = path.join(soleDir, "fleet.json");
+    writeJsonFile(soleFile, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(soleDir, "wt"),
+          roles: ["orchestrator"],
+        },
+        oldhost: {
+          transport: "ssh",
+          sshAlias: "old",
+          worktreeRoot: path.join(soleDir, "oldhost"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: { "lane-runner": "old-lr" },
+          runner: { kind: "opencode", port: 4200 },
+        },
+      },
+    });
+    const sole = await runHosts(
+      [
+        "add",
+        "newhost",
+        "--worktree-root",
+        path.join(soleDir, "newhost"),
+        "--role",
+        "lane-runner",
+        "--port",
+        "5000",
+        "--yes",
+      ],
+      soleFile,
+    );
+    expect(sole.code).toBe(0);
+    const soleReloaded = JSON.parse(readFileSync(soleFile, "utf8")) as {
+      hosts: Record<string, { roleAliases?: unknown }>;
+    };
+    expect(soleReloaded.hosts.oldhost.roleAliases).toBeUndefined();
+    expect(() => readInstallationFile(soleFile)).not.toThrow();
+  });
+
+  it("prints one line under --yes naming any role alias dropped by an edit", async () => {
+    // An edit that drops a role drops that role's alias.
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["lane-runner", "verifier"],
+          roleAliases: {
+            "lane-runner": "moved-lr",
+            verifier: "old-v",
+          },
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const edited = await runHosts(["edit", "lanehost", "--role", "lane-runner", "--yes"], file);
+    expect(edited.code).toBe(0);
+    const noticeLines = edited.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("dropped role alias:"));
+    expect(noticeLines).toEqual(["dropped role alias: hosts.lanehost.roleAliases.verifier"]);
+    expect(noticeLines.join("\n")).not.toContain("old-v");
+    // A lane-runner move drops the alias on the host it moved from.
+    const moveDir = makeTempDir();
+    const moveFile = path.join(moveDir, "fleet.json");
+    writeJsonFile(moveFile, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(moveDir, "wt"),
+          roles: ["orchestrator"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          worktreeRoot: path.join(moveDir, "lanehost"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: {
+            "lane-runner": "moved-lr",
+            verifier: "old-v",
+          },
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const moved = await runHosts(
+      [
+        "add",
+        "newhost",
+        "--worktree-root",
+        path.join(moveDir, "newhost"),
+        "--role",
+        "lane-runner",
+        "--port",
+        "5001",
+        "--yes",
+      ],
+      moveFile,
+    );
+    expect(moved.code).toBe(0);
+    const movedNotices = moved.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("dropped role alias:"));
+    expect(movedNotices).toEqual([
+      "dropped role alias: hosts.lanehost.roleAliases.lane-runner",
+    ]);
+    expect(movedNotices.join("\n")).not.toContain("moved-lr");
+  });
+
+  it("renders the role-ambiguous refusal as operator text naming the role and telling the operator to name the host", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator", "verifier"],
+        },
+        second: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "second"),
+          roles: ["verifier"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const shown = await runHosts(["show", "--role", "verifier"], file);
+    expect(shown.code).toBe(1);
+    expect(shown.stdout).toBe("");
+    expect(shown.stderr).toContain("verifier");
+    expect(shown.stderr).toContain("name the host");
+    expect(shown.stderr).not.toContain("fleet.json");
+  });
+
+  it("hosts show prints the generated port, tunnel, container, role-alias and auth-presence table for all hosts, one named host or one unambiguous --role", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+          runner: { kind: "opencode", port: 4100 },
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          container: "lane-box",
+          roleAliases: { "lane-runner": "m" },
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["lane-runner"],
+          runner: {
+            kind: "opencode",
+            port: 4166,
+            authFile: path.join(dir, "auth.json"),
+          },
+        },
+      },
+    });
+    const all = await runHosts(["show"], file);
+    expect(all.code).toBe(0);
+    for (const column of [
+      "HOST",
+      "TRANSPORT",
+      "SSH",
+      "CONTAINER",
+      "ROLES",
+      "ROLE_ALIASES",
+      "RUNNER",
+      "TUNNEL_OFFSET",
+      "DIAL_PORT",
+      "AUTH",
+    ]) {
+      expect(all.stdout).toContain(column);
+    }
+    expect(all.stdout.indexOf("lanehost")).toBeLessThan(all.stdout.indexOf("mac"));
+    expect(all.stdout).toContain("lane-box");
+    expect(all.stdout).toContain("lane-runner=m");
+    expect(all.stdout).toContain("4167");
+    expect(all.stdout).toContain("configured");
+    expect(all.stdout).not.toContain("auth.json");
+    const one = await runHosts(["show", "lanehost"], file);
+    expect(one.code).toBe(0);
+    expect(one.stdout).toContain("4167");
+    expect(one.stdout).not.toContain("mac");
+    const local = await runHosts(["show", "mac"], file);
+    expect(local.code).toBe(0);
+    expect(local.stdout).toContain("4100");
+    const byRole = await runHosts(["show", "--role", "orchestrator"], file);
+    expect(byRole.code).toBe(0);
+    expect(byRole.stdout).toContain("mac");
+    expect(byRole.stdout).not.toContain("lanehost");
+    const unknown = await runHosts(["show", "nosuchhost"], file);
+    expect(unknown.code).toBe(1);
+    const both = await runHosts(["show", "mac", "--role", "orchestrator"], file);
+    expect(both.code).toBe(2);
+  });
+
+  it("hosts edit updates container and role-alias over existing host values; the loader bounds tunnel offset to 1", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          container: "lane-box",
+          roleAliases: { "lane-runner": "m" },
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const edited = await runHosts(
+      [
+        "edit",
+        "lanehost",
+        "--container",
+        "newc",
+        "--role-alias",
+        "lane-runner=nl",
+        "--yes",
+      ],
+      file,
+    );
+    expect(edited.code).toBe(0);
+    const reloaded = readFileSync(file, "utf8");
+    expect(reloaded).toContain('"container": "newc"');
+    expect(reloaded).toContain('"lane-runner": "nl"');
+    expect(reloaded).not.toContain('"lane-box"');
+    expect(() => readInstallationFile(file)).not.toThrow();
+    // The frozen runner dials port + 1, so the loader refuses any other offset.
+    const refused = await runHosts(
+      ["edit", "lanehost", "--tunnel-offset", "3", "--yes"],
+      file,
+    );
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toContain("tunnelOffset");
+    expect(readFileSync(file, "utf8")).toBe(reloaded);
+  });
+
+  it("hostsCommand never throws on malformed runtime argv/options, sparse arrays, unknown role enums or throwing getters", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const hostileOptions = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error("no access");
+        },
+      },
+    );
+    const cases: readonly (readonly [
+      string,
+      () => Promise<number>,
+      number,
+    ])[] = [
+      ["null argv", () => hostsCommand(null as never, mockIo().io), 2],
+      ["string argv", () => hostsCommand("show" as never, mockIo().io), 2],
+      [
+        "sparse argv",
+        () => {
+          const sparse = ["show"] as unknown as string[];
+          sparse[3] = "x";
+          return hostsCommand(sparse, mockIo().io);
+        },
+        2,
+      ],
+      [
+        "hostile options",
+        () => hostsCommand(["show"], mockIo().io, hostileOptions as never),
+        1,
+      ],
+    ];
+    for (const [label, run, expected] of cases) {
+      const code = await run();
+      expect(code, label).toBe(expected);
+    }
+    void file;
+  });
+
+  it("leaves the installation file untouched when a probe fails or confirmation is declined on an edit with P2 fields", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const before = readFileSync(file, "utf8");
+    const failed = await runHosts(
+      ["edit", "lanehost", "--container", "newc", "--yes"],
+      file,
+      { failWhen: () => true },
+    );
+    expect(failed.code).toBe(1);
+    expect(failed.stderr).toContain("refused: a probe reported FAIL");
+    expect(readFileSync(file, "utf8")).toBe(before);
+    const declined = await runHosts(
+      ["edit", "lanehost", "--container", "newc"],
+      file,
+      {},
+      async () => false,
+    );
+    expect(declined.code).toBe(1);
+    expect(declined.stderr).toContain("not confirmed");
+    expect(readFileSync(file, "utf8")).toBe(before);
+  });
+
+  it("hosts show reports an unreadable installation as unknown and exits 1 instead of empty or 0", async () => {
+    const dir = makeTempDir();
+    const shown = await runHosts(["show"], dir);
+    expect(shown.code).toBe(1);
+    expect(shown.stderr).toContain("installation: unknown (unreadable)");
+    expect(shown.stdout).toBe("");
+  });
+
+  it("hosts show, dropped-alias notice and refusals never echo paths or secret-shaped text", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const token = ["ghp", "_" + "a".repeat(24)].join("");
+    const sk = ["sk", "-" + "b".repeat(24)].join("");
+    const aws = ["AKIA", "C".repeat(16)].join("");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: "/srv/secret/worktrees",
+          tmpDir: "/srv/secret/" + sk,
+          roles: ["orchestrator", "verifier"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: {
+            verifier: "m-v",
+            "lane-runner": "m-lr",
+          },
+          runner: {
+            kind: "opencode",
+            port: 4166,
+            authFile: "/srv/secret/" + token,
+          },
+        },
+      },
+    });
+    const shown = await runHosts(["show"], file);
+    expect(shown.code).toBe(0);
+    expect(shown.stdout).not.toContain("/srv/secret");
+    expect(shown.stdout).not.toContain(token);
+    expect(shown.stdout).not.toContain(sk);
+    expect(shown.stdout).not.toContain(aws);
+    const unknown = await runHosts(["show", "nosuchhost"], file);
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).not.toContain("/srv/secret");
+    expect(unknown.stderr).not.toContain(token);
+    // A lane-runner move drops the alias on the host it moved from; the notice
+    // and the diff name ids and roles only, never the secret paths.
+    const moved = await runHosts(
+      ["add", "newhost", "--worktree-root", path.join(dir, "newhost"), "--role", "lane-runner", "--port", "5000", "--yes"],
+      file,
+    );
+    expect(moved.code).toBe(0);
+    expect(moved.stdout).not.toContain("/srv/secret");
+    expect(moved.stdout).not.toContain(token);
+    expect(moved.stdout).not.toContain(sk);
+    expect(moved.stdout).not.toContain(aws);
+  });
+
+  it("hosts show invokes no subprocess or probe executor", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const { io } = mockIo();
+    const throwing = {
+      run: () => {
+        throw new Error("no subprocess");
+      },
+    } as unknown as HostProbeExecutor;
+    const code = await hostsCommand(["show"], io, {
+      installationFile: file,
+      probeExecutor: throwing,
+    });
+    expect(code).toBe(0);
+  });
+
+  it("bounds argv length, flag value length and hosts show table row count", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const longArgv = await runHosts(["show", ...Array.from({ length: 129 }, () => "x")], file);
+    expect(longArgv.code).toBe(2);
+    const longToken = await runHosts(["show", "x".repeat(1025)], file);
+    expect(longToken.code).toBe(2);
+    const hosts: Record<string, unknown> = {
+      mac: {
+        transport: "local",
+        worktreeRoot: path.join(dir, "wt"),
+        roles: ["orchestrator"],
+      },
+      lanehost: {
+        transport: "ssh",
+        sshAlias: "m",
+        worktreeRoot: path.join(dir, "lanehost"),
+        roles: ["lane-runner"],
+        runner: { kind: "opencode", port: 4166 },
+      },
+    };
+    for (let index = 0; index < 256; index += 1) {
+      hosts[`verifier${index}`] = {
+        transport: "local",
+        worktreeRoot: path.join(dir, `verifier${index}`),
+        roles: ["verifier"],
+      };
+    }
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts,
+    });
+    const crowded = await runHosts(["show"], file);
+    expect(crowded.code).toBe(1);
+    expect(crowded.stderr).toContain("host count exceeds maximum (256)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 1: global redaction, usage-refusal echo and move-role guards
+// ---------------------------------------------------------------------------
+
+describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () => {
+  it("sanitizeToken replaces every secret-shaped span and separator, not only the first", () => {
+    const first = ["ghp", "_" + "a".repeat(24)].join("");
+    const second = ["sk", "-" + "b".repeat(24)].join("");
+    const third = ["AKIA", "C".repeat(16)].join("");
+    const text = `${first} ${second} ${third} ${first}`;
+    const sanitized = sanitizeToken(text);
+    expect(sanitized).not.toContain(first);
+    expect(sanitized).not.toContain(second);
+    expect(sanitized).not.toContain(third);
+    expect(sanitized).toBe(
+      "<redacted> <redacted> <redacted> <redacted>",
+    );
+    // The separator pattern removes every slash and backslash, not one.
+    expect(sanitizeToken("/srv/a\\/b")).not.toContain("/");
+    expect(sanitizeToken("/srv/a\\/b")).not.toContain("\\");
+  });
+
+  it("usage refusals never echo raw operator values", async () => {
+    const token = ["sk", "-" + "c".repeat(24)].join("");
+    const path = "/srv/secret/fleet.json";
+    const { io, stderr } = mockIo();
+    expect(await hostsCommand(["add", "x", "--port", token], io)).toBe(2);
+    expect(await hostsCommand(["add", "x", "--role", token], io)).toBe(2);
+    expect(await hostsCommand([token], io)).toBe(2);
+    const out = stderr.join("");
+    expect(out).not.toContain(token);
+    expect(out).not.toContain(path);
+  });
+
+  it("host-name refusals and notices never echo a secret-shaped or invalid name (Fable round)", async () => {
+    const ghp = ["ghp", "_" + "a1".repeat(12)].join("");
+    const akia = ["AKIA", "C".repeat(16)].join("");
+    const colon = "user:" + "t".repeat(122) + "@h";
+    expect(colon.length).toBe(129);
+    const secrets = [ghp, akia, colon];
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        [akia]: {
+          transport: "ssh",
+          sshAlias: "old",
+          worktreeRoot: path.join(dir, "old"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: { "lane-runner": "old-lr", verifier: "old-v" },
+          runner: { kind: "opencode", port: 4200 },
+        },
+      },
+    });
+    for (const secret of secrets) {
+      const results = [
+        await runHosts(["edit", secret, "--port", "1"], file, {}, async () => false),
+        // A valid name that is added lands in the file diff by design; only the
+        // refused (invalid) name must stay out of every line.
+        ...(secret === colon
+          ? [await runHosts(["add", secret, "--ssh", "h", "--worktree-root", "/w", "--role", "verifier", "--yes"], file)]
+          : []),
+        // `show` of a name the file holds prints that row by design.
+        ...(secret !== akia ? [await runHosts(["show", secret], file)] : []),
+        await runHosts(["remove", secret], file, {}, async () => false),
+      ];
+      for (const result of results) {
+        for (const s of secrets) {
+          expect(result.stdout + result.stderr).not.toContain(s);
+        }
+      }
+    }
+    // The loader refuses a secret-shaped host-map key outright (HN1), so the
+    // movedFrom and dropped-alias notices are exercised with a key the loader
+    // accepts and the host-key screen still withholds: a long opaque run.
+    const opaque = ["Zq", "9x".repeat(12)].join("");
+    const movedFile = path.join(dir, "fleet-opaque.json");
+    writeJsonFile(movedFile, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        [opaque]: {
+          transport: "ssh",
+          sshAlias: "old",
+          worktreeRoot: path.join(dir, "old"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: { "lane-runner": "old-lr", verifier: "old-v" },
+          runner: { kind: "opencode", port: 4200 },
+        },
+      },
+    });
+    const moved = await runHosts(
+      ["add", "newhost", "--worktree-root", path.join(dir, "n"), "--role", "lane-runner", "--port", "5000", "--yes"],
+      movedFile,
+    );
+    expect(moved.code).toBe(0);
+    expect(moved.stdout).toContain("dropped role alias");
+    expect(moved.stdout + moved.stderr).not.toContain(opaque);
+    expect(moved.stdout + moved.stderr).not.toContain(akia);
+    expect(formatRoleAmbiguousRefusal("verifier", [ghp, akia, "ok-host"])).not.toContain(ghp);
+    expect(formatRoleAmbiguousRefusal("verifier", [ghp, akia, "ok-host"])).not.toContain(akia);
+    expect(formatRoleAmbiguousRefusal("verifier", [ghp, "ok-host"])).toContain("ok-host");
+  });
+
+  it("moveLaneRunnerRole guards hostile runtime hosts without throwing", () => {
+    // A null roleAliases map on the stripped host is omitted, not a throw.
+    const withNullAliases = {
+      schemaVersion: 2,
+      hosts: {
+        other: {
+          transport: "local",
+          worktreeRoot: "/w",
+          roles: ["lane-runner"],
+          roleAliases: null,
+        },
+      },
+    };
+    const nulled = moveLaneRunnerRole(withNullAliases, "new");
+    expect(nulled.movedFrom).toEqual(["other"]);
+    const nulledHosts = (nulled.value as { hosts: Record<string, Record<string, unknown>> }).hosts;
+    expect(nulledHosts.other.roles).toEqual([]);
+    expect(nulledHosts.other).not.toHaveProperty("roleAliases");
+
+    // A throwing getter on current.hosts never runs.
+    const hostileHosts = {
+      get hosts() {
+        throw new Error("hostile");
+      },
+    };
+    expect(() => moveLaneRunnerRole(hostileHosts, "new")).not.toThrow();
+    expect(moveLaneRunnerRole(hostileHosts, "new").movedFrom).toEqual([]);
+
+    // A throwing getter on a roles element never runs; the host is skipped.
+    const roles = ["lane-runner"];
+    Object.defineProperty(roles, 0, {
+      get() {
+        throw new Error("hostile");
+      },
+      enumerable: true,
+    });
+    const getterRoles = {
+      schemaVersion: 2,
+      hosts: { other: { transport: "local", worktreeRoot: "/w", roles } },
+    };
+    expect(() => moveLaneRunnerRole(getterRoles, "new")).not.toThrow();
+    expect(moveLaneRunnerRole(getterRoles, "new").movedFrom).toEqual([]);
+
+    // A throwing getter on roleAliases never runs; the alias map is omitted.
+    const hostileAliases = {
+      transport: "local",
+      worktreeRoot: "/w",
+      roles: ["lane-runner"],
+      get roleAliases() {
+        throw new Error("hostile");
+      },
+    };
+    const getterAliases = { schemaVersion: 2, hosts: { other: hostileAliases } };
+    const guarded = moveLaneRunnerRole(getterAliases, "new");
+    expect(guarded.movedFrom).toEqual(["other"]);
+    const guardedHosts = (guarded.value as { hosts: Record<string, Record<string, unknown>> }).hosts;
+    expect(guardedHosts.other).not.toHaveProperty("roleAliases");
+
+    // A non-plain host entry is skipped, never spread.
+    class HostileHost {
+      roles = ["lane-runner"];
+    }
+    const classHosts = {
+      schemaVersion: 2,
+      hosts: { other: new HostileHost() },
+    };
+    expect(() => moveLaneRunnerRole(classHosts, "new")).not.toThrow();
+    expect(moveLaneRunnerRole(classHosts, "new").movedFrom).toEqual([]);
+  });
+
+  it("moveLaneRunnerRole keeps the plain path: aliases prune and empty maps drop", () => {
+    const current = {
+      schemaVersion: 2,
+      hosts: {
+        other: {
+          transport: "local",
+          worktreeRoot: "/w",
+          roles: ["orchestrator", "lane-runner"],
+          roleAliases: { orchestrator: "o", "lane-runner": "l" },
+        },
+        sole: {
+          transport: "local",
+          worktreeRoot: "/w",
+          roles: ["lane-runner"],
+          roleAliases: { "lane-runner": "only" },
+        },
+      },
+    };
+    const moved = moveLaneRunnerRole(current, "new");
+    expect(moved.movedFrom).toEqual(["other", "sole"]);
+    const hosts = (moved.value as { hosts: Record<string, Record<string, unknown>> }).hosts;
+    expect(hosts.other.roles).toEqual(["orchestrator"]);
+    expect(hosts.other.roleAliases).toEqual({ orchestrator: "o" });
+    expect(hosts.sole.roles).toEqual([]);
+    expect(hosts.sole).not.toHaveProperty("roleAliases");
+  });
+});
+
+describe("moveLaneRunnerRole host-map accessors (Luna pre-merge round)", () => {
+  it("refuses a host-map entry that is a getter without invoking it", () => {
+    let invoked = 0;
+    const hosts: Record<string, unknown> = {
+      holder: {
+        transport: "local",
+        worktreeRoot: "/srv/w",
+        roles: ["orchestrator", "lane-runner"],
+      },
+    };
+    Object.defineProperty(hosts, "hostile", {
+      enumerable: true,
+      get() {
+        invoked += 1;
+        throw new Error("hostile getter ran");
+      },
+    });
+    const current = { schemaVersion: 2, hosts };
+    let result: ReturnType<typeof moveLaneRunnerRole> | undefined;
+    expect(() => {
+      result = moveLaneRunnerRole(current, "new");
+    }).not.toThrow();
+    expect(invoked).toBe(0);
+    expect(result?.movedFrom).toEqual([]);
+    expect(result?.value).toBe(current);
+    expect(result?.refused).toBe("accessor");
+  });
+});
+
+describe("hosts commands screen every host-map key (Fable re-check round)", () => {
+  function fixture(key: string, extra: Record<string, unknown> = {}) {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        [key]: {
+          transport: "ssh",
+          sshAlias: "old",
+          worktreeRoot: path.join(dir, "old"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: { "lane-runner": "old-lr", verifier: "old-v" },
+          runner: { kind: "opencode", port: 4200 },
+        },
+        ...extra,
+      },
+    });
+    return { dir, file };
+  }
+
+  it("a secret-shaped sole lane-runner key never reaches stdout or stderr when the role moves", async () => {
+    const key = ["ghp", "_" + "a1".repeat(18)].join("");
+    const { dir, file } = fixture(key);
+    const moved = await runHosts(
+      ["add", "newhost", "--role", "lane-runner", "--worktree-root", path.join(dir, "n"), "--port", "1", "--yes"],
+      file,
+    );
+    expect(moved.stdout + moved.stderr).not.toContain(key);
+    const refused = await runHosts(
+      ["add", "newhost", "--role", "lane-runner", "--worktree-root", "relative", "--port", "1", "--yes"],
+      file,
+    );
+    expect(refused.code).not.toBe(0);
+    expect(refused.stdout + refused.stderr).not.toContain(key);
+  });
+
+  it("a bare-alphanumeric-run key such as a slack-shaped one is screened in notices, list and loader errors", async () => {
+    // A secret-shaped key is refused by the loader (HN1); the notices screen
+    // a key it accepts: a long opaque alphanumeric run.
+    const key = ["Zq", "9x".repeat(12)].join("");
+    const { dir, file } = fixture(key);
+    const listed = await runHosts(["list"], file);
+    expect(listed.stdout + listed.stderr).not.toContain(key);
+    const moved = await runHosts(
+      ["add", "newhost", "--role", "lane-runner", "--worktree-root", path.join(dir, "n"), "--port", "1", "--yes"],
+      file,
+    );
+    expect(moved.stdout + moved.stderr).not.toContain(key);
+    expect(moved.stdout).toContain(HOST_KEY_WITHHELD);
+    expect(
+      formatRoleAmbiguousRefusal("verifier", [key, "ok-host"]),
+    ).not.toContain(key);
+  });
+
+  it("printed loader errors screen host-map keys", async () => {
+    const key = ["ghp", "_" + "a1".repeat(18)].join("");
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: { [key]: { transport: "carrier-pigeon", worktreeRoot: "/w", roles: ["orchestrator"] } },
+    });
+    for (const argv of [["list"], ["show"], ["remove", "x", "--yes"]]) {
+      const result = await runHosts(argv, file);
+      expect(result.stdout + result.stderr).not.toContain(key);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rename
+// ---------------------------------------------------------------------------
+
+describe("fleet-v2 hosts rename", () => {
+  const githubToken = `ghp_${'a'.repeat(20)}`;
+  const awsKey = `AKIA${'A'.repeat(16)}`;
+  const slackToken = `xoxb-${'a'.repeat(10)}`;
+  const apiKey = `sk-${'a'.repeat(20)}`;
+
+  const sha256 = (text: string): string =>
+    createHash("sha256").update(text).digest("hex");
+
+  /** A v2 file the loader refuses only because the lane-runner key is the GitHub token. */
+  function secretKeyInstallation(): unknown {
+    return {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: "/srv/fleet/mac",
+          roles: ["orchestrator"],
+          runner: { kind: "opencode", port: 46000 },
+        },
+        [githubToken]: {
+          transport: "ssh",
+          sshAlias: "lane-alias",
+          container: "fleet-runner",
+          roleAliases: { "lane-runner": "lane-alias" },
+          worktreeRoot: "/srv/fleet/lane",
+          tmpDir: "/srv/fleet/tmp",
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166, tunnelOffset: 1 },
+        },
+      },
+    };
+  }
+
+  /** A loader-valid two-host v2 file for the same-name refusal. */
+  function cleanTwoHostInstallation(): unknown {
+    return {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: "/srv/fleet/mac",
+          roles: ["orchestrator"],
+          runner: { kind: "opencode", port: 46000 },
+        },
+        "lane-host": {
+          transport: "ssh",
+          sshAlias: "lane-alias",
+          worktreeRoot: "/srv/fleet/lane",
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    };
+  }
+
+  it("loader refusal reaches hosts list with no echo", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const { code, stdout, stderr } = await runHosts(["list"], file);
+    expect(code).toBe(1);
+    expect(stderr).toContain(HOST_NAME_SECRET_REFUSAL);
+    expect(stdout + stderr).not.toContain(githubToken);
+  });
+
+  it("hosts add refuses a secret-shaped name and does not echo it", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const before = readFileSync(file, "utf8");
+    const { code, stderr } = await runHosts(["add", githubToken, "--yes"], file);
+    expect(code).toBe(1);
+    expect(stderr).toContain(HOST_NAME_SECRET_REFUSAL);
+    expect(stderr).not.toContain(githubToken);
+    expect(readFileSync(file, "utf8")).toBe(before);
+  });
+
+  it("rename on a secret-shaped key makes the loader accept the file", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const installation = secretKeyInstallation() as {
+      hosts: Record<string, unknown>;
+    };
+    writeJsonFile(file, installation);
+    const before = readFileSync(file, "utf8");
+    const expectedHash = sha256(before);
+    const screened = `host:${sha256(githubToken).slice(0, 12)}`;
+    const digest = sha256(
+      JSON.stringify({ expectedHash, newName: "lane-host", oldName: githubToken }),
+    );
+    const { code, stdout, stderr } = await runHosts(
+      ["rename", githubToken, "lane-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain(screened);
+    expect(stdout).toContain("to lane-host");
+    expect(stdout).toContain(`request:${digest}`);
+    expect(stdout + stderr).not.toContain(githubToken);
+    expect(stdout + stderr).not.toContain(file);
+
+    const parsed = parseInstallation(JSON.parse(readFileSync(file, "utf8")));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    const hosts = parsed.installation.hosts ?? {};
+    expect(Object.hasOwn(hosts, githubToken)).toBe(false);
+    expect(Object.hasOwn(hosts, "lane-host")).toBe(true);
+    expect(hosts["lane-host"]?.sshAlias).toBe("lane-alias");
+    expect(hosts["lane-host"]?.container).toBe("fleet-runner");
+    expect(hosts["lane-host"]?.roleAliases).toEqual({
+      "lane-runner": "lane-alias",
+    });
+    expect(hosts["lane-host"]?.tmpDir).toBe("/srv/fleet/tmp");
+    expect(hosts["lane-host"]?.worktreeRoot).toBe("/srv/fleet/lane");
+    expect(hosts["lane-host"]?.roles).toEqual(["lane-runner"]);
+    expect(hosts["lane-host"]?.runner).toEqual({
+      kind: "opencode",
+      port: 4166,
+      tunnelOffset: 1,
+    });
+    expect(hosts.mac).toEqual(installation.hosts.mac);
+  });
+
+  it("rename refusals", async () => {
+    const runRefusal = async (
+      argv: readonly string[],
+      file: string,
+    ): Promise<{ code: number; stdout: string; stderr: string }> => {
+      const before = readFileSync(file, "utf8");
+      const result = await runHosts([...argv, "--yes"], file);
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).not.toContain("request:");
+      expect(readFileSync(file, "utf8")).toBe(before);
+      return result;
+    };
+
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, secretKeyInstallation());
+      const { stderr } = await runRefusal(["rename", githubToken, "a..b"], file);
+      expect(stderr).toContain("the new host name is not a valid host name");
+    }
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, secretKeyInstallation());
+      const { stderr } = await runRefusal(["rename", githubToken, apiKey], file);
+      expect(stderr).toContain(HOST_NAME_SECRET_REFUSAL);
+      expect(stderr).not.toContain(apiKey);
+    }
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, secretKeyInstallation());
+      const { stderr } = await runRefusal(["rename", githubToken, "mac"], file);
+      expect(stderr).toContain("already a host");
+    }
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, secretKeyInstallation());
+      const { stderr } = await runRefusal(["rename", "nosuch", "lane-host"], file);
+      expect(stderr).toContain("no host has that name");
+    }
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, cleanTwoHostInstallation());
+      const { stderr } = await runRefusal(["rename", "lane-host", "lane-host"], file);
+      expect(stderr).toContain("the same as the current name");
+    }
+  });
+
+  it("F96-3 a second rename does not write again", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const first = await runHosts(["rename", githubToken, "lane-host", "--yes"], file);
+    expect(first.code).toBe(0);
+    const afterFirst = readFileSync(file, "utf8");
+
+    const second = await runHosts(["rename", githubToken, "lane-host", "--yes"], file);
+    expect(second.code).toBe(1);
+    expect(second.stderr).toContain("no host has that name");
+    expect(second.stdout + second.stderr).not.toContain(githubToken);
+    expect(readFileSync(file, "utf8")).toBe(afterFirst);
+
+    const declinedDir = makeTempDir();
+    const declinedFile = path.join(declinedDir, "fleet.json");
+    writeJsonFile(declinedFile, secretKeyInstallation());
+    const original = readFileSync(declinedFile, "utf8");
+    const declined = await runHosts(
+      ["rename", githubToken, "lane-host"],
+      declinedFile,
+      {},
+      async () => false,
+    );
+    expect(declined.code).toBe(1);
+    expect(declined.stderr).toContain("not confirmed; nothing was written");
+    expect(declined.stdout + declined.stderr).not.toContain("request:");
+    expect(readFileSync(declinedFile, "utf8")).toBe(original);
+
+    const racedDir = makeTempDir();
+    const racedFile = path.join(racedDir, "fleet.json");
+    writeJsonFile(racedFile, secretKeyInstallation());
+    const racedBytes =
+      `${JSON.stringify({ schemaVersion: 2, forge: { mode: "none" }, hosts: {} }, null, 2)}\n`;
+    const raced = await runHosts(
+      ["rename", githubToken, "lane-host"],
+      racedFile,
+      {},
+      async () => {
+        writeFileSync(racedFile, racedBytes, "utf8");
+        return true;
+      },
+    );
+    expect(raced.code).toBe(1);
+    expect(raced.stderr).toContain("installation: changed");
+    expect(raced.stderr).not.toContain(githubToken);
+    expect(readFileSync(racedFile, "utf8")).toBe(racedBytes);
+  });
+
+  it("F96-4 an unreadable or non-JSON file is not an empty rename", async () => {
+    const dir = makeTempDir();
+    const asDirectory = await runHosts(["rename", "a", "b", "--yes"], dir);
+    expect(asDirectory.code).toBe(1);
+    expect(asDirectory.stderr).toContain("installation: unreadable");
+    expect(asDirectory.stdout + asDirectory.stderr).not.toContain("request:");
+
+    const file = path.join(dir, "fleet.json");
+    writeFileSync(file, "not-json", "utf8");
+    const notJson = await runHosts(["rename", "a", "b", "--yes"], file);
+    expect(notJson.code).toBe(1);
+    expect(notJson.stderr).toContain("installation: invalid");
+    expect(notJson.stdout + notJson.stderr).not.toContain("request:");
+  });
+
+  it("F96-2 rename makes no forge, git, journal or network call", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const { code, calls } = await runHosts(
+      ["rename", githubToken, "lane-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(calls).toEqual([]);
+  });
+
+  it("F96-6 rename does not invoke git", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const { code, calls } = await runHosts(
+      ["rename", githubToken, "lane-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(calls).toEqual([]);
+  });
+
+  it("F96-5 no secret-shaped text and no path in rename or loader output", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+
+    const list = await runHosts(["list"], file);
+    expect(list.code).toBe(1);
+    const listOutput = list.stdout + list.stderr;
+    expect(listOutput).not.toContain(githubToken);
+    expect(listOutput).not.toContain(awsKey);
+    expect(listOutput).not.toContain(slackToken);
+    expect(listOutput).not.toContain(apiKey);
+    expect(listOutput).not.toContain(file);
+
+    const rename = await runHosts(["rename", githubToken, "lane-host", "--yes"], file);
+    expect(rename.code).toBe(0);
+    const renameOutput = rename.stdout + rename.stderr;
+    expect(renameOutput).not.toContain(githubToken);
+    expect(renameOutput).not.toContain(awsKey);
+    expect(renameOutput).not.toContain(slackToken);
+    expect(renameOutput).not.toContain(apiKey);
+    expect(renameOutput).not.toContain(file);
+  });
+
+  it("F96-8 rename carries the full request digest", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const before = readFileSync(file, "utf8");
+    const expectedHash = sha256(before);
+    const digest = sha256(
+      JSON.stringify({ expectedHash, newName: "lane-host", oldName: githubToken }),
+    );
+    const { code, stdout } = await runHosts(
+      ["rename", githubToken, "lane-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain(`request:${digest}`);
+  });
+
+  it("help lists rename", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const { code, stdout } = await runHosts(["--help"], file);
+    expect(code).toBe(0);
+    expect(stdout).toContain("rename <old> <new>");
+  });
+
+  it("the fakes are valid host names and secret-shaped", () => {
+    for (const fake of [githubToken, awsKey, slackToken, apiKey]) {
+      expect(fake.length).toBeLessThan(128);
+      expect(isValidHostName(fake)).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HN1 fix round 1: host keys are never echoed
+// ---------------------------------------------------------------------------
+
+/** Every window of twenty characters or more of `key` that `text` contains. */
+function echoedWindows(text: string, key: string): string[] {
+  const echoed: string[] = [];
+  for (let start = 0; start < key.length; start += 1) {
+    for (let end = start + 20; end <= key.length; end += 1) {
+      const window = key.slice(start, end);
+      if (text.includes(window) && !echoed.includes(window)) {
+        echoed.push(window);
+      }
+    }
+  }
+  return echoed;
+}
+
+describe("hosts output never echoes a withheld host key", () => {
+  // A valid dotted key the loader accepts, carrying a long opaque token run.
+  const tokenRunKey = "x.abcdefghijklmnopqrstuvwxyz0123456789";
+  // A flat 36-character alphanumeric key, the shape of an opaque token.
+  // Built at runtime so the fixture is not a literal secret-scanner match (gitleaks generic-api-key).
+  const flatTokenKey = "abcdefghij0123456789".repeat(2).slice(0, 36);
+
+  function installationWithTokenKeys(worktreeRoot: string): unknown {
+    return {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot,
+          roles: ["orchestrator", "lane-runner"],
+          runner: { kind: "opencode", port: 46000 },
+        },
+        [flatTokenKey]: {
+          transport: "ssh",
+          sshAlias: "lane-alias",
+          worktreeRoot: `${worktreeRoot}/lane`,
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    };
+  }
+
+  it("hosts list discloses nothing of a malformed host under a token-run key", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const installation = installationWithTokenKeys(
+      path.join(dir, "worktrees"),
+    ) as { hosts: Record<string, unknown> };
+    // The malformed entry: the loader refuses it and names the host key.
+    installation.hosts[tokenRunKey] = "not-an-object";
+    writeJsonFile(file, installation);
+    const { code, stdout, stderr } = await runHosts(["list"], file);
+    expect(code).toBe(1);
+    expect(stderr).toContain("the installation file is invalid");
+    expect(stderr).toContain("must be an object");
+    expect(echoedWindows(stdout + stderr, tokenRunKey)).toEqual([]);
+  });
+
+  it("hosts list never prints a withheld key even when the file parses", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    const { code, stdout } = await runHosts(["list"], file);
+    expect(code).toBe(0);
+    expect(echoedWindows(stdout, flatTokenKey)).toEqual([]);
+    expect(stdout).toContain("<host key withheld>");
+  });
+
+  it("removing a host with a 36-character alphanumeric key prints no key", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    const { code, stdout, stderr } = await runHosts(
+      ["remove", flatTokenKey, "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("written");
+    expect(stdout).toContain("-");
+    expect(echoedWindows(stdout + stderr, flatTokenKey)).toEqual([]);
+  });
+
+  it("editing a host with a 36-character alphanumeric key prints no key", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    const { code, stdout, stderr } = await runHosts(
+      ["edit", flatTokenKey, "--port", "4167", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("written");
+    expect(echoedWindows(stdout + stderr, flatTokenKey)).toEqual([]);
+  });
+
+  it("renaming a host whose root carries an own __proto__ key refuses and leaves the file unchanged", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    // Written as JSON text so the root gains an own "__proto__" data property.
+    writeFileSync(
+      file,
+      `${JSON.stringify(
+        installationWithTokenKeys(path.join(dir, "worktrees")),
+        null,
+        2,
+      ).slice(0, -1)},"__proto__": {"injected": true}}\n`,
+      "utf8",
+    );
+    const before = readFileSync(file, "utf8");
+    expect(JSON.parse(before)).toEqual(
+      expect.objectContaining({ schemaVersion: 2 }),
+    );
+    expect(Object.hasOwn(JSON.parse(before), "__proto__")).toBe(true);
+    const { code, stderr } = await runHosts(
+      ["rename", flatTokenKey, "renamed-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(1);
+    expect(readFileSync(file, "utf8")).toBe(before);
+    expect(stderr).not.toContain("renamed host");
+  });
+
+  // HN1b fix a: no thrown error escapes the screened io. A dependency's
+  // failure is reported as exactly one screened line — the tag, the message's
+  // first line, no stack — and the screen still withholds every secret.
+  it("a thrown Error from a state reader prints one screened error line and no stack", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    // Built at runtime so the fixture is not a literal secret-scanner match.
+    const token = `s3cret${"xY9".repeat(11)}`.slice(0, 36);
+    const spy = vi
+      .spyOn(AttemptRepositoryAdapter.prototype, "listAllAttempts")
+      .mockRejectedValue(
+        new Error(
+          `hosts.${flatTokenKey}: live-work read failed near token ${token}`,
+        ),
+      );
+    try {
+      const { code, stdout, stderr } = await runHosts(
+        ["remove", flatTokenKey, "--yes"],
+        file,
+      );
+      expect(code).toBe(1);
+      const errorLines = stderr
+        .split("\n")
+        .filter((line) => line.startsWith("error: "));
+      expect(errorLines).toHaveLength(1);
+      expect(stderr).not.toContain("    at ");
+      expect(echoedWindows(stdout + stderr, flatTokenKey)).toEqual([]);
+      expect(echoedWindows(stdout + stderr, token)).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a thrown non-Error prints error: unknown and nothing of the value", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    const token = `s3cret${"xY9".repeat(11)}`.slice(0, 36);
+    const spy = vi
+      .spyOn(AttemptRepositoryAdapter.prototype, "listAllAttempts")
+      .mockRejectedValue(`thrown string carrying token ${token}`);
+    try {
+      const { code, stdout, stderr } = await runHosts(
+        ["remove", flatTokenKey, "--yes"],
+        file,
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("error: unknown");
+      expect(stderr).not.toContain("thrown string");
+      expect(echoedWindows(stdout + stderr, token)).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HN1b fix round (a2): the installation-file resolution is inside the guard
+// ---------------------------------------------------------------------------
+
+describe("hosts installation-file resolution never escapes the screened io", () => {
+  it("a throwing process.cwd() with no explicit file prints one screened error line", async () => {
+    // Built at runtime so the fixture is not a literal secret-scanner match.
+    const token = `t0k3n${"aB7".repeat(11)}`.slice(0, 36);
+    const { io, stdout: rawStdout, stderr: rawStderr } = mockIo();
+    const spy = vi
+      .spyOn(process, "cwd")
+      .mockImplementation(() => {
+        throw new Error(`cwd lost near token ${token}`);
+      });
+    try {
+      const code = await hostsCommand(["list"], io);
+      const stdout = rawStdout.join("");
+      const stderr = rawStderr.join("");
+      expect(code).toBe(1);
+      const errorLines = stderr
+        .split("\n")
+        .filter((line) => line.startsWith("error: "));
+      expect(errorLines).toHaveLength(1);
+      expect(stderr).not.toContain("    at ");
+      expect(echoedWindows(stdout + stderr, token)).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

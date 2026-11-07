@@ -460,13 +460,24 @@ describe('review kind and request id (PC-1)', () => {
       implementerModel: IMPLEMENTER,
       readOnlyVerified: true,
       result: 'fail',
-      findings: [],
+      findings: [
+        {
+          findingId: 'rr-a-1:f-1',
+          severity: 'major',
+          summary: 'a blocking finding',
+          filePath: 'src/a.ts',
+          line: 1,
+          state: 'unresolved',
+          dispositionReason: null,
+          dispositionEvidenceRef: null,
+        },
+      ],
       evidenceRef: 'ref-1',
       policyRevision: 'policy-example-1',
       completedAtIso: '2026-10-28T12:00:00.000Z',
       kind: 'brief-check',
     };
-    const passCode: ReviewReceiptRecord = { ...failBrief, id: 'rr-a-2', result: 'pass', kind: 'code-review' };
+    const passCode: ReviewReceiptRecord = { ...failBrief, id: 'rr-a-2', result: 'pass', kind: 'code-review', findings: [] };
     const both = latestReceiptPerReviewer([failBrief, passCode]);
     expect(both).toHaveLength(2);
     expect(tallyReviews(both).disagreement).toBe(true);

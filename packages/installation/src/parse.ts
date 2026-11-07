@@ -119,7 +119,7 @@ import { readTelemetryPolicyBlock } from './telemetry-policy.js';
 import { readSeatsPolicyBlock } from './seats-policy.js';
 
 export type ParseResult =
-  | { ok: true; installation: FleetInstallation }
+  | { ok: true; installation: FleetInstallation; warnings?: string[] }
   | { ok: false; errors: string[] };
 
 type JsonObject = { readonly [key: string]: unknown };
@@ -1792,6 +1792,7 @@ function parseV2Chains(
 function parseV2Policy(
   value: JsonObject,
   errors: string[],
+  warnings: string[],
 ): PolicySection | undefined {
   if (!Object.hasOwn(value, 'policy')) {
     return undefined;
@@ -1866,7 +1867,7 @@ function parseV2Policy(
   const telemetry = parsePolicyBlock(section, 'telemetry', readTelemetryPolicyBlock, errors);
   const seats: SeatsPolicy | undefined = parsePolicyBlock(section, 'seats', readSeatsPolicyBlock, errors);
   const merge = parseMergePolicy(section, errors);
-  const daemon = parseMergeDaemonPolicy(section, errors);
+  const daemon = parseMergeDaemonPolicy(section, errors, warnings);
   return {
     ...(forbiddenRoutes !== undefined ? { forbiddenRoutes } : {}),
     ...(perLaneCostCeiling !== undefined ? { perLaneCostCeiling } : {}),
@@ -2601,6 +2602,7 @@ function parseMergePolicy(
 function parseMergeDaemonPolicy(
   section: JsonObject,
   errors: string[],
+  warnings: string[],
 ): MergeDaemonSection | undefined {
   if (!Object.hasOwn(section, 'daemon')) {
     return undefined;
@@ -2619,12 +2621,12 @@ function parseMergeDaemonPolicy(
   const intervalSeconds = read('intervalSeconds');
   const budgetSeconds = read('budgetSeconds');
   const settleSeconds = read('settleSeconds');
-  if (Object.hasOwn(value, 'chainRefresh')) {
-    if (value.chainRefresh === 'live') {
-      errors.push('policy.daemon.chainRefresh: live is not enabled');
-    } else if (value.chainRefresh !== 'shadow') {
-      errors.push('policy.daemon.chainRefresh: must be shadow or live');
-    }
+  // CO8a: an unknown or `live` `chainRefresh` is a warning, never an error:
+  // the file still parses and the raw value round-trips so the operator sees
+  // and fixes their own text. The warning names the key and the reason code
+  // only, never the value.
+  if (Object.hasOwn(value, 'chainRefresh') && value.chainRefresh !== 'shadow') {
+    warnings.push('policy.daemon.chainRefresh: chain-refresh-mode-invalid');
   }
   if (
     errors.length === before &&
@@ -2640,7 +2642,9 @@ function parseMergeDaemonPolicy(
     ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
     ...(budgetSeconds !== undefined ? { budgetSeconds } : {}),
     ...(settleSeconds !== undefined ? { settleSeconds } : {}),
-    ...(Object.hasOwn(value, 'chainRefresh') ? { chainRefresh: 'shadow' as const } : {}),
+    ...(Object.hasOwn(value, 'chainRefresh')
+      ? { chainRefresh: value.chainRefresh as MergeDaemonSection['chainRefresh'] }
+      : {}),
   };
 }
 
@@ -3237,6 +3241,7 @@ function parseInstallationV1(value: JsonObject): ParseResult {
 
 function parseInstallationV2(value: JsonObject): ParseResult {
   const errors: string[] = [];
+  const warnings: string[] = [];
   collectUnknownKeys(value, V2_ROOT_KEYS, 'installation', errors);
 
   const hosts = parseV2Hosts(value, errors);
@@ -3244,7 +3249,7 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   const seats = parseV2Seats(value, errors);
   const knownSeatIds = new Set<string>((seats ?? []).map((seat) => seat.id));
   const chains = parseV2Chains(value, knownSeatIds, errors);
-  const policy = parseV2Policy(value, errors);
+  const policy = parseV2Policy(value, errors, warnings);
   const shelf = parseV2Shelf(value, errors);
   const forge = parseV2Forge(value, errors);
   const verification = parseV2Verification(value, errors);
@@ -3293,5 +3298,5 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   if (daemon !== undefined) {
     installation.daemon = daemon;
   }
-  return { ok: true, installation };
+  return { ok: true, installation, ...(warnings.length > 0 ? { warnings } : {}) };
 }

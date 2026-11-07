@@ -8,8 +8,11 @@ import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-fact
 import type { LaneRunJournalOutcome, LaneRunJournalRefusal } from '../../../domain/lane-run-journal.js';
 import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
-import { boundedFindingsView } from '../../../domain/park-findings-view.js';
+import type { FindLatestReceiptOfKindResult } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { LaneRunParkFindingView } from '../../../domain/park-findings-view.js';
+import { causingParkFindingsView } from '../../../domain/park-findings-view.js';
+import { decideConductorReviewOutcome, } from '../../../domain/lane-run-decider.js';
+import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { resolveLaneRunProvenance } from '../../../domain/lane-run-records.js';
 import { canEnterLaneRunState, workOrderReleaseFor } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
@@ -249,51 +252,118 @@ export async function releaseWorkOrderAtEnd(ctx: AdvanceStepContext,
 }
 
 /**
- * The bounded findings snapshot of a blocker-after-round-2 park, read once at
- * park time and frozen on the parked record so repair and every retry reuse it
- * (GB2 correction 2). `null` means the findings could not be read at park time
- * (unwired deps, a missing attempt or head, an `unavailable` receipt lookup, or
- * a read throw); `[]` means the receipts were read and there was no failed
- * code-review receipt at that head. Every failure falls through to `null`,
- * never throws.
+ * The bounded findings snapshot of a finding-caused park (`blocker-after-
+ * round-2` or `acceptance-rejected`), read once at park time and frozen on
+ * the parked record (GB2 correction 2, RV3 req (d)). The review kinds are
+ * ordered by `parkedFrom` and the attempts are walked newest-first to the
+ * latest collected head; the first review receipt whose severity outcome is
+ * `failed` supplies the causing blocking findings through
+ * `causingParkFindingsView` (guaranteed non-empty when a blocking receipt is
+ * found).
+ *
+ * `null` means the findings could not be read at park time (unwired deps, a
+ * missing attempt or head, an `unavailable` receipt lookup, or a read throw):
+ * unread stays `null`, never `[]`. `undefined` means every lookup succeeded
+ * and no failing review receipt exists at the head (e.g. a gate-caused park):
+ * `findings` is omitted, never `[]`. Never throws.
  */
 async function blockerFindingsFor(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
-): Promise<readonly LaneRunParkFindingView[] | null> {
+  parkedFrom: LaneRunStateValue,
+): Promise<readonly LaneRunParkFindingView[] | null | undefined> {
   const reviewRequest = ctx.deps.reviewRequest;
   const attemptRepo = ctx.deps.attemptRepo;
   if (reviewRequest === undefined || attemptRepo === undefined) {
     return null;
   }
-  const attemptId = record.attemptIds[record.attemptIds.length - 1];
-  if (attemptId === undefined) {
-    return null;
-  }
-  try {
-    const attempt = await attemptRepo.findAttemptById(attemptId);
-    const head = attempt?.artifacts?.headCommit;
-    if (attempt === null || head === undefined) {
+  // The latest attempt with a collected head, newest first.
+  let head: string | undefined;
+  let attemptId: string | undefined;
+  for (let index = record.attemptIds.length - 1; index >= 0; index -= 1) {
+    const id = record.attemptIds[index];
+    if (id === undefined) {
+      continue;
+    }
+    try {
+      const attempt = await attemptRepo.findAttemptById(id);
+      const candidateHead = attempt?.artifacts?.headCommit;
+      if (attempt !== null && candidateHead !== undefined) {
+        head = candidateHead;
+        attemptId = id;
+        break;
+      }
+    } catch {
       return null;
     }
-    const found = await reviewRequest.findLatestReceiptOfKind({
-      attemptId,
-      candidateHeadSha: head,
-      kind: 'code-review',
-    });
-    // An `unavailable` lookup is a store that could not answer, not a
-    // confirmed absence: it stays unread (`null`) so a later park or the
-    // reader's receipt fallback can still recover the findings.
+  }
+  if (attemptId === undefined || head === undefined) {
+    return null;
+  }
+  const kinds: readonly ('brief-check' | 'code-review' | 'pre-merge')[] =
+    parkedFrom === 'brief-check'
+      ? ['brief-check', 'code-review', 'pre-merge']
+      : parkedFrom === 'awaiting-premerge' || parkedFrom === 'merging'
+        ? ['pre-merge', 'code-review', 'brief-check']
+        : ['code-review', 'brief-check', 'pre-merge'];
+  let sawUnavailableOrThrow = false;
+  for (const kind of kinds) {
+    let found: FindLatestReceiptOfKindResult;
+    try {
+      found = await reviewRequest.findLatestReceiptOfKind({ attemptId, candidateHeadSha: head, kind });
+    } catch {
+      sawUnavailableOrThrow = true;
+      continue;
+    }
     if (found.outcome === 'unavailable') {
-      return null;
+      sawUnavailableOrThrow = true;
+      continue;
     }
-    if (found.outcome !== 'found' || found.receipt.verdict !== 'failed') {
-      return [];
+    if (found.outcome === 'found' && decideConductorReviewOutcome(found.receipt).outcome === 'failed') {
+      const caused = causingParkFindingsView(found.receipt.findings);
+      return caused.length > 0 ? caused : null;
     }
-    return boundedFindingsView(found.receipt.findings);
-  } catch {
-    return null;
+    // RV3: a `not-found` receipt of a review kind falls back to the latest
+    // journal intent's minted request id before the kind is given up.
+    if (found.outcome === 'not-found' && (kind === 'code-review' || kind === 'brief-check')) {
+      try {
+        const entries = await ctx.deps.runJournal.listForRun(record.runId);
+        let mintedId: string | null = null;
+        for (let index = entries.length - 1; index >= 0; index -= 1) {
+          const entry = entries[index]!;
+          if (entry.kind !== 'intent' || entry.runId !== record.runId || entry.key === null) {
+            continue;
+          }
+          const parsed = parseLaneRunKey(entry.key);
+          if (parsed === null || parsed.kind !== 'step' || parsed.step !== kind) {
+            continue;
+          }
+          mintedId = entry.mintedId;
+          break;
+        }
+        if (mintedId !== null) {
+          const byRequest = await reviewRequest.findReviewReceipt({
+            attemptId,
+            requestId: mintedId,
+            candidateHeadSha: head,
+          });
+          if (
+            byRequest.outcome === 'found' &&
+            decideConductorReviewOutcome(byRequest.receipt).outcome === 'failed'
+          ) {
+            const caused = causingParkFindingsView(byRequest.receipt.findings);
+            return caused.length > 0 ? caused : null;
+          }
+          if (byRequest.outcome === 'unavailable') {
+            sawUnavailableOrThrow = true;
+          }
+        }
+      } catch {
+        sawUnavailableOrThrow = true;
+      }
+    }
   }
+  return sawUnavailableOrThrow ? null : undefined;
 }
 
 export async function performPark(ctx: AdvanceStepContext,
@@ -303,7 +373,14 @@ export async function performPark(ctx: AdvanceStepContext,
   parkedFrom: LaneRunStateValue,
   request: AdvanceLaneRunRequest,
 ): Promise<AdvanceLaneRunResult> {
-  const findings = reason === 'blocker-after-round-2' ? await blockerFindingsFor(ctx, record) : undefined;
+  // RV3 (req d): a park caused by review findings carries the non-empty
+  // bounded findings that caused it; `findings: []` is refused at the domain
+  // boundary, so only `null` (unread) or a non-empty snapshot is attached,
+  // and a park with no failing review receipt omits `findings`.
+  const findings =
+    reason === 'blocker-after-round-2' || reason === 'acceptance-rejected'
+      ? await blockerFindingsFor(ctx, record, parkedFrom)
+      : undefined;
   const parkedRecord: LaneRunRecord = {
     ...record,
     parked: {
@@ -311,7 +388,7 @@ export async function performPark(ctx: AdvanceStepContext,
       qualifier,
       parkedFrom,
       questionId: null,
-      ...(findings !== undefined ? { findings } : {}),
+      ...(findings === null || (findings !== undefined && findings.length > 0) ? { findings } : {}),
     },
     parkCount: record.parkCount + 1,
     revision: record.revision + 1,

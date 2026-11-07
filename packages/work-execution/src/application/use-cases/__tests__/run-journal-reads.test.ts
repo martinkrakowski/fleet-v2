@@ -483,6 +483,71 @@ describe('LaneRunBoardReads.readBoard', () => {
   });
 });
 
+describe('LaneRunBoardReads card id and label screening', () => {
+  const PATH_ID = '/srv/wt/secret-worktree';
+
+  async function board(foreign: LaneRunRecord, attempts: readonly AttemptRecord[] = []) {
+    const h = makeHarness({
+      runRepo: {
+        list: async () => [foreign],
+        get: async () => null,
+      } as unknown as LaneRunBoardReadsDependencies['runRepo'],
+    });
+    await h.laneRunJournal.append(laneRunConductEntry(ENTRY_1, foreign.runId, 'running', NOW));
+    for (const attempt of attempts) {
+      await h.attemptRepo.saveAttempt(attempt);
+    }
+    const result = await h.reads.readBoard({ nowIso: NOW });
+    expect(result.outcome).toBe('listed');
+    if (result.outcome !== 'listed') {
+      throw new Error('board must list');
+    }
+    return result;
+  }
+
+  it('replaces a path-shaped workOrderId with the invalid marker', async () => {
+    const result = await board({ ...runRecord(), workOrderId: PATH_ID });
+    expect(result.runs[0]?.workOrderId).toBe('<invalid>');
+    expect(JSON.stringify(result)).not.toContain(PATH_ID);
+  });
+
+  it('replaces a path-shaped attempt id with the invalid marker', async () => {
+    const result = await board({ ...runRecord(), attemptIds: [PATH_ID] });
+    expect(result.runs[0]?.latestAttemptId).toBe('<invalid>');
+    expect(JSON.stringify(result)).not.toContain(PATH_ID);
+  });
+
+  it('replaces a path-shaped parked questionId with the invalid marker', async () => {
+    const parked = {
+      reason: 'blocker-after-round-2',
+      qualifier: null,
+      parkedFrom: 'running',
+      questionId: PATH_ID,
+      findings: [],
+    } as unknown as LaneRunRecord['parked'];
+    const result = await board({ ...runRecord(), parked, parkCount: 1 });
+    expect(result.runs[0]?.parked?.questionId).toBe('<invalid>');
+    expect(JSON.stringify(result)).not.toContain(PATH_ID);
+  });
+
+  it('replaces a path-shaped or secret-shaped seat variant with the invalid marker', async () => {
+    const ghp = ['ghp', 'x'.repeat(28)].join('_'); // built at runtime, never a literal token
+    for (const bad of [PATH_ID, ghp]) {
+      const attempt = attemptRecord(ATTEMPT_ID, { seatSelection: { ...seatSelection('first-pass'), variant: bad } });
+      const result = await board(runRecord(), [attempt]);
+      expect(result.runs[0]?.seatsByRole['first-pass']?.variant).toBe('<invalid>');
+      expect(JSON.stringify(result)).not.toContain(bad);
+    }
+  });
+
+  it('keeps well-formed ids and variants verbatim', async () => {
+    const attempt = attemptRecord(ATTEMPT_ID, { seatSelection: { ...seatSelection('first-pass'), variant: 'low' } });
+    const result = await board(runRecord(), [attempt]);
+    expect(result.runs[0]).toMatchObject({ workOrderId: WO_ID, latestAttemptId: ATTEMPT_ID });
+    expect(result.runs[0]?.seatsByRole['first-pass']?.variant).toBe('low');
+  });
+});
+
 describe('LaneRunBoardReads.readRun', () => {
   it('lists a run with its bounded journal and halt/driver facts', async () => {
     const h = makeHarness();

@@ -109,6 +109,30 @@ export function safeOrNull(value: unknown, maxLen = 128): string | null {
   return isSafeWireId(value, maxLen) ? value : null;
 }
 
+/** The marker a stored id or label that fails screening is replaced by; the value is never echoed. */
+export const INVALID_WIRE_VALUE = '<invalid>';
+
+/** The repo's stored-id grammar (see COMMIT_ATTEMPT_ID_PATTERN): no slash, no whitespace, no `@`. */
+const WIRE_ID_GRAMMAR = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const WIRE_LABEL_GRAMMAR = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$/;
+
+/** A stored id that matches the id grammar and no secret shape, else the fixed marker. */
+function idOrInvalid(value: string): string {
+  return WIRE_ID_GRAMMAR.test(value) && !hasAnySecretShape(value) ? value : INVALID_WIRE_VALUE;
+}
+
+function idOrNull(value: string | null): string | null {
+  return value === null ? null : idOrInvalid(value);
+}
+
+/** A stored seat variant label that is neither path-shaped nor secret-shaped, else the fixed marker. */
+function labelOrInvalid(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return WIRE_LABEL_GRAMMAR.test(value) && !hasAnySecretShape(value) ? value : INVALID_WIRE_VALUE;
+}
+
 /** How an unreadable or unknown-version store read answers. */
 export type LaneRunUnknownReason = 'store-unreadable' | 'unknown-schema-version';
 
@@ -475,7 +499,7 @@ function seatSummaryOf(selection: AttemptRecord['seatSelection']): LaneRunRoleSe
     model,
     tool: selection.tool,
     seatIndex: selection.seatIndex,
-    variant: selection.variant ?? null,
+    variant: labelOrInvalid(selection.variant),
   };
 }
 
@@ -611,7 +635,7 @@ function buildLaneRunWireCard(
       reason: p.reason,
       qualifier: p.qualifier,
       parkedFrom: p.parkedFrom,
-      questionId: p.questionId,
+      questionId: idOrNull(p.questionId),
       findingCount: p.reason === 'blocker-after-round-2' && Array.isArray(p.findings) ? p.findings.length : null,
     };
   }
@@ -620,7 +644,7 @@ function buildLaneRunWireCard(
   const wouldAct = dryRunEntries.slice(-MAX_WOULD_ACT_PER_RUN).map(wouldActSummaryOf);
   return {
     runId: record.runId,
-    workOrderId: record.workOrderId,
+    workOrderId: idOrInvalid(record.workOrderId),
     baseBranch: resolveLaneRunBaseBranch(record),
     tier: record.tier,
     state,
@@ -636,7 +660,7 @@ function buildLaneRunWireCard(
     stopMode: stopFacts.stopMode,
     stopRequestedAtIso: stopFacts.stopRequestedAtIso,
     pendingIntent: pending === null ? null : { step: pending.step, reconciliation: pending.reconciliation },
-    latestAttemptId: record.attemptIds.length === 0 ? null : record.attemptIds[record.attemptIds.length - 1],
+    latestAttemptId: record.attemptIds.length === 0 ? null : idOrInvalid(record.attemptIds[record.attemptIds.length - 1]),
     attemptCount: record.attemptIds.length,
     lease,
     wouldAct,
@@ -825,7 +849,7 @@ export class LaneRunBoardReads {
     const latestTrace = latestTraceOf(traceList);
     const attemptWorkOrderIds = new Map(attempts.map((attempt) => [attempt.id, attempt.workOrderId]));
     const workOrders = new Map(orders.map((order) => [order.id, { repository: order.repository, ownedPaths: order.ownedPaths }]));
-    const schedule = deriveConductorSchedule(
+    const derived = deriveConductorSchedule(
       {
         halt: halt.state,
         driverLease: driver,
@@ -838,6 +862,11 @@ export class LaneRunBoardReads {
       },
       parsed.nowIso,
     );
+    // A stored work order id is screened here too: the schedule rows echo it.
+    const schedule: ConductorSchedule = {
+      ...derived,
+      rows: derived.rows.map((row) => ({ ...row, workOrderId: idOrInvalid(row.workOrderId) })),
+    };
     const { marks, truncated } = deriveSessionStartMarks(
       [...journals.values()].flat(),
       {

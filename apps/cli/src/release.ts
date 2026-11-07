@@ -145,7 +145,10 @@ export function servedRootFacts(installation: FleetInstallation | undefined): {
   if (cliSegments === null) {
     return null;
   }
-  const currentAt = cliSegments.indexOf('current');
+  // The served root is the `<root>` of the LAST `current` segment: the entry
+  // point of a nested installation such as `/srv/current/fleet/current/...`
+  // still names the innermost served root `/srv/current/fleet`, not `/srv`.
+  const currentAt = cliSegments.lastIndexOf('current');
   if (currentAt < 1) {
     return null;
   }
@@ -197,10 +200,11 @@ export async function resolveVerifiedRoot(
 ): Promise<RootResolution> {
   const realConfigured = await realpathOrNull(facts.configuredRoot);
   if (realConfigured === null) {
-    const stat = await lstatOrNull(facts.configuredRoot);
-    if (stat !== null || !options.createIfAbsent) {
-      // A dangling link or another realpath failure is never a first install;
-      // an absent configured root is accepted only where creation is allowed.
+    const observed = await lstatEntry(facts.configuredRoot);
+    if (observed !== 'absent' || !options.createIfAbsent) {
+      // Only genuine absence (ENOENT) is the first-install state. A dangling
+      // link, a permission error or any other realpath/lstat failure stays
+      // unknown and refuses — it never enters the creation path.
       return ROOT_REFUSED;
     }
     return createServedRoot(root, facts, options);
@@ -245,13 +249,12 @@ async function createServedRoot(
       nowIso,
     });
     if (taken.outcome !== 'ok') {
-      // Another holder may have created the root meanwhile: re-verify once,
-      // outside the lock, and accept only a now-existing equal root.
-      const realConfigured = await realpathOrNull(facts.configuredRoot);
-      if (realConfigured === null) {
-        return ROOT_REFUSED;
-      }
-      return verifiedEqualRoot(root, realConfigured);
+      // The lock is refused: another holder owns the creation window. Rule 4
+      // requires the rule-3 re-verification to happen INSIDE that same lock
+      // before the root is used, so without the lock the root is refused —
+      // even if it appears to exist meanwhile. The holder that does hold the
+      // lock performs the creation and the re-verification.
+      return ROOT_REFUSED;
     }
     acquired = { fence: taken.lease.fence };
   } catch {
@@ -289,9 +292,9 @@ async function mkdirRealDirectory(directory: string): Promise<boolean> {
   let current = '';
   for (const segment of segments) {
     current = `${current}/${segment}`;
-    const stat = await lstatOrNull(current);
-    if (stat !== null) {
-      if (!stat.isDirectory()) {
+    const observed = await lstatEntry(current);
+    if (observed !== 'absent') {
+      if (observed === 'unknown' || !observed.isDirectory()) {
         return false;
       }
       continue;
@@ -313,13 +316,19 @@ async function realpathOrNull(target: string): Promise<string | null> {
   }
 }
 
-async function lstatOrNull(target: string): Promise<Awaited<ReturnType<typeof lstat>> | null> {
+/**
+ * The lstat observation of a path, with error types kept: `'absent'` only for
+ * ENOENT (and ENOTDIR, whose parent walk also proves no entry exists there);
+ * every other failure is `'unknown'` and never treated as absence.
+ */
+async function lstatEntry(
+  target: string,
+): Promise<Awaited<ReturnType<typeof lstat>> | 'absent' | 'unknown'> {
   try {
     return await lstat(target);
-  } catch {
-    // An unreadable directory entry is treated as absent here; the mkdir that
-    // follows (or the realpath re-check) refuses when the path is not usable.
-    return null;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? 'absent' : 'unknown';
   }
 }
 

@@ -121,6 +121,18 @@ describe('servedRootFacts (lexical, CO14c rule 1)', () => {
     expect(facts).toEqual({ configuredRoot: root, stateDir: '/srv/state' });
   });
 
+  it('derives the innermost served root when the root path itself contains current', () => {
+    const installation = (cliPath: string): FleetInstallation =>
+      ({
+        schemaVersion: 2,
+        daemon: { nodePath: '/usr/bin/node', cliPath, stateDir: '/srv/state', unitDir: '/u', installationFile: '/f' },
+      }) as unknown as FleetInstallation;
+    expect(servedRootFacts(installation('/srv/current/fleet/current/apps/cli/dist/bin.js'))).toEqual({
+      configuredRoot: '/srv/current/fleet',
+      stateDir: '/srv/state',
+    });
+  });
+
   it('refuses an entry point with .. segments, no current segment, or no state directory', () => {
     const stateDir = '/srv/state';
     const installation = (cliPath: string): FleetInstallation =>

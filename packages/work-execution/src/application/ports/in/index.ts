@@ -31,6 +31,7 @@ export * from "./LandChainPort.in-port.js";
 export * from "./ListAttemptJournalPort.in-port.js";
 export * from "./ListAttemptsPort.in-port.js";
 export * from "./ListConductorPassesPort.in-port.js";
+export * from "./ListHeldWorkOrdersPort.in-port.js";
 export * from "./ListLaneRunsPort.in-port.js";
 export * from "./ListMergeQueuePort.in-port.js";
 export * from "./ListStaleWorkOrdersPort.in-port.js";

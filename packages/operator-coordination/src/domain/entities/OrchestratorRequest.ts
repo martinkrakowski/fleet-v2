@@ -494,7 +494,11 @@ export class OrchestratorRequest {
     }
   }
 
-  private completeUnchecked(holder: unknown, linked: unknown, nowIso: string): OrchestratorRequestResult {
+  private completeUnchecked(
+    holder: unknown,
+    linked: unknown,
+    nowIso: string,
+  ): OrchestratorRequestResult {
     const holderCheck = this.holderError('complete', ['claimed', 'cancel-requested'], holder, nowIso);
     if (holderCheck !== null) {
       return refusal(holderCheck.message, holderCheck.code);
@@ -522,7 +526,11 @@ export class OrchestratorRequest {
     }
   }
 
-  private refuseUnchecked(holder: unknown, reason: unknown, nowIso: string): OrchestratorRequestResult {
+  private refuseUnchecked(
+    holder: unknown,
+    reason: unknown,
+    nowIso: string,
+  ): OrchestratorRequestResult {
     const holderCheck = this.holderError('refuse', ['claimed', 'cancel-requested'], holder, nowIso);
     if (holderCheck !== null) {
       return refusal(holderCheck.message, holderCheck.code);
@@ -536,6 +544,102 @@ export class OrchestratorRequest {
       return invalid(reasonError);
     }
     return this.recreate(nowIso, { state: 'refused', reason: reasonSnapshot });
+  }
+
+  /**
+   * Apply a journal-recorded final result (completed or refused). Used during
+   * reconcile when recovering a recorded result even after the claim's lease
+   * expired or the claim was swept to queued or stalled. Checks the journal
+   * entry's requestId, fence, and digest instead of checking the claim.
+   */
+  applyRecordedResult(
+    result: unknown,
+    journalEntry: unknown,
+    nowIso: string = new Date().toISOString(),
+  ): OrchestratorRequestResult {
+    try {
+      return this.applyRecordedResultUnchecked(result, journalEntry, nowIso);
+    } catch {
+      return unreadableInputResult();
+    }
+  }
+
+  private applyRecordedResultUnchecked(
+    result: unknown,
+    journalEntry: unknown,
+    nowIso: string,
+  ): OrchestratorRequestResult {
+    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+      return invalid('OrchestratorRequest now must be a valid timestamp');
+    }
+    const allowedStates: readonly OrchestratorRequestState[] = [
+      'claimed',
+      'cancel-requested',
+      'queued',
+      'stalled',
+      'deferred',
+    ];
+    if (!allowedStates.includes(this.record.state)) {
+      return refusal('OrchestratorRequest cannot apply recorded result from its current state', 'state');
+    }
+    if (typeof journalEntry !== 'object' || journalEntry === null || Array.isArray(journalEntry)) {
+      return invalid('OrchestratorRequest journal entry must be { requestId, fence, digest }');
+    }
+    const entryObj = journalEntry as Record<string, unknown>;
+    if (typeof entryObj.requestId !== 'string' || entryObj.requestId !== this.record.requestId) {
+      return refusal('OrchestratorRequest caller does not hold the current claim', 'holder');
+    }
+    if (typeof entryObj.fence !== 'number' || !Number.isInteger(entryObj.fence) || entryObj.fence !== this.record.fence) {
+      return refusal('OrchestratorRequest caller does not hold the current claim', 'holder');
+    }
+    if (typeof entryObj.digest !== 'string' || !/^[0-9a-f]{64}$/.test(entryObj.digest)) {
+      return invalid('OrchestratorRequest journal entry digest must be 64 lowercase hex characters');
+    }
+    if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+      return invalid('OrchestratorRequest recorded result must be an object');
+    }
+    const resultObj = result as Record<string, unknown>;
+    const outcome = resultObj.outcome;
+    if (outcome === 'completed') {
+      const linkKey = ORCHESTRATOR_REQUEST_LINK_KEY[this.record.kind];
+      let linkedSnapshot: Record<string, unknown> | null = null;
+      if (resultObj.linked !== undefined) {
+        linkedSnapshot = readPlainObject(resultObj.linked, [linkKey, 'journalKey']);
+      } else if (typeof resultObj.linkedId === 'string') {
+        linkedSnapshot = {
+          [linkKey]: resultObj.linkedId,
+          journalKey: `request/${this.record.requestId}`,
+        };
+      }
+      if (linkedSnapshot === null) {
+        return invalid(`OrchestratorRequest linked must be null or { ${linkKey}, journalKey: request/<requestId> }`);
+      }
+      const linkedError = completeLinkedSnapshotError(this.record.kind, this.record.requestId, linkedSnapshot);
+      if (linkedError !== null) {
+        return invalid(linkedError);
+      }
+      return this.recreate(nowIso, { state: 'dispatched', linked: linkedSnapshot });
+    }
+    if (outcome === 'refused') {
+      let reasonSnapshot: Record<string, unknown> | null = null;
+      if (resultObj.reason !== undefined) {
+        reasonSnapshot = readPlainObject(resultObj.reason, ['reasonKind', 'detail']);
+      } else if (typeof resultObj.reasonKind === 'string') {
+        reasonSnapshot = {
+          reasonKind: resultObj.reasonKind,
+          detail: typeof resultObj.detail === 'string' ? resultObj.detail : null,
+        };
+      }
+      if (reasonSnapshot === null) {
+        return invalid('OrchestratorRequest reason must be null or { reasonKind, detail }');
+      }
+      const reasonError = reasonSnapshotError(reasonSnapshot);
+      if (reasonError !== null) {
+        return invalid(reasonError);
+      }
+      return this.recreate(nowIso, { state: 'refused', reason: reasonSnapshot });
+    }
+    return invalid('OrchestratorRequest recorded outcome must be completed or refused');
   }
 
   /**
@@ -998,19 +1102,19 @@ function stateShapeError(
     return null;
   }
   if (state === 'dispatched') {
-    if (claim === null || reason !== null || linked === null || deferredUntilIso !== null || claimCount > 1) {
+    if (reason !== null || linked === null || deferredUntilIso !== null || claimCount > 2) {
       return 'OrchestratorRequest fields do not match its state';
     }
-    if ((claim.fence as number) !== fence) {
+    if (claim !== null && (claim.fence as number) !== fence) {
       return 'OrchestratorRequest fields do not match its state';
     }
     return null;
   }
   if (state === 'refused') {
-    if (claim === null || reason === null || linked !== null || deferredUntilIso !== null || claimCount > 1) {
+    if (reason === null || linked !== null || deferredUntilIso !== null || claimCount > 2) {
       return 'OrchestratorRequest fields do not match its state';
     }
-    if ((claim.fence as number) !== fence) {
+    if (claim !== null && (claim.fence as number) !== fence) {
       return 'OrchestratorRequest fields do not match its state';
     }
     return null;

@@ -552,4 +552,77 @@ describe('OrchestratorRequest transitions', () => {
     expect(isOrchestratorRequestClaimable(deferred.toRecord(), '2026-10-27T10:09:59Z')).toBe(false);
     expect(isOrchestratorRequestClaimable(deferred.toRecord(), '2026-10-27T10:10:00Z')).toBe(true);
   });
+
+  it('a matching holder, fence and revision with an expired lease: complete is refused and request is unchanged; the same for refuse', () => {
+    const request = succeed(OrchestratorRequest.create(VALID));
+    const claimed = succeed(request.claim(A, '2026-10-27T10:00:10Z'));
+    const beforeState = claimed.toRecord();
+    const holder = { orchestratorId: 'orch-example-1', fence: 1, expectedRevision: 2 };
+
+    // Claim lease expires at 10:02:10. Test at 10:02:10 and later.
+    const expiredNow = '2026-10-27T10:02:15.000Z';
+
+    const completeResult = claimed.complete(holder, LINKED, expiredNow);
+    expect(completeResult.success).toBe(false);
+    if (!completeResult.success) {
+      expect(completeResult.code).toBe('lease');
+      expect(completeResult.error.message).toBe('OrchestratorRequest claim lease has expired');
+    }
+    expect(claimed.toRecord()).toEqual(beforeState);
+
+    const refuseResult = claimed.refuse(holder, REASON, expiredNow);
+    expect(refuseResult.success).toBe(false);
+    if (!refuseResult.success) {
+      expect(refuseResult.code).toBe('lease');
+      expect(refuseResult.error.message).toBe('OrchestratorRequest claim lease has expired');
+    }
+    expect(claimed.toRecord()).toEqual(beforeState);
+  });
+
+  it('applyRecordedResult reconciles a swept claim in queued and stalled states', () => {
+    const request = succeed(OrchestratorRequest.create(VALID));
+    const claimed = succeed(request.claim(A, '2026-10-27T10:00:10Z'));
+    expect(claimed.getFence()).toBe(1);
+
+    // Expire and sweep to queued (claimCount = 1, claim = null)
+    const sweptQueued = succeed(claimed.expireLapsedClaim('2026-10-27T10:02:15.000Z'));
+    expect(sweptQueued.getState()).toBe('queued');
+    expect(sweptQueued.toRecord().claim).toBeNull();
+    expect(sweptQueued.getFence()).toBe(1);
+
+    const digest = 'a'.repeat(64);
+    const journalEntry = { requestId: ID, fence: 1, digest };
+
+    // Apply completed to queued
+    const reconciledQueued = succeed(
+      sweptQueued.applyRecordedResult(
+        { outcome: 'completed', linked: LINKED },
+        journalEntry,
+        '2026-10-27T10:03:00.000Z',
+      ),
+    );
+    expect(reconciledQueued.getState()).toBe('dispatched');
+    expect(reconciledQueued.toRecord().linked).toEqual(LINKED);
+
+    // Now test stalled state (claimCount = 2, claim = null, fence = 2)
+    const stalledRecord = {
+      ...VALID,
+      state: 'stalled' as const,
+      fence: 2,
+      claimCount: 2,
+      claim: null,
+    };
+    const stalled = succeed(OrchestratorRequest.create(stalledRecord));
+    expect(stalled.getState()).toBe('stalled');
+
+    const reconciledStalled = succeed(
+      stalled.applyRecordedResult(
+        { outcome: 'refused', reason: REASON },
+        { ...journalEntry, fence: 2 },
+        '2026-10-27T10:03:00.000Z',
+      ),
+    );
+    expect(reconciledStalled.getState()).toBe('refused');
+    expect(reconciledStalled.toRecord().reason).toEqual(REASON);
+  });
 });

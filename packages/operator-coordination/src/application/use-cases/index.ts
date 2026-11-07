@@ -27,6 +27,7 @@ export * from "./profile-write-checks.js";
 export * from "./PublishProjectObservationUseCase.use-case.js";
 export * from "./ReadOwnerQuestionUseCase.use-case.js";
 export * from "./ReadProjectAttentionUseCase.use-case.js";
+export * from "./ReconcileOrchestratorRequestUseCase.use-case.js";
 export * from "./RecordAttentionItemUseCase.use-case.js";
 export * from "./RecordAuthorizationConsumptionUseCase.use-case.js";
 export * from "./RecordOwnerItemUseCase.use-case.js";

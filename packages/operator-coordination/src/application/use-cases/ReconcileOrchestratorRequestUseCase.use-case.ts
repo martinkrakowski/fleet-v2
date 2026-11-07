@@ -307,6 +307,9 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
       if (record.state === 'refused') {
         return { outcome: 'already-refused', requestId };
       }
+      if (record.state === 'stalled') {
+        return { outcome: 'unchanged', requestId };
+      }
       const reconciled = await this.reconcileFinalTransition(record, finalResult, requestId, intent.digest);
       if (!reconciled.ok) {
         return reconciled.result;
@@ -542,7 +545,8 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
         if (
           (outcome === 'completed' || outcome === 'refused') &&
           record.state !== 'dispatched' &&
-          record.state !== 'refused'
+          record.state !== 'refused' &&
+          record.state !== 'stalled'
         ) {
           // A retry may carry a different link id or reason kind than the
           // result that was recorded; the journal fields are the only ones
@@ -681,6 +685,9 @@ export class ReconcileOrchestratorRequestUseCase implements ReconcileOrchestrato
     | { ok: true; outcome: 'already-dispatched' | 'already-refused' }
     | { ok: false; result: ReconcileOrchestratorRequestResult }
   > {
+    if (record.state === 'stalled') {
+      return { ok: false, result: { outcome: 'unchanged', requestId } };
+    }
     const entityResult = OrchestratorRequest.create(record);
     if (!entityResult.success) {
       return { ok: false, result: unknown('unreadable-request', requestId) };

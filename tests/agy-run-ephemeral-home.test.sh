@@ -130,17 +130,19 @@ check 'the lane home is seeded with the host settings' '[ "$(cat "$T/settings.se
 check 'settings within the rule leave the run at 0' '[ "$(rc)" = 0 ]'
 
 echo widen > "$T/settings-mode"; run --ephemeral-home --dir "$WT" --model m
-check 'a lane that fills trustedWorkspaces fails the run (75)' '[ "$(rc)" = 75 ] && grep -q "trustedWorkspaces is not empty" "$T/e"'
+check 'a lane that fills trustedWorkspaces fails the run (6)' '[ "$(rc)" = 6 ] && grep -q "trustedWorkspaces is not empty" "$T/e"'
 check 'the failure says a lane may not widen its own permissions' 'grep -q "may not widen its own permissions" "$T/e"'
 
 echo readurl > "$T/settings-mode"; run --ephemeral-home --dir "$WT" --model m
-check 'a lane that adds read_url fails the run (75)' '[ "$(rc)" = 75 ] && grep -q "read_url appears in settings.json" "$T/e"'
+check 'a lane that adds read_url fails the run (6)' '[ "$(rc)" = 6 ] && grep -q "read_url appears in settings.json" "$T/e"'
 
 echo notobject > "$T/settings-mode"; run --ephemeral-home --dir "$WT" --model m
-check 'settings that stop being a JSON object fail the run (75)' '[ "$(rc)" = 75 ] && grep -q "not a JSON object" "$T/e"'
+check 'settings that stop being a JSON object fail the run (6)' '[ "$(rc)" = 6 ] && grep -q "not a JSON object" "$T/e"'
 
+# Superseded by Luna's re-check: deleting a SEEDED settings file is now a failure, covered below
+# together with the case where there was nothing to seed.
 echo gone > "$T/settings-mode"; run --ephemeral-home --dir "$WT" --model m
-check 'a lane that deletes its settings is not a failure' '[ "$(rc)" = 0 ]'
+check 'a lane that deletes its seeded settings fails the run' '[ "$(rc)" = 6 ]'
 
 rm -f "$T/settings-mode"
 check 'the lane home is still removed after a settings failure' '[ -z "$(ls -A "$BASE" 2>/dev/null)" ]'
@@ -176,7 +178,7 @@ printf '{"conversation_id":"cb","status":"SUCCESS","response":"ok","usage":{"tot
 FAKE
 chmod +x "$T/bin/agy"
 run --ephemeral-home --dir "$WT" --model m
-check 'a symlinked settings file fails the run (75)' '[ "$(rc)" = 75 ] && grep -q "settings file is a symlink" "$T/e"'
+check 'a symlinked settings file fails the run (6)' '[ "$(rc)" = 6 ] && grep -q "settings file is a symlink" "$T/e"'
 
 # 4. A dangling symlink at the candidate home is invisible to -e, and mkdir -p would follow it.
 cat > "$T/bin/agy" <<FAKE
@@ -202,14 +204,54 @@ check 'nothing was created through that symlink' '[ ! -e "$T/outside-home" ]'
 rm -f "$BASE"/"$hash_of_wt".*
 
 # A home left by a killed run is swept by the next run, so the sign-in does not linger.
-mkdir -p "$BASE/deadbeef.999999/.gemini/antigravity-cli"
-printf 'leftover\n' > "$BASE/deadbeef.999999/.gemini/antigravity-cli/antigravity-oauth-token"
+# The name must be one of ours (<64 hex>.<pid>), so the fixture uses that shape.
+dead_home=$BASE/$(printf 'b%.0s' $(seq 64)).999999
+mkdir -p "$dead_home/.gemini/antigravity-cli"
+printf 'leftover\n' > "$dead_home/.gemini/antigravity-cli/antigravity-oauth-token"
 run --ephemeral-home --dir "$WT" --model m
-check 'a home whose pid is gone is swept by the next run' '[ ! -e "$BASE/deadbeef.999999" ]'
+check 'a home whose pid is gone is swept by the next run' '[ ! -e "$dead_home" ]'
 mkdir -p "$BASE/livepid.$$"
 run --ephemeral-home --dir "$WT" --model m
 check 'a home whose pid is alive is left alone' '[ -d "$BASE/livepid.$$" ]'
 rm -rf "$BASE/livepid.$$"
+
+# Luna's re-check (2026-11-07): absence of a SEEDED settings file is a failure, the sweep must match
+# only our own names, a symlinked ancestor of the base is refused, and a policy failure is not 75.
+cat > "$T/bin/agy" <<FAKE
+#!/bin/sh
+rm -f "\$HOME/.gemini/antigravity-cli/settings.json"
+printf '{"conversation_id":"cd","status":"SUCCESS","response":"ok","usage":{"total_tokens":1}}'
+FAKE
+chmod +x "$T/bin/agy"
+run --ephemeral-home --dir "$WT" --model m
+check 'deleting a seeded settings file is a failure, not a pass' '[ "$(rc)" = 6 ] && grep -q "seeded settings file is gone" "$T/e"'
+check 'a settings policy failure is exit 6, not the refusal code 75' '[ "$(rc)" = 6 ]'
+
+# With nothing to seed there is no rule to check, so an absent file is not a failure.
+mv "$SEED/settings.json" "$T/settings.away"
+run --ephemeral-home --dir "$WT" --model m
+check 'with no settings to seed, an absent file is not a failure' '[ "$(rc)" = 0 ]'
+mv "$T/settings.away" "$SEED/settings.json"
+
+# The sweep takes only names of its own shape: <64 hex>.<pid>.
+cat > "$T/bin/agy" <<FAKE
+#!/bin/sh
+printf '{"conversation_id":"ce","status":"SUCCESS","response":"ok","usage":{"total_tokens":1}}'
+FAKE
+chmod +x "$T/bin/agy"
+mkdir -p "$BASE/anything.999999" "$BASE/short.999999" "$BASE/$(printf 'a%.0s' $(seq 64)).999999"
+run --ephemeral-home --dir "$WT" --model m
+check 'the sweep leaves a name that is not ours (anything.999999)' '[ -d "$BASE/anything.999999" ]'
+check 'the sweep leaves a too-short hash (short.999999)' '[ -d "$BASE/short.999999" ]'
+check 'the sweep removes a dead run of our own shape' '[ ! -e "$BASE/$(printf "a%.0s" $(seq 64)).999999" ]'
+rm -rf "$BASE/anything.999999" "$BASE/short.999999"
+
+# A symlinked ANCESTOR of the base is refused: -L on the last component alone would miss it.
+mkdir -p "$T/real-parent" "$T/parent-target"
+ln -s "$T/parent-target" "$T/real-parent/link"
+env AGY_HOME_BASE="$T/real-parent/link/homes" AGY_SEED_HOME="$SEED" "$RUNSH" "$SCRIPT" --ephemeral-home --dir "$WT" --model m > "$T/o" 2> "$T/e"; echo $? > "$T/rc"
+check 'a symlinked ancestor of the base is refused' '[ "$(rc)" = 2 ] && grep -q "symlinked ancestor" "$T/e"'
+check 'nothing was created through the ancestor symlink' '[ -z "$(ls -A "$T/parent-target" 2>/dev/null)" ]'
 
 printf '1..%s\n' "$n"
 [ "$fails" = 0 ]

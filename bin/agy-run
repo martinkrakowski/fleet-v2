@@ -57,8 +57,8 @@
 # run produced no response (an empty response is never a clean result), or agy failed; 2 usage;
 # 3 (--status) a lane is running; 4 agy reported a model or agent error (its exit 3, AGY_ERROR on
 # stderr); 5 denied actions with AGY_DENIED_IS_FAILURE=1; 75 refused, --wait gave up while a lane
-# still runs, or the lane's own settings broke the rule after the run (trustedWorkspaces empty,
-# no read_url)
+# still runs. 6: the run completed but the lane's own settings broke the rule afterwards
+# (trustedWorkspaces empty, no read_url), including a seeded settings file that was removed
 # still runs; 129/130/143 when stopped by HUP/INT/TERM.
 
 set -u
@@ -194,6 +194,7 @@ sha256_str() {
 STATE=''
 lane_home=''
 home_base=''
+seeded_settings=0
 RUN_DIR=''
 lock=''
 out=''
@@ -517,7 +518,24 @@ if [ "$ephemeral" = 1 ]; then
   if [ -L "$home_base" ]; then
     echo "agy-run: $home_base is a symlink; refusing to use it" >&2; rm -f "$lock"; exit 2
   fi
+  # -L catches only the last component, so a symlinked ANCESTOR could put the base somewhere else
+  # (Luna, 2026-11-07). Resolve the deepest EXISTING ancestor BEFORE creating anything: checking after
+  # mkdir -p would already have created the base through the symlink.
+  hb_anc=$home_base
+  while [ ! -d "$hb_anc" ]; do
+    hb_parent=$(dirname "$hb_anc")
+    [ "$hb_parent" = "$hb_anc" ] && break
+    hb_anc=$hb_parent
+  done
+  hb_anc_real=$(cd "$hb_anc" 2>/dev/null && pwd -P) || { echo "agy-run: could not resolve $hb_anc" >&2; rm -f "$lock"; exit 1; }
+  if [ "$hb_anc_real" != "$hb_anc" ]; then
+    echo "agy-run: $hb_anc resolves to $hb_anc_real (a symlinked ancestor of $home_base); refusing to use it" >&2; rm -f "$lock"; exit 2
+  fi
   ( umask 077; mkdir -p "$home_base" ) 2>/dev/null || { echo "agy-run: could not create $home_base" >&2; rm -f "$lock"; exit 1; }
+  home_base_real=$(cd "$home_base" 2>/dev/null && pwd -P) || { echo "agy-run: could not resolve $home_base" >&2; rm -f "$lock"; exit 1; }
+  if [ "$home_base_real" != "$home_base" ]; then
+    echo "agy-run: $home_base resolves to $home_base_real (a symlinked ancestor); refusing to use it" >&2; rm -f "$lock"; exit 2
+  fi
   # A dangling symlink is invisible to -e, and mkdir -p would follow it: the seeded sign-in would
   # land outside the base and cleanup would refuse to remove it (Luna, 2026-11-07).
   lane_home=$home_base/$run_hash.$$
@@ -531,8 +549,17 @@ if [ "$ephemeral" = 1 ]; then
     [ -d "$stale" ] || continue
     [ -L "$stale" ] && continue
     [ "$stale" = "$lane_home" ] && continue
-    stale_pid=${stale##*.}
+    # The name must be one of ours: 64 hex characters, a dot, then the pid. Without the prefix check
+    # an unrelated `anything.999999` under the base would be swept (Luna, 2026-11-07).
+    stale_name=${stale##*/}
+    stale_pid=${stale_name##*.}
+    stale_hash=${stale_name%.*}
     case $stale_pid in ''|*[!0-9]*) continue ;; esac
+    case $stale_hash in *[!0-9a-f]*) continue ;; esac
+    [ "${#stale_hash}" = 64 ] || continue
+    # A pid that has been reused leaves a stale home behind rather than removing a live one, which is
+    # the safe direction.
+
     kill -0 "$stale_pid" 2>/dev/null && continue
     rm -rf "$stale"
   done
@@ -557,6 +584,7 @@ if [ "$ephemeral" = 1 ]; then
   if [ -f "$seed_home/settings.json" ] && [ ! -L "$seed_home/settings.json" ]; then
     ( umask 077; cat "$seed_home/settings.json" > "$lane_home/.gemini/antigravity-cli/settings.json" ) 2>/dev/null \
       || { echo "agy-run: could not seed agy's settings into the lane home" >&2; rm -rf "$lane_home"; rm -f "$lock"; exit 1; }
+    seeded_settings=1
   fi
 fi
 
@@ -603,14 +631,22 @@ finish_run() { # $1: exit status to report; writes last in RUN_DIR via mktemp+mv
   rm -f "$lock"
 }
 
+# NOTE on `trustedWorkspaces` (Luna, 2026-11-07, held): the operator's guard treats a MISSING key and
+# `null` as empty (`s.get("trustedWorkspaces") not in (None, [])`), and this check mirrors it byte for
+# byte on purpose. Requiring exactly `[]` here would refuse runs the operator's own pre-dispatch check
+# passes, and two rules that disagree are worse than one that is loose. Change both or neither.
 # The operator's guard rule, byte for byte: a JSON object, `trustedWorkspaces` empty, and the raw
 # text free of `read_url`. Applied to the LANE's settings when the run ends, so a lane that widens
 # its own permissions is a failed run and not a silent one. No python3 is a failure, never a pass.
 settings_rule_ok() { # $1: the settings file
   # A symlink here would be judged by its target, so it is a failure, not a pass (Luna, 2026-11-07).
   [ -L "$1" ] && { echo "the lane's settings file is a symlink"; return 1; }
-  # An absent file widens nothing and agy writes it afresh next run, so it is not a failure.
-  [ -f "$1" ] || return 0
+  # Absence: when a file was SEEDED, something removed it, and a lane could do that to hide what it
+  # did during the run, so that is a failure. With nothing to seed there is no rule to check.
+  if [ ! -f "$1" ]; then
+    [ "$seeded_settings" = 1 ] && { echo "the seeded settings file is gone"; return 1; }
+    return 0
+  fi
   command -v python3 >/dev/null 2>&1 || { echo "no python3 to check the lane's settings"; return 1; }
   python3 -I -c '
 import json, sys
@@ -737,9 +773,10 @@ case "$flat" in
     [ "$status" = 0 ] && [ "${AGY_DENIED_IS_FAILURE:-0}" = 1 ] && status=5
     ;;
 esac
-# A lane that widened its own settings is a failed run, whatever else it produced (75: refused).
+# A lane that widened its own settings COMPLETED and then failed policy, which is not a refusal:
+# callers need to tell those apart, so it has its own code (6).
 if ! check_lane_settings; then
-  [ "$status" = 0 ] && status=75
+  [ "$status" = 0 ] && status=6
 fi
 clean_lane_home
 finish_run "$status"

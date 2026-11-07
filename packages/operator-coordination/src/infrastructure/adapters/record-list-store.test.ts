@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { StateFileUnreadableError } from './file-store.js';
+import { StateFileUnreadableError, StateFileUnreadableReadOnlyError } from './file-store.js';
 import { readRecordList } from './record-list-store.js';
 
 interface TestRecord {
@@ -88,5 +88,27 @@ describe('readRecordList', () => {
     expect(seen).toEqual([{ id: 'first' }, { id: '' }]);
     const copies = await fs.readdir(path.join(tempDir, 'quarantine'));
     expect(copies).toHaveLength(1);
+  });
+
+  // CO29a-ro2: a read-only read never quarantines; it throws the typed
+  // read-only unreadable error and touches nothing on disk.
+  it('read-only throws StateFileUnreadableReadOnlyError on the first invalid record and writes nothing', async () => {
+    const bytes = Buffer.from(JSON.stringify([{ id: 'first' }, { id: '' }]), 'utf8');
+    await fs.writeFile(storePath, bytes);
+    await expect(
+      readRecordList(storePath, 'TestAdapter', toTestRecord, { readOnly: true }),
+    ).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+    expect(await fs.readFile(storePath)).toEqual(bytes);
+    await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readdir(tempDir)).toEqual(['records.json']);
+  });
+
+  it('read-only still reads a valid file and a missing file as absence', async () => {
+    await expect(readRecordList(storePath, 'TestAdapter', toTestRecord, { readOnly: true })).resolves.toEqual([]);
+    const bytes = Buffer.from(JSON.stringify([{ id: 'only' }]), 'utf8');
+    await fs.writeFile(storePath, bytes);
+    await expect(readRecordList(storePath, 'TestAdapter', toTestRecord, { readOnly: true })).resolves.toEqual([
+      { id: 'only' },
+    ]);
   });
 });

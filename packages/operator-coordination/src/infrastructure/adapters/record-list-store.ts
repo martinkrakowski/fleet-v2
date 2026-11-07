@@ -3,15 +3,17 @@
  *
  * A store file must be a JSON array; the shared state-check parser validates
  * it exactly as `fleet-v2 state check` would. Unreadable bytes never become
- * readable state: the exact bytes are quarantined and a
- * StateFileUnreadableError names the reason. A missing file is known absence
+ * readable state: by default the exact bytes are quarantined and a
+ * StateFileUnreadableError names the reason. With `readOnly` the read
+ * quarantines nothing and throws StateFileUnreadableReadOnlyError instead.
+ * A missing file is known absence
  * (an empty list); any other read failure is thrown as the calling adapter's
  * "could not read" error, so a caller can always tell the two apart.
  */
 
 import { promises as fs } from 'node:fs';
 
-import { inspectRecordListBytes, quarantineUnreadable } from './file-store.js';
+import { inspectRecordListBytes, rejectUnreadableStateFile } from './file-store.js';
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -25,10 +27,21 @@ function isNotFound(error: unknown): boolean {
   );
 }
 
+export interface ReadRecordListOptions {
+  /**
+   * Read-only read (CO29a-ro2): an unreadable file is NEVER quarantined —
+   * the read throws the typed `StateFileUnreadableReadOnlyError` and touches
+   * nothing on disk. Without the option the default behaviour is unchanged:
+   * the exact bytes are quarantined and `StateFileUnreadableError` is thrown.
+   */
+  readonly readOnly?: boolean;
+}
+
 export async function readRecordList<T>(
   path: string,
   adapterName: string,
   parseRecord: (raw: unknown) => T | undefined,
+  options?: ReadRecordListOptions,
 ): Promise<T[]> {
   let buffer: Buffer;
   try {
@@ -41,7 +54,7 @@ export async function readRecordList<T>(
   }
   const inspection = inspectRecordListBytes(buffer, parseRecord);
   if (inspection.status === 'unreadable') {
-    return quarantineUnreadable(path, inspection.detail, buffer);
+    return rejectUnreadableStateFile(path, inspection.detail, buffer, options?.readOnly === true);
   }
   return [...inspection.records];
 }

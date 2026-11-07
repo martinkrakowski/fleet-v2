@@ -25,7 +25,9 @@
  * only. It writes nothing, journals nothing and mutates no worktree, and it
  * never throws on a read: unreadable records refuse the inventory, an
  * unreadable listing, runner or lease is reported `unknown` and counted,
- * never guessed (unknown is never true).
+ * never guessed (unknown is never true). CO29a-ro2: an unreadable halt
+ * marker or driver lease file makes the whole inventory answer `unknown`
+ * with `halt-unreadable` / `lease-unreadable`, never a value.
  */
 
 import type { AttemptRecord, AttemptRunnerRecord } from '../../domain/execution-records.js';
@@ -40,6 +42,7 @@ import type {
   RelaunchCloneRef,
   RelaunchConductorStatus,
   RelaunchHostInventory,
+  RelaunchInventoryUnknownReason,
   RelaunchLaneRow,
   RelaunchPopulation,
   RelaunchRecordOwnership,
@@ -147,6 +150,19 @@ function isValidRequest(request: InventoryRelaunchRequest | null | undefined): r
 
 function increment(counts: Map<string, number>, key: string, by = 1): void {
   counts.set(key, (counts.get(key) ?? 0) + by);
+}
+
+/**
+ * The typed unreadable state-file errors, recognised by their stable `name`
+ * so the application layer stays free of infrastructure imports. A read-only
+ * store read throws `StateFileUnreadableReadOnlyError`; a writable one throws
+ * `StateFileUnreadableError` after quarantining.
+ */
+function isUnreadableStateError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === 'StateFileUnreadableError' || error.name === 'StateFileUnreadableReadOnlyError')
+  );
 }
 
 /** The listing facts of the requested clones, per host. */
@@ -272,9 +288,13 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     const hostNames = new Set<string>(clones.map((clone) => clone.hostName));
     const hosts = [...hostNames].sort(byCodeUnit).map((hostName) => hostInventory(hostName, rows, listing));
 
-    // 7. Conductor status. An unreadable halt marker reads as halted; an
-    //    unreadable lease is unknown, never absent.
-    const conductor = await this.readConductor(request.nowIso, runs.length);
+    // 7. Conductor status. An unreadable halt marker or driver lease is never
+    //    a value (unknown is never true): the inventory answers `unknown`
+    //    with the reason code instead of reporting halted or absent.
+    const { conductor, unknownReasons } = await this.readConductor(request.nowIso, runs.length);
+    if (unknownReasons.length > 0) {
+      return { outcome: 'unknown', reasons: unknownReasons };
+    }
     const riskFlags: RelaunchRiskFlag[] = [];
     if (conductor.halted) riskFlags.push({ code: 'conductor-halted', count: 1 });
     if (conductor.driverLease === 'live') riskFlags.push({ code: 'driver-lease-live', count: 1 });
@@ -497,11 +517,19 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     row.ownership = 'none';
   }
 
-  private async readConductor(nowIso: string, runCount: number): Promise<RelaunchConductorStatus> {
+  private async readConductor(
+    nowIso: string,
+    runCount: number,
+  ): Promise<{ conductor: RelaunchConductorStatus; unknownReasons: RelaunchInventoryUnknownReason[] }> {
     const deps = this.deps;
+    const unknownReasons: RelaunchInventoryUnknownReason[] = [];
     let halted = true;
     try {
-      if (deps !== undefined) halted = isConductorHalted(await deps.halt.read());
+      if (deps !== undefined) {
+        const state = await deps.halt.read();
+        halted = isConductorHalted(state);
+        if (state.state === 'unreadable') unknownReasons.push('halt-unreadable');
+      }
     } catch {
       halted = true;
     }
@@ -511,9 +539,10 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
         const lease = await deps.driverLease.read();
         driverLease = lease === null ? 'absent' : isLeaseLapsed(lease, nowIso) ? 'lapsed' : 'live';
       }
-    } catch {
+    } catch (error: unknown) {
       driverLease = 'unknown';
+      if (isUnreadableStateError(error)) unknownReasons.push('lease-unreadable');
     }
-    return { halted, driverLease, runCount };
+    return { conductor: { halted, driverLease, runCount }, unknownReasons };
   }
 }

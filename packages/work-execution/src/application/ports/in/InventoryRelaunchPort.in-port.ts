@@ -109,13 +109,16 @@ export interface RelaunchHostInventory {
 
 /** The conductor's status, as the inventory reads it. */
 export interface RelaunchConductorStatus {
-  /** The halt marker; an unreadable marker reads as halted. */
+  /** The halt marker; the inventory answers `unknown` when the marker's bytes are unreadable. */
   readonly halted: boolean;
   /** The driver lease: absent, lapsed or live; unknown when the read throws. */
   readonly driverLease: 'absent' | 'lapsed' | 'live' | 'unknown';
   /** The recorded lane runs. */
   readonly runCount: number;
 }
+
+/** The conductor status unknowns the inventory reports (CO29a-ro2). */
+export type RelaunchInventoryUnknownReason = 'halt-unreadable' | 'lease-unreadable';
 
 export type InventoryRelaunchResult =
   | {
@@ -130,7 +133,15 @@ export type InventoryRelaunchResult =
    * run, attempt or profile records could not be read, so no population can
    * be told; the inventory is refused rather than guessed.
    */
-  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'records-unreadable' };
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'records-unreadable' }
+  /**
+   * CO29a-ro2: the conductor's state cannot be told — `halt-unreadable` when
+   * the halt marker's bytes are unreadable, `lease-unreadable` when the
+   * driver lease file's bytes are unreadable. Unknown is never a value: the
+   * inventory reports it instead of reading a corrupt file as halted or
+   * absent, and the relaunch plan takes `unknown` from it.
+   */
+  | { readonly outcome: 'unknown'; readonly reasons: readonly RelaunchInventoryUnknownReason[] };
 
 export interface InventoryRelaunchPort {
   inventoryRelaunch(request: InventoryRelaunchRequest): Promise<InventoryRelaunchResult>;

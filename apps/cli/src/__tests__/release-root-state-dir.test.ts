@@ -146,6 +146,52 @@ describe('release root state directory binding', () => {
     expect(resolveReleaseRootStateDir(releaseRoot, undefined)).toBeNull();
   });
 
+  it('a cliPath that traverses out of the root with .. is refused', () => {
+    const traversal: FleetInstallation = {
+      ...installationWithDriverStateDir('/state', '/srv/fleet/releases'),
+      daemon: {
+        stateDir: '/state',
+        nodePath: '/x',
+        cliPath: '/srv/fleet/releases/current/../../other/current/apps/cli/bin.js',
+        unitDir: '/x',
+        installationFile: '/x',
+      },
+    };
+    expect(resolveReleaseRootStateDir('/srv/fleet/releases', traversal)).toBeNull();
+    const served = installationWithDriverStateDir('/state', '/srv/fleet/releases');
+    expect(resolveReleaseRootStateDir('/srv/fleet/releases/../releases', served)).toBeNull();
+    expect(resolveReleaseRootStateDir('/srv/fleet/./releases', served)).toBeNull();
+    expect(resolveReleaseRootStateDir('/srv/fleet/releases', served)).toBe('/state');
+  });
+
+  it('a sibling directory that only shares the name prefix is refused', () => {
+    const served = installationWithDriverStateDir('/state', '/srv/fleet/releases');
+    expect(resolveReleaseRootStateDir('/srv/fleet/releases-old', served)).toBeNull();
+    const old = installationWithDriverStateDir('/state', '/srv/fleet/releases-old');
+    expect(resolveReleaseRootStateDir('/srv/fleet/releases', old)).toBeNull();
+  });
+
+  it('a symlinked current pointing into another root is refused', async () => {
+    const otherRoot = path.join(tempDir, 'other');
+    await fs.mkdir(path.join(otherRoot, 'build', 'apps', 'cli', 'dist'), { recursive: true });
+    await fs.writeFile(path.join(otherRoot, 'build', 'apps', 'cli', 'dist', 'bin.js'), '// cli\n');
+    await fs.mkdir(releaseRoot, { recursive: true });
+    await fs.symlink(path.join(otherRoot, 'build'), path.join(releaseRoot, 'current'));
+    const stateA = path.join(tempDir, 'state-a');
+    const rt = createFleetCliRuntime({
+      stateDir: stateA,
+      installation: installationWithDriverStateDir(stateA, releaseRoot),
+    });
+    // Lexically the entry point is under the root; really it is under another root.
+    expect(resolveReleaseRootStateDir(releaseRoot, installationWithDriverStateDir(stateA, releaseRoot))).toBe(stateA);
+    const { code, out } = await runRelease(
+      ['swap', '--root', releaseRoot, '--sha', SHA, '--project', PROJECT, '--apply'],
+      rt,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+  });
+
   it('an absolute root this installation does not serve is refused', async () => {
     const stateA = path.join(tempDir, 'state-a');
     const otherRoot = path.join(tempDir, 'someone-elses-releases');

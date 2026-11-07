@@ -30,6 +30,8 @@ import {
   type ReleaseStorePort,
 } from '@fleet/work-execution';
 
+import { lstat, realpath } from 'node:fs/promises';
+
 import type { FleetInstallation } from '@fleet/installation';
 import { CliUsageError } from './commands/payload.js';
 import type { CommandHandler, Payload } from './commands/payload.js';
@@ -143,9 +145,70 @@ export function resolveReleaseRootStateDir(
   // The installation serves one release root: the one its driver entry point
   // (`daemon.cliPath`) runs from, `<root>/current/...`. Any other root is not
   // served by this driver, so its lease is not this state directory's lease.
+  // Compared segment by segment (never a string prefix), and only for plain
+  // absolute paths: a `.`, `..` or empty segment binds nothing.
   const cliPath = daemon?.cliPath;
-  const served = root.endsWith('/') ? root : `${root}/`;
-  return typeof cliPath === 'string' && cliPath.startsWith(`${served}current/`) ? stateDir : null;
+  if (typeof cliPath !== 'string') {
+    return null;
+  }
+  const rootSegments = plainAbsoluteSegments(root, true);
+  const cliSegments = plainAbsoluteSegments(cliPath, false);
+  if (rootSegments === null || cliSegments === null || cliSegments.length <= rootSegments.length + 1) {
+    return null;
+  }
+  const underRoot = rootSegments.every((segment, index) => cliSegments[index] === segment);
+  return underRoot && cliSegments[rootSegments.length] === 'current' ? stateDir : null;
+}
+
+/** The segments of an absolute path with no `.`, `..` or empty segment; null otherwise. */
+function plainAbsoluteSegments(value: string, allowTrailingSlash: boolean): string[] | null {
+  if (!value.startsWith('/')) {
+    return null;
+  }
+  const parts = value.slice(1).split('/');
+  if (allowTrailingSlash && parts.length > 1 && parts[parts.length - 1] === '') {
+    parts.pop();
+  }
+  return parts.every((part) => part !== '' && part !== '.' && part !== '..') ? parts : null;
+}
+
+/**
+ * Symlink check at the CLI boundary: when the driver entry point exists, its
+ * real path must lie inside the real release root, segment by segment. A
+ * `realpath` failure other than "does not exist" refuses; the raw path is
+ * never trusted in its place.
+ */
+async function servedRootIsReal(root: string, cliPath: string): Promise<boolean> {
+  let realCli: string;
+  try {
+    realCli = await realpath(cliPath);
+  } catch (error) {
+    // Nothing exists at the entry point yet: there is no link to follow.
+    return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT' ? await lexicallyAbsent(cliPath) : false;
+  }
+  try {
+    const realRoot = await realpath(root);
+    const rootSegments = plainAbsoluteSegments(realRoot, true);
+    const cliSegments = plainAbsoluteSegments(realCli, false);
+    return (
+      rootSegments !== null &&
+      cliSegments !== null &&
+      cliSegments.length > rootSegments.length &&
+      rootSegments.every((segment, index) => cliSegments[index] === segment)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** ENOENT on the entry point is only believed when no ancestor is a dangling or foreign link. */
+async function lexicallyAbsent(cliPath: string): Promise<boolean> {
+  try {
+    await lstat(cliPath);
+    return false; // exists as a dangling link: the link target is unknown, refuse
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT';
+  }
 }
 
 function releaseHandler(action: ReleaseAction): CommandHandler {
@@ -155,7 +218,8 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     }
     const request = parseRequest({ ...payload, action });
     const stateDir = resolveReleaseRootStateDir(request.root, rt.installation);
-    if (stateDir === null) {
+    const cliPath = rt.installation?.daemon?.cliPath;
+    if (stateDir === null || typeof cliPath !== 'string' || !(await servedRootIsReal(request.root, cliPath))) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' };
     }
     return manageReleaseFromPayload(

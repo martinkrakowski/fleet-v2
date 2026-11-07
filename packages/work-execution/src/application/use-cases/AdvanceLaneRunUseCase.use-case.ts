@@ -95,7 +95,7 @@ import {
   performDispatch,
   performPrepare,
 } from './advance-lane-run/prepare-dispatch.js';
-import { performCancel, performStop } from './advance-lane-run/stop-cancel.js';
+import { abandonAmbiguousIntentForStop, performCancel, performStop } from './advance-lane-run/stop-cancel.js';
 import { performCollect, performGate } from './advance-lane-run/collect-gate.js';
 import { performReconcile } from './advance-lane-run/reconcile.js';
 import { performReview } from './advance-lane-run/review-fix.js';
@@ -324,7 +324,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'waiting', reason: 'facts-inconsistent' };
     }
 
-    const gathered = await gatherFacts(this.ctx, record, entries, request, journalState);
+    let gathered = await gatherFacts(this.ctx, record, entries, request, journalState);
     let decisionRecord: LaneRunRecord = record;
     // A parked run whose notice did not land re-raises it under its saved park
     // key on every advance until it lands. For an owner-question reason the
@@ -354,7 +354,15 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       decisionRecord = fresh;
     }
-    const decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    let decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    const abandoned = await abandonAmbiguousIntentForStop(this.ctx, decisionRecord, gathered, decision, request);
+    if (abandoned.kind === 'refused') {
+      return abandoned.result;
+    }
+    if (abandoned.kind === 'resolved') {
+      gathered = abandoned.gathered;
+      decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    }
     return this.performDecision(decisionRecord, gathered, decision, request);
   }
 

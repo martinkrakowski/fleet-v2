@@ -14,20 +14,28 @@
  * its dependencies writes.
  */
 
-import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
-import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
-import type { LaneRunRecord } from '../../domain/lane-run-records.js';
-import { LANE_RUN_ID_PATTERN, LANE_RUN_PARK_REASONS } from '../../domain/lane-run-records.js';
-import type { LaneRunKeyStep, LaneRunParkReason, LaneRunTier } from '../../domain/lane-run-records.js';
 import {
   LANE_RUN_JOURNAL_ENTRY_KINDS,
   LANE_RUN_JOURNAL_OUTCOMES,
   LANE_RUN_JOURNAL_REASON_CODE_PATTERN,
+  laneRunJournalPendingIntent,
+  laneRunJournalState,
+  laneRunJournalStopFacts,
 } from '../../domain/lane-run-journal.js';
-import type { LaneRunJournalEntryKind, LaneRunJournalOutcome } from '../../domain/lane-run-journal.js';
-import { laneRunJournalPendingIntent, laneRunJournalState, laneRunJournalStopFacts } from '../../domain/lane-run-journal.js';
-import { parseLaneRunKey } from '../../domain/lane-run-keys.js';
-import { LANE_RUN_STOP_KEY_MODES } from '../../domain/lane-run-keys.js';
+import type {
+  LaneRunJournalEntryKind,
+  LaneRunJournalEntryRecord,
+  LaneRunJournalOutcome,
+} from '../../domain/lane-run-journal.js';
+import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
+import { LANE_RUN_ID_PATTERN, LANE_RUN_PARK_REASONS } from '../../domain/lane-run-records.js';
+import type {
+  LaneRunKeyStep,
+  LaneRunParkReason,
+  LaneRunRecord,
+  LaneRunTier,
+} from '../../domain/lane-run-records.js';
+import { LANE_RUN_STOP_KEY_MODES, parseLaneRunKey } from '../../domain/lane-run-keys.js';
 import type { LaneRunStopKeyMode, ParsedLaneRunKey } from '../../domain/lane-run-keys.js';
 import { LANE_RUN_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
@@ -323,7 +331,7 @@ function assertDense<T>(arr: readonly T[]): void {
 }
 
 /** Strict decimal integer parse: a digit string or a safe integer in 1..max; undefined is max. */
-const DECIMAL_INT_PATTERN = /^(?:0|[1-9][0-9]{0,5})$/;
+const DECIMAL_INT_PATTERN = /^(?:0|[1-9]\d{0,5})$/;
 
 function parseBoundedLimit(value: unknown, max: number): number | null {
   if (value === undefined) {
@@ -358,7 +366,8 @@ function latestTraceOf(
   }
   if (traceList.outcome === 'listed') {
     const traces = traceList.traces;
-    return traces.length >= 1 ? { ok: true, record: traces[traces.length - 1]! } : null;
+    const newest = traces.at(-1);
+    return newest === undefined ? null : { ok: true, record: newest };
   }
   return traceList.reason === 'unknown-schema-version'
     ? { ok: false, reason: 'unknown-schema-version' }
@@ -366,7 +375,10 @@ function latestTraceOf(
 }
 
 function byCodeUnit(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  if (left < right) {
+    return -1;
+  }
+  return left > right ? 1 : 0;
 }
 
 /** Map a parsed key kind to the wire key kind; premerge and merge-enqueue are step keys. */
@@ -389,63 +401,56 @@ function wireKeyKindOf(parsed: ParsedLaneRunKey): LaneRunWireKeyKind {
   }
 }
 
+function failIf(condition: boolean, tag: string): void {
+  if (condition) {
+    throw new TypeError(tag);
+  }
+}
+
+function isStringOrNull(value: unknown): boolean {
+  return value === null || typeof value === 'string';
+}
+
+function isSecretShapedString(value: unknown): boolean {
+  return typeof value === 'string' && hasAnySecretShape(value);
+}
+
+/** Fail closed on a malformed entry shape, kind, entry id, key, run id or timestamp. */
+function validateJournalEntryIdentity(entry: LaneRunJournalEntryRecord): void {
+  failIf(typeof entry !== 'object' || entry === null || Array.isArray(entry), 'malformed-journal-entry');
+  failIf(!LANE_RUN_JOURNAL_ENTRY_KINDS.includes(entry.kind as LaneRunJournalEntryKind), 'unknown-journal-kind');
+  failIf(typeof entry.entryId !== 'string' || hasAnySecretShape(entry.entryId), 'bad-entry-id');
+  failIf(!isStringOrNull(entry.key), 'bad-key');
+  failIf(isSecretShapedString(entry.key), 'secret-key');
+  failIf(!isStringOrNull(entry.runId), 'bad-run-id');
+  failIf(isSecretShapedString(entry.runId), 'secret-run-id');
+  failIf(typeof entry.recordedAtIso !== 'string', 'bad-timestamp');
+}
+
+/** Fail closed on an unknown enum, a wrong-typed text slot or a secret-shaped reason or detail. */
+function validateJournalEntryFacts(entry: LaneRunJournalEntryRecord): void {
+  failIf(entry.mode !== null && !LANE_RUN_STOP_KEY_MODES.includes(entry.mode as LaneRunStopKeyMode), 'bad-mode');
+  failIf(entry.expectedRevision !== null && !Number.isSafeInteger(entry.expectedRevision), 'bad-revision');
+  failIf(
+    entry.outcome !== null && !LANE_RUN_JOURNAL_OUTCOMES.includes(entry.outcome as LaneRunJournalOutcome),
+    'unknown-outcome',
+  );
+  failIf(!isStringOrNull(entry.reasonCode), 'bad-reason');
+  failIf(isSecretShapedString(entry.reasonCode), 'secret-reason');
+  failIf(!isStringOrNull(entry.detail), 'bad-detail');
+  failIf(isSecretShapedString(entry.detail), 'secret-detail');
+  failIf(!isStringOrNull(entry.grantId), 'bad-grant');
+  failIf(entry.state !== null && !LANE_RUN_STATES.includes(entry.state as LaneRunStateValue), 'unknown-state');
+}
+
 /**
  * Project one stored journal entry to its wire view. Fails closed (throws) on
  * sparse, wrong-typed or unknown-enum slots and on secret-shaped key, entryId,
  * runId, reasonCode or detail.
  */
 function projectJournalEntry(entry: LaneRunJournalEntryRecord): LaneRunJournalWireEntry {
-  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
-    throw new Error('malformed-journal-entry');
-  }
-  if (!LANE_RUN_JOURNAL_ENTRY_KINDS.includes(entry.kind as LaneRunJournalEntryKind)) {
-    throw new Error('unknown-journal-kind');
-  }
-  if (typeof entry.entryId !== 'string' || hasAnySecretShape(entry.entryId)) {
-    throw new Error('bad-entry-id');
-  }
-  if (entry.key !== null && typeof entry.key !== 'string') {
-    throw new Error('bad-key');
-  }
-  if (typeof entry.key === 'string' && hasAnySecretShape(entry.key)) {
-    throw new Error('secret-key');
-  }
-  if (entry.runId !== null && typeof entry.runId !== 'string') {
-    throw new Error('bad-run-id');
-  }
-  if (typeof entry.runId === 'string' && hasAnySecretShape(entry.runId)) {
-    throw new Error('secret-run-id');
-  }
-  if (typeof entry.recordedAtIso !== 'string') {
-    throw new Error('bad-timestamp');
-  }
-  if (entry.mode !== null && !LANE_RUN_STOP_KEY_MODES.includes(entry.mode as LaneRunStopKeyMode)) {
-    throw new Error('bad-mode');
-  }
-  if (entry.expectedRevision !== null && !Number.isSafeInteger(entry.expectedRevision)) {
-    throw new Error('bad-revision');
-  }
-  if (entry.outcome !== null && !LANE_RUN_JOURNAL_OUTCOMES.includes(entry.outcome as LaneRunJournalOutcome)) {
-    throw new Error('unknown-outcome');
-  }
-  if (entry.reasonCode !== null && typeof entry.reasonCode !== 'string') {
-    throw new Error('bad-reason');
-  }
-  if (typeof entry.reasonCode === 'string' && hasAnySecretShape(entry.reasonCode)) {
-    throw new Error('secret-reason');
-  }
-  if (entry.detail !== null && typeof entry.detail !== 'string') {
-    throw new Error('bad-detail');
-  }
-  if (typeof entry.detail === 'string' && hasAnySecretShape(entry.detail)) {
-    throw new Error('secret-detail');
-  }
-  if (entry.grantId !== null && typeof entry.grantId !== 'string') {
-    throw new Error('bad-grant');
-  }
-  if (entry.state !== null && !LANE_RUN_STATES.includes(entry.state as LaneRunStateValue)) {
-    throw new Error('unknown-state');
-  }
+  validateJournalEntryIdentity(entry);
+  validateJournalEntryFacts(entry);
   let keyKind: LaneRunWireKeyKind | null = null;
   let step: LaneRunKeyStep | null = null;
   if (entry.key !== null) {
@@ -545,7 +550,7 @@ function lastQualifierResult(
       continue;
     }
     const parsed = parseLaneRunKey(entry.key);
-    if (parsed === null || parsed.kind !== 'step' || parsed.step !== qualifier) {
+    if (parsed?.kind !== 'step' || parsed.step !== qualifier) {
       continue;
     }
     last = entry;
@@ -556,7 +561,7 @@ function lastQualifierResult(
 /** The fixed refusal detail of a `step-refused` park (GB3a): its last qualifier result's token, if usable. */
 function parkRefusalDetailOf(record: LaneRunRecord, entries: readonly LaneRunJournalEntryRecord[]): string | null {
   const parked = record.parked;
-  if (parked === null || parked.reason !== 'step-refused' || parked.qualifier === null) {
+  if (parked?.reason !== 'step-refused' || parked.qualifier === null) {
     return null;
   }
   const last = lastQualifierResult(record, entries, parked.qualifier);
@@ -639,6 +644,7 @@ function buildLaneRunWireCard(
       findingCount: p.reason === 'blocker-after-round-2' && Array.isArray(p.findings) ? p.findings.length : null,
     };
   }
+  const latestAttemptId = record.attemptIds.at(-1);
   const dryRunEntries = entries.filter((entry) => entry.kind === 'result' && entry.outcome === 'dry-run');
   const wouldActTruncated = dryRunEntries.length > MAX_WOULD_ACT_PER_RUN;
   const wouldAct = dryRunEntries.slice(-MAX_WOULD_ACT_PER_RUN).map(wouldActSummaryOf);
@@ -660,7 +666,7 @@ function buildLaneRunWireCard(
     stopMode: stopFacts.stopMode,
     stopRequestedAtIso: stopFacts.stopRequestedAtIso,
     pendingIntent: pending === null ? null : { step: pending.step, reconciliation: pending.reconciliation },
-    latestAttemptId: record.attemptIds.length === 0 ? null : idOrInvalid(record.attemptIds[record.attemptIds.length - 1]),
+    latestAttemptId: latestAttemptId === undefined ? null : idOrInvalid(latestAttemptId),
     attemptCount: record.attemptIds.length,
     lease,
     wouldAct,
@@ -673,21 +679,32 @@ interface BoardRequestParsed {
   readonly limit: number;
 }
 
+function requireRunId(value: unknown): string {
+  if (typeof value !== 'string' || !LANE_RUN_ID_PATTERN.test(value) || hasAnySecretShape(value)) {
+    throw new TypeError('invalid-request');
+  }
+  return value;
+}
+
+/** The one optional bounded limit of a query record, under `keyName`, or the default maximum. */
+function readLimitQuery(query: unknown, keyName: 'limit' | 'journalLimit', max: number): number {
+  const querySnapshot = readPlainRecordWithOptionalKeys(query === undefined ? {} : query, [], [keyName]);
+  if (querySnapshot === null) {
+    throw new TypeError('invalid-request');
+  }
+  const limit = parseBoundedLimit(querySnapshot[keyName], max);
+  if (limit === null) {
+    throw new TypeError('invalid-request');
+  }
+  return limit;
+}
+
 function parseBoardRequest(request: unknown): BoardRequestParsed {
   const snapshot = readPlainRecordWithOptionalKeys(request, ['nowIso'], ['query']);
   if (snapshot === null || typeof snapshot.nowIso !== 'string' || !isZonedIsoDateTime(snapshot.nowIso)) {
     throw new Error('invalid-request');
   }
-  const queryInput = snapshot.query === undefined ? {} : snapshot.query;
-  const querySnapshot = readPlainRecordWithOptionalKeys(queryInput, [], ['limit']);
-  if (querySnapshot === null) {
-    throw new Error('invalid-request');
-  }
-  const limit = parseBoundedLimit(querySnapshot.limit, MAX_LANE_RUN_CARDS);
-  if (limit === null) {
-    throw new Error('invalid-request');
-  }
-  return { nowIso: snapshot.nowIso, limit };
+  return { nowIso: snapshot.nowIso, limit: readLimitQuery(snapshot.query, 'limit', MAX_LANE_RUN_CARDS) };
 }
 
 interface RunRequestParsed {
@@ -701,23 +718,12 @@ function parseRunRequest(request: unknown): RunRequestParsed {
   if (snapshot === null) {
     throw new Error('invalid-request');
   }
-  const { runId, nowIso } = snapshot;
-  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId) || hasAnySecretShape(runId)) {
-    throw new Error('invalid-request');
-  }
+  const runId = requireRunId(snapshot.runId);
+  const { nowIso } = snapshot;
   if (typeof nowIso !== 'string' || !isZonedIsoDateTime(nowIso)) {
-    throw new Error('invalid-request');
+    throw new TypeError('invalid-request');
   }
-  const queryInput = snapshot.query === undefined ? {} : snapshot.query;
-  const querySnapshot = readPlainRecordWithOptionalKeys(queryInput, [], ['journalLimit']);
-  if (querySnapshot === null) {
-    throw new Error('invalid-request');
-  }
-  const journalLimit = parseBoundedLimit(querySnapshot.journalLimit, MAX_RUN_JOURNAL_ENTRIES);
-  if (journalLimit === null) {
-    throw new Error('invalid-request');
-  }
-  return { runId, nowIso, journalLimit };
+  return { runId, nowIso, journalLimit: readLimitQuery(snapshot.query, 'journalLimit', MAX_RUN_JOURNAL_ENTRIES) };
 }
 
 interface JournalForRunRequestParsed {
@@ -730,20 +736,10 @@ function parseJournalForRunRequest(request: unknown): JournalForRunRequestParsed
   if (snapshot === null) {
     throw new Error('invalid-request');
   }
-  const { runId } = snapshot;
-  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId) || hasAnySecretShape(runId)) {
-    throw new Error('invalid-request');
-  }
-  const queryInput = snapshot.query === undefined ? {} : snapshot.query;
-  const querySnapshot = readPlainRecordWithOptionalKeys(queryInput, [], ['limit']);
-  if (querySnapshot === null) {
-    throw new Error('invalid-request');
-  }
-  const limit = parseBoundedLimit(querySnapshot.limit, MAX_RUN_JOURNAL_ENTRIES);
-  if (limit === null) {
-    throw new Error('invalid-request');
-  }
-  return { runId, limit };
+  return {
+    runId: requireRunId(snapshot.runId),
+    limit: readLimitQuery(snapshot.query, 'limit', MAX_RUN_JOURNAL_ENTRIES),
+  };
 }
 
 interface JournalByKeyRequestParsed {
@@ -831,7 +827,7 @@ export class LaneRunBoardReads {
     assertDense(reservations);
     assertDense(attempts);
     assertDense(orders);
-    if (traceList !== undefined && traceList.outcome === 'listed') {
+    if (traceList?.outcome === 'listed') {
       assertDense(traceList.traces);
     }
     const journals = await journalsForRuns(deps.runJournal, runs.map((run) => run.runId));

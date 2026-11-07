@@ -52,6 +52,7 @@ const ENVELOPE_MARKERS: readonly string[] = [
   "evidenceResponse(",
   "projectWriteHandler(",
   "ownedSessionRoute(",
+  "respondRunRead(",
 ];
 
 function methodFromFileName(fileName: string): string {

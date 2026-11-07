@@ -63,7 +63,7 @@ import {
   InventoryRelaunchUseCase,
   PlanRelaunchUseCase,
   RelaunchPlanRepositoryAdapter,
-  type LanePlanRepositoryAdapter,
+  LanePlanRepositoryAdapter,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
   OpencodeApiUsageAdapter,
@@ -1142,13 +1142,21 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
 
   // CO29a: the ordered relaunch plan reads the inventory and the same record
   // stores, and stores one immutable plan by digest (relaunch-plans.json).
+  // The plan is strictly read-only over the record stores, so it composes
+  // read-only instances: an unreadable state file is a read error (mapped to
+  // `unknown`) and never a quarantine write. planRepo stays the one allowed
+  // write. inventoryRelaunch (CO26) still shares the writable composition.
+  const relaunchRunRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
+  const relaunchAttemptRepo = new AttemptRepositoryAdapter({ stateDir, readOnly: true });
+  const relaunchWorkOrderRepo = new WorkOrderRepositoryAdapter({ stateDir, readOnly: true });
+  const relaunchLanePlanRepo = new LanePlanRepositoryAdapter({ stateDir, readOnly: true });
   const relaunchPlanRepository = new RelaunchPlanRepositoryAdapter({ stateDir });
   const planRelaunch = new PlanRelaunchUseCase({
     inventory: inventoryRelaunch,
-    runRepo: conductor.laneRunRepository,
-    attemptRepo: attemptRepository,
-    workOrderRepo: workOrderRepository,
-    lanePlanRepo: execution.lanePlanRepository,
+    runRepo: relaunchRunRepo,
+    attemptRepo: relaunchAttemptRepo,
+    workOrderRepo: relaunchWorkOrderRepo,
+    lanePlanRepo: relaunchLanePlanRepo,
     planRepo: relaunchPlanRepository,
     computeDigest: sha256HexDigest,
     clock: () => new Date().toISOString(),

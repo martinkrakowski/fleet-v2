@@ -210,6 +210,12 @@ function capture(): Captured {
   return { out, err, stdout: (text) => out.push(text), stderr: (text) => err.push(text) };
 }
 
+/** Every file and directory name under the state dir (recursive), sorted: the plan's on-disk footprint. */
+async function snapshotState(dir: string): Promise<string[]> {
+  const names = await fs.readdir(dir, { recursive: true });
+  return names.sort((a, b) => a.localeCompare(b));
+}
+
 async function plan(
   runtime: FleetCliRuntime,
   ...flags: string[]
@@ -381,6 +387,39 @@ describe('relaunch plan (production composition)', () => {
     const result = await plan(bare);
     expect(result.code).toBe(1);
     expect(result.result).toEqual({ outcome: 'unknown', reasons: ['unknown-worktree-read'] });
+    await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('exits 1 with unknown on an unreadable record store and quarantines nothing (CO29a fix round 2)', async () => {
+    const fx = await seededFixture();
+    // The corrupt work-order store: bytes no reader accepts. work-orders.json is
+    // read only by the plan (the CO26 inventory reads the lane-run stores), so
+    // this reaches the plan's own reads: they are read-only, so answering
+    // unknown must quarantine nothing and touch no file (no quarantine
+    // directory, no rewritten store file, no plan).
+    await fs.writeFile(path.join(fx.stateDir, 'work-orders.json'), '{broken CANARY-bytes', 'utf8');
+    const before = await snapshotState(fx.stateDir);
+
+    const result = await plan(fx.runtime);
+
+    expect(result.code).toBe(1);
+    expect(result.result).toEqual({ outcome: 'unknown', reasons: ['store-read-failed'] });
+    await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const after = await snapshotState(fx.stateDir);
+    expect(after).toEqual(before);
+  });
+
+  it('exits 1 with unknown on an unreadable lane-runs.json before any plan read (CO26 inventory shares the writable composition)', async () => {
+    const fx = await seededFixture();
+    // With an unreadable lane-run store the embedded CO26 inventory refuses
+    // first (it still reads the writable composition and may quarantine), and
+    // the plan maps that refusal to unknown without planning anything.
+    await fs.writeFile(path.join(fx.stateDir, 'lane-runs.json'), '{broken CANARY-bytes', 'utf8');
+
+    const result = await plan(fx.runtime);
+
+    expect(result.code).toBe(1);
+    expect(result.result).toEqual({ outcome: 'unknown', reasons: ['inventory-records-unreadable'] });
     await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 

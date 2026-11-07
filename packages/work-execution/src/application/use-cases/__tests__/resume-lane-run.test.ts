@@ -262,6 +262,60 @@ describe('ResumeLaneRunUseCase requestResume', () => {
     ).toEqual({ outcome: 'refused', reason: 'one-way-door' });
     expect(await fx.journal.listForRun(RUN_ID)).toHaveLength(1);
   });
+
+  it('acts on validated values and refuses altered ones when the request object is mutated after validation during awaits', async () => {
+    const fx = await seededParked();
+    const originalGet = fx.repo.get.bind(fx.repo);
+
+    // Case 1: Caller validates a request with stale revision (1) and mutates expectedRevision to
+    // matching revision (2) during await to attempt bypassing the stale-revision refusal.
+    const staleRequest = {
+      runId: RUN_ID,
+      via: 'cli' as const,
+      expectedRevision: 1,
+      entryId: ENTRY_1,
+      nowIso: NOW,
+    };
+    fx.repo.get = async (id: string) => {
+      (staleRequest as { expectedRevision?: number }).expectedRevision = 2;
+      (staleRequest as { via: string }).via = 'web';
+      (staleRequest as { runId: string }).runId = 'run-01JB9999999999999999999999';
+      return originalGet(id);
+    };
+
+    const staleResult = await fx.resume.requestResume(staleRequest);
+    expect(staleResult).toEqual({ outcome: 'refused', reason: 'stale-revision' });
+
+    // Case 2: Caller validates a request with valid revision (2) and mutates expectedRevision to
+    // stale revision (1) or different via during await: use case still acts on validated values and succeeds.
+    const validRequest = {
+      runId: RUN_ID,
+      via: 'cli' as const,
+      expectedRevision: 2,
+      entryId: ENTRY_2,
+      nowIso: NOW,
+    };
+    fx.repo.get = async (id: string) => {
+      (validRequest as { expectedRevision?: number }).expectedRevision = 1;
+      (validRequest as { via: string }).via = 'web';
+      (validRequest as { runId: string }).runId = 'run-01JB9999999999999999999999';
+      return originalGet(id);
+    };
+
+    const validResult = await fx.resume.requestResume(validRequest);
+    expect(validResult).toEqual({
+      outcome: 'resume-recorded',
+      runId: RUN_ID,
+      to: 'gating',
+      key: RESUME_CLI_KEY,
+    });
+    const entries = await fx.journal.listForRun(RUN_ID);
+    const intent = entries.find((e) => e.kind === 'intent' && e.key === RESUME_CLI_KEY);
+    expect(intent).toMatchObject({
+      expectedRevision: 2,
+      runId: RUN_ID,
+    });
+  });
 });
 
 describe('ResumeLaneRunUseCase applyPendingResume', () => {
@@ -804,5 +858,52 @@ describe('ResumeLaneRunUseCase PT1b3a ambiguous intent', () => {
     expect(await fx.resume.requestResume(good as Parameters<ResumeLaneRunUseCase['requestResume']>[0])).toMatchObject({
       outcome: 'resume-recorded',
     });
+  });
+
+  it('acts on validated values and refuses altered ones when the request object is mutated after validation during awaits', async () => {
+    // Case 1: Caller validates an apply with an unauthorized lease and mutates to the authorized lease
+    // during await to attempt bypassing the lease check: use case acts on validated values and refuses save.
+    const fx1 = await seededParked();
+    await fx1.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    const originalGet1 = fx1.repo.get.bind(fx1.repo);
+
+    const unauthorizedApply = {
+      runId: RUN_ID,
+      lease: { holderId: 'unauthorized-driver', fence: 99 },
+      nowIso: NOW,
+    };
+    fx1.repo.get = async (id: string) => {
+      (unauthorizedApply as { runId: string }).runId = 'run-01JB9999999999999999999999';
+      unauthorizedApply.lease.holderId = HOLDER;
+      unauthorizedApply.lease.fence = 1;
+      return originalGet1(id);
+    };
+
+    const unauthResult = await fx1.resume.applyPendingResume(unauthorizedApply);
+    expect(unauthResult).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'save-refused' });
+
+    // Case 2: Caller validates an apply with authorized lease and mutates to invalid/unauthorized values
+    // during await: use case still acts on validated values and succeeds.
+    const fx2 = await seededParked();
+    await fx2.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    const originalGet2 = fx2.repo.get.bind(fx2.repo);
+
+    const validApply = {
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      nowIso: NOW,
+    };
+    fx2.repo.get = async (id: string) => {
+      (validApply as { runId: string }).runId = 'run-01JB9999999999999999999999';
+      validApply.lease.holderId = 'attacker-driver';
+      validApply.lease.fence = 99;
+      return originalGet2(id);
+    };
+
+    const validResult = await fx2.resume.applyPendingResume(validApply);
+    expect(validResult).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
+    const record = await fx2.repo.get(RUN_ID);
+    expect(record?.parked).toBeNull();
+    expect(record?.revision).toBe(3);
   });
 });

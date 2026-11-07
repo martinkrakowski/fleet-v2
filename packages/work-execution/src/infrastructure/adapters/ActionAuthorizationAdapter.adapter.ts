@@ -25,6 +25,8 @@ import type {
   ConsumeActionAuthorizationResult,
   ResolveActionAuthorizationRequest,
   ResolveActionAuthorizationResult,
+  VerifyConsumedActionAuthorizationRequest,
+  VerifyConsumedActionAuthorizationResult,
 } from '../../application/ports/out/ActionAuthorizationPort.out-port.js';
 import { RELEASE_ACTION_KINDS } from '../../domain/coordination-keys.js';
 import { readRecordSchemaVersion } from '../../domain/record-schema-version.js';
@@ -71,6 +73,10 @@ export interface ActionAuthorizationDelegate {
   readonly consumeGrant?: (
     request: ConsumeActionAuthorizationRequest,
   ) => Promise<ConsumeActionAuthorizationResult>;
+  /** CO14b: proof that one action id consumed a grant for a root and head. */
+  readonly verifyConsumption?: (
+    request: VerifyConsumedActionAuthorizationRequest,
+  ) => Promise<VerifyConsumedActionAuthorizationResult>;
   /** Local grant store; entries are bound in place on consumption. */
   readonly grants?: Map<string, ActionAuthorizationGrantEntry>;
   /**
@@ -595,6 +601,7 @@ function readDelegateConsumeResult(
 interface ReadDelegate {
   readonly resolveGrant: ActionAuthorizationDelegate['resolveGrant'];
   readonly consumeGrant: ActionAuthorizationDelegate['consumeGrant'];
+  readonly verifyConsumption: ActionAuthorizationDelegate['verifyConsumption'];
   readonly grants: Map<string, ActionAuthorizationGrantEntry> | undefined;
   readonly authorizeUnsealedWorktreeRemoval: ActionAuthorizationDelegate['authorizeUnsealedWorktreeRemoval'];
 }
@@ -613,11 +620,72 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
       return {
         resolveGrant: this.delegate?.resolveGrant,
         consumeGrant: this.delegate?.consumeGrant,
+        verifyConsumption: this.delegate?.verifyConsumption,
         grants: grants instanceof Map ? grants : undefined,
         authorizeUnsealedWorktreeRemoval: this.delegate?.authorizeUnsealedWorktreeRemoval,
       };
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * CO14b: true proof only. A consumption by the same action id, kind, head
+   * and root is `consumed`; anything else readable is `absent`; an unreadable
+   * or unconfigured source is `unknown`. Never throws.
+   */
+  async verifyConsumedActionAuthorization(
+    request: VerifyConsumedActionAuthorizationRequest,
+  ): Promise<VerifyConsumedActionAuthorizationResult> {
+    try {
+      const delegate = this.readDelegate();
+      if (delegate === null) {
+        return { outcome: 'unknown' };
+      }
+      const read = readPlainRecord(request, {
+        actionId: { kind: 'string', maxLength: MAX_ACTION_ID_LENGTH },
+        projectId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
+        actionKind: { kind: 'literal', values: [...ALL_ACTION_KINDS] },
+        expectedHeadSha: { kind: 'string', maxLength: MAX_HEAD_LENGTH },
+        root: { kind: 'string', maxLength: MAX_ROOT_LENGTH },
+      });
+      if (!read.ok || !isCleanRoot(read.value.root) || !isSafeId(read.value.actionId, MAX_ACTION_ID_LENGTH, true)) {
+        return { outcome: 'unknown' };
+      }
+      const value = read.value as unknown as VerifyConsumedActionAuthorizationRequest;
+      if (typeof delegate.verifyConsumption === 'function') {
+        let answer: unknown;
+        try {
+          answer = await delegate.verifyConsumption(value);
+        } catch {
+          return { outcome: 'unknown' };
+        }
+        const head = readPlainRecord(answer, {
+          outcome: { kind: 'literal', values: ['consumed', 'absent', 'unknown'] },
+        });
+        return head.ok ? ({ outcome: head.value.outcome } as VerifyConsumedActionAuthorizationResult) : { outcome: 'unknown' };
+      }
+      if (delegate.grants === undefined || delegate.grants.size > MAX_ACTION_AUTHORIZATION_GRANTS) {
+        return { outcome: 'unknown' };
+      }
+      for (const rawEntry of delegate.grants.values()) {
+        const parsed = parseActionAuthorizationGrantEntry(rawEntry);
+        if (!parsed.ok) {
+          return { outcome: 'unknown' };
+        }
+        const grant = parsed.grant;
+        if (
+          grant.consumedByActionId === value.actionId &&
+          grant.kind === value.actionKind &&
+          grant.expectedHeadSha === value.expectedHeadSha &&
+          grant.root === value.root
+        ) {
+          return { outcome: 'consumed' };
+        }
+      }
+      return { outcome: 'absent' };
+    } catch {
+      return { outcome: 'unknown' };
     }
   }
 

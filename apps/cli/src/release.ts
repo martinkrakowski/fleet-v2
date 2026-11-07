@@ -73,6 +73,21 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
         ? { outcome: 'granted', authorizationGrantId: result.grantId, root: request.root }
         : { outcome: 'blocked', reason: result.reason };
     },
+    verifyConsumption: async (request) => {
+      const actionScope = releaseActionScope(request.actionKind);
+      if (actionScope === null) {
+        return { outcome: 'absent' };
+      }
+      const wanted = releaseScopeForRoot(actionScope, request.root);
+      const requests = await rt.coordination.coordinationRequestRepository.listRequests(request.projectId);
+      const found = requests.some(
+        (record) =>
+          record.actionScope === wanted &&
+          record.expectedHeadSha === request.expectedHeadSha &&
+          record.consumptions.some((consumption) => consumption.actionId === request.actionId),
+      );
+      return { outcome: found ? 'consumed' : 'absent' };
+    },
     consumeGrant: async (request) => {
       const actionScope = releaseActionScope(request.actionKind);
       if (actionScope === null || request.expectedHeadSha === undefined) {
@@ -120,8 +135,17 @@ export function resolveReleaseRootStateDir(
   if (!isAbsolutePath(root)) {
     return null;
   }
-  const stateDir = installation?.daemon?.stateDir;
-  return typeof stateDir === 'string' && stateDir.trim() !== '' ? stateDir : null;
+  const daemon = installation?.daemon;
+  const stateDir = daemon?.stateDir;
+  if (typeof stateDir !== 'string' || stateDir.trim() === '') {
+    return null;
+  }
+  // The installation serves one release root: the one its driver entry point
+  // (`daemon.cliPath`) runs from, `<root>/current/...`. Any other root is not
+  // served by this driver, so its lease is not this state directory's lease.
+  const cliPath = daemon?.cliPath;
+  const served = root.endsWith('/') ? root : `${root}/`;
+  return typeof cliPath === 'string' && cliPath.startsWith(`${served}current/`) ? stateDir : null;
 }
 
 function releaseHandler(action: ReleaseAction): CommandHandler {

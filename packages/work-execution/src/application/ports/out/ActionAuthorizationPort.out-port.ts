@@ -56,7 +56,30 @@ export type ConsumeActionAuthorizationResult =
   | { readonly outcome: 'consumed'; readonly actionId: string }
   | { readonly outcome: 'refused'; readonly reason: string };
 
+/**
+ * CO14b: does a recorded consumption prove that THIS action already consumed
+ * a grant for this root and head? Only a consumption by the same action id,
+ * action kind, head and root counts; a missing or foreign grant is `absent`.
+ */
+export interface VerifyConsumedActionAuthorizationRequest {
+  readonly actionId: string;
+  readonly projectId: string;
+  readonly actionKind: AuthorizedActionKind;
+  readonly expectedHeadSha: string;
+  readonly root: string;
+}
+
+export type VerifyConsumedActionAuthorizationResult =
+  | { readonly outcome: 'consumed' }
+  | { readonly outcome: 'absent' }
+  | { readonly outcome: 'unknown' };
+
 export interface ActionAuthorizationPort {
+  /** CO14b: proof that this exact action consumed a grant (resume of an interrupted swap). */
+  verifyConsumedActionAuthorization?(
+    request: VerifyConsumedActionAuthorizationRequest,
+  ): Promise<VerifyConsumedActionAuthorizationResult>;
+
   /** Obtain an applicable scope-bound grant; pending authority blocks the action. */
   resolveActionAuthorization(
     request: ResolveActionAuthorizationRequest,

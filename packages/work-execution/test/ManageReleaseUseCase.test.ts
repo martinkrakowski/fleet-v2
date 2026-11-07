@@ -352,6 +352,13 @@ class FakeAuthorization implements ActionAuthorizationPort {
     return { outcome: 'granted', authorizationGrantId: GRANT };
   }
 
+  /** Proof only when THIS action id consumed the grant. */
+  async verifyConsumedActionAuthorization(request: {
+    readonly actionId: string;
+  }): Promise<{ outcome: 'consumed' } | { outcome: 'absent' }> {
+    return this.consumedBy === request.actionId ? { outcome: 'consumed' } : { outcome: 'absent' };
+  }
+
   async consumeActionAuthorization(
     request: ConsumeActionAuthorizationRequest,
   ): Promise<ConsumeActionAuthorizationResult> {
@@ -923,6 +930,16 @@ describe('ManageReleaseUseCase', () => {
     // The retry completes the interrupted repoint without consuming again.
     expect(made.authorization.consumes).toEqual([]);
     expect(store.tempLinks.size).toBe(0);
+  });
+
+  it('a pending link whose grant was consumed by another action does not authorize the swap', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2)], B);
+    const made = granted(SWAP, A, { store });
+    store.tempLinks.set('.current.crashed.1234.tmp', A);
+    made.authorization.consumedBy = `release-swap-${C}`;
+    const result = await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }));
+    expect(result.outcome).toBe('refused');
+    expect(store.current).toBe(B);
   });
 
   it('swap repoints current to a kept build', async () => {

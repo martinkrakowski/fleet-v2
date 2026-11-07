@@ -162,6 +162,21 @@ describe('release install and swap integration', () => {
           ? { outcome: 'granted', authorizationGrantId: result.grantId, root: request.root }
           : { outcome: 'blocked', reason: result.reason };
       },
+      verifyConsumption: async (request) => {
+        const actionScope = releaseActionScope(request.actionKind);
+        if (actionScope === null) {
+          return { outcome: 'absent' };
+        }
+        const wanted = releaseScopeForRoot(actionScope, request.root);
+        const records = await requestRepo.listRequests(request.projectId);
+        const found = records.some(
+          (record) =>
+            record.actionScope === wanted &&
+            record.expectedHeadSha === request.expectedHeadSha &&
+            record.consumptions.some((consumption) => consumption.actionId === request.actionId),
+        );
+        return { outcome: found ? 'consumed' : 'absent' };
+      },
       consumeGrant: async (request) => {
         const actionScope = releaseActionScope(request.actionKind);
         if (actionScope === null || request.expectedHeadSha === undefined) {
@@ -337,6 +352,56 @@ describe('release install and swap integration', () => {
     const second = await uc.manageRelease(swapRequest(B));
     expect(second.outcome).toBe('refused');
     expect(await fs.readlink(path.join(root, 'current'))).toBe(B);
+  });
+
+  it('a pending link with a missing grant is refused and moves nothing', async () => {
+    await verified('a', 1);
+    await verified('b', 2);
+    await recordGrant('release-install', A, 'grant-install');
+    const uc = useCase();
+    expect(await uc.manageRelease(installRequest(A))).toMatchObject({ outcome: 'applied', current: null });
+    // An interrupted repoint left a pending link, but no grant was ever recorded or consumed.
+    await fs.symlink(B, path.join(root, '.current.crashed.abcd1234.tmp'));
+    const result = await uc.manageRelease(swapRequest(B));
+    expect(result.outcome).toBe('refused');
+    expect(await store.list({ root })).toMatchObject({ outcome: 'read', current: null });
+    await expect(fs.lstat(path.join(root, 'current'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('a pending link with a grant for another root is refused and moves nothing', async () => {
+    await verified('a', 1);
+    await verified('b', 2);
+    await recordGrant('release-install', A, 'grant-install');
+    // A swap grant recorded for ANOTHER root.
+    const otherRoot = path.join(tempDir, 'other-releases');
+    const record: CoordinationRequestRecord = {
+      id: 'request-grant-other',
+      projectId: PROJECT,
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: releaseScopeForRoot(releaseActionScope('release-swap') as string, otherRoot),
+      expectedHeadSha: B,
+      proposalDigest: 'digest-other',
+      policyRevision: 'policy-7',
+      decisionRevision: 'decision-3',
+      grantId: 'grant-other',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    };
+    await requestRepo.saveRequest(record);
+    const uc = useCase();
+    expect(await uc.manageRelease(installRequest(A))).toMatchObject({ outcome: 'applied', current: null });
+    await fs.symlink(B, path.join(root, '.current.crashed.abcd1234.tmp'));
+    const result = await uc.manageRelease(swapRequest(B));
+    expect(result.outcome).toBe('refused');
+    await expect(fs.lstat(path.join(root, 'current'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const stored = (await requestRepo.findRequestByGrantId('grant-other')) as CoordinationRequestRecord;
+    expect(stored.consumptions).toHaveLength(0);
   });
 
   it('release git reads write nothing and stay offline', async () => {

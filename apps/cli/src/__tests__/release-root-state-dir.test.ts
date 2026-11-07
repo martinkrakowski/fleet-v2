@@ -23,7 +23,7 @@ const SHA = 'a'.repeat(40);
 const PROJECT = 'fleet-v2';
 const NOW = '2026-11-06T10:00:00.000Z';
 
-function installationWithDriverStateDir(stateDir: string): FleetInstallation {
+function installationWithDriverStateDir(stateDir: string, servedRoot: string): FleetInstallation {
   return {
     schemaVersion: 2,
     forge: { mode: 'none' },
@@ -35,7 +35,13 @@ function installationWithDriverStateDir(stateDir: string): FleetInstallation {
         runner: { kind: 'opencode', port: 4166 },
       },
     },
-    daemon: { stateDir, nodePath: '/x', cliPath: '/x', unitDir: '/x', installationFile: '/x' },
+    daemon: {
+      stateDir,
+      nodePath: '/x',
+      cliPath: `${servedRoot}/current/apps/cli/dist/bin.js`,
+      unitDir: '/x',
+      installationFile: '/x',
+    },
   };
 }
 
@@ -114,7 +120,7 @@ describe('release root state directory binding', () => {
     // served by A: the lease is read from A and the swap is refused.
     const withProcessStateB = createFleetCliRuntime({
       stateDir: stateB,
-      installation: installationWithDriverStateDir(stateA),
+      installation: installationWithDriverStateDir(stateA, releaseRoot),
     });
     const fromA = await runRelease(argv, withProcessStateB);
     expect(fromA.code).toBe(1);
@@ -124,7 +130,7 @@ describe('release root state directory binding', () => {
     // same way: the live lease in A blocks both runs.
     const withProcessStateA = createFleetCliRuntime({
       stateDir: stateA,
-      installation: installationWithDriverStateDir(stateA),
+      installation: installationWithDriverStateDir(stateA, releaseRoot),
     });
     const fromB = await runRelease(argv, withProcessStateA);
     expect(fromB.code).toBe(1);
@@ -132,11 +138,27 @@ describe('release root state directory binding', () => {
   });
 
   it('resolveReleaseRootStateDir is root-aware: a non-absolute root binds no driver state directory', () => {
-    const installation = installationWithDriverStateDir(path.join(tempDir, 'state'));
+    const installation = installationWithDriverStateDir(path.join(tempDir, 'state'), releaseRoot);
     expect(resolveReleaseRootStateDir('relative/root', installation)).toBeNull();
     expect(resolveReleaseRootStateDir('', installation)).toBeNull();
     expect(resolveReleaseRootStateDir('/a/../b', installation)).toBeNull();
     expect(resolveReleaseRootStateDir(releaseRoot, installation)).toBe(path.join(tempDir, 'state'));
     expect(resolveReleaseRootStateDir(releaseRoot, undefined)).toBeNull();
+  });
+
+  it('an absolute root this installation does not serve is refused', async () => {
+    const stateA = path.join(tempDir, 'state-a');
+    const otherRoot = path.join(tempDir, 'someone-elses-releases');
+    const installation = installationWithDriverStateDir(stateA, releaseRoot);
+    expect(resolveReleaseRootStateDir(otherRoot, installation)).toBeNull();
+    expect(resolveReleaseRootStateDir(`${releaseRoot}-sibling`, installation)).toBeNull();
+    const rt = createFleetCliRuntime({ stateDir: stateA, installation });
+    const { code, out } = await runRelease(
+      ['install', '--root', otherRoot, '--sha', SHA, '--source', '/src', '--project', PROJECT, '--apply'],
+      rt,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+    await expect(fs.lstat(otherRoot)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

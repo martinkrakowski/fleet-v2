@@ -47,7 +47,7 @@ function installationWithDriverStateDir(stateDir: string): FleetInstallation {
     schemaVersion: 2,
     forge: { mode: 'none' },
     hosts: HOSTS,
-    daemon: { stateDir, nodePath: '/x', cliPath: '/x', unitDir: '/x', installationFile: '/x' },
+    daemon: { stateDir, nodePath: '/x', cliPath: `${ROOT}/current/apps/cli/dist/bin.js`, unitDir: '/x', installationFile: '/x' },
   };
 }
 

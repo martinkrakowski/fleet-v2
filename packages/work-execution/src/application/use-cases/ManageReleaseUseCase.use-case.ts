@@ -265,11 +265,17 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         if (!resumed) {
           return refuse(grant.refusal);
         }
-        // Resumed: the interruption happened after the grant was consumed. Only
-        // unknown authority stops the completion; a blocked resolve means the
-        // grant is already consumed by this exact operation.
-        if (grant.refusal === 'authority-unknown') {
-          return refuse('authority-unknown');
+        // Resumed: the interruption may have happened after the grant was
+        // consumed. A blocked resolve is NOT proof of that: only a recorded
+        // consumption by this exact operation (same action, head and root)
+        // lets the completion skip re-authorization. A missing grant, a grant
+        // for another root or an unreadable record refuses and moves nothing.
+        if (grant.refusal === 'authority-unknown' || grant.refusal === 'release-grant-root-mismatch') {
+          return refuse(grant.refusal);
+        }
+        const proof = await this.verifyOwnConsumption(request, target);
+        if (proof !== 'consumed') {
+          return refuse(proof === 'unknown' ? 'authority-unknown' : 'authority-refused');
         }
       }
       let tempLink: string;
@@ -364,6 +370,30 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       return lease !== null && !isLeaseLapsed(lease, this.deps.nowIso());
     } catch {
       return null;
+    }
+  }
+
+  /** Whether a recorded consumption by this exact release already holds the grant. */
+  private async verifyOwnConsumption(
+    request: ValidRequest,
+    target: string,
+  ): Promise<'consumed' | 'absent' | 'unknown'> {
+    const verify = this.deps.authorization.verifyConsumedActionAuthorization;
+    if (typeof verify !== 'function') {
+      return 'unknown';
+    }
+    const coordinates = grantCoordinates(request, target);
+    try {
+      const answer = await verify.call(this.deps.authorization, {
+        actionId: coordinates.actionId,
+        projectId: request.projectId as string,
+        actionKind: coordinates.actionKind,
+        expectedHeadSha: target,
+        root: request.root,
+      });
+      return answer.outcome;
+    } catch {
+      return 'unknown';
     }
   }
 

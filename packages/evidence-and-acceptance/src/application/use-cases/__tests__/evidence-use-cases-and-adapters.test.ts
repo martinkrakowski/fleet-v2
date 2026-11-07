@@ -1730,6 +1730,7 @@ describe('IndependentReviewAdapter', () => {
       outcome: 'unavailable',
       reason: 'reviewer seat timed out',
       code: 'timeout',
+      diagnostic: { exitCode: null, timedOut: true, stderr: 'Error: spawn threw', stdoutEmpty: null },
     });
   });
 

@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { EvidenceAssessmentRecord, OcmReviewTransportSpawn } from '@fleet/evidence-and-acceptance';
 import type { FleetInstallation } from '@fleet/installation';
@@ -121,6 +121,9 @@ function assessment(head: string): EvidenceAssessmentRecord {
 }
 
 describe('conductor review busy-worktree composition (RV4, F149)', () => {
+  const archived = async (runtime: Awaited<ReturnType<typeof compose>>['runtime'], ref: string) =>
+    runtime.evidence.evidenceArchive.readArchivedEvidence(ref);
+
   const dirs: string[] = [];
   afterEach(() => {
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
@@ -172,4 +175,34 @@ describe('conductor review busy-worktree composition (RV4, F149)', () => {
     expect(outcome).toEqual({ outcome: 'no-receipt', reason: 'review-unavailable', detail: 'seat-busy' });
     expect(calls).toHaveLength(2);
   });
+
+  for (const phase of ['--wait', 'review'] as const) {
+    it(`a spawn that throws on the ${phase} call still persists a transport record`, async () => {
+      const { runtime, request } = await compose(async (_file, args) => {
+        if (phase === '--wait' || !args.includes('--wait')) {
+          throw new Error('boom ghp_' + 'a'.repeat(36) + ' /secret/dir/x');
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      });
+      const archive = runtime.evidence.evidenceArchive;
+      let ref: string | null = null;
+      const real = archive.archiveEvidence.bind(archive);
+      vi.spyOn(archive, 'archiveEvidence').mockImplementation(async (r) => {
+        const out = await real(r);
+        ref = out.evidenceRef;
+        return out;
+      });
+      const outcome = await runtime.conductor.reviewRequest.requestReview(request);
+      expect(outcome).toMatchObject({ outcome: 'no-receipt', reason: 'review-unavailable', detail: 'transport' });
+      expect(ref).not.toBeNull();
+      expect(ref!.startsWith(`evidence://review-transport-${REQUEST_ID}@`)).toBe(true);
+      const content = (await archived(runtime, ref!)) ?? '';
+      const record = JSON.parse(content) as { exitCode: number | null; stderr: string; stdoutEmpty: boolean | null };
+      expect(record.exitCode).toBeNull();
+      expect(record.stderr).toContain('Error:');
+      expect(content).not.toContain('ghp_');
+      expect(content).not.toContain('/secret/dir');
+      vi.restoreAllMocks();
+    });
+  }
 });

@@ -90,6 +90,26 @@ function spawnDiagnosticOf(result: OcmReviewTransportSpawnResult): ReviewTranspo
   };
 }
 
+/**
+ * The diagnostic of a failure that carried no spawn result (a spawn that
+ * threw, or a refusal before any spawn): no exit code, the timeout shape, the
+ * error class name (never the message), and no stdout reading. Never throws.
+ */
+export function transportFailureDiagnostic(error: unknown): ReviewTransportDiagnostic {
+  // The thrown message is never copied: it may carry a secret or a path, and
+  // this package has no screen. Only the error class name travels.
+  const name = safeRead(() => {
+    const named = (error as { readonly name?: unknown } | null)?.name;
+    return typeof named === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(named) ? named : 'Error';
+  });
+  return {
+    exitCode: null,
+    timedOut: isTimeoutError(error),
+    stderr: capUtf8Bytes(`${name ?? 'Error'}: spawn threw`, MAX_TRANSPORT_STDERR_BYTES),
+    stdoutEmpty: null,
+  };
+}
+
 /** The timed-out classification of a spawn result, read without throwing. */
 function spawnTimedOut(result: OcmReviewTransportSpawnResult): boolean {
   if (safeRead(() => result.timedOut === true) === true) {
@@ -1260,7 +1280,11 @@ export function createOcmReviewTransport(
       // message is never passed through — it may carry a secret or a path —
       // and a typed ReviewTransportError thrown by the spawn is classified like
       // any other throw, never rethrown with its own code or message.
-      throw new ReviewTransportError('reviewer process failed', isTimeoutError(error) ? 'timeout' : 'transport');
+      throw new ReviewTransportError(
+        'reviewer process failed',
+        isTimeoutError(error) ? 'timeout' : 'transport',
+        transportFailureDiagnostic(error),
+      );
     }
     const waitExitCode = safeRead(() => waitResult.exitCode);
     if (waitExitCode === 75 || safeRead(() => waitResult.timedOut === true) === true) {
@@ -1345,7 +1369,11 @@ export function createOcmReviewTransport(
       // ReviewTransportError thrown by the spawn does not travel as-is — its
       // message could expose a secret or a path, and its code would bypass the
       // thrown-spawn classification; the fixed message travels instead.
-      throw new ReviewTransportError('reviewer process failed', isTimeoutError(error) ? 'timeout' : 'transport');
+      throw new ReviewTransportError(
+        'reviewer process failed',
+        isTimeoutError(error) ? 'timeout' : 'transport',
+        transportFailureDiagnostic(error),
+      );
     }
     const spawnExitCode = safeRead(() => spawnResult.exitCode);
     if (spawnExitCode !== 0) {

@@ -13,7 +13,7 @@ import type {
   RunIndependentReviewRequest,
   RunIndependentReviewResult,
 } from '../../application/ports/out/IndependentReviewPort.out-port.js';
-import { isTimeoutError, ReviewTransportError } from './OcmReviewTransport.adapter.js';
+import { isTimeoutError, ReviewTransportError, transportFailureDiagnostic } from './OcmReviewTransport.adapter.js';
 
 /** Re-exported so the timeout classification lives with the transport error it reads. */
 export { isTimeoutError } from './OcmReviewTransport.adapter.js';
@@ -114,7 +114,7 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
           outcome: 'unavailable',
           reason: error.message,
           code: error.code,
-          ...(error.diagnostic !== undefined ? { diagnostic: error.diagnostic } : {}),
+          diagnostic: error.diagnostic ?? transportFailureDiagnostic(error),
         };
       }
       let reason = 'Independent review transport failed';
@@ -125,7 +125,12 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
       } catch {
         // A hostile message getter keeps the fixed fallback reason.
       }
-      return { outcome: 'unavailable', reason, code: isTimeoutError(error) ? 'timeout' : 'transport' };
+      return {
+        outcome: 'unavailable',
+        reason,
+        code: isTimeoutError(error) ? 'timeout' : 'transport',
+        diagnostic: transportFailureDiagnostic(error),
+      };
     }
 
     // A malformed transport return is an unavailable transport, never a crash.

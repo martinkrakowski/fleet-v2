@@ -518,10 +518,24 @@ if [ "$ephemeral" = 1 ]; then
     echo "agy-run: $home_base is a symlink; refusing to use it" >&2; rm -f "$lock"; exit 2
   fi
   ( umask 077; mkdir -p "$home_base" ) 2>/dev/null || { echo "agy-run: could not create $home_base" >&2; rm -f "$lock"; exit 1; }
+  # A dangling symlink is invisible to -e, and mkdir -p would follow it: the seeded sign-in would
+  # land outside the base and cleanup would refuse to remove it (Luna, 2026-11-07).
   lane_home=$home_base/$run_hash.$$
-  if [ -e "$lane_home" ]; then
+  if [ -e "$lane_home" ] || [ -L "$lane_home" ]; then
     echo "agy-run: $lane_home already exists; refusing to reuse a lane home" >&2; rm -f "$lock"; exit 1
   fi
+  # A run killed with SIGKILL cannot clean up, so its home (with the seeded sign-in) is left behind.
+  # Sweep those here: only plain directories directly under the base, only when the pid in the name
+  # is no longer alive, and never this run's own.
+  for stale in "$home_base"/*.[0-9]*; do
+    [ -d "$stale" ] || continue
+    [ -L "$stale" ] && continue
+    [ "$stale" = "$lane_home" ] && continue
+    stale_pid=${stale##*.}
+    case $stale_pid in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$stale_pid" 2>/dev/null && continue
+    rm -rf "$stale"
+  done
   ( umask 077; mkdir -p "$lane_home/.gemini/antigravity-cli" "$lane_home/.config" ) 2>/dev/null \
     || { echo "agy-run: could not create the lane home $lane_home" >&2; rm -f "$lock"; exit 1; }
   # Only the sign-in is seeded. Nothing else is copied: agy makes what it needs, and whatever it
@@ -531,7 +545,9 @@ if [ "$ephemeral" = 1 ]; then
     ( umask 077; cat "$seed_home/antigravity-oauth-token" > "$lane_home/.gemini/antigravity-cli/antigravity-oauth-token" ) 2>/dev/null \
       || { echo "agy-run: could not seed agy's sign-in into the lane home" >&2; rm -rf "$lane_home"; rm -f "$lock"; exit 1; }
   else
-    echo "agy-run: no agy sign-in at \$AGY_SEED_HOME/antigravity-oauth-token; the lane home carries none and agy may refuse to run" >&2
+    echo "agy-run: no agy sign-in to seed at $seed_home/antigravity-oauth-token (or it is a symlink)." >&2
+    echo "agy-run: refusing: a lane home without a sign-in would either fail or run under an identity nobody chose." >&2
+    rm -rf "$lane_home"; rm -f "$lock"; exit 1
   fi
   # The settings file is seeded too, from the host's own, which the operator's dispatch-time check
   # has just declared within the rule (trustedWorkspaces empty, no read_url). The lane therefore
@@ -591,6 +607,9 @@ finish_run() { # $1: exit status to report; writes last in RUN_DIR via mktemp+mv
 # text free of `read_url`. Applied to the LANE's settings when the run ends, so a lane that widens
 # its own permissions is a failed run and not a silent one. No python3 is a failure, never a pass.
 settings_rule_ok() { # $1: the settings file
+  # A symlink here would be judged by its target, so it is a failure, not a pass (Luna, 2026-11-07).
+  [ -L "$1" ] && { echo "the lane's settings file is a symlink"; return 1; }
+  # An absent file widens nothing and agy writes it afresh next run, so it is not a failure.
   [ -f "$1" ] || return 0
   command -v python3 >/dev/null 2>&1 || { echo "no python3 to check the lane's settings"; return 1; }
   python3 -I -c '
@@ -604,6 +623,9 @@ if "read_url" in text: sys.exit("read_url appears in settings.json")
 ' "$1"
 }
 
+# Bound: this runs after the lane's own process has exited, so it cannot catch a process that
+# lingers and rewrites the file afterwards. That case is what the operator's own check catches with
+# "no lane process left" before and after every round; it is not covered here.
 check_lane_settings() { # 0 within the rule or not applicable; 1 the lane widened its own settings
   [ "$ephemeral" = 1 ] && [ -n "$lane_home" ] || return 0
   cls_why=$(settings_rule_ok "$lane_home/.gemini/antigravity-cli/settings.json" 2>&1) && return 0
@@ -651,7 +673,8 @@ trap 'stop_run 129' HUP
 if [ "$detach" = 1 ]; then
   ( trap '' HUP; cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 elif [ "$ephemeral" = 1 ]; then
-  ( cd "$dir" && exec env HOME="$lane_home" XDG_CONFIG_HOME="$lane_home/.config" "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
+  ( cd "$dir" && exec env HOME="$lane_home" XDG_CONFIG_HOME="$lane_home/.config" \
+      AGY_HOME="$lane_home/.gemini/antigravity-cli" "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 else
   ( cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 fi

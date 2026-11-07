@@ -145,5 +145,71 @@ check 'a lane that deletes its settings is not a failure' '[ "$(rc)" = 0 ]'
 rm -f "$T/settings-mode"
 check 'the lane home is still removed after a settings failure' '[ -z "$(ls -A "$BASE" 2>/dev/null)" ]'
 
+# Luna's review of the first version (2026-11-07), four majors, each with a test.
+cat > "$T/bin/agy" <<FAKE
+#!/bin/sh
+printf '%s\n' "\$HOME" > "$T/home.log"
+printf '%s\n' "\${AGY_HOME:-unset}" > "$T/agyhome.log"
+printf '{"conversation_id":"ca","status":"SUCCESS","response":"ok","usage":{"total_tokens":1}}'
+FAKE
+chmod +x "$T/bin/agy"
+
+# 1. AGY_HOME is inherited, and HOME alone does not stop a tool that reads it.
+env AGY_HOME="$SEED" AGY_HOME_BASE="$BASE" AGY_SEED_HOME="$SEED" "$RUNSH" "$SCRIPT" --ephemeral-home --dir "$WT" --model m > "$T/o" 2> "$T/e"; echo $? > "$T/rc"
+check 'a host AGY_HOME cannot reach the lane' '[ "$(cat "$T/agyhome.log")" = "$(cat "$T/home.log")/.gemini/antigravity-cli" ]'
+
+# 2. A missing sign-in is a refusal, not a warning: a run that succeeded without it would have used
+# an identity nobody chose.
+mv "$SEED/antigravity-oauth-token" "$T/token.away"
+run --ephemeral-home --dir "$WT" --model m
+check 'no sign-in to seed is a refusal' '[ "$(rc)" = 1 ] && grep -q "refusing: a lane home without a sign-in" "$T/e"'
+check 'the refusal leaves no lane home behind' '[ -z "$(ls -A "$BASE" 2>/dev/null)" ]'
+mv "$T/token.away" "$SEED/antigravity-oauth-token"
+
+# 3. A symlinked settings file would be judged by its target.
+printf '{"trustedWorkspaces": []}\n' > "$T/elsewhere-settings.json"
+cat > "$T/bin/agy" <<FAKE
+#!/bin/sh
+rm -f "\$HOME/.gemini/antigravity-cli/settings.json"
+ln -s "$T/elsewhere-settings.json" "\$HOME/.gemini/antigravity-cli/settings.json"
+printf '{"conversation_id":"cb","status":"SUCCESS","response":"ok","usage":{"total_tokens":1}}'
+FAKE
+chmod +x "$T/bin/agy"
+run --ephemeral-home --dir "$WT" --model m
+check 'a symlinked settings file fails the run (75)' '[ "$(rc)" = 75 ] && grep -q "settings file is a symlink" "$T/e"'
+
+# 4. A dangling symlink at the candidate home is invisible to -e, and mkdir -p would follow it.
+cat > "$T/bin/agy" <<FAKE
+#!/bin/sh
+printf '%s\n' "\$HOME" > "$T/home.log"
+printf '{"conversation_id":"cc","status":"SUCCESS","response":"ok","usage":{"total_tokens":1}}'
+FAKE
+chmod +x "$T/bin/agy"
+mkdir -p "$BASE"
+hash_of_wt=$(printf '%s' "$WT" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk '{print $1}')
+# The home is named with agy-run's own pid, which this shell cannot know in advance. This helper
+# plants the symlink and then execs the script, so the pid it inherits is the one in the name.
+cat > "$T/pidsym.sh" <<'H'
+#!/bin/sh
+base=$1; target=$2; wthash=$3; shift 3
+ln -s "$target" "$base/$wthash.$$" || exit 9
+exec "$@"
+H
+env AGY_HOME_BASE="$BASE" AGY_SEED_HOME="$SEED" "$RUNSH" "$T/pidsym.sh" "$BASE" "$T/outside-home" "$hash_of_wt" \
+  "$RUNSH" "$SCRIPT" --ephemeral-home --dir "$WT" --model m > "$T/o" 2> "$T/e"; echo $? > "$T/rc"
+check 'a dangling symlink at the lane home is refused' '[ "$(rc)" = 1 ] && grep -q "already exists; refusing to reuse" "$T/e"'
+check 'nothing was created through that symlink' '[ ! -e "$T/outside-home" ]'
+rm -f "$BASE"/"$hash_of_wt".*
+
+# A home left by a killed run is swept by the next run, so the sign-in does not linger.
+mkdir -p "$BASE/deadbeef.999999/.gemini/antigravity-cli"
+printf 'leftover\n' > "$BASE/deadbeef.999999/.gemini/antigravity-cli/antigravity-oauth-token"
+run --ephemeral-home --dir "$WT" --model m
+check 'a home whose pid is gone is swept by the next run' '[ ! -e "$BASE/deadbeef.999999" ]'
+mkdir -p "$BASE/livepid.$$"
+run --ephemeral-home --dir "$WT" --model m
+check 'a home whose pid is alive is left alone' '[ -d "$BASE/livepid.$$" ]'
+rm -rf "$BASE/livepid.$$"
+
 printf '1..%s\n' "$n"
 [ "$fails" = 0 ]

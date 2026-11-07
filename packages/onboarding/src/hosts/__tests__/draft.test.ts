@@ -17,6 +17,7 @@ import type { HostRole, RunnerCapabilityDeclaration } from '@fleet/installation'
 
 import {
   applyHostDraft,
+  copyOwnData,
   draftHost,
   isSafeSshHost,
   planHostRename,
@@ -842,6 +843,125 @@ describe('mergeDraftedHost precedence (P2-cli)', () => {
         'edit',
       ),
     ).not.toThrow();
+  });
+
+  it('guards an own __proto__ property in roleAliases without mutating prototype or invoking getters', () => {
+    // 1. A base roleAliases map built with JSON.parse('{"__proto__": {"orchestrator": "x"}}')
+    const jsonAliases: unknown = JSON.parse(
+      '{"__proto__": {"orchestrator": "x"}}',
+    );
+    expect(Object.hasOwn(jsonAliases as object, '__proto__')).toBe(true);
+
+    const jsonFile = hereFile({
+      transport: 'ssh',
+      sshAlias: 'here',
+      worktreeRoot: '/srv/worktrees',
+      roles: ['orchestrator'],
+      roleAliases: jsonAliases,
+    });
+    expect(() => applyHostDraft(jsonFile, hereDraft, 'edit')).not.toThrow();
+    const jsonResult = applyHostDraft(jsonFile, hereDraft, 'edit');
+    // Treats __proto__ as an ordinary key (so orchestrator is not inherited)
+    expect(jsonResult.ok).toBe(true);
+    if (jsonResult.ok) {
+      expect(jsonResult.candidate.hosts.here.roleAliases).toBeUndefined();
+    }
+
+    // A draft directly providing jsonAliases refuses safely
+    const jsonDraft: HostDraft = {
+      ...hereDraft,
+      host: {
+        ...hereDraft.host,
+        roleAliases: jsonAliases as never,
+      },
+    };
+    const jsonDraftResult = applyHostDraft(
+      hereFile(hereExisting),
+      jsonDraft,
+      'edit',
+    );
+    expect(jsonDraftResult.ok).toBe(false);
+    if (!jsonDraftResult.ok) {
+      expect(jsonDraftResult.reason).toBe('invalid');
+      expect(jsonDraftResult.errors.join(' ')).toContain('roleAliases');
+    }
+
+    // copyOwnData keeps __proto__ as an own key and prototype is unchanged
+    const jsonCopy = copyOwnData(jsonAliases);
+    expect(jsonCopy).toBeDefined();
+    if (jsonCopy !== undefined) {
+      expect(Object.hasOwn(jsonCopy, '__proto__')).toBe(true);
+      expect(Object.getPrototypeOf(jsonCopy)).toBe(null);
+      expect(jsonCopy['orchestrator']).toBeUndefined();
+      expect(jsonCopy['__proto__']).toEqual({ orchestrator: 'x' });
+    }
+
+    // 2. An own __proto__ value is an object with a throwing orchestrator getter
+    let getterCalled = false;
+    const throwingAliases: Record<string, unknown> = {};
+    Object.defineProperty(throwingAliases, '__proto__', {
+      value: {
+        get orchestrator() {
+          getterCalled = true;
+          throw new Error('hostile __proto__ getter');
+        },
+      },
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+    expect(Object.hasOwn(throwingAliases, '__proto__')).toBe(true);
+
+    const throwingFile = hereFile({
+      transport: 'ssh',
+      sshAlias: 'here',
+      worktreeRoot: '/srv/worktrees',
+      roles: ['orchestrator'],
+      roleAliases: throwingAliases,
+    });
+    expect(() => applyHostDraft(throwingFile, hereDraft, 'edit')).not.toThrow();
+    expect(getterCalled).toBe(false);
+    const throwingResult = applyHostDraft(throwingFile, hereDraft, 'edit');
+    expect(getterCalled).toBe(false);
+    // Treats __proto__ as an ordinary key: never throws, never calls the getter
+    expect(throwingResult.ok).toBe(true);
+    if (throwingResult.ok) {
+      expect(throwingResult.candidate.hosts.here.roleAliases).toBeUndefined();
+    }
+
+    // A draft directly providing throwingAliases refuses safely without calling the getter
+    const throwingDraft: HostDraft = {
+      ...hereDraft,
+      host: {
+        ...hereDraft.host,
+        roleAliases: throwingAliases as never,
+      },
+    };
+    expect(() =>
+      applyHostDraft(hereFile(hereExisting), throwingDraft, 'edit'),
+    ).not.toThrow();
+    expect(getterCalled).toBe(false);
+    const throwingDraftResult = applyHostDraft(
+      hereFile(hereExisting),
+      throwingDraft,
+      'edit',
+    );
+    expect(getterCalled).toBe(false);
+    expect(throwingDraftResult.ok).toBe(false);
+    if (!throwingDraftResult.ok) {
+      expect(throwingDraftResult.reason).toBe('invalid');
+      expect(throwingDraftResult.errors.join(' ')).toContain('roleAliases');
+    }
+
+    // copyOwnData keeps __proto__ as an own key and prototype is unchanged
+    const throwingCopy = copyOwnData(throwingAliases);
+    expect(throwingCopy).toBeDefined();
+    if (throwingCopy !== undefined) {
+      expect(Object.hasOwn(throwingCopy, '__proto__')).toBe(true);
+      expect(Object.getPrototypeOf(throwingCopy)).toBe(null);
+      expect(throwingCopy['orchestrator']).toBeUndefined();
+      expect(getterCalled).toBe(false);
+    }
   });
 
   it('applyHostDraft in edit mode is idempotent when re-applied with the same host draft', () => {

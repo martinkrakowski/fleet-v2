@@ -100,21 +100,46 @@ function ownDataValue(record: object, key: string): unknown {
 }
 
 /**
+ * Copy one own data property by descriptor, never by assignment: an own
+ * `"__proto__"` data property assigned onto a fresh `{}` triggers the
+ * inherited setter and is dropped, so a key the unknown-root-key check must
+ * see disappears. A null-prototype target plus `defineProperty` keeps it.
+ */
+function copyOwnDataProperty(
+  target: Record<string, unknown>,
+  key: string,
+  value: unknown,
+): void {
+  Object.defineProperty(target, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/**
  * Copy a plain record's own data properties, skipping accessors. A hostile
  * value never throws and never runs a getter; what it carries as plain data
- * survives, everything else is omitted.
+ * survives, everything else is omitted. A null-prototype target plus
+ * `copyOwnDataProperty` keeps an own `__proto__` from setting the copy's
+ * prototype.
  */
-function copyOwnData(record: unknown): Record<string, unknown> | undefined {
+export function copyOwnData(record: unknown): Record<string, unknown> | undefined {
   if (!isPlainRecord(record)) {
     return undefined;
   }
   try {
-    const out: Record<string, unknown> = {};
+    const out: Record<string, unknown> = Object.create(null);
     for (const key of Object.keys(record)) {
       if (Object.hasOwn(record, key)) {
         const descriptor = Object.getOwnPropertyDescriptor(record, key);
-        if (descriptor !== undefined && descriptor.get === undefined) {
-          out[key] = descriptor.value;
+        if (
+          descriptor !== undefined &&
+          descriptor.get === undefined &&
+          descriptor.set === undefined
+        ) {
+          copyOwnDataProperty(out, key, descriptor.value);
         }
       }
     }
@@ -314,25 +339,6 @@ function buildHostRunner(
     };
   }
   return { kind: 'opencode', ...common };
-}
-
-/**
- * Copy one own data property by descriptor, never by assignment: an own
- * `"__proto__"` data property assigned onto a fresh `{}` triggers the
- * inherited setter and is dropped, so a key the unknown-root-key check must
- * see disappears. A null-prototype target plus `defineProperty` keeps it.
- */
-function copyOwnDataProperty(
-  target: Record<string, unknown>,
-  key: string,
-  value: unknown,
-): void {
-  Object.defineProperty(target, key, {
-    value,
-    writable: true,
-    enumerable: true,
-    configurable: true,
-  });
 }
 
 /**
@@ -734,7 +740,7 @@ function mergeDraftedHost(
         }
         const alias = guardedAliases[role];
         if (typeof alias === 'string') {
-          pruned[role as HostRole] = alias;
+          copyOwnDataProperty(pruned as Record<string, unknown>, role, alias);
         }
       }
     }
@@ -844,7 +850,7 @@ export function applyHostDraft(
   if (!checked.ok) {
     return { ok: false, reason: 'invalid', errors: checked.errors };
   }
-  hostsRecord[name] = merged;
+  copyOwnDataProperty(hostsRecord, name, merged);
   return {
     ok: true,
     candidate: {

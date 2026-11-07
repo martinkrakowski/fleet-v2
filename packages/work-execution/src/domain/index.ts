@@ -16,6 +16,7 @@ export * from "./entities/index.js";
 export * from "./execution-record-readers.js";
 export * from "./execution-records.js";
 export * from "./gate-receipt-key.js";
+export * from "./held-work-order.js";
 export * from "./killall-stop.js";
 export * from "./lane-activity-records.js";
 export * from "./lane-diff-check.js";

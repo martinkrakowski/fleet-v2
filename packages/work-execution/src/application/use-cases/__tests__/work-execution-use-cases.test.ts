@@ -384,15 +384,15 @@ describe('RegisterWorkOrderUseCase', () => {
     const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo });
 
     const exact = await useCase.registerWorkOrder(validWorkOrderRequest({ ownedPaths: ['packages/app-a'] }));
-    expect(exact.outcome).toBe('rejected');
+    expect(exact).toMatchObject({ outcome: 'refused', reason: 'active-work-order-overlap', blockerId: 'wo-prior' });
 
     const nested = await useCase.registerWorkOrder(
       validWorkOrderRequest({ ownedPaths: ['packages/app-a/src/deep'] }),
     );
-    expect(nested.outcome).toBe('rejected');
+    expect(nested).toMatchObject({ outcome: 'refused', reason: 'active-work-order-overlap' });
 
     const covering = await useCase.registerWorkOrder(validWorkOrderRequest({ ownedPaths: ['packages'] }));
-    expect(covering.outcome).toBe('rejected');
+    expect(covering).toMatchObject({ outcome: 'refused', reason: 'active-work-order-overlap' });
   });
 
   it('allows overlapping owned paths once the prior work order is merged or stopped', async () => {
@@ -496,8 +496,7 @@ describe('RegisterWorkOrderUseCase', () => {
       validWorkOrderRequest({ workOrderId: 'wo-overlap', projectId: '  proj-1  ' }),
     );
 
-    expect(second.outcome).toBe('rejected');
-    expect(second.outcome === 'rejected' && second.reason).toContain('Owned path conflicts with active work order');
+    expect(second).toMatchObject({ outcome: 'refused', reason: 'active-work-order-overlap' });
   });
 
   it('applies the profile guard before the duplicate-id check', async () => {

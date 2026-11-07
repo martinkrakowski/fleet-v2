@@ -95,7 +95,7 @@ describe('work order risk (AM2)', () => {
     expect(high.workOrder.risk).toBe('high');
   });
 
-  it.each(['low', 'STANDARD', '', null, 1, true, {}])(
+  it.each(['low', 'STANDARD', '', null, 1, true, {}, 'bogus'])(
     'refuses a bad risk value without saving or echoing it',
     async (bad) => {
       const repo = makeWorkOrderRepo();
@@ -104,11 +104,10 @@ describe('work order risk (AM2)', () => {
         validWorkOrderRequest({ risk: bad as never }) as unknown,
       );
       expect(result).toEqual({
-        outcome: 'rejected',
-        reason: "Work order risk must be 'standard' or 'high'",
+        outcome: 'refused',
+        reason: 'invalid-request',
       });
       expect(repo.orders.size).toBe(0);
-      expect(result.outcome === 'rejected' && result.reason.includes('low')).toBe(false);
     },
   );
 

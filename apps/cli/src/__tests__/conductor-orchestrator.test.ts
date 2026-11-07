@@ -1014,6 +1014,9 @@ describe('o9 live composition', () => {
     expect(afterFirst).toHaveLength(1);
     expect(afterFirst[0]!.session.orchestratorId).toBe(firstId);
     expect(afterFirst[0]!.session.host).toBe('this-machine');
+    // Exactly one session row in total: the first pass wrote nothing else, so a
+    // second run can only adopt this one session, never register a duplicate.
+    expect(await adapter.list()).toHaveLength(1);
 
     const secondRuntime = runtimeOf(dir, installation);
     dropRetire(secondRuntime);

@@ -193,6 +193,18 @@ async function registerConductorOrchestratorUnchecked(
       continue;
     }
     try {
+      // The list is a snapshot: another process may have heartbeated this
+      // session since. Re-read the CURRENT record and skip the retire when it
+      // is no longer an active, lapsed conductor-driver session.
+      const current = await input.sessionRepo.get(entry.session.orchestratorId);
+      if (
+        current === null ||
+        current.session.status !== 'active' ||
+        current.session.registeredByTokenId !== CONDUCTOR_TOKEN_ID ||
+        isOrchestratorAttached(current.session, nowIso)
+      ) {
+        continue;
+      }
       const result = await retireUseCase.retireOrchestratorSession(
         { orchestratorId: entry.session.orchestratorId },
         CONDUCTOR_TOKEN_ID,

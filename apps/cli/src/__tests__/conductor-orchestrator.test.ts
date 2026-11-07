@@ -370,6 +370,36 @@ describe('o9 registerConductorOrchestrator store and retire behaviour', () => {
     expect(originalNew!.session.status).toBe('active');
   });
 
+  it('o9-heartbeat-between-list-and-retire-stays-live: a session heartbeated after the list snapshot is not retired', async () => {
+    class HeartbeatAfterListRepository extends FakeSessionRepository {
+      override async list(query?: OrchestratorSessionListQuery): Promise<readonly StoredOrchestratorSession[]> {
+        const snapshot = await super.list(query);
+        // Another process heartbeats the lapsed session right after the snapshot.
+        for (const entry of snapshot) {
+          const current = await this.get(entry.session.orchestratorId);
+          if (current !== null) {
+            await this.save(
+              {
+                ...current.session,
+                lastHeartbeatIso: ATTACHED_HEARTBEAT,
+                leaseUntilIso: ATTACHED_LEASE,
+              },
+              current.revision,
+            );
+          }
+        }
+        return snapshot;
+      }
+    }
+    const repo = new HeartbeatAfterListRepository();
+    await seedSession(repo, { orchestratorId: 'orch-raced-1' });
+    const result = await registerConductorOrchestrator(makeRegisterInput(repo));
+    expect(result.code).toBe('registered');
+    const raced = repo.snapshot().find((entry) => entry.session.orchestratorId === 'orch-raced-1');
+    expect(raced).toBeDefined();
+    expect(raced!.session.status).toBe('active');
+  });
+
   it('o9-unreadable-store-is-unknown: an unreadable profile store and session store are both register-unknown', async () => {
     const repo = new FakeSessionRepository();
     const viaProfiles = await registerConductorOrchestrator(

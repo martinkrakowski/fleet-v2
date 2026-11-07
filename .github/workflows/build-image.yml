@@ -4,7 +4,7 @@
 # self-hosted pool: a pull request from a fork must not reach the owner's hosts. Every action is
 # pinned by commit. The image is multi-platform: linux/amd64 for solstice's staging cluster and
 # linux/arm64 for the OCI production node (VM.Standard.A1.Flex, Ampere Altra), which serves
-# fleetcloud.dev. Each platform builds natively (hexagen-monaco's build-image.yml, same shape):
+# app.fleetcloud.dev. Each platform builds natively (hexagen-monaco's build-image.yml, same shape):
 # QEMU-emulated arm64 on a 2-CPU hosted runner can run for hours.
 #
 # - Pull requests build and scan amd64 with read-only permissions: no push, no signature. arm64 is

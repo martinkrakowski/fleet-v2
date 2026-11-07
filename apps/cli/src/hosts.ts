@@ -1547,12 +1547,13 @@ export async function hostsCommand(
   rawIo: CliIo,
   hostsOptions: HostsCliOptions = {},
 ): Promise<number> {
-  const file =
-    hostsOptions.installationFile ??
-    resolveInstallationFile(undefined, process.env, process.cwd());
   const out = screenedHostsIo(rawIo, [...argv]);
+  let file: string;
   let read: Awaited<ReturnType<typeof readInstallationFile>>;
   try {
+    file =
+      hostsOptions.installationFile ??
+      resolveInstallationFile(undefined, process.env, process.cwd());
     read = await readInstallationFile(file);
   } catch (error: unknown) {
     out.stderr(`error: ${errorTag(error)}\n`);

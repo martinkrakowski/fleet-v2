@@ -33,6 +33,7 @@ import {
 } from "@fleet/work-execution";
 
 import { runCli, type CliIo } from "../index.js";
+import { hostsCommand } from "../hosts.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures and helpers
@@ -1514,6 +1515,37 @@ describe("hosts output never echoes a withheld host key", () => {
       expect(code).toBe(1);
       expect(stderr).toContain("error: unknown");
       expect(stderr).not.toContain("thrown string");
+      expect(echoedWindows(stdout + stderr, token)).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HN1b fix round (a2): the installation-file resolution is inside the guard
+// ---------------------------------------------------------------------------
+
+describe("hosts installation-file resolution never escapes the screened io", () => {
+  it("a throwing process.cwd() with no explicit file prints one screened error line", async () => {
+    // Built at runtime so the fixture is not a literal secret-scanner match.
+    const token = `t0k3n${"aB7".repeat(11)}`.slice(0, 36);
+    const { io, stdout: rawStdout, stderr: rawStderr } = mockIo();
+    const spy = vi
+      .spyOn(process, "cwd")
+      .mockImplementation(() => {
+        throw new Error(`cwd lost near token ${token}`);
+      });
+    try {
+      const code = await hostsCommand(["list"], io);
+      const stdout = rawStdout.join("");
+      const stderr = rawStderr.join("");
+      expect(code).toBe(1);
+      const errorLines = stderr
+        .split("\n")
+        .filter((line) => line.startsWith("error: "));
+      expect(errorLines).toHaveLength(1);
+      expect(stderr).not.toContain("    at ");
       expect(echoedWindows(stdout + stderr, token)).toEqual([]);
     } finally {
       spy.mockRestore();

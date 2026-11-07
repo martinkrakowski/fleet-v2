@@ -68,10 +68,14 @@ describe('stalledRunsOf (PT1a)', () => {
     expect(stalled.map((view) => view.runId)).toEqual([RUN_A]);
   });
 
-  it('a run that is not parked, has a PR, or has no park time never appears', () => {
-    expect(stalledRunsOf({ records: [records[2]!], journals, stallAfterMinutes: 1, nowIso: NOW })).toEqual([]);
+  it('a parked run with an open PR is listed too (owned-park), once', () => {
     const withPr = [record(RUN_A, 'wo-fleet-v2-rv4-2026-11-06', PARK, 812)];
-    expect(stalledRunsOf({ records: withPr, journals, stallAfterMinutes: 1, nowIso: NOW })).toEqual([]);
+    const stalled = stalledRunsOf({ records: withPr, journals, stallAfterMinutes: 30, nowIso: NOW });
+    expect(stalled.map((view) => [view.runId, view.ageMinutes])).toEqual([[RUN_A, 120]]);
+  });
+
+  it('a run that is not parked or has no park time never appears', () => {
+    expect(stalledRunsOf({ records: [records[2]!], journals, stallAfterMinutes: 1, nowIso: NOW })).toEqual([]);
     expect(stalledRunsOf({ records: [records[1]!], journals: new Map(), stallAfterMinutes: 1, nowIso: NOW })).toEqual([]);
   });
 

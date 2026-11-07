@@ -59,7 +59,7 @@ function compareViews(a: StalledRunView, b: StalledRunView): number {
 
 /**
  * The stalled runs at `nowIso`: every run the journal projects as `parked`
- * for more than `stallAfterMinutes`, as the SN1 `unowned-park` rule decides.
+ * for more than `stallAfterMinutes`, as the SN1 `unowned-park` rule (no PR) or its `owned-park` sibling (a PR is open) decides.
  * A parked run without a usable park time is left out (unknown stays
  * unknown; SN1 names the missing field), and a run that is not parked never
  * appears.
@@ -98,7 +98,7 @@ export function stalledRunsOf(input: {
     );
     const views: StalledRunView[] = [];
     for (const finding of findings) {
-      const runId = finding.rule === 'unowned-park' ? finding.subjectIds[0] : undefined;
+      const runId = (finding.rule === 'unowned-park' || finding.rule === 'owned-park') ? finding.subjectIds[0] : undefined;
       const record = runId === undefined ? undefined : byId.get(runId);
       const minutes = finding.evidence.minutes;
       const parkedAtIso = finding.evidence.parkedAtIso;

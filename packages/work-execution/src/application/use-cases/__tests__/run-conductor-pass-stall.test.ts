@@ -197,16 +197,21 @@ describe('RunConductorPassUseCase stall attention (PT1a)', () => {
     expect(later.attention.raises).toEqual([]);
   });
 
-  it('raises nothing for a run the journal does not show parked, and for a parked run that has a PR (owned)', async () => {
+  it('raises nothing for a run the journal does not show parked', async () => {
     const noTime = await fixture();
     const second = record({ runId: RUN_ID_2 });
     await noTime.repo.create(second);
     await noTime.pass(at(31));
     expect(noTime.attention.raises.map((raise) => raise.runId)).toEqual([RUN_ID]);
+  });
 
+  it('a run parked past the threshold WITH an open PR raises exactly one stall item', async () => {
     const withPr = await fixture({ prNumber: 812 });
     await withPr.pass(at(60));
-    expect(withPr.attention.raises).toEqual([]);
+    expect(withPr.attention.raises).toEqual([
+      { projectId: PROJECT_ID, workOrderId: WORK_ORDER_ID, runId: RUN_ID, parkClass: 'step-refused', ageMinutes: 60 },
+    ]);
+    expect(withPr.attention.open.size).toBe(1);
   });
 
   it('a refused raise, an unreadable list and an unwired port never break the pass', async () => {

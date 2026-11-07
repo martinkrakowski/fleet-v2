@@ -71,7 +71,7 @@ function minutesAgo(minutes: number): string {
   return new Date(Date.now() - minutes * 60_000).toISOString();
 }
 
-function record(runId: string, workOrderId: string, parked: Record<string, unknown> | null): LaneRunRecord {
+function record(runId: string, workOrderId: string, parked: Record<string, unknown> | null, prNumber: number | null = null): LaneRunRecord {
   const created = LaneRun.create({
     version: 1,
     runId,
@@ -81,7 +81,7 @@ function record(runId: string, workOrderId: string, parked: Record<string, unkno
     cursors: { 'first-pass': 0, fix: null, review: null },
     round: 0,
     attemptIds: ['attempt-01M64PT1PX2MAZVQDYAYMZ7WNB'],
-    prNumber: null,
+    prNumber,
     parked,
     parkCount: parked === null ? 0 : 1,
     lease: null,
@@ -120,6 +120,7 @@ async function seedParkedRun(
   parkedMinutesAgo: number,
   parkClass: string | undefined,
   entryId: string,
+  prNumber: number | null = null,
 ): Promise<void> {
   await seedWorkOrder(runtime, workOrderId);
   const parked = {
@@ -129,7 +130,7 @@ async function seedParkedRun(
     questionId: null,
     ...(parkClass === undefined ? {} : { class: parkClass }),
   };
-  expect(await runtime.conductor.laneRunRepository.create(record(runId, workOrderId, parked))).toMatchObject({ outcome: 'saved' });
+  expect(await runtime.conductor.laneRunRepository.create(record(runId, workOrderId, parked, prNumber))).toMatchObject({ outcome: 'saved' });
   expect(
     await runtime.conductor.laneRunJournal.append(laneRunConductEntry(entryId, runId, 'parked', minutesAgo(parkedMinutesAgo))),
   ).toMatchObject({ outcome: 'appended' });
@@ -186,6 +187,16 @@ describe('conductor status --stalled (PT1a, SN3)', () => {
     };
     expect(document.stallAfterMinutes).toBe(120);
     expect(document.stalled.map((row) => row.runId)).toEqual([RUN_OLD]);
+  });
+
+  it('lists a run parked past the threshold with an open PR, with the same class and age fields', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'fleet-v2-pt1a-pr-'));
+    const runtime = runtimeOf(stateDir);
+    await seedParkedRun(runtime, RUN_OLD, WORK_ORDER_OLD, 90, 'blocker', '01M64PT1PX2MAZVQDYAYMZ7WN1', 819);
+    const document = JSON.parse((await statusStalled(runtime, stateDir, ['--stalled'])).out[0]!) as {
+      stalled: { runId: string; class: string; workOrderId: string }[];
+    };
+    expect(document.stalled.map((row) => [row.runId, row.class, row.workOrderId])).toEqual([[RUN_OLD, 'blocker', WORK_ORDER_OLD]]);
   });
 
   it('is an empty list when nothing is parked, and a usage error with a run id', async () => {
@@ -258,6 +269,18 @@ describe('stall attention through the live conductor driver (PT1a, SN2)', () => 
     const after = (await items(runtime)).filter((entry) => entry.item.kind === 'conductor-stall');
     expect(after).toHaveLength(1);
     expect(after[0]!.item.state).toBe('cleared');
+  });
+
+  it('a run parked past the threshold with an open PR raises exactly one stall item through the live driver', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'fleet-v2-pt1a-prpass-'));
+    const runtime = runtimeOf(stateDir);
+    await seedParkedRun(runtime, RUN_OLD, WORK_ORDER_OLD, 61, 'blocker', '01M64PT1PX2MAZVQDYAYMZ7WN1', 819);
+    const driver = buildLiveConductorDriver(runtime, { maxActiveRuns: 1, stateDir });
+    await driver.pass.runPass({ holderId: HOLDER, nowIso: new Date().toISOString() });
+    await driver.pass.runPass({ holderId: HOLDER, nowIso: new Date().toISOString() });
+    const stall = (await items(runtime)).filter((entry) => entry.item.kind === 'conductor-stall');
+    expect(stall).toHaveLength(1);
+    expect(stall[0]!.item).toMatchObject({ state: 'open', subject: { kind: 'run', ref: RUN_OLD } });
   });
 
   it('a run under the policy threshold raises nothing', async () => {

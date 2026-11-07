@@ -306,4 +306,17 @@ describe('extractSingleTrailingJsonFence', () => {
       jsonText: '{"verdict":"PASS","findings":[]}',
     });
   });
+
+  it('does not close a fence on a line that mixes markers and leaves it unclosed (invalid)', () => {
+    const mixed = '~~~text\n~~~```\n```json\n{"verdict":"PASS","findings":[]}\n```';
+    expect(extractSingleTrailingJsonFence(mixed)).toEqual({ kind: 'invalid' });
+  });
+
+  it('a tilde-fenced text block closed with ~~~, followed by a valid trailing json block, still passes', () => {
+    const stripped = '~~~text\nsome notes\n~~~\n```json\n{"verdict":"PASS","findings":[]}\n```\n';
+    expect(extractSingleTrailingJsonFence(stripped)).toEqual({
+      kind: 'single',
+      jsonText: '{"verdict":"PASS","findings":[]}',
+    });
+  });
 });

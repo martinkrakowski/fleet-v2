@@ -161,6 +161,75 @@ function hasExactKeys(
   return keys.length === expected.length && expected.every((key) => key in record);
 }
 
+function parseVerdict(raw: unknown): 'PASS' | 'FAIL' | null {
+  if (typeof raw !== 'string' || !VERDICTS.includes(raw)) {
+    return null;
+  }
+  return raw as 'PASS' | 'FAIL';
+}
+
+function isValidFindingLine(line: unknown): line is number | null {
+  return line === null || (typeof line === 'number' && Number.isSafeInteger(line) && line >= 1);
+}
+
+function isValidFindingSummary(summary: unknown): summary is string {
+  if (
+    typeof summary !== 'string' ||
+    summary.length > MAX_FINDING_SUMMARY_LENGTH ||
+    summary.includes('\0') ||
+    summary.trim().length === 0 ||
+    isWholeValuePlaceholder(summary) ||
+    containsReviewSecretShape(summary)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function validateOneFinding(entry: unknown): ValidatedReviewFinding | null {
+  const record = readPlainRecord(entry);
+  if (record === null || !hasExactKeys(record, ['severity', 'file', 'line', 'summary'])) {
+    return null;
+  }
+  const severity = record.severity;
+  if (typeof severity !== 'string' || !SEVERITIES.includes(severity)) {
+    return null;
+  }
+  const file = record.file;
+  if (!isSafeRelativeFilePath(file)) {
+    return null;
+  }
+  const line = record.line;
+  if (!isValidFindingLine(line)) {
+    return null;
+  }
+  const summary = record.summary;
+  if (!isValidFindingSummary(summary)) {
+    return null;
+  }
+  return { severity: severity as FindingSeverity, file, line, summary };
+}
+
+function validateFindingsArray(raw: unknown): ValidatedReviewFinding[] | null {
+  if (!Array.isArray(raw) || raw.length > MAX_STRUCTURED_FINDINGS) {
+    return null;
+  }
+  for (let index = 0; index < raw.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(raw, index)) {
+      return null;
+    }
+  }
+  const findings: ValidatedReviewFinding[] = [];
+  for (const entry of raw as unknown[]) {
+    const finding = validateOneFinding(entry);
+    if (finding === null) {
+      return null;
+    }
+    findings.push(finding);
+  }
+  return findings;
+}
+
 /**
  * Validate one parsed answer object. Never throws: every runtime shape (a
  * throwing getter, a sparse array, a hostile Proxy, a wrong type) reads as
@@ -174,56 +243,17 @@ export function validateReviewAnswerObject(raw: unknown):
     if (top === null || !hasExactKeys(top, ['verdict', 'findings'])) {
       return { ok: false, reason: 'unparseable-verdict' };
     }
-    const verdict = top.verdict;
-    if (typeof verdict !== 'string' || !VERDICTS.includes(verdict)) {
+    const verdict = parseVerdict(top.verdict);
+    if (verdict === null) {
       return { ok: false, reason: 'unparseable-verdict' };
     }
-    const findingsRaw = top.findings;
-    if (!Array.isArray(findingsRaw) || findingsRaw.length > MAX_STRUCTURED_FINDINGS) {
+    const findings = validateFindingsArray(top.findings);
+    if (findings === null) {
       return { ok: false, reason: 'unparseable-verdict' };
-    }
-    for (let index = 0; index < findingsRaw.length; index += 1) {
-      if (!Object.prototype.hasOwnProperty.call(findingsRaw, index)) {
-        return { ok: false, reason: 'unparseable-verdict' };
-      }
-    }
-    const findings: ValidatedReviewFinding[] = [];
-    for (const entry of findingsRaw as unknown[]) {
-      const record = readPlainRecord(entry);
-      if (record === null || !hasExactKeys(record, ['severity', 'file', 'line', 'summary'])) {
-        return { ok: false, reason: 'unparseable-verdict' };
-      }
-      const severity = record.severity;
-      if (typeof severity !== 'string' || !SEVERITIES.includes(severity)) {
-        return { ok: false, reason: 'unparseable-verdict' };
-      }
-      const file = record.file;
-      if (!isSafeRelativeFilePath(file)) {
-        return { ok: false, reason: 'unparseable-verdict' };
-      }
-      const line = record.line;
-      const lineOk =
-        line === null ||
-        (typeof line === 'number' && Number.isSafeInteger(line) && line >= 1);
-      if (!lineOk) {
-        return { ok: false, reason: 'unparseable-verdict' };
-      }
-      const summary = record.summary;
-      if (
-        typeof summary !== 'string' ||
-        summary.length > MAX_FINDING_SUMMARY_LENGTH ||
-        summary.includes('\0') ||
-        summary.trim().length === 0 ||
-        isWholeValuePlaceholder(summary) ||
-        containsReviewSecretShape(summary)
-      ) {
-        return { ok: false, reason: 'unparseable-verdict' };
-      }
-      findings.push({ severity: severity as FindingSeverity, file, line, summary });
     }
     return {
       ok: true,
-      value: { verdict: verdict as 'PASS' | 'FAIL', findings },
+      value: { verdict, findings },
     };
   } catch {
     return { ok: false, reason: 'unparseable-verdict' };
@@ -243,9 +273,103 @@ interface ScannedFence {
 }
 
 const FENCE_OPEN = /^[ \t]{0,3}(`{3,}|~{3,})[ \t]*([^\r\n]*)$/;
-const FENCE_CLOSE = /^[ \t]{0,3}([`~]+)[ \t]*$/;
+const FENCE_CLOSE = /^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$/;
 /** A trimmed info string that names the json answer block, case-insensitively. */
 const INFO_JSON = /^json(?:$|[^a-z0-9])/i;
+
+interface OpenFenceSpec {
+  readonly fence: string;
+  readonly info: string;
+}
+
+function parseFenceOpen(line: string): OpenFenceSpec | null {
+  const match = FENCE_OPEN.exec(line);
+  if (match === null) {
+    return null;
+  }
+  const fence = match[1] ?? '';
+  const info = match[2] ?? '';
+  if (fence.startsWith('`') && info.includes('`')) {
+    // CommonMark §4.5: a backtick fence whose info string carries a
+    // backtick cannot open a fence; the line is ordinary text.
+    return null;
+  }
+  return { fence, info };
+}
+
+function isFenceClose(line: string, openFence: string): boolean {
+  const match = FENCE_CLOSE.exec(line);
+  if (match === null) {
+    return false;
+  }
+  const token = match[1] ?? '';
+  return token[0] === openFence[0] && token.length >= openFence.length;
+}
+
+interface OpenFenceState {
+  readonly fence: string;
+  readonly info: string;
+  readonly openLine: number;
+  readonly body: string[];
+}
+
+function scanFences(lines: readonly string[]): {
+  readonly fences: readonly ScannedFence[];
+  readonly unclosed: boolean;
+} {
+  const fences: ScannedFence[] = [];
+  let open: OpenFenceState | null = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? '';
+    if (open !== null) {
+      if (isFenceClose(line, open.fence)) {
+        fences.push({
+          fence: open.fence,
+          info: open.info,
+          openLine: open.openLine,
+          endLine: index,
+          body: open.body.join('\n'),
+        });
+        open = null;
+      } else {
+        open.body.push(line);
+      }
+      continue;
+    }
+    const parsedOpen = parseFenceOpen(line);
+    if (parsedOpen !== null) {
+      open = {
+        fence: parsedOpen.fence,
+        info: parsedOpen.info,
+        openLine: index,
+        body: [],
+      };
+    }
+  }
+  return { fences, unclosed: open !== null };
+}
+
+function hasTrailingNonBlankLines(lines: readonly string[], startLine: number): boolean {
+  for (let index = startLine; index < lines.length; index += 1) {
+    if ((lines[index] ?? '').trim() !== '') {
+      return true;
+    }
+  }
+  return false;
+}
+
+function checkTrailingRegion(
+  lines: readonly string[],
+  fence: ScannedFence,
+): { kind: 'invalid' } | { kind: 'single'; jsonText: string } {
+  if (fence.endLine === null || fence.info !== 'json') {
+    return { kind: 'invalid' };
+  }
+  if (hasTrailingNonBlankLines(lines, fence.endLine + 1)) {
+    return { kind: 'invalid' };
+  }
+  return { kind: 'single', jsonText: fence.body };
+}
 
 /**
  * Extract the single trailing fenced ```json block of a stripped reply
@@ -261,41 +385,8 @@ export function extractSingleTrailingJsonFence(
   strippedText: string,
 ): { kind: 'none' } | { kind: 'invalid' } | { kind: 'single'; jsonText: string } {
   const lines = strippedText.split(/\r?\n/);
-  const fences: ScannedFence[] = [];
-  let open: { fence: string; info: string; openLine: number; body: string[] } | null = null;
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? '';
-    if (open !== null) {
-      const closeMatch = FENCE_CLOSE.exec(line);
-      if (closeMatch !== null && (closeMatch[1] ?? '').startsWith(open.fence)) {
-        const body = open.body.join('\n');
-        fences.push({
-          fence: open.fence,
-          info: open.info,
-          openLine: open.openLine,
-          endLine: index,
-          body,
-        });
-        open = null;
-      } else {
-        open.body.push(line);
-      }
-      continue;
-    }
-    const openMatch = FENCE_OPEN.exec(line);
-    if (openMatch === null) {
-      continue;
-    }
-    const fenceToken = openMatch[1] ?? '';
-    const info = openMatch[2] ?? '';
-    if (fenceToken.startsWith('`') && info.includes('`')) {
-      // CommonMark §4.5: a backtick fence whose info string carries a
-      // backtick cannot open a fence; the line is ordinary text.
-      continue;
-    }
-    open = { fence: fenceToken, info, openLine: index, body: [] };
-  }
-  if (open !== null) {
+  const { fences, unclosed } = scanFences(lines);
+  if (unclosed) {
     return { kind: 'invalid' };
   }
   const jsonFences = fences.filter((fence) => INFO_JSON.test(fence.info.trim()));
@@ -305,14 +396,5 @@ export function extractSingleTrailingJsonFence(
   if (jsonFences.length > 1) {
     return { kind: 'invalid' };
   }
-  const fence = jsonFences[0]!;
-  if (fence.endLine === null || fence.info !== 'json') {
-    return { kind: 'invalid' };
-  }
-  for (let index = fence.endLine + 1; index < lines.length; index += 1) {
-    if ((lines[index] ?? '').trim() !== '') {
-      return { kind: 'invalid' };
-    }
-  }
-  return { kind: 'single', jsonText: fence.body };
+  return checkTrailingRegion(lines, jsonFences[0]!);
 }

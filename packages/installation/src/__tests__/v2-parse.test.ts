@@ -3,8 +3,14 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { containsSecretShape } from '@fleet/shared';
+
 import { deriveInstallationModel } from '../model.js';
-import { parseInstallation } from '../parse.js';
+import {
+  HOST_NAME_SECRET_REFUSAL,
+  isValidHostName,
+  parseInstallation,
+} from '../parse.js';
 
 /** A minimal valid v2 file: one host with both required roles and a runner. */
 const validV2 = {
@@ -1344,4 +1350,49 @@ describe('parseInstallation v2 daemon', () => {
       errors: ['installation: unknown key'],
     });
   });
+});
+
+describe('parseInstallation v2 secret-shaped host keys', () => {
+  const githubToken = `ghp_${'a'.repeat(20)}`;
+  const awsKey = `AKIA${'A'.repeat(16)}`;
+  const slackToken = `xoxb-${'a'.repeat(10)}`;
+  const apiKey = `sk-${'a'.repeat(20)}`;
+
+  const fakes: ReadonlyArray<{ readonly label: string; readonly value: string }> = [
+    { label: 'github-token', value: githubToken },
+    { label: 'aws-access-key', value: awsKey },
+    { label: 'slack-token', value: slackToken },
+    { label: 'openai-style-key', value: apiKey },
+  ];
+
+  it.each(fakes)(
+    'refuses a secret-shaped host key with the rename refusal and does not echo it ($label)',
+    ({ value }) => {
+      const result = parseInstallation({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          [value]: {
+            transport: 'local',
+            worktreeRoot: '/srv/fleet/worktrees',
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46000 },
+          },
+        },
+      });
+      expect(result).toEqual({
+        ok: false,
+        errors: [
+          HOST_NAME_SECRET_REFUSAL,
+          'hosts: exactly one host must hold the orchestrator role',
+          'hosts: at least one host must hold the lane-runner role',
+        ],
+      });
+      if (!result.ok) {
+        expect(JSON.stringify(result.errors)).not.toContain(value);
+      }
+      expect(isValidHostName(value)).toBe(true);
+      expect(containsSecretShape(value)).toBe(true);
+    },
+  );
 });

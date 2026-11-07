@@ -7,12 +7,18 @@
 
 import { describe, expect, it } from 'vitest';
 
+import {
+  HOST_NAME_SECRET_REFUSAL,
+  hostNameHasSecretShape,
+  isValidHostName,
+} from '@fleet/installation';
 import type { RunnerCapabilityDeclaration } from '@fleet/installation';
 
 import {
   applyHostDraft,
   draftHost,
   isSafeSshHost,
+  planHostRename,
   type HostDraft,
   type HostDraftInput,
   type HostRunnerDraft,
@@ -308,6 +314,80 @@ describe('draftHost', () => {
       ]);
     }
   });
+
+  it('refuses a secret-shaped name and does not echo it', () => {
+    const githubToken = `ghp_${'a'.repeat(20)}`;
+    expect(isValidHostName(githubToken)).toBe(true);
+    expect(hostNameHasSecretShape(githubToken)).toBe(true);
+    const result = draftHost(sshInput({ name: githubToken }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toEqual([HOST_NAME_SECRET_REFUSAL]);
+      expect(result.errors.join(' ')).not.toContain(githubToken);
+    }
+  });
+
+  it('F96-1 draftHost and planHostRename refuse null, wrong types, a sparse hosts array, an unknown schema version and a throwing getter', () => {
+    const notObject = ['hosts: host draft is not an object'];
+    expect(draftHost(null)).toEqual({ ok: false, errors: notObject });
+    expect(draftHost([] as never)).toEqual({ ok: false, errors: notObject });
+    expect(draftHost({})).toEqual({ ok: false, errors: notObject });
+
+    let nameGetterRan = false;
+    const throwingName = draftHost({
+      get name() {
+        nameGetterRan = true;
+        throw new Error('boom');
+      },
+      transport: 'local',
+      worktreeRoot: '/srv',
+      roles: ['orchestrator'],
+    } as never);
+    expect(throwingName).toEqual({
+      ok: false,
+      errors: ['hosts: host name is unreadable'],
+    });
+    expect(nameGetterRan).toBe(false);
+
+    expect(planHostRename(null, 'a', 'b')).toEqual({
+      ok: false,
+      reason: 'not-object',
+    });
+    expect(
+      planHostRename({ schemaVersion: 2, hosts: new Array(2) }, 'a', 'b'),
+    ).toEqual({ ok: false, reason: 'hosts-not-object' });
+    expect(planHostRename({ schemaVersion: 3, hosts: {} }, 'a', 'b')).toEqual({
+      ok: false,
+      reason: 'not-v2',
+    });
+
+    let hostsGetterRan = false;
+    const throwingHosts = planHostRename(
+      {
+        schemaVersion: 2,
+        get hosts() {
+          hostsGetterRan = true;
+          throw new Error('boom');
+        },
+      },
+      'a',
+      'b',
+    );
+    expect(throwingHosts).toEqual({ ok: false, reason: 'unreadable' });
+    expect(hostsGetterRan).toBe(false);
+  });
+
+  it('F96-7 planHostRename refuses an over-long name', () => {
+    const value = { schemaVersion: 2, hosts: {} };
+    expect(planHostRename(value, 'a', 'b'.repeat(4097))).toEqual({
+      ok: false,
+      reason: 'name-too-long',
+    });
+    expect(planHostRename(value, 'a', 'x'.repeat(129))).toEqual({
+      ok: false,
+      reason: 'invalid-new-name',
+    });
+  });
 });
 
 describe('applyHostDraft', () => {
@@ -411,6 +491,40 @@ describe('applyHostDraft', () => {
           "installation: hosts can only be added to a schema version 2 file; converting an older file is the caller's step",
         ]);
       }
+    }
+  });
+});
+
+describe('planHostRename', () => {
+  it('renames a key, moves the entry unchanged and never mutates the input', () => {
+    const input = {
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        mac: {
+          transport: 'local',
+          worktreeRoot: '/srv/mac',
+          roles: ['orchestrator'],
+        },
+        old: {
+          transport: 'ssh',
+          sshAlias: 'm',
+          worktreeRoot: '/srv/lane',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: 4166 },
+        },
+      },
+    };
+    const before = JSON.stringify(input);
+    const result = planHostRename(input, 'old', 'new-host');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(JSON.stringify(input)).toBe(before);
+      expect(Object.keys(result.candidate.hosts)).toEqual(['mac', 'new-host']);
+      expect(result.candidate.hosts['new-host']).toBe(input.hosts.old);
+      expect(result.candidate.hosts['new-host']).toEqual(input.hosts.old);
+      expect(result.candidate.forge).toEqual({ mode: 'none' });
+      expect(result.candidate.schemaVersion).toBe(2);
     }
   });
 });

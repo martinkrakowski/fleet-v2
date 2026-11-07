@@ -14,7 +14,14 @@
 
 import { isAbsolute } from 'node:path';
 
-import { isSafeSshHost } from '@fleet/installation';
+import {
+  HOST_NAME_SECRET_REFUSAL,
+  HOST_NAME_TOO_LONG,
+  MAX_HOST_NAME_ARGUMENT_LENGTH,
+  hostNameHasSecretShape,
+  isSafeSshHost,
+  isValidHostName,
+} from '@fleet/installation';
 import type {
   AgyAcknowledgement,
   GateSlotSection,
@@ -184,59 +191,81 @@ function buildHostRunner(
  * format says — the loader's host rules, the dial-port collision rule, the
  * agy isolation floor — is the loader's answer, not this function's.
  */
-export function draftHost(input: HostDraftInput): HostDraftResult {
-  const path = `hosts.${input.name}`;
+export function draftHost(input: unknown): HostDraftResult {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return { ok: false, errors: ['hosts: host draft is not an object'] };
+  }
+  const record = input as Record<string, unknown>;
+  const nameDescriptor = Object.getOwnPropertyDescriptor(record, 'name');
+  if (
+    nameDescriptor !== undefined &&
+    (nameDescriptor.get !== undefined || nameDescriptor.set !== undefined)
+  ) {
+    return { ok: false, errors: ['hosts: host name is unreadable'] };
+  }
+  const name = nameDescriptor?.value;
+  if (typeof name !== 'string') {
+    return { ok: false, errors: ['hosts: host draft is not an object'] };
+  }
+  if (name.length > MAX_HOST_NAME_ARGUMENT_LENGTH) {
+    return { ok: false, errors: [HOST_NAME_TOO_LONG] };
+  }
+  if (hostNameHasSecretShape(name)) {
+    return { ok: false, errors: [HOST_NAME_SECRET_REFUSAL] };
+  }
+  const inputRecord = input as HostDraftInput;
+  const path = `hosts.${name}`;
   const errors: string[] = [];
 
-  if (input.transport === 'ssh') {
-    if (input.sshAlias === undefined) {
+  if (inputRecord.transport === 'ssh') {
+    if (inputRecord.sshAlias === undefined) {
       errors.push(`${path}.sshAlias: required when transport is "ssh"`);
-    } else if (!isSafeSshHost(input.sshAlias)) {
+    } else if (!isSafeSshHost(inputRecord.sshAlias)) {
       // The value never appears in the message: an alias is operator input.
       errors.push(
         `${path}.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option`,
       );
     }
-  } else if (input.sshAlias !== undefined) {
+  } else if (inputRecord.sshAlias !== undefined) {
     errors.push(`${path}.sshAlias: must be absent when transport is "local"`);
   }
 
-  if (!isAbsolute(input.worktreeRoot)) {
+  if (!isAbsolute(inputRecord.worktreeRoot)) {
     errors.push(`${path}.worktreeRoot: must be an absolute path`);
   }
-  if (input.tmpDir !== undefined && !isAbsolute(input.tmpDir)) {
+  if (inputRecord.tmpDir !== undefined && !isAbsolute(inputRecord.tmpDir)) {
     errors.push(`${path}.tmpDir: must be an absolute path`);
   }
 
-  if (input.roles.length === 0) {
+  if (inputRecord.roles.length === 0) {
     errors.push(`${path}.roles: at least one role is required`);
   }
-  for (const [index, role] of input.roles.entries()) {
+  for (const [index, role] of inputRecord.roles.entries()) {
     if (!HOST_ROLES.includes(role)) {
       errors.push(`${path}.roles[${index}]: must be a known host role`);
     }
   }
 
   const runner =
-    input.runner === undefined
+    inputRecord.runner === undefined
       ? undefined
-      : buildHostRunner(input.runner, `${path}.runner`, errors);
+      : buildHostRunner(inputRecord.runner, `${path}.runner`, errors);
 
   if (errors.length > 0) {
     return { ok: false, errors };
   }
 
   const host: HostSection = {
-    transport: input.transport,
-    ...(input.transport === 'ssh' && input.sshAlias !== undefined
-      ? { sshAlias: input.sshAlias }
+    transport: inputRecord.transport,
+    ...(inputRecord.transport === 'ssh' && inputRecord.sshAlias !== undefined
+      ? { sshAlias: inputRecord.sshAlias }
       : {}),
-    worktreeRoot: input.worktreeRoot,
-    ...(input.tmpDir !== undefined ? { tmpDir: input.tmpDir } : {}),
-    roles: [...input.roles],
+    worktreeRoot: inputRecord.worktreeRoot,
+    ...(inputRecord.tmpDir !== undefined ? { tmpDir: inputRecord.tmpDir } : {}),
+    roles: [...inputRecord.roles],
     ...(runner !== undefined ? { runner } : {}),
   };
-  return { ok: true, draft: { name: input.name, host } };
+  return { ok: true, draft: { name, host } };
 }
 
 /**
@@ -389,4 +418,120 @@ export function applyHostDraft(
       },
     },
   };
+}
+
+/** Why a rename cannot be planned; no reason string contains either name. */
+export type PlanHostRenameReason =
+  | 'not-object'
+  | 'unreadable'
+  | 'not-v2'
+  | 'hosts-not-object'
+  | 'same-name'
+  | 'secret-new-name'
+  | 'invalid-new-name'
+  | 'name-too-long'
+  | 'missing'
+  | 'exists';
+
+/** A planned rename, or the reason there is no candidate. */
+export type PlanHostRenameResult =
+  | { readonly ok: true; readonly candidate: HostDraftCandidate }
+  | { readonly ok: false; readonly reason: PlanHostRenameReason };
+
+/**
+ * Plan one host-key rename: a new v2 root with the old entry moved to the new
+ * key, unchanged, and every other own data property copied by descriptor. It
+ * never mutates the input and never walks a host entry. Accessors on the root
+ * or on a host entry are `unreadable`; the getter is never called.
+ */
+export function planHostRename(
+  value: unknown,
+  oldName: string,
+  newName: string,
+): PlanHostRenameResult {
+  if (typeof oldName !== 'string' || typeof newName !== 'string') {
+    return { ok: false, reason: 'not-object' };
+  }
+  if (
+    oldName.length > MAX_HOST_NAME_ARGUMENT_LENGTH ||
+    newName.length > MAX_HOST_NAME_ARGUMENT_LENGTH
+  ) {
+    return { ok: false, reason: 'name-too-long' };
+  }
+  if (oldName === newName) {
+    return { ok: false, reason: 'same-name' };
+  }
+  if (hostNameHasSecretShape(newName)) {
+    return { ok: false, reason: 'secret-new-name' };
+  }
+  if (!isValidHostName(newName)) {
+    return { ok: false, reason: 'invalid-new-name' };
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { ok: false, reason: 'not-object' };
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (
+      descriptor !== undefined &&
+      (descriptor.get !== undefined || descriptor.set !== undefined)
+    ) {
+      return { ok: false, reason: 'unreadable' };
+    }
+  }
+  if (record.schemaVersion !== 2) {
+    return { ok: false, reason: 'not-v2' };
+  }
+  const hosts = record.hosts;
+  if (hosts === null || typeof hosts !== 'object' || Array.isArray(hosts)) {
+    return { ok: false, reason: 'hosts-not-object' };
+  }
+  const hostsRecord = hosts as Record<string, unknown>;
+  if (!Object.hasOwn(hostsRecord, oldName)) {
+    return { ok: false, reason: 'missing' };
+  }
+  if (Object.hasOwn(hostsRecord, newName)) {
+    return { ok: false, reason: 'exists' };
+  }
+  const oldEntryDescriptor = Object.getOwnPropertyDescriptor(hostsRecord, oldName);
+  if (
+    oldEntryDescriptor === undefined ||
+    oldEntryDescriptor.get !== undefined ||
+    oldEntryDescriptor.set !== undefined
+  ) {
+    return { ok: false, reason: 'unreadable' };
+  }
+  const newHosts: Record<string, unknown> = {};
+  for (const key of Object.keys(hostsRecord)) {
+    const descriptor = Object.getOwnPropertyDescriptor(hostsRecord, key);
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return { ok: false, reason: 'unreadable' };
+    }
+    if (key !== oldName) {
+      newHosts[key] = descriptor.value;
+    }
+  }
+  newHosts[newName] = oldEntryDescriptor.value;
+  const newRoot: Record<string, unknown> = {};
+  for (const key of Object.keys(record)) {
+    if (key === 'hosts') {
+      continue;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return { ok: false, reason: 'unreadable' };
+    }
+    newRoot[key] = descriptor.value;
+  }
+  newRoot.hosts = newHosts;
+  return { ok: true, candidate: newRoot as HostDraftCandidate };
 }

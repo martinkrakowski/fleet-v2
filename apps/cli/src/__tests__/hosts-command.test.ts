@@ -8,6 +8,7 @@
  * conflict and the help text.
  */
 
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -18,7 +19,11 @@ import type {
   DoctorCommandRunResult,
   HostProbeExecutor,
 } from "@fleet/onboarding";
-import { parseInstallation } from "@fleet/installation";
+import {
+  HOST_NAME_SECRET_REFUSAL,
+  isValidHostName,
+  parseInstallation,
+} from "@fleet/installation";
 import {
   AttemptRepositoryAdapter,
   ExecutionJournalAdapter,
@@ -942,5 +947,333 @@ describe("fleet-v2 hosts usage", () => {
     expect(badRole.stderr).toContain(
       "--role must be one of: orchestrator, lane-runner, verifier",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rename
+// ---------------------------------------------------------------------------
+
+describe("fleet-v2 hosts rename", () => {
+  const githubToken = `ghp_${'a'.repeat(20)}`;
+  const awsKey = `AKIA${'A'.repeat(16)}`;
+  const slackToken = `xoxb-${'a'.repeat(10)}`;
+  const apiKey = `sk-${'a'.repeat(20)}`;
+
+  const sha256 = (text: string): string =>
+    createHash("sha256").update(text).digest("hex");
+
+  /** A v2 file the loader refuses only because the lane-runner key is the GitHub token. */
+  function secretKeyInstallation(): unknown {
+    return {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: "/srv/fleet/mac",
+          roles: ["orchestrator"],
+          runner: { kind: "opencode", port: 46000 },
+        },
+        [githubToken]: {
+          transport: "ssh",
+          sshAlias: "lane-alias",
+          container: "fleet-runner",
+          roleAliases: { "lane-runner": "lane-alias" },
+          worktreeRoot: "/srv/fleet/lane",
+          tmpDir: "/srv/fleet/tmp",
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166, tunnelOffset: 1 },
+        },
+      },
+    };
+  }
+
+  /** A loader-valid two-host v2 file for the same-name refusal. */
+  function cleanTwoHostInstallation(): unknown {
+    return {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: "/srv/fleet/mac",
+          roles: ["orchestrator"],
+          runner: { kind: "opencode", port: 46000 },
+        },
+        "lane-host": {
+          transport: "ssh",
+          sshAlias: "lane-alias",
+          worktreeRoot: "/srv/fleet/lane",
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    };
+  }
+
+  it("loader refusal reaches hosts list with no echo", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const { code, stdout, stderr } = await runHosts(["list"], file);
+    expect(code).toBe(1);
+    expect(stderr).toContain(HOST_NAME_SECRET_REFUSAL);
+    expect(stdout + stderr).not.toContain(githubToken);
+  });
+
+  it("hosts add refuses a secret-shaped name and does not echo it", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const before = readFileSync(file, "utf8");
+    const { code, stderr } = await runHosts(["add", githubToken, "--yes"], file);
+    expect(code).toBe(1);
+    expect(stderr).toContain(HOST_NAME_SECRET_REFUSAL);
+    expect(stderr).not.toContain(githubToken);
+    expect(readFileSync(file, "utf8")).toBe(before);
+  });
+
+  it("rename on a secret-shaped key makes the loader accept the file", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const installation = secretKeyInstallation() as {
+      hosts: Record<string, unknown>;
+    };
+    writeJsonFile(file, installation);
+    const before = readFileSync(file, "utf8");
+    const expectedHash = sha256(before);
+    const screened = `host:${sha256(githubToken).slice(0, 12)}`;
+    const digest = sha256(
+      JSON.stringify({ expectedHash, newName: "lane-host", oldName: githubToken }),
+    );
+    const { code, stdout, stderr } = await runHosts(
+      ["rename", githubToken, "lane-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain(screened);
+    expect(stdout).toContain("to lane-host");
+    expect(stdout).toContain(`request:${digest}`);
+    expect(stdout + stderr).not.toContain(githubToken);
+    expect(stdout + stderr).not.toContain(file);
+
+    const parsed = parseInstallation(JSON.parse(readFileSync(file, "utf8")));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    const hosts = parsed.installation.hosts ?? {};
+    expect(Object.hasOwn(hosts, githubToken)).toBe(false);
+    expect(Object.hasOwn(hosts, "lane-host")).toBe(true);
+    expect(hosts["lane-host"]?.sshAlias).toBe("lane-alias");
+    expect(hosts["lane-host"]?.container).toBe("fleet-runner");
+    expect(hosts["lane-host"]?.roleAliases).toEqual({
+      "lane-runner": "lane-alias",
+    });
+    expect(hosts["lane-host"]?.tmpDir).toBe("/srv/fleet/tmp");
+    expect(hosts["lane-host"]?.worktreeRoot).toBe("/srv/fleet/lane");
+    expect(hosts["lane-host"]?.roles).toEqual(["lane-runner"]);
+    expect(hosts["lane-host"]?.runner).toEqual({
+      kind: "opencode",
+      port: 4166,
+      tunnelOffset: 1,
+    });
+    expect(hosts.mac).toEqual(installation.hosts.mac);
+  });
+
+  it("rename refusals", async () => {
+    const runRefusal = async (
+      argv: readonly string[],
+      file: string,
+    ): Promise<{ code: number; stdout: string; stderr: string }> => {
+      const before = readFileSync(file, "utf8");
+      const result = await runHosts([...argv, "--yes"], file);
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).not.toContain("request:");
+      expect(readFileSync(file, "utf8")).toBe(before);
+      return result;
+    };
+
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, secretKeyInstallation());
+      const { stderr } = await runRefusal(["rename", githubToken, "a..b"], file);
+      expect(stderr).toContain("the new host name is not a valid host name");
+    }
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, secretKeyInstallation());
+      const { stderr } = await runRefusal(["rename", githubToken, apiKey], file);
+      expect(stderr).toContain(HOST_NAME_SECRET_REFUSAL);
+      expect(stderr).not.toContain(apiKey);
+    }
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, secretKeyInstallation());
+      const { stderr } = await runRefusal(["rename", githubToken, "mac"], file);
+      expect(stderr).toContain("already a host");
+    }
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, secretKeyInstallation());
+      const { stderr } = await runRefusal(["rename", "nosuch", "lane-host"], file);
+      expect(stderr).toContain("no host has that name");
+    }
+    {
+      const dir = makeTempDir();
+      const file = path.join(dir, "fleet.json");
+      writeJsonFile(file, cleanTwoHostInstallation());
+      const { stderr } = await runRefusal(["rename", "lane-host", "lane-host"], file);
+      expect(stderr).toContain("the same as the current name");
+    }
+  });
+
+  it("F96-3 a second rename does not write again", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const first = await runHosts(["rename", githubToken, "lane-host", "--yes"], file);
+    expect(first.code).toBe(0);
+    const afterFirst = readFileSync(file, "utf8");
+
+    const second = await runHosts(["rename", githubToken, "lane-host", "--yes"], file);
+    expect(second.code).toBe(1);
+    expect(second.stderr).toContain("no host has that name");
+    expect(second.stdout + second.stderr).not.toContain(githubToken);
+    expect(readFileSync(file, "utf8")).toBe(afterFirst);
+
+    const declinedDir = makeTempDir();
+    const declinedFile = path.join(declinedDir, "fleet.json");
+    writeJsonFile(declinedFile, secretKeyInstallation());
+    const original = readFileSync(declinedFile, "utf8");
+    const declined = await runHosts(
+      ["rename", githubToken, "lane-host"],
+      declinedFile,
+      {},
+      async () => false,
+    );
+    expect(declined.code).toBe(1);
+    expect(declined.stderr).toContain("not confirmed; nothing was written");
+    expect(declined.stdout + declined.stderr).not.toContain("request:");
+    expect(readFileSync(declinedFile, "utf8")).toBe(original);
+
+    const racedDir = makeTempDir();
+    const racedFile = path.join(racedDir, "fleet.json");
+    writeJsonFile(racedFile, secretKeyInstallation());
+    const racedBytes =
+      `${JSON.stringify({ schemaVersion: 2, forge: { mode: "none" }, hosts: {} }, null, 2)}\n`;
+    const raced = await runHosts(
+      ["rename", githubToken, "lane-host"],
+      racedFile,
+      {},
+      async () => {
+        writeFileSync(racedFile, racedBytes, "utf8");
+        return true;
+      },
+    );
+    expect(raced.code).toBe(1);
+    expect(raced.stderr).toContain("installation: changed");
+    expect(raced.stderr).not.toContain(githubToken);
+    expect(readFileSync(racedFile, "utf8")).toBe(racedBytes);
+  });
+
+  it("F96-4 an unreadable or non-JSON file is not an empty rename", async () => {
+    const dir = makeTempDir();
+    const asDirectory = await runHosts(["rename", "a", "b", "--yes"], dir);
+    expect(asDirectory.code).toBe(1);
+    expect(asDirectory.stderr).toContain("installation: unreadable");
+    expect(asDirectory.stdout + asDirectory.stderr).not.toContain("request:");
+
+    const file = path.join(dir, "fleet.json");
+    writeFileSync(file, "not-json", "utf8");
+    const notJson = await runHosts(["rename", "a", "b", "--yes"], file);
+    expect(notJson.code).toBe(1);
+    expect(notJson.stderr).toContain("installation: invalid");
+    expect(notJson.stdout + notJson.stderr).not.toContain("request:");
+  });
+
+  it("F96-2 rename makes no forge, git, journal or network call", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const { code, calls } = await runHosts(
+      ["rename", githubToken, "lane-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(calls).toEqual([]);
+  });
+
+  it("F96-6 rename does not invoke git", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const { code, calls } = await runHosts(
+      ["rename", githubToken, "lane-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(calls).toEqual([]);
+  });
+
+  it("F96-5 no secret-shaped text and no path in rename or loader output", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+
+    const list = await runHosts(["list"], file);
+    expect(list.code).toBe(1);
+    const listOutput = list.stdout + list.stderr;
+    expect(listOutput).not.toContain(githubToken);
+    expect(listOutput).not.toContain(awsKey);
+    expect(listOutput).not.toContain(slackToken);
+    expect(listOutput).not.toContain(apiKey);
+    expect(listOutput).not.toContain(file);
+
+    const rename = await runHosts(["rename", githubToken, "lane-host", "--yes"], file);
+    expect(rename.code).toBe(0);
+    const renameOutput = rename.stdout + rename.stderr;
+    expect(renameOutput).not.toContain(githubToken);
+    expect(renameOutput).not.toContain(awsKey);
+    expect(renameOutput).not.toContain(slackToken);
+    expect(renameOutput).not.toContain(apiKey);
+    expect(renameOutput).not.toContain(file);
+  });
+
+  it("F96-8 rename carries the full request digest", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, secretKeyInstallation());
+    const before = readFileSync(file, "utf8");
+    const expectedHash = sha256(before);
+    const digest = sha256(
+      JSON.stringify({ expectedHash, newName: "lane-host", oldName: githubToken }),
+    );
+    const { code, stdout } = await runHosts(
+      ["rename", githubToken, "lane-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain(`request:${digest}`);
+  });
+
+  it("help lists rename", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const { code, stdout } = await runHosts(["--help"], file);
+    expect(code).toBe(0);
+    expect(stdout).toContain("rename <old> <new>");
+  });
+
+  it("the fakes are valid host names and secret-shaped", () => {
+    for (const fake of [githubToken, awsKey, slackToken, apiKey]) {
+      expect(fake.length).toBeLessThan(128);
+      expect(isValidHostName(fake)).toBe(true);
+    }
   });
 });

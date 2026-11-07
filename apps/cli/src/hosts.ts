@@ -27,11 +27,13 @@ import {
   hostProbeSpecFromDraft,
   hostProbesHaveFailure,
   parseHostDescriptor,
+  planHostRename,
   probeHost,
   readHashOf,
   readInstallationFile,
   renderInstallationDiff,
   serialiseInstallationCandidate,
+  sha256Of,
   validateHostDraft,
   writeInstallation,
   type HostDraftCandidate,
@@ -40,8 +42,13 @@ import {
   type HostProbeExecutor,
   type HostRunnerDraft,
   type InstallationFileRead,
+  type PlanHostRenameReason,
 } from "@fleet/onboarding";
 import {
+  HOST_NAME_SECRET_REFUSAL,
+  HOST_NAME_TOO_LONG,
+  MAX_HOST_NAME_ARGUMENT_LENGTH,
+  hostNameHasSecretShape,
   isSafeSshHost,
   isValidHostName,
   parseInstallation,
@@ -105,6 +112,9 @@ A schema version 1 file is converted to v2 on the first write.
                                the entry's current values
   remove <name> [--yes]        remove a host; refuses the orchestrator host,
                                the last lane-runner and a host with live work
+  rename <old> <new> [--yes]  renames one host key, prints the screened
+                               current key, works when the loader refuses
+                               that key, keeps the entry
   daemon install|show|uninstall --scheduler systemd [--apply]
                                render the daemon tick's user-scope scheduler
                                units (systemd service and timer); install
@@ -117,8 +127,8 @@ role from the host that holds it. Multi-host dispatch lands with H10; until
 then exactly one host runs lanes.
 
 Exit codes: 0 written (or listed), 1 refused — a probe FAIL, a loader
-refusal, a changed or locked file, live work on remove — 2 usage error.
-There is no --force.`;
+refusal, a secret-shaped host name, a changed or locked file, live work on
+remove — 2 usage error. There is no --force.`;
 
 const HOST_ROLES: readonly HostRole[] = [
   "orchestrator",
@@ -144,11 +154,13 @@ const SUBCOMMAND_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
   add: new Set(["ssh", "port", "worktree-root", "from-descriptor", "role", "yes"]),
   edit: new Set(["ssh", "port", "worktree-root", "role", "yes"]),
   remove: new Set(["yes"]),
+  rename: new Set(["yes"]),
 };
 
 interface HostsArgs {
   readonly subcommand: string;
   readonly name?: string;
+  readonly newName?: string;
   readonly sshAlias?: string;
   readonly port?: number;
   readonly worktreeRoot?: string;
@@ -182,6 +194,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
   const args: {
     subcommand: string;
     name?: string;
+    newName?: string;
     sshAlias?: string;
     port?: number;
     worktreeRoot?: string;
@@ -195,13 +208,19 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
       return { ok: true, help: true, args: emptyArgs };
     }
     if (!token.startsWith("--") || token === "--") {
-      if (args.name !== undefined) {
+      if (args.name === undefined) {
+        args.name = token;
+      } else if (subcommand === "rename" && args.newName === undefined) {
+        args.newName = token;
+      } else {
         return {
           ok: false,
-          error: `Unexpected argument: ${token}\n${HOSTS_HELP}`,
+          error:
+            subcommand === "rename"
+              ? `hosts rename: unexpected extra argument\n${HOSTS_HELP}`
+              : `Unexpected argument: ${token}\n${HOSTS_HELP}`,
         };
       }
-      args.name = token;
       continue;
     }
     const body = token.slice(2);
@@ -550,6 +569,14 @@ async function writeHost(
     io.stderr(`hosts ${mode} requires a host name\n${HOSTS_HELP}\n`);
     return 2;
   }
+  if (name.length > MAX_HOST_NAME_ARGUMENT_LENGTH) {
+    io.stderr(`${HOST_NAME_TOO_LONG}\n`);
+    return 1;
+  }
+  if (hostNameHasSecretShape(name)) {
+    io.stderr(`${HOST_NAME_SECRET_REFUSAL}\n`);
+    return 1;
+  }
   if (!isValidHostName(name)) {
     // The same rule the loader applies to v2 host-map keys, refused at the
     // boundary before anything is drafted.
@@ -885,6 +912,94 @@ async function removeHost(
   return confirmAndWrite(file, state.read, candidate, args, io, options);
 }
 
+/** The one stderr line for a rename refusal reason; never echoes a name. */
+function renameRefusalLine(reason: PlanHostRenameReason): string {
+  switch (reason) {
+    case "name-too-long":
+      return HOST_NAME_TOO_LONG;
+    case "secret-new-name":
+      return HOST_NAME_SECRET_REFUSAL;
+    case "invalid-new-name":
+      return "hosts rename: the new host name is not a valid host name";
+    case "same-name":
+      return "hosts rename: the new name is the same as the current name";
+    case "missing":
+      return "hosts rename: no host has that name";
+    case "exists":
+      return "hosts rename: the new name is already a host";
+    case "not-v2":
+      return "installation: not a schema version 2 file";
+    case "hosts-not-object":
+    case "not-object":
+      return "installation: invalid";
+    case "unreadable":
+      return "installation: unreadable";
+  }
+}
+
+/**
+ * `fleet-v2 hosts rename <old> <new>`: rewrite one host key through the
+ * compare-and-swap write, so a key the loader refuses for secret-shaped text
+ * can be renamed. It reads the raw file (no parse), plans the rename on the
+ * value, confirms, and writes under `<file>.lock`. The old key is never
+ * echoed: only `host:<12 hex>` of it appears.
+ */
+async function renameHost(
+  args: HostsArgs,
+  file: string,
+  io: CliIo,
+  options: HostsCliOptions,
+): Promise<number> {
+  const oldName = args.name;
+  const newName = args.newName;
+  if (oldName === undefined || newName === undefined) {
+    io.stderr(
+      `hosts rename requires the current name and the new name\n${HOSTS_HELP}\n`,
+    );
+    return 2;
+  }
+  const read = await readInstallationFile(file);
+  if (read.status === "unreadable") {
+    io.stderr("installation: unreadable\n");
+    return 1;
+  }
+  if (read.status === "absent") {
+    io.stderr("installation: absent\n");
+    return 1;
+  }
+  if (read.value === undefined) {
+    io.stderr("installation: invalid\n");
+    return 1;
+  }
+  const planned = planHostRename(read.value, oldName, newName);
+  if (!planned.ok) {
+    io.stderr(`${renameRefusalLine(planned.reason)}\n`);
+    return 1;
+  }
+  const screened = `host:${sha256Of(oldName).slice(0, 12)}`;
+  const digest = sha256Of(
+    JSON.stringify({ expectedHash: read.hash, newName, oldName }),
+  );
+  if (!args.yes) {
+    const confirm = options.confirm ?? confirmFromStdin(io);
+    if (!(await confirm(`rename host ${screened} to ${newName}? [y/N]`))) {
+      io.stderr("not confirmed; nothing was written\n");
+      return 1;
+    }
+  }
+  const result = await writeInstallation({
+    file,
+    candidate: planned.candidate,
+    expectedHash: read.hash,
+  });
+  if (result.status === "refused") {
+    io.stderr(`installation: ${result.reason}\n`);
+    return 1;
+  }
+  io.stdout(`renamed host ${screened} to ${newName} request:${digest}\n`);
+  return 0;
+}
+
 async function listHosts(file: string, io: CliIo): Promise<number> {
   const state = await readInstallationState(file);
   if (state.status === "unreadable") {
@@ -1111,6 +1226,9 @@ export async function hostsCommand(
   }
   if (args.subcommand === "remove") {
     return removeHost(args, file, io, options);
+  }
+  if (args.subcommand === "rename") {
+    return renameHost(args, file, io, options);
   }
   return writeHost(
     args.subcommand === "edit" ? "edit" : "add",

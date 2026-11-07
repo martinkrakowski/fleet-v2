@@ -860,6 +860,18 @@ function parseShelfSection(
  */
 export { isValidHostName };
 
+/** Refused once a v2 `hosts` key carries secret-shaped text; never echoes the key. */
+export const HOST_NAME_SECRET_REFUSAL =
+  'hosts: host name must not contain secret-shaped text; rename it with fleet hosts rename';
+
+export const HOST_NAME_TOO_LONG = 'hosts: a host name is too long';
+
+export const MAX_HOST_NAME_ARGUMENT_LENGTH = 4096;
+
+export function hostNameHasSecretShape(name: string): boolean {
+  return typeof name === 'string' && containsSecretShape(name);
+}
+
 function readRequiredEnum<T extends string>(
   record: JsonObject,
   key: string,
@@ -1488,6 +1500,10 @@ function parseV2Hosts(
   }
   const hosts: Record<string, HostSection> = Object.create(null);
   for (const name of Object.keys(section)) {
+    if (hostNameHasSecretShape(name)) {
+      errors.push(HOST_NAME_SECRET_REFUSAL);
+      continue;
+    }
     if (!isValidHostName(name)) {
       errors.push('hosts: invalid host name');
       continue;

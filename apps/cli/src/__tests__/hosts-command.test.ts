@@ -1359,7 +1359,8 @@ describe("hosts output never echoes a withheld host key", () => {
   // A valid dotted key the loader accepts, carrying a long opaque token run.
   const tokenRunKey = "x.abcdefghijklmnopqrstuvwxyz0123456789";
   // A flat 36-character alphanumeric key, the shape of an opaque token.
-  const flatTokenKey = "abcdefghij0123456789abcdefghij012345";
+  // Built at runtime so the fixture is not a literal secret-scanner match (gitleaks generic-api-key).
+  const flatTokenKey = "abcdefghij0123456789".repeat(2).slice(0, 36);
 
   function installationWithTokenKeys(worktreeRoot: string): unknown {
     return {

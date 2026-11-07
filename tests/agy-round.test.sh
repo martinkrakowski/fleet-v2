@@ -345,7 +345,14 @@ check 'a run with edits exits 0' '[ "$(rc)" = 0 ]'
 check 'agy-run is passed --mode full' 'grep -A1 -x -- "--mode" "$T/agyrun.log" | grep -qx full'
 check 'agy-run is passed --isolation-declared' 'grep -qx -- "--isolation-declared" "$T/agyrun.log"'
 check 'agy-run is passed --sandbox' 'grep -qx -- "--sandbox" "$T/agyrun.log"'
-check 'agy-run gets exactly the documented argv, nothing more' '[ "$(cat "$T/agyrun.log" | tr "\n" " ")" = "agy-run --dir $T/container/n --model prov/model-x --mode full --isolation-declared --sandbox --timeout 45m --brief .lane/x.md " ]'
+check 'agy-run is passed --ephemeral-home' 'grep -qx -- "--ephemeral-home" "$T/agyrun.log"'
+check 'agy-run gets exactly the documented argv, nothing more' '[ "$(cat "$T/agyrun.log" | tr "\n" " ")" = "agy-run --dir $T/container/n --model prov/model-x --mode full --isolation-declared --sandbox --timeout 45m --brief .lane/x.md --ephemeral-home " ]'
+# AGY_ROUND_SHARED_HOME=1 is the operator's opt-out, back to the host's own agy home.
+touch "$T/agy-make-changes"; : > "$T/guard-count"; rm -f "$T/agyrun.log"
+env AGY_ROUND_SHARED_HOME=1 "$RUNSH" "$SCRIPT" run --name n --model prov/model-x --brief .lane/x.md > "$T/o" 2> "$T/e"
+echo $? > "$T/rc"
+check 'the shared-home opt-out exits 0' '[ "$(rc)" = 0 ]'
+check 'the opt-out passes no --ephemeral-home' '! grep -qx -- "--ephemeral-home" "$T/agyrun.log"'
 check 'agy-run is never passed --dangerously-skip-permissions' '[ -s "$T/agyrun.log" ] && ! grep -q "dangerously" "$T/agyrun.log"'
 check 'the run prints git status --porcelain' 'grep -q -- "--- git status --porcelain ---" "$T/o"'
 check 'the run prints git diff --stat' 'grep -q -- "--- git diff --stat ---" "$T/o"'

@@ -66,6 +66,11 @@ usage() {
 Usage: agy-run [--status|--wait|--abort|--check|--detach] --dir <worktree> --model <model>
                [--effort low|medium|high|xhigh|max] [--agent <name>] [--mode accept-edits|auto|plan|full]
                [--isolation-declared] [--sandbox] [--timeout <duration, default 45m>] [--brief <path inside --dir, default .lane/brief.md>]
+               [--ephemeral-home]
+--ephemeral-home gives the lane its own throwaway HOME, so agy's state dir, settings and
+install tree are per-run and the host's own agy home is never written. It is removed when the
+run ends. Only agy's OAuth token is seeded into it; it cannot be combined with --detach,
+because a detached lane outlives this script and nothing would clean the home up.
 --mode full additionally requires --isolation-declared and is the only mode that passes
 --dangerously-skip-permissions to agy (as agy's --mode auto plus that one flag).
 The prompt is fixed: agy reads the brief and carries out its WORK ORDER. No prompt text is accepted.
@@ -90,6 +95,8 @@ agymode=accept-edits
 isolation=0
 widen=0
 sandbox=${AGY_SANDBOX:-0}
+ephemeral=${AGY_EPHEMERAL_HOME:-0}
+case $ephemeral in 0 | 1) ;; *) echo "agy-run: AGY_EPHEMERAL_HOME must be 0 or 1" >&2; exit 2 ;; esac
 timeout=45m
 brief=.lane/brief.md
 
@@ -113,6 +120,7 @@ while [ "$#" -gt 0 ]; do
     --mode=*) agymode=${1#--mode=} ;;
     --isolation-declared) isolation=1 ;;
     --sandbox) sandbox=1 ;;
+    --ephemeral-home) ephemeral=1 ;;
     --timeout) need "$@"; timeout=$2; shift ;;
     --timeout=*) timeout=${1#--timeout=} ;;
     --brief) need "$@"; brief=$2; shift ;;
@@ -129,6 +137,10 @@ done
 case "$agymode" in accept-edits | auto | plan | full) ;; *) die_usage "--mode must be accept-edits, auto, plan or full" ;; esac
 # The permission-widening flag belongs to the `full` pair and to nothing else, whichever order it came in.
 if [ "$widen" = 1 ] && { [ "$agymode" != full ] || [ "$isolation" != 1 ]; }; then refuse_permissions; fi
+if [ "$ephemeral" = 1 ] && [ "$detach" = 1 ]; then
+  echo "agy-run: --ephemeral-home cannot be combined with --detach: a detached lane outlives this script, so nothing would remove its throwaway home" >&2
+  exit 2
+fi
 if [ "$agymode" = full ] && [ "$isolation" != 1 ]; then
   die_usage "--mode full requires --isolation-declared: the isolation floor and the acknowledgement are declared for this host, never assumed here"
 fi
@@ -176,6 +188,8 @@ sha256_str() {
 }
 
 STATE=''
+lane_home=''
+home_base=''
 RUN_DIR=''
 lock=''
 out=''
@@ -486,6 +500,37 @@ if ! ( umask 077; set -C; printf '%s\n' "$$" "$(pid_start "$$")" "$model" "$agym
   exit 75
 fi
 
+# --ephemeral-home: the lane gets its own throwaway HOME, so agy's state dir, settings and install
+# tree are per-run and this host's own agy home is never written. 2026-11-07: agy re-creates its
+# install dir as the lane user on every run, which voided a hardened container's pins each time; a
+# per-run home removes the thing that drifts instead of loosening the check that caught it.
+if [ "$ephemeral" = 1 ]; then
+  home_base=${AGY_HOME_BASE:-${STATE%/}/agy-run/homes}
+  case $home_base in
+    /*) ;;
+    *) echo "agy-run: AGY_HOME_BASE must be an absolute path" >&2; rm -f "$lock"; exit 2 ;;
+  esac
+  if [ -L "$home_base" ]; then
+    echo "agy-run: $home_base is a symlink; refusing to use it" >&2; rm -f "$lock"; exit 2
+  fi
+  ( umask 077; mkdir -p "$home_base" ) 2>/dev/null || { echo "agy-run: could not create $home_base" >&2; rm -f "$lock"; exit 1; }
+  lane_home=$home_base/$run_hash.$$
+  if [ -e "$lane_home" ]; then
+    echo "agy-run: $lane_home already exists; refusing to reuse a lane home" >&2; rm -f "$lock"; exit 1
+  fi
+  ( umask 077; mkdir -p "$lane_home/.gemini/antigravity-cli" "$lane_home/.config" ) 2>/dev/null \
+    || { echo "agy-run: could not create the lane home $lane_home" >&2; rm -f "$lock"; exit 1; }
+  # Only the sign-in is seeded. Nothing else is copied: agy makes what it needs, and whatever it
+  # writes dies with this home. The token is read, never printed.
+  seed_home=${AGY_SEED_HOME:-$HOME/.gemini/antigravity-cli}
+  if [ -f "$seed_home/antigravity-oauth-token" ] && [ ! -L "$seed_home/antigravity-oauth-token" ]; then
+    ( umask 077; cat "$seed_home/antigravity-oauth-token" > "$lane_home/.gemini/antigravity-cli/antigravity-oauth-token" ) 2>/dev/null \
+      || { echo "agy-run: could not seed agy's sign-in into the lane home" >&2; rm -rf "$lane_home"; rm -f "$lock"; exit 1; }
+  else
+    echo "agy-run: no agy sign-in at \$AGY_SEED_HOME/antigravity-oauth-token; the lane home carries none and agy may refuse to run" >&2
+  fi
+fi
+
 before=$(g -C "$dir" rev-parse HEAD 2>/dev/null || echo none)
 tmp=$(mk_run_tmp) || exit 1
 printf '%s\n' "$before" > "$tmp"
@@ -529,6 +574,16 @@ finish_run() { # $1: exit status to report; writes last in RUN_DIR via mktemp+mv
   rm -f "$lock"
 }
 
+clean_lane_home() { # removes the throwaway home, never the worktree; a no-op without --ephemeral-home
+  [ "$ephemeral" = 1 ] || return 0
+  [ -n "$lane_home" ] && [ -n "$home_base" ] || return 0
+  [ -L "$lane_home" ] && { echo "agy-run: $lane_home is a symlink; leaving it alone" >&2; return 0; }
+  case $lane_home in
+    "$home_base"/?*) rm -rf "$lane_home" ;;
+    *) echo "agy-run: refusing to remove $lane_home: it is not under $home_base" >&2 ;;
+  esac
+}
+
 stop_run() { # $1: exit status
   trap '' INT TERM HUP
   if [ "$detach" = 1 ]; then
@@ -544,6 +599,7 @@ stop_run() { # $1: exit status
     echo "agy-run: stopped; the lane in $dir was stopped with it" >&2
   fi
   cat "$err" >&2
+  clean_lane_home
   finish_run "$1"
   exit "$1"
 }
@@ -555,6 +611,8 @@ trap 'stop_run 129' HUP
 # ignores HUP, so it survives the end of the ssh session that started it.
 if [ "$detach" = 1 ]; then
   ( trap '' HUP; cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
+elif [ "$ephemeral" = 1 ]; then
+  ( cd "$dir" && exec env HOME="$lane_home" XDG_CONFIG_HOME="$lane_home/.config" "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 else
   ( cd "$dir" && exec "$AGY_BIN" "$@" ) < /dev/null > "$out" 2> "$err" &
 fi
@@ -602,7 +660,11 @@ case "$flat" in
     echo "agy-run: agy DENIED itself these actions (headless mode cannot ask): $names" >&2
     echo "agy-run: an allow rule for them belongs in agy's settings on this host, scoped to the worktree root; that is an owner change" >&2
     cid=$(printf '%s' "$flat" | sed -n 's/.*"conversation_id":"\([^"]*\)".*/\1/p')
-    agyhome=${AGY_HOME:-$HOME/.gemini/antigravity-cli}
+    if [ "$ephemeral" = 1 ] && [ -n "$lane_home" ]; then
+      agyhome=$lane_home/.gemini/antigravity-cli
+    else
+      agyhome=${AGY_HOME:-$HOME/.gemini/antigravity-cli}
+    fi
     if [ -n "$cid" ] && ls "$agyhome/conversations/$cid".db* >/dev/null 2>&1; then
       targets=$(cat "$agyhome/conversations/$cid".db* 2>/dev/null | LC_ALL=C grep -ao 'denied permission for [a-z_]*([^)]*)' | sed 's/^denied permission for //' | sort -u)
       if [ -n "$targets" ]; then
@@ -613,6 +675,7 @@ case "$flat" in
     [ "$status" = 0 ] && [ "${AGY_DENIED_IS_FAILURE:-0}" = 1 ] && status=5
     ;;
 esac
+clean_lane_home
 finish_run "$status"
 echo "agy-run: ended after $(( $(date +%s) - start )) s with exit $status (model $model, mode $agymode, HEAD before: $before, out: $out)" >&2
 exit "$status"

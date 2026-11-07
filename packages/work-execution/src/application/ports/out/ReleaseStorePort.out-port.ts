@@ -34,6 +34,16 @@ export type ReleaseStorePruneResult =
   /** An unfinished prune; `removed` names any builds it did take out first. */
   | { readonly outcome: 'unreadable'; readonly removed?: readonly string[] };
 
+/**
+ * CO14b: the outcome of the orphaned `.current.*.tmp` temp-link cleanup. A
+ * clean pass reports the count of removed temp links and the names of any
+ * matching entries that were not links (reported, never removed). An
+ * unreadable root is `unreadable`, never "no orphans" and never a pass.
+ */
+export type ReleaseStoreOrphanCleanupResult =
+  | { readonly outcome: 'cleaned'; readonly removed: number; readonly findings: readonly string[] }
+  | { readonly outcome: 'unreadable' };
+
 /** A fresh staging directory created by this `prepare` call; the paths stay inside the application. */
 export type ReleaseStagingResult =
   | {
@@ -92,4 +102,13 @@ export interface ReleaseStorePort {
   }): Promise<ReleaseStorePruneResult>;
   /** Remove an incomplete build: this run's staging directory, its archive and its home. */
   discard(input: { readonly root: string; readonly buildId: string }): Promise<ReleaseStoreWriteResult>;
+  /**
+   * CO14b: remove orphaned `.current.*.tmp` symlinks left by an interrupted
+   * repoint. Only entries whose name matches that temp pattern and that are
+   * symbolic links are removed; the `current` link and build directories
+   * (including a matching entry that is not a link) are never touched. A
+   * matching non-link entry is reported as a finding, not removed. Nothing
+   * outside the root is ever read or removed. The pass is idempotent.
+   */
+  cleanupOrphanTmpLinks(input: { readonly root: string }): Promise<ReleaseStoreOrphanCleanupResult>;
 }

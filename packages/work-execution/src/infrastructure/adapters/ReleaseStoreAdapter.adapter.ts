@@ -24,6 +24,7 @@ import { randomBytes } from 'node:crypto';
 import type {
   ReleaseBuildRecord,
   ReleaseStoreListing,
+  ReleaseStoreOrphanCleanupResult,
   ReleaseStorePort,
   ReleaseStagingResult,
   ReleaseStorePruneResult,
@@ -43,6 +44,13 @@ const MARKER_NAME = '.fleet-release-verified';
 const CLI_ENTRY = ['apps', 'cli', 'dist', 'bin.js'];
 const MARKER_MAX_BYTES = 4096;
 const CURRENT_NAME = 'current';
+/**
+ * CO14b: the temp-link pattern an interrupted repoint can leave at the root:
+ * `.current.<pid>.<hex>.tmp` (see `repoint`). Only a symlink whose name
+ * matches exactly this pattern is removable; `current`, build directories and
+ * any other entry are never touched.
+ */
+const ORPHAN_TMP_PATTERN = /^\.current\.[A-Za-z0-9._-]+\.tmp$/;
 
 type CurrentRead = { readonly ok: true; readonly sha: string | null } | { readonly ok: false };
 type BuildsRead = { readonly ok: true; readonly builds: readonly ReleaseBuildRecord[] } | { readonly ok: false };
@@ -193,6 +201,45 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     } catch {
       return { outcome: 'unreadable' };
     }
+  }
+
+  /**
+   * CO14b: remove orphaned `.current.*.tmp` temp links. Only symlinks whose
+   * name matches the temp pattern are removed; `current`, build directories
+   * and matching non-link entries are never removed (a matching non-link is
+   * reported as a finding). An unreadable root, or a failed removal, is
+   * `unreadable`, never "no orphans" and never a pass. Idempotent: a second
+   * pass over a clean root removes nothing.
+   */
+  async cleanupOrphanTmpLinks(input: { readonly root: string }): Promise<ReleaseStoreOrphanCleanupResult> {
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(input.root, { withFileTypes: true });
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+    const doomed: string[] = [];
+    const findings: string[] = [];
+    for (const entry of entries) {
+      if (!ORPHAN_TMP_PATTERN.test(entry.name)) {
+        continue;
+      }
+      if (entry.isSymbolicLink()) {
+        doomed.push(entry.name);
+      } else {
+        // A file or directory matching the pattern is a finding, never removed
+        // (this covers a build directory whose name starts with `.current.`).
+        findings.push(entry.name);
+      }
+    }
+    for (const name of doomed) {
+      try {
+        await fs.unlink(path.join(input.root, name));
+      } catch {
+        return { outcome: 'unreadable' };
+      }
+    }
+    return { outcome: 'cleaned', removed: doomed.length, findings };
   }
 }
 

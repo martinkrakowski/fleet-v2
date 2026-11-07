@@ -14,11 +14,13 @@
 
 import {
   ActionAuthorizationAdapter,
+  ConductorDriverLeaseAdapter,
   LocalExecutor,
   ManageReleaseUseCase,
   ReleaseStoreAdapter,
   consumptionId,
   releaseActionScope,
+  sha256HexDigest,
   type ActionAuthorizationPort,
   type CommandExecutorPort,
   type ConductorDriverLeasePort,
@@ -28,6 +30,7 @@ import {
   type ReleaseStorePort,
 } from '@fleet/work-execution';
 
+import type { FleetInstallation } from '@fleet/installation';
 import { CliUsageError } from './commands/payload.js';
 import type { CommandHandler, Payload } from './commands/payload.js';
 import type { FleetCliRuntime } from './composition.js';
@@ -63,11 +66,11 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
       }
       const result = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
         projectId: request.projectId,
-        actionScope,
+        actionScope: releaseScopeForRoot(actionScope, request.root),
         expectedHeadSha: request.expectedHeadSha,
       });
       return result.outcome === 'authorized'
-        ? { outcome: 'granted', authorizationGrantId: result.grantId }
+        ? { outcome: 'granted', authorizationGrantId: result.grantId, root: request.root }
         : { outcome: 'blocked', reason: result.reason };
     },
     consumeGrant: async (request) => {
@@ -79,7 +82,7 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
         consumptionId: consumptionId(request.actionId),
         grantId: request.authorizationGrantId,
         actionId: request.actionId,
-        actionScope,
+        actionScope: releaseScopeForRoot(actionScope, request.root),
         attemptId: request.attemptId ?? request.actionId,
         expectedHeadSha: request.expectedHeadSha,
       });
@@ -90,15 +93,48 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
   });
 }
 
+/**
+ * CO14b: the coordination scope of one release action, carrying the root the
+ * grant authorizes. The root is bound as a digest (never the path), so a
+ * grant recorded for one root can never authorize another, and no path ever
+ * reaches coordination state or output.
+ */
+function releaseScopeForRoot(actionScope: string, root: string | undefined): string {
+  return root === undefined ? actionScope : `${actionScope}@${sha256HexDigest(root)}`;
+}
+
+/**
+ * CO14b: the state directory of the driver that serves a release root. The
+ * installation's `daemon.stateDir` is the driver state directory (the release
+ * reads the lease of that directory, never the process-wide one). When none
+ * is recorded the root's driver state directory cannot be determined and the
+ * release refuses `release-root-state-dir-unknown`. Pure: no filesystem or
+ * environment access.
+ */
+export function resolveReleaseRootStateDir(
+  root: string,
+  installation: FleetInstallation | undefined,
+): string | null {
+  const stateDir = installation?.daemon?.stateDir;
+  return typeof stateDir === 'string' && stateDir.trim() !== '' ? stateDir : null;
+}
+
 function releaseHandler(action: ReleaseAction): CommandHandler {
   return async (payload, rt) => {
     if (Object.hasOwn(payload, 'action')) {
       throw new CliUsageError('Unknown release option: --action');
     }
+    const request = parseRequest({ ...payload, action });
+    const stateDir = resolveReleaseRootStateDir(request.root, rt.installation);
+    if (stateDir === null) {
+      return { outcome: 'refused', reason: 'release-root-state-dir-unknown' };
+    }
     return manageReleaseFromPayload(
       { ...payload, action },
       {
-        lease: rt.conductor.driverLease,
+        // CO14b: the release reads the lease of the driver that serves this
+        // root (its state directory), never the process-wide driver lease.
+        lease: new ConductorDriverLeaseAdapter({ stateDir }),
         authorization: releaseAuthorization(rt),
         executor: new LocalExecutor(),
         nowIso: () => new Date().toISOString(),

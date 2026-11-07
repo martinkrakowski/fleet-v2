@@ -6,7 +6,10 @@
  * store adapter reads an empty store and nothing touches the filesystem.
  */
 
-import { describe, expect, it } from 'vitest';
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import type {
   ActionAuthorizationPort,
@@ -16,6 +19,7 @@ import type {
   ConductorDriverLeaseRecord,
   ConductorDriverLeasePort,
 } from '@fleet/work-execution';
+import type { FleetInstallation } from '@fleet/installation';
 
 import { CliUsageError } from '../commands/payload.js';
 import { createFleetCliRuntime } from '../composition.js';
@@ -27,6 +31,25 @@ const SOURCE = '/nonexistent-fleet-v2-source-co14';
 const SHA = 'a'.repeat(40);
 const NOW = '2026-11-06T10:00:00.000Z';
 const PROJECT = 'fleet-v2';
+
+const HOSTS = {
+  here: {
+    transport: 'local' as const,
+    worktreeRoot: '/tmp/wt',
+    roles: ['orchestrator', 'lane-runner', 'verifier'] as const,
+    runner: { kind: 'opencode' as const, port: 4166 },
+  },
+};
+
+/** A v2 installation whose daemon records a driver state directory (CO14b). */
+function installationWithDriverStateDir(stateDir: string): FleetInstallation {
+  return {
+    schemaVersion: 2,
+    forge: { mode: 'none' },
+    hosts: HOSTS,
+    daemon: { stateDir, nodePath: '/x', cliPath: '/x', unitDir: '/x', installationFile: '/x' },
+  };
+}
 
 const LIVE_LEASE: ConductorDriverLeaseRecord = {
   version: 1,
@@ -68,6 +91,15 @@ function deps(lease: ConductorDriverLeaseRecord | null = null): {
 const installPayload = { action: 'install', root: ROOT, sha: SHA, source: SOURCE };
 
 describe('release command', () => {
+  let cliStateDir: string | undefined;
+
+  afterEach(async () => {
+    if (cliStateDir !== undefined) {
+      await fs.rm(cliStateDir, { recursive: true, force: true });
+      cliStateDir = undefined;
+    }
+  });
+
   it('install without apply returns the plan and runs no command', async () => {
     const d = deps();
     const result = await manageReleaseFromPayload(installPayload, d);
@@ -111,7 +143,11 @@ describe('release command', () => {
   });
 
   it('the registered release group refuses apply on a runtime with no recorded grant', async () => {
-    const rt = createFleetCliRuntime();
+    cliStateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-release-cli-state-'));
+    const rt = createFleetCliRuntime({
+      stateDir: cliStateDir,
+      installation: installationWithDriverStateDir(cliStateDir),
+    });
     const out: string[] = [];
     const err: string[] = [];
     const code = await runCli(

@@ -44,7 +44,16 @@ export type ManageReleaseRefusal =
   | 'build-failed'
   | 'verify-failed'
   | 'store-unreadable'
-  | 'failed';
+  | 'failed'
+  // CO14b: the release names the state directory of the driver that serves the
+  // root, and refuses when that directory cannot be determined.
+  | 'release-root-state-dir-unknown'
+  // CO14b: a release grant is bound to the root it names; any other root is
+  // refused before anything is built, repointed or consumed.
+  | 'release-grant-root-mismatch'
+  // CO14b: an unreadable release store/root is unknown, never an empty store
+  // or a pass (orphan temp-link cleanup reports this).
+  | 'release-unknown-state';
 
 export interface ManageReleasePlan {
   readonly outcome: 'planned';

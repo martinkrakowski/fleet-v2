@@ -16,10 +16,16 @@ export interface ResolveActionAuthorizationRequest {
   readonly actionKind: AuthorizedActionKind;
   readonly expectedHeadSha: string;
   readonly policyRevision: string;
+  /**
+   * CO14b: the release root the action runs on. Required for release action
+   * kinds (a release grant authorizes only the root it names); absent for
+   * forge actions, which carry no root.
+   */
+  readonly root?: string;
 }
 
 export type ResolveActionAuthorizationResult =
-  | { readonly outcome: 'granted'; readonly authorizationGrantId: string }
+  | { readonly outcome: 'granted'; readonly authorizationGrantId: string; readonly root?: string }
   | { readonly outcome: 'blocked'; readonly reason: string }
   | { readonly outcome: 'unknown'; readonly reason: string };
 
@@ -38,6 +44,12 @@ export interface ConsumeActionAuthorizationRequest {
    * reason: the recorded coordinates scope the consumption.
    */
   readonly attemptId?: string;
+  /**
+   * CO14b: the release root the action runs on. Required for release action
+   * kinds; the consume compares it against the root the grant was resolved
+   * for, so a grant cannot be moved to another root after it was issued.
+   */
+  readonly root?: string;
 }
 
 export type ConsumeActionAuthorizationResult =

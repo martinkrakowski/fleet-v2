@@ -221,11 +221,19 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         actionKind: coordinates.actionKind,
         expectedHeadSha: target,
         policyRevision: coordinates.actionKind,
+        // CO14b: the grant is bound to the root the release runs on.
+        root: request.root,
       });
       if (resolved.outcome === 'granted') {
+        if (resolved.root !== undefined && resolved.root !== request.root) {
+          return { refusal: 'release-grant-root-mismatch' };
+        }
         return typeof resolved.authorizationGrantId === 'string' && resolved.authorizationGrantId.trim() !== ''
           ? resolved.authorizationGrantId
           : { refusal: 'authority-unknown' };
+      }
+      if (resolved.outcome === 'blocked' && resolved.reason === 'release-grant-root-mismatch') {
+        return { refusal: 'release-grant-root-mismatch' };
       }
       return { refusal: resolved.outcome === 'blocked' ? 'authority-refused' : 'authority-unknown' };
     } catch {
@@ -370,8 +378,15 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         actionKind: coordinates.actionKind,
         expectedHeadSha: target,
         attemptId: coordinates.actionId,
+        // CO14b: the consume compares the root the grant was resolved for.
+        root: request.root,
       });
-      return consumed.outcome === 'consumed' && consumed.actionId === coordinates.actionId ? null : 'authority-refused';
+      if (consumed.outcome === 'consumed' && consumed.actionId === coordinates.actionId) {
+        return null;
+      }
+      return consumed.outcome === 'refused' && consumed.reason === 'release-grant-root-mismatch'
+        ? 'release-grant-root-mismatch'
+        : 'authority-refused';
     } catch {
       return 'authority-unknown';
     }

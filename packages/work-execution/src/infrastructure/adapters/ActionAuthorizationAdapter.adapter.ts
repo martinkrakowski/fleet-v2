@@ -26,6 +26,7 @@ import type {
   ResolveActionAuthorizationRequest,
   ResolveActionAuthorizationResult,
 } from '../../application/ports/out/ActionAuthorizationPort.out-port.js';
+import { RELEASE_ACTION_KINDS } from '../../domain/coordination-keys.js';
 import { readRecordSchemaVersion } from '../../domain/record-schema-version.js';
 
 /** The stored grant record version this adapter writes; `1` (or absent) is still read. */
@@ -44,6 +45,12 @@ export interface ActionAuthorizationGrantEntry {
   readonly expectedHeadSha: string;
   /** Action kind the grant was issued for. */
   readonly kind: string;
+  /**
+   * CO14b: the release root the grant was issued for. Required for a release
+   * kind (a release grant authorizes only the root it names); absent for a
+   * forge kind, which carries no root.
+   */
+  readonly root?: string;
   /** Action id that durably consumed this grant; null while unconsumed. */
   consumedByActionId: string | null;
 }
@@ -78,12 +85,22 @@ export interface ActionAuthorizationDelegate {
 
 const FORGE_ACTION_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status'] as const;
 
+/** Every authorized action kind: forge kinds plus the release kinds (CO14). */
+const ALL_ACTION_KINDS = [...FORGE_ACTION_KINDS, ...RELEASE_ACTION_KINDS] as const;
+
+/** True for a release action kind; only release actions are bound to a root. */
+function isReleaseActionKind(kind: string): boolean {
+  return (RELEASE_ACTION_KINDS as readonly string[]).includes(kind);
+}
+
 const MAX_GRANT_ID_LENGTH = 256;
 const MAX_ACTION_ID_LENGTH = 512;
 const MAX_SCOPE_ID_LENGTH = 256;
 const MAX_HEAD_LENGTH = 64;
 const MAX_POLICY_REVISION_LENGTH = 256;
 const MAX_REASON_LENGTH = 300;
+/** The release root coordinate bound to a grant; bounded like the use case's root. */
+const MAX_ROOT_LENGTH = 4096;
 
 const PATH_SHAPE = /(?:^|[\s"'(=])(?:\/[A-Za-z0-9._-]+){2,}|[A-Za-z]:\\/;
 const SAFE_HEAD_TOKEN = /^[A-Za-z0-9._-]+$/;
@@ -170,6 +187,20 @@ function isCleanText(value: unknown, maxLength: number): value is string {
   );
 }
 
+/**
+ * A release root coordinate: a bounded, non-blank string with no control or
+ * bidi character. It is a runtime input read at the port boundary (never a
+ * raw property access); it is never echoed into any result.
+ */
+function isCleanRoot(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length <= MAX_ROOT_LENGTH &&
+    value.trim().length > 0 &&
+    !hasControlOrBidiCharacter(value)
+  );
+}
+
 function ownDataDescriptor(
   source: object,
   key: string,
@@ -201,7 +232,7 @@ export function parseActionAuthorizationGrantEntry(raw: unknown): ParsedActionAu
   }
 }
 
-const GRANT_FIELD_KEYS = ['schemaVersion', 'attemptId', 'expectedHeadSha', 'kind', 'consumedByActionId'] as const;
+const GRANT_FIELD_KEYS = ['schemaVersion', 'attemptId', 'expectedHeadSha', 'kind', 'root', 'consumedByActionId'] as const;
 
 /**
  * One snapshot of the stored grant: each field's own descriptor is read exactly
@@ -259,16 +290,18 @@ function parseGrantUnchecked(source: unknown): ParsedActionAuthorizationGrantRea
 
   const read = readPlainRecord(record, {
     schemaVersion: { kind: 'integer', min: 1, max: 2, optional: true },
-    kind: { kind: 'literal', values: FORGE_ACTION_KINDS },
+    kind: { kind: 'literal', values: ALL_ACTION_KINDS },
     expectedHeadSha: { kind: 'string', maxLength: MAX_HEAD_LENGTH },
+    root: { kind: 'string', maxLength: MAX_ROOT_LENGTH, optional: true },
     ...(attemptDeclared ? { attemptId: { kind: 'string' as const, maxLength: MAX_SCOPE_ID_LENGTH } } : {}),
   });
   if (!read.ok) {
     return { ok: false, reason: 'malformed' };
   }
-  const { kind, expectedHeadSha, attemptId } = read.value as {
+  const { kind, expectedHeadSha, root, attemptId } = read.value as {
     kind: string;
     expectedHeadSha: string;
+    root?: string;
     attemptId?: string;
   };
   if (
@@ -276,6 +309,16 @@ function parseGrantUnchecked(source: unknown): ParsedActionAuthorizationGrantRea
     containsDisallowedOutputText(expectedHeadSha) ||
     (attemptDeclared && !isSafeId(attemptId, MAX_SCOPE_ID_LENGTH, false))
   ) {
+    return { ok: false, reason: 'malformed' };
+  }
+  // A release grant must name the root it authorizes: a rootless release grant
+  // is never readable, so it can never authorize a release ("never an empty
+  // root that matches anything"). Forge grants carry no root.
+  const releaseGrant = isReleaseActionKind(kind);
+  if (root !== undefined && !isCleanRoot(root)) {
+    return { ok: false, reason: 'malformed' };
+  }
+  if (releaseGrant && root === undefined) {
     return { ok: false, reason: 'malformed' };
   }
   return {
@@ -286,6 +329,7 @@ function parseGrantUnchecked(source: unknown): ParsedActionAuthorizationGrantRea
       ...(attemptDeclared && attemptId !== undefined ? { attemptId } : {}),
       expectedHeadSha,
       kind,
+      ...(releaseGrant ? { root: root as string } : {}),
       consumedByActionId: consumed.value,
     },
   };
@@ -307,9 +351,10 @@ function readResolveRequest(request: unknown): Validated<ResolveActionAuthorizat
     projectId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
     workOrderId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
     attemptId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
-    actionKind: { kind: 'literal', values: FORGE_ACTION_KINDS },
+    actionKind: { kind: 'literal', values: ALL_ACTION_KINDS },
     expectedHeadSha: { kind: 'string', maxLength: MAX_HEAD_LENGTH },
     policyRevision: { kind: 'string', maxLength: MAX_POLICY_REVISION_LENGTH },
+    root: { kind: 'string', maxLength: MAX_ROOT_LENGTH, optional: true },
   });
   if (!read.ok) {
     return { ok: false, reason: failureOf(read.reason) };
@@ -321,7 +366,9 @@ function readResolveRequest(request: unknown): Validated<ResolveActionAuthorizat
     !isSafeId(value.workOrderId, MAX_SCOPE_ID_LENGTH, false) ||
     !isSafeId(value.attemptId, MAX_SCOPE_ID_LENGTH, false) ||
     !isCleanText(value.expectedHeadSha, MAX_HEAD_LENGTH) ||
-    !isCleanText(value.policyRevision, MAX_POLICY_REVISION_LENGTH)
+    !isCleanText(value.policyRevision, MAX_POLICY_REVISION_LENGTH) ||
+    (value.root !== undefined && !isCleanRoot(value.root)) ||
+    (isReleaseActionKind(value.actionKind) && value.root === undefined)
   ) {
     return { ok: false, reason: 'invalid-request' };
   }
@@ -354,18 +401,21 @@ function readConsumeRequest(request: unknown): Validated<ConsumeActionAuthorizat
   const read = readPlainRecord(request, {
     authorizationGrantId: { kind: 'string', maxLength: MAX_GRANT_ID_LENGTH },
     actionId: { kind: 'string', maxLength: MAX_ACTION_ID_LENGTH },
-    actionKind: { kind: 'literal', values: FORGE_ACTION_KINDS },
+    actionKind: { kind: 'literal', values: ALL_ACTION_KINDS },
+    root: { kind: 'string', maxLength: MAX_ROOT_LENGTH, optional: true },
   });
   if (!read.ok) {
     return { ok: false, reason: failureOf(read.reason) };
   }
   const required = read.value as unknown as Pick<
     ConsumeActionAuthorizationRequest,
-    'authorizationGrantId' | 'actionId' | 'actionKind'
+    'authorizationGrantId' | 'actionId' | 'actionKind' | 'root'
   >;
   if (
     !isSafeId(required.authorizationGrantId, MAX_GRANT_ID_LENGTH, true) ||
-    !isSafeId(required.actionId, MAX_ACTION_ID_LENGTH, true)
+    !isSafeId(required.actionId, MAX_ACTION_ID_LENGTH, true) ||
+    (required.root !== undefined && !isCleanRoot(required.root)) ||
+    (isReleaseActionKind(required.actionKind) && required.root === undefined)
   ) {
     return { ok: false, reason: 'invalid-request' };
   }
@@ -384,6 +434,7 @@ function readConsumeRequest(request: unknown): Validated<ConsumeActionAuthorizat
       authorizationGrantId: required.authorizationGrantId,
       actionId: required.actionId,
       actionKind: required.actionKind,
+      ...(required.root !== undefined ? { root: required.root } : {}),
       ...(expectedHeadSha.value !== undefined ? { expectedHeadSha: expectedHeadSha.value } : {}),
       ...(attemptId.value !== undefined ? { attemptId: attemptId.value } : {}),
     },
@@ -482,11 +533,20 @@ function readDelegateResolveResult(
   if (head.value.outcome === 'granted') {
     const granted = readPlainRecord(answer, {
       authorizationGrantId: { kind: 'string', maxLength: MAX_GRANT_ID_LENGTH },
+      root: { kind: 'string', maxLength: MAX_ROOT_LENGTH, optional: true },
     });
-    if (!granted.ok || !isSafeId(granted.value.authorizationGrantId, MAX_GRANT_ID_LENGTH, true)) {
+    if (
+      !granted.ok ||
+      !isSafeId(granted.value.authorizationGrantId, MAX_GRANT_ID_LENGTH, true) ||
+      (granted.value.root !== undefined && !isCleanRoot(granted.value.root))
+    ) {
       return null;
     }
-    return { outcome: 'granted', authorizationGrantId: granted.value.authorizationGrantId as string };
+    return {
+      outcome: 'granted',
+      authorizationGrantId: granted.value.authorizationGrantId as string,
+      ...(granted.value.root !== undefined ? { root: granted.value.root } : {}),
+    };
   }
   const withReason = readPlainRecord(answer, {
     reason: { kind: 'string', maxLength: MAX_REASON_LENGTH },
@@ -645,7 +705,21 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
     } catch {
       return { outcome: 'blocked', reason: 'authorization-unavailable' };
     }
-    return readDelegateResolveResult(answer) ?? { outcome: 'blocked', reason: 'authorization-unavailable' };
+    const resolved = readDelegateResolveResult(answer);
+    if (resolved === null) {
+      return { outcome: 'blocked', reason: 'authorization-unavailable' };
+    }
+    // CO14b: a granted release must be bound to the root the request names; a
+    // grant resolved for another root is a mismatch, never authority.
+    if (
+      resolved.outcome === 'granted' &&
+      request.root !== undefined &&
+      resolved.root !== undefined &&
+      resolved.root !== request.root
+    ) {
+      return { outcome: 'blocked', reason: 'release-grant-root-mismatch' };
+    }
+    return resolved;
   }
 
   private async consumeThroughDelegate(
@@ -676,6 +750,7 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
     // Every record is read before any is matched: one unreadable or unknown-version
     // record fails the whole store closed instead of being skipped.
     let match: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry } | undefined;
+    let rootMismatch = false;
     for (const [rawGrantId, rawEntry] of grants) {
       if (!isSafeId(rawGrantId, MAX_GRANT_ID_LENGTH, true)) {
         return { outcome: 'blocked', reason: 'invalid-grant-record' };
@@ -688,15 +763,27 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         };
       }
       const grant = parsed.grant;
-      if (
-        match === undefined &&
+      const coordinatesMatch =
         grant.consumedByActionId === null &&
         grant.kind === request.actionKind &&
         grant.expectedHeadSha === request.expectedHeadSha &&
-        (grant.attemptId === undefined || grant.attemptId === request.attemptId)
-      ) {
+        (grant.attemptId === undefined || grant.attemptId === request.attemptId);
+      if (!coordinatesMatch) {
+        continue;
+      }
+      // CO14b: a release grant is bound to the root it names. A grant that
+      // matches kind/head/attempt but names another root is a root mismatch,
+      // never authority for this root.
+      if (grant.root !== undefined && grant.root !== request.root) {
+        rootMismatch = true;
+        continue;
+      }
+      if (match === undefined) {
         match = { id: rawGrantId, grant };
       }
+    }
+    if (rootMismatch && match === undefined) {
+      return { outcome: 'blocked', reason: 'release-grant-root-mismatch' };
     }
     if (match === undefined) {
       return { outcome: 'blocked', reason: 'no-matching-grant' };
@@ -708,10 +795,15 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         attemptId: request.attemptId,
         expectedHeadSha: match.grant.expectedHeadSha,
         kind: match.grant.kind,
+        ...(match.grant.root !== undefined ? { root: match.grant.root } : {}),
         consumedByActionId: null,
       });
     }
-    return { outcome: 'granted', authorizationGrantId: match.id };
+    return {
+      outcome: 'granted',
+      authorizationGrantId: match.id,
+      ...(match.grant.root !== undefined ? { root: match.grant.root } : {}),
+    };
   }
 
   private consumeLocally(
@@ -758,6 +850,13 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
       }
     }
+    // CO14b: the consume request carries the root the release runs on and
+    // compares it to the root the grant was resolved for, so a grant cannot be
+    // moved to another root after it was issued. Nothing is consumed on a
+    // mismatch.
+    if (grant.root !== undefined && grant.root !== request.root) {
+      return { outcome: 'refused', reason: 'release-grant-root-mismatch' };
+    }
     if (grant.consumedByActionId === null) {
       const boundAttemptId = grant.attemptId ?? request.attemptId;
       grants.set(request.authorizationGrantId, {
@@ -766,6 +865,7 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         ...(boundAttemptId !== undefined ? { attemptId: boundAttemptId } : {}),
         expectedHeadSha: grant.expectedHeadSha,
         kind: grant.kind,
+        ...(grant.root !== undefined ? { root: grant.root } : {}),
         consumedByActionId: request.actionId,
       });
       return { outcome: 'consumed', actionId: request.actionId };

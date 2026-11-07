@@ -35,6 +35,20 @@ function isFilled(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+// CO24f: the same control and bidi screen the CoordinationRequest entity
+// applies to a recorded attempt (C0, DEL/C1, U+061C, U+200E/F, U+2028/9,
+// U+202A–E, U+2066–9 and U+FEFF). A value carrying any of them is refused
+// here, typed, so it can never reach the record builder and make it throw.
+const ATTEMPT_CONTROL_CHARACTER =
+  // eslint-disable-next-line no-control-regex
+  /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
+
+// The record builder refuses an attempt longer than this; screen it here so an
+// over-long value is a typed rejection, never a throw from the record builder.
+const MAX_GRANT_ATTEMPT_ID_LENGTH = 256;
+
+const FORGE_SCOPE_PREFIX = 'forge:';
+
 export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
   constructor(private readonly deps?: RequestScopedDecisionDependencies) {}
 
@@ -70,11 +84,40 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (request.attemptId !== undefined && !isFilled(request.attemptId)) {
       return { outcome: 'rejected', reason: 'a decision request attemptId must be a non-empty string when given' };
     }
+    if (request.attemptId !== undefined && ATTEMPT_CONTROL_CHARACTER.test(request.attemptId)) {
+      return {
+        outcome: 'rejected',
+        reason: 'a decision request attemptId must not contain control or bidi characters',
+      };
+    }
+    if (
+      request.attemptId !== undefined &&
+      request.attemptId.trim().length > MAX_GRANT_ATTEMPT_ID_LENGTH
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: 'a decision request attemptId must be at most 256 characters',
+      };
+    }
     const kind = CoordinationKind.create(request.kind);
     if (!kind.success || kind.value === undefined) {
       return {
         outcome: 'rejected',
         reason: `a decision request requires a recorded kind: ${String(request.kind)}`,
+      };
+    }
+    // CO24f: a forge action decision must name the attempt it authorizes; the
+    // coordinate-less path is no longer requester-selectable. A merge grant is
+    // attempt-less by design (DT6b) and never passes through this use case, so
+    // every `forge:` action decision recorded here carries an attempt.
+    if (
+      kind.value.getValue() === 'action-decision' &&
+      request.actionScope.trim().startsWith(FORGE_SCOPE_PREFIX) &&
+      request.attemptId === undefined
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: 'a forge action decision requires an attemptId',
       };
     }
     const existing = await this.deps.requestRepo.findRequestById(request.requestId.trim());

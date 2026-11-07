@@ -7,7 +7,10 @@
  * nothing. The actor id is the caller's, never the body.
  */
 
-import type { PermissionVerdictRecord } from '../../domain/entities/PermissionRequest.js';
+import type {
+  PermissionRequestRecord,
+  PermissionVerdictRecord,
+} from '../../domain/entities/PermissionRequest.js';
 import type { PermissionRequestRepositoryPort } from '../ports/out/PermissionRequestRepositoryPort.out-port.js';
 import type {
   GiveToolPermissionVerdictOutcome,
@@ -47,6 +50,16 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
     }
   }
 
+  private read(requestId: string): PermissionRequestRecord | undefined {
+    try {
+      return this.repository.find(requestId);
+    } catch {
+      // A repository read that throws is a failed read, not a bug: report it
+      // as unknown so the caller treats the request id as unresolvable.
+      return undefined;
+    }
+  }
+
   private execute(
     body: unknown,
     requestId: string,
@@ -72,7 +85,7 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
       return { outcome: 'refused', reason: 'request-id-invalid' };
     }
 
-    const record = this.repository.find(requestId);
+    const record = this.read(requestId);
     if (record === undefined) {
       return { outcome: 'unknown' };
     }
@@ -88,7 +101,7 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
       if (result.outcome === 'unknown') {
         return { outcome: 'unknown' };
       }
-      const first = this.repository.find(requestId)?.verdict;
+      const first = this.read(requestId)?.verdict;
       if (first === undefined) {
         return { outcome: 'unknown' };
       }
@@ -108,7 +121,7 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
       return { outcome: 'recorded', verdict };
     }
     if (result.outcome === 'unchanged' || result.outcome === 'conflict') {
-      const first = this.repository.find(requestId)?.verdict;
+      const first = this.read(requestId)?.verdict;
       if (first === undefined) {
         return { outcome: 'unknown' };
       }

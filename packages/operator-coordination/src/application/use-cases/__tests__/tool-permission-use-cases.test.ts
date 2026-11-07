@@ -372,6 +372,20 @@ describe('GiveToolPermissionVerdictUseCase', () => {
     expect(result).toEqual({ outcome: 'unknown' });
   });
 
+  it('a repository read that throws is reported as unknown, never a refusal', async () => {
+    const unreadable: PermissionRequestRepositoryPort = {
+      record: () => ({ stored: true }),
+      find: () => {
+        throw new Error('unreadable');
+      },
+      listPending: () => [],
+      recordVerdict: () => ({ outcome: 'unknown' }),
+    };
+    const uc = verdictUseCase(unreadable);
+    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-1', 'actor');
+    expect(result).toEqual({ outcome: 'unknown' });
+  });
+
   it('a verdict after the deadline is expired, never allowed', async () => {
     const repo = new PermissionRequestRepositoryAdapter();
     repo.record(

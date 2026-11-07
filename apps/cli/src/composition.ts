@@ -1170,6 +1170,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
           runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
       )(args, timeoutMs),
+    chainAttention: {
+      recordAttentionItem: (body, actor) => coordination.recordAttentionItem.recordAttentionItem(body, actor),
+      clearAttentionItem: (request, via, actor) => coordination.clearAttentionItem.clearAttentionItem(request, via, actor),
+    },
   });
 
   return {

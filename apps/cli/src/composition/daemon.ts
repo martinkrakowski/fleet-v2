@@ -64,6 +64,15 @@ export interface ComposeDaemonInput {
   readonly evidence: Pick<FleetCliRuntime['evidence'], 'inspectAcceptanceEvidence' | 'requestVerification'>;
   readonly conductor: Pick<FleetCliRuntime['conductor'], 'laneRunJournal' | 'halt'>;
   readonly runGh: (args: readonly string[], timeoutMs?: number) => Promise<GhInvocationResult>;
+  /** The coordination attention store delegates for chain-refresh attention items (CO8/CO8a). */
+  readonly chainAttention: {
+    readonly recordAttentionItem: (body: unknown, actor: string) => Promise<unknown>;
+    readonly clearAttentionItem: (
+      request: unknown,
+      via: 'cli' | 'web' | 'machine',
+      actor: string,
+    ) => Promise<unknown>;
+  };
 }
 
 export interface ComposedDaemon {
@@ -129,9 +138,36 @@ function refusedPause(reasonCode: 'invalid-request' | 'invalid-clock' | 'pause-w
   return { outcome: 'refused', exitCode: 1, reasonCode };
 }
 
+/**
+ * The chain-refresh mode at composition time, mirroring the merge-policy seam the
+ * adapter reads (CO8a): an invalid written mode (`live` or unknown) resolves to
+ * `invalid`; `shadow` (written or absent) is `shadow`; an unreadable or invalid
+ * source answers `shadow` (nothing runs anyway). Never `live`.
+ */
+function resolveChainRefreshMode(source: MergePolicySource): 'shadow' | 'invalid' {
+  return source.outcome === 'resolved' && source.daemon.chainRefresh === 'invalid' ? 'invalid' : 'shadow';
+}
+
+/** The same source the merge-policy adapter reads, but synchronously and never thrown. */
+function readMergePolicySource(options: FleetCliRuntimeOptions | undefined, installationModel: FleetInstallationModel | undefined): MergePolicySource {
+  try {
+    if (options?.loadInstallationForMergePolicy !== undefined) {
+      return mergePolicySourceFromLoad(options.loadInstallationForMergePolicy());
+    }
+    if (options?.installation !== undefined) {
+      return resolveMergePolicy(installationModel?.policy ?? {});
+    }
+    return mergePolicySourceFromLoad(loadInstallation({ env: options?.env ?? process.env }));
+  } catch {
+    return { outcome: 'invalid', reason: 'installation-invalid' };
+  }
+}
+
 export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
   const { stateDir, options, installationModel } = input;
   const durable = stateDir !== undefined && stateDir.trim().length > 0;
+
+  const chainRefreshMode = resolveChainRefreshMode(readMergePolicySource(options, installationModel));
 
   const mergePolicy = new MergePolicyAdapter({
     readInstallation: async (): Promise<MergePolicySource> => {
@@ -168,21 +204,30 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     newUlid: () => newUlid(),
     nowIso: now,
   });
-  // CO8: the chain-refresh job runs in shadow mode only (`policy.daemon.chainRefresh` has no live
-  // value yet). The forge facade exposes the branch-head read and refuses every action, so no code
-  // path here can merge, push or write to the forge; chain-refresh.sh stays the only merger.
+  // CO8/CO8a: the chain-refresh job runs in shadow mode only (an invalid written
+  // mode resolves to `invalid`, never `live`). The forge facade exposes the
+  // branch-head read and refuses every action, so no code path here can merge,
+  // push or write to the forge; chain-refresh.sh stays the only merger.
   const shadowForge: MergeForgeActionPort = {
     readMergeBranchHead: (request) => input.chainBranchRead.readMergeBranchHead(request),
     performMergeForgeAction: async () => ({ outcome: 'refused', reason: 'shadow-mode', refusalKind: 'other' }),
     isConfigured: () => true,
   };
-  const chainRefresh = new RefreshChainsUseCase({
-    chains: durable ? new ChainRepositoryAdapter({ stateDir }) : new ChainRepositoryAdapter(),
-    forge: shadowForge,
-    attention: new ChainAttentionAdapter(),
-    now,
-    mode: 'shadow',
+  const chainAttention = new ChainAttentionAdapter({
+    recordAttentionItem: input.chainAttention.recordAttentionItem,
+    clearAttentionItem: (request, via, actor) =>
+      input.chainAttention.clearAttentionItem(request, via as 'cli' | 'web' | 'machine', actor),
   });
+  const chainRefresh =
+    chainRefreshMode === 'shadow'
+      ? new RefreshChainsUseCase({
+          chains: durable ? new ChainRepositoryAdapter({ stateDir }) : new ChainRepositoryAdapter(),
+          forge: shadowForge,
+          attention: chainAttention,
+          now,
+          mode: 'shadow',
+        })
+      : undefined;
   const runDaemonTick = new RunDaemonTickUseCase({
     pause,
     halt: input.conductor.halt,
@@ -193,7 +238,9 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     forge: input.mergeForgeRead,
     journal: input.conductor.laneRunJournal,
     mergePass: runMergePass,
-    chainRefresh,
+    ...(chainRefreshMode === 'invalid'
+      ? { chainRefreshMode: 'invalid' as const, chainAttention }
+      : { chainRefresh }),
     now,
     ...(options?.daemonSleep !== undefined ? { sleep: options.daemonSleep } : {}),
     newUlid: () => newUlid(),

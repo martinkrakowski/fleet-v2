@@ -15,6 +15,7 @@ import {
 } from '../../domain/entities/OrchestratorSession.js';
 import { ORCHESTRATOR_SESSION_SCOPES } from '../../domain/orchestrator-session-records.js';
 import {
+  OrchestratorSessionIdentityAlreadyActiveError,
   OrchestratorSessionRevisionConflictError,
   type OrchestratorSessionRepositoryPort,
 } from '../ports/out/OrchestratorSessionRepositoryPort.out-port.js';
@@ -186,6 +187,12 @@ export class RegisterOrchestratorSessionUseCase implements RegisterOrchestratorS
         return {
           outcome: 'refused',
           reason: 'an orchestrator session with this id already exists',
+        };
+      }
+      if (error instanceof OrchestratorSessionIdentityAlreadyActiveError) {
+        return {
+          outcome: 'refused',
+          reason: 'an active orchestrator session already exists for this conductor identity',
         };
       }
       throw error;

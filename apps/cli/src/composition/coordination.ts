@@ -106,6 +106,9 @@ export function composeCoordination(input: ComposeCoordinationInput) {
 
   const projectProfileRepository = new ProjectProfileRepositoryAdapter({ stateDir });
   const coordinationRequestRepository = new CoordinationRequestRepositoryAdapter({ stateDir });
+  // O9: the conductor's orchestrator session store; the no-op change signal is
+  // correct (sessions are never announced to the change feed).
+  const orchestratorSessionRepository = new OrchestratorSessionRepositoryAdapter({ stateDir });
   // Owner-recorded decision answers, one `<requestId>.json` per request. An
   // absent or grantless answer stays `awaiting-decision`; nothing is upgraded.
   const decisionTransport = new DecisionTransportAdapter({
@@ -137,7 +140,8 @@ export function composeCoordination(input: ComposeCoordinationInput) {
   // The journal is a second file-backed LaneRunJournalAdapter on the same
   // stateDir, sharing `run-journal.json` with the conductor's own adapter
   // under the existing lock; without a stateDir both stay in memory.
-  const orchestratorSessionRepository = new OrchestratorSessionRepositoryAdapter({ stateDir });
+  // (The orchestrator session store itself is the O9 adapter declared above;
+  // the merge of origin/main had declared it twice.)
   const orchestratorRequestRepository = new OrchestratorRequestRepositoryAdapter({ stateDir });
   const runJournal = new LaneRunJournalAdapter({ stateDir });
   const orchestratorRequestJournal = new OrchestratorRequestJournalAdapter({
@@ -169,6 +173,7 @@ export function composeCoordination(input: ComposeCoordinationInput) {
   const coordination = {
     projectProfileRepository,
     coordinationRequestRepository,
+    orchestratorSessionRepository,
     decisionTransport,
     observationPublication,
     relayTransport,

@@ -624,6 +624,12 @@ function makeReviewSpawn(verdicts: readonly ('PASS' | 'FAIL')[]) {
   let index = 0;
   const reviewSpawn = async (file: string, args: readonly string[]) => {
     calls.push({ file, args });
+    // RV4: the transport probes the seat with `ocm-run --wait --dir` before it
+    // dispatches a review. Real ocm-run exits 0 when nothing runs there; the
+    // probe is not a review, so it consumes no verdict.
+    if (args[0] === '--wait') {
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
     const verdict = verdicts[index] ?? 'PASS';
     index += 1;
     const text = verdict === 'FAIL' ? REVIEW_FAIL_TEXT : REVIEW_PASS_TEXT;

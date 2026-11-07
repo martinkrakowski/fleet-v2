@@ -147,6 +147,9 @@ export function composeConductor(input: ComposeConductorInput) {
     // evidence context's existing disposition use case, one id per call.
     recordFindingDisposition: (request) =>
       evidence.recordFindingDisposition.recordFindingDisposition(request),
+    // RV4: screen and archive a busy-transport diagnostic under the review
+    // request id; an archive miss never changes the review outcome.
+    archiveEvidence: (request) => evidence.evidenceArchive.archiveEvidence(request),
   });
 
   // C2': the scoped one-way owner approval behind the reap's

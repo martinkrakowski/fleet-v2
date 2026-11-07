@@ -15,12 +15,15 @@ import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../
 import type { HandoverFinding, RenderHandoverBriefInput } from '../../../domain/lane-run-handover.js';
 import { originalBriefOf, renderHandoverBrief } from '../../../domain/lane-run-handover.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
-import { laneRunReviewFact } from '../../../domain/lane-run-review-facts.js';
+import { laneRunReviewFact, laneRunReviewIntentIgnored } from '../../../domain/lane-run-review-facts.js';
 import { buildLaneRunStepKey, head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import type { ParsedLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision, LaneRunReviewFact, LaneRunSeatFact } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
+import type { AbortWorktreeRunResult, WorktreeRunState } from '../../../application/ports/out/ExecutionRunnerPort.out-port.js';
+import type { RunnerForAttemptResult } from '../../../application/ports/out/RunnerForAttemptPort.out-port.js';
 import { partitionFindingsByScope } from '../../../domain/review-finding-scope.js';
 import { historyEntryOf, selectReviewSeat } from '../../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
@@ -372,6 +375,37 @@ async function reviewInputsOf(
 }
 
 /**
+ * RV4: the lowest free review retry key for a parsed review step — `null`
+ * (no `/retry` segment) first, then `/retry1`..`/retry9` — that has no
+ * intent in `entries`. `null` when all ten keys are taken. Pure; never throws.
+ */
+function nextFreeReviewRetryKey(
+  entries: readonly LaneRunJournalEntryRecord[],
+  parsed: Extract<ParsedLaneRunKey, { readonly kind: 'step' }>,
+): string | null {
+  const retries: Array<number | null> = [null, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  for (const retry of retries) {
+    const built = buildLaneRunStepKey({
+      runId: parsed.runId,
+      round: parsed.round,
+      step: parsed.step,
+      seatIndex: parsed.seatIndex,
+      attemptOrdinal: parsed.attemptOrdinal,
+      head12: parsed.head12,
+      retry,
+    });
+    if (!built.ok) {
+      continue;
+    }
+    const taken = entries.some((entry) => entry.kind === 'intent' && entry.key === built.key);
+    if (!taken) {
+      return built.key;
+    }
+  }
+  return null;
+}
+
+/**
  * The `act brief-check` and `act code-review` steps (K5, plan §3.3, §3.4):
  * one review through `ReviewRequestPort` under a journalled request id, after
  * opening the evidence assessment through `ReviewAssessmentPort` with the
@@ -403,8 +437,96 @@ export async function performReview(
       return { outcome: 'waiting', reason: 'session-stagger' };
     }
   }
+
+  // RV4: pick the review key before any write. A journal read throw is
+  // facts-inconsistent and writes nothing. If the decider's base key already
+  // has an intent this generation must skip (a seat-busy or superseded review,
+  // or one predating the latest review-retry resume), open the lowest free
+  // retry key; when all ten keys are taken, wait `review-pending` and write
+  // nothing — never park.
+  let key = decision.key;
+  try {
+    const entries = await ctx.deps.runJournal.listForRun(record.runId);
+    const existingIntent = entries.find(
+      (entry) => entry.kind === 'intent' && entry.key === decision.key,
+    );
+    if (
+      existingIntent !== undefined &&
+      laneRunReviewIntentIgnored(entries, record.runId, decision.key, existingIntent.recordedAtIso)
+    ) {
+      const parsed = parseLaneRunKey(decision.key);
+      if (parsed === null || parsed.kind !== 'step') {
+        return { outcome: 'waiting', reason: 'facts-inconsistent' };
+      }
+      const next = nextFreeReviewRetryKey(entries, parsed);
+      if (next === null) {
+        return { outcome: 'waiting', reason: 'review-pending' };
+      }
+      key = next;
+    }
+  } catch {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
+  }
+
+  // RV4: resolve the recorded runner and inspect the worktree before the
+  // intent. A missing runnerForAttempt or a runner without inspectWorktreeRun
+  // skips the inspection (the transport --wait covers busy state). An unknown
+  // status is facts-inconsistent and does not abort or dispatch; a running
+  // session whose id equals the collected attempt's session is aborted by
+  // directory (the commit is already on latest.artifacts), and any non-aborted
+  // outcome waits `review-pending` with nothing written. A different session id
+  // is not aborted.
+  const runnerForAttempt = ctx.deps.runnerForAttempt;
+  if (runnerForAttempt !== undefined) {
+    let resolved: RunnerForAttemptResult;
+    try {
+      resolved = runnerForAttempt.runnerForAttempt({ runner: latest.runner ?? null });
+    } catch {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    if (resolved.ok && resolved.runner.inspectWorktreeRun !== undefined) {
+      let inspected: WorktreeRunState;
+      try {
+        inspected = await resolved.runner.inspectWorktreeRun({
+          attemptId: latest.id,
+          worktreePath: latest.worktreePath,
+          runner: latest.runner ?? null,
+        });
+      } catch {
+        return { outcome: 'waiting', reason: 'facts-inconsistent' };
+      }
+      if (inspected.state === 'unknown') {
+        return { outcome: 'waiting', reason: 'facts-inconsistent' };
+      }
+      if (
+        inspected.state === 'running' &&
+        latest.sessionId !== null &&
+        inspected.sessionId === latest.sessionId
+      ) {
+        if (resolved.runner.abortWorktreeRun === undefined) {
+          return { outcome: 'waiting', reason: 'review-pending' };
+        }
+        let aborted: AbortWorktreeRunResult;
+        try {
+          aborted = await resolved.runner.abortWorktreeRun({
+            attemptId: latest.id,
+            worktreePath: latest.worktreePath,
+            runner: latest.runner ?? null,
+            gracePeriodSeconds: 10,
+          });
+        } catch {
+          return { outcome: 'waiting', reason: 'review-pending' };
+        }
+        if (aborted.outcome !== 'aborted') {
+          return { outcome: 'waiting', reason: 'review-pending' };
+        }
+      }
+    }
+  }
+
+  const reviewDecision = key === decision.key ? decision : { ...decision, key };
   const requestId = 'review-' + ctx.deps.newUlid();
-  const intentRefusal = await appendRunIntent(ctx, request, decision.key, requestId);
+  const intentRefusal = await appendRunIntent(ctx, request, reviewDecision.key, requestId);
   if (intentRefusal !== null) {
     return refusedResult(intentRefusal);
   }
@@ -416,11 +538,11 @@ export async function performReview(
   // read) keeps today's unavailable refusal.
   const frozen = await readFrozenBriefVerified(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
   if (frozen.kind === 'unverified') {
-    return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
+    return finishReview(ctx, request, reviewDecision, 'refused', 'assessment-unavailable');
   }
   const requiredChecks = manifestAcceptanceChecks(frozen.kind === 'verified' ? frozen.manifest : null);
   if (requiredChecks === null) {
-    return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
+    return finishReview(ctx, request, reviewDecision, 'refused', 'assessment-unavailable');
   }
   const opened = await ctx.deps.reviewAssessment!.openReviewAssessment({
     attemptId: latest.id,
@@ -431,7 +553,7 @@ export async function performReview(
     requiredChecks,
   });
   if (opened.outcome !== 'open') {
-    return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
+    return finishReview(ctx, request, reviewDecision, 'refused', 'assessment-unavailable');
   }
   const briefText = decision.step === 'brief-check' && frozen.kind === 'verified' ? frozen.prose : undefined;
   let outcome: ReviewRequestResult;
@@ -449,7 +571,7 @@ export async function performReview(
       nowIso: request.nowIso,
     });
   } catch {
-    return pendingReview(decision);
+    return pendingReview(reviewDecision);
   }
   // RV3: the receipt's severity outcome decides the journal result, whatever
   // the raw verdict word. A severity-`failed` receipt (an unresolved
@@ -461,18 +583,24 @@ export async function performReview(
   if (outcome.outcome === 'receipt') {
     mapped = reviewResultOfReceiptDecision(outcome.receipt);
   } else if (outcome.outcome === 'no-receipt') {
-    mapped = { result: 'completed', reasonCode: 'review-no-receipt', detail: outcome.detail };
+    // RV4: a seat-busy rejection journals `completed` / `seat-busy` with the
+    // same detail — never `review-no-receipt` — so the decider treats it as
+    // no second verdict (no retry budget spent).
+    mapped =
+      outcome.detail === 'seat-busy'
+        ? { result: 'completed', reasonCode: 'seat-busy', detail: 'seat-busy' }
+        : { result: 'completed', reasonCode: 'review-no-receipt', detail: outcome.detail };
   } else if (outcome.outcome === 'refused') {
     mapped = { result: 'refused', reasonCode: 'review-refused', detail: outcome.detail };
   }
   if (mapped === null) {
-    return pendingReview(decision);
+    return pendingReview(reviewDecision);
   }
   const resolved =
     outcome.outcome === 'receipt' && mapped.reasonCode === 'review-failed'
       ? await reviewScopeDispositionOf(ctx, gathered, latest, head, outcome.receipt, mapped)
       : mapped;
-  return finishReview(ctx, request, decision, resolved.result, resolved.reasonCode, resolved.detail);
+  return finishReview(ctx, request, reviewDecision, resolved.result, resolved.reasonCode, resolved.detail);
 }
 
 /**

@@ -211,15 +211,52 @@ async function lexicallyAbsent(cliPath: string): Promise<boolean> {
   }
 }
 
+/**
+ * The state directory of the driver that serves `root`, or null. A root that
+ * is lexically the served root must also pass the real-path check. A root that
+ * is not (a symlink to the served root) is accepted only when `realpath(root)`
+ * equals `realpath` of the served root named by `daemon.cliPath`; a symlink to
+ * anything else, or a `realpath` failure, refuses. Symlinked roots as such are
+ * never refused: the install's own `current` is one.
+ */
+async function resolveServedStateDir(
+  root: string,
+  installation: FleetInstallation | undefined,
+): Promise<string | null> {
+  const daemon = installation?.daemon;
+  const cliPath = daemon?.cliPath;
+  const stateDir = daemon?.stateDir;
+  if (typeof cliPath !== 'string' || typeof stateDir !== 'string' || stateDir.trim() === '') {
+    return null;
+  }
+  if (resolveReleaseRootStateDir(root, installation) !== null) {
+    return (await servedRootIsReal(root, cliPath)) ? stateDir : null;
+  }
+  const rootSegments = plainAbsoluteSegments(root, true);
+  const cliSegments = plainAbsoluteSegments(cliPath, false);
+  const currentAt = cliSegments === null ? -1 : cliSegments.indexOf('current');
+  if (rootSegments === null || cliSegments === null || currentAt < 1) {
+    return null;
+  }
+  const served = `/${cliSegments.slice(0, currentAt).join('/')}`;
+  try {
+    if ((await realpath(root)) !== (await realpath(served))) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return (await servedRootIsReal(served, cliPath)) ? stateDir : null;
+}
+
 function releaseHandler(action: ReleaseAction): CommandHandler {
   return async (payload, rt) => {
     if (Object.hasOwn(payload, 'action')) {
       throw new CliUsageError('Unknown release option: --action');
     }
     const request = parseRequest({ ...payload, action });
-    const stateDir = resolveReleaseRootStateDir(request.root, rt.installation);
-    const cliPath = rt.installation?.daemon?.cliPath;
-    if (stateDir === null || typeof cliPath !== 'string' || !(await servedRootIsReal(request.root, cliPath))) {
+    const stateDir = await resolveServedStateDir(request.root, rt.installation);
+    if (stateDir === null) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' };
     }
     return manageReleaseFromPayload(

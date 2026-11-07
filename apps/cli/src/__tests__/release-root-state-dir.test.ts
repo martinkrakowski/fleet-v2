@@ -192,6 +192,43 @@ describe('release root state directory binding', () => {
     expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
   });
 
+  it('a symlinked root to an unrelated directory with an absent cliPath is refused', async () => {
+    const stateA = path.join(tempDir, 'state-a');
+    const unrelated = path.join(tempDir, 'unrelated');
+    const link = path.join(tempDir, 'link-root');
+    await fs.mkdir(releaseRoot, { recursive: true });
+    await fs.mkdir(unrelated, { recursive: true });
+    await fs.symlink(unrelated, link);
+    const rt = createFleetCliRuntime({
+      stateDir: stateA,
+      installation: installationWithDriverStateDir(stateA, releaseRoot),
+    });
+    const { code, out } = await runRelease(
+      ['swap', '--root', link, '--sha', SHA, '--project', PROJECT, '--apply'],
+      rt,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+  });
+
+  it('a symlinked root to the served root with an absent cliPath is accepted', async () => {
+    const stateA = path.join(tempDir, 'state-a');
+    const link = path.join(tempDir, 'link-root');
+    await fs.mkdir(releaseRoot, { recursive: true });
+    await fs.symlink(releaseRoot, link);
+    const rt = createFleetCliRuntime({
+      stateDir: stateA,
+      installation: installationWithDriverStateDir(stateA, releaseRoot),
+    });
+    const { code, out } = await runRelease(
+      ['swap', '--root', link, '--sha', SHA, '--project', PROJECT, '--apply'],
+      rt,
+    );
+    // Past the root binding: the swap is refused later (no verified build), never by the state-dir check.
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join('')).reason).not.toBe('release-root-state-dir-unknown');
+  });
+
   it('an absolute root this installation does not serve is refused', async () => {
     const stateA = path.join(tempDir, 'state-a');
     const otherRoot = path.join(tempDir, 'someone-elses-releases');

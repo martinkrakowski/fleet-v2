@@ -151,21 +151,134 @@ function screenIdentityText(
   return null;
 }
 
-/** Screen the identity's own fields before any store read; the registration facts are validated by the aggregate. */
-function screenAdoptionIdentity(
-  identity: OrchestratorSessionIdentity,
-): { readonly ok: true } | Refusal {
-  if (typeof identity !== 'object' || identity === null) {
-    return { ok: false, reason: 'the conductor identity must be a record' };
-  }
-  if (typeof identity.host !== 'string') {
+/** Screen the identity's host before any store read; the registration facts are validated by the aggregate. */
+function screenAdoptionHost(host: unknown): { readonly ok: true } | Refusal {
+  if (typeof host !== 'string') {
     return { ok: false, reason: 'the conductor identity host must be a string' };
   }
-  const hostError = screenIdentityText('host', identity.host, 256);
+  const hostError = screenIdentityText('host', host, 256);
   if (hostError !== null) {
     return { ok: false, reason: hostError };
   }
   return { ok: true };
+}
+
+/**
+ * Safely read every runtime input field once, as plain data: a hostile
+ * getter, a null registration or any other malformed shape is the store's
+ * typed refusal, never a throw. The registration's own fields are read here
+ * too, so no later step ever touches the caller's object again.
+ */
+function readAdoptionInputs(
+  identity: OrchestratorSessionIdentity,
+):
+  | {
+      readonly ok: true;
+      readonly host: string;
+      readonly stateDir: string | null;
+      readonly registration: OrchestratorSessionIdentity['registration'];
+    }
+  | Refusal {
+  if (typeof identity !== 'object' || identity === null) {
+    return { ok: false, reason: 'the conductor identity must be a record' };
+  }
+  try {
+    const source = identity as OrchestratorSessionIdentity;
+    const host = source.host;
+    const stateDir = source.stateDir;
+    const registration = source.registration;
+    return {
+      ok: true,
+      host,
+      stateDir: stateDir as string | null,
+      registration: {
+        orchestratorId: registration.orchestratorId,
+        model: registration.model,
+        projects: registration.projects,
+        claims: registration.claims,
+        scopes: registration.scopes,
+        registeredByTokenId: registration.registeredByTokenId,
+      },
+    };
+  } catch {
+    return { ok: false, reason: 'the conductor registration could not be read' };
+  }
+}
+
+type PreparedAdoption =
+  | {
+      readonly ok: true;
+      readonly host: string;
+      readonly stateDir: string | null;
+      readonly registration: OrchestratorSessionIdentity['registration'];
+      readonly fresh: OrchestratorSessionRecord;
+    }
+  | Refusal;
+
+/** Read, screen and build everything the adoption needs before any store read. Never throws on hostile input. */
+function prepareAdoption(
+  identity: OrchestratorSessionIdentity,
+  nowIso: string,
+): PreparedAdoption {
+  const read = readAdoptionInputs(identity);
+  if (!read.ok) {
+    return read;
+  }
+  const screened = screenAdoptionHost(read.host);
+  if (!screened.ok) {
+    return screened;
+  }
+  if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+    return { ok: false, reason: 'the adoption time is not a valid timestamp' };
+  }
+  const registration = read.registration;
+  if (!isOrchestratorTokenId(registration.registeredByTokenId)) {
+    return { ok: false, reason: 'the presenting token could not be identified' };
+  }
+  const created = buildFreshSession(read.host, registration, nowIso);
+  if (!created.ok) {
+    return created;
+  }
+  return {
+    ok: true,
+    host: read.host,
+    stateDir: read.stateDir,
+    registration,
+    fresh: created.fresh,
+  };
+}
+
+/** Build the fresh active session record from already-read plain data. */
+function buildFreshSession(
+  host: string,
+  registration: OrchestratorSessionIdentity['registration'],
+  nowIso: string,
+): { readonly ok: true; readonly fresh: OrchestratorSessionRecord } | Refusal {
+  try {
+    const created = OrchestratorSession.create({
+      orchestratorId: registration.orchestratorId,
+      cliKind: CONDUCTOR_CLI_KIND,
+      model: registration.model,
+      host,
+      projects: registration.projects,
+      claims: registration.claims,
+      scopes: registration.scopes,
+      registeredByTokenId: registration.registeredByTokenId,
+      startedAtIso: nowIso,
+      lastHeartbeatIso: nowIso,
+      leaseUntilIso: new Date(
+        Date.parse(nowIso) + ORCHESTRATOR_SESSION_LEASE_SECONDS * 1000,
+      ).toISOString(),
+      lastPolledRequestsAtIso: null,
+      status: 'active',
+    });
+    if (!created.success) {
+      return { ok: false, reason: 'the conductor session record was refused' };
+    }
+    return { ok: true, fresh: created.value.toRecord() };
+  } catch {
+    return { ok: false, reason: 'the conductor registration could not be read' };
+  }
 }
 
 type AdoptionDecision =
@@ -182,6 +295,106 @@ type AdoptionDecision =
     }
   | Refusal;
 
+type AdoptionUpdates = { readonly stored: StoredOrchestratorSession }[];
+type AdoptionSignals = {
+  before: OrchestratorSessionRecord | undefined;
+  after: OrchestratorSessionRecord;
+}[];
+
+/** Load one stored session and retire it at `nowIso`. Pure with respect to the store: the write is returned, never applied. */
+function retireStored(
+  stored: StoredOrchestratorSession,
+  nowIso: string,
+):
+  | {
+      readonly ok: true;
+      readonly stored: StoredOrchestratorSession;
+      readonly after: OrchestratorSessionRecord;
+    }
+  | Refusal {
+  const loaded = OrchestratorSession.create(stored.session);
+  if (!loaded.success) {
+    return { ok: false, reason: 'the stored session could not be read' };
+  }
+  const retired = loaded.value.retire(nowIso);
+  if (!retired.success) {
+    return { ok: false, reason: 'the lapsed session could not be retired' };
+  }
+  const record = retired.value.toRecord();
+  return {
+    ok: true,
+    stored: { revision: stored.revision + 1, session: record },
+    after: record,
+  };
+}
+
+/** Renew the single live session and retire every other lapsed candidate. Pure: writes are returned, never applied. */
+function adoptTheLiveSession(
+  liveStored: StoredOrchestratorSession,
+  candidates: readonly StoredOrchestratorSession[],
+  nowIso: string,
+):
+  | {
+      readonly ok: true;
+      readonly record: OrchestratorSessionRecord;
+      readonly revision: number;
+      readonly updates: AdoptionUpdates;
+      readonly signals: AdoptionSignals;
+    }
+  | Refusal {
+  const loaded = OrchestratorSession.create(liveStored.session);
+  if (!loaded.success) {
+    return { ok: false, reason: 'the stored session could not be read' };
+  }
+  const renewed = loaded.value.renewLease(nowIso);
+  if (!renewed.success) {
+    return { ok: false, reason: 'the live session could not be renewed' };
+  }
+  const record = renewed.value.toRecord();
+  const revision = liveStored.revision + 1;
+  const updates: AdoptionUpdates = [{ stored: { revision, session: record } }];
+  const signals: AdoptionSignals = [{ before: liveStored.session, after: record }];
+  for (const lapsed of candidates) {
+    if (lapsed.session.orchestratorId === liveStored.session.orchestratorId) {
+      continue;
+    }
+    const retired = retireStored(lapsed, nowIso);
+    if (!retired.ok) {
+      return retired;
+    }
+    updates.push({ stored: retired.stored });
+    signals.push({ before: lapsed.session, after: retired.after });
+  }
+  return { ok: true, record, revision, updates, signals };
+}
+
+/** Retire every lapsed candidate and register `fresh` over known absence. Pure: writes are returned, never applied. */
+function registerFreshSession(
+  candidates: readonly StoredOrchestratorSession[],
+  fresh: OrchestratorSessionRecord,
+  nowIso: string,
+):
+  | {
+      readonly ok: true;
+      readonly updates: AdoptionUpdates;
+      readonly signals: AdoptionSignals;
+    }
+  | Refusal {
+  const updates: AdoptionUpdates = [];
+  const signals: AdoptionSignals = [];
+  for (const lapsed of candidates) {
+    const retired = retireStored(lapsed, nowIso);
+    if (!retired.ok) {
+      return retired;
+    }
+    updates.push({ stored: retired.stored });
+    signals.push({ before: lapsed.session, after: retired.after });
+  }
+  updates.push({ stored: { revision: 1, session: fresh } });
+  signals.push({ before: undefined, after: fresh });
+  return { ok: true, updates, signals };
+}
+
 /**
  * The one decision of `registerOrAdoptSession` over an already-read set of
  * records: adopt the single live conductor session for the identity, or
@@ -190,7 +403,7 @@ type AdoptionDecision =
  */
 function decideAdoption(
   records: ReadonlyMap<string, StoredOrchestratorSession>,
-  identity: OrchestratorSessionIdentity,
+  host: string,
   fresh: OrchestratorSessionRecord,
   nowIso: string,
 ): AdoptionDecision {
@@ -201,7 +414,7 @@ function decideAdoption(
     (stored) =>
       stored.session.cliKind === CONDUCTOR_CLI_KIND &&
       stored.session.status === 'active' &&
-      stored.session.host === identity.host,
+      stored.session.host === host,
   );
   const live = candidates.filter((stored) =>
     isOrchestratorAttached(stored.session, nowIso),
@@ -212,70 +425,32 @@ function decideAdoption(
       reason: 'more than one live session exists for this conductor identity',
     };
   }
-  const retireOne = (
-    stored: StoredOrchestratorSession,
-  ):
-    | {
-        readonly ok: true;
-        readonly stored: StoredOrchestratorSession;
-        readonly after: OrchestratorSessionRecord;
-      }
-    | Refusal => {
-    const loaded = OrchestratorSession.create(stored.session);
-    if (!loaded.success) {
-      return { ok: false, reason: 'the stored session could not be read' };
+  if (live.length === 1) {
+    const adopted = adoptTheLiveSession(live[0]!, candidates, nowIso);
+    if (!adopted.ok) {
+      return adopted;
     }
-    const retired = loaded.value.retire(nowIso);
-    if (!retired.success) {
-      return { ok: false, reason: 'the lapsed session could not be retired' };
-    }
-    const record = retired.value.toRecord();
     return {
       ok: true,
-      stored: { revision: stored.revision + 1, session: record },
-      after: record,
+      outcome: 'adopted',
+      session: adopted.record,
+      revision: adopted.revision,
+      updates: adopted.updates,
+      signals: adopted.signals,
     };
+  }
+  const registered = registerFreshSession(candidates, fresh, nowIso);
+  if (!registered.ok) {
+    return registered;
+  }
+  return {
+    ok: true,
+    outcome: 'registered',
+    session: fresh,
+    revision: 1,
+    updates: registered.updates,
+    signals: registered.signals,
   };
-  const updates: { readonly stored: StoredOrchestratorSession }[] = [];
-  const signals: { before: OrchestratorSessionRecord | undefined; after: OrchestratorSessionRecord }[] = [];
-  if (live.length === 1) {
-    const liveStored = live[0]!;
-    const loaded = OrchestratorSession.create(liveStored.session);
-    if (!loaded.success) {
-      return { ok: false, reason: 'the stored session could not be read' };
-    }
-    const renewed = loaded.value.renewLease(nowIso);
-    if (!renewed.success) {
-      return { ok: false, reason: 'the live session could not be renewed' };
-    }
-    const record = renewed.value.toRecord();
-    const revision = liveStored.revision + 1;
-    updates.push({ stored: { revision, session: record } });
-    signals.push({ before: liveStored.session, after: record });
-    for (const lapsed of candidates) {
-      if (lapsed.session.orchestratorId === liveStored.session.orchestratorId) {
-        continue;
-      }
-      const retired = retireOne(lapsed);
-      if (!retired.ok) {
-        return retired;
-      }
-      updates.push({ stored: retired.stored });
-      signals.push({ before: lapsed.session, after: retired.after });
-    }
-    return { ok: true, outcome: 'adopted', session: record, revision, updates, signals };
-  }
-  for (const lapsed of candidates) {
-    const retired = retireOne(lapsed);
-    if (!retired.ok) {
-      return retired;
-    }
-    updates.push({ stored: retired.stored });
-    signals.push({ before: lapsed.session, after: retired.after });
-  }
-  updates.push({ stored: { revision: 1, session: fresh } });
-  signals.push({ before: undefined, after: fresh });
-  return { ok: true, outcome: 'registered', session: fresh, revision: 1, updates, signals };
 }
 
 function applyAdoption(
@@ -476,44 +651,11 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
     identity: OrchestratorSessionIdentity,
     nowIso: string,
   ): Promise<RegisterOrAdoptSessionResult> {
-    const screened = screenAdoptionIdentity(identity);
-    if (!screened.ok) {
-      return { outcome: 'refused', reason: screened.reason };
+    const prepared = prepareAdoption(identity, nowIso);
+    if (!prepared.ok) {
+      return { outcome: 'refused', reason: prepared.reason };
     }
-    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
-      return { outcome: 'refused', reason: 'the adoption time is not a valid timestamp' };
-    }
-    if (!isOrchestratorTokenId(identity.registration.registeredByTokenId)) {
-      return { outcome: 'refused', reason: 'the presenting token could not be identified' };
-    }
-    const nowMs = Date.parse(nowIso);
-    let fresh: OrchestratorSessionRecord;
-    try {
-      const created = OrchestratorSession.create({
-        orchestratorId: identity.registration.orchestratorId,
-        cliKind: CONDUCTOR_CLI_KIND,
-        model: identity.registration.model,
-        host: identity.host,
-        projects: identity.registration.projects,
-        claims: identity.registration.claims,
-        scopes: identity.registration.scopes,
-        registeredByTokenId: identity.registration.registeredByTokenId,
-        startedAtIso: nowIso,
-        lastHeartbeatIso: nowIso,
-        leaseUntilIso: new Date(
-          nowMs + ORCHESTRATOR_SESSION_LEASE_SECONDS * 1000,
-        ).toISOString(),
-        lastPolledRequestsAtIso: null,
-        status: 'active',
-      });
-      if (!created.success) {
-        return { outcome: 'refused', reason: 'the conductor session record was refused' };
-      }
-      fresh = created.value.toRecord();
-    } catch {
-      return { outcome: 'refused', reason: 'the conductor registration could not be read' };
-    }
-    const stateDirCheck = this.stateDirMatches(identity.stateDir);
+    const stateDirCheck = this.stateDirMatches(prepared.stateDir);
     if (!stateDirCheck.ok) {
       return { outcome: 'refused', reason: stateDirCheck.reason };
     }
@@ -521,33 +663,51 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
 
     if (target === null) {
       // The in-memory store's decision is one synchronous step on its map.
-      const decision = decideAdoption(this.inMemorySessions, identity, fresh, nowIso);
-      if (!decision.ok) {
-        return { outcome: 'refused', reason: decision.reason };
-      }
-      applyAdoption(this.inMemorySessions, decision);
-      for (const signalOf of decision.signals) {
-        this.signal({
-          kind: signalKindFor(signalOf.before, signalOf.after),
-          id: signalOf.after.orchestratorId,
-          stateFile: null,
-          before: null,
-          written: null,
-        });
-      }
-      return {
-        outcome: decision.outcome,
-        session: copy({ revision: decision.revision, session: decision.session }).session,
-        revision: decision.revision,
-      };
+      return this.adoptInMemory(prepared.host, prepared.fresh, nowIso);
     }
+    return this.adoptOnDisk(prepared.host, prepared.fresh, nowIso, target);
+  }
 
+  /** The in-memory branch of `registerOrAdoptSession`: decide on the map, apply, signal. */
+  private adoptInMemory(
+    host: string,
+    fresh: OrchestratorSessionRecord,
+    nowIso: string,
+  ): RegisterOrAdoptSessionResult {
+    const decision = decideAdoption(this.inMemorySessions, host, fresh, nowIso);
+    if (!decision.ok) {
+      return { outcome: 'refused', reason: decision.reason };
+    }
+    applyAdoption(this.inMemorySessions, decision);
+    for (const signalOf of decision.signals) {
+      this.signal({
+        kind: signalKindFor(signalOf.before, signalOf.after),
+        id: signalOf.after.orchestratorId,
+        stateFile: null,
+        before: null,
+        written: null,
+      });
+    }
+    return {
+      outcome: decision.outcome,
+      session: copy({ revision: decision.revision, session: decision.session }).session,
+      revision: decision.revision,
+    };
+  }
+
+  /** The file-backed branch of `registerOrAdoptSession`: decide under the lock, write, signal. */
+  private async adoptOnDisk(
+    host: string,
+    fresh: OrchestratorSessionRecord,
+    nowIso: string,
+    target: string,
+  ): Promise<RegisterOrAdoptSessionResult> {
     let written: ChangeSignal["written"] = null;
     let locked: AdoptionDecision;
     try {
       locked = await withFileLock(`${target}.lock`, async (): Promise<AdoptionDecision> => {
         const records = await this.readRecordsFromDisk(target);
-        const decision = decideAdoption(records, identity, fresh, nowIso);
+        const decision = decideAdoption(records, host, fresh, nowIso);
         if (!decision.ok) {
           return decision;
         }

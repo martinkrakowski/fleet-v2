@@ -221,6 +221,33 @@ describe('one active session per conductor identity (real adapter, temp dir)', (
     expect(await adapter.list()).toEqual([]);
   });
 
+  it('hostile runtime input is refused, never thrown: a throwing getter, a null registration and a non-object', async () => {
+    const dir = tempDir();
+    const adapter = fileAdapter(dir);
+    await expect(
+      adapter.registerOrAdoptSession(
+        {
+          host: 'local-host',
+          stateDir: dir,
+          get registration(): OrchestratorSessionIdentity['registration'] {
+            throw new Error('hostile getter');
+          },
+        } as unknown as OrchestratorSessionIdentity,
+        NOW,
+      ),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'the conductor registration could not be read' });
+    await expect(
+      adapter.registerOrAdoptSession(
+        { ...identityFor(dir, 'orch-any-9'), registration: null as never },
+        NOW,
+      ),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'the conductor registration could not be read' });
+    await expect(
+      adapter.registerOrAdoptSession('not-a-record' as never, NOW),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'the conductor identity must be a record' });
+    expect(await adapter.list()).toEqual([]);
+  });
+
   it('an unreadable store refuses and never registers', async () => {
     const dir = tempDir();
     await fs.writeFile(join(dir, 'orchestrators.json'), 'not json at all', 'utf8');

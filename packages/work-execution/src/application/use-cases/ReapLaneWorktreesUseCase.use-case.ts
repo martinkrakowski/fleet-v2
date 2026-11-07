@@ -38,9 +38,11 @@ import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.o
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
 import type { ProjectProfileReadPort } from '../ports/out/ProjectProfileReadPort.out-port.js';
+import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
 import { conductedRunnerOf } from './advance-lane-run/conducted-host.js';
+import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import { journalsForRuns, type RunJournalRunReads } from './run-journal-reads.js';
 import type {
   ReapLaneWorktreesPort,
@@ -70,6 +72,14 @@ export interface ReapLaneWorktreesDependencies {
   readonly attemptArtifact?: Pick<AttemptArtifactPort, 'checkArtifactManifestForRemoval'>;
   /** C2': the scoped owner approval for `--force-unsealed`. */
   readonly actionAuthorization?: Pick<ActionAuthorizationPort, 'authorizeUnsealedWorktreeRemoval'>;
+  /**
+   * C2': resolves the runner of the attempt's recorded host. When present,
+   * the worktree must be proved `idle` before any approval is consumed or any
+   * removal runs; `running` is `busy`, anything unprovable is `unknown`.
+   */
+  readonly runnerForAttempt?: RunnerForAttemptPort;
+  /** F129: infrastructure digest of the one-way intent; the pure fallback is used when absent. */
+  readonly computeDigest?: (content: string) => string;
   /** Clock override; production uses the system clock. */
   readonly now?: () => string;
   /** C2': the deadline of one outbound store/journal/workspace call. Default 15 s. */
@@ -89,9 +99,48 @@ function removalCompletedMarker(runId: string): string {
   return `branch ${branchForRun(runId)} kept at `;
 }
 
+/** The id prefix every crash-recoverable unsealed-removal intent entry of an attempt carries. */
+function unsealedIntentPrefix(attemptId: string): string {
+  return `${attemptId}:collect:reap-unsealed-intent:`;
+}
+
 /** The id of the crash-recoverable unsealed-removal intent entry. */
 function unsealedIntentEntryId(attemptId: string, runId: string): string {
-  return `${attemptId}:collect:reap-unsealed-intent:${runId}`;
+  return `${unsealedIntentPrefix(attemptId)}${runId}`;
+}
+
+/** The request digest an intent entry records in its detail (F129). */
+const INTENT_DIGEST_RE = /(?:^|;\s*)requestDigest=([0-9a-f]{64})(?:$|;)/;
+
+/** Every field the one-way `--force-unsealed` intent binds to. */
+export interface UnsealedRemovalDigestInput {
+  readonly attemptId: string;
+  readonly expectedHeadSha: string;
+  readonly projectId: string;
+  readonly repositoryRoot: string;
+  readonly runId: string;
+  readonly worktreePath: string;
+  readonly worktreeRoot: string;
+}
+
+/** F129: the full request digest of a one-way unsealed-removal intent. */
+export function unsealedRemovalRequestDigest(
+  fields: UnsealedRemovalDigestInput,
+  computeDigest: (content: string) => string = simpleDeterministicHexDigest,
+): string {
+  return computeDigest(
+    JSON.stringify({
+      action: 'reap-unsealed-worktree',
+      attemptId: fields.attemptId,
+      expectedHeadSha: fields.expectedHeadSha,
+      forceUnsealed: true,
+      projectId: fields.projectId,
+      repositoryRoot: fields.repositoryRoot,
+      runId: fields.runId,
+      worktreePath: fields.worktreePath,
+      worktreeRoot: fields.worktreeRoot,
+    }),
+  );
 }
 
 /** The deadline guard: the call's own answer, or a throw when it runs past `timeoutMs`. */
@@ -131,11 +180,23 @@ export class ReapLaneWorktreesUseCase implements ReapLaneWorktreesPort {
     if (!this.deps) {
       throw new Error('Not implemented: ReapLaneWorktreesUseCase');
     }
-    // Fail safe: a missing input is an empty request, so the pinned EX-2b
-    // defaulting (`execute(null)` is a dry run) stays exact. A primitive or
-    // an unreadable input is a typed refusal.
-    const request = input ?? {};
-    return this.reapLaneWorktrees(request as ReapLaneWorktreesRequest);
+    // Fail safe: a missing input is a dry run, so the pinned EX-2b defaulting
+    // (`execute(null)` is a dry run) stays exact. A primitive or an unreadable
+    // input is a typed refusal, and only an explicit `dryRun: false` removes.
+    if (input === null || input === undefined) {
+      return this.reapLaneWorktrees({ dryRun: true });
+    }
+    let snap: Record<string, unknown> | null;
+    try {
+      snap = snapshotPlainDataRecord(input);
+    } catch {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    if (snap === null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const dryRun = snap['dryRun'] !== false;
+    return this.reapLaneWorktrees({ ...snap, dryRun } as unknown as ReapLaneWorktreesRequest);
   }
 
   async reapLaneWorktrees(request: ReapLaneWorktreesRequest): Promise<ReapLaneWorktreesResult> {
@@ -153,9 +214,7 @@ export class ReapLaneWorktreesUseCase implements ReapLaneWorktreesPort {
     deps: ReapLaneWorktreesDependencies,
     request: ReapLaneWorktreesRequest,
   ): Promise<ReapLaneWorktreesResult> {
-    // Fail safe: only an explicit `dryRun: false` removes anything; a missing
-    // or malformed value (an unchecked `execute` input) is a dry run.
-    const dryRun = request.dryRun !== false;
+    const dryRun = request.dryRun;
     const forceUnsealed = request.forceUnsealed === true;
     const nowIso = request.nowIso ?? deps.now?.() ?? new Date().toISOString();
     const budget = deps.storeCallTimeoutMs ?? DEFAULT_STORE_CALL_TIMEOUT_MS;
@@ -289,8 +348,9 @@ function isRecordObject(value: unknown): value is Record<string, unknown> {
 
 /**
  * C2': the strict runtime-input guard. A null, a non-object, an unreadable
- * (throwing-getter) request, a non-boolean `forceUnsealed` or a malformed
- * `nowIso` is refused; a missing `nowIso` is fine (the clock answers).
+ * (throwing-getter) request, a missing or non-boolean `dryRun`, a non-boolean
+ * `forceUnsealed` or a malformed `nowIso` is refused; a missing `nowIso` is
+ * fine (the clock answers).
  */
 function reapRequestRefusal(input: unknown): 'invalid-request' | null {
   let snap: Record<string, unknown> | null;
@@ -302,12 +362,18 @@ function reapRequestRefusal(input: unknown): 'invalid-request' | null {
   if (snap === null) {
     return 'invalid-request';
   }
+  if (typeof snap['dryRun'] !== 'boolean') {
+    return 'invalid-request';
+  }
   const forceUnsealed = snap['forceUnsealed'];
   if (forceUnsealed !== undefined && typeof forceUnsealed !== 'boolean') {
     return 'invalid-request';
   }
   const nowIso = snap['nowIso'];
-  if (nowIso !== undefined && (typeof nowIso !== 'string' || !isCalendarDateTime(nowIso))) {
+  if (
+    nowIso !== undefined &&
+    (typeof nowIso !== 'string' || nowIso.length > 64 || !isCalendarDateTime(nowIso))
+  ) {
     return 'invalid-request';
   }
   return null;
@@ -593,6 +659,16 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
     return;
   }
 
+  // C2': the runner must prove the worktree idle before any approval is
+  // consumed or any removal runs; unprovable liveness is never idle.
+  if (deps.runnerForAttempt !== undefined) {
+    const liveness = await worktreeRunnerLiveness(deps.runnerForAttempt, latestAttempt, recordedHost, budget);
+    if (liveness !== 'idle') {
+      refused.push({ runId: run.runId, reason: liveness });
+      return;
+    }
+  }
+
   // C2': where the sealed manifest lives, read from the attempt's record.
   const coords = attemptManifestCoordinates(latestAttempt.artifacts);
   let manifest: RemoveWorktreeManifestInput;
@@ -710,6 +786,52 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
   }
 }
 
+/**
+ * Ask the attempt's recorded runner what runs in its worktree. Only an
+ * explicit `idle` is `idle`; `running` is `busy`; a missing runner, a missing
+ * inspect method, a throw, a timeout or any other answer is `unknown`.
+ */
+async function worktreeRunnerLiveness(
+  runnerForAttempt: RunnerForAttemptPort,
+  attempt: AttemptRecord,
+  recordedHost: AttemptRunnerRecord,
+  budget: number,
+): Promise<'idle' | 'busy' | 'unknown'> {
+  let state: unknown;
+  try {
+    const selection: unknown = runnerForAttempt.runnerForAttempt({ runner: recordedHost });
+    if (!isRecordObject(selection) || selection['ok'] !== true) {
+      return 'unknown';
+    }
+    const runner = selection['runner'];
+    if (typeof runner !== 'object' || runner === null) {
+      return 'unknown';
+    }
+    const inspect = (runner as { inspectWorktreeRun?: unknown }).inspectWorktreeRun;
+    if (typeof inspect !== 'function') {
+      return 'unknown';
+    }
+    // Called on the runner: the production adapters read `this`.
+    state = await withBudget(
+      inspect.call(runner, {
+        attemptId: attempt.id,
+        worktreePath: attempt.worktreePath,
+        runner: recordedHost,
+      }) as Promise<unknown>,
+      budget,
+    );
+  } catch {
+    return 'unknown';
+  }
+  if (!isRecordObject(state)) {
+    return 'unknown';
+  }
+  if (state['state'] === 'running') {
+    return 'busy';
+  }
+  return state['state'] === 'idle' ? 'idle' : 'unknown';
+}
+
 /** The manifest coordinates handed to `removeWorktree` (mirrors the port type). */
 type RemoveWorktreeManifestInput = Parameters<NonNullable<WorkspacePort['removeWorktree']>>[0]['manifest'];
 type InspectRemovalResult = Awaited<
@@ -738,13 +860,52 @@ async function authorizeUnsealedRemoval(
   priorEntries: readonly ActionJournalEntryRecord[],
   expectedHeadSha: string,
 ): Promise<UnsealedAuthorizationOutcome> {
-  const { deps, run, latestAttempt, workOrder, nowIso, budget } = params;
+  const { deps, run, latestAttempt, workOrder, clone, nowIso, budget } = params;
   const authorize = deps.actionAuthorization?.authorizeUnsealedWorktreeRemoval;
   if (authorize === undefined) {
     return { outcome: 'refused', reason: 'not-configured' };
   }
   const intentId = unsealedIntentEntryId(latestAttempt.id, run.runId);
-  if (!priorEntries.some((entry) => isRecordObject(entry) && entry['id'] === intentId)) {
+  const requestDigest = unsealedRemovalRequestDigest(
+    {
+      attemptId: latestAttempt.id,
+      expectedHeadSha,
+      projectId: workOrder.projectId,
+      repositoryRoot: clone.path,
+      runId: run.runId,
+      worktreePath: latestAttempt.worktreePath,
+      worktreeRoot: clone.worktreeRoot,
+    },
+    deps.computeDigest ?? simpleDeterministicHexDigest,
+  );
+  if (!/^[0-9a-f]{64}$/.test(requestDigest)) {
+    return { outcome: 'refused', reason: 'unknown' };
+  }
+  // F129: any prior intent of this attempt must be exactly this request;
+  // a retry under a changed id or coordinate is refused before any write.
+  const intentPrefix = unsealedIntentPrefix(latestAttempt.id);
+  const priorIntents = priorEntries.filter(
+    (entry) =>
+      isRecordObject(entry) &&
+      ((typeof entry['id'] === 'string' && entry['id'].startsWith(intentPrefix)) ||
+        (entry['action'] === 'collect' &&
+          entry['status'] === 'intent-recorded' &&
+          typeof entry['detail'] === 'string' &&
+          entry['detail'].startsWith('Authorizing unsealed worktree removal'))),
+  );
+  if (priorIntents.length > 0) {
+    const prior = priorIntents[0];
+    const priorDetail = isRecordObject(prior) ? prior['detail'] : undefined;
+    if (
+      priorIntents.length !== 1 ||
+      !isRecordObject(prior) ||
+      prior['id'] !== intentId ||
+      typeof priorDetail !== 'string' ||
+      INTENT_DIGEST_RE.exec(priorDetail)?.[1] !== requestDigest
+    ) {
+      return { outcome: 'refused', reason: 'intent-digest-mismatch' };
+    }
+  } else {
     try {
       await withBudget(
         deps.executionJournal.appendJournalEntry({
@@ -758,7 +919,7 @@ async function authorizeUnsealedRemoval(
           sessionId: null,
           detail:
             `Authorizing unsealed worktree removal for attempt ${latestAttempt.id} ` +
-            `on branch ${branchForRun(run.runId)}`,
+            `on branch ${branchForRun(run.runId)}; requestDigest=${requestDigest}`,
         }),
         budget,
       );
@@ -827,12 +988,17 @@ async function recordRemovalJournalEntry(
       budget,
     );
     const listed = Array.isArray(priorEntries) ? priorEntries : [];
-    const intentId = unsealedIntentEntryId(attempt.id, runId);
+    const intentPrefix = unsealedIntentPrefix(attempt.id);
     // Intent entries never consume a sequence number, so the completed id
     // stays `${attempt.id}:collect:${nonIntentCount + 1}` — `1` for a plain
     // sealed removal. A retry that would collide falls back to a keyed id.
     const nonIntentCount = listed.filter(
-      (entry) => !(isRecordObject(entry) && entry['id'] === intentId),
+      (entry) =>
+        !(
+          isRecordObject(entry) &&
+          typeof entry['id'] === 'string' &&
+          entry['id'].startsWith(intentPrefix)
+        ),
     ).length;
     let id = `${attempt.id}:collect:${nonIntentCount + 1}`;
     if (listed.some((entry) => isRecordObject(entry) && entry['id'] === id)) {

@@ -13,6 +13,7 @@ import {
   laneRunDispatchedAtIso,
   laneRunGateCongestion,
   laneRunGateFact,
+  laneRunGateUnknown,
   laneRunIntentEntry,
   laneRunParkedConductCount,
   laneRunPremergePost,
@@ -368,6 +369,46 @@ describe('laneRunGateCongestion', () => {
   it('returns null with no gate intent or a null head', () => {
     expect(laneRunGateCongestion([], RUN_ID, HEAD)).toBeNull();
     expect(laneRunGateCongestion([], RUN_ID, null)).toBeNull();
+  });
+});
+
+describe('laneRunGateUnknown', () => {
+  const run0 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD });
+  const run1 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD, retry: 1 });
+
+  it('returns null for an ambiguous-only gate-unknown, leaving the gate fact pending', () => {
+    const entries = [intent(run0), result(run0, 'ambiguous', 'gate-unknown')];
+    expect(laneRunGateUnknown(entries, RUN_ID, HEAD)).toBeNull();
+    expect(laneRunGateFact(entries, RUN_ID, HEAD)).toBe('pending');
+  });
+
+  it('returns { retry: 0, operatorAbandoned: true } for a final intent-abandoned-by-operator and keeps the gate fact unknown', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'ambiguous', 'gate-unknown'),
+      laneRunResultEntry(nextEntryId(), RUN_ID, run0, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE, NOW),
+    ];
+    expect(laneRunGateUnknown(entries, RUN_ID, HEAD)).toEqual({ retry: 0, operatorAbandoned: true });
+    expect(laneRunGateFact(entries, RUN_ID, HEAD)).toBe('unknown');
+  });
+
+  it('returns { retry: 0, operatorAbandoned: false } for a final refused gate-unknown', () => {
+    const entries = [intent(run0), result(run0, 'refused', 'gate-unknown')];
+    expect(laneRunGateUnknown(entries, RUN_ID, HEAD)).toEqual({ retry: 0, operatorAbandoned: false });
+  });
+
+  it('returns null when a later retry passed after an overtaken run 0', () => {
+    const entries = [
+      intent(run0),
+      laneRunResultEntry(nextEntryId(), RUN_ID, run0, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE, NOW),
+      intent(run1),
+      result(run1, 'completed', 'gate-passed'),
+    ];
+    expect(laneRunGateUnknown(entries, RUN_ID, HEAD)).toBeNull();
+  });
+
+  it('returns null for a null head', () => {
+    expect(laneRunGateUnknown([], RUN_ID, null)).toBeNull();
   });
 });
 

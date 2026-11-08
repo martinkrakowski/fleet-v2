@@ -7,6 +7,7 @@ import { LANE_RUN_MAX_RETRY } from '../lane-run-keys.js';
 import {
   GATE_CONGESTION_BACKOFF_MS,
   GATE_CONGESTION_MAX_RETRIES,
+  GATE_UNKNOWN_MAX_RETRIES,
   REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
   laneRunAttemptPhaseOf,
   nextLaneRunAction,
@@ -87,6 +88,7 @@ function baseFacts(overrides: Partial<LaneRunFacts> = {}): LaneRunFacts {
     acceptedHead12: null,
     gate: 'none',
     gateCongestion: null,
+    gateUnknown: null,
     briefCheck: { verdict: 'none', seatIndex: null, retries: 0 },
     codeReview: { verdict: 'none', seatIndex: null, retries: 0 },
     preMerge: 'none',
@@ -181,10 +183,10 @@ describe('global rules', () => {
     const facts = baseFacts({
       state: 'running',
       attempt: attemptFact(),
-      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+      pendingIntent: { key: `${RUN_ID}/r0/collect/0/a1`, step: 'collect', reconciliation: 'ambiguous' },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
-      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'running',
+      kind: 'park', reason: 'ambiguous', qualifier: 'collect', parkedFrom: 'running',
     });
   });
 
@@ -802,8 +804,122 @@ describe('gating state', () => {
     expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'gate-pending' });
   });
 
-  it('T3: unknown parks ambiguous gate', () => {
-    const facts = baseFacts({ state: 'gating', gate: 'unknown' });
+  it('T3: an unknown gate within the automatic bound acts the gate under /retry<n+1>', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: 0, operatorAbandoned: false },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('T3b: an unknown gate past the automatic bound parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: GATE_UNKNOWN_MAX_RETRIES, operatorAbandoned: false },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3c: an operator-abandoned unknown gate retries again past the automatic bound', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: GATE_UNKNOWN_MAX_RETRIES, operatorAbandoned: true },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry2`, round: 0, seatIndex: 0, head12: HEAD, retry: 2,
+    });
+  });
+
+  it('T3d: an unknown gate without its gateUnknown fact waits facts-inconsistent', () => {
+    const facts = baseFacts({ state: 'gating', gate: 'unknown', head12: HEAD, attempt: attemptFact() });
+    expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+  });
+
+  it('T3e: an operator-abandoned unknown gate at the max retry parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: LANE_RUN_MAX_RETRY, operatorAbandoned: true },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3f: an ambiguous gate pending intent acts the gate under /retry1 without parking', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('T3g: an ambiguous gate pending intent already at retry 1 parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3h: an ambiguous non-gate pending intent still parks with its step as qualifier', () => {
+    const facts = baseFacts({
+      state: 'collecting',
+      pendingIntent: { key: `${RUN_ID}/r0/collect/0/a1`, step: 'collect', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'collect', parkedFrom: 'collecting',
+    });
+  });
+
+  it('T3i: an ambiguous gate pending intent under a graceful stop parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      stopMode: 'graceful',
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3j: an ambiguous gate pending intent under a halt parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      halted: true,
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
     });

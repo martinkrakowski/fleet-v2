@@ -1607,7 +1607,7 @@ describe('RunConductorPassUseCase ambiguous intent stop and resume (PT1b3a / HN1
     expect((await h.workOrderRepo.findWorkOrderById('wo-example-1'))?.state).toBe('stopped');
   });
 
-  it('HN1 resume: a recorded resume abandons the ambiguous gate intent, conducts to gating and re-parks without a duplicate-key write', async () => {
+  it('HN1 resume: a recorded resume abandons the ambiguous gate intent, conducts to gating and re-gates under a retry key without a duplicate-key write', async () => {
     const h = await hn1('gate');
     await recordResume(h);
 
@@ -1615,7 +1615,7 @@ describe('RunConductorPassUseCase ambiguous intent stop and resume (PT1b3a / HN1
 
     const steps = stepsOf(result);
     expect(steps.some((step) => step.outcome === 'refused')).toBe(false);
-    expect(steps[0]).toMatchObject({ outcome: 'parked', reason: 'ambiguous', qualifier: 'gate' });
+    expect(steps[0]).toMatchObject({ outcome: 'not-wired', step: 'gate' });
     const entries = await h.journal.listForRun(RUN_ID);
     const finals = finalsOf(entries, GATE_KEY);
     expect(finals).toHaveLength(1);

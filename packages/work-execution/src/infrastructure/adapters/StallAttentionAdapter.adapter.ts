@@ -5,7 +5,7 @@
  *
  * One item per stalled run: kind `conductor-stall`, subject `{ kind: 'run',
  * ref: <runId> }`, so a repeat refreshes the open item and a second never
- * appears. The summary is fixed text composed here from ids, the park class
+ * appears. The summary is fixed text composed here from ids, the park class or the state
  * and the age rounded down to five minutes (so an item is not rewritten every
  * pass for a minute's change), and starts with the stall key `stall:<runId>`.
  * Never caller text, never a path. Clear resolves by key as `resolved` via
@@ -18,6 +18,8 @@ import { containsSecretShape } from '@fleet/shared';
 import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import { parseParkClass } from '../../domain/park-class.js';
 import { STALL_ATTENTION_KIND, stallAttentionKey } from '../../domain/stall-attention.js';
+import { LANE_RUN_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
+import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import type {
   ClearStallAttentionCommand,
   ClearStallAttentionResult,
@@ -73,6 +75,11 @@ function summaryOf(runId: string, workOrderId: string, parkClass: string, ageMin
   return `${stallAttentionKey(runId)} class=${parkClass} parked>=${bucket}m work-order=${workOrderId}`;
 }
 
+function idleSummaryOf(runId: string, workOrderId: string, state: string, ageMinutes: number): string {
+  const bucket = Math.floor(ageMinutes / AGE_BUCKET_MINUTES) * AGE_BUCKET_MINUTES;
+  return `${stallAttentionKey(runId)} state=${state} idle>=${bucket}m work-order=${workOrderId}`;
+}
+
 export class StallAttentionAdapter implements StallAttentionPort {
   constructor(private readonly delegate?: StallAttentionDelegate) {}
 
@@ -81,18 +88,43 @@ export class StallAttentionAdapter implements StallAttentionPort {
       const projectId = ownValue(raw, 'projectId');
       const runId = ownValue(raw, 'runId');
       const workOrderId = ownValue(raw, 'workOrderId');
-      const parkClass = parseParkClass(ownValue(raw, 'parkClass'));
       const ageMinutes = ownValue(raw, 'ageMinutes');
-      if (
-        !validProjectId(projectId) ||
-        !validRunId(runId) ||
-        !validWorkOrderId(workOrderId) ||
-        parkClass === undefined ||
-        typeof ageMinutes !== 'number' ||
-        !Number.isSafeInteger(ageMinutes) ||
-        ageMinutes < 0
-      ) {
+      const parkClass = parseParkClass(ownValue(raw, 'parkClass'));
+      const state = ownValue(raw, 'state');
+      const hasParkClass = ownValue(raw, 'parkClass') !== undefined;
+      const hasState = state !== undefined;
+      // Exactly one of `parkClass` (parked) and `state` (idle) is allowed; both or neither is malformed.
+      if (hasParkClass === hasState) {
         return { outcome: 'refused', reasonCode: 'invalid-request' };
+      }
+      let summary: string;
+      if (hasParkClass) {
+        if (
+          !validProjectId(projectId) ||
+          !validRunId(runId) ||
+          !validWorkOrderId(workOrderId) ||
+          parkClass === undefined ||
+          typeof ageMinutes !== 'number' ||
+          !Number.isSafeInteger(ageMinutes) ||
+          ageMinutes < 0
+        ) {
+          return { outcome: 'refused', reasonCode: 'invalid-request' };
+        }
+        summary = summaryOf(runId, workOrderId, parkClass, ageMinutes);
+      } else {
+        if (
+          !validProjectId(projectId) ||
+          !validRunId(runId) ||
+          !validWorkOrderId(workOrderId) ||
+          typeof state !== 'string' ||
+          !LANE_RUN_STATES.includes(state as LaneRunStateValue) ||
+          typeof ageMinutes !== 'number' ||
+          !Number.isSafeInteger(ageMinutes) ||
+          ageMinutes < 0
+        ) {
+          return { outcome: 'refused', reasonCode: 'invalid-request' };
+        }
+        summary = idleSummaryOf(runId, workOrderId, state, ageMinutes);
       }
       const record = this.delegate?.recordAttentionItem;
       if (record === undefined) {
@@ -104,7 +136,7 @@ export class StallAttentionAdapter implements StallAttentionPort {
           kind: STALL_ATTENTION_KIND,
           subject: { kind: 'run', ref: runId },
           workOrderId,
-          summary: summaryOf(runId, workOrderId, parkClass, ageMinutes),
+          summary,
         },
         STALL_ATTENTION_ACTOR,
       );

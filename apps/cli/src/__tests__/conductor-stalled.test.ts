@@ -136,6 +136,20 @@ async function seedParkedRun(
   ).toMatchObject({ outcome: 'appended' });
 }
 
+async function seedIdleGatingRun(
+  runtime: FleetCliRuntime,
+  runId: string,
+  workOrderId: string,
+  conductMinutesAgo: number,
+  entryId: string,
+): Promise<void> {
+  await seedWorkOrder(runtime, workOrderId);
+  expect(await runtime.conductor.laneRunRepository.create(record(runId, workOrderId, null))).toMatchObject({ outcome: 'saved' });
+  expect(
+    await runtime.conductor.laneRunJournal.append(laneRunConductEntry(entryId, runId, 'gating', minutesAgo(conductMinutesAgo))),
+  ).toMatchObject({ outcome: 'appended' });
+}
+
 function captureIo(): CliIo & { readonly out: string[]; readonly err: string[] } {
   const out: string[] = [];
   const err: string[] = [];
@@ -174,6 +188,30 @@ describe('conductor status --stalled (PT1a, SN3)', () => {
     ]);
     expect(document.stalled[0]!.ageMinutes).toBeGreaterThanOrEqual(200);
     expect(document.stalled[1]!.ageMinutes).toBeGreaterThanOrEqual(50);
+  });
+
+  it('lists a non-parked gating run as an idle row, without a class', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'fleet-v2-pt1a-idle-'));
+    const runtime = runtimeOf(stateDir);
+    await seedIdleGatingRun(runtime, RUN_YOUNG, WORK_ORDER_YOUNG, 120, '01M64PT1PX2MAZVQDYAYMZ7WN2');
+    const result = await statusStalled(runtime, stateDir, ['--stalled']);
+    expect(result.code).toBe(0);
+    expect(result.out).toHaveLength(1);
+    const document = JSON.parse(result.out[0]!) as {
+      outcome: string;
+      stallAfterMinutes: number;
+      stalled: { runId: string; state: string; ageMinutes: number; workOrderId: string; lastAdvancedAtIso: string }[];
+    };
+    expect(document.outcome).toBe('listed');
+    expect(document.stallAfterMinutes).toBe(30);
+    expect(document.stalled).toHaveLength(1);
+    const row = document.stalled[0]!;
+    expect(row.runId).toBe(RUN_YOUNG);
+    expect(row.state).toBe('gating');
+    expect(row.ageMinutes).toBeGreaterThanOrEqual(120);
+    expect(row.workOrderId).toBe(WORK_ORDER_YOUNG);
+    expect(typeof row.lastAdvancedAtIso).toBe('string');
+    expect(result.out[0]).not.toContain('"class"');
   });
 
   it('reads the threshold from policy.daemon.stallAfterMinutes', async () => {

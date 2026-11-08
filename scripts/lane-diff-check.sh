@@ -17,6 +17,12 @@
 #      lane-chosen filter.
 #   2. Does any changed, untracked or reviewed ignored file contain something that looks like a
 #      credential? Reported as file:line and the pattern's name only. The content is never printed.
+#      The same scan reports a lint suppression the lane ADDED (eslint-disable, @ts-ignore,
+#      @ts-expect-error) as `lint-suppression`. Rationale (2026-11-08): the gate's authority rests on rules
+#      the lane cannot switch off, and one lane silenced `no-console` — which IS configured as an error — with
+#      an inline `// eslint-disable-next-line no-console` to get debug output past the gate. It was caught only
+#      because a failing test printed that output. With --base, a suppression the base file already had is
+#      baseline-excused, so only a NEW one is a finding; the ten existing suppressions in the tree stay quiet.
 #      A file containing a NUL byte is still scanned, a file over 5 MiB is reported as
 #      unscanned-large-file, and symlinks are resolved up to 40 hops without ever reading their
 #      targets (reporting symlink-escape or symlink-unresolved; a link that stays inside the
@@ -426,6 +432,7 @@ home-credential-path|/home/[a-z]+/\.(ssh|config/gh|gemini|aws|docker/config\.jso
 password-assignment|[Pp]assword[[:space:]]*[:=][[:space:]]*["'][^"']{6,}["']
 token-assignment|[Tt]oken[[:space:]]*[:=][[:space:]]*["'][A-Za-z0-9_./+=-]{16,}["']
 basic-auth-url|https?://[^/:@[:space:]]+:[^/@[:space:]]{6,}@
+lint-suppression|eslint-disable|@ts-(ignore|expect-error)
 PAT
 
 # Resolve symbolic link $1 up to 40 hops against the physical worktree root $2.
@@ -550,7 +557,12 @@ while IFS= read -r f; do
     gone=$(awk -v n="$name" '$2 == n { print $1 }' "$T/hits" | grep -xFf "$T/excused" | tr '\n' ',' | sed 's/,$//')
     [ -z "$gone" ] || say "baseline-excused: $label:$gone ($name)"
     [ -n "$lines" ] || continue
-    say "secret-pattern: $label:$lines ($name)"
+    # The kind is named from the pattern, not from the scan it shares: a lint suppression is not a secret,
+    # and a misleading label is how a real finding gets ignored.
+    case $name in
+      lint-suppression) say "lint-suppression: $label:$lines (a suppression this lane added; the gate cannot enforce a rule the lane switches off)" ;;
+      *) say "secret-pattern: $label:$lines ($name)" ;;
+    esac
     findings=$((findings + 1))
   done < "$T/patterns"
 done < "$T/files"

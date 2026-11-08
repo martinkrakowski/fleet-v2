@@ -9,11 +9,12 @@ tests/agy-round.test.sh 3 3
 tests/agy-run.test.sh 17 17
 tests/check-duplication.test.sh 1 1
 tests/e2e-ssh-fixture.test.sh 1 1
-tests/fleet-host-bootstrap.test.sh 3 3
 tests/fleet-host-bootstrap-chmod.test.sh 1 1
+tests/fleet-host-bootstrap.test.sh 3 3
 tests/gate-slot.test.sh 16 16
 tests/hexagen-contract.test.sh 1 1
 tests/kill-worktree-tree.test.sh 13 13
+tests/lane-diff-check-lint-suppression.test.sh 2 2
 tests/lane-diff-check.test.sh 43 43
 tests/ocm-run.test.sh 187 187
 tests/seams.test.sh 1 1

@@ -41,6 +41,11 @@ import {
   BriefKnowledgeAdapter,
   CiStateAdapter,
   CloseWorkOrderUseCase,
+  CutoverJournalAdapter,
+  CutoverRecordRepositoryAdapter,
+  DaemonPauseAdapter,
+  KillallTrainPauseAdapter,
+  ManageCutoverUseCase,
   GateReceiptAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
@@ -784,6 +789,14 @@ export interface FleetCliRuntime {
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
     /** CO26: the read-only relaunch inventory per lane host. */
     readonly inventoryRelaunch: InventoryRelaunchUseCase;
+    /** CO30a: the one cutover record v1 (`cutover.json`). */
+    readonly cutoverRecordRepository: CutoverRecordRepositoryAdapter;
+    /** CO30a: the keyed cutover journal (`cutover-journal.json`). */
+    readonly cutoverJournal: CutoverJournalAdapter;
+    /** CO30a: the killall train-pause record `cutover rollback` lifts when the cutover set it. */
+    readonly killallTrainPause: KillallTrainPauseAdapter;
+    /** CO30a: `cutover status` and `cutover rollback`; switch and retire are CO30b. */
+    readonly manageCutover: ManageCutoverUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -1217,6 +1230,27 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     },
   });
 
+  // CO30a: `cutover status` reads the pause stores through read-only handles so a corrupt file is
+  // never quarantined; in memory mode the one writable instance is shared.
+  const durableCutover = stateDir !== undefined && stateDir.trim().length > 0;
+  const cutoverRecordRepository = new CutoverRecordRepositoryAdapter({ stateDir, nowIso: daemon.now });
+  const cutoverJournal = new CutoverJournalAdapter({ stateDir });
+  const killallTrainPause = new KillallTrainPauseAdapter({ stateDir });
+  const daemonPauseRead = durableCutover ? new DaemonPauseAdapter({ stateDir, readOnly: true }) : daemon.pause;
+  const trainPauseRead = durableCutover ? new KillallTrainPauseAdapter({ stateDir, readOnly: true }) : killallTrainPause;
+  const manageCutover = new ManageCutoverUseCase({
+    cutoverRepo: cutoverRecordRepository,
+    cutoverJournal,
+    daemonStatus: daemon.statusReadOnly,
+    daemonPauseRead,
+    daemonPause: daemon.pause,
+    trainPauseRead,
+    trainPause: killallTrainPause,
+    computeDigest: sha256HexDigest,
+    mintEntryId: daemon.newUlid,
+    nowIso: daemon.now,
+  });
+
   return {
     installation: options?.installation,
     daemon,
@@ -1230,6 +1264,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       listStaleWorkOrders,
       inspectMergeReadiness,
       inventoryRelaunch,
+      cutoverRecordRepository,
+      cutoverJournal,
+      killallTrainPause,
+      manageCutover,
     },
     conductor,
     runnerTunnel,

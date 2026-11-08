@@ -4,7 +4,7 @@ import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
-import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, performPark, refusedResult } from './step-context.js';
 import { manifestExpectedArtifacts, readFrozenManifestVerified, readVerifiedFrozenManifest } from './frozen-manifest.js';
@@ -285,6 +285,34 @@ export async function performGate(ctx: AdvanceStepContext,
   const preCheck = await gatePreCheck(ctx, record, gathered, decision, request);
   if (preCheck !== null) {
     return preCheck;
+  }
+  // GU1: a retry run closes its ambiguous predecessor key first (`overtaken` /
+  // `gate-unknown-retried`), so the lost read's key never becomes pending again
+  // after the retry passes. A predecessor with a final result is left alone (a
+  // congested predecessor is already `completed` / `gate-congested`; a resumed
+  // predecessor is already `overtaken` / `intent-abandoned-by-operator`).
+  if (decision.step === 'gate' && typeof decision.retry === 'number' && decision.retry >= 1) {
+    const previous = buildLaneRunStepKey({
+      runId: record.runId,
+      round: decision.round,
+      step: 'gate',
+      seatIndex: decision.seatIndex,
+      attemptOrdinal: null,
+      head12: decision.head12,
+      retry: decision.retry === 1 ? null : decision.retry - 1,
+    });
+    if (!previous.ok) {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    const previousEntries = await ctx.deps.runJournal.listForKey(previous.key);
+    const hasIntent = previousEntries.some((entry) => entry.kind === 'intent');
+    const hasFinal = previousEntries.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous');
+    if (hasIntent && !hasFinal) {
+      const closeRefusal = await appendRunResult(ctx, request, previous.key, 'overtaken', 'gate-unknown-retried');
+      if (closeRefusal !== null) {
+        return refusedResult(closeRefusal);
+      }
+    }
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {

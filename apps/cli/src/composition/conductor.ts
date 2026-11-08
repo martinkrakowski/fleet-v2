@@ -34,6 +34,8 @@ import {
   WorkspaceAdapter,
   WorkOrderRepositoryAdapter,
   sha256HexDigest,
+  isCalendarDateTime,
+  snapshotPlainDataRecord,
   unsealedWorktreeRemovalActionId,
   unsealedWorktreeRemovalScope,
   consumptionId,
@@ -244,6 +246,8 @@ export function composeConductor(input: ComposeConductorInput) {
       workspace,
       attemptArtifact,
       actionAuthorization: unsealedRemovalAuthorization,
+      runnerForAttempt,
+      computeDigest: sha256HexDigest,
     }),
     // EX-4: the operator-opt-in orphan-session reap, built beside the worktree
     // reap from the execution stores it scans and the per-host runner resolver.
@@ -319,23 +323,31 @@ export function unsealedWorktreeRemovalAuthorizer(
   request: AuthorizeUnsealedWorktreeRemovalRequest,
 ) => Promise<AuthorizeUnsealedWorktreeRemovalResult> {
   const { coordination, coordinationRequestRepository } = deps;
-  return async (request) => {
+  return async (rawRequest) => {
+    const request = readAuthorizerRequest(rawRequest);
+    if (request === null) {
+      return { outcome: 'blocked', reason: 'invalid-request' };
+    }
     const { projectId, runId, attemptId, worktreePath, expectedHeadSha, nowIso } = request;
     const actionScope = unsealedWorktreeRemovalScope(attemptId, sha256HexDigest(worktreePath));
     const actionId = unsealedWorktreeRemovalActionId(runId, attemptId);
     try {
       await coordination.syncOneWayOwnerQuestions.syncOneWayOwnerQuestions();
       const listed = await coordination.listOwnerQuestions.listOwnerQuestions();
-      const questions = Array.isArray(listed?.questions) ? listed.questions : [];
-      for (const question of questions) {
-        if (
-          question.doorKind !== 'one-way' ||
-          question.state !== 'answered' ||
-          question.linkedRequestId === null ||
-          question.answer === null ||
-          question.answer.shape !== 'accept' ||
-          question.answer.answeredVia !== 'signed-decision'
-        ) {
+      const questions: unknown = isRecordObject(listed) ? listed['questions'] : undefined;
+      if (!Array.isArray(questions)) {
+        return { outcome: 'unknown', reason: 'owner-question-sync-failed' };
+      }
+      if (questions.length > MAX_OWNER_QUESTIONS_SCAN) {
+        return { outcome: 'unknown', reason: 'owner-question-list-too-large' };
+      }
+      for (let index = 0; index < questions.length; index += 1) {
+        // A sparse array's hole is skipped, never read as a question.
+        if (!Object.hasOwn(questions, index)) {
+          continue;
+        }
+        const question = readApprovedOneWayQuestion(questions[index]);
+        if (question === null) {
           continue;
         }
         const coordReq = await coordinationRequestRepository.findRequestById(
@@ -400,4 +412,77 @@ export function unsealedWorktreeRemovalAuthorizer(
       return { outcome: 'unknown', reason: 'owner-question-sync-failed' };
     }
   };
+}
+
+/** The largest owner-question list one approval scan reads; more is unknown. */
+const MAX_OWNER_QUESTIONS_SCAN = 4_096;
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return snapshotPlainDataRecordOrNull(value) !== null;
+}
+
+/** A descriptor-safe snapshot of a plain object; null for anything else, never a throw. */
+function snapshotPlainDataRecordOrNull(value: unknown): Record<string, unknown> | null {
+  try {
+    return snapshotPlainDataRecord(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The validated approval request: every field present, of the right type and
+ * within bounds, or null (the caller answers `blocked` without any store call).
+ */
+function readAuthorizerRequest(
+  request: unknown,
+): AuthorizeUnsealedWorktreeRemovalRequest | null {
+  const snap = snapshotPlainDataRecordOrNull(request);
+  if (snap === null) {
+    return null;
+  }
+  const { projectId, runId, attemptId, worktreePath, expectedHeadSha, nowIso } = snap;
+  if (
+    typeof projectId !== 'string' ||
+    typeof runId !== 'string' ||
+    typeof attemptId !== 'string' ||
+    typeof worktreePath !== 'string' ||
+    worktreePath.length > 4096 ||
+    typeof expectedHeadSha !== 'string' ||
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedHeadSha) ||
+    typeof nowIso !== 'string' ||
+    nowIso.length > 64 ||
+    !isCalendarDateTime(nowIso)
+  ) {
+    return null;
+  }
+  return { projectId, runId, attemptId, worktreePath, expectedHeadSha, nowIso };
+}
+
+/**
+ * The ids of an answered, one-way, accepted, signed-decision owner question
+ * that is linked to a coordination request; null for any other question or a
+ * malformed record.
+ */
+function readApprovedOneWayQuestion(
+  value: unknown,
+): { readonly questionId: string; readonly linkedRequestId: string } | null {
+  const question = snapshotPlainDataRecordOrNull(value);
+  if (question === null) {
+    return null;
+  }
+  const answer = snapshotPlainDataRecordOrNull(question['answer']);
+  const { questionId, linkedRequestId } = question;
+  if (
+    question['doorKind'] !== 'one-way' ||
+    question['state'] !== 'answered' ||
+    typeof questionId !== 'string' ||
+    typeof linkedRequestId !== 'string' ||
+    answer === null ||
+    answer['shape'] !== 'accept' ||
+    answer['answeredVia'] !== 'signed-decision'
+  ) {
+    return null;
+  }
+  return { questionId, linkedRequestId };
 }

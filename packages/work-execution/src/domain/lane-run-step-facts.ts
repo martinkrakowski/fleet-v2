@@ -16,6 +16,9 @@ import type { LaneRunKeyStep } from './lane-run-records.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { SeatFailureOutcome } from './seat-selection.js';
 
+/** The fixed reason code of the result that closes an ambiguous pending intent an operator stop or resume abandoned (F171). */
+export const LANE_RUN_INTENT_ABANDONED_REASON_CODE = 'intent-abandoned-by-operator' as const;
+
 /** The conductor's result reason codes (K4); each matches LANE_RUN_JOURNAL_REASON_CODE_PATTERN. Stored data: version with the journal. */
 export const LANE_RUN_RESULT_REASON_CODES = [
   'prepared', 'prepare-refused', 'prepare-fix-round-not-built', 'no-frozen-brief', 'seat-missing',
@@ -34,12 +37,14 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'pushed', 'forge-refused', 'forge-ambiguous', 'grant-refused', 'merged', 'merge-not-merged', 'merge-waiting',
   'merge-off', 'notice-recorded', 'notice-refused', 'no-in-scope-findings',
   'gate-congested', // KF-30c2: a gate run that exhausted the gate-slot wait limit; the conductor may retry it
+  'gate-unknown-retried', // GU1: the final `overtaken` result written on an ambiguous gate key when a retry key starts
   'premerge-success', 'premerge-failure', 'premerge-overtaken', // KS7a-2: the merge hold's `premerge` commit status
   // KS7b: the `merge-enqueue` step's final results. The detail of `merge-dropped` / `merge-held` names the
   // queue's reason token; a pending (queued) entry has no result at all.
   'merge-dropped', 'merge-held', 'merge-enqueue-refused', 'merge-overtaken',
   'ci-failed', // GB4: the keyed `ci` step's refusal of the exact head's CI read
   'ci-overtaken', // GB4 fix rounds 1-2: a pending `ci` intent whose head/round moved, or whose CI has since passed
+  LANE_RUN_INTENT_ABANDONED_REASON_CODE, // F171: an operator stop or resume closed an ambiguous pending intent
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 
@@ -261,6 +266,32 @@ export function laneRunGateCongestion(
   return { retry: latest.retry, atIso: result.recordedAtIso };
 }
 
+/**
+ * The unknown gate run at head12 (GU1): the highest-retry gate intent whose
+ * final result is neither a pass, fail nor congestion, with that run's retry
+ * and whether an operator abandoned it (`intent-abandoned-by-operator`). Null
+ * when there is no such run; an ambiguous-only `gate-unknown` stays null here.
+ */
+export function laneRunGateUnknown(
+  entries: readonly LaneRunJournalEntryRecord[], runId: string, head12: string | null,
+): { readonly retry: number; readonly operatorAbandoned: boolean } | null {
+  if (head12 === null) {
+    return null;
+  }
+  const latest = highestRetryGateIntent(entries, runId, head12);
+  if (latest === null) {
+    return null;
+  }
+  const result = finalResultOf(entries, latest.key);
+  if (result === null) {
+    return null;
+  }
+  if (result.reasonCode === 'gate-passed' || result.reasonCode === 'gate-failed' || result.reasonCode === 'gate-congested') {
+    return null;
+  }
+  return { retry: latest.retry, operatorAbandoned: result.reasonCode === LANE_RUN_INTENT_ABANDONED_REASON_CODE };
+}
+
 const PREMERGE_HEAD12_PATTERN = /^[0-9a-f]{12}$/;
 
 /**
@@ -288,6 +319,9 @@ export function laneRunPremergePost(
     }
     const parsed = parseLaneRunKey(entry.key);
     if (parsed === null || parsed.kind !== 'premerge' || parsed.head12 !== head12) {
+      continue;
+    }
+    if (entry.reasonCode === LANE_RUN_INTENT_ABANDONED_REASON_CODE) {
       continue;
     }
     if (entry.reasonCode === 'premerge-success') {

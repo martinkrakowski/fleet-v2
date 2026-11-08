@@ -21,7 +21,13 @@ import {
   type LaneRunResultReasonCode,
 } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import {
+  nextLaneRunAction,
+  REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
+  type LaneRunDecision,
+} from '../../../domain/lane-run-decider.js';
 import type { SameModelFamily } from '../../../domain/seat-selection.js';
+import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
@@ -42,7 +48,7 @@ import type {
 import type { OpenReviewAssessmentRequest, OpenReviewAssessmentResult } from '../../ports/out/ReviewAssessmentPort.out-port.js';
 import type { AcceptanceAssessmentRequest } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import { reviewFactsOf } from '../advance-lane-run/review-fix.js';
-import type { AdvanceStepContext } from '../advance-lane-run/step-context.js';
+import type { AdvanceStepContext, GatheredLaneRunFacts } from '../advance-lane-run/step-context.js';
 import { ReviewRequestAdapter } from '../../../infrastructure/adapters/ReviewRequestAdapter.adapter.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
 import { SECRET_PATTERNS } from '@fleet/shared';
@@ -459,15 +465,39 @@ async function makeHarness(
   };
 }
 
-async function advance(harness: Harness, overrides: Record<string, unknown> = {}) {
+type PerformDecisionFn = (
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: LaneRunDecision,
+  request: AdvanceLaneRunRequest,
+) => Promise<AdvanceLaneRunResult>;
+
+async function advance(
+  harness: Harness,
+  overrides: Record<string, unknown> & { readonly reviewSeatUnavailablePasses?: number } = {},
+) {
   harness.setJournalBaseline((await harness.runJournal.listForRun(RUN_ID)).length);
+  const { reviewSeatUnavailablePasses, ...requestOverrides } = overrides;
   const useCase = new AdvanceLaneRunUseCase(harness.deps);
+  if (reviewSeatUnavailablePasses !== undefined) {
+    const target = useCase as unknown as { performDecision: PerformDecisionFn };
+    const origPerformDecision = target.performDecision.bind(useCase);
+    target.performDecision = (record, gathered, _decision, request) => {
+      const facts = { ...gathered.facts, reviewSeatUnavailablePasses };
+      return origPerformDecision(
+        record,
+        { ...gathered, facts },
+        nextLaneRunAction(record, facts, request.nowIso),
+        request,
+      );
+    };
+  }
   return useCase.advanceLaneRun({
     runId: RUN_ID,
     lease: { holderId: HOLDER, fence: 1 },
     halted: false,
     nowIso: LATER,
-    ...overrides,
+    ...requestOverrides,
   });
 }
 
@@ -576,7 +606,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
   });
 
-  it('no-receipt retries the same seat once, then moves to the next seat, then parks when the plan is exhausted', async () => {
+  it('no-receipt retries the same seat once, moves to the next seat, waits while a pass counter is below the bound, and parks on the production path when the plan is exhausted', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
     harness.setReviewAnswer(async () => ({ outcome: 'no-receipt', reason: 'review-unavailable', detail: null }));
@@ -606,11 +636,21 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
       result: 'completed',
       reasonCode: 'review-no-receipt',
     });
-    // RV4: retries count every remaining review intent of the generation
+    // RV4 + PT1d: retries count every remaining review intent of the generation
     // (`remaining.length - 1`), so after the one budget retry on the first
-    // seat the switched seat's no-receipt parks — no second budget retry.
-    const fourth = await advance(harness);
-    expect(fourth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+    // seat the switched seat's no-receipt gets no second retry; with the seat
+    // plan exhausted the step waits review-seat-unavailable only while a
+    // present reviewSeatUnavailablePasses is below
+    // REVIEW_SEAT_UNAVAILABLE_MAX_PASSES, and parks on the production path
+    // (absent counter) or at the bound.
+    const fourth = await advance(harness, { reviewSeatUnavailablePasses: 0 });
+    expect(fourth).toEqual({ outcome: 'waiting', reason: 'review-seat-unavailable' });
+    const fifth = await advance(harness, {
+      reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1,
+    });
+    expect(fifth).toEqual({ outcome: 'waiting', reason: 'review-seat-unavailable' });
+    const sixth = await advance(harness);
+    expect(sixth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
   });
 
   it('journals the fixed detail of a no-receipt result end to end', async () => {

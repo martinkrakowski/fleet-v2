@@ -47,6 +47,8 @@ const BUDGET_RANGE = { min: 5, max: 600 } as const;
 const SETTLE_RANGE = { min: 0, max: 600 } as const;
 const STALL_AFTER_RANGE = { min: 1, max: 1440 } as const;
 const DEFAULT_STALL_AFTER_MINUTES = 30;
+/** PT1b1: the auto-resume budget bounds mirror the installation policy's. */
+const AUTO_RESUME_RANGE = { min: 0, max: 32 } as const;
 const REVISION_PATTERN = /^[0-9a-f]{12}$/;
 const VETO_MODES: ReadonlySet<string> = new Set(['off', 'shadow', 'live']);
 const REPOSITORY_KEYS: readonly string[] = [
@@ -67,6 +69,8 @@ const VETO_KEYS: readonly string[] = ['mode', 'holdConfidence'];
 const DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds', 'chainRefresh'];
 /** PT1a: `stallAfterMinutes` is optional on the source (a record resolved before PT1a lacks it); an unusable value reads as 30. */
 const STALL_AFTER_KEY = 'stallAfterMinutes';
+/** PT1b1: `autoResumeMax` is optional the same way; an unusable value reads as 2. */
+const AUTO_RESUME_KEY = 'autoResumeMax';
 const CHAIN_REFRESH_MODES: ReadonlySet<string> = new Set(['shadow', 'invalid']);
 
 const UNREADABLE: MergePolicyAnswer = Object.freeze({
@@ -280,6 +284,13 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
   const chainRefresh = ownValue(value, 'chainRefresh');
   const hasStallAfter = Object.hasOwn(value, STALL_AFTER_KEY);
   const stallAfterMinutes = ownValue(value, STALL_AFTER_KEY);
+  const hasAutoResume = Object.hasOwn(value, AUTO_RESUME_KEY);
+  const autoResumeMax = ownValue(value, AUTO_RESUME_KEY);
+  const expectedDaemonKeys = [
+    ...DAEMON_KEYS,
+    ...(hasStallAfter ? [STALL_AFTER_KEY] : []),
+    ...(hasAutoResume ? [AUTO_RESUME_KEY] : []),
+  ];
   if (
     !isIntegerInRange(intervalSeconds, INTERVAL_RANGE) ||
     !isIntegerInRange(budgetSeconds, BUDGET_RANGE) ||
@@ -287,7 +298,7 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
     budgetSeconds >= intervalSeconds ||
     typeof chainRefresh !== 'string' ||
     !CHAIN_REFRESH_MODES.has(chainRefresh) ||
-    !hasExactlyKeys(value, hasStallAfter ? [...DAEMON_KEYS, STALL_AFTER_KEY] : DAEMON_KEYS)
+    !hasExactlyKeys(value, expectedDaemonKeys)
   ) {
     return undefined;
   }
@@ -299,6 +310,12 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
     // PT1a: never a refusal because of this key; an unusable value reads as the default.
     ...(hasStallAfter
       ? { stallAfterMinutes: isIntegerInRange(stallAfterMinutes, STALL_AFTER_RANGE) ? stallAfterMinutes : DEFAULT_STALL_AFTER_MINUTES }
+      : {}),
+    // PT1b1, fix round 1: never a refusal because of this key, but an unusable written value is
+    // fail-closed: it reads as `0` (never auto-resume), never as the permissive default. An
+    // absent key reads no `autoResumeMax` at all.
+    ...(hasAutoResume
+      ? { autoResumeMax: isIntegerInRange(autoResumeMax, AUTO_RESUME_RANGE) ? autoResumeMax : 0 }
       : {}),
   });
 }

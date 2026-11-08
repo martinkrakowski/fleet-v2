@@ -284,5 +284,7 @@ describe('BriefPackage acceptance spec', () => {
     expect(result.success).toBe(true);
     if (!result.success || result.value === undefined) return;
     expect(result.value.getAcceptanceSpec().equals(spec)).toBe(true);
+    expect(result.value.hasStructuredFrozenInputs()).toBe(false);
+    expect(result.value.getSchemaVersion()).toBe(1);
   });
 });

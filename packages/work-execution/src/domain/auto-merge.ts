@@ -5,6 +5,7 @@
 
 import { readExactPlainRecord } from './plain-record-reads.js';
 import { head12Of } from './lane-run-keys.js';
+import { isFixedProtectedPath, pathUnderPrefix } from './lane-diff-check.js';
 
 export const AUTO_MERGE_REASONS = [
   'invalid-request', 'settings-unreadable', 'attempt-missing', 'work-order-missing', 'records-unreadable',
@@ -52,6 +53,52 @@ export const AUTO_MERGE_ROUTE_RULE: Readonly<Record<AutoMergeReason, AutoMergeRo
   'acceptance-blocked': 'on-blocked',
   'ci-pending-second-look': 'on-blocked',
 });
+
+/**
+ * The conductor's own decision machinery: diffs touching these paths must never auto-merge unattended.
+ * All lowercase; ASCII A-Z is folded before matching (parity with `lane-diff-check.ts` on
+ * case-insensitive volumes).
+ */
+export const AUTO_MERGE_DECISION_MACHINERY_PATHS: readonly string[] = Object.freeze([
+  'packages/work-execution/src/domain/lane-run-decider.ts',
+  'packages/work-execution/src/domain/lane-run-journal.ts',
+  'packages/work-execution/src/domain/lane-run-keys.ts',
+  'packages/work-execution/src/domain/lane-run-transitions.ts',
+  'packages/work-execution/src/domain/lane-run-review-facts.ts',
+  'packages/work-execution/src/domain/auto-merge.ts',
+  'packages/work-execution/src/domain/lane-diff-check.ts',
+  'packages/evidence-and-acceptance/src/domain/review-selection.ts',
+  'apps/cli/src/conductor.ts',
+]);
+
+/** Lower-cases ASCII A-Z only, as `grep -i` does in the C locale. */
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+const LANE_RUN_DOMAIN_STEM = 'packages/work-execution/src/domain/lane-run-';
+const ADVANCE_LANE_RUN_DIR_PREFIXES: readonly string[] = [
+  'packages/work-execution/src/application/use-cases/advance-lane-run',
+  'packages/work-execution/src/application/advance-lane-run',
+];
+
+/**
+ * True when a touched path is a fixed protected path or the conductor's own decision machinery:
+ * such a diff is an implicit architectural owner door and must raise attention, never auto-merge.
+ */
+export function isAutoMergeDoorPath(path: string): boolean {
+  if (isFixedProtectedPath(path)) {
+    return true;
+  }
+  const lower = asciiLower(path);
+  if (AUTO_MERGE_DECISION_MACHINERY_PATHS.includes(lower)) {
+    return true;
+  }
+  if (lower.startsWith(LANE_RUN_DOMAIN_STEM)) {
+    return true;
+  }
+  return ADVANCE_LANE_RUN_DIR_PREFIXES.some((prefix) => pathUnderPrefix(lower, prefix));
+}
 
 /** One auto-merge action per (attempt, head): `auto-merge:<attemptId>:<headSha>`. */
 export function autoMergeActionId(attemptId: string, headSha: string): string {
@@ -107,6 +154,7 @@ export type AutoMergeSettingsRead =
   | { readonly kind: 'unreadable'; readonly reason: string };
 
 const AUTO_MERGE_SETTINGS_READ_KEYS = ['outcome', 'enabled', 'allowHighRisk', 'onBlocked', 'revision', 'forgeMode'];
+const AUTO_MERGE_SETTINGS_READ_DEFAULT_HIGH_RISK_KEYS = ['outcome', 'enabled', 'onBlocked', 'revision', 'forgeMode'];
 const AUTO_MERGE_SETTINGS_UNREADABLE_KEYS = ['outcome', 'reason'];
 const AUTO_MERGE_SETTINGS_NOT_PLAIN = 'settings answer is not a plain record';
 const AUTO_MERGE_SETTINGS_UNREADABLE = 'settings could not be read';
@@ -117,6 +165,9 @@ const AUTO_MERGE_SETTINGS_UNREADABLE = 'settings could not be read';
  */
 export function readAutoMergeSettingsAnswer(answer: unknown): AutoMergeSettingsRead {
   let record = readExactPlainRecord(answer, AUTO_MERGE_SETTINGS_READ_KEYS);
+  if (record === null) {
+    record = readExactPlainRecord(answer, AUTO_MERGE_SETTINGS_READ_DEFAULT_HIGH_RISK_KEYS);
+  }
   if (record === null) {
     record = readExactPlainRecord(answer, AUTO_MERGE_SETTINGS_UNREADABLE_KEYS);
     if (record !== null && record.outcome === 'unreadable') {
@@ -133,7 +184,8 @@ export function readAutoMergeSettingsAnswer(answer: unknown): AutoMergeSettingsR
   if (record.enabled !== true) {
     return { kind: 'unreadable', reason: 'enabled is not a boolean' };
   }
-  if (typeof record.allowHighRisk !== 'boolean') {
+  const allowHighRisk = record.allowHighRisk === undefined ? false : record.allowHighRisk;
+  if (typeof allowHighRisk !== 'boolean') {
     return { kind: 'unreadable', reason: 'allowHighRisk is not a boolean' };
   }
   if (record.onBlocked !== 'ask-owner' && record.onBlocked !== 'hold') {
@@ -148,7 +200,7 @@ export function readAutoMergeSettingsAnswer(answer: unknown): AutoMergeSettingsR
   return {
     kind: 'on',
     settings: Object.freeze({
-      allowHighRisk: record.allowHighRisk as boolean,
+      allowHighRisk,
       onBlocked: record.onBlocked as AutoMergeOnBlocked,
       revision: record.revision as string,
       forgeMode: record.forgeMode as AutoMergeForgeMode,
@@ -233,25 +285,121 @@ export function autoMergeDoorsOf(answer: unknown): AutoMergeDoors {
 export interface AutoMergeEligibilityFacts {
   readonly doors: AutoMergeDoors;
   readonly risk: 'standard' | 'high';
-  readonly allowHighRisk: boolean;
+  readonly allowHighRisk?: boolean;
   readonly forgeMode: AutoMergeForgeMode;
+  readonly touchedPaths?: readonly string[];
 }
 
-/** The first failing A4 fact, in this order: doors (unreadable, then named), risk, forge mode; else null. */
+/** True when every touched-path entry is a well-formed non-hostile relative path. */
+function isWellFormedTouchedPath(path: unknown): path is string {
+  if (typeof path !== 'string' || path === '') {
+    return false;
+  }
+  if (path.includes('\0') || path.includes('\\')) {
+    return false;
+  }
+  if (path.startsWith('/') || path.endsWith('/')) {
+    return false;
+  }
+  for (const segment of path.split('/')) {
+    if (segment === '' || segment === '.' || segment === '..') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The first failing A4 fact, in this order: doors (unreadable, then named), touched auto-merge door
+ * paths, risk, forge mode; else null. Total on hostile inputs: a malformed facts object, doors,
+ * touchedPaths, or any accessor property on facts (doors, touchedPaths, risk, allowHighRisk,
+ * forgeMode) fail closed to `doors-unreadable` without throwing, before the door-named return.
+ * Every read goes through own property descriptors — no getter, iterator or array element is ever
+ * invoked — and descriptor traps are caught, so proxies, accessor properties and hostile array
+ * iteration fail closed instead of throwing.
+ */
 export function autoMergeIneligibility(facts: AutoMergeEligibilityFacts): AutoMergeReason | null {
-  if (facts.doors.kind === 'unreadable') {
+  if (facts === null || typeof facts !== 'object') {
     return 'doors-unreadable';
   }
-  if (facts.doors.kind === 'named') {
-    return 'door-named';
+  try {
+    const doorsDescriptor = Object.getOwnPropertyDescriptor(facts, 'doors');
+    const touchedPathsDescriptor = Object.getOwnPropertyDescriptor(facts, 'touchedPaths');
+    const riskDescriptor = Object.getOwnPropertyDescriptor(facts, 'risk');
+    const allowHighRiskDescriptor = Object.getOwnPropertyDescriptor(facts, 'allowHighRisk');
+    const forgeModeDescriptor = Object.getOwnPropertyDescriptor(facts, 'forgeMode');
+    // Every own property read below must be a plain data property. Any accessor descriptor — a
+    // getter on doors, touchedPaths, risk, allowHighRisk or forgeMode — is hostile and fails
+    // closed to `doors-unreadable` before the door-named return, so a getter is never invoked
+    // and never skipped by a named door or protected touched path.
+    if (doorsDescriptor === undefined || !('value' in doorsDescriptor)) {
+      return 'doors-unreadable';
+    }
+    if (
+      (touchedPathsDescriptor !== undefined && !('value' in touchedPathsDescriptor)) ||
+      (riskDescriptor !== undefined && !('value' in riskDescriptor)) ||
+      (allowHighRiskDescriptor !== undefined && !('value' in allowHighRiskDescriptor)) ||
+      (forgeModeDescriptor !== undefined && !('value' in forgeModeDescriptor))
+    ) {
+      return 'doors-unreadable';
+    }
+    const doors = doorsDescriptor.value as AutoMergeDoors;
+    if (doors === null || typeof doors !== 'object') {
+      return 'doors-unreadable';
+    }
+    const kindDescriptor = Object.getOwnPropertyDescriptor(doors, 'kind');
+    if (kindDescriptor === undefined || !('value' in kindDescriptor)) {
+      return 'doors-unreadable';
+    }
+    const kind = kindDescriptor.value;
+    if (kind === 'unreadable' || (kind !== 'none' && kind !== 'named')) {
+      return 'doors-unreadable';
+    }
+    let touchedDoorPath = false;
+    if (touchedPathsDescriptor !== undefined) {
+      const touchedPaths = touchedPathsDescriptor.value;
+      if (!Array.isArray(touchedPaths)) {
+        return 'doors-unreadable';
+      }
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(touchedPaths, 'length');
+      if (
+        lengthDescriptor === undefined || !('value' in lengthDescriptor) ||
+        typeof lengthDescriptor.value !== 'number' || !Number.isSafeInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0
+      ) {
+        return 'doors-unreadable';
+      }
+      const validPaths: string[] = [];
+      for (let index = 0; index < lengthDescriptor.value; index += 1) {
+        const elementDescriptor = Object.getOwnPropertyDescriptor(touchedPaths, index);
+        if (
+          elementDescriptor === undefined || !('value' in elementDescriptor) ||
+          !isWellFormedTouchedPath(elementDescriptor.value)
+        ) {
+          return 'doors-unreadable';
+        }
+        validPaths.push(elementDescriptor.value);
+      }
+      // Every element is validated before any door classification.
+      touchedDoorPath = validPaths.some((path) => isAutoMergeDoorPath(path));
+    }
+    if (kind === 'named' || touchedDoorPath) {
+      return 'door-named';
+    }
+    const risk = riskDescriptor === undefined ? undefined : riskDescriptor.value;
+    const allowHighRisk = allowHighRiskDescriptor === undefined ? undefined : allowHighRiskDescriptor.value;
+    const forgeMode = forgeModeDescriptor === undefined ? undefined : forgeModeDescriptor.value;
+    // An allow-list (plan A5: absent or unknown risk is high): only `standard`, or `high` with an explicit opt-in.
+    const riskAllowed = risk === 'standard' || (risk === 'high' && allowHighRisk === true);
+    if (!riskAllowed) {
+      return 'high-risk';
+    }
+    if (forgeMode !== 'github') {
+      return 'forge-mode';
+    }
+    return null;
+  } catch {
+    // A proxy descriptor trap (or any other hostile runtime behaviour) fails closed.
+    return 'doors-unreadable';
   }
-  // An allow-list (plan A5: absent or unknown risk is high): only `standard`, or `high` with an explicit opt-in.
-  const riskAllowed = facts.risk === 'standard' || (facts.risk === 'high' && facts.allowHighRisk === true);
-  if (!riskAllowed) {
-    return 'high-risk';
-  }
-  if (facts.forgeMode !== 'github') {
-    return 'forge-mode';
-  }
-  return null;
 }

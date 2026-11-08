@@ -15,7 +15,11 @@ import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../
 import type { HandoverFinding, RenderHandoverBriefInput } from '../../../domain/lane-run-handover.js';
 import { originalBriefOf, renderHandoverBrief } from '../../../domain/lane-run-handover.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
-import { laneRunReviewFact, laneRunReviewIntentIgnored } from '../../../domain/lane-run-review-facts.js';
+import {
+  isLaneRunReviewUnreachableDetail,
+  laneRunReviewFact,
+  laneRunReviewIntentIgnored,
+} from '../../../domain/lane-run-review-facts.js';
 import { buildLaneRunStepKey, head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { ParsedLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
@@ -583,13 +587,14 @@ export async function performReview(
   if (outcome.outcome === 'receipt') {
     mapped = reviewResultOfReceiptDecision(outcome.receipt);
   } else if (outcome.outcome === 'no-receipt') {
-    // RV4: a seat-busy rejection journals `completed` / `seat-busy` with the
-    // same detail — never `review-no-receipt` — so the decider treats it as
-    // no second verdict (no retry budget spent).
-    mapped =
-      outcome.detail === 'seat-busy'
-        ? { result: 'completed', reasonCode: 'seat-busy', detail: 'seat-busy' }
-        : { result: 'completed', reasonCode: 'review-no-receipt', detail: outcome.detail };
+    // RV4 / U3: a seat-busy or transport no-receipt proves the reviewer seat
+    // was never reached; journal `completed` / `seat-busy` with the same
+    // detail — never `review-no-receipt` — so the decider treats it as no
+    // second verdict (no retry budget spent). Timeout, route-no-auth-file and
+    // null still journal `review-no-receipt` and spend budget.
+    mapped = isLaneRunReviewUnreachableDetail(outcome.detail)
+      ? { result: 'completed', reasonCode: 'seat-busy', detail: outcome.detail }
+      : { result: 'completed', reasonCode: 'review-no-receipt', detail: outcome.detail };
   } else if (outcome.outcome === 'refused') {
     mapped = { result: 'refused', reasonCode: 'review-refused', detail: outcome.detail };
   }

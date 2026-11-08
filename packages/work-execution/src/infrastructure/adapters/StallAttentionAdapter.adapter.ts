@@ -58,6 +58,14 @@ function ownValue(source: unknown, key: string): unknown {
   return Object.getOwnPropertyDescriptor(source, key)?.value;
 }
 
+/** Whether `source` has the key as an own data property, `undefined` included; a non-object has none. */
+function hasOwnField(source: unknown, key: string): boolean {
+  if (typeof source !== 'object' || source === null) {
+    return false;
+  }
+  return Object.prototype.hasOwnProperty.call(source, key);
+}
+
 function validRunId(value: unknown): value is string {
   return typeof value === 'string' && LANE_RUN_ID_PATTERN.test(value);
 }
@@ -91,8 +99,10 @@ export class StallAttentionAdapter implements StallAttentionPort {
       const ageMinutes = ownValue(raw, 'ageMinutes');
       const parkClass = parseParkClass(ownValue(raw, 'parkClass'));
       const state = ownValue(raw, 'state');
-      const hasParkClass = ownValue(raw, 'parkClass') !== undefined;
-      const hasState = state !== undefined;
+      // Presence is an own data property: a field set to `undefined` is still a field, so a
+      // command carrying both `parkClass` and `state` (even as `undefined`) is malformed.
+      const hasParkClass = hasOwnField(raw, 'parkClass');
+      const hasState = hasOwnField(raw, 'state');
       // Exactly one of `parkClass` (parked) and `state` (idle) is allowed; both or neither is malformed.
       if (hasParkClass === hasState) {
         return { outcome: 'refused', reasonCode: 'invalid-request' };

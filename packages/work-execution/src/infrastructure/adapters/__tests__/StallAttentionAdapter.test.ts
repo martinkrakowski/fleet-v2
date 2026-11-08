@@ -54,6 +54,8 @@ describe('StallAttentionAdapter (PT1a)', () => {
       { ...COMMAND, ageMinutes: 1.5 },
       { ...COMMAND, state: 'gating' },
       { ...COMMAND, parkClass: undefined },
+      { projectId: 'fleet-v2', workOrderId: 'wo-fleet-v2-sr1c-dedupe-2026-10-29', runId: RUN, parkClass: undefined, state: 'gating', ageMinutes: 47 },
+      { projectId: 'fleet-v2', workOrderId: 'wo-fleet-v2-sr1c-dedupe-2026-10-29', runId: RUN, ageMinutes: 47 },
       null,
     ]) {
       const answer = await adapter.raiseStallAttention(bad as never);

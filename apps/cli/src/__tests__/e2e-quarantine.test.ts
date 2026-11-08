@@ -56,7 +56,7 @@ describe('quarantined', () => {
   it('resolves when an active body passes, running it once without writing', async () => {
     const { lines, write } = linesOf();
     let runs = 0;
-    const fn = quarantined(marker(), 1000, async () => { runs += 1; }, { write });
+    const fn = quarantined(marker(), 1000, async () => { runs += 1; }, { write, now: () => NOW_MS });
     await fn();
     expect(runs).toBe(1);
     expect(lines).toEqual([]);
@@ -72,7 +72,7 @@ describe('quarantined', () => {
         runs += 1;
         throw new Error('port race\nsecond line');
       },
-      { write },
+      { write, now: () => NOW_MS },
     );
     await fn();
     expect(runs).toBe(1);
@@ -91,7 +91,7 @@ describe('quarantined', () => {
       (() => {
         throw new Error('sync throw');
       }) as () => Promise<void>,
-      { write },
+      { write, now: () => NOW_MS },
     );
     await fn();
     expect(lines).toHaveLength(1);
@@ -100,7 +100,7 @@ describe('quarantined', () => {
 
   it('resolves when an active body hangs, writing a warning on the budget', async () => {
     const { lines, write } = linesOf();
-    const fn = quarantined(marker(), 50, () => new Promise<void>(() => {}), { write });
+    const fn = quarantined(marker(), 50, () => new Promise<void>(() => {}), { write, now: () => NOW_MS });
     await fn();
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('#12');
@@ -113,7 +113,7 @@ describe('quarantined', () => {
       marker({ until: '2026-10-30' }),
       1000,
       async () => { runs += 1; },
-      { write },
+      { write, now: () => NOW_MS },
     );
     await expect(fn()).rejects.toThrow(
       'e2e quarantine expired on 2026-10-30 (#12): remove or renew the marker',

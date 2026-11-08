@@ -5,7 +5,7 @@ import { LaneRun } from '../entities/LaneRun.js';
 import type { LaneRunJournalEntryRecord } from '../lane-run-journal.js';
 import type { LaneRunRecord } from '../lane-run-records.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../lane-run-step-facts.js';
-import { laneRunMergeEnqueueKey } from '../lane-run-keys.js';
+import { laneRunMergeEnqueueKey, laneRunPremergeKey } from '../lane-run-keys.js';
 import type { LaneRunStateValue } from '../value-objects/LaneRunState.vo.js';
 import { isLegitimateIdleWait, parkedAtIsoOf, stallAttentionKey, stalledRunsOf } from '../stall-attention.js';
 
@@ -95,6 +95,24 @@ describe('stalledRunsOf (PT1a)', () => {
     expect(stalledRunsOf({ records, journals: new Map([[RUN_A, null as never]]), stallAfterMinutes: 30, nowIso: NOW })).toEqual([]);
   });
 
+  it('an ambiguous/gate parked run is listed by the existing park rule with its row unchanged', () => {
+    const ambiguousGate = record(RUN_B, 'wo-fleet-v2-co14b-2026-11-06', { ...PARK, reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating' });
+    const ambiguousGateJournals = new Map([
+      [RUN_B, [conduct('01M64PT1PX2MAZVQDYAYMZ7WN2', RUN_B, 'parked', '2026-11-06T20:00:00.000Z')]],
+    ]);
+    const stalled = stalledRunsOf({ records: [ambiguousGate], journals: ambiguousGateJournals, stallAfterMinutes: 30, nowIso: NOW });
+    expect(stalled).toEqual([
+      {
+        runId: RUN_B,
+        key: stallAttentionKey(RUN_B),
+        workOrderId: 'wo-fleet-v2-co14b-2026-11-06',
+        parkClass: 'other',
+        ageMinutes: 60,
+        parkedAtIso: '2026-11-06T20:00:00.000Z',
+      },
+    ]);
+  });
+
   it('parkedAtIsoOf takes the latest parked conduct entry of the run', () => {
     const entries = [
       conduct('01M64PT1PX2MAZVQDYAYMZ7WN1', RUN_A, 'parked', '2026-11-06T19:00:00.000Z'),
@@ -121,6 +139,17 @@ describe('isLegitimateIdleWait (PT1a)', () => {
     const entries = [conduct('01M64PT1PX2MAZVQDYAYMZ7WN1', RUN_A, 'awaiting-premerge', '2026-11-06T19:00:00.000Z')];
     expect(isLegitimateIdleWait(tier2, entries)).toBe(true);
     expect(isLegitimateIdleWait(tier1, entries)).toBe(false);
+  });
+
+  it('a Tier 2 merging run holding on an open premerge intent is a legitimate wait; Tier 1 is not', () => {
+    const premergeKey = laneRunPremergeKey(RUN_A, 0, 'a'.repeat(12));
+    if (!premergeKey.ok) {
+      throw new Error('fixture key must build');
+    }
+    const intent = laneRunIntentEntry('01M64PT1PX2MAZVQDYAYMZ7WN5', RUN_A, premergeKey.key, null, '2026-11-06T19:00:00.000Z');
+    const merging = conduct('01M64PT1PX2MAZVQDYAYMZ7WN2', RUN_A, 'merging', '2026-11-06T19:00:00.000Z');
+    expect(isLegitimateIdleWait(tier2, [intent, merging])).toBe(true);
+    expect(isLegitimateIdleWait(tier1, [intent, merging])).toBe(false);
   });
 
   it('merging with an open merge-enqueue intent is legitimate; a final result closes it', () => {
@@ -185,6 +214,38 @@ describe('stalledRunsOf non-parked runs (PT1a)', () => {
       ],
     ]);
     expect(stalledRunsOf({ records: [IDLE], journals: train, stallAfterMinutes: 1, nowIso: NOW })).toEqual([]);
+  });
+
+  it('a Tier 2 merging run with an open premerge intent is never listed, however stale', () => {
+    const premergeKey = laneRunPremergeKey(RUN_C, 0, 'a'.repeat(12));
+    if (!premergeKey.ok) {
+      throw new Error('fixture key must build');
+    }
+    const journals = new Map([
+      [
+        RUN_C,
+        [
+          laneRunIntentEntry('01M64PT1PX2MAZVQDYAYMZ7WN5', RUN_C, premergeKey.key, null, '2026-11-06T19:00:00.000Z'),
+          conduct('01M64PT1PX2MAZVQDYAYMZ7WN3', RUN_C, 'merging', '2026-11-06T19:00:00.000Z'),
+        ],
+      ],
+    ]);
+    expect(stalledRunsOf({ records: [IDLE], journals, stallAfterMinutes: 1, nowIso: NOW })).toEqual([]);
+  });
+
+  it('a Tier 2 brief-check run with no open intent past the threshold is listed once, end to end', () => {
+    const journals = new Map([[RUN_C, [conduct('01M64PT1PX2MAZVQDYAYMZ7WN3', RUN_C, 'brief-check', '2026-11-06T11:30:00.000Z')]]]);
+    const stalled = stalledRunsOf({ records: [IDLE], journals, stallAfterMinutes: 30, nowIso: NOW });
+    expect(stalled).toEqual([
+      {
+        runId: RUN_C,
+        key: stallAttentionKey(RUN_C),
+        workOrderId: 'wo-fleet-v2-t2c-2026-11-06',
+        state: 'brief-check',
+        ageMinutes: 570,
+        lastAdvancedAtIso: '2026-11-06T11:30:00.000Z',
+      },
+    ]);
   });
 
   it('a conduct entry at 19:00 and a later result entry at 20:00 lists age 60 and the result timestamp', () => {

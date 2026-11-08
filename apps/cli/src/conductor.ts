@@ -2073,7 +2073,7 @@ function controlUsageExit(
   return null;
 }
 
-/** `conductor status --stalled`: the runs held past the stall threshold — parked rows with a park class, non-park rows with a state and a last advanced time — oldest first, as one JSON document. */
+/** `conductor status --stalled`: the runs held past the stall threshold — a parked row is the run id, park class, age and work order; a non-park row is the run id, journal state, age, work order and last advanced time, with no park class — oldest first, as one JSON document. */
 async function conductorStalledExit(
   conductor: FleetCliRuntime['conductor'],
   io: CliIo,

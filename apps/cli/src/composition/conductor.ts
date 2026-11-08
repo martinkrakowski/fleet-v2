@@ -27,6 +27,9 @@ import {
   StallAttentionAdapter,
   ReapLaneWorktreesUseCase,
   ReapOrphanSessionsUseCase,
+  ReapZombiesUseCase,
+  ReaperFindingRepositoryAdapter,
+  InMemoryReaperFindingRepositoryAdapter,
   RequestLaneRunStopUseCase,
   ResumeLaneRunUseCase,
   ReviewAssessmentAdapter,
@@ -41,8 +44,11 @@ import {
   consumptionId,
   type AuthorizeUnsealedWorktreeRemovalRequest,
   type AuthorizeUnsealedWorktreeRemovalResult,
+  type ExecutionRunnerPort,
   type ForgeReadAdapter,
+  type MergeRecordRepositoryAdapter,
   type ProjectProfileReadPort,
+  type ReconcileAttemptUseCase,
   type RunnerForAttemptPort,
 } from '@fleet/work-execution';
 import type { CoordinationRequestRepositoryAdapter } from '@fleet/operator-coordination';
@@ -72,6 +78,7 @@ export interface ComposeConductorInput {
     | 'recordAttentionItem'
     | 'clearAttentionItem'
     | 'listAttentionItems'
+    | 'listProjectProfiles'
     | 'askOwnerQuestion'
     | 'syncOneWayOwnerQuestions'
     | 'listOwnerQuestions'
@@ -97,6 +104,12 @@ export interface ComposeConductorInput {
   readonly workspace: WorkspaceAdapter;
   /** H9b1: resolves the runner addressed by an attempt's recorded host (EX-4). */
   readonly runnerForAttempt: RunnerForAttemptPort;
+  /** The conductor's own run-reconciliation use case (KW4b'). */
+  readonly reconcileAttempt: ReconcileAttemptUseCase;
+  /** The merge-record store behind the reaper's merged-worktree evidence. */
+  readonly mergeRecordRepository: MergeRecordRepositoryAdapter;
+  /** The direct runner port, for the reaper's worktree holds and checks. */
+  readonly runner: ExecutionRunnerPort;
 }
 
 export function composeConductor(input: ComposeConductorInput) {
@@ -116,6 +129,9 @@ export function composeConductor(input: ComposeConductorInput) {
     executionJournal,
     workspace,
     runnerForAttempt,
+    reconcileAttempt,
+    mergeRecordRepository,
+    runner,
   } = input;
 
   // K7: the conductor's stores and its record-only controls. Nothing here
@@ -170,6 +186,65 @@ export function composeConductor(input: ComposeConductorInput) {
     mergePolicy.outcome === 'resolved'
       ? mergePolicy.daemon.stallAfterMinutes
       : DEFAULT_MERGE_DAEMON_POLICY.stallAfterMinutes;
+
+  // KW4b': the zombie reaper's findings store (file-backed with a state dir,
+  // in-memory otherwise) and its attention/merge-evidence delegates.
+  const reaperFindingRepository =
+    stateDir !== undefined
+      ? new ReaperFindingRepositoryAdapter({ stateDir })
+      : new InMemoryReaperFindingRepositoryAdapter();
+
+  // The coordination attention store keeps worktree subjects as `wt-<12 hex>`
+  // and host subjects as `host-<12 hex>` (project kind); the reaper's subject
+  // digests are normalized to that shape on record and clear.
+  const normalizeReaperSubject = (subject: unknown): unknown => {
+    if (subject === null || typeof subject !== 'object' || Array.isArray(subject)) {
+      return subject;
+    }
+    const record = subject as { readonly kind?: unknown; readonly ref?: unknown };
+    if (record.kind === 'worktree' && typeof record.ref === 'string') {
+      return { kind: 'worktree', ref: record.ref.startsWith('wt-') ? record.ref : 'wt-' + record.ref };
+    }
+    if (record.kind === 'host' && typeof record.ref === 'string') {
+      return { kind: 'project', ref: record.ref.startsWith('host-') ? record.ref : 'host-' + record.ref };
+    }
+    return subject;
+  };
+  const reaperAttention = {
+    listAttentionItems: (request: { readonly projectId?: string }) =>
+      coordination.listAttentionItems.listAttentionItems(request),
+    recordAttentionItem: async (body: unknown, actor: string) => {
+      const candidate = (body ?? {}) as Record<string, unknown>;
+      const result = await coordination.recordAttentionItem.recordAttentionItem(
+        { ...candidate, subject: normalizeReaperSubject(candidate['subject']) },
+        actor,
+      );
+      return { outcome: result.outcome };
+    },
+    clearAttentionItem: (request: unknown, via: string, actor: string) => {
+      const candidate = (request ?? {}) as Record<string, unknown>;
+      return coordination.clearAttentionItem.clearAttentionItem(
+        { ...candidate, subject: normalizeReaperSubject(candidate['subject']) },
+        via as 'cli' | 'web' | 'machine',
+        actor,
+      );
+    },
+  };
+
+  // The merge-record read the merged-worktree evidence uses: a record whose
+  // repository is the lane-run branch (`fleet/<runId>`) answers `merged-pr`
+  // without a forge read; anything else falls through to the forge.
+  const reaperMergeRecordRead = {
+    findByProjectAndBranch: async (_projectId: string, branch: string) => {
+      const records = await mergeRecordRepository.listMergeRecords();
+      for (const record of records) {
+        if (record.repository === branch) {
+          return record;
+        }
+      }
+      return null;
+    },
+  };
 
   const conductor = {
     stallAfterMinutes,
@@ -256,6 +331,32 @@ export function composeConductor(input: ComposeConductorInput) {
       executionJournal,
       runnerForAttempt,
     }),
+    // KW4b': the zombie reaper pass. The merged-worktree removal is opt-in
+    // behind `policy.conductor.reaper.repairs['merged-worktree']` (D-R6).
+    reapZombies: new ReapZombiesUseCase({
+      attemptRepo: attemptRepository,
+      executionJournal,
+      runJournal: laneRunJournal,
+      runRepo: laneRunRepository,
+      halt: conductorHalt,
+      reconcile: reconcileAttempt,
+      mergeRecordRepo: reaperMergeRecordRead,
+      runner,
+      runnerForAttempt,
+      attention: reaperAttention,
+      reaperFindings: reaperFindingRepository,
+      newId: conductorNewUlid,
+      workspace,
+      profiles: {
+        listProjectProfiles: (request: { readonly status?: 'active' | 'retired' }) =>
+          coordination.listProjectProfiles.listProjectProfiles(request),
+      },
+      forgeRead,
+      // The reaper's subjects are 12-hex digests (D1); the full sha256 is
+      // truncated to that shape.
+      computeDigest: (text) => sha256HexDigest(text).slice(0, 12),
+    }),
+    reaperFindingRepository,
     newUlid: conductorNewUlid,
     profileRead,
     // Delegates are bound as arrow functions: the use cases read `this.deps`,

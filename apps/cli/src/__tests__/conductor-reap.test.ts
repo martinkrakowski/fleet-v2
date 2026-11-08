@@ -1227,8 +1227,8 @@ describe('conductor reap --worktrees through production composition (C2)', () =>
     // The one composition that builds a reap hands it to the one use case.
     const builders = sources.filter((file) => readFileSync(file, 'utf8').includes('new ReapLaneWorktreesUseCase('));
     expect(builders.map((file) => path.basename(file))).toEqual(['conductor.ts']);
-    // K11b' stays cut: the zombie reaper is not composed into the conductor yet.
+    // KW4ba: the zombie reaper is composed into the conductor (conductor reap).
     const conductorSource = readFileSync(path.join(srcDir, 'composition', 'conductor.ts'), 'utf8');
-    expect(conductorSource).not.toContain('ReapZombiesUseCase');
+    expect(conductorSource).toContain('ReapZombiesUseCase');
   });
 });

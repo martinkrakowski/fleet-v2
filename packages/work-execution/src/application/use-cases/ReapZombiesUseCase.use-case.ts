@@ -458,7 +458,7 @@ function effectivePassBudgetSeconds(policy: ReaperPolicy): number {
 class BudgetExceededError extends Error {}
 
 /** Race one promise against a timer; a timeout rejects with `BudgetExceededError` when the budget bound it. */
-function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, budgetOnTimeout: boolean): Promise<T> {
+async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, budgetOnTimeout: boolean): Promise<T> {
   if (timeoutMs <= 0) {
     return Promise.reject(new BudgetExceededError());
   }
@@ -470,7 +470,10 @@ function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, budgetOnTime
     );
   });
   try {
-    return Promise.race([promise, deadline]);
+    // The `await` matters: without it the non-async function returns the race
+    // promise immediately and the `finally` would clear the timer before either
+    // promise settles, so no call would ever time out.
+    return await Promise.race([promise, deadline]);
   } finally {
     if (timer !== undefined) {
       clearTimeout(timer);
@@ -860,14 +863,15 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       'reservations-unreadable',
       unknown,
     );
-    const attentionItems = await safeRead(
-      async () => {
-        const result = await this.deps.attention.listAttentionItems({ projectId });
-        return Array.isArray(result?.items) ? result.items : [];
-      },
+    const attentionAttempt = await safeRead(
+      () => this.deps.attention.listAttentionItems({ projectId }),
       'attention-unreadable',
       unknown,
     );
+    // Unknown is unknown, never empty: a successful call that answers
+    // something other than an array is unreadable, like a failed call.
+    const attentionItems =
+      attentionAttempt !== null && Array.isArray(attentionAttempt.items) ? attentionAttempt.items : null;
     return { attempts, reservations, attentionItems };
   }
 
@@ -1523,12 +1527,14 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       }
       let entries = runJournalCache.get(run.runId);
       if (entries === undefined) {
-        try {
-          const listForRun = this.deps.runJournal.listForRun;
-          entries = listForRun === undefined ? null : await listForRun.call(this.deps.runJournal, run.runId);
-        } catch {
-          entries = null;
-        }
+        const listForRun = this.deps.runJournal.listForRun;
+        // The read is deadline-guarded like its neighbours: a `listForRun` that
+        // never resolves must end as an unknown within the pass budget, never
+        // hang the gathering past it.
+        const attempted = await this.boundedCall(() =>
+          listForRun === undefined ? Promise.resolve(null) : listForRun.call(this.deps.runJournal, run.runId),
+        );
+        entries = attempted.ok ? attempted.value : null;
         runJournalCache.set(run.runId, entries);
       }
       if (entries === null) {
@@ -2096,7 +2102,15 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     }
 
     // A crashed earlier pass may have left a hold before its intent; release it
-    // defensively so the hold can be re-acquired fresh.
+    // defensively so the hold can be re-acquired fresh — but only when no live
+    // concurrent pass owns it: releasing another pass's hold would remove its
+    // protection, and an unreadable hold state must not authorise a release.
+    const ownership = await this.holdOwnership(findingId, target, ctx);
+    if (ownership !== 'free') {
+      const reason = ownership === 'live' ? 'hold-held-concurrent' : 'hold-state-unknown';
+      pushBounded(ctx.unknown, { subject: finding.subject, kind: 'merged-worktree', reason });
+      return repairView(key, finding, 'refused', reason);
+    }
     await this.bestEffortReleaseHold(findingId, ctx.nowIso, ctx.unknown);
 
     const holdId = mintedUlid(this.deps.newId);
@@ -2231,6 +2245,46 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       return 'failed';
     }
     return 'released';
+  }
+
+  /**
+   * Whether the `reaper-<findingId>` hold is free to release before this pass
+   * acquires its own: `free` when no hold names it, or only a stale leftover
+   * from a crashed pass (reserved longer ago than a whole pass budget plus the
+   * grace); `live` when a fresh hold shows a concurrent pass still owns it;
+   * `unknown` when the listing is unreadable, not an array, or the holder's
+   * reservation time cannot be read. A hold this pass does not own is never
+   * released.
+   */
+  private async holdOwnership(
+    findingId: string,
+    target: MergedWorktreeTarget,
+    ctx: SettleContext,
+  ): Promise<'free' | 'live' | 'unknown'> {
+    const holdAttemptId = 'reaper-' + findingId;
+    const listing = await this.boundedCall(() => this.deps.executionJournal.listActiveReservations());
+    if (!listing.ok) {
+      return 'unknown';
+    }
+    const raw = listing.value;
+    if (!Array.isArray(raw)) {
+      return 'unknown';
+    }
+    const holds = raw.filter(
+      (reservation): reservation is CapacityReservationRecord =>
+        isPlainObject(reservation) &&
+        (reservation as { attemptId?: unknown }).attemptId === holdAttemptId &&
+        (reservation as { worktreePath?: unknown }).worktreePath === target.worktreePath,
+    );
+    const holdReservedAtMs = holds.length === 0 ? undefined : msOfSafe(holds[0].reservedAtIso);
+    if (holdReservedAtMs === undefined) {
+      return 'free';
+    }
+    if (holdReservedAtMs === null) {
+      return 'unknown';
+    }
+    const liveWindowMs = effectivePassBudgetSeconds(ctx.policy) * 1000 + ctx.graceMs;
+    return ctx.nowMs - holdReservedAtMs <= liveWindowMs ? 'live' : 'free';
   }
 
   /** Acquire the worktree hold through `reserveCapacityAtomically`. */
@@ -2410,13 +2464,17 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       return fail('recheck-unknown');
     }
     const rawReservations = reservationsAttempt.value;
-    const freshReservations = Array.isArray(rawReservations)
-      ? rawReservations.filter(
-          (reservation) =>
-            !isPlainObject(reservation) ||
-            (reservation as { attemptId?: unknown }).attemptId !== 'reaper-' + findingId,
-        )
-      : [];
+    // An unreadable listing must never authorise a deletion: a successful call
+    // that answers something other than an array is unknown, exactly like a
+    // failed call, never an empty list that reads as "no reservations exist".
+    if (!Array.isArray(rawReservations)) {
+      return fail('recheck-unknown');
+    }
+    const freshReservations = rawReservations.filter(
+      (reservation) =>
+        !isPlainObject(reservation) ||
+        (reservation as { attemptId?: unknown }).attemptId !== 'reaper-' + findingId,
+    );
 
     const freshFacts: PassFacts = {
       attempts: freshAttempts,

@@ -317,7 +317,8 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
    * PT1a: one attention item per stalled run, refreshed every pass and cleared
    * when the run no longer stalls (resumed, ended or its park reset). Reads the
    * runs again after the advances, so a run this pass resumed clears at once.
-   * Failure-tolerant like the park notice: a refused call, an unreadable store
+   * A stall item whose run is absent from the run repository is left open
+   * (unknown state, not proven non-stalling). Failure-tolerant like the park notice: a refused call, an unreadable store
    * or a throw never changes the pass, and the next pass converges. A run
    * whose project cannot be read raises nothing and keeps any open item.
    */
@@ -369,8 +370,13 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       if (open.outcome !== 'found') {
         return;
       }
+      // U7 fix round: a stall item whose run is no longer in the run
+      // repository has unknown state (not proven non-stalling), so it is
+      // never cleared here — the same rule `resolveTerminalRunAttention`
+      // applies to run-subject items.
+      const knownRunIds = new Set(records.map((record) => record.runId));
       for (const item of open.items) {
-        if (!stalledIds.has(item.runId)) {
+        if (!stalledIds.has(item.runId) && knownRunIds.has(item.runId)) {
           await port.clearStallAttention(item);
         }
       }

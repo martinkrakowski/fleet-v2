@@ -313,6 +313,17 @@ describe('RunConductorPassUseCase terminal-run attention resolution (U7)', () =>
     });
   });
 
+  it('a stall item whose run is absent from the run repository is never cleared by reconciliation', async () => {
+    const fx = await fixture([{ runId: RUN_MERGED, state: 'merged' }]);
+    fx.store.seed('conductor-stall', RUN_UNKNOWN);
+
+    const result = await fx.pass(at(1));
+    expect(result).toMatchObject({ outcome: 'completed' });
+    // Unknown run state is not proven non-stalling: the orphan stall item stays open.
+    expect(fx.store.clearsFor('conductor-stall', RUN_UNKNOWN)).toBe(0);
+    expect(fx.store.item('conductor-stall', RUN_UNKNOWN)?.state).toBe('open');
+  });
+
   it('a live stall item on a run parked past the threshold is refreshed, never resolved by this path', async () => {
     const fx = await fixture([{ runId: RUN_LIVE_PARKED, state: 'parked', parked: true }]);
     fx.store.seed('conductor-stall', RUN_LIVE_PARKED);

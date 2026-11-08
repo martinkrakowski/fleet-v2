@@ -312,57 +312,92 @@ function isWellFormedTouchedPath(path: unknown): path is string {
 /**
  * The first failing A4 fact, in this order: doors (unreadable, then named), touched auto-merge door
  * paths, risk, forge mode; else null. Total on hostile inputs: a malformed facts object, doors, or
- * touchedPaths fail closed to `doors-unreadable` without throwing.
+ * touchedPaths fail closed to `doors-unreadable` without throwing. Every read goes through own
+ * property descriptors — no getter, iterator or array element is ever invoked — and descriptor
+ * traps are caught, so proxies, accessor properties and hostile array iteration fail closed
+ * instead of throwing.
  */
 export function autoMergeIneligibility(facts: AutoMergeEligibilityFacts): AutoMergeReason | null {
   if (facts === null || typeof facts !== 'object') {
     return 'doors-unreadable';
   }
-  // Read own property descriptors so getter-bearing hostile facts fail closed without invoking getters.
-  const doorsDescriptor = Object.getOwnPropertyDescriptor(facts, 'doors');
-  const touchedPathsDescriptor = Object.getOwnPropertyDescriptor(facts, 'touchedPaths');
-  if (doorsDescriptor === undefined || !('value' in doorsDescriptor)) {
-    return 'doors-unreadable';
-  }
-  const doors = doorsDescriptor.value as AutoMergeDoors;
-  if (doors === null || typeof doors !== 'object') {
-    return 'doors-unreadable';
-  }
-  if (doors.kind === 'unreadable') {
-    return 'doors-unreadable';
-  }
-  if (doors.kind !== 'none' && doors.kind !== 'named') {
-    return 'doors-unreadable';
-  }
-  if (touchedPathsDescriptor !== undefined) {
-    if (!('value' in touchedPathsDescriptor)) {
+  try {
+    const doorsDescriptor = Object.getOwnPropertyDescriptor(facts, 'doors');
+    const touchedPathsDescriptor = Object.getOwnPropertyDescriptor(facts, 'touchedPaths');
+    const riskDescriptor = Object.getOwnPropertyDescriptor(facts, 'risk');
+    const allowHighRiskDescriptor = Object.getOwnPropertyDescriptor(facts, 'allowHighRisk');
+    const forgeModeDescriptor = Object.getOwnPropertyDescriptor(facts, 'forgeMode');
+    if (doorsDescriptor === undefined || !('value' in doorsDescriptor)) {
       return 'doors-unreadable';
     }
-    const touchedPaths = touchedPathsDescriptor.value;
-    if (!Array.isArray(touchedPaths)) {
+    const doors = doorsDescriptor.value as AutoMergeDoors;
+    if (doors === null || typeof doors !== 'object') {
       return 'doors-unreadable';
     }
-    for (const path of touchedPaths) {
-      if (!isWellFormedTouchedPath(path)) {
+    const kindDescriptor = Object.getOwnPropertyDescriptor(doors, 'kind');
+    if (kindDescriptor === undefined || !('value' in kindDescriptor)) {
+      return 'doors-unreadable';
+    }
+    const kind = kindDescriptor.value;
+    if (kind === 'unreadable' || (kind !== 'none' && kind !== 'named')) {
+      return 'doors-unreadable';
+    }
+    let touchedDoorPath = false;
+    if (touchedPathsDescriptor !== undefined) {
+      if (!('value' in touchedPathsDescriptor)) {
         return 'doors-unreadable';
       }
-    }
-    for (const path of touchedPaths) {
-      if (isAutoMergeDoorPath(path)) {
-        return 'door-named';
+      const touchedPaths = touchedPathsDescriptor.value;
+      if (!Array.isArray(touchedPaths)) {
+        return 'doors-unreadable';
       }
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(touchedPaths, 'length');
+      if (
+        lengthDescriptor === undefined || !('value' in lengthDescriptor) ||
+        typeof lengthDescriptor.value !== 'number' || !Number.isSafeInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0
+      ) {
+        return 'doors-unreadable';
+      }
+      const validPaths: string[] = [];
+      for (let index = 0; index < lengthDescriptor.value; index += 1) {
+        const elementDescriptor = Object.getOwnPropertyDescriptor(touchedPaths, index);
+        if (
+          elementDescriptor === undefined || !('value' in elementDescriptor) ||
+          !isWellFormedTouchedPath(elementDescriptor.value)
+        ) {
+          return 'doors-unreadable';
+        }
+        validPaths.push(elementDescriptor.value);
+      }
+      // Every element is validated before any door classification.
+      touchedDoorPath = validPaths.some((path) => isAutoMergeDoorPath(path));
     }
+    if (kind === 'named' || touchedDoorPath) {
+      return 'door-named';
+    }
+    // Accessor risk/allowHighRisk/forgeMode are hostile: fail closed without invoking the getter.
+    if (
+      (riskDescriptor !== undefined && !('value' in riskDescriptor)) ||
+      (allowHighRiskDescriptor !== undefined && !('value' in allowHighRiskDescriptor)) ||
+      (forgeModeDescriptor !== undefined && !('value' in forgeModeDescriptor))
+    ) {
+      return 'doors-unreadable';
+    }
+    const risk = riskDescriptor === undefined ? undefined : riskDescriptor.value;
+    const allowHighRisk = allowHighRiskDescriptor === undefined ? undefined : allowHighRiskDescriptor.value;
+    const forgeMode = forgeModeDescriptor === undefined ? undefined : forgeModeDescriptor.value;
+    // An allow-list (plan A5: absent or unknown risk is high): only `standard`, or `high` with an explicit opt-in.
+    const riskAllowed = risk === 'standard' || (risk === 'high' && allowHighRisk === true);
+    if (!riskAllowed) {
+      return 'high-risk';
+    }
+    if (forgeMode !== 'github') {
+      return 'forge-mode';
+    }
+    return null;
+  } catch {
+    // A proxy descriptor trap (or any other hostile runtime behaviour) fails closed.
+    return 'doors-unreadable';
   }
-  if (doors.kind === 'named') {
-    return 'door-named';
-  }
-  // An allow-list (plan A5: absent or unknown risk is high): only `standard`, or `high` with an explicit opt-in.
-  const riskAllowed = facts.risk === 'standard' || (facts.risk === 'high' && facts.allowHighRisk === true);
-  if (!riskAllowed) {
-    return 'high-risk';
-  }
-  if (facts.forgeMode !== 'github') {
-    return 'forge-mode';
-  }
-  return null;
 }

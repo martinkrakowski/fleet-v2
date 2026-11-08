@@ -400,4 +400,41 @@ describe('autoMergeIneligibility decision-machinery and protected-path doors', (
     expect(autoMergeIneligibility(getterBearingFacts as never)).toBe('doors-unreadable');
     expect(autoMergeIneligibility(null as never)).toBe('doors-unreadable');
   });
+
+  it('fails closed on getters, proxy traps and hostile array iteration without invoking them', () => {
+    const throwing = () => {
+      throw new Error('hostile');
+    };
+    // A getter on doors.kind is never invoked: the accessor descriptor itself fails closed.
+    const doorsWithKindGetter: Record<string, unknown> = {};
+    Object.defineProperty(doorsWithKindGetter, 'kind', { enumerable: true, get: throwing });
+    expect(
+      autoMergeIneligibility({ doors: doorsWithKindGetter as never, risk: 'standard', forgeMode: 'github' }),
+    ).toBe('doors-unreadable');
+    // Getters on risk, allowHighRisk and forgeMode are never invoked.
+    for (const key of ['risk', 'allowHighRisk', 'forgeMode']) {
+      const hostile: Record<string, unknown> = { doors: { kind: 'none' } };
+      Object.defineProperty(hostile, key, { enumerable: true, get: throwing });
+      expect(autoMergeIneligibility(hostile as never)).toBe('doors-unreadable');
+    }
+    // A proxy getOwnPropertyDescriptor trap on facts fails closed.
+    const trappingFacts = new Proxy(
+      { doors: { kind: 'none' }, risk: 'standard', forgeMode: 'github' },
+      { getOwnPropertyDescriptor: throwing },
+    );
+    expect(autoMergeIneligibility(trappingFacts as never)).toBe('doors-unreadable');
+    // A proxy getOwnPropertyDescriptor trap on touchedPaths fails closed.
+    const trappingPaths = new Proxy(['AGENTS.md'], { getOwnPropertyDescriptor: throwing });
+    expect(
+      autoMergeIneligibility({ ...base, risk: 'standard', touchedPaths: trappingPaths as never }),
+    ).toBe('doors-unreadable');
+    // An array element getter is never invoked.
+    const elementGetter = ['packages/work-execution/src/domain/plain-record-reads.ts'];
+    Object.defineProperty(elementGetter, 0, { enumerable: true, get: throwing });
+    expect(autoMergeIneligibility({ ...base, risk: 'standard', touchedPaths: elementGetter })).toBe('doors-unreadable');
+    // A hostile Symbol.iterator is never invoked: descriptor reads classify a valid list normally.
+    const hostileIterator = ['packages/work-execution/src/domain/plain-record-reads.ts'];
+    Object.defineProperty(hostileIterator, Symbol.iterator, { get: throwing });
+    expect(autoMergeIneligibility({ ...base, risk: 'standard', touchedPaths: hostileIterator })).toBeNull();
+  });
 });

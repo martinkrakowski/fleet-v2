@@ -22,10 +22,12 @@
  * While the quarantine is active the body runs exactly once: if it throws or
  * times out, the test still passes and the helper writes a `::warning` GitHub
  * annotation to stdout naming the issue, the marker date and the first line of
- * the error. When the marker expires the test fails immediately with a message
- * saying to remove or renew the marker — removing the wrapper ends the
- * quarantine. An invalid marker (a malformed or impossible `until`, an issue
- * that is not `#<digits>`, or an `until` more than
+ * the error. During the final `E2E_QUARANTINE_NOTICE_DAYS` active UTC days
+ * before `until` (inclusive) the helper also writes an approaching-expiry
+ * `::warning` annotation. When the marker expires the test fails immediately
+ * with a message saying to remove or renew the marker — removing the wrapper
+ * ends the quarantine. An invalid marker (a malformed or impossible `until`,
+ * an issue that is not `#<digits>`, or an `until` more than
  * `E2E_QUARANTINE_MAX_DAYS` days after today) always fails the test.
  */
 
@@ -36,6 +38,9 @@ export interface E2eQuarantineMarker {
 
 /** The newest `until` allowed: the weekly review renews markers past this. */
 export const E2E_QUARANTINE_MAX_DAYS = 14;
+
+/** Final active UTC days (`0..E2E_QUARANTINE_NOTICE_DAYS`) that emit an approaching-expiry warning. */
+export const E2E_QUARANTINE_NOTICE_DAYS = 3;
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const ISSUE_RE = /^#[1-9]\d*$/;
@@ -106,11 +111,27 @@ export function quarantineState(marker: E2eQuarantineMarker, nowMs: number): Qua
 }
 
 /**
+ * True when `marker` is valid, active, and within `0..E2E_QUARANTINE_NOTICE_DAYS`
+ * UTC days of `until` (inclusive). Sits beside `QuarantineState` without widening it.
+ */
+export function isQuarantineApproachingExpiry(
+  marker: E2eQuarantineMarker,
+  nowMs: number,
+): boolean {
+  if (quarantineState(marker, nowMs).kind !== 'active') {
+    return false;
+  }
+  return daysFromToday(marker.until, nowMs) <= E2E_QUARANTINE_NOTICE_DAYS;
+}
+
+/**
  * Wrap an e2e `it` body in a quarantine. Returns the function to pass to
  * `it(...)`. While the marker is active the body runs exactly once (no retry):
  * a pass passes, and a throw or a budget timeout resolves the test after
- * writing one `::warning` annotation line via `write`. An invalid or expired
- * marker throws before the body runs.
+ * writing one `::warning` annotation line via `write`. Within the final
+ * `E2E_QUARANTINE_NOTICE_DAYS` active UTC days before `until` an approaching-
+ * expiry `::warning` annotation is written before the body runs. An invalid or
+ * expired marker throws before the body runs.
  */
 export function quarantined(
   marker: E2eQuarantineMarker,
@@ -121,9 +142,16 @@ export function quarantined(
   const now = options?.now ?? Date.now;
   const writeLine = options?.write ?? ((line: string) => process.stdout.write(`${line}\n`));
   return async () => {
-    const state = quarantineState(marker, now());
+    const nowMs = now();
+    const state = quarantineState(marker, nowMs);
     if (state.kind !== 'active') {
       throw new Error(state.message);
+    }
+    if (isQuarantineApproachingExpiry(marker, nowMs)) {
+      const remainingDays = daysFromToday(marker.until, nowMs);
+      writeLine(
+        `::warning title=e2e quarantine::${marker.issue} quarantine approaching expiry on ${marker.until} (${remainingDays}d remaining): remove or renew the marker`,
+      );
     }
     // A body that throws synchronously is handled like a rejected one.
     const bodyPromise = Promise.resolve().then(body);

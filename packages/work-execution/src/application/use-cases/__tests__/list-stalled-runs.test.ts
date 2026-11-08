@@ -9,6 +9,7 @@ import { ListStalledRunsUseCase } from '../ListStalledRunsUseCase.use-case.js';
 
 const RUN_A = 'run-01M63WPH4GMF2CA3NQ7JAM4HS1';
 const RUN_B = 'run-01M63WPH4GMF2CA3NQ7JAM4HS2';
+const RUN_C = 'run-01M63WPH4GMF2CA3NQ7JAM4HS3';
 const NOW = '2026-11-06T21:00:00.000Z';
 
 async function seed(repo: LaneRunRepositoryAdapter, journal: LaneRunJournalAdapter, runId: string, workOrderId: string, parkedAtIso: string, parkClass: string | undefined): Promise<void> {
@@ -51,6 +52,47 @@ describe('ListStalledRunsUseCase (PT1a)', () => {
         { runId: RUN_B, class: 'other', ageMinutes: 60, workOrderId: 'wo-fleet-v2-co14b-2026-11-06' },
       ],
     });
+  });
+
+  it('lists a non-parked gating run as an idle row without a class', async () => {
+    const repo = new LaneRunRepositoryAdapter();
+    const journal = new LaneRunJournalAdapter();
+    const created = LaneRun.create({
+      version: 1,
+      runId: RUN_C,
+      workOrderId: 'wo-fleet-v2-t2c-2026-11-06',
+      tier: 2,
+      seatPlanRef: 'a'.repeat(64),
+      cursors: { 'first-pass': 0, fix: null, review: null },
+      round: 0,
+      attemptIds: ['attempt-01M64PT1PX2MAZVQDYAYMZ7WNB'],
+      prNumber: null,
+      parked: null,
+      parkCount: 0,
+      lease: null,
+      revision: 1,
+      runPolicyRevision: 'policy:conductor@7844746b0277',
+      schemaVersion: 1,
+    });
+    if (!created.success) {
+      throw new Error('fixture must be a valid LaneRun record');
+    }
+    await repo.create(created.value.toRecord());
+    await journal.append(laneRunConductEntry('01M64PT1PX2MAZVQDYAYMZ7' + RUN_C.slice(-3).padStart(3, '0'), RUN_C, 'gating', '2026-11-06T19:00:00.000Z'));
+    const result = await new ListStalledRunsUseCase({ runRepo: repo, runJournal: journal, stallAfterMinutes: 30 }).listStalledRuns({ nowIso: NOW });
+    expect(result.outcome).toBe('listed');
+    if (result.outcome !== 'listed') {
+      return;
+    }
+    expect(result.stalled).toHaveLength(1);
+    expect(result.stalled[0]!).toEqual({
+      runId: RUN_C,
+      state: 'gating',
+      ageMinutes: 120,
+      workOrderId: 'wo-fleet-v2-t2c-2026-11-06',
+      lastAdvancedAtIso: '2026-11-06T19:00:00.000Z',
+    });
+    expect(result.stalled[0]!).not.toHaveProperty('class');
   });
 
   it('defaults the threshold to 30 and lists nothing under it', async () => {

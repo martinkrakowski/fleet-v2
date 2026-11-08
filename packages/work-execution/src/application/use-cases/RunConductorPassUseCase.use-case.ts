@@ -345,13 +345,24 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         if (workOrder === null) {
           continue;
         }
-        await port.raiseStallAttention({
-          projectId: workOrder.projectId,
-          workOrderId: view.workOrderId,
-          runId: view.runId,
-          parkClass: view.parkClass,
-          ageMinutes: view.ageMinutes,
-        });
+        await port.raiseStallAttention(
+          'parkClass' in view
+            ? {
+                projectId: workOrder.projectId,
+                workOrderId: view.workOrderId,
+                runId: view.runId,
+                parkClass: view.parkClass,
+                ageMinutes: view.ageMinutes,
+              }
+            : {
+                projectId: workOrder.projectId,
+                workOrderId: view.workOrderId,
+                runId: view.runId,
+                state: view.state,
+                ageMinutes: view.ageMinutes,
+                lastAdvancedAtIso: view.lastAdvancedAtIso,
+              },
+        );
       }
       const open = await port.listOpenStallAttention();
       if (open.outcome !== 'found') {

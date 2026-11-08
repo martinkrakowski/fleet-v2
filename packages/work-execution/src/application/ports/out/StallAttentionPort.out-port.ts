@@ -3,13 +3,14 @@
  * attention items, one per stalled run, keyed `stall:<runId>`, through
  * operator coordination's attention store. A repeat refreshes the open item
  * and never adds a second; clearing resolves it. The item grants and blocks
- * nothing. Ids, a park class and an age only; a failed call is reported as a
- * value, never thrown and never retried blindly.
+ * nothing. Ids, a park class or a state, and an age only; a failed call is
+ * reported as a value, never thrown and never retried blindly.
  */
 
 import type { LaneRunParkClass } from '../../../domain/park-class.js';
+import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 
-export interface RaiseStallAttentionCommand {
+export interface ParkedRaiseStallAttentionCommand {
   readonly projectId: string;
   readonly workOrderId: string;
   readonly runId: string;
@@ -17,6 +18,18 @@ export interface RaiseStallAttentionCommand {
   /** Whole minutes the run has been parked. */
   readonly ageMinutes: number;
 }
+
+export interface IdleRaiseStallAttentionCommand {
+  readonly projectId: string;
+  readonly workOrderId: string;
+  readonly runId: string;
+  readonly state: LaneRunStateValue;
+  /** Whole minutes the run has been idle. */
+  readonly ageMinutes: number;
+  readonly lastAdvancedAtIso: string;
+}
+
+export type RaiseStallAttentionCommand = ParkedRaiseStallAttentionCommand | IdleRaiseStallAttentionCommand;
 
 export interface ClearStallAttentionCommand {
   readonly projectId: string;

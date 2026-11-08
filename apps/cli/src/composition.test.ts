@@ -1155,8 +1155,6 @@ describe("conductor reaper merged-worktree repair through production composition
       { projectId: 'reaper-project', nowIso: T0, policy: OPT_IN_POLICY },
     );
     expect(pass1.outcome).toBe('completed');
-    // eslint-disable-next-line no-console
-    console.log('DBG_P1X', JSON.stringify(pass1.unknown));
     expect(pass1.findings.find((finding) => finding.kind === 'merged-worktree')?.action).toBe('wait');
     expect(pass1.repairs.filter((repair) => repair.kind === 'merged-worktree')).toEqual([]);
     expect(existsSync(WT_PATH)).toBe(true);

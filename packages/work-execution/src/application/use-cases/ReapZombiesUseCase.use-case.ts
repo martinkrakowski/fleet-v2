@@ -1253,22 +1253,14 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     clone: CloneRef,
     workspace: NonNullable<ReapZombiesDependencies['workspace']>,
   ): Promise<readonly string[] | null> {
-    const listWorktrees = workspace.listWorktrees;
-    if (listWorktrees === undefined) {
+    if (workspace.listWorktrees === undefined) {
       wk.readsComplete = false;
       pushBounded(build.unknown, { subject: '', reason: 'worktree-read-unconfigured' });
       return null;
     }
     const attempted = await this.boundedCall(() =>
-      listWorktrees({ repositoryRoot: clone.clonePath, recordedHost: clone.recordedHost }),
+      workspace.listWorktrees!({ repositoryRoot: clone.clonePath, recordedHost: clone.recordedHost }),
     );
-    // eslint-disable-next-line no-console
-    console.error('DBG_UC_LIST', JSON.stringify({
-      ok: attempted.ok,
-      budget: attempted.ok ? null : attempted.budget,
-      outcome: attempted.ok ? (attempted.value as { outcome?: unknown } | null)?.outcome ?? null : null,
-      isArray: attempted.ok && attempted.value !== null ? Array.isArray((attempted.value as { worktrees?: unknown }).worktrees) : null,
-    }));
     if (!attempted.ok) {
       wk.readsComplete = false;
       pushBounded(build.unknown, { subject: '', reason: attempted.budget ? 'pass-budget' : 'worktree-list-unreadable' });
@@ -1333,14 +1325,13 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     workspace: NonNullable<ReapZombiesDependencies['workspace']>,
     diskByHost: Map<string, number>,
   ): Promise<boolean> {
-    const readFilesystemSpace = workspace.readFilesystemSpace;
-    if (readFilesystemSpace === undefined) {
+    if (workspace.readFilesystemSpace === undefined) {
       wk.readsComplete = false;
       pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
       return false;
     }
     const attempted = await this.boundedCall(() =>
-      readFilesystemSpace({ path: clone.worktreeRoot, recordedHost: clone.recordedHost }),
+      workspace.readFilesystemSpace!({ path: clone.worktreeRoot, recordedHost: clone.recordedHost }),
     );
     if (!attempted.ok) {
       wk.readsComplete = false;
@@ -1436,12 +1427,11 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       pushBounded(build.unknown, { subject, kind: 'merged-worktree', reason });
       return null;
     };
-    const inspectWorktreeForRemoval = workspace.inspectWorktreeForRemoval;
-    if (inspectWorktreeForRemoval === undefined) {
+    if (workspace.inspectWorktreeForRemoval === undefined) {
       return fail('worktree-read-unconfigured');
     }
     const attempted = await this.boundedCall(() =>
-      inspectWorktreeForRemoval({
+      workspace.inspectWorktreeForRemoval!({
         repositoryRoot: clone.clonePath,
         worktreePath,
         defaultRef: clone.defaultRef,

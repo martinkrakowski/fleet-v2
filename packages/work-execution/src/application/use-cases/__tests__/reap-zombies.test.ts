@@ -14,7 +14,7 @@ import { containsSecretShape } from '@fleet/shared';
 
 import type { ActionJournalEntryRecord, AttemptRecord, CapacityReservationRecord } from '../../../domain/execution-records.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
-import type { ExecutionJournalPort, ReserveCapacityAtomicallyRequest } from '../../ports/out/ExecutionJournalPort.out-port.js';
+import type { ExecutionJournalPort, ReleaseCapacityReservationIfUnchangedRequest, ReleaseCapacityReservationIfUnchangedResult, ReserveCapacityAtomicallyRequest } from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunJournalPort, LaneRunJournalAppendResult } from '../../ports/out/LaneRunJournalPort.out-port.js';
@@ -516,6 +516,10 @@ interface Harness {
   storeCallTimeoutMs?: number;
   /** KW4ba fix round 2: a scripted `listActiveReservations`; absent means the plain fixture list. */
   listActiveReservations?: () => Promise<unknown>;
+  /** KW4ba fix round 3: a scripted fenced release; absent means the port lacks it. */
+  fencedRelease?: (
+    request: ReleaseCapacityReservationIfUnchangedRequest,
+  ) => Promise<ReleaseCapacityReservationIfUnchangedResult>;
 }
 
 function build(harness: Harness): ReapZombiesUseCase {
@@ -531,6 +535,7 @@ function build(harness: Harness): ReapZombiesUseCase {
       return Promise.resolve(entries ?? []);
     },
     ...(harness.releaseSpy === undefined ? {} : { releaseCapacityReservationIfUnchanged: harness.releaseSpy }),
+    ...(harness.fencedRelease === undefined ? {} : { releaseCapacityReservationIfUnchanged: harness.fencedRelease }),
     ...(harness.reserveCapacity === undefined ? {} : { reserveCapacityAtomically: harness.reserveCapacity }),
     ...(harness.releaseCapacity === undefined ? {} : { releaseCapacityReservation: harness.releaseCapacity }),
   };
@@ -2224,6 +2229,187 @@ describe('reap zombies KW4b merged-worktree repair', () => {
     // The owning pass still holds it afterwards.
     expect(concurrentHold.held).toBe(true);
     expect(concurrentHold.releasedAtIso).toBeNull();
+  });
+
+  it('a hold acquired between the check and the release fails the fence, is not released and removes nothing (KW4ba fix round 3)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    // A crashed pass's stale leftover hold, as this pass's listing reads it:
+    // over a whole pass budget plus the grace old, so the check reads `free`.
+    const staleHold = reservationFixture('res-stale', 'reaper-' + seeded.findingId, {
+      hostId: 'reaper:' + HOST_NAME,
+      seatTool: null,
+      worktreePath: WT_PATH,
+      reservedAtIso: BEFORE,
+    });
+    // The hold a concurrent pass acquires in the window between this pass's
+    // listing and its release.
+    const liveHold = reservationFixture('res-live', 'reaper-' + seeded.findingId, {
+      hostId: 'reaper:' + HOST_NAME,
+      seatTool: null,
+      worktreePath: WT_PATH,
+      reservedAtIso: NOW,
+    });
+    const fencedCalls: ReleaseCapacityReservationIfUnchangedRequest[] = [];
+    let concurrentOwns = false;
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        return { outcome: 'removed', branchTip: COMMIT };
+      },
+    });
+    // The stale hold appears only once the repair reads its key: the gather
+    // must classify the finding first, exactly as in a real pass where the
+    // leftover hold is read at the ownership check.
+    const baseJournal = makeJournal();
+    let holdVisible = false;
+    const journal = {
+      ...baseJournal,
+      listForKey: (key: string) => {
+        holdVisible = true;
+        return baseJournal.listForKey(key);
+      },
+    };
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      journal,
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, releasedHolds),
+      listActiveReservations: () =>
+        Promise.resolve(concurrentOwns ? [liveHold] : holdVisible ? [staleHold] : []),
+      fencedRelease: async (fenceRequest) => {
+        fencedCalls.push(fenceRequest);
+        // The concurrent pass acquires its own hold while this pass's release
+        // is in flight: the held reservation is no longer the one the check
+        // read, so the fence fails.
+        concurrentOwns = true;
+        return fenceRequest.reservationId === liveHold.id
+          ? { outcome: 'released', reservationId: fenceRequest.reservationId }
+          : { outcome: 'changed' };
+      },
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'refused', reasonCode: 'hold-held-concurrent' });
+    // The release was fenced on the record the check read.
+    expect(fencedCalls).toHaveLength(1);
+    expect(fencedCalls[0]).toMatchObject({ attemptId: 'reaper-' + seeded.findingId, reservationId: 'res-stale' });
+    // The fence failed (`changed`): the concurrent pass's hold was never
+    // released, this pass never took its own and removed nothing.
+    expect(releasedHolds).toEqual([]);
+    expect(events.some((entry) => entry.startsWith('release:'))).toBe(false);
+    expect(events.includes('hold')).toBe(false);
+    expect(events.includes('remove')).toBe(false);
+    expect(workspace.requests.some((entry) => entry.remove !== undefined)).toBe(false);
+    // Nothing was journaled: the pass refused before the intent.
+    expect(harness.journal.state.appendCalls).toEqual([]);
+    // The owning pass still holds it afterwards.
+    expect(liveHold.held).toBe(true);
+    expect(liveHold.releasedAtIso).toBeNull();
+  });
+
+  it('fence-releases the stale leftover hold of a crashed pass and proceeds with the repair (KW4ba fix round 3)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    // A crashed pass abandoned this hold with no owner. It is stale, so the
+    // check reads `free` and this pass's fenced release recovers it — the
+    // abandoned hold never blocks a later pass for ever.
+    const staleHold = reservationFixture('res-stale', 'reaper-' + seeded.findingId, {
+      hostId: 'reaper:' + HOST_NAME,
+      seatTool: null,
+      worktreePath: WT_PATH,
+      reservedAtIso: BEFORE,
+    });
+    const fencedCalls: ReleaseCapacityReservationIfUnchangedRequest[] = [];
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        return { outcome: 'removed', branchTip: COMMIT };
+      },
+    });
+    // The stale hold appears only once the repair reads its key: the gather
+    // must classify the finding first, exactly as in a real pass where the
+    // leftover hold is read at the ownership check.
+    const baseJournal = makeJournal();
+    let holdVisible = false;
+    const journal = {
+      ...baseJournal,
+      listForKey: (key: string) => {
+        holdVisible = true;
+        return baseJournal.listForKey(key);
+      },
+    };
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      journal,
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, releasedHolds),
+      listActiveReservations: () => Promise.resolve(holdVisible ? [staleHold] : []),
+      fencedRelease: async (fenceRequest) => {
+        fencedCalls.push(fenceRequest);
+        events.push('fence');
+        return { outcome: 'released', reservationId: fenceRequest.reservationId };
+      },
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'completed' });
+    // The release was fenced on the record the check read.
+    expect(fencedCalls).toHaveLength(1);
+    expect(fencedCalls[0]).toMatchObject({
+      attemptId: 'reaper-' + seeded.findingId,
+      reservationId: 'res-stale',
+      attemptRevision: 0,
+    });
+    // The hold attempt is synthetic and has no attempt record: the fence
+    // reads revision 0, at the check and under the store's lock.
+    await expect(fencedCalls[0]!.readAttemptRevision()).resolves.toBe(0);
+    // The stale hold was released first, then this pass acquired its own
+    // hold, removed under it and released its own hold afterwards.
+    expect(events).toEqual(['fence', 'hold', 'remove', 'release:reaper-' + seeded.findingId]);
+    expect(releasedHolds).toEqual(['reaper-' + seeded.findingId]);
+  });
+
+  it('releases its own hold on every exit path, including a removal that throws (KW4ba fix round 3)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        // The removal itself throws: the hold must still be released.
+        throw new Error('remove blew up');
+      },
+    });
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, releasedHolds),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'ambiguous', reasonCode: 'remove-ambiguous' });
+    // No hold is left behind on the throw path: the pass released its own.
+    expect(events.filter((entry) => entry === 'hold')).toHaveLength(1);
+    expect(releasedHolds).toEqual(['reaper-' + seeded.findingId]);
+    expect(events.filter((entry) => entry.startsWith('release:reaper-'))).toHaveLength(1);
   });
 
   it('a listForRun that never resolves yields unknown within the pass budget rather than hanging (KW4ba fix 4)', async () => {

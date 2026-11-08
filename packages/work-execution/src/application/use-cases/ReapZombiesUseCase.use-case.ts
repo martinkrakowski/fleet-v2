@@ -141,7 +141,12 @@ export interface ReapZombiesDependencies {
   readonly attemptRepo: Pick<AttemptRepositoryPort, 'listAllAttempts' | 'findAttemptById'>;
   /** Read-only facts only; the reaper never releases capacity. */
   readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'> &
-    Partial<Pick<ExecutionJournalPort, 'reserveCapacityAtomically' | 'releaseCapacityReservation'>>;
+    Partial<
+      Pick<
+        ExecutionJournalPort,
+        'reserveCapacityAtomically' | 'releaseCapacityReservation' | 'releaseCapacityReservationIfUnchanged'
+      >
+    >;
   readonly runJournal: Pick<LaneRunJournalPort, 'append' | 'listForKey'> &
     Partial<Pick<LaneRunJournalPort, 'listForRun'>>;
   readonly reconcile: Pick<ReconcileAttemptPort, 'reconcileAttempt'>;
@@ -2102,16 +2107,36 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     }
 
     // A crashed earlier pass may have left a hold before its intent; release it
-    // defensively so the hold can be re-acquired fresh — but only when no live
-    // concurrent pass owns it: releasing another pass's hold would remove its
-    // protection, and an unreadable hold state must not authorise a release.
+    // so the hold can be re-acquired fresh — but only while it is still the
+    // hold this pass read. The release is fenced on the record the check read
+    // (KW4ba fix round 3): a hold a concurrent pass acquires between the
+    // listing and the release fails the fence, is never released by this pass,
+    // and this pass proceeds toward no removal. An unreadable hold state
+    // releases nothing.
     const ownership = await this.holdOwnership(findingId, target, ctx);
-    if (ownership !== 'free') {
-      const reason = ownership === 'live' ? 'hold-held-concurrent' : 'hold-state-unknown';
+    if (ownership.outcome !== 'free') {
+      const reason = ownership.outcome === 'live' ? 'hold-held-concurrent' : 'hold-state-unknown';
       pushBounded(ctx.unknown, { subject: finding.subject, kind: 'merged-worktree', reason });
       return repairView(key, finding, 'refused', reason);
     }
-    await this.bestEffortReleaseHold(findingId, ctx.nowIso, ctx.unknown);
+    if (ownership.staleHold !== null) {
+      const fenced = await this.fencedReleaseHold(findingId, ownership.staleHold, ctx.nowIso, ctx.unknown);
+      if (fenced === 'changed') {
+        // The fence failed: the held reservation is no longer the one this
+        // pass read, so a concurrent pass owns the hold now and this pass
+        // releases nothing and removes nothing.
+        pushBounded(ctx.unknown, { subject: finding.subject, kind: 'merged-worktree', reason: 'hold-held-concurrent' });
+        return repairView(key, finding, 'refused', 'hold-held-concurrent');
+      }
+      if (fenced !== 'released' && fenced !== 'not-held') {
+        // `unresolved`: the hold state cannot be established, so this pass
+        // releases nothing and removes nothing. The stale leftover stays
+        // recoverable: a later pass re-reads it and fence-releases it once
+        // the hold state reads again — no pass is blocked for ever.
+        pushBounded(ctx.unknown, { subject: finding.subject, kind: 'merged-worktree', reason: 'hold-state-unknown' });
+        return repairView(key, finding, 'refused', 'hold-state-unknown');
+      }
+    }
 
     const holdId = mintedUlid(this.deps.newId);
     if (holdId === null) {
@@ -2251,24 +2276,29 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
    * Whether the `reaper-<findingId>` hold is free to release before this pass
    * acquires its own: `free` when no hold names it, or only a stale leftover
    * from a crashed pass (reserved longer ago than a whole pass budget plus the
-   * grace); `live` when a fresh hold shows a concurrent pass still owns it;
-   * `unknown` when the listing is unreadable, not an array, or the holder's
-   * reservation time cannot be read. A hold this pass does not own is never
-   * released.
+   * grace) — with the stale record attached, so the release can fence on the
+   * reservation id the check read; `live` when a fresh hold shows a concurrent
+   * pass still owns it; `unknown` when the listing is unreadable, not an
+   * array, or the holder's reservation time cannot be read. A hold this pass
+   * does not own is never released.
    */
   private async holdOwnership(
     findingId: string,
     target: MergedWorktreeTarget,
     ctx: SettleContext,
-  ): Promise<'free' | 'live' | 'unknown'> {
+  ): Promise<
+    | { readonly outcome: 'free'; readonly staleHold: CapacityReservationRecord | null }
+    | { readonly outcome: 'live' }
+    | { readonly outcome: 'unknown' }
+  > {
     const holdAttemptId = 'reaper-' + findingId;
     const listing = await this.boundedCall(() => this.deps.executionJournal.listActiveReservations());
     if (!listing.ok) {
-      return 'unknown';
+      return { outcome: 'unknown' };
     }
     const raw = listing.value;
     if (!Array.isArray(raw)) {
-      return 'unknown';
+      return { outcome: 'unknown' };
     }
     const holds = raw.filter(
       (reservation): reservation is CapacityReservationRecord =>
@@ -2278,13 +2308,71 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     );
     const holdReservedAtMs = holds.length === 0 ? undefined : msOfSafe(holds[0].reservedAtIso);
     if (holdReservedAtMs === undefined) {
-      return 'free';
+      return { outcome: 'free', staleHold: null };
     }
     if (holdReservedAtMs === null) {
-      return 'unknown';
+      return { outcome: 'unknown' };
     }
     const liveWindowMs = effectivePassBudgetSeconds(ctx.policy) * 1000 + ctx.graceMs;
-    return ctx.nowMs - holdReservedAtMs <= liveWindowMs ? 'live' : 'free';
+    if (ctx.nowMs - holdReservedAtMs <= liveWindowMs) {
+      return { outcome: 'live' };
+    }
+    return { outcome: 'free', staleHold: holds[0] };
+  }
+
+  /**
+   * KW4ba fix round 3: the fenced release of a stale `reaper-<findingId>` hold,
+   * carrying the reservation record the ownership check read. The store
+   * releases only while that reservation is still the held one and the hold
+   * attempt still reads at the revision read at the check, so a hold a
+   * concurrent pass acquires in the window between the check and this release
+   * is reported `changed` and never released by this pass.
+   *
+   * The hold attempt is synthetic (`reaper-<findingId>`) and has no attempt
+   * record: the revision it reads is 0 both at the check and under the store's
+   * lock, and the reservation identity carries the fence.
+   *
+   * A hold abandoned by a crashed pass is recovered here: it is stale (no live
+   * owner), so a later pass reads it, fences on the record it read and
+   * releases it — no exit path leaves a hold that later passes cannot recover.
+   * When the journal provides no fenced release the pass releases nothing and
+   * reports the hold unresolved, rather than race an unfenced release.
+   */
+  private async fencedReleaseHold(
+    findingId: string,
+    staleHold: CapacityReservationRecord,
+    nowIso: string,
+    unknown: ReaperUnknownView[],
+  ): Promise<'released' | 'not-held' | 'changed' | 'unresolved'> {
+    const fenced = this.deps.executionJournal.releaseCapacityReservationIfUnchanged;
+    if (fenced === undefined) {
+      return 'unresolved';
+    }
+    const holdAttemptId = 'reaper-' + findingId;
+    const attempted = await this.boundedCall(() =>
+      fenced.call(this.deps.executionJournal, {
+        attemptId: holdAttemptId,
+        reservationId: staleHold.id,
+        attemptRevision: 0,
+        releasedAtIso: nowIso,
+        readAttemptRevision: async () => {
+          const holder = await this.deps.attemptRepo.findAttemptById(holdAttemptId);
+          return holder === null ? 0 : (holder.revision ?? 0);
+        },
+      }),
+    );
+    if (!attempted.ok) {
+      pushBounded(
+        unknown,
+        { subject: '', kind: 'merged-worktree', reason: attempted.budget ? 'pass-budget' : 'hold-release-failed' },
+      );
+      return 'unresolved';
+    }
+    const result = attempted.value;
+    if (result.outcome === 'released' || result.outcome === 'not-held' || result.outcome === 'changed') {
+      return result.outcome;
+    }
+    return 'unresolved';
   }
 
   /** Acquire the worktree hold through `reserveCapacityAtomically`. */

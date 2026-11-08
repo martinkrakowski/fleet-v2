@@ -115,10 +115,12 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
        fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes] [--force-unsealed]
 
-conductor status --stalled lists the runs parked longer than
-policy.daemon.stallAfterMinutes (default 30) as run id, park class, age in
-minutes and work order, oldest first; it is the view of the same stall rule
-that raises the conductor's stall:<runId> attention items.
+conductor status --stalled lists the runs held longer than
+policy.daemon.stallAfterMinutes (default 30), oldest first: a parked row is
+run id, park class, age in minutes and work order, and a non-park row is run
+id, state, age in minutes, work order and last advanced time, with no park
+class; it is the view of the same stall rule that raises the conductor's
+stall:<runId> attention items.
 
 Read-only status of one lane run (or every run) with its projected state,
 the halt marker and the driver lease; a kill-switch halt the driver checks
@@ -2071,7 +2073,7 @@ function controlUsageExit(
   return null;
 }
 
-/** `conductor status --stalled`: the runs parked past the stall threshold, oldest first, as one JSON document. */
+/** `conductor status --stalled`: the runs held past the stall threshold — a parked row is the run id, park class, age and work order; a non-park row is the run id, journal state, age, work order and last advanced time, with no park class — oldest first, as one JSON document. */
 async function conductorStalledExit(
   conductor: FleetCliRuntime['conductor'],
   io: CliIo,

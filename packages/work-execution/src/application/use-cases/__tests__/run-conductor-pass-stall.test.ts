@@ -277,4 +277,55 @@ describe('RunConductorPassUseCase stall attention (PT1a)', () => {
     expect(String(records[1]?.body.summary)).toBe(`stall:${RUN_ID} class=step-refused parked>=45m work-order=${WORK_ORDER_ID}`);
     expect(records[1]?.actor).toBe('conductor');
   });
+
+  it('a non-parked gating run past the threshold raises one idle item, and a second pass does not open a second one', async () => {
+    const repo = new LaneRunRepositoryAdapter();
+    const journal = new LaneRunJournalAdapter();
+    const attention = new FakeStallAttention();
+    await repo.create(record({ parked: null, parkCount: 0, runId: RUN_ID_2 }));
+    await journal.append(laneRunConductEntry('01M64PT1PX2MAZVQDYAYMZ7WN5', RUN_ID_2, 'gating', '2026-11-06T18:45:00.000Z'));
+    const pass = (nowIso: string) =>
+      new RunConductorPassUseCase({
+        driverLease: new ConductorDriverLeaseAdapter(),
+        runRepo: repo,
+        runJournal: journal,
+        halt: new ConductorHaltAdapter(),
+        resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+        advance: idleAdvance,
+        now: () => nowIso,
+        stallAttention: attention,
+        workOrderRepo: { findWorkOrderById: async () => WORK_ORDER },
+        stallAfterMinutes: 30,
+      }).runPass({ holderId: HOLDER, nowIso });
+    await pass('2026-11-06T21:00:00.000Z');
+    expect(attention.raises).toEqual([
+      { projectId: PROJECT_ID, workOrderId: WORK_ORDER_ID, runId: RUN_ID_2, state: 'gating', ageMinutes: 135, lastAdvancedAtIso: '2026-11-06T18:45:00.000Z' },
+    ]);
+    expect(attention.open.size).toBe(1);
+    await pass('2026-11-06T21:05:00.000Z');
+    expect(attention.open.size).toBe(1);
+  });
+
+  it('a watching-ci run past the threshold adds no raise', async () => {
+    const repo = new LaneRunRepositoryAdapter();
+    const journal = new LaneRunJournalAdapter();
+    const attention = new FakeStallAttention();
+    await repo.create(record({ parked: null, parkCount: 0, runId: RUN_ID_2 }));
+    await journal.append(laneRunConductEntry('01M64PT1PX2MAZVQDYAYMZ7WN6', RUN_ID_2, 'watching-ci', '2026-11-06T18:45:00.000Z'));
+    const pass = (nowIso: string) =>
+      new RunConductorPassUseCase({
+        driverLease: new ConductorDriverLeaseAdapter(),
+        runRepo: repo,
+        runJournal: journal,
+        halt: new ConductorHaltAdapter(),
+        resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+        advance: idleAdvance,
+        now: () => nowIso,
+        stallAttention: attention,
+        workOrderRepo: { findWorkOrderById: async () => WORK_ORDER },
+        stallAfterMinutes: 30,
+      }).runPass({ holderId: HOLDER, nowIso });
+    await pass('2026-11-06T21:00:00.000Z');
+    expect(attention.raises).toEqual([]);
+  });
 });

@@ -48,9 +48,24 @@ export type ListOpenStallAttentionResult =
   | { readonly outcome: 'found'; readonly items: readonly ClearStallAttentionCommand[] }
   | { readonly outcome: 'unavailable' };
 
+/** One open attention item whose subject is a run, of any kind (U7). */
+export interface OpenRunAttentionItem {
+  readonly projectId: string;
+  readonly kind: string;
+  readonly runId: string;
+}
+
+export type ListOpenRunAttentionResult =
+  | { readonly outcome: 'found'; readonly items: readonly OpenRunAttentionItem[] }
+  | { readonly outcome: 'unavailable' };
+
 export interface StallAttentionPort {
   raiseStallAttention(command: RaiseStallAttentionCommand): Promise<RaiseStallAttentionResult>;
   clearStallAttention(command: ClearStallAttentionCommand): Promise<ClearStallAttentionResult>;
   /** The runs whose stall item is open now (read-only). */
   listOpenStallAttention(): Promise<ListOpenStallAttentionResult>;
+  /** Every open attention item whose subject is `{ kind: 'run', ref: <runId> }`, across all item kinds (read-only). */
+  listOpenRunAttention?(): Promise<ListOpenRunAttentionResult>;
+  /** Resolve one open run-subject attention item by key as `resolved` via `machine`. */
+  resolveRunAttention?(command: OpenRunAttentionItem): Promise<ClearStallAttentionResult>;
 }

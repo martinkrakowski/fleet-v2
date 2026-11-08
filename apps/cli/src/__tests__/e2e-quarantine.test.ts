@@ -48,6 +48,10 @@ describe('quarantineState', () => {
 });
 
 describe('quarantined', () => {
+  // Every `quarantined(...)` here pins the clock to NOW_MS. Without it the wrapper falls back to Date.now,
+  // so these tests depended on the wall clock and the default marker's `until: '2026-11-07'`: they passed
+  // until that date and then failed for everyone, which is what turned main red on 2026-11-08. The expiry
+  // behaviour is still asserted — by the tests below that pass an `until` in the past against NOW_MS.
   const linesOf = () => {
     const lines: string[] = [];
     return { lines, write: (line: string) => void lines.push(line) };
@@ -56,7 +60,7 @@ describe('quarantined', () => {
   it('resolves when an active body passes, running it once without writing', async () => {
     const { lines, write } = linesOf();
     let runs = 0;
-    const fn = quarantined(marker(), 1000, async () => { runs += 1; }, { write, now: () => NOW_MS });
+    const fn = quarantined(marker(), 1000, async () => { runs += 1; }, { now: () => NOW_MS, write });
     await fn();
     expect(runs).toBe(1);
     expect(lines).toEqual([]);
@@ -72,7 +76,7 @@ describe('quarantined', () => {
         runs += 1;
         throw new Error('port race\nsecond line');
       },
-      { write, now: () => NOW_MS },
+      { now: () => NOW_MS, write },
     );
     await fn();
     expect(runs).toBe(1);
@@ -91,7 +95,7 @@ describe('quarantined', () => {
       (() => {
         throw new Error('sync throw');
       }) as () => Promise<void>,
-      { write, now: () => NOW_MS },
+      { now: () => NOW_MS, write },
     );
     await fn();
     expect(lines).toHaveLength(1);
@@ -100,7 +104,7 @@ describe('quarantined', () => {
 
   it('resolves when an active body hangs, writing a warning on the budget', async () => {
     const { lines, write } = linesOf();
-    const fn = quarantined(marker(), 50, () => new Promise<void>(() => {}), { write, now: () => NOW_MS });
+    const fn = quarantined(marker(), 50, () => new Promise<void>(() => {}), { now: () => NOW_MS, write });
     await fn();
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('#12');
@@ -113,7 +117,7 @@ describe('quarantined', () => {
       marker({ until: '2026-10-30' }),
       1000,
       async () => { runs += 1; },
-      { write, now: () => NOW_MS },
+      { now: () => NOW_MS, write },
     );
     await expect(fn()).rejects.toThrow(
       'e2e quarantine expired on 2026-10-30 (#12): remove or renew the marker',
@@ -125,7 +129,7 @@ describe('quarantined', () => {
   it('rejects an invalid marker and never runs the body', async () => {
     const { lines, write } = linesOf();
     let runs = 0;
-    const fn = quarantined(marker({ issue: '12' }), 1000, async () => { runs += 1; }, { write });
+    const fn = quarantined(marker({ issue: '12' }), 1000, async () => { runs += 1; }, { now: () => NOW_MS, write });
     await expect(fn()).rejects.toThrow(/invalid e2e quarantine marker/);
     expect(runs).toBe(0);
     expect(lines).toEqual([]);

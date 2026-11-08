@@ -311,11 +311,12 @@ function isWellFormedTouchedPath(path: unknown): path is string {
 
 /**
  * The first failing A4 fact, in this order: doors (unreadable, then named), touched auto-merge door
- * paths, risk, forge mode; else null. Total on hostile inputs: a malformed facts object, doors, or
- * touchedPaths fail closed to `doors-unreadable` without throwing. Every read goes through own
- * property descriptors — no getter, iterator or array element is ever invoked — and descriptor
- * traps are caught, so proxies, accessor properties and hostile array iteration fail closed
- * instead of throwing.
+ * paths, risk, forge mode; else null. Total on hostile inputs: a malformed facts object, doors,
+ * touchedPaths, or any accessor property on facts (doors, touchedPaths, risk, allowHighRisk,
+ * forgeMode) fail closed to `doors-unreadable` without throwing, before the door-named return.
+ * Every read goes through own property descriptors — no getter, iterator or array element is ever
+ * invoked — and descriptor traps are caught, so proxies, accessor properties and hostile array
+ * iteration fail closed instead of throwing.
  */
 export function autoMergeIneligibility(facts: AutoMergeEligibilityFacts): AutoMergeReason | null {
   if (facts === null || typeof facts !== 'object') {
@@ -327,7 +328,19 @@ export function autoMergeIneligibility(facts: AutoMergeEligibilityFacts): AutoMe
     const riskDescriptor = Object.getOwnPropertyDescriptor(facts, 'risk');
     const allowHighRiskDescriptor = Object.getOwnPropertyDescriptor(facts, 'allowHighRisk');
     const forgeModeDescriptor = Object.getOwnPropertyDescriptor(facts, 'forgeMode');
+    // Every own property read below must be a plain data property. Any accessor descriptor — a
+    // getter on doors, touchedPaths, risk, allowHighRisk or forgeMode — is hostile and fails
+    // closed to `doors-unreadable` before the door-named return, so a getter is never invoked
+    // and never skipped by a named door or protected touched path.
     if (doorsDescriptor === undefined || !('value' in doorsDescriptor)) {
+      return 'doors-unreadable';
+    }
+    if (
+      (touchedPathsDescriptor !== undefined && !('value' in touchedPathsDescriptor)) ||
+      (riskDescriptor !== undefined && !('value' in riskDescriptor)) ||
+      (allowHighRiskDescriptor !== undefined && !('value' in allowHighRiskDescriptor)) ||
+      (forgeModeDescriptor !== undefined && !('value' in forgeModeDescriptor))
+    ) {
       return 'doors-unreadable';
     }
     const doors = doorsDescriptor.value as AutoMergeDoors;
@@ -344,9 +357,6 @@ export function autoMergeIneligibility(facts: AutoMergeEligibilityFacts): AutoMe
     }
     let touchedDoorPath = false;
     if (touchedPathsDescriptor !== undefined) {
-      if (!('value' in touchedPathsDescriptor)) {
-        return 'doors-unreadable';
-      }
       const touchedPaths = touchedPathsDescriptor.value;
       if (!Array.isArray(touchedPaths)) {
         return 'doors-unreadable';
@@ -375,14 +385,6 @@ export function autoMergeIneligibility(facts: AutoMergeEligibilityFacts): AutoMe
     }
     if (kind === 'named' || touchedDoorPath) {
       return 'door-named';
-    }
-    // Accessor risk/allowHighRisk/forgeMode are hostile: fail closed without invoking the getter.
-    if (
-      (riskDescriptor !== undefined && !('value' in riskDescriptor)) ||
-      (allowHighRiskDescriptor !== undefined && !('value' in allowHighRiskDescriptor)) ||
-      (forgeModeDescriptor !== undefined && !('value' in forgeModeDescriptor))
-    ) {
-      return 'doors-unreadable';
     }
     const risk = riskDescriptor === undefined ? undefined : riskDescriptor.value;
     const allowHighRisk = allowHighRiskDescriptor === undefined ? undefined : allowHighRiskDescriptor.value;

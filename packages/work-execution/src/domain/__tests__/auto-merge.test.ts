@@ -411,11 +411,17 @@ describe('autoMergeIneligibility decision-machinery and protected-path doors', (
     expect(
       autoMergeIneligibility({ doors: doorsWithKindGetter as never, risk: 'standard', forgeMode: 'github' }),
     ).toBe('doors-unreadable');
-    // Getters on risk, allowHighRisk and forgeMode are never invoked.
+    // Getters on risk, allowHighRisk and forgeMode are never invoked — and they fail closed
+    // before the door-named return, so a named door or protected touched path cannot mask them.
     for (const key of ['risk', 'allowHighRisk', 'forgeMode']) {
-      const hostile: Record<string, unknown> = { doors: { kind: 'none' } };
-      Object.defineProperty(hostile, key, { enumerable: true, get: throwing });
-      expect(autoMergeIneligibility(hostile as never)).toBe('doors-unreadable');
+      for (const doors of [{ kind: 'none' }, { kind: 'named', count: 1 }]) {
+        const hostile: Record<string, unknown> = { doors };
+        Object.defineProperty(hostile, key, { enumerable: true, get: throwing });
+        expect(autoMergeIneligibility(hostile as never)).toBe('doors-unreadable');
+      }
+      const withDoorPath: Record<string, unknown> = { doors: { kind: 'none' }, touchedPaths: ['AGENTS.md'] };
+      Object.defineProperty(withDoorPath, key, { enumerable: true, get: throwing });
+      expect(autoMergeIneligibility(withDoorPath as never)).toBe('doors-unreadable');
     }
     // A proxy getOwnPropertyDescriptor trap on facts fails closed.
     const trappingFacts = new Proxy(

@@ -322,6 +322,7 @@ describe('decideReviewReceiptOutcome diff-facts gate (U4a / D3)', () => {
       '.github/workflows/ci.yml',
       'AGENTS.md',
       'packages/evidence-and-acceptance/package.json',
+      'node_modules/.claude/package.json',
     ]) {
       expect(decideReviewReceiptOutcome(receipt(), undefined, undefined, { changedLines: 448, files: [file] })).toEqual(
         { outcome: 'unknown', unknownReason: 'unparseable-verdict' },
@@ -450,14 +451,6 @@ describe('decideReviewReceiptOutcome diff-facts gate (U4a / D3)', () => {
       ({ get [key]() {
         throw new Error('boom');
       }, [key === 'changedLines' ? 'files' : 'changedLines']: value }) as unknown as ReviewDiffFacts;
-    const proxyFacts = {
-      getPrototypeOf(): never {
-        throw new Error('boom');
-      },
-      getOwnPropertyDescriptor(): never {
-        throw new Error('boom');
-      },
-    };
     const hostiles: readonly unknown[] = [
       null,
       42,
@@ -477,11 +470,28 @@ describe('decideReviewReceiptOutcome diff-facts gate (U4a / D3)', () => {
       { changedLines: 448, files: [domainFile, 7] },
       throwingGetter('changedLines', [domainFile]),
       throwingGetter('files', 448),
-      { changedLines: 448, files: [{ get 0() { throw new Error('boom'); }, length: 1 }] },
-      Object.create({
-        getPrototypeOf: proxyFacts.getPrototypeOf,
-        getOwnPropertyDescriptor: proxyFacts.getOwnPropertyDescriptor,
-      }),
+      (() => {
+        const files: string[] = [];
+        Object.defineProperty(files, 0, {
+          enumerable: true,
+          get(): string {
+            throw new Error('boom');
+          },
+        });
+        files.length = 1;
+        return { changedLines: 448, files };
+      })(),
+      new Proxy(
+        { changedLines: 448, files: [domainFile] },
+        {
+          getPrototypeOf(): never {
+            throw new Error('boom');
+          },
+          getOwnPropertyDescriptor(): never {
+            throw new Error('boom');
+          },
+        },
+      ),
     ];
     for (const facts of hostiles) {
       expect(() =>

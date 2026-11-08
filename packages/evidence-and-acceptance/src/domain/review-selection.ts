@@ -171,7 +171,8 @@ const ANY_DEPTH_PREFIX_PATTERN = /(?:^|\/)(?:opencode\.json|\.clinerules)/;
  * matches a `lane-diff-check` protected rule. Mirrors the fixed rule table
  * locally rather than importing `@fleet/work-execution`, whose dependency
  * direction (`work-execution -> evidence-and-acceptance`) an import would
- * reverse. The `package.json` rule does not apply under `node_modules/`.
+ * reverse. The `package.json` rule alone does not apply under `node_modules/`;
+ * every other protected rule still matches a path under `node_modules/`.
  */
 function isProtectedDiffPath(normalizedPath: string): boolean {
   const lowered = asciiLower(normalizedPath);
@@ -180,12 +181,14 @@ function isProtectedDiffPath(normalizedPath: string): boolean {
     ANY_DEPTH_DIRECTORY_PATTERN.test(lowered) ||
     ROOT_FILE_PATTERN.test(lowered) ||
     ROOT_PREFIX_PATTERN.test(lowered) ||
-    ANY_DEPTH_FILE_PATTERN.test(lowered) ||
     ANY_DEPTH_PREFIX_PATTERN.test(lowered)
   ) {
-    return !(lowered.endsWith('package.json') && isUnderNodeModules(normalizedPath));
+    return true;
   }
-  return false;
+  if (!ANY_DEPTH_FILE_PATTERN.test(lowered)) {
+    return false;
+  }
+  return !(lowered.endsWith('package.json') && isUnderNodeModules(normalizedPath));
 }
 
 /**

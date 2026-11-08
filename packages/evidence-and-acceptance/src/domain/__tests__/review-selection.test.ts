@@ -2,13 +2,16 @@ import { describe, expect, it } from 'vitest';
 import type { ReviewReceiptRecord } from '../evidence-records.js';
 import { REVIEW_KINDS } from '../evidence-records.js';
 import {
+  decideReviewReceiptOutcome,
   isFullyDispositioned,
   latestReceiptPerReviewer,
   reviewKindOf,
   satisfiesFullyDispositionedReviewPassGate,
   satisfiesReviewPassGate,
   tallyReviews,
+  ZERO_FINDING_PASS_DIFF_LINE_THRESHOLD,
 } from '../review-selection.js';
+import type { ReviewDiffFacts } from '../review-selection.js';
 
 function receipt(overrides?: Partial<ReviewReceiptRecord>): ReviewReceiptRecord {
   return {
@@ -295,5 +298,212 @@ describe('review kind selection', () => {
       receipt({ id: 'review-code', kind: 'code-review', result: 'fail' }),
     ]);
     expect(latest.map((record) => record.id)).toEqual(['review-code']);
+  });
+});
+
+describe('decideReviewReceiptOutcome diff-facts gate (U4a / D3)', () => {
+  const domainFile = 'packages/evidence-and-acceptance/src/domain/review-selection.ts';
+  const domainFileDotSlash = './packages/work-execution/src/domain/lane-diff-check.ts';
+
+  it('a large domain diff with a zero-finding pass reads unknown', () => {
+    for (const changedLines of [200, 448]) {
+      for (const file of [domainFile, domainFileDotSlash]) {
+        expect(decideReviewReceiptOutcome(receipt(), undefined, undefined, { changedLines, files: [file] })).toEqual({
+          outcome: 'unknown',
+          unknownReason: 'unparseable-verdict',
+        });
+      }
+    }
+  });
+
+  it('a large diff touching protected paths with a zero-finding pass reads unknown', () => {
+    for (const file of [
+      'scripts/lane-diff-check.sh',
+      '.github/workflows/ci.yml',
+      'AGENTS.md',
+      'packages/evidence-and-acceptance/package.json',
+    ]) {
+      expect(decideReviewReceiptOutcome(receipt(), undefined, undefined, { changedLines: 448, files: [file] })).toEqual(
+        { outcome: 'unknown', unknownReason: 'unparseable-verdict' },
+      );
+    }
+  });
+
+  it('the same large domain diff with one minor finding still reads pass', () => {
+    const minor = {
+      findingId: 'rr-1:f-1',
+      severity: 'minor' as const,
+      summary: 's',
+      filePath: domainFile,
+      line: 1,
+      state: 'unresolved' as const,
+      dispositionReason: null,
+      dispositionEvidenceRef: null,
+    };
+    expect(
+      decideReviewReceiptOutcome(receipt({ findings: [minor] }), undefined, undefined, {
+        changedLines: 448,
+        files: [domainFile],
+      }),
+    ).toEqual({ outcome: 'pass', carriedMinors: [minor] });
+    const nit = { ...minor, severity: 'nit' as const };
+    expect(
+      decideReviewReceiptOutcome(receipt({ findings: [nit] }), undefined, undefined, {
+        changedLines: 448,
+        files: [domainFile],
+      }),
+    ).toEqual({ outcome: 'pass', carriedMinors: [nit] });
+  });
+
+  it('a small diff with a zero-finding pass reads pass', () => {
+    expect(ZERO_FINDING_PASS_DIFF_LINE_THRESHOLD).toBe(200);
+    for (const changedLines of [199, 0]) {
+      for (const file of [domainFile, 'scripts/lane-diff-check.sh']) {
+        expect(decideReviewReceiptOutcome(receipt(), undefined, undefined, { changedLines, files: [file] })).toEqual({
+          outcome: 'pass',
+          carriedMinors: [],
+        });
+      }
+    }
+  });
+
+  it('a large diff touching neither domain nor a protected path reads pass', () => {
+    expect(
+      decideReviewReceiptOutcome(receipt(), undefined, undefined, {
+        changedLines: 500,
+        files: [
+          'packages/work-execution/src/infrastructure/git-adapter.ts',
+          'packages/work-execution/src/application/run-lane.ts',
+          'apps/web/src/app/page.tsx',
+          'docs/architecture.md',
+          'packages/evidence-and-acceptance/src/domain/__tests__/review-selection.test.ts',
+          'node_modules/pkg/package.json',
+        ],
+      }),
+    ).toEqual({ outcome: 'pass', carriedMinors: [] });
+  });
+
+  it('omitting diffFacts reproduces today\u2019s result on every existing case', () => {
+    const minor = {
+      findingId: 'rr-1:f-1',
+      severity: 'minor' as const,
+      summary: 's',
+      filePath: 'src/a.ts',
+      line: 1,
+      state: 'unresolved' as const,
+      dispositionReason: null,
+      dispositionEvidenceRef: null,
+    };
+    const blocker = { ...minor, severity: 'major' as const };
+    expect(decideReviewReceiptOutcome(receipt())).toEqual({ outcome: 'pass', carriedMinors: [] });
+    expect(decideReviewReceiptOutcome(receipt({ findings: [minor] }))).toEqual({
+      outcome: 'pass',
+      carriedMinors: [minor],
+    });
+    expect(decideReviewReceiptOutcome(receipt({ findings: [minor] }), new Set(['rr-1:f-1']))).toEqual({
+      outcome: 'pass',
+      carriedMinors: [],
+    });
+    expect(decideReviewReceiptOutcome(receipt({ result: 'fail', findings: [blocker] }))).toEqual({ outcome: 'fail' });
+    expect(
+      decideReviewReceiptOutcome(receipt({ result: 'fail', findings: [blocker] }), new Set(['rr-1:f-1']), new Set<string>()),
+    ).toEqual({ outcome: 'pass', carriedMinors: [] });
+    expect(decideReviewReceiptOutcome(receipt({ result: 'fail' }))).toEqual({
+      outcome: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+    expect(decideReviewReceiptOutcome(receipt({ result: 'fail', unknownReason: 'no-findings-on-fail' }))).toEqual({
+      outcome: 'unknown',
+      unknownReason: 'no-findings-on-fail',
+    });
+    expect(
+      decideReviewReceiptOutcome(receipt({ result: 'fail', unknownReason: 'no-findings-on-fail' }), undefined, undefined, {
+        changedLines: 448,
+        files: [domainFile],
+      }),
+    ).toEqual({ outcome: 'unknown', unknownReason: 'no-findings-on-fail' });
+    expect(decideReviewReceiptOutcome(receipt({ result: 'unknown' }))).toEqual({
+      outcome: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+    expect(decideReviewReceiptOutcome(receipt({ result: 'pending' }))).toEqual({
+      outcome: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+    expect(decideReviewReceiptOutcome(receipt({ readOnlyVerified: false }))).toEqual({
+      outcome: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+    expect(decideReviewReceiptOutcome('not-a-receipt')).toEqual({
+      outcome: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+  });
+
+  it('hostile diffFacts values fail closed to today\u2019s behaviour rather than throwing', () => {
+    class Hostile {
+      get changedLines(): number {
+        throw new Error('boom');
+      }
+    }
+    const throwingGetter = (key: string, value: unknown): ReviewDiffFacts =>
+      ({ get [key]() {
+        throw new Error('boom');
+      }, [key === 'changedLines' ? 'files' : 'changedLines']: value }) as unknown as ReviewDiffFacts;
+    const proxyFacts = {
+      getPrototypeOf(): never {
+        throw new Error('boom');
+      },
+      getOwnPropertyDescriptor(): never {
+        throw new Error('boom');
+      },
+    };
+    const hostiles: readonly unknown[] = [
+      null,
+      42,
+      'bad',
+      true,
+      [],
+      new Hostile(),
+      { changedLines: -1, files: [domainFile] },
+      { changedLines: -200, files: [domainFile] },
+      { changedLines: 200.5, files: [domainFile] },
+      { changedLines: Number.NaN, files: [domainFile] },
+      { changedLines: Number.POSITIVE_INFINITY, files: [domainFile] },
+      { changedLines: '448', files: [domainFile] },
+      { changedLines: 448, files: domainFile },
+      { changedLines: 448, files: { 0: domainFile, length: 1 } },
+      { changedLines: 448, files: new Array(2) },
+      { changedLines: 448, files: [domainFile, 7] },
+      throwingGetter('changedLines', [domainFile]),
+      throwingGetter('files', 448),
+      { changedLines: 448, files: [{ get 0() { throw new Error('boom'); }, length: 1 }] },
+      Object.create({
+        getPrototypeOf: proxyFacts.getPrototypeOf,
+        getOwnPropertyDescriptor: proxyFacts.getOwnPropertyDescriptor,
+      }),
+    ];
+    for (const facts of hostiles) {
+      expect(() =>
+        decideReviewReceiptOutcome(receipt(), undefined, undefined, facts as unknown as ReviewDiffFacts),
+      ).not.toThrow();
+      expect(decideReviewReceiptOutcome(receipt(), undefined, undefined, facts as unknown as ReviewDiffFacts)).toEqual({
+        outcome: 'pass',
+        carriedMinors: [],
+      });
+      const blocking = {
+        findingId: 'rr-1:f-1',
+        severity: 'major' as const,
+        summary: 's',
+        filePath: 'src/a.ts',
+        line: 1,
+        state: 'unresolved' as const,
+        dispositionReason: null,
+        dispositionEvidenceRef: null,
+      };
+      expect(
+        decideReviewReceiptOutcome(receipt({ result: 'fail', findings: [blocking] }), undefined, undefined, facts as unknown as ReviewDiffFacts),
+      ).toEqual({ outcome: 'fail' });
+    }
   });
 });

@@ -14,9 +14,13 @@ import { containsSecretShape } from '@fleet/shared';
 
 import type { ActionJournalEntryRecord, AttemptRecord, CapacityReservationRecord } from '../../../domain/execution-records.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
-import type { ExecutionJournalPort } from '../../ports/out/ExecutionJournalPort.out-port.js';
+import type { ExecutionJournalPort, ReleaseCapacityReservationIfUnchangedRequest, ReleaseCapacityReservationIfUnchangedResult, ReserveCapacityAtomicallyRequest } from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
+import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunJournalPort, LaneRunJournalAppendResult } from '../../ports/out/LaneRunJournalPort.out-port.js';
+import type { LaneRunRepositoryPort } from '../../ports/out/LaneRunRepositoryPort.out-port.js';
+import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
+import type { ConductorHaltState } from '../../../domain/conductor-halt.js';
 import type {
   ExecutionRunnerPort,
   RunnerSessionRef,
@@ -38,6 +42,8 @@ import type {
   ListedWorktree,
   ReadFilesystemSpaceRequest,
   ReadFilesystemSpaceResult,
+  RemoveWorktreeRequest,
+  RemoveWorktreeResult,
   WorktreeRemovalFacts,
   WorkspacePort,
 } from '../../ports/out/WorkspacePort.out-port.js';
@@ -48,9 +54,11 @@ import type {
 import {
   ReapZombiesUseCase,
   type ReaperAttentionPort,
+  type ReaperMergeRecordRead,
   type ReaperProjectProfileView,
   type ReaperProjectProfilesPort,
 } from '../ReapZombiesUseCase.use-case.js';
+import { ReserveExecutionCapacityUseCase } from '../ReserveExecutionCapacityUseCase.use-case.js';
 import { InMemoryReaperFindingRepositoryAdapter } from '../../../infrastructure/adapters/InMemoryReaperFindingRepositoryAdapter.adapter.js';
 import { REAPER_FINDING_SCHEMA_VERSION } from '../../../domain/reaper-findings.js';
 
@@ -310,8 +318,8 @@ function listedWorktree(path: string, overrides: Partial<ListedWorktree> = {}): 
 interface WorkspaceFake {
   /** Every method name called, in order, read or write. */
   calls: string[];
-  /** Every request of the three read methods, in order. */
-  requests: { list?: ListWorktreesRequest; inspect?: InspectWorktreeForRemovalRequest; space?: ReadFilesystemSpaceRequest }[];
+  /** Every request of the read methods (and a repair removal), in order. */
+  requests: { list?: ListWorktreesRequest; inspect?: InspectWorktreeForRemovalRequest; space?: ReadFilesystemSpaceRequest; remove?: RemoveWorktreeRequest }[];
   /** The forbidden write methods' call names; must stay empty for a report-only pass. */
   forbidden: string[];
   listWorktreesCount: number;
@@ -329,6 +337,8 @@ interface WorkspaceOptions {
   /** Answer overrides: an `unknown` inspection or a filesystem answer. */
   inspectAnswer?: () => InspectWorktreeForRemovalResult;
   spaceAnswer?: (request: ReadFilesystemSpaceRequest) => ReadFilesystemSpaceResult;
+  /** KW4b': an explicit `removeWorktree` answer; when set the write is allowed. */
+  removeAnswer?: () => RemoveWorktreeResult;
 }
 
 /**
@@ -378,8 +388,25 @@ function makeWorkspace(options: WorkspaceOptions = {}): WorkspacePort & Workspac
       return Promise.resolve({ outcome: 'read', freeBytes: 200, totalBytes: 1000 } satisfies ReadFilesystemSpaceResult);
     },
   } as unknown as WorkspacePort & WorkspaceFake;
+  if (options.removeAnswer !== undefined) {
+    Object.defineProperty(fake, 'removeWorktree', {
+      enumerable: true,
+      value: (request: RemoveWorktreeRequest) => {
+        fake.calls.push('removeWorktree');
+        fake.requests.push({ remove: request });
+        return Promise.resolve(options.removeAnswer!());
+      },
+    });
+  } else {
+    Object.defineProperty(fake, 'removeWorktree', {
+      enumerable: true,
+      value: () => {
+        fake.forbidden.push('removeWorktree');
+        return Promise.reject(new Error('a report-only pass must never call a write method'));
+      },
+    });
+  }
   const writes: [keyof WorkspacePort, string][] = [
-    ['removeWorktree', 'removeWorktree'],
     ['removeLaneWorktree', 'removeLaneWorktree'],
     ['commitLaneOutput', 'commitLaneOutput'],
     ['resetWorktreeToHead', 'resetWorktreeToHead'],
@@ -479,17 +506,38 @@ interface Harness {
   profiles?: ReaperProjectProfilesPort;
   forgeRead?: ForgeReadPort & { requests: ReadPullRequestRequest[] };
   computeDigest?: (text: string) => string;
+  /** KW4b': the optional merged-worktree repair dependencies. */
+  reserveCapacity?: ExecutionJournalPort['reserveCapacityAtomically'];
+  releaseCapacity?: ExecutionJournalPort['releaseCapacityReservation'];
+  runRepo?: Pick<LaneRunRepositoryPort, 'list'>;
+  mergeRecordRepo?: ReaperMergeRecordRead;
+  halt?: Pick<ConductorHaltPort, 'read'>;
+  clockMs?: () => number;
+  storeCallTimeoutMs?: number;
+  /** KW4ba fix round 2: a scripted `listActiveReservations`; absent means the plain fixture list. */
+  listActiveReservations?: () => Promise<unknown>;
+  /** KW4ba fix round 3: a scripted fenced release; absent means the port lacks it. */
+  fencedRelease?: (
+    request: ReleaseCapacityReservationIfUnchangedRequest,
+  ) => Promise<ReleaseCapacityReservationIfUnchangedResult>;
 }
 
 function build(harness: Harness): ReapZombiesUseCase {
   const attemptRepo = harness.attemptRepo ?? makeAttemptRepo(harness.attempts);
-  const executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'> = {
-    listActiveReservations: () => Promise.resolve(harness.reservations),
+  const executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'> & {
+    reserveCapacityAtomically?: ExecutionJournalPort['reserveCapacityAtomically'];
+    releaseCapacityReservation?: ExecutionJournalPort['releaseCapacityReservation'];
+  } = {
+    listActiveReservations: (harness.listActiveReservations ??
+      (() => Promise.resolve(harness.reservations))) as ExecutionJournalPort['listActiveReservations'],
     listJournalEntriesForAttempt: (attemptId: string) => {
       const entries = harness.actionJournal?.get(attemptId);
       return Promise.resolve(entries ?? []);
     },
     ...(harness.releaseSpy === undefined ? {} : { releaseCapacityReservationIfUnchanged: harness.releaseSpy }),
+    ...(harness.fencedRelease === undefined ? {} : { releaseCapacityReservationIfUnchanged: harness.fencedRelease }),
+    ...(harness.reserveCapacity === undefined ? {} : { reserveCapacityAtomically: harness.reserveCapacity }),
+    ...(harness.releaseCapacity === undefined ? {} : { releaseCapacityReservation: harness.releaseCapacity }),
   };
   const runnerForAttempt: RunnerForAttemptPort = harness.runnerForAttempt ?? {
     runnerForAttempt: () => {
@@ -511,6 +559,11 @@ function build(harness: Harness): ReapZombiesUseCase {
     ...(harness.profiles === undefined ? {} : { profiles: harness.profiles }),
     ...(harness.forgeRead === undefined ? {} : { forgeRead: harness.forgeRead }),
     ...(harness.computeDigest === undefined ? {} : { computeDigest: harness.computeDigest }),
+    ...(harness.runRepo === undefined ? {} : { runRepo: harness.runRepo }),
+    ...(harness.mergeRecordRepo === undefined ? {} : { mergeRecordRepo: harness.mergeRecordRepo }),
+    ...(harness.halt === undefined ? {} : { halt: harness.halt }),
+    ...(harness.clockMs === undefined ? {} : { clockMs: harness.clockMs }),
+    ...(harness.storeCallTimeoutMs === undefined ? {} : { storeCallTimeoutMs: harness.storeCallTimeoutMs }),
   });
 }
 
@@ -1337,15 +1390,15 @@ describe('reap zombies', () => {
     });
   });
 
-  it('never repairs a merged-worktree even when the policy opts the repair in', async () => {
+  it('keeps merged-worktree report-only unless the repair is explicitly opted in (D-R6)', async () => {
     const workspace = makeWorkspace();
     const harness = gatherHarness({ workspace });
-    const policy = { graceMinutes: 5, repairs: { 'merged-worktree': true, 'dead-attempt': true } as const };
+    const policy = { graceMinutes: 5, repairs: { 'dead-attempt': true } as const };
     await runPass(harness, { policy });
     const second = await runPass(harness, { nowIso: LATER, policy });
     const finding = second.findings.find((entry) => entry.kind === 'merged-worktree');
-    expect(finding?.action).toBe('report'); // KW4b' owns the repair; this lane is report only
-    expect(second.repairs).toEqual([]);
+    expect(finding?.action).toBe('report'); // D-R6: the absent flag stays report-only
+    expect(second.repairs.filter((entry) => entry.kind === 'merged-worktree')).toEqual([]);
     expect(workspace.forbidden).toEqual([]);
     expect(harness.journal.state.appendCalls).toEqual([]);
   });
@@ -1606,5 +1659,996 @@ describe('reap zombies', () => {
     expect(result.findings.some((entry) => entry.kind === 'disk-pressure')).toBe(false);
     expect((await store.listOpenFindings()).some((record) => record.finding.kind === 'disk-pressure')).toBe(true);
     expect(harness.attention.cleared).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KW4b': the merged-worktree repair — hold, re-read, caps, pass budget, F129.
+// ---------------------------------------------------------------------------
+
+describe('reap zombies KW4b merged-worktree repair', () => {
+  const MERGED_POLICY = { graceMinutes: 5, repairs: { 'merged-worktree': true } as const };
+  const MANIFEST_SHA = 'a'.repeat(64);
+
+  function sealedCollectedAttempt(id: string): AttemptRecord {
+    return attemptFixture(id, {
+      worktreePath: WT_PATH,
+      state: 'collected',
+      sessionId: null,
+      artifacts: {
+        headCommit: COMMIT,
+        commitsSinceBase: [],
+        collectedArtifactPaths: [],
+        notes: 'present',
+        manifestPath: `.lane/artifacts-manifest-${MANIFEST_SHA.slice(0, 16)}.json`,
+        manifestSha256: MANIFEST_SHA,
+      },
+    });
+  }
+
+  function mergedIntentMintedId(findingId: string, subject: string, targetPath = WT_PATH): string {
+    return `${findingId}:${testDigest(
+      ['merged-worktree-v1', PROJECT, findingId, subject, HOST_NAME, CLONE, ROOT, targetPath].join('\u0000'),
+    )}`;
+  }
+
+  function makeReserve(events: string[]): ExecutionJournalPort['reserveCapacityAtomically'] {
+    return async (request) => {
+      events.push('hold');
+      return { outcome: 'reserved', reservation: request.record as CapacityReservationRecord };
+    };
+  }
+
+  function makeRelease(events: string[], holdAttemptIds: string[] = []): ExecutionJournalPort['releaseCapacityReservation'] {
+    return async (attemptId) => {
+      events.push('release:' + attemptId);
+      holdAttemptIds.push(attemptId);
+      return true;
+    };
+  }
+
+  it('repairs an opted-in merged-worktree under a hold with an F129 intent and the sealed manifest', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        return { outcome: 'removed', branchTip: COMMIT };
+      },
+    });
+    const originalInspect = workspace.inspectWorktreeForRemoval!.bind(workspace);
+    workspace.inspectWorktreeForRemoval = async (request: InspectWorktreeForRemovalRequest) => {
+      events.push('inspect');
+      return originalInspect(request);
+    };
+
+    const shared = {
+      store,
+      journal: makeJournal(),
+      reconcile: makeReconcile(),
+      runner: makeRunner(),
+      attention: { recorded: [], cleared: [] } as AttentionState,
+      attempts: [sealedCollectedAttempt('att-1')],
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, releasedHolds),
+      computeDigest: testDigest,
+    };
+    const first = await runPass(
+      gatherHarness({ ...shared, workspace, attentionPort: makeAttention(shared.attention) }),
+      { policy: MERGED_POLICY },
+    );
+
+    const repair = first.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({
+      key: `reaper/${subject}/merged-worktree@${seeded.findingId}`,
+      outcome: 'completed',
+    });
+    expect(first.findings.find((entry) => entry.kind === 'merged-worktree')?.action).toBe('repair');
+
+    const appends = shared.journal.state.appendCalls;
+    expect(appends.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(appends[0]?.key).toBe(`reaper/${subject}/merged-worktree@${seeded.findingId}`);
+    expect(appends[0]?.mintedId).toBe(mergedIntentMintedId(seeded.findingId, subject));
+    expect(appends[1]?.outcome).toBe('completed');
+
+    // The hold is acquired before the re-read; the removal runs under the hold
+    // and the hold is released after it.
+    expect(events.indexOf('hold')).toBeGreaterThan(-1);
+    expect(events.indexOf('hold')).toBeLessThan(events.lastIndexOf('inspect'));
+    expect(events.indexOf('remove')).toBeGreaterThan(events.indexOf('hold'));
+    expect(events.some((entry) => entry === 'release:reaper-' + seeded.findingId)).toBe(true);
+    expect(releasedHolds).toContain('reaper-' + seeded.findingId);
+
+    const removeCalls = workspace.requests.flatMap((entry) => (entry.remove === undefined ? [] : [entry.remove]));
+    expect(removeCalls).toHaveLength(1);
+    expect(removeCalls[0]).toMatchObject({
+      repositoryRoot: CLONE,
+      worktreeRoot: ROOT,
+      worktreePath: WT_PATH,
+      expectedHead: COMMIT,
+      expectedBranch: 'fleet/merged-branch',
+      expectedLastActivityIso: OLD,
+      manifest: {
+        kind: 'sealed',
+        attemptId: 'att-1',
+        manifestPath: `.lane/artifacts-manifest-${MANIFEST_SHA.slice(0, 16)}.json`,
+        expectedManifestSha256: MANIFEST_SHA,
+      },
+    });
+  });
+
+  it('closes the repaired merged-worktree finding and clears its attention once the worktree is gone', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    await seedOpenFinding(store, subject, 'merged-worktree');
+
+    const events: string[] = [];
+    const attention: AttentionState = { recorded: [], cleared: [] };
+    const journal = makeJournal();
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        return { outcome: 'removed', branchTip: COMMIT };
+      },
+    });
+    const shared = {
+      store,
+      journal,
+      reconcile: makeReconcile(),
+      runner: makeRunner(),
+      attention,
+      attempts: [sealedCollectedAttempt('att-1')],
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events),
+      computeDigest: testDigest,
+    };
+
+    const pass1 = await runPass(
+      gatherHarness({ ...shared, workspace, attentionPort: makeAttention(attention) }),
+      { policy: MERGED_POLICY },
+    );
+    expect(pass1.repairs.find((entry) => entry.kind === 'merged-worktree')?.outcome).toBe('completed');
+
+    const pass2 = await runPass(
+      gatherHarness({ ...shared, workspace, attentionPort: makeAttention(attention) }),
+      { nowIso: LATER, policy: MERGED_POLICY },
+    );
+    expect(pass2.repairs.find((entry) => entry.kind === 'merged-worktree')).toMatchObject({
+      outcome: 'skipped',
+      reasonCode: 'already-repaired',
+    });
+
+    // Third pass: the worktree is gone from the list, so the unseen finding
+    // closes and its attention item clears.
+    const attentionItems = [{ kind: 'merged-worktree', subject: { kind: 'worktree', ref: subject }, state: 'open' }];
+    const pass3 = await runPass(
+      gatherHarness({
+        ...shared,
+        workspace: makeWorkspace({ entries: [] }),
+        attentionPort: makeAttention(attention, attentionItems),
+      }),
+      { nowIso: '2026-11-06T12:30:00.000Z', policy: MERGED_POLICY },
+    );
+    expect(pass3.outcome).toBe('completed');
+    expect(await store.listOpenFindings()).toHaveLength(0);
+    expect(attention.cleared.some((entry) => entry.request.kind === 'merged-worktree')).toBe(true);
+  });
+
+  it('re-reads under the hold and skips when a fact turned false (recheck-ineligible)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    await seedOpenFinding(store, subject, 'merged-worktree');
+
+    const events: string[] = [];
+    let inspectCount = 0;
+    const workspace = makeWorkspace({
+      facts: () => {
+        inspectCount += 1;
+        return inspectCount <= 1
+          ? removalFacts()
+          : removalFacts({ status: { tracked: 1, untracked: 0, unmerged: 0 } });
+      },
+    });
+    const shared = {
+      store,
+      journal: makeJournal(),
+      reconcile: makeReconcile(),
+      runner: makeRunner(),
+      attention: { recorded: [], cleared: [] } as AttentionState,
+      attempts: [sealedCollectedAttempt('att-1')],
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events),
+      computeDigest: testDigest,
+    };
+    const result = await runPass(
+      gatherHarness({ ...shared, workspace, attentionPort: makeAttention(shared.attention) }),
+      { policy: MERGED_POLICY },
+    );
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'skipped', reasonCode: 'recheck-ineligible' });
+    expect(shared.journal.state.appendCalls).toEqual([]);
+    expect(events.filter((entry) => entry === 'hold')).toHaveLength(1);
+    expect(events.some((entry) => entry.startsWith('release:'))).toBe(true);
+    expect(events.includes('remove')).toBe(false);
+    expect((await store.listOpenFindings()).some((record) => record.finding.kind === 'merged-worktree')).toBe(true);
+  });
+
+  it('skips the merged-worktree repair when the conductor is halted or the marker is unreadable', async () => {
+    for (const [state, reason] of [
+      ['halted', 'conductor-halted'],
+      ['unreadable', 'halt-unreadable'],
+    ] as const) {
+      const store = new InMemoryReaperFindingRepositoryAdapter();
+      const subject = subjectOfFixtureWorktree();
+      await seedOpenFinding(store, subject, 'merged-worktree');
+      const events: string[] = [];
+      const workspace = makeWorkspace({ removeAnswer: () => ({ outcome: 'removed', branchTip: COMMIT }) });
+      const harness = gatherHarness({
+        store,
+        attempts: [sealedCollectedAttempt('att-1')],
+        workspace,
+        halt: {
+          read: async (): Promise<ConductorHaltState> =>
+            state === 'halted'
+              ? { state: 'halted', record: { version: 1, halted: true, changedAtIso: BEFORE } }
+              : { state: 'unreadable' },
+        },
+        reserveCapacity: makeReserve(events),
+        releaseCapacity: makeRelease(events),
+      });
+      const result = await runPass(harness, { policy: MERGED_POLICY });
+      const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+      expect(repair).toMatchObject({ outcome: 'skipped', reasonCode: reason });
+      expect(events).toEqual([]);
+      expect(harness.journal.state.appendCalls).toEqual([]);
+      expect(result.unknown.some((entry) => entry.reason === 'halt-unreadable')).toBe(state === 'unreadable');
+    }
+  });
+
+  it('a reaper hold with no attempt record blocks concurrent ReserveExecutionCapacity on both request paths, and the reaper skips a busy worktree', async () => {
+    const holdReservation = (attemptId: string, worktreePath = WT_PATH): CapacityReservationRecord => ({
+      id: 'res-hold',
+      attemptId,
+      hostId: 'host-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: null,
+      hostName: HOST_NAME,
+      worktreePath,
+      reservedAtIso: BEFORE,
+      releasedAtIso: null,
+    });
+    const makeReserveJournal = (held: readonly CapacityReservationRecord[]): ExecutionJournalPort => ({
+      reserveCapacityAtomically: async (request: ReserveCapacityAtomicallyRequest) => {
+        if (request.selectRecord !== undefined) {
+          const selected = await request.selectRecord(held);
+          if (selected.outcome !== 'selected') {
+            return { outcome: 'no-capacity' };
+          }
+        }
+        const verdict = await request.checkBusyWorktree?.(held);
+        if (verdict !== undefined && verdict.outcome === 'busy-worktree') {
+          return { outcome: 'busy-worktree', blockingAttemptId: verdict.blockingAttemptId };
+        }
+        return { outcome: 'refused', reason: 'unexpected' };
+      },
+    } as unknown as ExecutionJournalPort);
+    const attemptRepo = makeAttemptRepo([]); // the hold has no attempt record
+
+    // Non-candidates path: the hold's own worktree path blocks.
+    const nonCandidates = await new ReserveExecutionCapacityUseCase({
+      journal: makeReserveJournal([holdReservation('reaper-f1')]),
+      attemptRepo,
+    }).reserveExecutionCapacity({
+      reservationId: 'res-x',
+      attemptId: 'attempt-x',
+      workOrderId: 'wo-a',
+      seatTool: 'opencode',
+      hostId: 'host-1',
+      worktreePath: WT_PATH,
+      maxSlots: 64,
+    });
+    expect(nonCandidates).toEqual({ outcome: 'busy-worktree', blockingAttemptId: 'reaper-f1' });
+
+    // Candidates path: the selected host's derived path matches the hold's path.
+    const derivedPathFor = (attemptId: string): string => `${ROOT}/${testDigest(attemptId).slice(0, 32)}`;
+    const candidates = await new ReserveExecutionCapacityUseCase({
+      journal: makeReserveJournal([holdReservation('reaper-f2', derivedPathFor('attempt-y'))]),
+      attemptRepo,
+      computeDigest: testDigest,
+    }).reserveExecutionCapacity({
+      reservationId: 'res-y',
+      attemptId: 'attempt-y',
+      workOrderId: 'wo-a',
+      seatTool: 'opencode',
+      candidateHosts: [
+        {
+          name: HOST_NAME,
+          kind: 'opencode',
+          transport: 'local',
+          sshAlias: null,
+          port: null,
+          maxLanes: 2,
+          worktreeRoot: ROOT,
+        },
+      ],
+    });
+    expect(candidates).toEqual({ outcome: 'busy-worktree', blockingAttemptId: 'reaper-f2' });
+
+    // The reaper itself skips when an attempt reservation already holds the path.
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    await seedOpenFinding(store, subject, 'merged-worktree');
+    const events: string[] = [];
+    const busyReserve: ExecutionJournalPort['reserveCapacityAtomically'] = async () => {
+      events.push('hold');
+      return { outcome: 'busy-worktree', blockingAttemptId: 'attempt-other' };
+    };
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      reserveCapacity: busyReserve,
+      releaseCapacity: makeRelease([]),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'skipped', reasonCode: 'worktree-busy' });
+    expect(events).toEqual(['hold']);
+    expect(harness.journal.state.appendCalls).toEqual([]);
+  });
+
+  it('refuses malformed runtime inputs, policy caps/budgets, unknown repair flags, sparse arrays and throwing getters without throwing', async () => {
+    const harness = baseHarness();
+    for (const policy of [
+      { maxRemovalsPerPass: -1 },
+      { maxRemovalsPerPass: 65 },
+      { passBudgetSeconds: 0 },
+      { passBudgetSeconds: -5 },
+      { passBudgetSeconds: 3601 },
+      { maxRemovalsPerPass: 'x' },
+      { repairs: { 'not-a-kind': true } },
+      { unknownKey: 1 },
+    ]) {
+      const result = await runPass(harness, { policy: policy as never });
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'request-invalid' });
+    }
+    const ok = await runPass(harness, { policy: { maxRemovalsPerPass: 10, passBudgetSeconds: 120 } });
+    expect(ok.outcome).toBe('completed');
+
+    const sparse: ListedWorktree[] = new Array(3);
+    sparse[1] = listedWorktree(WT_PATH);
+    const sparseResult = await runPass(gatherHarness({ workspace: makeWorkspace({ entries: sparse }) }), {
+      policy: DISK_POLICY,
+    });
+    expect(sparseResult.outcome).toBe('completed');
+
+    const hostilePolicy: Record<string, unknown> = {};
+    Object.defineProperty(hostilePolicy, 'passBudgetSeconds', {
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const hostile = await runPass(harness, { policy: hostilePolicy as never });
+    expect(hostile).toMatchObject({ outcome: 'refused', reason: 'request-invalid' });
+  });
+
+  it('guards every outbound call with the pass budget and leaves unvisited or timed-out worktrees for the next pass', async () => {
+    let wallTime = 0;
+    const profiles: ReaperProjectProfilesPort = {
+      listProjectProfiles: async (): Promise<{ readonly outcome: 'listed'; readonly profiles: readonly ReaperProjectProfileView[] }> => {
+        wallTime = 10 ** 9;
+        return { outcome: 'listed', profiles: [profileView()] };
+      },
+    };
+    const harness = gatherHarness({
+      profiles,
+      clockMs: () => wallTime,
+      storeCallTimeoutMs: 15_000,
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    expect(result.unknown.some((entry) => entry.reason === 'pass-budget')).toBe(true);
+    expect(result.findings.filter((entry) => entry.kind === 'merged-worktree')).toEqual([]);
+    expect(result.worktrees).toEqual([]);
+  });
+
+  it('recovers a crashed merged-worktree intent by releasing the reaper hold and reconciling read-only without removing twice', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    const key = `reaper/${subject}/merged-worktree@${seeded.findingId}`;
+    const intent: LaneRunJournalEntryRecord = {
+      version: 1,
+      entryId: newId(),
+      kind: 'intent',
+      key,
+      runId: null,
+      recordedAtIso: BEFORE,
+      mode: null,
+      expectedRevision: null,
+      mintedId: mergedIntentMintedId(seeded.findingId, subject),
+      outcome: null,
+      reasonCode: null,
+      detail: null,
+      grantId: null,
+      state: null,
+    };
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    const workspace = makeWorkspace({ removeAnswer: () => ({ outcome: 'removed', branchTip: COMMIT }) });
+    const harness = gatherHarness({
+      store,
+      journal: makeJournal([intent]),
+      attempts: [sealedCollectedAttempt('att-1')],
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, releasedHolds),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'reconciled', reasonCode: 'not-removed' });
+    expect(workspace.requests.some((entry) => entry.remove !== undefined)).toBe(false);
+    expect(releasedHolds).toEqual(['reaper-' + seeded.findingId]);
+    const appends = harness.journal.state.appendCalls;
+    expect(appends.map((entry) => entry.kind)).toEqual(['result']);
+    expect(appends[0]).toMatchObject({ key, outcome: 'reconciled', reasonCode: 'not-removed' });
+  });
+
+  it('a NON-ARRAY reservation listing at the fresh recheck refuses with recheck-unknown and removes nothing (KW4ba fix 1)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    // A concurrent pass holds the target. The listing answers a NON-ARRAY
+    // object that carries the hold under a key: a naive `[]` fallback would
+    // read as "no reservations exist" and authorise the removal.
+    const hold = reservationFixture('res-hold', 'reaper-' + seeded.findingId, {
+      hostId: 'reaper:' + HOST_NAME,
+      seatTool: null,
+      worktreePath: WT_PATH,
+      reservedAtIso: NOW,
+    });
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    let holdAcquired = false;
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        return { outcome: 'removed', branchTip: COMMIT };
+      },
+    });
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      workspace,
+      reserveCapacity: async (reserveRequest) => {
+        holdAcquired = true;
+        events.push('hold');
+        return { outcome: 'reserved', reservation: reserveRequest.record as CapacityReservationRecord };
+      },
+      releaseCapacity: makeRelease(events, releasedHolds),
+      listActiveReservations: () =>
+        holdAcquired ? Promise.resolve({ items: [hold] } as unknown) : Promise.resolve([]),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'skipped', reasonCode: 'recheck-unknown' });
+    // No removal was attempted: the unreadable listing never authorises one.
+    expect(events.includes('remove')).toBe(false);
+    expect(workspace.requests.some((entry) => entry.remove !== undefined)).toBe(false);
+    // No intent was written either: the pass refused before the journal.
+    expect(harness.journal.state.appendCalls).toEqual([]);
+    // The pass still releases its own hold on the way out.
+    expect(releasedHolds).toContain('reaper-' + seeded.findingId);
+  });
+
+  it('a store call that never resolves is timed out and the hold is released (KW4ba fix 2)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    let holdAcquired = false;
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        return { outcome: 'removed', branchTip: COMMIT };
+      },
+    });
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      workspace,
+      storeCallTimeoutMs: 50,
+      reserveCapacity: async (reserveRequest) => {
+        holdAcquired = true;
+        events.push('hold');
+        return { outcome: 'reserved', reservation: reserveRequest.record as CapacityReservationRecord };
+      },
+      releaseCapacity: makeRelease(events, releasedHolds),
+      listActiveReservations: () => (holdAcquired ? new Promise<unknown>(() => undefined) : Promise.resolve([])),
+    });
+    // The pass must end, not hang: the hung store call is timed out.
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'skipped', reasonCode: 'recheck-unknown' });
+    expect(events.includes('remove')).toBe(false);
+    // The hold is released despite the hung call.
+    expect(releasedHolds).toContain('reaper-' + seeded.findingId);
+  });
+
+  it('an overlapping pass does not release a hold it does not own (KW4ba fix 3)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    // Another pass's hold, fresh as of this pass's clock: a live owner.
+    const concurrentHold = reservationFixture('res-hold', 'reaper-' + seeded.findingId, {
+      hostId: 'reaper:' + HOST_NAME,
+      seatTool: null,
+      worktreePath: WT_PATH,
+      reservedAtIso: NOW,
+    });
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    // The hold appears only after the pass has gathered its facts and read the
+    // repair key: the race the fix closes, where the owner acquires between
+    // this pass's snapshot and its defensive release.
+    const baseJournal = makeJournal();
+    let holdVisible = false;
+    const journal = {
+      ...baseJournal,
+      listForKey: (key: string) => {
+        holdVisible = true;
+        return baseJournal.listForKey(key);
+      },
+    };
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      journal,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, releasedHolds),
+      listActiveReservations: () => (holdVisible ? Promise.resolve([concurrentHold]) : Promise.resolve([])),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'refused', reasonCode: 'hold-held-concurrent' });
+    // The other pass's hold was never released and this pass never took its own.
+    expect(releasedHolds).toEqual([]);
+    expect(events.some((entry) => entry.startsWith('release:'))).toBe(false);
+    expect(events.includes('hold')).toBe(false);
+    expect(events.includes('remove')).toBe(false);
+    // Nothing was journaled: the pass refused before the intent.
+    expect(harness.journal.state.appendCalls).toEqual([]);
+    // The owning pass still holds it afterwards.
+    expect(concurrentHold.held).toBe(true);
+    expect(concurrentHold.releasedAtIso).toBeNull();
+  });
+
+  it('a hold acquired between the check and the release fails the fence, is not released and removes nothing (KW4ba fix round 3)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    // A crashed pass's stale leftover hold, as this pass's listing reads it:
+    // over a whole pass budget plus the grace old, so the check reads `free`.
+    const staleHold = reservationFixture('res-stale', 'reaper-' + seeded.findingId, {
+      hostId: 'reaper:' + HOST_NAME,
+      seatTool: null,
+      worktreePath: WT_PATH,
+      reservedAtIso: BEFORE,
+    });
+    // The hold a concurrent pass acquires in the window between this pass's
+    // listing and its release.
+    const liveHold = reservationFixture('res-live', 'reaper-' + seeded.findingId, {
+      hostId: 'reaper:' + HOST_NAME,
+      seatTool: null,
+      worktreePath: WT_PATH,
+      reservedAtIso: NOW,
+    });
+    const fencedCalls: ReleaseCapacityReservationIfUnchangedRequest[] = [];
+    let concurrentOwns = false;
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        return { outcome: 'removed', branchTip: COMMIT };
+      },
+    });
+    // The stale hold appears only once the repair reads its key: the gather
+    // must classify the finding first, exactly as in a real pass where the
+    // leftover hold is read at the ownership check.
+    const baseJournal = makeJournal();
+    let holdVisible = false;
+    const journal = {
+      ...baseJournal,
+      listForKey: (key: string) => {
+        holdVisible = true;
+        return baseJournal.listForKey(key);
+      },
+    };
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      journal,
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, releasedHolds),
+      listActiveReservations: () =>
+        Promise.resolve(concurrentOwns ? [liveHold] : holdVisible ? [staleHold] : []),
+      fencedRelease: async (fenceRequest) => {
+        fencedCalls.push(fenceRequest);
+        // The concurrent pass acquires its own hold while this pass's release
+        // is in flight: the held reservation is no longer the one the check
+        // read, so the fence fails.
+        concurrentOwns = true;
+        return fenceRequest.reservationId === liveHold.id
+          ? { outcome: 'released', reservationId: fenceRequest.reservationId }
+          : { outcome: 'changed' };
+      },
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'refused', reasonCode: 'hold-held-concurrent' });
+    // The release was fenced on the record the check read.
+    expect(fencedCalls).toHaveLength(1);
+    expect(fencedCalls[0]).toMatchObject({ attemptId: 'reaper-' + seeded.findingId, reservationId: 'res-stale' });
+    // The fence failed (`changed`): the concurrent pass's hold was never
+    // released, this pass never took its own and removed nothing.
+    expect(releasedHolds).toEqual([]);
+    expect(events.some((entry) => entry.startsWith('release:'))).toBe(false);
+    expect(events.includes('hold')).toBe(false);
+    expect(events.includes('remove')).toBe(false);
+    expect(workspace.requests.some((entry) => entry.remove !== undefined)).toBe(false);
+    // Nothing was journaled: the pass refused before the intent.
+    expect(harness.journal.state.appendCalls).toEqual([]);
+    // The owning pass still holds it afterwards.
+    expect(liveHold.held).toBe(true);
+    expect(liveHold.releasedAtIso).toBeNull();
+  });
+
+  it('fence-releases the stale leftover hold of a crashed pass and proceeds with the repair (KW4ba fix round 3)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    // A crashed pass abandoned this hold with no owner. It is stale, so the
+    // check reads `free` and this pass's fenced release recovers it — the
+    // abandoned hold never blocks a later pass for ever.
+    const staleHold = reservationFixture('res-stale', 'reaper-' + seeded.findingId, {
+      hostId: 'reaper:' + HOST_NAME,
+      seatTool: null,
+      worktreePath: WT_PATH,
+      reservedAtIso: BEFORE,
+    });
+    const fencedCalls: ReleaseCapacityReservationIfUnchangedRequest[] = [];
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        return { outcome: 'removed', branchTip: COMMIT };
+      },
+    });
+    // The stale hold appears only once the repair reads its key: the gather
+    // must classify the finding first, exactly as in a real pass where the
+    // leftover hold is read at the ownership check.
+    const baseJournal = makeJournal();
+    let holdVisible = false;
+    const journal = {
+      ...baseJournal,
+      listForKey: (key: string) => {
+        holdVisible = true;
+        return baseJournal.listForKey(key);
+      },
+    };
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      journal,
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, releasedHolds),
+      listActiveReservations: () => Promise.resolve(holdVisible ? [staleHold] : []),
+      fencedRelease: async (fenceRequest) => {
+        fencedCalls.push(fenceRequest);
+        events.push('fence');
+        return { outcome: 'released', reservationId: fenceRequest.reservationId };
+      },
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'completed' });
+    // The release was fenced on the record the check read.
+    expect(fencedCalls).toHaveLength(1);
+    expect(fencedCalls[0]).toMatchObject({
+      attemptId: 'reaper-' + seeded.findingId,
+      reservationId: 'res-stale',
+      attemptRevision: 0,
+    });
+    // The hold attempt is synthetic and has no attempt record: the fence
+    // reads revision 0, at the check and under the store's lock.
+    await expect(fencedCalls[0]!.readAttemptRevision()).resolves.toBe(0);
+    // The stale hold was released first, then this pass acquired its own
+    // hold, removed under it and released its own hold afterwards.
+    expect(events).toEqual(['fence', 'hold', 'remove', 'release:reaper-' + seeded.findingId]);
+    expect(releasedHolds).toEqual(['reaper-' + seeded.findingId]);
+  });
+
+  it('releases its own hold on every exit path, including a removal that throws (KW4ba fix round 3)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    const events: string[] = [];
+    const releasedHolds: string[] = [];
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        // The removal itself throws: the hold must still be released.
+        throw new Error('remove blew up');
+      },
+    });
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, releasedHolds),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'ambiguous', reasonCode: 'remove-ambiguous' });
+    // No hold is left behind on the throw path: the pass released its own.
+    expect(events.filter((entry) => entry === 'hold')).toHaveLength(1);
+    expect(releasedHolds).toEqual(['reaper-' + seeded.findingId]);
+    expect(events.filter((entry) => entry.startsWith('release:reaper-'))).toHaveLength(1);
+  });
+
+  it('a listForRun that never resolves yields unknown within the pass budget rather than hanging (KW4ba fix 4)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    await seedOpenFinding(store, subject, 'merged-worktree');
+    const baseJournal = makeJournal();
+    const journal = { ...baseJournal, listForRun: () => new Promise<LaneRunJournalEntryRecord[]>(() => undefined) };
+    const events: string[] = [];
+    const workspace = makeWorkspace({
+      removeAnswer: () => {
+        events.push('remove');
+        return { outcome: 'removed', branchTip: COMMIT };
+      },
+    });
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      journal,
+      workspace,
+      runRepo: {
+        list: () => Promise.resolve([{ runId: 'run-1', attemptIds: ['att-1'] }] as unknown as LaneRunRecord[]),
+      },
+      storeCallTimeoutMs: 50,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events, []),
+    });
+    // The pass must end within the budget, not hang on the hung run read.
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    expect(result.outcome).toBe('completed');
+    expect(result.unknown.some((entry) => entry.reason === 'journal-unreadable')).toBe(true);
+    // No hold, no removal: the subject stayed unknown.
+    expect(events).toEqual([]);
+    expect(workspace.requests.some((entry) => entry.remove !== undefined)).toBe(false);
+  });
+
+  it('reconciles a crashed merged-worktree intent read-only when the worktree is no longer linked', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    const key = `reaper/${subject}/merged-worktree@${seeded.findingId}`;
+    const intent: LaneRunJournalEntryRecord = {
+      version: 1,
+      entryId: newId(),
+      kind: 'intent',
+      key,
+      runId: null,
+      recordedAtIso: BEFORE,
+      mode: null,
+      expectedRevision: null,
+      mintedId: mergedIntentMintedId(seeded.findingId, subject),
+      outcome: null,
+      reasonCode: null,
+      detail: null,
+      grantId: null,
+      state: null,
+    };
+    const events: string[] = [];
+    let inspectCount = 0;
+    const workspace = makeWorkspace({
+      inspectAnswer: () => {
+        inspectCount += 1;
+        return inspectCount <= 1
+          ? { outcome: 'inspected', facts: removalFacts() }
+          : { outcome: 'refused', reason: 'not-a-linked-worktree' };
+      },
+    });
+    const harness = gatherHarness({
+      store,
+      journal: makeJournal([intent]),
+      attempts: [sealedCollectedAttempt('att-1')],
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'reconciled' });
+    expect(repair?.reasonCode).toBeUndefined();
+    expect(harness.journal.state.appendCalls.map((entry) => entry.kind)).toEqual(['result']);
+  });
+
+  it('treats thrown or unreadable re-reads under the hold as unknown, skips removal and keeps open findings', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    await seedOpenFinding(store, subject, 'merged-worktree');
+    const attempts = [sealedCollectedAttempt('att-1')];
+    let listCalls = 0;
+    const attemptRepo: AttemptRepositoryPort = {
+      saveAttempt: () => Promise.resolve(),
+      findAttemptById: () => Promise.resolve(null),
+      listAttemptsByWorkOrder: () => Promise.resolve([]),
+      listAllAttempts: () => {
+        listCalls += 1;
+        return listCalls === 1 ? Promise.resolve(attempts) : Promise.reject(new Error('boom'));
+      },
+    };
+    const events: string[] = [];
+    const workspace = makeWorkspace({ removeAnswer: () => ({ outcome: 'removed', branchTip: COMMIT }) });
+    const harness = gatherHarness({
+      store,
+      attemptRepo,
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'skipped', reasonCode: 'recheck-unknown' });
+    expect(events.includes('remove')).toBe(false);
+    expect(events.some((entry) => entry.startsWith('release:'))).toBe(true);
+    expect(harness.journal.state.appendCalls).toEqual([]);
+    expect((await store.listOpenFindings()).some((record) => record.finding.kind === 'merged-worktree')).toBe(true);
+  });
+
+  it('refuses replay of a pending merged-worktree intent when the request digest mismatches before writing anything (F129)', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    const seeded = await seedOpenFinding(store, subject, 'merged-worktree');
+    const key = `reaper/${subject}/merged-worktree@${seeded.findingId}`;
+    const intent: LaneRunJournalEntryRecord = {
+      version: 1,
+      entryId: newId(),
+      kind: 'intent',
+      key,
+      runId: null,
+      recordedAtIso: BEFORE,
+      mode: null,
+      expectedRevision: null,
+      mintedId: `${seeded.findingId}:${'b'.repeat(64)}`, // a different digest
+      outcome: null,
+      reasonCode: null,
+      detail: null,
+      grantId: null,
+      state: null,
+    };
+    const events: string[] = [];
+    const workspace = makeWorkspace({ removeAnswer: () => ({ outcome: 'removed', branchTip: COMMIT }) });
+    const harness = gatherHarness({
+      store,
+      journal: makeJournal([intent]),
+      attempts: [sealedCollectedAttempt('att-1')],
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    const repair = result.repairs.find((entry) => entry.kind === 'merged-worktree');
+    expect(repair).toMatchObject({ outcome: 'refused', reasonCode: 'intent-digest-mismatch' });
+    expect(events).toEqual([]); // no hold, no release, no removal
+    expect(harness.journal.state.appendCalls).toEqual([]);
+    expect(result.unknown.some((entry) => entry.reason === 'intent-digest-mismatch')).toBe(true);
+    expect((await store.listOpenFindings()).some((record) => record.finding.kind === 'merged-worktree')).toBe(true);
+  });
+
+  it('caps merged-worktree removals at maxRemovalsPerPass oldest-first and bounds unknown and summary sizes', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const wtOld = `${ROOT}/wt-old`;
+    const wtMid = `${ROOT}/wt-mid`;
+    const wtNew = `${ROOT}/wt-new`;
+    const subjectOld = testDigest(`${HOST_NAME}\u0000${PROJECT}\u0000${CLONE}\u0000${wtOld}`);
+    const subjectMid = testDigest(`${HOST_NAME}\u0000${PROJECT}\u0000${CLONE}\u0000${wtMid}`);
+    const subjectNew = testDigest(`${HOST_NAME}\u0000${PROJECT}\u0000${CLONE}\u0000${wtNew}`);
+    for (const subject of [subjectOld, subjectMid, subjectNew]) {
+      await seedOpenFinding(store, subject, 'merged-worktree');
+    }
+    const workspace = makeWorkspace({
+      entries: [listedWorktree(wtOld), listedWorktree(wtMid), listedWorktree(wtNew)],
+      removeAnswer: () => ({ outcome: 'removed', branchTip: COMMIT }),
+    });
+    workspace.inspectWorktreeForRemoval = async (request) => {
+      const last =
+        request.worktreePath === wtOld
+          ? '2026-11-03T12:00:00.000Z'
+          : request.worktreePath === wtMid
+            ? '2026-11-04T12:00:00.000Z'
+            : '2026-11-05T12:00:00.000Z';
+      return {
+        outcome: 'inspected',
+        facts: removalFacts({
+          path: request.worktreePath,
+          branch: 'fleet/' + request.worktreePath.split('/').pop(),
+          lastActivity: { iso: last, unknown: false },
+        }),
+      };
+    };
+    const events: string[] = [];
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events),
+    });
+    const result = await runPass(harness, { policy: { graceMinutes: 5, repairs: { 'merged-worktree': true }, maxRemovalsPerPass: 2 } });
+    const repairs = result.repairs.filter((entry) => entry.kind === 'merged-worktree');
+    // Oldest two enter the repair (they are not removal-cap-skipped); the
+    // newest is skipped by the per-pass cap.
+    expect(repairs).toHaveLength(3);
+    expect(repairs[0]?.subject).toBe(subjectOld);
+    expect(repairs[1]?.subject).toBe(subjectMid);
+    expect(repairs[0]?.reasonCode).not.toBe('removal-cap');
+    expect(repairs[1]?.reasonCode).not.toBe('removal-cap');
+    expect(repairs[2]).toMatchObject({ subject: subjectNew, outcome: 'skipped', reasonCode: 'removal-cap' });
+    for (const unknown of result.unknown) {
+      expect(unknown.reason.length).toBeLessThanOrEqual(64);
+    }
+  });
+
+  it('echoes no filesystem path, branch name or secret-shaped text in results, journal entries or attention items', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const subject = subjectOfFixtureWorktree();
+    await seedOpenFinding(store, subject, 'merged-worktree');
+    const events: string[] = [];
+    const attention: AttentionState = { recorded: [], cleared: [] };
+    const workspace = makeWorkspace({ removeAnswer: () => ({ outcome: 'removed', branchTip: COMMIT }) });
+    const harness = gatherHarness({
+      store,
+      attempts: [sealedCollectedAttempt('att-1')],
+      workspace,
+      reserveCapacity: makeReserve(events),
+      releaseCapacity: makeRelease(events),
+      attentionPort: makeAttention(attention),
+    });
+    const result = await runPass(harness, { policy: MERGED_POLICY });
+    for (const forbidden of [WT_PATH, ROOT, CLONE, 'fleet/merged-branch']) {
+      expect(JSON.stringify(result).includes(forbidden)).toBe(false);
+    }
+    for (const entry of harness.journal.state.appendCalls) {
+      const text = JSON.stringify(entry);
+      for (const forbidden of [WT_PATH, ROOT, CLONE, 'fleet/merged-branch']) {
+        expect(text.includes(forbidden)).toBe(false);
+      }
+    }
+    for (const { body } of attention.recorded) {
+      const summary = String(body.summary);
+      expect(summary.includes('/')).toBe(false);
+      expect(containsSecretShape(summary)).toBe(false);
+      expect(summary.length).toBeLessThanOrEqual(1024);
+    }
   });
 });

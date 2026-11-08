@@ -196,3 +196,52 @@ state is something else.
 | U4 guardrails (D3) | briefed after U1 lands, to avoid path collision |
 | U5 watchdog | after U1 |
 | CO30a | #842, premerge green, on the train |
+
+## 9. Remediations from the 2026-11-07/08 night — every finding, and where its fix lives
+
+Added after the owner asked that the remediations be recorded rather than left in pull-request prose. One row
+per finding. A finding with no unit is not remediated, and is marked so.
+
+| finding | remediation | where it lives |
+|---|---|---|
+| F187 stall blindness | SV1: report a stall that is not a park, with a wait-aware allow-list | lane SV1, dispatched, #843 |
+| F188 gate retry loop | bounded retry under a retry key, gate only | GU1, MERGED as #840 |
+| F189 transport spends retry budget | U3: a no-receipt that never reached the seat spends no budget, with a bound | lane U3, dispatched |
+| F190 lane-host guard voids every round | correct the two pinned values, sweep the backups, re-harden | private fleet repo runbook; owner runs it |
+| F191 premerge hold never satisfied | U2: a conducted pre-merge review act, seat configurable, default Argon 4 | lane U2, dispatched |
+| F192 brief writer ran the test suite | escape the heredoc backticks; a check that no build tool is invoked | fleet #185 |
+| **F193 a dated marker turns main red with no warning** | **U6, below — not yet built** | **unbriefed at the time of writing** |
+| 186 of 188 attention items point at terminal runs | **U7, below — not yet built** | **unbriefed at the time of writing** |
+| the train would have merged onto a red main | U4's halt-on-red, now with evidence | part of U4 |
+
+### U6 — warn before a dated marker expires, do not only fail after (F193)
+
+On 2026-11-08 `main` went from green at 23:24Z to red at 00:43Z with no change in between: a quarantine marker
+in `apps/cli/src/__tests__/e2e/quarantine.ts` carried `until: '2026-11-07'`, and the wrapper's own tests drove
+it through the real clock. Fixed in #844 by pinning the clock, which is the right fix for those tests but not
+for the class of problem.
+
+The forcing function is good and must stay: an expired marker SHOULD fail CI loudly. What is missing is notice.
+Nothing warns while a marker is approaching its date, so a deadline set weeks earlier lands as an outage, at
+whatever hour the date rolls over, with the first symptom being an unrelated pull request looking broken. The
+orchestrator spent the first part of that diagnosis believing a merge had caused it, and said so to the owner.
+
+The unit: a marker within N days of expiry emits a warning annotation and is reported, without failing; and a
+pull request that INTRODUCES or renews a marker whose date is less than N days out fails, so a marker cannot be
+set with a deadline that is already nearly spent. The owner's view is wanted on whether this belongs to the
+quarantine helper or to CI, which is the open question in #844.
+
+The same question applies to any other dated deadline in the repository. The unit should start by finding them:
+a grep for date literals in acceptance and test-support code is in scope, and a finding of "there are no others"
+is a valid result worth recording.
+
+### U7 — resolve an attention item when its run goes terminal
+
+On 2026-11-07 there were 188 open attention items and **186 pointed at runs that were already terminal**. A real
+page was one line in 94 of noise, which is a large part of why a 9.5-hour stall went unnoticed: the owner asked
+"check for stalled lanes" and nothing in the attention store distinguished the live problem from months of
+residue. `state compact` does not touch attention items — it covers attempts, journals and reservations — so
+this needs code: an item whose subject run has reached a terminal state is resolved, and the compaction path
+learns about the attention store.
+
+Ordering: after SV1, because SV1 changes what raises an item, and the two would collide on the same files.

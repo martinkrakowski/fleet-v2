@@ -309,6 +309,7 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         ),
     );
     await this.reconcileStallAttention();
+    await this.resolveTerminalRunAttention();
     return { outcome: 'completed', halted: control.sawHalted(), progressed, runs: reports, attention };
   }
 
@@ -375,6 +376,61 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       }
     } catch {
       // Swallowed on purpose: stall attention is advisory and the next pass repeats it.
+    }
+  }
+
+  /**
+   * U7: resolve every open run-subject attention item whose subject run is
+   * terminal (`merged` or `stopped`), whatever its kind, so park notices and
+   * any later run-scoped kind do not stay open after their run ends. Runs on
+   * every completed pass, even when no run is live, so pre-existing residue
+   * converges without a one-off sweep. The state is projected from the run's
+   * journal: an item whose `runId` is missing from the run repository has
+   * unknown state (not proven terminal) and is left untouched. `ready` and
+   * `parked` (live states) are never resolved here. Failure-tolerant like the
+   * stall reconciliation: a refused call, an unreadable store or a throw never
+   * changes the pass, and the next pass converges.
+   */
+  private async resolveTerminalRunAttention(): Promise<void> {
+    const port = this.deps.stallAttention;
+    // Open items already carry their `projectId`, so the work-order repo is not needed here.
+    if (port?.listOpenRunAttention === undefined || port.resolveRunAttention === undefined) {
+      return;
+    }
+    try {
+      const open = await port.listOpenRunAttention();
+      if (open.outcome !== 'found' || open.items.length === 0) {
+        return;
+      }
+      const records = await this.deps.runRepo.list();
+      const knownRunIds = new Set(records.map((record) => record.runId));
+      const candidateRunIds: string[] = [];
+      for (const item of open.items) {
+        if (knownRunIds.has(item.runId) && !candidateRunIds.includes(item.runId)) {
+          candidateRunIds.push(item.runId);
+        }
+      }
+      if (candidateRunIds.length === 0) {
+        return;
+      }
+      const journals = await journalsForRuns(this.deps.runJournal, candidateRunIds);
+      const terminalRunIds = new Set<string>();
+      for (const runId of candidateRunIds) {
+        const state = laneRunJournalState(journals.get(runId) ?? [], runId);
+        if ((LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
+          terminalRunIds.add(runId);
+        }
+      }
+      if (terminalRunIds.size === 0) {
+        return;
+      }
+      for (const item of open.items) {
+        if (terminalRunIds.has(item.runId)) {
+          await port.resolveRunAttention(item);
+        }
+      }
+    } catch {
+      // Swallowed on purpose: attention resolution is advisory and the next pass repeats it.
     }
   }
 

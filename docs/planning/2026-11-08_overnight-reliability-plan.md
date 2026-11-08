@@ -42,11 +42,10 @@ worktree.
 - **F187 (stall blindness), OPEN.** `conductor status --stalled` counts only
   parked runs. Three runs stuck for 1 h, 1.5 h and 9.5 h were all reported as
   "no stalls", including when the owner asked directly.
-- **F190 (agy guard), OPEN, owner's container.** The guard pins
-  `~/.gemini/antigravity-cli/bin` as an install tree under its own comment
-  marking that layout UNVERIFIED. agy rewrites that directory every run —
-  39,807 `bin.bak.*` siblings — so every Argon or Flash round reports the lane
-  void. This is almost certainly the real content of F185.
+- **F190 (lane-host guard), OPEN, operator's host.** A guard pins a hash over a directory the tool rewrites on
+  every run, so every fix round on that seat reports the lane void. Details, verification and the fix are in the
+  private fleet repository, because they are host configuration; this plan only needs the consequence, which is
+  that the fix seat named in fleet #184 cannot run until it is fixed.
 - **F192 (brief writer), FIXED in fleet #185.** Two unescaped backticks in an
   unquoted heredoc made writing a brief RUN the affected-workspace test suite,
   twice, and splice ~1500 lines of its output into the prompt.
@@ -143,22 +142,57 @@ Recorded because the first version of this plan was built on them.
    grok running a command it was told not to run. The brief writer fed it the
    output.
 
-## 7. Decisions for the owner
+## 7. Decisions — ACCEPTED 2026-11-08
 
-- **D1 — the conducted pre-merge seat (U2).** Do you want a conducted `pre-merge`
-  review act whose reviewer is the stronger seat, so Tier 2 can finish
-  unattended? The alternative, letting the conductor certify premerge from its
-  own Luna brief-check and code-review receipts, is **not recommended**: the
-  Tier 2 control is a specific stronger reviewer at the exact head, and
-  self-certifying from the Luna receipts makes Tier 2 identical to Tier 1.
-- **D2 — the overnight tier cap.** Tier 0/1 merges unattended; Tier 2 stops at a
-  PR. Confirm, or name a narrower line.
-- **D3 — zero-finding passes.** Accept that a zero-finding `pass` on a large
-  domain diff becomes `review-unknown` (it will cost extra review rounds), or
-  keep today's behaviour and accept that such diffs merge unexamined.
-- **D4 — the agy guard (F190).** Fix the guard (one line plus a sweep, keeps the
-  plan-quota seat), or temporarily put paid GLM-5.3-Flash on the fix seat. The
-  first is recommended; the second reverses the cost reason for choosing Flash.
-- **D5 — CO30a.** Does the orchestrator's overruling of the brief on
-  `replayFinal` stand, and does CO30a land with its one reachable review finding
-  unfixed while F190 blocks the fix seat?
+The owner accepted the orchestrator's recommendations as written ("move forward with your recommendations").
+Recorded here as the decisions, with the reasoning kept because two of them differ from what a reviewer advised.
+
+**D1 — ACCEPTED: build the conducted `pre-merge` act; the seat is Argon 4, not Fable.**
+The act is added on an attempt subject and recorded through `RecordReviewReceiptUseCase`, which already enforces
+`readOnlyVerified` and an implementer/reviewer mismatch. The seat is configuration, defaulted to Argon 4
+(`gemini-4-argon-high` through agy).
+
+This **differs from the Fable review's recommendation**, which named the Fable seat. The reason is quota, which
+that review had no way to know: two weekly Fable quotas were spent in one week, which is why the standing rule
+is at most one Fable pass per lane and once per chain landing. Wiring Fable into a nightly unattended loop at
+8-12 lanes would break that rule by construction. Argon 4 is independent of all three other seats — Mercury
+implements, Gemini 3.8 Flash fixes, Luna does brief-check and code review — and runs on plan quota rather than
+per token. It was already an approved review seat (owner, 2026-10-29). Fable keeps its place: once per chain
+landing, and by hand for a security-touching lane.
+
+Blocked behind D4: Argon cannot run at all while the container guard voids every round.
+
+**D2 — ACCEPTED as drafted.** Overnight, Tier 0/1 merges unattended; Tier 2 stops at a PR with
+`premerge: pending`.
+
+**D3 — ACCEPTED, scoped.** A zero-finding `pass` reads `review-unknown` only when the diff exceeds ~200 lines
+AND touches `packages/*/src/domain` or a `lane-diff-check` protected path, and the consequence is one further
+round on a DIFFERENT seat, never a loop. Unscoped it would tax every small lane; scoped it targets the measured
+miss — a zero-finding pass on GU1's 448-line decider rewrite.
+
+**D4 — ACCEPTED: fix the guard, do not buy around it.** The fix seat stays Gemini 3.8 Flash on plan quota;
+moving it to paid GLM-5.3-Flash would reverse the cost reason for choosing Flash. The guard pins a hash over a
+directory the tool rewrites on every run, which is why it always fails. The host is operator-owned, so the
+owner runs the fix; the commands, the read-only verification and the reasoning live in the private fleet
+repository, not here, because they are host configuration.
+
+**D5 — ACCEPTED: CO30a lands now (#842), with all three review findings as blocking prerequisites of CO30b.**
+Every one of them needs a cutover record with `state: 'switched'`. Nothing can create one: `switch` and `retire`
+return `move-not-implemented` (`ManageCutoverUseCase.use-case.ts:106`) and no production path writes that state.
+They become reachable the moment CO30b implements `switch`, so CO30b carries them as prerequisites rather than
+as follow-ups. The orchestrator's overruling of the brief on `replayFinal` stands: the brief's literal
+instruction is internally incoherent, because it would return `state: 'rolled-back'` alongside a record whose
+state is something else.
+
+## 8. Status at acceptance
+
+| unit | state |
+|---|---|
+| F188 gate retry | CLOSED, GU1 merged as #840 |
+| F192 brief writer | fixed, fleet #185 open |
+| U1 SV1, stall view | briefed and dispatched, Mercury first pass |
+| U3 transport budget | briefed next; no decision needed |
+| U2 pre-merge act (D1) | briefed; cannot run until D4 |
+| U4 guardrails (D3) | briefed after U1 lands, to avoid path collision |
+| U5 watchdog | after U1 |
+| CO30a | #842, premerge green, on the train |

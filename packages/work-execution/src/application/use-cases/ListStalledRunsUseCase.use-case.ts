@@ -1,9 +1,10 @@
 /**
- * ListStalledRunsUseCase (PT1a, SN3): the runs parked for longer than
- * `policy.daemon.stallAfterMinutes`, sorted oldest first, from the same
- * `stalledRunsOf` the conductor pass raises attention from, so the status view
- * and the attention items never disagree. Read-only; total: a store failure
- * or a malformed clock is a typed refusal, never a throw.
+ * ListStalledRunsUseCase (PT1a, SN3): the runs held for longer than
+ * `policy.daemon.stallAfterMinutes` — parked runs with a park class, non-parked
+ * runs with a state and a last advanced time — sorted oldest first, from the
+ * same `stalledRunsOf` the conductor pass raises attention from, so the status
+ * view and the attention items never disagree. Read-only; total: a store
+ * failure or a malformed clock is a typed refusal, never a throw.
  */
 
 import { isCanonicalIso } from '../../domain/lane-activity-records.js';
@@ -43,12 +44,22 @@ export class ListStalledRunsUseCase implements ListStalledRunsPort {
       return {
         outcome: 'listed',
         stallAfterMinutes,
-        stalled: stalled.map((view) => ({
-          runId: view.runId,
-          class: view.parkClass,
-          ageMinutes: view.ageMinutes,
-          workOrderId: view.workOrderId,
-        })),
+        stalled: stalled.map((view) =>
+          'parkClass' in view
+            ? {
+                runId: view.runId,
+                class: view.parkClass,
+                ageMinutes: view.ageMinutes,
+                workOrderId: view.workOrderId,
+              }
+            : {
+                runId: view.runId,
+                state: view.state,
+                ageMinutes: view.ageMinutes,
+                workOrderId: view.workOrderId,
+                lastAdvancedAtIso: view.lastAdvancedAtIso,
+              },
+        ),
       };
     } catch {
       return { outcome: 'refused', reason: 'unreadable' };

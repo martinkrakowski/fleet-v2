@@ -52,12 +52,65 @@ describe('StallAttentionAdapter (PT1a)', () => {
       { ...COMMAND, parkClass: 'made-up' },
       { ...COMMAND, ageMinutes: -1 },
       { ...COMMAND, ageMinutes: 1.5 },
+      { ...COMMAND, state: 'gating' },
+      { ...COMMAND, parkClass: undefined },
+      { projectId: 'fleet-v2', workOrderId: 'wo-fleet-v2-sr1c-dedupe-2026-10-29', runId: RUN, parkClass: undefined, state: 'gating', ageMinutes: 47 },
+      { projectId: 'fleet-v2', workOrderId: 'wo-fleet-v2-sr1c-dedupe-2026-10-29', runId: RUN, ageMinutes: 47 },
       null,
     ]) {
       const answer = await adapter.raiseStallAttention(bad as never);
       expect(answer).toEqual({ outcome: 'refused', reasonCode: 'invalid-request' });
       expect(JSON.stringify(answer)).not.toContain(secret);
     }
+    expect(called).toBe(false);
+  });
+
+  it('raises an idle item with a state= summary and no class or parked text', async () => {
+    const calls: { body: unknown; actor: string }[] = [];
+    const adapter = new StallAttentionAdapter({
+      recordAttentionItem: async (body, actor) => {
+        calls.push({ body, actor });
+        return { outcome: 'raised' };
+      },
+    });
+    const idleCommand = {
+      projectId: 'fleet-v2',
+      workOrderId: 'wo-fleet-v2-sr1c-dedupe-2026-10-29',
+      runId: RUN,
+      state: 'gating',
+      ageMinutes: 47,
+      lastAdvancedAtIso: '2026-11-06T19:00:00.000Z',
+    } as const;
+    expect(await adapter.raiseStallAttention(idleCommand)).toEqual({ outcome: 'raised', reasonCode: null });
+    expect(calls[0]!.body).toEqual({
+      projectId: 'fleet-v2',
+      kind: 'conductor-stall',
+      subject: { kind: 'run', ref: RUN },
+      workOrderId: 'wo-fleet-v2-sr1c-dedupe-2026-10-29',
+      summary: `stall:${RUN} state=gating idle>=45m work-order=wo-fleet-v2-sr1c-dedupe-2026-10-29`,
+    });
+    const body = calls[0]!.body as { summary: string };
+    expect(body.summary).not.toContain('class=');
+    expect(body.summary).not.toContain('parked');
+  });
+
+  it('refuses an unknown state without calling the store', async () => {
+    let called = false;
+    const adapter = new StallAttentionAdapter({
+      recordAttentionItem: async () => {
+        called = true;
+        return { outcome: 'raised' };
+      },
+    });
+    const answer = await adapter.raiseStallAttention({
+      projectId: 'fleet-v2',
+      workOrderId: 'wo-fleet-v2-sr1c-dedupe-2026-10-29',
+      runId: RUN,
+      state: 'made-up',
+      ageMinutes: 47,
+      lastAdvancedAtIso: '2026-11-06T19:00:00.000Z',
+    } as never);
+    expect(answer).toEqual({ outcome: 'refused', reasonCode: 'invalid-request' });
     expect(called).toBe(false);
   });
 

@@ -103,6 +103,9 @@ import {
   ListLaneRunsUseCase,
   ReapLaneWorktreesUseCase,
   ReapOrphanSessionsUseCase,
+  ReapZombiesUseCase,
+  ReaperFindingRepositoryAdapter,
+  InMemoryReaperFindingRepositoryAdapter,
   RequestLaneRunStopUseCase,
   ResumeLaneRunUseCase,
   type ProjectProfileReadPort,
@@ -821,6 +824,10 @@ export interface FleetCliRuntime {
     readonly reapLaneWorktrees: ReapLaneWorktreesUseCase;
     /** EX-4: the operator-opt-in orphan-session reap (conductor reap --sessions). */
     readonly reapOrphanSessions: ReapOrphanSessionsUseCase;
+    /** KW4b': the zombie reaper pass. */
+    readonly reapZombies: ReapZombiesUseCase;
+    /** KW4b': the reaper's findings store (file-backed with a state dir). */
+    readonly reaperFindingRepository: ReaperFindingRepositoryAdapter | InMemoryReaperFindingRepositoryAdapter;
     /** A fresh ULID per call (journal entry ids, run and attempt ids). */
     readonly newUlid: () => string;
     /** The project profile read the root already builds; exposed for `conductor start` (K7-7). */
@@ -1115,6 +1122,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executionJournal,
     workspace,
     runnerForAttempt,
+    reconcileAttempt: execution.reconcileAttempt,
+    mergeRecordRepository: execution.mergeRecordRepository,
+    runner,
   });
 
   // PT1ca: registration checks the open pull requests of the base branch, so it

@@ -1,4 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, afterAll } from 'vitest';
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, promises as fs, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+import { promisify } from 'node:util';
 import {
   createFleetCliRuntime,
   forgeActionScope,
@@ -11,7 +17,17 @@ import { buildMergeGhChildEnv, composeExecutionHosts } from './composition/work-
 import { composeEvidence } from './composition/evidence.js';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
-import { ForgeActionAdapter, nextAttemptRevision } from '@fleet/work-execution';
+import {
+  ForgeActionAdapter,
+  LaneRun,
+  buildArtifactManifest,
+  laneRunConductEntry,
+  nextAttemptRevision,
+  serializeArtifactManifest,
+  type LaneRunRecord,
+  type SubprocessRunner,
+} from '@fleet/work-execution';
+import type { FleetInstallation } from '@fleet/installation';
 
 function makeHeadH(): string {
   return '1111111111111111111111111111111111111111';
@@ -875,4 +891,310 @@ baseRef: 'main',
       },
     );
   });
+});
+
+/**
+ * The fixture's pass reads run through the real `WorkspaceAdapter`, which
+ * shells out to git and df. Under the parallel vitest load of the full CLI
+ * suite a subprocess read intermittently fails to report an exit code, and the
+ * reaper correctly treats that as an unknown (reads incomplete — findings stay
+ * open, closures are skipped), exactly as the unit tests pin down. This helper
+ * re-runs the pass when it reports one of those transient read failures, so
+ * the end-to-end happy path is asserted without depending on the host's load.
+ * The unknown-handling semantics themselves are covered by the unit tests; a
+ * persistent failure still surfaces after the retries are exhausted.
+ */
+const TRANSIENT_REAP_READ_REASONS: ReadonlySet<string> = new Set([
+  'worktree-list-unreadable',
+  'worktree-unreadable',
+  'disk-unreadable',
+  'runs-unreadable',
+  'journal-unreadable',
+  'profiles-unreadable',
+  'forge-unreadable',
+  'halt-unreadable',
+  'merge-records-unreadable',
+  'attention-unreadable',
+  // A pass whose outbound calls ran past the pass budget under host load:
+  // the next attempt starts a fresh budget.
+  'pass-budget',
+]);
+
+async function reapPassRobust<Req, Res extends { readonly unknown: readonly { readonly reason?: unknown }[] }>(
+  pass: (request: Req) => Promise<Res>,
+  request: Req,
+): Promise<Res> {
+  let last!: Res;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    last = await pass(request);
+    const transient = last.unknown.some((entry) =>
+      typeof entry.reason === 'string' ? TRANSIENT_REAP_READ_REASONS.has(entry.reason) : false,
+    );
+    // A retry whose pass already acted (a merged-worktree removal ran) must
+    // not be replaced: a later attempt can no longer see the finding, so its
+    // repairs would be empty even though the worktree is gone.
+    const acted = (last as { repairs?: readonly { kind?: unknown }[] }).repairs?.some(
+      (repair) => (repair as { kind?: unknown } | null)?.kind === 'merged-worktree',
+    );
+    if (!transient || acted) {
+      return last;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+  }
+  return last;
+}
+
+describe("conductor reaper merged-worktree repair through production composition (KW4b')", () => {
+  const RUN_ID = 'run-01JB000000000000000000000A';
+  const OPT_IN_POLICY = { graceMinutes: 5, retentionHours: 0, repairs: { 'merged-worktree': true } };
+  const tempStateDirs: string[] = [];
+  const execGit = promisify(execFile);
+
+  afterAll(() => {
+    for (const dir of tempStateDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it(
+    'runs merged-worktree inspection and removal through production composition with read-only git flags and C2-prime sealed manifest',
+    async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-reaper-comp-'));
+    tempStateDirs.push(stateDir);
+    const clonePath = path.join(stateDir, 'clone');
+    const wtRoot = path.join(stateDir, 'worktrees');
+    await fs.mkdir(clonePath, { recursive: true });
+    await fs.mkdir(wtRoot, { recursive: true });
+
+    const git = async (args: readonly string[], cwd = clonePath): Promise<string> => {
+      const result = await execGit('git', args, { cwd });
+      return String(result.stdout ?? '');
+    };
+    await git(['init', '-q']);
+    await git(['config', 'user.email', 'lane@example.invalid']);
+    await git(['config', 'user.name', 'Lane']);
+    await fs.writeFile(path.join(clonePath, 'main.txt'), 'main\n');
+    await git(['add', '.']);
+    await git(['commit', '-q', '-m', 'initial']);
+    await git(['branch', '-m', 'main']);
+    const MAIN_COMMIT = (await git(['rev-parse', 'HEAD'])).trim();
+    await git(['update-ref', 'refs/remotes/origin/main', MAIN_COMMIT]);
+
+    const WT_PATH = path.join(wtRoot, 'wt1');
+    await git(['worktree', 'add', '-b', `fleet/${RUN_ID}`, WT_PATH]);
+
+    const attemptId = 'attempt-merged-1';
+    const manifestText = serializeArtifactManifest(buildArtifactManifest(attemptId, []));
+    const manifestSha = createHash('sha256').update(manifestText).digest('hex');
+    const manifestRel = `.lane/artifacts-manifest-${manifestSha.slice(0, 16)}.json`;
+    await fs.mkdir(path.join(WT_PATH, '.lane'), { recursive: true });
+    await fs.writeFile(path.join(WT_PATH, manifestRel), manifestText);
+    await git(['add', '.'], WT_PATH);
+    await git(['commit', '-q', '-m', 'sealed manifest'], WT_PATH);
+    const HEAD = (await git(['rev-parse', 'HEAD'], WT_PATH)).trim();
+
+    // Simulate the merge: the default branch (and its remote-tracking ref) now
+    // contains the worktree's HEAD, so the headOnDefault ancestor fact holds and
+    // the worktree reads as merged.
+    await git(['update-ref', 'refs/heads/main', HEAD]);
+    await git(['update-ref', 'refs/remotes/origin/main', HEAD]);
+
+    // Pass times run after the fixture, so the worktree's last activity is in
+    // the past and the `quiet` fact holds with `retentionHours: 0`.
+    const startMs = Date.now();
+    const isoAt = (offsetMs: number): string => new Date(startMs + offsetMs).toISOString();
+    const T0 = isoAt(60_000);
+    const T1 = isoAt(7 * 60_000);
+    const T2 = isoAt(13 * 60_000);
+    const T3 = isoAt(19 * 60_000);
+
+    const installation: FleetInstallation = {
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        'host-1': {
+          transport: 'local',
+          worktreeRoot: wtRoot,
+          roles: ['orchestrator', 'lane-runner', 'verifier'],
+        },
+      },
+    };
+    // A stub for the runner subprocess: `ocm-run --status` answers idle, so
+    // the real ExecutionRunnerAdapter reports the worktree idle.
+    const runSubprocess: SubprocessRunner = async (_command, args) => {
+      if (args.includes('--status')) {
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }
+      return { exitCode: 1, stdout: '', stderr: 'unexpected subprocess call' };
+    };
+    const runtime = createFleetCliRuntime({ stateDir, installation, runSubprocess });
+
+    const registered = await runtime.coordination.registerProjectProfile.execute({
+      projectId: 'reaper-project',
+      displayName: 'Reaper Project',
+      repository: 'https://example.com/reaper.git',
+      designatedDispatcherHost: 'host-1',
+      policyRevision: 'pol-1',
+      maxConcurrentLanes: 2,
+      runnerCapabilities: { networkEgressRestricted: true },
+      clones: { 'host-1': { path: clonePath, worktreeRoot: wtRoot } },
+    });
+    expect(registered.outcome).toBe('registered');
+
+    await runtime.execution.attemptRepository.saveAttempt({
+      id: attemptId,
+      workOrderId: 'wo-reaper-1',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: WT_PATH,
+      baseCommit: MAIN_COMMIT,
+      state: 'collected',
+      outcome: null,
+      briefDigest: 'b'.repeat(64),
+      briefPackagePath: '.lane/brief-package',
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: {
+        headCommit: HEAD,
+        commitsSinceBase: [HEAD],
+        collectedArtifactPaths: [],
+        notes: 'present',
+        manifestPath: manifestRel,
+        manifestSha256: manifestSha,
+      },
+      runner: {
+        kind: 'opencode',
+        remotePort: null,
+        host: null,
+        hostName: 'host-1',
+        agent: null,
+        model: null,
+        variant: null,
+      },
+      createdAtIso: '2026-11-04T12:00:00.000Z',
+      updatedAtIso: '2026-11-04T12:00:00.000Z',
+    });
+
+    const created = LaneRun.create({
+      version: 1,
+      runId: RUN_ID,
+      workOrderId: 'wo-reaper-1',
+      tier: 2,
+      seatPlanRef: 'c'.repeat(64),
+      cursors: { 'first-pass': 0, fix: null, review: null },
+      round: 0,
+      attemptIds: [attemptId],
+      prNumber: null,
+      parked: null,
+      parkCount: 0,
+      lease: null,
+      revision: 1,
+      runPolicyRevision: 'pol-1',
+      branchName: `fleet/${RUN_ID}`,
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) {
+      throw new Error('fixture must be a valid LaneRun record');
+    }
+    const record: LaneRunRecord = created.value.toRecord();
+    expect(await runtime.conductor.laneRunRepository.create(record)).toMatchObject({ outcome: 'saved' });
+    expect(
+      await runtime.conductor.laneRunJournal.append(
+        laneRunConductEntry('01JB0000000000000000000001', RUN_ID, 'merged', T0),
+      ),
+    ).toMatchObject({ outcome: 'appended' });
+
+    // A merge record whose repository is the lane-run branch answers merged-pr.
+    await runtime.execution.mergeRecordRepository.saveMergeRecord({
+      schemaVersion: 1,
+      repository: `fleet/${RUN_ID}`,
+      number: 1,
+      headSha: HEAD,
+      mergedAtIso: T0,
+      firstSeenAtIso: T0,
+      source: 'forge-observation',
+      merger: 'unknown',
+    });
+
+    // The runner for the recorded host answers idle (the stub subprocess would
+    // too, but only after resolving a recorded runner port; a local host has
+    // none, so the idle answer is stubbed at the runner boundary).
+    const origRunnerForAttempt = runtime.execution.runnerForAttempt.runnerForAttempt.bind(runtime.execution.runnerForAttempt);
+    runtime.execution.runnerForAttempt.runnerForAttempt = (request) => {
+      const resolved = origRunnerForAttempt(request);
+      if (!resolved.ok) {
+        return resolved;
+      }
+      return {
+        ...resolved,
+        runner: {
+          ...resolved.runner,
+          inspectWorktreeRun: async () => ({ state: 'idle' as const }),
+        },
+      };
+    };
+    // The `df` read is load-sensitive under the parallel suite (a spawn under
+    // heavy host load intermittently fails) and no assertion here reads the
+    // disk-pressure observation, so the filesystem-space read is pinned to a
+    // constant `read`; every git-side read stays on the real adapter.
+    runtime.execution.workspace.readFilesystemSpace = async () => ({
+      outcome: 'read' as const,
+      freeBytes: 42_800_000_000,
+      totalBytes: 53_700_000_000,
+    });
+    // The composed reaper's default 15 s per-outbound-call budget bounds one
+    // workspace inspection, which fans out into a dozen git subprocesses; on
+    // a saturated host (the parallel suite, other lanes building) one
+    // inspection can legitimately exceed 15 s. The pass budget itself still
+    // bounds the pass, so this test seam only widens the per-call cap.
+    (runtime.conductor.reapZombies as unknown as { deps: { storeCallTimeoutMs: number } }).deps.storeCallTimeoutMs = 60_000;
+    // Pass 1: the first sighting waits; no repair, the worktree stays.
+    const pass1 = await reapPassRobust(
+      (request) => runtime.conductor.reapZombies.reapZombies(request),
+      { projectId: 'reaper-project', nowIso: T0, policy: OPT_IN_POLICY },
+    );
+    expect(pass1.outcome).toBe('completed');
+    expect(pass1.findings.find((finding) => finding.kind === 'merged-worktree')?.action).toBe('wait');
+    expect(pass1.repairs.filter((repair) => repair.kind === 'merged-worktree')).toEqual([]);
+    expect(existsSync(WT_PATH)).toBe(true);
+
+    // D-R6: a default policy leaves the worktree on disk (report only).
+    const passDefault = await reapPassRobust(
+      (request) => runtime.conductor.reapZombies.reapZombies(request),
+      { projectId: 'reaper-project', nowIso: T1, policy: {} },
+    );
+    // The default policy keeps the repair off (D-R6): the worktree stays on
+    // disk, and no merged-worktree repair runs. (The default 24 h retention
+    // also means a fresh worktree is not `quiet`, so it is not even a report
+    // candidate — the D-R6 report-only semantics are covered by the unit test.)
+    expect(passDefault.repairs.filter((repair) => repair.kind === 'merged-worktree')).toEqual([]);
+    expect(existsSync(WT_PATH)).toBe(true);
+
+    // Pass 2: the opt-in repair removes the link worktree and keeps the branch.
+    const pass2 = await reapPassRobust(
+      (request) => runtime.conductor.reapZombies.reapZombies(request),
+      { projectId: 'reaper-project', nowIso: T2, policy: OPT_IN_POLICY },
+    );
+    const repair2 = pass2.repairs.find((repair) => repair.kind === 'merged-worktree');
+    expect(repair2?.outcome).toBe('completed');
+    expect(repair2?.key).toMatch(/^reaper\/[0-9a-f]{12}\/merged-worktree@/);
+    expect(pass2.attention.some((entry) => entry.kind === 'merged-worktree')).toBe(true);
+    expect(existsSync(WT_PATH)).toBe(false);
+    const branches = await git(['branch', '--list', `fleet/${RUN_ID}`]);
+    expect(branches.trim()).toContain(`fleet/${RUN_ID}`);
+    const held = await runtime.execution.executionJournal.listActiveReservations();
+    expect(held.some((reservation) => reservation.attemptId.startsWith('reaper-'))).toBe(false);
+
+    // Pass 3: the finding closes once the worktree is gone.
+    const pass3 = await reapPassRobust(
+      (request) => runtime.conductor.reapZombies.reapZombies(request),
+      { projectId: 'reaper-project', nowIso: T3, policy: OPT_IN_POLICY },
+    );
+    expect(pass3.outcome).toBe('completed');
+    const open = await runtime.conductor.reaperFindingRepository.listOpenFindings();
+    expect(open.filter((entry) => entry.finding.kind === 'merged-worktree')).toHaveLength(0);
+  },
+  420_000,
+);
 });

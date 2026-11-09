@@ -161,6 +161,12 @@ export interface ReviewTransportRouterOptions {
    */
   readonly apiSchemaEnforcement?: ApiSchemaEnforcement;
   /**
+   * Why a set api configuration variable was not accepted, from
+   * `resolveApiReviewSettings`. It travels into the refusal so an operator typo
+   * surfaces as a typo instead of looking like "not configured".
+   */
+  readonly apiConfigProblem?: string;
+  /**
    * Test seam only. Absent binds the provider library through
    * `createSdkApiReviewGenerate`, which is what `runApi` now does: an earlier
    * version of this comment claimed that and the code did not do it, so an
@@ -223,6 +229,13 @@ function runApi(
     throw new ReviewTransportError(
       `Reviewer seat '${seat.id}' sets a variant, which the api review transport does not support`,
       'seat-variant-unsupported',
+    );
+  }
+  if (options.apiConfigProblem !== undefined) {
+    // A set-but-rejected variable is an operator error, not an absent one.
+    throw new ReviewTransportError(
+      `Reviewer seat '${seat.id}' uses the api transport and its configuration was refused: ${options.apiConfigProblem}`,
+      'transport-missing',
     );
   }
   if (options.apiBaseURL === undefined || options.apiBaseURL.trim() === '') {

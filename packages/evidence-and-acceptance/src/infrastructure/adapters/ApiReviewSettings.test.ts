@@ -8,6 +8,7 @@ import {
   describeApiReviewConfigProblem,
   isApiReviewConfigProblemCode,
 } from './ApiReviewSettings.js';
+import { API_SCHEMA_ENFORCEMENTS } from './ApiReviewTransport.adapter.js';
 
 const URL_OK = 'http://10.60.0.1:4176/inception/v1';
 
@@ -149,8 +150,17 @@ describe('resolveApiReviewSettings', () => {
   it('no code text names anything but the two variables and the allowed values', () => {
     for (const code of API_REVIEW_CONFIG_PROBLEM_CODES) {
       const text = describeApiReviewConfigProblem(code);
-      expect(text).toMatch(/^FLEET_REVIEW_API_(BASE_URL|SCHEMA) /);
-      expect(text).not.toMatch(/[/\\]/);
+      // Exact expected texts, composed only of the two variable names and the
+      // compile-time allowed enforcement values.
+      const expected: Record<string, string> = {
+        'base-url-not-a-url': `${API_REVIEW_BASE_URL_VAR} is not a URL`,
+        'base-url-not-http': `${API_REVIEW_BASE_URL_VAR} must be http or https`,
+        'base-url-embeds-credentials': `${API_REVIEW_BASE_URL_VAR} must not embed credentials`,
+        'schema-not-allowed': `${API_REVIEW_SCHEMA_VAR} must be one of ${API_SCHEMA_ENFORCEMENTS.join(', ')}`,
+        'base-url-without-schema': `${API_REVIEW_BASE_URL_VAR} is set without ${API_REVIEW_SCHEMA_VAR}`,
+        'schema-without-base-url': `${API_REVIEW_SCHEMA_VAR} is set without ${API_REVIEW_BASE_URL_VAR}`,
+      };
+      expect(text).toBe(expected[code]);
     }
   });
 });

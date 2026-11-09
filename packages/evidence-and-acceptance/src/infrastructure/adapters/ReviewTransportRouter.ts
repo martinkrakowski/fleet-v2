@@ -239,17 +239,48 @@ export class ApiReviewConfigProblemError extends ReviewTransportError {
 }
 
 /**
+ * One own DATA property. An absent, inherited or accessor-backed field, or a
+ * descriptor read that throws, is reported rather than read: a thrown value
+ * must never be able to run code here or to decide a code through a getter.
+ */
+type OwnRead =
+  | { readonly kind: 'value'; readonly value: unknown }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unreadable' };
+
+function readOwn(target: object, key: string): OwnRead {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    if (descriptor === undefined) {
+      return { kind: 'absent' };
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { kind: 'unreadable' };
+    }
+    return { kind: 'value', value: descriptor.value };
+  } catch {
+    // A Proxy trap that throws is a malformed answer, not a crash.
+    return { kind: 'unreadable' };
+  }
+}
+
+/**
  * The api configuration problem code of a thrown value, or `undefined` for
  * every other failure. Structural and membership-checked rather than
  * `instanceof`: a duplicated module instance would defeat `instanceof`, and
  * only a member of the closed set may select a pass-through text.
+ * An own data property is read; an accessor-backed property yields `undefined`;
+ * a throwing trap yields `undefined`; the function never throws.
  */
 export function apiReviewConfigProblemCodeOf(error: unknown): ApiReviewConfigProblemCode | undefined {
   if (typeof error !== 'object' || error === null) {
     return undefined;
   }
-  const code = (error as { readonly configProblemCode?: unknown }).configProblemCode;
-  return isApiReviewConfigProblemCode(code) ? code : undefined;
+  const read = readOwn(error, 'configProblemCode');
+  if (read.kind !== 'value') {
+    return undefined;
+  }
+  return isApiReviewConfigProblemCode(read.value) ? read.value : undefined;
 }
 
 /**

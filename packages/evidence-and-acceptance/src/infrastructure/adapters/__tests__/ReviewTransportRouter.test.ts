@@ -754,5 +754,35 @@ describe('ReviewTransportRouter', () => {
       expect(apiReviewConfigProblemCodeOf(null)).toBeUndefined();
       expect(apiReviewConfigProblemCodeOf(undefined)).toBeUndefined();
     });
+
+    describe('apiReviewConfigProblemCodeOf safety', () => {
+      it('returns undefined and does not throw for a thrown object whose configProblemCode is a getter that throws a credential-shaped message', () => {
+        const error = {
+          get configProblemCode() {
+            throw new Error('synthetic-not-a-real-key');
+          },
+        };
+        expect(() => apiReviewConfigProblemCodeOf(error)).not.toThrow();
+        expect(apiReviewConfigProblemCodeOf(error)).toBeUndefined();
+      });
+
+      it('returns undefined and does not throw for a Proxy whose getOwnPropertyDescriptor trap throws', () => {
+        const error = new Proxy(
+          { configProblemCode: 'schema-not-allowed' },
+          {
+            getOwnPropertyDescriptor() {
+              throw new Error('trap');
+            },
+          },
+        );
+        expect(() => apiReviewConfigProblemCodeOf(error)).not.toThrow();
+        expect(apiReviewConfigProblemCodeOf(error)).toBeUndefined();
+      });
+
+      it('returns the code for a real ReviewTransportError carrying a valid code', () => {
+        const error = new ApiReviewConfigProblemError('base-url-not-a-url', 'reviewer-api');
+        expect(apiReviewConfigProblemCodeOf(error)).toBe('base-url-not-a-url');
+      });
+    });
   });
 });

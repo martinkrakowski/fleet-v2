@@ -106,6 +106,9 @@ export function createSdkApiReviewGenerate(options: SdkApiReviewGenerateOptions)
 
     return {
       object: generated.object,
+      // This call declares no tools and spawns no process, so nothing it did
+      // could have written. The transport reports read-only only on this.
+      readOnly: true,
       warnings,
       usage: {
         ...(typeof generated.usage?.inputTokens === 'number' ? { inputTokens: generated.usage.inputTokens } : {}),

@@ -126,6 +126,15 @@ export interface ApiReviewGenerateResult {
    * being misclassified as an unreachable endpoint (pre-merge finding 5).
    */
   readonly noObject?: boolean;
+  /**
+   * The call declared no tools and ran no process, so nothing could have
+   * written. Only the caller that MADE the call can say this, which is why it
+   * is reported here rather than assumed by the transport: `generate` is an
+   * injected function and the transport cannot see what it does. Absent or
+   * false means the transport reports `readOnlyVerified: false` (round 2,
+   * finding 6).
+   */
+  readonly readOnly?: boolean;
 }
 
 export interface ApiReviewTransportOptions {
@@ -266,7 +275,10 @@ function decodeFinding(raw: unknown, index: number): ReviewFindingRecord | 'inva
   if (severityRead.kind !== 'value' || summaryRead.kind !== 'value') {
     return 'invalid';
   }
-  if (pathRead.kind === 'unreadable' || lineRead.kind === 'unreadable') {
+  // The schema marks filePath and line REQUIRED (they may be null, but they may
+  // not be absent). Round 2 found them defaulted to null when missing, which
+  // accepted a finding the declared schema excludes.
+  if (pathRead.kind !== 'value' || lineRead.kind !== 'value') {
     return 'invalid';
   }
 
@@ -278,11 +290,11 @@ function decodeFinding(raw: unknown, index: number): ReviewFindingRecord | 'inva
   if (typeof summary !== 'string' || summary.trim() === '') {
     return 'invalid';
   }
-  const decodedPath = readPath(pathRead.kind === 'value' ? pathRead.value : null);
+  const decodedPath = readPath(pathRead.value);
   if (decodedPath === 'invalid') {
     return 'invalid';
   }
-  const decodedLine = readLine(lineRead.kind === 'value' ? lineRead.value : null);
+  const decodedLine = readLine(lineRead.value);
   if (decodedLine === 'invalid') {
     return 'invalid';
   }
@@ -384,19 +396,29 @@ function decodeChecked(object: unknown): ApiParsedVerdict {
 
 /** The reason codes a provider failure maps onto; all are existing review codes. */
 function classifyProviderFailure(error: unknown): { readonly reason: string; readonly code: 'timeout' | 'seat-busy' | 'transport-failed' | 'transport' } {
-  if (typeof error === 'object' && error !== null) {
-    const record = error as { readonly name?: unknown; readonly statusCode?: unknown };
-    if (record.name === 'AbortError' || record.name === 'TimeoutError') {
-      return { reason: 'the review call exceeded its time limit', code: 'timeout' };
-    }
-    const status = typeof record.statusCode === 'number' ? record.statusCode : undefined;
-    if (status === 429) {
-      return { reason: 'the reviewer seat is rate limited', code: 'seat-busy' };
-    }
-    if (status === 402 || status === 401 || status === 403) {
-      // The class only: a provider message may carry a key prefix or an account id.
-      return { reason: 'the reviewer endpoint refused the request', code: 'transport-failed' };
-    }
+  // Round 2: these fields were read directly, so a provider-controlled getter
+  // could run and throw, escaping the catch with the original error and its
+  // text. Both reads now go through the descriptor helper, which cannot run a
+  // getter, and an own `name`/`statusCode` that IS accessor-backed is simply
+  // not classified rather than trusted.
+  if (typeof error !== 'object' || error === null) {
+    return { reason: 'the reviewer endpoint could not be reached', code: 'transport' };
+  }
+
+  const nameRead = readOwn(error, 'name');
+  const name = nameRead.kind === 'value' ? nameRead.value : undefined;
+  if (name === 'AbortError' || name === 'TimeoutError') {
+    return { reason: 'the review call exceeded its time limit', code: 'timeout' };
+  }
+
+  const statusRead = readOwn(error, 'statusCode');
+  const status = statusRead.kind === 'value' && typeof statusRead.value === 'number' ? statusRead.value : undefined;
+  if (status === 429) {
+    return { reason: 'the reviewer seat is rate limited', code: 'seat-busy' };
+  }
+  if (status === 402 || status === 401 || status === 403) {
+    // The class only: a provider message may carry a key prefix or an account id.
+    return { reason: 'the reviewer endpoint refused the request', code: 'transport-failed' };
   }
   return { reason: 'the reviewer endpoint could not be reached', code: 'transport' };
 }
@@ -422,9 +444,10 @@ function buildPrompt(request: RunIndependentReviewRequest, diff: string, nonce: 
 /**
  * One single-turn, read-only, schema-checked review.
  *
- * `readOnlyVerified` is structurally true here and needs no inspection: the
- * call declares no tools and runs no command, so there is nothing that could
- * have written. That is a property of the transport, not a claim from the model.
+ * `readOnlyVerified` is reported by the provider call, not assumed here. The
+ * SDK binding declares no tools and runs no process, so it reports true; an
+ * injected call that does not say so yields false. The transport cannot inspect
+ * an arbitrary function, so it does not claim to (round 2, finding 6).
  */
 export function createApiReviewTransport(
   options: ApiReviewTransportOptions,
@@ -534,7 +557,8 @@ export function createApiReviewTransport(
 
     return {
       rawOutput: rawOutput.slice(0, MAX_RAW_OUTPUT_LENGTH),
-      readOnlyVerified: true,
+      // Reported by the provider call, never assumed: see `readOnly` above.
+      readOnlyVerified: answer.readOnly === true,
       result: parsed.result,
       findings: parsed.findings,
       completedAtIso: new Date().toISOString(),

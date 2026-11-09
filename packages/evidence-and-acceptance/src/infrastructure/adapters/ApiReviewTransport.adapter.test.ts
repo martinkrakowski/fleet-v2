@@ -38,8 +38,9 @@ const request = {
   reviewerModel: 'openai/gpt-6-luna',
 };
 
+/** Stands in for the SDK binding, which reports that it declared no tools. */
 function answers(object: unknown): ApiReviewGenerate {
-  return async (): Promise<ApiReviewGenerateResult> => ({ object });
+  return async (): Promise<ApiReviewGenerateResult> => ({ object, readOnly: true });
 }
 
 describe('decodeApiVerdict: a malformed verdict is unknown with a reason, never a pass', () => {
@@ -458,5 +459,60 @@ describe('review round 1: the defects both reviewers found', () => {
       result: 'fail',
       findings: [{ severity: 'major', summary: 'real finding', filePath: 'a.ts', line: 3 }],
     });
+  });
+});
+
+describe('review round 2: the remaining findings', () => {
+  it('a throwing getter on the provider error cannot escape the classification', async () => {
+    const hostile = {};
+    Object.defineProperty(hostile, 'statusCode', {
+      enumerable: true,
+      get(): never {
+        throw new Error('sk-leaked-from-a-getter');
+      },
+    });
+    const run = transport(async () => {
+      throw hostile;
+    });
+    // It must be a typed transport error with a fixed reason, not the hostile one.
+    await expect(run(request)).rejects.toThrow(/^the reviewer endpoint could not be reached$/);
+  });
+
+  it('an accessor-backed name is not trusted as a timeout', async () => {
+    const hostile = {};
+    Object.defineProperty(hostile, 'name', { enumerable: true, get: () => 'AbortError' });
+    const run = transport(async () => {
+      throw hostile;
+    });
+    await expect(run(request)).rejects.toThrow(/could not be reached/);
+  });
+
+  it('a finding missing filePath or line is rejected: the schema requires them', () => {
+    expect(decodeApiVerdict({ result: 'fail', findings: [{ severity: 'major', summary: 'x', line: 1 }] })).toMatchObject({
+      result: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+    expect(
+      decodeApiVerdict({ result: 'fail', findings: [{ severity: 'major', summary: 'x', filePath: 'a.ts' }] }),
+    ).toMatchObject({ result: 'unknown', unknownReason: 'unparseable-verdict' });
+  });
+
+  it('an explicit null filePath and line are still accepted', () => {
+    expect(
+      decodeApiVerdict({ result: 'fail', findings: [{ severity: 'major', summary: 'x', filePath: null, line: null }] }),
+    ).toMatchObject({ result: 'fail' });
+  });
+
+  it('read-only is reported by the call, not assumed of an arbitrary callback', async () => {
+    const silent = createApiReviewTransport({
+      baseURL: 'http://10.0.0.1:4176/inception/v1',
+      model: 'mercury-3',
+      schemaEnforcement: 'native-json-schema',
+      location: location(),
+      makeNonce: () => '0123456789abcdef',
+      // A callback that does not say it was read-only: the transport must not claim it.
+      generate: async () => ({ object: { result: 'pass', findings: [] } }),
+    });
+    await expect(silent(request)).resolves.toMatchObject({ result: 'pass', readOnlyVerified: false });
   });
 });

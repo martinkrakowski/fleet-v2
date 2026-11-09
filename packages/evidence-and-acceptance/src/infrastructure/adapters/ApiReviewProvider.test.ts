@@ -5,7 +5,9 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { APICallError, RetryError } from 'ai';
+import { APICallError, RetryError, generateObject, jsonSchema } from 'ai';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+import { findStatusCode } from './ApiReviewTransport.adapter.js';
 
 type OwnKind = 'absent' | 'accessor' | 'data';
 
@@ -100,5 +102,57 @@ describe('the installed ai package still wraps a retried 429 as findStatusCode e
       const narrowed = last as APICallError;
       expect(narrowed.statusCode).toBe(429);
     });
+  });
+});
+
+describe('end-to-end retry path surfaces a 429 through findStatusCode', () => {
+  it('when the provider always returns 429, the library retries and throws an error where findStatusCode finds 429', async () => {
+    let fetchCallCount = 0;
+
+    const stubFetch = async (): Promise<Response> => {
+      fetchCallCount += 1;
+      return new Response(
+        JSON.stringify({ error: { message: 'rate limited', type: 'rate_limit_error' } }),
+        {
+          status: 429,
+          headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
+        },
+      );
+    };
+
+    const provider = createOpenAICompatible({
+      name: 'test-provider',
+      baseURL: 'http://127.0.0.1:4176',
+      apiKey: 'test-key',
+      fetch: stubFetch,
+    });
+
+    const schema = jsonSchema({
+      type: 'object',
+      additionalProperties: false,
+      required: ['result'],
+      properties: { result: { type: 'string', enum: ['pass', 'fail'] } },
+    });
+
+    let caughtError: unknown;
+    try {
+      await generateObject({
+        model: provider.chatModel('test-model'),
+        schema,
+        schemaName: 'test_schema',
+        system: 'test system',
+        prompt: 'test prompt',
+        maxRetries: 2,
+      });
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeDefined();
+    // findStatusCode is the exact walk the transport uses; it must reach 429
+    const status = findStatusCode(caughtError, 0);
+    expect(status).toBe(429);
+    // Called more than once proves the retry path ran (default would be 3 total for maxRetries=2)
+    expect(fetchCallCount).toBeGreaterThan(1);
   });
 });

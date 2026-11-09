@@ -418,8 +418,11 @@ function decodeChecked(object: unknown): ApiParsedVerdict {
  * classified every surfaced 429 as "could not be reached", which defeated the
  * stated reason for using a library at all. This walks the chain, by descriptor
  * only, to a bounded depth.
+ *
+ * Exported so the end-to-end retry test can assert the same walk the transport
+ * makes, ensuring a library upgrade that changes the wrapper shape is caught.
  */
-function findStatusCode(error: unknown, depth: number): number | undefined {
+export function findStatusCode(error: unknown, depth: number): number | undefined {
   if (depth > 4 || typeof error !== 'object' || error === null) {
     return undefined;
   }

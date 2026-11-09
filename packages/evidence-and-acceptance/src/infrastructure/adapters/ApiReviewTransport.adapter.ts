@@ -30,7 +30,7 @@
  * the brief are wrapped with the same rules the other transports use.
  */
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewFindingRecord, ReviewUnknownReason } from '../../domain/evidence-records.js';
@@ -407,6 +407,55 @@ function decodeChecked(object: unknown): ApiParsedVerdict {
 }
 
 /** The reason codes a provider failure maps onto; all are existing review codes. */
+
+/**
+ * Scan an error list for a status code, walking each element from last to first.
+ * Module-private helper extracted to reduce the cognitive complexity of
+ * {@link findStatusCode}.
+ *
+ * @param list - The value read from an `errors` property (may be anything).
+ * @param depth - Current recursion depth; `depth > 4` stops the walk.
+ * @returns The first status code found, or `undefined` if none is reachable.
+ */
+/**
+ * Whether an `errors` value is an array longer than the scan bound. Only this
+ * case stops the whole walk: before the scan was lifted into
+ * {@link findStatusCodeInErrorList}, an oversized list returned from
+ * {@link findStatusCode} itself and so skipped the `cause` branch. A non-array,
+ * or a hostile `length` that throws, did NOT stop it and still does not.
+ */
+function errorListIsOversized(list: unknown): boolean {
+  try {
+    return Array.isArray(list) && !(Number.isSafeInteger(list.length) && list.length <= 16);
+  } catch {
+    return false;
+  }
+}
+
+function findStatusCodeInErrorList(list: unknown, depth: number): number | undefined {
+  let length = 0;
+  try {
+    length = Array.isArray(list) ? list.length : 0;
+  } catch {
+    length = 0;
+  }
+  if (!Number.isSafeInteger(length) || length > 16) {
+    return undefined;
+  }
+  // Last first: the most recent attempt is the one that surfaced.
+  for (let index = length - 1; index >= 0; index -= 1) {
+    const element = readOwn(list as unknown as object, String(index));
+    if (element.kind !== 'value') {
+      continue;
+    }
+    const found = findStatusCode(element.value, depth + 1);
+    if (found !== undefined) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
 /**
  * The HTTP status behind a provider failure, following the library's retry
  * wrapper.
@@ -418,8 +467,11 @@ function decodeChecked(object: unknown): ApiParsedVerdict {
  * classified every surfaced 429 as "could not be reached", which defeated the
  * stated reason for using a library at all. This walks the chain, by descriptor
  * only, to a bounded depth.
+ *
+ * Exported so the end-to-end retry test can assert the same walk the transport
+ * makes, ensuring a library upgrade that changes the wrapper shape is caught.
  */
-function findStatusCode(error: unknown, depth: number): number | undefined {
+export function findStatusCode(error: unknown, depth: number): number | undefined {
   if (depth > 4 || typeof error !== 'object' || error === null) {
     return undefined;
   }
@@ -439,26 +491,12 @@ function findStatusCode(error: unknown, depth: number): number | undefined {
 
   const nested = readOwn(error, 'errors');
   if (nested.kind === 'value') {
-    const list = nested.value;
-    let length = 0;
-    try {
-      length = Array.isArray(list) ? list.length : 0;
-    } catch {
-      length = 0;
-    }
-    if (!Number.isSafeInteger(length) || length > 16) {
+    if (errorListIsOversized(nested.value)) {
       return undefined;
     }
-    // Last first: the most recent attempt is the one that surfaced.
-    for (let index = length - 1; index >= 0; index -= 1) {
-      const element = readOwn(list as unknown as object, String(index));
-      if (element.kind !== 'value') {
-        continue;
-      }
-      const found = findStatusCode(element.value, depth + 1);
-      if (found !== undefined) {
-        return found;
-      }
+    const found = findStatusCodeInErrorList(nested.value, depth);
+    if (found !== undefined) {
+      return found;
     }
   }
 
@@ -496,21 +534,31 @@ function classifyProviderFailure(error: unknown): { readonly reason: string; rea
   return { reason: 'the reviewer endpoint could not be reached', code: 'transport' };
 }
 
+/**
+ * Diff first, instructions last.
+ *
+ * Prompt caching covers a stable PREFIX. The diff is the one part two reviews
+ * of the same head share, so it leads; the brief, the metadata and the
+ * instruction text trail it (ADR-0002, action 1). Only the order changed: the
+ * same sections are emitted, with the same `wrapUntrusted` calls and the same
+ * caller-supplied nonce. The brief rule stays immediately above the brief block
+ * because it says "below".
+ */
 function buildPrompt(request: RunIndependentReviewRequest, diff: string, nonce: string): string {
-  const sections: string[] = [
+  const sections: string[] = [wrapUntrusted({ label: 'diff', text: diff, nonce })];
+  if (request.briefText !== undefined && request.briefText.trim() !== '') {
+    sections.push(BRIEF_INPUT_RULE, wrapUntrusted({ label: 'brief', text: request.briefText, nonce }));
+  }
+  sections.push(
     `Implementer model: ${request.implementerModel}`,
     `Head under review: ${request.candidateHeadSha}`,
-  ];
+  );
   if (request.kind !== undefined) {
     sections.push(`Review kind: ${request.kind}`);
   }
   if (request.diffSummary !== undefined && request.diffSummary.trim() !== '') {
     sections.push(`Scope: ${request.diffSummary.trim()}`);
   }
-  if (request.briefText !== undefined && request.briefText.trim() !== '') {
-    sections.push(BRIEF_INPUT_RULE, wrapUntrusted({ label: 'brief', text: request.briefText, nonce }));
-  }
-  sections.push(wrapUntrusted({ label: 'diff', text: diff, nonce }));
   return sections.join('\n\n');
 }
 
@@ -575,8 +623,19 @@ export function createApiReviewTransport(
       throw new ReviewTransportError('The brief is larger than this transport forwards', 'transport-failed');
     }
 
-    const makeNonce = options.makeNonce ?? ((): string => randomBytes(16).toString('hex'));
-    const nonce = makeNonce();
+    // Default nonce is derived from the head under review so two reviews of the same
+    // head produce byte-identical prompts up to the diff's closing marker. The
+    // nonce's only job is that untrusted text cannot forge the fence; the untrusted
+    // text here is content committed before its own sha existed, so writing the
+    // fence into it needs a preimage of that sha; and `defangMarkerLikeTokens`
+    // already rewrites `<<<` inside the text, making the nonce the second fence.
+    const makeNonce = options.makeNonce ?? ((headSha: string): string => {
+      if (headSha === '') {
+        return randomBytes(16).toString('hex');
+      }
+      return createHash('sha256').update('fleet-review-nonce:').update(headSha).digest('hex').slice(0, 32);
+    });
+    const nonce = makeNonce(request.candidateHeadSha);
     const timeoutMs = options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     let answer: ApiReviewGenerateResult;
     try {

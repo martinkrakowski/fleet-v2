@@ -114,7 +114,9 @@ export function composeEvidence(input: ComposeEvidenceInput) {
         // Environmental like FLEET_OCM_RUN_BIN: it names the host-side key
         // proxy, not routing. Absent leaves an `api` seat refusing, which is
         // what it should do when nothing is configured.
-        ...resolveApiReviewSettings(process.env),
+        // The runtime's own env object, which tests inject; the sibling
+        // resolveRunnerSettings call honours it the same way.
+        ...resolveApiReviewSettings(options?.env ?? process.env),
         ...(options?.reviewSpawn !== undefined ? { ocmSpawn: options.reviewSpawn } : {}),
       }),
     });

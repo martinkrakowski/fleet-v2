@@ -61,6 +61,14 @@ runner environment allowlist to smuggle a setting through.
 - `FLEET_OCM_RUN_BIN` — override for the runner binary path. The repository
   bundles `bin/ocm-run` and `ExecutionRunnerAdapter` resolves it automatically;
   the override exists only for unusual installations.
+- `FLEET_REVIEW_API_BASE_URL`, `FLEET_REVIEW_API_SCHEMA` — the `api` review transport's
+  endpoint and the response format that endpoint is declared to honour
+  (`native-json-schema` or `json-object`). The endpoint is the host-side key proxy, which adds the
+  provider key on egress, so no credential belongs in the URL and one embedded there is refused.
+  Both are required together: an endpoint without a declared enforcement is refused, because the
+  half that goes missing is the declaration. A set-but-invalid value is reported in the seat's
+  refusal rather than treated as absent.
+
 - `FLEET_API_URL` — the server-side base URL for `@fleet/api`. The web client
   prefers it, falls back to `NEXT_PUBLIC_FLEET_API_URL`, and falls back again to
   the fixture set when neither is configured.

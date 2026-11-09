@@ -4,7 +4,11 @@ import {
   API_REVIEW_BASE_URL_VAR,
   API_REVIEW_SCHEMA_VAR,
   resolveApiReviewSettings,
+  API_REVIEW_CONFIG_PROBLEM_CODES,
+  describeApiReviewConfigProblem,
+  isApiReviewConfigProblemCode,
 } from './ApiReviewSettings.js';
+import { API_SCHEMA_ENFORCEMENTS } from './ApiReviewTransport.adapter.js';
 
 const URL_OK = 'http://10.60.0.1:4176/inception/v1';
 
@@ -121,5 +125,42 @@ describe('resolveApiReviewSettings', () => {
       }),
     );
     expect(resolved).toEqual({ apiBaseURL: URL_OK, apiSchemaEnforcement: 'json-object' });
+  });
+
+  it('every problem carries a typed code whose fixed text is the problem', () => {
+    const cases: Record<string, string | undefined>[] = [
+      { [API_REVIEW_BASE_URL_VAR]: 'not a url', [API_REVIEW_SCHEMA_VAR]: 'json-object' },
+      { [API_REVIEW_BASE_URL_VAR]: 'ftp://host/v1', [API_REVIEW_SCHEMA_VAR]: 'json-object' },
+      { [API_REVIEW_BASE_URL_VAR]: 'http://user:secret@10.0.0.1/v1', [API_REVIEW_SCHEMA_VAR]: 'json-object' },
+      { [API_REVIEW_BASE_URL_VAR]: URL_OK, [API_REVIEW_SCHEMA_VAR]: 'tool' },
+      { [API_REVIEW_BASE_URL_VAR]: URL_OK },
+      { [API_REVIEW_SCHEMA_VAR]: 'json-object' },
+    ];
+    const seen = new Set<string>();
+    for (const values of cases) {
+      const resolved = resolveApiReviewSettings(env(values));
+      expect(resolved.problemCode).toBeDefined();
+      expect(isApiReviewConfigProblemCode(resolved.problemCode)).toBe(true);
+      expect(resolved.problem).toBe(describeApiReviewConfigProblem(resolved.problemCode!));
+      seen.add(resolved.problemCode!);
+    }
+    expect(seen.size).toBe(API_REVIEW_CONFIG_PROBLEM_CODES.length);
+  });
+
+  it('no code text names anything but the two variables and the allowed values', () => {
+    for (const code of API_REVIEW_CONFIG_PROBLEM_CODES) {
+      const text = describeApiReviewConfigProblem(code);
+      // Exact expected texts, composed only of the two variable names and the
+      // compile-time allowed enforcement values.
+      const expected: Record<string, string> = {
+        'base-url-not-a-url': `${API_REVIEW_BASE_URL_VAR} is not a URL`,
+        'base-url-not-http': `${API_REVIEW_BASE_URL_VAR} must be http or https`,
+        'base-url-embeds-credentials': `${API_REVIEW_BASE_URL_VAR} must not embed credentials`,
+        'schema-not-allowed': `${API_REVIEW_SCHEMA_VAR} must be one of ${API_SCHEMA_ENFORCEMENTS.join(', ')}`,
+        'base-url-without-schema': `${API_REVIEW_BASE_URL_VAR} is set without ${API_REVIEW_SCHEMA_VAR}`,
+        'schema-without-base-url': `${API_REVIEW_SCHEMA_VAR} is set without ${API_REVIEW_BASE_URL_VAR}`,
+      };
+      expect(text).toBe(expected[code]);
+    }
   });
 });

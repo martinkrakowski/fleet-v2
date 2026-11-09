@@ -28,6 +28,7 @@ import {
 import {
   assessmentIdForAttempt,
   createReviewTransportRouter,
+  resolveApiReviewSettings,
   hasReviewerSeat,
   type IndependentReviewTransportResult,
   type OcmReviewTransportSpawn,
@@ -331,6 +332,11 @@ function buildReviewTransport(
     chains,
     locate: (attemptId) => locator.locate(attemptId),
     ocmRunBin: settings.ocmRunBin ?? defaultOcmRunPath(),
+    // The api transport's endpoint and its declared schema enforcement.
+    // Environmental like FLEET_OCM_RUN_BIN: it names the host-side key proxy,
+    // not routing. Absent leaves an `api` seat refusing, which is what it
+    // should do when nothing is configured.
+    ...resolveApiReviewSettings(process.env),
     ...(reviewSpawn !== undefined ? { ocmSpawn: reviewSpawn } : {}),
   });
   // The locator and the transports can fail with messages that name the attempt's recorded host,

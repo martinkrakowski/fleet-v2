@@ -417,6 +417,21 @@ function decodeChecked(object: unknown): ApiParsedVerdict {
  * @param depth - Current recursion depth; `depth > 4` stops the walk.
  * @returns The first status code found, or `undefined` if none is reachable.
  */
+/**
+ * Whether an `errors` value is an array longer than the scan bound. Only this
+ * case stops the whole walk: before the scan was lifted into
+ * {@link findStatusCodeInErrorList}, an oversized list returned from
+ * {@link findStatusCode} itself and so skipped the `cause` branch. A non-array,
+ * or a hostile `length` that throws, did NOT stop it and still does not.
+ */
+function errorListIsOversized(list: unknown): boolean {
+  try {
+    return Array.isArray(list) && !(Number.isSafeInteger(list.length) && list.length <= 16);
+  } catch {
+    return false;
+  }
+}
+
 function findStatusCodeInErrorList(list: unknown, depth: number): number | undefined {
   let length = 0;
   try {
@@ -476,6 +491,9 @@ export function findStatusCode(error: unknown, depth: number): number | undefine
 
   const nested = readOwn(error, 'errors');
   if (nested.kind === 'value') {
+    if (errorListIsOversized(nested.value)) {
+      return undefined;
+    }
     const found = findStatusCodeInErrorList(nested.value, depth);
     if (found !== undefined) {
       return found;

@@ -156,3 +156,39 @@ describe('end-to-end retry path surfaces a 429 through findStatusCode', () => {
     expect(fetchCallCount).toBeGreaterThan(1);
   });
 });
+
+describe('the oversized-error-list bound stops the walk, and nothing else does', () => {
+  it('returns undefined for an errors array longer than the bound, without reading cause', () => {
+    const wrapper = {
+      errors: Array.from({ length: 17 }, () => ({})),
+      cause: { statusCode: 503 },
+    };
+    expect(findStatusCode(wrapper, 0)).toBeUndefined();
+  });
+
+  it('still reaches cause when the errors array is within the bound', () => {
+    const wrapper = { errors: [{}, {}], cause: { statusCode: 503 } };
+    expect(findStatusCode(wrapper, 0)).toBe(503);
+  });
+
+  it('still reaches cause when errors is not an array at all', () => {
+    const wrapper = { errors: 'not a list', cause: { statusCode: 503 } };
+    expect(findStatusCode(wrapper, 0)).toBe(503);
+  });
+
+  it('still reaches cause when reading the errors length throws', () => {
+    // An array's own `length` is non-configurable, so it cannot be redefined as a
+    // throwing accessor. The reachable hostile shape is a Proxy over an array:
+    // `Array.isArray` is true for it, and its get trap can throw.
+    const hostileList = new Proxy([] as unknown[], {
+      get(target, key, receiver): unknown {
+        if (key === 'length') {
+          throw new Error('synthetic-not-a-real-key');
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const wrapper = { errors: hostileList, cause: { statusCode: 503 } };
+    expect(findStatusCode(wrapper, 0)).toBe(503);
+  });
+});

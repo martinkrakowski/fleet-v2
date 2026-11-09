@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname = resolve(__filename, '..');
 
 /**
  * Tests that importing the package root does not load the provider SDK.
@@ -16,7 +16,8 @@ const __dirname = dirname(__filename);
  * This test uses static analysis of the built output: it walks the dependency
  * graph from `dist/index.js` through relative imports and asserts that no
  * reachable file carries a top-level `import … from 'ai'` or
- * `import … from '@ai-sdk/openai-compatible'`.
+ * `import … from '@ai-sdk/openai-compatible'`, including side-effect imports
+ * like `import 'ai';`.
  */
 
 // A simple cache to avoid re-reading files during the walk
@@ -33,7 +34,8 @@ function readFileCached(filePath: string): string {
 
 /**
  * Extracts top-level import specifiers from a JavaScript/TypeScript file.
- * Only matches static `import ... from 'specifier'` or `export * from 'specifier'` at the top level.
+ * Matches static `import ... from 'specifier'`, `import 'specifier'`,
+ * and `export * from 'specifier'` at the top level.
  */
 function extractTopLevelImports(content: string): string[] {
   const imports: string[] = [];
@@ -43,6 +45,13 @@ function extractTopLevelImports(content: string): string[] {
     // Match `import ... from 'specifier'` or `import ... from "specifier"`
     if (trimmed.startsWith('import ') && trimmed.includes(" from ")) {
       const match = trimmed.match(/import\s+.*\s+from\s+['"]([^'"]+)['"]/);
+      if (match) {
+        imports.push(match[1]);
+      }
+    }
+    // Match side-effect import `import 'specifier'` or `import "specifier"`
+    if (trimmed.startsWith('import ') && !trimmed.includes(" from ")) {
+      const match = trimmed.match(/import\s+['"]([^'"]+)['"]/);
       if (match) {
         imports.push(match[1]);
       }
@@ -141,8 +150,31 @@ describe('Package root import: lazy SDK import (static analysis)', () => {
     // No reachable file should import '@ai-sdk/openai-compatible' at top level
     expect(forbiddenImports.filter((i) => i.specifier === '@ai-sdk/openai-compatible')).toEqual([]);
   });
-});
 
-function dirname(path: string): string {
-  return resolve(path, '..');
-}
+  it('scanner catches side-effect imports of forbidden modules', () => {
+    // This test verifies that the scanner detects bare side-effect imports
+    // like `import 'ai';` or `import '@ai-sdk/openai-compatible';`.
+    const testContent = `
+// Side-effect imports that would load the SDK at package-root import time
+import 'ai';
+import '@ai-sdk/openai-compatible';
+
+// Regular imports (also forbidden at top level in reachable files)
+import { generateObject } from 'ai';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+
+// Export re-exports
+export * from 'ai';
+export * from '@ai-sdk/openai-compatible';
+`;
+
+    const imports = extractTopLevelImports(testContent);
+
+    // Should catch all six forbidden specifiers (side-effect, named, re-export)
+    expect(imports).toContain('ai');
+    expect(imports).toContain('@ai-sdk/openai-compatible');
+    // Three 'ai' and three '@ai-sdk/openai-compatible' imports detected
+    expect(imports.filter((s) => s === 'ai')).toHaveLength(3);
+    expect(imports.filter((s) => s === '@ai-sdk/openai-compatible')).toHaveLength(3);
+  });
+});

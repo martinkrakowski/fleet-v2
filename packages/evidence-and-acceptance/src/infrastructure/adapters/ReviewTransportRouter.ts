@@ -15,6 +15,9 @@ import type { ReviewUnavailableCode, RunIndependentReviewRequest } from '../../a
 import { CLI_REVIEW_ARGV_TEMPLATES, createCliReviewTransport } from './CliReviewTransport.adapter.js';
 import type { CliReviewSpawn } from './CliReviewTransport.adapter.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
+import { createSdkApiReviewGenerate } from './ApiReviewProvider.js';
+import { createApiReviewTransport } from './ApiReviewTransport.adapter.js';
+import type { ApiReviewGenerate, ApiSchemaEnforcement } from './ApiReviewTransport.adapter.js';
 import { createOcmReviewTransport, ReviewTransportError } from './OcmReviewTransport.adapter.js';
 import type { OcmReviewTransportSpawn } from './OcmReviewTransport.adapter.js';
 
@@ -143,6 +146,33 @@ export interface ReviewTransportRouterOptions {
   readonly makeNonce?: () => string;
   readonly cliSpawn?: CliReviewSpawn;
   readonly makeScratchDir?: () => Promise<string>;
+  /**
+   * The `api` transport's endpoint: the host-side key proxy's base URL, which
+   * adds the provider key on egress so no credential reaches this process.
+   * Absent means the installation has no api reviewer configured, and an `api`
+   * seat is then refused rather than attempted.
+   */
+  readonly apiBaseURL?: string;
+  /**
+   * How the endpoint behind the proxy constrains the answer, declared by the
+   * operator per installation. The router does NOT infer it: an `api` seat
+   * without it is refused, because a json-mode endpoint would otherwise look
+   * schema-enforcing (ADR-0001, requirement 6).
+   */
+  readonly apiSchemaEnforcement?: ApiSchemaEnforcement;
+  /**
+   * Why a set api configuration variable was not accepted, from
+   * `resolveApiReviewSettings`. It travels into the refusal so an operator typo
+   * surfaces as a typo instead of looking like "not configured".
+   */
+  readonly apiConfigProblem?: string;
+  /**
+   * Test seam only. Absent binds the provider library through
+   * `createSdkApiReviewGenerate`, which is what `runApi` now does: an earlier
+   * version of this comment claimed that and the code did not do it, so an
+   * `api` seat refused with `transport-missing` instead of calling anything.
+   */
+  readonly apiGenerate?: ApiReviewGenerate;
 }
 
 export const DEFAULT_REVIEW_AGENT = 'reviewer';
@@ -172,6 +202,8 @@ export function createReviewTransportRouter(
     switch (seat.tool) {
       case 'opencode':
         return runOpencode(options, seat, location, request);
+      case 'api':
+        return runApi(options, seat, location, request);
       default:
         throw new ReviewTransportError(
           `Reviewer seat '${seat.id}' uses tool '${seat.tool}', which has no review transport`,
@@ -179,6 +211,64 @@ export function createReviewTransportRouter(
         );
     }
   };
+}
+
+/**
+ * The `api` transport: one single-turn, read-only, schema-checked call to the
+ * key proxy. A variant is meaningless for it (there is no agent and no server
+ * profile to select), so a seat that sets one is refused rather than silently
+ * ignored.
+ */
+function runApi(
+  options: ReviewTransportRouterOptions,
+  seat: ReviewTransportSeat,
+  location: ReviewLocation,
+  request: RunIndependentReviewRequest,
+): Promise<IndependentReviewTransportResult> {
+  if (seat.variant !== undefined) {
+    throw new ReviewTransportError(
+      `Reviewer seat '${seat.id}' sets a variant, which the api review transport does not support`,
+      'seat-variant-unsupported',
+    );
+  }
+  if (options.apiConfigProblem !== undefined) {
+    // A set-but-rejected variable is an operator error, not an absent one.
+    throw new ReviewTransportError(
+      `Reviewer seat '${seat.id}' uses the api transport and its configuration was refused: ${options.apiConfigProblem}`,
+      'transport-missing',
+    );
+  }
+  if (options.apiBaseURL === undefined || options.apiBaseURL.trim() === '') {
+    throw new ReviewTransportError(
+      `Reviewer seat '${seat.id}' uses the api transport, which has no endpoint configured`,
+      'transport-missing',
+    );
+  }
+  if (options.apiSchemaEnforcement === undefined) {
+    throw new ReviewTransportError(
+      `Reviewer seat '${seat.id}' uses the api transport with no declared schema enforcement`,
+      'transport-missing',
+    );
+  }
+
+  const generate =
+    options.apiGenerate ??
+    createSdkApiReviewGenerate({
+      baseURL: options.apiBaseURL,
+      model: seat.model,
+      schemaEnforcement: options.apiSchemaEnforcement,
+    });
+
+  const transport = createApiReviewTransport({
+    baseURL: options.apiBaseURL,
+    model: seat.model,
+    schemaEnforcement: options.apiSchemaEnforcement,
+    location,
+    generate,
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    ...(options.makeNonce !== undefined ? { makeNonce: options.makeNonce } : {}),
+  });
+  return transport(request);
 }
 
 function runCli(

@@ -506,7 +506,7 @@ function classifyProviderFailure(error: unknown): { readonly reason: string; rea
  * caller-supplied nonce. The brief rule stays immediately above the brief block
  * because it says "below".
  */
-function buildPrompt(request: RunIndependentReviewRequest, diff: string, nonce: string, _headSha: string): string {
+function buildPrompt(request: RunIndependentReviewRequest, diff: string, nonce: string): string {
   const sections: string[] = [wrapUntrusted({ label: 'diff', text: diff, nonce })];
   if (request.briefText !== undefined && request.briefText.trim() !== '') {
     sections.push(BRIEF_INPUT_RULE, wrapUntrusted({ label: 'brief', text: request.briefText, nonce }));
@@ -603,7 +603,7 @@ export function createApiReviewTransport(
     try {
       answer = await options.generate({
         system: SYSTEM_PROMPT,
-        prompt: buildPrompt(request, diff, nonce, request.candidateHeadSha),
+        prompt: buildPrompt(request, diff, nonce),
         abortSignal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {

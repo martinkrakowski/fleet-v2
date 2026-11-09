@@ -427,7 +427,7 @@ describe('OcmReviewTransport', () => {
     expect(result.rawOutput).toBe('stream-incomplete');
   });
 
-  it('a plain-text answer (no stream events, another transport) still parses: the finish gate is stream-only', () => {
+  it('the strict parser accepts a json block in a plain answer, with no stream events (this exercises the parser, NOT the transport finish gate)', () => {
     const plain = ['Reviewed the diff.', '```json', '{"verdict":"PASS","findings":[]}', '```'].join('\n');
     expect(parseReviewReplyStrict(plain).result).toBe('pass');
   });

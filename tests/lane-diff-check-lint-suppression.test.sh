@@ -121,4 +121,24 @@ printf '%s' "$out" | grep -q 'secret-pattern.*openai-style-key'; check $? "an ex
 # grep matches it inside the secret-pattern line and the assertion never means anything.
 printf '%s' "$out" | grep -q '^lint-suppression:'; [ $? -ne 0 ]; check $? "and still not for lint suppressions"
 
+# 13. A SCOPED rule name. The repository's own rules are scoped
+# (@typescript-eslint/no-explicit-any), so a rule-name class without @ and / misses exactly the
+# rules a lane would want to switch off.
+for form in \
+  '/* eslint @typescript-eslint/no-explicit-any: off */' \
+  '/* eslint @typescript-eslint/no-unused-vars: 0 */' \
+  '/* eslint import/no-cycle: ["off"] */'; do
+  r=$t/scoped-$(printf '%s' "$form" | tr -cd 'a-z'); base=$(mk "$r")
+  printf 'export const a = 1;\n%s\n' "$form" > "$r/packages/x/src/a.ts"
+  ( cd "$r" && git add -A && git commit -q -m lane )
+  sh "$script" "$r" --base "$base" 2>&1 | grep -q '^lint-suppression:'; check $? "a scoped rule set to off is a finding: $form"
+done
+
+# 14. The exemption is by EXACT name: a lane cannot name a new test file into it.
+r=$t/sneaky; base=$(mk "$r")
+mkdir -p "$r/tests"
+printf '# not one of the exempted files\n/* eslint no-console: off */\n' > "$r/tests/lane-diff-check-sneaky.test.sh"
+( cd "$r" && git add -A && git commit -q -m lane )
+sh "$script" "$r" --base "$base" 2>&1 | grep -q '^lint-suppression:'; check $? "a lane-named test file is NOT exempt"
+
 echo "1..$n"; [ "$fails" = 0 ]

@@ -14,9 +14,6 @@
  * to be present.
  */
 
-import { generateObject, jsonSchema, NoObjectGeneratedError } from 'ai';
-import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
-
 import type { ApiReviewGenerate, ApiReviewGenerateResult, ApiSchemaEnforcement } from './ApiReviewTransport.adapter.js';
 import { API_REVIEW_VERDICT_SCHEMA } from './ApiReviewTransport.adapter.js';
 
@@ -55,25 +52,45 @@ export interface SdkApiReviewGenerateOptions {
 const PROXY_INJECTS_THE_KEY = 'proxy-injects-the-real-key';
 
 export function createSdkApiReviewGenerate(options: SdkApiReviewGenerateOptions): ApiReviewGenerate {
+  // The provider library is imported lazily, on first call of the returned
+  // function. This prevents loading the SDK when the package root is imported
+  // but no API review is ever performed.
+  let generateObject: typeof import('ai').generateObject | null = null;
+  let jsonSchema: typeof import('ai').jsonSchema | null = null;
+  let NoObjectGeneratedError: typeof import('ai').NoObjectGeneratedError | null = null;
+  let createOpenAICompatible: typeof import('@ai-sdk/openai-compatible').createOpenAICompatible | null = null;
+
   // json-object wants json-mode; native-json-schema needs the schema on the
   // wire, which this flag enables. There are only those two levels: a `tool`
   // level was removed because this library has no tool mode for a typed object
   // call, so declaring it would not have matched the wire.
   const structured = options.schemaEnforcement !== 'json-object';
 
-  const provider = createOpenAICompatible({
-    name: options.providerName ?? 'fleet-key-proxy',
-    baseURL: options.baseURL,
-    apiKey: PROXY_INJECTS_THE_KEY,
-    supportsStructuredOutputs: structured,
-  });
-
   return async (input): Promise<ApiReviewGenerateResult> => {
+    // Lazy-load the provider SDK on first call.
+    if (generateObject === null) {
+      const [aiModule, openaiCompatibleModule] = await Promise.all([
+        import('ai'),
+        import('@ai-sdk/openai-compatible'),
+      ]);
+      generateObject = aiModule.generateObject;
+      jsonSchema = aiModule.jsonSchema;
+      NoObjectGeneratedError = aiModule.NoObjectGeneratedError;
+      createOpenAICompatible = openaiCompatibleModule.createOpenAICompatible;
+    }
+
+    const provider = createOpenAICompatible!({
+      name: options.providerName ?? 'fleet-key-proxy',
+      baseURL: options.baseURL,
+      apiKey: PROXY_INJECTS_THE_KEY,
+      supportsStructuredOutputs: structured,
+    });
+
     let generated;
     try {
-      generated = await generateObject({
+      generated = await generateObject!({
         model: provider.chatModel(options.model),
-        schema: jsonSchema(API_REVIEW_VERDICT_SCHEMA),
+        schema: jsonSchema!(API_REVIEW_VERDICT_SCHEMA),
         schemaName: 'review_verdict',
         system: input.system,
         prompt: input.prompt,
@@ -86,7 +103,7 @@ export function createSdkApiReviewGenerate(options: SdkApiReviewGenerateOptions)
       // keeps it on the `unknown`/`unparseable-verdict` path instead of being
       // classified as a transport failure (pre-merge finding 5). Every other
       // error keeps propagating so the transport can classify it.
-      if (NoObjectGeneratedError.isInstance(error)) {
+      if (NoObjectGeneratedError!.isInstance(error)) {
         return { object: undefined, noObject: true };
       }
       throw error;

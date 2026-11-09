@@ -29,6 +29,8 @@ import type {
 } from '../../domain/lane-run-journal.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import { LANE_RUN_ID_PATTERN, LANE_RUN_PARK_REASONS } from '../../domain/lane-run-records.js';
+import { parkClassOf } from '../../domain/park-class.js';
+import type { LaneRunParkClass } from '../../domain/park-class.js';
 import type {
   LaneRunKeyStep,
   LaneRunParkReason,
@@ -190,6 +192,8 @@ export interface LaneRunWireCard {
     readonly parkedFrom: LaneRunStateValue;
     readonly questionId: string | null;
     readonly findingCount: number | null;
+    /** PT1a: why the run is parked; a record written before PT1a reads as `other`. */
+    readonly class: LaneRunParkClass;
   } | null;
   readonly parkDetail: string | null;
   readonly parkCount: number;
@@ -642,6 +646,7 @@ function buildLaneRunWireCard(
       parkedFrom: p.parkedFrom,
       questionId: idOrNull(p.questionId),
       findingCount: p.reason === 'blocker-after-round-2' && Array.isArray(p.findings) ? p.findings.length : null,
+      class: parkClassOf(p),
     };
   }
   const latestAttemptId = record.attemptIds.at(-1);

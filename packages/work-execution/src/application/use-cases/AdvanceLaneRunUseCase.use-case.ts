@@ -72,6 +72,7 @@ import type { EnqueueMergePort } from '../ports/in/EnqueueMergePort.in-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { LaneRunParkNoticePort } from '../ports/out/LaneRunParkNoticePort.out-port.js';
 import type { GateReceiptPort } from '../ports/out/GateReceiptPort.out-port.js';
+import type { GateFailingFilePort } from '../ports/out/GateFailingFilePort.out-port.js';
 import type { SameModelFamily } from '../../domain/seat-selection.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
 import type { LeaseRefusal } from '../../domain/lane-run-lease.js';
@@ -94,7 +95,7 @@ import {
   performDispatch,
   performPrepare,
 } from './advance-lane-run/prepare-dispatch.js';
-import { performCancel, performStop } from './advance-lane-run/stop-cancel.js';
+import { abandonAmbiguousIntentForStop, performCancel, performStop } from './advance-lane-run/stop-cancel.js';
 import { performCollect, performGate } from './advance-lane-run/collect-gate.js';
 import { performReconcile } from './advance-lane-run/reconcile.js';
 import { performReview } from './advance-lane-run/review-fix.js';
@@ -200,6 +201,8 @@ export interface AdvanceLaneRunDependencies {
   readonly forgeAncestry?: ForgeAncestryPort;
   /** Record the conducted gate's verification receipts (KF-13a); absent → the gate records nothing. */
   readonly gateReceipts?: GateReceiptPort;
+  /** PT1a: read the file the failing gate check named, to class a gate park; absent → a gate park classes `other`. */
+  readonly gateFailingFile?: GateFailingFilePort;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */
@@ -321,7 +324,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'waiting', reason: 'facts-inconsistent' };
     }
 
-    const gathered = await gatherFacts(this.ctx, record, entries, request, journalState);
+    let gathered = await gatherFacts(this.ctx, record, entries, request, journalState);
     let decisionRecord: LaneRunRecord = record;
     // A parked run whose notice did not land re-raises it under its saved park
     // key on every advance until it lands. For an owner-question reason the
@@ -351,7 +354,15 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       decisionRecord = fresh;
     }
-    const decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    let decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    const abandoned = await abandonAmbiguousIntentForStop(this.ctx, decisionRecord, gathered, decision, request);
+    if (abandoned.kind === 'refused') {
+      return abandoned.result;
+    }
+    if (abandoned.kind === 'resolved') {
+      gathered = abandoned.gathered;
+      decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    }
     return this.performDecision(decisionRecord, gathered, decision, request);
   }
 

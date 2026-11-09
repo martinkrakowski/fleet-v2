@@ -1,6 +1,11 @@
 import { isAbsolute } from 'node:path';
 
-import { containsSecretShape, isValidHostName } from '@fleet/shared';
+import {
+  LANE_DIFF_SECRET_PATTERNS,
+  SECRET_PATTERNS,
+  containsSecretShape,
+  isValidHostName,
+} from '@fleet/shared';
 
 import { AGY_SECURITY_TEXT_VERSION } from './agy-security.js';
 
@@ -860,6 +865,82 @@ function parseShelfSection(
  */
 export { isValidHostName };
 
+/** Refused once a v2 `hosts` key carries secret-shaped text; never echoes the key. */
+export const HOST_NAME_SECRET_REFUSAL =
+  'hosts: host name must not contain secret-shaped text; rename it with fleet hosts rename';
+
+export const HOST_NAME_TOO_LONG = 'hosts: a host name is too long';
+
+export const MAX_HOST_NAME_ARGUMENT_LENGTH = 4096;
+
+/**
+ * The ONE host-name secret screen: the shared legacy six plus the canonical
+ * lane-diff seventeen. `containsSecretShape` alone scans only the legacy six,
+ * so the union lives here and every hosts surface (loader, draft, CLI) uses it.
+ */
+export function hostNameHasSecretShape(name: string): boolean {
+  return (
+    typeof name === 'string' &&
+    (containsSecretShape(name) ||
+      LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(name)))
+  );
+}
+
+/**
+ * Replace every span of `text` that matches a screened secret shape (the same
+ * union `hostNameHasSecretShape` tests) with `replacement`.
+ */
+export function redactSecretShapes(text: string, replacement: string): string {
+  let out = text;
+  for (const regex of [
+    ...SECRET_PATTERNS,
+    ...LANE_DIFF_SECRET_PATTERNS.map((pattern) => pattern.regex),
+  ]) {
+    out = out.replace(new RegExp(regex.source, 'g'), replacement);
+  }
+  return out;
+}
+
+/**
+ * A long run of alphanumeric characters is the shape of an opaque token even
+ * without a known prefix, so a host key carrying one is withheld from every
+ * error line too — the loader still accepts such a key, but the key text is
+ * never echoed back (HN1 fix round 1, finding 1).
+ */
+const HOST_KEY_TOKEN_RUN = /[A-Za-z0-9]{20,}/;
+
+/** The placeholder that stands in for a host key the screen withholds. */
+export const HOST_KEY_WITHHELD = '<host key withheld>';
+
+/**
+ * The key text an error line may carry: the key itself only when it passes
+ * the secret screen, otherwise the withheld placeholder. A key the loader
+ * refused for secret-shaped text and a key carrying a long opaque token run
+ * are both withheld; an ordinary host name is echoed unchanged.
+ */
+export function screenHostKey(key: string): string {
+  return typeof key === 'string' &&
+    (hostNameHasSecretShape(key) || HOST_KEY_TOKEN_RUN.test(key))
+    ? HOST_KEY_WITHHELD
+    : key;
+}
+
+/** The placeholder that stands in for an error line the screen withholds. */
+export const ERROR_LINE_WITHHELD =
+  '<error line withheld: it carried secret-shaped text>';
+
+/**
+ * The last screen before any CLI line reaches the operator: a line carrying
+ * secret-shaped text is withheld whole, because removing the matched text
+ * would mean quoting it. Host keys are screened at their source
+ * (`screenHostKey`); this is the defence in depth behind that.
+ */
+export function screenErrorLine(line: string): string {
+  return typeof line === 'string' && containsSecretShape(line)
+    ? ERROR_LINE_WITHHELD
+    : line;
+}
+
 function readRequiredEnum<T extends string>(
   record: JsonObject,
   key: string,
@@ -1488,16 +1569,25 @@ function parseV2Hosts(
   }
   const hosts: Record<string, HostSection> = Object.create(null);
   for (const name of Object.keys(section)) {
+    // Every error line carries the key only through the screen: a
+    // secret-shaped key, or one carrying a long opaque token run, is never
+    // echoed (HN1 fix round 1, finding 1).
+    const keyText = screenHostKey(name);
+    const hostPath = `hosts.${keyText}`;
+    if (hostNameHasSecretShape(name)) {
+      errors.push(HOST_NAME_SECRET_REFUSAL);
+      continue;
+    }
     if (!isValidHostName(name)) {
       errors.push('hosts: invalid host name');
       continue;
     }
     const entry = section[name];
     if (!isJsonObject(entry)) {
-      errors.push(`hosts.${name}: must be an object`);
+      errors.push(`${hostPath}: must be an object`);
       continue;
     }
-    const host = parseHost(entry, `hosts.${name}`, errors);
+    const host = parseHost(entry, hostPath, errors);
     if (host !== undefined) {
       hosts[name] = host;
     }
@@ -1506,13 +1596,16 @@ function parseV2Hosts(
   let laneRunners = 0;
   const dialPorts = new Map<number, string>();
   for (const [name, host] of Object.entries(hosts)) {
+    // These hosts parsed, but a key carrying a long opaque token run is
+    // still never echoed (HN1 fix round 1, finding 1).
+    const hostPath = `hosts.${screenHostKey(name)}`;
     if (host.roles.includes('orchestrator')) {
       orchestrators += 1;
       // The runtime always forces a local orchestrator executor, so an
       // orchestrator host reached over ssh could never run it (plan section 1).
       if (host.transport !== 'local') {
         errors.push(
-          `hosts.${name}.transport: must be "local" when the host holds the orchestrator role`,
+          `${hostPath}.transport: must be "local" when the host holds the orchestrator role`,
         );
       }
     }
@@ -1531,11 +1624,11 @@ function parseV2Hosts(
       if (dialPort > 65535) {
         // An ssh host on 65535 would need forward port 65536, which cannot be bound.
         errors.push(
-          `hosts.${name}.runner.port: must leave room for the ssh forward port`,
+          `${hostPath}.runner.port: must leave room for the ssh forward port`,
         );
       } else if (dialPorts.has(dialPort)) {
         errors.push(
-          `hosts.${name}.runner.port: derived dial port must be unique across hosts`,
+          `${hostPath}.runner.port: derived dial port must be unique across hosts`,
         );
       } else {
         dialPorts.set(dialPort, name);
@@ -2621,6 +2714,44 @@ function parseMergeDaemonPolicy(
   const intervalSeconds = read('intervalSeconds');
   const budgetSeconds = read('budgetSeconds');
   const settleSeconds = read('settleSeconds');
+  // PT1a: like `chainRefresh`, a bad `stallAfterMinutes` is a warning, never an error: it gates
+  // only the stall attention, so it must not stop the installation from loading or the merge
+  // pass from running. The raw value is kept so a write round-trips the operator's own text;
+  // the resolver reads the default (30). The warning names the key and a code, never the value.
+  const stallAfterMinutes: unknown = Object.hasOwn(value, 'stallAfterMinutes')
+    ? value.stallAfterMinutes
+    : undefined;
+  const stallBounds = MERGE_POLICY_BOUNDS.stallAfterMinutes;
+  if (
+    Object.hasOwn(value, 'stallAfterMinutes') &&
+    !(
+      typeof stallAfterMinutes === 'number' &&
+      Number.isInteger(stallAfterMinutes) &&
+      stallAfterMinutes >= stallBounds.min &&
+      stallAfterMinutes <= stallBounds.max
+    )
+  ) {
+    warnings.push('policy.daemon.stallAfterMinutes: stall-after-minutes-invalid');
+  }
+  // PT1b1: like `stallAfterMinutes`, a bad `autoResumeMax` is a warning, never an error: it gates
+  // only the auto-resume budget. The raw value is kept so a write round-trips the operator's own
+  // text; the resolver reads `0` (fail-closed, never auto-resume). The warning names the key and
+  // a code, never the value.
+  const autoResumeMax: unknown = Object.hasOwn(value, 'autoResumeMax')
+    ? value.autoResumeMax
+    : undefined;
+  const autoResumeBounds = MERGE_POLICY_BOUNDS.autoResumeMax;
+  if (
+    Object.hasOwn(value, 'autoResumeMax') &&
+    !(
+      typeof autoResumeMax === 'number' &&
+      Number.isInteger(autoResumeMax) &&
+      autoResumeMax >= autoResumeBounds.min &&
+      autoResumeMax <= autoResumeBounds.max
+    )
+  ) {
+    warnings.push('policy.daemon.autoResumeMax: auto-resume-max-invalid');
+  }
   // CO8a: an unknown or `live` `chainRefresh` is a warning, never an error:
   // the file still parses and the raw value round-trips so the operator sees
   // and fixes their own text. The warning names the key and the reason code
@@ -2642,6 +2773,12 @@ function parseMergeDaemonPolicy(
     ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
     ...(budgetSeconds !== undefined ? { budgetSeconds } : {}),
     ...(settleSeconds !== undefined ? { settleSeconds } : {}),
+    ...(Object.hasOwn(value, 'stallAfterMinutes')
+      ? { stallAfterMinutes: stallAfterMinutes as MergeDaemonSection['stallAfterMinutes'] }
+      : {}),
+    ...(Object.hasOwn(value, 'autoResumeMax')
+      ? { autoResumeMax: autoResumeMax as MergeDaemonSection['autoResumeMax'] }
+      : {}),
     ...(Object.hasOwn(value, 'chainRefresh')
       ? { chainRefresh: value.chainRefresh as MergeDaemonSection['chainRefresh'] }
       : {}),

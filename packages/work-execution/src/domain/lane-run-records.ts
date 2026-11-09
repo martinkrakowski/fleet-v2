@@ -13,6 +13,7 @@ import type { BaseBranchValue } from './base-branch.js';
 import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
 import type { LaneRunParkFindingView } from './park-findings-view.js';
 import { copyParkFindings } from './park-findings-view.js';
+import type { LaneRunParkClass } from './park-class.js';
 
 export const LANE_RUN_RECORD_VERSION = 1 as const;
 
@@ -123,6 +124,11 @@ export interface LaneRunParkRecord {
    * non-blocker parks.
    */
   readonly findings?: readonly LaneRunParkFindingView[] | null;
+  /**
+   * PT1a: why the run is parked, set when the park is raised (`classifyPark`); absent on records
+   * written before PT1a, which read as `other` through `parkClassOf`.
+   */
+  readonly class?: LaneRunParkClass;
 }
 
 /**

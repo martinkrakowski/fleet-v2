@@ -457,6 +457,20 @@ export interface MergeDaemonSection {
    * kept verbatim so a write round-trips the operator's own text.
    */
   readonly chainRefresh?: 'shadow' | 'live' | (string & {});
+  /**
+   * PT1a: minutes a run may sit parked before the conductor raises its stall attention; 1..1440,
+   * default 30. As written: a value outside that range or not an integer loads with a
+   * `stall-after-minutes-invalid` warning, is kept verbatim for a round trip and resolves to 30.
+   */
+  readonly stallAfterMinutes?: number | (string & {}) | boolean | null;
+  /**
+   * PT1b1: how many `resume@web` intents the conductor may write per pass for auto-resuming
+   * `transport-busy` parks; 0..32, default 2. As written: a value outside that range or not an
+   * integer loads with an `auto-resume-max-invalid` warning, is kept verbatim for a round trip
+   * and resolves fail-closed to `0` (never auto-resume); only an absent key resolves to the
+   * default 2.
+   */
+  readonly autoResumeMax?: number | (string & {}) | boolean | null;
 }
 
 /** A merge repository policy with every default applied (`resolveMergePolicy`). */
@@ -487,6 +501,10 @@ export interface ResolvedMergeDaemonPolicy {
    * `invalid` when written `live` or anything unknown. Never `live`.
    */
   readonly chainRefresh: 'shadow' | 'invalid';
+  /** PT1a: the stall threshold in minutes with the default (30) applied. */
+  readonly stallAfterMinutes: number;
+  /** PT1b1: the auto-resume budget with the default (2) applied. */
+  readonly autoResumeMax: number;
 }
 
 /** The result of `resolveMergePolicy`: the normalized sections at their revision, or a refusal code. */

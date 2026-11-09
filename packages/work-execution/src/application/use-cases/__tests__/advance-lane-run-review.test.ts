@@ -15,13 +15,23 @@ import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import {
+  laneRunReviewFact,
+  LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS,
+} from '../../../domain/lane-run-review-facts.js';
+import {
   laneRunConductEntry,
   laneRunIntentEntry,
   laneRunResultEntry,
   type LaneRunResultReasonCode,
 } from '../../../domain/lane-run-step-facts.js';
-import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import {
+  nextLaneRunAction,
+  REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
+  type LaneRunDecision,
+} from '../../../domain/lane-run-decider.js';
 import type { SameModelFamily } from '../../../domain/seat-selection.js';
+import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
@@ -42,7 +52,7 @@ import type {
 import type { OpenReviewAssessmentRequest, OpenReviewAssessmentResult } from '../../ports/out/ReviewAssessmentPort.out-port.js';
 import type { AcceptanceAssessmentRequest } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import { reviewFactsOf } from '../advance-lane-run/review-fix.js';
-import type { AdvanceStepContext } from '../advance-lane-run/step-context.js';
+import type { AdvanceStepContext, GatheredLaneRunFacts } from '../advance-lane-run/step-context.js';
 import { ReviewRequestAdapter } from '../../../infrastructure/adapters/ReviewRequestAdapter.adapter.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
 import { SECRET_PATTERNS } from '@fleet/shared';
@@ -459,15 +469,39 @@ async function makeHarness(
   };
 }
 
-async function advance(harness: Harness, overrides: Record<string, unknown> = {}) {
+type PerformDecisionFn = (
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: LaneRunDecision,
+  request: AdvanceLaneRunRequest,
+) => Promise<AdvanceLaneRunResult>;
+
+async function advance(
+  harness: Harness,
+  overrides: Record<string, unknown> & { readonly reviewSeatUnavailablePasses?: number } = {},
+) {
   harness.setJournalBaseline((await harness.runJournal.listForRun(RUN_ID)).length);
+  const { reviewSeatUnavailablePasses, ...requestOverrides } = overrides;
   const useCase = new AdvanceLaneRunUseCase(harness.deps);
+  if (reviewSeatUnavailablePasses !== undefined) {
+    const target = useCase as unknown as { performDecision: PerformDecisionFn };
+    const origPerformDecision = target.performDecision.bind(useCase);
+    target.performDecision = (record, gathered, _decision, request) => {
+      const facts = { ...gathered.facts, reviewSeatUnavailablePasses };
+      return origPerformDecision(
+        record,
+        { ...gathered, facts },
+        nextLaneRunAction(record, facts, request.nowIso),
+        request,
+      );
+    };
+  }
   return useCase.advanceLaneRun({
     runId: RUN_ID,
     lease: { holderId: HOLDER, fence: 1 },
     halted: false,
     nowIso: LATER,
-    ...overrides,
+    ...requestOverrides,
   });
 }
 
@@ -576,7 +610,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
   });
 
-  it('no-receipt retries the same seat once, then moves to the next seat, then parks when the plan is exhausted', async () => {
+  it('no-receipt retries the same seat once, moves to the next seat, waits while a pass counter is below the bound, and parks on the production path when the plan is exhausted', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
     harness.setReviewAnswer(async () => ({ outcome: 'no-receipt', reason: 'review-unavailable', detail: null }));
@@ -606,11 +640,21 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
       result: 'completed',
       reasonCode: 'review-no-receipt',
     });
-    // RV4: retries count every remaining review intent of the generation
+    // RV4 + PT1d: retries count every remaining review intent of the generation
     // (`remaining.length - 1`), so after the one budget retry on the first
-    // seat the switched seat's no-receipt parks — no second budget retry.
-    const fourth = await advance(harness);
-    expect(fourth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+    // seat the switched seat's no-receipt gets no second retry; with the seat
+    // plan exhausted the step waits review-seat-unavailable only while a
+    // present reviewSeatUnavailablePasses is below
+    // REVIEW_SEAT_UNAVAILABLE_MAX_PASSES, and parks on the production path
+    // (absent counter) or at the bound.
+    const fourth = await advance(harness, { reviewSeatUnavailablePasses: 0 });
+    expect(fourth).toEqual({ outcome: 'waiting', reason: 'review-seat-unavailable' });
+    const fifth = await advance(harness, {
+      reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1,
+    });
+    expect(fifth).toEqual({ outcome: 'waiting', reason: 'review-seat-unavailable' });
+    const sixth = await advance(harness);
+    expect(sixth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
   });
 
   it('journals the fixed detail of a no-receipt result end to end', async () => {
@@ -1581,7 +1625,7 @@ describe('review cause codes reach the run journal (RV2)', () => {
   }
 
   for (const code of ['timeout', 'transport'] as const) {
-    it(`journals an unavailable review with code '${code}' as review-no-receipt detail`, async () => {
+    it(`journals an unavailable review with code '${code}' without echoing the hostile reason`, async () => {
       const harness = await makeHarness(runRecord(), [collectedAttempt()]);
       await conduct(harness, 'brief-check', NOW);
       Object.assign(harness.deps, {
@@ -1592,18 +1636,21 @@ describe('review cause codes reach the run journal (RV2)', () => {
           code,
         })),
       });
+      // U3: transport proves the seat was never reached and journals seat-busy;
+      // timeout means the seat ran to timeout and still journals review-no-receipt.
+      const reasonCode = code === 'transport' ? 'seat-busy' : 'review-no-receipt';
       const result = await advance(harness);
       expect(result).toEqual({
         outcome: 'acted',
         step: 'brief-check',
         key: reviewKey('brief-check', 0, HEAD12_A),
         result: 'completed',
-        reasonCode: 'review-no-receipt',
+        reasonCode,
         detail: code,
       });
       expect(await lastResultEntry(harness)).toMatchObject({
         outcome: 'completed',
-        reasonCode: 'review-no-receipt',
+        reasonCode,
         detail: code,
       });
     });
@@ -2020,5 +2067,273 @@ describe('review cause codes reach the run journal (RV2)', () => {
     expect(running).toEqual({ outcome: 'waiting', reason: 'review-pending' });
     expect(runningHarness.reviewRequests).toHaveLength(0);
     expect(await runningHarness.runJournal.listForRun(RUN_ID)).toHaveLength(1);
+  });
+});
+
+describe('transport no-receipt budget exemption and unreachable bound (U3 / F189)', () => {
+  it('transport no-receipts spend no retry budget and the run does not park', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => ({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'transport',
+    }));
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'transport',
+    });
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'transport',
+    });
+    // Two back-to-back transports left the fact at none: zero retry budget spent.
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'none',
+      seatIndex: null,
+      retries: 0,
+    });
+    // A pass on /retry2 closes the brief-check with retries 0 and enters code-review.
+    harness.setReviewAnswer(async (request) => ({ outcome: 'receipt', receipt: receiptFor(request, 'passed') }));
+    const third = await advance(harness);
+    expect(third).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 2),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'passed',
+      seatIndex: 0,
+      retries: 0,
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
+  });
+
+  it('genuine no-receipts from a reached seat still spend the retry budget', async () => {
+    // timeout, null and route-no-auth-file still journal review-no-receipt.
+    for (const detail of ['timeout', null, 'route-no-auth-file'] as const) {
+      const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+      await conduct(harness, 'brief-check', NOW);
+      harness.setReviewAnswer(async () => ({
+        outcome: 'no-receipt',
+        reason: 'review-unavailable',
+        detail,
+      }));
+      const result = await advance(harness);
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'brief-check',
+        key: reviewKey('brief-check', 0, HEAD12_A),
+        result: 'completed',
+        reasonCode: 'review-no-receipt',
+        ...(detail !== null ? { detail } : {}),
+      });
+    }
+    // Even after a free transport attempt, two genuine timeouts still exhaust the budget.
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    let calls = 0;
+    harness.setReviewAnswer(async () => {
+      calls += 1;
+      if (calls === 2) {
+        return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'transport' };
+      }
+      return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'timeout' };
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-no-receipt',
+      detail: 'timeout',
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'transport',
+    });
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 0,
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 2),
+      result: 'completed',
+      reasonCode: 'review-no-receipt',
+      detail: 'timeout',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+    expect(calls).toBe(3);
+  });
+
+  it('an unreachable seat cannot retry unboundedly: four attempts hit the bound and park without a fifth request', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    let reviewCalls = 0;
+    harness.setReviewAnswer(async () => {
+      reviewCalls += 1;
+      return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'transport' };
+    });
+    for (let i = 0; i < LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS; i += 1) {
+      const result = await advance(harness);
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'brief-check',
+        key: reviewKey('brief-check', 0, HEAD12_A, i === 0 ? null : i),
+        result: 'completed',
+        reasonCode: 'seat-busy',
+        detail: 'transport',
+      });
+    }
+    expect(reviewCalls).toBe(LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+    // The fifth advance parks without calling requestReview a fifth time.
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+    expect(reviewCalls).toBe(LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS);
+  });
+
+  it('the bound also stops a run with one reached timeout followed by four transport failures', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    let calls = 0;
+    harness.setReviewAnswer(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'timeout' };
+      }
+      return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'transport' };
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-no-receipt',
+      detail: 'timeout',
+    });
+    for (let i = 0; i < LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS; i += 1) {
+      const result = await advance(harness);
+      expect(result).toMatchObject({ result: 'completed', reasonCode: 'seat-busy', detail: 'transport' });
+    }
+    expect(calls).toBe(1 + LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+  });
+
+  it('a resumed / review-retry generation boundary resets the unreachable window', async () => {
+    const mint = makeUlidMinter();
+    const before = '2026-10-27T10:01:00.000Z';
+    const resumedAt = '2026-10-27T10:02:00.000Z';
+    const after = '2026-10-27T10:03:00.000Z';
+    const transportResultOf = (key: string, at: string): LaneRunJournalEntryRecord =>
+      laneRunResultEntry(mint(), RUN_ID, key, 'completed', 'seat-busy', at, 'transport');
+    const entries: LaneRunJournalEntryRecord[] = [];
+    for (let i = 0; i < LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS; i += 1) {
+      const key = reviewKey('brief-check', 0, HEAD12_A, i === 0 ? null : i);
+      entries.push(laneRunIntentEntry(mint(), RUN_ID, key, null, before));
+      entries.push(transportResultOf(key, before));
+    }
+    // Four transports closed the first window.
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+    // An operator resume / review-retry result advances the generation boundary.
+    entries.push(laneRunResultEntry(mint(), RUN_ID, 'resume@test', 'completed', 'resumed', resumedAt, 'review-retry'));
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'none',
+      seatIndex: null,
+      retries: 0,
+    });
+    // The next transport starts a fresh 4-attempt window.
+    for (let i = 0; i < LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS; i += 1) {
+      const key = reviewKey('brief-check', 0, HEAD12_A, 4 + i);
+      entries.push(laneRunIntentEntry(mint(), RUN_ID, key, null, after));
+      entries.push(transportResultOf(key, after));
+    }
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+  });
+
+  it('existing seat-busy behaviour is unchanged: free, and a later pass opens /retry1 with retries 0', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => ({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'seat-busy',
+    }));
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'seat-busy',
+    });
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'none',
+      seatIndex: null,
+      retries: 0,
+    });
+    harness.setReviewAnswer(async (request) => ({ outcome: 'receipt', receipt: receiptFor(request, 'passed') }));
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'passed',
+      seatIndex: 0,
+      retries: 0,
+    });
   });
 });

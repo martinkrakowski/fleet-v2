@@ -1515,10 +1515,13 @@ describe('ResolveActionAuthorizationUseCase', () => {
     actionScope: 'forge:merge',
     expectedHeadSha: 'abc123',
     authorizationGrantId: 'grant-9',
+    attemptId: 'attempt-1',
   };
 
   it('returns the applicable grant of an approved, unconsumed request', async () => {
-    const repo = new StubRequestRepository([requestRecord()]);
+    const repo = new StubRequestRepository([
+      requestRecord({ grantRecordVersion: 2, grantAttemptId: 'attempt-1' }),
+    ]);
     const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute(
       request,
     );
@@ -1532,11 +1535,14 @@ describe('ResolveActionAuthorizationUseCase', () => {
   });
 
   it('finds an approved request by project and action scope without a grant id', async () => {
-    const repo = new StubRequestRepository([requestRecord()]);
+    const repo = new StubRequestRepository([
+      requestRecord({ grantRecordVersion: 2, grantAttemptId: 'attempt-1' }),
+    ]);
     const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute({
       projectId: 'project-atlas',
       actionScope: 'forge:merge',
       expectedHeadSha: 'abc123',
+      attemptId: 'attempt-1',
     });
     expect(result.outcome === 'authorized' && result.grantId).toBe('grant-9');
   });
@@ -1591,7 +1597,12 @@ describe('ResolveActionAuthorizationUseCase', () => {
 
   it('refreshes a pending request from a verified answer once', async () => {
     const repo = new StubRequestRepository([
-      requestRecord({ state: 'awaiting-decision', decisionRevision: null }),
+      requestRecord({
+        state: 'awaiting-decision',
+        decisionRevision: null,
+        grantRecordVersion: 2,
+        grantAttemptId: 'attempt-1',
+      }),
     ]);
     const transport = new StubDecisionTransport({
       'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' },

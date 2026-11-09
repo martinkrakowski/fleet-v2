@@ -11,6 +11,7 @@ import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.o
 import type { FindLatestReceiptOfKindResult } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { LaneRunParkFindingView } from '../../../domain/park-findings-view.js';
 import { causingParkFindingsView } from '../../../domain/park-findings-view.js';
+import { classifyPark } from '../../../domain/park-class.js';
 import { decideConductorReviewOutcome, } from '../../../domain/lane-run-decider.js';
 import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { resolveLaneRunProvenance } from '../../../domain/lane-run-records.js';
@@ -366,6 +367,46 @@ async function blockerFindingsFor(
   return sawUnavailableOrThrow ? null : undefined;
 }
 
+/**
+ * PT1a: the gate-park evidence `classifyPark` reads: the screened file the
+ * failing gate check named at the latest collected head, and the work order's
+ * owned paths. Each part is `null` when it cannot be read (unwired port, no
+ * collected head, a throw): unknown stays unknown. Never throws.
+ */
+async function gateParkEvidence(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+): Promise<{ readonly gateFailingFile: string | null; readonly ownedPaths: readonly string[] | null }> {
+  const none = { gateFailingFile: null, ownedPaths: null };
+  const reader = ctx.deps.gateFailingFile;
+  const workOrderRepo = ctx.deps.workOrderRepo;
+  if (reader === undefined || workOrderRepo === undefined) {
+    return none;
+  }
+  try {
+    for (let index = record.attemptIds.length - 1; index >= 0; index -= 1) {
+      const id = record.attemptIds[index];
+      if (id === undefined) {
+        continue;
+      }
+      const attempt = await ctx.deps.attemptRepo.findAttemptById(id);
+      const head = attempt?.artifacts?.headCommit;
+      if (attempt === null || head === undefined) {
+        continue;
+      }
+      const read = await reader.readGateFailingFile({ attemptId: id, headSha: head });
+      const workOrder = await workOrderRepo.findWorkOrderById(record.workOrderId);
+      return {
+        gateFailingFile: read.outcome === 'found' ? read.failingFile : null,
+        ownedPaths: workOrder === null ? null : [...workOrder.ownedPaths],
+      };
+    }
+    return none;
+  } catch {
+    return none;
+  }
+}
+
 export async function performPark(ctx: AdvanceStepContext,
   record: LaneRunRecord,
   reason: LaneRunParkReason,
@@ -381,6 +422,19 @@ export async function performPark(ctx: AdvanceStepContext,
     reason === 'blocker-after-round-2' || reason === 'acceptance-rejected'
       ? await blockerFindingsFor(ctx, record, parkedFrom)
       : undefined;
+  // PT1a: the park's class, from data held at this point; ids and codes only.
+  const gateEvidence =
+    reason === 'blocker-after-round-2' && parkedFrom === 'gating'
+      ? await gateParkEvidence(ctx, record)
+      : { gateFailingFile: null, ownedPaths: null };
+  const parkClass = classifyPark({
+    reason,
+    qualifier,
+    parkedFrom,
+    findingSeverities: Array.isArray(findings) ? findings.map((finding) => finding.severity) : null,
+    gateFailingFile: gateEvidence.gateFailingFile,
+    ownedPaths: gateEvidence.ownedPaths,
+  });
   const parkedRecord: LaneRunRecord = {
     ...record,
     parked: {
@@ -388,6 +442,7 @@ export async function performPark(ctx: AdvanceStepContext,
       qualifier,
       parkedFrom,
       questionId: null,
+      class: parkClass,
       ...(findings === null || (findings !== undefined && findings.length > 0) ? { findings } : {}),
     },
     parkCount: record.parkCount + 1,

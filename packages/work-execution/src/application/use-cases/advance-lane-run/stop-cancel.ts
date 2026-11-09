@@ -3,13 +3,58 @@ import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in
 import type { StopAttemptResult } from '../../ports/in/StopAttemptPort.in-port.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
+import { LANE_RUN_INTENT_ABANDONED_REASON_CODE } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunStopEffect } from '../../../domain/lane-run-transitions.js';
 import type { RunStopEffect, RunStopOutcome } from '../../../domain/lane-run-transitions.js';
+import { refreshGatheredJournalFacts } from './facts.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendConduct, appendRunIntent, appendRunResult, performPark, refusedResult, releaseWorkOrderAtEnd } from './step-context.js';
+
+export type AbandonAmbiguousStopOutcome =
+  | { readonly kind: 'unchanged' }
+  | { readonly kind: 'resolved'; readonly gathered: GatheredLaneRunFacts }
+  | { readonly kind: 'refused'; readonly result: AdvanceLaneRunResult };
+
+/**
+ * F171: a recorded stop on a run whose pending intent is ambiguous would wait
+ * on that intent forever (G3b/G3c run ahead of the stop rules). The operator's
+ * stop abandons it: one final `overtaken` `intent-abandoned-by-operator` result
+ * on the intent's key, then the journal-derived facts are refreshed so the
+ * decider applies the stop rules. Nothing is read or written unless a stop is
+ * recorded over an ambiguous non-reconcile intent; a merged PR (G3f) still
+ * ends the run `merged`, and a key that already has a final result is not
+ * written twice.
+ */
+export async function abandonAmbiguousIntentForStop(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: LaneRunDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AbandonAmbiguousStopOutcome> {
+  const pending = gathered.facts.pendingIntent;
+  if (
+    gathered.facts.stopMode === null ||
+    pending === null ||
+    pending.reconciliation !== 'ambiguous' ||
+    pending.step === 'reconcile' ||
+    decision.kind === 'done' ||
+    (decision.kind === 'enter' && decision.to === 'merged')
+  ) {
+    return { kind: 'unchanged' };
+  }
+  const keyEntries = await ctx.deps.runJournal.listForKey(pending.key);
+  if (!keyEntries.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous')) {
+    const resultRefusal = await appendRunResult(ctx, request, pending.key, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE);
+    if (resultRefusal !== null) {
+      return { kind: 'refused', result: refusedResult(resultRefusal) };
+    }
+  }
+  const refreshedEntries = await ctx.deps.runJournal.listForRun(request.runId);
+  return { kind: 'resolved', gathered: refreshGatheredJournalFacts(ctx, record, refreshedEntries, gathered) };
+}
 
 /** Map a StopAttempt port result onto the domain's RunStopOutcome; a refusal re-reads the attempt for its kind. */
 export async function runStopOutcomeOf(

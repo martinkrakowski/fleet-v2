@@ -272,7 +272,13 @@ case "$cmd" in
       echo "agy-round: hash check failed before the run" >&2
       exit 1
     fi
-    cmd="agy-run --dir $(shq "$dir") --model $(shq "$model") --mode full --isolation-declared --sandbox --timeout $(shq "$timeout") --brief $(shq "$brief")"
+    # The lane gets a throwaway HOME unless the operator opts out: agy re-creates its install dir as
+    # the lane user on every run, which voided the hardened container's pins each round until this
+    # existed (2026-11-07). The flag is passed to the REMOTE agy-run, so the container needs a copy
+    # that carries it; AGY_ROUND_SHARED_HOME=1 falls back to the host's own agy home.
+    eph=''
+    [ "${AGY_ROUND_SHARED_HOME:-0}" = 1 ] || eph=' --ephemeral-home'
+    cmd="agy-run --dir $(shq "$dir") --model $(shq "$model") --mode full --isolation-declared --sandbox --timeout $(shq "$timeout") --brief $(shq "$brief")$eph"
     if [ -n "$log" ]; then
       ssh -o BatchMode=yes "$AGY_ROUND_SSH" "$cmd" > "$log"
       rc=$?

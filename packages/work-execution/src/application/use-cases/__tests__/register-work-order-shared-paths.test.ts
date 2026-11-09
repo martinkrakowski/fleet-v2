@@ -48,8 +48,13 @@ describe('RegisterWorkOrderUseCase shared append paths (CG2)', () => {
     const second = await useCase.registerWorkOrder(
       registerRequest({ workOrderId: 'wo-b', ownedPaths: ['packages/a/src/x.ts'] }),
     );
-    expect(second.outcome).toBe('rejected');
-    expect(second.outcome === 'rejected' && second.reason.includes('Owned path conflicts with active work order')).toBe(true);
+    expect(second).toMatchObject({
+      outcome: 'refused',
+      reason: 'active-work-order-overlap',
+      blockerKind: 'active-work-order',
+      blockerId: 'wo-a',
+      held: false,
+    });
   });
 
   it('rejects two work orders owning the same non-shared file', async () => {
@@ -61,6 +66,6 @@ describe('RegisterWorkOrderUseCase shared append paths (CG2)', () => {
     const second = await useCase.registerWorkOrder(
       registerRequest({ workOrderId: 'wo-b', ownedPaths: ['packages/a/src/x.ts'] }),
     );
-    expect(second.outcome).toBe('rejected');
+    expect(second).toMatchObject({ outcome: 'refused', reason: 'active-work-order-overlap', blockerId: 'wo-a' });
   });
 });

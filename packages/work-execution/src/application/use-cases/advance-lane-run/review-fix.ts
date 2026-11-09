@@ -15,7 +15,11 @@ import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../
 import type { HandoverFinding, RenderHandoverBriefInput } from '../../../domain/lane-run-handover.js';
 import { originalBriefOf, renderHandoverBrief } from '../../../domain/lane-run-handover.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
-import { laneRunReviewFact, laneRunReviewIntentIgnored } from '../../../domain/lane-run-review-facts.js';
+import {
+  isLaneRunReviewUnreachableDetail,
+  laneRunReviewFact,
+  laneRunReviewIntentIgnored,
+} from '../../../domain/lane-run-review-facts.js';
 import { buildLaneRunStepKey, head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { ParsedLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
@@ -583,13 +587,14 @@ export async function performReview(
   if (outcome.outcome === 'receipt') {
     mapped = reviewResultOfReceiptDecision(outcome.receipt);
   } else if (outcome.outcome === 'no-receipt') {
-    // RV4: a seat-busy rejection journals `completed` / `seat-busy` with the
-    // same detail — never `review-no-receipt` — so the decider treats it as
-    // no second verdict (no retry budget spent).
-    mapped =
-      outcome.detail === 'seat-busy'
-        ? { result: 'completed', reasonCode: 'seat-busy', detail: 'seat-busy' }
-        : { result: 'completed', reasonCode: 'review-no-receipt', detail: outcome.detail };
+    // RV4 / U3: a seat-busy or transport no-receipt proves the reviewer seat
+    // was never reached; journal `completed` / `seat-busy` with the same
+    // detail — never `review-no-receipt` — so the decider treats it as no
+    // second verdict (no retry budget spent). Timeout, route-no-auth-file and
+    // null still journal `review-no-receipt` and spend budget.
+    mapped = isLaneRunReviewUnreachableDetail(outcome.detail)
+      ? { result: 'completed', reasonCode: 'seat-busy', detail: outcome.detail }
+      : { result: 'completed', reasonCode: 'review-no-receipt', detail: outcome.detail };
   } else if (outcome.outcome === 'refused') {
     mapped = { result: 'refused', reasonCode: 'review-refused', detail: outcome.detail };
   }
@@ -1525,6 +1530,28 @@ interface FixRenderInput {
 }
 
 /**
+ * PF1: the brief now refuses absolute finding paths, but a reviewer may spell
+ * a changed file with the absolute worktree prefix (the scope rule already
+ * normalises that spelling). Strip the prior attempt's worktree prefix before
+ * rendering so such a finding still hands over — as the repository-relative
+ * path — while every other absolute path refuses at the render.
+ */
+function relativeWorktreeFindingsOf(
+  findings: readonly HandoverFinding[],
+  worktreePath: string,
+): readonly HandoverFinding[] {
+  if (worktreePath === '' || !findings.some((finding) => finding.filePath?.startsWith(worktreePath + '/') === true)) {
+    return findings;
+  }
+  return findings.map((finding) => {
+    if (finding.filePath === null || !finding.filePath.startsWith(worktreePath + '/')) {
+      return finding;
+    }
+    return { ...finding, filePath: finding.filePath.slice(worktreePath.length + 1) };
+  });
+}
+
+/**
  * Steps 16–17: the handover note flag (GB3a) and the rendered brief
  * (KF-5b). A brief that does not render, or renders no numbered fix,
  * refuses.
@@ -1553,14 +1580,25 @@ async function fixRenderHandoverStep(
     branchName,
     head12: input.head,
     source: input.failure.source === 'review' ? 'review' : 'gate',
-    findings: input.findings,
+    findings: relativeWorktreeFindingsOf(input.findings, input.prior.worktreePath),
     gateReasonCodes: input.failure.source === 'review' ? [] : [input.failure.reasonCode],
     gatePredicates: input.gatePredicates,
     proofCommands: input.proofCommands,
     originalBrief: input.originalBrief,
     ...(handover ? { uncommittedHandover: true } : {}),
   } satisfies RenderHandoverBriefInput);
-  if (!brief.ok || brief.numberedFixes.length === 0) {
+  if (!brief.ok) {
+    // PF1: `nothing-to-fix` keeps its own token; any other render refusal
+    // reports the real reason as `prepare-handover-<reason>` — built only
+    // from the closed reason union, never from free text, so the path is
+    // never echoed into the detail.
+    const detail =
+      brief.reason === 'nothing-to-fix'
+        ? 'prepare-nothing-to-fix'
+        : `prepare-handover-${brief.reason}`;
+    return { status: 'refused', result: await shared.refuse('prepare-refused', detail) };
+  }
+  if (brief.numberedFixes.length === 0) {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-nothing-to-fix') };
   }
   return { status: 'ok', value: { briefText: brief.text, numberedFixes: brief.numberedFixes } };

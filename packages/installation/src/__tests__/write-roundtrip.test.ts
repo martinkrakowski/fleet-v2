@@ -230,7 +230,7 @@ const fullV2File = {
         'example-owner/second-repo': { projectId: 'second-project' },
       },
     },
-    daemon: { intervalSeconds: 90, budgetSeconds: 60, settleSeconds: 30, chainRefresh: 'shadow' },
+    daemon: { intervalSeconds: 90, budgetSeconds: 60, settleSeconds: 30, chainRefresh: 'shadow', stallAfterMinutes: 45, autoResumeMax: 3 },
   },
   shelf: {
     provider: 'git',
@@ -521,6 +521,66 @@ describe('writeInstallationV2 round trip (shared key lists)', () => {
       expect(parseInstallation(JSON.parse(text))).toStrictEqual({ ok: true, installation: first });
       expect(JSON.parse(text)).toStrictEqual(fixture);
       expect(writeInstallationV2(second)).toBe(text);
+    }
+  });
+
+  it('PT1a: round-trips a bad stallAfterMinutes value unchanged, with the same warning on the way back', () => {
+    const base = {
+      schemaVersion: 2,
+      hosts: {
+        local: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      },
+      forge: { mode: 'none' },
+      policy: { daemon: { stallAfterMinutes: 0 } },
+    };
+    const parsed = parseInstallation(base);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.warnings).toEqual(['policy.daemon.stallAfterMinutes: stall-after-minutes-invalid']);
+    const written = writeInstallationV2(parsed.installation as FleetInstallationV2);
+    expect(written).toContain('"stallAfterMinutes": 0');
+    const reparsed = parseInstallation(JSON.parse(written));
+    expect(reparsed.ok).toBe(true);
+    if (reparsed.ok) {
+      expect(reparsed.installation).toEqual(parsed.installation);
+      expect(reparsed.warnings).toEqual(parsed.warnings);
+    }
+  });
+
+  it('PT1b1: round-trips a bad autoResumeMax value unchanged, with the same warning on the way back', () => {
+    const base = {
+      schemaVersion: 2,
+      hosts: {
+        local: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      },
+      forge: { mode: 'none' },
+      policy: { daemon: { autoResumeMax: 'many' } },
+    };
+    const parsed = parseInstallation(base);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.warnings).toEqual(['policy.daemon.autoResumeMax: auto-resume-max-invalid']);
+    const written = writeInstallationV2(parsed.installation as FleetInstallationV2);
+    expect(written).toContain('"autoResumeMax": "many"');
+    const reparsed = parseInstallation(JSON.parse(written));
+    expect(reparsed.ok).toBe(true);
+    if (reparsed.ok) {
+      expect(reparsed.installation).toEqual(parsed.installation);
+      expect(reparsed.warnings).toEqual(parsed.warnings);
     }
   });
 

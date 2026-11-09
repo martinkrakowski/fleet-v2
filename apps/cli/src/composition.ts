@@ -41,9 +41,15 @@ import {
   BriefKnowledgeAdapter,
   CiStateAdapter,
   CloseWorkOrderUseCase,
+  CutoverJournalAdapter,
+  CutoverRecordRepositoryAdapter,
+  DaemonPauseAdapter,
+  KillallTrainPauseAdapter,
+  ManageCutoverUseCase,
   GateReceiptAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
+  ListHeldWorkOrdersUseCase,
   ListStaleWorkOrdersUseCase,
   ConductorForgeGrantAdapter,
   DispatchAttemptUseCase,
@@ -97,6 +103,9 @@ import {
   ListLaneRunsUseCase,
   ReapLaneWorktreesUseCase,
   ReapOrphanSessionsUseCase,
+  ReapZombiesUseCase,
+  ReaperFindingRepositoryAdapter,
+  InMemoryReaperFindingRepositoryAdapter,
   RequestLaneRunStopUseCase,
   ResumeLaneRunUseCase,
   type ProjectProfileReadPort,
@@ -113,6 +122,9 @@ import {
   type SubprocessRunner,
   type CommandExecutorPort,
   type AcceptanceReceiptReadAdapter,
+  type GateFailingFileAdapter,
+  type ListStalledRunsUseCase,
+  type StallAttentionAdapter,
   type ExportRunTelemetryUseCase,
   type TelemetryDispositionAdapter,
   type TelemetryResourceInput,
@@ -174,6 +186,7 @@ import {
   ListOwnerQuestionsUseCase,
   ListProjectProfilesUseCase,
   ObservationPublicationAdapter,
+  OrchestratorSessionRepositoryAdapter,
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   PublishProjectObservationUseCase,
@@ -638,6 +651,7 @@ export interface FleetCliRuntime {
   readonly coordination: {
     readonly projectProfileRepository: ProjectProfileRepositoryAdapter;
     readonly coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
+    readonly orchestratorSessionRepository: OrchestratorSessionRepositoryAdapter;
     readonly decisionTransport: DecisionTransportAdapter;
     readonly observationPublication: ObservationPublicationAdapter;
     readonly relayTransport: RelayTransportAdapter;
@@ -747,6 +761,8 @@ export interface FleetCliRuntime {
     readonly closeWorkOrder: CloseWorkOrderUseCase;
     /** KF-36b-2: the read-only stale work-order listing; built beside closeWorkOrder from the same stores. */
     readonly listStaleWorkOrders: ListStaleWorkOrdersUseCase;
+    /** PT1ca: the read-only listing of registrations held by overlap admission. */
+    readonly listHeldWorkOrders: ListHeldWorkOrdersUseCase;
     readonly inspectAttempt: InspectAttemptUseCase;
     readonly explainAttempt: ExplainAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
@@ -776,6 +792,14 @@ export interface FleetCliRuntime {
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
     /** CO26: the read-only relaunch inventory per lane host. */
     readonly inventoryRelaunch: InventoryRelaunchUseCase;
+    /** CO30a: the one cutover record v1 (`cutover.json`). */
+    readonly cutoverRecordRepository: CutoverRecordRepositoryAdapter;
+    /** CO30a: the keyed cutover journal (`cutover-journal.json`). */
+    readonly cutoverJournal: CutoverJournalAdapter;
+    /** CO30a: the killall train-pause record `cutover rollback` lifts when the cutover set it. */
+    readonly killallTrainPause: KillallTrainPauseAdapter;
+    /** CO30a: `cutover status` and `cutover rollback`; switch and retire are CO30b. */
+    readonly manageCutover: ManageCutoverUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -784,6 +808,14 @@ export interface FleetCliRuntime {
     readonly halt: ConductorHaltAdapter;
     readonly requestLaneRunStop: RequestLaneRunStopUseCase;
     readonly inspectLaneRuns: InspectLaneRunsUseCase;
+    /** PT1a (SN3): the runs parked past `policy.daemon.stallAfterMinutes`, for `conductor status --stalled`. */
+    readonly listStalledRuns: ListStalledRunsUseCase;
+    /** PT1a (SN2): raises, refreshes and clears one `stall:<runId>` attention item per stalled run. */
+    readonly stallAttention: StallAttentionAdapter;
+    /** PT1a: the failing gate file a verification receipt recorded, read to class a gate park. */
+    readonly gateFailingFile: GateFailingFileAdapter;
+    /** PT1a: `policy.daemon.stallAfterMinutes` as resolved at composition. */
+    readonly stallAfterMinutes: number;
     readonly listLaneRuns: ListLaneRunsUseCase;
     /** VZ5b: the recorded conductor passes newest first (conductor schedule --passes). */
     readonly listConductorPasses: ListConductorPassesUseCase;
@@ -792,6 +824,10 @@ export interface FleetCliRuntime {
     readonly reapLaneWorktrees: ReapLaneWorktreesUseCase;
     /** EX-4: the operator-opt-in orphan-session reap (conductor reap --sessions). */
     readonly reapOrphanSessions: ReapOrphanSessionsUseCase;
+    /** KW4b': the zombie reaper pass. */
+    readonly reapZombies: ReapZombiesUseCase;
+    /** KW4b': the reaper's findings store (file-backed with a state dir). */
+    readonly reaperFindingRepository: ReaperFindingRepositoryAdapter | InMemoryReaperFindingRepositoryAdapter;
     /** A fresh ULID per call (journal entry ids, run and attempt ids). */
     readonly newUlid: () => string;
     /** The project profile read the root already builds; exposed for `conductor start` (K7-7). */
@@ -1086,6 +1122,32 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executionJournal,
     workspace,
     runnerForAttempt,
+    reconcileAttempt: execution.reconcileAttempt,
+    mergeRecordRepository: execution.mergeRecordRepository,
+    runner,
+  });
+
+  // PT1ca: registration checks the open pull requests of the base branch, so it
+  // is built here, after the conductor composes its lane-run stores (a pull
+  // request bound to the work order by a run is never its own blocker). The
+  // forge read is bound in forge mode `github` only, as for AssessHeadAcceptance
+  // in the evidence composition: a workspace without a GitHub installation keeps
+  // registering, while every GitHub installation enforces the open-PR check and
+  // fails closed with `overlap-unknown` when the forge cannot be read.
+  const registerWorkOrder = new RegisterWorkOrderUseCase({
+    workOrderRepo: workOrderRepository,
+    profileRead,
+    lanePlanRepo: execution.lanePlanRepository,
+    heldWorkOrderRepo: execution.heldWorkOrderRepository,
+    runRepo: conductor.laneRunRepository,
+    attemptRepo: attemptRepository,
+    executionJournal,
+    computeDigest: sha256HexDigest,
+    // PT1ca fix 3: a hold skipped for an invalid blocker id is recorded as a
+    // work-execution attention item, through the same recorder the conductor
+    // and the daemon use.
+    recordAttentionItem: (body, actor) => coordination.recordAttentionItem.recordAttentionItem(body, actor),
+    ...(forgeMode === 'github' ? { forgeRead } : {}),
   });
 
   // KF-36b-1b: the operator's close command is built here, after the
@@ -1178,13 +1240,45 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     },
   });
 
+  // CO30a: `cutover status` reads the pause stores through read-only handles so a corrupt file is
+  // never quarantined; in memory mode the one writable instance is shared.
+  const durableCutover = stateDir !== undefined && stateDir.trim().length > 0;
+  const cutoverRecordRepository = new CutoverRecordRepositoryAdapter({ stateDir, nowIso: daemon.now });
+  const cutoverJournal = new CutoverJournalAdapter({ stateDir });
+  const killallTrainPause = new KillallTrainPauseAdapter({ stateDir });
+  const daemonPauseRead = durableCutover ? new DaemonPauseAdapter({ stateDir, readOnly: true }) : daemon.pause;
+  const trainPauseRead = durableCutover ? new KillallTrainPauseAdapter({ stateDir, readOnly: true }) : killallTrainPause;
+  const manageCutover = new ManageCutoverUseCase({
+    cutoverRepo: cutoverRecordRepository,
+    cutoverJournal,
+    daemonStatus: daemon.statusReadOnly,
+    daemonPauseRead,
+    daemonPause: daemon.pause,
+    trainPauseRead,
+    trainPause: killallTrainPause,
+    computeDigest: sha256HexDigest,
+    mintEntryId: daemon.newUlid,
+    nowIso: daemon.now,
+  });
+
   return {
     installation: options?.installation,
     daemon,
     coordination,
     knowledge,
     evidence,
-    execution: { ...execution, closeWorkOrder, listStaleWorkOrders, inspectMergeReadiness, inventoryRelaunch },
+    execution: {
+      ...execution,
+      registerWorkOrder,
+      closeWorkOrder,
+      listStaleWorkOrders,
+      inspectMergeReadiness,
+      inventoryRelaunch,
+      cutoverRecordRepository,
+      cutoverJournal,
+      killallTrainPause,
+      manageCutover,
+    },
     conductor,
     runnerTunnel,
     telemetry,

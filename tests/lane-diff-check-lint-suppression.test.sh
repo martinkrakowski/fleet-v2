@@ -94,4 +94,31 @@ printf 'export const a = 1;\n/* eslint no-console: error */\n' > "$r/packages/x/
 ( cd "$r" && git add -A && git commit -q -m lane )
 sh "$script" "$r" --base "$base" 2>&1 | grep -q 'lint-suppression'; [ $? -ne 0 ]; check $? "eslint rule set to error is not a finding"
 
+# 10. The scan does not flag its OWN definition: these files must contain the strings they
+# match, so a match in them is a definition, not a suppression. The exemption is deliberately
+# narrow, and cases 11 and 12 are what keep it from becoming a blind spot.
+r=$t/self-exempt; base=$(mk "$r")
+mkdir -p "$r/scripts"
+printf '#!/bin/sh\n# documents the forms it matches\n/* eslint no-console: off */\n# @ts-nocheck\n' > "$r/scripts/lane-diff-check.sh"
+( cd "$r" && git add -A && git commit -q -m lane )
+sh "$script" "$r" --base "$base" 2>&1 | grep -q '^lint-suppression:'; [ $? -ne 0 ]; check $? "a suppression form in the scan's own script is not a lint-suppression finding"
+
+# 11. The exemption is narrow: the same line in an ordinary source file is still a finding.
+r=$t/not-exempt; base=$(mk "$r")
+printf 'export const a = 1;\n/* eslint no-console: off */\n' > "$r/packages/x/src/a.ts"
+( cd "$r" && git add -A && git commit -q -m lane )
+sh "$script" "$r" --base "$base" 2>&1 | grep -q '^lint-suppression:'; check $? "the same form in an ordinary source file is still a finding"
+
+# 12. The exemption covers lint-suppression ONLY: an exempted file is still scanned for secrets,
+# which is what stops the exemption becoming a hole in the rest of the gate.
+r=$t/exempt-still-secret; base=$(mk "$r")
+mkdir -p "$r/tests"
+printf '# fixture\nk="sk-abcdefghijklmnopqrstuvwx"\n/* eslint no-console: off */\n' > "$r/tests/lane-diff-check-lint-suppression.test.sh"
+( cd "$r" && git add -A && git commit -q -m lane )
+out=$(sh "$script" "$r" --base "$base" 2>&1)
+printf '%s' "$out" | grep -q 'secret-pattern.*openai-style-key'; check $? "an exempted file is still scanned for secrets"
+# Anchored: the fixture's own file NAME contains "lint-suppression", so an unanchored
+# grep matches it inside the secret-pattern line and the assertion never means anything.
+printf '%s' "$out" | grep -q '^lint-suppression:'; [ $? -ne 0 ]; check $? "and still not for lint suppressions"
+
 echo "1..$n"; [ "$fails" = 0 ]

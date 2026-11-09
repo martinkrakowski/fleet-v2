@@ -62,4 +62,36 @@ printf 'export const k = "sk-abcdefghijklmnopqrstuvwx";\n' > "$r/packages/x/src/
 ( cd "$r" && git add -A && git commit -q -m lane )
 sh "$script" "$r" --base "$base" 2>&1 | grep -q 'secret-pattern.*openai-style-key'; check $? "a credential still reports as secret-pattern"
 
+# 6. New inline eslint rule disabling forms (the gap this PR closes).
+for form in \
+  '/* eslint no-console: off */' \
+  '/* eslint no-console: 0 */' \
+  '/* eslint no-console: "off" */' \
+  "/* eslint no-console: 'off' */" \
+  '/* eslint no-console: ["off"] */' \
+  "/* eslint no-console: ['off'] */"; do
+  r=$t/eslint-inline-$(printf '%s' "$form" | tr -cd 'a-z0-9'); base=$(mk "$r")
+  printf 'export const a = 1;\n%s\nexport const b = 2;\n' "$form" > "$r/packages/x/src/a.ts"
+  ( cd "$r" && git add -A && git commit -q -m lane )
+  sh "$script" "$r" --base "$base" 2>&1 | grep -q 'lint-suppression'; check $? "inline eslint rule off form is a finding: $form"
+done
+
+# 7. @ts-nocheck disables typechecking for an entire file.
+r=$t/tsnocheck; base=$(mk "$r")
+printf '// @ts-nocheck\nexport const a: string = 1 as never;\n' > "$r/packages/x/src/a.ts"
+( cd "$r" && git add -A && git commit -q -m lane )
+sh "$script" "$r" --base "$base" 2>&1 | grep -q 'lint-suppression'; check $? "an added @ts-nocheck is a finding"
+
+# 8. Negative: a comment that merely mentions eslint is NOT a finding.
+r=$t/eslint-mention; base=$(mk "$r")
+printf 'export const a = 1;\n// eslint is configured in eslint.config.js\n' > "$r/packages/x/src/a.ts"
+( cd "$r" && git add -A && git commit -q -m lane )
+sh "$script" "$r" --base "$base" 2>&1 | grep -q 'lint-suppression'; [ $? -ne 0 ]; check $? "a bare eslint mention is not a finding"
+
+# 9. Negative: a rule set to error is NOT a finding.
+r=$t/eslint-error; base=$(mk "$r")
+printf 'export const a = 1;\n/* eslint no-console: error */\n' > "$r/packages/x/src/a.ts"
+( cd "$r" && git add -A && git commit -q -m lane )
+sh "$script" "$r" --base "$base" 2>&1 | grep -q 'lint-suppression'; [ $? -ne 0 ]; check $? "eslint rule set to error is not a finding"
+
 echo "1..$n"; [ "$fails" = 0 ]

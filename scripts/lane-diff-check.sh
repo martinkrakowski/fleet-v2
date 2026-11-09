@@ -432,7 +432,7 @@ home-credential-path|/home/[a-z]+/\.(ssh|config/gh|gemini|aws|docker/config\.jso
 password-assignment|[Pp]assword[[:space:]]*[:=][[:space:]]*["'][^"']{6,}["']
 token-assignment|[Tt]oken[[:space:]]*[:=][[:space:]]*["'][A-Za-z0-9_./+=-]{16,}["']
 basic-auth-url|https?://[^/:@[:space:]]+:[^/@[:space:]]{6,}@
-lint-suppression|eslint-disable|@ts-(ignore|expect-error)
+lint-suppression|eslint-disable|eslint[[:space:]]+[a-zA-Z0-9_-]+[[:space:]]*:[[:space:]]*(off|0|"off"|'off'|\["off"\]|\['off'\])|@ts-(ignore|expect-error|nocheck)
 PAT
 
 # Resolve symbolic link $1 up to 40 hops against the physical worktree root $2.

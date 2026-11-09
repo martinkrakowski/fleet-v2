@@ -407,6 +407,40 @@ function decodeChecked(object: unknown): ApiParsedVerdict {
 }
 
 /** The reason codes a provider failure maps onto; all are existing review codes. */
+
+/**
+ * Scan an error list for a status code, walking each element from last to first.
+ * Module-private helper extracted to reduce the cognitive complexity of
+ * {@link findStatusCode}.
+ *
+ * @param list - The value read from an `errors` property (may be anything).
+ * @param depth - Current recursion depth; `depth > 4` stops the walk.
+ * @returns The first status code found, or `undefined` if none is reachable.
+ */
+function findStatusCodeInErrorList(list: unknown, depth: number): number | undefined {
+  let length = 0;
+  try {
+    length = Array.isArray(list) ? list.length : 0;
+  } catch {
+    length = 0;
+  }
+  if (!Number.isSafeInteger(length) || length > 16) {
+    return undefined;
+  }
+  // Last first: the most recent attempt is the one that surfaced.
+  for (let index = length - 1; index >= 0; index -= 1) {
+    const element = readOwn(list as unknown as object, String(index));
+    if (element.kind !== 'value') {
+      continue;
+    }
+    const found = findStatusCode(element.value, depth + 1);
+    if (found !== undefined) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
 /**
  * The HTTP status behind a provider failure, following the library's retry
  * wrapper.
@@ -442,26 +476,9 @@ export function findStatusCode(error: unknown, depth: number): number | undefine
 
   const nested = readOwn(error, 'errors');
   if (nested.kind === 'value') {
-    const list = nested.value;
-    let length = 0;
-    try {
-      length = Array.isArray(list) ? list.length : 0;
-    } catch {
-      length = 0;
-    }
-    if (!Number.isSafeInteger(length) || length > 16) {
-      return undefined;
-    }
-    // Last first: the most recent attempt is the one that surfaced.
-    for (let index = length - 1; index >= 0; index -= 1) {
-      const element = readOwn(list as unknown as object, String(index));
-      if (element.kind !== 'value') {
-        continue;
-      }
-      const found = findStatusCode(element.value, depth + 1);
-      if (found !== undefined) {
-        return found;
-      }
+    const found = findStatusCodeInErrorList(nested.value, depth);
+    if (found !== undefined) {
+      return found;
     }
   }
 

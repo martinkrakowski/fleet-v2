@@ -67,7 +67,7 @@ describe('the installed ai package still wraps a retried 429 as findStatusCode e
     it('errors is an own data array of length 2', () => {
       expect(ownKind(retryError, 'errors')).toBe('data');
       expect(Array.isArray(retryError.errors)).toBe(true);
-      expect(retryError.errors.length).toBe(2);
+      expect(retryError.errors).toHaveLength(2);
     });
 
     it('reason is an own data property with value maxRetriesExceeded', () => {

@@ -34,6 +34,8 @@ import {
   type OcmReviewTransportSpawn,
   type RunIndependentReviewRequest,
   selectReviewerSeat,
+  apiReviewConfigProblemCodeOf,
+  describeApiReviewConfigProblem,
 } from "@fleet/evidence-and-acceptance";
 import type {
   AttemptOwnerDecisionDelegate as EvidenceAttemptOwnerDecisionDelegate,
@@ -327,21 +329,23 @@ function buildReviewTransport(
       ...(settings.runnerRemoteHost !== undefined ? { remoteHost: settings.runnerRemoteHost } : {}),
     },
   });
+  const apiReview = resolveApiReviewSettings(process.env);
   const router = createReviewTransportRouter({
     seats,
     chains,
     locate: (attemptId) => locator.locate(attemptId),
     ocmRunBin: settings.ocmRunBin ?? defaultOcmRunPath(),
-    // The api transport's endpoint and its declared schema enforcement.
-    // Environmental like FLEET_OCM_RUN_BIN: it names the host-side key proxy,
-    // not routing. Absent leaves an `api` seat refusing, which is what it
-    // should do when nothing is configured.
-    ...resolveApiReviewSettings(process.env),
+    ...(apiReview.apiBaseURL !== undefined ? { apiBaseURL: apiReview.apiBaseURL } : {}),
+    ...(apiReview.apiSchemaEnforcement !== undefined
+      ? { apiSchemaEnforcement: apiReview.apiSchemaEnforcement }
+      : {}),
+    ...(apiReview.problemCode !== undefined ? { apiConfigProblemCode: apiReview.problemCode } : {}),
     ...(reviewSpawn !== undefined ? { ocmSpawn: reviewSpawn } : {}),
   });
   // The locator and the transports can fail with messages that name the attempt's recorded host,
   // its worktree path or subprocess stderr. The repository is public, so only seat selection's
-  // own refusal passes through; every other failure becomes one fixed, host-free reason.
+  // own refusal and the api transport's typed configuration refusal pass through, and
+  // every other failure becomes one fixed, host-free reason.
   return async (
     request: RunIndependentReviewRequest,
   ): Promise<IndependentReviewTransportResult> => {
@@ -353,8 +357,17 @@ function buildReviewTransport(
     }
     try {
       return await router(request);
-    } catch {
-      // Any later failure reaches an API caller as one fixed, host-free reason: locator and
+    } catch (error) {
+      const configProblemCode = apiReviewConfigProblemCodeOf(error);
+      if (configProblemCode !== undefined) {
+        // The ONE pass-through: not the error's message, but text regenerated
+        // here from a closed set of codes. `describeApiReviewConfigProblem`
+        // composes it from the two variable names and the allowed enforcement
+        // values alone, so no host, path, seat id, URL or stderr can ride along
+        // even though the thrown message names the seat.
+        throw new Error(describeApiReviewConfigProblem(configProblemCode));
+      }
+      // Any other failure reaches an API caller as one fixed, host-free reason: locator and
       // subprocess errors can carry hosts, paths, stderr or tokens, and the repository is public.
       throw new Error("review transport unavailable");
     }

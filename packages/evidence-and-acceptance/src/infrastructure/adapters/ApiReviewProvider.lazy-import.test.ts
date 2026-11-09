@@ -23,9 +23,48 @@ describe('createSdkApiReviewGenerate: lazy SDK import', () => {
     expect(generate.constructor.name).toBe('AsyncFunction');
   });
 
+  /**
+   * Walks the error cause chain to find the first error with a `code` property.
+   * Also checks the `errors` array (for RetryError from AI SDK).
+   * Returns the code if found, otherwise undefined.
+   */
+  function findErrorCode(error: Error): string | number | undefined {
+    const visited = new Set<Error>();
+
+    function walk(err: Error | undefined): string | number | undefined {
+      if (!err || visited.has(err)) return undefined;
+      visited.add(err);
+
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== undefined) {
+        return code;
+      }
+
+      // Check cause chain
+      const cause = (err as { cause?: Error }).cause;
+      if (cause) {
+        const found = walk(cause);
+        if (found !== undefined) return found;
+      }
+
+      // Check errors array (for AI SDK RetryError)
+      const errors = (err as { errors?: Error[] }).errors;
+      if (Array.isArray(errors)) {
+        for (const e of errors) {
+          const found = walk(e);
+          if (found !== undefined) return found;
+        }
+      }
+
+      return undefined;
+    }
+
+    return walk(error);
+  }
+
   it('loads the SDK on first call of the returned function', async () => {
     const generate = createSdkApiReviewGenerate({
-      baseURL: 'http://test',
+      baseURL: 'http://127.0.0.1:9999',
       model: 'test-model',
       schemaEnforcement: 'json-object',
     });
@@ -37,41 +76,46 @@ describe('createSdkApiReviewGenerate: lazy SDK import', () => {
     const input = {
       system: 'test',
       prompt: 'test',
-      abortSignal: AbortSignal.timeout(100),
+      abortSignal: AbortSignal.timeout(5000),
     };
 
     // We expect this to fail because there's no real endpoint, but the failure
     // should be a network/transport error, not a module loading error.
     // The dynamic import of 'ai' and '@ai-sdk/openai-compatible' must have
     // succeeded for the code to reach the network call.
-    let errorCode: string | undefined;
+    let error: Error | null = null;
     try {
       await generate(input);
-    } catch (error) {
-      if (error instanceof Error) {
-        // Network errors like ECONNREFUSED mean the SDK loaded and tried to call
-        // the endpoint. Module loading errors (MODULE_NOT_FOUND, etc.) would mean
-        // the dynamic import failed.
-        errorCode = (error as NodeJS.ErrnoException).code;
-      }
+    } catch (e) {
+      error = e as Error;
     }
 
-    // If we got a network error (ECONNREFUSED, ENOTFOUND, etc.), the SDK loaded
-    // successfully and attempted the call. If we got MODULE_NOT_FOUND, the
-    // dynamic import failed.
-    // We accept any error that is NOT a module resolution error.
+    // A successful call (no error) means the test setup is wrong — we must fail.
+    expect(error).not.toBeNull();
+
+    // The error (or its cause chain) MUST have a code property.
+    // An error without a code anywhere in its chain (e.g., a generic Error
+    // from a failed import that didn't set a code) would not be a network
+    // error and must fail the test.
+    const errorCode = findErrorCode(error!);
+    expect(errorCode).toBeDefined();
+
+    // If we got a network error (ECONNREFUSED, ENOTFOUND, EAI_AGAIN, etc.),
+    // the SDK loaded successfully and attempted the call.
+    // If we got MODULE_NOT_FOUND or ERR_MODULE_NOT_FOUND, the dynamic import failed.
     expect(errorCode).not.toBe('MODULE_NOT_FOUND');
     expect(errorCode).not.toBe('ERR_MODULE_NOT_FOUND');
+    // We accept network error codes (strings like ECONNREFUSED, or numeric errno).
+    // We only forbid the module error codes above.
   });
 
   it('caches the SDK after first load (subsequent calls reuse it)', async () => {
     const generate = createSdkApiReviewGenerate({
-      baseURL: 'http://test',
+      baseURL: 'http://127.0.0.1:9999',
       model: 'test-model',
       schemaEnforcement: 'json-object',
     });
 
-    // Use a longer timeout so the network attempt happens before abort
     const input = {
       system: 'test',
       prompt: 'test',
@@ -94,12 +138,19 @@ describe('createSdkApiReviewGenerate: lazy SDK import', () => {
       secondError = error as Error;
     }
 
-    // Both should have failed with network/transport errors, not module errors
+    // Both calls MUST have thrown (no successful call in this test setup).
+    // A null error means the call succeeded unexpectedly — fail the test.
     expect(firstError).not.toBeNull();
     expect(secondError).not.toBeNull();
+
+    // Both errors (or their cause chains) MUST have a code property.
+    // An error without a code anywhere in its chain fails the test.
+    const firstCode = findErrorCode(firstError!);
+    const secondCode = findErrorCode(secondError!);
+    expect(firstCode).toBeDefined();
+    expect(secondCode).toBeDefined();
+
     // The error should be a network error (ECONNREFUSED, etc.), not a module error
-    const firstCode = (firstError as NodeJS.ErrnoException)?.code;
-    const secondCode = (secondError as NodeJS.ErrnoException)?.code;
     expect(firstCode).not.toBe('MODULE_NOT_FOUND');
     expect(firstCode).not.toBe('ERR_MODULE_NOT_FOUND');
     expect(secondCode).not.toBe('MODULE_NOT_FOUND');

@@ -529,6 +529,16 @@ while IFS= read -r f; do
   : > "$T/hits"
   while IFS='|' read -r name re; do
     [ -n "$name" ] || continue
+    # The lint-suppression pattern must not flag its own definition or tests: these files
+    # contain the strings they match, so a match in them is a definition, not a suppression.
+    # Exemption applies to lint-suppression ONLY; those files stay fully subject to secret-pattern.
+    case "$name" in
+      lint-suppression)
+        case "$f" in
+          scripts/lane-diff-check.sh | scripts/lane-diff-check.protected | tests/lane-diff-check*.test.sh) continue ;;
+        esac
+        ;;
+    esac
     # -a keeps a NUL-containing file scannable instead of skipping it as binary
     # (shell minor 10).
     grep -naE -e "$re" -- "$scan_target" 2>/dev/null | cut -d: -f1 | sed "s/\$/ $name/" >> "$T/hits"

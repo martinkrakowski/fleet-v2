@@ -15,6 +15,7 @@ import type { ReviewUnavailableCode, RunIndependentReviewRequest } from '../../a
 import { CLI_REVIEW_ARGV_TEMPLATES, createCliReviewTransport } from './CliReviewTransport.adapter.js';
 import type { CliReviewSpawn } from './CliReviewTransport.adapter.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
+import { createSdkApiReviewGenerate } from './ApiReviewProvider.js';
 import { createApiReviewTransport } from './ApiReviewTransport.adapter.js';
 import type { ApiReviewGenerate, ApiSchemaEnforcement } from './ApiReviewTransport.adapter.js';
 import { createOcmReviewTransport, ReviewTransportError } from './OcmReviewTransport.adapter.js';
@@ -159,7 +160,12 @@ export interface ReviewTransportRouterOptions {
    * schema-enforcing (ADR-0001, requirement 6).
    */
   readonly apiSchemaEnforcement?: ApiSchemaEnforcement;
-  /** Test seam: the provider call. Absent binds the provider library. */
+  /**
+   * Test seam only. Absent binds the provider library through
+   * `createSdkApiReviewGenerate`, which is what `runApi` now does: an earlier
+   * version of this comment claimed that and the code did not do it, so an
+   * `api` seat refused with `transport-missing` instead of calling anything.
+   */
   readonly apiGenerate?: ApiReviewGenerate;
 }
 
@@ -232,14 +238,22 @@ function runApi(
     );
   }
 
+  const generate =
+    options.apiGenerate ??
+    createSdkApiReviewGenerate({
+      baseURL: options.apiBaseURL,
+      model: seat.model,
+      schemaEnforcement: options.apiSchemaEnforcement,
+    });
+
   const transport = createApiReviewTransport({
     baseURL: options.apiBaseURL,
     model: seat.model,
     schemaEnforcement: options.apiSchemaEnforcement,
     location,
+    generate,
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.makeNonce !== undefined ? { makeNonce: options.makeNonce } : {}),
-    ...(options.apiGenerate !== undefined ? { generate: options.apiGenerate } : {}),
   });
   return transport(request);
 }

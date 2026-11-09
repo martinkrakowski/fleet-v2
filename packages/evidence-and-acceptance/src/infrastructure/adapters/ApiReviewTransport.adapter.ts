@@ -119,6 +119,13 @@ export interface ApiReviewGenerateResult {
   readonly warnings?: readonly string[];
   /** Token usage when the provider reported it. */
   readonly usage?: { readonly inputTokens?: number; readonly outputTokens?: number };
+  /**
+   * The provider answered, but not with an object the library could parse at
+   * all (a non-JSON reply). The provider module reports it here instead of
+   * throwing, so it decodes as `unknown`/`unparseable-verdict` rather than
+   * being misclassified as an unreachable endpoint (pre-merge finding 5).
+   */
+  readonly noObject?: boolean;
 }
 
 export interface ApiReviewTransportOptions {
@@ -144,12 +151,66 @@ const SYSTEM_PROMPT = [
   UNTRUSTED_INPUT_RULE,
 ].join('\n');
 
-/** A positive integer line number, or null. Rejects 1.5, NaN, Infinity and -1. */
+/**
+ * One own DATA property. An absent, inherited or accessor-backed field, or a
+ * descriptor read that throws, is reported rather than read: a provider answer
+ * must never be able to run code here or to decide a verdict through a getter.
+ *
+ * Luna and the pre-merge pass both found the previous version reading top-level
+ * fields with `record['result']`, which ran accessors and could throw out of the
+ * decoder. Every read now goes through this.
+ */
+type OwnRead =
+  | { readonly kind: 'value'; readonly value: unknown }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unreadable' };
+
+function readOwn(target: object, key: string): OwnRead {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    if (descriptor === undefined) {
+      return { kind: 'absent' };
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { kind: 'unreadable' };
+    }
+    return { kind: 'value', value: descriptor.value };
+  } catch {
+    // A Proxy trap that throws is a malformed answer, not a crash.
+    return { kind: 'unreadable' };
+  }
+}
+
+/**
+ * True when the object carries only the keys the schema declares. The schema
+ * says `additionalProperties: false`, so an answer with extra keys is not
+ * conforming; the previous version declared that and did not check it, which
+ * also let unreviewed provider text reach the stored raw copy.
+ */
+function hasOnlyKeys(target: object, allowed: readonly string[]): boolean {
+  try {
+    const names = Object.getOwnPropertyNames(target);
+    for (const name of names) {
+      if (!allowed.includes(name)) {
+        return false;
+      }
+    }
+    return Object.getOwnPropertySymbols(target).length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A line number that can actually identify a source line: a safe integer of 1
+ * or more. `Number.isInteger(1e100)` is true, so the safe-integer check is the
+ * one that matters.
+ */
 function readLine(value: unknown): number | null | 'invalid' {
   if (value === null || value === undefined) {
     return null;
   }
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
     return 'invalid';
   }
   return value;
@@ -166,52 +227,62 @@ function readPath(value: unknown): string | null | 'invalid' {
   return value.trim();
 }
 
+const FINDING_KEYS = ['severity', 'summary', 'filePath', 'line'] as const;
+const VERDICT_KEYS = ['result', 'findings'] as const;
+
+/** A plain object: an `Object.prototype` or null prototype, and not an array. */
+function isPlainish(raw: unknown): raw is object {
+  if (typeof raw !== 'object' || raw === null) {
+    return false;
+  }
+  try {
+    if (Array.isArray(raw)) {
+      return false;
+    }
+    const prototype = Object.getPrototypeOf(raw);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    // A revoked Proxy throws here. Malformed, not a crash.
+    return false;
+  }
+}
+
 /**
  * Decode one finding. Returns `'invalid'` for anything the schema should have
  * excluded, because `json-object` enforcement cannot be trusted to have done so.
  */
 function decodeFinding(raw: unknown, index: number): ReviewFindingRecord | 'invalid' {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+  if (!isPlainish(raw)) {
     return 'invalid';
   }
-  const prototype = Object.getPrototypeOf(raw);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return 'invalid';
-  }
-
-  // Own-property reads only: an inherited or accessor-backed field is a
-  // malformed answer, and no getter from provider data ever runs.
-  let severity: unknown;
-  let summary: unknown;
-  let filePath: unknown;
-  let line: unknown;
-  try {
-    const own = Object.getOwnPropertyDescriptors(raw as Record<string, unknown>);
-    if (own['severity']?.get !== undefined || own['summary']?.get !== undefined) {
-      return 'invalid';
-    }
-    if (own['filePath']?.get !== undefined || own['line']?.get !== undefined) {
-      return 'invalid';
-    }
-    severity = own['severity']?.value;
-    summary = own['summary']?.value;
-    filePath = own['filePath']?.value;
-    line = own['line']?.value;
-  } catch {
+  if (!hasOnlyKeys(raw, FINDING_KEYS)) {
     return 'invalid';
   }
 
+  const severityRead = readOwn(raw, 'severity');
+  const summaryRead = readOwn(raw, 'summary');
+  const pathRead = readOwn(raw, 'filePath');
+  const lineRead = readOwn(raw, 'line');
+  if (severityRead.kind !== 'value' || summaryRead.kind !== 'value') {
+    return 'invalid';
+  }
+  if (pathRead.kind === 'unreadable' || lineRead.kind === 'unreadable') {
+    return 'invalid';
+  }
+
+  const severity = severityRead.value;
+  const summary = summaryRead.value;
   if (typeof severity !== 'string' || !SEVERITIES.includes(severity)) {
     return 'invalid';
   }
   if (typeof summary !== 'string' || summary.trim() === '') {
     return 'invalid';
   }
-  const decodedPath = readPath(filePath);
+  const decodedPath = readPath(pathRead.kind === 'value' ? pathRead.value : null);
   if (decodedPath === 'invalid') {
     return 'invalid';
   }
-  const decodedLine = readLine(line);
+  const decodedLine = readLine(lineRead.kind === 'value' ? lineRead.value : null);
   if (decodedLine === 'invalid') {
     return 'invalid';
   }
@@ -230,39 +301,68 @@ function decodeFinding(raw: unknown, index: number): ReviewFindingRecord | 'inva
 
 /**
  * Check a provider answer against the verdict contract. Every rejection is a
- * typed `unknown` with a fixed reason, never a thrown error and never a pass:
+ * typed `unknown` with a fixed reason, NEVER a thrown error and never a pass:
  * that is the whole point of this transport over a text parser.
+ *
+ * The outer try is deliberate belt and braces. Every read below is already
+ * descriptor-based, but a hostile object can throw from places that are easy to
+ * miss, and a decoder that throws would break the contract this function exists
+ * to provide.
  */
 export function decodeApiVerdict(object: unknown): ApiParsedVerdict {
+  try {
+    return decodeChecked(object);
+  } catch {
+    return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+  }
+}
+
+function decodeChecked(object: unknown): ApiParsedVerdict {
   if (object === null || object === undefined) {
     return { result: 'unknown', findings: [], unknownReason: 'empty' };
   }
-  if (typeof object !== 'object' || Array.isArray(object)) {
+  if (!isPlainish(object)) {
+    return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+  }
+  if (!hasOnlyKeys(object, VERDICT_KEYS)) {
     return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
   }
 
-  const record = object as Record<string, unknown>;
-  const result = Object.hasOwn(record, 'result') ? record['result'] : undefined;
+  const resultRead = readOwn(object, 'result');
+  const findingsRead = readOwn(object, 'findings');
+  if (resultRead.kind !== 'value' || findingsRead.kind !== 'value') {
+    return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+  }
+
+  const result = resultRead.value;
   if (typeof result !== 'string' || !RESULTS.includes(result)) {
     return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
   }
 
-  const rawFindings = Object.hasOwn(record, 'findings') ? record['findings'] : undefined;
-  if (!Array.isArray(rawFindings)) {
+  const rawFindings = findingsRead.value;
+  let length: number;
+  try {
+    if (!Array.isArray(rawFindings)) {
+      return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+    }
+    length = rawFindings.length;
+  } catch {
     return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
   }
-  if (rawFindings.length > MAX_API_REVIEW_FINDINGS) {
+  if (!Number.isSafeInteger(length) || length > MAX_API_REVIEW_FINDINGS) {
     return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
   }
 
   const findings: ReviewFindingRecord[] = [];
-  for (let index = 0; index < rawFindings.length; index += 1) {
+  for (let index = 0; index < length; index += 1) {
     // A hole in a sparse array is a malformed answer, checked by index because
-    // `for...of` and `every` skip holes.
-    if (!(index in rawFindings)) {
+    // `for...of` and `every` skip holes. The element itself is read as an own
+    // data property so an index-level getter cannot run.
+    const element = readOwn(rawFindings as unknown as object, String(index));
+    if (element.kind !== 'value') {
       return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
     }
-    const decoded = decodeFinding(rawFindings[index], findings.length);
+    const decoded = decodeFinding(element.value, findings.length);
     if (decoded === 'invalid') {
       return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
     }
@@ -360,6 +460,14 @@ export function createApiReviewTransport(
     if (diff === null) {
       throw new ReviewTransportError('The diff under review could not be read', 'transport-failed');
     }
+    if (diff.trim() === '') {
+      // A blank diff is reachable in production: when the recorded base equals
+      // the head under review, `git diff X X` prints nothing and exits 0, so the
+      // locator returns '' rather than null. Sending it asks the model to judge
+      // nothing, and the system prompt invites a "pass". The opencode transport
+      // already refuses exactly this in `classifyDiffForEmbedding`; this follows it.
+      throw new ReviewTransportError('The change under review could not be seen', 'transport-failed');
+    }
     if (Buffer.byteLength(diff, 'utf8') > MAX_API_REVIEW_DIFF_BYTES) {
       // A truncated diff makes a verdict that reads as complete, so this refuses.
       throw new ReviewTransportError('The diff under review is larger than this transport forwards', 'transport-failed');
@@ -386,13 +494,40 @@ export function createApiReviewTransport(
       throw new ReviewTransportError(classified.reason, classified.code);
     }
 
-    const parsed = decodeApiVerdict(answer.object);
+    // The declaration must be true on the wire, not just in configuration. When
+    // a seat declares schema enforcement and the endpoint reports that it ignored
+    // the response format, the declaration is false and the review is refused
+    // rather than silently graded by the decoder alone (ADR-0001 requirement 6).
+    const warnings = answer.warnings ?? [];
+    if (options.schemaEnforcement !== 'json-object' && warnings.includes('unsupported:responseFormat')) {
+      throw new ReviewTransportError(
+        'The endpoint did not enforce the declared response schema',
+        'transport-failed',
+      );
+    }
 
-    // The raw answer is kept for the receipt, bounded and serialised by us: the
-    // provider's own text is never echoed into a record unbounded.
+    const parsed =
+      answer.noObject === true
+        ? ({ result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' } as const)
+        : decodeApiVerdict(answer.object);
+
+    // The receipt copy is built from the DECODED verdict, never from the
+    // provider's object: serialising the raw answer would persist any extra
+    // property the model added, which is unreviewed provider text in a record
+    // (review finding 3). Only fields this adapter validated are kept.
     let rawOutput: string;
     try {
-      rawOutput = JSON.stringify(answer.object ?? null) ?? 'null';
+      rawOutput =
+        JSON.stringify({
+          result: parsed.result,
+          ...(parsed.unknownReason !== undefined ? { unknownReason: parsed.unknownReason } : {}),
+          findings: parsed.findings.map((finding) => ({
+            severity: finding.severity,
+            summary: finding.summary,
+            filePath: finding.filePath,
+            line: finding.line,
+          })),
+        }) ?? 'null';
     } catch {
       rawOutput = 'null';
     }

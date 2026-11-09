@@ -14,7 +14,7 @@
  * to be present.
  */
 
-import { generateObject, jsonSchema } from 'ai';
+import { generateObject, jsonSchema, NoObjectGeneratedError } from 'ai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 
 import type { ApiReviewGenerate, ApiReviewGenerateResult, ApiSchemaEnforcement } from './ApiReviewTransport.adapter.js';
@@ -25,9 +25,18 @@ export interface SdkApiReviewGenerateOptions {
   readonly baseURL: string;
   readonly model: string;
   /**
-   * Recorded for traceability. The library chooses its own strategy and does
-   * not expose a knob to pin it, which is exactly why the transport validates
-   * the answer itself rather than trusting that a schema was enforced.
+   * Which response format this seat's endpoint is declared to honour, and it
+   * DOES reach the wire.
+   *
+   * Corrected 2026-11-08 after the pre-merge pass: an earlier version of this
+   * comment said the library exposes no knob to pin the strategy. That was
+   * wrong. `createOpenAICompatible` defaults `supportsStructuredOutputs` to
+   * false, and with it false `generateObject` sends
+   * `response_format: {type: 'json_object'}` and NO schema — so a seat declared
+   * `native-json-schema` was in fact getting json-mode, which is the
+   * "capability declared but not real" failure the transport header forbids.
+   * The flag is set from this value below, and the transport refuses the review
+   * when the endpoint reports that it ignored the format anyway.
    */
   readonly schemaEnforcement: ApiSchemaEnforcement;
   /** Provider name for the library's own error messages. */
@@ -46,32 +55,53 @@ export interface SdkApiReviewGenerateOptions {
 const PROXY_INJECTS_THE_KEY = 'proxy-injects-the-real-key';
 
 export function createSdkApiReviewGenerate(options: SdkApiReviewGenerateOptions): ApiReviewGenerate {
+  // json-object is the only level that genuinely wants json-mode; the other two
+  // need the schema on the wire, which this flag is what enables.
+  const structured = options.schemaEnforcement !== 'json-object';
+
   const provider = createOpenAICompatible({
     name: options.providerName ?? 'fleet-key-proxy',
     baseURL: options.baseURL,
     apiKey: PROXY_INJECTS_THE_KEY,
+    supportsStructuredOutputs: structured,
   });
 
   return async (input): Promise<ApiReviewGenerateResult> => {
-    const generated = await generateObject({
-      model: provider.chatModel(options.model),
-      schema: jsonSchema(API_REVIEW_VERDICT_SCHEMA),
-      schemaName: 'review_verdict',
-      system: input.system,
-      prompt: input.prompt,
-      abortSignal: input.abortSignal,
-      maxRetries: options.maxRetries ?? 1,
-    });
-
-    const warnings = (generated.warnings ?? []).map((warning) => {
-      // Warnings are the library's own diagnostics (a dropped setting, an
-      // unsupported option). Only the type is kept: a message may carry request
-      // detail, and nothing here is acted on.
-      if (typeof warning === 'object' && warning !== null && 'type' in warning) {
-        const type = (warning as { readonly type?: unknown }).type;
-        return typeof type === 'string' ? type : 'unknown';
+    let generated;
+    try {
+      generated = await generateObject({
+        model: provider.chatModel(options.model),
+        schema: jsonSchema(API_REVIEW_VERDICT_SCHEMA),
+        schemaName: 'review_verdict',
+        system: input.system,
+        prompt: input.prompt,
+        abortSignal: input.abortSignal,
+        maxRetries: options.maxRetries ?? 1,
+      });
+    } catch (error) {
+      // A reply the library could not parse into an object at all is a
+      // malformed VERDICT, not an unreachable endpoint. Reporting it as such
+      // keeps it on the `unknown`/`unparseable-verdict` path instead of being
+      // classified as a transport failure (pre-merge finding 5). Every other
+      // error keeps propagating so the transport can classify it.
+      if (NoObjectGeneratedError.isInstance(error)) {
+        return { object: undefined, noObject: true };
       }
-      return 'unknown';
+      throw error;
+    }
+
+    // Warnings are the library's own diagnostics. Only `type:feature` is kept —
+    // never `details`, which carries request text — and the transport ACTS on
+    // `unsupported:responseFormat`, which is how a false enforcement
+    // declaration is caught rather than discarded as it was before.
+    const warnings = (generated.warnings ?? []).map((warning) => {
+      if (typeof warning !== 'object' || warning === null) {
+        return 'unknown';
+      }
+      const record = warning as { readonly type?: unknown; readonly feature?: unknown };
+      const type = typeof record.type === 'string' ? record.type : 'unknown';
+      const feature = typeof record.feature === 'string' ? record.feature : '';
+      return feature === '' ? type : `${type}:${feature}`;
     });
 
     return {

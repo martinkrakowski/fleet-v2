@@ -272,14 +272,16 @@ describe('createApiReviewTransport: the completed result', () => {
     expect(JSON.parse(result.rawOutput)).toEqual({ result: 'pass', findings: [] });
   });
 
-  it('survives an unserialisable answer without throwing', async () => {
+  it('a cyclic answer carries an extra key, so it is unknown and still serialises', async () => {
     const cyclic: Record<string, unknown> = { result: 'pass', findings: [] };
     cyclic['self'] = cyclic;
     const run = transport(answers(cyclic));
     const result = await run(request);
-    // The verdict still decodes; only the raw copy degrades.
-    expect(result.result).toBe('pass');
-    expect(result.rawOutput).toBe('null');
+    // The extra key fails additionalProperties, so it never reaches a pass, and
+    // rawOutput is built from the decoded verdict rather than the cyclic object.
+    expect(result.result).toBe('unknown');
+    expect(result.unknownReason).toBe('unparseable-verdict');
+    expect(JSON.parse(result.rawOutput)).toEqual({ result: 'unknown', unknownReason: 'unparseable-verdict', findings: [] });
   });
 
   it('sends the brief and the diff wrapped as untrusted input', async () => {
@@ -310,5 +312,151 @@ describe('createApiReviewTransport: the completed result', () => {
     await run(request);
     expect(seenSystem).toMatch(/read-only/);
     expect(seenSystem).toMatch(/no command/);
+  });
+});
+
+describe('review round 1: the defects both reviewers found', () => {
+  it('a blank diff is refused, not graded (the production case base === head)', async () => {
+    let called = false;
+    const run = transport(
+      async () => {
+        called = true;
+        return { object: { result: 'pass', findings: [] } };
+      },
+      { readDiff: async () => '' },
+    );
+    await expect(run(request)).rejects.toThrow(/could not be seen/);
+    expect(called).toBe(false);
+  });
+
+  it('a whitespace-only diff is refused too', async () => {
+    const run = transport(answers({ result: 'pass', findings: [] }), { readDiff: async () => '\n  \t\n' });
+    await expect(run(request)).rejects.toThrow(/could not be seen/);
+  });
+
+  it('an extra top-level key fails additionalProperties and never passes', () => {
+    expect(decodeApiVerdict({ result: 'pass', findings: [], note: 'anything' })).toMatchObject({
+      result: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+  });
+
+  it('an extra key on a finding is rejected', () => {
+    expect(
+      decodeApiVerdict({
+        result: 'fail',
+        findings: [{ severity: 'major', summary: 'x', filePath: null, line: 1, extra: 'text' }],
+      }),
+    ).toMatchObject({ result: 'unknown', unknownReason: 'unparseable-verdict' });
+  });
+
+  it('a TOP-LEVEL getter cannot supply a pass and cannot throw out of the decoder', () => {
+    expect(
+      decodeApiVerdict({
+        get result() {
+          return 'pass';
+        },
+        findings: [],
+      }),
+    ).toMatchObject({ result: 'unknown', unknownReason: 'unparseable-verdict' });
+
+    expect(() =>
+      decodeApiVerdict({
+        get result(): string {
+          throw new Error('should not escape');
+        },
+        findings: [],
+      }),
+    ).not.toThrow();
+  });
+
+  it('a revoked Proxy is unknown, not a thrown TypeError', () => {
+    const revocable = Proxy.revocable({ result: 'pass', findings: [] }, {});
+    revocable.revoke();
+    expect(() => decodeApiVerdict(revocable.proxy)).not.toThrow();
+    expect(decodeApiVerdict(revocable.proxy)).toMatchObject({ result: 'unknown' });
+  });
+
+  it('a Proxy whose descriptor trap throws is unknown, not a throw', () => {
+    const hostile = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor(): never {
+          throw new Error('trap');
+        },
+        ownKeys(): never {
+          throw new Error('trap');
+        },
+      },
+    );
+    expect(() => decodeApiVerdict(hostile)).not.toThrow();
+    expect(decodeApiVerdict(hostile)).toMatchObject({ result: 'unknown' });
+  });
+
+  it('an index-level getter on the findings array cannot run', () => {
+    const arr: unknown[] = [];
+    Object.defineProperty(arr, '0', {
+      enumerable: true,
+      configurable: true,
+      get(): never {
+        throw new Error('should not run');
+      },
+    });
+    arr.length = 1;
+    expect(() => decodeApiVerdict({ result: 'fail', findings: arr })).not.toThrow();
+    expect(decodeApiVerdict({ result: 'fail', findings: arr })).toMatchObject({
+      result: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+  });
+
+  it('a line number that is an integer but not a SAFE integer is rejected', () => {
+    expect(
+      decodeApiVerdict({ result: 'fail', findings: [{ severity: 'major', summary: 'x', filePath: 'a.ts', line: 1e100 }] }),
+    ).toMatchObject({ result: 'unknown', unknownReason: 'unparseable-verdict' });
+  });
+
+  it('an answer the library could not parse is unparseable, not an unreachable endpoint', async () => {
+    const run = transport(async () => ({ object: undefined, noObject: true }));
+    const result = await run(request);
+    expect(result.result).toBe('unknown');
+    expect(result.unknownReason).toBe('unparseable-verdict');
+  });
+
+  it('a declared schema the endpoint ignored is a refusal, not a decoder-only grade', async () => {
+    const run = transport(async () => ({
+      object: { result: 'pass', findings: [] },
+      warnings: ['unsupported:responseFormat'],
+    }));
+    await expect(run(request)).rejects.toThrow(/did not enforce the declared response schema/);
+  });
+
+  it('the same warning is not a refusal for a seat that declared json-object', async () => {
+    const run = createApiReviewTransport({
+      baseURL: 'http://10.0.0.1:4176/inception/v1',
+      model: 'mercury-3',
+      schemaEnforcement: 'json-object',
+      location: location(),
+      makeNonce: () => '0123456789abcdef',
+      generate: async () => ({
+        object: { result: 'pass', findings: [] },
+        warnings: ['unsupported:responseFormat'],
+      }),
+    });
+    await expect(run(request)).resolves.toMatchObject({ result: 'pass' });
+  });
+
+  it('rawOutput carries only validated fields, never provider text the decoder rejected', async () => {
+    const run = transport(
+      answers({
+        result: 'fail',
+        findings: [{ severity: 'major', summary: 'real finding', filePath: 'a.ts', line: 3 }],
+      }),
+    );
+    const result = await run(request);
+    expect(JSON.parse(result.rawOutput)).toEqual({
+      result: 'fail',
+      findings: [{ severity: 'major', summary: 'real finding', filePath: 'a.ts', line: 3 }],
+    });
   });
 });

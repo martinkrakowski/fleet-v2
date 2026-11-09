@@ -161,7 +161,7 @@ describe('fleet-v2 state compact', () => {
     expect(result.out).toContain('compacted journal.json: 2 -> 1 records\n');
     expect(result.out).toContain('compacted reservations.json: 2 -> 1 records\n');
     expect(result.out).toContain('state compact: 3 of 3 stores compacted\n');
-    expect(result.out).toContain('state check after compaction: all 32 store files readable or missing\n');
+    expect(result.out).toContain('state check after compaction: all 33 store files readable or missing\n');
     expect(await idsOf(dir, 'attempts.json')).toEqual(['att-live']);
     expect(await idsOf(dir, 'journal.json')).toEqual(['j-live']);
     expect(await idsOf(dir, 'reservations.json')).toEqual(['res-live']);
@@ -294,7 +294,7 @@ describe('fleet-v2 state compact', () => {
     expect(result.code).toBe(0);
     expect(await idsOf(dir, 'attempts.json')).toEqual(['att-live']);
     expect(await exists(path.join(dir, 'attempts.json.compacted'))).toBe(false);
-    expect(result.out).toContain('state check after compaction: all 32 store files readable or missing\n');
+    expect(result.out).toContain('state check after compaction: all 33 store files readable or missing\n');
   });
 
   it('keeps an attempt a kept attempt names as its prior attempt', async () => {

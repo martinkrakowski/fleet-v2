@@ -112,6 +112,10 @@ export interface ReaperPolicy {
   readonly retentionHours?: number;
   /** `policy.conductor.reaper.disk.clearFreePercent` (D9). Default 20; must order above minFreePercent. */
   readonly clearFreePercent?: number;
+  /** `policy.conductor.reaper.worktrees.maxRemovalsPerPass` (§3.10.4). Default 10. */
+  readonly maxRemovalsPerPass?: number;
+  /** `policy.conductor.reaper.worktrees.passBudgetSeconds` (§3.10.4). Default 120. */
+  readonly passBudgetSeconds?: number;
 }
 
 export interface ReaperFacts {

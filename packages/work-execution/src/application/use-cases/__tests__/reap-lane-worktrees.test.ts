@@ -1318,9 +1318,12 @@ describe('ReapLaneWorktreesUseCase', () => {
     expect(cleanResult.journalFailed[0]!.reason).toBe('journal write failed');
   });
 
-  it('never references removeLaneWorktree: only ReapLaneWorktreesUseCase calls removeWorktree among implemented use cases', async () => {
+  it('never references removeLaneWorktree: only the two reaper use cases call removeWorktree among implemented use cases', async () => {
     // Composition guard (C2'): no non-reaper use case in the work-execution
-    // application layer may call `removeWorktree` or `removeLaneWorktree`.
+    // application layer may call `removeWorktree`, and nobody may call
+    // `removeLaneWorktree`. The two reaper use cases (
+    // ReapLaneWorktreesUseCase and ReapZombiesUseCase) must keep the
+    // `removeWorktree` reference.
     const useCaseDir = path.resolve(
       path.dirname(fileURLToPath(import.meta.url)),
       '..',
@@ -1338,12 +1341,17 @@ describe('ReapLaneWorktreesUseCase', () => {
           continue;
         }
         const text = fs.readFileSync(full, 'utf8');
-        const referencesRemoval = text.includes('.removeWorktree') || text.includes('.removeLaneWorktree');
-        if (referencesRemoval && !name.startsWith('ReapLaneWorktrees')) {
-          offenders.push(name);
+        if (text.includes('.removeLaneWorktree')) {
+          offenders.push(`${name} (removeLaneWorktree)`);
         }
-        if (!referencesRemoval && name.startsWith('ReapLaneWorktrees')) {
-          offenders.push(name);
+        const referencesRemoveWorktree = text.includes('.removeWorktree');
+        const allowedRemoveWorktreeCallers =
+          name.startsWith('ReapLaneWorktrees') || name.startsWith('ReapZombies');
+        if (referencesRemoveWorktree && !allowedRemoveWorktreeCallers) {
+          offenders.push(`${name} (removeWorktree)`);
+        }
+        if (!referencesRemoveWorktree && allowedRemoveWorktreeCallers) {
+          offenders.push(`${name} (missing removeWorktree)`);
         }
       }
     };

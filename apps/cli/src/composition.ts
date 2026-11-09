@@ -41,6 +41,11 @@ import {
   BriefKnowledgeAdapter,
   CiStateAdapter,
   CloseWorkOrderUseCase,
+  CutoverJournalAdapter,
+  CutoverRecordRepositoryAdapter,
+  DaemonPauseAdapter,
+  KillallTrainPauseAdapter,
+  ManageCutoverUseCase,
   GateReceiptAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
@@ -98,6 +103,9 @@ import {
   ListLaneRunsUseCase,
   ReapLaneWorktreesUseCase,
   ReapOrphanSessionsUseCase,
+  ReapZombiesUseCase,
+  ReaperFindingRepositoryAdapter,
+  InMemoryReaperFindingRepositoryAdapter,
   RequestLaneRunStopUseCase,
   ResumeLaneRunUseCase,
   type ProjectProfileReadPort,
@@ -784,6 +792,14 @@ export interface FleetCliRuntime {
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
     /** CO26: the read-only relaunch inventory per lane host. */
     readonly inventoryRelaunch: InventoryRelaunchUseCase;
+    /** CO30a: the one cutover record v1 (`cutover.json`). */
+    readonly cutoverRecordRepository: CutoverRecordRepositoryAdapter;
+    /** CO30a: the keyed cutover journal (`cutover-journal.json`). */
+    readonly cutoverJournal: CutoverJournalAdapter;
+    /** CO30a: the killall train-pause record `cutover rollback` lifts when the cutover set it. */
+    readonly killallTrainPause: KillallTrainPauseAdapter;
+    /** CO30a: `cutover status` and `cutover rollback`; switch and retire are CO30b. */
+    readonly manageCutover: ManageCutoverUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -808,6 +824,10 @@ export interface FleetCliRuntime {
     readonly reapLaneWorktrees: ReapLaneWorktreesUseCase;
     /** EX-4: the operator-opt-in orphan-session reap (conductor reap --sessions). */
     readonly reapOrphanSessions: ReapOrphanSessionsUseCase;
+    /** KW4b': the zombie reaper pass. */
+    readonly reapZombies: ReapZombiesUseCase;
+    /** KW4b': the reaper's findings store (file-backed with a state dir). */
+    readonly reaperFindingRepository: ReaperFindingRepositoryAdapter | InMemoryReaperFindingRepositoryAdapter;
     /** A fresh ULID per call (journal entry ids, run and attempt ids). */
     readonly newUlid: () => string;
     /** The project profile read the root already builds; exposed for `conductor start` (K7-7). */
@@ -1102,6 +1122,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     executionJournal,
     workspace,
     runnerForAttempt,
+    reconcileAttempt: execution.reconcileAttempt,
+    mergeRecordRepository: execution.mergeRecordRepository,
+    runner,
   });
 
   // PT1ca: registration checks the open pull requests of the base branch, so it
@@ -1217,6 +1240,27 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     },
   });
 
+  // CO30a: `cutover status` reads the pause stores through read-only handles so a corrupt file is
+  // never quarantined; in memory mode the one writable instance is shared.
+  const durableCutover = stateDir !== undefined && stateDir.trim().length > 0;
+  const cutoverRecordRepository = new CutoverRecordRepositoryAdapter({ stateDir, nowIso: daemon.now });
+  const cutoverJournal = new CutoverJournalAdapter({ stateDir });
+  const killallTrainPause = new KillallTrainPauseAdapter({ stateDir });
+  const daemonPauseRead = durableCutover ? new DaemonPauseAdapter({ stateDir, readOnly: true }) : daemon.pause;
+  const trainPauseRead = durableCutover ? new KillallTrainPauseAdapter({ stateDir, readOnly: true }) : killallTrainPause;
+  const manageCutover = new ManageCutoverUseCase({
+    cutoverRepo: cutoverRecordRepository,
+    cutoverJournal,
+    daemonStatus: daemon.statusReadOnly,
+    daemonPauseRead,
+    daemonPause: daemon.pause,
+    trainPauseRead,
+    trainPause: killallTrainPause,
+    computeDigest: sha256HexDigest,
+    mintEntryId: daemon.newUlid,
+    nowIso: daemon.now,
+  });
+
   return {
     installation: options?.installation,
     daemon,
@@ -1230,6 +1274,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       listStaleWorkOrders,
       inspectMergeReadiness,
       inventoryRelaunch,
+      cutoverRecordRepository,
+      cutoverJournal,
+      killallTrainPause,
+      manageCutover,
     },
     conductor,
     runnerTunnel,

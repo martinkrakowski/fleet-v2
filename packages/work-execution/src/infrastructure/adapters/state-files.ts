@@ -26,6 +26,7 @@ import { parseConductorDriverLeaseStateRecord } from './ConductorDriverLeaseAdap
 import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
 import { parseKillallHaltMarkerStateRecord } from './KillallHaltMarkerAdapter.adapter.js';
 import { parseKillallTrainPauseStateRecord } from './KillallTrainPauseAdapter.adapter.js';
+import { inspectSingleCutoverRecord } from './CutoverRecordRepositoryAdapter.adapter.js';
 import {
   parseVersionedJournalEntryStateRecord,
   parseVersionedReservationStateRecord,
@@ -129,4 +130,5 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
     parseVersionedHeldWorkOrderStateRecord,
     (records) => duplicateHeldWorkOrderKeyError(records) ?? undefined,
   ),
+  describeSingleRecordStore('cutover.json', inspectSingleCutoverRecord),
 ];

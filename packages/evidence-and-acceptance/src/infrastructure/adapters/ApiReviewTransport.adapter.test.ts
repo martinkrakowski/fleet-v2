@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { createApiReviewTransport, decodeApiVerdict, MAX_API_REVIEW_DIFF_BYTES } from './ApiReviewTransport.adapter.js';
 import type { ApiReviewGenerate, ApiReviewGenerateResult } from './ApiReviewTransport.adapter.js';
+import { BRIEF_INPUT_RULE } from '../../domain/untrusted-input.js';
 import { ReviewTransportError } from './OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from './ReviewTransportRouter.js';
 
@@ -295,6 +296,46 @@ describe('createApiReviewTransport: the completed result', () => {
     expect(seenPrompt).toContain('0123456789abcdef');
     expect(seenPrompt).toContain('do the thing');
     expect(seenPrompt).toContain('diff --git');
+  });
+
+  it('puts the diff first and the metadata last, so the cached prefix is the diff', async () => {
+    let seenPrompt = '';
+    const run = transport(async (input) => {
+      seenPrompt = input.prompt;
+      return { object: { result: 'pass', findings: [] } };
+    });
+    await run({ ...request, diffSummary: 'one file touched' });
+
+    const diffAt = seenPrompt.indexOf('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
+    const modelAt = seenPrompt.indexOf('Implementer model:');
+    const headAt = seenPrompt.indexOf('Head under review:');
+    const scopeAt = seenPrompt.indexOf('Scope: one file touched');
+
+    expect(diffAt).toBe(0);
+    expect(modelAt).toBeGreaterThan(diffAt);
+    expect(headAt).toBeGreaterThan(modelAt);
+    expect(scopeAt).toBeGreaterThan(headAt);
+  });
+
+  it('a brief-check puts the diff first, then the brief, then the metadata', async () => {
+    let seenPrompt = '';
+    const run = transport(async (input) => {
+      seenPrompt = input.prompt;
+      return { object: { result: 'pass', findings: [] } };
+    });
+    await run({ ...request, kind: 'brief-check', briefText: 'do the thing' });
+
+    const diffAt = seenPrompt.indexOf('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
+    const ruleAt = seenPrompt.indexOf(BRIEF_INPUT_RULE);
+    const briefAt = seenPrompt.indexOf('<<<UNTRUSTED nonce=0123456789abcdef label="brief">>>');
+    const modelAt = seenPrompt.indexOf('Implementer model:');
+    const kindAt = seenPrompt.indexOf('Review kind: brief-check');
+
+    expect(diffAt).toBe(0);
+    expect(ruleAt).toBeGreaterThan(diffAt);
+    expect(briefAt).toBeGreaterThan(ruleAt);
+    expect(modelAt).toBeGreaterThan(briefAt);
+    expect(kindAt).toBeGreaterThan(modelAt);
   });
 
   it('refuses an oversized brief rather than truncating it', async () => {

@@ -496,21 +496,31 @@ function classifyProviderFailure(error: unknown): { readonly reason: string; rea
   return { reason: 'the reviewer endpoint could not be reached', code: 'transport' };
 }
 
+/**
+ * Diff first, instructions last.
+ *
+ * Prompt caching covers a stable PREFIX. The diff is the one part two reviews
+ * of the same head share, so it leads; the brief, the metadata and the
+ * instruction text trail it (ADR-0002, action 1). Only the order changed: the
+ * same sections are emitted, with the same `wrapUntrusted` calls and the same
+ * caller-supplied nonce. The brief rule stays immediately above the brief block
+ * because it says "below".
+ */
 function buildPrompt(request: RunIndependentReviewRequest, diff: string, nonce: string): string {
-  const sections: string[] = [
+  const sections: string[] = [wrapUntrusted({ label: 'diff', text: diff, nonce })];
+  if (request.briefText !== undefined && request.briefText.trim() !== '') {
+    sections.push(BRIEF_INPUT_RULE, wrapUntrusted({ label: 'brief', text: request.briefText, nonce }));
+  }
+  sections.push(
     `Implementer model: ${request.implementerModel}`,
     `Head under review: ${request.candidateHeadSha}`,
-  ];
+  );
   if (request.kind !== undefined) {
     sections.push(`Review kind: ${request.kind}`);
   }
   if (request.diffSummary !== undefined && request.diffSummary.trim() !== '') {
     sections.push(`Scope: ${request.diffSummary.trim()}`);
   }
-  if (request.briefText !== undefined && request.briefText.trim() !== '') {
-    sections.push(BRIEF_INPUT_RULE, wrapUntrusted({ label: 'brief', text: request.briefText, nonce }));
-  }
-  sections.push(wrapUntrusted({ label: 'diff', text: diff, nonce }));
   return sections.join('\n\n');
 }
 

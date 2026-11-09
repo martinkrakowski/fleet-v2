@@ -174,7 +174,7 @@ describe('createApiReviewTransport: configuration is declared, never inferred', 
     const run = createApiReviewTransport({
       baseURL: '   ',
       model: 'mercury-3',
-      schemaEnforcement: 'tool',
+      schemaEnforcement: 'native-json-schema',
       location: location(),
       generate: answers({ result: 'pass', findings: [] }),
     });
@@ -185,7 +185,7 @@ describe('createApiReviewTransport: configuration is declared, never inferred', 
     const run = createApiReviewTransport({
       baseURL: 'http://10.0.0.1:4176/inception/v1',
       model: 'mercury-3',
-      schemaEnforcement: 'tool',
+      schemaEnforcement: 'native-json-schema',
       location: location(),
     });
     await expect(run(request)).rejects.toThrow(/provider call/);
@@ -514,5 +514,76 @@ describe('review round 2: the remaining findings', () => {
       generate: async () => ({ object: { result: 'pass', findings: [] } }),
     });
     await expect(silent(request)).resolves.toMatchObject({ result: 'pass', readOnlyVerified: false });
+  });
+});
+
+describe('pre-merge re-check: a 429 that actually surfaces', () => {
+  function retryWrapped(status: number): unknown {
+    // The shape the library throws once the retry budget is exceeded: the
+    // wrapper carries no statusCode of its own; the real error is in `errors`
+    // and `lastError`.
+    const inner = Object.assign(new Error('rate limited'), { statusCode: status });
+    return Object.assign(new Error('maxRetriesExceeded'), {
+      reason: 'maxRetriesExceeded',
+      errors: [inner, inner],
+      lastError: inner,
+    });
+  }
+
+  async function codeFor(error: unknown): Promise<string> {
+    const run = transport(async () => {
+      throw error;
+    });
+    try {
+      await run(request);
+    } catch (thrown) {
+      return thrown instanceof ReviewTransportError ? thrown.code : 'not-a-transport-error';
+    }
+    return 'no-error';
+  }
+
+  it('a wrapped 429 is seat-busy, so the seat chain rotates', async () => {
+    expect(await codeFor(retryWrapped(429))).toBe('seat-busy');
+  });
+
+  it('a wrapped 402 is transport-failed', async () => {
+    expect(await codeFor(retryWrapped(402))).toBe('transport-failed');
+  });
+
+  it('a 429 nested behind cause is found too', async () => {
+    const inner = Object.assign(new Error('rate limited'), { statusCode: 429 });
+    expect(await codeFor(Object.assign(new Error('wrapped'), { cause: inner }))).toBe('seat-busy');
+  });
+
+  it('the chain walk terminates on a self-referencing error', async () => {
+    const loop: Record<string, unknown> = { message: 'loop' };
+    loop['cause'] = loop;
+    loop['errors'] = [loop];
+    expect(await codeFor(loop)).toBe('transport');
+  });
+
+  it('a getter in the chain cannot run', async () => {
+    const hostile = {};
+    Object.defineProperty(hostile, 'errors', {
+      enumerable: true,
+      get(): never {
+        throw new Error('should not run');
+      },
+    });
+    expect(await codeFor(hostile)).toBe('transport');
+  });
+
+  it('an over-long errors array is not walked', async () => {
+    const inner = Object.assign(new Error('rate limited'), { statusCode: 429 });
+    const many = new Array(20).fill(inner);
+    expect(await codeFor(Object.assign(new Error('many'), { errors: many }))).toBe('transport');
+  });
+
+  it('more than 200 findings is still refused by the decoder, not by the schema', () => {
+    const findings = new Array(201).fill({ severity: 'minor', summary: 'x', filePath: null, line: null });
+    expect(decodeApiVerdict({ result: 'fail', findings })).toMatchObject({
+      result: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
   });
 });

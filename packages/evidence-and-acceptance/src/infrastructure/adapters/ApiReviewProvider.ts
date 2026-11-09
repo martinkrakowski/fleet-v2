@@ -55,8 +55,10 @@ export interface SdkApiReviewGenerateOptions {
 const PROXY_INJECTS_THE_KEY = 'proxy-injects-the-real-key';
 
 export function createSdkApiReviewGenerate(options: SdkApiReviewGenerateOptions): ApiReviewGenerate {
-  // json-object is the only level that genuinely wants json-mode; the other two
-  // need the schema on the wire, which this flag is what enables.
+  // json-object wants json-mode; native-json-schema needs the schema on the
+  // wire, which this flag enables. There are only those two levels: a `tool`
+  // level was removed because this library has no tool mode for a typed object
+  // call, so declaring it would not have matched the wire.
   const structured = options.schemaEnforcement !== 'json-object';
 
   const provider = createOpenAICompatible({

@@ -44,16 +44,29 @@ import type { ReviewLocation } from './ReviewTransportRouter.js';
  * How the endpoint behind the proxy actually constrains the answer. The
  * operator declares this per seat; the adapter never guesses it.
  *
- * `json-object` is the weak one: the endpoint promises valid JSON and nothing
- * about the shape, so the schema check below is the only guarantee. It is
- * allowed, and reported, rather than silently treated as equivalent.
+ * `native-json-schema` sends `response_format: {type: 'json_schema', ...}`;
+ * `json-object` sends `{type: 'json_object'}`, where the endpoint promises
+ * valid JSON and nothing about the shape, so the decoder below is the only
+ * guarantee. It is allowed, and declared, never silently treated as equivalent.
+ *
+ * A `tool` level was offered until the pre-merge re-check established it was a
+ * lie on the wire: this library has no tool mode for a typed object call, so a
+ * seat declaring `tool` was sent `json_schema` anyway. An enforcement value the
+ * library cannot deliver must not be declarable, so it was removed rather than
+ * documented.
  */
-export const API_SCHEMA_ENFORCEMENTS = ['native-json-schema', 'tool', 'json-object'] as const;
+export const API_SCHEMA_ENFORCEMENTS = ['native-json-schema', 'json-object'] as const;
 export type ApiSchemaEnforcement = (typeof API_SCHEMA_ENFORCEMENTS)[number];
 
 const API_SCHEMA_ENFORCEMENT_VALUES: readonly string[] = API_SCHEMA_ENFORCEMENTS;
 
-/** Bound on findings one answer may contribute, matching the text parsers' intent. */
+/**
+ * Bound on findings one answer may contribute. Enforced by the decoder, not by
+ * the schema: `strict: true` plus validation keywords (`maxItems`, `minLength`,
+ * `minimum`) is rejected by some endpoints' strict modes, and sending a schema
+ * is new as of this change, so the keywords were dropped and the decoder keeps
+ * the bound (pre-merge re-check, finding D).
+ */
 export const MAX_API_REVIEW_FINDINGS = 200;
 /** Bound on one finding's summary; a longer summary is truncated, never dropped. */
 export const MAX_API_FINDING_SUMMARY = 2000;
@@ -79,16 +92,15 @@ export const API_REVIEW_VERDICT_SCHEMA: Record<string, unknown> = {
     result: { type: 'string', enum: ['pass', 'fail', 'unknown'] },
     findings: {
       type: 'array',
-      maxItems: MAX_API_REVIEW_FINDINGS,
       items: {
         type: 'object',
         additionalProperties: false,
         required: ['severity', 'summary', 'filePath', 'line'],
         properties: {
           severity: { type: 'string', enum: ['blocker', 'major', 'minor', 'nit'] },
-          summary: { type: 'string', minLength: 1 },
+          summary: { type: 'string' },
           filePath: { type: ['string', 'null'] },
-          line: { type: ['integer', 'null'], minimum: 1 },
+          line: { type: ['integer', 'null'] },
         },
       },
     },
@@ -395,6 +407,68 @@ function decodeChecked(object: unknown): ApiParsedVerdict {
 }
 
 /** The reason codes a provider failure maps onto; all are existing review codes. */
+/**
+ * The HTTP status behind a provider failure, following the library's retry
+ * wrapper.
+ *
+ * The pre-merge re-check established that `seat-busy` was unreachable: a 429 is
+ * retryable, so the library absorbs the first and, when the next exceeds the
+ * retry budget, throws a wrapper whose OWN object has no `statusCode` — the 429
+ * sits in its `errors` array and `lastError`. Reading only the top-level field
+ * classified every surfaced 429 as "could not be reached", which defeated the
+ * stated reason for using a library at all. This walks the chain, by descriptor
+ * only, to a bounded depth.
+ */
+function findStatusCode(error: unknown, depth: number): number | undefined {
+  if (depth > 4 || typeof error !== 'object' || error === null) {
+    return undefined;
+  }
+
+  const direct = readOwn(error, 'statusCode');
+  if (direct.kind === 'value' && typeof direct.value === 'number') {
+    return direct.value;
+  }
+
+  const last = readOwn(error, 'lastError');
+  if (last.kind === 'value') {
+    const found = findStatusCode(last.value, depth + 1);
+    if (found !== undefined) {
+      return found;
+    }
+  }
+
+  const nested = readOwn(error, 'errors');
+  if (nested.kind === 'value') {
+    const list = nested.value;
+    let length = 0;
+    try {
+      length = Array.isArray(list) ? list.length : 0;
+    } catch {
+      length = 0;
+    }
+    if (!Number.isSafeInteger(length) || length > 16) {
+      return undefined;
+    }
+    // Last first: the most recent attempt is the one that surfaced.
+    for (let index = length - 1; index >= 0; index -= 1) {
+      const element = readOwn(list as unknown as object, String(index));
+      if (element.kind !== 'value') {
+        continue;
+      }
+      const found = findStatusCode(element.value, depth + 1);
+      if (found !== undefined) {
+        return found;
+      }
+    }
+  }
+
+  const cause = readOwn(error, 'cause');
+  if (cause.kind === 'value') {
+    return findStatusCode(cause.value, depth + 1);
+  }
+  return undefined;
+}
+
 function classifyProviderFailure(error: unknown): { readonly reason: string; readonly code: 'timeout' | 'seat-busy' | 'transport-failed' | 'transport' } {
   // Round 2: these fields were read directly, so a provider-controlled getter
   // could run and throw, escaping the catch with the original error and its
@@ -411,8 +485,7 @@ function classifyProviderFailure(error: unknown): { readonly reason: string; rea
     return { reason: 'the review call exceeded its time limit', code: 'timeout' };
   }
 
-  const statusRead = readOwn(error, 'statusCode');
-  const status = statusRead.kind === 'value' && typeof statusRead.value === 'number' ? statusRead.value : undefined;
+  const status = findStatusCode(error, 0);
   if (status === 429) {
     return { reason: 'the reviewer seat is rate limited', code: 'seat-busy' };
   }
@@ -517,10 +590,14 @@ export function createApiReviewTransport(
       throw new ReviewTransportError(classified.reason, classified.code);
     }
 
-    // The declaration must be true on the wire, not just in configuration. When
-    // a seat declares schema enforcement and the endpoint reports that it ignored
-    // the response format, the declaration is false and the review is refused
-    // rather than silently graded by the decoder alone (ADR-0001 requirement 6).
+    // A TRIPWIRE, not the guarantee. The declaration is true by construction:
+    // the provider module sets the library's structured-output flag from this
+    // same value, so `native-json-schema` sends a schema and `json-object` does
+    // not, and the library does not emit this warning on the path that reaches
+    // here. The pre-merge re-check was right that an earlier commit message
+    // overstated this as the mechanism catching a false declaration. It is kept
+    // because it costs nothing and would fire if a library change broke that
+    // correspondence.
     const warnings = answer.warnings ?? [];
     if (options.schemaEnforcement !== 'json-object' && warnings.includes('unsupported:responseFormat')) {
       throw new ReviewTransportError(

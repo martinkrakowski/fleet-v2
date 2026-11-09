@@ -165,7 +165,8 @@ async function makeHarness(
       mergeState: 'clean',
       headSha: COMMIT,
       headRef: 'wt-example-1',
-      baseRef: 'main',
+      isCrossRepository: false,
+      headRepositoryOwner: 'example-owner',      baseRef: 'main',
       mergedAtIso: null,
       closedAtIso: null,
       mergeCommitSha: null,
@@ -222,6 +223,7 @@ async function makeHarness(
               return forgeAnswer;
             },
             isConfigured: () => true,
+            listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }),
           },
         }),
     ...(options.forgeAncestry === 'unwired'
@@ -273,7 +275,8 @@ function mergedPullRequest(overrides: Partial<Extract<ReadPullRequestResult, { o
       mergeState: 'clean',
       headSha: COMMIT,
       headRef: 'wt-example-1',
-      baseRef: 'main',
+      isCrossRepository: false,
+      headRepositoryOwner: 'example-owner',      baseRef: 'main',
       mergedAtIso: LATER,
       closedAtIso: null,
       mergeCommitSha: 'd'.repeat(40),

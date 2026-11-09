@@ -26,7 +26,9 @@ import {
   laneRunResultEntry,
   type LaneRunResultReasonCode,
 } from '../../../domain/lane-run-step-facts.js';
-import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import { laneRunJournalPendingIntent, laneRunJournalState } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import type { ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
 import type { ReconcileAttemptResult } from '../../ports/in/ReconcileAttemptPort.in-port.js';
 import type {
   StopAttemptRequest,
@@ -53,6 +55,7 @@ import type {
   RecordGateReceiptsResult,
 } from '../../ports/out/GateReceiptPort.out-port.js';
 import type { GatePredicatePort, EvaluateGatePredicatesResult } from '../../ports/out/GatePredicatePort.out-port.js';
+import type { ReviewRequest, ReviewRequestResult } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type {
   DispatchAttemptRequest,
   DispatchAttemptResult,
@@ -70,6 +73,7 @@ import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/Attem
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import { ResumeLaneRunUseCase } from '../ResumeLaneRunUseCase.use-case.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -111,6 +115,12 @@ const SEAT_PLAN = {
   ],
   fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
   review: [],
+};
+
+/** A seat plan with one review seat, so a brief-check can start beside the gate. */
+const SEAT_PLAN_WITH_REVIEW = {
+  ...SEAT_PLAN,
+  review: [{ id: 'rv-1', model: 'reviewer-example-1', tool: 'opencode' }],
 };
 
 const SEAT_SELECTION = {
@@ -235,7 +245,7 @@ function makeUlidMinter(): () => string {
 
 function stepKey(parts: {
   readonly round: number;
-  readonly step: 'dispatch' | 'stop' | 'collect' | 'gate' | 'prepare';
+  readonly step: 'dispatch' | 'stop' | 'collect' | 'gate' | 'prepare' | 'brief-check' | 'code-review';
   readonly seatIndex: number;
   readonly attemptOrdinal: number | null;
   readonly head12: string | null;
@@ -289,6 +299,16 @@ function gateKey(): string {
   return stepKey({ round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
 }
 
+/** The brief-check key the in-flight start builds: the same shape the brief-check state uses. */
+function briefCheckKey(): string {
+  return stepKey({ round: 0, step: 'brief-check', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
+}
+
+/** The code-review key the in-flight start builds: the same shape the code-review state uses. */
+function codeReviewKey(): string {
+  return stepKey({ round: 0, step: 'code-review', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
+}
+
 /** Reserve capacity for one prepared attempt, like the conductor's admission. */
 async function admit(harness: Harness, attemptId: string): Promise<void> {
   await harness.executionJournal.saveCapacityReservation({
@@ -329,6 +349,7 @@ interface Harness {
   readonly callOrder: string[];
   readonly deps: AdvanceLaneRunDependencies;
   readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
+  readonly reviewRequests: readonly ReviewRequest[];
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
   /** The harness's work-order store (KF-36a-2); seeded with a copy of the fixture. */
   readonly workOrders: Map<string, WorkOrderRecord>;
@@ -353,6 +374,8 @@ interface HarnessOptions {
   readonly wireGate?: boolean;
   readonly wireReviewAssessment?: boolean;
   readonly wireGateReceipts?: boolean;
+  /** Wire the KS6 brief-check fake: it records the request and answers a passed receipt. */
+  readonly wireReviewRequest?: boolean;
   /** Wire the KF-36a `workOrderRelease` fake over the harness's work-order map. */
   readonly wireWorkOrderRelease?: boolean;
 }
@@ -372,6 +395,7 @@ async function makeHarness(
   const gateRequests: EvaluateAttemptGateRequest[] = [];
   const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
+  const reviewRequests: ReviewRequest[] = [];
   const callOrder: string[] = [];
   // KF-36a-2: a per-harness work-order store, seeded with a copy of the fixture
   // (never the fixture itself — the release fake writes only into this map).
@@ -521,6 +545,30 @@ async function makeHarness(
           },
         }
       : {}),
+    ...(options.wireReviewRequest === true
+      ? {
+          sameModelFamily: (left: string, right: string) => left === right,
+          reviewRequest: {
+            requestReview: async (request: ReviewRequest): Promise<ReviewRequestResult> => {
+              reviewRequests.push(request);
+              return {
+                outcome: 'receipt',
+                receipt: {
+                  receiptId: 'rcpt-' + request.requestId,
+                  requestId: request.requestId,
+                  kind: request.kind,
+                  reviewerModel: request.reviewerModel,
+                  candidateHeadSha: request.candidateHeadSha,
+                  verdict: 'passed',
+                  findings: [],
+                },
+              };
+            },
+            findReviewReceipt: async () => ({ outcome: 'not-found' }) as const,
+            findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }) as const,
+          },
+        }
+      : {}),
     ...(options.wireGateReceipts === true
       ? {
           gateReceipts: {
@@ -542,6 +590,7 @@ async function makeHarness(
     commitRequests,
     gateRequests,
     reviewOpenRequests,
+    reviewRequests,
     gateReceiptRequests,
     workOrders,
     callOrder,
@@ -778,6 +827,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       qualifier: null,
       parkedFrom: 'running',
       questionId: null,
+      class: 'other',
     });
     expect(afterRunning?.parkCount).toBe(1);
 
@@ -803,6 +853,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       qualifier: 'attempt-terminal',
       parkedFrom: 'running',
       questionId: null,
+      class: 'other',
     });
   });
 
@@ -988,6 +1039,27 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       outcome: 'acted',
       step: 'gate',
       key: gateKey(),
+      result: 'ambiguous',
+      reasonCode: 'gate-unknown',
+    });
+    const retryBuilt = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'gate',
+      seatIndex: 0,
+      attemptOrdinal: null,
+      head12: HEAD12,
+      retry: 1,
+    });
+    expect(retryBuilt.ok).toBe(true);
+    if (!retryBuilt.ok) {
+      throw new Error('fixture must build a retry gate key');
+    }
+    const retried = await advance(hUnknown);
+    expect(retried).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: retryBuilt.key,
       result: 'ambiguous',
       reasonCode: 'gate-unknown',
     });
@@ -2197,5 +2269,394 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
       journalRefusal: 'duplicate-key',
       detail: null,
     });
+  });
+
+  it('test 20 (KS6): the gate act starts only the brief-check review beside the gate; code-review is not started', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
+    const harness = await makeHarness(runRecord(), [collected], { wireReviewRequest: true, wireReviewAssessment: true });
+    await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['command 1'] }));
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    // Only the brief-check went out beside the gate, on the sealed diff (the collected head).
+    expect(harness.reviewRequests).toEqual([
+      expect.objectContaining({ kind: 'brief-check', candidateHeadSha: COMMIT }),
+    ]);
+    // The journal holds the gate intent, then the brief-check intent and
+    // result, then the gate's result; no code-review entry exists.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const gateIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === gateKey());
+    const briefIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === briefCheckKey());
+    const briefResultIndex = entries.findIndex((entry) => entry.kind === 'result' && entry.key === briefCheckKey());
+    const codeIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === codeReviewKey());
+    const codeResultIndex = entries.findIndex((entry) => entry.kind === 'result' && entry.key === codeReviewKey());
+    const gateResultIndex = entries.findIndex((entry) => entry.kind === 'result' && entry.key === gateKey());
+    expect(gateIntentIndex).toBeGreaterThanOrEqual(0);
+    expect(briefIntentIndex).toBeGreaterThan(gateIntentIndex);
+    expect(briefResultIndex).toBeGreaterThan(briefIntentIndex);
+    expect(codeIntentIndex).toBe(-1);
+    expect(codeResultIndex).toBe(-1);
+    expect(gateResultIndex).toBeGreaterThan(briefResultIndex);
+    expect(entries[briefIntentIndex]).toMatchObject({ kind: 'intent', mintedId: expect.stringMatching(/^review-/) });
+    expect(entries[briefResultIndex]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'review-passed' });
+    expect(entries[gateResultIndex]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'gate-passed' });
+  });
+
+  it('test 21 (KS6): the brief-check state reads the recorded receipt; the code-review state still requests its own review', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
+    const harness = await makeHarness(runRecord(), [collected], { wireReviewRequest: true, wireReviewAssessment: true });
+    await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['command 1'] }));
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'gate', reasonCode: 'gate-passed' });
+    // The gate's verdict is consumed only after the review's receipt is recorded: the next advance enters brief-check.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+    // The recorded receipt is read: the brief-check state requests no second review.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
+    expect(harness.reviewRequests).toHaveLength(1);
+    // The code-review was not in flight: its own state requests it.
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'code-review' });
+    expect(harness.reviewRequests).toHaveLength(2);
+    expect(harness.reviewRequests[1]).toMatchObject({ kind: 'code-review' });
+  });
+
+  it('test 22 (KS6): without the review wiring the gate act behaves exactly as before', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
+    const harness = await makeHarness(runRecord(), [collected], { wireReviewAssessment: true });
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    expect(harness.gateRequests).toEqual([{ attemptId: 'attempt-example-1', candidateHeadSha: COMMIT }]);
+    expect(harness.reviewRequests).toHaveLength(0);
+    // No brief-check intent or result was appended: the review never started.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind !== 'conduct' && entry.key === briefCheckKey())).toBe(false);
+  });
+});
+
+const AMBIGUOUS_GATE_PARK = {
+  reason: 'ambiguous',
+  qualifier: 'gate',
+  parkedFrom: 'gating',
+  questionId: null,
+} as const;
+
+/** HN1's shape: parked `ambiguous` at gate over an open, ambiguous gate intent, the work order released through the harness store. */
+async function parkedAmbiguousGateHarness(): Promise<Harness> {
+  const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+  const harness = await makeHarness(runRecord({ parked: AMBIGUOUS_GATE_PARK, parkCount: 1 }), [collected], {
+    wireWorkOrderRelease: true,
+  });
+  await conduct(harness, 'gating', NOW);
+  await appendIntent(harness, gateKey(), null, NOW);
+  await appendResult(harness, gateKey(), 'ambiguous', 'gate-unknown', NOW);
+  await conduct(harness, 'parked', NOW);
+  return harness;
+}
+
+function finalResultsOn(entries: readonly LaneRunJournalEntryRecord[], key: string): readonly LaneRunJournalEntryRecord[] {
+  return entries.filter((entry) => entry.kind === 'result' && entry.key === key && entry.outcome !== 'ambiguous');
+}
+
+describe('AdvanceLaneRunUseCase abandons an ambiguous pending intent on a recorded stop (PT1b3a / F171)', () => {
+  it('PT1b3a: force stop on parked ambiguous gate run abandons pending gate intent, enters stopped, and releases work order', async () => {
+    const harness = await parkedAmbiguousGateHarness();
+    await appendStopIntent(harness, 'force', NOW);
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'stopped' });
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const finals = finalResultsOn(entries, gateKey());
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toBeNull();
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('stopped');
+    expect(entries.indexOf(finals[0]!)).toBeLessThan(entries.length - 1);
+    expect((await harness.runRepo.get(RUN_ID))?.parked).toBeNull();
+    expect(harness.workOrders.get('wo-example-1')).toMatchObject({ state: 'stopped', revision: 2, updatedAtIso: LATER });
+    expect(harness.gateRequests).toHaveLength(0);
+    expect(harness.stopRequests).toHaveLength(0);
+  });
+
+  it('PT1b3a: a graceful stop on a parked ambiguous gate run abandons the intent and enters stopped', async () => {
+    const harness = await parkedAmbiguousGateHarness();
+    await appendStopIntent(harness, 'graceful', NOW);
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'stopped' });
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(finalResultsOn(entries, gateKey())).toHaveLength(1);
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('stopped');
+  });
+
+  it('PT1b3a: replay after crash between intent-abandoned-by-operator result and stopped conduct never double-writes', async () => {
+    const harness = await parkedAmbiguousGateHarness();
+    await appendStopIntent(harness, 'force', NOW);
+
+    let armed = true;
+    const crashing: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      runJournal: {
+        append: async (entry) => {
+          if (armed && entry.kind === 'conduct' && entry.state === 'stopped') {
+            armed = false;
+            return { outcome: 'refused', reason: 'invalid-entry', detail: null };
+          }
+          return harness.runJournal.append(entry);
+        },
+        listForRun: (runId) => harness.runJournal.listForRun(runId),
+        listForKey: (key) => harness.runJournal.listForKey(key),
+      },
+    };
+    const crashed = await new AdvanceLaneRunUseCase(crashing).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(crashed).toMatchObject({ outcome: 'refused', reason: 'journal-refused' });
+    expect(finalResultsOn(await harness.runJournal.listForRun(RUN_ID), gateKey())).toHaveLength(1);
+    expect(laneRunJournalState(await harness.runJournal.listForRun(RUN_ID), RUN_ID)).toBe('parked');
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'stopped' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(finalResultsOn(entries, gateKey())).toHaveLength(1);
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('stopped');
+    expect(harness.workOrders.get('wo-example-1')).toMatchObject({ state: 'stopped', revision: 2 });
+  });
+
+  it('PT1b3a: non-ambiguous parked run stop path is unchanged and makes no abandon result write', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+    const harness = await makeHarness(
+      runRecord({ parked: { reason: 'halted', qualifier: null, parkedFrom: 'gating', questionId: null }, parkCount: 1 }),
+      [collected],
+      { wireWorkOrderRelease: true },
+    );
+    await conduct(harness, 'gating', NOW);
+    await conduct(harness, 'parked', NOW);
+    await appendStopIntent(harness, 'force', NOW);
+
+    const keyReads: string[] = [];
+    const appended: LaneRunJournalEntryRecord[] = [];
+    const spied: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      runJournal: {
+        append: async (entry) => {
+          appended.push(entry);
+          return harness.runJournal.append(entry);
+        },
+        listForRun: (runId) => harness.runJournal.listForRun(runId),
+        listForKey: (key) => {
+          keyReads.push(key);
+          return harness.runJournal.listForKey(key);
+        },
+      },
+    };
+    const result = await new AdvanceLaneRunUseCase(spied).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+
+    expect(result).toEqual({ outcome: 'entered', state: 'stopped' });
+    expect(keyReads).toEqual([]);
+    expect(appended).toHaveLength(1);
+    expect(appended[0]).toMatchObject({ kind: 'conduct', state: 'stopped' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.reasonCode === 'intent-abandoned-by-operator')).toBe(false);
+  });
+
+  it('PT1b3a: G3f merged PR carrying lane head still enters merged even with ambiguous pending intent and stop recorded', async () => {
+    const harness = await parkedAmbiguousGateHarness();
+    await appendStopIntent(harness, 'force', NOW);
+    const mergedRead: ReadPullRequestResult = {
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'merged',
+        mergeState: 'clean',
+        headSha: COMMIT,
+        headRef: 'wt-example-1',
+        isCrossRepository: false,
+        headRepositoryOwner: 'owner-example',
+        baseRef: 'main',
+        mergedAtIso: LATER,
+        closedAtIso: null,
+        mergeCommitSha: COMMIT,
+      },
+    };
+    const withForge: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      forgeRead: {
+        readPullRequest: async () => mergedRead,
+        isConfigured: () => true,
+        listOpenPullRequestsByBase: async () => ({ outcome: 'unavailable' as const, reason: 'not-used' }),
+      },
+    };
+
+    const result = await new AdvanceLaneRunUseCase(withForge).advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+
+    expect(result).toEqual({ outcome: 'entered', state: 'merged' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(finalResultsOn(entries, gateKey())).toHaveLength(0);
+    expect(entries.some((entry) => entry.reasonCode === 'intent-abandoned-by-operator')).toBe(false);
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('merged');
+  });
+});
+
+describe('GU1: an unknown gate retries under a new key before parking', () => {
+  const retryKey = (retry: number): string => {
+    const built = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'gate',
+      seatIndex: 0,
+      attemptOrdinal: null,
+      head12: HEAD12,
+      retry,
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      throw new Error('fixture must build a retry gate key');
+    }
+    return built.key;
+  };
+
+  function gateHarness(): Promise<Harness> {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+    return makeHarness(runRecord(), [collected]);
+  }
+
+  it('unknown then pass retries under /retry1 and never parks', async () => {
+    const harness = await gateHarness();
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+    harness.setGateAnswer({ verdict: 'unknown', reason: 'predicate returned neither pass nor fail' });
+
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'ambiguous',
+      reasonCode: 'gate-unknown',
+    });
+    expect((await harness.runRepo.get(RUN_ID))?.parked).toBeNull();
+
+    harness.setGateAnswer({ verdict: 'passed' });
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: retryKey(1),
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    expect(harness.gateRequests.some((request) => request.gateRun === 1)).toBe(true);
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) =>
+      entry.kind === 'result' && entry.key === gateKey() && entry.outcome === 'overtaken' && entry.reasonCode === 'gate-unknown-retried',
+    )).toBe(true);
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+    expect((await harness.runRepo.get(RUN_ID))?.parked).toBeNull();
+  });
+
+  it('an unknown that stays unknown parks past the bound', async () => {
+    const harness = await gateHarness();
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+    harness.setGateAnswer({ verdict: 'unknown', reason: 'predicate returned neither pass nor fail' });
+
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'gate', result: 'ambiguous', reasonCode: 'gate-unknown',
+    });
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'gate', key: retryKey(1), result: 'ambiguous', reasonCode: 'gate-unknown',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'gate' });
+    expect(harness.gateRequests.every((request) => request.gateRun !== 2)).toBe(true);
+  });
+
+  it('a resume after that park re-gates the same head under /retry2', async () => {
+    const harness = await gateHarness();
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+    harness.setGateAnswer({ verdict: 'unknown', reason: 'predicate returned neither pass nor fail' });
+
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'gate', result: 'ambiguous', reasonCode: 'gate-unknown',
+    });
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'gate', key: retryKey(1), result: 'ambiguous', reasonCode: 'gate-unknown',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'gate' });
+
+    const saved = await harness.runRepo.get(RUN_ID);
+    expect(saved).not.toBeNull();
+    const resume = new ResumeLaneRunUseCase({
+      runRepo: harness.runRepo,
+      runJournal: harness.runJournal,
+      newUlid: harness.deps.newUlid,
+    });
+    const requested = await resume.requestResume({
+      runId: RUN_ID,
+      via: 'cli',
+      expectedRevision: saved?.revision,
+      entryId: harness.deps.newUlid(),
+      nowIso: '2026-10-27T10:02:00.000Z',
+    });
+    expect(requested.outcome).toBe('resume-recorded');
+    const applied = await resume.applyPendingResume({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      nowIso: '2026-10-27T10:02:00.000Z',
+    });
+    expect(applied.outcome).toBe('resumed');
+
+    harness.setGateAnswer({ verdict: 'passed' });
+    const acted = await advance(harness, { nowIso: '2026-10-27T10:03:00.000Z' });
+    expect(acted).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: retryKey(2),
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    if (acted.outcome !== 'acted') {
+      throw new Error('expected an act decision');
+    }
+    expect(acted.key).not.toBe(gateKey());
+    expect(acted.key).not.toBe(retryKey(1));
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) =>
+      entry.kind === 'result' && entry.key === retryKey(1) && entry.outcome === 'overtaken' && entry.reasonCode === 'intent-abandoned-by-operator',
+    )).toBe(true);
+    expect((await harness.runRepo.get(RUN_ID))?.parked).toBeNull();
   });
 });

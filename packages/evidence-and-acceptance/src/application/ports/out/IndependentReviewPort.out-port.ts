@@ -8,6 +8,7 @@ import type { EvidenceResultValue } from '../../../domain/value-objects/Evidence
 import type {
   ReviewFindingRecord,
   ReviewKind,
+  ReviewUnknownReason,
 } from '../../../domain/evidence-records.js';
 
 export interface RunIndependentReviewRequest {
@@ -33,8 +34,24 @@ export const REVIEW_UNAVAILABLE_CODES = [
   'route-unresolved',
   'seat-none', 'seat-ambiguous', 'seat-implementer', 'seat-tool-no-transport', 'seat-variant-unsupported',
   'same-family', 'transport-missing', 'transport-failed',
+  'timeout', 'transport',
+  'seat-busy',
 ] as const;
 export type ReviewUnavailableCode = (typeof REVIEW_UNAVAILABLE_CODES)[number];
+
+/**
+ * The bounded transport diagnostic of an unavailable review (RV4): exit
+ * code, timeout flag, capped stderr and whether stdout was empty. `stderr`
+ * is capped at 2048 bytes before it leaves the transport; `stderr === null`
+ * and `stdoutEmpty === null` mean the read threw, never `''` or `false`.
+ * The message of the transport error never carries stderr or a path.
+ */
+export interface ReviewTransportDiagnostic {
+  readonly exitCode: number | null;
+  readonly timedOut: boolean;
+  readonly stderr: string | null;
+  readonly stdoutEmpty: boolean | null;
+}
 
 export type RunIndependentReviewResult =
   | {
@@ -44,8 +61,16 @@ export type RunIndependentReviewResult =
       readonly findings: readonly ReviewFindingRecord[];
       readonly rawOutput: string;
       readonly completedAtIso: string;
+      /** Fixed cause code when `result === 'unknown'`; absent otherwise. */
+      readonly unknownReason?: ReviewUnknownReason;
     }
-  | { readonly outcome: 'unavailable'; readonly reason: string; readonly code: ReviewUnavailableCode };
+  | {
+      readonly outcome: 'unavailable';
+      readonly reason: string;
+      readonly code: ReviewUnavailableCode;
+      /** The bounded transport diagnostic (RV4); absent when the transport carried none. */
+      readonly diagnostic?: ReviewTransportDiagnostic;
+    };
 
 export interface IndependentReviewPort {
   runIndependentReview(request: RunIndependentReviewRequest): Promise<RunIndependentReviewResult>;

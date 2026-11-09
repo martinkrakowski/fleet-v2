@@ -6,8 +6,13 @@
  * anything a model reported: the commit predicate checks the candidate head
  * and a clean tree, the diff-check predicate runs the lane diff check with
  * the frozen allowed path prefixes, and each command predicate runs a fixed
- * argv with its declared coverage. The first predicate that does not pass
- * stops the run and later ones are reported skipped; results carry no
+ * argv with its declared coverage. A command never runs after the commit or
+ * diff-check predicate did not pass (it is reported skipped). With more than
+ * one declared gate slot the commands
+ * run concurrently under the host's slot budget (KS3); with one they run in
+ * order and the first non-pass skips the rest. Results come back in
+ * declared order, each as that predicate really ended, and the gate's verdict
+ * is decided from the first non-pass in declared order. Results carry no
  * command output.
  */
 
@@ -36,6 +41,11 @@ export interface GatePredicateResult {
   readonly cause?: 'gate-slot-wait-limit';
   /** Commands with a coverage declaration that ran. */
   readonly coverage?: CheckCoverage;
+  /**
+   * PT1a: on a failing command, the screened repo-relative file its output names, or null when
+   * none could be determined. Absent on every other result. Never command output.
+   */
+  readonly failingFile?: string | null;
 }
 
 export interface EvaluateGatePredicatesRequest {

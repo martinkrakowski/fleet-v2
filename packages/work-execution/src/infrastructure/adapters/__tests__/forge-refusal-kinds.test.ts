@@ -128,13 +128,14 @@ describe('ForgeActionAdapter refusal kinds', () => {
         mergeState: 'clean',
         headSha: HEAD_SHA,
         headRef: LANE_BRANCH,
-        baseRef: 'main',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',        baseRef: 'main',
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
       },
     });
-    return { readPullRequest: read, isConfigured: () => true };
+    return { readPullRequest: read, isConfigured: () => true, listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }) };
   }
 
   it('kinds a refused create as permission', async () => {

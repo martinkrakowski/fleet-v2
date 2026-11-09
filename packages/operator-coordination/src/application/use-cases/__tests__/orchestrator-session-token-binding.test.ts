@@ -20,6 +20,7 @@ import { OrchestratorSessionRevisionConflictError } from '../../ports/out/Orches
 import type {
   OrchestratorSessionListQuery,
   OrchestratorSessionRepositoryPort,
+  RegisterOrAdoptSessionResult,
   StoredOrchestratorSession,
 } from '../../ports/out/OrchestratorSessionRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../ports/out/ChangeSignalPort.out-port.js';
@@ -435,6 +436,10 @@ class ConflictSessionRepo implements OrchestratorSessionRepositoryPort {
   private readonly stored = new Map<string, StoredOrchestratorSession>();
   saveCalls = 0;
   conflictsRemaining = 0;
+
+  async registerOrAdoptSession(): Promise<RegisterOrAdoptSessionResult> {
+    return { outcome: 'refused', reason: 'registerOrAdoptSession is not part of this double' };
+  }
 
   async save(
     session: OrchestratorSessionRecord,

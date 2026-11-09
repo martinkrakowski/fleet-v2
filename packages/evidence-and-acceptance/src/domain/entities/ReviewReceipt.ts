@@ -8,13 +8,17 @@
  */
 
 import type {
+  ReceiptSubject,
   ReviewFindingRecord,
   ReviewReceiptRecord,
   ReviewKind,
+  ReviewUnknownReason,
 } from '../evidence-records.js';
 import {
   REVIEW_KINDS,
   REVIEW_REQUEST_ID_PATTERN,
+  REVIEW_UNKNOWN_REASONS,
+  receiptSubjectOf,
 } from '../evidence-records.js';
 import type { EvidenceResultValue } from '../value-objects/EvidenceResult.vo.js';
 import { EVIDENCE_RESULTS } from '../value-objects/EvidenceResult.vo.js';
@@ -38,6 +42,10 @@ export interface ReviewReceiptProps {
   readonly kind?: ReviewKind;
   /** The conductor's request id (§3.5); absent on manual reviews. */
   readonly requestId?: string;
+  /** What the receipt is about; absent reads as the attempt. */
+  readonly subject?: ReceiptSubject;
+  /** Fixed cause code when `result === 'unknown'`; absent on pass/fail and pre-RV2 receipts. */
+  readonly unknownReason?: ReviewUnknownReason;
 }
 
 function isNonEmptyTrimmedString(value: unknown): value is string {
@@ -93,22 +101,80 @@ export function isSameModelFamily(left: string, right: string): boolean {
   return left === right || left === '' || right === '';
 }
 
-function isValidFinding(finding: ReviewFindingRecord): boolean {
+function isValidFinding(finding: unknown): boolean {
+  if (typeof finding !== 'object' || finding === null) {
+    return false;
+  }
+  const candidate = finding as ReviewFindingRecord;
   return (
-    isNonEmptyTrimmedString(finding.findingId) &&
-    (finding.severity === 'blocker' ||
-      finding.severity === 'major' ||
-      finding.severity === 'minor' ||
-      finding.severity === 'nit') &&
-    isNonEmptyTrimmedString(finding.summary) &&
-    (finding.filePath === null || typeof finding.filePath === 'string') &&
-    (finding.line === null || Number.isInteger(finding.line)) &&
-    typeof finding.state === 'string' &&
-    FINDING_STATES.includes(finding.state) &&
-    (finding.dispositionReason === null || typeof finding.dispositionReason === 'string') &&
-    (finding.dispositionEvidenceRef === null ||
-      typeof finding.dispositionEvidenceRef === 'string')
+    isNonEmptyTrimmedString(candidate.findingId) &&
+    (candidate.severity === 'blocker' ||
+      candidate.severity === 'major' ||
+      candidate.severity === 'minor' ||
+      candidate.severity === 'nit') &&
+    isNonEmptyTrimmedString(candidate.summary) &&
+    (candidate.filePath === null || typeof candidate.filePath === 'string') &&
+    (candidate.line === null || Number.isInteger(candidate.line)) &&
+    typeof candidate.state === 'string' &&
+    FINDING_STATES.includes(candidate.state) &&
+    (candidate.dispositionReason === null || typeof candidate.dispositionReason === 'string') &&
+    (candidate.dispositionEvidenceRef === null ||
+      typeof candidate.dispositionEvidenceRef === 'string')
   );
+}
+
+/**
+ * Every slot of `findings` is a valid finding: a sparse array (a hole, an
+ * inherited index) is invalid before iteration, so a hole can never read as
+ * `undefined` and slip past a check.
+ */
+function findingsAreValid(findings: unknown): boolean {
+  if (!Array.isArray(findings)) {
+    return false;
+  }
+  for (let index = 0; index < findings.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(findings, index)) {
+      return false;
+    }
+    if (!isValidFinding(findings[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The later checks of `create`, in their order: the in-receipt duplicate finding
+ * ids, then the optional kind, requestId and subject. Returns the refusal
+ * message, or null when all hold.
+ */
+function checkOptionalFields(props: ReviewReceiptProps): string | null {
+  // Finding ids are numbered per receipt: one receipt may not raise two
+  // findings under the same id, or dispositions could not name one finding.
+  // The real transport never produces in-receipt duplicates (positional ids).
+  const findingIds = new Set<string>();
+  for (const finding of props.findings) {
+    if (findingIds.has(finding.findingId)) {
+      return `ReviewReceipt contains duplicate finding id '${finding.findingId}'`;
+    }
+    findingIds.add(finding.findingId);
+  }
+  if (props.kind !== undefined && !REVIEW_KINDS.includes(props.kind)) {
+    return 'ReviewReceipt has an invalid kind: ' + String(props.kind);
+  }
+  if (
+    props.requestId !== undefined &&
+    (typeof props.requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(props.requestId))
+  ) {
+    return 'ReviewReceipt has an invalid requestId';
+  }
+  if (props.requestId !== undefined && props.kind === undefined) {
+    return 'ReviewReceipt with a requestId requires a kind';
+  }
+  if (props.subject !== undefined && receiptSubjectOf(props) === null) {
+    return 'ReviewReceipt has an invalid subject';
+  }
+  return null;
 }
 
 export class ReviewReceipt {
@@ -121,94 +187,96 @@ export class ReviewReceipt {
     value?: ReviewReceipt;
     error?: Error;
   } {
-    if (
-      !isNonEmptyTrimmedString(props.id) ||
-      !isNonEmptyTrimmedString(props.assessmentId) ||
-      !isNonEmptyTrimmedString(props.projectId) ||
-      !isNonEmptyTrimmedString(props.attemptId) ||
-      !isNonEmptyTrimmedString(props.candidateHeadSha) ||
-      !isNonEmptyTrimmedString(props.reviewerModel) ||
-      !isNonEmptyTrimmedString(props.implementerModel) ||
-      !isNonEmptyTrimmedString(props.evidenceRef) ||
-      !isNonEmptyTrimmedString(props.policyRevision) ||
-      !isNonEmptyTrimmedString(props.completedAtIso)
-    ) {
-      return {
-        success: false,
-        error: new Error(
-          'ReviewReceipt requires non-empty id, assessmentId, projectId, attemptId, candidateHeadSha, reviewerModel, implementerModel, evidenceRef, policyRevision and completedAtIso',
-        ),
-      };
-    }
-    if (typeof props.result !== 'string' || !EVIDENCE_RESULTS.includes(props.result)) {
-      return {
-        success: false,
-        error: new Error(`ReviewReceipt has an invalid result: ${String(props.result)}`),
-      };
-    }
-    if (typeof props.readOnlyVerified !== 'boolean') {
-      return {
-        success: false,
-        error: new Error('ReviewReceipt requires a boolean readOnlyVerified'),
-      };
-    }
-    // The reviewer's underlying model differs from the implementer's; a
-    // provider change alone is insufficient.
-    if (isSameModelFamily(
-      underlyingModelFamily(props.reviewerModel),
-      underlyingModelFamily(props.implementerModel),
-    )) {
-      return {
-        success: false,
-        error: new Error(
-          `ReviewReceipt requires a reviewer distinct from the implementer: ${props.reviewerModel} and ${props.implementerModel} share the same underlying model`,
-        ),
-      };
-    }
-    if (!Array.isArray(props.findings) || !props.findings.every(isValidFinding)) {
-      return {
-        success: false,
-        error: new Error('ReviewReceipt contains an invalid finding'),
-      };
-    }
-    // Finding ids are numbered per receipt: one receipt may not raise two
-    // findings under the same id, or dispositions could not name one finding.
-    // The real transport never produces in-receipt duplicates (positional ids).
-    const findingIds = new Set<string>();
-    for (const finding of props.findings) {
-      if (findingIds.has(finding.findingId)) {
+    // Runtime input never throws: a null, a non-object or a throwing getter is
+    // a refusal, not a crash.
+    try {
+      if (typeof props !== 'object' || props === null || Array.isArray(props)) {
         return {
           success: false,
-          error: new Error(`ReviewReceipt contains duplicate finding id '${finding.findingId}'`),
+          error: new Error('Invalid ReviewReceipt props'),
         };
       }
-      findingIds.add(finding.findingId);
-    }
-    if (props.kind !== undefined && !REVIEW_KINDS.includes(props.kind)) {
+      if (
+        !isNonEmptyTrimmedString(props.id) ||
+        !isNonEmptyTrimmedString(props.assessmentId) ||
+        !isNonEmptyTrimmedString(props.projectId) ||
+        !isNonEmptyTrimmedString(props.attemptId) ||
+        !isNonEmptyTrimmedString(props.candidateHeadSha) ||
+        !isNonEmptyTrimmedString(props.reviewerModel) ||
+        !isNonEmptyTrimmedString(props.implementerModel) ||
+        !isNonEmptyTrimmedString(props.evidenceRef) ||
+        !isNonEmptyTrimmedString(props.policyRevision) ||
+        !isNonEmptyTrimmedString(props.completedAtIso)
+      ) {
+        return {
+          success: false,
+          error: new Error(
+            'ReviewReceipt requires non-empty id, assessmentId, projectId, attemptId, candidateHeadSha, reviewerModel, implementerModel, evidenceRef, policyRevision and completedAtIso',
+          ),
+        };
+      }
+      if (typeof props.result !== 'string' || !EVIDENCE_RESULTS.includes(props.result)) {
+        return {
+          success: false,
+          error: new Error(`ReviewReceipt has an invalid result: ${String(props.result)}`),
+        };
+      }
+      if (typeof props.readOnlyVerified !== 'boolean') {
+        return {
+          success: false,
+          error: new Error('ReviewReceipt requires a boolean readOnlyVerified'),
+        };
+      }
+      // The reviewer's underlying model differs from the implementer's; a
+      // provider change alone is insufficient.
+      if (isSameModelFamily(
+        underlyingModelFamily(props.reviewerModel),
+        underlyingModelFamily(props.implementerModel),
+      )) {
+        return {
+          success: false,
+          error: new Error(
+            `ReviewReceipt requires a reviewer distinct from the implementer: ${props.reviewerModel} and ${props.implementerModel} share the same underlying model`,
+          ),
+        };
+      }
+      if (!findingsAreValid(props.findings)) {
+        return {
+          success: false,
+          error: new Error('ReviewReceipt contains an invalid finding'),
+        };
+      }
+      if (
+        props.unknownReason !== undefined &&
+        (!(REVIEW_UNKNOWN_REASONS as readonly string[]).includes(props.unknownReason) ||
+          props.result !== 'unknown')
+      ) {
+        return {
+          success: false,
+          error: new Error('ReviewReceipt has an invalid unknownReason'),
+        };
+      }
+      const optionalFieldsError = checkOptionalFields(props);
+      if (optionalFieldsError !== null) {
+        return { success: false, error: new Error(optionalFieldsError) };
+      }
+      // The optional `unknownReason` key is omitted completely when absent, so
+      // existing receipt assertions without it stay identical.
+      const { unknownReason, ...rest } = props;
+      const storedProps: ReviewReceiptProps =
+        unknownReason === undefined
+          ? rest
+          : { ...rest, unknownReason };
+      return {
+        success: true,
+        value: new ReviewReceipt({ ...storedProps, findings: [...storedProps.findings] }),
+      };
+    } catch {
       return {
         success: false,
-        error: new Error('ReviewReceipt has an invalid kind: ' + String(props.kind)),
+        error: new Error('Invalid ReviewReceipt props'),
       };
     }
-    if (
-      props.requestId !== undefined &&
-      (typeof props.requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(props.requestId))
-    ) {
-      return {
-        success: false,
-        error: new Error('ReviewReceipt has an invalid requestId'),
-      };
-    }
-    if (props.requestId !== undefined && props.kind === undefined) {
-      return {
-        success: false,
-        error: new Error('ReviewReceipt with a requestId requires a kind'),
-      };
-    }
-    return {
-      success: true,
-      value: new ReviewReceipt({ ...props, findings: [...props.findings] }),
-    };
   }
 
   static fromRecord(record: ReviewReceiptRecord): ReviewReceipt {
@@ -253,6 +321,10 @@ export class ReviewReceipt {
 
   getRequestId(): string | undefined {
     return this.props.requestId;
+  }
+
+  getUnknownReason(): ReviewUnknownReason | undefined {
+    return this.props.unknownReason;
   }
 
   /** A review only proves the head it was produced for. */

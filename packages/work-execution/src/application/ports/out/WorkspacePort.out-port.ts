@@ -170,6 +170,91 @@ export type RemoveLaneWorktreeResult =
   | { readonly outcome: 'unknown' };
 
 /**
+ * KW3' (conductor plan §3.10.3): the request to remove one worktree under the
+ * reaper's guards. The caller has read the worktree's facts; this call
+ * re-reads them and removes only when every guard still holds. The branch is
+ * the record of the run and is never touched.
+ */
+export interface RemoveWorktreeRequest {
+  /** The registered clone the worktree belongs to (absolute, normalised). */
+  readonly repositoryRoot: string;
+  /** The worktree root the worktree path must sit under (absolute, normalised). */
+  readonly worktreeRoot: string;
+  /** The worktree to remove (absolute, normalised, under `worktreeRoot`). */
+  readonly worktreePath: string;
+  /** The HEAD the caller read; the removal refuses `head-moved` when it differs. */
+  readonly expectedHead: string;
+  /** The branch the worktree must be checked out on. */
+  readonly expectedBranch: string;
+  /**
+   * The activity the caller read under its hold (KW2 `lastActivity.iso`),
+   * or null when none was readable. The removal re-runs the bounded file
+   * walk and refuses `busy` when the newest mtime moved past this value, or
+   * when the walk cannot answer (conductor plan §3.10.3).
+   */
+  readonly expectedLastActivityIso: string | null;
+  /** The attempt's recorded runner block: the removal runs on that host's executor. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+  /**
+   * C2': the sealed-artifact-manifest coordinates the removal is gated on. A
+   * `sealed` request carries the recorded manifest path and digest and is
+   * removed only when the manifest on disk still verifies; `uncollected` is
+   * always refused; `force-unsealed` carries a consumed owner approval
+   * reference and still runs every git and activity guard.
+   */
+  readonly manifest: RemoveWorktreeManifestCheck;
+}
+
+/**
+ * C2': the manifest coordinates one `removeWorktree` request is gated on.
+ */
+export type RemoveWorktreeManifestCheck =
+  | {
+      readonly kind: 'sealed';
+      readonly attemptId: string;
+      readonly manifestPath: string;
+      readonly expectedManifestSha256: string;
+    }
+  | { readonly kind: 'uncollected' }
+  | {
+      readonly kind: 'force-unsealed';
+      readonly attemptId: string;
+      readonly approvalReference: string;
+    };
+
+/**
+ * Why a removal was refused. The plan's seven facts (`head-moved`, `detached`,
+ * `dirty`, `locked`, `busy`, `not-a-linked-worktree`, `path-refused`) plus the
+ * three names this port already uses for a malformed request, a branch that is
+ * not the expected one and a git failure (`invalid-request`,
+ * `branch-mismatch`, `git-refused`).
+ */
+export type RemoveWorktreeRefusal =
+  | 'invalid-request'
+  | 'path-refused'
+  | 'not-a-linked-worktree'
+  | 'head-moved'
+  | 'branch-mismatch'
+  | 'detached'
+  | 'dirty'
+  | 'locked'
+  | 'busy'
+  | 'git-refused'
+  /** C2': the attempt's artifacts were never sealed into a manifest. */
+  | 'artifacts not collected'
+  /** C2': a sealed artifact or the manifest itself changed since collection. */
+  | 'artifacts changed since collection';
+
+export type RemoveWorktreeResult =
+  /** Removed; `branchTip` is the HEAD the removal answered. The branch is kept. */
+  | { readonly outcome: 'removed'; readonly branchTip: string }
+  | { readonly outcome: 'refused'; readonly reason: RemoveWorktreeRefusal }
+  /** The command ran, but the directory or its administrative entry is still there. */
+  | { readonly outcome: 'partial'; readonly detail: 'directory-present' | 'admin-entry-present' }
+  /** The executor did not answer: the worktree may or may not be removed. */
+  | { readonly outcome: 'unknown'; readonly reason: string };
+
+/**
  * GB3: the request to preserve a refused dispatch's uncommitted tracked edits
  * as a patch file outside the worktree. The worktree root and the patch
  * destination's parent are canonicalized on the recorded host before any
@@ -404,6 +489,18 @@ export interface WorkspacePort {
    * conductor-plan :146).
    */
   removeLaneWorktree?(request: RemoveLaneWorktreeRequest): Promise<RemoveLaneWorktreeResult>;
+
+  /**
+   * KW3' (conductor plan §3.10.3): remove one worktree after re-reading HEAD,
+   * the branch, the porcelain status, the lock, the in-progress operation
+   * files and the bounded file walk in this one executor call, and only then
+   * run `git worktree remove <path>`. Never `--force`, never a branch
+   * command, never `prune`, never `rm`, never a fetch or a push. A refusal
+   * removes nothing; `partial` means the command ran but the directory or its
+   * administrative entry is still there; `unknown` means the executor did not
+   * answer. The branch is always kept.
+   */
+  removeWorktree?(request: RemoveWorktreeRequest): Promise<RemoveWorktreeResult>;
 
   /**
    * KW2 (D18): list one registered clone's worktrees. Read-only: it never

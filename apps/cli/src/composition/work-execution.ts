@@ -27,6 +27,9 @@ import {
   EnqueueMergeUseCase,
   ExecutionObservationAdapter,
   GatePredicateAdapter,
+  GateReceiptReuseAdapter,
+  HeldWorkOrderRepositoryAdapter,
+  ListHeldWorkOrdersUseCase,
   ProcessTreeTerminationAdapter,
   ImportLanePlanUseCase,
   ImportTrainStateUseCase,
@@ -34,6 +37,7 @@ import {
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
   LanePlanRepositoryAdapter,
+  MergeRecordRepositoryAdapter,
   LegacyTrainStateReadAdapter,
   ListMergeQueueUseCase,
   ListUnregisteredProjectsUseCase,
@@ -53,6 +57,8 @@ import {
   consumptionId,
   forgeActionScope,
   observationEventKind,
+  readGateDeclaredEnvironmentDigest,
+  readGateToolchainVersions,
   sha256HexDigest,
   type AgyRunnerAdapter,
   type AttemptArtifactAdapter,
@@ -353,6 +359,8 @@ export function composeExecution(input: ComposeExecutionInput) {
         projectId: request.projectId,
         actionScope: forgeActionScope(request.actionKind),
         expectedHeadSha: request.expectedHeadSha,
+        // CO24e: the grant records the attempt it is resolved for, durably.
+        attemptId: request.attemptId,
       });
       if (result.outcome === 'authorized') {
         resolveCoordinates.set(result.grantId, {
@@ -403,8 +411,7 @@ export function composeExecution(input: ComposeExecutionInput) {
         };
       }
       // Coordinates recorded at resolve time bind the grant to its attempt;
-      // a fresh process reloads them from disk before falling back to the
-      // head-matching scan over all recorded attempts.
+      // a fresh process reloads them from disk.
       if (
         !resolveCoordinates.has(request.authorizationGrantId) &&
         authorizationCoordinatesPath !== undefined
@@ -424,17 +431,25 @@ export function composeExecution(input: ComposeExecutionInput) {
         }
       }
       const coordinates = resolveCoordinates.get(request.authorizationGrantId);
-      const boundAttempt =
-        coordinates === undefined
-          ? null
-          : await attemptRepository.findAttemptById(coordinates.attemptId);
+      // The grant record names its attempt (CO24e: written at issue, at request
+      // time or at the first resolve); the resolve-time coordinates are the
+      // fallback. A legacy grant carries neither: the request's own attempt is
+      // then the only candidate (CO24d), validated at the head below. No
+      // attempt is ever picked by head alone.
+      const resolvedAttemptId = grant.grantAttemptId ?? grant.policyGrant?.attemptId ?? coordinates?.attemptId;
+      if (resolvedAttemptId !== undefined) {
+        if (request.attemptId !== undefined && request.attemptId !== resolvedAttemptId) {
+          return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
+        }
+      } else if (typeof request.attemptId !== 'string') {
+        return { outcome: 'refused', reason: 'grant-attempt-unresolved' };
+      }
+      const boundAttemptId = resolvedAttemptId ?? request.attemptId;
       const attempt =
-        boundAttempt !== null && boundAttempt.artifacts?.headCommit === request.expectedHeadSha
-          ? boundAttempt
-          : (await attemptRepository.listAllAttempts()).find(
-              (candidate) => candidate.artifacts?.headCommit === request.expectedHeadSha,
-            );
-      if (attempt === undefined) {
+        typeof boundAttemptId === 'string'
+          ? await attemptRepository.findAttemptById(boundAttemptId)
+          : null;
+      if (attempt === null || attempt.artifacts?.headCommit !== request.expectedHeadSha) {
         return {
           outcome: 'refused',
           reason:
@@ -503,6 +518,11 @@ export function composeExecution(input: ComposeExecutionInput) {
     allowedSeats,
     gatePredicates: new GatePredicateAdapter({
       executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+      receiptReuse: {
+        port: new GateReceiptReuseAdapter({ stateDir }),
+        toolchainVersions: readGateToolchainVersions,
+        declaredEnvironmentDigest: readGateDeclaredEnvironmentDigest,
+      },
     }),
     journal: executionJournal,
     computeDigest: sha256HexDigest,
@@ -527,11 +547,22 @@ export function composeExecution(input: ComposeExecutionInput) {
   // stateDir is omitted, lane-plans.json otherwise). Its change signal
   // defaults to a no-op, exactly as the work-order adapter's does.
   const lanePlanRepository = new LanePlanRepositoryAdapter({ stateDir });
+  // WB5b: a completed merge saves its record (merge-records.json) beside the
+  // other work-execution stores; without it `merge-pr` refuses.
+  const mergeRecordRepository = new MergeRecordRepositoryAdapter({ stateDir });
+  // PT1ca: an overlap-refused registration is kept in held-work-orders.json
+  // (in memory without a stateDir) and listed by `work-order held`.
+  const heldWorkOrderRepository = new HeldWorkOrderRepositoryAdapter({ stateDir });
+  const listHeldWorkOrders = new ListHeldWorkOrdersUseCase({ heldRepo: heldWorkOrderRepository });
 
   const execution = {
+    lanePlanRepository,
+    heldWorkOrderRepository,
+    listHeldWorkOrders,
     workOrderRepository,
     attemptRepository,
     executionJournal,
+    mergeRecordRepository,
     workspace,
     runner,
     runnerForAttempt,
@@ -572,6 +603,8 @@ export function composeExecution(input: ComposeExecutionInput) {
       workOrderRepo: workOrderRepository,
       profileRead,
       lanePlanRepo: lanePlanRepository,
+      heldWorkOrderRepo: heldWorkOrderRepository,
+      computeDigest: sha256HexDigest,
     }),
     importLanePlan: new ImportLanePlanUseCase({
       lanePlanRepo: lanePlanRepository,
@@ -682,6 +715,11 @@ export function composeExecution(input: ComposeExecutionInput) {
       // owner-decision resolution acceptance uses.
       ownerDecisionPort: ownerDecision,
       attemptOwnerDecisionPort: attemptOwnerDecision,
+      lanePlanRepo: lanePlanRepository,
+      mergeRecordRepo: mergeRecordRepository,
+      // WB5b2: the merge verifies a pull-request number no typed journal
+      // entry confirms through the installation's read-only forge read.
+      forgeRead,
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
     }),

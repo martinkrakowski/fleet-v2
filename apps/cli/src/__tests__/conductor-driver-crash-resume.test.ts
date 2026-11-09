@@ -252,7 +252,9 @@ async function startScenario(options?: StartScenarioOptions): Promise<Scenario> 
     forgeRead: fakes.forgeRead,
     conductorForgeGrant: fakes.conductorForgeGrant,
     executeForgeAction: fakes.executeForgeAction,
-    autoMergeAttempt: fakes.autoMergeAttempt,
+    enqueueMerge: fakes.enqueueMerge,
+    mergeQueue: fakes.mergeQueue,
+    forgeRepository: fakes.forgeRepository,
     parkNotice: fakes.parkNotice,
     autoMergeEnabled: true,
   });
@@ -348,7 +350,7 @@ async function runUntilCrash(scenario: Scenario, pass: RunConductorPassUseCase, 
   throw new Error('the injected crash never fired within the pass budget');
 }
 
-const READ_PORTS = new Set(['runnerForAttempt', 'findLatestReceiptOfKind', 'ciState', 'forgeRead']);
+const READ_PORTS = new Set(['runnerForAttempt', 'findLatestReceiptOfKind', 'ciState', 'forgeRead', 'listMergeQueue']);
 
 function oneWayTally(calls: DryRunFakes['recorder']['calls']): Record<string, number> {
   const tally: Record<string, number> = {};
@@ -428,7 +430,7 @@ function expectExplicitCounts(tally: Record<string, number>): void {
   expect(tally.dispatch).toBe(1);
   expect(tally.reviewRequest).toBe(2);
   expect(tally.executeForgeAction).toBe(2);
-  expect(tally.autoMergeAttempt).toBe(1);
+  expect(tally.enqueueMerge).toBe(1);
 }
 
 describe('conductor driver crash and resume at every step boundary', () => {

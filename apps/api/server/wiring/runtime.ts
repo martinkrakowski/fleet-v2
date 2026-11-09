@@ -28,6 +28,7 @@ import {
 import {
   assessmentIdForAttempt,
   createReviewTransportRouter,
+  resolveApiReviewSettings,
   hasReviewerSeat,
   type IndependentReviewTransportResult,
   type OcmReviewTransportSpawn,
@@ -331,6 +332,11 @@ function buildReviewTransport(
     chains,
     locate: (attemptId) => locator.locate(attemptId),
     ocmRunBin: settings.ocmRunBin ?? defaultOcmRunPath(),
+    // The api transport's endpoint and its declared schema enforcement.
+    // Environmental like FLEET_OCM_RUN_BIN: it names the host-side key proxy,
+    // not routing. Absent leaves an `api` seat refusing, which is what it
+    // should do when nothing is configured.
+    ...resolveApiReviewSettings(process.env),
     ...(reviewSpawn !== undefined ? { ocmSpawn: reviewSpawn } : {}),
   });
   // The locator and the transports can fail with messages that name the attempt's recorded host,
@@ -588,6 +594,8 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           projectId: request.projectId,
           actionScope: forgeActionScope(request.actionKind),
           expectedHeadSha: request.expectedHeadSha,
+          // CO24e: the grant records the attempt it is resolved for, durably.
+          attemptId: request.attemptId,
         });
         if (result.outcome === "blocked") {
           return { outcome: "blocked", reason: result.reason };
@@ -631,13 +639,19 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
             reason: `No in-process authorization resolve recorded grant ${request.authorizationGrantId}`,
           };
         }
+        // The grant is bound to the attempt resolved for it. A request that
+        // names an attempt must name that one; a wrong-typed id is a mismatch
+        // too. The caller's id is never preferred over the resolved one.
+        if (request.attemptId !== undefined && request.attemptId !== coordinates.attemptId) {
+          return { outcome: "refused", reason: "grant-attempt-mismatch" };
+        }
         const result =
           await operator.recordAuthorizationConsumption.recordAuthorizationConsumption({
             consumptionId: consumptionId(request.actionId),
             grantId: request.authorizationGrantId,
             actionId: request.actionId,
             actionScope: forgeActionScope(request.actionKind),
-            attemptId: request.attemptId ?? coordinates.attemptId,
+            attemptId: coordinates.attemptId,
             expectedHeadSha: request.expectedHeadSha ?? coordinates.expectedHeadSha,
           });
         if (result.outcome === "consumed") {
@@ -697,5 +711,5 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   configureKnowledgeComposition(knowledge);
   configureEvidenceUseCases(evidence);
   configureWorkComposition(work);
-  configureTelemetryReadComposition({ stateDir });
+  configureTelemetryReadComposition({ stateDir, installation });
 }

@@ -333,7 +333,7 @@ describe('InspectLaneRunsUseCase (GB2)', () => {
     expect(run.reviewFindings).toEqual([FINDING]);
   });
 
-  it('returns [] and does not call receipt store when parked findings is explicitly null even with receipt available', async () => {
+  it('a null findings snapshot falls back to the receipt and shows its findings', async () => {
     const findLatestReceiptOfKind = vi.fn(async (request: { candidateHeadSha: string }) => ({
       outcome: 'found' as const,
       receipt: {
@@ -351,8 +351,54 @@ describe('InspectLaneRunsUseCase (GB2)', () => {
     });
     await seedParkedRun(harness, 'blocker-after-round-2', 1, [ATTEMPT_ID], null);
     const [run] = await statusRuns(harness);
-    expect(run.reviewFindings).toEqual([]);
-    expect(findLatestReceiptOfKind).not.toHaveBeenCalled();
+    expect(run.reviewFindings).toEqual([FINDING]);
+    expect(findLatestReceiptOfKind).toHaveBeenCalled();
+  });
+
+  it('LaneRun.create refuses a parked findings snapshot of [] (RV3 req d)', () => {
+    const result = LaneRun.create({
+      ...BASE_RECORD,
+      parked: {
+        reason: 'blocker-after-round-2',
+        qualifier: null,
+        parkedFrom: 'fixing',
+        questionId: null,
+        findings: [],
+      },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toContain('parked findings');
+    }
+  });
+
+  it('projects colon-scoped receipt finding ids on a blocker-after-round-2 park (RV3 req d)', async () => {
+    const colonFinding: LaneRunParkFindingView = {
+      findingId: 'rr-assessment-attempt-example-1-fe520fe2-review-01M6RH29P27AP4SQ8EA4E5GC02:review-1',
+      severity: 'major',
+      summary: 'a blocking colon-scoped finding',
+      filePath: 'src/ex.ts',
+      line: 8,
+    };
+    const findLatestReceiptOfKind = vi.fn(async (request: { candidateHeadSha: string }) => ({
+      outcome: 'found' as const,
+      receipt: {
+        receiptId: 'rcpt-1',
+        requestId: null,
+        kind: 'code-review' as const,
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: request.candidateHeadSha,
+        verdict: 'failed' as const,
+        findings: [colonFinding],
+      },
+    }));
+    const harness = makeHarness({
+      reviewReceipts: { findLatestReceiptOfKind },
+    });
+    await seedParkedRun(harness, 'blocker-after-round-2', 1, [ATTEMPT_ID], null);
+    const [run] = await statusRuns(harness);
+    expect(run.reviewFindings).toEqual([colonFinding]);
+    expect(findLatestReceiptOfKind).toHaveBeenCalled();
   });
 
   it('falls back to the receipt when parked record has no findings field (undefined)', async () => {

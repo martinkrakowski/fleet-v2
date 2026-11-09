@@ -300,6 +300,6 @@ describe("fleet-v2 hosts daemon", () => {
     const { io, stdout } = mockIo();
     const code = await runCli(["--help"], io);
     expect(code).toBe(0);
-    expect(stdout.join("")).toContain("hosts list|add|edit|remove|daemon");
+    expect(stdout.join("")).toContain("hosts list|add|edit|remove|rename|daemon");
   });
 });

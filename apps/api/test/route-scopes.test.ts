@@ -104,6 +104,24 @@ describe("requiredScope", () => {
     expect(requiredScope("POST", "/v1/forge")).toBe("hook");
   });
 
+  it("maps the permission-request route to hook", () => {
+    expect(requiredScope("POST", "/v1/threads/:id/permissions")).toBe("hook");
+  });
+
+  it("maps the permission verdict route to verdict", () => {
+    expect(requiredScope("POST", "/v1/threads/:id/permissions/:requestId/verdict")).toBe(
+      "verdict",
+    );
+  });
+
+  it("maps the permission list route to verdict", () => {
+    expect(requiredScope("GET", "/v1/threads/:id/permissions")).toBe("verdict");
+  });
+
+  it("fails closed on unsupported GET permission paths", () => {
+    expect(requiredScope("GET", "/v1/threads/:id/permissions/:requestId/verdict")).toBeNull();
+  });
+
   it("maps the operate family", () => {
     expect(requiredScope("POST", "/v1/attempts/:id/stop")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/reconcile")).toBe("operate");
@@ -112,6 +130,7 @@ describe("requiredScope", () => {
     expect(requiredScope("POST", "/v1/attempts/:id/cancel-prepared")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/artifacts")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/notes")).toBe("operate");
+    expect(requiredScope("POST", "/v1/owner-items/:id/resolution")).toBe("operate");
     expect(requiredScope("POST", "/v1/verifications")).toBe("operate");
     expect(requiredScope("POST", "/v1/verifications/:id/receipt")).toBe("operate");
     expect(requiredScope("POST", "/v1/observations")).toBe("operate");
@@ -123,6 +142,16 @@ describe("requiredScope", () => {
     expect(requiredScope("POST", "/v1/projects/:id/retire")).toBe("operate");
     expect(requiredScope("POST", "/v1/projects/:id/probe")).toBe("operate");
     expect(requiredScope("PATCH", "/v1/projects/:id")).toBe("operate");
+  });
+
+  it("maps the run-control family to operate (A-C)", () => {
+    expect(requiredScope("POST", "/v1/runs/halt")).toBe("operate");
+    expect(requiredScope("POST", "/v1/runs/run-01J00000000000000000000000/stop")).toBe("operate");
+    // Since A-R the detail GET pattern /v1/runs/:id captures the four-segment
+    // path; the use case's run-id validation turns it into a 400. There is no
+    // GET route for the five-segment stop path, so it stays unmapped.
+    expect(requiredScope("GET", "/v1/runs/halt")).toBe("read");
+    expect(requiredScope("GET", "/v1/runs/run-01J00000000000000000000000/stop")).toBeNull();
   });
 
   it("maps the brief preview dry run to read", () => {

@@ -1,21 +1,42 @@
 // ReviewRequestPort: the conductor's review step (plan §3.3, §3.4, §3.5). A review of one kind at one exact head under a request id the conductor journalled first; the receipt of a request id is what reconcile reads. No receipt is not a verdict.
 
-import type { ReviewKind } from '@fleet/evidence-and-acceptance';
+import type { ReviewKind, ReviewUnknownReason } from '@fleet/evidence-and-acceptance';
 
-export type ReviewRequestKind = ReviewKind;
+/** The kinds a request may name: the stored review kinds plus `brief-verify` (the manifest contract), which is refused at runtime until the brief subject is implemented. */
+export type ReviewRequestKind = ReviewKind | 'brief-verify';
+
+/** The stored review kinds, which a receipt can carry (`brief-verify` is never stored yet). */
+export type StoredReviewRequestKind = ReviewKind;
+
+export const REVIEW_SUBJECT_KINDS = ['attempt', 'chain', 'brief'] as const;
+
+/** What a review is about: an attempt at one exact head, a chain at its integration head, or a brief package at its base commit. */
+export type ReviewSubject =
+  | { readonly kind: 'attempt'; readonly projectId: string; readonly attemptId: string; readonly headSha: string }
+  | { readonly kind: 'chain'; readonly projectId: string; readonly chainName: string; readonly integrationHeadSha: string }
+  | { readonly kind: 'brief'; readonly projectId: string; readonly briefPackageDigest: string; readonly baseCommit: string };
 
 export interface ReviewRequest {
   readonly requestId: string;
+  /** `brief-verify` is typed in and refused at runtime (`subject-not-implemented`) until CO18. */
   readonly kind: ReviewRequestKind;
   readonly attemptId: string;
   readonly projectId: string;
   /** 40 lowercase hex. */
   readonly candidateHeadSha: string;
+  /**
+   * Absent: the attempt `attemptId` at `candidateHeadSha`. A `chain` subject
+   * names the combined review of a chain at its integration head, which must
+   * equal `candidateHeadSha`; the attempt fields then only mirror the subject.
+   */
+  readonly subject?: ReviewSubject;
   readonly policyRevision: string;
   readonly implementerModel: string;
   readonly reviewerModel: string;
   /** The frozen brief; only forwarded with `kind: 'brief-check'`, capped at 64 KiB. */
   readonly briefText?: string;
+  /** Only forwarded with a chain subject: the scope in a few words (no path, no diff text), capped at 2 KiB. */
+  readonly diffSummary?: string;
   readonly nowIso?: string;
 }
 
@@ -39,11 +60,13 @@ export interface ReviewReceiptSummary {
   readonly candidateHeadSha: string;
   readonly verdict: ReviewVerdict;
   readonly findings: readonly ReviewRequestFinding[];
+  /** Fixed cause code when `verdict === 'unknown'`; absent otherwise. */
+  readonly unknownReason?: ReviewUnknownReason;
 }
 
 export const REVIEW_REQUEST_REFUSALS = [
   'invalid-request', 'not-configured', 'not-independent', 'seat-refused', 'no-assessment',
-  'assessment-mismatch', 'assessment-terminal', 'request-id-reused', 'unclassified',
+  'assessment-mismatch', 'assessment-terminal', 'request-id-reused', 'unclassified', 'subject-not-implemented',
 ] as const;
 export type ReviewRequestRefusal = (typeof REVIEW_REQUEST_REFUSALS)[number];
 
@@ -67,6 +90,8 @@ export interface FindReviewReceiptRequest {
   readonly attemptId: string;
   readonly requestId: string;
   readonly candidateHeadSha: string;
+  /** Absent: the attempt semantics above. A chain subject reads the chain's own assessment. */
+  readonly subject?: ReviewSubject;
 }
 
 export type FindReviewReceiptResult =
@@ -78,6 +103,8 @@ export interface FindLatestReceiptOfKindRequest {
   readonly attemptId: string;
   readonly candidateHeadSha: string;
   readonly kind: ReviewRequestKind;
+  /** Absent: the attempt semantics above. A chain subject reads the chain's own assessment. */
+  readonly subject?: ReviewSubject;
 }
 
 /** A receipt of one kind at one head; manual receipts carry no request id. */
@@ -88,7 +115,7 @@ export type ReviewReceiptOfKind = Omit<ReviewReceiptSummary, 'requestId'> & {
 export type FindLatestReceiptOfKindResult =
   | { readonly outcome: 'found'; readonly receipt: ReviewReceiptOfKind }
   | { readonly outcome: 'not-found' }
-  | { readonly outcome: 'unavailable'; readonly reason: 'invalid-request' | 'not-configured' | 'unreadable' };
+  | { readonly outcome: 'unavailable'; readonly reason: 'invalid-request' | 'not-configured' | 'unreadable' | 'receipt-mismatch' };
 
 /**
  * KF-33b2: the conductor's out-of-scope dispositions for one failed review

@@ -33,6 +33,8 @@ import { resolveE2eDir, startE2eFixture, type E2eFixture } from './fixture.js';
 const ID_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 const WORK_ORDER_ID = 'wo-example-1';
 const WORK_ORDER_ID2 = 'wo-example-2';
+/** PT1ca: work orders name the forge coordinates (owner/repo of the installation's forge), which the open-PR overlap check parses. */
+export const FORGE_REPOSITORY = 'example-owner/example-repo';
 const PROJECT_ID = 'project-example-1';
 const TASK_ID = 'task-example-1';
 const TASK_ID2 = 'task-example-2';
@@ -106,6 +108,12 @@ export interface ConductedFixtureOptions {
    * within one pass.
    */
   readonly ciChecksPending?: boolean;
+  /**
+   * KS7b: when true the installation turns `policy.autoMerge` on, so a run that
+   * reaches `merging` hands its PR to the merge queue instead of parking for the
+   * owner's merge.
+   */
+  readonly autoMerge?: boolean;
 }
 
 export interface CliRunResult {
@@ -187,6 +195,26 @@ export interface ConductedFixture extends E2eFixture {
    * `stop()` restores the mode.
    */
   readonly makeFixPlacementFail: () => Promise<void>;
+  /**
+   * KS7b: the fake forge now reads the run's PR as merged (the merge queue's pass
+   * merged it). Later `pr view` reads answer MERGED at the worktree head.
+   */
+  readonly markPullRequestMerged: () => Promise<void>;
+  /**
+   * PT1ca: set the fake forge's open pull requests (number to changed file
+   * paths). The fixture starts with none; registration reads this list through
+   * the production forge read port.
+   */
+  readonly setOpenPullRequests: (pullRequests: Readonly<Record<number, readonly string[]>>) => void;
+  /** PT1ca: run one CLI command (e.g. `work-order held`) over the current runtime. */
+  readonly runCommand: (argv: readonly string[]) => Promise<CliRunResult>;
+  /**
+   * KS7b: rewrite the merge queue's one entry for this run as the daemon's merge
+   * pass would leave it: `merged`, or `dropped` / `parked` with a reason.
+   */
+  readonly settleQueueEntry: (
+    settled: { readonly state: 'merged' } | { readonly state: 'dropped' | 'parked'; readonly reason: string },
+  ) => Promise<void>;
   /** A runtime rebuilt over the current installation FILE (scenario 3). */
   readonly rebuildRuntime: () => Promise<FleetCliRuntime>;
   /** Kill the fake lanes, tear the tunnel and sshd down, restore PATH. */
@@ -253,6 +281,7 @@ function buildConductedInstallation(
   seatAgent: string,
   laneAuthFile: string,
   maxLanes: number,
+  autoMerge = false,
 ): FleetInstallationV2 {
   return {
     schemaVersion: 2,
@@ -307,7 +336,10 @@ function buildConductedInstallation(
       implementer: [{ seatId: 'implementer' }],
       reviewer: [{ seatId: 'reviewer' }],
     },
-    policy: { conductor: { enabled: true } },
+    policy: {
+      conductor: { enabled: true },
+      ...(autoMerge ? { autoMerge: { enabled: true, allowHighRisk: false, onBlocked: 'hold' as const } } : {}),
+    },
     forge: { mode: 'github', owner: 'example-owner', repo: 'example-repo' },
     shelf: { provider: 'local' },
     verification: { procedures: { gate: { command: 'true', args: [] } } },
@@ -512,13 +544,45 @@ function makeForgeGhRunner(
     readonly prCreateMarkerFile?: string;
     /** R4a: when true, `pr checks` answers a pending bucket, so a run in watching-ci rests there. */
     readonly ciChecksPending?: boolean;
+    /** KS7b: once this file exists, `pr view` answers the PR as merged. */
+    readonly prMergedMarkerFile?: string;
+    /**
+     * PT1ca: the fake forge's open pull requests against the base branch, as
+     * number to changed file paths. EMPTY by default; registration still reads
+     * it through the production ForgeReadAdapter (list + changed files), so
+     * the overlap check is never skipped.
+     */
+    readonly openPullRequests?: Map<number, readonly string[]>;
   } = {},
 ) {
   const calls: string[][] = [];
+  const openPullRequests = options.openPullRequests ?? new Map<number, readonly string[]>();
   const flipToOpen = options.prViewOpenAfterCreate === true && options.prCreateMarkerFile !== undefined;
   let postCreateReads = 0;
   const forgeGhRunner = async (args: readonly string[]) => {
     calls.push([...args]);
+    // PT1ca: the open-PR list read (`gh api --paginate .../pulls?state=open&base=... --jq ...`),
+    // one jq-shaped JSON object per line, as the adapter parses it.
+    if (
+      args[0] === 'api' &&
+      args[1] === '--paginate' &&
+      typeof args[2] === 'string' &&
+      args[2].includes('/pulls?state=open')
+    ) {
+      const stdout = [...openPullRequests.keys()]
+        .map((number) => JSON.stringify({ number, head: { sha: 'f'.repeat(40) }, base: { ref: 'main' } }))
+        .join('\n');
+      return { exitCode: 0, stdout, stderr: '' };
+    }
+    // PT1ca: one open PR's changed files (`gh pr view N --json files,changedFiles`).
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('files,changedFiles')) {
+      const paths = openPullRequests.get(Number(args[2])) ?? [];
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ files: paths.map((file) => ({ path: file })), changedFiles: paths.length }),
+        stderr: '',
+      };
+    }
     if (args[0] === 'pr' && args[1] === 'view') {
       if (flipToOpen && !existsSync(options.prCreateMarkerFile!)) {
         return {
@@ -537,18 +601,21 @@ function makeForgeGhRunner(
           };
         }
       }
+      const merged = options.prMergedMarkerFile !== undefined && existsSync(options.prMergedMarkerFile);
       return {
         exitCode: 0,
         stdout: JSON.stringify({
           number: 7,
-          state: 'OPEN',
+          state: merged ? 'MERGED' : 'OPEN',
           headRefOid: head(),
           headRefName: branchName,
           baseRefName: 'main',
-          mergedAt: null,
+          mergedAt: merged ? '2026-11-06T10:00:00Z' : null,
           closedAt: null,
-          mergeCommit: null,
+          mergeCommit: merged ? { oid: head() } : null,
           mergeStateStatus: 'CLEAN',
+          isCrossRepository: false,
+          headRepositoryOwner: { id: 'MDQ6VXNlcjE=', login: 'example-owner', name: 'Example Owner' },
         }),
         stderr: '',
       };
@@ -597,6 +664,12 @@ function makeReviewSpawn(verdicts: readonly ('PASS' | 'FAIL')[]) {
   let index = 0;
   const reviewSpawn = async (file: string, args: readonly string[]) => {
     calls.push({ file, args });
+    // RV4: the transport probes the seat with `ocm-run --wait --dir` before it
+    // dispatches a review. Real ocm-run exits 0 when nothing runs there; the
+    // probe is not a review, so it consumes no verdict.
+    if (args[0] === '--wait') {
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
     const verdict = verdicts[index] ?? 'PASS';
     index += 1;
     const text = verdict === 'FAIL' ? REVIEW_FAIL_TEXT : REVIEW_PASS_TEXT;
@@ -656,6 +729,7 @@ export async function startConductedFixture(
   // fake `pr view` flips to the open PR) and uses the count file to make the
   // ambiguous create happen exactly once.
   const ghPrCreateMarker = path.join(dir, 'pr-created.marker');
+  const prMergedMarker = path.join(dir, 'pr-merged.marker');
   const ghPrCreateCount = path.join(dir, 'pr-create.count');
   const laneScriptPath = path.join(dir, 'lane-commit.sh');
 
@@ -810,6 +884,7 @@ export async function startConductedFixture(
       seatAgent,
       laneAuthFile,
       options?.secondRun === true ? 2 : 1,
+      options?.autoMerge === true,
     );
     const written = writeInstallationV2(installation);
     const parsed = parseInstallation(JSON.parse(written));
@@ -829,11 +904,14 @@ export async function startConductedFixture(
     const attemptId2 = 'attempt-' + idChars(97202611, 26);
 
     // --- runtime ----------------------------------------------------------
+    const openPullRequests = new Map<number, readonly string[]>();
     const gh = makeForgeGhRunner(() => readWorktreeHead(worktreeRoot, baseCommit), `fleet/${runId}`, {
       ...(options?.prViewOpenAfterCreate === true
         ? { prViewOpenAfterCreate: true, prCreateMarkerFile: ghPrCreateMarker }
         : {}),
       ...(options?.ciChecksPending === true ? { ciChecksPending: true } : {}),
+      prMergedMarkerFile: prMergedMarker,
+      openPullRequests,
     });
     const review = makeReviewSpawn(options?.reviewVerdicts ?? []);
     const buildRuntime = (installationForRuntime: FleetInstallationV2): FleetCliRuntime => {
@@ -885,7 +963,7 @@ export async function startConductedFixture(
       projectId: PROJECT_ID,
       taskId: TASK_ID,
       laneId: LANE_ID,
-      repository: bareRepo,
+      repository: FORGE_REPOSITORY,
       baseCommit,
       policyRevision: POLICY_REVISION,
       ownedPaths: ['packages/example'],
@@ -899,7 +977,7 @@ export async function startConductedFixture(
         projectId: PROJECT_ID,
         taskId: TASK_ID2,
         laneId: LANE_ID2,
-        repository: bareRepo,
+        repository: FORGE_REPOSITORY,
         baseCommit,
         policyRevision: POLICY_REVISION,
         ownedPaths: ['packages/second'],
@@ -1161,6 +1239,53 @@ export async function startConductedFixture(
       failedBriefPath = briefPath;
     };
 
+    const setOpenPullRequests: ConductedFixture['setOpenPullRequests'] = (pullRequests) => {
+      openPullRequests.clear();
+      for (const [number, files] of Object.entries(pullRequests)) {
+        openPullRequests.set(Number(number), files);
+      }
+    };
+
+    const runCommand = async (argv: readonly string[]): Promise<CliRunResult> => {
+      const code = await runCli(
+        [...argv],
+        io,
+        currentRuntime,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { stateDir: e2e.stateDir },
+      );
+      return { code, ...takeOutput() };
+    };
+
+    const markPullRequestMerged = async (): Promise<void> => {
+      await fs.writeFile(prMergedMarker, 'merged\n', 'utf8');
+    };
+
+    const settleQueueEntry: ConductedFixture['settleQueueEntry'] = async (settled) => {
+      const queueFile = path.join(e2e.stateDir, 'merge-queue.json');
+      const records = JSON.parse(await fs.readFile(queueFile, 'utf8')) as Record<string, unknown>[];
+      const mine = records.filter((record) => record['runId'] === runId);
+      if (mine.length !== 1) {
+        throw new Error(`settleQueueEntry expects exactly one queue entry for the run, found ${mine.length}`);
+      }
+      const entry = mine[0]!;
+      entry['revision'] = (entry['revision'] as number) + 1;
+      entry['state'] = settled.state;
+      if (settled.state === 'merged') {
+        entry['reason'] = null;
+        entry['mergeCommitOid'] = String(entry['headOid']);
+        entry['mergedAtIso'] = '2026-11-06T10:00:00.000Z';
+      } else {
+        entry['reason'] = settled.reason;
+      }
+      await fs.writeFile(queueFile, JSON.stringify(records), 'utf8');
+    };
+
     return {
       ...e2e,
       get runtime() {
@@ -1196,6 +1321,10 @@ export async function startConductedFixture(
       runPass,
       recordAcceptanceReceipts,
       makeFixPlacementFail,
+      markPullRequestMerged,
+      setOpenPullRequests,
+      runCommand,
+      settleQueueEntry,
       rebuildRuntime,
       stop,
     };

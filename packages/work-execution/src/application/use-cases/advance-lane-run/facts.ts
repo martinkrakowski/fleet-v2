@@ -15,6 +15,8 @@ import {
   laneRunDispatchedAtIso,
   laneRunGateCongestion,
   laneRunGateFact,
+  laneRunGateUnknown,
+  laneRunMergeEnqueueFact,
   laneRunPremergePost,
   laneRunRecordedSeatAdvance,
   laneRunRefusedStep,
@@ -264,10 +266,12 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     acceptedHead12: acceptance.acceptedHead12,
     gate: laneRunGateFact(entries, record.runId, head12),
     gateCongestion: laneRunGateCongestion(entries, record.runId, head12),
+    gateUnknown: laneRunGateUnknown(entries, record.runId, head12),
     briefCheck: review.briefCheck,
     codeReview: review.codeReview,
     preMerge: acceptance.preMerge,
     premergePost: laneRunPremergePost(entries, record.runId, head12),
+    mergeEnqueue: laneRunMergeEnqueueFact(entries, record.runId, record.round, head12),
     acceptance: acceptance.acceptance,
     acceptanceRetry: acceptance.acceptanceRetry,
     acceptanceRejection: acceptance.acceptanceRejection,
@@ -278,6 +282,53 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     merge: acceptance.merge,
   };
   return { facts, deadlineUnknown, latestAttempt: latest, attemptRecords };
+}
+
+/**
+ * The journal-derived fields of already gathered facts, recomputed over fresh
+ * `entries` after the driver appended a result (F171). Pure and synchronous:
+ * no port is called, and the attempt, acceptance, reservation and cost facts
+ * the gather read from the stores stay as they were.
+ */
+export function refreshGatheredJournalFacts(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  entries: readonly LaneRunJournalEntryRecord[],
+  gathered: GatheredLaneRunFacts,
+): GatheredLaneRunFacts {
+  const state = gathered.facts.state;
+  const head12 = gathered.facts.head12;
+  const stopFacts = laneRunJournalStopFacts(entries, record.runId);
+  const review = reviewFactsOf(ctx, record, state, entries, head12, gathered.attemptRecords);
+  const attempt: LaneRunAttemptFact | null =
+    gathered.facts.attempt !== null && gathered.latestAttempt !== null
+      ? {
+          ...gathered.facts.attempt,
+          stopsIssued: laneRunStopsIssued(entries, record.runId, gathered.facts.attempt.round, gathered.facts.attempt.seatIndex),
+          dispatchResult: laneRunAttemptDispatchResult(entries, record.runId, gathered.latestAttempt.id),
+        }
+      : gathered.facts.attempt;
+  return {
+    ...gathered,
+    facts: {
+      ...gathered.facts,
+      stopMode: stopFacts.stopMode,
+      stopRequestedAtIso: stopFacts.stopRequestedAtIso,
+      pendingIntent: laneRunJournalPendingIntent(entries, record.runId),
+      implementerSeat: implementerSeatOf(record, state, entries, gathered.attemptRecords, ctx.deps.sameModelFamily),
+      reviewSeat: review.reviewSeat,
+      attempt,
+      gate: laneRunGateFact(entries, record.runId, head12),
+      gateCongestion: laneRunGateCongestion(entries, record.runId, head12),
+      gateUnknown: laneRunGateUnknown(entries, record.runId, head12),
+      briefCheck: review.briefCheck,
+      codeReview: review.codeReview,
+      premergePost: laneRunPremergePost(entries, record.runId, head12),
+      mergeEnqueue: laneRunMergeEnqueueFact(entries, record.runId, record.round, head12),
+      ciFailureRecorded: laneRunCiFailureRecorded(entries, record.runId, record.round, head12),
+      refusedStep: laneRunRefusedStep(entries, record.runId, record.round),
+    },
+  };
 }
 
 /** Reconcile the latest running attempt; `refused` / `not-found` keep the record as read. */

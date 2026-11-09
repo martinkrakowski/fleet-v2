@@ -9,6 +9,8 @@ import {
   BriefKnowledgeAdapter,
   ExecutionJournalAdapter,
   ExecutionObservationAdapter,
+  LanePlanRepositoryAdapter,
+  MergeRecordRepositoryAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
   ConductorHaltAdapter,
@@ -43,6 +45,9 @@ import {
   type ChangeSignalPort,
   type OwnerDecisionDelegate,
   type AttemptOwnerDecisionDelegate,
+  type ConductorHaltPort,
+  type RequestLaneRunStopPort,
+  type StopAttemptRequest,
 } from "@fleet/work-execution";
 import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
@@ -52,6 +57,7 @@ import {
   ExecuteAuthorizedForgeActionUseCase,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
+  LaneRunBoardReads,
   ListLaneRunsUseCase,
   ListAttemptsUseCase,
   ListAttemptJournalUseCase,
@@ -63,6 +69,7 @@ import {
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
+  RequestLaneRunStopUseCase,
   ReserveExecutionCapacityUseCase,
   StopAttemptUseCase,
   resolveImplementerSeat,
@@ -71,6 +78,7 @@ import {
 import { ProbeLimiter } from "./probe-limiter";
 import { withPendingFixLimit } from "./pending-fix-guard";
 import { withRunActiveRefusal, type GuardedCancelPreparedResult } from "./cancel-prepared-guard";
+import { withRunOwnedStopRefusal, type GuardedStopAttemptResult } from "./stop-attempt-guard";
 
 /**
  * Reads the seat an attempt was actually implemented on. Absent on a
@@ -95,6 +103,8 @@ export interface WorkComposition {
   listAttempts: ListAttemptsUseCase;
   // GET /v1/runs: the read-only conductor schedule (A-R-1)
   listLaneRuns: ListLaneRunsUseCase;
+  // GET /v1/runs*: the read-only board, detail and keyed journal reads (A-R)
+  laneRunReads: LaneRunBoardReads;
   // GET /v1/runs/passes: the recorded conductor pass traces (VZ6)
   listConductorPasses: ListConductorPassesUseCase;
   listAttemptJournal: ListAttemptJournalUseCase;
@@ -109,7 +119,20 @@ export interface WorkComposition {
   reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
   dispatchAttempt: DispatchAttemptUseCase;
   reconcileAttempt: ReconcileAttemptUseCase;
-  stopAttempt: StopAttemptUseCase;
+  stopAttempt: {
+    stopAttempt(request: StopAttemptRequest): Promise<GuardedStopAttemptResult>;
+    execute(input?: unknown): Promise<GuardedStopAttemptResult>;
+  };
+  // POST /v1/runs/halt: the durable conductor halt marker write (A-C)
+  setConductorHalt: Pick<ConductorHaltPort, "set">;
+  // POST /v1/runs/:id/stop: the keyed run-journal stop intent write (A-C)
+  requestLaneRunStop: RequestLaneRunStopPort;
+  /**
+   * Throttles HTTP run-control actions (halt, stop): one in-flight action per
+   * run id (or the shared halt key) and a small global cap. Owned by this
+   * composition root, not the route.
+   */
+  runControlLimiter: ProbeLimiter;
   collectAttemptArtifacts: CollectAttemptArtifactsUseCase;
   prepareFixAttempt: Pick<PrepareFixAttemptUseCase, "execute">;
   requestAttemptAcceptance: RequestAttemptAcceptanceUseCase;
@@ -259,6 +282,7 @@ function unconfiguredWorkComposition(): WorkComposition {
     inspectAttempt: new InspectAttemptUseCase(),
     listAttempts: new ListAttemptsUseCase(),
     listLaneRuns: new ListLaneRunsUseCase(),
+    laneRunReads: new LaneRunBoardReads(),
     listConductorPasses: new ListConductorPassesUseCase(),
     listAttemptJournal: new ListAttemptJournalUseCase(),
     probeProject: new ProbeProjectUseCase(),
@@ -272,6 +296,16 @@ function unconfiguredWorkComposition(): WorkComposition {
     dispatchAttempt: new DispatchAttemptUseCase(),
     reconcileAttempt: new ReconcileAttemptUseCase(),
     stopAttempt: new StopAttemptUseCase(),
+    // Unconfigured, the halt write throws Not implemented (501) and the stop
+    // use case refuses every request with invalid-request: an API without a
+    // runtime never reports a durable write.
+    setConductorHalt: {
+      set() {
+        return Promise.reject(new Error("Not implemented: ConductorHaltPort"));
+      },
+    },
+    requestLaneRunStop: new RequestLaneRunStopUseCase(),
+    runControlLimiter: new ProbeLimiter(4),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase(),
     prepareFixAttempt: new PrepareFixAttemptUseCase(),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase(),
@@ -318,6 +352,9 @@ export function createConfiguredWorkComposition(
   crossContext?: WorkCrossContextDelegates,
 ): WorkComposition {
   const stateDir = options?.stateDir;
+  // A durable halt or stop write exists only when the runtime was given a
+  // real state directory; in-memory state is disposable by definition.
+  const hasDurableStateDir = typeof stateDir === "string" && stateDir.trim().length > 0;
 
   const {
     worktreeSshHost,
@@ -357,6 +394,16 @@ export function createConfiguredWorkComposition(
     stateDir,
     ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
   });
+  // A-R: the run reads are read-only GETs, so the stores they touch are opened
+  // read-only: a malformed file reads as unreadable and is never quarantined
+  // or written by a GET. Mutating use cases keep the writable instances.
+  const readOnlyWorkOrderRepo = new WorkOrderRepositoryAdapter({ stateDir, readOnly: true });
+  const readOnlyAttemptRepo = new AttemptRepositoryAdapter({ stateDir, readOnly: true });
+  const readOnlyExecutionJournal = new ExecutionJournalAdapter({ stateDir, readOnly: true });
+  // WB5b: the stores a completed merge writes to (merge-records.json and the
+  // pull-request link files), opened on the same state dir as the others.
+  const lanePlanRepo = new LanePlanRepositoryAdapter({ stateDir });
+  const mergeRecordRepo = new MergeRecordRepositoryAdapter({ stateDir });
   // EX-1c: the cancel-prepared guard reads lane runs and their journal; the
   // route only ever reads them, so both adapters are opened read-only.
   const laneRunRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
@@ -499,9 +546,20 @@ export function createConfiguredWorkComposition(
       runJournal: laneRunJournal,
       halt: conductorHalt,
       driverLease: conductorDriverLease,
-      attemptRepo,
-      executionJournal: journal,
-      workOrderRepo,
+      attemptRepo: readOnlyAttemptRepo,
+      executionJournal: readOnlyExecutionJournal,
+      workOrderRepo: readOnlyWorkOrderRepo,
+      passTrace: conductorPassTrace,
+    }),
+    laneRunReads: new LaneRunBoardReads({
+      runRepo: laneRunRepo,
+      runJournal: laneRunJournal,
+      halt: conductorHalt,
+      driverLease: conductorDriverLease,
+      attemptRepo: readOnlyAttemptRepo,
+      executionJournal: readOnlyExecutionJournal,
+      workOrderRepo: readOnlyWorkOrderRepo,
+      passTrace: conductorPassTrace,
     }),
     listConductorPasses: new ListConductorPassesUseCase({ passTrace: conductorPassTrace }),
     listAttemptJournal: new ListAttemptJournalUseCase({ attemptRepo, journal }),
@@ -529,12 +587,36 @@ export function createConfiguredWorkComposition(
       runner,
       runnerForAttempt,
     }),
-    stopAttempt: new StopAttemptUseCase({
-      attemptRepo,
-      journal,
-      runner,
-      runnerForAttempt,
-    }),
+    stopAttempt: withRunOwnedStopRefusal(
+      new StopAttemptUseCase({
+        attemptRepo,
+        journal,
+        runner,
+        runnerForAttempt,
+      }),
+      laneRunRepo,
+    ),
+    // A-C: the run-control writes go through the same durable state directory
+    // as the conductor driver's own files, so a web stop or halt is exactly
+    // the record the driver reads on its next pass. An API without a durable
+    // stateDir stays refusing (disposable memory is never a durable halt).
+    ...(hasDurableStateDir
+      ? {
+          setConductorHalt: new ConductorHaltAdapter({ stateDir: stateDir as string }),
+          requestLaneRunStop: new RequestLaneRunStopUseCase({
+            runRepo: laneRunRepo,
+            runJournal: new LaneRunJournalAdapter({ stateDir: stateDir as string }),
+          }),
+        }
+      : {
+          setConductorHalt: {
+            set() {
+              return Promise.reject(new Error("Not implemented: ConductorHaltPort"));
+            },
+          },
+          requestLaneRunStop: new RequestLaneRunStopUseCase(),
+        }),
+    runControlLimiter: new ProbeLimiter(4),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase({
       attemptRepo,
       journal,
@@ -566,6 +648,13 @@ export function createConfiguredWorkComposition(
       // owner-decision resolution acceptance uses.
       ownerDecisionPort,
       attemptOwnerDecisionPort,
+      lanePlanRepo,
+      mergeRecordRepo,
+      // WB5b2: a merge's unconfirmed pull-request number is verified through
+      // the host's read-only pull-request read; absent, it stays unverified.
+      ...(crossContext?.forge?.pullRequestRead !== undefined
+        ? { forgeRead: crossContext.forge.pullRequestRead }
+        : {}),
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === "none" ? { forgeMode: "none" as const } : {}),
     }),

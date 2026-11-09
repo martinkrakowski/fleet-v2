@@ -9,6 +9,7 @@
  * this issue, which cancels its own grant. It never decides eligibility.
  */
 
+import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import {
@@ -238,6 +239,8 @@ export class IssuePolicyForgeGrantUseCase implements IssuePolicyForgeGrantPort {
         attemptId: input.attemptId,
         acceptanceReceiptId: input.acceptanceReceiptId,
       },
+      grantRecordVersion: GRANT_RECORD_VERSION,
+      grantAttemptId: input.attemptId,
     };
   }
 }

@@ -416,7 +416,9 @@ describe("API Security and Hardening", () => {
         },
         body: JSON.stringify({}),
       });
-      expect(resStop.status).toBe(200);
+      // The handler runs and the absent attempt resolves to the stop route's
+      // 404 NOT_FOUND; the middleware itself must not block the request.
+      expect(resStop.status).toBe(404);
       expect(stopHandlerInvoked).toBe(true);
     });
 

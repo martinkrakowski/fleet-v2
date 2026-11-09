@@ -31,18 +31,22 @@ import {
   LANE_RUN_SCHEMA_VERSION,
   LANE_RUN_TIERS,
   RUN_STOP_REFUSAL_KINDS,
+  parseLaneRunProvenance,
 } from '../lane-run-records.js';
 import type {
   LaneRunKeyStep,
   LaneRunLeaseRecord,
   LaneRunParkReason,
   LaneRunParkRecord,
+  LaneRunProvenance,
   LaneRunRecord,
   LaneRunTier,
   RunStopRefusalKind,
 } from '../lane-run-records.js';
 import { copyParkRecord } from '../lane-run-records.js';
 import type { LaneRunParkFindingView } from '../park-findings-view.js';
+import { parseParkClass } from '../park-class.js';
+import type { LaneRunParkClass } from '../park-class.js';
 import { copyParkFindings, parkFindingsSnapshotOf } from '../park-findings-view.js';
 import { LANE_RUN_RESUMABLE_STATES } from '../value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../value-objects/LaneRunState.vo.js';
@@ -75,14 +79,14 @@ const REQUIRED_RECORD_KEYS: readonly string[] = [
 ];
 
 /**
- * The keys a record may omit: `branchName` (KF-5a), `baseBranch` (CB1) and
- * `schemaVersion` (Q5a, D6). One optional-key read keeps every stored record
+ * The keys a record may omit: `branchName` (KF-5a), `baseBranch` (CB1), `provenance`
+ * (CO28, D-R8) and `schemaVersion` (Q5a, D6). One optional-key read keeps every stored record
  * readable without a version bump; anything else is an unknown key.
  */
-const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'schemaVersion'];
+const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'provenance', 'schemaVersion'];
 
 const PARKED_REQUIRED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
-const PARKED_OPTIONAL_KEYS: readonly string[] = ['findings'];
+const PARKED_OPTIONAL_KEYS: readonly string[] = ['findings', 'class'];
 const LEASE_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
 
 export class LaneRun {
@@ -164,6 +168,7 @@ export class LaneRun {
       runPolicyRevision: recordInput.runPolicyRevision as string,
       ...(branchFields.branchName === undefined ? {} : { branchName: branchFields.branchName }),
       ...(branchFields.baseBranch === undefined ? {} : { baseBranch: branchFields.baseBranch }),
+      ...(branchFields.provenance === undefined ? {} : { provenance: branchFields.provenance }),
       ...(versionRead.explicit ? { schemaVersion: versionRead.schemaVersion } : {}),
     };
     return { success: true, value: new LaneRun(Object.freeze(record)) };
@@ -214,6 +219,7 @@ export class LaneRun {
       runPolicyRevision: this.record.runPolicyRevision,
       ...(this.record.branchName === undefined ? {} : { branchName: this.record.branchName }),
       ...(this.record.baseBranch === undefined ? {} : { baseBranch: this.record.baseBranch }),
+      ...(this.record.provenance === undefined ? {} : { provenance: this.record.provenance }),
       ...(this.record.schemaVersion === undefined ? {} : { schemaVersion: this.record.schemaVersion }),
     };
   }
@@ -445,7 +451,26 @@ function readOptionalBaseBranch(recordInput: Record<string, unknown>): {
 }
 
 /**
- * runPolicyRevision, branchName (KF-5a) and baseBranch (CB1): the last field
+ * `provenance` is optional (CO28, D-R8): an absent key reads as `started` and stays absent on the record;
+ * when the key is present the value must be exactly `started` or `adopted` (an explicit `undefined`, a
+ * getter, null or any other value is refused, never defaulted).
+ */
+function readOptionalProvenance(recordInput: Record<string, unknown>): {
+  ok: true;
+  provenance: LaneRunProvenance | undefined;
+} | { ok: false; error: string } {
+  if (!Object.hasOwn(recordInput, 'provenance')) {
+    return { ok: true, provenance: undefined };
+  }
+  const parsed = parseLaneRunProvenance(recordInput.provenance);
+  if (parsed === undefined) {
+    return { ok: false, error: 'LaneRun provenance must be started or adopted' };
+  }
+  return { ok: true, provenance: parsed };
+}
+
+/**
+ * runPolicyRevision, branchName (KF-5a), baseBranch (CB1) and provenance (CO28): the last field
  * checks of the body, moved here (fix round 1) so createUnchecked stays under
  * the file's complexity cap of 12. Returns the first refusal, with the same
  * messages as the inline checks it replaced.
@@ -454,6 +479,7 @@ function readOptionalBranchFields(recordInput: Record<string, unknown>): {
   ok: true;
   branchName: string | undefined;
   baseBranch: BaseBranchValue | undefined;
+  provenance: LaneRunProvenance | undefined;
 } | { ok: false; error: string } {
   const runPolicyRevisionError = idError('runPolicyRevision', recordInput.runPolicyRevision);
   if (runPolicyRevisionError !== null) {
@@ -467,7 +493,16 @@ function readOptionalBranchFields(recordInput: Record<string, unknown>): {
   if (!baseBranch.ok) {
     return { ok: false, error: baseBranch.error };
   }
-  return { ok: true, branchName: branchName.branchName, baseBranch: baseBranch.baseBranch };
+  const provenance = readOptionalProvenance(recordInput);
+  if (!provenance.ok) {
+    return { ok: false, error: provenance.error };
+  }
+  return {
+    ok: true,
+    branchName: branchName.branchName,
+    baseBranch: baseBranch.baseBranch,
+    provenance: provenance.provenance,
+  };
 }
 
 function invalid(message: string): LaneRunResult {
@@ -555,6 +590,9 @@ function parkedSnapshotError(snapshot: Record<string, unknown> | null): string |
       return findingsError;
     }
   }
+  if (snapshot.class !== undefined && parseParkClass(snapshot.class) === undefined) {
+    return 'LaneRun parked class is not a known park class';
+  }
   const reason = snapshot.reason;
   if (typeof reason !== 'string' || !LANE_RUN_PARK_REASONS.includes(reason as LaneRunParkReason)) {
     return 'LaneRun parked reason is not a known park reason';
@@ -614,6 +652,7 @@ function buildParkedRecord(snapshot: Record<string, unknown>): LaneRunParkRecord
     parkedFrom: snapshot.parkedFrom as LaneRunStateValue,
     questionId: snapshot.questionId as string | null,
     ...(findings !== undefined ? { findings } : {}),
+    ...(snapshot.class !== undefined ? { class: snapshot.class as LaneRunParkClass } : {}),
   });
 }
 

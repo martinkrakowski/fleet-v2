@@ -84,12 +84,19 @@ const RUNTIME_ONLY = new Set([
   "TMPDIR",
   "SYSTEMROOT",
   "YARN_NM_MODE",
+  // Passed through by the release runner's child allowlist; never a build input.
+  "COREPACK_ENABLE_DOWNLOAD_PROMPT",
+  "TZ",
   // git and ssh variables the adapters clear or pin for their children.
   "GIT_DIR",
   "GIT_WORK_TREE",
   "GIT_CONFIG_COUNT",
   "GIT_ASKPASS",
   "GIT_TERMINAL_PROMPT",
+  // Pinned by e2e tests so a host's git config never reaches a test repository.
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_NOSYSTEM",
   "SSH_ASKPASS",
 ]);
 
@@ -105,6 +112,7 @@ const CREDENTIAL = new Set([
   "OPENCODE_AUTH_FILE",
   "FLEET_API_TOKEN_FILE",
   "FLEET_TELEMETRY_TOKEN_FILE",
+  "FLEET_CONDUCTOR_WAKE_TOKEN_FILE",
   "FLEET_TEST_SECRET",
   "PASSWORD",
   "SSH_AUTH_SOCK",

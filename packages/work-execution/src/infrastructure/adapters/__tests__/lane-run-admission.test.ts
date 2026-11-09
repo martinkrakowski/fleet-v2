@@ -158,6 +158,8 @@ interface AdmissionHarnessOptions {
   readonly wireForgeRead?: boolean;
   /** A custom forge read (e.g. one that throws); takes precedence over the wire-in fake. */
   readonly forgeRead?: Pick<ForgeReadPort, 'readPullRequest'>;
+  /** AD-1: a profile read answering with this lane cap (absent = no cap). */
+  readonly profileRead?: { readonly maxConcurrentLanes?: number };
 }
 
 function makeHarness(options: AdmissionHarnessOptions = {}) {
@@ -206,6 +208,23 @@ function makeHarness(options: AdmissionHarnessOptions = {}) {
     maxActiveRuns: options.maxActiveRuns ?? 1,
     ...(options.candidateHosts === undefined ? { candidateHosts: CANDIDATE_HOSTS } : { candidateHosts: options.candidateHosts }),
     ...(options.forgeRead !== undefined || options.wireForgeRead ? { forgeRead } : {}),
+    ...(options.profileRead !== undefined
+      ? {
+          profileRead: {
+            readProjectProfile: async () => ({
+              projectId: 'project-example-1',
+              status: 'active' as const,
+              repository: 'repo-example-1',
+              clones: {},
+              gateProcedures: [],
+              revision: 1,
+              ...(options.profileRead?.maxConcurrentLanes !== undefined
+                ? { maxConcurrentLanes: options.profileRead.maxConcurrentLanes }
+                : {}),
+            }),
+          },
+        }
+      : {}),
     newReservationId: () => {
       reservationCounter += 1;
       return 'res-adm-' + String(reservationCounter);
@@ -283,7 +302,8 @@ function foundPullRequest(state: 'open' | 'merged' | 'closed' = 'merged'): ReadP
       mergeState: 'clean',
       headSha: COMMIT,
       headRef: 'fleet/example',
-      baseRef: 'main',
+      isCrossRepository: false,
+      headRepositoryOwner: 'example-owner',      baseRef: 'main',
       mergedAtIso: state === 'merged' ? NOW : null,
       closedAtIso: null,
       mergeCommitSha: state === 'merged' ? COMMIT : null,
@@ -1222,6 +1242,79 @@ describe('LaneRunAdmissionAdapter parked exclusion (KS5)', () => {
       blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
     });
     expect(harness.reserveCalls).toHaveLength(0);
+  });
+});
+
+describe('LaneRunAdmissionAdapter project lane cap (AD-1)', () => {
+  it('new: a start is refused when the project\'s lanes reach the profile\'s cap', async () => {
+    const harness = makeHarness({ maxActiveRuns: 5, profileRead: { maxConcurrentLanes: 1 } });
+    await harness.createRun(runRecord(RUN_A_ID, ['attempt-example-2'], 'wo-example-1'));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(
+      firstReservationRequest({ attemptId: 'attempt-example-9' }),
+    );
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('new: a start is allowed while the project is below its cap', async () => {
+    const harness = makeHarness({ maxActiveRuns: 5, profileRead: { maxConcurrentLanes: 2 } });
+    harness.workOrders.set('wo-other', workOrderFixture({ id: 'wo-other', projectId: 'project-example-1', ownedPaths: ['packages/other/src'] }));
+    await harness.createRun(runRecord(RUN_A_ID, ['attempt-example-2'], 'wo-other'));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(
+      firstReservationRequest({ attemptId: 'attempt-example-9' }),
+    );
+    expect(result).toMatchObject({ outcome: 'reserved' });
+  });
+
+  it('new: another project\'s lanes do not count toward the cap', async () => {
+    const harness = makeHarness({ maxActiveRuns: 5, profileRead: { maxConcurrentLanes: 1 } });
+    await harness.createRun(runRecord(RUN_A_ID, ['attempt-example-2'], 'wo-other'));
+    harness.workOrders.set('wo-other', workOrderFixture({ id: 'wo-other', projectId: 'project-example-2', ownedPaths: ['packages/other/src'] }));
+    await harness.holdReservation('attempt-example-2');
+
+    const result = await harness.adapter.reserveFirst(
+      firstReservationRequest({ attemptId: 'attempt-example-9' }),
+    );
+    expect(result).toMatchObject({ outcome: 'reserved' });
+  });
+
+  it('new: an in-flight reservation of the project counts toward the cap', async () => {
+    const harness = makeHarness({ maxActiveRuns: 5, profileRead: { maxConcurrentLanes: 1 } });
+    harness.workOrders.set('wo-same', workOrderFixture({ id: 'wo-same', projectId: 'project-example-1', ownedPaths: ['packages/other/src'] }));
+    await harness.holdReservation('attempt-example-9', { workOrderId: 'wo-same' });
+
+    const result = await harness.adapter.reserveFirst(
+      firstReservationRequest({ attemptId: 'attempt-example-1' }),
+    );
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('new: a profile without a lane cap caps nothing', async () => {
+    const harness = makeHarness({ maxActiveRuns: 1, profileRead: {} });
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toMatchObject({ outcome: 'reserved' });
+  });
+
+  it('new: a run\'s own later attempt does not count against its cap', async () => {
+    const harness = makeHarness({ maxActiveRuns: 5, profileRead: { maxConcurrentLanes: 1 } });
+    await harness.createRun(runRecord(RUN_A_ID, ['attempt-example-2'], 'wo-example-1'));
+    await harness.holdReservation('attempt-example-2');
+    harness.attempts.set('attempt-example-2', attemptFixture('attempt-example-2'));
+
+    const result = await harness.adapter.admit(admitRequest({ attemptId: 'attempt-example-2' }));
+    expect(result).toEqual({ outcome: 'admitted' });
   });
 });
 

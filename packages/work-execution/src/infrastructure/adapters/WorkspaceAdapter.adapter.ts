@@ -29,8 +29,14 @@ import {
   type WorktreeInspectionRequest,
   type WorkspacePort,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
+import type {
+  ArtifactManifestRemovalCheckResult,
+  VerifyArtifactManifestRequest,
+} from '../../application/ports/out/AttemptArtifactPort.out-port.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
+import { LANE_DIFF_SECRET_PATTERNS, containsSecretShape } from '@fleet/shared';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+import type { CommandRunResult } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isFixedProtectedPath, pathUnderPrefix } from '../../domain/lane-diff-check.js';
@@ -52,6 +58,9 @@ import type {
   ReadFilesystemSpaceResult,
   RemoveLaneWorktreeRequest,
   RemoveLaneWorktreeResult,
+  RemoveWorktreeManifestCheck,
+  RemoveWorktreeRequest,
+  RemoveWorktreeResult,
   ResetWorktreeToHeadRequest,
   ResetWorktreeToHeadResult,
   VerifySavedPatchRequest,
@@ -59,6 +68,9 @@ import type {
   WorktreeStatusCounts,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
 import { runnerHasHostName } from '../../domain/execution-records.js';
+import { SEALED_MANIFEST_PATH_PATTERN } from '../../domain/artifact-manifest.js';
+import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import { AttemptArtifactAdapter } from './AttemptArtifactAdapter.adapter.js';
 
 /**
  * Adapter-layer helper for resolving one caller-supplied path against a
@@ -175,6 +187,15 @@ export interface WorkspaceAdapterOptions {
   readonly executorForRecordedHost?: (
     recorded: AttemptRunnerRecord | null | undefined,
   ) => ExecutorForRecordedHostResult;
+  /**
+   * C2': the fail-closed artifact-manifest check behind `removeWorktree`'s
+   * manifest gate. When omitted, the adapter builds its own
+   * `AttemptArtifactAdapter` over the same executors and answers through
+   * `checkArtifactManifestForRemoval`.
+   */
+  readonly checkArtifactManifest?: (
+    request: VerifyArtifactManifestRequest,
+  ) => Promise<ArtifactManifestRemovalCheckResult>;
 }
 
 /** Residue markers a previous attempt may have left in the worktree. */
@@ -280,6 +301,222 @@ export function removeLaneWorktreeRequestIsValid(request: RemoveLaneWorktreeRequ
     return false;
   }
   return LANE_RUN_BRANCH_PATTERN.test(branch);
+}
+
+/**
+ * KW3' (conductor plan §3.10.3) path validation of one `removeWorktree`
+ * request, before any command runs: all three paths are absolute and
+ * normalised, the worktree path sits strictly under the worktree root, and it
+ * is neither equal to nor inside the clone. A path problem is refused as
+ * `path-refused`. This is the lexical pre-command check; containment against
+ * the resolved physical paths is enforced again in `removeCheckedListedWorktree`
+ * after the listed entry is found, so a symlink inside the root pointing at a
+ * worktree outside it is still refused.
+ */
+function removeWorktreePathRefusal(request: RemoveWorktreeRequest): boolean {
+  const { repositoryRoot, worktreeRoot, worktreePath } = request;
+  if (
+    !isAbsoluteNormalisedPath(repositoryRoot) ||
+    !isAbsoluteNormalisedPath(worktreeRoot) ||
+    !isAbsoluteNormalisedPath(worktreePath)
+  ) {
+    return true;
+  }
+  if (!worktreePath.startsWith(`${worktreeRoot}/`)) {
+    return true;
+  }
+  return worktreePath === repositoryRoot || worktreePath.startsWith(`${repositoryRoot}/`);
+}
+
+/**
+ * KW3' (conductor plan §3.10.3) non-path validation of one `removeWorktree`
+ * request: the recorded host is named, `expectedHead` is a real commit sha
+ * (40 or 64 lowercase hex, not all zeros), `expectedBranch` is a non-empty
+ * branch that is not `main`, and `expectedLastActivityIso` is either null (no
+ * activity was readable under the caller's hold) or an ISO-8601 UTC instant with milliseconds (the form `toISOString` writes). Any
+ * other malformed request is refused as `invalid-request`.
+ */
+/** True when `value` is exactly what `toISOString` writes, so no calendar date was normalised. */
+function isCanonicalIsoInstant(value: string): boolean {
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function removeWorktreeRequestIsValid(request: RemoveWorktreeRequest): boolean {
+  const { expectedHead, expectedBranch, expectedLastActivityIso, recordedHost, repositoryRoot, worktreeRoot, worktreePath } = request;
+  if (!runnerHasHostName(recordedHost)) {
+    return false;
+  }
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedHead) || /^0+$/.test(expectedHead)) {
+    return false;
+  }
+  if (typeof expectedBranch !== 'string' || expectedBranch === '' || expectedBranch === 'main') {
+    return false;
+  }
+  if (
+    expectedLastActivityIso !== null &&
+    (typeof expectedLastActivityIso !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(expectedLastActivityIso) ||
+      !isCanonicalIsoInstant(expectedLastActivityIso))
+  ) {
+    return false;
+  }
+  // C2': every input is size-bounded before any command runs.
+  if (
+    typeof repositoryRoot !== 'string' ||
+    repositoryRoot.length > 4096 ||
+    typeof worktreeRoot !== 'string' ||
+    worktreeRoot.length > 4096 ||
+    typeof worktreePath !== 'string' ||
+    worktreePath.length > 4096 ||
+    expectedBranch.length > 256
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * C2': a bounded, path-free approval reference: non-empty, at most 256
+ * characters, no `/`, no `\`, no whitespace or control characters, and never
+ * a secret-shaped string.
+ */
+function isValidApprovalReference(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 256 &&
+    !value.includes('/') &&
+    !value.includes('\\') &&
+    !/[\s\p{C}]/u.test(value) &&
+    !containsSecretShape(value) &&
+    !LANE_DIFF_SECRET_PATTERNS.some((entry) => entry.regex.test(value))
+  );
+}
+
+/**
+ * C2': validation of the manifest coordinates one `removeWorktree` request is
+ * gated on. `uncollected` is valid as-is; `sealed` must carry a
+ * content-addressed manifest path whose embedded digest slice matches the
+ * recorded digest; `force-unsealed` must carry a bounded attempt id and a
+ * clean approval reference; anything else is `invalid-request`.
+ */
+function removeWorktreeManifestIsValid(manifest: unknown): boolean {
+  let snap: Partial<Record<keyof RemoveWorktreeManifestCheck, unknown>> & Record<string, unknown>;
+  try {
+    // Descriptor-safe snapshot: an accessor or a throwing getter reads as invalid.
+    const read = snapshotPlainDataRecord(manifest);
+    if (read === null) {
+      return false;
+    }
+    snap = read;
+  } catch {
+    return false;
+  }
+  const attemptIdOk = (value: unknown): value is string =>
+    typeof value === 'string' && value.length > 0 && value.length <= 128 &&
+    !value.includes('/') && !value.includes('\0');
+  if (snap.kind === 'uncollected') {
+    return true;
+  }
+  if (snap.kind === 'sealed') {
+    const match =
+      typeof snap.manifestPath === 'string' ? SEALED_MANIFEST_PATH_PATTERN.exec(snap.manifestPath) : null;
+    return (
+      attemptIdOk(snap.attemptId) &&
+      typeof snap.manifestPath === 'string' &&
+      match !== null &&
+      typeof snap.expectedManifestSha256 === 'string' &&
+      /^[0-9a-f]{64}$/.test(snap.expectedManifestSha256) &&
+      match[1] === snap.expectedManifestSha256.slice(0, 16)
+    );
+  }
+  if (snap.kind === 'force-unsealed') {
+    return attemptIdOk(snap.attemptId) && isValidApprovalReference(snap.approvalReference);
+  }
+  return false;
+}
+
+/**
+ * C2': a descriptor-safe snapshot of one `removeWorktree` request. A null, a
+ * non-object or a request with a throwing getter reads as null; the caller
+ * answers `invalid-request` and never throws.
+ */
+function snapshotRemoveWorktreeRequest(request: unknown): RemoveWorktreeRequest | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(request);
+  } catch {
+    return null;
+  }
+  if (snap === null) {
+    return null;
+  }
+  return snap as unknown as RemoveWorktreeRequest;
+}
+
+/**
+ * C2': the hardened prefix every git read inside `removeWorktree` runs under:
+ * no protocol transport, no lazy fetch, no terminal prompt, no optional
+ * locks, no hooks, no fsmonitor. Reads only — the removal itself stays the
+ * plain five-argv `git worktree remove`.
+ */
+const REMOVAL_GIT_READ_PREFIX = [
+  'env',
+  'GIT_ALLOW_PROTOCOL=none',
+  'GIT_NO_LAZY_FETCH=1',
+  'GIT_TERMINAL_PROMPT=0',
+  'git',
+  '--no-optional-locks',
+  '-c',
+  'core.hooksPath=/dev/null',
+  '-c',
+  'core.fsmonitor=false',
+  '-c',
+  'protocol.allow=never',
+] as const;
+
+/** C2': the bounded output buffer of one hardened git read. */
+const REMOVAL_READ_MAX_BUFFER_BYTES = 1_048_576;
+
+/**
+ * C2': one hardened git read. A thrown executor rejection is answered as an
+ * unanswered `CommandRunResult` (`exitCode: null`), which every caller reads
+ * as unknown — it never propagates and never embeds stderr.
+ */
+async function runRemovalGitRead(
+  executor: CommandExecutorPort,
+  repoOrWorktreePath: string,
+  gitArgs: readonly string[],
+): Promise<CommandRunResult> {
+  try {
+    return await executor.run(
+      [...REMOVAL_GIT_READ_PREFIX, '-C', repoOrWorktreePath, ...gitArgs],
+      { timeoutMs: GIT_TIMEOUT_MS, maxBufferBytes: REMOVAL_READ_MAX_BUFFER_BYTES },
+    );
+  } catch {
+    return { signal: null, stdout: '', stderr: '', exitCode: null, error: 'executor-threw' };
+  }
+}
+
+/**
+ * C2': the executor the activity and size reads run through: every `git -C`
+ * argv is rewritten onto the hardened read prefix, and every other subprocess
+ * call is bounded. `inspectWorktreeForRemoval` and `removeWorktree` run
+ * through it; `removeLaneWorktree` keeps its legacy argv.
+ */
+function removalActivityExecutor(executor: CommandExecutorPort): CommandExecutorPort {
+  return {
+    run: async (argv, options) => {
+      if (argv[0] === 'git' && argv[1] === '-C' && typeof argv[2] === 'string') {
+        return runRemovalGitRead(executor, argv[2], argv.slice(3));
+      }
+      return executor.run(argv, {
+        ...(options ?? {}),
+        ...(options?.maxBufferBytes === undefined ? { maxBufferBytes: REMOVAL_READ_MAX_BUFFER_BYTES } : {}),
+      });
+    },
+  };
 }
 
 /** One entry of `git worktree list --porcelain`, as far as this adapter reads it. */
@@ -764,18 +1001,45 @@ export async function writeAndVerifyPatch(
   return 'preserved';
 }
 
-function isValidInspectRequest(request: InspectWorktreeForRemovalRequest): boolean {
-  const { repositoryRoot, worktreePath, defaultRef } = request;
-  if (!isAbsoluteNormalisedPath(repositoryRoot) || !isAbsoluteNormalisedPath(worktreePath)) {
-    return false;
+/**
+ * A bounded, typed absolute path: a string of at most 4096 characters that is
+ * absolute and normalised. Anything else is not a path.
+ */
+function isBoundedAbsolutePath(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 4096 && isAbsoluteNormalisedPath(value);
+}
+
+/**
+ * C2': the validated request of one `inspectWorktreeForRemoval`. The request
+ * is snapshotted without running any getter, so a null, a primitive or a
+ * throwing getter reads as null (the caller answers `invalid-request`). The
+ * ref is bounded and can never read as an option (`--upload-pack=...`).
+ */
+function snapshotInspectRequest(request: unknown): InspectWorktreeForRemovalRequest | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(request);
+  } catch {
+    return null;
   }
-  if (typeof defaultRef !== 'string' || defaultRef === '') {
-    return false;
+  if (snap === null) {
+    return null;
   }
-  if (/\s/.test(defaultRef) || defaultRef.includes('\0')) {
-    return false;
+  const { repositoryRoot, worktreePath, defaultRef } = snap;
+  if (!isBoundedAbsolutePath(repositoryRoot) || !isBoundedAbsolutePath(worktreePath)) {
+    return null;
   }
-  return true;
+  if (
+    typeof defaultRef !== 'string' ||
+    defaultRef.length === 0 ||
+    defaultRef.length > 256 ||
+    defaultRef.startsWith('-') ||
+    /\s/.test(defaultRef) ||
+    defaultRef.includes('\0')
+  ) {
+    return null;
+  }
+  return snap as unknown as InspectWorktreeForRemovalRequest;
 }
 
 function parseWorktreeStatusCounts(stdout: string): WorktreeStatusCounts {
@@ -824,6 +1088,40 @@ function parseReflogTimestamp(stdout: string): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
+/**
+ * One `stat` answer as milliseconds. The first token is the whole-second epoch
+ * (`%Y` / `%m`); the sub-second part comes from the same line when the host
+ * prints it (GNU `%y`: `2026-01-01 00:00:00.123456789 +0000`, BSD `%Fm`:
+ * `1767225600.123456`). A host that prints only whole seconds yields whole
+ * seconds and `fractional: false`; the removal re-check treats such a reading
+ * as too coarse to prove quiet. Whole-second readings alone cannot tell a write made in the same
+ * second as the caller's inspection from the inspected state, so the removal
+ * re-check compares at millisecond precision.
+ */
+function parseStatMtime(line: string): { readonly ms: number; readonly fractional: boolean } | null {
+  const tokens = line.trim().split(/\s+/);
+  const first = tokens[0];
+  if (first === undefined || !/^\d+$/.test(first)) {
+    return null;
+  }
+  const seconds = Number.parseInt(first, 10);
+  if (!Number.isSafeInteger(seconds)) {
+    return null;
+  }
+  let millis = 0;
+  let fractional = false;
+  for (const token of tokens.slice(1)) {
+    const fraction = /^(?:\d{2}:\d{2}:\d{2}|\d+)\.(\d+)$/.exec(token);
+    if (fraction !== null) {
+      millis = Number.parseInt(fraction[1]!.padEnd(3, '0').slice(0, 3), 10);
+      // An all-zero fraction is a filesystem that stores whole seconds.
+      fractional = /[1-9]/.test(fraction[1]!);
+      break;
+    }
+  }
+  return { ms: seconds * 1000 + millis, fractional };
+}
+
 async function readReflogActivityMs(
   executor: CommandExecutorPort,
   worktreePath: string,
@@ -861,7 +1159,7 @@ async function readIndexActivityMs(
   executor: CommandExecutorPort,
   worktreePath: string,
   flavour: 'gnu' | 'bsd',
-): Promise<number | null> {
+): Promise<{ readonly ms: number; readonly fractional: boolean } | null> {
   const indexPathRun = await executor.run(
     ['git', '-C', worktreePath, 'rev-parse', '--git-path', 'index'],
     { timeoutMs: GIT_TIMEOUT_MS },
@@ -874,7 +1172,7 @@ async function readIndexActivityMs(
     indexPath = path.join(worktreePath, indexPath);
   }
   const indexStatRun = await executor.run(
-    flavour === 'gnu' ? ['stat', '-c', '%Y', indexPath] : ['stat', '-f', '%m', indexPath],
+    flavour === 'gnu' ? ['stat', '-c', '%Y %y', indexPath] : ['stat', '-f', '%m %Fm', indexPath],
     { timeoutMs: GIT_TIMEOUT_MS },
   );
   if (
@@ -884,38 +1182,58 @@ async function readIndexActivityMs(
   ) {
     return null;
   }
-  const seconds = Number.parseInt(indexStatRun.stdout.trim(), 10);
-  if (!Number.isSafeInteger(seconds)) {
-    return null;
-  }
-  return seconds * 1000;
+  return parseStatMtime(indexStatRun.stdout.trim());
 }
 
 async function walkTreeActivity(
   executor: CommandExecutorPort,
   worktreePath: string,
   flavour: 'gnu' | 'bsd',
-): Promise<{ newestMs: number | null; unknown: boolean }> {
+): Promise<{ newestMs: number | null; unknown: boolean; coarse: boolean }> {
   const walkArgv =
     flavour === 'gnu'
-      ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y', '{}', '+']
-      : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m', '{}', '+'];
+      ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y %y', '{}', '+']
+      : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m %Fm', '{}', '+'];
   const walkRun = await executor.run(walkArgv, { timeoutMs: GIT_TIMEOUT_MS });
   let newestMs: number | null = null;
+  let coarse = false;
   for (const line of walkRun.stdout.split('\n')) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
-    const seconds = Number.parseInt(trimmed, 10);
-    if (Number.isSafeInteger(seconds) && (newestMs === null || seconds * 1000 > newestMs)) {
-      newestMs = seconds * 1000;
+    const lineMtime = parseStatMtime(trimmed);
+    if (lineMtime === null) continue;
+    if (!lineMtime.fractional) coarse = true;
+    if (newestMs === null || lineMtime.ms > newestMs) {
+      newestMs = lineMtime.ms;
     }
   }
   const unknown = walkRun.exitCode === null || walkRun.error !== undefined || walkRun.exitCode !== 0;
-  return { newestMs, unknown };
+  return { newestMs, unknown, coarse };
 }
 
 export class WorkspaceAdapter implements WorkspacePort {
   constructor(private readonly options?: WorkspaceAdapterOptions) {}
+
+  /**
+   * C2': the fail-closed manifest check behind `removeWorktree`'s gate. When
+   * composition supplied one, it is used; otherwise a private
+   * `AttemptArtifactAdapter` over the same executors answers.
+   */
+  private checkArtifactManifest(
+    request: VerifyArtifactManifestRequest,
+  ): Promise<ArtifactManifestRemovalCheckResult> {
+    const supplied = this.options?.checkArtifactManifest;
+    if (supplied !== undefined) {
+      return supplied(request);
+    }
+    const fallback = new AttemptArtifactAdapter({
+      ...(this.options?.executor !== undefined ? { executor: this.options.executor } : {}),
+      ...(this.options?.executorForRecordedHost !== undefined
+        ? { executorForRecordedHost: this.options.executorForRecordedHost }
+        : {}),
+    });
+    return fallback.checkArtifactManifestForRemoval(request);
+  }
 
   /**
    * When given, a request carrying a recorded runner block (reads, brief
@@ -1759,6 +2077,271 @@ export class WorkspaceAdapter implements WorkspacePort {
   }
 
   /**
+   * KW3' (conductor plan §3.10.3): remove one worktree after re-reading HEAD,
+   * the branch, the porcelain status, the lock, the in-progress operation
+   * files and the bounded file walk in this one executor call, and only then
+   * run `git worktree remove <path>`. Never `--force`, never a branch
+   * command, never `prune`, never `rm`, never a fetch or a push. The only
+   * write is `git worktree remove <path>` with no flags. Every command runs
+   * through the recorded host's executor — never the configured or legacy
+   * executor — and when the recorded host is not named or no host executor is
+   * configured, nothing runs. A refusal removes nothing; `partial` means the
+   * command ran but the directory or its administrative entry is still there;
+   * `unknown` means the executor did not answer.
+   */
+  async removeWorktree(request: RemoveWorktreeRequest): Promise<RemoveWorktreeResult> {
+    // 1. Validate before anything runs (no executor call on a bad request).
+    //    C2': the request is snapshotted without running any getter, so a
+    //    null, a primitive or a throwing getter is a typed refusal, and no
+    //    hostile input ever throws.
+    const snapshotted = snapshotRemoveWorktreeRequest(request);
+    if (snapshotted === null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    if (removeWorktreePathRefusal(snapshotted)) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
+    if (!removeWorktreeRequestIsValid(snapshotted)) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    if (!removeWorktreeManifestIsValid(snapshotted.manifest)) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The removal runs on the recorded host's executor and nowhere else.
+    const executor = this.recordedHostExecutor(snapshotted.recordedHost);
+    if (executor === null) {
+      return { outcome: 'unknown', reason: 'no executor for the recorded host' };
+    }
+    try {
+      return await this.removeCheckedListedWorktree(snapshotted, executor);
+    } catch {
+      return { outcome: 'unknown', reason: 'the removal did not report' };
+    }
+  }
+
+  /**
+   * Steps 3–6 of `removeWorktree` on a resolved executor: find the worktree in
+   * the clone's list, re-read HEAD, branch, status, lock, in-progress
+   * operations and the bounded file walk through the same executor, then
+   * remove it only when every guard still holds. The outer try/catch stays in
+   * `removeWorktree` and answers `unknown` on any throw.
+   */
+  private async removeCheckedListedWorktree(
+    request: RemoveWorktreeRequest,
+    executor: CommandExecutorPort,
+  ): Promise<RemoveWorktreeResult> {
+    const { repositoryRoot, worktreeRoot, worktreePath, expectedHead, expectedBranch, expectedLastActivityIso } =
+      request;
+
+    // 3. Containment and the listed facts. C2': the git reads run hardened.
+    const listRun = await runRemovalGitRead(executor, repositoryRoot, [
+      'worktree',
+      'list',
+      '--porcelain',
+    ]);
+    if (listRun.exitCode === null || listRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git worktree list did not report an exit code' };
+    }
+    if (listRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git worktree list failed' };
+    }
+    const listed = parseWorktreeList(listRun.stdout);
+    if (listed === null) {
+      return { outcome: 'unknown', reason: 'git worktree list output could not be parsed' };
+    }
+    const entry = await this.findLinkedWorktreeEntry(executor, repositoryRoot, worktreePath, listed, true);
+    if (entry === null) {
+      return { outcome: 'refused', reason: 'not-a-linked-worktree' };
+    }
+
+    // 3b. Containment against the resolved physical paths. The lexical check
+    //     above cannot see a symlink inside the worktree root pointing at a
+    //     linked worktree outside it; the listed entry's path is the physical
+    //     path git lists, so it is compared against the physical root, and a
+    //     target outside the configured root is refused.
+    const physicalWorktreeRoot = await resolvePhysicalPath(executor, worktreeRoot, GIT_TIMEOUT_MS);
+    if (physicalWorktreeRoot === null) {
+      return { outcome: 'unknown', reason: 'the worktree root could not be resolved to a physical path' };
+    }
+    const containmentRoot = physicalWorktreeRoot;
+    if (entry.path === containmentRoot || !entry.path.startsWith(`${containmentRoot}/`)) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
+    //     The requested path itself must be the listed physical path: a
+    //     registered path since replaced by a symlink resolves elsewhere, and
+    //     a path that is itself reached through a symlink is refused too.
+    const physicalRequestedPath = await resolvePhysicalPath(executor, worktreePath, GIT_TIMEOUT_MS);
+    if (physicalRequestedPath === null) {
+      return { outcome: 'unknown', reason: 'the worktree path could not be resolved to a physical path' };
+    }
+    if (physicalRequestedPath !== entry.path || physicalRequestedPath !== worktreePath) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
+    //     A worktree inside the clone itself (reached through an alias of the
+    //     repository root) is refused as well.
+    const physicalRepositoryRoot = await resolvePhysicalPath(executor, repositoryRoot, GIT_TIMEOUT_MS);
+    if (
+      physicalRepositoryRoot === null ||
+      physicalRequestedPath === physicalRepositoryRoot ||
+      physicalRequestedPath.startsWith(`${physicalRepositoryRoot}/`)
+    ) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
+
+    // 4. Re-read the facts, in this order, through the same executor.
+    //    HEAD first: a moved HEAD refuses before anything else is read.
+    const headRun = await runRemovalGitRead(executor, worktreePath, ['rev-parse', 'HEAD']);
+    if (headRun.exitCode === null || headRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git rev-parse HEAD did not report an exit code' };
+    }
+    if (headRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git rev-parse HEAD failed' };
+    }
+    const head = headRun.stdout.trim();
+    if (head !== expectedHead) {
+      return { outcome: 'refused', reason: 'head-moved' };
+    }
+
+    //    Branch, from the listed entry.
+    if (entry.branch === null) {
+      return { outcome: 'refused', reason: 'detached' };
+    }
+    if (entry.branch !== expectedBranch) {
+      return { outcome: 'refused', reason: 'branch-mismatch' };
+    }
+
+    //    Status: a read that did not answer is never a refusal.
+    const statusResult = await this.readWorktreeStatus(executor, worktreePath, true);
+    if (statusResult.outcome === 'unknown') {
+      return { outcome: 'unknown', reason: statusResult.reason };
+    }
+    if (statusResult.status.tracked + statusResult.status.untracked + statusResult.status.unmerged > 0) {
+      return { outcome: 'refused', reason: 'dirty' };
+    }
+
+    //    Lock.
+    if (entry.locked) {
+      return { outcome: 'refused', reason: 'locked' };
+    }
+
+    //    In-progress operations.
+    const inProgressResult = await this.readInProgressOperations(executor, worktreePath, true);
+    if (inProgressResult.outcome === 'unknown') {
+      return { outcome: 'unknown', reason: inProgressResult.reason };
+    }
+    if (inProgressResult.operations.length > 0) {
+      return { outcome: 'refused', reason: 'busy' };
+    }
+
+    //    Bounded activity: the porcelain status cannot see writes to ignored
+    //    files, so the removal re-runs the bounded file walk and refuses busy
+    //    when the newest mtime moved past the value read under the caller's
+    //    hold, or when no baseline was read, or when the walk cannot answer
+    //    (conductor plan §3.10.3).
+    //    Instants are compared as parsed times, never as strings, and a
+    //    reading without a sub-second part is too coarse to prove quiet.
+    const activity = await this.readLastActivityDetailed(
+      removalActivityExecutor(executor),
+      worktreePath,
+    );
+    if (activity.unknown || activity.coarse || expectedLastActivityIso === null) {
+      return { outcome: 'refused', reason: 'busy' };
+    }
+    if (
+      activity.iso !== null &&
+      Date.parse(activity.iso) > Date.parse(expectedLastActivityIso)
+    ) {
+      return { outcome: 'refused', reason: 'busy' };
+    }
+
+    // 4b. Artifact-manifest gate (C2'): after every git and activity guard has
+    //     succeeded, the manifest decides. An uncollected worktree is refused;
+    //     a force-unsealed request (owner approval already consumed by the use
+    //     case) proceeds; a sealed request is removed only when the manifest
+    //     on disk still verifies, and an unreadable check is unknown — never
+    //     missing, never clean.
+    const manifest = request.manifest;
+    if (manifest.kind === 'uncollected') {
+      return { outcome: 'refused', reason: 'artifacts not collected' };
+    }
+    if (manifest.kind === 'sealed') {
+      let check: ArtifactManifestRemovalCheckResult;
+      try {
+        check = await this.checkArtifactManifest({
+          attemptId: manifest.attemptId,
+          worktreePath,
+          manifestPath: manifest.manifestPath,
+          expectedManifestSha256: manifest.expectedManifestSha256,
+          recordedHost: request.recordedHost ?? null,
+        });
+      } catch {
+        return { outcome: 'unknown', reason: 'artifact-manifest-unreadable' };
+      }
+      if (check.outcome === 'missing') {
+        return { outcome: 'refused', reason: 'artifacts not collected' };
+      }
+      if (check.outcome === 'mismatch') {
+        return { outcome: 'refused', reason: 'artifacts changed since collection' };
+      }
+      if (check.outcome !== 'sealed') {
+        return { outcome: 'unknown', reason: 'artifact-manifest-unreadable' };
+      }
+    }
+
+    // 5. Remove: exactly these five argv entries, no flags at all.
+    const removeRun = await executor.run(
+      ['git', '-C', repositoryRoot, 'worktree', 'remove', worktreePath],
+      { timeoutMs: GIT_TIMEOUT_MS, maxBufferBytes: REMOVAL_READ_MAX_BUFFER_BYTES },
+    );
+    if (removeRun.exitCode === null || removeRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'the remove did not report an exit code' };
+    }
+    if (removeRun.exitCode !== 0) {
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+
+    // 6. Post-conditions, only after exit 0.
+    const existsRun = await executor.run(['test', '-e', worktreePath], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+      maxBufferBytes: REMOVAL_READ_MAX_BUFFER_BYTES,
+    });
+    // `test -e` answers 1 when the directory is gone; a missing exit code, a
+    // reported error or any other exit is an unanswered probe, never a proof
+    // of removal.
+    if (existsRun.exitCode === null || existsRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'the existence probe did not report an exit code' };
+    }
+    if (existsRun.exitCode === 0) {
+      return { outcome: 'partial', detail: 'directory-present' };
+    }
+    if (existsRun.exitCode !== 1) {
+      return { outcome: 'unknown', reason: 'the existence probe failed' };
+    }
+    const relistRun = await runRemovalGitRead(executor, repositoryRoot, [
+      'worktree',
+      'list',
+      '--porcelain',
+    ]);
+    // A failed or unparseable relist cannot confirm that the administrative
+    // entry is gone, so it must not be reported as `removed`.
+    if (relistRun.exitCode === null || relistRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'the post-removal worktree list did not report an exit code' };
+    }
+    if (relistRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'the post-removal worktree list failed' };
+    }
+    const relisted = parseWorktreeList(relistRun.stdout);
+    if (relisted === null) {
+      return { outcome: 'unknown', reason: 'the post-removal worktree list output could not be parsed' };
+    }
+    if (listedWorktreeAt(relisted, entry.path) !== null) {
+      return { outcome: 'partial', detail: 'admin-entry-present' };
+    }
+    return { outcome: 'removed', branchTip: head };
+  }
+
+  /**
    * Step 4 of `removeListedLaneWorktree`: the branch is the record of the
    * run (D17) — a detached entry, or one on another branch, is refused,
    * never removed.
@@ -1799,19 +2382,25 @@ export class WorkspaceAdapter implements WorkspacePort {
    * prunes, removes, locks or fetches anything, and it never scans a host.
    */
   async listWorktrees(request: ListWorktreesRequest): Promise<ListWorktreesResult> {
-    if (!isAbsoluteNormalisedPath(request.repositoryRoot)) {
+    // C2': a descriptor-safe snapshot; a null, a primitive or a throwing
+    // getter is a typed answer with no executor call.
+    let snap: Record<string, unknown> | null;
+    try {
+      snap = snapshotPlainDataRecord(request);
+    } catch {
+      return { outcome: 'unknown', reason: 'invalid-request' };
+    }
+    const repositoryRoot = snap?.['repositoryRoot'];
+    if (snap === null || !isBoundedAbsolutePath(repositoryRoot)) {
       return { outcome: 'unknown', reason: 'invalid-request' };
     }
     let executor: CommandExecutorPort;
     try {
-      executor = this.executorFor(request.recordedHost);
+      executor = this.executorFor(snap['recordedHost'] as AttemptRunnerRecord | null | undefined);
     } catch {
       return { outcome: 'unknown', reason: 'no executor for the read' };
     }
-    const run = await executor.run(
-      ['git', '-C', request.repositoryRoot, 'worktree', 'list', '--porcelain'],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
+    const run = await runRemovalGitRead(executor, repositoryRoot, ['worktree', 'list', '--porcelain']);
     if (run.exitCode === null || run.error !== undefined) {
       return { outcome: 'unknown', reason: 'git worktree list did not report an exit code' };
     }
@@ -1836,25 +2425,42 @@ export class WorkspaceAdapter implements WorkspacePort {
     request: InspectWorktreeForRemovalRequest,
   ): Promise<InspectWorktreeForRemovalResult> {
     // 1. Validate before any command runs (no executor call on a bad request).
-    if (!isValidInspectRequest(request)) {
+    const snapshotted = snapshotInspectRequest(request);
+    if (snapshotted === null) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
-    const { repositoryRoot, worktreePath, defaultRef } = request;
+    const { repositoryRoot, worktreePath, defaultRef } = snapshotted;
 
     // 2. The read runs on the recorded host's executor; an unresolvable host
     //    is unknown — nothing is known to have been read.
     let executor: CommandExecutorPort;
     try {
-      executor = this.executorFor(request.recordedHost);
+      executor = this.executorFor(snapshotted.recordedHost);
     } catch {
       return { outcome: 'unknown', reason: 'no executor for the read' };
     }
 
+    try {
+      return await this.inspectListedWorktree(executor, repositoryRoot, worktreePath, defaultRef);
+    } catch {
+      return { outcome: 'unknown', reason: 'worktree inspection failed' };
+    }
+  }
+
+  /**
+   * Steps 3–11 of `inspectWorktreeForRemoval` on a resolved executor. Every
+   * git read runs hardened (no network, no lazy fetch, no hooks, no
+   * fsmonitor, bounded output); the outer try/catch stays in
+   * `inspectWorktreeForRemoval` and answers `unknown` on any throw.
+   */
+  private async inspectListedWorktree(
+    executor: CommandExecutorPort,
+    repositoryRoot: string,
+    worktreePath: string,
+    defaultRef: string,
+  ): Promise<InspectWorktreeForRemovalResult> {
     // 3. List the clone's worktrees.
-    const listRun = await executor.run(
-      ['git', '-C', repositoryRoot, 'worktree', 'list', '--porcelain'],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
+    const listRun = await runRemovalGitRead(executor, repositoryRoot, ['worktree', 'list', '--porcelain']);
     if (listRun.exitCode === null || listRun.error !== undefined) {
       return { outcome: 'unknown', reason: 'git worktree list did not report an exit code' };
     }
@@ -1880,22 +2486,22 @@ export class WorkspaceAdapter implements WorkspacePort {
     const headOnDefault = await this.readHeadOnDefault(executor, worktreePath, head, defaultRef);
 
     // 8. Status counts.
-    const statusResult = await this.readWorktreeStatus(executor, worktreePath);
+    const statusResult = await this.readWorktreeStatus(executor, worktreePath, true);
     if (statusResult.outcome === 'unknown') {
       return statusResult;
     }
 
     // 9. In-progress operations.
-    const inProgressResult = await this.readInProgressOperations(executor, worktreePath);
+    const inProgressResult = await this.readInProgressOperations(executor, worktreePath, true);
     if (inProgressResult.outcome === 'unknown') {
       return inProgressResult;
     }
 
     // 10. Last activity.
-    const lastActivity = await this.readLastActivity(executor, worktreePath);
+    const lastActivity = await this.readLastActivity(removalActivityExecutor(executor), worktreePath);
 
     // 11. Size (budgeted; a failure is null, never a guess).
-    const sizeBytes = await this.readWorktreeSize(executor, worktreePath);
+    const sizeBytes = await this.readWorktreeSize(removalActivityExecutor(executor), worktreePath);
 
     return {
       outcome: 'inspected',
@@ -1919,6 +2525,7 @@ export class WorkspaceAdapter implements WorkspacePort {
     repositoryRoot: string,
     worktreePath: string,
     listed: readonly ListedWorktreeEntry[],
+    requirePhysicalRepositoryRoot = false,
   ): Promise<ListedWorktreeEntry | null> {
     let entry = listedWorktreeAt(listed, worktreePath);
     if (entry === null) {
@@ -1934,6 +2541,11 @@ export class WorkspaceAdapter implements WorkspacePort {
     if (physicalRepositoryRoot !== null && entry.path === physicalRepositoryRoot) {
       return null;
     }
+    // A removal must prove the entry is not the main checkout; when the
+    // physical repository root cannot be resolved it cannot, so it refuses.
+    if (physicalRepositoryRoot === null && requirePhysicalRepositoryRoot) {
+      return null;
+    }
     return entry;
   }
 
@@ -1943,11 +2555,14 @@ export class WorkspaceAdapter implements WorkspacePort {
     head: string | null,
     defaultRef: string,
   ): Promise<boolean | null> {
-    if (head === null) return null;
-    const mergeBaseRun = await executor.run(
-      ['git', '-C', worktreePath, 'merge-base', '--is-ancestor', head, defaultRef],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
+    if (head === null || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head)) return null;
+    const mergeBaseRun = await runRemovalGitRead(executor, worktreePath, [
+      'merge-base',
+      '--is-ancestor',
+      head,
+      defaultRef,
+    ]);
+    if (mergeBaseRun.error !== undefined || mergeBaseRun.exitCode === null) return null;
     if (mergeBaseRun.exitCode === 0) return true;
     if (mergeBaseRun.exitCode === 1) return false;
     return null;
@@ -1956,21 +2571,24 @@ export class WorkspaceAdapter implements WorkspacePort {
   private async readWorktreeStatus(
     executor: CommandExecutorPort,
     worktreePath: string,
+    hardened: boolean = false,
   ): Promise<{ outcome: 'read'; status: WorktreeStatusCounts } | { outcome: 'unknown'; reason: string }> {
-    const statusRun = await executor.run(
-      [
-        'git',
-        '--no-optional-locks',
-        '-c',
-        'core.fsmonitor=false',
-        '-C',
-        worktreePath,
-        'status',
-        '--porcelain',
-        '--untracked-files=all',
-      ],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
+    const statusRun = hardened
+      ? await runRemovalGitRead(executor, worktreePath, ['status', '--porcelain', '--untracked-files=all'])
+      : await executor.run(
+          [
+            'git',
+            '--no-optional-locks',
+            '-c',
+            'core.fsmonitor=false',
+            '-C',
+            worktreePath,
+            'status',
+            '--porcelain',
+            '--untracked-files=all',
+          ],
+          { timeoutMs: GIT_TIMEOUT_MS },
+        );
     if (statusRun.exitCode === null || statusRun.error !== undefined) {
       return { outcome: 'unknown', reason: 'git status did not report an exit code' };
     }
@@ -1983,11 +2601,13 @@ export class WorkspaceAdapter implements WorkspacePort {
   private async readInProgressOperations(
     executor: CommandExecutorPort,
     worktreePath: string,
+    hardened: boolean = false,
   ): Promise<{ outcome: 'read'; operations: string[] } | { outcome: 'unknown'; reason: string }> {
-    const gitDirRun = await executor.run(
-      ['git', '-C', worktreePath, 'rev-parse', '--git-dir'],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
+    const gitDirRun = hardened
+      ? await runRemovalGitRead(executor, worktreePath, ['rev-parse', '--git-dir'])
+      : await executor.run(['git', '-C', worktreePath, 'rev-parse', '--git-dir'], {
+          timeoutMs: GIT_TIMEOUT_MS,
+        });
     if (gitDirRun.exitCode === null || gitDirRun.error !== undefined) {
       return { outcome: 'unknown', reason: 'git rev-parse --git-dir did not report an exit code' };
     }
@@ -2000,12 +2620,18 @@ export class WorkspaceAdapter implements WorkspacePort {
     for (const name of IN_PROGRESS_OPERATION_FILES) {
       const probeRun = await executor.run(['test', '-e', path.join(gitDir, name)], {
         timeoutMs: PROBE_TIMEOUT_MS,
+        maxBufferBytes: REMOVAL_READ_MAX_BUFFER_BYTES,
       });
       if (probeRun.exitCode === null || probeRun.error !== undefined) {
         return { outcome: 'unknown', reason: 'operation file probe did not report an exit code' };
       }
       if (probeRun.exitCode === 0) {
         inProgressOperations.push(name);
+      } else if (probeRun.exitCode !== 1) {
+        // Only `test -e` exit 1 means "file absent". Any other exit is an
+        // unanswered probe: it cannot establish that no operation is in
+        // progress, so it is never treated as absent.
+        return { outcome: 'unknown', reason: 'operation file probe failed with an unexpected exit' };
       }
     }
     return { outcome: 'read', operations: inProgressOperations };
@@ -2067,6 +2693,19 @@ export class WorkspaceAdapter implements WorkspacePort {
     executor: CommandExecutorPort,
     worktreePath: string,
   ): Promise<WorktreeLastActivity> {
+    const { iso, unknown } = await this.readLastActivityDetailed(executor, worktreePath);
+    return { iso, unknown };
+  }
+
+  /**
+   * `readLastActivity` plus `coarse`: true when any file or index reading
+   * carried no sub-second part, so an equal-to-baseline answer cannot prove
+   * that nothing was written later in the same second.
+   */
+  private async readLastActivityDetailed(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+  ): Promise<{ iso: string | null; unknown: boolean; coarse: boolean }> {
     // reflog: the newest reflog entry's timestamp; a non-zero exit or empty
     // stdout contributes nothing.
     let newestMs: number | null = null;
@@ -2074,6 +2713,8 @@ export class WorkspaceAdapter implements WorkspacePort {
     if (reflogMs !== null) {
       newestMs = reflogMs;
     }
+    // An unreadable reflog is an unreadable activity source: too coarse to prove quiet.
+    let coarse = reflogMs === null;
 
     // Detect the `stat` flavour once: GNU (`-c %Y`) or BSD (`-f %m`).
     const flavour = await detectStatFlavour(executor, worktreePath);
@@ -2084,9 +2725,15 @@ export class WorkspaceAdapter implements WorkspacePort {
       unknown = true;
     } else {
       // Index mtime: resolve the index path, then stat it with the detected flavour.
-      const indexMs = await readIndexActivityMs(executor, worktreePath, flavour);
-      if (indexMs !== null && (newestMs === null || indexMs > newestMs)) {
-        newestMs = indexMs;
+      const indexMtime = await readIndexActivityMs(executor, worktreePath, flavour);
+      if (indexMtime === null) {
+        // An unreadable index is an unreadable activity source: too coarse to prove quiet.
+        coarse = true;
+      } else {
+        if (!indexMtime.fractional) coarse = true;
+        if (newestMs === null || indexMtime.ms > newestMs) {
+          newestMs = indexMtime.ms;
+        }
       }
 
       // Bounded tree walk: newest file mtime under the worktree, skipping .git.
@@ -2094,15 +2741,18 @@ export class WorkspaceAdapter implements WorkspacePort {
       if (walk.newestMs !== null && (newestMs === null || walk.newestMs > newestMs)) {
         newestMs = walk.newestMs;
       }
+      if (walk.coarse) {
+        coarse = true;
+      }
       if (walk.unknown) {
         unknown = true;
       }
     }
 
     if (newestMs === null) {
-      return { iso: null, unknown: true };
+      return { iso: null, unknown: true, coarse };
     }
-    return { iso: new Date(newestMs).toISOString(), unknown };
+    return { iso: new Date(newestMs).toISOString(), unknown, coarse };
   }
 
   /**

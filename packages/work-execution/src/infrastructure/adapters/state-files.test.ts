@@ -27,6 +27,7 @@ import { ConductorHaltAdapter } from './ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from './LaneRunJournalAdapter.adapter.js';
 import { LanePlanRepositoryAdapter } from './LanePlanRepositoryAdapter.adapter.js';
 import { MergeQueueRepositoryAdapter } from './MergeQueueRepositoryAdapter.adapter.js';
+import { MergeRecordRepositoryAdapter } from './MergeRecordRepositoryAdapter.adapter.js';
 import {
   TelemetryDispositionAdapter,
   parseTelemetryDispositionStateRecord,
@@ -332,6 +333,27 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
     { version: 1, paused: true, requestedAtIso: '2026-10-27T10:00:00.000Z' },
     { version: 1, paused: false, requestedAtIso: '2026-10-27T10:01:00.000Z' },
   ],
+  'merge-records.json': [
+    {
+      repository: 'acme/app',
+      number: 7,
+      headSha: '0123456789abcdef0123456789abcdef01234567',
+      mergedAtIso: '2026-11-05T10:00:00.000Z',
+      firstSeenAtIso: '2026-11-05T10:01:00.000Z',
+      source: 'forge-observation',
+      merger: 'unknown',
+    },
+    {
+      repository: 'acme/app',
+      number: 8,
+      headSha: '0123456789abcdef0123456789abcdef01234568',
+      mergedAtIso: '2026-11-05T11:00:00.000Z',
+      firstSeenAtIso: '2026-11-05T11:00:30.000Z',
+      source: 'fleet-forge-action',
+      merger: 'fleet',
+      actionRef: 'action-8',
+    },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -412,6 +434,7 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
     }
     return new KillallTrainPauseAdapter({ stateDir }).read();
   },
+  'merge-records.json': (stateDir) => new MergeRecordRepositoryAdapter({ stateDir }).listMergeRecords(),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -530,6 +553,11 @@ describe('work-execution state file descriptors match the store readers', () => 
       'merge-queue.json',
       'killall-halt.json',
       'killall-train-pause.json',
+      'seat-tickets.json',
+      'seat-observations.json',
+      'merge-records.json',
+      'held-work-orders.json',
+      'cutover.json',
     ]);
   });
 });
@@ -552,6 +580,7 @@ describe('versioned store descriptors', () => {
     'lane-runs.json',
     'run-journal.json',
     'lane-plans.json',
+    'merge-records.json',
   ];
 
   it('reports schemaVersions [1] on valid fixtures', () => {

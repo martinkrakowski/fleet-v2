@@ -5,20 +5,33 @@ import {
   DecisionTransportAdapter,
   InstallationReferenceAdapter,
   ObservationPublicationAdapter,
+  OrchestratorRequestJournalAdapter,
+  OrchestratorRequestRepositoryAdapter,
   OrchestratorSessionRepositoryAdapter,
+  OwnerItemRepositoryAdapter,
   OwnerQuestionRepositoryAdapter,
+  PermissionRequestRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   RelayTransportAdapter,
+  hashOrchestratorRequestDigest,
   type ChangeSignalPort,
 } from "@fleet/operator-coordination";
 
 import type { FleetInstallation } from "@fleet/installation";
+import {
+  AttemptRepositoryAdapter,
+  LaneRunJournalAdapter,
+  WorkOrderRepositoryAdapter,
+} from "@fleet/work-execution";
+import type { LaneRunJournalEntryRecord } from "@fleet/work-execution";
 import { join } from "node:path";
+import { newUlid } from "../work/ulid.js";
 import {
   AcknowledgeOwnerAnswerUseCase,
   AnswerOwnerQuestionUseCase,
   AskOwnerQuestionUseCase,
   ExpireOwnerQuestionsUseCase,
+  GiveToolPermissionVerdictUseCase,
   HeartbeatOrchestratorSessionUseCase,
   InspectConfiguredCapabilitiesUseCase,
   InspectOutstandingCoordinationUseCase,
@@ -29,13 +42,16 @@ import {
   PublishProjectObservationUseCase,
   ReadOwnerQuestionUseCase,
   ReadProjectAttentionUseCase,
+  ReconcileOrchestratorRequestUseCase,
   RecordAuthorizationConsumptionUseCase,
   RecordProjectProbeUseCase,
   RecordRelayAcknowledgementUseCase,
   RegisterOrchestratorSessionUseCase,
   RegisterProjectProfileUseCase,
   RequestScopedDecisionUseCase,
+  RequestToolPermissionUseCase,
   ResolveActionAuthorizationUseCase,
+  ResolveOwnerItemUseCase,
   RetireOrchestratorSessionUseCase,
   RetireProjectProfileUseCase,
   SendFleetRelayUseCase,
@@ -52,6 +68,7 @@ export interface OperatorComposition {
   publishProjectObservation: PublishProjectObservationUseCase;
   requestScopedDecision: RequestScopedDecisionUseCase;
   resolveActionAuthorization: ResolveActionAuthorizationUseCase;
+  resolveOwnerItem: ResolveOwnerItemUseCase;
   checkOwnerDecision: CheckOwnerDecisionUseCase;
   recordAuthorizationConsumption: RecordAuthorizationConsumptionUseCase;
   readProjectAttention: ReadProjectAttentionUseCase;
@@ -75,6 +92,11 @@ export interface OperatorComposition {
   heartbeatOrchestratorSession: HeartbeatOrchestratorSessionUseCase;
   retireOrchestratorSession: RetireOrchestratorSessionUseCase;
   listOrchestratorSessions: ListOrchestratorSessionsUseCase;
+  permissionRequestRepository: PermissionRequestRepositoryAdapter;
+  requestToolPermission: RequestToolPermissionUseCase;
+  giveToolPermissionVerdict: GiveToolPermissionVerdictUseCase;
+  orchestratorRequestRepository: OrchestratorRequestRepositoryAdapter;
+  reconcileOrchestratorRequest: ReconcileOrchestratorRequestUseCase;
 }
 
 export interface OperatorCompositionOptions {
@@ -83,18 +105,24 @@ export interface OperatorCompositionOptions {
   readonly installation?: FleetInstallation;
   /** Emitter for post-save change signals; the API runtime wires the change feed. */
   readonly changeSignal?: ChangeSignalPort;
+  /** The explicit-deny deadline for tool-permission requests, in ms (default 540 000). */
+  readonly permissionDeadlineMs?: number;
+  /** The clock for orchestrator-request reconciliation; defaults to the system clock. */
+  readonly clock?: () => string;
 }
 
 let composition: OperatorComposition | undefined;
 let configured: OperatorComposition | undefined;
 
 function unconfiguredOperatorComposition(): OperatorComposition {
+  const permissionRequestRepository = new PermissionRequestRepositoryAdapter();
   return {
     coordinationRequestRepository: new CoordinationRequestRepositoryAdapter(),
     inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase(),
     publishProjectObservation: new PublishProjectObservationUseCase(),
     requestScopedDecision: new RequestScopedDecisionUseCase(),
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase(),
+    resolveOwnerItem: new ResolveOwnerItemUseCase(),
     checkOwnerDecision: new CheckOwnerDecisionUseCase(),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase(),
     readProjectAttention: new ReadProjectAttentionUseCase(),
@@ -118,6 +146,13 @@ function unconfiguredOperatorComposition(): OperatorComposition {
     heartbeatOrchestratorSession: new HeartbeatOrchestratorSessionUseCase(),
     retireOrchestratorSession: new RetireOrchestratorSessionUseCase(),
     listOrchestratorSessions: new ListOrchestratorSessionsUseCase(),
+    permissionRequestRepository,
+    requestToolPermission: new RequestToolPermissionUseCase({ repository: permissionRequestRepository }),
+    giveToolPermissionVerdict: new GiveToolPermissionVerdictUseCase({
+      repository: permissionRequestRepository,
+    }),
+    orchestratorRequestRepository: new OrchestratorRequestRepositoryAdapter(),
+    reconcileOrchestratorRequest: new ReconcileOrchestratorRequestUseCase(),
   };
 }
 
@@ -160,6 +195,57 @@ export function createConfiguredOperatorComposition(
     stateDir,
     ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
   });
+  const ownerItemRepo = new OwnerItemRepositoryAdapter({
+    stateDir,
+    ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
+  });
+  // Tool-permission requests are in-process memory only: one adapter instance,
+  // shared by both use cases so a verdict posted on the route reaches the
+  // waiting request. It takes no stateDir and writes no file.
+  const permissionRequestRepository = new PermissionRequestRepositoryAdapter();
+
+  // O2c: the orchestrator-request store and the shared run-journal delegate.
+  // The journal adapter is a second file-backed `LaneRunJournalAdapter` on the
+  // same stateDir, sharing `run-journal.json` with the work composition under
+  // the existing lock (the work composition's own adapter stays read-only).
+  const orchestratorRequestRepository = new OrchestratorRequestRepositoryAdapter({
+    stateDir,
+    ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
+  });
+  const runJournal = new LaneRunJournalAdapter({ stateDir });
+  const orchestratorRequestJournal = new OrchestratorRequestJournalAdapter({
+    append: (entry) => runJournal.append(entry as unknown as LaneRunJournalEntryRecord),
+    listForKey: (key) => runJournal.listForKey(key),
+  });
+  const reconcileClock = { nowIso: options?.clock ?? (() => new Date().toISOString()) };
+  const reconcileOrchestratorRequest = new ReconcileOrchestratorRequestUseCase({
+    requestRepo: orchestratorRequestRepository,
+    sessionRepo: orchestratorSessionRepo,
+    profileRepo,
+    journal: orchestratorRequestJournal,
+    clock: reconcileClock,
+    hashDigest: hashOrchestratorRequestDigest,
+    mintEntryId: newUlid,
+  });
+
+  // CO24f: the attempt facts the authorization resolve binds owner grants
+  // against, read through the execution stack's own repositories.
+  const attemptRepo = new AttemptRepositoryAdapter({ stateDir });
+  const attemptWorkOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
+  const attemptFactsRead = {
+    findAttemptFactsById: async (attemptId: string) => {
+      const attempt = await attemptRepo.findAttemptById(attemptId);
+      if (attempt === null) {
+        return null;
+      }
+      const workOrder = await attemptWorkOrderRepo.findWorkOrderById(attempt.workOrderId);
+      return {
+        attemptId,
+        projectId: workOrder?.projectId ?? null,
+        collectedHeadSha: attempt.artifacts?.headCommit ?? null,
+      };
+    },
+  };
 
   // Installation name references for project profiles (P5a): a v2
   // installation enables host and gate-procedure name checks behind profile
@@ -184,6 +270,12 @@ export function createConfiguredOperatorComposition(
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase({
       requestRepo,
       decisionTransport,
+      attemptFactsRead,
+    }),
+    resolveOwnerItem: new ResolveOwnerItemUseCase({
+      itemRepo: ownerItemRepo,
+      ownerQuestionRepo,
+      clock: systemClock,
     }),
     checkOwnerDecision: new CheckOwnerDecisionUseCase({ requestRepo }),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({ requestRepo }),
@@ -247,6 +339,18 @@ export function createConfiguredOperatorComposition(
       sessionRepo: orchestratorSessionRepo,
       clock: systemClock,
     }),
+    permissionRequestRepository,
+    requestToolPermission: new RequestToolPermissionUseCase({
+      repository: permissionRequestRepository,
+      ...(options?.permissionDeadlineMs !== undefined
+        ? { deadlineMs: options.permissionDeadlineMs }
+        : {}),
+    }),
+    giveToolPermissionVerdict: new GiveToolPermissionVerdictUseCase({
+      repository: permissionRequestRepository,
+    }),
+    orchestratorRequestRepository,
+    reconcileOrchestratorRequest,
   };
 }
 

@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildLaneRunStepKey } from '../lane-run-keys.js';
+import { buildLaneRunStepKey, laneRunPremergeKey } from '../lane-run-keys.js';
 import type { LaneRunKeyResult } from '../lane-run-keys.js';
-import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../lane-run-journal.js';
+import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN, laneRunJournalPendingIntent } from '../lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../lane-run-journal.js';
 import {
+  LANE_RUN_INTENT_ABANDONED_REASON_CODE,
   LANE_RUN_RESULT_REASON_CODES,
   laneRunAttemptDispatchResult,
   laneRunAttemptPlacement,
@@ -12,8 +13,10 @@ import {
   laneRunDispatchedAtIso,
   laneRunGateCongestion,
   laneRunGateFact,
+  laneRunGateUnknown,
   laneRunIntentEntry,
   laneRunParkedConductCount,
+  laneRunPremergePost,
   laneRunRecordedSeatAdvance,
   laneRunRefusedStep,
   laneRunResultEntry,
@@ -369,6 +372,46 @@ describe('laneRunGateCongestion', () => {
   });
 });
 
+describe('laneRunGateUnknown', () => {
+  const run0 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD });
+  const run1 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD, retry: 1 });
+
+  it('returns null for an ambiguous-only gate-unknown, leaving the gate fact pending', () => {
+    const entries = [intent(run0), result(run0, 'ambiguous', 'gate-unknown')];
+    expect(laneRunGateUnknown(entries, RUN_ID, HEAD)).toBeNull();
+    expect(laneRunGateFact(entries, RUN_ID, HEAD)).toBe('pending');
+  });
+
+  it('returns { retry: 0, operatorAbandoned: true } for a final intent-abandoned-by-operator and keeps the gate fact unknown', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'ambiguous', 'gate-unknown'),
+      laneRunResultEntry(nextEntryId(), RUN_ID, run0, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE, NOW),
+    ];
+    expect(laneRunGateUnknown(entries, RUN_ID, HEAD)).toEqual({ retry: 0, operatorAbandoned: true });
+    expect(laneRunGateFact(entries, RUN_ID, HEAD)).toBe('unknown');
+  });
+
+  it('returns { retry: 0, operatorAbandoned: false } for a final refused gate-unknown', () => {
+    const entries = [intent(run0), result(run0, 'refused', 'gate-unknown')];
+    expect(laneRunGateUnknown(entries, RUN_ID, HEAD)).toEqual({ retry: 0, operatorAbandoned: false });
+  });
+
+  it('returns null when a later retry passed after an overtaken run 0', () => {
+    const entries = [
+      intent(run0),
+      laneRunResultEntry(nextEntryId(), RUN_ID, run0, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE, NOW),
+      intent(run1),
+      result(run1, 'completed', 'gate-passed'),
+    ];
+    expect(laneRunGateUnknown(entries, RUN_ID, HEAD)).toBeNull();
+  });
+
+  it('returns null for a null head', () => {
+    expect(laneRunGateUnknown([], RUN_ID, null)).toBeNull();
+  });
+});
+
 describe('laneRunRefusedStep', () => {
   const collectKey = keyOf({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1 });
 
@@ -397,6 +440,34 @@ describe('laneRunRefusedStep', () => {
       result(gateKey, 'completed', 'gate-passed'),
     ];
     expect(laneRunRefusedStep(entries, RUN_ID, 0)).toBeNull();
+  });
+});
+
+describe('intent-abandoned-by-operator', () => {
+  it('LANE_RUN_RESULT_REASON_CODES includes intent-abandoned-by-operator and keeps gate unknown, refusedStep null, and premergePost none', () => {
+    expect(LANE_RUN_INTENT_ABANDONED_REASON_CODE).toBe('intent-abandoned-by-operator');
+    expect(LANE_RUN_RESULT_REASON_CODES).toContain(LANE_RUN_INTENT_ABANDONED_REASON_CODE);
+    expect(LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(LANE_RUN_INTENT_ABANDONED_REASON_CODE)).toBe(true);
+
+    const gateKey = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD });
+    const ambiguous = [intent(gateKey), result(gateKey, 'ambiguous', 'gate-unknown')];
+    expect(laneRunJournalPendingIntent(ambiguous, RUN_ID)).toEqual({ key: gateKey, step: 'gate', reconciliation: 'ambiguous' });
+
+    const abandoned = [
+      ...ambiguous,
+      laneRunResultEntry(nextEntryId(), RUN_ID, gateKey, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE, NOW),
+    ];
+    expect(laneRunJournalPendingIntent(abandoned, RUN_ID)).toBeNull();
+    expect(laneRunGateFact(abandoned, RUN_ID, HEAD)).toBe('unknown');
+    expect(laneRunRefusedStep(abandoned, RUN_ID, 0)).toBeNull();
+
+    const premergeKey = mustBuild(laneRunPremergeKey(RUN_ID, 0, HEAD));
+    const premerge = [
+      intent(premergeKey),
+      result(premergeKey, 'ambiguous', 'forge-ambiguous'),
+      laneRunResultEntry(nextEntryId(), RUN_ID, premergeKey, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE, NOW),
+    ];
+    expect(laneRunPremergePost(premerge, RUN_ID, HEAD)).toBe('none');
   });
 });
 

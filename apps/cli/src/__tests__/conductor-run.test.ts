@@ -8,11 +8,11 @@
  * a forge, or reaches the network.
  */
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   conductorRevision,
@@ -35,6 +35,7 @@ import { runCli } from '../index.js';
 import type { CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
 import { nextPollDelayMs, PASS_CONCURRENCY_LIMIT, runsWaitOnForge, pollSleepMs } from '../conductor.js';
+import type { ChangeWakeReader } from '../conductor-wake.js';
 import { buildLiveConductorDriver, type ConductorDriver } from '../conductor-wiring.js';
 import { RunnerTunnelAdapter, type TunnelChild } from '../runner-tunnel.js';
 
@@ -553,6 +554,253 @@ describe('conductor run live loop (K7-7)', () => {
   });
 });
 
+describe('conductor run change wake-up (K9)', () => {
+  const WAKE_URL = 'http://127.0.0.1:3001';
+  const WAKE_TOKEN = 'tok_' + 'a'.repeat(40);
+  const WAKE_ENV_KEYS = [
+    'FLEET_API_URL',
+    'FLEET_API_TOKEN_FILE',
+    'FLEET_CONDUCTOR_WAKE_TOKEN_FILE',
+  ] as const;
+
+  function writeWakeTokenFile(dir: string): string {
+    const path = join(dir, 'wake-token');
+    writeFileSync(path, `${WAKE_TOKEN}\n`, { mode: 0o600, encoding: 'utf8' });
+    chmodSync(path, 0o600);
+    return path;
+  }
+
+  function wakeReader(): ChangeWakeReader {
+    return {
+      waitForSignal: async (): Promise<boolean> => true,
+      close: (): void => undefined,
+    };
+  }
+
+  async function withWakeEnv(
+    vars: Partial<Record<(typeof WAKE_ENV_KEYS)[number], string>>,
+    run: () => Promise<void>,
+  ): Promise<void> {
+    const saved = new Map<string, string | undefined>();
+    for (const key of WAKE_ENV_KEYS) {
+      saved.set(key, process.env[key]);
+      delete process.env[key];
+    }
+    for (const [key, value] of Object.entries(vars)) {
+      if (value !== undefined) {
+        process.env[key] = value;
+      }
+    }
+    try {
+      await run();
+    } finally {
+      for (const key of WAKE_ENV_KEYS) {
+        const previous = saved.get(key);
+        if (previous === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = previous;
+        }
+      }
+    }
+  }
+
+  it('a change signal ends the sleep and the next pass runs at once', async () => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({
+      enabled: true,
+      passes: [
+        completedPass(),
+        completedPass(),
+        { outcome: 'refused', reason: 'driver-lease-held' },
+      ],
+    });
+    const delays: number[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+      wakeReader: wakeReader(),
+      sleep: (ms, iterationSignal) =>
+        new Promise<void>((resolve) => {
+          delays.push(ms);
+          const onAbort = (): void => resolve();
+          iterationSignal.addEventListener('abort', onAbort, { once: true });
+        }),
+    });
+    expect(result.code).toBe(1);
+    expect(fake.passCalls).toHaveLength(3);
+    expect(delays).toEqual([30000, 60000]);
+  });
+
+  it('does not open a reader without the wake token file (D9)', async () => {
+    const dir = tempStateDir();
+    const sharedTokenFile = writeWakeTokenFile(dir);
+    let opened = 0;
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_API_TOKEN_FILE: sharedTokenFile,
+      },
+      async () => {
+        const fake = makeFakeDriver({
+          enabled: true,
+          passes: [completedPass(), completedPass(), completedPass()],
+        });
+        const controller = new AbortController();
+        const delays: number[] = [];
+        const result = await runConductor(runtimeOf(dir), ['run', '--live'], {
+          stateDir: dir,
+          buildDriver: () => fake.driver,
+          stopSignal: controller.signal,
+          openWakeReader: async () => {
+            opened += 1;
+            return wakeReader();
+          },
+          sleep: recorderSleep(delays, 3, controller),
+        });
+        expect(result.code).toBe(0);
+        expect(opened).toBe(0);
+        expect(delays).toEqual([30000, 60000, 120000]);
+      },
+    );
+  });
+
+  it('a configured wake opens the reader once with the base URL and token', async () => {
+    const dir = tempStateDir();
+    const tokenFile = writeWakeTokenFile(dir);
+    const calls: Array<{ readonly baseUrl: string; readonly token: string }> = [];
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_CONDUCTOR_WAKE_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], {
+          stateDir: dir,
+          buildDriver: () => fake.driver,
+          openWakeReader: async (config) => {
+            calls.push(config);
+            return wakeReader();
+          },
+        });
+        expect(result.code).toBe(0);
+        expect(calls).toEqual([{ baseUrl: WAKE_URL, token: WAKE_TOKEN }]);
+        expect(fake.passCalls).toHaveLength(1);
+      },
+    );
+  });
+
+  it('the reader is closed when the driver stops', async () => {
+    const dir = tempStateDir();
+    const tokenFile = writeWakeTokenFile(dir);
+    let closed = 0;
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_CONDUCTOR_WAKE_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], {
+          stateDir: dir,
+          buildDriver: () => fake.driver,
+          openWakeReader: async () => ({
+            waitForSignal: async (): Promise<boolean> => false,
+            close: (): void => {
+              closed += 1;
+            },
+          }),
+        });
+        expect(result.code).toBe(0);
+        expect(closed).toBe(1);
+      },
+    );
+  });
+
+  it('the dry run opens no reader', async () => {
+    const dir = tempStateDir();
+    const tokenFile = writeWakeTokenFile(dir);
+    let opened = 0;
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_CONDUCTOR_WAKE_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const result = await runConductor(runtimeOf(dir), ['run', '--dry-run', '--once'], {
+          stateDir: dir,
+          openWakeReader: async () => {
+            opened += 1;
+            return wakeReader();
+          },
+        });
+        expect(result.code).toBe(0);
+        expect(opened).toBe(0);
+      },
+    );
+  });
+
+  it('an interrupt during wake-reader startup stops the tunnel child', async () => {
+    const dir = tempStateDir();
+    const tokenFile = writeWakeTokenFile(dir);
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    let resolveExit: (value: { readonly code: number | null }) => void = () => undefined;
+    const exited = new Promise<{ readonly code: number | null }>((resolve) => {
+      resolveExit = resolve;
+    });
+    const killCalls: number[] = [];
+    const child: TunnelChild = {
+      exited,
+      stop: () => {
+        killCalls.push(1);
+        resolveExit({ code: null });
+      },
+      release: () => undefined,
+    };
+    let probes = 0;
+    const tunnel = new RunnerTunnelAdapter({
+      sshHost: 'lane-host',
+      remotePort: 46000,
+      isPortListening: async () => {
+        probes += 1;
+        return probes > 1;
+      },
+      spawner: () => child,
+      sleep: async () => undefined,
+      waitMs: 10_000,
+      pollMs: 1,
+    });
+    const controller = new AbortController();
+    let openedOpeners = 0;
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_CONDUCTOR_WAKE_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const result = await runConductor(runtimeOf(dir), ['run', '--live'], {
+          stateDir: dir,
+          buildDriver: () => fake.driver,
+          stopSignal: controller.signal,
+          tunnel,
+          openWakeReader: async () => {
+            openedOpeners += 1;
+            // The interrupt arrives while the wake-reader opener is pending.
+            controller.abort();
+            return new Promise(() => undefined); // never settles
+          },
+        });
+        expect(result.code).toBe(0);
+        expect(openedOpeners).toBe(1);
+        expect(killCalls).toHaveLength(1);
+        expect(tunnel.owned).toBe(false);
+        expect(fake.passCalls).toHaveLength(0);
+      },
+    );
+  });
+});
+
 describe('conductor run --live tunnel wiring (KF-35 fix 1)', () => {
   it('a live run whose runtime environment has no OCM_HOST starts no tunnel even with OCM_HOST in the process environment', async () => {
     const savedHost = process.env.OCM_HOST;
@@ -839,6 +1087,222 @@ describe('conductor start (K7-7)', () => {
         .code,
     ).toBe(2);
     expect(fake.startCalls).toHaveLength(0);
+  });
+
+  it('a start raises one attention item for a crashed start', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    const crashedAttemptId = 'attempt-01JB0000000000000000000001';
+    await runtime.execution.workOrderRepository.saveWorkOrder({
+      id: 'wo-example-1',
+      projectId: 'project-example-1',
+      taskId: 'task-example-1',
+      laneId: 'lane-example-1',
+      repository: 'repo-example-1',
+      baseCommit: 'a'.repeat(40),
+      ownedPaths: ['packages/example/src'],
+      policyRevision: 'policy-example-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    await runtime.execution.executionJournal.saveCapacityReservation({
+      id: 'reservation-crashed-1',
+      attemptId: crashedAttemptId,
+      hostId: 'host-example-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: 'lane-host-example',
+      workOrderId: 'wo-example-1',
+      reservedAtIso: new Date(Date.parse(NOW) - 61 * 60 * 1000).toISOString(),
+      releasedAtIso: null,
+    });
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const result = await runConductor(runtime, ['start', '--brief-request', briefPath, '--tier', '2'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+    });
+    expect(result.code).toBe(0);
+    const items = await runtime.coordination.attentionItemRepository.list({ projectId: 'project-example-1' });
+    expect(items).toHaveLength(1);
+    expect(items[0]!.item).toMatchObject({
+      kind: 'crashed-start',
+      subject: { kind: 'attempt', ref: crashedAttemptId },
+    });
+  });
+
+  it('a retry of the crashed attempt raises no attention item', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    const crashedAttemptId = 'attempt-01JB0000000000000000000001';
+    await runtime.execution.workOrderRepository.saveWorkOrder({
+      id: 'wo-example-1',
+      projectId: 'project-example-1',
+      taskId: 'task-example-1',
+      laneId: 'lane-example-1',
+      repository: 'repo-example-1',
+      baseCommit: 'a'.repeat(40),
+      ownedPaths: ['packages/example/src'],
+      policyRevision: 'policy-example-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    await runtime.execution.executionJournal.saveCapacityReservation({
+      id: 'reservation-crashed-1',
+      attemptId: crashedAttemptId,
+      hostId: 'host-example-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: 'lane-host-example',
+      workOrderId: 'wo-example-1',
+      reservedAtIso: new Date(Date.parse(NOW) - 10 * 60 * 1000).toISOString(),
+      releasedAtIso: null,
+    });
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const result = await runConductor(
+      runtime,
+      ['start', '--brief-request', briefPath, '--tier', '2', '--run-id', RUN_ID, '--attempt-id', crashedAttemptId],
+      { stateDir: dir, buildDriver: () => fake.driver },
+    );
+    expect(result.code).toBe(0);
+    const items = await runtime.coordination.attentionItemRepository.list({ projectId: 'project-example-1' });
+    expect(items).toEqual([]);
+  });
+
+  it('a usage error persists no attention item for a crashed start', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    const crashedAttemptId = 'attempt-01JB0000000000000000000001';
+    await runtime.execution.workOrderRepository.saveWorkOrder({
+      id: 'wo-example-1',
+      projectId: 'project-example-1',
+      taskId: 'task-example-1',
+      laneId: 'lane-example-1',
+      repository: 'repo-example-1',
+      baseCommit: 'a'.repeat(40),
+      ownedPaths: ['packages/example/src'],
+      policyRevision: 'policy-example-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    await runtime.execution.executionJournal.saveCapacityReservation({
+      id: 'reservation-crashed-1',
+      attemptId: crashedAttemptId,
+      hostId: 'host-example-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: 'lane-host-example',
+      workOrderId: 'wo-example-1',
+      reservedAtIso: new Date(Date.parse(NOW) - 10 * 60 * 1000).toISOString(),
+      releasedAtIso: null,
+    });
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const result = await runConductor(runtime, ['start', '--brief-request', briefPath], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+    });
+    expect(result.code).toBe(2);
+    const items = await runtime.coordination.attentionItemRepository.list({ projectId: 'project-example-1' });
+    expect(items).toEqual([]);
+  });
+
+  it('a start raises no attention item for a candidate younger than the notice age (AD-2 pre-merge)', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    const crashedAttemptId = 'attempt-01JB0000000000000000000001';
+    await runtime.execution.workOrderRepository.saveWorkOrder({
+      id: 'wo-example-1',
+      projectId: 'project-example-1',
+      taskId: 'task-example-1',
+      laneId: 'lane-example-1',
+      repository: 'repo-example-1',
+      baseCommit: 'a'.repeat(40),
+      ownedPaths: ['packages/example/src'],
+      policyRevision: 'policy-example-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    await runtime.execution.executionJournal.saveCapacityReservation({
+      id: 'reservation-crashed-1',
+      attemptId: crashedAttemptId,
+      hostId: 'host-example-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: 'lane-host-example',
+      workOrderId: 'wo-example-1',
+      reservedAtIso: new Date(Date.parse(NOW) - 10 * 60 * 1000).toISOString(),
+      releasedAtIso: null,
+    });
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const result = await runConductor(runtime, ['start', '--brief-request', briefPath, '--tier', '2'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+    });
+    expect(result.code).toBe(0);
+    const items = await runtime.coordination.attentionItemRepository.list({ projectId: 'project-example-1' });
+    expect(items).toEqual([]);
+  });
+
+  it('a start warns when the crashed-start scan is incomplete', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    vi.spyOn(runtime.execution.executionJournal, 'listActiveReservations').mockRejectedValue(
+      new Error('store unavailable'),
+    );
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const result = await runConductor(runtime, ['start', '--brief-request', briefPath, '--tier', '2'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr.join('\n')).toContain('the crashed-start scan was incomplete');
+  });
+
+  it('a start warns when the crashed-start scan fails outright (AD-2 pre-merge)', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    vi.spyOn(runtime.conductor.inspectLaneRuns, 'inspectLaneRuns').mockRejectedValue(new Error('runs unreadable'));
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const result = await runConductor(runtime, ['start', '--brief-request', briefPath, '--tier', '2'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr.join('\n')).toContain('the crashed-start scan failed');
+  });
+
+  it('status prints crashedStarts without an extra field and warns on stderr when the scan was incomplete (AD-2 pre-merge)', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    vi.spyOn(runtime.execution.executionJournal, 'listActiveReservations').mockRejectedValue(
+      new Error('store unavailable'),
+    );
+    const result = await runConductor(runtime, ['status'], { stateDir: dir });
+    const document = JSON.parse(result.stdout.join(''));
+    expect(document).not.toHaveProperty('crashedStartsIncomplete');
+    expect(document.crashedStarts).toEqual([]);
+    expect(result.stderr.join('\n')).toContain('conductor status: the crashed-start scan was incomplete');
   });
 });
 

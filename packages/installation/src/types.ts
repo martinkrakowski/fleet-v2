@@ -167,6 +167,12 @@ export interface GateSlotSection {
 /** The fields a host runner carries regardless of its kind. */
 interface HostRunnerCommon {
   readonly port: number;
+  /**
+   * The offset the bundled runner program adds to `port` when it dials the
+   * server over an ssh tunnel. The frozen `bin/ocm-run` dials `port + 1`, so
+   * the loader only accepts the offset that program implements; absent means 1.
+   */
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly capabilities?: RunnerCapabilityDeclaration;
   readonly maxLanes?: number;
@@ -191,6 +197,14 @@ export type HostRunnerSection = OpencodeHostRunnerSection | AgyHostRunnerSection
 export interface HostSection {
   readonly transport: HostTransport;
   readonly sshAlias?: string;
+  /** Optional lowercase container name the host's runner runs in. */
+  readonly container?: string;
+  /**
+   * Per-role ssh alias overrides: `roleAliases[role]` wins over `sshAlias`
+   * for that role. Only roles the host holds may appear, and only on an ssh
+   * host.
+   */
+  readonly roleAliases?: Readonly<Partial<Record<HostRole, string>>>;
   readonly worktreeRoot: string;
   readonly tmpDir?: string;
   readonly roles: readonly HostRole[];
@@ -406,6 +420,103 @@ export interface BoardPolicySection {
   readonly forgeSyncMinutes?: number;
 }
 
+export type MergeVetoMode = 'off' | 'shadow' | 'live';
+
+/** The `veto` block of a `policy.merge.repos` entry. Every field optional. */
+export interface MergeVetoPolicy {
+  readonly mode?: MergeVetoMode;
+  readonly holdConfidence?: number;
+}
+
+/** One `policy.merge.repos["<owner>/<repo>"]` entry as written; `projectId` is required. */
+export interface MergeRepositoryPolicy {
+  readonly projectId?: string;
+  readonly shadow?: boolean;
+  readonly unattended?: boolean;
+  readonly requiredContexts?: readonly string[];
+  readonly updateBranch?: boolean;
+  readonly macosProcedure?: string;
+  readonly maxAttempts?: number;
+  readonly checksGraceMinutes?: number;
+  readonly veto?: MergeVetoPolicy;
+}
+
+/** The v2 `policy.merge` section as written; read it through `resolveMergePolicy`. */
+export interface MergePolicySection {
+  readonly repos?: Readonly<Record<string, MergeRepositoryPolicy>>;
+}
+
+/** The v2 `policy.daemon` section as written; read it through `resolveMergePolicy`. */
+export interface MergeDaemonSection {
+  readonly intervalSeconds?: number;
+  readonly budgetSeconds?: number;
+  readonly settleSeconds?: number;
+  /**
+   * Chain refresh mode as written. Only `shadow` is valid; `live` and any
+   * unknown value load with a `chain-refresh-mode-invalid` warning and are
+   * kept verbatim so a write round-trips the operator's own text.
+   */
+  readonly chainRefresh?: 'shadow' | 'live' | (string & {});
+  /**
+   * PT1a: minutes a run may sit parked before the conductor raises its stall attention; 1..1440,
+   * default 30. As written: a value outside that range or not an integer loads with a
+   * `stall-after-minutes-invalid` warning, is kept verbatim for a round trip and resolves to 30.
+   */
+  readonly stallAfterMinutes?: number | (string & {}) | boolean | null;
+  /**
+   * PT1b1: how many `resume@web` intents the conductor may write per pass for auto-resuming
+   * `transport-busy` parks; 0..32, default 2. As written: a value outside that range or not an
+   * integer loads with an `auto-resume-max-invalid` warning, is kept verbatim for a round trip
+   * and resolves fail-closed to `0` (never auto-resume); only an absent key resolves to the
+   * default 2.
+   */
+  readonly autoResumeMax?: number | (string & {}) | boolean | null;
+}
+
+/** A merge repository policy with every default applied (`resolveMergePolicy`). */
+export interface ResolvedMergeRepositoryPolicy {
+  readonly owner: string;
+  readonly repo: string;
+  /** `<owner>/<repo>`. */
+  readonly repositoryKey: string;
+  readonly projectId: string;
+  readonly shadow: boolean;
+  readonly unattended: boolean;
+  readonly requiredContexts: readonly string[];
+  readonly updateBranch: boolean;
+  /** Null means none. */
+  readonly macosProcedure: string | null;
+  readonly maxAttempts: number;
+  readonly checksGraceMinutes: number;
+  readonly veto: { readonly mode: MergeVetoMode; readonly holdConfidence: number };
+}
+
+/** The daemon tick settings with every default applied (`resolveMergePolicy`). */
+export interface ResolvedMergeDaemonPolicy {
+  readonly intervalSeconds: number;
+  readonly budgetSeconds: number;
+  readonly settleSeconds: number;
+  /**
+   * The effective chain-refresh mode: `shadow` when written `shadow` or absent,
+   * `invalid` when written `live` or anything unknown. Never `live`.
+   */
+  readonly chainRefresh: 'shadow' | 'invalid';
+  /** PT1a: the stall threshold in minutes with the default (30) applied. */
+  readonly stallAfterMinutes: number;
+  /** PT1b1: the auto-resume budget with the default (2) applied. */
+  readonly autoResumeMax: number;
+}
+
+/** The result of `resolveMergePolicy`: the normalized sections at their revision, or a refusal code. */
+export type MergePolicyRead =
+  | {
+      readonly outcome: 'resolved';
+      readonly policyRevision: string;
+      readonly repositories: readonly ResolvedMergeRepositoryPolicy[];
+      readonly daemon: ResolvedMergeDaemonPolicy;
+    }
+  | { readonly outcome: 'invalid'; readonly reason: string };
+
 /**
  * The v2 `policy` section: shape only. The rules are enforced by the loader
  * itself through `validateSeatPolicy` (lane O5) on every v2 file.
@@ -427,6 +538,10 @@ export interface PolicySection {
   readonly telemetry?: TelemetryPolicy;
   /** Absent means no rotation, 60-minute cooling, observations off (`DEFAULT_SEATS_POLICY`); read it through `resolveSeatsPolicy`. */
   readonly seats?: SeatsPolicy;
+  /** Absent means no merge repository is configured; read it through `resolveMergePolicy`. */
+  readonly merge?: MergePolicySection;
+  /** Absent means the D-DT9 defaults 60 / 45 / 20; read it through `resolveMergePolicy`. */
+  readonly daemon?: MergeDaemonSection;
 }
 
 /** The v2 `shelf` section with the local provider (D1, default). */
@@ -574,6 +689,7 @@ export interface DerivedRunnerCapabilities {
 export interface OpencodeHostRunnerModel {
   readonly kind: 'opencode';
   readonly port?: number;
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
@@ -584,6 +700,7 @@ export interface OpencodeHostRunnerModel {
 export interface AgyHostRunnerModel {
   readonly kind: 'agy';
   readonly port?: number;
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
@@ -602,6 +719,8 @@ export type HostRunnerModel = OpencodeHostRunnerModel | AgyHostRunnerModel;
 export interface HostModel {
   readonly transport: HostTransport;
   readonly sshAlias?: string;
+  readonly container?: string;
+  readonly roleAliases?: Readonly<Partial<Record<HostRole, string>>>;
   readonly worktreeRoot?: string;
   readonly tmpDir?: string;
   readonly roles: readonly HostRole[];

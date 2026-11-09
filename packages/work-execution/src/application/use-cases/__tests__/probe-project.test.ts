@@ -127,6 +127,28 @@ describe('ProbeProjectUseCase', () => {
     });
   });
 
+  it('carries the generator state into the recorded receipt', async () => {
+    const profile = makeProfile();
+    const generatorState = {
+      state: 'provisioned' as const,
+      generatorVersion: '0.16.0',
+      pinnedVersion: '0.16.0',
+    };
+    const report = makeReport({ generatorState });
+    const probe = new FakeProbe(report);
+    const record = new FakeProbeRecord({ outcome: 'recorded' });
+    const useCase = new ProbeProjectUseCase({
+      profileRead: new FakeProfileRead(profile),
+      probe,
+      probeRecord: record,
+      verificationProcedureNames: ['verify-head', 'review', 'lint'],
+    });
+
+    await useCase.execute({ projectId: 'proj-a' });
+
+    expect(record.calls[0]?.receipt.generatorState).toEqual(generatorState);
+  });
+
   it('fails the gate check naming the first missing procedure in sorted order', async () => {
     const profile = makeProfile({ gateProcedures: ['beta', 'alpha'] });
     const probe = new FakeProbe(makeReport());

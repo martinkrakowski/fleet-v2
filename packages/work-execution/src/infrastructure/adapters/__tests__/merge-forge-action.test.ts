@@ -96,7 +96,8 @@ function foundSnapshot(
       mergeState: 'clean',
       headSha: overrides.headSha ?? HEAD_SHA,
       headRef: overrides.headRef ?? BRANCH,
-      baseRef: 'main',
+      isCrossRepository: false,
+      headRepositoryOwner: 'fleet',      baseRef: 'main',
       mergedAtIso: overrides.state === 'merged' ? '2026-11-01T12:00:05.000Z' : null,
       closedAtIso: null,
       mergeCommitSha: overrides.state === 'merged' ? HEAD_SHA : null,
@@ -120,6 +121,8 @@ function snapshotToStdout(pullRequest: PullRequestSnapshot): string {
     closedAt: pullRequest.closedAtIso,
     mergeCommit: pullRequest.mergeCommitSha !== null ? { oid: pullRequest.mergeCommitSha } : null,
     mergeStateStatus: pullRequest.mergeState.toUpperCase(),
+    isCrossRepository: pullRequest.isCrossRepository,
+    headRepositoryOwner: { login: pullRequest.headRepositoryOwner },
   });
 }
 
@@ -601,5 +604,259 @@ describe('ForgeActionAdapter merge-pass path (MergeForgeActionPort)', () => {
     });
     const result = await adapter.performMergeForgeAction(mergeRequest());
     expect(result).toEqual({ outcome: 'ambiguous', reason: 'gh pr merge could not complete' });
+  });
+});
+
+// --- create-branch and the branch-head read (lane CO7) -----------------------
+
+const CHAIN_BRANCH = 'chain/example';
+const REF_URL = `repos/${OWNER}/${REPO}/git/ref/heads/${CHAIN_BRANCH}`;
+
+type GhAnswer = { exitCode: number; stdout: string; stderr: string } | { throw: true };
+
+function refBody(sha: string, branch = CHAIN_BRANCH): string {
+  return JSON.stringify({ ref: `refs/heads/${branch}`, object: { sha, type: 'commit' } });
+}
+
+function makeChainAdapter(answers: GhAnswer[], config: { mergeGhConfigDir?: string } = { mergeGhConfigDir: MERGE_DIR }) {
+  const calls: RunGhCall[] = [];
+  const pending = [...answers];
+  const adapter = new ForgeActionAdapter(
+    {
+      runGh: async (args, ghConfigDir, timeoutMs) => {
+        calls.push({ args: [...args], ghConfigDir, timeoutMs });
+        const next = pending.shift() ?? { exitCode: 1, stdout: '', stderr: 'no scripted answer' };
+        if ('throw' in next) {
+          throw new Error('gh subprocess timed out');
+        }
+        return next;
+      },
+      nowIso: makeClock().nowIso,
+    },
+    undefined,
+    config,
+  );
+  return { adapter, calls };
+}
+
+function createBranchRequest(overrides: Record<string, unknown> = {}): MergeForgeActionRequest {
+  return {
+    kind: 'create-branch',
+    actionId: 'chain-start-1',
+    repository: { owner: OWNER, repo: REPO },
+    branchName: CHAIN_BRANCH,
+    sourceBranch: 'main',
+    expectedHeadSha: HEAD_SHA,
+    deadlineIso: DEADLINE_ISO,
+    ...overrides,
+  } as MergeForgeActionRequest;
+}
+
+const OK = { exitCode: 0, stdout: '{}', stderr: '' };
+const EXISTS = { exitCode: 1, stdout: '', stderr: 'gh: Reference already exists (HTTP 422)' };
+const MISSING = { exitCode: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' };
+
+describe('ForgeActionAdapter create-branch (lane CO7)', () => {
+  it('sends the exact argv with the merge identity and a bounded timeout', async () => {
+    const { adapter, calls } = makeChainAdapter([OK]);
+    const result = await adapter.performMergeForgeAction(createBranchRequest());
+    expect(result).toEqual({ outcome: 'executed', headSha: HEAD_SHA });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toEqual([
+      'api', '--method', 'POST', `repos/${OWNER}/${REPO}/git/refs`,
+      '-f', `ref=refs/heads/${CHAIN_BRANCH}`, '-f', `sha=${HEAD_SHA}`,
+    ]);
+    expect(calls[0]!.ghConfigDir).toBe(MERGE_DIR);
+    expect(calls[0]!.timeoutMs).toBeLessThanOrEqual(30_000);
+  });
+
+  it('reports an existing ref at the expected commit as executed', async () => {
+    const { adapter, calls } = makeChainAdapter([EXISTS, { exitCode: 0, stdout: refBody(HEAD_SHA), stderr: '' }]);
+    expect(await adapter.performMergeForgeAction(createBranchRequest())).toEqual({
+      outcome: 'executed',
+      headSha: HEAD_SHA,
+    });
+    expect(calls[1]!.args).toEqual(['api', REF_URL]);
+  });
+
+  it('refuses an existing ref at another commit', async () => {
+    const { adapter } = makeChainAdapter([EXISTS, { exitCode: 0, stdout: refBody(OTHER_SHA), stderr: '' }]);
+    expect(await adapter.performMergeForgeAction(createBranchRequest())).toEqual({
+      outcome: 'refused',
+      reason: 'branch-exists-at-other-commit',
+      refusalKind: 'other',
+    });
+  });
+
+  it('classifies the create failure when the read-back finds no branch', async () => {
+    const forbidden = { exitCode: 1, stdout: '', stderr: 'gh: Resource not accessible by integration (HTTP 403)' };
+    const { adapter } = makeChainAdapter([forbidden, MISSING, OK]);
+    const result = await adapter.performMergeForgeAction(createBranchRequest());
+    expect(result.outcome).toBe('refused');
+    if (result.outcome === 'refused') {
+      expect(result.refusalKind).toBe('permission');
+    }
+  });
+
+  it('is ambiguous when the create fails and the read-back cannot answer', async () => {
+    const { adapter } = makeChainAdapter([EXISTS, { exitCode: 1, stdout: '', stderr: 'gh: Bad gateway (HTTP 502)' }]);
+    expect(await adapter.performMergeForgeAction(createBranchRequest())).toEqual({
+      outcome: 'ambiguous',
+      reason: 'create-branch failed and the branch could not be read back',
+    });
+  });
+
+  it('is ambiguous when the delegate throws, with no input echoed', async () => {
+    const { adapter } = makeChainAdapter([{ throw: true }]);
+    const result = await adapter.performMergeForgeAction(createBranchRequest());
+    expect(result).toEqual({ outcome: 'ambiguous', reason: 'gh api create-branch could not complete' });
+  });
+
+  it('refuses invalid requests before any gh call without echoing the value', async () => {
+    const bad: Record<string, unknown>[] = [
+      { branchName: 'main' },
+      { branchName: 'feat/x' },
+      { branchName: 'chain/Bad' },
+      { branchName: 'chain/a/b' },
+      { sourceBranch: 'develop' },
+      { expectedHeadSha: 'abc' },
+      { expectedHeadSha: OTHER_SHA.toUpperCase() },
+      { repository: { owner: '..', repo: REPO } },
+      { repository: { owner: OWNER, repo: 'a b' } },
+      { repository: null },
+      { deadlineIso: 'tomorrow' },
+      { actionId: '' },
+      { pullRequestNumber: 5 },
+      { status: { context: 'premerge', state: 'success', description: 'x' } },
+    ];
+    for (const overrides of bad) {
+      const { adapter, calls } = makeChainAdapter([OK]);
+      const result = await adapter.performMergeForgeAction(createBranchRequest(overrides));
+      expect(result.outcome).toBe('refused');
+      expect(calls).toHaveLength(0);
+      expect(JSON.stringify(result)).not.toContain('develop');
+      expect(JSON.stringify(result)).not.toContain('chain/Bad');
+    }
+  });
+
+  it('refuses a throwing getter, a kind getter and a sparse repository without throwing', async () => {
+    const thrower = (key: string) => {
+      const request = { ...createBranchRequest() } as unknown as Record<string, unknown>;
+      Object.defineProperty(request, key, { get() { throw new Error('boom'); }, enumerable: true });
+      return request as unknown as MergeForgeActionRequest;
+    };
+    for (const key of ['deadlineIso', 'branchName', 'expectedHeadSha', 'repository', 'actionId']) {
+      const { adapter, calls } = makeChainAdapter([OK]);
+      const result = await adapter.performMergeForgeAction(thrower(key));
+      expect(result.outcome).toBe('refused');
+      expect(calls).toHaveLength(0);
+    }
+    const trapped = new Proxy(createBranchRequest(), {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'pullRequestNumber') throw new Error('boom');
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const proxied = makeChainAdapter([OK]);
+    await expect(proxied.adapter.performMergeForgeAction(trapped)).resolves.toMatchObject({ outcome: 'refused' });
+    expect(proxied.calls).toHaveLength(0);
+    const kindGetter = Object.defineProperty({}, 'kind', { get() { throw new Error('boom'); }, enumerable: true });
+    const { adapter } = makeChainAdapter([OK]);
+    await expect(adapter.performMergeForgeAction(kindGetter as unknown as MergeForgeActionRequest)).resolves.toMatchObject({
+      outcome: 'refused',
+    });
+  });
+
+  it('refuses a null request and a missing merge identity without a gh call', async () => {
+    const first = makeChainAdapter([OK]);
+    const nullResult = await first.adapter.performMergeForgeAction(null as unknown as MergeForgeActionRequest);
+    expect(nullResult.outcome).toBe('refused');
+    const second = makeChainAdapter([OK], {});
+    expect(await second.adapter.performMergeForgeAction(createBranchRequest())).toEqual({
+      outcome: 'refused',
+      reason: 'no merger identity is configured',
+      refusalKind: 'other',
+    });
+    expect(second.calls).toHaveLength(0);
+  });
+
+  it('refuses to start with under two seconds of budget left', async () => {
+    const { adapter, calls } = makeChainAdapter([OK]);
+    const result = await adapter.performMergeForgeAction(
+      createBranchRequest({ deadlineIso: '2026-11-01T12:00:01.000Z' }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'budget-exhausted', refusalKind: 'other' });
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe('ForgeActionAdapter readMergeBranchHead (lane CO7)', () => {
+  const read = { repository: { owner: OWNER, repo: REPO }, branchName: CHAIN_BRANCH, deadlineIso: DEADLINE_ISO };
+
+  it('returns found with the 40-hex head', async () => {
+    const { adapter, calls } = makeChainAdapter([{ exitCode: 0, stdout: refBody(HEAD_SHA), stderr: '' }]);
+    expect(await adapter.readMergeBranchHead(read)).toEqual({ outcome: 'found', headSha: HEAD_SHA });
+    expect(calls[0]!.args).toEqual(['api', REF_URL]);
+    expect(calls[0]!.ghConfigDir).toBe(MERGE_DIR);
+  });
+
+  it('returns not-found on a 404 only when the repository itself reads', async () => {
+    const { adapter, calls } = makeChainAdapter([MISSING, OK]);
+    expect(await adapter.readMergeBranchHead(read)).toEqual({ outcome: 'not-found' });
+    expect(calls[1]!.args).toEqual(['api', `repos/${OWNER}/${REPO}`]);
+  });
+
+  it('keeps a 404 unavailable when the repository cannot be read or the probe throws', async () => {
+    for (const probe of [MISSING, { throw: true } as GhAnswer]) {
+      const { adapter } = makeChainAdapter([MISSING, probe]);
+      expect((await adapter.readMergeBranchHead(read)).outcome).toBe('unavailable');
+    }
+  });
+
+  it('returns unavailable, never not-found, for other failures and bad bodies', async () => {
+    const bodies: GhAnswer[] = [
+      { exitCode: 1, stdout: '', stderr: 'gh: Bad gateway (HTTP 502)' },
+      { throw: true },
+      { exitCode: 0, stdout: 'not json', stderr: '' },
+      { exitCode: 0, stdout: '[]', stderr: '' },
+      { exitCode: 0, stdout: JSON.stringify([{ ref: `refs/heads/${CHAIN_BRANCH}`, object: { sha: HEAD_SHA } }]), stderr: '' },
+      { exitCode: 0, stdout: refBody('abc'), stderr: '' },
+      { exitCode: 0, stdout: refBody(HEAD_SHA, 'chain/other'), stderr: '' },
+      { exitCode: 0, stdout: `${' '.repeat(70_000)}{}`, stderr: '' },
+    ];
+    for (const answer of bodies) {
+      const { adapter } = makeChainAdapter([answer]);
+      expect((await adapter.readMergeBranchHead(read)).outcome).toBe('unavailable');
+    }
+  });
+
+  it('is unavailable, not a rejection, for a throwing getter', async () => {
+    const { adapter, calls } = makeChainAdapter([OK]);
+    const request = {} as Record<string, unknown>;
+    for (const key of ['deadlineIso', 'repository', 'branchName']) {
+      Object.defineProperty(request, key, { get() { throw new Error('boom'); }, enumerable: true });
+    }
+    const result = await adapter.readMergeBranchHead(request as unknown as typeof read);
+    expect(result.outcome).toBe('unavailable');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('is unavailable for invalid input, no identity and an exhausted budget, without a gh call', async () => {
+    const cases = [
+      { ...read, branchName: '' },
+      { ...read, repository: { owner: '', repo: REPO } },
+      { ...read, deadlineIso: 'soon' },
+      { ...read, deadlineIso: '2026-11-01T12:00:01.000Z' },
+      null,
+    ];
+    for (const request of cases) {
+      const { adapter, calls } = makeChainAdapter([OK]);
+      const result = await adapter.readMergeBranchHead(request as unknown as typeof read);
+      expect(result.outcome).toBe('unavailable');
+      expect(calls).toHaveLength(0);
+    }
+    const noIdentity = makeChainAdapter([OK], {});
+    expect((await noIdentity.adapter.readMergeBranchHead(read)).outcome).toBe('unavailable');
+    expect(noIdentity.calls).toHaveLength(0);
   });
 });

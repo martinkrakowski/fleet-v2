@@ -206,7 +206,7 @@ function envelopeOf(payload: unknown): { code: string; result: Record<string, un
 // Pilot identities.
 // ---------------------------------------------------------------------------
 
-const PILOT_HEAD = "0123456789abcdef";
+const PILOT_HEAD = "0123456789abcdef0123456789abcdef01234567";
 const MATRIX_HEAD = "aaaabbbbccccdddd";
 
 const PILOT_PROFILE_REQUEST = {
@@ -420,7 +420,7 @@ const CONFIGURED_EMPTY_BODY_ROUTES: ReadonlyArray<{
   { method: "get", path: "/v1/attempts/attempt-matrix", outcome: "not-found" },
   { method: "post", path: "/v1/attempts/attempt-matrix/artifacts", outcome: "refused" },
   { method: "post", path: "/v1/attempts/attempt-matrix/fix", outcome: "refused" },
-  { method: "post", path: "/v1/attempts/attempt-matrix/stop", outcome: "refused" },
+  { method: "post", path: "/v1/attempts/attempt-matrix/stop", outcome: "refused", status: 404, code: "NOT_FOUND" },
   { method: "post", path: "/v1/attempts/attempt-matrix/acceptance", outcome: "rejected" },
   { method: "post", path: "/v1/attempts/attempt-matrix/notes", outcome: "rejected" },
   { method: "post", path: "/v1/forge", outcome: "refused" },
@@ -649,7 +649,12 @@ describe("501-vs-validation matrix", () => {
       const envelope = envelopeOf(response.payload);
       expect(envelope.code, `${route.method} ${route.path}`).toBe(route.code ?? "OK");
       if (route.status === 404) {
-        expect(envelope.result, `${route.method} ${route.path}`).toBeNull();
+        // The attempt stop route's not-found carries the use case's refusal
+        // (no attempt id exists in the run store); other 404s return null.
+        expect(
+          envelope.result === null || typeof envelope.result?.reason === "string",
+          `${route.method} ${route.path}`,
+        ).toBe(true);
       } else if (route.status !== undefined && route.status >= 400) {
         // A client-error envelope carries a reason instead of a domain outcome.
         expect(typeof envelope.result?.reason, `${route.method} ${route.path}`).toBe("string");
@@ -911,6 +916,7 @@ describe("restarted API and web client loopback pilot", () => {
       attemptId: "attempt-pilot-1",
       workOrderId: "wo-pilot-1",
       kind: "merge-pr",
+      pullRequestNumber: 7,
       expectedHeadSha: PILOT_HEAD,
       authorizationGrantId: "grant-unknown",
     });
@@ -930,6 +936,7 @@ describe("restarted API and web client loopback pilot", () => {
       attemptId: "attempt-pilot-1",
       workOrderId: "wo-pilot-1",
       kind: "merge-pr",
+      pullRequestNumber: 7,
       expectedHeadSha: PILOT_HEAD,
       authorizationGrantId: "grant-pilot-1",
     });

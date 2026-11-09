@@ -34,11 +34,30 @@ export interface ProjectProbeCheckRecord {
   readonly detail: string;
 }
 
+/**
+ * One project's generator state, read from files only. `state` is fleet-v2's
+ * own vocabulary; a version the project does not state is null. Never a
+ * credential, a path or a URL.
+ */
+export type ProjectGeneratorStateValue =
+  | 'provisioned'
+  | 'provisioned-legacy'
+  | 'adopting'
+  | 'none';
+
+export interface ProjectGeneratorStateRecord {
+  readonly state: ProjectGeneratorStateValue;
+  readonly generatorVersion: string | null;
+  readonly pinnedVersion: string | null;
+}
+
 /** Durable receipt proving a project was probed at a point in time. */
 export interface ProjectProbeReceiptRecord {
   readonly probedAtIso: string;
   readonly probedFrom: string;
   readonly checks: readonly ProjectProbeCheckRecord[];
+  /** The project's generator state; absent when the probe did not read it. */
+  readonly generatorState?: ProjectGeneratorStateRecord;
 }
 
 /**
@@ -144,6 +163,28 @@ export interface MergeGrantRecord {
   readonly pullRequestNumber: number;
 }
 
+/**
+ * The stored grant record version that records the attempt a grant is bound to (CO24e).
+ * A record without `grantRecordVersion` is a legacy grant: it carries no attempt and
+ * is bound by scope and exact head only, until it expires.
+ */
+export const GRANT_RECORD_VERSION = 2 as const;
+
+/**
+ * The exact scope of a release grant (cutover row CO14): `release:install`,
+ * `release:swap` or `release:rollback`. A release grant is attempt-less by
+ * design (CO24g): it is anchored by its scope and exact head and consumed once
+ * by its deterministic action id, so it never binds a work attempt. No other
+ * `release:*` scope is exempt: an unknown release scope is an owner grant and
+ * must bind an attempt like any other.
+ */
+export const RELEASE_ACTION_SCOPES = ['release:install', 'release:swap', 'release:rollback'] as const;
+
+/** True only for one of the three exact release action scopes; such a grant never binds an attempt. */
+export function isReleaseActionScope(actionScope: string): boolean {
+  return (RELEASE_ACTION_SCOPES as readonly string[]).includes(actionScope);
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;
@@ -167,6 +208,14 @@ export interface CoordinationRequestRecord {
   readonly policyGrant?: PolicyGrantRecord;
   /** Present only on an attempt-less merge grant (DT6b); absent everywhere else. */
   readonly mergeGrant?: MergeGrantRecord;
+  /** `2` once the record can name the attempt its grant is bound to; absent on a legacy grant. */
+  readonly grantRecordVersion?: typeof GRANT_RECORD_VERSION;
+  /**
+   * The attempt the grant is bound to (CO24e). Written with `grantRecordVersion: 2`: at issue
+   * for a policy grant, at request time or first resolve for an owner grant. A version-2 record
+   * without it authorizes nothing at consumption.
+   */
+  readonly grantAttemptId?: string;
 }
 
 /** Bounded attention and staleness summary; reading it rewrites nothing. */

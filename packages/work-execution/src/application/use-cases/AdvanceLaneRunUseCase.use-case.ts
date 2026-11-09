@@ -68,9 +68,11 @@ import type { CiStatePort } from '../ports/out/CiStatePort.out-port.js';
 import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
 import type { ForgeAncestryPort } from '../ports/out/ForgeAncestryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
-import type { AutoMergeAttemptPort } from '../ports/in/AutoMergeAttemptPort.in-port.js';
+import type { EnqueueMergePort } from '../ports/in/EnqueueMergePort.in-port.js';
+import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { LaneRunParkNoticePort } from '../ports/out/LaneRunParkNoticePort.out-port.js';
 import type { GateReceiptPort } from '../ports/out/GateReceiptPort.out-port.js';
+import type { GateFailingFilePort } from '../ports/out/GateFailingFilePort.out-port.js';
 import type { SameModelFamily } from '../../domain/seat-selection.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
 import type { LeaseRefusal } from '../../domain/lane-run-lease.js';
@@ -93,11 +95,12 @@ import {
   performDispatch,
   performPrepare,
 } from './advance-lane-run/prepare-dispatch.js';
-import { performCancel, performStop } from './advance-lane-run/stop-cancel.js';
+import { abandonAmbiguousIntentForStop, performCancel, performStop } from './advance-lane-run/stop-cancel.js';
 import { performCollect, performGate } from './advance-lane-run/collect-gate.js';
 import { performReconcile } from './advance-lane-run/reconcile.js';
 import { performReview } from './advance-lane-run/review-fix.js';
-import { performAccept, performMerge, performOpenPr, performPush } from './advance-lane-run/merge.js';
+import { performAccept, performOpenPr, performPush } from './advance-lane-run/merge.js';
+import { performMergeEnqueue } from './advance-lane-run/merge-enqueue.js';
 import { performCiFailure, performPremerge } from './advance-lane-run/premerge.js';
 import { gatherFacts, performAdmissionWait } from './advance-lane-run/facts.js';
 import { conductedRunnerOf } from './advance-lane-run/conducted-host.js';
@@ -180,8 +183,16 @@ export interface AdvanceLaneRunDependencies {
   readonly conductorForgeGrant?: ConductorForgeGrantPort;
   /** Execute an authorized forge action under a conductor grant (K6-6); absent → `not-wired`. */
   readonly executeForgeAction?: ExecuteAuthorizedForgeActionPort;
-  /** Merge the accepted head through `AutoMergeAttemptPort` (K6-7); absent → `not-wired merge`. */
-  readonly autoMergeAttempt?: AutoMergeAttemptPort;
+  /** KS7b: enqueue the accepted head on the daemon's merge queue; absent → `not-wired merge-enqueue`. */
+  readonly enqueueMerge?: EnqueueMergePort;
+  /**
+   * KS7b: read ALL the merge queue's entries, terminal ones included (the in-port's list shows only live
+   * entries, and a merged or dropped entry is exactly what the run must read), read-only; absent →
+   * `not-wired merge-enqueue`.
+   */
+  readonly mergeQueue?: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>;
+  /** KS7b: the forge repository the queue keys its entries by; absent → `not-wired merge-enqueue`. */
+  readonly forgeRepository?: { readonly owner: string; readonly repo: string };
   /** Raise one attention item / keyed owner question per park (K6-3/7); absent → parks raise nothing. */
   readonly parkNotice?: LaneRunParkNoticePort;
   /** Whether `policy.autoMerge` is enabled (K6-7); absent → the merge fact `policyGrant` is false. */
@@ -190,28 +201,50 @@ export interface AdvanceLaneRunDependencies {
   readonly forgeAncestry?: ForgeAncestryPort;
   /** Record the conducted gate's verification receipts (KF-13a); absent → the gate records nothing. */
   readonly gateReceipts?: GateReceiptPort;
+  /** PT1a: read the file the failing gate check named, to class a gate park; absent → a gate park classes `other`. */
+  readonly gateFailingFile?: GateFailingFilePort;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */
 function requestShapeError(request: AdvanceLaneRunRequest): AdvanceLaneRunRefusal | null {
-  if (typeof request.runId !== 'string' || request.runId.trim().length === 0) {
+  try {
+    // F96 (1): null, primitives, arrays and non-plain objects are typed
+    // refusals, never throws; own data properties only, so a throwing or
+    // accessor-shaped getter reads as absent.
+    if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+      return 'invalid-request';
+    }
+    const read = (key: string): unknown => Object.getOwnPropertyDescriptor(request, key)?.value;
+    const runId = read('runId');
+    if (typeof runId !== 'string' || runId.trim().length === 0) {
+      return 'invalid-request';
+    }
+    // The port is reached from the CLI and the driver; a missing lease is refused, never thrown on.
+    const lease: unknown = read('lease');
+    if (typeof lease !== 'object' || lease === null || Array.isArray(lease)) {
+      return 'invalid-request';
+    }
+    const readLease = (key: string): unknown => Object.getOwnPropertyDescriptor(lease, key)?.value;
+    const holderId = readLease('holderId');
+    if (typeof holderId !== 'string' || holderId.trim().length === 0) {
+      return 'invalid-request';
+    }
+    const fence = readLease('fence');
+    if (!Number.isSafeInteger(fence) || (fence as number) < 1) {
+      return 'invalid-request';
+    }
+    const halted = read('halted');
+    if (halted !== undefined && typeof halted !== 'boolean') {
+      return 'invalid-request';
+    }
+    const nowIso = read('nowIso');
+    if (typeof nowIso !== 'string' || !isCalendarDateTime(nowIso)) {
+      return 'invalid-request';
+    }
+    return null;
+  } catch {
     return 'invalid-request';
   }
-  // The port is reached from the CLI and the driver; a missing lease is refused, never thrown on.
-  const lease: unknown = request.lease;
-  if (typeof lease !== 'object' || lease === null) {
-    return 'invalid-request';
-  }
-  if (typeof request.lease.holderId !== 'string' || request.lease.holderId.trim().length === 0) {
-    return 'invalid-request';
-  }
-  if (!Number.isSafeInteger(request.lease.fence) || request.lease.fence < 1) {
-    return 'invalid-request';
-  }
-  if (typeof request.nowIso !== 'string' || !isCalendarDateTime(request.nowIso)) {
-    return 'invalid-request';
-  }
-  return null;
 }
 
 /** `checkLeaseHeld`'s three outcomes mapped onto the advance refusals. */
@@ -291,7 +324,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'waiting', reason: 'facts-inconsistent' };
     }
 
-    const gathered = await gatherFacts(this.ctx, record, entries, request, journalState);
+    let gathered = await gatherFacts(this.ctx, record, entries, request, journalState);
     let decisionRecord: LaneRunRecord = record;
     // A parked run whose notice did not land re-raises it under its saved park
     // key on every advance until it lands. For an owner-question reason the
@@ -321,7 +354,15 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       decisionRecord = fresh;
     }
-    const decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    let decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    const abandoned = await abandonAmbiguousIntentForStop(this.ctx, decisionRecord, gathered, decision, request);
+    if (abandoned.kind === 'refused') {
+      return abandoned.result;
+    }
+    if (abandoned.kind === 'resolved') {
+      gathered = abandoned.gathered;
+      decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    }
     return this.performDecision(decisionRecord, gathered, decision, request);
   }
 
@@ -375,8 +416,8 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       if (decision.step === 'push') {
         return performPush(this.ctx, record, gathered, decision, request);
       }
-      if (decision.step === 'merge') {
-        return performMerge(this.ctx, record, gathered, decision, request);
+      if (decision.step === 'merge-enqueue') {
+        return performMergeEnqueue(this.ctx, record, gathered, decision, request);
       }
       if (decision.step === 'premerge') {
         return performPremerge(this.ctx, record, gathered, decision, request);

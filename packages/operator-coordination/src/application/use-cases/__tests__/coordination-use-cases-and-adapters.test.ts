@@ -1140,6 +1140,29 @@ describe('RecordProjectProbeUseCase', () => {
     expect(repo.saves).toEqual([result.profile]);
   });
 
+  it('records a receipt that carries the generator state', async () => {
+    const seeded = profileRecord({ revision: 4 });
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const receiptWithState: ProjectProbeReceiptRecord = {
+      ...receipt,
+      generatorState: {
+        state: 'provisioned-legacy',
+        generatorVersion: '0.14.0',
+        pinnedVersion: '0.16.0',
+      },
+    };
+    const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 4,
+      receipt: receiptWithState,
+    });
+    expect(result.outcome).toBe('recorded');
+    if (result.outcome !== 'recorded') {
+      throw new Error('expected a recorded probe');
+    }
+    expect(result.profile.lastProbe).toEqual(receiptWithState);
+  });
+
   it('refuses an unregistered project', async () => {
     const repo = new StubProfileRepository();
     const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({
@@ -1308,6 +1331,7 @@ describe('RequestScopedDecisionUseCase', () => {
     expectedHeadSha: 'abc123',
     proposalDigest: 'digest-1',
     policyRevision: 'policy-7',
+    attemptId: 'att-1',
     nowIso: NOW_ISO,
   };
 
@@ -1491,10 +1515,13 @@ describe('ResolveActionAuthorizationUseCase', () => {
     actionScope: 'forge:merge',
     expectedHeadSha: 'abc123',
     authorizationGrantId: 'grant-9',
+    attemptId: 'attempt-1',
   };
 
   it('returns the applicable grant of an approved, unconsumed request', async () => {
-    const repo = new StubRequestRepository([requestRecord()]);
+    const repo = new StubRequestRepository([
+      requestRecord({ grantRecordVersion: 2, grantAttemptId: 'attempt-1' }),
+    ]);
     const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute(
       request,
     );
@@ -1508,11 +1535,14 @@ describe('ResolveActionAuthorizationUseCase', () => {
   });
 
   it('finds an approved request by project and action scope without a grant id', async () => {
-    const repo = new StubRequestRepository([requestRecord()]);
+    const repo = new StubRequestRepository([
+      requestRecord({ grantRecordVersion: 2, grantAttemptId: 'attempt-1' }),
+    ]);
     const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).execute({
       projectId: 'project-atlas',
       actionScope: 'forge:merge',
       expectedHeadSha: 'abc123',
+      attemptId: 'attempt-1',
     });
     expect(result.outcome === 'authorized' && result.grantId).toBe('grant-9');
   });
@@ -1567,7 +1597,12 @@ describe('ResolveActionAuthorizationUseCase', () => {
 
   it('refreshes a pending request from a verified answer once', async () => {
     const repo = new StubRequestRepository([
-      requestRecord({ state: 'awaiting-decision', decisionRevision: null }),
+      requestRecord({
+        state: 'awaiting-decision',
+        decisionRevision: null,
+        grantRecordVersion: 2,
+        grantAttemptId: 'attempt-1',
+      }),
     ]);
     const transport = new StubDecisionTransport({
       'request-1': { state: 'approved', decisionRevision: 'decision-3', grantId: 'grant-9' },

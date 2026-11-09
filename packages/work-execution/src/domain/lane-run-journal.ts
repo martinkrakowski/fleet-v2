@@ -36,7 +36,9 @@ export type LaneRunJournalEntryKind = (typeof LANE_RUN_JOURNAL_ENTRY_KINDS)[numb
 
 /**
  * A result's outcome. `ambiguous` is the only non-final outcome: a key may collect any number of
- * `ambiguous` results, then at most one final result, and nothing after it.
+ * `ambiguous` results, then at most one final result, and nothing after it. The request channel
+ * (O2c) additionally treats `not-started` as non-final: it does not move the request, so a later
+ * final result is still allowed there.
  */
 export const LANE_RUN_JOURNAL_OUTCOMES = [
   'completed', 'refused', 'not-started', 'cancelled-unstarted', 'reconciled', 'overtaken', 'dry-run',
@@ -79,6 +81,18 @@ export interface LaneRunJournalEntryRecord {
   readonly state: LaneRunStateValue | null;
   /** Record schema version on disk (Q5a, D6); absent reads as 1. */
   readonly schemaVersion?: number;
+  /** A request intent's request digest (O2c); only on an intent; absent reads as null. */
+  readonly digest?: string | null;
+  /**
+   * A result: the typed reason kind its transition recorded (O2c recovery);
+   * only on a result; absent reads as null.
+   */
+  readonly reasonKind?: string | null;
+  /**
+   * A result: the id its completed transition linked to (O2c recovery); only
+   * on a result; absent reads as null.
+   */
+  readonly linkedId?: string | null;
 }
 
 export type LaneRunJournalEntryRead =
@@ -110,11 +124,20 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
   if (!versionRead.ok) {
     return { ok: false, reason: versionRead.reason, error: 'LaneRunJournal schemaVersion is not supported' };
   }
-  const snapshot = readPlainRecordWithOptionalKeys(input, LEGACY_ENTRY_KEYS, ['detail', 'schemaVersion']);
+  const snapshot = readPlainRecordWithOptionalKeys(input, LEGACY_ENTRY_KEYS, [
+    'detail',
+    'schemaVersion',
+    'digest',
+    'reasonKind',
+    'linkedId',
+  ]);
   if (snapshot === null) {
     return journalEntryBodyError('LaneRunJournal entry must be a record with exactly the entry keys');
   }
   const hasDetail = Object.hasOwn(snapshot, 'detail');
+  const hasDigest = Object.hasOwn(snapshot, 'digest');
+  const hasReasonKind = Object.hasOwn(snapshot, 'reasonKind');
+  const hasLinkedId = Object.hasOwn(snapshot, 'linkedId');
   const headError = entryHeadError(snapshot);
   if (headError !== null) {
     return journalEntryBodyError(headError);
@@ -122,6 +145,18 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
   const detailError = entryDetailError(snapshot, hasDetail);
   if (detailError !== null) {
     return journalEntryBodyError(detailError);
+  }
+  const digestError = entryDigestError(snapshot, hasDigest);
+  if (digestError !== null) {
+    return journalEntryBodyError(digestError);
+  }
+  const reasonKindError = entryReasonKindError(snapshot, hasReasonKind);
+  if (reasonKindError !== null) {
+    return journalEntryBodyError(reasonKindError);
+  }
+  const linkedIdError = entryLinkedIdError(snapshot, hasLinkedId);
+  if (linkedIdError !== null) {
+    return journalEntryBodyError(linkedIdError);
   }
   const kind = snapshot.kind as LaneRunJournalEntryKind;
   const parsedKey = kind === 'conduct' ? null : parseLaneRunKey(snapshot.key);
@@ -133,7 +168,14 @@ function readJournalEntryWithVersion(input: unknown, currentVersion: number): Jo
   if (payloadError !== null) {
     return journalEntryBodyError(payloadError);
   }
-  const entry = buildJournalEntry(snapshot, hasDetail, versionRead.explicit ? versionRead.schemaVersion : null);
+  const entry = buildJournalEntry(
+    snapshot,
+    hasDetail,
+    hasDigest,
+    hasReasonKind,
+    hasLinkedId,
+    versionRead.explicit ? versionRead.schemaVersion : null,
+  );
   return { ok: true, entry, schemaVersion: versionRead.schemaVersion };
 }
 
@@ -146,6 +188,9 @@ function journalEntryBodyError(error: string): JournalEntryVersionedRead {
 function buildJournalEntry(
   snapshot: Record<string, unknown>,
   hasDetail: boolean,
+  hasDigest: boolean,
+  hasReasonKind: boolean,
+  hasLinkedId: boolean,
   schemaVersion: number | null,
 ): LaneRunJournalEntryRecord {
   return Object.freeze({
@@ -164,6 +209,9 @@ function buildJournalEntry(
     grantId: snapshot.grantId as string | null,
     state: snapshot.state as LaneRunStateValue | null,
     ...(schemaVersion === null ? {} : { schemaVersion }),
+    ...(hasDigest ? { digest: snapshot.digest as string | null } : {}),
+    ...(hasReasonKind ? { reasonKind: snapshot.reasonKind as string | null } : {}),
+    ...(hasLinkedId ? { linkedId: snapshot.linkedId as string | null } : {}),
   });
 }
 
@@ -301,7 +349,8 @@ function entryRunIdError(
       parsedKey.kind === 'step' ||
       parsedKey.kind === 'stop' ||
       parsedKey.kind === 'resume' ||
-      parsedKey.kind === 'premerge'
+      parsedKey.kind === 'premerge' ||
+      parsedKey.kind === 'merge-enqueue'
     ) {
       if (runId !== parsedKey.runId) {
         return 'LaneRunJournal runId does not match its key';
@@ -414,6 +463,58 @@ function entryDetailError(snapshot: Record<string, unknown>, present: boolean): 
     return 'LaneRunJournal detail must be null or a lowercase token';
   }
   return null;
+}
+
+/** A request intent's digest (O2c): only on an intent, null or a 64-hex string. */
+const ENTRY_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+function entryDigestError(snapshot: Record<string, unknown>, present: boolean): string | null {
+  if (!present) {
+    return null;
+  }
+  if (snapshot.kind !== 'intent') {
+    return 'LaneRunJournal digest must be null or a 64-hex string on an intent and null elsewhere';
+  }
+  const digest = snapshot.digest;
+  if (digest === null) {
+    return null;
+  }
+  if (typeof digest !== 'string' || !ENTRY_DIGEST_PATTERN.test(digest)) {
+    return 'LaneRunJournal digest must be null or a 64-hex string on an intent and null elsewhere';
+  }
+  return null;
+}
+
+/** A result's recorded transition data (O2c): only on a result, null or a valid value. */
+function entryReasonKindError(snapshot: Record<string, unknown>, present: boolean): string | null {
+  if (!present) {
+    return null;
+  }
+  if (snapshot.kind !== 'result') {
+    return 'LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere';
+  }
+  const reasonKind = snapshot.reasonKind;
+  if (reasonKind === null) {
+    return null;
+  }
+  if (typeof reasonKind !== 'string' || !LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(reasonKind)) {
+    return 'LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere';
+  }
+  return null;
+}
+
+function entryLinkedIdError(snapshot: Record<string, unknown>, present: boolean): string | null {
+  if (!present) {
+    return null;
+  }
+  if (snapshot.kind !== 'result') {
+    return 'LaneRunJournal linkedId must be null except on a result';
+  }
+  const linkedId = snapshot.linkedId;
+  if (linkedId === null) {
+    return null;
+  }
+  return idError('linkedId', linkedId);
 }
 
 function entryGrantIdError(kind: LaneRunJournalEntryKind, grantId: unknown): string | null {
@@ -614,11 +715,25 @@ function resultRefusal(
     return { ok: false, reason: 'invalid-entry', detail: 'LaneRunJournal result runId must equal its intent\'s' };
   }
   for (const existingEntry of existing) {
-    if (existingEntry.kind === 'result' && existingEntry.key === entry.key && existingEntry.outcome !== 'ambiguous') {
+    if (existingEntry.kind === 'result' && existingEntry.key === entry.key && isClosedByFinalResult(existingEntry)) {
       return { ok: false, reason: 'result-after-final', detail: null };
     }
   }
   return null;
+}
+
+/** Whether an existing result closes its key: every outcome except `ambiguous`, and except
+ *  `not-started` on the request channel (O2c), where a not-started result does not move the
+ *  request and a later final result is still allowed. */
+function isClosedByFinalResult(entry: LaneRunJournalEntryRecord): boolean {
+  if (entry.outcome === 'ambiguous') {
+    return false;
+  }
+  if (entry.outcome === 'not-started') {
+    const parsed = parseLaneRunKey(entry.key);
+    return parsed?.kind !== 'request';
+  }
+  return true;
 }
 
 export interface LaneRunJournalStopFacts {
@@ -679,13 +794,13 @@ function pendingStepIntent(
     return null;
   }
   const parsed = parseLaneRunKey(entry.key);
-  if (parsed?.kind === 'premerge') {
+  if (parsed?.kind === 'premerge' || parsed?.kind === 'merge-enqueue') {
     if (entryHasFinalResult(entries, entry.key)) {
       return null;
     }
     return {
       key: entry.key,
-      step: 'premerge',
+      step: parsed.kind,
       reconciliation: entryHasAnyResult(entries, entry.key) ? 'ambiguous' : 'unread',
     };
   }

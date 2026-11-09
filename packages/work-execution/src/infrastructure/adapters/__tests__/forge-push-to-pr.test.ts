@@ -9,6 +9,7 @@ import { ForgeActionAdapter } from '../ForgeActionAdapter.adapter.js';
 import type { ForgeActionRequest } from '../../../application/ports/out/ForgeActionPort.out-port.js';
 import type {
   ForgeReadPort,
+  ListOpenPullRequestsByBaseResult,
   ForgeRepositoryRef,
   PullRequestRef,
   PullRequestState,
@@ -61,7 +62,8 @@ function pr(number: number, state: PullRequestState, headSha: string): ReadPullR
       mergeState: 'clean',
       headSha,
       headRef: `feat/${LANE_ID}`,
-      baseRef: 'main',
+      isCrossRepository: false,
+      headRepositoryOwner: 'acme',      baseRef: 'main',
       mergedAtIso: state === 'merged' ? '2026-10-25T20:12:08Z' : null,
       closedAtIso: state === 'closed' ? '2026-10-25T20:12:08Z' : null,
       mergeCommitSha: state === 'merged' ? headSha : null,
@@ -77,6 +79,10 @@ class FakeReader implements ForgeReadPort {
 
   constructor(results: Array<ReadPullRequestResult | Error>) {
     this.queue = [...results];
+  }
+
+  async listOpenPullRequestsByBase(): Promise<ListOpenPullRequestsByBaseResult> {
+    return { outcome: "unavailable", reason: "not-used" };
   }
 
   isConfigured(): boolean {

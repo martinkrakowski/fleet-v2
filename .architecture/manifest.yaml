@@ -339,7 +339,7 @@ bounded_contexts:
     depends_on: [evidence-and-acceptance, brief-knowledge, operator-coordination]
     layers:
       domain:
-        entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation, LaneRun, LanePlan, PlannedLane, PullRequestLink]
+        entities: [WorkOrder, Attempt, ActionJournalEntry, CapacityReservation, LaneRun, LanePlan, PlannedLane, PullRequestLink, MergeRecord]
         value_objects: [WorkOrderState, AttemptState, AttemptOutcome, ModelAssignment, BriefPackage, AcceptanceSpec, RunnerObservation, ExecutionLimits, StopReason, SeatPlan, LaneRunState]
       application:
         use_cases:
@@ -369,6 +369,8 @@ bounded_contexts:
           - ListConductorPassesUseCase
           - ReapOrphanSessionsUseCase
           - EnqueueMergeUseCase
+          - ReapZombiesUseCase
+          - ManageReleaseUseCase
           - StartChainUseCase
           - ListMergeQueueUseCase
           - RunMergePassUseCase
@@ -380,6 +382,20 @@ bounded_contexts:
           - ManageDaemonSchedulerUseCase
           - InventoryRelaunchUseCase
           - BuildFactPackUseCase
+          - RefreshChainsUseCase
+          - ReviewChainUseCase
+          - LandChainUseCase
+          - SweepChainsUseCase
+          - AuthorBriefUseCase
+          - VerifyBriefUseCase
+          - AppendScorecardUseCase
+          - CompareScorecardUseCase
+          - PreparePullRequestFeedbackFixUseCase
+          - SaveLaneEditsUseCase
+          - AdoptLaneUseCase
+          - PlanRelaunchUseCase
+          - ApplyRelaunchUseCase
+          - ManageCutoverUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -411,6 +427,8 @@ bounded_contexts:
             - InspectDaemonStatusPort
             - SetDaemonPausePort
             - EnqueueMergePort
+            - ReapZombiesPort
+            - ManageReleasePort
             - StartChainPort
             - RunMergePassPort
             - ListMergeQueuePort
@@ -420,6 +438,20 @@ bounded_contexts:
             - ManageDaemonSchedulerPort
             - InventoryRelaunchPort
             - BuildFactPackPort
+            - RefreshChainsPort
+            - ReviewChainPort
+            - LandChainPort
+            - SweepChainsPort
+            - AuthorBriefPort
+            - VerifyBriefPort
+            - AppendScorecardPort
+            - CompareScorecardPort
+            - PreparePullRequestFeedbackFixPort
+            - SaveLaneEditsPort
+            - AdoptLanePort
+            - PlanRelaunchPort
+            - ApplyRelaunchPort
+            - ManageCutoverPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -490,8 +522,22 @@ bounded_contexts:
             - RepositoryFactsPort
             - GateReceiptReusePort
             - WorktreePoolPort
+            - MergeRecordRepositoryPort
+            - ChainAttentionPort
+            - LaneScorecardPort
+            - PullRequestFindingsReadPort
+            - LaneEditSavePort
+            - CutoverJournalPort
+            - RelaunchPlanRepositoryPort
+            - CutoverRecordRepositoryPort
+            - ShadowEvidencePort
+            - ReaperFindingRepositoryPort
+            - ReleaseStorePort
+            - SeatTicketRepositoryPort
+            - SeatObservationRepositoryPort
+            - SeatCatalogPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GitMirrorPatchIdentityAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter, RepositoryFactsAdapter, GateReceiptReuseAdapter, WorktreePoolAdapter, ChainRepositoryAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GitMirrorPatchIdentityAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter, RepositoryFactsAdapter, GateReceiptReuseAdapter, WorktreePoolAdapter, ChainRepositoryAdapter, SeatTicketRepositoryAdapter, SeatObservationRepositoryAdapter, SeatCatalogAdapter, ReaperFindingRepositoryAdapter, InMemoryReaperFindingRepositoryAdapter, MergePolicyAdapter, ReleaseStoreAdapter, ChainAttentionAdapter, LaneScorecardFileAdapter, PullRequestFindingsReadAdapter, LaneEditSaveAdapter, CutoverJournalAdapter, RelaunchPlanRepositoryAdapter, CutoverRecordRepositoryAdapter, ShadowEvidenceAdapter, MergeRecordRepositoryAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       ImportLanePlanPort: "Import one validated plan sidecar revision per (projectId, planId): project match, greater-revision CAS with digest idempotency, the cycle check across every stored plan, dropped lanes kept; it authorizes nothing."
@@ -521,23 +567,23 @@ bounded_contexts:
       KillallHaltMarkerPort: "Read and set the killall halt marker of a state directory (plan §6): one record, halted or clear, always readable as halted, clear or unreadable; halting never fails on a bad file, lifting refuses one; no path or file content crosses the port."
       KillallTrainPausePort: "Read and set the killall train-pause record beside the verification pause (plan §6); a lift clears only this record, never any other pause or the marker; unreadable is a value, never a default."
       KillallStopAgentPort: "Ask the stop agent beside the lane servers (KA3, another repository) to stop every running lane and return its raw stop-report payload; unavailable, timeout and transport errors are named results, never guesses, and no supplied value is echoed."
-      BriefAuthoringPort: "Obtain a project orchestrator's brief or a hand-written file without introducing provider inference into the control plane."
+      BriefAuthoringPort: "Obtain a project orchestrator's brief or a hand-written file without introducing provider inference into the control plane, or run one session of an installation brief-author seat per brief, read-only in a checkout pinned at the base commit, writing only into the ignored briefs directory and returning the raw answer as untrusted text; a session that ends without an answer is unavailable, never an empty brief."
       ExecutionRunnerPort: "Start, inspect and stop a matching attempt/session with explicit capabilities and strict per-lane directory isolation; a busy-worktree start is blocked and keeps its reservation until reconcile or stop resolves the worktree, and a worktree can be inspected or aborted by directory without a session id."
       RunnerSelectorPort: "Given the installation's lane-runner hosts and the attempt's seat tool, return the runner kind and host to use; a kind without an implemented adapter is refused as runner-not-available."
       AllowedSeatPort: "Given the installation's seat catalogue and policy.useFreeSeats, decide whether a dispatch seat (tool, model, variant) or a reviewer model may be used; with the flag false only seats that are all not free are allowed, and an unknown or mixed match is refused."
       RunnerForAttemptPort: "Given the attempt's recorded runner block, return the runner that addresses the recorded host; a host that changed, was renamed or was removed is refused naming the recorded host, and a legacy attempt keeps the single legacy runner."
       LaneDiffCheckPort: "Before any edit-only commit, collect a worktree's tracked and untracked changes against the base and run the pure lane diff check: allowed path prefixes from the frozen brief, fixed and policy protected paths, and secret patterns on added lines; findings carry path, line and rule name only, never a matched value."
-      GatePredicatePort: "Evaluate a frozen acceptance spec on an attempt's worktree host in order: the commit since the base at the candidate head with a clean tree, the lane diff check, then each fixed argv command with its declared coverage; the first predicate that does not pass stops the run and later ones are skipped; results carry no command output."
+      GatePredicatePort: "Evaluate a frozen acceptance spec on an attempt's worktree host: the commit since the base at the candidate head with a clean tree and the lane diff check first, then the fixed argv commands with their declared coverage, independent ones run concurrently within the gate slot budget; the verdict is the first predicate in declared order that does not pass, and results after it are discarded; results carry no command output."
       CommandExecutorPort: "Run one reviewed argv array without a shell through a local or ssh transport and report its completed outcome, never a launch as completion."
-      WorkspacePort: "Prepare scoped Git worktrees and inspect base/head commits and commit deltas and, for a conducted recovery only, resets a worktree after saving its edits.; remove a finished lane's clean worktree on explicit request, keeping its branch.; list one registered clone's worktrees and read one worktree's removal facts (branch, ancestor answer, status counts, lock, in-progress operations, last activity, size), all read-only.; read the free and total bytes of the filesystem holding a path"
+      WorkspacePort: "Prepare scoped Git worktrees and inspect base/head commits and commit deltas and, for a conducted recovery only, resets a worktree after saving its edits.; remove a finished lane's clean worktree on explicit request, keeping its branch.; list one registered clone's worktrees and read one worktree's removal facts (branch, ancestor answer, status counts, lock, in-progress operations, last activity, size), all read-only.; read the free and total bytes of the filesystem holding a path; remove one worktree only after re-reading its HEAD, branch, status, lock and in-progress operations in the same call (removeWorktree, KW3'), keeping its branch and never forcing."
       AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
       ForgeActionPort: "Perform permitted credential-bearing PR and merge operations through stable action IDs and explicit expected-head checks."
-      ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence."
+      ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence; also list the open pull requests against one base branch (number, head and base only, fully paginated) and read one merged pull request's CI cost (check runs and billed minutes per workflow), where an unreadable or partial answer is unavailable, never an empty list or zero."
       ForgeAncestryPort: "Answer whether one commit contains another as an ancestor (a merged PR head containing the lane head) through a read-only forge compare; no answer is unavailable, never a guess."
       ProcessTreeTerminationPort: "Terminate every process on the attempt's recorded host whose working directory is inside the attempt's worktree, TERM then KILL after a grace period, never a process outside it; the count is reported; no recorded host or no answer is refused or unavailable, never a guess."
       AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
       AcceptanceEvidencePort: "Consume the evidence context's exact-head assessment to authorize merge actions."
-      ReviewRequestPort: "Request a read-only review of one kind (brief-check, code-review, pre-merge) at one exact head under the conductor's request id, and find the receipt recorded for a request id; a review that recorded nothing is no-receipt, a refusal before any review is refused, anything unestablished is unknown, and read the latest receipt of one kind at a head; reason codes only."
+      ReviewRequestPort: "Request a read-only review of one kind (brief-check, code-review, pre-merge or brief-verify) under the conductor's request id for one receipt subject (an attempt at one exact head, a chain at its integration head, or a brief package digest at its base commit; brief-verify only for a brief), and find the receipt recorded for a request id; a review that recorded nothing is no-receipt, a refusal before any review is refused, anything unestablished is unknown, and read the latest receipt of one kind for a subject; an unknown subject kind is never a pass; reason codes only."
       CiStatePort: "Read the CI state of one exact head (pending, passed, failed, unknown) with a reason code through the evidence context; unknown is never a pass."
       ReviewAssessmentPort: "Open the evidence context's assessment for one attempt at one exact head before a conductor review; opened or existing is open, anything else is unavailable with a reason code."
       AutoMergeAttemptPort: "Merge one accepted attempt at its collected head under policy.autoMerge, or route the exception by the auto-merge plan's fixed and configured rules; off reads nothing else and writes nothing; unknown is never eligible, and a named one-way door or a high-risk lane without the opt-in is never merged by policy."
@@ -582,13 +628,13 @@ bounded_contexts:
       DaemonPausePort: "Read and write the pause marker; an unreadable marker reads as paused."
       MergeQueueRepositoryPort: "Persist merge-queue entries v1 by identity (repository, pull request, head oid) with CAS-guarded revisions, supersede transitions, inherited position for successors and the queue head per (repository, base branch); known absence is separate from unreadable state."
       ForgeMergeReadPort: "Read merge-pass forge facts for one exact head: PR state and live head, merge state status, required contexts by name with creator login, and fully paginated review threads, classifying errors; unknown never merges."
-      MergeForgeActionPort: "Apply one repo-scoped forge action (merge-pr, update-branch, post-status or create-branch) through a stable action id at the expected head, and read a branch's head; the request carries actionId, repository{owner,repo}, pullRequestNumber, branchName and expectedHeadSha, a status field is refused on any kind but post-status, and create-branch creates only a registered chain/<name> branch at the given commit, reporting an existing branch at that commit as already applied and one at another commit as a refusal."
+      MergeForgeActionPort: "Apply one repo-scoped forge action (merge-pr, update-branch, post-status, create-branch, merge-main-into-branch, open-pr or delete-branch) through a stable action id at the expected head, and read a branch's head; the request carries actionId, repository{owner,repo}, pullRequestNumber, branchName and expectedHeadSha, a status field is refused on any kind but post-status, and create-branch creates only a registered chain/<name> branch at the given commit, reporting an existing branch at that commit as already applied and one at another commit as a refusal; merge-main-into-branch merges main into a registered chain/<name> branch through the forge's merge API, reporting already up to date as already applied, a conflict as a refusal of kind conflict and a missing branch as branch-gone; open-pr opens chain/<name> into main, or adopts the one open pull request with that head and base and rewrites its title and body, and never pushes; delete-branch deletes only a chain/<name> or recorded link branch whose forge tip equals expectedHeadSha, reporting a missing branch as already applied and another tip as a refusal."
       MergeGrantPort: "Issue one merge policy grant bound to (repository, pull request, expected head sha) at policy:merge@<revision> through operator coordination; it never decides eligibility."
       PatchIdentityPort: "Decide whether an update-branch carry is allowed under the speed-plan file rule and patch-id guard against a bare mirror of the repository with allow-listed argv through the command executor; never touches the live checkout."
       MergeVerificationPort: "Request and read the verification receipt for one exact head through the evidence context's procedure; a receipt naming another head is unknown."
       MergeVetoPort: "Ask one Jev veto question bound to the verified head over the shared decision client and record the answer, confidence, mode and decision receipt id; unknown never blocks."
       MergeNotificationPort: "Emit one notification per merged, dropped, first parked, forge-error-exhausted, veto-hold and pause/halt transition through operator coordination with fixed text, ids and codes only."
-      MergePolicyPort: "Read the structural subset of policy.merge for one repository (shadow, unattended, requiredContexts, updateBranch, macosProcedure, maxAttempts, checksGraceMinutes, veto) at its revision on every call; unreadable is unknown, never a default."
+      MergePolicyPort: "Read policy.merge.repos and policy.daemon from the installation, read-only, at their revision on every call: per repository (owner/repo) its projectId, shadow (default true), unattended, requiredContexts, updateBranch, an optional macosProcedure (absent means none), maxAttempts, checksGraceMinutes and veto, and policy.daemon intervalSeconds, budgetSeconds and settleSeconds (defaults 60, 45 and 20, D-DT9); policyRevision is the digest of the normalized sections; an unreadable or invalid section answers unknown, never a default or an empty registry."
       ImportTrainStatePort: "Import the shell merge train's queue, parked list and chain state into merge-queue entries: dry-run by default, applied only on explicit request with its authority, idempotent by entry identity (repository, pull request, head, base) under a keyed import journal entry; unknown or secret-shaped input is reported and never guessed; imported entries start queued and park reasons are not imported; ids and codes only."
       ExportLegacyTrainStatePort: "Emit the live merge-queue entries as the shell train's pull request, sha and base lines for rollback only; read-only, never writes the legacy state and never carries a park reason."
       InspectMergeReadinessPort: "Report, read-only, whether one pull request of a repository without a merge train is ready to merge: open, required checks finished and none failing, no unresolved review thread and mergeable; the answer is ready, still-waiting with a reason code, or unknown; unknown is never ready and nothing is mutated."
@@ -600,6 +646,36 @@ bounded_contexts:
       RepositoryFactsPort: "Read repository facts at one pinned commit, read-only, through the command executor: file listings, file ranges, the manifest and plan rows a lane names; bounded sizes; an unreadable or oversized read is reported, never truncated silently; no write, no network, no credential path."
       GateReceiptReusePort: "Find a recorded gate receipt by its full versioned key (predicate id, tree hash, predicate definition digest, toolchain versions, declared environment digest) and record a new receipt under that key; a lookup hits only on an equal key, and an unreadable component, an unknown key version or an unreadable store is a miss, never a hit; it never runs a predicate and stores no secret value."
       WorktreePoolPort: "Take a warm lane worktree for a project and base commit from the pool, reset it to that base, and refill the pool after a merge, on the recorded host; take returns a worktree or an empty pool, never one already taken; reset refuses a tree it cannot account for and reports an unknown directory instead of deleting it; it pushes nothing and holds no credential."
+      MergeRecordRepositoryPort: "Store one merge record per (repository, pull request number) under the store's lock: the first sighting is kept and a later sighting never rewrites it, a conflicting record for the same key is an integrity finding rather than an overwrite, and an unreadable or unknown-version store is reported, never treated as empty."
+      RefreshChainsPort: "Run the daemon's chain-refresh job once for one repository within nowIso and deadlineIso: for each active chain record that is not landing, merge main into chain/<name> through the forge's merge-main-into-branch kind under the key chain-refresh/<name>@<main12>, the intent recorded on the chain record by CAS before the forge call, and a repeated key returns the recorded result without a second forge call; merged or already up to date clears the record's conflict mark and its attention item, a conflict sets the mark (which blocks landing) and raises a chain-refresh-conflict attention item, and a branch the forge no longer has is left to the sweep; an unreadable record or forge answer is skipped with a reason code, never retried as a merge; ids and codes only."
+      ReviewChainPort: "Start or complete the combined pre-merge review of one chain: start refuses while a link is queued or in progress, a pull request against chain/<name> is open, or either cannot be read, then pins the chain tip on the record by CAS and requests one review of kind pre-merge of the combined diff from the merge base, on the receipt subject chain (project, chain name, integration head), under the key chain-review/<name>@<head12>, by a model that wrote none of the chain's code; completing refuses when the tip has moved past the pin and returns the receipt id, reviewer model and verdict together with each link's own attempt-subject pre-merge receipt aggregated for landing; no receipt, an unknown verdict or a link without a receipt is never a pass; ids and codes only."
+      LandChainPort: "Land one chain: refuse while a link is unsettled (open, queued, in progress, merged into another base or not on the chain tip), the record carries a conflict mark, an unfinished batch targets the chain, or, when the highest link tier is 2 (an absent tier counts as 2), the combined pre-merge receipt is missing or names another head; otherwise open or adopt the integration pull request chain/<name> into main with a body rendered from the links' records and receipts, post premerge on the exact chain tip carrying that evidence, mark the record landing by CAS, re-check that no link opened meanwhile (one did: the mark is withdrawn), and enqueue the integration head on main; every forge write is keyed chain-land/<name>/<step>@<head12> with intent before action and a repeat returns the recorded outcome; a dry run renders the title and body and writes nothing; ids and codes only."
+      SweepChainsPort: "Run the daemon's chain-sweep job once within nowIso and deadlineIso: for each landing chain whose integration pull request has merged, delete each link's branch and then chain/<name> through the forge's delete-branch kind, keyed chain-sweep/<name>/<branch>@<tip12>, only when the branch's current forge tip is an ancestor of main; a link not on main or a moved or unreadable tip keeps its row and raises an attention item; a closed unmerged integration pull request clears the landing mark and deletes nothing; worktrees are left to the reaper; the record is archived only when every row is handled, so a failed deletion is retried next tick; unknown never deletes; ids and codes only."
+      ChainAttentionPort: "Raise or clear one chain attention item (chain-refresh-conflict, link-not-landed or branch-moved), keyed by project, chain name, kind and link pull request, through operator coordination's attention store; a repeat refreshes the open item, the item grants and blocks nothing (the chain record's own mark is what blocks landing), and a failed raise is reported, never retried blindly; ids and codes only."
+      AuthorBriefPort: "Author one lane's brief: build the fact pack at the pinned base commit, run one brief-author seat session for the brief through the brief authoring port, then parse the answer into dispatch and notes, lint it and freeze only the dispatch text through PrepareBriefPackage; a parse or lint violation, a secret-shaped answer or a seat that answers nothing refuses with a typed reason and freezes nothing, and the notes never enter the dispatch text; the session is keyed brief-author/<workOrderId>/<laneId>@<base12> so a repeat returns the recorded outcome; it dispatches no lane; ids and codes only."
+      VerifyBriefPort: "Before dispatch, request one read-only review of kind brief-verify of a frozen brief package by a seat whose model family differs from the lane's implementer's, on the receipt subject brief (project, brief package digest, base commit), keyed brief-verify/<workOrderId>@<digest12>; a dispatch without a passing brief-verify receipt for the frozen digest is refused, a changed digest makes an earlier receipt stale, and no receipt, an unknown verdict or an unreadable store is never a pass; ids and codes only."
+      AppendScorecardPort: "Append one lane-performance row for one terminal conducted run to the versioned scorecard, derived only from read-only stores (run record, attempts, run journal, and acceptance receipts); a run already present is a no-op that returns the recorded row, a non-terminal or unreadable run is refused with a reason code, and nothing but the scorecard is written; ids, codes, counts and durations only."
+      LaneScorecardPort: "Append and read scorecard rows under <stateDir>/scorecard/ as versioned JSONL whose first line is {\"schemaVersion\":1}: an append is atomic under the store's lock and refuses a duplicate run id; a read returns rows in append order and reports an unknown-version or malformed line by line number, never skipping or guessing it; an absent file is known absence and an unreadable one is unreadable."
+      CompareScorecardPort: "Compare scorecard rows before and after a split date within an optional from and to range, read-only: per period the counts of runs, first-pass completions, fix rounds, review findings by severity and escaped defects, and the CI cost of each merged pull request read from the forge; a row or CI cost that cannot be read is counted as unknown and named, never as zero; it writes nothing; ids, codes and counts only."
+      PreparePullRequestFeedbackFixPort: "Turn one open pull request's review feedback into a fix round: read its unresolved review threads at the exact current head as typed fields, wrap every forge-sourced text as untrusted input, and prepare a fresh fix attempt through PrepareFixAttempt with those numbered findings, keyed pr-feedback/<pullRequest>@<head12>; the fixed head is pushed only through push-to-pr under the run's grant; a moved head, an unreadable forge or no unresolved thread refuses with a reason code; it never resolves a thread; ids and codes only."
+      PullRequestFindingsReadPort: "Read, read-only, one pull request's unresolved review threads at one exact head as typed fields only (thread id, path, line, author kind and thread state), with any text returned for the caller to wrap as untrusted, fully paginated; an answer for another head, an unreadable forge or a partial page is unavailable, never an empty list; it never resolves or comments on anything, and no credential crosses the port."
+      SaveLaneEditsPort: "Save one lane worktree's edits before any abort: refuse a busy worktree (a runner session still live there), an unreadable tree or a lane diff check with a secret finding; otherwise record the intent under relaunch/<planDigest>/<lane>/save, write a save ref on the lane host's clone without pushing, re-read the ref, verify that its tree digest equals the worktree's and record the result; a repeat with the same key returns the recorded save; it never resets, removes or aborts anything; ids, codes and digests only."
+      LaneEditSavePort: "On the recorded host, write a worktree's tracked and untracked changes (ignored paths excluded) as one commit object on a save ref under refs/fleet/saved/ in the lane's clone, without touching the index, the working tree, the branch or any remote, and read back the ref's tree digest beside the worktree's; an existing save ref with the same tree is already saved and one with another tree is refused; an unreadable tree or no recorded host is refused, never a guess; it pushes nothing and holds no credential."
+      AdoptLanePort: "Adopt one relaunched lane from a verified save ref or a clean commit: register the work order with its planRef and baseBranch, freeze the lane's existing brief with its digest unchanged, record an ended partial attempt at that commit, and create a lane run entering at collecting with adopted provenance so the gate decides; each step is keyed relaunch/<planDigest>/<lane>/adopt/<step> with intent before action and a repeat returns the recorded outcome; a missing or unverified save, a commit not on the lane's branch or a lane that already has a run refuses; it dispatches nothing and opens no fix round; ids and codes only."
+      PlanRelaunchPort: "Build, read-only from the relaunch inventory, the ordered relaunch plan (per lane its population and its save, abort, adopt and redispatch steps, in dependency order with chain heads first, under admission and the dispatch stagger) and its digest over the canonical form, then store it by digest; the same plan again is a no-op; it saves, aborts and dispatches nothing; worktree paths only in the local CLI output; ids and codes only."
+      ApplyRelaunchPort: "Apply one stored relaunch plan by digest, only under a recorded owner grant naming that digest: run its steps in order, each keyed relaunch/<planDigest>/<lane>/<step> with intent before action; abort a lane only by directory through the runner after its save is verified, then wait for the runner's end report before adopting it and handing redispatch to the conductor; a refused save stops that lane before any abort, and a step with an intent but no result is reconciled read-only, never repeated, so a re-run is safe; it removes, resets or deletes no worktree or branch; ids and codes only."
+      RelaunchPlanRepositoryPort: "Store relaunch plans by digest, immutable once written: the same content under the same digest is a no-op and other content under a stored digest is refused; a read by digest returns the plan or known absence, and an unreadable or unknown-version plan is reported, never treated as absent."
+      CutoverJournalPort: "Append keyed cutover and relaunch journal entries (cutover/<move>@<revision> and relaunch/<planDigest>/<lane>/<step>, with one optional sub-step segment such as adopt/<step>) under the store's guard: an intent is durable before its action, a second intent with the same key is refused, a result pairs with its intent and only ambiguous results may precede the one final result; list by key prefix in append order; an unreadable journal is reported, never empty; an intent may carry a request digest that replay checks before any write; ids, codes and digests only."
+      ManageCutoverPort: "Read and move the cutover record v1 (status, switch, rollback, retire) by CAS on its revision: status is read-only; switch reads the recorded shadow evidence and refuses unless every comparison kind has a passing verdict on each of the required consecutive days, no live lane lacks a record, a relaunch plan digest is recorded and the daemon status and train-pause record are readable, then sets the train-pause record so the shell train stops and records the switch; rollback pauses the daemon and lifts only that train-pause record; retire refuses inside the rollback window or without the owner's recorded grant; each move is keyed cutover/<move>@<revision> with intent before action and a repeat returns the recorded outcome; it installs, starts or stops no host unit and moves no credential; an unknown or unreadable day is never a pass; ids and codes only."
+      CutoverRecordRepositoryPort: "Store and read the one CutoverRecord v1 of an installation with compare-and-set on its revision; an absent version reads as 1, and an unknown version or an unreadable record is reported, never treated as absent; it performs no forge, host or git action."
+      ShadowEvidencePort: "Record and read the daily cutover shadow report result (CO32) keyed by day and comparison kind as the report digest plus verdict codes: the same day, kind and digest again is a no-op and another digest for a recorded day and kind is refused; a read returns each day's verdicts or known absence, and an unreadable or unknown-version day is unknown, never a pass; ids, digests and codes only."
+      ReapZombiesPort: "Run one reaper pass: gather facts through the read ports, classify zombies with the two-sighting and grace rules, upsert findings, raise or refresh attention items, and perform only record-only repairs (attempt reconciliation, reservation release, attention items) as keyed intents with results; it never deletes a worktree, a branch or a session, and a subject with a young intent is never repaired."
+      ReaperFindingRepositoryPort: "Keep reaper findings across passes per subject and kind (first and last sighting, sighting count) with compare-and-set on revision; an unreadable or unknown-version store is reported, never treated as empty."
+      ManageReleasePort: "Install, swap or roll back the pinned conductor build: install builds one commit at <root>/<sha> through reviewed argv and verifies it, swap atomically repoints current to a verified build, rollback repoints to the previous kept build; it prints the plan by default, applies only with --apply under deployment authority, and refuses while the conductor driver lease is live."
+      ReleaseStorePort: "Hold built releases at <root>/<sha> on the local host: list the kept builds and the current pointer, repoint current atomically, and prune to the last N, never removing the current or the previous build; it runs no build and holds no credential."
+      SeatTicketRepositoryPort: "Persist one seat rotation counter per (project, role): a compare-and-swap on revision writes the next ticket under the store's lock, the ticket never decreases, known absence is null and an unreadable store is an error."
+      SeatObservationRepositoryPort: "Append seat observations to an append-only store: a stored observation is never rewritten or removed, a repeated observation id is refused as duplicate, and every observation reads back in append order."
+      SeatCatalogPort: "Read the installation's seat catalogue and the seat plan it builds, as a structural subset of the installation: the seats with their tool, model, variant, agent and health, and the implementer, fix and reviewer chains; an absent catalogue is absent and an unreadable one is unknown, never an empty catalogue; it writes nothing and returns ids, models and codes only."
     adapter_bindings:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
       - { adapter: AttemptRepositoryAdapter, implements: AttemptRepositoryPort, integration: local-transactional-store }
@@ -615,7 +691,7 @@ bounded_contexts:
       - { adapter: NoopRunTelemetryAdapter, implements: RunTelemetryPort, integration: in-process-noop }
       - { adapter: RecordingRunTelemetryAdapter, implements: RunTelemetryPort, integration: in-process-recording }
       - { adapter: OtlpHttpRunTelemetryAdapter, implements: RunTelemetryPort, integration: otlp-http-json-bearer-token-file }
-      - { adapter: BriefAuthoringAdapter, implements: BriefAuthoringPort, integration: reviewed-harness-or-hand-written-file }
+      - { adapter: BriefAuthoringAdapter, implements: BriefAuthoringPort, integration: reviewed-harness-hand-written-file-or-read-only-brief-author-seat }
       - { adapter: ExecutionRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-ocm-run-subprocess }
       - { adapter: AgyRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-agy-run-subprocess-behind-runner-mode }
       - { adapter: RunnerSelectorAdapter, implements: RunnerSelectorPort, integration: installation-host-structural-selection }
@@ -726,9 +802,28 @@ bounded_contexts:
       - { adapter: RepositoryFactsAdapter, implements: RepositoryFactsPort, integration: injected-command-executor-read-only-git }
       - { adapter: GateReceiptReuseAdapter, implements: GateReceiptReusePort, integration: local-transactional-store }
       - { adapter: WorktreePoolAdapter, implements: WorktreePoolPort, integration: injected-command-executor-recorded-host-git }
+      - { adapter: MergeRecordRepositoryAdapter, implements: MergeRecordRepositoryPort, integration: local-transactional-store }
+      - { adapter: ReaperFindingRepositoryAdapter, implements: ReaperFindingRepositoryPort, integration: local-transactional-store }
+      - { adapter: InMemoryReaperFindingRepositoryAdapter, implements: ReaperFindingRepositoryPort, integration: in-process }
+      - { adapter: MergePolicyAdapter, implements: MergePolicyPort, integration: installation-file-read-only }
+      - { adapter: ReleaseStoreAdapter, implements: ReleaseStorePort, integration: local-filesystem-atomic-symlink }
+      - { adapter: SeatTicketRepositoryAdapter, implements: SeatTicketRepositoryPort, integration: local-transactional-store }
+      - { adapter: SeatObservationRepositoryAdapter, implements: SeatObservationRepositoryPort, integration: local-transactional-store }
+      - { adapter: SeatCatalogAdapter, implements: SeatCatalogPort, integration: installation-seat-catalogue-structural-read }
       - { adapter: ChainRepositoryAdapter, implements: ChainRepositoryPort, integration: local-transactional-store }
+      - adapter: ChainAttentionAdapter
+        implements: ChainAttentionPort
+        integration: in-process
+        delegates_to: [operator-coordination/RecordAttentionItemPort, operator-coordination/ClearAttentionItemPort]
+      - { adapter: LaneScorecardFileAdapter, implements: LaneScorecardPort, integration: local-versioned-jsonl-store }
+      - { adapter: PullRequestFindingsReadAdapter, implements: PullRequestFindingsReadPort, integration: reviewed-github-cli-subprocess-read-only }
+      - { adapter: LaneEditSaveAdapter, implements: LaneEditSavePort, integration: injected-command-executor-recorded-host-git }
+      - { adapter: CutoverJournalAdapter, implements: CutoverJournalPort, integration: local-keyed-run-journal }
+      - { adapter: RelaunchPlanRepositoryAdapter, implements: RelaunchPlanRepositoryPort, integration: local-transactional-store }
+      - { adapter: CutoverRecordRepositoryAdapter, implements: CutoverRecordRepositoryPort, integration: local-transactional-store }
+      - { adapter: ShadowEvidenceAdapter, implements: ShadowEvidencePort, integration: local-transactional-store }
     domain_specification:
-      aggregate_roots: [WorkOrder, Attempt, LaneRun, LanePlan, PullRequestLink]
+      aggregate_roots: [WorkOrder, Attempt, LaneRun, LanePlan, PullRequestLink, MergeRecord]
       child_ownership: { ActionJournalEntry: Attempt, CapacityReservation: Attempt, PlannedLane: LanePlan }
       enum_values:
         WorkOrderState: [approved, prepared, implementing, verifying, reviewing, fixing, ready-to-merge, merged, stopped]
@@ -768,7 +863,7 @@ bounded_contexts:
     layers:
       domain:
         entities: [EvidenceAssessment, VerificationReceipt, ReviewReceipt, FindingDisposition]
-        value_objects: [AssessmentState, EvidenceResult, FindingState, AcceptanceReceipt, EvidenceScope]
+        value_objects: [AssessmentState, EvidenceResult, FindingState, AcceptanceReceipt, EvidenceScope, ReceiptSubjectKind]
       application:
         use_cases: [RequestVerificationUseCase, RequestIndependentReviewUseCase, RecordVerificationReceiptUseCase, RecordReviewReceiptUseCase, RecordFindingDispositionUseCase, AssessHeadAcceptanceUseCase, InspectAcceptanceEvidenceUseCase, InspectHeadCiStateUseCase, OpenEvidenceAssessmentUseCase]
         ports:
@@ -778,12 +873,12 @@ bounded_contexts:
         adapters: [EvidenceAssessmentRepositoryAdapter, EvidenceArchiveAdapter, VerificationExecutorAdapter, ForgeEvidenceAdapter, IndependentReviewAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, LocalExecutor, SshExecutor, EvidenceSeatPolicyAdapter]
     contracts:
       RequestVerificationPort: "Request the required completed checks on configured verification hosts for a precise head and acceptance-policy revision."
-      RequestIndependentReviewPort: "Request a read-only review using an underlying model distinct from the implementer's and bind its result to the reviewed head."
-      RecordVerificationReceiptPort: "Validate and retain a completed check's head, host, procedure, exit result and evidence reference without treating launch as completion."
-      RecordReviewReceiptPort: "Retain exact-head reviewer identity, read-only capability, findings and source evidence; reject a purported independent review by the same model."
+      RequestIndependentReviewPort: "Request a read-only review using an underlying model distinct from the implementer's and bind its result to one receipt subject: a receipt subject is attempt (project, attempt, exact head), chain (project, chain name, integration head) or brief (project, brief package digest, base commit); a brief subject is reviewed only as kind brief-verify, and an unknown subject kind is refused."
+      RecordVerificationReceiptPort: "Validate and retain a completed check's subject, host, procedure, exit result and evidence reference without treating launch as completion; a receipt subject is attempt (project, attempt, exact head), chain (project, chain name, integration head) or brief (project, brief package digest, base commit), a receipt recorded without a subject reads as attempt, and an unknown subject kind is refused, never a pass."
+      RecordReviewReceiptPort: "Retain one subject's reviewer identity, read-only capability, review kind (brief-check, code-review, pre-merge or brief-verify), findings and source evidence; a receipt subject is attempt (project, attempt, exact head), chain (project, chain name, integration head) or brief (project, brief package digest, base commit), brief-verify only on a brief subject; a receipt recorded without a subject reads as attempt, an unknown subject kind is refused, and a purported independent review by the same model is rejected."
       RecordFindingDispositionPort: "Record a fix or evidence-backed refutation of a specific finding while preserving unresolved findings."
       AssessHeadAcceptancePort: "Evaluate every required check and finding against the current head and policy; issue a scoped acceptance receipt or explicit blockers."
-      InspectAcceptanceEvidencePort: "Return assessment revisions and receipt provenance, including stale, missing and unknown evidence."
+      InspectAcceptanceEvidencePort: "Return assessment revisions and receipt provenance by subject (attempt, chain or brief), including stale, missing and unknown evidence; a receipt recorded without a subject reads as attempt, and an unknown subject kind is reported as unknown, never a pass."
       InspectHeadCiStatePort: "Read the CI state of one exact head through the forge without mutating anything: pending, passed, failed or unknown with a reason code; an unbound forge, an invalid head, an unreadable forge, no checks or an answer for another head is unknown, never a pass."
       OpenEvidenceAssessmentPort: "Open a pending assessment for one attempt at one exact head and policy, idempotently; an assessment at another head or in a terminal state is refused, never overwritten or marked stale."
       EvidenceAssessmentRepositoryPort: "Persist assessments and child receipts with revision-aware updates."
@@ -819,8 +914,9 @@ bounded_contexts:
         AssessmentState: [pending, blocked, accepted, rejected, stale]
         EvidenceResult: [pending, pass, fail, unknown, not-applicable]
         FindingState: [unresolved, fixed, refuted, out-of-scope]
+        ReceiptSubjectKind: [attempt, chain, brief]
       invariants:
-        - "Receipts bind project, attempt, exact head, source, completion time and acceptance-policy revision."
+        - "Receipts bind one subject, source, completion time and acceptance-policy revision: a receipt subject is attempt (project, attempt, exact head), chain (project, chain name, integration head) or brief (project, brief package digest, base commit). The subject is versioned: a receipt recorded without one reads as attempt, and an unknown subject kind is never a pass. A chain or brief receipt never satisfies an attempt's acceptance, and a brief receipt is of kind brief-verify, never brief-check."
         - "The reviewer's underlying model differs from the implementer's; a provider change alone is insufficient."
         - "Project CI and configured verification-host policy decide acceptance. Explicit host exclusions do not waive unrelated failures."
         - "Mutation proof requires the predicted assertion failure, not a parse, bind or setup error."
@@ -903,15 +999,15 @@ bounded_contexts:
     depends_on: []
     layers:
       domain:
-        entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement, OwnerQuestion, OrchestratorSession, OrchestratorRequest, OwnerItem]
+        entities: [ProjectProfile, CoordinationRequest, AuthorizationConsumption, RelayAcknowledgement, OwnerQuestion, OrchestratorSession, OrchestratorRequest, OwnerItem, PermissionRequest]
         value_objects: [CoordinationKind, CoordinationState, ActionAuthorization, PolicyReference, ObservationEnvelope, OwnerItemKind]
       application:
-        use_cases: [RegisterProjectProfileUseCase, UpdateProjectProfileUseCase, RetireProjectProfileUseCase, ListProjectProfilesUseCase, InspectProjectProfileUseCase, RecordProjectProbeUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase, AskOwnerQuestionUseCase, AnswerOwnerQuestionUseCase, ExpireOwnerQuestionsUseCase, AcknowledgeOwnerAnswerUseCase, ListOwnerQuestionsUseCase, ReadOwnerQuestionUseCase, SyncOneWayOwnerQuestionsUseCase, RegisterOrchestratorSessionUseCase, HeartbeatOrchestratorSessionUseCase, RetireOrchestratorSessionUseCase, ListOrchestratorSessionsUseCase, IssuePolicyForgeGrantUseCase, IssueMergeGrantUseCase, CancelPolicyGrantsUseCase, RecordOwnerItemUseCase, ListOwnerItemsUseCase, ResolveOwnerItemUseCase, RecordAttentionItemUseCase, ClearAttentionItemUseCase, ListAttentionItemsUseCase]
+        use_cases: [RegisterProjectProfileUseCase, UpdateProjectProfileUseCase, RetireProjectProfileUseCase, ListProjectProfilesUseCase, InspectProjectProfileUseCase, RecordProjectProbeUseCase, InspectConfiguredCapabilitiesUseCase, RequestScopedDecisionUseCase, ResolveActionAuthorizationUseCase, CheckOwnerDecisionUseCase, RecordAuthorizationConsumptionUseCase, PublishProjectObservationUseCase, ReadProjectAttentionUseCase, ReconcileOrchestratorRequestUseCase, SendFleetRelayUseCase, RecordRelayAcknowledgementUseCase, InspectOutstandingCoordinationUseCase, AskOwnerQuestionUseCase, AnswerOwnerQuestionUseCase, ExpireOwnerQuestionsUseCase, AcknowledgeOwnerAnswerUseCase, ListOwnerQuestionsUseCase, ReadOwnerQuestionUseCase, SyncOneWayOwnerQuestionsUseCase, RegisterOrchestratorSessionUseCase, HeartbeatOrchestratorSessionUseCase, RetireOrchestratorSessionUseCase, ListOrchestratorSessionsUseCase, IssuePolicyForgeGrantUseCase, IssueMergeGrantUseCase, CancelPolicyGrantsUseCase, RecordOwnerItemUseCase, ListOwnerItemsUseCase, ResolveOwnerItemUseCase, RecordAttentionItemUseCase, ClearAttentionItemUseCase, ListAttentionItemsUseCase, RequestToolPermissionUseCase, GiveToolPermissionVerdictUseCase]
         ports:
-          in: [RegisterProjectProfilePort, UpdateProjectProfilePort, RetireProjectProfilePort, ListProjectProfilesPort, InspectProjectProfilePort, RecordProjectProbePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, CheckOwnerDecisionPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort, AskOwnerQuestionPort, AnswerOwnerQuestionPort, ExpireOwnerQuestionsPort, AcknowledgeOwnerAnswerPort, ListOwnerQuestionsPort, ReadOwnerQuestionPort, SyncOneWayOwnerQuestionsPort, RegisterOrchestratorSessionPort, HeartbeatOrchestratorSessionPort, RetireOrchestratorSessionPort, ListOrchestratorSessionsPort, IssuePolicyForgeGrantPort, IssueMergeGrantPort, CancelPolicyGrantsPort, RecordOwnerItemPort, ListOwnerItemsPort, ResolveOwnerItemPort, RecordAttentionItemPort, ClearAttentionItemPort, ListAttentionItemsPort]
-          out: [ProjectProfileRepositoryPort, InstallationReferencePort, CoordinationRequestRepositoryPort, OwnerQuestionRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort, OrchestratorSessionRepositoryPort, OwnerItemRepositoryPort, ChangeSignalPort]
+          in: [RegisterProjectProfilePort, UpdateProjectProfilePort, RetireProjectProfilePort, ListProjectProfilesPort, InspectProjectProfilePort, RecordProjectProbePort, InspectConfiguredCapabilitiesPort, RequestScopedDecisionPort, ResolveActionAuthorizationPort, CheckOwnerDecisionPort, RecordAuthorizationConsumptionPort, PublishProjectObservationPort, ReadProjectAttentionPort, ReconcileOrchestratorRequestPort, SendFleetRelayPort, RecordRelayAcknowledgementPort, InspectOutstandingCoordinationPort, AskOwnerQuestionPort, AnswerOwnerQuestionPort, ExpireOwnerQuestionsPort, AcknowledgeOwnerAnswerPort, ListOwnerQuestionsPort, ReadOwnerQuestionPort, SyncOneWayOwnerQuestionsPort, RegisterOrchestratorSessionPort, HeartbeatOrchestratorSessionPort, RetireOrchestratorSessionPort, ListOrchestratorSessionsPort, IssuePolicyForgeGrantPort, IssueMergeGrantPort, CancelPolicyGrantsPort, RecordOwnerItemPort, ListOwnerItemsPort, ResolveOwnerItemPort, RecordAttentionItemPort, ClearAttentionItemPort, ListAttentionItemsPort, RequestToolPermissionPort, GiveToolPermissionVerdictPort]
+          out: [ProjectProfileRepositoryPort, InstallationReferencePort, CoordinationRequestRepositoryPort, OwnerQuestionRepositoryPort, DecisionTransportPort, ObservationPublicationPort, AttentionReadPort, RelayTransportPort, OrchestratorSessionRepositoryPort, OwnerItemRepositoryPort, ChangeSignalPort, PermissionRequestRepositoryPort, OrchestratorRequestJournalPort, OrchestratorRequestRepositoryPort, AttemptFactsReadPort]
       infrastructure:
-        adapters: [ProjectProfileRepositoryAdapter, InstallationReferenceAdapter, CoordinationRequestRepositoryAdapter, OwnerQuestionRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter, OrchestratorSessionRepositoryAdapter, OwnerItemRepositoryAdapter, NoopChangeSignalAdapter]
+        adapters: [ProjectProfileRepositoryAdapter, InstallationReferenceAdapter, CoordinationRequestRepositoryAdapter, OwnerQuestionRepositoryAdapter, DecisionTransportAdapter, ObservationPublicationAdapter, AttentionReadAdapter, RelayTransportAdapter, OrchestratorSessionRepositoryAdapter, OwnerItemRepositoryAdapter, NoopChangeSignalAdapter, PermissionRequestRepositoryAdapter, OrchestratorRequestJournalAdapter, OrchestratorRequestRepositoryAdapter]
     contracts:
       RegisterProjectProfilePort: "Validate installation references, designated dispatcher, runner capabilities and approved policy without persisting credential values."
       UpdateProjectProfilePort: "Change an active profile only when the caller names the revision it read; host, clone and gate procedure names are checked against the installation; a change of repository or clones clears the last probe."
@@ -950,14 +1046,23 @@ bounded_contexts:
       RecordAttentionItemPort: "Raise a machine attention notice from a closed body with the injected clock and id source; the raiser is the caller's actor, never the body. One item per project, subject and kind: a repeat refreshes the open item or reopens a cleared one. An attention item grants and blocks nothing."
       ClearAttentionItemPort: "Clear attention items by one typed action: the owner dismisses one item at the revision read, the raiser resolves one by key as resolved or stale, or every open item of a merged work order is cleared; a cleared item is left unchanged."
       ListAttentionItemsPort: "List attention items, optionally by project, state, kind and work order, one entry per item id, without mutating state."
+      RequestToolPermissionPort: "Record one pending tool-permission request under an API-issued id with the tool input stored verbatim, then wait for the first verdict; no verdict before the deadline is an explicit deny, and the request never returns updatedInput."
+      GiveToolPermissionVerdictPort: "Record the first verdict on one pending tool-permission request; the first verdict wins, the same decision again changes nothing, and a different decision is a conflict. A verdict grants nothing beyond the one tool call it names."
+      ReconcileOrchestratorRequestUseCase: "Reconciles request/<requestId> for start-lane-run, prepare-fix, request-review and resume-run: writes the intent carrying the full request digest before the action and the result after, and claims start-lane-run only for cliKind conductor."
+      ReconcileOrchestratorRequestPort: "The inbound contract for journal-key reconciliation of orchestrator requests, in three closed actions; results carry fixed codes only and never paths, hosts or request text."
+      OrchestratorRequestJournalPort: "Reports an unreadable journal as unknown; entries expose only entryId, kind, digest, outcome and reasonCode."
+      OrchestratorRequestJournalAdapter: "Appends through the injected run-journal delegate with the K1b request-entry shape and the full 64-hex intent digest."
+      PermissionRequestRepositoryPort: "Hold pending tool-permission requests and their first verdict; a request that already holds a verdict is never overwritten."
       ProjectProfileRepositoryPort: "Persist private installation references and policy revisions with version-aware updates."
       CoordinationRequestRepositoryPort: "Persist scoped proposals, revisions, acknowledgements and authorization-consumption receipts."
       OwnerQuestionRepositoryPort: "Persist owner questions as a separate aggregate with revision-aware saves; never share the coordination requests store."
-      OrchestratorSessionRepositoryPort: "Persist orchestrator sessions in their own store with revision-aware saves; a save that only renews the lease or the mailbox poll is announced as a heartbeat, never as an orchestrator change."
+      OrchestratorSessionRepositoryPort: "Persist orchestrator sessions in their own store with revision-aware saves; a save that only renews the lease or the mailbox poll is announced as a heartbeat, never as an orchestrator change. registerOrAdoptSession is the one locked operation keyed by the conductor identity (host plus state directory, both screened): it adopts the identity's single live session, replaces a lapsed one, or registers over known absence, and every save path refuses a second ACTIVE session for the identity with the typed identity-already-active error."
+      OrchestratorRequestRepositoryPort: "Persist orchestrator requests as their own versioned aggregate with compare-and-swap on revision and idempotent retry; transitions emit a request change signal while claim lease renewals emit nothing; a stored request grants nothing."
       OwnerItemRepositoryPort: "Persist owner items in their own store with revision-aware saves; one item per natural key (a merge's project, repository and number; a plan decision; a question), refused when another item holds it; nothing is ever deleted; every save is announced as an owner-item change."
       DecisionTransportPort: "Read and verify the existing Waves signed-answer protocol or an explicit owner-recorded local decision."
       ObservationPublicationPort: "Publish a versioned Waves snapshot through its client without exposing tokens to agents."
       AttentionReadPort: "Read the existing Waves attention and project-staleness endpoints with bounded requests."
+      AttemptFactsReadPort: "Read an attempt's existence, owning project and collected head so a grant binds only to a real attempt of its own project at the expected head; unknown is null and nothing is written."
       RelayTransportPort: "Deliver notices or write a local outbox and return transport receipts without inferring acceptance."
       ChangeSignalPort: "Announce, after a successful save, that a record of a kind changed; carries no record state; never fails or delays the save."
     adapter_bindings:
@@ -966,14 +1071,17 @@ bounded_contexts:
       - { adapter: CoordinationRequestRepositoryAdapter, implements: CoordinationRequestRepositoryPort, integration: local-transactional-store }
       - { adapter: OwnerQuestionRepositoryAdapter, implements: OwnerQuestionRepositoryPort, integration: local-json-store }
       - { adapter: OrchestratorSessionRepositoryAdapter, implements: OrchestratorSessionRepositoryPort, integration: local-json-store }
+      - { adapter: OrchestratorRequestJournalAdapter, implements: OrchestratorRequestJournalPort, integration: in-process-run-journal-delegate }
+      - { adapter: OrchestratorRequestRepositoryAdapter, implements: OrchestratorRequestRepositoryPort, integration: local-json-store }
       - { adapter: OwnerItemRepositoryAdapter, implements: OwnerItemRepositoryPort, integration: local-json-store }
       - { adapter: DecisionTransportAdapter, implements: DecisionTransportPort, integration: existing-waves-decision-client-or-owner-recorded-file }
       - { adapter: ObservationPublicationAdapter, implements: ObservationPublicationPort, integration: existing-waves-client }
       - { adapter: AttentionReadAdapter, implements: AttentionReadPort, integration: existing-waves-read-endpoints }
       - { adapter: RelayTransportAdapter, implements: RelayTransportPort, integration: harness-notice-channel-or-local-outbox }
       - { adapter: NoopChangeSignalAdapter, implements: ChangeSignalPort, integration: in-process-noop }
+      - { adapter: PermissionRequestRepositoryAdapter, implements: PermissionRequestRepositoryPort, integration: in-process-memory }
     domain_specification:
-      aggregate_roots: [ProjectProfile, CoordinationRequest, OwnerQuestion, OrchestratorSession, OrchestratorRequest, OwnerItem]
+      aggregate_roots: [ProjectProfile, CoordinationRequest, OwnerQuestion, OrchestratorSession, OrchestratorRequest, OwnerItem, PermissionRequest]
       child_ownership: { AuthorizationConsumption: CoordinationRequest, RelayAcknowledgement: CoordinationRequest }
       enum_values:
         CoordinationKind: [action-decision, policy-proposal, relay, registry-alert]
@@ -991,6 +1099,7 @@ bounded_contexts:
         - "A status delivery failure is visible but does not block ordinary work. Missing required authorization blocks the affected action."
         - "Use Waves contracts through an anti-corruption boundary. Do not fabricate lane/PR fields for host alerts or relays."
         - "Fleet masters receive summaries and fleet-relevant proposals; project controllers own their status and raw notes."
+        - "A tool permission request is its own aggregate: the API issues its id, the tool input is stored verbatim and never rewritten, the first verdict wins, a missing verdict is an explicit deny, and the request grants nothing beyond the one tool call it names."
 
   - name: merge-coordination
     type: supporting

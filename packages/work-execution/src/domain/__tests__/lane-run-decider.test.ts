@@ -7,6 +7,8 @@ import { LANE_RUN_MAX_RETRY } from '../lane-run-keys.js';
 import {
   GATE_CONGESTION_BACKOFF_MS,
   GATE_CONGESTION_MAX_RETRIES,
+  GATE_UNKNOWN_MAX_RETRIES,
+  REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
   laneRunAttemptPhaseOf,
   nextLaneRunAction,
 } from '../lane-run-decider.js';
@@ -86,16 +88,18 @@ function baseFacts(overrides: Partial<LaneRunFacts> = {}): LaneRunFacts {
     acceptedHead12: null,
     gate: 'none',
     gateCongestion: null,
+    gateUnknown: null,
     briefCheck: { verdict: 'none', seatIndex: null, retries: 0 },
     codeReview: { verdict: 'none', seatIndex: null, retries: 0 },
     preMerge: 'none',
     premergePost: 'none',
+    mergeEnqueue: 'none',
     acceptance: 'none',
     acceptanceRetry: null,
     ci: 'pending',
     pr: null,
     refusedStep: null,
-    merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: true },
+    merge: { oneWayDoor: false, policyGrant: true },
     ...overrides,
   };
 }
@@ -179,10 +183,10 @@ describe('global rules', () => {
     const facts = baseFacts({
       state: 'running',
       attempt: attemptFact(),
-      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+      pendingIntent: { key: `${RUN_ID}/r0/collect/0/a1`, step: 'collect', reconciliation: 'ambiguous' },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
-      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'running',
+      kind: 'park', reason: 'ambiguous', qualifier: 'collect', parkedFrom: 'running',
     });
   });
 
@@ -365,6 +369,7 @@ describe('global rules', () => {
     const facts = baseFacts({
       state: 'collecting',
       stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:16:00.000Z',
       attempt: attemptFact({ phase: 'collected', collection: null }),
     });
     expect(decide(rec, facts)).toEqual({
@@ -799,8 +804,122 @@ describe('gating state', () => {
     expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'gate-pending' });
   });
 
-  it('T3: unknown parks ambiguous gate', () => {
-    const facts = baseFacts({ state: 'gating', gate: 'unknown' });
+  it('T3: an unknown gate within the automatic bound acts the gate under /retry<n+1>', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: 0, operatorAbandoned: false },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('T3b: an unknown gate past the automatic bound parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: GATE_UNKNOWN_MAX_RETRIES, operatorAbandoned: false },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3c: an operator-abandoned unknown gate retries again past the automatic bound', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: GATE_UNKNOWN_MAX_RETRIES, operatorAbandoned: true },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry2`, round: 0, seatIndex: 0, head12: HEAD, retry: 2,
+    });
+  });
+
+  it('T3d: an unknown gate without its gateUnknown fact waits facts-inconsistent', () => {
+    const facts = baseFacts({ state: 'gating', gate: 'unknown', head12: HEAD, attempt: attemptFact() });
+    expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+  });
+
+  it('T3e: an operator-abandoned unknown gate at the max retry parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: LANE_RUN_MAX_RETRY, operatorAbandoned: true },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3f: an ambiguous gate pending intent acts the gate under /retry1 without parking', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('T3g: an ambiguous gate pending intent already at retry 1 parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3h: an ambiguous non-gate pending intent still parks with its step as qualifier', () => {
+    const facts = baseFacts({
+      state: 'collecting',
+      pendingIntent: { key: `${RUN_ID}/r0/collect/0/a1`, step: 'collect', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'collect', parkedFrom: 'collecting',
+    });
+  });
+
+  it('T3i: an ambiguous gate pending intent under a graceful stop parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      stopMode: 'graceful',
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3j: an ambiguous gate pending intent under a halt parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      halted: true,
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
     });
@@ -896,11 +1015,58 @@ describe('gating state', () => {
 });
 
 describe('review rules per kind', () => {
-  it.each(['brief-check', 'code-review'] as const)('V1: %s with no seat parks review-seat-unavailable', (kind) => {
+  it.each(['brief-check', 'code-review'] as const)('V1: %s with no seat and no pass count parks review-seat-unavailable', (kind) => {
     const facts = reviewFacts(kind, { verdict: 'none' }, { reviewSeat: { ok: false } });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
     });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1b: %s with no seat below the pass bound waits review-seat-unavailable', (kind) => {
+    for (const reviewSeatUnavailablePasses of [0, REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1]) {
+      const facts = reviewFacts(kind, { verdict: 'none' }, { reviewSeat: { ok: false }, reviewSeatUnavailablePasses });
+      expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+    }
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1c: %s with no seat at the pass bound parks review-seat-unavailable', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'none' },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1d: %s none with a free seat acts even at the pass bound', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'none' },
+      { reviewSeat: { ok: true, seatIndex: 0 }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1e: %s malformed reviewSeatUnavailablePasses waits facts-inconsistent at both sites', (kind) => {
+    for (const reviewSeatUnavailablePasses of [-1, 1.5, Number.POSITIVE_INFINITY]) {
+      const site1 = reviewFacts(
+        kind,
+        { verdict: 'none' },
+        { reviewSeat: { ok: false }, reviewSeatUnavailablePasses },
+      );
+      expect(decide(record({}), site1)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+
+      const site2 = reviewFacts(
+        kind,
+        { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+        { reviewSeatUnavailablePasses },
+      );
+      expect(decide(record({}), site2)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+    }
   });
 
   it.each(['brief-check', 'code-review'] as const)('V2: %s none acts the kind', (kind) => {
@@ -922,6 +1088,17 @@ describe('review rules per kind', () => {
     });
   });
 
+  it.each(['brief-check', 'code-review'] as const)('V4b: %s no-receipt with retries: 0 retries the same seat even with no free seat and at the pass bound', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 0 },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
   it.each(['brief-check', 'code-review'] as const)('V5: %s no-receipt switches to a new seat without retry', (kind) => {
     const facts = reviewFacts(kind, { verdict: 'no-receipt', seatIndex: 0, retries: 1 }, { reviewSeat: { ok: true, seatIndex: 2 } });
     expect(decide(record({}), facts)).toEqual({
@@ -929,9 +1106,67 @@ describe('review rules per kind', () => {
     });
   });
 
-  it.each(['brief-check', 'code-review'] as const)('V6: %s no-receipt otherwise parks review-seat-unavailable', (kind) => {
+  it.each(['brief-check', 'code-review'] as const)('V5b: %s no-receipt switches to a new seat even at the pass bound', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: true, seatIndex: 2 }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/2@${HEAD}`, round: 0, seatIndex: 2, head12: HEAD, retry: null,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V6: %s no-receipt with no other seat and no pass count parks review-seat-unavailable', (kind) => {
     const facts = reviewFacts(kind, { verdict: 'no-receipt', seatIndex: 0, retries: 1 });
     assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V6b: %s no-receipt with no other seat waits below the pass bound and parks at the bound', (kind) => {
+    for (const reviewSeatUnavailablePasses of [0, REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1]) {
+      const below = reviewFacts(
+        kind,
+        { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+        { reviewSeatUnavailablePasses },
+      );
+      expect(decide(record({}), below)).toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+    }
+
+    const atBound = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    assertDecision(atBound, record({}), decide(record({}), atBound), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V6c: %s no-receipt with reviewSeat not ok parks when pass count omitted, waits below the bound, and parks at the bound', (kind) => {
+    const omitted = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: false } },
+    );
+    assertDecision(omitted, record({}), decide(record({}), omitted), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+
+    const below = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1 },
+    );
+    expect(decide(record({}), below)).toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+
+    const atBound = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    assertDecision(atBound, record({}), decide(record({}), atBound), {
       kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
     });
   });
@@ -1352,48 +1587,105 @@ describe('merging state', () => {
 
   it('M4: a one-way door parks one-way-door', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: true, branchBehind: false, trainFree: true, policyGrant: true },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: true, policyGrant: true },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'one-way-door', qualifier: null, parkedFrom: 'merging',
     });
   });
 
-  it('M5: a behind branch parks branch-behind', () => {
-    const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: true, trainFree: true, policyGrant: true },
-    });
-    assertDecision(facts, record({}), decide(record({}), facts), {
-      kind: 'park', reason: 'branch-behind', qualifier: null, parkedFrom: 'merging',
-    });
-  });
-
   it('M6: after the premerge success, without a policy grant parks owner-merge', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: false },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, policyGrant: false },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'owner-merge', qualifier: null, parkedFrom: 'merging',
     });
   });
 
-  it('M7: after the premerge success, without a free train waits merge-train', () => {
+  it('KS7b M5: a behind branch no longer parks; the queue updates it, so the run enqueues', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: false, policyGrant: true },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', attempt: attemptFact(),
+      pr: { state: 'open', head12: HEAD, containsLaneHead: true },
     });
-    expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'merge-train' });
+    expect(decide(record({}), facts)).toMatchObject({ kind: 'act', step: 'merge-enqueue' });
   });
 
-  it('M8: after the premerge success, otherwise acts merge', () => {
+  it('KS7b M8: after the premerge success, otherwise acts merge-enqueue under the round/head key', () => {
     const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, attempt: attemptFact() });
     expect(decide(record({}), facts)).toEqual({
-      kind: 'act', step: 'merge', key: `${RUN_ID}/r0/merge/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+      kind: 'act', step: 'merge-enqueue', key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
     });
+  });
+
+  it('KS7b: no merge act, trainFree or branchBehind remains: a pr-open merging run never acts merge', () => {
+    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, attempt: attemptFact() });
+    expect(decide(record({}), facts)).not.toMatchObject({ step: 'merge' });
+  });
+
+  it('KS7b: the pending enqueue hand-off is reconciled, never acted again', () => {
+    const facts = baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+      pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, step: 'merge-enqueue', reconciliation: 'unread' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'reconcile', step: 'merge-enqueue', key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`,
+    });
+  });
+
+  it('KS7b: a merged PR ends the run even while the enqueue intent is unread', () => {
+    const facts = baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
+      pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, step: 'merge-enqueue', reconciliation: 'unread' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('KS7b: a halt parks a pending enqueue hand-off instead of reconciling it', () => {
+    const facts = baseFacts({
+      state: 'merging', halted: true, head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+      pendingIntent: { key: `${RUN_ID}/r0/merge-enqueue@${HEAD}`, step: 'merge-enqueue', reconciliation: 'unread' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'halted', qualifier: null, parkedFrom: 'merging',
+    });
+  });
+
+  const queueFacts = (mergeEnqueue: LaneRunFacts['mergeEnqueue']): LaneRunFacts =>
+    baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', attempt: attemptFact(),
+      pr: { state: 'open', head12: HEAD, containsLaneHead: true }, mergeEnqueue,
+    });
+
+  it('KS7b: a fixable queue drop with a round left enters fixing', () => {
+    assertDecision(queueFacts('dropped-fixable'), record({}), decide(record({}), queueFacts('dropped-fixable')), { kind: 'enter', to: 'fixing' });
+    const round1 = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    assertDecision(queueFacts('dropped-fixable'), round1, decide(round1, queueFacts('dropped-fixable')), { kind: 'enter', to: 'fixing' });
+  });
+
+  it('KS7b: a fixable queue drop with no round left parks blocker-after-round-2', () => {
+    const round2 = record({ round: 2, attemptIds: ['a1', 'a2', 'a3'] });
+    assertDecision(queueFacts('dropped-fixable'), round2, decide(round2, queueFacts('dropped-fixable')), {
+      kind: 'park', reason: 'blocker-after-round-2', qualifier: null, parkedFrom: 'merging',
+    });
+  });
+
+  it('KS7b: a queue veto-hold parks owner-merge; any other final answer parks step-refused merge-enqueue', () => {
+    assertDecision(queueFacts('held'), record({}), decide(record({}), queueFacts('held')), {
+      kind: 'park', reason: 'owner-merge', qualifier: null, parkedFrom: 'merging',
+    });
+    assertDecision(queueFacts('stuck'), record({}), decide(record({}), queueFacts('stuck')), {
+      kind: 'park', reason: 'step-refused', qualifier: 'merge-enqueue', parkedFrom: 'merging',
+    });
+  });
+
+  it('KS7b: a queue-merged answer with the forge still reading open waits, never enters merged', () => {
+    expect(decide(record({}), queueFacts('merged'))).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
   });
 
   it('KS7a-2: a Tier 2 merging hold with no post acts premerge before the owner-merge park', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, attempt: attemptFact(), pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: false },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, attempt: attemptFact(), pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, policyGrant: false },
     });
     expect(decide(record({}), facts)).toEqual({
       kind: 'act', step: 'premerge', key: `${RUN_ID}/r0/premerge@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
@@ -1447,7 +1739,7 @@ describe('merging state', () => {
   it('KS7a-2: Tier 1 posts success on the first merging advance', () => {
     const rec = record({ tier: 1 });
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, attempt: attemptFact(), pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: false },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, attempt: attemptFact(), pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, policyGrant: false },
     });
     expect(decide(rec, facts)).toEqual({
       kind: 'act', step: 'premerge', key: `${RUN_ID}/r0/premerge@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
@@ -1724,7 +2016,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
   it('a zero-commit collection ends the drain stopped, never preparing the next seat', () => {
     const rec = record({});
     const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 0, manifest: 'sealed' } });
-    const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt });
+    const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', stopRequestedAtIso: '2026-10-27T09:16:00.000Z', attempt });
     assertDecision(collecting, rec, decide(rec, collecting), { kind: 'enter', to: 'seat-failed' });
     const seatFailed = baseFacts({ state: 'seat-failed', stopMode: 'graceful', attempt });
     assertDecision(seatFailed, rec, decide(rec, seatFailed), { kind: 'enter', to: 'stopped' });
@@ -1733,7 +2025,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
   it('an unsealed collection parks, then the parked run enters stopped', () => {
     const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'missing' } });
     const rec = record({});
-    const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt });
+    const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', stopRequestedAtIso: '2026-10-27T09:16:00.000Z', attempt });
     assertDecision(collecting, rec, decide(rec, collecting), {
       kind: 'park', reason: 'artifacts-unsealed', qualifier: null, parkedFrom: 'collecting',
     });
@@ -1754,6 +2046,76 @@ describe('cancel and modes (plan §3.9.1)', () => {
     expect(decide(rec, exceeded)).toEqual({ kind: 'wait', reason: 'stop-grace-exceeded' });
     const none = baseFacts({ state: 'running', stopMode: 'graceful', attempt, stopRequestedAtIso: null });
     expect(decide(rec, none)).toEqual({ kind: 'wait', reason: 'stop-grace-exceeded' });
+  });
+
+  it('GD7: a collecting drain with no live attempt and the grace passed enters stopped', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'collecting',
+      stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:00:00.000Z',
+      attempt: attemptFact({ phase: 'collected', collection: null }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
+  });
+
+  it('GD7: the same collecting drain inside the grace still lets the collecting rules decide', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'collecting',
+      stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:16:00.000Z',
+      attempt: attemptFact({ phase: 'collected', collection: null }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0/a1`, round: 0, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('GD7: a gating drain with no live attempt and the grace passed enters stopped', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'gating',
+      stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:00:00.000Z',
+      head12: HEAD,
+      gate: 'none',
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'sealed' } }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
+  });
+
+  it('GD7: a live running attempt past the grace still waits stop-grace-exceeded', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'running',
+      stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:00:00.000Z',
+      attempt: attemptFact(),
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'stop-grace-exceeded' });
+  });
+
+  it('GD7: a missing stopRequestedAtIso with no live attempt in collecting enters stopped', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'collecting',
+      stopMode: 'graceful',
+      stopRequestedAtIso: null,
+      attempt: attemptFact({ phase: 'collected', collection: null }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
+  });
+
+  it('GD7: an invalid stopRequestedAtIso with no live attempt in collecting enters stopped', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'collecting',
+      stopMode: 'graceful',
+      stopRequestedAtIso: 'not-a-timestamp',
+      attempt: attemptFact({ phase: 'collected', collection: null }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
   });
 
   it('the run deadline still stops the attempt under a graceful stop', () => {
@@ -1777,7 +2139,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
     const lifted = baseFacts({ state: 'parked', stopMode: 'graceful', halted: false, head12: HEAD, gate: 'none', attempt });
     assertDecision(lifted, parkedRec, decide(parkedRec, lifted), { kind: 'enter', to: 'gating' });
 
-    const resumed = baseFacts({ state: 'gating', stopMode: 'graceful', halted: false, head12: HEAD, gate: 'none', attempt });
+    const resumed = baseFacts({ state: 'gating', stopMode: 'graceful', halted: false, head12: HEAD, gate: 'none', stopRequestedAtIso: '2026-10-27T09:16:00.000Z', attempt });
     expect(decide(rec, resumed)).toEqual({
       kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
     });

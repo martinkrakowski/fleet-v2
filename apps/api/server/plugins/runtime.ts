@@ -10,11 +10,16 @@ import { listenHostRefusal } from "../wiring/listen-host";
 import { configureFleetApiRuntime } from "../wiring/runtime";
 import { configureSessionExchange } from "../wiring/session-exchange";
 import { readApiTokenFromFile, setActiveApiToken } from "../wiring/token";
+import { issueWebLoginCode, removeWebLoginCodeFile, resetWebLogin } from "../wiring/web-login";
 
-function refuse(): false {
+function refuse(stateDir?: string): false {
   setActiveApiToken(null);
   configureFleetApiRuntime(null);
   configureSessionExchange();
+  resetWebLogin();
+  if (stateDir) {
+    removeWebLoginCodeFile(stateDir);
+  }
   return false;
 }
 
@@ -26,16 +31,16 @@ export function bootstrapFleetApiFromEnv(env: NodeJS.ProcessEnv = process.env): 
 
   const tokenFile = env.FLEET_API_TOKEN_FILE?.trim();
   if (!tokenFile) {
-    return refuse();
+    return refuse(stateDir);
   }
   const token = readApiTokenFromFile(tokenFile);
   if (!token) {
-    return refuse();
+    return refuse(stateDir);
   }
 
   const loadResult = loadInstallation({ env: env as Record<string, string | undefined> });
   if (loadResult.status === "invalid") {
-    return refuse();
+    return refuse(stateDir);
   }
 
   const ownerPublicKey = env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined;
@@ -45,6 +50,8 @@ export function bootstrapFleetApiFromEnv(env: NodeJS.ProcessEnv = process.env): 
     ownerPublicKey,
     installation: loadResult.installation,
   });
+  // A null return means the login stays closed; the API still serves reads.
+  issueWebLoginCode(stateDir);
   return true;
 }
 

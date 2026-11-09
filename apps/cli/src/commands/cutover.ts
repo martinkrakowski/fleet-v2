@@ -1,6 +1,8 @@
 /**
- * The `cutover` command group of the CLI driver (lane CO32). Reads only: the
- * `shadow report` subcommand compares the fleet-v2 merge queue against the
+ * The `cutover` command group of the CLI driver. `status` and `rollback` (lane
+ * CO30a) read and move the cutover record through `ManageCutoverUseCase`;
+ * `switch` and `retire` are not mounted until CO30b. The rest of this note is
+ * lane CO32: reads only: the `shadow report` subcommand compares the fleet-v2 merge queue against the
  * shell train's recorded queue for one repository and prints one JSON document
  * of ids and codes. It writes nothing and grants nothing.
  *
@@ -41,7 +43,69 @@ function repositoryFromPayload(p: Payload): { owner: string; repo: string } {
   return { owner: segments[0], repo: segments[1] };
 }
 
+/** Usage error for a flag or positional the subcommand does not take; the value is never echoed. */
+function rejectUnexpectedInput(p: Payload, subcommand: string, allowed: readonly string[]): void {
+  for (const key of Object.keys(p)) {
+    if (key === 'positional') {
+      if (Array.isArray(p[key]) && p[key].length > 0) {
+        throw new CliUsageError(`cutover ${subcommand} takes no positional arguments`);
+      }
+    } else if (!allowed.includes(key)) {
+      throw new CliUsageError(`cutover ${subcommand} does not accept an unknown flag`);
+    }
+  }
+}
+
+/** An optional string flag; a flag given without a value is a usage error. */
+function optionalIsoFlag(p: Payload, key: string, flag: string): string | undefined {
+  const value = p[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new CliUsageError(`--${flag} requires a value`);
+  }
+  return value;
+}
+
+function expectedRevisionFlag(p: Payload): number {
+  const value = p['expectedRevision'];
+  const revision =
+    typeof value === 'number' ? value : typeof value === 'string' && /^[1-9][0-9]{0,9}$/.test(value) ? Number(value) : NaN;
+  if (!Number.isSafeInteger(revision) || revision < 1) {
+    throw new CliUsageError('cutover rollback requires --expected-revision as a positive integer');
+  }
+  return revision;
+}
+
 export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
+  status: async (payload, runtime) => {
+    rejectUnexpectedInput(payload, 'status', ['nowIso', 'deadlineIso']);
+    const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso');
+    const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
+    return runtime.execution.manageCutover.execute({
+      move: 'status',
+      ...(nowIso === undefined ? {} : { nowIso }),
+      ...(deadlineIso === undefined ? {} : { deadlineIso }),
+    });
+  },
+
+  rollback: async (payload, runtime) => {
+    rejectUnexpectedInput(payload, 'rollback', ['expectedRevision', 'operationId', 'nowIso', 'deadlineIso']);
+    const expectedRevision = expectedRevisionFlag(payload);
+    const operationId = payload['operationId'];
+    if (typeof operationId !== 'string' || operationId.trim() === '') {
+      throw new CliUsageError('cutover rollback requires --operation-id');
+    }
+    const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso') ?? runtime.daemon.now();
+    const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
+    return runtime.execution.manageCutover.execute({
+      move: 'rollback',
+      expectedRevision,
+      operationId,
+      nowIso,
+      ...(deadlineIso === undefined ? {} : { deadlineIso }),
+    });
+  },
+
   shadow: async (payload, runtime) => {
     const sub = firstPositional(payload);
     if (sub !== 'report') {

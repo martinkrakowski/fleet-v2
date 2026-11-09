@@ -68,6 +68,11 @@ const STORE_ORDER = [
   'merge-queue.json',
   'killall-halt.json',
   'killall-train-pause.json',
+  'seat-tickets.json',
+  'seat-observations.json',
+  'merge-records.json',
+  'held-work-orders.json',
+  'cutover.json',
   'assessments.json',
   'knowledge-entries.json',
   'context-selections.json',
@@ -77,6 +82,7 @@ const STORE_ORDER = [
   'orchestrators.json',
   'owner-items.json',
   'attention-items.json',
+  'orchestrator-requests.json',
 ];
 
 describe('fleet-v2 state', () => {
@@ -116,11 +122,11 @@ describe('fleet-v2 state', () => {
     const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
     expect(code).toBe(0);
     const missingLines = stdout.filter((line) => line.endsWith(': missing\n'));
-    expect(missingLines).toHaveLength(27);
+    expect(missingLines).toHaveLength(33);
     for (let index = 0; index < STORE_ORDER.length; index += 1) {
       expect(missingLines[index]).toBe(`${STORE_ORDER[index]}: missing\n`);
     }
-    expect(stdout.at(-1)).toBe('state check: all 27 store files readable or missing\n');
+    expect(stdout.at(-1)).toBe('state check: all 33 store files readable or missing\n');
   });
 
   it('reports a valid attempts store as ok', async () => {
@@ -152,7 +158,7 @@ describe('fleet-v2 state', () => {
     expect(code).toBe(1);
     const text = stdout.join('');
     expect(text).toContain('journal.json: unreadable: not valid JSON\n');
-    expect(text).toContain('state check: 1 of 27 store files unreadable\n');
+    expect(text).toContain('state check: 1 of 33 store files unreadable\n');
     expect(stdout.at(-1)).toBe('nothing was changed; no quarantine copies were found\n');
   });
 
@@ -316,7 +322,28 @@ describe('fleet-v2 state', () => {
     };
   }
 
-  /** Write all five versioned stores with minimal readable records; when `stamp`, carry schemaVersion 1. */
+  function requestFixture(requestId: string): Record<string, unknown> {
+    return {
+      requestId,
+      revision: 1,
+      kind: 'dispatch-attempt',
+      projectId: 'example-project',
+      target: { attemptId: 'attempt-example-1' },
+      requestedBy: { via: 'web', sessionId: 'session-example-1' },
+      createdAtIso: '2026-10-27T10:00:00.000Z',
+      expiresAtIso: '2026-10-27T10:30:00.000Z',
+      updatedAtIso: '2026-10-27T10:00:00.000Z',
+      state: 'queued',
+      fence: 0,
+      claimCount: 0,
+      claim: null,
+      deferredUntilIso: null,
+      reason: null,
+      linked: null,
+    };
+  }
+
+  /** Write all six versioned stores with minimal readable records; when `stamp`, carry schemaVersion 1. */
   async function writeAllVersionedStores(dir: string, stamp: boolean): Promise<void> {
     const stampIf = (record: Record<string, unknown>): unknown => (stamp ? { ...record, schemaVersion: 1 } : record);
     await fs.writeFile(
@@ -345,9 +372,16 @@ describe('fleet-v2 state', () => {
         stampIf(runJournalEntryFixture('01JB0000000000000000000002', 'run-01JB0000000000000000000000') as Record<string, unknown>),
       ]),
     );
+    await fs.writeFile(
+      path.join(dir, 'orchestrator-requests.json'),
+      JSON.stringify([
+        stampIf(requestFixture('01JB0000000000000000000000') as Record<string, unknown>),
+        stampIf(requestFixture('01JB0000000000000000000001') as Record<string, unknown>),
+      ]),
+    );
   }
 
-  it('reports schemaVersion 1 across all five versioned stores whether on-disk records omit or carry it', async () => {
+  it('reports schemaVersion 1 across all six versioned stores whether on-disk records omit or carry it', async () => {
     for (const stamp of [false, true]) {
       const dir = makeTempDir();
       await writeAllVersionedStores(dir, stamp);
@@ -360,6 +394,7 @@ describe('fleet-v2 state', () => {
       expect(text).toContain('reservations.json: ok (2 records, schemaVersion 1)\n');
       expect(text).toContain('lane-runs.json: ok (2 records, schemaVersion 1)\n');
       expect(text).toContain('run-journal.json: ok (2 records, schemaVersion 1)\n');
+      expect(text).toContain('orchestrator-requests.json: ok (2 records, schemaVersion 1)\n');
     }
   });
 
@@ -394,7 +429,46 @@ describe('fleet-v2 state', () => {
     expect(code).toBe(1);
     const text = stdout.join('');
     expect(text).toContain('attempts.json: unsupported schemaVersion at record 1\n');
-    expect(text).toContain('state check: 1 of 27 store files unreadable\n');
+    expect(text).toContain('state check: 1 of 33 store files unreadable\n');
+    expect(await snapshot()).toEqual(before);
+    await expect(fs.stat(path.join(dir, 'quarantine'))).rejects.toThrow();
+  });
+
+  it('reports orchestrator-requests.json schemaVersion 1 and refuses unsupported schemaVersion without quarantining', async () => {
+    for (const stamp of [false, true]) {
+      const dir = makeTempDir();
+      await writeAllVersionedStores(dir, stamp);
+      const { io, stdout } = mockIo();
+      const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
+      expect(code).toBe(0);
+      expect(stdout.join('')).toContain('orchestrator-requests.json: ok (2 records, schemaVersion 1)\n');
+    }
+
+    const dir = makeTempDir();
+    await fs.writeFile(
+      path.join(dir, 'orchestrator-requests.json'),
+      JSON.stringify([
+        requestFixture('01JB0000000000000000000000'),
+        { ...requestFixture('01JB0000000000000000000001'), schemaVersion: 2 },
+      ]),
+    );
+    const snapshot = async (): Promise<Array<{ rel: string; size: number; mtimeMs: number }>> => {
+      const entries = await fs.readdir(dir, { recursive: true });
+      const stats = await Promise.all(
+        entries.map(async (rel) => ({ rel, stat: await fs.lstat(path.join(dir, rel)) })),
+      );
+      return stats
+        .filter(({ stat }) => !stat.isDirectory())
+        .map(({ rel, stat }) => ({ rel, size: stat.size, mtimeMs: stat.mtimeMs }))
+        .sort((a, b) => a.rel.localeCompare(b.rel));
+    };
+    const before = await snapshot();
+    const { io, stdout } = mockIo();
+    const exitCode = await runCli(['--state-dir', dir, 'state', 'check'], io);
+    expect(exitCode).toBe(1);
+    const text = stdout.join('');
+    expect(text).toContain('orchestrator-requests.json: unsupported schemaVersion at record 1\n');
+    expect(text).toContain('state check: 1 of 33 store files unreadable\n');
     expect(await snapshot()).toEqual(before);
     await expect(fs.stat(path.join(dir, 'quarantine'))).rejects.toThrow();
   });

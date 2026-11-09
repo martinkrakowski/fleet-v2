@@ -21,6 +21,8 @@ const MERGED_FIXTURE = JSON.stringify({
   headRefOid: '3dd5d90509461e3d2154b52da28671aeffa84130',
   mergeCommit: { oid: '3fe9fac07688024ae64dc5a3da66010e4418d628' },
   mergedAt: '2026-10-25T20:12:08Z',
+  isCrossRepository: false,
+  headRepositoryOwner: { login: 'example-owner' },
   number: 202,
   state: 'MERGED',
 });

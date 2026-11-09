@@ -50,15 +50,27 @@ import {
   type ConductorDriverLeaseRecord,
   type RunConductorPassResult,
   type ConductorRunReport,
+  type ConductorAttentionItem,
   type AdvanceLaneRunResult,
   type ListLaneRunsResult,
   type ConductorScheduleRow,
   type ConductorPassTraceInput,
   type ConductorPassTracePort,
   type RunTelemetryMarkPort,
+  type WorkOrderRecord,
+  CRASHED_START_NOTICE_MINUTES,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
+import {
+  CONDUCTOR_HEARTBEAT_GAP_CAP_MS,
+  heartbeatOrReRegisterConductorOrchestrator,
+  pollDelayWhileRegistered,
+  registerConductorOrchestrator,
+  type RegisterConductorOrchestratorResult,
+  retireConductorOrchestrator,
+} from './conductor-orchestrator.js';
+import { openChangeWakeReader, resolveWakeConfig, type ChangeWakeReader } from './conductor-wake.js';
 import { buildLiveConductorDriver, buildDryRunConductorDriver, type ConductorDriver, type DryRunStores } from './conductor-wiring.js';
 import { withFileLock } from './file-store.js';
 import type { CliIo } from './index.js';
@@ -86,9 +98,14 @@ export interface ConductorCliOptions {
    * runtime's `RunnerTunnelAdapter`.
    */
   readonly tunnel?: RunnerTunnelPort;
+  /** An injected change-feed reader (tests); null means "no reader". */
+  readonly wakeReader?: ChangeWakeReader | null;
+  /** The opener seam; production uses `openChangeWakeReader`. */
+  readonly openWakeReader?: (config: { readonly baseUrl: string; readonly token: string }) => Promise<ChangeWakeReader | null>;
 }
 
 export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
+       fleet-v2 conductor status --stalled
        fleet-v2 conductor schedule [--json] [--passes]
        fleet-v2 conductor halt [--lift]
        fleet-v2 conductor stop <runId> [--force] [--revision <n>]
@@ -96,7 +113,14 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>] [--max-active-runs <n>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
-       fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes]
+       fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes] [--force-unsealed]
+
+conductor status --stalled lists the runs held longer than
+policy.daemon.stallAfterMinutes (default 30), oldest first: a parked row is
+run id, park class, age in minutes and work order, and a non-park row is run
+id, state, age in minutes, work order and last advanced time, with no park
+class; it is the view of the same stall rule that raises the conductor's
+stall:<runId> attention items.
 
 Read-only status of one lane run (or every run) with its projected state,
 the halt marker and the driver lease; a kill-switch halt the driver checks
@@ -115,7 +139,11 @@ worktree of every finished lane run (terminal run, terminal work order,
 every attempt cancelled or collected, no held reservation) on explicit
 request: --dry-run lists the candidates and removes nothing, and without it
 --yes is required; the branch fleet/<runId> is kept — no branch, run record
-or evidence is removed. conductor reap --sessions lists and, on request,
+or evidence is removed. Since C2' the removal is gated on the attempt's
+sealed artifact manifest: an uncollected or tampered worktree is refused.
+--force-unsealed (with --worktrees only) removes an uncollected or tampered
+worktree only through a scoped, one-way owner approval consumed from the
+coordination store; every clean, unlocked and idle check still runs. conductor reap --sessions lists and, on request,
 aborts sessions with no live attempt: worktrees whose every attempt is
 finished (cancelled, collected or ended) and none holds a reservation, but
 where the runner still reports a running session; --dry-run lists them and
@@ -131,10 +159,16 @@ explicit authority; it also needs policy.conductor.enabled and a state
 directory. conductor run --dry-run copies the state stores into a scratch
 directory and drives them with recording fakes, printing what the driver
 would do; it reaches no host, needs neither --live nor
-policy.conductor.enabled, and never writes the real state. conductor start
-reserves capacity and prepares a worktree on a lane host; it needs
-policy.conductor.enabled and a state directory, and dispatches nothing.
-start --abandon works while the conductor is disabled.
+policy.conductor.enabled, and never writes the real state. conductor run
+--live registers one orchestrator session (cliKind conductor, claim
+start-lane-run) after a pass holds the driver lease and retires it on exit.
+It does not claim a request and does not start a lane. Dry-run writes no
+session. conductor start reserves capacity and prepares a worktree on a lane
+host; it needs policy.conductor.enabled and a state directory, and dispatches
+nothing.
+start --abandon works while the conductor is disabled. The status document
+also lists the reservations a crashed start left held, and conductor start
+raises one attention item per crashed start.
 
 Each subcommand prints one JSON document on stdout (conductor run prints one
 JSON line per pass; conductor schedule without --json prints text lines and,
@@ -158,6 +192,7 @@ function revisionOf(value: string | undefined): number | 'invalid' | 'absent' {
 interface ControlOptions {
   readonly force: boolean;
   readonly lift: boolean;
+  readonly stalled: boolean;
   readonly revision: number | undefined;
   readonly positionals: readonly string[];
 }
@@ -171,6 +206,7 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
   const positionals: string[] = [];
   let force = false;
   let lift = false;
+  let stalled = false;
   let revision: number | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]!;
@@ -188,6 +224,14 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
         return null;
       }
       lift = true;
+      continue;
+    }
+    if (token === '--stalled') {
+      if (stalled) {
+        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      stalled = true;
       continue;
     }
     if (token === '--revision' || token.startsWith('--revision=')) {
@@ -217,17 +261,17 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
     io.stderr(`conductor takes at most one run id\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { force, lift, revision, positionals };
+  return { force, lift, stalled, revision, positionals };
 }
 
 /** What each subcommand accepts; anything else is a usage error, never silently ignored. */
 const SUBCOMMAND_SHAPE: Readonly<
-  Record<string, { readonly force: boolean; readonly lift: boolean; readonly revision: boolean; readonly runId: 'none' | 'optional' | 'required'; readonly writes: boolean }>
+  Record<string, { readonly force: boolean; readonly lift: boolean; readonly stalled: boolean; readonly revision: boolean; readonly runId: 'none' | 'optional' | 'required'; readonly writes: boolean }>
 > = {
-  status: { force: false, lift: false, revision: false, runId: 'optional', writes: false },
-  halt: { force: false, lift: true, revision: false, runId: 'none', writes: true },
-  stop: { force: true, lift: false, revision: true, runId: 'required', writes: true },
-  resume: { force: false, lift: false, revision: true, runId: 'required', writes: true },
+  status: { force: false, lift: false, stalled: true, revision: false, runId: 'optional', writes: false },
+  halt: { force: false, lift: true, stalled: false, revision: false, runId: 'none', writes: true },
+  stop: { force: true, lift: false, stalled: false, revision: true, runId: 'required', writes: true },
+  resume: { force: false, lift: false, stalled: false, revision: true, runId: 'required', writes: true },
 };
 
 /** The exit code of a control result, read from its outcome; text is never parsed. */
@@ -501,6 +545,74 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
   return { maxActiveRuns: 1, ...flags, abandon, dryRun, live };
 }
 
+/** How the crashed-start scan went: the caller, not the helper, tells the operator. */
+type CrashedStartScan = 'complete' | 'incomplete' | 'failed';
+
+/**
+ * AD-2: raise one stored attention item per crashed start the status view
+ * reports that has been held for at least CRASHED_START_NOTICE_MINUTES, except
+ * the attempt a retry continues (`skipAttemptId`). A younger candidate may be a
+ * live start still preparing, so it raises nothing. The body is exactly the five
+ * keys of `RecordAttentionItemBody`. Best-effort: a refusal or throw never fails
+ * a start. It prints nothing; it returns how the scan went.
+ */
+async function raiseCrashedStartNotices(
+  runtime: FleetCliRuntime,
+  nowIso: string,
+  skipAttemptId: string | undefined,
+): Promise<CrashedStartScan> {
+  let result: Awaited<ReturnType<FleetCliRuntime['conductor']['inspectLaneRuns']['inspectLaneRuns']>>;
+  try {
+    result = await runtime.conductor.inspectLaneRuns.inspectLaneRuns({ nowIso });
+  } catch {
+    return 'failed';
+  }
+  if (result.outcome !== 'listed') {
+    return 'complete';
+  }
+  for (const crashed of result.crashedStarts) {
+    if (crashed.attemptId === skipAttemptId || crashed.workOrderId === null) {
+      continue;
+    }
+    if (crashed.heldMinutes === null || crashed.heldMinutes < CRASHED_START_NOTICE_MINUTES) {
+      continue;
+    }
+    let workOrder: WorkOrderRecord | null;
+    try {
+      workOrder = await runtime.execution.workOrderRepository.findWorkOrderById(crashed.workOrderId);
+    } catch {
+      continue;
+    }
+    if (workOrder === null) {
+      continue;
+    }
+    const body = {
+      projectId: workOrder.projectId,
+      kind: 'crashed-start',
+      subject: { kind: 'attempt', ref: crashed.attemptId },
+      workOrderId: crashed.workOrderId,
+      summary: `A lane start crashed and left capacity slot ${crashed.slotIndex} held for attempt ${crashed.attemptId}.`,
+    };
+    try {
+      await runtime.coordination.recordAttentionItem.recordAttentionItem(body, 'conductor');
+    } catch {
+      // A notice never fails a start.
+    }
+  }
+  return result.crashedStartsIncomplete === true ? 'incomplete' : 'complete';
+}
+
+/** The operator's line for a scan that did not check every held reservation, or null when it did. */
+function crashedStartScanWarning(command: string, scan: CrashedStartScan): string | null {
+  if (scan === 'incomplete') {
+    return `conductor ${command}: the crashed-start scan was incomplete; some held reservations were not checked\n`;
+  }
+  if (scan === 'failed') {
+    return `conductor ${command}: the crashed-start scan failed; held reservations were not checked\n`;
+  }
+  return null;
+}
+
 /**
  * `conductor start` (K7-D7): reserve capacity, prepare the run's worktree at
  * the reserved path, place the brief, record the first attempt and the run.
@@ -586,6 +698,15 @@ async function startCommand(
   if (driver.start === null) {
     io.stderr(`conductor start has no start port in this driver\n${CONDUCTOR_HELP}\n`);
     return 2;
+  }
+  // AD-2: surface crashed-start reservations as attention items. The flags
+  // and the brief are validated above; the scan writes stored items, so it
+  // must not run before a usage error. Best-effort; a retry with the same
+  // attempt id continues the crashed start, so it raises nothing for it. The
+  // `--abandon` path returned earlier and raises nothing.
+  const scanWarning = crashedStartScanWarning('start', await raiseCrashedStartNotices(runtime, nowIsoOf(options), flags.attemptId));
+  if (scanWarning !== null) {
+    io.stderr(scanWarning);
   }
   const result = await driver.start.startLaneRun({
     runId,
@@ -813,6 +934,60 @@ async function stopTelemetryExporter(runtime: FleetCliRuntime): Promise<void> {
   }
 }
 
+/** The interrupt marker `resolveWakeReader` returns when the stop signal ends the opener wait. */
+const WAKE_OPENER_INTERRUPTED = 'wake-opener-interrupted';
+
+/**
+ * K9: build the change-feed wake reader for a live run. An injected reader
+ * wins; otherwise the environment must configure both the API base URL and a
+ * wake-token file, and the opener must succeed — a reader that cannot open
+ * prints one line and leaves the driver polling. The opener wait races the
+ * stop signal: an API that never answers must not hold the run hostage, so an
+ * interrupt ends the wait (and the production opener's fetch); the caller stops
+ * the tunnel and the `finally` stops the exporter and closes the reader.
+ */
+async function resolveWakeReader(
+  io: CliIo,
+  options: ConductorCliOptions,
+  signal: AbortSignal,
+): Promise<ChangeWakeReader | undefined | typeof WAKE_OPENER_INTERRUPTED> {
+  if (options.wakeReader !== undefined) {
+    return options.wakeReader ?? undefined;
+  }
+  const config = resolveWakeConfig(process.env);
+  if (config === null) {
+    return undefined;
+  }
+  const opener =
+    options.openWakeReader ?? ((open: { readonly baseUrl: string; readonly token: string }) => openChangeWakeReader({ ...open, signal }));
+  let onAbort: (() => void) | null = null;
+  const interrupted = new Promise<typeof WAKE_OPENER_INTERRUPTED>((resolve) => {
+    onAbort = () => resolve(WAKE_OPENER_INTERRUPTED);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    // The opener's promise is settled into a value before racing, so a later
+    // rejection can never surface as an unhandled rejection after the race.
+    const openerPromise = opener(config).then(
+      (reader): ChangeWakeReader | null => reader,
+      (): ChangeWakeReader | null => null,
+    );
+    const raced = await Promise.race([openerPromise.then((reader) => ({ reader })), interrupted]);
+    if (raced === WAKE_OPENER_INTERRUPTED) {
+      return WAKE_OPENER_INTERRUPTED;
+    }
+    if (raced.reader === null) {
+      io.stderr('conductor run: the change feed is unavailable; polling\n');
+      return undefined;
+    }
+    return raced.reader;
+  } finally {
+    if (onAbort !== null) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
 /**
  * `conductor run --live`: the driver. One pass at a time under the state
  * directory's driver lease, polling with back-off from 30 seconds to 2 minutes,
@@ -865,6 +1040,7 @@ async function runCommand(
   // interrupt during the startup wait stops the tunnel child too.
   const tunnel = options.tunnel ?? runtime.runnerTunnel;
   const controller = new AbortController();
+  let wake: ChangeWakeReader | undefined;
   const signal = options.stopSignal ?? controller.signal;
   const onSignal = (): void => {
     controller.abort();
@@ -881,6 +1057,66 @@ async function runCommand(
     onAbort = () => resolve('interrupted');
     signal.addEventListener('abort', onAbort, { once: true });
   });
+  // O9: the orchestrator session this process registers; null until a pass
+  // holds the lease. Its id drives the heartbeat gap and the final retire.
+  let registeredOrchestratorId: string | null = null;
+  // Registration is attempted exactly once per process, whether it succeeds or not.
+  let registrationAttempted = false;
+  // The heartbeat re-registers a refused (retired or missing) session once per process.
+  let reRegistrationUsed = false;
+  // One stderr line per distinct non-renewed heartbeat code per process.
+  const seenHeartbeatCodes = new Set<string>();
+  // O9 fix: the heartbeat gap is anchored to the last beat, never to the pass
+  // start. A between-pass sleep up to the 60 s cap plus a fresh 60 s in-pass
+  // timer would let the first beat of the next pass arrive up to 120 s after
+  // the previous beat, past the 90 s lease. Waiting only the remainder of the
+  // gap keeps every beat within 60 s of the last. Null until the first beat or
+  // registration, so that first in-pass wait is the full gap.
+  let lastHeartbeatAtMs: number | null = null;
+  const nextBeatDelayMs = (): number => {
+    if (lastHeartbeatAtMs === null) {
+      return CONDUCTOR_HEARTBEAT_GAP_CAP_MS;
+    }
+    return Math.max(0, CONDUCTOR_HEARTBEAT_GAP_CAP_MS - (Date.now() - lastHeartbeatAtMs));
+  };
+  // O9 fix: the heartbeat used both during a pass and before the sleep. It
+  // no-ops until a session id is registered and never stops the loop.
+  const beatNow = async (): Promise<void> => {
+    if (registeredOrchestratorId === null) {
+      return;
+    }
+    const heartbeat = await heartbeatOrReRegisterConductorOrchestrator(
+      {
+        sessionRepo: runtime.coordination.orchestratorSessionRepository,
+        listProfiles: () => runtime.coordination.projectProfileRepository.listProfiles(),
+        installation: runtime.installation,
+        clock: { nowIso: () => nowIsoOf(options) },
+        newOrchestratorId: () => runtime.conductor.newUlid(),
+      },
+      registeredOrchestratorId,
+      !reRegistrationUsed,
+    );
+    lastHeartbeatAtMs = Date.now();
+    if (heartbeat.reRegistration !== null) {
+      // Self-heal is one-shot per process.
+      reRegistrationUsed = true;
+      registeredOrchestratorId = heartbeat.orchestratorId;
+      io.stderr(
+        `${JSON.stringify(
+          heartbeat.reRegistration === 'registered'
+            ? { orchestrator: 're-registered', orchestratorId: heartbeat.orchestratorId }
+            : { orchestrator: heartbeat.reRegistration },
+        )}\n`,
+      );
+      if (heartbeat.reRegistration === 'registered') {
+        return;
+      }
+    }
+    if (heartbeat.code !== 'renewed' && !seenHeartbeatCodes.has(heartbeat.code)) {
+      seenHeartbeatCodes.add(heartbeat.code);
+      io.stderr(`${JSON.stringify({ orchestrator: heartbeat.code })}\n`);
+    }
+  };
   try {
     const startPromise = tunnel.ensureTunnel({
       onEarlyExit: () => {
@@ -908,20 +1144,67 @@ async function runCommand(
     } catch {
       // a lost exporter delays only the next export
     }
+    // K9: open the change-feed wake reader (when configured) so a signal ends
+    // the between-passes sleep; a reader that cannot open never prevents
+    // polling, and the stop signal ends the opener wait itself (an API that
+    // never answers cannot hold the run hostage).
+    const opened = await resolveWakeReader(io, options, signal);
+    if (opened === WAKE_OPENER_INTERRUPTED) {
+      // Same contract as the tunnel startup race: an interrupt ends the opener
+      // wait, and the owned tunnel is stopped here too — the poll loop never
+      // starts, so its tunnel-release path would otherwise be skipped.
+      await tunnel.stop();
+      return 0;
+    }
+    wake = opened;
     const holderId = 'driver-' + runtime.conductor.newUlid();
     const seenAttention = new Set<string>();
+    // O9: once a session is registered, cap the poll sleep to the heartbeat
+    // gap so the 90 s lease never lapses across the sleep.
+    const baseSleep = options.sleep ?? defaultSleep;
+    const conductorSleep = async (delayMs: number, signal: AbortSignal): Promise<void> => {
+      const delay = registeredOrchestratorId === null ? delayMs : pollDelayWhileRegistered(delayMs);
+      await baseSleep(delay, signal);
+    };
     return await pollConductorPasses({
       driver,
       holderId,
       nowIso: () => nowIsoOf(options),
-      sleep: options.sleep ?? defaultSleep,
+      sleep: conductorSleep,
       stopSignal: signal,
       once: flags.once,
+      wake,
       releaseTunnel: () => tunnel.release(),
+      heartbeatDuringPass: beatNow,
+      nextBeatDelayMs,
       eachPass: async (pass, result, nowIso) => {
         io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
         if (result.outcome === 'refused') {
           return { stop: true, exitCode: 1 };
+        }
+        if (result.outcome === 'completed') {
+          if (!registrationAttempted) {
+            registrationAttempted = true;
+            const registration = await registerConductorOrchestrator({
+              sessionRepo: runtime.coordination.orchestratorSessionRepository,
+              listProfiles: () => runtime.coordination.projectProfileRepository.listProfiles(),
+              installation: runtime.installation,
+              clock: { nowIso: () => nowIsoOf(options) },
+              newOrchestratorId: () => runtime.conductor.newUlid(),
+            });
+            registeredOrchestratorId =
+              registration.code === 'registered' ? registration.orchestratorId : null;
+            if (registeredOrchestratorId !== null) {
+              // Anchor the gap to the moment the session was created: the next
+              // pass may follow a sleep up to the 60 s cap, and the lease is
+              // only 90 s, so the first beat of that pass must not wait a full
+              // fresh 60 s timer.
+              lastHeartbeatAtMs = Date.now();
+            }
+            logRegistrationOutcome(io, registration);
+          } else if (registeredOrchestratorId !== null) {
+            await beatNow();
+          }
         }
         await recordPassTrace(io, driver.passTrace, {
           passId: 'pass-' + runtime.conductor.newUlid(),
@@ -935,19 +1218,8 @@ async function runCommand(
         // OT5: mark every advanced run after its pass has journalled its result
         // (only advanced passes journalled results; the exporter re-reads the
         // records, so the root is emitted whenever the run is already terminal).
-        for (const report of result.runs) {
-          if (report.outcome === 'advanced') {
-            markRunQuietly(runtime.telemetry.mark, report.runId);
-          }
-        }
-        for (const item of result.attention) {
-          const key = `${item.runId}:${item.kind}`;
-          if (seenAttention.has(key)) {
-            continue;
-          }
-          seenAttention.add(key);
-          io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
-        }
+        markAdvancedRunsQuietly(runtime.telemetry.mark, result.runs);
+        reportNewAttention(io, seenAttention, result.attention);
         return { stop: false };
       },
     });
@@ -961,6 +1233,18 @@ async function runCommand(
     }
     // OT5: stop the background exporter within the 2 s stop race (plan §3.5).
     await stopTelemetryExporter(runtime);
+    // K9: close the change-feed reader after the poll loop; idempotent.
+    wake?.close();
+    // O9: retire the registered session on exit, including after a throw; the
+    // pass exit code is never changed here.
+    if (registeredOrchestratorId !== null) {
+      const retirement = await retireConductorOrchestrator(
+        runtime.coordination.orchestratorSessionRepository,
+        { nowIso: () => nowIsoOf(options) },
+        registeredOrchestratorId,
+      );
+      io.stderr(`${JSON.stringify({ orchestrator: retirement.code })}\n`);
+    }
   }
 }
 
@@ -994,6 +1278,163 @@ async function recordPassTrace(
 }
 
 /**
+ * O9: one stderr line for a conductor registration outcome. `registered`
+ * carries the new session id; every other code names the refusal.
+ */
+function logRegistrationOutcome(
+  io: CliIo,
+  registration: RegisterConductorOrchestratorResult,
+): void {
+  io.stderr(
+    `${JSON.stringify(
+      registration.code === 'registered'
+        ? { orchestrator: registration.code, orchestratorId: registration.orchestratorId }
+        : { orchestrator: registration.code },
+    )}\n`,
+  );
+}
+
+/**
+ * OT5: mark every run whose pass advanced after that pass journalled its
+ * result. The exporter re-reads the records, so the root is emitted whenever
+ * the run is already terminal.
+ */
+function markAdvancedRunsQuietly(mark: RunTelemetryMarkPort | undefined, runs: readonly ConductorRunReport[]): void {
+  for (const report of runs) {
+    if (report.outcome === 'advanced') {
+      markRunQuietly(mark, report.runId);
+    }
+  }
+}
+
+/**
+ * K9: one stdout line per distinct attention item. An item already reported
+ * earlier in the run is never printed again; `seenAttention` carries the
+ * run's deduplication state.
+ */
+function reportNewAttention(
+  io: CliIo,
+  seenAttention: Set<string>,
+  attention: readonly ConductorAttentionItem[],
+): void {
+  for (const item of attention) {
+    const key = `${item.runId}:${item.kind}`;
+    if (seenAttention.has(key)) {
+      continue;
+    }
+    seenAttention.add(key);
+    io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
+  }
+}
+
+/**
+ * The between-passes sleep of the poll loop. K9: a change signal ends the sleep
+ * early, so the next pass runs at once; a stream that closes without a signal
+ * keeps the back-off for the rest of this sleep.
+ */
+async function sleepBetweenPasses(options: {
+  readonly delayMs: number;
+  readonly signal: AbortSignal;
+  readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  readonly wake: ChangeWakeReader | undefined;
+}): Promise<void> {
+  const { signal, wake } = options;
+  let sleepSettled = false;
+  const iteration = new AbortController();
+  const onStop = (): void => iteration.abort();
+  signal.addEventListener('abort', onStop, { once: true });
+  if (signal.aborted) {
+    iteration.abort();
+  }
+  try {
+    const slept = options.sleep(options.delayMs, iteration.signal).then(() => {
+      sleepSettled = true;
+    });
+    if (wake === undefined) {
+      await slept;
+      return;
+    }
+    const arrived = await Promise.race([
+      slept.then(() => false),
+      wake.waitForSignal(iteration.signal),
+    ]);
+    if (!arrived && !sleepSettled) {
+      // The stream closed without a signal: keep the back-off.
+      await slept;
+    }
+  } finally {
+    signal.removeEventListener('abort', onStop);
+    iteration.abort(); // ends a pending sleep timer and a pending waiter
+  }
+}
+
+/**
+ * O9 fix: run one pass while heartbeating the registered orchestrator session
+ * in the background. A pass can outlive the 90-second session lease; the beat
+ * fires at most once per 60 seconds, anchored to the last beat (not to the
+ * pass start), so a live conductor never appears detached while it is still
+ * running. Without a registered session (or before registration) the pass
+ * runs unchanged. The beat loop ends when the pass settles or the stop signal
+ * fires; the pass result is always the one returned, and the loop can never
+ * end it early.
+ */
+export async function runPassWithHeartbeat(
+  options: {
+    readonly driver: ConductorDriver;
+    readonly stopSignal?: AbortSignal;
+    readonly heartbeatDuringPass?: () => Promise<void>;
+    readonly nextBeatDelayMs?: () => number;
+  },
+  passRequest: { readonly holderId: string; readonly nowIso: string },
+): Promise<RunConductorPassResult> {
+  const heartbeat = options.heartbeatDuringPass;
+  const passPromise = options.driver.pass.runPass(passRequest);
+  if (heartbeat === undefined) {
+    return await passPromise;
+  }
+  const iteration = new AbortController();
+  const onStop = (): void => iteration.abort();
+  const signal = options.stopSignal;
+  if (signal !== undefined) {
+    signal.addEventListener('abort', onStop, { once: true });
+    if (signal.aborted) {
+      iteration.abort();
+    }
+  }
+  try {
+    return await Promise.race([
+      passPromise,
+      (async () => {
+        while (!iteration.signal.aborted) {
+          // The beat interval uses the raw real-timer sleep, never the
+          // poll-loop sleep: a test-recorded poll sleep must not see these
+          // 60-second gaps, and the poll back-off owns that recording. The
+          // wait is the remainder of the heartbeat gap since the last beat,
+          // so a long between-pass sleep cannot push this pass's first beat
+          // past the 90 s lease.
+          await defaultSleep(options.nextBeatDelayMs?.() ?? CONDUCTOR_HEARTBEAT_GAP_CAP_MS, iteration.signal);
+          if (iteration.signal.aborted) {
+            break;
+          }
+          try {
+            await heartbeat();
+          } catch {
+            // A thrown beat can never settle the race; the pass result owns it.
+            break;
+          }
+        }
+        return await passPromise;
+      })(),
+    ]);
+  } finally {
+    if (signal !== undefined) {
+      signal.removeEventListener('abort', onStop);
+    }
+    iteration.abort(); // ends a pending beat sleep; the pass promise always settles
+  }
+}
+
+/**
  * The shared poll loop of `conductor run`: one pass at a time under the
  * driver lease, printing one line per pass through `eachPass`, polling with
  * back-off from 30 seconds to 2 minutes, with a 10-second floor while a run
@@ -1008,11 +1449,27 @@ async function pollConductorPasses(options: {
   readonly stopSignal?: AbortSignal;
   readonly once: boolean;
   /**
+   * K9: the change-feed wake reader; when present its signal ends the
+   * between-passes sleep early.
+   */
+  readonly wake?: ChangeWakeReader;
+  /**
    * KF-35: releases the driver's runner tunnel after `releaseLeases`, leaving
    * the forward running: detached lanes still talk to the server through it.
    */
   readonly releaseTunnel?: () => Promise<void>;
   readonly eachPass: (pass: number, result: RunConductorPassResult, nowIso: string) => Promise<PollPassOutcome>;
+  /**
+   * O9 fix: heartbeats the registered orchestrator session while a pass runs.
+   * A pass can outlive the 90 s lease, so the live conductor renews during the
+   * pass, not only after it completes; a no-op until an id is registered.
+   */
+  readonly heartbeatDuringPass?: () => Promise<void>;
+  /**
+   * O9 fix: how long to wait before the next in-pass beat, measured from the
+   * last beat (or from registration). When absent the full 60 s gap is used.
+   */
+  readonly nextBeatDelayMs?: () => number;
 }): Promise<number> {
   const controller = new AbortController();
   const signal = options.stopSignal ?? controller.signal;
@@ -1030,7 +1487,7 @@ async function pollConductorPasses(options: {
   try {
     for (let pass = 1; ; pass += 1) {
       const passNowIso = options.nowIso();
-      const result = await options.driver.pass.runPass({
+      const result = await runPassWithHeartbeat(options, {
         holderId: options.holderId,
         nowIso: passNowIso,
       });
@@ -1047,7 +1504,13 @@ async function pollConductorPasses(options: {
       if (result.outcome !== 'refused') {
         previousDelay = nextPollDelayMs(previousDelay, result.progressed);
       }
-      await options.sleep(pollSleepMs(previousDelay ?? MIN_POLL_MS, result), signal);
+      const delayMs = pollSleepMs(previousDelay ?? MIN_POLL_MS, result);
+      await sleepBetweenPasses({
+        delayMs,
+        signal,
+        sleep: options.sleep,
+        wake: options.wake,
+      });
       if (signal.aborted) {
         break;
       }
@@ -1140,6 +1603,8 @@ function printDryRunAppendedLines(io: CliIo, appended: readonly LaneRunJournalEn
         step = parsed.step;
       } else if (parsed !== null && parsed.kind === 'premerge') {
         step = 'premerge';
+      } else if (parsed !== null && parsed.kind === 'merge-enqueue') {
+        step = 'merge-enqueue';
       }
       const result = resultsByKey.get(entry.key);
       io.stdout(
@@ -1265,6 +1730,7 @@ interface ReapFlags {
   readonly sessions: boolean;
   readonly dryRun: boolean;
   readonly yes: boolean;
+  readonly forceUnsealed: boolean;
 }
 
 /**
@@ -1277,6 +1743,7 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
   let sessions = false;
   let dryRun = false;
   let yes = false;
+  let forceUnsealed = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]!;
     if (token === '--worktrees') {
@@ -1311,14 +1778,28 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
       yes = true;
       continue;
     }
+    if (token === '--force-unsealed') {
+      // C2': given at most once; a secret-shaped or path-shaped token is
+      // never echoed, so the message names the flag, not the argv value.
+      if (forceUnsealed) {
+        io.stderr(`conductor reap: --force-unsealed given more than once\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      forceUnsealed = true;
+      continue;
+    }
     if (token.startsWith('--')) {
-      io.stderr(`Unknown conductor reap flag: ${token}\n${CONDUCTOR_HELP}\n`);
+      io.stderr(`conductor reap: unknown or unsupported flag\n${CONDUCTOR_HELP}\n`);
       return null;
     }
     io.stderr(`conductor reap takes no positional arguments\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { worktrees, sessions, dryRun, yes };
+  if (forceUnsealed && sessions) {
+    io.stderr(`conductor reap: --force-unsealed applies only to --worktrees\n${CONDUCTOR_HELP}\n`);
+    return null;
+  }
+  return { worktrees, sessions, dryRun, yes, forceUnsealed };
 }
 
 /**
@@ -1382,9 +1863,14 @@ async function reapCommand(
   }
   const result = await runtime.conductor.reapLaneWorktrees.reapLaneWorktrees({
     dryRun: flags.dryRun,
+    forceUnsealed: flags.forceUnsealed,
     nowIso: nowIsoOf(options),
   });
   io.stdout(`${JSON.stringify(result)}\n`);
+  // A refused or unknown top-level outcome is a failure too (C2').
+  if (result.outcome !== 'reaped') {
+    return 1;
+  }
   // Refusals and unknowns both land in `refused`; a failed post-removal
   // journal append lands in `journalFailed`. Nothing refused, unknown or
   // un-journalled exits 0.
@@ -1564,9 +2050,14 @@ function controlUsageExit(
   const misplaced =
     (parsed.force && !shape.force ? '--force' : null) ??
     (parsed.lift && !shape.lift ? '--lift' : null) ??
+    (parsed.stalled && !shape.stalled ? '--stalled' : null) ??
     (parsed.revision !== undefined && !shape.revision ? '--revision' : null);
   if (misplaced !== null) {
     io.stderr(`conductor ${subcommand} does not take ${misplaced}\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  if (parsed.stalled && parsed.positionals.length > 0) {
+    io.stderr(`conductor ${subcommand} --stalled takes no run id\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
   if (shape.runId === 'none' && parsed.positionals.length > 0) {
@@ -1582,6 +2073,17 @@ function controlUsageExit(
   return null;
 }
 
+/** `conductor status --stalled`: the runs held past the stall threshold — a parked row is the run id, park class, age and work order; a non-park row is the run id, journal state, age, work order and last advanced time, with no park class — oldest first, as one JSON document. */
+async function conductorStalledExit(
+  conductor: FleetCliRuntime['conductor'],
+  io: CliIo,
+  nowIso: string,
+): Promise<number> {
+  const result = await conductor.listStalledRuns.listStalledRuns({ nowIso });
+  io.stdout(`${JSON.stringify(result)}\n`);
+  return exitFor(result);
+}
+
 /** `conductor status`: one JSON document describing lane runs. */
 async function conductorStatusExit(
   conductor: FleetCliRuntime['conductor'],
@@ -1593,6 +2095,12 @@ async function conductorStatusExit(
     nowIso,
     ...(runId !== undefined ? { runId } : {}),
   });
+  // The status document carries `crashedStarts` only; an incomplete scan is told on stderr, not as an extra field.
+  if (result.outcome === 'listed' && result.crashedStartsIncomplete === true) {
+    io.stdout(`${JSON.stringify(result, (key: string, value: unknown) => (key === 'crashedStartsIncomplete' ? undefined : value))}\n`);
+    io.stderr(crashedStartScanWarning('status', 'incomplete') ?? '');
+    return exitFor(result);
+  }
   io.stdout(`${JSON.stringify(result)}\n`);
   return exitFor(result);
 }
@@ -1733,6 +2241,9 @@ export async function conductorCommand(
   const conductor = runtime.conductor;
   switch (subcommand) {
     case 'status':
+      if (parsed.stalled) {
+        return await conductorStalledExit(conductor, io, nowIso);
+      }
       return await conductorStatusExit(conductor, io, nowIso, parsed.positionals[0]);
     case 'halt':
       return await conductorHaltExit(conductor, io, nowIso, parsed.lift);

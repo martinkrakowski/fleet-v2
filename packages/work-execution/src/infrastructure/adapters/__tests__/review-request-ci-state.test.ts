@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { assessmentIdForChain, attemptIdForChain } from '@fleet/evidence-and-acceptance';
 import type {
   EvidenceAssessmentRecord,
   InspectAcceptanceEvidenceRequest,
@@ -313,6 +314,76 @@ describe('ReviewRequestAdapter.requestReview', () => {
       outcome: 'no-receipt',
       reason: 'review-unavailable',
       detail: null,
+    });
+  });
+
+  it('RV4: a seat-busy rejection archives a screened diagnostic under the request id and maps to no-receipt', async () => {
+    const secret = 'ghp_' + 'a'.repeat(36);
+    const diagnostic = {
+      exitCode: 75,
+      timedOut: false,
+      stderr: `${secret} /home/operator/secret.txt`,
+      stdoutEmpty: false,
+    };
+    const { requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'rejected',
+      reason: 'review seat busy',
+      rejection: 'review-unavailable',
+      code: 'seat-busy',
+      diagnostic,
+    });
+    const archived: Array<{ artifactId: string; candidateHeadSha: string; content: string }> = [];
+    const adapter = new ReviewRequestAdapter({
+      requestIndependentReview,
+      archiveEvidence: async (request) => {
+        archived.push(request);
+        return { evidenceRef: 'evidence://' + request.artifactId, digest: 'd' };
+      },
+    });
+
+    const result = await adapter.requestReview(makeReviewRequest());
+
+    expect(result).toEqual({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'seat-busy',
+    });
+    expect(archived).toHaveLength(1);
+    expect(archived[0]!.artifactId).toBe('review-transport-' + REQUEST_ID);
+    expect(archived[0]!.candidateHeadSha).toBe(HEAD);
+    const content = JSON.parse(archived[0]!.content) as Record<string, unknown>;
+    expect(content).toEqual({
+      exitCode: 75,
+      timedOut: false,
+      stdoutEmpty: false,
+      stderr: '[redacted] [path]',
+    });
+    // The archived content carries no secret match and no path except the [path] token.
+    expect(archived[0]!.content).not.toContain(secret);
+    expect(archived[0]!.content).not.toContain('/home/operator');
+  });
+
+  it('RV4: an archive failure is swallowed and the outcome is unchanged', async () => {
+    const { requestIndependentReview } = makeRequestReviewFake({
+      outcome: 'rejected',
+      reason: 'review seat busy',
+      rejection: 'review-unavailable',
+      code: 'seat-busy',
+      diagnostic: { exitCode: 75, timedOut: false, stderr: null, stdoutEmpty: null },
+    });
+    const adapter = new ReviewRequestAdapter({
+      requestIndependentReview,
+      archiveEvidence: async () => {
+        throw new Error('archive boom');
+      },
+    });
+
+    const result = await adapter.requestReview(makeReviewRequest());
+
+    expect(result).toEqual({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'seat-busy',
     });
   });
 
@@ -996,5 +1067,200 @@ describe('CiStateAdapter.readHeadCiState', () => {
     const result = await adapter.readHeadCiState({ headSha: HEAD });
 
     expect(result).toEqual({ headSha: HEAD, state: 'unknown', reason: 'unreadable' });
+  });
+});
+
+describe('ReviewRequestAdapter with a chain subject', () => {
+  const PROJECT = 'project-example-1';
+  const CHAIN = 'example-chain';
+  const CHAIN_REQUEST_ID = 'chain-review:example-chain:000000000000';
+  const CHAIN_ASSESSMENT_ID = assessmentIdForChain(PROJECT, CHAIN);
+  const CHAIN_SUBJECT = { kind: 'chain', projectId: PROJECT, chainName: CHAIN, integrationHeadSha: HEAD } as const;
+  const STORED_SUBJECT = {
+    kind: 'chain', projectId: PROJECT, attemptId: null, chainName: CHAIN, integrationHeadSha: HEAD,
+    briefPackageDigest: null, baseCommit: null,
+  } as const;
+  const BRIEF_SUBJECT = { kind: 'brief', projectId: PROJECT, briefPackageDigest: 'd'.repeat(64), baseCommit: HEAD } as const;
+  const FIND = { attemptId: attemptIdForChain(PROJECT, CHAIN), requestId: CHAIN_REQUEST_ID, candidateHeadSha: HEAD };
+
+  function chainReceipt(overrides: Partial<ReviewReceiptRecord> = {}): ReviewReceiptRecord {
+    return makeReceipt({
+      id: 'rr-chain-1', assessmentId: CHAIN_ASSESSMENT_ID, projectId: PROJECT, attemptId: attemptIdForChain(PROJECT, CHAIN),
+      kind: 'pre-merge', requestId: CHAIN_REQUEST_ID, subject: STORED_SUBJECT, ...overrides,
+    });
+  }
+
+  function chainAssessment(receipts: ReviewReceiptRecord[]): EvidenceAssessmentRecord {
+    return makeAssessment({
+      id: CHAIN_ASSESSMENT_ID, projectId: PROJECT, attemptId: attemptIdForChain(PROJECT, CHAIN), reviewReceipts: receipts,
+    });
+  }
+
+  function chainRequest(overrides: Partial<ReviewRequest> = {}): ReviewRequest {
+    return makeReviewRequest({
+      requestId: CHAIN_REQUEST_ID, kind: 'pre-merge', attemptId: attemptIdForChain(PROJECT, CHAIN), projectId: PROJECT,
+      subject: CHAIN_SUBJECT, diffSummary: 'Combined review of chain example-chain against main at 000000000000', ...overrides,
+    });
+  }
+
+  function inspecting(receipts: ReviewReceiptRecord[]) {
+    return makeInspectFake({ outcome: 'found', assessment: chainAssessment(receipts) } as never);
+  }
+
+  it('requests one pre-merge review on the chain-scoped assessment with the chain subject and the scope summary', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: chainReceipt() });
+    const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(chainRequest());
+    expect(result.outcome).toBe('receipt');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      assessmentId: CHAIN_ASSESSMENT_ID, projectId: PROJECT, attemptId: `chain:${PROJECT}:${CHAIN}`, candidateHeadSha: HEAD,
+      kind: 'pre-merge', requestId: CHAIN_REQUEST_ID, subject: STORED_SUBJECT,
+      diffSummary: 'Combined review of chain example-chain against main at 000000000000',
+    });
+  });
+
+  it('treats a receipt of another subject, head, kind or request id as unknown with receipt-mismatch', async () => {
+    for (const receipt of [
+      chainReceipt({ subject: { ...STORED_SUBJECT, chainName: 'another' } }),
+      chainReceipt({ candidateHeadSha: OTHER_HEAD }),
+      chainReceipt({ kind: 'code-review' }),
+      chainReceipt({ subject: undefined }),
+      chainReceipt({ requestId: 'chain-review:example-chain:ffffffffffff' }),
+    ]) {
+      const { requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt });
+      expect(await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(chainRequest())).toEqual({
+        outcome: 'unknown', reason: 'receipt-mismatch',
+      });
+    }
+  });
+
+  it('maps rejections and throws exactly as the attempt path does, and never throws', async () => {
+    const rejected = makeRequestReviewFake({ outcome: 'rejected', reason: 'x', rejection: 'not-independent' });
+    expect(await new ReviewRequestAdapter({ requestIndependentReview: rejected.requestIndependentReview }).requestReview(chainRequest())).toEqual({
+      outcome: 'refused', reason: 'not-independent', detail: null,
+    });
+    const throwing = async (): Promise<RequestIndependentReviewResult> => {
+      throw new Error('boom');
+    };
+    expect(await new ReviewRequestAdapter({ requestIndependentReview: throwing }).requestReview(chainRequest())).toEqual({
+      outcome: 'unknown', reason: 'delegate-failed',
+    });
+    expect(await new ReviewRequestAdapter().requestReview(chainRequest())).toEqual({
+      outcome: 'refused', reason: 'not-configured', detail: null,
+    });
+  });
+
+  it('refuses a malformed or disagreeing chain request with invalid-request and calls no delegate', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: chainReceipt() });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    const bad: Partial<ReviewRequest>[] = [
+      { subject: { ...CHAIN_SUBJECT, integrationHeadSha: OTHER_HEAD } },
+      { subject: { ...CHAIN_SUBJECT, chainName: 'Bad/Name' } },
+      { subject: { ...CHAIN_SUBJECT, projectId: 'another-project' } },
+      { subject: { kind: 'galaxy' } as never },
+      { kind: 'code-review' },
+      { requestId: 'has space' },
+      { diffSummary: 'x'.repeat(3000) },
+    ];
+    for (const overrides of bad) {
+      expect(await adapter.requestReview(chainRequest(overrides))).toEqual({ outcome: 'refused', reason: 'invalid-request', detail: null });
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses a request whose subject is an accessor, even one returning a chain subject, and calls no delegate', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: chainReceipt() });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    const request = { ...chainRequest() } as Record<string, unknown>;
+    delete request.subject;
+    Object.defineProperty(request, 'subject', { enumerable: true, get: () => CHAIN_SUBJECT });
+    expect(await adapter.requestReview(request as unknown as ReviewRequest)).toEqual({
+      outcome: 'refused', reason: 'invalid-request', detail: null,
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses the brief subject and the brief-verify kind as subject-not-implemented', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: chainReceipt() });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    expect(await adapter.requestReview(chainRequest({ subject: BRIEF_SUBJECT }))).toEqual({
+      outcome: 'refused', reason: 'subject-not-implemented', detail: null,
+    });
+    expect(await adapter.requestReview(makeReviewRequest({ kind: 'brief-verify' }))).toEqual({
+      outcome: 'refused', reason: 'subject-not-implemented', detail: null,
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('keeps an attempt request without a subject, and one restating its own attempt, on the attempt path', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: makeReceipt() });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    await adapter.requestReview(makeReviewRequest());
+    await adapter.requestReview(
+      makeReviewRequest({ subject: { kind: 'attempt', projectId: 'project-example-1', attemptId: 'attempt-example-1', headSha: HEAD } }),
+    );
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.assessmentId).toBe(ASSESSMENT_ID);
+      expect(call.subject).toBeUndefined();
+    }
+    const other = makeReviewRequest({ subject: { kind: 'attempt', projectId: 'project-example-1', attemptId: 'other', headSha: HEAD } });
+    expect(await adapter.requestReview(other)).toEqual({ outcome: 'refused', reason: 'invalid-request', detail: null });
+  });
+
+  it('finds the chain receipt of a request id from the chain-scoped assessment', async () => {
+    const { calls, inspectAcceptanceEvidence } = inspecting([chainReceipt()]);
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+    const found = await adapter.findReviewReceipt({ ...FIND, subject: CHAIN_SUBJECT });
+    expect(found).toMatchObject({ outcome: 'found', receipt: { receiptId: 'rr-chain-1', requestId: CHAIN_REQUEST_ID, kind: 'pre-merge' } });
+    expect(calls[0]).toEqual({ assessmentId: CHAIN_ASSESSMENT_ID });
+    const missing = await adapter.findReviewReceipt({ ...FIND, requestId: 'chain-review:example-chain:ffffffffffff', subject: CHAIN_SUBJECT });
+    expect(missing).toEqual({ outcome: 'not-found' });
+  });
+
+  it('reports a chain receipt of another kind, head or subject as unavailable with receipt-mismatch', async () => {
+    for (const receipt of [
+      chainReceipt({ kind: 'code-review' }),
+      chainReceipt({ candidateHeadSha: OTHER_HEAD }),
+      chainReceipt({ subject: undefined }),
+      chainReceipt({ subject: { ...STORED_SUBJECT, integrationHeadSha: OTHER_HEAD } }),
+    ]) {
+      const { inspectAcceptanceEvidence } = inspecting([receipt]);
+      const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+      expect(await adapter.findReviewReceipt({ ...FIND, subject: CHAIN_SUBJECT })).toEqual({
+        outcome: 'unavailable', reason: 'receipt-mismatch',
+      });
+    }
+  });
+
+  it('answers unavailable for a brief subject and not-found or unreadable as the store does', async () => {
+    const { inspectAcceptanceEvidence } = makeInspectFake({ outcome: 'not-found' } as never);
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+    expect(await adapter.findReviewReceipt({ ...FIND, subject: CHAIN_SUBJECT })).toEqual({ outcome: 'not-found' });
+    expect(await adapter.findReviewReceipt({ ...FIND, subject: BRIEF_SUBJECT })).toEqual({
+      outcome: 'unavailable', reason: 'invalid-request',
+    });
+    const throwing = new ReviewRequestAdapter({
+      inspectAcceptanceEvidence: async () => {
+        throw new Error('boom');
+      },
+    });
+    expect(await throwing.findReviewReceipt({ ...FIND, subject: CHAIN_SUBJECT })).toEqual({
+      outcome: 'unavailable', reason: 'unreadable',
+    });
+  });
+
+  it('finds the latest chain receipt of one kind and refuses a brief subject', async () => {
+    const older = chainReceipt({ id: 'rr-old', requestId: 'chain-review:example-chain:aaaaaaaaaaaa', completedAtIso: '2026-10-01T00:00:00.000Z' });
+    const newer = chainReceipt({ id: 'rr-new', completedAtIso: '2026-10-02T00:00:00.000Z' });
+    const { inspectAcceptanceEvidence } = inspecting([older, newer]);
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+    const base = { attemptId: attemptIdForChain(PROJECT, CHAIN), candidateHeadSha: HEAD };
+    const latest = await adapter.findLatestReceiptOfKind({ ...base, kind: 'pre-merge', subject: CHAIN_SUBJECT });
+    expect(latest).toMatchObject({ outcome: 'found', receipt: { receiptId: 'rr-new', kind: 'pre-merge' } });
+    expect(await adapter.findLatestReceiptOfKind({ ...base, kind: 'code-review', subject: CHAIN_SUBJECT })).toEqual({ outcome: 'not-found' });
+    expect(await adapter.findLatestReceiptOfKind({ ...base, kind: 'pre-merge', subject: BRIEF_SUBJECT })).toEqual({
+      outcome: 'unavailable', reason: 'invalid-request',
+    });
   });
 });

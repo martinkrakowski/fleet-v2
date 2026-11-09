@@ -4,11 +4,12 @@ import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
-import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, performPark, refusedResult } from './step-context.js';
 import { manifestExpectedArtifacts, readFrozenManifestVerified, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { historyEntryOf } from '../../../domain/seat-selection.js';
+import { startReviewsInFlight } from './review-fix.js';
 
 /**
  * The `act collect` decision (K4-6): collect an ended attempt's artifacts
@@ -261,6 +262,9 @@ async function recordGateReceiptsGuarded(
         ...(commandResults[index]!.coverage !== undefined
           ? { coverage: commandResults[index]!.coverage }
           : {}),
+        ...(commandResults[index]!.failingFile !== undefined
+          ? { failingFile: commandResults[index]!.failingFile }
+          : {}),
       })),
     });
   // A recorded answer counts only when every check got its receipt.
@@ -282,11 +286,39 @@ export async function performGate(ctx: AdvanceStepContext,
   if (preCheck !== null) {
     return preCheck;
   }
+  // GU1: a retry run closes its ambiguous predecessor key first (`overtaken` /
+  // `gate-unknown-retried`), so the lost read's key never becomes pending again
+  // after the retry passes. A predecessor with a final result is left alone (a
+  // congested predecessor is already `completed` / `gate-congested`; a resumed
+  // predecessor is already `overtaken` / `intent-abandoned-by-operator`).
+  if (decision.step === 'gate' && typeof decision.retry === 'number' && decision.retry >= 1) {
+    const previous = buildLaneRunStepKey({
+      runId: record.runId,
+      round: decision.round,
+      step: 'gate',
+      seatIndex: decision.seatIndex,
+      attemptOrdinal: null,
+      head12: decision.head12,
+      retry: decision.retry === 1 ? null : decision.retry - 1,
+    });
+    if (!previous.ok) {
+      return { outcome: 'waiting', reason: 'facts-inconsistent' };
+    }
+    const previousEntries = await ctx.deps.runJournal.listForKey(previous.key);
+    const hasIntent = previousEntries.some((entry) => entry.kind === 'intent');
+    const hasFinal = previousEntries.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous');
+    if (hasIntent && !hasFinal) {
+      const closeRefusal = await appendRunResult(ctx, request, previous.key, 'overtaken', 'gate-unknown-retried');
+      if (closeRefusal !== null) {
+        return refusedResult(closeRefusal);
+      }
+    }
+  }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
     return refusedResult(intentRefusal);
   }
-  return runGateBody(ctx, record, gathered, decision, request, decision.key);
+  return runGateBody(ctx, record, gathered, decision, request, decision.key, true);
 }
 
 /** The gate's pre-checks before its intent (K4-6): the wiring, the attempt's artifacts, the sealed collection. */
@@ -326,6 +358,7 @@ export async function runGateBody(ctx: AdvanceStepContext,
   decision: Extract<LaneRunDecision, { kind: 'act' | 'reconcile' }>,
   request: AdvanceLaneRunRequest,
   key: string,
+  startReview = false,
 ): Promise<AdvanceLaneRunResult> {
   const gate = ctx.deps.evaluateAttemptGate;
   if (gate === undefined) {
@@ -337,11 +370,30 @@ export async function runGateBody(ctx: AdvanceStepContext,
   }
   const parsedKey = parseLaneRunKey(key);
   const gateRun = parsedKey !== null && parsedKey.kind === 'step' ? (parsedKey.retry ?? undefined) : undefined;
-  const verdict = await gate.evaluateAttemptGate({
+  // KS6: the evaluation is launched without being awaited, so the brief-check
+  // starts beside it (the review runs while the gate runs; code-review is not
+  // part of this lane). The settled outcome keeps a throwing port behaving
+  // exactly as today — the throw leaves the advance — and leaves no rejection
+  // unhandled.
+  const gateOutcome = gate.evaluateAttemptGate({
     attemptId: latest.id,
     candidateHeadSha: latest.artifacts.headCommit,
     ...(gateRun === undefined ? {} : { gateRun }),
-  });
+  }).then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  if (startReview) {
+    // The reconcile must never start a second review, so only the act starts
+    // them; the reviews' intents and results are appended between the gate's
+    // intent and the gate's result.
+    await startReviewsInFlight(ctx, record, gathered, request);
+  }
+  const settled = await gateOutcome;
+  if (!settled.ok) {
+    throw settled.error;
+  }
+  const verdict = settled.value;
   if (verdict.verdict === 'passed' || verdict.verdict === 'failed') {
     // KF-13a: record one verification receipt per acceptance check before the
     // run-result is appended; any failure fails closed to `gate-unknown`.

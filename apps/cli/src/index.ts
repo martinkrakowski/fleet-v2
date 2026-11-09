@@ -45,6 +45,7 @@ import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
+import { daemonCommand, daemonHelpRequested, DAEMON_HELP, type DaemonCliOptions } from './daemon.js';
 import { telemetryCommand, type TelemetryCliOptions } from './telemetry.js';
 import { killallCommand, type KillallCliOptions } from './commands/killall.js';
 import { reportCommand, type ReportCliOptions } from './report.js';
@@ -66,6 +67,8 @@ import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
 import { mergeCommands } from './merge.js';
+import { relaunchCommands } from './relaunch.js';
+import { releaseCommands } from './release.js';
 import { cutoverCommands } from './commands/cutover.js';
 import { tuiCommand } from './tui/command.js';
 
@@ -268,6 +271,8 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   coordination: coordinationCommands,
   questions: questionsCommands,
   merge: mergeCommands,
+  relaunch: relaunchCommands,
+  release: releaseCommands,
   cutover: cutoverCommands,
 };
 
@@ -637,8 +642,9 @@ doctor prints one check per line (JSON documents with --json). Without
 doctor --host <name> prints only that host's probe subset.
 
 The hosts group manages the installation file's named hosts: list, add,
-edit and remove, each write confirmed and compare-and-swapped, and shows or
-installs the user-scope daemon scheduler units from the daemon section.
+edit, remove and rename, each write confirmed and compare-and-swapped, and
+shows or installs the user-scope daemon scheduler units from the daemon
+section.
 
 The seats group lists the installation file's seats, checks them with the
 loader and the doctor's seat probes (seats list, seats check), and shows or
@@ -657,7 +663,9 @@ flag); run 'fleet-v2 init --help' for its flags.
 state check reads every JSON state store under the state directory and reports
 ok, missing, unreadable or invalid record per file; it never writes. state
 restore replaces a missing or unreadable store from a quarantine copy after
-confirmation; it is CLI only.
+confirmation; it is CLI only. state compact removes finished attempt, journal
+and reservation records no live run references, keeps the last five
+pre-compaction copies in quarantine and checks the stores before and after.
 
 A seat plan lists ordered seats per role (first-pass, fix, review). brief
 prepare --seatPlanFromInstallation builds it from the installation's chains;
@@ -681,21 +689,30 @@ codes only). Run 'fleet-v2 cutover --help'.
 The report group prints the weekly run-journal service report (read-only, one
 JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 
+The relaunch group reports what a relaunch would find, read-only: relaunch
+inventory lists, per lane host, the registered clones' worktrees, the runner's
+state per worktree directory, the conductor's status and each lane's
+population (conducted, attempt-recorded, unrecorded). It writes nothing,
+journals nothing and mutates no worktree.
+
 The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
 
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
-  hosts list|add|edit|remove|daemon
+  hosts list|add|edit|remove|rename|daemon|show
   seats list|check|free-tier [status|on|off] [--yes]
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
-  state check|restore
+  state check|restore|compact
   conductor status|halt|stop|resume|start|run
+  daemon tick|status|pause|resume
   telemetry export|status
   killall [--lift]
   report weekly
+  relaunch inventory [--host <name>]
+  release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
   tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
@@ -740,6 +757,7 @@ export async function runCli(
   telemetryOptions?: TelemetryCliOptions,
   reportOptions?: ReportCliOptions,
   killallOptions?: KillallCliOptions,
+  daemonOptions?: DaemonCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -796,6 +814,35 @@ export async function runCli(
       return await killallCommand(restArgv.slice(1), io, {
         ...killallOptions,
         stateDir: killallOptions?.stateDir ?? stateDir,
+      });
+    }
+    // The daemon group answers help before anything is loaded, and resolves its
+    // own runtime so an invalid installation file never reaches the generic
+    // "installation invalid (<file>)" refusal (which echoes a path) and never
+    // blocks `daemon pause` / `daemon resume`: the merge policy is simply unknown.
+    if (group === 'daemon') {
+      if (daemonHelpRequested(restArgv.slice(1))) {
+        io.stdout(`${DAEMON_HELP}\n`);
+        return 0;
+      }
+      let daemonRuntime: FleetCliRuntime;
+      if (runtime !== undefined) {
+        daemonRuntime = runtime;
+      } else {
+        const loadResult = loadInstallation();
+        daemonRuntime = createFleetCliRuntime(
+          loadResult.status === 'invalid'
+            ? { stateDir, loadInstallationForMergePolicy: () => loadResult }
+            : {
+                stateDir,
+                installation: loadResult.installation,
+                loadInstallationForMergePolicy: () => loadInstallation(),
+              },
+        );
+      }
+      return await daemonCommand(restArgv.slice(1), io, daemonRuntime, {
+        ...daemonOptions,
+        stateDir: daemonOptions?.stateDir ?? stateDir,
       });
     }
     // An explicitly injected runtime stays authoritative; only a call without

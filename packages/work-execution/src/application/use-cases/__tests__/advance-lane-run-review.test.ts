@@ -15,13 +15,23 @@ import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import {
+  laneRunReviewFact,
+  LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS,
+} from '../../../domain/lane-run-review-facts.js';
+import {
   laneRunConductEntry,
   laneRunIntentEntry,
   laneRunResultEntry,
   type LaneRunResultReasonCode,
 } from '../../../domain/lane-run-step-facts.js';
-import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import {
+  nextLaneRunAction,
+  REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
+  type LaneRunDecision,
+} from '../../../domain/lane-run-decider.js';
 import type { SameModelFamily } from '../../../domain/seat-selection.js';
+import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
@@ -42,7 +52,16 @@ import type {
 import type { OpenReviewAssessmentRequest, OpenReviewAssessmentResult } from '../../ports/out/ReviewAssessmentPort.out-port.js';
 import type { AcceptanceAssessmentRequest } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import { reviewFactsOf } from '../advance-lane-run/review-fix.js';
-import type { AdvanceStepContext } from '../advance-lane-run/step-context.js';
+import type { AdvanceStepContext, GatheredLaneRunFacts } from '../advance-lane-run/step-context.js';
+import { ReviewRequestAdapter } from '../../../infrastructure/adapters/ReviewRequestAdapter.adapter.js';
+import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
+import { SECRET_PATTERNS } from '@fleet/shared';
+import type {
+  RequestIndependentReviewRequest,
+  RequestIndependentReviewResult,
+  ReviewReceiptRecord,
+  ReviewUnknownReason,
+} from '@fleet/evidence-and-acceptance';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -450,15 +469,39 @@ async function makeHarness(
   };
 }
 
-async function advance(harness: Harness, overrides: Record<string, unknown> = {}) {
+type PerformDecisionFn = (
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: LaneRunDecision,
+  request: AdvanceLaneRunRequest,
+) => Promise<AdvanceLaneRunResult>;
+
+async function advance(
+  harness: Harness,
+  overrides: Record<string, unknown> & { readonly reviewSeatUnavailablePasses?: number } = {},
+) {
   harness.setJournalBaseline((await harness.runJournal.listForRun(RUN_ID)).length);
+  const { reviewSeatUnavailablePasses, ...requestOverrides } = overrides;
   const useCase = new AdvanceLaneRunUseCase(harness.deps);
+  if (reviewSeatUnavailablePasses !== undefined) {
+    const target = useCase as unknown as { performDecision: PerformDecisionFn };
+    const origPerformDecision = target.performDecision.bind(useCase);
+    target.performDecision = (record, gathered, _decision, request) => {
+      const facts = { ...gathered.facts, reviewSeatUnavailablePasses };
+      return origPerformDecision(
+        record,
+        { ...gathered, facts },
+        nextLaneRunAction(record, facts, request.nowIso),
+        request,
+      );
+    };
+  }
   return useCase.advanceLaneRun({
     runId: RUN_ID,
     lease: { holderId: HOLDER, fence: 1 },
     halted: false,
     nowIso: LATER,
-    ...overrides,
+    ...requestOverrides,
   });
 }
 
@@ -567,7 +610,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
   });
 
-  it('no-receipt retries the same seat once, then moves to the next seat, then parks when the plan is exhausted', async () => {
+  it('no-receipt retries the same seat once, moves to the next seat, waits while a pass counter is below the bound, and parks on the production path when the plan is exhausted', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
     harness.setReviewAnswer(async () => ({ outcome: 'no-receipt', reason: 'review-unavailable', detail: null }));
@@ -597,16 +640,21 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
       result: 'completed',
       reasonCode: 'review-no-receipt',
     });
-    const fourth = await advance(harness);
-    expect(fourth).toEqual({
-      outcome: 'acted',
-      step: 'brief-check',
-      key: reviewKey('brief-check', 1, HEAD12_A, 1),
-      result: 'completed',
-      reasonCode: 'review-no-receipt',
+    // RV4 + PT1d: retries count every remaining review intent of the generation
+    // (`remaining.length - 1`), so after the one budget retry on the first
+    // seat the switched seat's no-receipt gets no second retry; with the seat
+    // plan exhausted the step waits review-seat-unavailable only while a
+    // present reviewSeatUnavailablePasses is below
+    // REVIEW_SEAT_UNAVAILABLE_MAX_PASSES, and parks on the production path
+    // (absent counter) or at the bound.
+    const fourth = await advance(harness, { reviewSeatUnavailablePasses: 0 });
+    expect(fourth).toEqual({ outcome: 'waiting', reason: 'review-seat-unavailable' });
+    const fifth = await advance(harness, {
+      reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1,
     });
-    const fifth = await advance(harness);
-    expect(fifth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+    expect(fifth).toEqual({ outcome: 'waiting', reason: 'review-seat-unavailable' });
+    const sixth = await advance(harness);
+    expect(sixth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
   });
 
   it('journals the fixed detail of a no-receipt result end to end', async () => {
@@ -919,7 +967,7 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
     const first = await advance(harness);
     expect(first).toEqual({ outcome: 'acted', step: 'brief-check', key, result: 'ambiguous', reasonCode: 'review-unknown' });
     const second = await advance(harness);
-    expect(second).toEqual({ outcome: 'acted', step: 'brief-check', key, result: 'reconciled', reasonCode: 'review-passed' });
+    expect(second).toEqual({ outcome: 'acted', step: 'brief-check', key, result: 'reconciled', reasonCode: 'review-passed', detail: 'minor-only-findings' });
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const results = entries.filter((entry) => entry.kind === 'result' && entry.key === key);
     expect(results).toHaveLength(1);
@@ -927,7 +975,7 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
   });
 
-  it('a code-review fail with only minors keeps review-failed: the override is brief-check only', async () => {
+  it('a code-review fail with only minors journals review-passed with the minor-only detail and enters accepting (RV3)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'code-review', NOW);
     harness.setReviewAnswer(async (request) => receiptWith(request, MINOR_ONLY_FINDINGS));
@@ -937,9 +985,10 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
       step: 'code-review',
       key: reviewKey('code-review', 0, HEAD12_A),
       result: 'completed',
-      reasonCode: 'review-failed',
+      reasonCode: 'review-passed',
+      detail: 'minor-only-findings',
     });
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'accepting' });
   });
 
   it('a brief-check fail carrying a major finding still journals review-failed and enters fixing', async () => {
@@ -959,7 +1008,7 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
   });
 
-  it('a failed brief-check receipt with zero findings keeps review-failed (fail closed)', async () => {
+  it('a failed brief-check receipt with zero findings is an unparseable verdict: review-unknown, retried once on the same seat (RV3)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
     harness.setReviewAnswer(async (request) => receiptWith(request, []));
@@ -969,8 +1018,21 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
       step: 'brief-check',
       key: reviewKey('brief-check', 0, HEAD12_A),
       result: 'completed',
-      reasonCode: 'review-failed',
+      reasonCode: 'review-unknown',
+      detail: 'unparseable-verdict',
     });
+    // V7: the unknown verdict retries once on the same seat at the same head —
+    // never `fixing`, never `code-review`.
+    const next = await advance(harness);
+    expect(next).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A) + '/retry1',
+      result: 'completed',
+      reasonCode: 'review-unknown',
+      detail: 'unparseable-verdict',
+    });
+    expect(JSON.stringify(next)).not.toContain('fixing');
   });
 
   it('a brief-check receipt with an unreadable verdict still maps review-unknown (fail closed)', async () => {
@@ -990,13 +1052,14 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
     });
   });
 
-  it('an all-out-of-scope minors-only fail keeps the earlier out-of-scope result untouched', async () => {
+  it('a minor-only fail never records out-of-scope dispositions and journals the minor-only detail (RV3)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
     harness.setReviewAnswer(async (request) => receiptWith(request, [
       { findingId: 'finding-1', severity: 'minor', summary: 'a minor note', filePath: 'src/ex.ts', line: 4 },
       { findingId: 'finding-2', severity: 'nit', summary: 'a nit', filePath: 'src/ex-2.ts', line: 9 },
     ]));
+    let outOfScopeCalls = 0;
     Object.assign(harness.deps, {
       artifactPort: {
         ...harness.deps.artifactPort,
@@ -1004,7 +1067,10 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
       },
       reviewRequest: {
         ...harness.deps.reviewRequest,
-        recordOutOfScope: async () => ({ outcome: 'recorded' }) as const,
+        recordOutOfScope: async () => {
+          outOfScopeCalls += 1;
+          return { outcome: 'recorded' } as const;
+        },
       },
     });
     const result = await advance(harness);
@@ -1014,8 +1080,10 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
       key: reviewKey('brief-check', 0, HEAD12_A),
       result: 'completed',
       reasonCode: 'review-passed',
-      detail: 'out-of-scope-findings',
+      detail: 'minor-only-findings',
     });
+    // A minor-only receipt never records any out-of-scope disposition.
+    expect(outOfScopeCalls).toBe(0);
   });
 });
 
@@ -1478,5 +1546,794 @@ describe('AdvanceLaneRunUseCase review acts scope dispositions (KF-33b2)', () =>
       },
     ]);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'opening-pr' });
+  });
+});
+
+describe('review cause codes reach the run journal (RV2)', () => {
+  /** The secret shapes the journal must never echo (the shared registry). */
+  const SECRET_REGEXES: readonly RegExp[] = SECRET_PATTERNS;
+
+  function unknownReceipt(
+    request: RequestIndependentReviewRequest,
+    unknownReason?: string,
+  ): ReviewReceiptRecord {
+    return {
+      id: 'rcpt-' + request.requestId,
+      assessmentId: 'asm-1',
+      projectId: 'project-example-1',
+      attemptId: request.attemptId,
+      candidateHeadSha: request.candidateHeadSha,
+      reviewerModel: request.reviewerModel,
+      implementerModel: request.implementerModel,
+      readOnlyVerified: true,
+      result: 'unknown',
+      findings: [],
+      evidenceRef: 'evidence-ref-1',
+      policyRevision: 'policy-example-1',
+      completedAtIso: NOW,
+      kind: 'brief-check',
+      requestId: request.requestId,
+      ...(unknownReason !== undefined ? { unknownReason: unknownReason as ReviewUnknownReason } : {}),
+    };
+  }
+
+  /** An adapter whose evidence delegate answers each request with the given result. */
+  function adapterAnswering(
+    answer: (request: RequestIndependentReviewRequest) => Promise<RequestIndependentReviewResult>,
+  ): ReviewRequestAdapter {
+    return new ReviewRequestAdapter({
+      requestIndependentReview: (request) => answer(request),
+    });
+  }
+
+  /** The secret-bearing prose a hostile reviewer answer or transport carries. */
+  const HOSTILE_REASON =
+    'The reviewer said: use token ghp_' + 'a'.repeat(36) + ' or sk-' + 'a'.repeat(24) +
+    ', see /worktrees/wo-example-1/wt/diff.ts for details';
+
+  async function lastResultEntry(harness: Harness) {
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const results = entries.filter((entry) => entry.outcome !== null);
+    return results[results.length - 1] ?? null;
+  }
+
+  for (const unknownReason of ['empty', 'unparseable-verdict', 'no-findings-on-fail']) {
+    it(`journals an unknown receipt with unknownReason '${unknownReason}' as review-unknown detail`, async () => {
+      const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+      await conduct(harness, 'brief-check', NOW);
+      Object.assign(harness.deps, {
+        reviewRequest: adapterAnswering(async (request) => ({
+          outcome: 'reviewed',
+          receipt: unknownReceipt(request, unknownReason),
+        })),
+      });
+      const result = await advance(harness);
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'brief-check',
+        key: reviewKey('brief-check', 0, HEAD12_A),
+        result: 'completed',
+        reasonCode: 'review-unknown',
+        detail: unknownReason,
+      });
+      expect(await lastResultEntry(harness)).toMatchObject({
+        outcome: 'completed',
+        reasonCode: 'review-unknown',
+        detail: unknownReason,
+      });
+    });
+  }
+
+  for (const code of ['timeout', 'transport'] as const) {
+    it(`journals an unavailable review with code '${code}' without echoing the hostile reason`, async () => {
+      const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+      await conduct(harness, 'brief-check', NOW);
+      Object.assign(harness.deps, {
+        reviewRequest: adapterAnswering(async () => ({
+          outcome: 'rejected',
+          reason: HOSTILE_REASON,
+          rejection: 'review-unavailable' as const,
+          code,
+        })),
+      });
+      // U3: transport proves the seat was never reached and journals seat-busy;
+      // timeout means the seat ran to timeout and still journals review-no-receipt.
+      const reasonCode = code === 'transport' ? 'seat-busy' : 'review-no-receipt';
+      const result = await advance(harness);
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'brief-check',
+        key: reviewKey('brief-check', 0, HEAD12_A),
+        result: 'completed',
+        reasonCode,
+        detail: code,
+      });
+      expect(await lastResultEntry(harness)).toMatchObject({
+        outcome: 'completed',
+        reasonCode,
+        detail: code,
+      });
+    });
+  }
+
+  it('robustness (3): reconcileReview after a mid-step crash recovers unknownReason into the journal once', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    // The first advance's delegate throws: the intent (with the minted request
+    // id) is journalled, nothing is established.
+    Object.assign(harness.deps, {
+      reviewRequest: adapterAnswering(async () => {
+        throw new Error('delegate-failed');
+      }),
+    });
+    const key = reviewKey('brief-check', 0, HEAD12_A);
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'ambiguous',
+      reasonCode: 'review-unknown',
+    });
+
+    // The request id the intent minted before the crash.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intent = entries.find((entry) => entry.mintedId !== null && entry.key === key);
+    expect(intent).toBeDefined();
+    const mintedRequestId = intent!.mintedId!;
+
+    // After the crash the receipt (with its unknownReason) is found by request id.
+    Object.assign(harness.deps, {
+      reviewRequest: new ReviewRequestAdapter({
+        inspectAcceptanceEvidence: async (request) => ({
+          outcome: 'found',
+          assessment: {
+            id: request.assessmentId ?? 'asm-1',
+            projectId: 'project-example-1',
+            attemptId: 'attempt-example-1',
+            candidateHeadSha: COMMIT_A,
+            policyRevision: 'policy-example-1',
+            implementerModel: 'model-example-1',
+            requiredChecks: [],
+            state: 'pending',
+            verificationReceipts: [],
+            reviewReceipts: [
+              unknownReceipt(
+                {
+                  assessmentId: 'asm-1',
+                  projectId: 'project-example-1',
+                  attemptId: 'attempt-example-1',
+                  candidateHeadSha: COMMIT_A,
+                  policyRevision: 'policy-example-1',
+                  implementerModel: 'model-example-1',
+                  reviewerModel: 'review-model-1',
+                  requestId: mintedRequestId,
+                },
+                'no-findings-on-fail',
+              ),
+            ],
+            findingDispositions: [],
+            acceptanceReceiptId: null,
+            blockers: [],
+            revision: 1,
+            updatedAtIso: NOW,
+          },
+        }),
+        requestIndependentReview: async () => {
+          throw new Error('requestReview is never called by the reconcile');
+        },
+      }),
+    });
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'reconciled',
+      reasonCode: 'review-unknown',
+      detail: 'no-findings-on-fail',
+    });
+    // The journal records the recovered cause exactly once as the result entry.
+    const allEntries = await harness.runJournal.listForRun(RUN_ID);
+    const recovered = allEntries.filter(
+      (entry) =>
+        entry.outcome !== null &&
+        entry.key === key &&
+        entry.reasonCode === 'review-unknown' &&
+        entry.detail === 'no-findings-on-fail',
+    );
+    expect(recovered).toHaveLength(1);
+  });
+
+  it('robustness (5): journal detail records fixed cause codes only and never echoes answer prose, paths, or secret-shaped strings', async () => {
+    // A hostile unknownReason is dropped to a null detail, not echoed.
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    Object.assign(harness.deps, {
+      reviewRequest: adapterAnswering(async (request) => ({
+        outcome: 'reviewed',
+        receipt: unknownReceipt(request, 'Answer: ghp_' + 'a'.repeat(36) + ' /worktrees/x'),
+      })),
+    });
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-unknown',
+    });
+    expect(await lastResultEntry(harness)).toMatchObject({
+      outcome: 'completed',
+      reasonCode: 'review-unknown',
+      detail: null,
+    });
+
+    // An undeclared enum value is dropped too.
+    const enumHarness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(enumHarness, 'brief-check', NOW);
+    Object.assign(enumHarness.deps, {
+      reviewRequest: adapterAnswering(async (request) => ({
+        outcome: 'reviewed',
+        receipt: unknownReceipt(request, 'unknown-enum'),
+      })),
+    });
+    expect(await advance(enumHarness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-unknown',
+    });
+    expect(await lastResultEntry(enumHarness)).toMatchObject({ detail: null });
+
+    // Across every entry of every run journalled here, no detail ever holds a
+    // secret shape, a path, or a non-journal token.
+    for (const runHarness of [harness, enumHarness]) {
+      const entries = await runHarness.runJournal.listForRun(RUN_ID);
+      for (const entry of entries) {
+        expect(entry.detail === null || LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(entry.detail)).toBe(true);
+        const serialized = JSON.stringify(entry);
+        for (const pattern of SECRET_REGEXES) {
+          expect(pattern.test(serialized), entry.detail ?? 'null-detail').toBe(false);
+        }
+        expect(serialized).not.toContain('/worktrees/');
+      }
+    }
+  });
+
+  it('robustness (1): ReviewRequestAdapter refuses null, non-object, wrong-typed fields, sparse arrays, unknown unknownReason, and throwing getters without throwing', async () => {
+    const adapter = adapterAnswering(async () => ({
+      outcome: 'rejected' as const,
+      reason: 'unused',
+      rejection: 'review-unavailable' as const,
+      code: 'transport-failed' as const,
+    }));
+    const hostile = Object.defineProperty({}, 'requestId', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    const badRequests: unknown[] = [
+      null,
+      42,
+      'x',
+      [],
+      hostile,
+      { requestId: 123, kind: 'brief-check', attemptId: 'a', projectId: 'p', candidateHeadSha: COMMIT_A, policyRevision: 'pol', implementerModel: 'i', reviewerModel: 'r' },
+      { requestId: 'ok-id', kind: 'brief-check', attemptId: 'a', projectId: 'p', candidateHeadSha: 'not-a-sha', policyRevision: 'pol', implementerModel: 'i', reviewerModel: 'r' },
+    ];
+    for (const bad of badRequests) {
+      const refused = await adapter.requestReview(bad as never);
+      expect(refused).toEqual({ outcome: 'refused', reason: 'invalid-request', detail: null });
+      const findRefused = await adapter.findReviewReceipt(bad as never);
+      expect(findRefused).toEqual({ outcome: 'unavailable', reason: 'invalid-request' });
+    }
+
+    // A sparse findingIds array is refused, never thrown.
+    const sparseIds = ['finding-1'] as unknown as string[];
+    delete (sparseIds as unknown as Record<string, unknown>)[0];
+    await expect(
+      adapter.recordOutOfScope!({
+        attemptId: 'attempt-example-1',
+        candidateHeadSha: COMMIT_A,
+        findingIds: sparseIds,
+      }),
+    ).resolves.toEqual({ outcome: 'refused' });
+    await expect(
+      adapter.recordOutOfScope!(null as never),
+    ).resolves.toEqual({ outcome: 'refused' });
+  });
+
+  it('RV2 fix (Luna 1): a findingIds array with a hole is refused before any disposition is recorded', async () => {
+    const recorded: unknown[] = [];
+    const adapter = new ReviewRequestAdapter({
+      recordFindingDisposition: async (request) => {
+        recorded.push(request);
+        return { outcome: 'recorded' } as never;
+      },
+    });
+    const holey = new Array(1) as unknown as string[];
+    await expect(
+      adapter.recordOutOfScope!({ attemptId: 'a', candidateHeadSha: COMMIT_A, findingIds: holey }),
+    ).resolves.toEqual({ outcome: 'refused' });
+    const mixed = ['finding-1', 'finding-2'] as unknown as string[];
+    delete (mixed as unknown as Record<string, unknown>)[1];
+    await expect(
+      adapter.recordOutOfScope!({ attemptId: 'a', candidateHeadSha: COMMIT_A, findingIds: mixed }),
+    ).resolves.toEqual({ outcome: 'refused' });
+    await expect(
+      adapter.recordOutOfScope!({ attemptId: 'a', candidateHeadSha: COMMIT_A, findingIds: [7 as never] }),
+    ).resolves.toEqual({ outcome: 'refused' });
+    expect(recorded).toEqual([]);
+  });
+
+  it('RV2 fix (Luna 2): a throwing optional field getter is invalid-request on the attempt and the chain path', async () => {
+    let delegateCalls = 0;
+    const adapter = adapterAnswering(async () => {
+      delegateCalls += 1;
+      return { outcome: 'rejected' as const, reason: 'unused', rejection: 'review-unavailable' as const, code: 'transport-failed' as const };
+    });
+    const throwing = (target: object, key: string): object =>
+      Object.defineProperty(target, key, {
+        get() {
+          throw new Error('boom');
+        },
+        enumerable: true,
+      });
+    const attempt = {
+      requestId: 'req-1', kind: 'brief-check', attemptId: 'a', projectId: 'p', candidateHeadSha: COMMIT_A,
+      policyRevision: 'pol', implementerModel: 'i', reviewerModel: 'r',
+    };
+    const chain = {
+      requestId: 'req-2', kind: 'pre-merge', attemptId: 'a', projectId: 'p', candidateHeadSha: COMMIT_A,
+      policyRevision: 'pol', implementerModel: 'i', reviewerModel: 'r',
+      subject: { kind: 'chain', projectId: 'p', chainName: 'rv2', integrationHeadSha: COMMIT_A },
+    };
+    for (const request of [
+      throwing({ ...attempt }, 'briefText'),
+      throwing({ ...attempt }, 'nowIso'),
+      throwing({ ...chain }, 'diffSummary'),
+      throwing({ ...chain }, 'nowIso'),
+      throwing({ ...chain }, 'policyRevision'),
+    ]) {
+      await expect(adapter.requestReview(request as never)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+        detail: null,
+      });
+    }
+    expect(delegateCalls).toBe(0);
+  });
+
+  it('RV2 fix (Luna 4): a receipt whose findings are not plain objects is a receipt-mismatch', async () => {
+    const adapter = adapterAnswering(async (request) => ({
+      outcome: 'reviewed' as const,
+      receipt: {
+        ...unknownReceipt(request, undefined),
+        result: 'fail' as const,
+        findings: [new Date()] as never,
+      },
+    }));
+    const result = await adapter.requestReview({
+      requestId: 'req-3', kind: 'brief-check', attemptId: 'a', projectId: 'p', candidateHeadSha: COMMIT_A,
+      policyRevision: 'pol', implementerModel: 'i', reviewerModel: 'r',
+    } as never);
+    expect(result).toEqual({ outcome: 'unknown', reason: 'receipt-mismatch' });
+  });
+
+  it('RV4: seat-busy is idempotent under the same key and opens the next free retry key', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    // The seat is busy for the first review, then frees: the retry succeeds.
+    let reviewCalls = 0;
+    harness.setReviewAnswer(async (request) => {
+      reviewCalls += 1;
+      if (reviewCalls === 1) {
+        return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'seat-busy' };
+      }
+      return { outcome: 'receipt', receipt: receiptFor(request, 'passed') };
+    });
+
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'seat-busy',
+    });
+
+    // The base key has exactly one intent, never appended twice.
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    const baseIntents = entries.filter(
+      (entry) => entry.kind === 'intent' && entry.key === reviewKey('brief-check', 0, HEAD12_A),
+    );
+    expect(baseIntents).toHaveLength(1);
+
+    // The seat-busy result is not a second verdict: the next pass opens the
+    // next free retry key instead of parking or reusing the same key.
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    const retryIntents = entries.filter(
+      (entry) => entry.kind === 'intent' && entry.key === reviewKey('brief-check', 0, HEAD12_A, 1),
+    );
+    expect(retryIntents).toHaveLength(1);
+  });
+
+  it('RV4: unknown worktree status does not dispatch and does not abort', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+
+    let inspectCalls = 0;
+    let abortCalls = 0;
+    const deps: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      runnerForAttempt: {
+        runnerForAttempt: () => ({
+          ok: true,
+          runner: {
+            inspectWorktreeRun: async () => {
+              inspectCalls += 1;
+              return { state: 'unknown', reason: 'status unreadable' };
+            },
+            abortWorktreeRun: async () => {
+              abortCalls += 1;
+              return { outcome: 'aborted', endedAtIso: LATER };
+            },
+          } as never,
+        }),
+      },
+    };
+    harness.setJournalBaseline((await harness.runJournal.listForRun(RUN_ID)).length);
+    const useCase = new AdvanceLaneRunUseCase(deps);
+    const result = await useCase.advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+
+    expect(result).toEqual({ outcome: 'waiting', reason: 'facts-inconsistent' });
+    expect(inspectCalls).toBe(1);
+    expect(abortCalls).toBe(0);
+    expect(harness.reviewRequests).toHaveLength(0);
+    // Nothing was written: the journal holds only the conduct entry.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries).toHaveLength(1);
+  });
+
+  it('RV4: a running session matching the collected attempt is aborted; a non-aborted abort waits review-pending', async () => {
+    const collected = { ...collectedAttempt(), sessionId: 'session-match' };
+
+    // Matching session, abort succeeds: the review proceeds on the free base key.
+    const abortedHarness = await makeHarness(runRecord(), [collected]);
+    await conduct(abortedHarness, 'brief-check', NOW);
+    const abortedDeps: AdvanceLaneRunDependencies = {
+      ...abortedHarness.deps,
+      runnerForAttempt: {
+        runnerForAttempt: () => ({
+          ok: true,
+          runner: {
+            inspectWorktreeRun: async () => ({ state: 'running', sessionId: 'session-match' }),
+            abortWorktreeRun: async () => ({ outcome: 'aborted', endedAtIso: LATER }),
+          } as never,
+        }),
+      },
+    };
+    abortedHarness.setJournalBaseline((await abortedHarness.runJournal.listForRun(RUN_ID)).length);
+    const abortedUseCase = new AdvanceLaneRunUseCase(abortedDeps);
+    const aborted = await abortedUseCase.advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(aborted).toMatchObject({ outcome: 'acted', step: 'brief-check', reasonCode: 'review-passed' });
+    expect(abortedHarness.reviewRequests).toHaveLength(1);
+
+    // Matching session but the abort stays running: review-pending, nothing written.
+    const runningHarness = await makeHarness(runRecord(), [collected]);
+    await conduct(runningHarness, 'brief-check', NOW);
+    const runningDeps: AdvanceLaneRunDependencies = {
+      ...runningHarness.deps,
+      runnerForAttempt: {
+        runnerForAttempt: () => ({
+          ok: true,
+          runner: {
+            inspectWorktreeRun: async () => ({ state: 'running', sessionId: 'session-match' }),
+            abortWorktreeRun: async () => ({ outcome: 'still-running', reason: 'still there' }),
+          } as never,
+        }),
+      },
+    };
+    runningHarness.setJournalBaseline((await runningHarness.runJournal.listForRun(RUN_ID)).length);
+    const runningUseCase = new AdvanceLaneRunUseCase(runningDeps);
+    const running = await runningUseCase.advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(running).toEqual({ outcome: 'waiting', reason: 'review-pending' });
+    expect(runningHarness.reviewRequests).toHaveLength(0);
+    expect(await runningHarness.runJournal.listForRun(RUN_ID)).toHaveLength(1);
+  });
+});
+
+describe('transport no-receipt budget exemption and unreachable bound (U3 / F189)', () => {
+  it('transport no-receipts spend no retry budget and the run does not park', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => ({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'transport',
+    }));
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'transport',
+    });
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'transport',
+    });
+    // Two back-to-back transports left the fact at none: zero retry budget spent.
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'none',
+      seatIndex: null,
+      retries: 0,
+    });
+    // A pass on /retry2 closes the brief-check with retries 0 and enters code-review.
+    harness.setReviewAnswer(async (request) => ({ outcome: 'receipt', receipt: receiptFor(request, 'passed') }));
+    const third = await advance(harness);
+    expect(third).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 2),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'passed',
+      seatIndex: 0,
+      retries: 0,
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
+  });
+
+  it('genuine no-receipts from a reached seat still spend the retry budget', async () => {
+    // timeout, null and route-no-auth-file still journal review-no-receipt.
+    for (const detail of ['timeout', null, 'route-no-auth-file'] as const) {
+      const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+      await conduct(harness, 'brief-check', NOW);
+      harness.setReviewAnswer(async () => ({
+        outcome: 'no-receipt',
+        reason: 'review-unavailable',
+        detail,
+      }));
+      const result = await advance(harness);
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'brief-check',
+        key: reviewKey('brief-check', 0, HEAD12_A),
+        result: 'completed',
+        reasonCode: 'review-no-receipt',
+        ...(detail !== null ? { detail } : {}),
+      });
+    }
+    // Even after a free transport attempt, two genuine timeouts still exhaust the budget.
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    let calls = 0;
+    harness.setReviewAnswer(async () => {
+      calls += 1;
+      if (calls === 2) {
+        return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'transport' };
+      }
+      return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'timeout' };
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-no-receipt',
+      detail: 'timeout',
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'transport',
+    });
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 0,
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 2),
+      result: 'completed',
+      reasonCode: 'review-no-receipt',
+      detail: 'timeout',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+    expect(calls).toBe(3);
+  });
+
+  it('an unreachable seat cannot retry unboundedly: four attempts hit the bound and park without a fifth request', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    let reviewCalls = 0;
+    harness.setReviewAnswer(async () => {
+      reviewCalls += 1;
+      return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'transport' };
+    });
+    for (let i = 0; i < LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS; i += 1) {
+      const result = await advance(harness);
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'brief-check',
+        key: reviewKey('brief-check', 0, HEAD12_A, i === 0 ? null : i),
+        result: 'completed',
+        reasonCode: 'seat-busy',
+        detail: 'transport',
+      });
+    }
+    expect(reviewCalls).toBe(LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+    // The fifth advance parks without calling requestReview a fifth time.
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+    expect(reviewCalls).toBe(LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS);
+  });
+
+  it('the bound also stops a run with one reached timeout followed by four transport failures', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    let calls = 0;
+    harness.setReviewAnswer(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'timeout' };
+      }
+      return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'transport' };
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-no-receipt',
+      detail: 'timeout',
+    });
+    for (let i = 0; i < LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS; i += 1) {
+      const result = await advance(harness);
+      expect(result).toMatchObject({ result: 'completed', reasonCode: 'seat-busy', detail: 'transport' });
+    }
+    expect(calls).toBe(1 + LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+  });
+
+  it('a resumed / review-retry generation boundary resets the unreachable window', async () => {
+    const mint = makeUlidMinter();
+    const before = '2026-10-27T10:01:00.000Z';
+    const resumedAt = '2026-10-27T10:02:00.000Z';
+    const after = '2026-10-27T10:03:00.000Z';
+    const transportResultOf = (key: string, at: string): LaneRunJournalEntryRecord =>
+      laneRunResultEntry(mint(), RUN_ID, key, 'completed', 'seat-busy', at, 'transport');
+    const entries: LaneRunJournalEntryRecord[] = [];
+    for (let i = 0; i < LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS; i += 1) {
+      const key = reviewKey('brief-check', 0, HEAD12_A, i === 0 ? null : i);
+      entries.push(laneRunIntentEntry(mint(), RUN_ID, key, null, before));
+      entries.push(transportResultOf(key, before));
+    }
+    // Four transports closed the first window.
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+    // An operator resume / review-retry result advances the generation boundary.
+    entries.push(laneRunResultEntry(mint(), RUN_ID, 'resume@test', 'completed', 'resumed', resumedAt, 'review-retry'));
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'none',
+      seatIndex: null,
+      retries: 0,
+    });
+    // The next transport starts a fresh 4-attempt window.
+    for (let i = 0; i < LANE_RUN_REVIEW_UNREACHABLE_MAX_ATTEMPTS; i += 1) {
+      const key = reviewKey('brief-check', 0, HEAD12_A, 4 + i);
+      entries.push(laneRunIntentEntry(mint(), RUN_ID, key, null, after));
+      entries.push(transportResultOf(key, after));
+    }
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'no-receipt',
+      seatIndex: 0,
+      retries: 1,
+    });
+  });
+
+  it('existing seat-busy behaviour is unchanged: free, and a later pass opens /retry1 with retries 0', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => ({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'seat-busy',
+    }));
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'seat-busy',
+    });
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'none',
+      seatIndex: null,
+      retries: 0,
+    });
+    harness.setReviewAnswer(async (request) => ({ outcome: 'receipt', receipt: receiptFor(request, 'passed') }));
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(laneRunReviewFact(entries, RUN_ID, 'brief-check', HEAD12_A)).toEqual({
+      verdict: 'passed',
+      seatIndex: 0,
+      retries: 0,
+    });
   });
 });

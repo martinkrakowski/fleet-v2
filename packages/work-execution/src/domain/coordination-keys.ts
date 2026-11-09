@@ -21,6 +21,23 @@ export function forgeActionPushesBranch(kind: ForgeActionKind): boolean {
 export const FORGE_REFUSAL_KINDS = ['conflict', 'protection', 'permission', 'other'] as const;
 export type ForgeRefusalKind = (typeof FORGE_REFUSAL_KINDS)[number];
 
+/**
+ * Release actions an owner grant may authorize (cutover row CO14). Each is its
+ * own coordination scope (`release:install`, `release:swap`,
+ * `release:rollback`), never a forge scope, so a forge grant never authorizes a
+ * release and a grant for one release action never authorizes another.
+ */
+export const RELEASE_ACTION_KINDS = ['release-install', 'release-swap', 'release-rollback'] as const;
+export type ReleaseActionKind = (typeof RELEASE_ACTION_KINDS)[number];
+
+/** Every action kind an `ActionAuthorizationPort` grant may be resolved for. */
+export type AuthorizedActionKind = ForgeActionKind | ReleaseActionKind;
+
+/** The coordination scope of one release action kind; null for any other kind. */
+export function releaseActionScope(kind: string): string | null {
+  return (RELEASE_ACTION_KINDS as readonly string[]).includes(kind) ? `release:${kind.slice('release-'.length)}` : null;
+}
+
 /** Deterministic coordination action scope for one forge action kind. */
 export function forgeActionScope(kind: ForgeActionKind | string): string {
   return `forge:${kind}`;
@@ -34,4 +51,20 @@ export function consumptionId(actionId: string): string {
 /** Deterministic observation event kind for an execution action and status. */
 export function observationEventKind(action: string, status: string): string {
   return `execution:${action}:${status}`;
+}
+
+/**
+ * C2': the coordination action scope for removing one attempt's unsealed
+ * worktree. It binds to the attempt and to the exact worktree path digest (a
+ * SHA-256 of the absolute path, computed by the caller), so a different
+ * worktree — or a moved path — is a different scope, and no filesystem path
+ * is ever placed into coordination state or output.
+ */
+export function unsealedWorktreeRemovalScope(attemptId: string, worktreePathSha256: string): string {
+  return `worktree:remove-unsealed:${attemptId}:${worktreePathSha256}`;
+}
+
+/** Deterministic consumption identifier for one unsealed worktree removal. */
+export function unsealedWorktreeRemovalActionId(runId: string, attemptId: string): string {
+  return `reap-unsealed:${runId}:${attemptId}`;
 }

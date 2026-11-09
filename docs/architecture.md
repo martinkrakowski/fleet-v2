@@ -62,6 +62,48 @@ Notes are bounded candidate claims collected after authoritative lane end. Keepe
 require checked scope and provenance. Policy proposals are not memory entries.
 Retrieval proposes context; the orchestrator decides what enters the frozen brief.
 
+## Model access
+
+Seats reach a model through one runner port, never by calling a vendor directly
+from application code. A runner is infrastructure: domain and application code
+depend only on the port, and no provider client, subprocess or vendor database
+appears above it.
+
+The port covers five things and nothing more: seat capability, dispatch,
+liveness, cost and verdict decoding. Adapters implement it for two different
+shapes of work.
+
+- An **agent-CLI runner** drives an existing agent tool as a subprocess for
+  multi-step work that reads and edits files and runs commands. It owns the
+  sandbox, the tool permissions and the step budget.
+- A **provider-API runner** makes a single typed call for work that needs no
+  tools: a review of a diff already embedded in the prompt, a per-item
+  judgement, a capability probe. Its answers are decoded against a schema, so a
+  missing or malformed verdict is a parse failure rather than something a caller
+  must notice.
+
+The agent-CLI adapters stay fully supported and are the default. A deployment
+that already runs one of these tools keeps working as configured, needs no
+provider credential of its own, and selects the provider-API runner only by
+opting in. Credentials stay out of agents and out of lane sandboxes; the
+host-side key proxy named above remains the provider boundary, and the
+provider-API runner is pointed at it rather than holding a key.
+
+Two rules keep the abstraction honest.
+
+- **Capability is declared, never inferred.** An adapter that cannot enforce a
+  schema, or cannot report real spend because it draws on a plan quota, says so.
+  Callers degrade explicitly. The port must not present a uniform surface that
+  hides a difference a caller needs to act on.
+- **A dispatch probe is the only evidence that a seat exists.** A provider's
+  model listing is filtered by the credentials configured where it runs, so an
+  absence in a catalogue is not an absence upstream, and a presence is not proof
+  of authorization. Capability is a probe result.
+
+Every adapter passes one conformance suite. Several supported backends without
+shared contract tests decay into one tested path and several that are quietly
+broken, so the suite is a condition of adding an adapter, not a follow-up.
+
 ## Migration sequence
 
 1. Refine typed contracts for brief preparation, runner start/inspection, worktree

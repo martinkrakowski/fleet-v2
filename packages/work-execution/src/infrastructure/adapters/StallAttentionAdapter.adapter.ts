@@ -23,7 +23,9 @@ import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.
 import type {
   ClearStallAttentionCommand,
   ClearStallAttentionResult,
+  ListOpenRunAttentionResult,
   ListOpenStallAttentionResult,
+  OpenRunAttentionItem,
   RaiseStallAttentionCommand,
   RaiseStallAttentionResult,
   StallAttentionPort,
@@ -36,12 +38,13 @@ const CLEAR_VIA = 'machine';
 const AGE_BUCKET_MINUTES = 5;
 const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORK_ORDER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const ATTENTION_KIND_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 
 export interface StallAttentionDelegate {
   readonly recordAttentionItem?: (body: unknown, actor: string) => Promise<unknown>;
   readonly clearAttentionItem?: (request: unknown, via: string, actor: string) => Promise<unknown>;
   readonly listAttentionItems?: (request: {
-    readonly kind: string;
+    readonly kind?: string;
     readonly state: 'open';
   }) => Promise<unknown>;
 }
@@ -76,6 +79,10 @@ function validProjectId(value: unknown): value is string {
 
 function validWorkOrderId(value: unknown): value is string {
   return typeof value === 'string' && WORK_ORDER_ID_PATTERN.test(value) && !containsSecretShape(value);
+}
+
+function validAttentionKind(value: unknown): value is string {
+  return typeof value === 'string' && ATTENTION_KIND_PATTERN.test(value) && !containsSecretShape(value);
 }
 
 function summaryOf(runId: string, workOrderId: string, parkClass: string, ageMinutes: number): string {
@@ -226,6 +233,84 @@ export class StallAttentionAdapter implements StallAttentionPort {
       return { outcome: 'found', items };
     } catch {
       return { outcome: 'unavailable' };
+    }
+  }
+
+  /**
+   * U7: every open attention item whose subject is a run, across all item
+   * kinds. Lists with no kind filter so park notices and any later run-scoped
+   * kind come through the same read. An unreadable store is a value, never a
+   * throw; entries whose ids or kind fail screening are dropped.
+   */
+  async listOpenRunAttention(): Promise<ListOpenRunAttentionResult> {
+    try {
+      const list = this.delegate?.listAttentionItems;
+      if (list === undefined) {
+        return { outcome: 'unavailable' };
+      }
+      const answer = await list({ state: 'open' });
+      const entries = ownValue(answer, 'items');
+      if (!Array.isArray(entries)) {
+        return { outcome: 'unavailable' };
+      }
+      const items: OpenRunAttentionItem[] = [];
+      for (const entry of entries) {
+        const item = ownValue(entry, 'item');
+        const projectId = ownValue(item, 'projectId');
+        const kind = ownValue(item, 'kind');
+        const subject = ownValue(item, 'subject');
+        const runId = ownValue(subject, 'ref');
+        if (ownValue(subject, 'kind') === 'run' && validProjectId(projectId) && validAttentionKind(kind) && validRunId(runId)) {
+          items.push({ projectId, kind, runId });
+        }
+      }
+      return { outcome: 'found', items };
+    } catch {
+      return { outcome: 'unavailable' };
+    }
+  }
+
+  /**
+   * U7: resolve one open run-subject attention item by key as `resolved` via
+   * `machine`, whatever its kind. The store never deletes: the item moves to
+   * `cleared` and keeps its audit record. A refused or thrown delegate call is
+   * a refusal value; the adapter never throws.
+   */
+  async resolveRunAttention(raw: OpenRunAttentionItem): Promise<ClearStallAttentionResult> {
+    try {
+      const projectId = ownValue(raw, 'projectId');
+      const kind = ownValue(raw, 'kind');
+      const runId = ownValue(raw, 'runId');
+      if (!validProjectId(projectId) || !validAttentionKind(kind) || !validRunId(runId)) {
+        return { outcome: 'refused', reasonCode: 'invalid-request' };
+      }
+      const clear = this.delegate?.clearAttentionItem;
+      if (clear === undefined) {
+        return { outcome: 'refused', reasonCode: 'not-configured' };
+      }
+      const answer = await clear(
+        {
+          action: 'resolve',
+          projectId,
+          kind,
+          subject: { kind: 'run', ref: runId },
+          reason: 'resolved',
+        },
+        CLEAR_VIA,
+        STALL_ATTENTION_ACTOR,
+      );
+      if (
+        isPlainObject(answer) &&
+        (answer.outcome === 'cleared' || answer.outcome === 'unchanged' || answer.outcome === 'not-found')
+      ) {
+        return { outcome: answer.outcome, reasonCode: null };
+      }
+      if (isPlainObject(answer) && answer.outcome === 'refused') {
+        return { outcome: 'refused', reasonCode: typeof answer.code === 'string' ? answer.code : 'unreadable' };
+      }
+      return { outcome: 'refused', reasonCode: 'unreadable' };
+    } catch {
+      return { outcome: 'refused', reasonCode: 'unreadable' };
     }
   }
 }

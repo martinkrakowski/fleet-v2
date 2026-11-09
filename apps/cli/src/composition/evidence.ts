@@ -10,6 +10,7 @@ import {
   AssessHeadAcceptanceUseCase,
   AttemptOwnerDecisionAdapter,
   createReviewTransportRouter,
+  resolveApiReviewSettings,
   EvidenceArchiveAdapter,
   EvidenceAssessmentRepositoryAdapter,
   EvidenceSeatPolicyAdapter,
@@ -109,6 +110,13 @@ export function composeEvidence(input: ComposeEvidenceInput) {
           return locator.locate(attemptId);
         },
         ocmRunBin: ocmRunBin ?? defaultOcmRunPath(),
+        // The api transport's endpoint and its declared schema enforcement.
+        // Environmental like FLEET_OCM_RUN_BIN: it names the host-side key
+        // proxy, not routing. Absent leaves an `api` seat refusing, which is
+        // what it should do when nothing is configured.
+        // The runtime's own env object, which tests inject; the sibling
+        // resolveRunnerSettings call honours it the same way.
+        ...resolveApiReviewSettings(options?.env ?? process.env),
         ...(options?.reviewSpawn !== undefined ? { ocmSpawn: options.reviewSpawn } : {}),
       }),
     });

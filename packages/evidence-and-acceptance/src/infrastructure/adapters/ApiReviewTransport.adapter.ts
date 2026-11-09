@@ -30,7 +30,7 @@
  * the brief are wrapped with the same rules the other transports use.
  */
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewFindingRecord, ReviewUnknownReason } from '../../domain/evidence-records.js';
@@ -506,7 +506,7 @@ function classifyProviderFailure(error: unknown): { readonly reason: string; rea
  * caller-supplied nonce. The brief rule stays immediately above the brief block
  * because it says "below".
  */
-function buildPrompt(request: RunIndependentReviewRequest, diff: string, nonce: string): string {
+function buildPrompt(request: RunIndependentReviewRequest, diff: string, nonce: string, _headSha: string): string {
   const sections: string[] = [wrapUntrusted({ label: 'diff', text: diff, nonce })];
   if (request.briefText !== undefined && request.briefText.trim() !== '') {
     sections.push(BRIEF_INPUT_RULE, wrapUntrusted({ label: 'brief', text: request.briefText, nonce }));
@@ -585,14 +585,25 @@ export function createApiReviewTransport(
       throw new ReviewTransportError('The brief is larger than this transport forwards', 'transport-failed');
     }
 
-    const makeNonce = options.makeNonce ?? ((): string => randomBytes(16).toString('hex'));
-    const nonce = makeNonce();
+    // Default nonce is derived from the head under review so two reviews of the same
+    // head produce byte-identical prompts up to the diff's closing marker. The
+    // nonce's only job is that untrusted text cannot forge the fence; the untrusted
+    // text here is content committed before its own sha existed, so writing the
+    // fence into it needs a preimage of that sha; and `defangMarkerLikeTokens`
+    // already rewrites `<<<` inside the text, making the nonce the second fence.
+    const makeNonce = options.makeNonce ?? ((headSha: string): string => {
+      if (headSha === '') {
+        return randomBytes(16).toString('hex');
+      }
+      return createHash('sha256').update('fleet-review-nonce:').update(headSha).digest('hex').slice(0, 32);
+    });
+    const nonce = makeNonce(request.candidateHeadSha);
     const timeoutMs = options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     let answer: ApiReviewGenerateResult;
     try {
       answer = await options.generate({
         system: SYSTEM_PROMPT,
-        prompt: buildPrompt(request, diff, nonce),
+        prompt: buildPrompt(request, diff, nonce, request.candidateHeadSha),
         abortSignal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {

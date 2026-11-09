@@ -628,3 +628,97 @@ describe('pre-merge re-check: a 429 that actually surfaces', () => {
     });
   });
 });
+
+describe('nonce derivation from candidate head sha', () => {
+  const DIFF = 'diff --git a/x b/x\n+one line\n';
+
+  function makeTransportForHead(headSha: string, overrides: Partial<{
+    makeNonce: () => string;
+    generate: ApiReviewGenerate;
+  }> = {}) {
+    let seenPrompt = '';
+    const run = createApiReviewTransport({
+      baseURL: 'http://10.0.0.1:4176/inception/v1',
+      model: 'mercury-3',
+      schemaEnforcement: 'native-json-schema',
+      location: location({ readDiff: async () => DIFF, readHead: async () => headSha }),
+      makeNonce: overrides.makeNonce,
+      generate: overrides.generate ?? (async (input) => {
+        seenPrompt = input.prompt;
+        return { object: { result: 'pass', findings: [] }, readOnly: true };
+      }),
+    });
+    return { run, get seenPrompt() { return seenPrompt; } };
+  }
+
+  it('two calls with the same candidateHeadSha produce identical prompts up to the diff closing marker', async () => {
+    const t1 = makeTransportForHead(HEAD);
+    await t1.run({ ...request, candidateHeadSha: HEAD });
+    const prompt1 = t1.seenPrompt;
+
+    const t2 = makeTransportForHead(HEAD);
+    await t2.run({ ...request, candidateHeadSha: HEAD });
+    const prompt2 = t2.seenPrompt;
+
+    const closingMarker1 = prompt1.indexOf('<<<END UNTRUSTED nonce=');
+    const closingMarker2 = prompt2.indexOf('<<<END UNTRUSTED nonce=');
+    expect(closingMarker1).toBeGreaterThan(0);
+    expect(closingMarker2).toBeGreaterThan(0);
+    expect(prompt1.slice(0, closingMarker1)).toBe(prompt2.slice(0, closingMarker2));
+  });
+
+  it('two calls with different candidateHeadSha values produce different nonces', async () => {
+    const HEAD2 = 'c'.repeat(40);
+    const t1 = makeTransportForHead(HEAD);
+    await t1.run({ ...request, candidateHeadSha: HEAD });
+    const prompt1 = t1.seenPrompt;
+
+    const t2 = makeTransportForHead(HEAD2);
+    await t2.run({ ...request, candidateHeadSha: HEAD2 });
+    const prompt2 = t2.seenPrompt;
+
+    const nonceMatch1 = prompt1.match(/<<<UNTRUSTED nonce=([0-9a-f]{32}) label="diff">>>/);
+    const nonceMatch2 = prompt2.match(/<<<UNTRUSTED nonce=([0-9a-f]{32}) label="diff">>>/);
+    expect(nonceMatch1).not.toBeNull();
+    expect(nonceMatch2).not.toBeNull();
+    expect(nonceMatch1![1]).not.toBe(nonceMatch2![1]);
+  });
+
+  it('the derived nonce matches the expected format', async () => {
+    const t = makeTransportForHead(HEAD);
+    await t.run({ ...request, candidateHeadSha: HEAD });
+    const prompt = t.seenPrompt;
+
+    const nonceMatch = prompt.match(/<<<UNTRUSTED nonce=([0-9a-f]{32}) label="diff">>>/);
+    expect(nonceMatch).not.toBeNull();
+    expect(nonceMatch![1]).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('an empty candidateHeadSha still produces a valid nonce and does not throw', async () => {
+    const t = makeTransportForHead('');
+    await t.run({ ...request, candidateHeadSha: '' });
+    const prompt = t.seenPrompt;
+
+    const nonceMatch = prompt.match(/<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="diff">>>/);
+    expect(nonceMatch).not.toBeNull();
+    expect(nonceMatch![1]).toMatch(/^[0-9a-f]{16,64}$/);
+  });
+
+  it('an injected makeNonce still wins over the derived one', async () => {
+    let seenPrompt = '';
+    const run = createApiReviewTransport({
+      baseURL: 'http://10.0.0.1:4176/inception/v1',
+      model: 'mercury-3',
+      schemaEnforcement: 'native-json-schema',
+      location: location({ readDiff: async () => DIFF, readHead: async () => HEAD }),
+      makeNonce: () => 'ffffffffffffffffffffffffffffffff',
+      generate: async (input) => {
+        seenPrompt = input.prompt;
+        return { object: { result: 'pass', findings: [] }, readOnly: true };
+      },
+    });
+    await run({ ...request, candidateHeadSha: HEAD });
+
+    expect(seenPrompt).toContain('<<<UNTRUSTED nonce=ffffffffffffffffffffffffffffffff label="diff">>>');
+  });
+});

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AUTO_MERGE_REASONS,
   AUTO_MERGE_ROUTE_RULE,
+  AUTO_MERGE_DECISION_MACHINERY_PATHS,
   AUTO_MERGE_DECISION_PREFIX,
   AUTO_MERGE_REVISION_PATTERN,
   AUTO_MERGE_HEAD_PATTERN,
@@ -136,6 +137,56 @@ describe('readAutoMergeSettingsAnswer', () => {
       kind: 'unreadable',
       reason: 'settings could not be read',
     });
+  });
+
+  it('defaults allowHighRisk to false when omitted or undefined on an enabled block', () => {
+    expect(
+      readAutoMergeSettingsAnswer({
+        outcome: 'read',
+        enabled: true,
+        onBlocked: 'hold',
+        revision: '0123456789ab',
+        forgeMode: 'github',
+      }),
+    ).toEqual({
+      kind: 'on',
+      settings: {
+        allowHighRisk: false,
+        onBlocked: 'hold',
+        revision: '0123456789ab',
+        forgeMode: 'github',
+      },
+    });
+    expect(readAutoMergeSettingsAnswer({ ...validEnabled, allowHighRisk: undefined })).toEqual({
+      kind: 'on',
+      settings: {
+        allowHighRisk: false,
+        onBlocked: 'hold',
+        revision: '0123456789ab',
+        forgeMode: 'github',
+      },
+    });
+  });
+
+  it('returns off for a disabled block omitting allowHighRisk', () => {
+    expect(
+      readAutoMergeSettingsAnswer({
+        outcome: 'read',
+        enabled: false,
+        onBlocked: 'hold',
+        revision: 'abc',
+        forgeMode: 'none',
+      }),
+    ).toEqual({ kind: 'off' });
+  });
+
+  it('keeps non-boolean allowHighRisk values unreadable with the same reason', () => {
+    for (const allowHighRisk of [null, 1]) {
+      expect(readAutoMergeSettingsAnswer({ ...validEnabled, allowHighRisk })).toEqual({
+        kind: 'unreadable',
+        reason: 'allowHighRisk is not a boolean',
+      });
+    }
   });
 });
 
@@ -289,5 +340,107 @@ describe('autoMergeIneligibility risk allow-list', () => {
   it('allows standard, and high only with allowHighRisk true', () => {
     expect(autoMergeIneligibility({ ...base, risk: 'standard', allowHighRisk: false })).toBeNull();
     expect(autoMergeIneligibility({ ...base, risk: 'high', allowHighRisk: true })).toBeNull();
+  });
+});
+
+describe('autoMergeIneligibility decision-machinery and protected-path doors', () => {
+  const base = { doors: { kind: 'none' } as const, forgeMode: 'github' as const };
+  const withTouched = (touchedPaths: readonly string[]) => ({ ...base, risk: 'standard' as const, touchedPaths });
+
+  it('refuses every decision-machinery path, its stem siblings, and mixed-case spellings', () => {
+    const doorPaths = [
+      ...AUTO_MERGE_DECISION_MACHINERY_PATHS,
+      'packages/work-execution/src/domain/lane-run-state.ts',
+      'packages/work-execution/src/application/use-cases/advance-lane-run/premerge.ts',
+      'packages/work-execution/src/application/advance-lane-run/review-fix.ts',
+      'Packages/Work-Execution/Src/Domain/Auto-Merge.ts',
+    ];
+    for (const path of doorPaths) {
+      expect(autoMergeIneligibility(withTouched([path]))).toBe('door-named');
+    }
+  });
+
+  it('refuses lane-diff-check protected paths but exempts package.json under node_modules', () => {
+    for (const path of ['AGENTS.md', '.github/workflows/ci.yml', 'package.json', 'scripts/lane-diff-check.sh', 'turbo.json']) {
+      expect(autoMergeIneligibility(withTouched([path]))).toBe('door-named');
+    }
+    expect(autoMergeIneligibility(withTouched(['packages/work-execution/node_modules/pkg/package.json']))).toBeNull();
+  });
+
+  it('still merges ordinary diffs at standard risk and refuses high risk without the opt-in', () => {
+    expect(autoMergeIneligibility(withTouched([]))).toBeNull();
+    expect(
+      autoMergeIneligibility(withTouched(['packages/work-execution/src/domain/plain-record-reads.ts', 'apps/web/src/app/page.tsx'])),
+    ).toBeNull();
+    expect(autoMergeIneligibility({ ...withTouched([]), risk: 'high' })).toBe('high-risk');
+    expect(autoMergeIneligibility({ ...withTouched([]), risk: 'high', allowHighRisk: true })).toBeNull();
+  });
+
+  it('does not let allowHighRisk bypass a door', () => {
+    for (const path of ['packages/work-execution/src/domain/auto-merge.ts', 'AGENTS.md']) {
+      expect(
+        autoMergeIneligibility({ doors: { kind: 'none' }, risk: 'high', allowHighRisk: true, forgeMode: 'github', touchedPaths: [path] }),
+      ).toBe('door-named');
+    }
+  });
+
+  it('fails closed on hostile facts and touchedPaths without throwing', () => {
+    for (const touchedPaths of [null, undefined, 'packages/a.ts', 42, {}]) {
+      expect(autoMergeIneligibility({ ...base, risk: 'standard', touchedPaths: touchedPaths as never })).toBe('doors-unreadable');
+    }
+    for (const touchedPaths of [[123], ['apps/web/a.ts', null], [undefined]]) {
+      expect(autoMergeIneligibility({ ...base, risk: 'standard', touchedPaths: touchedPaths as never })).toBe('doors-unreadable');
+    }
+    for (const path of ['', './AGENTS.md', 'packages/../AGENTS.md', '/AGENTS.md', 'a\\b.ts', 'a\0b.ts']) {
+      expect(autoMergeIneligibility(withTouched([path]))).toBe('doors-unreadable');
+    }
+    expect(autoMergeIneligibility(withTouched(['packages/work-execution/src/domain/auto-merge.ts', 123] as never))).toBe('doors-unreadable');
+    const getterBearingFacts: Record<string, unknown> = { doors: { kind: 'none' }, risk: 'standard', forgeMode: 'github' };
+    Object.defineProperty(getterBearingFacts, 'touchedPaths', { enumerable: true, get: () => ['packages/work-execution/src/domain/auto-merge.ts'] });
+    expect(autoMergeIneligibility(getterBearingFacts as never)).toBe('doors-unreadable');
+    expect(autoMergeIneligibility(null as never)).toBe('doors-unreadable');
+  });
+
+  it('fails closed on getters, proxy traps and hostile array iteration without invoking them', () => {
+    const throwing = () => {
+      throw new Error('hostile');
+    };
+    // A getter on doors.kind is never invoked: the accessor descriptor itself fails closed.
+    const doorsWithKindGetter: Record<string, unknown> = {};
+    Object.defineProperty(doorsWithKindGetter, 'kind', { enumerable: true, get: throwing });
+    expect(
+      autoMergeIneligibility({ doors: doorsWithKindGetter as never, risk: 'standard', forgeMode: 'github' }),
+    ).toBe('doors-unreadable');
+    // Getters on risk, allowHighRisk and forgeMode are never invoked — and they fail closed
+    // before the door-named return, so a named door or protected touched path cannot mask them.
+    for (const key of ['risk', 'allowHighRisk', 'forgeMode']) {
+      for (const doors of [{ kind: 'none' }, { kind: 'named', count: 1 }]) {
+        const hostile: Record<string, unknown> = { doors };
+        Object.defineProperty(hostile, key, { enumerable: true, get: throwing });
+        expect(autoMergeIneligibility(hostile as never)).toBe('doors-unreadable');
+      }
+      const withDoorPath: Record<string, unknown> = { doors: { kind: 'none' }, touchedPaths: ['AGENTS.md'] };
+      Object.defineProperty(withDoorPath, key, { enumerable: true, get: throwing });
+      expect(autoMergeIneligibility(withDoorPath as never)).toBe('doors-unreadable');
+    }
+    // A proxy getOwnPropertyDescriptor trap on facts fails closed.
+    const trappingFacts = new Proxy(
+      { doors: { kind: 'none' }, risk: 'standard', forgeMode: 'github' },
+      { getOwnPropertyDescriptor: throwing },
+    );
+    expect(autoMergeIneligibility(trappingFacts as never)).toBe('doors-unreadable');
+    // A proxy getOwnPropertyDescriptor trap on touchedPaths fails closed.
+    const trappingPaths = new Proxy(['AGENTS.md'], { getOwnPropertyDescriptor: throwing });
+    expect(
+      autoMergeIneligibility({ ...base, risk: 'standard', touchedPaths: trappingPaths as never }),
+    ).toBe('doors-unreadable');
+    // An array element getter is never invoked.
+    const elementGetter = ['packages/work-execution/src/domain/plain-record-reads.ts'];
+    Object.defineProperty(elementGetter, 0, { enumerable: true, get: throwing });
+    expect(autoMergeIneligibility({ ...base, risk: 'standard', touchedPaths: elementGetter })).toBe('doors-unreadable');
+    // A hostile Symbol.iterator is never invoked: descriptor reads classify a valid list normally.
+    const hostileIterator = ['packages/work-execution/src/domain/plain-record-reads.ts'];
+    Object.defineProperty(hostileIterator, Symbol.iterator, { get: throwing });
+    expect(autoMergeIneligibility({ ...base, risk: 'standard', touchedPaths: hostileIterator })).toBeNull();
   });
 });

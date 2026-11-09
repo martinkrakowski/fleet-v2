@@ -359,6 +359,17 @@ export class ReserveExecutionCapacityUseCase implements ReserveExecutionCapacity
           return { outcome: 'ok' };
         }
         for (const reservation of held) {
+          // A claim by the same attempt is the store's duplicate-attempt refusal,
+          // never a busy-worktree verdict.
+          if (reservation.attemptId === request.attemptId) {
+            continue;
+          }
+          // A reaper hold (`attemptId = 'reaper-' + findingId`) has no attempt
+          // record: its own worktree path blocks concurrent admission on the
+          // same worktree, before any attempt lookup runs.
+          if (reservation.worktreePath === busyPath) {
+            return { outcome: 'busy-worktree', blockingAttemptId: reservation.attemptId };
+          }
           const holder = await deps.attemptRepo.findAttemptById(reservation.attemptId);
           if (holder && holder.worktreePath === busyPath) {
             return { outcome: 'busy-worktree', blockingAttemptId: reservation.attemptId };

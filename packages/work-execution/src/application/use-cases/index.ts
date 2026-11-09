@@ -32,6 +32,7 @@ export * from "./LandChainUseCase.use-case.js";
 export * from "./ListAttemptJournalUseCase.use-case.js";
 export * from "./ListAttemptsUseCase.use-case.js";
 export * from "./ListConductorPassesUseCase.use-case.js";
+export * from "./ListHeldWorkOrdersUseCase.use-case.js";
 export * from "./ListLaneRunsUseCase.use-case.js";
 export * from "./ListMergeQueueUseCase.use-case.js";
 export * from "./ListStaleWorkOrdersUseCase.use-case.js";

@@ -26,6 +26,7 @@ import { parseConductorDriverLeaseStateRecord } from './ConductorDriverLeaseAdap
 import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
 import { parseKillallHaltMarkerStateRecord } from './KillallHaltMarkerAdapter.adapter.js';
 import { parseKillallTrainPauseStateRecord } from './KillallTrainPauseAdapter.adapter.js';
+import { inspectSingleCutoverRecord } from './CutoverRecordRepositoryAdapter.adapter.js';
 import {
   parseVersionedJournalEntryStateRecord,
   parseVersionedReservationStateRecord,
@@ -35,6 +36,11 @@ import { parseVersionedLaneRunStateRecord } from './LaneRunRepositoryAdapter.ada
 import { parseVersionedLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
 import { parseVersionedLanePlanStateRecord } from './LanePlanRepositoryAdapter.adapter.js';
 import { parseVersionedSeatTicketStateRecord } from './SeatTicketRepositoryAdapter.adapter.js';
+import {
+  HELD_WORK_ORDERS_FILE,
+  duplicateHeldWorkOrderKeyError,
+  parseVersionedHeldWorkOrderStateRecord,
+} from './HeldWorkOrderRepositoryAdapter.adapter.js';
 import type { SeatTicketRecord } from '../../domain/execution-records.js';
 import { parseVersionedSeatObservationStateRecord } from './SeatObservationRepositoryAdapter.adapter.js';
 import { parseTelemetryDispositionStateRecord } from './TelemetryDispositionAdapter.adapter.js';
@@ -119,4 +125,10 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   ),
   describeVersionedRecordListStore('seat-observations.json', parseVersionedSeatObservationStateRecord),
   describeVersionedRecordListStore('merge-records.json', parseVersionedMergeRecordStateRecord, mergeRecordListError),
+  describeVersionedRecordListStore(
+    HELD_WORK_ORDERS_FILE,
+    parseVersionedHeldWorkOrderStateRecord,
+    (records) => duplicateHeldWorkOrderKeyError(records) ?? undefined,
+  ),
+  describeSingleRecordStore('cutover.json', inspectSingleCutoverRecord),
 ];

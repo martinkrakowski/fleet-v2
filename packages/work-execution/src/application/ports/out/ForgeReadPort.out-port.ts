@@ -130,7 +130,48 @@ export type ReadPullRequestCiCostResult =
   | { readonly outcome: 'not-found' }
   | { readonly outcome: 'unavailable'; readonly reason: PullRequestCiCostUnavailableReason };
 
+// --- PT1ca: read-only open-PR changed files ---------------------------------
+
+export { MAX_PULL_REQUEST_CHANGED_FILES } from '../../../domain/held-work-order.js';
+
+export interface ReadPullRequestChangedFilesRequest {
+  readonly pullRequestNumber: number;
+  readonly repository?: ForgeRepositoryRef;
+  /** Optional per-read timeout cap (ms), as for `ReadPullRequestRequest`. */
+  readonly timeoutMs?: number;
+}
+
+/** Fixed reason codes only: never a path, a stderr line or an error message. */
+export type PullRequestChangedFilesUnknownReason =
+  | 'forge-not-configured'
+  | 'invalid-request'
+  | 'invalid-repository'
+  | 'files-timed-out'
+  | 'files-failed'
+  | 'files-too-large'
+  | 'too-many-files'
+  | 'unreadable-files';
+
+/** A failed, partial, oversized or unscreened read is `unknown`, never an empty list. */
+export type ReadPullRequestChangedFilesResult =
+  | {
+      readonly outcome: 'found';
+      readonly files: readonly string[];
+    }
+  | {
+      readonly outcome: 'unknown';
+      readonly reason: PullRequestChangedFilesUnknownReason;
+    };
+
 export interface ForgeReadPort {
+  /**
+   * Read one pull request's changed file paths (at most
+   * `MAX_PULL_REQUEST_CHANGED_FILES`, every path screened); mutates nothing.
+   * Anything that cannot be read in full is `unknown`, never an empty list.
+   */
+  readPullRequestChangedFiles?(
+    request: ReadPullRequestChangedFilesRequest,
+  ): Promise<ReadPullRequestChangedFilesResult>;
   /**
    * Read one merged pull request's CI cost (check runs and billed minutes per
    * workflow), fully paginated; mutates nothing. An unreadable or partial

@@ -7,6 +7,8 @@ import { LANE_RUN_MAX_RETRY } from '../lane-run-keys.js';
 import {
   GATE_CONGESTION_BACKOFF_MS,
   GATE_CONGESTION_MAX_RETRIES,
+  GATE_UNKNOWN_MAX_RETRIES,
+  REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
   laneRunAttemptPhaseOf,
   nextLaneRunAction,
 } from '../lane-run-decider.js';
@@ -86,6 +88,7 @@ function baseFacts(overrides: Partial<LaneRunFacts> = {}): LaneRunFacts {
     acceptedHead12: null,
     gate: 'none',
     gateCongestion: null,
+    gateUnknown: null,
     briefCheck: { verdict: 'none', seatIndex: null, retries: 0 },
     codeReview: { verdict: 'none', seatIndex: null, retries: 0 },
     preMerge: 'none',
@@ -180,10 +183,10 @@ describe('global rules', () => {
     const facts = baseFacts({
       state: 'running',
       attempt: attemptFact(),
-      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+      pendingIntent: { key: `${RUN_ID}/r0/collect/0/a1`, step: 'collect', reconciliation: 'ambiguous' },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
-      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'running',
+      kind: 'park', reason: 'ambiguous', qualifier: 'collect', parkedFrom: 'running',
     });
   });
 
@@ -801,8 +804,122 @@ describe('gating state', () => {
     expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'gate-pending' });
   });
 
-  it('T3: unknown parks ambiguous gate', () => {
-    const facts = baseFacts({ state: 'gating', gate: 'unknown' });
+  it('T3: an unknown gate within the automatic bound acts the gate under /retry<n+1>', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: 0, operatorAbandoned: false },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('T3b: an unknown gate past the automatic bound parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: GATE_UNKNOWN_MAX_RETRIES, operatorAbandoned: false },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3c: an operator-abandoned unknown gate retries again past the automatic bound', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: GATE_UNKNOWN_MAX_RETRIES, operatorAbandoned: true },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry2`, round: 0, seatIndex: 0, head12: HEAD, retry: 2,
+    });
+  });
+
+  it('T3d: an unknown gate without its gateUnknown fact waits facts-inconsistent', () => {
+    const facts = baseFacts({ state: 'gating', gate: 'unknown', head12: HEAD, attempt: attemptFact() });
+    expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+  });
+
+  it('T3e: an operator-abandoned unknown gate at the max retry parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'unknown',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateUnknown: { retry: LANE_RUN_MAX_RETRY, operatorAbandoned: true },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3f: an ambiguous gate pending intent acts the gate under /retry1 without parking', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('T3g: an ambiguous gate pending intent already at retry 1 parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3h: an ambiguous non-gate pending intent still parks with its step as qualifier', () => {
+    const facts = baseFacts({
+      state: 'collecting',
+      pendingIntent: { key: `${RUN_ID}/r0/collect/0/a1`, step: 'collect', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'collect', parkedFrom: 'collecting',
+    });
+  });
+
+  it('T3i: an ambiguous gate pending intent under a graceful stop parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      stopMode: 'graceful',
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
+    });
+  });
+
+  it('T3j: an ambiguous gate pending intent under a halt parks ambiguous gate', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'pending',
+      head12: HEAD,
+      attempt: attemptFact(),
+      halted: true,
+      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
+    });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
     });
@@ -898,11 +1015,58 @@ describe('gating state', () => {
 });
 
 describe('review rules per kind', () => {
-  it.each(['brief-check', 'code-review'] as const)('V1: %s with no seat parks review-seat-unavailable', (kind) => {
+  it.each(['brief-check', 'code-review'] as const)('V1: %s with no seat and no pass count parks review-seat-unavailable', (kind) => {
     const facts = reviewFacts(kind, { verdict: 'none' }, { reviewSeat: { ok: false } });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
     });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1b: %s with no seat below the pass bound waits review-seat-unavailable', (kind) => {
+    for (const reviewSeatUnavailablePasses of [0, REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1]) {
+      const facts = reviewFacts(kind, { verdict: 'none' }, { reviewSeat: { ok: false }, reviewSeatUnavailablePasses });
+      expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+    }
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1c: %s with no seat at the pass bound parks review-seat-unavailable', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'none' },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1d: %s none with a free seat acts even at the pass bound', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'none' },
+      { reviewSeat: { ok: true, seatIndex: 0 }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1e: %s malformed reviewSeatUnavailablePasses waits facts-inconsistent at both sites', (kind) => {
+    for (const reviewSeatUnavailablePasses of [-1, 1.5, Number.POSITIVE_INFINITY]) {
+      const site1 = reviewFacts(
+        kind,
+        { verdict: 'none' },
+        { reviewSeat: { ok: false }, reviewSeatUnavailablePasses },
+      );
+      expect(decide(record({}), site1)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+
+      const site2 = reviewFacts(
+        kind,
+        { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+        { reviewSeatUnavailablePasses },
+      );
+      expect(decide(record({}), site2)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+    }
   });
 
   it.each(['brief-check', 'code-review'] as const)('V2: %s none acts the kind', (kind) => {
@@ -924,6 +1088,17 @@ describe('review rules per kind', () => {
     });
   });
 
+  it.each(['brief-check', 'code-review'] as const)('V4b: %s no-receipt with retries: 0 retries the same seat even with no free seat and at the pass bound', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 0 },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
   it.each(['brief-check', 'code-review'] as const)('V5: %s no-receipt switches to a new seat without retry', (kind) => {
     const facts = reviewFacts(kind, { verdict: 'no-receipt', seatIndex: 0, retries: 1 }, { reviewSeat: { ok: true, seatIndex: 2 } });
     expect(decide(record({}), facts)).toEqual({
@@ -931,9 +1106,67 @@ describe('review rules per kind', () => {
     });
   });
 
-  it.each(['brief-check', 'code-review'] as const)('V6: %s no-receipt otherwise parks review-seat-unavailable', (kind) => {
+  it.each(['brief-check', 'code-review'] as const)('V5b: %s no-receipt switches to a new seat even at the pass bound', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: true, seatIndex: 2 }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/2@${HEAD}`, round: 0, seatIndex: 2, head12: HEAD, retry: null,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V6: %s no-receipt with no other seat and no pass count parks review-seat-unavailable', (kind) => {
     const facts = reviewFacts(kind, { verdict: 'no-receipt', seatIndex: 0, retries: 1 });
     assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V6b: %s no-receipt with no other seat waits below the pass bound and parks at the bound', (kind) => {
+    for (const reviewSeatUnavailablePasses of [0, REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1]) {
+      const below = reviewFacts(
+        kind,
+        { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+        { reviewSeatUnavailablePasses },
+      );
+      expect(decide(record({}), below)).toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+    }
+
+    const atBound = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    assertDecision(atBound, record({}), decide(record({}), atBound), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V6c: %s no-receipt with reviewSeat not ok parks when pass count omitted, waits below the bound, and parks at the bound', (kind) => {
+    const omitted = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: false } },
+    );
+    assertDecision(omitted, record({}), decide(record({}), omitted), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+
+    const below = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1 },
+    );
+    expect(decide(record({}), below)).toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+
+    const atBound = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    assertDecision(atBound, record({}), decide(record({}), atBound), {
       kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
     });
   });

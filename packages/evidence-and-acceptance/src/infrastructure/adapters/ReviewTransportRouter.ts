@@ -20,6 +20,8 @@ import { createApiReviewTransport } from './ApiReviewTransport.adapter.js';
 import type { ApiReviewGenerate, ApiSchemaEnforcement } from './ApiReviewTransport.adapter.js';
 import { createOcmReviewTransport, ReviewTransportError } from './OcmReviewTransport.adapter.js';
 import type { OcmReviewTransportSpawn } from './OcmReviewTransport.adapter.js';
+import { describeApiReviewConfigProblem, isApiReviewConfigProblemCode } from './ApiReviewSettings.js';
+import type { ApiReviewConfigProblemCode } from './ApiReviewSettings.js';
 
 export interface ReviewTransportSeat {
   readonly id: string;
@@ -161,11 +163,13 @@ export interface ReviewTransportRouterOptions {
    */
   readonly apiSchemaEnforcement?: ApiSchemaEnforcement;
   /**
-   * Why a set api configuration variable was not accepted, from
-   * `resolveApiReviewSettings`. It travels into the refusal so an operator typo
-   * surfaces as a typo instead of looking like "not configured".
+   * Which api configuration variable was not accepted, from
+   * `resolveApiReviewSettings`, as a typed code. It travels into the refusal so
+   * an operator typo surfaces as a typo instead of looking like "not
+   * configured". A code, not text, because the api composition root may pass
+   * this one refusal through to a public caller.
    */
-  readonly apiConfigProblem?: string;
+  readonly apiConfigProblemCode?: ApiReviewConfigProblemCode;
   /**
    * Test seam only. Absent binds the provider library through
    * `createSdkApiReviewGenerate`, which is what `runApi` now does: an earlier
@@ -214,6 +218,41 @@ export function createReviewTransportRouter(
 }
 
 /**
+ * The api transport's configuration refusal, marked as such by a typed code.
+ *
+ * `message` is for an operator and names the seat; the CODE is what a
+ * composition root that answers a public caller is allowed to use, because
+ * `describeApiReviewConfigProblem` composes its text from literals alone. A
+ * reader must therefore never pass `message` on.
+ */
+export class ApiReviewConfigProblemError extends ReviewTransportError {
+  readonly configProblemCode: ApiReviewConfigProblemCode;
+
+  constructor(code: ApiReviewConfigProblemCode, seatId: string) {
+    super(
+      `Reviewer seat '${seatId}' uses the api transport and its configuration was refused: ${describeApiReviewConfigProblem(code)}`,
+      'transport-missing',
+    );
+    this.name = 'ApiReviewConfigProblemError';
+    this.configProblemCode = code;
+  }
+}
+
+/**
+ * The api configuration problem code of a thrown value, or `undefined` for
+ * every other failure. Structural and membership-checked rather than
+ * `instanceof`: a duplicated module instance would defeat `instanceof`, and
+ * only a member of the closed set may select a pass-through text.
+ */
+export function apiReviewConfigProblemCodeOf(error: unknown): ApiReviewConfigProblemCode | undefined {
+  if (typeof error !== 'object' || error === null) {
+    return undefined;
+  }
+  const code = (error as { readonly configProblemCode?: unknown }).configProblemCode;
+  return isApiReviewConfigProblemCode(code) ? code : undefined;
+}
+
+/**
  * The `api` transport: one single-turn, read-only, schema-checked call to the
  * key proxy. A variant is meaningless for it (there is no agent and no server
  * profile to select), so a seat that sets one is refused rather than silently
@@ -231,12 +270,9 @@ function runApi(
       'seat-variant-unsupported',
     );
   }
-  if (options.apiConfigProblem !== undefined) {
+  if (options.apiConfigProblemCode !== undefined) {
     // A set-but-rejected variable is an operator error, not an absent one.
-    throw new ReviewTransportError(
-      `Reviewer seat '${seat.id}' uses the api transport and its configuration was refused: ${options.apiConfigProblem}`,
-      'transport-missing',
-    );
+    throw new ApiReviewConfigProblemError(options.apiConfigProblemCode, seat.id);
   }
   if (options.apiBaseURL === undefined || options.apiBaseURL.trim() === '') {
     throw new ReviewTransportError(

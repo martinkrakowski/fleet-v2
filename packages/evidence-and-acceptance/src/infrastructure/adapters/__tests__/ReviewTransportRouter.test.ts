@@ -12,6 +12,8 @@ import {
   type ReviewRunnerRoute,
   type ReviewTransportChains,
   type ReviewTransportSeat,
+  apiReviewConfigProblemCodeOf,
+  ApiReviewConfigProblemError,
 } from '../ReviewTransportRouter.js';
 
 const IMPLEMENTER_SEAT: ReviewTransportSeat = {
@@ -697,6 +699,60 @@ describe('ReviewTransportRouter', () => {
       expect(cliCalled).toBe(true);
       expect(ocmCalled).toBe(false);
       expect(result.result).toBe('pass');
+    });
+  });
+
+  describe('api configuration problem pass-through', () => {
+    const API_SEAT: ReviewTransportSeat = {
+      id: 'reviewer-api',
+      tool: 'api',
+      model: 'example-vendor/review-api-1',
+      roles: ['reviewer'],
+    };
+
+    const API_CHAINS: ReviewTransportChains = {
+      reviewer: [{ seatId: 'reviewer-api' }],
+    };
+
+    const API_REQUEST: RunIndependentReviewRequest = {
+      attemptId: 'att-api',
+      candidateHeadSha: 'sha-candidate-head',
+      implementerModel: IMPLEMENTER_SEAT.model,
+      reviewerModel: API_SEAT.model,
+    };
+
+    function apiLocation(route: ReviewRunnerRoute): ReviewLocation {
+      return {
+        worktreePath: '/srv/fleet/worktrees/att-api',
+        baseCommit: 'base-sha',
+        route,
+        readHead: async () => API_REQUEST.candidateHeadSha,
+        readStatus: async () => '',
+        readDiff: async () => '',
+      };
+    }
+
+    it('rejects with ApiReviewConfigProblemError and apiReviewConfigProblemCodeOf reads the code', async () => {
+      const router = createReviewTransportRouter({
+        seats: [API_SEAT],
+        chains: API_CHAINS,
+        locate: async () => apiLocation({ kind: 'installation', remotePort: 46000, remoteHost: '' }),
+        ocmRunBin: '/bundled/bin/ocm-run',
+        apiConfigProblemCode: 'schema-not-allowed',
+      });
+
+      await expect(router(API_REQUEST)).rejects.toBeInstanceOf(ApiReviewConfigProblemError);
+      await expect(router(API_REQUEST)).rejects.toMatchObject({ configProblemCode: 'schema-not-allowed' });
+
+      const thrown = await router(API_REQUEST).catch((e) => e);
+      expect(apiReviewConfigProblemCodeOf(thrown)).toBe('schema-not-allowed');
+    });
+
+    it('apiReviewConfigProblemCodeOf returns undefined for unrelated errors', () => {
+      expect(apiReviewConfigProblemCodeOf(new Error('boom'))).toBeUndefined();
+      expect(apiReviewConfigProblemCodeOf({})).toBeUndefined();
+      expect(apiReviewConfigProblemCodeOf(null)).toBeUndefined();
+      expect(apiReviewConfigProblemCodeOf(undefined)).toBeUndefined();
     });
   });
 });

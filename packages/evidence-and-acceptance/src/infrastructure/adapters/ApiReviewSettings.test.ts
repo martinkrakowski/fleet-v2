@@ -4,6 +4,9 @@ import {
   API_REVIEW_BASE_URL_VAR,
   API_REVIEW_SCHEMA_VAR,
   resolveApiReviewSettings,
+  API_REVIEW_CONFIG_PROBLEM_CODES,
+  describeApiReviewConfigProblem,
+  isApiReviewConfigProblemCode,
 } from './ApiReviewSettings.js';
 
 const URL_OK = 'http://10.60.0.1:4176/inception/v1';
@@ -121,5 +124,33 @@ describe('resolveApiReviewSettings', () => {
       }),
     );
     expect(resolved).toEqual({ apiBaseURL: URL_OK, apiSchemaEnforcement: 'json-object' });
+  });
+
+  it('every problem carries a typed code whose fixed text is the problem', () => {
+    const cases: Record<string, string | undefined>[] = [
+      { [API_REVIEW_BASE_URL_VAR]: 'not a url', [API_REVIEW_SCHEMA_VAR]: 'json-object' },
+      { [API_REVIEW_BASE_URL_VAR]: 'ftp://host/v1', [API_REVIEW_SCHEMA_VAR]: 'json-object' },
+      { [API_REVIEW_BASE_URL_VAR]: 'http://user:secret@10.0.0.1/v1', [API_REVIEW_SCHEMA_VAR]: 'json-object' },
+      { [API_REVIEW_BASE_URL_VAR]: URL_OK, [API_REVIEW_SCHEMA_VAR]: 'tool' },
+      { [API_REVIEW_BASE_URL_VAR]: URL_OK },
+      { [API_REVIEW_SCHEMA_VAR]: 'json-object' },
+    ];
+    const seen = new Set<string>();
+    for (const values of cases) {
+      const resolved = resolveApiReviewSettings(env(values));
+      expect(resolved.problemCode).toBeDefined();
+      expect(isApiReviewConfigProblemCode(resolved.problemCode)).toBe(true);
+      expect(resolved.problem).toBe(describeApiReviewConfigProblem(resolved.problemCode!));
+      seen.add(resolved.problemCode!);
+    }
+    expect(seen.size).toBe(API_REVIEW_CONFIG_PROBLEM_CODES.length);
+  });
+
+  it('no code text names anything but the two variables and the allowed values', () => {
+    for (const code of API_REVIEW_CONFIG_PROBLEM_CODES) {
+      const text = describeApiReviewConfigProblem(code);
+      expect(text).toMatch(/^FLEET_REVIEW_API_(BASE_URL|SCHEMA) /);
+      expect(text).not.toMatch(/[/\\]/);
+    }
   });
 });

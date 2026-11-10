@@ -357,7 +357,7 @@ describe('classifyFindingCitation', () => {
     }
   });
 
-  it('looks up each finding in one path index', () => {
+  it('traverses diff files and lines via indexed access, not filter/includes/iterator', () => {
     const fileA: DiffCitationFile = { path: 'a/b.ts', lines: [1], lineCount: 20 };
     const fileB: DiffCitationFile = { path: 'x/y.ts', lines: [5], lineCount: 20 };
     const files = [fileA, fileB];

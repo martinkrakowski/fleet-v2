@@ -4,7 +4,8 @@
  * (no ssh, no subprocess). The engine owns every rule, so these tests assert
  * the command's contract: exit codes (0 written, 1 refused, 2 usage), the
  * loader's own refusals, the v1→v2 conversion on the first write, the
- * lane-runner role move, live-work refusals on remove, the compare-and-swap
+ * lane-runner role (several hosts may hold it; add and edit leave it in
+ * place), live-work refusals on remove, the compare-and-swap
  * conflict and the help text.
  */
 
@@ -512,7 +513,125 @@ describe("fleet-v2 hosts add", () => {
     expect(here.runner.capabilities).toEqual(CONVERSION_FLOOR);
   });
 
-  it("moves the lane-runner role from the host that holds it and says so", async () => {
+  it("adds a second lane-runner when the existing host holds only that role, and the existing host keeps it", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const { code, stdout, stderr } = await runHosts(
+      [
+        "add",
+        "lane2",
+        "--role",
+        "lane-runner",
+        "--port",
+        "4266",
+        "--worktree-root",
+        path.join(dir, "lane2"),
+        "--yes",
+      ],
+      file,
+    );
+    expect(code).toBe(0);
+    const parsed = readInstallationFile(file) as {
+      hosts: Record<string, { roles: string[] }>;
+    };
+    expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts.lane2?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts.mac?.roles).toEqual(["orchestrator", "verifier"]);
+    expect(stderr).not.toContain("at least one role");
+    expect(stdout).not.toContain("role moved");
+  });
+
+  it("adds a lane-runner when three hosts already hold only that role, and each of those three keeps it", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        "lane-a": {
+          transport: "local",
+          worktreeRoot: path.join(dir, "lane-a"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 46101 },
+        },
+        "lane-b": {
+          transport: "local",
+          worktreeRoot: path.join(dir, "lane-b"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 46102 },
+        },
+        "lane-c": {
+          transport: "local",
+          worktreeRoot: path.join(dir, "lane-c"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 46103 },
+        },
+      },
+    });
+    const { code, stderr } = await runHosts(
+      [
+        "add",
+        "lane-d",
+        "--role",
+        "lane-runner",
+        "--port",
+        "46104",
+        "--worktree-root",
+        path.join(dir, "lane-d"),
+        "--yes",
+      ],
+      file,
+    );
+    expect(code).toBe(0);
+    const parsed = readInstallationFile(file) as {
+      hosts: Record<string, { roles: string[] }>;
+    };
+    expect(parsed.hosts["lane-a"]?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts["lane-b"]?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts["lane-c"]?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts["lane-d"]?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts.mac?.roles).toEqual(["orchestrator"]);
+    expect(stderr).not.toContain("at least one role");
+  });
+
+  it("adds a verifier while a host holds only lane-runner, and does not change that host's role", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const { code, stdout, stderr } = await runHosts(
+      [
+        "add",
+        "verifyhost",
+        "--ssh",
+        "verifyhost.example",
+        "--port",
+        "47000",
+        "--worktree-root",
+        path.join(dir, "verifyhost"),
+        "--role",
+        "verifier",
+        "--yes",
+      ],
+      file,
+    );
+    expect(code).toBe(0);
+    const parsed = readInstallationFile(file) as {
+      hosts: Record<string, { roles: string[] }>;
+    };
+    expect(parsed.hosts.verifyhost?.roles).toEqual(["verifier"]);
+    expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner"]);
+    expect(parsed.hosts.mac?.roles).toEqual(["orchestrator", "verifier"]);
+    expect(stdout).not.toContain("role moved");
+    expect(stderr).not.toContain("at least one role");
+  });
+
+  it("adds a lane-runner beside a host that also holds orchestrator, and that host keeps lane-runner", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, singleMachineInstallation(path.join(dir, "worktrees")));
@@ -531,13 +650,11 @@ describe("fleet-v2 hosts add", () => {
       file,
     );
     expect(code).toBe(0);
-    expect(stdout).toContain(
-      "lanes now run on lanehost (the lane-runner role moved from mac)",
-    );
+    expect(stdout).not.toContain("role moved");
     const parsed = readInstallationFile(file) as {
       hosts: Record<string, { roles: string[] }>;
     };
-    expect(parsed.hosts.mac?.roles).toEqual(["orchestrator"]);
+    expect(parsed.hosts.mac?.roles).toEqual(["orchestrator", "lane-runner"]);
     expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner"]);
   });
 
@@ -756,21 +873,33 @@ describe("fleet-v2 hosts edit", () => {
     expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner", "verifier"]);
   });
 
-  it("refuses a lane-runner move that would leave the other host with no role", async () => {
+  it("edits a host to add lane-runner while another host holds only that role, and the other host keeps it", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
-    // Moving the lane-runner role onto mac would leave lanehost with no role;
-    // the loader refuses the candidate with its own message.
     const { code, stderr } = await runHosts(
-      ["edit", "mac", "--role", "orchestrator,verifier,lane-runner", "--yes"],
+      [
+        "edit",
+        "mac",
+        "--role",
+        "orchestrator,verifier,lane-runner",
+        "--port",
+        "46000",
+        "--yes",
+      ],
       file,
     );
-    expect(code).toBe(1);
-    expect(stderr).toContain("the loader refuses this change");
-    expect(stderr).toContain(
-      "hosts.lanehost.roles: at least one role is required",
-    );
+    expect(code).toBe(0);
+    const parsed = readInstallationFile(file) as {
+      hosts: Record<string, { roles: string[] }>;
+    };
+    expect(parsed.hosts.mac?.roles).toEqual([
+      "orchestrator",
+      "verifier",
+      "lane-runner",
+    ]);
+    expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner"]);
+    expect(stderr).not.toContain("at least one role");
   });
 
   it("keeps the runner's gateSlot when another field is edited (KF-30b)", async () => {
@@ -996,6 +1125,8 @@ describe("fleet-v2 hosts usage", () => {
     expect(stdout).toContain("add <name>");
     expect(stdout).toContain("remove <name>");
     expect(stdout).toContain("There is no --force.");
+    expect(stdout).toContain("Several hosts may hold");
+    expect(stdout).not.toContain("moves that");
   });
 
   it("treats a missing subcommand and an unknown flag as usage errors", async () => {
@@ -1043,7 +1174,7 @@ describe("fleet-v2 hosts usage", () => {
 // ---------------------------------------------------------------------------
 
 describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
-  it("drops roleAliases['lane-runner'] on the stripped host when moving lane-runner so the loader accepts the write", async () => {
+  it("keeps the existing host's lane-runner role alias when another lane-runner is added", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, {
@@ -1084,10 +1215,16 @@ describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
     );
     expect(added.code).toBe(0);
     const reloaded = readFileSync(file, "utf8");
+    expect(reloaded).toContain('"lane-runner": "old-lr"');
     expect(reloaded).toContain('"verifier": "old-v"');
-    expect(reloaded).not.toContain("old-lr");
-    expect(() => readInstallationFile(file)).not.toThrow();
-    // The sole-key case: the whole roleAliases map drops off.
+    const addedParsed = readInstallationFile(file) as {
+      hosts: Record<string, { roles: string[] }>;
+    };
+    expect(addedParsed.hosts.oldhost?.roles).toEqual([
+      "verifier",
+      "lane-runner",
+    ]);
+    // The sole-alias case: the alias map stays intact on the untouched host.
     const soleDir = makeTempDir();
     const soleFile = path.join(soleDir, "fleet.json");
     writeJsonFile(soleFile, {
@@ -1125,10 +1262,15 @@ describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
     );
     expect(sole.code).toBe(0);
     const soleReloaded = JSON.parse(readFileSync(soleFile, "utf8")) as {
-      hosts: Record<string, { roleAliases?: unknown }>;
+      hosts: Record<string, { roleAliases?: unknown; roles?: string[] }>;
     };
-    expect(soleReloaded.hosts.oldhost.roleAliases).toBeUndefined();
-    expect(() => readInstallationFile(soleFile)).not.toThrow();
+    expect(soleReloaded.hosts.oldhost.roleAliases).toEqual({
+      "lane-runner": "old-lr",
+    });
+    expect(soleReloaded.hosts.oldhost.roles).toEqual([
+      "verifier",
+      "lane-runner",
+    ]);
   });
 
   it("prints one line under --yes naming any role alias dropped by an edit", async () => {
@@ -1164,53 +1306,6 @@ describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
       .filter((line) => line.startsWith("dropped role alias:"));
     expect(noticeLines).toEqual(["dropped role alias: hosts.lanehost.roleAliases.verifier"]);
     expect(noticeLines.join("\n")).not.toContain("old-v");
-    // A lane-runner move drops the alias on the host it moved from.
-    const moveDir = makeTempDir();
-    const moveFile = path.join(moveDir, "fleet.json");
-    writeJsonFile(moveFile, {
-      schemaVersion: 2,
-      forge: { mode: "none" },
-      hosts: {
-        mac: {
-          transport: "local",
-          worktreeRoot: path.join(moveDir, "wt"),
-          roles: ["orchestrator"],
-        },
-        lanehost: {
-          transport: "ssh",
-          sshAlias: "m",
-          worktreeRoot: path.join(moveDir, "lanehost"),
-          roles: ["verifier", "lane-runner"],
-          roleAliases: {
-            "lane-runner": "moved-lr",
-            verifier: "old-v",
-          },
-          runner: { kind: "opencode", port: 4166 },
-        },
-      },
-    });
-    const moved = await runHosts(
-      [
-        "add",
-        "newhost",
-        "--worktree-root",
-        path.join(moveDir, "newhost"),
-        "--role",
-        "lane-runner",
-        "--port",
-        "5001",
-        "--yes",
-      ],
-      moveFile,
-    );
-    expect(moved.code).toBe(0);
-    const movedNotices = moved.stdout
-      .split("\n")
-      .filter((line) => line.startsWith("dropped role alias:"));
-    expect(movedNotices).toEqual([
-      "dropped role alias: hosts.lanehost.roleAliases.lane-runner",
-    ]);
-    expect(movedNotices.join("\n")).not.toContain("moved-lr");
   });
 
   it("renders the role-ambiguous refusal as operator text naming the role and telling the operator to name the host", async () => {
@@ -1629,9 +1724,9 @@ describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () 
         }
       }
     }
-    // The loader refuses a secret-shaped host-map key outright (HN1), so the
-    // movedFrom and dropped-alias notices are exercised with a key the loader
-    // accepts and the host-key screen still withholds: a long opaque run.
+    // The loader refuses a secret-shaped host-map key outright (HN1); an add
+    // that succeeds still screens a key the loader accepts but the host-key
+    // screen withholds: a long opaque run.
     const opaque = ["Zq", "9x".repeat(12)].join("");
     const movedFile = path.join(dir, "fleet-opaque.json");
     writeJsonFile(movedFile, {
@@ -1658,7 +1753,6 @@ describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () 
       movedFile,
     );
     expect(moved.code).toBe(0);
-    expect(moved.stdout).toContain("dropped role alias");
     expect(moved.stdout + moved.stderr).not.toContain(opaque);
     expect(moved.stdout + moved.stderr).not.toContain(akia);
     expect(formatRoleAmbiguousRefusal("verifier", [ghp, akia, "ok-host"])).not.toContain(ghp);
@@ -1667,7 +1761,7 @@ describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () 
   });
 
   it("moveLaneRunnerRole guards hostile runtime hosts without throwing", () => {
-    // A null roleAliases map on the stripped host is omitted, not a throw.
+    // A null roleAliases map is returned unchanged, not a throw.
     const withNullAliases = {
       schemaVersion: 2,
       hosts: {
@@ -1680,10 +1774,11 @@ describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () 
       },
     };
     const nulled = moveLaneRunnerRole(withNullAliases, "new");
-    expect(nulled.movedFrom).toEqual(["other"]);
+    expect(nulled.movedFrom).toEqual([]);
+    expect(nulled.value).toBe(withNullAliases);
     const nulledHosts = (nulled.value as { hosts: Record<string, Record<string, unknown>> }).hosts;
-    expect(nulledHosts.other.roles).toEqual([]);
-    expect(nulledHosts.other).not.toHaveProperty("roleAliases");
+    expect(nulledHosts.other.roles).toEqual(["lane-runner"]);
+    expect(nulledHosts.other.roleAliases).toBeNull();
 
     // A throwing getter on current.hosts never runs.
     const hostileHosts = {
@@ -1709,20 +1804,22 @@ describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () 
     expect(() => moveLaneRunnerRole(getterRoles, "new")).not.toThrow();
     expect(moveLaneRunnerRole(getterRoles, "new").movedFrom).toEqual([]);
 
-    // A throwing getter on roleAliases never runs; the alias map is omitted.
+    // A throwing getter on roleAliases never runs; the value still comes back.
+    let aliasInvocations = 0;
     const hostileAliases = {
       transport: "local",
       worktreeRoot: "/w",
       roles: ["lane-runner"],
       get roleAliases() {
+        aliasInvocations += 1;
         throw new Error("hostile");
       },
     };
     const getterAliases = { schemaVersion: 2, hosts: { other: hostileAliases } };
     const guarded = moveLaneRunnerRole(getterAliases, "new");
-    expect(guarded.movedFrom).toEqual(["other"]);
-    const guardedHosts = (guarded.value as { hosts: Record<string, Record<string, unknown>> }).hosts;
-    expect(guardedHosts.other).not.toHaveProperty("roleAliases");
+    expect(aliasInvocations).toBe(0);
+    expect(guarded.movedFrom).toEqual([]);
+    expect(guarded.value).toBe(getterAliases);
 
     // A non-plain host entry is skipped, never spread.
     class HostileHost {
@@ -1736,7 +1833,7 @@ describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () 
     expect(moveLaneRunnerRole(classHosts, "new").movedFrom).toEqual([]);
   });
 
-  it("moveLaneRunnerRole keeps the plain path: aliases prune and empty maps drop", () => {
+  it("moveLaneRunnerRole does not change another host's roles or role aliases", () => {
     const current = {
       schemaVersion: 2,
       hosts: {
@@ -1755,17 +1852,22 @@ describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () 
       },
     };
     const moved = moveLaneRunnerRole(current, "new");
-    expect(moved.movedFrom).toEqual(["other", "sole"]);
+    expect(moved.movedFrom).toEqual([]);
+    expect(moved.value).toBe(current);
+    expect(moved.refused).toBeUndefined();
     const hosts = (moved.value as { hosts: Record<string, Record<string, unknown>> }).hosts;
-    expect(hosts.other.roles).toEqual(["orchestrator"]);
-    expect(hosts.other.roleAliases).toEqual({ orchestrator: "o" });
-    expect(hosts.sole.roles).toEqual([]);
-    expect(hosts.sole).not.toHaveProperty("roleAliases");
+    expect(hosts.other.roles).toEqual(["orchestrator", "lane-runner"]);
+    expect(hosts.other.roleAliases).toEqual({
+      orchestrator: "o",
+      "lane-runner": "l",
+    });
+    expect(hosts.sole.roles).toEqual(["lane-runner"]);
+    expect(hosts.sole.roleAliases).toEqual({ "lane-runner": "only" });
   });
 });
 
 describe("moveLaneRunnerRole host-map accessors (Luna pre-merge round)", () => {
-  it("refuses a host-map entry that is a getter without invoking it", () => {
+  it("refuses an accessor on the host map, returns the same value, and does not run the getter", () => {
     let invoked = 0;
     const hosts: Record<string, unknown> = {
       holder: {
@@ -1843,12 +1945,17 @@ describe("hosts commands screen every host-map key (Fable re-check round)", () =
     const { dir, file } = fixture(key);
     const listed = await runHosts(["list"], file);
     expect(listed.stdout + listed.stderr).not.toContain(key);
+    expect(listed.stdout).toContain(HOST_KEY_WITHHELD);
     const moved = await runHosts(
       ["add", "newhost", "--role", "lane-runner", "--worktree-root", path.join(dir, "n"), "--port", "1", "--yes"],
       file,
     );
+    expect(moved.code).toBe(0);
     expect(moved.stdout + moved.stderr).not.toContain(key);
-    expect(moved.stdout).toContain(HOST_KEY_WITHHELD);
+    const parsed = readInstallationFile(file) as {
+      hosts: Record<string, { roles: string[] }>;
+    };
+    expect(parsed.hosts[key]?.roles).toEqual(["verifier", "lane-runner"]);
     expect(
       formatRoleAmbiguousRefusal("verifier", [key, "ok-host"]),
     ).not.toContain(key);

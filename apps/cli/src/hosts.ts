@@ -131,10 +131,10 @@ A schema version 1 file is converted to v2 on the first write.
                                prints the enable and linger commands, and
                                --apply writes or removes the unit files
 
-Roles: orchestrator, lane-runner, verifier. hosts add/edit keep one
-lane-runner role: adding or editing a host with the lane-runner role moves that
-role from the host that holds it. Multi-host dispatch lands with H10; until
-then exactly one host runs lanes.
+Roles: orchestrator, lane-runner, verifier. Several hosts may hold
+lane-runner. hosts add and hosts edit leave every other host's roles as they
+are. hosts remove refuses the last lane-runner host. hosts show --role
+refuses a role held by more than one host; name the host.
 
 Exit codes: 0 written (or listed), 1 refused — a probe FAIL, a loader
 refusal, a secret-shaped host name, a changed or locked file, live work on
@@ -530,29 +530,6 @@ function ownData(record: object, key: string): unknown {
   }
 }
 
-/**
- * Copy a plain record's own data properties, skipping accessors; `undefined`
- * for anything that is not a plain record. A hostile value never throws and
- * never runs a getter.
- */
-function copyOwnDataOf(record: unknown): Record<string, unknown> | undefined {
-  if (!isPlainObject(record)) {
-    return undefined;
-  }
-  try {
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(record)) {
-      const value = ownData(record, key);
-      if (value !== undefined) {
-        out[key] = value;
-      }
-    }
-    return out;
-  } catch {
-    return undefined;
-  }
-}
-
 /** True when any own property of `record` is an accessor; never runs one. */
 function hasAccessor(record: object): boolean {
   try {
@@ -580,16 +557,15 @@ function hostsOf(value: unknown): Record<string, unknown> | undefined {
 }
 
 /**
- * Move the lane-runner role off every other host (plan section 1: until the
- * loader allows several, adding one moves the role). The current value is
- * never mutated; a host that keeps no role is left for the loader to refuse.
- * A host stripped of the lane-runner role also drops its lane-runner role
- * alias: the loader refuses an alias for a role the host does not hold, so
- * leaving it would turn every role move into a refused write.
+ * Return the current value unchanged. The loader already allows several
+ * lane-runner hosts, so an add or edit no longer moves the lane-runner role
+ * off every other host. An accessor on the host map is still refused with
+ * `refused: "accessor"` on the same value; every other input comes back
+ * unchanged. The function does not throw.
  */
 export function moveLaneRunnerRole(
   current: unknown,
-  name: string,
+  _name: string,
 ): {
   readonly value: unknown;
   readonly movedFrom: readonly string[];
@@ -604,78 +580,7 @@ export function moveLaneRunnerRole(
   if (hasAccessor(hosts)) {
     return { value: current, movedFrom: [], refused: "accessor" };
   }
-  const movedFrom: string[] = [];
-  let nextHosts: Record<string, unknown> | undefined;
-  for (const hostName of Object.keys(hosts)) {
-    const rawHost = ownData(hosts, hostName);
-    if (hostName === name || !isPlainObject(rawHost)) {
-      continue;
-    }
-    // Roles are read through own-data guards: a sparse array or an
-    // element-carrying getter is skipped, never invoked and never a throw.
-    const rawRoles = ownData(rawHost, "roles");
-    if (!Array.isArray(rawRoles)) {
-      continue;
-    }
-    const roles: string[] = [];
-    let holdsLaneRunner = false;
-    let dense = true;
-    for (let index = 0; index < rawRoles.length; index += 1) {
-      const role = ownData(rawRoles, String(index));
-      if (typeof role !== "string") {
-        dense = false;
-        break;
-      }
-      roles.push(role);
-      if (role === "lane-runner") {
-        holdsLaneRunner = true;
-      }
-    }
-    if (!dense || !holdsLaneRunner) {
-      continue;
-    }
-    movedFrom.push(hostName);
-    nextHosts ??= copyOwnDataOf(hosts) ?? {};
-    const kept = roles.filter((role) => role !== "lane-runner");
-    const rawAliases = ownData(rawHost, "roleAliases");
-    const aliasData = copyOwnDataOf(rawAliases);
-    const keptAliases =
-      aliasData === undefined
-        ? undefined
-        : Object.fromEntries(
-            Object.entries(aliasData).filter(
-              ([role]) => role !== "lane-runner",
-            ),
-          );
-    // Drop the host's original alias map and re-add only what survives the
-    // role move; when nothing survives, the key is omitted entirely rather
-    // than left naming a role the host no longer holds. The host's other
-    // fields are carried through the own-data copy, so a getter never runs.
-    const hostData = copyOwnDataOf(rawHost);
-    if (hostData === undefined) {
-      continue;
-    }
-    const { roleAliases: _rawAliases, ...hostWithoutAliases } = hostData;
-    void _rawAliases;
-    const nextHost: Record<string, unknown> = {
-      ...hostWithoutAliases,
-      roles: kept,
-      ...(keptAliases !== undefined && Object.keys(keptAliases).length > 0
-        ? { roleAliases: keptAliases }
-        : {}),
-    };
-    nextHosts[hostName] = nextHost;
-  }
-  if (nextHosts === undefined) {
-    return { value: current, movedFrom: [] };
-  }
-  return {
-    value: {
-      ...(copyOwnDataOf(current) ?? {}),
-      hosts: nextHosts,
-    },
-    movedFrom,
-  };
+  return { value: current, movedFrom: [] };
 }
 
 /**
@@ -1303,7 +1208,6 @@ async function writeHost(
   } else if (state.status === "v2") {
     current = state.value;
   }
-  let movedFrom: readonly string[] = [];
   if (draft.host.roles.includes("lane-runner")) {
     const moved = moveLaneRunnerRole(current, name);
     if (moved.refused !== undefined) {
@@ -1313,7 +1217,6 @@ async function writeHost(
       return 1;
     }
     current = moved.value;
-    movedFrom = moved.movedFrom;
   }
 
   const validated = validateHostDraft(current, draft, mode);
@@ -1403,13 +1306,6 @@ async function writeHost(
         }
       }
     }
-  }
-  if (movedFrom.length > 0) {
-    out.stdout(
-      `lanes now run on ${screenHostKey(name)} (the lane-runner role moved from ${movedFrom
-        .map((key) => screenHostKey(key))
-        .join(", ")})\n`,
-    );
   }
   // An edit that removes a role (or a host) can silently drop the role alias
   // that named it; under --yes there is no diff-confirm step, so the dropped

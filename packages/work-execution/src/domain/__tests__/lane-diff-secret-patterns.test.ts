@@ -1,7 +1,16 @@
 // Parity tests for the lane diff check's secret registry (O14d1): the
-// `LANE_DIFF_SECRET_PATTERNS` registry must carry exactly the 17 named
-// patterns of `scripts/lane-diff-check.sh`, in the script's order, with the
-// same match semantics. Every fixture value is built at run time from
+// `LANE_DIFF_SECRET_PATTERNS` registry must carry exactly the SECRET patterns
+// of `scripts/lane-diff-check.sh`, in the script's order, with the same match
+// semantics.
+//
+// The script's table is not all secrets. It also carries `lint-suppression`,
+// which reports a lint rule the lane switched off. That one must NOT join the
+// registry: the registry is what `containsSecretShape` and the aggregates'
+// `isSecretShaped` consult to REFUSE text, so adding it would make any summary
+// mentioning `@ts-ignore` or `eslint-disable` be refused as credential-shaped.
+// So the parity rule is: every name in the script's table is either mirrored in
+// the registry or listed in NON_SECRET_SCRIPT_PATTERNS below. A new pattern
+// cannot slip past this test; it has to be classified. Every fixture value is built at run time from
 // harmless parts, so this file itself matches none of the patterns, and no
 // matched value is ever asserted or printed — only rule names.
 
@@ -47,6 +56,13 @@ function scriptPatternNames(): string[] {
   }
   return names;
 }
+
+/**
+ * Names in the script's table that are deliberately NOT secret patterns, and so
+ * are not mirrored in `LANE_DIFF_SECRET_PATTERNS`. Adding one of these to the
+ * registry would make the aggregates refuse ordinary text as credential-shaped.
+ */
+const NON_SECRET_SCRIPT_PATTERNS: readonly string[] = ["lint-suppression"];
 
 /**
  * One obviously fake synthetic value per rule, built from harmless parts at
@@ -228,13 +244,33 @@ function runScript(files: Record<string, string>): Set<string> {
 }
 
 describe("LANE_DIFF_SECRET_PATTERNS (script parity)", () => {
-  it("carries exactly the script’s 17 names, in the script’s order", () => {
+  it("carries exactly the script’s secret names, in the script’s order", () => {
     const script = scriptPatternNames();
-    expect(script.length).toBe(17);
+    const secretNames = script.filter(
+      (name) => !NON_SECRET_SCRIPT_PATTERNS.includes(name),
+    );
+    expect(secretNames.length).toBe(17);
     expect(LANE_DIFF_SECRET_PATTERNS.length).toBe(17);
     expect(LANE_DIFF_SECRET_PATTERNS.map((entry) => entry.name)).toEqual(
-      script,
+      secretNames,
     );
+  });
+
+  it("every name in the script table is classified: mirrored, or explicitly non-secret", () => {
+    const script = scriptPatternNames();
+    const mirrored = new Set(LANE_DIFF_SECRET_PATTERNS.map((e) => e.name));
+    const unclassified = script.filter(
+      (name) =>
+        !mirrored.has(name) && !NON_SECRET_SCRIPT_PATTERNS.includes(name),
+    );
+    expect(unclassified).toEqual([]);
+  });
+
+  it("nothing declared non-secret is also in the registry", () => {
+    const mirrored = new Set(LANE_DIFF_SECRET_PATTERNS.map((e) => e.name));
+    expect(
+      NON_SECRET_SCRIPT_PATTERNS.filter((name) => mirrored.has(name)),
+    ).toEqual([]);
   });
 
   it("every pattern in the script table appears exactly once", () => {

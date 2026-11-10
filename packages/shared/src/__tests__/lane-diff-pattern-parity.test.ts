@@ -73,21 +73,53 @@ function normalizeSource(source: string): string {
   return source.split('\\/').join('/');
 }
 
+/**
+ * Rules the SHELL table carries that are deliberately NOT in the TypeScript
+ * secret registry, by exact name.
+ *
+ * `scripts/lane-diff-check.sh`'s table grew a second purpose: it now also
+ * reports inline lint suppression (`eslint-disable`, `@ts-nocheck`, commit
+ * c94b1d0a1d). That is a code-review signal, not a credential shape, and it
+ * must not enter `LANE_DIFF_SECRET_PATTERNS` — that registry backs
+ * `containsSecretShape`, which refuses host names and frozen brief fields, so
+ * admitting `lint-suppression` would make any brief that merely mentions
+ * `eslint-disable` refuse as secret-shaped.
+ *
+ * Every name here must still be present in the script, which the first test
+ * asserts: an exemption that stops matching a real row is a dead exemption,
+ * and a dead exemption would silently widen to cover a genuinely missing
+ * secret rule. Adding a name here is a deliberate act with a reason, never a
+ * way to quiet this test.
+ */
+const SCRIPT_ONLY_NON_SECRET_RULES: readonly string[] = ['lint-suppression'];
+
+/** The script's SECRET rows: the table minus the declared non-secret rules. */
+function scriptSecretRows(): Array<{ name: string; ere: string }> {
+  return scriptPatternTable().filter(
+    (row) => !SCRIPT_ONLY_NON_SECRET_RULES.includes(row.name),
+  );
+}
+
 describe('LANE_DIFF_SECRET_PATTERNS (script-table parity)', () => {
-  it('carries exactly the script table\'s 17 names, in the same order', () => {
-    const table = scriptPatternTable();
-    expect(table).toHaveLength(17);
-    expect(LANE_DIFF_SECRET_PATTERNS).toHaveLength(17);
+  it('declares every script-only exemption, and each one really is in the script', () => {
+    const names = scriptPatternTable().map((row) => row.name);
+    for (const exempt of SCRIPT_ONLY_NON_SECRET_RULES) {
+      expect(names, `exemption ${exempt} no longer matches a script row`).toContain(exempt);
+    }
+  });
+
+  it('carries exactly the script table\'s secret names, in the same order', () => {
+    const rows = scriptSecretRows();
+    expect(rows).toHaveLength(LANE_DIFF_SECRET_PATTERNS.length);
     expect(LANE_DIFF_SECRET_PATTERNS.map((entry) => entry.name)).toEqual(
-      table.map((row) => row.name),
+      rows.map((row) => row.name),
     );
   });
 
   it('every rule\'s regex text matches the script table\'s ERE after normalization', () => {
-    const table = scriptPatternTable();
-    expect(table).toHaveLength(17);
+    const table = scriptSecretRows();
     const registry = LANE_DIFF_SECRET_PATTERNS;
-    expect(registry).toHaveLength(17);
+    expect(table).toHaveLength(registry.length);
     for (let index = 0; index < registry.length; index += 1) {
       const entry = registry[index];
       const row = table[index];

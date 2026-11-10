@@ -39,7 +39,7 @@ export function namedSecretPatterns(): readonly NamedSecretPattern[] {
  * the shell table's order, each POSIX ERE translated to an equivalent JS
  * RegExp. The exported name is historical — this list began as the lane-diff
  * check's rule set and the barrel keeps the old name. The shell twin's table
- * is `scripts/lane-diff-check.sh:411-429`; the parity test that pins this
+ * is the `PAT` heredoc in `scripts/lane-diff-check.sh` (its non-secret rows are declared in the parity test); the parity test that pins this
  * registry to that table is
  * `packages/shared/src/__tests__/lane-diff-pattern-parity.test.ts`. The
  * matched text is never reported — only the rule name.

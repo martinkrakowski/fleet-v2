@@ -2,7 +2,7 @@
 // use cases). The CLI has no direct store access; items are seeded and read
 // through the command handlers themselves against a temp --state-dir.
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -248,6 +248,52 @@ describe('owner-items add|list|resolve', () => {
     );
     expect(result.code).toBe(0);
     expect(parseDocument(result.stdout).outcome).toBe('recorded');
+    // Both refs must survive into the recorded item, by value: keeping only
+    // the last ref would still print `recorded` above, so the assertion has
+    // to read the persisted item.
+    const stored = JSON.parse(
+      readFileSync(join(stateDir, 'owner-items.json'), 'utf8'),
+    ) as Array<{ item: { refs: unknown[] } }>;
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.item.refs).toEqual([
+      { kind: 'question', id: 'q1' },
+      { kind: 'plan-decision', planId: 'example-plan', decisionId: 'D1' },
+    ]);
+  });
+
+  it('a valueless --ref is a usage error, not a silent drop', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const result = await runOwnerItems(
+      runtime,
+      ['add', '--project-id', 'example-project', '--kind', 'other', '--subject', 's', '--ref'],
+      stateDir,
+    );
+    expect(result.code).toBe(2);
+    expect(result.stdout).toEqual([]);
+  });
+
+  it('a repeated --ref where one occurrence has no value is a usage error', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const result = await runOwnerItems(
+      runtime,
+      [
+        'add',
+        '--project-id',
+        'example-project',
+        '--kind',
+        'other',
+        '--subject',
+        's',
+        '--ref',
+        'question:q1',
+        '--ref',
+      ],
+      stateDir,
+    );
+    expect(result.code).toBe(2);
+    expect(result.stdout).toEqual([]);
   });
 
   it('second add of the same plan-decision ref exists with the same itemId', async () => {
@@ -440,6 +486,37 @@ describe('owner-items add|list|resolve', () => {
     const result = await runOwnerItems(runtime, ['resolve', '--as', 'done'], stateDir);
     expect(result.code).toBe(2);
     expect(result.stdout).toEqual([]);
+  });
+
+  it('resolve refuses an empty id as a usage error', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const result = await runOwnerItems(runtime, ['resolve', '', '--as', 'done'], stateDir);
+    expect(result.code).toBe(2);
+    expect(result.stdout).toEqual([]);
+  });
+
+  it('resolve refuses a whitespace-only id as a usage error', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const result = await runOwnerItems(runtime, ['resolve', '   ', '--as', 'done'], stateDir);
+    expect(result.code).toBe(2);
+    expect(result.stdout).toEqual([]);
+  });
+
+  it('resolve still accepts a valid id', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const added = await runOwnerItems(
+      runtime,
+      ['add', '--project-id', 'example-project', '--kind', 'other', '--subject', 'owed'],
+      stateDir,
+    );
+    expect(added.code).toBe(0);
+    const { itemId } = parseDocument(added.stdout);
+    const result = await runOwnerItems(runtime, ['resolve', itemId as string, '--as', 'done'], stateDir);
+    expect(result.code).toBe(0);
+    expect(parseDocument(result.stdout).outcome).toBe('resolved');
   });
 
   it('resolve with two id positionals is usage', async () => {

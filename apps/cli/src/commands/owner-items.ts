@@ -62,14 +62,23 @@ function typedRef(token: string): OwnerItemRefRecord {
 function refTokensFromPayload(payload: Payload): string[] {
   const value = payload['ref'];
   const tokens: string[] = [];
-  if (typeof value === 'string') {
-    tokens.push(value);
-  } else if (Array.isArray(value)) {
-    for (const item of value) {
-      if (typeof item === 'string') {
-        tokens.push(item);
-      }
+  // A valueless `--ref` parses as boolean true; dropping a typed value is
+  // never correct, so anything but a non-empty string is a usage error.
+  const pushToken = (item: unknown): void => {
+    if (typeof item !== 'string' || item === '') {
+      throw new CliUsageError('--ref requires a value');
     }
+    tokens.push(item);
+  };
+  if (value === undefined) {
+    return tokens;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      pushToken(item);
+    }
+  } else {
+    pushToken(value);
   }
   return tokens;
 }
@@ -140,6 +149,11 @@ export const ownerItemsCommands: Readonly<Record<string, CommandHandler>> = {
     const count = Array.isArray(positionals) ? positionals.length : 0;
     if (count !== 1) {
       throw new CliUsageError('owner-items resolve requires exactly one owner item id');
+    }
+    // `firstPositional` trims, so a whitespace-only id reaches here as '';
+    // refuse it before the use case is called.
+    if (firstPositional(p) === '') {
+      throw new CliUsageError('owner-items resolve requires a non-empty owner item id');
     }
     for (const key of Object.keys(p)) {
       if (key !== 'as' && key !== 'positional') {

@@ -84,7 +84,7 @@ function unreadableInputResult(): AttentionItemResult {
   return { success: false, error: new Error('AttentionItem input could not be read'), code: 'invalid' };
 }
 
-function isSecretShaped(text: string): boolean {
+export function isSecretShaped(text: string): boolean {
   return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
 }
 

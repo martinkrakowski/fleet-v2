@@ -5,8 +5,9 @@
  * no filesystem, no I/O, no mutation of the input. It only decides; wiring it
  * into a use case and into the compaction path is a later unit.
  */
-import { readPlainRecord, type PlainRecordSchema, containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+import { readPlainRecord, type PlainRecordSchema } from '@fleet/shared';
 import type { AttentionItemRecord } from './attention-item-records.js';
+import { isSecretShaped } from './entities/AttentionItem.js';
 import {
   ATTENTION_ITEM_ID_PATTERN,
   ATTENTION_ITEM_STATES,
@@ -47,10 +48,6 @@ interface AttentionCompactionSnapshot {
     subject: { readonly kind: AttentionItemSubjectKind; readonly ref: string };
   }>;
   terminalRunRefs: readonly string[];
-}
-
-function isSecretShaped(text: string): boolean {
-  return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
 }
 
 function subjectRefError(kind: AttentionItemSubjectKind, ref: string): string | null {

@@ -150,11 +150,14 @@ function recordedHostOf(reservation: {
   };
 }
 
+/** Upper bound on the brief-rejection detail carried into the result string. */
+const BRIEF_REASON_DETAIL_MAX_CHARS = 200;
+
 function incomplete(
   runId: string,
   attemptId: string,
   step: StartLaneRunStep,
-  reason: StartLaneRunIncompleteReason,
+  reason: StartLaneRunIncompleteReason | string,
 ): StartLaneRunResult {
   return { outcome: 'incomplete', runId, attemptId, step, reason };
 }
@@ -455,13 +458,31 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     };
     const briefResult = await deps.prepareBrief.prepareBriefPackage(briefRequest);
     if (briefResult.outcome === 'rejected') {
+      // The class is what callers switch on, but discarding the prepare's own
+      // reason left an operator with `brief-rejected` and nothing else: the
+      // reason had to be recovered by re-running `brief prepare` by hand with a
+      // reconstructed request. The class stays first in the string so prefix
+      // matching still works, and the detail follows it.
+      const briefClass =
+        briefResult.reasonClass === 'acceptance-spec-shell'
+          ? 'brief-acceptance-spec-shell'
+          : 'brief-rejected';
+      // The prepare's reasons are authored messages ('worktreePath is
+      // required', 'acceptanceChecks must be distinct names'), never matched
+      // text: the secret scan reports rule names only. Even so this is bounded
+      // and flattened before it joins a result string - a reason that embeds a
+      // nested error message is the one case that could carry caller input, and
+      // an unbounded newline-carrying string in a one-line CLI result is a
+      // readability problem at best.
+      const detail =
+        typeof briefResult.reason === 'string'
+          ? briefResult.reason.replace(/\s+/gu, ' ').trim().slice(0, BRIEF_REASON_DETAIL_MAX_CHARS)
+          : '';
       return incomplete(
         request.runId,
         request.attemptId,
         'brief',
-        briefResult.reasonClass === 'acceptance-spec-shell'
-          ? 'brief-acceptance-spec-shell'
-          : 'brief-rejected',
+        detail === '' ? briefClass : `${briefClass}: ${detail}`,
       );
     }
     const briefDigest = briefResult.prepared.briefDigest;

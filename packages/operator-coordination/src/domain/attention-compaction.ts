@@ -5,12 +5,16 @@
  * no filesystem, no I/O, no mutation of the input. It only decides; wiring it
  * into a use case and into the compaction path is a later unit.
  */
-import { readPlainRecord, type PlainRecordSchema } from '@fleet/shared';
+import { readPlainRecord, type PlainRecordSchema, containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import type { AttentionItemRecord } from './attention-item-records.js';
 import {
   ATTENTION_ITEM_ID_PATTERN,
   ATTENTION_ITEM_STATES,
   ATTENTION_ITEM_SUBJECT_KINDS,
+  ATTENTION_ITEM_SLUG_REF_PATTERN,
+  ATTENTION_ITEM_WORKTREE_REF_PATTERN,
+  ATTENTION_ITEM_PR_REF_PATTERN,
+  ATTENTION_ITEM_PROJECT_ID_PATTERN,
 } from './attention-item-records.js';
 import type { AttentionItemState, AttentionItemSubjectKind } from './attention-item-records.js';
 
@@ -43,6 +47,43 @@ interface AttentionCompactionSnapshot {
     subject: { readonly kind: AttentionItemSubjectKind; readonly ref: string };
   }>;
   terminalRunRefs: readonly string[];
+}
+
+function isSecretShaped(text: string): boolean {
+  return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
+}
+
+function subjectRefError(kind: AttentionItemSubjectKind, ref: string): string | null {
+  if (kind === 'worktree' && !ATTENTION_ITEM_WORKTREE_REF_PATTERN.test(ref)) {
+    return 'AttentionItem worktree subject ref must be a wt-<12 hex> digest, never a path';
+  }
+  if (kind === 'pr' && !ATTENTION_ITEM_PR_REF_PATTERN.test(ref)) {
+    return 'AttentionItem pr subject ref must be <owner>/<repo>#<number>';
+  }
+  if (kind === 'project' && !ATTENTION_ITEM_PROJECT_ID_PATTERN.test(ref)) {
+    return 'AttentionItem project subject ref must be a project id';
+  }
+  if (kind !== 'worktree' && kind !== 'pr' && kind !== 'project' && !ATTENTION_ITEM_SLUG_REF_PATTERN.test(ref)) {
+    return 'AttentionItem subject ref must be an id slug, never a path';
+  }
+  return null;
+}
+
+function runRefError(ref: string): string | null {
+  if (!ATTENTION_ITEM_SLUG_REF_PATTERN.test(ref)) {
+    return 'AttentionItem run ref must be an id slug, never a path';
+  }
+  return null;
+}
+
+function itemIdError(value: string): string | null {
+  if (!ATTENTION_ITEM_ID_PATTERN.test(value)) {
+    return 'AttentionItem itemId must be printable ASCII without space, 1-256 characters';
+  }
+  if (isSecretShaped(value)) {
+    return 'AttentionItem itemId contains a secret-shaped value and was refused';
+  }
+  return null;
 }
 
 const ATTENTION_COMPACTION_SCHEMA = {
@@ -84,7 +125,19 @@ export function planAttentionCompaction(input: unknown): AttentionCompactionResu
     const snapshot = read.value as unknown as AttentionCompactionSnapshot;
 
     for (const item of snapshot.items) {
-      if (!ATTENTION_ITEM_ID_PATTERN.test(item.itemId)) {
+      const idErr = itemIdError(item.itemId);
+      if (idErr !== null) {
+        return refusal();
+      }
+      const subjErr = subjectRefError(item.subject.kind, item.subject.ref);
+      if (subjErr !== null) {
+        return refusal();
+      }
+    }
+
+    for (const ref of snapshot.terminalRunRefs) {
+      const runErr = runRefError(ref);
+      if (runErr !== null) {
         return refusal();
       }
     }

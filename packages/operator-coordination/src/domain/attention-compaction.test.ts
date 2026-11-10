@@ -100,7 +100,7 @@ describe('planAttentionCompaction', () => {
     const result = planAttentionCompaction({
       items: [
         makeItem({ itemId: 'att-a', subject: { kind: 'run', ref: 'Run-1' } }),
-        makeItem({ itemId: 'att-b', subject: { kind: 'run', ref: 'run-1 ' } }),
+        makeItem({ itemId: 'att-b', subject: { kind: 'run', ref: 'run_1' } }),
         makeItem({ itemId: 'att-exact', subject: { kind: 'run', ref: 'run-1' } }),
       ],
       terminalRunRefs: ['run-1'],
@@ -160,7 +160,7 @@ describe('planAttentionCompaction', () => {
     }
   });
 
-  it('returns a frozen plan, never hands back a caller-owned array, and keeps identity across calls (rule 7)', () => {
+  it('returns a frozen plan, never hands back a caller-owned array, and returns a fresh array each call (rule 7)', () => {
     const item = makeItem({ itemId: 'att-a', subject: { kind: 'run', ref: 'run-1' } });
     Object.freeze(item.subject);
     Object.freeze(item);
@@ -309,6 +309,87 @@ describe('planAttentionCompaction', () => {
     expectRefusal(
       planAttentionCompaction({
         items: [makeItem({ itemId: 'has space', subject: { kind: 'run', ref: 'run-1' } })],
+        terminalRunRefs: ['run-1'],
+      }),
+    );
+  });
+
+  it('refuses a secret-shaped itemId', () => {
+    expectRefusal(
+      planAttentionCompaction({
+        items: [makeItem({ itemId: 'ghp_abcdefghijklmnopqrstuvwxyz123456', subject: { kind: 'run', ref: 'run-1' } })],
+        terminalRunRefs: ['run-1'],
+      }),
+    );
+  });
+
+  it('refuses a run subject ref that is not a valid slug (space)', () => {
+    expectRefusal(
+      planAttentionCompaction({
+        items: [makeItem({ itemId: 'att-a', subject: { kind: 'run', ref: 'run 1' } })],
+        terminalRunRefs: ['run 1'],
+      }),
+    );
+  });
+
+  it('refuses a terminalRunRef that is not a valid run slug (space)', () => {
+    expectRefusal(
+      planAttentionCompaction({
+        items: [makeItem({ itemId: 'att-a', subject: { kind: 'run', ref: 'run-1' } })],
+        terminalRunRefs: ['run 1'],
+      }),
+    );
+  });
+
+  it('refuses a worktree subject ref that is not a wt- digest', () => {
+    expectRefusal(
+      planAttentionCompaction({
+        items: [makeItem({ itemId: 'att-a', subject: { kind: 'worktree', ref: 'not-a-digest' } })],
+        terminalRunRefs: ['run-1'],
+      }),
+    );
+  });
+
+  it('refuses a pr subject ref that is not owner/repo#number', () => {
+    expectRefusal(
+      planAttentionCompaction({
+        items: [makeItem({ itemId: 'att-a', subject: { kind: 'pr', ref: 'invalid-ref' } })],
+        terminalRunRefs: ['run-1'],
+      }),
+    );
+  });
+
+  it('refuses a project subject ref that is not a project id', () => {
+    expectRefusal(
+      planAttentionCompaction({
+        items: [makeItem({ itemId: 'att-a', subject: { kind: 'project', ref: 'has space' } })],
+        terminalRunRefs: ['run-1'],
+      }),
+    );
+  });
+
+  it('refuses an attempt subject ref that is not a slug', () => {
+    expectRefusal(
+      planAttentionCompaction({
+        items: [makeItem({ itemId: 'att-a', subject: { kind: 'attempt', ref: 'has space' } })],
+        terminalRunRefs: ['run-1'],
+      }),
+    );
+  });
+
+  it('refuses a reservation subject ref that is not a slug', () => {
+    expectRefusal(
+      planAttentionCompaction({
+        items: [makeItem({ itemId: 'att-a', subject: { kind: 'reservation', ref: 'has space' } })],
+        terminalRunRefs: ['run-1'],
+      }),
+    );
+  });
+
+  it('refuses a work-order subject ref that is not a slug', () => {
+    expectRefusal(
+      planAttentionCompaction({
+        items: [makeItem({ itemId: 'att-a', subject: { kind: 'work-order', ref: 'has space' } })],
         terminalRunRefs: ['run-1'],
       }),
     );

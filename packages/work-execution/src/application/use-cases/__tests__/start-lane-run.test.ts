@@ -972,7 +972,7 @@ describe('StartLaneRunUseCase', () => {
 
   it.each([
     ['worktree-unknown', 'worktree', 'worktree-unknown'],
-    ['brief-rejected', 'brief', 'brief-rejected'],
+    ['brief-rejected', 'brief', 'brief-rejected: example brief rejection'],
     ['attempt-save-failed', 'attempt', 'attempt-save-failed'],
     ['run-exists', 'run', 'run-exists'],
   ])('test 4 (%s): a crash at that step keeps the reservation; the retry with the same ids completes', async (
@@ -1028,7 +1028,7 @@ describe('StartLaneRunUseCase', () => {
       runId: RUN_ID,
       attemptId: ATTEMPT_ID,
       step: 'brief',
-      reason: 'brief-acceptance-spec-shell',
+      reason: 'brief-acceptance-spec-shell: <redacted>',
     });
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
   });
@@ -1042,9 +1042,43 @@ describe('StartLaneRunUseCase', () => {
       runId: RUN_ID,
       attemptId: ATTEMPT_ID,
       step: 'brief',
-      reason: 'brief-rejected',
+      reason: 'brief-rejected: example brief rejection',
     });
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+  });
+
+  it('test 4e: the brief rejection detail is carried, so an operator need not reconstruct the request', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([
+      { outcome: 'rejected', reason: 'acceptanceChecks must be distinct names' },
+    ]);
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    // The class stays the prefix, so callers matching on it keep working.
+    expect(result).toMatchObject({ step: 'brief' });
+    expect(result).toHaveProperty('reason');
+    const reason = (result as { reason: string }).reason;
+    expect(reason.startsWith('brief-rejected')).toBe(true);
+    expect(reason).toContain('acceptanceChecks must be distinct names');
+  });
+
+  it('test 4f: a long multi-line rejection reason is flattened and bounded', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([
+      { outcome: 'rejected', reason: 'line one\nline two   spaced\n' + 'x'.repeat(500) },
+    ]);
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    const reason = (result as { reason: string }).reason;
+    expect(reason).not.toContain('\n');
+    expect(reason).toContain('line one line two spaced');
+    // class + ': ' + at most 200 detail characters
+    expect(reason.length).toBeLessThanOrEqual('brief-rejected'.length + 2 + 200);
+  });
+
+  it('test 4g: a rejection with no reason string keeps the bare class', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([{ outcome: 'rejected', reason: '   ' }]);
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toMatchObject({ step: 'brief', reason: 'brief-rejected' });
   });
 
   it('test 5: a retry after completion returns started and calls no fake again', async () => {

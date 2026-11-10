@@ -35,6 +35,9 @@ const POLICY_REVISION = "policy-1";
 const IMPLEMENTER_MODEL = "example-provider/glm-5.3";
 const REVIEWER_MODEL = "example-provider/grok-4.7";
 
+const API_REVIEWER_MODEL = "example-vendor/review-api-1";
+const API_BASE_URL_OK = "http://10.60.0.1:4176/inception/v1";
+
 const INSTALLATION: FleetInstallation = {
   schemaVersion: 2,
   hosts: {
@@ -99,6 +102,35 @@ const INSTALLATION_NO_REVIEWER: FleetInstallation = {
   ],
   chains: {
     implementer: [{ seatId: "implementer" }],
+  },
+  shelf: { provider: "local" },
+  forge: { mode: "none" },
+};
+
+const INSTALLATION_API_REVIEWER: FleetInstallation = {
+  schemaVersion: 2,
+  hosts: INSTALLATION.hosts,
+  tools: ["opencode", "api"],
+  seats: [
+    {
+      id: "implementer",
+      tool: "opencode",
+      model: IMPLEMENTER_MODEL,
+      agent: "example-agent",
+      roles: ["implementer"],
+      costClass: "plan-quota",
+    },
+    {
+      id: "reviewer-api",
+      tool: "api",
+      model: API_REVIEWER_MODEL,
+      roles: ["reviewer"],
+      costClass: "paid",
+    },
+  ],
+  chains: {
+    implementer: [{ seatId: "implementer" }],
+    reviewer: [{ seatId: "reviewer-api" }],
   },
   shelf: { provider: "local" },
   forge: { mode: "none" },
@@ -249,6 +281,38 @@ function makeSpy(): { spy: OcmReviewTransportSpawn; calls: SpawnCall[] } {
     };
   };
   return { spy, calls };
+}
+
+/** Set the two api review variables for one call and restore them afterwards. */
+async function withApiReviewEnv(
+  values: { baseUrl?: string; schema?: string },
+  run: () => Promise<void>,
+): Promise<void> {
+  const previousBase = process.env.FLEET_REVIEW_API_BASE_URL;
+  const previousSchema = process.env.FLEET_REVIEW_API_SCHEMA;
+  const restore = (name: string, previous: string | undefined): void => {
+    if (previous === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = previous;
+    }
+  };
+  if (values.baseUrl === undefined) {
+    delete process.env.FLEET_REVIEW_API_BASE_URL;
+  } else {
+    process.env.FLEET_REVIEW_API_BASE_URL = values.baseUrl;
+  }
+  if (values.schema === undefined) {
+    delete process.env.FLEET_REVIEW_API_SCHEMA;
+  } else {
+    process.env.FLEET_REVIEW_API_SCHEMA = values.schema;
+  }
+  try {
+    await run();
+  } finally {
+    restore("FLEET_REVIEW_API_BASE_URL", previousBase);
+    restore("FLEET_REVIEW_API_SCHEMA", previousSchema);
+  }
 }
 
 let apiBaseUrl = "";
@@ -446,5 +510,106 @@ describe("POST /v1/reviews review transport wiring", () => {
     expect(response.envelope.result?.outcome).toBe("rejected");
     expect(response.envelope.result?.reason).toContain("share the same underlying model");
     expect(calls).toHaveLength(0);
+  });
+
+  it("passes an api configuration problem through with its text", async () => {
+    const { dir: repoDir, base, head } = await makeGitRepo();
+    const stateDir = await makeTempDir();
+    await seedAttempt(stateDir, repoDir, base, head);
+    await seedAssessment(stateDir, head);
+    await withApiReviewEnv({ baseUrl: API_BASE_URL_OK, schema: "tool" }, async () => {
+      const { spy } = makeSpy();
+      configureFleetApiRuntime({
+        stateDir,
+        installation: INSTALLATION_API_REVIEWER,
+        reviewSpawn: spy,
+      });
+
+      const response = await callReviews(
+        reviewRequest({ candidateHeadSha: head, reviewerModel: API_REVIEWER_MODEL }),
+      );
+
+      expect(response.envelope.result?.outcome).toBe("rejected");
+      const reason = response.envelope.result?.reason ?? "";
+      // An operator typo surfaces as a typo, not as "not configured".
+      expect(reason).toContain("FLEET_REVIEW_API_SCHEMA");
+      expect(reason).toContain("must be one of");
+      expect(reason).not.toBe("review transport unavailable");
+      // ...and nothing else rides along: no seat id, no host, no path.
+      expect(reason).not.toContain("reviewer-api");
+      expect(reason).not.toContain("this-machine");
+      expect(reason).not.toContain(repoDir);
+    });
+  });
+
+  it("never echoes the rejected endpoint value of a configuration problem", async () => {
+    const { dir: repoDir, base, head } = await makeGitRepo();
+    const stateDir = await makeTempDir();
+    await seedAttempt(stateDir, repoDir, base, head);
+    await seedAssessment(stateDir, head);
+    await withApiReviewEnv(
+      { baseUrl: "http://operator:sk-secret@10.0.0.1/v1", schema: "json-object" },
+      async () => {
+        const { spy } = makeSpy();
+        configureFleetApiRuntime({
+          stateDir,
+          installation: INSTALLATION_API_REVIEWER,
+          reviewSpawn: spy,
+        });
+
+        const response = await callReviews(
+          reviewRequest({ candidateHeadSha: head, reviewerModel: API_REVIEWER_MODEL }),
+        );
+
+        const reason = response.envelope.result?.reason ?? "";
+        expect(reason).toContain("must not embed credentials");
+        expect(reason).not.toContain("sk-secret");
+        expect(reason).not.toContain("10.0.0.1");
+        expect(reason).not.toContain("operator");
+      },
+    );
+  });
+
+  it("collapses a review timeout to the fixed reason", async () => {
+    const { dir: repoDir, base, head } = await makeGitRepo();
+    const stateDir = await makeTempDir();
+    await seedAttempt(stateDir, repoDir, base, head);
+    await seedAssessment(stateDir, head);
+    let call = 0;
+    const spy: OcmReviewTransportSpawn = async () => {
+      call += 1;
+      if (call === 1) {
+        // The idle --wait probe answers; the review itself then times out.
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return {
+        exitCode: null,
+        stdout: "",
+        stderr: `timed out reviewing ${repoDir} on this-machine`,
+        timedOut: true,
+      };
+    };
+    configureFleetApiRuntime({ stateDir, installation: INSTALLATION, reviewSpawn: spy });
+
+    const response = await callReviews(reviewRequest({ candidateHeadSha: head }));
+
+    expect(response.envelope.result?.outcome).toBe("rejected");
+    expect(response.envelope.result?.reason).toBe("review transport unavailable");
+  });
+
+  it("collapses a busy seat refusal to the fixed reason", async () => {
+    const { dir: repoDir, base, head } = await makeGitRepo();
+    const stateDir = await makeTempDir();
+    await seedAttempt(stateDir, repoDir, base, head);
+    await seedAssessment(stateDir, head);
+    // Exit 75 from the --wait probe is the busy-worktree refusal.
+    const spy: OcmReviewTransportSpawn = async () => ({ exitCode: 75, stdout: "", stderr: "" });
+    configureFleetApiRuntime({ stateDir, installation: INSTALLATION, reviewSpawn: spy });
+
+    const response = await callReviews(reviewRequest({ candidateHeadSha: head }));
+
+    expect(response.envelope.result?.outcome).toBe("rejected");
+    expect(response.envelope.result?.reason).toBe("review transport unavailable");
+    expect(response.envelope.result?.reason).not.toContain("busy");
   });
 });

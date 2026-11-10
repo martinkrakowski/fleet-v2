@@ -55,6 +55,11 @@ const RUNTIME_ONLY = new Set([
   "FLEET_STATE_DIR",
   "FLEET_INSTALLATION_FILE",
   "FLEET_API_URL",
+  // The api review transport's endpoint and declared schema enforcement: read by the API and CLI
+  // composition roots at runtime, and set by the wiring tests for the code under test. No task's
+  // result depends on the ambient value, because every test that reads them sets them itself.
+  "FLEET_REVIEW_API_BASE_URL",
+  "FLEET_REVIEW_API_SCHEMA",
   "FLEET_API_ALLOWED_ORIGINS",
   "FLEET_API_ALLOW_REMOTE",
   "FLEET_TELEMETRY_ENDPOINT",

@@ -98,6 +98,7 @@ export function composeEvidence(input: ComposeEvidenceInput) {
   const reviewChains = installationModel?.chains;
   let independentReview: IndependentReviewAdapter;
   if (hasReviewerSeat(reviewSeats, reviewChains)) {
+    const apiReview = resolveApiReviewSettings(options?.env ?? process.env);
     independentReview = new IndependentReviewAdapter({
       runReview: createReviewTransportRouter({
         seats: reviewSeats,
@@ -116,7 +117,12 @@ export function composeEvidence(input: ComposeEvidenceInput) {
         // what it should do when nothing is configured.
         // The runtime's own env object, which tests inject; the sibling
         // resolveRunnerSettings call honours it the same way.
-        ...resolveApiReviewSettings(options?.env ?? process.env),
+        // Mapped field by field so an operator typo surfaces in the CLI too.
+        ...(apiReview.apiBaseURL !== undefined ? { apiBaseURL: apiReview.apiBaseURL } : {}),
+        ...(apiReview.apiSchemaEnforcement !== undefined
+          ? { apiSchemaEnforcement: apiReview.apiSchemaEnforcement }
+          : {}),
+        ...(apiReview.problemCode !== undefined ? { apiConfigProblemCode: apiReview.problemCode } : {}),
         ...(options?.reviewSpawn !== undefined ? { ocmSpawn: options.reviewSpawn } : {}),
       }),
     });

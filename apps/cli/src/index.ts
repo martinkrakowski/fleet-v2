@@ -66,6 +66,7 @@ import { evidenceCommands } from './commands/evidence.js';
 import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
+import { ownerItemsCommands } from './commands/owner-items.js';
 import { mergeCommands } from './merge.js';
 import { relaunchCommands } from './relaunch.js';
 import { releaseCommands } from './release.js';
@@ -122,6 +123,33 @@ interface ParseFlagsOptions {
    * key instead of refusing them; handlers that read `positional` validate it.
    */
   readonly allowPositional?: boolean;
+  /**
+   * Repeatable flag keys: when present, repeated occurrences accumulate as an
+   * array instead of replacing the last value. Used only by `owner-items add`
+   * for the `ref` key; every other group stays last-wins.
+   */
+  readonly repeatableKeys?: ReadonlySet<string>;
+}
+
+/** Assign one flag value; a repeatable key accumulates successive values as an array. */
+function setFlagValue(
+  payload: Payload,
+  key: string,
+  value: unknown,
+  repeatableKeys?: ReadonlySet<string>,
+): void {
+  if (repeatableKeys?.has(key)) {
+    const existing = payload[key];
+    if (Array.isArray(existing)) {
+      existing.push(value);
+    } else if (existing !== undefined) {
+      payload[key] = [existing, value];
+    } else {
+      payload[key] = value;
+    }
+    return;
+  }
+  payload[key] = value;
 }
 
 /**
@@ -166,15 +194,15 @@ function parseFlags(tokens: readonly string[], options?: ParseFlagsOptions): Pay
     const separator = body.indexOf('=');
     const key = kebabToCamel(separator === -1 ? body : body.slice(0, separator));
     if (separator !== -1) {
-      payload[key] = body.slice(separator + 1);
+      setFlagValue(payload, key, body.slice(separator + 1), options?.repeatableKeys);
       continue;
     }
     const next = tokens[index + 1];
     if (next === undefined || next.startsWith('--')) {
-      payload[key] = true;
+      setFlagValue(payload, key, true, options?.repeatableKeys);
       continue;
     }
-    payload[key] = next;
+    setFlagValue(payload, key, next, options?.repeatableKeys);
     index += 1;
   }
   if (jsonPayload !== undefined) {
@@ -270,6 +298,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   knowledge: knowledgeCommands,
   coordination: coordinationCommands,
   questions: questionsCommands,
+  'owner-items': ownerItemsCommands,
   merge: mergeCommands,
   relaunch: relaunchCommands,
   release: releaseCommands,
@@ -724,6 +753,7 @@ Commands:
   decisions report --consumer knowledge-ranking
   coordination register-profile|capabilities|request-decision|resolve-auth|consume-auth|publish-observation|attention|attention-items|attention-dismiss|send-relay|ack-relay|outstanding
   questions ask|list|show|answer|sync|expire|acknowledge|wait
+  owner-items add|list|resolve
   help | --help
 
 Exit codes: 0 completed, 1 refused/rejected/blocked/unknown result, 2 usage error.`;
@@ -915,8 +945,14 @@ export async function runCli(
     const allowPositional =
       (group === 'questions' && QUESTIONS_POSITIONAL_SUBCOMMANDS.has(subcommand)) ||
       (group === 'knowledge' && subcommand === 'candidates') ||
-      (group === 'cutover' && subcommand === 'shadow');
-    const payload = parseFlags(rest, { allowPositional });
+      (group === 'cutover' && subcommand === 'shadow') ||
+      (group === 'owner-items' && subcommand === 'resolve');
+    const payload = parseFlags(rest, {
+      allowPositional,
+      ...(group === 'owner-items' && subcommand === 'add'
+        ? { repeatableKeys: new Set(['ref']) }
+        : {}),
+    });
     const result = await handler(payload, activeRuntime);
     // Line-oriented outputs (`knowledge candidates`, `decisions report`)
     // print one line per record instead of one JSON document; a refusal

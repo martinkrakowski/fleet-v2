@@ -176,6 +176,7 @@ import {
   AttentionReadAdapter,
   ClearAttentionItemUseCase,
   ListAttentionItemsUseCase,
+  ListOwnerItemsUseCase,
   CheckOwnerDecisionUseCase,
   CoordinationRequestRepositoryAdapter,
   DecisionTransportAdapter,
@@ -194,12 +195,14 @@ import {
   ReadProjectAttentionUseCase,
   RecordAttentionItemUseCase,
   RecordAuthorizationConsumptionUseCase,
+  RecordOwnerItemUseCase,
   RecordProjectProbeUseCase,
   RecordRelayAcknowledgementUseCase,
   RegisterProjectProfileUseCase,
   RelayTransportAdapter,
   RequestScopedDecisionUseCase,
   ResolveActionAuthorizationUseCase,
+  ResolveOwnerItemUseCase,
   RetireProjectProfileUseCase,
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
@@ -672,6 +675,9 @@ export interface FleetCliRuntime {
     readonly recordAttentionItem: RecordAttentionItemUseCase;
     readonly clearAttentionItem: ClearAttentionItemUseCase;
     readonly listAttentionItems: ListAttentionItemsUseCase;
+    readonly recordOwnerItem: RecordOwnerItemUseCase;
+    readonly listOwnerItems: ListOwnerItemsUseCase;
+    readonly resolveOwnerItem: ResolveOwnerItemUseCase;
     readonly sendFleetRelay: SendFleetRelayUseCase;
     readonly recordRelayAcknowledgement: RecordRelayAcknowledgementUseCase;
     readonly inspectOutstandingCoordination: InspectOutstandingCoordinationUseCase;

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { createApiReviewTransport, decodeApiVerdict, MAX_API_REVIEW_DIFF_BYTES } from './ApiReviewTransport.adapter.js';
 import type { ApiReviewGenerate, ApiReviewGenerateResult } from './ApiReviewTransport.adapter.js';
+import { BRIEF_INPUT_RULE } from '../../domain/untrusted-input.js';
 import { ReviewTransportError } from './OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from './ReviewTransportRouter.js';
 
@@ -297,6 +298,46 @@ describe('createApiReviewTransport: the completed result', () => {
     expect(seenPrompt).toContain('diff --git');
   });
 
+  it('puts the diff first and the metadata last, so the cached prefix is the diff', async () => {
+    let seenPrompt = '';
+    const run = transport(async (input) => {
+      seenPrompt = input.prompt;
+      return { object: { result: 'pass', findings: [] } };
+    });
+    await run({ ...request, diffSummary: 'one file touched' });
+
+    const diffAt = seenPrompt.indexOf('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
+    const modelAt = seenPrompt.indexOf('Implementer model:');
+    const headAt = seenPrompt.indexOf('Head under review:');
+    const scopeAt = seenPrompt.indexOf('Scope: one file touched');
+
+    expect(diffAt).toBe(0);
+    expect(modelAt).toBeGreaterThan(diffAt);
+    expect(headAt).toBeGreaterThan(modelAt);
+    expect(scopeAt).toBeGreaterThan(headAt);
+  });
+
+  it('a brief-check puts the diff first, then the brief, then the metadata', async () => {
+    let seenPrompt = '';
+    const run = transport(async (input) => {
+      seenPrompt = input.prompt;
+      return { object: { result: 'pass', findings: [] } };
+    });
+    await run({ ...request, kind: 'brief-check', briefText: 'do the thing' });
+
+    const diffAt = seenPrompt.indexOf('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
+    const ruleAt = seenPrompt.indexOf(BRIEF_INPUT_RULE);
+    const briefAt = seenPrompt.indexOf('<<<UNTRUSTED nonce=0123456789abcdef label="brief">>>');
+    const modelAt = seenPrompt.indexOf('Implementer model:');
+    const kindAt = seenPrompt.indexOf('Review kind: brief-check');
+
+    expect(diffAt).toBe(0);
+    expect(ruleAt).toBeGreaterThan(diffAt);
+    expect(briefAt).toBeGreaterThan(ruleAt);
+    expect(modelAt).toBeGreaterThan(briefAt);
+    expect(kindAt).toBeGreaterThan(modelAt);
+  });
+
   it('refuses an oversized brief rather than truncating it', async () => {
     const run = transport(answers({ result: 'pass', findings: [] }));
     await expect(run({ ...request, kind: 'brief-check', briefText: 'z'.repeat(70 * 1024) })).rejects.toThrow(
@@ -585,5 +626,99 @@ describe('pre-merge re-check: a 429 that actually surfaces', () => {
       result: 'unknown',
       unknownReason: 'unparseable-verdict',
     });
+  });
+});
+
+describe('nonce derivation from candidate head sha', () => {
+  const DIFF = 'diff --git a/x b/x\n+one line\n';
+
+  function makeTransportForHead(headSha: string, overrides: Partial<{
+    makeNonce: () => string;
+    generate: ApiReviewGenerate;
+  }> = {}) {
+    let seenPrompt = '';
+    const run = createApiReviewTransport({
+      baseURL: 'http://10.0.0.1:4176/inception/v1',
+      model: 'mercury-3',
+      schemaEnforcement: 'native-json-schema',
+      location: location({ readDiff: async () => DIFF, readHead: async () => headSha }),
+      makeNonce: overrides.makeNonce,
+      generate: overrides.generate ?? (async (input) => {
+        seenPrompt = input.prompt;
+        return { object: { result: 'pass', findings: [] }, readOnly: true };
+      }),
+    });
+    return { run, get seenPrompt() { return seenPrompt; } };
+  }
+
+  it('two calls with the same candidateHeadSha produce identical prompts up to the diff closing marker', async () => {
+    const t1 = makeTransportForHead(HEAD);
+    await t1.run({ ...request, candidateHeadSha: HEAD });
+    const prompt1 = t1.seenPrompt;
+
+    const t2 = makeTransportForHead(HEAD);
+    await t2.run({ ...request, candidateHeadSha: HEAD });
+    const prompt2 = t2.seenPrompt;
+
+    const closingMarker1 = prompt1.indexOf('<<<END UNTRUSTED nonce=');
+    const closingMarker2 = prompt2.indexOf('<<<END UNTRUSTED nonce=');
+    expect(closingMarker1).toBeGreaterThan(0);
+    expect(closingMarker2).toBeGreaterThan(0);
+    expect(prompt1.slice(0, closingMarker1)).toBe(prompt2.slice(0, closingMarker2));
+  });
+
+  it('two calls with different candidateHeadSha values produce different nonces', async () => {
+    const HEAD2 = 'c'.repeat(40);
+    const t1 = makeTransportForHead(HEAD);
+    await t1.run({ ...request, candidateHeadSha: HEAD });
+    const prompt1 = t1.seenPrompt;
+
+    const t2 = makeTransportForHead(HEAD2);
+    await t2.run({ ...request, candidateHeadSha: HEAD2 });
+    const prompt2 = t2.seenPrompt;
+
+    const nonceMatch1 = prompt1.match(/<<<UNTRUSTED nonce=([0-9a-f]{32}) label="diff">>>/);
+    const nonceMatch2 = prompt2.match(/<<<UNTRUSTED nonce=([0-9a-f]{32}) label="diff">>>/);
+    expect(nonceMatch1).not.toBeNull();
+    expect(nonceMatch2).not.toBeNull();
+    expect(nonceMatch1![1]).not.toBe(nonceMatch2![1]);
+  });
+
+  it('the derived nonce matches the expected format', async () => {
+    const t = makeTransportForHead(HEAD);
+    await t.run({ ...request, candidateHeadSha: HEAD });
+    const prompt = t.seenPrompt;
+
+    const nonceMatch = prompt.match(/<<<UNTRUSTED nonce=([0-9a-f]{32}) label="diff">>>/);
+    expect(nonceMatch).not.toBeNull();
+    expect(nonceMatch![1]).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('an empty candidateHeadSha still produces a valid nonce and does not throw', async () => {
+    const t = makeTransportForHead('');
+    await t.run({ ...request, candidateHeadSha: '' });
+    const prompt = t.seenPrompt;
+
+    const nonceMatch = prompt.match(/<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="diff">>>/);
+    expect(nonceMatch).not.toBeNull();
+    expect(nonceMatch![1]).toMatch(/^[0-9a-f]{16,64}$/);
+  });
+
+  it('an injected makeNonce still wins over the derived one', async () => {
+    let seenPrompt = '';
+    const run = createApiReviewTransport({
+      baseURL: 'http://10.0.0.1:4176/inception/v1',
+      model: 'mercury-3',
+      schemaEnforcement: 'native-json-schema',
+      location: location({ readDiff: async () => DIFF, readHead: async () => HEAD }),
+      makeNonce: () => 'ffffffffffffffffffffffffffffffff',
+      generate: async (input) => {
+        seenPrompt = input.prompt;
+        return { object: { result: 'pass', findings: [] }, readOnly: true };
+      },
+    });
+    await run({ ...request, candidateHeadSha: HEAD });
+
+    expect(seenPrompt).toContain('<<<UNTRUSTED nonce=ffffffffffffffffffffffffffffffff label="diff">>>');
   });
 });

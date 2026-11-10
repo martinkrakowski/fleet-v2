@@ -25,12 +25,14 @@ import {
   IssueMergeGrantUseCase,
   IssuePolicyForgeGrantUseCase,
   ListAttentionItemsUseCase,
+  ListOwnerItemsUseCase,
   ListOwnerQuestionsUseCase,
   ListProjectProfilesUseCase,
   ObservationPublicationAdapter,
   OrchestratorRequestJournalAdapter,
   OrchestratorRequestRepositoryAdapter,
   OrchestratorSessionRepositoryAdapter,
+  OwnerItemRepositoryAdapter,
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   PublishProjectObservationUseCase,
@@ -39,12 +41,14 @@ import {
   ReconcileOrchestratorRequestUseCase,
   RecordAttentionItemUseCase,
   RecordAuthorizationConsumptionUseCase,
+  RecordOwnerItemUseCase,
   RecordProjectProbeUseCase,
   RecordRelayAcknowledgementUseCase,
   RegisterProjectProfileUseCase,
   RelayTransportAdapter,
   RequestScopedDecisionUseCase,
   ResolveActionAuthorizationUseCase,
+  ResolveOwnerItemUseCase,
   RetireProjectProfileUseCase,
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
@@ -133,6 +137,7 @@ export function composeCoordination(input: ComposeCoordinationInput) {
   // acknowledged.
   const ownerQuestionRepository = new OwnerQuestionRepositoryAdapter({ stateDir });
   const ownerQuestionClock: OwnerQuestionClock = { nowIso: () => new Date().toISOString() };
+  const ownerItemRepository = new OwnerItemRepositoryAdapter({ stateDir });
   const attentionItemRepository = new AttentionItemRepositoryAdapter({ stateDir });
   const attentionClock: AttentionClock = { nowIso: () => new Date().toISOString() };
 
@@ -273,6 +278,17 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     }),
     listAttentionItems: new ListAttentionItemsUseCase({
       itemRepo: attentionItemRepository,
+    }),
+    recordOwnerItem: new RecordOwnerItemUseCase({
+      itemRepo: ownerItemRepository,
+      clock: { nowIso: () => new Date().toISOString() },
+      ids: { newItemId: () => 'oi-' + newUlid() },
+    }),
+    listOwnerItems: new ListOwnerItemsUseCase({ itemRepo: ownerItemRepository }),
+    resolveOwnerItem: new ResolveOwnerItemUseCase({
+      itemRepo: ownerItemRepository,
+      ownerQuestionRepo: ownerQuestionRepository,
+      clock: { nowIso: () => new Date().toISOString() },
     }),
     orchestratorRequestRepository,
     reconcileOrchestratorRequest,

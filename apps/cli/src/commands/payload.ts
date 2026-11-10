@@ -171,6 +171,7 @@ export const NON_ZERO_OUTCOMES: ReadonlySet<string> = new Set([
   'refused',
   'blocked',
   'not-found',
+  'key-held',
   'unavailable',
   'delivery-gap',
   'delivery-failed',

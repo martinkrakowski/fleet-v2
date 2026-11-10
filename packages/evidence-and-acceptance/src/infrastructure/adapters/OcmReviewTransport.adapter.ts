@@ -2,6 +2,16 @@ import { randomBytes } from 'node:crypto';
 
 import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
 import type { FindingSeverity, ReviewFindingRecord, ReviewUnknownReason } from '../../domain/evidence-records.js';
+import { isWholeValuePlaceholder } from '../../domain/placeholder-evidence.js';
+import {
+  MAX_REVIEW_REPLY_LENGTH,
+  MAX_STRUCTURED_FINDINGS,
+  MAX_FINDING_SUMMARY_LENGTH,
+  containsReviewSecretShape,
+  extractSingleTrailingJsonFence,
+  isSafeRelativeFilePath,
+  validateReviewAnswerObject,
+} from '../../domain/review-answer-schema.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewTransportDiagnostic, ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
@@ -515,7 +525,6 @@ export const REVIEWER_ENV_ALLOWLIST: readonly string[] = [
   'SSH_AUTH_SOCK',
 ];
 
-const VERDICT_PATTERN = /^VERDICT: (PASS|FAIL|FIX FIRST)$/;
 const FINDING_PATTERN = /^FINDING: ([A-Za-z][\w-]*) (\S+?)(?::(\d+))? (.+)$/i;
 
 /**
@@ -638,6 +647,17 @@ function isStepStart(record: Record<string, unknown>): boolean {
   return false;
 }
 
+function isStepFinish(record: Record<string, unknown>): boolean {
+  if (record.type === 'step_finish' || record.type === 'step-finish') {
+    return true;
+  }
+  const part = isPlainRecord(record.part) ? record.part : null;
+  if (part !== null && (part.type === 'step_finish' || part.type === 'step-finish')) {
+    return true;
+  }
+  return false;
+}
+
 function isToolEvent(record: Record<string, unknown>): boolean {
   if (record.type === 'tool' || record.type === 'tool_use' || record.type === 'tool_call') {
     return true;
@@ -690,21 +710,25 @@ function extractToolName(record: Record<string, unknown>): string | null {
 // lane-written text (a full diff, file contents) must go through
 // `wrapUntrusted` with a per-prompt nonce, never pasted in directly.
 export const REVIEW_REPLY_CONTRACT: string =
-  'When your review is complete, format your response according to the following reply contract:\n\n' +
-  '- For each finding, output a line matching:\n' +
-  '  FINDING: <blocker|major|minor|nit> <filePath>[:<line>] <summary>\n' +
-  '  Use "-" for filePath if the finding is not tied to a specific file.\n' +
-  '- Conclude with exactly one verdict line matching:\n' +
-  '  VERDICT: PASS\n' +
-  '  or\n' +
-  '  VERDICT: FAIL';
+  'When your review is complete, end your reply with exactly ONE fenced ```json block, placed at the very end of your reply:\n\n' +
+  '```json\n' +
+  '{"verdict":"PASS"|"FAIL","findings":[{"severity":"blocker"|"major"|"minor"|"nit","file":"<repo-relative path>","line":<positive int or null>,"summary":"<= 300 chars"}]}\n' +
+  '```\n\n' +
+  'Reply-contract rules:\n' +
+  '- Place this single ```json block at the very end of the reply, with no text after the closing fence and no other ```json block anywhere in the reply.\n' +
+  '- Use "findings":[] when there are no findings (at most 100 entries).\n' +
+  '- Include exact keys only: "verdict" and "findings" at the top level, and "severity", "file", "line", "summary" on each finding.\n' +
+  '- "file" must be a safe repo-relative path (no leading "/", "-", "~", or "..").\n' +
+  '- "line" must be a positive integer or null.\n' +
+  '- "summary" must be non-empty, at most 300 characters, and free of secrets.\n' +
+  '- Do not emit free-text VERDICT: or FINDING: lines: the outcome is read only from the validated ```json block.';
 
 /**
  * Failure-mode checklist every conductor review prompt carries (§3.3). The
  * CLI transport reuses it, so both transports ask the same items.
  */
 export const REVIEW_CHECKLIST: string = [
-  'Check every item below and report a FINDING for each item that fails:',
+  'Check every item below and report each item that fails as a finding:',
   '(a) the change does what the brief asks, nothing more (scope drift);',
   '(b) claimed checks really pass, or are not claimed;',
   '(c) imports, APIs and files that do not exist;',
@@ -811,7 +835,7 @@ function buildKindReviewPrompt(
       });
       sections.push(
         `${BRIEF_INPUT_RULE}\n\nBrief:\n${wrappedBrief}\n\n` +
-          'Does the change satisfy every work-order item of the brief? Report a FINDING for each item the change does not satisfy.',
+          'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.',
       );
     } else {
       throw new ReviewTransportError('a brief-check review requires the brief text', 'transport-failed');
@@ -878,24 +902,20 @@ export function stripUntrustedEchoBlocks(text: string): string {
 }
 
 /**
- * The stripped text plus whether an untrusted block or diff fence was opened
- * and never closed. An unclosed block is a malformed answer: callers refuse it
+ * The stripped text plus whether an untrusted block was opened and never
+ * closed. An unclosed block is a malformed answer: callers refuse it
  * (no verdict is read) rather than trusting whatever the strip left.
  */
-function scanUntrustedEchoBlocks(text: string): { readonly stripped: string; readonly unclosed: boolean } {
+function scanUntrustedEchoBlocks(text: string): {
+  readonly stripped: string;
+  readonly unclosed: boolean;
+} {
   const kept: string[] = [];
   let openNonce: string | null = null;
-  let fenceToken: string | null = null;
   for (const line of text.split(/\r?\n/)) {
     if (openNonce !== null) {
       if (line.trim() === `<<<END UNTRUSTED nonce=${openNonce}>>>`) {
         openNonce = null;
-      }
-      continue;
-    }
-    if (fenceToken !== null) {
-      if (line.trim() === fenceToken) {
-        fenceToken = null;
       }
       continue;
     }
@@ -904,14 +924,9 @@ function scanUntrustedEchoBlocks(text: string): { readonly stripped: string; rea
       openNonce = openMatch[1] ?? null;
       continue;
     }
-    const fenceMatch = /^(```|~~~)diff\s*$/.exec(line.trim());
-    if (fenceMatch !== null) {
-      fenceToken = fenceMatch[1] ?? null;
-      continue;
-    }
     kept.push(line);
   }
-  return { stripped: kept.join('\n'), unclosed: openNonce !== null || fenceToken !== null };
+  return { stripped: kept.join('\n'), unclosed: openNonce !== null };
 }
 
 /**
@@ -1046,101 +1061,137 @@ function parseFindingLines(text: string): ParsedFindingLines {
  * when that line carries none. The argument is always the whole answer (every
  * text part joined in order), never a single part or a pre-extracted verdict
  * snippet.
+ *
+ * Removed with RV5 (F153): free-text `VERDICT:` matching is gone. The outcome
+ * is read only from a single schema-valid trailing ```json block, so both
+ * parsers below delegate to one structured parse.
  */
-function lastLineVerdict(verdictText: string): 'PASS' | 'FAIL' | null {
-  // Echoed untrusted blocks and fenced diffs are data, never the reviewer's
-  // verdict; an unclosed one swallows to EOF, so no verdict line remains.
-  const scanned = scanUntrustedEchoBlocks(verdictText);
-  if (scanned.unclosed) {
-    return null;
+
+/** Bounded diagnostic findings of a free-text-only reply (RV5): each entry is screened, capped, and renumbered. */
+function boundedFallbackFindings(parsed: ParsedFindingLines): ReviewFindingRecord[] {
+  const findings: ReviewFindingRecord[] = [];
+  for (const finding of parsed.findings) {
+    if (findings.length >= MAX_STRUCTURED_FINDINGS) {
+      break;
+    }
+    const summary = finding.summary;
+    if (summary.length > MAX_FINDING_SUMMARY_LENGTH) {
+      continue;
+    }
+    if (isWholeValuePlaceholder(summary) || containsReviewSecretShape(summary)) {
+      continue;
+    }
+    if (finding.filePath !== null && !isSafeRelativeFilePath(finding.filePath)) {
+      continue;
+    }
+    findings.push({ ...finding, findingId: `review-${findings.length + 1}` });
   }
-  const lastNonEmptyLine = scanned.stripped
-    .split(/\r?\n/)
-    .reverse()
-    .find((line) => line.trim() !== '');
-  if (lastNonEmptyLine === undefined) {
-    return null;
-  }
-  // Only trailing horizontal whitespace is dropped: an indented quote
-  // (`    VERDICT: PASS`) is not a verdict line and stays null.
-  const lastLine = lastNonEmptyLine.replace(/[ \t]+$/, '');
-  const verdictMatch = VERDICT_PATTERN.exec(lastLine);
-  if (verdictMatch === null) {
-    return null;
-  }
-  // `FIX FIRST` is the reviewer's fail verdict: it maps to FAIL.
-  return verdictMatch[1] === 'PASS' ? 'PASS' : 'FAIL';
+  return findings;
 }
 
 /**
- * Findings and verdict both come from `text`, the whole answer (every text
- * part joined in order): one path for every answer shape. The verdict is the
- * last non-empty line of the text left after untrusted blocks are stripped;
- * an unclosed block or fence anywhere makes the answer unparseable. The
+ * The one shared structured parser (RV5, F153): the outcome comes only from a
+ * single schema-valid trailing ```json block outside every echoed untrusted
+ * / diff block. Blank replies are `empty`; free text, several json blocks,
+ * schema violations, oversized replies and malformed json all refuse to
+ * `unparseable-verdict` — free text never parses to `pass` or `fail`, it only
+ * contributes bounded diagnostic findings onto the `unknown` result. The
  * second parameter (`_ignoredVerdictText`) has no effect on the parse; it is
  * kept only so existing callers compile.
  */
-export function parseReviewReply(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
-  if (typeof text !== 'string') {
-    return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+function parseStructuredReviewReply(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
+  const UNPARSEABLE: ParsedReviewReply = {
+    result: 'unknown',
+    findings: [],
+    unknownReason: 'unparseable-verdict',
+  };
+  if (
+    typeof text !== 'string' ||
+    (_ignoredVerdictText !== undefined && typeof _ignoredVerdictText !== 'string') ||
+    text.length > MAX_REVIEW_REPLY_LENGTH
+  ) {
+    return UNPARSEABLE;
   }
-  const parsedLines = parseFindingLines(text);
-  const findings = parsedLines.findings;
-  if (parsedLines.invalid) {
-    // RV3: a finding with an unrecognised severity refuses the whole reply.
-    return { result: 'unknown', findings, unknownReason: 'unparseable-verdict' };
+  if (text.trim() === '') {
+    return { result: 'unknown', findings: [], unknownReason: 'empty' };
   }
-  const verdict = lastLineVerdict(text);
-  let result: EvidenceResultValue = 'unknown';
-  if (verdict === 'PASS') {
-    result = findings.some((f) => f.severity === 'blocker') ? 'fail' : 'pass';
-  } else if (verdict === 'FAIL') {
-    result = 'fail';
+  // RV2: an echoed untrusted block (the reviewer repeating the diff or brief)
+  // is data, so any ```json block inside it is stripped before fence extraction
+  // and therefore ignored. An unclosed block anywhere is a malformed answer.
+  const scanned = scanUntrustedEchoBlocks(text);
+  if (scanned.unclosed) {
+    return UNPARSEABLE;
   }
-  if (result === 'unknown') {
-    const unknownReason: ReviewUnknownReason =
-      text.trim() === '' ? 'empty' : 'unparseable-verdict';
-    return { result, findings, unknownReason };
+  const fence = extractSingleTrailingJsonFence(scanned.stripped);
+  if (fence.kind === 'none') {
+    // Free text with zero json blocks: keep the parsed finding lines only as
+    // bounded, screened diagnostics on an `unknown` result. Free text never
+    // yields `pass` or `fail`.
+    return {
+      result: 'unknown',
+      findings: boundedFallbackFindings(parseFindingLines(scanned.stripped)),
+      unknownReason: 'unparseable-verdict',
+    };
   }
-  return { result, findings };
+  if (fence.kind === 'invalid') {
+    return UNPARSEABLE;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fence.jsonText);
+  } catch {
+    return UNPARSEABLE;
+  }
+  const validated = validateReviewAnswerObject(parsed);
+  if (!validated.ok) {
+    return UNPARSEABLE;
+  }
+  const findings: ReviewFindingRecord[] = validated.value.findings.map(
+    (entry, index): ReviewFindingRecord => ({
+      findingId: `review-${index + 1}`,
+      severity: entry.severity,
+      summary: entry.summary.trim(),
+      filePath: entry.file,
+      line: entry.line,
+      state: 'unresolved',
+      dispositionReason: null,
+      dispositionEvidenceRef: null,
+    }),
+  );
+  // Severities decide first, then the verdict: a blocker or major fails even
+  // on a PASS verdict; minors/nits ride a pass even on a FAIL verdict; a
+  // FAIL with zero findings stays unknown.
+  if (findings.some((finding) => finding.severity === 'blocker' || finding.severity === 'major')) {
+    return { result: 'fail', findings };
+  }
+  if (findings.length > 0) {
+    return { result: 'pass', findings };
+  }
+  if (validated.value.verdict === 'PASS') {
+    return { result: 'pass', findings: [] };
+  }
+  return { result: 'unknown', findings: [], unknownReason: 'no-findings-on-fail' };
 }
 
 /**
- * Strict verdict validation for conductor replies (a request with `kind`):
- * PASS with any blocker or major finding is a fail, a FAIL with zero findings
- * is unknown (the run parks ambiguous rather than starting a fix round
- * without findings), and a missing verdict is unknown. Manual reviews keep
- * `parseReviewReply` unchanged. The second parameter
- * (`_ignoredVerdictText`) has no effect; it is kept only so existing callers
- * compile.
+ * Findings and outcome both come from `text`, the whole answer (every text
+ * part joined in order): one structured parse for every answer shape (RV5).
+ * The second parameter (`_ignoredVerdictText`) has no effect on the parse; it
+ * is kept only so existing callers compile.
+ */
+export function parseReviewReply(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
+  return parseStructuredReviewReply(text, _ignoredVerdictText);
+}
+
+/**
+ * Strict parsing for conductor replies (a request with `kind`). Since RV5
+ * (F153) this is the same structured parse as `parseReviewReply`: the outcome
+ * comes only from a single schema-valid trailing ```json block. The second
+ * parameter (`_ignoredVerdictText`) has no effect; it is kept only so
+ * existing callers compile.
  */
 export function parseReviewReplyStrict(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
-  if (typeof text !== 'string') {
-    return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
-  }
-  const parsedLines = parseFindingLines(text);
-  const findings = parsedLines.findings;
-  if (parsedLines.invalid) {
-    // RV3: a finding with an unrecognised severity refuses the whole reply.
-    return { result: 'unknown', findings, unknownReason: 'unparseable-verdict' };
-  }
-  const verdict = lastLineVerdict(text);
-  let result: EvidenceResultValue = 'unknown';
-  if (verdict === 'PASS') {
-    result = findings.some((f) => f.severity === 'blocker' || f.severity === 'major') ? 'fail' : 'pass';
-  } else if (verdict === 'FAIL' && findings.length > 0) {
-    result = 'fail';
-  }
-  if (result === 'unknown') {
-    const unknownReason: ReviewUnknownReason =
-      text.trim() === ''
-        ? 'empty'
-        : verdict === null
-          ? 'unparseable-verdict'
-          : 'no-findings-on-fail';
-    return { result, findings, unknownReason };
-  }
-  return { result, findings };
+  return parseStructuredReviewReply(text, _ignoredVerdictText);
 }
 
 export function buildReviewerEnv(
@@ -1209,6 +1260,19 @@ export async function defaultSpawn(
     stderr: outcome.stderr !== '' ? outcome.stderr : outcome.error ?? '',
     ...(timedOut ? { timedOut: true } : {}),
   };
+}
+
+/**
+ * RV5 (Fable, F157 hand fix): a stream-format answer is accepted only after the
+ * stream finished. Without a `step_finish` event the run was cut short, and no
+ * verdict is read from it, PASS or otherwise: the answer is `unknown`
+ * (`stream-incomplete`). Plain-text answers from other transports never come
+ * through here; they are parsed directly by parseReviewReplyStrict. Every
+ * step emits its own finish, so the test is that the LAST step started also
+ * finished: an earlier step's finish does not cover a step cut short.
+ */
+function isStreamCutBeforeFinish(hasStepFinish: boolean, lastStepOpen: boolean): boolean {
+  return !hasStepFinish || lastStepOpen;
 }
 
 export function createOcmReviewTransport(
@@ -1396,6 +1460,8 @@ export function createOcmReviewTransport(
     const spawnStdout = safeRead(() => spawnResult.stdout);
     let readOnlyVoided = false;
     let hasStepStart = false;
+    let hasStepFinish = false;
+    let lastStepOpen = false;
     const textParts: string[] = [];
     const toolNames: string[] = [];
     for (const rawLine of (typeof spawnStdout === 'string' ? spawnStdout : '').split(/\r?\n/)) {
@@ -1430,6 +1496,12 @@ export function createOcmReviewTransport(
 
       if (isStepStart(parsed)) {
         hasStepStart = true;
+        lastStepOpen = true;
+      }
+
+      if (isStepFinish(parsed)) {
+        hasStepFinish = true;
+        lastStepOpen = false;
       }
 
       if (isToolEvent(parsed)) {
@@ -1463,6 +1535,15 @@ export function createOcmReviewTransport(
       after === request.candidateHeadSha;
 
     // 9. Parse verdict, findings, and rawOutput
+    if (isStreamCutBeforeFinish(hasStepFinish, lastStepOpen)) {
+      return {
+        rawOutput: 'stream-incomplete',
+        readOnlyVerified,
+        result: 'unknown',
+        findings: [],
+        completedAtIso: new Date().toISOString(),
+      };
+    }
     // Each text part is a whole message part; a part that does not end in a newline must not glue its last line onto the next part's first.
     const finalText = textParts.join('\n');
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.

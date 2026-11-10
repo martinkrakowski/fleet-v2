@@ -7,6 +7,7 @@ export * from "./entities/index.js";
 export * from "./evidence-records.js";
 export * from "./failing-file.js";
 export * from "./placeholder-evidence.js";
+export * from "./review-answer-schema.js";
 export * from "./review-selection.js";
 export * from "./untrusted-input.js";
 export * from "./value-objects/index.js";

@@ -135,6 +135,7 @@ export const V2_ROOT_KEYS: readonly string[] = freezeKeys<FleetInstallationV2>()
   'waves',
   'decisions',
   'daemon',
+  'stateDir',
 ]);
 
 /** `hosts.<name>` keys in the writer's stable order (byte-identical host JSON). */

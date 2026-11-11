@@ -46,6 +46,7 @@ import {
   WAVES_KEYS,
 } from '../keys.js';
 import { parseInstallation } from '../parse.js';
+import { deriveInstallationModel } from '../model.js';
 import { resolveMergePolicy } from '../policy.js';
 import { isFleetInstallationV2, writeInstallationV2 } from '../write.js';
 import type { FleetInstallationV2, HostSection, PolicySection } from '../types.js';
@@ -279,6 +280,7 @@ const fullV2File = {
     unitDir: '/etc/systemd/user',
     installationFile: '/srv/fleet/fleet.json',
   },
+  stateDir: '/srv/fleet/installation-state',
 };
 
 /** A small valid v2 file the union-branch variants extend. */
@@ -959,5 +961,245 @@ describe('F96 robustness', () => {
       expect(result.ok).toBe(false);
       expect(() => parseInstallation(input)).not.toThrow();
     }
+  });
+});
+
+describe('optional root stateDir', () => {
+  const baseWithStateDir = (stateDir: unknown) =>
+    ({ ...minimalV2File, stateDir }) as Record<string, unknown>;
+  const daemonSection = {
+    nodePath: '/usr/bin/node',
+    cliPath: '/opt/fleet/cli.js',
+    stateDir: '/var/lib/fleet',
+    unitDir: '/etc/systemd/user',
+    installationFile: '/srv/fleet/fleet.json',
+  };
+
+  it('leaves stateDir off the installation and the model when the key is absent', () => {
+    const result = parseInstallation({ ...minimalV2File });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.installation).not.toHaveProperty('stateDir');
+    const model = deriveInstallationModel(result.installation);
+    expect(model.model).not.toHaveProperty('stateDir');
+  });
+
+  it.each([
+    ['explicit', '/srv/fleet/state', '/srv/fleet/state'],
+    ['trimmed', '  /srv/fleet/state  ', '/srv/fleet/state'],
+    ['dotdot kept', '/srv/fleet/../state', '/srv/fleet/../state'],
+    ['trailing slash kept', '/srv/fleet/state/', '/srv/fleet/state/'],
+    ['max length', '/' + 'a'.repeat(4095), '/' + 'a'.repeat(4095)],
+  ])(
+    'keeps an absolute stateDir verbatim except surrounding trim (%s)',
+    (_label, input, expected) => {
+      const result = parseInstallation({ ...minimalV2File, stateDir: input });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.installation.stateDir).toBe(expected);
+      expect(result).not.toHaveProperty('warnings');
+      const model = deriveInstallationModel(result.installation);
+      expect(model.model.stateDir).toBe(expected);
+    },
+  );
+
+  it('stores a root stateDir separately from daemon.stateDir', () => {
+    const file = {
+      ...minimalV2File,
+      stateDir: '/srv/fleet/state',
+      daemon: daemonSection,
+    };
+    const result = parseInstallation(file);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.installation.stateDir).toBe('/srv/fleet/state');
+    expect(result.installation.daemon?.stateDir).toBe('/var/lib/fleet');
+    const model = deriveInstallationModel(result.installation);
+    expect(model.model.stateDir).toBe('/srv/fleet/state');
+    expect(model.model.daemon?.stateDir).toBe('/var/lib/fleet');
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['false', false],
+    ['zero', 0],
+    ['object', {}],
+    ['array', ['/srv/fleet/state']],
+    [
+      'array hole',
+      (() => {
+        const hole: string[] = [];
+        hole.length = 2;
+        hole[1] = '/srv/fleet/state';
+        return hole;
+      })(),
+    ],
+    ['String object', Object('/srv/fleet/state')],
+  ])(
+    'refuses a non-string stateDir (%s) as not an absolute path',
+    (_label, value) => {
+      expect(refusalErrors(baseWithStateDir(value))).toStrictEqual([
+        'stateDir: must be an absolute path',
+      ]);
+    },
+  );
+
+  it('refuses an accessor stateDir without running the getter', () => {
+    let getterRuns = 0;
+    const file = { ...minimalV2File } as Record<string, unknown>;
+    Object.defineProperty(file, 'stateDir', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterRuns += 1;
+        throw new Error('getter ran');
+      },
+    });
+    expect(parseInstallation(file)).toStrictEqual({
+      ok: false,
+      errors: ['stateDir: must be an absolute path'],
+    });
+    expect(getterRuns).toBe(0);
+  });
+
+  it('refuses a Proxy stateDir without invoking its traps', () => {
+    let counter = 0;
+    const proxy = new Proxy({}, {
+      get() {
+        counter += 1;
+        throw new Error('trap ran');
+      },
+    });
+    expect(refusalErrors({ ...minimalV2File, stateDir: proxy })).toStrictEqual([
+      'stateDir: must be an absolute path',
+    ]);
+    expect(counter).toBe(0);
+  });
+
+  it('refuses an array-like stateDir with a huge length without walking it', () => {
+    const arrayLike = { length: 1e9, 0: '/srv/fleet/state' };
+    expect(refusalErrors(baseWithStateDir(arrayLike))).toStrictEqual([
+      'stateDir: must be an absolute path',
+    ]);
+  });
+
+  it('ignores an inherited stateDir and does not copy it', () => {
+    const proto = { stateDir: '/srv/fleet/state' };
+    const file = Object.assign(Object.create(proto), minimalV2File);
+    const result = parseInstallation(file);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.installation).not.toHaveProperty('stateDir');
+    const model = deriveInstallationModel(result.installation);
+    expect(model.model).not.toHaveProperty('stateDir');
+  });
+
+  it('refuses an own __proto__ key as an unknown key and does not pollute Object.prototype', () => {
+    const file = {
+      ...minimalV2File,
+      stateDir: '/srv/fleet/state',
+    } as Record<string, unknown>;
+    Object.defineProperty(file, '__proto__', {
+      value: { polluted: true },
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    expect(refusalErrors(file)).toStrictEqual(['installation: unknown key']);
+    expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it.each([
+    ['relative', 'rel/state'],
+    ['empty', ''],
+    ['whitespace', '   '],
+    ['single dot', '.'],
+    ['double dot', '..'],
+  ])(
+    'refuses a non-absolute stateDir (%s) and does not echo the value',
+    (_label, input) => {
+      const errors = refusalErrors(baseWithStateDir(input));
+      expect(errors).toStrictEqual(['stateDir: must be an absolute path']);
+      if (input.trim() !== '') {
+        expect(errors.join(' ')).not.toContain(input);
+      }
+    },
+  );
+
+  it('refuses an over-long stateDir on length before any credential scan', () => {
+    const overLong = '/' + 'a'.repeat(4096) + 'ghp_';
+    const errors = refusalErrors(baseWithStateDir(overLong));
+    expect(errors).toStrictEqual([
+      'stateDir: must be an absolute path no longer than 4096 characters',
+    ]);
+    expect(errors.join(' ')).not.toContain('ghp_');
+  });
+
+  it('refuses a credential-shaped stateDir and does not echo the value', () => {
+    const errors = refusalErrors(baseWithStateDir('/srv/fleet/ghp_abc'));
+    expect(errors).toStrictEqual(['stateDir: refused']);
+    expect(errors.join(' ')).not.toContain('ghp_');
+  });
+
+  it('reports refused, not the spaces message, when stateDir has a credential shape and a space', () => {
+    expect(refusalErrors(baseWithStateDir('/srv/fleet/ghp_abc '))).toStrictEqual([
+      'stateDir: refused',
+    ]);
+  });
+
+  it('refuses a relative credential-shaped stateDir as not absolute, and does not report refused', () => {
+    const errors = refusalErrors(baseWithStateDir('ghp_not_absolute'));
+    expect(errors).toStrictEqual(['stateDir: must be an absolute path']);
+    expect(errors.join(' ')).not.toContain('ghp_');
+  });
+
+  it.each([
+    ['a space', '/srv/fleet/state dir'],
+    ['a newline', '/srv/fleet/state\nline'],
+    ['a tab', '/srv/fleet/state\ttab'],
+    ['a double quote', '/srv/fleet/state"q'],
+    ['a single quote', "/srv/fleet/state'q"],
+    ['a backtick', '/srv/fleet/state`q'],
+    ['a backslash', '/srv/fleet/state\\q'],
+    ['a left brace', '/srv/fleet/state{q'],
+    ['a right brace', '/srv/fleet/state}q'],
+    ['a percent', '/srv/fleet/state%q'],
+    ['an asterisk', '/srv/fleet/state*q'],
+    ['a question mark', '/srv/fleet/state?q'],
+    ['a NUL', '/srv/fleet/state\u0000q'],
+  ])(
+    'refuses stateDir containing %s with the spaces, quotes or NUL message',
+    (_label, input) => {
+      expect(refusalErrors(baseWithStateDir(input))).toStrictEqual([
+        'stateDir: must be an absolute path with no spaces, quotes or NUL',
+      ]);
+    },
+  );
+
+  it('refuses stateDir on a v1 file as an unknown key', () => {
+    expect(
+      refusalErrors({ schemaVersion: 1, stateDir: '/srv/fleet/state' }),
+    ).toStrictEqual(['installation: unknown key']);
+  });
+
+  it('does not copy stateDir onto a model derived from schemaVersion 1', () => {
+    const v1 = {
+      schemaVersion: 1,
+      stateDir: '/srv/fleet/state',
+    } as unknown as Parameters<typeof deriveInstallationModel>[0];
+    expect(deriveInstallationModel(v1).model).not.toHaveProperty('stateDir');
+  });
+
+  it('does not copy daemon.stateDir onto the root when the root key is absent', () => {
+    const file = { ...minimalV2File, daemon: daemonSection };
+    const result = parseInstallation(file);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.installation).not.toHaveProperty('stateDir');
+    expect(result.installation.daemon?.stateDir).toBe('/var/lib/fleet');
+    const model = deriveInstallationModel(result.installation);
+    expect(model.model).not.toHaveProperty('stateDir');
+    expect(model.model.daemon?.stateDir).toBe('/var/lib/fleet');
   });
 });

@@ -666,6 +666,11 @@ export interface FleetInstallationV2 {
   readonly waves?: WavesSection;
   readonly decisions?: DecisionsSectionV2;
   readonly daemon?: DaemonSection;
+  /**
+   * The absolute installation state directory; absent means the file does not
+   * name one; distinct from `daemon.stateDir`; not a default.
+   */
+  readonly stateDir?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +767,8 @@ export interface FleetInstallationModel {
   readonly waves?: WavesSection;
   readonly decisions?: DecisionsSectionV2;
   readonly daemon?: DaemonSection;
+  /** v2 only; copied when present; never defaulted. */
+  readonly stateDir?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -807,4 +814,6 @@ export interface FleetInstallation {
   readonly decisions?: DecisionsSectionV2;
   /** v2: the daemon tick's user-scope scheduler unit paths. Never set in v1. */
   readonly daemon?: DaemonSection;
+  /** v2 only; copied when present; never defaulted. */
+  readonly stateDir?: string;
 }

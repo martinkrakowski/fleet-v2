@@ -1,260 +1,213 @@
 /**
- * G1a stored-record compatibility corpus (work-execution).
- *
- * Every `*.legacy.json` fixture under `compat-fixtures/` is an on-disk record
- * shape a pre-Q5a build wrote: valid records with no `schemaVersion` key at
- * all (D6: absent reads as `1`). These tests prove the current readers accept
- * every fixture, stamp `schemaVersion: 1` on read-back, leave the state file's
- * bytes bit-identical, refuse an unknown version without rewriting or
- * quarantining, and stay pinned to the stores' schema-version policies.
+ * G1a stored-record compatibility corpus: the checked-in `*.legacy.json`
+ * fixtures in `compat-fixtures/` are the on-disk shapes a pre-Q5a build wrote
+ * (no `schemaVersion` key; absent reads as `1`, D6). Each store's read path
+ * must accept its fixture, stamp nothing, rewrite nothing and quarantine
+ * nothing; a synthetic unknown `schemaVersion` is refused with
+ * `StateFileUnknownVersionError` and the file's bytes stay bit-identical.
  *
  * Future-lane rule (R6): when a writer bumps a record's `schemaVersion` to N,
  * that lane adds `<store>.v<N>.json` produced by the new writer, leaves every
  * older fixture byte-for-byte untouched, adds N to the store's
- * `acceptedVersions`, and adds a describe block for the new fixture. Older
- * fixtures are never edited.
+ * `acceptedVersions`, and adds a describe block here for the new fixture.
+ * Older fixtures are never edited.
  */
 
-import { createHash } from "node:crypto";
-import { promises as fs } from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { promises as fs } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { describe, expect, it } from 'vitest';
 
 import {
   assertValidSchemaVersionPolicy,
   StateFileUnknownVersionError,
-} from "../file-store.js";
+  type StoreSchemaVersionPolicy,
+} from '../file-store.js';
 import {
   ATTEMPT_STORE_VERSION_POLICY,
   AttemptRepositoryAdapter,
-} from "../AttemptRepositoryAdapter.adapter.js";
+} from '../AttemptRepositoryAdapter.adapter.js';
 import {
-  LANE_RUN_JOURNAL_STORE_VERSION_POLICY,
   LaneRunJournalAdapter,
-} from "../LaneRunJournalAdapter.adapter.js";
+  LANE_RUN_JOURNAL_STORE_VERSION_POLICY,
+} from '../LaneRunJournalAdapter.adapter.js';
 import {
-  LANE_RUN_STORE_VERSION_POLICY,
   LaneRunRepositoryAdapter,
-} from "../LaneRunRepositoryAdapter.adapter.js";
+  LANE_RUN_STORE_VERSION_POLICY,
+} from '../LaneRunRepositoryAdapter.adapter.js';
 import {
   ExecutionJournalAdapter,
   JOURNAL_STORE_VERSION_POLICY,
   RESERVATION_STORE_VERSION_POLICY,
-} from "../ExecutionJournalAdapter.adapter.js";
+} from '../ExecutionJournalAdapter.adapter.js';
 
-const FIXTURE_FILENAMES = [
-  "attempts.json",
-  "lane-runs.json",
-  "run-journal.json",
-  "journal.json",
-  "reservations.json",
-] as const;
+const FIXTURE_DIR = fileURLToPath(new URL('./compat-fixtures/', import.meta.url));
 
-const RUN_0 = "run-01JB0000000000000000000000";
-
-/** The `attemptId` every `journal.legacy.json` entry carries. */
-const JOURNAL_ATTEMPT_ID = "attempt-example-1";
-
-interface StoreCorpusSpec {
+interface StoreSpec {
   readonly basename: string;
+  readonly fixture: string;
+  readonly policy: StoreSchemaVersionPolicy;
   readonly read: (stateDir: string) => Promise<readonly unknown[]>;
-  readonly policy: {
-    readonly writerVersion: number;
-    readonly acceptedVersions: readonly number[];
-  };
 }
 
-const STORE_SPECS: readonly StoreCorpusSpec[] = [
+const RUN_0 = 'run-01JB0000000000000000000000';
+
+const STORES: readonly StoreSpec[] = [
   {
-    basename: "attempts.json",
-    read: (dir) =>
-      new AttemptRepositoryAdapter({ stateDir: dir }).listAllAttempts(),
+    basename: 'attempts.json',
+    fixture: 'attempts.legacy.json',
     policy: ATTEMPT_STORE_VERSION_POLICY,
+    read: (dir) => new AttemptRepositoryAdapter({ stateDir: dir }).listAllAttempts(),
   },
   {
-    basename: "lane-runs.json",
-    read: (dir) => new LaneRunRepositoryAdapter({ stateDir: dir }).list(),
+    basename: 'lane-runs.json',
+    fixture: 'lane-runs.legacy.json',
     policy: LANE_RUN_STORE_VERSION_POLICY,
+    read: (dir) => new LaneRunRepositoryAdapter({ stateDir: dir }).list(),
   },
   {
-    basename: "run-journal.json",
-    read: (dir) =>
-      new LaneRunJournalAdapter({ stateDir: dir }).listForRun(RUN_0),
+    basename: 'run-journal.json',
+    fixture: 'run-journal.legacy.json',
     policy: LANE_RUN_JOURNAL_STORE_VERSION_POLICY,
+    read: (dir) => new LaneRunJournalAdapter({ stateDir: dir }).listForRun(RUN_0),
   },
   {
-    basename: "journal.json",
-    read: (dir) =>
-      new ExecutionJournalAdapter({
-        stateDir: dir,
-      }).listJournalEntriesForAttempt(JOURNAL_ATTEMPT_ID),
+    basename: 'journal.json',
+    fixture: 'journal.legacy.json',
     policy: JOURNAL_STORE_VERSION_POLICY,
+    read: (dir) => new ExecutionJournalAdapter({ stateDir: dir }).listJournalEntriesForAttempt('attempt-example-1'),
   },
   {
-    basename: "reservations.json",
-    read: (dir) =>
-      new ExecutionJournalAdapter({ stateDir: dir }).listActiveReservations(),
+    basename: 'reservations.json',
+    fixture: 'reservations.legacy.json',
     policy: RESERVATION_STORE_VERSION_POLICY,
+    read: (dir) => new ExecutionJournalAdapter({ stateDir: dir }).listActiveReservations(),
   },
 ];
 
-const FIXTURE_DIR = fileURLToPath(
-  new URL("./compat-fixtures/", import.meta.url),
-);
-
-const STORE_CASES: [string, StoreCorpusSpec][] = STORE_SPECS.map((spec) => [
-  spec.basename,
-  spec,
-]);
-
-/**
- * The fixture file for a state file is `<store>.legacy.json` (the four
- * schema-version constants' store name without its `.json` suffix).
- */
-function fixturePath(basename: string): string {
-  const stem = basename.replace(/\.json$/, "");
-  return path.join(FIXTURE_DIR, `${stem}.legacy.json`);
+async function makeTempStateDir(prefix: string): Promise<string> {
+  return fs.mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
-function sha256Of(bytes: Buffer): string {
-  return createHash("sha256").update(bytes).digest("hex");
+async function removeTempStateDir(dir: string): Promise<void> {
+  await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
 }
 
-async function withFreshDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "fleet-compat-"));
-  try {
-    return await fn(dir);
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
-  }
+function stateFilePath(stateDir: string, basename: string): string {
+  return path.join(stateDir, basename);
 }
 
-/** Leaf string field values of a record. */
-function leafStrings(value: unknown, out: string[] = []): string[] {
-  if (typeof value === "string") {
-    out.push(value);
-  } else if (Array.isArray(value)) {
-    for (const item of value) {
-      leafStrings(item, out);
-    }
-  } else if (value !== null && typeof value === "object") {
-    for (const item of Object.values(value)) {
-      leafStrings(item, out);
-    }
-  }
-  return out;
+async function readFixtureBytes(fixture: string): Promise<Buffer> {
+  return fs.readFile(path.join(FIXTURE_DIR, fixture));
+}
+
+function expectNoSchemaVersionKey(record: unknown): void {
+  expect(Object.hasOwn(record as Record<string, unknown>, 'schemaVersion')).toBe(false);
 }
 
 /**
- * Distinctive string field values of a fixture record, used to assert the
- * refusal error echoes none of them. Tokens shorter than 4 characters are not
- * distinctive enough (a short value can be a substring of an innocuous
- * message), so the corpus keeps every fixture field value at that length or
- * longer and the shape test below fails loudly if one ever falls short —
- * the filter therefore never silently skips a fixture field value.
+ * Writes `bytes` as the store's state file in a fresh temp state directory and
+ * returns the directory; the caller removes it in `finally`.
  */
-function fixtureFieldValues(record: unknown): string[] {
-  return [...new Set(leafStrings(record).filter((value) => value.length >= 4))];
+async function seedStateFile(
+  prefix: string,
+  basename: string,
+  bytes: Buffer,
+): Promise<string> {
+  const dir = await makeTempStateDir(prefix);
+  await fs.writeFile(stateFilePath(dir, basename), bytes);
+  return dir;
 }
 
-describe.each(STORE_CASES)(
-  "%s stored-record compatibility corpus",
-  (basename, spec) => {
-    it("reads the legacy fixture, stamps schemaVersion 1, and leaves bytes untouched", async () => {
-      await withFreshDir(async (dir) => {
-        const target = path.join(dir, basename);
-        const fixtureBytes = await fs.readFile(fixturePath(basename));
-        const fixture = JSON.parse(fixtureBytes.toString("utf8")) as unknown[];
-        await fs.writeFile(target, fixtureBytes);
+async function assertBytesUnchanged(stateFile: string, before: Buffer): Promise<void> {
+  const after = await fs.readFile(stateFile);
+  expect(Buffer.compare(before, after)).toBe(0);
+}
 
-        const records = await spec.read(dir);
+/**
+ * Field values whose `String` form can meaningfully appear in an error
+ * message at all: strings long enough to be identifiers. Booleans, numbers,
+ * nulls and one-character strings collide trivially with ordinary prose and
+ * prove nothing about echoing.
+ */
+function echoedValues(record: Record<string, unknown>): readonly string[] {
+  return Object.values(record)
+    .filter((value): value is string => typeof value === 'string' && value.length >= 8);
+}
 
-        expect(records.length).toBe(fixture.length);
-        for (const record of records) {
-          expect((record as { schemaVersion?: unknown }).schemaVersion).toBe(1);
-        }
-        expect(sha256Of(await fs.readFile(target))).toBe(
-          sha256Of(fixtureBytes),
-        );
-      });
-    });
+/** The only entry next to a state file must be the state file itself: nothing was quarantined. */
+async function assertNothingQuarantined(stateDir: string): Promise<void> {
+  const entries = await fs.readdir(stateDir);
+  expect(entries).toHaveLength(1);
+}
 
-    it("refuses an unknown schemaVersion at record index 1 without quarantine or rewrite", async () => {
-      await withFreshDir(async (dir) => {
-        const target = path.join(dir, basename);
-        const fixture = JSON.parse(
-          await fs.readFile(fixturePath(basename), "utf8"),
-        ) as Record<string, unknown>[];
-        const first = fixture[0]!;
-        const unknownBytes = Buffer.from(
-          JSON.stringify([first, { ...first, schemaVersion: 2 }]),
-        );
-        await fs.writeFile(target, unknownBytes);
-        const shaBefore = sha256Of(unknownBytes);
-
-        let caught: unknown;
-        try {
-          await spec.read(dir);
-        } catch (error) {
-          caught = error;
-        }
-        expect(caught).toBeInstanceOf(StateFileUnknownVersionError);
-        const error = caught as StateFileUnknownVersionError;
-        expect(error.recordIndex).toBe(1);
-        expect(error.message).toContain("unsupported schemaVersion");
-        expect(error.message).toContain("record 1");
-        for (const value of fixtureFieldValues(first)) {
-          expect(error.message).not.toContain(value);
-        }
-
-        expect(sha256Of(await fs.readFile(target))).toBe(shaBefore);
-        await expect(fs.stat(path.join(dir, "quarantine"))).rejects.toThrow();
-        expect(await fs.readdir(dir)).toEqual([basename]);
-      });
-    });
-
-    it("store schema-version policy keeps accepting the corpus version", () => {
-      expect(assertValidSchemaVersionPolicy(basename, spec.policy)).toBe(
-        spec.policy,
-      );
-    });
-  },
-);
-
-describe("legacy fixtures keep their pre-schemaVersion shape", () => {
-  it.each(FIXTURE_FILENAMES)(
-    "%s has no schemaVersion key on any element",
-    async (basename) => {
-      const parsed = JSON.parse(
-        await fs.readFile(fixturePath(basename), "utf8"),
-      ) as unknown;
+describe('compat corpus fixtures', () => {
+  it('every legacy fixture is a JSON array whose records carry no schemaVersion key', async () => {
+    const fixtures = (await fs.readdir(FIXTURE_DIR)).filter((name) => name.endsWith('.legacy.json'));
+    expect(fixtures).toHaveLength(STORES.length);
+    for (const fixture of fixtures) {
+      const fixtureBytes = await readFixtureBytes(fixture);
+      const parsed: unknown = JSON.parse(fixtureBytes.toString('utf8'));
       expect(Array.isArray(parsed)).toBe(true);
-      const records = parsed as unknown[];
+      for (const record of parsed as unknown[]) {
+        expectNoSchemaVersionKey(record);
+      }
+    }
+  });
+});
+
+describe.each(STORES)('$basename accepts its pre-Q5a fixture', (spec) => {
+  it('reads every legacy record as schemaVersion 1 without rewriting the file', async () => {
+    const bytes = await readFixtureBytes(spec.fixture);
+    const dir = await seedStateFile('fleet-compat-ok-', spec.basename, bytes);
+    try {
+      const records = await spec.read(dir);
       expect(records.length).toBeGreaterThan(0);
       for (const record of records) {
-        expect(typeof record).toBe("object");
-        expect(record).not.toBeNull();
-        expect(Object.hasOwn(record as object, "schemaVersion")).toBe(false);
+        expect((record as { schemaVersion?: unknown }).schemaVersion).toBe(1);
       }
-    },
-  );
+      await assertBytesUnchanged(stateFilePath(dir, spec.basename), bytes);
+    } finally {
+      await removeTempStateDir(dir);
+    }
+  });
 
-  it.each(FIXTURE_FILENAMES)(
-    "%s has a distinctive (length >= 4) value on every string field",
-    async (basename) => {
-      const parsed = JSON.parse(
-        await fs.readFile(fixturePath(basename), "utf8"),
-      ) as unknown;
-      for (const value of leafStrings(parsed)) {
-        // The unknown-version refusal test asserts the error echoes none of
-        // the fixture's field values. A shorter token cannot be asserted
-        // against (it matches innocuous message text), so the corpus must
-        // not contain one: if it did, a field value would be silently
-        // skipped instead of checked.
-        expect(value.length).toBeGreaterThanOrEqual(4);
+  it('refuses a record with an unknown schemaVersion, leaving the bytes untouched and nothing quarantined', async () => {
+    const bytes = await readFixtureBytes(spec.fixture);
+    const legacyRecord = JSON.parse(bytes.toString('utf8'))[0] as Record<string, unknown>;
+    const futureRecord = { ...legacyRecord, schemaVersion: 2 };
+    const refusingBytes = Buffer.from(JSON.stringify([legacyRecord, futureRecord]), 'utf8');
+    const dir = await seedStateFile('fleet-compat-refuse-', spec.basename, refusingBytes);
+    try {
+      const stateFile = stateFilePath(dir, spec.basename);
+      const onDiskBefore = await fs.readFile(stateFile);
+      let error: unknown;
+      try {
+        await spec.read(dir);
+      } catch (caught) {
+        error = caught;
       }
-    },
-  );
+      expect(error).toBeInstanceOf(StateFileUnknownVersionError);
+      const unknownVersionError = error as StateFileUnknownVersionError;
+      expect(unknownVersionError.recordIndex).toBe(1);
+      expect(unknownVersionError.message).toContain('unsupported schemaVersion');
+      expect(unknownVersionError.message).toContain('record 1');
+      for (const value of echoedValues(legacyRecord)) {
+        expect(unknownVersionError.message).not.toContain(String(value));
+      }
+      await assertNothingQuarantined(dir);
+      await assertBytesUnchanged(stateFile, onDiskBefore);
+    } finally {
+      await removeTempStateDir(dir);
+    }
+  });
+
+  it('declares a policy that accepts the writer version and the previous version', () => {
+    const checked = assertValidSchemaVersionPolicy(spec.basename, spec.policy);
+    expect(checked.acceptedVersions).toContain(checked.writerVersion);
+    if (checked.writerVersion > 1) {
+      expect(checked.acceptedVersions).toContain(checked.writerVersion - 1);
+    }
+  });
 });

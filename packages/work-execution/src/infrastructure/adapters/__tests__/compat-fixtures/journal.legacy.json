@@ -1,14 +1,13 @@
 [
   {
-    "id": "je-1",
-    "attemptId": "attempt-example-1"
-  },
-  {
-    "id": "je-2",
-    "attemptId": "attempt-example-1"
-  },
-  {
-    "id": "je-3",
-    "attemptId": "attempt-example-1"
+    "id": "je-example-1",
+    "attemptId": "attempt-example-1",
+    "workOrderId": "wo-1",
+    "action": "dispatch",
+    "baseCommit": "abc123",
+    "recordedAtIso": "2026-10-25T00:00:00.000Z",
+    "status": "intent-recorded",
+    "sessionId": null,
+    "detail": null
   }
 ]

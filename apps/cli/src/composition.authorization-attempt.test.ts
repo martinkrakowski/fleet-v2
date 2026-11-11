@@ -195,6 +195,43 @@ describe('CLI composition: grant bound to its resolved attempt (CO24d)', () => {
     });
     expect(result).toEqual({ outcome: 'consumed', actionId: 'action-a' });
   });
+
+  it('CO24g: an unbound owner grant resolved without an attempt refuses; with the attempt it binds', async () => {
+    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    await seed(runtime, 'grant-1');
+
+    // The resolve omits the attempt: the real CLI composition's coordination
+    // use case refuses the unbound owner grant without binding or consuming it.
+    const refused = await runtime.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'project-1',
+      actionScope: 'forge:push-and-open-pr',
+      expectedHeadSha: HEAD,
+    });
+    expect(refused).toEqual({ outcome: 'blocked', reason: 'attempt-required' });
+
+    const untouched = await runtime.coordination.coordinationRequestRepository.findRequestByGrantId('grant-1');
+    expect(untouched?.grantAttemptId).toBeUndefined();
+    expect(untouched?.consumptions).toHaveLength(0);
+
+    // The same grant still resolves with the right attempt, and binds durably.
+    expect(
+      await runtime.coordination.resolveActionAuthorization.resolveActionAuthorization({
+        projectId: 'project-1',
+        actionScope: 'forge:push-and-open-pr',
+        expectedHeadSha: HEAD,
+        attemptId: 'att-A',
+      }),
+    ).toEqual({
+      outcome: 'authorized',
+      grantId: 'grant-1',
+      requestId: 'req-grant-1',
+      expectedHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    const bound = await runtime.coordination.coordinationRequestRepository.findRequestByGrantId('grant-1');
+    expect(bound?.grantRecordVersion).toBe(2);
+    expect(bound?.grantAttemptId).toBe('att-A');
+  });
 });
 
 // CO24e: the grant record names its attempt, so a grant is bound even when no

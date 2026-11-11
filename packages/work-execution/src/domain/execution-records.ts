@@ -126,6 +126,8 @@ export interface WorkOrderRecord {
    * `resolveWorkOrderBaseBranch`, which treats an absent value as `main`.
    */
   readonly baseBranch?: BaseBranchValue;
+  /** Optional pull-request title given at registration; absent when none was given. */
+  readonly pullRequestTitle?: string;
 }
 
 /** Fix rounds are fresh attempts; they never resume the prior conversation. */

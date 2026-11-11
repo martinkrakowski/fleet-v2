@@ -44,6 +44,11 @@ export interface ExecuteAuthorizedForgeActionRequest {
    */
   readonly baseBranch?: string;
   /**
+   * The single conducted-open label (CP1B): `tier:1` or `tier:2`, forwarded
+   * to the forge only for `push-and-open-pr`. Absent on every other caller.
+   */
+  readonly tierLabel?: 'tier:1' | 'tier:2';
+  /**
    * Status to post for `post-status`: the pre-merge review receipt of the
    * expected head. Only `post-status` may carry it.
    */

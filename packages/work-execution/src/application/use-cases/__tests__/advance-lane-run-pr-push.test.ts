@@ -1105,6 +1105,63 @@ describe('AdvanceLaneRunUseCase recorded branch (KF-5b)', () => {
   });
 });
 
+describe('AdvanceLaneRunUseCase conducted-open tier label (CP1B)', () => {
+  it('open-pr for a tier 2 run sets tierLabel to tier:2', async () => {
+    const harness = await openingPrHarness();
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'completed',
+      reasonCode: 'pr-opened',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]!.tierLabel).toBe('tier:2');
+  });
+
+  it('open-pr for a tier 1 run sets tierLabel to tier:1', async () => {
+    const harness = await openingPrHarness({}, runRecord({ tier: 1 }));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'completed',
+      reasonCode: 'pr-opened',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]!.tierLabel).toBe('tier:1');
+  });
+
+  it('a push to an existing pull request does not carry a tier label', async () => {
+    const harness = await pushingHarness();
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'open',
+        mergeState: 'clean',
+        headSha: MOVED_COMMIT,
+        headRef: 'wt-example-1',
+        isCrossRepository: false,
+        headRepositoryOwner: 'example-owner',
+        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'push',
+      key: pushKey(),
+      result: 'completed',
+      reasonCode: 'pushed',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]!.tierLabel).toBeUndefined();
+  });
+});
+
 describe('R4a: the parked open-pr recovery', () => {
   const RESUME_CLI_KEY = `${RUN_ID}/park/1/resume@cli`;
   const RESUME_ENTRY = '01JB0000000000000000000099';

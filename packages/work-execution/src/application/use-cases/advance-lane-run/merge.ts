@@ -10,6 +10,7 @@ import type { ReviewRequestPort, FindReviewReceiptResult, FindLatestReceiptOfKin
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import { resolveLaneRunBaseBranch } from '../../../domain/base-branch.js';
+import { pullRequestTierLabel } from '../../../domain/pull-request-tier-label.js';
 import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunPrBodyFrozen, LaneRunCarriedMinor, RenderPrBodyResult } from '../../../domain/lane-run-pr-body.js';
 import { renderPrBody } from '../../../domain/lane-run-pr-body.js';
@@ -1052,6 +1053,7 @@ async function runPrPushBody(
   let forgeRequest: ExecuteAuthorizedForgeActionRequest;
   const recordedBranch = record.branchName === undefined ? {} : { branchName: record.branchName };
   if (kind === 'push-and-open-pr' && rendered !== null) {
+    const tierLabel = pullRequestTierLabel(record.tier);
     forgeRequest = {
       actionId,
       attemptId: latest.id,
@@ -1064,6 +1066,7 @@ async function runPrPushBody(
       body: rendered.body,
       ...recordedBranch,
       baseBranch: resolveLaneRunBaseBranch(record),
+      ...(tierLabel.ok ? { tierLabel: tierLabel.label } : {}),
     };
   } else {
     forgeRequest = {

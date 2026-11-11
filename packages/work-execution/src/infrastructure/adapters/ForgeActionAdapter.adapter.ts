@@ -39,6 +39,7 @@ import type {
 } from '../../application/ports/out/ForgeReadPort.out-port.js';
 import type { ForgeRefusalKind } from '../../domain/coordination-keys.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
+import { isPullRequestTierLabel } from '../../domain/pull-request-tier-label.js';
 import { classifyGhRefusal } from './gh-refusal.js';
 import { ForgeReadAdapter } from './ForgeReadAdapter.adapter.js';
 
@@ -628,7 +629,13 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     if (request.baseBranch !== undefined && baseBranch === undefined) {
       return refusedOther('Invalid base branch');
     }
+    // CP1B: the one conducted-open label must be exactly `tier:1` or
+    // `tier:2`; anything else refuses before `gh` runs.
+    if (request.tierLabel !== undefined && !isPullRequestTierLabel(request.tierLabel)) {
+      return refusedOther('tierLabel must be tier:1 or tier:2');
+    }
     const baseArgs = baseBranch === undefined ? [] : ['--base', baseBranch];
+    const labelArgs = request.tierLabel === undefined ? [] : ['--label', request.tierLabel];
     const args = [
       'pr',
       'create',
@@ -640,6 +647,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       request.title ?? `Fleet work order ${request.workOrderId}`,
       '--body',
       request.body ?? `Attempt ${request.attemptId} (action ${request.actionId}) at head ${request.expectedHeadSha}.`,
+      ...labelArgs,
     ];
     let gh: GhInvocationResult;
     try {

@@ -1,6 +1,6 @@
 [
   {
-    "id": "rs-1",
+    "id": "rs-example-1",
     "attemptId": "attempt-example-1",
     "hostId": "host-example-1",
     "slotIndex": 0,
@@ -13,54 +13,6 @@
     "port": null,
     "worktreePath": null,
     "reservedAtIso": "2026-10-25T00:00:00.000Z",
-    "releasedAtIso": null
-  },
-  {
-    "id": "rs-2",
-    "attemptId": "attempt-example-2",
-    "hostId": "host-example-1",
-    "slotIndex": 1,
-    "held": true,
-    "seatTool": null,
-    "hostName": null,
-    "hostKind": null,
-    "transport": null,
-    "sshAlias": null,
-    "port": null,
-    "worktreePath": null,
-    "reservedAtIso": "2026-10-25T00:01:00.000Z",
-    "releasedAtIso": null
-  },
-  {
-    "id": "rs-3",
-    "attemptId": "attempt-example-3",
-    "hostId": "host-example-1",
-    "slotIndex": 2,
-    "held": true,
-    "seatTool": null,
-    "hostName": null,
-    "hostKind": null,
-    "transport": null,
-    "sshAlias": null,
-    "port": null,
-    "worktreePath": null,
-    "reservedAtIso": "2026-10-25T00:02:00.000Z",
-    "releasedAtIso": null
-  },
-  {
-    "id": "rs-4",
-    "attemptId": "attempt-example-4",
-    "hostId": "host-example-1",
-    "slotIndex": 3,
-    "held": true,
-    "seatTool": null,
-    "hostName": null,
-    "hostKind": null,
-    "transport": null,
-    "sshAlias": null,
-    "port": null,
-    "worktreePath": null,
-    "reservedAtIso": "2026-10-25T00:03:00.000Z",
     "releasedAtIso": null
   }
 ]

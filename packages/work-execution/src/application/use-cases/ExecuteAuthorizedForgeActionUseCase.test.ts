@@ -30,6 +30,7 @@ import type {
 import type { AttemptOwnerDecisionPort } from "../ports/out/AttemptOwnerDecisionPort.out-port.js";
 import type { OwnerDecisionPort } from "../ports/out/OwnerDecisionPort.out-port.js";
 import { ExecuteAuthorizedForgeActionUseCase } from "./ExecuteAuthorizedForgeActionUseCase.use-case.js";
+import type { ExecuteAuthorizedForgeActionRequest } from "../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js";
 import {
   decideMergeRecord,
   type MergeRecordRecord,
@@ -1182,6 +1183,213 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       expect(seen[0]).toMatchObject({ kind: "push-and-open-pr" });
       expect(seen[0]).not.toHaveProperty("title");
       expect(seen[0]).not.toHaveProperty("body");
+    });
+  });
+
+  describe("conducted-open tier label (CP1B)", () => {
+    const HEAD = "1111111111111111111111111111111111111111";
+
+    function capturingDeps() {
+      const seen: Array<Record<string, unknown>> = [];
+      let consumeCalls = 0;
+      let forgeCalls = 0;
+      const journal = new InMemoryJournal();
+      const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+      const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+      const authorizationPort: ActionAuthorizationPort = {
+        async resolveActionAuthorization() {
+          return { outcome: "granted", authorizationGrantId: "grant-001" };
+        },
+        async consumeActionAuthorization(req) {
+          consumeCalls += 1;
+          return { outcome: "consumed", actionId: req.actionId };
+        },
+      };
+      const forgePort: ForgeActionPort = {
+        isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
+        async performForgeAction(
+          request: ForgeActionRequest,
+        ): Promise<ForgeActionResult> {
+          forgeCalls += 1;
+          seen.push({ ...request });
+          return {
+            outcome: "executed",
+            pullRequestNumber: 42,
+            headSha: request.expectedHeadSha,
+          };
+        },
+      };
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
+        attemptRepo,
+        attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
+        workOrderRepo,
+        journal,
+        authorizationPort,
+        forgePort,
+        acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
+          outcome: "found",
+          assessment: {
+            candidateHeadSha: HEAD,
+            policyRevision: "pol-1",
+            state: "accepted",
+            acceptanceReceiptId: "receipt-001",
+          },
+        }),
+      });
+      return { useCase, seen, consumeCalls, forgeCalls };
+    }
+
+    it("forwards tier:2 on push-and-open-pr and no other label", async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: "act-open",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
+        expectedHeadSha: HEAD,
+        authorizationGrantId: "grant-001",
+        title: "My PR title",
+        tierLabel: "tier:2",
+      });
+
+      expect(result.outcome).toBe("executed");
+      expect(seen).toHaveLength(1);
+      expect(seen[0].tierLabel).toBe("tier:2");
+      expect(seen[0]).not.toHaveProperty("labels");
+    });
+
+    it("refuses a tierLabel of tier:0 before the grant is consumed and does not call the forge", async () => {
+      const { useCase, seen, consumeCalls, forgeCalls } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: "act-open",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
+        expectedHeadSha: HEAD,
+        authorizationGrantId: "grant-001",
+        title: "My PR title",
+        tierLabel: "tier:0" as unknown as "tier:1" | "tier:2",
+      });
+
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "tierLabel must be tier:1 or tier:2",
+      });
+      expect(consumeCalls).toBe(0);
+      expect(forgeCalls).toBe(0);
+      expect(seen).toHaveLength(0);
+    });
+
+    it("refuses an accessor tierLabel without calling the getter or the forge", async () => {
+      const { useCase, seen, consumeCalls, forgeCalls } = capturingDeps();
+      let getterCalls = 0;
+
+      const request: Record<string, unknown> = {
+        actionId: "act-open",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
+        expectedHeadSha: HEAD,
+        authorizationGrantId: "grant-001",
+        title: "My PR title",
+      };
+      Object.defineProperty(request, "tierLabel", {
+        get() {
+          getterCalls += 1;
+          return "tier:2";
+        },
+        enumerable: true,
+        configurable: true,
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction(
+        request as unknown as ExecuteAuthorizedForgeActionRequest,
+      );
+
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "request fields must be plain data properties",
+      });
+      expect(getterCalls).toBe(0);
+      expect(consumeCalls).toBe(0);
+      expect(forgeCalls).toBe(0);
+      expect(seen).toHaveLength(0);
+    });
+
+    it("refuses a Proxy tierLabel value without invoking its get trap or calling the forge", async () => {
+      const { useCase, seen, consumeCalls, forgeCalls } = capturingDeps();
+      let trapCalls = 0;
+      const proxy = new Proxy({}, {
+        get() {
+          trapCalls += 1;
+          return "tier:1";
+        },
+      });
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: "act-open",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
+        expectedHeadSha: HEAD,
+        authorizationGrantId: "grant-001",
+        title: "My PR title",
+        tierLabel: proxy as unknown as "tier:1" | "tier:2",
+      });
+
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "tierLabel must be tier:1 or tier:2",
+      });
+      expect(trapCalls).toBe(0);
+      expect(consumeCalls).toBe(0);
+      expect(forgeCalls).toBe(0);
+      expect(seen).toHaveLength(0);
+    });
+
+    it("refuses tierLabel on push-to-pr instead of dropping it", async () => {
+      const { useCase, seen, consumeCalls, forgeCalls } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: "act-push",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-to-pr",
+        expectedHeadSha: HEAD,
+        authorizationGrantId: "grant-001",
+        tierLabel: "tier:1",
+      });
+
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "tierLabel must be tier:1 or tier:2",
+      });
+      expect(consumeCalls).toBe(0);
+      expect(forgeCalls).toBe(0);
+      expect(seen).toHaveLength(0);
+    });
+
+    it("omits tierLabel when push-and-open-pr does not carry one", async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: "act-open",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
+        expectedHeadSha: HEAD,
+        authorizationGrantId: "grant-001",
+        title: "My PR title",
+      });
+
+      expect(result.outcome).toBe("executed");
+      expect(seen).toHaveLength(1);
+      expect(seen[0].tierLabel).toBeUndefined();
     });
   });
 

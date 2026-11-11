@@ -47,6 +47,7 @@ export * from "./owner-todo.js";
 export * from "./park-class.js";
 export * from "./park-findings-view.js";
 export * from "./plain-record-reads.js";
+export * from "./pull-request-tier-label.js";
 export * from "./reaper-findings.js";
 export * from "./record-schema-version.js";
 export * from "./review-finding-scope.js";

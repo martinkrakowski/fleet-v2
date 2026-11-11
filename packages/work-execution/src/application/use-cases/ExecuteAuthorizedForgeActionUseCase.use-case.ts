@@ -53,6 +53,7 @@ import {
   BASE_BRANCH_INVALID_MESSAGE,
   parseBaseBranch,
 } from "../../domain/base-branch.js";
+import { isPullRequestTierLabel } from "../../domain/pull-request-tier-label.js";
 
 /** A safe branch name, the forge read's rule (KF-5b): one safe git ref, never all digits. */
 function isSafeBranchName(value: unknown): value is string {
@@ -498,6 +499,22 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     }
     const request = requestRead.request;
 
+    // The single conducted-open label (CP1B) must be exactly `tier:1` or
+    // `tier:2`, and only `push-and-open-pr` may carry it. This runs before
+    // the forge-mode check, before the grant is consumed and before the forge
+    // is called.
+    if (Object.prototype.hasOwnProperty.call(request, "tierLabel")) {
+      if (
+        !isPullRequestTierLabel(request.tierLabel) ||
+        request.kind !== "push-and-open-pr"
+      ) {
+        return {
+          outcome: "refused",
+          reason: "tierLabel must be tier:1 or tier:2",
+        };
+      }
+    }
+
     // Forge mode `none` (D6) is an explicit installation choice: every forge
     // action refuses before anything is consumed, journalled or executed.
     if (deps.forgeMode === "none") {
@@ -838,6 +855,9 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
               ...(request.body !== undefined ? { body: request.body } : {}),
               ...(request.baseBranch !== undefined
                 ? { baseBranch: request.baseBranch }
+                : {}),
+              ...(request.tierLabel !== undefined
+                ? { tierLabel: request.tierLabel }
                 : {}),
             }
           : {}),

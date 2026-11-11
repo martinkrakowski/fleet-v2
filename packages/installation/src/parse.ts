@@ -158,6 +158,7 @@ const PROCEDURE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 /** Container names share the procedure-name shape; see parseHostContainer. */
 const CONTAINER_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const MAX_CONTAINER_NAME_LENGTH = 64;
+const MAX_INSTALLATION_STATE_DIR_LENGTH = 4096;
 /** The tunnel offset is bounded so a dial port stays far below 65535. */
 const MAX_TUNNEL_OFFSET = 1024;
 const FORBIDDEN_PROCEDURE_NAMES: ReadonlySet<string> = new Set([
@@ -392,6 +393,54 @@ function readRequiredDaemonPath(
     return undefined;
   }
   return value;
+}
+
+/**
+ * The optional root `stateDir` field: an absolute installation state directory,
+ * distinct from `daemon.stateDir` and never defaulted. Reads the own data
+ * property only, so a getter or proxy trap never runs and the prototype is not
+ * walked. Messages name only the field; the value is never echoed.
+ */
+function readOptionalInstallationStateDir(
+  record: JsonObject,
+  errors: string[],
+): string | undefined {
+  if (!Object.hasOwn(record, 'stateDir')) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(record, 'stateDir');
+  if (typeof value !== 'string') {
+    errors.push('stateDir: must be an absolute path');
+    return undefined;
+  }
+  const raw = value;
+  if (raw.length > MAX_INSTALLATION_STATE_DIR_LENGTH) {
+    errors.push(
+      'stateDir: must be an absolute path no longer than 4096 characters',
+    );
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (trimmed === '' || !isAbsolute(trimmed)) {
+    errors.push('stateDir: must be an absolute path');
+    return undefined;
+  }
+  // The credential check comes first so a value carrying both a credential
+  // shape and a refused character reports `refused`, never the milder shape
+  // error, and the credential prefix is never echoed either way.
+  if (DAEMON_CREDENTIAL_PATTERN.test(raw)) {
+    errors.push('stateDir: refused');
+    return undefined;
+  }
+  if (
+    /\s/.test(trimmed) ||
+    /["'`\\{}%*?]/.test(trimmed) ||
+    trimmed.includes('\u0000')
+  ) {
+    errors.push('stateDir: must be an absolute path with no spaces, quotes or NUL');
+    return undefined;
+  }
+  return trimmed;
 }
 
 function isCanonicalBase64Of32Bytes(value: string): boolean {
@@ -3393,6 +3442,7 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   const waves = parseWavesSection(value, errors);
   const decisions = parseV2Decisions(value, errors);
   const daemon = parseV2Daemon(value, errors);
+  const stateDir = readOptionalInstallationStateDir(value, errors);
 
   if (errors.length > 0) {
     return { ok: false, errors };
@@ -3434,6 +3484,9 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   }
   if (daemon !== undefined) {
     installation.daemon = daemon;
+  }
+  if (stateDir !== undefined) {
+    installation.stateDir = stateDir;
   }
   return { ok: true, installation, ...(warnings.length > 0 ? { warnings } : {}) };
 }

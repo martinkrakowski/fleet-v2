@@ -8,6 +8,7 @@ import type { ForgeReadPort, PullRequestRef, ReadPullRequestResult } from '../..
 import type { ForgeAncestryPort } from '../../ports/out/ForgeAncestryPort.out-port.js';
 import type { ReviewRequestPort, FindReviewReceiptResult, FindLatestReceiptOfKindResult } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
+import { conductedOpenPullRequestTitle } from '../../../domain/held-work-order.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import { resolveLaneRunBaseBranch } from '../../../domain/base-branch.js';
 import { pullRequestTierLabel } from '../../../domain/pull-request-tier-label.js';
@@ -960,7 +961,11 @@ async function runPrPushBody(
     // Challenge section. Display only — an unavailable receipt contributes
     // no lines and never blocks the open-pr.
     const carriedMinors = await carriedMinorsOf(ctx, record, latest, headSha);
-    const title = 'Fleet work order ' + record.workOrderId;
+    const chosenTitle = conductedOpenPullRequestTitle(workOrder, record.workOrderId);
+    if (!chosenTitle.ok) {
+      return refuseKeyed(ctx, request, decision, 'forge-refused', baseBranch);
+    }
+    const title = chosenTitle.title;
     rendered = frozen === null ? null : renderPrBody({
       workOrderId: record.workOrderId,
       title,

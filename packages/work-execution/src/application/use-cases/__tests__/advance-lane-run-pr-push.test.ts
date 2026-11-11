@@ -247,6 +247,7 @@ interface Harness {
   setForgeAnswer(answer: ExecuteAuthorizedForgeActionResult | 'throw'): void;
   setForgeReadAnswer(answer: ReadPullRequestResult | 'throw'): void;
   setWorkOrderNull(nullIt: boolean): void;
+  setWorkOrder(extra: Partial<WorkOrderRecord>): void;
 }
 
 interface HarnessOptions {
@@ -311,6 +312,7 @@ async function makeHarness(
   };
   let forgeReadAnswer: ReadPullRequestResult | 'throw' = { outcome: 'not-found' };
   let workOrderNull = false;
+  let workOrderExtra: Partial<WorkOrderRecord> = {};
 
   const created = await runRepo.create(record);
   expect(created.outcome).toBe('saved');
@@ -408,7 +410,7 @@ async function makeHarness(
               if (workOrderNull) {
                 return null;
               }
-              return makeWorkOrder({ id: workOrderId });
+              return makeWorkOrder({ ...workOrderExtra, id: workOrderId });
             },
           },
         }),
@@ -477,6 +479,9 @@ async function makeHarness(
     },
     setWorkOrderNull: (nullIt) => {
       workOrderNull = nullIt;
+    },
+    setWorkOrder: (extra) => {
+      workOrderExtra = extra;
     },
   };
 }
@@ -817,6 +822,39 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
     expect(await advance(nullWorkOrder)).toEqual({ outcome: 'waiting', reason: 'facts-inconsistent' });
     const unwired = await openingPrHarness({ wireGrant: false });
     expect(await advance(unwired)).toEqual({ outcome: 'not-wired', step: 'open-pr' });
+  });
+
+  it('uses the registered pullRequestTitle as the forge request title and inside the What section', async () => {
+    const harness = await openingPrHarness();
+    harness.setWorkOrder({ pullRequestTitle: 'Open the gate' });
+    await advance(harness);
+    expect(harness.forgeRequests[0]!.title).toBe('Open the gate');
+    expect(harness.forgeRequests[0]!.body).toContain('Open the gate');
+    expect(harness.forgeRequests[0]!.body).toContain('Work order: wo-example-1');
+    expect(harness.forgeRequests[0]!.title).not.toBe('Fleet work order wo-example-1');
+  });
+
+  it('refuses a leading-space pullRequestTitle with forge-refused before any grant or forge call and parks on the next advance', async () => {
+    const harness = await openingPrHarness();
+    harness.setWorkOrder({ pullRequestTitle: ' Open the gate' });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'refused',
+      reasonCode: 'forge-refused',
+    });
+    expect(harness.grantRequests).toEqual([]);
+    expect(harness.forgeRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === openPrKey());
+    expect(intents).toHaveLength(1);
+    expect(intents[0]!.mintedId).toBeNull();
+    expect(await advance(harness)).toEqual({
+      outcome: 'parked',
+      reason: 'step-refused',
+      qualifier: 'open-pr',
+    });
   });
 });
 

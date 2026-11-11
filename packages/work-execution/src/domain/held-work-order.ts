@@ -114,8 +114,11 @@ export function conductedOpenPullRequestTitle(
       return { ok: false, reason: 'invalid-pull-request-title' };
     }
 
-    // Arrays (and other non-plain objects) are refused before any key is read.
-    if (Array.isArray(workOrder)) {
+    // Only plain objects (`Object.prototype`) or null-prototype records are
+    // accepted. Arrays, class instances and any other custom prototype are
+    // refused before any key is read.
+    const prototype = Object.getPrototypeOf(workOrder);
+    if (prototype !== Object.prototype && prototype !== null) {
       return { ok: false, reason: 'invalid-pull-request-title' };
     }
 

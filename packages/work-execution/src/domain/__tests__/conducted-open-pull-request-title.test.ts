@@ -179,7 +179,7 @@ describe('conductedOpenPullRequestTitle', () => {
     }
   });
 
-  it('uses the generic title when the only pullRequestTitle is on the prototype and does not call that getter', () => {
+  it('refuses a work order with a custom prototype and does not call its pullRequestTitle getter', () => {
     let calls = 0;
     const proto = {
       get pullRequestTitle() {
@@ -190,9 +190,30 @@ describe('conductedOpenPullRequestTitle', () => {
     const workOrder = Object.create(proto);
     expect(() => conductedOpenPullRequestTitle(workOrder, 'wo-example-1')).not.toThrow();
     expect(conductedOpenPullRequestTitle(workOrder, 'wo-example-1')).toEqual({
-      ok: true,
-      title: 'Fleet work order wo-example-1',
+      ok: false,
+      reason: 'invalid-pull-request-title',
     });
     expect(calls).toBe(0);
+  });
+
+  it('refuses a class instance work order with invalid-pull-request-title', () => {
+    class WorkOrder {
+      pullRequestTitle = 'Open the gate';
+    }
+    const workOrder = new WorkOrder();
+    expect(() => conductedOpenPullRequestTitle(workOrder, 'wo-example-1')).not.toThrow();
+    expect(conductedOpenPullRequestTitle(workOrder, 'wo-example-1')).toEqual({
+      ok: false,
+      reason: 'invalid-pull-request-title',
+    });
+  });
+
+  it('accepts a null-prototype work order with a stored title', () => {
+    const workOrder = Object.create(null);
+    workOrder.pullRequestTitle = 'Open the gate';
+    expect(conductedOpenPullRequestTitle(workOrder, 'wo-example-1')).toEqual({
+      ok: true,
+      title: 'Open the gate',
+    });
   });
 });

@@ -81,6 +81,69 @@ export function parsePullRequestTitle(
   return { ok: true, title: value };
 }
 
+export type ConductedOpenPullRequestTitleResult =
+  | { readonly ok: true; readonly title: string }
+  | { readonly ok: false; readonly reason: 'invalid-pull-request-title' | 'invalid-work-order-id' };
+
+/**
+ * Resolve the pull-request title for a conducted open-pr act, purely from the
+ * registered work order. A valid stored `pullRequestTitle` (an own data
+ * property) wins; an absent one, or an own data value of `undefined`, falls
+ * back to `Fleet work order <id>`. Malformed or hostile input refuses with a
+ * typed result. Never throws: an outer guard converts any trap throw into the
+ * typed refusal. The id is validated first, and the work order is only read
+ * through its own `pullRequestTitle` descriptor, never enumerated, and never
+ * via `get`/`set` invocation.
+ */
+export function conductedOpenPullRequestTitle(
+  workOrder: unknown,
+  workOrderId: unknown,
+): ConductedOpenPullRequestTitleResult {
+  try {
+    // The id is validated before any read of the work order, using length only
+    // for the bound so no regex or secret scan runs on an over-long id.
+    if (typeof workOrderId !== 'string' || workOrderId.length < 1 || workOrderId.length > 128) {
+      return { ok: false, reason: 'invalid-work-order-id' };
+    }
+    const id = workOrderId;
+    if (!ID_TOKEN_PATTERN.test(id) || containsAnySecretPattern(id)) {
+      return { ok: false, reason: 'invalid-work-order-id' };
+    }
+
+    if (workOrder === null || typeof workOrder !== 'object') {
+      return { ok: false, reason: 'invalid-pull-request-title' };
+    }
+
+    // Only plain objects (`Object.prototype`) or null-prototype records are
+    // accepted. Arrays, class instances and any other custom prototype are
+    // refused before any key is read.
+    const prototype = Object.getPrototypeOf(workOrder);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return { ok: false, reason: 'invalid-pull-request-title' };
+    }
+
+    // Read only the own `pullRequestTitle` descriptor; never enumerate, never
+    // use `in` or `??`, and never invoke an accessor.
+    const descriptor = Object.getOwnPropertyDescriptor(workOrder, 'pullRequestTitle');
+    if (descriptor === undefined) {
+      return { ok: true, title: 'Fleet work order ' + id };
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { ok: false, reason: 'invalid-pull-request-title' };
+    }
+    if (descriptor.value === undefined) {
+      return { ok: true, title: 'Fleet work order ' + id };
+    }
+    const parsed = parsePullRequestTitle(descriptor.value);
+    if (parsed.ok) {
+      return { ok: true, title: parsed.title };
+    }
+    return { ok: false, reason: 'invalid-pull-request-title' };
+  } catch {
+    return { ok: false, reason: 'invalid-pull-request-title' };
+  }
+}
+
 /** The UTF-8 bytes of a string, a lone surrogate encoded as U+FFFD like `TextEncoder`. */
 function utf8Bytes(value: string): number[] {
   const bytes: number[] = [];

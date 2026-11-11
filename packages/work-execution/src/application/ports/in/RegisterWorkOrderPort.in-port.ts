@@ -32,6 +32,13 @@ export interface RegisterWorkOrderRequest {
    * rejected with reason `invalid-base-branch`.
    */
   readonly baseBranch?: string;
+  /**
+   * Optional pull-request title given at registration (`--pull-request-title`).
+   * Absent stores no title; a present value must be a trimmed, non-secret
+   * string of 1..256 code units or registration is refused
+   * `invalid-pull-request-title`.
+   */
+  readonly pullRequestTitle?: string;
   /** Optional plan link (`--plan`/`--lane`, CLI in WB7a). The stored planRef's
    *  projectId is always the work order's own projectId; `planProjectId`, when
    *  the caller supplies it, must equal it or registration is rejected
@@ -85,6 +92,7 @@ export type RegisterWorkOrderResult =
       readonly reason:
         | 'overlap-unknown'
         | 'invalid-request'
+        | 'invalid-pull-request-title'
         | 'held-request-mismatch'
         | 'intent-digest-mismatch'
         | 'store-unavailable';

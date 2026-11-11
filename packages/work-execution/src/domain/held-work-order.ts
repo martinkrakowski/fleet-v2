@@ -51,6 +51,36 @@ export function containsAnySecretPattern(value: string): boolean {
   });
 }
 
+export const PULL_REQUEST_TITLE_MAX_LENGTH = 256;
+
+/**
+ * Parse an optional pull-request title given at registration. Accepts only a
+ * string of 1..256 UTF-16 code units that equals its own `trim()`, is free of
+ * control characters and fails no secret shape. Returns the typed refusal and
+ * never throws. The long-title refusal is decided by `length` alone, before
+ * `containsAnySecretPattern`, so an over-long input is not scanned.
+ */
+export function parsePullRequestTitle(
+  value: unknown,
+): { ok: true; title: string } | { ok: false; reason: 'invalid-pull-request-title' } {
+  if (typeof value !== 'string') {
+    return { ok: false, reason: 'invalid-pull-request-title' };
+  }
+  if (value.length < 1 || value.length > PULL_REQUEST_TITLE_MAX_LENGTH) {
+    return { ok: false, reason: 'invalid-pull-request-title' };
+  }
+  if (value.trim() !== value) {
+    return { ok: false, reason: 'invalid-pull-request-title' };
+  }
+  if (CONTROL_CHARACTER.test(value)) {
+    return { ok: false, reason: 'invalid-pull-request-title' };
+  }
+  if (containsAnySecretPattern(value)) {
+    return { ok: false, reason: 'invalid-pull-request-title' };
+  }
+  return { ok: true, title: value };
+}
+
 /** The UTF-8 bytes of a string, a lone surrogate encoded as U+FFFD like `TextEncoder`. */
 function utf8Bytes(value: string): number[] {
   const bytes: number[] = [];
@@ -281,6 +311,8 @@ export interface HeldWorkOrderRequestSnapshot {
   readonly prerequisiteWorkOrderIds: readonly string[];
   readonly planRef?: PlanRef;
   readonly supersedesWorkOrderId?: string;
+  /** Optional pull-request title given at registration; absent when none was given. */
+  readonly pullRequestTitle?: string;
 }
 
 export interface HeldWorkOrderRecord {
@@ -308,8 +340,19 @@ export function computeRegisterWorkOrderRequestDigest(
   digestFn: DigestFn = pureSha256Hex,
 ): string {
   const planRef = request.planRef;
+  let versionTag = 'register-work-order-request/v1';
+  const appendedTitle: string[] = [];
+  if (request.pullRequestTitle !== undefined) {
+    const parsedTitle = parsePullRequestTitle(request.pullRequestTitle);
+    if (parsedTitle.ok) {
+      versionTag = 'register-work-order-request/v2';
+      appendedTitle.push(parsedTitle.title);
+    } else {
+      versionTag = 'register-work-order-request/invalid-title';
+    }
+  }
   const canonical = JSON.stringify([
-    'register-work-order-request/v1',
+    versionTag,
     workOrderId,
     request.projectId,
     request.taskId,
@@ -324,6 +367,7 @@ export function computeRegisterWorkOrderRequestDigest(
     planRef === undefined ? null : [planRef.planId, planRef.laneId, planRef.projectId],
     request.supersedesWorkOrderId ?? null,
     briefRequestRef ?? null,
+    ...appendedTitle,
   ]);
   return digestFn(canonical);
 }

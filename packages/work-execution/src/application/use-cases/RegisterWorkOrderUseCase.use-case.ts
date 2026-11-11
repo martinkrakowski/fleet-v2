@@ -34,6 +34,7 @@ import {
   containsAnySecretPattern,
   findFirstOverlappingOwnedPathCode,
   parseForgeRepositoryCoordinates,
+  parsePullRequestTitle,
   pureSha256Hex,
   readDenseUnknownArray,
   screenBriefRequestRef,
@@ -124,6 +125,7 @@ const REQUEST_KEYS: readonly string[] = [
   'supersedesWorkOrderId',
   'briefRequestRef',
   'intentId',
+  'pullRequestTitle',
 ];
 
 const REQUIRED_STRING_FIELDS = [
@@ -307,6 +309,18 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       return INVALID_REQUEST;
     }
 
+    // An optional pull-request title is decided before the missing-field check
+    // and before any repository, profile, forge or held-store call: a present
+    // value must parse, or the whole request is refused and nothing is written.
+    let pullRequestTitle: string | undefined;
+    if (Object.hasOwn(request, 'pullRequestTitle') && request.pullRequestTitle !== undefined) {
+      const parsedTitle = parsePullRequestTitle(request.pullRequestTitle);
+      if (!parsedTitle.ok) {
+        return { outcome: 'refused', reason: 'invalid-pull-request-title' };
+      }
+      pullRequestTitle = parsedTitle.title;
+    }
+
     const requiredFields: readonly (keyof RegisterWorkOrderRequest)[] = [
       'workOrderId',
       'projectId',
@@ -450,6 +464,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       ...(request.supersedesWorkOrderId !== undefined
         ? { supersedesWorkOrderId: request.supersedesWorkOrderId.trim() }
         : {}),
+      ...(pullRequestTitle !== undefined ? { pullRequestTitle } : {}),
     };
     const requestDigest = computeRegisterWorkOrderRequestDigest(
       request.workOrderId,
@@ -522,6 +537,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       ...(request.supersedesWorkOrderId !== undefined
         ? { supersedesWorkOrderId: request.supersedesWorkOrderId.trim() }
         : {}),
+      ...(pullRequestTitle !== undefined ? { pullRequestTitle } : {}),
       state: 'approved',
       revision: 1,
       createdAtIso: nowIso,

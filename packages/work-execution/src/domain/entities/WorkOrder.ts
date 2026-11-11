@@ -10,6 +10,7 @@ import { resolveWorkOrderRisk } from '../execution-records.js';
 import type { BaseBranchValue } from '../base-branch.js';
 import { BASE_BRANCH_INVALID_MESSAGE, parseBaseBranch, resolveWorkOrderBaseBranch } from '../base-branch.js';
 import { PLAN_ID_PATTERN, PLANNED_LANE_ID_PATTERN } from '../lane-plan-records.js';
+import { parsePullRequestTitle } from '../held-work-order.js';
 import type { WorkOrderStateValue } from '../value-objects/WorkOrderState.vo.js';
 import { WorkOrderState } from '../value-objects/WorkOrderState.vo.js';
 
@@ -60,6 +61,9 @@ export class WorkOrder {
     if (Object.hasOwn(record, 'baseBranch') && parseBaseBranch(record.baseBranch) === undefined) {
       throw new Error('WorkOrder ' + BASE_BRANCH_INVALID_MESSAGE);
     }
+    if (Object.hasOwn(record, 'pullRequestTitle') && !parsePullRequestTitle(record.pullRequestTitle).ok) {
+      throw new Error('WorkOrder pullRequestTitle is invalid');
+    }
     return new WorkOrder(storedRecord(record));
   }
 
@@ -93,6 +97,11 @@ export class WorkOrder {
     return resolveWorkOrderBaseBranch(this.record);
   }
 
+  /** The pull-request title given at registration; `null` when none was given. */
+  getPullRequestTitle(): string | null {
+    return this.record.pullRequestTitle ?? null;
+  }
+
   /** Terminal states (merged, stopped) accept no further attempt dispatch. */
   isTerminal(): boolean {
     return this.record.state === 'merged' || this.record.state === 'stopped';
@@ -116,11 +125,12 @@ export class WorkOrder {
 
 /** A fresh record; `planRef`, `risk` and `baseBranch` are copied when present and omitted when absent. */
 function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
-  const stored: Omit<WorkOrderRecord, 'planRef' | 'risk' | 'supersedesWorkOrderId' | 'baseBranch'> & {
+  const stored: Omit<WorkOrderRecord, 'planRef' | 'risk' | 'supersedesWorkOrderId' | 'baseBranch' | 'pullRequestTitle'> & {
     planRef?: PlanRef;
     risk?: WorkOrderRisk;
     supersedesWorkOrderId?: string;
     baseBranch?: BaseBranchValue;
+    pullRequestTitle?: string;
   } = {
     id: record.id,
     projectId: record.projectId,
@@ -151,6 +161,9 @@ function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
   }
   if (Object.hasOwn(record, 'baseBranch') && record.baseBranch !== undefined) {
     stored.baseBranch = record.baseBranch;
+  }
+  if (Object.hasOwn(record, 'pullRequestTitle') && record.pullRequestTitle !== undefined) {
+    stored.pullRequestTitle = record.pullRequestTitle;
   }
   return stored;
 }

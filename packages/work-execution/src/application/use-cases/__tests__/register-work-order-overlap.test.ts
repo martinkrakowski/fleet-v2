@@ -3,7 +3,14 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ActionJournalEntryRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
-import { overlapPathCode } from '../../../domain/held-work-order.js';
+import {
+  computeRegisterWorkOrderRequestDigest,
+  overlapPathCode,
+  parsePullRequestTitle,
+  pureSha256Hex,
+} from '../../../domain/held-work-order.js';
+import type { HeldWorkOrderRequestSnapshot } from '../../../domain/held-work-order.js';
+import { WorkOrder } from '../../../domain/entities/WorkOrder.js';
 import { ForgeReadAdapter } from '../../../infrastructure/adapters/ForgeReadAdapter.adapter.js';
 import { HeldWorkOrderRepositoryAdapter } from '../../../infrastructure/adapters/HeldWorkOrderRepositoryAdapter.adapter.js';
 import { WorkOrderRepositoryAdapter } from '../../../infrastructure/adapters/WorkOrderRepositoryAdapter.adapter.js';
@@ -717,5 +724,366 @@ describe('ListHeldWorkOrdersUseCase', () => {
     for (const input of bad) {
       expect(await state.listHeld.listHeldWorkOrders(input as never)).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     }
+  });
+});
+
+describe('parsePullRequestTitle', () => {
+  const refusal = { ok: false as const, reason: 'invalid-pull-request-title' as const };
+
+  it('parsePullRequestTitle refuses null with invalid-pull-request-title and does not throw', () => {
+    expect(parsePullRequestTitle(null)).toEqual(refusal);
+  });
+
+  it('parsePullRequestTitle refuses undefined with invalid-pull-request-title and does not throw', () => {
+    expect(parsePullRequestTitle(undefined)).toEqual(refusal);
+  });
+
+  it('parsePullRequestTitle refuses a number, a boolean, a bigint, a symbol, and a function', () => {
+    const fn = () => {};
+    for (const value of [1, true, 1n, Symbol('t'), fn]) {
+      expect(parsePullRequestTitle(value)).toEqual(refusal);
+    }
+  });
+
+  it('parsePullRequestTitle refuses an array hole with a throwing getter without calling it', () => {
+    let calls = 0;
+    const arr: unknown[] = [];
+    Object.defineProperty(arr, '0', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        throw new Error('hostile getter');
+      },
+    });
+    expect(parsePullRequestTitle(arr)).toEqual(refusal);
+    expect(calls).toBe(0);
+  });
+
+  it('parsePullRequestTitle refuses a throwing getter and a Proxy without invoking them', () => {
+    let getterCalls = 0;
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, 'title', {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error('hostile getter');
+      },
+    });
+    let proxyCalls = 0;
+    const proxy = new Proxy({}, {
+      get() {
+        proxyCalls += 1;
+        return 'x';
+      },
+    });
+    expect(parsePullRequestTitle(hostile)).toEqual(refusal);
+    expect(parsePullRequestTitle(proxy)).toEqual(refusal);
+    expect(getterCalls).toBe(0);
+    expect(proxyCalls).toBe(0);
+  });
+
+  it('parsePullRequestTitle refuses an array-like with an enormous length getter without calling it', () => {
+    let calls = 0;
+    const arrayLike = {
+      get length() {
+        calls += 1;
+        return 1e15;
+      },
+    };
+    expect(parsePullRequestTitle(arrayLike)).toEqual(refusal);
+    expect(calls).toBe(0);
+  });
+
+  it('parsePullRequestTitle refuses a prototype-polluting object and leaves Object.prototype clean', () => {
+    const polluted = JSON.parse(
+      '{"__proto__":{"polluted":true},"constructor":{"prototype":{"polluted":true}}}',
+    ) as Record<string, unknown>;
+    expect(parsePullRequestTitle(polluted)).toEqual(refusal);
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+  });
+
+  it('parsePullRequestTitle refuses an empty, blank, or padded title', () => {
+    for (const value of ['', '   ', ' title', 'title ']) {
+      expect(parsePullRequestTitle(value)).toEqual(refusal);
+    }
+  });
+
+  it('parsePullRequestTitle refuses a title longer than 256 code units', () => {
+    for (const value of ['a'.repeat(257), 'a'.repeat(100000)]) {
+      expect(parsePullRequestTitle(value)).toEqual(refusal);
+    }
+  });
+
+  it('parsePullRequestTitle refuses a secret-shaped title and does not return the secret', () => {
+    const secret = ['ghp', '_', 'x'.repeat(36)].join('');
+    const result = parsePullRequestTitle(`prefix ${secret}`);
+    expect(result).toEqual(refusal);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it('parsePullRequestTitle accepts a trimmed title of 1 to 256 code units', () => {
+    expect(parsePullRequestTitle('Add the registration title')).toEqual({
+      ok: true,
+      title: 'Add the registration title',
+    });
+    const long = 'a'.repeat(256);
+    expect(parsePullRequestTitle(long)).toEqual({ ok: true, title: long });
+  });
+});
+
+describe('WorkOrder pullRequestTitle', () => {
+  const baseRecord: WorkOrderRecord = {
+    id: 'wo-1',
+    projectId: 'proj-1',
+    taskId: 'task-1',
+    laneId: 'lane-1',
+    repository: 'acme/fleet',
+    baseCommit: '1111111111111111111111111111111111111111',
+    ownedPaths: ['packages/a/src'],
+    policyRevision: 'rev-1',
+    prerequisiteWorkOrderIds: [],
+    state: 'approved',
+    revision: 1,
+    createdAtIso: '2026-11-07T10:00:00.000Z',
+    updatedAtIso: '2026-11-07T10:00:00.000Z',
+  };
+
+  it('WorkOrder.fromRecord throws WorkOrder pullRequestTitle is invalid for a non-string title', () => {
+    expect(() =>
+      WorkOrder.fromRecord({ ...baseRecord, pullRequestTitle: 1 } as unknown as WorkOrderRecord),
+    ).toThrow('WorkOrder pullRequestTitle is invalid');
+  });
+
+  it('WorkOrder.getPullRequestTitle returns null when the record has no title', () => {
+    const order = WorkOrder.fromRecord(baseRecord);
+    expect(order.getPullRequestTitle()).toBeNull();
+    expect(order.toRecord()).not.toHaveProperty('pullRequestTitle');
+  });
+});
+
+describe('RegisterWorkOrderUseCase pull request title', () => {
+  const secret = ['ghp', '_', 'x'.repeat(36)].join('');
+
+  it('registerWorkOrder refuses an invalid pullRequestTitle and saves nothing', async () => {
+    const { useCase, saved } = setup();
+    const inputs: unknown[] = [1, null, 'a'.repeat(257), secret, ' title'];
+    for (const value of inputs) {
+      const result = await useCase.registerWorkOrder(request({ pullRequestTitle: value as never }));
+      expect(result).toEqual({ outcome: 'refused', reason: 'invalid-pull-request-title' });
+      expect(JSON.stringify(result)).not.toContain(secret);
+    }
+    expect(saved).toEqual([]);
+  });
+
+  it('registerWorkOrder reports invalid-pull-request-title before a missing taskId', async () => {
+    const { useCase, saved } = setup();
+    const result = await useCase.registerWorkOrder(
+      request({ taskId: undefined, pullRequestTitle: 1 as never }) as never,
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-pull-request-title' });
+    expect(saved).toEqual([]);
+  });
+
+  it('registerWorkOrder still rejects an empty taskId when the title is valid', async () => {
+    const { useCase } = setup();
+    const result = await useCase.registerWorkOrder(request({ taskId: '', pullRequestTitle: 'A title' }));
+    expect(result).toEqual({ outcome: 'rejected', reason: 'Missing required work order fields: taskId' });
+  });
+
+  it('registerWorkOrder refuses a throwing pullRequestTitle getter as invalid-request without calling it', async () => {
+    const { useCase, saved } = setup();
+    let calls = 0;
+    const hostile = { ...request() };
+    Object.defineProperty(hostile, 'pullRequestTitle', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        throw new Error('hostile getter');
+      },
+    });
+    const result = await useCase.registerWorkOrder(hostile as never);
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+    expect(saved).toEqual([]);
+  });
+
+  it('registerWorkOrder stores the given title and omits the field when the key is absent', async () => {
+    const state = setup();
+    const title = 'Add the registration title';
+    const registered = await state.useCase.registerWorkOrder(request({ pullRequestTitle: title }));
+    expect(registered.outcome).toBe('registered');
+    const stored = await state.workOrderRepo.findWorkOrderById('wo-new');
+    expect(stored?.pullRequestTitle).toBe(title);
+    expect(WorkOrder.fromRecord(stored!).getPullRequestTitle()).toBe(title);
+
+    await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-other', ownedPaths: ['packages/other/src'], pullRequestTitle: undefined }),
+    );
+    const other = await state.workOrderRepo.findWorkOrderById('wo-other');
+    expect(Object.hasOwn(other!, 'pullRequestTitle')).toBe(false);
+  });
+
+  it('a held replay with a different title returns held-request-mismatch and does not echo the title', async () => {
+    const state = setup();
+    await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a' }));
+    const first = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', pullRequestTitle: 'First title' }),
+    );
+    const second = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', pullRequestTitle: 'Second title' }),
+    );
+    expect(first).toMatchObject({ outcome: 'refused', held: true });
+    expect(second).toEqual({ outcome: 'refused', reason: 'held-request-mismatch' });
+    const listed = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(listed.outcome === 'ok' && listed.records).toHaveLength(1);
+    expect(JSON.stringify(first)).not.toContain('First title');
+    expect(JSON.stringify(second)).not.toContain('Second title');
+  });
+
+  it('a held record does not store the pull request title text', async () => {
+    const state = setup();
+    await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a' }));
+    const refused = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', pullRequestTitle: 'Store this title' }),
+    );
+    expect(refused).toMatchObject({ outcome: 'refused', held: true });
+    const held = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(held.outcome).toBe('ok');
+    if (held.outcome === 'ok') {
+      expect(JSON.stringify(held.records[0])).not.toContain('Store this title');
+    }
+  });
+
+  it('adding a title to a held no-title request returns held-request-mismatch', async () => {
+    const state = setup();
+    await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a' }));
+    await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b' }));
+    const second = await state.useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', pullRequestTitle: 'New title' }),
+    );
+    expect(second).toEqual({ outcome: 'refused', reason: 'held-request-mismatch' });
+  });
+});
+
+describe('RegisterWorkOrderUseCase titled overlap paths', () => {
+  const title = 'Add the registration title';
+
+  it('an overlapping titled registration is held without saving the work order or echoing the title', async () => {
+    const { forge } = fakeForge({
+      list: { outcome: 'listed', pullRequests: [openPr(42)] },
+      files: { 42: { outcome: 'found', files: ['packages/a/src/x.ts'] } },
+    });
+    const state = setup({ forgeRead: forge });
+    const refused = await state.useCase.registerWorkOrder(request({ pullRequestTitle: title }));
+    expect(refused).toMatchObject({ outcome: 'refused', reason: 'open-pr-overlap', held: true });
+    expect(state.saved).toEqual([]);
+    expect(JSON.stringify(refused)).not.toContain(title);
+  });
+
+  it('a titled registration returns overlap-unknown when the forge list throws', async () => {
+    const { forge } = fakeForge({ list: 'throw' });
+    const state = setup({ forgeRead: forge });
+    const result = await state.useCase.registerWorkOrder(request({ pullRequestTitle: title }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'overlap-unknown' });
+    expect(state.saved).toEqual([]);
+    expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual({ outcome: 'ok', records: [] });
+  });
+
+  it('a titled overlap is held false when the held store is absent', async () => {
+    const workOrderRepo = new WorkOrderRepositoryAdapter();
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo });
+    await useCase.registerWorkOrder(request({ workOrderId: 'wo-a' }));
+    const result = await useCase.registerWorkOrder(
+      request({ workOrderId: 'wo-b', pullRequestTitle: 'A title' }),
+    );
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'active-work-order-overlap', held: false });
+  });
+
+  it('a titled registration returns store-unavailable when save throws', async () => {
+    const throwingRepo = {
+      findWorkOrderById: async () => null,
+      listWorkOrdersByProject: async () => [],
+      saveWorkOrder: async () => {
+        throw new Error('boom');
+      },
+    };
+    const state = setup({ workOrderRepo: throwingRepo as never });
+    const result = await state.useCase.registerWorkOrder(request({ pullRequestTitle: title }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'store-unavailable' });
+  });
+});
+
+describe('computeRegisterWorkOrderRequestDigest pull request title', () => {
+  const baseSnapshot = (): HeldWorkOrderRequestSnapshot => ({
+    projectId: 'proj-1',
+    taskId: 'task-1',
+    laneId: 'lane-1',
+    repository: 'acme/fleet',
+    baseCommit: '1111111111111111111111111111111111111111',
+    ownedPaths: ['packages/a/src', 'packages/b/src'],
+    policyRevision: 'rev-1',
+    risk: 'high',
+    baseBranch: 'main',
+    prerequisiteWorkOrderIds: [],
+  });
+
+  it('a snapshot with no title keeps the v1 request digest', () => {
+    const workOrderId = 'wo-new';
+    const snapshot = baseSnapshot();
+    const expected = pureSha256Hex(
+      JSON.stringify([
+        'register-work-order-request/v1',
+        workOrderId,
+        snapshot.projectId,
+        snapshot.taskId,
+        snapshot.laneId,
+        snapshot.repository,
+        snapshot.baseCommit,
+        [...snapshot.ownedPaths],
+        snapshot.policyRevision,
+        snapshot.risk,
+        snapshot.baseBranch,
+        [...snapshot.prerequisiteWorkOrderIds],
+        null,
+        null,
+        null,
+      ]),
+    );
+    expect(computeRegisterWorkOrderRequestDigest(workOrderId, snapshot, null)).toBe(expected);
+  });
+
+  it('two accepted titles produce two digests different from the v1 digest', () => {
+    const workOrderId = 'wo-new';
+    const v1 = computeRegisterWorkOrderRequestDigest(workOrderId, baseSnapshot(), null);
+    const a = computeRegisterWorkOrderRequestDigest(
+      workOrderId,
+      { ...baseSnapshot(), pullRequestTitle: 'Add feature X' },
+      null,
+    );
+    const b = computeRegisterWorkOrderRequestDigest(
+      workOrderId,
+      { ...baseSnapshot(), pullRequestTitle: 'Add feature Y' },
+      null,
+    );
+    expect(a).not.toBe(v1);
+    expect(b).not.toBe(v1);
+    expect(a).not.toBe(b);
+  });
+
+  it('an invalid snapshot title does not throw and does not reuse the v1 digest', () => {
+    const workOrderId = 'wo-new';
+    const invalid = computeRegisterWorkOrderRequestDigest(
+      workOrderId,
+      { ...baseSnapshot(), pullRequestTitle: 1 } as unknown as HeldWorkOrderRequestSnapshot,
+      null,
+    );
+    const accepted = computeRegisterWorkOrderRequestDigest(
+      workOrderId,
+      { ...baseSnapshot(), pullRequestTitle: 'Add feature X' },
+      null,
+    );
+    const v1 = computeRegisterWorkOrderRequestDigest(workOrderId, baseSnapshot(), null);
+    expect(invalid).not.toBe(v1);
+    expect(invalid).not.toBe(accepted);
   });
 });

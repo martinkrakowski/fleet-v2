@@ -29,6 +29,14 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       ) {
         throw new CliUsageError('work-order register --base-branch needs a branch');
       }
+      // A given --pull-request-title must carry a value the same way; a bad string
+      // (over-long, secret-shaped or padded) is the use case's refusal, not a usage error.
+      if (
+        Object.hasOwn(p, 'pullRequestTitle') &&
+        (typeof p.pullRequestTitle !== 'string' || p.pullRequestTitle.trim() === '')
+      ) {
+        throw new CliUsageError('work-order register --pull-request-title needs a title');
+      }
       // A given --brief-request-ref or --intent-id must carry a value the same way.
       if (
         Object.hasOwn(p, 'briefRequestRef') &&
@@ -39,6 +47,10 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       if (Object.hasOwn(p, 'intentId') && (typeof p.intentId !== 'string' || p.intentId.trim() === '')) {
         throw new CliUsageError('work-order register --intent-id needs an intent id');
       }
+      const pullRequestTitle =
+        Object.hasOwn(p, 'pullRequestTitle') && typeof p.pullRequestTitle === 'string'
+          ? p.pullRequestTitle
+          : undefined;
       return rt.execution.registerWorkOrder.registerWorkOrder({
         workOrderId: str(p, 'workOrderId'),
         projectId: str(p, 'projectId'),
@@ -57,6 +69,7 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
         supersedesWorkOrderId: optStr(p, 'supersedesWorkOrderId'),
         briefRequestRef: optStr(p, 'briefRequestRef'),
         intentId: optStr(p, 'intentId'),
+        pullRequestTitle,
         nowIso: optStr(p, 'nowIso'),
       });
     },
@@ -128,6 +141,11 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       if (source.state !== 'stopped') {
         return { outcome: 'refused' as const, reason: 'source-not-stopped', workOrderId: from, state: source.state };
       }
+      // A tampered on-disk title (a present key with a non-string value) is
+      // refused before registering; a valid or absent title copies through.
+      if (Object.hasOwn(source, 'pullRequestTitle') && typeof source.pullRequestTitle !== 'string') {
+        return { outcome: 'refused', reason: 'invalid-pull-request-title' };
+      }
       return rt.execution.registerWorkOrder.registerWorkOrder({
         workOrderId: newId,
         projectId: source.projectId,
@@ -141,6 +159,7 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
         baseCommit: p.baseCommit !== undefined ? String(p.baseCommit) : source.baseCommit,
         prerequisiteWorkOrderIds: [],
         supersedesWorkOrderId: from,
+        ...(typeof source.pullRequestTitle === 'string' ? { pullRequestTitle: source.pullRequestTitle } : {}),
         nowIso: optStr(p, 'nowIso'),
       });
     },

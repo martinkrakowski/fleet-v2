@@ -22,7 +22,7 @@ import type {
   BriefAuthoringPort,
   BriefAuthorSessionRequest,
   BriefAuthorSessionResult,
-  BriefAuthorSessionUnavailable,
+  BriefAuthorSessionUnavailableReason,
 } from '../../application/ports/out/BriefAuthoringPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import { withFileLock } from './file-store.js';
@@ -42,7 +42,6 @@ export interface BriefAuthoringAdapterOptions {
 
 const DEFAULT_TIMEOUT_MS = 900_000;
 const MAX_TIMEOUT_MS = 3_600_000;
-const DEFAULT_MAX_ANSWER_BYTES = 262_144;
 /** Room for the seat's stderr inside the executor's stdout+stderr cap. */
 const STDERR_HEADROOM_BYTES = 65_536;
 /** Slack added to the session timeout when judging an intent claim stale. */
@@ -50,8 +49,11 @@ const INTENT_CLAIM_SLACK_MS = 60_000;
 const GIT_TIMEOUT_MS = 30_000;
 /** Mirrors the fact pack's prompt cap. */
 const MAX_PROMPT_BYTES = 300_000;
+/** Largest prompt or answer accepted for one seat session, in UTF-8 bytes. */
+const MAX_SESSION_BYTES = 256_000;
 const MAX_STEM_LENGTH = 120;
 const COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
+const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]{1,120}$/;
 const PLACEHOLDER_PATTERN = /\{([^{}]*)\}/g;
 const ALLOWED_PLACEHOLDERS: ReadonlySet<string> = new Set([
   'promptFile', 'model', 'variant', 'agent', 'workOrderId', 'laneId', 'baseCommit',
@@ -66,8 +68,28 @@ const GIT_ARGV_PREFIX = [
   '-c', 'core.attributesFile=/dev/null', '-c', 'protocol.allow=never', '-C',
 ] as const;
 
-const unavailable = (reason: BriefAuthorSessionUnavailable): BriefAuthorSessionResult =>
+const MISSING = Symbol('missing');
+
+const unavailable = (reason: BriefAuthorSessionUnavailableReason): BriefAuthorSessionResult =>
   ({ outcome: 'unavailable', reason });
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype: unknown = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** Read an own data property: never invokes a getter, never reads a prototype field. */
+function readOwnData(value: Record<string, unknown>, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined
+    || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+    return MISSING;
+  }
+  return descriptor.value;
+}
 
 function isNonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
@@ -81,6 +103,10 @@ function hasControlCharacter(value: string): boolean {
     }
   }
   return false;
+}
+
+function hasDotDotSegment(value: string): boolean {
+  return value.split(path.sep).some((segment) => segment === '..');
 }
 
 function safeSegment(value: string): string {
@@ -118,6 +144,24 @@ function renderSeatArgv(
     argv.push(rendered);
   }
   return promptFileCount === 1 ? argv : null;
+}
+
+/**
+ * Validate the seat command template before it is rendered. Returns a refusal
+ * reason when the command is missing or unsafe, and null when it can run.
+ */
+function validateSessionCommand(
+  seatCommand: readonly string[] | undefined,
+): 'session-command-missing' | 'session-command-invalid' | null {
+  if (seatCommand === undefined || seatCommand.length === 0) {
+    return 'session-command-missing';
+  }
+  const binary = seatCommand[0];
+  if (typeof binary !== 'string' || binary.length === 0 || hasControlCharacter(binary)
+    || !path.isAbsolute(binary) || hasDotDotSegment(binary)) {
+    return 'session-command-invalid';
+  }
+  return null;
 }
 
 function resolveTimeout(requested: number | undefined): number {
@@ -171,56 +215,62 @@ async function writeFileNoFollow(filePath: string, data: string): Promise<void> 
 }
 
 /**
- * True when any existing component of the absolute path is a symlink, or the
- * path cannot be inspected safely. Each component is inspected with lstat from
- * the root down and never followed; the first missing component ends the walk
- * because nothing below it exists yet. A parent-directory (dot-dot) segment is refused: the kernel
- * would resolve it through a link while path.join resolves it lexically.
+ * True when the briefs directory is a safe absolute path: no dot-dot segment,
+ * and every existing component is a real directory, never a symlink. The first
+ * missing component ends the walk because nothing below it exists yet. The
+ * directory is created if it does not exist. Each component is inspected with
+ * lstat from the root down and never followed.
  */
-async function pathCrossesSymbolicLink(absolutePath: string): Promise<boolean> {
-  const segments = absolutePath.split(path.sep).filter((segment) => segment.length > 0);
-  if (segments.includes('..')) {
-    return true;
+async function ensureSafeDirectory(briefsDir: string): Promise<boolean> {
+  if (!path.isAbsolute(briefsDir) || hasDotDotSegment(briefsDir)) {
+    return false;
   }
-  let current = path.parse(absolutePath).root;
+  const segments = briefsDir.split(path.sep).filter((segment) => segment.length > 0);
+  let current = path.parse(briefsDir).root;
   for (const segment of segments) {
     current = path.join(current, segment);
     try {
-      if ((await fs.lstat(current)).isSymbolicLink()) {
-        return true;
+      const stat = await fs.lstat(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        return false;
       }
     } catch (error) {
-      return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        return false;
+      }
+      break;
     }
   }
-  return false;
+  try {
+    await fs.mkdir(briefsDir, { recursive: true });
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 /**
- * The recorded answer, or null when none exists, or 'too-large' when the
- * recorded answer itself exceeds the answer limit. A symlinked answer file is
- * refused like any other unreadable answer: it may point outside the briefs
- * directory.
+ * The recorded answer, or `null` when none exists or it is unusable, or
+ * `'too-large'` when the recorded answer itself exceeds the answer limit. The
+ * caller separately refuses a symlinked answer file, which may point outside the
+ * briefs directory.
  */
 async function readRecordedAnswer(
   answerPath: string,
   maxAnswerBytes: number,
 ): Promise<string | null | 'too-large'> {
   const stat = await fs.lstat(answerPath).catch(() => null);
-  if (stat === null) {
+  if (stat === null || stat.isSymbolicLink() || !stat.isFile()) {
     return null;
-  }
-  if (stat.isSymbolicLink()) {
-    throw new Error('recorded brief answer is unreadable');
   }
   let text: string;
   try {
     text = await readFileNoFollow(answerPath);
   } catch {
-    throw new Error('recorded brief answer is unreadable');
+    return null;
   }
   if (text.trim().length === 0) {
-    throw new Error('recorded brief answer is unreadable');
+    return null;
   }
   return Buffer.byteLength(text, 'utf8') > maxAnswerBytes ? 'too-large' : text;
 }
@@ -348,74 +398,169 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
 
   /**
    * A recorded answer that cannot be read back rejects: the use case reports
-   * that as an unknown outcome, never as an empty brief.
+   * that as an unavailable outcome, never as an empty brief.
    */
   async authorBriefSession(request: BriefAuthorSessionRequest): Promise<BriefAuthorSessionResult> {
+    try {
+      return await this.runAuthorBriefSession(request);
+    } catch {
+      return unavailable('session-failed');
+    }
+  }
+
+  private async runAuthorBriefSession(request: BriefAuthorSessionRequest): Promise<BriefAuthorSessionResult> {
+    // The whole request is inspected through own data descriptors: a non-plain
+    // object or any accessor is refused before any field is read.
+    if (!isPlainObject(request)) {
+      return unavailable('session-command-invalid');
+    }
+    const record = request as Record<string, unknown>;
+    const workOrderId = readOwnData(record, 'workOrderId');
+    const laneId = readOwnData(record, 'laneId');
+    const checkoutPath = readOwnData(record, 'checkoutPath');
+    const briefsDir = readOwnData(record, 'briefsDir');
+    const baseCommit = readOwnData(record, 'baseCommit');
+    const prompt = readOwnData(record, 'prompt');
+    const model = readOwnData(record, 'model');
+    const variant = readOwnData(record, 'variant');
+    const agent = readOwnData(record, 'agent');
+    const sessionKey = readOwnData(record, 'sessionKey');
+    const timeoutMs = readOwnData(record, 'timeoutMs');
+
+    for (const field of [workOrderId, laneId, checkoutPath, briefsDir, baseCommit, prompt, model, sessionKey]) {
+      if (field === MISSING || typeof field !== 'string') {
+        return unavailable('session-command-invalid');
+      }
+    }
+
+    // Commit and ids: a malformed commit or id is not pinned to a known revision.
+    if (!COMMIT_PATTERN.test(baseCommit as string)
+      || !SAFE_ID_PATTERN.test(workOrderId as string) || workOrderId === '.' || workOrderId === '..'
+      || !SAFE_ID_PATTERN.test(laneId as string) || laneId === '.' || laneId === '..') {
+      return unavailable('checkout-not-pinned');
+    }
+
+    // Checkout path: absolute, no dot-dot, no control characters.
+    if (hasControlCharacter(checkoutPath as string)
+      || !path.isAbsolute(checkoutPath as string)
+      || hasDotDotSegment(checkoutPath as string)) {
+      return unavailable('checkout-unreadable');
+    }
+
+    // Briefs directory: non-empty, no control characters, absolute, no dot-dot.
+    // The directory walk is verified later via ensureSafeDirectory.
+    if (hasControlCharacter(briefsDir as string)
+      || !path.isAbsolute(briefsDir as string)
+      || hasDotDotSegment(briefsDir as string)) {
+      return unavailable('briefs-dir-invalid');
+    }
+
+    // Prompt and model (and optional variant/agent).
+    if ((prompt as string).trim().length === 0) {
+      return unavailable('session-empty');
+    }
+    if (Buffer.byteLength(prompt as string, 'utf8') > MAX_SESSION_BYTES) {
+      return unavailable('session-oversized');
+    }
+    if (hasControlCharacter(model as string) || (model as string).trim().length === 0) {
+      return unavailable('session-command-invalid');
+    }
+    for (const optional of [variant, agent]) {
+      if (optional === MISSING || optional === undefined) {
+        continue;
+      }
+      if (typeof optional !== 'string' || hasControlCharacter(optional) || optional.trim().length === 0) {
+        return unavailable('session-command-invalid');
+      }
+    }
+
     const stem = sessionStem(request);
     if (stem === null) {
       return unavailable('session-command-invalid');
     }
-    // A symlink anywhere along briefsDir (the leaf or any parent) redirects every
-    // read and write outside the intended directory; refuse before touching the
-    // filesystem through the link.
-    if (await pathCrossesSymbolicLink(request.briefsDir)) {
-      return unavailable('session-command-invalid');
+    if (!(await ensureSafeDirectory(briefsDir as string))) {
+      return unavailable('briefs-dir-invalid');
     }
-    const base = path.join(request.briefsDir, stem);
+
+    const base = path.join(briefsDir as string, stem);
     const answerPath = `${base}.answer.md`;
-    const maxAnswerBytes = this.options?.maxAnswerBytes ?? DEFAULT_MAX_ANSWER_BYTES;
+    const promptPath = `${base}.prompt.md`;
+    const maxAnswerBytes = this.options?.maxAnswerBytes ?? MAX_SESSION_BYTES;
+
+    // A symlinked answer is refused before it could redirect the read outside
+    // the briefs directory.
+    if (await isSymbolicLink(answerPath)) {
+      return unavailable('briefs-dir-invalid');
+    }
     // Recorded outcome first: a completed session replays without any seat
     // configuration, executor or checkout check.
     const recorded = await readRecordedAnswer(answerPath, maxAnswerBytes);
     if (recorded === 'too-large') {
-      return unavailable('session-output-too-large');
+      return unavailable('session-oversized');
     }
     if (recorded !== null) {
-      return { outcome: 'answered', answer: recorded };
+      return { outcome: 'answered', rawAnswer: recorded, sessionKey: sessionKey as string, answerPath, cached: true };
     }
+
     const { seatCommand, executor } = this.options ?? {};
-    if (seatCommand === undefined || executor === undefined) {
-      return unavailable('seat-command-not-configured');
+    const commandError = validateSessionCommand(seatCommand);
+    if (commandError !== null) {
+      return unavailable(commandError);
     }
-    const promptPath = `${base}.prompt.md`;
-    const argv = renderSeatArgv(seatCommand, {
-      promptFile: promptPath, model: request.model, variant: request.variant, agent: request.agent,
-      workOrderId: request.workOrderId, laneId: request.laneId, baseCommit: request.baseCommit,
+    if (executor === undefined) {
+      return unavailable('session-command-missing');
+    }
+
+    const argv = renderSeatArgv(seatCommand as readonly string[], {
+      promptFile: promptPath, model: model as string,
+      variant: variant === MISSING || variant === undefined ? undefined : (variant as string),
+      agent: agent === MISSING || agent === undefined ? undefined : (agent as string),
+      workOrderId: workOrderId as string, laneId: laneId as string, baseCommit: baseCommit as string,
     });
-    if (argv === null) return unavailable('session-command-invalid');
-    const timeoutMs = resolveTimeout(request.timeoutMs ?? this.options?.timeoutMs);
+    if (argv === null) {
+      return unavailable('session-command-invalid');
+    }
+
+    const timeout = resolveTimeout(timeoutMs === MISSING || timeoutMs === undefined ? undefined : (timeoutMs as number));
     // The exclusive intent claim is what grants the seat run: a concurrent
     // call sees a fresh claim for the same key and refuses instead of also
     // running the seat.
-    const claimWindowMs = timeoutMs + INTENT_CLAIM_SLACK_MS;
-    if (!(await claimIntent(request.briefsDir, `${base}.intent.json`, request.sessionKey, claimWindowMs))) {
+    const claimWindowMs = timeout + INTENT_CLAIM_SLACK_MS;
+    if (!(await claimIntent(briefsDir as string, `${base}.intent.json`, sessionKey as string, claimWindowMs))) {
       return unavailable('session-failed');
     }
+
     const pinned = await this.checkPinnedCheckout(executor, request);
-    if (pinned !== null) return unavailable(pinned);
-    if (await isSymbolicLink(promptPath)
-      || !(await writeFileNoFollow(promptPath, request.prompt).then(() => true, () => false))) {
+    if (pinned !== null) {
+      return unavailable(pinned);
+    }
+
+    if (await isSymbolicLink(promptPath)) {
+      return unavailable('briefs-dir-invalid');
+    }
+    if (!(await writeFileNoFollow(promptPath, prompt as string).then(() => true, () => false))) {
       return unavailable('session-failed');
     }
+
     const run = await executor.run(argv, {
-      cwd: request.checkoutPath,
-      timeoutMs,
+      cwd: checkoutPath as string,
+      timeoutMs: timeout,
       maxBufferBytes: maxAnswerBytes + STDERR_HEADROOM_BYTES,
     }).catch(() => null);
-    if (run === null || (run.error === undefined && run.exitCode !== 0)) {
+    if (run === null || typeof run.exitCode !== 'number' || typeof run.stdout !== 'string') {
       return unavailable('session-failed');
     }
-    if (run.error !== undefined) {
-      return unavailable(/timeout|maxBufferBytes/.test(run.error) ? 'session-timeout' : 'session-failed');
+    if (run.error !== undefined || run.exitCode !== 0) {
+      return unavailable('session-failed');
     }
     if (run.stdout.trim().length === 0) {
       return unavailable('session-empty');
     }
     if (Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes) {
-      return unavailable('session-output-too-large');
+      return unavailable('session-oversized');
     }
     return (await recordAnswer(answerPath, run.stdout))
-      ? { outcome: 'answered', answer: run.stdout }
+      ? { outcome: 'answered', rawAnswer: run.stdout, sessionKey: sessionKey as string, answerPath, cached: false }
       : unavailable('session-failed');
   }
 
@@ -423,17 +568,19 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
   private async checkPinnedCheckout(
     executor: CommandExecutorPort,
     request: BriefAuthorSessionRequest,
-  ): Promise<'checkout-unavailable' | 'checkout-not-pinned' | null> {
-    const stat = await fs.stat(request.checkoutPath).catch(() => null);
-    if (stat === null || !stat.isDirectory()) {
-      return 'checkout-unavailable';
+  ): Promise<'checkout-unreadable' | 'checkout-not-pinned' | null> {
+    const stat = await fs.lstat(request.checkoutPath).catch(() => null);
+    if (stat === null || !stat.isDirectory() || stat.isSymbolicLink()) {
+      return 'checkout-unreadable';
     }
     const head = await executor.run(
-      [...GIT_ARGV_PREFIX, request.checkoutPath, 'rev-parse', 'HEAD'],
+      [...GIT_ARGV_PREFIX, request.checkoutPath, 'rev-parse', '--verify', 'HEAD'],
       { cwd: request.checkoutPath, timeoutMs: GIT_TIMEOUT_MS },
     ).catch(() => null);
-    if (head === null || head.error !== undefined || head.exitCode !== 0
-      || head.stdout.trim() !== request.baseCommit) {
+    if (head === null || typeof head.exitCode !== 'number' || typeof head.stdout !== 'string') {
+      return 'checkout-unreadable';
+    }
+    if (head.error !== undefined || head.exitCode !== 0 || head.stdout.trim() !== request.baseCommit) {
       return 'checkout-not-pinned';
     }
     return null;

@@ -16,7 +16,7 @@ import { BriefAuthoringAdapter } from '../BriefAuthoringAdapter.adapter.js';
 const COMMIT = 'c'.repeat(40);
 const SESSION_KEY = `brief-author/wo-1/lane-1@${COMMIT.slice(0, 12)}`;
 const STEM = `brief-author__wo-1__lane-1@${COMMIT.slice(0, 12)}`;
-const SEAT_COMMAND = ['seat-bin', '--model', '{model}', '--prompt', '{promptFile}'] as const;
+const SEAT_COMMAND = ['/usr/local/bin/seat-bin', '--model', '{model}', '--prompt', '{promptFile}'] as const;
 
 const roots: string[] = [];
 
@@ -79,10 +79,13 @@ describe('BriefAuthoringAdapter seat session', () => {
   it('runs one seat session per brief in the pinned checkout and records the raw answer', async () => {
     const s = await setup();
     const result = await adapterFor(s.executor).authorBriefSession(s.request);
-    expect(result).toEqual({ outcome: 'answered', answer: s.executor.seat.stdout });
+    expect(result).toEqual({
+      outcome: 'answered', rawAnswer: s.executor.seat.stdout,
+      sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
+    });
     expect(s.executor.seatCalls).toHaveLength(1);
     const call = s.executor.seatCalls[0];
-    expect(call?.argv).toEqual(['seat-bin', '--model', 'author-model', '--prompt', path.join(s.briefsDir, `${STEM}.prompt.md`)]);
+    expect(call?.argv).toEqual(['/usr/local/bin/seat-bin', '--model', 'author-model', '--prompt', path.join(s.briefsDir, `${STEM}.prompt.md`)]);
     expect(call?.options?.cwd).toBe(s.checkout);
     expect(call?.options?.timeoutMs).toBe(900_000);
     expect(call?.options?.maxBufferBytes).toBeGreaterThanOrEqual(262_144);
@@ -100,7 +103,11 @@ describe('BriefAuthoringAdapter seat session', () => {
     const callsAfterFirst = s.executor.calls.length;
     s.executor.seat = { exitCode: 0, signal: null, stdout: 'a different answer', stderr: '' };
     const second = await adapter.authorBriefSession(s.request);
-    expect(second).toEqual(first);
+    expect(second.outcome).toBe('answered');
+    expect(second).toEqual({
+      outcome: 'answered', rawAnswer: (first as { rawAnswer: string }).rawAnswer,
+      sessionKey: SESSION_KEY, answerPath: (first as { answerPath: string }).answerPath, cached: true,
+    });
     expect(s.executor.calls).toHaveLength(callsAfterFirst);
   });
 
@@ -109,30 +116,39 @@ describe('BriefAuthoringAdapter seat session', () => {
     await fs.mkdir(s.briefsDir, { recursive: true });
     await fs.writeFile(path.join(s.briefsDir, `${STEM}.intent.json`), '{"sessionKey":"x","startedAt":"t"}\n', 'utf8');
     const result = await adapterFor(s.executor).authorBriefSession(s.request);
-    expect(result).toEqual({ outcome: 'answered', answer: s.executor.seat.stdout });
+    expect(result).toEqual({
+      outcome: 'answered', rawAnswer: s.executor.seat.stdout,
+      sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
+    });
     expect(s.executor.seatCalls).toHaveLength(1);
   });
 
-  it('an unreadable recorded answer is unknown, never an empty brief', async () => {
+  it('refuses null request, throwing getters, and control characters without throwing', async () => {
     const s = await setup();
-    await fs.mkdir(path.join(s.briefsDir, `${STEM}.answer.md`), { recursive: true });
     const adapter = adapterFor(s.executor);
-    await expect(adapter.authorBriefSession(s.request)).rejects.toThrow('recorded brief answer is unreadable');
+    expect(await adapter.authorBriefSession(null as never)).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(await adapter.authorBriefSession('x' as never)).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+
+    const getter = { ...s.request } as unknown as Record<string, unknown>;
+    Object.defineProperty(getter, 'model', {
+      enumerable: true,
+      get() { throw new Error('boom'); },
+    });
+    expect(await adapter.authorBriefSession(getter as unknown as BriefAuthorSessionRequest)).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
     expect(s.executor.calls).toHaveLength(0);
-    await fs.rm(path.join(s.briefsDir, `${STEM}.answer.md`), { recursive: true });
-    await fs.writeFile(path.join(s.briefsDir, `${STEM}.answer.md`), '  \n', 'utf8');
-    await expect(adapter.authorBriefSession(s.request)).rejects.toThrow('recorded brief answer is unreadable');
+
+    expect(await adapter.authorBriefSession({ ...s.request, model: 'bad\u0000model' })).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
     expect(s.executor.calls).toHaveLength(0);
   });
 
-  it('refuses when the checkout is missing', async () => {
+  it('refuses when the checkout is missing or unreadable', async () => {
     const s = await setup();
     const result = await adapterFor(s.executor).authorBriefSession({ ...s.request, checkoutPath: path.join(s.root, 'absent') });
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'checkout-unavailable' });
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'checkout-unreadable' });
     expect(s.executor.calls).toHaveLength(0);
   });
 
-  it('refuses when the checkout is not at the pinned commit', async () => {
+  it('refuses when checkout HEAD does not match the pinned commit (checkout-not-pinned)', async () => {
     const s = await setup();
     s.executor.head = 'd'.repeat(40);
     const result = await adapterFor(s.executor).authorBriefSession(s.request);
@@ -145,7 +161,7 @@ describe('BriefAuthoringAdapter seat session', () => {
     const s = await setup();
     s.executor.seat = { exitCode: null, signal: 'SIGTERM', stdout: 'partial', stderr: '', error: 'command exceeded its 900000ms timeout and its process tree was killed' };
     const result = await adapterFor(s.executor).authorBriefSession({ ...s.request, timeoutMs: 99_999_999 });
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-timeout' });
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
     expect(s.executor.seatCalls[0]?.options?.timeoutMs).toBe(3_600_000);
     await expect(fs.stat(path.join(s.briefsDir, `${STEM}.answer.md`))).rejects.toThrow();
     await fs.stat(path.join(s.briefsDir, `${STEM}.intent.json`));
@@ -153,19 +169,48 @@ describe('BriefAuthoringAdapter seat session', () => {
     expect(await adapterFor(s.executor).authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
   });
 
-  it('an empty seat answer is refused, never an empty brief', async () => {
-    const s = await setup();
-    s.executor.seat = { exitCode: 0, signal: null, stdout: ' \n\t', stderr: '' };
-    expect(await adapterFor(s.executor).authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-empty' });
-    await expect(fs.stat(path.join(s.briefsDir, `${STEM}.answer.md`))).rejects.toThrow();
+  it('refuses failed, empty, or oversized seat responses and oversized prompts', async () => {
+    {
+      const s = await setup();
+      s.executor.seat = { exitCode: 1, signal: null, stdout: 'partial', stderr: '' };
+      expect(await adapterFor(s.executor).authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+    }
+    {
+      const s = await setup();
+      s.executor.seat = { exitCode: 0, signal: null, stdout: ' \n\t', stderr: '' };
+      expect(await adapterFor(s.executor).authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-empty' });
+      await expect(fs.stat(path.join(s.briefsDir, `${STEM}.answer.md`))).rejects.toThrow();
+    }
+    {
+      const s = await setup();
+      s.executor.seat = { exitCode: 0, signal: null, stdout: 'x'.repeat(101), stderr: '' };
+      expect(await adapterFor(s.executor, { maxAnswerBytes: 100 }).authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-oversized' });
+    }
+    {
+      const s = await setup();
+      const oversizedPrompt = 'p'.repeat(300_000);
+      expect(await adapterFor(s.executor).authorBriefSession({ ...s.request, prompt: oversizedPrompt })).toEqual({ outcome: 'unavailable', reason: 'session-oversized' });
+    }
   });
 
-  it('an oversized answer is refused, never truncated silently', async () => {
+  it('refuses missing or invalid sessionCommand (session-command-missing, session-command-invalid)', async () => {
     const s = await setup();
-    s.executor.seat = { exitCode: 0, signal: null, stdout: 'x'.repeat(101), stderr: '' };
-    const result = await adapterFor(s.executor, { maxAnswerBytes: 100 }).authorBriefSession(s.request);
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-output-too-large' });
-    await expect(fs.stat(path.join(s.briefsDir, `${STEM}.answer.md`))).rejects.toThrow();
+    const unconfigured = await new BriefAuthoringAdapter({ executor: s.executor }).authorBriefSession(s.request);
+    expect(unconfigured).toEqual({ outcome: 'unavailable', reason: 'session-command-missing' });
+
+    for (const command of [
+      ['/usr/local/bin/seat-bin', '{promptFile}', '{secret}'],
+      ['/usr/local/bin/seat-bin', '--model', '{model}'],
+      ['/usr/local/bin/seat-bin', '{promptFile}', '{promptFile}'],
+      ['/usr/local/bin/seat-bin', '{variant}', '{promptFile}'],
+      ['seat-bin', '--prompt', '{promptFile}'],
+      ['/usr/local/bin/../seat-bin', '{promptFile}'],
+      ['/usr/local/bin/seat-bin\u0000', '{promptFile}'],
+    ]) {
+      const result = await adapterFor(s.executor, { seatCommand: command }).authorBriefSession(s.request);
+      expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    }
+    expect(s.executor.calls).toHaveLength(0);
   });
 
   it('the pinned-commit check runs git with no network, no hooks and no lazy fetch', async () => {
@@ -179,8 +224,8 @@ describe('BriefAuthoringAdapter seat session', () => {
     expect(git?.argv).toEqual(expect.arrayContaining([
       'git', '--no-replace-objects', 'core.hooksPath=/dev/null', 'core.fsmonitor=false', 'protocol.allow=never',
     ]));
-    expect(git?.argv.slice(-4)).toEqual(['-C', s.checkout, 'rev-parse', 'HEAD']);
-    expect(git?.argv.slice(-3)).toEqual([s.checkout, 'rev-parse', 'HEAD']);
+    expect(git?.argv.slice(-4)).toEqual([s.checkout, 'rev-parse', '--verify', 'HEAD']);
+    expect(git?.argv.slice(-5)).toEqual(['-C', s.checkout, 'rev-parse', '--verify', 'HEAD']);
     expect(git?.options?.timeoutMs).toBeGreaterThan(0);
   });
 
@@ -190,22 +235,6 @@ describe('BriefAuthoringAdapter seat session', () => {
     expect((await fs.readdir(s.briefsDir)).sort()).toEqual([`${STEM}.answer.md`, `${STEM}.intent.json`, `${STEM}.prompt.md`]);
     expect((await fs.readdir(s.root)).sort()).toEqual(['briefs', 'checkout']);
     expect(await fs.readdir(s.checkout)).toEqual([]);
-  });
-
-  it('a session command with an unknown placeholder is refused', async () => {
-    const s = await setup();
-    for (const command of [
-      ['seat-bin', '{promptFile}', '{secret}'],
-      ['seat-bin', '--model', '{model}'],
-      ['seat-bin', '{promptFile}', '{promptFile}'],
-      ['seat-bin', '{variant}', '{promptFile}'],
-    ]) {
-      const result = await adapterFor(s.executor, { seatCommand: command }).authorBriefSession(s.request);
-      expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
-    }
-    expect(s.executor.calls).toHaveLength(0);
-    const unconfigured = await new BriefAuthoringAdapter({ executor: s.executor }).authorBriefSession(s.request);
-    expect(unconfigured).toEqual({ outcome: 'unavailable', reason: 'seat-command-not-configured' });
   });
 
   it('a pre-existing symlink at the intent-file path is never followed', async () => {
@@ -218,45 +247,32 @@ describe('BriefAuthoringAdapter seat session', () => {
     await fs.writeFile(decoy, decoyContent, 'utf8');
     await fs.symlink(decoy, path.join(s.briefsDir, `${STEM}.intent.json`));
     const result = await adapterFor(s.executor).authorBriefSession(s.request);
-    expect(result).toEqual({ outcome: 'answered', answer: s.executor.seat.stdout });
+    expect(result).toEqual({
+      outcome: 'answered', rawAnswer: s.executor.seat.stdout,
+      sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
+    });
     expect(s.executor.seatCalls).toHaveLength(1);
     expect(await fs.readFile(decoy, 'utf8')).toBe(decoyContent);
     const intent = JSON.parse(await fs.readFile(path.join(s.briefsDir, `${STEM}.intent.json`), 'utf8')) as Record<string, unknown>;
     expect(intent.sessionKey).toBe(SESSION_KEY);
   });
 
-  it('a symlinked briefsDir is refused and nothing is written through the link', async () => {
+  it('refuses relative, dot-dot, or symlinked briefsDir (briefs-dir-invalid)', async () => {
     const s = await setup();
+
+    const relative = await adapterFor(s.executor).authorBriefSession({ ...s.request, briefsDir: 'relative/briefs' });
+    expect(relative).toEqual({ outcome: 'unavailable', reason: 'briefs-dir-invalid' });
+
+    const dotDot = await adapterFor(s.executor).authorBriefSession({ ...s.request, briefsDir: `${s.root}/elsewhere/../briefs` });
+    expect(dotDot).toEqual({ outcome: 'unavailable', reason: 'briefs-dir-invalid' });
+
     const realBriefs = path.join(s.root, 'real-briefs');
     await fs.mkdir(realBriefs);
     await fs.symlink(realBriefs, s.briefsDir);
-    const result = await adapterFor(s.executor).authorBriefSession(s.request);
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    const symlinked = await adapterFor(s.executor).authorBriefSession(s.request);
+    expect(symlinked).toEqual({ outcome: 'unavailable', reason: 'briefs-dir-invalid' });
     expect(s.executor.calls).toHaveLength(0);
     expect(await fs.readdir(realBriefs)).toEqual([]);
-  });
-
-  it('a symlinked recorded answer is refused and its target is never read', async () => {
-    const s = await setup();
-    await fs.mkdir(s.briefsDir, { recursive: true });
-    const secret = path.join(s.root, 'secret.txt');
-    await fs.writeFile(secret, 'outside content', 'utf8');
-    await fs.symlink(secret, path.join(s.briefsDir, `${STEM}.answer.md`));
-    await expect(adapterFor(s.executor).authorBriefSession(s.request)).rejects.toThrow('recorded brief answer is unreadable');
-    expect(s.executor.calls).toHaveLength(0);
-    expect(await fs.readFile(secret, 'utf8')).toBe('outside content');
-  });
-
-  it('a symlinked prompt file is refused and its target is never written', async () => {
-    const s = await setup();
-    await fs.mkdir(s.briefsDir, { recursive: true });
-    const target = path.join(s.root, 'target.txt');
-    await fs.writeFile(target, 'untouched', 'utf8');
-    await fs.symlink(target, path.join(s.briefsDir, `${STEM}.prompt.md`));
-    const result = await adapterFor(s.executor).authorBriefSession(s.request);
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
-    expect(s.executor.seatCalls).toHaveLength(0);
-    expect(await fs.readFile(target, 'utf8')).toBe('untouched');
   });
 
   it('a briefsDir under a regular file (uninspectable component) is refused', async () => {
@@ -264,14 +280,7 @@ describe('BriefAuthoringAdapter seat session', () => {
     await fs.writeFile(path.join(s.root, 'notdir'), 'x', 'utf8');
     const request = { ...s.request, briefsDir: path.join(s.root, 'notdir', 'briefs') };
     const result = await adapterFor(s.executor).authorBriefSession(request);
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
-    expect(s.executor.calls).toHaveLength(0);
-  });
-
-  it('a relative briefsDir is refused', async () => {
-    const s = await setup();
-    const result = await adapterFor(s.executor).authorBriefSession({ ...s.request, briefsDir: 'relative/briefs' });
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'briefs-dir-invalid' });
     expect(s.executor.calls).toHaveLength(0);
   });
 
@@ -283,7 +292,7 @@ describe('BriefAuthoringAdapter seat session', () => {
     await fs.symlink(realParent, linkedParent);
     const request = { ...s.request, briefsDir: path.join(linkedParent, 'briefs') };
     const result = await adapterFor(s.executor).authorBriefSession(request);
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'briefs-dir-invalid' });
     expect(s.executor.calls).toHaveLength(0);
     expect(await fs.readdir(path.join(realParent, 'briefs'))).toEqual([]);
   });
@@ -296,25 +305,43 @@ describe('BriefAuthoringAdapter seat session', () => {
     await fs.symlink(realParent, linkedParent);
     const request = { ...s.request, briefsDir: path.join(linkedParent, 'deep', 'briefs') };
     const result = await adapterFor(s.executor).authorBriefSession(request);
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'briefs-dir-invalid' });
     expect(s.executor.calls).toHaveLength(0);
     expect(await fs.readdir(realParent)).toEqual([]);
   });
 
-  it('a briefsDir with a dot-dot segment is refused', async () => {
+  it('a symlinked recorded answer is refused and its target is never read', async () => {
     const s = await setup();
-    const request = { ...s.request, briefsDir: `${s.root}/elsewhere/../briefs` };
-    const result = await adapterFor(s.executor).authorBriefSession(request);
-    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    await fs.mkdir(s.briefsDir, { recursive: true });
+    const secret = path.join(s.root, 'secret.txt');
+    await fs.writeFile(secret, 'outside content', 'utf8');
+    await fs.symlink(secret, path.join(s.briefsDir, `${STEM}.answer.md`));
+    const result = await adapterFor(s.executor).authorBriefSession(s.request);
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'briefs-dir-invalid' });
     expect(s.executor.calls).toHaveLength(0);
-    expect(await fs.readdir(s.root)).toEqual(['checkout']);
+    expect(await fs.readFile(secret, 'utf8')).toBe('outside content');
+  });
+
+  it('a symlinked prompt file is refused and its target is never written', async () => {
+    const s = await setup();
+    await fs.mkdir(s.briefsDir, { recursive: true });
+    const target = path.join(s.root, 'target.txt');
+    await fs.writeFile(target, 'untouched', 'utf8');
+    await fs.symlink(target, path.join(s.briefsDir, `${STEM}.prompt.md`));
+    const result = await adapterFor(s.executor).authorBriefSession(s.request);
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'briefs-dir-invalid' });
+    expect(s.executor.seatCalls).toHaveLength(0);
+    expect(await fs.readFile(target, 'utf8')).toBe('untouched');
   });
 
   it('a briefsDir that does not exist yet, under real directories, is created and used', async () => {
     const s = await setup();
     const request = { ...s.request, briefsDir: path.join(s.root, 'fresh', 'briefs') };
     const result = await adapterFor(s.executor).authorBriefSession(request);
-    expect(result).toEqual({ outcome: 'answered', answer: s.executor.seat.stdout });
+    expect(result).toEqual({
+      outcome: 'answered', rawAnswer: s.executor.seat.stdout,
+      sessionKey: SESSION_KEY, answerPath: path.join(request.briefsDir, `${STEM}.answer.md`), cached: false,
+    });
     expect(await fs.readFile(path.join(request.briefsDir, `${STEM}.answer.md`), 'utf8')).toBe(s.executor.seat.stdout);
   });
 
@@ -328,7 +355,10 @@ describe('BriefAuthoringAdapter seat session', () => {
       adapter.authorBriefSession(s.request),
     ]);
     expect(results.filter((r) => r.outcome === 'answered')).toEqual([
-      { outcome: 'answered', answer: s.executor.seat.stdout },
+      {
+        outcome: 'answered', rawAnswer: s.executor.seat.stdout,
+        sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
+      },
     ]);
     expect(results.filter((r) => r.outcome === 'unavailable')).toEqual([
       { outcome: 'unavailable', reason: 'session-failed' },

@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { createApiReviewTransport, decodeApiVerdict, MAX_API_REVIEW_DIFF_BYTES } from './ApiReviewTransport.adapter.js';
+import { createApiReviewTransport, decodeApiVerdict, findStatusCode, MAX_API_REVIEW_DIFF_BYTES } from './ApiReviewTransport.adapter.js';
 import type { ApiReviewGenerate, ApiReviewGenerateResult } from './ApiReviewTransport.adapter.js';
 import { BRIEF_INPUT_RULE } from '../../domain/untrusted-input.js';
-import { ReviewTransportError } from './OcmReviewTransport.adapter.js';
+import { MAX_RAW_OUTPUT_LENGTH, ReviewTransportError } from './OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from './ReviewTransportRouter.js';
 
 const HEAD = 'a'.repeat(40);
@@ -720,5 +720,214 @@ describe('nonce derivation from candidate head sha', () => {
     await run({ ...request, candidateHeadSha: HEAD });
 
     expect(seenPrompt).toContain('<<<UNTRUSTED nonce=ffffffffffffffffffffffffffffffff label="diff">>>');
+  });
+});
+
+describe('defensive bounds that were unpinned', () => {
+  async function codeFor(error: unknown): Promise<string> {
+    const run = transport(async () => {
+      throw error;
+    });
+    try {
+      await run(request);
+    } catch (thrown) {
+      return thrown instanceof ReviewTransportError ? thrown.code : 'not-a-transport-error';
+    }
+    return 'no-error';
+  }
+
+  it('a status four causes deep is seat-busy and five causes deep is transport', async () => {
+    const wrapInCauses = (causes: number): unknown => {
+      let current: unknown = { statusCode: 429 };
+      for (let i = 0; i < causes; i += 1) {
+        current = { cause: current };
+      }
+      return current;
+    };
+    expect(await codeFor(wrapInCauses(4))).toBe('seat-busy');
+    expect(await codeFor(wrapInCauses(5))).toBe('transport');
+  });
+
+  it('the errors scan uses the last status and not the first', async () => {
+    // A later 500 hides an earlier 429; a later 429 hides an earlier 500.
+    expect(await codeFor({ errors: [{ statusCode: 429 }, { statusCode: 500 }] })).toBe('transport');
+    expect(await codeFor({ errors: [{ statusCode: 500 }, { statusCode: 429 }] })).toBe('seat-busy');
+  });
+
+  it('a non-safe errors length stops the walk and a safe length of one does not', () => {
+    const hostileLength = new Proxy([] as unknown[], {
+      get(target, key, receiver): unknown {
+        if (key === 'length') {
+          return 1.5;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    // 1.5 is not a safe integer, so the walk stops and never reaches cause.
+    expect(findStatusCode({ errors: hostileLength, cause: { statusCode: 503 } }, 0)).toBeUndefined();
+    // A safe length of one walks through to cause.
+    expect(findStatusCode({ errors: [{}], cause: { statusCode: 503 } }, 0)).toBe(503);
+  });
+
+  it('a non-safe findings length is unparseable and one real finding still fails', () => {
+    const finding = { severity: 'major', summary: 'x', filePath: null, line: 1 };
+    const hostileLength = new Proxy([finding, finding] as unknown[], {
+      get(target, key, receiver): unknown {
+        if (key === 'length') {
+          return 1.5;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    // 1.5 is not a safe integer, so the verdict is unparseable, never a pass.
+    expect(decodeApiVerdict({ result: 'pass', findings: hostileLength })).toMatchObject({
+      result: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+    // One real finding still decodes to a fail.
+    expect(decodeApiVerdict({ result: 'fail', findings: [finding] })).toMatchObject({ result: 'fail' });
+  });
+
+  it('a symbol own key is unparseable and the same verdict without it passes', () => {
+    const withSymbol = Object.defineProperty({ result: 'pass', findings: [] } as Record<string, unknown>, Symbol('extra'), {
+      value: 1,
+      enumerable: true,
+    });
+    expect(decodeApiVerdict(withSymbol)).toMatchObject({ result: 'unknown', unknownReason: 'unparseable-verdict' });
+    expect(decodeApiVerdict({ result: 'pass', findings: [] })).toEqual({ result: 'pass', findings: [] });
+  });
+
+  it('a prototype other than Object.prototype or null is unparseable and a null prototype still passes', () => {
+    const hostile = Object.create(Object.create(null)) as Record<string, unknown>;
+    hostile.result = 'pass';
+    hostile.findings = [];
+    expect(decodeApiVerdict(hostile)).toMatchObject({ result: 'unknown', unknownReason: 'unparseable-verdict' });
+    const nullProto = Object.create(null) as Record<string, unknown>;
+    nullProto.result = 'pass';
+    nullProto.findings = [];
+    expect(decodeApiVerdict(nullProto)).toEqual({ result: 'pass', findings: [] });
+  });
+
+  it('array-like findings are unparseable and a real one-element array still fails', () => {
+    const finding = { severity: 'major', summary: 'x', filePath: null, line: 1 };
+    const arrayLike = { 0: finding, length: 1 };
+    expect(decodeApiVerdict({ result: 'fail', findings: arrayLike })).toMatchObject({
+      result: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+    expect(decodeApiVerdict({ result: 'fail', findings: [finding] })).toMatchObject({ result: 'fail' });
+  });
+
+  it('a blank filePath is unparseable and null is still accepted', () => {
+    for (const filePath of ['   ', '']) {
+      expect(
+        decodeApiVerdict({ result: 'fail', findings: [{ severity: 'major', summary: 'x', filePath, line: 1 }] }),
+      ).toMatchObject({ result: 'unknown', unknownReason: 'unparseable-verdict' });
+    }
+    expect(
+      decodeApiVerdict({ result: 'fail', findings: [{ severity: 'major', summary: 'x', filePath: null, line: null }] }),
+    ).toMatchObject({ result: 'fail' });
+  });
+
+  it('rawOutput is capped at MAX_RAW_OUTPUT_LENGTH and the findings are not', async () => {
+    const findings = Array.from({ length: 15 }, () => ({
+      severity: 'major' as const,
+      summary: 'y'.repeat(2000),
+      filePath: null as null,
+      line: 1,
+    }));
+    const run = transport(answers({ result: 'fail', findings }));
+    const result = await run(request);
+    expect(result.findings.length).toBe(15);
+    for (const finding of result.findings) {
+      expect(finding.summary.length).toBe(2000);
+    }
+    expect(result.rawOutput.length).toBe(MAX_RAW_OUTPUT_LENGTH);
+    expect(result.rawOutput).toBe(
+      JSON.stringify({
+        result: 'fail',
+        findings: findings.map((finding) => ({
+          severity: finding.severity,
+          summary: finding.summary,
+          filePath: finding.filePath,
+          line: finding.line,
+        })),
+      }).slice(0, MAX_RAW_OUTPUT_LENGTH),
+    );
+  });
+
+  it('TimeoutError is a timeout and a plain Error is transport', async () => {
+    const timeout = Object.assign(new Error('timed out'), { name: 'TimeoutError' });
+    expect(await codeFor(timeout)).toBe('timeout');
+    expect(await codeFor(new Error('socket hang up'))).toBe('transport');
+  });
+
+  it('status 403 is transport-failed and status 500 is transport', async () => {
+    const run403 = transport(async () => {
+      throw Object.assign(new Error('forbidden'), { statusCode: 403 });
+    });
+    await expect(run403(request)).rejects.toThrow(/^the reviewer endpoint refused the request$/);
+    expect(await codeFor(Object.assign(new Error('forbidden'), { statusCode: 403 }))).toBe('transport-failed');
+    expect(await codeFor(Object.assign(new Error('boom'), { statusCode: 500 }))).toBe('transport');
+  });
+
+  it('a null head is refused before the call and a matching head still passes', async () => {
+    let called = false;
+    const run = transport(
+      async () => {
+        called = true;
+        return { object: { result: 'pass', findings: [] } };
+      },
+      { readHead: async () => null },
+    );
+    let err: unknown;
+    try {
+      await run(request);
+    } catch (thrown) {
+      err = thrown;
+    }
+    expect(err).toBeInstanceOf(ReviewTransportError);
+    if (err instanceof ReviewTransportError) {
+      expect(err.code).toBe('transport-failed');
+      expect(err.message).toMatch(/could not be read for review/);
+    }
+    expect(called).toBe(false);
+
+    const okRun = transport(answers({ result: 'pass', findings: [] }));
+    await expect(okRun(request)).resolves.toMatchObject({ result: 'pass' });
+  });
+
+  it('a blank model is transport-missing and a set model still passes', async () => {
+    const missingModel = createApiReviewTransport({
+      baseURL: 'http://10.0.0.1:4176/inception/v1',
+      model: '   ',
+      schemaEnforcement: 'native-json-schema',
+      location: location(),
+      makeNonce: () => '0123456789abcdef',
+      generate: answers({ result: 'pass', findings: [] }),
+    });
+    await expect(missingModel(request)).rejects.toThrow(/no model configured/);
+    const okRun = transport(answers({ result: 'pass', findings: [] }));
+    await expect(okRun(request)).resolves.toMatchObject({ result: 'pass' });
+  });
+
+  it('a setter-only line accessor is unparseable and a null line still fails', () => {
+    const setterOnly = {
+      severity: 'major',
+      summary: 'x',
+      filePath: null,
+    };
+    Object.defineProperty(setterOnly, 'line', {
+      set(): void {},
+      enumerable: true,
+      configurable: true,
+    });
+    expect(decodeApiVerdict({ result: 'fail', findings: [setterOnly] })).toMatchObject({
+      result: 'unknown',
+      unknownReason: 'unparseable-verdict',
+    });
+    expect(
+      decodeApiVerdict({ result: 'fail', findings: [{ severity: 'major', summary: 'x', filePath: null, line: null }] }),
+    ).toMatchObject({ result: 'fail' });
   });
 });

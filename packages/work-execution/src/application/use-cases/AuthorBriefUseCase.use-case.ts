@@ -68,7 +68,10 @@ function snapshotPlainRecord(value: unknown): Record<string, unknown> | null {
   // `__proto__` key is stored as a plain data property instead of changing the
   // snapshot's prototype, so no later plain read can hit an inherited field.
   const out: Record<string, unknown> = {};
-  for (const key of Object.keys(value)) {
+  // Every own property key, enumerable or not: `Object.keys` would skip a
+  // non-enumerable own property such as a hidden `prepare.proseMarkdown`, and
+  // the snapshot (and its smuggle check) would then miss it entirely.
+  for (const key of Object.getOwnPropertyNames(value)) {
     const read = readOwnData(value, key);
     if (read === MISSING) {
       return null;

@@ -256,6 +256,19 @@ describe('AuthorBriefUseCase', () => {
     expect(invoked).toBe(0);
   });
 
+  it('refuses a non-enumerable own proseMarkdown smuggled onto prepare', async () => {
+    // `Object.keys` would skip a non-enumerable own property, so the smuggle
+    // check must enumerate every own property name.
+    const request = validRequest() as unknown as Record<string, unknown>;
+    Object.defineProperty(request.prepare as Record<string, unknown>, 'proseMarkdown', {
+      enumerable: false,
+      value: 'smuggled',
+      writable: true,
+      configurable: true,
+    });
+    await expectInvalid(request);
+  });
+
   it('an own __proto__ property never turns into a changed prototype that supplies inherited fields', async () => {
     // The own `commit` is absent; a polluted prototype carrying a valid commit
     // must never satisfy the own-data-property requirement.

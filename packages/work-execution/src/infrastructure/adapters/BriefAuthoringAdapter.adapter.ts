@@ -90,6 +90,22 @@ function readOwnData(value: Record<string, unknown>, key: string): unknown {
   return descriptor.value;
 }
 
+/**
+ * Read an optional own property: absent is `undefined`, but an own accessor
+ * descriptor is `MISSING` so it can be refused instead of treated as absent.
+ */
+function readOptionalOwnData(value: Record<string, unknown>, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined) {
+    return undefined;
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined
+    || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+    return MISSING;
+  }
+  return descriptor.value;
+}
+
 function isNonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
@@ -359,8 +375,8 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     const baseCommit = readOwnData(record, 'baseCommit');
     const prompt = readOwnData(record, 'prompt');
     const model = readOwnData(record, 'model');
-    const variant = readOwnData(record, 'variant');
-    const agent = readOwnData(record, 'agent');
+    const variant = readOptionalOwnData(record, 'variant');
+    const agent = readOptionalOwnData(record, 'agent');
     const sessionKey = readOwnData(record, 'sessionKey');
     const timeoutMs = readOwnData(record, 'timeoutMs');
 
@@ -403,10 +419,13 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
       return unavailable('session-command-invalid');
     }
     for (const optional of [variant, agent]) {
-      if (optional === MISSING || optional === undefined) {
+      // An own accessor descriptor reads as MISSING here: it must be refused,
+      // never silently treated as an absent optional field.
+      if (optional === undefined) {
         continue;
       }
-      if (typeof optional !== 'string' || hasControlCharacter(optional) || optional.trim().length === 0) {
+      if (optional === MISSING || typeof optional !== 'string' || hasControlCharacter(optional)
+        || optional.trim().length === 0) {
         return unavailable('session-command-invalid');
       }
     }
@@ -422,7 +441,14 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     const base = path.join(briefsDir as string, stem);
     const answerPath = `${base}.answer.md`;
     const promptPath = `${base}.prompt.md`;
-    const maxAnswerBytes = this.options?.maxAnswerBytes ?? MAX_SESSION_BYTES;
+    // The session cap is absolute: a configured limit above 256 000 bytes is
+    // clamped, because an answer over MAX_SESSION_BYTES must be refused
+    // regardless of configuration.
+    const configuredAnswerBytes = this.options?.maxAnswerBytes;
+    const maxAnswerBytes = typeof configuredAnswerBytes === 'number' && Number.isFinite(configuredAnswerBytes)
+      && configuredAnswerBytes > 0
+      ? Math.min(configuredAnswerBytes, MAX_SESSION_BYTES)
+      : MAX_SESSION_BYTES;
 
     // A symlinked answer is refused before it could redirect the read outside
     // the briefs directory.

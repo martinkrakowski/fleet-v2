@@ -199,6 +199,29 @@ describe('BriefAuthoringAdapter seat session', () => {
     }
   });
 
+  it('refuses an own accessor variant or agent instead of treating it as absent', async () => {
+    const s = await setup();
+    const adapter = adapterFor(s.executor);
+    for (const field of ['variant', 'agent'] as const) {
+      const request = { ...s.request } as unknown as Record<string, unknown>;
+      Object.defineProperty(request, field, {
+        enumerable: true,
+        get() { throw new Error('boom'); },
+      });
+      expect(await adapter.authorBriefSession(request as unknown as BriefAuthorSessionRequest))
+        .toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    }
+    expect(s.executor.calls).toHaveLength(0);
+  });
+
+  it('a configured maxAnswerBytes above the session cap never raises the accepted answer limit', async () => {
+    const s = await setup();
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'x'.repeat(256_001), stderr: '' };
+    const adapter = adapterFor(s.executor, { maxAnswerBytes: 10_000_000 });
+    expect(await adapter.authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-oversized' });
+    await expect(fs.stat(path.join(s.briefsDir, `${STEM}.answer.md`))).rejects.toThrow();
+  });
+
   it('refuses missing or invalid sessionCommand (session-command-missing, session-command-invalid)', async () => {
     const s = await setup();
     const unconfigured = await new BriefAuthoringAdapter({ executor: s.executor }).authorBriefSession(s.request);

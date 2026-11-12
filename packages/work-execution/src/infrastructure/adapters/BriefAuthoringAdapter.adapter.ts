@@ -7,9 +7,10 @@
  *
  * Lane CO17 adds `authorBriefSession`: one read-only seat session per brief, an
  * argv array through the executor (never a shell) in a checkout pinned at the
- * base commit. Only `<stem>.intent.json`, `.prompt.md` and `.answer.md` are
- * written (plus a short-lived `.intent.json.lock`), inside the briefs directory. A repeat returns the recorded answer;
- * a cut-short session leaves its intent and no answer, so the next call re-runs.
+ * base commit. Only `<stem>.prompt.md`, `<stem>.answer.md` and a short-lived
+ * `<stem>.lock` are written, inside the briefs directory. A repeat returns the
+ * recorded answer; concurrent callers serialize on the lock so the seat runs
+ * exactly once.
  * Results carry codes only: never a path, the answer or a secret.
  */
 
@@ -44,8 +45,6 @@ const DEFAULT_TIMEOUT_MS = 900_000;
 const MAX_TIMEOUT_MS = 3_600_000;
 /** Room for the seat's stderr inside the executor's stdout+stderr cap. */
 const STDERR_HEADROOM_BYTES = 65_536;
-/** Slack added to the session timeout when judging an intent claim stale. */
-const INTENT_CLAIM_SLACK_MS = 60_000;
 const GIT_TIMEOUT_MS = 30_000;
 /** Mirrors the fact pack's prompt cap. */
 const MAX_PROMPT_BYTES = 300_000;
@@ -155,6 +154,11 @@ function validateSessionCommand(
 ): 'session-command-missing' | 'session-command-invalid' | null {
   if (seatCommand === undefined || seatCommand.length === 0) {
     return 'session-command-missing';
+  }
+  // Control characters are refused anywhere in the command, not only in the
+  // binary: any literal argv element could reach the seat executor.
+  if (seatCommand.some((part) => typeof part !== 'string' || hasControlCharacter(part))) {
+    return 'session-command-invalid';
   }
   const binary = seatCommand[0];
   if (typeof binary !== 'string' || binary.length === 0 || hasControlCharacter(binary)
@@ -287,73 +291,6 @@ async function recordAnswer(answerPath: string, answer: string): Promise<boolean
     await fs.rm(answerPath, { force: true }).catch(() => undefined);
   }
   return recorded;
-}
-
-/**
- * True when the intent file records this key and a start time inside the claim
- * window. The path is inspected with lstat first: a symlink is never followed,
- * so a planted link cannot redirect the read outside the briefs directory.
- */
-async function intentIsLive(intentPath: string, sessionKey: string, windowMs: number): Promise<boolean> {
-  const stat = await fs.lstat(intentPath).catch(() => null);
-  if (stat === null || !stat.isFile()) {
-    return false;
-  }
-  const text = await readFileNoFollow(intentPath).catch(() => null);
-  if (text === null) {
-    return false;
-  }
-  try {
-    const parsed = JSON.parse(text) as { sessionKey?: unknown; startedAt?: unknown };
-    if (parsed.sessionKey !== sessionKey || typeof parsed.startedAt !== 'string') {
-      return false;
-    }
-    const startedAt = Date.parse(parsed.startedAt);
-    return Number.isFinite(startedAt) && Date.now() - startedAt < windowMs;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Claim the session by creating the intent file exclusively. When one already
- * exists without an answer, it is another call's session while it is fresh for
- * this key; a stale or foreign intent is replaced so an interrupted session
- * stays recoverable on the next call. The whole check-and-set runs under the
- * store's exclusive file lock, so concurrent retries can never both replace
- * the same stale intent and both run the seat.
- */
-async function claimIntent(
-  briefsDir: string,
-  intentPath: string,
-  sessionKey: string,
-  windowMs: number,
-): Promise<boolean> {
-  const intent = `${JSON.stringify({ sessionKey, startedAt: new Date().toISOString() })}\n`;
-  return withFileLock(`${intentPath}.lock`, async () => {
-    try {
-      await fs.mkdir(briefsDir, { recursive: true });
-      await fs.writeFile(intentPath, intent, { encoding: 'utf8', flag: 'wx' });
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        return false;
-      }
-    }
-    if (await intentIsLive(intentPath, sessionKey, windowMs)) {
-      return false;
-    }
-    // Stale, foreign or planted (symlinked) intent: clear the entry and
-    // re-claim exclusively. Unlink removes only the directory entry, never a
-    // linked target, so a planted symlink is neutralised, not followed.
-    try {
-      await fs.rm(intentPath, { force: true });
-      await fs.writeFile(intentPath, intent, { encoding: 'utf8', flag: 'wx' });
-      return true;
-    } catch {
-      return false;
-    }
-  }).catch(() => false);
 }
 
 export class BriefAuthoringAdapter implements BriefAuthoringPort {
@@ -522,46 +459,69 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     }
 
     const timeout = resolveTimeout(timeoutMs === MISSING || timeoutMs === undefined ? undefined : (timeoutMs as number));
-    // The exclusive intent claim is what grants the seat run: a concurrent
-    // call sees a fresh claim for the same key and refuses instead of also
-    // running the seat.
-    const claimWindowMs = timeout + INTENT_CLAIM_SLACK_MS;
-    if (!(await claimIntent(briefsDir as string, `${base}.intent.json`, sessionKey as string, claimWindowMs))) {
-      return unavailable('session-failed');
-    }
-
-    const pinned = await this.checkPinnedCheckout(executor, request);
-    if (pinned !== null) {
-      return unavailable(pinned);
-    }
-
-    if (await isSymbolicLink(promptPath)) {
+    // The session lock serializes concurrent callers for the same stem, so the
+    // seat runs at most once and a caller that waits past the default lock
+    // budget refuses instead of also running the seat. Only the prompt, answer
+    // and lock files are ever written inside the briefs directory — never an
+    // intent file.
+    const lockPath = `${base}.lock`;
+    // A planted symlink at the lock path is refused without attempting the
+    // lock: the open could never create a real lock file through it anyway.
+    if (await isSymbolicLink(lockPath)) {
       return unavailable('briefs-dir-invalid');
     }
-    if (!(await writeFileNoFollow(promptPath, prompt as string).then(() => true, () => false))) {
-      return unavailable('session-failed');
-    }
+    return withFileLock<BriefAuthorSessionResult>(
+      lockPath,
+      async () => {
+        // A concurrent call may have completed the session while this one waited.
+        const recordedUnderLock = await readRecordedAnswer(answerPath, maxAnswerBytes);
+        if (recordedUnderLock === 'too-large') {
+          return unavailable('session-oversized');
+        }
+        if (recordedUnderLock !== null) {
+          return { outcome: 'answered', rawAnswer: recordedUnderLock, sessionKey: sessionKey as string, answerPath, cached: true };
+        }
 
-    const run = await executor.run(argv, {
-      cwd: checkoutPath as string,
-      timeoutMs: timeout,
-      maxBufferBytes: maxAnswerBytes + STDERR_HEADROOM_BYTES,
-    }).catch(() => null);
-    if (run === null || typeof run.exitCode !== 'number' || typeof run.stdout !== 'string') {
-      return unavailable('session-failed');
-    }
-    if (run.error !== undefined || run.exitCode !== 0) {
-      return unavailable('session-failed');
-    }
-    if (run.stdout.trim().length === 0) {
-      return unavailable('session-empty');
-    }
-    if (Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes) {
-      return unavailable('session-oversized');
-    }
-    return (await recordAnswer(answerPath, run.stdout))
-      ? { outcome: 'answered', rawAnswer: run.stdout, sessionKey: sessionKey as string, answerPath, cached: false }
-      : unavailable('session-failed');
+        const pinned = await this.checkPinnedCheckout(executor, request);
+        if (pinned !== null) {
+          return unavailable(pinned);
+        }
+
+        if (await isSymbolicLink(promptPath)) {
+          return unavailable('briefs-dir-invalid');
+        }
+        if (!(await writeFileNoFollow(promptPath, prompt as string).then(() => true, () => false))) {
+          return unavailable('session-failed');
+        }
+
+        const run = await executor.run(argv, {
+          cwd: checkoutPath as string,
+          timeoutMs: timeout,
+          maxBufferBytes: maxAnswerBytes + STDERR_HEADROOM_BYTES,
+        }).catch(() => null);
+        if (run === null || typeof run.exitCode !== 'number' || typeof run.stdout !== 'string') {
+          return unavailable('session-failed');
+        }
+        // A timed-out run is never a success, even when it otherwise carries an
+        // exit code, stdout and no error.
+        if (run.error !== undefined || run.exitCode !== 0
+          || (run as { timedOut?: unknown }).timedOut === true) {
+          return unavailable('session-failed');
+        }
+        if (run.stdout.trim().length === 0) {
+          return unavailable('session-empty');
+        }
+        if (Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes) {
+          return unavailable('session-oversized');
+        }
+        return (await recordAnswer(answerPath, run.stdout))
+          ? { outcome: 'answered', rawAnswer: run.stdout, sessionKey: sessionKey as string, answerPath, cached: false }
+          : unavailable('session-failed');
+    },
+    // The store's default lock budget: a concurrent caller refuses rather than
+    // blocking for the seat's whole runtime budget.
+    )
+      .catch(() => unavailable('session-failed'));
   }
 
   /** One read-only git call: null when the checkout exists and is at the base commit. */

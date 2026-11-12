@@ -241,6 +241,47 @@ describe('AuthorBriefUseCase', () => {
     });
     await expectInvalid(prepareGetter);
     expect(invoked).toBe(0);
+
+    // An own accessor index on the facts array is refused, never invoked.
+    invoked = 0;
+    const indexGetter = withRequest((request) => {
+      const facts = [{ kind: 'file-list', label: 'Sources', pathPrefix: 'src' }] as unknown[];
+      Object.defineProperty(facts, 0, {
+        enumerable: true,
+        get() { invoked += 1; return { kind: 'file-list', label: 'Evil', pathPrefix: 'src' }; },
+      });
+      request.facts = facts;
+    });
+    await expectInvalid(indexGetter);
+    expect(invoked).toBe(0);
+  });
+
+  it('an own __proto__ property never turns into a changed prototype that supplies inherited fields', async () => {
+    // The own `commit` is absent; a polluted prototype carrying a valid commit
+    // must never satisfy the own-data-property requirement.
+    const polluted: Record<string, unknown> = validRequest() as unknown as Record<string, unknown>;
+    delete polluted.commit;
+    Object.defineProperty(polluted, '__proto__', {
+      enumerable: true,
+      value: { commit: COMMIT },
+      writable: true,
+      configurable: true,
+    });
+    await expectInvalid(polluted);
+
+    // Same for `prepare`: an inherited proseMarkdown from a polluted prototype
+    // is not accepted, and the polluted key stays an inert own data property.
+    const pollutedPrepare: Record<string, unknown> = validRequest() as unknown as Record<string, unknown>;
+    Object.defineProperty(pollutedPrepare.prepare as Record<string, unknown>, '__proto__', {
+      enumerable: true,
+      value: { proseMarkdown: 'smuggled' },
+      writable: true,
+      configurable: true,
+    });
+    const h = harness();
+    const result = await author(h, pollutedPrepare);
+    expect(result.outcome).toBe('authored');
+    expect(h.prepareCalls[0]?.proseMarkdown).toBe(DISPATCH);
   });
 
   it('refuses sparse facts array, oversized facts list, and control characters in paths', async () => {

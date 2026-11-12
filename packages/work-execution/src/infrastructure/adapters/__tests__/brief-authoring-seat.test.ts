@@ -91,9 +91,7 @@ describe('BriefAuthoringAdapter seat session', () => {
     expect(call?.options?.maxBufferBytes).toBeGreaterThanOrEqual(262_144);
     expect(await fs.readFile(path.join(s.briefsDir, `${STEM}.answer.md`), 'utf8')).toBe(s.executor.seat.stdout);
     expect(await fs.readFile(path.join(s.briefsDir, `${STEM}.prompt.md`), 'utf8')).toBe('FACT PACK PROMPT');
-    const intent = JSON.parse(await fs.readFile(path.join(s.briefsDir, `${STEM}.intent.json`), 'utf8')) as Record<string, unknown>;
-    expect(intent.sessionKey).toBe(SESSION_KEY);
-    expect(typeof intent.startedAt).toBe('string');
+    expect((await fs.readdir(s.briefsDir)).sort()).toEqual([`${STEM}.answer.md`, `${STEM}.prompt.md`]);
   });
 
   it('a repeat with the same session key returns the recorded answer and runs no second session', async () => {
@@ -111,10 +109,10 @@ describe('BriefAuthoringAdapter seat session', () => {
     expect(s.executor.calls).toHaveLength(callsAfterFirst);
   });
 
-  it('a session interrupted before its answer is recoverable on the next call', async () => {
+  it('a session interrupted after its prompt but before its answer is recoverable on the next call', async () => {
     const s = await setup();
     await fs.mkdir(s.briefsDir, { recursive: true });
-    await fs.writeFile(path.join(s.briefsDir, `${STEM}.intent.json`), '{"sessionKey":"x","startedAt":"t"}\n', 'utf8');
+    await fs.writeFile(path.join(s.briefsDir, `${STEM}.prompt.md`), 'earlier prompt', 'utf8');
     const result = await adapterFor(s.executor).authorBriefSession(s.request);
     expect(result).toEqual({
       outcome: 'answered', rawAnswer: s.executor.seat.stdout,
@@ -164,7 +162,6 @@ describe('BriefAuthoringAdapter seat session', () => {
     expect(result).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
     expect(s.executor.seatCalls[0]?.options?.timeoutMs).toBe(3_600_000);
     await expect(fs.stat(path.join(s.briefsDir, `${STEM}.answer.md`))).rejects.toThrow();
-    await fs.stat(path.join(s.briefsDir, `${STEM}.intent.json`));
     s.executor.seat = { exitCode: 1, signal: null, stdout: '', stderr: '' };
     expect(await adapterFor(s.executor).authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
   });
@@ -174,6 +171,15 @@ describe('BriefAuthoringAdapter seat session', () => {
       const s = await setup();
       s.executor.seat = { exitCode: 1, signal: null, stdout: 'partial', stderr: '' };
       expect(await adapterFor(s.executor).authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+    }
+    {
+      // A timed-out run is refused even when it otherwise looks complete:
+      // exit code 0, stdout present and no error field.
+      const s = await setup();
+      s.executor.seat = { exitCode: 0, signal: null, stdout: 'complete-looking', stderr: '', timedOut: true } as unknown as CommandRunResult;
+      const result = await adapterFor(s.executor).authorBriefSession(s.request);
+      expect(result).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+      await expect(fs.stat(path.join(s.briefsDir, `${STEM}.answer.md`))).rejects.toThrow();
     }
     {
       const s = await setup();
@@ -206,6 +212,9 @@ describe('BriefAuthoringAdapter seat session', () => {
       ['seat-bin', '--prompt', '{promptFile}'],
       ['/usr/local/bin/../seat-bin', '{promptFile}'],
       ['/usr/local/bin/seat-bin\u0000', '{promptFile}'],
+      // A control character in a non-binary literal element is refused too.
+      ['/usr/local/bin/seat-bin', '--mode\nstrict', '{promptFile}'],
+      ['/usr/local/bin/seat-bin', '--log=/tmp/a\u001bb.log', '{promptFile}'],
     ]) {
       const result = await adapterFor(s.executor, { seatCommand: command }).authorBriefSession(s.request);
       expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
@@ -232,29 +241,21 @@ describe('BriefAuthoringAdapter seat session', () => {
   it('writes only inside the briefs directory', async () => {
     const s = await setup();
     await adapterFor(s.executor).authorBriefSession(s.request);
-    expect((await fs.readdir(s.briefsDir)).sort()).toEqual([`${STEM}.answer.md`, `${STEM}.intent.json`, `${STEM}.prompt.md`]);
+    expect((await fs.readdir(s.briefsDir)).sort()).toEqual([`${STEM}.answer.md`, `${STEM}.prompt.md`]);
     expect((await fs.readdir(s.root)).sort()).toEqual(['briefs', 'checkout']);
     expect(await fs.readdir(s.checkout)).toEqual([]);
   });
 
-  it('a pre-existing symlink at the intent-file path is never followed', async () => {
+  it('a pre-existing symlink at the lock-file path is refused and its target is never touched', async () => {
     const s = await setup();
     await fs.mkdir(s.briefsDir, { recursive: true });
-    const decoy = path.join(s.root, 'decoy-intent.json');
-    // Live-looking intent planted outside the briefs directory. Following the
-    // symlink would make the claim look live and refuse instead of running.
-    const decoyContent = `${JSON.stringify({ sessionKey: SESSION_KEY, startedAt: new Date().toISOString() })}\n`;
-    await fs.writeFile(decoy, decoyContent, 'utf8');
-    await fs.symlink(decoy, path.join(s.briefsDir, `${STEM}.intent.json`));
+    const decoy = path.join(s.root, 'decoy.lock');
+    await fs.writeFile(decoy, 'untouched', 'utf8');
+    await fs.symlink(decoy, path.join(s.briefsDir, `${STEM}.lock`));
     const result = await adapterFor(s.executor).authorBriefSession(s.request);
-    expect(result).toEqual({
-      outcome: 'answered', rawAnswer: s.executor.seat.stdout,
-      sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
-    });
-    expect(s.executor.seatCalls).toHaveLength(1);
-    expect(await fs.readFile(decoy, 'utf8')).toBe(decoyContent);
-    const intent = JSON.parse(await fs.readFile(path.join(s.briefsDir, `${STEM}.intent.json`), 'utf8')) as Record<string, unknown>;
-    expect(intent.sessionKey).toBe(SESSION_KEY);
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'briefs-dir-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+    expect(await fs.readFile(decoy, 'utf8')).toBe('untouched');
   });
 
   it('refuses relative, dot-dot, or symlinked briefsDir (briefs-dir-invalid)', async () => {
@@ -345,24 +346,30 @@ describe('BriefAuthoringAdapter seat session', () => {
     expect(await fs.readFile(path.join(request.briefsDir, `${STEM}.answer.md`), 'utf8')).toBe(s.executor.seat.stdout);
   });
 
-  it('concurrent retries on a stale intent run the seat exactly once', async () => {
+  it('concurrent retries run the seat exactly once and the waiter replays the recorded answer', async () => {
     const s = await setup();
     await fs.mkdir(s.briefsDir, { recursive: true });
-    await fs.writeFile(path.join(s.briefsDir, `${STEM}.intent.json`), '{"sessionKey":"x","startedAt":"t"}\n', 'utf8');
     const adapter = adapterFor(s.executor);
     const results = await Promise.all([
       adapter.authorBriefSession(s.request),
       adapter.authorBriefSession(s.request),
     ]);
-    expect(results.filter((r) => r.outcome === 'answered')).toEqual([
+    expect(s.executor.seatCalls).toHaveLength(1);
+    const answered = results.filter((r) => r.outcome === 'answered');
+    expect(answered).toHaveLength(2);
+    const uncached = answered.filter((r) => r.cached === false);
+    const cached = answered.filter((r) => r.cached === true);
+    expect(uncached).toEqual([
       {
         outcome: 'answered', rawAnswer: s.executor.seat.stdout,
         sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
       },
     ]);
-    expect(results.filter((r) => r.outcome === 'unavailable')).toEqual([
-      { outcome: 'unavailable', reason: 'session-failed' },
+    expect(cached).toEqual([
+      {
+        outcome: 'answered', rawAnswer: s.executor.seat.stdout,
+        sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: true,
+      },
     ]);
-    expect(s.executor.seatCalls).toHaveLength(1);
   });
 });

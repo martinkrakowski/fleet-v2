@@ -64,13 +64,18 @@ function snapshotPlainRecord(value: unknown): Record<string, unknown> | null {
   if (!isPlainObject(value)) {
     return null;
   }
+  // Defined with `Object.defineProperty`, never by assignment: an own
+  // `__proto__` key is stored as a plain data property instead of changing the
+  // snapshot's prototype, so no later plain read can hit an inherited field.
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(value)) {
     const read = readOwnData(value, key);
     if (read === MISSING) {
       return null;
     }
-    out[key] = read;
+    Object.defineProperty(out, key, {
+      value: read, enumerable: true, writable: true, configurable: true,
+    });
   }
   return out;
 }
@@ -146,10 +151,14 @@ function snapshotRequest(request: unknown): Snapshot | null {
   }
   const copiedFacts: BuildFactPackFact[] = [];
   for (let index = 0; index < facts.length; index += 1) {
-    if (!Object.prototype.hasOwnProperty.call(facts, index)) {
+    // The element is read through its own data descriptor: an own accessor
+    // index would otherwise invoke its getter instead of refusing.
+    if (!Object.prototype.hasOwnProperty.call(facts, index)
+      || readOwnData(facts as unknown as Record<string, unknown>, String(index)) === MISSING) {
       return null;
     }
-    const fact = snapshotPlainRecord((facts as unknown[])[index]);
+    const element = readOwnData(facts as unknown as Record<string, unknown>, String(index));
+    const fact = snapshotPlainRecord(element);
     if (fact === null) {
       return null;
     }

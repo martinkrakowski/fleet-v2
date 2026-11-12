@@ -11,7 +11,7 @@ The shadow record requires 3 consecutive shadow days (`CUTOVER_SHADOW_CONSECUTIV
 Commands that exist today:
 
 - `fleet-v2 cutover status` is read-only. With no cutover record it exits 0 with `outcome` `completed`, `state` `shadow`, `revision` 0, and `record` null. `withinRollbackWindow` is null when the record is missing or `switchedAtIso` is null.
-- `fleet-v2 cutover shadow report --repository <owner>/<repo> --legacy-state-dir <path>` compares enqueue sets only, writes nothing, and is not an S1–S13 verdict. An `outcome` of `unknown` (`shell-state-incomplete`), or `refused` (`shell-queue-absent`, `shell-queue-unreadable`, `secret-shaped`), or `equal` false, or `complete` false, is exit 1 and is not a pass.
+- `fleet-v2 cutover shadow report --repository <owner>/<repo> --legacy-state-dir <path>` compares enqueue sets only, writes nothing, and is not an S1–S13 verdict. A complete comparison with divergent enqueue sets returns `outcome` `completed` with `equal` false and exits 0, so the exit code alone never signals a divergence — check `equal` and `complete`. Exit 1 means the report is not a pass: `outcome` `unknown` (`shell-state-incomplete`), or `refused` (`shell-queue-absent`, `shell-queue-unreadable`, `secret-shaped`), or `complete` false.
 - `fleet-v2 merge import --repository <owner>/<repo> --legacy-state-dir <path>` is a dry-run unless `--apply` is paired with `--authority`.
 - `fleet-v2 state check` and `fleet-v2 daemon status` are read-only.
 - `fleet-v2 conductor status` is the status read.

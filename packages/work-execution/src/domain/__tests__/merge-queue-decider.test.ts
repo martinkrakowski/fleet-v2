@@ -723,3 +723,100 @@ describe('defaults', () => {
     expect(MERGE_QUEUE_DEFAULT_MAX_ATTEMPTS).toBe(9);
   });
 });
+
+describe('base gate', () => {
+  function fakeSecret(): string {
+    return `sk-${'a'.repeat(20)}`;
+  }
+
+  it('updates a v1 entry with no observed base when the pull request is BEHIND', () => {
+    const decision = decideMergeStep(
+      makeEntry(),
+      makeOpenFacts({ pr: { status: 'open', headOid: HEAD, mergeStateStatus: 'BEHIND' } }),
+      makePolicy(),
+      NOW,
+    );
+    expect(decision).toEqual({
+      kind: 'act', action: 'update-branch', execution: 'live', shadowReason: null,
+      expectedHeadOid: HEAD, receiptHeadOid: null, procedure: null, vetoShadow: null,
+    });
+  });
+
+  it('merges a ready v1 entry with no observed base when the pull request is CLEAN', () => {
+    const decision = decideMergeStep(makeReadyEntry(), makeOpenFacts(), makePolicy(), NOW);
+    expect(decision).toEqual({
+      kind: 'act', action: 'merge-pr', execution: 'live', shadowReason: null,
+      expectedHeadOid: HEAD, receiptHeadOid: null, procedure: null, vetoShadow: null,
+    });
+  });
+
+  it('waits base-unobserved for a chain entry when facts omit observedBaseBranch', () => {
+    const entry = makeReadyEntry({ version: 2, baseBranch: 'chain/example' });
+    const decision = decideMergeStep(entry, makeOpenFacts(), makePolicy(), NOW);
+    expect(decision).toEqual({ kind: 'wait', reason: 'base-unobserved' });
+  });
+
+  it('updates a chain entry that is BEHIND its own base', () => {
+    const entry = makeEntry({ version: 2, baseBranch: 'chain/example' });
+    const decision = decideMergeStep(
+      entry,
+      makeOpenFacts({
+        observedBaseBranch: 'chain/example',
+        pr: { status: 'open', headOid: HEAD, mergeStateStatus: 'BEHIND' },
+      }),
+      makePolicy(),
+      NOW,
+    );
+    expect(decision).toEqual({
+      kind: 'act', action: 'update-branch', execution: 'live', shadowReason: null,
+      expectedHeadOid: HEAD, receiptHeadOid: null, procedure: null, vetoShadow: null,
+    });
+  });
+
+  it('merges a ready chain entry that is CLEAN against its own base', () => {
+    const entry = makeReadyEntry({ version: 2, baseBranch: 'chain/example' });
+    const decision = decideMergeStep(entry, makeOpenFacts({ observedBaseBranch: 'chain/example' }), makePolicy(), NOW);
+    expect(decision).toEqual({
+      kind: 'act', action: 'merge-pr', execution: 'live', shadowReason: null,
+      expectedHeadOid: HEAD, receiptHeadOid: null, procedure: null, vetoShadow: null,
+    });
+  });
+
+  it('waits base-mismatch and does not update when the observed base is main', () => {
+    const entry = makeEntry({ version: 2, baseBranch: 'chain/example' });
+    const decision = decideMergeStep(
+      entry,
+      makeOpenFacts({
+        observedBaseBranch: 'main',
+        pr: { status: 'open', headOid: HEAD, mergeStateStatus: 'BEHIND' },
+      }),
+      makePolicy(),
+      NOW,
+    );
+    expect(decision).toEqual({ kind: 'wait', reason: 'base-mismatch' });
+  });
+
+  it('waits base-mismatch and does not merge a CLEAN v1 entry observed on chain/example', () => {
+    const decision = decideMergeStep(makeReadyEntry(), makeOpenFacts({ observedBaseBranch: 'chain/example' }), makePolicy(), NOW);
+    expect(decision).toEqual({ kind: 'wait', reason: 'base-mismatch' });
+  });
+
+  it('waits facts-inconsistent for a secret-shaped observed base and does not echo it', () => {
+    const secret = fakeSecret();
+    const entry = makeReadyEntry({ version: 2, baseBranch: 'chain/example' });
+    const decision = decideMergeStep(entry, makeOpenFacts({ observedBaseBranch: secret }), makePolicy(), NOW);
+    expect(decision).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+    expect(JSON.stringify(decision)).not.toContain(secret);
+  });
+
+  it('waits facts-inconsistent for an unparsable observed base', () => {
+    const entry = makeReadyEntry({ version: 2, baseBranch: 'chain/example' });
+    const decision = decideMergeStep(entry, makeOpenFacts({ observedBaseBranch: 'Main' }), makePolicy(), NOW);
+    expect(decision).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+  });
+
+  it('waits facts-inconsistent for a null entry', () => {
+    const decision = decideMergeStep(null, makeOpenFacts(), makePolicy(), NOW);
+    expect(decision).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+  });
+});

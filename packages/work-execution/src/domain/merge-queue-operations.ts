@@ -5,10 +5,14 @@
  * `readMergeQueueEntryRecord`; a non-ok read refuses without writing.
  */
 
+import { containsSecretShape } from '@fleet/shared';
 import { isZonedIsoDateTime } from './conductor-halt.js';
+import { parseBaseBranch } from './base-branch.js';
+import type { BaseBranchValue } from './base-branch.js';
 import { REQUEST_ID_PATTERN } from './lane-run-keys.js';
 import {
-  MERGE_QUEUE_ENTRY_VERSION,
+  MERGE_QUEUE_ENTRY_V2_VERSION,
+  MERGE_QUEUE_ORDER_CAP,
   MERGE_QUEUE_TIERS,
   isMergeHex40,
   isMergeQueueEntryLive,
@@ -29,7 +33,8 @@ export type MergeEnqueueRefusal =
   | 'invalid-entry-id'
   | 'invalid-tier'
   | 'invalid-enqueued-at'
-  | 'invalid-deadline';
+  | 'invalid-deadline'
+  | 'invalid-base';
 
 export interface MergeEnqueueInput {
   readonly repository: MergeQueueRepositoryRef;
@@ -42,6 +47,8 @@ export interface MergeEnqueueInput {
   readonly successorEntryId: unknown;
   readonly enqueuedAtIso: string;
   readonly repoDigest: string;
+  /** Optional own base; absent means the default base and a version-1 record. */
+  readonly baseBranch?: unknown;
 }
 
 export type MergeEnqueueDecision =
@@ -96,9 +103,15 @@ function isUlid(value: unknown): value is string {
 }
 
 /** The fresh record shape a created or superseding enqueue writes. */
-function buildCreatedRecord(input: MergeEnqueueInput, supersedes: string | null): MergeQueueEntryRecord {
+function buildCreatedRecord(
+  input: MergeEnqueueInput,
+  supersedes: string | null,
+  baseBranch?: BaseBranchValue,
+): MergeQueueEntryRecord {
   return {
-    version: MERGE_QUEUE_ENTRY_VERSION,
+    ...(baseBranch === undefined
+      ? { version: 1 as const }
+      : { version: MERGE_QUEUE_ENTRY_V2_VERSION, baseBranch }),
     entryId: input.entryId as string,
     repository: input.repository,
     repoDigest: input.repoDigest,
@@ -129,7 +142,9 @@ function buildCreatedRecord(input: MergeEnqueueInput, supersedes: string | null)
 /** The successor of a superseded entry: inherits the predecessor's position. */
 function buildSuccessorRecord(predecessor: MergeQueueEntryRecord, input: MergeEnqueueInput): MergeQueueEntryRecord {
   return {
-    version: MERGE_QUEUE_ENTRY_VERSION,
+    ...(predecessor.version === MERGE_QUEUE_ENTRY_V2_VERSION
+      ? { version: MERGE_QUEUE_ENTRY_V2_VERSION, baseBranch: predecessor.baseBranch }
+      : { version: 1 as const }),
     entryId: input.successorEntryId as string,
     repository: predecessor.repository,
     repoDigest: predecessor.repoDigest,
@@ -236,8 +251,26 @@ export function decideMergeEnqueue(
     if (!isZonedIsoDateTime(input.enqueuedAtIso)) {
       return { outcome: 'refused', reason: 'invalid-enqueued-at' };
     }
+    if (!Array.isArray(entries) || entries.length > MERGE_QUEUE_ORDER_CAP) {
+      return { outcome: 'refused', reason: 'invalid-entry-id' };
+    }
 
-    const ordered = orderMergeQueue(entries.filter(isMergeQueueEntryLive));
+    // Own `baseBranch` only: an inherited key is not a supplied base.
+    const baseDescriptor = Reflect.getOwnPropertyDescriptor(input, 'baseBranch');
+    let baseBranch: BaseBranchValue | undefined;
+    if (baseDescriptor !== undefined) {
+      const rawBase = baseDescriptor.value;
+      if (typeof rawBase === 'string' && containsSecretShape(rawBase)) {
+        return { outcome: 'refused', reason: 'invalid-base' };
+      }
+      const parsedBase = parseBaseBranch(rawBase);
+      if (parsedBase === undefined) {
+        return { outcome: 'refused', reason: 'invalid-base' };
+      }
+      baseBranch = parsedBase;
+    }
+
+    const ordered = orderMergeQueue(entries.filter(isMergeQueueEntryLive), undefined, baseBranch);
 
     const duplicate = findDuplicateLiveEntry(ordered, input);
     if (duplicate !== undefined) {
@@ -249,7 +282,7 @@ export function decideMergeEnqueue(
       return supersedeResult;
     }
 
-    const createdRead = readMergeQueueEntryRecord(buildCreatedRecord(input, null));
+    const createdRead = readMergeQueueEntryRecord(buildCreatedRecord(input, null, baseBranch));
     if (!createdRead.ok) {
       return { outcome: 'refused', reason: 'invalid-entry-id' };
     }
@@ -264,8 +297,13 @@ export function decideMergeDrop(
   entryId: unknown,
 ): MergeDropDecision {
   try {
-    const ordered = orderMergeQueue(entries.filter(isMergeQueueEntryLive));
-    for (const entry of ordered) {
+    if (!Array.isArray(entries) || entries.length > MERGE_QUEUE_ORDER_CAP) {
+      return { outcome: 'refused', reason: 'unknown-entry' };
+    }
+    // Lookup runs on the bounded live list, not on a base-filtered order, so
+    // an entry on any base can be dropped.
+    const live = entries.filter(isMergeQueueEntryLive);
+    for (const entry of live) {
       if (entry.entryId === entryId) {
         const droppedRead = readMergeQueueEntryRecord({
           ...entry,
@@ -294,6 +332,9 @@ export function decideMergeRetry(
   retry: { readonly entryId: unknown; readonly enqueuedAtIso: string },
 ): MergeRetryDecision {
   try {
+    if (!Array.isArray(entries) || entries.length > MERGE_QUEUE_ORDER_CAP) {
+      return { outcome: 'refused', reason: 'unknown-entry' };
+    }
     const target = entries.find((entry) => entry.entryId === entryId);
     if (target === undefined) {
       return { outcome: 'refused', reason: 'unknown-entry' };
@@ -308,7 +349,9 @@ export function decideMergeRetry(
       return { outcome: 'duplicate', entries, record: duplicate };
     }
     const record: MergeQueueEntryRecord = {
-      version: MERGE_QUEUE_ENTRY_VERSION,
+      ...(target.version === MERGE_QUEUE_ENTRY_V2_VERSION
+        ? { version: MERGE_QUEUE_ENTRY_V2_VERSION, baseBranch: target.baseBranch }
+        : { version: 1 as const }),
       entryId: retry.entryId as string,
       repository: target.repository,
       repoDigest: target.repoDigest,

@@ -7,6 +7,9 @@
  */
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
+import { containsSecretShape } from '@fleet/shared';
+import { DEFAULT_BASE_BRANCH, parseBaseBranch } from './base-branch.js';
+import type { BaseBranchValue } from './base-branch.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from './lane-run-journal.js';
 import { LANE_RUN_MAX_RETRY } from './lane-run-keys.js';
 import {
@@ -112,6 +115,8 @@ export interface MergeStepFacts {
   readonly macosVerification: MergeMacosVerificationFact;
   readonly veto?: MergeQueueVetoRecord | null;
   readonly lastForgeOutcome?: MergeLastForgeOutcomeFact | null;
+  /** Optional observed base; the caller reads it from the forge. Absent means unobserved. */
+  readonly observedBaseBranch?: unknown;
 }
 
 export interface MergeRepoPolicy {
@@ -137,7 +142,8 @@ export type MergeStepWaitReason =
   | 'threads-unknown' | 'not-queue-head' | 'already-merged' | 'pr-unknown'
   | 'checks-unknown' | 'updates-unknown' | 'premerge-carry-unknown' | 'disjointness-unknown'
   | 'merge-state-unknown' | 'merge-state-blocked' | 'macos-unknown' | 'head-reread-unknown'
-  | 'unverified-head' | 'facts-inconsistent';
+  | 'unverified-head' | 'facts-inconsistent'
+  | 'base-unobserved' | 'base-mismatch';
 
 export type MergeStepDecision =
   | {
@@ -958,6 +964,39 @@ function readyRowsStep(
 }
 
 /** Rows 6 through 14 in order, then the ready rows. */
+/** A record's effective base: its own base on version 2, `main` on version 1. */
+function effectiveMergeQueueBase(entry: MergeQueueEntryRecord): BaseBranchValue {
+  return entry.version === 2 && entry.baseBranch !== undefined ? entry.baseBranch : DEFAULT_BASE_BRANCH;
+}
+
+/**
+ * The base gate between the PR rows and the update row: an unobserved base
+ * holds a chain entry, an observed base that is not the entry's own base
+ * holds everything, and a hostile base value is facts-inconsistent. The
+ * branch text never reaches the decision.
+ */
+function baseGateStep(entry: MergeQueueEntryRecord, facts: MergeStepFacts): MergeStepDecision | null {
+  const descriptor = Reflect.getOwnPropertyDescriptor(facts, 'observedBaseBranch');
+  if (descriptor === undefined) {
+    return effectiveMergeQueueBase(entry) === DEFAULT_BASE_BRANCH ? null : waitDecision('base-unobserved');
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined) {
+    return FACTS_INCONSISTENT;
+  }
+  const raw = descriptor.value;
+  if (typeof raw === 'string' && containsSecretShape(raw)) {
+    return FACTS_INCONSISTENT;
+  }
+  const parsed = parseBaseBranch(raw);
+  if (parsed === undefined) {
+    return FACTS_INCONSISTENT;
+  }
+  if (parsed === effectiveMergeQueueBase(entry)) {
+    return null;
+  }
+  return waitDecision('base-mismatch');
+}
+
 function decideRows(
   entry: MergeQueueEntryRecord,
   facts: MergeStepFacts,
@@ -972,6 +1011,10 @@ function decideRows(
   const pr = prStatusStep(facts);
   if (pr !== null) {
     return pr;
+  }
+  const baseGate = baseGateStep(entry, facts);
+  if (baseGate !== null) {
+    return baseGate;
   }
   const update = updateRowStep(entry, facts, policy, nowMs);
   if (update !== null) {

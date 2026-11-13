@@ -315,3 +315,162 @@ describe('decideMergeRetry', () => {
     expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-entry' });
   });
 });
+
+describe('base-aware enqueue', () => {
+  function fakeSecret(): string {
+    return `sk-${'a'.repeat(20)}`;
+  }
+
+  it('creates a version 1 entry with no baseBranch when the input omits it', () => {
+    const decision = decideMergeEnqueue([], input());
+    expect(decision.outcome).toBe('created');
+    if (decision.outcome === 'created') {
+      expect(decision.record.version).toBe(1);
+      expect(Object.hasOwn(decision.record, 'baseBranch')).toBe(false);
+      expectAllValid(decision.entries);
+    }
+  });
+
+  it('creates a version 2 entry on chain/example when that base is supplied', () => {
+    const decision = decideMergeEnqueue([], input({ baseBranch: 'chain/example' }));
+    expect(decision.outcome).toBe('created');
+    if (decision.outcome === 'created') {
+      expect(decision.record.version).toBe(2);
+      expect(decision.record.baseBranch).toBe('chain/example');
+      expectAllValid(decision.entries);
+    }
+  });
+
+  it('refuses a malformed baseBranch with invalid-base and does not create', () => {
+    expect(decideMergeEnqueue([], input({ baseBranch: 'Main' }))).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-base',
+    });
+    expect(decideMergeEnqueue([], input({ baseBranch: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-base',
+    });
+  });
+
+  it('refuses a secret-shaped baseBranch with invalid-base and does not echo it', () => {
+    const secret = fakeSecret();
+    const decision = decideMergeEnqueue([], input({ baseBranch: secret }));
+    expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-base' });
+    expect(JSON.stringify(decision)).not.toContain(secret);
+  });
+
+  it('does not take a prototype baseBranch as supplied', () => {
+    const prototypeInput = Object.create({ baseBranch: 'chain/example' });
+    Object.assign(prototypeInput, input());
+    const decision = decideMergeEnqueue([], prototypeInput as MergeEnqueueInput);
+    expect(decision.outcome).toBe('created');
+    if (decision.outcome === 'created') {
+      expect(decision.record.version).toBe(1);
+      expect(Object.hasOwn(decision.record, 'baseBranch')).toBe(false);
+    }
+  });
+
+  it('does not treat a live main entry as the duplicate of the same head enqueued on chain/example', () => {
+    const first = decideMergeEnqueue([], input());
+    expect(first.outcome).toBe('created');
+    if (first.outcome !== 'created') {
+      return;
+    }
+    const second = decideMergeEnqueue(first.entries, input({ headOid: HEAD_B, baseBranch: 'chain/example' }));
+    expect(second.outcome).toBe('created');
+    if (second.outcome === 'created') {
+      expect(second.entries).toHaveLength(2);
+      expect(second.entries[0].version).toBe(1);
+      expect(Object.hasOwn(second.entries[0], 'baseBranch')).toBe(false);
+      expectAllValid(second.entries);
+    }
+  });
+
+  it('does not supersede a main entry when the new head is enqueued on chain/example', () => {
+    const first = decideMergeEnqueue([], input());
+    expect(first.outcome).toBe('created');
+    if (first.outcome !== 'created') {
+      return;
+    }
+    const second = decideMergeEnqueue(first.entries, input({ headOid: HEAD_B, baseBranch: 'chain/example' }));
+    expect(second.outcome).toBe('created');
+    if (second.outcome === 'created') {
+      expect(first.record.state).toBe('queued');
+    }
+  });
+
+  it('supersedes an earlier head on the same chain base', () => {
+    const first = decideMergeEnqueue([], input({ baseBranch: 'chain/example' }));
+    expect(first.outcome).toBe('created');
+    if (first.outcome !== 'created') {
+      return;
+    }
+    const second = decideMergeEnqueue(
+      first.entries,
+      input({ headOid: HEAD_B, successorEntryId: nextEntryId(), baseBranch: 'chain/example' }),
+    );
+    expect(second.outcome).toBe('supersedes');
+    if (second.outcome === 'supersedes') {
+      expect(second.record.version).toBe(2);
+      expect(second.record.baseBranch).toBe('chain/example');
+      expectAllValid(second.entries);
+    }
+  });
+
+  it('refuses an entry list longer than 5000 instead of creating', () => {
+    const huge: unknown[] = [makeEntry()];
+    huge.length = 5001;
+    const decision = decideMergeEnqueue(huge as readonly MergeQueueEntryRecord[], input());
+    expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-entry-id' });
+  });
+
+  it('refuses a non-array entry list with invalid-entry-id', () => {
+    const decision = decideMergeEnqueue({ length: 1, 0: makeEntry() } as unknown as readonly MergeQueueEntryRecord[], input());
+    expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-entry-id' });
+  });
+});
+
+describe('base-aware drop and retry', () => {
+  it('drops a chain entry and keeps version 2 and baseBranch', () => {
+    const entry = makeEntry({ version: 2, baseBranch: 'chain/example' });
+    const decision = decideMergeDrop([entry], entry.entryId);
+    expect(decision.outcome).toBe('dropped');
+    if (decision.outcome === 'dropped') {
+      expect(decision.record.version).toBe(2);
+      expect(decision.record.baseBranch).toBe('chain/example');
+      expect(decision.record.state).toBe('dropped');
+      expectAllValid(decision.entries);
+    }
+  });
+
+  it('retries a dropped chain entry onto version 2 and the same baseBranch', () => {
+    const dropped = makeEntry({ version: 2, baseBranch: 'chain/example', state: 'dropped', reason: 'operator-dropped' });
+    const decision = decideMergeRetry([dropped], dropped.entryId, {
+      entryId: nextEntryId(),
+      enqueuedAtIso: '2026-11-01T12:00:00.000Z',
+    });
+    expect(decision.outcome).toBe('retried');
+    if (decision.outcome === 'retried') {
+      expect(decision.record.version).toBe(2);
+      expect(decision.record.baseBranch).toBe('chain/example');
+      expect(decision.record.state).toBe('queued');
+      expectAllValid(decision.entries);
+    }
+  });
+
+  it('refuses a drop on a list longer than the cap without dropping', () => {
+    const entry = makeEntry();
+    const huge: MergeQueueEntryRecord[] = [entry];
+    huge.length = 5001;
+    expect(decideMergeDrop(huge, entry.entryId)).toEqual({ outcome: 'refused', reason: 'unknown-entry' });
+  });
+
+  it('refuses a retry on a list longer than the cap without retrying', () => {
+    const entry = makeEntry({ state: 'dropped', reason: 'operator-dropped' });
+    const huge: MergeQueueEntryRecord[] = [entry];
+    huge.length = 5001;
+    expect(
+      decideMergeRetry(huge, entry.entryId, { entryId: nextEntryId(), enqueuedAtIso: '2026-11-01T12:00:00.000Z' }),
+    ).toEqual({ outcome: 'refused', reason: 'unknown-entry' });
+  });
+});

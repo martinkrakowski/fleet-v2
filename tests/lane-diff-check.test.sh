@@ -606,6 +606,77 @@ printf '%s\n' 'protected: node_modules/B/.NPMRC' 'protected: node_modules/a/.cla
 check 'a large ignored tree gives exactly the protected findings, in candidate order (S2)' '[ "$(rc)" = 1 ] && cmp -s "$T/prot" "$T/prot-want" && [ "$(grep -c "^protected: " "$T/o")" = 5 ]'
 rm -rf node_modules secrets
 
+# DN1B: the base-line allowance trusts only a full commit sha that is an ancestor of HEAD. A ref
+# name, a short sha, a non-ancestor sha, or a missing --base excuses nothing and prints one warning.
+cur=$(git symbolic-ref --short HEAD)
+fx='const password = "'; fx="${fx}hunter2hunter2\";"
+{ echo 'line one'; echo "$fx"; echo 'line three'; } > packages/x/src/guard.ts
+git add packages/x/src/guard.ts && git -c commit.gpgsign=false commit -q -m guard
+guardbase=$(git rev-parse HEAD)
+echo 'line four' >> packages/x/src/guard.ts
+run "$R" --base "$guardbase"
+check 'a recorded full sha excuses the base line and prints no allowance warning (DN1B)' '[ "$(rc)" = 0 ] && grep -q "^baseline-excused: packages/x/src/guard.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^secret-pattern:" "$T/o" && ! grep -q "no base-line allowance" "$T/e" && ! grep -q "hunter2" "$T/o" && ! grep -q "hunter2" "$T/e"'
+git tag guardref "$guardbase"
+run "$R" --base guardref
+check 'a ref-name base excuses nothing and warns that it is not a commit sha (DN1B)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/guard.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o" && [ "$(grep -c "^lane-diff-check: base is not a commit sha; no base-line allowance$" "$T/e")" = 1 ]'
+short=$(git rev-parse --short=12 "$guardbase")
+run "$R" --base "$short"
+check 'a short sha excuses nothing and warns that it is not a commit sha (DN1B)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/guard.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o" && [ "$(grep -c "^lane-diff-check: base is not a commit sha; no base-line allowance$" "$T/e")" = 1 ]'
+# A full sha that is not an ancestor of HEAD excuses nothing, even though its own blob still holds
+# the password line.
+git checkout -q -- packages/x/src/guard.ts
+git checkout -q -b guardside "$guardbase"
+echo 'side' >> packages/x/src/guard.ts
+git -c commit.gpgsign=false commit -qam side
+sidesha=$(git rev-parse HEAD)
+git checkout -q "$cur"
+echo 'line four' >> packages/x/src/guard.ts
+run "$R" --base "$sidesha"
+check 'a full sha that is not an ancestor of HEAD excuses nothing (DN1B)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/guard.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o" && grep -q "^lane-diff-check: base is not an ancestor commit of HEAD; no base-line allowance$" "$T/e"'
+# A non-ancestor whose own blob does NOT hold the line, while the merge-base of it and HEAD does:
+# the guard must refuse the merge-base blob, not quietly read it.
+git checkout -q -- packages/x/src/guard.ts
+{ echo 'line one'; echo 'line two'; echo 'line three'; } > packages/x/src/guard.ts
+git add packages/x/src/guard.ts && git -c commit.gpgsign=false commit -q -m recorded
+recorded=$(git rev-parse HEAD)
+git checkout -q -b guardrebased "$guardbase"
+echo 'rebased' >> packages/x/src/guard.ts
+git -c commit.gpgsign=false commit -qam rebased
+run "$R" --base "$recorded"
+check 'a merge-base of a non-ancestor base excuses nothing (DN1B)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/guard.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o" && grep -q "^lane-diff-check: base is not an ancestor commit of HEAD; no base-line allowance$" "$T/e"'
+git checkout -q "$cur"
+git branch -q -D guardrebased
+# A missing --base leaves base empty (no origin here) and excuses nothing. The worktree file goes
+# back to the password version so the reviewed line is a hit again.
+git checkout -q "$guardbase" -- packages/x/src/guard.ts
+echo 'line four' >> packages/x/src/guard.ts
+run "$R"
+check 'a missing --base excuses nothing and warns (DN1B)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/guard.ts:2 (password-assignment)$" "$T/o" && ! grep -q "baseline-excused" "$T/o" && [ "$(grep -c "^lane-diff-check: base is not a commit sha; no base-line allowance$" "$T/e")" = 1 ]'
+# A default origin/main is copied as a ref NAME (line 149) and must not be expanded before the guard.
+git update-ref refs/remotes/origin/main "$guardbase"
+run "$R"
+check 'a default origin/main ref excuses nothing (DN1B)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/guard.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o" && [ "$(grep -c "^lane-diff-check: base is not a commit sha; no base-line allowance$" "$T/e")" = 1 ]'
+git update-ref -d refs/remotes/origin/main
+# An unborn HEAD: the object exists but HEAD does not resolve, so the ancestor test cannot pass.
+U=$T/unborn-guard
+mkdir -p "$U/packages/x/src"
+( cd "$U" && git init -q . && git config user.email t@example.invalid && git config user.name t &&
+  { echo 'line one'; echo "$fx"; echo 'line three'; } > packages/x/src/guard.ts &&
+  git add packages/x/src/guard.ts && git -c commit.gpgsign=false commit -q -m guard &&
+  git rev-parse HEAD > "$T/unborn-sha" &&
+  git checkout -q --orphan unbornb && git add packages/x/src/guard.ts )
+unborn=$(cat "$T/unborn-sha")
+run "$U" --base "$unborn"
+check 'an unborn HEAD excuses nothing for a full sha (DN1B)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/guard.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o" && grep -q "^lane-diff-check: base is not an ancestor commit of HEAD; no base-line allowance$" "$T/e"'
+run "$R" --base
+check 'a --base flag with no value exits 2 (DN1B)' '[ "$(rc)" = 2 ] && grep -q "^lane-diff-check: --base needs a value$" "$T/e"'
+# Cleanup: tags, the extra branch, the remote ref, and the worktree file if it is untracked.
+git tag -d guardref > /dev/null
+git branch -q -D guardside
+git update-ref -d refs/remotes/origin/main 2>/dev/null || :
+git ls-files --error-unmatch packages/x/src/guard.ts > /dev/null 2>&1 || rm -f packages/x/src/guard.ts
+git symbolic-ref --short HEAD | grep -qx "$cur" || git checkout -q "$cur"
+
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
 [ "$fails" = 0 ]

@@ -184,6 +184,11 @@ function isChainReceiptOf(receipt: ReviewReceiptRecord, chain: ChainSubject): bo
   const stored = receiptSubjectOf(receipt);
   return (
     receipt.kind === 'pre-merge' &&
+    // Fix round 2: the receipt's attempt id must be the chain's derived one —
+    // the id the review request itself carried — so a fallback receipt with
+    // the right chain subject and a mismatched attempt id is a mismatch,
+    // never the chain's review.
+    receipt.attemptId === attemptIdForChain(chain.projectId, chain.chainName) &&
     receipt.candidateHeadSha === chain.integrationHeadSha &&
     stored !== null &&
     stored.kind === 'chain' &&

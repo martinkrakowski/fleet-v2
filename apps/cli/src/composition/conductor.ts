@@ -59,7 +59,7 @@ import {
   resolveConductorPolicy,
   resolveMergePolicy,
 } from '@fleet/installation';
-import { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
+import { assessmentIdForAttempt, reviewerChainSeatIds } from '@fleet/evidence-and-acceptance';
 
 import type { FleetCliRuntime } from '../composition.js';
 import type { FleetInstallation, LoadResult } from '@fleet/installation';
@@ -156,6 +156,26 @@ export function composeConductor(input: ComposeConductorInput) {
   // The review request adapter, shared by the review step and the status view's
   // read-only findings projection (GB2). Hoisted above the conductor literal so
   // today the inspect use case can read the parked head's latest receipt.
+  // D1C fix round 2: the adapter's opencode fallback keys off the api reviewer
+  // seat's model (the api-route guard) and the opencode reviewer seat's model
+  // (the fallback seat), so the composed delegates carry both, derived from the
+  // installation's reviewer chains exactly as the review transport router
+  // resolves its seats (chain order, duplicates dropped). Without exactly one
+  // api reviewer seat there is no api route, so neither value is set and the
+  // fallback stays off — the fail-closed default, not a silent degradation.
+  const reviewerChainSeatIdList = reviewerChainSeatIds(installation?.chains);
+  const reviewerSeats = (installation?.seats ?? []).filter((seat) =>
+    reviewerChainSeatIdList.includes(seat.id),
+  );
+  const apiReviewerModels = new Set(
+    reviewerSeats.filter((seat) => seat.tool === 'api').map((seat) => seat.model),
+  );
+  const primaryApiReviewerModel = apiReviewerModels.size === 1 ? [...apiReviewerModels][0] : undefined;
+  const opencodeFallbackReviewerModel =
+    primaryApiReviewerModel === undefined
+      ? undefined
+      : reviewerSeats.find((seat) => seat.tool === 'opencode' && seat.model !== primaryApiReviewerModel)
+          ?.model;
   const reviewRequest = new ReviewRequestAdapter({
     requestIndependentReview: (request) =>
       evidence.requestIndependentReview.requestIndependentReview(request),
@@ -168,6 +188,12 @@ export function composeConductor(input: ComposeConductorInput) {
     // RV4: screen and archive a busy-transport diagnostic under the review
     // request id; an archive miss never changes the review outcome.
     archiveEvidence: (request) => evidence.evidenceArchive.archiveEvidence(request),
+    // D1C fix round 2: the composed fallback route — only a request whose
+    // primary reviewer is the api seat's model retries once against the
+    // opencode reviewer seat's model; without an api reviewer seat neither
+    // is set and no fallback runs.
+    ...(primaryApiReviewerModel !== undefined ? { primaryApiReviewerModel } : {}),
+    ...(opencodeFallbackReviewerModel !== undefined ? { opencodeFallbackReviewerModel } : {}),
   });
 
   // C2': the scoped one-way owner approval behind the reap's

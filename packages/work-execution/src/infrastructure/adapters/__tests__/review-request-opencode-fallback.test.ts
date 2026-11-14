@@ -341,6 +341,8 @@ describe('ReviewRequestAdapter opencode fallback', () => {
     const mismatchedChain: readonly ReviewReceiptRecord[] = [
       makeChainReceipt({ requestId: 'review-01JB00000000000000000000XX' }),
       makeChainReceipt({ kind: KIND }),
+      // Fix round 2: the chain receipt's attempt id is validated too.
+      makeChainReceipt({ attemptId: 'attempt-other-1' }),
       makeChainReceipt({ candidateHeadSha: HEAD }),
       makeChainReceipt({
         findings: [

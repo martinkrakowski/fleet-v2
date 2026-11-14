@@ -192,6 +192,8 @@ function depsWith(options: {
         receipt: {
           requestId: request.requestId,
           kind: 'brief-verify',
+          candidateHeadSha: COMMIT,
+          reviewerModel: REVIEWER,
           verdict: 'passed',
           findings: [],
         },
@@ -243,6 +245,8 @@ function receiptFor(briefDigest: string, verdict: string): unknown {
   return {
     requestId: `brief-verify:${WORK_ORDER_ID}:${briefDigest.slice(0, 12)}`,
     kind: 'brief-verify',
+    candidateHeadSha: COMMIT,
+    reviewerModel: REVIEWER,
     verdict,
     findings: [],
   };
@@ -863,6 +867,56 @@ describe('VerifyBriefUseCase', () => {
       reason: 'review-unverified',
       detail: 'receipt-mismatch',
     });
+  });
+
+  it('fails closed as unverified when a passing receipt omits or empties candidateHeadSha or reviewerModel', async () => {
+    const base = fixture();
+    const requestId = `brief-verify:${WORK_ORDER_ID}:${base.briefDigest.slice(0, 12)}`;
+    const incompleteReceipts: Record<string, unknown>[] = [
+      {
+        requestId,
+        kind: 'brief-verify',
+        reviewerModel: REVIEWER,
+        verdict: 'passed',
+        findings: [],
+      },
+      {
+        requestId,
+        kind: 'brief-verify',
+        candidateHeadSha: COMMIT,
+        verdict: 'passed',
+        findings: [],
+      },
+      {
+        requestId,
+        kind: 'brief-verify',
+        candidateHeadSha: '',
+        reviewerModel: REVIEWER,
+        verdict: 'passed',
+        findings: [],
+      },
+      {
+        requestId,
+        kind: 'brief-verify',
+        candidateHeadSha: COMMIT,
+        reviewerModel: '   ',
+        verdict: 'passed',
+        findings: [],
+      },
+    ];
+    for (const receipt of incompleteReceipts) {
+      const result = await new VerifyBriefUseCase(depsWith({
+        reviews: () => Promise.resolve({
+          outcome: 'receipt',
+          receipt,
+        } as unknown as ReviewRequestResult),
+      })).verifyBrief(base.request);
+      expect(result).toEqual({
+        outcome: 'unverified',
+        reason: 'review-unverified',
+        detail: 'receipt-mismatch',
+      });
+    }
   });
 
   it('passes an AttemptRunnerRecord with host set and hostName null when recordedHost is provided', async () => {

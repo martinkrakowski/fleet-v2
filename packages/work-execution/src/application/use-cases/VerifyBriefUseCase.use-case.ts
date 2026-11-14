@@ -105,8 +105,8 @@ const RECEIPT_SCHEMA: PlainRecordSchema = {
   requestId: { kind: 'string', maxLength: 512 },
   kind: { kind: 'literal', values: ['brief-verify'] },
   verdict: { kind: 'string', maxLength: 64 },
-  candidateHeadSha: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_SCALAR_CHARS, optional: true },
-  reviewerModel: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_SCALAR_CHARS, optional: true },
+  candidateHeadSha: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_SCALAR_CHARS },
+  reviewerModel: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_SCALAR_CHARS },
 };
 
 /**
@@ -636,8 +636,10 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
     if (
       receipt === null
       || receipt.requestId !== requestId
-      || (receipt.candidateHeadSha !== undefined && receipt.candidateHeadSha !== workOrderRecord.baseCommit)
-      || (receipt.reviewerModel !== undefined && receipt.reviewerModel !== pkg.getIndependentReviewer())
+      || !isValidScalar(receipt.candidateHeadSha)
+      || receipt.candidateHeadSha !== workOrderRecord.baseCommit
+      || !isValidScalar(receipt.reviewerModel)
+      || receipt.reviewerModel !== pkg.getIndependentReviewer()
     ) {
       return unverified('review-unverified', 'receipt-mismatch');
     }

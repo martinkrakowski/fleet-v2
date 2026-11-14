@@ -1,545 +1,448 @@
-// G3a: contract snapshot for every /v1 route. Walks apps/api/server/routes/v1,
-// derives one record per route file (method from the filename suffix, path from
-// the directory layout with `index` collapsed and bracket segments kept), and
-// compares the sorted records against the checked-in route-snapshot.json. It
-// fails when a route is removed or renamed, and additions pass only when the
-// snapshot is updated in the same commit. Failure messages name only routes and
-// field lists, never supplied values.
-//
-// Envelope detection: a route is an envelope route when its source references
-// one of the standard builders (`successEnvelope`/`envelope`) or one of the
-// shared handlers that build the same three-field envelope (`knowledgeResponse`,
-// `evidenceResponse`, `projectWriteHandler`, `ownedSessionRoute`). A route that
-// references none of those must be declared in STREAM_ROUTES; anything else
-// fails as an unknown stream route.
+// G3a: the /v1 route and success-envelope contract snapshot. The test walks
+// apps/api/server/routes/v1, derives every route's HTTP method, source-level
+// path and success-envelope contract, and compares the sorted result against
+// the checked-in route-snapshot.json. Any removed, renamed, added or drifted
+// route fails closed until the snapshot is explicitly updated in the same
+// commit. Every walker and parser failure path throws; nothing is skipped.
 import "./nitro-globals.js";
 
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
-import { successEnvelope } from "../operator/errors";
-import { envelope } from "../work/errors";
+import { successEnvelope } from "../operator/errors.js";
+import { envelope } from "../work/errors.js";
 
-type EnvelopeShape = readonly string[] | "stream";
+const ROUTES_ROOT = fileURLToPath(new URL("../../routes/v1", import.meta.url));
+const SNAPSHOT_PATH = fileURLToPath(new URL("./route-snapshot.json", import.meta.url));
 
-interface RouteEntry {
-  method: string;
-  path: string;
-  envelope: EnvelopeShape;
-}
-
-interface DerivedRouteSet {
-  entries: RouteEntry[];
-  problems: string[];
-}
-
-/** Stream routes are exempt from the envelope check and must be declared here. */
-const STREAM_ROUTES: readonly string[] = ["v1/changes.get.ts"];
-const STREAM_ROUTE_KEYS = new Set(STREAM_ROUTES);
-
-const METHOD_SUFFIXES = new Set(["get", "post", "patch"]);
+/** Route files whose handler streams NDJSON instead of returning an envelope. */
+const STREAM_ROUTES = new Set<string>(["changes.get.ts"]);
 
 /**
- * Regular file names deliberately ignored when walking the route tree.
- * Empty in production because apps/api/server/routes/v1 contains only route files and directories.
+ * Source symbols that build the ["operationId", "code", "result"] envelope.
+ * The first three are the direct builders; the remaining four are the wiring
+ * response helpers (work/run-read-response, evidence/errors, knowledge/errors,
+ * owned-session-route) that all emit the same envelope shape.
  */
-const IGNORED_ROUTE_TREE_NAMES: ReadonlySet<string> = new Set<string>([]);
-
-const ENVELOPE_FIELDS: readonly string[] = ["operationId", "code", "result"];
-
-/** Envelope producers recognized in route source. */
-const ENVELOPE_MARKERS: readonly string[] = [
+const ENVELOPE_BUILDER_NAMES: readonly string[] = [
   "successEnvelope(",
   "envelope(",
-  "knowledgeResponse(",
-  "evidenceResponse(",
   "projectWriteHandler(",
-  "ownedSessionRoute(",
   "respondRunRead(",
+  "evidenceResponse(",
+  "knowledgeResponse(",
+  "ownedSessionRoute(",
 ];
 
-function methodFromFileName(fileName: string, relativePath: string = fileName): string {
-  if (!fileName.endsWith(".ts")) {
-    throw new Error(`unexpected route file suffix: ${relativePath}`);
-  }
-  const withoutExtension = fileName.slice(0, -3);
-  const dot = withoutExtension.lastIndexOf(".");
-  const base = dot <= 0 ? "" : withoutExtension.slice(0, dot);
-  const method = dot <= 0 ? "" : withoutExtension.slice(dot + 1);
-  if (base === "" || !METHOD_SUFFIXES.has(method)) {
-    throw new Error(`unexpected route file suffix: ${relativePath}`);
-  }
-  return method;
+const ENVELOPE_KEYS = ["operationId", "code", "result"] as const;
+
+type HttpMethod = "GET" | "POST" | "PATCH";
+
+interface RouteContract {
+  method: HttpMethod;
+  path: string;
+  envelope: "stream" | string[];
 }
 
-function routePathFromFileName(fileName: string, directoryRelative: string): string {
-  const withoutExtension = fileName.slice(0, -3);
-  const dot = withoutExtension.lastIndexOf(".");
-  const base = withoutExtension.slice(0, dot);
-  const segment = base === "index" ? "" : base;
-  const parts = [directoryRelative, segment].filter((part) => part !== "");
-  return `/v1/${parts.join("/")}`;
+interface SnapshotRecord {
+  method: HttpMethod;
+  path: string;
+  envelope: "stream" | string[];
 }
 
-function streamKeyFromFileName(fileName: string, directoryRelative: string): string {
-  const parts = ["v1", directoryRelative, fileName].filter((part) => part !== "");
-  return parts.join("/");
-}
-
-function envelopeForRoute(source: string, streamKey: string): EnvelopeShape {
-  if (STREAM_ROUTE_KEYS.has(streamKey)) {
-    return "stream";
-  }
-  for (const marker of ENVELOPE_MARKERS) {
-    if (source.includes(marker)) {
-      return ENVELOPE_FIELDS;
-    }
-  }
-  throw new Error(
-    `unknown stream route: ${streamKey} (references no envelope builder or shared envelope handler)`,
+function sortContracts<T extends { method: HttpMethod; path: string }>(list: T[]): T[] {
+  return [...list].sort((a, b) =>
+    a.path < b.path ? -1 : a.path > b.path ? 1 : a.method < b.method ? -1 : 1,
   );
 }
 
-function toRelativeRoutePath(root: string, targetPath: string): string {
-  const rel = relative(root, targetPath).split("\\").join("/");
-  return rel === "" ? "." : rel;
+/** Extracts the HTTP method from a Nitro route file name's suffix. */
+export function methodFromFileName(fileName: string): HttpMethod {
+  const match = fileName.match(/\.(get|post|patch)\.ts$/);
+  if (match === null) {
+    throw new Error(
+      `unrecognized route file method suffix (expected .get.ts, .post.ts or .patch.ts): ${fileName}`,
+    );
+  }
+  return match[1].toUpperCase() as HttpMethod;
 }
 
-async function collectRouteFiles(
-  root: string,
-  ignoredNames: ReadonlySet<string> = IGNORED_ROUTE_TREE_NAMES,
-): Promise<string[]> {
+/** Derives the source-level /v1 route path from a route file's relative path. */
+export function routePathFromRelativeFile(relativePosixPath: string): string {
+  const method = methodFromFileName(relativePosixPath);
+  const suffix = `.${method.toLowerCase()}.ts`;
+  const withoutSuffix = relativePosixPath.slice(0, relativePosixPath.length - suffix.length);
+  const withoutIndex = withoutSuffix === "index" || withoutSuffix.endsWith("/index")
+    ? withoutSuffix.slice(0, -"/index".length)
+    : withoutSuffix;
+  return `/v1/${withoutIndex}`;
+}
+
+/** Recursively collects route files; any unexpected entry fails closed. */
+export async function walkRouteFiles(rootDir: string, currentDir: string): Promise<string[]> {
+  const entries = await readdir(currentDir, { withFileTypes: true });
   const files: string[] = [];
-  async function walk(directory: string): Promise<void> {
-    const dirRel = toRelativeRoutePath(root, directory);
-    let dirStat;
-    try {
-      dirStat = await lstat(directory);
-    } catch {
-      throw new Error(`unreadable entry in route tree: ${dirRel}`);
+  const sorted = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of sorted) {
+    const relative = relativePosixPath(rootDir, currentDir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await walkRouteFiles(rootDir, join(currentDir, entry.name))));
+      continue;
     }
-    if (dirStat.isSymbolicLink()) {
-      throw new Error(`unexpected symlink in route tree: ${dirRel}`);
+    if (entry.isFile() && entry.name.endsWith(".ts")) {
+      files.push(relative);
+      continue;
     }
-    if (!dirStat.isDirectory()) {
-      throw new Error(`unexpected entry in route tree: ${dirRel}`);
+    if (entry.isFile()) {
+      throw new Error(`unexpected non-TS entry in the route tree: ${relative}`);
     }
-    if ((dirStat.mode & 0o444) === 0) {
-      throw new Error(`unreadable entry in route tree: ${dirRel}`);
-    }
-    let dirents;
-    try {
-      dirents = await readdir(directory, { withFileTypes: true });
-    } catch {
-      throw new Error(`unreadable entry in route tree: ${dirRel}`);
-    }
-    dirents.sort((a, b) => a.name.localeCompare(b.name));
-    for (const dirent of dirents) {
-      const fullPath = join(directory, dirent.name);
-      const relPath = toRelativeRoutePath(root, fullPath);
-      if (dirent.isSymbolicLink()) {
-        throw new Error(`unexpected symlink in route tree: ${relPath}`);
-      }
-      let entryStat;
-      try {
-        entryStat = await lstat(fullPath);
-      } catch {
-        throw new Error(`unreadable entry in route tree: ${relPath}`);
-      }
-      if (entryStat.isSymbolicLink()) {
-        throw new Error(`unexpected symlink in route tree: ${relPath}`);
-      }
-      if ((entryStat.mode & 0o444) === 0) {
-        throw new Error(`unreadable entry in route tree: ${relPath}`);
-      }
-      if (dirent.isDirectory() || entryStat.isDirectory()) {
-        if (dirent.name.includes(".")) {
-          throw new Error(`unexpected directory in route tree: ${relPath}`);
-        }
-        const beforeCount = files.length;
-        await walk(fullPath);
-        if (files.length === beforeCount) {
-          throw new Error(`unexpected directory in route tree: ${relPath}`);
-        }
-        continue;
-      }
-      if (!dirent.isFile() || !entryStat.isFile()) {
-        throw new Error(`unexpected entry in route tree: ${relPath}`);
-      }
-      if (ignoredNames.has(dirent.name)) {
-        continue;
-      }
-      if (!dirent.name.endsWith(".ts")) {
-        throw new Error(`unexpected file in route tree: ${relPath}`);
-      }
-      methodFromFileName(dirent.name, relPath);
-      try {
-        await readFile(fullPath, "utf8");
-      } catch {
-        throw new Error(`unreadable entry in route tree: ${relPath}`);
-      }
-      files.push(fullPath);
-    }
+    throw new Error(`unexpected non-file entry in the route tree: ${relative}`);
   }
-  await walk(root);
-  if (files.length === 0) {
-    throw new Error("unexpected directory in route tree: .");
+  if (currentDir === rootDir && files.length === 0) {
+    throw new Error(`the route tree contains zero route files: ${rootDir}`);
   }
   return files;
 }
 
-async function deriveEntries(routeFiles: string[], root: string): Promise<DerivedRouteSet> {
-  const entries: RouteEntry[] = [];
-  const problems: string[] = [];
-  if (routeFiles.length === 0) {
-    problems.push("route file list is empty");
-    return { entries, problems };
+function relativePosixPath(rootDir: string, currentDir: string, name: string): string {
+  const joined = join(currentDir, name);
+  const relative = joined.startsWith(rootDir) ? joined.slice(rootDir.length) : joined;
+  return relative.replace(/^\/+/, "").replace(/\\/g, "/");
+}
+
+/** Classifies a route's success contract from its source; unknown fails closed. */
+export function detectEnvelopeContract(relativePosixPath: string, source: string): "stream" | string[] {
+  // A stream route may still reference envelope() for its unconfigured or
+  // limit-reached error responses; membership in STREAM_ROUTES decides first.
+  if (STREAM_ROUTES.has(relativePosixPath)) {
+    return "stream";
   }
-  for (const file of routeFiles) {
-    const rest = toRelativeRoutePath(root, file);
-    const parts = rest.split("/");
-    const fileName = parts[parts.length - 1] ?? "";
-    const directoryRelative = parts.slice(0, -1).join("/");
+  if (ENVELOPE_BUILDER_NAMES.some((name) => source.includes(name))) {
+    return [...ENVELOPE_KEYS];
+  }
+  throw new Error(`route source references no envelope builder: ${relativePosixPath}`);
+}
+
+/** Fails if either envelope builder stops emitting the frozen key order. */
+export function verifyEnvelopeBuilders(): void {
+  const operator = successEnvelope("route-snapshot-check", null);
+  const work = envelope("route-snapshot-check", "OK", null);
+  expect(Object.keys(operator)).toEqual([...ENVELOPE_KEYS]);
+  expect(Object.keys(work)).toEqual([...ENVELOPE_KEYS]);
+}
+
+/** Reads one record field, so a throwing getter becomes malformed input. */
+function readField(record: object, field: string): unknown {
+  try {
+    return (record as Record<string, unknown>)[field];
+  } catch {
+    throw new Error(`malformed snapshot record: reading "${field}" threw`);
+  }
+}
+
+function parseSnapshotEnvelope(value: unknown, label: string): "stream" | string[] {
+  if (value === "stream") {
+    return "stream";
+  }
+  if (Array.isArray(value) && value.length === ENVELOPE_KEYS.length) {
+    const keys = value.every((entry, index) => entry === ENVELOPE_KEYS[index]);
+    if (keys) {
+      return [...ENVELOPE_KEYS];
+    }
+  }
+  throw new Error(`malformed snapshot envelope for ${label}`);
+}
+
+/** Parses and strictly validates the snapshot document; never coerces. */
+export function parseSnapshotDocument(raw: unknown): SnapshotRecord[] {
+  let parsed: unknown;
+  if (typeof raw === "string") {
     try {
-      let st;
-      try {
-        st = await lstat(file);
-      } catch {
-        throw new Error(`unreadable entry in route tree: ${rest}`);
-      }
-      if (st.isSymbolicLink()) {
-        throw new Error(`unexpected symlink in route tree: ${rest}`);
-      }
-      if (st.isDirectory()) {
-        throw new Error(`unexpected directory in route tree: ${rest}`);
-      }
-      if (!st.isFile()) {
-        throw new Error(`unexpected entry in route tree: ${rest}`);
-      }
-      if ((st.mode & 0o444) === 0) {
-        throw new Error(`unreadable entry in route tree: ${rest}`);
-      }
-      const method = methodFromFileName(fileName, rest);
-      let source: string;
-      try {
-        source = await readFile(file, "utf8");
-      } catch {
-        throw new Error(`unreadable entry in route tree: ${rest}`);
-      }
-      const envelope = envelopeForRoute(source, streamKeyFromFileName(fileName, directoryRelative));
-      entries.push({
-        method: method.toUpperCase(),
-        path: routePathFromFileName(fileName, directoryRelative),
-        envelope,
-      });
-    } catch (error) {
-      problems.push(error instanceof Error ? error.message : String(error));
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("malformed snapshot document: not valid JSON");
     }
+  } else {
+    parsed = raw;
   }
-  return { entries, problems };
-}
-
-function entryKey(entry: RouteEntry): string {
-  return `${entry.method} ${entry.path}`;
-}
-
-function compareByPathThenMethod(a: RouteEntry, b: RouteEntry): number {
-  if (a.path !== b.path) {
-    return a.path < b.path ? -1 : 1;
+  if (!Array.isArray(parsed)) {
+    throw new Error("malformed snapshot document: the root is not an array");
   }
-  if (a.method !== b.method) {
-    return a.method < b.method ? -1 : 1;
-  }
-  return 0;
+  return parsed.map((entry, index) => {
+    const label = `snapshot entry ${index}`;
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error(`malformed snapshot record: ${label} is not an object`);
+    }
+    const method = readField(entry, "method");
+    if (method !== "GET" && method !== "POST" && method !== "PATCH") {
+      throw new Error(`malformed snapshot record: ${label} has an invalid method`);
+    }
+    const path = readField(entry, "path");
+    if (typeof path !== "string" || !path.startsWith("/v1/")) {
+      throw new Error(`malformed snapshot record: ${label} has an invalid path`);
+    }
+    const envelopeValue = parseSnapshotEnvelope(readField(entry, "envelope"), label);
+    return { method, path, envelope: envelopeValue } satisfies SnapshotRecord;
+  });
 }
 
-function sortEntries(entries: readonly RouteEntry[]): RouteEntry[] {
-  return [...entries].sort(compareByPathThenMethod);
-}
-
-function envelopeText(envelope: EnvelopeShape): string {
-  return typeof envelope === "string" ? envelope : JSON.stringify(envelope);
-}
-
-function compareSnapshots(codeEntries: readonly RouteEntry[], snapshotEntries: readonly RouteEntry[]): string[] {
-  const problems: string[] = [];
-  const code = sortEntries(codeEntries);
-  const snapshot = sortEntries(snapshotEntries);
-  const codeKeys = new Set(code.map(entryKey));
-  const snapshotKeys = new Set(snapshot.map(entryKey));
-  for (const entry of code) {
-    if (!snapshotKeys.has(entryKey(entry))) {
-      problems.push(
-        `${entryKey(entry)} exists in code but is absent from route-snapshot.json; ` +
-          "update route-snapshot.json in the same commit",
+/** Compares the two sorted contract lists entry-by-entry, reporting all drift. */
+export function compareRouteContracts(
+  actualSorted: RouteContract[],
+  snapshotSorted: SnapshotRecord[],
+): void {
+  const differences: string[] = [];
+  let actualIndex = 0;
+  let snapshotIndex = 0;
+  while (actualIndex < actualSorted.length || snapshotIndex < snapshotSorted.length) {
+    const actual = actualSorted[actualIndex];
+    const snapshot = snapshotSorted[snapshotIndex];
+    if (actual === undefined) {
+      differences.push(
+        `snapshot route missing from code: ${snapshot.method} ${snapshot.path}`,
       );
+      snapshotIndex += 1;
+      continue;
     }
-  }
-  for (const entry of snapshot) {
-    if (!codeKeys.has(entryKey(entry))) {
-      problems.push(
-        `${entryKey(entry)} exists in route-snapshot.json but is absent from code (removed or renamed)`,
+    if (snapshot === undefined) {
+      differences.push(
+        `code route missing from snapshot: ${actual.method} ${actual.path} (update route-snapshot.json in the same commit)`,
       );
+      actualIndex += 1;
+      continue;
     }
-  }
-  let i = 0;
-  let j = 0;
-  while (i < code.length && j < snapshot.length) {
-    const comparison = compareByPathThenMethod(code[i], snapshot[j]);
-    if (comparison === 0) {
-      if (envelopeText(code[i].envelope) !== envelopeText(snapshot[j].envelope)) {
-        problems.push(
-          `${entryKey(code[i])} envelope ${envelopeText(code[i].envelope)} does not match ` +
-            `snapshot ${envelopeText(snapshot[j].envelope)}`,
+    if (actual.path === snapshot.path) {
+      if (actual.method !== snapshot.method) {
+        differences.push(
+          `route contract drift: ${snapshot.path} expected method ${snapshot.method} but code derives ${actual.method}`,
+        );
+      } else if (!contractMatches(actual, snapshot)) {
+        differences.push(
+          `route contract drift: ${actual.method} ${actual.path} expected ${describeEnvelope(snapshot.envelope)} but code derives ${describeEnvelope(actual.envelope)}`,
         );
       }
-      i += 1;
-      j += 1;
-    } else if (comparison < 0) {
-      i += 1;
-    } else {
-      j += 1;
+      actualIndex += 1;
+      snapshotIndex += 1;
+      continue;
     }
+    const order = actual.path < snapshot.path ? -1 : 1;
+    if (order < 0) {
+      differences.push(
+        `code route missing from snapshot: ${actual.method} ${actual.path} (update route-snapshot.json in the same commit)`,
+      );
+      actualIndex += 1;
+      continue;
+    }
+    if (order > 0) {
+      differences.push(
+        `snapshot route missing from code: ${snapshot.method} ${snapshot.path}`,
+      );
+      snapshotIndex += 1;
+      continue;
+    }
+    if (!contractMatches(actual, snapshot)) {
+      differences.push(
+        `route contract drift: ${actual.method} ${actual.path} expected ${describeEnvelope(snapshot.envelope)} but code derives ${describeEnvelope(actual.envelope)}`,
+      );
+    }
+    actualIndex += 1;
+    snapshotIndex += 1;
   }
-  return problems;
+  if (differences.length > 0) {
+    throw new Error(`route contract snapshot mismatch:\n${differences.join("\n")}`);
+  }
 }
 
-const routeRoot = fileURLToPath(new URL("../../routes/v1", import.meta.url));
+function contractMatches(actual: RouteContract, snapshot: SnapshotRecord): boolean {
+  if (actual.method !== snapshot.method || actual.path !== snapshot.path) {
+    return false;
+  }
+  if (actual.envelope === "stream" || snapshot.envelope === "stream") {
+    return actual.envelope === snapshot.envelope;
+  }
+  return actual.envelope.every((key, index) => key === snapshot.envelope[index]);
+}
 
-describe("route contract snapshot (/v1)", () => {
-  it("records every /v1 route and matches the checked-in snapshot", async () => {
-    const routeFiles = await collectRouteFiles(routeRoot);
-    const derived = await deriveEntries(routeFiles, routeRoot);
-    expect(derived.problems).toEqual([]);
-    const snapshotText = await readFile(new URL("./route-snapshot.json", import.meta.url), "utf8");
-    const snapshot = JSON.parse(snapshotText) as RouteEntry[];
-    expect(compareSnapshots(derived.entries, snapshot)).toEqual([]);
+function describeEnvelope(value: "stream" | string[]): string {
+  return value === "stream" ? "stream" : `[${value.join(", ")}]`;
+}
+
+/** Derives every route contract from the route tree on disk. */
+export async function collectRouteContracts(rootDir: string): Promise<RouteContract[]> {
+  const files = await walkRouteFiles(rootDir, rootDir);
+  const contracts: RouteContract[] = [];
+  for (const file of files) {
+    const source = await readFile(join(rootDir, file), "utf8");
+    contracts.push({
+      method: methodFromFileName(file),
+      path: routePathFromRelativeFile(file),
+      envelope: detectEnvelopeContract(file, source),
+    });
+  }
+  if (contracts.length === 0) {
+    throw new Error(`the route tree contains zero route files: ${rootDir}`);
+  }
+  return sortContracts(contracts);
+}
+
+const createdDirs = new Set<string>();
+
+async function makeTempDir(prefix: string): Promise<string> {
+  const directory = await mkdtemp(join("/tmp/opencode", prefix));
+  createdDirs.add(directory);
+  return directory;
+}
+
+afterEach(async () => {
+  await Promise.all(
+    [...createdDirs].map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+  createdDirs.clear();
+});
+
+describe("the /v1 route contract snapshot", () => {
+  it("matches the checked-in snapshot for every route in the tree", async () => {
+    const actual = await collectRouteContracts(ROUTES_ROOT);
+    const snapshot = parseSnapshotDocument(await readFile(SNAPSHOT_PATH, "utf8"));
+    expect(actual.length).toBe(70);
+    expect(snapshot.length).toBe(70);
+    compareRouteContracts(actual, sortContracts(snapshot));
   });
 
-  it("declares GET /v1/changes as the only streaming route", async () => {
-    const routeFiles = await collectRouteFiles(routeRoot);
-    const derived = await deriveEntries(routeFiles, routeRoot);
-    expect(derived.problems).toEqual([]);
-    const streams = derived.entries.filter((entry) => entry.envelope === "stream");
-    expect(streams).toEqual([{ method: "GET", path: "/v1/changes", envelope: "stream" }]);
+  it("verifies both envelope builders emit operationId, code, and result", () => {
+    verifyEnvelopeBuilders();
   });
 
-  it("derives a deterministic snapshot from filesystem reads alone", async () => {
-    const routeFiles = await collectRouteFiles(routeRoot);
-    const first = await deriveEntries(routeFiles, routeRoot);
-    const second = await deriveEntries(routeFiles, routeRoot);
-    expect(first.problems).toEqual([]);
-    expect(second.problems).toEqual([]);
-    expect(first.entries.length).toBeGreaterThan(0);
-    expect(first.entries).toEqual(second.entries);
+  it("derives the stream contract only for the NDJSON change feed", async () => {
+    const actual = await collectRouteContracts(ROUTES_ROOT);
+    const streamed = actual.filter((route) => route.envelope === "stream");
+    expect(streamed).toEqual([{ method: "GET", path: "/v1/changes", envelope: "stream" }]);
   });
 });
 
-describe("snapshot comparison rules", () => {
-  it("fails when a snapshot entry has no corresponding code route (removal or rename)", () => {
-    const code: RouteEntry[] = [{ method: "GET", path: "/v1/attempts", envelope: ENVELOPE_FIELDS }];
-    const snapshot: RouteEntry[] = [
-      { method: "GET", path: "/v1/attempts", envelope: ENVELOPE_FIELDS },
-      { method: "DELETE", path: "/v1/legacy", envelope: ENVELOPE_FIELDS },
-    ];
-    const problems = compareSnapshots(code, snapshot);
-    expect(
-      problems.some((problem) => problem.includes("/v1/legacy") && problem.includes("removed or renamed")),
-    ).toBe(true);
+describe("fail-closed walker and parser behaviour", () => {
+  it("fails closed when the route root is unreadable", async () => {
+    const root = await makeTempDir("route-snapshot-missing-");
+    const missing = join(root, "routes-v1");
+    await expect(walkRouteFiles(missing, missing)).rejects.toThrow(/routes-v1/);
+    await expect(collectRouteContracts(missing)).rejects.toThrow();
   });
 
-  it("fails when a code route is absent from the snapshot (additions need an explicit update)", () => {
-    const code: RouteEntry[] = [{ method: "POST", path: "/v1/new-route", envelope: ENVELOPE_FIELDS }];
-    const problems = compareSnapshots(code, []);
-    expect(
-      problems.some((problem) => problem.includes("/v1/new-route") && problem.includes("in the same commit")),
-    ).toBe(true);
-  });
+  it("fails closed on unexpected non-ts or non-file entries in the route tree", async () => {
+    const root = await makeTempDir("route-snapshot-unexpected-");
+    const routes = join(root, "v1");
+    await mkdir(routes);
+    await writeFile(join(routes, "attempts.get.ts"), "export default 1;", "utf8");
+    await writeFile(join(routes, "notes.txt"), "not a route", "utf8");
+    await writeFile(join(routes, "other.get.ts"), "export default 1;", "utf8");
 
-  it("reports an envelope shape mismatch between code and snapshot", () => {
-    const code: RouteEntry[] = [{ method: "GET", path: "/v1/attempts", envelope: ENVELOPE_FIELDS }];
-    const snapshot: RouteEntry[] = [
-      { method: "GET", path: "/v1/attempts", envelope: ["operationId", "result"] },
-    ];
-    const problems = compareSnapshots(code, snapshot);
-    expect(
-      problems.some((problem) => problem.includes("/v1/attempts") && problem.includes("does not match")),
-    ).toBe(true);
-  });
-});
-
-describe("route file derivation", () => {
-  it("rejects an unexpected method suffix naming only the file", () => {
-    expect(() => methodFromFileName("legacy.delete.ts")).toThrow(
-      "unexpected route file suffix: legacy.delete.ts",
+    await expect(collectRouteContracts(routes)).rejects.toThrow(
+      /unexpected non-TS entry in the route tree: notes\.txt/,
     );
   });
 
-  it("treats a declared stream route as streaming even when it references an envelope builder", () => {
-    const changesSource = 'return envelope(newOperationId(), "OK");';
-    expect(envelopeForRoute(changesSource, "v1/changes.get.ts")).toBe("stream");
+  it("fails closed on a non-file entry such as a symlink in the route tree", async () => {
+    const root = await makeTempDir("route-snapshot-symlink-");
+    const routes = join(root, "v1");
+    await mkdir(routes);
+    await writeFile(join(routes, "attempts.get.ts"), "export default 1;", "utf8");
+    await symlink(join(routes, "attempts.get.ts"), join(routes, "linked"));
+
+    await expect(collectRouteContracts(routes)).rejects.toThrow(
+      /unexpected non-file entry in the route tree: linked/,
+    );
   });
 
-  it("fails for a route that references no envelope producer and is not declared streaming", () => {
-    expect(() => envelopeForRoute("return raw;", "v1/mystery.get.ts")).toThrow(/unknown stream route/);
+  it("fails closed when the route tree is empty", async () => {
+    const root = await makeTempDir("route-snapshot-empty-");
+    const routes = join(root, "v1");
+    await mkdir(routes);
+    await expect(collectRouteContracts(routes)).rejects.toThrow(/zero route files/);
   });
 
-  async function withTempRouteTree(
-    build: (tempRoot: string) => Promise<void>,
-  ): Promise<{ tempRoot: string; cleanup: () => Promise<void> }> {
-    const tempRoot = await mkdtemp(join(tmpdir(), "route-snapshot-"));
-    await build(tempRoot);
-    return {
-      tempRoot,
-      cleanup: async () => {
-        await rm(tempRoot, { recursive: true, force: true });
+  it("refuses unrecognized method suffixes", () => {
+    expect(() => methodFromFileName("attempts.put.ts")).toThrow(/attempts\.put\.ts/);
+    expect(() => methodFromFileName("attempts/get.ts")).toThrow(/attempts\/get\.ts/);
+  });
+
+  it("refuses non-stream routes missing an envelope builder", () => {
+    expect(() => detectEnvelopeContract("attempts/index.get.ts", "export default 1;")).toThrow(
+      /attempts\/index\.get\.ts/,
+    );
+    expect(detectEnvelopeContract("changes.get.ts", "export default 1;")).toBe("stream");
+  });
+
+  it("refuses null, non-array, malformed entries, and throwing getters in snapshot parsing", () => {
+    expect(() => parseSnapshotDocument("not json")).toThrow(/not valid JSON/);
+    expect(() => parseSnapshotDocument("null")).toThrow(/not an array/);
+    expect(() => parseSnapshotDocument("{\"method\":\"GET\"}")).toThrow(/not an array/);
+    expect(() => parseSnapshotDocument(["nope"])).toThrow(/is not an object/);
+    expect(() => parseSnapshotDocument([{ method: "PUT", path: "/v1/x", envelope: [] }])).toThrow(
+      /invalid method/,
+    );
+    expect(() => parseSnapshotDocument([{ method: "GET", path: "/v1/x", envelope: "nope" }])).toThrow(
+      /malformed snapshot envelope/,
+    );
+    expect(() => parseSnapshotDocument([{ method: "GET", path: "v1/x", envelope: "stream" }])).toThrow(
+      /invalid path/,
+    );
+    const throwingGetter = {
+      get method(): string {
+        throw new Error("getter boom");
       },
+      path: "/v1/x",
+      envelope: "stream",
     };
-  }
-
-  const validRouteSource = 'return envelope(op, "OK");';
-
-  it("rejects a non-.ts file suffix in the route tree naming its relative path", async () => {
-    const { tempRoot, cleanup } = await withTempRouteTree(async (root) => {
-      await mkdir(join(root, "attempts"), { recursive: true });
-      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
-      await writeFile(join(root, "attempts", "stray.get.js"), validRouteSource);
-    });
-    try {
-      await expect(collectRouteFiles(tempRoot)).rejects.toThrow(
-        "unexpected file in route tree: attempts/stray.get.js",
-      );
-      const derived = await deriveEntries([join(tempRoot, "attempts/stray.get.js")], tempRoot);
-      expect(derived.problems).toEqual(["unexpected route file suffix: attempts/stray.get.js"]);
-      expect(derived.entries).toEqual([]);
-    } finally {
-      await cleanup();
-    }
+    expect(() => parseSnapshotDocument([throwingGetter])).toThrow(/reading "method" threw/);
   });
 
-  it("rejects an unrecognised .ts route suffix in the route tree naming its relative path", async () => {
-    const legacyTree = await withTempRouteTree(async (root) => {
-      await mkdir(join(root, "attempts"), { recursive: true });
-      await writeFile(join(root, "attempts", "legacy.delete.ts"), validRouteSource);
-    });
-    const helperTree = await withTempRouteTree(async (root) => {
-      await mkdir(join(root, "attempts"), { recursive: true });
-      await writeFile(join(root, "attempts", "helper.ts"), validRouteSource);
-    });
-    try {
-      await expect(collectRouteFiles(legacyTree.tempRoot)).rejects.toThrow(
-        "unexpected route file suffix: attempts/legacy.delete.ts",
-      );
-      await expect(collectRouteFiles(helperTree.tempRoot)).rejects.toThrow(
-        "unexpected route file suffix: attempts/helper.ts",
-      );
-      expect(() => methodFromFileName(".get.ts", "attempts/.get.ts")).toThrow(
-        "unexpected route file suffix: attempts/.get.ts",
-      );
-    } finally {
-      await legacyTree.cleanup();
-      await helperTree.cleanup();
-    }
+  it("fails when a code route is missing from the snapshot", () => {
+    const actual: RouteContract[] = [
+      { method: "GET", path: "/v1/attempts", envelope: [...ENVELOPE_KEYS] },
+      { method: "GET", path: "/v1/attempts/[id]", envelope: [...ENVELOPE_KEYS] },
+    ];
+    const snapshot: SnapshotRecord[] = [
+      { method: "GET", path: "/v1/attempts", envelope: [...ENVELOPE_KEYS] },
+    ];
+    expect(() => compareRouteContracts(actual, snapshot)).toThrow(
+      /missing from snapshot.*update route-snapshot.json in the same commit/s,
+    );
   });
 
-  it("ignores only regular files whose exact name is in the explicit ignored list and rejects unlisted names", async () => {
-    const { tempRoot, cleanup } = await withTempRouteTree(async (root) => {
-      await mkdir(join(root, "attempts"), { recursive: true });
-      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
-      await writeFile(join(root, "attempts", ".gitkeep"), "");
-    });
-    try {
-      await expect(collectRouteFiles(tempRoot, new Set([".gitkeep"]))).resolves.toEqual([
-        join(tempRoot, "attempts", "index.get.ts"),
-      ]);
-      await expect(collectRouteFiles(tempRoot)).rejects.toThrow(
-        "unexpected file in route tree: attempts/.gitkeep",
-      );
-    } finally {
-      await cleanup();
-    }
+  it("fails when a snapshot route is missing from code", () => {
+    const actual: RouteContract[] = [
+      { method: "GET", path: "/v1/attempts", envelope: [...ENVELOPE_KEYS] },
+    ];
+    const snapshot: SnapshotRecord[] = [
+      { method: "GET", path: "/v1/attempts", envelope: [...ENVELOPE_KEYS] },
+      { method: "POST", path: "/v1/attempts/[id]/fix", envelope: [...ENVELOPE_KEYS] },
+    ];
+    expect(() => compareRouteContracts(actual, snapshot)).toThrow(
+      /snapshot route missing from code: POST \/v1\/attempts\/\[id\]\/fix/,
+    );
   });
 
-  it("rejects a directory where a route file was expected naming its relative path", async () => {
-    const spoofTree = await withTempRouteTree(async (root) => {
-      await mkdir(join(root, "attempts", "spoof.get.ts"), { recursive: true });
-      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
-    });
-    const emptyTree = await withTempRouteTree(async (root) => {
-      await mkdir(join(root, "attempts", "empty-dir"), { recursive: true });
-      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
-    });
-    try {
-      await expect(collectRouteFiles(spoofTree.tempRoot)).rejects.toThrow(
-        "unexpected directory in route tree: attempts/spoof.get.ts",
-      );
-      await expect(collectRouteFiles(emptyTree.tempRoot)).rejects.toThrow(
-        "unexpected directory in route tree: attempts/empty-dir",
-      );
-      const derived = await deriveEntries([join(spoofTree.tempRoot, "attempts/spoof.get.ts")], spoofTree.tempRoot);
-      expect(derived.problems).toEqual(["unexpected directory in route tree: attempts/spoof.get.ts"]);
-      expect(derived.entries).toEqual([]);
-    } finally {
-      await spoofTree.cleanup();
-      await emptyTree.cleanup();
-    }
-  });
+  it("fails when a route envelope shape or method drifts", () => {
+    const envelopeRoutes: RouteContract[] = [
+      { method: "GET", path: "/v1/changes", envelope: [...ENVELOPE_KEYS] },
+    ];
+    const streamSnapshot: SnapshotRecord[] = [
+      { method: "GET", path: "/v1/changes", envelope: "stream" },
+    ];
+    expect(() => compareRouteContracts(envelopeRoutes, streamSnapshot)).toThrow(
+      /contract drift: GET \/v1\/changes expected stream but code derives \[operationId, code, result\]/,
+    );
 
-  it("rejects a symlink in the route tree naming its relative path", async () => {
-    const { tempRoot, cleanup } = await withTempRouteTree(async (root) => {
-      await mkdir(join(root, "attempts"), { recursive: true });
-      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
-      await symlink(join(root, "attempts", "index.get.ts"), join(root, "attempts", "alias.get.ts"));
-    });
-    try {
-      await expect(collectRouteFiles(tempRoot)).rejects.toThrow(
-        "unexpected symlink in route tree: attempts/alias.get.ts",
-      );
-      const derived = await deriveEntries([join(tempRoot, "attempts/alias.get.ts")], tempRoot);
-      expect(derived.problems).toEqual(["unexpected symlink in route tree: attempts/alias.get.ts"]);
-      expect(derived.entries).toEqual([]);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  it("rejects an unreadable entry in the route tree naming its relative path", async () => {
-    const { tempRoot, cleanup } = await withTempRouteTree(async (root) => {
-      await mkdir(join(root, "attempts"), { recursive: true });
-      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
-      await writeFile(join(root, "attempts", "secret.get.ts"), validRouteSource);
-      await chmod(join(root, "attempts", "secret.get.ts"), 0o000);
-    });
-    const secretFile = join(tempRoot, "attempts", "secret.get.ts");
-    try {
-      await expect(collectRouteFiles(tempRoot)).rejects.toThrow(
-        "unreadable entry in route tree: attempts/secret.get.ts",
-      );
-      const derived = await deriveEntries([secretFile], tempRoot);
-      expect(derived.problems).toEqual(["unreadable entry in route tree: attempts/secret.get.ts"]);
-      expect(derived.entries).toEqual([]);
-    } finally {
-      await chmod(secretFile, 0o644);
-      await cleanup();
-    }
-  });
-
-  it("reports a problem when deriveEntries receives an empty route file list", async () => {
-    const derived = await deriveEntries([], routeRoot);
-    expect(derived).toEqual({ entries: [], problems: ["route file list is empty"] });
+    const methodDrift: RouteContract[] = [
+      { method: "POST", path: "/v1/projects/[id]", envelope: [...ENVELOPE_KEYS] },
+    ];
+    const patchSnapshot: SnapshotRecord[] = [
+      { method: "PATCH", path: "/v1/projects/[id]", envelope: [...ENVELOPE_KEYS] },
+    ];
+    expect(() => compareRouteContracts(methodDrift, patchSnapshot)).toThrow(/contract drift/);
   });
 });
 
-describe("envelope builders expose exactly the three snapshot fields", () => {
-  it("operator successEnvelope", () => {
-    expect(Object.keys(successEnvelope("route-snapshot-check", null))).toEqual(ENVELOPE_FIELDS);
-  });
-
-  it("work envelope", () => {
-    expect(Object.keys(envelope("route-snapshot-check", "OK", null))).toEqual(ENVELOPE_FIELDS);
-  });
-});

@@ -6,7 +6,7 @@ import type {
   AttemptArtifactPort,
 } from '../../ports/out/AttemptArtifactPort.out-port.js';
 import type { ReviewRequest, ReviewRequestResult } from '../../ports/out/ReviewRequestPort.out-port.js';
-import type { WorkOrderRecord } from '../../../domain/execution-records.js';
+import type { AttemptRunnerRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { VerifyBriefDependencies } from '../VerifyBriefUseCase.use-case.js';
 import type { VerifyBriefRequest, VerifyBriefResult } from '../../ports/in/VerifyBriefPort.in-port.js';
 import { VerifyBriefUseCase } from '../VerifyBriefUseCase.use-case.js';
@@ -122,6 +122,12 @@ function fixture(
   };
 }
 
+interface RecordedArtifactRead {
+  readonly worktreePath: string;
+  readonly relativePath: string;
+  readonly recordedHost: AttemptRunnerRecord | null | undefined;
+}
+
 function depsWith(options: {
   record?: WorkOrderRecord | null | 'throw';
   manifest?: string | null | 'throw' | 7;
@@ -129,10 +135,16 @@ function depsWith(options: {
   readManifest?: boolean;
   readFile?: boolean;
   findWorkOrderById?: boolean;
-  computeDigest?: (content: string) => string;
-  reviews?: (request: ReviewRequest) => Promise<ReviewRequestResult>;
-}): VerifyBriefDependencies & { readonly reviewRequests: ReviewRequest[] } {
+  computeDigest?: ((content: string) => string) | null;
+  reviews?: ((request: ReviewRequest) => Promise<ReviewRequestResult>) | null;
+}): VerifyBriefDependencies & {
+  readonly reviewRequests: ReviewRequest[];
+  readonly manifestReads: RecordedArtifactRead[];
+  readonly fileReads: RecordedArtifactRead[];
+} {
   const reviewRequests: ReviewRequest[] = [];
+  const manifestReads: RecordedArtifactRead[] = [];
+  const fileReads: RecordedArtifactRead[] = [];
   const workOrderRepo = {
     ...(options.findWorkOrderById === false ? {} : {
       async findWorkOrderById() {
@@ -145,7 +157,12 @@ function depsWith(options: {
   };
   const artifactPort = {
     ...(options.readManifest === false ? {} : {
-      async readBriefManifest() {
+      async readBriefManifest(
+        worktreePath: string,
+        relativePath: string,
+        recordedHost?: AttemptRunnerRecord | null,
+      ) {
+        manifestReads.push({ worktreePath, relativePath, recordedHost });
         if (options.manifest === 'throw') {
           throw new Error('permission denied');
         }
@@ -153,7 +170,12 @@ function depsWith(options: {
       },
     }),
     ...(options.readFile === false ? {} : {
-      async readBriefFile() {
+      async readBriefFile(
+        worktreePath: string,
+        relativePath: string,
+        recordedHost?: AttemptRunnerRecord | null,
+      ) {
+        fileReads.push({ worktreePath, relativePath, recordedHost });
         if (options.prose === 'throw') {
           throw new Error('ssh timeout');
         }
@@ -161,12 +183,25 @@ function depsWith(options: {
       },
     }),
   } as unknown as Pick<AttemptArtifactPort, 'readBriefManifest' | 'readBriefFile'>;
-  const reviewsFn = options.reviews;
+  const computeDigest = options.computeDigest === undefined
+    ? simpleDeterministicHexDigest
+    : options.computeDigest;
+  const reviewsFn = options.reviews === undefined
+    ? (request: ReviewRequest) => Promise.resolve({
+        outcome: 'receipt',
+        receipt: {
+          requestId: request.requestId,
+          kind: 'brief-verify',
+          verdict: 'passed',
+          findings: [],
+        },
+      } as unknown as ReviewRequestResult)
+    : options.reviews;
   return {
     workOrderRepo,
     artifactPort,
-    ...(options.computeDigest !== undefined ? { computeDigest: options.computeDigest } : {}),
-    ...(reviewsFn !== undefined ? {
+    ...(computeDigest !== null ? { computeDigest } : {}),
+    ...(reviewsFn !== null ? {
       reviews: {
         async requestReview(request: ReviewRequest) {
           reviewRequests.push(request);
@@ -175,7 +210,13 @@ function depsWith(options: {
       },
     } : {}),
     reviewRequests,
-  } as VerifyBriefDependencies & { readonly reviewRequests: ReviewRequest[] };
+    manifestReads,
+    fileReads,
+  } as VerifyBriefDependencies & {
+    readonly reviewRequests: ReviewRequest[];
+    readonly manifestReads: RecordedArtifactRead[];
+    readonly fileReads: RecordedArtifactRead[];
+  };
 }
 
 async function verify(call: VerifyBriefDependencies): Promise<VerifyBriefResult> {
@@ -305,7 +346,7 @@ describe('VerifyBriefUseCase', () => {
       });
     }
     const missingMethod = new VerifyBriefUseCase({
-      artifactPort: depsWith({}).artifactPort,
+      ...depsWith({}),
       workOrderRepo: {} as VerifyBriefDependencies['workOrderRepo'],
     });
     const result = await missingMethod.verifyBrief(fixture().request);
@@ -720,5 +761,156 @@ describe('VerifyBriefUseCase', () => {
       } as unknown as ReviewRequestResult),
     })).verifyBrief(base.request);
     expect(passing.outcome).toBe('verified');
+  });
+
+  it('fails closed with unverified review-unverified when the reviews dependency is omitted', async () => {
+    const base = fixture();
+    const omitted = await new VerifyBriefUseCase(depsWith({ reviews: null })).verifyBrief(base.request);
+    expect(omitted).toEqual({
+      outcome: 'unverified',
+      reason: 'review-unverified',
+      detail: 'missing-request-review',
+    });
+  });
+
+  it('sends a complete typed brief-verify ReviewRequest and treats subject-not-implemented or receipt mismatch as unverified', async () => {
+    const base = fixture();
+    const deps = depsWith({
+      reviews: (request) => Promise.resolve({
+        outcome: 'receipt',
+        receipt: {
+          receiptId: 'receipt-1',
+          requestId: request.requestId,
+          kind: 'brief-verify',
+          reviewerModel: REVIEWER,
+          candidateHeadSha: COMMIT,
+          verdict: 'passed',
+          findings: [],
+        },
+      }),
+    });
+    const verifiedResult = await new VerifyBriefUseCase(deps).verifyBrief(base.request);
+    expect(verifiedResult.outcome).toBe('verified');
+    expect(deps.reviewRequests).toEqual([
+      {
+        requestId: `brief-verify:${WORK_ORDER_ID}:${base.briefDigest.slice(0, 12)}`,
+        kind: 'brief-verify',
+        attemptId: ATTEMPT_ID,
+        projectId: 'proj-1',
+        candidateHeadSha: COMMIT,
+        subject: {
+          kind: 'brief',
+          projectId: 'proj-1',
+          briefPackageDigest: base.briefDigest,
+          baseCommit: COMMIT,
+        },
+        policyRevision: 'policy-1',
+        implementerModel: 'impl-model',
+        reviewerModel: REVIEWER,
+        briefText: base.prose,
+      },
+    ]);
+
+    const subjectNotImplemented = await new VerifyBriefUseCase(depsWith({
+      reviews: () => Promise.resolve({
+        outcome: 'refused',
+        reason: 'subject-not-implemented',
+        detail: null,
+      }),
+    })).verifyBrief(base.request);
+    expect(subjectNotImplemented).toEqual({
+      outcome: 'unverified',
+      reason: 'review-unverified',
+      detail: 'subject-not-implemented',
+    });
+
+    const wrongHead = await new VerifyBriefUseCase(depsWith({
+      reviews: (request) => Promise.resolve({
+        outcome: 'receipt',
+        receipt: {
+          receiptId: 'receipt-2',
+          requestId: request.requestId,
+          kind: 'brief-verify',
+          reviewerModel: REVIEWER,
+          candidateHeadSha: 'b'.repeat(40),
+          verdict: 'passed',
+          findings: [],
+        },
+      }),
+    })).verifyBrief(base.request);
+    expect(wrongHead).toEqual({
+      outcome: 'unverified',
+      reason: 'review-unverified',
+      detail: 'receipt-mismatch',
+    });
+
+    const wrongReviewer = await new VerifyBriefUseCase(depsWith({
+      reviews: (request) => Promise.resolve({
+        outcome: 'receipt',
+        receipt: {
+          receiptId: 'receipt-3',
+          requestId: request.requestId,
+          kind: 'brief-verify',
+          reviewerModel: 'other-reviewer',
+          candidateHeadSha: COMMIT,
+          verdict: 'passed',
+          findings: [],
+        },
+      }),
+    })).verifyBrief(base.request);
+    expect(wrongReviewer).toEqual({
+      outcome: 'unverified',
+      reason: 'review-unverified',
+      detail: 'receipt-mismatch',
+    });
+  });
+
+  it('passes an AttemptRunnerRecord with host set and hostName null when recordedHost is provided', async () => {
+    const base = fixture();
+    const remoteDeps = depsWith({});
+    const remoteResult = await new VerifyBriefUseCase(remoteDeps).verifyBrief({
+      ...base.request,
+      recordedHost: 'lane-runner-ssh',
+    });
+    expect(remoteResult.outcome).toBe('verified');
+    const expectedRunnerRecord: AttemptRunnerRecord = {
+      kind: 'opencode',
+      remotePort: null,
+      host: 'lane-runner-ssh',
+      hostName: null,
+      agent: null,
+      model: null,
+      variant: null,
+    };
+    expect(remoteDeps.manifestReads).toEqual([
+      {
+        worktreePath: WORKTREE,
+        relativePath: '.lane/brief-manifest.json',
+        recordedHost: expectedRunnerRecord,
+      },
+    ]);
+    expect(remoteDeps.fileReads).toEqual([
+      {
+        worktreePath: WORKTREE,
+        relativePath: '.lane/brief.md',
+        recordedHost: expectedRunnerRecord,
+      },
+    ]);
+
+    const localDeps = depsWith({});
+    const localResult = await new VerifyBriefUseCase(localDeps).verifyBrief(base.request);
+    expect(localResult.outcome).toBe('verified');
+    expect(localDeps.manifestReads[0]?.recordedHost).toBeUndefined();
+    expect(localDeps.fileReads[0]?.recordedHost).toBeUndefined();
+  });
+
+  it('fails closed with digest-computation-failed when computeDigest is omitted rather than defaulting to the FNV test helper', async () => {
+    const base = fixture();
+    const omitted = await new VerifyBriefUseCase(depsWith({ computeDigest: null })).verifyBrief(base.request);
+    expect(omitted).toEqual({
+      outcome: 'unverified',
+      reason: 'digest-computation-failed',
+      detail: 'missing-digest-function',
+    });
   });
 });

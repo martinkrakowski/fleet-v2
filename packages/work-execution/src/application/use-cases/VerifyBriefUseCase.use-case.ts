@@ -4,12 +4,13 @@
  * JSON and the prose markdown) against the `WorkOrderRecord` it claims to
  * implement: digest integrity through `readBriefPackageManifest`, prose
  * structure through `lintBrief`, `allowedPathPrefixes` containment, and exact
- * `ownedPaths` agreement with the record. When an optional `ReviewRequestPort`
- * is injected, its receipt must pass; an incomplete or refused review is
- * `unverified`, never `verified`. Pure application code: no filesystem, no
- * subprocess, no clock, no randomness; the artifacts are read only through
- * `AttemptArtifactPort`, and every failure is a typed verdict that never
- * throws and never echoes file content.
+ * `ownedPaths` agreement with the record. The independent review through
+ * `ReviewRequestPort` is required and its `brief-verify` receipt must pass; an
+ * omitted, incomplete or refused review is `unverified`, never `verified`.
+ * Pure application code: no filesystem, no subprocess, no clock, no
+ * randomness; the artifacts are read only through `AttemptArtifactPort`, and
+ * every failure is a typed verdict that never throws and never echoes file
+ * content.
  */
 
 import { readPlainRecord, type PlainRecordSchema } from '@fleet/shared';
@@ -41,7 +42,7 @@ import type {
 import type {
   WorkOrderRepositoryPort,
 } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
-import type { WorkOrderRecord } from '../../domain/execution-records.js';
+import type { AttemptRunnerRecord, WorkOrderRecord } from '../../domain/execution-records.js';
 import type {
   VerifyBriefPort,
   VerifyBriefRefusalReason,
@@ -50,15 +51,14 @@ import type {
   VerifyBriefUnverifiedReason,
 } from '../ports/in/VerifyBriefPort.in-port.js';
 import { VERIFY_BRIEF_DEFAULT_MANIFEST_PATH, VERIFY_BRIEF_DEFAULT_PROSE_PATH } from '../ports/in/VerifyBriefPort.in-port.js';
-import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 
 export interface VerifyBriefDependencies {
   readonly workOrderRepo: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'>;
   readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'readBriefFile'>;
-  /** Defaults to the deterministic test digest; composition roots inject SHA-256. */
-  readonly computeDigest?: (content: string) => string;
-  /** Optional independent review; omitted means local verification is authoritative. */
-  readonly reviews?: Pick<ReviewRequestPort, 'requestReview'>;
+  /** Cryptographic digest function (e.g. SHA-256); omitted at runtime fails closed as `unverified`. */
+  readonly computeDigest: (content: string) => string;
+  /** Independent review port; omitted at runtime fails closed as `unverified`. */
+  readonly reviews: Pick<ReviewRequestPort, 'requestReview'>;
 }
 
 const HEX_64 = /^[0-9a-f]{64}$/;
@@ -105,6 +105,8 @@ const RECEIPT_SCHEMA: PlainRecordSchema = {
   requestId: { kind: 'string', maxLength: 512 },
   kind: { kind: 'literal', values: ['brief-verify'] },
   verdict: { kind: 'string', maxLength: 64 },
+  candidateHeadSha: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_SCALAR_CHARS, optional: true },
+  reviewerModel: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_SCALAR_CHARS, optional: true },
 };
 
 /**
@@ -304,6 +306,27 @@ async function loadWorkOrder(
   return { record };
 }
 
+/**
+ * Builds the `AttemptRunnerRecord` shape `AttemptArtifactPort` and
+ * `ExecutorForHost` expect for a worktree host alias (`host` set, `hostName`
+ * null so `ExecutorForHost` resolves the SSH host by alias instead of
+ * falling back to the local executor).
+ */
+function recordedHostRunnerOf(recordedHost: string | undefined): AttemptRunnerRecord | undefined {
+  if (recordedHost === undefined) {
+    return undefined;
+  }
+  return {
+    kind: 'opencode',
+    remotePort: null,
+    host: recordedHost,
+    hostName: null,
+    agent: null,
+    model: null,
+    variant: null,
+  };
+}
+
 export class VerifyBriefUseCase implements VerifyBriefPort {
   // Defaulted so zero-argument structural checks compile; runtime calls
   // validate the dependencies and report `unverified` instead of throwing.
@@ -346,14 +369,15 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
       return unverified('artifact-reader-unavailable', null);
     }
 
+    const recordedHost = recordedHostRunnerOf(request.recordedHost);
     let manifestRaw: unknown;
     let proseRaw: unknown;
     try {
       manifestRaw = await deps.artifactPort.readBriefManifest(
-        request.worktreePath, request.manifestPath, request.recordedHost as never,
+        request.worktreePath, request.manifestPath, recordedHost,
       );
       proseRaw = await deps.artifactPort.readBriefFile(
-        request.worktreePath, request.prosePath, request.recordedHost as never,
+        request.worktreePath, request.prosePath, recordedHost,
       );
     } catch {
       return refuse('unreadable-package', 'artifact-read-thrown');
@@ -377,7 +401,10 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
     manifestRaw: string,
     proseRaw: string,
   ): Promise<VerifyBriefResult> {
-    const computeDigest = this.deps.computeDigest ?? simpleDeterministicHexDigest;
+    const computeDigest = this.deps.computeDigest;
+    if (typeof computeDigest !== 'function') {
+      return unverified('digest-computation-failed', 'missing-digest-function');
+    }
     const encoder = new TextEncoder();
     if (
       encoder.encode(manifestRaw).byteLength > BRIEF_PACKAGE_MAX_MANIFEST_BYTES
@@ -515,14 +542,17 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
 
     const digest12 = pkg.getBriefDigest().slice(0, 12);
     const verificationKey = `brief-verify/${workOrderRecord.id}@${digest12}`;
-    const reviews = this.deps.reviews;
-    if (reviews !== undefined) {
-      const reviewOutcome = await this.requestIndependentReview({
-        reviews, pkg, workOrderRecord, request, digest12,
-      });
-      if (reviewOutcome !== null) {
-        return reviewOutcome;
-      }    }
+    const reviewOutcome = await this.requestIndependentReview({
+      reviews: this.deps.reviews,
+      pkg,
+      workOrderRecord,
+      proseRaw,
+      implementerModel: implementerModels[0]!,
+      digest12,
+    });
+    if (reviewOutcome !== null) {
+      return reviewOutcome;
+    }
 
     return {
       outcome: 'verified',
@@ -533,32 +563,37 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
     };
   }
 
-  /** Runs the optional independent review; null means the receipt passed. */
+  /** Runs the required independent `brief-verify` review; null means the receipt passed. */
   private async requestIndependentReview(context: {
-    readonly reviews: Pick<ReviewRequestPort, 'requestReview'>;
+    readonly reviews: Pick<ReviewRequestPort, 'requestReview'> | undefined;
     readonly pkg: BriefPackage;
     readonly workOrderRecord: WorkOrderRecord;
-    readonly request: Snapshot;
+    readonly proseRaw: string;
+    readonly implementerModel: string;
     readonly digest12: string;
   }): Promise<VerifyBriefResult | null> {
-    const { reviews, pkg, workOrderRecord, request, digest12 } = context;
+    const { reviews, pkg, workOrderRecord, proseRaw, implementerModel, digest12 } = context;
     if (typeof reviews?.requestReview !== 'function') {
       return unverified('review-unverified', 'missing-request-review');
     }
-    const reviewRequest = {
-      requestId: `brief-verify:${workOrderRecord.id}:${digest12}`,
+    const requestId = `brief-verify:${workOrderRecord.id}:${digest12}`;
+    const reviewRequest: ReviewRequest = {
+      requestId,
       kind: 'brief-verify',
+      attemptId: pkg.getAttemptId(),
+      projectId: workOrderRecord.projectId,
+      candidateHeadSha: workOrderRecord.baseCommit,
       subject: {
         kind: 'brief',
         projectId: workOrderRecord.projectId,
         briefPackageDigest: pkg.getBriefDigest(),
         baseCommit: workOrderRecord.baseCommit,
       },
-      worktreePath: request.worktreePath,
-      recordedHost: request.recordedHost,
-      reviewerSeat: pkg.getIndependentReviewer(),
-      authorSeat: null,
-    } as unknown as ReviewRequest;
+      policyRevision: workOrderRecord.policyRevision,
+      implementerModel,
+      reviewerModel: pkg.getIndependentReviewer(),
+      briefText: proseRaw,
+    };
     let reviewResult: unknown;
     try {
       reviewResult = await reviews.requestReview(reviewRequest);
@@ -600,7 +635,9 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
       : null;
     if (
       receipt === null
-      || receipt.requestId !== `brief-verify:${workOrderRecord.id}:${digest12}`
+      || receipt.requestId !== requestId
+      || (receipt.candidateHeadSha !== undefined && receipt.candidateHeadSha !== workOrderRecord.baseCommit)
+      || (receipt.reviewerModel !== undefined && receipt.reviewerModel !== pkg.getIndependentReviewer())
     ) {
       return unverified('review-unverified', 'receipt-mismatch');
     }

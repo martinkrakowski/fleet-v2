@@ -363,8 +363,17 @@ export function decideMergeRetry(
     if (target.state !== 'dropped') {
       return { outcome: 'refused', reason: 'not-dropped' };
     }
+    // Duplicate detection is partitioned by the target's effective base: a
+    // live main entry must not block retrying a dropped chain entry, and a
+    // live chain entry must not block retrying a dropped main entry.
+    const targetBase =
+      target.version === MERGE_QUEUE_ENTRY_V2_VERSION ? target.baseBranch : DEFAULT_BASE_BRANCH;
     const duplicate = entries.find(
-      (entry) => isMergeQueueEntryLive(entry) && sameMergeQueueIdentity(entry, target),
+      (entry) =>
+        isMergeQueueEntryLive(entry) &&
+        (entry.version === MERGE_QUEUE_ENTRY_V2_VERSION ? entry.baseBranch : DEFAULT_BASE_BRANCH) ===
+          targetBase &&
+        sameMergeQueueIdentity(entry, target),
     );
     if (duplicate !== undefined) {
       return { outcome: 'duplicate', entries, record: duplicate };

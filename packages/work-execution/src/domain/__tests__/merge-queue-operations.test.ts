@@ -406,6 +406,85 @@ describe('decideMergeRetry', () => {
     }
   });
 
+  it('retries a dropped chain entry even when a live main entry matches the same head', () => {
+    const dropped = makeEntry({
+      version: MERGE_QUEUE_ENTRY_V2_VERSION,
+      baseBranch: 'chain/example',
+      state: 'dropped',
+      reason: 'operator-dropped',
+    });
+    const liveMain = makeEntry({
+      repository: dropped.repository,
+      pullRequest: dropped.pullRequest,
+      headOid: dropped.headOid,
+      state: 'queued',
+    });
+    const retryEntryId = nextEntryId();
+    const decision = decideMergeRetry([dropped, liveMain], dropped.entryId, {
+      entryId: retryEntryId,
+      enqueuedAtIso: '2026-11-01T12:00:00.000Z',
+    });
+    expect(decision.outcome).toBe('retried');
+    if (decision.outcome === 'retried') {
+      expect(decision.record.entryId).toBe(retryEntryId);
+      expect(decision.record.version).toBe(MERGE_QUEUE_ENTRY_V2_VERSION);
+      expect(decision.record.baseBranch).toBe('chain/example');
+      expect(decision.entries).toHaveLength(3);
+      expectAllValid(decision.entries);
+    }
+  });
+
+  it('still returns duplicate when a live twin shares the dropped chain entry base', () => {
+    const dropped = makeEntry({
+      version: MERGE_QUEUE_ENTRY_V2_VERSION,
+      baseBranch: 'chain/example',
+      state: 'dropped',
+      reason: 'operator-dropped',
+    });
+    const liveTwin = makeEntry({
+      version: MERGE_QUEUE_ENTRY_V2_VERSION,
+      baseBranch: 'chain/example',
+      repository: dropped.repository,
+      pullRequest: dropped.pullRequest,
+      headOid: dropped.headOid,
+      state: 'queued',
+    });
+    const decision = decideMergeRetry([dropped, liveTwin], dropped.entryId, {
+      entryId: nextEntryId(),
+      enqueuedAtIso: '2026-11-01T12:00:00.000Z',
+    });
+    expect(decision.outcome).toBe('duplicate');
+    if (decision.outcome === 'duplicate') {
+      expect(decision.record.entryId).toBe(liveTwin.entryId);
+      expect(decision.entries).toEqual([dropped, liveTwin]);
+    }
+  });
+
+  it('retries a dropped main entry even when a live chain entry matches the same head', () => {
+    const dropped = makeEntry({ state: 'dropped', reason: 'operator-dropped' });
+    const liveChain = makeEntry({
+      version: MERGE_QUEUE_ENTRY_V2_VERSION,
+      baseBranch: 'chain/example',
+      repository: dropped.repository,
+      pullRequest: dropped.pullRequest,
+      headOid: dropped.headOid,
+      state: 'queued',
+    });
+    const retryEntryId = nextEntryId();
+    const decision = decideMergeRetry([dropped, liveChain], dropped.entryId, {
+      entryId: retryEntryId,
+      enqueuedAtIso: '2026-11-01T12:00:00.000Z',
+    });
+    expect(decision.outcome).toBe('retried');
+    if (decision.outcome === 'retried') {
+      expect(decision.record.entryId).toBe(retryEntryId);
+      expect(decision.record.version).toBe(MERGE_QUEUE_ENTRY_VERSION);
+      expect(Object.hasOwn(decision.record, 'baseBranch')).toBe(false);
+      expect(decision.entries).toHaveLength(3);
+      expectAllValid(decision.entries);
+    }
+  });
+
   it('retries a dropped chain entry onto version 2 and the same baseBranch', () => {
     const dropped = makeEntry({
       version: MERGE_QUEUE_ENTRY_V2_VERSION,

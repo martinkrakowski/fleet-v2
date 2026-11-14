@@ -139,34 +139,45 @@ describe('ExportLegacyTrainStateUseCase', () => {
     });
   });
 
-  it('renders main when an entry has an extra base property', async () => {
-    const result = await exportOf([entry(ulid(1), 42, HEAD_A, 'queued', { base: 'chain/example-1' })]);
+  it('exports a chain/<name>-based entry with base chain/<name>, not main', async () => {
+    const result = await exportOf([
+      entry(ulid(1), 42, HEAD_A, 'queued', { base: 'chain/example-1' }),
+      entry(ulid(2), 7, HEAD_B, 'queued', { baseBranch: 'chain/example-2' }),
+      entry(ulid(3), 9, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'parked', { targetRef: 'chain/example-3' }),
+    ]);
 
-    expect(result.outcome).toBe('exported');
+    expect(result).toEqual({
+      outcome: 'exported',
+      queueDocument: `42 ${HEAD_A} chain/example-1\n7 ${HEAD_B} chain/example-2`,
+      parkedDocument: `9 ${'a'.repeat(40)} chain/example-3`,
+    });
     if (result.outcome === 'exported') {
-      expect(result.queueDocument).toBe(`42 ${HEAD_A} main`);
       const parsed = parseLegacyTrainQueue(result.queueDocument);
       expect(parsed.ok).toBe(true);
       if (parsed.ok) {
-        expect(parsed.lines[0].ok).toBe(true);
-        if (parsed.lines[0].ok) {
-          expect(parsed.lines[0].entry.base).toBe('main');
-        }
+        expect(parsed.lines.map((line) => (line.ok ? line.entry.base : null))).toEqual([
+          'chain/example-1',
+          'chain/example-2',
+        ]);
+      }
+      const parkedParsed = parseLegacyTrainQueue(result.parkedDocument);
+      expect(parkedParsed.ok).toBe(true);
+      if (parkedParsed.ok) {
+        expect(parkedParsed.lines.map((line) => (line.ok ? line.entry.base : null))).toEqual([
+          'chain/example-3',
+        ]);
       }
     }
+
+    const badBase = await exportOf([entry(ulid(1), 42, HEAD_A, 'queued', { base: 'chain/Bad' })]);
+    expectRefusal(badBase, { outcome: 'refused', reason: 'unrenderable', entryId: ulid(1) }, ['chain/Bad']);
   });
 
-  it('never inspects a secret-shaped base property', async () => {
-    // The base is never read, not even to scan it for secret shapes: an
-    // otherwise valid entry whose ignored `base` looks secret-shaped still
-    // exports, because the rule is to never inspect that property at all.
-    const result = await exportOf([entry(ulid(1), 42, HEAD_A, 'queued', { base: fakeSecretShape() })]);
+  it('refuses a secret-shaped base property without echoing it', async () => {
+    const secret = fakeSecretShape();
+    const result = await exportOf([entry(ulid(1), 42, HEAD_A, 'queued', { base: secret })]);
 
-    expect(result.outcome).toBe('exported');
-    if (result.outcome === 'exported') {
-      expect(result.queueDocument).toBe(`42 ${HEAD_A} main`);
-      expect(JSON.stringify(result)).not.toContain(fakeSecretShape());
-    }
+    expectRefusal(result, { outcome: 'refused', reason: 'secret-shaped', entryId: ulid(1) }, [secret]);
   });
 
   it('renders an empty list as two empty documents', async () => {

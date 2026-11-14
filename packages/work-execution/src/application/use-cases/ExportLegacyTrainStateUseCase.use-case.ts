@@ -3,6 +3,7 @@
 // written, mutated or logged; the documents travel in the command payload.
 import { containsSecretShape } from '@fleet/shared';
 
+import { DEFAULT_BASE_BRANCH, parseBaseBranch, type BaseBranchValue } from '../../domain/base-branch.js';
 import { parseLegacyTrainQueue } from '../../domain/legacy-train-queue.js';
 import { isMergeHex40, isMergeSafeId, isPlainObject } from '../../domain/merge-queue-records.js';
 import type {
@@ -65,9 +66,36 @@ function isPlainDataRepository(
   );
 }
 
-/** Render one legacy line. The base is always `main`; it is never read from an entry. */
-function renderLegacyLine(pullRequest: number, headOid: string): string {
-  return `${pullRequest} ${headOid} main`;
+const ENTRY_BASE_KEYS = ['baseBranch', 'base', 'baseRef', 'targetRef', 'targetBranch'] as const;
+
+/**
+ * Resolve the entry's recorded base branch (`baseBranch`/`base`/target ref),
+ * falling back to `main` only when the entry genuinely records no base. Any
+ * present non-nullish value that is not a valid base branch (or disagrees with
+ * another present base field) returns `null` so the entry is refused.
+ */
+function resolveEntryBaseBranch(record: Record<string, unknown>): BaseBranchValue | null {
+  let resolved: BaseBranchValue | undefined;
+  for (const key of ENTRY_BASE_KEYS) {
+    const raw = ownValue(record, key);
+    if (raw === undefined || raw === null) {
+      continue;
+    }
+    const parsed = parseBaseBranch(raw);
+    if (parsed === undefined) {
+      return null;
+    }
+    if (resolved !== undefined && resolved !== parsed) {
+      return null;
+    }
+    resolved = parsed;
+  }
+  return resolved ?? DEFAULT_BASE_BRANCH;
+}
+
+/** Render one legacy line with its resolved base branch (`main` when none is recorded). */
+function renderLegacyLine(pullRequest: number, headOid: string, base: BaseBranchValue): string {
+  return `${pullRequest} ${headOid} ${base}`;
 }
 
 /** Export the merge queue's live entries as queue and parked legacy documents. */
@@ -168,12 +196,9 @@ export class ExportLegacyTrainStateUseCase implements ExportLegacyTrainStatePort
 
       // Any own string value that would be inspected or copied is checked
       // before anything is rendered, so a secret never reaches a document.
-      // `base` is exempt: the rule is to never inspect or read it, not even
-      // to scan it, and it is never rendered (the base is always `main`).
       const descriptors = Object.getOwnPropertyDescriptors(rawEntry);
-      for (const [name, value] of Object.entries(descriptors)) {
+      for (const value of Object.values(descriptors)) {
         if (
-          name !== 'base' &&
           'value' in value &&
           typeof value.value === 'string' &&
           containsSecretShape(value.value)
@@ -186,6 +211,7 @@ export class ExportLegacyTrainStateUseCase implements ExportLegacyTrainStatePort
       const headOid = ownValue(rawEntry, 'headOid');
       const state = ownValue(rawEntry, 'state');
       const entryRepository = ownValue(rawEntry, 'repository');
+      const base = resolveEntryBaseBranch(rawEntry);
       if (
         typeof pullRequest !== 'number' ||
         !Number.isSafeInteger(pullRequest) ||
@@ -193,7 +219,8 @@ export class ExportLegacyTrainStateUseCase implements ExportLegacyTrainStatePort
         !isMergeHex40(headOid) ||
         typeof state !== 'string' ||
         !EXPORTABLE_STATES.has(state) ||
-        !isPlainDataRepository(entryRepository, repository)
+        !isPlainDataRepository(entryRepository, repository) ||
+        base === null
       ) {
         return { outcome: 'refused', reason: 'unrenderable', entryId };
       }
@@ -208,7 +235,7 @@ export class ExportLegacyTrainStateUseCase implements ExportLegacyTrainStatePort
       }
       seen.set(identityKey, entryId);
 
-      const line = renderLegacyLine(pullRequest, headOid);
+      const line = renderLegacyLine(pullRequest, headOid, base);
       if (state === 'parked') {
         parkedLines.push(line);
       } else {
@@ -220,7 +247,7 @@ export class ExportLegacyTrainStateUseCase implements ExportLegacyTrainStatePort
     const parkedDocument = parkedLines.join('\n');
 
     // The documents must survive the very parser the rollback import uses,
-    // with `main` read back as the base in the exact list order.
+    // with each entry's base read back in the exact list order.
     for (const document of [queueDocument, parkedDocument]) {
       const parsed = parseLegacyTrainQueue(document);
       if (!parsed.ok) {
@@ -241,11 +268,11 @@ export class ExportLegacyTrainStateUseCase implements ExportLegacyTrainStatePort
         const [pullRequestField, headOid, base] = line.entry
           ? [String(line.entry.pullRequest), line.entry.headOid, line.entry.base]
           : ['', '', ''];
-        const [pr, oid] = rendered[i].split(' ');
+        const [pr, oid, expectedBase] = rendered[i].split(' ');
         if (
           pullRequestField !== pr ||
           headOid !== oid ||
-          base !== 'main'
+          base !== expectedBase
         ) {
           return { outcome: 'refused', reason: 'unrenderable', entryId: null };
         }

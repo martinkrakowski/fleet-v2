@@ -21,6 +21,7 @@ const REQUEST_ID = 'review-01JB0000000000000000000002';
 const POLICY = 'policy-example-1';
 const IMPL = 'example-provider/glm-5.3';
 const API_REVIEWER = 'example-provider/grok-4.7';
+const SECONDARY_API_REVIEWER = 'example-provider/claude-4.9';
 const OPENCODE_REVIEWER = 'example-provider/gpt-6-luna';
 
 function makeReviewRequest(reviewerModel: string) {
@@ -108,6 +109,37 @@ function installationWithoutApiSeat(): FleetInstallation {
   } as FleetInstallation;
 }
 
+function installationWithTwoApiSeats(): FleetInstallation {
+  const installation = installationWithApiSeat();
+  return {
+    ...installation,
+    seats: [
+      { id: 'api-reviewer', tool: 'api', model: API_REVIEWER, roles: ['reviewer'], costClass: 'paid' },
+      {
+        id: 'api-high-risk-reviewer',
+        tool: 'api',
+        model: SECONDARY_API_REVIEWER,
+        roles: ['high-risk-reviewer'],
+        costClass: 'paid',
+      },
+      {
+        id: 'opencode-reviewer',
+        tool: 'opencode',
+        model: OPENCODE_REVIEWER,
+        roles: ['reviewer', 'high-risk-reviewer'],
+        costClass: 'paid',
+      },
+    ],
+    chains: {
+      reviewer: [{ seatId: 'api-reviewer' }, { seatId: 'opencode-reviewer' }],
+      'high-risk-reviewer': [
+        { seatId: 'api-high-risk-reviewer' },
+        { seatId: 'opencode-reviewer' },
+      ],
+    },
+  } as FleetInstallation;
+}
+
 const dirs: string[] = [];
 afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
@@ -179,5 +211,57 @@ describe('conductor review opencode fallback composition (D1C fix round 2)', () 
 
     expect(result).toEqual({ outcome: 'no-receipt', reason: 'review-unavailable', detail: 'seat-busy' });
     expect(calls).toHaveLength(1);
+  });
+
+  it('wires per-model opencode fallback when the reviewer chains contain two distinct api models', async () => {
+    const runtime = compose(installationWithTwoApiSeats());
+    const calls: Array<Record<string, unknown>> = [];
+    vi.spyOn(runtime.evidence.requestIndependentReview, 'requestIndependentReview').mockImplementation(
+      async (request) => {
+        calls.push({ ...request } as Record<string, unknown>);
+        if (request.reviewerModel === OPENCODE_REVIEWER && calls.length < 5) {
+          return makeReceipt(OPENCODE_REVIEWER);
+        }
+        return {
+          outcome: 'rejected',
+          reason: 'review seat busy',
+          rejection: 'review-unavailable',
+          code: 'seat-busy',
+        };
+      },
+    );
+
+    const firstApiResult = await runtime.conductor.reviewRequest.requestReview(
+      makeReviewRequest(API_REVIEWER),
+    );
+    expect(firstApiResult).toMatchObject({ outcome: 'receipt', receipt: { verdict: 'passed' } });
+    if (firstApiResult.outcome === 'receipt') {
+      expect(firstApiResult.receipt.reviewerModel).toBe(OPENCODE_REVIEWER);
+    }
+
+    const secondApiResult = await runtime.conductor.reviewRequest.requestReview(
+      makeReviewRequest(SECONDARY_API_REVIEWER),
+    );
+    expect(secondApiResult).toMatchObject({ outcome: 'receipt', receipt: { verdict: 'passed' } });
+    if (secondApiResult.outcome === 'receipt') {
+      expect(secondApiResult.receipt.reviewerModel).toBe(OPENCODE_REVIEWER);
+    }
+
+    const opencodeDirectResult = await runtime.conductor.reviewRequest.requestReview(
+      makeReviewRequest(OPENCODE_REVIEWER),
+    );
+    expect(opencodeDirectResult).toEqual({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'seat-busy',
+    });
+
+    expect(calls.map((call) => call.reviewerModel)).toEqual([
+      API_REVIEWER,
+      OPENCODE_REVIEWER,
+      SECONDARY_API_REVIEWER,
+      OPENCODE_REVIEWER,
+      OPENCODE_REVIEWER,
+    ]);
   });
 });

@@ -37,15 +37,26 @@ export interface BriefAuthorSessionRequest {
 }
 
 export const BRIEF_AUTHOR_SESSION_UNAVAILABLE = [
-  'seat-command-not-configured', 'session-command-invalid', 'checkout-unavailable',
-  'checkout-not-pinned', 'session-failed', 'session-empty', 'session-output-too-large',
-  'session-timeout', 'session-not-supported',
+  'checkout-unreadable',
+  'checkout-not-pinned',
+  'briefs-dir-invalid',
+  'session-command-missing',
+  'session-command-invalid',
+  'session-failed',
+  'session-empty',
+  'session-oversized',
 ] as const;
-export type BriefAuthorSessionUnavailable = (typeof BRIEF_AUTHOR_SESSION_UNAVAILABLE)[number];
+export type BriefAuthorSessionUnavailableReason = (typeof BRIEF_AUTHOR_SESSION_UNAVAILABLE)[number];
 
 export type BriefAuthorSessionResult =
-  | { readonly outcome: 'answered'; readonly answer: string }
-  | { readonly outcome: 'unavailable'; readonly reason: BriefAuthorSessionUnavailable };
+  | {
+      readonly outcome: 'answered';
+      readonly rawAnswer: string;
+      readonly sessionKey: string;
+      readonly answerPath: string;
+      readonly cached: boolean;
+    }
+  | { readonly outcome: 'unavailable'; readonly reason: BriefAuthorSessionUnavailableReason };
 
 export interface BriefAuthoringPort {
   /** Obtain the reviewed prose brief for one lane. */

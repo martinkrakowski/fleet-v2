@@ -270,6 +270,11 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     briefCheck: review.briefCheck,
     codeReview: review.codeReview,
     preMergeReview: review.preMergeReview,
+    preMergeReviewWired:
+      ctx.deps.sameModelFamily !== undefined &&
+      ctx.deps.reviewRequest !== undefined &&
+      ctx.deps.reviewAssessment !== undefined &&
+      ctx.deps.workOrderRepo !== undefined,
     preMerge: acceptance.preMerge,
     premergePost: laneRunPremergePost(entries, record.runId, head12),
     mergeEnqueue: laneRunMergeEnqueueFact(entries, record.runId, record.round, head12),

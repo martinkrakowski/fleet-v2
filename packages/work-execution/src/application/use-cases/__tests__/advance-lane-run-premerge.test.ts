@@ -570,9 +570,12 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
     };
 
     /** A merging harness whose attempt can run a review: seat plan, frozen brief, review wiring. */
-    async function requestingHarness(answer: (request: ReviewRequest) => ReviewRequestResult) {
+    async function requestingHarness(
+      answer: (request: ReviewRequest) => ReviewRequestResult,
+      seatPlan: typeof REVIEW_PLAN | typeof SEAT_PLAN = REVIEW_PLAN,
+    ) {
       const attempt = attemptFixture({
-        seatPlan: REVIEW_PLAN,
+        seatPlan,
         briefPackagePath: '.lane/brief-package',
         briefDigest: simpleDeterministicHexDigest(PROSE + '\n' + MANIFEST),
       });
@@ -643,6 +646,35 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
         { context: 'premerge', state: 'success', description: 'pre-merge receipt recorded' },
       ]);
       expect(requests).toHaveLength(1);
+    });
+
+    it('a wired Tier 2 run with no review seat parks review-seat-unavailable instead of posting pending forever', async () => {
+      const { harness, requests, run } = await requestingHarness(
+        () => ({ outcome: 'unknown', reason: 'delegate-failed' }),
+        SEAT_PLAN,
+      );
+      expect(await run()).toEqual({ outcome: 'parked', qualifier: null, reason: 'review-seat-unavailable' });
+      expect(requests).toHaveLength(0);
+      expect(harness.forgeRequests).toHaveLength(0);
+    });
+
+    it('a run already holding an unread pending premerge intent is requested ahead of its reconcile', async () => {
+      const { harness, requests, run } = await requestingHarness(() => ({ outcome: 'unknown', reason: 'delegate-failed' }));
+      await appendIntent(harness, premergeKey(), 'forge-example-1', NOW);
+      // The review request goes out (an unknown answer leaves it in flight), ahead of any reconcile of the post.
+      expect(await run()).toMatchObject({ outcome: 'acted', step: 'pre-merge' });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.kind).toBe('pre-merge');
+    });
+
+    it('a halted run with an unread pending premerge intent parks halted and spends no review', async () => {
+      const { harness, requests } = await requestingHarness(() => ({ outcome: 'unknown', reason: 'delegate-failed' }));
+      await appendIntent(harness, premergeKey(), 'forge-example-1', NOW);
+      const halted = await new AdvanceLaneRunUseCase(harness.deps).advanceLaneRun({
+        runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, halted: true, nowIso: LATER,
+      });
+      expect(halted).toMatchObject({ outcome: 'parked', reason: 'halted' });
+      expect(requests).toHaveLength(0);
     });
 
     it('a dropped request is re-requested, never a silent pending post; a failed receipt is never a pass', async () => {

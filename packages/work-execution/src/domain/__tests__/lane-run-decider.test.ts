@@ -1767,7 +1767,7 @@ describe('merging state', () => {
   it('KS7a-2: a Tier 2 merging hold with no post acts premerge before the owner-merge park', () => {
     const facts = baseFacts({
       state: 'merging', head12: HEAD, acceptedHead12: HEAD, attempt: attemptFact(), pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, policyGrant: false },
-      reviewSeat: { ok: false },
+      preMergeReviewWired: false,
     });
     expect(decide(record({}), facts)).toEqual({
       kind: 'act', step: 'premerge', key: `${RUN_ID}/r0/premerge@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
@@ -1790,13 +1790,30 @@ describe('merging state', () => {
       expect(decide(record({}), mergingFacts())).toEqual(requestAct(0, null));
     });
 
-    it('a request in flight waits premerge-pending; a dropped one retries; no seat posts the pending hold', () => {
+    it('a request in flight waits premerge-pending; a dropped one retries', () => {
       expect(decide(record({}), mergingFacts({ preMergeReview: { verdict: 'pending', seatIndex: 0, retries: 0 } })))
         .toEqual({ kind: 'wait', reason: 'premerge-pending' });
       expect(decide(record({}), mergingFacts({ preMergeReview: { verdict: 'no-receipt', seatIndex: 0, retries: 0 } })))
         .toEqual(requestAct(0, 1));
+    });
+
+    it('no free seat parks review-seat-unavailable (below the pass bound it waits); an unwired conductor keeps the pending hold', () => {
       expect(decide(record({}), mergingFacts({ reviewSeat: { ok: false } })))
+        .toEqual({ kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: 'merging' });
+      expect(decide(record({}), mergingFacts({ reviewSeat: { ok: false }, reviewSeatUnavailablePasses: 0 })))
+        .toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+      expect(decide(record({}), mergingFacts({ reviewSeat: { ok: false }, preMergeReviewWired: false })))
         .toMatchObject({ kind: 'act', step: 'premerge' });
+      expect(decide(record({ tier: 1 }), mergingFacts({ reviewSeat: { ok: false } })))
+        .toMatchObject({ kind: 'act', step: 'premerge' });
+    });
+
+    it('an exhausted request path parks: a terminal no-receipt with no other seat, and an unread verdict after its retry', () => {
+      expect(decide(record({}), mergingFacts({
+        preMergeReview: { verdict: 'no-receipt', seatIndex: 0, retries: 1 }, reviewSeat: { ok: false },
+      }))).toEqual({ kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: 'merging' });
+      expect(decide(record({}), mergingFacts({ preMergeReview: { verdict: 'unknown', seatIndex: 0, retries: 1 } })))
+        .toEqual({ kind: 'park', reason: 'ambiguous', qualifier: 'pre-merge', parkedFrom: 'merging' });
     });
 
     it('a journal verdict without a readable receipt is never a pass', () => {
@@ -1815,13 +1832,41 @@ describe('merging state', () => {
       expect(decide(record({ tier: 1 }), mergingFacts())).toMatchObject({ kind: 'act', step: 'premerge' });
     });
 
-    it('an unread pending premerge intent with a free seat requests the review; without one it reconciles', () => {
+    describe('a run already holding an unread pending premerge intent', () => {
       const pendingIntent = { key: `${RUN_ID}/r0/premerge@${HEAD}`, step: 'premerge' as const, reconciliation: 'unread' as const };
-      expect(decide(record({}), mergingFacts({ pendingIntent }))).toEqual(requestAct(0, null));
-      expect(decide(record({}), mergingFacts({ pendingIntent, reviewSeat: { ok: false } })))
-        .toEqual({ kind: 'reconcile', step: 'premerge', key: pendingIntent.key });
-      expect(decide(record({}), mergingFacts({ pendingIntent, preMergeReview: { verdict: 'pending', seatIndex: 0, retries: 0 } })))
-        .toEqual({ kind: 'reconcile', step: 'premerge', key: pendingIntent.key });
+      const withIntent = (extra: Partial<LaneRunFacts> = {}): LaneRunFacts => mergingFacts({ pendingIntent, ...extra });
+      const reconcile: LaneRunDecision = { kind: 'reconcile', step: 'premerge', key: pendingIntent.key };
+
+      it('requests the review through the later guards, and parks when the request path is exhausted', () => {
+        expect(decide(record({}), withIntent())).toEqual(requestAct(0, null));
+        expect(decide(record({}), withIntent({ reviewSeat: { ok: false } })))
+          .toEqual({ kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: 'merging' });
+        expect(decide(record({}), withIntent({ preMergeReview: { verdict: 'unknown', seatIndex: 0, retries: 1 } })))
+          .toEqual({ kind: 'park', reason: 'ambiguous', qualifier: 'pre-merge', parkedFrom: 'merging' });
+      });
+
+      it('reconciles when unwired, when the request is in flight, or when a receipt exists', () => {
+        expect(decide(record({}), withIntent({ preMergeReviewWired: false }))).toEqual(reconcile);
+        expect(decide(record({}), withIntent({ preMergeReview: { verdict: 'pending', seatIndex: 0, retries: 0 } }))).toEqual(reconcile);
+        expect(decide(record({}), withIntent({ preMerge: 'passed' }))).toEqual(reconcile);
+      });
+
+      it('never spends a review ahead of the stop, halt, head-change, merged/closed PR and one-way-door guards', () => {
+        // A stop in flight reconciles as before; it never requests.
+        expect(decide(record({}), withIntent({ stopMode: 'graceful', stopRequestedAtIso: NOW })).kind).not.toBe('act');
+        // A halt parks halted.
+        expect(decide(record({}), withIntent({ halted: true }))).toMatchObject({ kind: 'park', reason: 'halted' });
+        // A moved head re-enters gating.
+        expect(decide(record({}), withIntent({ acceptedHead12: 'f'.repeat(12) }))).toEqual({ kind: 'enter', to: 'gating' });
+        // A merged PR carrying the head ends the run; a closed one parks ambiguous merge.
+        expect(decide(record({}), withIntent({ pr: { state: 'merged', head12: HEAD, containsLaneHead: true } })))
+          .toEqual({ kind: 'enter', to: 'merged' });
+        expect(decide(record({}), withIntent({ pr: { state: 'closed', head12: HEAD, containsLaneHead: true } })))
+          .toMatchObject({ kind: 'park', reason: 'ambiguous', qualifier: 'merge' });
+        // A one-way door parks one-way-door.
+        expect(decide(record({}), withIntent({ merge: { oneWayDoor: true, policyGrant: true } })))
+          .toMatchObject({ kind: 'park', reason: 'one-way-door' });
+      });
     });
   });
 
@@ -1829,7 +1874,7 @@ describe('merging state', () => {
     const facts = baseFacts({
       state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true },
       pendingIntent: { key: `${RUN_ID}/r0/premerge@${HEAD}`, step: 'premerge', reconciliation: 'unread' },
-      reviewSeat: { ok: false },
+      preMergeReviewWired: false,
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'reconcile', step: 'premerge', key: `${RUN_ID}/r0/premerge@${HEAD}`,
@@ -2693,7 +2738,7 @@ describe('G3f (R4c): a merged PR carrying the lane head ends the run from any wa
       acceptedHead12: HEAD,
       pr: mergedOtherHeadNotContaining,
       pendingIntent: premergeIntent,
-      reviewSeat: { ok: false },
+      preMergeReviewWired: false,
     });
     expect(decide(rec, facts)).toEqual({ kind: 'reconcile', step: 'premerge', key: premergeIntent.key });
   });
@@ -2706,7 +2751,7 @@ describe('G3f (R4c): a merged PR carrying the lane head ends the run from any wa
       acceptedHead12: HEAD,
       pr: { state: 'open', head12: HEAD, containsLaneHead: true },
       pendingIntent: premergeIntent,
-      reviewSeat: { ok: false },
+      preMergeReviewWired: false,
     });
     expect(decide(rec, facts)).toEqual({ kind: 'reconcile', step: 'premerge', key: premergeIntent.key });
   });

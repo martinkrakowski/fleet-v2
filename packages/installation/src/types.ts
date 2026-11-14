@@ -443,6 +443,12 @@ export interface MergeRepositoryPolicy {
   readonly maxAttempts?: number;
   readonly checksGraceMinutes?: number;
   readonly veto?: MergeVetoPolicy;
+  /**
+   * CO22: the per-project worktree prepare argv (install and build steps run
+   * as one executable with arguments, never a shell string). Validated on
+   * parse; an argv that fails validation is never passed through.
+   */
+  readonly prepare?: readonly string[];
 }
 
 /** The v2 `policy.merge` section as written; read it through `resolveMergePolicy`. */
@@ -493,6 +499,12 @@ export interface ResolvedMergeRepositoryPolicy {
   readonly maxAttempts: number;
   readonly checksGraceMinutes: number;
   readonly veto: { readonly mode: MergeVetoMode; readonly holdConfidence: number };
+  /**
+   * CO22: present only when the written entry carries a `prepare` argv, so
+   * resolved-entry snapshots and `canonicalMergePolicyJson` digests for
+   * installations that omit `prepare` stay unchanged.
+   */
+  readonly prepare?: readonly string[];
 }
 
 /** The daemon tick settings with every default applied (`resolveMergePolicy`). */
@@ -520,6 +532,39 @@ export type MergePolicyRead =
       readonly daemon: ResolvedMergeDaemonPolicy;
     }
   | { readonly outcome: 'invalid'; readonly reason: string };
+
+/** The refusal codes the merge-policy readers return (ids, never values). */
+export type MergePolicyInvalidReason =
+  | 'policy-merge-invalid'
+  | 'policy-daemon-invalid'
+  | 'policy-too-large'
+  | 'policy-secret-shape'
+  | 'policy-unreadable';
+
+/** Why `readProjectPrepareArgv` refused (CO22). */
+export type ProjectPrepareArgvInvalidReason =
+  | MergePolicyInvalidReason
+  | 'project-id-invalid'
+  | 'project-id-ambiguous';
+
+/**
+ * CO22: the per-project prepare argv read (`readProjectPrepareArgv`). On the
+ * resolved variant, `repositoryKey` is `null` when no repository names the
+ * project, and `argv` is `null` when the matched repository carries no
+ * `prepare`. Never throws; an unvalidated argv is never passed through.
+ */
+export type ProjectPrepareArgvRead =
+  | {
+      readonly outcome: 'resolved';
+      readonly projectId: string;
+      readonly repositoryKey: string | null;
+      readonly argv: readonly string[] | null;
+      readonly policyRevision: string;
+    }
+  | {
+      readonly outcome: 'invalid';
+      readonly reason: ProjectPrepareArgvInvalidReason;
+    };
 
 /**
  * The v2 `policy` section: shape only. The rules are enforced by the loader

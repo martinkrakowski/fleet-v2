@@ -408,6 +408,7 @@ export const MERGE_REPO_KEYS: readonly string[] = freezeKeys<MergeRepositoryPoli
   'maxAttempts',
   'checksGraceMinutes',
   'veto',
+  'prepare',
 ]);
 
 export const MERGE_VETO_KEYS: readonly string[] = freezeKeys<MergeVetoPolicy>()([

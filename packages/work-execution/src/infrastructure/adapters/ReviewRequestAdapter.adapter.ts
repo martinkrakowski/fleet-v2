@@ -20,7 +20,7 @@ import {
   REVIEW_UNKNOWN_REASONS,
   type RecordFindingDispositionPort,
   type RequestIndependentReviewPort,
-  type RequestIndependentReviewResult,
+  type RequestIndependentReviewRequest,
   type ReviewKind,
   type ReviewReceiptRecord,
   type ReviewRejection,
@@ -49,6 +49,19 @@ import type {
 import { parseChainName } from '../../domain/chain-records.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
 import { screenTransportText } from '../../domain/review-transport-screen.js';
+
+/**
+ * D1C: the API-transport unavailable codes of an `review-unavailable`
+ * rejection that justify one bounded re-request against the configured
+ * opencode fallback reviewer seat. Every other unavailable or refusal code
+ * is surfaced unchanged.
+ */
+const API_TRANSPORT_UNAVAILABLE_CODES: ReadonlySet<string> = new Set([
+  'transport',
+  'transport-failed',
+  'seat-busy',
+  'timeout',
+]);
 
 /** The only codes that may reach a run-journal `detail`: the evidence context's unavailable codes plus the two post-run rejections. */
 const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([...REVIEW_UNAVAILABLE_CODES, 'not-read-only', 'invalid-receipt']);
@@ -171,6 +184,11 @@ function isChainReceiptOf(receipt: ReviewReceiptRecord, chain: ChainSubject): bo
   const stored = receiptSubjectOf(receipt);
   return (
     receipt.kind === 'pre-merge' &&
+    // Fix round 2: the receipt's attempt id must be the chain's derived one —
+    // the id the review request itself carried — so a fallback receipt with
+    // the right chain subject and a mismatched attempt id is a mismatch,
+    // never the chain's review.
+    receipt.attemptId === attemptIdForChain(chain.projectId, chain.chainName) &&
     receipt.candidateHeadSha === chain.integrationHeadSha &&
     stored !== null &&
     stored.kind === 'chain' &&
@@ -194,6 +212,24 @@ export interface ReviewRequestDelegates {
    * typed outcome is returned unchanged; an archive failure is swallowed.
    */
   readonly archiveEvidence?: EvidenceArchivePort['archiveEvidence'];
+  /**
+   * D1C: the model of the optional opencode fallback reviewer seat. When set
+   * (a non-blank string distinct from the request's primary reviewer model),
+   * a review rejected as `review-unavailable` with an API-transport code is
+   * re-requested once against this seat; absent or equal to the primary
+   * model, no fallback runs.
+   */
+  readonly opencodeFallbackReviewerModel?: string;
+  /**
+   * D1C fix round 1: the model of the primary reviewer seat served by the
+   * `api` transport. The unavailable codes that trigger the fallback
+   * (`transport`, `transport-failed`, `seat-busy`, `timeout`) are generic —
+   * the opencode transport emits the same ones — so the retry must verify
+   * the rejected request actually went through the api route: it runs only
+   * when the request's primary reviewer model matches this one. Absent or
+   * mismatched, no fallback runs.
+   */
+  readonly primaryApiReviewerModel?: string;
 }
 
 function isNonEmptyTrimmed(value: unknown): boolean {
@@ -487,6 +523,117 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     }
   }
 
+  /**
+   * D1C: the opencode fallback reviewer seat's model, read from the delegates
+   * through own data properties (a getter never runs). Null when it is absent,
+   * a non-string, blank, or equal after trimming to the primary reviewer
+   * model: no fallback seat, no fallback.
+   */
+  private opencodeFallbackReviewerModel(primaryReviewerModel: string): string | null {
+    const value = ownValue(this.delegates, 'opencodeFallbackReviewerModel');
+    if (typeof value !== 'string') {
+      return null;
+    }
+    const trimmed = value.trim();
+    return trimmed === '' || trimmed === primaryReviewerModel.trim() ? null : trimmed;
+  }
+
+  /**
+   * D1C fix round 1: whether the rejected request's primary reviewer model is
+   * the configured api seat's model — the only route the fallback may follow
+   * up, because the triggering codes are shared with the opencode transport.
+   * Read through own data properties (a getter never runs); false when absent,
+   * a non-string, blank, or not equal after trimming to the request's model.
+   */
+  private primaryRouteIsApi(primaryReviewerModel: string): boolean {
+    const value = ownValue(this.delegates, 'primaryApiReviewerModel');
+    return typeof value === 'string' && value.trim() !== '' && value.trim() === primaryReviewerModel.trim();
+  }
+
+  /**
+   * D1C: one bounded dispatch of an independent review, shared by the attempt
+   * and the chain paths. A throwing delegate is `unknown`/`delegate-failed`.
+   * The delegate's answer is validated through own properties: a null,
+   * non-object, unknown-outcome, throwing-getter or reviewed-without-receipt
+   * answer is an unavailable review, never an exception and never a retry. A
+   * rejected diagnostic is archived as in RV4. Then — at most once, only when
+   * the rejection is `review-unavailable` with an API-transport code and a
+   * distinct opencode fallback seat is configured and the request's primary
+   * reviewer model is the configured api seat's model (the triggering codes
+   * are shared with the opencode transport) — the same review is re-requested
+   * against the fallback reviewer model; its answer is mapped and returned
+   * without any further retry.
+   */
+  private async dispatchReview(
+    reviewInput: RequestIndependentReviewRequest,
+    context: { readonly requestId: string; readonly candidateHeadSha: string },
+    validateReceipt: (receipt: ReviewReceiptRecord) => boolean,
+    kind: ReviewKind,
+    retried: boolean,
+  ): Promise<ReviewRequestResult> {
+    let result: unknown;
+    try {
+      const requestIndependentReview = this.delegates.requestIndependentReview;
+      if (requestIndependentReview === undefined) {
+        return { outcome: 'refused', reason: 'not-configured', detail: null };
+      }
+      result = await requestIndependentReview(reviewInput);
+    } catch {
+      return { outcome: 'unknown', reason: 'delegate-failed' };
+    }
+    if (!isPlainObject(result)) {
+      return { outcome: 'no-receipt', reason: 'review-unavailable', detail: null };
+    }
+    const outcome = ownValue(result, 'outcome');
+    if (outcome === 'reviewed') {
+      const read = ownProperty(result, 'receipt');
+      const receipt = read !== undefined && typeof read === 'object' ? read.value : undefined;
+      if (!isPlainObject(receipt)) {
+        return { outcome: 'no-receipt', reason: 'review-unavailable', detail: null };
+      }
+      if (!validateReceipt(receipt as ReviewReceiptRecord)) {
+        return { outcome: 'unknown', reason: 'receipt-mismatch' };
+      }
+      const summary = summaryOf(receipt as ReviewReceiptRecord, kind, context.requestId);
+      return summary === null
+        ? { outcome: 'unknown', reason: 'receipt-mismatch' }
+        : { outcome: 'receipt', receipt: summary };
+    }
+    if (outcome !== 'rejected') {
+      return { outcome: 'no-receipt', reason: 'review-unavailable', detail: null };
+    }
+    // Every field is a data-property read; a hostile answer never throws here.
+    const rejection = ownValue(result, 'rejection');
+    const code = ownValue(result, 'code');
+    const diagnostic = ownValue(result, 'diagnostic');
+    if (code !== undefined && diagnostic !== undefined) {
+      await this.archiveTransportDiagnostic(
+        context.requestId,
+        context.candidateHeadSha,
+        diagnostic as ReviewTransportDiagnostic,
+      );
+    }
+    if (
+      !retried &&
+      rejection === 'review-unavailable' &&
+      typeof code === 'string' &&
+      API_TRANSPORT_UNAVAILABLE_CODES.has(code) &&
+      this.primaryRouteIsApi(reviewInput.reviewerModel)
+    ) {
+      const fallbackModel = this.opencodeFallbackReviewerModel(reviewInput.reviewerModel);
+      if (fallbackModel !== null) {
+        return await this.dispatchReview(
+          { ...reviewInput, reviewerModel: fallbackModel },
+          context,
+          validateReceipt,
+          kind,
+          true,
+        );
+      }
+    }
+    return mapRejection(rejection as ReviewRejection | undefined, code as ReviewUnavailableCode | undefined);
+  }
+
   /** The attempt's assessment through the inspection delegate: the one read both receipt lookups share. */
   private async readAssessmentOf(attemptId: string): Promise<AssessmentRead> {
     if (!this.delegates.inspectAcceptanceEvidence) {
@@ -538,9 +685,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (!this.delegates.requestIndependentReview) {
       return { outcome: 'refused', reason: 'not-configured', detail: null };
     }
-    let result: RequestIndependentReviewResult;
-    try {
-      result = await this.delegates.requestIndependentReview({
+    return this.dispatchReview(
+      {
         assessmentId: assessmentIdForChain(chain.projectId, chain.chainName),
         projectId: chain.projectId,
         attemptId: attemptIdForChain(chain.projectId, chain.chainName),
@@ -553,24 +699,12 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         subject: evidenceChainSubject(chain),
         ...(diffSummary !== undefined ? { diffSummary } : {}),
         ...(nowIso !== undefined ? { nowIso } : {}),
-      });
-    } catch {
-      return { outcome: 'unknown', reason: 'delegate-failed' };
-    }
-    if (result.outcome === 'reviewed') {
-      const receipt = result.receipt;
-      if (receipt.requestId !== requestId || !isChainReceiptOf(receipt, chain)) {
-        return { outcome: 'unknown', reason: 'receipt-mismatch' };
-      }
-      const summary = summaryOf(receipt, 'pre-merge', requestId);
-      return summary === null
-        ? { outcome: 'unknown', reason: 'receipt-mismatch' }
-        : { outcome: 'receipt', receipt: summary };
-    }
-    if (result.outcome === 'rejected' && result.code !== undefined && result.diagnostic !== undefined) {
-      await this.archiveTransportDiagnostic(requestId, chain.integrationHeadSha, result.diagnostic);
-    }
-    return mapRejection(result.rejection, result.code);
+      },
+      { requestId, candidateHeadSha: chain.integrationHeadSha },
+      (receipt) => receipt.requestId === requestId && isChainReceiptOf(receipt, chain),
+      'pre-merge',
+      false,
+    );
   }
 
   async requestReview(request: ReviewRequest): Promise<ReviewRequestResult> {
@@ -601,9 +735,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     }
     // isValidReviewRequest accepted the kind, so it is one of the three stored review kinds here.
     const kind = request.kind as ReviewKind;
-    let result: RequestIndependentReviewResult;
-    try {
-      result = await this.delegates.requestIndependentReview({
+    return this.dispatchReview(
+      {
         assessmentId: assessmentIdForAttempt(request.attemptId),
         projectId: request.projectId,
         attemptId: request.attemptId,
@@ -617,29 +750,16 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         // kind's transport call carries exactly the fields it carried before.
         ...(kind === 'brief-check' && briefText !== undefined ? { briefText: briefText as string } : {}),
         ...(nowIso !== undefined ? { nowIso } : {}),
-      });
-    } catch {
-      return { outcome: 'unknown', reason: 'delegate-failed' };
-    }
-    if (result.outcome === 'reviewed') {
-      const receipt = result.receipt;
-      if (
-        receipt.requestId !== request.requestId ||
-        receipt.kind !== kind ||
-        receipt.attemptId !== request.attemptId ||
-        receipt.candidateHeadSha !== request.candidateHeadSha
-      ) {
-        return { outcome: 'unknown', reason: 'receipt-mismatch' };
-      }
-      const summary = summaryOf(receipt, kind, request.requestId);
-      return summary === null
-        ? { outcome: 'unknown', reason: 'receipt-mismatch' }
-        : { outcome: 'receipt', receipt: summary };
-    }
-    if (result.outcome === 'rejected' && result.code !== undefined && result.diagnostic !== undefined) {
-      await this.archiveTransportDiagnostic(request.requestId, request.candidateHeadSha, result.diagnostic);
-    }
-    return mapRejection(result.rejection, result.code);
+      },
+      { requestId: request.requestId, candidateHeadSha: request.candidateHeadSha },
+      (receipt) =>
+        receipt.requestId === request.requestId &&
+        receipt.kind === kind &&
+        receipt.attemptId === request.attemptId &&
+        receipt.candidateHeadSha === request.candidateHeadSha,
+      kind,
+      false,
+    );
   }
 
   async findReviewReceipt(request: FindReviewReceiptRequest): Promise<FindReviewReceiptResult> {

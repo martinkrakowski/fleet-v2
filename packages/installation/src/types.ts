@@ -63,11 +63,15 @@ export interface ForgeSection {
   readonly repo: string;
 }
 
+/** The review tools the review transport router dispatches (D1A). */
+export type ReviewerTool = 'opencode' | 'api' | 'grok' | 'agy';
+
 /** The `reviewer` section. */
 export interface ReviewerSection {
   readonly agent: string;
   readonly model: string;
   readonly variant?: string;
+  readonly tool?: ReviewerTool;
 }
 
 /** The `waves` section. */

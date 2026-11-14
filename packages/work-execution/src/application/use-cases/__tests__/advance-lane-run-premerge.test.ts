@@ -15,7 +15,7 @@ import { describe, expect, it } from 'vitest';
 import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
-import { laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type { AcceptanceReceiptsResult } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
@@ -530,6 +530,30 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
     // One intent only; the terminal post never appends a second intent.
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === premergeKey());
     expect(intents).toHaveLength(1);
+  });
+
+  it('PMR1: a passed pre-merge review receipt at the head releases the hold; the review intent and the status post are two different keys', async () => {
+    const harness = await mergingHarness();
+    // The conductor's own pre-merge review request for this head, already journalled.
+    const reviewKey = buildLaneRunStepKey({
+      runId: RUN_ID, round: 0, step: 'pre-merge', seatIndex: 0, attemptOrdinal: null, head12: HEAD12, retry: null,
+    });
+    expect(reviewKey.ok).toBe(true);
+    if (!reviewKey.ok) {
+      throw new Error('fixture must build a pre-merge key');
+    }
+    expect(reviewKey.key).not.toBe(premergeKey());
+    await appendIntent(harness, reviewKey.key, 'review-example-1', NOW);
+    await appendResult(harness, reviewKey.key, 'completed', 'review-passed', NOW);
+    harness.setReceiptAnswer(passedReceipt());
+    const posted = await advance(harness);
+    expect(posted).toMatchObject({ outcome: 'acted', step: 'premerge', key: premergeKey(), reasonCode: 'premerge-success' });
+    expect(harness.forgeRequests.map((request) => request.status)).toEqual([
+      { context: 'premerge', state: 'success', description: 'pre-merge receipt recorded' },
+    ]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === premergeKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === reviewKey.key)).toHaveLength(1);
   });
 
   it('test 3: a failed receipt with two findings posts failure with findings: 2 and never copies summary text', async () => {

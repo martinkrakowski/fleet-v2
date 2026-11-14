@@ -29,7 +29,7 @@ import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-fact
 import type { AbortWorktreeRunResult, WorktreeRunState } from '../../../application/ports/out/ExecutionRunnerPort.out-port.js';
 import type { RunnerForAttemptResult } from '../../../application/ports/out/RunnerForAttemptPort.out-port.js';
 import { partitionFindingsByScope } from '../../../domain/review-finding-scope.js';
-import { historyEntryOf, selectReviewSeat } from '../../../domain/seat-selection.js';
+import { historyEntryOf, implementerModelsOf as strictImplementerModelsOf, selectPreMergeSeat, selectReviewSeat } from '../../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { AcceptanceSpec } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
@@ -41,13 +41,14 @@ import { lastDispatchLeftDirtyWorktree } from './dirty-handover.js';
 import { nonPassingGatePredicatesOf } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
-type ReviewKind = 'brief-check' | 'code-review';
+type ReviewKind = 'brief-check' | 'code-review' | 'pre-merge';
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
 
 export interface ReviewFacts {
   readonly reviewSeat: LaneRunSeatFact;
   readonly briefCheck: LaneRunReviewFact;
   readonly codeReview: LaneRunReviewFact;
+  readonly preMergeReview: LaneRunReviewFact;
 }
 
 /** The latest non-null attempt's seat plan; null without one or when it does not parse. */
@@ -113,6 +114,9 @@ function reviewSeatOf(
   if (plan === null) {
     return { ok: false };
   }
+  if (kind === 'pre-merge') {
+    return preMergeSeatOf(ctx, record, entries, attemptRecords, plan);
+  }
   const pinned = pinnedReviewSeatIndex(entries, record.runId, kind);
   if (pinned !== null) {
     return pinned < plan.getSeats('review').length ? { ok: true, seatIndex: pinned } : { ok: false };
@@ -131,6 +135,50 @@ function reviewSeatOf(
 }
 
 /**
+ * PMR1: the independent pre-merge reviewer. It fails closed where the other
+ * kinds do not: an attempt with no known implementer model, or an unbound
+ * family comparison, reads `{ ok: false }`, because a same-family reviewer
+ * must never be drawn on a guess. No `high-risk-reviewer` chain is wired, so
+ * the `review` seats are passed to `selectPreMergeSeat` explicitly, which
+ * also excludes fallback (`on`) seats. A seat pinned by a recorded pre-merge
+ * failure (D10) is re-checked against EVERY implementer attempt, because a
+ * fix round after that failure may have added a same-family implementer; a
+ * conflict, an out-of-range pin or an unknown model reads `{ ok: false }`,
+ * never the stale pin.
+ */
+function preMergeSeatOf(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  entries: readonly LaneRunJournalEntryRecord[],
+  attemptRecords: readonly (AttemptRecord | null)[],
+  plan: SeatPlan,
+): LaneRunSeatFact {
+  const sameFamily = ctx.deps.sameModelFamily;
+  if (sameFamily === undefined) {
+    return { ok: false };
+  }
+  const attempts: AttemptRecord[] = [];
+  for (const attempt of attemptRecords) {
+    if (attempt === null || historyEntryOf(attempt).model === null) {
+      return { ok: false };
+    }
+    attempts.push(attempt);
+  }
+  const seats = plan.getSeats('review');
+  const pinned = pinnedReviewSeatIndex(entries, record.runId, 'pre-merge');
+  if (pinned !== null) {
+    const seat = seats[pinned];
+    const models = strictImplementerModelsOf(attempts);
+    if (seat === undefined || !models.ok || models.models.some((model) => sameFamily(seat.model, model))) {
+      return { ok: false };
+    }
+    return { ok: true, seatIndex: pinned };
+  }
+  const selected = selectPreMergeSeat({ seats, attempts, sameFamily });
+  return selected.ok ? { ok: true, seatIndex: selected.seatIndex } : { ok: false };
+}
+
+/**
  * The review facts of one advance (K5, plan §3.4): the per-kind journal facts
  * (`briefCheck`, `codeReview`) plus the review seat for the kind due. Pure
  * except `ctx.deps.sameModelFamily`; nothing throws.
@@ -145,11 +193,14 @@ export function reviewFactsOf(
 ): ReviewFacts {
   const briefCheck = laneRunReviewFact(entries, record.runId, 'brief-check', head12);
   const codeReview = laneRunReviewFact(entries, record.runId, 'code-review', head12);
+  const preMergeReview = laneRunReviewFact(entries, record.runId, 'pre-merge', head12);
   const reviewSeat: LaneRunSeatFact =
     state === 'brief-check' || state === 'code-review'
       ? reviewSeatOf(ctx, record, state, entries, attemptRecords)
-      : { ok: false };
-  return { reviewSeat, briefCheck, codeReview };
+      : state === 'awaiting-premerge'
+        ? reviewSeatOf(ctx, record, 'pre-merge', entries, attemptRecords)
+        : { ok: false };
+  return { reviewSeat, briefCheck, codeReview, preMergeReview };
 }
 
 /** `acceptanceChecks` of a frozen manifest: a non-empty array of non-empty strings, else null. */

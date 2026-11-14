@@ -94,6 +94,24 @@ describe('deriveInstallationModel reviewer.tool', () => {
     expect(outcome.model.chains?.reviewer).toBeUndefined();
   });
 
+  it('refuses invalid reviewer.tool even when reviewer.model is undefined', () => {
+    for (const tool of ['unknown', null, 123]) {
+      const outcome = deriveInstallationModel(v1WithReviewer({ agent: 'reviewer', tool }));
+      expect(outcome.errors).toEqual(['reviewer.tool: must be a known review tool']);
+      expect(outcome.model.seats?.some((entry) => entry.id === 'reviewer')).toBe(false);
+    }
+    const accessor: Record<string, unknown> = { agent: 'reviewer' };
+    Object.defineProperty(accessor, 'tool', {
+      get() {
+        throw new Error('getter must never run');
+      },
+      enumerable: true,
+    });
+    const accessorOutcome = deriveInstallationModel(v1WithReviewer(accessor));
+    expect(accessorOutcome.errors).toEqual(['reviewer.tool: must be a plain data property']);
+    expect(accessorOutcome.model.seats?.some((entry) => entry.id === 'reviewer')).toBe(false);
+  });
+
   it('still reports the shelf warning alongside a derivation error', () => {
     const outcome = deriveInstallationModel({
       ...v1WithReviewer({ agent: 'reviewer', model: 'review-model', tool: 'nope' }),

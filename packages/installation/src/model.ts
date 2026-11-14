@@ -334,7 +334,7 @@ function deriveReviewerSeat(
   reviewer: FleetInstallation['reviewer'],
   errors: string[],
 ): SeatModel | undefined {
-  if (reviewer?.model === undefined) {
+  if (reviewer === undefined) {
     return undefined;
   }
   const descriptor = Object.getOwnPropertyDescriptor(reviewer, 'tool');
@@ -349,6 +349,9 @@ function deriveReviewerSeat(
       !REVIEWER_TOOLS.includes(descriptor.value as ReviewerTool))
   ) {
     errors.push('reviewer.tool: must be a known review tool');
+    return undefined;
+  }
+  if (reviewer.model === undefined) {
     return undefined;
   }
   const tool: ReviewerTool =

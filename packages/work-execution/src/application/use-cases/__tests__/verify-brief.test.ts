@@ -667,4 +667,58 @@ describe('VerifyBriefUseCase', () => {
       outcome: 'unverified', reason: 'review-unverified', detail: 'review-incomplete',
     });
   });
+
+  it('survives traps on the reason read, hasOwn, and getOwnPropertyDescriptor paths with review-unverified', async () => {
+    const base = fixture();
+    // A throwing getter on `reason` used to be read directly for the detail.
+    const trappingReason = new Proxy({
+      outcome: 'refused',
+    }, {
+      get(_target, property) {
+        if (property === 'reason') {
+          throw new Error('trap');
+        }
+        return undefined;
+      },
+    });
+    const reasonResult = await new VerifyBriefUseCase(depsWith({
+      reviews: () => Promise.resolve(trappingReason as unknown as ReviewRequestResult),
+    })).verifyBrief(base.request);
+    expect(reasonResult).toEqual({
+      outcome: 'unverified', reason: 'review-unverified', detail: 'review-incomplete',
+    });
+
+    // A throwing `ownKeys`/`getOwnPropertyDescriptor` trap used to be reached
+    // through `Object.hasOwn` and `getOwnPropertyDescriptor` on `receipt`;
+    // the trap fires only on `receipt` so the outcome snapshot succeeds and
+    // the receipt path itself is what is exercised.
+    const trappingReceipt = new Proxy({
+      outcome: 'receipt',
+      receipt: receiptFor(base.briefDigest, 'passed'),
+    }, {
+      ownKeys() {
+        throw new Error('trap');
+      },
+      getOwnPropertyDescriptor(target, property) {
+        if (property === 'receipt') {
+          throw new Error('trap');
+        }
+        return Object.getOwnPropertyDescriptor(target, property);
+      },
+    });
+    const receiptResult = await new VerifyBriefUseCase(depsWith({
+      reviews: () => Promise.resolve(trappingReceipt as unknown as ReviewRequestResult),
+    })).verifyBrief(base.request);
+    expect(receiptResult).toEqual({
+      outcome: 'unverified', reason: 'review-unverified', detail: 'receipt-mismatch',
+    });
+
+    // The same traps must not mask a genuinely passed receipt on a plain result.
+    const passing = await new VerifyBriefUseCase(depsWith({
+      reviews: () => Promise.resolve({
+        outcome: 'receipt', receipt: receiptFor(base.briefDigest, 'passed'),
+      } as unknown as ReviewRequestResult),
+    })).verifyBrief(base.request);
+    expect(passing.outcome).toBe('verified');
+  });
 });

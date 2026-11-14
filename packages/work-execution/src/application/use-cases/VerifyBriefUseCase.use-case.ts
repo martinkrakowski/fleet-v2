@@ -107,6 +107,21 @@ const RECEIPT_SCHEMA: PlainRecordSchema = {
   verdict: { kind: 'string', maxLength: 64 },
 };
 
+/**
+ * The untrusted review result is read only through `readPlainRecord`, never
+ * through direct property access, `Object.hasOwn` or
+ * `Object.getOwnPropertyDescriptor`: each of those runs a proxy trap that can
+ * throw out of `verifyBrief`, so every read goes through the snapshotting
+ * reader, which turns a hostile trap into a typed refusal.
+ */
+const REVIEW_REASON_SCHEMA: PlainRecordSchema = {
+  reason: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_SCALAR_CHARS, optional: true },
+};
+
+const REVIEW_RECEIPT_SCHEMA: PlainRecordSchema = {
+  receipt: { kind: 'record', schema: RECEIPT_SCHEMA },
+};
+
 const UNVERIFIED_WORK_ORDER_UNREADABLE: VerifyBriefResult = {
   outcome: 'unverified',
   reason: 'work-order-unreadable',
@@ -550,10 +565,14 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
     } catch {
       return unverified('review-unverified', 'review-thrown');
     }
-    const detailForIncomplete = (): string =>
-      typeof (reviewResult as { reason?: unknown } | null | undefined)?.reason === 'string'
-        ? (reviewResult as { reason: string }).reason
+    // The `reason` detail is snapshotted like everything else: reading it
+    // directly would run a proxy trap that can throw out of `verifyBrief`.
+    const detailForIncomplete = (): string => {
+      const reasonRead = readPlainRecord(reviewResult, REVIEW_REASON_SCHEMA);
+      return reasonRead.ok && typeof reasonRead.value.reason === 'string'
+        ? reasonRead.value.reason
         : 'review-incomplete';
+    };
     // The result must be a plain record: `in` and property access accept
     // inherited outcomes and hostile proxy traps can throw out of
     // `verifyBrief`, so the snapshot below refuses both.
@@ -571,19 +590,21 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
     if (outcome !== 'receipt') {
       return unverified('review-unverified', detailForIncomplete());
     }
+    // The receipt is snapshotted as a nested record: `Object.hasOwn` and
+    // `getOwnPropertyDescriptor` on the untrusted result run proxy traps that
+    // can throw out of `verifyBrief`, and `in`/property access accept
+    // inherited receipts.
+    const receiptRead = readPlainRecord(reviewResult, REVIEW_RECEIPT_SCHEMA);
+    const receipt = receiptRead.ok
+      ? (receiptRead.value.receipt as Record<string, unknown>)
+      : null;
     if (
-      typeof reviewResult !== 'object'
-      || reviewResult === null
-      || !Object.hasOwn(reviewResult, 'receipt')
+      receipt === null
+      || receipt.requestId !== `brief-verify:${workOrderRecord.id}:${digest12}`
     ) {
       return unverified('review-unverified', 'receipt-mismatch');
     }
-    const receiptRaw = Object.getOwnPropertyDescriptor(reviewResult, 'receipt')?.value;
-    const receiptRead = readPlainRecord(receiptRaw, RECEIPT_SCHEMA);
-    if (!receiptRead.ok || receiptRead.value.requestId !== `brief-verify:${workOrderRecord.id}:${digest12}`) {
-      return unverified('review-unverified', 'receipt-mismatch');
-    }
-    const verdict = receiptRead.value.verdict;
+    const verdict = receipt.verdict;
     if (verdict === 'failed') {
       return refuse('review-failed', null);
     }

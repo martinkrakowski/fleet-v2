@@ -8,6 +8,7 @@ import {
 import type { MergeEnqueueInput } from '../merge-queue-operations.js';
 import {
   MERGE_QUEUE_ENTRY_VERSION,
+  MERGE_QUEUE_ENTRY_V2_VERSION,
   readMergeQueueEntryRecord,
 } from '../merge-queue-records.js';
 import type { MergeQueueEntryRecord } from '../merge-queue-records.js';
@@ -15,6 +16,11 @@ import type { MergeQueueEntryRecord } from '../merge-queue-records.js';
 const HEAD_A = '0123456789abcdef0123456789abcdef01234567';
 const HEAD_B = '0123456789abcdef0123456789abcdef01234568';
 const DIGEST = '0123456789ab';
+
+/** A secret-shaped fake assembled from inert pieces (never a literal in this file). */
+function fakeSecret(): string {
+  return `sk-${'a'.repeat(20)}`;
+}
 
 let entryIdCounter = 0;
 function nextEntryId(): string {
@@ -123,6 +129,89 @@ describe('decideMergeEnqueue', () => {
       expect(decision.entries).toEqual([decision.record]);
       expectAllValid(decision.entries);
     }
+  });
+
+  it('creates a version 1 entry with no baseBranch when the input omits it', () => {
+    const decision = decideMergeEnqueue([], input());
+    expect(decision.outcome).toBe('created');
+    if (decision.outcome === 'created') {
+      expect(decision.record.version).toBe(MERGE_QUEUE_ENTRY_VERSION);
+      expect(Object.hasOwn(decision.record, 'baseBranch')).toBe(false);
+    }
+  });
+
+  it('creates a version 2 entry on chain/example when that base is supplied', () => {
+    const decision = decideMergeEnqueue([], input({ baseBranch: 'chain/example' }));
+    expect(decision.outcome).toBe('created');
+    if (decision.outcome === 'created') {
+      expect(decision.record.version).toBe(MERGE_QUEUE_ENTRY_V2_VERSION);
+      expect(decision.record.baseBranch).toBe('chain/example');
+      expectAllValid(decision.entries);
+    }
+  });
+
+  it('refuses a malformed baseBranch with invalid-base and does not create', () => {
+    for (const baseBranch of ['Main', null]) {
+      const decision = decideMergeEnqueue([], input({ baseBranch }));
+      expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-base' });
+    }
+  });
+
+  it('refuses a secret-shaped baseBranch with invalid-base and does not echo it', () => {
+    const secret = fakeSecret();
+    const decision = decideMergeEnqueue([], input({ baseBranch: secret }));
+    expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-base' });
+  });
+
+  it('does not take a prototype baseBranch as supplied', () => {
+    const protoInput = Object.assign(Object.create({ baseBranch: 'chain/example' }), input());
+    const decision = decideMergeEnqueue([], protoInput as MergeEnqueueInput);
+    expect(decision.outcome).toBe('created');
+    if (decision.outcome === 'created') {
+      expect(decision.record.version).toBe(MERGE_QUEUE_ENTRY_VERSION);
+      expect(Object.hasOwn(decision.record, 'baseBranch')).toBe(false);
+    }
+  });
+
+  it('does not treat a live main entry as the duplicate of the same head enqueued on chain/example', () => {
+    const mainEntry = makeEntry();
+    const decision = decideMergeEnqueue([mainEntry], input({ baseBranch: 'chain/example' }));
+    expect(decision.outcome).toBe('created');
+  });
+
+  it('does not supersede a main entry when the new head is enqueued on chain/example', () => {
+    const mainEntry = makeEntry();
+    const decision = decideMergeEnqueue([mainEntry], input({ headOid: HEAD_B, baseBranch: 'chain/example' }));
+    expect(decision.outcome).toBe('created');
+  });
+
+  it('supersedes an earlier head on the same chain base', () => {
+    const first = decideMergeEnqueue([], input({ baseBranch: 'chain/example' }));
+    expect(first.outcome).toBe('created');
+    if (first.outcome !== 'created') {
+      return;
+    }
+    const second = decideMergeEnqueue(
+      first.entries,
+      input({ headOid: HEAD_B, successorEntryId: nextEntryId(), baseBranch: 'chain/example' }),
+    );
+    expect(second.outcome).toBe('supersedes');
+    if (second.outcome === 'supersedes') {
+      expect(second.record.version).toBe(MERGE_QUEUE_ENTRY_V2_VERSION);
+      expect(second.record.baseBranch).toBe('chain/example');
+      expectAllValid(second.entries);
+    }
+  });
+
+  it('refuses an entry list longer than 5000 instead of creating', () => {
+    const first = makeEntry();
+    const sparse = new Array(5001) as unknown as MergeQueueEntryRecord[];
+    sparse[0] = first;
+    expect(decideMergeEnqueue(sparse, input())).toEqual({ outcome: 'refused', reason: 'invalid-entry-id' });
+    expect(decideMergeDrop(sparse, first.entryId)).toEqual({ outcome: 'refused', reason: 'unknown-entry' });
+    expect(
+      decideMergeRetry(sparse, first.entryId, { entryId: nextEntryId(), enqueuedAtIso: '2026-11-01T12:00:00.000Z' }),
+    ).toEqual({ outcome: 'refused', reason: 'unknown-entry' });
   });
 
   it('returns the first live entry on a duplicate and keeps the list unchanged', () => {
@@ -239,6 +328,17 @@ describe('decideMergeDrop', () => {
     const decision = decideMergeDrop([dropped], dropped.entryId);
     expect(decision).toEqual({ outcome: 'refused', reason: 'unknown-entry' });
   });
+
+  it('drops a chain entry and keeps version 2 and baseBranch', () => {
+    const entry = makeEntry({ version: MERGE_QUEUE_ENTRY_V2_VERSION, baseBranch: 'chain/example' });
+    const decision = decideMergeDrop([entry], entry.entryId);
+    expect(decision.outcome).toBe('dropped');
+    if (decision.outcome === 'dropped') {
+      expect(decision.record.version).toBe(MERGE_QUEUE_ENTRY_V2_VERSION);
+      expect(decision.record.baseBranch).toBe('chain/example');
+      expectAllValid(decision.entries);
+    }
+  });
 });
 
 describe('decideMergeRetry', () => {
@@ -303,6 +403,25 @@ describe('decideMergeRetry', () => {
     if (decision.outcome === 'duplicate') {
       expect(decision.record.entryId).toBe(liveTwin.entryId);
       expect(decision.entries).toEqual([dropped, liveTwin]);
+    }
+  });
+
+  it('retries a dropped chain entry onto version 2 and the same baseBranch', () => {
+    const dropped = makeEntry({
+      version: MERGE_QUEUE_ENTRY_V2_VERSION,
+      baseBranch: 'chain/example',
+      state: 'dropped',
+      reason: 'operator-dropped',
+    });
+    const decision = decideMergeRetry([dropped], dropped.entryId, {
+      entryId: nextEntryId(),
+      enqueuedAtIso: '2026-11-01T12:00:00.000Z',
+    });
+    expect(decision.outcome).toBe('retried');
+    if (decision.outcome === 'retried') {
+      expect(decision.record.version).toBe(MERGE_QUEUE_ENTRY_V2_VERSION);
+      expect(decision.record.baseBranch).toBe('chain/example');
+      expectAllValid(decision.entries);
     }
   });
 

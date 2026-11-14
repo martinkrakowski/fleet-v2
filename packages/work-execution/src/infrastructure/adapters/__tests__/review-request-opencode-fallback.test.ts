@@ -1,15 +1,18 @@
 // ReviewRequestAdapter: the D1C opencode fallback. When a review request is
 // rejected as `review-unavailable` with an API-transport code (`transport`,
-// `transport-failed`, `seat-busy`, `timeout`), the adapter re-requests the same
+// `transport-failed`, `seat-busy`, `timeout`) AND the request's primary
+// reviewer model is the configured api seat's model (fix round 1: those codes
+// are shared with the opencode transport), the adapter re-requests the same
 // review once against the configured opencode fallback reviewer seat. Every
 // refusal path here is covered for both attempt reviews and chain reviews.
 /**
  * Covers: no fallback on a completed verdict, non-API-transport refusals
  * surfaced unchanged, the absent/blank/equal fallback seat, the single-retry
  * bound, null/malformed/throwing delegate answers, delegate throws,
- * not-configured, fallback receipt mismatches, swallowed archive failures and
- * the successful fallback on each API-transport code. All fakes are object
- * literals; nothing touches a host.
+ * not-configured, fallback receipt mismatches, swallowed archive failures,
+ * the successful fallback on each API-transport code, and the fix-round-1
+ * route verification: a non-api primary seat never triggers the fallback.
+ * All fakes are object literals; nothing touches a host.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -32,6 +35,10 @@ const REQUEST_ID = 'review-01JB00000000000000000000NN';
 const KIND = 'code-review';
 const PRIMARY_MODEL = 'example-provider/grok-4.7';
 const FALLBACK_MODEL = 'example-provider/glm-5.3';
+// Fix round 1: the fallback must verify the primary route was the api
+// transport, so every fallback-capable adapter below declares the primary
+// api seat's model alongside the opencode fallback seat's model.
+const API_DELEGATES = { primaryApiReviewerModel: PRIMARY_MODEL };
 const RECEIPT_ID = 'rr-assessment-attempt-example-1-00000000-review-01JB00000000000000000000NN';
 
 function makeReceipt(overrides: Partial<ReviewReceiptRecord> = {}): ReviewReceiptRecord {
@@ -164,7 +171,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
         const { calls, requestIndependentReview } = makeScriptedDelegate([
           { result: { outcome: 'reviewed', receipt } },
         ]);
-        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL });
+        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL, ...API_DELEGATES });
 
         const result = await adapter.requestReview(request);
 
@@ -201,7 +208,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
             } as RequestIndependentReviewResult,
           },
         ]);
-        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL });
+        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL, ...API_DELEGATES });
 
         const result = await adapter.requestReview(request);
 
@@ -257,7 +264,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
         { result: unavailable('transport-failed') },
         { result: unavailable('timeout') },
       ]);
-      const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL });
+      const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL, ...API_DELEGATES });
 
       const result = await adapter.requestReview(request);
 
@@ -287,7 +294,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
         const { calls, requestIndependentReview } = makeScriptedDelegate([
           { result: answer as RequestIndependentReviewResult },
         ]);
-        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL });
+        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL, ...API_DELEGATES });
 
         const result = await adapter.requestReview(request);
 
@@ -303,6 +310,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
       const adapter = new ReviewRequestAdapter({
         requestIndependentReview: primary.requestIndependentReview,
         opencodeFallbackReviewerModel: FALLBACK_MODEL,
+        ...API_DELEGATES,
       });
       await expect(adapter.requestReview(request)).resolves.toEqual({ outcome: 'unknown', reason: 'delegate-failed' });
       expect(primary.calls).toHaveLength(1);
@@ -311,6 +319,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
       const withFallback = new ReviewRequestAdapter({
         requestIndependentReview: fallback.requestIndependentReview,
         opencodeFallbackReviewerModel: FALLBACK_MODEL,
+        ...API_DELEGATES,
       });
       await expect(withFallback.requestReview(request)).resolves.toEqual({ outcome: 'unknown', reason: 'delegate-failed' });
       expect(fallback.calls).toHaveLength(2);
@@ -319,7 +328,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
 
   it('returns refused not-configured when requestIndependentReview delegate is absent', async () => {
     for (const request of [makeReviewRequest(), makeChainRequest()]) {
-      const adapter = new ReviewRequestAdapter({ opencodeFallbackReviewerModel: FALLBACK_MODEL });
+      const adapter = new ReviewRequestAdapter({ opencodeFallbackReviewerModel: FALLBACK_MODEL, ...API_DELEGATES });
       await expect(adapter.requestReview(request)).resolves.toEqual({
         outcome: 'refused',
         reason: 'not-configured',
@@ -378,7 +387,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
           { result: unavailable('transport-failed') },
           { result: { outcome: 'reviewed', receipt } },
         ]);
-        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL });
+        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL, ...API_DELEGATES });
 
         const result = await adapter.requestReview(request);
 
@@ -404,6 +413,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
         requestIndependentReview,
         archiveEvidence: boom,
         opencodeFallbackReviewerModel: FALLBACK_MODEL,
+        ...API_DELEGATES,
       });
 
       const result = await adapter.requestReview(request);
@@ -423,6 +433,59 @@ describe('ReviewRequestAdapter opencode fallback', () => {
     }
   });
 
+  it('does not fall back when the primary reviewer model is not the configured api seat model', async () => {
+    // Fix round 1: the opencode transport emits the same generic codes, so a
+    // seat-busy or timeout from a non-api primary seat must never trigger a
+    // second review against the fallback model.
+    for (const code of ['transport', 'transport-failed', 'seat-busy', 'timeout'] as const) {
+      for (const primaryApiReviewerModel of [undefined, '', '   ', 42, 'example-provider/other-1']) {
+        for (const request of [makeReviewRequest(), makeChainRequest()]) {
+          const { calls, requestIndependentReview } = makeScriptedDelegate([{ result: unavailable(code) }]);
+          const delegates: Record<string, unknown> = {
+            requestIndependentReview,
+            opencodeFallbackReviewerModel: FALLBACK_MODEL,
+          };
+          if (primaryApiReviewerModel !== undefined) {
+            delegates.primaryApiReviewerModel = primaryApiReviewerModel;
+          }
+          const adapter = new ReviewRequestAdapter(delegates as never);
+
+          const result = await adapter.requestReview(request);
+
+          expect(result).toEqual({ outcome: 'no-receipt', reason: 'review-unavailable', detail: code });
+          expect(calls).toHaveLength(1);
+          expect(calls[0].reviewerModel).toBe(request.reviewerModel);
+        }
+      }
+    }
+    // The match is by trimmed value, and a throwing getter on the configured
+    // model is a non-match, never a crash.
+    for (const configured of ['  ' + PRIMARY_MODEL + '  ', { get toString(): never { throw new Error('boom'); } }]) {
+      for (const request of [makeReviewRequest(), makeChainRequest()]) {
+        const receipt = request.kind === 'pre-merge' && request.attemptId === CHAIN_ATTEMPT_ID ? makeChainReceipt() : makeReceipt();
+        const { calls, requestIndependentReview } = makeScriptedDelegate([
+          { result: unavailable('seat-busy') },
+          { result: { outcome: 'reviewed', receipt } },
+        ]);
+        const adapter = new ReviewRequestAdapter({
+          requestIndependentReview,
+          opencodeFallbackReviewerModel: FALLBACK_MODEL,
+          primaryApiReviewerModel: configured as never,
+        });
+
+        const result = await adapter.requestReview(request);
+
+        if (configured === '  ' + PRIMARY_MODEL + '  ') {
+          expect(result.outcome).toBe('receipt');
+          expect(calls).toHaveLength(2);
+        } else {
+          expect(result).toEqual({ outcome: 'no-receipt', reason: 'review-unavailable', detail: 'seat-busy' });
+          expect(calls).toHaveLength(1);
+        }
+      }
+    }
+  });
+
   it('retries once against opencodeFallbackReviewerModel on each api-transport unavailable code for attempt and chain reviews', async () => {
     for (const code of ['transport', 'transport-failed', 'seat-busy', 'timeout'] as const) {
       for (const [request, receipt] of [
@@ -433,7 +496,7 @@ describe('ReviewRequestAdapter opencode fallback', () => {
           { result: unavailable(code) },
           { result: { outcome: 'reviewed', receipt } },
         ]);
-        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL });
+        const adapter = new ReviewRequestAdapter({ requestIndependentReview, opencodeFallbackReviewerModel: FALLBACK_MODEL, ...API_DELEGATES });
 
         const result = await adapter.requestReview(request);
 

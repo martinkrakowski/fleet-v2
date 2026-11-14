@@ -215,6 +215,16 @@ export interface ReviewRequestDelegates {
    * model, no fallback runs.
    */
   readonly opencodeFallbackReviewerModel?: string;
+  /**
+   * D1C fix round 1: the model of the primary reviewer seat served by the
+   * `api` transport. The unavailable codes that trigger the fallback
+   * (`transport`, `transport-failed`, `seat-busy`, `timeout`) are generic —
+   * the opencode transport emits the same ones — so the retry must verify
+   * the rejected request actually went through the api route: it runs only
+   * when the request's primary reviewer model matches this one. Absent or
+   * mismatched, no fallback runs.
+   */
+  readonly primaryApiReviewerModel?: string;
 }
 
 function isNonEmptyTrimmed(value: unknown): boolean {
@@ -524,6 +534,18 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
   }
 
   /**
+   * D1C fix round 1: whether the rejected request's primary reviewer model is
+   * the configured api seat's model — the only route the fallback may follow
+   * up, because the triggering codes are shared with the opencode transport.
+   * Read through own data properties (a getter never runs); false when absent,
+   * a non-string, blank, or not equal after trimming to the request's model.
+   */
+  private primaryRouteIsApi(primaryReviewerModel: string): boolean {
+    const value = ownValue(this.delegates, 'primaryApiReviewerModel');
+    return typeof value === 'string' && value.trim() !== '' && value.trim() === primaryReviewerModel.trim();
+  }
+
+  /**
    * D1C: one bounded dispatch of an independent review, shared by the attempt
    * and the chain paths. A throwing delegate is `unknown`/`delegate-failed`.
    * The delegate's answer is validated through own properties: a null,
@@ -531,9 +553,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
    * answer is an unavailable review, never an exception and never a retry. A
    * rejected diagnostic is archived as in RV4. Then — at most once, only when
    * the rejection is `review-unavailable` with an API-transport code and a
-   * distinct opencode fallback seat is configured — the same review is
-   * re-requested against the fallback reviewer model; its answer is mapped
-   * and returned without any further retry.
+   * distinct opencode fallback seat is configured and the request's primary
+   * reviewer model is the configured api seat's model (the triggering codes
+   * are shared with the opencode transport) — the same review is re-requested
+   * against the fallback reviewer model; its answer is mapped and returned
+   * without any further retry.
    */
   private async dispatchReview(
     reviewInput: RequestIndependentReviewRequest,
@@ -588,7 +612,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       !retried &&
       rejection === 'review-unavailable' &&
       typeof code === 'string' &&
-      API_TRANSPORT_UNAVAILABLE_CODES.has(code)
+      API_TRANSPORT_UNAVAILABLE_CODES.has(code) &&
+      this.primaryRouteIsApi(reviewInput.reviewerModel)
     ) {
       const fallbackModel = this.opencodeFallbackReviewerModel(reviewInput.reviewerModel);
       if (fallbackModel !== null) {

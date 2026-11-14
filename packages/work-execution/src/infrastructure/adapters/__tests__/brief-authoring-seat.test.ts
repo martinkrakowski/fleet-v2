@@ -395,4 +395,50 @@ describe('BriefAuthoringAdapter seat session', () => {
       },
     ]);
   });
+
+  it('a present-but-unreadable recorded answer surfaces session-failed without rerunning the seat or overwriting the answer', async () => {
+    const s = await setup();
+    await fs.mkdir(s.briefsDir, { recursive: true });
+    const answerPath = path.join(s.briefsDir, `${STEM}.answer.md`);
+    const originalAnswer = '===NOTES===\noriginal\n===DISPATCH===\npreserved\n';
+    await fs.writeFile(answerPath, originalAnswer, { encoding: 'utf8', mode: 0o600 });
+    await fs.chmod(answerPath, 0o200);
+    try {
+      const result = await adapterFor(s.executor).authorBriefSession(s.request);
+      expect(result).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+      expect(s.executor.calls).toHaveLength(0);
+    } finally {
+      await fs.chmod(answerPath, 0o600);
+    }
+    expect(await fs.readFile(answerPath, 'utf8')).toBe(originalAnswer);
+  });
+
+  it('recovers a stale lock from a dead owner or an expired lock and completes acquisition', async () => {
+    {
+      const s = await setup();
+      await fs.mkdir(s.briefsDir, { recursive: true });
+      const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
+      await fs.writeFile(lockPath, `999999999-deadbeefdeadbeef-${Date.now()}`, 'utf8');
+      const result = await adapterFor(s.executor).authorBriefSession(s.request);
+      expect(result).toEqual({
+        outcome: 'answered', rawAnswer: s.executor.seat.stdout,
+        sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
+      });
+      expect(s.executor.seatCalls).toHaveLength(1);
+      expect((await fs.readdir(s.briefsDir)).sort()).toEqual([`${STEM}.answer.md`, `${STEM}.prompt.md`]);
+    }
+    {
+      const s = await setup();
+      await fs.mkdir(s.briefsDir, { recursive: true });
+      const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
+      await fs.writeFile(lockPath, `${process.pid}-deadbeefdeadbeef-${Date.now() - 2_000_000}`, 'utf8');
+      const result = await adapterFor(s.executor).authorBriefSession(s.request);
+      expect(result).toEqual({
+        outcome: 'answered', rawAnswer: s.executor.seat.stdout,
+        sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
+      });
+      expect(s.executor.seatCalls).toHaveLength(1);
+      expect((await fs.readdir(s.briefsDir)).sort()).toEqual([`${STEM}.answer.md`, `${STEM}.prompt.md`]);
+    }
+  });
 });

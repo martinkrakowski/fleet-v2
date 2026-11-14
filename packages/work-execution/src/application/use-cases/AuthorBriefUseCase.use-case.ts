@@ -28,6 +28,19 @@ export interface AuthorBriefDependencies {
 const COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]{1,120}$/;
 const FACT_PACK_MAX_FACTS = 32;
+const FACT_PACK_REFUSAL_REASONS: ReadonlySet<string> = new Set([
+  'invalid-request',
+  'fact-absent',
+  'fact-unreadable',
+  'fact-oversized',
+  'pack-too-large',
+  'secret-shaped',
+]);
+
+export type AuthorBriefFreezeRefusalDetail =
+  | 'acceptance-spec-shell'
+  | 'freeze-rejected'
+  | 'freeze-outcome-unknown';
 
 const MISSING = Symbol('missing');
 
@@ -197,6 +210,14 @@ function snapshotRequest(request: unknown): Snapshot | null {
   };
 }
 
+function mapFreezeRejectionDetail(frozen: unknown): 'acceptance-spec-shell' | 'freeze-rejected' {
+  if (isPlainObject(frozen) && readOwnData(frozen, 'outcome') === 'rejected'
+    && readOwnData(frozen, 'reasonClass') === 'acceptance-spec-shell') {
+    return 'acceptance-spec-shell';
+  }
+  return 'freeze-rejected';
+}
+
 function refusal(reason: AuthorBriefRefusalReason, detail: string, findings?: readonly { rule: string; label: string }[]): AuthorBriefResult {
   return {
     outcome: 'refused',
@@ -220,14 +241,19 @@ export class AuthorBriefUseCase implements AuthorBriefPort {
   }
 
   public async authorBrief(request: AuthorBriefRequest): Promise<AuthorBriefResult> {
+    let snapshot: Snapshot | null;
     try {
-      const snapshot = snapshotRequest(request);
-      if (snapshot === null) {
-        return refusal('invalid-request', 'request must be a plain object');
-      }
+      snapshot = snapshotRequest(request);
+    } catch {
+      return refusal('invalid-request', 'request must be a plain object');
+    }
+    if (snapshot === null) {
+      return refusal('invalid-request', 'request must be a plain object');
+    }
+    try {
       return await this.run(snapshot);
     } catch {
-      return refusal('invalid-request', 'unexpected authoring error');
+      return refusal('freeze-rejected', 'freeze-outcome-unknown');
     }
   }
 
@@ -239,15 +265,21 @@ export class AuthorBriefUseCase implements AuthorBriefPort {
       return refusal('session-unavailable', 'session-command-missing');
     }
 
-    const pack: Awaited<ReturnType<BuildFactPackPort['buildFactPack']>> = await this.factPack.buildFactPack({
-      laneId, repositoryPath: request.repositoryPath, commit, facts: request.facts,
-    });
+    let pack: Awaited<ReturnType<BuildFactPackPort['buildFactPack']>>;
+    try {
+      pack = await this.factPack.buildFactPack({
+        laneId, repositoryPath: request.repositoryPath, commit, facts: request.facts,
+      });
+    } catch {
+      return refusal('fact-pack-refused', 'fact-pack-failed');
+    }
     if (!isPlainObject(pack)) {
       return refusal('fact-pack-refused', 'invalid-fact-pack-result');
     }
     if (pack.outcome === 'refused') {
-      const reason = isPlainObject(pack.refusal) && typeof pack.refusal.reason === 'string'
-        ? pack.refusal.reason
+      const rawReason = isPlainObject(pack.refusal) ? readOwnData(pack.refusal, 'reason') : MISSING;
+      const reason = typeof rawReason === 'string' && FACT_PACK_REFUSAL_REASONS.has(rawReason)
+        ? rawReason
         : 'fact-pack-refused';
       return refusal('fact-pack-refused', reason);
     }
@@ -256,13 +288,18 @@ export class AuthorBriefUseCase implements AuthorBriefPort {
     }
 
     const sessionKey = `brief-author/${workOrderId}/${laneId}@${commit.slice(0, 12)}`;
-    const session: BriefAuthorSessionResult = await authoring.authorBriefSession({
-      sessionKey, workOrderId, laneId, baseCommit: commit,
-      checkoutPath: request.checkoutPath, briefsDir: request.briefsDir,
-      prompt: pack.prompt, model: request.model,
-      ...(request.variant !== undefined ? { variant: request.variant } : {}),
-      ...(request.agent !== undefined ? { agent: request.agent } : {}),
-    });
+    let session: BriefAuthorSessionResult;
+    try {
+      session = await authoring.authorBriefSession({
+        sessionKey, workOrderId, laneId, baseCommit: commit,
+        checkoutPath: request.checkoutPath, briefsDir: request.briefsDir,
+        prompt: pack.prompt, model: request.model,
+        ...(request.variant !== undefined ? { variant: request.variant } : {}),
+        ...(request.agent !== undefined ? { agent: request.agent } : {}),
+      });
+    } catch {
+      return refusal('session-unavailable', 'session-failed');
+    }
     if (!isPlainObject(session)) {
       return refusal('session-unavailable', 'session-failed');
     }
@@ -299,13 +336,21 @@ export class AuthorBriefUseCase implements AuthorBriefPort {
     }
 
     // Only the dispatch text is frozen: the notes never leave `parsed`.
-    const frozen: Awaited<ReturnType<PrepareBriefPackagePort['prepareBriefPackage']>> =
-      await this.prepareBriefPackage.prepareBriefPackage({ ...request.prepare, proseMarkdown: parsed.dispatch });
-    if (!isPlainObject(frozen) || frozen.outcome !== 'prepared' || !isPlainObject(frozen.prepared)) {
-      const detail = isPlainObject(frozen) && frozen.outcome === 'rejected' && typeof frozen.reason === 'string' && frozen.reason.length > 0
-        ? frozen.reason
-        : 'freeze-rejected';
-      return refusal('freeze-rejected', detail);
+    // If `prepareBriefPackage` throws after writing the brief, the outcome is
+    // uncertain/unknown rather than `invalid-request` or a clean pre-write rejection.
+    let frozen: Awaited<ReturnType<PrepareBriefPackagePort['prepareBriefPackage']>>;
+    try {
+      frozen = await this.prepareBriefPackage.prepareBriefPackage({
+        ...request.prepare,
+        proseMarkdown: parsed.dispatch,
+      });
+    } catch {
+      return refusal('freeze-rejected', 'freeze-outcome-unknown');
+    }
+    if (!isPlainObject(frozen) || readOwnData(frozen, 'outcome') !== 'prepared'
+      || !isPlainObject(readOwnData(frozen, 'prepared'))
+      || frozen.outcome !== 'prepared') {
+      return refusal('freeze-rejected', mapFreezeRejectionDetail(frozen));
     }
 
     return { outcome: 'authored', sessionKey: session.sessionKey, prepared: frozen.prepared };

@@ -389,19 +389,25 @@ describe('AuthorBriefUseCase', () => {
     expect(h.prepareCalls).toHaveLength(0);
   });
 
-  it('Propagates freeze-rejected when PrepareBriefPackagePort rejects', async () => {
+  it('Propagates freeze-rejected with a typed non-leaking detail when PrepareBriefPackagePort rejects', async () => {
     const plain = harness({ prepare: { outcome: 'rejected', reason: 'cannot place /private/path/brief.md' } });
-    expect(await author(plain, validRequest())).toEqual({
+    const plainResult = await author(plain, validRequest());
+    expect(plainResult).toEqual({
       outcome: 'refused',
-      refusal: { reason: 'freeze-rejected', detail: 'cannot place /private/path/brief.md' },
+      refusal: { reason: 'freeze-rejected', detail: 'freeze-rejected' },
     });
+    expect(JSON.stringify(plainResult)).not.toContain('/private/path');
+
     const classed = harness({
       prepare: { outcome: 'rejected', reason: 'shell at /private/path', reasonClass: 'acceptance-spec-shell' },
     });
-    expect(await author(classed, validRequest())).toEqual({
+    const classedResult = await author(classed, validRequest());
+    expect(classedResult).toEqual({
       outcome: 'refused',
-      refusal: { reason: 'freeze-rejected', detail: 'shell at /private/path' },
+      refusal: { reason: 'freeze-rejected', detail: 'acceptance-spec-shell' },
     });
+    expect(JSON.stringify(classedResult)).not.toContain('/private/path');
+
     const malformed = harness({ prepare: 'malformed' });
     expect(await author(malformed, validRequest())).toEqual({
       outcome: 'refused',
@@ -409,25 +415,30 @@ describe('AuthorBriefUseCase', () => {
     });
   });
 
-  it('catches unexpected port throws and refuses cleanly', async () => {
+  it('catches unexpected port throws and preserves uncertain freeze outcomes distinctly from invalid-request', async () => {
     const pack = harness({ pack: 'throw' });
     expect(await author(pack, validRequest())).toEqual({
       outcome: 'refused',
-      refusal: { reason: 'invalid-request', detail: 'unexpected authoring error' },
+      refusal: { reason: 'fact-pack-refused', detail: 'fact-pack-failed' },
     });
 
     const session = harness({ session: 'throw' });
     const sessionResult = await author(session, validRequest());
     expect(sessionResult).toEqual({
       outcome: 'refused',
-      refusal: { reason: 'invalid-request', detail: 'unexpected authoring error' },
+      refusal: { reason: 'session-unavailable', detail: 'session-failed' },
     });
     expect(JSON.stringify(sessionResult)).not.toContain('/secret/path');
 
     const freeze = harness({ prepare: 'throw' });
-    expect(await author(freeze, validRequest())).toEqual({
+    const freezeResult = await author(freeze, validRequest());
+    expect(freezeResult).toEqual({
       outcome: 'refused',
-      refusal: { reason: 'invalid-request', detail: 'unexpected authoring error' },
+      refusal: { reason: 'freeze-rejected', detail: 'freeze-outcome-unknown' },
+    });
+    expect(freezeResult).not.toEqual({
+      outcome: 'refused',
+      refusal: { reason: 'invalid-request', detail: expect.any(String) },
     });
   });
 
@@ -435,13 +446,13 @@ describe('AuthorBriefUseCase', () => {
     const results = await Promise.all([
       author(harness({ pack: { outcome: 'refused', refusal: { reason: 'secret-shaped', label: '/etc/label', rule: 'rule text' } } }), validRequest()),
       author(harness({ session: { outcome: 'unavailable', reason: 'checkout-unreadable' } }), validRequest()),
-      author(harness({ prepare: { outcome: 'rejected', reason: 'bad-shell' } }), validRequest()),
+      author(harness({ prepare: { outcome: 'rejected', reason: 'cannot place /private/path/brief.md: bad-shell' } }), validRequest()),
       author(harness({ session: { outcome: 'answered', rawAnswer: answerOf(DISPATCH.replace('## Tier\nTier 1\n', '')), sessionKey: 'k', answerPath: '/p', cached: false } }), validRequest()),
       author(harness(), null),
     ]);
     for (const result of results) {
       const text = JSON.stringify(result);
-      for (const leaked of ['/etc', '/private', '/repo', '/checkout', '/briefs', 'rule text', 'NOTES-SENTINEL', 'Sources']) {
+      for (const leaked of ['/etc', '/private', '/repo', '/checkout', '/briefs', 'rule text', 'bad-shell', 'NOTES-SENTINEL', 'Sources']) {
         expect(text).not.toContain(leaked);
       }
     }

@@ -14,6 +14,7 @@
  * Results carry codes only: never a path, the answer or a secret.
  */
 
+import { randomBytes } from 'node:crypto';
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
 
@@ -26,7 +27,6 @@ import type {
   BriefAuthorSessionUnavailableReason,
 } from '../../application/ports/out/BriefAuthoringPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
-import { withFileLock } from './file-store.js';
 
 export interface BriefAuthoringAdapterOptions {
   /** Reviewed orchestrator prose keyed by work order id. */
@@ -184,11 +184,230 @@ function validateSessionCommand(
   return null;
 }
 
-function resolveTimeout(requested: number | undefined): number {
-  if (requested === undefined || !Number.isFinite(requested) || requested <= 0) {
+function resolveTimeout(requested: number | undefined, configured?: number): number {
+  const candidate = requested !== undefined ? requested : configured;
+  if (candidate === undefined || !Number.isFinite(candidate) || candidate <= 0) {
     return DEFAULT_TIMEOUT_MS;
   }
-  return Math.min(requested, MAX_TIMEOUT_MS);
+  return Math.min(candidate, MAX_TIMEOUT_MS);
+}
+
+const DEFAULT_LOCK_MAX_WAIT_MS = 15_000;
+const DEFAULT_LOCK_POLL_INTERVAL_MS = 25;
+const UNPARSEABLE_LOCK_GRACE_MS = 50;
+
+interface ParsedLockMetadata {
+  readonly pid: number | undefined;
+  readonly time: number | undefined;
+  readonly expiresAt: number | undefined;
+}
+
+function parseLockMetadata(raw: string): ParsedLockMetadata {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return { pid: undefined, time: undefined, expiresAt: undefined };
+  }
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (isPlainObject(parsed)) {
+        const pid = typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0
+          ? parsed.pid
+          : undefined;
+        const rawTime = typeof parsed.time === 'number'
+          ? parsed.time
+          : typeof parsed.timestamp === 'number'
+            ? parsed.timestamp
+            : typeof parsed.createdAt === 'number'
+              ? parsed.createdAt
+              : undefined;
+        const time = rawTime !== undefined && Number.isFinite(rawTime) ? rawTime : undefined;
+        const expiresAt = typeof parsed.expiresAt === 'number' && Number.isFinite(parsed.expiresAt)
+          ? parsed.expiresAt
+          : undefined;
+        return { pid, time, expiresAt };
+      }
+    } catch {
+      return { pid: undefined, time: undefined, expiresAt: undefined };
+    }
+  }
+  const tokenMatch = /^(\d+)-[0-9a-fA-F]+-(\d+)$/.exec(trimmed);
+  if (tokenMatch !== null) {
+    const pid = Number(tokenMatch[1]);
+    const time = Number(tokenMatch[2]);
+    return {
+      pid: Number.isSafeInteger(pid) && pid > 0 ? pid : undefined,
+      time: Number.isFinite(time) ? time : undefined,
+      expiresAt: undefined,
+    };
+  }
+  const pairMatch = /^(\d+):(\d+)$/.exec(trimmed);
+  if (pairMatch !== null) {
+    const pid = Number(pairMatch[1]);
+    const time = Number(pairMatch[2]);
+    return {
+      pid: Number.isSafeInteger(pid) && pid > 0 ? pid : undefined,
+      time: Number.isFinite(time) ? time : undefined,
+      expiresAt: undefined,
+    };
+  }
+  const pidOnlyMatch = /^(\d+)$/.exec(trimmed);
+  if (pidOnlyMatch !== null) {
+    const pid = Number(pidOnlyMatch[1]);
+    return {
+      pid: Number.isSafeInteger(pid) && pid > 0 ? pid : undefined,
+      time: undefined,
+      expiresAt: undefined,
+    };
+  }
+  return { pid: undefined, time: undefined, expiresAt: undefined };
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  if (pid === process.pid) {
+    return true;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code !== 'ESRCH';
+  }
+}
+
+function isLockStale(
+  raw: string,
+  stat: { readonly mtimeMs: number },
+  staleAfterMs: number,
+  now: number,
+): boolean {
+  const { pid, time, expiresAt } = parseLockMetadata(raw);
+  if (expiresAt !== undefined && now >= expiresAt) {
+    return true;
+  }
+  const timestampAge = time !== undefined ? Math.max(0, now - time) : 0;
+  const mtimeAge = Math.max(0, now - stat.mtimeMs);
+  const ageMs = Math.max(timestampAge, mtimeAge);
+  if (ageMs >= staleAfterMs) {
+    return true;
+  }
+  if (pid !== undefined) {
+    return !isProcessAlive(pid);
+  }
+  return ageMs >= UNPARSEABLE_LOCK_GRACE_MS;
+}
+
+/**
+ * Atomically replace a verified stale lock file by writing our token to a
+ * private sibling file, re-verifying the stale lock's inode and content,
+ * renaming over the lock path, and confirming ownership after one poll window.
+ */
+async function tryReclaimStaleLock(
+  lockPath: string,
+  token: string,
+  expectedIno: number,
+  expectedContent: string,
+  pollIntervalMs: number,
+): Promise<boolean> {
+  const tempPath = `${lockPath}.${process.pid}-${randomBytes(8).toString('hex')}.tmp`;
+  try {
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
+    const handle = await fs.open(tempPath, flags, 0o600);
+    try {
+      await handle.writeFile(token, 'utf8');
+    } finally {
+      await handle.close();
+    }
+
+    const currentStat = await fs.lstat(lockPath).catch(() => null);
+    if (currentStat === null || currentStat.isSymbolicLink() || !currentStat.isFile()
+      || currentStat.ino !== expectedIno) {
+      await fs.rm(tempPath, { force: true }).catch(() => undefined);
+      return false;
+    }
+    const currentContent = await readFileNoFollow(lockPath).catch(() => null);
+    if (currentContent === null || currentContent !== expectedContent) {
+      await fs.rm(tempPath, { force: true }).catch(() => undefined);
+      return false;
+    }
+
+    await fs.rename(tempPath, lockPath);
+  } catch {
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    return false;
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  const verified = await readFileNoFollow(lockPath).catch(() => null);
+  return verified !== null && verified.trim() === token;
+}
+
+async function withSessionLock<T>(
+  lockPath: string,
+  staleAfterMs: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  let token = `${process.pid}-${randomBytes(8).toString('hex')}-${Date.now()}`;
+  const deadline = Date.now() + DEFAULT_LOCK_MAX_WAIT_MS;
+
+  for (;;) {
+    try {
+      const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
+      const handle = await fs.open(lockPath, flags, 0o600);
+      try {
+        await handle.writeFile(token, 'utf8');
+      } finally {
+        await handle.close();
+      }
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== 'EEXIST') {
+        throw error;
+      }
+      const stat = await fs.lstat(lockPath).catch(() => null);
+      if (stat === null) {
+        continue;
+      }
+      if (stat.isSymbolicLink() || !stat.isFile()) {
+        throw new Error('Lock path is not a regular file');
+      }
+      const raw = await readFileNoFollow(lockPath).catch(() => null);
+      if (raw !== null && isLockStale(raw, stat, staleAfterMs, Date.now())) {
+        token = `${process.pid}-${randomBytes(8).toString('hex')}-${Date.now()}`;
+        const reclaimed = await tryReclaimStaleLock(
+          lockPath,
+          token,
+          stat.ino,
+          raw,
+          DEFAULT_LOCK_POLL_INTERVAL_MS,
+        );
+        if (reclaimed) {
+          break;
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new Error('Timed out waiting for session lock');
+      }
+      await new Promise((resolve) => setTimeout(resolve, DEFAULT_LOCK_POLL_INTERVAL_MS));
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    try {
+      const current = await readFileNoFollow(lockPath);
+      if (current.trim() === token) {
+        await fs.unlink(lockPath);
+      }
+    } catch {
+      // Lock already removed or replaced after timeout.
+    }
+  }
 }
 
 /** The safe file stem for a valid request, or null; the key must match the ids and commit. */
@@ -270,27 +489,39 @@ async function ensureSafeDirectory(briefsDir: string): Promise<boolean> {
 }
 
 /**
- * The recorded answer, or `null` when none exists or it is unusable, or
- * `'too-large'` when the recorded answer itself exceeds the answer limit. The
+ * The recorded answer, `null` when none exists (ENOENT), `'unreadable'` when a
+ * path is present at `answerPath` but cannot be read or is empty/non-regular,
+ * or `'too-large'` when the recorded answer exceeds the answer limit. The
  * caller separately refuses a symlinked answer file, which may point outside the
  * briefs directory.
  */
 async function readRecordedAnswer(
   answerPath: string,
   maxAnswerBytes: number,
-): Promise<string | null | 'too-large'> {
-  const stat = await fs.lstat(answerPath).catch(() => null);
-  if (stat === null || stat.isSymbolicLink() || !stat.isFile()) {
-    return null;
+): Promise<string | null | 'too-large' | 'unreadable'> {
+  let stat: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    stat = await fs.lstat(answerPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return null;
+    }
+    return 'unreadable';
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    return 'unreadable';
   }
   let text: string;
   try {
     text = await readFileNoFollow(answerPath);
-  } catch {
-    return null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return null;
+    }
+    return 'unreadable';
   }
   if (text.trim().length === 0) {
-    return null;
+    return 'unreadable';
   }
   return Buffer.byteLength(text, 'utf8') > maxAnswerBytes ? 'too-large' : text;
 }
@@ -456,8 +687,12 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
       return unavailable('briefs-dir-invalid');
     }
     // Recorded outcome first: a completed session replays without any seat
-    // configuration, executor or checkout check.
+    // configuration, executor or checkout check. A present-but-unreadable
+    // answer file is refused without running the seat or touching the file.
     const recorded = await readRecordedAnswer(answerPath, maxAnswerBytes);
+    if (recorded === 'unreadable') {
+      return unavailable('session-failed');
+    }
     if (recorded === 'too-large') {
       return unavailable('session-oversized');
     }
@@ -484,7 +719,10 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
       return unavailable('session-command-invalid');
     }
 
-    const timeout = resolveTimeout(timeoutMs === MISSING || timeoutMs === undefined ? undefined : (timeoutMs as number));
+    const timeout = resolveTimeout(
+      timeoutMs === MISSING || timeoutMs === undefined ? undefined : (timeoutMs as number),
+      this.options?.timeoutMs,
+    );
     // The session lock serializes concurrent callers for the same stem, so the
     // seat runs at most once and a caller that waits past the default lock
     // budget refuses instead of also running the seat. Only the prompt, answer
@@ -496,11 +734,18 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     if (await isSymbolicLink(lockPath)) {
       return unavailable('briefs-dir-invalid');
     }
-    return withFileLock<BriefAuthorSessionResult>(
+    return withSessionLock<BriefAuthorSessionResult>(
       lockPath,
+      timeout,
       async () => {
+        if (await isSymbolicLink(answerPath)) {
+          return unavailable('briefs-dir-invalid');
+        }
         // A concurrent call may have completed the session while this one waited.
         const recordedUnderLock = await readRecordedAnswer(answerPath, maxAnswerBytes);
+        if (recordedUnderLock === 'unreadable') {
+          return unavailable('session-failed');
+        }
         if (recordedUnderLock === 'too-large') {
           return unavailable('session-oversized');
         }
@@ -543,9 +788,7 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
         return (await recordAnswer(answerPath, run.stdout))
           ? { outcome: 'answered', rawAnswer: run.stdout, sessionKey: sessionKey as string, answerPath, cached: false }
           : unavailable('session-failed');
-    },
-    // The store's default lock budget: a concurrent caller refuses rather than
-    // blocking for the seat's whole runtime budget.
+      },
     )
       .catch(() => unavailable('session-failed'));
   }

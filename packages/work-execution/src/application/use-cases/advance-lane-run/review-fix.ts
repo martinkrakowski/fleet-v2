@@ -143,7 +143,7 @@ function reviewSeatOf(
  * also excludes fallback (`on`) seats. A seat pinned by a recorded pre-merge
  * failure (D10) is re-checked against EVERY implementer attempt, because a
  * fix round after that failure may have added a same-family implementer; a
- * conflict, an out-of-range pin or an unknown model reads `{ ok: false }`,
+ * conflict, an out-of-range pin, a fallback (`on`) seat or an unknown model reads `{ ok: false }`,
  * never the stale pin.
  */
 function preMergeSeatOf(
@@ -169,7 +169,7 @@ function preMergeSeatOf(
   if (pinned !== null) {
     const seat = seats[pinned];
     const models = strictImplementerModelsOf(attempts);
-    if (seat === undefined || !models.ok || models.models.some((model) => sameFamily(seat.model, model))) {
+    if (seat === undefined || seat.on !== undefined || !models.ok || models.models.some((model) => sameFamily(seat.model, model))) {
       return { ok: false };
     }
     return { ok: true, seatIndex: pinned };
@@ -197,7 +197,7 @@ export function reviewFactsOf(
   const reviewSeat: LaneRunSeatFact =
     state === 'brief-check' || state === 'code-review'
       ? reviewSeatOf(ctx, record, state, entries, attemptRecords)
-      : state === 'awaiting-premerge'
+      : state === 'awaiting-premerge' || state === 'merging'
         ? reviewSeatOf(ctx, record, 'pre-merge', entries, attemptRecords)
         : { ok: false };
   return { reviewSeat, briefCheck, codeReview, preMergeReview };

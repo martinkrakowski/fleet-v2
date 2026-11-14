@@ -1144,6 +1144,26 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return act({ step: 'ci', round: record.round, seatIndex: attempt.seatIndex, head12: facts.head12, retry: null, attemptOrdinal: null });
     };
 
+    /**
+     * PMR1: the pre-merge request from `merging`. Only Tier 2 with no receipt at
+     * the head; a request in flight waits, a dropped one retries under the review
+     * rules. Null (post the hold as before) when no seat is free, or when the
+     * journal verdict is a pass/fail whose receipt is not readable: never a pass.
+     */
+    const mergingPreMergeRequest = (): LaneRunDecision | null => {
+      if (record.tier !== 2 || facts.preMerge !== 'none' || facts.premergePost === 'refused') {
+        return null;
+      }
+      const review: LaneRunReviewFact = facts.preMergeReview ?? { verdict: 'none', seatIndex: null, retries: 0 };
+      if (review.verdict === 'none' && !facts.reviewSeat.ok) {
+        return null;
+      }
+      if (review.verdict === 'no-receipt' && review.retries !== 0 && !facts.reviewSeat.ok) {
+        return null;
+      }
+      return requestRules('pre-merge', review, 'premerge-pending');
+    };
+
     const mergingRules = (): LaneRunDecision => {
       if (facts.pr === null) {
         return WAIT_FACTS_INCONSISTENT;
@@ -1156,6 +1176,14 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       }
       if (facts.merge.oneWayDoor) {
         return park('one-way-door', null);
+      }
+      // PMR1: a Tier 2 run reaches `merging` (D20) with no pre-merge receipt. The
+      // independent review is requested here, BEFORE the pending `premerge` post
+      // (whose unread intent would otherwise hold every later advance in the
+      // reconcile). Without an available seat the hold posts pending as before.
+      const preMergeRequest = mergingPreMergeRequest();
+      if (preMergeRequest !== null) {
+        return preMergeRequest;
       }
       // KS7a-2 (D20): the `premerge` post is the merge hold, read before the
       // policy-grant park and the merge tail; null falls through to them.
@@ -1231,6 +1259,15 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
           return wait('parked');
         }
         return park('halted', null);
+      }
+      // PMR1: a run already holding an unread pending `premerge` post (posted before
+      // the request existed) still needs its review; requesting it leaves the post
+      // intent for its own reconcile, which posts success once the receipt passes.
+      if (facts.pendingIntent.step === 'premerge' && facts.state === 'merging') {
+        const requested = mergingPreMergeRequest();
+        if (requested !== null && requested.kind === 'act') {
+          return requested;
+        }
       }
       return { kind: 'reconcile', step: facts.pendingIntent.step, key: facts.pendingIntent.key };
     }

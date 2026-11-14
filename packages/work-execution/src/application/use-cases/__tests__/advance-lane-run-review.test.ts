@@ -2483,4 +2483,28 @@ describe('PMR1: the pre-merge review request (awaiting-premerge)', () => {
     expect(seatOf(failedAt(5), [collectedAttempt()])).toEqual({ ok: false });
     expect(seatOf(failedAt(1), [collectedAttempt(), laterAttempt(null)])).toEqual({ ok: false });
   });
+
+  it('a pinned pre-merge seat that is a fallback (on) seat is refused, and merging computes the seat too', () => {
+    const ctx = { deps: { sameModelFamily: (left: string, right: string) => left === right } } as unknown as AdvanceStepContext;
+    const mint = makeUlidMinter();
+    const withFallback = {
+      ...collectedAttempt(),
+      seatPlan: {
+        ...REVIEW_SEAT_PLAN,
+        review: [
+          { id: 'rev-1', model: 'review-model-1', tool: 'opencode' },
+          { id: 'rev-fb', model: 'review-model-3', tool: 'opencode', on: ['rate-limited'] },
+        ],
+      },
+    } as AttemptRecord;
+    const key = reviewKey('pre-merge', 1, HEAD12_A);
+    const entries = [
+      laneRunConductEntry(mint(), RUN_ID, 'merging', NOW),
+      laneRunIntentEntry(mint(), RUN_ID, key, null, NOW),
+      laneRunResultEntry(mint(), RUN_ID, key, 'completed', 'review-failed', NOW),
+    ];
+    expect(reviewFactsOf(ctx, runRecord(), 'merging', entries, HEAD12_B, [withFallback]).reviewSeat).toEqual({ ok: false });
+    // Without the pin, the same plan draws the primary seat in `merging`.
+    expect(reviewFactsOf(ctx, runRecord(), 'merging', [entries[0]!], HEAD12_B, [withFallback]).reviewSeat).toEqual({ ok: true, seatIndex: 0 });
+  });
 });

@@ -156,6 +156,19 @@ describe('ExportLegacyTrainStateUseCase', () => {
     }
   });
 
+  it('never inspects a secret-shaped base property', async () => {
+    // The base is never read, not even to scan it for secret shapes: an
+    // otherwise valid entry whose ignored `base` looks secret-shaped still
+    // exports, because the rule is to never inspect that property at all.
+    const result = await exportOf([entry(ulid(1), 42, HEAD_A, 'queued', { base: fakeSecretShape() })]);
+
+    expect(result.outcome).toBe('exported');
+    if (result.outcome === 'exported') {
+      expect(result.queueDocument).toBe(`42 ${HEAD_A} main`);
+      expect(JSON.stringify(result)).not.toContain(fakeSecretShape());
+    }
+  });
+
   it('renders an empty list as two empty documents', async () => {
     const result = await exportOf([]);
 

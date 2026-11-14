@@ -162,9 +162,16 @@ export class ExportLegacyTrainStateUseCase implements ExportLegacyTrainStatePort
 
       // Any own string value that would be inspected or copied is checked
       // before anything is rendered, so a secret never reaches a document.
+      // `base` is exempt: the rule is to never inspect or read it, not even
+      // to scan it, and it is never rendered (the base is always `main`).
       const descriptors = Object.getOwnPropertyDescriptors(rawEntry);
-      for (const value of Object.values(descriptors)) {
-        if ('value' in value && typeof value.value === 'string' && containsSecretShape(value.value)) {
+      for (const [name, value] of Object.entries(descriptors)) {
+        if (
+          name !== 'base' &&
+          'value' in value &&
+          typeof value.value === 'string' &&
+          containsSecretShape(value.value)
+        ) {
           return { outcome: 'refused', reason: 'secret-shaped', entryId };
         }
       }

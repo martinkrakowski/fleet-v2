@@ -204,6 +204,22 @@ describe('ExportLegacyTrainStateUseCase', () => {
     expect(listPort.calls).toEqual([]);
   });
 
+  it('refuses a token-shaped repository owner before reading the queue', async () => {
+    const listPort = new FakeListMergeQueue({ entries: [], heads: [] });
+    const useCase = makeUseCase(listPort);
+    const tokenOwner = fakeSecretShape();
+
+    // A `ghp_<token>` owner satisfies the segment pattern, so only the secret
+    // scan stops it: the export must refuse instead of answering with a
+    // misleadingly successful empty document, and the token never echoes.
+    const result = await useCase.exportLegacyTrainState({
+      repository: { owner: tokenOwner, repo: 'v2' },
+    } as ExportLegacyTrainStateRequest);
+
+    expectRefusal(result, { outcome: 'refused', reason: 'invalid-repository' }, [tokenOwner]);
+    expect(listPort.calls).toEqual([]);
+  });
+
   it('refuses a clock that does not yield a deadline', async () => {
     const listPort = new FakeListMergeQueue({ entries: [], heads: [] });
     const throwing = makeUseCase(listPort, () => {

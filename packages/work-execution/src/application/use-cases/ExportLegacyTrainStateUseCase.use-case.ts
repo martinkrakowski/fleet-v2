@@ -80,11 +80,17 @@ export class ExportLegacyTrainStateUseCase implements ExportLegacyTrainStatePort
     }
     const owner = ownValue(request.repository, 'owner');
     const repo = ownValue(request.repository, 'repo');
+    // The shape contract is not enough on its own: a token-shaped owner such
+    // as `ghp_<token>` satisfies the segment pattern, so the segment is also
+    // scanned against the shared secret registry and refused without echoing
+    // it, before anything reaches the list port.
     if (
       typeof owner !== 'string' ||
       typeof repo !== 'string' ||
       !REPOSITORY_SEGMENT_PATTERN.test(owner) ||
       !REPOSITORY_SEGMENT_PATTERN.test(repo) ||
+      containsSecretShape(owner) ||
+      containsSecretShape(repo) ||
       owner === '.' ||
       owner === '..' ||
       repo === '.' ||

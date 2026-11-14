@@ -529,23 +529,25 @@ function effectiveEntryBase(record: MergeQueueEntryRecord): BaseBranchValue {
   return DEFAULT_BASE_BRANCH;
 }
 
-/** The shared entry-list guards; null means the caller's empty refusal. */
+/** The shared entry-list guards. Returns null for the caller's empty refusal,
+ * undefined when no base filter applies (an omitted base must not silently
+ * drop chain-based entries from processing and listing), and the parsed base
+ * when an explicit base partitions the queue. */
 function queueListGuard(
   entries: readonly MergeQueueEntryRecord[],
   repoDigest: string | undefined,
   base: string | undefined,
-): BaseBranchValue | null {
+): BaseBranchValue | undefined | null {
   if (!Array.isArray(entries) || !Number.isSafeInteger(entries.length) || entries.length > MERGE_QUEUE_ORDER_CAP) {
     return null;
   }
   if (repoDigest !== undefined && !isMergeHex12(repoDigest)) {
     return null;
   }
-  const selectedBase = base === undefined ? DEFAULT_BASE_BRANCH : parseBaseBranch(base);
-  if (selectedBase === undefined) {
-    return null;
+  if (base === undefined) {
+    return undefined;
   }
-  return selectedBase;
+  return parseBaseBranch(base) ?? null;
 }
 
 export function orderMergeQueue(
@@ -567,7 +569,7 @@ export function orderMergeQueue(
       if (repoDigest !== undefined && read.record.repoDigest !== repoDigest) {
         continue;
       }
-      if (effectiveEntryBase(read.record) !== selectedBase) {
+      if (selectedBase !== undefined && effectiveEntryBase(read.record) !== selectedBase) {
         continue;
       }
       ordered.push(read.record);

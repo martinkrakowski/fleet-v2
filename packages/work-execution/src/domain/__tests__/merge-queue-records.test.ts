@@ -534,14 +534,26 @@ describe('orderMergeQueue', () => {
     expect(ordered.map((entry) => entry.entryId)).toEqual([earlier.entryId, later.entryId]);
   });
 
-  it('leases each base separately', () => {
+  it('orders every base when no base filter is given instead of silently dropping chain entries', () => {
     const chainB = makeEntry({ version: 2, baseBranch: 'chain/b', enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
     const main = makeEntry({ enqueuedAtIso: '2026-11-01T11:00:00.000Z' });
     const chainA = makeEntry({ version: 2, baseBranch: 'chain/a', enqueuedAtIso: '2026-11-01T12:00:00.000Z' });
     const list = [chainB, main, chainA];
-    expect(findMergeQueueHead(list)?.entryId).toBe(main.entryId);
+    // Without a base argument every live entry is ordered, earliest first, and
+    // the head is the earliest unparked entry regardless of its base.
+    expect(orderMergeQueue(list).map((entry) => entry.entryId)).toEqual([
+      chainB.entryId,
+      main.entryId,
+      chainA.entryId,
+    ]);
+    expect(findMergeQueueHead(list)?.entryId).toBe(chainB.entryId);
+    // An explicit base still partitions the queue, so each base leases separately.
+    expect(orderMergeQueue(list, DIGEST, 'main').map((entry) => entry.entryId)).toEqual([main.entryId]);
     expect(findMergeQueueHead(list, DIGEST, 'chain/a')?.entryId).toBe(chainA.entryId);
     expect(orderMergeQueue(list, DIGEST, 'chain/a').map((entry) => entry.entryId)).toEqual([chainA.entryId]);
+    // An invalid base still refuses with an empty list.
+    expect(orderMergeQueue(list, DIGEST, 'Main')).toEqual([]);
+    expect(findMergeQueueHead(list, DIGEST, 'Main')).toBeNull();
   });
 
   it('keeps a v1 successor at version 1 with no baseBranch', () => {

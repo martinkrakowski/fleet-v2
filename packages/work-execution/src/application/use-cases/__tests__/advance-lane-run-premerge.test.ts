@@ -15,7 +15,7 @@ import { describe, expect, it } from 'vitest';
 import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
-import { laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type { AcceptanceReceiptsResult } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
@@ -34,6 +34,8 @@ import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/Attem
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
+import type { ReviewRequest, ReviewRequestResult } from '../../ports/out/ReviewRequestPort.out-port.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -530,6 +532,167 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
     // One intent only; the terminal post never appends a second intent.
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === premergeKey());
     expect(intents).toHaveLength(1);
+  });
+
+  it('PMR1: a passed pre-merge review receipt at the head releases the hold; the review intent and the status post are two different keys', async () => {
+    const harness = await mergingHarness();
+    // The conductor's own pre-merge review request for this head, already journalled.
+    const reviewKey = buildLaneRunStepKey({
+      runId: RUN_ID, round: 0, step: 'pre-merge', seatIndex: 0, attemptOrdinal: null, head12: HEAD12, retry: null,
+    });
+    expect(reviewKey.ok).toBe(true);
+    if (!reviewKey.ok) {
+      throw new Error('fixture must build a pre-merge key');
+    }
+    expect(reviewKey.key).not.toBe(premergeKey());
+    await appendIntent(harness, reviewKey.key, 'review-example-1', NOW);
+    await appendResult(harness, reviewKey.key, 'completed', 'review-passed', NOW);
+    harness.setReceiptAnswer(passedReceipt());
+    const posted = await advance(harness);
+    expect(posted).toMatchObject({ outcome: 'acted', step: 'premerge', key: premergeKey(), reasonCode: 'premerge-success' });
+    expect(harness.forgeRequests.map((request) => request.status)).toEqual([
+      { context: 'premerge', state: 'success', description: 'pre-merge receipt recorded' },
+    ]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === premergeKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === reviewKey.key)).toHaveLength(1);
+  });
+
+  describe('PMR1: the pre-merge request from merging, nothing pre-seeded', () => {
+    const PROSE = '# brief\n';
+    const MANIFEST = JSON.stringify({ acceptanceChecks: ['check-1'] });
+    const REVIEW_PLAN = {
+      ...SEAT_PLAN,
+      review: [
+        { id: 'rev-1', model: 'review-model-1', tool: 'opencode' },
+        { id: 'rev-2', model: 'review-model-2', tool: 'opencode' },
+      ],
+    };
+
+    /** A merging harness whose attempt can run a review: seat plan, frozen brief, review wiring. */
+    async function requestingHarness(
+      answer: (request: ReviewRequest) => ReviewRequestResult,
+      seatPlan: typeof REVIEW_PLAN | typeof SEAT_PLAN = REVIEW_PLAN,
+    ) {
+      const attempt = attemptFixture({
+        seatPlan,
+        briefPackagePath: '.lane/brief-package',
+        briefDigest: simpleDeterministicHexDigest(PROSE + '\n' + MANIFEST),
+      });
+      const harness = await makeHarness(runRecord(), [attempt]);
+      await conduct(harness, 'merging', NOW);
+      await appendIntent(harness, acceptKey(), null, NOW);
+      await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
+      const requests: ReviewRequest[] = [];
+      const deps: AdvanceLaneRunDependencies = {
+        ...harness.deps,
+        sameModelFamily: (left, right) => left === right,
+        artifactPort: {
+          readBriefManifest: async () => MANIFEST,
+          readBriefFile: async () => PROSE,
+          verifyArtifactManifest: async () => ({ outcome: 'sealed' }) as never,
+        },
+        reviewAssessment: { openReviewAssessment: async () => ({ outcome: 'open' }) },
+        reviewRequest: {
+          ...harness.deps.reviewRequest!,
+          requestReview: async (request) => {
+            requests.push(request);
+            return answer(request);
+          },
+        },
+      };
+      const run = () =>
+        new AdvanceLaneRunUseCase(deps).advanceLaneRun({
+          runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, halted: false, nowIso: LATER,
+        });
+      return { harness, requests, run };
+    }
+
+    function stepKey(seatIndex: number, retry: number | null): string {
+      const built = buildLaneRunStepKey({
+        runId: RUN_ID, round: 0, step: 'pre-merge', seatIndex, attemptOrdinal: null, head12: HEAD12, retry,
+      });
+      if (!built.ok) {
+        throw new Error('fixture must build a pre-merge key');
+      }
+      return built.key;
+    }
+
+    it('requests the review first (no status post yet), then posts success once the passed receipt exists at the head', async () => {
+      const { harness, requests, run } = await requestingHarness((request) => {
+        // The evidence receipt the review writes, as the next receipt read sees it.
+        harness.setReceiptAnswer(passedReceipt());
+        return {
+          outcome: 'receipt',
+          receipt: {
+            receiptId: 'pm-example-1', requestId: request.requestId, kind: 'pre-merge',
+            reviewerModel: request.reviewerModel, candidateHeadSha: request.candidateHeadSha,
+            verdict: 'passed', findings: [],
+          },
+        };
+      });
+      const requested = await run();
+      expect(requested).toEqual({
+        outcome: 'acted', step: 'pre-merge', key: stepKey(0, null), result: 'completed', reasonCode: 'review-passed',
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ kind: 'pre-merge', reviewerModel: 'review-model-1', implementerModel: 'model-example-1' });
+      expect(requests[0]).not.toHaveProperty('briefText');
+      // No pending premerge status was posted ahead of the request.
+      expect(harness.forgeRequests).toHaveLength(0);
+      const posted = await run();
+      expect(posted).toMatchObject({ outcome: 'acted', step: 'premerge', key: premergeKey(), reasonCode: 'premerge-success' });
+      expect(harness.forgeRequests.map((request) => request.status)).toEqual([
+        { context: 'premerge', state: 'success', description: 'pre-merge receipt recorded' },
+      ]);
+      expect(requests).toHaveLength(1);
+    });
+
+    it('a wired Tier 2 run with no review seat parks review-seat-unavailable instead of posting pending forever', async () => {
+      const { harness, requests, run } = await requestingHarness(
+        () => ({ outcome: 'unknown', reason: 'delegate-failed' }),
+        SEAT_PLAN,
+      );
+      expect(await run()).toEqual({ outcome: 'parked', qualifier: null, reason: 'review-seat-unavailable' });
+      expect(requests).toHaveLength(0);
+      expect(harness.forgeRequests).toHaveLength(0);
+    });
+
+    it('a run already holding an unread pending premerge intent is requested ahead of its reconcile', async () => {
+      const { harness, requests, run } = await requestingHarness(() => ({ outcome: 'unknown', reason: 'delegate-failed' }));
+      await appendIntent(harness, premergeKey(), 'forge-example-1', NOW);
+      // The review request goes out (an unknown answer leaves it in flight), ahead of any reconcile of the post.
+      expect(await run()).toMatchObject({ outcome: 'acted', step: 'pre-merge' });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.kind).toBe('pre-merge');
+    });
+
+    it('a halted run with an unread pending premerge intent parks halted and spends no review', async () => {
+      const { harness, requests } = await requestingHarness(() => ({ outcome: 'unknown', reason: 'delegate-failed' }));
+      await appendIntent(harness, premergeKey(), 'forge-example-1', NOW);
+      const halted = await new AdvanceLaneRunUseCase(harness.deps).advanceLaneRun({
+        runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, halted: true, nowIso: LATER,
+      });
+      expect(halted).toMatchObject({ outcome: 'parked', reason: 'halted' });
+      expect(requests).toHaveLength(0);
+    });
+
+    it('a dropped request is re-requested, never a silent pending post; a failed receipt is never a pass', async () => {
+      let calls = 0;
+      const { harness, requests, run } = await requestingHarness(() => {
+        calls += 1;
+        return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'timeout' };
+      });
+      expect(await run()).toMatchObject({ step: 'pre-merge', key: stepKey(0, null), reasonCode: 'review-no-receipt' });
+      expect(await run()).toMatchObject({ step: 'pre-merge', key: stepKey(0, 1), reasonCode: 'review-no-receipt' });
+      expect(calls).toBe(2);
+      expect(requests.every((request) => request.kind === 'pre-merge')).toBe(true);
+      expect(harness.forgeRequests).toHaveLength(0);
+      harness.setReceiptAnswer(failedReceipt([finding('blocking', 1)]));
+      const afterFail = await run();
+      expect(afterFail).not.toMatchObject({ reasonCode: 'premerge-success' });
+      expect(harness.forgeRequests.every((request) => request.status?.state !== 'success')).toBe(true);
+    });
   });
 
   it('test 3: a failed receipt with two findings posts failure with findings: 2 and never copies summary text', async () => {

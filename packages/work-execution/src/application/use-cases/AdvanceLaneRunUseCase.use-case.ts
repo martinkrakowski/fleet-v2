@@ -98,7 +98,7 @@ import {
 import { abandonAmbiguousIntentForStop, performCancel, performStop } from './advance-lane-run/stop-cancel.js';
 import { performCollect, performGate } from './advance-lane-run/collect-gate.js';
 import { performReconcile } from './advance-lane-run/reconcile.js';
-import { performReview } from './advance-lane-run/review-fix.js';
+import { performReview, reconcileReview } from './advance-lane-run/review-fix.js';
 import { performAccept, performOpenPr, performPush } from './advance-lane-run/merge.js';
 import { performMergeEnqueue } from './advance-lane-run/merge-enqueue.js';
 import { performCiFailure, performPremerge } from './advance-lane-run/premerge.js';
@@ -434,12 +434,15 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       if (decision.step === 'gate') {
         return performGate(this.ctx, record, gathered, decision, request);
       }
-      if (decision.step === 'brief-check' || decision.step === 'code-review') {
+      if (decision.step === 'brief-check' || decision.step === 'code-review' || decision.step === 'pre-merge') {
         return performReview(this.ctx, record, gathered, decision, request);
       }
       return { outcome: 'not-built', decision: 'act', step: decision.step };
     }
     if (decision.kind === 'reconcile') {
+      if (decision.step === 'pre-merge') {
+        return reconcileReview(this.ctx, record, gathered, decision, request);
+      }
       return performReconcile(this.ctx, record, gathered, decision, request);
     }
     if (decision.kind === 'cancel') {

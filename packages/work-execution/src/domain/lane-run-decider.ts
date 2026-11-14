@@ -341,6 +341,21 @@ export interface LaneRunFacts {
   /** Receipts per (reviewer, kind) at `head12` (RW1) (PC/K5). */
   readonly briefCheck: LaneRunReviewFact;
   readonly codeReview: LaneRunReviewFact;
+  /**
+   * PMR1: the journal fact of the `pre-merge` review request at `head12`. Absent
+   * reads as `none`. The receipt fact `preMerge` below stays the authority on
+   * the verdict; this one only says whether a request was issued, is in flight,
+   * or was dropped without a receipt.
+   */
+  readonly preMergeReview?: LaneRunReviewFact;
+  /**
+   * PMR1: whether the conductor can request a review at all (seat comparison,
+   * review port, assessment port and work-order lookup are all wired). Absent
+   * reads as wired. When `false`, `merging` keeps the pre-PMR1 hold (post
+   * `pending`, no request, no park), so an installation that cannot review
+   * does not start parking.
+   */
+  readonly preMergeReviewWired?: boolean;
   /** Tier 2 pre-merge receipt for `head12` (D3) (K6). */
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   /** KS7a-2: the latest final `premerge` journal result at `head12` (the merging hold's post). */
@@ -714,8 +729,16 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return wait('review-seat-unavailable');
     };
 
-    const reviewRules = (kind: 'brief-check' | 'code-review'): LaneRunDecision => {
-      const review = kind === 'brief-check' ? facts.briefCheck : facts.codeReview;
+    /**
+     * The request side of a review kind: none, pending, no-receipt and unknown
+     * verdicts. `passed` and `failed` are the caller's, because what follows a
+     * verdict differs per kind. `pendingReason` is the wait a review in flight reads.
+     */
+    const requestRules = (
+      kind: 'brief-check' | 'code-review' | 'pre-merge',
+      review: LaneRunReviewFact,
+      pendingReason: 'review-pending' | 'premerge-pending',
+    ): LaneRunDecision | null => {
       if (review.verdict === 'none') {
         if (!facts.reviewSeat.ok) {
           return reviewSeatUnavailableDecision();
@@ -730,7 +753,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         });
       }
       if (review.verdict === 'pending') {
-        return wait('review-pending');
+        return wait(pendingReason);
       }
       if (review.verdict === 'no-receipt') {
         if (review.retries === 0 && review.seatIndex !== null) {
@@ -774,6 +797,15 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
           });
         }
         return park('ambiguous', kind);
+      }
+      return null;
+    };
+
+    const reviewRules = (kind: 'brief-check' | 'code-review'): LaneRunDecision => {
+      const review = kind === 'brief-check' ? facts.briefCheck : facts.codeReview;
+      const requested = requestRules(kind, review, 'review-pending');
+      if (requested !== null) {
+        return requested;
       }
       if (review.verdict === 'passed') {
         return kind === 'brief-check' ? enter('code-review') : enter('accepting');
@@ -1034,7 +1066,16 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
 
     const awaitingPremergeRules = (): LaneRunDecision => {
       if (facts.preMerge === 'none') {
-        return wait('premerge-pending');
+        // PMR1: no receipt yet. The request is issued here, the way the
+        // code-review is: a request in flight waits; a dropped one (no receipt
+        // after a reconcile) is re-requested under the review retry rules,
+        // never waited on forever. A journal verdict without a readable receipt
+        // is not a pass and not a fail: it waits for the receipt read.
+        const review: LaneRunReviewFact = facts.preMergeReview ?? {
+          verdict: 'none', seatIndex: null, retries: 0,
+        };
+        const requested = requestRules('pre-merge', review, 'premerge-pending');
+        return requested ?? wait('premerge-pending');
       }
       if (facts.preMerge === 'unknown') {
         return park('ambiguous', 'pre-merge');
@@ -1111,6 +1152,28 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return act({ step: 'ci', round: record.round, seatIndex: attempt.seatIndex, head12: facts.head12, retry: null, attemptOrdinal: null });
     };
 
+    /**
+     * PMR1: the pre-merge request from `merging`. Only Tier 2 with no receipt at
+     * the head, and only where the conductor can review at all. A request in
+     * flight waits, a dropped one retries under the review rules, and an
+     * exhausted request path PARKS (no free seat, a terminal no-receipt, an
+     * unread verdict): a seat is structural and never frees on its own. Null
+     * (post the hold as before) for a journal pass/fail whose receipt is not
+     * readable yet: never a pass.
+     */
+    const mergingPreMergeRequest = (): LaneRunDecision | null => {
+      if (
+        record.tier !== 2 ||
+        facts.preMerge !== 'none' ||
+        facts.premergePost === 'refused' ||
+        facts.preMergeReviewWired === false
+      ) {
+        return null;
+      }
+      const review: LaneRunReviewFact = facts.preMergeReview ?? { verdict: 'none', seatIndex: null, retries: 0 };
+      return requestRules('pre-merge', review, 'premerge-pending');
+    };
+
     const mergingRules = (): LaneRunDecision => {
       if (facts.pr === null) {
         return WAIT_FACTS_INCONSISTENT;
@@ -1123,6 +1186,14 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       }
       if (facts.merge.oneWayDoor) {
         return park('one-way-door', null);
+      }
+      // PMR1: a Tier 2 run reaches `merging` (D20) with no pre-merge receipt. The
+      // independent review is requested here, BEFORE the pending `premerge` post
+      // (whose unread intent would otherwise hold every later advance in the
+      // reconcile). A Tier 2 run that can review but has no free seat parks.
+      const preMergeRequest = mergingPreMergeRequest();
+      if (preMergeRequest !== null) {
+        return preMergeRequest;
       }
       // KS7a-2 (D20): the `premerge` post is the merge hold, read before the
       // policy-grant park and the merge tail; null falls through to them.
@@ -1199,7 +1270,22 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         }
         return park('halted', null);
       }
-      return { kind: 'reconcile', step: facts.pendingIntent.step, key: facts.pendingIntent.key };
+      // PMR1: a run already holding an unread pending `premerge` post (posted before
+      // the request existed) still needs its review. It does NOT act or park from
+      // here: it falls through to the guards below (stop, halt, head change, PR
+      // merged/closed, one-way door) and `mergingRules` issues the request or the
+      // park. A stopped run, or one whose request is merely in flight, reconciles.
+      const premergeNeedsReview =
+        facts.pendingIntent.step === 'premerge' &&
+        facts.state === 'merging' &&
+        facts.stopMode === null &&
+        (() => {
+          const requested = mergingPreMergeRequest();
+          return requested !== null && requested.kind !== 'wait';
+        })();
+      if (!premergeNeedsReview) {
+        return { kind: 'reconcile', step: facts.pendingIntent.step, key: facts.pendingIntent.key };
+      }
     }
 
     // G3b0 (R4a): a settled open-pr park leaves by itself; G3b below would

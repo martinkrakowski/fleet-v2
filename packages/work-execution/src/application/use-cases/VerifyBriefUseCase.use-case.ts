@@ -14,6 +14,7 @@
 
 import { readPlainRecord, type PlainRecordSchema } from '@fleet/shared';
 import { lintBrief } from '../../domain/brief-answer.js';
+import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import {
   isFixedProtectedPath,
   pathUnderPrefix,
@@ -92,7 +93,12 @@ const MANIFEST_SCHEMA: PlainRecordSchema = {
   prosePath: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_PATH_CHARS, optional: true },
   manifestPath: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_PATH_CHARS, optional: true },
   independentReviewer: { kind: 'string', maxLength: BRIEF_PACKAGE_MAX_SCALAR_CHARS },
-  acceptanceSpec: { kind: 'record', schema: {}, optional: true },
+  // `acceptanceSpec`, `modelAssignment` and `seatPlan` are deliberately not
+  // snapshotted here: an empty nested schema snapshots any record to `{}`,
+  // which would make `AcceptanceSpec.create` refuse every valid spec with
+  // `missing-acceptance-spec` and would erase the seat models the reviewer
+  // family check reads. The parsed manifest is fresh `JSON.parse` output
+  // (plain, dense), so the raw values are read from it directly below.
 };
 
 const RECEIPT_SCHEMA: PlainRecordSchema = {
@@ -123,6 +129,66 @@ function isValidScalar(value: unknown): value is string {
     && value.length <= BRIEF_PACKAGE_MAX_SCALAR_CHARS
     && !value.includes('\0')
   );
+}
+
+/**
+ * A prefix the brief accepts. `validateAllowedPathPrefix` itself normalises
+ * trailing slashes away, so a prefix such as `src/` passes it; the brief
+ * refuses that form explicitly.
+ */
+function isValidAllowedPrefix(prefix: unknown): boolean {
+  if (typeof prefix !== 'string' || validateAllowedPathPrefix(prefix) !== null) {
+    return false;
+  }
+  return !prefix.trim().endsWith('/');
+}
+
+/**
+ * The implementer/author seat models the frozen manifest declares: the model
+ * assignment (the authoring seat) plus every first-pass and fix seat of the
+ * optional seat plan. Read from the parsed manifest (fresh `JSON.parse`
+ * output, plain and dense) and fail closed: a seat whose model cannot be
+ * established is not a model that proves independence, so an empty result
+ * means the reviewer's independence cannot be verified.
+ */
+function implementerModelsOf(manifestPaths: Record<string, unknown>): string[] {
+  const models: string[] = [];
+  const assignment = manifestPaths.modelAssignment;
+  if (assignment !== null && typeof assignment === 'object' && !Array.isArray(assignment)) {
+    const model = (assignment as { model?: unknown }).model;
+    if (isValidScalar(model)) {
+      models.push(model.trim());
+    } else {
+      // The authoring seat must be known; without it no independence is provable.
+      return [];
+    }
+  } else {
+    return [];
+  }
+  const seatPlan = manifestPaths.seatPlan;
+  if (seatPlan !== undefined && seatPlan !== null && typeof seatPlan === 'object' && !Array.isArray(seatPlan)) {
+    // The frozen plan groups its seats under role keys (SeatPlanProps).
+    for (const role of ['first-pass', 'fix'] as const) {
+      const seats = (seatPlan as Record<string, unknown>)[role];
+      if (!Array.isArray(seats)) {
+        // A malformed plan is the reader's refusal (`invalid-seat-plan`); skip it here.
+        continue;
+      }
+      for (let index = 0; index < seats.length; index += 1) {
+        const seat = Object.getOwnPropertyDescriptor(seats, String(index))?.value;
+        if (seat === null || typeof seat !== 'object' || Array.isArray(seat)) {
+          continue;
+        }
+        const model = (seat as { model?: unknown }).model;
+        if (isValidScalar(model)) {
+          models.push(model.trim());
+        } else {
+          return [];
+        }
+      }
+    }
+  }
+  return models;
 }
 
 interface Snapshot {
@@ -348,9 +414,7 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
       !Array.isArray(allowedPathPrefixes)
       || allowedPathPrefixes.length === 0
       || allowedPathPrefixes.length > BRIEF_PACKAGE_MAX_OWNED_PATHS
-      || !allowedPathPrefixes.every(
-        (prefix) => typeof prefix === 'string' && validateAllowedPathPrefix(prefix) === null,
-      )
+      || !allowedPathPrefixes.every((prefix) => isValidAllowedPrefix(prefix))
     ) {
       return refuse('path-escapes-allowed-prefixes', 'invalid-allowed-prefix');
     }
@@ -386,7 +450,9 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
         policyRevision: workOrderRecord.policyRevision,
         independentReviewer: rawManifest.independentReviewer,
         ownedPaths: manifestPaths.ownedPaths,
-        acceptanceSpec: rawManifest.acceptanceSpec,
+        // Read raw from the parsed manifest: the plain-record snapshot would
+        // reduce any acceptance spec to `{}` and break `AcceptanceSpec.create`.
+        acceptanceSpec: manifestPaths.acceptanceSpec,
       },
       { computeDigest },
     );
@@ -407,6 +473,24 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
       || rawManifest.policyRevision !== workOrderRecord.policyRevision
     ) {
       return refuse('malformed-package', 'record-mismatch');
+    }
+
+    // The reviewer must be independent of every implementer/author seat the
+    // frozen manifest declares (owner rule 2026-10-16, fail closed): the
+    // same underlying model family after provider prefixes and tier variants
+    // is never independence, and a seat whose model is unknown refuses.
+    const implementerModels = implementerModelsOf(manifestPaths);
+    if (implementerModels.length === 0) {
+      return refuse('malformed-package', 'invalid-model-assignment');
+    }
+    const reviewerModel = typeof rawManifest.independentReviewer === 'string'
+      ? rawManifest.independentReviewer.trim()
+      : '';
+    const reviewerFamily = underlyingModelFamily(reviewerModel);
+    if (implementerModels.some(
+      (model) => isSameModelFamily(reviewerFamily, underlyingModelFamily(model)),
+    )) {
+      return refuse('malformed-package', 'reviewer-not-independent');
     }
 
     const lintResult = lintBrief(proseRaw);
@@ -470,21 +554,31 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
       typeof (reviewResult as { reason?: unknown } | null | undefined)?.reason === 'string'
         ? (reviewResult as { reason: string }).reason
         : 'review-incomplete';
-    if (
-      typeof reviewResult !== 'object'
-      || reviewResult === null
-      || !('outcome' in reviewResult)
-    ) {
+    // The result must be a plain record: `in` and property access accept
+    // inherited outcomes and hostile proxy traps can throw out of
+    // `verifyBrief`, so the snapshot below refuses both.
+    const outcomeRead = readPlainRecord(
+      reviewResult,
+      { outcome: { kind: 'string', maxLength: 64 } },
+    );
+    if (!outcomeRead.ok) {
       return unverified('review-unverified', detailForIncomplete());
     }
-    const outcome = (reviewResult as { outcome: unknown }).outcome;
+    const outcome = outcomeRead.value.outcome;
     if (outcome === 'unknown' || outcome === 'no-receipt' || outcome === 'refused') {
       return unverified('review-unverified', detailForIncomplete());
     }
     if (outcome !== 'receipt') {
       return unverified('review-unverified', detailForIncomplete());
     }
-    const receiptRaw = (reviewResult as unknown as { receipt: unknown }).receipt;
+    if (
+      typeof reviewResult !== 'object'
+      || reviewResult === null
+      || !Object.hasOwn(reviewResult, 'receipt')
+    ) {
+      return unverified('review-unverified', 'receipt-mismatch');
+    }
+    const receiptRaw = Object.getOwnPropertyDescriptor(reviewResult, 'receipt')?.value;
     const receiptRead = readPlainRecord(receiptRaw, RECEIPT_SCHEMA);
     if (!receiptRead.ok || receiptRead.value.requestId !== `brief-verify:${workOrderRecord.id}:${digest12}`) {
       return unverified('review-unverified', 'receipt-mismatch');

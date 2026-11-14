@@ -569,4 +569,102 @@ describe('VerifyBriefUseCase', () => {
       outcome: 'unverified', reason: 'review-unverified', detail: 'missing-request-review',
     });
   });
+
+  it('refuses a trailing-slash allowedPathPrefix such as src/ with path-escapes-allowed-prefixes', async () => {
+    for (const prefix of ['src/', 'src//']) {
+      const result = await verifyWith(fixture((manifest) => {
+        manifest.allowedPathPrefixes = [prefix];
+      }));
+      expect(result).toEqual({
+        outcome: 'refused', reason: 'path-escapes-allowed-prefixes', detail: 'invalid-allowed-prefix',
+      });
+    }
+  });
+
+  it('refuses a reviewer sharing a model family with the implementer, seat-plan, or author seat, and an unknown author model', async () => {
+    // Same underlying family after provider path and tier suffix.
+    const sameAsAssignment = await verifyWith(fixture((manifest) => {
+      manifest.independentReviewer = 'provider/impl-model#low';
+    }));
+    expect(sameAsAssignment).toEqual({
+      outcome: 'refused', reason: 'malformed-package', detail: 'reviewer-not-independent',
+    });
+
+    // Same family with a fix seat of the frozen plan.
+    const sameAsSeatPlan = await verifyWith(fixture((manifest) => {
+      manifest.seatPlan = {
+        version: 1,
+        'first-pass': [{ id: 'fp-1', model: 'impl-model', tool: 'opencode' }],
+        fix: [{ id: 'fx-1', model: 'fixer-model', tool: 'agy' }],
+        review: [{ id: 'rv-1', model: REVIEWER }],
+      };
+      manifest.independentReviewer = 'other/fixer-model@alt';
+    }));
+    expect(sameAsSeatPlan).toEqual({
+      outcome: 'refused', reason: 'malformed-package', detail: 'reviewer-not-independent',
+    });
+
+    // Without the author model no independence is provable, so it refuses closed.
+    const missingAssignment = await verifyWith(
+      fixture((manifest) => { delete manifest.modelAssignment; }),
+    );
+    expect(missingAssignment).toEqual({
+      outcome: 'refused', reason: 'malformed-package', detail: 'invalid-model-assignment',
+    });
+
+    // A distinct family still verifies.
+    const independent = await verifyWith(fixture((manifest) => {
+      manifest.seatPlan = {
+        version: 1,
+        'first-pass': [{ id: 'fp-1', model: 'impl-model', tool: 'opencode' }],
+        fix: [{ id: 'fx-1', model: 'unrelated-model', tool: 'agy' }],
+        review: [{ id: 'rv-1', model: REVIEWER }],
+      };
+    }));
+    expect(independent.outcome).toBe('verified');
+  });
+
+  it('honours the manifest acceptance spec instead of an empty snapshot', async () => {
+    // A manifest whose acceptance spec was removed (not merely emptied) is
+    // refused as missing: with the spec read raw, the absence is what the
+    // reader sees; the valid happy path above proves a real spec survives.
+    const removed = await verifyWith(
+      fixture((manifest) => { delete manifest.acceptanceSpec; }),
+    );
+    expect(removed).toEqual({
+      outcome: 'refused', reason: 'malformed-package', detail: 'missing-acceptance-spec',
+    });
+  });
+
+  it('returns unverified when the review result inherits outcome and receipt or traps a property access', async () => {
+    const base = fixture();
+    // Inherited outcome and receipt: `in` and property access would accept
+    // this and reach verified; the plain-record read refuses it.
+    const inherited = Object.create({
+      outcome: 'receipt',
+      receipt: receiptFor(base.briefDigest, 'passed'),
+    });
+    const inheritedResult = await new VerifyBriefUseCase(depsWith({
+      reviews: () => Promise.resolve(inherited as unknown as ReviewRequestResult),
+    })).verifyBrief(base.request);
+    expect(inheritedResult).toEqual({
+      outcome: 'unverified', reason: 'review-unverified', detail: 'review-incomplete',
+    });
+
+    // A hostile proxy trap must never throw out of verifyBrief.
+    const trapping = new Proxy({}, {
+      get(_target, property) {
+        if (property === 'outcome') {
+          throw new Error('trap');
+        }
+        return undefined;
+      },
+    });
+    const trappingResult = await new VerifyBriefUseCase(depsWith({
+      reviews: () => Promise.resolve(trapping as unknown as ReviewRequestResult),
+    })).verifyBrief(base.request);
+    expect(trappingResult).toEqual({
+      outcome: 'unverified', reason: 'review-unverified', detail: 'review-incomplete',
+    });
+  });
 });

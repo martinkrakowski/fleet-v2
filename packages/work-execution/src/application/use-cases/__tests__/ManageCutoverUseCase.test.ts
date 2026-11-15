@@ -13,7 +13,11 @@ import { DaemonPauseAdapter } from '../../../infrastructure/adapters/DaemonPause
 import { KillallTrainPauseAdapter } from '../../../infrastructure/adapters/KillallTrainPauseAdapter.adapter.js';
 import { WORK_EXECUTION_STATE_FILES } from '../../../infrastructure/adapters/state-files.js';
 import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifactAdapter.adapter.js';
-import type { CutoverRecord } from '../../../domain/cutover-records.js';
+import {
+  CUTOVER_ROLLBACK_WINDOW_MS,
+  CUTOVER_SHADOW_CRITERIA,
+  type CutoverRecord,
+} from '../../../domain/cutover-records.js';
 import { ManageCutoverUseCase, type ManageCutoverDependencies } from '../ManageCutoverUseCase.use-case.js';
 
 const SWITCHED_AT = '2026-11-03T12:00:00.000Z';
@@ -22,6 +26,9 @@ const LATER = '2026-11-05T13:00:00.000Z';
 const EARLIER_DEADLINE = '2026-11-05T11:00:00.000Z';
 const FUTURE_DEADLINE = '2026-11-05T18:00:00.000Z';
 const PLAN_DIGEST = 'b'.repeat(64);
+const AT_WINDOW_NOW = new Date(Date.parse(SWITCHED_AT) + CUTOVER_ROLLBACK_WINDOW_MS).toISOString();
+const INSIDE_WINDOW_NOW = new Date(Date.parse(SWITCHED_AT) + CUTOVER_ROLLBACK_WINDOW_MS - 1).toISOString();
+const AFTER_WINDOW_NOW = new Date(Date.parse(SWITCHED_AT) + CUTOVER_ROLLBACK_WINDOW_MS + 3 * 86_400_000).toISOString();
 
 // Built at runtime so no literal token shape appears in source.
 const LEGACY_ONLY_SECRET = 'xox' + 's-' + '1234567890';
@@ -256,6 +263,67 @@ function rollbackRequest(overrides: Record<string, unknown> = {}): Record<string
   return { move: 'rollback', expectedRevision: 1, operationId: 'op-1', nowIso: NOW, ...overrides };
 }
 
+function shadowRecord(revision = 1): CutoverRecord {
+  return {
+    schemaVersion: 1,
+    revision,
+    state: 'shadow',
+    updatedAtIso: SWITCHED_AT,
+    switchedAtIso: null,
+    rolledBackAtIso: null,
+    retiredAtIso: null,
+    relaunchPlanDigest: null,
+    trainPauseSetByCutover: false,
+  };
+}
+
+function rolledBackRecord(revision = 1): CutoverRecord {
+  return { ...switchedRecord(revision), state: 'rolled-back', rolledBackAtIso: NOW, trainPauseSetByCutover: false };
+}
+
+function switchRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    move: 'switch',
+    expectedRevision: 0,
+    operationId: 'op-1',
+    relaunchPlanDigest: PLAN_DIGEST,
+    nowIso: NOW,
+    ...overrides,
+  };
+}
+
+function retireRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { move: 'retire', expectedRevision: 1, operationId: 'op-1', nowIso: AT_WINDOW_NOW, ...overrides };
+}
+
+/** Three consecutive pass days ending on the UTC date of `nowIso`. */
+function shadowEvidence(nowIso: string, verdictOverrides: Record<string, string> = {}): Record<string, unknown> {
+  const base = Date.parse(nowIso);
+  const days = [2, 1, 0].map((back) => {
+    const verdicts: Record<string, string> = {};
+    for (const id of CUTOVER_SHADOW_CRITERIA) verdicts[id] = 'pass';
+    return { day: new Date(base - back * 86_400_000).toISOString().slice(0, 10), verdicts };
+  });
+  for (const [id, verdict] of Object.entries(verdictOverrides)) {
+    (days[2].verdicts as Record<string, string>)[id] = verdict;
+  }
+  return { days };
+}
+
+type ShadowEvidenceReader = NonNullable<ManageCutoverDependencies['readShadowEvidence']>;
+type UnrecordedLanesCounter = NonNullable<ManageCutoverDependencies['countUnrecordedLanes']>;
+
+function readers(overrides: { readShadowEvidence?: ShadowEvidenceReader; countUnrecordedLanes?: UnrecordedLanesCounter } = {}): {
+  readShadowEvidence: ShadowEvidenceReader;
+  countUnrecordedLanes: UnrecordedLanesCounter;
+} {
+  return {
+    readShadowEvidence: async () => ({ status: 'ok', evidence: shadowEvidence(NOW) }),
+    countUnrecordedLanes: async () => ({ status: 'ok', unrecorded: 0, unknownListings: 0 }),
+    ...overrides,
+  };
+}
+
 async function journalEntries(h: Harness, key: string): Promise<readonly { kind: string; outcome?: string }[]> {
   const listed = await h.journal.listByKeyPrefix(key);
   return listed.outcome === 'listed' ? listed.entries.filter((entry) => entry.key === key) : [];
@@ -367,11 +435,11 @@ describe('ManageCutoverUseCase rollback', () => {
     expect(totalWriteCalls(early)).toBe(0);
   });
 
-  it('refuses switch and retire as not implemented, with no port call', async () => {
+  it('refuses bare switch and retire requests that carry none of the required fields, with no port call', async () => {
     const h = await harness();
     resetSpies(h);
     for (const move of ['switch', 'retire']) {
-      expect(await h.useCase.execute({ move })).toEqual({ outcome: 'refused', reason: 'move-not-implemented' });
+      expect(await h.useCase.execute({ move })).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     }
     expect(h.spies.repoRead).not.toHaveBeenCalled();
     expect(totalWriteCalls(h)).toBe(0);
@@ -401,6 +469,403 @@ describe('ManageCutoverUseCase rollback', () => {
       next: { ...switchedRecord(3) },
     });
     expect(await h.useCase.execute(rollbackRequest())).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
+  });
+});
+
+describe('ManageCutoverUseCase switch', () => {
+  it('switch rejects a throwing getter on the request with invalid-request and writes nothing', async () => {
+    const h = await harness({ seed: null });
+    const request: Record<string, unknown> = { move: 'switch', expectedRevision: 0, operationId: 'op-1', relaunchPlanDigest: PLAN_DIGEST, nowIso: NOW };
+    Object.defineProperty(request, 'deadlineIso', {
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    resetSpies(h);
+    const result = await h.useCase.execute(request);
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(JSON.stringify(result)).not.toContain('boom');
+    expect(totalWriteCalls(h)).toBe(0);
+    expect(h.spies.repoRead).not.toHaveBeenCalled();
+  });
+
+  it('switch returns secret-shaped for a secret-shaped operation id and writes nothing', async () => {
+    const h = await harness({ seed: null });
+    const result = await h.useCase.execute(switchRequest({ operationId: LEGACY_ONLY_SECRET }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
+    expect(JSON.stringify(result)).not.toContain(LEGACY_ONLY_SECRET);
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('switch returns unknown for an unreadable cutover record and writes nothing', async () => {
+    for (const status of ['unreadable', 'unknown-version'] as const) {
+      const h = await harness({ seed: null });
+      h.spies.repoRead.mockResolvedValue({ status });
+      resetSpies(h);
+      expect(await h.useCase.execute(switchRequest())).toEqual({
+        outcome: 'unknown',
+        reason: status === 'unreadable' ? 'cutover-record-unreadable' : 'cutover-record-unknown-version',
+      });
+      expect(totalWriteCalls(h)).toBe(0);
+    }
+  });
+
+  it('refuses not-shadow for a stored state that is not shadow, and revision-conflict for a mismatched revision', async () => {
+    const switched = await harness();
+    resetSpies(switched);
+    expect(await switched.useCase.execute(switchRequest({ expectedRevision: 1 }))).toEqual({
+      outcome: 'refused',
+      reason: 'not-shadow',
+    });
+    expect(totalWriteCalls(switched)).toBe(0);
+
+    const missing = await harness({ seed: null });
+    resetSpies(missing);
+    expect(await missing.useCase.execute(switchRequest({ expectedRevision: 1 }))).toEqual({
+      outcome: 'refused',
+      reason: 'revision-conflict',
+    });
+    expect(totalWriteCalls(missing)).toBe(0);
+  });
+
+  it('a missing readShadowEvidence method refuses shadow-evidence-absent and names S1 through S13', async () => {
+    const h = await harness({ seed: null });
+    resetSpies(h);
+    const result = await h.useCase.execute(switchRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'shadow-evidence-absent', failed: [...CUTOVER_SHADOW_CRITERIA] });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+  });
+
+  it('a reader that answers absent refuses shadow-evidence-absent, and unreadable or unknown-version answers are unknown', async () => {
+    for (const [status, expected] of [
+      ['absent', { outcome: 'refused', reason: 'shadow-evidence-absent', failed: [...CUTOVER_SHADOW_CRITERIA] }],
+      ['unreadable', { outcome: 'unknown', reason: 'shadow-evidence-unreadable' }],
+      ['unknown-version', { outcome: 'unknown', reason: 'shadow-evidence-unknown-version' }],
+      ['threw', { outcome: 'unknown', reason: 'shadow-evidence-unreadable' }],
+    ] as const) {
+      const h = await harness({ seed: null });
+      const reader: ShadowEvidenceReader =
+        status === 'threw'
+          ? async () => {
+              throw new Error('boom');
+            }
+          : (async () => ({ status })) as ShadowEvidenceReader;
+      const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers({ readShadowEvidence: reader }) });
+      resetSpies(h);
+      expect(await useCase.execute(switchRequest())).toEqual(expected);
+      expect(totalWriteCalls(h)).toBe(0);
+    }
+  });
+
+  it('switch names S4 when that verdict is unknown and the other criteria pass', async () => {
+    const h = await harness({ seed: null });
+    const useCase = new ManageCutoverUseCase({
+      ...h.deps,
+      ...readers({ readShadowEvidence: async () => ({ status: 'ok', evidence: shadowEvidence(NOW, { S4: 'unknown' }) }) }),
+    });
+    resetSpies(h);
+    const result = await useCase.execute(switchRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: ['S4'] });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+  });
+
+  it('answers unrecorded-lanes-unknown for a missing or unreadable count or unknown listings, and unrecorded-lanes for unrecorded work', async () => {
+    for (const [label, counter, expected] of [
+      ['missing', undefined, { outcome: 'unknown', reason: 'unrecorded-lanes-unknown' }],
+      ['unreadable', async () => ({ status: 'unreadable' }) as unknown as ReturnType<UnrecordedLanesCounter>, { outcome: 'unknown', reason: 'unrecorded-lanes-unknown' }],
+      ['unknown listings', async () => ({ status: 'ok', unrecorded: 0, unknownListings: 2 }), { outcome: 'unknown', reason: 'unrecorded-lanes-unknown' }],
+      ['unrecorded', async () => ({ status: 'ok', unrecorded: 1, unknownListings: 0 }), { outcome: 'refused', reason: 'unrecorded-lanes' }],
+      ['throws', async () => { throw new Error('boom'); }, { outcome: 'unknown', reason: 'unrecorded-lanes-unknown' }],
+    ] as const) {
+      const h = await harness({ seed: null });
+      const useCase = new ManageCutoverUseCase({
+        ...h.deps,
+        ...readers(counter === undefined ? { countUnrecordedLanes: undefined } : { countUnrecordedLanes: counter as UnrecordedLanesCounter }),
+      });
+      resetSpies(h);
+      expect({ label, result: await useCase.execute(switchRequest()) }).toEqual({ label, result: expected });
+      expect(totalWriteCalls(h)).toBe(0);
+    }
+  });
+
+  it('reports daemon-status-unreadable, train-pause-unreadable and deadline-exceeded for a switch, with no compare-and-set', async () => {
+    const boom = (): never => {
+      throw new Error('boom');
+    };
+    const cases: Array<[string, (h: Harness) => void | Promise<void>, Record<string, string>]> = [
+      ['daemon status throws', (h) => void ((h.deps as { daemonStatus: unknown }).daemonStatus = { read: boom }), { outcome: 'unknown', reason: 'daemon-status-unreadable' }],
+      ['daemon status unreadable', (h) => void ((h.deps as { daemonStatus: unknown }).daemonStatus = { read: async () => ({ status: 'unreadable' }) }), { outcome: 'unknown', reason: 'daemon-status-unreadable' }],
+      ['train pause throws', (h) => void ((h.deps as { trainPauseRead: unknown }).trainPauseRead = { read: boom }), { outcome: 'unknown', reason: 'train-pause-unreadable' }],
+      ['train pause unreadable', (h) => void ((h.deps as { trainPauseRead: unknown }).trainPauseRead = { read: async () => ({ status: 'unreadable' }) }), { outcome: 'unknown', reason: 'train-pause-unreadable' }],
+      ['deadline passed', () => undefined, { outcome: 'unknown', reason: 'deadline-exceeded' }],
+    ];
+    for (const [label, arrange, expected] of cases) {
+      const h = await harness({ seed: null });
+      await arrange(h);
+      const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+      resetSpies(h);
+      const request = label === 'deadline passed' ? switchRequest({ deadlineIso: EARLIER_DEADLINE }) : switchRequest();
+      expect({ label, result: await useCase.execute(request) }).toEqual({ label, result: expected });
+      expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+      expect(h.spies.journalAppend).not.toHaveBeenCalled();
+      if (label.startsWith('train pause')) {
+        expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it('switch sets the train pause and saves a switched record when evidence passes and no lane is unrecorded', async () => {
+    const h = await harness({ seed: null });
+    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    resetSpies(h);
+    const result = await useCase.execute(switchRequest());
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      move: 'switch',
+      key: 'cutover/switch@0',
+      replayed: false,
+      state: 'switched',
+      revision: 1,
+    });
+    expect(h.spies.trainPauseSet).toHaveBeenCalledWith({ paused: true, nowIso: NOW });
+    expect(h.spies.daemonPauseWrite).not.toHaveBeenCalled();
+    expect(await h.repo.read()).toMatchObject({
+      status: 'ok',
+      record: {
+        state: 'switched',
+        revision: 1,
+        switchedAtIso: NOW,
+        relaunchPlanDigest: PLAN_DIGEST,
+        trainPauseSetByCutover: true,
+        rolledBackAtIso: null,
+        retiredAtIso: null,
+      },
+    });
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([
+      expect.objectContaining({ kind: 'intent' }),
+      expect.objectContaining({ kind: 'result', outcome: 'completed' }),
+    ]);
+
+    // A second call with the same operation id replays without calling set again.
+    resetSpies(h);
+    const replay = await useCase.execute(switchRequest());
+    expect(replay).toMatchObject({ outcome: 'completed', replayed: true, state: 'switched', revision: 1 });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+  });
+
+  it('switch still proceeds when the daemon is present with a failed last tick', async () => {
+    const h = await harness({ seed: null, daemonStatus: { read: async () => ({ status: 'ok', record: { exitCode: 1 } as never }) } });
+    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', state: 'switched', revision: 1 });
+    expect(h.spies.trainPauseSet).toHaveBeenCalledTimes(1);
+  });
+
+  it('finishes a switch cut short after the intent, and maps refused writes to unknown', async () => {
+    // A compare-and-set that throws once leaves the intent recorded; the next pass finishes the move.
+    const h = await harness({ seed: null });
+    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    h.spies.compareAndSet.mockRejectedValueOnce(new Error('disk gone'));
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'cutover-record-write-failed' });
+    expect(await journalEntries(h, 'cutover/switch@0')).toHaveLength(1);
+    expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false, revision: 1 });
+    expect(await journalEntries(h, 'cutover/switch@0')).toHaveLength(2);
+
+    // A refused train-pause set is unknown and the record stays unswitched.
+    const refusedSet = await harness({ seed: null });
+    const refusedUseCase = new ManageCutoverUseCase({ ...refusedSet.deps, ...readers() });
+    refusedSet.spies.trainPauseSet.mockResolvedValueOnce({ outcome: 'refused', reason: 'pause-unreadable' });
+    expect(await refusedUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'train-pause-write-failed' });
+    expect(await refusedSet.repo.read()).toEqual({ status: 'missing' });
+
+    // A refused compare-and-set is unknown; a conflict is a refusal.
+    const refusedCas = await harness({ seed: null });
+    const refusedCasUseCase = new ManageCutoverUseCase({ ...refusedCas.deps, ...readers() });
+    refusedCas.spies.compareAndSet.mockResolvedValueOnce({ outcome: 'refused', reason: 'unreadable' });
+    expect(await refusedCasUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'cutover-record-write-failed' });
+    refusedCas.spies.compareAndSet.mockResolvedValueOnce({ outcome: 'conflict', currentRevision: 4 });
+    expect(await refusedCasUseCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
+
+    // A failed intent append writes no journal entry.
+    const failedAppend = await harness({ seed: null });
+    const failedAppendUseCase = new ManageCutoverUseCase({ ...failedAppend.deps, ...readers() });
+    failedAppend.spies.journalAppend.mockResolvedValueOnce({ outcome: 'refused', reason: 'store-unreadable' });
+    expect(await failedAppendUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'journal-append-failed' });
+    expect(await journalEntries(failedAppend, 'cutover/switch@0')).toHaveLength(0);
+  });
+
+  it('refuses a switch whose intent digest differs and a replay whose recorded outcome was a refusal', async () => {
+    const h = await harness({ seed: null });
+    const digest = sha256HexDigest(`{"move":"switch","expectedRevision":0,"operationId":"op-1","relaunchPlanDigest":"${PLAN_DIGEST}"}`);
+    await h.journal.append({ key: 'cutover/switch@0', kind: 'intent', entryId: ulid(910), recordedAtIso: NOW, digest });
+    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    expect(await useCase.execute(switchRequest({ operationId: 'op-2' }))).toEqual({
+      outcome: 'refused',
+      reason: 'intent-digest-mismatch',
+    });
+    await h.journal.append({
+      key: 'cutover/switch@0',
+      kind: 'result',
+      entryId: ulid(911),
+      recordedAtIso: NOW,
+      outcome: 'refused',
+      reasonCode: 'refused',
+      digest,
+    });
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'journal-refused' });
+  });
+});
+
+describe('ManageCutoverUseCase retire', () => {
+  it('retire refuses not-switched when no switch is recorded', async () => {
+    const missing = await harness({ seed: null });
+    resetSpies(missing);
+    expect(await missing.useCase.execute(retireRequest())).toEqual({ outcome: 'refused', reason: 'not-switched' });
+    expect(totalWriteCalls(missing)).toBe(0);
+
+    const shadow = await harness({ seed: shadowRecord(1) });
+    expect(await shadow.useCase.execute(retireRequest())).toEqual({ outcome: 'refused', reason: 'not-switched' });
+
+    const rolledBack = await harness({ seed: rolledBackRecord(1) });
+    resetSpies(rolledBack);
+    expect(await rolledBack.useCase.execute(retireRequest())).toEqual({ outcome: 'refused', reason: 'not-switched' });
+    expect(totalWriteCalls(rolledBack)).toBe(0);
+  });
+
+  it('retire at exactly 14 days lifts a cutover-owned train pause and saves retired', async () => {
+    const h = await harness();
+    resetSpies(h);
+    const result = await h.useCase.execute(retireRequest({ nowIso: AT_WINDOW_NOW }));
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      move: 'retire',
+      key: 'cutover/retire@1',
+      replayed: false,
+      state: 'retired',
+      revision: 2,
+    });
+    expect(h.spies.trainPauseSet).toHaveBeenCalledWith({ paused: false, nowIso: AT_WINDOW_NOW });
+    expect(h.spies.daemonPauseWrite).not.toHaveBeenCalled();
+    expect(await h.repo.read()).toMatchObject({
+      status: 'ok',
+      record: {
+        state: 'retired',
+        revision: 2,
+        switchedAtIso: SWITCHED_AT,
+        retiredAtIso: AT_WINDOW_NOW,
+        rolledBackAtIso: null,
+        relaunchPlanDigest: PLAN_DIGEST,
+        trainPauseSetByCutover: false,
+      },
+    });
+    expect(await journalEntries(h, 'cutover/retire@1')).toEqual([
+      expect.objectContaining({ kind: 'intent' }),
+      expect.objectContaining({ kind: 'result', outcome: 'completed' }),
+    ]);
+  });
+
+  it('retire leaves an existing train pause when the cutover did not set it', async () => {
+    const h = await harness({ seed: switchedRecord(1, false) });
+    await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
+    resetSpies(h);
+    expect(await h.useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toMatchObject({
+      outcome: 'completed',
+      state: 'retired',
+      revision: 2,
+    });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect((await h.trainPause.read()).status).toBe('paused');
+  });
+
+  it('retire one millisecond before 14 days refuses inside-rollback-window and does not lift the pause', async () => {
+    const h = await harness();
+    resetSpies(h);
+    expect(await h.useCase.execute(retireRequest({ nowIso: INSIDE_WINDOW_NOW }))).toEqual({
+      outcome: 'refused',
+      reason: 'inside-rollback-window',
+    });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+    expect((await h.trainPause.read()).status).toBe('paused');
+  });
+
+  it('retire with nowIso before the switch refuses invalid-clock', async () => {
+    const h = await harness();
+    resetSpies(h);
+    expect(await h.useCase.execute(retireRequest({ nowIso: '2026-11-01T00:00:00.000Z' }))).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-clock',
+    });
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('maps a refused pause lift, a refused compare-and-set and a failed journal append to unknown for a retire', async () => {
+    const lift = await harness();
+    lift.spies.trainPauseSet.mockResolvedValueOnce({ outcome: 'refused', reason: 'pause-unreadable' });
+    expect(await lift.useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'unknown',
+      reason: 'train-pause-write-failed',
+    });
+    expect(await lift.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', revision: 1 } });
+
+    const cas = await harness();
+    cas.spies.compareAndSet.mockResolvedValueOnce({ outcome: 'refused', reason: 'unreadable' });
+    expect(await cas.useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'unknown',
+      reason: 'cutover-record-write-failed',
+    });
+    cas.spies.compareAndSet.mockResolvedValueOnce({ outcome: 'conflict', currentRevision: 9 });
+    expect(await cas.useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'refused',
+      reason: 'revision-conflict',
+    });
+
+    const append = await harness();
+    append.spies.journalAppend.mockResolvedValueOnce({ outcome: 'refused', reason: 'store-unreadable' });
+    expect(await append.useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'unknown',
+      reason: 'journal-append-failed',
+    });
+    expect(await journalEntries(append, 'cutover/retire@1')).toHaveLength(0);
+  });
+
+  it('replays a completed retire without lifting the pause again', async () => {
+    const h = await harness();
+    const request = retireRequest({ nowIso: AFTER_WINDOW_NOW });
+    expect(await h.useCase.execute(request)).toMatchObject({ outcome: 'completed', replayed: false, state: 'retired' });
+    resetSpies(h);
+    expect(await h.useCase.execute(request)).toMatchObject({ outcome: 'completed', replayed: true, state: 'retired', revision: 2 });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+  });
+
+  it('answers deadline-exceeded for a retire before any write', async () => {
+    const h = await harness();
+    resetSpies(h);
+    expect(await h.useCase.execute(retireRequest({ deadlineIso: EARLIER_DEADLINE }))).toEqual({
+      outcome: 'unknown',
+      reason: 'deadline-exceeded',
+    });
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('refuses a retire whose intent digest differs', async () => {
+    const h = await harness();
+    const digest = sha256HexDigest('{"move":"retire","expectedRevision":1,"operationId":"op-1"}');
+    await h.journal.append({ key: 'cutover/retire@1', kind: 'intent', entryId: ulid(920), recordedAtIso: NOW, digest });
+    expect(await h.useCase.execute(retireRequest({ operationId: 'op-2' }))).toEqual({
+      outcome: 'refused',
+      reason: 'intent-digest-mismatch',
+    });
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
   });
 });
 

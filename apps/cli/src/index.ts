@@ -714,7 +714,9 @@ killall halt marker; --lift clears the pause then the marker. Run
 
 The cutover group reports the shadow comparison of the fleet-v2 merge queue
 against the shell train's recorded queue for one repository (read-only, ids and
-codes only). Run 'fleet-v2 cutover --help'.
+codes only), and moves the cutover record: 'switch' is the one-way door through
+the shadow criteria evidence, and 'retire' closes the record after the 14-day
+rollback window. Run 'fleet-v2 cutover --help'.
 The report group prints the weekly run-journal service report (read-only, one
 JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 
@@ -743,6 +745,8 @@ Commands:
   relaunch inventory [--host <name>]
   release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
+  cutover switch --expected-revision <n> --operation-id <id> --relaunch-plan-digest <64 hex> [--now-iso <iso>] [--deadline-iso <iso>]
+  cutover retire --expected-revision <n> --operation-id <id> [--now-iso <iso>] [--deadline-iso <iso>]
   tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve

@@ -1,7 +1,8 @@
 /**
  * The `cutover` command group of the CLI driver. `status` and `rollback` (lane
  * CO30a) read and move the cutover record through `ManageCutoverUseCase`;
- * `switch` and `retire` are not mounted until CO30b. The rest of this note is
+ * `switch` is the one-way door through the shadow criteria and `retire` closes
+ * the record after the rollback window (lane CO30b). The rest of this note is
  * lane CO32: reads only: the `shadow report` subcommand compares the fleet-v2 merge queue against the
  * shell train's recorded queue for one repository and prints one JSON document
  * of ids and codes. It writes nothing and grants nothing.
@@ -76,6 +77,33 @@ function expectedRevisionFlag(p: Payload): number {
   return revision;
 }
 
+/** The switch revision accepts 0, the one-way door's no-record-yet revision. */
+function switchExpectedRevisionFlag(p: Payload): number {
+  const value = p['expectedRevision'];
+  const revision =
+    typeof value === 'number' ? value : typeof value === 'string' && /^[0-9]{1,10}$/.test(value) ? Number(value) : NaN;
+  if (!Number.isSafeInteger(revision) || revision < 0 || revision > 1_000_000_000) {
+    throw new CliUsageError('cutover switch requires --expected-revision as an integer between 0 and 1000000000');
+  }
+  return revision;
+}
+
+function operationIdFlag(p: Payload, subcommand: 'rollback' | 'switch' | 'retire'): string {
+  const operationId = p['operationId'];
+  if (typeof operationId !== 'string' || operationId.trim() === '') {
+    throw new CliUsageError(`cutover ${subcommand} requires --operation-id`);
+  }
+  return operationId;
+}
+
+function relaunchPlanDigestFlag(p: Payload): string {
+  const digest = p['relaunchPlanDigest'];
+  if (typeof digest !== 'string' || !/^[0-9a-f]{64}$/.test(digest)) {
+    throw new CliUsageError('cutover switch requires --relaunch-plan-digest as 64 lowercase hex characters');
+  }
+  return digest;
+}
+
 export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
   status: async (payload, runtime) => {
     rejectUnexpectedInput(payload, 'status', ['nowIso', 'deadlineIso']);
@@ -91,14 +119,45 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
   rollback: async (payload, runtime) => {
     rejectUnexpectedInput(payload, 'rollback', ['expectedRevision', 'operationId', 'nowIso', 'deadlineIso']);
     const expectedRevision = expectedRevisionFlag(payload);
-    const operationId = payload['operationId'];
-    if (typeof operationId !== 'string' || operationId.trim() === '') {
-      throw new CliUsageError('cutover rollback requires --operation-id');
-    }
+    const operationId = operationIdFlag(payload, 'rollback');
     const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso') ?? runtime.daemon.now();
     const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
     return runtime.execution.manageCutover.execute({
       move: 'rollback',
+      expectedRevision,
+      operationId,
+      nowIso,
+      ...(deadlineIso === undefined ? {} : { deadlineIso }),
+    });
+  },
+
+  switch: async (payload, runtime) => {
+    rejectUnexpectedInput(payload, 'switch', [
+      'expectedRevision', 'operationId', 'relaunchPlanDigest', 'nowIso', 'deadlineIso',
+    ]);
+    const expectedRevision = switchExpectedRevisionFlag(payload);
+    const operationId = operationIdFlag(payload, 'switch');
+    const relaunchPlanDigest = relaunchPlanDigestFlag(payload);
+    const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso') ?? runtime.daemon.now();
+    const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
+    return runtime.execution.manageCutover.execute({
+      move: 'switch',
+      expectedRevision,
+      operationId,
+      relaunchPlanDigest,
+      nowIso,
+      ...(deadlineIso === undefined ? {} : { deadlineIso }),
+    });
+  },
+
+  retire: async (payload, runtime) => {
+    rejectUnexpectedInput(payload, 'retire', ['expectedRevision', 'operationId', 'nowIso', 'deadlineIso']);
+    const expectedRevision = expectedRevisionFlag(payload);
+    const operationId = operationIdFlag(payload, 'retire');
+    const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso') ?? runtime.daemon.now();
+    const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
+    return runtime.execution.manageCutover.execute({
+      move: 'retire',
       expectedRevision,
       operationId,
       nowIso,

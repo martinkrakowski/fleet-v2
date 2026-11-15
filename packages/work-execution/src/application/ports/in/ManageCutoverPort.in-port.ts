@@ -1,9 +1,9 @@
 /**
- * ManageCutoverPort reads and moves the cutover record v1 (lane CO30a): `status`
- * is read-only and `rollback` pauses the daemon and lifts only the train pause
- * the cutover itself set. `switch` and `retire` are not built yet and are
- * refused as `move-not-implemented`. `execute` accepts `unknown` and never
- * throws; ids and codes only.
+ * ManageCutoverPort reads and moves the cutover record v1 (lanes CO30a and
+ * CO30b): `status` is read-only, `rollback` pauses the daemon and lifts only
+ * the train pause the cutover itself set, `switch` is the one-way door through
+ * the shadow criteria, and `retire` closes the record after the rollback
+ * window. `execute` accepts `unknown` and never throws; ids and codes only.
  */
 import type { CutoverRecord, CutoverState } from '../../../domain/cutover-records.js';
 
@@ -21,7 +21,31 @@ export interface ManageCutoverRollbackRequest {
   readonly deadlineIso?: string;
 }
 
-export type ManageCutoverRequest = ManageCutoverStatusRequest | ManageCutoverRollbackRequest;
+export interface ManageCutoverSwitchRequest {
+  readonly move: 'switch';
+  /** The revision the caller believes is stored; 0 is allowed when no record exists yet. */
+  readonly expectedRevision: number;
+  readonly operationId: string;
+  /** 64 lowercase hex characters naming the relaunch plan the switch commits to. */
+  readonly relaunchPlanDigest: string;
+  readonly nowIso: string;
+  readonly deadlineIso?: string;
+}
+
+export interface ManageCutoverRetireRequest {
+  readonly move: 'retire';
+  /** At least 1: a retire only follows a recorded switch. */
+  readonly expectedRevision: number;
+  readonly operationId: string;
+  readonly nowIso: string;
+  readonly deadlineIso?: string;
+}
+
+export type ManageCutoverRequest =
+  | ManageCutoverStatusRequest
+  | ManageCutoverRollbackRequest
+  | ManageCutoverSwitchRequest
+  | ManageCutoverRetireRequest;
 
 export interface ManageCutoverStatusResult {
   readonly outcome: 'completed';
@@ -46,6 +70,26 @@ export interface ManageCutoverRollbackCompleted {
   readonly record: CutoverRecord;
 }
 
+export interface ManageCutoverSwitchCompleted {
+  readonly outcome: 'completed';
+  readonly move: 'switch';
+  readonly key: string;
+  readonly replayed: boolean;
+  readonly state: 'switched';
+  readonly revision: number;
+  readonly record: CutoverRecord;
+}
+
+export interface ManageCutoverRetireCompleted {
+  readonly outcome: 'completed';
+  readonly move: 'retire';
+  readonly key: string;
+  readonly replayed: boolean;
+  readonly state: 'retired';
+  readonly revision: number;
+  readonly record: CutoverRecord;
+}
+
 export type ManageCutoverRefusalReason =
   | 'invalid-request'
   | 'secret-shaped'
@@ -54,7 +98,12 @@ export type ManageCutoverRefusalReason =
   | 'revision-conflict'
   | 'invalid-clock'
   | 'intent-digest-mismatch'
-  | 'journal-refused';
+  | 'journal-refused'
+  | 'not-shadow'
+  | 'shadow-evidence-absent'
+  | 'shadow-criteria-failed'
+  | 'unrecorded-lanes'
+  | 'inside-rollback-window';
 
 export type ManageCutoverUnknownReason =
   | 'deadline-exceeded'
@@ -67,12 +116,22 @@ export type ManageCutoverUnknownReason =
   | 'journal-append-failed'
   | 'daemon-pause-write-failed'
   | 'train-pause-write-failed'
-  | 'cutover-record-write-failed';
+  | 'cutover-record-write-failed'
+  | 'shadow-evidence-unreadable'
+  | 'shadow-evidence-unknown-version'
+  | 'unrecorded-lanes-unknown';
 
 export type ManageCutoverResult =
   | ManageCutoverStatusResult
   | ManageCutoverRollbackCompleted
-  | { readonly outcome: 'refused'; readonly reason: ManageCutoverRefusalReason }
+  | ManageCutoverSwitchCompleted
+  | ManageCutoverRetireCompleted
+  | {
+      readonly outcome: 'refused';
+      readonly reason: ManageCutoverRefusalReason;
+      /** The shadow criterion codes a refusal names; ids and codes only. */
+      readonly failed?: readonly string[];
+    }
   | { readonly outcome: 'unknown'; readonly reason: ManageCutoverUnknownReason };
 
 export interface ManageCutoverPort {

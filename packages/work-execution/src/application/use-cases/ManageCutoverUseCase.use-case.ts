@@ -1,10 +1,14 @@
 /**
- * ManageCutoverUseCase (lane CO30a): `status` reads the cutover record and the
- * stores a cutover depends on and writes nothing; `rollback` pauses the daemon,
- * lifts only the train pause the cutover itself set, and saves the rolled-back
- * record by compare-and-set. `switch` and `retire` are refused until CO30b.
+ * ManageCutoverUseCase (lanes CO30a and CO30b): `status` reads the cutover
+ * record and the stores a cutover depends on and writes nothing; `rollback`
+ * pauses the daemon, lifts only the train pause the cutover itself set, and
+ * saves the rolled-back record by compare-and-set; `switch` is the one-way
+ * door, refused unless the shadow criteria evidence passes and every
+ * precondition holds, then it sets the train pause and saves the switched
+ * record; `retire` closes the record after the 14-day rollback window and
+ * lifts a pause the cutover itself set.
  *
- * A rollback is keyed `cutover/rollback@<expectedRevision>`: the intent carries a
+ * A move is keyed `cutover/<move>@<expectedRevision>`: the intent carries a
  * digest of the full request and is checked on replay before any write, every
  * outbound call is deadline-guarded, and a pass cut short at any step is finished
  * by the next pass. An unreadable or unknown-version store is `unknown`, never a
@@ -14,9 +18,13 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import {
+  CUTOVER_SHADOW_CRITERIA,
+  canonicalCutoverRetirePayload,
   canonicalCutoverRollbackPayload,
+  canonicalCutoverSwitchPayload,
   cutoverJournalKey,
   isWithinCutoverRollbackWindow,
+  readCutoverShadowEvidence,
   type CutoverRecord,
 } from '../../domain/cutover-records.js';
 import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
@@ -24,8 +32,10 @@ import type {
   ManageCutoverPort,
   ManageCutoverRefusalReason,
   ManageCutoverResult,
+  ManageCutoverRetireRequest,
   ManageCutoverRollbackRequest,
   ManageCutoverStatusRequest,
+  ManageCutoverSwitchRequest,
   ManageCutoverUnknownReason,
 } from '../ports/in/ManageCutoverPort.in-port.js';
 import type { CutoverJournalEntry, CutoverJournalPort } from '../ports/out/CutoverJournalPort.out-port.js';
@@ -50,6 +60,18 @@ export interface ManageCutoverDependencies {
   readonly computeDigest: (text: string) => string;
   readonly mintEntryId: () => string;
   readonly nowIso: () => string;
+  /**
+   * CO30b, optional: the shadow-evidence document the switch move demands. The
+   * production runtime leaves it undefined, and a missing reader is a refusal,
+   * never a pass.
+   */
+  readonly readShadowEvidence?: () => Promise<
+    { readonly status: 'ok'; readonly evidence: unknown } | { readonly status: 'absent' } | { readonly status: 'unreadable' } | { readonly status: 'unknown-version' }
+  >;
+  /** CO30b, optional: how many lanes hold work no attempt record explains. */
+  readonly countUnrecordedLanes?: () => Promise<
+    { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number } | { readonly status: 'unreadable' }
+  >;
 }
 
 const MAX_REQUEST_KEYS = 8;
@@ -57,11 +79,23 @@ const MAX_STRING_LENGTH = 256;
 const MAX_ISO_LENGTH = 64;
 const MAX_REVISION = 1_000_000_000;
 const OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const RELAUNCH_DIGEST = /^[0-9a-f]{64}$/;
 const STATUS_KEYS: readonly string[] = ['move', 'nowIso', 'deadlineIso'];
 const ROLLBACK_KEYS: readonly string[] = ['move', 'expectedRevision', 'operationId', 'nowIso', 'deadlineIso'];
+const SWITCH_KEYS: readonly string[] = [
+  'move', 'expectedRevision', 'operationId', 'relaunchPlanDigest', 'nowIso', 'deadlineIso',
+];
+const RETIRE_KEYS: readonly string[] = ['move', 'expectedRevision', 'operationId', 'nowIso', 'deadlineIso'];
 
 type ParsedRequest =
-  | { readonly ok: true; readonly request: ManageCutoverStatusRequest | ManageCutoverRollbackRequest }
+  | {
+      readonly ok: true;
+      readonly request:
+        | ManageCutoverStatusRequest
+        | ManageCutoverRollbackRequest
+        | ManageCutoverSwitchRequest
+        | ManageCutoverRetireRequest;
+    }
   | { readonly ok: false; readonly reason: ManageCutoverRefusalReason };
 
 /** The outcome of one guarded outbound call. */
@@ -72,6 +106,11 @@ type Guarded<T> =
 
 function refuse(reason: ManageCutoverRefusalReason): ManageCutoverResult {
   return { outcome: 'refused', reason };
+}
+
+/** A refusal that names the shadow criterion codes it failed; ids and codes only. */
+function refuseWith(reason: ManageCutoverRefusalReason, failed: readonly string[]): ManageCutoverResult {
+  return { outcome: 'refused', reason, failed };
 }
 
 function unknown(reason: ManageCutoverUnknownReason): ManageCutoverResult {
@@ -103,14 +142,17 @@ function parseRequest(input: unknown): ParsedRequest {
     return { ok: false, reason: 'secret-shaped' };
   }
   const { move } = snapshot;
-  if (move === 'switch' || move === 'retire') {
-    return { ok: false, reason: 'move-not-implemented' };
-  }
   if (move === 'status') {
     return parseStatus(snapshot);
   }
   if (move === 'rollback') {
     return parseRollback(snapshot);
+  }
+  if (move === 'switch') {
+    return parseSwitch(snapshot);
+  }
+  if (move === 'retire') {
+    return parseRetire(snapshot);
   }
   return { ok: false, reason: 'invalid-request' };
 }
@@ -165,6 +207,65 @@ function parseRollback(snapshot: Record<string, unknown>): ParsedRequest {
   };
 }
 
+/** Switch allows revision 0 (the one-way door runs on an unrecorded cutover); the digest is 64 lowercase hex. */
+function parseSwitch(snapshot: Record<string, unknown>): ParsedRequest {
+  const { expectedRevision, operationId, relaunchPlanDigest, nowIso, deadlineIso } = snapshot;
+  if (
+    !hasOnlyKeys(snapshot, SWITCH_KEYS) ||
+    typeof expectedRevision !== 'number' ||
+    !Number.isSafeInteger(expectedRevision) ||
+    expectedRevision < 0 ||
+    expectedRevision > MAX_REVISION ||
+    typeof operationId !== 'string' ||
+    !OPERATION_ID.test(operationId) ||
+    typeof relaunchPlanDigest !== 'string' ||
+    !RELAUNCH_DIGEST.test(relaunchPlanDigest) ||
+    !isBoundedIso(nowIso) ||
+    (deadlineIso !== undefined && !isBoundedIso(deadlineIso))
+  ) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  return {
+    ok: true,
+    request: {
+      move: 'switch',
+      expectedRevision,
+      operationId,
+      relaunchPlanDigest,
+      nowIso,
+      ...(deadlineIso === undefined ? {} : { deadlineIso }),
+    },
+  };
+}
+
+/** Retire only follows a recorded switch, so its revision starts at 1. */
+function parseRetire(snapshot: Record<string, unknown>): ParsedRequest {
+  const { expectedRevision, operationId, nowIso, deadlineIso } = snapshot;
+  if (
+    !hasOnlyKeys(snapshot, RETIRE_KEYS) ||
+    typeof expectedRevision !== 'number' ||
+    !Number.isSafeInteger(expectedRevision) ||
+    expectedRevision < 1 ||
+    expectedRevision > MAX_REVISION ||
+    typeof operationId !== 'string' ||
+    !OPERATION_ID.test(operationId) ||
+    !isBoundedIso(nowIso) ||
+    (deadlineIso !== undefined && !isBoundedIso(deadlineIso))
+  ) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  return {
+    ok: true,
+    request: {
+      move: 'retire',
+      expectedRevision,
+      operationId,
+      nowIso,
+      ...(deadlineIso === undefined ? {} : { deadlineIso }),
+    },
+  };
+}
+
 export class ManageCutoverUseCase implements ManageCutoverPort {
   constructor(private readonly deps: ManageCutoverDependencies) {}
 
@@ -174,7 +275,16 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
       if (!parsed.ok) {
         return refuse(parsed.reason);
       }
-      return parsed.request.move === 'status' ? await this.status(parsed.request) : await this.rollback(parsed.request);
+      switch (parsed.request.move) {
+        case 'status':
+          return await this.status(parsed.request);
+        case 'rollback':
+          return await this.rollback(parsed.request);
+        case 'switch':
+          return await this.switchMove(parsed.request);
+        case 'retire':
+          return await this.retireMove(parsed.request);
+      }
     } catch {
       return refuse('invalid-request');
     }
@@ -491,5 +601,498 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (swapped.kind === 'threw' || swapped.value.outcome === 'refused') return unknown('cutover-record-write-failed');
     if (swapped.value.outcome === 'conflict') return refuse('revision-conflict');
     return { record: swapped.value.record };
+  }
+
+  /**
+   * The exact-key journal view of one move: the deadline and unreadable outcomes
+   * are answered here, and only entries under the exact key survive the prefix
+   * match (`cutover/switch@10` never collides with `cutover/switch@1`).
+   */
+  private async listMoveJournal(
+    move: 'switch' | 'rollback' | 'retire',
+    expectedRevision: number,
+    deadlineIso: string | undefined,
+  ):
+    Promise<{ readonly intent: CutoverJournalEntry | null; readonly final: CutoverJournalEntry | null } | { readonly stop: ManageCutoverResult }> {
+    const key = cutoverJournalKey(move, expectedRevision);
+    if (key === null) {
+      return { stop: refuse('invalid-request') };
+    }
+    const listed = await this.guarded(deadlineIso, () => this.deps.cutoverJournal.listByKeyPrefix(key));
+    if (listed.kind === 'deadline') return { stop: unknown('deadline-exceeded') };
+    if (listed.kind === 'threw' || listed.value.outcome !== 'listed' || !Array.isArray(listed.value.entries)) {
+      return { stop: unknown('journal-unreadable') };
+    }
+    const entries = listed.value.entries.filter((entry) => entry.key === key);
+    return {
+      intent: entries.find((entry) => entry.kind === 'intent') ?? null,
+      final: entries.find((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous') ?? null,
+    };
+  }
+
+  /** The append that records one move's intent, deadline-guarded. */
+  private async appendIntent(
+    key: string,
+    digest: string,
+    normalizedNowIso: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | null> {
+    const intent = await this.guarded(deadlineIso, () =>
+      this.deps.cutoverJournal.append({
+        key,
+        kind: 'intent',
+        entryId: this.deps.mintEntryId(),
+        recordedAtIso: normalizedNowIso,
+        digest,
+      }),
+    );
+    if (intent.kind === 'deadline') return unknown('deadline-exceeded');
+    if (intent.kind === 'threw' || intent.value.outcome !== 'appended') {
+      return unknown('journal-append-failed');
+    }
+    return null;
+  }
+
+  /** The completed-result append shared by every move; a second final result is not a failure. */
+  private async appendResult(
+    key: string,
+    digest: string,
+    reasonCode: 'switched' | 'rolled-back' | 'retired',
+    recordedAtIso: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | null> {
+    const result = await this.guarded(deadlineIso, () =>
+      this.deps.cutoverJournal.append({
+        key,
+        kind: 'result',
+        entryId: this.deps.mintEntryId(),
+        recordedAtIso,
+        outcome: 'completed',
+        reasonCode,
+        digest,
+      }),
+    );
+    if (result.kind === 'deadline') return unknown('deadline-exceeded');
+    const appended =
+      result.kind === 'value' &&
+      (result.value.outcome === 'appended' || result.value.reason === 'result-after-final-result');
+    if (!appended) {
+      return unknown('journal-append-failed');
+    }
+    return null;
+  }
+
+  private async switchMove(request: ManageCutoverSwitchRequest): Promise<ManageCutoverResult> {
+    const { expectedRevision, deadlineIso, nowIso } = request;
+    const key = cutoverJournalKey('switch', expectedRevision);
+    if (key === null) {
+      return refuse('invalid-request');
+    }
+    const requestDigest = this.deps.computeDigest(
+      canonicalCutoverSwitchPayload({
+        expectedRevision,
+        operationId: request.operationId,
+        relaunchPlanDigest: request.relaunchPlanDigest,
+      }),
+    );
+
+    const journal = await this.listMoveJournal('switch', expectedRevision, deadlineIso);
+    if ('stop' in journal) {
+      return journal.stop;
+    }
+    if (journal.intent !== null && journal.intent.digest !== requestDigest) {
+      return refuse('intent-digest-mismatch');
+    }
+    if (journal.final !== null) {
+      return this.replaySwitchFinal(journal.final, key, deadlineIso);
+    }
+
+    const cutover = await this.readCutover(deadlineIso);
+    if ('stop' in cutover) {
+      return cutover.stop;
+    }
+    const { record } = cutover;
+
+    if (journal.intent === null) {
+      const refusal = this.switchFreshRefusal(record, expectedRevision);
+      if (refusal !== null) {
+        return refusal;
+      }
+    }
+
+    const evidenceFailure = await this.shadowEvidenceFailure(request, deadlineIso);
+    if (evidenceFailure !== null) {
+      return evidenceFailure;
+    }
+    const lanesFailure = await this.unrecordedLanesFailure(deadlineIso);
+    if (lanesFailure !== null) {
+      return lanesFailure;
+    }
+    const daemonFailure = await this.daemonStatusFailure(deadlineIso);
+    if (daemonFailure !== null) {
+      return daemonFailure;
+    }
+    const trainReadFailure = await this.trainPauseReadFailure(deadlineIso);
+    if (trainReadFailure !== null) {
+      return trainReadFailure;
+    }
+
+    const normalizedNowIso = normalizeIso(nowIso);
+    if (journal.intent === null) {
+      const intentFailure = await this.appendIntent(key, requestDigest, normalizedNowIso, deadlineIso);
+      if (intentFailure !== null) {
+        return intentFailure;
+      }
+    }
+
+    const saved = await this.applySwitch(record, expectedRevision, request.relaunchPlanDigest, normalizedNowIso, deadlineIso);
+    if ('outcome' in saved) {
+      return saved;
+    }
+
+    const resultFailure = await this.appendResult(key, requestDigest, 'switched', saved.record.updatedAtIso, deadlineIso);
+    if (resultFailure !== null) {
+      return resultFailure;
+    }
+    return {
+      outcome: 'completed',
+      move: 'switch',
+      key,
+      replayed: false,
+      state: 'switched',
+      revision: saved.record.revision,
+      record: saved.record,
+    };
+  }
+
+  /** The refusals a fresh switch decides before anything is recorded. */
+  private switchFreshRefusal(record: CutoverRecord | null, expectedRevision: number): ManageCutoverResult | null {
+    if (record === null) {
+      return expectedRevision === 0 ? null : refuse('revision-conflict');
+    }
+    if (record.revision !== expectedRevision) {
+      return refuse('revision-conflict');
+    }
+    if (record.state !== 'shadow') {
+      return refuse('not-shadow');
+    }
+    return null;
+  }
+
+  /**
+   * The shadow-evidence gate: a missing reader or an absent document is a
+   * refusal naming every criterion, an unreadable or unknown-version reader is
+   * `unknown`, and a document that fails any criterion is a refusal naming
+   * exactly the failed ids.
+   */
+  private async shadowEvidenceFailure(
+    request: ManageCutoverSwitchRequest,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | null> {
+    const reader = this.deps.readShadowEvidence;
+    if (reader === undefined) {
+      return refuseWith('shadow-evidence-absent', [...CUTOVER_SHADOW_CRITERIA]);
+    }
+    const read = await this.guarded(deadlineIso, reader);
+    if (read.kind === 'deadline') return unknown('deadline-exceeded');
+    if (read.kind === 'threw') return unknown('shadow-evidence-unreadable');
+    if (read.value.status === 'unreadable') return unknown('shadow-evidence-unreadable');
+    if (read.value.status === 'unknown-version') return unknown('shadow-evidence-unknown-version');
+    if (read.value.status === 'absent') {
+      return refuseWith('shadow-evidence-absent', [...CUTOVER_SHADOW_CRITERIA]);
+    }
+    const verdict = readCutoverShadowEvidence(read.value.evidence, request.nowIso);
+    if (!verdict.ok) {
+      return refuseWith('shadow-criteria-failed', verdict.failed);
+    }
+    return null;
+  }
+
+  /** Unknown lane coverage is never a pass: only an exact zero of unrecorded lanes proceeds. */
+  private async unrecordedLanesFailure(deadlineIso: string | undefined): Promise<ManageCutoverResult | null> {
+    const counter = this.deps.countUnrecordedLanes;
+    if (counter === undefined) {
+      return unknown('unrecorded-lanes-unknown');
+    }
+    const counted = await this.guarded(deadlineIso, counter);
+    if (counted.kind === 'deadline') return unknown('deadline-exceeded');
+    if (counted.kind === 'threw' || counted.value.status !== 'ok') {
+      return unknown('unrecorded-lanes-unknown');
+    }
+    if (counted.value.unknownListings > 0) {
+      return unknown('unrecorded-lanes-unknown');
+    }
+    if (counted.value.unrecorded > 0) {
+      return refuse('unrecorded-lanes');
+    }
+    return null;
+  }
+
+  /** A daemon status that is neither `ok` nor `missing` is unreadable; a failed last tick still proceeds. */
+  private async daemonStatusFailure(deadlineIso: string | undefined): Promise<ManageCutoverResult | null> {
+    const status = await this.guarded(deadlineIso, () => this.deps.daemonStatus.read());
+    if (status.kind === 'deadline') return unknown('deadline-exceeded');
+    if (status.kind === 'threw') return unknown('daemon-status-unreadable');
+    if (status.value.status !== 'ok' && status.value.status !== 'missing') {
+      return unknown('daemon-status-unreadable');
+    }
+    return null;
+  }
+
+  /** The train-pause store must read `paused` or `clear` before a switch moves anything. */
+  private async trainPauseReadFailure(deadlineIso: string | undefined): Promise<ManageCutoverResult | null> {
+    const trainPause = await this.guarded(deadlineIso, () => this.deps.trainPauseRead.read());
+    if (trainPause.kind === 'deadline') return unknown('deadline-exceeded');
+    if (trainPause.kind === 'threw' || (trainPause.value.status !== 'paused' && trainPause.value.status !== 'clear')) {
+      return unknown('train-pause-unreadable');
+    }
+    return null;
+  }
+
+  /**
+   * The crash-recoverable action sequence for a switch. Case A: the record is still `shadow`
+   * (or absent with revision 0); case B: an earlier pass already saved the switched record.
+   */
+  private async applySwitch(
+    record: CutoverRecord | null,
+    expectedRevision: number,
+    relaunchPlanDigest: string,
+    normalizedNowIso: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | { readonly record: CutoverRecord }> {
+    if (record !== null) {
+      const caseB = record.revision === expectedRevision + 1 && record.state === 'switched';
+      if (caseB) {
+        return { record };
+      }
+      const caseA = record.revision === expectedRevision && record.state === 'shadow';
+      if (!caseA) {
+        return refuse('revision-conflict');
+      }
+    } else if (expectedRevision !== 0) {
+      return refuse('revision-conflict');
+    }
+
+    const paused = await this.guarded(deadlineIso, () => this.deps.trainPause.set({ paused: true, nowIso: normalizedNowIso }));
+    if (paused.kind === 'deadline') return unknown('deadline-exceeded');
+    if (paused.kind === 'threw' || paused.value.outcome === 'refused') return unknown('train-pause-write-failed');
+
+    const nextRecord: CutoverRecord = {
+      schemaVersion: 1,
+      revision: expectedRevision + 1,
+      state: 'switched',
+      updatedAtIso: normalizedNowIso,
+      switchedAtIso: normalizedNowIso,
+      rolledBackAtIso: null,
+      retiredAtIso: null,
+      relaunchPlanDigest,
+      trainPauseSetByCutover: true,
+    };
+    const swapped = await this.guarded(deadlineIso, () =>
+      this.deps.cutoverRepo.compareAndSet({ expectedRevision, next: nextRecord, deadlineIso }),
+    );
+    if (swapped.kind === 'deadline') return unknown('deadline-exceeded');
+    if (swapped.kind === 'threw' || swapped.value.outcome === 'refused') return unknown('cutover-record-write-failed');
+    if (swapped.value.outcome === 'conflict') return refuse('revision-conflict');
+    return { record: swapped.value.record };
+  }
+
+  /** A completed switch returns its recorded outcome with no write; a refused one stays refused. */
+  private async replaySwitchFinal(
+    finalEntry: CutoverJournalEntry,
+    key: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult> {
+    if (finalEntry.outcome === 'refused') {
+      return refuse('journal-refused');
+    }
+    const cutover = await this.readCutover(deadlineIso);
+    if ('stop' in cutover) {
+      return cutover.stop;
+    }
+    const read = cutover.record;
+    if (read === null) {
+      return unknown('cutover-record-unreadable');
+    }
+    if (read.state !== 'switched') {
+      return refuse('revision-conflict');
+    }
+    return {
+      outcome: 'completed',
+      move: 'switch',
+      key,
+      replayed: true,
+      state: 'switched',
+      revision: read.revision,
+      record: read,
+    };
+  }
+
+  private async retireMove(request: ManageCutoverRetireRequest): Promise<ManageCutoverResult> {
+    const { expectedRevision, deadlineIso, nowIso } = request;
+    const key = cutoverJournalKey('retire', expectedRevision);
+    if (key === null) {
+      return refuse('invalid-request');
+    }
+    const requestDigest = this.deps.computeDigest(
+      canonicalCutoverRetirePayload({ expectedRevision, operationId: request.operationId }),
+    );
+
+    const journal = await this.listMoveJournal('retire', expectedRevision, deadlineIso);
+    if ('stop' in journal) {
+      return journal.stop;
+    }
+    if (journal.intent !== null && journal.intent.digest !== requestDigest) {
+      return refuse('intent-digest-mismatch');
+    }
+    if (journal.final !== null) {
+      return this.replayRetireFinal(journal.final, key, deadlineIso);
+    }
+
+    const cutover = await this.readCutover(deadlineIso);
+    if ('stop' in cutover) {
+      return cutover.stop;
+    }
+    const { record } = cutover;
+
+    const normalizedNowIso = normalizeIso(nowIso);
+    if (journal.intent === null) {
+      const refusal = this.retireFreshRefusal(record, expectedRevision, normalizedNowIso);
+      if (refusal !== null) {
+        return refusal;
+      }
+      const intentFailure = await this.appendIntent(key, requestDigest, normalizedNowIso, deadlineIso);
+      if (intentFailure !== null) {
+        return intentFailure;
+      }
+    }
+
+    const saved = await this.applyRetire(record, expectedRevision, normalizedNowIso, deadlineIso);
+    if ('outcome' in saved) {
+      return saved;
+    }
+
+    const resultFailure = await this.appendResult(key, requestDigest, 'retired', saved.record.updatedAtIso, deadlineIso);
+    if (resultFailure !== null) {
+      return resultFailure;
+    }
+    return {
+      outcome: 'completed',
+      move: 'retire',
+      key,
+      replayed: false,
+      state: 'retired',
+      revision: saved.record.revision,
+      record: saved.record,
+    };
+  }
+
+  /** The refusals a fresh retire decides before anything is recorded. */
+  private retireFreshRefusal(
+    record: CutoverRecord | null,
+    expectedRevision: number,
+    normalizedNowIso: string,
+  ): ManageCutoverResult | null {
+    if (record === null || record.revision !== expectedRevision) {
+      return refuse('not-switched');
+    }
+    if (record.state !== 'switched' || record.switchedAtIso === null) {
+      return refuse('not-switched');
+    }
+    if (Date.parse(normalizedNowIso) < Date.parse(record.switchedAtIso)) {
+      return refuse('invalid-clock');
+    }
+    const withinWindow = isWithinCutoverRollbackWindow(record.switchedAtIso, normalizedNowIso);
+    if (withinWindow === null) {
+      return refuse('invalid-clock');
+    }
+    if (withinWindow) {
+      return refuse('inside-rollback-window');
+    }
+    return null;
+  }
+
+  /**
+   * The crash-recoverable action sequence for a retire. Case A: the record is still `switched`;
+   * case B: an earlier pass already saved the retired record.
+   */
+  private async applyRetire(
+    record: CutoverRecord | null,
+    expectedRevision: number,
+    normalizedNowIso: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | { readonly record: CutoverRecord }> {
+    if (record === null) {
+      return refuse('revision-conflict');
+    }
+    const caseB = record.revision === expectedRevision + 1 && record.state === 'retired';
+    if (caseB) {
+      return { record };
+    }
+    const caseA = record.revision === expectedRevision && record.state === 'switched' && record.switchedAtIso !== null;
+    if (!caseA) {
+      return refuse('revision-conflict');
+    }
+    if (Date.parse(normalizedNowIso) < Date.parse(record.switchedAtIso as string)) {
+      return refuse('invalid-clock');
+    }
+
+    if (record.trainPauseSetByCutover) {
+      const lifted = await this.guarded(deadlineIso, () =>
+        this.deps.trainPause.set({ paused: false, nowIso: normalizedNowIso }),
+      );
+      if (lifted.kind === 'deadline') return unknown('deadline-exceeded');
+      if (lifted.kind === 'threw' || lifted.value.outcome === 'refused') return unknown('train-pause-write-failed');
+    }
+
+    const nextRecord: CutoverRecord = {
+      schemaVersion: 1,
+      revision: expectedRevision + 1,
+      state: 'retired',
+      updatedAtIso: normalizedNowIso,
+      switchedAtIso: record.switchedAtIso,
+      rolledBackAtIso: null,
+      retiredAtIso: normalizedNowIso,
+      relaunchPlanDigest: record.relaunchPlanDigest,
+      trainPauseSetByCutover: false,
+    };
+    const swapped = await this.guarded(deadlineIso, () =>
+      this.deps.cutoverRepo.compareAndSet({ expectedRevision, next: nextRecord, deadlineIso }),
+    );
+    if (swapped.kind === 'deadline') return unknown('deadline-exceeded');
+    if (swapped.kind === 'threw' || swapped.value.outcome === 'refused') return unknown('cutover-record-write-failed');
+    if (swapped.value.outcome === 'conflict') return refuse('revision-conflict');
+    return { record: swapped.value.record };
+  }
+
+  /** A completed retire returns its recorded outcome with no write and lifts no pause again. */
+  private async replayRetireFinal(
+    finalEntry: CutoverJournalEntry,
+    key: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult> {
+    if (finalEntry.outcome === 'refused') {
+      return refuse('journal-refused');
+    }
+    const cutover = await this.readCutover(deadlineIso);
+    if ('stop' in cutover) {
+      return cutover.stop;
+    }
+    const read = cutover.record;
+    if (read === null) {
+      return unknown('cutover-record-unreadable');
+    }
+    if (read.state !== 'retired') {
+      return refuse('revision-conflict');
+    }
+    return {
+      outcome: 'completed',
+      move: 'retire',
+      key,
+      replayed: true,
+      state: 'retired',
+      revision: read.revision,
+      record: read,
+    };
   }
 }

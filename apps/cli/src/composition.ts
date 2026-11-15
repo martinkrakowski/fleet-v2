@@ -55,6 +55,7 @@ import {
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
   ExplainAttemptUseCase,
+  ExportLegacyTrainStateUseCase,
   ExecutionJournalAdapter,
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
@@ -792,6 +793,8 @@ export interface FleetCliRuntime {
     readonly enqueueMerge: EnqueueMergeUseCase;
     readonly listMergeQueue: ListMergeQueueUseCase;
     readonly importTrainState: ImportTrainStateUseCase;
+    /** CO5b: the read-only rollback export of the queue as legacy documents. */
+    readonly exportLegacyTrainState: ExportLegacyTrainStateUseCase;
     /** CO32: the read-only shell train state reader behind the cutover shadow report. */
     readonly legacyTrainState: LegacyTrainStateReadAdapter;
     /** CO25: the read-only merge readiness check for one pull request. */
@@ -1284,6 +1287,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       cutoverJournal,
       killallTrainPause,
       manageCutover,
+      exportLegacyTrainState: new ExportLegacyTrainStateUseCase({
+        listMergeQueue: execution.listMergeQueue,
+        nowIso: () => new Date().toISOString(),
+      }),
     },
     conductor,
     runnerTunnel,

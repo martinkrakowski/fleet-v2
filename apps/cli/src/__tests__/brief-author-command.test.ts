@@ -456,6 +456,59 @@ describe('brief author', () => {
     expect(reads.get('model')).toBe(1);
   });
 
+  it('nested payload objects reach the use case as fresh copies, not the payload objects', async () => {
+    const acceptanceSpec = { commitRequired: true, nested: { deep: ['a'] } };
+    const resourceBounds = { cpu: '2' };
+    const allowedPathPrefixes = ['packages/x'];
+    const seatPlan = {
+      version: 1,
+      'first-pass': [{ id: 's1', model: 'plan-model', tool: 'opencode' }],
+      fix: [{ id: 's2', model: 'plan-model', tool: 'opencode' }],
+      review: [],
+    };
+    const payload: Record<string, unknown> = {
+      workOrderId: 'wo-1',
+      laneId: 'lane-1',
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      repository: 'owner/repo',
+      baseCommit: COMMIT,
+      policyRevision: 'pol-1',
+      model: IMPLEMENTER_MODEL,
+      fallbackModel: 'fallback-model',
+      independentReviewer: 'reviewer-model',
+      authorModel: AUTHOR_MODEL,
+      checkoutPath: '/checkout',
+      repositoryPath: '/repo',
+      worktreePath: '/worktree',
+      briefsDir: '/briefs',
+      seatTool: 'opencode',
+      facts: [{ kind: 'file-list', label: 'Sources', pathPrefix: 'src' }],
+      acceptanceSpec,
+      resourceBounds,
+      allowedPathPrefixes,
+      seatPlan,
+    };
+    let captured: AuthorBriefRequest | undefined;
+    const { runtime } = guardsRuntime({
+      authorBrief: async (request) => {
+        captured = request as AuthorBriefRequest;
+        return { outcome: 'authored', attemptId: 'att-1', briefDigest: 'digest-1', sessionKey: 'k' };
+      },
+    });
+    await briefCommands['author'](payload, runtime);
+    const prepare = (captured as AuthorBriefRequest).prepare as unknown as Record<string, unknown>;
+    expect(prepare['acceptanceSpec']).toEqual(acceptanceSpec);
+    expect(prepare['acceptanceSpec']).not.toBe(acceptanceSpec);
+    expect((prepare['acceptanceSpec'] as { nested: unknown }).nested).not.toBe(acceptanceSpec.nested);
+    expect(prepare['resourceBounds']).toEqual(resourceBounds);
+    expect(prepare['resourceBounds']).not.toBe(resourceBounds);
+    expect(prepare['allowedPathPrefixes']).toEqual(allowedPathPrefixes);
+    expect(prepare['allowedPathPrefixes']).not.toBe(allowedPathPrefixes);
+    expect(prepare['seatPlan']).toEqual(seatPlan);
+    expect(prepare['seatPlan']).not.toBe(seatPlan);
+  });
+
   it('authorModel and the implementer model stay distinct', async () => {
     const { io, stdout } = capturingIo();
     let captured: AuthorBriefRequest | undefined;

@@ -114,6 +114,35 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
     // handler validates the invocation shape (exit 2 on a malformed one),
     // never dispatches, writes nothing and prints nothing itself.
     author: async (p, rt) => {
+      /**
+       * Copy one plain JSON value (string / number / boolean / null / plain
+       * object / array) into fresh containers. Every nested payload value that
+       * reaches the use case goes through this: the payload may be a Proxy, so
+       * returning the original object (as `jsonObj`, `nested` or a parsed
+       * array would) would forward that Proxy to the use case.
+       */
+      const copyJson = <T>(value: T): T => {
+        if (Array.isArray(value)) {
+          return value.map((item) => copyJson(item)) as unknown as T;
+        }
+        if (value !== null && typeof value === 'object') {
+          const source = value as Record<string, unknown>;
+          const copy: Record<string, unknown> = {};
+          for (const key of Object.keys(source)) {
+            copy[key] = copyJson(source[key]);
+          }
+          return copy as unknown as T;
+        }
+        return value;
+      };
+      /** Copy a nested payload value, refusing an unreadable one as usage. */
+      const copyField = <T>(value: T): T => {
+        try {
+          return copyJson(value);
+        } catch {
+          throw new CliUsageError('brief author could not read its arguments');
+        }
+      };
       /** Read one payload field exactly once; a throwing getter is a usage error. */
       const field = (key: string): unknown => {
         try {
@@ -295,13 +324,16 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
       // The seat plan is read through the guarded helper, but only from a
       // fresh plain payload built from single reads: the raw payload object
       // never reaches it.
-      const seatPlan = briefSeatPlan(
+      const seatPlanRaw = briefSeatPlan(
         {
           seatPlan: field('seatPlan'),
           seatPlanFromInstallation: field('seatPlanFromInstallation'),
         },
         rt,
       );
+      // The plan may be the payload's own object (a Proxy's target); only the
+      // copy travels with the request.
+      const seatPlan = seatPlanRaw === undefined ? undefined : copyField(seatPlanRaw);
       const unhealthy = new Set(unhealthySeatIdsFromCatalog(derivedV2Model(rt)));
       // `--model` was read once above and `required` guarantees it, so the
       // seat plan's auto-selection never applies here.
@@ -322,7 +354,9 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
       }
       let modelAssignment: BriefModelAssignment;
       if (nestedAssignment !== undefined) {
-        modelAssignment = { ...nestedAssignment, seatTool };
+        // A shallow spread would still share any nested value the payload's
+        // assignment object carries; copy it like every other nested field.
+        modelAssignment = { ...copyField(nestedAssignment), seatTool };
       } else if (planSeatForAssignment !== undefined) {
         modelAssignment = {
           model: planSeatForAssignment.model,
@@ -341,7 +375,11 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
       }
 
       const allowedPathPrefixes = viaHelper('allowedPathPrefixes', (payload) => jsonStrArr(payload, 'allowedPathPrefixes', 'brief author'));
-      const acceptanceSpec = viaHelper('acceptanceSpec', (payload) => jsonObj(payload, 'acceptanceSpec', 'brief author'));
+      // `jsonStrArr` may return the payload's own array and `jsonObj` returns
+      // the parsed payload object itself; copy both so no Proxy or shared
+      // object reaches the use case.
+      const acceptanceSpecRaw = viaHelper('acceptanceSpec', (payload) => jsonObj(payload, 'acceptanceSpec', 'brief author'));
+      const acceptanceSpec = acceptanceSpecRaw === undefined ? undefined : copyField(acceptanceSpecRaw);
       const prepare = {
         workOrderId,
         projectId,
@@ -353,13 +391,13 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
         modelAssignment,
         independentReviewer,
         ownedPaths: viaHelper('ownedPaths', (payload) => strArr(payload, 'ownedPaths')),
-        allowedPathPrefixes,
+        allowedPathPrefixes: [...allowedPathPrefixes],
         permissions: viaHelper('permissions', (payload) => strArr(payload, 'permissions')),
         acceptanceChecks: viaHelper('acceptanceChecks', (payload) => strArr(payload, 'acceptanceChecks')),
         acceptanceSpec,
         stepLimit: viaHelper('stepLimit', (payload) => num(payload, 'stepLimit', 200)),
         timeLimitSeconds: viaHelper('timeLimitSeconds', (payload) => num(payload, 'timeLimitSeconds', 3600)),
-        resourceBounds: viaHelper('resourceBounds', (payload) => nested<Record<string, string>>(payload, 'resourceBounds')) ?? {},
+        resourceBounds: copyField(viaHelper('resourceBounds', (payload) => nested<Record<string, string>>(payload, 'resourceBounds')) ?? {}),
         expectedArtifacts: viaHelper('expectedArtifacts', (payload) => strArr(payload, 'expectedArtifacts')),
         ownerDecisionReferences: viaHelper('ownerDecisionReferences', (payload) => strArr(payload, 'ownerDecisionReferences')),
         contextDecisions,

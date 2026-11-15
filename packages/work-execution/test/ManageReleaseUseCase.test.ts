@@ -360,7 +360,7 @@ function make(
       HOME: '/home/example',
       UNSET: undefined,
       YARN_NM_MODE: 'classic',
-      GH_TOKEN: 'ghp_operatorSecretValue000000000000000',
+      GH_TOKEN: 'tk_gh',
       FLEET_NTFY_TOKEN: 'tk_operator',
     }),
   });
@@ -436,8 +436,11 @@ describe('ManageReleaseUseCase', () => {
 
   it('refuses invalid-request for a sparse array request', async () => {
     const { useCase } = make();
-    // eslint-disable-next-line no-sparse-arrays
-    expect(await manage(useCase, [, , ,])).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    const holed = ['a', 'b', 'c'];
+    delete holed[0];
+    delete holed[1];
+    delete holed[2];
+    expect(await manage(useCase, holed)).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     expect(await manage(useCase, [request()])).toEqual({ outcome: 'refused', reason: 'invalid-request' });
   });
 

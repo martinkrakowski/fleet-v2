@@ -15,7 +15,7 @@
 
 import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
-import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
+import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
 import { CoordinationKind } from '../../domain/value-objects/CoordinationKind.vo.js';
 import { isReleaseRootCoordinate } from '../../domain/coordination-records.js';
 import type {
@@ -40,9 +40,8 @@ function isFilled(value: unknown): value is string {
 // applies to a recorded attempt (C0, DEL/C1, U+061C, U+200E/F, U+2028/9,
 // U+202A–E, U+2066–9 and U+FEFF). A value carrying any of them is refused
 // here, typed, so it can never reach the record builder and make it throw.
-const ATTEMPT_CONTROL_CHARACTER =
-  // eslint-disable-next-line no-control-regex
-  /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
+// The screen is imported from the entity so the two cannot drift.
+const ATTEMPT_CONTROL_CHARACTER = CONTROL_CHARACTER;
 
 // The record builder refuses an attempt longer than this; screen it here so an
 // over-long value is a typed rejection, never a throw from the record builder.

@@ -29,6 +29,7 @@ import type {
   MergeForgeActionRequest,
   MergeForgeActionResult,
   MergeForgeCreateBranchRequest,
+  MergeForgeDeleteBranchRequest,
   MergeForgeMergeMainIntoBranchRequest,
 } from '../../application/ports/out/MergeForgeActionPort.out-port.js';
 import type {
@@ -37,6 +38,7 @@ import type {
   ReadPullRequestRequest,
   ReadPullRequestResult,
 } from '../../application/ports/out/ForgeReadPort.out-port.js';
+import { containsSecretShape } from '@fleet/shared';
 import type { ForgeRefusalKind } from '../../domain/coordination-keys.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
 import { isPullRequestTierLabel } from '../../domain/pull-request-tier-label.js';
@@ -159,7 +161,7 @@ const MIN_REMAINING_TO_START_MS = 2_000;
 /** A merge-pass request that is bound to a pull request (every kind but create-branch and merge-main-into-branch). */
 type MergePullRequestRequest = Exclude<
   MergeForgeActionRequest,
-  { readonly kind: 'create-branch' } | { readonly kind: 'merge-main-into-branch' }
+  { readonly kind: 'create-branch' } | { readonly kind: 'merge-main-into-branch' } | { readonly kind: 'delete-branch' }
 >;
 
 /** One own data property, read without running a getter; undefined for anything else. */
@@ -197,6 +199,27 @@ function snapshotCreateBranchRequest(request: object): MergeForgeCreateBranchReq
     }
   }
   return copy as unknown as MergeForgeCreateBranchRequest;
+}
+
+/** A plain copy of a delete-branch request's own data properties; absent keys stay absent. */
+function snapshotDeleteBranchRequest(request: object): MergeForgeDeleteBranchRequest {
+  const repository = ownData(request, 'repository');
+  const copy: Record<string, unknown> = {
+    kind: 'delete-branch',
+    actionId: ownData(request, 'actionId'),
+    repository:
+      typeof repository === 'object' && repository !== null
+        ? { owner: ownData(repository, 'owner'), repo: ownData(repository, 'repo') }
+        : repository,
+    branchName: ownData(request, 'branchName'),
+    deadlineIso: ownData(request, 'deadlineIso'),
+  };
+  for (const key of ['pullRequestNumber', 'status', 'sourceBranch', 'expectedHeadSha']) {
+    if (Object.getOwnPropertyDescriptor(request, key) !== undefined) {
+      copy[key] = ownData(request, key) ?? true;
+    }
+  }
+  return copy as unknown as MergeForgeDeleteBranchRequest;
 }
 
 /** Bounds for the legacy open-pull-request head lookup. */
@@ -795,6 +818,16 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       }
       return this.performMergeMainIntoBranch(snapshot);
     }
+    if (ownData(rawRequest, 'kind') === 'delete-branch') {
+      // The sweep kind is read through its own data properties once; no getter runs twice or throws.
+      let snapshot: MergeForgeDeleteBranchRequest;
+      try {
+        snapshot = snapshotDeleteBranchRequest(rawRequest);
+      } catch {
+        return this.mergeRefusedOther('invalid request');
+      }
+      return this.performDeleteBranch(snapshot);
+    }
     const kind = ownData(rawRequest, 'kind');
     if (kind !== 'merge-pr' && kind !== 'update-branch' && kind !== 'post-status') {
       // Includes an accessor `kind`, which would run its getter at the first read below.
@@ -1333,6 +1366,104 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       };
     }
     return { outcome: 'ambiguous', reason: 'create-branch failed and the branch could not be read back' };
+  }
+
+  // --- delete-branch (lane CO11): delete chain/<name> for a landed chain ---
+
+  private async performDeleteBranch(request: MergeForgeDeleteBranchRequest): Promise<MergeForgeActionResult> {
+    const refusal = this.deleteBranchValidationRefusal(request);
+    if (refusal !== null) {
+      return refusal;
+    }
+    if (this.mergeConfigDir() === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    return this.runDeleteBranch(request);
+  }
+
+  /** Validation for delete-branch: fixed reasons only, no input value echoed. */
+  private deleteBranchValidationRefusal(request: MergeForgeDeleteBranchRequest): MergeForgeActionResult | null {
+    if ('pullRequestNumber' in request) {
+      return this.mergeRefusedOther('delete-branch carries no pull request');
+    }
+    if ('status' in request) {
+      return this.mergeRefusedOther('status is only valid for post-status');
+    }
+    if ('sourceBranch' in request) {
+      return this.mergeRefusedOther('delete-branch carries no source branch');
+    }
+    if ('expectedHeadSha' in request) {
+      return this.mergeRefusedOther('delete-branch carries no expected head');
+    }
+    if (
+      typeof request.actionId !== 'string' ||
+      request.actionId.length === 0 ||
+      request.actionId.length > 256 ||
+      containsSecretShape(request.actionId)
+    ) {
+      return this.mergeRefusedOther('Invalid action id');
+    }
+    if (typeof request.deadlineIso !== 'string' || !Number.isFinite(Date.parse(request.deadlineIso))) {
+      return this.mergeRefusedOther('unparseable deadline');
+    }
+    if (!this.isValidRepositoryRef(request.repository)) {
+      return this.mergeRefusedOther('Invalid repository owner or repo');
+    }
+    if (!this.isChainBranch(request.branchName)) {
+      return this.mergeRefusedOther('delete-branch deletes only a chain branch');
+    }
+    return null;
+  }
+
+  private async runDeleteBranch(request: MergeForgeDeleteBranchRequest): Promise<MergeForgeActionResult> {
+    const configDir = this.mergeConfigDir();
+    if (configDir === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    const runGh = this.delegate?.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'ambiguous', reason: 'no gh subprocess is configured' };
+    }
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return this.mergeRefusedOther(budget.reason);
+    }
+    // The ref is read before any delete: an absent branch is already swept, never a second DELETE.
+    const head = await this.readBranchHead(request);
+    if (head.outcome === 'not-found') {
+      return { outcome: 'branch-gone' };
+    }
+    if (head.outcome === 'unavailable') {
+      return { outcome: 'ambiguous', reason: 'delete-branch could not read the branch' };
+    }
+    const args = [
+      'api',
+      '--method',
+      'DELETE',
+      `repos/${request.repository.owner}/${request.repository.repo}/git/refs/heads/${request.branchName}`,
+    ];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args, configDir, budget.timeoutMs);
+    } catch {
+      return { outcome: 'ambiguous', reason: 'gh api delete-branch could not complete' };
+    }
+    if (gh.exitCode === 0) {
+      return { outcome: 'executed', headSha: head.headSha };
+    }
+    // A non-zero exit does not prove the branch is present (the delete may have landed): read it back.
+    const reRead = await this.readBranchHead(request);
+    if (reRead.outcome === 'not-found') {
+      return { outcome: 'branch-gone' };
+    }
+    if (reRead.outcome === 'found') {
+      return {
+        outcome: 'refused',
+        reason: 'gh api delete-branch failed',
+        refusalKind: classifyGhRefusal(gh.stderr, gh.stdout),
+      };
+    }
+    return { outcome: 'ambiguous', reason: 'gh api delete-branch failed and the branch could not be read back' };
   }
 
   // --- merge-main-into-branch (lane CO8): merge main into chain/<name> ---

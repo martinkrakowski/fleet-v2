@@ -120,6 +120,156 @@ describe('detectStalls', () => {
     });
   });
 
+  describe('parked severity escalation (PK3)', () => {
+    it('keeps both park rules at digest past parkedMinutes and at exactly parkedPageMinutes', () => {
+      // 61 minutes parked: past parkedMinutes (30), below parkedPageMinutes (180).
+      const under = detectStalls(snapshot({ runs: [parkedRun()] }), DEFAULT_STALL_THRESHOLDS, NOW);
+      expect(rulesOf(under)).toEqual(['unowned-park']);
+      expect(under[0]?.severity).toBe('digest');
+
+      const ownedUnder = detectStalls(
+        snapshot({ runs: [parkedRun({ prNumber: 7 })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(ownedUnder)).toEqual(['owned-park']);
+      expect(ownedUnder[0]?.severity).toBe('digest');
+
+      // Exactly 180 minutes parked: not yet over the page threshold.
+      const at = detectStalls(
+        snapshot({ runs: [parkedRun({ parkedAtIso: '2026-11-06T09:00:00.000Z' })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(at)).toEqual(['unowned-park']);
+      expect(at[0]?.severity).toBe('digest');
+
+      const ownedAt = detectStalls(
+        snapshot({ runs: [parkedRun({ prNumber: 7, parkedAtIso: '2026-11-06T09:00:00.000Z' })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(ownedAt)).toEqual(['owned-park']);
+      expect(ownedAt[0]?.severity).toBe('digest');
+    });
+
+    it('escalates both park rules to page one second past parkedPageMinutes, sorting ahead of digest findings', () => {
+      const past = detectStalls(
+        snapshot({ runs: [parkedRun({ parkedAtIso: '2026-11-06T08:59:59.000Z' })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(past)).toEqual(['unowned-park']);
+      expect(past[0]?.severity).toBe('page');
+
+      const ownedPast = detectStalls(
+        snapshot({ runs: [parkedRun({ prNumber: 7, parkedAtIso: '2026-11-06T08:59:59.000Z' })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(ownedPast)).toEqual(['owned-park']);
+      expect(ownedPast[0]?.severity).toBe('page');
+
+      // A page finding sorts ahead of a digest finding from another rule.
+      const both = detectStalls(
+        snapshot({
+          runs: [
+            parkedRun({ id: 'run-page', parkedAtIso: '2026-11-06T08:59:59.000Z' }),
+            parkedRun({ id: 'run-digest', parkedAtIso: '2026-11-06T11:00:00.000Z' }),
+          ],
+          providerErrors: [{ provider: 'prov-1', class: 'rate-limited', atIso: NOW }],
+        }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(both.map((f) => f.severity)).toEqual(['page', 'page', 'digest']);
+    });
+
+    it('keeps a hand-owned run silent past parkedPageMinutes', () => {
+      const handOwned = detectStalls(
+        snapshot({ runs: [parkedRun({ handOwned: true, parkedAtIso: '2026-11-06T08:00:00.000Z' })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(handOwned)).toEqual([]);
+    });
+
+    it('honors a custom parkedPageMinutes', () => {
+      const over = detectStalls(
+        snapshot({ runs: [parkedRun()] }),
+        { ...DEFAULT_STALL_THRESHOLDS, parkedPageMinutes: 10 },
+        NOW,
+      );
+      expect(rulesOf(over)).toEqual(['unowned-park']);
+      expect(over[0]?.severity).toBe('page');
+
+      // Exactly 10 minutes parked, past parkedMinutes (lowered to 5): still digest.
+      const thresholds: StallThresholds = {
+        ...DEFAULT_STALL_THRESHOLDS,
+        parkedMinutes: 5,
+        parkedPageMinutes: 10,
+      };
+      const at = detectStalls(
+        snapshot({ runs: [parkedRun({ parkedAtIso: '2026-11-06T11:50:00.000Z' })] }),
+        thresholds,
+        NOW,
+      );
+      expect(rulesOf(at)).toEqual(['unowned-park']);
+      expect(at[0]?.severity).toBe('digest');
+      const past = detectStalls(
+        snapshot({ runs: [parkedRun({ parkedAtIso: '2026-11-06T11:49:59.000Z' })] }),
+        thresholds,
+        NOW,
+      );
+      expect(rulesOf(past)).toEqual(['unowned-park']);
+      expect(past[0]?.severity).toBe('page');
+    });
+
+    it('falls back to 180 for a missing, negative, or non-finite parkedPageMinutes', () => {
+      const parked = parkedRun({ parkedAtIso: '2026-11-06T08:59:59.000Z' });
+      const missing = detectStalls(
+        snapshot({ runs: [parked] }),
+        { ...DEFAULT_STALL_THRESHOLDS, parkedPageMinutes: undefined } as StallThresholds,
+        NOW,
+      );
+      expect(missing[0]?.severity).toBe('page');
+
+      const negative = detectStalls(
+        snapshot({ runs: [parked] }),
+        { ...DEFAULT_STALL_THRESHOLDS, parkedPageMinutes: -5 },
+        NOW,
+      );
+      expect(negative[0]?.severity).toBe('page');
+
+      const nonFinite = detectStalls(
+        snapshot({ runs: [parked] }),
+        { ...DEFAULT_STALL_THRESHOLDS, parkedPageMinutes: Number.POSITIVE_INFINITY },
+        NOW,
+      );
+      expect(nonFinite[0]?.severity).toBe('page');
+    });
+
+    it('emits snapshot-invalid for an invalid or missing parkedAtIso and never a page finding', () => {
+      for (const parkedAtIso of ['not-a-time', undefined]) {
+        const findings = detectStalls(
+          snapshot({ runs: [parkedRun({ parkedAtIso: parkedAtIso as string | undefined })] }),
+          DEFAULT_STALL_THRESHOLDS,
+          NOW,
+        );
+        expect(rulesOf(findings)).toEqual(['snapshot-invalid']);
+        expect(findings[0]?.severity).toBe('digest');
+      }
+      // An invalid clock silences every time-based rule and names nowIso.
+      const badClock = detectStalls(
+        snapshot({ runs: [parkedRun({ parkedAtIso: '2026-11-06T08:59:59.000Z' })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        'not-a-time',
+      );
+      expect(rulesOf(badClock)).toEqual(['snapshot-invalid']);
+      expect(badClock.some((f) => f.severity === 'page')).toBe(false);
+    });
+  });
+
   describe('driver-absent', () => {
     it('pages when the lease is missing while non-terminal runs exist', () => {
       const findings = detectStalls(

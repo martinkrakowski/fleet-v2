@@ -729,6 +729,43 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(result).toEqual({ outcome: 'parked', reason: 'seat-plan-exhausted', qualifier: null });
   });
 
+  it('F198: the seat-plan-exhausted park preserves and NAMES the worktree it leaves behind', async () => {
+    const first = attemptFixture({ state: 'cancelled', stopReason: 'rate-limited' });
+    const second = attemptFixture({
+      id: 'attempt-example-2',
+      state: 'cancelled',
+      stopReason: 'rate-limited',
+      seatSelection: SEAT_SELECTION_FP2,
+    });
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [first, second],
+      { wireRecovery: true },
+    );
+    await appendIntent(harness, prepareKey(0, 0, 1), 'attempt-example-1', NOW);
+    await appendResult(harness, prepareKey(0, 0, 1), 'completed', 'prepared', NOW);
+    await appendIntent(harness, prepareKey(0, 1, 2), 'attempt-example-2', NOW);
+    await appendResult(harness, prepareKey(0, 1, 2), 'completed', 'prepared', NOW);
+    await conduct(harness, 'seat-failed', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'seat-plan-exhausted', qualifier: null });
+
+    // The park preserved the worktree the exhausted plan leaves behind...
+    const preserved = harness.preserveRequests.filter((request) =>
+      request.patchPath.endsWith('.park.patch'),
+    );
+    expect(preserved).toHaveLength(1);
+    // ...and nothing was reset: the worktree is left exactly as the seat left it.
+    expect(harness.resetRequests).toEqual([]);
+    // ...and the journal NAMES it, which is what makes stranded work findable
+    // instead of one of hundreds of hash-named directories.
+    const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-2');
+    const named = entries.filter((entry) => (entry.detail ?? '').startsWith('parked worktree preserved: '));
+    expect(named).toHaveLength(1);
+    expect(named[0]?.detail).toContain(preserved[0]?.worktreePath ?? 'no-worktree');
+    expect(named[0]?.status).toBe('completed');
+  });
+
   it('test 6: a dispatch refused with the attempt still intent-recorded parks step-refused dispatch', async () => {
     const harness = await makeHarness(runRecord(), [attemptFixture()]);
     harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: 'refused by the example runner' }));

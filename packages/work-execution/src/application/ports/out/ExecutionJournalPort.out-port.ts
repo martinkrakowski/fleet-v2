@@ -9,6 +9,7 @@ import type {
   ActionJournalEntryRecord,
   CapacityReservationRecord,
 } from '../../../domain/execution-records.js';
+import type { StartIncompleteFact } from '../../../domain/start-incomplete-fact.js';
 
 /** A capacity reservation before a physical slot index is assigned under the lock. */
 export type CapacityReservationClaim = Omit<CapacityReservationRecord, 'slotIndex'>;
@@ -161,4 +162,20 @@ export interface ExecutionJournalPort {
   releaseCapacityReservationIfUnchanged?(
     request: ReleaseCapacityReservationIfUnchangedRequest,
   ): Promise<ReleaseCapacityReservationIfUnchangedResult>;
+
+  /**
+   * Append one closed-code start-incomplete fact. A fact the domain parser
+   * refuses is `unrecorded reason invalid-fact` and writes nothing; the same
+   * `(attemptId, step, reasonCode)` already stored is `recorded` and appends
+   * nothing; one attempt caps at 16 facts and a 17th is
+   * `unrecorded reason write-failed`.
+   */
+  appendStartIncomplete?(
+    fact: unknown,
+  ): Promise<{ outcome: 'recorded' } | { outcome: 'unrecorded'; reason: 'invalid-fact' | 'write-failed' }>;
+
+  /** List the start-incomplete facts recorded for one attempt, in recorded order. */
+  listStartIncompleteForAttempt?(
+    attemptId: string,
+  ): Promise<{ outcome: 'listed'; facts: readonly StartIncompleteFact[] } | { outcome: 'unreadable' }>;
 }

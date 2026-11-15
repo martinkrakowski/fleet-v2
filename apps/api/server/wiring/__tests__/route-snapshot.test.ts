@@ -14,7 +14,8 @@
 // fails as an unknown stream route.
 import "./nitro-globals.js";
 
-import { readFile, readdir } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,6 +43,12 @@ const STREAM_ROUTE_KEYS = new Set(STREAM_ROUTES);
 
 const METHOD_SUFFIXES = new Set(["get", "post", "patch"]);
 
+/**
+ * Regular file names deliberately ignored when walking the route tree.
+ * Empty in production because apps/api/server/routes/v1 contains only route files and directories.
+ */
+const IGNORED_ROUTE_TREE_NAMES: ReadonlySet<string> = new Set<string>([]);
+
 const ENVELOPE_FIELDS: readonly string[] = ["operationId", "code", "result"];
 
 /** Envelope producers recognized in route source. */
@@ -55,12 +62,16 @@ const ENVELOPE_MARKERS: readonly string[] = [
   "respondRunRead(",
 ];
 
-function methodFromFileName(fileName: string): string {
+function methodFromFileName(fileName: string, relativePath: string = fileName): string {
+  if (!fileName.endsWith(".ts")) {
+    throw new Error(`unexpected route file suffix: ${relativePath}`);
+  }
   const withoutExtension = fileName.slice(0, -3);
   const dot = withoutExtension.lastIndexOf(".");
-  const method = dot === -1 ? "" : withoutExtension.slice(dot + 1);
-  if (!METHOD_SUFFIXES.has(method)) {
-    throw new Error(`unexpected route file suffix: ${fileName}`);
+  const base = dot <= 0 ? "" : withoutExtension.slice(0, dot);
+  const method = dot <= 0 ? "" : withoutExtension.slice(dot + 1);
+  if (base === "" || !METHOD_SUFFIXES.has(method)) {
+    throw new Error(`unexpected route file suffix: ${relativePath}`);
   }
   return method;
 }
@@ -93,40 +104,132 @@ function envelopeForRoute(source: string, streamKey: string): EnvelopeShape {
   );
 }
 
-async function collectRouteFiles(root: string): Promise<string[]> {
+function toRelativeRoutePath(root: string, targetPath: string): string {
+  const rel = relative(root, targetPath).split("\\").join("/");
+  return rel === "" ? "." : rel;
+}
+
+async function collectRouteFiles(
+  root: string,
+  ignoredNames: ReadonlySet<string> = IGNORED_ROUTE_TREE_NAMES,
+): Promise<string[]> {
   const files: string[] = [];
   async function walk(directory: string): Promise<void> {
-    const dirents = await readdir(directory, { withFileTypes: true });
+    const dirRel = toRelativeRoutePath(root, directory);
+    let dirStat;
+    try {
+      dirStat = await lstat(directory);
+    } catch {
+      throw new Error(`unreadable entry in route tree: ${dirRel}`);
+    }
+    if (dirStat.isSymbolicLink()) {
+      throw new Error(`unexpected symlink in route tree: ${dirRel}`);
+    }
+    if (!dirStat.isDirectory()) {
+      throw new Error(`unexpected entry in route tree: ${dirRel}`);
+    }
+    if ((dirStat.mode & 0o444) === 0) {
+      throw new Error(`unreadable entry in route tree: ${dirRel}`);
+    }
+    let dirents;
+    try {
+      dirents = await readdir(directory, { withFileTypes: true });
+    } catch {
+      throw new Error(`unreadable entry in route tree: ${dirRel}`);
+    }
     dirents.sort((a, b) => a.name.localeCompare(b.name));
     for (const dirent of dirents) {
-      if (dirent.isDirectory()) {
-        await walk(join(directory, dirent.name));
+      const fullPath = join(directory, dirent.name);
+      const relPath = toRelativeRoutePath(root, fullPath);
+      if (dirent.isSymbolicLink()) {
+        throw new Error(`unexpected symlink in route tree: ${relPath}`);
+      }
+      let entryStat;
+      try {
+        entryStat = await lstat(fullPath);
+      } catch {
+        throw new Error(`unreadable entry in route tree: ${relPath}`);
+      }
+      if (entryStat.isSymbolicLink()) {
+        throw new Error(`unexpected symlink in route tree: ${relPath}`);
+      }
+      if ((entryStat.mode & 0o444) === 0) {
+        throw new Error(`unreadable entry in route tree: ${relPath}`);
+      }
+      if (dirent.isDirectory() || entryStat.isDirectory()) {
+        if (dirent.name.includes(".")) {
+          throw new Error(`unexpected directory in route tree: ${relPath}`);
+        }
+        const beforeCount = files.length;
+        await walk(fullPath);
+        if (files.length === beforeCount) {
+          throw new Error(`unexpected directory in route tree: ${relPath}`);
+        }
         continue;
       }
-      if (!dirent.isFile()) {
-        throw new Error(`unexpected entry in route tree: ${dirent.name}`);
+      if (!dirent.isFile() || !entryStat.isFile()) {
+        throw new Error(`unexpected entry in route tree: ${relPath}`);
+      }
+      if (ignoredNames.has(dirent.name)) {
+        continue;
       }
       if (!dirent.name.endsWith(".ts")) {
-        throw new Error(`unexpected file in route tree: ${dirent.name}`);
+        throw new Error(`unexpected file in route tree: ${relPath}`);
       }
-      files.push(join(directory, dirent.name));
+      methodFromFileName(dirent.name, relPath);
+      try {
+        await readFile(fullPath, "utf8");
+      } catch {
+        throw new Error(`unreadable entry in route tree: ${relPath}`);
+      }
+      files.push(fullPath);
     }
   }
   await walk(root);
+  if (files.length === 0) {
+    throw new Error("unexpected directory in route tree: .");
+  }
   return files;
 }
 
 async function deriveEntries(routeFiles: string[], root: string): Promise<DerivedRouteSet> {
   const entries: RouteEntry[] = [];
   const problems: string[] = [];
+  if (routeFiles.length === 0) {
+    problems.push("route file list is empty");
+    return { entries, problems };
+  }
   for (const file of routeFiles) {
-    const rest = relative(root, file);
+    const rest = toRelativeRoutePath(root, file);
     const parts = rest.split("/");
     const fileName = parts[parts.length - 1] ?? "";
     const directoryRelative = parts.slice(0, -1).join("/");
     try {
-      const method = methodFromFileName(fileName);
-      const source = await readFile(file, "utf8");
+      let st;
+      try {
+        st = await lstat(file);
+      } catch {
+        throw new Error(`unreadable entry in route tree: ${rest}`);
+      }
+      if (st.isSymbolicLink()) {
+        throw new Error(`unexpected symlink in route tree: ${rest}`);
+      }
+      if (st.isDirectory()) {
+        throw new Error(`unexpected directory in route tree: ${rest}`);
+      }
+      if (!st.isFile()) {
+        throw new Error(`unexpected entry in route tree: ${rest}`);
+      }
+      if ((st.mode & 0o444) === 0) {
+        throw new Error(`unreadable entry in route tree: ${rest}`);
+      }
+      const method = methodFromFileName(fileName, rest);
+      let source: string;
+      try {
+        source = await readFile(file, "utf8");
+      } catch {
+        throw new Error(`unreadable entry in route tree: ${rest}`);
+      }
       const envelope = envelopeForRoute(source, streamKeyFromFileName(fileName, directoryRelative));
       entries.push({
         method: method.toUpperCase(),
@@ -229,6 +332,9 @@ describe("route contract snapshot (/v1)", () => {
     const routeFiles = await collectRouteFiles(routeRoot);
     const first = await deriveEntries(routeFiles, routeRoot);
     const second = await deriveEntries(routeFiles, routeRoot);
+    expect(first.problems).toEqual([]);
+    expect(second.problems).toEqual([]);
+    expect(first.entries.length).toBeGreaterThan(0);
     expect(first.entries).toEqual(second.entries);
   });
 });
@@ -280,6 +386,151 @@ describe("route file derivation", () => {
 
   it("fails for a route that references no envelope producer and is not declared streaming", () => {
     expect(() => envelopeForRoute("return raw;", "v1/mystery.get.ts")).toThrow(/unknown stream route/);
+  });
+
+  async function withTempRouteTree(
+    build: (tempRoot: string) => Promise<void>,
+  ): Promise<{ tempRoot: string; cleanup: () => Promise<void> }> {
+    const tempRoot = await mkdtemp(join(tmpdir(), "route-snapshot-"));
+    await build(tempRoot);
+    return {
+      tempRoot,
+      cleanup: async () => {
+        await rm(tempRoot, { recursive: true, force: true });
+      },
+    };
+  }
+
+  const validRouteSource = 'return envelope(op, "OK");';
+
+  it("rejects a non-.ts file suffix in the route tree naming its relative path", async () => {
+    const { tempRoot, cleanup } = await withTempRouteTree(async (root) => {
+      await mkdir(join(root, "attempts"), { recursive: true });
+      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
+      await writeFile(join(root, "attempts", "stray.get.js"), validRouteSource);
+    });
+    try {
+      await expect(collectRouteFiles(tempRoot)).rejects.toThrow(
+        "unexpected file in route tree: attempts/stray.get.js",
+      );
+      const derived = await deriveEntries([join(tempRoot, "attempts/stray.get.js")], tempRoot);
+      expect(derived.problems).toEqual(["unexpected route file suffix: attempts/stray.get.js"]);
+      expect(derived.entries).toEqual([]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("rejects an unrecognised .ts route suffix in the route tree naming its relative path", async () => {
+    const legacyTree = await withTempRouteTree(async (root) => {
+      await mkdir(join(root, "attempts"), { recursive: true });
+      await writeFile(join(root, "attempts", "legacy.delete.ts"), validRouteSource);
+    });
+    const helperTree = await withTempRouteTree(async (root) => {
+      await mkdir(join(root, "attempts"), { recursive: true });
+      await writeFile(join(root, "attempts", "helper.ts"), validRouteSource);
+    });
+    try {
+      await expect(collectRouteFiles(legacyTree.tempRoot)).rejects.toThrow(
+        "unexpected route file suffix: attempts/legacy.delete.ts",
+      );
+      await expect(collectRouteFiles(helperTree.tempRoot)).rejects.toThrow(
+        "unexpected route file suffix: attempts/helper.ts",
+      );
+      expect(() => methodFromFileName(".get.ts", "attempts/.get.ts")).toThrow(
+        "unexpected route file suffix: attempts/.get.ts",
+      );
+    } finally {
+      await legacyTree.cleanup();
+      await helperTree.cleanup();
+    }
+  });
+
+  it("ignores only regular files whose exact name is in the explicit ignored list and rejects unlisted names", async () => {
+    const { tempRoot, cleanup } = await withTempRouteTree(async (root) => {
+      await mkdir(join(root, "attempts"), { recursive: true });
+      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
+      await writeFile(join(root, "attempts", ".gitkeep"), "");
+    });
+    try {
+      await expect(collectRouteFiles(tempRoot, new Set([".gitkeep"]))).resolves.toEqual([
+        join(tempRoot, "attempts", "index.get.ts"),
+      ]);
+      await expect(collectRouteFiles(tempRoot)).rejects.toThrow(
+        "unexpected file in route tree: attempts/.gitkeep",
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("rejects a directory where a route file was expected naming its relative path", async () => {
+    const spoofTree = await withTempRouteTree(async (root) => {
+      await mkdir(join(root, "attempts", "spoof.get.ts"), { recursive: true });
+      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
+    });
+    const emptyTree = await withTempRouteTree(async (root) => {
+      await mkdir(join(root, "attempts", "empty-dir"), { recursive: true });
+      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
+    });
+    try {
+      await expect(collectRouteFiles(spoofTree.tempRoot)).rejects.toThrow(
+        "unexpected directory in route tree: attempts/spoof.get.ts",
+      );
+      await expect(collectRouteFiles(emptyTree.tempRoot)).rejects.toThrow(
+        "unexpected directory in route tree: attempts/empty-dir",
+      );
+      const derived = await deriveEntries([join(spoofTree.tempRoot, "attempts/spoof.get.ts")], spoofTree.tempRoot);
+      expect(derived.problems).toEqual(["unexpected directory in route tree: attempts/spoof.get.ts"]);
+      expect(derived.entries).toEqual([]);
+    } finally {
+      await spoofTree.cleanup();
+      await emptyTree.cleanup();
+    }
+  });
+
+  it("rejects a symlink in the route tree naming its relative path", async () => {
+    const { tempRoot, cleanup } = await withTempRouteTree(async (root) => {
+      await mkdir(join(root, "attempts"), { recursive: true });
+      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
+      await symlink(join(root, "attempts", "index.get.ts"), join(root, "attempts", "alias.get.ts"));
+    });
+    try {
+      await expect(collectRouteFiles(tempRoot)).rejects.toThrow(
+        "unexpected symlink in route tree: attempts/alias.get.ts",
+      );
+      const derived = await deriveEntries([join(tempRoot, "attempts/alias.get.ts")], tempRoot);
+      expect(derived.problems).toEqual(["unexpected symlink in route tree: attempts/alias.get.ts"]);
+      expect(derived.entries).toEqual([]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("rejects an unreadable entry in the route tree naming its relative path", async () => {
+    const { tempRoot, cleanup } = await withTempRouteTree(async (root) => {
+      await mkdir(join(root, "attempts"), { recursive: true });
+      await writeFile(join(root, "attempts", "index.get.ts"), validRouteSource);
+      await writeFile(join(root, "attempts", "secret.get.ts"), validRouteSource);
+      await chmod(join(root, "attempts", "secret.get.ts"), 0o000);
+    });
+    const secretFile = join(tempRoot, "attempts", "secret.get.ts");
+    try {
+      await expect(collectRouteFiles(tempRoot)).rejects.toThrow(
+        "unreadable entry in route tree: attempts/secret.get.ts",
+      );
+      const derived = await deriveEntries([secretFile], tempRoot);
+      expect(derived.problems).toEqual(["unreadable entry in route tree: attempts/secret.get.ts"]);
+      expect(derived.entries).toEqual([]);
+    } finally {
+      await chmod(secretFile, 0o644);
+      await cleanup();
+    }
+  });
+
+  it("reports a problem when deriveEntries receives an empty route file list", async () => {
+    const derived = await deriveEntries([], routeRoot);
+    expect(derived).toEqual({ entries: [], problems: ["route file list is empty"] });
   });
 });
 

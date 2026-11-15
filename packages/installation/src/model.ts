@@ -18,11 +18,15 @@ import type {
   HostRunnerModel,
   HostSection,
   MutableHostModel,
+  ReviewerTool,
   SeatModel,
   SeatSection,
 } from './types.js';
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+/** The review tools the review transport router dispatches (D1A). */
+const REVIEWER_TOOLS: readonly ReviewerTool[] = ['opencode', 'api', 'grok', 'agy'];
 
 /**
  * Warning recorded in the load result when a v1 file still carries the
@@ -249,18 +253,9 @@ function deriveModelFromV1(installation: FleetInstallation): ModelOutcome {
 
   const seats: SeatModel[] = [];
   const implementerSteps: ChainStep[] = [];
+  const errors: string[] = [];
   const reviewer = installation.reviewer;
-  const reviewerSeat: SeatModel | undefined =
-    reviewer?.model === undefined
-      ? undefined
-      : {
-          id: 'reviewer',
-          tool: 'opencode',
-          model: reviewer.model,
-          ...(reviewer.variant !== undefined ? { variant: reviewer.variant } : {}),
-          ...(reviewer.agent !== undefined ? { agent: reviewer.agent } : {}),
-          roles: ['reviewer'],
-        };
+  const reviewerSeat: SeatModel | undefined = deriveReviewerSeat(reviewer, errors);
   const implementerSeat: SeatModel | undefined =
     runner?.model === undefined
       ? undefined
@@ -326,7 +321,49 @@ function deriveModelFromV1(installation: FleetInstallation): ModelOutcome {
     ...(verification !== undefined ? { verification: { procedures: verification.procedures } } : {}),
     ...(installation.waves !== undefined ? { waves: installation.waves } : {}),
   };
-  return { model, warnings };
+  return { model, warnings, ...(errors.length > 0 ? { errors } : {}) };
+}
+
+/**
+ * The reviewer seat derived from a v1 `reviewer` section. The `tool` own
+ * property is inspected through its descriptor so a throwing getter is never
+ * invoked; absent `tool` defaults to `opencode` for backward compatibility.
+ * Any invalid `tool` records a derivation error and omits the seat.
+ */
+function deriveReviewerSeat(
+  reviewer: FleetInstallation['reviewer'],
+  errors: string[],
+): SeatModel | undefined {
+  if (reviewer === undefined) {
+    return undefined;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(reviewer, 'tool');
+  if (descriptor !== undefined && ('get' in descriptor || 'set' in descriptor)) {
+    errors.push('reviewer.tool: must be a plain data property');
+    return undefined;
+  }
+  if (
+    descriptor !== undefined &&
+    descriptor.value !== undefined &&
+    (typeof descriptor.value !== 'string' ||
+      !REVIEWER_TOOLS.includes(descriptor.value as ReviewerTool))
+  ) {
+    errors.push('reviewer.tool: must be a known review tool');
+    return undefined;
+  }
+  if (reviewer.model === undefined) {
+    return undefined;
+  }
+  const tool: ReviewerTool =
+    descriptor?.value === undefined ? 'opencode' : (descriptor.value as ReviewerTool);
+  return {
+    id: 'reviewer',
+    tool,
+    model: reviewer.model,
+    ...(reviewer.variant !== undefined ? { variant: reviewer.variant } : {}),
+    ...(reviewer.agent !== undefined ? { agent: reviewer.agent } : {}),
+    roles: ['reviewer'],
+  };
 }
 
 /** The v2 form of a forge section: v1 owner/repository becomes mode `github` (D6). */

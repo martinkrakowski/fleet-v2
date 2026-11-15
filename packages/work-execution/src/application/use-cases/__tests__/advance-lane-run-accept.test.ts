@@ -857,14 +857,15 @@ describe('AdvanceLaneRunUseCase read-only facts (K6-5)', () => {
       wireForge: false,
       wireReceiptRead: false,
     });
-    expect(await advance(waiting)).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    // PMR1: no receipt and no reviewer seat is a seat outage, not a silent wait.
+    expect(await advance(waiting)).toEqual({ outcome: 'parked', qualifier: null, reason: 'review-seat-unavailable' });
     const watching = await acceptedHarness('watching-ci', {}, { wireCi: false, wireForge: false, wireReceiptRead: false });
     expect(await advance(watching)).toEqual({ outcome: 'waiting', reason: 'ci-unknown' });
     const pushing = await acceptedHarness('pushing', {}, { wireCi: false, wireForge: false, wireReceiptRead: false });
     expect(await advance(pushing)).toEqual({ outcome: 'waiting', reason: 'facts-inconsistent' });
   });
 
-  it('test 11: a passed pre-merge receipt enters opening-pr; a not-found one waits premerge-pending', async () => {
+  it('test 11: a passed pre-merge receipt enters opening-pr; a not-found one asks for a review (PMR1)', async () => {
     const passed = await acceptedHarness('awaiting-premerge');
     passed.setReceiptAnswer({
       outcome: 'found',
@@ -883,7 +884,8 @@ describe('AdvanceLaneRunUseCase read-only facts (K6-5)', () => {
       { attemptId: 'attempt-example-1', candidateHeadSha: COMMIT, kind: 'pre-merge' },
     ]);
     const none = await acceptedHarness('awaiting-premerge');
-    expect(await advance(none)).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    // PMR1: a not-found receipt asks for a review; with no seat wired the run parks seat-unavailable.
+    expect(await advance(none)).toEqual({ outcome: 'parked', qualifier: null, reason: 'review-seat-unavailable' });
   });
 
   it('test 12: an unknown or unavailable pre-merge receipt parks ambiguous pre-merge; a failed one with a blocking finding at round 2 parks blocker-after-round-2 with non-empty findings; a failed one with zero findings parks ambiguous (RV3)', async () => {

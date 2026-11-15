@@ -47,6 +47,7 @@ import type {
   OpencodeHostRunnerSection,
   PolicySection,
   ProcedureCoverage,
+  ReviewerSection,
   RunnerCapabilityDeclaration,
   RunnerSection,
   SeatSection,
@@ -107,6 +108,13 @@ export const SEAT_KEYS: readonly string[] = freezeKeys<FallbackSeat>()([
   'agent',
   'model',
   'variant',
+]);
+
+export const REVIEWER_KEYS: readonly string[] = freezeKeys<ReviewerSection>()([
+  'agent',
+  'model',
+  'variant',
+  'tool',
 ]);
 
 export const SHELF_KEYS: readonly string[] = freezeKeys<ShelfSection>()(['baseUrl', 'keyFile']);

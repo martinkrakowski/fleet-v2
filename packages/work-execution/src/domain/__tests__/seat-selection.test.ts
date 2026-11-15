@@ -8,6 +8,7 @@ import {
   seatMatchesAssignment,
   seatOutcomeOfStopReason,
   seatPlanFamilyConflicts,
+  selectPreMergeSeat,
   selectReviewSeat,
   selectSeat,
   type SeatHistoryEntry,
@@ -484,5 +485,28 @@ describe("pickNextSeat", () => {
     expect(seatOutcomeOfStopReason("runner-refused")).toBe("provider-error");
     expect(seatOutcomeOfStopReason("none")).toBeNull();
     expect(seatOutcomeOfStopReason("unknown")).toBeNull();
+  });
+});
+
+describe("pre-merge seat over the review pool (PMR1)", () => {
+  const reviewPlan = plan(
+    [seat("fx1", "alpha-2")],
+    [
+      seat("rv-fallback", "beta-1", { on: ["rate-limited"] }),
+      seat("rv-same", "alpha-9"),
+      seat("rv-a", "gamma-1"),
+      seat("rv-b", "delta-1"),
+    ],
+  );
+
+  it("test_select_pre_merge_seat_ignores_fallback_seats_and_respects_owner_order", () => {
+    const attempts = [attemptRecord({ runner: { kind: "opencode", remotePort: null, host: null, agent: null, model: "alpha-1", variant: null } })];
+    const result = selectPreMergeSeat({ seats: reviewPlan.getSeats("review"), attempts, sameFamily });
+    // `rv-fallback` (a fallback seat) is skipped though first and family-free; `rv-same` shares the
+    // implementer's family; the first eligible primary in owner order is `rv-a`.
+    expect(result).toMatchObject({ ok: true, seatIndex: 2 });
+    if (result.ok) {
+      expect(result.seat.id).toBe("rv-a");
+    }
   });
 });

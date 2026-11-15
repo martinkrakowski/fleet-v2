@@ -577,3 +577,63 @@ describe('fast-check round-trips stamp schemaVersion 1', () => {
     );
   });
 });
+
+describe('ExecutionJournalAdapter start-incomplete ledger', () => {
+  function startIncompleteFact(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      attemptId: 'attempt-example-1',
+      runId: RUN_0,
+      step: 'brief',
+      reasonCode: 'brief-rejected',
+      recordedAtIso: NOW,
+      ...overrides,
+    };
+  }
+
+  it('does not append a second fact for the same attempt step and reason', async () => {
+    const store = new ExecutionJournalAdapter();
+    expect(await store.appendStartIncomplete(startIncompleteFact())).toEqual({ outcome: 'recorded' });
+    expect(await store.appendStartIncomplete(startIncompleteFact())).toEqual({ outcome: 'recorded' });
+    expect(await store.appendStartIncomplete(startIncompleteFact({ reasonCode: 'attempt-differs' }))).toEqual({
+      outcome: 'recorded',
+    });
+    const listed = await store.listStartIncompleteForAttempt('attempt-example-1');
+    expect(listed).toEqual({
+      outcome: 'listed',
+      facts: [startIncompleteFact(), startIncompleteFact({ reasonCode: 'attempt-differs' })],
+    });
+  });
+
+  it('reports the start-incomplete ledger unreadable when a record is malformed', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-schema-start-incomplete-'));
+    try {
+      await fs.writeFile(
+        path.join(dir, 'start-incomplete.json'),
+        JSON.stringify([{ not: 'a fact' }]),
+        'utf8',
+      );
+      const unreadable = await new ExecutionJournalAdapter({ stateDir: dir }).listStartIncompleteForAttempt(
+        'attempt-example-1',
+      );
+      expect(unreadable).toEqual({ outcome: 'unreadable' });
+      // The file is left exactly as it was read: no quarantine, no rewrite.
+      expect(JSON.parse(await fs.readFile(path.join(dir, 'start-incomplete.json'), 'utf8'))).toEqual([
+        { not: 'a fact' },
+      ]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('lists no start-incomplete facts when the ledger file is absent', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-schema-start-incomplete-'));
+    try {
+      expect(await new ExecutionJournalAdapter({ stateDir: dir }).listStartIncompleteForAttempt('attempt-example-1')).toEqual({
+        outcome: 'listed',
+        facts: [],
+      });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+});

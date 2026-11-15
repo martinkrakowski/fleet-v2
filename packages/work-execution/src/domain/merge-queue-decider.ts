@@ -6,10 +6,13 @@
  * tick, reaching `act merge-pr` only when every earlier row is false.
  */
 
+import { containsSecretShape } from '@fleet/shared';
+import { DEFAULT_BASE_BRANCH, parseBaseBranch } from './base-branch.js';
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from './lane-run-journal.js';
 import { LANE_RUN_MAX_RETRY } from './lane-run-keys.js';
 import {
+  MERGE_QUEUE_ENTRY_V2_VERSION,
   effectiveVerifiedHeadOid,
   isMergeHex40,
   isMergeQueueEntryLive,
@@ -112,6 +115,8 @@ export interface MergeStepFacts {
   readonly macosVerification: MergeMacosVerificationFact;
   readonly veto?: MergeQueueVetoRecord | null;
   readonly lastForgeOutcome?: MergeLastForgeOutcomeFact | null;
+  /** The base branch the forge read the pull request against; absent means unobserved. */
+  readonly observedBaseBranch?: unknown;
 }
 
 export interface MergeRepoPolicy {
@@ -137,7 +142,7 @@ export type MergeStepWaitReason =
   | 'threads-unknown' | 'not-queue-head' | 'already-merged' | 'pr-unknown'
   | 'checks-unknown' | 'updates-unknown' | 'premerge-carry-unknown' | 'disjointness-unknown'
   | 'merge-state-unknown' | 'merge-state-blocked' | 'macos-unknown' | 'head-reread-unknown'
-  | 'unverified-head' | 'facts-inconsistent';
+  | 'unverified-head' | 'facts-inconsistent' | 'base-unobserved' | 'base-mismatch';
 
 export type MergeStepDecision =
   | {
@@ -957,6 +962,39 @@ function readyRowsStep(
   return macos !== null ? macos : finalRow(entry, facts, policy, verdict);
 }
 
+/**
+ * The base gate between the PR rows and the update row: an entry may only be
+ * driven against the base it was queued for. The observed base is read
+ * through its own descriptor, so no getter ever runs; an absent observation
+ * is exact only for a `main` (v1 or explicit-main) entry.
+ */
+function observedBaseStep(entry: MergeQueueEntryRecord, facts: MergeStepFacts): MergeStepDecision | null {
+  try {
+    const effectiveBase: string =
+      entry.version === MERGE_QUEUE_ENTRY_V2_VERSION && entry.baseBranch !== undefined
+        ? entry.baseBranch
+        : DEFAULT_BASE_BRANCH;
+    const descriptor = Reflect.getOwnPropertyDescriptor(facts, 'observedBaseBranch');
+    if (descriptor === undefined) {
+      return effectiveBase === DEFAULT_BASE_BRANCH ? null : waitDecision('base-unobserved');
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      return FACTS_INCONSISTENT;
+    }
+    const observed = descriptor.value;
+    if (typeof observed === 'string' && containsSecretShape(observed)) {
+      return FACTS_INCONSISTENT;
+    }
+    const parsed = parseBaseBranch(observed);
+    if (parsed === undefined) {
+      return FACTS_INCONSISTENT;
+    }
+    return parsed === effectiveBase ? null : waitDecision('base-mismatch');
+  } catch {
+    return FACTS_INCONSISTENT;
+  }
+}
+
 /** Rows 6 through 14 in order, then the ready rows. */
 function decideRows(
   entry: MergeQueueEntryRecord,
@@ -972,6 +1010,10 @@ function decideRows(
   const pr = prStatusStep(facts);
   if (pr !== null) {
     return pr;
+  }
+  const base = observedBaseStep(entry, facts);
+  if (base !== null) {
+    return base;
   }
   const update = updateRowStep(entry, facts, policy, nowMs);
   if (update !== null) {

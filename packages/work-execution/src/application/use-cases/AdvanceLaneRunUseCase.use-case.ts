@@ -74,6 +74,7 @@ import type { LaneRunParkNoticePort } from '../ports/out/LaneRunParkNoticePort.o
 import type { GateReceiptPort } from '../ports/out/GateReceiptPort.out-port.js';
 import type { GateFailingFilePort } from '../ports/out/GateFailingFilePort.out-port.js';
 import type { SameModelFamily } from '../../domain/seat-selection.js';
+import type { PremergeMode } from '../../domain/lane-run-transitions.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
 import type { LeaseRefusal } from '../../domain/lane-run-lease.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
@@ -197,6 +198,13 @@ export interface AdvanceLaneRunDependencies {
   readonly parkNotice?: LaneRunParkNoticePort;
   /** Whether `policy.autoMerge` is enabled (K6-7); absent → the merge fact `policyGrant` is false. */
   readonly autoMergeEnabled?: boolean;
+  /**
+   * AP1: controls whether a verified released Tier 2 pre-merge receipt
+   * auto-posts commit status `'success'` (`'auto-attest'`) or holds at
+   * `'pending'` (`'human-gate'`). Defaults fail-closed to `'human-gate'` when
+   * omitted or unknown.
+   */
+  readonly premergeMode?: PremergeMode;
   /** Answer whether a merged PR head contains the lane head (CT-2b); absent → `containsLaneHead` stays head equality. */
   readonly forgeAncestry?: ForgeAncestryPort;
   /** Record the conducted gate's verification receipts (KF-13a); absent → the gate records nothing. */

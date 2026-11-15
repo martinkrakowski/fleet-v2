@@ -89,6 +89,13 @@ export interface ChainRepositoryPort {
    * leaves it unchanged.
    */
   recordChainRefreshOutcome(command: ChainRefreshOutcomeCommand): Promise<ChainRecordDecision>;
+  /**
+   * Record that the sweep handled a landed chain's branches (lane CO11) by
+   * compare-and-set on `revision`: sets the record's `sweptAtIso` so the next
+   * sweep tick skips it. Already swept answers `already-recorded`; a stale
+   * revision or a record that is not `landed` refuses.
+   */
+  recordChainSwept(command: ChainSweptCommand): Promise<ChainRecordDecision>;
 }
 
 export interface ChainListCommand {
@@ -122,5 +129,16 @@ export interface ChainRefreshOutcomeCommand {
   readonly expectedRevision: number;
   readonly outcome: ChainRefreshTerminalOutcome;
   readonly atIso: string;
+  readonly deadlineIso: string;
+}
+
+/** The sweep's handled mark: one CAS write per swept landed chain (lane CO11). */
+export interface ChainSweptCommand {
+  readonly repository: ChainRepositoryRef;
+  readonly chainName: string;
+  /** Compare-and-set: applies only to the record at this revision. */
+  readonly expectedRevision: number;
+  /** Supplied by the caller; never read from a clock. */
+  readonly sweptAtIso: string;
   readonly deadlineIso: string;
 }

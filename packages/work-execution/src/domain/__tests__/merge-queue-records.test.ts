@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   MERGE_QUEUE_ENTRY_VERSION,
+  MERGE_QUEUE_ENTRY_V2_VERSION,
   compareMergeQueueEntries,
   createUpdateSuccessorEntry,
   effectiveVerifiedHeadOid,
@@ -75,6 +76,11 @@ function expectMalformed(input: unknown, error: string, secret?: string): void {
   }
 }
 
+/** A raw v2 entry: the v1 shape plus an explicit version and base. */
+function makeV2Raw(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { ...makeEntry(), version: MERGE_QUEUE_ENTRY_V2_VERSION, baseBranch: 'chain/example', ...overrides };
+}
+
 describe('round-trip', () => {
   it('reads a valid v1 record', () => {
     const result = readMergeQueueEntryRecord(makeEntry());
@@ -115,22 +121,122 @@ describe('round-trip', () => {
       expect(Object.isFrozen(result.record.veto)).toBe(true);
     }
   });
+
+  it('reads a v1 entry with no baseBranch as version 1 and leaves baseBranch off the record', () => {
+    const result = readMergeQueueEntryRecord(makeEntry());
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.record.version).toBe(1);
+      expect(Object.hasOwn(result.record, 'baseBranch')).toBe(false);
+    }
+  });
+
+  it('round-trips a v1 entry without restamping it as version 2', () => {
+    const first = readMergeQueueEntryRecord(makeEntry());
+    expect(first.ok).toBe(true);
+    if (!first.ok) {
+      return;
+    }
+    expect(first.record.version).toBe(1);
+    expect(Object.hasOwn(first.record, 'baseBranch')).toBe(false);
+    const second = readMergeQueueEntryRecord(JSON.parse(JSON.stringify(first.record)));
+    expect(second.ok).toBe(true);
+    if (second.ok) {
+      expect(second.record.version).toBe(1);
+      expect(Object.hasOwn(second.record, 'baseBranch')).toBe(false);
+    }
+  });
+
+  it('reads a v2 entry and keeps main', () => {
+    const result = readMergeQueueEntryRecord(makeV2Raw({ baseBranch: 'main' }));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.record.version).toBe(2);
+      expect(result.record.baseBranch).toBe('main');
+      const second = readMergeQueueEntryRecord(JSON.parse(JSON.stringify(result.record)));
+      expect(second.ok).toBe(true);
+      if (second.ok) {
+        expect(second.record.version).toBe(2);
+        expect(second.record.baseBranch).toBe('main');
+      }
+    }
+  });
+
+  it('reads a v2 entry and keeps chain/example', () => {
+    const result = readMergeQueueEntryRecord(makeV2Raw());
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.record.version).toBe(2);
+      expect(result.record.baseBranch).toBe('chain/example');
+      const second = readMergeQueueEntryRecord(JSON.parse(JSON.stringify(result.record)));
+      expect(second.ok).toBe(true);
+      if (second.ok) {
+        expect(second.record.version).toBe(2);
+        expect(second.record.baseBranch).toBe('chain/example');
+      }
+    }
+  });
+
+  it('refuses a v2 entry whose baseBranch does not parse', () => {
+    for (const base of ['Main', '', null, 12]) {
+      const result = readMergeQueueEntryRecord(makeV2Raw({ baseBranch: base }));
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe('malformed');
+        expect(result.error).toBe('MergeQueueEntry baseBranch must be main or chain/<name>');
+        if (typeof base === 'string' && base.length > 0) {
+          expect(result.error).not.toContain(base);
+        }
+      }
+    }
+  });
+
+  it('refuses a secret-shaped v2 baseBranch without echoing it', () => {
+    const secret = fakeSecret();
+    const result = readMergeQueueEntryRecord(makeV2Raw({ baseBranch: secret }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('malformed');
+      expect(result.error).toBe('MergeQueueEntry baseBranch is secret-shaped');
+      expect(result.error).not.toContain(secret);
+    }
+  });
+
+  it('refuses version 2 when baseBranch is missing instead of reading it as v1', () => {
+    const input = rawEntry({ version: MERGE_QUEUE_ENTRY_V2_VERSION });
+    const result = readMergeQueueEntryRecord(input);
+    expect(result).toEqual({
+      ok: false,
+      reason: 'malformed',
+      error: 'MergeQueueEntry must have exactly the v2 entry keys',
+    });
+  });
+
+  it('refuses a v1 entry that also has baseBranch instead of promoting it to v2', () => {
+    const result = readMergeQueueEntryRecord(rawEntry({ baseBranch: 'main' }));
+    expect(result).toEqual({
+      ok: false,
+      reason: 'malformed',
+      error: 'MergeQueueEntry must have exactly the v1 entry keys',
+    });
+  });
 });
 
 describe('D-R8 version handling', () => {
-  it('reads a legacy record without version as version 1', () => {
+  it('reads a legacy record without version as version 1 and does not add baseBranch', () => {
     const legacy = rawEntry();
     delete legacy.version;
     const result = readMergeQueueEntryRecord(legacy);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.record.version).toBe(1);
+      expect(Object.hasOwn(result.record, 'baseBranch')).toBe(false);
     }
   });
 
-  it.each([2, 0, '1'])('refuses version %p', (version) => {
+  it.each([0, 3, '1'])('refuses version %p', (version) => {
     const result = readMergeQueueEntryRecord(rawEntry({ version }));
-    expect(result).toEqual({ ok: false, reason: 'unknown-version', error: 'MergeQueueEntry version must be 1' });
+    expect(result).toEqual({ ok: false, reason: 'unknown-version', error: 'MergeQueueEntry version must be 1 or 2' });
   });
 
   it('refuses a non-enumerable version', () => {
@@ -239,7 +345,76 @@ describe('hostile inputs', () => {
 
   it('does not let a throwing proxy escape the reader', () => {
     const result = readMergeQueueEntryRecord(throwingProxy(makeEntry()));
-    expect(result.ok).toBe(false);
+    expect(result).toEqual({
+      ok: false,
+      reason: 'malformed',
+      error: 'MergeQueueEntry input could not be read',
+    });
+  });
+
+  it.each([null, 7, 'x', true, undefined, [], { length: 1, 0: makeEntry() }])(
+    'returns a malformed plain-record error for %p',
+    (input) => {
+      expect(readMergeQueueEntryRecord(input)).toEqual({
+        ok: false,
+        reason: 'malformed',
+        error: 'MergeQueueEntry must be a plain record',
+      });
+    },
+  );
+
+  it('reads a throwing version getter as an unknown version', () => {
+    const input = makeEntry();
+    Object.defineProperty(input, 'version', { get() { throw new Error('boom'); }, enumerable: true, configurable: true });
+    const result = readMergeQueueEntryRecord(input);
+    expect(result).toEqual({
+      ok: false,
+      reason: 'unknown-version',
+      error: 'MergeQueueEntry version must be 1 or 2',
+    });
+  });
+
+  it('reads a throwing baseBranch getter as malformed', () => {
+    const input = makeV2Raw();
+    Object.defineProperty(input, 'baseBranch', { get() { throw new Error('boom'); }, enumerable: true, configurable: true });
+    const result = readMergeQueueEntryRecord(input);
+    expect(result).toEqual({
+      ok: false,
+      reason: 'malformed',
+      error: 'MergeQueueEntry baseBranch must be main or chain/<name>',
+    });
+  });
+
+  it('refuses an own __proto__ key as a key mismatch', () => {
+    const input = makeEntry();
+    Object.defineProperty(input, '__proto__', { value: 'polluted', enumerable: true, configurable: true });
+    const result = readMergeQueueEntryRecord(input);
+    expect(result).toEqual({
+      ok: false,
+      reason: 'malformed',
+      error: 'MergeQueueEntry must have exactly the v1 entry keys',
+    });
+  });
+
+  it('ignores an inherited baseBranch on a v1 entry', () => {
+    const input = makeEntry();
+    Object.defineProperty(Object.prototype, 'baseBranch', {
+      value: 'chain/inherited',
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    try {
+      const result = readMergeQueueEntryRecord(input);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.record.version).toBe(1);
+        expect(Object.hasOwn(result.record, 'baseBranch')).toBe(false);
+        expect(findMergeQueueHead([result.record])?.entryId).toBe(result.record.entryId);
+      }
+    } finally {
+      delete (Object.prototype as { baseBranch?: unknown }).baseBranch;
+    }
   });
 
   it('returns [] from orderMergeQueue on a throwing proxy', () => {
@@ -250,6 +425,27 @@ describe('hostile inputs', () => {
   it('returns null from findMergeQueueHead on a throwing proxy', () => {
     const entries = [throwingProxy(makeEntry())] as unknown as readonly MergeQueueEntryRecord[];
     expect(findMergeQueueHead(entries)).toBeNull();
+  });
+
+  it('returns [] and null from the queue readers on hostile lists', () => {
+    const hostiles: unknown[] = [null, undefined, {}, 7, { length: 1, 0: makeEntry() }];
+    const sparse = new Array(5001) as unknown as MergeQueueEntryRecord[];
+    sparse[0] = makeEntry();
+    hostiles.push(sparse);
+    for (const hostile of hostiles) {
+      expect(orderMergeQueue(hostile as readonly MergeQueueEntryRecord[])).toEqual([]);
+      expect(findMergeQueueHead(hostile as readonly MergeQueueEntryRecord[])).toBeNull();
+    }
+  });
+
+  it('skips a sparse hole and a wrong primitive element while ordering the live siblings', () => {
+    const later = makeEntry({ enqueuedAtIso: '2026-11-01T12:00:00.000Z' });
+    const earlier = makeEntry({ enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
+    const holed = [later, undefined, earlier] as unknown as readonly MergeQueueEntryRecord[];
+    expect(orderMergeQueue(holed).map((entry) => entry.entryId)).toEqual([earlier.entryId, later.entryId]);
+    expect(findMergeQueueHead(holed)?.entryId).toBe(earlier.entryId);
+    const primitive = [7, earlier] as unknown as readonly MergeQueueEntryRecord[];
+    expect(orderMergeQueue(primitive).map((entry) => entry.entryId)).toEqual([earlier.entryId]);
   });
 
   it('returns ok:false from createUpdateSuccessorEntry on a hostile input', () => {
@@ -319,6 +515,62 @@ describe('orderMergeQueue', () => {
     expect(orderMergeQueue([makeEntry()], 'nope')).toEqual([]);
     const notArray = undefined as unknown as readonly MergeQueueEntryRecord[];
     expect(orderMergeQueue(notArray)).toEqual([]);
+  });
+
+  it('treats a v1 entry and a v2 main entry as one base', () => {
+    const earlier = makeEntry({ enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
+    const later = makeEntry({ version: 2, baseBranch: 'main', enqueuedAtIso: '2026-11-01T11:00:00.000Z' });
+    const ordered = orderMergeQueue([later, earlier]);
+    expect(ordered.map((entry) => entry.entryId)).toEqual([earlier.entryId, later.entryId]);
+    expect(findMergeQueueHead([later, earlier])?.entryId).toBe(earlier.entryId);
+  });
+
+  it('orders two same-base entries by enqueued instant rather than by entry id or input position', () => {
+    // The smaller entryId carries the later instant and is passed first.
+    const later = makeEntry({ version: 2, baseBranch: 'chain/example', enqueuedAtIso: '2026-11-01T12:00:00.000Z' });
+    const earlier = makeEntry({ version: 2, baseBranch: 'chain/example', enqueuedAtIso: '2026-11-01T11:00:00.000Z' });
+    expect(later.entryId < earlier.entryId).toBe(true);
+    const ordered = orderMergeQueue([later, earlier], undefined, 'chain/example');
+    expect(ordered.map((entry) => entry.entryId)).toEqual([earlier.entryId, later.entryId]);
+  });
+
+  it('orders only the main base when no base filter is given, without mixing chain entries', () => {
+    const chainB = makeEntry({ version: 2, baseBranch: 'chain/b', enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
+    const main = makeEntry({ enqueuedAtIso: '2026-11-01T11:00:00.000Z' });
+    const chainA = makeEntry({ version: 2, baseBranch: 'chain/a', enqueuedAtIso: '2026-11-01T12:00:00.000Z' });
+    const list = [chainB, main, chainA];
+    // Without a base argument the queue is filtered to the default base, so
+    // chain entries are not mixed into ordering and the head is the earliest
+    // unparked main entry.
+    expect(orderMergeQueue(list).map((entry) => entry.entryId)).toEqual([main.entryId]);
+    expect(findMergeQueueHead(list)?.entryId).toBe(main.entryId);
+    // An explicit base still partitions the queue, so each base leases separately.
+    expect(orderMergeQueue(list, DIGEST, 'main').map((entry) => entry.entryId)).toEqual([main.entryId]);
+    expect(findMergeQueueHead(list, DIGEST, 'chain/a')?.entryId).toBe(chainA.entryId);
+    expect(orderMergeQueue(list, DIGEST, 'chain/a').map((entry) => entry.entryId)).toEqual([chainA.entryId]);
+    // An invalid base still refuses with an empty list.
+    expect(orderMergeQueue(list, DIGEST, 'Main')).toEqual([]);
+    expect(findMergeQueueHead(list, DIGEST, 'Main')).toBeNull();
+  });
+
+  it('keeps a v1 successor at version 1 with no baseBranch', () => {
+    const predecessor = makeEntry();
+    const result = createUpdateSuccessorEntry(predecessor, { entryId: nextEntryId(), headOid: HEAD_2 });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.record.version).toBe(1);
+      expect(Object.hasOwn(result.record, 'baseBranch')).toBe(false);
+    }
+  });
+
+  it('keeps a v2 successor on the predecessor base', () => {
+    const predecessor = makeEntry({ version: 2, baseBranch: 'chain/example' });
+    const result = createUpdateSuccessorEntry(predecessor, { entryId: nextEntryId(), headOid: HEAD_2 });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.record.version).toBe(2);
+      expect(result.record.baseBranch).toBe('chain/example');
+    }
   });
 });
 

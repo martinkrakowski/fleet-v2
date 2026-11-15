@@ -1,5 +1,7 @@
 /** The `brief` command group of the CLI driver; its entries moved verbatim from the command table. */
 
+import { resolve as resolvePath } from 'node:path';
+
 import { parseSeatTool, unhealthySeatIdsFromCatalog } from '@fleet/work-execution';
 import type { AuthorBriefRequest, BuildFactPackFact, AcceptanceSpecProps, BriefContextDecision, BriefModelAssignment } from '@fleet/work-execution';
 import { FACT_PACK_MAX_FACTS } from '@fleet/work-execution';
@@ -152,7 +154,9 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
       }
 
       const worktreePath = required('worktreePath');
-      if (!worktreePath.startsWith('/') || worktreePath === '/') {
+      // Not just the literal `/`: `/.`, `/foo/..`, `//` and friends all
+      // resolve to the filesystem root and are refused the same way.
+      if (!worktreePath.startsWith('/') || resolvePath(worktreePath) === '/') {
         throw new CliUsageError('brief author requires an absolute --worktreePath that is not the filesystem root');
       }
 
@@ -234,18 +238,42 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
       }
 
       // The seat tool and the model assignment, as `brief prepare` freezes them.
-      const contextDecisions = viaHelper('contextDecisions', (payload) => nestedArr<BriefContextDecision>(payload, 'contextDecisions')) ?? [];
-      for (const decision of contextDecisions) {
-        if (
-          !decision ||
-          typeof decision !== 'object' ||
-          typeof decision.decisionBecause !== 'string' ||
-          decision.decisionBecause.trim() === ''
-        ) {
+      // The decisions are copied into fresh plain objects with an allowlisted
+      // key set: a payload-supplied Proxy or hostile object must not reach the
+      // use case through `contextDecisions`.
+      const rawContextDecisions =
+        viaHelper('contextDecisions', (payload) => nestedArr<BriefContextDecision>(payload, 'contextDecisions')) ?? [];
+      const contextDecisions: BriefContextDecision[] = [];
+      for (let decisionIndex = 0; decisionIndex < rawContextDecisions.length; decisionIndex += 1) {
+        let rawDecision: unknown;
+        try {
+          rawDecision = rawContextDecisions[decisionIndex];
+        } catch {
+          throw new CliUsageError('brief author could not read its arguments');
+        }
+        if (!rawDecision || typeof rawDecision !== 'object' || Array.isArray(rawDecision)) {
           throw new CliUsageError(
             "brief author contextDecisions requires a non-empty 'decisionBecause' for each item",
           );
         }
+        const record = rawDecision as Record<string, unknown>;
+        const stringField = (key: string): string => {
+          const value = record[key];
+          if (typeof value !== 'string' || value.trim() === '') {
+            throw new CliUsageError(
+              "brief author contextDecisions requires a non-empty 'decisionBecause' for each item",
+            );
+          }
+          return value;
+        };
+        contextDecisions.push({
+          proposalId: stringField('proposalId'),
+          knowledgeEntryId: stringField('knowledgeEntryId'),
+          version: stringField('version'),
+          proposedBecause: stringField('proposedBecause'),
+          accepted: record['accepted'] === true,
+          decisionBecause: stringField('decisionBecause'),
+        });
       }
       const nestedAssignment = viaHelper('modelAssignment', (payload) => nested<BriefModelAssignment>(payload, 'modelAssignment'));
       const rawSeatTool = field('seatTool') ?? nestedAssignment?.seatTool;
@@ -264,16 +292,28 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
           `'--seatTool ${String(seatTool)}' conflicts with the seat tool in --modelAssignment`,
         );
       }
-      const seatPlan = briefSeatPlan(p, rt);
+      // The seat plan is read through the guarded helper, but only from a
+      // fresh plain payload built from single reads: the raw payload object
+      // never reaches it.
+      const seatPlan = briefSeatPlan(
+        {
+          seatPlan: field('seatPlan'),
+          seatPlanFromInstallation: field('seatPlanFromInstallation'),
+        },
+        rt,
+      );
       const unhealthy = new Set(unhealthySeatIdsFromCatalog(derivedV2Model(rt)));
+      // `--model` was read once above and `required` guarantees it, so the
+      // seat plan's auto-selection never applies here.
+      const modelSupplied = implementerModel !== '';
       const planSeatForAssignment =
-        seatPlan !== undefined && nestedAssignment === undefined && opt('model') === undefined
+        seatPlan !== undefined && nestedAssignment === undefined && !modelSupplied
           ? seatPlan['first-pass'].find((seat) => !unhealthy.has(seat.id))
           : undefined;
       if (
         seatPlan !== undefined &&
         nestedAssignment === undefined &&
-        opt('model') === undefined &&
+        !modelSupplied &&
         planSeatForAssignment === undefined
       ) {
         throw new CliUsageError(

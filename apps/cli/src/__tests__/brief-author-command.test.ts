@@ -64,6 +64,19 @@ function validPayload(): string[] {
     '--worktreePath', '/worktree',
     '--briefsDir', '/briefs',
     '--seatTool', 'opencode',
+    '--json', JSON.stringify({
+      contextDecisions: [
+        {
+          proposalId: 'prop-1',
+          knowledgeEntryId: 'ke-1',
+          version: '1.0.0',
+          proposedBecause: 'because',
+          accepted: true,
+          decisionBecause: 'why',
+          extraKey: 'must-not-reach-the-use-case',
+        },
+      ],
+    }),
     '--facts', '[{"kind":"file-list","label":"Sources","pathPrefix":"src"}]',
   ];
 }
@@ -257,11 +270,15 @@ describe('brief author', () => {
   });
 
   it('a filesystem-root worktreePath is a usage error', async () => {
-    const { io } = capturingIo();
-    const { runtime, authorCalls } = guardsRuntime();
-    const exitCode = await runCli(briefAuthorArgs(['--worktreePath', '/']), io, runtime);
-    expect(exitCode).toBe(2);
-    expect(authorCalls).toHaveLength(0);
+    // Not only the literal `/`: `/.`, `/foo/..` and `//` all resolve to the
+    // filesystem root and must be refused the same way.
+    for (const root of ['/', '/.', '/foo/..', '//']) {
+      const { io } = capturingIo();
+      const { runtime, authorCalls } = guardsRuntime();
+      const exitCode = await runCli(briefAuthorArgs(['--worktreePath', root]), io, runtime);
+      expect(exitCode).toBe(2);
+      expect(authorCalls).toHaveLength(0);
+    }
   });
 
   it('operator prose is not accepted', async () => {
@@ -355,6 +372,90 @@ describe('brief author', () => {
     expect((thrown as CliUsageError).message).toBe('brief author could not read its arguments');
   });
 
+  it('a throwing seatPlan getter is a usage error, not a raw escape', async () => {
+    const payload: Record<string, unknown> = {
+      workOrderId: 'wo-1',
+      laneId: 'lane-1',
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      repository: 'owner/repo',
+      baseCommit: COMMIT,
+      policyRevision: 'pol-1',
+      model: IMPLEMENTER_MODEL,
+      fallbackModel: 'fallback-model',
+      independentReviewer: 'reviewer-model',
+      authorModel: AUTHOR_MODEL,
+      checkoutPath: '/checkout',
+      repositoryPath: '/repo',
+      worktreePath: '/worktree',
+      briefsDir: '/briefs',
+      seatTool: 'opencode',
+      facts: [{ kind: 'file-list', label: 'Sources', pathPrefix: 'src' }],
+    };
+    Object.defineProperty(payload, 'seatPlan', {
+      get() {
+        throw new Error('hostile seatPlan');
+      },
+    });
+    const { runtime, authorCalls } = guardsRuntime();
+    let thrown: unknown = null;
+    try {
+      await briefCommands['author'](payload, runtime);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CliUsageError);
+    expect((thrown as CliUsageError).message).toBe('brief author could not read its arguments');
+    expect(authorCalls).toHaveLength(0);
+  });
+
+  it('model and the seat-plan fields are each read exactly once', async () => {
+    const base: Record<string, unknown> = {
+      workOrderId: 'wo-1',
+      laneId: 'lane-1',
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      repository: 'owner/repo',
+      baseCommit: COMMIT,
+      policyRevision: 'pol-1',
+      model: IMPLEMENTER_MODEL,
+      fallbackModel: 'fallback-model',
+      independentReviewer: 'reviewer-model',
+      authorModel: AUTHOR_MODEL,
+      checkoutPath: '/checkout',
+      repositoryPath: '/repo',
+      worktreePath: '/worktree',
+      briefsDir: '/briefs',
+      seatTool: 'opencode',
+      facts: [{ kind: 'file-list', label: 'Sources', pathPrefix: 'src' }],
+      // A seat plan with no modelAssignment makes the handler evaluate the
+      // plan-selection branch, so a second `model` read would throw here.
+      seatPlan: {
+        version: 1,
+        'first-pass': [{ id: 's1', model: 'plan-model', tool: 'opencode' }],
+        fix: [{ id: 's2', model: 'plan-model', tool: 'opencode' }],
+        review: [],
+      },
+    };
+    const reads = new Map<string, number>();
+    const payload = new Proxy(base, {
+      get(target, key, receiver) {
+        const name = String(key);
+        reads.set(name, (reads.get(name) ?? 0) + 1);
+        if (name === 'model' && (reads.get(name) ?? 0) > 1) {
+          throw new Error('model was read twice');
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const { runtime } = guardsRuntime({
+      authorBrief: async () => ({ outcome: 'authored', attemptId: 'att-1', briefDigest: 'digest-1', sessionKey: 'k' }),
+    });
+    const result = (await briefCommands['author'](payload, runtime)) as { outcome: string };
+    expect(result.outcome).toBe('authored');
+    expect(reads.get('model')).toBe(1);
+  });
+
   it('authorModel and the implementer model stay distinct', async () => {
     const { io, stdout } = capturingIo();
     let captured: AuthorBriefRequest | undefined;
@@ -374,6 +475,19 @@ describe('brief author', () => {
     expect(request.factPack.commit).toBe(COMMIT);
     expect(request.prepare.workOrderId).toBe(request.workOrderId);
     expect('proseMarkdown' in request.prepare).toBe(false);
+    // The decisions reach the use case as fresh plain objects with only the
+    // allowlisted keys, never as the payload's own objects.
+    const decisions = JSON.parse(JSON.stringify(request.prepare.contextDecisions)) as Array<Record<string, unknown>>;
+    expect(decisions).toEqual([
+      {
+        proposalId: 'prop-1',
+        knowledgeEntryId: 'ke-1',
+        version: '1.0.0',
+        proposedBecause: 'because',
+        accepted: true,
+        decisionBecause: 'why',
+      },
+    ]);
     expect(stdout.join('')).toContain('authored');
   });
 

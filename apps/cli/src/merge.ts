@@ -184,6 +184,27 @@ export const mergeCommands: Readonly<Record<string, CommandHandler>> = {
     }
     return rt.execution.importTrainState.importTrainState({ repository, stateDir, apply, authority });
   },
+  export: async (p, rt) => {
+    for (const key of Object.keys(p)) {
+      if (key !== 'legacy' && key !== 'repository' && key !== 'positional') {
+        throw new CliUsageError('merge export does not accept an unknown flag');
+      }
+    }
+    const positional = p['positional'];
+    if (positional !== undefined) {
+      if (Array.isArray(positional) ? positional.length > 0 : positional !== '') {
+        throw new CliUsageError('merge export does not accept an unknown flag');
+      }
+    }
+    if (p['legacy'] !== true && p['legacy'] !== 'true') {
+      throw new CliUsageError('merge export requires --legacy');
+    }
+    const repository = repositoryFromPayload(p);
+    if (repository === undefined) {
+      throw new CliUsageError('merge export requires --repository owner/repo');
+    }
+    return rt.execution.exportLegacyTrainState.exportLegacyTrainState({ repository });
+  },
   ready: async (p, rt) => {
     const repository = repositoryFromPayload(p);
     if (repository === undefined) {

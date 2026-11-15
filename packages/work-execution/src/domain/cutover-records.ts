@@ -293,11 +293,14 @@ function utcDayNumber(day: string): number | null {
  * record whose only own key is `days`: exactly three consecutive ascending UTC calendar dates,
  * none after the UTC date of `nowIso`, each carrying the thirteen criteria, every verdict the
  * string `pass`. Key counts are checked before any descriptor walk, so a document padded with
- * extra keys costs a constant number of descriptor reads. A serializer probe on `days` runs
- * before any own-key walk or length read on it, so a Proxy stand-in for `days` (or for a day
- * record inside it) is refused without a single inspection; a second probe on the whole
- * document refuses a Proxy document root. Never throws, never echoes the input, and never
- * runs a getter to decide a verdict.
+ * extra keys costs a constant number of descriptor reads. The `days` array-length and key-count
+ * bounds are settled before any serializer probe, so an oversized array is refused without a
+ * traversal, and no probe ever meets a getter: the only serializer probe is the final one on
+ * the whole document, which runs after the walk has proved every own property a primitive data
+ * value, so it reads no getter, and a Proxy stand-in for `days` (or for a day record inside it,
+ * or for the document root) is refused by it without being accepted. A verdict getter is never
+ * run at all: the walk reads descriptors only, so a throwing or uncloneable getter stays
+ * unread and names only its own criterion. Never throws, never echoes the input.
  */
 export function readCutoverShadowEvidence(raw: unknown, nowIso: string): CutoverShadowEvidenceRead {
   try {
@@ -309,33 +312,14 @@ export function readCutoverShadowEvidence(raw: unknown, nowIso: string): Cutover
     if (!Array.isArray(days) || Object.getPrototypeOf(days) !== Array.prototype) {
       return allCriteriaFailed();
     }
-    // A transparent Proxy also answers that prototype check, and every own-key
-    // and descriptor read below would then inspect it. So the serializer probe
-    // runs here, before any key walk or length read: the serializer refuses a
-    // Proxy exotic object without enumerating it, so no trap and no getter on
-    // the stand-in runs, and the refusal precedes every inspection. A getter
-    // deeper inside a real array also throws during the probe, but that is a
-    // getter error, not a clone refusal; the descriptor walk below still
-    // decides that case without running the getter again and names the
-    // criterion. The probe clones at most three small day records, so its
-    // cost is the same constant bound as the walk it guards.
-    // A transparent Proxy also answers that prototype check, and every own-key
-    // and descriptor read below would then inspect it. So the serializer probe
-    // runs here, before any key walk or length read: the serializer refuses a
-    // Proxy exotic object without enumerating it, so no trap and no getter on
-    // the stand-in runs, and the refusal precedes every inspection. A getter
-    // deeper inside a real array also throws during the probe, but that is a
-    // getter error, not a clone refusal; the descriptor walk below still
-    // decides that case without running the getter again and names the
-    // criterion. The probe clones at most three small day records, so its
-    // cost is the same constant bound as the walk it guards.
-    try {
-      structuredClone(days);
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'DataCloneError') {
-        return allCriteriaFailed();
-      }
-    }
+    // The array-length and key-count bounds run BEFORE any serializer probe.
+    // A probe on an unbounded array would traverse it — a sparse array with an
+    // enormous `length` costs a traversal per hole — and would run any getter
+    // it meets on the way, whose DataCloneError a clone refusal cannot tell
+    // apart from a Proxy stand-in. With the bounds settled first, an oversized
+    // array is refused without being cloned, and the descriptor walk below
+    // never runs a getter; a Proxy stand-in is refused by the final serializer
+    // probe, which reads only proved primitive data properties.
     const dayKeys = Reflect.ownKeys(days);
     const allowedDayKeys: readonly string[] = ['0', '1', '2', 'length'];
     // Key-count guard first: an over-count is refused before any descriptor read.

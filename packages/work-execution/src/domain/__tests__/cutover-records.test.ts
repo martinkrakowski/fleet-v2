@@ -303,6 +303,40 @@ describe('readCutoverShadowEvidence', () => {
       failed: ['S9'],
     });
 
+    // A verdict getter that yields an uncloneable value, or throws a
+    // DataCloneError itself, must stay unread and name only its own
+    // criterion. A serializer probe that runs before the bounds would meet
+    // these getters and mistake their failure for a stand-in refusal, naming
+    // every criterion instead.
+    const uncloneableGetter = evidence(NOW, (root) => {
+      const days = root.days as Array<{ verdicts: Record<string, unknown> }>;
+      Object.defineProperty(days[0].verdicts, 'S5', {
+        enumerable: true,
+        get() {
+          return () => 1; // a function cannot be cloned
+        },
+      });
+    });
+    expect(readCutoverShadowEvidence(uncloneableGetter, NOW)).toEqual({
+      ok: false,
+      reason: 'invalid-evidence',
+      failed: ['S5'],
+    });
+    const dataCloneThrowingGetter = evidence(NOW, (root) => {
+      const days = root.days as Array<{ verdicts: Record<string, unknown> }>;
+      Object.defineProperty(days[2].verdicts, 'S6', {
+        enumerable: true,
+        get() {
+          throw new DOMException('unread', 'DataCloneError');
+        },
+      });
+    });
+    expect(readCutoverShadowEvidence(dataCloneThrowingGetter, NOW)).toEqual({
+      ok: false,
+      reason: 'invalid-evidence',
+      failed: ['S6'],
+    });
+
     expect(readCutoverShadowEvidence({ days: new Proxy({}, {}) }, NOW)).toEqual(ALL_FAILED);
     expect(
       readCutoverShadowEvidence(
@@ -343,19 +377,17 @@ describe('readCutoverShadowEvidence', () => {
     expect(readCutoverShadowEvidence(new Proxy(evidence(NOW) as object, {}), NOW)).toEqual(ALL_FAILED);
   });
 
-  it('refuses a transparent Proxy standing in for days before any own-key walk or length read on it', () => {
-    // A transparent Proxy answers Array.isArray, getPrototypeOf and every
-    // descriptor read exactly as its target would, so the serializer probe
-    // must refuse it before the validator inspects a single key or the
-    // `length` descriptor. Prove it by counting descriptor reads: only the
-    // root's `days` slot may be read before the refusal, whereas the old
-    // eventual refusal walked three day records and thirteen verdicts each
-    // through the proxy first.
+  it('refuses a transparent Proxy standing in for days after a bounded descriptor walk, via the final serializer probe', () => {
+    // The array-length and key-count bounds run before any serializer probe,
+    // so a Proxy stand-in for `days` is inspected by the bounded walk and then
+    // refused by the final serializer probe: still a constant number of
+    // descriptor reads, never a result, and the probe itself reads no getter
+    // because every accessor would already have failed the walk.
     const validDays = (evidence(NOW) as { days: object[] }).days;
     const descriptorReads = vi.spyOn(Object, 'getOwnPropertyDescriptor');
     try {
       expect(readCutoverShadowEvidence({ days: new Proxy(validDays, {}) }, NOW)).toEqual(ALL_FAILED);
-      expect(descriptorReads.mock.calls.length).toBeLessThanOrEqual(3);
+      expect(descriptorReads.mock.calls.length).toBeLessThanOrEqual(50);
     } finally {
       descriptorReads.mockRestore();
     }

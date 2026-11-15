@@ -771,11 +771,15 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (record === null) {
       return expectedRevision === 0 ? null : refuse('revision-conflict');
     }
-    if (record.state !== 'shadow') {
-      return refuse('not-shadow');
-    }
+    // The revision precondition governs every stored record, shadow or not:
+    // a stored revision other than the expected one is a `revision-conflict`
+    // even when the stored state is not `shadow`, so the revision is checked
+    // before the not-shadow path.
     if (record.revision !== expectedRevision) {
       return refuse('revision-conflict');
+    }
+    if (record.state !== 'shadow') {
+      return refuse('not-shadow');
     }
     return null;
   }

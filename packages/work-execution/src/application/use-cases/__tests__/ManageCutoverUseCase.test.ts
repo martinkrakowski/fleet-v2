@@ -529,6 +529,23 @@ describe('ManageCutoverUseCase switch', () => {
     expect(totalWriteCalls(missing)).toBe(0);
   });
 
+  it('refuses revision-conflict before not-shadow when a stored non-shadow record carries a mismatched revision', async () => {
+    // The revision precondition governs every stored record, shadow or not:
+    // a stored non-shadow state with a revision other than the expected one
+    // is a `revision-conflict`, never a `not-shadow`. The seed walks the
+    // repository to a `switched` record at revision 3.
+    const h = await harness({ seed: null });
+    await h.repo.compareAndSet({ expectedRevision: 0, next: switchedRecord(1) });
+    await h.repo.compareAndSet({ expectedRevision: 1, next: switchedRecord(2) });
+    await h.repo.compareAndSet({ expectedRevision: 2, next: switchedRecord(3) });
+    resetSpies(h);
+    expect(await h.useCase.execute(switchRequest({ expectedRevision: 2 }))).toEqual({
+      outcome: 'refused',
+      reason: 'revision-conflict',
+    });
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
   it('a missing readShadowEvidence method refuses shadow-evidence-absent and names S1 through S13', async () => {
     const h = await harness({ seed: null });
     resetSpies(h);
@@ -724,13 +741,15 @@ describe('ManageCutoverUseCase switch', () => {
   it('refuses not-shadow on a retried switch whose intent exists but no final result does, and writes nothing', async () => {
     // An intent without a final journal result is not a replay: a stored
     // switched record must still be refused `not-shadow`, never accepted as
-    // case B by the compare-and-set recovery path.
+    // case B by the compare-and-set recovery path. The retry carries the
+    // stored revision; a retry whose expected revision no longer matches the
+    // stored one is refused `revision-conflict` before the state is read.
     const h = await harness({ seed: switchedRecord(1) });
-    const digest = sha256HexDigest(`{"move":"switch","expectedRevision":0,"operationId":"op-1","relaunchPlanDigest":"${PLAN_DIGEST}"}`);
-    await h.journal.append({ key: 'cutover/switch@0', kind: 'intent', entryId: ulid(912), recordedAtIso: NOW, digest });
+    const digest = sha256HexDigest(`{"move":"switch","expectedRevision":1,"operationId":"op-1","relaunchPlanDigest":"${PLAN_DIGEST}"}`);
+    await h.journal.append({ key: 'cutover/switch@1', kind: 'intent', entryId: ulid(912), recordedAtIso: NOW, digest });
     const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
     resetSpies(h);
-    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'not-shadow' });
+    expect(await useCase.execute(switchRequest({ expectedRevision: 1 }))).toEqual({ outcome: 'refused', reason: 'not-shadow' });
     expect(totalWriteCalls(h)).toBe(0);
     expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', revision: 1 } });
   });

@@ -757,6 +757,80 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
     expect(results[2]).not.toHaveProperty('cause');
   });
 
+  it('maps command exit 137 without executor error to unknown with cause resource-exhausted', async () => {
+    const { adapter } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 137, signal: 'KILL' } : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({
+      kind: 'command',
+      verdict: 'unknown',
+      exitCode: 137,
+      cause: 'resource-exhausted',
+    });
+    expect(results[2].kind === 'command' && results[2].detail).toContain('137');
+  });
+
+  it('maps command exit 143 without executor error to unknown with cause resource-exhausted', async () => {
+    const { adapter } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 143, signal: 'TERM' } : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({
+      kind: 'command',
+      verdict: 'unknown',
+      exitCode: 143,
+      cause: 'resource-exhausted',
+    });
+    expect(results[2].kind === 'command' && results[2].detail).toContain('143');
+  });
+
+  it('keeps command exit 137 or 143 with executor error as unknown without cause', async () => {
+    for (const exitCode of [137, 143]) {
+      const { adapter } = makeAdapter(
+        (argv) => (argv[0] === 'sh' ? { exitCode, error: 'timed out' } : happyGit(argv)),
+        {},
+        { outcome: 'clean' },
+        HOST_SPEC,
+      );
+      const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+      expect(results[2]).toMatchObject({ verdict: 'unknown', exitCode });
+      expect(results[2]).not.toHaveProperty('cause');
+    }
+  });
+
+  it('keeps other non-zero command exits such as 1 and 2 as fail without cause', async () => {
+    for (const exitCode of [1, 2]) {
+      const { adapter } = makeAdapter(
+        (argv) => (argv[0] === 'sh' ? { exitCode } : happyGit(argv)),
+        {},
+        { outcome: 'clean' },
+        HOST_SPEC,
+      );
+      const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+      expect(results[2]).toMatchObject({ verdict: 'fail', exitCode });
+      expect(results[2]).not.toHaveProperty('cause');
+    }
+  });
+
+  it('keeps command exit 0 as pass without cause', async () => {
+    const { adapter } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 0 } : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({ verdict: 'pass', exitCode: 0 });
+    expect(results[2]).not.toHaveProperty('cause');
+  });
+
   it('never passes a zero wait limit, whatever the command budget', async () => {
     const { adapter, executor } = makeAdapter(
       (argv) => (argv[0] === 'sh' ? { exitCode: 0 } : happyGit(argv)),

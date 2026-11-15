@@ -53,12 +53,14 @@ import { AcceptanceSpec, gateCommandPredicateName } from '../../domain/value-obj
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import { readFrozenManifestAtHostVerified } from './advance-lane-run/frozen-manifest.js';
 import type {
+  GatePredicateCause,
   GatePredicateKind,
   GatePredicatePort,
   GatePredicateResult,
   GatePredicateVerdict,
 } from '../ports/out/GatePredicatePort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
@@ -221,7 +223,7 @@ function gateVerdictForResults(
     return gateFailed(reasonFor(first), results);
   }
   const reason = reasonFor(first);
-  const congested = first.verdict === 'unknown' && first.cause === 'gate-slot-wait-limit';
+  const congested = first.verdict === 'unknown' && isCongestionCause(first.cause);
   return congested ? { verdict: 'unknown', reason, congested: true } : gateUnknown(reason);
 }
 
@@ -231,6 +233,11 @@ function isGatePredicateKind(value: unknown): value is GatePredicateKind {
 
 function isGatePredicateVerdict(value: unknown): value is GatePredicateVerdict {
   return value === 'pass' || value === 'fail' || value === 'unknown' || value === 'skipped';
+}
+
+/** Either congestion cause routes an `unknown` gate verdict to the retry path. */
+function isCongestionCause(value: unknown): value is GatePredicateCause {
+  return value === 'gate-slot-wait-limit' || value === 'resource-exhausted';
 }
 
 export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
@@ -254,7 +261,7 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
     (record.exitCode !== null && typeof record.exitCode !== 'number') ||
     typeof record.durationMs !== 'number' ||
     typeof record.detail !== 'string' ||
-    (record.cause !== undefined && record.cause !== 'gate-slot-wait-limit')
+    (record.cause !== undefined && !isCongestionCause(record.cause))
   ) {
     return null;
   }
@@ -326,6 +333,78 @@ export function nonPassingGatePredicatesOf(
     }
   }
   return [];
+}
+
+/**
+ * Journal detail for the retrievable projection: secret-shaped text is
+ * withheld in full; other detail is cut to the same 300-character bound the
+ * gate adapter applies before journalling.
+ */
+function boundedJournalDetail(detail: string): string {
+  if (containsSecretShape(detail) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(detail))) {
+    return 'detail withheld: secret-shaped text';
+  }
+  return detail.length <= 300 ? detail : detail.slice(0, 300);
+}
+
+export interface NonPassingGatePredicateDetail {
+  readonly name: string;
+  readonly kind: GatePredicateKind;
+  readonly verdict: 'fail' | 'unknown';
+  readonly exitCode: number | null;
+  readonly detail: string;
+  readonly cause?: GatePredicateCause;
+}
+
+/**
+ * Retrivable companion of `nonPassingGatePredicatesOf`: the same highest
+ * stored gate run scan, but keeping the first non-passing predicate's
+ * bounded, secret-screened `detail` and its `cause`, so a resource kill
+ * (exit 137/143), a timeout, and a real failure can be told apart after the
+ * fact without re-running. `null` when no run stored a non-passing predicate.
+ */
+export function firstNonPassingGatePredicateOf(
+  entries: readonly ActionJournalEntryRecord[],
+  attemptId: string,
+  headSha: string,
+): NonPassingGatePredicateDetail | null {
+  for (let run = GATE_RUN_MAX; run >= 0; run -= 1) {
+    const prefix = gateRunPrefix(attemptId, headSha, run);
+    const collected: Array<{ readonly order: number; readonly value: NonPassingGatePredicateDetail }> = [];
+    let stored = false;
+    for (const entry of entries) {
+      // The id prefix alone is not trusted: the row must be this attempt's own
+      // acceptance entry.
+      if (!entry.id.startsWith(prefix) || entry.action !== 'accept' || entry.attemptId !== attemptId) {
+        continue;
+      }
+      const indexText = entry.id.slice(prefix.length);
+      if (!/^\d+$/.test(indexText)) {
+        continue;
+      }
+      stored = true;
+      const parsed = parseStoredPredicateResult(entry);
+      if (parsed === null || (parsed.verdict !== 'fail' && parsed.verdict !== 'unknown')) {
+        continue;
+      }
+      collected.push({
+        order: Number.parseInt(indexText, 10),
+        value: {
+          name: parsed.name,
+          kind: parsed.kind,
+          verdict: parsed.verdict,
+          exitCode: parsed.exitCode,
+          detail: boundedJournalDetail(parsed.detail),
+          ...(parsed.cause === undefined ? {} : { cause: parsed.cause }),
+        },
+      });
+    }
+    if (stored) {
+      collected.sort((a, b) => a.order - b.order);
+      return collected[0]?.value ?? null;
+    }
+  }
+  return null;
 }
 
 type StoredGateOutcome =

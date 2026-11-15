@@ -363,6 +363,37 @@ export interface NonPassingGatePredicateDetail {
  * (exit 137/143), a timeout, and a real failure can be told apart after the
  * fact without re-running. `null` when no run stored a non-passing predicate.
  */
+/**
+ * The entry's numeric predicate index when `entry` is this attempt's own
+ * acceptance entry under `prefix`; `null` otherwise. The id prefix alone is
+ * not trusted: the row must be this attempt's own acceptance entry.
+ */
+function acceptanceEntryIndexOf(
+  entry: ActionJournalEntryRecord,
+  attemptId: string,
+  prefix: string,
+): number | null {
+  if (!entry.id.startsWith(prefix) || entry.action !== 'accept' || entry.attemptId !== attemptId) {
+    return null;
+  }
+  const indexText = entry.id.slice(prefix.length);
+  if (!/^\d+$/.test(indexText)) {
+    return null;
+  }
+  return Number.parseInt(indexText, 10);
+}
+
+function nonPassingDetailOf(parsed: GatePredicateResult): NonPassingGatePredicateDetail {
+  return {
+    name: parsed.name,
+    kind: parsed.kind,
+    verdict: parsed.verdict as 'fail' | 'unknown',
+    exitCode: parsed.exitCode,
+    detail: boundedJournalDetail(parsed.detail),
+    ...(parsed.cause === undefined ? {} : { cause: parsed.cause }),
+  };
+}
+
 export function firstNonPassingGatePredicateOf(
   entries: readonly ActionJournalEntryRecord[],
   attemptId: string,
@@ -370,38 +401,29 @@ export function firstNonPassingGatePredicateOf(
 ): NonPassingGatePredicateDetail | null {
   for (let run = GATE_RUN_MAX; run >= 0; run -= 1) {
     const prefix = gateRunPrefix(attemptId, headSha, run);
-    const collected: Array<{ readonly order: number; readonly value: NonPassingGatePredicateDetail }> = [];
     let stored = false;
+    let first: NonPassingGatePredicateDetail | null = null;
+    let firstOrder = Number.POSITIVE_INFINITY;
     for (const entry of entries) {
-      // The id prefix alone is not trusted: the row must be this attempt's own
-      // acceptance entry.
-      if (!entry.id.startsWith(prefix) || entry.action !== 'accept' || entry.attemptId !== attemptId) {
-        continue;
-      }
-      const indexText = entry.id.slice(prefix.length);
-      if (!/^\d+$/.test(indexText)) {
+      const order = acceptanceEntryIndexOf(entry, attemptId, prefix);
+      if (order === null) {
         continue;
       }
       stored = true;
+      // A stable sort of the run's entries by index puts the lowest-order
+      // entry first; ties keep the earlier-encountered row.
+      if (first !== null && order >= firstOrder) {
+        continue;
+      }
       const parsed = parseStoredPredicateResult(entry);
       if (parsed === null || (parsed.verdict !== 'fail' && parsed.verdict !== 'unknown')) {
         continue;
       }
-      collected.push({
-        order: Number.parseInt(indexText, 10),
-        value: {
-          name: parsed.name,
-          kind: parsed.kind,
-          verdict: parsed.verdict,
-          exitCode: parsed.exitCode,
-          detail: boundedJournalDetail(parsed.detail),
-          ...(parsed.cause === undefined ? {} : { cause: parsed.cause }),
-        },
-      });
+      first = nonPassingDetailOf(parsed);
+      firstOrder = order;
     }
     if (stored) {
-      collected.sort((a, b) => a.order - b.order);
-      return collected[0]?.value ?? null;
+      return first;
     }
   }
   return null;

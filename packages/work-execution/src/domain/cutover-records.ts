@@ -290,7 +290,8 @@ function utcDayNumber(day: string): number | null {
 
 /**
  * Read one shadow-evidence document without running a single getter. The root is a plain data
- * record whose only own key is `days`: exactly three consecutive ascending UTC calendar dates,
+ * record whose only own keys are `merges` (a safe integer of at least
+ * `CUTOVER_SHADOW_MIN_MERGES`) and `days`: exactly three consecutive ascending UTC calendar dates,
  * none after the UTC date of `nowIso`, each carrying the thirteen criteria, every verdict the
  * string `pass`. Key counts are checked before any descriptor walk, so a document padded with
  * extra keys costs a constant number of descriptor reads. The `days` array-length and key-count
@@ -304,7 +305,19 @@ function utcDayNumber(day: string): number | null {
  */
 export function readCutoverShadowEvidence(raw: unknown, nowIso: string): CutoverShadowEvidenceRead {
   try {
-    if (!isPlainRecordObject(raw) || Reflect.ownKeys(raw).length !== 1) {
+    if (!isPlainRecordObject(raw) || Reflect.ownKeys(raw).length !== 2) {
+      return allCriteriaFailed();
+    }
+    // The recorded merge count is part of the evidence: below the minimum (or
+    // absent, mistyped or out of range) the shadow evidence is insufficient,
+    // whatever the day verdicts say.
+    const merges = ownDataValue(raw, 'merges');
+    if (typeof merges !== 'number' ||
+      typeof merges !== 'number' ||
+      !Number.isSafeInteger(merges) ||
+      merges < CUTOVER_SHADOW_MIN_MERGES ||
+      merges > MAX_REVISION
+    ) {
       return allCriteriaFailed();
     }
     const days = ownDataValue(raw, 'days');

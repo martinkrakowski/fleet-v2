@@ -5,8 +5,8 @@
  * saves the rolled-back record by compare-and-set; `switch` is the one-way
  * door, refused unless the shadow criteria evidence passes and every
  * precondition holds, then it sets the train pause and saves the switched
- * record; `retire` closes the record after the 14-day rollback window and
- * lifts a pause the cutover itself set.
+ * record; `retire` closes the record after the 14-day rollback window, under
+ * the owner's recorded grant, and lifts a pause the cutover itself set.
  *
  * A move is keyed `cutover/<move>@<expectedRevision>`: the intent carries a
  * digest of the full request and is checked on replay before any write, every
@@ -71,6 +71,14 @@ export interface ManageCutoverDependencies {
   /** CO30b, optional: how many lanes hold work no attempt record explains. */
   readonly countUnrecordedLanes?: () => Promise<
     { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number } | { readonly status: 'unreadable' }
+  >;
+  /**
+   * CO30b, optional: the owner's recorded grant a retire demands. The
+   * production runtime leaves it undefined, and a missing reader is a refusal,
+   * never a pass.
+   */
+  readonly readRetireGrant?: () => Promise<
+    { readonly status: 'granted' } | { readonly status: 'absent' } | { readonly status: 'unreadable' }
   >;
 }
 
@@ -879,6 +887,10 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     const paused = await this.guarded(deadlineIso, () => this.deps.trainPause.set({ paused: true, nowIso: normalizedNowIso }));
     if (paused.kind === 'deadline') return unknown('deadline-exceeded');
     if (paused.kind === 'threw' || paused.value.outcome === 'refused') return unknown('train-pause-write-failed');
+    // The pause is credited to the cutover only when this move set it; a pause
+    // that was already `paused` (`unchanged`) is someone else's, so a later
+    // rollback or retire must never lift it.
+    const trainPauseSetByCutover = paused.value.outcome === 'changed';
 
     const nextRecord: CutoverRecord = {
       schemaVersion: 1,
@@ -889,7 +901,7 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
       rolledBackAtIso: null,
       retiredAtIso: null,
       relaunchPlanDigest,
-      trainPauseSetByCutover: true,
+      trainPauseSetByCutover,
     };
     const swapped = await this.guarded(deadlineIso, () =>
       this.deps.cutoverRepo.compareAndSet({ expectedRevision, next: nextRecord, deadlineIso }),
@@ -966,6 +978,13 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (precondition !== null) {
       return precondition;
     }
+    // The owner's recorded grant is demanded on every pass, like the record,
+    // clock and window preconditions: a retry re-decides it, never trusts an
+    // earlier pass.
+    const grantFailure = await this.retireGrantFailure(deadlineIso);
+    if (grantFailure !== null) {
+      return grantFailure;
+    }
     if (journal.intent === null) {
       const intentFailure = await this.appendIntent(key, requestDigest, normalizedNowIso, deadlineIso);
       if (intentFailure !== null) {
@@ -991,6 +1010,24 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
       revision: saved.record.revision,
       record: saved.record,
     };
+  }
+
+  /**
+   * The owner-grant gate: a missing reader or an absent grant is a refusal, an
+   * unreadable reader is `unknown`, and only a recorded grant proceeds. Never
+   * a default.
+   */
+  private async retireGrantFailure(deadlineIso: string | undefined): Promise<ManageCutoverResult | null> {
+    const reader = this.deps.readRetireGrant;
+    if (reader === undefined) {
+      return refuse('retire-grant-absent');
+    }
+    const read = await this.guarded(deadlineIso, reader);
+    if (read.kind === 'deadline') return unknown('deadline-exceeded');
+    if (read.kind === 'threw') return unknown('retire-grant-unreadable');
+    if (read.value.status === 'unreadable') return unknown('retire-grant-unreadable');
+    if (read.value.status === 'absent') return refuse('retire-grant-absent');
+    return null;
   }
 
   /** The record, clock and window refusals a retire decides on every pass. */

@@ -16,6 +16,7 @@ import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifac
 import {
   CUTOVER_ROLLBACK_WINDOW_MS,
   CUTOVER_SHADOW_CRITERIA,
+  CUTOVER_SHADOW_MIN_MERGES,
   type CutoverRecord,
 } from '../../../domain/cutover-records.js';
 import { ManageCutoverUseCase, type ManageCutoverDependencies } from '../ManageCutoverUseCase.use-case.js';
@@ -238,6 +239,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     computeDigest: sha256HexDigest,
     mintEntryId: () => ulid((sequence += 1)),
     nowIso: () => clock.now,
+    readRetireGrant: async () => ({ status: 'granted' }),
   };
   const spies = {
     daemonPauseWrite: vi.spyOn(daemonPause, 'write'),
@@ -307,10 +309,11 @@ function shadowEvidence(nowIso: string, verdictOverrides: Record<string, string>
   for (const [id, verdict] of Object.entries(verdictOverrides)) {
     (days[2].verdicts as Record<string, string>)[id] = verdict;
   }
-  return { days };
+  return { merges: CUTOVER_SHADOW_MIN_MERGES, days };
 }
 
 type ShadowEvidenceReader = NonNullable<ManageCutoverDependencies['readShadowEvidence']>;
+type RetireGrantReader = NonNullable<ManageCutoverDependencies['readRetireGrant']>;
 type UnrecordedLanesCounter = NonNullable<ManageCutoverDependencies['countUnrecordedLanes']>;
 
 function readers(overrides: { readShadowEvidence?: ShadowEvidenceReader; countUnrecordedLanes?: UnrecordedLanesCounter } = {}): {
@@ -577,6 +580,52 @@ describe('ManageCutoverUseCase switch', () => {
     }
   });
 
+  it('refuses a switch whose evidence carries fewer merges than the minimum', async () => {
+    const h = await harness({ seed: null });
+    const useCase = new ManageCutoverUseCase({
+      ...h.deps,
+      ...readers({
+        readShadowEvidence: async () => ({
+          status: 'ok',
+          evidence: { ...shadowEvidence(NOW), merges: CUTOVER_SHADOW_MIN_MERGES - 1 },
+        }),
+      }),
+    });
+    resetSpies(h);
+    const result = await useCase.execute(switchRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: [...CUTOVER_SHADOW_CRITERIA] });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+  });
+
+  it('switch does not credit a train pause that was already paused, and a later rollback lifts nothing', async () => {
+    const h = await harness({ seed: null });
+    // The pause already exists before the switch, so `set` answers `unchanged`.
+    await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
+    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toMatchObject({
+      outcome: 'completed',
+      state: 'switched',
+      revision: 1,
+    });
+    expect(await h.repo.read()).toMatchObject({
+      status: 'ok',
+      record: { state: 'switched', trainPauseSetByCutover: false },
+    });
+
+    // A later rollback leaves the pre-existing pause alone.
+    resetSpies(h);
+    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({
+      outcome: 'completed',
+      state: 'rolled-back',
+      revision: 2,
+    });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect((await h.trainPause.read()).status).toBe('paused');
+  });
+
   it('switch names S4 when that verdict is unknown and the other criteria pass', async () => {
     const h = await harness({ seed: null });
     const useCase = new ManageCutoverUseCase({
@@ -837,6 +886,37 @@ describe('ManageCutoverUseCase retire', () => {
       reason: 'invalid-clock',
     });
     expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('retire refuses without the owner\'s recorded grant and answers unknown for an unreadable one', async () => {
+    for (const [status, expected] of [
+      ['absent', { outcome: 'refused', reason: 'retire-grant-absent' }],
+      ['unreadable', { outcome: 'unknown', reason: 'retire-grant-unreadable' }],
+      ['threw', { outcome: 'unknown', reason: 'retire-grant-unreadable' }],
+    ] as const) {
+      const h = await harness();
+      const reader: RetireGrantReader =
+        status === 'threw'
+          ? async () => {
+              throw new Error('boom');
+            }
+          : (async () => ({ status })) as RetireGrantReader;
+      const useCase = new ManageCutoverUseCase({ ...h.deps, readRetireGrant: reader });
+      resetSpies(h);
+      expect(await useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual(expected);
+      expect(totalWriteCalls(h)).toBe(0);
+      expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+      expect((await h.trainPause.read()).status).toBe('paused');
+    }
+
+    // A missing reader is a refusal, never a pass.
+    const withoutReader = await harness();
+    const noReaderUseCase = new ManageCutoverUseCase({ ...withoutReader.deps, readRetireGrant: undefined });
+    expect(await noReaderUseCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'refused',
+      reason: 'retire-grant-absent',
+    });
+    expect(totalWriteCalls(withoutReader)).toBe(0);
   });
 
   it('maps a refused pause lift, a refused compare-and-set and a failed journal append to unknown for a retire', async () => {

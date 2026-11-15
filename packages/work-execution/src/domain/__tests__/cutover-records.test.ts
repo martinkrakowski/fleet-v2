@@ -4,6 +4,7 @@ import {
   CUTOVER_ROLLBACK_WINDOW_MS,
   CUTOVER_RECORD_SCHEMA_VERSION,
   CUTOVER_SHADOW_CRITERIA,
+  CUTOVER_SHADOW_MIN_MERGES,
   canonicalCutoverRetirePayload,
   canonicalCutoverRollbackPayload,
   canonicalCutoverSwitchPayload,
@@ -195,7 +196,7 @@ describe('readCutoverShadowEvidence', () => {
     return verdicts;
   }
 
-  function evidence(nowIso: string, mutate?: (root: Record<string, unknown>) => void): unknown {
+  function evidence(nowIso: string, mutate?: (root: Record<string, unknown>) => void, merges: number = CUTOVER_SHADOW_MIN_MERGES): unknown {
     const base = Date.parse(nowIso);
     const root: Record<string, unknown> = {
       days: [2, 1, 0].map((back) => ({
@@ -204,6 +205,7 @@ describe('readCutoverShadowEvidence', () => {
       })),
     };
     mutate?.(root);
+    root.merges = merges;
     return root;
   }
 
@@ -211,6 +213,21 @@ describe('readCutoverShadowEvidence', () => {
     expect(readCutoverShadowEvidence(evidence(NOW), NOW)).toEqual({ ok: true });
     // The last day may equal the UTC date of nowIso but not follow it.
     expect(readCutoverShadowEvidence(evidence('2026-11-05T00:00:00.000Z'), NOW)).toEqual({ ok: true });
+    expect(readCutoverShadowEvidence(evidence(NOW, undefined, CUTOVER_SHADOW_MIN_MERGES + 1), NOW)).toEqual({ ok: true });
+  });
+
+  it('refuses shadow evidence with fewer merges than the minimum, or an unusable merge count', () => {
+    for (const merges of [CUTOVER_SHADOW_MIN_MERGES - 1, 0, -1, 1.5, '20', null, Number.NaN, Infinity]) {
+      expect({ merges, verdict: readCutoverShadowEvidence(evidence(NOW, undefined, merges as number), NOW) }).toEqual({
+        merges,
+        verdict: ALL_FAILED,
+      });
+    }
+    const withoutMerges = evidence(NOW);
+    delete (withoutMerges as Record<string, unknown>).merges;
+    expect(readCutoverShadowEvidence(withoutMerges, NOW)).toEqual(ALL_FAILED);
+    // A second, unexpected key is refused as before.
+    expect(readCutoverShadowEvidence({ ...(evidence(NOW) as Record<string, unknown>), extra: 1 }, NOW)).toEqual(ALL_FAILED);
   });
 
   it('names only S4 when that verdict is unknown', () => {

@@ -746,6 +746,16 @@ export const DIFF_UNAVAILABLE_REASON = 'diff-unavailable';
 /** The fixed reason a review is refused because the diff under review exceeded the embedding limit. */
 export const DIFF_TRUNCATED_REASON = 'diff-truncated';
 
+/**
+ * Byte cap for the whole review prompt (instructions + brief + diff) before it
+ * travels as a single `argv` element to `ocm-run` / `opencode run`. Linux caps
+ * one argv element at 131,072 bytes; this leaves headroom below that limit.
+ */
+export const MAX_OCM_PROMPT_BYTES = 125_000;
+
+/** The fixed reason a review is refused because the built prompt exceeded the single-argument limit. */
+export const PROMPT_TOO_LARGE_REASON = 'prompt-too-large';
+
 export type DiffEmbedding =
   | { readonly kind: 'embedded'; readonly diff: string }
   | { readonly kind: 'refused'; readonly reason: string };
@@ -1408,6 +1418,22 @@ export function createOcmReviewTransport(
       embeddedDiff = embedding.diff;
     }
     const prompt = buildReviewPrompt(request, nonce, embeddedDiff);
+    // The prompt travels as one argv element; Linux caps a single argument at
+    // 131,072 bytes, and a larger prompt makes the spawn throw E2BIG, which
+    // classifies as a retryable transport failure and parks the run as a seat
+    // outage. An oversize prompt is refused here instead: no process is
+    // spawned, nothing throws, and the review refuses cleanly (the caller
+    // should split the lane, not retry).
+    if (Buffer.byteLength(prompt, 'utf8') > MAX_OCM_PROMPT_BYTES) {
+      const after = await options.readHead(dir);
+      return {
+        rawOutput: PROMPT_TOO_LARGE_REASON,
+        readOnlyVerified: before === request.candidateHeadSha && after === request.candidateHeadSha,
+        result: 'unknown',
+        findings: [],
+        completedAtIso: new Date().toISOString(),
+      };
+    }
     const argv: string[] = [
       '--dir',
       dir,

@@ -5,10 +5,15 @@
  * `readMergeQueueEntryRecord`; a non-ok read refuses without writing.
  */
 
+import { containsSecretShape } from '@fleet/shared';
+import { DEFAULT_BASE_BRANCH, parseBaseBranch } from './base-branch.js';
+import type { BaseBranchValue } from './base-branch.js';
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { REQUEST_ID_PATTERN } from './lane-run-keys.js';
 import {
   MERGE_QUEUE_ENTRY_VERSION,
+  MERGE_QUEUE_ENTRY_V2_VERSION,
+  MERGE_QUEUE_ORDER_CAP,
   MERGE_QUEUE_TIERS,
   isMergeHex40,
   isMergeQueueEntryLive,
@@ -29,7 +34,8 @@ export type MergeEnqueueRefusal =
   | 'invalid-entry-id'
   | 'invalid-tier'
   | 'invalid-enqueued-at'
-  | 'invalid-deadline';
+  | 'invalid-deadline'
+  | 'invalid-base';
 
 export interface MergeEnqueueInput {
   readonly repository: MergeQueueRepositoryRef;
@@ -42,6 +48,7 @@ export interface MergeEnqueueInput {
   readonly successorEntryId: unknown;
   readonly enqueuedAtIso: string;
   readonly repoDigest: string;
+  readonly baseBranch?: unknown;
 }
 
 export type MergeEnqueueDecision =
@@ -95,10 +102,39 @@ function isUlid(value: unknown): value is string {
   return typeof value === 'string' && REQUEST_ID_PATTERN.test(value);
 }
 
-/** The fresh record shape a created or superseding enqueue writes. */
-function buildCreatedRecord(input: MergeEnqueueInput, supersedes: string | null): MergeQueueEntryRecord {
-  return {
-    version: MERGE_QUEUE_ENTRY_VERSION,
+/** The entry-list guard: a non-array, a non-safe-integer length or an
+ * over-cap list is refused before any element is read. */
+function isQueueListValid(entries: readonly MergeQueueEntryRecord[]): boolean {
+  return Array.isArray(entries) && Number.isSafeInteger(entries.length) && entries.length <= MERGE_QUEUE_ORDER_CAP;
+}
+
+/** Read the enqueue input's selected base without invoking any getter.
+ * Absent reads as `main` (v1); a present accessor, secret-shaped value or
+ * unparsable value returns undefined so the caller refuses `invalid-base`. */
+function readInputBase(input: MergeEnqueueInput): BaseBranchValue | undefined {
+  const descriptor = Reflect.getOwnPropertyDescriptor(input, 'baseBranch');
+  if (descriptor === undefined) {
+    return DEFAULT_BASE_BRANCH;
+  }
+  if ('get' in descriptor || 'set' in descriptor) {
+    return undefined;
+  }
+  if (typeof descriptor.value === 'string' && containsSecretShape(descriptor.value)) {
+    return undefined;
+  }
+  return parseBaseBranch(descriptor.value);
+}
+
+/** The fresh record shape a created or superseding enqueue writes. A v1
+ * write (no supplied base) carries no `baseBranch` key; a supplied base
+ * writes a v2 record with that base. */
+function buildCreatedRecord(
+  input: MergeEnqueueInput,
+  supersedes: string | null,
+  base: BaseBranchValue | undefined,
+): MergeQueueEntryRecord {
+  const common: MergeQueueEntryRecord = {
+    version: base === undefined ? MERGE_QUEUE_ENTRY_VERSION : MERGE_QUEUE_ENTRY_V2_VERSION,
     entryId: input.entryId as string,
     repository: input.repository,
     repoDigest: input.repoDigest,
@@ -124,12 +160,14 @@ function buildCreatedRecord(input: MergeEnqueueInput, supersedes: string | null)
     mergedAtIso: null,
     revision: 1,
   };
+  return base === undefined ? common : { ...common, baseBranch: base };
 }
 
-/** The successor of a superseded entry: inherits the predecessor's position. */
+/** The successor of a superseded entry: inherits the predecessor's position,
+ * version and base. */
 function buildSuccessorRecord(predecessor: MergeQueueEntryRecord, input: MergeEnqueueInput): MergeQueueEntryRecord {
-  return {
-    version: MERGE_QUEUE_ENTRY_VERSION,
+  const common: MergeQueueEntryRecord = {
+    version: predecessor.version,
     entryId: input.successorEntryId as string,
     repository: predecessor.repository,
     repoDigest: predecessor.repoDigest,
@@ -155,6 +193,9 @@ function buildSuccessorRecord(predecessor: MergeQueueEntryRecord, input: MergeEn
     mergedAtIso: null,
     revision: 1,
   };
+  return predecessor.version === MERGE_QUEUE_ENTRY_V2_VERSION
+    ? { ...common, baseBranch: predecessor.baseBranch }
+    : common;
 }
 
 function findDuplicateLiveEntry(
@@ -224,6 +265,9 @@ export function decideMergeEnqueue(
   input: MergeEnqueueInput,
 ): MergeEnqueueDecision {
   try {
+    if (!isQueueListValid(entries)) {
+      return { outcome: 'refused', reason: 'invalid-entry-id' };
+    }
     if (!isMergeHex40(input.headOid)) {
       return { outcome: 'refused', reason: 'invalid-head' };
     }
@@ -236,8 +280,14 @@ export function decideMergeEnqueue(
     if (!isZonedIsoDateTime(input.enqueuedAtIso)) {
       return { outcome: 'refused', reason: 'invalid-enqueued-at' };
     }
+    const selectedBase = readInputBase(input);
+    if (selectedBase === undefined) {
+      return { outcome: 'refused', reason: 'invalid-base' };
+    }
 
-    const ordered = orderMergeQueue(entries.filter(isMergeQueueEntryLive));
+    // Duplicate and supersede matching is partitioned by the selected base;
+    // `orderMergeQueue` already filters live entries.
+    const ordered = orderMergeQueue(entries, undefined, selectedBase);
 
     const duplicate = findDuplicateLiveEntry(ordered, input);
     if (duplicate !== undefined) {
@@ -249,7 +299,9 @@ export function decideMergeEnqueue(
       return supersedeResult;
     }
 
-    const createdRead = readMergeQueueEntryRecord(buildCreatedRecord(input, null));
+    const createdRead = readMergeQueueEntryRecord(
+      buildCreatedRecord(input, null, selectedBase === DEFAULT_BASE_BRANCH && !Object.hasOwn(input, 'baseBranch') ? undefined : selectedBase),
+    );
     if (!createdRead.ok) {
       return { outcome: 'refused', reason: 'invalid-entry-id' };
     }
@@ -264,23 +316,30 @@ export function decideMergeDrop(
   entryId: unknown,
 ): MergeDropDecision {
   try {
-    const ordered = orderMergeQueue(entries.filter(isMergeQueueEntryLive));
-    for (const entry of ordered) {
-      if (entry.entryId === entryId) {
-        const droppedRead = readMergeQueueEntryRecord({
-          ...entry,
-          state: 'dropped',
-          reason: 'operator-dropped',
-          revision: entry.revision + 1,
-        });
-        if (!droppedRead.ok) {
-          return { outcome: 'refused', reason: 'unknown-entry' };
-        }
-        const next = entries.map((candidate) =>
-          candidate.entryId === entry.entryId ? droppedRead.record : candidate,
-        );
-        return { outcome: 'dropped', entries: next, record: droppedRead.record };
+    if (!isQueueListValid(entries)) {
+      return { outcome: 'refused', reason: 'unknown-entry' };
+    }
+    // A bounded scan over every live entry so chain-based entries are found
+    // regardless of their base.
+    for (const element of entries) {
+      const read = readMergeQueueEntryRecord(element);
+      if (!read.ok || !isMergeQueueEntryLive(read.record) || read.record.entryId !== entryId) {
+        continue;
       }
+      const entry = read.record;
+      const droppedRead = readMergeQueueEntryRecord({
+        ...entry,
+        state: 'dropped',
+        reason: 'operator-dropped',
+        revision: entry.revision + 1,
+      });
+      if (!droppedRead.ok) {
+        return { outcome: 'refused', reason: 'unknown-entry' };
+      }
+      const next = entries.map((candidate) =>
+        candidate.entryId === entry.entryId ? droppedRead.record : candidate,
+      );
+      return { outcome: 'dropped', entries: next, record: droppedRead.record };
     }
     return { outcome: 'refused', reason: 'unknown-entry' };
   } catch {
@@ -294,21 +353,56 @@ export function decideMergeRetry(
   retry: { readonly entryId: unknown; readonly enqueuedAtIso: string },
 ): MergeRetryDecision {
   try {
-    const target = entries.find((entry) => entry.entryId === entryId);
+    if (!isQueueListValid(entries)) {
+      return { outcome: 'refused', reason: 'unknown-entry' };
+    }
+    let target: MergeQueueEntryRecord | undefined = undefined;
+    for (const element of entries) {
+      const read = readMergeQueueEntryRecord(element);
+      if (!read.ok) {
+        // A malformed record whose entry id matches the request is not
+        // silently skipped or rebuilt: retry refuses it.
+        if (element.entryId === entryId) {
+          return { outcome: 'refused', reason: 'invalid-entry' };
+        }
+        continue;
+      }
+      if (read.record.entryId === entryId) {
+        target = read.record;
+        break;
+      }
+    }
     if (target === undefined) {
       return { outcome: 'refused', reason: 'unknown-entry' };
     }
     if (target.state !== 'dropped') {
       return { outcome: 'refused', reason: 'not-dropped' };
     }
-    const duplicate = entries.find(
-      (entry) => isMergeQueueEntryLive(entry) && sameMergeQueueIdentity(entry, target),
-    );
-    if (duplicate !== undefined) {
-      return { outcome: 'duplicate', entries, record: duplicate };
+    // Duplicate detection is partitioned by the target's effective base: a
+    // live main entry must not block retrying a dropped chain entry, and a
+    // live chain entry must not block retrying a dropped main entry. Only
+    // validated records participate in the duplicate scan.
+    const targetBase =
+      target.version === MERGE_QUEUE_ENTRY_V2_VERSION ? target.baseBranch : DEFAULT_BASE_BRANCH;
+    for (const element of entries) {
+      const read = readMergeQueueEntryRecord(element);
+      if (!read.ok || !isMergeQueueEntryLive(read.record)) {
+        continue;
+      }
+      const entry = read.record;
+      const entryBase =
+        entry.version === MERGE_QUEUE_ENTRY_V2_VERSION ? entry.baseBranch : DEFAULT_BASE_BRANCH;
+      if (entryBase !== targetBase || !sameMergeQueueIdentity(entry, target)) {
+        continue;
+      }
+      return { outcome: 'duplicate', entries, record: entry };
     }
+    // A v1 target retries as v1 with no base; a v2 target keeps its base.
+    const retryBase: { baseBranch?: BaseBranchValue } =
+      target.version === MERGE_QUEUE_ENTRY_V2_VERSION ? { baseBranch: target.baseBranch } : {};
     const record: MergeQueueEntryRecord = {
-      version: MERGE_QUEUE_ENTRY_VERSION,
+      ...retryBase,
+      version: target.version,
       entryId: retry.entryId as string,
       repository: target.repository,
       repoDigest: target.repoDigest,

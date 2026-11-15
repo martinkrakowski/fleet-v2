@@ -11,6 +11,7 @@ import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.o
 import type { FindLatestReceiptOfKindResult } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { LaneRunParkFindingView } from '../../../domain/park-findings-view.js';
 import { causingParkFindingsView } from '../../../domain/park-findings-view.js';
+import { preserveParkedWorktree } from './park-preserve.js';
 import { classifyPark } from '../../../domain/park-class.js';
 import { decideConductorReviewOutcome, } from '../../../domain/lane-run-decider.js';
 import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
@@ -456,6 +457,10 @@ export async function performPark(ctx: AdvanceStepContext,
   if (!appended.ok) {
     return refusedResult(appended);
   }
+  // F198: preserve and NAME the worktree this run leaves behind, so work no
+  // commit carries is discoverable instead of orphaned. Never resets, never
+  // throws, and never fails the park.
+  await preserveParkedWorktree(ctx.deps, saved.record ?? parkedRecord, reason, request.nowIso);
   await raiseParkNotice(ctx, saved.record ?? parkedRecord, reason, qualifier, request);
   return { outcome: 'parked', reason, qualifier };
 }

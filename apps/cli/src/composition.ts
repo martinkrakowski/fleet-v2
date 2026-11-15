@@ -22,6 +22,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
+import { composeReadOnlyRelaunch } from './composition/relaunch.js';
 import { composeKnowledge } from './composition/knowledge.js';
 import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
@@ -664,6 +665,8 @@ export interface FleetCliRuntime {
     readonly updateProjectProfile: UpdateProjectProfileUseCase;
     readonly retireProjectProfile: RetireProjectProfileUseCase;
     readonly listProjectProfiles: ListProjectProfilesUseCase;
+    /** CO29a-ro2: the read-only profile listing the relaunch commands read. */
+    readonly listProjectProfilesReadOnly: ListProjectProfilesUseCase;
     readonly inspectProjectProfile: InspectProjectProfileUseCase;
     readonly recordProjectProbe: RecordProjectProbeUseCase;
     readonly inspectConfiguredCapabilities: InspectConfiguredCapabilitiesUseCase;
@@ -1180,13 +1183,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   });
 
   // CO26: the read-only relaunch inventory reads the same lane-run stores the
-  // conductor composes, beside closeWorkOrder / listStaleWorkOrders.
+  // conductor composes, beside closeWorkOrder / listStaleWorkOrders. Its halt
+  // and lease reads are the read-only instances (CO29a-ro2): a corrupt store
+  // file is never quarantined by the inventory, and unreadable bytes answer
+  // unknown instead of a value.
   const inventoryRelaunch = new InventoryRelaunchUseCase({
     runRepo: conductor.laneRunRepository,
     attemptRepo: attemptRepository,
     workspace,
-    halt: conductor.halt,
-    driverLease: conductor.driverLease,
+    ...composeReadOnlyRelaunch({ stateDir }),
     runnerForAttempt,
     computeDigest: sha256HexDigest,
   });

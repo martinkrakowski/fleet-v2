@@ -5,6 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { ProjectProfileRecord } from '../../domain/coordination-records.js';
 import { ProjectProfileRevisionConflictError } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
+import {
+  ReadOnlyStateStoreError,
+  StateFileUnreadableError,
+  StateFileUnreadableReadOnlyError,
+} from './file-store.js';
 import { ProjectProfileRepositoryAdapter } from './ProjectProfileRepositoryAdapter.adapter.js';
 
 describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () => {
@@ -199,5 +204,77 @@ describe('ProjectProfileRepositoryAdapter cross-process safe persistence', () =>
       { id: 'proj-a', status: 'active' },
       { id: 'proj-z', status: 'retired' },
     ]);
+  });
+
+  describe('readOnly (CO29a-ro2)', () => {
+    const PROFILE: ProjectProfileRecord = {
+      projectId: 'proj-ro',
+      displayName: 'Project RO',
+      repository: 'org/repo-ro',
+      designatedDispatcherHost: 'host-1',
+      policyRevision: 'pol-1',
+      maxConcurrentLanes: 1,
+      runnerCapabilities: {},
+      revision: 0,
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+      status: 'active',
+      defaultBranch: 'main',
+      clones: {},
+      gateProcedures: [],
+      defaultAllowedPathPrefixes: [],
+      lastProbe: null,
+    };
+
+    it('never quarantines: an unreadable store file answers the typed read-only error on every read', async () => {
+      const filePath = path.join(tempDir, 'project-profiles.json');
+      const corruptContent = '{ not valid json';
+      await fs.writeFile(filePath, corruptContent, 'utf8');
+
+      const reader = new ProjectProfileRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+      await expect(reader.listProfiles()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+      await expect(reader.findProfileById('proj-ro')).rejects.toBeInstanceOf(
+        StateFileUnreadableReadOnlyError,
+      );
+      // The exact bytes stay untouched and no quarantine copy is written.
+      expect(await fs.readFile(filePath, 'utf8')).toBe(corruptContent);
+      await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+
+    it('refuses every write without locking, reading or writing', async () => {
+      const reader = new ProjectProfileRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+      await expect(reader.saveProfile(PROFILE)).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
+      expect(await fs.readdir(tempDir)).toEqual([]);
+    });
+
+    it('reads a valid store without quarantining, and a missing store as known absence', async () => {
+      const writer = new ProjectProfileRepositoryAdapter({ stateDir: tempDir });
+      await writer.saveProfile(PROFILE);
+      const reader = new ProjectProfileRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+      expect((await reader.listProfiles()).map((profile) => profile.projectId)).toEqual(['proj-ro']);
+      const emptyDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-proj-profile-empty-'));
+      try {
+        expect(
+          await new ProjectProfileRepositoryAdapter({ stateDir: emptyDir, readOnly: true }).listProfiles(),
+        ).toEqual([]);
+      } finally {
+        await fs.rm(emptyDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+  });
+
+  it('the default (writable) reader still quarantines corrupt bytes', async () => {
+    const filePath = path.join(tempDir, 'project-profiles.json');
+    const corruptContent = '{ not valid json';
+    await fs.writeFile(filePath, corruptContent, 'utf8');
+
+    const adapter = new ProjectProfileRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.listProfiles()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const copies = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(copies).toHaveLength(1);
+    expect(await fs.readFile(path.join(tempDir, 'quarantine', copies[0]), 'utf8')).toBe(
+      corruptContent,
+    );
   });
 });

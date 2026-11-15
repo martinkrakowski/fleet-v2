@@ -5,6 +5,10 @@
  * conductor's status and each lane's population (conducted, attempt-recorded,
  * unrecorded). Risk flags are counts only; the worktree paths are printed
  * here, in the local CLI output. It writes nothing and mutates no worktree.
+ *
+ * CO29a-ro2: every store this group reads is read-only — the profile listing
+ * never quarantines a corrupt file and the halt/lease reads never invent a
+ * value, so a corrupt input answers `unknown` (exit 1), never a report.
  */
 
 import { optStr, type CommandHandler } from './commands/payload.js';
@@ -40,10 +44,12 @@ export const relaunchCommands: Readonly<Record<string, CommandHandler>> = {
     const hostName = optStr(p, 'host') ?? null;
     // D18: only the clones of active project profiles are read; never a
     // host-wide scan. An unreadable profile listing is not "no clones": the
-    // inventory is refused rather than reporting zero hosts.
+    // inventory is refused rather than reporting zero hosts. CO29a-ro2: the
+    // listing reads the read-only profile repository, so a corrupt store file
+    // is never quarantined by this command.
     let profiles: Awaited<ReturnType<FleetCliRuntime['coordination']['listProjectProfiles']['listProjectProfiles']>>;
     try {
-      profiles = await rt.coordination.listProjectProfiles.listProjectProfiles({ status: 'active' });
+      profiles = await rt.coordination.listProjectProfilesReadOnly.listProjectProfiles({ status: 'active' });
     } catch {
       return UNREADABLE;
     }

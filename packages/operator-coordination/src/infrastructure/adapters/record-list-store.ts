@@ -11,7 +11,11 @@
 
 import { promises as fs } from 'node:fs';
 
-import { inspectRecordListBytes, quarantineUnreadable } from './file-store.js';
+import {
+  inspectRecordListBytes,
+  quarantineUnreadable,
+  StateFileUnreadableReadOnlyError,
+} from './file-store.js';
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -25,10 +29,17 @@ function isNotFound(error: unknown): boolean {
   );
 }
 
+/**
+ * Read one record-list store. With `readOnly` the unreadable path never
+ * quarantines (a read-only command must never write): the exact bytes stay
+ * untouched and the typed `StateFileUnreadableReadOnlyError` answers instead.
+ * The default quarantining read is unchanged.
+ */
 export async function readRecordList<T>(
   path: string,
   adapterName: string,
   parseRecord: (raw: unknown) => T | undefined,
+  readOnly = false,
 ): Promise<T[]> {
   let buffer: Buffer;
   try {
@@ -41,6 +52,9 @@ export async function readRecordList<T>(
   }
   const inspection = inspectRecordListBytes(buffer, parseRecord);
   if (inspection.status === 'unreadable') {
+    if (readOnly) {
+      throw new StateFileUnreadableReadOnlyError(path, inspection.detail);
+    }
     return quarantineUnreadable(path, inspection.detail, buffer);
   }
   return [...inspection.records];

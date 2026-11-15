@@ -773,6 +773,43 @@ function parseJournalByKeyRequest(request: unknown): JournalByKeyRequestParsed {
 }
 
 /**
+ * What the driver-lease read yields: the lease record, null when none was
+ * ever taken, or 'unreadable' when the lease file could not be read. An
+ * unreadable lease is unknown — never treated as "no lease held".
+ */
+type DriverLeaseReadOutcome = Awaited<ReturnType<ConductorDriverLeasePort['read']>> | 'unreadable';
+
+/**
+ * True only for the typed unreadable state-file errors the read-only lease
+ * adapter throws for a malformed lease file. They are recognised by name:
+ * application code may not import infrastructure classes (the hexagen layer
+ * rules) and the port exports no error type, so the names are the contract
+ * the adapter's own error classes carry in `error.name`.
+ */
+function isStateFileUnreadableError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === 'StateFileUnreadableError' || error.name === 'StateFileUnreadableReadOnlyError')
+  );
+}
+
+/**
+ * One driver-lease read that maps ONLY the typed unreadable errors to
+ * 'unreadable'; every other error still rejects as the port throws it
+ * (CO29a-ro2: a read-only lease read never answers an absent lease).
+ */
+async function readDriverLease(port: Pick<ConductorDriverLeasePort, 'read'>): Promise<DriverLeaseReadOutcome> {
+  try {
+    return await port.read();
+  } catch (error: unknown) {
+    if (isStateFileUnreadableError(error)) {
+      return 'unreadable';
+    }
+    throw error;
+  }
+}
+
+/**
  * LaneRunBoardReads: the read-only board, detail and keyed run-journal reads
  * behind `GET /v1/runs`, `GET /v1/runs/:id`, `GET /v1/runs/:id/journal` and
  * `GET /v1/runs/journal?key=`. Every dependency is a `Pick` of read methods
@@ -810,7 +847,7 @@ export class LaneRunBoardReads {
 
   private async readBoardStores(): Promise<{
     halt: ConductorHaltState;
-    driver: Awaited<ReturnType<ConductorDriverLeasePort['read']>>;
+    driver: DriverLeaseReadOutcome;
     runs: readonly LaneRunRecord[];
     reservations: Awaited<ReturnType<ExecutionJournalPort['listActiveReservations']>>;
     attempts: Awaited<ReturnType<AttemptRepositoryPort['listAllAttempts']>>;
@@ -821,7 +858,7 @@ export class LaneRunBoardReads {
     const deps = this.deps!;
     const [halt, driver, runs, reservations, attempts, orders, traceList] = await Promise.all([
       deps.halt.read(),
-      deps.driverLease.read(),
+      readDriverLease(deps.driverLease),
       deps.runRepo.list(),
       deps.executionJournal.listActiveReservations(),
       deps.attemptRepo.listAllAttempts(),
@@ -853,7 +890,10 @@ export class LaneRunBoardReads {
     const derived = deriveConductorSchedule(
       {
         halt: halt.state,
-        driverLease: driver,
+        // CO29a-ro2: an 'unreadable' lease is the conservative unknown branch
+        // here — it projects like "no lease recorded" (driverLeaseLapsed
+        // null), never false ("no lease held") or true (lapsed).
+        driverLease: driver === 'unreadable' ? null : driver,
         runs,
         journals,
         reservations,
@@ -905,7 +945,7 @@ export class LaneRunBoardReads {
       const [halt, driver, record] = await withReadBudget(this.readTimeoutMs, () =>
         Promise.all([
           deps.halt.read(),
-          deps.driverLease.read(),
+          readDriverLease(deps.driverLease),
           deps.runRepo.get(parsed.runId),
         ]),
       );
@@ -930,7 +970,10 @@ export class LaneRunBoardReads {
       return {
         outcome: 'listed',
         halt: halt.state,
-        driverLeaseLapsed: driver === null ? null : isLeaseLapsed(driver, parsed.nowIso),
+        // An 'unreadable' lease is unknown: it projects as null here, never
+        // as "no lease held" (false) or lapsed (true) — the conservative branch.
+        driverLeaseLapsed:
+          driver === null || driver === 'unreadable' ? null : isLeaseLapsed(driver, parsed.nowIso),
         run,
         journal: journal.slice(-parsed.journalLimit),
         journalTruncated: journal.length > parsed.journalLimit,

@@ -48,8 +48,6 @@ import type {
   ConductorDriverLeaseResult,
 } from '../../application/ports/out/ConductorDriverLeasePort.out-port.js';
 import {
-  StateFileUnreadableError,
-  StateFileUnreadableReadOnlyError,
   assertStoreWritable,
   inspectRecordListBytes,
   rejectUnreadableStateFile,
@@ -61,7 +59,12 @@ export interface ConductorDriverLeaseAdapterOptions {
   /** When set, the lease persists here and reloads on first use. */
   readonly stateDir?: string;
   readonly fileName?: string;
-  /** Read-only mode: an unreadable marker reads as `null` without quarantining or writing. */
+  /**
+   * CO29a-ro2: read-only mode. The read never quarantines and never writes;
+   * an unreadable lease file is a typed `StateFileUnreadableReadOnlyError`,
+   * never an absent lease — only a missing file is absent. Every write is
+   * refused.
+   */
   readonly readOnly?: boolean;
 }
 
@@ -133,19 +136,12 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
       const current = this.inMemoryLease;
       return current === null ? null : { ...current };
     }
-    try {
-      const current = currentLeaseOf(await this.readRecordsFromDisk(target));
-      return current === null ? null : { ...current };
-    } catch (error: unknown) {
-      if (
-        this.options?.readOnly === true &&
-        (error instanceof StateFileUnreadableError ||
-          error instanceof StateFileUnreadableReadOnlyError)
-      ) {
-        return null;
-      }
-      throw error;
-    }
+    const current = currentLeaseOf(await this.readRecordsFromDisk(target));
+    // CO29a-ro2: unreadable bytes propagate as the typed unreadable error,
+    // never an absent lease — a read-only command must not mistake a corrupt
+    // file for "no lease", and a writable read has already quarantined and
+    // thrown.
+    return current === null ? null : { ...current };
   }
 
   acquire(request: LeaseAcquireRequest): Promise<ConductorDriverLeaseResult> {

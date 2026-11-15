@@ -343,6 +343,24 @@ describe('readCutoverShadowEvidence', () => {
     expect(readCutoverShadowEvidence(new Proxy(evidence(NOW) as object, {}), NOW)).toEqual(ALL_FAILED);
   });
 
+  it('refuses a transparent Proxy standing in for days before any own-key walk or length read on it', () => {
+    // A transparent Proxy answers Array.isArray, getPrototypeOf and every
+    // descriptor read exactly as its target would, so the serializer probe
+    // must refuse it before the validator inspects a single key or the
+    // `length` descriptor. Prove it by counting descriptor reads: only the
+    // root's `days` slot may be read before the refusal, whereas the old
+    // eventual refusal walked three day records and thirteen verdicts each
+    // through the proxy first.
+    const validDays = (evidence(NOW) as { days: object[] }).days;
+    const descriptorReads = vi.spyOn(Object, 'getOwnPropertyDescriptor');
+    try {
+      expect(readCutoverShadowEvidence({ days: new Proxy(validDays, {}) }, NOW)).toEqual(ALL_FAILED);
+      expect(descriptorReads.mock.calls.length).toBeLessThanOrEqual(3);
+    } finally {
+      descriptorReads.mockRestore();
+    }
+  });
+
   it('refuses a document padded with thousands of extra keys after a constant number of descriptor reads', async () => {
     const padded: Record<string, unknown> = evidence(NOW) as Record<string, unknown>;
     for (let i = 0; i < 5000; i += 1) {

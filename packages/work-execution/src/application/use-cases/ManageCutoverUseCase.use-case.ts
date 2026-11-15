@@ -713,11 +713,12 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     }
     const { record } = cutover;
 
-    if (journal.intent === null) {
-      const refusal = this.switchFreshRefusal(record, expectedRevision);
-      if (refusal !== null) {
-        return refusal;
-      }
+    // The state precondition runs on every pass, intent or not: only a final
+    // journal result replays a stored record, so a stored non-`shadow` state
+    // with an intent but no final result is still refused `not-shadow`.
+    const precondition = this.switchStatePrecondition(record, expectedRevision);
+    if (precondition !== null) {
+      return precondition;
     }
 
     const evidenceFailure = await this.shadowEvidenceFailure(request, deadlineIso);
@@ -765,16 +766,16 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     };
   }
 
-  /** The refusals a fresh switch decides before anything is recorded. */
-  private switchFreshRefusal(record: CutoverRecord | null, expectedRevision: number): ManageCutoverResult | null {
+  /** The record state a switch demands on every pass, before anything is recorded. */
+  private switchStatePrecondition(record: CutoverRecord | null, expectedRevision: number): ManageCutoverResult | null {
     if (record === null) {
       return expectedRevision === 0 ? null : refuse('revision-conflict');
     }
-    if (record.revision !== expectedRevision) {
-      return refuse('revision-conflict');
-    }
     if (record.state !== 'shadow') {
       return refuse('not-shadow');
+    }
+    if (record.revision !== expectedRevision) {
+      return refuse('revision-conflict');
     }
     return null;
   }
@@ -850,8 +851,10 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
   }
 
   /**
-   * The crash-recoverable action sequence for a switch. Case A: the record is still `shadow`
-   * (or absent with revision 0); case B: an earlier pass already saved the switched record.
+   * The guarded action sequence for a switch: the record is still `shadow`
+   * (or absent with revision 0). A stored switched record never reaches here —
+   * the state precondition refuses it on every pass; only a final journal
+   * result replays a completed switch.
    */
   private async applySwitch(
     record: CutoverRecord | null,
@@ -861,10 +864,6 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     deadlineIso: string | undefined,
   ): Promise<ManageCutoverResult | { readonly record: CutoverRecord }> {
     if (record !== null) {
-      const caseB = record.revision === expectedRevision + 1 && record.state === 'switched';
-      if (caseB) {
-        return { record };
-      }
       const caseA = record.revision === expectedRevision && record.state === 'shadow';
       if (!caseA) {
         return refuse('revision-conflict');
@@ -956,11 +955,14 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     const { record } = cutover;
 
     const normalizedNowIso = normalizeIso(nowIso);
+    // The record, clock and window preconditions run on every pass: `nowIso` is
+    // not part of the intent digest, so a retry must re-decide the rollback
+    // window against the request's own clock, never trust the earlier pass.
+    const precondition = this.retireStatePrecondition(record, expectedRevision, normalizedNowIso);
+    if (precondition !== null) {
+      return precondition;
+    }
     if (journal.intent === null) {
-      const refusal = this.retireFreshRefusal(record, expectedRevision, normalizedNowIso);
-      if (refusal !== null) {
-        return refusal;
-      }
       const intentFailure = await this.appendIntent(key, requestDigest, normalizedNowIso, deadlineIso);
       if (intentFailure !== null) {
         return intentFailure;
@@ -987,8 +989,8 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     };
   }
 
-  /** The refusals a fresh retire decides before anything is recorded. */
-  private retireFreshRefusal(
+  /** The record, clock and window refusals a retire decides on every pass. */
+  private retireStatePrecondition(
     record: CutoverRecord | null,
     expectedRevision: number,
     normalizedNowIso: string,
@@ -1013,8 +1015,10 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
   }
 
   /**
-   * The crash-recoverable action sequence for a retire. Case A: the record is still `switched`;
-   * case B: an earlier pass already saved the retired record.
+   * The guarded action sequence for a retire: the record is still `switched`.
+   * A stored retired record never reaches here — the state precondition
+   * refuses it on every pass; only a final journal result replays a completed
+   * retire.
    */
   private async applyRetire(
     record: CutoverRecord | null,
@@ -1024,10 +1028,6 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
   ): Promise<ManageCutoverResult | { readonly record: CutoverRecord }> {
     if (record === null) {
       return refuse('revision-conflict');
-    }
-    const caseB = record.revision === expectedRevision + 1 && record.state === 'retired';
-    if (caseB) {
-      return { record };
     }
     const caseA = record.revision === expectedRevision && record.state === 'switched' && record.switchedAtIso !== null;
     if (!caseA) {

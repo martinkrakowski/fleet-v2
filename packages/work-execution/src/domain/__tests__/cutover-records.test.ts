@@ -328,6 +328,21 @@ describe('readCutoverShadowEvidence', () => {
     expect(readCutoverShadowEvidence(defined, NOW)).toEqual(ALL_FAILED);
   });
 
+  it('refuses a transparent Proxy standing in for days, for a day record, or for the whole document, before any result is built', () => {
+    // A transparent Proxy answers Array.isArray, getPrototypeOf and every
+    // descriptor read exactly as its target would, so the validator must
+    // refuse it before accepting the document.
+    const validDays = (evidence(NOW) as { days: object[] }).days;
+    expect(readCutoverShadowEvidence({ days: new Proxy(validDays, {}) }, NOW)).toEqual(ALL_FAILED);
+
+    const dayRecord = validDays[0];
+    expect(
+      readCutoverShadowEvidence({ days: [new Proxy(dayRecord, {}), validDays[1], validDays[2]] }, NOW),
+    ).toEqual(ALL_FAILED);
+
+    expect(readCutoverShadowEvidence(new Proxy(evidence(NOW) as object, {}), NOW)).toEqual(ALL_FAILED);
+  });
+
   it('refuses a document padded with thousands of extra keys after a constant number of descriptor reads', async () => {
     const padded: Record<string, unknown> = evidence(NOW) as Record<string, unknown>;
     for (let i = 0; i < 5000; i += 1) {

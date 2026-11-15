@@ -293,7 +293,9 @@ function utcDayNumber(day: string): number | null {
  * record whose only own key is `days`: exactly three consecutive ascending UTC calendar dates,
  * none after the UTC date of `nowIso`, each carrying the thirteen criteria, every verdict the
  * string `pass`. Key counts are checked before any descriptor walk, so a document padded with
- * extra keys costs a constant number of descriptor reads. Never throws, never echoes the input.
+ * extra keys costs a constant number of descriptor reads, and a structured-clone probe refuses
+ * a Proxy stand-in for the document before any result is built. Never throws, never echoes the
+ * input, never runs a getter.
  */
 export function readCutoverShadowEvidence(raw: unknown, nowIso: string): CutoverShadowEvidenceRead {
   try {
@@ -358,7 +360,22 @@ export function readCutoverShadowEvidence(raw: unknown, nowIso: string): Cutover
     if (!ascendingConsecutive || dayNumbers[2] > nowDay) {
       return allCriteriaFailed();
     }
-    return failed.size === 0 ? { ok: true } : criteriaFailed(failed);
+    if (failed.size > 0) {
+      return criteriaFailed(failed);
+    }
+    // A transparent Proxy over the document answers every prototype, key and
+    // descriptor read exactly as its target would, so the checks above cannot
+    // tell it from data. The structured-clone serializer refuses any Proxy
+    // exotic object, and at this point every own property on the document is a
+    // validated data property with a primitive value, so the probe reads no
+    // getter and costs a constant walk over at most the permitted keys. A
+    // clone failure here means a stand-in, never data.
+    try {
+      structuredClone(raw);
+    } catch {
+      return allCriteriaFailed();
+    }
+    return { ok: true };
   } catch {
     return allCriteriaFailed();
   }

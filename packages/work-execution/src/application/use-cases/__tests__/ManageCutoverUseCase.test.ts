@@ -720,6 +720,20 @@ describe('ManageCutoverUseCase switch', () => {
     });
     expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'journal-refused' });
   });
+
+  it('refuses not-shadow on a retried switch whose intent exists but no final result does, and writes nothing', async () => {
+    // An intent without a final journal result is not a replay: a stored
+    // switched record must still be refused `not-shadow`, never accepted as
+    // case B by the compare-and-set recovery path.
+    const h = await harness({ seed: switchedRecord(1) });
+    const digest = sha256HexDigest(`{"move":"switch","expectedRevision":0,"operationId":"op-1","relaunchPlanDigest":"${PLAN_DIGEST}"}`);
+    await h.journal.append({ key: 'cutover/switch@0', kind: 'intent', entryId: ulid(912), recordedAtIso: NOW, digest });
+    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'not-shadow' });
+    expect(totalWriteCalls(h)).toBe(0);
+    expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', revision: 1 } });
+  });
 });
 
 describe('ManageCutoverUseCase retire', () => {
@@ -866,6 +880,27 @@ describe('ManageCutoverUseCase retire', () => {
       reason: 'intent-digest-mismatch',
     });
     expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+  });
+
+  it('refuses inside-rollback-window on a retried retire whose intent exists but no final result does, and writes nothing', async () => {
+    // `nowIso` is not part of the intent digest, so a retry re-decides the
+    // rollback window against the request's own clock instead of trusting the
+    // pass that appended the intent.
+    const h = await harness();
+    h.spies.trainPauseSet.mockResolvedValueOnce({ outcome: 'refused', reason: 'pause-unreadable' });
+    expect(await h.useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'unknown',
+      reason: 'train-pause-write-failed',
+    });
+    expect(await journalEntries(h, 'cutover/retire@1')).toEqual([expect.objectContaining({ kind: 'intent' })]);
+    resetSpies(h);
+    expect(await h.useCase.execute(retireRequest({ nowIso: INSIDE_WINDOW_NOW }))).toEqual({
+      outcome: 'refused',
+      reason: 'inside-rollback-window',
+    });
+    expect(totalWriteCalls(h)).toBe(0);
+    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+    expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', revision: 1 } });
   });
 });
 

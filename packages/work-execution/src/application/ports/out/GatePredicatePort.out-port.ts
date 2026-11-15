@@ -22,6 +22,13 @@ import type { AcceptanceSpecProps } from '../../../domain/value-objects/Acceptan
 
 export type GatePredicateKind = 'commit' | 'diff-check' | 'command';
 export type GatePredicateVerdict = 'pass' | 'fail' | 'unknown' | 'skipped';
+/**
+ * Why a command verdict is `unknown` without being the command's own result:
+ * `gate-slot-wait-limit` is host congestion (exit 75 with the fixed gate-slot
+ * stderr line); `resource-exhausted` is the OS or cgroup killing the command
+ * (exit 137 SIGKILL or 143 SIGTERM).
+ */
+export type GatePredicateCause = 'gate-slot-wait-limit' | 'resource-exhausted';
 
 export interface GatePredicateResult {
   /** 'commit', 'diff-check', or 'command <n>: <argv joined by spaces, cut to 120 characters>'. */
@@ -34,11 +41,13 @@ export interface GatePredicateResult {
   /** One short line; never command output. */
   readonly detail: string;
   /**
-   * Set only by the gate-slot congestion branch (KF-30c): an `unknown`
-   * command verdict whose run exited 75 with the fixed gate-slot wait-limit
-   * stderr line. Any other result omits it.
+   * Set only when an `unknown` command verdict is not the command's own
+   * result (KF-30c): `gate-slot-wait-limit` is host congestion (exit 75 with
+   * the fixed gate-slot stderr line); `resource-exhausted` is the command
+   * terminated by the OS or cgroup with exit 137 (SIGKILL) or 143 (SIGTERM).
+   * Any other result omits it.
    */
-  readonly cause?: 'gate-slot-wait-limit';
+  readonly cause?: GatePredicateCause;
   /** Commands with a coverage declaration that ran. */
   readonly coverage?: CheckCoverage;
   /**

@@ -98,6 +98,137 @@ export function laneRunReviewIntentIgnored(
 }
 
 /**
+ * RV5: whether an earlier review intent at `head12` reached `review-passed`
+ * and how many confirming re-reviews ran after a contradictory `failed`.
+ * Pure: no store, no clock; nothing throws; malformed input fails closed.
+ */
+export interface LaneRunReviewConfirmationFact {
+  readonly priorPassedAtHead: boolean;
+  readonly confirmingRetries: number;
+}
+
+const NO_CONFIRMATION_FACT: LaneRunReviewConfirmationFact = Object.freeze({
+  priorPassedAtHead: false,
+  confirmingRetries: 0,
+});
+
+/** Defensive plain-object check (see `lane-run-decider.ts`). */
+function isPlainRecordObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Own-property descriptor read without invoking getters (see `lane-run-decider.ts`). */
+function ownProp(source: unknown, key: string): unknown {
+  try {
+    if (typeof source !== 'object' || source === null) {
+      return undefined;
+    }
+    return Object.getOwnPropertyDescriptor(source, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The latest non-`ambiguous` result entry for `key`'s reason code, read
+ * defensively over untrusted records: `undefined` when absent, malformed, or
+ * when the entry's reason code is neither `null` nor a string. Never throws.
+ */
+function safeFinalReasonCodeOf(entries: readonly unknown[], key: string): string | null | undefined {
+  let reason: string | null | undefined = undefined;
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (ownProp(entry, 'kind') !== 'result' || ownProp(entry, 'key') !== key) {
+      continue;
+    }
+    if (ownProp(entry, 'outcome') === 'ambiguous') {
+      continue;
+    }
+    const reasonCode = ownProp(entry, 'reasonCode');
+    if (reasonCode === null || typeof reasonCode === 'string') {
+      reason = reasonCode;
+    } else {
+      reason = undefined;
+    }
+  }
+  return reason;
+}
+
+/**
+ * RV5: the confirmation fact of `kind` at `head12` — `priorPassedAtHead` when
+ * an earlier step intent of exactly `kind` at `head12` finally reached
+ * `review-passed`, and `confirmingRetries` counting the step intents issued
+ * after a contradictory `review-failed` on that same head (the bounded
+ * confirming re-reviews). Intents whose final reason is `seat-busy` or
+ * `review-superseded` are not verdicts and are skipped. Malformed or hostile
+ * input fails closed to `NO_CONFIRMATION_FACT`; nothing throws.
+ */
+export function laneRunReviewConfirmationFact(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  kind: LaneRunReviewKind,
+  head12: string | null,
+): LaneRunReviewConfirmationFact {
+  try {
+    if (!Array.isArray(entries)) {
+      return NO_CONFIRMATION_FACT;
+    }
+    if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+      return NO_CONFIRMATION_FACT;
+    }
+    if (typeof head12 !== 'string' || head12.length !== 12) {
+      return NO_CONFIRMATION_FACT;
+    }
+    if (kind !== 'brief-check' && kind !== 'code-review' && kind !== 'pre-merge') {
+      return NO_CONFIRMATION_FACT;
+    }
+    for (let index = 0; index < entries.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(entries, index) || !isPlainRecordObject(entries[index])) {
+        return NO_CONFIRMATION_FACT;
+      }
+    }
+    let sawPassed = false;
+    let sawFailedAfterPass = false;
+    let confirmingRetries = 0;
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index]!;
+      if (ownProp(entry, 'kind') !== 'intent' || ownProp(entry, 'runId') !== runId) {
+        continue;
+      }
+      const entryKey = ownProp(entry, 'key');
+      if (typeof entryKey !== 'string') {
+        continue;
+      }
+      const parsed = parseLaneRunKey(entryKey);
+      if (parsed === null || parsed.kind !== 'step' || parsed.runId !== runId) {
+        continue;
+      }
+      if (parsed.step !== kind || parsed.head12 !== head12) {
+        continue;
+      }
+      const finalReason = safeFinalReasonCodeOf(entries, entryKey);
+      if (finalReason === 'seat-busy' || finalReason === 'review-superseded') {
+        continue;
+      }
+      if (sawFailedAfterPass) {
+        confirmingRetries += 1;
+      } else if (sawPassed && finalReason === 'review-failed') {
+        sawFailedAfterPass = true;
+      } else if (finalReason === 'review-passed') {
+        sawPassed = true;
+      }
+    }
+    return Object.freeze({ priorPassedAtHead: sawPassed, confirmingRetries });
+  } catch {
+    return NO_CONFIRMATION_FACT;
+  }
+}
+
+/**
  * The review fact for `kind` at `head12` (plan §3.4): `head12 === null` → `none`.
  * Considers the run's step intents of exactly `kind` at `head12`, ignoring an
  * intent whose final reason is `seat-busy`/`review-superseded` or that predates

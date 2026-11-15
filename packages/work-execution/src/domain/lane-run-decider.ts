@@ -282,6 +282,10 @@ export interface LaneRunReviewFact {
   readonly seatIndex: number | null;
   /** Retries already issued for that seat at this head (0 or 1). */
   readonly retries: number;
+  /** RV5: true when a prior review intent of this kind at this head reached `review-passed`. Absent reads as false. */
+  readonly priorPassedAtHead?: boolean;
+  /** RV5: confirming re-reviews already issued at this head after a contradictory `failed`. Absent reads as 0. */
+  readonly confirmingRetries?: number;
 }
 
 export interface LaneRunFacts {
@@ -801,6 +805,40 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return null;
     };
 
+    /**
+     * RV5: a `failed` read at a head where a prior review of the same kind
+     * already reached `review-passed` is a contradictory read. One bounded
+     * confirming re-review on the SAME seat at the SAME head settles it: a
+     * confirming pass keeps the earlier `passed` standing; a confirming
+     * `failed` (or any malformed confirmation fact, or an exhausted retry
+     * budget) falls through to `afterFailure`. A real fix changes `head12`,
+     * so this never suppresses a genuine finding and cannot loop.
+     */
+    const confirmingRetryDecision = (kind: 'brief-check' | 'code-review'): LaneRunDecision => {
+      const review = kind === 'brief-check' ? facts.briefCheck : facts.codeReview;
+      const confirmingRetries = review.confirmingRetries ?? 0;
+      if (
+        review.priorPassedAtHead === true &&
+        typeof confirmingRetries === 'number' &&
+        Number.isSafeInteger(confirmingRetries) &&
+        confirmingRetries === 0 &&
+        review.seatIndex !== null &&
+        Number.isSafeInteger(review.retries) &&
+        review.retries >= 0 &&
+        review.retries < LANE_RUN_MAX_RETRY
+      ) {
+        return act({
+          step: kind,
+          round: record.round,
+          seatIndex: review.seatIndex,
+          head12: facts.head12,
+          retry: review.retries + 1,
+          attemptOrdinal: null,
+        });
+      }
+      return afterFailure(record.round, kind);
+    };
+
     const reviewRules = (kind: 'brief-check' | 'code-review'): LaneRunDecision => {
       const review = kind === 'brief-check' ? facts.briefCheck : facts.codeReview;
       const requested = requestRules(kind, review, 'review-pending');
@@ -809,6 +847,9 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       }
       if (review.verdict === 'passed') {
         return kind === 'brief-check' ? enter('code-review') : enter('accepting');
+      }
+      if (review.verdict === 'failed') {
+        return confirmingRetryDecision(kind);
       }
       return afterFailure(record.round, kind);
     };

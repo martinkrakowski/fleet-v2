@@ -17,6 +17,7 @@ import { originalBriefOf, renderHandoverBrief } from '../../../domain/lane-run-h
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import {
   isLaneRunReviewUnreachableDetail,
+  laneRunReviewConfirmationFact,
   laneRunReviewFact,
   laneRunReviewIntentIgnored,
 } from '../../../domain/lane-run-review-facts.js';
@@ -25,6 +26,7 @@ import type { ParsedLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision, LaneRunReviewFact, LaneRunSeatFact } from '../../../domain/lane-run-decider.js';
+import type { LaneRunReviewConfirmationFact } from '../../../domain/lane-run-review-facts.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { AbortWorktreeRunResult, WorktreeRunState } from '../../../application/ports/out/ExecutionRunnerPort.out-port.js';
 import type { RunnerForAttemptResult } from '../../../application/ports/out/RunnerForAttemptPort.out-port.js';
@@ -179,6 +181,20 @@ function preMergeSeatOf(
 }
 
 /**
+ * RV5: attach the confirmation fact to a review fact only when a prior
+ * `review-passed` exists at this head — normal runs keep the bare object
+ * shape unchanged. Pure; never throws.
+ */
+function withReviewConfirmationOf(
+  review: LaneRunReviewFact,
+  confirmation: LaneRunReviewConfirmationFact,
+): LaneRunReviewFact {
+  return confirmation.priorPassedAtHead
+    ? { ...review, priorPassedAtHead: true, confirmingRetries: confirmation.confirmingRetries }
+    : review;
+}
+
+/**
  * The review facts of one advance (K5, plan §3.4): the per-kind journal facts
  * (`briefCheck`, `codeReview`) plus the review seat for the kind due. Pure
  * except `ctx.deps.sameModelFamily`; nothing throws.
@@ -191,8 +207,14 @@ export function reviewFactsOf(
   head12: string | null,
   attemptRecords: readonly (AttemptRecord | null)[],
 ): ReviewFacts {
-  const briefCheck = laneRunReviewFact(entries, record.runId, 'brief-check', head12);
-  const codeReview = laneRunReviewFact(entries, record.runId, 'code-review', head12);
+  const briefCheck = withReviewConfirmationOf(
+    laneRunReviewFact(entries, record.runId, 'brief-check', head12),
+    laneRunReviewConfirmationFact(entries, record.runId, 'brief-check', head12),
+  );
+  const codeReview = withReviewConfirmationOf(
+    laneRunReviewFact(entries, record.runId, 'code-review', head12),
+    laneRunReviewConfirmationFact(entries, record.runId, 'code-review', head12),
+  );
   const preMergeReview = laneRunReviewFact(entries, record.runId, 'pre-merge', head12);
   const reviewSeat: LaneRunSeatFact =
     state === 'brief-check' || state === 'code-review'

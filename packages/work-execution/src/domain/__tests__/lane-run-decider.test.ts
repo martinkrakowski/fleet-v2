@@ -1209,6 +1209,48 @@ describe('review rules per kind', () => {
     const facts = reviewFacts(kind, { verdict: 'failed' });
     assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'fixing' });
   });
+
+  it.each(['brief-check', 'code-review'] as const)('V9a: %s failed after a prior pass at the same head confirms once on the same seat', (kind) => {
+    const zero = reviewFacts(kind, { verdict: 'failed', seatIndex: 0, retries: 0, priorPassedAtHead: true, confirmingRetries: 0 });
+    expect(decide(record({}), zero)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+    const one = reviewFacts(kind, { verdict: 'failed', seatIndex: 2, retries: 1, priorPassedAtHead: true, confirmingRetries: 0 });
+    expect(decide(record({}), one)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/2@${HEAD}/retry2`, round: 0, seatIndex: 2, head12: HEAD, retry: 2,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V9b: %s failed with one confirming retry already spent enters fixing', (kind) => {
+    const facts = reviewFacts(kind, { verdict: 'failed', seatIndex: 0, retries: 1, priorPassedAtHead: true, confirmingRetries: 1 });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'fixing' });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V9b2: %s failed with one confirming retry in round 2 parks blocker-after-round-2', (kind) => {
+    const rec = record({ round: 2, attemptIds: ['a1', 'a2', 'a3'] });
+    const facts = reviewFacts(kind, { verdict: 'failed', seatIndex: 0, retries: 1, priorPassedAtHead: true, confirmingRetries: 1 });
+    assertDecision(facts, rec, decide(rec, facts), {
+      kind: 'park', reason: 'blocker-after-round-2', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V9c: %s failed after a prior pass without a usable seat or budget falls through to afterFailure', (kind) => {
+    const noSeat = reviewFacts(kind, { verdict: 'failed', seatIndex: null, retries: 0, priorPassedAtHead: true, confirmingRetries: 0 });
+    assertDecision(noSeat, record({}), decide(record({}), noSeat), { kind: 'enter', to: 'fixing' });
+
+    const noBudget = reviewFacts(kind, {
+      verdict: 'failed', seatIndex: 0, retries: LANE_RUN_MAX_RETRY, priorPassedAtHead: true, confirmingRetries: 0,
+    });
+    assertDecision(noBudget, record({}), decide(record({}), noBudget), { kind: 'enter', to: 'fixing' });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V9c2: %s failed with a malformed confirmingRetries falls through to afterFailure, never loops', (kind) => {
+    const malformed = reviewFacts(kind, {
+      verdict: 'failed', seatIndex: 0, retries: 0, priorPassedAtHead: true,
+      confirmingRetries: 1.5 as unknown as number,
+    });
+    assertDecision(malformed, record({}), decide(record({}), malformed), { kind: 'enter', to: 'fixing' });
+  });
 });
 
 describe('fixing state', () => {

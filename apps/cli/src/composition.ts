@@ -69,6 +69,8 @@ import {
   InspectMergeReadinessUseCase,
   InspectWorkOrderUseCase,
   InventoryRelaunchUseCase,
+  PlanRelaunchUseCase,
+  RelaunchPlanRepositoryAdapter,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
   OpencodeApiUsageAdapter,
@@ -804,6 +806,10 @@ export interface FleetCliRuntime {
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
     /** CO26: the read-only relaunch inventory per lane host. */
     readonly inventoryRelaunch: InventoryRelaunchUseCase;
+    /** CO29a: the immutable relaunch plan store, keyed by canonical plan digest. */
+    readonly relaunchPlanRepository: RelaunchPlanRepositoryAdapter;
+    /** CO29a: build and store the ordered relaunch plan (read-only over the inventory and records). */
+    readonly planRelaunch: PlanRelaunchUseCase;
     /** CO30a: the one cutover record v1 (`cutover.json`). */
     readonly cutoverRecordRepository: CutoverRecordRepositoryAdapter;
     /** CO30a: the keyed cutover journal (`cutover-journal.json`). */
@@ -1182,16 +1188,16 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runJournal: conductor.laneRunJournal,
   });
 
-  // CO26: the read-only relaunch inventory reads the same lane-run stores the
-  // conductor composes, beside closeWorkOrder / listStaleWorkOrders. Its halt
-  // and lease reads are the read-only instances (CO29a-ro2): a corrupt store
-  // file is never quarantined by the inventory, and unreadable bytes answer
-  // unknown instead of a value.
-  const inventoryRelaunch = new InventoryRelaunchUseCase({
-    runRepo: conductor.laneRunRepository,
-    attemptRepo: attemptRepository,
+  // CO26 + CO29a: `relaunch inventory` and `relaunch plan` are strictly
+  // read-only; composeReadOnlyRelaunch builds every state adapter they reach
+  // read-only and takes no store from the conductor (CO29a-ro). A corrupt
+  // store file is never quarantined by either command, and unreadable halt
+  // or lease bytes answer unknown instead of a value (CO29a-ro2). The plan
+  // store (relaunch-plans.json) is the one allowed write, and only
+  // `planRelaunch` holds it.
+  const { inventoryRelaunch, planRelaunch, relaunchPlanRepository } = composeReadOnlyRelaunch({
+    stateDir,
     workspace,
-    ...composeReadOnlyRelaunch({ stateDir }),
     runnerForAttempt,
     computeDigest: sha256HexDigest,
   });
@@ -1288,6 +1294,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       listStaleWorkOrders,
       inspectMergeReadiness,
       inventoryRelaunch,
+      /** CO29a: the immutable relaunch plan store, keyed by canonical plan digest. */
+      relaunchPlanRepository,
+      /** CO29a: build and store the ordered relaunch plan (read-only over the inventory and records). */
+      planRelaunch,
       cutoverRecordRepository,
       cutoverJournal,
       killallTrainPause,

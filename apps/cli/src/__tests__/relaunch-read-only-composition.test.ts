@@ -1,76 +1,108 @@
 /**
- * CO29a-ro2: the read-only relaunch composition. The halt marker and driver
- * lease `relaunch inventory` reads are opened read-only: a corrupt store file
- * is never quarantined by the command, the typed unreadable error answers
- * instead, and every write is refused. The default (writable) instances keep
- * quarantining, unchanged.
+ * CO29a-ro: the architecture guard behind `relaunch inventory` and
+ * `relaunch plan`. Every state adapter `composeReadOnlyRelaunch` constructs is
+ * built read-only, except the relaunch plan store, which only `planRelaunch`
+ * holds. The adapter constructors are wrapped (not replaced), so the real
+ * adapters are built and only their options are recorded.
  */
 
-import { promises as fs } from 'node:fs';
-import * as os from 'node:os';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ReadOnlyStateStoreError, StateFileUnreadableReadOnlyError } from '@fleet/work-execution';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+interface BuiltAdapter {
+  readonly name: string;
+  readonly options: { readonly stateDir?: string; readonly readOnly?: boolean } | undefined;
+}
+
+const built = vi.hoisted(() => [] as unknown[]);
+
+vi.mock('@fleet/work-execution', async (importOriginal) => {
+  const original = await importOriginal<Record<string, unknown>>();
+  const wrapped: Record<string, unknown> = { ...original };
+  for (const [name, value] of Object.entries(original)) {
+    if (typeof value !== 'function' || !/(Adapter)$/.test(name)) continue;
+    const Original = value as new (options?: unknown) => object;
+    wrapped[name] = class extends Original {
+      constructor(options?: unknown) {
+        super(options);
+        built.push({ name, options });
+      }
+    };
+  }
+  return wrapped;
+});
+
+import { sha256HexDigest } from '@fleet/work-execution';
 
 import { composeReadOnlyRelaunch } from '../composition/relaunch.js';
 
-describe('composeReadOnlyRelaunch', () => {
-  let tempDir: string;
+const roots: string[] = [];
 
-  beforeEach(async () => {
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-relaunch-composition-test-'));
+afterAll(() => {
+  for (const root of roots) rmSync(root, { recursive: true, force: true });
+});
+
+function adapters(): BuiltAdapter[] {
+  return built as BuiltAdapter[];
+}
+
+const unusedWorkspace = { listWorktrees: async () => ({ outcome: 'unknown' as const, reason: 'unused' }) };
+const unusedRunnerForAttempt = { runnerForAttempt: () => ({ ok: false as const, reason: 'unused' }) };
+
+describe('composeReadOnlyRelaunch (architecture)', () => {
+  beforeEach(() => {
+    built.length = 0;
   });
 
-  afterEach(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
-  });
+  it('builds every state adapter read-only except the relaunch plan store', () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-v2-relaunch-ro-'));
+    roots.push(stateDir);
 
-  it('reads a corrupt halt marker as the typed unreadable state and writes nothing', async () => {
-    const file = path.join(tempDir, 'conductor-halt.json');
-    const garbage = '{ not json CANARY-bytes';
-    await fs.writeFile(file, garbage, 'utf8');
-
-    const { halt } = composeReadOnlyRelaunch({ stateDir: tempDir });
-    expect(await halt.read()).toEqual({ state: 'unreadable' });
-    expect(await fs.readFile(file, 'utf8')).toBe(garbage);
-    await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
-      code: 'ENOENT',
+    const composed = composeReadOnlyRelaunch({
+      stateDir,
+      workspace: unusedWorkspace,
+      runnerForAttempt: unusedRunnerForAttempt,
+      computeDigest: sha256HexDigest,
     });
-  });
 
-  it('reads a corrupt driver lease as the typed unreadable error and writes nothing', async () => {
-    const file = path.join(tempDir, 'conductor-driver-lease.json');
-    const garbage = '{ not json CANARY-bytes';
-    await fs.writeFile(file, garbage, 'utf8');
+    expect(composed.inventoryRelaunch).toBeDefined();
+    expect(composed.planRelaunch).toBeDefined();
 
-    const { driverLease } = composeReadOnlyRelaunch({ stateDir: tempDir });
-    await expect(driverLease.read()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
-    expect(await fs.readFile(file, 'utf8')).toBe(garbage);
-    await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
-      code: 'ENOENT',
-    });
-  });
-
-  it('refuses every write on both stores', async () => {
-    const { halt, driverLease } = composeReadOnlyRelaunch({ stateDir: tempDir });
-    await expect(halt.set({ halted: true, nowIso: '2026-11-15T00:00:00.000Z' })).rejects.toBeInstanceOf(
-      ReadOnlyStateStoreError,
+    const names = adapters().map((adapter) => adapter.name).sort();
+    expect(names).toEqual(
+      [
+        'AttemptRepositoryAdapter',
+        'ConductorDriverLeaseAdapter',
+        'ConductorHaltAdapter',
+        'LanePlanRepositoryAdapter',
+        'LaneRunRepositoryAdapter',
+        'RelaunchPlanRepositoryAdapter',
+        'WorkOrderRepositoryAdapter',
+      ].sort(),
     );
-    await expect(
-      driverLease.acquire({
-        holderId: 'driver-test',
-        observedFence: 0,
-        leaseUntilIso: '2026-11-15T00:02:00.000Z',
-        nowIso: '2026-11-15T00:00:00.000Z',
-      }),
-    ).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
-    expect(await fs.readdir(tempDir)).toEqual([]);
+
+    for (const adapter of adapters()) {
+      expect(adapter.options?.stateDir, adapter.name).toBe(stateDir);
+      if (adapter.name === 'RelaunchPlanRepositoryAdapter') {
+        expect(adapter.options?.readOnly, adapter.name).not.toBe(true);
+      } else {
+        expect(adapter.options?.readOnly, adapter.name).toBe(true);
+      }
+    }
   });
 
-  it('absent files read as clear and absent', async () => {
-    const { halt, driverLease } = composeReadOnlyRelaunch({ stateDir: tempDir });
-    expect(await halt.read()).toEqual({ state: 'clear', record: null });
-    expect(await driverLease.read()).toBeNull();
+  it('also builds read-only without a state directory (in-memory, disposable)', () => {
+    composeReadOnlyRelaunch({
+      workspace: unusedWorkspace,
+      runnerForAttempt: unusedRunnerForAttempt,
+      computeDigest: sha256HexDigest,
+    });
+    for (const adapter of adapters()) {
+      if (adapter.name === 'RelaunchPlanRepositoryAdapter') continue;
+      expect(adapter.options?.readOnly, adapter.name).toBe(true);
+    }
   });
 });

@@ -21,6 +21,13 @@ export interface ResolveActionAuthorizationRequest {
    * to one root never authorizes an operation on another root.
    */
   readonly releaseRoot?: string;
+  /**
+   * The deterministic action id this resolve resumes (CO14 follow-up), derived
+   * from `actionId` at the adapter boundary: a release grant already durably
+   * consumed by exactly this action id resolves again, so a crash between the
+   * consumption and the release's write is recoverable.
+   */
+  readonly resumeActionId?: string;
 }
 
 export type ResolveActionAuthorizationResult =

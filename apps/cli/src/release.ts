@@ -71,8 +71,12 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
         // attempt coordinate is passed through only when the caller carries one.
         attemptId: request.attemptId,
         // CO14 follow-up: the release root travels with the grant coordinates,
-        // so a grant for one root cannot authorize another.
+        // so a grant for one root never authorizes another; and the
+        // deterministic action id travels as the resume key, so a grant
+        // consumed by exactly this action id (a crash between the consumption
+        // and the release's write) resolves again idempotently.
         releaseRoot: request.releaseRoot,
+        resumeActionId: request.actionId,
       });
       return result.outcome === 'authorized'
         ? {

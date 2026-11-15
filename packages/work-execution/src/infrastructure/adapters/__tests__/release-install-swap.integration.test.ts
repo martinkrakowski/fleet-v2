@@ -110,6 +110,7 @@ async function harness(): Promise<Harness> {
         expectedHeadSha: request.expectedHeadSha,
         attemptId: request.attemptId,
         releaseRoot: request.releaseRoot,
+        resumeActionId: request.actionId,
       });
       return result.outcome === 'authorized'
         ? {
@@ -161,7 +162,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     h = await harness();
   });
 
-  it('install builds the target and repoints current; a second install keeps the previous build; swap repoints atomically', async () => {
+  it('install stages the build and leaves current unmoved; swap repoints current atomically', async () => {
     await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
     const installA = await h.useCase.manageRelease({
       action: 'install',
@@ -173,9 +174,9 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
       projectId: 'p',
     });
     expect(installA.outcome).toBe('applied');
-    // <root>/<sha> exists and is a verified build; `current` names it.
+    // <root>/<sha> exists and is a verified build; `current` is untouched.
     expect(await readFile(join(h.root, shaA, '.fleet-release-verified'), 'utf8')).toContain(shaA);
-    expect(await readlinkSha(h.root)).toBe(shaA);
+    expect(await readlinkSha(h.root)).toBeNull();
     // The grant was consumed exactly once.
     expect((await h.grants.findRequestByGrantId('grant-a'))?.consumptions).toHaveLength(1);
 
@@ -193,7 +194,8 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     const afterInstall = await h.store.list({ root: h.root });
     expect(afterInstall.outcome).toBe('read');
     if (afterInstall.outcome === 'read') {
-      expect(afterInstall.current).toBe(shaB);
+      // Install never moves `current`, not even when it is already set.
+      expect(afterInstall.current).toBeNull();
       expect(afterInstall.builds.map((build) => build.sha).sort()).toEqual([shaA, shaB].sort());
     }
 
@@ -212,13 +214,14 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     expect(await readlinkSha(h.root)).toBe(shaA);
     expect(await h.store.list({ root: h.root })).toMatchObject({
       outcome: 'read',
+      current: shaA,
       builds: expect.arrayContaining([
         expect.objectContaining({ sha: shaB }),
       ]),
     });
   });
 
-  it('a second identical release is refused by the consumed grant, not re-authorised', async () => {
+  it('a second release for another target is refused by the consumed grant, and the identical replay stays idempotent', async () => {
     await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
     const first = await h.useCase.manageRelease({
       action: 'install',
@@ -241,6 +244,21 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     });
     expect(second).toEqual({ outcome: 'refused', reason: 'authority-refused' });
     expect((await h.grants.findRequestByGrantId('grant-a'))?.consumptions).toHaveLength(1);
+    // The replay of the same deterministic release id resolves the same consumed
+    // grant idempotently and reaches the same single state: the build is in
+    // place, `current` is unmoved and the grant is consumed exactly once.
+    const replay = await h.useCase.manageRelease({
+      action: 'install',
+      root: h.root,
+      sha: shaA,
+      source: h.root,
+      keep: 5,
+      apply: true,
+      projectId: 'p',
+    });
+    expect(replay.outcome).toBe('applied');
+    expect((await h.grants.findRequestByGrantId('grant-a'))?.consumptions).toHaveLength(1);
+    expect(await h.store.list({ root: h.root })).toMatchObject({ outcome: 'read', current: null });
   });
 
   it('a live driver lease in the root\'s state directory refuses the swap and current stays on the old build', async () => {
@@ -264,19 +282,20 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
       nowIso: NOW,
     });
     expect(held.outcome).toBe('ok');
-    await h.grants.saveRequest(releaseGrant('grant-b', 'release:install', shaB, h.root));
+    await h.grants.saveRequest(releaseGrant('grant-swap', 'release:swap', shaA, h.root));
     const refused = await h.useCase.manageRelease({
-      action: 'install',
+      action: 'swap',
       root: h.root,
-      sha: shaB,
-      source: h.root,
+      sha: shaA,
+      source: null,
       keep: 5,
       apply: true,
       projectId: 'p',
     });
     expect(refused).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
-    expect(await readlinkSha(h.root)).toBe(shaA);
-    // No build was started for the refused release.
+    // The refused swap repointed nothing: `current` is still where install left it.
+    expect(await readlinkSha(h.root)).toBeNull();
+    // No build was started for the refused release: only the install's four steps ran.
     expect(h.executor.argvs).toHaveLength(4);
   });
 });

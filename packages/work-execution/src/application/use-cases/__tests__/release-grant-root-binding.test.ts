@@ -96,6 +96,7 @@ function releaseUseCase(grants: CoordinationRequestRepositoryAdapter): ManageRel
         actionScope: 'release:install',
         expectedHeadSha: request.expectedHeadSha,
         releaseRoot: request.releaseRoot,
+        resumeActionId: request.actionId,
       });
       return result.outcome === 'authorized'
         ? {
@@ -164,8 +165,8 @@ describe('release grant root binding (CO14 follow-up)', () => {
 
   it('a grant for the root it names authorizes that root, once', async () => {
     await grants.saveRequest(grantFor(rootA));
-    // The target build already exists, so no build runs and the grant is
-    // consumed by the repoint alone.
+    // The target build already exists, so no build runs; the staged install
+    // consumes the grant without touching `current`.
     const store = new ReleaseStoreAdapter();
     const staging = await store.prepare({ root: rootA, sha: SHA_A });
     expect(staging.outcome).toBe('prepared');
@@ -186,7 +187,8 @@ describe('release grant root binding (CO14 follow-up)', () => {
     });
     expect(result.outcome).toBe('applied');
     expect((await grants.findRequestByGrantId('grant-owner'))?.consumptions).toHaveLength(1);
-    expect(await store.list({ root: rootA })).toMatchObject({ outcome: 'read', current: SHA_A });
+    // Install stages the build and never moves `current` (CO14 follow-up).
+    expect(await store.list({ root: rootA })).toMatchObject({ outcome: 'read', current: null });
   });
 
   it('a consumed grant does not authorize a second release', async () => {
@@ -212,10 +214,12 @@ describe('release grant root binding (CO14 follow-up)', () => {
       projectId: 'p',
     });
     expect(first.outcome).toBe('applied');
+    // A release for another target carries another deterministic action id, so
+    // the consumed grant never resumes for it: the second apply is refused.
     const second = await useCase.manageRelease({
       action: 'install',
       root: rootA,
-      sha: SHA_A,
+      sha: SHA_B,
       source: rootA,
       keep: 5,
       apply: true,

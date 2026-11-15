@@ -24,11 +24,39 @@ import {
   type ResolveActionAuthorizationRequest,
   type ConsumeActionAuthorizationRequest,
 } from '@fleet/work-execution';
+import { CoordinationRequestRepositoryAdapter } from '../../../../../operator-coordination/src/infrastructure/adapters/CoordinationRequestRepositoryAdapter.adapter.js';
+import { RecordAuthorizationConsumptionUseCase } from '../../../../../operator-coordination/src/application/use-cases/RecordAuthorizationConsumptionUseCase.use-case.js';
+import { ResolveActionAuthorizationUseCase } from '../../../../../operator-coordination/src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
+import type { CoordinationRequestRecord } from '../../../../../operator-coordination/src/domain/coordination-records.js';
 
 const NOW = '2026-11-10T10:00:00.000Z';
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
 const ROOT = '/nonexistent-co14b-robustness-root';
+
+/** A recorded, approved, unconsumed owner grant for one release scope at one head, bound to one root. */
+function releaseGrant(grantId: string, scope: string, sha: string, root: string): CoordinationRequestRecord {
+  return {
+    id: `req-${grantId}`,
+    projectId: 'p',
+    kind: 'action-decision',
+    state: 'approved',
+    actionScope: scope,
+    expectedHeadSha: sha,
+    proposalDigest: 'prop-1',
+    policyRevision: 'pol-1',
+    decisionRevision: 'dec-1',
+    grantId,
+    consumptions: [],
+    acknowledgements: [],
+    deliveryStatus: 'pending',
+    deliveryGapReason: null,
+    revision: 0,
+    createdAtIso: NOW,
+    updatedAtIso: NOW,
+    releaseRoot: root,
+  } as CoordinationRequestRecord;
+}
 
 let dirs: string[] = [];
 
@@ -44,11 +72,12 @@ afterEach(async () => {
   await Promise.all(pending.map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-/** Always grants, never consumes; the consume is refused, so an apply repoints nothing. */
+/** Always grants, echoing the release root the request names; the consume always succeeds. */
 const grantingAuthorization: ActionAuthorizationPort = {
-  resolveActionAuthorization: async (_request: ResolveActionAuthorizationRequest) => ({
+  resolveActionAuthorization: async (request: ResolveActionAuthorizationRequest) => ({
     outcome: 'granted',
     authorizationGrantId: 'grant-1',
+    ...(request.releaseRoot !== undefined ? { releaseRoot: request.releaseRoot } : {}),
   }),
   consumeActionAuthorization: async (request: ConsumeActionAuthorizationRequest) => ({
     outcome: 'consumed',
@@ -168,14 +197,15 @@ describe('release robustness bar (CO14 follow-up)', () => {
       apply: true,
       projectId: 'p',
     });
-    expect(cutShort).toEqual({ outcome: 'refused', reason: 'build-failed' });    for (const invocation of executor2.invocations) {
+    expect(cutShort).toEqual({ outcome: 'refused', reason: 'build-failed' });
+    for (const invocation of executor2.invocations) {
       expect(invocation.options?.timeoutMs).toBeGreaterThan(0);
       expect(invocation.options?.maxBufferBytes).toBeGreaterThan(0);
     }
     // The store still lists the same builds and the same `current`, and the
     // next pass with a working executor completes the build.
     const listing = await new ReleaseStoreAdapter().list({ root });
-    expect(listing).toMatchObject({ outcome: 'read', current: SHA_A, builds: [expect.objectContaining({ sha: SHA_A })] });
+    expect(listing).toMatchObject({ outcome: 'read', current: null, builds: [expect.objectContaining({ sha: SHA_A })] });
     const { useCase: uc3 } = useCase();
     const nextPass = await uc3.manageRelease({
       action: 'install',
@@ -187,11 +217,13 @@ describe('release robustness bar (CO14 follow-up)', () => {
       projectId: 'p',
     });
     expect(nextPass.outcome).toBe('applied');
-    expect(await new ReleaseStoreAdapter().list({ root })).toMatchObject({ outcome: 'read', current: SHA_B });
+    // Install stages the build and never moves `current` (CO14 follow-up).
+    expect(await new ReleaseStoreAdapter().list({ root })).toMatchObject({ outcome: 'read', current: null });
   });
 
-  it('a release swap is keyed idempotent and survives a crash between intent and result', async () => {
+  it('a release swap is keyed idempotent and survives a crash between the consumption and the repoint', async () => {
     const root = await tempDir('co14b-idem-');
+    const stateDir = await tempDir('co14b-idem-state-');
     const store = new ReleaseStoreAdapter();
     for (const sha of [SHA_A, SHA_B]) {
       const staging = await store.prepare({ root, sha });
@@ -202,35 +234,78 @@ describe('release robustness bar (CO14 follow-up)', () => {
       expect((await store.markVerified({ root, sha, buildId: staging.buildId, builtAtIso: NOW })).outcome).toBe('ok');
     }
     await store.repoint({ root, sha: SHA_A });
-    // One consumption key per action id: the same swap consumes the same key,
-    // so a second consumption of the same grant is refused, never recorded twice.
-    let consumptions = 0;
-    const onceAuthorization: ActionAuthorizationPort = {
-      resolveActionAuthorization: async (_request: ResolveActionAuthorizationRequest) => ({
-        outcome: 'granted',
-        authorizationGrantId: 'grant-1',
-      }),
+    // The real grant path: a recorded, approved `release:swap` grant bound to
+    // this release root, resolved and consumed through the coordination use
+    // cases — never a stub that grants and consumes every replay.
+    const grants = new CoordinationRequestRepositoryAdapter({ stateDir });
+    await grants.saveRequest(releaseGrant('grant-1', 'release:swap', SHA_B, root));
+    // The crash window: the first attempt's consume succeeds durably and then
+    // the process dies before the repoint, so the caller sees a refusal while
+    // the grant is already consumed and `current` is unmoved.
+    let crashed = true;
+    const resolve = async (request: ResolveActionAuthorizationRequest) => {
+      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants }).resolveActionAuthorization({
+        projectId: request.projectId,
+        actionScope: 'release:swap',
+        expectedHeadSha: request.expectedHeadSha,
+        releaseRoot: request.releaseRoot,
+        resumeActionId: request.actionId,
+      });
+      return result.outcome === 'authorized'
+        ? {
+            outcome: 'granted' as const,
+            authorizationGrantId: result.grantId,
+            ...(result.releaseRoot !== undefined ? { releaseRoot: result.releaseRoot } : {}),
+          }
+        : { outcome: 'blocked' as const, reason: result.reason };
+    };
+    const consume = async (request: ConsumeActionAuthorizationRequest) => {
+      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants }).recordAuthorizationConsumption({
+        consumptionId: `c-${request.actionId}`,
+        grantId: request.authorizationGrantId,
+        actionId: request.actionId,
+        actionScope: 'release:swap',
+        attemptId: request.attemptId ?? request.actionId,
+        expectedHeadSha: request.expectedHeadSha ?? SHA_B,
+        releaseRoot: request.releaseRoot,
+      });
+      return result.outcome === 'consumed'
+        ? { outcome: 'consumed' as const, actionId: request.actionId }
+        : { outcome: 'refused' as const, reason: result.reason };
+    };
+    const crashAuthorization: ActionAuthorizationPort = {
+      resolveActionAuthorization: resolve,
       consumeActionAuthorization: async (request: ConsumeActionAuthorizationRequest) => {
-        consumptions += 1;
-        return { outcome: 'consumed', actionId: request.actionId };
+        const result = await consume(request);
+        if (crashed) {
+          crashed = false;
+          return { outcome: 'refused', reason: 'simulated crash between the consumption and the repoint' };
+        }
+        return result;
       },
     };
-    const { useCase: uc } = useCase({}, onceAuthorization);
-    const first = await uc.manageRelease({ action: 'swap', root, sha: SHA_B, source: null, keep: 5, apply: true, projectId: 'p' });
-    expect(first.outcome).toBe('applied');
-    expect(consumptions).toBe(1);
-    const afterFirst = await store.list({ root });
-    expect(afterFirst.outcome).toBe('read');
-    if (afterFirst.outcome === 'read') {
-      expect(afterFirst.current).toBe(SHA_B);
-    }
-    // The next pass after a crash between intent and result reaches one consistent state:
-    // the same swap key re-run repoints to the same single `current`, never two pointers.
-    const { useCase: uc2 } = useCase({}, onceAuthorization);
+    const { useCase: uc } = useCase({}, crashAuthorization);
+    const interrupted = await uc.manageRelease({ action: 'swap', root, sha: SHA_B, source: null, keep: 5, apply: true, projectId: 'p' });
+    expect(interrupted).toEqual({ outcome: 'refused', reason: 'authority-refused' });
+    // The consumption is durable and `current` is unmoved: the crash left one
+    // intent with no result.
+    expect((await grants.findRequestByGrantId('grant-1'))?.consumptions).toHaveLength(1);
+    expect(await store.list({ root })).toMatchObject({ outcome: 'read', current: SHA_A });
+    // The next pass resumes the same consumed grant by its own deterministic
+    // action id, replays the consumption idempotently and reaches one
+    // consistent state: a single `current` on the target, one consumption.
+    const { useCase: uc2 } = useCase({}, crashAuthorization);
     const replay = await uc2.manageRelease({ action: 'swap', root, sha: SHA_B, source: null, keep: 5, apply: true, projectId: 'p' });
-    expect(replay.outcome).toBe('applied');
-    const after = await store.list({ root });
-    expect(after).toMatchObject({ outcome: 'read', current: SHA_B });
+    expect(replay).toMatchObject({ outcome: 'applied', action: 'swap', target: SHA_B });
+    expect((await grants.findRequestByGrantId('grant-1'))?.consumptions).toHaveLength(1);
+    expect(await store.list({ root })).toMatchObject({ outcome: 'read', current: SHA_B });
+    // The same swap key never records a second consumption: a further full
+    // replay reaches the same single state, never two `current` pointers.
+    const { useCase: uc3 } = useCase({}, crashAuthorization);
+    const again = await uc3.manageRelease({ action: 'swap', root, sha: SHA_B, source: null, keep: 5, apply: true, projectId: 'p' });
+    expect(again).toMatchObject({ outcome: 'applied', action: 'swap', target: SHA_B });
+    expect((await grants.findRequestByGrantId('grant-1'))?.consumptions).toHaveLength(1);
+    expect(await store.list({ root })).toMatchObject({ outcome: 'read', current: SHA_B });
   });
 
   it('an unreadable release store is reported as unknown, never as empty', async () => {

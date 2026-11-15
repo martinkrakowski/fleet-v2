@@ -5,12 +5,19 @@
  * unreadable lease is `lease-unknown`, never "no lease"), read the store,
  * resolve the target, then either report the plan or apply it.
  *
- * Apply is fenced three ways:
+ * An install stages a release: it builds at `<root>/<sha>` and consumes its
+ * grant exactly once, but never repoints `current` and never prunes — only a
+ * swap or a rollback serves a build. Apply is fenced three ways:
  * - Authority: a recorded owner grant for `release:<action>` at the target sha
  *   is resolved through ActionAuthorizationPort before any write, and consumed
  *   (once, durably) just before the repoint. A missing, mismatched, expired or
  *   consumed grant is `authority-refused`; a grant read that fails or answers
- *   unknown is `authority-unknown`. No free-text value is ever authority.
+ *   unknown is `authority-unknown`. No free-text value is ever authority. The
+ *   grant is bound to the release root it names: a granted result that does
+ *   not carry exactly this release's root is `release-grant-root-mismatch`.
+ *   A crash after the consumption but before the repoint is recoverable: the
+ *   deterministic action id resumes the same grant idempotently, the same
+ *   consumption id replays as consumed, and the retry reaches the repoint.
  * - The driver: a live lease refuses before any write; the build then runs
  *   outside any lock, and the repoint runs only while this process holds the
  *   conductor driver lease itself (acquired by CAS just before the repoint,
@@ -157,7 +164,13 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     return this.apply(request, target, current, alreadyBuilt);
   }
 
-  /** The apply path: grant, build when needed, the fenced repoint, then prune. */
+  /**
+   * The apply path: grant, build when needed, then act. An install creates the
+   * build and consumes its grant but never repoints `current` (CO14 follow-up:
+   * install stages a release, a swap or a rollback is what serves it), so it
+   * runs no repoint and no prune and reports the unmoved current. A swap or a
+   * rollback goes through the fenced repoint.
+   */
   private async apply(
     request: ValidRequest,
     target: string,
@@ -175,6 +188,28 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         return refuse(built);
       }
       rebuilt = true;
+    }
+    if (request.action === 'install') {
+      // Install stages the build and consumes the grant exactly once; `current`
+      // is left where it was, and nothing is pruned.
+      const consumed = await this.consumeGrant(request, target, grant);
+      if (consumed !== null) {
+        return refuse(consumed);
+      }
+      const fresh = await this.deps.store.list({ root: request.root });
+      if (fresh.outcome !== 'read') {
+        return refuse('store-unreadable');
+      }
+      return {
+        outcome: 'applied',
+        action: request.action,
+        target,
+        current: fresh.current,
+        kept: fresh.builds.map((build) => build.sha),
+        pruned: [],
+        pruneOutcome: 'pruned',
+        rebuilt,
+      };
     }
     const repointed = await this.fencedRepoint(request, target, plannedCurrent, grant);
     if ('refusal' in repointed) {
@@ -224,9 +259,10 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         releaseRoot: request.root,
       });
       if (resolved.outcome === 'granted') {
-        // The grant is bound to the root it names (CO14 follow-up): a grant
-        // bound to another root never authorizes this release.
-        if (resolved.releaseRoot !== undefined && resolved.releaseRoot !== request.root) {
+        // The grant is bound to the root it names (CO14 follow-up): a granted
+        // release result that does not carry exactly this release's root never
+        // authorizes it — a missing root is a mismatch too, never a match.
+        if (resolved.releaseRoot !== request.root) {
           return { refusal: 'release-grant-root-mismatch' };
         }
         return typeof resolved.authorizationGrantId === 'string' && resolved.authorizationGrantId.trim() !== ''

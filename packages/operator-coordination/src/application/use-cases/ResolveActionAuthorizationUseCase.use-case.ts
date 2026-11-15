@@ -85,7 +85,20 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     const refreshed = await this.refreshFromVerifiedAnswer(recorded);
     const candidate = CoordinationRequest.fromRecord(refreshed);
-    if (!candidate.isApproved()) {
+    // CO14 follow-up: a release grant already durably consumed by exactly the
+    // deterministic action id this resolve names resolves again idempotently,
+    // so a crash between the consumption and the release's own write leaves
+    // the retry able to recover. Any other consumed grant stays blocked, and
+    // a completed record that does not resume is refused like any other
+    // non-approving state.
+    const resumeActionId = isFilled(request.resumeActionId) ? request.resumeActionId.trim() : undefined;
+    const consumptions = candidate.getConsumptions();
+    const resumable =
+      resumeActionId !== undefined &&
+      isReleaseActionScope(candidate.getActionScope()) &&
+      consumptions.length === 1 &&
+      consumptions[0].actionId === resumeActionId;
+    if (!candidate.isApproved() && !resumable) {
       return blocked(
         `recorded request ${candidate.getId()} is ${candidate.getState()}, which does not authorize an action`,
       );
@@ -100,7 +113,23 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (refreshed.projectId !== request.projectId.trim()) {
       return blocked(`grant ${grantId} belongs to project ${refreshed.projectId}`);
     }
-    if (!candidate.canAuthorizeAction(request.actionScope.trim(), request.expectedHeadSha.trim())) {
+    if (
+      !resumable &&
+      !candidate.canAuthorizeAction(request.actionScope.trim(), request.expectedHeadSha.trim())
+    ) {
+      return blocked(
+        `grant ${grantId} authorizes ${candidate.getActionScope()} at ${
+          candidate.getExpectedHeadSha() ?? 'no commit'
+        }, not ${request.actionScope.trim()} at ${request.expectedHeadSha.trim()}`,
+      );
+    }
+    if (
+      resumable &&
+      (candidate.getActionScope() !== request.actionScope.trim() ||
+        candidate.getExpectedHeadSha() !== request.expectedHeadSha.trim())
+    ) {
+      // A resumed release grant still authorizes only its recorded scope at
+      // its recorded head; the resume never widens either.
       return blocked(
         `grant ${grantId} authorizes ${candidate.getActionScope()} at ${
           candidate.getExpectedHeadSha() ?? 'no commit'
@@ -131,7 +160,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         );
       }
     }
-    if (candidate.getConsumptions().length > 0) {
+    if (candidate.getConsumptions().length > 0 && !resumable) {
       return blocked(`grant ${grantId} is already consumed by another action`);
     }
     const attemptBlock = await this.bindAttempt(candidate, refreshed, request, grantId);
@@ -161,6 +190,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     const recorded = await (this.deps?.requestRepo.listRequests(request.projectId.trim()) ?? []);
     const head = request.expectedHeadSha.trim();
+    const resumeActionId = isFilled(request.resumeActionId) ? request.resumeActionId.trim() : undefined;
     const matching = recorded.filter(
       (candidate) =>
         candidate.projectId === request.projectId.trim() &&
@@ -170,11 +200,25 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         this.matchesMergeGrantCoordinates(candidate, request),
     );
     const approved = matching.filter((candidate) => candidate.state === 'approved');
-    const preferred =
-      approved.length > 0
-        ? approved
-        : matching.filter((candidate) => candidate.state === 'awaiting-decision');
-    return preferred.length > 0 ? preferred[preferred.length - 1] : null;
+    if (approved.length > 0) {
+      return approved[approved.length - 1];
+    }
+    if (resumeActionId !== undefined) {
+      // CO14 follow-up: a release grant consumed by exactly the resuming
+      // action id is still the grant that authorizes this resolve, so the
+      // retry after a crash between consumption and write finds it again.
+      const resumable = matching.filter(
+        (candidate) =>
+          candidate.state === 'completed' &&
+          candidate.consumptions.length === 1 &&
+          candidate.consumptions[0].actionId === resumeActionId,
+      );
+      if (resumable.length > 0) {
+        return resumable[resumable.length - 1];
+      }
+    }
+    const awaiting = matching.filter((candidate) => candidate.state === 'awaiting-decision');
+    return awaiting.length > 0 ? awaiting[awaiting.length - 1] : null;
   }
 
   /**

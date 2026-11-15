@@ -21,6 +21,14 @@ export interface ResolveActionAuthorizationRequest {
    * recorded for one root never authorizes an operation on another.
    */
   readonly releaseRoot?: string;
+  /**
+   * The deterministic action id this resolve is resuming (CO14 follow-up). A
+   * release grant already durably consumed by exactly this action id resolves
+   * again idempotently, so a crash between the consumption and the release's
+   * write is recoverable: the retry resolves, observes the same consumption
+   * and completes. A different action id never resumes a consumed grant.
+   */
+  readonly resumeActionId?: string;
   readonly repository?: { readonly owner: string; readonly repo: string } | string;
   readonly pullRequestNumber?: number;
 }

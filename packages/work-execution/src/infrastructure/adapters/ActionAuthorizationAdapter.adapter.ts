@@ -41,6 +41,11 @@ export interface ActionAuthorizationGrantEntry {
   readonly schemaVersion?: 1 | 2;
   /** Attempt the grant is bound to; absent only on a legacy `1` grant. */
   readonly attemptId?: string;
+  /**
+   * The release root the grant is bound to (CO14 follow-up); only a release
+   * grant carries one. A resolve or consumption naming another root is refused.
+   */
+  readonly releaseRoot?: string;
   /** Head the grant applies to; a moved head is out of scope. */
   readonly expectedHeadSha: string;
   /** Action kind the grant was issued for. */
@@ -210,7 +215,14 @@ export function parseActionAuthorizationGrantEntry(raw: unknown): ParsedActionAu
   }
 }
 
-const GRANT_FIELD_KEYS = ['schemaVersion', 'attemptId', 'expectedHeadSha', 'kind', 'consumedByActionId'] as const;
+const GRANT_FIELD_KEYS = [
+  'schemaVersion',
+  'attemptId',
+  'releaseRoot',
+  'expectedHeadSha',
+  'kind',
+  'consumedByActionId',
+] as const;
 
 /**
  * One snapshot of the stored grant: each field's own descriptor is read exactly
@@ -263,6 +275,31 @@ function parseGrantUnchecked(source: unknown): ParsedActionAuthorizationGrantRea
   if (attempt.state === 'invalid') {
     return { ok: false, reason: 'malformed' };
   }
+  // CO14 follow-up: a release grant may carry the root it is bound to. A
+  // present-but-hostile root is a malformed record, never a root that matches
+  // everything.
+  const root = ownDataDescriptor(record, 'releaseRoot');
+  if (root.state === 'invalid') {
+    return { ok: false, reason: 'malformed' };
+  }
+  let releaseRoot: string | undefined;
+  if (root.state === 'data' && root.value !== undefined) {
+    if (typeof root.value !== 'string') {
+      return { ok: false, reason: 'malformed' };
+    }
+    const value = root.value;
+    if (
+      value.length === 0 ||
+      value.length > MAX_ROOT_LENGTH ||
+      !value.startsWith('/') ||
+      value.includes('\0') ||
+      /[\p{C}]/u.test(value) ||
+      value.split('/').includes('..')
+    ) {
+      return { ok: false, reason: 'malformed' };
+    }
+    releaseRoot = value;
+  }
   const attemptDeclared =
     schemaVersion === 2 || (attempt.state === 'data' && attempt.value !== undefined);
 
@@ -293,6 +330,7 @@ function parseGrantUnchecked(source: unknown): ParsedActionAuthorizationGrantRea
     grant: {
       schemaVersion,
       ...(attemptDeclared && attemptId !== undefined ? { attemptId } : {}),
+      ...(releaseRoot !== undefined ? { releaseRoot } : {}),
       expectedHeadSha,
       kind,
       consumedByActionId: consumed.value,
@@ -368,11 +406,16 @@ function readResolveRequest(request: unknown): Validated<ResolveActionAuthorizat
   if (!releaseRoot.ok) {
     return releaseRoot;
   }
+  // CO14 follow-up: the resolve carries the deterministic action id it is
+  // resuming, so a grant already durably consumed by exactly this action id
+  // resolves again and a crash between the consumption and the release's own
+  // write is recoverable on the next pass.
   return {
     ok: true,
     value: {
       ...value,
       ...(releaseRoot.value !== undefined ? { releaseRoot: releaseRoot.value } : {}),
+      resumeActionId: value.actionId,
     },
   };
 }
@@ -740,6 +783,8 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
     // Every record is read before any is matched: one unreadable or unknown-version
     // record fails the whole store closed instead of being skipped.
     let match: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry } | undefined;
+    let rootConflict = false;
+    let consumedByOther = false;
     for (const [rawGrantId, rawEntry] of grants) {
       if (!isSafeId(rawGrantId, MAX_GRANT_ID_LENGTH, true)) {
         return { outcome: 'blocked', reason: 'invalid-grant-record' };
@@ -752,30 +797,63 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         };
       }
       const grant = parsed.grant;
-      if (
-        match === undefined &&
-        grant.consumedByActionId === null &&
+      const structural =
         grant.kind === request.actionKind &&
         grant.expectedHeadSha === request.expectedHeadSha &&
-        (grant.attemptId === undefined || grant.attemptId === request.attemptId)
-      ) {
-        match = { id: rawGrantId, grant };
+        (grant.attemptId === undefined || grant.attemptId === request.attemptId);
+      if (!structural) {
+        continue;
       }
+      if (grant.releaseRoot !== undefined && grant.releaseRoot !== request.releaseRoot) {
+        // CO14 follow-up: a grant bound to one root never resolves for
+        // another; the mismatch is a typed refusal, never a silent skip.
+        rootConflict = true;
+        continue;
+      }
+      if (grant.consumedByActionId === null) {
+        match = { id: rawGrantId, grant };
+        continue;
+      }
+      // CO14 follow-up: a release grant already consumed by exactly this
+      // resolve's deterministic action id resolves again idempotently, so a
+      // crash between the consumption and the release's write is recoverable
+      // on the next pass. A different action id never resumes a consumed grant.
+      if (RELEASE_ACTION_KINDS.includes(grant.kind as never) && grant.consumedByActionId === request.actionId) {
+        match = { id: rawGrantId, grant };
+        continue;
+      }
+      consumedByOther = true;
     }
     if (match === undefined) {
-      return { outcome: 'blocked', reason: 'no-matching-grant' };
+      return {
+        outcome: 'blocked',
+        reason: !consumedByOther && rootConflict ? 'release-grant-root-mismatch' : 'no-matching-grant',
+      };
     }
-    if (match.grant.attemptId === undefined) {
-      // A legacy grant binds to the first attempt that resolves it.
+    if (match.grant.attemptId === undefined || (request.releaseRoot !== undefined && match.grant.releaseRoot === undefined)) {
+      // A legacy grant binds to the first attempt that resolves it, and a
+      // release grant without a recorded root binds to the first root that
+      // resolves it (CO14 follow-up); both bindings persist in place, so a
+      // bound grant can never be moved to another attempt or root afterwards.
+      const needsAttempt = match.grant.attemptId === undefined;
       grants.set(match.id, {
-        schemaVersion: ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION,
-        attemptId: request.attemptId,
+        schemaVersion: needsAttempt ? ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION : match.grant.schemaVersion,
+        attemptId: match.grant.attemptId ?? request.attemptId,
+        ...(request.releaseRoot !== undefined ? { releaseRoot: request.releaseRoot } : {}),
         expectedHeadSha: match.grant.expectedHeadSha,
         kind: match.grant.kind,
-        consumedByActionId: null,
+        consumedByActionId: match.grant.consumedByActionId,
       });
     }
-    return { outcome: 'granted', authorizationGrantId: match.id };
+    return {
+      outcome: 'granted',
+      authorizationGrantId: match.id,
+      ...(match.grant.releaseRoot !== undefined
+        ? { releaseRoot: match.grant.releaseRoot }
+        : request.releaseRoot !== undefined
+          ? { releaseRoot: request.releaseRoot }
+          : {}),
+    };
   }
 
   private consumeLocally(
@@ -822,12 +900,22 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
       }
     }
+    // CO14 follow-up: a grant bound to one release root is never consumed for
+    // another. A consumption that names a root this grant does not carry is a
+    // mismatch too: a root the grant never recorded cannot be verified here.
+    if (
+      request.releaseRoot !== undefined &&
+      (grant.releaseRoot === undefined || grant.releaseRoot !== request.releaseRoot)
+    ) {
+      return { outcome: 'refused', reason: 'release-grant-root-mismatch' };
+    }
     if (grant.consumedByActionId === null) {
       const boundAttemptId = grant.attemptId ?? request.attemptId;
       grants.set(request.authorizationGrantId, {
         // A record without an attempt stays a legacy `1` record: `2` requires `attemptId`.
         schemaVersion: boundAttemptId !== undefined ? ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION : 1,
         ...(boundAttemptId !== undefined ? { attemptId: boundAttemptId } : {}),
+        ...(grant.releaseRoot !== undefined ? { releaseRoot: grant.releaseRoot } : {}),
         expectedHeadSha: grant.expectedHeadSha,
         kind: grant.kind,
         consumedByActionId: request.actionId,

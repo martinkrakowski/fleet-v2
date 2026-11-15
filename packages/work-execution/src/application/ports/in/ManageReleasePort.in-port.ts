@@ -63,7 +63,8 @@ export interface ManageReleaseApplied {
   readonly outcome: 'applied';
   readonly action: ReleaseAction;
   readonly target: string;
-  readonly current: string;
+  /** The current link after the action: the new build for a swap or a rollback, the unmoved current for an install. */
+  readonly current: string | null;
   readonly kept: readonly string[];
   readonly pruned: readonly string[];
   /** `unreadable` means the retention cleanup did not complete; never a silent success. */

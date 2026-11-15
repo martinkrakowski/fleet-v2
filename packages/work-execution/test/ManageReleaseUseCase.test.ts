@@ -274,7 +274,14 @@ class FakeAuthorization implements ActionAuthorizationPort {
     ) {
       return { outcome: 'blocked', reason: 'no recorded decision authorizes this' };
     }
-    return { outcome: 'granted', authorizationGrantId: GRANT };
+    // The release grant is bound to the root it names: a grant resolved for
+    // one root never authorizes another, so the fake echoes the request's own
+    // root the way the real recorded grant path does.
+    return {
+      outcome: 'granted',
+      authorizationGrantId: GRANT,
+      ...(request.releaseRoot !== undefined ? { releaseRoot: request.releaseRoot } : {}),
+    };
   }
 
   async consumeActionAuthorization(
@@ -565,16 +572,20 @@ describe('ManageReleaseUseCase', () => {
     expect(executor.runs).toEqual([]);
     const lapsed = granted(INSTALL, A, { lease: LAPSED_LEASE });
     expect((await manage(lapsed.useCase, applyRequest())).outcome).toBe('applied');
-    expect(lapsed.lease.events).toEqual([`acquire ${LAPSED_LEASE.fence}`, `renew ${LAPSED_LEASE.fence + 1}`, `release ${LAPSED_LEASE.fence + 1}`]);
+    // Install stages a release and never repoints, so it takes no lease fence
+    // around a rename: nothing is acquired, renewed or released.
+    expect(lapsed.lease.events).toEqual([]);
   });
 
-  it('refuses driver-lease-live when a driver starts during the build and repoints nothing', async () => {
+  it('a driver that starts during an install build does not block the staged install', async () => {
     const lease = new FakeLease(null);
     lease.reads = [null, LIVE_LEASE];
-    const { useCase, store, executor } = granted(INSTALL, A, { lease });
-    expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
+    const { useCase, executor, store } = granted(INSTALL, A, { lease });
+    const result = await manage(useCase, applyRequest());
+    // The live lease appears only after the run-start read, and install stages
+    // a build without repointing, so nothing is fenced and nothing is refused.
+    expect(result).toMatchObject({ outcome: 'applied', target: A, current: null, rebuilt: true });
     expect(executor.runs).toHaveLength(4);
-    expect(store.calls).not.toContain(`repoint ${A}`);
     expect(store.current).toBeNull();
     expect(lease.events).toEqual([]);
   });
@@ -781,20 +792,22 @@ describe('ManageReleaseUseCase', () => {
     expect(install.executor.runs).toEqual([]);
   });
 
-  it('install builds, verifies and repoints current', async () => {
+  it('install builds and verifies the target and leaves current unmoved', async () => {
     const { useCase, store, executor } = granted(INSTALL, A);
     const result = await manage(useCase, applyRequest());
     expect(result).toEqual({
       outcome: 'applied',
       action: 'install',
       target: A,
-      current: A,
+      // CO14 follow-up: install stages a release; only a swap or a rollback
+      // serves it, so `current` is left where it was and nothing is pruned.
+      current: null,
       kept: [A],
       pruned: [],
       pruneOutcome: 'pruned',
       rebuilt: true,
     });
-    expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `repoint ${A}`, 'prune 5']);
+    expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`]);
     const staging = `${ROOT}/.staging-${store.preparedIds[0]}`;
     expect(executor.runs.map((run) => run.argv)).toEqual([
       [
@@ -822,21 +835,21 @@ describe('ManageReleaseUseCase', () => {
     expect(executor.runs[2].options?.cwd).toBe(staging);
   });
 
-  it('install of an already built sha does not build twice', async () => {
+  it('install of an already built sha does not build twice and leaves current where it is', async () => {
     const { useCase, store, executor } = granted(INSTALL, A, { store: new FakeStore([build('a', 1), build('b', 2)], B) });
     const result = await manage(useCase, applyRequest({ sha: A }));
-    expect(result).toMatchObject({ outcome: 'applied', target: A, current: A, rebuilt: false });
+    expect(result).toMatchObject({ outcome: 'applied', target: A, current: B, rebuilt: false });
     expect(executor.runs).toEqual([]);
-    expect(store.calls).toEqual([`repoint ${A}`, 'prune 5']);
+    expect(store.calls).toEqual([]);
     expect(store.builds.filter((entry) => entry.sha === A)).toHaveLength(1);
   });
 
-  it('completes a crash between the build and the repoint on the next install', async () => {
+  it('completes a crash between the build and the consumption on the next install', async () => {
     const store = new FakeStore([build('a', 1)], null);
     const { useCase, executor } = granted(INSTALL, A, { store });
     const result = await manage(useCase, applyRequest({ sha: A }));
-    expect(result).toMatchObject({ outcome: 'applied', current: A, rebuilt: false });
-    expect(store.current).toBe(A);
+    expect(result).toMatchObject({ outcome: 'applied', current: null, rebuilt: false });
+    expect(store.current).toBeNull();
     expect(executor.runs).toEqual([]);
   });
 
@@ -883,9 +896,11 @@ describe('ManageReleaseUseCase', () => {
     const fresh = granted(INSTALL, F, { store: new FakeStore(builds, E) });
     expect(await manage(fresh.useCase, applyRequest({ sha: F, keep: 2 }))).toMatchObject({
       outcome: 'applied',
-      current: F,
-      kept: [E, F],
-      pruned: [A, B, C, D],
+      // Install stages the new build and leaves `current` and the kept builds
+      // exactly where they were; only a swap or a rollback prunes.
+      current: E,
+      kept: [A, B, C, D, E, F],
+      pruned: [],
     });
   });
 

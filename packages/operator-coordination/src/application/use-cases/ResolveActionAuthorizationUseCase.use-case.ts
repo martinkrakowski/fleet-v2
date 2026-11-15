@@ -14,7 +14,7 @@
  */
 
 import { isPolicyGrantRecord } from '../../domain/policy-grants.js';
-import { GRANT_RECORD_VERSION, isReleaseActionScope } from '../../domain/coordination-records.js';
+import { GRANT_RECORD_VERSION, isReleaseActionScope, isReleaseRootCoordinate } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type {
@@ -107,6 +107,14 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         }, not ${request.actionScope.trim()} at ${request.expectedHeadSha.trim()}`,
       );
     }
+    // CO14 follow-up: a release grant bound to one root authorizes only an
+    // operation on that root. An invalid coordinate on either side fails
+    // closed as a mismatch, never as a match.
+    const recordedRoot = isReleaseRootCoordinate(refreshed.releaseRoot) ? refreshed.releaseRoot : undefined;
+    const requestedRoot = isReleaseRootCoordinate(request.releaseRoot) ? request.releaseRoot : undefined;
+    if (recordedRoot !== requestedRoot) {
+      return blocked('release-grant-root-mismatch');
+    }
     const mergeGrant = candidate.getMergeGrant();
     if (mergeGrant !== null) {
       const targetRepo = this.resolveTargetRepository(request);
@@ -136,6 +144,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       requestId: candidate.getId(),
       expectedHeadSha: request.expectedHeadSha.trim(),
       policyRevision: candidate.getPolicyRevision(),
+      ...(recordedRoot !== undefined ? { releaseRoot: recordedRoot } : {}),
     };
   }
 

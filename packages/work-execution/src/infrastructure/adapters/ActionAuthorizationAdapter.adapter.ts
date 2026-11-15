@@ -27,6 +27,7 @@ import type {
   ResolveActionAuthorizationResult,
 } from '../../application/ports/out/ActionAuthorizationPort.out-port.js';
 import { readRecordSchemaVersion } from '../../domain/record-schema-version.js';
+import { RELEASE_ACTION_KINDS } from '../../domain/coordination-keys.js';
 
 /** The stored grant record version this adapter writes; `1` (or absent) is still read. */
 export const ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION = 2 as const;
@@ -77,6 +78,13 @@ export interface ActionAuthorizationDelegate {
 }
 
 const FORGE_ACTION_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status'] as const;
+/**
+ * Every action kind a request at this boundary may name (CO14): the forge
+ * kinds and the three release kinds. A release grant is resolved and consumed
+ * through the same port as a forge grant; the scope gate that keeps the two
+ * apart lives in the release delegate, not here.
+ */
+const ACTION_KINDS = [...FORGE_ACTION_KINDS, ...RELEASE_ACTION_KINDS] as const;
 
 const MAX_GRANT_ID_LENGTH = 256;
 const MAX_ACTION_ID_LENGTH = 512;
@@ -84,6 +92,7 @@ const MAX_SCOPE_ID_LENGTH = 256;
 const MAX_HEAD_LENGTH = 64;
 const MAX_POLICY_REVISION_LENGTH = 256;
 const MAX_REASON_LENGTH = 300;
+const MAX_ROOT_LENGTH = 4096;
 
 const PATH_SHAPE = /(?:^|[\s"'(=])(?:\/[A-Za-z0-9._-]+){2,}|[A-Za-z]:\\/;
 const SAFE_HEAD_TOKEN = /^[A-Za-z0-9._-]+$/;
@@ -259,7 +268,7 @@ function parseGrantUnchecked(source: unknown): ParsedActionAuthorizationGrantRea
 
   const read = readPlainRecord(record, {
     schemaVersion: { kind: 'integer', min: 1, max: 2, optional: true },
-    kind: { kind: 'literal', values: FORGE_ACTION_KINDS },
+    kind: { kind: 'literal', values: ACTION_KINDS },
     expectedHeadSha: { kind: 'string', maxLength: MAX_HEAD_LENGTH },
     ...(attemptDeclared ? { attemptId: { kind: 'string' as const, maxLength: MAX_SCOPE_ID_LENGTH } } : {}),
   });
@@ -301,13 +310,43 @@ function failureOf(reason: string): RequestFailure {
   return reason === 'too-long' ? 'too-large' : 'invalid-request';
 }
 
+/**
+ * A bounded release root coordinate (CO14 follow-up): an absolute path-shaped
+ * runtime input, read descriptor-safely. It is validated here so a
+ * wrong-typed, oversized or hostile root is a typed refusal, never a thrown
+ * error and never an empty root that matches anything. A root is a path by
+ * design, so the path-shape output rule does not apply to it; it is never
+ * echoed into a result, message or log.
+ */
+function readOptionalRootPath(source: object, key: string): Validated<string | undefined> {
+  const field = ownDataDescriptor(source, key);
+  if (field.state === 'absent' || (field.state === 'data' && field.value === undefined)) {
+    return { ok: true, value: undefined };
+  }
+  if (field.state === 'invalid' || typeof field.value !== 'string') {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  const value = field.value;
+  if (
+    value.length === 0 ||
+    value.length > MAX_ROOT_LENGTH ||
+    !value.startsWith('/') ||
+    value.includes('\0') ||
+    /[\p{C}]/u.test(value) ||
+    value.split('/').includes('..')
+  ) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  return { ok: true, value };
+}
+
 function readResolveRequest(request: unknown): Validated<ResolveActionAuthorizationRequest> {
   const read = readPlainRecord(request, {
     actionId: { kind: 'string', maxLength: MAX_ACTION_ID_LENGTH },
     projectId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
     workOrderId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
     attemptId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
-    actionKind: { kind: 'literal', values: FORGE_ACTION_KINDS },
+    actionKind: { kind: 'literal', values: ACTION_KINDS },
     expectedHeadSha: { kind: 'string', maxLength: MAX_HEAD_LENGTH },
     policyRevision: { kind: 'string', maxLength: MAX_POLICY_REVISION_LENGTH },
   });
@@ -325,7 +364,17 @@ function readResolveRequest(request: unknown): Validated<ResolveActionAuthorizat
   ) {
     return { ok: false, reason: 'invalid-request' };
   }
-  return { ok: true, value: { ...value } };
+  const releaseRoot = readOptionalRootPath(request as object, 'releaseRoot');
+  if (!releaseRoot.ok) {
+    return releaseRoot;
+  }
+  return {
+    ok: true,
+    value: {
+      ...value,
+      ...(releaseRoot.value !== undefined ? { releaseRoot: releaseRoot.value } : {}),
+    },
+  };
 }
 
 function readOptionalRequestString(
@@ -354,7 +403,7 @@ function readConsumeRequest(request: unknown): Validated<ConsumeActionAuthorizat
   const read = readPlainRecord(request, {
     authorizationGrantId: { kind: 'string', maxLength: MAX_GRANT_ID_LENGTH },
     actionId: { kind: 'string', maxLength: MAX_ACTION_ID_LENGTH },
-    actionKind: { kind: 'literal', values: FORGE_ACTION_KINDS },
+    actionKind: { kind: 'literal', values: ACTION_KINDS },
   });
   if (!read.ok) {
     return { ok: false, reason: failureOf(read.reason) };
@@ -378,6 +427,10 @@ function readConsumeRequest(request: unknown): Validated<ConsumeActionAuthorizat
   if (!attemptId.ok) {
     return attemptId;
   }
+  const releaseRoot = readOptionalRootPath(source, 'releaseRoot');
+  if (!releaseRoot.ok) {
+    return releaseRoot;
+  }
   return {
     ok: true,
     value: {
@@ -386,6 +439,7 @@ function readConsumeRequest(request: unknown): Validated<ConsumeActionAuthorizat
       actionKind: required.actionKind,
       ...(expectedHeadSha.value !== undefined ? { expectedHeadSha: expectedHeadSha.value } : {}),
       ...(attemptId.value !== undefined ? { attemptId: attemptId.value } : {}),
+      ...(releaseRoot.value !== undefined ? { releaseRoot: releaseRoot.value } : {}),
     },
   };
 }
@@ -486,7 +540,17 @@ function readDelegateResolveResult(
     if (!granted.ok || !isSafeId(granted.value.authorizationGrantId, MAX_GRANT_ID_LENGTH, true)) {
       return null;
     }
-    return { outcome: 'granted', authorizationGrantId: granted.value.authorizationGrantId as string };
+    // A release grant's root binding travels with the granted answer; an
+    // invalid one makes the whole answer unreadable.
+    const root = readOptionalRootPath(answer as object, 'releaseRoot');
+    if (!root.ok) {
+      return null;
+    }
+    return {
+      outcome: 'granted',
+      authorizationGrantId: granted.value.authorizationGrantId as string,
+      ...(root.value !== undefined ? { releaseRoot: root.value } : {}),
+    };
   }
   const withReason = readPlainRecord(answer, {
     reason: { kind: 'string', maxLength: MAX_REASON_LENGTH },

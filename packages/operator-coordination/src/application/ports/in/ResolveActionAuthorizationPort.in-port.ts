@@ -16,6 +16,11 @@ export interface ResolveActionAuthorizationRequest {
    * owner grant that records none is bound to it by this resolve.
    */
   readonly attemptId?: string;
+  /**
+   * The release root the action names (CO14 follow-up). A release grant
+   * recorded for one root never authorizes an operation on another.
+   */
+  readonly releaseRoot?: string;
   readonly repository?: { readonly owner: string; readonly repo: string } | string;
   readonly pullRequestNumber?: number;
 }
@@ -27,6 +32,8 @@ export type ResolveActionAuthorizationResult =
       readonly requestId: string;
       readonly expectedHeadSha: string;
       readonly policyRevision: string;
+      /** The root the granted release grant is bound to; absent on every other grant. */
+      readonly releaseRoot?: string;
     }
   | {
       readonly outcome: 'blocked';

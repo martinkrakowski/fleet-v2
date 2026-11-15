@@ -23,6 +23,7 @@ import { randomBytes } from 'node:crypto';
 
 import type {
   ReleaseBuildRecord,
+  ReleaseOrphanCurrentTempsResult,
   ReleaseStoreListing,
   ReleaseStorePort,
   ReleaseStagingResult,
@@ -43,6 +44,8 @@ const MARKER_NAME = '.fleet-release-verified';
 const CLI_ENTRY = ['apps', 'cli', 'dist', 'bin.js'];
 const MARKER_MAX_BYTES = 4096;
 const CURRENT_NAME = 'current';
+/** The temp link name an interrupted repoint can leave behind (CO14 follow-up). */
+const CURRENT_TEMP_PATTERN = /^\.current\..+\.tmp$/;
 
 type CurrentRead = { readonly ok: true; readonly sha: string | null } | { readonly ok: false };
 type BuildsRead = { readonly ok: true; readonly builds: readonly ReleaseBuildRecord[] } | { readonly ok: false };
@@ -194,6 +197,37 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       return { outcome: 'unreadable' };
     }
   }
+
+  async removeOrphanCurrentTemps(input: {
+    readonly root: string;
+  }): Promise<ReleaseOrphanCurrentTempsResult> {
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(input.root, { withFileTypes: true });
+    } catch {
+      return { outcome: 'unknown' };
+    }
+    let removed = 0;
+    let findings = 0;
+    for (const entry of entries) {
+      if (!CURRENT_TEMP_PATTERN.test(entry.name)) {
+        continue;
+      }
+      // A temp-named directory or file is a finding: it is reported, never removed.
+      if (!entry.isSymbolicLink()) {
+        findings += 1;
+        continue;
+      }
+      // One removal after another; a failing removal is an unknown root.
+      try {
+        await fs.rm(path.join(input.root, entry.name), { force: true });
+        removed += 1;
+      } catch {
+        return { outcome: 'unknown' };
+      }
+    }
+    return { outcome: 'cleaned', removed, findings };
+  }
 }
 
 async function passesFence(fence: () => Promise<boolean>): Promise<boolean> {
@@ -286,9 +320,11 @@ async function removeOrphans(root: string): Promise<boolean> {
   try {
     const entries = await fs.readdir(root, { withFileTypes: true });
     const dirs = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
-    // One delete after another, stopping at the first failure.
+    // One delete after another, stopping at the first failure. An orphaned
+    // `.current.<...>.tmp` link an interrupted repoint left is removed too;
+    // a temp-named entry that is not a link is left in place, never removed.
     await entries
-      .filter((entry) => isOrphan(entry, dirs))
+      .filter((entry) => isOrphan(entry, dirs) || (entry.isSymbolicLink() && CURRENT_TEMP_PATTERN.test(entry.name)))
       .reduce(
         (previous, entry) =>
           previous.then(() => fs.rm(path.join(root, entry.name), { recursive: true, force: true })),

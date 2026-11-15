@@ -37,6 +37,8 @@ export type ManageReleaseRefusal =
   | 'authority-required'
   | 'authority-refused'
   | 'authority-unknown'
+  | /** The grant is bound to another release root than the one this release names. */ 'release-grant-root-mismatch'
+  | /** The root's driver state directory cannot be determined (CLI binding). */ 'release-root-state-dir-unknown'
   | 'current-moved'
   | 'driver-lease-live'
   | 'lease-unknown'

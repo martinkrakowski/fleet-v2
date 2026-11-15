@@ -14,6 +14,7 @@
 
 import {
   ActionAuthorizationAdapter,
+  ConductorDriverLeaseAdapter,
   LocalExecutor,
   ManageReleaseUseCase,
   ReleaseStoreAdapter,
@@ -69,9 +70,16 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
         // its `release:<action>` scope and exact head and consumed once — so the
         // attempt coordinate is passed through only when the caller carries one.
         attemptId: request.attemptId,
+        // CO14 follow-up: the release root travels with the grant coordinates,
+        // so a grant for one root cannot authorize another.
+        releaseRoot: request.releaseRoot,
       });
       return result.outcome === 'authorized'
-        ? { outcome: 'granted', authorizationGrantId: result.grantId }
+        ? {
+            outcome: 'granted',
+            authorizationGrantId: result.grantId,
+            ...(result.releaseRoot !== undefined ? { releaseRoot: result.releaseRoot } : {}),
+          }
         : { outcome: 'blocked', reason: result.reason };
     },
     consumeGrant: async (request) => {
@@ -86,6 +94,7 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
         actionScope,
         attemptId: request.attemptId ?? request.actionId,
         expectedHeadSha: request.expectedHeadSha,
+        releaseRoot: request.releaseRoot,
       });
       return result.outcome === 'consumed'
         ? { outcome: 'consumed', actionId: request.actionId }
@@ -99,10 +108,23 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     if (Object.hasOwn(payload, 'action')) {
       throw new CliUsageError('Unknown release option: --action');
     }
+    // CO14 follow-up: the release reads the lease of the state directory of
+    // the driver that serves this root — the one the installation records —
+    // never the process-wide one, so a release under another state directory
+    // cannot miss a live lease. A root whose driver state directory cannot be
+    // determined is refused before anything is read, built or written.
+    const root = payload['root'];
+    if (typeof root !== 'string') {
+      throw new CliUsageError("release requires --root <absolute path without '..'>");
+    }
+    const stateDir = resolveRootStateDir(root, rt.installation as ReleaseDriverConfiguration | undefined);
+    if (stateDir === null) {
+      return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+    }
     return manageReleaseFromPayload(
       { ...payload, action },
       {
-        lease: rt.conductor.driverLease,
+        lease: new ConductorDriverLeaseAdapter({ stateDir }),
         authorization: releaseAuthorization(rt),
         executor: new LocalExecutor(),
         nowIso: () => new Date().toISOString(),
@@ -110,6 +132,40 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
       },
     );
   };
+}
+
+export interface ReleaseDriverConfiguration {
+  /** The installation's daemon section, whose `stateDir` names the driver state directory. */
+  readonly daemon?: { readonly stateDir?: string };
+}
+
+/**
+ * CO14 follow-up: the pure binding of a release root to the state directory
+ * of the driver that serves it. The state directory comes from the
+ * installation configuration the runtime composed with (`daemon.stateDir`);
+ * a missing, non-absolute or blank one cannot be determined, and the caller
+ * refuses with `release-root-state-dir-unknown`. No filesystem or environment
+ * access of its own.
+ */
+export function resolveRootStateDir(
+  root: string,
+  configuration: ReleaseDriverConfiguration | undefined,
+): string | null {
+  if (typeof root !== 'string' || root === '') {
+    return null;
+  }
+  try {
+    const daemon = configuration?.daemon;
+    if (typeof daemon !== 'object' || daemon === null) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(daemon, 'stateDir');
+    const value = descriptor !== undefined && !descriptor.get && !descriptor.set ? descriptor.value : undefined;
+    return typeof value === 'string' && value.startsWith('/') && value.trim() !== '' ? value : null;
+  } catch {
+    // A hostile configuration never resolves to a state directory.
+    return null;
+  }
 }
 
 export const releaseCommands: Readonly<Record<string, CommandHandler>> = {

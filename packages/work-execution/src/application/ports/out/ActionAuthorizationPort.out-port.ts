@@ -16,10 +16,19 @@ export interface ResolveActionAuthorizationRequest {
   readonly actionKind: AuthorizedActionKind;
   readonly expectedHeadSha: string;
   readonly policyRevision: string;
+  /**
+   * The release root the action names (CO14 follow-up). A release grant bound
+   * to one root never authorizes an operation on another root.
+   */
+  readonly releaseRoot?: string;
 }
 
 export type ResolveActionAuthorizationResult =
-  | { readonly outcome: 'granted'; readonly authorizationGrantId: string }
+  | {
+      readonly outcome: 'granted'; readonly authorizationGrantId: string;
+      /** The root the granted release grant is bound to; absent on every other grant. */
+      readonly releaseRoot?: string;
+    }
   | { readonly outcome: 'blocked'; readonly reason: string }
   | { readonly outcome: 'unknown'; readonly reason: string };
 
@@ -38,6 +47,11 @@ export interface ConsumeActionAuthorizationRequest {
    * reason: the recorded coordinates scope the consumption.
    */
   readonly attemptId?: string;
+  /**
+   * The release root the consumption names (CO14 follow-up); compared with the
+   * root the grant was bound to at resolve time.
+   */
+  readonly releaseRoot?: string;
 }
 
 export type ConsumeActionAuthorizationResult =

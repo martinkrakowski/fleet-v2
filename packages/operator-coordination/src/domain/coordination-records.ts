@@ -185,6 +185,22 @@ export function isReleaseActionScope(actionScope: string): boolean {
   return (RELEASE_ACTION_SCOPES as readonly string[]).includes(actionScope);
 }
 
+/**
+ * The release root a release grant (CO14, follow-up) is bound to. A grant
+ * recorded for root R authorizes only an operation on root R. Pure: bounded
+ * absolute path text with no control character and no `..` segment; anything
+ * else is not a root coordinate.
+ */
+export function isReleaseRootCoordinate(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4096) {
+    return false;
+  }
+  if (!value.startsWith('/') || /[\p{C}]/u.test(value)) {
+    return false;
+  }
+  return !value.split('/').includes('..');
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;
@@ -216,6 +232,12 @@ export interface CoordinationRequestRecord {
    * without it authorizes nothing at consumption.
    */
   readonly grantAttemptId?: string;
+  /**
+   * The release root the grant is bound to (CO14 follow-up); only a release
+   * grant carries one. A resolve or consumption naming another root is
+   * refused, so a grant for one root never authorizes another.
+   */
+  readonly releaseRoot?: string;
 }
 
 /** Bounded attention and staleness summary; reading it rewrites nothing. */

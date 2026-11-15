@@ -7,6 +7,9 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import type {
   ActionAuthorizationPort,
@@ -111,7 +114,22 @@ describe('release command', () => {
   });
 
   it('the registered release group refuses apply on a runtime with no recorded grant', async () => {
-    const rt = createFleetCliRuntime();
+    const stateDir = await mkdtemp(join(tmpdir(), 'co14-cli-release-'));
+    const rt = createFleetCliRuntime({
+      stateDir,
+      installation: {
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {},
+        daemon: {
+          nodePath: '/usr/bin/node',
+          cliPath: '/usr/bin/fleet-v2',
+          stateDir,
+          unitDir: join(stateDir, 'units'),
+          installationFile: join(stateDir, 'fleet.json'),
+        },
+      } as never,
+    });
     const out: string[] = [];
     const err: string[] = [];
     const code = await runCli(

@@ -92,4 +92,24 @@ export interface ReleaseStorePort {
   }): Promise<ReleaseStorePruneResult>;
   /** Remove an incomplete build: this run's staging directory, its archive and its home. */
   discard(input: { readonly root: string; readonly buildId: string }): Promise<ReleaseStoreWriteResult>;
+  /**
+   * CO14 follow-up: remove the orphaned `.current.<...>.tmp` links an
+   * interrupted repoint can leave in <root>. Only entries that are links whose
+   * name matches that temp pattern are removed — never the `current` link
+   * itself, never a build directory, never an entry that is not a link (that
+   * entry is reported as a finding). Idempotent: a second pass over a clean
+   * root removes nothing. An unreadable root is `unknown`, never an empty
+   * result.
+   */
+  removeOrphanCurrentTemps(input: { readonly root: string }): Promise<ReleaseOrphanCurrentTempsResult>;
 }
+
+export type ReleaseOrphanCurrentTempsResult =
+  | {
+      readonly outcome: 'cleaned';
+      /** How many orphan temp links were removed. */
+      readonly removed: number;
+      /** How many temp-named entries were found that are not links (reported, never removed). */
+      readonly findings: number;
+    }
+  | { readonly outcome: 'unknown' };

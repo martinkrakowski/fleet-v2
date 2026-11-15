@@ -15,7 +15,7 @@ import type {
 } from '../../domain/coordination-records.js';
 import { AuthorizationConsumption } from '../../domain/entities/AuthorizationConsumption.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
-import { isReleaseActionScope } from '../../domain/coordination-records.js';
+import { isReleaseActionScope, isReleaseRootCoordinate } from '../../domain/coordination-records.js';
 import type {
   RecordAuthorizationConsumptionPort,
   RecordAuthorizationConsumptionRequest,
@@ -104,6 +104,14 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
       return refused(
         `grant ${grantId} was recorded for commit ${recorded.expectedHeadSha ?? 'none'}, not ${request.expectedHeadSha.trim()}`,
       );
+    }
+    // CO14 follow-up: a grant bound to one release root is never consumed for
+    // another. An invalid coordinate on either side fails closed as a
+    // mismatch, never as a match.
+    const recordedRoot = isReleaseRootCoordinate(recorded.releaseRoot) ? recorded.releaseRoot : undefined;
+    const requestedRoot = isReleaseRootCoordinate(request.releaseRoot) ? request.releaseRoot : undefined;
+    if (recordedRoot !== requestedRoot) {
+      return refused('release-grant-root-mismatch');
     }
     // A grant that records an attempt, owner or policy, authorizes no other
     // (CO24e). A version-2 record without one authorizes nothing. A legacy grant

@@ -18,6 +18,8 @@ import {
   KIND_PROMPT_TOOLS_ONLY,
   MAX_FINDING_LINE_LENGTH,
   MAX_OCM_EMBEDDED_DIFF_BYTES,
+  MAX_OCM_PROMPT_BYTES,
+  PROMPT_TOO_LARGE_REASON,
   MAX_PARSED_FINDINGS,
   type OcmReviewTransportSpawn,
   type OcmReviewTransportSpawnResult,
@@ -2324,6 +2326,37 @@ describe('OcmReviewTransport', () => {
 
       expect(result.result).toBe('unknown');
       expect(result.rawOutput).toBe('diff-truncated');
+      expect(spawnCalls).toBe(1);
+    });
+
+    it('a prompt over MAX_OCM_PROMPT_BYTES is refused with prompt-too-large and never spawns the review', async () => {
+      let spawnCalls = 0;
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async () => {
+          spawnCalls += 1;
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+        baseCommit: 'base-sha-1',
+        // The diff stays under the embedding cap; the brief pushes the whole
+        // prompt (instructions + brief + diff) over the prompt cap.
+        readDiff: async () => 'x'.repeat(MAX_OCM_EMBEDDED_DIFF_BYTES - 100),
+        makeNonce: () => nonce,
+      });
+      const oversizedBrief = { ...kindRequest, briefText: 'b'.repeat(10_000) };
+      expect(Buffer.byteLength(buildReviewPrompt(oversizedBrief, nonce, 'x'.repeat(MAX_OCM_EMBEDDED_DIFF_BYTES - 100)), 'utf8')).toBeGreaterThan(MAX_OCM_PROMPT_BYTES);
+
+      const result = await transport(oversizedBrief);
+
+      expect(result.result).toBe('unknown');
+      expect(result.rawOutput).toBe(PROMPT_TOO_LARGE_REASON);
+      expect(result.findings).toEqual([]);
+      // Only the idle `--wait` ran; the review itself never spawned.
       expect(spawnCalls).toBe(1);
     });
 

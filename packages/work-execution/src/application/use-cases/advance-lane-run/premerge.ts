@@ -16,8 +16,23 @@ import type { ExecuteAuthorizedForgeActionResult, ExecuteAuthorizedForgeActionRe
 import type { ConductorForgeGrantResult } from '../../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ReviewReceiptOfKind } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { WorkOrderRecord } from '../../../domain/execution-records.js';
-import { laneRunMergeHold } from '../../../domain/lane-run-transitions.js';
-import type { LaneRunMergeHold } from '../../../domain/lane-run-transitions.js';
+import {
+  DEFAULT_PREMERGE_MODE,
+  effectivePremergeHold,
+  type LaneRunMergeHold,
+  laneRunMergeHold,
+  normalizePremergeMode,
+  PREMERGE_MODES,
+  type PremergeMode,
+} from '../../../domain/lane-run-transitions.js';
+
+export {
+  DEFAULT_PREMERGE_MODE,
+  effectivePremergeHold,
+  normalizePremergeMode,
+  PREMERGE_MODES,
+  type PremergeMode,
+};
 import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import { buildLaneRunStepKey, parseLaneRunKey, LANE_RUN_MAX_RETRY } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -286,11 +301,11 @@ export async function performPremerge(
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
   const read = await premergeVerdictOf(ctx, latest, headSha);
-  const hold = laneRunMergeHold(record.tier, read.verdict, record.round);
+  const rawHold = laneRunMergeHold(record.tier, read.verdict, record.round);
   if (
-    hold.kind === 'park' ||
+    rawHold.kind === 'park' ||
     read.verdict !== gathered.facts.preMerge ||
-    (hold.kind === 'fail' && (read.receipt === null || read.receipt.findings.length > 999))
+    (rawHold.kind === 'fail' && (read.receipt === null || read.receipt.findings.length > 999))
   ) {
     // Nothing is posted: an ambiguous result under a fresh intent (the next
     // tick parks); never a forge call.
@@ -301,6 +316,10 @@ export async function performPremerge(
     }
     return appendPremergeResult(ctx, request, decision, 'ambiguous', 'review-unknown');
   }
+  // AP1: the mode gate applies after the ambiguity checks, so a corrupt or
+  // ambiguous receipt still parks in both modes; only a released Tier 2 hold
+  // downgrades to `wait` under `human-gate`.
+  const hold = effectivePremergeHold(rawHold, record.tier, ctx.deps.premergeMode);
   const receiptId = await premergeAuthorisationReceiptIdOf(ctx, latest, record, headSha, hold, read.receipt);
   if (receiptId === null) {
     return refuseKeyedPremerge(ctx, request, decision, 'grant-refused');
@@ -467,12 +486,15 @@ export async function reconcilePremerge(
   if (parsed === null || parsed.kind !== 'premerge' || parsed.head12 !== gathered.facts.head12) {
     return appendPremergeResult(ctx, request, decision, 'overtaken', 'premerge-overtaken');
   }
-  const hold = laneRunMergeHold(record.tier, gathered.facts.preMerge, record.round);
-  if (hold.kind === 'wait') {
-    return { outcome: 'waiting', reason: 'premerge-pending' };
-  }
-  if (hold.kind === 'park') {
+  const rawFactHold = laneRunMergeHold(record.tier, gathered.facts.preMerge, record.round);
+  if (rawFactHold.kind === 'park') {
     return appendPremergeResult(ctx, request, decision, 'ambiguous', 'review-unknown');
+  }
+  // AP1: the mode gate applies on the gathered fact hold too, so a pending
+  // intent under a released fact stays `premerge-pending` under `human-gate`.
+  const factHold = effectivePremergeHold(rawFactHold, record.tier, ctx.deps.premergeMode);
+  if (factHold.kind === 'wait') {
+    return { outcome: 'waiting', reason: 'premerge-pending' };
   }
   if (
     ctx.deps.conductorForgeGrant === undefined ||
@@ -497,8 +519,18 @@ export async function reconcilePremerge(
   if (read.verdict !== gathered.facts.preMerge) {
     return appendPremergeResult(ctx, request, decision, 'ambiguous', 'review-unknown');
   }
-  if (hold.kind === 'fail' && (read.receipt === null || read.receipt.findings.length > 999)) {
+  const rawHold = laneRunMergeHold(record.tier, read.verdict, record.round);
+  if (rawHold.kind === 'park') {
     return appendPremergeResult(ctx, request, decision, 'ambiguous', 'review-unknown');
+  }
+  if (rawHold.kind === 'fail' && (read.receipt === null || read.receipt.findings.length > 999)) {
+    return appendPremergeResult(ctx, request, decision, 'ambiguous', 'review-unknown');
+  }
+  // AP1: the re-read hold is gated the same way as the fact hold; a released
+  // Tier 2 hold under `human-gate` keeps waiting with no grant and no post.
+  const hold = effectivePremergeHold(rawHold, record.tier, ctx.deps.premergeMode);
+  if (hold.kind === 'wait') {
+    return { outcome: 'waiting', reason: 'premerge-pending' };
   }
   let workOrder: WorkOrderRecord | null;
   try {

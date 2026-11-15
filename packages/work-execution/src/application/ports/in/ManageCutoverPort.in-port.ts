@@ -103,8 +103,7 @@ export type ManageCutoverRefusalReason =
   | 'shadow-evidence-absent'
   | 'shadow-criteria-failed'
   | 'unrecorded-lanes'
-  | 'inside-rollback-window'
-  | 'retire-grant-absent';
+  | 'inside-rollback-window';
 
 export type ManageCutoverUnknownReason =
   | 'deadline-exceeded'
@@ -120,8 +119,7 @@ export type ManageCutoverUnknownReason =
   | 'cutover-record-write-failed'
   | 'shadow-evidence-unreadable'
   | 'shadow-evidence-unknown-version'
-  | 'unrecorded-lanes-unknown'
-  | 'retire-grant-unreadable';
+  | 'unrecorded-lanes-unknown';
 
 export type ManageCutoverResult =
   | ManageCutoverStatusResult

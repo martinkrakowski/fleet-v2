@@ -239,7 +239,6 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     computeDigest: sha256HexDigest,
     mintEntryId: () => ulid((sequence += 1)),
     nowIso: () => clock.now,
-    readRetireGrant: async () => ({ status: 'granted' }),
   };
   const spies = {
     daemonPauseWrite: vi.spyOn(daemonPause, 'write'),
@@ -313,7 +312,6 @@ function shadowEvidence(nowIso: string, verdictOverrides: Record<string, string>
 }
 
 type ShadowEvidenceReader = NonNullable<ManageCutoverDependencies['readShadowEvidence']>;
-type RetireGrantReader = NonNullable<ManageCutoverDependencies['readRetireGrant']>;
 type UnrecordedLanesCounter = NonNullable<ManageCutoverDependencies['countUnrecordedLanes']>;
 
 function readers(overrides: { readShadowEvidence?: ShadowEvidenceReader; countUnrecordedLanes?: UnrecordedLanesCounter } = {}): {
@@ -886,37 +884,6 @@ describe('ManageCutoverUseCase retire', () => {
       reason: 'invalid-clock',
     });
     expect(totalWriteCalls(h)).toBe(0);
-  });
-
-  it('retire refuses without the owner\'s recorded grant and answers unknown for an unreadable one', async () => {
-    for (const [status, expected] of [
-      ['absent', { outcome: 'refused', reason: 'retire-grant-absent' }],
-      ['unreadable', { outcome: 'unknown', reason: 'retire-grant-unreadable' }],
-      ['threw', { outcome: 'unknown', reason: 'retire-grant-unreadable' }],
-    ] as const) {
-      const h = await harness();
-      const reader: RetireGrantReader =
-        status === 'threw'
-          ? async () => {
-              throw new Error('boom');
-            }
-          : (async () => ({ status })) as RetireGrantReader;
-      const useCase = new ManageCutoverUseCase({ ...h.deps, readRetireGrant: reader });
-      resetSpies(h);
-      expect(await useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual(expected);
-      expect(totalWriteCalls(h)).toBe(0);
-      expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
-      expect((await h.trainPause.read()).status).toBe('paused');
-    }
-
-    // A missing reader is a refusal, never a pass.
-    const withoutReader = await harness();
-    const noReaderUseCase = new ManageCutoverUseCase({ ...withoutReader.deps, readRetireGrant: undefined });
-    expect(await noReaderUseCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
-      outcome: 'refused',
-      reason: 'retire-grant-absent',
-    });
-    expect(totalWriteCalls(withoutReader)).toBe(0);
   });
 
   it('maps a refused pause lift, a refused compare-and-set and a failed journal append to unknown for a retire', async () => {

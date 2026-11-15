@@ -356,7 +356,22 @@ export function decideMergeRetry(
     if (!isQueueListValid(entries)) {
       return { outcome: 'refused', reason: 'unknown-entry' };
     }
-    const target = entries.find((entry) => entry.entryId === entryId);
+    let target: MergeQueueEntryRecord | undefined = undefined;
+    for (const element of entries) {
+      const read = readMergeQueueEntryRecord(element);
+      if (!read.ok) {
+        // A malformed record whose entry id matches the request is not
+        // silently skipped or rebuilt: retry refuses it.
+        if (element.entryId === entryId) {
+          return { outcome: 'refused', reason: 'invalid-entry' };
+        }
+        continue;
+      }
+      if (read.record.entryId === entryId) {
+        target = read.record;
+        break;
+      }
+    }
     if (target === undefined) {
       return { outcome: 'refused', reason: 'unknown-entry' };
     }
@@ -365,18 +380,22 @@ export function decideMergeRetry(
     }
     // Duplicate detection is partitioned by the target's effective base: a
     // live main entry must not block retrying a dropped chain entry, and a
-    // live chain entry must not block retrying a dropped main entry.
+    // live chain entry must not block retrying a dropped main entry. Only
+    // validated records participate in the duplicate scan.
     const targetBase =
       target.version === MERGE_QUEUE_ENTRY_V2_VERSION ? target.baseBranch : DEFAULT_BASE_BRANCH;
-    const duplicate = entries.find(
-      (entry) =>
-        isMergeQueueEntryLive(entry) &&
-        (entry.version === MERGE_QUEUE_ENTRY_V2_VERSION ? entry.baseBranch : DEFAULT_BASE_BRANCH) ===
-          targetBase &&
-        sameMergeQueueIdentity(entry, target),
-    );
-    if (duplicate !== undefined) {
-      return { outcome: 'duplicate', entries, record: duplicate };
+    for (const element of entries) {
+      const read = readMergeQueueEntryRecord(element);
+      if (!read.ok || !isMergeQueueEntryLive(read.record)) {
+        continue;
+      }
+      const entry = read.record;
+      const entryBase =
+        entry.version === MERGE_QUEUE_ENTRY_V2_VERSION ? entry.baseBranch : DEFAULT_BASE_BRANCH;
+      if (entryBase !== targetBase || !sameMergeQueueIdentity(entry, target)) {
+        continue;
+      }
+      return { outcome: 'duplicate', entries, record: entry };
     }
     // A v1 target retries as v1 with no base; a v2 target keeps its base.
     const retryBase: { baseBranch?: BaseBranchValue } =

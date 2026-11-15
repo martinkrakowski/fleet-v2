@@ -534,19 +534,16 @@ describe('orderMergeQueue', () => {
     expect(ordered.map((entry) => entry.entryId)).toEqual([earlier.entryId, later.entryId]);
   });
 
-  it('orders every base when no base filter is given instead of silently dropping chain entries', () => {
+  it('orders only the main base when no base filter is given, without mixing chain entries', () => {
     const chainB = makeEntry({ version: 2, baseBranch: 'chain/b', enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
     const main = makeEntry({ enqueuedAtIso: '2026-11-01T11:00:00.000Z' });
     const chainA = makeEntry({ version: 2, baseBranch: 'chain/a', enqueuedAtIso: '2026-11-01T12:00:00.000Z' });
     const list = [chainB, main, chainA];
-    // Without a base argument every live entry is ordered, earliest first, and
-    // the head is the earliest unparked entry regardless of its base.
-    expect(orderMergeQueue(list).map((entry) => entry.entryId)).toEqual([
-      chainB.entryId,
-      main.entryId,
-      chainA.entryId,
-    ]);
-    expect(findMergeQueueHead(list)?.entryId).toBe(chainB.entryId);
+    // Without a base argument the queue is filtered to the default base, so
+    // chain entries are not mixed into ordering and the head is the earliest
+    // unparked main entry.
+    expect(orderMergeQueue(list).map((entry) => entry.entryId)).toEqual([main.entryId]);
+    expect(findMergeQueueHead(list)?.entryId).toBe(main.entryId);
     // An explicit base still partitions the queue, so each base leases separately.
     expect(orderMergeQueue(list, DIGEST, 'main').map((entry) => entry.entryId)).toEqual([main.entryId]);
     expect(findMergeQueueHead(list, DIGEST, 'chain/a')?.entryId).toBe(chainA.entryId);

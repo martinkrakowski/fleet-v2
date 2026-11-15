@@ -359,6 +359,19 @@ describe('decideMergeRetry', () => {
     expect(decision).toEqual({ outcome: 'refused', reason: 'not-dropped' });
   });
 
+  it('refuses a malformed entry that matches the requested entry id instead of rebuilding it', () => {
+    const entry = makeEntry({ state: 'dropped', reason: 'operator-dropped', attempt: 1 });
+    // A v1 record carrying an extra baseBranch key is malformed by the exact
+    // key rule, so the reader refuses it.
+    const malformed = { ...entry, baseBranch: 'chain/example' as const };
+    expect(readMergeQueueEntryRecord(malformed).ok).toBe(false);
+    const decision = decideMergeRetry([malformed], entry.entryId, {
+      entryId: nextEntryId(),
+      enqueuedAtIso: '2026-11-01T12:00:00.000Z',
+    });
+    expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-entry' });
+  });
+
   it('retries a dropped entry with a fresh queued record', () => {
     const dropped = makeEntry({ state: 'dropped', reason: 'operator-dropped', attempt: 1 });
     const retryEntryId = nextEntryId();

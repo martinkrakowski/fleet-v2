@@ -530,9 +530,10 @@ function effectiveEntryBase(record: MergeQueueEntryRecord): BaseBranchValue {
 }
 
 /** The shared entry-list guards. Returns null for the caller's empty refusal,
- * undefined when no base filter applies (an omitted base must not silently
- * drop chain-based entries from processing and listing), and the parsed base
- * when an explicit base partitions the queue. */
+ * the parsed base when an explicit base partitions the queue, and
+ * DEFAULT_BASE_BRANCH when the base is omitted — an omitted base must not
+ * silently mix chain-based entries into the main queue's ordering and head
+ * selection. */
 function queueListGuard(
   entries: readonly MergeQueueEntryRecord[],
   repoDigest: string | undefined,
@@ -545,7 +546,7 @@ function queueListGuard(
     return null;
   }
   if (base === undefined) {
-    return undefined;
+    return DEFAULT_BASE_BRANCH;
   }
   return parseBaseBranch(base) ?? null;
 }

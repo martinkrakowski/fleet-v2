@@ -850,10 +850,14 @@ export class GatePredicateAdapter implements GatePredicatePort {
     // not the command's own verdict — earlier stderr lines (ssh warnings) do
     // not matter. A congestion `unknown` verdict parks the run `ambiguous` at
     // the gate, fail closed and visible to the owner; automatic wait-and-retry
-    // is a separate unit (KF-30c). Without a declared gate slot, exit 75 is
-    // the command's own result. Any other exit 75 stays the command's result.
+    // is a separate unit (KF-30c). A run carrying an executor error (such as
+    // an executor timeout) is never congestion, even when its partial stderr
+    // ends with the fixed line — its exit code is not the command's verdict.
+    // Without a declared gate slot, exit 75 is the command's own result. Any
+    // other exit 75 stays the command's result.
     if (
       gateSlot !== undefined &&
+      run.error === undefined &&
       run.exitCode === GATE_SLOT_EXIT_CODE &&
       lastStderrLine(run.stderr) === GATE_SLOT_WAIT_LIMIT_LINE
     ) {

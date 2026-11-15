@@ -34,6 +34,10 @@ import type {
 } from '../../../domain/execution-records.js';
 
 const HEAD_SHA = '0123456789abcdef0123456789abcdef01234567';
+
+// Assembled at runtime so no credential-shaped literal sits in this file; the
+// runtime value still matches the openai-style-key shape the check scans for.
+const fakeKey = 'sk-' + 'a'.repeat(24);
 const BASE_COMMIT = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const FIXED_NOW = '2026-11-15T08:00:00.000Z';
 
@@ -355,7 +359,7 @@ describe('resource-exhausted gate classification', () => {
       verdict: 'unknown',
       exitCode: 137,
       durationMs: 1,
-      detail: 'killed while printing token sk-abcdef1234567890abcdef end',
+      detail: 'killed while printing token ' + fakeKey + ' end',
       cause: 'resource-exhausted',
     });
     const secret = firstNonPassingGatePredicateOf([secretEntry], 'attempt-1', HEAD_SHA);

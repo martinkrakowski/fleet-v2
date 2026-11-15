@@ -721,6 +721,25 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
     });
   });
 
+  it('keeps exit 75 with the fixed stderr line and an executor error as unknown without cause', async () => {
+    const { adapter } = makeAdapter(
+      (argv) =>
+        argv[0] === 'sh'
+          ? {
+              exitCode: 75,
+              stderr: 'gate-slot: no slot within the wait limit\n',
+              error: 'timed out',
+            }
+          : happyGit(argv),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({ verdict: 'unknown', exitCode: 75 });
+    expect(results[2]).not.toHaveProperty('cause');
+  });
+
   it('keeps exit 75 with the fixed stderr line as the command own fail without a declared gateSlot', async () => {
     const { adapter } = makeAdapter(
       (argv) =>

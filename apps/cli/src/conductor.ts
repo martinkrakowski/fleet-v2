@@ -58,7 +58,10 @@ import {
   type ConductorPassTracePort,
   type RunTelemetryMarkPort,
   type WorkOrderRecord,
+  type StartLaneRunResult,
   CRASHED_START_NOTICE_MINUTES,
+  crashedStartNoticeSummary,
+  startIncompleteReasonCode,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
@@ -586,12 +589,25 @@ async function raiseCrashedStartNotices(
     if (workOrder === null) {
       continue;
     }
+    // AD-2: the notice reads the closed-code ledger. Only a recorded fact
+    // names the step and reason code, so the old sentence stays when the
+    // ledger is empty or unreadable.
+    let summary = `A lane start crashed and left capacity slot ${crashed.slotIndex} held for attempt ${crashed.attemptId}.`;
+    try {
+      const ledger = await runtime.execution.executionJournal.listStartIncompleteForAttempt?.(crashed.attemptId);
+      if (ledger !== undefined && ledger.outcome === 'listed' && ledger.facts.length > 0) {
+        const fact = ledger.facts[ledger.facts.length - 1];
+        summary = crashedStartNoticeSummary({ slotIndex: crashed.slotIndex, attemptId: crashed.attemptId, fact });
+      }
+    } catch {
+      // keep the old summary
+    }
     const body = {
       projectId: workOrder.projectId,
       kind: 'crashed-start',
       subject: { kind: 'attempt', ref: crashed.attemptId },
       workOrderId: crashed.workOrderId,
-      summary: `A lane start crashed and left capacity slot ${crashed.slotIndex} held for attempt ${crashed.attemptId}.`,
+      summary,
     };
     try {
       await runtime.coordination.recordAttentionItem.recordAttentionItem(body, 'conductor');
@@ -727,6 +743,7 @@ async function startCommand(
         retry: `conductor start --brief-request ${flags.briefRequest} --tier ${flags.tier} --run-id ${result.runId} --attempt-id ${result.attemptId}${flags.maxActiveRuns !== undefined && flags.maxActiveRuns !== 1 ? ` --max-active-runs ${flags.maxActiveRuns}` : ''}`,
       })}\n`,
     );
+    await raiseStartIncompleteAttention(runtime, brief, result, nowIsoOf(options), io);
     return 1;
   }
   io.stdout(`${JSON.stringify(result)}\n`);
@@ -749,6 +766,74 @@ function buildDriverOf(
 /** The clock override, or the system clock. */
 function nowIsoOf(options: ConductorCliOptions): string {
   return options.now !== undefined ? options.now() : new Date().toISOString();
+}
+
+/**
+ * AD-2 fallback: when the start use case returned `incomplete` without a
+ * recorded ledger fact, raise a `crashed-start` attention item immediately
+ * with the closed code. Best-effort: a refusal or throw only writes one stderr
+ * line (the closed code, never the detail) and never changes the stdout result
+ * or the exit code. When the ledger already holds the fact for this step and
+ * code, or the reason is not a closed code, nothing is raised.
+ */
+async function raiseStartIncompleteAttention(
+  runtime: FleetCliRuntime,
+  brief: Record<string, unknown>,
+  result: Extract<StartLaneRunResult, { outcome: 'incomplete' }>,
+  nowIso: string,
+  io: CliIo,
+): Promise<void> {
+  const code = startIncompleteReasonCode(result.reason);
+  let factPresent = false;
+  try {
+    const ledger = await runtime.execution.executionJournal.listStartIncompleteForAttempt?.(result.attemptId);
+    if (ledger !== undefined && ledger.outcome === 'listed') {
+      factPresent = ledger.facts.some((fact) => fact.step === result.step && fact.reasonCode === code);
+    }
+  } catch {
+    factPresent = false;
+  }
+  if (factPresent || code === null) {
+    return;
+  }
+  let slotIndex: number | null = null;
+  try {
+    const reservations = await runtime.execution.executionJournal.listActiveReservations();
+    const held = reservations.find(
+      (reservation) => reservation.attemptId === result.attemptId && reservation.held,
+    );
+    if (held !== undefined) {
+      slotIndex = held.slotIndex ?? null;
+    }
+  } catch {
+    slotIndex = null;
+  }
+  const summary = crashedStartNoticeSummary({
+    slotIndex,
+    attemptId: result.attemptId,
+    fact: {
+      runId: result.runId,
+      attemptId: result.attemptId,
+      step: result.step,
+      reasonCode: code,
+      recordedAtIso: nowIso,
+    },
+  });
+  const body = {
+    projectId: brief.projectId as string,
+    kind: 'crashed-start',
+    subject: { kind: 'attempt', ref: result.attemptId },
+    workOrderId: brief.workOrderId as string,
+    summary,
+  };
+  try {
+    const raised = await runtime.coordination.recordAttentionItem.recordAttentionItem(body, 'conductor');
+    if (raised.outcome === 'refused') {
+      io.stderr(`start-incomplete-unrecorded step=${result.step} reason=${code}\n`);
+    }
+  } catch {
+    io.stderr(`start-incomplete-unrecorded step=${result.step} reason=${code}\n`);
+  }
 }
 
 /**

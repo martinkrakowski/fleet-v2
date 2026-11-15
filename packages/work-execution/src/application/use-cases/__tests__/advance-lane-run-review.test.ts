@@ -215,7 +215,7 @@ function makeUlidMinter(): () => string {
   };
 }
 
-function reviewKey(step: 'brief-check' | 'code-review', seatIndex: number, head12: string, retry: number | null = null): string {
+function reviewKey(step: 'brief-check' | 'code-review' | 'pre-merge', seatIndex: number, head12: string, retry: number | null = null): string {
   const built = buildLaneRunStepKey({
     runId: RUN_ID,
     round: 0,
@@ -2335,5 +2335,176 @@ describe('transport no-receipt budget exemption and unreachable bound (U3 / F189
       seatIndex: 0,
       retries: 0,
     });
+  });
+});
+
+describe('PMR1: the pre-merge review request (awaiting-premerge)', () => {
+  /** A harness conducted to `awaiting-premerge` with an accepted head, no pre-merge receipt yet. */
+  async function awaitingPremergeHarness(
+    attempts: readonly AttemptRecord[] = [collectedAttempt()],
+  ): Promise<Harness> {
+    const harness = await makeHarness(runRecord(), attempts);
+    await conduct(harness, 'awaiting-premerge', NOW);
+    await appendIntent(harness, acceptKey(), null, NOW);
+    await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
+    return harness;
+  }
+
+  /** A second implementer attempt on a given model, appended after the first. */
+  function laterAttempt(model: string | null): AttemptRecord {
+    return {
+      ...collectedAttempt(),
+      id: 'attempt-example-2',
+      seatSelection: model === null ? null : { ...collectedAttempt().seatSelection!, model },
+      runner: { ...CONDUCTED_RUNNER, model },
+    };
+  }
+
+  it('requests a pre-merge review with no brief text, journals the result, and the next advance waits on the receipt read', async () => {
+    const harness = await awaitingPremergeHarness();
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'pre-merge',
+      key: reviewKey('pre-merge', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    expect(harness.reviewRequests).toHaveLength(1);
+    const request = harness.reviewRequests[0]!;
+    expect(request.kind).toBe('pre-merge');
+    expect(request.reviewerModel).toBe('review-model-1');
+    expect(request.implementerModel).toBe('model-example-1');
+    expect(request).not.toHaveProperty('briefText');
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === reviewKey('pre-merge', 0, HEAD12_A))).toHaveLength(1);
+    expect(laneRunReviewFact(entries, RUN_ID, 'pre-merge', HEAD12_A)).toMatchObject({ verdict: 'passed', seatIndex: 0 });
+    // The receipt is the authority: its read answers not-found here, so the run waits, never passes.
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+    expect(harness.reviewRequests).toHaveLength(1);
+  });
+
+  it('reconciles a pre-merge intent that has no result: no receipt closes review-no-receipt, then one retry on the same seat', async () => {
+    const harness = await awaitingPremergeHarness();
+    await appendIntent(harness, reviewKey('pre-merge', 0, HEAD12_A), 'review-example-1', NOW);
+    const reconciled = await advance(harness);
+    expect(reconciled).toEqual({
+      outcome: 'acted',
+      step: 'pre-merge',
+      key: reviewKey('pre-merge', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-no-receipt',
+    });
+    expect(harness.reviewRequests).toHaveLength(0);
+    const retried = await advance(harness);
+    expect(retried).toMatchObject({
+      outcome: 'acted',
+      step: 'pre-merge',
+      key: reviewKey('pre-merge', 0, HEAD12_A, 1),
+    });
+    expect(harness.reviewRequests).toHaveLength(1);
+    expect(harness.reviewRequests[0]!.kind).toBe('pre-merge');
+  });
+
+  it('test_perform_review_premerge_out_of_bounds_seat_refuses', async () => {
+    const harness = await awaitingPremergeHarness();
+    const useCase = new AdvanceLaneRunUseCase(harness.deps);
+    const target = useCase as unknown as { performDecision: PerformDecisionFn };
+    const orig = target.performDecision.bind(useCase);
+    target.performDecision = (record, gathered, decision, request) =>
+      orig(record, gathered, { ...decision, seatIndex: 9, key: reviewKey('pre-merge', 9, HEAD12_A) } as LaneRunDecision, request);
+    const result = await useCase.advanceLaneRun({
+      runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, halted: false, nowIso: LATER,
+    });
+    expect(result).toMatchObject({ outcome: 'acted', step: 'pre-merge', result: 'refused', reasonCode: 'review-seat-unavailable' });
+    expect(harness.reviewRequests).toHaveLength(0);
+  });
+
+  it('test_perform_review_premerge_missing_implementer_model_refuses', async () => {
+    const unknownModel = { ...collectedAttempt(), seatSelection: null, runner: { ...CONDUCTED_RUNNER, model: null } };
+    const harness = await awaitingPremergeHarness([unknownModel]);
+    const useCase = new AdvanceLaneRunUseCase(harness.deps);
+    const target = useCase as unknown as { performDecision: PerformDecisionFn };
+    const orig = target.performDecision.bind(useCase);
+    // The decider would never draw a seat here (fail closed); force the act to prove the handler refuses too.
+    target.performDecision = (record, gathered, decision, request) =>
+      orig(
+        record,
+        gathered,
+        { kind: 'act', step: 'pre-merge', key: reviewKey('pre-merge', 0, HEAD12_A), round: 0, seatIndex: 0, head12: HEAD12_A, retry: null } as LaneRunDecision,
+        request,
+      );
+    const result = await useCase.advanceLaneRun({
+      runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, halted: false, nowIso: LATER,
+    });
+    expect(result).toMatchObject({ outcome: 'acted', step: 'pre-merge', result: 'refused', reasonCode: 'review-refused' });
+    expect(harness.reviewRequests).toHaveLength(0);
+  });
+
+  it('test_pre_merge_seat_unknown_implementer_model_fails_closed', () => {
+    const ctx = { deps: { sameModelFamily: (left: string, right: string) => left === right } } as unknown as AdvanceStepContext;
+    const mint = makeUlidMinter();
+    const entries = [laneRunConductEntry(mint(), RUN_ID, 'awaiting-premerge', NOW)];
+    const seatOf = (attempts: readonly (AttemptRecord | null)[]) =>
+      reviewFactsOf(ctx, runRecord(), 'awaiting-premerge', entries, HEAD12_A, attempts).reviewSeat;
+    // Control: every implementer model is known and none shares a family with a reviewer.
+    expect(seatOf([collectedAttempt()])).toEqual({ ok: true, seatIndex: 0 });
+    // A null attempt record is an unknown implementer, never filtered out.
+    expect(seatOf([collectedAttempt(), null])).toEqual({ ok: false });
+    // An attempt with no ran and no bound model, same.
+    const noModel = { ...collectedAttempt(), id: 'attempt-example-2', seatSelection: null, runner: { ...CONDUCTED_RUNNER, model: null } };
+    expect(seatOf([collectedAttempt(), noModel])).toEqual({ ok: false });
+    expect(seatOf([noModel])).toEqual({ ok: false });
+    // Unbound family comparison also fails closed.
+    const unbound = { deps: {} } as unknown as AdvanceStepContext;
+    expect(reviewFactsOf(unbound, runRecord(), 'awaiting-premerge', entries, HEAD12_A, [collectedAttempt()]).reviewSeat).toEqual({ ok: false });
+  });
+
+  it('test_pre_merge_pinned_seat_rechecks_family_and_refuses_on_conflict', () => {
+    const ctx = { deps: { sameModelFamily: (left: string, right: string) => left === right } } as unknown as AdvanceStepContext;
+    const mint = makeUlidMinter();
+    const failedAt = (seatIndex: number): LaneRunJournalEntryRecord[] => {
+      const key = reviewKey('pre-merge', seatIndex, HEAD12_A);
+      return [
+        laneRunConductEntry(mint(), RUN_ID, 'awaiting-premerge', NOW),
+        laneRunIntentEntry(mint(), RUN_ID, key, null, NOW),
+        laneRunResultEntry(mint(), RUN_ID, key, 'completed', 'review-failed', NOW),
+      ];
+    };
+    const seatOf = (entries: readonly LaneRunJournalEntryRecord[], attempts: readonly AttemptRecord[]) =>
+      reviewFactsOf(ctx, runRecord(), 'awaiting-premerge', entries, HEAD12_B, attempts).reviewSeat;
+    // The pin holds while no implementer shares the pinned seat's family (seat 1 = review-model-2).
+    expect(seatOf(failedAt(1), [collectedAttempt()])).toEqual({ ok: true, seatIndex: 1 });
+    // A fix round after the failure ran on the pinned reviewer's family: refuse, never the stale pin.
+    expect(seatOf(failedAt(1), [collectedAttempt(), laterAttempt('review-model-2')])).toEqual({ ok: false });
+    // The conflict is against ALL attempts, not just the latest.
+    expect(seatOf(failedAt(1), [laterAttempt('review-model-2'), collectedAttempt()])).toEqual({ ok: false });
+    // An out-of-range pin and an unknown implementer model refuse too.
+    expect(seatOf(failedAt(5), [collectedAttempt()])).toEqual({ ok: false });
+    expect(seatOf(failedAt(1), [collectedAttempt(), laterAttempt(null)])).toEqual({ ok: false });
+  });
+
+  it('a pinned pre-merge seat that is a fallback (on) seat is refused, and merging computes the seat too', () => {
+    const ctx = { deps: { sameModelFamily: (left: string, right: string) => left === right } } as unknown as AdvanceStepContext;
+    const mint = makeUlidMinter();
+    const withFallback = {
+      ...collectedAttempt(),
+      seatPlan: {
+        ...REVIEW_SEAT_PLAN,
+        review: [
+          { id: 'rev-1', model: 'review-model-1', tool: 'opencode' },
+          { id: 'rev-fb', model: 'review-model-3', tool: 'opencode', on: ['rate-limited'] },
+        ],
+      },
+    } as AttemptRecord;
+    const key = reviewKey('pre-merge', 1, HEAD12_A);
+    const entries = [
+      laneRunConductEntry(mint(), RUN_ID, 'merging', NOW),
+      laneRunIntentEntry(mint(), RUN_ID, key, null, NOW),
+      laneRunResultEntry(mint(), RUN_ID, key, 'completed', 'review-failed', NOW),
+    ];
+    expect(reviewFactsOf(ctx, runRecord(), 'merging', entries, HEAD12_B, [withFallback]).reviewSeat).toEqual({ ok: false });
+    // Without the pin, the same plan draws the primary seat in `merging`.
+    expect(reviewFactsOf(ctx, runRecord(), 'merging', [entries[0]!], HEAD12_B, [withFallback]).reviewSeat).toEqual({ ok: true, seatIndex: 0 });
   });
 });

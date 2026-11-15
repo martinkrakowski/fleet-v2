@@ -49,6 +49,13 @@ import {
 } from './file-store.js';
 import { isCanonicalIso } from '../../domain/lane-activity-records.js';
 import { containsSecretShape } from '@fleet/shared';
+import { INITIAL_RECORD_SCHEMA_VERSION } from '../../domain/record-schema-version.js';
+import {
+  ATTEMPT_ID_PATTERN,
+  readStartIncompleteFact,
+  START_INCOMPLETE_MAX_FACTS_PER_ATTEMPT,
+  type StartIncompleteFact,
+} from '../../domain/start-incomplete-fact.js';
 
 /** The schema-version policy of `journal.json` (Q5a, D6). */
 export const JOURNAL_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('journal.json', {
@@ -61,6 +68,37 @@ export const RESERVATION_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('
   writerVersion: CAPACITY_RESERVATION_SCHEMA_VERSION,
   acceptedVersions: [1],
 });
+
+/** The schema-version policy of `start-incomplete.json` (Q5a, D6). */
+export const START_INCOMPLETE_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('start-incomplete.json', {
+  writerVersion: INITIAL_RECORD_SCHEMA_VERSION,
+  acceptedVersions: [1],
+});
+
+/**
+ * Parse one stored fact with its `schemaVersion` wrapper: the version check
+ * runs first, then the body is validated by the pure domain reader (which
+ * refuses the extra `schemaVersion` key, so it is stripped before the body is
+ * read). Never throws; an unknown version or bad body is an invalid/unknown
+ * typed result.
+ */
+export function parseStartIncompleteFactRecord(raw: unknown): VersionedRecordParseResult<StartIncompleteFact> {
+  const versionCheck = readStoreRecordSchemaVersion(raw, START_INCOMPLETE_STORE_VERSION_POLICY);
+  if (versionCheck.status !== 'ok') {
+    return versionCheck;
+  }
+  try {
+    const body = { ...(raw as Record<string, unknown>) };
+    delete (body as Record<string, unknown>).schemaVersion;
+    const parsed = readStartIncompleteFact(body);
+    if (!parsed.ok) {
+      return { status: 'invalid' };
+    }
+    return { status: 'ok', record: parsed.fact, schemaVersion: versionCheck.schemaVersion };
+  } catch {
+    return { status: 'invalid' };
+  }
+}
 
 export interface ExecutionJournalAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
@@ -299,6 +337,7 @@ function arbitrateReservation(
 
 export class ExecutionJournalAdapter implements ExecutionJournalPort {
   private readonly inMemoryJournalEntries: ActionJournalEntryRecord[] = [];
+  private readonly inMemoryStartIncomplete: StartIncompleteFact[] = [];
   private readonly inMemoryReservationsById = new Map<string, CapacityReservationRecord>();
   private readonly fencedReleaseChainsByAttemptId = new Map<string, Promise<unknown>>();
   private readonly changeSignal: ChangeSignalPort;
@@ -358,6 +397,88 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
     const target = path.join(stateDir, 'journal.json');
     const entries = await this.readJournalFromDisk(target);
     return entries.filter((entry) => entry.attemptId === attemptId).map(normalizeJournalEntry);
+  }
+
+  async appendStartIncomplete(fact: unknown): Promise<
+    { outcome: 'recorded' } | { outcome: 'unrecorded'; reason: 'invalid-fact' | 'write-failed' }
+  > {
+    try {
+      assertStoreWritable(this.options?.readOnly === true, 'ExecutionJournalAdapter');
+      const parsed = readStartIncompleteFact(fact);
+      if (!parsed.ok) {
+        return { outcome: 'unrecorded', reason: 'invalid-fact' };
+      }
+      const factRecord = parsed.fact;
+      const stateDir = this.options?.stateDir;
+      if (stateDir === undefined) {
+        const duplicate = this.inMemoryStartIncomplete.some(
+          (existing) =>
+            existing.attemptId === factRecord.attemptId &&
+            existing.step === factRecord.step &&
+            existing.reasonCode === factRecord.reasonCode,
+        );
+        if (duplicate) {
+          return { outcome: 'recorded' };
+        }
+        const attemptCount = this.inMemoryStartIncomplete.filter(
+          (existing) => existing.attemptId === factRecord.attemptId,
+        ).length;
+        if (attemptCount >= START_INCOMPLETE_MAX_FACTS_PER_ATTEMPT) {
+          return { outcome: 'unrecorded', reason: 'write-failed' };
+        }
+        this.inMemoryStartIncomplete.push(factRecord);
+        return { outcome: 'recorded' };
+      }
+
+      const target = path.join(stateDir, 'start-incomplete.json');
+      const lockPath = path.join(stateDir, 'start-incomplete.json.lock');
+
+      return await withFileLock(lockPath, async () => {
+        const facts = await this.readStartIncompleteListFromDisk(target);
+        const duplicate = facts.some(
+          (existing) =>
+            existing.attemptId === factRecord.attemptId &&
+            existing.step === factRecord.step &&
+            existing.reasonCode === factRecord.reasonCode,
+        );
+        if (duplicate) {
+          return { outcome: 'recorded' };
+        }
+        const attemptCount = facts.filter((existing) => existing.attemptId === factRecord.attemptId).length;
+        if (attemptCount >= START_INCOMPLETE_MAX_FACTS_PER_ATTEMPT) {
+          return { outcome: 'unrecorded', reason: 'write-failed' };
+        }
+        facts.push({ ...factRecord, schemaVersion: INITIAL_RECORD_SCHEMA_VERSION } as StartIncompleteFact & {
+          schemaVersion: number;
+        });
+        await writeJsonAtomically(target, facts);
+        return { outcome: 'recorded' };
+      });
+    } catch {
+      return { outcome: 'unrecorded', reason: 'write-failed' };
+    }
+  }
+
+  async listStartIncompleteForAttempt(
+    attemptId: string,
+  ): Promise<{ outcome: 'listed'; facts: readonly StartIncompleteFact[] } | { outcome: 'unreadable' }> {
+    try {
+      if (typeof attemptId !== 'string' || !ATTEMPT_ID_PATTERN.test(attemptId)) {
+        return { outcome: 'unreadable' };
+      }
+      const stateDir = this.options?.stateDir;
+      if (stateDir === undefined) {
+        return {
+          outcome: 'listed',
+          facts: this.inMemoryStartIncomplete.filter((fact) => fact.attemptId === attemptId),
+        };
+      }
+      const target = path.join(stateDir, 'start-incomplete.json');
+      const facts = await this.readStartIncompleteListFromDisk(target);
+      return { outcome: 'listed', facts: facts.filter((fact) => fact.attemptId === attemptId) };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
   }
 
   async saveCapacityReservation(reservation: CapacityReservationRecord): Promise<void> {
@@ -791,6 +912,32 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
     }
     if (inspection.status === 'unreadable') {
       return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
+    }
+    return [...inspection.records];
+  }
+
+  /**
+   * Read the start-incomplete ledger for display. A missing file is an empty
+   * list; any other read or parse problem throws so the caller reports the
+   * whole list unreadable. Never quarantines or rewrites the file.
+   */
+  private async readStartIncompleteListFromDisk(target: string): Promise<StartIncompleteFact[]> {
+    let buffer: Buffer;
+    try {
+      buffer = await fs.readFile(target);
+    } catch (error: unknown) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        (error as { code?: string }).code === 'ENOENT'
+      ) {
+        return [];
+      }
+      throw error;
+    }
+    const inspection = inspectVersionedRecordListBytes(buffer, parseStartIncompleteFactRecord);
+    if (inspection.status !== 'ok') {
+      throw new Error('start-incomplete ledger is unreadable');
     }
     return [...inspection.records];
   }

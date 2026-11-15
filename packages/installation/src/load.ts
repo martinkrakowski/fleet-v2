@@ -247,8 +247,8 @@ export interface CheckedInstallationModel {
 export function checkInstallationModel(installation: FleetInstallation): CheckedInstallationModel {
   const { model, warnings, errors: modelErrors } = deriveInstallationModel(installation);
   const errors: string[] = [];
+  errors.push(...(modelErrors ?? []));
   if (installation.schemaVersion === 2) {
-    errors.push(...(modelErrors ?? []));
     // The file chains go along so the reference rules report file
     // positions when useFreeSeats false reduced the derived chains (FS1).
     errors.push(...validateSeatPolicy(model, installation.chains));

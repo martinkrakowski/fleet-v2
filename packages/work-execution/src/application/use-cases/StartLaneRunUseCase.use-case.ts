@@ -34,6 +34,11 @@ import { laneRunJournalState } from '../../domain/lane-run-journal.js';
 import type { SeatHistoryEntry } from '../../domain/seat-selection.js';
 import { selectSeat, seatMatchesAssignment, seatSelectionRecord } from '../../domain/seat-selection.js';
 import { isCalendarDateTime } from '../../domain/plain-record-reads.js';
+import {
+  ATTEMPT_ID_PATTERN,
+  startIncompleteReasonCode,
+  type StartIncompleteReasonCode,
+} from '../../domain/start-incomplete-fact.js';
 import { LANE_RUN_TERMINAL_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { AttemptStateValue } from '../../domain/value-objects/AttemptState.vo.js';
@@ -77,7 +82,7 @@ export interface StartLaneRunDependencies {
   readonly capacity: LaneRunStartCapacityPort;
   readonly executionJournal: Pick<
     ExecutionJournalPort,
-    'listActiveReservations' | 'releaseCapacityReservation'
+    'listActiveReservations' | 'releaseCapacityReservation' | 'appendStartIncomplete'
   >;
   readonly workspace: Pick<WorkspacePort, 'prepareLaneWorktree' | 'resolveBaseTip'>;
   readonly prepareBrief: PrepareBriefPackagePort;
@@ -89,7 +94,7 @@ export interface StartLaneRunDependencies {
 }
 
 /** `attempt-` followed by a short, key-safe id; a ULID in production. */
-const ATTEMPT_ID_PATTERN = /^attempt-[0-9A-Za-z][0-9A-Za-z-]{0,63}$/;
+export { ATTEMPT_ID_PATTERN } from '../../domain/start-incomplete-fact.js';
 
 /**
  * The attempt's frozen base commit (CB-D2): 40 lowercase hex. The
@@ -105,20 +110,7 @@ function branchForRun(runId: string): string {
 }
 
 /** The fixed reason codes an `incomplete` may carry, never a host's text. */
-export type StartLaneRunIncompleteReason =
-  | 'worktree-path-exists-other'
-  | 'worktree-branch-exists-other'
-  | 'worktree-git-refused'
-  | 'worktree-unknown'
-  | 'base-tip-unknown'
-  | 'no-clone-on-host'
-  | 'brief-rejected'
-  | 'brief-acceptance-spec-shell'
-  | 'attempt-differs'
-  | 'attempt-save-failed'
-  | 'run-exists'
-  | 'reservation-incomplete'
-  | 'attempt-incomplete';
+export type StartLaneRunIncompleteReason = StartIncompleteReasonCode;
 
 const WORKTREE_REFUSAL_REASONS: Record<string, StartLaneRunIncompleteReason> = {
   'path-exists-other': 'worktree-path-exists-other',
@@ -329,7 +321,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       (attempt.state !== ('intent-recorded' satisfies AttemptStateValue) ||
         attempt.workOrderId !== request.brief.workOrderId)
     ) {
-      return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-differs');
+      return await this.recordIncomplete(request, 'attempt', 'attempt-differs');
     }
 
     // Step 1: reserve (a retry reuses the held reservation).
@@ -357,7 +349,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       // lets the operator's retry start clean; an unconfirmed one keeps the run
       // absent and the abandon path can still release it later.
       await deps.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
-      return incomplete(request.runId, request.attemptId, 'reserve', 'reservation-incomplete');
+      return await this.recordIncomplete(request, 'reserve', 'reservation-incomplete');
     } else {
       const reserved = await deps.capacity.reserveFirst({
         attemptId: request.attemptId,
@@ -398,7 +390,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       (hostKind === 'opencode' && port === null)
     ) {
       await deps.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
-      return incomplete(request.runId, request.attemptId, 'reserve', 'reservation-incomplete');
+      return await this.recordIncomplete(request, 'reserve', 'reservation-incomplete');
     }
     const reservation = { hostName, hostKind, worktreePath };
     const recordedHost = recordedHostOf({ hostKind, hostName, transport, sshAlias, port });
@@ -407,7 +399,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     // leaves the reservation held.
     const clone = profile.clones[hostName];
     if (clone === undefined) {
-      return incomplete(request.runId, request.attemptId, 'worktree', 'no-clone-on-host');
+      return await this.recordIncomplete(request, 'worktree', 'no-clone-on-host');
     }
     // CB-D2 (CB2): choose the worktree's base commit. A retried start whose
     // attempt already froze a 40-hex base commit reuses that tip; otherwise
@@ -432,14 +424,14 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       recordedHost,
     });
     if (prepared === undefined) {
-      return incomplete(request.runId, request.attemptId, 'worktree', 'worktree-unknown');
+      return await this.recordIncomplete(request, 'worktree', 'worktree-unknown');
     }
     if (prepared.outcome === 'unknown') {
-      return incomplete(request.runId, request.attemptId, 'worktree', 'worktree-unknown');
+      return await this.recordIncomplete(request, 'worktree', 'worktree-unknown');
     }
     if (prepared.outcome === 'refused') {
       const reason = WORKTREE_REFUSAL_REASONS[prepared.reason] ?? 'worktree-unknown';
-      return incomplete(request.runId, request.attemptId, 'worktree', reason);
+      return await this.recordIncomplete(request, 'worktree', reason);
     }
 
     // Step 3: brief (a retry prepares and places again; the files are
@@ -478,9 +470,8 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         typeof briefResult.reason === 'string'
           ? briefResult.reason.replace(/\s+/gu, ' ').trim().slice(0, BRIEF_REASON_DETAIL_MAX_CHARS)
           : '';
-      return incomplete(
-        request.runId,
-        request.attemptId,
+      return await this.recordIncomplete(
+        request,
         'brief',
         detail === '' ? briefClass : `${briefClass}: ${detail}`,
       );
@@ -534,7 +525,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       if (reread !== null && reread.attemptIds[0] === request.attemptId) {
         return this.startedResult(request, reservation);
       }
-      return incomplete(request.runId, request.attemptId, 'run', 'run-exists');
+      return await this.recordIncomplete(request, 'run', 'run-exists');
     }
 
     // Step 6: started.
@@ -614,7 +605,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       // Neither the attempt's runner host nor a held reservation gives a host
       // and worktree path: incomplete, never `started` with an empty host or
       // path.
-      return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-incomplete');
+      return await this.recordIncomplete(request, 'attempt', 'attempt-incomplete');
     }
     return { outcome: 'started', runId: run.runId, attemptId: request.attemptId, hostName, worktreePath };
   }
@@ -637,6 +628,34 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       (reservation) => reservation.attemptId === attemptId && reservation.held,
     );
     return held ?? null;
+  }
+
+  /**
+   * Build the `incomplete` result and, when the ledger is reachable, append
+   * one closed-code fact for it. The reason string is unchanged; the ledger
+   * stores only the closed code. A missing or failing append never changes
+   * the result — the `incomplete` object is returned either way.
+   */
+  private async recordIncomplete(
+    request: StartLaneRunRequest,
+    step: StartLaneRunStep,
+    reason: StartLaneRunIncompleteReason | string,
+  ): Promise<StartLaneRunResult> {
+    const code = startIncompleteReasonCode(reason);
+    if (code !== null && typeof this.deps!.executionJournal.appendStartIncomplete === 'function') {
+      try {
+        await this.deps!.executionJournal.appendStartIncomplete({
+          attemptId: request.attemptId,
+          runId: request.runId,
+          step,
+          reasonCode: code,
+          recordedAtIso: request.nowIso,
+        });
+      } catch {
+        // The incomplete result is returned regardless of the ledger outcome.
+      }
+    }
+    return incomplete(request.runId, request.attemptId, step, reason);
   }
 
   /**
@@ -671,7 +690,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     if (resolved === undefined) {
       return {
         outcome: 'refused',
-        result: incomplete(request.runId, request.attemptId, 'worktree', 'base-tip-unknown'),
+        result: await this.recordIncomplete(request, 'worktree', 'base-tip-unknown'),
       };
     }
     if (resolved.outcome === 'resolved') {
@@ -686,7 +705,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     }
     return {
       outcome: 'refused',
-      result: incomplete(request.runId, request.attemptId, 'worktree', 'base-tip-unknown'),
+      result: await this.recordIncomplete(request, 'worktree', 'base-tip-unknown'),
     };
   }
 
@@ -712,7 +731,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     const deps = this.deps!;
     const selectedSeat = plan.getSeats('first-pass')[seatIndex];
     if (selectedSeat === undefined) {
-      return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-differs');
+      return await this.recordIncomplete(request, 'attempt', 'attempt-differs');
     }
     const existing = await deps.attemptRepo.findAttemptById(request.attemptId);
     if (existing !== null) {
@@ -721,7 +740,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         existing.worktreePath === reservation.worktreePath &&
         existing.workOrderId === request.brief.workOrderId;
       if (!sameIdentity) {
-        return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-differs');
+        return await this.recordIncomplete(request, 'attempt', 'attempt-differs');
       }
       if (existing.briefDigest === briefDigest && existing.briefPackagePath === briefPackagePath) {
         // Same digest and path: nothing to rewrite unless the record has no
@@ -738,7 +757,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         try {
           await deps.attemptRepo.saveAttempt(stamped);
         } catch {
-          return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-save-failed');
+          return await this.recordIncomplete(request, 'attempt', 'attempt-save-failed');
         }
         return null;
       }
@@ -753,7 +772,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       try {
         await deps.attemptRepo.saveAttempt(updated);
       } catch {
-        return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-save-failed');
+        return await this.recordIncomplete(request, 'attempt', 'attempt-save-failed');
       }
       return null;
     }
@@ -786,7 +805,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     try {
       await deps.attemptRepo.saveAttempt(record);
     } catch {
-      return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-save-failed');
+      return await this.recordIncomplete(request, 'attempt', 'attempt-save-failed');
     }
     return null;
   }

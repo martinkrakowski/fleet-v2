@@ -1652,4 +1652,75 @@ describe('StartLaneRunUseCase', () => {
     ).toEqual({ outcome: 'abandoned', capacity: 'released', attemptCancelled: false });
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
+
+  it('appends a brief-rejected fact and does not store the prepare detail', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([{ outcome: 'rejected', reason: 'worktreePath is required' }]);
+    const result = await harness.useCase.startLaneRun(requestFixture());
+
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'brief',
+      reason: 'brief-rejected: worktreePath is required',
+    });
+    const listed = await harness.executionJournal.listStartIncompleteForAttempt(ATTEMPT_ID);
+    expect(listed).toEqual({
+      outcome: 'listed',
+      facts: [
+        {
+          attemptId: ATTEMPT_ID,
+          runId: RUN_ID,
+          step: 'brief',
+          reasonCode: 'brief-rejected',
+          recordedAtIso: NOW,
+        },
+      ],
+    });
+    // The prepare sentence never reaches the ledger.
+    expect(JSON.stringify(listed)).not.toContain('worktreePath');
+  });
+
+  it('returns incomplete with the reason intact when the journal append throws', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([{ outcome: 'rejected', reason: 'worktreePath is required' }]);
+    const journal = harness.executionJournal as unknown as Record<string, unknown>;
+    const append = journal.appendStartIncomplete;
+    journal.appendStartIncomplete = async () => {
+      throw new Error('example ledger failure');
+    };
+    const result = await harness.useCase.startLaneRun(requestFixture());
+
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'brief',
+      reason: 'brief-rejected: worktreePath is required',
+    });
+    journal.appendStartIncomplete = append;
+    expect(await harness.executionJournal.listStartIncompleteForAttempt(ATTEMPT_ID)).toEqual({
+      outcome: 'listed',
+      facts: [],
+    });
+  });
+
+  it('returns incomplete when the journal has no start-incomplete method', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([{ outcome: 'rejected', reason: 'worktreePath is required' }]);
+    const journal = harness.executionJournal as unknown as Record<string, unknown>;
+    const append = journal.appendStartIncomplete;
+    delete journal.appendStartIncomplete;
+    const result = await harness.useCase.startLaneRun(requestFixture());
+
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'brief',
+      reason: 'brief-rejected: worktreePath is required',
+    });
+    journal.appendStartIncomplete = append;
+  });
 });

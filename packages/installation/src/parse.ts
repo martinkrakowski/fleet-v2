@@ -44,6 +44,7 @@ import type {
   PolicySection,
   ProcedureCoverage,
   ReviewerSection,
+  ReviewerTool,
   RunnerCapabilityDeclaration,
   RunnerSection,
   SeatHealth,
@@ -107,6 +108,7 @@ import {
   POLICY_KEYS,
   PROCEDURE_COVERAGE_KEYS,
   PROCEDURE_KEYS,
+  REVIEWER_KEYS,
   RUNNER_KEYS,
   SEAT_KEYS,
   SHELF_KEYS,
@@ -806,6 +808,9 @@ function parseForgeSection(
   return { owner, repo };
 }
 
+/** The review tools the review transport router dispatches (D1A). */
+const REVIEWER_TOOLS: readonly ReviewerTool[] = ['opencode', 'api', 'grok', 'agy'];
+
 function parseReviewerSection(
   value: JsonObject,
   errors: string[],
@@ -818,8 +823,26 @@ function parseReviewerSection(
     errors.push('reviewer: must be an object');
     return undefined;
   }
-  collectUnknownKeys(section, SEAT_KEYS, 'reviewer', errors);
-  return buildSeat(section, 'reviewer', errors);
+  collectUnknownKeys(section, REVIEWER_KEYS, 'reviewer', errors);
+  const field = readOptionalDataField(section, 'tool');
+  let tool: ReviewerTool | undefined;
+  let toolError = false;
+  if (field.kind === 'accessor') {
+    errors.push('reviewer.tool: must be a plain data property');
+    toolError = true;
+  } else if (field.kind === 'value') {
+    if (typeof field.value === 'string' && REVIEWER_TOOLS.includes(field.value as ReviewerTool)) {
+      tool = field.value as ReviewerTool;
+    } else {
+      errors.push('reviewer.tool: must be a known review tool');
+      toolError = true;
+    }
+  }
+  const seat = buildSeat(section, 'reviewer', errors);
+  if (seat === undefined || toolError) {
+    return undefined;
+  }
+  return { ...seat, ...(tool !== undefined ? { tool } : {}) };
 }
 
 function parseWavesSection(

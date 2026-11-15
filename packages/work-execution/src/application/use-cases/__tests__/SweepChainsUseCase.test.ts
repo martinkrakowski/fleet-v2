@@ -22,6 +22,8 @@ class FakeChains {
   result: unknown = { status: 'ok', records: [] };
   throwOnCall = false;
   listed: ChainListCommand[] = [];
+  swept: unknown[] = [];
+  sweptResult: unknown = { outcome: 'recorded' };
 
   async listChains(command: ChainListCommand): Promise<ChainListResult> {
     this.listed.push(command);
@@ -29,6 +31,11 @@ class FakeChains {
       throw new Error('chain store exploded');
     }
     return this.result as ChainListResult;
+  }
+
+  async recordChainSwept(command: unknown): Promise<unknown> {
+    this.swept.push(command);
+    return this.sweptResult;
   }
 }
 
@@ -442,6 +449,80 @@ describe('SweepChainsUseCase', () => {
     const result = await useCase.runSweepChains(command({ mode: 'apply' }));
     expect(result.outcome).toBe('refused');
     expect(result.reasonCode).toBe('forge-not-configured');
+    expect(forge.requests).toHaveLength(0);
+  });
+
+  it('apply deletes each recorded link branch before the chain branch', async () => {
+    const { useCase, chains, forge } = harness();
+    chains.result = {
+      status: 'ok',
+      records: [record('foo', 'landed', ['feature/widget-1', 'chain/foo', 'feature/widget-1'])],
+    };
+    forge.results = [
+      { outcome: 'executed', headSha: 'a'.repeat(40) },
+      { outcome: 'executed', headSha: 'a'.repeat(40) },
+    ];
+    const result = await useCase.runSweepChains(command({ mode: 'apply' }));
+    expect(result.outcome).toBe('completed');
+    expect(forge.requests).toHaveLength(2);
+    expect(forge.requests[0]).toMatchObject({
+      kind: 'delete-branch',
+      branchName: 'feature/widget-1',
+      actionId: 'chain-sweep/foo@r1/link/0',
+    });
+    expect(forge.requests[1]).toMatchObject({ branchName: 'chain/foo', actionId: 'chain-sweep/foo@r1/chain' });
+    expect(result.branches.map((branch) => branch.role)).toEqual(['link', 'chain']);
+    expect(result.branches.every((branch) => branch.outcome === 'deleted')).toBe(true);
+  });
+
+  it('apply marks the swept chain so the next tick skips it', async () => {
+    const { useCase, chains, forge } = harness();
+    chains.result = { status: 'ok', records: landedFoo() };
+    forge.results = [{ outcome: 'executed', headSha: 'a'.repeat(40) }];
+    const result = await useCase.runSweepChains(command({ mode: 'apply' }));
+    expect(result.outcome).toBe('completed');
+    expect(chains.swept).toEqual([
+      {
+        repository: { owner: 'acme', repo: 'widgets' },
+        chainName: 'foo',
+        expectedRevision: 1,
+        sweptAtIso: NOW,
+        deadlineIso: DEADLINE,
+      },
+    ]);
+  });
+
+  it('a record the sweep already handled is skipped', async () => {
+    const { useCase, chains, forge } = harness();
+    const swept = { ...record('foo', 'landed'), sweptAtIso: NOW };
+    chains.result = { status: 'ok', records: [swept, record('bar', 'landed')] };
+    forge.results = [{ outcome: 'executed', headSha: 'a'.repeat(40) }];
+    const result = await useCase.runSweepChains(command({ mode: 'apply' }));
+    expect(result.outcome).toBe('completed');
+    expect(forge.requests).toHaveLength(1);
+    expect(forge.requests[0]).toMatchObject({ branchName: 'chain/bar' });
+    expect(result.branches.map((branch) => branch.chainName)).toEqual(['bar']);
+  });
+
+  it('a failed sweep mark is incomplete, not completed', async () => {
+    const { useCase, chains, forge } = harness();
+    chains.result = { status: 'ok', records: landedFoo() };
+    chains.sweptResult = { outcome: 'refused', reason: 'stale-revision' };
+    forge.results = [{ outcome: 'executed', headSha: 'a'.repeat(40) }];
+    const result = await useCase.runSweepChains(command({ mode: 'apply' }));
+    expect(result.outcome).toBe('incomplete');
+    expect(result.reasonCode).toBe('sweep-unrecorded');
+    expect(result.branches[0]!.outcome).toBe('deleted');
+  });
+
+  it('a dry-run reports would-delete for links too and calls nothing', async () => {
+    const { useCase, chains, forge } = harness();
+    chains.result = { status: 'ok', records: [record('foo', 'landed', ['feature/widget-1'])] };
+    const result = await useCase.runSweepChains(command({ mode: 'dry-run' }));
+    expect(result.outcome).toBe('dry-run');
+    expect(result.branches).toHaveLength(2);
+    expect(result.branches[0]).toMatchObject({ branchName: 'feature/widget-1', role: 'link', outcome: 'would-delete' });
+    expect(result.branches[1]).toMatchObject({ branchName: 'chain/foo', role: 'chain', outcome: 'would-delete' });
     expect(forge.requests).toHaveLength(0);
   });
 });

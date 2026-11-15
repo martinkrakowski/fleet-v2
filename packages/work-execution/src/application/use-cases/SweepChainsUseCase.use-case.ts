@@ -1,18 +1,22 @@
 /**
- * SweepChainsUseCase (lane CO11): delete the branch of every chain record
+ * SweepChainsUseCase (lane CO11): delete the branches of every chain record
  * whose own `state` is the exact string `landed`. The order is the contract:
  * validate the envelope, list the chains, validate every record and every
  * `linkBranches` member before the first delete (one bad member means zero
- * deletes), then delete each landed chain's `chain/<name>` branch once
- * through the forge's `delete-branch` kind under the id
- * `chain-sweep/<name>@r<revision>/chain`. Dry-run is the default: deletion
- * runs only when the command's own `mode` is the exact string `apply`. A
- * `branch-gone` or repeated-id answer is `already-absent`, so a repeat after
- * a partial sweep completes. A malformed, unreadable, secret-shaped or
- * off-pattern member refuses the whole sweep; the raw rejected string is
- * never copied into any result. Worktrees are left to the reaper. No clock is
- * read here except the injected one; reasons, keys and chain names only,
- * never a path or an input value.
+ * deletes), then delete each landed chain's recorded link branches and
+ * finally its own `chain/<name>` branch through the forge's `delete-branch`
+ * kind (link id `chain-sweep/<name>@r<revision>/link/<index>`, chain id
+ * `chain-sweep/<name>@r<revision>/chain`; duplicates collapse into one
+ * delete). A record that already carries a `sweptAtIso` mark is skipped, and
+ * when every branch of a chain is deleted or already absent the mark is
+ * written through `recordChainSwept` by CAS, so the next tick does not repeat
+ * the sweep. Dry-run is the default: deletion runs only when the command's
+ * own `mode` is the exact string `apply`. A `branch-gone` or repeated-id
+ * answer is `already-absent`, so a repeat after a partial sweep completes. A
+ * malformed, unreadable, secret-shaped or off-pattern member refuses the
+ * whole sweep; the raw rejected string is never copied into any result.
+ * Worktrees are left to the reaper. No clock is read here except the injected
+ * one; reasons, keys and chain names only, never a path or an input value.
  */
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
@@ -109,10 +113,64 @@ function classifySweepBranch(chainName: unknown, branchName: unknown): string | 
   return 'not-chain-pattern';
 }
 
-interface PlannedDelete {
-  readonly chainName: string;
+/** A safe git branch name a recorded link may carry; stricter shapes are refusals. */
+const LINK_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+
+function isSafeLinkBranchName(branchName: string): boolean {
+  return (
+    branchName.length <= 200 &&
+    !branchName.includes('..') &&
+    !branchName.endsWith('/') &&
+    !branchName.endsWith('.') &&
+    !branchName.endsWith('.lock') &&
+    LINK_NAME_PATTERN.test(branchName)
+  );
+}
+
+/**
+ * The class of a recorded link member a sweep refuses, or null when the link
+ * is deletable: any safe branch name that is not protected, not another
+ * chain's branch and not secret-shaped. A link naming this chain's own
+ * `chain/<chainName>` branch classifies as null and collapses into the chain
+ * delete.
+ */
+function classifySweepLink(chainName: string, branchName: unknown): string | null {
+  if (typeof branchName !== 'string') {
+    return 'non-string';
+  }
+  if (isSecretShaped(branchName) || isSecretShaped(chainName)) {
+    return 'secret-shaped';
+  }
+  if (PROTECTED_BRANCHES.includes(branchName)) {
+    return branchName === 'release' ? 'release' : 'main';
+  }
+  if (branchName.startsWith('release/') || branchName.startsWith('releases/')) {
+    return 'release';
+  }
+  if (branchName.startsWith('refs/')) {
+    return 'unsafe';
+  }
+  if (branchName.startsWith('chain/')) {
+    if (parseBaseBranch(branchName) === undefined) {
+      return 'not-chain-pattern';
+    }
+    return branchName === `chain/${chainName}` ? null : 'other-chain';
+  }
+  return isSafeLinkBranchName(branchName) ? null : 'not-chain-pattern';
+}
+
+interface PlannedBranch {
+  readonly role: 'chain' | 'link';
+  readonly memberIndex: number | null;
   readonly branchName: string;
   readonly actionId: string;
+}
+
+/** One landed chain's planned sweep: its link branches first, its own branch last. */
+interface PlannedChain {
+  readonly chainName: string;
+  readonly revision: number;
+  readonly branches: readonly PlannedBranch[];
 }
 
 type SweepRefusal =
@@ -125,6 +183,11 @@ type SweepRefusal =
       readonly memberRole: 'chain' | 'link';
       readonly memberIndex: number | null;
     };
+
+/** True for a refusal inside the mixed link-plan answer. */
+function isSweepRefusal(value: unknown): value is SweepRefusal {
+  return typeof value === 'object' && value !== null && 'kind' in value;
+}
 
 function refusalResult(refusal: SweepRefusal): SweepChainsResult {
   if (refusal.kind === 'branch') {
@@ -185,9 +248,10 @@ const KNOWN_STATES: readonly string[] = ['intent-recorded', 'started', 'refused'
 
 /**
  * Validate one chain record's own data properties. Returns the plan entry for
- * a landed chain, null for a skipped non-landed record, or a refusal.
+ * a landed chain, null for a skipped record (non-landed, or already swept),
+ * or a refusal.
  */
-function readRecord(record: unknown): PlannedDelete | null | SweepRefusal {
+function readRecord(record: unknown): PlannedChain | null | SweepRefusal {
   try {
     if (typeof record !== 'object' || record === null || Array.isArray(record)) {
       return { kind: 'plain', reasonCode: 'record-malformed' };
@@ -223,7 +287,26 @@ function readRecord(record: unknown): PlannedDelete | null | SweepRefusal {
     if (state !== 'landed') {
       return null;
     }
-    return { chainName, branchName, actionId: `chain-sweep/${chainName}@r${revision}/chain` };
+    // A record a previous sweep already handled is skipped, never re-swept.
+    const sweptAtIso = ownValue(record, 'sweptAtIso');
+    if (sweptAtIso !== undefined && sweptAtIso !== null) {
+      if (typeof sweptAtIso !== 'string' || !isZonedIsoDateTime(sweptAtIso)) {
+        return { kind: 'plain', reasonCode: 'record-malformed' };
+      }
+      return null;
+    }
+    return {
+      chainName,
+      revision,
+      branches: [
+        {
+          role: 'chain',
+          memberIndex: null,
+          branchName,
+          actionId: `chain-sweep/${chainName}@r${revision}/chain`,
+        },
+      ],
+    };
   } catch {
     return { kind: 'plain', reasonCode: 'record-malformed' };
   }
@@ -232,7 +315,7 @@ function readRecord(record: unknown): PlannedDelete | null | SweepRefusal {
 export class SweepChainsUseCase implements SweepChainsPort {
   constructor(
     private readonly deps: {
-      readonly chains: Pick<ChainRepositoryPort, 'listChains'>;
+      readonly chains: Pick<ChainRepositoryPort, 'listChains' | 'recordChainSwept'>;
       readonly forge: MergeForgeActionPort;
       readonly now: () => string;
     },
@@ -275,7 +358,7 @@ export class SweepChainsUseCase implements SweepChainsPort {
     if (typeof listed === 'string') {
       return refusalResult({ kind: 'plain', reasonCode: listed });
     }
-    const planned: PlannedDelete[] = [];
+    const planned: PlannedChain[] = [];
     const seenChains = new Set<string>();
     const records = listed;
     const count = records.length;
@@ -287,10 +370,7 @@ export class SweepChainsUseCase implements SweepChainsPort {
       if (read === null) {
         continue;
       }
-      if ('kind' in read && read.kind === 'plain') {
-        return refusalResult(read);
-      }
-      if ('kind' in read && read.kind === 'branch') {
+      if ('kind' in read) {
         return refusalResult(read);
       }
       // A landed record: validate its linkBranches membership before any delete.
@@ -298,12 +378,12 @@ export class SweepChainsUseCase implements SweepChainsPort {
       if (typeof links === 'string') {
         return refusalResult({ kind: 'plain', reasonCode: links });
       }
-      for (const refusal of links) {
-        return refusalResult(refusal);
+      if (links.length > 0 && isSweepRefusal(links[0])) {
+        return refusalResult(links[0]);
       }
       if (!seenChains.has(read.chainName)) {
         seenChains.add(read.chainName);
-        planned.push(read);
+        planned.push({ ...read, branches: [...(links as readonly PlannedBranch[]), ...read.branches] });
       }
     }
     if (!command.apply) {
@@ -314,14 +394,16 @@ export class SweepChainsUseCase implements SweepChainsPort {
         chainName: null,
         memberRole: null,
         memberIndex: null,
-        branches: planned.map((entry) => ({
-          chainName: entry.chainName,
-          role: 'chain' as const,
-          actionId: entry.actionId,
-          branchName: entry.branchName,
-          outcome: 'would-delete' as const,
-          reasonCode: null,
-        })),
+        branches: planned.flatMap((chain) =>
+          chain.branches.map((entry) => ({
+            chainName: chain.chainName,
+            role: entry.role,
+            actionId: entry.actionId,
+            branchName: entry.branchName,
+            outcome: 'would-delete' as const,
+            reasonCode: null,
+          })),
+        ),
       };
     }
     return this.apply(command, planned);
@@ -354,10 +436,15 @@ export class SweepChainsUseCase implements SweepChainsPort {
 
   /**
    * Read one landed record's `linkBranches` own property: a string is the
-   * refusal reason, otherwise each member is classified and every refusal is
-   * returned. Duplicate valid links collapse into the one planned delete.
+   * refusal reason, refusals name a rejected member, and otherwise every
+   * deletable link becomes a planned delete (link branches first, so the
+   * chain branch goes last). A link naming this chain's own branch, and
+   * duplicates of an already planned link, collapse into nothing new.
    */
-  private readLinkBranches(source: unknown, record: PlannedDelete): string | readonly SweepRefusal[] {
+  private readLinkBranches(
+    source: unknown,
+    chain: PlannedChain,
+  ): readonly PlannedBranch[] | readonly SweepRefusal[] | string {
     try {
       const raw = ownValue(source, 'linkBranches');
       if (raw === undefined || raw === null) {
@@ -369,30 +456,44 @@ export class SweepChainsUseCase implements SweepChainsPort {
       if (!Number.isSafeInteger(raw.length) || raw.length > MAX_LINKS) {
         return 'too-many-members';
       }
-      const refusals: SweepRefusal[] = [];
+      const links: PlannedBranch[] = [];
+      const seen = new Set<string>();
       for (let index = 0; index < raw.length; index += 1) {
         if (!Object.hasOwn(raw, index)) {
           return [{ kind: 'plain', reasonCode: 'record-malformed' }];
         }
-        const branchClass = classifySweepBranch(record.chainName, raw[index]);
-        if (branchClass !== null || raw[index] !== record.branchName) {
-          refusals.push({
-            kind: 'branch',
-            reasonCode: 'branch-pattern-refused',
-            branchClass: branchClass ?? 'not-chain-pattern',
-            chainName: record.chainName,
-            memberRole: 'link',
-            memberIndex: index,
-          });
+        const branchClass = classifySweepLink(chain.chainName, raw[index]);
+        if (branchClass !== null) {
+          return [
+            {
+              kind: 'branch',
+              reasonCode: 'branch-pattern-refused',
+              branchClass,
+              chainName: chain.chainName,
+              memberRole: 'link',
+              memberIndex: index,
+            },
+          ];
         }
+        const branchName = raw[index] as string;
+        if (branchName === chain.branches[chain.branches.length - 1]!.branchName || seen.has(branchName)) {
+          continue;
+        }
+        seen.add(branchName);
+        links.push({
+          role: 'link',
+          memberIndex: index,
+          branchName,
+          actionId: `chain-sweep/${chain.chainName}@r${chain.revision}/link/${index}`,
+        });
       }
-      return refusals;
+      return links;
     } catch {
       return 'record-malformed';
     }
   }
 
-  private async apply(command: ValidCommand, planned: readonly PlannedDelete[]): Promise<SweepChainsResult> {
+  private async apply(command: ValidCommand, planned: readonly PlannedChain[]): Promise<SweepChainsResult> {
     try {
       if (typeof this.deps.forge?.isConfigured !== 'function' || this.deps.forge.isConfigured() === false) {
         return refusalResult({ kind: 'plain', reasonCode: 'forge-not-configured' });
@@ -415,39 +516,76 @@ export class SweepChainsUseCase implements SweepChainsPort {
       };
     }
     const branches: SweepChainsBranchReport[] = [];
-    for (const entry of planned) {
-      const nowIso = this.safeNow();
-      if (!this.hasBudget(command.deadlineIso, nowIso)) {
-        return { outcome: 'budget-exhausted', reasonCode: null, branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
-      }
-      let result;
-      try {
-        result = await this.deps.forge.performMergeForgeAction({
-          kind: 'delete-branch',
-          actionId: entry.actionId,
-          repository: command.repository,
-          branchName: entry.branchName,
-          deadlineIso: command.deadlineIso,
-        });
-      } catch {
+    for (const chain of planned) {
+      for (const entry of chain.branches) {
+        const nowIso = this.safeNow();
+        if (!this.hasBudget(command.deadlineIso, nowIso)) {
+          return { outcome: 'budget-exhausted', reasonCode: null, branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
+        }
+        let result;
+        try {
+          result = await this.deps.forge.performMergeForgeAction({
+            kind: 'delete-branch',
+            actionId: entry.actionId,
+            repository: command.repository,
+            branchName: entry.branchName,
+            deadlineIso: command.deadlineIso,
+          });
+        } catch {
+          return { outcome: 'incomplete', reasonCode: 'delete-ambiguous', branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
+        }
+        if (result.outcome === 'executed') {
+          branches.push({ chainName: chain.chainName, role: entry.role, actionId: entry.actionId, branchName: entry.branchName, outcome: 'deleted', reasonCode: null });
+          continue;
+        }
+        if (result.outcome === 'branch-gone' || result.outcome === 'already-applied') {
+          branches.push({ chainName: chain.chainName, role: entry.role, actionId: entry.actionId, branchName: entry.branchName, outcome: 'already-absent', reasonCode: null });
+          continue;
+        }
+        if (result.outcome === 'refused' && result.reason === 'budget-exhausted') {
+          return { outcome: 'budget-exhausted', reasonCode: null, branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
+        }
+        if (result.outcome === 'refused') {
+          return { outcome: 'incomplete', reasonCode: 'delete-refused', branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
+        }
         return { outcome: 'incomplete', reasonCode: 'delete-ambiguous', branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
       }
-      if (result.outcome === 'executed') {
-        branches.push({ chainName: entry.chainName, role: 'chain', actionId: entry.actionId, branchName: entry.branchName, outcome: 'deleted', reasonCode: null });
-        continue;
+      // Every branch of this chain is deleted or already absent: write the
+      // sweep mark so the next tick skips it. A failed mark leaves the record
+      // for the next retry, which completes as `already-absent` and marks again.
+      const markRefusal = await this.recordSwept(command, chain);
+      if (markRefusal !== null) {
+        return { outcome: 'incomplete', reasonCode: markRefusal, branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
       }
-      if (result.outcome === 'branch-gone' || result.outcome === 'already-applied') {
-        branches.push({ chainName: entry.chainName, role: 'chain', actionId: entry.actionId, branchName: entry.branchName, outcome: 'already-absent', reasonCode: null });
-        continue;
-      }
-      if (result.outcome === 'refused' && result.reason === 'budget-exhausted') {
-        return { outcome: 'budget-exhausted', reasonCode: null, branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
-      }
-      if (result.outcome === 'refused') {
-        return { outcome: 'incomplete', reasonCode: 'delete-refused', branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
-      }
-      return { outcome: 'incomplete', reasonCode: 'delete-ambiguous', branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
     }
     return { outcome: 'completed', reasonCode: null, branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
+  }
+
+  /**
+   * Write one swept chain's handled mark by CAS on the revision the list
+   * read. Null when recorded (or already recorded); a fixed refusal code
+   * otherwise. Never throws.
+   */
+  private async recordSwept(command: ValidCommand, chain: PlannedChain): Promise<string | null> {
+    const record = this.deps.chains?.recordChainSwept;
+    if (typeof record !== 'function') {
+      return 'sweep-unrecorded';
+    }
+    try {
+      const decision = await record.call(this.deps.chains, {
+        repository: command.repository,
+        chainName: chain.chainName,
+        expectedRevision: chain.revision,
+        sweptAtIso: command.nowIso,
+        deadlineIso: command.deadlineIso,
+      });
+      if (decision === null || typeof decision !== 'object') {
+        return 'sweep-unrecorded';
+      }
+      const outcome = (decision as { readonly outcome?: unknown }).outcome;
+      return outcome === 'recorded' || outcome === 'already-recorded' ? null : 'sweep-unrecorded';
+    } catch {
+      return 'sweep-unrecorded';
+    }
   }
 }

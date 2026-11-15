@@ -168,6 +168,9 @@ function harness(script: Script = {}) {
     async recordChainRefreshOutcome() {
       throw new Error('not used');
     },
+    async recordChainSwept() {
+      throw new Error('not used');
+    },
   };
 
   const useCase = new ReviewChainUseCase({

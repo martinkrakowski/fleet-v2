@@ -64,6 +64,13 @@ export type ParsedDaemonJobId =
       readonly touchesForge: true;
     }
   | {
+      readonly kind: 'chain-sweep';
+      readonly jobId: string;
+      readonly repoDigest: string;
+      readonly leaseScope: string;
+      readonly touchesForge: true;
+    }
+  | {
       readonly kind: 'notifier';
       readonly jobId: 'notifier';
       readonly leaseScope: 'notifier';
@@ -317,6 +324,14 @@ export function chainRefreshJobId(repoDigest: string): string | null {
   return `chain-refresh:${repoDigest}`;
 }
 
+/** The chain-sweep job id of a repository digest (lane CO11): `chain-sweep:<repoDigest>`. */
+export function chainSweepJobId(repoDigest: string): string | null {
+  if (!DAEMON_REPO_DIGEST_PATTERN.test(repoDigest)) {
+    return null;
+  }
+  return `chain-sweep:${repoDigest}`;
+}
+
 const NOTIFIER_JOB: ParsedDaemonJobId = Object.freeze({
   kind: 'notifier',
   jobId: 'notifier',
@@ -367,14 +382,27 @@ export function parseDaemonJobId(jobId: unknown): ParsedDaemonJobId | null {
       touchesForge: true,
     });
   }
+  if (jobId.startsWith('chain-sweep:')) {
+    const repoDigest = jobId.slice('chain-sweep:'.length);
+    if (!DAEMON_REPO_DIGEST_PATTERN.test(repoDigest)) {
+      return null;
+    }
+    return Object.freeze({
+      kind: 'chain-sweep',
+      jobId,
+      repoDigest,
+      leaseScope: `chain-sweep/${repoDigest}`,
+      touchesForge: true,
+    });
+  }
   return null;
 }
 
 /**
  * True for `notifier`, `replan-digest`, `merge/<12 lowercase hex>`,
- * `chain-refresh/<12 lowercase hex>`, or a cloud `<org>/<repo>` scope whose
- * segments are not `.` or `..` and which carries no secret-shaped text. Never
- * throws.
+ * `chain-refresh/<12 lowercase hex>`, `chain-sweep/<12 lowercase hex>`, or a
+ * cloud `<org>/<repo>` scope whose segments are not `.` or `..` and which
+ * carries no secret-shaped text. Never throws.
  */
 export function isValidDaemonLeaseScope(scope: unknown): scope is string {
   try {
@@ -390,6 +418,12 @@ export function isValidDaemonLeaseScope(scope: unknown): scope is string {
     if (
       scope.startsWith('chain-refresh/') &&
       DAEMON_REPO_DIGEST_PATTERN.test(scope.slice('chain-refresh/'.length))
+    ) {
+      return true;
+    }
+    if (
+      scope.startsWith('chain-sweep/') &&
+      DAEMON_REPO_DIGEST_PATTERN.test(scope.slice('chain-sweep/'.length))
     ) {
       return true;
     }
@@ -455,8 +489,9 @@ function compareMergePassJobs(
 /**
  * Deterministic tick order (plan §3.1): merge-pass jobs by `lastServedAtIso`
  * ascending from the previous status (never-served first, ties by digest),
- * then chain-refresh jobs by digest, then `notifier`, then `replan-digest`.
- * Duplicates keep the first; unknown ids drop; a given filter keeps only listed ids.
+ * then chain-refresh jobs by digest, then chain-sweep jobs by digest, then
+ * `notifier`, then `replan-digest`. Duplicates keep the first; unknown ids
+ * drop; a given filter keeps only listed ids.
  */
 export function orderDaemonJobs(
   candidates: readonly string[],
@@ -467,6 +502,7 @@ export function orderDaemonJobs(
   const seen = new Set<string>();
   const mergePass: Extract<ParsedDaemonJobId, { kind: 'merge-pass' }>[] = [];
   const chainRefresh: Extract<ParsedDaemonJobId, { kind: 'chain-refresh' }>[] = [];
+  const chainSweep: Extract<ParsedDaemonJobId, { kind: 'chain-sweep' }>[] = [];
   let notifier: ParsedDaemonJobId | null = null;
   let replanDigest: ParsedDaemonJobId | null = null;
   for (const candidate of candidates) {
@@ -482,6 +518,8 @@ export function orderDaemonJobs(
       mergePass.push(parsed);
     } else if (parsed.kind === 'chain-refresh') {
       chainRefresh.push(parsed);
+    } else if (parsed.kind === 'chain-sweep') {
+      chainSweep.push(parsed);
     } else if (parsed.kind === 'notifier' && notifier === null) {
       notifier = parsed;
     } else if (parsed.kind === 'replan-digest' && replanDigest === null) {
@@ -491,6 +529,7 @@ export function orderDaemonJobs(
   const lastServed = lastServedMap(previousStatus);
   const ordered: ParsedDaemonJobId[] = mergePass.sort((a, b) => compareMergePassJobs(a, b, lastServed));
   ordered.push(...chainRefresh.sort((a, b) => byCodeUnit(a.repoDigest, b.repoDigest)));
+  ordered.push(...chainSweep.sort((a, b) => byCodeUnit(a.repoDigest, b.repoDigest)));
   if (notifier !== null) {
     ordered.push(notifier);
   }

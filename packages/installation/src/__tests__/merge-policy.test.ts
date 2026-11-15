@@ -11,7 +11,11 @@ import {
   readProjectPrepareArgv,
   resolveMergePolicy,
 } from '../policy.js';
-import { loadInstallation, requireValidInstallationModel } from '../load.js';
+import {
+  InvalidInstallationError,
+  loadInstallation,
+  requireValidInstallationModel,
+} from '../load.js';
 import { writeInstallationV2 } from '../write.js';
 import type {
   FleetInstallationV2,
@@ -835,6 +839,51 @@ describe('per-project prepare argv policy (CO22)', () => {
     const entry = { projectId, prepare: [] };
     expectInvalid(resolveMergePolicy(reposWith(entry, repoKey)), 'policy-merge-invalid');
     expectInvalidRead(readProjectPrepareArgv(reposWith(entry, repoKey), projectId), 'policy-merge-invalid');
+  });
+
+  it('refuses an invalid prepare argv at the requireValidInstallationModel boundary', () => {
+    const parsed = parseWithPrepare(['yarn', 'install']);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      throw new Error(parsed.errors.join('; '));
+    }
+    const base = parsed.installation as FleetInstallationV2;
+    const installationWithPrepare = (prepare: unknown): FleetInstallationV2 =>
+      ({
+        ...base,
+        policy: {
+          ...base.policy,
+          merge: { repos: { [repoKey]: { projectId, prepare } } },
+        },
+      }) as unknown as FleetInstallationV2;
+
+    // An installation that reaches the model boundary without going through
+    // parseInstallation (e.g. built in memory) cannot carry an argv the
+    // parser would have refused: requireValidInstallationModel itself throws.
+    const error = (() => {
+      try {
+        requireValidInstallationModel(installationWithPrepare(['yarn', 'install;rm']));
+      } catch (caught) {
+        return caught as InvalidInstallationError;
+      }
+      return undefined;
+    })();
+    expect(error).toBeInstanceOf(InvalidInstallationError);
+    expect(error?.errors).toEqual([
+      `policy.merge.repos["${repoKey}"].prepare[1]: must not contain whitespace, control characters or shell metacharacters`,
+    ]);
+
+    // Every argv shape the parser refuses is refused at the boundary too.
+    for (const prepare of [[], null, 42, [''], ['..', 'run'], ['yarn', 'a b']]) {
+      expect(() => requireValidInstallationModel(installationWithPrepare(prepare))).toThrow(
+        InvalidInstallationError,
+      );
+    }
+
+    // A valid argv still passes the boundary.
+    expect(() =>
+      requireValidInstallationModel(installationWithPrepare(['yarn', 'install', '--immutable'])),
+    ).not.toThrow();
   });
 
   it('refuses non-array prepare values including null, primitives, plain objects, and non-array iterables', () => {

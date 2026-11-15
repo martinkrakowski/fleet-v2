@@ -2664,7 +2664,7 @@ function readMergeProjectId(entry: JsonObject, path: string, errors: string[]): 
  * echoed — and the whole argv is refused the moment any element fails, so an
  * unvalidated argv is never passed through.
  */
-function parsePrepareArgv(
+export function parsePrepareArgv(
   value: unknown,
   path: string,
   errors: string[],

@@ -177,11 +177,15 @@ export async function laneCommand(
           : {}),
       });
     }
-    if (result === null || typeof result !== 'object') {
+    if (result === null || typeof result !== 'object' || Array.isArray(result)) {
       io.stderr('lane diff-check: unknown\n');
       return 1;
     }
-    if (result.outcome === 'clean') {
+    // Success requires exactly `{outcome:'clean'}` on a plain object. An
+    // array carrying the property, or a clean result with any extra field,
+    // is a malformed result and fails closed.
+    const resultKeys = Object.keys(result as Record<string, unknown>);
+    if (result.outcome === 'clean' && resultKeys.length === 1) {
       // A clean scan with the base-line allowance off is not a pass: the
       // committed range cannot be named without a sha, and a ref is
       // lane-writable. The one warning is the stderr; stdout stays empty.
@@ -193,11 +197,22 @@ export async function laneCommand(
         io.stderr('lane diff-check: unknown\n');
         return 1;
       }
-      if (!findings.every(isSafeFinding)) {
-        io.stderr('lane diff-check: unknown\n');
-        return 1;
+      // Index by number instead of `every`: `every` skips sparse-array
+      // holes and a result array carrying its own `every` method would
+      // override the call. A hole yields undefined and is rejected.
+      const findingList: readonly unknown[] = findings;
+      for (let index = 0; index < findingList.length; index += 1) {
+        if (!isSafeFinding(findingList[index])) {
+          io.stderr('lane diff-check: unknown\n');
+          return 1;
+        }
       }
-      for (const finding of findings) {
+      for (let index = 0; index < findingList.length; index += 1) {
+        const finding = findingList[index] as {
+          path: string;
+          line?: number;
+          rule: string;
+        };
         io.stdout(
           finding.line === undefined
             ? `${finding.path}:${finding.rule}\n`

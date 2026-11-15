@@ -271,6 +271,62 @@ describe("lane diff-check command", () => {
     expect(stderr).toEqual(["lane diff-check: unknown\n"]);
   });
 
+  it("a sparse hole or an own every override in findings exits 1", async () => {
+    const { io, stdout, stderr } = capturingIo();
+    // A sparse array: `every` skips the hole, an index loop does not.
+    const sparse = [
+      { path: "ok.ts", line: 1, rule: "secret-pattern:aws-access-key" },
+    ] as unknown[];
+    sparse[2] = {
+      path: "late.ts",
+      line: 2,
+      rule: "secret-pattern:aws-access-key",
+    };
+    const code = await laneCommand(
+      READY_ARGV,
+      io,
+      fakeChecker(() => ({ outcome: "findings", findings: sparse } as never)),
+    );
+    expect(code).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(stderr).toEqual(["lane diff-check: unknown\n"]);
+  });
+
+  it("a clean result with an extra field or an array shape exits 1", async () => {
+    const { io, stdout, stderr } = capturingIo();
+    const malformed = {
+      outcome: "clean",
+      extra: 1,
+    } as unknown as LaneDiffCheckResult;
+    const arrayShape = ["clean"] as unknown as LaneDiffCheckResult;
+    let code = await laneCommand(
+      READY_ARGV,
+      io,
+      fakeChecker(() => malformed),
+    );
+    expect(code).toBe(1);
+    code = await laneCommand(
+      READY_ARGV,
+      io,
+      fakeChecker(() => arrayShape),
+    );
+    expect(code).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(stderr.join("")).not.toContain("extra");
+  });
+
+  it("a clean result with only the outcome exits 0 for a trusted base", async () => {
+    const { io, stdout, stderr } = capturingIo();
+    const code = await laneCommand(
+      READY_ARGV,
+      io,
+      fakeChecker(() => ({ outcome: "clean" })),
+    );
+    expect(code).toBe(0);
+    expect(stdout).toEqual([]);
+    expect(stderr).toEqual([]);
+  });
+
   it("a throwing getter on the checker result exits 1", async () => {
     const { io, stdout, stderr } = capturingIo();
     const checker = fakeChecker(() => ({ outcome: "clean" }));

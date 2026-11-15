@@ -257,6 +257,43 @@ export function laneRunMergeHold(tier: LaneRunTier, preMerge: LaneRunPreMergeRec
   return { kind: 'park', status: null, reason: 'ambiguous', qualifier: 'pre-merge' };
 }
 
+export const PREMERGE_MODES = ['human-gate', 'auto-attest'] as const;
+
+export type PremergeMode = (typeof PREMERGE_MODES)[number];
+
+export const DEFAULT_PREMERGE_MODE: PremergeMode = 'human-gate';
+
+/**
+ * AP1 fail-closed normalizer: only the exact literal `'auto-attest'` enables
+ * automatic Tier 2 pre-merge `'success'` attestation; `'human-gate'`,
+ * `undefined`, or any unknown value normalizes to `'human-gate'`.
+ * Constant-time: one strict-equality comparison, no iteration, no throwing.
+ */
+export function normalizePremergeMode(mode: unknown): PremergeMode {
+  return mode === 'auto-attest' ? 'auto-attest' : DEFAULT_PREMERGE_MODE;
+}
+
+/**
+ * AP1 policy gate over `laneRunMergeHold`:
+ * - Tier 1 `'released'`, any `'fail'`, `'wait'`, or `'park'` hold is unchanged.
+ * - Tier 2 `'released'` stays `'released'` only when `normalizePremergeMode(mode) === 'auto-attest'`;
+ *   under `'human-gate'` (default) it stays `{ kind: 'wait', status: 'pending' }`.
+ */
+export function effectivePremergeHold(
+  hold: LaneRunMergeHold,
+  tier: LaneRunTier,
+  mode?: unknown,
+): LaneRunMergeHold {
+  if (
+    hold.kind === 'released' &&
+    tier === 2 &&
+    normalizePremergeMode(mode) !== 'auto-attest'
+  ) {
+    return { kind: 'wait', status: 'pending' };
+  }
+  return hold;
+}
+
 /**
  * How the repository merges (speed plan §3.3): a merge queue (D21), or strict up-to-date checks with forge
  * branch updates (D22). A-0 found no queue for fleet-v2, so the conductor runs `strict`.

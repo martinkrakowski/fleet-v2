@@ -30,6 +30,12 @@ import {
   strongerStopMode,
   workOrderReleaseFor,
 } from '../lane-run-transitions.js';
+import {
+  DEFAULT_PREMERGE_MODE,
+  effectivePremergeHold,
+  normalizePremergeMode,
+  PREMERGE_MODES,
+} from '../lane-run-transitions.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const BASE_RECORD = {
@@ -520,6 +526,63 @@ describe('speed-plan rows (KS1: D19, D20, D22, D24)', () => {
       throw new Error('expected a fix round');
     }
     expect(canEnterLaneRunState('merging', failed.outcome.to)).toBe(true);
+  });
+
+  describe('normalizePremergeMode and effectivePremergeHold (AP1)', () => {
+    it('the mode literals and the default are the fail-closed set', () => {
+      expect(PREMERGE_MODES).toEqual(['human-gate', 'auto-attest']);
+      expect(DEFAULT_PREMERGE_MODE).toBe('human-gate');
+    });
+
+    it('normalizePremergeMode: only the exact literal auto-attest enables attestation; everything else fails closed', () => {
+      expect(normalizePremergeMode('auto-attest')).toBe('auto-attest');
+      for (const hostile of [
+        'human-gate',
+        undefined,
+        null,
+        '',
+        'AUTO-ATTEST',
+        'auto',
+        true,
+        false,
+        0,
+        1,
+        {},
+        [],
+        ['auto-attest'],
+        { mode: 'auto-attest' },
+      ]) {
+        expect(normalizePremergeMode(hostile)).toBe('human-gate');
+      }
+      expect(normalizePremergeMode('x'.repeat(100_000))).toBe('human-gate');
+    });
+
+    it('effectivePremergeHold: Tier 2 released stays released only under auto-attest, else downgrades to wait', () => {
+      const released = { kind: 'released', status: 'success' } as const;
+      expect(effectivePremergeHold(released, 2, 'auto-attest')).toEqual(released);
+      expect(effectivePremergeHold(released, 2, 'human-gate')).toEqual({ kind: 'wait', status: 'pending' });
+      expect(effectivePremergeHold(released, 2, undefined)).toEqual({ kind: 'wait', status: 'pending' });
+      expect(effectivePremergeHold(released, 2, 'invalid')).toEqual({ kind: 'wait', status: 'pending' });
+      expect(effectivePremergeHold(released, 2)).toEqual({ kind: 'wait', status: 'pending' });
+    });
+
+    it('effectivePremergeHold: Tier 1 released is unaffected by the mode in both directions', () => {
+      const released = { kind: 'released', status: 'success' } as const;
+      expect(effectivePremergeHold(released, 1, 'human-gate')).toEqual(released);
+      expect(effectivePremergeHold(released, 1, 'auto-attest')).toEqual(released);
+      expect(effectivePremergeHold(released, 1, undefined)).toEqual(released);
+    });
+
+    it('effectivePremergeHold: fail and park holds pass through unchanged in both modes', () => {
+      const fail = {
+        kind: 'fail', status: 'failure', outcome: { kind: 'enter', to: 'fixing', nextRound: 2 },
+      } as const;
+      const park = { kind: 'park', status: null, reason: 'ambiguous', qualifier: 'pre-merge' } as const;
+      for (const mode of ['human-gate', 'auto-attest', undefined] as const) {
+        expect(effectivePremergeHold(fail, 2, mode)).toEqual(fail);
+        expect(effectivePremergeHold(park, 2, mode)).toEqual(park);
+      }
+    });
   });
 
   it('branch-behind exit: a queue never parks; strict updates the branch or parks on an overlap', () => {

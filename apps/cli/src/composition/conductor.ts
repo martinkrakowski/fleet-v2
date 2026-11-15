@@ -56,10 +56,15 @@ import type { CoordinationRequestRepositoryAdapter } from '@fleet/operator-coord
 import {
   DEFAULT_MERGE_DAEMON_POLICY,
   conductorRevision,
+  deriveInstallationModel,
   resolveConductorPolicy,
   resolveMergePolicy,
 } from '@fleet/installation';
-import { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
+import {
+  assessmentIdForAttempt,
+  reviewerChainSeatIds,
+  selectReviewerSeat,
+} from '@fleet/evidence-and-acceptance';
 
 import type { FleetCliRuntime } from '../composition.js';
 import type { FleetInstallation, LoadResult } from '@fleet/installation';
@@ -156,19 +161,132 @@ export function composeConductor(input: ComposeConductorInput) {
   // The review request adapter, shared by the review step and the status view's
   // read-only findings projection (GB2). Hoisted above the conductor literal so
   // today the inspect use case can read the parked head's latest receipt.
-  const reviewRequest = new ReviewRequestAdapter({
-    requestIndependentReview: (request) =>
-      evidence.requestIndependentReview.requestIndependentReview(request),
-    inspectAcceptanceEvidence: (request) =>
-      evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence(request),
+  // D1C fix round 2: the adapter's opencode fallback keys off the api reviewer
+  // seat's model (the api-route guard) and the opencode reviewer seat's model
+  // (the fallback seat), so the composed delegates carry both, derived from the
+  // installation's reviewer chains through the review transport router's
+  // model-specific seat selection (chain order, duplicates dropped). Whenever
+  // the reviewer chains contain one or more distinct api reviewer models, each
+  // api model routes its fallback to the opencode reviewer seat; without any
+  // api reviewer seat neither value is set and the fallback stays off — the
+  // fail-closed default, not a silent degradation.
+  const derivedInstallation =
+    installation !== undefined ? deriveInstallationModel(installation).model : undefined;
+  const installationSeats = derivedInstallation?.seats ?? installation?.seats ?? [];
+  const installationChains = derivedInstallation?.chains ?? installation?.chains;
+  const reviewerChainSeatIdList = reviewerChainSeatIds(installationChains);
+  const reviewerSeats = reviewerChainSeatIdList
+    .map((id) => installationSeats.find((seat) => seat.id === id))
+    .filter((seat): seat is NonNullable<typeof seat> => seat !== undefined);
+  const apiReviewerModels: string[] = [];
+  for (const seat of reviewerSeats) {
+    if (seat.tool !== 'api' || apiReviewerModels.includes(seat.model)) {
+      continue;
+    }
+    const selected = selectReviewerSeat(installationSeats, installationChains, seat.model);
+    if (selected.ok && selected.seat.tool === 'api') {
+      apiReviewerModels.push(selected.seat.model);
+    }
+  }
+  const isSelectableOpencodeSeat = (
+    seat: (typeof reviewerSeats)[number],
+    apiModel: string,
+  ): boolean => {
+    if (seat.tool !== 'opencode' || seat.model === apiModel) {
+      return false;
+    }
+    const selected = selectReviewerSeat(installationSeats, installationChains, seat.model);
+    return selected.ok && selected.seat.tool === 'opencode';
+  };
+  const opencodeFallbackModelFor = (apiModel: string): string | undefined => {
+    const chainList = [installationChains?.reviewer, installationChains?.['high-risk-reviewer']];
+    for (const chain of chainList) {
+      if (chain === undefined) {
+        continue;
+      }
+      const chainSeats = chain
+        .map((step) => installationSeats.find((seat) => seat.id === step.seatId))
+        .filter((seat): seat is NonNullable<typeof seat> => seat !== undefined);
+      if (!chainSeats.some((seat) => seat.tool === 'api' && seat.model === apiModel)) {
+        continue;
+      }
+      const sameChainFallback = chainSeats.find((seat) => isSelectableOpencodeSeat(seat, apiModel));
+      if (sameChainFallback !== undefined) {
+        return sameChainFallback.model;
+      }
+    }
+    return reviewerSeats.find((seat) => isSelectableOpencodeSeat(seat, apiModel))?.model;
+  };
+  const baseReviewRequestDelegates = {
+    requestIndependentReview: (
+      request: Parameters<typeof evidence.requestIndependentReview.requestIndependentReview>[0],
+    ) => evidence.requestIndependentReview.requestIndependentReview(request),
+    inspectAcceptanceEvidence: (
+      request: Parameters<typeof evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence>[0],
+    ) => evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence(request),
     // KF-33b2: the review step's out-of-scope dispositions through the
     // evidence context's existing disposition use case, one id per call.
-    recordFindingDisposition: (request) =>
-      evidence.recordFindingDisposition.recordFindingDisposition(request),
+    recordFindingDisposition: (
+      request: Parameters<typeof evidence.recordFindingDisposition.recordFindingDisposition>[0],
+    ) => evidence.recordFindingDisposition.recordFindingDisposition(request),
     // RV4: screen and archive a busy-transport diagnostic under the review
     // request id; an archive miss never changes the review outcome.
-    archiveEvidence: (request) => evidence.evidenceArchive.archiveEvidence(request),
+    archiveEvidence: (request: Parameters<typeof evidence.evidenceArchive.archiveEvidence>[0]) =>
+      evidence.evidenceArchive.archiveEvidence(request),
+  };
+  const primaryApiReviewerModel = apiReviewerModels[0];
+  const opencodeFallbackReviewerModel =
+    primaryApiReviewerModel === undefined
+      ? undefined
+      : opencodeFallbackModelFor(primaryApiReviewerModel);
+  const reviewRequest = new ReviewRequestAdapter({
+    ...baseReviewRequestDelegates,
+    // D1C fix round 2: the composed fallback route — only a request whose
+    // primary reviewer is an api seat's model retries once against the
+    // opencode reviewer seat's model; without an api reviewer seat neither
+    // is set and no fallback runs.
+    ...(primaryApiReviewerModel !== undefined ? { primaryApiReviewerModel } : {}),
+    ...(opencodeFallbackReviewerModel !== undefined ? { opencodeFallbackReviewerModel } : {}),
   });
+  if (apiReviewerModels.length > 1) {
+    const reviewRequestByApiModel = new Map<string, ReviewRequestAdapter>();
+    for (const apiModel of apiReviewerModels) {
+      const fallback = opencodeFallbackModelFor(apiModel);
+      reviewRequestByApiModel.set(
+        apiModel,
+        new ReviewRequestAdapter({
+          ...baseReviewRequestDelegates,
+          primaryApiReviewerModel: apiModel,
+          ...(fallback !== undefined ? { opencodeFallbackReviewerModel: fallback } : {}),
+        }),
+      );
+    }
+    const defaultRequestReview = reviewRequest.requestReview.bind(reviewRequest);
+    reviewRequest.requestReview = (request) => {
+      let requestedModel: unknown;
+      try {
+        if (typeof request === 'object' && request !== null) {
+          requestedModel = Object.getOwnPropertyDescriptor(request, 'reviewerModel')?.value;
+        }
+      } catch {
+        requestedModel = undefined;
+      }
+      if (typeof requestedModel === 'string') {
+        const selected = selectReviewerSeat(
+          installationSeats,
+          installationChains,
+          requestedModel,
+        );
+        if (selected.ok && selected.seat.tool === 'api') {
+          const perModelAdapter = reviewRequestByApiModel.get(selected.seat.model);
+          if (perModelAdapter !== undefined) {
+            return perModelAdapter.requestReview(request);
+          }
+        }
+      }
+      return defaultRequestReview(request);
+    };
+  }
 
   // C2': the scoped one-way owner approval behind the reap's
   // `--force-unsealed`, built from the coordination stack.

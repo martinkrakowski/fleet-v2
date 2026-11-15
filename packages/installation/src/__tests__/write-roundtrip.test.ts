@@ -227,6 +227,7 @@ const fullV2File = {
           maxAttempts: 3,
           checksGraceMinutes: 10,
           veto: { mode: 'shadow', holdConfidence: 0.8 },
+          prepare: ['yarn', 'install', '--immutable'],
         },
         'example-owner/second-repo': { projectId: 'second-project' },
       },

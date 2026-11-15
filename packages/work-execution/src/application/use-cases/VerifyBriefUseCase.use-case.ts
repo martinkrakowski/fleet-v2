@@ -168,7 +168,8 @@ function isValidAllowedPrefix(prefix: unknown): boolean {
  * established is not a model that proves independence, so an empty result
  * means the reviewer's independence cannot be verified.
  */
-function implementerModelsOf(manifestPaths: Record<string, unknown>): string[] {
+function implementerModelsOf(manifestPaths: Record<string, unknown>):
+  { ok: true; models: string[] } | { ok: false; code: 'invalid-model-assignment' | 'invalid-seat-plan' } {
   const models: string[] = [];
   const assignment = manifestPaths.modelAssignment;
   if (assignment !== null && typeof assignment === 'object' && !Array.isArray(assignment)) {
@@ -177,35 +178,45 @@ function implementerModelsOf(manifestPaths: Record<string, unknown>): string[] {
       models.push(model.trim());
     } else {
       // The authoring seat must be known; without it no independence is provable.
-      return [];
+      return { ok: false, code: 'invalid-model-assignment' };
     }
   } else {
-    return [];
+    return { ok: false, code: 'invalid-model-assignment' };
   }
   const seatPlan = manifestPaths.seatPlan;
-  if (seatPlan !== undefined && seatPlan !== null && typeof seatPlan === 'object' && !Array.isArray(seatPlan)) {
-    // The frozen plan groups its seats under role keys (SeatPlanProps).
+  if (seatPlan !== undefined && seatPlan !== null) {
+    // A seat plan, when declared, must be a plain record grouping its seats
+    // under role keys (SeatPlanProps). Anything else is malformed, and a
+    // malformed plan must fail closed: a skipped role would let verification
+    // pass while the independence check only covers the well-formed seats.
+    if (typeof seatPlan !== 'object' || Array.isArray(seatPlan)) {
+      return { ok: false, code: 'invalid-seat-plan' };
+    }
     for (const role of ['first-pass', 'fix'] as const) {
       const seats = (seatPlan as Record<string, unknown>)[role];
       if (!Array.isArray(seats)) {
-        // A malformed plan is the reader's refusal (`invalid-seat-plan`); skip it here.
+        // A role that is present but not a seat array is a malformed plan.
+        if (seats !== undefined) {
+          return { ok: false, code: 'invalid-seat-plan' };
+        }
         continue;
       }
       for (let index = 0; index < seats.length; index += 1) {
         const seat = Object.getOwnPropertyDescriptor(seats, String(index))?.value;
         if (seat === null || typeof seat !== 'object' || Array.isArray(seat)) {
-          continue;
+          // A null or array seat entry is a malformed plan, not a seat to skip.
+          return { ok: false, code: 'invalid-seat-plan' };
         }
         const model = (seat as { model?: unknown }).model;
         if (isValidScalar(model)) {
           models.push(model.trim());
         } else {
-          return [];
+          return { ok: false, code: 'invalid-model-assignment' };
         }
       }
     }
   }
-  return models;
+  return { ok: true, models };
 }
 
 interface Snapshot {
@@ -521,7 +532,11 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
     // frozen manifest declares (owner rule 2026-10-16, fail closed): the
     // same underlying model family after provider prefixes and tier variants
     // is never independence, and a seat whose model is unknown refuses.
-    const implementerModels = implementerModelsOf(manifestPaths);
+    const implementerRead = implementerModelsOf(manifestPaths);
+    if (!implementerRead.ok) {
+      return refuse('malformed-package', implementerRead.code);
+    }
+    const implementerModels = implementerRead.models;
     if (implementerModels.length === 0) {
       return refuse('malformed-package', 'invalid-model-assignment');
     }

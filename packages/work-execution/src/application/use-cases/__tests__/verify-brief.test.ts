@@ -669,6 +669,64 @@ describe('VerifyBriefUseCase', () => {
     expect(independent.outcome).toBe('verified');
   });
 
+  it('refuses a malformed seatPlan with invalid-seat-plan instead of skipping the malformed shape', async () => {
+    // A role value that is not an array: the malformed plan must refuse, not
+    // silently skip the role out of the independence check.
+    const nonArrayRole = await verifyWith(fixture((manifest) => {
+      manifest.seatPlan = {
+        version: 1,
+        'first-pass': [{ id: 'fp-1', model: 'impl-model', tool: 'opencode' }],
+        fix: { id: 'fx-1', model: 'fixer-model' },
+        review: [{ id: 'rv-1', model: REVIEWER }],
+      };
+    }));
+    expect(nonArrayRole).toEqual({
+      outcome: 'refused', reason: 'malformed-package', detail: 'invalid-seat-plan',
+    });
+
+    // A null seat entry.
+    const nullSeat = await verifyWith(fixture((manifest) => {
+      manifest.seatPlan = {
+        version: 1,
+        'first-pass': [null],
+        fix: [{ id: 'fx-1', model: 'fixer-model', tool: 'agy' }],
+        review: [{ id: 'rv-1', model: REVIEWER }],
+      };
+    }));
+    expect(nullSeat).toEqual({
+      outcome: 'refused', reason: 'malformed-package', detail: 'invalid-seat-plan',
+    });
+
+    // An array seat entry.
+    const arraySeat = await verifyWith(fixture((manifest) => {
+      manifest.seatPlan = {
+        version: 1,
+        'first-pass': [{ id: 'fp-1', model: 'impl-model', tool: 'opencode' }],
+        fix: [['fx-1', 'fixer-model']],
+        review: [{ id: 'rv-1', model: REVIEWER }],
+      };
+    }));
+    expect(arraySeat).toEqual({
+      outcome: 'refused', reason: 'malformed-package', detail: 'invalid-seat-plan',
+    });
+
+    // A seat plan that is not a plain record (an array).
+    const arrayPlan = await verifyWith(fixture((manifest) => {
+      manifest.seatPlan = [{ id: 'fp-1', model: 'impl-model' }];
+    }));
+    expect(arrayPlan).toEqual({
+      outcome: 'refused', reason: 'malformed-package', detail: 'invalid-seat-plan',
+    });
+
+    // A seat plan that is not even an object.
+    const scalarPlan = await verifyWith(fixture((manifest) => {
+      manifest.seatPlan = 'no-plan';
+    }));
+    expect(scalarPlan).toEqual({
+      outcome: 'refused', reason: 'malformed-package', detail: 'invalid-seat-plan',
+    });
+  });
+
   it('honours the manifest acceptance spec instead of an empty snapshot', async () => {
     // A manifest whose acceptance spec was removed (not merely emptied) is
     // refused as missing: with the spec read raw, the absence is what the

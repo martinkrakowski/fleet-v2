@@ -14,8 +14,9 @@
  * Results carry codes only: never a path, the answer or a secret.
  */
 
-import { randomBytes } from 'node:crypto';
-import { constants as fsConstants, promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import fsSync, { constants as fsConstants, promises as fs } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import type {
@@ -27,6 +28,7 @@ import type {
   BriefAuthorSessionUnavailableReason,
 } from '../../application/ports/out/BriefAuthoringPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+import { textContainsSecretShape } from '../../domain/brief-answer.js';
 
 export interface BriefAuthoringAdapterOptions {
   /** Reviewed orchestrator prose keyed by work order id. */
@@ -192,157 +194,251 @@ function resolveTimeout(requested: number | undefined, configured?: number): num
   return Math.min(candidate, MAX_TIMEOUT_MS);
 }
 
-const DEFAULT_LOCK_MAX_WAIT_MS = 15_000;
+const DEFAULT_LOCK_MAX_WAIT_MS = 1_000;
 const DEFAULT_LOCK_POLL_INTERVAL_MS = 25;
-const UNPARSEABLE_LOCK_GRACE_MS = 50;
+/** Bound on stale-takeover attempts per acquireLock call; the session lock polls and retries. */
+const MAX_TAKEOVER_ATTEMPTS = 4;
+export const CROSS_HOST_FACTOR = 6;
 
-interface ParsedLockMetadata {
-  readonly pid: number | undefined;
-  readonly time: number | undefined;
-  readonly expiresAt: number | undefined;
+export interface LockPayload {
+  readonly pid?: number;
+  readonly host?: string;
+  readonly ts?: number;
+  readonly token?: string;
 }
 
-function parseLockMetadata(raw: string): ParsedLockMetadata {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) {
-    return { pid: undefined, time: undefined, expiresAt: undefined };
-  }
-  if (trimmed.startsWith('{')) {
-    try {
-      const parsed: unknown = JSON.parse(trimmed);
-      if (isPlainObject(parsed)) {
-        const pid = typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0
-          ? parsed.pid
-          : undefined;
-        const rawTime = typeof parsed.time === 'number'
-          ? parsed.time
-          : typeof parsed.timestamp === 'number'
-            ? parsed.timestamp
-            : typeof parsed.createdAt === 'number'
-              ? parsed.createdAt
-              : undefined;
-        const time = rawTime !== undefined && Number.isFinite(rawTime) ? rawTime : undefined;
-        const expiresAt = typeof parsed.expiresAt === 'number' && Number.isFinite(parsed.expiresAt)
-          ? parsed.expiresAt
-          : undefined;
-        return { pid, time, expiresAt };
-      }
-    } catch {
-      return { pid: undefined, time: undefined, expiresAt: undefined };
+export interface LockFsOps {
+  writeFileSync(
+    filePath: string,
+    data: string,
+    options?: { readonly encoding?: BufferEncoding; readonly mode?: number; readonly flag?: string },
+  ): void;
+  readFileSync(filePath: string, encoding: BufferEncoding): string;
+  renameSync(oldPath: string, newPath: string): void;
+  unlinkSync(filePath: string): void;
+}
+
+export interface AcquireLockOptions {
+  readonly now?: number;
+  readonly pid?: number;
+  readonly currentHost?: string;
+  readonly token?: string;
+  readonly fsOps?: LockFsOps;
+}
+
+export type AcquireLockResult =
+  | { readonly owned: true; readonly token: string; readonly payload: string }
+  | { readonly owned: false };
+
+export function createLockPayload(
+  ts: number = Date.now(),
+  pid: number | undefined = process.pid,
+  host: string | undefined = os.hostname(),
+  token: string = randomUUID(),
+): string {
+  return JSON.stringify({
+    ...(pid !== undefined ? { pid } : {}),
+    ...(host !== undefined ? { host } : {}),
+    ts,
+    token,
+  });
+}
+
+export function parseLockPayload(raw: string): LockPayload | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!isPlainObject(parsed)) {
+      return null;
     }
+    const rawPid = readOptionalOwnData(parsed, 'pid');
+    const pid = typeof rawPid === 'number' && Number.isSafeInteger(rawPid) && rawPid > 0
+      ? rawPid
+      : undefined;
+    const rawHost = readOptionalOwnData(parsed, 'host');
+    const host = typeof rawHost === 'string' && rawHost.trim().length > 0
+      ? rawHost.trim()
+      : undefined;
+    const rawTs = readOptionalOwnData(parsed, 'ts');
+    const ts = typeof rawTs === 'number' && Number.isFinite(rawTs)
+      ? rawTs
+      : undefined;
+    const rawToken = readOptionalOwnData(parsed, 'token');
+    const token = typeof rawToken === 'string' && rawToken.length > 0
+      ? rawToken
+      : undefined;
+    return { pid, host, ts, token };
+  } catch {
+    return null;
   }
-  const tokenMatch = /^(\d+)-[0-9a-fA-F]+-(\d+)$/.exec(trimmed);
-  if (tokenMatch !== null) {
-    const pid = Number(tokenMatch[1]);
-    const time = Number(tokenMatch[2]);
-    return {
-      pid: Number.isSafeInteger(pid) && pid > 0 ? pid : undefined,
-      time: Number.isFinite(time) ? time : undefined,
-      expiresAt: undefined,
-    };
-  }
-  const pairMatch = /^(\d+):(\d+)$/.exec(trimmed);
-  if (pairMatch !== null) {
-    const pid = Number(pairMatch[1]);
-    const time = Number(pairMatch[2]);
-    return {
-      pid: Number.isSafeInteger(pid) && pid > 0 ? pid : undefined,
-      time: Number.isFinite(time) ? time : undefined,
-      expiresAt: undefined,
-    };
-  }
-  const pidOnlyMatch = /^(\d+)$/.exec(trimmed);
-  if (pidOnlyMatch !== null) {
-    const pid = Number(pidOnlyMatch[1]);
-    return {
-      pid: Number.isSafeInteger(pid) && pid > 0 ? pid : undefined,
-      time: undefined,
-      expiresAt: undefined,
-    };
-  }
-  return { pid: undefined, time: undefined, expiresAt: undefined };
 }
 
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-  if (pid === process.pid) {
-    return true;
-  }
+function isPidNotAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
-    return true;
+    return false;
   } catch (error) {
-    return (error as NodeJS.ErrnoException)?.code !== 'ESRCH';
+    return (error as NodeJS.ErrnoException)?.code === 'ESRCH';
   }
-}
-
-function isLockStale(
-  raw: string,
-  stat: { readonly mtimeMs: number },
-  staleAfterMs: number,
-  now: number,
-): boolean {
-  const { pid, time, expiresAt } = parseLockMetadata(raw);
-  if (expiresAt !== undefined && now >= expiresAt) {
-    return true;
-  }
-  const timestampAge = time !== undefined ? Math.max(0, now - time) : 0;
-  const mtimeAge = Math.max(0, now - stat.mtimeMs);
-  const ageMs = Math.max(timestampAge, mtimeAge);
-  if (ageMs >= staleAfterMs) {
-    return true;
-  }
-  if (pid !== undefined) {
-    return !isProcessAlive(pid);
-  }
-  return ageMs >= UNPARSEABLE_LOCK_GRACE_MS;
 }
 
 /**
- * Atomically replace a verified stale lock file by writing our token to a
- * private sibling file, re-verifying the stale lock's inode and content,
- * renaming over the lock path, and confirming ownership after one poll window.
+ * STALE(payload): a lock is stale ONLY when BOTH hold:
+ * - age = now - payload.ts >= staleAfterMs, AND
+ * - the owner is established-not-alive:
+ *   * if payload.host === current host AND payload.pid is a number:
+ *     not alive iff `process.kill(pid, 0)` throws ESRCH (EPERM means alive).
+ *   * otherwise (different host, or pid missing): require the long threshold
+ *     `staleAfterMs * CROSS_HOST_FACTOR`.
  */
-async function tryReclaimStaleLock(
-  lockPath: string,
-  token: string,
-  expectedIno: number,
-  expectedContent: string,
-  pollIntervalMs: number,
-): Promise<boolean> {
-  const tempPath = `${lockPath}.${process.pid}-${randomBytes(8).toString('hex')}.tmp`;
-  try {
-    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
-    const handle = await fs.open(tempPath, flags, 0o600);
-    try {
-      await handle.writeFile(token, 'utf8');
-    } finally {
-      await handle.close();
-    }
-
-    const currentStat = await fs.lstat(lockPath).catch(() => null);
-    if (currentStat === null || currentStat.isSymbolicLink() || !currentStat.isFile()
-      || currentStat.ino !== expectedIno) {
-      await fs.rm(tempPath, { force: true }).catch(() => undefined);
-      return false;
-    }
-    const currentContent = await readFileNoFollow(lockPath).catch(() => null);
-    if (currentContent === null || currentContent !== expectedContent) {
-      await fs.rm(tempPath, { force: true }).catch(() => undefined);
-      return false;
-    }
-
-    await fs.rename(tempPath, lockPath);
-  } catch {
-    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+export function isLockStale(
+  payloadOrRaw: LockPayload | string | null,
+  staleAfterMs: number,
+  now: number = Date.now(),
+  currentHost: string = os.hostname(),
+): boolean {
+  const payload = typeof payloadOrRaw === 'string'
+    ? parseLockPayload(payloadOrRaw)
+    : payloadOrRaw;
+  if (payload === null || typeof payload.ts !== 'number' || !Number.isFinite(payload.ts)) {
     return false;
   }
+  const age = now - payload.ts;
+  if (age < staleAfterMs) {
+    return false;
+  }
+  if (
+    payload.host === currentHost &&
+    typeof payload.pid === 'number' &&
+    Number.isSafeInteger(payload.pid) &&
+    payload.pid > 0
+  ) {
+    return isPidNotAlive(payload.pid);
+  }
+  return age >= staleAfterMs * CROSS_HOST_FACTOR;
+}
 
-  await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-  const verified = await readFileNoFollow(lockPath).catch(() => null);
-  return verified !== null && verified.trim() === token;
+/**
+ * ACQUIRE(lockPath):
+ * 1. Try `fs.writeFileSync(lockPath, payload, { flag: 'wx' })`. If it succeeds,
+ *    record payload {pid, host, ts, token} where token is a fresh randomUUID()
+ *    and return owned. The exclusive create is the only step that ever grants
+ *    ownership, so two racers can never both own the lock.
+ * 2. If it throws EEXIST: read the existing lock payload.
+ *    a. If it is NOT stale: return NOT owned.
+ *    b. If it IS stale: TAKE OVER atomically:
+ *       - re-read the lock and confirm it still holds the exact stale bytes
+ *         that were inspected (a foreign writer replaced it otherwise),
+ *       - `fs.renameSync(lockPath, graveyard)` moves the stale lock aside —
+ *         exactly one racer's rename can succeed; a later racer gets ENOENT,
+ *       - re-read the moved bytes: if they are no longer the stale payload,
+ *         a live lock was moved by mistake — put it back and lose this round,
+ *       - unlink the stale copy and create the lock again with `wx`; on
+ *         EEXIST another waiter created first — re-evaluate from step 1.
+ */
+export function acquireLock(
+  lockPath: string,
+  staleAfterMs: number,
+  options?: AcquireLockOptions,
+): AcquireLockResult {
+  const fsOps: LockFsOps = options?.fsOps ?? fsSync;
+  const now = options?.now ?? Date.now();
+  const pid = options !== undefined && 'pid' in options ? options.pid : process.pid;
+  const currentHost = options?.currentHost ?? os.hostname();
+  const myToken = options?.token ?? randomUUID();
+  const payload = createLockPayload(now, pid, currentHost, myToken);
+
+  for (let attempt = 0; attempt < MAX_TAKEOVER_ATTEMPTS; attempt += 1) {
+    try {
+      fsOps.writeFileSync(lockPath, payload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      return { owned: true, token: myToken, payload };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+        throw error;
+      }
+    }
+
+    let existingRaw: string;
+    try {
+      existingRaw = fsOps.readFileSync(lockPath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        continue;
+      }
+      throw error;
+    }
+
+    const existingPayload = parseLockPayload(existingRaw);
+    if (!isLockStale(existingPayload, staleAfterMs, now, currentHost)) {
+      return { owned: false };
+    }
+
+    // The takeover below moves whatever sits at the lock path, so confirm the
+    // stale bytes are still there first. If another writer replaced them, this
+    // round is lost and the next attempt re-evaluates from the exclusive
+    // create instead of touching a lock it did not inspect.
+    let verifiedRaw: string;
+    try {
+      verifiedRaw = fsOps.readFileSync(lockPath, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        continue;
+      }
+      throw error;
+    }
+    if (verifiedRaw !== existingRaw) {
+      continue;
+    }
+
+    const graveyardPath = `${lockPath}.${myToken}.stale`;
+    try {
+      fsOps.renameSync(lockPath, graveyardPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        // Another reclaimer moved the stale lock first; retry the create.
+        continue;
+      }
+      return { owned: false };
+    }
+
+    // The move is atomic but unconditional: between the verification and the
+    // rename the path could have been replaced by a live lock (a fresher
+    // waiter that won its own takeover). The moved bytes decide: anything
+    // other than the inspected stale payload is put back exactly where it
+    // was, and this round is lost rather than stealing a running owner's
+    // lock.
+    let movedRaw: string | null;
+    try {
+      movedRaw = fsOps.readFileSync(graveyardPath, 'utf8');
+    } catch {
+      movedRaw = null;
+    }
+    if (movedRaw !== existingRaw) {
+      try {
+        fsOps.renameSync(graveyardPath, lockPath);
+      } catch {
+        // The moved lock is orphaned at the graveyard path; the next waiter
+        // re-creates the lock from scratch.
+      }
+      return { owned: false };
+    }
+    try {
+      fsOps.unlinkSync(graveyardPath);
+    } catch {
+      // The stale copy lingers at the graveyard path, never at the lock path.
+    }
+
+    try {
+      fsOps.writeFileSync(lockPath, payload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      return { owned: true, token: myToken, payload };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+        throw error;
+      }
+      // Another waiter created its lock between the move and this create;
+      // re-evaluate from the exclusive create.
+    }
+  }
+  return { owned: false };
 }
 
 async function withSessionLock<T>(
@@ -350,59 +446,36 @@ async function withSessionLock<T>(
   staleAfterMs: number,
   fn: () => Promise<T>,
 ): Promise<T> {
-  let token = `${process.pid}-${randomBytes(8).toString('hex')}-${Date.now()}`;
-  const deadline = Date.now() + DEFAULT_LOCK_MAX_WAIT_MS;
+  const maxWaitMs = Math.min(
+    DEFAULT_LOCK_MAX_WAIT_MS,
+    Math.max(DEFAULT_LOCK_POLL_INTERVAL_MS * 2, staleAfterMs),
+  );
+  const deadline = Date.now() + maxWaitMs;
+  let ownedToken: string;
 
   for (;;) {
-    try {
-      const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
-      const handle = await fs.open(lockPath, flags, 0o600);
-      try {
-        await handle.writeFile(token, 'utf8');
-      } finally {
-        await handle.close();
-      }
-      break;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException)?.code;
-      if (code !== 'EEXIST') {
-        throw error;
-      }
-      const stat = await fs.lstat(lockPath).catch(() => null);
-      if (stat === null) {
-        continue;
-      }
-      if (stat.isSymbolicLink() || !stat.isFile()) {
-        throw new Error('Lock path is not a regular file');
-      }
-      const raw = await readFileNoFollow(lockPath).catch(() => null);
-      if (raw !== null && isLockStale(raw, stat, staleAfterMs, Date.now())) {
-        token = `${process.pid}-${randomBytes(8).toString('hex')}-${Date.now()}`;
-        const reclaimed = await tryReclaimStaleLock(
-          lockPath,
-          token,
-          stat.ino,
-          raw,
-          DEFAULT_LOCK_POLL_INTERVAL_MS,
-        );
-        if (reclaimed) {
-          break;
-        }
-      }
-      if (Date.now() >= deadline) {
-        throw new Error('Timed out waiting for session lock');
-      }
-      await new Promise((resolve) => setTimeout(resolve, DEFAULT_LOCK_POLL_INTERVAL_MS));
+    const stat = await fs.lstat(lockPath).catch(() => null);
+    if (stat !== null && (stat.isSymbolicLink() || !stat.isFile())) {
+      throw new Error('Lock path is not a regular file');
     }
+    const acquired = acquireLock(lockPath, staleAfterMs);
+    if (acquired.owned) {
+      ownedToken = acquired.token;
+      break;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error('Timed out waiting for session lock');
+    }
+    await new Promise((resolve) => setTimeout(resolve, DEFAULT_LOCK_POLL_INTERVAL_MS));
   }
 
   try {
     return await fn();
   } finally {
     try {
-      const current = await readFileNoFollow(lockPath);
-      if (current.trim() === token) {
-        await fs.unlink(lockPath);
+      const current = parseLockPayload(fsSync.readFileSync(lockPath, 'utf8'));
+      if (current?.token === ownedToken) {
+        fsSync.unlinkSync(lockPath);
       }
     } catch {
       // Lock already removed or replaced after timeout.
@@ -784,6 +857,16 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
         }
         if (Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes) {
           return unavailable('session-oversized');
+        }
+        // The raw answer is untrusted text and the use case refuses authoring
+        // for secret-shaped content only after the session returns. The same
+        // secret-shape screen therefore runs here, before anything is
+        // persisted: a secret-shaped answer is never written into the briefs
+        // directory. Nothing is recorded, so a later attempt runs the seat
+        // again instead of replaying the refused answer — the same semantics
+        // every other refused outcome already has.
+        if (textContainsSecretShape(run.stdout)) {
+          return unavailable('session-failed');
         }
         return (await recordAnswer(answerPath, run.stdout))
           ? { outcome: 'answered', rawAnswer: run.stdout, sessionKey: sessionKey as string, answerPath, cached: false }

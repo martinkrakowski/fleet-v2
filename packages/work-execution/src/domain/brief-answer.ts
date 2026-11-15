@@ -123,7 +123,12 @@ function stripOuterBlank(blockLines: readonly string[]): string {
  * registry, as the operator-coordination entities check: the short registry
  * misses shapes such as `github_pat_`. Refusing on either is the safe side.
  */
-function textContainsSecretShape(text: string): boolean {
+/**
+ * Exported for the brief-author seat adapter: the raw seat answer is screened
+ * with this exact predicate before it is persisted, so the briefs directory
+ * never holds secret-shaped text that the use case would only refuse later.
+ */
+export function textContainsSecretShape(text: string): boolean {
   return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((entry) => entry.regex.test(text));
 }
 

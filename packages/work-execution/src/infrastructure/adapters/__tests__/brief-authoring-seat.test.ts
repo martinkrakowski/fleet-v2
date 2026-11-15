@@ -1,9 +1,9 @@
 // Lane CO17: BriefAuthoringAdapter seat session tests (fake executor, real temp directories).
-import { promises as fs } from 'node:fs';
+import fsSync, { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import type { BriefAuthorSessionRequest } from '../../../application/ports/out/BriefAuthoringPort.out-port.js';
 import type {
@@ -11,7 +11,16 @@ import type {
   CommandRunOptions,
   CommandRunResult,
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
-import { BriefAuthoringAdapter } from '../BriefAuthoringAdapter.adapter.js';
+import {
+  type AcquireLockResult,
+  BriefAuthoringAdapter,
+  CROSS_HOST_FACTOR,
+  type LockFsOps,
+  acquireLock,
+  createLockPayload,
+  isLockStale,
+  parseLockPayload,
+} from '../BriefAuthoringAdapter.adapter.js';
 
 const COMMIT = 'c'.repeat(40);
 const SESSION_KEY = `brief-author/wo-1/lane-1@${COMMIT.slice(0, 12)}`;
@@ -73,6 +82,19 @@ async function setup(): Promise<Setup> {
 
 function adapterFor(executor: CommandExecutorPort, options: { seatCommand?: readonly string[]; maxAnswerBytes?: number } = {}) {
   return new BriefAuthoringAdapter({ seatCommand: SEAT_COMMAND, executor, ...options });
+}
+
+/**
+ * A lock payload with NO pid. `createLockPayload(ts, undefined, host)` cannot
+ * produce one: an explicitly `undefined` pid selects its `process.pid`
+ * default, which would make the fixture a live same-host lock instead.
+ */
+function noPidPayload(ts: number, host: string | undefined): string {
+  return JSON.stringify({
+    ...(host !== undefined ? { host } : {}),
+    ts,
+    token: 'no-pid-lock-token',
+  });
 }
 
 describe('BriefAuthoringAdapter seat session', () => {
@@ -197,6 +219,33 @@ describe('BriefAuthoringAdapter seat session', () => {
       const oversizedPrompt = 'p'.repeat(300_000);
       expect(await adapterFor(s.executor).authorBriefSession({ ...s.request, prompt: oversizedPrompt })).toEqual({ outcome: 'unavailable', reason: 'session-oversized' });
     }
+  });
+
+  it('a secret-shaped seat answer is refused and never persisted in the briefs directory', async () => {
+    const s = await setup();
+    // The shape is split across template expressions so this test file itself
+    // never carries a credential-shaped literal.
+    const secret = `AKIA${'ABCDEFGHIJKLMNOP'}`;
+    s.executor.seat = {
+      exitCode: 0,
+      signal: null,
+      stdout: `===NOTES===\nnote ${secret}\n===DISPATCH===\nbody\n`,
+      stderr: '',
+    };
+    const result = await adapterFor(s.executor).authorBriefSession(s.request);
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+    expect(s.executor.seatCalls).toHaveLength(1);
+    // The raw answer was never written: the briefs directory holds only the
+    // prompt, and no file on disk carries the secret-shaped text.
+    const entries = await fs.readdir(s.briefsDir);
+    expect(entries).toEqual([`${STEM}.prompt.md`]);
+    for (const entry of entries) {
+      expect(await fs.readFile(path.join(s.briefsDir, entry), 'utf8')).not.toContain(secret);
+    }
+    // Nothing was recorded, so a repeat runs the seat again instead of
+    // replaying the refused answer.
+    expect(await adapterFor(s.executor).authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+    expect(s.executor.seatCalls).toHaveLength(2);
   });
 
   it('refuses an own accessor variant or agent instead of treating it as absent', async () => {
@@ -413,12 +462,13 @@ describe('BriefAuthoringAdapter seat session', () => {
     expect(await fs.readFile(answerPath, 'utf8')).toBe(originalAnswer);
   });
 
-  it('recovers a stale lock from a dead owner or an expired lock and completes acquisition', async () => {
+  it('recovers a stale lock when its age exceeds the threshold and its owner is not alive', async () => {
     {
       const s = await setup();
       await fs.mkdir(s.briefsDir, { recursive: true });
       const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
-      await fs.writeFile(lockPath, `999999999-deadbeefdeadbeef-${Date.now()}`, 'utf8');
+      const stalePayload = createLockPayload(Date.now() - 2_000_000, 999_999_999, os.hostname());
+      await fs.writeFile(lockPath, stalePayload, 'utf8');
       const result = await adapterFor(s.executor).authorBriefSession(s.request);
       expect(result).toEqual({
         outcome: 'answered', rawAnswer: s.executor.seat.stdout,
@@ -431,14 +481,261 @@ describe('BriefAuthoringAdapter seat session', () => {
       const s = await setup();
       await fs.mkdir(s.briefsDir, { recursive: true });
       const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
-      await fs.writeFile(lockPath, `${process.pid}-deadbeefdeadbeef-${Date.now() - 2_000_000}`, 'utf8');
-      const result = await adapterFor(s.executor).authorBriefSession(s.request);
+      const remoteStalePayload = createLockPayload(Date.now() - 2_000_000, process.pid, 'other-host.internal');
+      await fs.writeFile(lockPath, remoteStalePayload, 'utf8');
+      const result = await adapterFor(s.executor).authorBriefSession({ ...s.request, timeoutMs: 100 });
       expect(result).toEqual({
         outcome: 'answered', rawAnswer: s.executor.seat.stdout,
         sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
       });
       expect(s.executor.seatCalls).toHaveLength(1);
       expect((await fs.readdir(s.briefsDir)).sort()).toEqual([`${STEM}.answer.md`, `${STEM}.prompt.md`]);
+    }
+  });
+
+  it('two reclaimers racing a stale lock: loser observes a different token after rename and exactly one returns owned', async () => {
+    {
+      const s = await setup();
+      await fs.mkdir(s.briefsDir, { recursive: true });
+      const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
+      const now = Date.now();
+      const staleAfterMs = 1_000;
+      const stalePayload = createLockPayload(now - 2_000_000, 999_999_999, os.hostname());
+      await fs.writeFile(lockPath, stalePayload, 'utf8');
+
+      const realOps: LockFsOps = {
+        writeFileSync: fsSync.writeFileSync.bind(fsSync),
+        readFileSync: fsSync.readFileSync.bind(fsSync),
+        renameSync: fsSync.renameSync.bind(fsSync),
+        unlinkSync: fsSync.unlinkSync.bind(fsSync),
+      };
+      let winnerResult: AcquireLockResult | undefined;
+      const loserFs: LockFsOps = {
+        ...realOps,
+        renameSync(fromPath: string, toPath: string): void {
+          // The winner's whole acquire completes inside the loser's takeover
+          // move, before the loser's rename lands.
+          if (winnerResult === undefined) {
+            winnerResult = acquireLock(lockPath, staleAfterMs, { now, fsOps: realOps });
+          }
+          fsSync.renameSync(fromPath, toPath);
+        },
+      };
+
+      const loserResult = acquireLock(lockPath, staleAfterMs, { now, fsOps: loserFs });
+      expect(winnerResult).toBeDefined();
+      expect(loserResult.owned).toBe(false);
+      expect(winnerResult?.owned).toBe(true);
+      expect([loserResult.owned, winnerResult?.owned].filter(Boolean)).toHaveLength(1);
+      if (winnerResult !== undefined && winnerResult.owned) {
+        expect(parseLockPayload(await fs.readFile(lockPath, 'utf8'))?.token).toBe(winnerResult.token);
+      }
+      expect((await fs.readdir(s.briefsDir)).sort()).toEqual([`${STEM}.lock`]);
+    }
+    {
+      const s = await setup();
+      await fs.mkdir(s.briefsDir, { recursive: true });
+      const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
+      const stalePayload = createLockPayload(Date.now() - 2_000_000, 999_999_999, os.hostname());
+      await fs.writeFile(lockPath, stalePayload, 'utf8');
+
+      let activeSeats = 0;
+      let maxConcurrentSeats = 0;
+      const slowExecutor: CommandExecutorPort = {
+        async run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
+          s.executor.calls.push({ argv, options });
+          if (argv.includes('rev-parse')) {
+            return { exitCode: 0, signal: null, stdout: `${COMMIT}\n`, stderr: '' };
+          }
+          activeSeats += 1;
+          maxConcurrentSeats = Math.max(maxConcurrentSeats, activeSeats);
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          activeSeats -= 1;
+          return s.executor.seat;
+        },
+      };
+
+      const results = await Promise.all([
+        adapterFor(slowExecutor).authorBriefSession(s.request),
+        adapterFor(slowExecutor).authorBriefSession(s.request),
+      ]);
+      expect(maxConcurrentSeats).toBe(1);
+      expect(s.executor.seatCalls).toHaveLength(1);
+      const answered = results.filter((r) => r.outcome === 'answered');
+      expect(answered).toHaveLength(2);
+      expect(answered.map((r) => r.cached).sort()).toEqual([false, true]);
+    }
+  });
+
+  it('two reclaimers racing a stale lock stay at-most-once wherever the loser is suspended', async () => {
+    // The winner's whole acquire runs synchronously inside one of the loser's
+    // fs calls, scripting the interleavings in which two waiters each observed
+    // their own token after renaming over the stale lock and both returned
+    // owned — the seat would have run twice. Ownership must come only from the
+    // exclusive create, so exactly one waiter owns under every interleaving.
+    const scenarios = [
+      { name: 'during the loser inspection read', trigger: 'read-1' },
+      { name: 'during the loser re-verification read', trigger: 'read-2' },
+      { name: 'before the loser moves the stale lock aside', trigger: 'rename-before' },
+      { name: 'after the loser moves the stale lock aside', trigger: 'rename-after' },
+    ] as const;
+    for (const scenario of scenarios) {
+      const s = await setup();
+      await fs.mkdir(s.briefsDir, { recursive: true });
+      const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
+      const staleAfterMs = 1_000;
+      const now = Date.now();
+      const stalePayload = createLockPayload(now - 2_000_000, 999_999_999, os.hostname());
+      await fs.writeFile(lockPath, stalePayload, 'utf8');
+
+      const realOps: LockFsOps = {
+        writeFileSync: fsSync.writeFileSync.bind(fsSync),
+        readFileSync: fsSync.readFileSync.bind(fsSync),
+        renameSync: fsSync.renameSync.bind(fsSync),
+        unlinkSync: fsSync.unlinkSync.bind(fsSync),
+      };
+      let winnerResult: AcquireLockResult | undefined;
+      const runWinner = (): void => {
+        winnerResult = acquireLock(lockPath, staleAfterMs, { now, fsOps: realOps });
+      };
+
+      let readsOfLock = 0;
+      const loserFs: LockFsOps = {
+        ...realOps,
+        readFileSync(filePath: string, encoding: BufferEncoding): string {
+          const raw = fsSync.readFileSync(filePath, encoding);
+          if (filePath === lockPath && winnerResult === undefined) {
+            readsOfLock += 1;
+            if (scenario.trigger === 'read-1' && readsOfLock === 1) {
+              runWinner();
+            }
+            if (scenario.trigger === 'read-2' && readsOfLock === 2) {
+              runWinner();
+            }
+          }
+          return raw;
+        },
+        renameSync(fromPath: string, toPath: string): void {
+          if (scenario.trigger === 'rename-before' && winnerResult === undefined) {
+            runWinner();
+          }
+          fsSync.renameSync(fromPath, toPath);
+          if (scenario.trigger === 'rename-after' && winnerResult === undefined) {
+            runWinner();
+          }
+        },
+      };
+
+      const loserResult = acquireLock(lockPath, staleAfterMs, { now, fsOps: loserFs });
+      const owners = [loserResult, winnerResult].filter(
+        (result): result is Extract<AcquireLockResult, { owned: true }> => result?.owned === true,
+      );
+      expect(owners, `scenario ${scenario.name}: exactly one waiter owns`).toHaveLength(1);
+      const owner = owners[0]!;
+      expect(
+        parseLockPayload(await fs.readFile(lockPath, 'utf8'))?.token,
+        `scenario ${scenario.name}: the lock payload carries the owner token`,
+      ).toBe(owner.token);
+      expect(
+        await fs.readdir(s.briefsDir),
+        `scenario ${scenario.name}: no takeover scratch file lingers`,
+      ).toEqual([`${STEM}.lock`]);
+    }
+  });
+
+  it('a same-host lock whose pid is alive is never stale even past staleAfterMs', async () => {
+    const now = Date.now();
+    const staleAfterMs = 1_000;
+    const oldTime = now - staleAfterMs * CROSS_HOST_FACTOR * 10;
+    const livePayload = createLockPayload(oldTime, process.pid, os.hostname());
+    expect(parseLockPayload(livePayload)).toEqual({
+      pid: process.pid,
+      host: os.hostname(),
+      ts: oldTime,
+      token: expect.any(String),
+    });
+    expect(isLockStale(livePayload, staleAfterMs, now, os.hostname())).toBe(false);
+
+    // EPERM from process.kill(pid, 0) means the process exists and is treated as alive.
+    const killSpy = vi.spyOn(process, 'kill').mockImplementationOnce(() => {
+      const err = new Error('Operation not permitted') as NodeJS.ErrnoException;
+      err.code = 'EPERM';
+      throw err;
+    });
+    try {
+      const epermPayload = createLockPayload(oldTime, 999_999_999, os.hostname());
+      expect(isLockStale(epermPayload, staleAfterMs, now, os.hostname())).toBe(false);
+    } finally {
+      killSpy.mockRestore();
+    }
+
+    const freshDeadPayload = createLockPayload(now, 999_999_999, os.hostname());
+    const agedDeadPayload = createLockPayload(now - staleAfterMs, 999_999_999, os.hostname());
+    expect(isLockStale(freshDeadPayload, staleAfterMs, now, os.hostname())).toBe(false);
+    expect(isLockStale(agedDeadPayload, staleAfterMs, now, os.hostname())).toBe(true);
+
+    const s = await setup();
+    await fs.mkdir(s.briefsDir, { recursive: true });
+    const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
+    const liveHeldPayload = createLockPayload(Date.now() - 2_000_000, process.pid, os.hostname());
+    await fs.writeFile(lockPath, liveHeldPayload, 'utf8');
+    expect(acquireLock(lockPath, staleAfterMs)).toEqual({ owned: false });
+
+    const result = await adapterFor(s.executor).authorBriefSession({ ...s.request, timeoutMs: 60 });
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+    expect(s.executor.seatCalls).toHaveLength(0);
+    expect(await fs.readFile(lockPath, 'utf8')).toBe(liveHeldPayload);
+  });
+
+  it('a lock with no pid (or cross-host) is only reclaimed past the long threshold', async () => {
+    const now = Date.now();
+    const staleAfterMs = 1_000;
+    const longThresholdMs = staleAfterMs * CROSS_HOST_FACTOR;
+
+    // A missing pid on the SAME host must NOT be treated as dead at the short threshold.
+    const sameHostNoPidShort = noPidPayload(now - staleAfterMs, os.hostname());
+    const sameHostNoPidBeforeLong = noPidPayload(now - (longThresholdMs - 1), os.hostname());
+    const sameHostNoPidAtLong = noPidPayload(now - longThresholdMs, os.hostname());
+    expect(isLockStale(sameHostNoPidShort, staleAfterMs, now, os.hostname())).toBe(false);
+    expect(isLockStale(sameHostNoPidBeforeLong, staleAfterMs, now, os.hostname())).toBe(false);
+    expect(isLockStale(sameHostNoPidAtLong, staleAfterMs, now, os.hostname())).toBe(true);
+
+    // Missing pid and missing host: also requires the long threshold.
+    const noPidNoHostShort = noPidPayload(now - staleAfterMs, undefined);
+    const noPidNoHostAtLong = noPidPayload(now - longThresholdMs, undefined);
+    expect(isLockStale(noPidNoHostShort, staleAfterMs, now, os.hostname())).toBe(false);
+    expect(isLockStale(noPidNoHostAtLong, staleAfterMs, now, os.hostname())).toBe(true);
+
+    // Cross-host lock: also requires the long threshold.
+    const remoteShort = createLockPayload(now - staleAfterMs, 999_999_999, 'other-host.internal');
+    const remoteAtLong = createLockPayload(now - longThresholdMs, 999_999_999, 'other-host.internal');
+    expect(isLockStale(remoteShort, staleAfterMs, now, os.hostname())).toBe(false);
+    expect(isLockStale(remoteAtLong, staleAfterMs, now, os.hostname())).toBe(true);
+
+    {
+      const s = await setup();
+      await fs.mkdir(s.briefsDir, { recursive: true });
+      const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
+      await fs.writeFile(lockPath, sameHostNoPidShort, 'utf8');
+      expect(acquireLock(lockPath, staleAfterMs, { now })).toEqual({ owned: false });
+      expect(await fs.readFile(lockPath, 'utf8')).toBe(sameHostNoPidShort);
+
+      await fs.writeFile(lockPath, sameHostNoPidAtLong, 'utf8');
+      const reclaimed = acquireLock(lockPath, staleAfterMs, { now });
+      expect(reclaimed.owned).toBe(true);
+    }
+    {
+      const s = await setup();
+      await fs.mkdir(s.briefsDir, { recursive: true });
+      const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
+      const longNoPidPayload = noPidPayload(Date.now() - 2_000_000, os.hostname());
+      await fs.writeFile(lockPath, longNoPidPayload, 'utf8');
+      const result = await adapterFor(s.executor).authorBriefSession({ ...s.request, timeoutMs: 100 });
+      expect(result).toEqual({
+        outcome: 'answered', rawAnswer: s.executor.seat.stdout,
+        sessionKey: SESSION_KEY, answerPath: path.join(s.briefsDir, `${STEM}.answer.md`), cached: false,
+      });
+      expect(s.executor.seatCalls).toHaveLength(1);
     }
   });
 });

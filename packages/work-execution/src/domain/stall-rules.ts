@@ -90,6 +90,8 @@ export interface StallThresholds {
   readonly reviewFailures: number;
   readonly admissionRefusals: number;
   readonly admissionHours: number;
+  /** The parked-run page threshold; a run parked past it escalates from `digest` to `page`. */
+  readonly parkedPageMinutes?: number;
 }
 
 /** The defaults of the brief. */
@@ -99,6 +101,7 @@ export const DEFAULT_STALL_THRESHOLDS: StallThresholds = Object.freeze({
   reviewFailures: 2,
   admissionRefusals: 6,
   admissionHours: 2,
+  parkedPageMinutes: 180,
 });
 
 /** One finding: fixed rule code, severity, stable key, ids only, bounded evidence. */
@@ -127,6 +130,9 @@ const LIMITING_PROVIDER_CLASSES: ReadonlySet<string> = new Set(['payment-require
 /** Milliseconds of one minute and of one hour. */
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
+
+/** The default parked-run page threshold in minutes. */
+const DEFAULT_PARKED_PAGE_MINUTES = 180;
 
 /**
  * A subject that is not an identifier but a credential-shaped string (a token
@@ -362,6 +368,8 @@ interface StallContext {
   readonly reviewFailures: number;
   readonly admissionRefusalLimit: number;
   readonly admissionHours: number;
+  /** The resolved parked-run page threshold in minutes. */
+  readonly parkedPageMinutes: number;
   /** The clock in epoch ms, or null when `nowIso` is not a canonical ISO time. */
   readonly nowMs: number | null;
 }
@@ -373,6 +381,7 @@ function contextOf(thresholds: StallThresholds, nowIso: unknown): StallContext {
     reviewFailures: thresholdOf(thresholds?.reviewFailures, DEFAULT_STALL_THRESHOLDS.reviewFailures),
     admissionRefusalLimit: thresholdOf(thresholds?.admissionRefusals, DEFAULT_STALL_THRESHOLDS.admissionRefusals),
     admissionHours: thresholdOf(thresholds?.admissionHours, DEFAULT_STALL_THRESHOLDS.admissionHours),
+    parkedPageMinutes: thresholdOf(thresholds?.parkedPageMinutes, DEFAULT_PARKED_PAGE_MINUTES),
     nowMs: isCanonicalIso(nowIso) ? msOf(nowIso) : null,
   };
 }
@@ -385,6 +394,16 @@ function elapsedOver(iso: unknown, nowMs: number | null, limitMs: number): { ove
   }
   const elapsedMs = nowMs - thenMs;
   return { over: elapsedMs > limitMs, minutes: Math.floor(elapsedMs / MINUTE_MS) };
+}
+
+/**
+ * The severity of a parked-run finding: `page` once parked beyond
+ * `parkedPageMinutes`, `digest` before that. An unusable time yields the
+ * base severity because the run is already silenced by its own invalid finding.
+ */
+function parkedSeverity(parkedAtIso: unknown, ctx: StallContext): StallSeverity {
+  const over = elapsedOver(parkedAtIso, ctx.nowMs, ctx.parkedPageMinutes * MINUTE_MS);
+  return over.over ? 'page' : 'digest';
 }
 
 /** The driver-absent rule: no live lease while non-terminal runs exist. Not time-based. */
@@ -484,7 +503,7 @@ function runTimeFindings(runs: readonly Row[], ctx: StallContext, out: StallFind
     if (parkedUsable && run.prNumber === undefined && run.handOwned === false) {
       const parkedFor = elapsedOver(run.parkedAtIso, ctx.nowMs, ctx.parkedMinutes * MINUTE_MS);
       if (parkedFor.over) {
-        out.push(finding('unowned-park', 'digest', [runId], {
+        out.push(finding('unowned-park', parkedSeverity(run.parkedAtIso, ctx), [runId], {
           runId: safeId(runId),
           parkedAtIso: String(run.parkedAtIso),
           minutes: parkedFor.minutes,
@@ -496,7 +515,7 @@ function runTimeFindings(runs: readonly Row[], ctx: StallContext, out: StallFind
     if (parkedUsable && typeof run.prNumber === 'number' && run.handOwned === false) {
       const parkedFor = elapsedOver(run.parkedAtIso, ctx.nowMs, ctx.parkedMinutes * MINUTE_MS);
       if (parkedFor.over) {
-        out.push(finding('owned-park', 'digest', [runId], {
+        out.push(finding('owned-park', parkedSeverity(run.parkedAtIso, ctx), [runId], {
           runId: safeId(runId),
           parkedAtIso: String(run.parkedAtIso),
           minutes: parkedFor.minutes,

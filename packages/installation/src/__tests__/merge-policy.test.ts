@@ -1,15 +1,27 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { deriveInstallationModel } from '../model.js';
 import { parseInstallation } from '../parse.js';
 import {
   canonicalMergePolicyJson,
   mergePolicyRevision,
+  readProjectPrepareArgv,
   resolveMergePolicy,
 } from '../policy.js';
+import {
+  InvalidInstallationError,
+  loadInstallation,
+  requireValidInstallationModel,
+} from '../load.js';
+import { writeInstallationV2 } from '../write.js';
 import type {
+  FleetInstallationV2,
   MergePolicyRead,
   PolicySection,
+  ProjectPrepareArgvRead,
   ResolvedMergeDaemonPolicy,
   ResolvedMergeRepositoryPolicy,
 } from '../types.js';
@@ -714,5 +726,399 @@ describe('the parsed installation', () => {
       expect(parsed.ok).toBe(false);
       expect(JSON.stringify(parsed)).not.toContain(secret);
     }
+  });
+});
+
+describe('per-project prepare argv policy (CO22)', () => {
+  const repoKey = 'acme/web';
+  const projectId = 'proj-web';
+
+  function expectInvalidRead(read: ProjectPrepareArgvRead, reason: string): void {
+    expect(read).toEqual({ outcome: 'invalid', reason });
+  }
+
+  function expectResolvedRead(read: ProjectPrepareArgvRead): Extract<ProjectPrepareArgvRead, { outcome: 'resolved' }> {
+    if (read.outcome !== 'resolved') {
+      throw new Error(`expected resolved, got ${read.reason}`);
+    }
+    return read;
+  }
+
+  /** The minimal v2 file with one merge repository entry carrying the given prepare argv. */
+  function v2WithPrepare(prepare: unknown): Record<string, unknown> {
+    return {
+      ...validV2,
+      policy: {
+        ...validV2.policy,
+        merge: { repos: { [repoKey]: { projectId, ...(prepare !== undefined ? { prepare } : {}) } } },
+      },
+    };
+  }
+
+  function parseWithPrepare(prepare: unknown): ReturnType<typeof parseInstallation> {
+    return parseInstallation(v2WithPrepare(prepare));
+  }
+
+  it('parses, writes, resolves, and reads a valid per-project prepare argv as a frozen array and updates mergePolicyRevision', () => {
+    const argv = ['yarn', 'install', '--immutable'];
+    const parsed = parseWithPrepare(argv);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      throw new Error(parsed.errors.join('; '));
+    }
+    const model = requireValidInstallationModel(parsed.installation);
+    expect(model.policy?.merge?.repos?.[repoKey]).toEqual({ projectId, prepare: argv });
+
+    // The writer preserves the argv (round trip), and re-parsing the written
+    // text gives the same model — never a shell string.
+    const written = writeInstallationV2(parsed.installation as FleetInstallationV2);
+    expect(JSON.parse(written).policy.merge.repos[repoKey].prepare).toEqual(argv);
+    const reparsed = parseInstallation(JSON.parse(written));
+    expect(reparsed.ok).toBe(true);
+
+    const policy = model.policy;
+    const resolved = expectResolved(resolveMergePolicy(policy));
+    const entry = resolved.repositories.find((candidate) => candidate.repositoryKey === repoKey);
+    expect(entry?.prepare).toEqual(argv);
+    expect(Object.isFrozen(entry?.prepare)).toBe(true);
+
+    const read = expectResolvedRead(readProjectPrepareArgv(policy, projectId));
+    expect(read.repositoryKey).toBe(repoKey);
+    expect(read.argv).toEqual(argv);
+    expect(Object.isFrozen(read.argv)).toBe(true);
+    expect(read.policyRevision).toBe(resolved.policyRevision);
+
+    // The revision covers prepare: changing it changes the digest, so prepare
+    // is neither ignored by canonical digesting nor replaced by a constant.
+    const policyOf = (prepare: readonly string[]): PolicySection | undefined => {
+      const attempt = parseWithPrepare(prepare);
+      if (!attempt.ok) {
+        throw new Error(attempt.errors.join('; '));
+      }
+      return requireValidInstallationModel(attempt.installation).policy;
+    };
+    const installRevision = expectResolved(resolveMergePolicy(policyOf(['yarn', 'install']))).policyRevision;
+    const buildRevision = expectResolved(resolveMergePolicy(policyOf(['yarn', 'build']))).policyRevision;
+    expect(installRevision).not.toBe(buildRevision);
+  });
+
+  it('keeps prepare optional when omitted and returns null argv from readProjectPrepareArgv', () => {
+    const parsed = parseWithPrepare(undefined);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      throw new Error(parsed.errors.join('; '));
+    }
+    const policy = requireValidInstallationModel(parsed.installation).policy;
+    expect(policy?.merge?.repos?.[repoKey]).toEqual({ projectId });
+
+    const resolved = expectResolved(resolveMergePolicy(policy));
+    const entry = resolved.repositories.find((candidate) => candidate.repositoryKey === repoKey);
+    expect(entry?.prepare).toBeUndefined();
+
+    const read = expectResolvedRead(readProjectPrepareArgv(policy, projectId));
+    expect(read).toEqual({
+      outcome: 'resolved',
+      projectId,
+      repositoryKey: repoKey,
+      argv: null,
+      policyRevision: resolved.policyRevision,
+    });
+
+    // A project no repository names resolves with a null repository key too.
+    const unmatched = expectResolvedRead(readProjectPrepareArgv(policy, 'other-project'));
+    expect(unmatched.repositoryKey).toBeNull();
+    expect(unmatched.argv).toBeNull();
+  });
+
+  it('refuses an empty prepare array in both parseInstallation and resolveMergePolicy', () => {
+    const parsed = parseWithPrepare([]);
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.errors).toEqual([`${'policy.merge.repos'}["${repoKey}"].prepare: must hold 1 to 32 entries`]);
+    }
+    const entry = { projectId, prepare: [] };
+    expectInvalid(resolveMergePolicy(reposWith(entry, repoKey)), 'policy-merge-invalid');
+    expectInvalidRead(readProjectPrepareArgv(reposWith(entry, repoKey), projectId), 'policy-merge-invalid');
+  });
+
+  it('refuses an invalid prepare argv at the requireValidInstallationModel boundary', () => {
+    const parsed = parseWithPrepare(['yarn', 'install']);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      throw new Error(parsed.errors.join('; '));
+    }
+    const base = parsed.installation as FleetInstallationV2;
+    const installationWithPrepare = (prepare: unknown): FleetInstallationV2 =>
+      ({
+        ...base,
+        policy: {
+          ...base.policy,
+          merge: { repos: { [repoKey]: { projectId, prepare } } },
+        },
+      }) as unknown as FleetInstallationV2;
+
+    // An installation that reaches the model boundary without going through
+    // parseInstallation (e.g. built in memory) cannot carry an argv the
+    // parser would have refused: requireValidInstallationModel itself throws.
+    const error = (() => {
+      try {
+        requireValidInstallationModel(installationWithPrepare(['yarn', 'install;rm']));
+      } catch (caught) {
+        return caught as InvalidInstallationError;
+      }
+      return undefined;
+    })();
+    expect(error).toBeInstanceOf(InvalidInstallationError);
+    expect(error?.errors).toEqual([
+      `policy.merge.repos["${repoKey}"].prepare[1]: must not contain whitespace, control characters or shell metacharacters`,
+    ]);
+
+    // Every argv shape the parser refuses is refused at the boundary too.
+    for (const prepare of [[], null, 42, [''], ['..', 'run'], ['yarn', 'a b']]) {
+      expect(() => requireValidInstallationModel(installationWithPrepare(prepare))).toThrow(
+        InvalidInstallationError,
+      );
+    }
+
+    // A valid argv still passes the boundary.
+    expect(() =>
+      requireValidInstallationModel(installationWithPrepare(['yarn', 'install', '--immutable'])),
+    ).not.toThrow();
+  });
+
+  it('refuses non-array prepare values including null, primitives, plain objects, and non-array iterables', () => {
+    for (const value of [null, 'yarn build', 42, {}, true, new Set(['yarn'])]) {
+      const entry = { projectId, prepare: value };
+      const parsed = parseWithPrepare(value);
+      expect([value, parsed.ok ? [] : parsed.errors]).toEqual([
+        value,
+        [`policy.merge.repos["${repoKey}"].prepare: must be an array`],
+      ]);
+      expectInvalid(resolveMergePolicy(reposWith(entry, repoKey)), 'policy-merge-invalid');
+      expectInvalidRead(readProjectPrepareArgv(reposWith(entry, repoKey), projectId), 'policy-merge-invalid');
+    }
+  });
+
+  it('refuses prepare arrays containing non-string elements', () => {
+    for (const value of [['yarn', 123], [null], [undefined], [{}]]) {
+      const entry = { projectId, prepare: value };
+      const parsed = parseWithPrepare(value);
+      const field = `policy.merge.repos["${repoKey}"].prepare`;
+      const index = (value as readonly unknown[]).indexOf(123) === 1 ? 1 : 0;
+      expect([value, parsed.ok ? [] : parsed.errors]).toEqual([
+        value,
+        [`${field}[${index}]: must be a non-empty string`],
+      ]);
+      expectInvalid(resolveMergePolicy(reposWith(entry, repoKey)), 'policy-merge-invalid');
+      expectInvalidRead(readProjectPrepareArgv(reposWith(entry, repoKey), projectId), 'policy-merge-invalid');
+    }
+  });
+
+  it('refuses prepare arrays containing empty or whitespace-only tokens', () => {
+    for (const value of [[''], ['yarn', ''], ['yarn', '   ']]) {
+      const entry = { projectId, prepare: value };
+      const parsed = parseWithPrepare(value);
+      const field = `policy.merge.repos["${repoKey}"].prepare`;
+      const index = value.length === 1 ? 0 : 1;
+      expect([value, parsed.ok ? [] : parsed.errors]).toEqual([
+        value,
+        [`${field}[${index}]: must be a non-empty string`],
+      ]);
+      expectInvalid(resolveMergePolicy(reposWith(entry, repoKey)), 'policy-merge-invalid');
+      expectInvalidRead(readProjectPrepareArgv(reposWith(entry, repoKey), projectId), 'policy-merge-invalid');
+    }
+  });
+
+  it('refuses prepare tokens with shell metacharacters, whitespace, or control characters without echoing the token', () => {
+    for (const token of ['install;rm', 'a&&b', 'a|b', '$HOME', '`id`', 'a>b', 'a b', 'a\nb', 'a\0b']) {
+      const value = ['yarn', token];
+      const parsed = parseWithPrepare(value);
+      expect([token, parsed.ok ? [] : parsed.errors]).toEqual([
+        token,
+        [`policy.merge.repos["${repoKey}"].prepare[1]: must not contain whitespace, control characters or shell metacharacters`],
+      ]);
+      // The token itself is never echoed into the error text.
+      expect((parsed.ok ? [] : parsed.errors).join(' ')).not.toContain(token);
+      const entry = { projectId, prepare: value };
+      expectInvalid(resolveMergePolicy(reposWith(entry, repoKey)), 'policy-merge-invalid');
+      expectInvalidRead(readProjectPrepareArgv(reposWith(entry, repoKey), projectId), 'policy-merge-invalid');
+    }
+  });
+
+  it('refuses prepare executable tokens that start with a flag dash or traverse parent directories', () => {
+    for (const argv of [['-c', 'yarn'], ['../bin/prep'], ['..']]) {
+      const parsed = parseWithPrepare(argv);
+      expect([argv, parsed.ok ? [] : parsed.errors]).toEqual([
+        argv,
+        [`policy.merge.repos["${repoKey}"].prepare[0]: must be an executable name or path without flag prefix or parent traversal`],
+      ]);
+      const entry = { projectId, prepare: argv };
+      expectInvalid(resolveMergePolicy(reposWith(entry, repoKey)), 'policy-merge-invalid');
+      expectInvalidRead(readProjectPrepareArgv(reposWith(entry, repoKey), projectId), 'policy-merge-invalid');
+    }
+  });
+
+  it('refuses prepare arrays exceeding 32 entries or 256 characters per token in bounded time', () => {
+    const long = Array.from({ length: 33 }, (_, index) => (index === 0 ? 'yarn' : `step-${index}`));
+    const parsed = parseWithPrepare(long);
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.errors).toEqual([`policy.merge.repos["${repoKey}"].prepare: must hold 1 to 32 entries`]);
+    }
+    expectInvalid(resolveMergePolicy(reposWith({ projectId, prepare: long }, repoKey)), 'policy-merge-invalid');
+
+    const wide = ['yarn', 'a'.repeat(257)];
+    const wideParsed = parseWithPrepare(wide);
+    expect(wideParsed.ok).toBe(false);
+    if (!wideParsed.ok) {
+      expect(wideParsed.errors).toEqual([`policy.merge.repos["${repoKey}"].prepare[1]: must be at most 256 characters`]);
+    }
+    expectInvalid(resolveMergePolicy(reposWith({ projectId, prepare: wide }, repoKey)), 'policy-merge-invalid');
+
+    // An array-like with an enormous length is not an array at all: refused
+    // in O(1) before any element scan.
+    const huge = { length: 1_000_000_000, 0: 'yarn' };
+    const hugeParsed = parseWithPrepare(huge);
+    expect(hugeParsed.ok).toBe(false);
+    if (!hugeParsed.ok) {
+      expect(hugeParsed.errors).toEqual([`policy.merge.repos["${repoKey}"].prepare: must be an array`]);
+    }
+    expectInvalid(
+      resolveMergePolicy(reposWith({ projectId, prepare: huge }, repoKey)),
+      'policy-merge-invalid',
+    );
+
+    // The accepted bounds themselves still pass.
+    expect(parseWithPrepare(Array.from({ length: 32 }, (_, index) => (index === 0 ? 'yarn' : `s${index}`))).ok).toBe(true);
+    expect(parseWithPrepare(['yarn', 'a'.repeat(256)]).ok).toBe(true);
+  });
+
+  it('refuses sparse prepare arrays, element getters, and hostile proxies without throwing', () => {
+    // eslint-disable-next-line no-sparse-arrays
+    const sparse = ['yarn', , 'build'] as unknown as string[];
+    const sparseParsed = parseWithPrepare(sparse);
+    expect(sparseParsed.ok).toBe(false);
+    if (!sparseParsed.ok) {
+      expect(sparseParsed.errors).toEqual([`policy.merge.repos["${repoKey}"].prepare[1]: must be a non-empty string`]);
+    }
+    expectInvalid(resolveMergePolicy(reposWith({ projectId, prepare: sparse }, repoKey)), 'policy-merge-invalid');
+
+    const withGetter = ['yarn', 'build'];
+    Object.defineProperty(withGetter, 1, {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter ran');
+      },
+    });
+    const getterParsed = parseWithPrepare(withGetter);
+    expect(getterParsed.ok).toBe(false);
+    if (!getterParsed.ok) {
+      expect(getterParsed.errors).toEqual([`policy.merge.repos["${repoKey}"].prepare[1]: must be a non-empty string`]);
+    }
+    expect(() => resolveMergePolicy(reposWith({ projectId, prepare: withGetter }, repoKey))).not.toThrow();
+    expectInvalid(resolveMergePolicy(reposWith({ projectId, prepare: withGetter }, repoKey)), 'policy-merge-invalid');
+
+    const hostile = new Proxy(['yarn', 'build'], {
+      getOwnPropertyDescriptor: () => {
+        throw new Error('trap ran');
+      },
+    });
+    expect(() => parseWithPrepare(hostile)).not.toThrow();
+    expect(() => resolveMergePolicy(reposWith({ projectId, prepare: hostile }, repoKey))).not.toThrow();
+    expectInvalidRead(
+      readProjectPrepareArgv(reposWith({ projectId, prepare: hostile }, repoKey), projectId),
+      'policy-unreadable',
+    );
+  });
+
+  it('refuses secret-shaped prepare tokens with policy-secret-shape and never echoes the secret', () => {
+    for (const token of ['ghp_1234567890abcdefghijklmnopqrstuvwx', 'sk-1234567890abcdefghijklmnop']) {
+      const value = ['yarn', token];
+      const parsed = parseWithPrepare(value);
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.errors).toEqual([`policy.merge.repos["${repoKey}"].prepare[1]: must not look like a credential or secret`]);
+        expect(parsed.errors.join(' ')).not.toContain(token);
+      }
+      const entry = { projectId, prepare: value };
+      expectInvalid(resolveMergePolicy(reposWith(entry, repoKey)), 'policy-secret-shape');
+      expectInvalidRead(readProjectPrepareArgv(reposWith(entry, repoKey), projectId), 'policy-secret-shape');
+      expect(JSON.stringify(readProjectPrepareArgv(reposWith(entry, repoKey), projectId))).not.toContain(token);
+    }
+  });
+
+  it('refuses invalid or ambiguous projectId in readProjectPrepareArgv', () => {
+    const policy = reposWith({ projectId, prepare: ['yarn', 'install'] }, repoKey);
+    const secret = `sk-${'a1'.repeat(15)}`;
+    for (const [value, reason] of [
+      ['', 'project-id-invalid'],
+      ['  ', 'project-id-invalid'],
+      [' padded ', 'project-id-invalid'],
+      [42, 'project-id-invalid'],
+      [null, 'project-id-invalid'],
+      ['x'.repeat(129), 'project-id-invalid'],
+      [secret, 'policy-secret-shape'],
+    ] as const) {
+      expect(() => readProjectPrepareArgv(policy, value as unknown as string)).not.toThrow();
+      expectInvalidRead(readProjectPrepareArgv(policy, value as unknown as string), reason);
+    }
+
+    const ambiguous = policyWith({
+      repos: {
+        'acme/web': { projectId, prepare: ['yarn', 'install'] },
+        'acme/other': { projectId, prepare: ['yarn', 'build'] },
+      },
+    });
+    expectInvalidRead(readProjectPrepareArgv(ambiguous, projectId), 'project-id-ambiguous');
+
+    // A hostile policy never throws.
+    const proxy = new Proxy(
+      {},
+      {
+        getPrototypeOf: () => {
+          throw new Error('trap ran');
+        },
+      },
+    );
+    expectInvalidRead(readProjectPrepareArgv(proxy as unknown as PolicySection, projectId), 'policy-unreadable');
+  });
+
+  describe('the load boundary refuses an installation whose prepare argv is invalid', () => {
+    let tempDir: string;
+
+    afterEach(() => {
+      if (tempDir !== undefined) {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('loadInstallation returns invalid with the prepare error and never loads the file', () => {
+      tempDir = mkdtempSync(join(tmpdir(), 'fleet-co22-'));
+      const file = join(tempDir, 'fleet.json');
+      writeFileSync(file, JSON.stringify(v2WithPrepare(['yarn', 'install;rm'])));
+      const result = loadInstallation({ file, cwd: tempDir });
+      expect(result.status).toBe('invalid');
+      if (result.status === 'invalid') {
+        expect(result.errors).toEqual([
+          'policy.merge.repos["acme/web"].prepare[1]: must not contain whitespace, control characters or shell metacharacters',
+        ]);
+      }
+    });
+
+    it('loadInstallation loads a valid prepare argv into the model', () => {
+      tempDir = mkdtempSync(join(tmpdir(), 'fleet-co22-'));
+      const file = join(tempDir, 'fleet.json');
+      writeFileSync(file, JSON.stringify(v2WithPrepare(['yarn', 'install', '--immutable'])));
+      const result = loadInstallation({ file, cwd: tempDir });
+      expect(result.status).toBe('loaded');
+      if (result.status === 'loaded') {
+        expect(result.model.policy?.merge?.repos?.[repoKey]).toEqual({
+          projectId,
+          prepare: ['yarn', 'install', '--immutable'],
+        });
+        const read = expectResolvedRead(readProjectPrepareArgv(result.model.policy, projectId));
+        expect(read.argv).toEqual(['yarn', 'install', '--immutable']);
+      }
+    });
   });
 });

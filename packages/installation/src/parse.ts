@@ -67,6 +67,8 @@ import {
   CONDUCTOR_REAPER_WORKTREE_BOUNDS,
   DEFAULT_MERGE_DAEMON_POLICY,
   MERGE_POLICY_BOUNDS,
+  PREPARE_FORBIDDEN_CHAR_RE,
+  PREPARE_PARENT_TRAVERSAL_RE,
   parseMergeRepositoryKey,
 } from './policy.js';
 import { readOwnDataProperty } from './policy-read.js';
@@ -2651,12 +2653,77 @@ function readMergeProjectId(entry: JsonObject, path: string, errors: string[]): 
   return readMergeText(entry, 'projectId', path, MERGE_POLICY_BOUNDS.projectIdLength, errors);
 }
 
+/**
+ * CO22: validate a per-project prepare argv as written. The rules mirror the
+ * policy reader (`readPrepareArgv`): 1..32 own-data-property string tokens of
+ * 1..256 characters, no whitespace, control characters, shell metacharacters
+ * or secret shape, and an `argv[0]` that is an executable name or path rather
+ * than a flag, a dot directory or a `..` traversal. Array length is checked
+ * before any element is touched, so a hostile array fails in O(1). Each
+ * offending element is reported by index and code only — the token is never
+ * echoed — and the whole argv is refused the moment any element fails, so an
+ * unvalidated argv is never passed through.
+ */
+export function parsePrepareArgv(
+  value: unknown,
+  path: string,
+  errors: string[],
+): readonly string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    errors.push(`${path}: must be an array`);
+    return undefined;
+  }
+  const maxArgs = MERGE_POLICY_BOUNDS.prepareMaxArgs;
+  if (value.length < 1 || value.length > maxArgs) {
+    errors.push(`${path}: must hold 1 to ${maxArgs} entries`);
+    return undefined;
+  }
+  const out: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    const item: unknown = descriptor?.value;
+    if (
+      descriptor === undefined ||
+      !('value' in descriptor) ||
+      typeof item !== 'string' ||
+      item.trim().length === 0
+    ) {
+      errors.push(`${path}[${index}]: must be a non-empty string`);
+      continue;
+    }
+    if (item.length > MERGE_POLICY_BOUNDS.prepareArgMaxLength) {
+      errors.push(`${path}[${index}]: must be at most ${MERGE_POLICY_BOUNDS.prepareArgMaxLength} characters`);
+      continue;
+    }
+    if (containsSecretShape(item)) {
+      errors.push(`${path}[${index}]: must not look like a credential or secret`);
+      continue;
+    }
+    if (PREPARE_FORBIDDEN_CHAR_RE.test(item)) {
+      errors.push(`${path}[${index}]: must not contain whitespace, control characters or shell metacharacters`);
+      continue;
+    }
+    if (
+      index === 0 &&
+      (item.startsWith('-') || item === '.' || item === '..' || PREPARE_PARENT_TRAVERSAL_RE.test(item))
+    ) {
+      errors.push(`${path}[0]: must be an executable name or path without flag prefix or parent traversal`);
+      continue;
+    }
+    out.push(item);
+  }
+  return out.length === value.length ? out : undefined;
+}
+
 function buildMergeRepositoryPolicy(
   projectId: string,
   fields: MergeRepositoryFields,
 ): MergeRepositoryPolicy {
   const { shadow, unattended, requiredContexts, updateBranch } = fields;
-  const { macosProcedure, maxAttempts, checksGraceMinutes, veto } = fields;
+  const { macosProcedure, maxAttempts, checksGraceMinutes, veto, prepare } = fields;
   return {
     projectId,
     ...(shadow !== undefined ? { shadow } : {}),
@@ -2667,6 +2734,7 @@ function buildMergeRepositoryPolicy(
     ...(maxAttempts !== undefined ? { maxAttempts } : {}),
     ...(checksGraceMinutes !== undefined ? { checksGraceMinutes } : {}),
     ...(veto !== undefined ? { veto } : {}),
+    ...(prepare !== undefined ? { prepare } : {}),
   };
 }
 
@@ -2712,6 +2780,9 @@ function parseMergeRepository(
       ),
     ),
     veto: ifPresent(entry, 'veto', () => parseMergeVeto(entry, path, errors)),
+    prepare: ifPresent(entry, 'prepare', () =>
+      parsePrepareArgv(entry.prepare, `${path}.prepare`, errors),
+    ),
   };
   if (errors.length !== before || projectId === undefined) {
     return undefined;

@@ -226,27 +226,25 @@ describe('detectStalls', () => {
     });
 
     it('falls back to 180 for a missing, negative, or non-finite parkedPageMinutes', () => {
-      const parked = parkedRun({ parkedAtIso: '2026-11-06T08:59:59.000Z' });
-      const missing = detectStalls(
-        snapshot({ runs: [parked] }),
+      // Just past 180 minutes: every fallback case escalates to page.
+      const parkedPast = parkedRun({ parkedAtIso: '2026-11-06T08:59:59.000Z' });
+      // Exactly 180 minutes: every fallback case stays digest, so a wrong
+      // fallback below 180 cannot pass this test.
+      const parkedAt = parkedRun({ parkedAtIso: '2026-11-06T09:00:00.000Z' });
+      const fallbackThresholds: Array<StallThresholds> = [
         { ...DEFAULT_STALL_THRESHOLDS, parkedPageMinutes: undefined } as StallThresholds,
-        NOW,
-      );
-      expect(missing[0]?.severity).toBe('page');
-
-      const negative = detectStalls(
-        snapshot({ runs: [parked] }),
         { ...DEFAULT_STALL_THRESHOLDS, parkedPageMinutes: -5 },
-        NOW,
-      );
-      expect(negative[0]?.severity).toBe('page');
-
-      const nonFinite = detectStalls(
-        snapshot({ runs: [parked] }),
         { ...DEFAULT_STALL_THRESHOLDS, parkedPageMinutes: Number.POSITIVE_INFINITY },
-        NOW,
-      );
-      expect(nonFinite[0]?.severity).toBe('page');
+        { ...DEFAULT_STALL_THRESHOLDS, parkedPageMinutes: Number.NaN },
+      ];
+      for (const thresholds of fallbackThresholds) {
+        const past = detectStalls(snapshot({ runs: [parkedPast] }), thresholds, NOW);
+        expect(past.map((f) => f.rule)).toEqual(['unowned-park']);
+        expect(past[0]?.severity).toBe('page');
+        const at = detectStalls(snapshot({ runs: [parkedAt] }), thresholds, NOW);
+        expect(at.map((f) => f.rule)).toEqual(['unowned-park']);
+        expect(at[0]?.severity).toBe('digest');
+      }
     });
 
     it('emits snapshot-invalid for an invalid or missing parkedAtIso and never a page finding', () => {

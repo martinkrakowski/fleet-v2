@@ -26,6 +26,7 @@ import {
   assessmentIdForBrief,
   attemptIdForBrief,
   isValidChainName,
+  receiptSubjectOf,
 } from '../../../domain/evidence-records.js';
 import { RequestIndependentReviewUseCase } from '../RequestIndependentReviewUseCase.use-case.js';
 
@@ -851,13 +852,18 @@ describe('brief-verify and the brief subject', () => {
   });
 
   it('refuses an attempt-path request whose attemptId starts with brief: or chain:', async () => {
-    const reservedIds = [attemptIdForBrief(PROJECT, DIGEST), 'chain:proj-1:main'];
-    const repo = new InMemoryAssessmentRepo(reservedIds.map((attemptId) => sampleRecord({ attemptId })));
+    const reserved = [
+      { assessmentId: 'asm-brief', attemptId: attemptIdForBrief(PROJECT, DIGEST) },
+      { assessmentId: 'asm-chain', attemptId: 'chain:proj-1:main' },
+    ];
+    const repo = new InMemoryAssessmentRepo(
+      reserved.map(({ assessmentId, attemptId }) => sampleRecord({ id: assessmentId, attemptId })),
+    );
     const { useCase, reviewer } = buildUseCase(repo);
 
-    for (const attemptId of reservedIds) {
+    for (const { assessmentId, attemptId } of reserved) {
       const request = {
-        assessmentId: 'asm-1',
+        assessmentId,
         projectId: PROJECT,
         attemptId,
         candidateHeadSha: HEAD1,
@@ -888,7 +894,7 @@ describe('brief-verify and the brief subject', () => {
     };
     const withSubject = await useCase.requestIndependentReview(
       briefRequest({
-        assessmentId: 'asm-1',
+        assessmentId: 'asm-chain',
         attemptId: 'chain:proj-1:main',
         kind: 'code-review',
         subject: attemptSubject,
@@ -900,7 +906,7 @@ describe('brief-verify and the brief subject', () => {
     }
 
     // A manual review (no kind, no requestId, no subject) on a reserved id is refused too.
-    const manual = omit(briefRequest({ assessmentId: 'asm-1', attemptId: 'chain:proj-1:main' }), 'requestId', 'kind', 'subject');
+    const manual = omit(briefRequest({ assessmentId: 'asm-chain', attemptId: 'chain:proj-1:main' }), 'requestId', 'kind', 'subject');
     const manualResult = await useCase.requestIndependentReview(manual as RequestIndependentReviewRequest);
     expect(manualResult.outcome).toBe('rejected');
     if (manualResult.outcome === 'rejected') {
@@ -908,9 +914,12 @@ describe('brief-verify and the brief subject', () => {
     }
 
     expect(reviewer.calls).toHaveLength(0);
-    const seeded = await repo.findAssessmentById('asm-1');
-    expect(seeded?.revision).toBe(0);
-    expect(seeded?.reviewReceipts).toHaveLength(0);
+    for (const { assessmentId, attemptId } of reserved) {
+      const seeded = await repo.findAssessmentById(assessmentId);
+      expect(seeded?.attemptId).toBe(attemptId);
+      expect(seeded?.revision).toBe(0);
+      expect(seeded?.reviewReceipts).toHaveLength(0);
+    }
   });
 
   it('refuses a brief subject that disagrees with the request', async () => {
@@ -920,11 +929,16 @@ describe('brief-verify and the brief subject', () => {
     const rows: Array<{ name: string; request: RequestIndependentReviewRequest }> = [
       { name: 'another digest in the subject only', request: briefRequest({ subject: briefSubject({ briefPackageDigest: 'b'.repeat(64) }) }) },
       { name: 'baseCommit different from candidateHeadSha', request: briefRequest({ subject: briefSubject({ baseCommit: HEAD2 }) }) },
-      { name: 'projectId different from the request', request: briefRequest({ subject: briefSubject({ projectId: 'proj-2' }) }) },
+      {
+        name: 'projectId different from the request, with ids derived from the subject project',
+        request: briefRequest({
+          subject: briefSubject({ projectId: 'proj-2' }),
+          attemptId: attemptIdForBrief('proj-2', DIGEST),
+          assessmentId: assessmentIdForBrief('proj-2', DIGEST),
+        }),
+      },
       { name: 'attemptId not the derived brief id', request: briefRequest({ attemptId: 'att-1' }) },
       { name: 'assessmentId not the derived one', request: briefRequest({ assessmentId: 'asm-other' }) },
-      { name: 'a non-null chainName', request: briefRequest({ subject: briefSubject({ chainName: 'main' }) }) },
-      { name: 'a non-null integrationHeadSha', request: briefRequest({ subject: briefSubject({ integrationHeadSha: HEAD1 }) }) },
       { name: 'a requestId that fails the pattern', request: briefRequest({ requestId: 'bad id' }) },
     ];
     for (const row of rows) {
@@ -938,6 +952,27 @@ describe('brief-verify and the brief subject', () => {
       expect(result.reason).toBe(SUBJECT_REASON);
     }
     expect(reviewer.calls).toHaveLength(0);
+    expect(await repo.findAssessmentById(assessmentIdForBrief(PROJECT, DIGEST))).toBeNull();
+    expect(await repo.findAssessmentById(assessmentIdForBrief('proj-2', DIGEST))).toBeNull();
+  });
+
+  it('refuses a brief subject carrying a field of another kind, at the subject parser', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const subjects: ReceiptSubject[] = [
+      briefSubject({ chainName: 'main' }),
+      briefSubject({ integrationHeadSha: HEAD1 }),
+      briefSubject({ attemptId: 'att-1' }),
+    ];
+    for (const subject of subjects) {
+      // The parser itself returns null for the mixed-kind subject: the refusal below is the parser's.
+      expect(receiptSubjectOf({ subject, projectId: PROJECT, attemptId: attemptIdForBrief(PROJECT, DIGEST) })).toBeNull();
+      await expectInvalidRequest(useCase, briefRequest({ subject }), reviewer, SUBJECT_REASON);
+    }
+    expect(receiptSubjectOf({ subject: briefSubject(), projectId: PROJECT, attemptId: attemptIdForBrief(PROJECT, DIGEST) })).toEqual(briefSubject());
+    expect(reviewer.calls).toHaveLength(0);
+    expect(await repo.findAssessmentById(assessmentIdForBrief(PROJECT, DIGEST))).toBeNull();
   });
 
   it('refuses a malformed digest or base commit even when every id agrees with it', async () => {

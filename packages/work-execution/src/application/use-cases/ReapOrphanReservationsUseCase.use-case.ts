@@ -241,6 +241,109 @@ const asEntry = (
   reservedAtIso: classified.reservedAtIso ?? '',
 });
 
+/** The attempt ids of the held reservations; unreadable or not-held elements are skipped. */
+function readHeldAttemptIds(reservations: readonly unknown[]): Set<string> {
+  const held = new Set<string>();
+  const count = safeLength(reservations, MAX_ORPHAN_RESERVATION_SCAN);
+  for (let index = 0; index < count; index += 1) {
+    const element = safeElementAt(reservations, index);
+    const attemptId = element.ok ? heldAttemptIdOf(element.value) : null;
+    if (attemptId !== null) {
+      held.add(attemptId);
+    }
+  }
+  return held;
+}
+
+function heldAttemptIdOf(value: unknown): string | null {
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(value);
+  } catch {
+    return null;
+  }
+  if (snap === null || snap['held'] !== true) {
+    return null;
+  }
+  const attemptId = snap['attemptId'];
+  return typeof attemptId === 'string' && attemptId.length > 0 ? attemptId : null;
+}
+
+/** True when the run's `attemptIds` names a held attempt; every read is guarded. */
+function listsHeldAttempt(attemptIds: unknown, held: ReadonlySet<string>): boolean {
+  if (!safeIsArray(attemptIds)) {
+    return false;
+  }
+  const count = safeLength(attemptIds, MAX_ORPHAN_RESERVATION_SCAN);
+  for (let index = 0; index < count; index += 1) {
+    const element = safeElementAt(attemptIds as readonly unknown[], index);
+    if (element.ok && typeof element.value === 'string' && held.has(element.value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** The run id of a run that lists a held attempt, or null. */
+function runIdListingHeld(runElement: unknown, held: ReadonlySet<string>): string | null {
+  let runSnap: Record<string, unknown> | null;
+  try {
+    runSnap = snapshotPlainDataRecord(runElement);
+  } catch {
+    return null;
+  }
+  if (runSnap === null || typeof runSnap['runId'] !== 'string' || runSnap['runId'].length === 0) {
+    return null;
+  }
+  return listsHeldAttempt(runSnap['attemptIds'], held) ? runSnap['runId'] : null;
+}
+
+/** Orphan entries are mapped to the port's four entry lists. */
+function entriesOf(classified: ReturnType<typeof classifyOrphanReservations>): {
+  readonly orphans: ReapOrphanReservationEntry[];
+  readonly reportOnly: ReapOrphanReservationReportOnlyEntry[];
+  readonly skipped: ReapOrphanReservationSkippedEntry[];
+  readonly unknown: ReapOrphanReservationUnknownEntry[];
+} {
+  return {
+    orphans: classified.orphans.map(asEntry),
+    reportOnly: classified.reportOnly.map((entry) => ({
+      reservationId: entry.reservationId,
+      attemptId: entry.attemptId,
+      reason: 'no-run-unstarted',
+      reservedAtIso: entry.reservedAtIso ?? '',
+    })),
+    skipped: classified.skipped.map((entry) => ({
+      reservationId: entry.reservationId,
+      attemptId: entry.attemptId,
+      reason: entry.reason as ReapOrphanReservationSkippedEntry['reason'],
+    })),
+    unknown: classified.unknown.map((entry) => ({
+      reservationId: entry.reservationId,
+      attemptId: entry.attemptId,
+      reason: entry.reason as ReapOrphanReservationUnknownEntry['reason'],
+    })),
+  };
+}
+
+/** The journal outcome and failed reason of one release call. */
+function releaseVerdict(release: StoreCallResult<{ readonly outcome: 'released' | 'not-held' | 'changed' | 'refused' | 'unknown' }>): {
+  readonly journalOutcome: LaneRunJournalOutcome;
+  readonly failedReason: ReapOrphanReservationFailedEntry['reason'] | null;
+} {
+  if (!release.ok || release.value.outcome === 'unknown') {
+    return { journalOutcome: 'ambiguous', failedReason: 'ambiguous' };
+  }
+  if (release.value.outcome === 'released') {
+    return { journalOutcome: 'completed', failedReason: null };
+  }
+  const mapping = releaseOutcomeMapping(release.value.outcome);
+  return { journalOutcome: mapping.journal, failedReason: mapping.failedReason };
+}
+
+const sortByReservationId = <T extends { readonly reservationId: string }>(list: T[]): T[] =>
+  list.sort((left, right) => byCodeUnit(left.reservationId, right.reservationId));
+
 export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort {
   constructor(private readonly deps: ReapOrphanReservationsDependencies) {}
 
@@ -251,7 +354,6 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
     }
     const { dryRun, nowIso } = validated;
     const timeoutMs = this.deps.storeCallTimeoutMs ?? DEFAULT_STORE_CALL_TIMEOUT_MS;
-    const maxReleasesPerPass = this.deps.maxReleasesPerPass ?? DEFAULT_MAX_RELEASES_PER_PASS;
 
     // Top-level reads are deadline-guarded and fail closed: an unreadable
     // store refuses the whole pass as unknown before anything is released.
@@ -266,84 +368,9 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
     const reservations: readonly unknown[] = reservationsRead.value;
     const runs: readonly unknown[] = runsRead.value;
 
-    // The attempt ids of the held reservations; each run naming one is read.
-    const heldAttemptIds = new Set<string>();
-    const reservationCount = safeLength(reservations, MAX_ORPHAN_RESERVATION_SCAN);
-    for (let index = 0; index < reservationCount; index += 1) {
-      const element = safeElementAt(reservations, index);
-      if (!element.ok) {
-        continue;
-      }
-      let snap: Record<string, unknown> | null;
-      try {
-        snap = snapshotPlainDataRecord(element.value);
-      } catch {
-        continue;
-      }
-      if (snap === null || snap['held'] !== true || typeof snap['attemptId'] !== 'string' || (snap['attemptId'] as string).length === 0) {
-        continue;
-      }
-      heldAttemptIds.add(snap['attemptId'] as string);
-    }
-
-    // The run state per run that lists a held reservation's attempt: read
-    // from the run journal; an unreadable journal is 'unreadable' and the
-    // classifier refuses to release on it.
-    const runStates = new Map<string, ReturnType<typeof laneRunJournalState> | 'unreadable'>();
-    const runCount = safeLength(runs, MAX_RUN_SCAN);
-    for (let index = 0; index < runCount; index += 1) {
-      const runElement = safeElementAt(runs, index);
-      if (!runElement.ok) {
-        continue;
-      }
-      let runSnap: Record<string, unknown> | null;
-      try {
-        runSnap = snapshotPlainDataRecord(runElement.value);
-      } catch {
-        continue;
-      }
-      if (runSnap === null || typeof runSnap['runId'] !== 'string' || (runSnap['runId'] as string).length === 0) {
-        continue;
-      }
-      const runId = runSnap['runId'] as string;
-      let lists = false;
-      const attemptIds = runSnap['attemptIds'];
-      if (safeIsArray(attemptIds)) {
-        const count = safeLength(attemptIds, MAX_ORPHAN_RESERVATION_SCAN);
-        for (let attemptIndex = 0; attemptIndex < count; attemptIndex += 1) {
-          const attemptElement = safeElementAt(attemptIds as readonly unknown[], attemptIndex);
-          if (!attemptElement.ok) {
-            continue;
-          }
-          const attemptId = attemptElement.value;
-          if (typeof attemptId === 'string' && heldAttemptIds.has(attemptId)) {
-            lists = true;
-            break;
-          }
-        }
-      }
-      if (!lists) {
-        continue;
-      }
-      const journalRead = await callStore(() => this.deps.runJournal.listForRun(runId), timeoutMs);
-      if (!journalRead.ok || !safeIsArray(journalRead.value)) {
-        runStates.set(runId, 'unreadable');
-        continue;
-      }
-      try {
-        runStates.set(runId, laneRunJournalState(journalRead.value, runId));
-      } catch {
-        runStates.set(runId, 'unreadable');
-      }
-    }
-
-    // The attempt per held reservation's attempt id: known absence is null,
-    // a failed or timed-out read is the 'unreadable' sentinel.
-    const attemptsById = new Map<string, Awaited<ReturnType<typeof this.deps.attemptRepo.findAttemptById>> | 'unreadable'>();
-    for (const attemptId of heldAttemptIds) {
-      const attemptRead = await callStore(() => this.deps.attemptRepo.findAttemptById(attemptId), timeoutMs);
-      attemptsById.set(attemptId, attemptRead.ok ? attemptRead.value : 'unreadable');
-    }
+    const heldAttemptIds = readHeldAttemptIds(reservations);
+    const runStates = await this.readRunStates(runs, heldAttemptIds, timeoutMs);
+    const attemptsById = await this.readAttempts(heldAttemptIds, timeoutMs);
 
     const classified = classifyOrphanReservations({
       reservations,
@@ -353,24 +380,7 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
       nowIso,
       graceMs: CRASHED_START_GRACE_MINUTES * 60_000,
     });
-
-    const orphans: ReapOrphanReservationEntry[] = classified.orphans.map(asEntry);
-    const reportOnly: ReapOrphanReservationReportOnlyEntry[] = classified.reportOnly.map((entry) => ({
-      reservationId: entry.reservationId,
-      attemptId: entry.attemptId,
-      reason: 'no-run-unstarted',
-      reservedAtIso: entry.reservedAtIso ?? '',
-    }));
-    const skipped: ReapOrphanReservationSkippedEntry[] = classified.skipped.map((entry) => ({
-      reservationId: entry.reservationId,
-      attemptId: entry.attemptId,
-      reason: entry.reason as ReapOrphanReservationSkippedEntry['reason'],
-    }));
-    const unknown: ReapOrphanReservationUnknownEntry[] = classified.unknown.map((entry) => ({
-      reservationId: entry.reservationId,
-      attemptId: entry.attemptId,
-      reason: entry.reason as ReapOrphanReservationUnknownEntry['reason'],
-    }));
+    const { orphans, reportOnly, skipped, unknown } = entriesOf(classified);
 
     if (dryRun) {
       return { outcome: 'reaped', dryRun: true, orphans, reportOnly, released: [], skipped, failed: [], journalFailed: [], unknown };
@@ -389,6 +399,7 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
       return { outcome: 'reaped', dryRun: false, orphans, reportOnly, released, skipped, failed, journalFailed, unknown };
     }
 
+    const maxReleasesPerPass = this.deps.maxReleasesPerPass ?? DEFAULT_MAX_RELEASES_PER_PASS;
     let attemptedReleases = 0;
     for (const orphan of orphans) {
       if (attemptedReleases >= maxReleasesPerPass) {
@@ -396,86 +407,123 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
         continue;
       }
       attemptedReleases += 1;
-
-      const releaseId = this.deps.newUlid();
-      const keyResult = reaperRepairKey(orphan.reservationId, 'leaked-slot', releaseId);
-      if (!keyResult.ok) {
-        failed.push({ reservationId: orphan.reservationId, attemptId: orphan.attemptId, reason: 'invalid-key' });
-        continue;
-      }
-
-      // Intent before action: a failed intent append never releases.
-      const intentAppend = await callStore(
-        () => this.deps.runJournal.append(intentEntry(keyResult.key, releaseId, nowIso, this.deps.newUlid())),
-        timeoutMs,
-      );
-      if (!intentAppend.ok || intentAppend.value.outcome !== 'appended') {
-        failed.push({ reservationId: orphan.reservationId, attemptId: orphan.attemptId, reason: 'intent-failed' });
-        continue;
-      }
-
-      const attemptRead = attemptsById.get(orphan.attemptId);
-      const attempt = typeof attemptRead === 'object' && attemptRead !== null ? attemptRead : null;
-      const release = await callStore(
-        () =>
-          this.deps.executionJournal.releaseCapacityReservationIfUnchanged!({
-            attemptId: orphan.attemptId,
-            reservationId: orphan.reservationId,
-            attemptRevision: attempt?.revision ?? 0,
-            releasedAtIso: nowIso,
-            readAttemptRevision: async () => {
-              try {
-                const fresh = await withBudget(this.deps.attemptRepo.findAttemptById(orphan.attemptId), timeoutMs);
-                return fresh?.revision ?? (fresh === null ? 0 : null);
-              } catch {
-                return null;
-              }
-            },
-          }),
-        timeoutMs,
-      );
-
-      let journalOutcome: LaneRunJournalOutcome;
-      let failedReason: ReapOrphanReservationFailedEntry['reason'] | null = null;
-      if (!release.ok) {
-        journalOutcome = 'ambiguous';
-        failedReason = 'ambiguous';
-      } else if (release.value.outcome === 'released') {
-        journalOutcome = 'completed';
-      } else if (release.value.outcome === 'unknown') {
-        journalOutcome = 'ambiguous';
-        failedReason = 'ambiguous';
-      } else {
-        const mapping = releaseOutcomeMapping(release.value.outcome);
-        journalOutcome = mapping.journal;
-        failedReason = mapping.failedReason;
-      }
-
-      if (journalOutcome === 'completed') {
-        released.push(orphan);
-      } else {
-        failed.push({ reservationId: orphan.reservationId, attemptId: orphan.attemptId, reason: failedReason ?? 'ambiguous' });
-      }
-
-      const resultAppend = await callStore(
-        () => this.deps.runJournal.append(resultEntry(keyResult.key, nowIso, this.deps.newUlid(), journalOutcome, failedReason)),
-        timeoutMs,
-      );
-      if (!resultAppend.ok || resultAppend.value.outcome !== 'appended') {
-        journalFailed.push({ reservationId: orphan.reservationId, attemptId: orphan.attemptId, reason: 'result-append-failed' });
-      }
+      await this.releaseOne(orphan, attemptsById, nowIso, timeoutMs, { released, failed, journalFailed });
     }
 
-    const byReservationId = <T extends { readonly reservationId: string }>(list: T[]): T[] =>
-      list.sort((left, right) => byCodeUnit(left.reservationId, right.reservationId));
-    orphans.sort((left, right) => byCodeUnit(left.reservationId, right.reservationId));
-    reportOnly.sort((left, right) => byCodeUnit(left.reservationId, right.reservationId));
-    skipped.sort((left, right) => byCodeUnit(left.reservationId, right.reservationId));
-    unknown.sort((left, right) => byCodeUnit(left.reservationId, right.reservationId));
-    byReservationId(released);
-    byReservationId(failed);
-    byReservationId(journalFailed);
-
+    for (const list of [orphans, reportOnly, skipped, unknown, released, failed, journalFailed]) {
+      sortByReservationId(list as { readonly reservationId: string }[]);
+    }
     return { outcome: 'reaped', dryRun: false, orphans, reportOnly, released, skipped, failed, journalFailed, unknown };
+  }
+
+  /**
+   * The run state per run that lists a held reservation's attempt, read from
+   * the run journal; an unreadable journal is 'unreadable' and the classifier
+   * refuses to release on it.
+   */
+  private async readRunStates(
+    runs: readonly unknown[],
+    heldAttemptIds: ReadonlySet<string>,
+    timeoutMs: number,
+  ): Promise<Map<string, ReturnType<typeof laneRunJournalState> | 'unreadable'>> {
+    const runStates = new Map<string, ReturnType<typeof laneRunJournalState> | 'unreadable'>();
+    const runCount = safeLength(runs, MAX_RUN_SCAN);
+    for (let index = 0; index < runCount; index += 1) {
+      const runElement = safeElementAt(runs, index);
+      const runId = runElement.ok ? runIdListingHeld(runElement.value, heldAttemptIds) : null;
+      if (runId === null) {
+        continue;
+      }
+      const journalRead = await callStore(() => this.deps.runJournal.listForRun(runId), timeoutMs);
+      if (!journalRead.ok || !safeIsArray(journalRead.value)) {
+        runStates.set(runId, 'unreadable');
+        continue;
+      }
+      try {
+        runStates.set(runId, laneRunJournalState(journalRead.value, runId));
+      } catch {
+        runStates.set(runId, 'unreadable');
+      }
+    }
+    return runStates;
+  }
+
+  /** The attempt per held attempt id: known absence is null, a failed or timed-out read is 'unreadable'. */
+  private async readAttempts(
+    heldAttemptIds: ReadonlySet<string>,
+    timeoutMs: number,
+  ): Promise<Map<string, Awaited<ReturnType<AttemptRepositoryPort['findAttemptById']>> | 'unreadable'>> {
+    const attemptsById = new Map<string, Awaited<ReturnType<AttemptRepositoryPort['findAttemptById']>> | 'unreadable'>();
+    for (const attemptId of heldAttemptIds) {
+      const attemptRead = await callStore(() => this.deps.attemptRepo.findAttemptById(attemptId), timeoutMs);
+      attemptsById.set(attemptId, attemptRead.ok ? attemptRead.value : 'unreadable');
+    }
+    return attemptsById;
+  }
+
+  /** One fenced release with intent before action and a result entry after; outcomes go into `sinks`. */
+  private async releaseOne(
+    orphan: ReapOrphanReservationEntry,
+    attemptsById: ReadonlyMap<string, unknown>,
+    nowIso: string,
+    timeoutMs: number,
+    sinks: {
+      readonly released: ReapOrphanReservationEntry[];
+      readonly failed: ReapOrphanReservationFailedEntry[];
+      readonly journalFailed: ReapOrphanReservationJournalFailureEntry[];
+    },
+  ): Promise<void> {
+    const releaseId = this.deps.newUlid();
+    const keyResult = reaperRepairKey(orphan.reservationId, 'leaked-slot', releaseId);
+    if (!keyResult.ok) {
+      sinks.failed.push({ reservationId: orphan.reservationId, attemptId: orphan.attemptId, reason: 'invalid-key' });
+      return;
+    }
+
+    // Intent before action: a failed intent append never releases.
+    const intentAppend = await callStore(
+      () => this.deps.runJournal.append(intentEntry(keyResult.key, releaseId, nowIso, this.deps.newUlid())),
+      timeoutMs,
+    );
+    if (!intentAppend.ok || intentAppend.value.outcome !== 'appended') {
+      sinks.failed.push({ reservationId: orphan.reservationId, attemptId: orphan.attemptId, reason: 'intent-failed' });
+      return;
+    }
+
+    const attemptRead = attemptsById.get(orphan.attemptId);
+    const attempt = typeof attemptRead === 'object' && attemptRead !== null ? (attemptRead as { readonly revision?: number }) : null;
+    const release = await callStore(
+      () =>
+        this.deps.executionJournal.releaseCapacityReservationIfUnchanged!({
+          attemptId: orphan.attemptId,
+          reservationId: orphan.reservationId,
+          attemptRevision: attempt?.revision ?? 0,
+          releasedAtIso: nowIso,
+          readAttemptRevision: async () => {
+            try {
+              const fresh = await withBudget(this.deps.attemptRepo.findAttemptById(orphan.attemptId), timeoutMs);
+              return fresh?.revision ?? (fresh === null ? 0 : null);
+            } catch {
+              return null;
+            }
+          },
+        }),
+      timeoutMs,
+    );
+
+    const { journalOutcome, failedReason } = releaseVerdict(release);
+    if (journalOutcome === 'completed') {
+      sinks.released.push(orphan);
+    } else {
+      sinks.failed.push({ reservationId: orphan.reservationId, attemptId: orphan.attemptId, reason: failedReason ?? 'ambiguous' });
+    }
+
+    const resultAppend = await callStore(
+      () => this.deps.runJournal.append(resultEntry(keyResult.key, nowIso, this.deps.newUlid(), journalOutcome, failedReason)),
+      timeoutMs,
+    );
+    if (!resultAppend.ok || resultAppend.value.outcome !== 'appended') {
+      sinks.journalFailed.push({ reservationId: orphan.reservationId, attemptId: orphan.attemptId, reason: 'result-append-failed' });
+    }
   }
 }

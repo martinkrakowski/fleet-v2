@@ -110,21 +110,32 @@ interface ReservationSnapshot {
   readonly reservedMs: number;
 }
 
-/** `.length` read once and clamped; a lying or hostile length is bounded. */
-function boundedLength(value: unknown, max: number): number {
-  let raw: unknown;
+/** How one untrusted array read ended: a bounded length, not an array, or a read that threw. */
+type ArrayRead =
+  | { readonly kind: 'array'; readonly length: number }
+  | { readonly kind: 'not-array' }
+  | { readonly kind: 'unreadable' };
+
+/** `Array.isArray` and `.length` behind one guard; a revoked Proxy or a throwing `length` is unreadable. */
+function readArrayLength(value: unknown, max: number): ArrayRead {
   try {
     if (!Array.isArray(value)) {
-      return 0;
+      return { kind: 'not-array' };
     }
-    raw = value.length;
+    const raw: unknown = value.length;
+    if (typeof raw !== 'number') {
+      return { kind: 'unreadable' };
+    }
+    return { kind: 'array', length: Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), max) : 0 };
   } catch {
-    return 0;
+    return { kind: 'unreadable' };
   }
-  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) {
-    return 0;
-  }
-  return Math.min(Math.floor(raw), max);
+}
+
+/** `.length` read once and clamped; a lying, hostile or unreadable length is bounded to 0 or `max`. */
+function boundedLength(value: unknown, max: number): number {
+  const read = readArrayLength(value, max);
+  return read.kind === 'array' ? read.length : 0;
 }
 
 /** One element read behind a guard; a throwing Proxy get trap reads as a hole. */
@@ -236,35 +247,164 @@ function readInputField(input: ClassifyOrphanReservationsInput | undefined, key:
   }
 }
 
-/** The attempt ids one run lists, read defensively; [] when the run is malformed. */
-function runAttemptIds(element: unknown): readonly string[] {
+/** The attempt ids one run lists; `complete` is false when any read of the list threw. */
+interface RunListing {
+  readonly ids: readonly string[];
+  readonly complete: boolean;
+}
+
+/** One run's own fields read through descriptors, or null when the run is not a plain data record. */
+function snapshotRun(element: unknown): Record<string, unknown> | null {
   let snap: Record<string, unknown> | null;
   try {
     snap = snapshotPlainDataRecord(element);
   } catch {
-    return [];
+    return null;
   }
   if (snap === null) {
-    return [];
+    return null;
   }
   for (const forbidden of FORBIDDEN_OWN_KEYS) {
     if (Object.prototype.hasOwnProperty.call(snap, forbidden)) {
-      return [];
+      return null;
     }
   }
-  const raw = snap['attemptIds'];
-  if (!Array.isArray(raw)) {
-    return [];
+  return snap;
+}
+
+/** The attempt ids in one run's `attemptIds`, every read guarded; an unreadable read marks the listing incomplete. */
+function readAttemptIdList(raw: unknown): RunListing {
+  const read = readArrayLength(raw, MAX_ORPHAN_RESERVATION_SCAN);
+  if (read.kind === 'not-array') {
+    return { ids: [], complete: true };
+  }
+  if (read.kind === 'unreadable') {
+    return { ids: [], complete: false };
   }
   const ids: string[] = [];
-  const count = boundedLength(raw, MAX_ORPHAN_RESERVATION_SCAN);
-  for (let index = 0; index < count; index += 1) {
-    const value = raw[index];
-    if (typeof value === 'string' && value.length > 0) {
-      ids.push(value);
+  let complete = true;
+  for (let index = 0; index < read.length; index += 1) {
+    const value = safeElementAt(raw as readonly unknown[], index);
+    if (!value.ok) {
+      complete = false;
+    } else if (typeof value.value === 'string' && value.value.length > 0) {
+      ids.push(value.value);
     }
   }
-  return ids;
+  return { ids, complete };
+}
+
+/** The run id of a snapshot, or null. */
+function runIdOf(snap: Record<string, unknown>): string | null {
+  const value = snap['runId'];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/** The state the caller read for `runId`; a hostile map or a throwing `get` reads as unreadable. */
+function runStateOf(
+  runStates: OrphanReservationRunStates | undefined,
+  runId: string | null,
+): LaneRunStateValue | 'unreadable' | undefined {
+  try {
+    if (runId !== null && runStates !== undefined && runStates instanceof Map) {
+      return runStates.get(runId);
+    }
+    return undefined;
+  } catch {
+    return 'unreadable';
+  }
+}
+
+/** What the runs say: the states of the runs listing each attempt, and whether any run's list was unreadable. */
+interface RunListings {
+  readonly byAttemptId: ReadonlyMap<string, readonly (LaneRunStateValue | 'unreadable' | undefined)[]>;
+  readonly incomplete: boolean;
+}
+
+function collectRunListings(
+  runs: unknown,
+  runStates: OrphanReservationRunStates | undefined,
+): RunListings {
+  const byAttemptId = new Map<string, (LaneRunStateValue | 'unreadable' | undefined)[]>();
+  let incomplete = false;
+  const runCount = boundedLength(runs, MAX_RUN_SCAN);
+  for (let index = 0; index < runCount; index += 1) {
+    const element = safeElementAt(runs as readonly unknown[], index);
+    if (!element.ok || element.value === undefined || element.value === null || isHole(runs as readonly unknown[], index)) {
+      continue;
+    }
+    const snap = snapshotRun(element.value);
+    if (snap === null) {
+      continue;
+    }
+    const listing = readAttemptIdList(snap['attemptIds']);
+    incomplete = incomplete || !listing.complete;
+    const state = runStateOf(runStates, runIdOf(snap));
+    for (const attemptId of listing.ids) {
+      const bucket = byAttemptId.get(attemptId);
+      if (bucket === undefined) {
+        byAttemptId.set(attemptId, [state]);
+      } else {
+        bucket.push(state);
+      }
+    }
+  }
+  return { byAttemptId, incomplete };
+}
+
+/** The result of one keyed attempt lookup. */
+type AttemptLookup =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unreadable' }
+  | { readonly kind: 'value'; readonly value: unknown };
+
+/**
+ * One keyed read of a plain record through its OWN data property. An
+ * inherited entry or an accessor is not a value: it is unreadable, never a
+ * state the caller read.
+ */
+function lookupOwnDataValue(record: unknown, key: string): AttemptLookup {
+  try {
+    if (typeof record !== 'object' || record === null) {
+      return { kind: 'unreadable' };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (descriptor === undefined) {
+      return key in record ? { kind: 'unreadable' } : { kind: 'absent' };
+    }
+    if (!('value' in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { kind: 'unreadable' };
+    }
+    return { kind: 'value', value: descriptor.value };
+  } catch {
+    return { kind: 'unreadable' };
+  }
+}
+
+function lookupAttempt(attemptsById: OrphanReservationAttemptsById, attemptId: string): AttemptLookup {
+  try {
+    if (attemptsById instanceof Map) {
+      return { kind: 'value', value: attemptsById.get(attemptId) };
+    }
+  } catch {
+    return { kind: 'unreadable' };
+  }
+  return lookupOwnDataValue(attemptsById, attemptId);
+}
+
+/** The state field of an attempt value read through its own data properties. */
+function stateOfAttemptValue(value: unknown): AttemptStateValue | 'unreadable' {
+  if (typeof value !== 'object') {
+    return 'unreadable';
+  }
+  let snap: Record<string, unknown> | null;
+  try {
+    snap = snapshotPlainDataRecord(value);
+  } catch {
+    return 'unreadable';
+  }
+  const state = snap === null ? undefined : snap['state'];
+  return typeof state === 'string' && state.length > 0 ? (state as AttemptStateValue) : 'unreadable';
 }
 
 /** The attempt's state, read defensively; null when the attempt is absent, `'unreadable'` when it cannot be read. */
@@ -272,32 +412,17 @@ function attemptStateOf(
   attemptsById: OrphanReservationAttemptsById,
   attemptId: string,
 ): AttemptStateValue | 'unreadable' | null {
-  let lookedUp: unknown;
-  try {
-    lookedUp = attemptsById instanceof Map ? attemptsById.get(attemptId) : (attemptsById as Record<string, unknown>)[attemptId];
-  } catch {
+  const lookup = lookupAttempt(attemptsById, attemptId);
+  if (lookup.kind === 'unreadable') {
     return 'unreadable';
   }
-  if (lookedUp === undefined || lookedUp === null) {
+  if (lookup.kind === 'absent' || lookup.value === undefined || lookup.value === null) {
     return null;
   }
-  if (lookedUp === 'unreadable') {
+  if (lookup.value === 'unreadable') {
     return 'unreadable';
   }
-  if (typeof lookedUp !== 'object') {
-    return 'unreadable';
-  }
-  let snap: Record<string, unknown> | null;
-  try {
-    snap = snapshotPlainDataRecord(lookedUp);
-  } catch {
-    return 'unreadable';
-  }
-  if (snap === null) {
-    return 'unreadable';
-  }
-  const state = snap['state'];
-  return typeof state === 'string' && state.length > 0 ? (state as AttemptStateValue) : 'unreadable';
+  return stateOfAttemptValue(lookup.value);
 }
 
 function inCapacityReleaseStates(state: string): boolean {
@@ -308,252 +433,188 @@ function isTerminalRunState(state: LaneRunStateValue): boolean {
   return (LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state);
 }
 
+/** The pass-wide facts every reservation is classified against. */
+interface ClassifyContext {
+  readonly listings: RunListings;
+  readonly attemptsById: OrphanReservationAttemptsById;
+  readonly nowMs: number;
+  readonly graceMs: number;
+}
+
+/** One entry for a snapshotted reservation in the given bucket. */
+function entryOf(
+  snapshot: ReservationSnapshot,
+  classification: OrphanReservationClassification,
+  reason: OrphanReservationReason,
+): ClassifiedOrphanReservation {
+  return {
+    reservationId: snapshot.id,
+    attemptId: snapshot.attemptId,
+    classification,
+    reason,
+    workOrderId: snapshot.workOrderId,
+    hostName: snapshot.hostName,
+    slotIndex: snapshot.slotIndex,
+    reservedAtIso: snapshot.reservedAtIso,
+  };
+}
+
+/** True when no clock reading can prove the reservation older than the grace. */
+function withinGrace(snapshot: ReservationSnapshot, context: ClassifyContext): boolean {
+  return (
+    !Number.isFinite(context.nowMs) ||
+    !Number.isFinite(snapshot.reservedMs) ||
+    context.nowMs - snapshot.reservedMs < context.graceMs
+  );
+}
+
+/** A reservation no run lists: never released. */
+function classifyUnlisted(snapshot: ReservationSnapshot, context: ClassifyContext): ClassifiedOrphanReservation {
+  if (withinGrace(snapshot, context)) {
+    return entryOf(snapshot, 'skipped', 'within-grace');
+  }
+  if (context.listings.incomplete) {
+    // A run whose attempt list could not be read may list this attempt.
+    return entryOf(snapshot, 'unknown', 'run-state-unknown');
+  }
+  const state = attemptStateOf(context.attemptsById, snapshot.attemptId);
+  if (state === 'unreadable') {
+    return entryOf(snapshot, 'unknown', 'attempt-unreadable');
+  }
+  if (state === null || state === 'intent-recorded') {
+    return entryOf(snapshot, 'reportOnly', 'no-run-unstarted');
+  }
+  return entryOf(snapshot, 'skipped', 'attempt-live');
+}
+
+/** A reservation one or more runs list: released only when every one is terminal and the attempt is finished. */
+function classifyListed(
+  snapshot: ReservationSnapshot,
+  context: ClassifyContext,
+  listingStates: readonly (LaneRunStateValue | 'unreadable' | undefined)[],
+): ClassifiedOrphanReservation {
+  if (listingStates.some((state) => state === undefined || state === 'unreadable')) {
+    return entryOf(snapshot, 'unknown', 'run-state-unknown');
+  }
+  if (listingStates.some((state) => !isTerminalRunState(state as LaneRunStateValue))) {
+    return entryOf(snapshot, 'skipped', 'live-run');
+  }
+  if (context.listings.incomplete) {
+    return entryOf(snapshot, 'unknown', 'run-state-unknown');
+  }
+  const state = attemptStateOf(context.attemptsById, snapshot.attemptId);
+  if (state === null || state === 'unreadable') {
+    return entryOf(snapshot, 'unknown', 'attempt-unreadable');
+  }
+  return inCapacityReleaseStates(state)
+    ? entryOf(snapshot, 'orphan', 'terminal-run')
+    : entryOf(snapshot, 'skipped', 'attempt-live');
+}
+
+function classifySnapshot(snapshot: ReservationSnapshot, context: ClassifyContext): ClassifiedOrphanReservation {
+  const listingStates = context.listings.byAttemptId.get(snapshot.attemptId);
+  return listingStates === undefined || listingStates.length === 0
+    ? classifyUnlisted(snapshot, context)
+    : classifyListed(snapshot, context, listingStates);
+}
+
+/** The attempt and id a malformed reservation still readably carries. */
+function malformedIdentity(element: unknown, index: number): { readonly id: string; readonly attemptId: string } {
+  let snap: Record<string, unknown> | null = null;
+  try {
+    snap = snapshotPlainDataRecord(element);
+  } catch {
+    snap = null;
+  }
+  const idValue = snap?.['id'];
+  const attemptValue = snap?.['attemptId'];
+  return {
+    id: typeof idValue === 'string' && idValue.length > 0 ? idValue : `malformed-${index}`,
+    attemptId: typeof attemptValue === 'string' ? attemptValue : '',
+  };
+}
+
+/** One reservation element to its entry; null when the reservation is not held (ignored). */
+function classifyReservationElement(
+  reservations: unknown,
+  index: number,
+  context: ClassifyContext,
+): ClassifiedOrphanReservation | null {
+  const elementRead = safeElementAt(reservations as readonly unknown[], index);
+  const element = elementRead.ok ? elementRead.value : undefined;
+  if (!elementRead.ok || element === undefined || element === null || isHole(reservations as readonly unknown[], index)) {
+    // A hole, a null element or a throwing element read cannot even name
+    // its reservation; the fallback id is deterministic so the report
+    // stays stable.
+    return malformedEntry(`malformed-${index}`, '');
+  }
+  const snapshot = snapshotReservation(element);
+  if (snapshot === null) {
+    // A record whose `held` is readable `false` is ignored; everything else
+    // that failed the snapshot is reported malformed and never released.
+    if (rawHeldOf(element) === false) {
+      return null;
+    }
+    const identity = malformedIdentity(element, index);
+    return malformedEntry(identity.id, identity.attemptId);
+  }
+  // A held reservation whose `id` cannot be read keeps its deterministic
+  // fallback id; it is reported malformed and never released.
+  if (snapshot.idFallback) {
+    return malformedEntry(`malformed-${index}`, snapshot.attemptId);
+  }
+  return classifySnapshot(snapshot, context);
+}
+
+const byReservation = (a: ClassifiedOrphanReservation, b: ClassifiedOrphanReservation): number =>
+  byCodeUnit(a.reservationId, b.reservationId) || byCodeUnit(a.attemptId, b.attemptId);
+
+/** The grace from the input; anything but a finite non-negative number is infinite (everything within grace). */
+function graceOf(input: ClassifyOrphanReservationsInput): number {
+  const graceRaw = readInputField(input, 'graceMs');
+  return typeof graceRaw === 'number' && Number.isFinite(graceRaw) && graceRaw >= 0 ? graceRaw : Number.POSITIVE_INFINITY;
+}
+
 /**
  * Classify the held reservations against the runs, the run states the caller
  * read and the attempts the caller read. Never throws; malformed input is
  * classified `unknown` (`malformed-reservation`) and never released, and
  * hostile arrays are bounded by the `MAX_*` scan limits with `.length` read
- * once.
+ * once. A run whose attempt list cannot be read makes every reservation that
+ * would otherwise be released or reported `unknown`.
  */
 export function classifyOrphanReservations(
   input: ClassifyOrphanReservationsInput,
 ): OrphanReservationClassificationResult {
-  const orphans: ClassifiedOrphanReservation[] = [];
-  const reportOnly: ClassifiedOrphanReservation[] = [];
-  const skipped: ClassifiedOrphanReservation[] = [];
-  const unknown: ClassifiedOrphanReservation[] = [];
-
   const reservations = readInputField(input, 'reservations');
-  const runs = readInputField(input, 'runs');
-  const runStates = readInputField(input, 'runStates') as OrphanReservationRunStates | undefined;
-  const attemptsById = readInputField(input, 'attemptsById') as OrphanReservationAttemptsById | undefined;
   const nowRaw = readInputField(input, 'nowIso');
-  const nowMs = Date.parse(typeof nowRaw === 'string' ? nowRaw : '');
-  const graceRaw = readInputField(input, 'graceMs');
-  const graceMs = typeof graceRaw === 'number' && Number.isFinite(graceRaw) && graceRaw >= 0
-    ? graceRaw
-    : Number.POSITIVE_INFINITY;
+  const context: ClassifyContext = {
+    listings: collectRunListings(
+      readInputField(input, 'runs'),
+      readInputField(input, 'runStates') as OrphanReservationRunStates | undefined,
+    ),
+    attemptsById: (readInputField(input, 'attemptsById') as OrphanReservationAttemptsById | undefined) ?? new Map(),
+    nowMs: Date.parse(typeof nowRaw === 'string' ? nowRaw : ''),
+    graceMs: graceOf(input),
+  };
 
+  const buckets: Record<OrphanReservationClassification, ClassifiedOrphanReservation[]> = {
+    orphan: [],
+    reportOnly: [],
+    skipped: [],
+    unknown: [],
+  };
   const reservationCount = boundedLength(reservations, MAX_ORPHAN_RESERVATION_SCAN);
-  const runCount = boundedLength(runs, MAX_RUN_SCAN);
-
-  // attemptId -> the listing runs' states, read defensively.
-  const runsByAttemptId = new Map<string, (LaneRunStateValue | 'unreadable' | undefined)[]>();
-  for (let index = 0; index < runCount; index += 1) {
-    const runElement = safeElementAt(runs as readonly unknown[], index);
-    if (!runElement.ok || runElement.value === undefined || runElement.value === null || isHole(runs as readonly unknown[], index)) {
-      continue;
-    }
-    const element = runElement.value;
-    const attemptIds = runAttemptIds(element);
-    if (attemptIds.length === 0) {
-      continue;
-    }
-    // The run's state comes from the caller's map; an absent id is unknown.
-    let runId: string | null = null;
-    try {
-      const snap = snapshotPlainDataRecord(element);
-      if (snap !== null && typeof snap['runId'] === 'string' && (snap['runId'] as string).length > 0) {
-        runId = snap['runId'] as string;
-      }
-    } catch {
-      runId = null;
-    }
-    // The run's state comes from the caller's map; an unreadable map or a
-    // throwing `get` (a hostile Proxy) reads as undefined — the reservation
-    // then classifies unknown, never released.
-    let state: LaneRunStateValue | 'unreadable' | undefined = undefined;
-    try {
-      if (runId !== null && runStates !== undefined && runStates instanceof Map) {
-        state = runStates.get(runId);
-      }
-    } catch {
-      state = 'unreadable';
-    }
-    for (const attemptId of attemptIds) {
-      const bucket = runsByAttemptId.get(attemptId);
-      if (bucket === undefined) {
-        runsByAttemptId.set(attemptId, [state]);
-      } else {
-        bucket.push(state);
-      }
-    }
-  }
-
   for (let index = 0; index < reservationCount; index += 1) {
-    const elementRead = safeElementAt(reservations as readonly unknown[], index);
-    const element = elementRead.ok ? elementRead.value : undefined;
-    if (!elementRead.ok || element === undefined || element === null || isHole(reservations as readonly unknown[], index)) {
-      // A hole, a null element or a throwing element read cannot even name
-      // its reservation; the fallback id is deterministic so the report
-      // stays stable.
-      unknown.push(malformedEntry(`malformed-${index}`, ''));
-      continue;
+    const entry = classifyReservationElement(reservations, index, context);
+    if (entry !== null) {
+      buckets[entry.classification].push(entry);
     }
-    const snapshot = snapshotReservation(element);
-    if (snapshot === null) {
-      // Distinguish "not held" (a released reservation: ignored) from
-      // "malformed": a record whose `held` is readable `false` is ignored,
-      // everything else that failed the snapshot — a primitive, a Proxy
-      // with throwing traps, a throwing getter, a forbidden own key, an
-      // invalid `held`, a missing id/attemptId/reservedAtIso — is reported
-      // malformed and never released.
-      if (rawHeldOf(element) === false) {
-        continue;
-      }
-      let attemptId = '';
-      let id: string | null = null;
-      try {
-        const snap = snapshotPlainDataRecord(element);
-        if (snap !== null) {
-          if (typeof snap['attemptId'] === 'string') {
-            attemptId = snap['attemptId'];
-          }
-          if (typeof snap['id'] === 'string' && snap['id'].length > 0) {
-            id = snap['id'];
-          }
-        }
-      } catch {
-        attemptId = '';
-      }
-      unknown.push(malformedEntry(id ?? `malformed-${index}`, attemptId));
-      continue;
-    }
-    // A held reservation whose `id` cannot be read keeps its deterministic
-    // fallback id; it is reported malformed and never released.
-    if (snapshot.idFallback) {
-      unknown.push(malformedEntry(`malformed-${index}`, snapshot.attemptId));
-      continue;
-    }
-
-    const listingStates = runsByAttemptId.get(snapshot.attemptId);
-    if (listingStates === undefined || listingStates.length === 0) {
-      // No run lists the attempt: never release.
-      const reservedMs = snapshot.reservedMs;
-      if (!Number.isFinite(nowMs) || !Number.isFinite(reservedMs) || nowMs - reservedMs < graceMs) {
-        skipped.push({
-          reservationId: snapshot.id,
-          attemptId: snapshot.attemptId,
-          classification: 'skipped',
-          reason: 'within-grace',
-          workOrderId: snapshot.workOrderId,
-          hostName: snapshot.hostName,
-          slotIndex: snapshot.slotIndex,
-          reservedAtIso: snapshot.reservedAtIso,
-        });
-        continue;
-      }
-      const state = attemptStateOf(attemptsById ?? new Map(), snapshot.attemptId);
-      if (state === 'unreadable') {
-        unknown.push({
-          reservationId: snapshot.id,
-          attemptId: snapshot.attemptId,
-          classification: 'unknown',
-          reason: 'attempt-unreadable',
-          workOrderId: snapshot.workOrderId,
-          hostName: snapshot.hostName,
-          slotIndex: snapshot.slotIndex,
-          reservedAtIso: snapshot.reservedAtIso,
-        });
-        continue;
-      }
-      if (state === null || state === 'intent-recorded') {
-        reportOnly.push({
-          reservationId: snapshot.id,
-          attemptId: snapshot.attemptId,
-          classification: 'reportOnly',
-          reason: 'no-run-unstarted',
-          workOrderId: snapshot.workOrderId,
-          hostName: snapshot.hostName,
-          slotIndex: snapshot.slotIndex,
-          reservedAtIso: snapshot.reservedAtIso,
-        });
-        continue;
-      }
-      skipped.push({
-        reservationId: snapshot.id,
-        attemptId: snapshot.attemptId,
-        classification: 'skipped',
-        reason: 'attempt-live',
-        workOrderId: snapshot.workOrderId,
-        hostName: snapshot.hostName,
-        slotIndex: snapshot.slotIndex,
-        reservedAtIso: snapshot.reservedAtIso,
-      });
-      continue;
-    }
-
-    // One or more runs list the attempt.
-    if (listingStates.some((state) => state === undefined || state === 'unreadable')) {
-      unknown.push({
-        reservationId: snapshot.id,
-        attemptId: snapshot.attemptId,
-        classification: 'unknown',
-        reason: 'run-state-unknown',
-        workOrderId: snapshot.workOrderId,
-        hostName: snapshot.hostName,
-        slotIndex: snapshot.slotIndex,
-        reservedAtIso: snapshot.reservedAtIso,
-      });
-      continue;
-    }
-    if (listingStates.some((state) => !isTerminalRunState(state as LaneRunStateValue))) {
-      skipped.push({
-        reservationId: snapshot.id,
-        attemptId: snapshot.attemptId,
-        classification: 'skipped',
-        reason: 'live-run',
-        workOrderId: snapshot.workOrderId,
-        hostName: snapshot.hostName,
-        slotIndex: snapshot.slotIndex,
-        reservedAtIso: snapshot.reservedAtIso,
-      });
-      continue;
-    }
-    const state = attemptStateOf(attemptsById ?? new Map(), snapshot.attemptId);
-    if (state === null || state === 'unreadable') {
-      unknown.push({
-        reservationId: snapshot.id,
-        attemptId: snapshot.attemptId,
-        classification: 'unknown',
-        reason: 'attempt-unreadable',
-        workOrderId: snapshot.workOrderId,
-        hostName: snapshot.hostName,
-        slotIndex: snapshot.slotIndex,
-        reservedAtIso: snapshot.reservedAtIso,
-      });
-      continue;
-    }
-    if (inCapacityReleaseStates(state)) {
-      orphans.push({
-        reservationId: snapshot.id,
-        attemptId: snapshot.attemptId,
-        classification: 'orphan',
-        reason: 'terminal-run',
-        workOrderId: snapshot.workOrderId,
-        hostName: snapshot.hostName,
-        slotIndex: snapshot.slotIndex,
-        reservedAtIso: snapshot.reservedAtIso,
-      });
-      continue;
-    }
-    skipped.push({
-      reservationId: snapshot.id,
-      attemptId: snapshot.attemptId,
-      classification: 'skipped',
-      reason: 'attempt-live',
-      workOrderId: snapshot.workOrderId,
-      hostName: snapshot.hostName,
-      slotIndex: snapshot.slotIndex,
-      reservedAtIso: snapshot.reservedAtIso,
-    });
   }
-
-  const byId = (a: ClassifiedOrphanReservation, b: ClassifiedOrphanReservation): number =>
-    byCodeUnit(a.reservationId, b.reservationId) || byCodeUnit(a.attemptId, b.attemptId);
-  orphans.sort(byId);
-  reportOnly.sort(byId);
-  skipped.sort(byId);
-  unknown.sort(byId);
-  return { orphans, reportOnly, skipped, unknown };
+  return {
+    orphans: buckets.orphan.sort(byReservation),
+    reportOnly: buckets.reportOnly.sort(byReservation),
+    skipped: buckets.skipped.sort(byReservation),
+    unknown: buckets.unknown.sort(byReservation),
+  };
 }

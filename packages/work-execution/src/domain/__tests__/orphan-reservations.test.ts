@@ -553,4 +553,159 @@ describe('classifyOrphanReservations', () => {
     expect(both.orphans).toHaveLength(1);
     expect(both.orphans[0]?.reason).toBe('terminal-run');
   });
+
+  describe('untrusted run attempt lists and keyed attempt lookups', () => {
+    const hostileAttemptLists: readonly (readonly [string, () => unknown])[] = [
+      [
+        'a revoked Proxy',
+        () => {
+          const { proxy, revoke } = Proxy.revocable(['att-1'], {});
+          revoke();
+          return proxy;
+        },
+      ],
+      [
+        'an array Proxy whose element getter throws',
+        () =>
+          new Proxy(['att-1'], {
+            get(target, prop, receiver) {
+              if (prop === 'length') {
+                return 1;
+              }
+              if (prop === '0') {
+                throw new Error('trap');
+              }
+              return Reflect.get(target, prop, receiver);
+            },
+          }),
+      ],
+      [
+        'an array whose length getter throws',
+        () =>
+          new Proxy(['att-1'], {
+            get(target, prop, receiver) {
+              if (prop === 'length') {
+                throw new Error('trap');
+              }
+              return Reflect.get(target, prop, receiver);
+            },
+          }),
+      ],
+    ];
+
+    it.each(hostileAttemptLists)(
+      'never releases when a run attempt list is %s, and still classifies the other reservations',
+      (_name, makeList) => {
+        const hostileRun = { runId: 'run-hostile', attemptIds: makeList() };
+        const result = classify(
+          [
+            reservation({ id: 'res-a', attemptId: 'att-1' }),
+            reservation({ id: 'res-b', attemptId: 'att-2' }),
+            reservation({ id: 'res-c', attemptId: 'att-3' }),
+            { held: true, attemptId: 'att-4' },
+          ],
+          [hostileRun, run('run-2', ['att-2']), run('run-3', ['att-3'])],
+          {
+            runStates: new Map<string, LaneRunStateValue | 'unreadable'>([
+              ['run-2', LANE_RUN_TERMINAL_STATES[0]],
+              ['run-3', 'gating'],
+            ]),
+            attemptsById: new Map([
+              ['att-1', { state: 'ended' }],
+              ['att-2', { state: 'ended' }],
+            ]),
+          },
+        );
+        expect(result.orphans).toHaveLength(0);
+        expect(result.reportOnly).toHaveLength(0);
+        // The unreadable run may list att-1 and att-2: both are unknown, never released.
+        expect(result.unknown.map((entry) => [entry.reservationId, entry.reason])).toEqual([
+          ['malformed-3', 'malformed-reservation'],
+          ['res-a', 'run-state-unknown'],
+          ['res-b', 'run-state-unknown'],
+        ]);
+        // A reservation on a readable live run is still classified.
+        expect(result.skipped.map((entry) => [entry.reservationId, entry.reason])).toEqual([['res-c', 'live-run']]);
+      },
+    );
+
+    it('keeps the readable ids of a partly unreadable list and releases nothing it could hide', () => {
+      const partly = new Proxy(['att-1', 'att-2'], {
+        get(target, prop, receiver) {
+          if (prop === '1') {
+            throw new Error('trap');
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+      const result = classify(
+        [reservation({ id: 'res-a', attemptId: 'att-1' })],
+        [{ runId: 'run-1', attemptIds: partly }],
+        {
+          runStates: new Map([['run-1', LANE_RUN_TERMINAL_STATES[0]]]),
+          attemptsById: new Map([['att-1', { state: 'ended' }]]),
+        },
+      );
+      expect(result.orphans).toHaveLength(0);
+      expect(result.unknown.map((entry) => entry.reason)).toEqual(['run-state-unknown']);
+    });
+
+    it('does not read an inherited attempt entry from a plain record: unreadable, never an orphan', () => {
+      const attempts = Object.create({ 'att-1': { state: 'ended' } }) as Record<string, unknown>;
+      attempts['att-2'] = { state: 'ended' };
+      const result = classifyOrphanReservations({
+        reservations: [
+          reservation({ id: 'res-a', attemptId: 'att-1' }),
+          reservation({ id: 'res-b', attemptId: 'att-2' }),
+        ],
+        runs: [run('run-1', ['att-1', 'att-2'])],
+        runStates: new Map([['run-1', LANE_RUN_TERMINAL_STATES[0]]]),
+        attemptsById: attempts as never,
+        nowIso: NOW,
+        graceMs: GRACE_MS,
+      });
+      expect(result.unknown.map((entry) => [entry.reservationId, entry.reason])).toEqual([['res-a', 'attempt-unreadable']]);
+      expect(ids(result.orphans)).toEqual(['res-b']);
+    });
+
+    it('does not read an accessor attempt entry from a plain record: unreadable, never an orphan', () => {
+      let getterRan = false;
+      const attempts: Record<string, unknown> = { 'att-2': { state: 'ended' } };
+      Object.defineProperty(attempts, 'att-1', {
+        enumerable: true,
+        get() {
+          getterRan = true;
+          return { state: 'ended' };
+        },
+      });
+      const result = classifyOrphanReservations({
+        reservations: [
+          reservation({ id: 'res-a', attemptId: 'att-1' }),
+          reservation({ id: 'res-b', attemptId: 'att-2' }),
+        ],
+        runs: [run('run-1', ['att-1', 'att-2'])],
+        runStates: new Map([['run-1', LANE_RUN_TERMINAL_STATES[0]]]),
+        attemptsById: attempts as never,
+        nowIso: NOW,
+        graceMs: GRACE_MS,
+      });
+      expect(getterRan).toBe(false);
+      expect(result.unknown.map((entry) => [entry.reservationId, entry.reason])).toEqual([['res-a', 'attempt-unreadable']]);
+      expect(ids(result.orphans)).toEqual(['res-b']);
+    });
+
+    it('reads an inherited attempt entry as unreadable for a no-run reservation too, never reportOnly', () => {
+      const attempts = Object.create({ 'att-1': { state: 'ended' } }) as Record<string, unknown>;
+      const result = classifyOrphanReservations({
+        reservations: [reservation({ id: 'res-a', attemptId: 'att-1' })],
+        runs: [],
+        runStates: new Map(),
+        attemptsById: attempts as never,
+        nowIso: NOW,
+        graceMs: GRACE_MS,
+      });
+      expect(result.unknown.map((entry) => entry.reason)).toEqual(['attempt-unreadable']);
+      expect(result.reportOnly).toHaveLength(0);
+    });
+  });
 });

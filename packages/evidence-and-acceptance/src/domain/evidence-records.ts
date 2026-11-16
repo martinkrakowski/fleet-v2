@@ -189,11 +189,13 @@ export function assessmentIdForChain(projectId: string, chainName: string): stri
 
 /**
  * The package digest of a frozen brief: exactly 64 lowercase hex characters.
- * The `(?!\n)` guard makes the exact-length requirement hold even if the
- * `m` flag were ever added (with `m`, a bare `$` accepts a final line
- * terminator; JavaScript's `$` without `m` does not).
+ * The end of the input is asserted with an explicit `(?![\s\S])` lookahead
+ * rather than `$`: the lookahead means "no character follows" regardless of
+ * flags or regex flavour, while `$` is flavour-dependent (with `m` it accepts
+ * a final line terminator, and some engines define it to match before a
+ * final CR, which would let a 64-hex digest followed by `\r` through).
  */
-export const BRIEF_PACKAGE_DIGEST_PATTERN = /^[0-9a-f]{64}(?!\n)$/;
+export const BRIEF_PACKAGE_DIGEST_PATTERN = /^[0-9a-f]{64}(?![\s\S])/;
 
 /** A brief package digest is a string of exactly 64 lowercase hex characters. */
 export function isValidBriefPackageDigest(value: unknown): value is string {

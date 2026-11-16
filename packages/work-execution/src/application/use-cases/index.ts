@@ -54,6 +54,7 @@ export * from "./ReapOrphanSessionsUseCase.use-case.js";
 export * from "./ReapZombiesUseCase.use-case.js";
 export * from "./ReconcileAttemptUseCase.use-case.js";
 export * from "./RecordBriefReadUseCase.use-case.js";
+export * from "./RecordShadowDayUseCase.use-case.js";
 export * from "./RefreshChainsUseCase.use-case.js";
 export * from "./RegisterWorkOrderUseCase.use-case.js";
 export * from "./RequestAttemptAcceptanceUseCase.use-case.js";

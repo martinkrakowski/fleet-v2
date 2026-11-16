@@ -225,6 +225,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
           forge: shadowForge,
           attention: chainAttention,
           now,
+          halt: input.conductor.halt,
           mode: 'shadow',
         })
       : undefined;

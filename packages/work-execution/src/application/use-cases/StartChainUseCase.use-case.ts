@@ -20,7 +20,7 @@ import {
   parseChainRepository,
 } from '../../domain/chain-records.js';
 import type { ChainRecord, ChainRepositoryRef } from '../../domain/chain-records.js';
-import { isConductorHalted, isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type {
   StartChainCommand,
   StartChainDecision,
@@ -102,13 +102,14 @@ function unresolved(record: ChainRecord | null = null): StartChainDecision {
 }
 
 /**
- * The fail-closed halt read (plan §3.7): an absent dependency keeps today's
- * behaviour; a provided port without `read`, a throw, and any answer that is
- * not an object with `state: 'clear'` read as halted.
+ * The fail-closed halt read (plan §3.7, fix round 1): a missing dependency
+ * fails closed; a provided port without `read`, a throw, and any answer that
+ * is not an object with `state: 'clear'` — or whose record does not agree
+ * with that tag — read as halted.
  */
 async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
   if (halt === undefined) {
-    return false;
+    return true;
   }
   if (typeof halt.read !== 'function') {
     return true;
@@ -119,10 +120,21 @@ async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean
       return true;
     }
     const tag = (state as { readonly state?: unknown }).state;
-    if (tag === 'clear') {
-      return isConductorHalted(state as Parameters<typeof isConductorHalted>[0]);
+    if (tag !== 'clear') {
+      return true;
     }
-    return true;
+    // `clear` is believed only when its record agrees: absent (null), or a
+    // plain record whose own `halted` is exactly false. Anything else — a
+    // malformed record, a getter, `halted: true` — fails closed.
+    const record = (state as { readonly record?: unknown }).record;
+    if (record === null) {
+      return false;
+    }
+    if (typeof record !== 'object' || Array.isArray(record)) {
+      return true;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, 'halted');
+    return descriptor === undefined || descriptor.value !== false;
   } catch {
     return true;
   }
@@ -143,11 +155,11 @@ export class StartChainUseCase implements StartChainPort {
       readonly chains: ChainRepositoryPort;
       readonly forge: MergeForgeActionPort;
       /**
-       * The conductor halt read (plan §3.7). Absent, today's behaviour stands;
-       * provided but unreadable, off-contract or halted, a start refuses
-       * before the intent write and before any forge call.
+       * The conductor halt read (plan §3.7). Required and fail closed:
+       * missing, unreadable, off-contract or halted, a start refuses before
+       * the intent write and before any forge call.
        */
-      readonly halt?: Pick<ConductorHaltPort, 'read'>;
+      readonly halt: Pick<ConductorHaltPort, 'read'>;
     },
   ) {}
 

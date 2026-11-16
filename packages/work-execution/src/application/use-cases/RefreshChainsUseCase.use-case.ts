@@ -23,7 +23,7 @@ import {
   parseChainRepository,
 } from '../../domain/chain-records.js';
 import type { ChainRecord } from '../../domain/chain-records.js';
-import { isConductorHalted, isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { computeCallBudget, DAEMON_CALL_MIN_REMAINING_MS } from '../../domain/daemon-tick.js';
 import type {
   RefreshChainsChainReport,
@@ -115,11 +115,12 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       readonly forge: MergeForgeActionPort;
       readonly attention: ChainAttentionPort;
       /**
-       * The conductor halt read (plan §3.7). Absent, today's behaviour stands;
-       * provided but unreadable, off-contract or halted, the pass refuses
-       * before any forge call or intent write.
+       * The conductor halt read (plan §3.7). Required and fail closed: a
+       * missing port, an unreadable read, a throw and any answer that is not
+       * an object whose `state: 'clear'` agrees with its record refuse the
+       * pass before any forge call or intent write.
        */
-      readonly halt?: Pick<ConductorHaltPort, 'read'>;
+      readonly halt: Pick<ConductorHaltPort, 'read'>;
       readonly now?: () => string;
       /** `live` writes and is accepted only when passed explicitly; an omitted or unknown mode is `shadow` (observe only: no intent, no forge write, no attention). */
       readonly mode?: 'shadow' | 'live';
@@ -152,13 +153,14 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
   }
 
   /**
-   * The fail-closed halt read (plan §3.7): an absent dependency keeps today's
-   * behaviour; a provided port without `read`, a throw, and any answer that is
-   * not an object with `state: 'clear'` read as halted.
+   * The fail-closed halt read (plan §3.7, fix round 1): a missing dependency
+   * fails closed; a provided port without `read`, a throw, and any answer
+   * that is not an object with `state: 'clear'` — or whose record does not
+   * agree with that tag — read as halted.
    */
   private async isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
     if (halt === undefined) {
-      return false;
+      return true;
     }
     if (typeof halt.read !== 'function') {
       return true;
@@ -169,10 +171,21 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
         return true;
       }
       const tag = (state as { readonly state?: unknown }).state;
-      if (tag === 'clear') {
-        return isConductorHalted(state as Parameters<typeof isConductorHalted>[0]);
+      if (tag !== 'clear') {
+        return true;
       }
-      return true;
+      // `clear` is believed only when its record agrees: absent (null), or a
+      // plain record whose own `halted` is exactly false. Anything else — a
+      // malformed record, a getter, `halted: true` — fails closed.
+      const record = (state as { readonly record?: unknown }).record;
+      if (record === null) {
+        return false;
+      }
+      if (typeof record !== 'object' || Array.isArray(record)) {
+        return true;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(record, 'halted');
+      return descriptor === undefined || descriptor.value !== false;
     } catch {
       return true;
     }
@@ -188,7 +201,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     }
     if (await this.isHalted(this.deps.halt)) {
       // Refused before any forge call and before any intent or outcome write;
-      // the halt is read once here, never again inside the per-chain loop.
+      // rechecked before every not-yet-sent action below.
       return { outcome: 'refused', reasonCode: 'halted', chains: [] };
     }
     const head = await this.readMainHead(command);
@@ -206,6 +219,11 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     for (const record of listed.records) {
       if (record.state !== 'started') {
         continue;
+      }
+      if (await this.isHalted(this.deps.halt)) {
+        // Recheck before this chain's not-yet-sent intent and forge action: a
+        // merge already sent above still settles and is reported in `chains`.
+        return { outcome: 'refused', reasonCode: 'halted', chains };
       }
       if (!this.hasBudget(command.deadlineIso)) {
         budgetHit = true;

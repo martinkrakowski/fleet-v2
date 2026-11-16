@@ -273,7 +273,7 @@ describe('buildLaneUsageLogRow refusals', () => {
     expect(buildLaneUsageLogRow({ attempt: null as never, nowIso: NOW_ISO })).toBeNull();
   });
 
-  it('returns null without invoking or propagating a throwing getter', () => {
+  it('returns null without propagating a throwing getter, which is invoked exactly once', () => {
     let calls = 0;
     const hostile = attempt();
     Object.defineProperty(hostile, 'worktreePath', {
@@ -372,10 +372,54 @@ describe('parseLaneUsageLogRow', () => {
     expect(parseLaneUsageLogRow({ ...row, billing: 'plan', costUsd: null, costBasis: 'unknown' })).not.toBeNull();
   });
 
+  const STRING_FIELD_CASES: ReadonlyArray<{
+    field: 'attemptId' | 'workOrderId' | 'runId' | 'worktreeName' | 'agent' | 'model';
+    realistic: string;
+    build: (value: string) => LaneUsageLogRow | null;
+  }> = [
+    { field: 'attemptId', realistic: 'attempt-2.a_b:c', build: (v) => build({ id: v } as Partial<AttemptRecord>) },
+    { field: 'workOrderId', realistic: 'wo-2', build: (v) => build({ workOrderId: v } as Partial<AttemptRecord>) },
+    {
+      field: 'runId',
+      realistic: 'run-01M7GWPQF07D6V4WFZYGPJKZXQ',
+      build: (v) => buildLaneUsageLogRow({ attempt: attempt(), runId: v, nowIso: NOW_ISO }),
+    },
+    {
+      field: 'worktreeName',
+      realistic: '66a76bf39f1054ade96bea7102d62c67',
+      build: (v) => build({ worktreePath: `/lanes/${v}` } as Partial<AttemptRecord>),
+    },
+    { field: 'agent', realistic: 'lane-glm', build: (v) => build({ usage: meteredUsage({ agent: v }) } as Partial<AttemptRecord>) },
+    {
+      field: 'model',
+      realistic: 'openrouter/z-ai/glm-5.3-flash',
+      build: (v) => build({ usage: meteredUsage({ model: v }) } as Partial<AttemptRecord>),
+    },
+  ];
+
+  for (const { field, realistic, build: buildWith } of STRING_FIELD_CASES) {
+    it(`${field}: a value with spaces never reaches a built, parsed or serialised row, and a realistic value round-trips`, () => {
+      const bad = 'prompt details here';
+      const built = buildWith(bad);
+      // Identifier fields refuse the row; agent and model redact to null.
+      if (built !== null) {
+        expect(built[field]).toBeNull();
+        expect(JSON.stringify(built)).not.toContain(bad);
+      }
+      const base = build() as LaneUsageLogRow;
+      expect(parseLaneUsageLogRow({ ...base, [field]: bad })).toBeNull();
+      expect(serializeLaneUsageLogRow({ ...base, [field]: bad } as LaneUsageLogRow)).toBeNull();
+      const good = buildWith(realistic);
+      expect(good).not.toBeNull();
+      expect((good as LaneUsageLogRow)[field]).toBe(realistic);
+      expect(parseLaneUsageLogRow(good)).toEqual(good);
+    });
+  }
+
   it('returns null on a worktreeName longer than the text bound', () => {
     const row = build() as LaneUsageLogRow;
-    expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a'.repeat(512) })).not.toBeNull();
-    expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a'.repeat(513) })).toBeNull();
+    expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a'.repeat(128) })).not.toBeNull();
+    expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a'.repeat(129) })).toBeNull();
     expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a'.repeat(100_000) })).toBeNull();
   });
 

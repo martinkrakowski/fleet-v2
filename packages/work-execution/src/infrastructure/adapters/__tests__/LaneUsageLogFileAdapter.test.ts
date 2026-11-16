@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   LANE_USAGE_LOG_SCHEMA_VERSION,
   buildLaneUsageLogRow,
+  serializeLaneUsageLogHeader,
   serializeLaneUsageLogRow,
   type LaneUsageLogRow,
 } from '../../../domain/lane-usage-log.js';
@@ -178,16 +179,38 @@ describe('LaneUsageLogFileAdapter', () => {
   });
 
   it('enforces the byte budget in memory too', async () => {
+    const headerBytes = Buffer.byteLength(serializeLaneUsageLogHeader() + '\n', 'utf8');
     const rowBytes = Buffer.byteLength(serializeLaneUsageLogRow(row()) + '\n', 'utf8');
-    const adapter = new LaneUsageLogFileAdapter({ maxFileBytes: rowBytes, maxRows: 100 });
+    const adapter = new LaneUsageLogFileAdapter({ maxFileBytes: headerBytes + rowBytes, maxRows: 100 });
     expect(await adapter.append(row())).toEqual({ outcome: 'appended' });
     expect(await adapter.append(row('attempt-2'))).toEqual({
       outcome: 'refused', reason: 'log-budget-exhausted',
     });
-    const tiny = new LaneUsageLogFileAdapter({ maxFileBytes: rowBytes - 1, maxRows: 100 });
+    const tiny = new LaneUsageLogFileAdapter({ maxFileBytes: headerBytes + rowBytes - 1, maxRows: 100 });
     expect(await tiny.append(row())).toEqual({ outcome: 'refused', reason: 'log-budget-exhausted' });
     expect(await tiny.read()).toEqual({ outcome: 'read', rows: [] });
   });
+
+  it('applies the same byte budget in memory as on disk when the budget equals one row plus newline', async () => {
+    const rowBytes = Buffer.byteLength(serializeLaneUsageLogRow(row()) + '\n', 'utf8');
+    const stateDir = await tempStateDir();
+    const disk = new LaneUsageLogFileAdapter({ stateDir, maxFileBytes: rowBytes, maxRows: 100 });
+    const memory = new LaneUsageLogFileAdapter({ maxFileBytes: rowBytes, maxRows: 100 });
+    const expected = { outcome: 'refused', reason: 'log-budget-exhausted' };
+    expect(await disk.append(row())).toEqual(expected);
+    expect(await memory.append(row())).toEqual(expected);
+  });
+
+  for (const field of ['attemptId', 'workOrderId', 'runId', 'worktreeName', 'agent', 'model'] as const) {
+    it(`refuses to append a row whose ${field} has spaces and accepts the same row with a realistic value`, async () => {
+      const adapter = new LaneUsageLogFileAdapter({});
+      const bad = { ...row(), [field]: 'prompt details here' } as unknown as LaneUsageLogRow;
+      expect(await adapter.append(bad)).toEqual({ outcome: 'refused', reason: 'invalid-row' });
+      expect(await adapter.read()).toEqual({ outcome: 'read', rows: [] });
+      const realistic = { attemptId: 'attempt-9', workOrderId: 'wo-9', runId: 'run-9', worktreeName: 'wt-9', agent: 'lane-glm', model: 'openrouter/z-ai/glm-5.3-flash' }[field];
+      expect(await adapter.append({ ...row(), [field]: realistic } as LaneUsageLogRow)).toEqual({ outcome: 'appended' });
+    });
+  }
 
   it('returns store-unreadable when log file cannot be read', async () => {
     const stateDir = await tempStateDir();

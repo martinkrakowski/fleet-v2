@@ -82,18 +82,20 @@ const MAX_TEXT_LENGTH = 512;
 /** The canonical instant shape every timestamp field must carry. */
 const ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
-function isSafeText(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    value.length > 0 &&
-    value.length <= MAX_TEXT_LENGTH &&
-    !CONTROL_CHARACTERS.test(value) &&
-    !containsSecretShape(value)
-  );
+/**
+ * Identifier fields (attempt, work order and run ids, the agent name, the
+ * worktree name) are strict identifiers, never free text: no whitespace, a
+ * closed character set, anchored, at most 128 characters. Model ids keep the
+ * telemetry model-id shape (`isTelemetryModelId`).
+ */
+const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function isIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && IDENTIFIER_PATTERN.test(value) && !containsSecretShape(value);
 }
 
-function isOptionalSafeText(value: unknown): value is string | null {
-  return value === null || isSafeText(value);
+function isOptionalIdentifier(value: unknown): value is string | null {
+  return value === null || isIdentifier(value);
 }
 
 function isNonNegativeNumber(value: unknown): value is number {
@@ -201,7 +203,7 @@ export function buildLaneUsageLogRow(input: {
       return null;
     }
     const { id, workOrderId, kind, fixNumber, worktreePath, outcome, stopReason } = attempt;
-    if (!isSafeText(id) || !isSafeText(workOrderId)) {
+    if (!isIdentifier(id) || !isIdentifier(workOrderId)) {
       return null;
     }
     if (!isEnum(kind, ['initial', 'fix'] as const)) {
@@ -217,11 +219,11 @@ export function buildLaneUsageLogRow(input: {
       return null;
     }
     const runIdField = input.runId === undefined ? null : input.runId;
-    if (runIdField !== null && !isSafeText(runIdField)) {
+    if (runIdField !== null && !isIdentifier(runIdField)) {
       return null;
     }
     const worktreeName = worktreeNameFromPath(worktreePath);
-    if (worktreeName === null) {
+    if (worktreeName === null || !isIdentifier(worktreeName)) {
       return null;
     }
     const runnerRecord = (attempt as { runner?: unknown }).runner;
@@ -256,7 +258,7 @@ export function buildLaneUsageLogRow(input: {
       ? usageRecord.source
       : 'unavailable';
     const model = isTelemetryModelId(usageRecord?.model) ? (usageRecord?.model as string) : null;
-    const agent = isOptionalSafeText(usageRecord?.agent) ? (usageRecord?.agent as string | null) : null;
+    const agent = isOptionalIdentifier(usageRecord?.agent) ? (usageRecord?.agent as string | null) : null;
     // The usage record's `reason` is prompt/detail text — diagnostic stderr,
     // provider messages — and never belongs in a telemetry row, so the builder
     // always redacts it to `null` rather than copying it through.
@@ -340,12 +342,12 @@ export function parseLaneUsageLogRow(value: unknown): LaneUsageLogRow | null {
     if (schemaVersion !== 1) {
       return null;
     }
-    if (!isSafeText(attemptId) || !isSafeText(workOrderId) || !isOptionalSafeText(runId)) {
+    if (!isIdentifier(attemptId) || !isIdentifier(workOrderId) || !isOptionalIdentifier(runId)) {
       return null;
     }
     if (
       worktreeName !== null &&
-      (typeof worktreeName !== 'string' || worktreeName.length === 0 ||
+      (!isIdentifier(worktreeName) || worktreeName.length === 0 ||
         worktreeName.length > MAX_TEXT_LENGTH ||
         worktreeName === '.' || worktreeName === '..' ||
         /[\\/]/.test(worktreeName) || CONTROL_CHARACTERS.test(worktreeName) ||
@@ -362,7 +364,7 @@ export function parseLaneUsageLogRow(value: unknown): LaneUsageLogRow | null {
       !isEnum(billing, ['metered', 'plan', 'unknown'] as const) ||
       seatRole !== null && !isEnum(seatRole, SEAT_PLAN_ROLES) ||
       model !== null && !isTelemetryModelId(model) ||
-      !isOptionalSafeText(agent) ||
+      !isOptionalIdentifier(agent) ||
       !isEnum(source, ['opencode-db', 'opencode-api', 'unavailable'] as const) ||
       // The builder always writes null (usage reasons are prompt/detail text);
       // the parser, and so serialise and append, accept nothing else.

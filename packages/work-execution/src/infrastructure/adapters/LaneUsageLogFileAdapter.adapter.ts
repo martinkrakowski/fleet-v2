@@ -87,7 +87,8 @@ export class LaneUsageLogFileAdapter implements LaneUsageLogPort {
   private readonly maxRows: number;
   private readonly maxFileBytes: number;
   private readonly memoryRows: LaneUsageLogRow[] = [];
-  private memoryBytes = 0;
+  // The in-memory store budgets the versioned header exactly as the file does.
+  private memoryBytes = Buffer.byteLength(`${serializeLaneUsageLogHeader()}\n`, 'utf8');
 
   constructor(options: LaneUsageLogFileAdapterOptions = {}) {
     const fileName = options.fileName ?? DEFAULT_FILE_NAME;

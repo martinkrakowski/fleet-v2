@@ -27,7 +27,7 @@ import type {
   BriefAuthorSessionResult,
   BriefAuthorSessionUnavailableReason,
 } from '../../application/ports/out/BriefAuthoringPort.out-port.js';
-import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+import type { CommandExecutorPort, CommandRunResult } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import { textContainsSecretShape } from '../../domain/brief-answer.js';
 
 export interface BriefAuthoringAdapterOptions {
@@ -196,8 +196,6 @@ function resolveTimeout(requested: number | undefined, configured?: number): num
 
 const DEFAULT_LOCK_MAX_WAIT_MS = 1_000;
 const DEFAULT_LOCK_POLL_INTERVAL_MS = 25;
-/** Bound on stale-takeover attempts per acquireLock call; the session lock polls and retries. */
-const MAX_TAKEOVER_ATTEMPTS = 4;
 export const CROSS_HOST_FACTOR = 6;
 
 export interface LockPayload {
@@ -215,8 +213,6 @@ export interface LockFsOps {
   ): void;
   readFileSync(filePath: string, encoding: BufferEncoding): string;
   renameSync(oldPath: string, newPath: string): void;
-  /** Hard link that fails with EEXIST instead of overwriting; restores a moved lock safely. */
-  linkSync(existingPath: string, newPath: string): void;
   unlinkSync(filePath: string): void;
 }
 
@@ -226,6 +222,9 @@ export interface AcquireLockOptions {
   readonly currentHost?: string;
   readonly token?: string;
   readonly fsOps?: LockFsOps;
+  /** Bound on guard attempts and the pause between them; defaults are for production. */
+  readonly guardAttempts?: number;
+  readonly guardRetryMs?: number;
 }
 
 export type AcquireLockResult =
@@ -319,12 +318,41 @@ export function isLockStale(
   return age >= staleAfterMs * CROSS_HOST_FACTOR;
 }
 
-/** Unlink a scratch file, ignoring every failure (a leftover is harmless; see ACQUIRE). */
+// LOCK INVARIANT: no operation creates, deletes or replaces the lock file
+// without holding the guard (`<lock>.guard`, an exclusive-create file). Acquire
+// (first-time create and stale takeover) and release are each a short
+// read-then-write run entirely under the guard; the stale lock is deleted, never
+// moved aside or renamed over, so there is no restore step to race. The guard is
+// held for a few local file calls only and never across the seat session.
+// Ownership is reported only after re-reading the lock and finding the caller's
+// own token. Any doubt means "not acquired".
+
+/**
+ * Age past which a guard whose holder cannot be shown alive is considered left
+ * behind by a dead process. A live holder runs only a handful of local file
+ * calls (microseconds to milliseconds, no network or subprocess), so it cannot
+ * come near this bound; a same-host holder whose pid is alive is never broken
+ * at any age (isLockStale), and a cross-host guard needs six times the bound.
+ */
+export const GUARD_STALE_AFTER_MS = 10_000;
+const GUARD_ATTEMPTS = 20;
+const RELEASE_GUARD_ATTEMPTS = 200;
+const GUARD_RETRY_MS = 5;
+
+interface GuardTiming {
+  readonly now: number;
+  readonly pid: number | undefined;
+  readonly currentHost: string;
+  readonly attempts: number;
+  readonly retryMs: number;
+}
+
+/** Unlink a file, ignoring every failure. */
 function bestEffortUnlink(fsOps: LockFsOps, filePath: string): void {
   try {
     fsOps.unlinkSync(filePath);
   } catch {
-    // A lingering scratch file never sits at the lock path.
+    // Nothing more to do for this caller.
   }
 }
 
@@ -336,77 +364,76 @@ function readIfPresent(fsOps: LockFsOps, filePath: string): string | null | 'unr
   }
 }
 
-/**
- * Remove the takeover guard only while it still carries `guardToken`; any
- * doubt leaves it in place (it ages out through isLockStale).
- */
-function releaseGuard(fsOps: LockFsOps, guardPath: string, guardToken: string): void {
-  const raw = readIfPresent(fsOps, guardPath);
-  if (typeof raw === 'string' && parseLockPayload(raw)?.token === guardToken) {
-    bestEffortUnlink(fsOps, guardPath);
+function pause(ms: number): void {
+  if (ms > 0) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   }
 }
 
 /**
- * Move `targetPath` aside only if it still holds exactly `examinedRaw`, and
- * never leave the path absent because of this call. `rename` is by path, so a
- * different file could slip in between the compare and the move; the moved
- * bytes are therefore compared again, and a mismatch is restored with `link`
- * (which refuses to overwrite) rather than `rename` (which would clobber a
- * lock somebody created in the gap). Returns true only when the examined bytes
- * were moved aside and removed.
+ * Runs `section` while holding the guard, or returns null when the guard cannot
+ * be taken within the bounded retries (never an error, never state left behind).
+ * A guard left by a dead holder is removed only when it is stale and still
+ * byte-identical to the copy that was judged stale, and acquisition then starts
+ * again from the exclusive create; the breaker holds nothing else meanwhile.
  */
-function removeIfUnchanged(
+function withGuard<T>(
+  lockPath: string,
   fsOps: LockFsOps,
-  targetPath: string,
-  examinedRaw: string,
-  scratchPath: string,
-): boolean {
-  if (readIfPresent(fsOps, targetPath) !== examinedRaw) {
-    return false;
+  timing: GuardTiming,
+  section: () => T,
+): { readonly value: T } | null {
+  const guardPath = `${lockPath}.guard`;
+  const guardToken = randomUUID();
+  const guardPayload = createLockPayload(timing.now, timing.pid, timing.currentHost, guardToken);
+  for (let attempt = 0; attempt < timing.attempts; attempt += 1) {
+    try {
+      fsOps.writeFileSync(guardPath, guardPayload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+        return null;
+      }
+      const heldRaw = readIfPresent(fsOps, guardPath);
+      if (typeof heldRaw === 'string'
+        && isLockStale(parseLockPayload(heldRaw), GUARD_STALE_AFTER_MS, timing.now, timing.currentHost)) {
+        if (readIfPresent(fsOps, guardPath) === heldRaw) {
+          bestEffortUnlink(fsOps, guardPath);
+        }
+        continue;
+      }
+      pause(timing.retryMs);
+      continue;
+    }
+    try {
+      return { value: section() };
+    } finally {
+      const current = readIfPresent(fsOps, guardPath);
+      if (typeof current === 'string' && parseLockPayload(current)?.token === guardToken) {
+        bestEffortUnlink(fsOps, guardPath);
+      }
+    }
   }
-  try {
-    fsOps.renameSync(targetPath, scratchPath);
-  } catch {
-    return false;
-  }
-  if (readIfPresent(fsOps, scratchPath) === examinedRaw) {
-    bestEffortUnlink(fsOps, scratchPath);
-    return true;
-  }
-  // A different file was moved. Put it back without overwriting anything.
-  try {
-    fsOps.linkSync(scratchPath, targetPath);
-    bestEffortUnlink(fsOps, scratchPath);
-  } catch {
-    // The path is occupied again (or the link failed): the moved copy stays at
-    // the scratch path and this caller reports not-acquired.
-  }
-  return false;
+  return null;
+}
+
+function guardTiming(options: AcquireLockOptions | undefined, attempts: number): GuardTiming {
+  return {
+    now: options?.now ?? Date.now(),
+    pid: options !== undefined && 'pid' in options ? options.pid : process.pid,
+    currentHost: options?.currentHost ?? os.hostname(),
+    attempts: options?.guardAttempts ?? attempts,
+    retryMs: options?.guardRetryMs ?? GUARD_RETRY_MS,
+  };
 }
 
 /**
- * ACQUIRE(lockPath). Ownership is granted only by an exclusive create
- * (`wx`) of the lock path whose content, re-read afterwards, carries this
- * caller's own token. Nothing else ever grants it.
- * 1. Try `wx` create. Success -> re-read and confirm the token -> owned.
- * 2. On EEXIST read the lock. Unreadable (other than gone) or not stale ->
- *    NOT owned. Gone -> retry step 1.
- * 3. Stale: TAKE OVER under a guard. Take `${lockPath}.takeover` by `wx`
- *    create; if it exists, the guard is itself broken only when it is stale
- *    (same compare-then-move discipline), otherwise NOT owned. Only the guard
- *    holder may touch a stale lock, so two takers (and a taker examining an
- *    earlier read against a lock that has since been replaced) cannot
- *    interleave their destructive steps.
- *    - Re-read the lock: gone or not byte-identical to the examined stale
- *      payload -> release the guard and re-evaluate from step 1; the live
- *      lock is never touched.
- *    - Move it aside to a unique name, compare the moved bytes again, and
- *      restore with `link` (no overwrite) on mismatch (removeIfUnchanged).
- *    - `wx` create the new lock, re-read it, own it only if the token matches;
- *      then release the guard (only while it still carries this caller's token).
- * A crash at any step leaves either a stale lock, an absent lock path, or an
- * aged guard / scratch file; the next caller resolves each of those.
+ * ACQUIRE(lockPath), under the guard:
+ * - lock absent: create it with `wx`;
+ * - lock present and unreadable or not stale: NOT owned;
+ * - lock present and stale (age and owner-not-alive per isLockStale): delete it,
+ *   then create ours with `wx`.
+ * Ownership is reported only after re-reading the lock and finding our token.
+ * The guard being unavailable within the bounded retries is NOT owned.
  */
 export function acquireLock(
   lockPath: string,
@@ -414,87 +441,70 @@ export function acquireLock(
   options?: AcquireLockOptions,
 ): AcquireLockResult {
   const fsOps: LockFsOps = options?.fsOps ?? fsSync;
-  const now = options?.now ?? Date.now();
-  const pid = options !== undefined && 'pid' in options ? options.pid : process.pid;
-  const currentHost = options?.currentHost ?? os.hostname();
+  const timing = guardTiming(options, GUARD_ATTEMPTS);
   const myToken = options?.token ?? randomUUID();
-  const payload = createLockPayload(now, pid, currentHost, myToken);
-  const guardPath = `${lockPath}.takeover`;
+  const payload = createLockPayload(timing.now, timing.pid, timing.currentHost, myToken);
 
-  const tryCreate = (): 'created' | 'exists' | 'failed' => {
+  const underGuard = (): AcquireLockResult => {
+    const existing = readIfPresent(fsOps, lockPath);
+    if (existing === 'unreadable') {
+      return { owned: false };
+    }
+    if (existing !== null) {
+      if (!isLockStale(parseLockPayload(existing), staleAfterMs, timing.now, timing.currentHost)) {
+        return { owned: false };
+      }
+      try {
+        fsOps.unlinkSync(lockPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+          return { owned: false };
+        }
+      }
+    }
     try {
       fsOps.writeFileSync(lockPath, payload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    } catch (error) {
-      return (error as NodeJS.ErrnoException)?.code === 'EEXIST' ? 'exists' : 'failed';
+    } catch {
+      return { owned: false };
     }
-    // Confirm what is at the path is this caller's own write before claiming it.
     const written = readIfPresent(fsOps, lockPath);
-    return typeof written === 'string' && parseLockPayload(written)?.token === myToken
-      ? 'created'
-      : 'failed';
-  };
-
-  for (let attempt = 0; attempt < MAX_TAKEOVER_ATTEMPTS; attempt += 1) {
-    const created = tryCreate();
-    if (created === 'created') {
+    if (typeof written === 'string' && parseLockPayload(written)?.token === myToken) {
       return { owned: true, token: myToken, payload };
     }
-    if (created === 'failed') {
-      return { owned: false };
+    if (written === 'unreadable') {
+      // Only this caller can have created the file while it holds the guard.
+      bestEffortUnlink(fsOps, lockPath);
     }
+    return { owned: false };
+  };
 
-    const existingRaw = readIfPresent(fsOps, lockPath);
-    if (existingRaw === null) {
-      continue;
-    }
-    if (existingRaw === 'unreadable' || !isLockStale(parseLockPayload(existingRaw), staleAfterMs, now, currentHost)) {
-      return { owned: false };
-    }
+  return withGuard(lockPath, fsOps, timing, underGuard)?.value ?? { owned: false };
+}
 
-    // Stale: only the takeover-guard holder may touch it.
-    const guardToken = `${myToken}.guard`;
-    const guardPayload = createLockPayload(now, pid, currentHost, guardToken);
-    let guardHeld = false;
+/**
+ * RELEASE(lockPath, token), under the guard: delete the lock only while it still
+ * carries `token`; otherwise leave it. Returns whether this call deleted it.
+ */
+export function releaseLock(
+  lockPath: string,
+  token: string,
+  options?: AcquireLockOptions,
+): boolean {
+  const fsOps: LockFsOps = options?.fsOps ?? fsSync;
+  const timing = guardTiming(options, RELEASE_GUARD_ATTEMPTS);
+  const underGuard = (): boolean => {
+    const current = readIfPresent(fsOps, lockPath);
+    if (typeof current !== 'string' || parseLockPayload(current)?.token !== token) {
+      return false;
+    }
     try {
-      fsOps.writeFileSync(guardPath, guardPayload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-      guardHeld = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
-        return { owned: false };
-      }
+      fsOps.unlinkSync(lockPath);
+      return true;
+    } catch {
+      return false;
     }
-    if (!guardHeld) {
-      const guardRaw = readIfPresent(fsOps, guardPath);
-      if (typeof guardRaw === 'string' && isLockStale(parseLockPayload(guardRaw), staleAfterMs, now, currentHost)) {
-        // A crashed taker left its guard behind: break exactly that guard, then retry.
-        removeIfUnchanged(fsOps, guardPath, guardRaw, `${guardPath}.${myToken}.stale`);
-        continue;
-      }
-      return { owned: false };
-    }
-
-    try {
-      // Re-check under the guard: a lock that changed since it was judged
-      // stale is somebody else's and must not be touched.
-      if (readIfPresent(fsOps, lockPath) !== existingRaw) {
-        continue;
-      }
-      if (!removeIfUnchanged(fsOps, lockPath, existingRaw, `${lockPath}.${myToken}.stale`)) {
-        return { owned: false };
-      }
-      const takeover = tryCreate();
-      if (takeover === 'created') {
-        return { owned: true, token: myToken, payload };
-      }
-      if (takeover === 'failed') {
-        return { owned: false };
-      }
-      // Somebody created a lock in the gap: re-evaluate it from step 1.
-    } finally {
-      releaseGuard(fsOps, guardPath, guardToken);
-    }
-  }
-  return { owned: false };
+  };
+  return withGuard(lockPath, fsOps, timing, underGuard)?.value ?? false;
 }
 
 async function withSessionLock<T>(
@@ -528,14 +538,7 @@ async function withSessionLock<T>(
   try {
     return await fn();
   } finally {
-    try {
-      const current = parseLockPayload(fsSync.readFileSync(lockPath, 'utf8'));
-      if (current?.token === ownedToken) {
-        fsSync.unlinkSync(lockPath);
-      }
-    } catch {
-      // Lock already removed or replaced after timeout.
-    }
+    releaseLock(lockPath, ownedToken);
   }
 }
 
@@ -669,6 +672,168 @@ async function recordAnswer(answerPath: string, answer: string): Promise<boolean
   return recorded;
 }
 
+interface SessionFields {
+  readonly workOrderId: string;
+  readonly laneId: string;
+  readonly checkoutPath: string;
+  readonly briefsDir: string;
+  readonly baseCommit: string;
+  readonly prompt: string;
+  readonly model: string;
+  readonly sessionKey: string;
+  readonly variant: string | undefined;
+  readonly agent: string | undefined;
+  readonly timeoutMs: number | undefined;
+}
+
+interface SeatPlan {
+  readonly fields: SessionFields;
+  readonly argv: readonly string[];
+  readonly timeout: number;
+  readonly maxAnswerBytes: number;
+  readonly answerPath: string;
+  readonly promptPath: string;
+}
+
+type ParsedSession =
+  | { readonly fields: SessionFields }
+  | { readonly refusal: BriefAuthorSessionResult };
+
+/** Reads the request through own data descriptors and refuses anything malformed, before any I/O. */
+function parseSessionFields(request: BriefAuthorSessionRequest): ParsedSession {
+  const refuse = (reason: Parameters<typeof unavailable>[0]): ParsedSession => ({ refusal: unavailable(reason) });
+  // A non-plain object or any accessor is refused before any field is read.
+  if (!isPlainObject(request)) {
+    return refuse('session-command-invalid');
+  }
+  const record = request as Record<string, unknown>;
+  const workOrderId = readOwnData(record, 'workOrderId');
+  const laneId = readOwnData(record, 'laneId');
+  const checkoutPath = readOwnData(record, 'checkoutPath');
+  const briefsDir = readOwnData(record, 'briefsDir');
+  const baseCommit = readOwnData(record, 'baseCommit');
+  const prompt = readOwnData(record, 'prompt');
+  const model = readOwnData(record, 'model');
+  const variant = readOptionalOwnData(record, 'variant');
+  const agent = readOptionalOwnData(record, 'agent');
+  const sessionKey = readOwnData(record, 'sessionKey');
+  const timeoutMs = readOwnData(record, 'timeoutMs');
+
+  for (const field of [workOrderId, laneId, checkoutPath, briefsDir, baseCommit, prompt, model, sessionKey]) {
+    if (field === MISSING || typeof field !== 'string') {
+      return refuse('session-command-invalid');
+    }
+  }
+
+  // Commit and ids: a malformed commit or id is not pinned to a known revision.
+  if (!COMMIT_PATTERN.test(baseCommit as string)
+    || !SAFE_ID_PATTERN.test(workOrderId as string) || workOrderId === '.' || workOrderId === '..'
+    || !SAFE_ID_PATTERN.test(laneId as string) || laneId === '.' || laneId === '..') {
+    return refuse('checkout-not-pinned');
+  }
+
+  // Checkout path: absolute, no dot-dot, no control characters.
+  if (hasControlCharacter(checkoutPath as string)
+    || !path.isAbsolute(checkoutPath as string)
+    || hasDotDotSegment(checkoutPath as string)) {
+    return refuse('checkout-unreadable');
+  }
+
+  // Briefs directory: no control characters, absolute, no dot-dot.
+  // The directory walk is verified later via ensureSafeDirectory.
+  if (hasControlCharacter(briefsDir as string)
+    || !path.isAbsolute(briefsDir as string)
+    || hasDotDotSegment(briefsDir as string)) {
+    return refuse('briefs-dir-invalid');
+  }
+
+  // Prompt and model (and optional variant/agent).
+  if ((prompt as string).trim().length === 0) {
+    return refuse('session-empty');
+  }
+  if (Buffer.byteLength(prompt as string, 'utf8') > MAX_SESSION_BYTES) {
+    return refuse('session-oversized');
+  }
+  if (hasControlCharacter(model as string) || (model as string).trim().length === 0) {
+    return refuse('session-command-invalid');
+  }
+  for (const optional of [variant, agent]) {
+    // An own accessor descriptor reads as MISSING here: it must be refused,
+    // never silently treated as an absent optional field.
+    if (optional === undefined) {
+      continue;
+    }
+    if (optional === MISSING || typeof optional !== 'string' || hasControlCharacter(optional)
+      || optional.trim().length === 0) {
+      return refuse('session-command-invalid');
+    }
+  }
+
+  return {
+    fields: {
+      workOrderId: workOrderId as string, laneId: laneId as string, checkoutPath: checkoutPath as string,
+      briefsDir: briefsDir as string, baseCommit: baseCommit as string, prompt: prompt as string,
+      model: model as string, sessionKey: sessionKey as string,
+      variant: variant === MISSING || variant === undefined ? undefined : (variant as string),
+      agent: agent === MISSING || agent === undefined ? undefined : (agent as string),
+      timeoutMs: timeoutMs === MISSING || timeoutMs === undefined ? undefined : (timeoutMs as number),
+    },
+  };
+}
+
+/** The replayed result for a recorded answer, a refusal for an unusable one, or null when none is recorded. */
+async function replayRecordedAnswer(
+  answerPath: string,
+  maxAnswerBytes: number,
+  sessionKey: string,
+): Promise<BriefAuthorSessionResult | null> {
+  if (await isSymbolicLink(answerPath)) {
+    return unavailable('briefs-dir-invalid');
+  }
+  // A present-but-unreadable answer file is refused without running the seat or touching the file.
+  const recorded = await readRecordedAnswer(answerPath, maxAnswerBytes);
+  if (recorded === 'unreadable') {
+    return unavailable('session-failed');
+  }
+  if (recorded === 'too-large') {
+    return unavailable('session-oversized');
+  }
+  if (recorded !== null) {
+    return { outcome: 'answered', rawAnswer: recorded, sessionKey, answerPath, cached: true };
+  }
+  return null;
+}
+
+/**
+ * The seat's stdout when it is a usable answer, otherwise the refusal. The raw
+ * answer is untrusted text: the secret-shape screen runs here, before anything
+ * is persisted, so a secret-shaped answer is never written into the briefs
+ * directory and a later attempt runs the seat again.
+ */
+function acceptedSeatStdout(
+  run: CommandRunResult | null,
+  maxAnswerBytes: number,
+): string | BriefAuthorSessionResult {
+  if (run === null || typeof run.exitCode !== 'number' || typeof run.stdout !== 'string') {
+    return unavailable('session-failed');
+  }
+  // A timed-out run is never a success, even when it otherwise carries an exit code, stdout and no error.
+  if (run.error !== undefined || run.exitCode !== 0
+    || (run as { timedOut?: unknown }).timedOut === true) {
+    return unavailable('session-failed');
+  }
+  if (run.stdout.trim().length === 0) {
+    return unavailable('session-empty');
+  }
+  if (Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes) {
+    return unavailable('session-oversized');
+  }
+  if (textContainsSecretShape(run.stdout)) {
+    return unavailable('session-failed');
+  }
+  return run.stdout;
+}
+
 export class BriefAuthoringAdapter implements BriefAuthoringPort {
   constructor(private readonly options?: BriefAuthoringAdapterOptions) {}
 
@@ -722,83 +887,20 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
   }
 
   private async runAuthorBriefSession(request: BriefAuthorSessionRequest): Promise<BriefAuthorSessionResult> {
-    // The whole request is inspected through own data descriptors: a non-plain
-    // object or any accessor is refused before any field is read.
-    if (!isPlainObject(request)) {
-      return unavailable('session-command-invalid');
+    const parsed = parseSessionFields(request);
+    if ('refusal' in parsed) {
+      return parsed.refusal;
     }
-    const record = request as Record<string, unknown>;
-    const workOrderId = readOwnData(record, 'workOrderId');
-    const laneId = readOwnData(record, 'laneId');
-    const checkoutPath = readOwnData(record, 'checkoutPath');
-    const briefsDir = readOwnData(record, 'briefsDir');
-    const baseCommit = readOwnData(record, 'baseCommit');
-    const prompt = readOwnData(record, 'prompt');
-    const model = readOwnData(record, 'model');
-    const variant = readOptionalOwnData(record, 'variant');
-    const agent = readOptionalOwnData(record, 'agent');
-    const sessionKey = readOwnData(record, 'sessionKey');
-    const timeoutMs = readOwnData(record, 'timeoutMs');
-
-    for (const field of [workOrderId, laneId, checkoutPath, briefsDir, baseCommit, prompt, model, sessionKey]) {
-      if (field === MISSING || typeof field !== 'string') {
-        return unavailable('session-command-invalid');
-      }
-    }
-
-    // Commit and ids: a malformed commit or id is not pinned to a known revision.
-    if (!COMMIT_PATTERN.test(baseCommit as string)
-      || !SAFE_ID_PATTERN.test(workOrderId as string) || workOrderId === '.' || workOrderId === '..'
-      || !SAFE_ID_PATTERN.test(laneId as string) || laneId === '.' || laneId === '..') {
-      return unavailable('checkout-not-pinned');
-    }
-
-    // Checkout path: absolute, no dot-dot, no control characters.
-    if (hasControlCharacter(checkoutPath as string)
-      || !path.isAbsolute(checkoutPath as string)
-      || hasDotDotSegment(checkoutPath as string)) {
-      return unavailable('checkout-unreadable');
-    }
-
-    // Briefs directory: non-empty, no control characters, absolute, no dot-dot.
-    // The directory walk is verified later via ensureSafeDirectory.
-    if (hasControlCharacter(briefsDir as string)
-      || !path.isAbsolute(briefsDir as string)
-      || hasDotDotSegment(briefsDir as string)) {
-      return unavailable('briefs-dir-invalid');
-    }
-
-    // Prompt and model (and optional variant/agent).
-    if ((prompt as string).trim().length === 0) {
-      return unavailable('session-empty');
-    }
-    if (Buffer.byteLength(prompt as string, 'utf8') > MAX_SESSION_BYTES) {
-      return unavailable('session-oversized');
-    }
-    if (hasControlCharacter(model as string) || (model as string).trim().length === 0) {
-      return unavailable('session-command-invalid');
-    }
-    for (const optional of [variant, agent]) {
-      // An own accessor descriptor reads as MISSING here: it must be refused,
-      // never silently treated as an absent optional field.
-      if (optional === undefined) {
-        continue;
-      }
-      if (optional === MISSING || typeof optional !== 'string' || hasControlCharacter(optional)
-        || optional.trim().length === 0) {
-        return unavailable('session-command-invalid');
-      }
-    }
-
+    const fields = parsed.fields;
     const stem = sessionStem(request);
     if (stem === null) {
       return unavailable('session-command-invalid');
     }
-    if (!(await ensureSafeDirectory(briefsDir as string))) {
+    if (!(await ensureSafeDirectory(fields.briefsDir))) {
       return unavailable('briefs-dir-invalid');
     }
 
-    const base = path.join(briefsDir as string, stem);
+    const base = path.join(fields.briefsDir, stem);
     const answerPath = `${base}.answer.md`;
     const promptPath = `${base}.prompt.md`;
     // The session cap is absolute: a configured limit above 256 000 bytes is
@@ -811,22 +913,11 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
       : MAX_SESSION_BYTES;
 
     // A symlinked answer is refused before it could redirect the read outside
-    // the briefs directory.
-    if (await isSymbolicLink(answerPath)) {
-      return unavailable('briefs-dir-invalid');
-    }
-    // Recorded outcome first: a completed session replays without any seat
-    // configuration, executor or checkout check. A present-but-unreadable
-    // answer file is refused without running the seat or touching the file.
-    const recorded = await readRecordedAnswer(answerPath, maxAnswerBytes);
-    if (recorded === 'unreadable') {
-      return unavailable('session-failed');
-    }
-    if (recorded === 'too-large') {
-      return unavailable('session-oversized');
-    }
-    if (recorded !== null) {
-      return { outcome: 'answered', rawAnswer: recorded, sessionKey: sessionKey as string, answerPath, cached: true };
+    // the briefs directory. A completed session then replays without any seat
+    // configuration, executor or checkout check.
+    const replay = await replayRecordedAnswer(answerPath, maxAnswerBytes, fields.sessionKey);
+    if (replay !== null) {
+      return replay;
     }
 
     const { seatCommand, executor } = this.options ?? {};
@@ -839,19 +930,15 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     }
 
     const argv = renderSeatArgv(seatCommand as readonly string[], {
-      promptFile: promptPath, model: model as string,
-      variant: variant === MISSING || variant === undefined ? undefined : (variant as string),
-      agent: agent === MISSING || agent === undefined ? undefined : (agent as string),
-      workOrderId: workOrderId as string, laneId: laneId as string, baseCommit: baseCommit as string,
+      promptFile: promptPath, model: fields.model,
+      variant: fields.variant, agent: fields.agent,
+      workOrderId: fields.workOrderId, laneId: fields.laneId, baseCommit: fields.baseCommit,
     });
     if (argv === null) {
       return unavailable('session-command-invalid');
     }
 
-    const timeout = resolveTimeout(
-      timeoutMs === MISSING || timeoutMs === undefined ? undefined : (timeoutMs as number),
-      this.options?.timeoutMs,
-    );
+    const timeout = resolveTimeout(fields.timeoutMs, this.options?.timeoutMs);
     // The session lock serializes concurrent callers for the same stem, so the
     // seat runs at most once and a caller that waits past the default lock
     // budget refuses instead of also running the seat. Only the prompt, answer
@@ -866,70 +953,48 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     return withSessionLock<BriefAuthorSessionResult>(
       lockPath,
       timeout,
-      async () => {
-        if (await isSymbolicLink(answerPath)) {
-          return unavailable('briefs-dir-invalid');
-        }
-        // A concurrent call may have completed the session while this one waited.
-        const recordedUnderLock = await readRecordedAnswer(answerPath, maxAnswerBytes);
-        if (recordedUnderLock === 'unreadable') {
-          return unavailable('session-failed');
-        }
-        if (recordedUnderLock === 'too-large') {
-          return unavailable('session-oversized');
-        }
-        if (recordedUnderLock !== null) {
-          return { outcome: 'answered', rawAnswer: recordedUnderLock, sessionKey: sessionKey as string, answerPath, cached: true };
-        }
-
-        const pinned = await this.checkPinnedCheckout(executor, request);
-        if (pinned !== null) {
-          return unavailable(pinned);
-        }
-
-        if (await isSymbolicLink(promptPath)) {
-          return unavailable('briefs-dir-invalid');
-        }
-        if (!(await writeFileNoFollow(promptPath, prompt as string).then(() => true, () => false))) {
-          return unavailable('session-failed');
-        }
-
-        const run = await executor.run(argv, {
-          cwd: checkoutPath as string,
-          timeoutMs: timeout,
-          maxBufferBytes: maxAnswerBytes + STDERR_HEADROOM_BYTES,
-        }).catch(() => null);
-        if (run === null || typeof run.exitCode !== 'number' || typeof run.stdout !== 'string') {
-          return unavailable('session-failed');
-        }
-        // A timed-out run is never a success, even when it otherwise carries an
-        // exit code, stdout and no error.
-        if (run.error !== undefined || run.exitCode !== 0
-          || (run as { timedOut?: unknown }).timedOut === true) {
-          return unavailable('session-failed');
-        }
-        if (run.stdout.trim().length === 0) {
-          return unavailable('session-empty');
-        }
-        if (Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes) {
-          return unavailable('session-oversized');
-        }
-        // The raw answer is untrusted text and the use case refuses authoring
-        // for secret-shaped content only after the session returns. The same
-        // secret-shape screen therefore runs here, before anything is
-        // persisted: a secret-shaped answer is never written into the briefs
-        // directory. Nothing is recorded, so a later attempt runs the seat
-        // again instead of replaying the refused answer — the same semantics
-        // every other refused outcome already has.
-        if (textContainsSecretShape(run.stdout)) {
-          return unavailable('session-failed');
-        }
-        return (await recordAnswer(answerPath, run.stdout))
-          ? { outcome: 'answered', rawAnswer: run.stdout, sessionKey: sessionKey as string, answerPath, cached: false }
-          : unavailable('session-failed');
-      },
+      () => this.runSeatUnderLock(request, executor, { fields, argv, timeout, maxAnswerBytes, answerPath, promptPath }),
     )
       .catch(() => unavailable('session-failed'));
+  }
+
+  /** The seat run itself, executed only while this caller holds the session lock. */
+  private async runSeatUnderLock(
+    request: BriefAuthorSessionRequest,
+    executor: CommandExecutorPort,
+    plan: SeatPlan,
+  ): Promise<BriefAuthorSessionResult> {
+    const { fields, argv, timeout, maxAnswerBytes, answerPath, promptPath } = plan;
+    // A concurrent call may have completed the session while this one waited.
+    const replay = await replayRecordedAnswer(answerPath, maxAnswerBytes, fields.sessionKey);
+    if (replay !== null) {
+      return replay;
+    }
+
+    const pinned = await this.checkPinnedCheckout(executor, request);
+    if (pinned !== null) {
+      return unavailable(pinned);
+    }
+
+    if (await isSymbolicLink(promptPath)) {
+      return unavailable('briefs-dir-invalid');
+    }
+    if (!(await writeFileNoFollow(promptPath, fields.prompt).then(() => true, () => false))) {
+      return unavailable('session-failed');
+    }
+
+    const run = await executor.run(argv, {
+      cwd: fields.checkoutPath,
+      timeoutMs: timeout,
+      maxBufferBytes: maxAnswerBytes + STDERR_HEADROOM_BYTES,
+    }).catch(() => null);
+    const stdout = acceptedSeatStdout(run, maxAnswerBytes);
+    if (typeof stdout !== 'string') {
+      return stdout;
+    }
+    return (await recordAnswer(answerPath, stdout))
+      ? { outcome: 'answered', rawAnswer: stdout, sessionKey: fields.sessionKey, answerPath, cached: false }
+      : unavailable('session-failed');
   }
 
   /** One read-only git call: null when the checkout exists and is at the base commit. */

@@ -17,6 +17,7 @@ import {
   CUTOVER_ROLLBACK_WINDOW_MS,
   CUTOVER_SHADOW_CRITERIA,
   CUTOVER_SHADOW_MIN_MERGES,
+  canonicalCutoverSwitchPayload,
   type CutoverRecord,
 } from '../../../domain/cutover-records.js';
 import { ManageCutoverUseCase, type ManageCutoverDependencies } from '../ManageCutoverUseCase.use-case.js';
@@ -29,6 +30,8 @@ const FUTURE_DEADLINE = '2026-11-05T18:00:00.000Z';
 const PLAN_DIGEST = 'b'.repeat(64);
 const AT_WINDOW_NOW = new Date(Date.parse(SWITCHED_AT) + CUTOVER_ROLLBACK_WINDOW_MS).toISOString();
 const INSIDE_WINDOW_NOW = new Date(Date.parse(SWITCHED_AT) + CUTOVER_ROLLBACK_WINDOW_MS - 1).toISOString();
+/** Past the rollback window of a switch performed at `NOW`. */
+const AFTER_SWITCH_WINDOW = new Date(Date.parse(NOW) + CUTOVER_ROLLBACK_WINDOW_MS + 86_400_000).toISOString();
 const AFTER_WINDOW_NOW = new Date(Date.parse(SWITCHED_AT) + CUTOVER_ROLLBACK_WINDOW_MS + 3 * 86_400_000).toISOString();
 
 // Built at runtime so no literal token shape appears in source.
@@ -341,6 +344,12 @@ async function journalEntries(h: Harness, key: string): Promise<readonly { kind:
   return listed.outcome === 'listed' ? listed.entries.filter((entry) => entry.key === key) : [];
 }
 
+/** The `trainPauseSetByCutover` flag of the stored switched record. */
+async function savedPauseOwnership(h: Harness): Promise<boolean | 'no-switched-record'> {
+  const read = await h.repo.read();
+  return read.status === 'ok' && read.record.state === 'switched' ? read.record.trainPauseSetByCutover : 'no-switched-record';
+}
+
 describe('ManageCutoverUseCase status', () => {
   it('reports shadow at revision 0 when no cutover record exists, and writes nothing', async () => {
     const h = await harness({ seed: null });
@@ -601,24 +610,48 @@ describe('ManageCutoverUseCase switch', () => {
     expectNoSwitchWrites(h);
   });
 
-  it('switch credits the train pause to the cutover even when set answers unchanged, and a later rollback lifts it', async () => {
-    // The brief saves `trainPauseSetByCutover: true` for both `changed` and `unchanged`: a pass that
-    // finds the pause already set cannot tell the operator's pause from its own earlier pass.
+  it('switch does not credit a train pause that was already paused, and a later rollback lifts nothing', async () => {
     const h = await harness({ seed: null });
+    // The pause already exists before the switch, so `set` answers `unchanged`.
     await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
     const useCase = useCaseWithReaders(h);
     resetSpies(h);
-    expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', state: 'switched', revision: 1 });
-    expect(h.spies.trainPauseSet).toHaveReturnedWith(expect.any(Promise));
+    expect(await useCase.execute(switchRequest())).toMatchObject({
+      outcome: 'completed',
+      state: 'switched',
+      revision: 1,
+    });
     expect(await h.spies.trainPauseSet.mock.results[0].value).toMatchObject({ outcome: 'unchanged' });
     expect(await h.repo.read()).toMatchObject({
       status: 'ok',
-      record: { state: 'switched', trainPauseSetByCutover: true },
+      record: { state: 'switched', trainPauseSetByCutover: false },
     });
+
+    // A later rollback leaves the pre-existing pause alone.
     resetSpies(h);
-    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({ outcome: 'completed', state: 'rolled-back', revision: 2 });
-    expect(h.spies.trainPauseSet).toHaveBeenCalledWith({ paused: false, nowIso: NOW });
-    expect((await h.trainPause.read()).status).toBe('clear');
+    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({
+      outcome: 'completed',
+      state: 'rolled-back',
+      revision: 2,
+    });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect((await h.trainPause.read()).status).toBe('paused');
+  });
+
+  it('switch does not credit a train pause that was already paused, and a later retire lifts nothing', async () => {
+    const h = await harness({ seed: null });
+    await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
+    expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({ outcome: 'completed', revision: 1 });
+    expect(await savedPauseOwnership(h)).toBe(false);
+
+    resetSpies(h);
+    expect(await h.useCase.execute(retireRequest({ nowIso: AFTER_SWITCH_WINDOW }))).toMatchObject({
+      outcome: 'completed',
+      state: 'retired',
+      revision: 2,
+    });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect((await h.trainPause.read()).status).toBe('paused');
   });
 
   it('switch names S4 when that verdict is unknown and the other criteria pass', async () => {
@@ -833,6 +866,207 @@ describe('ManageCutoverUseCase switch', () => {
     resetSpies(h);
     expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
     expect(totalWriteCalls(h)).toBe(0);
+  });
+});
+
+describe('ManageCutoverUseCase switch pause ownership', () => {
+  /** The digest a switch intent carries for the default request and one recorded `trainPausedBefore`. */
+  const intentDigest = (trainPausedBefore?: boolean, operationId = 'op-1'): string =>
+    sha256HexDigest(
+      canonicalCutoverSwitchPayload({ expectedRevision: 0, operationId, relaunchPlanDigest: PLAN_DIGEST, trainPausedBefore }),
+    );
+
+  /** A first pass that appends its intent, calls `set`, and then loses the record save. */
+  async function crashAfterSet(h: Harness, useCase: ManageCutoverUseCase): Promise<void> {
+    h.spies.compareAndSet.mockRejectedValueOnce(new Error('disk gone'));
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'cutover-record-write-failed' });
+    expect(await h.repo.read()).toEqual({ status: 'missing' });
+  }
+
+  /** The outcome the latest `trainPause.set` call answered. */
+  async function lastSetOutcome(h: Harness): Promise<string> {
+    return (await h.spies.trainPauseSet.mock.results.at(-1)?.value)?.outcome ?? 'not-called';
+  }
+
+  it('a clean switch on a clear train records trainPausedBefore false in the intent digest and owns the pause, and rollback lifts it', async () => {
+    const h = await harness({ seed: null });
+    expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
+    expect(await lastSetOutcome(h)).toBe('changed');
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([
+      expect.objectContaining({ kind: 'intent', digest: intentDigest(false) }),
+      expect.objectContaining({ kind: 'result', digest: intentDigest(false) }),
+    ]);
+    expect(await savedPauseOwnership(h)).toBe(true);
+
+    resetSpies(h);
+    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({ outcome: 'completed', state: 'rolled-back' });
+    expect(h.spies.trainPauseSet).toHaveBeenCalledWith({ paused: false, nowIso: NOW });
+    expect((await h.trainPause.read()).status).toBe('clear');
+  });
+
+  it('a clean switch on a clear train owns the pause, and retire lifts it', async () => {
+    const h = await harness({ seed: null });
+    expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
+    expect(await savedPauseOwnership(h)).toBe(true);
+
+    resetSpies(h);
+    expect(await h.useCase.execute(retireRequest({ nowIso: AFTER_SWITCH_WINDOW }))).toMatchObject({
+      outcome: 'completed',
+      state: 'retired',
+    });
+    expect(h.spies.trainPauseSet).toHaveBeenCalledWith({ paused: false, nowIso: AFTER_SWITCH_WINDOW });
+    expect((await h.trainPause.read()).status).toBe('clear');
+  });
+
+  it('a switch on an already paused train records trainPausedBefore true in the intent digest', async () => {
+    const h = await harness({ seed: null });
+    await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
+    expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([
+      expect.objectContaining({ kind: 'intent', digest: intentDigest(true) }),
+      expect.objectContaining({ kind: 'result', digest: intentDigest(true) }),
+    ]);
+  });
+
+  it('a replay after a crash between a changed set and the record save still owns the pause although it now reads paused and set answers unchanged, and rollback lifts it', async () => {
+    const h = await harness({ seed: null });
+    const useCase = useCaseWithReaders(h);
+    await crashAfterSet(h, useCase);
+    expect(await lastSetOutcome(h)).toBe('changed');
+    // What the replay's own preflight read will see: the pause its first pass set.
+    expect((await h.trainPause.read()).status).toBe('paused');
+
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false, revision: 1 });
+    expect(await lastSetOutcome(h)).toBe('unchanged');
+    expect(await savedPauseOwnership(h)).toBe(true);
+
+    resetSpies(h);
+    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({ outcome: 'completed', state: 'rolled-back' });
+    expect(h.spies.trainPauseSet).toHaveBeenCalledWith({ paused: false, nowIso: NOW });
+    expect((await h.trainPause.read()).status).toBe('clear');
+  });
+
+  it('a replay whose set answers changed after the first set threw owns the pause', async () => {
+    const h = await harness({ seed: null });
+    const useCase = useCaseWithReaders(h);
+    h.spies.trainPauseSet.mockRejectedValueOnce(new Error('pause store gone'));
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'train-pause-write-failed' });
+    expect(await journalEntries(h, 'cutover/switch@0')).toHaveLength(1);
+    expect((await h.trainPause.read()).status).toBe('clear');
+
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
+    expect(await lastSetOutcome(h)).toBe('changed');
+    expect(await savedPauseOwnership(h)).toBe(true);
+  });
+
+  it('a first pass that read clear but whose set answers unchanged does not own the pause, and rollback lifts nothing', async () => {
+    const h = await harness({ seed: null });
+    // Someone pauses the train between this pass's read and its set: the read answers `clear`.
+    await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
+    const read = vi.spyOn(h.trainPause, 'read').mockResolvedValueOnce({ status: 'clear' });
+    resetSpies(h);
+    expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(await lastSetOutcome(h)).toBe('unchanged');
+    expect(await journalEntries(h, 'cutover/switch@0')).toContainEqual(
+      expect.objectContaining({ kind: 'intent', digest: intentDigest(false) }),
+    );
+    expect(await savedPauseOwnership(h)).toBe(false);
+
+    resetSpies(h);
+    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({ outcome: 'completed', state: 'rolled-back' });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect((await h.trainPause.read()).status).toBe('paused');
+  });
+
+  it('a replay whose set answers changed owns the pause even though the train was paused before the first pass and lifted by hand since', async () => {
+    const h = await harness({ seed: null });
+    await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
+    const useCase = useCaseWithReaders(h);
+    await crashAfterSet(h, useCase);
+    expect(await lastSetOutcome(h)).toBe('unchanged');
+    await h.trainPause.set({ paused: false, nowIso: SWITCHED_AT });
+
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
+    expect(await lastSetOutcome(h)).toBe('changed');
+    expect(await savedPauseOwnership(h)).toBe(true);
+  });
+
+  it('a replay whose set answers unchanged does not own a pause the operator set before the first pass, and rollback lifts nothing', async () => {
+    const h = await harness({ seed: null });
+    await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
+    const useCase = useCaseWithReaders(h);
+    await crashAfterSet(h, useCase);
+
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
+    expect(await lastSetOutcome(h)).toBe('unchanged');
+    expect(await savedPauseOwnership(h)).toBe(false);
+
+    resetSpies(h);
+    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({ outcome: 'completed', state: 'rolled-back' });
+    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+    expect((await h.trainPause.read()).status).toBe('paused');
+  });
+
+  it('a replay over a legacy four-key-digest intent succeeds and does not own the pause when set answers unchanged', async () => {
+    const h = await harness({ seed: null });
+    const legacy = intentDigest();
+    expect(legacy).toBe(
+      sha256HexDigest(`{"move":"switch","expectedRevision":0,"operationId":"op-1","relaunchPlanDigest":"${PLAN_DIGEST}"}`),
+    );
+    await h.journal.append({ key: 'cutover/switch@0', kind: 'intent', entryId: ulid(920), recordedAtIso: NOW, digest: legacy });
+    await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
+
+    resetSpies(h);
+    expect(await useCaseWithReaders(h).execute(switchRequest())).toMatchObject({
+      outcome: 'completed',
+      replayed: false,
+      state: 'switched',
+      revision: 1,
+    });
+    expect(await lastSetOutcome(h)).toBe('unchanged');
+    expect(await savedPauseOwnership(h)).toBe(false);
+    // The legacy intent is the only intent; the result carries its digest.
+    expect(await journalEntries(h, 'cutover/switch@0')).toEqual([
+      expect.objectContaining({ kind: 'intent', digest: legacy }),
+      expect.objectContaining({ kind: 'result', digest: legacy }),
+    ]);
+  });
+
+  it('a different operation id on a key whose intent records trainPausedBefore still answers intent-digest-mismatch and writes nothing', async () => {
+    for (const pausedBefore of [false, true]) {
+      const h = await harness({ seed: null });
+      if (pausedBefore) await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
+      const useCase = useCaseWithReaders(h);
+      await crashAfterSet(h, useCase);
+      expect(await journalEntries(h, 'cutover/switch@0')).toEqual([
+        expect.objectContaining({ kind: 'intent', digest: intentDigest(pausedBefore) }),
+      ]);
+
+      resetSpies(h);
+      expect(await useCase.execute(switchRequest({ operationId: 'op-2' }))).toEqual({
+        outcome: 'refused',
+        reason: 'intent-digest-mismatch',
+      });
+      expect(totalWriteCalls(h)).toBe(0);
+      expect(await h.repo.read()).toEqual({ status: 'missing' });
+    }
+  });
+
+  it('an unreadable train-pause read on a replay is train-pause-unreadable, with no set call and no second intent', async () => {
+    const h = await harness({ seed: null });
+    const useCase = useCaseWithReaders(h);
+    await crashAfterSet(h, useCase);
+    vi.spyOn(h.trainPause, 'read').mockResolvedValueOnce({ status: 'unreadable' });
+
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'train-pause-unreadable' });
+    expect(totalWriteCalls(h)).toBe(0);
+    expect(await journalEntries(h, 'cutover/switch@0')).toHaveLength(1);
   });
 });
 

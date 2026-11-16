@@ -266,6 +266,39 @@ function completedResult(kind: MoveKind, key: string, replayed: boolean, record:
   } as ManageCutoverResult;
 }
 
+/**
+ * What a switch pass knows about the train pause before it sets it: the digest its intent
+ * carries, whether the train was already paused when the intent was appended, and whether this
+ * pass found that intent (a replay) or appends it.
+ */
+interface SwitchIntentPlan {
+  readonly digest: string;
+  readonly trainPausedBefore: boolean;
+  readonly replay: boolean;
+}
+
+/**
+ * Whether the switched record credits the train pause to the cutover; rollback and retire lift
+ * the pause only when it does.
+ *  - `set` answered `changed`, on any pass: this move set the pause, so the cutover owns it.
+ *  - `unchanged` on the pass that appended the intent: the pause was there before this move
+ *    wrote anything, so it is someone else's and is never claimed.
+ *  - `unchanged` on a replay: the pause is the cutover's unless the intent recorded that the
+ *    train was already paused before the first pass.
+ * Residual: a replay that gets `unchanged` cannot tell its earlier pass's pause from one an
+ * operator set after the intent. A crash before `set` followed by an operator pause, and an
+ * operator lift then re-pause, both leave such a pause recorded as the cutover's.
+ */
+function switchOwnsTrainPause(outcome: 'changed' | 'unchanged', plan: SwitchIntentPlan): boolean {
+  if (outcome === 'changed') {
+    return true;
+  }
+  if (!plan.replay) {
+    return false;
+  }
+  return !plan.trainPausedBefore;
+}
+
 type MoveKind = { readonly move: 'switch'; readonly state: 'switched' } | { readonly move: 'retire'; readonly state: 'retired' };
 const SWITCH_KIND: MoveKind = { move: 'switch', state: 'switched' };
 const RETIRE_KIND: MoveKind = { move: 'retire', state: 'retired' };
@@ -703,19 +736,13 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (key === null) {
       return refuse('invalid-request');
     }
-    const requestDigest = this.deps.computeDigest(
-      canonicalCutoverSwitchPayload({
-        expectedRevision,
-        operationId: request.operationId,
-        relaunchPlanDigest: request.relaunchPlanDigest,
-      }),
-    );
 
     const journal = await this.listMoveJournal('switch', expectedRevision, deadlineIso);
     if ('stop' in journal) {
       return journal.stop;
     }
-    if (journal.intent !== null && journal.intent.digest !== requestDigest) {
+    const recorded = this.recordedSwitchIntent(journal.intent, request);
+    if (recorded === 'mismatch') {
       return refuse('intent-digest-mismatch');
     }
     if (journal.final !== null) {
@@ -736,16 +763,19 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
       return precondition;
     }
 
-    const preflightFailure = await this.switchPreflightFailure(request, deadlineIso);
-    if (preflightFailure !== null) {
-      return preflightFailure;
+    const preflight = await this.switchPreflight(request, deadlineIso);
+    if ('outcome' in preflight) {
+      return preflight;
     }
+    // A recorded intent keeps the value its own pass read; this pass's read was only the
+    // readability gate. With no intent yet, this pass's read is what the digest records.
+    const plan = recorded ?? this.newSwitchIntent(request, preflight.trainPausedBefore);
 
     const normalizedNowIso = normalizeIso(nowIso);
     const intentFailure = await this.appendIntentUnlessRecorded(
       journal.intent,
       key,
-      requestDigest,
+      plan.digest,
       normalizedNowIso,
       deadlineIso,
     );
@@ -753,29 +783,78 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
       return intentFailure;
     }
 
-    const saved = await this.applySwitch(record, expectedRevision, request.relaunchPlanDigest, normalizedNowIso, deadlineIso);
+    const saved = await this.applySwitch(record, request, plan, normalizedNowIso);
     if ('outcome' in saved) {
       return saved;
     }
 
-    const resultFailure = await this.appendResult(key, requestDigest, 'switched', saved.record.updatedAtIso, deadlineIso);
+    const resultFailure = await this.appendResult(key, plan.digest, 'switched', saved.record.updatedAtIso, deadlineIso);
     if (resultFailure !== null) {
       return resultFailure;
     }
     return this.completedMove(SWITCH_KIND, key, saved.record);
   }
 
-  /** The switch gates after the state precondition, in order: evidence, lane coverage, daemon, train pause. */
-  private async switchPreflightFailure(
+  /** The digest a switch intent carries for one value of `trainPausedBefore` (none: the four-key payload). */
+  private switchIntentDigest(request: ManageCutoverSwitchRequest, trainPausedBefore?: boolean): string {
+    return this.deps.computeDigest(
+      canonicalCutoverSwitchPayload({
+        expectedRevision: request.expectedRevision,
+        operationId: request.operationId,
+        relaunchPlanDigest: request.relaunchPlanDigest,
+        trainPausedBefore,
+      }),
+    );
+  }
+
+  /** The plan of the pass that appends the intent: its own train-pause read goes into the digest. */
+  private newSwitchIntent(request: ManageCutoverSwitchRequest, trainPausedBefore: boolean): SwitchIntentPlan {
+    return { digest: this.switchIntentDigest(request, trainPausedBefore), trainPausedBefore, replay: false };
+  }
+
+  /**
+   * What a recorded intent says about this request: null when there is none, `mismatch` when its
+   * digest is not this request's under any recorded value, else the value its pass recorded. The
+   * journal intent has no field for `trainPausedBefore`, so the value is recovered by matching
+   * the stored digest against the request's digest for `true`, for `false`, and for the four-key
+   * payload of an intent written before the key existed. That last one reads as `true`: nothing
+   * is known about the train then, so an `unchanged` pause is not claimed.
+   */
+  private recordedSwitchIntent(
+    intent: CutoverJournalEntry | null,
+    request: ManageCutoverSwitchRequest,
+  ): SwitchIntentPlan | 'mismatch' | null {
+    if (intent === null) {
+      return null;
+    }
+    const candidates: readonly (readonly [boolean | undefined, boolean])[] = [
+      [true, true],
+      [false, false],
+      [undefined, true],
+    ];
+    for (const [payloadValue, trainPausedBefore] of candidates) {
+      const digest = this.switchIntentDigest(request, payloadValue);
+      if (intent.digest === digest) {
+        return { digest, trainPausedBefore, replay: true };
+      }
+    }
+    return 'mismatch';
+  }
+
+  /**
+   * The switch gates after the state precondition, in order: evidence, lane coverage, daemon,
+   * train pause. The train-pause read runs on every pass and answers whether the train was
+   * already paused.
+   */
+  private async switchPreflight(
     request: ManageCutoverSwitchRequest,
     deadlineIso: string | undefined,
-  ): Promise<ManageCutoverResult | null> {
-    return (
+  ): Promise<ManageCutoverResult | { readonly trainPausedBefore: boolean }> {
+    const failure =
       (await this.shadowEvidenceFailure(request, deadlineIso)) ??
       (await this.unrecordedLanesFailure(deadlineIso)) ??
-      (await this.daemonStatusFailure(deadlineIso)) ??
-      (await this.trainPauseReadFailure(deadlineIso))
-    );
+      (await this.daemonStatusFailure(deadlineIso));
+    return failure ?? this.readTrainPausedBefore(deadlineIso);
   }
 
   /** The record state a switch demands on every pass, before anything is recorded. */
@@ -857,13 +936,15 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
   }
 
   /** The train-pause store must read `paused` or `clear` before a switch moves anything. */
-  private async trainPauseReadFailure(deadlineIso: string | undefined): Promise<ManageCutoverResult | null> {
+  private async readTrainPausedBefore(
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | { readonly trainPausedBefore: boolean }> {
     const trainPause = await this.guarded(deadlineIso, () => this.deps.trainPauseRead.read());
     if (trainPause.kind === 'deadline') return unknown('deadline-exceeded');
     if (trainPause.kind === 'threw' || (trainPause.value.status !== 'paused' && trainPause.value.status !== 'clear')) {
       return unknown('train-pause-unreadable');
     }
-    return null;
+    return { trainPausedBefore: trainPause.value.status === 'paused' };
   }
 
   /**
@@ -874,11 +955,11 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
    */
   private async applySwitch(
     record: CutoverRecord | null,
-    expectedRevision: number,
-    relaunchPlanDigest: string,
+    request: ManageCutoverSwitchRequest,
+    plan: SwitchIntentPlan,
     normalizedNowIso: string,
-    deadlineIso: string | undefined,
   ): Promise<ManageCutoverResult | { readonly record: CutoverRecord }> {
+    const { expectedRevision, relaunchPlanDigest, deadlineIso } = request;
     if (record !== null) {
       const caseA = record.revision === expectedRevision && record.state === 'shadow';
       if (!caseA) {
@@ -891,10 +972,7 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     const paused = await this.guarded(deadlineIso, () => this.deps.trainPause.set({ paused: true, nowIso: normalizedNowIso }));
     if (paused.kind === 'deadline') return unknown('deadline-exceeded');
     if (paused.kind === 'threw' || paused.value.outcome === 'refused') return unknown('train-pause-write-failed');
-    // Both `changed` and `unchanged` credit the pause to the cutover, as the
-    // brief requires: a replayed pass (same operation id) sees `unchanged`
-    // for the pause its first pass set, and must not lose ownership of it.
-    const trainPauseSetByCutover = true;
+    const trainPauseSetByCutover = switchOwnsTrainPause(paused.value.outcome, plan);
 
     const nextRecord: CutoverRecord = {
       schemaVersion: 1,

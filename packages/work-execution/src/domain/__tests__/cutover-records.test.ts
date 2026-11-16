@@ -185,6 +185,19 @@ describe('canonicalCutoverSwitchPayload and canonicalCutoverRetirePayload', () =
       '{"move":"retire","expectedRevision":2,"operationId":"op-1"}',
     );
   });
+
+  it('puts trainPausedBefore last in the switch payload, and leaves it out when it is not given', () => {
+    const base = { expectedRevision: 0, operationId: 'op-1', relaunchPlanDigest: DIGEST };
+    const fourKeys = `{"move":"switch","expectedRevision":0,"operationId":"op-1","relaunchPlanDigest":"${DIGEST}"}`;
+    expect(canonicalCutoverSwitchPayload({ ...base, trainPausedBefore: true })).toBe(
+      `${fourKeys.slice(0, -1)},"trainPausedBefore":true}`,
+    );
+    expect(canonicalCutoverSwitchPayload({ ...base, trainPausedBefore: false })).toBe(
+      `${fourKeys.slice(0, -1)},"trainPausedBefore":false}`,
+    );
+    expect(canonicalCutoverSwitchPayload({ ...base, trainPausedBefore: undefined })).toBe(fourKeys);
+    expect(canonicalCutoverSwitchPayload(base)).toBe(fourKeys);
+  });
 });
 
 describe('readCutoverShadowEvidence', () => {
@@ -299,18 +312,42 @@ describe('readCutoverShadowEvidence', () => {
       },
     });
     expect(readCutoverShadowEvidence(throwingRoot, NOW)).toEqual(ALL_FAILED);
-    // A verdict getter (one that throws, yields an uncloneable value, or throws a DataCloneError
-    // itself) is met by the Proxy probe on `days`, which runs before any key, length or descriptor
-    // read. The probe cannot tell its failure from a stand-in's, so the whole document is refused
-    // with every criterion named; the result is still the typed refusal and never a throw.
-    const getters: Array<[number, string, () => unknown]> = [
-      [0, 'S9', () => { throw new Error('boom'); }],
-      [0, 'S5', () => () => 1],
-      [2, 'S6', () => { throw new DOMException('unread', 'DataCloneError'); }],
-    ];
-    for (const [dayIndex, id, get] of getters) {
-      expect(readCutoverShadowEvidence(withVerdict(dayIndex, id, { get }), NOW)).toEqual(ALL_FAILED);
-    }
+    expect(
+      readCutoverShadowEvidence(
+        withVerdict(0, 'S9', {
+          get() {
+            throw new Error('boom');
+          },
+        }),
+        NOW,
+      ),
+    ).toEqual(onlyFailed('S9'));
+
+    // A verdict getter that yields an uncloneable value, or throws a
+    // DataCloneError itself, must stay unread and name only its own
+    // criterion. A serializer probe that runs before the bounds would meet
+    // these getters and mistake their failure for a stand-in refusal, naming
+    // every criterion instead.
+    expect(
+      readCutoverShadowEvidence(
+        withVerdict(0, 'S5', {
+          get() {
+            return () => 1; // a function cannot be cloned
+          },
+        }),
+        NOW,
+      ),
+    ).toEqual(onlyFailed('S5'));
+    expect(
+      readCutoverShadowEvidence(
+        withVerdict(2, 'S6', {
+          get() {
+            throw new DOMException('unread', 'DataCloneError');
+          },
+        }),
+        NOW,
+      ),
+    ).toEqual(onlyFailed('S6'));
 
     expect(readCutoverShadowEvidence(docWith(new Proxy({}, {})), NOW)).toEqual(ALL_FAILED);
     expect(
@@ -355,36 +392,143 @@ describe('readCutoverShadowEvidence', () => {
     expect(readCutoverShadowEvidence(new Proxy(evidence(NOW) as object, {}), NOW)).toEqual(ALL_FAILED);
   });
 
-  it('refuses a transparent Proxy standing in for days before any key, length, descriptor or prototype read', () => {
-    // The Proxy forwards every operation to a valid days array, so only a trap call could show that
-    // the validator looked inside it. None may fire: the refusal comes from a probe that rejects a
-    // Proxy outright.
-    const validDays = (evidence(NOW) as { days: object[] }).days;
-    const trapCalls: string[] = [];
-    const recording = new Proxy(validDays, {
-      ownKeys(target) {
-        trapCalls.push('ownKeys');
-        return Reflect.ownKeys(target);
-      },
-      getOwnPropertyDescriptor(target, key) {
-        trapCalls.push('getOwnPropertyDescriptor');
-        return Reflect.getOwnPropertyDescriptor(target, key);
-      },
-      get(target, key, receiver) {
-        trapCalls.push('get');
-        return Reflect.get(target, key, receiver);
-      },
-      getPrototypeOf(target) {
-        trapCalls.push('getPrototypeOf');
-        return Reflect.getPrototypeOf(target);
-      },
-      has(target, key) {
-        trapCalls.push('has');
-        return Reflect.has(target, key);
+  /** Every Proxy trap name; a handler built from this list sees whatever the validator does to the Proxy. */
+  const TRAPS = [
+    'apply', 'construct', 'defineProperty', 'deleteProperty', 'get', 'getOwnPropertyDescriptor', 'getPrototypeOf',
+    'has', 'isExtensible', 'ownKeys', 'preventExtensions', 'set', 'setPrototypeOf',
+  ] as const;
+  type AnyFunction = (...args: unknown[]) => unknown;
+
+  /** A Proxy that forwards every operation to `target` and appends the trap's name to `calls`. */
+  function recordingProxy<T extends object>(target: T, calls: string[]): T {
+    const handler: Record<string, AnyFunction> = {};
+    for (const trap of TRAPS) {
+      handler[trap] = (...args) => {
+        calls.push(trap);
+        return (Reflect as unknown as Record<string, AnyFunction>)[trap](...args);
+      };
+    }
+    return new Proxy(target, handler as ProxyHandler<T>);
+  }
+
+  /** A Proxy whose every trap throws. */
+  function throwingProxy<T extends object>(target: T): T {
+    const handler: Record<string, AnyFunction> = {};
+    for (const trap of TRAPS) {
+      handler[trap] = () => {
+        throw new Error('trap');
+      };
+    }
+    return new Proxy(target, handler as ProxyHandler<T>);
+  }
+
+  function revokedProxy<T extends object>(target: T): T {
+    const { proxy, revoke } = Proxy.revocable(target, {});
+    revoke();
+    return proxy;
+  }
+
+  type DayRecord = { day: string; verdicts: Record<string, string> };
+  type Stand = <T extends object>(target: T) => T;
+
+  /** Valid evidence with `stand` put in place of the root, of `days`, of the first day record, or of its verdicts. */
+  function standIn(position: 'root' | 'days' | 'day' | 'verdicts', stand: Stand): unknown {
+    const root = evidence(NOW) as { days: DayRecord[]; merges: number };
+    if (position === 'root') return stand(root);
+    if (position === 'days') root.days = stand(root.days);
+    if (position === 'day') root.days[0] = stand(root.days[0]);
+    if (position === 'verdicts') root.days[0].verdicts = stand(root.days[0].verdicts);
+    return root;
+  }
+
+  it('refuses a recording Proxy for days after at most 6 trap calls and for verdicts after at most 15, and never fires a get trap', () => {
+    // The Proxy forwards every operation to valid data, so only the final serializer probe can
+    // refuse it. Before that the walk may look at it through a constant number of traps fixed by
+    // the permitted key lists: one prototype read, one key list and one descriptor read per
+    // permitted key (`length`, `0`, `1`, `2` for days; the thirteen criteria for verdicts).
+    const limits = { days: 6, verdicts: 15 } as const;
+    for (const position of ['days', 'verdicts'] as const) {
+      const calls: string[] = [];
+      const result = readCutoverShadowEvidence(standIn(position, (target) => recordingProxy(target, calls)), NOW);
+      expect({ position, result }).toEqual({ position, result: ALL_FAILED });
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls.length).toBeLessThanOrEqual(limits[position]);
+      expect(calls.filter((trap) => trap === 'get')).toEqual([]);
+      expect(calls.filter((trap) => !['getPrototypeOf', 'ownKeys', 'getOwnPropertyDescriptor'].includes(trap))).toEqual([]);
+    }
+  });
+
+  it('refuses a recording Proxy for the root or for a day record without firing a get trap', () => {
+    for (const position of ['root', 'day'] as const) {
+      const calls: string[] = [];
+      const result = readCutoverShadowEvidence(standIn(position, (target) => recordingProxy(target, calls)), NOW);
+      expect({ position, result }).toEqual({ position, result: ALL_FAILED });
+      expect(calls.filter((trap) => trap === 'get')).toEqual([]);
+    }
+  });
+
+  it('returns the typed refusal, never a throw, for a throwing-trap Proxy and for a revoked Proxy as the root, days, a day record or the verdicts', () => {
+    for (const position of ['root', 'days', 'day', 'verdicts'] as const) {
+      for (const [label, stand] of [['throwing', throwingProxy], ['revoked', revokedProxy]] as const) {
+        const input = standIn(position, stand);
+        let result: unknown = 'threw';
+        expect(() => {
+          result = readCutoverShadowEvidence(input, NOW);
+        }).not.toThrow();
+        expect({ position, label, result }).toEqual({ position, label, result: ALL_FAILED });
+      }
+    }
+  });
+
+  it('refuses an index getter, a day getter and a verdict getter inside a real days array, and invokes none of them', () => {
+    // Each getter would answer the valid value it replaced, so a validator that ran one would
+    // accept the document: only reading the descriptor, never the value, refuses it.
+    const calls = { index: 0, day: 0, verdict: 0 };
+
+    const indexGetter = evidence(NOW, (root) => {
+      const days = root.days as DayRecord[];
+      const first = days[0];
+      Object.defineProperty(days, '0', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          calls.index += 1;
+          return first;
+        },
+      });
+    });
+    expect(Array.isArray((indexGetter as { days: unknown }).days)).toBe(true);
+    expect(readCutoverShadowEvidence(indexGetter, NOW)).toEqual(ALL_FAILED);
+
+    const dayGetter = evidence(NOW, (root) => {
+      const record = (root.days as DayRecord[])[1];
+      const value = record.day;
+      Object.defineProperty(record, 'day', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          calls.day += 1;
+          return value;
+        },
+      });
+    });
+    expect(readCutoverShadowEvidence(dayGetter, NOW)).toEqual(ALL_FAILED);
+
+    const verdictGetter = withVerdict(2, 'S3', {
+      configurable: true,
+      get() {
+        calls.verdict += 1;
+        return 'pass';
       },
     });
-    expect(readCutoverShadowEvidence(docWith(recording), NOW)).toEqual(ALL_FAILED);
-    expect(trapCalls).toEqual([]);
+    expect(readCutoverShadowEvidence(verdictGetter, NOW)).toEqual(onlyFailed('S3'));
+
+    expect(calls).toEqual({ index: 0, day: 0, verdict: 0 });
+    // The fixtures are live: read directly, each getter does answer.
+    void (indexGetter as { days: unknown[] }).days[0];
+    void (dayGetter as { days: DayRecord[] }).days[1].day;
+    void (verdictGetter as { days: DayRecord[] }).days[2].verdicts.S3;
+    expect(calls).toEqual({ index: 1, day: 1, verdict: 1 });
   });
 
   it('refuses a document padded with thousands of extra keys after a constant number of descriptor reads', async () => {

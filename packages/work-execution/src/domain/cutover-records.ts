@@ -218,17 +218,24 @@ export function canonicalCutoverRollbackPayload(input: {
   return JSON.stringify({ move: 'rollback', expectedRevision: input.expectedRevision, operationId: input.operationId });
 }
 
-/** The deterministic text the F129 switch intent digest covers. */
+/**
+ * The deterministic text the F129 switch intent digest covers. `trainPausedBefore` is the last
+ * key and is what the pass that appends the intent read from the train-pause store: the journal
+ * intent carries no field of its own for it, so the digest is where a replay finds it again.
+ * Left out, the text is the four-key payload of an intent recorded before the key existed.
+ */
 export function canonicalCutoverSwitchPayload(input: {
   readonly expectedRevision: number;
   readonly operationId: string;
   readonly relaunchPlanDigest: string;
+  readonly trainPausedBefore?: boolean;
 }): string {
   return JSON.stringify({
     move: 'switch',
     expectedRevision: input.expectedRevision,
     operationId: input.operationId,
     relaunchPlanDigest: input.relaunchPlanDigest,
+    trainPausedBefore: input.trainPausedBefore,
   });
 }
 
@@ -351,17 +358,22 @@ const ALLOWED_DAY_KEYS: ReadonlySet<string> = new Set(['0', '1', '2', 'length'])
 
 /** The `days` array when it is a real, bounded array of exactly the permitted shape, else null. */
 function readBoundedDaysArray(days: unknown): readonly unknown[] | null {
-  // `Array.isArray` follows a Proxy without running a trap, and the structured-clone probe refuses
-  // any Proxy exotic object before it reads a key, a length or a descriptor, so a transparent
-  // stand-in for `days` is refused here, before a single trap can fire. A getter inside the array
-  // is also run by this probe, and a clone refusal for any reason refuses the whole document: the
-  // typed result is the same, only a getter that would have named its own criterion no longer does.
-  if (!Array.isArray(days) || !isCloneableData(days)) {
+  // The prototype check rejects a non-array stand-in before any length read. `Array.isArray`
+  // follows a Proxy without running a trap.
+  if (!Array.isArray(days) || Object.getPrototypeOf(days) !== Array.prototype) {
     return null;
   }
-  if (Object.getPrototypeOf(days) !== Array.prototype) {
-    return null;
-  }
+  // The array-length and key-count bounds run BEFORE any serializer probe.
+  // A probe on an unbounded array would traverse it — a sparse array with an
+  // enormous `length` costs a traversal per hole — and would run any getter
+  // it meets on the way, whose DataCloneError a clone refusal cannot tell
+  // apart from a Proxy stand-in. With the bounds settled first, an oversized
+  // array is refused without being cloned, and the descriptor walk never runs
+  // a getter: an accessor is refused from its descriptor. A Proxy stand-in is
+  // refused by the final serializer probe, which reads only proved primitive
+  // data properties; until then it sees a constant number of trap calls (one
+  // prototype read, one key list, and one descriptor read per permitted key)
+  // and never a `get`. Residual: the time spent inside a trap is not bounded.
   const dayKeys = Reflect.ownKeys(days);
   // Key-count guard first: an over-count is refused before any descriptor read.
   if (dayKeys.length !== ALLOWED_DAY_KEYS.size || dayKeys.some((key) => !ALLOWED_DAY_KEYS.has(key as string))) {

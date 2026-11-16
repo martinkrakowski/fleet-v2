@@ -14,6 +14,7 @@ import {
   CAPABILITY_KEYS,
   CHAIN_KEYS,
   CHAIN_STEP_KEYS,
+  CI_RUNNER_SLOT_KEYS,
   CONDUCTOR_KEYS,
   CONDUCTOR_REAPER_DISK_KEYS,
   CONDUCTOR_REAPER_KEYS,
@@ -50,6 +51,7 @@ import type {
   AutoMergePolicy,
   BoardPolicySection,
   ChainsSection,
+  CiRunnerSlotSection,
   ConductorPolicy,
   ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
@@ -168,6 +170,10 @@ function serializeHosts(
 function serializeHost(host: HostSection): Record<string, unknown> {
   return serializeByKeys(host, HOST_KEYS, {
     roleAliases: (roleAliases) => serializeByKeys(roleAliases as object, HOST_ROLES),
+    ciRunnerSlots: (slots) =>
+      (slots as readonly CiRunnerSlotSection[]).map((slot) =>
+        serializeByKeys(slot, CI_RUNNER_SLOT_KEYS),
+      ),
     runner: (runner) => serializeHostRunner(runner as HostRunnerSection),
   });
 }

@@ -2445,3 +2445,27 @@ describe('ConductorDriverLeaseKeeper loss latch and expiry monotonicity (KF-34b)
     expect(renews[0]!.leaseUntilIso).toBe(new Date(Date.parse(NOW) + 5 * 60 * 1000).toISOString());
   });
 });
+
+describe('RunConductorPassUseCase run discovery', () => {
+  it('a run created between two passes by the same holder is advanced by the second pass and not by the first', async () => {
+    const fx = stores();
+    const advance = new ScriptedAdvance(new Map([[RUN_ID_2, [{ outcome: 'waiting', reason: 'admission' }]]]));
+    let clock = NOW;
+    const pass = useCase(fx, advance, undefined, () => clock);
+
+    const first = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(first).toMatchObject({ outcome: 'completed', runs: [] });
+    expect(advance.calls).toEqual([]);
+
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    clock = SOON;
+
+    const second = await pass.runPass({ holderId: HOLDER, nowIso: SOON });
+    if (second.outcome !== 'completed') {
+      throw new Error(`expected the second pass to complete, got: ${second.outcome} / ${second.reason}`);
+    }
+    expect(second.runs).toEqual([{ runId: RUN_ID_2, outcome: 'advanced', steps: [{ outcome: 'waiting', reason: 'admission' }] }]);
+    expect(advance.calls).toHaveLength(1);
+    expect(advance.calls[0]!.request.runId).toBe(RUN_ID_2);
+  });
+});

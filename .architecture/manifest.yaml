@@ -368,6 +368,7 @@ bounded_contexts:
           - ListLaneRunsUseCase
           - ListConductorPassesUseCase
           - ReapOrphanSessionsUseCase
+          - ReapOrphanReservationsUseCase
           - EnqueueMergeUseCase
           - ReapZombiesUseCase
           - ManageReleaseUseCase
@@ -423,6 +424,7 @@ bounded_contexts:
             - ListLaneRunsPort
             - ListConductorPassesPort
             - ReapOrphanSessionsPort
+            - ReapOrphanReservationsPort
             - RunDaemonTickPort
             - InspectDaemonStatusPort
             - SetDaemonPausePort
@@ -512,6 +514,7 @@ bounded_contexts:
             - PatchIdentityPort
             - MergeVerificationPort
             - MergeVetoPort
+            - MergeVetoStatePort
             - MergeNotificationPort
             - MergePolicyPort
             - KillallHaltMarkerPort
@@ -608,6 +611,7 @@ bounded_contexts:
       ListStaleWorkOrdersPort: "List, read-only, the work orders whose state disagrees with their lane runs: active work orders whose every run is terminal, active work orders with no run, and non-terminal runs whose work order is terminal; never writes."
       ReapLaneWorktreesPort: "On the operator's explicit request, list or remove the clean worktree of every lane run that is terminal and whose work order is terminal and whose attempts are all cancelled or collected with no held reservation; never removes a dirty, locked or unlisted worktree and never deletes a branch; a dry run removes nothing."
       ReapOrphanSessionsPort: "On the operator's explicit request, list worktrees whose latest attempt is finished (cancelled, collected or ended) but where the runner still reports a running session, and abort those by directory only with confirmation; never touches a worktree with a live attempt or a held reservation; a dry run aborts nothing."
+      ReapOrphanReservationsPort: "On the operator's explicit request, classify every held capacity reservation and release only `terminal-run` orphans through the fenced release with intent before action; a reservation no run lists is never released and is reported only past the grace, and a dry run releases nothing."
       ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
       ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."
@@ -634,6 +638,7 @@ bounded_contexts:
       PatchIdentityPort: "Decide whether an update-branch carry is allowed under the speed-plan file rule and patch-id guard against a bare mirror of the repository with allow-listed argv through the command executor; never touches the live checkout."
       MergeVerificationPort: "Request and read the verification receipt for one exact head through the evidence context's procedure; a receipt naming another head is unknown."
       MergeVetoPort: "Ask one Jev veto question bound to the verified head over the shared decision client and record the answer, confidence, mode and decision receipt id; unknown never blocks."
+      MergeVetoStatePort: "Read the veto state fields (tier, title, changed paths, additions, deletions, hard-to-undo, fix rounds, reviewer families, resolved threads, major blockers, head-changed flag) for one pull request at one exact head, read-only; unreadable or unconfigured state is reported as unavailable, never guessed."
       MergeNotificationPort: "Emit one notification per merged, dropped, first parked, forge-error-exhausted, veto-hold and pause/halt transition through operator coordination with fixed text, ids and codes only."
       MergePolicyPort: "Read policy.merge.repos and policy.daemon from the installation, read-only, at their revision on every call: per repository (owner/repo) its projectId, shadow (default true), unattended, requiredContexts, updateBranch, an optional macosProcedure (absent means none), maxAttempts, checksGraceMinutes and veto, and policy.daemon intervalSeconds, budgetSeconds and settleSeconds (defaults 60, 45 and 20, D-DT9); policyRevision is the digest of the normalized sections; an unreadable or invalid section answers unknown, never a default or an empty registry."
       ImportTrainStatePort: "Import the shell merge train's queue, parked list and chain state into merge-queue entries: dry-run by default, applied only on explicit request with its authority, idempotent by entry identity (repository, pull request, head, base) under a keyed import journal entry; unknown or secret-shaped input is reported and never guessed; imported entries start queued and park reasons are not imported; ids and codes only."

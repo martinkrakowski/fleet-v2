@@ -30,6 +30,7 @@ import {
   REVIEW_CHECKLIST,
   REVIEW_REPLY_CONTRACT,
   ReviewTransportError,
+  classifySpawnErrorCode,
 } from '../OcmReviewTransport.adapter.js';
 
 function extractPromptNonce(prompt: string): string {
@@ -3482,5 +3483,134 @@ describe('RV4: busy worktree transport (seat-busy)', () => {
     expect(Buffer.byteLength(diagnostic?.stderr ?? '', 'utf8')).toBeLessThanOrEqual(2048);
     // The cap keeps the leading bytes, not the tail.
     expect(diagnostic?.stderr).toMatch(/^x{2048}$/);
+  });
+});
+
+describe('RS2: permanent spawn errno classification (transport-failed)', () => {
+  const request: RunIndependentReviewRequest = {
+    attemptId: 'att-errno',
+    candidateHeadSha: 'sha-errno-head',
+    implementerModel: 'provider-a/implementer',
+    reviewerModel: 'provider-b/reviewer',
+  };
+
+  const makeTransport = (spawn: OcmReviewTransportSpawn) =>
+    createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: request.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => request.candidateHeadSha,
+      spawn,
+    });
+
+  const ERRNOS = ['E2BIG', 'ENOENT', 'EACCES', 'ENOEXEC'] as const;
+
+  it('a resolved null-exit spawn with a permanent errno rejects transport-failed on --wait and on the reviewer call', async () => {
+    for (const errno of ERRNOS) {
+      // --wait site: the first (and only) spawn resolves with the errno.
+      const waitOnly = makeTransport(async () => ({
+        exitCode: null,
+        stdout: '',
+        stderr: 'x',
+        errorCode: errno,
+      }));
+      const waitRejection = await waitOnly(request).catch((error: unknown) => error);
+      expect(waitRejection).toBeInstanceOf(ReviewTransportError);
+      expect((waitRejection as ReviewTransportError).code).toBe('transport-failed');
+      expect((waitRejection as ReviewTransportError).message).toBe(
+        'reviewer process failed with exit code null',
+      );
+
+      // Reviewer site: --wait exits 0, the review spawn resolves with the errno.
+      let calls = 0;
+      const reviewOnly = makeTransport(async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        return { exitCode: null, stdout: '', stderr: 'x', errorCode: errno };
+      });
+      const reviewRejection = await reviewOnly(request).catch((error: unknown) => error);
+      expect(reviewRejection).toBeInstanceOf(ReviewTransportError);
+      expect((reviewRejection as ReviewTransportError).code).toBe('transport-failed');
+      expect((reviewRejection as ReviewTransportError).message).toBe(
+        'reviewer process failed with exit code null',
+      );
+      expect(calls).toBe(2);
+    }
+  });
+
+  it('a thrown spawn error with a permanent errno code rejects transport-failed on --wait and on the reviewer call', async () => {
+    for (const errno of ERRNOS) {
+      const errnoError = Object.assign(new Error('boom'), { code: errno });
+
+      // --wait site.
+      const waitOnly = makeTransport(async () => {
+        throw errnoError;
+      });
+      const waitRejection = await waitOnly(request).catch((error: unknown) => error);
+      expect(waitRejection).toBeInstanceOf(ReviewTransportError);
+      expect((waitRejection as ReviewTransportError).code).toBe('transport-failed');
+      expect((waitRejection as ReviewTransportError).message).toBe('reviewer process failed');
+
+      // Reviewer site.
+      const reviewOnly = makeTransport(async (_file: string, args: readonly string[]) => {
+        if (args[0] === '--wait') {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        throw errnoError;
+      });
+      const reviewRejection = await reviewOnly(request).catch((error: unknown) => error);
+      expect(reviewRejection).toBeInstanceOf(ReviewTransportError);
+      expect((reviewRejection as ReviewTransportError).code).toBe('transport-failed');
+      expect((reviewRejection as ReviewTransportError).message).toBe('reviewer process failed');
+    }
+  });
+
+  it('a resolved null exit without errorCode, with a transient errorCode, or with a non-string errorCode stays transport', async () => {
+    const resolved: Array<Record<string, unknown>> = [
+      { exitCode: null, stdout: '', stderr: 'x' },
+      { exitCode: null, stdout: '', stderr: 'x', errorCode: 'ECONNRESET' },
+      { exitCode: null, stdout: '', stderr: 'x', errorCode: 123 as never },
+    ];
+    for (const shape of resolved) {
+      const transport = makeTransport(async () => shape as unknown as OcmReviewTransportSpawnResult);
+      const rejection = await transport(request).catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(ReviewTransportError);
+      expect((rejection as ReviewTransportError).code).toBe('transport');
+      expect((rejection as ReviewTransportError).message).toBe(
+        'reviewer process failed with exit code null',
+      );
+    }
+  });
+
+  it('classifySpawnErrorCode keeps timeout shapes as timeout', () => {
+    expect(classifySpawnErrorCode(Object.assign(new Error('the command timed out'), { name: 'AbortError' }))).toBe('timeout');
+    expect(classifySpawnErrorCode(Object.assign(new Error('boom'), { code: 'ETIMEDOUT' }))).toBe('timeout');
+    expect(classifySpawnErrorCode(new Error('wait timed out before the exit'))).toBe('timeout');
+  });
+
+  it('classifySpawnErrorCode never throws on hostile thrown values and reads transport', () => {
+    expect(classifySpawnErrorCode(null)).toBe('transport');
+    expect(classifySpawnErrorCode('EACCES')).toBe('transport');
+    expect(classifySpawnErrorCode(['EACCES'])).toBe('transport');
+    expect(classifySpawnErrorCode({ code: 123 })).toBe('transport');
+    expect(classifySpawnErrorCode({
+      get code(): string {
+        throw new Error('code getter boom');
+      },
+    })).toBe('transport');
+  });
+
+  it('a thrown non-string code rejects transport with the fixed message', async () => {
+    const transport = makeTransport(async () => {
+      throw Object.assign(new Error('boom'), { code: 123 });
+    });
+    const rejection = await transport(request).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(ReviewTransportError);
+    expect((rejection as ReviewTransportError).code).toBe('transport');
+    expect((rejection as ReviewTransportError).message).toBe('reviewer process failed');
   });
 });

@@ -45,6 +45,44 @@ export function isTimeoutError(error: unknown): boolean {
   }
 }
 
+/**
+ * Spawn errnos that are permanent OS failures: the same command cannot
+ * succeed on a retry. Classified `transport-failed` — journalled downstream
+ * as `review-no-receipt` and counted against the review retry budget (never
+ * described as non-retryable).
+ */
+const PERMANENT_SPAWN_ERRNOS: ReadonlySet<string> = new Set([
+  'E2BIG',
+  'ENOENT',
+  'EACCES',
+  'ENOEXEC',
+]);
+
+/**
+ * Classify a thrown spawn error. A timeout shape is `timeout`; a permanent
+ * spawn errno is `transport-failed` (journalled downstream as
+ * `review-no-receipt` and counted against the review retry budget); anything
+ * else is `transport`. Hostile shapes (null, primitives, arrays, non-string
+ * codes, throwing getters) read as `transport` without ever throwing.
+ */
+export function classifySpawnErrorCode(error: unknown): 'timeout' | 'transport-failed' | 'transport' {
+  try {
+    if (isTimeoutError(error)) {
+      return 'timeout';
+    }
+    if (typeof error !== 'object' || error === null || Array.isArray(error)) {
+      return 'transport';
+    }
+    const code = safeRead(() => (error as { readonly code?: unknown }).code);
+    if (typeof code === 'string' && PERMANENT_SPAWN_ERRNOS.has(code)) {
+      return 'transport-failed';
+    }
+    return 'transport';
+  } catch {
+    return 'transport';
+  }
+}
+
 export class ReviewTransportError extends Error {
   readonly code: ReviewUnavailableCode;
   /** The bounded transport diagnostic (RV4); absent when the failure carried none. */
@@ -139,6 +177,8 @@ export interface OcmReviewTransportSpawnResult {
   readonly stderr: string;
   /** Set only when the spawn ended because its wall-clock budget ran out. */
   readonly timedOut?: boolean;
+  /** The OS errno of a spawn failure (for example `ENOENT`); absent otherwise. */
+  readonly errorCode?: string;
 }
 
 export type OcmReviewTransportSpawn = (
@@ -1269,6 +1309,7 @@ export async function defaultSpawn(
     stdout: outcome.stdout,
     stderr: outcome.stderr !== '' ? outcome.stderr : outcome.error ?? '',
     ...(timedOut ? { timedOut: true } : {}),
+    ...(outcome.errorCode !== undefined ? { errorCode: outcome.errorCode } : {}),
   };
 }
 
@@ -1338,8 +1379,9 @@ export function createOcmReviewTransport(
     // when idle (two reads) and 75 when a session still runs past
     // `OCM_WAIT_MAX`; a cut-short wait (a timeout) writes no review intent, so
     // the next pass can dispatch. Exit 75 or `timedOut` is `seat-busy`; any
-    // other non-zero exit, an unreadable exit code or a thrown spawn is the
-    // existing `transport`/`timeout` code. None of these spawn the review.
+    // other non-zero exit, an unreadable exit code or a thrown spawn classifies
+    // as `timeout`, `transport-failed` (a permanent spawn errno) or `transport`.
+    // None of these spawn the review.
     const timeoutMs = options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     const reviewEnv = buildReviewerEnv(options);
     const waitSpawnFn = options.spawn ?? defaultSpawn;
@@ -1350,13 +1392,14 @@ export function createOcmReviewTransport(
         OCM_WAIT_MAX: String(Math.max(1, Math.ceil(timeoutMs / 1000))),
       }, { timeoutMs });
     } catch (error) {
-      // RV4: a thrown spawn always classifies as `timeout` or `transport`. Its
-      // message is never passed through — it may carry a secret or a path —
-      // and a typed ReviewTransportError thrown by the spawn is classified like
-      // any other throw, never rethrown with its own code or message.
+      // RV4: a thrown spawn classifies as `timeout`, `transport-failed` (a
+      // permanent spawn errno) or `transport`. Its message is never passed
+      // through — it may carry a secret or a path — and a typed
+      // ReviewTransportError thrown by the spawn is classified like any other
+      // throw, never rethrown with its own code or message.
       throw new ReviewTransportError(
         'reviewer process failed',
-        isTimeoutError(error) ? 'timeout' : 'transport',
+        classifySpawnErrorCode(error),
         transportFailureDiagnostic(error),
       );
     }
@@ -1366,9 +1409,14 @@ export function createOcmReviewTransport(
     }
     if (waitExitCode !== 0) {
       const waitTimedOut = spawnTimedOut(waitResult);
+      const waitErrorCode = safeRead(() => waitResult.errorCode);
       throw new ReviewTransportError(
         `reviewer process failed with exit code ${String(waitExitCode)}`,
-        waitTimedOut ? 'timeout' : 'transport',
+        waitTimedOut
+          ? 'timeout'
+          : typeof waitErrorCode === 'string' && PERMANENT_SPAWN_ERRNOS.has(waitErrorCode)
+            ? 'transport-failed'
+            : 'transport',
         spawnDiagnosticOf(waitResult),
       );
     }
@@ -1419,11 +1467,12 @@ export function createOcmReviewTransport(
     }
     const prompt = buildReviewPrompt(request, nonce, embeddedDiff);
     // The prompt travels as one argv element; Linux caps a single argument at
-    // 131,072 bytes, and a larger prompt makes the spawn throw E2BIG, which
-    // classifies as a retryable transport failure and parks the run as a seat
-    // outage. An oversize prompt is refused here instead: no process is
-    // spawned, nothing throws, and the review refuses cleanly (the caller
-    // should split the lane, not retry).
+    // 131,072 bytes, and a larger prompt makes the spawn report E2BIG as a
+    // child `error` event — classified as `transport-failed`, which is
+    // journalled downstream as `review-no-receipt` and counts against the
+    // review retry budget. An oversize prompt is refused here instead: no
+    // process is spawned, nothing throws, and the review refuses cleanly (the
+    // caller should split the lane, not retry).
     if (Buffer.byteLength(prompt, 'utf8') > MAX_OCM_PROMPT_BYTES) {
       const after = await options.readHead(dir);
       return {
@@ -1455,13 +1504,14 @@ export function createOcmReviewTransport(
       });
     } catch (error) {
       // Every throw from the review spawn is classified: a timeout shape is a
-      // `timeout`, anything else a `transport` failure. A typed
-      // ReviewTransportError thrown by the spawn does not travel as-is — its
-      // message could expose a secret or a path, and its code would bypass the
-      // thrown-spawn classification; the fixed message travels instead.
+      // `timeout`, a permanent spawn errno a `transport-failed`, anything else
+      // a `transport` failure. A typed ReviewTransportError thrown by the
+      // spawn does not travel as-is — its message could expose a secret or a
+      // path, and its code would bypass the thrown-spawn classification; the
+      // fixed message travels instead.
       throw new ReviewTransportError(
         'reviewer process failed',
-        isTimeoutError(error) ? 'timeout' : 'transport',
+        classifySpawnErrorCode(error),
         transportFailureDiagnostic(error),
       );
     }
@@ -1474,9 +1524,14 @@ export function createOcmReviewTransport(
         // worktree is busy too. The fixed message carries no stderr and no path.
         throw new ReviewTransportError('review seat busy', 'seat-busy', diagnostic);
       }
+      const spawnErrorCode = safeRead(() => spawnResult.errorCode);
       throw new ReviewTransportError(
         `reviewer process failed with exit code ${String(spawnExitCode)}`,
-        timedOut ? 'timeout' : 'transport',
+        timedOut
+          ? 'timeout'
+          : typeof spawnErrorCode === 'string' && PERMANENT_SPAWN_ERRNOS.has(spawnErrorCode)
+            ? 'transport-failed'
+            : 'transport',
         diagnostic,
       );
     }

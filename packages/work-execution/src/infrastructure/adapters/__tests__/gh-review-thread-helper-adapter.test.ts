@@ -401,6 +401,39 @@ describe('GhReviewThreadHelperAdapter', () => {
     expect(resolveCalls.calls).toHaveLength(1);
   });
 
+  it('owner and repo that differ from the request only by letter case pass the ownership check', async () => {
+    const reply = scripted(checkAnswer(onThread()), REPLY_ANSWER);
+    expect(
+      await adapterFor(reply.runGh).replyToReviewThread(
+        replyRequest({ repository: { owner: 'Fleet', repo: 'V2' } }),
+      ),
+    ).toEqual({ outcome: 'ok', commentId: 'IC_1' });
+    expect(reply.calls).toHaveLength(2);
+
+    const resolve = scripted(checkAnswer(onThread()), RESOLVE_ANSWER);
+    expect(
+      await adapterFor(resolve.runGh).resolveReviewThread(
+        resolveRequest({ repository: { owner: 'Fleet', repo: 'V2' } }),
+      ),
+    ).toEqual({ outcome: 'ok', isResolved: true });
+    expect(resolve.calls).toHaveLength(2);
+  });
+
+  it('a forge owner outside the repository pattern is refused even when its lower case equals the request', async () => {
+    const check = { ...onThread(), pullRequest: { number: 42, repository: { name: 'v2', owner: { login: '\u212Aleet' } } } };
+    const { calls, runGh } = scripted(checkAnswer(check), REPLY_ANSWER);
+    expect(
+      await adapterFor(runGh).replyToReviewThread(
+        replyRequest({ repository: { owner: 'kleet', repo: 'v2' } }),
+      ),
+    ).toEqual({
+      outcome: 'refused',
+      code: 'thread-not-on-pull-request',
+      reason: 'review thread belongs to another pull request',
+    });
+    expect(calls).toHaveLength(1);
+  });
+
   it('an ownership check naming another thread id is thread-not-found before any mutation', async () => {
     // The check query returns a well-formed PullRequestReviewThread whose
     // pull request matches the request, but its node id is not the requested

@@ -43,6 +43,11 @@ writeFileSync(join(stubDir, 'git'), '#!/bin/sh\nprintf \'%s\\0\' "$@"\n', {
   mode: 0o755,
 });
 chmodSync(join(stubDir, 'git'), 0o755);
+/** An executable stand-in for the ssh client, so no test depends on the host's own ssh. */
+const sshStub = join(stubDir, 'ssh');
+writeFileSync(sshStub, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+chmodSync(sshStub, 0o755);
+const sshCandidates: readonly string[] = ['/nonexistent/fleet-ssh', sshStub];
 afterAll(() => {
   rmSync(stubDir, { recursive: true, force: true });
 });
@@ -128,8 +133,8 @@ describe('readGitHeadOverSsh argv and options', () => {
   });
 
   it('pins the exact ssh argv and options for a plain path', async () => {
-    await readGitHeadOverSsh('/plain/path', 'lane.example');
-    expect(captured[0]!.file).toBe('ssh');
+    await readGitHeadOverSsh('/plain/path', 'lane.example', sshCandidates);
+    expect(captured[0]!.file).toBe(sshStub);
     expect(captured[0]!.args).toEqual([
       '-o',
       'BatchMode=yes',
@@ -145,7 +150,7 @@ describe('readGitHeadOverSsh argv and options', () => {
   });
 
   it.each(pathKinds)('quotes the remote command line exactly twice for $name', async ({ path }) => {
-    await readGitHeadOverSsh(path, 'lane.example');
+    await readGitHeadOverSsh(path, 'lane.example', sshCandidates);
     expect(captured).toHaveLength(1);
     expect(captured[0]!.args).toEqual([
       '-o',
@@ -164,8 +169,22 @@ describe('readGitHeadOverSsh argv and options', () => {
     });
   });
 
+  it('spawns the resolved absolute ssh path, never the bare name', async () => {
+    await readGitHeadOverSsh('/plain/path', 'lane.example', sshCandidates);
+    expect(captured[0]!.file).toBe(sshStub);
+    expect(captured[0]!.file).not.toBe('ssh');
+  });
+
+  it('rejects and spawns nothing when no candidate is an executable file', async () => {
+    await expect(
+      readGitHeadOverSsh('/plain/path', 'lane.example', ['/nonexistent/fleet-ssh', stubDir]),
+    ).rejects.toThrow(/ssh not found in fixed locations/);
+    expect(captured).toHaveLength(0);
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
   it('always carries BatchMode, ConnectTimeout and a 60 s timeout', async () => {
-    await readGitHeadOverSsh('/plain/path', 'lane.example');
+    await readGitHeadOverSsh('/plain/path', 'lane.example', sshCandidates);
     expect(captured[0]!.args).toContain('-o');
     expect(captured[0]!.args).toContain('BatchMode=yes');
     expect(captured[0]!.args).toContain('ConnectTimeout=15');
@@ -183,7 +202,7 @@ describe('readGitHeadOverSsh remote round-trip', () => {
   it.each(pathKinds)(
     'gives the stub git exactly the rev-parse words for $name',
     async ({ path }) => {
-      await readGitHeadOverSsh(path, 'lane.example');
+      await readGitHeadOverSsh(path, 'lane.example', sshCandidates);
       const words = await runRemoteCommandRemotely(captured[0]!.args);
       expect(words).toEqual(['-C', path, 'rev-parse', 'HEAD']);
     },
@@ -211,7 +230,7 @@ describe('readGitHeadOverSsh refusals', () => {
   it('refuses an empty worktree path with an error that does not echo it', async () => {
     let message = '';
     try {
-      await readGitHeadOverSsh('', 'lane.example');
+      await readGitHeadOverSsh('', 'lane.example', sshCandidates);
     } catch (error) {
       message = (error as Error).message;
     }
@@ -227,7 +246,7 @@ describe('readGitHeadOverSsh refusals', () => {
   ])('refuses a NUL byte in the %s of the path without echoing it', async (_kind, path) => {
     let message = '';
     try {
-      await readGitHeadOverSsh(path, 'lane.example');
+      await readGitHeadOverSsh(path, 'lane.example', sshCandidates);
     } catch (error) {
       message = (error as Error).message;
     }

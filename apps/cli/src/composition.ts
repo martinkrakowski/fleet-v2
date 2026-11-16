@@ -21,6 +21,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
+import { SSH_BINARY_CANDIDATES, resolveSshBinary } from './ssh-binary.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
 import { composeReadOnlyRelaunch } from './composition/relaunch.js';
@@ -488,7 +489,7 @@ function applyGhEnvironmentOverrides(args: readonly string[]): readonly string[]
   return args;
 }
 
-/** Whether `path` is an executable regular file (S4036: absolute gh only). */
+/** Whether `path` is an executable regular file (S4036: absolute gh and ssh only). */
 function isExecutableRegularFile(path: string): boolean {
   try {
     const stats = statSync(path);
@@ -602,12 +603,20 @@ export function readGitHead(worktreePath: string, sshHost?: string): Promise<str
  * `sh` inherits only its exported environment. fish and csh are not
  * supported, before or after this change.
  */
-export function readGitHeadOverSsh(worktreePath: string, sshHost: string): Promise<string> {
+export function readGitHeadOverSsh(
+  worktreePath: string,
+  sshHost: string,
+  sshCandidates: readonly string[] = SSH_BINARY_CANDIDATES,
+): Promise<string> {
   if (!isSafeSshHost(sshHost)) {
     return Promise.reject(new Error(`Refusing to read HEAD over SSH: unsafe host '${sshHost}'`));
   }
   if (worktreePath === '' || worktreePath.includes('\0')) {
     return Promise.reject(new Error('Refusing to read HEAD over SSH: unusable worktree path'));
+  }
+  const sshBinary = resolveSshBinary(sshCandidates, isExecutableRegularFile);
+  if (sshBinary === undefined) {
+    return Promise.reject(new Error('Refusing to read HEAD over SSH: ssh not found in fixed locations'));
   }
   const words = ['git', '-C', worktreePath, 'rev-parse', 'HEAD'];
   const args = [
@@ -622,7 +631,7 @@ export function readGitHeadOverSsh(worktreePath: string, sshHost: string): Promi
     posixQuote(words.map(posixQuote).join(' ')),
   ];
   return new Promise((resolve, reject) => {
-    execFile('ssh', args, { encoding: 'utf8', timeout: 60_000 }, (error, stdout) => {
+    execFile(sshBinary, args, { encoding: 'utf8', timeout: 60_000 }, (error, stdout) => {
       if (error === null) {
         resolve(String(stdout).trim());
         return;

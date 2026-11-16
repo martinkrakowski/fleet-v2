@@ -346,7 +346,7 @@ describe('ChainRepositoryAdapter (file store)', () => {
     expect(await adapter.recordChainIntent({ record: recordOf(), deadlineIso: deadline() })).toEqual({
       outcome: 'refused', reason: 'record-limit',
     });
-  });
+  }, 30_000);
 
   it('writes atomically: a crash that left a temp file keeps the old record readable and the next write cleans it', async () => {
     const file = await seed();

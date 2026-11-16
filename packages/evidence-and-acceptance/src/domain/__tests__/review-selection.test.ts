@@ -565,7 +565,7 @@ describe('isAttemptReceiptSubject', () => {
     expect(isAttemptReceiptSubject(hostile)).toBe(false);
   });
 
-  it('ignores prototype-polluting keys: a JSON-parsed __proto__ with no own subject is not an attempt receipt, and one with a non-attempt subject is not either', () => {
+  it('refuses a receipt with an own __proto__ key: one with no own subject is not an attempt receipt, and one with a chain subject is not either', () => {
     expect(isAttemptReceiptSubject(JSON.parse('{"attemptId":"att-1","__proto__":{"kind":"chain"}}'))).toBe(false);
     expect(
       isAttemptReceiptSubject(JSON.parse('{"attemptId":"att-1","__proto__":{"kind":"chain"},"subject":{"kind":"chain","projectId":"proj-1","attemptId":null,"chainName":"main","integrationHeadSha":"' + 'a'.repeat(40) + '","briefPackageDigest":null,"baseCommit":null}}')),
@@ -588,6 +588,21 @@ describe('isAttemptReceiptSubject', () => {
       ),
     ).toBe(true);
   });
+
+  it('returns false for a chain subject on an ordinary attemptId, so the subject rule decides without the prefix rule', () => {
+    expect(isAttemptReceiptSubject(receipt({ attemptId: 'att-1', subject: chainSubject() }))).toBe(false);
+  });
+
+  it.each(['brief:proj-1:' + 'd'.repeat(64), 'chain:proj-1:main'])(
+    'returns false for an explicit attempt subject whose attemptId is the pseudo id %s, so the prefix rule decides without the subject rule',
+    (attemptId) => {
+      const subject: ReceiptSubject = {
+        kind: 'attempt', projectId: 'proj-1', attemptId, chainName: null, integrationHeadSha: null,
+        briefPackageDigest: null, baseCommit: null,
+      };
+      expect(isAttemptReceiptSubject(receipt({ attemptId, subject }))).toBe(false);
+    },
+  );
 
   it('returns true for a legacy receipt without a subject', () => {
     expect(isAttemptReceiptSubject(receipt())).toBe(true);
@@ -654,6 +669,24 @@ describe('attempt isolation of the review pass gates', () => {
     expect(
       satisfiesFullyDispositionedReviewPassGate(briefSubjectReceipt, new Set([finding.findingId]), new Set()),
     ).toBe(false);
+  });
+
+  it('a passing code-review with a chain subject on an ordinary attemptId never satisfies either gate', () => {
+    const chainOnAttemptId = receipt({
+      kind: 'code-review',
+      result: 'pass',
+      attemptId: 'att-1',
+      subject: { kind: 'chain', projectId: 'proj-1', attemptId: null, chainName: 'main', integrationHeadSha: BASE, briefPackageDigest: null, baseCommit: null },
+    });
+    expect(satisfiesReviewPassGate(chainOnAttemptId)).toBe(false);
+    expect(satisfiesFullyDispositionedReviewPassGate(chainOnAttemptId, new Set(), new Set())).toBe(false);
+  });
+
+  it('a passing receipt with no kind and a brief subject on an ordinary attemptId never satisfies either gate', () => {
+    const noKind = receipt({ result: 'pass', attemptId: 'att-1', subject: briefSubject() });
+    expect(noKind.kind).toBeUndefined();
+    expect(satisfiesReviewPassGate(noKind)).toBe(false);
+    expect(satisfiesFullyDispositionedReviewPassGate(noKind, new Set(), new Set())).toBe(false);
   });
 
   it('a code-review with a subject that is not an attempt is never a pass, keeping the legacy attempt receipt passing', () => {

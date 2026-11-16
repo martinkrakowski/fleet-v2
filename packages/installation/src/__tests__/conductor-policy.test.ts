@@ -567,3 +567,124 @@ describe('policy.conductor (K2)', () => {
     }
   });
 });
+
+describe('policy.conductor.premergeMode (CO21)', () => {
+  it('parses the two premergeMode literals and keeps the key', () => {
+    for (const premergeMode of ['human-gate', 'auto-attest'] as const) {
+      const input = withConductor({ enabled: true, premergeMode });
+      expect(parseInstallation(input)).toEqual({ ok: true, installation: input });
+    }
+  });
+
+  it('refuses any other premergeMode with its path and without echoing the value', () => {
+    for (const value of ['AUTO-ATTEST', 'auto', '', 1, true, null, ['auto-attest'], { mode: 'auto-attest' }]) {
+      expect(parseInstallation(withConductor({ enabled: true, premergeMode: value }))).toEqual({
+        ok: false,
+        errors: ['policy.conductor.premergeMode: must be one of human-gate, auto-attest'],
+      });
+    }
+    const refused = parseInstallation(withConductor({ enabled: true, premergeMode: 'AUTO-ATTEST' }));
+    const joined = refused.ok ? '' : refused.errors.join('\n');
+    expect(joined).not.toContain('AUTO-ATTEST');
+  });
+
+  it('resolves an absent premergeMode to human-gate', () => {
+    expect(DEFAULT_CONDUCTOR_POLICY.premergeMode).toBe('human-gate');
+    expect(resolveConductorPolicy(undefined).premergeMode).toBe('human-gate');
+    expect(resolveConductorPolicy({ conductor: { enabled: true } } as never).premergeMode).toBe(
+      'human-gate',
+    );
+  });
+
+  it('resolves each literal to itself and leaves the rest of the block applied', () => {
+    const auto = resolveConductorPolicy({
+      conductor: { enabled: true, premergeMode: 'auto-attest' },
+    } as never);
+    expect(auto).toEqual({ ...DEFAULT_CONDUCTOR_POLICY, enabled: true, premergeMode: 'auto-attest' });
+    expect(Object.isFrozen(auto)).toBe(true);
+    expect(
+      resolveConductorPolicy({ conductor: { enabled: true, premergeMode: 'human-gate' } } as never),
+    ).toEqual({ ...DEFAULT_CONDUCTOR_POLICY, enabled: true });
+  });
+
+  it('fails closed to the whole default for a malformed premergeMode and never runs a getter', () => {
+    for (const value of ['AUTO-ATTEST', 'auto-attest ', '', 1, true, null, undefined, ['auto-attest'], {}]) {
+      expect(
+        resolveConductorPolicy({ conductor: { enabled: true, premergeMode: value } } as never),
+      ).toEqual(DEFAULT_CONDUCTOR_POLICY);
+    }
+    let getterRan = false;
+    const withGetter = {
+      conductor: {
+        enabled: true,
+        get premergeMode(): string {
+          getterRan = true;
+          return 'auto-attest';
+        },
+      },
+    };
+    expect(resolveConductorPolicy(withGetter as never)).toEqual(DEFAULT_CONDUCTOR_POLICY);
+    expect(getterRan).toBe(false);
+    expect(
+      resolveConductorPolicy({
+        conductor: Object.assign(Object.create({ premergeMode: 'auto-attest' }), { enabled: true }),
+      } as never),
+    ).toEqual(DEFAULT_CONDUCTOR_POLICY);
+  });
+
+  it('keeps every existing revision without auto-attest and pins the auto-attest revision', () => {
+    const human = canonicalConductorJson(
+      resolveConductorPolicy({ conductor: { enabled: true } } as never),
+    );
+    const humanGate = canonicalConductorJson(
+      resolveConductorPolicy({
+        conductor: { enabled: true, premergeMode: 'human-gate' },
+      } as never),
+    );
+    expect(human).toBe(humanGate);
+    expect(human).not.toContain('premergeMode');
+    expect(conductorRevision(resolveConductorPolicy({ conductor: { enabled: true } } as never))).toBe(
+      'ed656a35e15c',
+    );
+    expect(
+      conductorRevision(
+        resolveConductorPolicy({
+          conductor: { enabled: true, premergeMode: 'human-gate' },
+        } as never),
+      ),
+    ).toBe('ed656a35e15c');
+    const auto = resolveConductorPolicy({
+      conductor: { enabled: true, premergeMode: 'auto-attest' },
+    } as never);
+    expect(canonicalConductorJson(auto)).toBe(
+      '{"enabled":true,"stopGraceMinutes":45,"premergeMode":"auto-attest","reaper":{"enabled":true,"intervalMinutes":10,"graceMinutes":5,"staleStopMinutes":30,"repairs":{"dead-attempt":false,"leaked-slot":false,"stale-stop":false,"stale-attention":false,"merged-worktree":false,"orphan-session":false},"worktrees":{"retentionHours":24,"maxRemovalsPerPass":10,"passBudgetSeconds":120},"disk":{"minFreePercent":15,"clearFreePercent":20}}}',
+    );
+    expect(conductorRevision(auto)).toBe('2d666f03d92f');
+  });
+
+  it('hashes an unknown premergeMode on a hand-built policy as human-gate', () => {
+    expect(
+      canonicalConductorJson({
+        ...resolveConductorPolicy({ conductor: { enabled: true } } as never),
+        premergeMode: 'AUTO-ATTEST' as never,
+      }),
+    ).toBe(canonicalConductorJson(resolveConductorPolicy({ conductor: { enabled: true } } as never)));
+  });
+
+  it('writes premergeMode in key order and round-trips it', () => {
+    const parsed = parseV2Fixture(
+      withConductor({ reaper: { enabled: true }, premergeMode: 'auto-attest', stopGraceMinutes: 30, enabled: true }),
+    );
+    const written = writeInstallationV2(parsed);
+    const writtenConductor = (
+      (JSON.parse(written).policy as Record<string, unknown>).conductor
+    ) as Record<string, unknown>;
+    expect(Object.keys(writtenConductor)).toEqual([
+      'enabled',
+      'stopGraceMinutes',
+      'premergeMode',
+      'reaper',
+    ]);
+    expect(parseInstallation(JSON.parse(written))).toEqual({ ok: true, installation: parsed });
+  });
+});

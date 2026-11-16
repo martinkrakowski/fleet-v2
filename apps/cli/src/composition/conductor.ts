@@ -26,6 +26,7 @@ import {
   ListStalledRunsUseCase,
   StallAttentionAdapter,
   ReapLaneWorktreesUseCase,
+  ReapOrphanReservationsUseCase,
   ReapOrphanSessionsUseCase,
   ReapZombiesUseCase,
   ReaperFindingRepositoryAdapter,
@@ -448,6 +449,24 @@ export function composeConductor(input: ComposeConductorInput) {
       attemptRepo: attemptRepository,
       executionJournal,
       runnerForAttempt,
+    }),
+    // OG22b: the adapters are passed whole; the use case calls the fenced
+    // release as a method of the journal adapter.
+    reapOrphanReservations: new ReapOrphanReservationsUseCase({
+      executionJournal,
+      runRepo: laneRunRepository,
+      runJournal: laneRunJournal,
+      attemptRepo: attemptRepository,
+      newUlid: conductorNewUlid,
+    }),
+    // OG22b: a dry run reads through read-only stores, so an unreadable state
+    // file is a read error and is never quarantined by a listing.
+    reapOrphanReservationsDryRun: new ReapOrphanReservationsUseCase({
+      executionJournal: new ExecutionJournalAdapter({ stateDir, readOnly: true }),
+      runRepo: new LaneRunRepositoryAdapter({ stateDir, readOnly: true }),
+      runJournal: new LaneRunJournalAdapter({ stateDir, readOnly: true }),
+      attemptRepo: new AttemptRepositoryAdapter({ stateDir, readOnly: true }),
+      newUlid: conductorNewUlid,
     }),
     // KW4b': the zombie reaper pass. The merged-worktree removal is opt-in
     // behind `policy.conductor.reaper.repairs['merged-worktree']` (D-R6).

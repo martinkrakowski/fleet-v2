@@ -147,14 +147,46 @@ describe('LaneUsageLogFileAdapter', () => {
     });
 
     const bytesStateDir = await tempStateDir();
+    const headerBytes = Buffer.byteLength('{"schemaVersion":1}\n', 'utf8');
     const tinyBytes = Buffer.byteLength(serializeLaneUsageLogRow(row()) + '\n', 'utf8');
     const bytesAdapter = new LaneUsageLogFileAdapter({
-      stateDir: bytesStateDir, maxFileBytes: tinyBytes, maxRows: 100,
+      stateDir: bytesStateDir, maxFileBytes: headerBytes + tinyBytes, maxRows: 100,
     });
     expect(await bytesAdapter.append(row('attempt-1'))).toEqual({ outcome: 'appended' });
     expect(await bytesAdapter.append(row('attempt-2'))).toEqual({
       outcome: 'refused', reason: 'log-budget-exhausted',
     });
+  });
+
+  it('refuses the first append when header and row exceed the byte budget', async () => {
+    const stateDir = await tempStateDir();
+    const rowBytes = Buffer.byteLength(serializeLaneUsageLogRow(row()) + '\n', 'utf8');
+    const adapter = new LaneUsageLogFileAdapter({
+      stateDir, maxFileBytes: rowBytes, maxRows: 100,
+    });
+    expect(await adapter.append(row())).toEqual({ outcome: 'refused', reason: 'log-budget-exhausted' });
+    // Nothing was written: the store is still absent.
+    await expect(adapter.read()).resolves.toEqual({ outcome: 'read', rows: [] });
+  });
+
+  it('refuses an append onto an existing file already larger than the byte budget', async () => {
+    const stateDir = await tempStateDir();
+    await mkdir(join(stateDir, 'telemetry'), { recursive: true });
+    await writeFile(targetPath(stateDir), `{"schemaVersion":1}\n${'x'.repeat(64)}\n`, 'utf8');
+    const adapter = new LaneUsageLogFileAdapter({ stateDir, maxFileBytes: 32, maxRows: 100 });
+    expect(await adapter.append(row())).toEqual({ outcome: 'refused', reason: 'log-budget-exhausted' });
+  });
+
+  it('enforces the byte budget in memory too', async () => {
+    const rowBytes = Buffer.byteLength(serializeLaneUsageLogRow(row()) + '\n', 'utf8');
+    const adapter = new LaneUsageLogFileAdapter({ maxFileBytes: rowBytes, maxRows: 100 });
+    expect(await adapter.append(row())).toEqual({ outcome: 'appended' });
+    expect(await adapter.append(row('attempt-2'))).toEqual({
+      outcome: 'refused', reason: 'log-budget-exhausted',
+    });
+    const tiny = new LaneUsageLogFileAdapter({ maxFileBytes: rowBytes - 1, maxRows: 100 });
+    expect(await tiny.append(row())).toEqual({ outcome: 'refused', reason: 'log-budget-exhausted' });
+    expect(await tiny.read()).toEqual({ outcome: 'read', rows: [] });
   });
 
   it('returns store-unreadable when log file cannot be read', async () => {

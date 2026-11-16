@@ -113,8 +113,11 @@ function isEnum<T extends string>(value: unknown, allowed: readonly T[]): value 
 }
 
 /**
- * The worktree name: only the final non-empty segment of `path`, split on
- * both separators. A parent directory, a `..` or `.` segment, a segment with
+ * The worktree name: only the final non-empty segment of `path`. The scan is
+ * bounded: it walks backwards from the end of the string and stops once a
+ * segment longer than `MAX_TEXT_LENGTH` is proven, so an input of any size
+ * costs at most `MAX_TEXT_LENGTH + 1` examined characters — never a split of
+ * the whole input. A parent directory, a `..` or `.` segment, a segment with
  * control characters or a secret shape never yields a name. Never throws.
  */
 export function worktreeNameFromPath(path: unknown): string | null {
@@ -122,16 +125,23 @@ export function worktreeNameFromPath(path: unknown): string | null {
     if (typeof path !== 'string') {
       return null;
     }
-    const segments = path.split(/[\\/]/);
-    // The final non-empty segment, so a trailing separator is not the name.
-    let last = '';
-    for (let index = segments.length - 1; index >= 0; index -= 1) {
-      if (segments[index].length > 0) {
-        last = segments[index];
-        break;
-      }
+    const isSeparator = (character: string): boolean => character === '/' || character === '\\';
+    let end = path.length - 1;
+    while (end >= 0 && isSeparator(path[end])) {
+      end -= 1;
     }
-    if (last.length === 0 || last.length > MAX_TEXT_LENGTH) {
+    if (end < 0) {
+      return null;
+    }
+    // Collect at most MAX_TEXT_LENGTH + 1 characters: one more than allowed,
+    // so an over-long segment is refused without scanning further back.
+    let last = '';
+    let start = end;
+    while (start >= 0 && !isSeparator(path[start]) && last.length <= MAX_TEXT_LENGTH) {
+      last = `${path[start]}${last}`;
+      start -= 1;
+    }
+    if (start >= 0 && !isSeparator(path[start])) {
       return null;
     }
     if (last === '.' || last === '..' || CONTROL_CHARACTERS.test(last) || containsSecretShape(last)) {
@@ -231,7 +241,10 @@ export function buildLaneUsageLogRow(input: {
       : 'unavailable';
     const model = isTelemetryModelId(usageRecord?.model) ? (usageRecord?.model as string) : null;
     const agent = isOptionalSafeText(usageRecord?.agent) ? (usageRecord?.agent as string | null) : null;
-    const reason = isOptionalSafeText(usageRecord?.reason) ? (usageRecord?.reason as string | null) : null;
+    // The usage record's `reason` is prompt/detail text — diagnostic stderr,
+    // provider messages — and never belongs in a telemetry row, so the builder
+    // always redacts it to `null` rather than copying it through.
+    const reason = null;
     const wallSeconds = isOptionalNonNegativeNumber(usageRecord?.wallSeconds)
       ? (usageRecord?.wallSeconds as number | null)
       : null;
@@ -317,6 +330,7 @@ export function parseLaneUsageLogRow(value: unknown): LaneUsageLogRow | null {
     if (
       worktreeName !== null &&
       (typeof worktreeName !== 'string' || worktreeName.length === 0 ||
+        worktreeName.length > MAX_TEXT_LENGTH ||
         worktreeName === '.' || worktreeName === '..' ||
         /[\\/]/.test(worktreeName) || CONTROL_CHARACTERS.test(worktreeName) ||
         containsSecretShape(worktreeName))
@@ -347,6 +361,12 @@ export function parseLaneUsageLogRow(value: unknown): LaneUsageLogRow | null {
       if (!isOptionalNonNegativeNumber(numberValue)) {
         return null;
       }
+    }
+    // The stored costBasis must be the one its billing and cost derive to
+    // (plan §3.6): a row claiming `metered` with no cost, or `plan-estimate`
+    // under metered billing, is inconsistent and refused.
+    if (costBasis !== costBasisOf(billing as SeatBilling, costUsd as number | null)) {
+      return null;
     }
     return {
       schemaVersion: 1,

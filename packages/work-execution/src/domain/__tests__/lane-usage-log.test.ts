@@ -66,6 +66,16 @@ function build(overrides: Partial<AttemptRecord> = {}, runId: string | null = 'r
   return buildLaneUsageLogRow({ attempt: attempt(overrides), runId, nowIso: NOW_ISO });
 }
 
+// Synthetic, deliberately non-credential fixtures: each string matches one
+// legacy secret *shape* only, so the secret-shape refusals are exercised.
+// None of them is a real token; they are assembled from parts to say so.
+const SECRET_SHAPED = {
+  githubToken: ['ghp', '_0123456789abcdefghijklmn'].join(''),
+  awsAccessKey: ['AKIA', '0123456789ABCDEF'].join(''),
+  openaiKey: ['sk', '-0123456789abcdefghijklmn'].join(''),
+  slackToken: ['xoxb', '-0123456789ab'].join(''),
+};
+
 describe('LaneUsageLogRow building', () => {
   it('builds a metered row for an opencode attempt with usage', () => {
     const row = build();
@@ -146,8 +156,15 @@ describe('LaneUsageLogRow building', () => {
     });
     expect(row?.source).toBe('unavailable');
     expect(row?.costBasis).toBe('unknown');
-    expect(row?.reason).toBe('usage read failed');
+    expect(row?.reason).toBeNull();
     expect(row?.steps).toBeNull();
+  });
+
+  it('never carries the usage reason text, even benign diagnostic detail', () => {
+    const row = build({
+      usage: meteredUsage({ reason: 'opencode db missing: stderr line one\nstderr line two' }),
+    });
+    expect(row?.reason).toBeNull();
   });
 
   it('carries seatRole from the seat selection', () => {
@@ -191,7 +208,7 @@ describe('worktreeNameFromPath', () => {
     expect(worktreeNameFromPath('/a/.')).toBeNull();
     expect(worktreeNameFromPath('/a/wt\n1')).toBeNull();
     expect(worktreeNameFromPath('/a/wt\u0000')).toBeNull();
-    expect(worktreeNameFromPath('/a/ghp_0123456789abcdefghijklmn')).toBeNull();
+    expect(worktreeNameFromPath(`/a/${SECRET_SHAPED.githubToken}`)).toBeNull();
   });
 
   it('refuses non-string and empty input', () => {
@@ -200,6 +217,16 @@ describe('worktreeNameFromPath', () => {
     expect(worktreeNameFromPath(42)).toBeNull();
     expect(worktreeNameFromPath('')).toBeNull();
     expect(worktreeNameFromPath('//')).toBeNull();
+  });
+
+  it('stays bounded on an enormous input without splitting it', () => {
+    // A megabyte of parent directories must cost a bounded scan, not a split
+    // of the whole string, and must still yield the final segment.
+    const deep = `/a${'/b'.repeat(500_000)}/wt-deep`;
+    expect(worktreeNameFromPath(deep)).toBe('wt-deep');
+    // A single over-long segment is refused, however short the prefix is.
+    expect(worktreeNameFromPath(`/a/${'x'.repeat(100_000)}`)).toBeNull();
+    expect(worktreeNameFromPath('x'.repeat(1_000_000))).toBeNull();
   });
 });
 
@@ -236,11 +263,11 @@ describe('buildLaneUsageLogRow refusals', () => {
   });
 
   it('returns null on a secret-shaped attempt id, work order id or run id', () => {
-    expect(build({ id: 'sk-0123456789abcdefghijklmn' } as Partial<AttemptRecord>)).toBeNull();
-    expect(build({ workOrderId: 'xoxb-0123456789ab' } as Partial<AttemptRecord>)).toBeNull();
+    expect(build({ id: SECRET_SHAPED.openaiKey } as Partial<AttemptRecord>)).toBeNull();
+    expect(build({ workOrderId: SECRET_SHAPED.slackToken } as Partial<AttemptRecord>)).toBeNull();
     expect(buildLaneUsageLogRow({
       attempt: attempt(),
-      runId: 'ghp_0123456789abcdefghijklmn',
+      runId: SECRET_SHAPED.githubToken,
       nowIso: NOW_ISO,
     })).toBeNull();
   });
@@ -294,8 +321,31 @@ describe('parseLaneUsageLogRow', () => {
     expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a/b' })).toBeNull();
     expect(parseLaneUsageLogRow({ ...row, worktreeName: 'wt\u0000' })).toBeNull();
     expect(parseLaneUsageLogRow({ ...row, worktreeName: '..' })).toBeNull();
-    expect(parseLaneUsageLogRow({ ...row, model: 'AKIA0123456789ABCDEF' })).toBeNull();
+    expect(parseLaneUsageLogRow({ ...row, model: SECRET_SHAPED.awsAccessKey })).toBeNull();
     expect(parseLaneUsageLogRow({ ...row, reason: 'line\nbreak' })).toBeNull();
+  });
+
+  it('returns null on an inconsistent costBasis for its billing and cost', () => {
+    const row = build() as LaneUsageLogRow;
+    // metered billing with a cost must derive costBasis 'metered'.
+    expect(parseLaneUsageLogRow({ ...row, billing: 'metered', costUsd: 0.01, costBasis: 'plan-estimate' })).toBeNull();
+    expect(parseLaneUsageLogRow({ ...row, billing: 'metered', costUsd: 0.01, costBasis: 'unknown' })).toBeNull();
+    // no cost must always derive 'unknown'.
+    expect(parseLaneUsageLogRow({ ...row, billing: 'metered', costUsd: null, costBasis: 'metered' })).toBeNull();
+    expect(parseLaneUsageLogRow({ ...row, billing: 'plan', costUsd: null, costBasis: 'plan-estimate' })).toBeNull();
+    // plan billing with a cost must derive 'plan-estimate'.
+    expect(parseLaneUsageLogRow({ ...row, billing: 'plan', costUsd: 0.01, costBasis: 'metered' })).toBeNull();
+    // each consistent combination still parses.
+    expect(parseLaneUsageLogRow({ ...row, billing: 'metered', costUsd: 0.01, costBasis: 'metered' })).not.toBeNull();
+    expect(parseLaneUsageLogRow({ ...row, billing: 'plan', costUsd: 0.01, costBasis: 'plan-estimate' })).not.toBeNull();
+    expect(parseLaneUsageLogRow({ ...row, billing: 'plan', costUsd: null, costBasis: 'unknown' })).not.toBeNull();
+  });
+
+  it('returns null on a worktreeName longer than the text bound', () => {
+    const row = build() as LaneUsageLogRow;
+    expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a'.repeat(512) })).not.toBeNull();
+    expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a'.repeat(513) })).toBeNull();
+    expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a'.repeat(100_000) })).toBeNull();
   });
 
   it('returns null without invoking or propagating a throwing getter', () => {
@@ -334,7 +384,7 @@ describe('serialization', () => {
       runner: { kind: 'opencode', remotePort: 4097, host: 'secret-host-1', hostName: 'secret-host-1', agent: 'implementer', model: 'openai/gpt-6-luna', variant: null },
       usage: meteredUsage({
         sessionId: 'session-1',
-        reason: 'read failed with token ghp_0123456789abcdefghijklmn',
+        reason: `read failed with token ${SECRET_SHAPED.githubToken}`,
       }),
     });
     const line = serializeLaneUsageLogRow(row as LaneUsageLogRow);
@@ -344,7 +394,7 @@ describe('serialization', () => {
     expect(line).not.toContain('secret-host-1');
     expect(line).not.toContain('4097');
     expect(line).not.toContain('session-1');
-    expect(line).not.toContain('ghp_0123456789');
+    expect(line).not.toContain(SECRET_SHAPED.githubToken.slice(0, 8));
     expect(line).not.toContain('briefPackagePath');
     expect(line).not.toContain('manifestPath');
   });

@@ -87,6 +87,7 @@ export class LaneUsageLogFileAdapter implements LaneUsageLogPort {
   private readonly maxRows: number;
   private readonly maxFileBytes: number;
   private readonly memoryRows: LaneUsageLogRow[] = [];
+  private memoryBytes = 0;
 
   constructor(options: LaneUsageLogFileAdapterOptions = {}) {
     const fileName = options.fileName ?? DEFAULT_FILE_NAME;
@@ -145,10 +146,14 @@ export class LaneUsageLogFileAdapter implements LaneUsageLogPort {
           }
           const line = Buffer.from(`${serializeLaneUsageLogRow(checked)}\n`, 'utf8');
           if (file.kind === 'absent') {
-            await writeBytesAtomically(
-              target,
-              Buffer.concat([Buffer.from(`${serializeLaneUsageLogHeader()}\n`, 'utf8'), line]),
-            );
+            // The first append is budgeted too: the header plus the one row
+            // must fit within the byte budget, and at least one row slot
+            // must remain.
+            const initial = Buffer.concat([Buffer.from(`${serializeLaneUsageLogHeader()}\n`, 'utf8'), line]);
+            if (this.maxRows < 1 || initial.length > this.maxFileBytes) {
+              return { outcome: 'refused', reason: 'log-budget-exhausted' };
+            }
+            await writeBytesAtomically(target, initial);
             return { outcome: 'appended' };
           }
           const parsed = parseFile(file.bytes);
@@ -185,7 +190,15 @@ export class LaneUsageLogFileAdapter implements LaneUsageLogPort {
     if (this.memoryRows.length >= this.maxRows) {
       return { outcome: 'refused', reason: 'log-budget-exhausted' };
     }
+    // The in-memory store honours the same byte budget as the file: the
+    // serialized rows together may never exceed it.
+    const serialized = serializeLaneUsageLogRow(row);
+    const rowBytes = serialized === null ? Number.POSITIVE_INFINITY : Buffer.byteLength(`${serialized}\n`, 'utf8');
+    if (serialized === null || this.memoryBytes + rowBytes > this.maxFileBytes) {
+      return { outcome: 'refused', reason: 'log-budget-exhausted' };
+    }
     this.memoryRows.push(row);
+    this.memoryBytes += rowBytes;
     return { outcome: 'appended' };
   }
 

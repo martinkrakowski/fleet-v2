@@ -21,13 +21,18 @@ export type AuthoredBriefResult =
   | { readonly outcome: 'unavailable'; readonly reason: string };
 
 export interface BriefAuthorSessionRequest {
-  /** brief-author/<workOrderId>/<laneId>@<base12> */
+  /** brief-author/<workOrderId>/<laneId>@<base12>, with an optional '/retry' suffix on the retry call. */
   readonly sessionKey: string;
   readonly workOrderId: string;
   readonly laneId: string;
   readonly baseCommit: string;
   readonly checkoutPath: string;
   readonly briefsDir: string;
+  /**
+   * The single permitted retry: the session key must end '/retry' and the
+   * session's files use the '__retry' stem.
+   */
+  readonly retry?: true;
   /** The rendered fact-pack prompt. */
   readonly prompt: string;
   readonly model: string;

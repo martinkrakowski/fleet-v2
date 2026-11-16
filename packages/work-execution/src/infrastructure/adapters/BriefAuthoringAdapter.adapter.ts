@@ -11,6 +11,10 @@
  * written (plus a short-lived `.intent.json.lock`), inside the briefs directory. A repeat returns the recorded answer;
  * a cut-short session leaves its intent and no answer, so the next call re-runs.
  * Results carry codes only: never a path, the answer or a secret.
+ *
+ * A single retry session uses the `__retry` stem, is admitted only after the
+ * first answer is recorded, and its answer is deleted when the first attempt
+ * runs again.
  */
 
 import { constants as fsConstants, promises as fs } from 'node:fs';
@@ -51,6 +55,7 @@ const GIT_TIMEOUT_MS = 30_000;
 /** Mirrors the fact pack's prompt cap. */
 const MAX_PROMPT_BYTES = 300_000;
 const MAX_STEM_LENGTH = 120;
+const RETRY_STEM_SUFFIX = '__retry';
 const COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
 const PLACEHOLDER_PATTERN = /\{([^{}]*)\}/g;
 const ALLOWED_PLACEHOLDERS: ReadonlySet<string> = new Set([
@@ -130,10 +135,15 @@ function resolveTimeout(requested: number | undefined): number {
 /** The safe file stem for a valid request, or null; the key must match the ids and commit. */
 function sessionStem(request: BriefAuthorSessionRequest): string | null {
   const { sessionKey, workOrderId, laneId, baseCommit, checkoutPath, briefsDir, prompt, model } = request;
+  const canonical = `brief-author/${workOrderId}/${laneId}@${baseCommit.slice(0, 12)}`;
+  const retry = request.retry;
+  const keyMatches = retry === undefined
+    ? sessionKey === canonical
+    : retry === true && sessionKey === `${canonical}/retry`;
   if (![sessionKey, workOrderId, laneId, checkoutPath, briefsDir, prompt, model].every(isNonEmpty)
     || !COMMIT_PATTERN.test(baseCommit) || !path.isAbsolute(briefsDir)
     || Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES
-    || sessionKey !== `brief-author/${workOrderId}/${laneId}@${baseCommit.slice(0, 12)}`) {
+    || !keyMatches) {
     return null;
   }
   const stem = `brief-author__${safeSegment(workOrderId)}__${safeSegment(laneId)}@${baseCommit.slice(0, 12)}`;
@@ -143,6 +153,22 @@ function sessionStem(request: BriefAuthorSessionRequest): string | null {
 /** True when the path is a symlink; a link may point outside the briefs directory. */
 async function isSymbolicLink(filePath: string): Promise<boolean> {
   return fs.lstat(filePath).then((stat) => stat.isSymbolicLink(), () => false);
+}
+
+/** True only when the first attempt's answer is recorded as a regular file (never follow a link). */
+async function firstAnswerRecorded(briefsDir: string, baseStem: string): Promise<boolean> {
+  const stat = await fs.lstat(path.join(briefsDir, `${baseStem}.answer.md`)).catch(() => null);
+  return stat !== null && stat.isFile();
+}
+
+/**
+ * Delete a recorded retry answer; true on success, false when it rejects.
+ * Without `recursive`, fs.rm removes a file or a symlink entry, never a
+ * link's target, and rejects on a directory — unknown is never success.
+ */
+async function clearRetryAnswer(briefsDir: string, baseStem: string): Promise<boolean> {
+  return fs.rm(path.join(briefsDir, `${baseStem}${RETRY_STEM_SUFFIX}.answer.md`), { force: true })
+    .then(() => true, () => false);
 }
 
 /**
@@ -351,14 +377,21 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
    * that as an unknown outcome, never as an empty brief.
    */
   async authorBriefSession(request: BriefAuthorSessionRequest): Promise<BriefAuthorSessionResult> {
-    const stem = sessionStem(request);
-    if (stem === null) {
+    const baseStem = sessionStem(request);
+    if (baseStem === null) {
       return unavailable('session-command-invalid');
     }
     // A symlink anywhere along briefsDir (the leaf or any parent) redirects every
     // read and write outside the intended directory; refuse before touching the
     // filesystem through the link.
     if (await pathCrossesSymbolicLink(request.briefsDir)) {
+      return unavailable('session-command-invalid');
+    }
+    const retry = request.retry === true;
+    const stem = retry ? `${baseStem}${RETRY_STEM_SUFFIX}` : baseStem;
+    // A retry belongs to ONE first answer: without a recorded first answer the
+    // retry is refused (and a recorded retry answer is never replayed).
+    if (retry && !(await firstAnswerRecorded(request.briefsDir, baseStem))) {
       return unavailable('session-command-invalid');
     }
     const base = path.join(request.briefsDir, stem);
@@ -389,6 +422,11 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     // running the seat.
     const claimWindowMs = timeoutMs + INTENT_CLAIM_SLACK_MS;
     if (!(await claimIntent(request.briefsDir, `${base}.intent.json`, request.sessionKey, claimWindowMs))) {
+      return unavailable('session-failed');
+    }
+    // A first attempt that runs the seat deletes the recorded retry answer
+    // first, so an old retry answer never survives beside a new first answer.
+    if (!retry && !(await clearRetryAnswer(request.briefsDir, baseStem))) {
       return unavailable('session-failed');
     }
     const pinned = await this.checkPinnedCheckout(executor, request);

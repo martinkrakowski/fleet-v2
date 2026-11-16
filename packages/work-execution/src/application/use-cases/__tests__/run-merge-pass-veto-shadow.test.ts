@@ -511,64 +511,6 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     expect(w.vetoAdvice.calls).toBe(0);
   });
 
-  it('a missing queue writer never calls the veto ports and never reports the row stored', async () => {
-    const entry = makeEntry();
-    const w = wire([entry], greenForge, { bindVetoPorts: true });
-    // Rebuild the use case with the veto ports bound but no queue writer:
-    // the veto answer could be asked, yet nothing could ever be recorded.
-    let ulid = 0;
-    const useCase = new RunMergePassUseCase({
-      queue: w.queue,
-      forgeRead: forgeReadFake(greenForge),
-      verification: verificationFake(),
-      journal: w.journal as LaneRunJournalPort,
-      halt: haltFake,
-      newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
-      nowIso: () => NOW,
-      vetoAdvice: w.vetoAdvice,
-      vetoState: w.vetoState,
-    });
-
-    const result = await useCase.runMergePass(w.request);
-
-    expect(result.outcome).toBe('completed');
-    expect(result.entries[0].decision).toBe('no-action');
-    expect(result.entries[0].reasonCode).toBe('veto-writer-absent');
-    expect(w.vetoState.calls).toBe(0); // no ask that could not be recorded
-    expect(w.vetoAdvice.calls).toBe(0);
-    expect(storedVeto(w.queue, entry.entryId)).toBeNull();
-  });
-
-  it('returns budget-exhausted without calling veto ports when budget is spent', async () => {
-    const entry = makeEntry();
-    // The clock lapses the deadline right after the forge read: the
-    // enter-ready write succeeds, then the veto budget guard aborts.
-    const w = wire([entry], greenForge, {});
-    // Rebuild with a clock that lapses once the forge has been read.
-    const forge = forgeReadFake(greenForge);
-    let ulid = 0;
-    const useCase = new RunMergePassUseCase({
-      queue: w.queue,
-      queueWriter: w.queue,
-      forgeRead: forge,
-      verification: verificationFake(),
-      journal: w.journal as LaneRunJournalPort,
-      halt: haltFake,
-      newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
-      nowIso: () => (forge.calls === 0 ? NOW : '2026-11-01T12:20:00.000Z'),
-      vetoAdvice: w.vetoAdvice,
-      vetoState: w.vetoState,
-    });
-    const request: RunMergePassRequest = { ...w.request, policy: makePolicy({}) };
-
-    const result = await useCase.runMergePass(request);
-
-    expect(result.outcome).toBe('budget-exhausted');
-    expect(result.reasonCode).toBeNull();
-    expect(w.vetoState.calls).toBe(0);
-    expect(w.vetoAdvice.calls).toBe(0);
-  });
-
   it('treats malformed advice or throwing getter as unknown', async () => {
     const malformed: Array<MergeVetoAdvice | Error> = [
       null as unknown as MergeVetoAdvice,
@@ -605,13 +547,115 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     expect(storedVeto(wThrowing.queue, entry.entryId)).toMatchObject({ outcome: 'unknown' });
   });
 
-  it('refuses entry when decisionReceiptId fails record validation', async () => {
+  it('a vetoState that throws or returns null records unknown and skips adviseMergeVeto', async () => {
+    const cases: Array<MergeVetoStateResult | Error> = [
+      new Error('state down'),
+      null as unknown as MergeVetoStateResult,
+    ];
+    for (const [index, stateResult] of cases.entries()) {
+      const entry = makeEntry({ pullRequest: 300 + index });
+      const w = wire([entry], greenForge, { vetoStateResult: stateResult });
+      const first = await w.useCase.runMergePass(w.request);
+      expect(first.outcome).toBe('completed');
+      expect(first.entries[0].reasonCode).toBe('veto');
+      expect(w.vetoState.calls).toBe(1);
+      expect(w.vetoAdvice.calls).toBe(0);
+      expect(storedVeto(w.queue, entry.entryId)).toEqual({
+        outcome: 'unknown',
+        confidence: null,
+        mode: 'shadow',
+        decisionReceiptId: null,
+      });
+      const second = await w.useCase.runMergePass(w.request);
+      expect(second.entries[0].reasonCode).toBe('would-merge');
+      expect(w.vetoState.calls).toBe(1);
+    }
+  });
+
+  it('a null decisionReceiptId in an answered advice is accepted as no receipt', async () => {
     const entry = makeEntry();
     const w = wire([entry], greenForge, {
       vetoAdviceResult: {
         status: 'answered',
         choice: 'merge-safe',
-        confidence: 0.9,
+        confidence: 0.7,
+        decisionReceiptId: null,
+        mode: 'shadow',
+      } as unknown as MergeVetoAdvice,
+    });
+    await w.useCase.runMergePass(w.request);
+    expect(storedVeto(w.queue, entry.entryId)).toEqual({
+      outcome: 'merge-safe',
+      confidence: 0.7,
+      mode: 'shadow',
+      decisionReceiptId: null,
+    });
+  });
+
+  /** After the enter-ready write, the next queue write is refused or throws. */
+  function failVetoWrite(queue: Wiring['queue'], how: 'refused' | 'throws'): void {
+    const original = queue.applyMergeTransition.bind(queue);
+    let writes = 0;
+    (queue as unknown as Record<string, unknown>).applyMergeTransition = async (
+      request: Parameters<MergeQueueRepositoryPort['applyMergeTransition']>[0],
+    ) => {
+      writes += 1;
+      if (writes >= 2) {
+        if (how === 'throws') {
+          throw new Error('store down');
+        }
+        return { outcome: 'refused', reason: 'revision-conflict' };
+      }
+      return original(request);
+    };
+  }
+
+  /** The pass went on to the shadow merge row; nothing was merged or stored as a veto. */
+  function expectUnrecordedVetoReachedWouldMerge(
+    w: Wiring,
+    entryId: string,
+    result: Awaited<ReturnType<RunMergePassUseCase['runMergePass']>>,
+  ): void {
+    expect(result.outcome).toBe('completed');
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-merge');
+    expect(w.vetoAdvice.calls).toBeLessThanOrEqual(1);
+    expect(storedVeto(w.queue, entryId)).toBeNull();
+    const stored = w.queue.records.get(entryId) as MergeQueueEntryRecord;
+    expect(stored.state).not.toBe('merged');
+    expect(stored.mergeCommitOid).toBeNull();
+  }
+
+  it('a veto that cannot be recorded (writer absent) is unknown for the pass and reaches would-merge', async () => {
+    const entry = makeEntry();
+    const w = wire([entry]);
+    let ulid = 0;
+    const useCase = new RunMergePassUseCase({
+      queue: w.queue,
+      forgeRead: forgeReadFake(greenForge),
+      verification: verificationFake(),
+      journal: w.journal as LaneRunJournalPort,
+      halt: haltFake,
+      newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
+      nowIso: () => NOW,
+      vetoAdvice: w.vetoAdvice,
+      vetoState: w.vetoState,
+    });
+
+    const result = await useCase.runMergePass(w.request);
+
+    expectUnrecordedVetoReachedWouldMerge(w, entry.entryId, result);
+    expect(w.vetoState.calls).toBe(0); // no ask that could never be recorded
+    expect(w.vetoAdvice.calls).toBe(0);
+  });
+
+  it('a veto entry the record validation refuses is unknown for the pass and reaches would-merge', async () => {
+    const entry = makeEntry();
+    const w = wire([entry], greenForge, {
+      vetoAdviceResult: {
+        status: 'answered',
+        choice: 'hold-for-human',
+        confidence: 0.99,
         decisionReceiptId: `receipt-${'x'.repeat(300)}`,
         mode: 'shadow',
       },
@@ -619,35 +663,101 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
 
     const result = await w.useCase.runMergePass(w.request);
 
-    expect(result.entries[0].decision).toBe('no-action');
-    expect(result.entries[0].reasonCode).toBe('entry-refused');
-    expect(storedVeto(w.queue, entry.entryId)).toBeNull();
+    expectUnrecordedVetoReachedWouldMerge(w, entry.entryId, result);
+    expect(w.vetoAdvice.calls).toBe(1);
   });
 
-  it('returns persist failure reasonCode when CAS write fails', async () => {
+  it('a veto write that fails (refused or throwing) is unknown for the pass and reaches would-merge', async () => {
+    for (const how of ['refused', 'throws'] as const) {
+      const entry = makeEntry({ pullRequest: 400 + (how === 'refused' ? 0 : 1) });
+      const w = wire([entry]);
+      failVetoWrite(w.queue, how);
+
+      const result = await w.useCase.runMergePass({ ...w.request });
+
+      expect(w.vetoAdvice.calls).toBe(1); // asked once; the write then failed
+      expect(result.outcome).toBe('completed');
+      expect(result.entries[0].decision).toBe('journalled');
+      expect(result.entries[0].reasonCode).toBe('would-merge');
+      expect(storedVeto(w.queue, entry.entryId)).toBeNull();
+      const stored = w.queue.records.get(entry.entryId) as MergeQueueEntryRecord;
+      expect(stored.mergeCommitOid).toBeNull();
+    }
+  });
+
+  it('a recorded veto is never converted into a pass: a stored hold-for-human stays on the entry', async () => {
+    const entry = makeEntry();
+    const w = wire([entry], greenForge, {
+      vetoAdviceResult: {
+        status: 'answered',
+        choice: 'hold-for-human',
+        confidence: 0.95,
+        decisionReceiptId: 'receipt-hold',
+        mode: 'shadow',
+      },
+    });
+    const first = await w.useCase.runMergePass(w.request);
+    expect(first.entries[0].reasonCode).toBe('veto');
+    expect(storedVeto(w.queue, entry.entryId)).toMatchObject({ outcome: 'hold-for-human' });
+  });
+
+  /** A clock that lapses the deadline once `lapsed()` is true. */
+  function lapsingUseCase(w: Wiring, lapsed: () => boolean): RunMergePassUseCase {
+    let ulid = 0;
+    return new RunMergePassUseCase({
+      queue: w.queue,
+      queueWriter: w.queue,
+      forgeRead: forgeReadFake(greenForge),
+      verification: verificationFake(),
+      journal: w.journal as LaneRunJournalPort,
+      halt: haltFake,
+      newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
+      nowIso: () => (lapsed() ? '2026-11-01T12:20:00.000Z' : NOW),
+      vetoAdvice: w.vetoAdvice,
+      vetoState: w.vetoState,
+    });
+  }
+
+  it('returns budget-exhausted without calling veto ports when the budget lapses before the state read', async () => {
     const entry = makeEntry();
     const w = wire([entry]);
-    // The enter-ready write lands; the veto write is refused by the CAS.
-    const writer = w.queue.applyMergeTransition as unknown as (
-      request: Parameters<MergeQueueRepositoryPort['applyMergeTransition']>[0],
-    ) => Promise<{ outcome: string; reason?: string }>;
+    // The deadline lapses once the enter-ready write has landed, so the veto
+    // step's own first budget guard is the next one to run.
+    const original = w.queue.applyMergeTransition.bind(w.queue);
     let writes = 0;
-    const original = writer.bind(w.queue);
     (w.queue as unknown as Record<string, unknown>).applyMergeTransition = async (
       request: Parameters<MergeQueueRepositoryPort['applyMergeTransition']>[0],
     ) => {
+      const result = await original(request);
       writes += 1;
-      if (writes >= 2) {
-        return { outcome: 'refused', reason: 'revision-conflict' };
-      }
-      return original(request);
+      return result;
     };
+    const useCase = lapsingUseCase(w, () => writes >= 1);
+    // Policy shadow off: the open-intent sweep, which has its own budget
+    // guards, does not run, so only the veto step's guard can abort here.
+    const request: RunMergePassRequest = { ...w.request, policy: makePolicy({ shadow: false }) };
 
-    const result = await w.useCase.runMergePass(w.request);
+    const result = await useCase.runMergePass(request);
 
-    expect(w.vetoAdvice.calls).toBe(1); // the answer was asked, the write failed
-    expect(result.entries[0].decision).toBe('no-action');
-    expect(result.entries[0].reasonCode).toBe('persist-conflict');
+    expect(writes).toBe(1);
+    expect(result.outcome).toBe('budget-exhausted');
+    expect(result.reasonCode).toBeNull();
+    expect(w.vetoState.calls).toBe(0);
+    expect(w.vetoAdvice.calls).toBe(0);
+  });
+
+  it('returns budget-exhausted without asking advice when the budget lapses after the state read', async () => {
+    const entry = makeEntry();
+    const w = wire([entry]);
+    const useCase = lapsingUseCase(w, () => w.vetoState.calls >= 1);
+    const request: RunMergePassRequest = { ...w.request, policy: makePolicy({ shadow: false }) };
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.outcome).toBe('budget-exhausted');
+    expect(w.vetoState.calls).toBe(1);
+    expect(w.vetoAdvice.calls).toBe(0);
+    expect(storedVeto(w.queue, entry.entryId)).toBeNull();
   });
 
   it('a null request or one without a repository is refused, never thrown on', async () => {

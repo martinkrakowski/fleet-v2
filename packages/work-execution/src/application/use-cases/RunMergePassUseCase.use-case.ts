@@ -115,7 +115,7 @@ function isValidVetoAdvice(advice: unknown): advice is {
   readonly status: 'answered';
   readonly choice: 'merge-safe' | 'hold-for-human';
   readonly confidence: number;
-  readonly decisionReceiptId?: string;
+  readonly decisionReceiptId?: string | null;
 } {
   try {
     if (!isPlainObject(advice) || advice.status !== 'answered') {
@@ -129,7 +129,7 @@ function isValidVetoAdvice(advice: unknown): advice is {
       return false;
     }
     const receipt: unknown = advice.decisionReceiptId;
-    return receipt === undefined || (typeof receipt === 'string' && receipt.length > 0);
+    return receipt === undefined || receipt === null || (typeof receipt === 'string' && receipt.length > 0);
   } catch {
     return false;
   }
@@ -361,17 +361,44 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
 
     if (request.policy.shadow === true) {
-      // The action journaled now completes its own open intent with its real
-      // reason (journalShadowAct); every other open shadow intent is closed.
-      const acting =
-        decision.kind === 'act' && decision.execution === 'shadow'
-          ? decision.action === 'premerge-carry'
-            ? 'post-status'
-            : decision.action
-          : null;
-      await this.closeOpenShadowIntents(request, current, acting);
+      await this.closeOpenShadowIntents(request, current, this.actingShadowAction(decision));
+    }
+    if (decision.kind === 'act' && decision.action === 'veto' && this.shadowVetoBound(request)) {
+      const vetoReport = await this.performShadowVeto(request, current, decision.expectedHeadOid);
+      if (vetoReport !== null) {
+        return vetoReport;
+      }
+      // The veto row could not be recorded: it is unknown for this pass and
+      // never blocks (D-JV1), so the pass moves on to the next row exactly as
+      // if the veto had answered unknown. Nothing is stored, nothing re-asked.
+      const unrecorded: MergeStepFacts = {
+        ...facts,
+        veto: { outcome: 'unknown', confidence: null, mode: 'shadow', decisionReceiptId: null },
+      };
+      decision = decideMergeStep(current, unrecorded, request.policy, this.deps.nowIso());
+      if (request.policy.shadow === true) {
+        await this.closeOpenShadowIntents(request, current, this.actingShadowAction(decision));
+      }
     }
     return this.actOnDecision(request, current, decision);
+  }
+
+  /** The shadow action this decision journals now, if any (its own open intent is completed, not closed). */
+  private actingShadowAction(decision: MergeStepDecision): string | null {
+    return decision.kind === 'act' && decision.execution === 'shadow'
+      ? decision.action === 'premerge-carry'
+        ? 'post-status'
+        : decision.action
+      : null;
+  }
+
+  /** Shadow mode with both advisory veto ports bound (OG-16a). */
+  private shadowVetoBound(request: RunMergePassRequest): boolean {
+    return (
+      request.policy.veto.mode === 'shadow' &&
+      this.deps.vetoAdvice !== undefined &&
+      this.deps.vetoState !== undefined
+    );
   }
 
   /** One action per entry per tick (plan §3.3); shadow mode journals, live defers. */
@@ -386,14 +413,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
         return this.report(entry, 'no-action', decision.action, null);
       }
       if (decision.action === 'veto') {
-        if (
-          request.policy.veto.mode === 'shadow' &&
-          this.deps.vetoAdvice !== undefined &&
-          this.deps.vetoState !== undefined
-        ) {
-          return this.performShadowVeto(request, entry, decision.expectedHeadOid);
-        }
         // Live, off or an unbound port pair: the veto row stays a no-action.
+        // (The bound shadow veto is performed by `actOnEntry`.)
         return this.report(entry, 'no-action', 'veto', null);
       }
       if (decision.execution === 'live') {
@@ -428,7 +449,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
     request: RunMergePassRequest,
     entry: MergeQueueEntryRecord,
     verifiedHeadOid: string,
-  ): Promise<MergePassEntryReport> {
+  ): Promise<MergePassEntryReport | null> {
     const unknownRecord: MergeQueueVetoRecord = {
       outcome: 'unknown',
       confidence: null,
@@ -438,11 +459,10 @@ export class RunMergePassUseCase implements RunMergePassPort {
     const vetoState = this.deps.vetoState as Pick<MergeVetoStatePort, 'readMergeVetoState'>;
     const vetoAdvice = this.deps.vetoAdvice as Pick<MergeVetoPort, 'adviseMergeVeto'>;
 
-    // Without a queue writer the veto row cannot be stored; asking the ports
-    // anyway would report a veto that was never recorded and ask the same
-    // advice again on every later pass, so neither port is called here.
+    // Without a queue writer the veto row cannot be stored; neither port is
+    // called, and `null` tells the caller the veto is unknown for this pass.
     if (this.deps.queueWriter === undefined) {
-      return this.report(entry, 'no-action', 'veto-writer-absent', null);
+      return null;
     }
 
     this.ensureBudget(request);
@@ -500,19 +520,22 @@ export class RunMergePassUseCase implements RunMergePassPort {
     return this.persistShadowVeto(request, entry, record);
   }
 
-  /** Build and persist one veto row; always reports `no-action` / `veto`. */
+  /**
+   * Build and persist one veto row. Reports `no-action` / `veto` once the row
+   * is stored; `null` when it could not be (refused entry, failed write).
+   */
   private async persistShadowVeto(
     request: RunMergePassRequest,
     entry: MergeQueueEntryRecord,
     vetoRecord: MergeQueueVetoRecord,
-  ): Promise<MergePassEntryReport> {
+  ): Promise<MergePassEntryReport | null> {
     const built = buildVetoEntry(entry, vetoRecord);
     if (!built.ok) {
-      return this.report(entry, 'no-action', 'entry-refused', null);
+      return null;
     }
     const persisted = await this.persist(request, entry, built.record, null, null);
-    if (persisted.status === 'failed') {
-      return this.report(entry, 'no-action', persisted.reasonCode, null);
+    if (persisted.status !== 'written') {
+      return null;
     }
     return this.report(entry, 'no-action', 'veto', null);
   }

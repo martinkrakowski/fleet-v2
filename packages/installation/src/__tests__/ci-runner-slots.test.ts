@@ -184,6 +184,43 @@ describe('parseInstallation hosts.<name>.ciRunnerSlots (OG-28a)', () => {
     expect(unitRead).toBe(false);
   });
 
+  it('refuses a throwing getter at an array index without invoking it', () => {
+    let reads = 0;
+    const slots: unknown[] = [];
+    Object.defineProperty(slots, 0, {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        throw new Error('the getter must never run');
+      },
+    });
+    expect(parseInstallation(withSlots('lane-host', slots))).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.ciRunnerSlots[0]: must be an object'],
+    });
+    expect(reads).toBe(0);
+  });
+
+  it('refuses a hole in the ciRunnerSlots array', () => {
+    const slots: unknown[] = [];
+    slots.length = 1;
+    expect(parseInstallation(withSlots('lane-host', slots))).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.ciRunnerSlots[0]: must be an object'],
+    });
+  });
+
+  it('matches slot name and unit patterns against the whole string', () => {
+    for (const bad of ['primary\n', 'primary\r\n', '\nprimary']) {
+      const r = parseInstallation(withSlots('lane-host', [{ name: bad, unit: SLOT.unit }]));
+      expect(r.ok).toBe(false);
+    }
+    for (const bad of ['fleet-ci.service\n', 'fleet-ci.service\r\n', '\nfleet-ci.service']) {
+      const r = parseInstallation(withSlots('lane-host', [{ name: SLOT.name, unit: bad }]));
+      expect(r.ok).toBe(false);
+    }
+  });
+
   it('requires name and unit on each ciRunnerSlots entry', () => {
     expect(parseInstallation(withSlots('lane-host', [{ unit: SLOT.unit }]))).toEqual({
       ok: false,

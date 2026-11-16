@@ -1568,55 +1568,90 @@ function parseHostCiRunnerSlots(
   }
   const seenNames = new Set<string>();
   const slots: CiRunnerSlotSection[] = [];
-  for (const [index, item] of field.value.entries()) {
+  // Index reads go through own property descriptors: a getter at an index, or
+  // a hole, is refused and never invoked.
+  for (let index = 0; index < field.value.length; index += 1) {
     const slotPath = `${fieldPath}[${index}]`;
-    if (!isJsonObject(item)) {
-      errors.push(`${slotPath}: must be an object`);
-      continue;
-    }
-    collectUnknownKeys(item, CI_RUNNER_SLOT_KEYS, slotPath, errors);
-    let name: string | undefined;
-    const nameField = readOptionalDataField(item, 'name');
-    if (nameField.kind === 'absent') {
-      errors.push(`${slotPath}.name: required`);
-    } else if (nameField.kind === 'accessor') {
-      errors.push(`${slotPath}.name: must be a plain data property`);
-    } else {
-      const value = nameField.value;
-      if (typeof value !== 'string' || value.trim() === '') {
-        errors.push(`${slotPath}.name: must be a non-empty string`);
-      } else if (!CI_RUNNER_SLOT_NAME_PATTERN.test(value)) {
-        errors.push(`${slotPath}.name: must match ^[a-z0-9][a-z0-9._-]{0,63}$`);
-      } else if (seenNames.has(value)) {
-        errors.push(`${slotPath}.name: duplicate slot name`);
-      } else {
-        seenNames.add(value);
-        name = value;
-      }
-    }
-    let unit: string | undefined;
-    const unitField = readOptionalDataField(item, 'unit');
-    if (unitField.kind === 'absent') {
-      errors.push(`${slotPath}.unit: required`);
-    } else if (unitField.kind === 'accessor') {
-      errors.push(`${slotPath}.unit: must be a plain data property`);
-    } else {
-      const value = unitField.value;
-      if (typeof value !== 'string' || value.trim() === '') {
-        errors.push(`${slotPath}.unit: must be a non-empty string`);
-      } else if (value.startsWith('-') || !CI_RUNNER_SLOT_UNIT_PATTERN.test(value)) {
-        errors.push(
-          `${slotPath}.unit: must be a systemd service unit name ending in .service and not starting with "-"`,
-        );
-      } else {
-        unit = value;
-      }
-    }
-    if (name !== undefined && unit !== undefined) {
-      slots.push({ name, unit });
+    const descriptor = Object.getOwnPropertyDescriptor(field.value, index);
+    const item: unknown = descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+    const slot = parseCiRunnerSlotEntry(item, slotPath, seenNames, errors);
+    if (slot !== undefined) {
+      slots.push(slot);
     }
   }
   return slots;
+}
+
+function parseCiRunnerSlotEntry(
+  item: unknown,
+  slotPath: string,
+  seenNames: Set<string>,
+  errors: string[],
+): CiRunnerSlotSection | undefined {
+  if (!isJsonObject(item)) {
+    errors.push(`${slotPath}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(item, CI_RUNNER_SLOT_KEYS, slotPath, errors);
+  const name = readCiRunnerSlotName(item, slotPath, seenNames, errors);
+  const unit = readCiRunnerSlotUnit(item, slotPath, errors);
+  return name !== undefined && unit !== undefined ? { name, unit } : undefined;
+}
+
+function readCiRunnerSlotName(
+  item: JsonObject,
+  slotPath: string,
+  seenNames: Set<string>,
+  errors: string[],
+): string | undefined {
+  const field = readOptionalDataField(item, 'name');
+  if (field.kind === 'absent') {
+    errors.push(`${slotPath}.name: required`);
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${slotPath}.name: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (typeof value !== 'string' || value.trim() === '') {
+    errors.push(`${slotPath}.name: must be a non-empty string`);
+    return undefined;
+  }
+  if (!CI_RUNNER_SLOT_NAME_PATTERN.test(value)) {
+    errors.push(`${slotPath}.name: must match ^[a-z0-9][a-z0-9._-]{0,63}$`);
+    return undefined;
+  }
+  if (seenNames.has(value)) {
+    errors.push(`${slotPath}.name: duplicate slot name`);
+    return undefined;
+  }
+  seenNames.add(value);
+  return value;
+}
+
+function readCiRunnerSlotUnit(item: JsonObject, slotPath: string, errors: string[]): string | undefined {
+  const field = readOptionalDataField(item, 'unit');
+  if (field.kind === 'absent') {
+    errors.push(`${slotPath}.unit: required`);
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${slotPath}.unit: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (typeof value !== 'string' || value.trim() === '') {
+    errors.push(`${slotPath}.unit: must be a non-empty string`);
+    return undefined;
+  }
+  if (value.startsWith('-') || !CI_RUNNER_SLOT_UNIT_PATTERN.test(value)) {
+    errors.push(
+      `${slotPath}.unit: must be a systemd service unit name ending in .service and not starting with "-"`,
+    );
+    return undefined;
+  }
+  return value;
 }
 
 function parseHost(

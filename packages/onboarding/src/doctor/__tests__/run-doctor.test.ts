@@ -370,8 +370,9 @@ describe('runDoctor', () => {
       'ConnectTimeout=10',
       'verifier-host',
       '--',
-      'claude',
-      '--version',
+      'sh',
+      '-c',
+      "''\\''claude'\\'' '\\''--version'\\'''",
     ]);
   });
 

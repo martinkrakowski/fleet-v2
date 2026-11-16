@@ -350,7 +350,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
   }
 
   /** Awaits one attention call and answers whether its outcome is a success. */
-  private async attentionCall(call: () => Promise<unknown>, outcomes: readonly string[] = ['raised', 'refreshed', 'reopened', 'cleared', 'unchanged', 'not-found']): Promise<boolean> {
+  private async attentionCall(call: () => Promise<unknown>, outcomes: readonly string[] = ['raised', 'refreshed', 'reopened']): Promise<boolean> {
     try {
       const answer: unknown = await call();
       if (!isPlainObject(answer)) {
@@ -422,6 +422,9 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
       !listed.failed &&
       !evaluation.truncated &&
       openItems.length <= OPEN_LIST_MAX;
+    if (!clearable && listed.kind === 'ok' && !listed.failed && openItems.length > OPEN_LIST_MAX) {
+      attentionFailures += 1;
+    }
     if (clearable) {
       for (const item of openItems) {
         if (budgetExhausted) {

@@ -13,8 +13,8 @@
  * Results carry codes only: never a path, the answer or a secret.
  *
  * A single retry session uses the `__retry` stem, is admitted only after the
- * first answer is recorded, and its answer is deleted only once a re-run of
- * the first attempt has successfully recorded a new first answer.
+ * first answer is recorded, and its answer is deleted by a first attempt
+ * BEFORE that attempt checks the checkout or runs the seat.
  */
 
 import { constants as fsConstants, promises as fs } from 'node:fs';
@@ -332,6 +332,33 @@ async function claimIntent(
   }).catch(() => false);
 }
 
+interface SeatSession {
+  readonly request: BriefAuthorSessionRequest;
+  readonly base: string;
+  readonly argv: readonly string[];
+  readonly timeoutMs: number;
+  readonly maxAnswerBytes: number;
+}
+
+/** Write the prompt file; false when it is a symlink or the write fails. */
+async function promptWritten(promptPath: string, prompt: string): Promise<boolean> {
+  return !(await isSymbolicLink(promptPath))
+    && (await writeFileNoFollow(promptPath, prompt).then(() => true, () => false));
+}
+
+type SeatRun = Awaited<ReturnType<CommandExecutorPort['run']>>;
+
+/** The refusal code for a seat run that did not produce a usable answer, or null. */
+function classifySeatRun(run: SeatRun | null, maxAnswerBytes: number): BriefAuthorSessionUnavailable | null {
+  if (run === null) return 'session-failed';
+  if (run.error !== undefined) {
+    return /timeout|maxBufferBytes/.test(run.error) ? 'session-timeout' : 'session-failed';
+  }
+  if (run.exitCode !== 0) return 'session-failed';
+  if (run.stdout.trim().length === 0) return 'session-empty';
+  return Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes ? 'session-output-too-large' : null;
+}
+
 export class BriefAuthoringAdapter implements BriefAuthoringPort {
   constructor(private readonly options?: BriefAuthoringAdapterOptions) {}
 
@@ -378,41 +405,34 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
    */
   async authorBriefSession(request: BriefAuthorSessionRequest): Promise<BriefAuthorSessionResult> {
     const baseStem = sessionStem(request);
-    if (baseStem === null) {
-      return unavailable('session-command-invalid');
-    }
     // A symlink anywhere along briefsDir (the leaf or any parent) redirects every
     // read and write outside the intended directory; refuse before touching the
     // filesystem through the link.
-    if (await pathCrossesSymbolicLink(request.briefsDir)) {
+    if (baseStem === null || await pathCrossesSymbolicLink(request.briefsDir)) {
       return unavailable('session-command-invalid');
     }
     const retry = request.retry === true;
-    const stem = retry ? `${baseStem}${RETRY_STEM_SUFFIX}` : baseStem;
     // A retry belongs to ONE first answer: without a recorded first answer the
-    // retry is refused (and a recorded retry answer is never replayed).
+    // retry is refused first (and a recorded retry answer is never replayed).
     if (retry && !(await firstAnswerRecorded(request.briefsDir, baseStem))) {
       return unavailable('session-command-invalid');
     }
-    const base = path.join(request.briefsDir, stem);
-    const answerPath = `${base}.answer.md`;
+    const base = path.join(request.briefsDir, retry ? `${baseStem}${RETRY_STEM_SUFFIX}` : baseStem);
     const maxAnswerBytes = this.options?.maxAnswerBytes ?? DEFAULT_MAX_ANSWER_BYTES;
     // Recorded outcome first: a completed session replays without any seat
     // configuration, executor or checkout check.
-    const recorded = await readRecordedAnswer(answerPath, maxAnswerBytes);
-    if (recorded === 'too-large') {
-      return unavailable('session-output-too-large');
-    }
+    const recorded = await readRecordedAnswer(`${base}.answer.md`, maxAnswerBytes);
     if (recorded !== null) {
-      return { outcome: 'answered', answer: recorded };
+      return recorded === 'too-large'
+        ? unavailable('session-output-too-large')
+        : { outcome: 'answered', answer: recorded };
     }
     const { seatCommand, executor } = this.options ?? {};
     if (seatCommand === undefined || executor === undefined) {
       return unavailable('seat-command-not-configured');
     }
-    const promptPath = `${base}.prompt.md`;
     const argv = renderSeatArgv(seatCommand, {
-      promptFile: promptPath, model: request.model, variant: request.variant, agent: request.agent,
+      promptFile: `${base}.prompt.md`, model: request.model, variant: request.variant, agent: request.agent,
       workOrderId: request.workOrderId, laneId: request.laneId, baseCommit: request.baseCommit,
     });
     if (argv === null) return unavailable('session-command-invalid');
@@ -420,14 +440,26 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     // The exclusive intent claim is what grants the seat run: a concurrent
     // call sees a fresh claim for the same key and refuses instead of also
     // running the seat.
-    const claimWindowMs = timeoutMs + INTENT_CLAIM_SLACK_MS;
-    if (!(await claimIntent(request.briefsDir, `${base}.intent.json`, request.sessionKey, claimWindowMs))) {
+    if (!(await claimIntent(request.briefsDir, `${base}.intent.json`, request.sessionKey, timeoutMs + INTENT_CLAIM_SLACK_MS))) {
+      return unavailable('session-failed');
+    }
+    // A first attempt that is about to run the seat removes any stale retry
+    // answer BEFORE the checkout check and the seat, so an old retry answer can
+    // never sit beside a new first answer, not even after a crash. A removal
+    // that fails is a refusal: the seat is not run.
+    if (!retry && !(await clearRetryAnswer(request.briefsDir, baseStem))) {
       return unavailable('session-failed');
     }
     const pinned = await this.checkPinnedCheckout(executor, request);
     if (pinned !== null) return unavailable(pinned);
-    if (await isSymbolicLink(promptPath)
-      || !(await writeFileNoFollow(promptPath, request.prompt).then(() => true, () => false))) {
+    return this.runSeat(executor, { request, base, argv, timeoutMs, maxAnswerBytes });
+  }
+
+  /** Write the prompt, run the seat, validate its output and record the answer. */
+  private async runSeat(executor: CommandExecutorPort, session: SeatSession): Promise<BriefAuthorSessionResult> {
+    const { request, base, argv, timeoutMs, maxAnswerBytes } = session;
+    const promptPath = `${base}.prompt.md`;
+    if (!(await promptWritten(promptPath, request.prompt))) {
       return unavailable('session-failed');
     }
     const run = await executor.run(argv, {
@@ -435,28 +467,14 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
       timeoutMs,
       maxBufferBytes: maxAnswerBytes + STDERR_HEADROOM_BYTES,
     }).catch(() => null);
-    if (run === null || (run.error === undefined && run.exitCode !== 0)) {
-      return unavailable('session-failed');
+    const refusal = classifySeatRun(run, maxAnswerBytes);
+    if (refusal !== null || run === null) {
+      return unavailable(refusal ?? 'session-failed');
     }
-    if (run.error !== undefined) {
-      return unavailable(/timeout|maxBufferBytes/.test(run.error) ? 'session-timeout' : 'session-failed');
-    }
-    if (run.stdout.trim().length === 0) {
-      return unavailable('session-empty');
-    }
-    if (Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes) {
-      return unavailable('session-output-too-large');
-    }
-    if (!recordAnswer(answerPath, run.stdout)) {
-      return unavailable('session-failed');
-    }
-    // The recorded retry answer is deleted only once the new first answer is
-    // successfully recorded, so a failed first rerun never destroys the saved
-    // retry result.
-    if (!retry && !(await clearRetryAnswer(request.briefsDir, baseStem))) {
-      return unavailable('session-failed');
-    }
-    return { outcome: 'answered', answer: run.stdout };
+    // recordAnswer is async: the write must be awaited, and a rejection or a
+    // false result is a failed write, never an answer.
+    const written = await recordAnswer(`${base}.answer.md`, run.stdout).catch(() => false);
+    return written ? { outcome: 'answered', answer: run.stdout } : unavailable('session-failed');
   }
 
   /** One read-only git call: null when the checkout exists and is at the base commit. */

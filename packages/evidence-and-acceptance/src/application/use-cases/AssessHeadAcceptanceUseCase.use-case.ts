@@ -293,9 +293,32 @@ function collectFindingBlockers(assessment: EvidenceAssessmentRecord): readonly 
 const INVALID_RECORD_PREFIX = 'Assessment record is invalid and cannot be assessed: ';
 
 /**
+ * The fixed refusal reasons of `EvidenceAssessment.create` that name the check
+ * that failed without quoting any part of the stored record. A domain message
+ * outside this set interpolates a stored value (for example an invalid
+ * `state` or a receipt's raw `result`, which could carry a token or another
+ * secret), so it is never returned to the caller: a fixed reason stands in
+ * for it.
+ */
+const SAFE_INVALID_RECORD_REASONS: ReadonlySet<string> = new Set([
+  'EvidenceAssessment requires non-empty id, projectId, attemptId, candidateHeadSha, policyRevision, implementerModel and updatedAtIso',
+  'EvidenceAssessment requiredChecks must be non-empty strings',
+  "EvidenceAssessment forgeEvidence must be 'not-configured' when present",
+  'EvidenceAssessment requestedReviewerModel must be a non-empty string when present',
+  'EvidenceAssessment contains an invalid verification receipt',
+  'EvidenceAssessment contains an invalid review receipt',
+  'EvidenceAssessment contains an invalid finding disposition',
+  'EvidenceAssessment acceptanceReceiptId must be a non-empty string or null',
+  'EvidenceAssessment blockers must be non-empty strings',
+  'EvidenceAssessment requires a non-negative integer revision',
+]);
+
+/**
  * Why the stored record cannot be assessed, or null when the aggregate accepts
  * it (CO18a7a). Never throws: a record the aggregate cannot even read (for
- * example a receipt list that is not an array) is `unreadable record`.
+ * example a receipt list that is not an array) is `unreadable record`. The
+ * reason is sanitized: only a fixed, value-free refusal reason of the
+ * aggregate is returned, never the domain's raw error text.
  */
 function invalidStoredRecordReason(assessment: EvidenceAssessmentRecord): string | null {
   try {
@@ -303,7 +326,11 @@ function invalidStoredRecordReason(assessment: EvidenceAssessmentRecord): string
     if (created.success && created.value !== undefined) {
       return null;
     }
-    return INVALID_RECORD_PREFIX + (created.error?.message ?? 'unknown reason');
+    const message = created.error?.message ?? '';
+    return (
+      INVALID_RECORD_PREFIX +
+      (SAFE_INVALID_RECORD_REASONS.has(message) ? message : 'the record failed a validation of the aggregate')
+    );
   } catch {
     return INVALID_RECORD_PREFIX + 'unreadable record';
   }

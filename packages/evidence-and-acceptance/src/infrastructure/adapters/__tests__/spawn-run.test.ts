@@ -35,6 +35,17 @@ describe('runSpawnOutcome kill grace', () => {
   });
 });
 
+describe('runSpawnOutcome spawn errno', () => {
+  it('resolves with exitCode null and the OS errno on a nonexistent executable', async () => {
+    const outcome = await runSpawnOutcome('/nonexistent/fleet-v2-test-executable', [], {
+      timeoutMs: 10_000,
+    });
+    expect(outcome.exitCode).toBeNull();
+    expect(outcome.errorCode).toBe('ENOENT');
+    expect(outcome.error).toBeDefined();
+  });
+});
+
 describe('defaultSpawn', () => {
   it('forwards the review budget, output cap and kill grace to runSpawnOutcome', async () => {
     const received: SpawnRunOptions[] = [];
@@ -82,5 +93,34 @@ describe('defaultSpawn', () => {
     expect(received[0]?.timeoutMs).toBe(DEFAULT_REVIEW_TIMEOUT_MS);
     expect(result.exitCode).toBeNull();
     expect(result.stderr).toBe('command exceeded its budget and its process tree was killed');
+  });
+
+  it('forwards the runner errorCode to the spawn result', async () => {
+    const fakeRunner = async (): Promise<SpawnRunOutcome> => ({
+      exitCode: null,
+      signal: null,
+      stdout: '',
+      stderr: '',
+      error: 'spawn failed',
+      errorCode: 'EACCES',
+    });
+
+    const result = await defaultSpawn('/bin/true', [], {}, undefined, fakeRunner);
+
+    expect(result.errorCode).toBe('EACCES');
+  });
+
+  it('omits errorCode from the spawn result when the runner outcome carries none', async () => {
+    const fakeRunner = async (): Promise<SpawnRunOutcome> => ({
+      exitCode: 0,
+      signal: null,
+      stdout: '',
+      stderr: '',
+    });
+
+    const result = await defaultSpawn('/bin/true', [], {}, undefined, fakeRunner);
+
+    expect('errorCode' in result).toBe(false);
+    expect(result.errorCode).toBeUndefined();
   });
 });

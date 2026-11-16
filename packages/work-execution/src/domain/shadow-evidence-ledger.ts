@@ -315,7 +315,7 @@ function dayNumber(day: string): number | null {
   if (month < 1 || month > 12) {
     return null;
   }
-  if (date < 1 || date > new Date(Date.UTC(year, month, 0)).getUTCDate()) {
+  if (date < 1 || date > new Date(utcInstant(year, month, 0)).getUTCDate()) {
     return null;
   }
   return Math.floor(utcInstant(year, month - 1, date) / DAY_MS);

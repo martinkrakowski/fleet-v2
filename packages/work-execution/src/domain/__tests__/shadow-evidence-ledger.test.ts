@@ -512,6 +512,29 @@ describe('shadow evidence ledger (SH1)', () => {
       expect(second).toEqual({ ok: true, ledger: expect.objectContaining({ revision: 2 }), changed: true });
     });
 
+    it('accepts the proleptic leap day for a two-digit year (0000-02-29 is a real date)', () => {
+      // `dayNumber`'s own days-in-month check is a SIBLING bug to the one
+      // fixed above for the ordinal computation: it used to bound the day
+      // of month with `new Date(Date.UTC(year, month, 0)).getUTCDate()`,
+      // which carries the same two-digit-year special case (a year of 0-99
+      // read as 1900-1999). Year 0, read literally, is a leap year in the
+      // proleptic Gregorian calendar (divisible by 400), so '0000-02-29' is
+      // a real date and must be accepted; under the old bug it was computed
+      // as if it were 1900-02-29, and 1900 is NOT a leap year (divisible by
+      // 100, not 400), so the day was wrongly refused. Fixed by computing
+      // the bound with `utcInstant`, which carries no such special case.
+      const result = recordShadowVerdicts(null, dayInput('0000-02-29', 7));
+      if (!result.ok) {
+        throw new Error(`expected ok, got ${result.reason}`);
+      }
+      const read = readShadowLedger(result.ledger);
+      expect(read).toEqual({ ok: true, ledger: result.ledger });
+    });
+
+    it('still refuses 0000-02-30: no leap-day shape makes it a real date', () => {
+      expect(recordShadowVerdicts(null, dayInput('0000-02-30', 7))).toEqual({ ok: false, reason: 'invalid-input' });
+    });
+
     it('refuses a differing re-record of a recorded criterion with verdict-conflict', () => {
       const ledger = buildLedger([dayInput(D1, 7)]);
       const before = JSON.stringify(ledger);

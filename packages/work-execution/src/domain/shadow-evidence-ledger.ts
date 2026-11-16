@@ -340,7 +340,16 @@ export function recordShadowVerdicts(ledger: unknown, input: unknown): ShadowVer
     }
     existing = { revision: read.ledger.revision, days: read.ledger.days };
   }
-  const parsed = readVerdictsInput(input);
+  // A Proxy stand-in for the input can throw from an `ownKeys` or `get`
+  // trap before any field is read; the refusal is the same invalid-input.
+  // A Proxy stand-in for the input can throw from an `ownKeys` or `get`
+  // trap before any field is read; the refusal is the same invalid-input.
+  let parsed: ShadowVerdictsInput | null;
+  try {
+    parsed = readVerdictsInput(input);
+  } catch {
+    parsed = null;
+  }
   if (parsed === null) {
     return { ok: false, reason: 'invalid-input' };
   }
@@ -411,9 +420,15 @@ function mergeIntoDay(
   if (parsed.mergesCompared !== undefined && !carriesS1(day.verdicts, parsed.verdicts)) {
     return { ok: false, reason: 'invalid-input' };
   }
+  // Only criteria not already recorded are written. An equal verdict, reason
+  // and digest is an idempotent no-op for that criterion: the recorded
+  // verdict (including its recordedAtIso) is kept, so a re-record with a
+  // different timestamp leaves the ledger exactly as it was.
   const mergedVerdicts: Partial<Record<CutoverShadowCriterion, ShadowCriterionVerdict>> = { ...day.verdicts };
   for (const [criterion, verdict] of Object.entries(parsed.verdicts)) {
-    mergedVerdicts[criterion as CutoverShadowCriterion] = copyVerdict(verdict);
+    if (day.verdicts[criterion as CutoverShadowCriterion] === undefined) {
+      mergedVerdicts[criterion as CutoverShadowCriterion] = copyVerdict(verdict);
+    }
   }
   const mergesCompared = parsed.mergesCompared !== undefined ? parsed.mergesCompared : day.mergesCompared;
   const changed =
@@ -484,13 +499,21 @@ function copyVerdict(verdict: ShadowCriterionVerdict): ShadowCriterionVerdict {
   return { ...verdict };
 }
 
-/** The final ledger, bumping the revision and pruning only on a real change. */
+/**
+ * The final ledger, bumping the revision and pruning only on a real change.
+ * At the revision cap a real change is refused: the bumped revision would
+ * fall outside the reader's accepted range, so the write never persists an
+ * unreadable ledger. An idempotent no-op at the cap stays a valid no-op.
+ */
 function commit(
   existing: { readonly revision: number; readonly days: readonly ShadowDayRecord[] },
   replaceIndex: number,
   nextDay: ShadowDayRecord,
   changed: boolean,
 ): ShadowVerdictsWrite {
+  if (changed && existing.revision + 1 > MAX_REVISION) {
+    return { ok: false, reason: 'invalid-ledger' };
+  }
   const appended = replaceIndex >= existing.days.length;
   const withReplacement = appended
     ? [...existing.days.map(copyDay), nextDay]
@@ -550,7 +573,14 @@ export function composeCutoverShadowEvidence(
   nowIso: unknown,
   options: unknown,
 ): ShadowEvidenceCompose {
-  const optionSnapshot = readExactPlainRecord(options, ['requireSingleRelease']);
+  // A Proxy stand-in for `options` can throw from an `ownKeys` trap before
+  // any field is read; the refusal is the same invalid-options.
+  let optionSnapshot: Record<string, unknown> | null;
+  try {
+    optionSnapshot = readExactPlainRecord(options, ['requireSingleRelease']);
+  } catch {
+    optionSnapshot = null;
+  }
   if (optionSnapshot === null || typeof optionSnapshot.requireSingleRelease !== 'boolean') {
     return { status: 'absent', reason: 'invalid-options' };
   }

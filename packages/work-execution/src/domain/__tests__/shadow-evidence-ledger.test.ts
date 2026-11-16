@@ -303,6 +303,42 @@ describe('shadow evidence ledger (SH1)', () => {
       expect(again.ok && again.ledger.revision).toBe(ledger.revision);
     });
 
+    it('keeps the recorded verdict (including recordedAtIso) when a re-record matches on verdict, reason and digest', () => {
+      const ledger = buildLedger([{ ...dayInput(D1, 7), verdicts: { S1: passVerdict() } }]);
+      const reRecorded = recordShadowVerdicts(ledger, {
+        day: D1,
+        releaseSha: RELEASE_SHA,
+        verdicts: { S1: passVerdict({ recordedAtIso: '2026-02-04T12:00:00Z' }) },
+      });
+      expect(reRecorded).toEqual({ ok: true, ledger: { ...ledger, revision: ledger.revision }, changed: false });
+      expect(reRecorded.ok && reRecorded.ledger.days[0].verdicts.S1?.recordedAtIso).toBe(RECORDED_AT);
+    });
+
+    it('refuses a Proxy over the input whose ownKeys trap throws with invalid-input', () => {
+      const proxy = new Proxy(dayInput(D1, 7) as unknown as object, {
+        ownKeys() {
+          throw new Error('trap');
+        },
+      });
+      expect(recordShadowVerdicts(null, proxy)).toEqual({ ok: false, reason: 'invalid-input' });
+    });
+
+    it('refuses a real change on a ledger at the revision cap with invalid-ledger', () => {
+      const ledger = buildLedger([dayInput(D1, 7)]);
+      const atCap = { ...ledger, revision: 1_000_000_000 };
+      expect(recordShadowVerdicts(atCap, dayInput(D2, 7))).toEqual({ ok: false, reason: 'invalid-ledger' });
+    });
+
+    it('allows an idempotent no-op on a ledger at the revision cap (changed false, revision kept)', () => {
+      const ledger = buildLedger([dayInput(D1, 7)]);
+      const atCap = { ...ledger, revision: 1_000_000_000 };
+      expect(recordShadowVerdicts(atCap, dayInput(D1, 7))).toEqual({
+        ok: true,
+        ledger: { ...atCap, revision: 1_000_000_000 },
+        changed: false,
+      });
+    });
+
     it('returns a fresh structure, never mutating the ledger or input arguments', () => {
       const ledger = buildLedger([dayInput(D1, 7)]);
       const before = JSON.stringify(ledger);
@@ -545,6 +581,16 @@ describe('shadow evidence ledger (SH1)', () => {
     it('refuses options whose requireSingleRelease is not a boolean with invalid-options', () => {
       const ledger = threeDays([7, 7, 6]);
       expect(composeCutoverShadowEvidence(ledger, NOW, { requireSingleRelease: 'no' })).toEqual({ status: 'absent', reason: 'invalid-options' });
+    });
+
+    it('refuses a Proxy over the options whose ownKeys trap throws with invalid-options', () => {
+      const ledger = threeDays([7, 7, 6]);
+      const proxy = new Proxy({ requireSingleRelease: false }, {
+        ownKeys() {
+          throw new Error('trap');
+        },
+      });
+      expect(composeCutoverShadowEvidence(ledger, NOW, proxy)).toEqual({ status: 'absent', reason: 'invalid-options' });
     });
 
     it('refuses fewer than three stored days with too-few-days', () => {

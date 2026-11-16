@@ -183,7 +183,9 @@ function fixture(kind: FileKind): Fixture {
 
 const probeExecutor: HostProbeExecutor = {
   async run(argv): Promise<DoctorCommandRunResult> {
-    const template = argv.find((part) => part.includes(".fleet-probe.XXXXXX"));
+    const template = argv
+      .join(" ")
+      .match(/[^\s']*\.fleet-probe\.XXXXXX/)?.[0];
     return {
       exitCode: 0,
       signal: null,

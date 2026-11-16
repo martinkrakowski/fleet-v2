@@ -304,7 +304,7 @@ function hostProbeExecutor(listening: (port: number) => boolean): {
     executor: {
       async run(argv) {
         calls.push([...argv]);
-        const template = argv.find((token) => token.includes('.fleet-probe.XXXXXX'));
+        const template = argv.join(' ').match(/[^\s']*\.fleet-probe\.XXXXXX/)?.[0];
         if (template !== undefined) {
           return { exitCode: 0, signal: null, stdout: template.replace('XXXXXX', 'probe1'), stderr: '' };
         }

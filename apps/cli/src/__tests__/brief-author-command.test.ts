@@ -642,6 +642,45 @@ describe('brief author', () => {
     expect(await run(objectForm)).toBe(fromString);
   });
 
+  describe('JSON-string inputs are bounded like their object forms', () => {
+    const UNREADABLE_MESSAGE = 'brief author could not read its arguments';
+    const wideArray = `[${Array.from({ length: 6000 }, () => '"p"').join(',')}]`;
+    const wideObject = `{${Array.from({ length: 6000 }, (_, i) => `"k${i}":1`).join(',')}}`;
+    const deepArray = '['.repeat(3000) + ']'.repeat(3000);
+    const wideSeatPlan = JSON.stringify({
+      version: 1,
+      'first-pass': [{ id: 's1', model: 'plan-model', tool: 'opencode' }],
+      fix: [{ id: 's2', model: 'plan-model', tool: 'opencode' }],
+      review: [],
+      junk: Array.from({ length: 6000 }, () => 0),
+    });
+
+    it.each([
+      ['acceptanceSpec as a JSON object string over the node budget', 'acceptanceSpec', wideObject],
+      ['allowedPathPrefixes as a JSON array string over the node budget', 'allowedPathPrefixes', wideArray],
+      ['allowedPathPrefixes as a JSON array string nested 3000 deep', 'allowedPathPrefixes', deepArray],
+      ['seatPlan as a JSON string over the node budget', 'seatPlan', wideSeatPlan],
+    ])('%s is a usage error and the use case is not called', async (_title, field, text) => {
+      const { runtime, authorCalls } = guardsRuntime();
+      let thrown: unknown = null;
+      try {
+        await briefCommands['author']({ ...validRecordPayload(), [field]: text }, runtime);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(CliUsageError);
+      expect((thrown as CliUsageError).message).toBe(UNREADABLE_MESSAGE);
+      expect(authorCalls).toHaveLength(0);
+      const { io, stdout, stderr } = capturingIo();
+      const cli = guardsRuntime();
+      const exitCode = await runCli(briefAuthorArgs([`--${field}`, text]), io, cli.runtime);
+      expect(exitCode).toBe(2);
+      expect(stderr.join('')).toContain(UNREADABLE_MESSAGE);
+      expect(stdout).toHaveLength(0);
+      expect(cli.authorCalls).toHaveLength(0);
+    });
+  });
+
   it('more than 5000 facts reports the at-most-32 limit, not an unreadable argument', async () => {
     const { io, stderr } = capturingIo();
     const { runtime, authorCalls } = guardsRuntime();

@@ -438,6 +438,13 @@ export class RunMergePassUseCase implements RunMergePassPort {
     const vetoState = this.deps.vetoState as Pick<MergeVetoStatePort, 'readMergeVetoState'>;
     const vetoAdvice = this.deps.vetoAdvice as Pick<MergeVetoPort, 'adviseMergeVeto'>;
 
+    // Without a queue writer the veto row cannot be stored; asking the ports
+    // anyway would report a veto that was never recorded and ask the same
+    // advice again on every later pass, so neither port is called here.
+    if (this.deps.queueWriter === undefined) {
+      return this.report(entry, 'no-action', 'veto-writer-absent', null);
+    }
+
     this.ensureBudget(request);
     let stateResult: MergeVetoStateResult;
     try {

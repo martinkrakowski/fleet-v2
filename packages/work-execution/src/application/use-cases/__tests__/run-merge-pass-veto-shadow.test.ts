@@ -511,6 +511,34 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     expect(w.vetoAdvice.calls).toBe(0);
   });
 
+  it('a missing queue writer never calls the veto ports and never reports the row stored', async () => {
+    const entry = makeEntry();
+    const w = wire([entry], greenForge, { bindVetoPorts: true });
+    // Rebuild the use case with the veto ports bound but no queue writer:
+    // the veto answer could be asked, yet nothing could ever be recorded.
+    let ulid = 0;
+    const useCase = new RunMergePassUseCase({
+      queue: w.queue,
+      forgeRead: forgeReadFake(greenForge),
+      verification: verificationFake(),
+      journal: w.journal as LaneRunJournalPort,
+      halt: haltFake,
+      newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
+      nowIso: () => NOW,
+      vetoAdvice: w.vetoAdvice,
+      vetoState: w.vetoState,
+    });
+
+    const result = await useCase.runMergePass(w.request);
+
+    expect(result.outcome).toBe('completed');
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('veto-writer-absent');
+    expect(w.vetoState.calls).toBe(0); // no ask that could not be recorded
+    expect(w.vetoAdvice.calls).toBe(0);
+    expect(storedVeto(w.queue, entry.entryId)).toBeNull();
+  });
+
   it('returns budget-exhausted without calling veto ports when budget is spent', async () => {
     const entry = makeEntry();
     // The clock lapses the deadline right after the forge read: the

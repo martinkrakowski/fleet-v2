@@ -95,8 +95,17 @@ export function relaunchStepStatus(entries: unknown, key: unknown): RelaunchStep
   try {
     if (typeof key !== 'string' || key === '') return 'inconsistent';
     if (!Array.isArray(entries)) return 'inconsistent';
-    const length: number = entries.length;
-    if (length > MAX_RELAUNCH_LEDGER_ENTRIES) return 'inconsistent';
+    // Array Proxies may report NaN, a negative or a fractional length; validate
+    // it as an integer in range before scanning.
+    const length: unknown = entries.length;
+    if (
+      typeof length !== 'number' ||
+      !Number.isInteger(length) ||
+      length < 0 ||
+      length > MAX_RELAUNCH_LEDGER_ENTRIES
+    ) {
+      return 'inconsistent';
+    }
     let state: LedgerState = 'none';
     for (let index = 0; index < length; index += 1) {
       if (!(index in entries)) return 'inconsistent';
@@ -136,7 +145,9 @@ function readLaneStep(item: unknown): ReadLaneStep | null {
   if (item === null || typeof item !== 'object') return null;
   const fields = item as Record<string, unknown>;
   const step: unknown = fields.step;
-  if (typeof step !== 'string' || !LANE_STEP_NAME.test(step)) return null;
+  // `$` without the `m` flag also matches before one trailing newline, so a
+  // step ending in `\n` (e.g. `'save\n'`) would pass the regex alone; refuse it.
+  if (typeof step !== 'string' || step.endsWith('\n') || !LANE_STEP_NAME.test(step)) return null;
   const status: unknown = fields.status;
   if (typeof status !== 'string') return null;
   if (!(RELAUNCH_STEP_STATUSES as readonly string[]).includes(status)) return null;
@@ -177,8 +188,16 @@ function stepToProgress(step: ReadLaneStep): RelaunchLaneProgress {
 export function relaunchLaneProgress(steps: unknown): RelaunchLaneProgress {
   try {
     if (!Array.isArray(steps)) return INVALID_STEPS;
-    const length: number = steps.length;
-    if (length > MAX_RELAUNCH_LANE_STEPS) return INVALID_STEPS;
+    // As above: a Proxy length may be NaN or out of range; validate it first.
+    const length: unknown = steps.length;
+    if (
+      typeof length !== 'number' ||
+      !Number.isInteger(length) ||
+      length < 0 ||
+      length > MAX_RELAUNCH_LANE_STEPS
+    ) {
+      return INVALID_STEPS;
+    }
     const seen = new Set<string>();
     const read: ReadLaneStep[] = [];
     for (let index = 0; index < length; index += 1) {

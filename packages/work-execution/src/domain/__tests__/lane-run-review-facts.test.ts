@@ -406,9 +406,7 @@ describe('laneRunReviewConfirmationFact hostile journals (Proxy, array-like, eno
     const { proxy, reads } = countingProxy(contradictoryJournal(), {
       get: (t, prop, receiver) => (prop === 'length' ? 2 ** 32 - 1 : Reflect.get(t, prop, receiver)),
     });
-    const started = performance.now();
     expect(laneRunReviewConfirmationFact(proxy, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
-    expect(performance.now() - started).toBeLessThan(1_000);
     expect(reads.get('get:length')).toBe(1);
     expect(indexReadsOf(reads)).toBe(0);
   });
@@ -432,30 +430,31 @@ describe('laneRunReviewConfirmationFact hostile journals (Proxy, array-like, eno
     expect(indexReadsOf(reads)).toBe(0);
   });
 
-  it(`grants no confirmation for a real journal of ${LANE_RUN_REVIEW_CONFIRMATION_MAX_ENTRIES + 1} entries (one past the cap) that starts with a contradictory pass and fail, within one second`, () => {
+  it(`reads no element of a real journal of ${LANE_RUN_REVIEW_CONFIRMATION_MAX_ENTRIES + 1} entries (one past the cap) that starts with a contradictory pass and fail, and grants no confirmation`, () => {
     const entries = contradictoryJournal();
     const filler = result(reviewKey('code-review', { seatIndex: 0 }), 'completed', 'review-passed');
     while (entries.length <= LANE_RUN_REVIEW_CONFIRMATION_MAX_ENTRIES) {
       entries.push(filler);
     }
-    const started = performance.now();
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
-    expect(performance.now() - started).toBeLessThan(1_000);
+    const { proxy, reads } = countingProxy(entries, {});
+    expect(laneRunReviewConfirmationFact(proxy, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+    expect(indexReadsOf(reads)).toBe(0);
   });
 
-  it('counts 20000 confirming intents of one key after a contradictory failed within two seconds (linear, not quadratic)', () => {
+  it('makes at most 3 element reads per journal entry in total over 2000 confirming intents of one key (linear, not quadratic) and counts all 2000', () => {
+    const confirmations = 2_000;
     const entries = contradictoryJournal();
     const confirmKey = reviewKey('brief-check', { seatIndex: 0, retry: 2 });
     const confirmIntent = intent(confirmKey);
-    for (let n = 0; n < 20_000; n += 1) {
+    for (let n = 0; n < confirmations; n += 1) {
       entries.push(confirmIntent);
     }
     entries.push(result(confirmKey, 'completed', 'review-failed'));
-    const started = performance.now();
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({
+    const { proxy, reads } = countingProxy(entries, {});
+    expect(laneRunReviewConfirmationFact(proxy, RUN_ID, 'brief-check', HEAD)).toEqual({
       priorPassedAtHead: true,
-      confirmingRetries: 20_000,
+      confirmingRetries: confirmations,
     });
-    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(indexReadsOf(reads)).toBeLessThanOrEqual(3 * entries.length);
   });
 });

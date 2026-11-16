@@ -380,6 +380,12 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
     if (!reservationsRead.ok || !safeIsArray(reservationsRead.value) || !hasReadableLength(reservationsRead.value)) {
       return { outcome: 'unknown', reason: 'reservations-unreadable' };
     }
+    // A reservations list longer than the scan cap is never partially
+    // classified: reservations beyond the cap cannot even be named, so the
+    // whole pass fails closed as unknown and nothing is released.
+    if (reservationsRead.value.length > MAX_ORPHAN_RESERVATION_SCAN) {
+      return { outcome: 'unknown', reason: 'reservations-unreadable' };
+    }
     const runsRead = await callStore(() => this.deps.runRepo.list(), timeoutMs);
     if (!runsRead.ok || !safeIsArray(runsRead.value) || !hasReadableLength(runsRead.value)) {
       return { outcome: 'unknown', reason: 'runs-unreadable' };

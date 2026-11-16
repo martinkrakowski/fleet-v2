@@ -268,7 +268,9 @@ describe('classifyOrphanReservations', () => {
         nowIso: NOW,
         graceMs: GRACE_MS,
       });
-      expect(result.reportOnly).toHaveLength(1);
+      // Absent runs say nothing about listings: unknown, never reported or released.
+      expect(result.reportOnly).toHaveLength(0);
+      expect(result.unknown.map((entry) => entry.reason)).toEqual(['run-state-unknown']);
     }
   });
 
@@ -282,7 +284,21 @@ describe('classifyOrphanReservations', () => {
         nowIso: NOW,
         graceMs: GRACE_MS,
       });
-      expect(result.unknown).toHaveLength(0);
+      expect(result).toEqual({ orphans: [], reportOnly: [], skipped: [], unknown: [] });
+    }
+    // A non-array where the runs are declared hides every listing: a held
+    // reservation past the grace is unknown run-state-unknown, never reported.
+    for (const runs of ['nope', 42, {}, null, undefined]) {
+      const result = classifyOrphanReservations({
+        reservations: [reservation({ id: 'res-a' })],
+        runs: runs as unknown as readonly unknown[],
+        runStates: new Map(),
+        attemptsById: new Map(),
+        nowIso: NOW,
+        graceMs: GRACE_MS,
+      });
+      expect(result.unknown.map((entry) => [entry.reservationId, entry.reason])).toEqual([['res-a', 'run-state-unknown']]);
+      expect(result.reportOnly).toHaveLength(0);
       expect(result.orphans).toHaveLength(0);
     }
   });
@@ -314,7 +330,9 @@ describe('classifyOrphanReservations', () => {
       graceMs: GRACE_MS,
     });
     expect(runsResult.orphans).toHaveLength(0);
-    expect(runsResult.reportOnly.map((entry) => entry.reservationId)).toEqual(['res-ok']);
+    // Unreadable runs may list the attempt: unknown, never reported or released.
+    expect(runsResult.reportOnly).toHaveLength(0);
+    expect(runsResult.unknown.map((entry) => [entry.reservationId, entry.reason])).toEqual([['res-ok', 'run-state-unknown']]);
   });
 
   it('handles hostile inputs and malformed reservations without throwing: traps that throw on element and map reads', () => {
@@ -337,7 +355,7 @@ describe('classifyOrphanReservations', () => {
     });
     // The unreadable element is malformed with a fallback id, never released.
     expect(ids(elementResult.unknown)).toEqual(['malformed-0']);
-    // The same Proxy where the runs are declared: the unreadable element is skipped.
+    // The same Proxy where the runs are declared: every run element is unreadable, so nothing may be reported or released.
     const runsResult = classifyOrphanReservations({
       reservations: [reservation({ id: 'res-ok' })],
       runs: hostileArray as unknown as readonly unknown[],
@@ -347,7 +365,8 @@ describe('classifyOrphanReservations', () => {
       graceMs: GRACE_MS,
     });
     expect(runsResult.orphans).toHaveLength(0);
-    expect(runsResult.unknown).toHaveLength(0);
+    expect(runsResult.reportOnly).toHaveLength(0);
+    expect(runsResult.unknown.map((entry) => [entry.reservationId, entry.reason])).toEqual([['res-ok', 'run-state-unknown']]);
     // A Map Proxy whose `get` throws: the run state is unreadable, so the
     // reservation is unknown run-state-unknown, never an orphan.
     const hostileStates = new Proxy(new Map([['run-1', LANE_RUN_TERMINAL_STATES[0]]]), {
@@ -497,21 +516,76 @@ describe('classifyOrphanReservations', () => {
     expect(bounded.reportOnly).toHaveLength(MAX_ORPHAN_RESERVATION_SCAN);
   });
 
-  it('bounds a hostile runs array by MAX_RUN_SCAN', () => {
+  it('reads the first MAX_RUN_SCAN runs by index, drops the rest, and marks the sweep incomplete', () => {
+    // Runs 0..MAX_RUN_SCAN-1 are read; the live run listing att-1 sits at index MAX_RUN_SCAN and is dropped.
     const runs: unknown[] = [];
-    for (let index = 0; index < MAX_RUN_SCAN + 5_000; index += 1) {
-      runs.push(run(`run-${index}`, ['att-1']));
+    for (let index = 0; index < MAX_RUN_SCAN; index += 1) {
+      runs.push(run(`run-${index}`, [`other-${index}`]));
     }
+    runs.push(run('run-live', ['att-1']));
+    const attemptsById = new Map([['att-1', { state: 'ended' }]]);
     const result = classifyOrphanReservations({
-      reservations: [reservation()],
+      reservations: [reservation({ id: 'res-a' })],
       runs,
-      runStates: new Map(),
-      attemptsById: new Map(),
+      runStates: new Map([['run-live', 'gating']]),
+      attemptsById,
       nowIso: NOW,
       graceMs: GRACE_MS,
     });
-    // Bounded loop: the attempt is listed by runs inside the bound, all without states, so unknown.
-    expect(result.unknown[0]?.reason).toBe('run-state-unknown');
+    // The attempt looks unlisted, but the dropped tail may list it: never reportOnly, never released.
+    expect(result.reportOnly).toHaveLength(0);
+    expect(result.orphans).toHaveLength(0);
+    expect(result.unknown.map((entry) => [entry.reservationId, entry.reason])).toEqual([['res-a', 'run-state-unknown']]);
+
+    // A run beyond the cap that lists the attempt cannot turn a terminal visible listing into a release.
+    const terminalThenDropped: unknown[] = [run('run-terminal', ['att-1'])];
+    while (terminalThenDropped.length < MAX_RUN_SCAN) {
+      terminalThenDropped.push(run(`filler-${terminalThenDropped.length}`, ['other']));
+    }
+    terminalThenDropped.push(run('run-live', ['att-1']));
+    const combined = classifyOrphanReservations({
+      reservations: [reservation({ id: 'res-a' })],
+      runs: terminalThenDropped,
+      runStates: new Map<string, LaneRunStateValue | 'unreadable'>([
+        ['run-terminal', LANE_RUN_TERMINAL_STATES[0]],
+        ['run-live', 'gating'],
+      ]),
+      attemptsById,
+      nowIso: NOW,
+      graceMs: GRACE_MS,
+    });
+    expect(combined.orphans).toHaveLength(0);
+    expect(combined.unknown.map((entry) => entry.reason)).toEqual(['run-state-unknown']);
+  });
+
+  it('never releases on a terminal visible listing when another run list is non-array, holey, malformed or a bad element', () => {
+    const holey: unknown[] = new Array(2);
+    holey[0] = 'other';
+    const hostileRuns: readonly (readonly [string, unknown])[] = [
+      ['non-array attemptIds', { runId: 'run-x', attemptIds: 'att-1' }],
+      ['missing attemptIds', { runId: 'run-x' }],
+      ['holey attemptIds', { runId: 'run-x', attemptIds: holey }],
+      ['a non-plain run element', 'not-a-run'],
+      ['a null run element', null],
+    ];
+    for (const [name, hostile] of hostileRuns) {
+      const result = classifyOrphanReservations({
+        reservations: [reservation({ id: 'res-a' })],
+        runs: [run('run-terminal', ['att-1']), hostile],
+        runStates: new Map([['run-terminal', LANE_RUN_TERMINAL_STATES[0]]]),
+        attemptsById: new Map([['att-1', { state: 'ended' }]]),
+        nowIso: NOW,
+        graceMs: GRACE_MS,
+      });
+      expect(result.orphans, name).toHaveLength(0);
+      expect(result.unknown.map((entry) => [entry.reservationId, entry.reason]), name).toEqual([['res-a', 'run-state-unknown']]);
+    }
+    // Control: with every run readable the same reservation is an orphan.
+    const control = classify([reservation({ id: 'res-a' })], [run('run-terminal', ['att-1'])], {
+      runStates: new Map([['run-terminal', LANE_RUN_TERMINAL_STATES[0]]]),
+      attemptsById: new Map([['att-1', { state: 'ended' }]]),
+    });
+    expect(ids(control.orphans)).toEqual(['res-a']);
   });
 
   it('treats a non-finite or negative graceMs as within-grace for every no-run reservation', () => {

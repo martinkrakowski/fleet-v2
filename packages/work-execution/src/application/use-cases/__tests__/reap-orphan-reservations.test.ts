@@ -83,6 +83,14 @@ function attemptRecord(id: string, overrides: Partial<AttemptRecord> = {}): Atte
   };
 }
 
+/** The fenced release request the use case passes. */
+interface FencedReleaseRequest {
+  readonly attemptId: string;
+  readonly reservationId: string;
+  readonly attemptRevision: number;
+  readonly readAttemptRevision: () => Promise<number | null>;
+}
+
 interface HarnessOptions {
   reservations?: readonly CapacityReservationRecord[];
   reservationsImpl?: () => Promise<unknown>;
@@ -93,6 +101,8 @@ interface HarnessOptions {
   attempts?: Map<string, AttemptRecord | null>;
   findAttemptImpl?: (attemptId: string) => Promise<unknown>;
   releaseOutcome?: FakeReleaseOutcome;
+  /** Replaces the canned release answer; it receives the real request, fence callback included. */
+  releaseImpl?: (request: FencedReleaseRequest) => Promise<unknown>;
   /** Set to omit the fenced release method entirely (the unfenced-refusal case). */
   omitFencedRelease?: boolean;
   appendImpl?: (entry: LaneRunJournalEntryRecord) => Promise<unknown>;
@@ -137,6 +147,9 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         : {
             releaseCapacityReservationIfUnchanged: async (request: unknown) => {
               releaseCalls.push(request);
+              if (options.releaseImpl) {
+                return (await options.releaseImpl(request as FencedReleaseRequest)) as never;
+              }
               if (options.releaseOutcome instanceof Error) {
                 throw options.releaseOutcome;
               }
@@ -185,13 +198,27 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     },
     newUlid: () => {
       ulidCounter += 1;
-      return `01JB00000000000000000000${String(ulidCounter).padStart(2, '0')}`;
+      return `01JB${'0'.repeat(18)}${String(ulidCounter).padStart(4, '0')}`;
     },
     ...(options.storeCallTimeoutMs !== undefined ? { storeCallTimeoutMs: options.storeCallTimeoutMs } : {}),
     ...(options.maxReleasesPerPass !== undefined ? { maxReleasesPerPass: options.maxReleasesPerPass } : {}),
   };
 
-  return { deps, releaseCalls, releaseCallsUnfenced, journalEntries, listForRunCalls, findAttemptCalls, listReservationsCalls, listRunsCalls };
+  // Live counters: getters, so an assertion reads the value at assertion time.
+  return {
+    deps,
+    releaseCalls,
+    releaseCallsUnfenced,
+    journalEntries,
+    listForRunCalls,
+    findAttemptCalls,
+    get listReservationsCalls() {
+      return listReservationsCalls;
+    },
+    get listRunsCalls() {
+      return listRunsCalls;
+    },
+  };
 }
 
 function run(harness: Harness, request: ReapOrphanReservationsRequest | unknown): Promise<ReapOrphanReservationsResult> {
@@ -538,5 +565,151 @@ describe('ReapOrphanReservationsUseCase', () => {
     expect(result.released.map((entry) => entry.reservationId)).toEqual(['res-1', 'res-2']);
     expect(result.failed).toEqual([{ reservationId: 'res-3', attemptId: 'att-3', reason: 'budget-exhausted' }]);
     expect(harness.releaseCalls).toHaveLength(2);
+  });
+
+  it('releases an orphan whose attempt has no revision field, reading absent as 0 on both sides of the fence', async () => {
+    const attempt = attemptRecord('att-1');
+    delete (attempt as { revision?: number }).revision;
+    const harness = orphanHarness({
+      attempts: new Map([['att-1', attempt]]),
+      releaseImpl: async (request) => {
+        const fresh = await request.readAttemptRevision();
+        return fresh === request.attemptRevision ? { outcome: 'released' } : { outcome: 'unknown' };
+      },
+    });
+    const result = await run(harness, { dryRun: false, nowIso: NOW });
+    expect(result.outcome).toBe('reaped');
+    if (result.outcome !== 'reaped') return;
+    expect(harness.releaseCalls[0]).toMatchObject({ attemptRevision: 0 });
+    expect(result.released.map((entry) => entry.reservationId)).toEqual(['res-1']);
+    expect(result.failed).toHaveLength(0);
+  });
+
+  it('keeps a wrong-typed or negative re-read revision unreadable: the fence does not confirm', async () => {
+    for (const revision of ['3', -1, 1.5, null]) {
+      let reads = 0;
+      const harness = orphanHarness({
+        findAttemptImpl: async () => {
+          reads += 1;
+          // The classification read sees a valid attempt; the fence re-read sees the hostile revision.
+          return reads === 1 ? attemptRecord('att-1') : attemptRecord('att-1', { revision: revision as never });
+        },
+        releaseImpl: async (request) => {
+          const fresh = await request.readAttemptRevision();
+          return fresh === request.attemptRevision ? { outcome: 'released' } : { outcome: 'unknown' };
+        },
+      });
+      const result = await run(harness, { dryRun: false, nowIso: NOW });
+      expect(result.outcome).toBe('reaped');
+      if (result.outcome !== 'reaped') return;
+      expect(result.released).toHaveLength(0);
+      expect(result.failed.map((entry) => entry.reason)).toEqual(['ambiguous']);
+    }
+  });
+
+  it('does not starve a 65th orphan: 64 attempts without a revision release, the next sweep takes the rest', async () => {
+    const total = 65;
+    const held = new Map<string, CapacityReservationRecord>();
+    const runs: Record<string, unknown>[] = [];
+    const journalsByRun = new Map<string, LaneRunJournalEntryRecord[]>();
+    const attempts = new Map<string, AttemptRecord | null>();
+    for (let index = 1; index <= total; index += 1) {
+      const id = String(index).padStart(3, '0');
+      held.set(`res-${id}`, reservation(`res-${id}`, `att-${id}`));
+      const runId = `run-01JB${'0'.repeat(19)}${id}`;
+      runs.push(runRecord(runId, [`att-${id}`]));
+      journalsByRun.set(runId, [conductEntry(runId, 'merged')]);
+      const attempt = attemptRecord(`att-${id}`);
+      delete (attempt as { revision?: number }).revision;
+      attempts.set(`att-${id}`, attempt);
+    }
+    const harness = makeHarness({
+      reservationsImpl: async () => [...held.values()],
+      runs,
+      journalsByRun,
+      attempts,
+      releaseImpl: async (request) => {
+        const fresh = await request.readAttemptRevision();
+        if (fresh !== request.attemptRevision) {
+          return { outcome: 'unknown' };
+        }
+        held.delete(request.reservationId);
+        return { outcome: 'released' };
+      },
+    });
+    const first = await run(harness, { dryRun: false, nowIso: NOW });
+    expect(first.outcome).toBe('reaped');
+    if (first.outcome !== 'reaped') return;
+    expect(first.released).toHaveLength(64);
+    expect(first.failed).toEqual([{ reservationId: 'res-065', attemptId: 'att-065', reason: 'budget-exhausted' }]);
+    const second = await run(harness, { dryRun: false, nowIso: NOW });
+    expect(second.outcome).toBe('reaped');
+    if (second.outcome !== 'reaped') return;
+    expect(second.released.map((entry) => entry.reservationId)).toEqual(['res-065']);
+    expect(held.size).toBe(0);
+  });
+
+  it('does not release when the fence callback finds the attempt revision changed since classification', async () => {
+    let reads = 0;
+    const harness = orphanHarness({
+      findAttemptImpl: async () => {
+        reads += 1;
+        return attemptRecord('att-1', { revision: reads === 1 ? 3 : 4 });
+      },
+      releaseImpl: async (request) => {
+        const fresh = await request.readAttemptRevision();
+        return fresh === request.attemptRevision ? { outcome: 'released' } : { outcome: 'changed' };
+      },
+    });
+    const result = await run(harness, { dryRun: false, nowIso: NOW });
+    expect(result.outcome).toBe('reaped');
+    if (result.outcome !== 'reaped') return;
+    expect(harness.releaseCalls).toHaveLength(1);
+    expect(reads).toBe(2);
+    expect(result.released).toHaveLength(0);
+    expect(result.failed).toEqual([{ reservationId: 'res-1', attemptId: 'att-1', reason: 'changed' }]);
+    expect(harness.journalEntries[1]?.outcome).toBe('refused');
+  });
+
+  it('does not release when the fence finds the reservation no longer the one classified', async () => {
+    const harness = orphanHarness({
+      releaseImpl: async (request) => {
+        const stillHeld: readonly string[] = ['res-replacement'];
+        return stillHeld.includes(request.reservationId) ? { outcome: 'released' } : { outcome: 'changed' };
+      },
+    });
+    const result = await run(harness, { dryRun: false, nowIso: NOW });
+    expect(result.outcome).toBe('reaped');
+    if (result.outcome !== 'reaped') return;
+    expect(result.released).toHaveLength(0);
+    expect(result.failed).toEqual([{ reservationId: 'res-1', attemptId: 'att-1', reason: 'changed' }]);
+  });
+
+  it('releases nothing and reports every reservation unknown when a run attempt list is hostile', async () => {
+    const revoked = Proxy.revocable(['att-1'], {});
+    revoked.revoke();
+    const harness = makeHarness({
+      reservations: [reservation('res-1', 'att-1'), reservation('res-2', 'att-2')],
+      runs: [
+        { ...runRecord('run-01JB0000000000000000000001', []), attemptIds: revoked.proxy },
+        runRecord('run-01JB0000000000000000000002', ['att-2']),
+      ],
+      journalsByRun: new Map([['run-01JB0000000000000000000002', [conductEntry('run-01JB0000000000000000000002', 'merged')]]]),
+      attempts: new Map([
+        ['att-1', attemptRecord('att-1')],
+        ['att-2', attemptRecord('att-2')],
+      ]),
+      releaseOutcome: 'released',
+    });
+    const result = await run(harness, { dryRun: false, nowIso: NOW });
+    expect(result.outcome).toBe('reaped');
+    if (result.outcome !== 'reaped') return;
+    expect(harness.releaseCalls).toHaveLength(0);
+    expect(harness.journalEntries).toHaveLength(0);
+    expect(result.released).toHaveLength(0);
+    expect(result.unknown).toEqual([
+      { reservationId: 'res-1', attemptId: 'att-1', reason: 'run-state-unknown' },
+      { reservationId: 'res-2', attemptId: 'att-2', reason: 'run-state-unknown' },
+    ]);
   });
 });

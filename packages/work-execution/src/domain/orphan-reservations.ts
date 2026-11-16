@@ -112,7 +112,7 @@ interface ReservationSnapshot {
 
 /** How one untrusted array read ended: a bounded length, not an array, or a read that threw. */
 type ArrayRead =
-  | { readonly kind: 'array'; readonly length: number }
+  | { readonly kind: 'array'; readonly length: number; readonly truncated: boolean }
   | { readonly kind: 'not-array' }
   | { readonly kind: 'unreadable' };
 
@@ -126,7 +126,8 @@ function readArrayLength(value: unknown, max: number): ArrayRead {
     if (typeof raw !== 'number') {
       return { kind: 'unreadable' };
     }
-    return { kind: 'array', length: Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), max) : 0 };
+    const length = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+    return { kind: 'array', length: Math.min(length, max), truncated: length > max };
   } catch {
     return { kind: 'unreadable' };
   }
@@ -275,17 +276,17 @@ function snapshotRun(element: unknown): Record<string, unknown> | null {
 /** The attempt ids in one run's `attemptIds`, every read guarded; an unreadable read marks the listing incomplete. */
 function readAttemptIdList(raw: unknown): RunListing {
   const read = readArrayLength(raw, MAX_ORPHAN_RESERVATION_SCAN);
-  if (read.kind === 'not-array') {
-    return { ids: [], complete: true };
-  }
-  if (read.kind === 'unreadable') {
+  if (read.kind !== 'array') {
+    // A missing or non-array list says nothing about what the run holds.
     return { ids: [], complete: false };
   }
   const ids: string[] = [];
-  let complete = true;
+  // Ids past the scan cap are never read: the listing is incomplete.
+  let complete = !read.truncated;
   for (let index = 0; index < read.length; index += 1) {
     const value = safeElementAt(raw as readonly unknown[], index);
-    if (!value.ok) {
+    if (!value.ok || isHole(raw as readonly unknown[], index)) {
+      // An unreadable element or a hole may hide a listed attempt.
       complete = false;
     } else if (typeof value.value === 'string' && value.value.length > 0) {
       ids.push(value.value);
@@ -326,15 +327,20 @@ function collectRunListings(
   runStates: OrphanReservationRunStates | undefined,
 ): RunListings {
   const byAttemptId = new Map<string, (LaneRunStateValue | 'unreadable' | undefined)[]>();
-  let incomplete = false;
-  const runCount = boundedLength(runs, MAX_RUN_SCAN);
+  // Runs at index MAX_RUN_SCAN and beyond are dropped (the first MAX_RUN_SCAN
+  // by index are read), and a run that cannot be read as a plain record may
+  // list any attempt: either marks the whole sweep incomplete.
+  const read = readArrayLength(runs, MAX_RUN_SCAN);
+  let incomplete = read.kind !== 'array' || read.truncated;
+  const runCount = read.kind === 'array' ? read.length : 0;
   for (let index = 0; index < runCount; index += 1) {
     const element = safeElementAt(runs as readonly unknown[], index);
-    if (!element.ok || element.value === undefined || element.value === null || isHole(runs as readonly unknown[], index)) {
-      continue;
-    }
-    const snap = snapshotRun(element.value);
+    const snap =
+      !element.ok || element.value === undefined || element.value === null || isHole(runs as readonly unknown[], index)
+        ? null
+        : snapshotRun(element.value);
     if (snap === null) {
+      incomplete = true;
       continue;
     }
     const listing = readAttemptIdList(snap['attemptIds']);

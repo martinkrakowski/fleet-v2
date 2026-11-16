@@ -341,6 +341,25 @@ function releaseVerdict(release: StoreCallResult<{ readonly outcome: 'released' 
   return { journalOutcome: mapping.journal, failedReason: mapping.failedReason };
 }
 
+/**
+ * The revision a re-read attempt reads as: an absent attempt and an absent
+ * revision on a present attempt read as 0; a wrong-typed or negative
+ * revision is unreadable (null).
+ */
+function revisionOf(attempt: { readonly revision?: unknown } | null | undefined): number | null {
+  if (attempt === null) {
+    return 0;
+  }
+  if (attempt === undefined) {
+    return null;
+  }
+  const revision = attempt.revision;
+  if (revision === undefined) {
+    return 0;
+  }
+  return typeof revision === 'number' && Number.isInteger(revision) && revision >= 0 ? revision : null;
+}
+
 const sortByReservationId = <T extends { readonly reservationId: string }>(list: T[]): T[] =>
   list.sort((left, right) => byCodeUnit(left.reservationId, right.reservationId));
 
@@ -502,7 +521,7 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
           readAttemptRevision: async () => {
             try {
               const fresh = await withBudget(this.deps.attemptRepo.findAttemptById(orphan.attemptId), timeoutMs);
-              return fresh?.revision ?? (fresh === null ? 0 : null);
+              return revisionOf(fresh);
             } catch {
               return null;
             }

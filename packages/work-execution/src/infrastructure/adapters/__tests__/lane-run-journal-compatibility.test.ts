@@ -351,6 +351,29 @@ function baseFacts(overrides: Partial<LaneRunFacts> = {}): LaneRunFacts {
 
 const SEALED_COLLECTION = { commits: 2, manifest: 'sealed' as const, headUnchanged: false };
 
+/** Exhaustive memberships for projection-helper results, asserted per fixture. */
+const GATE_FACTS = ['none', 'pending', 'passed', 'failed', 'unknown', 'congested'] as const;
+const PREMERGE_POSTS = ['none', 'success', 'failure', 'refused'] as const;
+const DISPATCH_RESULTS = ['none', 'not-started', 'started'] as const;
+const DECISION_KINDS = [
+  'act', 'wait', 'enter', 'park', 'reconcile', 'stop', 'resume',
+] as const;
+
+/** The projection step a step-shaped key contributes to a pending intent, else null. */
+function pendingStepOf(key: string): string | null {
+  const parsed = parseLaneRunKey(key);
+  if (parsed === null) {
+    return null;
+  }
+  if (parsed.kind === 'step') {
+    return parsed.step;
+  }
+  if (parsed.kind === 'premerge' || parsed.kind === 'merge-enqueue') {
+    return parsed.kind;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 
 describe('released run-journal key-format fixtures', () => {
@@ -379,6 +402,41 @@ describe('released run-journal key-format fixtures', () => {
         });
         expect(readLaneRunJournalEntry(raw)).toEqual({ ok: true, entry: expect.objectContaining({ key: raw.key }) });
         expect(readLaneRunJournalEntryRecord(raw).ok).toBe(true);
+      }
+      // Replay the fixture through the projection helpers on the current build.
+      expect(laneRunJournalState(listed, RUN_ID)).toBe('ready');
+      expect(Object.keys(laneRunJournalStopFacts(listed, RUN_ID)).sort()).toEqual([
+        'stopMode', 'stopRequestedAtIso',
+      ]);
+      expect(GATE_FACTS).toContain(laneRunGateFact(listed, RUN_ID, HEAD12));
+      expect(PREMERGE_POSTS).toContain(laneRunPremergePost(listed, RUN_ID, HEAD12));
+      expect(laneRunAttemptPlacement(listed, RUN_ID, 'attempt-example-1')).toBeNull();
+      for (const key of fixture.keys) {
+        expect(DISPATCH_RESULTS).toContain(laneRunJournalDispatchResult(listed, key));
+      }
+
+      // Advance the replayed journal through the decider: an unread step intent
+      // reconciles its own key in any state; journals with only non-step keys
+      // (control, channel, merge-queue) still yield a decision, never a throw.
+      const pending = laneRunJournalPendingIntent(listed, RUN_ID);
+      const lastStepKey = [...fixture.keys].reverse().find((key) => pendingStepOf(key) !== null) ?? null;
+      if (lastStepKey === null) {
+        expect(pending).toBeNull();
+      } else {
+        expect(pending).toEqual({
+          key: lastStepKey,
+          step: pendingStepOf(lastStepKey),
+          reconciliation: 'unread',
+        });
+      }
+      const decision: LaneRunDecision = nextLaneRunAction(record(), baseFacts({
+        state: laneRunJournalState(listed, RUN_ID),
+        pendingIntent: pending,
+        attempt: attemptFact({ phase: 'ended' }),
+      }), NOW);
+      expect(DECISION_KINDS).toContain(decision.kind);
+      if (pending !== null && pending.reconciliation === 'unread') {
+        expect(decision).toEqual({ kind: 'reconcile', step: pending.step, key: pending.key });
       }
       expect(target).toBe(path.join(dir, 'run-journal.json'));
     }

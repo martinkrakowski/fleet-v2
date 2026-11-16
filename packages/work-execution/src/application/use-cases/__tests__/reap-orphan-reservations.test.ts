@@ -340,6 +340,51 @@ describe('ReapOrphanReservationsUseCase', () => {
     expect(nonArray.journalEntries).toHaveLength(0);
   });
 
+  it('reads the reservations length exactly once, so a length that throws on a later read cannot reject the pass', async () => {
+    let lengthReads = 0;
+    const twoFaced = new Proxy([] as CapacityReservationRecord[], {
+      get(target, prop, receiver) {
+        if (prop === 'then') {
+          return undefined;
+        }
+        if (prop === 'length') {
+          lengthReads += 1;
+          if (lengthReads > 1) {
+            throw new Error('second length read');
+          }
+          return 0;
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const harness = makeHarness({ reservationsImpl: () => Promise.resolve(twoFaced as readonly CapacityReservationRecord[]), runs: [] });
+    await expect(run(harness, { dryRun: false, nowIso: NOW })).resolves.toEqual({
+      outcome: 'reaped', dryRun: false, orphans: [], reportOnly: [], released: [], skipped: [], failed: [], journalFailed: [], unknown: [],
+    });
+    expect(lengthReads).toBe(1);
+    expect(harness.releaseCalls).toHaveLength(0);
+    expect(harness.releaseCallsUnfenced).toHaveLength(0);
+  });
+
+  it('fails closed as unknown reservations-unreadable when more reservations are held than the scan cap', async () => {
+    // 10,001 held reservations: the 10,001st (index 10,000) is a terminal-run
+    // orphan that a truncated scan would silently drop while still reporting
+    // a clean reap. The pass must refuse to classify at all instead.
+    const beyondCap = Array.from({ length: 10_000 }, (_, index) => reservation(`res-held-${index}`, `att-held-${index}`));
+    beyondCap.push(reservation('res-orphan-10000', 'att-orphan-10000', { held: true }));
+    const harness = makeHarness({
+      reservations: beyondCap,
+      runs: [runRecord('run-01JB0000000000000000000001', ['att-orphan-10000'])],
+      journalsByRun: new Map([['run-01JB0000000000000000000001', [conductEntry('run-01JB0000000000000000000001', 'merged')]]]),
+      attempts: new Map([['att-orphan-10000', attemptRecord('att-orphan-10000')]]),
+    });
+    await expect(run(harness, { dryRun: false, nowIso: NOW })).resolves.toEqual({ outcome: 'unknown', reason: 'reservations-unreadable' });
+    expect(harness.listRunsCalls).toBe(0);
+    expect(harness.releaseCalls).toHaveLength(0);
+    expect(harness.releaseCallsUnfenced).toHaveLength(0);
+    expect(harness.journalEntries).toHaveLength(0);
+  });
+
   it('returns unknown runs-unreadable on throw, timeout, or non-array', async () => {
     const throwing = makeHarness({ reservations: [], runsImpl: () => Promise.reject(new Error('down')) });
     await expect(run(throwing, { dryRun: false, nowIso: NOW })).resolves.toEqual({ outcome: 'unknown', reason: 'runs-unreadable' });

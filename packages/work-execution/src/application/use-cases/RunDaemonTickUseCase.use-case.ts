@@ -23,6 +23,7 @@ import {
   DAEMON_REPO_DIGEST_PATTERN,
   DAEMON_TICK_ID_PATTERN,
   chainRefreshJobId,
+  chainSweepJobId,
   computeCallBudget,
   computeTickDeadlineIso,
   decideDaemonJobLease,
@@ -77,6 +78,7 @@ import type {
 } from '../ports/in/RunDaemonTickPort.in-port.js';
 import type { RunMergePassPort, RunMergePassResult } from '../ports/in/RunMergePassPort.in-port.js';
 import type { RefreshChainsPort, RefreshChainsResult } from '../ports/in/RefreshChainsPort.in-port.js';
+import type { SweepChainsPort, SweepChainsResult } from '../ports/in/SweepChainsPort.in-port.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
@@ -113,6 +115,8 @@ export interface RunDaemonTickDependencies {
   readonly chainRefreshMode?: 'shadow' | 'invalid';
   /** Raises the channel-level attention item when `chainRefreshMode` is `invalid`. */
   readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
+  /** The chain-sweep use case; absent registers no chain-sweep job (lane CO11). */
+  readonly chainSweep?: SweepChainsPort;
   /** The tick clock; production real time, tests a fake. Absent means the system clock. */
   readonly now?: () => string;
   /** The tick sleep, awaited for the wake settle delay. Absent means a `setTimeout` promise. */
@@ -133,6 +137,8 @@ export interface DaemonJobRegistryDependencies {
   readonly chainRefreshMode?: 'shadow' | 'invalid';
   /** Raises the policy-level attention item when `chainRefreshMode` is `invalid`. */
   readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
+  /** The chain-sweep use case; absent registers no chain-sweep job (lane CO11). */
+  readonly chainSweep?: SweepChainsPort;
 }
 
 /** One journal key a merge pass reported as journalled, with the queue entry it acts on. */
@@ -424,6 +430,59 @@ class ChainRefreshJob implements DaemonJobPort {
   }
 }
 
+/** CO11's pass result → the DaemonJobOutcome the tick records; a malformed result is refused. */
+function toChainSweepJobOutcome(result: SweepChainsResult): DaemonJobOutcome {
+  if (!isRecord(result)) {
+    return { outcome: 'refused', reasonCode: 'chain-sweep-malformed' };
+  }
+  switch (result.outcome) {
+    case 'completed':
+      return { outcome: 'completed', progressed: false };
+    case 'budget-exhausted':
+      return { outcome: 'budget-exhausted', progressed: false };
+    case 'dry-run':
+      // A composed sweep job always runs in apply mode; a dry-run answer is a
+      // malformed job, never a skip.
+      return { outcome: 'refused', reasonCode: 'chain-sweep-malformed' };
+    case 'incomplete':
+      return {
+        outcome: 'refused',
+        reasonCode: isSafeReasonCode(result.reasonCode) ? result.reasonCode : 'chain-sweep-incomplete',
+      };
+    case 'refused':
+      return {
+        outcome: 'refused',
+        reasonCode: isSafeReasonCode(result.reasonCode) ? result.reasonCode : 'job-failed',
+      };
+    default:
+      return { outcome: 'refused', reasonCode: 'chain-sweep-malformed' };
+  }
+}
+
+/**
+ * One chain-sweep job instance: wraps the sweep use case for one repository in
+ * apply mode (lane CO11). The use case still refuses every delete when the
+ * record, the membership or a branch fails its contract.
+ */
+class ChainSweepJob implements DaemonJobPort {
+  constructor(
+    private readonly repository: DaemonRepositoryRef,
+    private readonly sweep: SweepChainsPort,
+    readonly jobId: string,
+    readonly leaseScope: string,
+  ) {}
+
+  async pass(request: DaemonJobPassRequest): Promise<DaemonJobOutcome> {
+    const result = await this.sweep.runSweepChains({
+      repository: { owner: this.repository.owner, repo: this.repository.repo },
+      projectId: this.repository.projectId,
+      nowIso: request.nowIso,
+      deadlineIso: request.deadlineIso,
+      mode: 'apply',
+    });
+    return toChainSweepJobOutcome(result);
+  }
+}
 /**
  * CO8a: one chain-refresh job instance when `policy.daemon.chainRefresh` is
  * `invalid`. The job never touches the forge: it raises one policy-level
@@ -521,6 +580,20 @@ export class DaemonJobRegistry {
         }
         refreshSeen.add(repository.repoDigest);
         instances.push(new ChainRefreshJob(repository, this.deps.chainRefresh, parsed.jobId, parsed.leaseScope));
+      }
+    }
+    if (this.deps.chainSweep !== undefined) {
+      const sweepSeen = new Set<string>();
+      for (const repository of repositories) {
+        if (!isUsableRepository(repository) || sweepSeen.has(repository.repoDigest)) {
+          continue;
+        }
+        const parsed = parseDaemonJobId(chainSweepJobId(repository.repoDigest));
+        if (parsed === null || parsed.kind !== 'chain-sweep') {
+          continue;
+        }
+        sweepSeen.add(repository.repoDigest);
+        instances.push(new ChainSweepJob(repository, this.deps.chainSweep, parsed.jobId, parsed.leaseScope));
       }
     }
     return instances;
@@ -720,6 +793,7 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       ...(this.deps.chainRefresh !== undefined ? { chainRefresh: this.deps.chainRefresh } : {}),
       ...(this.deps.chainRefreshMode !== undefined ? { chainRefreshMode: this.deps.chainRefreshMode } : {}),
       ...(this.deps.chainAttention !== undefined ? { chainAttention: this.deps.chainAttention } : {}),
+      ...(this.deps.chainSweep !== undefined ? { chainSweep: this.deps.chainSweep } : {}),
     }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
     await this.settle(ctx, plan.settleDelayMs);

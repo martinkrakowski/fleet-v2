@@ -94,6 +94,7 @@ const fullV2File = {
         verifier: 'verify-override.example',
       },
       roles: ['lane-runner', 'verifier'],
+      ciRunnerSlots: [{ name: 'primary', unit: 'fleet-ci@0.service' }],
       runner: {
         kind: 'opencode',
         port: 46010,
@@ -227,6 +228,7 @@ const fullV2File = {
           maxAttempts: 3,
           checksGraceMinutes: 10,
           veto: { mode: 'shadow', holdConfidence: 0.8 },
+          prepare: ['yarn', 'install', '--immutable'],
         },
         'example-owner/second-repo': { projectId: 'second-project' },
       },

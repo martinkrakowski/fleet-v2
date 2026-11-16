@@ -43,16 +43,16 @@ import {
   decideLeaseRenew,
   readConductorDriverLease,
 } from '../../domain/lane-run-lease.js';
-import type {
-  ConductorDriverLeasePort,
-  ConductorDriverLeaseResult,
+import {
+  ConductorDriverLeaseUnreadableError,
+  type ConductorDriverLeasePort,
+  type ConductorDriverLeaseResult,
 } from '../../application/ports/out/ConductorDriverLeasePort.out-port.js';
 import {
-  StateFileUnreadableError,
-  StateFileUnreadableReadOnlyError,
   assertStoreWritable,
   inspectRecordListBytes,
   rejectUnreadableStateFile,
+  StateFileUnreadableReadOnlyError,
   withFileLock,
   writeJsonAtomically,
 } from './file-store.js';
@@ -61,7 +61,12 @@ export interface ConductorDriverLeaseAdapterOptions {
   /** When set, the lease persists here and reloads on first use. */
   readonly stateDir?: string;
   readonly fileName?: string;
-  /** Read-only mode: an unreadable marker reads as `null` without quarantining or writing. */
+  /**
+   * CO29a-ro2: read-only mode. The read never quarantines and never writes;
+   * an unreadable lease file is the port's typed `ConductorDriverLeaseUnreadableError`,
+   * never an absent lease — only a missing file is absent. Every write is
+   * refused.
+   */
   readonly readOnly?: boolean;
 }
 
@@ -133,19 +138,21 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
       const current = this.inMemoryLease;
       return current === null ? null : { ...current };
     }
+    let records: readonly ConductorDriverLeaseRecord[];
     try {
-      const current = currentLeaseOf(await this.readRecordsFromDisk(target));
-      return current === null ? null : { ...current };
+      records = await this.readRecordsFromDisk(target);
     } catch (error: unknown) {
-      if (
-        this.options?.readOnly === true &&
-        (error instanceof StateFileUnreadableError ||
-          error instanceof StateFileUnreadableReadOnlyError)
-      ) {
-        return null;
+      // CO29a-ro2: every read-only read failure other than a true ENOENT (which
+      // readRecordsFromDisk answers as an empty list) surfaces the port's typed
+      // unreadable error, never an absent lease. A writable read keeps its own
+      // error (it has already quarantined and thrown).
+      if (this.options?.readOnly === true) {
+        throw new ConductorDriverLeaseUnreadableError({ cause: error });
       }
       throw error;
     }
+    const current = currentLeaseOf(records);
+    return current === null ? null : { ...current };
   }
 
   acquire(request: LeaseAcquireRequest): Promise<ConductorDriverLeaseResult> {
@@ -225,6 +232,11 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
   private async readRecordsFromDisk(target: string): Promise<readonly ConductorDriverLeaseRecord[]> {
     let buffer: Buffer;
     try {
+      if (this.options?.readOnly === true) {
+        // A symlink (dangling or not) or a non-regular file is unreadable, never absent.
+        const info = await fs.lstat(target);
+        if (!info.isFile()) throw new StateFileUnreadableReadOnlyError(target, 'not a regular file');
+      }
       buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (

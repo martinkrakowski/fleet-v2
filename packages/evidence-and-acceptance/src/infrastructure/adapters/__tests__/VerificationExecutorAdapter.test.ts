@@ -2,12 +2,14 @@
 // ssh transport quoting, fail-closed mapping of completed outcomes, and
 // bounded output summaries. Uses the spawn seam except for one real process.
 
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { VerificationExecutorAdapter } from '../VerificationExecutorAdapter.adapter.js';
+import { posixQuote } from '../SshExecutor.adapter.js';
 import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import type {
   SpawnedVerificationOutcome,
@@ -126,7 +128,7 @@ describe('VerificationExecutorAdapter', () => {
     ]);
   });
 
-  it('runs over ssh, quoting every remote word as one POSIX argument', async () => {
+  it('runs over ssh through an explicit sh -c with every remote word single-quoted', async () => {
     const calls: RecordedSpawn[] = [];
     const adapter = new VerificationExecutorAdapter({
       allowListedCommands: {
@@ -151,13 +153,173 @@ describe('VerificationExecutorAdapter', () => {
           'ConnectTimeout=15',
           'verify.internal',
           '--',
-          "'/opt/verify run.sh'",
-          "'it'\\''s a test'",
-          `'${HEAD}'`,
+          'sh',
+          '-c',
+          posixQuote(
+            ["/opt/verify run.sh", "it's a test", HEAD].map(posixQuote).join(' '),
+          ),
         ],
         options: { timeout: 5000 },
       },
     ]);
+  });
+
+  it('spawns ssh whose last three argv entries are sh, -c, and the twice-quoted command line', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: {
+        ci: {
+          command: "/opt/verify run.sh",
+          args: ["it's a test", '-n', '$(id)', '', 'a b', 'a\\b', 'a\nb', '!'],
+        },
+      },
+      sshHost: 'verify.internal',
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    assertCompleted(result);
+    expect(result.result).toBe('pass');
+    expect(calls).toHaveLength(1);
+    const argv = [...calls[0].args];
+    expect(argv[argv.length - 3]).toBe('sh');
+    expect(argv[argv.length - 2]).toBe('-c');
+    const remoteProgram = argv[argv.length - 1];
+    const words = [
+      "/opt/verify run.sh",
+      "it's a test",
+      '-n',
+      '$(id)',
+      '',
+      'a b',
+      'a\\b',
+      'a\nb',
+      '!',
+      HEAD,
+    ].map(posixQuote);
+    const commandLine = words.join(' ');
+    expect(remoteProgram).toBe(
+      "'" + commandLine.replace(/'/g, "'\\''") + "'",
+    );
+    // Unquoting the program must recover exactly the space-joined words.
+    expect(remoteProgram.slice(1, -1).replace(/'\\''/g, "'")).toBe(commandLine);
+  });
+
+  it('reproduces every remote argument byte-identically through a local /bin/sh -c round trip', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: {
+        ci: {
+          command: '/opt/verify run.sh',
+          args: ["it's a test", '-n', '$(id)', '', 'a b', 'a\\b', 'a\nb', '!'],
+        },
+      },
+      sshHost: 'verify.internal',
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    await adapter.executeVerificationCheck(checkRequest());
+
+    const argv = [...calls[0].args];
+    const dashDashIndex = argv.indexOf('--');
+    const remoteProgram = argv[dashDashIndex + 3];
+    const remoteArguments = [
+      '/opt/verify run.sh',
+      "it's a test",
+      '-n',
+      '$(id)',
+      '',
+      'a b',
+      'a\\b',
+      'a\nb',
+      '!',
+      HEAD,
+    ];
+    // ssh joins the words after the destination with spaces into one line
+    // for the remote login shell: `sh -c '<remoteProgram>'`. Replicate that
+    // locally in two shell parses. In each parse the printf format string is
+    // the literal '%s\0' and the parsed words are captured as printf
+    // arguments (`printf '%s\0' "$@"` shape) — the remote command line is
+    // never spliced into a format string. Parse 1 recovers the program text
+    // the remote login shell would hand to `sh -c`; parse 2 parses that text
+    // as the inner sh would and echoes every resulting argument
+    // NUL-separated.
+    const remoteLine = argv.slice(dashDashIndex + 1).join(' ');
+    const parsed = spawnSync('/bin/sh', ['-c', "printf '%s\\0' " + remoteLine], {
+      encoding: 'buffer',
+    });
+    expect(parsed.status).toBe(0);
+    const loginWords = (parsed.stdout as Buffer).toString('utf8').split('\0');
+    expect(loginWords.pop()).toBe('');
+    expect(loginWords).toEqual(['sh', '-c', remoteProgram.slice(1, -1).replace(/'\\''/g, "'")]);
+    const programText = loginWords[loginWords.length - 1];
+    const echoed = spawnSync('/bin/sh', ['-c', "printf '%s\\0' " + programText], {
+      encoding: 'buffer',
+    });
+    expect(echoed.status).toBe(0);
+    const words = (echoed.stdout as Buffer).toString('utf8').split('\0');
+    expect(words[words.length - 1]).toBe('');
+    expect(words.slice(0, -1)).toEqual(remoteArguments);
+  });
+
+  it('refuses to spawn when the command contains a NUL byte', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: { command: '/opt/verify-\0run.sh' } },
+      sshHost: 'verify.internal',
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    assertCompleted(result);
+    expect(result.result).toBe('unknown');
+    expect(result.exitCode).toBeNull();
+    expect(result.outputSummary).toBe(
+      "verification command contains a NUL byte; refusing to run 'ci'",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses to spawn when an argument contains a NUL byte', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: { command: '/opt/verify-run.sh', args: ['--profile', 'ci\0'] } },
+      sshHost: 'verify.internal',
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    assertCompleted(result);
+    expect(result.result).toBe('unknown');
+    expect(result.exitCode).toBeNull();
+    expect(result.outputSummary).toBe(
+      "verification command contains a NUL byte; refusing to run 'ci'",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses to spawn when the candidate head sha contains a NUL byte', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      sshHost: 'verify.internal',
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const result = await adapter.executeVerificationCheck(
+      checkRequest({ candidateHeadSha: '1111111\0' }),
+    );
+
+    assertCompleted(result);
+    expect(result.result).toBe('unknown');
+    expect(result.exitCode).toBeNull();
+    expect(result.outputSummary).toBe(
+      "verification command contains a NUL byte; refusing to run 'ci'",
+    );
+    expect(calls).toHaveLength(0);
   });
 
   it('maps exit code 1 to fail and keeps the check output', async () => {

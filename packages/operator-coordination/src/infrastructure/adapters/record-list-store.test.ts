@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { StateFileUnreadableError } from './file-store.js';
+import { StateFileUnreadableError, StateFileUnreadableReadOnlyError } from './file-store.js';
 import { readRecordList } from './record-list-store.js';
 
 interface TestRecord {
@@ -88,5 +88,38 @@ describe('readRecordList', () => {
     expect(seen).toEqual([{ id: 'first' }, { id: '' }]);
     const copies = await fs.readdir(path.join(tempDir, 'quarantine'));
     expect(copies).toHaveLength(1);
+  });
+
+  describe('readOnly (CO29a-ro2)', () => {
+    it('never quarantines: an unreadable store file answers the typed read-only error', async () => {
+      const garbage = '{ not json CANARY-bytes';
+      await fs.writeFile(storePath, garbage, 'utf8');
+      await expect(
+        readRecordList(storePath, 'TestAdapter', toTestRecord, true),
+      ).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+      expect(await fs.readFile(storePath, 'utf8')).toBe(garbage);
+      await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+
+    it('a missing file is still known absence, and a readable file still reads', async () => {
+      expect(await readRecordList(storePath, 'TestAdapter', toTestRecord, true)).toEqual([]);
+      await fs.writeFile(storePath, JSON.stringify([{ id: 'first' }]), 'utf8');
+      expect(await readRecordList(storePath, 'TestAdapter', toTestRecord, true)).toEqual([
+        { id: 'first' },
+      ]);
+    });
+  });
+
+  it('the default read still quarantines corrupt bytes (unchanged)', async () => {
+    const garbage = '{ not json CANARY-bytes';
+    await fs.writeFile(storePath, garbage, 'utf8');
+    await expect(readRecordList(storePath, 'TestAdapter', toTestRecord)).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+    const copies = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(copies).toHaveLength(1);
+    expect(await fs.readFile(path.join(tempDir, 'quarantine', copies[0]), 'utf8')).toBe(garbage);
   });
 });

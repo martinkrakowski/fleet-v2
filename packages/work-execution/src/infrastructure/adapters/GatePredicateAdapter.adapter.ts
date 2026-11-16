@@ -114,6 +114,8 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
 /** The fixed last stderr line `bin/gate-slot` prints when no slot freed up (KF-30a). */
 const GATE_SLOT_WAIT_LIMIT_LINE = 'gate-slot: no slot within the wait limit';
 const GATE_SLOT_EXIT_CODE = 75;
+/** Exit codes the OS or cgroup produces when it kills a command (SIGKILL/SIGTERM). */
+const RESOURCE_EXHAUSTED_EXIT_CODES: ReadonlySet<number> = new Set([137, 143]);
 /** The slot wait may use at most a third of the command budget, capped at 600 s. */
 const GATE_SLOT_MAX_WAIT_SECONDS = 600;
 const GATE_SLOT_WAIT_DIVISOR_MS = 3000;
@@ -174,6 +176,27 @@ function mapVerdict(value: EvidenceResultValue): GatePredicateVerdict {
     return 'fail';
   }
   return 'unknown';
+}
+
+/**
+ * A command the OS or cgroup killed with SIGKILL (exit 137) or SIGTERM
+ * (exit 143) never reported its own verdict: it is `unknown` with
+ * `cause: 'resource-exhausted'`, so the run retries under the congestion
+ * backoff instead of recording a hard failure.
+ */
+function resourceExhaustedResult(name: string, exitCode: number, durationMs: number): GatePredicateResult {
+  return {
+    name,
+    kind: 'command',
+    verdict: 'unknown',
+    exitCode,
+    durationMs,
+    detail:
+      exitCode === 137
+        ? 'resource exhausted (exit 137, SIGKILL)'
+        : 'resource exhausted (exit 143, SIGTERM)',
+    cause: 'resource-exhausted',
+  };
 }
 
 function detailForCommand(
@@ -827,10 +850,14 @@ export class GatePredicateAdapter implements GatePredicatePort {
     // not the command's own verdict — earlier stderr lines (ssh warnings) do
     // not matter. A congestion `unknown` verdict parks the run `ambiguous` at
     // the gate, fail closed and visible to the owner; automatic wait-and-retry
-    // is a separate unit (KF-30c). Without a declared gate slot, exit 75 is
-    // the command's own result. Any other exit 75 stays the command's result.
+    // is a separate unit (KF-30c). A run carrying an executor error (such as
+    // an executor timeout) is never congestion, even when its partial stderr
+    // ends with the fixed line — its exit code is not the command's verdict.
+    // Without a declared gate slot, exit 75 is the command's own result. Any
+    // other exit 75 stays the command's result.
     if (
       gateSlot !== undefined &&
+      run.error === undefined &&
       run.exitCode === GATE_SLOT_EXIT_CODE &&
       lastStderrLine(run.stderr) === GATE_SLOT_WAIT_LIMIT_LINE
     ) {
@@ -843,6 +870,14 @@ export class GatePredicateAdapter implements GatePredicatePort {
         detail: 'gate slot wait limit reached',
         cause: 'gate-slot-wait-limit',
       };
+    }
+
+    // KF-30c: a command killed by the OS or cgroup under concurrent gate load
+    // (SIGKILL 137, SIGTERM 143) never reported its own verdict. Only a run
+    // that completed with one of those exit codes is congestion; a run with
+    // an executor error or no exit code stays `unknown` with no cause.
+    if (run.error === undefined && run.exitCode !== null && RESOURCE_EXHAUSTED_EXIT_CODES.has(run.exitCode)) {
+      return resourceExhaustedResult(name, run.exitCode, this.nowMs() - started);
     }
 
     const raw = rawVerdict(run, this.isRemote(executor));

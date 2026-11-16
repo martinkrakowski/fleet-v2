@@ -30,8 +30,12 @@
 
 import type { AttemptRecord, AttemptRunnerRecord } from '../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
-import { isConductorHalted, isZonedIsoDateTime } from '../../domain/conductor-halt.js';
-import { isLeaseLapsed } from '../../domain/lane-run-lease.js';
+import {
+  isConductorHalted,
+  isZonedIsoDateTime,
+  type ConductorHaltState,
+} from '../../domain/conductor-halt.js';
+import { isLeaseLapsed, type ConductorDriverLeaseRecord } from '../../domain/lane-run-lease.js';
 import { pathUnderPrefix } from '../../domain/lane-diff-check.js';
 import type {
   InventoryRelaunchPort,
@@ -61,6 +65,11 @@ export interface InventoryRelaunchDependencies {
   readonly halt: Pick<ConductorHaltPort, 'read'>;
   readonly driverLease: Pick<ConductorDriverLeasePort, 'read'>;
   readonly runnerForAttempt?: RunnerForAttemptPort;
+  /**
+   * Read-only probe: whether the state directory exists and is a directory.
+   * False refuses the inventory (a missing directory is not an empty installation).
+   */
+  readonly stateAvailable?: () => Promise<boolean>;
   /** The digest used for an unrecorded worktree's lane id (12 hex of the path's digest). */
   readonly computeDigest: (text: string) => string;
 }
@@ -228,6 +237,16 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
 
+    if (deps.stateAvailable !== undefined) {
+      let available = false;
+      try {
+        available = await deps.stateAvailable();
+      } catch {
+        available = false;
+      }
+      if (!available) return { outcome: 'refused', reason: 'records-unreadable' };
+    }
+
     // 1. Read the records. Without them no population can be told, so an
     //    unreadable store refuses the inventory instead of guessing every
     //    listed worktree unrecorded. Nothing is thrown out of the use case.
@@ -272,9 +291,13 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     const hostNames = new Set<string>(clones.map((clone) => clone.hostName));
     const hosts = [...hostNames].sort(byCodeUnit).map((hostName) => hostInventory(hostName, rows, listing));
 
-    // 7. Conductor status. An unreadable halt marker reads as halted; an
-    //    unreadable lease is unknown, never absent.
-    const conductor = await this.readConductor(request.nowIso, runs.length);
+    // 7. Conductor status. Unreadable input stays unknown: an unreadable halt
+    //    marker or driver lease makes the whole inventory unknown instead of
+    //    inventing a halted flag or a lease state (CO29a-ro2).
+    const conductor = await this.readConductorStatus(request.nowIso, runs.length);
+    if ('unreadable' in conductor) {
+      return { outcome: 'unknown', reason: conductor.unreadable === 'halt' ? 'halt-unreadable' : 'lease-unreadable' };
+    }
     const riskFlags: RelaunchRiskFlag[] = [];
     if (conductor.halted) riskFlags.push({ code: 'conductor-halted', count: 1 });
     if (conductor.driverLease === 'live') riskFlags.push({ code: 'driver-lease-live', count: 1 });
@@ -497,23 +520,37 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     row.ownership = 'none';
   }
 
-  private async readConductor(nowIso: string, runCount: number): Promise<RelaunchConductorStatus> {
+  /**
+   * The conductor's status, or the part of it that could not be read. A
+   * missing halt marker is clear and a missing lease is absent; unreadable
+   * bytes are never a value — the marker's `unreadable` state and any thrown
+   * read answer as unknown for the whole inventory (CO29a-ro2).
+   */
+  private async readConductorStatus(
+    nowIso: string,
+    runCount: number,
+  ): Promise<RelaunchConductorStatus | { readonly unreadable: 'halt' | 'lease' }> {
     const deps = this.deps;
-    let halted = true;
+    let haltState: ConductorHaltState;
     try {
-      if (deps !== undefined) halted = isConductorHalted(await deps.halt.read());
+      haltState =
+        deps !== undefined ? await deps.halt.read() : { state: 'clear' as const, record: null };
     } catch {
-      halted = true;
+      // A halt read that cannot be completed is unreadable, never halted.
+      return { unreadable: 'halt' };
     }
-    let driverLease: RelaunchConductorStatus['driverLease'] = 'unknown';
+    if (haltState.state === 'unreadable') {
+      return { unreadable: 'halt' };
+    }
+    const halted = isConductorHalted(haltState);
+    let lease: ConductorDriverLeaseRecord | null;
     try {
-      if (deps !== undefined) {
-        const lease = await deps.driverLease.read();
-        driverLease = lease === null ? 'absent' : isLeaseLapsed(lease, nowIso) ? 'lapsed' : 'live';
-      }
+      lease = deps !== undefined ? await deps.driverLease.read() : null;
     } catch {
-      driverLease = 'unknown';
+      // An unreadable lease is unknown, never absent.
+      return { unreadable: 'lease' };
     }
+    const driverLease = lease === null ? 'absent' : isLeaseLapsed(lease, nowIso) ? 'lapsed' : 'live';
     return { halted, driverLease, runCount };
   }
 }

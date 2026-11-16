@@ -9,13 +9,25 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+// `resolveRepoRoot` walks up from this module's own URL; pointing
+// `fileURLToPath` at a path with no `bin/ocm-run` ancestor makes the
+// auto-resolution fail, which is how the unresolved-repoRoot tests force
+// the refusal path. Every other `node:url` export stays real.
+vi.mock('node:url', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:url')>();
+  return {
+    ...actual,
+    fileURLToPath: () => '/nonexistent-fleet-doctor-probes-root',
+  };
+});
 
 import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
 import type { SeatModel } from '@fleet/installation';
 
-import { GH_BINARY_CANDIDATES } from '../gh-binary.js';
+import { GH_BINARY_CANDIDATES, hasGhTokenEnv } from '../gh-binary.js';
 import type {
   DoctorCommandExecutor,
   DoctorCommandRunOptions,
@@ -356,6 +368,179 @@ describe('createNodeDoctorProbes', () => {
     expect(result?.candidates).toEqual(GH_BINARY_CANDIDATES);
   });
 
+  it('returns fail without spawning gh when no token variable is present', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor, serviceEnv: {} });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: false,
+      authCheck: { outcome: 'fail', reason: 'no GH_TOKEN or GITHUB_TOKEN in service environment' },
+    });
+    // An empty-string token is as good as absent; nothing is spawned either way.
+    await expect(
+      probes.ghAuth!('/usr/bin/gh'),
+    ).resolves.toMatchObject({ tokenPresent: false });
+    expect(local.calls).toHaveLength(0);
+    const emptyTokenProbes = createNodeDoctorProbes({
+      localExecutor: fakeExecutor({}).executor,
+      serviceEnv: { GH_TOKEN: '' },
+    });
+    await expect(emptyTokenProbes.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({
+      tokenPresent: false,
+      authCheck: { outcome: 'fail' },
+    });
+  });
+
+  it('maps non-zero gh auth status exit to fail without leaking stdout or stderr', async () => {
+    const local = fakeExecutor({
+      exitCode: 1,
+      signal: null,
+      stdout: 'Logged in to github.com account octocat',
+      stderr: 'secret detail',
+    });
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'fail', reason: 'gh auth status failed' },
+    });
+    expect(local.calls).toEqual([
+      { argv: ['/usr/bin/gh', 'auth', 'status'], options: { timeoutMs: 5_000 } },
+    ]);
+  });
+
+  it('maps spawn error or empty binary path to unknown', async () => {
+    const local = fakeExecutor({
+      exitCode: null,
+      signal: null,
+      stdout: '',
+      stderr: '',
+      error: 'spawn ENOENT',
+    });
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'unknown', reason: 'gh auth status timed out or could not be run' },
+    });
+    await expect(probes.ghAuth!('   ')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'unknown', reason: 'gh auth status could not be run' },
+    });
+  });
+
+  it('maps timed-out or signaled gh auth status to unknown', async () => {
+    const local = fakeExecutor({
+      exitCode: null,
+      signal: 'SIGTERM',
+      stdout: '',
+      stderr: '',
+    });
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'unknown', reason: 'gh auth status timed out or could not be run' },
+    });
+    expect(local.calls).toHaveLength(1);
+  });
+
+  it('returns unknown when ghAuthTimeoutMs budget is exhausted', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+      ghAuthTimeoutMs: 0,
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'unknown', reason: 'gh auth status could not be run' },
+    });
+    const negative = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+      ghAuthTimeoutMs: -1,
+    });
+    await expect(negative.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({
+      authCheck: { outcome: 'unknown' },
+    });
+    expect(local.calls).toHaveLength(0);
+  });
+
+  it('passes a positive ghAuthTimeoutMs budget to the executor', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+      ghAuthTimeoutMs: 1_234,
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({
+      authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+    });
+    expect(local.calls).toEqual([
+      { argv: ['/usr/bin/gh', 'auth', 'status'], options: { timeoutMs: 1_234 } },
+    ]);
+  });
+
+  it('honours a serviceEnv function and treats null or undefined env as no token', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: () => ({ GITHUB_TOKEN: 'token-value' }),
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({ tokenPresent: true });
+    const nullEnv = createNodeDoctorProbes({
+      localExecutor: fakeExecutor({}).executor,
+      // The guard exists for embedders that hand a null environment through
+      // the wider `Readonly<Record<...>>` type.
+      serviceEnv: null as unknown as Readonly<Record<string, string | undefined>>,
+    });
+    await expect(nullEnv.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({
+      tokenPresent: false,
+    });
+    // Only the token-bearing reader spawned `gh`; the null env did not.
+    expect(local.calls).toEqual([
+      { argv: ['/usr/bin/gh', 'auth', 'status'], options: { timeoutMs: 5_000 } },
+    ]);
+  });
+
+  it('rejects on a throwing serviceEnv getter so doctor turns it into unknown', async () => {
+    const throwingEnv = Object.defineProperties(
+      {} as Record<string, string | undefined>,
+      {
+        GH_TOKEN: {
+          get() {
+            throw new Error('unreadable');
+          },
+          enumerable: true,
+        },
+      },
+    );
+    const probes = createNodeDoctorProbes({ serviceEnv: throwingEnv });
+    await expect(probes.ghAuth!('/usr/bin/gh')).rejects.toThrow('unreadable');
+    const throwingReader = createNodeDoctorProbes({
+      serviceEnv: () => {
+        throw new Error('env unavailable');
+      },
+    });
+    await expect(throwingReader.ghAuth!('/usr/bin/gh')).rejects.toThrow('env unavailable');
+  });
+
+  it('hasGhTokenEnv checks both variable names and never exposes values', () => {
+    expect(hasGhTokenEnv(undefined)).toBe(false);
+    expect(hasGhTokenEnv(null)).toBe(false);
+    expect(hasGhTokenEnv({} as Record<string, string | undefined>)).toBe(false);
+    expect(hasGhTokenEnv([] as unknown as Record<string, string | undefined>)).toBe(false);
+    expect(hasGhTokenEnv({ GH_TOKEN: '  ' })).toBe(false);
+    expect(hasGhTokenEnv({ GITHUB_TOKEN: 'x' })).toBe(true);
+    expect(hasGhTokenEnv({ GH_TOKEN: 'x' })).toBe(true);
+  });
+
   it('probes the server with two curl runs and parses the listed models', async () => {
     const local = fakeExecutor(({ argv }) =>
       argv.some((arg) => arg.endsWith('/api/model'))
@@ -496,5 +681,287 @@ describe('seatProbeArgv', () => {
         ['opencode', 'run', '-m', '{model}#{variant}', '{prompt}'],
       ),
     ).toEqual(['opencode', 'run', '-m', 'glm-5.3', 'Reply with the single word OK and nothing else.']);
+  });
+});
+
+describe('createNodeDoctorProbes pinned-build (DB1)', () => {
+  const HEAD = 'a'.repeat(40);
+  const TIP = 'b'.repeat(40);
+
+  /** A fake executor answering per git subcommand. */
+  function gitExecutor(
+    answers: Record<string, Partial<DoctorCommandRunResult>>,
+  ): { executor: DoctorCommandExecutor; calls: RecordedCall[] } {
+    return fakeExecutor(({ argv }) => {
+      const key = argv.slice(0, 2).join(' ');
+      const answer = answers[key];
+      if (answer === undefined) {
+        throw new Error(`unexpected argv ${key}`);
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        stdout: '',
+        stderr: '',
+        ...answer,
+      };
+    });
+  }
+
+  it('reads pinnedCommit, baseTipCommit, behindCount, and installRootName via git argv arrays', async () => {
+    // `rev-parse` answers HEAD first, the base branch second; distinguish
+    // them by the third argv element.
+    const calls: RecordedCall[] = [];
+    const executor: DoctorCommandExecutor = {
+      async run(argv, options) {
+        calls.push({ argv, options });
+        if (argv[2] === 'HEAD') {
+          return { exitCode: 0, signal: null, stdout: `${TIP}\n`, stderr: '' };
+        }
+        if (argv[2] === 'origin/main') {
+          return { exitCode: 0, signal: null, stdout: `${TIP}\n`, stderr: '' };
+        }
+        throw new Error(`unexpected argv ${argv.join(' ')}`);
+      },
+    };
+    const probes = createNodeDoctorProbes({
+      localExecutor: executor,
+      repoRoot: '/srv/fleet/instances/prod-1',
+    });
+    await expect(probes.pinnedBuild!()).resolves.toEqual({
+      pinnedCommit: TIP,
+      baseTipCommit: TIP,
+      behindCount: 0,
+      installRootName: 'prod-1',
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[0].argv).toEqual(['git', 'rev-parse', 'HEAD']);
+    expect(calls[0].options).toEqual({ cwd: '/srv/fleet/instances/prod-1', timeoutMs: 10_000 });
+    expect(calls[1].argv).toEqual(['git', 'rev-parse', 'origin/main']);
+  });
+
+  it('runs rev-list --count with the commit range when the commits differ', async () => {
+    const calls: RecordedCall[] = [];
+    const executor: DoctorCommandExecutor = {
+      async run(argv, options) {
+        calls.push({ argv, options });
+        if (argv[2] === 'HEAD') {
+          return { exitCode: 0, signal: null, stdout: `${HEAD}\n`, stderr: '' };
+        }
+        if (argv[2] === 'origin/main') {
+          return { exitCode: 0, signal: null, stdout: `${TIP}\n`, stderr: '' };
+        }
+        return { exitCode: 0, signal: null, stdout: '8\n', stderr: '' };
+      },
+    };
+    const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+    await expect(probes.pinnedBuild!()).resolves.toEqual({
+      pinnedCommit: HEAD,
+      baseTipCommit: TIP,
+      behindCount: 8,
+      installRootName: 'repo',
+    });
+    expect(calls[2].argv).toEqual(['git', 'rev-list', '--count', `${HEAD}..${TIP}`]);
+    expect(calls[2].options).toEqual({ cwd: '/repo', timeoutMs: 10_000 });
+  });
+
+  it('honours a custom baseBranch dependency', async () => {
+    const calls: RecordedCall[] = [];
+    const executor: DoctorCommandExecutor = {
+      async run(argv) {
+        calls.push({ argv });
+        if (argv[2] === 'HEAD') {
+          return { exitCode: 0, signal: null, stdout: `${HEAD}\n`, stderr: '' };
+        }
+        return { exitCode: 0, signal: null, stdout: `${HEAD}\n`, stderr: '' };
+      },
+    };
+    const probes = createNodeDoctorProbes({
+      localExecutor: executor,
+      repoRoot: '/repo',
+      baseBranch: 'origin/trunk',
+    });
+    await expect(probes.pinnedBuild!()).resolves.toMatchObject({ behindCount: 0 });
+    expect(calls[1].argv).toEqual(['git', 'rev-parse', 'origin/trunk']);
+  });
+
+  it('returns undefined commits when repoRoot is unresolved', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor });
+    await expect(probes.pinnedBuild!()).resolves.toEqual({
+      pinnedCommit: undefined,
+      baseTipCommit: undefined,
+      behindCount: undefined,
+    });
+    expect(local.calls).toHaveLength(0);
+  });
+
+  it('returns undefined pinnedCommit when git rev-parse HEAD fails or times out', async () => {
+    const calls: RecordedCall[] = [];
+    const executor: DoctorCommandExecutor = {
+      async run(argv) {
+        calls.push({ argv });
+        if (argv[2] === 'HEAD') {
+          return { exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '' };
+        }
+        return { exitCode: 0, signal: null, stdout: `${TIP}\n`, stderr: '' };
+      },
+    };
+    const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+    const result = (await probes.pinnedBuild!())!;
+    expect(result.pinnedCommit).toBeUndefined();
+    expect(result.baseTipCommit).toBe(TIP);
+    expect(result.behindCount).toBeUndefined();
+    const erroring = gitExecutor({ 'git rev-parse': { error: 'spawn ENOENT' } });
+    const probes2 = createNodeDoctorProbes({
+      localExecutor: erroring.executor,
+      repoRoot: '/repo',
+    });
+    await expect(probes2.pinnedBuild!()).resolves.toMatchObject({
+      pinnedCommit: undefined,
+      baseTipCommit: undefined,
+      behindCount: undefined,
+    });
+  });
+
+  it('returns undefined baseTipCommit when git rev-parse base branch fails', async () => {
+    const executor: DoctorCommandExecutor = {
+      async run(argv) {
+        if (argv[2] === 'HEAD') {
+          return { exitCode: 0, signal: null, stdout: `${HEAD}\n`, stderr: '' };
+        }
+        return { exitCode: 128, signal: null, stdout: '', stderr: 'unknown revision' };
+      },
+    };
+    const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+    const result = (await probes.pinnedBuild!())!;
+    expect(result.pinnedCommit).toBe(HEAD);
+    expect(result.baseTipCommit).toBeUndefined();
+    expect(result.behindCount).toBeUndefined();
+  });
+
+  it('rejects malformed rev-parse output as an unreadable commit', async () => {
+    const executor: DoctorCommandExecutor = {
+      async run(argv) {
+        if (argv[2] === 'HEAD') {
+          return { exitCode: 0, signal: null, stdout: 'not-a-sha\n', stderr: '' };
+        }
+        return { exitCode: 0, signal: null, stdout: `${TIP}\n`, stderr: '' };
+      },
+    };
+    const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+    const result = (await probes.pinnedBuild!())!;
+    expect(result.pinnedCommit).toBeUndefined();
+    expect(result.baseTipCommit).toBe(TIP);
+  });
+
+  it('accepts only one well-formed sha line from git rev-parse', async () => {
+    const bad = [
+      `not-a-sha\n${HEAD}\n`,
+      `${HEAD}\nnot-a-sha\n`,
+      `${HEAD}\n${HEAD}\n`,
+      `\n${HEAD}\n`,
+      `${HEAD}\r\n`,
+      `${HEAD}\n\n`,
+      ` ${HEAD}\n`,
+      `${'A'.repeat(40)}\n`,
+      `${'a'.repeat(39)}\n`,
+      `${'a'.repeat(41)}\n`,
+      '',
+    ];
+    for (const stdout of bad) {
+      const executor: DoctorCommandExecutor = {
+        async run(argv) {
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: argv[2] === 'HEAD' ? stdout : `${TIP}\n`,
+            stderr: '',
+          };
+        },
+      };
+      const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+      const result = (await probes.pinnedBuild!())!;
+      expect(result.pinnedCommit, JSON.stringify(stdout)).toBeUndefined();
+    }
+    for (const stdout of [HEAD, `${HEAD}\n`]) {
+      const executor: DoctorCommandExecutor = {
+        async run(argv) {
+          return { exitCode: 0, signal: null, stdout: argv[2] === 'HEAD' ? stdout : `${TIP}\n`, stderr: '' };
+        },
+      };
+      const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+      expect((await probes.pinnedBuild!())!.pinnedCommit).toBe(HEAD);
+    }
+  });
+
+  it('accepts only one well-formed integer from git rev-list --count', async () => {
+    const run = async (countOut: string) => {
+      const executor: DoctorCommandExecutor = {
+        async run(argv) {
+          if (argv[1] === 'rev-list') {
+            return { exitCode: 0, signal: null, stdout: countOut, stderr: '' };
+          }
+          return { exitCode: 0, signal: null, stdout: argv[2] === 'HEAD' ? `${HEAD}\n` : `${TIP}\n`, stderr: '' };
+        },
+      };
+      const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+      return (await probes.pinnedBuild!())!.behindCount;
+    };
+    for (const bad of ['3\n4\n', 'x\n3\n', '\n3\n', '3\r\n', '3\n\n', ' 3\n', '', '99999999999999999999\n']) {
+      expect(await run(bad), JSON.stringify(bad)).toBeUndefined();
+    }
+    expect(await run('7\n')).toBe(7);
+    expect(await run('7')).toBe(7);
+  });
+
+  it('returns undefined behindCount when git rev-list fails or outputs non-integer', async () => {
+    for (const answer of [
+      { exitCode: 1, signal: null, stdout: '', stderr: 'boom' },
+      { exitCode: null, signal: 'SIGKILL', stdout: '', stderr: '' },
+      { exitCode: 0, signal: null, stdout: 'many\n', stderr: '' },
+      { exitCode: 0, signal: null, stdout: '-3\n', stderr: '' },
+      { exitCode: 0, signal: null, stdout: '2.5\n', stderr: '' },
+    ] satisfies Partial<DoctorCommandRunResult>[]) {
+      const executor: DoctorCommandExecutor = {
+        async run(argv) {
+          if (argv[0] === 'git' && argv[1] === 'rev-list') {
+            return answer;
+          }
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: argv[2] === 'HEAD' ? `${HEAD}\n` : `${TIP}\n`,
+            stderr: '',
+          };
+        },
+      };
+      const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+      const result = (await probes.pinnedBuild!())!;
+      expect(result.behindCount).toBeUndefined();
+      expect(result.pinnedCommit).toBe(HEAD);
+      expect(result.baseTipCommit).toBe(TIP);
+    }
+  });
+
+  it('delegates to an injected readPinnedBuild without spawning git', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      repoRoot: '/repo',
+      readPinnedBuild: async () => ({
+        pinnedCommit: HEAD,
+        baseTipCommit: HEAD,
+        behindCount: 0,
+        installRootName: 'override',
+      }),
+    });
+    await expect(probes.pinnedBuild!()).resolves.toEqual({
+      pinnedCommit: HEAD,
+      baseTipCommit: HEAD,
+      behindCount: 0,
+      installRootName: 'override',
+    });
+    expect(local.calls).toHaveLength(0);
   });
 });

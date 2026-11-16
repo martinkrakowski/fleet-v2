@@ -110,6 +110,10 @@ class FakeChains implements ChainRepositoryPort {
     return { outcome: 'recorded' };
   }
 
+  async recordChainSwept(): Promise<ChainRecordDecision> {
+    return { outcome: 'refused', reason: 'not used' };
+  }
+
   async recordChainIntent(): Promise<ChainRecordDecision> {
     throw new Error('not used');
   }

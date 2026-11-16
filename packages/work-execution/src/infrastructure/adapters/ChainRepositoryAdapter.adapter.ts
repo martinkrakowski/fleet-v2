@@ -54,6 +54,7 @@ import type {
   ChainRepositoryPort,
   ChainReviewPinCommand,
   ChainReviewPinDecision,
+  ChainSweptCommand,
 } from '../../application/ports/out/ChainRepositoryPort.out-port.js';
 import {
   CHAIN_REFRESH_TERMINAL_OUTCOMES,
@@ -61,6 +62,7 @@ import {
   applyChainRefreshIntent,
   applyChainRefreshOutcome,
   applyChainReviewPin,
+  applyChainSwept,
   isChainActionKey,
   isChainCommitSha,
   isChainReasonCode,
@@ -69,6 +71,7 @@ import {
   parseChainRepository,
   readChainRecord,
   reviewPinOf,
+  sweptAtIsoOf,
 } from '../../domain/chain-records.js';
 import type { ChainRecord, ChainRefreshTerminalOutcome, ChainRepositoryRef, ChainReviewPin } from '../../domain/chain-records.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
@@ -436,6 +439,43 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
         const next = applyChainRefreshOutcome(current.record, outcome as ChainRefreshTerminalOutcome, atIso);
         const check = readChainRecord(next);
         if (!check.ok) return refused('invalid-record');
+        await section.write(check.record, id);
+        return { outcome: 'recorded' } as const;
+      });
+    } catch (error) {
+      return this.refusalFor(error);
+    }
+  }
+
+  /**
+   * Record that the sweep handled a landed chain's branches (lane CO11) by CAS
+   * on the revision: sets the record's `sweptAtIso`. A record already carrying
+   * a sweep mark answers `already-recorded`; a non-`landed` record or a stale
+   * revision refuses and nothing is written.
+   */
+  async recordChainSwept(command: ChainSweptCommand): Promise<ChainRecordDecision> {
+    try {
+      const deadline = freshDeadline(own(command, 'deadlineIso'));
+      if (deadline !== 'ok') return refused(deadline);
+      const id = identityOf(own(command, 'repository'), own(command, 'chainName'));
+      const expectedRevision = own(command, 'expectedRevision');
+      const sweptAtIso = own(command, 'sweptAtIso');
+      if (id === undefined) return refused('invalid-request');
+      if (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+        return refused('invalid-request');
+      }
+      if (!isZonedIsoDateTime(sweptAtIso)) return refused('invalid-request');
+      if (this.readOnly) return refused('read-only');
+      return await this.exclusive(own(command, 'deadlineIso') as string, async (section) => {
+        const current = await section.read(id);
+        if (current.status === 'unreadable') return refused('record-unreadable');
+        if (current.status === 'not-found') return refused('chain-not-found');
+        if (sweptAtIsoOf(current.record) !== null) return { outcome: 'already-recorded' } as const;
+        if (current.record.revision !== expectedRevision) return refused('stale-revision');
+        if (current.record.state !== 'landed') return refused('invalid-record');
+        const next = applyChainSwept(current.record, sweptAtIso as string);
+        const check = readChainRecord(next);
+        if (!check.ok || sweptAtIsoOf(check.record) === null) return refused('invalid-record');
         await section.write(check.record, id);
         return { outcome: 'recorded' } as const;
       });

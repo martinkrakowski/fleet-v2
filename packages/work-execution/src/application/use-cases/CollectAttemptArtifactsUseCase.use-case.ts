@@ -27,6 +27,8 @@ import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 import type { ProcessTreeTerminationPort } from '../ports/out/ProcessTreeTerminationPort.out-port.js';
 import type { ReadUsageResult, UsagePort } from '../ports/out/UsagePort.out-port.js';
+import type { LaneUsageLogPort } from '../ports/out/LaneUsageLogPort.out-port.js';
+import { buildLaneUsageLogRow } from '../../domain/lane-usage-log.js';
 import { terminateAttemptProcessTree } from './StopAttemptUseCase.use-case.js';
 
 export interface CollectAttemptArtifactsDependencies {
@@ -52,6 +54,12 @@ export interface CollectAttemptArtifactsDependencies {
    * Without it the behaviour is unchanged.
    */
   readonly processTreeTermination?: ProcessTreeTerminationPort;
+  /**
+   * Optional (OG14). When wired with an `append`, one lane usage log row is
+   * written after the collected attempt is saved. A failing or throwing
+   * usage log never changes the collection outcome.
+   */
+  readonly usageLog?: Partial<Pick<LaneUsageLogPort, 'append'>>;
 }
 
 /**
@@ -217,6 +225,9 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       ...(usageResult !== undefined ? { usage: usageResult.usage } : {}),
       updatedAtIso: nowIso,
     };
+    // OG14: the attempt record the store accepted; the usage log row is
+    // built from it after the save and cleanup below.
+    let savedAttempt: AttemptRecord = collectedAttempt;
     try {
       await this.deps.attemptRepo.saveAttempt(collectedAttempt);
     } catch (error) {
@@ -246,6 +257,7 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
           updatedAtIso: nowIso,
         };
         await this.deps.attemptRepo.saveAttempt(rebuilt);
+        savedAttempt = rebuilt;
       } else {
         throw error;
       }
@@ -260,6 +272,19 @@ export class CollectAttemptArtifactsUseCase implements CollectAttemptArtifactsPo
       10,
       nowIso,
     );
+    // OG14: one usage row per collected attempt, after the save and the
+    // capacity/process-tree cleanup. A failing or throwing usage log never
+    // changes or fails collection.
+    if (typeof this.deps.usageLog?.append === 'function') {
+      try {
+        const row = buildLaneUsageLogRow({ attempt: savedAttempt, nowIso });
+        if (row !== null) {
+          await this.deps.usageLog.append(row);
+        }
+      } catch {
+        // A failing usage log never changes the collection outcome.
+      }
+    }
     const usageDetail =
       usageResult === undefined
         ? `Artifacts collected with outcome ${outcome}`

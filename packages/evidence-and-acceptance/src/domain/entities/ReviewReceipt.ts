@@ -18,6 +18,10 @@ import {
   REVIEW_KINDS,
   REVIEW_REQUEST_ID_PATTERN,
   REVIEW_UNKNOWN_REASONS,
+  assessmentIdForBrief,
+  attemptIdForBrief,
+  isValidBriefPackageDigest,
+  isValidBriefProjectId,
   receiptSubjectOf,
 } from '../evidence-records.js';
 import type { EvidenceResultValue } from '../value-objects/EvidenceResult.vo.js';
@@ -173,6 +177,36 @@ function checkOptionalFields(props: ReviewReceiptProps): string | null {
   }
   if (props.subject !== undefined && receiptSubjectOf(props) === null) {
     return 'ReviewReceipt has an invalid subject';
+  }
+  const subject = props.subject !== undefined ? receiptSubjectOf(props) : undefined;
+  if (props.kind === 'brief-verify' && subject?.kind !== 'brief') {
+    return 'ReviewReceipt with kind brief-verify requires a brief subject';
+  }
+  if (subject?.kind === 'brief') {
+    if (props.kind !== 'brief-verify') {
+      return 'ReviewReceipt with a brief subject requires the brief-verify kind';
+    }
+    if (!isValidBriefProjectId(subject.projectId)) {
+      return 'ReviewReceipt with a brief subject has an invalid projectId';
+    }
+    if (!isValidBriefPackageDigest(subject.briefPackageDigest)) {
+      return 'ReviewReceipt with a brief subject has an invalid briefPackageDigest';
+    }
+    if (subject.baseCommit === null || !/^[0-9a-f]{40}$/.test(subject.baseCommit)) {
+      return 'ReviewReceipt with a brief subject has an invalid baseCommit';
+    }
+    if (props.projectId !== subject.projectId) {
+      return 'ReviewReceipt with a brief subject has a projectId that disagrees with the subject';
+    }
+    if (props.candidateHeadSha !== subject.baseCommit) {
+      return 'ReviewReceipt with a brief subject has a candidateHeadSha that disagrees with the subject baseCommit';
+    }
+    if (props.attemptId !== attemptIdForBrief(subject.projectId, subject.briefPackageDigest)) {
+      return 'ReviewReceipt with a brief subject has an attemptId that is not the brief attempt id';
+    }
+    if (props.assessmentId !== assessmentIdForBrief(subject.projectId, subject.briefPackageDigest)) {
+      return 'ReviewReceipt with a brief subject has an assessmentId that is not the brief assessment id';
+    }
   }
   return null;
 }

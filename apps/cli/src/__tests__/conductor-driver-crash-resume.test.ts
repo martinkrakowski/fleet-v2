@@ -257,6 +257,9 @@ async function startScenario(options?: StartScenarioOptions): Promise<Scenario> 
     forgeRepository: fakes.forgeRepository,
     parkNotice: fakes.parkNotice,
     autoMergeEnabled: true,
+    // The same opt-in as the dry-run driver: this scenario walks the full
+    // merging -> merged cycle on the fakes.
+    premergeMode: 'auto-attest',
   });
   return { dir, runtime, fakes, clock, advance, runSubprocess };
 }

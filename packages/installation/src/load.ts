@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 
 import type { FleetInstallation, FleetInstallationModel, RunnerSection } from './types.js';
 import { deriveInstallationModel } from './model.js';
-import { parseInstallation } from './parse.js';
+import { parseInstallation, parsePrepareArgv } from './parse.js';
 import { validateSeatPolicy, v1FamilyWarnings } from './policy.js';
 
 export interface LoadOptions {
@@ -244,6 +244,34 @@ export interface CheckedInstallationModel {
   readonly errors: string[];
 }
 
+/**
+ * CO22: the prepare-argv half of the model check. Every merge repository
+ * entry that carries a `prepare` value is validated as written, so an
+ * installation that reaches the model boundary without parsing cannot carry
+ * an argv the parser would have refused. Absent `prepare` stays absent.
+ */
+function mergePrepareModelErrors(policy: unknown): string[] {
+  const errors: string[] = [];
+  const repos = (policy as { merge?: { repos?: unknown } } | undefined)?.merge?.repos;
+  if (repos === undefined || repos === null || typeof repos !== 'object') {
+    return errors;
+  }
+  for (const [key, entry] of Object.entries(repos as Record<string, unknown>)) {
+    if (entry === undefined || entry === null || typeof entry !== 'object') {
+      continue;
+    }
+    if (!Object.hasOwn(entry, 'prepare')) {
+      continue;
+    }
+    parsePrepareArgv(
+      (entry as { prepare: unknown }).prepare,
+      `policy.merge.repos[${JSON.stringify(key)}].prepare`,
+      errors,
+    );
+  }
+  return errors;
+}
+
 export function checkInstallationModel(installation: FleetInstallation): CheckedInstallationModel {
   const { model, warnings, errors: modelErrors } = deriveInstallationModel(installation);
   const errors: string[] = [];
@@ -252,6 +280,11 @@ export function checkInstallationModel(installation: FleetInstallation): Checked
     // The file chains go along so the reference rules report file
     // positions when useFreeSeats false reduced the derived chains (FS1).
     errors.push(...validateSeatPolicy(model, installation.chains));
+    // CO22: the model boundary re-checks every written prepare argv with the
+    // parser's own rules. parseInstallation refuses an invalid argv before
+    // this runs, so this only fires for installations constructed without
+    // parsing — exactly the path requireValidInstallationModel guards.
+    errors.push(...mergePrepareModelErrors(installation.policy));
   } else {
     // v1 files get no new refusals: their single runner/reviewer pair is
     // checked only for the family rule and reported as a warning.

@@ -25,9 +25,31 @@
 // The list file itself is skipped whenever it lives inside the scanned tree,
 // so it never flags itself. Untracked files are never read.
 //
-// The gate runs this check on every push and pull request with --require-list
-// against the owner's FLEET_PUBLIC_SAFETY_LIST secret, so a gate without a
-// configured list fails instead of passing without checking anything.
+// Tracked PATH NAMES are matched too: every tracked entry (file, symlink,
+// gitlink) has its full repository path checked against the list, so a file
+// or directory named after a listed name is a finding, reported as
+// `<path>:0 entry #<n>` (line 0 marks a path-name hit). That finding line
+// necessarily prints the path, which contains the match.
+//
+// STATUS: this script is NOT wired into CI or any package script yet; nothing
+// invokes it. Without a list (no --list, no FLEET_PUBLIC_SAFETY_LIST) it
+// checks NOTHING and exits 0 after printing "NO LIST CONFIGURED, NOTHING WAS
+// CHECKED" on stderr; --require-list turns a missing list into exit 2. Any
+// future gate must pass --require-list.
+//
+// A tracked path with a symlinked or missing ancestor directory is refused
+// (exit 2) before anything is opened, so nothing outside the repository is read.
+//
+// A tracked file that is missing from the working tree is an unreadable
+// tracked entry (exit 2), never silently skipped. Binary files (NUL in the
+// first 8 KiB) are skipped but counted: one stderr summary line gives the
+// count.
+//
+// Known limits (not implemented): no unicode normalisation (composed and
+// decomposed forms differ); `re:` entries are case-sensitive; a name split
+// across two lines is missed; UTF-16 files are skipped as binary (they
+// contain NUL); a tracked list file inside the repository is skipped, so its
+// own content and name are never checked.
 //
 // Usage:
 //   node scripts/check-public-safety.mjs [--root <dir>] [--list <file>] [--require-list]
@@ -71,6 +93,33 @@ function matchLine(name, lineNo, line, entries, findings) {
       ? entry.regex.test(line)
       : folded.includes(entry.literal);
     if (hit) findings.push(`${NAME}: ${name}:${lineNo} entry #${entry.n}`);
+  }
+}
+
+// A tracked path against every entry: line 0 marks a path-name finding.
+function matchPath(name, entries, findings) {
+  const folded = name.toLowerCase();
+  for (const entry of entries) {
+    const hit = entry.regex ? entry.regex.test(name) : folded.includes(entry.literal);
+    if (hit) findings.push(`${NAME}: ${name}:0 entry #${entry.n}`);
+  }
+}
+
+// No ancestor directory of a tracked path may be a symlink (or missing): a
+// parent replaced by a link would make a later open read outside the
+// repository. Checked with lstat per component, before anything is opened.
+function checkParents(root, name) {
+  const parts = name.split("/");
+  let cur = root;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    cur = path.join(cur, parts[i]);
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch {
+      cannotRead(name);
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) cannotRead(name);
   }
 }
 
@@ -142,7 +191,7 @@ function scanTracked(name, full, realRoot, entries, findings) {
         const need = Math.min(BINARY_WINDOW - prefix.length, data.length);
         prefix = Buffer.concat([prefix, data.subarray(0, need)]);
         // A NUL within the window marks a binary file, skipped entirely.
-        if (prefix.includes(0)) return 0;
+        if (prefix.includes(0)) return -1;
       }
       const carry = pending.length === 0 ? data : Buffer.concat([pending, data]);
       let start = 0;
@@ -209,6 +258,7 @@ if (!listPath) {
     process.exit(2);
   }
   // Explicitly a no-op: no list means nothing was checked, never a clean bill.
+  console.error(`${NAME}: NO LIST CONFIGURED, NOTHING WAS CHECKED`);
   console.log(`${NAME}: no list configured, nothing checked`);
   process.exit(0);
 }
@@ -275,11 +325,8 @@ try {
   const root = top;
 
   const nulNames = (args) => gitOrDie(args).split("\0").filter(Boolean);
-  // Tracked files minus the ones deleted from the working tree without staging.
-  const deleted = new Set(nulNames(["ls-files", "-z", "--deleted"]));
-  const tracked = nulNames(["ls-files", "-z"])
-    .filter((name) => !deleted.has(name))
-    .sort(byCodeUnit);
+  // Every tracked entry; one missing from the working tree is refused in the loop.
+  const tracked = nulNames(["ls-files", "-z"]).sort(byCodeUnit);
 
   let realList;
   try {
@@ -292,8 +339,10 @@ try {
   const realRoot = realpathSync(root);
   const findings = [];
   let scanned = 0;
+  let skippedBinary = 0;
   for (const name of tracked) {
     const full = path.join(root, name);
+    checkParents(root, name);
     // The list never scans itself when it lives inside the scanned tree.
     // A symlink is never skipped as the list: it is validated and scanned.
     let isLink = false;
@@ -311,7 +360,15 @@ try {
       }
       if (realFile !== null && realFile === realList) continue;
     }
-    scanned += scanTracked(name, full, realRoot, entries, findings);
+    matchPath(name, entries, findings);
+    const got = scanTracked(name, full, realRoot, entries, findings);
+    if (got < 0) skippedBinary += 1;
+    else scanned += got;
+  }
+  if (skippedBinary > 0) {
+    console.error(
+      `${NAME}: skipped ${skippedBinary} binary file(s) (NUL in the first 8 KiB), not scanned`,
+    );
   }
   if (findings.length > 0) {
     for (const line of findings) console.log(line);

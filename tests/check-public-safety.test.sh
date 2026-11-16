@@ -48,6 +48,18 @@ check() { # remaining args = script args; sets rc, stdout, stderr
   stderr=$(cat "$err_file")
 }
 
+check_t() { # like check, but bounded: an attempted read of a FIFO hangs and times out (rc 124)
+  out_file=$T/check.out
+  err_file=$T/check.err
+  (
+    unset FLEET_PUBLIC_SAFETY_LIST
+    timeout 10 node "$SCRIPT" "$@"
+  ) >"$out_file" 2>"$err_file"
+  rc=$?
+  stdout=$(cat "$out_file")
+  stderr=$(cat "$err_file")
+}
+
 check_env() { # $1 = list path, remaining args = script args; sets rc, stdout, stderr
   list_env=$1
   shift
@@ -182,6 +194,10 @@ if [ $rc -eq 0 ] && [ "$stdout" = 'check-public-safety: ok, 1 files, 1 entries' 
 else
   bad "a binary file is skipped (rc $rc: $stdout $stderr)"
 fi
+case $stderr in
+*'skipped 1 binary file'*) ok 'a skipped binary file is counted on stderr, not silent' ;;
+*) bad "a skipped binary file is counted on stderr, not silent ($stderr)" ;;
+esac
 
 # --- an oversized file (> 1 MiB) is scanned, never skipped.
 R=$T/oversized
@@ -200,6 +216,101 @@ else
 fi
 no_leak "$stdout" 'supersecrettoken'
 clean_stderr "$stderr"
+
+# --- a needle after the first read chunk is found with the right line number.
+R=$T/late
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/late.list"
+{
+  yes x | head -c 70000
+  printf 'supersecrettoken\n'
+} >"$R/src/late.txt"
+track "$R" leak
+check --root "$R" --list "$T/late.list"
+if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/late.txt:35001 entry #1' ]; then
+  ok 'a needle after the first chunk is found with its line number'
+else
+  bad "a needle after the first chunk is found with its line number (rc $rc: $stdout $stderr)"
+fi
+
+# --- a needle spanning the 64 KiB chunk boundary is found.
+R=$T/span
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/span.list"
+{
+  head -c 65529 /dev/zero | tr '\000' a
+  printf '\n'
+  printf 'xxsupersecrettoken\n'
+} >"$R/src/span.txt"
+track "$R" leak
+check --root "$R" --list "$T/span.list"
+if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/span.txt:2 entry #1' ]; then
+  ok 'a needle spanning a chunk boundary is found'
+else
+  bad "a needle spanning a chunk boundary is found (rc $rc: $stdout $stderr)"
+fi
+
+# --- CRLF line endings: the right line number, and a $-anchored regex still matches.
+R=$T/crlf
+new_repo "$R"
+printf 're:^supersecrettoken$\n' >"$T/crlf.list"
+printf 'one\r\ntwo\r\nsupersecrettoken\r\nfour\r\n' >"$R/src/crlf.txt"
+track "$R" leak
+check --root "$R" --list "$T/crlf.list"
+if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/crlf.txt:3 entry #1' ]; then
+  ok 'CRLF lines report the correct line number'
+else
+  bad "CRLF lines report the correct line number (rc $rc: $stdout $stderr)"
+fi
+
+# --- tracked path names are matched: file name, directory component, symlink name.
+printf 'forbiddenname\n' >"$T/path.list"
+R=$T/pathfile
+new_repo "$R"
+printf 'clean\n' >"$R/src/forbiddenname.txt"
+track "$R" pathfile
+check --root "$R" --list "$T/path.list"
+if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/forbiddenname.txt:0 entry #1' ]; then
+  ok 'a private name in a tracked file name is a finding'
+else
+  bad "a private name in a tracked file name is a finding (rc $rc: $stdout $stderr)"
+fi
+R=$T/pathdir
+new_repo "$R"
+mkdir -p "$R/forbiddenname"
+printf 'clean\n' >"$R/forbiddenname/ok.txt"
+track "$R" pathdir
+check --root "$R" --list "$T/path.list"
+if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: forbiddenname/ok.txt:0 entry #1' ]; then
+  ok 'a private name in a directory component is a finding'
+else
+  bad "a private name in a directory component is a finding (rc $rc: $stdout $stderr)"
+fi
+R=$T/pathlink
+new_repo "$R"
+ln -s plain.txt "$R/src/forbiddenname"
+track "$R" pathlink
+check --root "$R" --list "$T/path.list"
+if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/forbiddenname:0 entry #1' ]; then
+  ok 'a private name in a symlink own name is a finding'
+else
+  bad "a private name in a symlink own name is a finding (rc $rc: $stdout $stderr)"
+fi
+
+# --- a tracked file missing from the working tree is refused, not skipped.
+R=$T/gone
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/gone.list"
+printf 'clean\n' >"$R/src/gone.txt"
+track "$R" gone
+rm "$R/src/gone.txt"
+check --root "$R" --list "$T/gone.list"
+if [ $rc -eq 2 ] && [ -z "$stdout" ] &&
+  case $stderr in *'src/gone.txt'*) true ;; *) false ;; esac; then
+  ok 'a tracked file missing from the working tree is refused naming the path'
+else
+  bad "a tracked file missing from the working tree is refused naming the path (rc $rc: $stdout $stderr)"
+fi
 
 # --- a tracked list file inside the repository never scans itself.
 R=$T/selfscan
@@ -232,6 +343,10 @@ if [ $rc -eq 0 ] && [ "$stdout" = 'check-public-safety: no list configured, noth
 else
   bad "no list configured without --require-list is an explicit no-op (rc $rc: $stdout $stderr)"
 fi
+case $stderr in
+*'NO LIST CONFIGURED, NOTHING WAS CHECKED'*) ok 'no list prints an unmistakable stderr warning' ;;
+*) bad "no list prints an unmistakable stderr warning ($stderr)" ;;
+esac
 clean_stderr "$stderr"
 
 # --- no list configured with --require-list: exit 2.
@@ -350,11 +465,38 @@ expect_refused() { # $1 = title, $2 = path that must be named
 R=$T/link
 new_repo "$R"
 printf 'supersecrettoken\n' >"$T/link.list"
-printf 'supersecrettoken\n' >"$T/outside.txt"
+mkfifo "$T/outside.txt"
 ln -s "$T/outside.txt" "$R/src/link"
 track "$R" link
-check --root "$R" --list "$T/link.list"
+check_t --root "$R" --list "$T/link.list"
 expect_refused 'a tracked symlink to a file outside the repository is refused, not read' 'src/link'
+
+# --- a parent directory replaced by a symlink is refused before any open (the external regular file holds the needle: a read would exit 1).
+R=$T/parentlink
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/parentlink.list"
+printf 'clean\n' >"$R/src/file.txt"
+track "$R" file
+rm -rf "$R/src"
+mkdir -p "$T/ext1"
+printf 'supersecrettoken\n' >"$T/ext1/file.txt"
+ln -s "$T/ext1" "$R/src"
+check_t --root "$R" --list "$T/parentlink.list"
+expect_refused 'a tracked file under a parent replaced by a symlink is refused, never opened' 'src/file.txt'
+
+# --- a deeper ancestor replaced by a symlink is refused too.
+R=$T/deeplink
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/deeplink.list"
+mkdir -p "$R/src/a/b"
+printf 'clean\n' >"$R/src/a/b/file.txt"
+track "$R" deep
+rm -rf "$R/src/a"
+mkdir -p "$T/ext2/b"
+printf 'supersecrettoken\n' >"$T/ext2/b/file.txt"
+ln -s "$T/ext2" "$R/src/a"
+check_t --root "$R" --list "$T/deeplink.list"
+expect_refused 'a tracked file under a deeper ancestor replaced by a symlink is refused, never opened' 'src/a/b/file.txt'
 
 # --- a dangling tracked symlink is refused naming the path, even when its text matches.
 R=$T/dangling
@@ -384,14 +526,27 @@ track "$R" dirlink
 check --root "$R" --list "$T/dirlink.list"
 expect_refused 'a tracked symlink to a directory is refused naming the path' 'src/dirlink'
 
-# --- a symlink to the list file outside the repository is refused, not skipped.
+# --- a symlink to a file outside the repository is refused because it is outside, even when that file is the list.
 R=$T/listlink
 new_repo "$R"
 printf 'supersecrettoken\n' >"$T/listlink.list"
 ln -s "$T/listlink.list" "$R/src/listlink"
 track "$R" listlink
 check --root "$R" --list "$T/listlink.list"
-expect_refused 'a tracked symlink to the list file is refused, not skipped' 'src/listlink'
+expect_refused 'a tracked symlink to an outside-repo file (the list) is refused because it leaves the repository' 'src/listlink'
+
+# --- a symlink to an in-repo list file is scanned as a link, never skipped as the list.
+R=$T/listlink2
+new_repo "$R"
+printf 'supersecrettoken\n' >"$R/.public-safety-list"
+ln -s ../.public-safety-list "$R/src/listalias"
+track "$R" listalias
+check --root "$R" --list "$R/.public-safety-list"
+if [ $rc -eq 0 ] && [ "$stdout" = 'check-public-safety: ok, 2 files, 1 entries' ]; then
+  ok 'a tracked symlink to the in-repo list is scanned as a link, not skipped as the list'
+else
+  bad "a tracked symlink to the in-repo list is scanned as a link, not skipped as the list (rc $rc: $stdout $stderr)"
+fi
 
 # --- a gitlink (submodule) entry is refused naming the path.
 R=$T/sub
@@ -430,12 +585,12 @@ printf 'x\n' >"$R/src/forbidden-supersecrettoken"
 ln -s forbidden-supersecrettoken "$R/src/link"
 track "$R" linktext
 check --root "$R" --list "$T/linktext.list"
-if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/link:1 entry #1' ]; then
+# The target's own path name matches too (line 0); the link-text hit is line 1.
+if [ $rc -eq 1 ] && printf '%s\n' "$stdout" | grep -qx 'check-public-safety: src/link:1 entry #1'; then
   ok 'an in-repo symlink matching by its link text is reported'
 else
   bad "an in-repo symlink matching by its link text is reported (rc $rc: $stdout $stderr)"
 fi
-no_leak "$stdout" 'supersecrettoken'
 clean_stderr "$stderr"
 
 # --- an unreadable tracked file is refused naming the path.

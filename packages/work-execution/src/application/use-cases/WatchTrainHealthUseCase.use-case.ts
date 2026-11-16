@@ -135,6 +135,22 @@ function isAttentionRule(value: string): value is TrainHealthAttentionRule {
   return (TRAIN_HEALTH_ATTENTION_RULES as readonly string[]).includes(value);
 }
 
+/** The result of one open-list read, before any raise. */
+type ListOpenResult =
+  | { readonly kind: 'ok'; readonly items: readonly unknown[]; readonly budgetExhausted: boolean; readonly failed: boolean }
+  | { readonly kind: 'exhausted' }
+  | { readonly kind: 'refused' };
+
+/** The result of raising every target of one pass. */
+type RaiseAllResult =
+  | { readonly kind: 'ok'; readonly raised: number; readonly attentionFailures: number; readonly budgetExhausted: boolean }
+  | { readonly kind: 'refused'; readonly reason: 'invalid-clock' };
+
+/** The result of clearing every resolved open item of one pass. */
+type ClearResolvedResult =
+  | { readonly kind: 'ok'; readonly cleared: number; readonly attentionFailures: number; readonly budgetExhausted: boolean }
+  | { readonly kind: 'refused'; readonly reason: 'invalid-clock' };
+
 export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
   constructor(private readonly deps: WatchTrainHealthDependencies) {}
 
@@ -308,13 +324,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
   }
 
   /** Reads the open list once, before any raise, so CO-WD7 sees pre-pass times. */
-  private async listOpen(
-    validated: ValidatedRequest,
-  ): Promise<
-    { readonly kind: 'ok'; items: readonly unknown[]; budgetExhausted: boolean; failed: boolean } | {
-      readonly kind: 'exhausted';
-    } | { readonly kind: 'refused' }
-  > {
+  private async listOpen(validated: ValidatedRequest): Promise<ListOpenResult> {
     const listBudget = await this.budget(validated.deadlineIso);
     if (!listBudget.ok) {
       return { kind: 'refused' };
@@ -395,108 +405,40 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     evaluation: Extract<TrainHealthEvaluation, { outcome: 'evaluated' }>,
     queueOverflow: boolean,
   ): Promise<WatchTrainHealthResult> {
-    let budgetExhausted = false;
-    let attentionFailures = 0;
-
     const listed = await this.listOpen(validated);
     if (listed.kind === 'refused') {
       return refuse('invalid-clock');
     }
-    if (listed.kind === 'exhausted') {
-      budgetExhausted = true;
-    } else if (listed.failed) {
-      attentionFailures += 1;
-    }
-    const openItems = listed.kind === 'ok' ? listed.items : [];
+    let budgetExhausted = listed.kind === 'exhausted';
+    let attentionFailures = listed.kind === 'ok' && listed.failed ? 1 : 0;
 
-    let raised = 0;
     const targets = WatchTrainHealthUseCase.raiseTargets(evaluation, queueOverflow);
     const targetKeys = new Set(
       targets.map((target) => targetKey(target.rule, target.pullRequest)),
     );
-    for (const target of targets) {
-      if (budgetExhausted) {
-        break;
-      }
-      const budget = await this.budget(validated.deadlineIso);
-      if (!budget.ok) {
-        return refuse(budget.reason);
-      }
-      if (!budget.allowed) {
-        budgetExhausted = true;
-        break;
-      }
-      const raiseAnswer = await this.attentionCall(
-        () =>
-          this.deps.attention.raiseTrainHealthAttention({
-            projectId: validated.projectId,
-            repository: validated.repository,
-            rule: target.rule,
-            pullRequest: target.pullRequest,
-            deadlineIso: validated.deadlineIso,
-          }),
-        budget.timeoutMs,
-      );
-      if (RAISE_OK.includes(this.outcomeOf(raiseAnswer))) {
-        raised += 1;
-      } else {
-        attentionFailures += 1;
-      }
-    }
 
-    let cleared = 0;
-    const mustKeepUnassessed = evaluation.unknownForgeStates > 0 || queueOverflow;
-    const clearable =
-      !budgetExhausted &&
-      listed.kind === 'ok' &&
-      !listed.failed &&
-      !evaluation.truncated &&
-      openItems.length <= OPEN_LIST_MAX;
-    if (!clearable && listed.kind === 'ok' && !listed.failed && openItems.length > OPEN_LIST_MAX) {
-      attentionFailures += 1;
+    const raiseResult = await this.raiseAll(validated, targets, budgetExhausted);
+    if (raiseResult.kind === 'refused') {
+      return refuse(raiseResult.reason);
     }
-    if (clearable) {
-      for (const item of openItems) {
-        if (budgetExhausted) {
-          break;
-        }
-        const parsed = this.parseOpenItem(item);
-        if (parsed === null) {
-          attentionFailures += 1;
-          continue;
-        }
-        if (targetKeys.has(targetKey(parsed.rule, parsed.pullRequest))) {
-          continue;
-        }
-        if (mustKeepUnassessed && (parsed.rule === 'stale-queue-entry' || parsed.rule === 'repeated-park')) {
-          continue;
-        }
-        const budget = await this.budget(validated.deadlineIso);
-        if (!budget.ok) {
-          return refuse(budget.reason);
-        }
-        if (!budget.allowed) {
-          budgetExhausted = true;
-          break;
-        }
-        const clearAnswer = await this.attentionCall(
-          () =>
-            this.deps.attention.clearTrainHealthAttention({
-              projectId: validated.projectId,
-              repository: validated.repository,
-              rule: parsed.rule,
-              pullRequest: parsed.pullRequest,
-              deadlineIso: validated.deadlineIso,
-            }),
-          budget.timeoutMs,
-        );
-        if (CLEAR_OK.includes(this.outcomeOf(clearAnswer))) {
-          cleared += 1;
-        } else {
-          attentionFailures += 1;
-        }
-      }
+    const raised = raiseResult.raised;
+    attentionFailures += raiseResult.attentionFailures;
+    budgetExhausted = raiseResult.budgetExhausted;
+
+    const clearResult = await this.clearResolved(
+      validated,
+      evaluation,
+      queueOverflow,
+      listed,
+      targetKeys,
+      budgetExhausted,
+    );
+    if (clearResult.kind === 'refused') {
+      return refuse(clearResult.reason);
     }
+    const cleared = clearResult.cleared;
+    attentionFailures += clearResult.attentionFailures;
+    budgetExhausted = clearResult.budgetExhausted;
 
     const healthy =
       evaluation.findings.length === 0 &&
@@ -518,6 +460,146 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
       attentionFailures,
       budgetExhausted,
     };
+  }
+
+  /**
+   * Raises every target in evaluation order, re-checking the budget before
+   * each call. Already-exhausted on entry (the open-list read ran out)
+   * raises nothing, matching the pre-split behaviour exactly.
+   */
+  private async raiseAll(
+    validated: ValidatedRequest,
+    targets: readonly AttentionTarget[],
+    budgetExhausted: boolean,
+  ): Promise<RaiseAllResult> {
+    if (budgetExhausted) {
+      return { kind: 'ok', raised: 0, attentionFailures: 0, budgetExhausted: true };
+    }
+    let raised = 0;
+    let attentionFailures = 0;
+    for (const target of targets) {
+      const budget = await this.budget(validated.deadlineIso);
+      if (!budget.ok) {
+        return { kind: 'refused', reason: budget.reason };
+      }
+      if (!budget.allowed) {
+        return { kind: 'ok', raised, attentionFailures, budgetExhausted: true };
+      }
+      const raiseAnswer = await this.attentionCall(
+        () =>
+          this.deps.attention.raiseTrainHealthAttention({
+            projectId: validated.projectId,
+            repository: validated.repository,
+            rule: target.rule,
+            pullRequest: target.pullRequest,
+            deadlineIso: validated.deadlineIso,
+          }),
+        budget.timeoutMs,
+      );
+      if (RAISE_OK.includes(this.outcomeOf(raiseAnswer))) {
+        raised += 1;
+      } else {
+        attentionFailures += 1;
+      }
+    }
+    return { kind: 'ok', raised, attentionFailures, budgetExhausted: false };
+  }
+
+  /**
+   * Whether the open list may be cleared this pass, and the one extra
+   * `attentionFailures` count when it holds more than `OPEN_LIST_MAX` items
+   * (counted whatever else also makes the list unclearable).
+   */
+  private static clearability(
+    evaluation: Extract<TrainHealthEvaluation, { outcome: 'evaluated' }>,
+    listed: ListOpenResult,
+    budgetExhausted: boolean,
+  ): { readonly clearable: boolean; readonly extraFailure: number } {
+    const openItems = listed.kind === 'ok' ? listed.items : [];
+    const clearable =
+      !budgetExhausted &&
+      listed.kind === 'ok' &&
+      !listed.failed &&
+      !evaluation.truncated &&
+      openItems.length <= OPEN_LIST_MAX;
+    const overLimit = listed.kind === 'ok' && !listed.failed && openItems.length > OPEN_LIST_MAX;
+    return { clearable, extraFailure: !clearable && overLimit ? 1 : 0 };
+  }
+
+  /** True when an open item matches a raise target of this pass, or is not assessed this pass. */
+  private static shouldSkipClear(
+    parsed: { readonly rule: TrainHealthAttentionRule; readonly pullRequest: number | null },
+    targetKeys: ReadonlySet<string>,
+    mustKeepUnassessed: boolean,
+  ): boolean {
+    if (targetKeys.has(targetKey(parsed.rule, parsed.pullRequest))) {
+      return true;
+    }
+    return mustKeepUnassessed && (parsed.rule === 'stale-queue-entry' || parsed.rule === 'repeated-park');
+  }
+
+  /**
+   * Clears every open item whose condition ended, using the list read before
+   * any raise. Clears nothing when the list is unusable (truncated, unknown,
+   * too large or the budget already ran out).
+   */
+  private async clearResolved(
+    validated: ValidatedRequest,
+    evaluation: Extract<TrainHealthEvaluation, { outcome: 'evaluated' }>,
+    queueOverflow: boolean,
+    listed: ListOpenResult,
+    targetKeys: ReadonlySet<string>,
+    budgetExhausted: boolean,
+  ): Promise<ClearResolvedResult> {
+    const { clearable, extraFailure } = WatchTrainHealthUseCase.clearability(
+      evaluation,
+      listed,
+      budgetExhausted,
+    );
+    if (!clearable) {
+      return { kind: 'ok', cleared: 0, attentionFailures: extraFailure, budgetExhausted };
+    }
+
+    const openItems = listed.kind === 'ok' ? listed.items : [];
+    const mustKeepUnassessed = evaluation.unknownForgeStates > 0 || queueOverflow;
+    let cleared = 0;
+    let attentionFailures = 0;
+    let exhausted = budgetExhausted;
+    for (const item of openItems) {
+      const parsed = this.parseOpenItem(item);
+      if (parsed === null) {
+        attentionFailures += 1;
+        continue;
+      }
+      if (WatchTrainHealthUseCase.shouldSkipClear(parsed, targetKeys, mustKeepUnassessed)) {
+        continue;
+      }
+      const budget = await this.budget(validated.deadlineIso);
+      if (!budget.ok) {
+        return { kind: 'refused', reason: budget.reason };
+      }
+      if (!budget.allowed) {
+        exhausted = true;
+        break;
+      }
+      const clearAnswer = await this.attentionCall(
+        () =>
+          this.deps.attention.clearTrainHealthAttention({
+            projectId: validated.projectId,
+            repository: validated.repository,
+            rule: parsed.rule,
+            pullRequest: parsed.pullRequest,
+            deadlineIso: validated.deadlineIso,
+          }),
+        budget.timeoutMs,
+      );
+      if (CLEAR_OK.includes(this.outcomeOf(clearAnswer))) {
+        cleared += 1;
+      } else {
+        attentionFailures += 1;
+      }
+    }
+    return { kind: 'ok', cleared, attentionFailures, budgetExhausted: exhausted };
   }
 
   /** Identifies an open item from own data properties only; null when unidentifiable. */

@@ -37,8 +37,9 @@ describe('parseReviewStreamGrammar', () => {
   });
 
   it('refuses non-string input without throwing', () => {
-    // eslint-disable-next-line no-sparse-arrays
-    for (const bad of [null, undefined, 42, {}, [,]]) {
+    const holey: unknown[] = [];
+    holey.length = 1;
+    for (const bad of [null, undefined, 42, {}, holey]) {
       expect(parseReviewStreamGrammar(bad)).toEqual(refused);
     }
   });
@@ -213,7 +214,7 @@ describe('parseReviewStreamGrammar', () => {
       expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     });
 
-    it('refuses a constructor or prototype key event line without throwing', () => {
+    it('accepts a constructor key on a step_start line without throwing or polluting', () => {
       const stream = [
         '{"constructor":{"polluted":true},"type":"step_start"}',
         textEvent('clean'),
@@ -257,8 +258,10 @@ describe('parseReviewStreamGrammar', () => {
     });
 
     it('refuses a sparse array with holes without throwing', () => {
-      // eslint-disable-next-line no-sparse-arrays
-      expect(parseReviewStreamGrammar([,])).toEqual(refused);
+      const holey: unknown[] = [];
+      holey.length = 2;
+      expect(1 in holey).toBe(false);
+      expect(parseReviewStreamGrammar(holey)).toEqual(refused);
     });
   });
 });

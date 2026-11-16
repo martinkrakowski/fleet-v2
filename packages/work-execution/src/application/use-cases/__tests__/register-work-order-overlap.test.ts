@@ -9,7 +9,7 @@ import {
   parsePullRequestTitle,
   pureSha256Hex,
 } from '../../../domain/held-work-order.js';
-import type { HeldWorkOrderRequestSnapshot } from '../../../domain/held-work-order.js';
+import type { HeldWorkOrderRecord, HeldWorkOrderRequestSnapshot } from '../../../domain/held-work-order.js';
 import { WorkOrder } from '../../../domain/entities/WorkOrder.js';
 import { ForgeReadAdapter } from '../../../infrastructure/adapters/ForgeReadAdapter.adapter.js';
 import { HeldWorkOrderRepositoryAdapter } from '../../../infrastructure/adapters/HeldWorkOrderRepositoryAdapter.adapter.js';
@@ -1085,5 +1085,410 @@ describe('computeRegisterWorkOrderRequestDigest pull request title', () => {
     const v1 = computeRegisterWorkOrderRequestDigest(workOrderId, baseSnapshot(), null);
     expect(invalid).not.toBe(v1);
     expect(invalid).not.toBe(accepted);
+  });
+});
+
+describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () => {
+  const NEW_BASE = '2'.repeat(40);
+
+  const releaseBlocker = async (state: ReturnType<typeof setup>, to: 'stopped' | 'merged') => {
+    await state.workOrderRepo.saveWorkOrder({
+      ...(await state.workOrderRepo.findWorkOrderById('wo-a'))!,
+      state: to,
+      revision: 2,
+    });
+  };
+
+  const heldBehindWoA = async (
+    state: ReturnType<typeof setup>,
+    overrides: Partial<RegisterWorkOrderRequest> = {},
+  ) => {
+    const first = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a' }));
+    const second = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', ...overrides }));
+    return {
+      digest: (second as { requestDigest: string }).requestDigest,
+      first,
+      second,
+    };
+  };
+
+  const seedHeld = async (
+    repo: HeldWorkOrderRepositoryPort,
+    overrides: Partial<HeldWorkOrderRecord> = {},
+    settle = true,
+  ) => {
+    const record = {
+      version: 1 as const,
+      stage: 'intent' as const,
+      intentId: 'hold-seeded',
+      workOrderId: 'wo-new',
+      requestDigest: 'a'.repeat(64),
+      briefRequestRef: null,
+      blockerKind: 'active-work-order' as const,
+      blockerId: 'wo-gone',
+      pathCode: 'path-000000000000',
+      heldAtIso: '2026-11-07T09:00:00.000Z',
+      ...overrides,
+    };
+    await repo.recordHoldIntent(record);
+    if (settle) {
+      await repo.completeHoldIntent({
+        intentId: record.intentId,
+        workOrderId: record.workOrderId,
+        requestDigest: record.requestDigest,
+      });
+    }
+  };
+
+  const wrapHeld = (
+    inner: HeldWorkOrderRepositoryPort,
+    overrides: Partial<HeldWorkOrderRepositoryPort> = {},
+  ): HeldWorkOrderRepositoryPort => ({
+    listHeldWorkOrders: () => inner.listHeldWorkOrders(),
+    findByWorkOrderId: (workOrderId) => inner.findByWorkOrderId(workOrderId),
+    findByIntentId: (intentId) => inner.findByIntentId(intentId),
+    recordHoldIntent: (record) => inner.recordHoldIntent(record),
+    completeHoldIntent: (input) => inner.completeHoldIntent(input),
+    deleteHeldWorkOrder: (workOrderId, requestDigest) => inner.deleteHeldWorkOrder(workOrderId, requestDigest),
+    ...overrides,
+  });
+
+  const prForge = (answer: unknown) => {
+    const { forge, calls } = fakeForge({ list: { outcome: 'listed', pullRequests: [] } });
+    const reads: unknown[] = [];
+    return {
+      calls,
+      reads,
+      forge: {
+        ...forge,
+        readPullRequest: async (req: unknown) => {
+          reads.push(req);
+          if (answer === 'throw') throw new Error('boom');
+          return answer as never;
+        },
+      },
+    };
+  };
+
+  const prAnswer = (number: number, state: 'open' | 'merged' | 'closed') => ({
+    outcome: 'found',
+    pullRequest: { number, state },
+  });
+
+  it.each(['stopped', 'merged'] as const)(
+    'registers a changed request once the blocker work order is %s, deletes the stale held record and reports it',
+    async (to) => {
+      const state = setup();
+      const { digest } = await heldBehindWoA(state);
+      await releaseBlocker(state, to);
+      const result = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }));
+      expect(result).toEqual({
+        outcome: 'registered',
+        workOrder: expect.objectContaining({ id: 'wo-b', baseCommit: NEW_BASE }),
+        supersededHeld: {
+          requestDigest: digest,
+          blockerKind: 'active-work-order',
+          blockerId: 'wo-a',
+          heldAtIso: '2026-11-07T10:00:00.000Z',
+        },
+      });
+      expect(await state.heldWorkOrderRepo.findByWorkOrderId('wo-b')).toEqual({ outcome: 'not-found' });
+    },
+  );
+
+  it('refuses a changed request held-request-mismatch while the blocker work order is active and leaves the held store unchanged', async () => {
+    const state = setup();
+    await heldBehindWoA(state);
+    const before = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }))).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+    });
+    expect(state.saved).toHaveLength(1);
+    expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
+  });
+
+  it('refuses held-request-mismatch when the blocker work order cannot be found', async () => {
+    const state = setup();
+    await seedHeld(state.heldWorkOrderRepo);
+    const before = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(await state.useCase.registerWorkOrder(request())).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+    });
+    expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
+    expect(state.saved).toEqual([]);
+  });
+
+  it('refuses held-request-mismatch without throwing when the blocker lookup throws', async () => {
+    const inner = new WorkOrderRepositoryAdapter();
+    const state = setup({
+      workOrderRepo: {
+        saveWorkOrder: (r) => inner.saveWorkOrder(r),
+        listWorkOrdersByProject: (p) => inner.listWorkOrdersByProject(p),
+        findWorkOrderById: async (id) => {
+          if (id === 'wo-gone') throw new Error('boom');
+          return inner.findWorkOrderById(id);
+        },
+      },
+    });
+    await seedHeld(state.heldWorkOrderRepo);
+    const before = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    await expect(state.useCase.registerWorkOrder(request())).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+    });
+    expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
+  });
+
+  it.each(['merged', 'closed'] as const)('supersedes a stale record held behind pull request 42 once it is %s', async (state) => {
+    const { reads, forge } = prForge(prAnswer(42, state));
+    const setupState = setup({ forgeRead: forge as never });
+    await seedHeld(setupState.heldWorkOrderRepo, { blockerKind: 'open-pr', blockerId: '42' });
+    const result = await setupState.useCase.registerWorkOrder(request());
+    expect(result).toEqual({
+      outcome: 'registered',
+      workOrder: expect.objectContaining({ id: 'wo-new' }),
+      supersededHeld: {
+        requestDigest: 'a'.repeat(64),
+        blockerKind: 'open-pr',
+        blockerId: '42',
+        heldAtIso: '2026-11-07T09:00:00.000Z',
+      },
+    });
+    expect(reads).toEqual([
+      { ref: { kind: 'number', number: 42 }, repository: { owner: 'acme', repo: 'fleet' }, timeoutMs: 30000 },
+    ]);
+  });
+
+  it.each([
+    ['open', prAnswer(42, 'open')],
+    ['not-found', { outcome: 'not-found' }],
+    ['unavailable', { outcome: 'unavailable', reason: 'x' }],
+    ['a different pull request number', prAnswer(43, 'merged')],
+    ['null', null],
+    ['a throw', 'throw'],
+  ])('refuses held-request-mismatch when the blocking pull request read answers %s', async (_label, answer) => {
+    const { calls, forge } = prForge(answer);
+    const state = setup({ forgeRead: forge as never });
+    await seedHeld(state.heldWorkOrderRepo, { blockerKind: 'open-pr', blockerId: '42' });
+    const before = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(await state.useCase.registerWorkOrder(request())).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+    });
+    expect(calls.list).toBe(0);
+    expect(state.saved).toEqual([]);
+    expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
+  });
+
+  it('refuses held-request-mismatch for a pull-request blocker when no forge read is configured, the budget is zero, or the repository is not a coordinate', async () => {
+    // (i) no forgeRead at all
+    const noForge = setup();
+    await seedHeld(noForge.heldWorkOrderRepo, { blockerKind: 'open-pr', blockerId: '42' });
+    const before = await noForge.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(await noForge.useCase.registerWorkOrder(request())).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+    });
+    expect(await noForge.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
+
+    // (ii) a zero overlap check budget
+    const merged = prForge(prAnswer(42, 'merged'));
+    const zeroBudget = setup({ forgeRead: merged.forge as never, overlapCheckBudgetMs: 0 });
+    await seedHeld(zeroBudget.heldWorkOrderRepo, { blockerKind: 'open-pr', blockerId: '42' });
+    expect(await zeroBudget.useCase.registerWorkOrder(request())).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+    });
+    expect(merged.reads).toEqual([]);
+
+    // (iii) a repository value that is not a forge coordinate
+    const mergedAgain = prForge(prAnswer(42, 'merged'));
+    const badRepository = setup({ forgeRead: mergedAgain.forge as never });
+    await seedHeld(badRepository.heldWorkOrderRepo, { blockerKind: 'open-pr', blockerId: '42' });
+    expect(await badRepository.useCase.registerWorkOrder(request({ repository: 'not-a-coordinate' }))).toEqual({
+      outcome: 'refused',
+      reason: 'held-request-mismatch',
+    });
+    expect(mergedAgain.reads).toEqual([]);
+  });
+
+  it('replaces the stale held record when the changed request overlaps a new blocker, reports it once, and a replay reports nothing', async () => {
+    const state = setup();
+    const { digest, second } = await heldBehindWoA(state);
+    expect(second).toMatchObject({ outcome: 'refused', reason: 'active-work-order-overlap', held: true });
+    await releaseBlocker(state, 'stopped');
+    expect(await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-c' }))).toMatchObject({
+      outcome: 'registered',
+    });
+    const answer = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }));
+    const newDigest = (answer as { requestDigest: string }).requestDigest;
+    expect(newDigest).not.toBe(digest);
+    expect(answer).toEqual({
+      outcome: 'refused',
+      reason: 'active-work-order-overlap',
+      blockerKind: 'active-work-order',
+      blockerId: 'wo-c',
+      pathCode: expect.stringMatching(/^path-[0-9a-f]{12}$/),
+      held: true,
+      requestDigest: newDigest,
+      supersededHeld: {
+        requestDigest: digest,
+        blockerKind: 'active-work-order',
+        blockerId: 'wo-a',
+        heldAtIso: '2026-11-07T10:00:00.000Z',
+      },
+    });
+    const listed = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(listed.outcome === 'ok' && listed.records).toHaveLength(1);
+    expect(listed.outcome === 'ok').toBe(true);
+    const record = listed.outcome === 'ok' ? listed.records[0] : undefined;
+    expect(record).toMatchObject({
+      workOrderId: 'wo-b',
+      blockerId: 'wo-c',
+      stage: 'held',
+      requestDigest: newDigest,
+    });
+    const replay = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }));
+    expect(Object.hasOwn(replay, 'supersededHeld')).toBe(false);
+    expect(replay).toMatchObject({ reason: 'active-work-order-overlap', blockerId: 'wo-c', held: true });
+    const after = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(after.outcome === 'ok' && after.records).toHaveLength(1);
+  });
+
+  it('leaves the stale held record in the store when the changed request ends overlap-unknown', async () => {
+    const script: ForgeScript = { list: { outcome: 'listed', pullRequests: [] } };
+    const state = setup({ forgeRead: fakeForge(script).forge });
+    await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a', ownedPaths: ['packages/z/src'] }));
+    await state.workOrderRepo.saveWorkOrder({
+      ...(await state.workOrderRepo.findWorkOrderById('wo-a'))!,
+      state: 'stopped',
+      revision: 2,
+    });
+    await seedHeld(state.heldWorkOrderRepo, { blockerId: 'wo-a' });
+    const before = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    script.list = 'throw';
+    expect(await state.useCase.registerWorkOrder(request())).toEqual({ outcome: 'refused', reason: 'overlap-unknown' });
+    expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
+  });
+
+  it.each([
+    ['is refused', async () => ({ outcome: 'refused' })],
+    ['answers an unknown outcome', async () => ({ outcome: 'weird' })],
+    ['answers null', async () => null],
+    ['throws', async () => {
+      throw new Error('boom');
+    }],
+  ])('answers store-unavailable and records no new hold when deleting the stale record %s on the hold path', async (_label, answer) => {
+    const inner = new HeldWorkOrderRepositoryAdapter();
+    let recorded = 0;
+    const wrapped = wrapHeld(inner, {
+      deleteHeldWorkOrder: async () => (await answer()) as never,
+      recordHoldIntent: (r) => {
+        recorded += 1;
+        return inner.recordHoldIntent(r);
+      },
+    });
+    const state = setup({ heldWorkOrderRepo: wrapped });
+    await heldBehindWoA(state);
+    await releaseBlocker(state, 'stopped');
+    expect(await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-c' }))).toMatchObject({
+      outcome: 'registered',
+    });
+    recorded = 0;
+    const result = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'store-unavailable' });
+    expect(recorded).toBe(0);
+  });
+
+  it('continues to the hold when the stale record is already gone and reports no supersession', async () => {
+    const inner = new HeldWorkOrderRepositoryAdapter();
+    let recorded = 0;
+    const wrapped = wrapHeld(inner, {
+      deleteHeldWorkOrder: async () => ({ outcome: 'not-found' }),
+      recordHoldIntent: (r) => {
+        recorded += 1;
+        return inner.recordHoldIntent(r);
+      },
+    });
+    const state = setup({ heldWorkOrderRepo: wrapped });
+    await heldBehindWoA(state);
+    await releaseBlocker(state, 'stopped');
+    expect(await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-c' }))).toMatchObject({
+      outcome: 'registered',
+    });
+    recorded = 0;
+    const answer = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }));
+    expect(answer).toEqual({ outcome: 'refused', reason: 'held-request-mismatch' });
+    expect(recorded).toBe(1);
+    expect(Object.hasOwn(answer, 'supersededHeld')).toBe(false);
+  });
+
+  it.each([
+    ['is refused', async () => ({ outcome: 'refused' })],
+    ['throws', async () => {
+      throw new Error('boom');
+    }],
+  ])('still registers and reports no supersession when deleting the stale record %s after the save', async (_label, answer) => {
+    const inner = new HeldWorkOrderRepositoryAdapter();
+    const wrapped = wrapHeld(inner, { deleteHeldWorkOrder: async () => (await answer()) as never });
+    const state = setup({ heldWorkOrderRepo: wrapped });
+    await heldBehindWoA(state);
+    await releaseBlocker(state, 'stopped');
+    const result = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }));
+    expect(result.outcome).toBe('registered');
+    expect(Object.hasOwn(result, 'supersededHeld')).toBe(false);
+    expect(await state.workOrderRepo.findWorkOrderById('wo-b')).not.toBeNull();
+  });
+
+  it('supersedes a stale intent-stage record whose blocker work order is stopped', async () => {
+    const state = setup();
+    await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a', ownedPaths: ['packages/z/src'] }));
+    await state.workOrderRepo.saveWorkOrder({
+      ...(await state.workOrderRepo.findWorkOrderById('wo-a'))!,
+      state: 'stopped',
+      revision: 2,
+    });
+    await seedHeld(state.heldWorkOrderRepo, { blockerId: 'wo-a' }, false);
+    const result = await state.useCase.registerWorkOrder(request());
+    expect(result).toMatchObject({
+      outcome: 'registered',
+      supersededHeld: { requestDigest: 'a'.repeat(64), blockerId: 'wo-a' },
+    });
+    expect(await state.heldWorkOrderRepo.findByWorkOrderId('wo-new')).toEqual({ outcome: 'not-found' });
+  });
+
+  it('refuses intent-digest-mismatch for a stale intent-stage record whose blocker is still active', async () => {
+    const state = setup();
+    await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-a', ownedPaths: ['packages/z/src'] }));
+    await seedHeld(state.heldWorkOrderRepo, { blockerId: 'wo-a' }, false);
+    const before = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(await state.useCase.registerWorkOrder(request())).toEqual({
+      outcome: 'refused',
+      reason: 'intent-digest-mismatch',
+    });
+    expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
+  });
+
+  it('keeps an explicit intent id an idempotency key after the blocker is released', async () => {
+    const state = setup();
+    await heldBehindWoA(state, { intentId: 'intent-1' });
+    await releaseBlocker(state, 'stopped');
+    const before = await state.heldWorkOrderRepo.listHeldWorkOrders();
+    expect(
+      await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', intentId: 'intent-1', baseCommit: NEW_BASE })),
+    ).toEqual({ outcome: 'refused', reason: 'intent-digest-mismatch' });
+    expect(await state.heldWorkOrderRepo.listHeldWorkOrders()).toEqual(before);
+    expect(await state.workOrderRepo.findWorkOrderById('wo-b')).toBeNull();
+  });
+
+  it('registers the unchanged request after release without a supersededHeld key', async () => {
+    const state = setup();
+    await heldBehindWoA(state);
+    await releaseBlocker(state, 'stopped');
+    const answer = await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b' }));
+    expect(answer.outcome).toBe('registered');
+    expect(Object.hasOwn(answer, 'supersededHeld')).toBe(false);
   });
 });

@@ -65,9 +65,16 @@ export interface RegisterWorkOrderRequest {
  * refused with the blocker's id (a work order id or a pull request number) and
  * the code of the first overlapping owned path (`path-<12 hex>`), never a path.
  * `held` says whether the refused registration was kept (`work-order held`).
+ * A held record whose recorded blocker is proven released is superseded when
+ * the changed request reaches a recorded outcome (`registered`, or held again
+ * behind a new blocker) and is reported as `supersededHeld`.
  */
 export type RegisterWorkOrderResult =
-  | { readonly outcome: 'registered'; readonly workOrder: WorkOrderRecord }
+  | {
+      readonly outcome: 'registered';
+      readonly workOrder: WorkOrderRecord;
+      readonly supersededHeld?: SupersededHeldWorkOrder;
+    }
   | {
       readonly outcome: 'refused';
       readonly reason: 'active-work-order-overlap';
@@ -76,6 +83,7 @@ export type RegisterWorkOrderResult =
       readonly pathCode: string;
       readonly held: boolean;
       readonly requestDigest: string;
+      readonly supersededHeld?: SupersededHeldWorkOrder;
     }
   | {
       readonly outcome: 'refused';
@@ -86,6 +94,7 @@ export type RegisterWorkOrderResult =
       readonly pathCode: string;
       readonly held: boolean;
       readonly requestDigest: string;
+      readonly supersededHeld?: SupersededHeldWorkOrder;
     }
   | {
       readonly outcome: 'refused';
@@ -98,6 +107,13 @@ export type RegisterWorkOrderResult =
         | 'store-unavailable';
     }
   | { readonly outcome: 'rejected'; readonly reason: string };
+
+export interface SupersededHeldWorkOrder {
+  readonly requestDigest: string;
+  readonly blockerKind: 'active-work-order' | 'open-pr';
+  readonly blockerId: string;
+  readonly heldAtIso: string;
+}
 
 export interface RegisterWorkOrderPort {
   /** Register one approved work unit. No dispatch is authorized by this call. */

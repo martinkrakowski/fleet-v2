@@ -11,7 +11,10 @@
  * refused, naming only the blocker id and the code of the first overlapping
  * path. With a held store the refused registration is kept as `held`; a forge
  * read that fails or cannot be trusted refuses `overlap-unknown` and neither
- * admits nor holds. Nothing here ever echoes a path or a secret-shaped value.
+ * admits nor holds. A held record for the same work order whose request no
+ * longer matches is superseded only once its recorded blocker is proven
+ * released and the changed request reaches a recorded outcome; unknown is
+ * never released. Nothing here ever echoes a path or a secret-shaped value.
  */
 
 import {
@@ -50,6 +53,7 @@ import type {
   RegisterWorkOrderPort,
   RegisterWorkOrderRequest,
   RegisterWorkOrderResult,
+  SupersededHeldWorkOrder,
 } from '../ports/in/RegisterWorkOrderPort.in-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
@@ -153,6 +157,16 @@ function isActiveWorkOrder(state: WorkOrderRecord['state']): boolean {
 
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** The stale-held notice for a superseded record: ids and codes only. */
+function supersededNotice(record: HeldWorkOrderRecord): SupersededHeldWorkOrder {
+  return {
+    requestDigest: record.requestDigest,
+    blockerKind: record.blockerKind,
+    blockerId: record.blockerId,
+    heldAtIso: record.heldAtIso,
+  };
 }
 
 /** A stored path read leniently for the overlap check: trimmed, no trailing slash, never empty. */
@@ -293,6 +307,8 @@ interface OverlapContext {
   readonly snapshot: HeldWorkOrderRequestSnapshot;
   readonly nowIso: string;
   readonly ownedPaths: readonly string[];
+  /** The same-work-order held record whose request no longer matches; proven released. */
+  readonly staleRecord: HeldWorkOrderRecord | null;
 }
 
 export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
@@ -473,7 +489,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       digestFn,
     );
     const nowIso = request.nowIso ?? new Date().toISOString();
-    const context: OverlapContext = {
+    const baseContext: Omit<OverlapContext, 'staleRecord'> = {
       workOrderId: request.workOrderId,
       requestDigest,
       intentId: request.intentId ?? `hold-${requestDigest.slice(0, 24)}`,
@@ -484,11 +500,14 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     };
 
     // F129: a replayed intent or a held registration with a changed request is
-    // refused here, before any forge call and before anything is written.
-    const heldCheck = await this.checkHeldStore(context);
+    // refused here, before any forge call and before anything is written. A
+    // changed request whose recorded blocker is proven released supersedes the
+    // stale record instead of refusing.
+    const heldCheck = await this.checkHeldStore(baseContext);
     if (heldCheck.refusal !== null) {
       return heldCheck.refusal;
     }
+    const context: OverlapContext = { ...baseContext, staleRecord: heldCheck.staleRecord };
 
     const activeOrders = existing
       .filter((order) => isActiveWorkOrder(order.state))
@@ -548,12 +567,27 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     } catch {
       return STORE_UNAVAILABLE;
     }
-    if (heldCheck.heldRecord !== null && deps.heldWorkOrderRepo !== undefined) {
-      try {
-        await deps.heldWorkOrderRepo.deleteHeldWorkOrder(request.workOrderId, requestDigest);
-      } catch {
-        // The work order is registered; a stale held entry is left for the next pass to clear.
+    if (heldCheck.heldRecord !== null || heldCheck.staleRecord !== null) {
+      const clearing = heldCheck.heldRecord ?? heldCheck.staleRecord;
+      let supersededHeld: SupersededHeldWorkOrder | undefined;
+      if (clearing !== null && deps.heldWorkOrderRepo !== undefined) {
+        try {
+          const deleted = await deps.heldWorkOrderRepo.deleteHeldWorkOrder(
+            request.workOrderId,
+            clearing.requestDigest,
+          );
+          if (heldCheck.staleRecord !== null && deleted.outcome === 'deleted') {
+            supersededHeld = supersededNotice(heldCheck.staleRecord);
+          }
+        } catch {
+          // The work order is registered; a stale held entry is left for the next pass to clear.
+        }
       }
+      return {
+        outcome: 'registered',
+        workOrder: record,
+        ...(supersededHeld !== undefined ? { supersededHeld } : {}),
+      };
     }
     return { outcome: 'registered', workOrder: record };
   }
@@ -561,14 +595,20 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
   /**
    * The upfront F129 read of the held store: an intent id or a work order id
    * already used with a different request digest is refused, and an unreadable
-   * store is `store-unavailable`.
+   * store is `store-unavailable`. A changed request for the same work order
+   * whose recorded blocker is proven released supersedes the stale record
+   * instead of refusing.
    */
   private async checkHeldStore(
-    context: OverlapContext,
-  ): Promise<{ readonly refusal: RegisterWorkOrderResult | null; readonly heldRecord: HeldWorkOrderRecord | null }> {
+    context: Omit<OverlapContext, 'staleRecord'>,
+  ): Promise<{
+    readonly refusal: RegisterWorkOrderResult | null;
+    readonly heldRecord: HeldWorkOrderRecord | null;
+    readonly staleRecord: HeldWorkOrderRecord | null;
+  }> {
     const heldRepo = this.deps?.heldWorkOrderRepo;
     if (heldRepo === undefined) {
-      return { refusal: null, heldRecord: null };
+      return { refusal: null, heldRecord: null, staleRecord: null };
     }
     let byIntent;
     let byWorkOrder;
@@ -576,28 +616,105 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       byIntent = await heldRepo.findByIntentId(context.intentId);
       byWorkOrder = await heldRepo.findByWorkOrderId(context.workOrderId);
     } catch {
-      return { refusal: STORE_UNAVAILABLE, heldRecord: null };
+      return { refusal: STORE_UNAVAILABLE, heldRecord: null, staleRecord: null };
     }
     if (byIntent.outcome === 'unreadable' || byWorkOrder.outcome === 'unreadable') {
-      return { refusal: STORE_UNAVAILABLE, heldRecord: null };
+      return { refusal: STORE_UNAVAILABLE, heldRecord: null, staleRecord: null };
     }
     if (
       byIntent.outcome === 'found' &&
       (byIntent.record.workOrderId !== context.workOrderId || byIntent.record.requestDigest !== context.requestDigest)
     ) {
-      return { refusal: { outcome: 'refused', reason: 'intent-digest-mismatch' }, heldRecord: null };
+      return {
+        refusal: { outcome: 'refused', reason: 'intent-digest-mismatch' },
+        heldRecord: null,
+        staleRecord: null,
+      };
     }
     if (byWorkOrder.outcome === 'found') {
-      const record = byWorkOrder.record;
-      if (record.stage === 'intent' && (record.requestDigest !== context.requestDigest || record.intentId !== context.intentId)) {
-        return { refusal: { outcome: 'refused', reason: 'intent-digest-mismatch' }, heldRecord: null };
-      }
-      if (record.stage === 'held' && record.requestDigest !== context.requestDigest) {
-        return { refusal: { outcome: 'refused', reason: 'held-request-mismatch' }, heldRecord: null };
-      }
-      return { refusal: null, heldRecord: record };
+      return this.resolveSameWorkOrderHeldRecord(byWorkOrder.record, context);
     }
-    return { refusal: null, heldRecord: null };
+    return { refusal: null, heldRecord: null, staleRecord: null };
+  }
+
+  private async resolveSameWorkOrderHeldRecord(
+    record: HeldWorkOrderRecord,
+    context: Omit<OverlapContext, 'staleRecord'>,
+  ): Promise<{
+    readonly refusal: RegisterWorkOrderResult | null;
+    readonly heldRecord: HeldWorkOrderRecord | null;
+    readonly staleRecord: HeldWorkOrderRecord | null;
+  }> {
+    const mismatch =
+      record.requestDigest !== context.requestDigest ||
+      (record.stage === 'intent' && record.intentId !== context.intentId);
+    if (!mismatch) {
+      return { refusal: null, heldRecord: record, staleRecord: null };
+    }
+    if (await this.heldBlockerReleased(record, context.snapshot.repository)) {
+      return { refusal: null, heldRecord: null, staleRecord: record };
+    }
+    if (record.stage === 'intent') {
+      return {
+        refusal: { outcome: 'refused', reason: 'intent-digest-mismatch' },
+        heldRecord: null,
+        staleRecord: null,
+      };
+    }
+    return {
+      refusal: { outcome: 'refused', reason: 'held-request-mismatch' },
+      heldRecord: null,
+      staleRecord: null,
+    };
+  }
+
+  /**
+   * Whether the stale record's blocker is proven released: a terminal blocker
+   * work order, or a merged/closed pull request read from the forge. Unknown
+   * is never released; any failure or doubt answers `false`.
+   */
+  private async heldBlockerReleased(record: HeldWorkOrderRecord, repositoryText: string): Promise<boolean> {
+    try {
+      const deps = this.deps;
+      if (deps === undefined) {
+        return false;
+      }
+      if (record.blockerKind === 'active-work-order') {
+        const blocker = await deps.workOrderRepo.findWorkOrderById(record.blockerId);
+        return blocker !== null && blocker !== undefined && !isActiveWorkOrder(blocker.state);
+      }
+      if (record.blockerKind === 'open-pr') {
+        const forgeRead = deps.forgeRead;
+        if (
+          forgeRead === undefined ||
+          typeof forgeRead.readPullRequest !== 'function' ||
+          parseForgeRepositoryCoordinates(repositoryText) === null
+        ) {
+          return false;
+        }
+        const number = Number(record.blockerId);
+        if (!Number.isSafeInteger(number) || number < 1) {
+          return false;
+        }
+        if (deps.overlapCheckBudgetMs !== undefined && !(deps.overlapCheckBudgetMs > 0)) {
+          return false;
+        }
+        const repository = parseForgeRepositoryCoordinates(repositoryText)!;
+        const timeoutMs = Math.min(
+          MAX_OVERLAP_CHECK_BUDGET_MS,
+          Math.max(1, deps.overlapCheckBudgetMs ?? DEFAULT_OVERLAP_CHECK_BUDGET_MS),
+        );
+        const read = await forgeRead.readPullRequest({ ref: { kind: 'number', number }, repository, timeoutMs });
+        return (
+          read.outcome === 'found' &&
+          read.pullRequest.number === number &&
+          (read.pullRequest.state === 'merged' || read.pullRequest.state === 'closed')
+        );
+      }
+      return false;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -738,6 +855,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     const blockerKind: OverlapBlockerKind = blocker.kind;
     const blockerId = blocker.kind === 'open-pr' ? String(blocker.pullRequestNumber) : blocker.workOrderId;
     let held = false;
+    let supersededHeld: SupersededHeldWorkOrder | undefined;
     const heldRepo = this.deps?.heldWorkOrderRepo;
     const isLegacyActiveId =
       blocker.kind === 'active-work-order' && !ID_TOKEN_PATTERN.test(blockerId);
@@ -777,6 +895,13 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
         heldAtIso: context.nowIso,
       };
       try {
+        if (context.staleRecord !== null) {
+          const replaced = await this.replaceStaleHeld(heldRepo, context);
+          if (!replaced.ok) {
+            return STORE_UNAVAILABLE;
+          }
+          supersededHeld = replaced.notice;
+        }
         const recorded = await heldRepo.recordHoldIntent(record);
         if (recorded.outcome === 'refused') {
           return recorded.reason === 'invalid-record'
@@ -814,6 +939,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
         pathCode,
         held,
         requestDigest: context.requestDigest,
+        ...(supersededHeld !== undefined ? { supersededHeld } : {}),
       };
     }
     return {
@@ -824,7 +950,32 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       pathCode,
       held,
       requestDigest: context.requestDigest,
+      ...(supersededHeld !== undefined ? { supersededHeld } : {}),
     };
+  }
+
+  /**
+   * Replaces the stale held record with the new hold: the record is deleted
+   * first, and only a `deleted` answer reports a supersession. `not-found`
+   * continues silently (a replay already removed it); any other answer or a
+   * throw propagates to the caller's store-unavailable handling.
+   */
+  private async replaceStaleHeld(
+    heldRepo: HeldWorkOrderRepositoryPort,
+    context: OverlapContext,
+  ): Promise<{ readonly ok: true; readonly notice: SupersededHeldWorkOrder | undefined } | { readonly ok: false }> {
+    const stale = context.staleRecord;
+    if (stale === null) {
+      return { ok: true, notice: undefined };
+    }
+    const deleted = await heldRepo.deleteHeldWorkOrder(context.workOrderId, stale.requestDigest);
+    if (deleted.outcome === 'deleted') {
+      return { ok: true, notice: supersededNotice(stale) };
+    }
+    if (deleted.outcome === 'not-found') {
+      return { ok: true, notice: undefined };
+    }
+    return { ok: false };
   }
 
   /**

@@ -5,8 +5,11 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
-import { isPlainRecordObject } from './record-schema-version.js';
-import { INITIAL_RECORD_SCHEMA_VERSION, readRecordSchemaVersion } from './record-schema-version.js';
+import {
+  INITIAL_RECORD_SCHEMA_VERSION,
+  isPlainRecordObject,
+  readRecordSchemaVersion,
+} from './record-schema-version.js';
 
 export const CUTOVER_RECORD_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
 
@@ -311,98 +314,133 @@ export function readCutoverShadowEvidence(raw: unknown, nowIso: string): Cutover
     // The recorded merge count is part of the evidence: below the minimum (or
     // absent, mistyped or out of range) the shadow evidence is insufficient,
     // whatever the day verdicts say.
-    const merges = ownDataValue(raw, 'merges');
-    if (typeof merges !== 'number' ||
-      typeof merges !== 'number' ||
-      !Number.isSafeInteger(merges) ||
-      merges < CUTOVER_SHADOW_MIN_MERGES ||
-      merges > MAX_REVISION
-    ) {
+    if (!isSufficientMergeCount(ownDataValue(raw, 'merges'))) {
       return allCriteriaFailed();
     }
-    const days = ownDataValue(raw, 'days');
-    // The prototype check rejects a stand-in before any length read.
-    if (!Array.isArray(days) || Object.getPrototypeOf(days) !== Array.prototype) {
-      return allCriteriaFailed();
-    }
-    // The array-length and key-count bounds run BEFORE any serializer probe.
-    // A probe on an unbounded array would traverse it — a sparse array with an
-    // enormous `length` costs a traversal per hole — and would run any getter
-    // it meets on the way, whose DataCloneError a clone refusal cannot tell
-    // apart from a Proxy stand-in. With the bounds settled first, an oversized
-    // array is refused without being cloned, and the descriptor walk below
-    // never runs a getter; a Proxy stand-in is refused by the final serializer
-    // probe, which reads only proved primitive data properties.
-    const dayKeys = Reflect.ownKeys(days);
-    const allowedDayKeys: readonly string[] = ['0', '1', '2', 'length'];
-    // Key-count guard first: an over-count is refused before any descriptor read.
-    if (dayKeys.length !== allowedDayKeys.length || dayKeys.some((key) => !allowedDayKeys.includes(key as string))) {
-      return allCriteriaFailed();
-    }
-    const lengthDescriptor = Object.getOwnPropertyDescriptor(days, 'length');
-    if (
-      lengthDescriptor === undefined ||
-      lengthDescriptor.get !== undefined ||
-      lengthDescriptor.set !== undefined ||
-      typeof lengthDescriptor.value !== 'number' ||
-      lengthDescriptor.value !== CUTOVER_SHADOW_CONSECUTIVE_DAYS
-    ) {
+    const days = readBoundedDaysArray(ownDataValue(raw, 'days'));
+    if (days === null) {
       return allCriteriaFailed();
     }
     const nowMs = Date.parse(nowIso);
     if (Number.isNaN(nowMs)) {
       return allCriteriaFailed();
     }
-    const nowDay = Math.floor(nowMs / DAY_MS);
-    const failed = new Set<string>();
-    const dayNumbers: number[] = [];
-    for (let index = 0; index < CUTOVER_SHADOW_CONSECUTIVE_DAYS; index += 1) {
-      const element = ownDataValue(days, String(index));
-      if (!isPlainRecordObject(element) || Reflect.ownKeys(element).length !== 2) {
-        return allCriteriaFailed();
-      }
-      const day = ownDataValue(element, 'day');
-      const verdicts = ownDataValue(element, 'verdicts');
-      if (!isBoundedText(day) || !isPlainRecordObject(verdicts)) {
-        return allCriteriaFailed();
-      }
-      const dayNumber = utcDayNumber(day);
-      if (dayNumber === null) {
-        return allCriteriaFailed();
-      }
-      const verdictKeys = Reflect.ownKeys(verdicts);
-      if (verdictKeys.length > ALL_CRITERIA.length || verdictKeys.some((key) => !ALL_CRITERIA.includes(key as string))) {
-        return allCriteriaFailed();
-      }
-      for (const criterion of ALL_CRITERIA) {
-        if (ownDataValue(verdicts, criterion) !== 'pass') {
-          failed.add(criterion);
-        }
-      }
-      dayNumbers.push(dayNumber);
-    }
-    const ascendingConsecutive =
-      dayNumbers[0] < dayNumbers[1] && dayNumbers[1] < dayNumbers[2] && dayNumbers[2] - dayNumbers[0] === 2;
-    if (!ascendingConsecutive || dayNumbers[2] > nowDay) {
+    const walk = walkEvidenceDays(days);
+    if (walk === null || !isAscendingConsecutive(walk.dayNumbers) || walk.dayNumbers[2] > Math.floor(nowMs / DAY_MS)) {
       return allCriteriaFailed();
     }
-    if (failed.size > 0) {
-      return criteriaFailed(failed);
+    if (walk.failed.size > 0) {
+      return criteriaFailed(walk.failed);
     }
-    // A transparent Proxy over the document answers every prototype, key and
-    // descriptor read exactly as its target would, so the checks above cannot
-    // tell it from data. The structured-clone serializer refuses any Proxy
-    // exotic object, and at this point every own property on the document is a
-    // validated data property with a primitive value, so the probe reads no
-    // getter and costs a constant walk over at most the permitted keys. A
-    // clone failure here means a stand-in, never data.
-    try {
-      structuredClone(raw);
-    } catch {
-      return allCriteriaFailed();
-    }
-    return { ok: true };
+    return isCloneableData(raw) ? { ok: true } : allCriteriaFailed();
   } catch {
     return allCriteriaFailed();
+  }
+}
+
+function isSufficientMergeCount(merges: unknown): boolean {
+  return (
+    typeof merges === 'number' &&
+    Number.isSafeInteger(merges) &&
+    merges >= CUTOVER_SHADOW_MIN_MERGES &&
+    merges <= MAX_REVISION
+  );
+}
+
+const ALLOWED_DAY_KEYS: ReadonlySet<string> = new Set(['0', '1', '2', 'length']);
+
+/** The `days` array when it is a real, bounded array of exactly the permitted shape, else null. */
+function readBoundedDaysArray(days: unknown): readonly unknown[] | null {
+  // The prototype check rejects a stand-in before any length read.
+  if (!Array.isArray(days) || Object.getPrototypeOf(days) !== Array.prototype) {
+    return null;
+  }
+  // The array-length and key-count bounds run BEFORE any serializer probe.
+  // A probe on an unbounded array would traverse it — a sparse array with an
+  // enormous `length` costs a traversal per hole — and would run any getter
+  // it meets on the way, whose DataCloneError a clone refusal cannot tell
+  // apart from a Proxy stand-in. With the bounds settled first, an oversized
+  // array is refused without being cloned, and the descriptor walk never runs
+  // a getter; a Proxy stand-in is refused by the final serializer probe,
+  // which reads only proved primitive data properties.
+  const dayKeys = Reflect.ownKeys(days);
+  // Key-count guard first: an over-count is refused before any descriptor read.
+  if (dayKeys.length !== ALLOWED_DAY_KEYS.size || dayKeys.some((key) => !ALLOWED_DAY_KEYS.has(key as string))) {
+    return null;
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(days, 'length');
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined ||
+    typeof lengthDescriptor.value !== 'number' ||
+    lengthDescriptor.value !== CUTOVER_SHADOW_CONSECUTIVE_DAYS
+  ) {
+    return null;
+  }
+  return days;
+}
+
+/** The UTC day serials and failed criteria of the three day records, or null when any shape is unusable. */
+function walkEvidenceDays(
+  days: readonly unknown[],
+): { readonly dayNumbers: readonly number[]; readonly failed: ReadonlySet<string> } | null {
+  const failed = new Set<string>();
+  const dayNumbers: number[] = [];
+  for (let index = 0; index < CUTOVER_SHADOW_CONSECUTIVE_DAYS; index += 1) {
+    const dayNumber = readEvidenceDay(ownDataValue(days, String(index)), failed);
+    if (dayNumber === null) {
+      return null;
+    }
+    dayNumbers.push(dayNumber);
+  }
+  return { dayNumbers, failed };
+}
+
+/** One day record's UTC day serial (adding its non-pass criteria to `failed`), or null when unusable. */
+function readEvidenceDay(element: unknown, failed: Set<string>): number | null {
+  if (!isPlainRecordObject(element) || Reflect.ownKeys(element).length !== 2) {
+    return null;
+  }
+  const day = ownDataValue(element, 'day');
+  const verdicts = ownDataValue(element, 'verdicts');
+  if (!isBoundedText(day) || !isPlainRecordObject(verdicts)) {
+    return null;
+  }
+  const dayNumber = utcDayNumber(day);
+  if (dayNumber === null) {
+    return null;
+  }
+  const verdictKeys = Reflect.ownKeys(verdicts);
+  if (verdictKeys.length > ALL_CRITERIA.length || verdictKeys.some((key) => !ALL_CRITERIA.includes(key as string))) {
+    return null;
+  }
+  for (const criterion of ALL_CRITERIA) {
+    if (ownDataValue(verdicts, criterion) !== 'pass') {
+      failed.add(criterion);
+    }
+  }
+  return dayNumber;
+}
+
+function isAscendingConsecutive(dayNumbers: readonly number[]): boolean {
+  return dayNumbers[0] < dayNumbers[1] && dayNumbers[1] < dayNumbers[2] && dayNumbers[2] - dayNumbers[0] === 2;
+}
+
+/**
+ * A transparent Proxy over the document answers every prototype, key and
+ * descriptor read exactly as its target would, so the checks above cannot
+ * tell it from data. The structured-clone serializer refuses any Proxy
+ * exotic object, and at this point every own property on the document is a
+ * validated data property with a primitive value, so the probe reads no
+ * getter and costs a constant walk over at most the permitted keys. A
+ * clone failure here means a stand-in, never data.
+ */
+function isCloneableData(raw: unknown): boolean {
+  try {
+    structuredClone(raw);
+    return true;
+  } catch {
+    return false;
   }
 }

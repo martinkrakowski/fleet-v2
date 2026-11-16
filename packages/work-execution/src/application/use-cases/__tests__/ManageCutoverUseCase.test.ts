@@ -311,6 +311,17 @@ function shadowEvidence(nowIso: string, verdictOverrides: Record<string, string>
   return { merges: CUTOVER_SHADOW_MIN_MERGES, days };
 }
 
+function useCaseWithReaders(h: Harness, overrides: Parameters<typeof readers>[0] = {}): ManageCutoverUseCase {
+  return new ManageCutoverUseCase({ ...h.deps, ...readers(overrides) });
+}
+
+/** A switch refused before any port write: no pause set, no record save, no journal entry. */
+function expectNoSwitchWrites(h: Harness): void {
+  expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
+  expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+  expect(h.spies.journalAppend).not.toHaveBeenCalled();
+}
+
 type ShadowEvidenceReader = NonNullable<ManageCutoverDependencies['readShadowEvidence']>;
 type UnrecordedLanesCounter = NonNullable<ManageCutoverDependencies['countUnrecordedLanes']>;
 
@@ -552,9 +563,7 @@ describe('ManageCutoverUseCase switch', () => {
     resetSpies(h);
     const result = await h.useCase.execute(switchRequest());
     expect(result).toEqual({ outcome: 'refused', reason: 'shadow-evidence-absent', failed: [...CUTOVER_SHADOW_CRITERIA] });
-    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
-    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
-    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+    expectNoSwitchWrites(h);
   });
 
   it('a reader that answers absent refuses shadow-evidence-absent, and unreadable or unknown-version answers are unknown', async () => {
@@ -571,7 +580,7 @@ describe('ManageCutoverUseCase switch', () => {
               throw new Error('boom');
             }
           : (async () => ({ status })) as ShadowEvidenceReader;
-      const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers({ readShadowEvidence: reader }) });
+      const useCase = useCaseWithReaders(h, { readShadowEvidence: reader });
       resetSpies(h);
       expect(await useCase.execute(switchRequest())).toEqual(expected);
       expect(totalWriteCalls(h)).toBe(0);
@@ -580,28 +589,23 @@ describe('ManageCutoverUseCase switch', () => {
 
   it('refuses a switch whose evidence carries fewer merges than the minimum', async () => {
     const h = await harness({ seed: null });
-    const useCase = new ManageCutoverUseCase({
-      ...h.deps,
-      ...readers({
-        readShadowEvidence: async () => ({
-          status: 'ok',
-          evidence: { ...shadowEvidence(NOW), merges: CUTOVER_SHADOW_MIN_MERGES - 1 },
-        }),
+    const useCase = useCaseWithReaders(h, {
+      readShadowEvidence: async () => ({
+        status: 'ok',
+        evidence: { ...shadowEvidence(NOW), merges: CUTOVER_SHADOW_MIN_MERGES - 1 },
       }),
     });
     resetSpies(h);
     const result = await useCase.execute(switchRequest());
     expect(result).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: [...CUTOVER_SHADOW_CRITERIA] });
-    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
-    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
-    expect(h.spies.journalAppend).not.toHaveBeenCalled();
+    expectNoSwitchWrites(h);
   });
 
   it('switch does not credit a train pause that was already paused, and a later rollback lifts nothing', async () => {
     const h = await harness({ seed: null });
     // The pause already exists before the switch, so `set` answers `unchanged`.
     await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
-    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    const useCase = useCaseWithReaders(h);
     resetSpies(h);
     expect(await useCase.execute(switchRequest())).toMatchObject({
       outcome: 'completed',
@@ -626,15 +630,13 @@ describe('ManageCutoverUseCase switch', () => {
 
   it('switch names S4 when that verdict is unknown and the other criteria pass', async () => {
     const h = await harness({ seed: null });
-    const useCase = new ManageCutoverUseCase({
-      ...h.deps,
-      ...readers({ readShadowEvidence: async () => ({ status: 'ok', evidence: shadowEvidence(NOW, { S4: 'unknown' }) }) }),
+    const useCase = useCaseWithReaders(h, {
+      readShadowEvidence: async () => ({ status: 'ok', evidence: shadowEvidence(NOW, { S4: 'unknown' }) }),
     });
     resetSpies(h);
     const result = await useCase.execute(switchRequest());
     expect(result).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: ['S4'] });
-    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
-    expect(h.spies.compareAndSet).not.toHaveBeenCalled();
+    expectNoSwitchWrites(h);
   });
 
   it('answers unrecorded-lanes-unknown for a missing or unreadable count or unknown listings, and unrecorded-lanes for unrecorded work', async () => {
@@ -646,10 +648,7 @@ describe('ManageCutoverUseCase switch', () => {
       ['throws', async () => { throw new Error('boom'); }, { outcome: 'unknown', reason: 'unrecorded-lanes-unknown' }],
     ] as const) {
       const h = await harness({ seed: null });
-      const useCase = new ManageCutoverUseCase({
-        ...h.deps,
-        ...readers(counter === undefined ? { countUnrecordedLanes: undefined } : { countUnrecordedLanes: counter as UnrecordedLanesCounter }),
-      });
+      const useCase = useCaseWithReaders(h, { countUnrecordedLanes: counter as UnrecordedLanesCounter | undefined });
       resetSpies(h);
       expect({ label, result: await useCase.execute(switchRequest()) }).toEqual({ label, result: expected });
       expect(totalWriteCalls(h)).toBe(0);
@@ -670,7 +669,7 @@ describe('ManageCutoverUseCase switch', () => {
     for (const [label, arrange, expected] of cases) {
       const h = await harness({ seed: null });
       await arrange(h);
-      const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+      const useCase = useCaseWithReaders(h);
       resetSpies(h);
       const request = label === 'deadline passed' ? switchRequest({ deadlineIso: EARLIER_DEADLINE }) : switchRequest();
       expect({ label, result: await useCase.execute(request) }).toEqual({ label, result: expected });
@@ -684,7 +683,7 @@ describe('ManageCutoverUseCase switch', () => {
 
   it('switch sets the train pause and saves a switched record when evidence passes and no lane is unrecorded', async () => {
     const h = await harness({ seed: null });
-    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    const useCase = useCaseWithReaders(h);
     resetSpies(h);
     const result = await useCase.execute(switchRequest());
     expect(result).toMatchObject({
@@ -725,7 +724,7 @@ describe('ManageCutoverUseCase switch', () => {
 
   it('switch still proceeds when the daemon is present with a failed last tick', async () => {
     const h = await harness({ seed: null, daemonStatus: { read: async () => ({ status: 'ok', record: { exitCode: 1 } as never }) } });
-    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    const useCase = useCaseWithReaders(h);
     resetSpies(h);
     expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', state: 'switched', revision: 1 });
     expect(h.spies.trainPauseSet).toHaveBeenCalledTimes(1);
@@ -734,7 +733,7 @@ describe('ManageCutoverUseCase switch', () => {
   it('finishes a switch cut short after the intent, and maps refused writes to unknown', async () => {
     // A compare-and-set that throws once leaves the intent recorded; the next pass finishes the move.
     const h = await harness({ seed: null });
-    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    const useCase = useCaseWithReaders(h);
     h.spies.compareAndSet.mockRejectedValueOnce(new Error('disk gone'));
     expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'cutover-record-write-failed' });
     expect(await journalEntries(h, 'cutover/switch@0')).toHaveLength(1);
@@ -743,14 +742,14 @@ describe('ManageCutoverUseCase switch', () => {
 
     // A refused train-pause set is unknown and the record stays unswitched.
     const refusedSet = await harness({ seed: null });
-    const refusedUseCase = new ManageCutoverUseCase({ ...refusedSet.deps, ...readers() });
+    const refusedUseCase = useCaseWithReaders(refusedSet);
     refusedSet.spies.trainPauseSet.mockResolvedValueOnce({ outcome: 'refused', reason: 'pause-unreadable' });
     expect(await refusedUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'train-pause-write-failed' });
     expect(await refusedSet.repo.read()).toEqual({ status: 'missing' });
 
     // A refused compare-and-set is unknown; a conflict is a refusal.
     const refusedCas = await harness({ seed: null });
-    const refusedCasUseCase = new ManageCutoverUseCase({ ...refusedCas.deps, ...readers() });
+    const refusedCasUseCase = useCaseWithReaders(refusedCas);
     refusedCas.spies.compareAndSet.mockResolvedValueOnce({ outcome: 'refused', reason: 'unreadable' });
     expect(await refusedCasUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'cutover-record-write-failed' });
     refusedCas.spies.compareAndSet.mockResolvedValueOnce({ outcome: 'conflict', currentRevision: 4 });
@@ -758,7 +757,7 @@ describe('ManageCutoverUseCase switch', () => {
 
     // A failed intent append writes no journal entry.
     const failedAppend = await harness({ seed: null });
-    const failedAppendUseCase = new ManageCutoverUseCase({ ...failedAppend.deps, ...readers() });
+    const failedAppendUseCase = useCaseWithReaders(failedAppend);
     failedAppend.spies.journalAppend.mockResolvedValueOnce({ outcome: 'refused', reason: 'store-unreadable' });
     expect(await failedAppendUseCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'journal-append-failed' });
     expect(await journalEntries(failedAppend, 'cutover/switch@0')).toHaveLength(0);
@@ -768,7 +767,7 @@ describe('ManageCutoverUseCase switch', () => {
     const h = await harness({ seed: null });
     const digest = sha256HexDigest(`{"move":"switch","expectedRevision":0,"operationId":"op-1","relaunchPlanDigest":"${PLAN_DIGEST}"}`);
     await h.journal.append({ key: 'cutover/switch@0', kind: 'intent', entryId: ulid(910), recordedAtIso: NOW, digest });
-    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    const useCase = useCaseWithReaders(h);
     expect(await useCase.execute(switchRequest({ operationId: 'op-2' }))).toEqual({
       outcome: 'refused',
       reason: 'intent-digest-mismatch',
@@ -794,7 +793,7 @@ describe('ManageCutoverUseCase switch', () => {
     const h = await harness({ seed: switchedRecord(1) });
     const digest = sha256HexDigest(`{"move":"switch","expectedRevision":1,"operationId":"op-1","relaunchPlanDigest":"${PLAN_DIGEST}"}`);
     await h.journal.append({ key: 'cutover/switch@1', kind: 'intent', entryId: ulid(912), recordedAtIso: NOW, digest });
-    const useCase = new ManageCutoverUseCase({ ...h.deps, ...readers() });
+    const useCase = useCaseWithReaders(h);
     resetSpies(h);
     expect(await useCase.execute(switchRequest({ expectedRevision: 1 }))).toEqual({ outcome: 'refused', reason: 'not-shadow' });
     expect(totalWriteCalls(h)).toBe(0);

@@ -67,10 +67,14 @@ function optionalIsoFlag(p: Payload, key: string, flag: string): string | undefi
   return value;
 }
 
+/** A flag value as a number: a number as given, a string only when it matches `pattern`, else NaN. */
+function revisionFromFlagValue(value: unknown, pattern: RegExp): number {
+  if (typeof value === 'number') return value;
+  return typeof value === 'string' && pattern.test(value) ? Number(value) : Number.NaN;
+}
+
 function expectedRevisionFlag(p: Payload): number {
-  const value = p['expectedRevision'];
-  const revision =
-    typeof value === 'number' ? value : typeof value === 'string' && /^[1-9][0-9]{0,9}$/.test(value) ? Number(value) : NaN;
+  const revision = revisionFromFlagValue(p['expectedRevision'], /^[1-9]\d{0,9}$/);
   if (!Number.isSafeInteger(revision) || revision < 1) {
     throw new CliUsageError('cutover rollback requires --expected-revision as a positive integer');
   }
@@ -79,9 +83,7 @@ function expectedRevisionFlag(p: Payload): number {
 
 /** The switch revision accepts 0, the one-way door's no-record-yet revision. */
 function switchExpectedRevisionFlag(p: Payload): number {
-  const value = p['expectedRevision'];
-  const revision =
-    typeof value === 'number' ? value : typeof value === 'string' && /^[0-9]{1,10}$/.test(value) ? Number(value) : NaN;
+  const revision = revisionFromFlagValue(p['expectedRevision'], /^\d{1,10}$/);
   if (!Number.isSafeInteger(revision) || revision < 0 || revision > 1_000_000_000) {
     throw new CliUsageError('cutover switch requires --expected-revision as an integer between 0 and 1000000000');
   }
@@ -104,6 +106,37 @@ function relaunchPlanDigestFlag(p: Payload): string {
   return digest;
 }
 
+type CutoverRuntime = Parameters<CommandHandler>[1];
+
+/** Reads the shared flags of a revisioned move and runs it; the use case result is returned unchanged. */
+async function executeMove(
+  payload: Payload,
+  runtime: CutoverRuntime,
+  move: 'rollback' | 'switch' | 'retire',
+  expectedRevision: number,
+  extra: Readonly<Record<string, string>>,
+): Promise<unknown> {
+  const operationId = operationIdFlag(payload, move);
+  const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso') ?? runtime.daemon.now();
+  const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
+  return runtime.execution.manageCutover.execute({
+    move,
+    expectedRevision,
+    operationId,
+    ...extra,
+    nowIso,
+    ...(deadlineIso === undefined ? {} : { deadlineIso }),
+  });
+}
+
+/** The handler of a move that takes only a revision and an operation id (rollback and retire). */
+function revisionMoveHandler(move: 'rollback' | 'retire'): CommandHandler {
+  return async (payload, runtime) => {
+    rejectUnexpectedInput(payload, move, ['expectedRevision', 'operationId', 'nowIso', 'deadlineIso']);
+    return executeMove(payload, runtime, move, expectedRevisionFlag(payload), {});
+  };
+}
+
 export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
   status: async (payload, runtime) => {
     rejectUnexpectedInput(payload, 'status', ['nowIso', 'deadlineIso']);
@@ -116,54 +149,19 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
     });
   },
 
-  rollback: async (payload, runtime) => {
-    rejectUnexpectedInput(payload, 'rollback', ['expectedRevision', 'operationId', 'nowIso', 'deadlineIso']);
-    const expectedRevision = expectedRevisionFlag(payload);
-    const operationId = operationIdFlag(payload, 'rollback');
-    const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso') ?? runtime.daemon.now();
-    const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
-    return runtime.execution.manageCutover.execute({
-      move: 'rollback',
-      expectedRevision,
-      operationId,
-      nowIso,
-      ...(deadlineIso === undefined ? {} : { deadlineIso }),
-    });
-  },
+  rollback: revisionMoveHandler('rollback'),
 
   switch: async (payload, runtime) => {
     rejectUnexpectedInput(payload, 'switch', [
       'expectedRevision', 'operationId', 'relaunchPlanDigest', 'nowIso', 'deadlineIso',
     ]);
     const expectedRevision = switchExpectedRevisionFlag(payload);
-    const operationId = operationIdFlag(payload, 'switch');
-    const relaunchPlanDigest = relaunchPlanDigestFlag(payload);
-    const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso') ?? runtime.daemon.now();
-    const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
-    return runtime.execution.manageCutover.execute({
-      move: 'switch',
-      expectedRevision,
-      operationId,
-      relaunchPlanDigest,
-      nowIso,
-      ...(deadlineIso === undefined ? {} : { deadlineIso }),
+    return executeMove(payload, runtime, 'switch', expectedRevision, {
+      relaunchPlanDigest: relaunchPlanDigestFlag(payload),
     });
   },
 
-  retire: async (payload, runtime) => {
-    rejectUnexpectedInput(payload, 'retire', ['expectedRevision', 'operationId', 'nowIso', 'deadlineIso']);
-    const expectedRevision = expectedRevisionFlag(payload);
-    const operationId = operationIdFlag(payload, 'retire');
-    const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso') ?? runtime.daemon.now();
-    const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
-    return runtime.execution.manageCutover.execute({
-      move: 'retire',
-      expectedRevision,
-      operationId,
-      nowIso,
-      ...(deadlineIso === undefined ? {} : { deadlineIso }),
-    });
-  },
+  retire: revisionMoveHandler('retire'),
 
   shadow: async (payload, runtime) => {
     const sub = firstPositional(payload);

@@ -180,91 +180,77 @@ function parseStatus(snapshot: Record<string, unknown>): ParsedRequest {
   };
 }
 
-function parseRollback(snapshot: Record<string, unknown>): ParsedRequest {
+/** The fields every revisioned move carries: key set, revision floor, operation id and timestamps. */
+function hasValidMoveFields(
+  snapshot: Record<string, unknown>,
+  allowedKeys: readonly string[],
+  minRevision: number,
+): boolean {
   const { expectedRevision, operationId, nowIso, deadlineIso } = snapshot;
-  if (
-    !hasOnlyKeys(snapshot, ROLLBACK_KEYS) ||
-    typeof expectedRevision !== 'number' ||
-    !Number.isSafeInteger(expectedRevision) ||
-    expectedRevision < 1 ||
-    expectedRevision > MAX_REVISION ||
-    typeof operationId !== 'string' ||
-    !OPERATION_ID.test(operationId) ||
-    !isBoundedIso(nowIso) ||
-    (deadlineIso !== undefined && !isBoundedIso(deadlineIso))
-  ) {
-    return { ok: false, reason: 'invalid-request' };
-  }
+  return (
+    hasOnlyKeys(snapshot, allowedKeys) &&
+    typeof expectedRevision === 'number' &&
+    Number.isSafeInteger(expectedRevision) &&
+    expectedRevision >= minRevision &&
+    expectedRevision <= MAX_REVISION &&
+    typeof operationId === 'string' &&
+    OPERATION_ID.test(operationId) &&
+    isBoundedIso(nowIso) &&
+    (deadlineIso === undefined || isBoundedIso(deadlineIso))
+  );
+}
+
+/** The request of a move whose fields `hasValidMoveFields` already proved, plus any `extra` fields. */
+function moveRequestFrom(
+  snapshot: Record<string, unknown>,
+  move: 'rollback' | 'switch' | 'retire',
+  extra: Record<string, unknown>,
+): ParsedRequest {
+  const { expectedRevision, operationId, nowIso, deadlineIso } = snapshot;
   return {
     ok: true,
     request: {
-      move: 'rollback',
+      move,
       expectedRevision,
       operationId,
+      ...extra,
       nowIso,
       ...(deadlineIso === undefined ? {} : { deadlineIso }),
     },
-  };
+  } as ParsedRequest;
+}
+
+function parseRollback(snapshot: Record<string, unknown>): ParsedRequest {
+  if (!hasValidMoveFields(snapshot, ROLLBACK_KEYS, 1)) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  return moveRequestFrom(snapshot, 'rollback', {});
 }
 
 /** Switch allows revision 0 (the one-way door runs on an unrecorded cutover); the digest is 64 lowercase hex. */
 function parseSwitch(snapshot: Record<string, unknown>): ParsedRequest {
-  const { expectedRevision, operationId, relaunchPlanDigest, nowIso, deadlineIso } = snapshot;
+  const { relaunchPlanDigest } = snapshot;
   if (
-    !hasOnlyKeys(snapshot, SWITCH_KEYS) ||
-    typeof expectedRevision !== 'number' ||
-    !Number.isSafeInteger(expectedRevision) ||
-    expectedRevision < 0 ||
-    expectedRevision > MAX_REVISION ||
-    typeof operationId !== 'string' ||
-    !OPERATION_ID.test(operationId) ||
+    !hasValidMoveFields(snapshot, SWITCH_KEYS, 0) ||
     typeof relaunchPlanDigest !== 'string' ||
-    !RELAUNCH_DIGEST.test(relaunchPlanDigest) ||
-    !isBoundedIso(nowIso) ||
-    (deadlineIso !== undefined && !isBoundedIso(deadlineIso))
+    !RELAUNCH_DIGEST.test(relaunchPlanDigest)
   ) {
     return { ok: false, reason: 'invalid-request' };
   }
-  return {
-    ok: true,
-    request: {
-      move: 'switch',
-      expectedRevision,
-      operationId,
-      relaunchPlanDigest,
-      nowIso,
-      ...(deadlineIso === undefined ? {} : { deadlineIso }),
-    },
-  };
+  return moveRequestFrom(snapshot, 'switch', { relaunchPlanDigest });
 }
 
 /** Retire only follows a recorded switch, so its revision starts at 1. */
 function parseRetire(snapshot: Record<string, unknown>): ParsedRequest {
-  const { expectedRevision, operationId, nowIso, deadlineIso } = snapshot;
-  if (
-    !hasOnlyKeys(snapshot, RETIRE_KEYS) ||
-    typeof expectedRevision !== 'number' ||
-    !Number.isSafeInteger(expectedRevision) ||
-    expectedRevision < 1 ||
-    expectedRevision > MAX_REVISION ||
-    typeof operationId !== 'string' ||
-    !OPERATION_ID.test(operationId) ||
-    !isBoundedIso(nowIso) ||
-    (deadlineIso !== undefined && !isBoundedIso(deadlineIso))
-  ) {
+  if (!hasValidMoveFields(snapshot, RETIRE_KEYS, 1)) {
     return { ok: false, reason: 'invalid-request' };
   }
-  return {
-    ok: true,
-    request: {
-      move: 'retire',
-      expectedRevision,
-      operationId,
-      nowIso,
-      ...(deadlineIso === undefined ? {} : { deadlineIso }),
-    },
-  };
+  return moveRequestFrom(snapshot, 'retire', {});
 }
+
+type MoveKind = { readonly move: 'switch'; readonly state: 'switched' } | { readonly move: 'retire'; readonly state: 'retired' };
+const SWITCH_KIND: MoveKind = { move: 'switch', state: 'switched' };
+const RETIRE_KIND: MoveKind = { move: 'retire', state: 'retired' };
 
 export class ManageCutoverUseCase implements ManageCutoverPort {
   constructor(private readonly deps: ManageCutoverDependencies) {}
@@ -653,6 +639,17 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     return null;
   }
 
+  /** Appends the intent only when this exact move has none yet; a recorded intent is a retry. */
+  private async appendIntentUnlessRecorded(
+    recorded: CutoverJournalEntry | null,
+    key: string,
+    digest: string,
+    normalizedNowIso: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | null> {
+    return recorded === null ? this.appendIntent(key, digest, normalizedNowIso, deadlineIso) : null;
+  }
+
   /** The completed-result append shared by every move; a second final result is not a failure. */
   private async appendResult(
     key: string,
@@ -721,29 +718,21 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
       return precondition;
     }
 
-    const evidenceFailure = await this.shadowEvidenceFailure(request, deadlineIso);
-    if (evidenceFailure !== null) {
-      return evidenceFailure;
-    }
-    const lanesFailure = await this.unrecordedLanesFailure(deadlineIso);
-    if (lanesFailure !== null) {
-      return lanesFailure;
-    }
-    const daemonFailure = await this.daemonStatusFailure(deadlineIso);
-    if (daemonFailure !== null) {
-      return daemonFailure;
-    }
-    const trainReadFailure = await this.trainPauseReadFailure(deadlineIso);
-    if (trainReadFailure !== null) {
-      return trainReadFailure;
+    const preflightFailure = await this.switchPreflightFailure(request, deadlineIso);
+    if (preflightFailure !== null) {
+      return preflightFailure;
     }
 
     const normalizedNowIso = normalizeIso(nowIso);
-    if (journal.intent === null) {
-      const intentFailure = await this.appendIntent(key, requestDigest, normalizedNowIso, deadlineIso);
-      if (intentFailure !== null) {
-        return intentFailure;
-      }
+    const intentFailure = await this.appendIntentUnlessRecorded(
+      journal.intent,
+      key,
+      requestDigest,
+      normalizedNowIso,
+      deadlineIso,
+    );
+    if (intentFailure !== null) {
+      return intentFailure;
     }
 
     const saved = await this.applySwitch(record, expectedRevision, request.relaunchPlanDigest, normalizedNowIso, deadlineIso);
@@ -755,15 +744,20 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (resultFailure !== null) {
       return resultFailure;
     }
-    return {
-      outcome: 'completed',
-      move: 'switch',
-      key,
-      replayed: false,
-      state: 'switched',
-      revision: saved.record.revision,
-      record: saved.record,
-    };
+    return this.completedMove(SWITCH_KIND, key, saved.record);
+  }
+
+  /** The switch gates after the state precondition, in order: evidence, lane coverage, daemon, train pause. */
+  private async switchPreflightFailure(
+    request: ManageCutoverSwitchRequest,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | null> {
+    return (
+      (await this.shadowEvidenceFailure(request, deadlineIso)) ??
+      (await this.unrecordedLanesFailure(deadlineIso)) ??
+      (await this.daemonStatusFailure(deadlineIso)) ??
+      (await this.trainPauseReadFailure(deadlineIso))
+    );
   }
 
   /** The record state a switch demands on every pass, before anything is recorded. */
@@ -895,6 +889,15 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
       relaunchPlanDigest,
       trainPauseSetByCutover,
     };
+    return this.swapCutoverRecord(expectedRevision, nextRecord, deadlineIso);
+  }
+
+  /** The compare-and-set every switch or retire ends with, mapped to the move's refusals. */
+  private async swapCutoverRecord(
+    expectedRevision: number,
+    nextRecord: CutoverRecord,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult | { readonly record: CutoverRecord }> {
     const swapped = await this.guarded(deadlineIso, () =>
       this.deps.cutoverRepo.compareAndSet({ expectedRevision, next: nextRecord, deadlineIso }),
     );
@@ -904,8 +907,31 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     return { record: swapped.value.record };
   }
 
+  /** The completed result of a move this pass performed. */
+  private completedMove(kind: MoveKind, key: string, record: CutoverRecord): ManageCutoverResult {
+    return { outcome: 'completed', ...kind, key, replayed: false, revision: record.revision, record };
+  }
+
   /** A completed switch returns its recorded outcome with no write; a refused one stays refused. */
-  private async replaySwitchFinal(
+  private replaySwitchFinal(
+    finalEntry: CutoverJournalEntry,
+    key: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult> {
+    return this.replayCompletedMove(SWITCH_KIND, finalEntry, key, deadlineIso);
+  }
+
+  /** A completed retire returns its recorded outcome with no write and lifts no pause again. */
+  private replayRetireFinal(
+    finalEntry: CutoverJournalEntry,
+    key: string,
+    deadlineIso: string | undefined,
+  ): Promise<ManageCutoverResult> {
+    return this.replayCompletedMove(RETIRE_KIND, finalEntry, key, deadlineIso);
+  }
+
+  private async replayCompletedMove(
+    kind: MoveKind,
     finalEntry: CutoverJournalEntry,
     key: string,
     deadlineIso: string | undefined,
@@ -921,18 +947,10 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (read === null) {
       return unknown('cutover-record-unreadable');
     }
-    if (read.state !== 'switched') {
+    if (read.state !== kind.state) {
       return refuse('revision-conflict');
     }
-    return {
-      outcome: 'completed',
-      move: 'switch',
-      key,
-      replayed: true,
-      state: 'switched',
-      revision: read.revision,
-      record: read,
-    };
+    return { outcome: 'completed', ...kind, key, replayed: true, revision: read.revision, record: read };
   }
 
   private async retireMove(request: ManageCutoverRetireRequest): Promise<ManageCutoverResult> {
@@ -970,11 +988,15 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (precondition !== null) {
       return precondition;
     }
-    if (journal.intent === null) {
-      const intentFailure = await this.appendIntent(key, requestDigest, normalizedNowIso, deadlineIso);
-      if (intentFailure !== null) {
-        return intentFailure;
-      }
+    const intentFailure = await this.appendIntentUnlessRecorded(
+      journal.intent,
+      key,
+      requestDigest,
+      normalizedNowIso,
+      deadlineIso,
+    );
+    if (intentFailure !== null) {
+      return intentFailure;
     }
 
     const saved = await this.applyRetire(record, expectedRevision, normalizedNowIso, deadlineIso);
@@ -986,15 +1008,7 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (resultFailure !== null) {
       return resultFailure;
     }
-    return {
-      outcome: 'completed',
-      move: 'retire',
-      key,
-      replayed: false,
-      state: 'retired',
-      revision: saved.record.revision,
-      record: saved.record,
-    };
+    return this.completedMove(RETIRE_KIND, key, saved.record);
   }
 
   /** The record, clock and window refusals a retire decides on every pass. */
@@ -1003,7 +1017,7 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     expectedRevision: number,
     normalizedNowIso: string,
   ): ManageCutoverResult | null {
-    if (record === null || record.revision !== expectedRevision) {
+    if (record?.revision !== expectedRevision) {
       return refuse('not-switched');
     }
     if (record.state !== 'switched' || record.switchedAtIso === null) {
@@ -1064,43 +1078,6 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
       relaunchPlanDigest: record.relaunchPlanDigest,
       trainPauseSetByCutover: false,
     };
-    const swapped = await this.guarded(deadlineIso, () =>
-      this.deps.cutoverRepo.compareAndSet({ expectedRevision, next: nextRecord, deadlineIso }),
-    );
-    if (swapped.kind === 'deadline') return unknown('deadline-exceeded');
-    if (swapped.kind === 'threw' || swapped.value.outcome === 'refused') return unknown('cutover-record-write-failed');
-    if (swapped.value.outcome === 'conflict') return refuse('revision-conflict');
-    return { record: swapped.value.record };
-  }
-
-  /** A completed retire returns its recorded outcome with no write and lifts no pause again. */
-  private async replayRetireFinal(
-    finalEntry: CutoverJournalEntry,
-    key: string,
-    deadlineIso: string | undefined,
-  ): Promise<ManageCutoverResult> {
-    if (finalEntry.outcome === 'refused') {
-      return refuse('journal-refused');
-    }
-    const cutover = await this.readCutover(deadlineIso);
-    if ('stop' in cutover) {
-      return cutover.stop;
-    }
-    const read = cutover.record;
-    if (read === null) {
-      return unknown('cutover-record-unreadable');
-    }
-    if (read.state !== 'retired') {
-      return refuse('revision-conflict');
-    }
-    return {
-      outcome: 'completed',
-      move: 'retire',
-      key,
-      replayed: true,
-      state: 'retired',
-      revision: read.revision,
-      record: read,
-    };
+    return this.swapCutoverRecord(expectedRevision, nextRecord, deadlineIso);
   }
 }

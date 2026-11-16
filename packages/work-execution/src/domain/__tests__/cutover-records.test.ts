@@ -209,6 +209,16 @@ describe('readCutoverShadowEvidence', () => {
     return root;
   }
 
+  const onlyFailed = (...ids: string[]) => ({ ok: false, reason: 'invalid-evidence', failed: ids });
+
+  /** Valid evidence with criterion `id` of day `dayIndex` redefined as an own enumerable property. */
+  function withVerdict(dayIndex: number, id: string, descriptor: PropertyDescriptor): unknown {
+    return evidence(NOW, (root) => {
+      const days = root.days as Array<{ verdicts: Record<string, unknown> }>;
+      Object.defineProperty(days[dayIndex].verdicts, id, { enumerable: true, ...descriptor });
+    });
+  }
+
   it('accepts three consecutive pass days', () => {
     expect(readCutoverShadowEvidence(evidence(NOW), NOW)).toEqual({ ok: true });
     // The last day may equal the UTC date of nowIso but not follow it.
@@ -231,11 +241,7 @@ describe('readCutoverShadowEvidence', () => {
   });
 
   it('names only S4 when that verdict is unknown', () => {
-    const document = evidence(NOW, (root) => {
-      const days = root.days as Array<{ verdicts: Record<string, string> }>;
-      days[2].verdicts['S4'] = 'unknown';
-    });
-    expect(readCutoverShadowEvidence(document, NOW)).toEqual({ ok: false, reason: 'invalid-evidence', failed: ['S4'] });
+    expect(readCutoverShadowEvidence(withVerdict(2, 'S4', { value: 'unknown' }), NOW)).toEqual(onlyFailed('S4'));
   });
 
   it('refuses a future, gapped, duplicate or non-calendar day with every criterion named', () => {
@@ -278,24 +284,8 @@ describe('readCutoverShadowEvidence', () => {
     holed.length = 3; // holes at indices 1 and 2
     expect(readCutoverShadowEvidence({ days: holed }, NOW)).toEqual(ALL_FAILED);
 
-    const wrongPrimitive = evidence(NOW, (root) => {
-      const days = root.days as Array<{ verdicts: Record<string, unknown> }>;
-      days[1].verdicts['S7'] = 7;
-    });
-    expect(readCutoverShadowEvidence(wrongPrimitive, NOW)).toEqual({
-      ok: false,
-      reason: 'invalid-evidence',
-      failed: ['S7'],
-    });
-    const booleanVerdict = evidence(NOW, (root) => {
-      const days = root.days as Array<{ verdicts: Record<string, unknown> }>;
-      days[0].verdicts['S2'] = true;
-    });
-    expect(readCutoverShadowEvidence(booleanVerdict, NOW)).toEqual({
-      ok: false,
-      reason: 'invalid-evidence',
-      failed: ['S2'],
-    });
+    expect(readCutoverShadowEvidence(withVerdict(1, 'S7', { value: 7 }), NOW)).toEqual(onlyFailed('S7'));
+    expect(readCutoverShadowEvidence(withVerdict(0, 'S2', { value: true }), NOW)).toEqual(onlyFailed('S2'));
 
     const throwingRoot: Record<string, unknown> = {};
     Object.defineProperty(throwingRoot, 'days', {
@@ -305,54 +295,42 @@ describe('readCutoverShadowEvidence', () => {
       },
     });
     expect(readCutoverShadowEvidence(throwingRoot, NOW)).toEqual(ALL_FAILED);
-    const getterDays = evidence(NOW, (root) => {
-      const days = root.days as Array<{ verdicts: Record<string, unknown> }>;
-      Object.defineProperty(days[0].verdicts, 'S9', {
-        enumerable: true,
-        get() {
-          throw new Error('boom');
-        },
-      });
-    });
-    expect(readCutoverShadowEvidence(getterDays, NOW)).toEqual({
-      ok: false,
-      reason: 'invalid-evidence',
-      failed: ['S9'],
-    });
+    expect(
+      readCutoverShadowEvidence(
+        withVerdict(0, 'S9', {
+          get() {
+            throw new Error('boom');
+          },
+        }),
+        NOW,
+      ),
+    ).toEqual(onlyFailed('S9'));
 
     // A verdict getter that yields an uncloneable value, or throws a
     // DataCloneError itself, must stay unread and name only its own
     // criterion. A serializer probe that runs before the bounds would meet
     // these getters and mistake their failure for a stand-in refusal, naming
     // every criterion instead.
-    const uncloneableGetter = evidence(NOW, (root) => {
-      const days = root.days as Array<{ verdicts: Record<string, unknown> }>;
-      Object.defineProperty(days[0].verdicts, 'S5', {
-        enumerable: true,
-        get() {
-          return () => 1; // a function cannot be cloned
-        },
-      });
-    });
-    expect(readCutoverShadowEvidence(uncloneableGetter, NOW)).toEqual({
-      ok: false,
-      reason: 'invalid-evidence',
-      failed: ['S5'],
-    });
-    const dataCloneThrowingGetter = evidence(NOW, (root) => {
-      const days = root.days as Array<{ verdicts: Record<string, unknown> }>;
-      Object.defineProperty(days[2].verdicts, 'S6', {
-        enumerable: true,
-        get() {
-          throw new DOMException('unread', 'DataCloneError');
-        },
-      });
-    });
-    expect(readCutoverShadowEvidence(dataCloneThrowingGetter, NOW)).toEqual({
-      ok: false,
-      reason: 'invalid-evidence',
-      failed: ['S6'],
-    });
+    expect(
+      readCutoverShadowEvidence(
+        withVerdict(0, 'S5', {
+          get() {
+            return () => 1; // a function cannot be cloned
+          },
+        }),
+        NOW,
+      ),
+    ).toEqual(onlyFailed('S5'));
+    expect(
+      readCutoverShadowEvidence(
+        withVerdict(2, 'S6', {
+          get() {
+            throw new DOMException('unread', 'DataCloneError');
+          },
+        }),
+        NOW,
+      ),
+    ).toEqual(onlyFailed('S6'));
 
     expect(readCutoverShadowEvidence({ days: new Proxy({}, {}) }, NOW)).toEqual(ALL_FAILED);
     expect(

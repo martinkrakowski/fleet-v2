@@ -25,10 +25,10 @@ env:
 # which passes only when every job it needs succeeded. Renaming or dropping it blocks every PR.
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      # ubuntu-latest has curl and nc: the ocm-run integration suite (a vitest test in
+      # ubuntu-24.04 has curl and nc: the ocm-run integration suite (a vitest test in
       # work-execution) must run, never silently skip. turbo.json declares it in the test task's
       # env, so strict env mode passes it through to vitest.
       OCM_IT_REQUIRE: "1"
@@ -71,7 +71,7 @@ jobs:
         run: yarn test
 
   sync:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -92,7 +92,7 @@ jobs:
         run: yarn sync:check
 
   shell:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       # Every shard reports, so one failure does not hide another's.
@@ -125,7 +125,7 @@ jobs:
   # scripted review verdicts; every PR runs it (plan D1). The suite is skipped
   # everywhere else unless FLEET_E2E_SSH=1 (tests/e2e/ssh-fixture.sh).
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -157,7 +157,7 @@ jobs:
   # Q8b: dependency audit, report-only (production-quality plan §4.8: report first, gate later). It is not in
   # `gate`'s needs, so a finding never blocks a PR; the findings are written to the job summary.
   audit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -186,7 +186,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     needs: [build-test, sync, shell, e2e]
     # Runs whatever the needed jobs did, and fails unless every one succeeded: a failed,

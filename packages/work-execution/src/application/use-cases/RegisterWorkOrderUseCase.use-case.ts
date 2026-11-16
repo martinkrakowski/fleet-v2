@@ -985,7 +985,8 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       progress.staleMayBeGone = true;
       const replaced = await this.replaceStaleHeld(heldRepo, context);
       if (!replaced.ok) {
-        progress.staleMayBeGone = false;
+        // A refused or unrecognised delete may still have landed (an adapter can
+        // fail after writing), so the rollback looks the stale record up.
         return { ok: false, answer: STORE_UNAVAILABLE };
       }
       supersededHeld = replaced.notice;
@@ -997,25 +998,29 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       progress.replacementMayExist = false;
       return { ok: false, answer: recordRefusalAnswer(recorded.reason) };
     }
-    if (recorded.outcome === 'recorded') {
-      const completed = await heldRepo.completeHoldIntent({
-        intentId: context.intentId,
-        workOrderId: context.workOrderId,
-        requestDigest: context.requestDigest,
-      });
-      if (completed.outcome === 'refused') {
-        return {
-          ok: false,
-          answer:
-            completed.reason === 'intent-digest-mismatch'
-              ? { outcome: 'refused', reason: 'intent-digest-mismatch' }
-              : STORE_UNAVAILABLE,
-        };
-      }
-    } else {
-      progress.replacementMayExist = false;
+    if (recorded.outcome !== 'recorded' && recorded.outcome !== 'already-held') {
+      // Unrecognised or malformed: nothing was confirmed, so never report held.
+      return { ok: false, answer: STORE_UNAVAILABLE };
     }
-    return { ok: true, supersededHeld };
+    if (recorded.outcome === 'already-held') {
+      progress.replacementMayExist = false;
+      return { ok: true, supersededHeld };
+    }
+    const completed = await heldRepo.completeHoldIntent({
+      intentId: context.intentId,
+      workOrderId: context.workOrderId,
+      requestDigest: context.requestDigest,
+    });
+    if (completed.outcome === 'held') {
+      return { ok: true, supersededHeld };
+    }
+    return {
+      ok: false,
+      answer:
+        completed.outcome === 'refused' && completed.reason === 'intent-digest-mismatch'
+          ? { outcome: 'refused', reason: 'intent-digest-mismatch' }
+          : STORE_UNAVAILABLE,
+    };
   }
 
   /**
@@ -1073,7 +1078,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       }
       const asIntent = stale.stage === 'held' ? { ...stale, stage: 'intent' as const } : stale;
       const recorded = await heldRepo.recordHoldIntent(asIntent);
-      if (recorded.outcome === 'refused') {
+      if (recorded.outcome !== 'recorded' && recorded.outcome !== 'already-held') {
         return false;
       }
       if (stale.stage === 'intent') {

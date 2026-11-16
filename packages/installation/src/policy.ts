@@ -18,6 +18,7 @@ import type {
   ChainRole,
   ChainStep,
   ChainsSection,
+  ConductorPremergeMode,
   ConductorReaperRepairKind,
   FleetInstallationModel,
   LiveTailContent,
@@ -535,10 +536,24 @@ function freshDefaultConductorReaper(): ResolvedConductorReaperPolicy {
   });
 }
 
+function readResolvedConductorPremergeMode(
+  block: Record<string, unknown>,
+): ConductorPremergeMode | undefined {
+  if (!Object.hasOwn(block, 'premergeMode')) {
+    return 'human-gate';
+  }
+  const value = readOwnDataProperty(block, 'premergeMode');
+  if (value === 'human-gate' || value === 'auto-attest') {
+    return value;
+  }
+  return undefined;
+}
+
 function freshDefaultConductorPolicy(): ResolvedConductorPolicy {
   return Object.freeze({
     enabled: false,
     stopGraceMinutes: 45,
+    premergeMode: 'human-gate',
     reaper: freshDefaultConductorReaper(),
   });
 }
@@ -575,6 +590,10 @@ export function resolveConductorPolicy(policy: PolicySection | undefined): Resol
     CONDUCTOR_MINUTE_BOUNDS.stopGraceMinutes,
   );
   if (Object.hasOwn(block, 'stopGraceMinutes') && stopGraceMinutes === undefined) {
+    return freshDefaultConductorPolicy();
+  }
+  const premergeMode = readResolvedConductorPremergeMode(block);
+  if (premergeMode === undefined) {
     return freshDefaultConductorPolicy();
   }
   let reaper: ResolvedConductorReaperPolicy | undefined;
@@ -642,6 +661,7 @@ export function resolveConductorPolicy(policy: PolicySection | undefined): Resol
   return Object.freeze({
     enabled,
     stopGraceMinutes: stopGraceMinutes ?? 45,
+    premergeMode,
     reaper: reaper ?? freshDefaultConductorReaper(),
   });
 }

@@ -345,6 +345,7 @@ export const AUTO_MERGE_KEYS: readonly string[] = freezeKeys<AutoMergePolicy>()(
 export const CONDUCTOR_KEYS: readonly string[] = freezeKeys<ConductorPolicy>()([
   'enabled',
   'stopGraceMinutes',
+  'premergeMode',
   'reaper',
 ]);
 

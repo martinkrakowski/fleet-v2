@@ -17,6 +17,7 @@ import type {
   ChainsSection,
   CiRunnerSlotSection,
   ConductorPolicy,
+  ConductorPremergeMode,
   ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
   ConductorReaperRepairs,
@@ -2300,6 +2301,21 @@ function readConductorMinutes(
   return value;
 }
 
+function readConductorPremergeMode(
+  record: JsonObject,
+  errors: string[],
+): ConductorPremergeMode | undefined {
+  if (!Object.hasOwn(record, 'premergeMode')) {
+    return undefined;
+  }
+  const value = record.premergeMode;
+  if (value !== 'human-gate' && value !== 'auto-attest') {
+    errors.push('policy.conductor.premergeMode: must be one of human-gate, auto-attest');
+    return undefined;
+  }
+  return value;
+}
+
 function parseConductorRepairs(
   reaper: JsonObject,
   errors: string[],
@@ -2518,6 +2534,7 @@ function parseConductorPolicy(
     CONDUCTOR_MINUTE_BOUNDS.stopGraceMinutes,
     errors,
   );
+  const premergeMode = readConductorPremergeMode(value, errors);
   const reaper = parseConductorReaper(value, errors);
   if (errors.length !== before || enabled === undefined) {
     return undefined;
@@ -2525,6 +2542,7 @@ function parseConductorPolicy(
   return {
     enabled,
     ...(stopGraceMinutes !== undefined ? { stopGraceMinutes } : {}),
+    ...(premergeMode !== undefined ? { premergeMode } : {}),
     ...(reaper !== undefined ? { reaper } : {}),
   };
 }

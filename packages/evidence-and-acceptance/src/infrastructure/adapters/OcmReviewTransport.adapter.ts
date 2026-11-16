@@ -797,19 +797,32 @@ export const BRIEF_VERIFY_CHECKLIST: string = [
 /** The fixed reason a kind with no prompt plan is refused; it never carries the kind value. */
 export const UNSUPPORTED_REVIEW_KIND_REASON = 'unsupported review kind';
 
+/**
+ * The fixed reason a brief-verify review whose candidate head is not the
+ * brief's base commit is refused; it carries no request text.
+ */
+export const BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON =
+  'a pre-dispatch brief verification requires the candidate head to be the base commit the brief was written against';
+
 /** What one review kind's prompt needs: the brief, the base..head diff, and its instruction text. */
 export interface KindPromptPlan {
   readonly brief: boolean;
   readonly diff: boolean;
+  /**
+   * Whether the kind's review checks the repository at the candidate head, so
+   * the head must be the base commit the brief was written against; a
+   * different head is refused before any read or spawn.
+   */
+  readonly headIsBase: boolean;
   readonly instructions: string;
 }
 
 // `Record<ReviewKind, ...>`: adding a kind to REVIEW_KINDS fails the build here until it gets its own plan.
 const KIND_PROMPT_PLANS: Readonly<Record<ReviewKind, KindPromptPlan>> = {
-  'brief-check': { brief: true, diff: true, instructions: BRIEF_CHECK_QUESTION },
-  'brief-verify': { brief: true, diff: false, instructions: BRIEF_VERIFY_CHECKLIST },
-  'code-review': { brief: false, diff: true, instructions: REVIEW_CHECKLIST },
-  'pre-merge': { brief: false, diff: true, instructions: REVIEW_CHECKLIST },
+  'brief-check': { brief: true, diff: true, headIsBase: false, instructions: BRIEF_CHECK_QUESTION },
+  'brief-verify': { brief: true, diff: false, headIsBase: true, instructions: BRIEF_VERIFY_CHECKLIST },
+  'code-review': { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST },
+  'pre-merge': { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST },
 };
 
 /** The plan of a kind, or `null` for anything that is not one of the four kinds (own keys only). */
@@ -1388,6 +1401,20 @@ export function createOcmReviewTransport(
     // 0b. A kind with no prompt plan is refused before any read or spawn; a
     // manual review (no kind) has no plan and keeps the manual prompt.
     const kindPlan = request.kind === undefined ? undefined : requireKindPromptPlan(request.kind);
+
+    // 0c. A plan whose review checks the repository at the candidate head
+    // (no change exists yet) requires that head to be the base commit the
+    // brief was written against. A different head is refused before any read
+    // or spawn, so a review of a head the brief does not describe can never
+    // pass. Without a known base commit there is nothing to compare against.
+    if (
+      kindPlan !== undefined &&
+      kindPlan.headIsBase &&
+      options.baseCommit !== undefined &&
+      request.candidateHeadSha !== options.baseCommit
+    ) {
+      throw new ReviewTransportError(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON, 'transport-failed');
+    }
 
     // 1. Verify reviewer model matches options.model
     if (request.reviewerModel !== options.model) {

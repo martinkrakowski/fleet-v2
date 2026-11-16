@@ -11,6 +11,7 @@ import {
   ALLOWED_PART_TYPES,
   BRIEF_CHECK_QUESTION,
   BRIEF_VERIFY_CHECKLIST,
+  BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON,
   buildReviewerEnv,
   buildReviewPrompt,
   createOcmReviewTransport,
@@ -2472,7 +2473,10 @@ describe('OcmReviewTransport', () => {
           prompts.push(args[args.length - 1]);
           return { exitCode: 0, stdout: PASS_STREAM, stderr: '' };
         },
-        baseCommit: 'baseCommit' in overrides ? overrides.baseCommit : 'base-sha-1',
+        // A brief-verify review requires the candidate head to be the brief
+        // base commit, so the default base commit matches the request head;
+        // a test that needs a mismatch overrides it.
+        baseCommit: 'baseCommit' in overrides ? overrides.baseCommit : baseRequest.candidateHeadSha,
         readDiff:
           'readDiff' in overrides
             ? async () => {
@@ -2502,10 +2506,10 @@ describe('OcmReviewTransport', () => {
 
     it('every kind in REVIEW_KINDS has its own plan', () => {
       expect(REVIEW_KINDS.map((kind) => [kind, kindPromptPlanOf(kind)])).toEqual([
-        ['brief-check', { brief: true, diff: true, instructions: BRIEF_CHECK_QUESTION }],
-        ['brief-verify', { brief: true, diff: false, instructions: BRIEF_VERIFY_CHECKLIST }],
-        ['code-review', { brief: false, diff: true, instructions: REVIEW_CHECKLIST }],
-        ['pre-merge', { brief: false, diff: true, instructions: REVIEW_CHECKLIST }],
+        ['brief-check', { brief: true, diff: true, headIsBase: false, instructions: BRIEF_CHECK_QUESTION }],
+        ['brief-verify', { brief: true, diff: false, headIsBase: true, instructions: BRIEF_VERIFY_CHECKLIST }],
+        ['code-review', { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST }],
+        ['pre-merge', { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST }],
       ]);
     });
 
@@ -2637,6 +2641,30 @@ describe('OcmReviewTransport', () => {
       const result = await transport(verifyRequest);
       expect(result.result).toBe('pass');
       expect(result.rawOutput).not.toBe('diff-unavailable');
+    });
+
+    it('a brief-verify review whose candidate head is not the brief base commit is refused before any read or spawn', async () => {
+      const counted = makeCounted({ baseCommit: 'base-sha-1' });
+      await expect(counted.transport(verifyRequest)).rejects.toMatchObject({
+        name: 'ReviewTransportError',
+        code: 'transport-failed',
+        message: BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON,
+      });
+      // The refusal carries no request text: neither head value is echoed.
+      expect(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON).not.toContain('base-sha-1');
+      expect(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON).not.toContain(baseRequest.candidateHeadSha);
+      expect(counted.dirCalls).toBe(0);
+      expect(counted.headCalls).toBe(0);
+      expect(counted.diffCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(0);
+    });
+
+    it('a brief-verify review at the candidate head that matches the brief base commit still passes', async () => {
+      const counted = makeCounted({});
+      const result = await counted.transport(verifyRequest);
+      expect(result.result).toBe('pass');
+      expect(result.readOnlyVerified).toBe(true);
+      expect(counted.prompts).toHaveLength(2);
     });
 
     it('a brief-verify review at the wrong head is refused before any spawn, and a head that moves during it voids read-only', async () => {

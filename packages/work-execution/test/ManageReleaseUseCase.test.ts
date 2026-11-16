@@ -29,6 +29,10 @@ import type {
 } from '../src/application/ports/out/ConductorDriverLeasePort.out-port.js';
 import type {
   ReleaseBuildRecord,
+  ReleaseDriverBinding,
+  ReleaseOperationBegin,
+  ReleaseOperationRef,
+  ReleaseOrphanCurrentTempsResult,
   ReleaseStagingResult,
   ReleaseStoreListing,
   ReleaseStorePort,
@@ -156,6 +160,68 @@ class FakeStore implements ReleaseStorePort {
 
   get writes(): string[] {
     return this.calls;
+  }
+
+  /** In-memory release operations: one open intent per (action, sha), a claim while a run holds it. */
+  readonly operations = new Map<string, { opId: string; claimed: boolean }>();
+  readonly completed: string[] = [];
+  private operationCount = 0;
+  orphanPasses = 0;
+
+  async beginOperation(input: { action: string; sha: string; opId: string }): Promise<ReleaseOperationBegin> {
+    const key = `${input.action}-${input.sha}`;
+    const open = this.operations.get(key);
+    if (open !== undefined) {
+      if (open.claimed || open.opId !== input.opId) {
+        return { outcome: 'busy' };
+      }
+      open.claimed = true;
+      return { outcome: 'resumed', opId: open.opId };
+    }
+    this.operations.set(key, { opId: input.opId, claimed: true });
+    return { outcome: 'started', opId: input.opId };
+  }
+
+  async peekOperation(input: { action: string; sha: string }): Promise<{ outcome: 'open'; opId: string } | { outcome: 'none' }> {
+    const open = this.operations.get(`${input.action}-${input.sha}`);
+    return open === undefined ? { outcome: 'none' } : { outcome: 'open', opId: open.opId };
+  }
+
+  newOperationId(): string {
+    this.operationCount += 1;
+    return this.operationCount.toString(16).padStart(32, '0');
+  }
+
+  async completeOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    this.operations.delete(`${input.action}-${input.sha}`);
+    this.completed.push(input.opId);
+    return { outcome: 'ok' };
+  }
+
+  async cancelOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    this.operations.delete(`${input.action}-${input.sha}`);
+    return { outcome: 'ok' };
+  }
+
+  async releaseOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    const open = this.operations.get(`${input.action}-${input.sha}`);
+    if (open !== undefined) {
+      open.claimed = false;
+    }
+    return { outcome: 'ok' };
+  }
+
+  async removeOrphanCurrentTemps(): Promise<ReleaseOrphanCurrentTempsResult> {
+    this.orphanPasses += 1;
+    return { outcome: 'cleaned', removed: 0, findings: 0 };
+  }
+
+  async readDriverBinding(): Promise<ReleaseDriverBinding> {
+    return { outcome: 'unbound' };
+  }
+
+  async bindDriver(input: { stateDir: string }): Promise<ReleaseDriverBinding> {
+    return { outcome: 'bound', stateDir: input.stateDir };
   }
 }
 
@@ -568,6 +634,56 @@ describe('ManageReleaseUseCase', () => {
     expect(made.store.current).toBe(B);
   });
 
+  it('install builds nothing when its grant cannot be consumed (consumed before the build)', async () => {
+    for (const answer of [
+      { outcome: 'refused', reason: 'grant cancelled' } as const,
+      new Error('journal unreadable'),
+    ]) {
+      const made = granted(INSTALL, A);
+      made.authorization.consumeAnswer = answer;
+      const result = await manage(made.useCase, applyRequest());
+      expect(result.outcome).toBe('refused');
+      expect(made.executor.runs).toEqual([]);
+      expect(made.store.calls).toEqual([]);
+      expect(made.store.builds).toEqual([]);
+    }
+  });
+
+  it('a grant spent for one operation resumes only that operation; a completed one is never resumed', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2)], B);
+    const made = granted(SWAP, A, { store });
+    made.authorization.consumeAnswer = new Error('crash after the consume was recorded');
+    expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('refused');
+    // The intent survives with its operation id, unclaimed, so the retry resumes it.
+    expect(store.operations.size).toBe(1);
+    const firstId = made.authorization.consumes[0].actionId;
+    made.authorization.consumeAnswer = null;
+    const retry = await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }));
+    expect(retry.outcome).toBe('applied');
+    expect(made.authorization.consumes[1].actionId).toBe(firstId);
+    expect(firstId).toMatch(/^release-swap-a{40}-[0-9a-f]{32}$/);
+    expect(store.operations.size).toBe(0);
+    expect(store.completed).toHaveLength(1);
+    // A new request after completion is a new operation with a new, different id.
+    store.current = B;
+    made.authorization.consumedBy = 'spent';
+    expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('refused');
+    expect(made.authorization.resolves.at(-1)?.actionId).not.toBe(firstId);
+    expect(store.current).toBe(B);
+  });
+
+  it('a second run on a claimed operation is refused release-in-progress', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2)], B);
+    await store.beginOperation({ action: 'swap', sha: A, opId: store.newOperationId() });
+    const made = granted(SWAP, A, { store });
+    expect(await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'release-in-progress',
+    });
+    expect(made.authorization.consumes).toEqual([]);
+    expect(store.current).toBe(B);
+  });
+
   it('refuses driver-lease-live while the conductor driver lease is live', async () => {
     const { useCase, store, executor } = granted(INSTALL, A, { lease: LIVE_LEASE });
     expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
@@ -729,11 +845,13 @@ describe('ManageReleaseUseCase', () => {
       const executor = new FakeExecutor();
       executor.failAt = failAt;
       const { useCase, store, authorization } = granted(INSTALL, A, { executor });
-      expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed' });
+      // The grant is consumed before the build, so a failed build says it is spent.
+      expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
       expect(store.calls).toEqual([`prepare ${A}`, `discard ${A}`]);
       expect(store.current).toBeNull();
+      expect(store.builds).toEqual([]);
       expect(executor.runs).toHaveLength(failAt + 1);
-      expect(authorization.consumes).toEqual([]);
+      expect(authorization.consumes).toHaveLength(1);
     }
   });
 
@@ -741,8 +859,9 @@ describe('ManageReleaseUseCase', () => {
     const store = new FakeStore();
     store.entryMissing = true;
     const { useCase } = granted(INSTALL, A, { store });
-    expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'verify-failed' });
+    expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
     expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `discard ${A}`]);
+    expect(store.builds).toEqual([]);
     expect(store.current).toBeNull();
   });
 
@@ -752,7 +871,7 @@ describe('ManageReleaseUseCase', () => {
     const store = new FakeStore();
     store.discardUnreadable = true;
     const first = granted(INSTALL, A, { executor, store });
-    expect(await manage(first.useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed' });
+    expect(await manage(first.useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
     executor.failAt = null;
     const retry = granted(INSTALL, A, { executor, store });
     expect((await manage(retry.useCase, applyRequest())).outcome).toBe('applied');

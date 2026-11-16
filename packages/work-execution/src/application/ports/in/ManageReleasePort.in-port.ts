@@ -44,6 +44,8 @@ export type ManageReleaseRefusal =
   | 'lease-unknown'
   | 'not-found'
   | 'build-failed'
+  | /** The grant was consumed before the build, and the build then failed; a retry resumes the same operation. */ 'build-failed-grant-spent'
+  | /** Another run holds this operation (same action, sha and root). */ 'release-in-progress'
   | 'verify-failed'
   | 'store-unreadable'
   | 'failed';

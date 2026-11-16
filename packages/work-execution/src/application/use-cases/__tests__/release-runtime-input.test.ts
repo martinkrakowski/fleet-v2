@@ -208,7 +208,7 @@ describe('release robustness bar (CO14 follow-up)', () => {
       apply: true,
       projectId: 'p',
     });
-    expect(cutShort).toEqual({ outcome: 'refused', reason: 'build-failed' });
+    expect(cutShort).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
     for (const invocation of executor2.invocations) {
       expect(invocation.options?.timeoutMs).toBeGreaterThan(0);
       expect(invocation.options?.maxBufferBytes).toBeGreaterThan(0);
@@ -310,11 +310,12 @@ describe('release robustness bar (CO14 follow-up)', () => {
     expect(replay).toMatchObject({ outcome: 'applied', action: 'swap', target: SHA_B });
     expect((await grants.findRequestByGrantId('grant-1'))?.consumptions).toHaveLength(1);
     expect(await store.list({ root })).toMatchObject({ outcome: 'read', current: SHA_B });
-    // The same swap key never records a second consumption: a further full
-    // replay reaches the same single state, never two `current` pointers.
+    // Once the operation's result is recorded, the grant authorizes nothing
+    // more: a further identical request is refused, records no second
+    // consumption and never leaves two `current` pointers.
     const { useCase: uc3 } = useCase({}, crashAuthorization);
     const again = await uc3.manageRelease({ action: 'swap', root, sha: SHA_B, source: null, keep: 5, apply: true, projectId: 'p' });
-    expect(again).toMatchObject({ outcome: 'applied', action: 'swap', target: SHA_B });
+    expect(again).toEqual({ outcome: 'refused', reason: 'authority-refused' });
     expect((await grants.findRequestByGrantId('grant-1'))?.consumptions).toHaveLength(1);
     expect(await store.list({ root })).toMatchObject({ outcome: 'read', current: SHA_B });
   });

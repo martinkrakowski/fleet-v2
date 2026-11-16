@@ -105,6 +105,42 @@ describe('release root state directory binding (CO14 follow-up)', () => {
     expect(err.join('')).toBe('');
   });
 
+  it('refuses a root bound to another installation\'s driver state directory, and writes nothing', async () => {
+    const root = await tempDir('co14-release-root-');
+    const boundDir = await tempDir('co14-state-bound-');
+    const ownDir = await tempDir('co14-state-own-');
+    expect(await new ReleaseStoreAdapter().bindDriver({ root, stateDir: boundDir })).toEqual({
+      outcome: 'bound',
+      stateDir: boundDir,
+    });
+    const before = await readdir(root);
+    const rt: FleetCliRuntime = createFleetCliRuntime({
+      stateDir: ownDir,
+      installation: installationWithDaemonStateDir(ownDir) as never,
+    });
+    const out: string[] = [];
+    const code = await runCli(
+      ['release', 'swap', '--root', root, '--sha', SHA, '--project', 'p', '--apply'],
+      { stdout: (text) => out.push(text), stderr: () => undefined },
+      rt,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+    expect(await readdir(root)).toEqual(before);
+    // The same root under the driver it is bound to is served: the plan is printed.
+    const servedRt: FleetCliRuntime = createFleetCliRuntime({
+      stateDir: ownDir,
+      installation: installationWithDaemonStateDir(boundDir) as never,
+    });
+    const planOut: string[] = [];
+    await runCli(
+      ['release', 'install', '--root', root, '--sha', SHA, '--source', root],
+      { stdout: (text) => planOut.push(text), stderr: () => undefined },
+      servedRt,
+    );
+    expect(JSON.parse(planOut.join('')).outcome).toBe('planned');
+  });
+
   it('the binding is a pure (root, configuration) mapping', () => {
     expect(resolveRootStateDir('/srv/releases', installationWithDaemonStateDir('/srv/state'))).toBe(
       '/srv/state',

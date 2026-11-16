@@ -77,4 +77,25 @@ describe('orphaned .current temp links (CO14 follow-up)', () => {
     expect(second).toEqual({ outcome: 'cleaned', removed: 0, findings: 0 });
     expect(await readdir(root)).toEqual([SHA, 'current']);
   });
+
+  it('a failed or throwing fence stops the pass and removes nothing (an in-flight link is never deleted)', async () => {
+    await verifiedBuild(SHA);
+    await symlink(SHA, join(root, 'current'));
+    await symlink(SHA, join(root, '.current.inflight.tmp'));
+    expect(await store.removeOrphanCurrentTemps({ root, fence: async () => false })).toEqual({ outcome: 'unknown' });
+    expect(
+      await store.removeOrphanCurrentTemps({
+        root,
+        fence: async () => {
+          throw new Error('lease lost');
+        },
+      }),
+    ).toEqual({ outcome: 'unknown' });
+    expect(await readdir(root)).toEqual(['.current.inflight.tmp', SHA, 'current']);
+    expect(await store.removeOrphanCurrentTemps({ root, fence: async () => true })).toEqual({
+      outcome: 'cleaned',
+      removed: 1,
+      findings: 0,
+    });
+  });
 });

@@ -23,6 +23,9 @@ import { randomBytes } from 'node:crypto';
 
 import type {
   ReleaseBuildRecord,
+  ReleaseDriverBinding,
+  ReleaseOperationBegin,
+  ReleaseOperationRef,
   ReleaseOrphanCurrentTempsResult,
   ReleaseStoreListing,
   ReleaseStorePort,
@@ -46,6 +49,12 @@ const MARKER_MAX_BYTES = 4096;
 const CURRENT_NAME = 'current';
 /** The temp link name an interrupted repoint can leave behind (CO14 follow-up). */
 const CURRENT_TEMP_PATTERN = /^\.current\..+\.tmp$/;
+
+const OPS_DIR = '.release-ops';
+const DRIVER_BINDING_NAME = '.release-driver';
+const OP_ID_PATTERN = /^[0-9a-f]{32}$/;
+/** A claim older than this is a crashed run's; the longest build budget is well inside it. */
+const CLAIM_STALE_MS = 2 * 60 * 60 * 1000;
 
 type CurrentRead = { readonly ok: true; readonly sha: string | null } | { readonly ok: false };
 type BuildsRead = { readonly ok: true; readonly builds: readonly ReleaseBuildRecord[] } | { readonly ok: false };
@@ -198,8 +207,154 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     }
   }
 
+  async beginOperation(input: {
+    readonly root: string;
+    readonly action: 'install' | 'swap' | 'rollback';
+    readonly sha: string;
+    readonly opId: string;
+    readonly nowIso: string;
+  }): Promise<ReleaseOperationBegin> {
+    if (!SHA_PATTERN.test(input.sha) || !isZonedIso(input.nowIso) || !OP_ID_PATTERN.test(input.opId)) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      const names = opNames(input.root, input.action, input.sha);
+      await fs.mkdir(path.dirname(names.intent), { recursive: true });
+      const opId = input.opId;
+      let started = true;
+      try {
+        await fs.writeFile(
+          names.intent,
+          JSON.stringify({ version: 1, opId, action: input.action, sha: input.sha, createdAtIso: input.nowIso }),
+          { flag: 'wx' },
+        );
+      } catch (error) {
+        if (errorCode(error) !== 'EEXIST') {
+          throw error;
+        }
+        const existing = parseOpId(await readSmall(names.intent));
+        if (existing === null) {
+          return { outcome: 'unreadable' };
+        }
+        if (existing !== opId) {
+          // Another run recorded a different operation first: it owns the intent.
+          return { outcome: 'busy' };
+        }
+        started = false;
+      }
+      if (!(await takeClaim(names.claim, input.nowIso))) {
+        return { outcome: 'busy' };
+      }
+      return { outcome: started ? 'started' : 'resumed', opId };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  async peekOperation(input: {
+    readonly root: string;
+    readonly action: 'install' | 'swap' | 'rollback';
+    readonly sha: string;
+  }): Promise<{ readonly outcome: 'open'; readonly opId: string } | { readonly outcome: 'none' } | { readonly outcome: 'unreadable' }> {
+    if (!SHA_PATTERN.test(input.sha)) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      const text = await readSmall(opNames(input.root, input.action, input.sha).intent);
+      if (text === null) {
+        return { outcome: 'none' };
+      }
+      const opId = parseOpId(text);
+      return opId === null ? { outcome: 'unreadable' } : { outcome: 'open', opId };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  newOperationId(): string {
+    return randomBytes(16).toString('hex');
+  }
+
+  async completeOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    return this.endOperation(input, async (names) => {
+      await fs.rename(names.intent, names.done(input.opId));
+    });
+  }
+
+  async cancelOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    return this.endOperation(input, async (names) => {
+      await fs.rm(names.intent, { force: true });
+    });
+  }
+
+  async releaseOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    return this.endOperation(input, async () => undefined);
+  }
+
+  /** Runs `change` only while the intent still names this operation id; the claim is always released. */
+  private async endOperation(
+    input: ReleaseOperationRef,
+    change: (names: ReturnType<typeof opNames>) => Promise<void>,
+  ): Promise<ReleaseStoreWriteResult> {
+    if (!SHA_PATTERN.test(input.sha) || !OP_ID_PATTERN.test(input.opId)) {
+      return { outcome: 'unreadable' };
+    }
+    const names = opNames(input.root, input.action, input.sha);
+    try {
+      const recorded = parseOpId(await readSmall(names.intent));
+      if (recorded !== null && recorded !== input.opId) {
+        // Another operation owns this intent now; this run's claim is not its to remove.
+        return { outcome: 'unreadable' };
+      }
+      if (recorded === null) {
+        return { outcome: 'not-found' };
+      }
+      await change(names);
+      await fs.rm(names.claim, { force: true });
+      return { outcome: 'ok' };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  async readDriverBinding(input: { readonly root: string }): Promise<ReleaseDriverBinding> {
+    try {
+      const text = await readSmall(path.join(input.root, DRIVER_BINDING_NAME));
+      if (text === null) {
+        return { outcome: 'unbound' };
+      }
+      const stateDir = text.trim();
+      return stateDir.startsWith('/') && stateDir.length <= MARKER_MAX_BYTES
+        ? { outcome: 'bound', stateDir }
+        : { outcome: 'unreadable' };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  async bindDriver(input: { readonly root: string; readonly stateDir: string }): Promise<ReleaseDriverBinding> {
+    if (!input.stateDir.startsWith('/') || input.stateDir.length > MARKER_MAX_BYTES) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      await fs.mkdir(input.root, { recursive: true });
+      try {
+        await fs.writeFile(path.join(input.root, DRIVER_BINDING_NAME), input.stateDir, { flag: 'wx' });
+        return { outcome: 'bound', stateDir: input.stateDir };
+      } catch (error) {
+        if (errorCode(error) !== 'EEXIST') {
+          throw error;
+        }
+        return await this.readDriverBinding({ root: input.root });
+      }
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
   async removeOrphanCurrentTemps(input: {
     readonly root: string;
+    readonly fence?: () => Promise<boolean>;
   }): Promise<ReleaseOrphanCurrentTempsResult> {
     let entries: Dirent[];
     try {
@@ -218,7 +373,10 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
         findings += 1;
         continue;
       }
-      // One removal after another; a failing removal is an unknown root.
+      // One removal after another; a failing removal or a failed fence is an unknown root.
+      if (input.fence !== undefined && !(await passesFence(input.fence))) {
+        return { outcome: 'unknown' };
+      }
       try {
         await fs.rm(path.join(input.root, entry.name), { force: true });
         removed += 1;
@@ -228,6 +386,68 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     }
     return { outcome: 'cleaned', removed, findings };
   }
+}
+
+function opNames(root: string, action: string, sha: string) {
+  const base = path.join(root, OPS_DIR, `${action}-${sha}`);
+  return {
+    intent: `${base}.intent`,
+    claim: `${base}.claim`,
+    done: (opId: string) => `${base}.${opId}.done`,
+  };
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error ? String((error as { code: unknown }).code) : undefined;
+}
+
+/** The text of a small file; null when it does not exist; any other failure throws. */
+async function readSmall(file: string): Promise<string | null> {
+  try {
+    const text = await fs.readFile(file, 'utf8');
+    if (text.length > MARKER_MAX_BYTES) {
+      throw new Error('too large');
+    }
+    return text;
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function parseOpId(text: string | null): string | null {
+  if (text === null) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    const opId = typeof parsed === 'object' && parsed !== null ? (parsed as { opId?: unknown }).opId : undefined;
+    return typeof opId === 'string' && OP_ID_PATTERN.test(opId) ? opId : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Exclusive claim; a claim older than the stale window (a crashed run's) is taken over once. */
+async function takeClaim(claim: string, nowIso: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await fs.writeFile(claim, nowIso, { flag: 'wx' });
+      return true;
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw error;
+      }
+    }
+    const claimedAt = Date.parse((await readSmall(claim)) ?? '');
+    if (Number.isNaN(claimedAt) || Date.parse(nowIso) - claimedAt < CLAIM_STALE_MS) {
+      return false;
+    }
+    await fs.rm(claim, { force: true });
+  }
+  return false;
 }
 
 async function passesFence(fence: () => Promise<boolean>): Promise<boolean> {

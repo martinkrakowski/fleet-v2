@@ -54,7 +54,12 @@ import type {
 import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
 import type { CommandExecutorPort, CommandRunOptions } from '../ports/out/CommandExecutorPort.out-port.js';
 import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
-import type { ReleaseBuildRecord, ReleaseStorePort, ReleaseStorePruneResult } from '../ports/out/ReleaseStorePort.out-port.js';
+import type {
+  ReleaseBuildRecord,
+  ReleaseOperationBegin,
+  ReleaseStorePort,
+  ReleaseStorePruneResult,
+} from '../ports/out/ReleaseStorePort.out-port.js';
 
 export interface ManageReleaseDependencies {
   readonly store: ReleaseStorePort;
@@ -177,24 +182,90 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     plannedCurrent: string | null,
     alreadyBuilt: boolean,
   ): Promise<ManageReleaseResult> {
-    const grant = await this.resolveGrant(request, target);
+    // One operation per apply: a durable intent with a unique id is recorded
+    // before the grant is touched, and its result after the irreversible step.
+    // The grant authorizes exactly this operation id; only an intent that has
+    // no recorded result may be resumed, and only under its own id.
+    let opId: string;
+    try {
+      const open = await this.deps.store.peekOperation({ root: request.root, action: request.action, sha: target });
+      if (open.outcome === 'unreadable') {
+        return refuse('store-unreadable');
+      }
+      opId = open.outcome === 'open' ? open.opId : this.deps.store.newOperationId();
+    } catch {
+      return refuse('store-unreadable');
+    }
+    // Read-only until the grant resolves: a refused authority writes nothing.
+    const grant = await this.resolveGrant(request, target, opId);
     if (typeof grant !== 'string') {
       return refuse(grant.refusal);
     }
-    let rebuilt = false;
-    if (request.action === 'install' && !alreadyBuilt) {
-      const built = await this.build(request, target);
-      if (built !== null) {
-        return refuse(built);
-      }
-      rebuilt = true;
+    let begun: ReleaseOperationBegin;
+    try {
+      begun = await this.deps.store.beginOperation({
+        root: request.root,
+        action: request.action,
+        sha: target,
+        opId,
+        nowIso: this.deps.nowIso(),
+      });
+    } catch {
+      return refuse('store-unreadable');
     }
+    if (begun.outcome === 'busy') {
+      return refuse('release-in-progress');
+    }
+    if (begun.outcome === 'unreadable') {
+      return refuse('store-unreadable');
+    }
+    const operation: OperationContext = { opId: begun.opId, consumed: false };
+    let result: ManageReleaseResult;
+    try {
+      result = await this.applyOperation(request, target, plannedCurrent, alreadyBuilt, operation, grant);
+    } catch {
+      result = refuse('failed');
+    }
+    const ref = { root: request.root, action: request.action, sha: target, opId: operation.opId };
+    try {
+      if (result.outcome === 'applied') {
+        await this.deps.store.completeOperation(ref);
+      } else if (!operation.consumed && begun.outcome === 'started') {
+        await this.deps.store.cancelOperation(ref);
+      } else {
+        // The grant may be spent: the intent stays so the same operation can resume.
+        await this.deps.store.releaseOperation(ref);
+      }
+    } catch {
+      // The claim goes stale by itself; the result stands.
+    }
+    return result;
+  }
+
+  private async applyOperation(
+    request: ValidRequest,
+    target: string,
+    plannedCurrent: string | null,
+    alreadyBuilt: boolean,
+    operation: OperationContext,
+    grant: string,
+  ): Promise<ManageReleaseResult> {
+    let rebuilt = false;
     if (request.action === 'install') {
-      // Install stages the build and consumes the grant exactly once; `current`
-      // is left where it was, and nothing is pruned.
-      const consumed = await this.consumeGrant(request, target, grant);
+      // CO14 round 5: the grant is consumed BEFORE anything is built or placed;
+      // a grant that cannot be consumed builds nothing. A build that then
+      // fails leaves no installed build and reports the grant as spent.
+      operation.consumed = true;
+      const consumed = await this.consumeGrant(request, target, grant, operation.opId);
       if (consumed !== null) {
         return refuse(consumed);
+      }
+      if (!alreadyBuilt) {
+        const built = await this.build(request, target);
+        if (built !== null) {
+          return refuse('build-failed-grant-spent');
+        }
+        rebuilt = true;
       }
       const fresh = await this.deps.store.list({ root: request.root });
       if (fresh.outcome !== 'read') {
@@ -211,7 +282,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         rebuilt,
       };
     }
-    const repointed = await this.fencedRepoint(request, target, plannedCurrent, grant);
+    const repointed = await this.fencedRepoint(request, target, plannedCurrent, grant, operation);
     if ('refusal' in repointed) {
       return refuse(repointed.refusal);
     }
@@ -245,8 +316,9 @@ export class ManageReleaseUseCase implements ManageReleasePort {
   private async resolveGrant(
     request: ValidRequest,
     target: string,
+    opId: string,
   ): Promise<string | { readonly refusal: ManageReleaseRefusal }> {
-    const coordinates = grantCoordinates(request, target);
+    const coordinates = grantCoordinates(request, target, opId);
     try {
       const resolved = await this.deps.authorization.resolveActionAuthorization({
         actionId: coordinates.actionId,
@@ -291,6 +363,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     target: string,
     plannedCurrent: string | null,
     grantId: string,
+    operation: OperationContext,
   ): Promise<
     | { readonly refusal: ManageReleaseRefusal }
     | { readonly pruned: ReleaseStorePruneResult; readonly kept: readonly string[] }
@@ -311,7 +384,16 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         return { refusal: 'current-moved' };
       }
       const kept = fresh.builds.map((build) => build.sha);
-      const consumed = await this.consumeGrant(request, target, grantId);
+      // Only this process holds the lease, so no repoint has a temp link in
+      // flight: an orphan is a crashed run's. The pass is fenced under the
+      // same lease and is best effort.
+      try {
+        await this.deps.store.removeOrphanCurrentTemps({ root: request.root, fence: () => this.stillHolds(held) });
+      } catch {
+        // An unknown root here never blocks the repoint, which re-checks everything itself.
+      }
+      operation.consumed = true;
+      const consumed = await this.consumeGrant(request, target, grantId, operation.opId);
       if (consumed !== null) {
         return { refusal: consumed };
       }
@@ -406,8 +488,9 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     request: ValidRequest,
     target: string,
     grantId: string,
+    opId: string,
   ): Promise<ManageReleaseRefusal | null> {
-    const coordinates = grantCoordinates(request, target);
+    const coordinates = grantCoordinates(request, target, opId);
     try {
       const consumed = await this.deps.authorization.consumeActionAuthorization({
         authorizationGrantId: grantId,
@@ -565,13 +648,25 @@ function allowlisted(
   return picked;
 }
 
-/** The release action kind and the deterministic action id one grant is bound to. */
+/** One apply's operation: its unique id, and whether the grant may have been spent for it. */
+interface OperationContext {
+  readonly opId: string;
+  consumed: boolean;
+}
+
+/**
+ * The release action kind and the action id one grant is bound to. The id
+ * carries the operation id, which is unique per operation and is not derivable
+ * from action and sha, so a new request can never look like a resume of an
+ * earlier, completed one.
+ */
 function grantCoordinates(
   request: ValidRequest,
   target: string,
+  opId: string,
 ): { readonly actionKind: ReleaseActionKind; readonly actionId: string } {
   const actionKind: ReleaseActionKind = `release-${request.action}`;
-  return { actionKind, actionId: `${actionKind}-${target}` };
+  return { actionKind, actionId: `${actionKind}-${target}-${opId}` };
 }
 
 function refuse(reason: ManageReleaseRefusal): ManageReleaseResult {

@@ -125,7 +125,17 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     if (stateDir === null) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
     }
-    return manageReleaseFromPayload(
+    // A root bound to another installation's driver is not served by this one:
+    // its lease would be read from the wrong directory, so it is refused. A
+    // root with no binding yet is bound to this driver after its first applied
+    // release (first binding wins). An unreadable binding is unknown.
+    const store = new ReleaseStoreAdapter();
+    const checkable = root.startsWith('/') && !root.split('/').includes('..') && root.length <= 4096;
+    const binding = checkable ? await store.readDriverBinding({ root }) : ({ outcome: 'unbound' } as const);
+    if (binding.outcome === 'unreadable' || (binding.outcome === 'bound' && binding.stateDir !== stateDir)) {
+      return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+    }
+    const result = await manageReleaseFromPayload(
       { ...payload, action },
       {
         lease: new ConductorDriverLeaseAdapter({ stateDir }),
@@ -133,8 +143,13 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
         executor: new LocalExecutor(),
         nowIso: () => new Date().toISOString(),
         env: () => process.env, // the use case passes only a filtered allowlist to the git child
+        store,
       },
     );
+    if (result.outcome === 'applied' && binding.outcome === 'unbound') {
+      await store.bindDriver({ root, stateDir });
+    }
+    return result;
   };
 }
 

@@ -101,8 +101,70 @@ export interface ReleaseStorePort {
    * root removes nothing. An unreadable root is `unknown`, never an empty
    * result.
    */
-  removeOrphanCurrentTemps(input: { readonly root: string }): Promise<ReleaseOrphanCurrentTempsResult>;
+  removeOrphanCurrentTemps(input: {
+    readonly root: string;
+    /**
+     * Awaited before each removal: the caller passes the driver-lease fence, so
+     * the pass runs only while no other repoint can have a temp link in
+     * flight. A false or throwing fence stops the pass (`unknown`) with
+     * nothing further removed.
+     */
+    readonly fence?: () => Promise<boolean>;
+  }): Promise<ReleaseOrphanCurrentTempsResult>;
+  /**
+   * CO14 round 5: begin one release operation for (action, sha) under this
+   * root. The durable intent carries a unique operation id that is NOT derivable
+   * from action and sha: a fresh intent is `started`; an intent left by a run
+   * that never recorded its result is `resumed` with its original id (only
+   * that id may resume); a live claim by another run is `busy`. The claim is
+   * exclusive; a claim older than the stale window is taken over.
+   */
+  beginOperation(input: {
+    readonly root: string;
+    readonly action: ReleaseOperationAction;
+    readonly sha: string;
+    /** The id this run proposes; an existing intent with another id makes the run `busy`. */
+    readonly opId: string;
+    readonly nowIso: string;
+  }): Promise<ReleaseOperationBegin>;
+  /** Read-only: the open intent's operation id for (action, sha), or none. Writes nothing. */
+  peekOperation(input: {
+    readonly root: string;
+    readonly action: ReleaseOperationAction;
+    readonly sha: string;
+  }): Promise<{ readonly outcome: 'open'; readonly opId: string } | { readonly outcome: 'none' } | { readonly outcome: 'unreadable' }>;
+  /** A fresh, unique operation id (32 hex characters); never derivable from action and sha. */
+  newOperationId(): string;
+  /** Record the operation's result: the intent becomes a completed record and the claim is released. */
+  completeOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult>;
+  /** Drop an operation that consumed nothing: the intent and the claim are removed. */
+  cancelOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult>;
+  /** Release this run's claim and keep the intent, so the same operation id can resume. */
+  releaseOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult>;
+  /** The driver state directory this root is bound to; `unbound` before the first applied release. */
+  readDriverBinding(input: { readonly root: string }): Promise<ReleaseDriverBinding>;
+  /** Bind the root to a driver state directory when it has none (first binding wins). */
+  bindDriver(input: { readonly root: string; readonly stateDir: string }): Promise<ReleaseDriverBinding>;
 }
+
+export type ReleaseOperationAction = 'install' | 'swap' | 'rollback';
+
+export interface ReleaseOperationRef {
+  readonly root: string;
+  readonly action: ReleaseOperationAction;
+  readonly sha: string;
+  readonly opId: string;
+}
+
+export type ReleaseOperationBegin =
+  | { readonly outcome: 'started' | 'resumed'; readonly opId: string }
+  | { readonly outcome: 'busy' }
+  | { readonly outcome: 'unreadable' };
+
+export type ReleaseDriverBinding =
+  | { readonly outcome: 'bound'; readonly stateDir: string }
+  | { readonly outcome: 'unbound' }
+  | { readonly outcome: 'unreadable' };
 
 export type ReleaseOrphanCurrentTempsResult =
   | {

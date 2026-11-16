@@ -42,3 +42,22 @@ export async function isChainPassHalted(halt?: Pick<ConductorHaltPort, 'read'>):
     return true;
   }
 }
+
+/**
+ * The fail-closed halt read required for every one-way action (plan §3.7): an
+ * absent or null dependency is halted, and any throw or off-contract answer is
+ * halted. Only a provided port whose `read` answers `clear` with an agreeing
+ * record reads as not halted.
+ */
+export async function isRequiredPassHalted(
+  halt: Pick<ConductorHaltPort, 'read'> | null | undefined,
+): Promise<boolean> {
+  if (halt === undefined || halt === null) {
+    return true;
+  }
+  try {
+    return await isChainPassHalted(halt);
+  } catch {
+    return true;
+  }
+}

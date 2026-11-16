@@ -27,6 +27,8 @@ import {
 } from '../../domain/chain-records.js';
 import type { ChainRecord } from '../../domain/chain-records.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
+import { isRequiredPassHalted } from './chain-pass-halt.js';
 import type { AttemptRecord } from '../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
 import { MERGE_QUEUE_TERMINAL_STATES } from '../../domain/merge-queue-records.js';
@@ -228,6 +230,8 @@ export interface LandChainDependencies {
   readonly mintEntryId: () => string;
   readonly nowIso: () => string;
   readonly computeDigest: (text: string) => string;
+  /** The operator kill switch: re-read before applying (plan §3.7); never read on a dry run. */
+  readonly halt: Pick<ConductorHaltPort, 'read'>;
 }
 
 /** The answer of one deadline-guarded outbound call: the deadline fail, the mapped throw fail, or the value. */
@@ -301,7 +305,19 @@ export class LandChainUseCase implements LandChainPort {
     }
   }
 
+  /** Fails closed: a `dryRun` never reads the halt, an apply is refused `halted`. */
+  private async haltRefusalIfApplying(command: LandChainCommand): Promise<LandChainResult | null> {
+    if (command.dryRun) {
+      return null;
+    }
+    return (await isRequiredPassHalted(this.deps.halt)) ? refused('halted') : null;
+  }
+
   private async run(command: LandChainCommand): Promise<LandChainResult> {
+    const preReadHalt = await this.haltRefusalIfApplying(command);
+    if (preReadHalt !== null) {
+      return preReadHalt;
+    }
     const prepared = await this.prepare(command);
     if (!prepared.ok) {
       return prepared.fail;
@@ -338,6 +354,10 @@ export class LandChainUseCase implements LandChainPort {
         action: resolved.mode,
         pullRequestNumber: resolved.pullRequestNumber,
       };
+    }
+    const preApplyHalt = await this.haltRefusalIfApplying(command);
+    if (preApplyHalt !== null) {
+      return preApplyHalt;
     }
     return this.apply(command, { pin: prepared.pin, tip: prepared.tip, tier: collected.value.highestTier, links: receipts.value, title: rendered.title, body: rendered.body });
   }

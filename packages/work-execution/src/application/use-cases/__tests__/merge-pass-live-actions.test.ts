@@ -38,6 +38,16 @@ const KEY_MERGE_PR = 'merge/0123456789ab/42/aaaaaaaaaaaa/merge-pr';
 const KEY_UPDATE_BRANCH = 'merge/0123456789ab/42/aaaaaaaaaaaa/update-branch';
 const KEY_POST_STATUS = 'merge/0123456789ab/42/aaaaaaaaaaaa/post-status';
 
+const clearHalt: MergeLiveActionDependencies['halt'] = {
+  read: async () => ({ state: 'clear', record: null }),
+};
+
+function haltedHalt(): MergeLiveActionDependencies['halt'] {
+  return {
+    read: async () => ({ state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW_ISO } }),
+  };
+}
+
 class FakeJournal implements LaneRunJournalPort {
   readonly entries: LaneRunJournalEntryRecord[] = [];
 
@@ -161,7 +171,7 @@ function build(overrides: Partial<MergeLiveActionDependencies> = {}) {
   const forgeAction = new FakeForgeAction();
   const forgeRead = new FakeForgeRead();
   const mintId = makeUlidMinter();
-  const deps: MergeLiveActionDependencies = { journal, forgeAction, forgeRead, mintId, ...overrides };
+  const deps: MergeLiveActionDependencies = { journal, forgeAction, forgeRead, mintId, halt: clearHalt, ...overrides };
   return { journal, forgeAction, forgeRead, deps };
 }
 
@@ -291,6 +301,7 @@ describe('performMergeLiveAction (DT9b)', () => {
       forgeAction,
       forgeRead: new FakeForgeRead(),
       mintId: () => mintIds[next++] ?? '01JB00000000000000000000FF',
+      halt: clearHalt,
     };
     const result = await performMergeLiveAction(deps, makeRequest());
     expect(result).toEqual({ outcome: 'journal-refused', journalKey: KEY_MERGE_PR, refusal: 'duplicate-entry-id' });
@@ -892,6 +903,69 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
       makeRequest({ nowIso: '2026-11-05T09:02:00.000Z', deadlineIso: '2026-11-05T09:03:00.000Z' }),
     );
     expect(nextPass).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'already-settled' });
+    expect(forgeAction.requests).toHaveLength(1);
+  });
+
+  it('skips a live merge-pr as halted before any journal entry or forge call', async () => {
+    const { journal, forgeAction, deps } = build({ halt: haltedHalt() });
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'halted' });
+    expect(journal.entries).toHaveLength(0);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('skips a live merge-pr as halted when the halt read throws', async () => {
+    const { journal, forgeAction, deps } = build({
+      halt: {
+        read: async () => {
+          throw new Error('store gone');
+        },
+      },
+    });
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'halted' });
+    expect(journal.entries).toHaveLength(0);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('skips a live merge-pr as halted when the halt dependency is missing', async () => {
+    const { journal, forgeAction, deps } = build({ halt: undefined as unknown as MergeLiveActionDependencies['halt'] });
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'halted' });
+    expect(journal.entries).toHaveLength(0);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('skips a live update-branch as halted', async () => {
+    const { forgeAction, deps } = build({ halt: haltedHalt() });
+    const result = await performMergeLiveAction(deps, makeRequest({ action: 'update-branch' }));
+    expect(result).toEqual({ outcome: 'skipped', journalKey: KEY_UPDATE_BRANCH, reasonCode: 'halted' });
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('a shadow request does not read the halt and still journals its dry-run', async () => {
+    let reads = 0;
+    const { forgeAction, deps } = build({
+      halt: {
+        read: async () => {
+          reads += 1;
+          return haltedHalt().read();
+        },
+      },
+    });
+    const result = await performMergeLiveAction(deps, makeRequest({ execution: 'shadow', shadowReason: 'would-merge' }));
+    expect(result).toEqual({ outcome: 'dry-run', journalKey: KEY_MERGE_PR, shadowReason: 'would-merge' });
+    expect(reads).toBe(0);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('a halted skip leaves the key free: the same request acts once the halt is clear', async () => {
+    const { journal, forgeAction, deps } = build();
+    const halted = await performMergeLiveAction({ ...deps, halt: haltedHalt() }, makeRequest());
+    expect(halted).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'halted' });
+    expect(journal.entries).toHaveLength(0);
+    const acted = await performMergeLiveAction(deps, makeRequest());
+    expect(acted.outcome).toBe('acted');
     expect(forgeAction.requests).toHaveLength(1);
   });
 });

@@ -223,6 +223,7 @@ interface World {
     enqueueMergeEntry: number;
     performMergeForgeAction: number;
     openOrAdopt: number;
+    haltReads: number;
     enqueued: { tier: number; entryId: string; successorEntryId: string }[];
   };
 }
@@ -246,6 +247,7 @@ interface Overrides {
   readChain?: { status: 'ok'; record: ChainRecord } | { status: 'not-found' } | { status: 'unreadable'; reason: string } | 'throw';
   journalFail?: 'list' | 'append' | 'mark' | 'cas-stale' | 'cas-conflict';
   mintThrows?: boolean;
+  halt?: LandChainDependencies['halt'];
   clock?: () => string;
   postStatusOutcome?: { outcome: string; reason?: string };
   openOrAdoptOutcome?: { outcome: string; reason?: string; pullRequestNumber?: number; headSha?: string };
@@ -257,6 +259,7 @@ function makeWorld(overrides: Overrides = {}): World {
     enqueueMergeEntry: 0,
     performMergeForgeAction: 0,
     openOrAdopt: 0,
+    haltReads: 0,
     enqueued: [],
   };
   const landing = makeLanding();
@@ -448,6 +451,14 @@ function makeWorld(overrides: Overrides = {}): World {
     })(),
     nowIso: overrides.clock ?? (() => NOW),
     computeDigest: digest,
+    halt:
+      overrides.halt ??
+      ({
+        read: async () => {
+          calls.haltReads += 1;
+          return { state: 'clear' as const, record: null };
+        },
+      } as unknown as LandChainDependencies['halt']),
   };
   if (overrides.candidatePullRequest !== undefined) {
     const forgeRead = deps.forgeRead as unknown as {
@@ -874,6 +885,81 @@ describe('LandChainUseCase dry run', () => {
     delete (world.deps.forge as { findOpenPullRequestsByHead?: unknown }).findOpenPullRequestsByHead;
     const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND, dryRun: true });
     expect(result).toEqual({ outcome: 'unknown', reason: 'head-lookup-unavailable' });
+  });
+});
+
+describe('LandChainUseCase halt gate', () => {
+  const haltedFake = {
+    read: async () => ({ state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } }),
+  } as unknown as LandChainDependencies['halt'];
+
+  it('an apply run while halted is refused halted before any read or write', async () => {
+    const { result, world } = await run({}, { halt: haltedFake, readChain: 'throw' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(world.landing.calls.openOrAdopt).toBe(0);
+    expect(world.calls.performMergeForgeAction).toBe(0);
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    expect(world.landing.journal.size).toBe(0);
+    expect(world.landing.marks.size).toBe(0);
+  });
+
+  it('a halt raised between the first read and the apply is refused halted with nothing opened or journalled', async () => {
+    let reads = 0;
+    const flippingHalt = {
+      read: async () => {
+        reads += 1;
+        if (reads === 1) {
+          return { state: 'clear', record: null };
+        }
+        return { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } };
+      },
+    } as unknown as LandChainDependencies['halt'];
+    const { result, world } = await run({}, { halt: flippingHalt });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(world.landing.calls.openOrAdopt).toBe(0);
+    expect(world.landing.journal.size).toBe(0);
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    expect(reads).toBe(2);
+  });
+
+  it('a throwing halt read refuses an apply run as halted', async () => {
+    const { result, world } = await run({}, {
+      halt: {
+        read: async () => {
+          throw new Error('store down');
+        },
+      } as unknown as LandChainDependencies['halt'],
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(world.landing.calls.openOrAdopt).toBe(0);
+  });
+
+  it('a missing halt dependency refuses an apply run as halted', async () => {
+    const world = makeWorld();
+    const result = await new LandChainUseCase({
+      ...world.deps,
+      halt: undefined as unknown as LandChainDependencies['halt'],
+    }).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+  });
+
+  it('a dry run while halted still answers dry-run and never reads the halt', async () => {
+    let reads = 0;
+    const halt = {
+      read: async () => {
+        reads += 1;
+        return { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } };
+      },
+    } as unknown as LandChainDependencies['halt'];
+    const { result } = await run({ dryRun: true }, { halt, openPullRequests: [] });
+    expect(result.outcome).toBe('dry-run');
+    expect(reads).toBe(0);
+  });
+
+  it('a clean landing reads the halt exactly twice', async () => {
+    const { result, world } = await run();
+    expect(result.outcome).toBe('landed');
+    expect(world.calls.haltReads).toBe(2);
   });
 });
 

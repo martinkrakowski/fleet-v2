@@ -238,6 +238,9 @@ function readRunList(value: unknown): readonly LaneRunRecord[] | null {
   return value as readonly LaneRunRecord[];
 }
 
+/** Thrown by `timestamp()` inside a guarded call when the injected clock throws: a spent budget, never a fallback. */
+class ClockUnavailableError extends Error {}
+
 export class LandChainUseCase implements LandChainPort {
   constructor(private readonly deps: LandChainDependencies) {}
 
@@ -272,8 +275,8 @@ export class LandChainUseCase implements LandChainPort {
     }
     try {
       return { ok: true, value: await call() };
-    } catch {
-      return { ok: false, fail: threw };
+    } catch (error) {
+      return { ok: false, fail: error instanceof ClockUnavailableError ? FAIL_BUDGET : threw };
     }
   }
 
@@ -402,14 +405,22 @@ export class LandChainUseCase implements LandChainPort {
     if (allRuns === null) {
       return { ok: false, fail: FAIL_STORE };
     }
-    let runs: readonly LaneRunRecord[];
+    // The cap is on the listed input itself: read the length once, refuse over it
+    // before filtering, and iterate only to that captured length.
+    const listedLength = allRuns.length;
+    if (listedLength > LAND_CHAIN_MAX_LINKS) {
+      return { ok: false, fail: refused('too-many-links') };
+    }
+    const runs: LaneRunRecord[] = [];
     try {
-      runs = allRuns.filter((run) => resolveLaneRunBaseBranch(run) === command.branchName);
+      for (let at = 0; at < listedLength; at += 1) {
+        const candidate = allRuns[at];
+        if (resolveLaneRunBaseBranch(candidate) === command.branchName) {
+          runs.push(candidate);
+        }
+      }
     } catch {
       return { ok: false, fail: FAIL_STORE };
-    }
-    if (runs.length > LAND_CHAIN_MAX_LINKS) {
-      return { ok: false, fail: refused('too-many-links') };
     }
     if (runs.length === 0) {
       return { ok: false, fail: refused('no-links') };
@@ -604,6 +615,10 @@ export class LandChainUseCase implements LandChainPort {
     if (aggregate.links.some((link) => link.result === 'fail')) {
       return { ok: false, fail: refused('link-receipt-failed') };
     }
+    // Allow-list: only `pass` lands; pending, unknown, not-applicable and anything else is unknown.
+    if (aggregate.links.some((link) => link.result !== 'pass')) {
+      return { ok: false, fail: unknown('verdict-unknown') };
+    }
     return { ok: true, value: inputs };
   }
 
@@ -711,7 +726,7 @@ export class LandChainUseCase implements LandChainPort {
       return refused('intent-digest-mismatch');
     }
     if (finalEntry !== undefined) {
-      return this.replayLanded(command, facts.title, finalEntry);
+      return this.replayLanded(command, facts.title, finalEntry, key, facts.tip);
     }
     if (intentEntry === undefined) {
       const fail = await this.appendJournalEntry(command, key, 'intent', digest);
@@ -720,12 +735,39 @@ export class LandChainUseCase implements LandChainPort {
       }
     }
 
+    const integration = await this.openIntegrationPullRequest(command, facts, key);
+    if (!integration.ok) {
+      return integration.fail;
+    }
+    const pullRequestNumber = integration.value;
+
+    const premerge = await this.postPremergeStatus(command, facts, pullRequestNumber);
+    if (premerge !== null) {
+      return premerge;
+    }
+
+    const marked = await this.recordLandingMark(command, key, facts.tip, pullRequestNumber);
+    if (marked !== null) {
+      return marked;
+    }
+
+    // Re-check after the mark: any failure withdraws the mark and never enqueues.
+    const rechecked = await this.recheckAfterMark(command, facts);
+    if (rechecked !== null) {
+      return this.withdrawAndReturn(command, key, facts.tip, pullRequestNumber, rechecked);
+    }
+
+    return this.enqueueAndRecord(command, facts, key, digest, pullRequestNumber);
+  }
+
+  /** Step 10: open or adopt the one integration pull request and re-read it; its number, or the failure. */
+  private async openIntegrationPullRequest(command: LandChainCommand, facts: LandFacts, key: string): Promise<Guarded<number>> {
     const open = await this.openPullRequestsOfBranch(command, facts.tip);
     if (!open.ok) {
-      return open.fail;
+      return open;
     }
     if (open.value.length >= 2) {
-      return refused('integration-pr-ambiguous');
+      return { ok: false, fail: refused('integration-pr-ambiguous') };
     }
     const mode = open.value.length === 1 ? ('adopt' as const) : ('open' as const);
     const opened = await this.guarded(
@@ -747,13 +789,13 @@ export class LandChainUseCase implements LandChainPort {
         }),
     );
     if (!opened.ok) {
-      return opened.fail;
+      return opened;
     }
     if (opened.value.outcome === 'refused') {
-      return refused('forge-refused');
+      return { ok: false, fail: refused('forge-refused') };
     }
     if (opened.value.outcome === 'ambiguous') {
-      return FAIL_FORGE;
+      return { ok: false, fail: FAIL_FORGE };
     }
     const pullRequestNumber = opened.value.pullRequestNumber;
 
@@ -763,19 +805,24 @@ export class LandChainUseCase implements LandChainPort {
       () => this.deps.forgeRead.readPullRequest({ ref: { kind: 'number', number: pullRequestNumber }, repository: command.repository }),
     );
     if (!reRead.ok) {
-      return reRead.fail;
+      return reRead;
     }
     if (reRead.value.outcome !== 'found') {
-      return FAIL_FORGE;
+      return { ok: false, fail: FAIL_FORGE };
     }
     if (
       reRead.value.pullRequest.baseRef !== 'main' ||
       reRead.value.pullRequest.headRef !== command.branchName ||
       reRead.value.pullRequest.headSha !== facts.tip
     ) {
-      return refused('integration-pr-wrong-base');
+      return { ok: false, fail: refused('integration-pr-wrong-base') };
     }
+    return { ok: true, value: opened.value.pullRequestNumber };
+  }
 
+  /** Step 11: the keyed premerge intent, then the `premerge` status; `null` when posted. */
+  private async postPremergeStatus(command: LandChainCommand, facts: LandFacts, pullRequestNumber: number): Promise<Fail | null> {
+    const head12 = facts.tip.slice(0, 12);
     const premergeKey = `chain-land/${command.chainName}/premerge@${head12}`;
     const premergeDigest = this.deps.computeDigest(
       canonicalLandChainPayload({ chainName: command.chainName, headSha: facts.tip, dryRun: command.dryRun, step: 'premerge' }),
@@ -812,30 +859,40 @@ export class LandChainUseCase implements LandChainPort {
     if (status.value.outcome === 'ambiguous') {
       return FAIL_FORGE;
     }
+    return null;
+  }
 
-    const marked = await this.recordLandingMark(command, key, facts.tip, pullRequestNumber);
-    if (marked !== null) {
-      return marked;
-    }
-
+  /** Step 13: links, receipts and batches read again after the mark; `null` when still clean, else the failure to withdraw on. */
+  private async recheckAfterMark(command: LandChainCommand, facts: LandFacts): Promise<Fail | null> {
     // Re-check after the mark: any failure withdraws the mark and never enqueues.
     const recheckLinks = await this.collectLinks(command, facts.tip);
     if (!recheckLinks.ok) {
-      return this.withdrawAndReturn(command, key, facts.tip, pullRequestNumber, recheckLinks.fail);
+      return recheckLinks.fail;
     }
     const recheckChain = await this.checkChainReceipt(command, facts.pin, recheckLinks.value.highestTier);
     if (recheckChain !== null) {
-      return this.withdrawAndReturn(command, key, facts.tip, pullRequestNumber, recheckChain);
+      return recheckChain;
     }
     const recheckReceipts = await this.collectLinkReceipts(command, recheckLinks.value.links, facts.tip);
     if (!recheckReceipts.ok) {
-      return this.withdrawAndReturn(command, key, facts.tip, pullRequestNumber, recheckReceipts.fail);
+      return recheckReceipts.fail;
     }
     const recheckBatch = await this.checkBatch(command);
     if (recheckBatch !== null) {
-      return this.withdrawAndReturn(command, key, facts.tip, pullRequestNumber, recheckBatch);
+      return recheckBatch;
     }
+    return null;
+  }
 
+  /** Steps 14-15: the enqueue with its keyed intent, then the final journal result and the `landed` answer. */
+  private async enqueueAndRecord(
+    command: LandChainCommand,
+    facts: LandFacts,
+    key: string,
+    digest: string,
+    pullRequestNumber: number,
+  ): Promise<LandChainResult> {
+    const head12 = facts.tip.slice(0, 12);
     const enqueueKey = `chain-land/${command.chainName}/enqueue@${head12}`;
     const enqueueDigest = this.deps.computeDigest(
       canonicalLandChainPayload({ chainName: command.chainName, headSha: facts.tip, dryRun: command.dryRun, step: 'enqueue' }),
@@ -865,7 +922,7 @@ export class LandChainUseCase implements LandChainPort {
           runId: null,
           entryId: entryId.id,
           successorEntryId: successorId.id,
-          enqueuedAtIso: this.safeNow(command),
+          enqueuedAtIso: this.timestamp(),
           deadlineIso: command.deadlineIso,
         }),
     );
@@ -924,7 +981,7 @@ export class LandChainUseCase implements LandChainPort {
           key,
           kind,
           entryId: minted.id,
-          recordedAtIso: this.safeNow(command),
+          recordedAtIso: this.timestamp(),
           digest,
           deadlineIso: command.deadlineIso,
         }),
@@ -1082,12 +1139,26 @@ export class LandChainUseCase implements LandChainPort {
   }
 
   /** The answer of an already-recorded final result: the landing stands, forge and queue are not called again. */
-  private async replayLanded(command: LandChainCommand, title: string, finalEntry: { entryId: string }): Promise<LandChainResult> {
+  private async replayLanded(
+    command: LandChainCommand,
+    title: string,
+    finalEntry: { entryId: string },
+    key: string,
+    tip: string,
+  ): Promise<LandChainResult> {
     const stored = await this.readLandingMark(command);
     if (!stored.ok) {
       return stored.fail;
     }
-    if (stored.outcome !== 'found' || stored.mark === undefined) {
+    // A final result is a landing only while the mark is present, still `landing`,
+    // and belongs to this key and head; any other record is inconsistent.
+    if (
+      stored.outcome !== 'found' ||
+      stored.mark === undefined ||
+      stored.mark.state !== 'landing' ||
+      stored.mark.key !== key ||
+      stored.mark.headSha !== tip
+    ) {
       return FAIL_JOURNAL;
     }
     return {
@@ -1100,12 +1171,12 @@ export class LandChainUseCase implements LandChainPort {
     };
   }
 
-  /** The injected instant; an unreadable clock falls back to the command's own (already validated) one. */
-  private safeNow(command: LandChainCommand): string {
+  /** The injected instant for a recorded timestamp; a throwing clock aborts the guarded call as `budget-exhausted`. */
+  private timestamp(): string {
     try {
       return this.deps.nowIso();
     } catch {
-      return command.nowIso;
+      throw new ClockUnavailableError();
     }
   }
 }

@@ -607,6 +607,13 @@ describe('LandChainUseCase read phase', () => {
     expect(result).toEqual({ outcome: 'refused', reason: 'too-many-links' });
   });
 
+  it('more than 50 listed runs of which only one matches the chain is too-many-links, not a filtered pass', async () => {
+    const mixed = Array.from({ length: 51 }, (_, at) => laneRun({ runId: `run-${at}`, baseBranch: at === 0 ? BRANCH : 'main' }));
+    const { result, world } = await run({}, { laneRuns: mixed });
+    expect(result).toEqual({ outcome: 'refused', reason: 'too-many-links' });
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+  });
+
   it('a chain with no links is no-links', async () => {
     const { result } = await run({}, { laneRuns: [laneRun({ baseBranch: 'main' })] });
     expect(result).toEqual({ outcome: 'refused', reason: 'no-links' });
@@ -664,6 +671,16 @@ describe('LandChainUseCase read phase', () => {
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'link-receipt-missing' });
     expect(world.landing.calls.openOrAdopt).toBe(0);
+  });
+
+  it('a link receipt that is pending or not-applicable is verdict-unknown and does not enqueue', async () => {
+    for (const result of ['pending', 'not-applicable']) {
+      const world = makeWorld({ linkReceipts: () => ({ outcome: 'found', verification: [], review: [preMergeReceipt(result)] }) });
+      const answer = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+      expect(answer).toEqual({ outcome: 'unknown', reason: 'verdict-unknown' });
+      expect(world.calls.enqueueMergeEntry).toBe(0);
+      expect(world.landing.calls.openOrAdopt).toBe(0);
+    }
   });
 
   it('a failed link receipt is link-receipt-failed', async () => {
@@ -797,6 +814,28 @@ describe('LandChainUseCase apply', () => {
     expect(world.calls.enqueueMergeEntry).toBe(0);
   });
 
+  it('a stored final result whose mark is withdrawn, or belongs to another key or head, is journal-unreadable and not landed', async () => {
+    const key = `chain-land/${CHAIN}@${TIP.slice(0, 12)}`;
+    const entryDigest = digest(canonicalLandChainPayload({ chainName: CHAIN, headSha: TIP, dryRun: false }));
+    const stored = [
+      { state: 'withdrawn' as const, headSha: TIP, key },
+      { state: 'landing' as const, headSha: OTHER_SHA, key },
+      { state: 'landing' as const, headSha: TIP, key: `chain-land/${CHAIN}@${OTHER_SHA.slice(0, 12)}` },
+    ];
+    for (const mark of stored) {
+      const world = makeWorld();
+      world.landing.journal.set(key, [
+        { key, kind: 'intent', entryId: '0AAAAAAAAAAAAAAAAAAAAAAAA', recordedAtIso: NOW, digest: entryDigest, deadlineIso: FUTURE },
+        { key, kind: 'result', entryId: '0BBBBBBBBBBBBBBBBBBBBBBBB', recordedAtIso: NOW, digest: entryDigest, deadlineIso: FUTURE },
+      ]);
+      world.landing.marks.set(`${OWNER}/${REPO}#${CHAIN}`, { revision: 2, mark: { pullRequestNumber: 77, ...mark } });
+      const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+      expect(result).toEqual({ outcome: 'unknown', reason: 'journal-unreadable' });
+      expect(world.landing.calls.openOrAdopt).toBe(0);
+      expect(world.calls.enqueueMergeEntry).toBe(0);
+    }
+  });
+
   it('a stored final result replays without calling forge or queue again', async () => {
     const world = makeWorld();
     const key = `chain-land/${CHAIN}@${TIP.slice(0, 12)}`;
@@ -886,10 +925,12 @@ describe('LandChainUseCase apply', () => {
         return read <= 1 ? { outcome: 'found', verification: [], review: [preMergeReceipt('pass')] } : { outcome: 'none' };
       },
     });
-    landingCasAlwaysStale(world.landing);
+    withdrawalCasAlwaysStale(world.landing);
     const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
     expect(result).toEqual({ outcome: 'refused', reason: 'landing-mark-stale' });
     expect(world.calls.enqueueMergeEntry).toBe(0);
+    // The landing mark was recorded (initial CAS succeeded) and the withdrawal never took effect.
+    expect(world.landing.marks.get(`${OWNER}/${REPO}#${CHAIN}`)?.mark.state).toBe('landing');
   });
 
   it('a refused enqueue is enqueue-refused', async () => {
@@ -908,9 +949,40 @@ describe('LandChainUseCase apply', () => {
     const throwingClock = await run({}, { clock: () => { throw new Error('no clock'); } });
     expect(throwingClock.result).toEqual({ outcome: 'unknown', reason: 'budget-exhausted' });
   });
+
+  it('a clock that throws only on the timestamp read before the enqueue is budget-exhausted with no enqueue call', async () => {
+    // Record how many clock reads happen before enqueueMergeEntry is invoked on a clean run.
+    let reads = 0;
+    let readsAtEnqueue = 0;
+    const probe = makeWorld({ clock: () => { reads += 1; return NOW; } });
+    const probeEnqueue = probe.deps.mergeQueue.enqueueMergeEntry.bind(probe.deps.mergeQueue);
+    probe.deps.mergeQueue.enqueueMergeEntry = async (command) => {
+      readsAtEnqueue = reads;
+      return probeEnqueue(command);
+    };
+    expect((await new LandChainUseCase(probe.deps).execute({ ...BASE_COMMAND })).outcome).toBe('landed');
+    expect(readsAtEnqueue).toBeGreaterThan(1);
+
+    // The last clock read before the enqueue is the timestamp read, after the deadline guard passed.
+    let count = 0;
+    const world = makeWorld({
+      clock: () => {
+        count += 1;
+        if (count === readsAtEnqueue) {
+          throw new Error('clock failed on the timestamp read');
+        }
+        return NOW;
+      },
+    });
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'unknown', reason: 'budget-exhausted' });
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+  });
 });
 
-/** Force every landing-mark CAS answer to `stale-revision`, whatever the stored revision. */
-function landingCasAlwaysStale(landing: ChainLandingPort): void {
-  landing.compareAndSetMark = async () => ({ outcome: 'refused', reason: 'stale-revision' });
+/** Force only the withdrawal CAS (the `withdrawn` mark) to `stale-revision`; the landing-mark CAS behaves normally. */
+function withdrawalCasAlwaysStale(landing: ChainLandingPort): void {
+  const original = landing.compareAndSetMark.bind(landing);
+  landing.compareAndSetMark = async (command) =>
+    command.mark.state === 'withdrawn' ? { outcome: 'refused', reason: 'stale-revision' } : original(command);
 }

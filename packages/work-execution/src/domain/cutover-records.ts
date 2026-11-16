@@ -278,7 +278,13 @@ function ownDataValue(record: unknown, key: string): unknown {
 }
 
 function isBoundedText(value: unknown): value is string {
-  return typeof value === 'string' && new TextEncoder().encode(value).length <= MAX_EVIDENCE_STRING_BYTES;
+  // The UTF-16 length is checked first: a string's UTF-8 byte length is never less than it, so
+  // this refuses nothing the byte check would accept, and an oversized string is never encoded.
+  return (
+    typeof value === 'string' &&
+    value.length <= MAX_EVIDENCE_STRING_BYTES &&
+    new TextEncoder().encode(value).length <= MAX_EVIDENCE_STRING_BYTES
+  );
 }
 
 /** The UTC day serial of a real calendar `YYYY-MM-DD` date, or null. */

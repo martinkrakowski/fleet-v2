@@ -256,6 +256,35 @@ describe('readCutoverShadowEvidence', () => {
     expect(readCutoverShadowEvidence({ ...(evidence(NOW) as Record<string, unknown>), extra: 1 }, NOW)).toEqual(ALL_FAILED);
   });
 
+  it('bounds a day string by its UTF-16 length before encoding it, and by its byte length after', () => {
+    const withDay = (day: string): unknown =>
+      evidence(NOW, (root) => {
+        (root.days as Array<{ day: string }>)[0].day = day;
+      });
+    const encode = vi.spyOn(TextEncoder.prototype, 'encode');
+    /** The verdict for `day` in the first record, and the byte length of each encoding of it. */
+    const probe = (day: string): { verdict: unknown; encodedBytes: number[] } => {
+      encode.mockClear();
+      const verdict = readCutoverShadowEvidence(withDay(day), NOW);
+      const encodedBytes = encode.mock.calls.flatMap((call, index) =>
+        call[0] === day ? [(encode.mock.results[index].value as Uint8Array).length] : [],
+      );
+      return { verdict, encodedBytes };
+    };
+    try {
+      // Exactly the limit passes the length bound and is measured (the date pattern then refuses it).
+      expect(probe('a'.repeat(64))).toEqual({ verdict: ALL_FAILED, encodedBytes: [64] });
+      // One over the limit, and a multi-megabyte string, are refused without being encoded.
+      expect(probe('a'.repeat(65))).toEqual({ verdict: ALL_FAILED, encodedBytes: [] });
+      expect(probe('a'.repeat(4 * 1024 * 1024))).toEqual({ verdict: ALL_FAILED, encodedBytes: [] });
+      // Within the UTF-16 length but over the byte limit: still measured, still refused.
+      expect(probe('\u00e9'.repeat(64))).toEqual({ verdict: ALL_FAILED, encodedBytes: [128] });
+      expect(probe('\u{1F600}'.repeat(32))).toEqual({ verdict: ALL_FAILED, encodedBytes: [128] });
+    } finally {
+      encode.mockRestore();
+    }
+  });
+
   it('names only S4 when that verdict is unknown', () => {
     expect(readCutoverShadowEvidence(withVerdict(2, 'S4', { value: 'unknown' }), NOW)).toEqual(onlyFailed('S4'));
   });

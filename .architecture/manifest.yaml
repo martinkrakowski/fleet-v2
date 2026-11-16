@@ -377,6 +377,7 @@ bounded_contexts:
           - RunMergePassUseCase
           - RunDaemonTickUseCase
           - InspectDaemonStatusUseCase
+          - WatchTrainHealthUseCase
           - ImportTrainStateUseCase
           - ExportLegacyTrainStateUseCase
           - InspectMergeReadinessUseCase
@@ -427,6 +428,7 @@ bounded_contexts:
             - ReapOrphanReservationsPort
             - RunDaemonTickPort
             - InspectDaemonStatusPort
+            - WatchTrainHealthPort
             - SetDaemonPausePort
             - EnqueueMergePort
             - ReapZombiesPort
@@ -541,6 +543,8 @@ bounded_contexts:
             - SeatTicketRepositoryPort
             - SeatObservationRepositoryPort
             - SeatCatalogPort
+            - TrainHealthStateReadPort
+            - TrainHealthAttentionPort
       infrastructure:
         adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GhReviewThreadHelperAdapter, GitMirrorPatchIdentityAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter, RepositoryFactsAdapter, GateReceiptReuseAdapter, WorktreePoolAdapter, ChainRepositoryAdapter, SeatTicketRepositoryAdapter, SeatObservationRepositoryAdapter, SeatCatalogAdapter, ReaperFindingRepositoryAdapter, InMemoryReaperFindingRepositoryAdapter, MergePolicyAdapter, ReleaseStoreAdapter, ChainAttentionAdapter, LaneScorecardFileAdapter, LaneUsageLogFileAdapter, PullRequestFindingsReadAdapter, LaneEditSaveAdapter, CutoverJournalAdapter, RelaunchPlanRepositoryAdapter, CutoverRecordRepositoryAdapter, ShadowEvidenceAdapter, MergeRecordRepositoryAdapter, GhMergeVetoStateAdapter]
     contracts:
@@ -685,6 +689,9 @@ bounded_contexts:
       SeatTicketRepositoryPort: "Persist one seat rotation counter per (project, role): a compare-and-swap on revision writes the next ticket under the store's lock, the ticket never decreases, known absence is null and an unreadable store is an error."
       SeatObservationRepositoryPort: "Append seat observations to an append-only store: a stored observation is never rewritten or removed, a repeated observation id is refused as duplicate, and every observation reads back in append order."
       SeatCatalogPort: "Read the installation's seat catalogue and the seat plan it builds, as a structural subset of the installation: the seats with their tool, model, variant, agent and health, and the implementer, fix and reviewer chains; an absent catalogue is absent and an unreadable one is unknown, never an empty catalogue; it writes nothing and returns ids, models and codes only."
+      WatchTrainHealthPort: "One bounded pass reads the train state, evaluates the pure CO-WD1 rules and raises one attention item per finding; an unreadable or unevaluable state is reported as blind and never as healthy, nothing is cleared on unknown, and a cut finding list or a queue over 500 entries raises its own item."
+      TrainHealthStateReadPort: "Read-only; live entries only, oldest first, never unavailable only because the queue is long."
+      TrainHealthAttentionPort: "Raise, clear or list the seven train-health item codes keyed by project, repository, rule and pull request; every request carries the pass deadline and the caller bounds each await with the remaining call budget."
     adapter_bindings:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
       - { adapter: AttemptRepositoryAdapter, implements: AttemptRepositoryPort, integration: local-transactional-store }

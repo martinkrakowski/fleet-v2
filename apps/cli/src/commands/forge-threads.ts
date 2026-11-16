@@ -28,7 +28,9 @@ export function strictPullRequestNumber(p: Payload): number | undefined {
 }
 
 const SUBCOMMANDS = new Set(['list', 'reply', 'resolve']);
-const REPOSITORY_PATTERN = /^([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})$/;
+// The `(?!\n)` lookahead keeps a trailing newline out: without it `$` would
+// also match just before a final newline and 'owner/repo\n' would validate.
+const REPOSITORY_PATTERN = /^([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})(?!\n)$/;
 const THREAD_ID_PATTERN = /^[A-Za-z0-9_+/=-]{1,256}$/;
 const MAX_BODY_FILE_BYTES = 32000;
 const MAX_BODY_CHARS = 8000;

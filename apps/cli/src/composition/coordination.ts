@@ -109,6 +109,13 @@ export function composeCoordination(input: ComposeCoordinationInput) {
   // --- operator-coordination -------------------------------------------------
 
   const projectProfileRepository = new ProjectProfileRepositoryAdapter({ stateDir });
+  // CO29a-ro2: the relaunch commands read profiles through a read-only
+  // instance, so an unreadable profile store is never quarantined by a
+  // read-only command; every other reader keeps the writable instance.
+  const projectProfileReadOnlyRepository = new ProjectProfileRepositoryAdapter({
+    stateDir,
+    readOnly: true,
+  });
   const coordinationRequestRepository = new CoordinationRequestRepositoryAdapter({ stateDir });
   // O9: the conductor's orchestrator session store; the no-op change signal is
   // correct (sessions are never announced to the change feed).
@@ -193,6 +200,9 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     }),
     retireProjectProfile: new RetireProjectProfileUseCase({ profileRepo: projectProfileRepository }),
     listProjectProfiles: new ListProjectProfilesUseCase({ profileRepo: projectProfileRepository }),
+    listProjectProfilesReadOnly: new ListProjectProfilesUseCase({
+      profileRepo: projectProfileReadOnlyRepository,
+    }),
     inspectProjectProfile: new InspectProjectProfileUseCase({ profileRepo: projectProfileRepository }),
     recordProjectProbe: new RecordProjectProbeUseCase({ profileRepo: projectProfileRepository }),
     inspectConfiguredCapabilities: new InspectConfiguredCapabilitiesUseCase({

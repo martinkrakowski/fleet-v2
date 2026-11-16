@@ -15,7 +15,7 @@ import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
 import type { SeatModel } from '@fleet/installation';
 
-import { GH_BINARY_CANDIDATES } from '../gh-binary.js';
+import { GH_BINARY_CANDIDATES, hasGhTokenEnv } from '../gh-binary.js';
 import type {
   DoctorCommandExecutor,
   DoctorCommandRunOptions,
@@ -354,6 +354,179 @@ describe('createNodeDoctorProbes', () => {
     const probes = createNodeDoctorProbes();
     const result = await probes.ghBinary!();
     expect(result?.candidates).toEqual(GH_BINARY_CANDIDATES);
+  });
+
+  it('returns fail without spawning gh when no token variable is present', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor, serviceEnv: {} });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: false,
+      authCheck: { outcome: 'fail', reason: 'no GH_TOKEN or GITHUB_TOKEN in service environment' },
+    });
+    // An empty-string token is as good as absent; nothing is spawned either way.
+    await expect(
+      probes.ghAuth!('/usr/bin/gh'),
+    ).resolves.toMatchObject({ tokenPresent: false });
+    expect(local.calls).toHaveLength(0);
+    const emptyTokenProbes = createNodeDoctorProbes({
+      localExecutor: fakeExecutor({}).executor,
+      serviceEnv: { GH_TOKEN: '' },
+    });
+    await expect(emptyTokenProbes.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({
+      tokenPresent: false,
+      authCheck: { outcome: 'fail' },
+    });
+  });
+
+  it('maps non-zero gh auth status exit to fail without leaking stdout or stderr', async () => {
+    const local = fakeExecutor({
+      exitCode: 1,
+      signal: null,
+      stdout: 'Logged in to github.com account octocat',
+      stderr: 'secret detail',
+    });
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'fail', reason: 'gh auth status failed' },
+    });
+    expect(local.calls).toEqual([
+      { argv: ['/usr/bin/gh', 'auth', 'status'], options: { timeoutMs: 5_000 } },
+    ]);
+  });
+
+  it('maps spawn error or empty binary path to unknown', async () => {
+    const local = fakeExecutor({
+      exitCode: null,
+      signal: null,
+      stdout: '',
+      stderr: '',
+      error: 'spawn ENOENT',
+    });
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'unknown', reason: 'gh auth status timed out or could not be run' },
+    });
+    await expect(probes.ghAuth!('   ')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'unknown', reason: 'gh auth status could not be run' },
+    });
+  });
+
+  it('maps timed-out or signaled gh auth status to unknown', async () => {
+    const local = fakeExecutor({
+      exitCode: null,
+      signal: 'SIGTERM',
+      stdout: '',
+      stderr: '',
+    });
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'unknown', reason: 'gh auth status timed out or could not be run' },
+    });
+    expect(local.calls).toHaveLength(1);
+  });
+
+  it('returns unknown when ghAuthTimeoutMs budget is exhausted', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+      ghAuthTimeoutMs: 0,
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toEqual({
+      tokenPresent: true,
+      authCheck: { outcome: 'unknown', reason: 'gh auth status could not be run' },
+    });
+    const negative = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+      ghAuthTimeoutMs: -1,
+    });
+    await expect(negative.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({
+      authCheck: { outcome: 'unknown' },
+    });
+    expect(local.calls).toHaveLength(0);
+  });
+
+  it('passes a positive ghAuthTimeoutMs budget to the executor', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: { GH_TOKEN: 'token-value' },
+      ghAuthTimeoutMs: 1_234,
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({
+      authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+    });
+    expect(local.calls).toEqual([
+      { argv: ['/usr/bin/gh', 'auth', 'status'], options: { timeoutMs: 1_234 } },
+    ]);
+  });
+
+  it('honours a serviceEnv function and treats null or undefined env as no token', async () => {
+    const local = fakeExecutor({});
+    const probes = createNodeDoctorProbes({
+      localExecutor: local.executor,
+      serviceEnv: () => ({ GITHUB_TOKEN: 'token-value' }),
+    });
+    await expect(probes.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({ tokenPresent: true });
+    const nullEnv = createNodeDoctorProbes({
+      localExecutor: fakeExecutor({}).executor,
+      // The guard exists for embedders that hand a null environment through
+      // the wider `Readonly<Record<...>>` type.
+      serviceEnv: null as unknown as Readonly<Record<string, string | undefined>>,
+    });
+    await expect(nullEnv.ghAuth!('/usr/bin/gh')).resolves.toMatchObject({
+      tokenPresent: false,
+    });
+    // Only the token-bearing reader spawned `gh`; the null env did not.
+    expect(local.calls).toEqual([
+      { argv: ['/usr/bin/gh', 'auth', 'status'], options: { timeoutMs: 5_000 } },
+    ]);
+  });
+
+  it('rejects on a throwing serviceEnv getter so doctor turns it into unknown', async () => {
+    const throwingEnv = Object.defineProperties(
+      {} as Record<string, string | undefined>,
+      {
+        GH_TOKEN: {
+          get() {
+            throw new Error('unreadable');
+          },
+          enumerable: true,
+        },
+      },
+    );
+    const probes = createNodeDoctorProbes({ serviceEnv: throwingEnv });
+    await expect(probes.ghAuth!('/usr/bin/gh')).rejects.toThrow('unreadable');
+    const throwingReader = createNodeDoctorProbes({
+      serviceEnv: () => {
+        throw new Error('env unavailable');
+      },
+    });
+    await expect(throwingReader.ghAuth!('/usr/bin/gh')).rejects.toThrow('env unavailable');
+  });
+
+  it('hasGhTokenEnv checks both variable names and never exposes values', () => {
+    expect(hasGhTokenEnv(undefined)).toBe(false);
+    expect(hasGhTokenEnv(null)).toBe(false);
+    expect(hasGhTokenEnv({} as Record<string, string | undefined>)).toBe(false);
+    expect(hasGhTokenEnv([] as unknown as Record<string, string | undefined>)).toBe(false);
+    expect(hasGhTokenEnv({ GH_TOKEN: '  ' })).toBe(false);
+    expect(hasGhTokenEnv({ GITHUB_TOKEN: 'x' })).toBe(true);
+    expect(hasGhTokenEnv({ GH_TOKEN: 'x' })).toBe(true);
   });
 
   it('probes the server with two curl runs and parses the listed models', async () => {

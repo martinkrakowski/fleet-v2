@@ -208,6 +208,11 @@ export class ConductorHaltAdapter implements ConductorHaltPort {
   private async readRecordsFromDisk(target: string): Promise<readonly ConductorHaltRecord[]> {
     let buffer: Buffer;
     try {
+      if (this.options?.readOnly === true) {
+        // A symlink (dangling or not) or a non-regular file is unreadable, never absent.
+        const info = await fs.lstat(target);
+        if (!info.isFile()) throw new StateFileUnreadableReadOnlyError(target, 'not a regular file');
+      }
       buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (

@@ -45,6 +45,10 @@ function seatModel(reason: string): DoctorProbes {
       resolved: '/usr/bin/gh',
       candidates: ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'],
     }),
+    ghAuth: async () => ({
+      tokenPresent: true,
+      authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+    }),
     seatProbe: async () => result,
     serverProbe: async () => ({ outcome: 'pass', reason: 'the opencode server answered' }),
   };

@@ -18,7 +18,7 @@ import { promisify } from 'node:util';
 import type { SeatModel } from '@fleet/installation';
 import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
-import { GH_BINARY_CANDIDATES } from './gh-binary.js';
+import { GH_BINARY_CANDIDATES, hasGhTokenEnv, type GhAuthObservation } from './gh-binary.js';
 import type { DoctorProbes, SeatProbeResult, ServerProbeResult } from './probes.js';
 
 const execFileAsync = promisify(execFileCallback);
@@ -55,6 +55,9 @@ export interface DoctorCommandExecutor {
 
 /** Default wall-clock budget for a platform probe command. */
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
+
+/** Default wall-clock budget for the bounded `gh auth status` run. */
+const DEFAULT_GH_AUTH_TIMEOUT_MS = 5_000;
 
 /** Default wall-clock budget for the one-step seat probe (a live model call). */
 const DEFAULT_SEAT_TIMEOUT_MS = 60_000;
@@ -142,6 +145,16 @@ export interface NodeDoctorProbesDeps {
    * to `GH_BINARY_CANDIDATES`; injectable for tests and embedders.
    */
   readonly ghBinaryCandidates?: readonly string[];
+  /**
+   * The service environment the `gh` auth probe inspects for a token
+   * variable, given directly or as a reader. Defaults to `process.env`;
+   * a reader that throws rejects so the doctor reports `UNKNOWN`.
+   */
+  readonly serviceEnv?:
+    | Readonly<Record<string, string | undefined>>
+    | (() => Readonly<Record<string, string | undefined>>);
+  /** Wall-clock budget for the `gh auth status` run. */
+  readonly ghAuthTimeoutMs?: number;
 }
 
 /** Walk up from this module to the repository root that owns `bin/ocm-run`. */
@@ -292,6 +305,10 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
   const executors = { localExecutor, sshExecutor, timeoutMs };
   const repoRoot = deps.repoRoot ?? resolveRepoRoot();
   const worktreeRoot = deps.worktreeRoot ?? '.';
+  const ghAuthTimeoutMs = deps.ghAuthTimeoutMs ?? DEFAULT_GH_AUTH_TIMEOUT_MS;
+
+  const readServiceEnv = (): Readonly<Record<string, string | undefined>> =>
+    typeof deps.serviceEnv === 'function' ? deps.serviceEnv() : deps.serviceEnv ?? process.env;
 
   return {
     async hostReachable(host) {
@@ -411,6 +428,42 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
       } catch {
         return undefined;
       }
+    },
+
+    async ghAuth(binaryPath): Promise<GhAuthObservation> {
+      const env = readServiceEnv();
+      const tokenPresent = hasGhTokenEnv(env);
+      // Without a token in the service environment `gh` falls back to the
+      // desktop keyring, which blocks a non-interactive session; never
+      // spawn it in that case.
+      if (!tokenPresent) {
+        return {
+          tokenPresent,
+          authCheck: { outcome: 'fail', reason: 'no GH_TOKEN or GITHUB_TOKEN in service environment' },
+        };
+      }
+      if (binaryPath.trim() === '' || ghAuthTimeoutMs <= 0) {
+        return {
+          tokenPresent,
+          authCheck: { outcome: 'unknown', reason: 'gh auth status could not be run' },
+        };
+      }
+      const result = await localExecutor.run([binaryPath, 'auth', 'status'], {
+        timeoutMs: ghAuthTimeoutMs,
+      });
+      if (result.error !== undefined || result.signal !== null || result.exitCode === null) {
+        return {
+          tokenPresent,
+          authCheck: { outcome: 'unknown', reason: 'gh auth status timed out or could not be run' },
+        };
+      }
+      if (result.exitCode === 0) {
+        return {
+          tokenPresent,
+          authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+        };
+      }
+      return { tokenPresent, authCheck: { outcome: 'fail', reason: 'gh auth status failed' } };
     },
 
     async serverProbe(host, port): Promise<ServerProbeResult> {

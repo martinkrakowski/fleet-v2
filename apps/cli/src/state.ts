@@ -602,7 +602,7 @@ async function liveRunsMovedUnderPlan(stateDir: string, plan: CompactPlan): Prom
   }
 }
 
-/** True when the lease file holds anything but an empty list: a read-only adapter answers null for an unreadable lease too. */
+/** True when the lease file holds anything but an empty list. */
 async function leaseFileHoldsRecords(stateDir: string): Promise<boolean> {
   try {
     const text = (await fs.readFile(path.join(stateDir, 'conductor-driver-lease.json'), 'utf8')).trim();

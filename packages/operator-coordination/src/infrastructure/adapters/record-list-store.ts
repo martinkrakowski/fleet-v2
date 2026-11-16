@@ -11,7 +11,11 @@
 
 import { promises as fs } from 'node:fs';
 
-import { inspectRecordListBytes, quarantineUnreadable } from './file-store.js';
+import {
+  inspectRecordListBytes,
+  quarantineUnreadable,
+  StateFileUnreadableReadOnlyError,
+} from './file-store.js';
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -25,22 +29,42 @@ function isNotFound(error: unknown): boolean {
   );
 }
 
+/**
+ * Read one record-list store. With `readOnly` the unreadable path never
+ * quarantines (a read-only command must never write): the exact bytes stay
+ * untouched and the typed `StateFileUnreadableReadOnlyError` answers instead.
+ * The default quarantining read is unchanged.
+ */
 export async function readRecordList<T>(
   path: string,
   adapterName: string,
   parseRecord: (raw: unknown) => T | undefined,
+  readOnly = false,
 ): Promise<T[]> {
   let buffer: Buffer;
   try {
+    if (readOnly) {
+      // A symlink (dangling or not) or a non-regular file is unreadable, never an absent store.
+      const info = await fs.lstat(path);
+      if (!info.isFile()) {
+        throw new StateFileUnreadableReadOnlyError(path, 'not a regular file');
+      }
+    }
     buffer = await fs.readFile(path);
   } catch (error: unknown) {
     if (isNotFound(error)) {
       return [];
     }
+    if (error instanceof StateFileUnreadableReadOnlyError) {
+      throw error;
+    }
     throw new Error(`${adapterName} could not read ${path}: ${describe(error)}`);
   }
   const inspection = inspectRecordListBytes(buffer, parseRecord);
   if (inspection.status === 'unreadable') {
+    if (readOnly) {
+      throw new StateFileUnreadableReadOnlyError(path, inspection.detail);
+    }
     return quarantineUnreadable(path, inspection.detail, buffer);
   }
   return [...inspection.records];

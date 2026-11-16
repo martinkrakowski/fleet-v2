@@ -3,7 +3,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { ReadOnlyStateStoreError, StateFileUnreadableError } from './file-store.js';
+import { ReadOnlyStateStoreError, StateFileUnreadableError, StateFileUnreadableReadOnlyError } from './file-store.js';
+import { ConductorDriverLeaseUnreadableError } from '../../application/ports/out/ConductorDriverLeasePort.out-port.js';
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -196,13 +197,17 @@ describe('ConductorDriverLeaseAdapter read-only mode', () => {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('read-only leaves a malformed marker untouched and reads null while the default quarantines', async () => {
+  it('read-only leaves a malformed marker untouched and answers the typed unreadable error while the default quarantines', async () => {
     const garbage = '{ not json CANARY-bytes';
     const file = path.join(tempDir, 'conductor-driver-lease.json');
     await fs.writeFile(file, garbage, 'utf8');
 
+    // CO29a-ro2: a read-only read never turns unreadable bytes into an absent
+    // lease; the typed error answers and the exact bytes stay untouched.
     const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
-    expect(await readonlyAdapter.read()).toBeNull();
+    const unreadable = await readonlyAdapter.read().catch((error: unknown) => error);
+    expect(unreadable).toBeInstanceOf(ConductorDriverLeaseUnreadableError);
+    expect((unreadable as Error).cause).toBeInstanceOf(StateFileUnreadableReadOnlyError);
     expect(await fs.readFile(file, 'utf8')).toBe(garbage);
     await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
       code: 'ENOENT',
@@ -216,4 +221,28 @@ describe('ConductorDriverLeaseAdapter read-only mode', () => {
 
     await expect(readonlyAdapter.acquire(ACQUIRE)).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
   });
+
+  it('read-only reads a missing lease file as absent, never unreadable', async () => {
+    const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
+    expect(await readonlyAdapter.read()).toBeNull();
+  });
+  it('read-only: a directory at the lease path, or a dangling symlink, is the typed unreadable error, never an absent lease', async () => {
+    const file = path.join(tempDir, 'conductor-driver-lease.json');
+    await fs.mkdir(file);
+    const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
+    const dirError = await readonlyAdapter.read().catch((error: unknown) => error);
+    expect(dirError).toBeInstanceOf(ConductorDriverLeaseUnreadableError);
+    expect((dirError as Error).cause).toBeDefined();
+    await fs.rmdir(file);
+
+    await fs.symlink(path.join(tempDir, 'does-not-exist'), file);
+    const linkError = await readonlyAdapter.read().catch((error: unknown) => error);
+    expect(linkError).toBeInstanceOf(ConductorDriverLeaseUnreadableError);
+    expect((await fs.lstat(file)).isSymbolicLink()).toBe(true);
+
+    // A truly missing file is still an absent lease.
+    await fs.unlink(file);
+    await expect(readonlyAdapter.read()).resolves.toBeNull();
+  });
+
 });

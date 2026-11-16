@@ -30,6 +30,8 @@ import type {
   SweepChainsResult,
 } from '../ports/in/SweepChainsPort.in-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
+import { isChainPassHalted } from './chain-pass-halt.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeForgeActionPort } from '../ports/out/MergeForgeActionPort.out-port.js';
 
 const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
@@ -318,6 +320,13 @@ export class SweepChainsUseCase implements SweepChainsPort {
       readonly chains: Pick<ChainRepositoryPort, 'listChains' | 'recordChainSwept'>;
       readonly forge: MergeForgeActionPort;
       readonly now: () => string;
+      /**
+       * The conductor halt read (plan §3.7). Optional: absent means not halted
+       * and behaves exactly as before. When present it fails closed:
+       * unreadable, off-contract or halted, an apply-mode sweep refuses before
+       * any delete and before any swept mark. Read once, at the start of apply.
+       */
+      readonly halt?: Pick<ConductorHaltPort, 'read'>;
     },
   ) {}
 
@@ -494,6 +503,12 @@ export class SweepChainsUseCase implements SweepChainsPort {
   }
 
   private async apply(command: ValidCommand, planned: readonly PlannedChain[]): Promise<SweepChainsResult> {
+    if (await isChainPassHalted(this.deps.halt)) {
+      // Read once per pass: refused before any delete and before any swept
+      // mark. Never re-read per delete, so a delete already sent always
+      // finishes and its chain is recorded as swept.
+      return refusalResult({ kind: 'plain', reasonCode: 'halted' });
+    }
     try {
       if (typeof this.deps.forge?.isConfigured !== 'function' || this.deps.forge.isConfigured() === false) {
         return refusalResult({ kind: 'plain', reasonCode: 'forge-not-configured' });

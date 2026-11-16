@@ -73,6 +73,10 @@ function passingProbes(calls?: string[]): DoctorProbes {
       resolved: '/usr/bin/gh',
       candidates: GH_BINARY_CANDIDATES,
     }),
+    ghAuth: async () => ({
+      tokenPresent: true,
+      authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+    }),
     seatProbe: async () => {
       calls?.push('seatProbe');
       return { outcome: 'pass', reason: 'answered' };

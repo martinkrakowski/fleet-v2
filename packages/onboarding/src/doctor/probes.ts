@@ -7,6 +7,8 @@
  * reasons only — never file contents, keys or tokens.
  */
 
+import type { GhAuthObservation } from './gh-binary.js';
+
 import type { SeatModel } from '@fleet/installation';
 import type { ToolId } from '@fleet/tooling';
 
@@ -60,6 +62,14 @@ export interface DoctorProbes {
   ghBinary(): Promise<
     { resolved: string | undefined; candidates: readonly string[] } | undefined
   >;
+  /**
+   * The bounded, non-interactive `gh` auth observation: whether a token
+   * variable is present in the service environment and how the budgeted
+   * `gh auth status` run concluded. No token value, file content or
+   * account name ever enters the observation. Optional so existing
+   * `DoctorProbes` fakes stay compatible.
+   */
+  ghAuth?(binaryPath: string): Promise<GhAuthObservation>;
   /**
    * The opencode server on the host's own loopback port: does it answer, and
    * which models does it list? The probe asks the server on the host that

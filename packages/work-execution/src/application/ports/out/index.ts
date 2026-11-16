@@ -55,6 +55,7 @@ export * from "./LaneRunParkNoticePort.out-port.js";
 export * from "./LaneRunRepositoryPort.out-port.js";
 export * from "./LaneRunStartCapacityPort.out-port.js";
 export * from "./LaneScorecardPort.out-port.js";
+export * from "./LaneUsageLogPort.out-port.js";
 export * from "./LegacyTrainStateReadPort.out-port.js";
 export * from "./MergeForgeActionPort.out-port.js";
 export * from "./MergeGrantPort.out-port.js";

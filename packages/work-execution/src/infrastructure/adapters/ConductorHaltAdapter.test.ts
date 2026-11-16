@@ -265,4 +265,17 @@ describe('ConductorHaltAdapter read-only mode', () => {
       readonlyAdapter.set({ halted: true, nowIso: NOW }),
     ).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
   });
+  it('read-only: a dangling symlink or a directory at the marker path reads unreadable, never clear', async () => {
+    const file = path.join(tempDir, 'conductor-halt.json');
+    const readonlyAdapter = new ConductorHaltAdapter({ stateDir: tempDir, readOnly: true });
+    await fs.symlink(path.join(tempDir, 'does-not-exist'), file);
+    expect(await readonlyAdapter.read()).toEqual({ state: 'unreadable' });
+    expect((await fs.lstat(file)).isSymbolicLink()).toBe(true);
+    await fs.unlink(file);
+    await fs.mkdir(file);
+    expect(await readonlyAdapter.read()).toEqual({ state: 'unreadable' });
+    await fs.rmdir(file);
+    expect(await readonlyAdapter.read()).toEqual({ state: 'clear', record: null });
+  });
+
 });

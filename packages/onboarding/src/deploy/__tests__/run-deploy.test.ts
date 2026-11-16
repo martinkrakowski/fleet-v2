@@ -115,6 +115,29 @@ describe('runCheckedDeploy', () => {
     expect(calls).toEqual([]);
   });
 
+  it('refuses a getter that is valid once but throws on a later read as invalid-request with zero probe calls', async () => {
+    const { probes, calls } = fakeProbes();
+    let stagingReads = 0;
+    const request = {
+      ...sampleRequest(),
+      get stagingPath(): string {
+        stagingReads += 1;
+        if (stagingReads === 1) return '/staging';
+        throw new Error('staging getter boom');
+      },
+    } as unknown as DeployRequest;
+    const result = await runCheckedDeploy(request, probes);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+      detail: 'invalid-request',
+    });
+    // The unstable getter is flushed during validation: no probe runs and
+    // the deploy never reaches the staging digest as a probe failure.
+    expect(calls).toEqual([]);
+    expect(stagingReads).toBe(2);
+  });
+
   it('refuses when merge is in progress before the build and runs nothing else', async () => {
     const { probes, calls } = fakeProbes({
       mergeInProgress: async (repoPath) => {
@@ -359,6 +382,31 @@ describe('runCheckedDeploy', () => {
       reason: 'probe-failed',
       detail: 'probe-failed',
     });
+  });
+
+  it('treats a null, undefined or empty installed digest as probe-failed and rolls back the unconfirmed repoint', async () => {
+    for (const bad of [null, undefined, '', '   '] as unknown[]) {
+      const { probes, calls } = fakeProbes({
+        currentTarget: async (link) => {
+          calls.push(`currentTarget:${link}`);
+          return '/previous';
+        },
+        digestTree: async (path) => {
+          calls.push(`digestTree:${path}`);
+          return path === '/staging' ? 'digest-staged' : (bad as never);
+        },
+      });
+      const result = await runCheckedDeploy(sampleRequest(), probes);
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: 'probe-failed',
+        detail: 'probe-failed',
+      });
+      // An invalid installed digest is never classified as bytes-mismatch,
+      // and the unconfirmed repoint is rolled back.
+      expect(calls).toContain('repoint:/install:/staging');
+      expect(calls).toContain('repoint:/install:/previous');
+    }
   });
 
   it('succeeds, calls repoint exactly once, and returns the verified digest', async () => {

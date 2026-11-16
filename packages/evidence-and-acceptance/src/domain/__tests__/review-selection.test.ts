@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { ReviewReceiptRecord } from '../evidence-records.js';
-import { REVIEW_KINDS } from '../evidence-records.js';
+import type { ReceiptSubject, ReviewReceiptRecord } from '../evidence-records.js';
+import { REVIEW_KINDS, assessmentIdForBrief, attemptIdForBrief, isValidBriefPackageDigest } from '../evidence-records.js';
+import { assessmentIdForAttempt } from '../assessment-id.js';
+import { ReviewReceipt } from '../entities/ReviewReceipt.js';
 import {
   decideReviewReceiptOutcome,
+  isAttemptReceiptSubject,
   isFullyDispositioned,
   latestReceiptPerReviewer,
   reviewKindOf,
@@ -515,5 +518,246 @@ describe('decideReviewReceiptOutcome diff-facts gate (U4a / D3)', () => {
         decideReviewReceiptOutcome(receipt({ result: 'fail', findings: [blocking] }), undefined, undefined, facts as unknown as ReviewDiffFacts),
       ).toEqual({ outcome: 'fail' });
     }
+  });
+});
+
+describe('isAttemptReceiptSubject', () => {
+  const DIGEST = 'd'.repeat(64);
+  const BASE = 'a'.repeat(40);
+
+  function briefSubject(): ReceiptSubject {
+    return {
+      kind: 'brief', projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null,
+      briefPackageDigest: DIGEST, baseCommit: BASE,
+    };
+  }
+
+  function chainSubject(): ReceiptSubject {
+    return {
+      kind: 'chain', projectId: 'proj-1', attemptId: null, chainName: 'main', integrationHeadSha: BASE,
+      briefPackageDigest: null, baseCommit: null,
+    };
+  }
+
+  it('returns false for null, undefined, primitives and arrays', () => {
+    for (const value of [null, undefined, 42, 'receipt', true, Symbol.iterator, [], [receipt()]]) {
+      expect(isAttemptReceiptSubject(value)).toBe(false);
+    }
+  });
+
+  it('returns false when a getter on subject or attemptId throws or is an accessor', () => {
+    for (const key of ['subject', 'attemptId']) {
+      const throwing = receipt();
+      Object.defineProperty(throwing, key, { get() { throw new Error('boom'); }, enumerable: true });
+      expect(isAttemptReceiptSubject(throwing)).toBe(false);
+      const accessorOnly: Record<string, unknown> = { ...receipt() };
+      Object.defineProperty(accessorOnly, key, { get: () => undefined, enumerable: true });
+      expect(isAttemptReceiptSubject(accessorOnly)).toBe(false);
+    }
+  });
+
+  it('returns false for a Proxy that throws on getOwnPropertyDescriptor, without throwing itself', () => {
+    const hostile = new Proxy(receipt(), {
+      getOwnPropertyDescriptor(): never {
+        throw new Error('boom');
+      },
+    });
+    expect(isAttemptReceiptSubject(hostile)).toBe(false);
+  });
+
+  it('ignores prototype-polluting keys: a JSON-parsed __proto__ with no own subject is not an attempt receipt, and one with a non-attempt subject is not either', () => {
+    expect(isAttemptReceiptSubject(JSON.parse('{"attemptId":"att-1","__proto__":{"kind":"chain"}}'))).toBe(false);
+    expect(
+      isAttemptReceiptSubject(JSON.parse('{"attemptId":"att-1","__proto__":{"kind":"chain"},"subject":{"kind":"chain","projectId":"proj-1","attemptId":null,"chainName":"main","integrationHeadSha":"' + 'a'.repeat(40) + '","briefPackageDigest":null,"baseCommit":null}}')),
+    ).toBe(false);
+  });
+
+  it('returns false for a chain: or brief: attemptId, even without a subject', () => {
+    expect(isAttemptReceiptSubject(receipt({ attemptId: 'chain:proj-1:main' }))).toBe(false);
+    expect(isAttemptReceiptSubject(receipt({ attemptId: attemptIdForBrief('proj-1', DIGEST) }))).toBe(false);
+  });
+
+  it('returns false for brief and chain subjects, true for an explicit attempt subject', () => {
+    expect(isAttemptReceiptSubject(receipt({ subject: briefSubject() }))).toBe(false);
+    expect(isAttemptReceiptSubject(receipt({ subject: chainSubject() }))).toBe(false);
+    expect(
+      isAttemptReceiptSubject(
+        receipt({
+          subject: { kind: 'attempt', projectId: 'proj-1', attemptId: 'att-1', chainName: null, integrationHeadSha: null, briefPackageDigest: null, baseCommit: null },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('returns true for a legacy receipt without a subject', () => {
+    expect(isAttemptReceiptSubject(receipt())).toBe(true);
+  });
+
+  it('returns true for a null-prototype object that carries an attemptId and no subject', () => {
+    expect(isAttemptReceiptSubject({ attemptId: 'att-1', __proto__: null })).toBe(true);
+  });
+
+  it('returns false for an object with an OWN __proto__ key, even one carrying an attempt subject', () => {
+    const subject = { kind: 'attempt', projectId: 'proj-1', attemptId: 'att-1', chainName: null, integrationHeadSha: null, briefPackageDigest: null, baseCommit: null };
+    const hostile = JSON.parse(`{"__proto__": {"polluted": true}, "attemptId": "att-1", "subject": ${JSON.stringify(subject)}}`) as unknown;
+    expect(Object.getOwnPropertyDescriptor(hostile, '__proto__')).toBeDefined();
+    expect(Object.getOwnPropertyDescriptor(hostile, 'subject')?.value).toEqual(subject);
+    expect(isAttemptReceiptSubject(hostile)).toBe(false);
+    const defined = {};
+    Object.defineProperty(defined, '__proto__', { value: {}, enumerable: true });
+    Object.defineProperty(defined, 'subject', { value: subject, enumerable: true });
+    expect(isAttemptReceiptSubject(defined)).toBe(false);
+  });
+});
+
+describe('attempt isolation of the review pass gates', () => {
+  const DIGEST = 'd'.repeat(64);
+  const BASE = 'a'.repeat(40);
+  const finding = {
+    findingId: 'rr-1:f-1',
+    severity: 'major' as const,
+    summary: 's',
+    filePath: 'src/a.ts',
+    line: 1,
+    state: 'out-of-scope' as const,
+    dispositionReason: 'not in scope',
+    dispositionEvidenceRef: 'ref-d',
+  };
+
+  function briefSubject(): ReceiptSubject {
+    return {
+      kind: 'brief', projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null,
+      briefPackageDigest: DIGEST, baseCommit: BASE,
+    };
+  }
+
+  it('a passing brief-verify receipt never satisfies either gate', () => {
+    const briefVerify = receipt({ kind: 'brief-verify', result: 'pass', attemptId: attemptIdForBrief('proj-1', DIGEST), subject: briefSubject() });
+    expect(satisfiesReviewPassGate(briefVerify)).toBe(false);
+    expect(satisfiesFullyDispositionedReviewPassGate(briefVerify, new Set(), new Set())).toBe(false);
+  });
+
+  it('a passing chain receipt never satisfies either gate', () => {
+    const chain = receipt({
+      kind: 'code-review',
+      result: 'pass',
+      attemptId: 'chain:proj-1:main',
+      subject: { kind: 'chain', projectId: 'proj-1', attemptId: null, chainName: 'main', integrationHeadSha: BASE, briefPackageDigest: null, baseCommit: null },
+    });
+    expect(satisfiesReviewPassGate(chain)).toBe(false);
+    expect(satisfiesFullyDispositionedReviewPassGate(chain, new Set(), new Set())).toBe(false);
+  });
+
+  it('a code-review carrying a brief subject never satisfies either gate, even fully dispositioned', () => {
+    const briefSubjectReceipt = receipt({ kind: 'code-review', result: 'fail', findings: [finding], subject: briefSubject() });
+    expect(satisfiesReviewPassGate(briefSubjectReceipt)).toBe(false);
+    expect(
+      satisfiesFullyDispositionedReviewPassGate(briefSubjectReceipt, new Set([finding.findingId]), new Set()),
+    ).toBe(false);
+  });
+
+  it('a code-review with a subject that is not an attempt is never a pass, keeping the legacy attempt receipt passing', () => {
+    expect(satisfiesReviewPassGate(receipt({ result: 'pass' }))).toBe(true);
+    expect(satisfiesReviewPassGate(receipt({ result: 'pass', subject: briefSubject() }))).toBe(false);
+  });
+});
+
+describe('ReviewReceipt brief-verify invariants', () => {
+  const DIGEST = 'd'.repeat(64);
+  const BASE = 'a'.repeat(40);
+
+  function briefVerifyProps(overrides: Partial<Parameters<typeof ReviewReceipt.create>[0]> = {}) {
+    return {
+      id: 'rr-1',
+      assessmentId: assessmentIdForBrief('proj-1', DIGEST),
+      projectId: 'proj-1',
+      attemptId: attemptIdForBrief('proj-1', DIGEST),
+      candidateHeadSha: BASE,
+      reviewerModel: 'seat-a/reviewer',
+      implementerModel: 'seat-b/implementer',
+      readOnlyVerified: true,
+      result: 'pass' as const,
+      findings: [],
+      evidenceRef: 'ref-1',
+      policyRevision: 'pol-1',
+      completedAtIso: '2026-10-15T12:00:00.000Z',
+      kind: 'brief-verify' as const,
+      subject: {
+        kind: 'brief' as const, projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null,
+        briefPackageDigest: DIGEST, baseCommit: BASE,
+      },
+      ...overrides,
+    };
+  }
+
+  it('accepts a valid brief-verify receipt carrying a brief subject', () => {
+    const created = ReviewReceipt.create(briefVerifyProps());
+    expect(created.success).toBe(true);
+  });
+
+  type BriefVerifyOverrides = Partial<Parameters<typeof ReviewReceipt.create>[0]>;
+  const refusals: readonly [string, BriefVerifyOverrides, string][] = [
+    ['brief-verify without a brief subject', { subject: undefined }, 'requires a brief subject'],
+    ['a brief subject under a wrong kind', { kind: 'code-review' }, 'requires the brief-verify kind'],
+    ['an invalid projectId in the brief subject', { subject: { kind: 'brief', projectId: 'proj/1', attemptId: null, chainName: null, integrationHeadSha: null, briefPackageDigest: 'd'.repeat(64), baseCommit: 'a'.repeat(40) } }, 'invalid projectId'],
+    ['an invalid briefPackageDigest in the brief subject', { subject: { kind: 'brief', projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null, briefPackageDigest: 'd'.repeat(63), baseCommit: 'a'.repeat(40) } }, 'invalid briefPackageDigest'],
+    ['an invalid baseCommit in the brief subject', { subject: { kind: 'brief', projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null, briefPackageDigest: 'd'.repeat(64), baseCommit: 'zzz' } }, 'invalid baseCommit'],
+    ['a projectId that disagrees with the subject', { projectId: 'proj-2' }, 'projectId that disagrees'],
+    ['a candidateHeadSha that disagrees with the subject baseCommit', { candidateHeadSha: 'b'.repeat(40) }, 'candidateHeadSha that disagrees'],
+    ['an attemptId that is not the brief attempt id', { attemptId: 'att-1' }, 'attemptId that is not the brief attempt id'],
+    ['an assessmentId that is not the brief assessment id', { assessmentId: 'asm-1' }, 'assessmentId that is not the brief assessment id'],
+  ];
+  it.each(refusals)('refuses %s with a fixed error, never a throw', (_title, overrides, messagePart) => {
+    const created = ReviewReceipt.create(briefVerifyProps(overrides));
+    expect(created.success).toBe(false);
+    expect(created.error).toBeInstanceOf(Error);
+    expect(created.error?.message).toContain(messagePart);
+  });
+
+  it('a brief-verify attemptId mirrors attemptIdForBrief and its assessment mirrors assessmentIdForBrief', () => {
+    expect(attemptIdForBrief('proj-1', DIGEST)).toBe(`brief:proj-1:${DIGEST}`);
+    expect(assessmentIdForBrief('proj-1', DIGEST)).toBe(`assessment-brief:proj-1:${'d'.repeat(64)}`);
+    expect(assessmentIdForBrief('proj-1', DIGEST)).not.toBe(attemptIdForBrief('proj-1', DIGEST));
+  });
+
+  it('two briefs differing in either input field get different assessment ids', () => {
+    const base = assessmentIdForBrief('proj-1', DIGEST);
+    expect(assessmentIdForBrief('proj-2', DIGEST)).not.toBe(base);
+    expect(assessmentIdForBrief('proj-1', 'e'.repeat(64))).not.toBe(base);
+    expect(assessmentIdForBrief('proj-2', 'e'.repeat(64))).not.toBe(base);
+    expect(assessmentIdForBrief('proj-2', DIGEST)).toBe(`assessment-brief:proj-2:${DIGEST}`);
+    expect(assessmentIdForBrief('proj-1', 'e'.repeat(64))).toBe(`assessment-brief:proj-1:${'e'.repeat(64)}`);
+  });
+
+  it('a brief assessment id never equals the code-review or pre-merge assessment id of an attempt', () => {
+    const briefId = assessmentIdForBrief('proj-1', DIGEST);
+    for (const attemptId of ['att-1', 'proj-1', DIGEST, 'brief', `${DIGEST}`]) {
+      expect(assessmentIdForAttempt(attemptId)).toBe(`assessment-${attemptId}`);
+      expect(briefId).not.toBe(assessmentIdForAttempt(attemptId));
+    }
+    expect(briefId.startsWith('assessment-brief:')).toBe(true);
+  });
+
+  it.each([
+    ['a trailing newline', `${'a'.repeat(40)}\n`],
+    ['a trailing carriage return', `${'a'.repeat(40)}\r`],
+    ['a leading newline', `\n${'a'.repeat(40)}`],
+    ['uppercase hex', 'A'.repeat(40)],
+    ['39 characters', 'a'.repeat(39)],
+    ['41 characters', 'a'.repeat(41)],
+  ])('refuses a brief subject baseCommit with %s', (_title, baseCommit) => {
+    const subject = { ...briefVerifyProps().subject, baseCommit };
+    const created = ReviewReceipt.create(briefVerifyProps({ subject, candidateHeadSha: baseCommit }));
+    expect(created.success).toBe(false);
+    expect(created.error?.message).toContain('invalid baseCommit');
+  });
+
+  it('isValidBriefPackageDigest rejects a 64-hex digest followed by a newline and accepts only the exact 64 lowercase hex characters', () => {
+    expect(isValidBriefPackageDigest(DIGEST)).toBe(true);
+    expect(isValidBriefPackageDigest(`${DIGEST}\n`)).toBe(false);
+    expect(isValidBriefPackageDigest(`\n${DIGEST}`)).toBe(false);
+    expect(isValidBriefPackageDigest(`${DIGEST}\r`)).toBe(false);
+    expect(isValidBriefPackageDigest(DIGEST.slice(0, 63))).toBe(false);
+    expect(isValidBriefPackageDigest(null)).toBe(false);
   });
 });

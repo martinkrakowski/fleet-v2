@@ -29,6 +29,20 @@ export interface ServerProbeResult {
   readonly models?: readonly string[];
 }
 
+/**
+ * What the pinned-build freshness probe found: the installed build's commit,
+ * the base branch tip's commit, and how many commits the pinned build is
+ * behind. Every field is `undefined` when it could not be read; `behindCount`
+ * is meaningful only when both commits are known and differ.
+ */
+export interface PinnedBuildProbeResult {
+  readonly pinnedCommit: string | undefined;
+  readonly baseTipCommit: string | undefined;
+  readonly behindCount: number | undefined;
+  /** The install root's directory basename only, never a full path. */
+  readonly installRootName?: string;
+}
+
 /** Every side effect the doctor performs, injected by the caller. */
 export interface DoctorProbes {
   /** Whether the named host is reachable (an ssh alias or `local`). */
@@ -78,4 +92,10 @@ export interface DoctorProbes {
   serverProbe(host: string, port: number): Promise<ServerProbeResult>;
   /** The one-step probe of a seat: model, variant, agent. */
   seatProbe(seat: SeatModel): Promise<SeatProbeResult>;
+  /**
+   * The pinned-build freshness observation: the installed build's commit
+   * against the base branch tip. Optional so existing `DoctorProbes`
+   * fakes stay compatible; a missing probe reports `UNKNOWN`.
+   */
+  pinnedBuild?(): Promise<PinnedBuildProbeResult | undefined>;
 }

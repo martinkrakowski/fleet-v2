@@ -94,6 +94,7 @@ const fullV2File = {
         verifier: 'verify-override.example',
       },
       roles: ['lane-runner', 'verifier'],
+      ciRunnerSlots: [{ name: 'primary', unit: 'fleet-ci@0.service' }],
       runner: {
         kind: 'opencode',
         port: 46010,

@@ -66,6 +66,7 @@ export * from "./MergeQueueRepositoryPort.out-port.js";
 export * from "./MergeRecordRepositoryPort.out-port.js";
 export * from "./MergeVerificationPort.out-port.js";
 export * from "./MergeVetoPort.out-port.js";
+export * from "./MergeVetoStatePort.out-port.js";
 export * from "./OwnerDecisionPort.out-port.js";
 export * from "./OwnerItemsWritePort.out-port.js";
 export * from "./PatchIdentityPort.out-port.js";

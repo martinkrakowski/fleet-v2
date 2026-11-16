@@ -906,7 +906,7 @@ describe('runHostProbes', () => {
       ['/srv/a\u001bb', CONTROL],
       ['/srv/r\0oot', CONTROL],
       ['/srv/a\u2028b', CONTROL],
-      ['/srv/a‮b', CONTROL],
+      ['/srv/a\u202eb', CONTROL],
     ];
     for (const [root, detail] of cases) {
       for (const base of [localSpec, sshSpec]) {

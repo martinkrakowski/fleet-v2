@@ -327,6 +327,34 @@ describe('GhReviewThreadHelperAdapter', () => {
     });
   });
 
+  it('a thread id repeated across pages is unreadable even when the length matches totalCount', async () => {
+    // Two pages each return thread A while totalCount is 2: the naive
+    // threads.length === totalCount check would pass and drop thread B.
+    const duplicated = scripted(
+      listAnswer([thread('PRRT_A')], { total: 2, hasNextPage: true, endCursor: 'cursor-1' }),
+      listAnswer([thread('PRRT_A')], { total: 2, hasNextPage: false }),
+    );
+    expect(await adapterFor(duplicated.runGh).listReviewThreads(listRequest())).toEqual({
+      outcome: 'unavailable',
+      reason: 'unreadable',
+    });
+    // The same id twice on a single page is equally a repetition.
+    const samePage = scripted(
+      listAnswer([thread('PRRT_A'), thread('PRRT_A')], { total: 2, hasNextPage: false }),
+    );
+    expect(await adapterFor(samePage.runGh).listReviewThreads(listRequest())).toEqual({
+      outcome: 'unavailable',
+      reason: 'unreadable',
+    });
+    // Distinct ids across pages remain a complete list.
+    const distinct = scripted(
+      listAnswer([thread('PRRT_A')], { total: 2, hasNextPage: true, endCursor: 'cursor-1' }),
+      listAnswer([thread('PRRT_B')], { total: 2, hasNextPage: false }),
+    );
+    const result = await adapterFor(distinct.runGh).listReviewThreads(listRequest());
+    expect(result.outcome).toBe('ok');
+  });
+
   it('refuses thread-not-found before any mutation', async () => {
     for (const node of [null, { __typename: 'Issue' }]) {
       const { calls, runGh } = scripted(checkAnswer(node), REPLY_ANSWER);
@@ -371,6 +399,41 @@ describe('GhReviewThreadHelperAdapter', () => {
       code: 'thread-not-on-pull-request',
     });
     expect(resolveCalls.calls).toHaveLength(1);
+  });
+
+  it('an ownership check naming another thread id is thread-not-found before any mutation', async () => {
+    // The check query returns a well-formed PullRequestReviewThread whose
+    // pull request matches the request, but its node id is not the requested
+    // thread: the response must not pass the ownership check.
+    const impostor = {
+      __typename: 'PullRequestReviewThread',
+      id: 'PRRT_OTHER',
+      pullRequest: { number: 42, repository: { name: 'v2', owner: { login: 'fleet' } } },
+    };
+    const replyCalls = scripted(checkAnswer(impostor), REPLY_ANSWER);
+    expect(await adapterFor(replyCalls.runGh).replyToReviewThread(replyRequest())).toEqual({
+      outcome: 'refused',
+      code: 'thread-not-found',
+      reason: 'review thread not found',
+    });
+    expect(replyCalls.calls).toHaveLength(1);
+    expect(JSON.stringify(replyCalls.calls[0]!.args)).not.toContain('addPullRequestReviewThreadReply');
+
+    const resolveCalls = scripted(checkAnswer(impostor), RESOLVE_ANSWER);
+    expect(await adapterFor(resolveCalls.runGh).resolveReviewThread(resolveRequest())).toEqual({
+      outcome: 'refused',
+      code: 'thread-not-found',
+      reason: 'review thread not found',
+    });
+    expect(resolveCalls.calls).toHaveLength(1);
+    expect(JSON.stringify(resolveCalls.calls[0]!.args)).not.toContain('resolveReviewThread(input');
+
+    // The matching id still passes.
+    const honest = scripted(checkAnswer(onThread()), RESOLVE_ANSWER);
+    expect(await adapterFor(honest.runGh).resolveReviewThread(resolveRequest())).toEqual({
+      outcome: 'ok',
+      isResolved: true,
+    });
   });
 
   it('reply makes exactly one call', async () => {

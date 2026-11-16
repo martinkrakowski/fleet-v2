@@ -295,7 +295,7 @@ interface ThreadLocation {
   readonly repo: string;
 }
 
-function parseThreadLocation(stdout: string): ThreadLocation | null | 'absent' {
+function parseThreadLocation(stdout: string, requestedThreadId: string): ThreadLocation | null | 'absent' {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -316,6 +316,11 @@ function parseThreadLocation(stdout: string): ThreadLocation | null | 'absent' {
     return 'absent';
   }
   if (!isRecord(node) || node.__typename !== 'PullRequestReviewThread') {
+    return 'absent';
+  }
+  // The answer must be the requested thread itself: a malformed response that
+  // names another node must never pass the ownership check.
+  if (node.id !== requestedThreadId) {
     return 'absent';
   }
   const pullRequest = node.pullRequest;
@@ -359,6 +364,7 @@ export class GhReviewThreadHelperAdapter implements ReviewThreadHelperPort {
     }
     const threads: ReviewThreadSummary[] = [];
     const seenCursors = new Set<string>();
+    const seenThreadIds = new Set<string>();
     let firstTotal: number | null = null;
     let cursor: string | null = null;
     for (let pageNumber = 1; ; pageNumber += 1) {
@@ -398,6 +404,12 @@ export class GhReviewThreadHelperAdapter implements ReviewThreadHelperPort {
         if (thread === null) {
           return unavailable('unreadable');
         }
+        // A thread id seen twice across pages means the server is repeating
+        // nodes, so the list is not a faithful complete answer.
+        if (seenThreadIds.has(thread.threadId)) {
+          return unavailable('unreadable');
+        }
+        seenThreadIds.add(thread.threadId);
         threads.push(thread);
       }
       if (!page.hasNextPage) {
@@ -512,7 +524,7 @@ export class GhReviewThreadHelperAdapter implements ReviewThreadHelperPort {
     if ('outcome' in gh) {
       return gh;
     }
-    const location = parseThreadLocation(gh.stdout);
+    const location = parseThreadLocation(gh.stdout, threadId);
     if (location === null) {
       return unavailable('unreadable');
     }

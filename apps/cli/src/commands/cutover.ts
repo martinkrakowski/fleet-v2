@@ -73,10 +73,10 @@ function revisionFromFlagValue(value: unknown, pattern: RegExp): number {
   return typeof value === 'string' && pattern.test(value) ? Number(value) : Number.NaN;
 }
 
-function expectedRevisionFlag(p: Payload): number {
+function expectedRevisionFlag(p: Payload, move: 'rollback' | 'retire'): number {
   const revision = revisionFromFlagValue(p['expectedRevision'], /^[1-9]\d{0,9}$/);
   if (!Number.isSafeInteger(revision) || revision < 1) {
-    throw new CliUsageError('cutover rollback requires --expected-revision as a positive integer');
+    throw new CliUsageError(`cutover ${move} requires --expected-revision as a positive integer`);
   }
   return revision;
 }
@@ -114,16 +114,17 @@ async function executeMove(
   runtime: CutoverRuntime,
   move: 'rollback' | 'switch' | 'retire',
   expectedRevision: number,
-  extra: Readonly<Record<string, string>>,
+  extra: () => Readonly<Record<string, string>>,
 ): Promise<unknown> {
   const operationId = operationIdFlag(payload, move);
+  const moveFlags = extra();
   const nowIso = optionalIsoFlag(payload, 'nowIso', 'now-iso') ?? runtime.daemon.now();
   const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
   return runtime.execution.manageCutover.execute({
     move,
     expectedRevision,
     operationId,
-    ...extra,
+    ...moveFlags,
     nowIso,
     ...(deadlineIso === undefined ? {} : { deadlineIso }),
   });
@@ -133,7 +134,7 @@ async function executeMove(
 function revisionMoveHandler(move: 'rollback' | 'retire'): CommandHandler {
   return async (payload, runtime) => {
     rejectUnexpectedInput(payload, move, ['expectedRevision', 'operationId', 'nowIso', 'deadlineIso']);
-    return executeMove(payload, runtime, move, expectedRevisionFlag(payload), {});
+    return executeMove(payload, runtime, move, expectedRevisionFlag(payload, move), () => ({}));
   };
 }
 
@@ -156,9 +157,9 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
       'expectedRevision', 'operationId', 'relaunchPlanDigest', 'nowIso', 'deadlineIso',
     ]);
     const expectedRevision = switchExpectedRevisionFlag(payload);
-    return executeMove(payload, runtime, 'switch', expectedRevision, {
+    return executeMove(payload, runtime, 'switch', expectedRevision, () => ({
       relaunchPlanDigest: relaunchPlanDigestFlag(payload),
-    });
+    }));
   },
 
   retire: revisionMoveHandler('retire'),

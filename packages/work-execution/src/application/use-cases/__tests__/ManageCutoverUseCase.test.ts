@@ -601,31 +601,24 @@ describe('ManageCutoverUseCase switch', () => {
     expectNoSwitchWrites(h);
   });
 
-  it('switch does not credit a train pause that was already paused, and a later rollback lifts nothing', async () => {
+  it('switch credits the train pause to the cutover even when set answers unchanged, and a later rollback lifts it', async () => {
+    // The brief saves `trainPauseSetByCutover: true` for both `changed` and `unchanged`: a pass that
+    // finds the pause already set cannot tell the operator's pause from its own earlier pass.
     const h = await harness({ seed: null });
-    // The pause already exists before the switch, so `set` answers `unchanged`.
     await h.trainPause.set({ paused: true, nowIso: SWITCHED_AT });
     const useCase = useCaseWithReaders(h);
     resetSpies(h);
-    expect(await useCase.execute(switchRequest())).toMatchObject({
-      outcome: 'completed',
-      state: 'switched',
-      revision: 1,
-    });
+    expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', state: 'switched', revision: 1 });
+    expect(h.spies.trainPauseSet).toHaveReturnedWith(expect.any(Promise));
+    expect(await h.spies.trainPauseSet.mock.results[0].value).toMatchObject({ outcome: 'unchanged' });
     expect(await h.repo.read()).toMatchObject({
       status: 'ok',
-      record: { state: 'switched', trainPauseSetByCutover: false },
+      record: { state: 'switched', trainPauseSetByCutover: true },
     });
-
-    // A later rollback leaves the pre-existing pause alone.
     resetSpies(h);
-    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({
-      outcome: 'completed',
-      state: 'rolled-back',
-      revision: 2,
-    });
-    expect(h.spies.trainPauseSet).not.toHaveBeenCalled();
-    expect((await h.trainPause.read()).status).toBe('paused');
+    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({ outcome: 'completed', state: 'rolled-back', revision: 2 });
+    expect(h.spies.trainPauseSet).toHaveBeenCalledWith({ paused: false, nowIso: NOW });
+    expect((await h.trainPause.read()).status).toBe('clear');
   });
 
   it('switch names S4 when that verdict is unknown and the other criteria pass', async () => {
@@ -739,6 +732,9 @@ describe('ManageCutoverUseCase switch', () => {
     expect(await journalEntries(h, 'cutover/switch@0')).toHaveLength(1);
     expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false, revision: 1 });
     expect(await journalEntries(h, 'cutover/switch@0')).toHaveLength(2);
+    // The first pass set the pause (`changed`); the replay saw it already set (`unchanged`). The saved
+    // record must still own it, or a later rollback would leave the cutover's pause in place.
+    expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', trainPauseSetByCutover: true } });
 
     // A refused train-pause set is unknown and the record stays unswitched.
     const refusedSet = await harness({ seed: null });
@@ -798,6 +794,45 @@ describe('ManageCutoverUseCase switch', () => {
     expect(await useCase.execute(switchRequest({ expectedRevision: 1 }))).toEqual({ outcome: 'refused', reason: 'not-shadow' });
     expect(totalWriteCalls(h)).toBe(0);
     expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', revision: 1 } });
+  });
+
+  it('a replayed switch after a crash in the first pass lets a later rollback lift the pause the cutover set', async () => {
+    const h = await harness({ seed: null });
+    const useCase = useCaseWithReaders(h);
+    h.spies.compareAndSet.mockRejectedValueOnce(new Error('disk gone'));
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'cutover-record-write-failed' });
+    expect(await useCase.execute(switchRequest())).toMatchObject({ outcome: 'completed', replayed: false });
+    resetSpies(h);
+    expect(await h.useCase.execute(rollbackRequest())).toMatchObject({ outcome: 'completed', state: 'rolled-back' });
+    expect(h.spies.trainPauseSet).toHaveBeenCalledWith({ paused: false, nowIso: NOW });
+    expect((await h.trainPause.read()).status).toBe('clear');
+  });
+
+  it('a replayed switch after a crash in the first pass lets a later retire lift the pause the cutover set', async () => {
+    const h = await harness({ seed: null });
+    const useCase = useCaseWithReaders(h);
+    h.spies.compareAndSet.mockRejectedValueOnce(new Error('disk gone'));
+    await useCase.execute(switchRequest());
+    await useCase.execute(switchRequest());
+    resetSpies(h);
+    const afterWindow = new Date(Date.parse(NOW) + CUTOVER_ROLLBACK_WINDOW_MS + 86_400_000).toISOString();
+    expect(await h.useCase.execute(retireRequest({ nowIso: afterWindow }))).toMatchObject({ outcome: 'completed', state: 'retired' });
+    expect(h.spies.trainPauseSet).toHaveBeenCalledWith({ paused: false, nowIso: afterWindow });
+    expect((await h.trainPause.read()).status).toBe('clear');
+  });
+
+  it('a switch whose result append failed after the record save is refused revision-conflict on replay, not finished', async () => {
+    const h = await harness({ seed: null });
+    const useCase = useCaseWithReaders(h);
+    const realAppend = Object.getPrototypeOf(h.journal).append as CutoverJournalAdapter['append'];
+    h.spies.journalAppend.mockImplementation(async (entry) =>
+      entry.kind === 'result' ? { outcome: 'refused', reason: 'store-unreadable' } : realAppend.call(h.journal, entry),
+    );
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'unknown', reason: 'journal-append-failed' });
+    expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', revision: 1 } });
+    resetSpies(h);
+    expect(await useCase.execute(switchRequest())).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
+    expect(totalWriteCalls(h)).toBe(0);
   });
 });
 
@@ -965,6 +1000,36 @@ describe('ManageCutoverUseCase retire', () => {
     });
     expect(totalWriteCalls(h)).toBe(0);
     expect(h.spies.journalAppend).not.toHaveBeenCalled();
+    expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', revision: 1 } });
+  });
+
+  it('a retire whose result append failed after the record save is refused not-switched on replay, not finished', async () => {
+    const h = await harness();
+    const realAppend = Object.getPrototypeOf(h.journal).append as CutoverJournalAdapter['append'];
+    h.spies.journalAppend.mockImplementation(async (entry) =>
+      entry.kind === 'result' ? { outcome: 'refused', reason: 'store-unreadable' } : realAppend.call(h.journal, entry),
+    );
+    expect(await h.useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'unknown',
+      reason: 'journal-append-failed',
+    });
+    expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'retired', revision: 2 } });
+    resetSpies(h);
+    expect(await h.useCase.execute(retireRequest({ nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'refused',
+      reason: 'not-switched',
+    });
+    expect(totalWriteCalls(h)).toBe(0);
+  });
+
+  it('retire with a stale expected revision refuses not-switched and writes nothing', async () => {
+    const h = await harness(); // stored switched record is at revision 1
+    resetSpies(h);
+    expect(await h.useCase.execute(retireRequest({ expectedRevision: 2, nowIso: AFTER_WINDOW_NOW }))).toEqual({
+      outcome: 'refused',
+      reason: 'not-switched',
+    });
+    expect(totalWriteCalls(h)).toBe(0);
     expect(await h.repo.read()).toMatchObject({ status: 'ok', record: { state: 'switched', revision: 1 } });
   });
 });

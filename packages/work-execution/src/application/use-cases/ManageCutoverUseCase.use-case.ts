@@ -5,13 +5,18 @@
  * saves the rolled-back record by compare-and-set; `switch` is the one-way
  * door, refused unless the shadow criteria evidence passes and every
  * precondition holds, then it sets the train pause and saves the switched
- * record; `retire` closes the record after the 14-day rollback window, under
- * the owner's recorded grant, and lifts a pause the cutover itself set.
+ * record; `retire` closes the record once the 14-day rollback window has
+ * passed (it consults no grant: the window is the gate) and lifts a pause the
+ * cutover itself set.
  *
  * A move is keyed `cutover/<move>@<expectedRevision>`: the intent carries a
  * digest of the full request and is checked on replay before any write, every
  * outbound call is deadline-guarded, and a pass cut short at any step is finished
- * by the next pass. An unreadable or unknown-version store is `unknown`, never a
+ * by the next pass, with one exception: a switch or retire that crashed after
+ * its record save but before its result append is not finished on replay. The
+ * saved record no longer meets the move's precondition, so a replayed switch
+ * answers `revision-conflict` and a replayed retire answers `not-switched`.
+ * An unreadable or unknown-version store is `unknown`, never a
  * default. Nothing here echoes a path or a raw input value.
  */
 
@@ -246,6 +251,19 @@ function parseRetire(snapshot: Record<string, unknown>): ParsedRequest {
     return { ok: false, reason: 'invalid-request' };
   }
   return moveRequestFrom(snapshot, 'retire', {});
+}
+
+/** A completed switch or retire result, keys in the order the shipped moves print them. */
+function completedResult(kind: MoveKind, key: string, replayed: boolean, record: CutoverRecord): ManageCutoverResult {
+  return {
+    outcome: 'completed',
+    move: kind.move,
+    key,
+    replayed,
+    state: kind.state,
+    revision: record.revision,
+    record,
+  } as ManageCutoverResult;
 }
 
 type MoveKind = { readonly move: 'switch'; readonly state: 'switched' } | { readonly move: 'retire'; readonly state: 'retired' };
@@ -873,10 +891,10 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     const paused = await this.guarded(deadlineIso, () => this.deps.trainPause.set({ paused: true, nowIso: normalizedNowIso }));
     if (paused.kind === 'deadline') return unknown('deadline-exceeded');
     if (paused.kind === 'threw' || paused.value.outcome === 'refused') return unknown('train-pause-write-failed');
-    // The pause is credited to the cutover only when this move set it; a pause
-    // that was already `paused` (`unchanged`) is someone else's, so a later
-    // rollback or retire must never lift it.
-    const trainPauseSetByCutover = paused.value.outcome === 'changed';
+    // Both `changed` and `unchanged` credit the pause to the cutover, as the
+    // brief requires: a replayed pass (same operation id) sees `unchanged`
+    // for the pause its first pass set, and must not lose ownership of it.
+    const trainPauseSetByCutover = true;
 
     const nextRecord: CutoverRecord = {
       schemaVersion: 1,
@@ -909,7 +927,7 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
 
   /** The completed result of a move this pass performed. */
   private completedMove(kind: MoveKind, key: string, record: CutoverRecord): ManageCutoverResult {
-    return { outcome: 'completed', ...kind, key, replayed: false, revision: record.revision, record };
+    return completedResult(kind, key, false, record);
   }
 
   /** A completed switch returns its recorded outcome with no write; a refused one stays refused. */
@@ -950,7 +968,7 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     if (read.state !== kind.state) {
       return refuse('revision-conflict');
     }
-    return { outcome: 'completed', ...kind, key, replayed: true, revision: read.revision, record: read };
+    return completedResult(kind, key, true, read);
   }
 
   private async retireMove(request: ManageCutoverRetireRequest): Promise<ManageCutoverResult> {

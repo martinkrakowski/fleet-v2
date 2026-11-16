@@ -351,18 +351,17 @@ const ALLOWED_DAY_KEYS: ReadonlySet<string> = new Set(['0', '1', '2', 'length'])
 
 /** The `days` array when it is a real, bounded array of exactly the permitted shape, else null. */
 function readBoundedDaysArray(days: unknown): readonly unknown[] | null {
-  // The prototype check rejects a stand-in before any length read.
-  if (!Array.isArray(days) || Object.getPrototypeOf(days) !== Array.prototype) {
+  // `Array.isArray` follows a Proxy without running a trap, and the structured-clone probe refuses
+  // any Proxy exotic object before it reads a key, a length or a descriptor, so a transparent
+  // stand-in for `days` is refused here, before a single trap can fire. A getter inside the array
+  // is also run by this probe, and a clone refusal for any reason refuses the whole document: the
+  // typed result is the same, only a getter that would have named its own criterion no longer does.
+  if (!Array.isArray(days) || !isCloneableData(days)) {
     return null;
   }
-  // The array-length and key-count bounds run BEFORE any serializer probe.
-  // A probe on an unbounded array would traverse it — a sparse array with an
-  // enormous `length` costs a traversal per hole — and would run any getter
-  // it meets on the way, whose DataCloneError a clone refusal cannot tell
-  // apart from a Proxy stand-in. With the bounds settled first, an oversized
-  // array is refused without being cloned, and the descriptor walk never runs
-  // a getter; a Proxy stand-in is refused by the final serializer probe,
-  // which reads only proved primitive data properties.
+  if (Object.getPrototypeOf(days) !== Array.prototype) {
+    return null;
+  }
   const dayKeys = Reflect.ownKeys(days);
   // Key-count guard first: an over-count is refused before any descriptor read.
   if (dayKeys.length !== ALLOWED_DAY_KEYS.size || dayKeys.some((key) => !ALLOWED_DAY_KEYS.has(key as string))) {

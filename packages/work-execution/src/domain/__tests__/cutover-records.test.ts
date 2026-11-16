@@ -209,6 +209,9 @@ describe('readCutoverShadowEvidence', () => {
     return root;
   }
 
+  /** A document with a valid merge count, so the hostile `days` under test is what the validator reaches. */
+  const docWith = (days: unknown): unknown => ({ days, merges: CUTOVER_SHADOW_MIN_MERGES });
+
   const onlyFailed = (...ids: string[]) => ({ ok: false, reason: 'invalid-evidence', failed: ids });
 
   /** Valid evidence with criterion `id` of day `dayIndex` redefined as an own enumerable property. */
@@ -277,17 +280,18 @@ describe('readCutoverShadowEvidence', () => {
     expect(readCutoverShadowEvidence(null, NOW)).toEqual(ALL_FAILED);
     expect(readCutoverShadowEvidence(undefined, NOW)).toEqual(ALL_FAILED);
     expect(readCutoverShadowEvidence('evidence', NOW)).toEqual(ALL_FAILED);
-    expect(readCutoverShadowEvidence({ days: 'nope' }, NOW)).toEqual(ALL_FAILED);
-    expect(readCutoverShadowEvidence({ days: 7 }, NOW)).toEqual(ALL_FAILED);
+    expect(readCutoverShadowEvidence(docWith('nope'), NOW)).toEqual(ALL_FAILED);
+    expect(readCutoverShadowEvidence(docWith(7), NOW)).toEqual(ALL_FAILED);
 
     const holed = [ { day: day(2), verdicts: passVerdicts() } ];
     holed.length = 3; // holes at indices 1 and 2
-    expect(readCutoverShadowEvidence({ days: holed }, NOW)).toEqual(ALL_FAILED);
+    expect(readCutoverShadowEvidence(docWith(holed), NOW)).toEqual(ALL_FAILED);
 
     expect(readCutoverShadowEvidence(withVerdict(1, 'S7', { value: 7 }), NOW)).toEqual(onlyFailed('S7'));
     expect(readCutoverShadowEvidence(withVerdict(0, 'S2', { value: true }), NOW)).toEqual(onlyFailed('S2'));
 
     const throwingRoot: Record<string, unknown> = {};
+    Object.defineProperty(throwingRoot, 'merges', { enumerable: true, value: CUTOVER_SHADOW_MIN_MERGES });
     Object.defineProperty(throwingRoot, 'days', {
       enumerable: true,
       get() {
@@ -295,44 +299,20 @@ describe('readCutoverShadowEvidence', () => {
       },
     });
     expect(readCutoverShadowEvidence(throwingRoot, NOW)).toEqual(ALL_FAILED);
-    expect(
-      readCutoverShadowEvidence(
-        withVerdict(0, 'S9', {
-          get() {
-            throw new Error('boom');
-          },
-        }),
-        NOW,
-      ),
-    ).toEqual(onlyFailed('S9'));
+    // A verdict getter (one that throws, yields an uncloneable value, or throws a DataCloneError
+    // itself) is met by the Proxy probe on `days`, which runs before any key, length or descriptor
+    // read. The probe cannot tell its failure from a stand-in's, so the whole document is refused
+    // with every criterion named; the result is still the typed refusal and never a throw.
+    const getters: Array<[number, string, () => unknown]> = [
+      [0, 'S9', () => { throw new Error('boom'); }],
+      [0, 'S5', () => () => 1],
+      [2, 'S6', () => { throw new DOMException('unread', 'DataCloneError'); }],
+    ];
+    for (const [dayIndex, id, get] of getters) {
+      expect(readCutoverShadowEvidence(withVerdict(dayIndex, id, { get }), NOW)).toEqual(ALL_FAILED);
+    }
 
-    // A verdict getter that yields an uncloneable value, or throws a
-    // DataCloneError itself, must stay unread and name only its own
-    // criterion. A serializer probe that runs before the bounds would meet
-    // these getters and mistake their failure for a stand-in refusal, naming
-    // every criterion instead.
-    expect(
-      readCutoverShadowEvidence(
-        withVerdict(0, 'S5', {
-          get() {
-            return () => 1; // a function cannot be cloned
-          },
-        }),
-        NOW,
-      ),
-    ).toEqual(onlyFailed('S5'));
-    expect(
-      readCutoverShadowEvidence(
-        withVerdict(2, 'S6', {
-          get() {
-            throw new DOMException('unread', 'DataCloneError');
-          },
-        }),
-        NOW,
-      ),
-    ).toEqual(onlyFailed('S6'));
-
-    expect(readCutoverShadowEvidence({ days: new Proxy({}, {}) }, NOW)).toEqual(ALL_FAILED);
+    expect(readCutoverShadowEvidence(docWith(new Proxy({}, {})), NOW)).toEqual(ALL_FAILED);
     expect(
       readCutoverShadowEvidence(
         evidence(NOW, (root) => {
@@ -344,17 +324,20 @@ describe('readCutoverShadowEvidence', () => {
     ).toEqual(ALL_FAILED);
 
     const enormous = { length: 1_000_000_000, '0': { day: day(2), verdicts: passVerdicts() } };
-    expect(readCutoverShadowEvidence({ days: enormous }, NOW)).toEqual(ALL_FAILED);
+    expect(readCutoverShadowEvidence(docWith(enormous), NOW)).toEqual(ALL_FAILED);
     const longArray = [ { day: day(2), verdicts: passVerdicts() }, { day: day(1), verdicts: passVerdicts() }, { day: day(0), verdicts: passVerdicts() }, { day: day(0), verdicts: passVerdicts() } ];
-    expect(readCutoverShadowEvidence({ days: longArray }, NOW)).toEqual(ALL_FAILED);
+    expect(readCutoverShadowEvidence(docWith(longArray), NOW)).toEqual(ALL_FAILED);
 
     const pollutingVerdicts = passVerdicts();
     (pollutingVerdicts as unknown as Record<string, string>)['constructor'] = 'pass';
-    expect(readCutoverShadowEvidence({ days: [ { day: day(2), verdicts: pollutingVerdicts }, { day: day(1), verdicts: passVerdicts() }, { day: day(0), verdicts: passVerdicts() } ] }, NOW)).toEqual(ALL_FAILED);
+    expect(readCutoverShadowEvidence(docWith([ { day: day(2), verdicts: pollutingVerdicts }, { day: day(1), verdicts: passVerdicts() }, { day: day(0), verdicts: passVerdicts() } ]), NOW)).toEqual(ALL_FAILED);
     // A literal own `__proto__` key must be built with defineProperty: an assignment only retargets the prototype.
-    const defined: Record<string, unknown> = { days: evidence(NOW) };
-    Object.defineProperty(defined, '__proto__', { enumerable: true, value: {} });
-    expect(readCutoverShadowEvidence(defined, NOW)).toEqual(ALL_FAILED);
+    const protoVerdicts = passVerdicts();
+    Object.defineProperty(protoVerdicts, '__proto__', { enumerable: true, value: 'pass' });
+    expect(readCutoverShadowEvidence(docWith([ { day: day(2), verdicts: protoVerdicts }, { day: day(1), verdicts: passVerdicts() }, { day: day(0), verdicts: passVerdicts() } ]), NOW)).toEqual(ALL_FAILED);
+    const protoRoot = evidence(NOW) as Record<string, unknown>;
+    Object.defineProperty(protoRoot, '__proto__', { enumerable: true, value: {} });
+    expect(readCutoverShadowEvidence(protoRoot, NOW)).toEqual(ALL_FAILED);
   });
 
   it('refuses a transparent Proxy standing in for days, for a day record, or for the whole document, before any result is built', () => {
@@ -362,30 +345,46 @@ describe('readCutoverShadowEvidence', () => {
     // descriptor read exactly as its target would, so the validator must
     // refuse it before accepting the document.
     const validDays = (evidence(NOW) as { days: object[] }).days;
-    expect(readCutoverShadowEvidence({ days: new Proxy(validDays, {}) }, NOW)).toEqual(ALL_FAILED);
+    expect(readCutoverShadowEvidence(docWith(new Proxy(validDays, {})), NOW)).toEqual(ALL_FAILED);
 
     const dayRecord = validDays[0];
     expect(
-      readCutoverShadowEvidence({ days: [new Proxy(dayRecord, {}), validDays[1], validDays[2]] }, NOW),
+      readCutoverShadowEvidence(docWith([new Proxy(dayRecord, {}), validDays[1], validDays[2]]), NOW),
     ).toEqual(ALL_FAILED);
 
     expect(readCutoverShadowEvidence(new Proxy(evidence(NOW) as object, {}), NOW)).toEqual(ALL_FAILED);
   });
 
-  it('refuses a transparent Proxy standing in for days after a bounded descriptor walk, via the final serializer probe', () => {
-    // The array-length and key-count bounds run before any serializer probe,
-    // so a Proxy stand-in for `days` is inspected by the bounded walk and then
-    // refused by the final serializer probe: still a constant number of
-    // descriptor reads, never a result, and the probe itself reads no getter
-    // because every accessor would already have failed the walk.
+  it('refuses a transparent Proxy standing in for days before any key, length, descriptor or prototype read', () => {
+    // The Proxy forwards every operation to a valid days array, so only a trap call could show that
+    // the validator looked inside it. None may fire: the refusal comes from a probe that rejects a
+    // Proxy outright.
     const validDays = (evidence(NOW) as { days: object[] }).days;
-    const descriptorReads = vi.spyOn(Object, 'getOwnPropertyDescriptor');
-    try {
-      expect(readCutoverShadowEvidence({ days: new Proxy(validDays, {}) }, NOW)).toEqual(ALL_FAILED);
-      expect(descriptorReads.mock.calls.length).toBeLessThanOrEqual(50);
-    } finally {
-      descriptorReads.mockRestore();
-    }
+    const trapCalls: string[] = [];
+    const recording = new Proxy(validDays, {
+      ownKeys(target) {
+        trapCalls.push('ownKeys');
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        trapCalls.push('getOwnPropertyDescriptor');
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+      get(target, key, receiver) {
+        trapCalls.push('get');
+        return Reflect.get(target, key, receiver);
+      },
+      getPrototypeOf(target) {
+        trapCalls.push('getPrototypeOf');
+        return Reflect.getPrototypeOf(target);
+      },
+      has(target, key) {
+        trapCalls.push('has');
+        return Reflect.has(target, key);
+      },
+    });
+    expect(readCutoverShadowEvidence(docWith(recording), NOW)).toEqual(ALL_FAILED);
+    expect(trapCalls).toEqual([]);
   });
 
   it('refuses a document padded with thousands of extra keys after a constant number of descriptor reads', async () => {
@@ -403,7 +402,7 @@ describe('readCutoverShadowEvidence', () => {
   });
 
   it('never echoes input values in its result', () => {
-    const text = JSON.stringify(readCutoverShadowEvidence({ days: 'sentinel-days' }, NOW));
+    const text = JSON.stringify(readCutoverShadowEvidence({ days: 'sentinel-days', merges: CUTOVER_SHADOW_MIN_MERGES }, NOW));
     expect(text).not.toContain('sentinel-days');
   });
 });

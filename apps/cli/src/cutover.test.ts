@@ -256,4 +256,31 @@ describe('fleet-v2 cutover status and rollback', () => {
     expect(JSON.parse(readFileSync(join(stateDir, 'cutover.json'), 'utf8'))).toMatchObject({ state: 'retired', retiredAtIso: '2026-11-20T12:00:00.000Z' });
     expect(result.out).not.toContain(stateDir);
   });
+
+  it('cutover retire names retire, not rollback, in its expected-revision usage error', async () => {
+    const runtime = runtimeFor();
+    const retire = await run(runtime, ['cutover', 'retire', '--expected-revision', '0', '--operation-id', 'op-1']);
+    expect(retire.code).toBe(2);
+    expect(retire.err).toContain('cutover retire requires --expected-revision');
+    expect(retire.err).not.toContain('cutover rollback');
+    const rollback = await run(runtime, ['cutover', 'rollback', '--expected-revision', '0', '--operation-id', 'op-1']);
+    expect(rollback.err).toContain('cutover rollback requires --expected-revision');
+  });
+
+  it('cutover switch validates the operation id before the digest, as the first release did', async () => {
+    const runtime = runtimeFor();
+    const result = await run(runtime, ['cutover', 'switch', '--expected-revision', '0']);
+    expect(result.code).toBe(2);
+    expect(result.err).toContain('cutover switch requires --operation-id');
+    expect(result.err).not.toContain('--relaunch-plan-digest');
+  });
+
+  it('a completed retire prints its keys in the first release order', async () => {
+    const runtime = runtimeFor();
+    await seedSwitched(runtime, true);
+    const result = await run(runtime, [
+      'cutover', 'retire', '--expected-revision', '1', '--operation-id', 'op-1', '--now-iso', '2026-11-20T12:00:00.000Z',
+    ]);
+    expect(Object.keys(result.json ?? {})).toEqual(['outcome', 'move', 'key', 'replayed', 'state', 'revision', 'record']);
+  });
 });

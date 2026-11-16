@@ -183,7 +183,7 @@ else
   bad "a binary file is skipped (rc $rc: $stdout $stderr)"
 fi
 
-# --- an oversized file (> 1 MiB) is skipped.
+# --- an oversized file (> 1 MiB) is scanned, never skipped.
 R=$T/oversized
 new_repo "$R"
 printf 'supersecrettoken\n' >"$T/big.list"
@@ -193,11 +193,13 @@ printf 'supersecrettoken\n' >"$T/big.list"
 } >"$R/src/big.txt"
 track "$R" leak
 check --root "$R" --list "$T/big.list"
-if [ $rc -eq 0 ] && [ "$stdout" = 'check-public-safety: ok, 1 files, 1 entries' ]; then
-  ok 'an oversized file is skipped'
+if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/big.txt:1 entry #1' ]; then
+  ok 'an oversized file is scanned'
 else
-  bad "an oversized file is skipped (rc $rc: $stdout $stderr)"
+  bad "an oversized file is scanned (rc $rc: $stdout $stderr)"
 fi
+no_leak "$stdout" 'supersecrettoken'
+clean_stderr "$stderr"
 
 # --- a tracked list file inside the repository never scans itself.
 R=$T/selfscan
@@ -333,21 +335,71 @@ case $stderr in
 esac
 clean_stderr "$stderr"
 
-# --- an unreadable tracked file (broken symlink) is refused naming the path.
-R=$T/broken
+# --- a tracked symlink is scanned by its own text and never followed.
+R=$T/link
 new_repo "$R"
-printf 'supersecrettoken\n' >"$T/broken.list"
-ln -s nowhere "$R/src/dangling"
-track "$R" dangling
-check --root "$R" --list "$T/broken.list"
-if [ $rc -eq 2 ] &&
-  case $stderr in *'src/dangling'*) true ;; *) false ;; esac &&
-  [ -z "$stdout" ]; then
-  ok 'an unreadable tracked file is refused naming the relative path'
+printf 'supersecrettoken\n' >"$T/link.list"
+printf 'supersecrettoken\n' >"$T/outside.txt"
+ln -s "$T/outside.txt" "$R/src/link"
+track "$R" link
+check --root "$R" --list "$T/link.list"
+if [ $rc -eq 0 ] && [ "$stdout" = 'check-public-safety: ok, 2 files, 1 entries' ]; then
+  ok 'a tracked symlink is not followed outside the tree'
 else
-  bad "an unreadable tracked file is refused naming the relative path (rc $rc: $stdout $stderr)"
+  bad "a tracked symlink is not followed outside the tree (rc $rc: $stdout $stderr)"
 fi
 clean_stderr "$stderr"
+
+# --- a symlink whose tracked link-target text matches is reported.
+R=$T/linktext
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/linktext.list"
+ln -s ../../outside/forbidden-supersecrettoken "$R/src/link"
+track "$R" linktext
+check --root "$R" --list "$T/linktext.list"
+if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/link:1 entry #1' ]; then
+  ok 'a symlink matching by its link-target text is reported'
+else
+  bad "a symlink matching by its link-target text is reported (rc $rc: $stdout $stderr)"
+fi
+no_leak "$stdout" 'supersecrettoken'
+clean_stderr "$stderr"
+
+# --- a dangling tracked symlink is scanned as its link text and passes.
+R=$T/dangling
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/dangling.list"
+ln -s nowhere "$R/src/dangling"
+track "$R" dangling
+check --root "$R" --list "$T/dangling.list"
+if [ $rc -eq 0 ] && [ "$stdout" = 'check-public-safety: ok, 2 files, 1 entries' ]; then
+  ok 'a dangling tracked symlink is scanned as its link text'
+else
+  bad "a dangling tracked symlink is scanned as its link text (rc $rc: $stdout $stderr)"
+fi
+clean_stderr "$stderr"
+
+# --- an unreadable tracked file is refused naming the path.
+R=$T/noaccess
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/noaccess.list"
+printf 'x\n' >"$R/src/locked.txt"
+track "$R" locked
+if [ "$(id -u)" = 0 ]; then
+  ok 'an unreadable tracked file is refused (skipped: running as root)'
+else
+  chmod 000 "$R/src/locked.txt"
+  check --root "$R" --list "$T/noaccess.list"
+  chmod 600 "$R/src/locked.txt"
+  if [ $rc -eq 2 ] &&
+    case $stderr in *'src/locked.txt'*) true ;; *) false ;; esac &&
+    [ -z "$stdout" ]; then
+    ok 'an unreadable tracked file is refused naming the relative path'
+  else
+    bad "an unreadable tracked file is refused naming the relative path (rc $rc: $stdout $stderr)"
+  fi
+  clean_stderr "$stderr"
+fi
 
 [ "$fails" -eq 0 ] && echo 'check-public-safety: all tests passed' || echo "check-public-safety: $fails failure(s)"
 [ "$fails" -eq 0 ]

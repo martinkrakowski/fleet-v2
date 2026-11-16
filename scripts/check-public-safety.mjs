@@ -14,10 +14,17 @@
 // its pattern, or the matched line text. List parse errors name the entry
 // number, never the pattern.
 //
-// Every tracked file under 1 MiB whose first 8 KiB contain no NUL byte is
-// scanned; oversized and binary files are skipped, and the list file itself
-// is skipped whenever it lives inside the scanned tree, so it never flags
-// itself. Untracked files are never read.
+// Every tracked file is scanned no matter how large, so no tracked text file
+// is a blind spot; only files whose first 8 KiB contain a NUL byte (binary)
+// are skipped. A tracked symlink is scanned by its own tracked text — the
+// link target path — and the link is never followed, so nothing outside the
+// scanned tree is read and a target's contents never stand in for the link's.
+// The list file itself is skipped whenever it lives inside the scanned tree,
+// so it never flags itself. Untracked files are never read.
+//
+// The gate runs this check on every push and pull request with --require-list
+// against the owner's FLEET_PUBLIC_SAFETY_LIST secret, so a gate without a
+// configured list fails instead of passing without checking anything.
 //
 // Usage:
 //   node scripts/check-public-safety.mjs [--root <dir>] [--list <file>] [--require-list]
@@ -29,15 +36,113 @@
 // unreadable list file, invalid list entry, failed git command, unreadable
 // tracked file, internal error).
 import { execFileSync } from "node:child_process";
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const NAME = "check-public-safety";
-const MAX_BYTES = 1048576; // 1 MiB: files this size or larger are skipped.
+const CHUNK = 1 << 16; // Streaming read size; no tracked file is skipped for size.
 const BINARY_WINDOW = 8192; // 8 KiB: a NUL byte within this prefix marks a binary file.
 // Bytewise order, the same on every host and locale.
 const byCodeUnit = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+const cannotRead = (name) => {
+  console.error(`${NAME}: cannot read tracked file ${name}`);
+  process.exit(2);
+};
+
+// One list entry against one decoded line; a hit names the file, the 1-based
+// line and the 1-based entry — never the entry text or the matched text.
+function matchLine(name, lineNo, line, entries, findings) {
+  const folded = line.toLowerCase();
+  for (const entry of entries) {
+    const hit = entry.regex
+      ? entry.regex.test(line)
+      : folded.includes(entry.literal);
+    if (hit) findings.push(`${NAME}: ${name}:${lineNo} entry #${entry.n}`);
+  }
+}
+
+function scanTextBytes(name, bytes, entries, findings) {
+  const lines = bytes.toString("utf8").split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  for (let i = 0; i < lines.length; i += 1) {
+    matchLine(name, i + 1, lines[i].replace(/\r$/, ""), entries, findings);
+  }
+}
+
+// Streams the tracked bytes, so file size is never a blind spot, and never
+// follows a symlink: a tracked symlink's own tracked text is its link target
+// path, and that text is what gets scanned.
+function scanTracked(name, full, entries, findings) {
+  let st;
+  try {
+    st = lstatSync(full);
+  } catch {
+    cannotRead(name);
+  }
+  if (st.isSymbolicLink()) {
+    let target;
+    try {
+      target = readlinkSync(full, "buffer");
+    } catch {
+      cannotRead(name);
+    }
+    scanTextBytes(name, target, entries, findings);
+    return 1;
+  }
+  let fd;
+  try {
+    fd = openSync(full, "r");
+  } catch {
+    cannotRead(name);
+  }
+  try {
+    const chunk = Buffer.alloc(CHUNK);
+    let pending = Buffer.alloc(0); // Bytes of the line still without its newline.
+    let prefix = Buffer.alloc(0); // The first BINARY_WINDOW bytes of the file.
+    let lineNo = 0;
+    const flushLine = (bytes) => {
+      lineNo += 1;
+      let text = bytes.toString("utf8");
+      if (text.endsWith("\r")) text = text.slice(0, -1);
+      matchLine(name, lineNo, text, entries, findings);
+    };
+    for (;;) {
+      const read = readSync(fd, chunk, 0, CHUNK, null);
+      if (read === 0) break;
+      const data = chunk.subarray(0, read);
+      if (prefix.length < BINARY_WINDOW) {
+        const need = Math.min(BINARY_WINDOW - prefix.length, data.length);
+        prefix = Buffer.concat([prefix, data.subarray(0, need)]);
+        // A NUL within the window marks a binary file, skipped entirely.
+        if (prefix.includes(0)) return 0;
+      }
+      const carry = pending.length === 0 ? data : Buffer.concat([pending, data]);
+      let start = 0;
+      for (;;) {
+        const nl = carry.indexOf(10, start);
+        if (nl === -1) break;
+        flushLine(carry.subarray(start, nl));
+        start = nl + 1;
+      }
+      pending = carry.subarray(start);
+    }
+    // A file not ending in a newline still has its last line scanned.
+    if (pending.length > 0) flushLine(pending);
+  } finally {
+    closeSync(fd);
+  }
+  return 1;
+}
 
 const DEFAULT_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -178,27 +283,7 @@ try {
       realFile = null;
     }
     if (realFile !== null && realFile === realList) continue;
-    let bytes;
-    try {
-      if (statSync(full).size > MAX_BYTES) continue;
-      bytes = readFileSync(full);
-    } catch {
-      console.error(`${NAME}: cannot read tracked file ${name}`);
-      process.exit(2);
-    }
-    if (bytes.subarray(0, BINARY_WINDOW).includes(0)) continue;
-    scanned += 1;
-    const lines = bytes.toString("utf8").split("\n");
-    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-    for (let i = 0; i < lines.length; i += 1) {
-      const line = lines[i].replace(/\r$/, "");
-      for (const entry of entries) {
-        const hit = entry.regex
-          ? entry.regex.test(line)
-          : line.toLowerCase().includes(entry.literal);
-        if (hit) findings.push(`${NAME}: ${name}:${i + 1} entry #${entry.n}`);
-      }
-    }
+    scanned += scanTracked(name, full, entries, findings);
   }
   if (findings.length > 0) {
     for (const line of findings) console.log(line);

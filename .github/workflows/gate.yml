@@ -59,6 +59,21 @@ jobs:
         run: sh scripts/check-model-family-fixtures.sh
       - name: turbo env declarations (every env read is declared or reviewed)
         run: node scripts/check-turbo-env.mjs
+      # OG-18: the public-safety scan runs in every gate. The list is the
+      # owner's FLEET_PUBLIC_SAFETY_LIST secret, kept outside the repository,
+      # and the scan is fail-closed: without a configured list the gate fails
+      # rather than passing without checking anything.
+      - name: public-safety scan (OG-18)
+        env:
+          FLEET_PUBLIC_SAFETY_LIST_TEXT: ${{ secrets.FLEET_PUBLIC_SAFETY_LIST }}
+        run: |
+          if [ -z "$FLEET_PUBLIC_SAFETY_LIST_TEXT" ]; then
+            echo "gate: FLEET_PUBLIC_SAFETY_LIST is not configured; OG-18 refuses a gate that would check nothing" >&2
+            exit 1
+          fi
+          list="$RUNNER_TEMP/public-safety.list"
+          printf '%s' "$FLEET_PUBLIC_SAFETY_LIST_TEXT" >"$list"
+          node scripts/check-public-safety.mjs --list "$list" --require-list
       - name: yarn build
         run: yarn build
       - name: yarn typecheck

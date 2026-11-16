@@ -190,6 +190,18 @@ describe('forge threads', () => {
     expect(out.join('') + err.join('')).not.toContain(file);
   });
 
+  it('a multi-line body keeps every interior newline: only the carriage returns are removed', async () => {
+    const { calls, helper } = recordingStub({ outcome: 'ok', commentId: 'IC_1' });
+    const file = bodyFile('line one\r\nline two\r\n\r\nline three\n');
+    const { io, out, err } = collectIo();
+    const code = await runCli(replyArgv(file), io, stubRuntime(helper));
+    expect(code).toBe(0);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'ok', threadId: 'PRRT_1', commentId: 'IC_1' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ body: 'line one\nline two\n\nline three\n' });
+    expect(out.join('') + err.join('')).not.toContain(file);
+  });
+
   it('resolve makes one port call and prints the thread as resolved', async () => {
     const { calls, helper } = recordingStub({ outcome: 'ok', isResolved: true });
     const { io, out } = collectIo();

@@ -10,6 +10,7 @@ import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js
 import {
   ALLOWED_PART_TYPES,
   BRIEF_CHECK_QUESTION,
+  BRIEF_VERIFY_BASE_UNKNOWN_REASON,
   BRIEF_VERIFY_CHECKLIST,
   BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON,
   buildReviewerEnv,
@@ -2636,11 +2637,19 @@ describe('OcmReviewTransport', () => {
       expect(result.readOnlyVerified).toBe(true);
     });
 
-    it('a brief-verify review needs no diff source', async () => {
-      const { transport } = makeCounted({ baseCommit: undefined, readDiff: undefined });
-      const result = await transport(verifyRequest);
-      expect(result.result).toBe('pass');
-      expect(result.rawOutput).not.toBe('diff-unavailable');
+    it('a brief-verify review with no known base commit is refused before any read or spawn', async () => {
+      const counted = makeCounted({ baseCommit: undefined, readDiff: undefined });
+      await expect(counted.transport(verifyRequest)).rejects.toMatchObject({
+        name: 'ReviewTransportError',
+        code: 'transport-failed',
+        message: BRIEF_VERIFY_BASE_UNKNOWN_REASON,
+      });
+      // The refusal carries no request text.
+      expect(BRIEF_VERIFY_BASE_UNKNOWN_REASON).not.toContain(baseRequest.candidateHeadSha);
+      expect(counted.dirCalls).toBe(0);
+      expect(counted.headCalls).toBe(0);
+      expect(counted.diffCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(0);
     });
 
     it('a brief-verify review whose candidate head is not the brief base commit is refused before any read or spawn', async () => {

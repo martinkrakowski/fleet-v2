@@ -215,7 +215,9 @@ export interface OcmReviewTransportOptions {
   readonly makeNonce?: () => string;
   /**
    * The base commit the candidate diff is read against. When set together
-   * with `readDiff`, a kind review prompt embeds the base..head diff.
+   * with `readDiff`, a kind review prompt embeds the base..head diff. A
+   * `headIsBase` kind (brief-verify) additionally requires it: without a
+   * known base commit that review is refused.
    */
   readonly baseCommit?: string;
   /** Read-only diff read through the review location; paired with `baseCommit`. */
@@ -804,6 +806,15 @@ export const UNSUPPORTED_REVIEW_KIND_REASON = 'unsupported review kind';
 export const BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON =
   'a pre-dispatch brief verification requires the candidate head to be the base commit the brief was written against';
 
+/**
+ * The fixed reason a brief-verify review with no known base commit is refused;
+ * it carries no request text. Without a base commit the head/base comparison
+ * cannot run, so the prompt's claim that the candidate head is the brief's
+ * base cannot be verified and the review can never pass.
+ */
+export const BRIEF_VERIFY_BASE_UNKNOWN_REASON =
+  'a pre-dispatch brief verification requires a known base commit';
+
 /** What one review kind's prompt needs: the brief, the base..head diff, and its instruction text. */
 export interface KindPromptPlan {
   readonly brief: boolean;
@@ -811,7 +822,8 @@ export interface KindPromptPlan {
   /**
    * Whether the kind's review checks the repository at the candidate head, so
    * the head must be the base commit the brief was written against; a
-   * different head is refused before any read or spawn.
+   * different head, or an unknown base commit, is refused before any read or
+   * spawn.
    */
   readonly headIsBase: boolean;
   readonly instructions: string;
@@ -1406,14 +1418,15 @@ export function createOcmReviewTransport(
     // (no change exists yet) requires that head to be the base commit the
     // brief was written against. A different head is refused before any read
     // or spawn, so a review of a head the brief does not describe can never
-    // pass. Without a known base commit there is nothing to compare against.
-    if (
-      kindPlan !== undefined &&
-      kindPlan.headIsBase &&
-      options.baseCommit !== undefined &&
-      request.candidateHeadSha !== options.baseCommit
-    ) {
-      throw new ReviewTransportError(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON, 'transport-failed');
+    // pass. Without a known base commit there is nothing to compare against,
+    // so the review is refused too: an unverifiable claim is never a pass.
+    if (kindPlan !== undefined && kindPlan.headIsBase) {
+      if (options.baseCommit === undefined) {
+        throw new ReviewTransportError(BRIEF_VERIFY_BASE_UNKNOWN_REASON, 'transport-failed');
+      }
+      if (request.candidateHeadSha !== options.baseCommit) {
+        throw new ReviewTransportError(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON, 'transport-failed');
+      }
     }
 
     // 1. Verify reviewer model matches options.model

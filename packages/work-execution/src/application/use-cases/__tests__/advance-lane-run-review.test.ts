@@ -56,11 +56,12 @@ import type { AdvanceStepContext, GatheredLaneRunFacts } from '../advance-lane-r
 import { ReviewRequestAdapter } from '../../../infrastructure/adapters/ReviewRequestAdapter.adapter.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
 import { SECRET_PATTERNS } from '@fleet/shared';
-import type {
-  RequestIndependentReviewRequest,
-  RequestIndependentReviewResult,
-  ReviewReceiptRecord,
-  ReviewUnknownReason,
+import {
+  assessmentIdForAttempt,
+  type RequestIndependentReviewRequest,
+  type RequestIndependentReviewResult,
+  type ReviewReceiptRecord,
+  type ReviewUnknownReason,
 } from '@fleet/evidence-and-acceptance';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -1559,7 +1560,7 @@ describe('review cause codes reach the run journal (RV2)', () => {
   ): ReviewReceiptRecord {
     return {
       id: 'rcpt-' + request.requestId,
-      assessmentId: 'asm-1',
+      assessmentId: assessmentIdForAttempt(request.attemptId),
       projectId: 'project-example-1',
       attemptId: request.attemptId,
       candidateHeadSha: request.candidateHeadSha,

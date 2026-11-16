@@ -17,7 +17,10 @@ import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-po
 import type { ConductorHaltState } from '../../../domain/conductor-halt.js';
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
-import { MERGE_QUEUE_ENTRY_VERSION } from '../../../domain/merge-queue-records.js';
+import {
+  MERGE_QUEUE_ENTRY_VERSION,
+  MERGE_QUEUE_ENTRY_V2_VERSION,
+} from '../../../domain/merge-queue-records.js';
 import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import type { MergeRepoPolicy } from '../../../domain/merge-queue-decider.js';
@@ -204,6 +207,92 @@ const greenForge: ReadForgeMergeResult = {
   contexts: greenContexts(),
   unresolvedThreads: 0,
 };
+
+function makeChainEntry(): MergeQueueEntryRecord {
+  return makeEntry({ version: MERGE_QUEUE_ENTRY_V2_VERSION, baseBranch: 'chain/example' });
+}
+
+describe('RunMergePassUseCase observed base (OG-7)', () => {
+  // A chain entry is never selected by runPass today: orderMergeQueue/findMergeQueueHead
+  // default an omitted base to DEFAULT_BASE_BRANCH (CO3b review fixes, 7748fd4d), and
+  // runPass calls them with no base (OG-7 fix round: runPass is unchanged from
+  // origin/main, by the brief's own rule). observedBaseFact is still correctly wired in
+  // gatherFacts, but it has no effect for a chain entry until a later unit makes runPass
+  // base-partition-aware; that gap is tracked separately and is out of OG-7's scope. The
+  // decider's own chain-base behaviour (base-unobserved, base-mismatch, would-merge,
+  // checks) is pinned directly against decideMergeStep in merge-queue-decider.test.ts
+  // (the observed base gate block, D1-D3), independent of this selection gap.
+  const laneSoloChainCases: ReadonlyArray<[string, ReadForgeMergeResult]> = [
+    ["the entry's own base", { ...greenForge, baseRef: 'chain/example' }],
+    ['no base', greenForge],
+    ['main', { ...greenForge, baseRef: 'main' }],
+    [
+      "the entry's own base with a failed gate",
+      {
+        ...greenForge,
+        baseRef: 'chain/example',
+        contexts: [
+          { name: 'gate', state: 'FAILURE', isGreen: false, creatorLogin: null },
+          { name: 'premerge', state: 'SUCCESS', isGreen: true, creatorLogin: POSTER },
+        ],
+      },
+    ],
+  ];
+
+  it.each(laneSoloChainCases)(
+    'a lone chain entry is excluded from the pass before any forge read, whatever the forge would report as the base (%s)',
+    async (_label, forgeResult) => {
+      const { useCase, deps, request } = makeUseCase([makeChainEntry()], forgeResult);
+
+      const result = await useCase.runMergePass(request);
+
+      expect(result.entries).toHaveLength(0);
+      expect(deps.forgeRead.calls).toBe(0);
+      expect(await journalOf(deps.journal)).toHaveLength(0);
+    },
+  );
+
+  it('a main entry read on chain/example waits base-mismatch and journals nothing', async () => {
+    const { useCase, deps, request } = makeUseCase([makeEntry()], {
+      ...greenForge,
+      baseRef: 'chain/example',
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('base-mismatch');
+    expect(await journalOf(deps.journal)).toHaveLength(0);
+  });
+
+  it('a main entry read on main journals would-merge', async () => {
+    const { useCase, request } = makeUseCase([makeEntry()], {
+      ...greenForge,
+      baseRef: 'main',
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-merge');
+  });
+
+  it.each([42, null, '', 'Main', 'chain/Example'])(
+    'passes a malformed base %s through, and the decider waits facts-inconsistent',
+    async (value) => {
+      const { useCase, deps, request } = makeUseCase([makeEntry()], {
+        ...greenForge,
+        baseRef: value as unknown as string,
+      });
+
+      const result = await useCase.runMergePass(request);
+
+      expect(result.entries[0].decision).toBe('no-action');
+      expect(result.entries[0].reasonCode).toBe('facts-inconsistent');
+      expect(await journalOf(deps.journal)).toHaveLength(0);
+    },
+  );
+});
 
 describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
   it('journals one intent and one dry-run result for a green entry in shadow mode', async () => {

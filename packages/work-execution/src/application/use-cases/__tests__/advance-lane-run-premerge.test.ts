@@ -1072,6 +1072,10 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
       // head would read as a head change after acceptance (G7) and re-enter gating.
       await appendIntent(harness, acceptKeyFor(HEAD_B12, 0), null, NOW);
       await appendResult(harness, acceptKeyFor(HEAD_B12, 0), 'completed', 'accepted', NOW);
+      // makeHarness defaults the receipts assessment to head A (COMMIT); a run
+      // collected at head B must have its assessment name that exact head, or
+      // premergeReceiptIdOf rejects it and the hold refuses the grant instead
+      // of posting pending.
       harness.setReceiptsAnswer({ outcome: 'passed', receiptsId: RECEIPT_ID, assessedHeadSha: HEAD_B });
       harness.setForgeAnswer({ outcome: 'executed', headSha: HEAD_B });
       return harness;

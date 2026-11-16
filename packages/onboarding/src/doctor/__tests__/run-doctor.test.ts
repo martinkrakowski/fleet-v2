@@ -6,9 +6,9 @@ import type {
   SeatModel,
 } from '@fleet/installation';
 
-import type { DoctorProbes, SeatProbeResult } from '../probes.js';
+import type { DoctorProbes, PinnedBuildProbeResult, SeatProbeResult } from '../probes.js';
 import type { DoctorLine } from '../types.js';
-import { doctorExitCode, runDoctor } from '../run-doctor.js';
+import { doctorExitCode, pinnedBuildLines, runDoctor } from '../run-doctor.js';
 import type {
   DoctorableInstallation,
   RunDoctorOptions,
@@ -142,6 +142,15 @@ function fakeProbes(
           'acme/alpha-2',
           'nvidia/acme/beta-2',
         ],
+      };
+    },
+    pinnedBuild: async () => {
+      calls.push('pinnedBuild');
+      return {
+        pinnedCommit: 'a'.repeat(40),
+        baseTipCommit: 'a'.repeat(40),
+        behindCount: 0,
+        installRootName: 'fleet-install',
       };
     },
     ...overrides,
@@ -652,6 +661,9 @@ describe('runDoctor', () => {
       },
       serverProbe: async () => {
         throw new Error('server exploded');
+      },
+      pinnedBuild: async () => {
+        throw new Error('pinned-build exploded');
       },
     };
     const { probes } = fakeProbes(throwing);
@@ -1293,5 +1305,318 @@ describe('runDoctor server probes (P1)', () => {
     expect(calls).toContain('serverProbe:local:4096');
     expect(lines.filter((line) => line.check === 'server-answers')).toHaveLength(1);
     expect(lines.filter((line) => line.check === 'model-listed')).toHaveLength(1);
+  });
+});
+
+describe('pinned-build freshness (DB1)', () => {
+  const SHA_A = 'a'.repeat(40);
+  const SHA_B = 'b'.repeat(40);
+
+  function pinnedProbes(
+    result: PinnedBuildProbeResult | undefined | null,
+    overrides: Record<string, unknown> = {},
+  ): DoctorProbes {
+    const base = fakeProbes();
+    return {
+      ...base.probes,
+      ...(overrides.pinnedBuild !== undefined
+        ? { pinnedBuild: overrides.pinnedBuild }
+        : { pinnedBuild: async () => result }),
+    } as DoctorProbes;
+  }
+
+  function pinnedLine(lines: readonly DoctorLine[]): DoctorLine {
+    const found = lines.find((doctorLine) => doctorLine.check === 'pinned-build');
+    expect(found).toBeDefined();
+    return found!;
+  }
+
+  it('reports PASS when pinned build equals base branch tip', async () => {
+    const lines = await pinnedBuildLines(
+      pinnedProbes({
+        pinnedCommit: SHA_A,
+        baseTipCommit: SHA_A.toUpperCase(),
+        behindCount: 0,
+        installRootName: 'fleet-install',
+      }),
+    );
+    expect(pinnedLine(lines)).toMatchObject({
+      scope: 'installation',
+      subject: 'build',
+      check: 'pinned-build',
+      status: 'PASS',
+    });
+    expect(pinnedLine(lines).detail).toContain('aaaaaaaa');
+    expect(pinnedLine(lines).detail).not.toContain(SHA_A);
+  });
+
+  it('reports FAIL with commit count when pinned build is behind base branch tip', async () => {
+    const lines = await pinnedBuildLines(
+      pinnedProbes({
+        pinnedCommit: SHA_A,
+        baseTipCommit: SHA_B,
+        behindCount: 8,
+        installRootName: 'fleet-install',
+      }),
+    );
+    expect(pinnedLine(lines)).toMatchObject({
+      scope: 'installation',
+      subject: 'build',
+      check: 'pinned-build',
+      status: 'FAIL',
+    });
+    expect(pinnedLine(lines).detail).toContain('8 commits behind');
+  });
+
+  it('reports UNKNOWN when optional pinnedBuild probe is absent', async () => {
+    const base = fakeProbes();
+    const { pinnedBuild: _omitted, ...withoutProbe } = base.probes;
+    void _omitted;
+    const lines = await pinnedBuildLines(withoutProbe as DoctorProbes);
+    expect(pinnedLine(lines)).toMatchObject({
+      status: 'UNKNOWN',
+      detail: 'pinned build probe not available',
+    });
+    const notAFunction = pinnedProbes(undefined, { pinnedBuild: 'nope' });
+    const notFnLines = await pinnedBuildLines(notAFunction);
+    expect(pinnedLine(notFnLines).detail).toBe('pinned build probe not available');
+  });
+
+  it('reports UNKNOWN when pinnedBuild probe throws', async () => {
+    const throwing = pinnedProbes(undefined, {
+      pinnedBuild: () => {
+        throw new Error('boom');
+      },
+    });
+    const lines = await pinnedBuildLines(throwing);
+    expect(pinnedLine(lines)).toMatchObject({
+      status: 'UNKNOWN',
+      detail: 'pinned build probe failed',
+    });
+    // A throwing getter on the returned object is caught the same way.
+    const hostile: DoctorProbes = {
+      ...fakeProbes().probes,
+      get pinnedBuild(): never {
+        throw new Error('getter boom');
+      },
+    } as unknown as DoctorProbes;
+    const getterLines = await pinnedBuildLines(hostile);
+    expect(pinnedLine(getterLines).detail).toBe('pinned build probe failed');
+  });
+
+  it('reports UNKNOWN when pinnedBuild returns null or undefined', async () => {
+    for (const value of [undefined, null]) {
+      const lines = await pinnedBuildLines(pinnedProbes(value as undefined));
+      expect(pinnedLine(lines)).toMatchObject({
+        status: 'UNKNOWN',
+        detail: 'pinned build probe failed',
+      });
+    }
+  });
+
+  it('reports UNKNOWN when pinned commit cannot be read', async () => {
+    for (const pinnedCommit of [undefined, null, '', '   ', 'xyz', 'g'.repeat(40), 7] as unknown[]) {
+      const lines = await pinnedBuildLines(
+        pinnedProbes({ pinnedCommit, baseTipCommit: SHA_B, behindCount: 3 } as never),
+      );
+      expect(pinnedLine(lines)).toMatchObject({
+        status: 'UNKNOWN',
+        detail: 'pinned build commit could not be read',
+      });
+    }
+  });
+
+  it('reports UNKNOWN when base branch tip commit cannot be read', async () => {
+    for (const baseTipCommit of [undefined, null, '', '  \n', 'nothex', 'z'.repeat(40)] as unknown[]) {
+      const lines = await pinnedBuildLines(
+        pinnedProbes({ pinnedCommit: SHA_A, baseTipCommit, behindCount: 3 } as never),
+      );
+      expect(pinnedLine(lines)).toMatchObject({
+        status: 'UNKNOWN',
+        detail: 'base branch tip commit could not be read',
+      });
+    }
+  });
+
+  it('reports UNKNOWN when behindCount is missing or invalid for differing commits', async () => {
+    for (const behindCount of [undefined, null, NaN, -1, 1.5, '3'] as unknown[]) {
+      const lines = await pinnedBuildLines(
+        pinnedProbes({ pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount } as never),
+      );
+      expect(pinnedLine(lines)).toMatchObject({
+        status: 'UNKNOWN',
+        detail: 'commit distance between pinned build and base tip could not be determined',
+      });
+    }
+  });
+
+  it('reports UNKNOWN when commits differ with zero behindCount', async () => {
+    const lines = await pinnedBuildLines(
+      pinnedProbes({ pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: 0 }),
+    );
+    expect(pinnedLine(lines)).toMatchObject({ status: 'UNKNOWN' });
+  });
+
+  it('strips directory prefixes from installRootName and redacts secret-shaped text', async () => {
+    const lines = await pinnedBuildLines(
+      pinnedProbes({
+        pinnedCommit: SHA_A,
+        baseTipCommit: SHA_B,
+        behindCount: 2,
+        installRootName: '/srv/fleet/instances/prod-1\\nested',
+      }),
+    );
+    const doctorLine = pinnedLine(lines);
+    expect(doctorLine.status).toBe('FAIL');
+    expect(doctorLine.detail).toContain('install root nested');
+    expect(doctorLine.detail).not.toContain('/srv');
+    expect(doctorLine.detail).not.toContain('/');
+    expect(doctorLine.detail).not.toContain('\\');
+    // Secret-shaped text in the root name is redacted by the detail boundary.
+    // The `sk-` shape is the same shape the redaction tests elsewhere use;
+    // it exercises redaction without embedding a real vendor token format.
+    const secret = await pinnedBuildLines(
+      pinnedProbes({
+        pinnedCommit: SHA_A,
+        baseTipCommit: SHA_B,
+        behindCount: 2,
+        installRootName: `sk-${'a'.repeat(16)}`,
+      }),
+    );
+    expect(pinnedLine(secret).detail).toContain('[redacted]');
+  });
+
+  it('runs after ghBinaryLines and before seatLines so lines[0] stays schema-version', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'impl', tool: 'opencode', model: 'm', roles: ['implementer'], costClass: 'free' },
+      ],
+    });
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes, { probeSeats: true });
+    expect(lines[0]).toMatchObject({ check: 'schema-version', status: 'PASS' });
+    const ghIndex = lines.findIndex((doctorLine) => doctorLine.scope === 'gh-binary');
+    const pinnedIndex = lines.findIndex((doctorLine) => doctorLine.check === 'pinned-build');
+    const seatIndex = lines.findIndex((doctorLine) => doctorLine.scope === 'seat');
+    expect(ghIndex).toBeGreaterThanOrEqual(0);
+    expect(pinnedIndex).toBeGreaterThan(ghIndex);
+    expect(pinnedIndex).toBeLessThan(seatIndex);
+    expect(calls.indexOf('pinnedBuild')).toBeGreaterThan(calls.indexOf('ghBinary'));
+  });
+
+  describe('hostile probe results', () => {
+    const FIELDS = ['pinnedCommit', 'baseTipCommit', 'behindCount', 'installRootName'] as const;
+
+    function withThrowingField(field: (typeof FIELDS)[number]): PinnedBuildProbeResult {
+      const result = {
+        pinnedCommit: SHA_A,
+        baseTipCommit: SHA_B,
+        behindCount: 2,
+        installRootName: 'fleet-install',
+      };
+      Object.defineProperty(result, field, {
+        get(): never {
+          throw new Error(`${field} getter boom`);
+        },
+        enumerable: true,
+      });
+      return result as PinnedBuildProbeResult;
+    }
+
+    async function sweepWith(result: unknown): Promise<DoctorLine[]> {
+      const { probes } = fakeProbes({ pinnedBuild: async () => result as never });
+      return collect(loadedResult(sampleModel()), probes);
+    }
+
+    async function baselineLines(): Promise<DoctorLine[]> {
+      return collect(loadedResult(sampleModel()), fakeProbes().probes);
+    }
+
+    function expectOnlyPinnedUnknown(
+      lines: readonly DoctorLine[],
+      baseline: readonly DoctorLine[],
+    ): void {
+      expect(pinnedLine(lines).status).toBe('UNKNOWN');
+      const others = (all: readonly DoctorLine[]): DoctorLine[] =>
+        all.filter((doctorLine) => doctorLine.check !== 'pinned-build');
+      expect(others(lines)).toEqual(others(baseline));
+    }
+
+    for (const field of FIELDS) {
+      it(`reports UNKNOWN when ${field} is a throwing getter on the returned result`, async () => {
+        const baseline = await baselineLines();
+        const lines = await sweepWith(withThrowingField(field));
+        expectOnlyPinnedUnknown(lines, baseline);
+        expect(pinnedLine(lines).detail).toBe('pinned build probe result could not be read');
+      });
+    }
+
+    it('reports UNKNOWN for a throwing Proxy result and a throwing then', async () => {
+      const baseline = await baselineLines();
+      const proxy = new Proxy(
+        {},
+        {
+          get(): never {
+            throw new Error('proxy boom');
+          },
+        },
+      );
+      expectOnlyPinnedUnknown(await sweepWith(proxy), baseline);
+      const thenable = {
+        get then(): never {
+          throw new Error('then boom');
+        },
+      };
+      expectOnlyPinnedUnknown(await sweepWith(thenable), baseline);
+    });
+
+    it('reports UNKNOWN for results that are not objects', async () => {
+      const baseline = await baselineLines();
+      for (const value of ['a'.repeat(40), 42, true]) {
+        expectOnlyPinnedUnknown(await sweepWith(value), baseline);
+      }
+    });
+
+    it('reports UNKNOWN for wrong-typed and non-finite fields', async () => {
+      const baseline = await baselineLines();
+      const bad: Record<string, unknown>[] = [
+        { pinnedCommit: {}, baseTipCommit: SHA_B, behindCount: 2 },
+        { pinnedCommit: [SHA_A], baseTipCommit: SHA_B, behindCount: 2 },
+        { pinnedCommit: SHA_A, baseTipCommit: 12345678, behindCount: 2 },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: Infinity },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: -Infinity },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: NaN },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: 1e21 },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: [3] },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: 2, installRootName: 5 },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: 2, installRootName: {} },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: 2, installRootName: null },
+      ];
+      for (const result of bad) {
+        expectOnlyPinnedUnknown(await sweepWith(result), baseline);
+      }
+    });
+
+    it('reports UNKNOWN when strings carry control characters, never printing them', async () => {
+      const baseline = await baselineLines();
+      const controls = ['\u0000', '\u001b[31m', '\u0007', '\u007f', '\u0085', ' ', '‮'];
+      for (const control of controls) {
+        const lines = await sweepWith({
+          pinnedCommit: SHA_A,
+          baseTipCommit: SHA_B,
+          behindCount: 2,
+          installRootName: `ro${control}ot`,
+        });
+        expectOnlyPinnedUnknown(lines, baseline);
+        expect(pinnedLine(lines).detail).not.toContain(control);
+        const commitLines = await sweepWith({
+          pinnedCommit: `${SHA_A.slice(0, 20)}${control}${SHA_A.slice(20)}`,
+          baseTipCommit: SHA_B,
+          behindCount: 2,
+        });
+        expectOnlyPinnedUnknown(commitLines, baseline);
+        expect(pinnedLine(commitLines).detail).not.toContain(control);
+      }
+    });
   });
 });

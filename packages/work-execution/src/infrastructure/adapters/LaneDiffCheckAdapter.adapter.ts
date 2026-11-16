@@ -202,6 +202,12 @@ export interface LaneDiffCheckAdapterOptions {
   readonly secretPatterns?: readonly LaneDiffSecretPattern[];
 }
 
+/** The `checkLaneDiffBaselineOff` request: no caller-supplied base commit. */
+export type LaneDiffBaselineOffRequest = Omit<
+  LaneDiffCheckRequest,
+  "baseCommit"
+>;
+
 export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
   constructor(
     private readonly commandExecutor: CommandExecutorPort,
@@ -217,7 +223,33 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     if (!BASE_COMMIT_PATTERN.test(request.baseCommit)) {
       return { outcome: "error", reason: "invalid-base-commit" };
     }
+    return this.runScan(request, "trusted");
+  }
 
+  /**
+   * The baseline-off variant behind `lane diff-check` without a trusted
+   * `--base` sha: the same change set is collected and scanned, but no
+   * base-line allowance is computed — every `baseLines` stays null, so a
+   * line the base file already had is still reported. The method takes the
+   * request without `baseCommit`: no caller-supplied base text ever becomes
+   * a git argument. Off mode still runs `git status --porcelain=v1 -z
+   * --untracked-files=all`, the cached name-status, and one name-status
+   * diff whose revision argument is the literal `HEAD` — no argv element is
+   * the caller's ref, an empty string, or a synthetic sha. The trusted
+   * `checkLaneDiff` keeps its exact sequence, including the early
+   * `invalid-base-commit` return, the ancestor verification, the diff
+   * against `request.baseCommit` and the base-blob probe.
+   */
+  async checkLaneDiffBaselineOff(
+    request: LaneDiffBaselineOffRequest,
+  ): Promise<LaneDiffCheckResult> {
+    return this.runScan({ ...request, baseCommit: "" }, "off");
+  }
+
+  private async runScan(
+    request: LaneDiffCheckRequest,
+    mode: "trusted" | "off",
+  ): Promise<LaneDiffCheckResult> {
     const git = async (
       argv: readonly string[],
       what: string,
@@ -276,6 +308,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     // checked once per check (the script's TRUSTED_BASE). On any failure the
     // allowance is simply off: every baseLines stays null, never an error.
     let baseTreeId: string | null = null;
+    if (mode === "trusted") {
     const baseType = await git(
       ["cat-file", "-t", request.baseCommit],
       "check the base object's type",
@@ -311,6 +344,9 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         }
       }
     }
+    }
+    // Baseline off: no base tree is computed, so `verifiedBaseBlob` below is
+    // never reached and every `baseLines` stays null.
 
     /**
      * Read object `id` of a text-safe type and re-hash its bytes: 0 only
@@ -417,6 +453,8 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
     // Committed changes since the base are still reviewed: the name status
     // against the base lists every path the base..worktree and base..HEAD
     // deltas touch, including committed deletions and mode-only changes.
+    // Baseline off diffs against the literal `HEAD` instead: no argv element
+    // is the caller's ref, an empty string, or a synthetic sha.
     const nameStatus = await git(
       [
         "diff",
@@ -426,7 +464,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         "-z",
         "--src-prefix=a/",
         "--dst-prefix=b/",
-        request.baseCommit,
+        mode === "trusted" ? request.baseCommit : "HEAD",
       ],
       "list the committed and staged files",
     );
@@ -557,6 +595,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         if (!index.ok) return { outcome: "error", reason: index.reason };
         mergeContentLines(merged, index.stdout);
         if (index.stdout.includes("\u0000")) scannedHasNul = true;
+        if (mode === "trusted") {
         // The base version of the same path, for the base-line allowance:
         // the probe answers 0 (a base blob exists) or 128 (none — a new or
         // untracked-in-base path excuses nothing); any other exit is no
@@ -580,6 +619,7 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
           // at the path is a null (nothing excused for that file), never an
           // error and never a trust of unverified bytes.
           baseRaw = await verifiedBaseBlob(entry.path);
+        }
         }
       }
       addedLines.set(entry.path, flattenContentLines(merged));

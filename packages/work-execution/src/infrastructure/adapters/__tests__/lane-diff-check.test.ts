@@ -1169,5 +1169,44 @@ describe("LaneDiffCheckAdapter", () => {
       expect(used.length).toBeGreaterThan(0);
       rmSync(bin, { recursive: true, force: true });
     });
+
+    it("baseline off still reports a line the base file already had", async () => {
+      // The worktree changes the touched file but keeps the fixture line
+      // exactly as the base commit had it. With no trusted base sha the
+      // allowance is off: baseLines stay null and the line is still
+      // reported.
+      const repo = makeFixtureRepo();
+      writeFileSync(
+        join(repo, "packages/x/src/a.ts"),
+        `export const a = 1;\nconst fixture = "${tok}";\nexport const a = 2;\n`,
+      );
+      const result = await adapter.checkLaneDiffBaselineOff({
+        worktreePath: repo,
+        allowedPathPrefixes: PREFIXES,
+      });
+      if (result.outcome !== "findings")
+        throw new Error(`expected findings, got ${result.outcome}`);
+      expect(result.findings).toEqual([
+        {
+          path: "packages/x/src/a.ts",
+          line: 2,
+          rule: "secret-pattern:github-token",
+        },
+      ]);
+    });
+
+    it("a trusted base sha still excuses a line the base file already had", async () => {
+      const repo = makeFixtureRepo();
+      writeFileSync(
+        join(repo, "packages/x/src/a.ts"),
+        `export const a = 1;\nconst fixture = "${tok}";\nexport const a = 2;\n`,
+      );
+      const result = await adapter.checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: base(repo),
+        allowedPathPrefixes: PREFIXES,
+      });
+      expect(result).toEqual({ outcome: "clean" });
+    });
   });
 });

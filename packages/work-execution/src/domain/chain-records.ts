@@ -15,7 +15,7 @@ import { readRecordSchemaVersion } from './record-schema-version.js';
 
 export const CHAIN_RECORD_SCHEMA_VERSION = 1 as const;
 
-export const CHAIN_RECORD_STATES = ['intent-recorded', 'started', 'refused'] as const;
+export const CHAIN_RECORD_STATES = ['intent-recorded', 'started', 'refused', 'landed'] as const;
 export type ChainRecordState = (typeof CHAIN_RECORD_STATES)[number];
 
 export interface ChainRepositoryRef {
@@ -63,6 +63,19 @@ export interface ChainRecord {
    * or null. A merge never clears it; an outcome of `merged` or `up-to-date` does.
    */
   readonly conflictMark?: typeof CHAIN_REFRESH_CONFLICT_MARK | null;
+  /**
+   * The work branches the landing merged into the chain (lane CO11): present,
+   * possibly empty, only on a `landed` record. Additive: the record stays
+   * version 1, and a record stored without it reads as no recorded links.
+   */
+  readonly linkBranches?: readonly string[];
+  /**
+   * When the sweep handled the landed chain's branches (lane CO11): absent or
+   * null until the sweep has deleted (or found already absent) every branch.
+   * Additive: the record stays version 1, and a record stored without it reads
+   * as not yet swept (`sweptAtIsoOf`).
+   */
+  readonly sweptAtIso?: string;
 }
 
 /** The pin the combined review is bound to: one per chain record, never overwritten by another. */
@@ -268,7 +281,7 @@ const REQUIRED_KEYS: readonly string[] = [
   'repository', 'chainName', 'branchName', 'sourceBranch', 'expectedHeadSha', 'actionKey', 'state',
   'reason', 'createdAtIso', 'revision',
 ];
-const OPTIONAL_KEYS: readonly string[] = ['schemaVersion', 'reviewPin', 'refresh', 'conflictMark'];
+const OPTIONAL_KEYS: readonly string[] = ['schemaVersion', 'reviewPin', 'refresh', 'conflictMark', 'linkBranches', 'sweptAtIso'];
 
 export type ChainRecordReadResult =
   | { readonly ok: true; readonly record: ChainRecord }
@@ -321,6 +334,14 @@ export function readChainRecord(input: unknown): ChainRecordReadResult {
     if (conflictMark === undefined) {
       return MALFORMED;
     }
+    const linkBranches = readLinkBranches(snapshot.linkBranches);
+    if (linkBranches === undefined) {
+      return MALFORMED;
+    }
+    const sweptAtIso = readSweptAtIso(snapshot.sweptAtIso);
+    if (sweptAtIso === undefined) {
+      return MALFORMED;
+    }
     return {
       ok: true,
       record: Object.freeze({
@@ -340,6 +361,10 @@ export function readChainRecord(input: unknown): ChainRecordReadResult {
         // The refresh fields are always emitted: the writer always stores both (lane CO8).
         refresh: refresh === null ? null : refresh,
         conflictMark: conflictMark === null ? null : conflictMark,
+        // Omitted when there are no recorded links or no sweep mark, so a
+        // record stored without them reads exactly as before (lane CO11).
+        ...(linkBranches === null ? {} : { linkBranches }),
+        ...(sweptAtIso === null ? {} : { sweptAtIso }),
       }),
     };
   } catch {
@@ -417,6 +442,52 @@ function readConflictMark(value: unknown): typeof CHAIN_REFRESH_CONFLICT_MARK | 
   return value === CHAIN_REFRESH_CONFLICT_MARK ? CHAIN_REFRESH_CONFLICT_MARK : undefined;
 }
 
+const LINK_BRANCH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const LINK_BRANCH_MAX_LENGTH = 200;
+const LINK_BRANCHES_MAX_COUNT = 64;
+
+/**
+ * A stored link-branch list: null when absent (or stored as null), the frozen
+ * list when every member is a safe single-repo branch name without a secret
+ * shape, undefined when present but malformed. The sweep classifies each
+ * member against its own stricter contract; the record only refuses names no
+ * git ref could carry.
+ */
+function readLinkBranches(value: unknown): readonly string[] | null | undefined {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!Array.isArray(value) || value.length > LINK_BRANCHES_MAX_COUNT) {
+    return undefined;
+  }
+  const names: string[] = [];
+  for (const entry of value) {
+    if (
+      typeof entry !== 'string' ||
+      entry.length === 0 ||
+      entry.length > LINK_BRANCH_MAX_LENGTH ||
+      !LINK_BRANCH_PATTERN.test(entry) ||
+      entry.includes('..') ||
+      entry.endsWith('/') ||
+      entry.endsWith('.') ||
+      entry.endsWith('.lock') ||
+      containsSecretShape(entry)
+    ) {
+      return undefined;
+    }
+    names.push(entry);
+  }
+  return Object.freeze(names);
+}
+
+/** A stored sweep mark: null when absent (or stored as null), the ISO time when well formed, undefined when malformed. */
+function readSweptAtIso(value: unknown): string | null | undefined {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return isZonedIsoDateTime(value) ? (value as string) : undefined;
+}
+
 /** The record's review pin; a record without one (every CO7 record) has none. */
 export function reviewPinOf(record: ChainRecord): ChainReviewPin | null {
   return record.reviewPin ?? null;
@@ -442,6 +513,43 @@ export function chainRefreshOf(record: ChainRecord): ChainRefreshEntry | null {
 /** The record's conflict mark; a record without one (every CO7 record) has none. */
 export function conflictMarkOf(record: ChainRecord): typeof CHAIN_REFRESH_CONFLICT_MARK | null {
   return record.conflictMark ?? null;
+}
+
+/** The record's recorded link branches; a record without any (every pre-CO11 record) has none. */
+export function chainLinkBranchesOf(record: ChainRecord): readonly string[] | null {
+  return record.linkBranches ?? null;
+}
+
+/**
+ * The record with its landing recorded (state `landed`, the merged link
+ * branches recorded) and revision advanced by one. Never throws; never echoes
+ * an input value.
+ */
+export function applyChainLanded(
+  record: ChainRecord,
+  linkBranches: readonly string[],
+): ChainRecord {
+  return Object.freeze({
+    ...record,
+    state: 'landed' as const,
+    reason: null,
+    linkBranches: Object.freeze([...linkBranches]),
+    revision: record.revision + 1,
+  });
+}
+
+/** The record's sweep mark; a record without one has not been swept yet. */
+export function sweptAtIsoOf(record: ChainRecord): string | null {
+  return record.sweptAtIso ?? null;
+}
+
+/** The record with its sweep mark set and revision advanced by one; never throws. */
+export function applyChainSwept(record: ChainRecord, atIso: string): ChainRecord {
+  return Object.freeze({
+    ...record,
+    sweptAtIso: atIso,
+    revision: record.revision + 1,
+  });
 }
 
 /**

@@ -1,7 +1,8 @@
 // @generated outbound contract scaffold — refined for lane DT6a.
 /**
  * MergeForgeActionPort: perform one repo-scoped forge action of the merge
- * pass (merge-pr, update-branch, post-status or create-branch) through a stable action id
+ * pass (merge-pr, update-branch, post-status, create-branch or
+ * merge-main-into-branch, plus delete-branch for the sweep) through a stable action id
  * at the expected head. Unlike ForgeActionPort the request is repo-scoped
  * and carries no attempt coordinates; every method takes a deadlineIso per
  * the daemon budget rule (plan §3.1). A status field is refused on any kind
@@ -44,9 +45,19 @@ export interface MergeForgeMergeMainIntoBranchRequest {
   readonly deadlineIso: string;
 }
 
+/** Delete `chain/<name>` on the forge (lane CO11); carries no pull request, status, source or expected head. */
+export interface MergeForgeDeleteBranchRequest {
+  readonly kind: 'delete-branch';
+  readonly actionId: string;
+  readonly repository: { readonly owner: string; readonly repo: string };
+  readonly branchName: string;
+  readonly deadlineIso: string;
+}
+
 export type MergeForgeActionRequest =
   | MergeForgeCreateBranchRequest
   | MergeForgeMergeMainIntoBranchRequest
+  | MergeForgeDeleteBranchRequest
   | (MergeForgeActionBase & { readonly kind: 'merge-pr' })
   | (MergeForgeActionBase & { readonly kind: 'update-branch' })
   | (MergeForgeActionBase & {

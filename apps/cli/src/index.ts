@@ -71,6 +71,7 @@ import { mergeCommands } from './merge.js';
 import { relaunchCommands } from './relaunch.js';
 import { releaseCommands } from './release.js';
 import { cutoverCommands } from './commands/cutover.js';
+import { laneCommand } from './commands/lane.js';
 import { tuiCommand } from './tui/command.js';
 
 export { resolveRunnerSettings };
@@ -726,6 +727,13 @@ journals nothing and mutates no worktree.
 
 The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
 
+The lane group runs the lane diff check over one worktree (read-only, findings
+carry path, line and rule name only): lane diff-check <worktree>
+--allowed-path-prefixes '<json array>' [--base <value>]
+[--policy-protected-paths '<json array>']. Only a 40-digit lowercase hex base
+sha enables the base-line allowance; any other base value is never a clean
+exit. Run 'fleet-v2 lane diff-check --help'.
+
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
@@ -743,6 +751,7 @@ Commands:
   relaunch inventory [--host <name>]
   release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
+  lane diff-check <worktree> --allowed-path-prefixes '<json array>' [--base <value>]
   tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
@@ -874,6 +883,12 @@ export async function runCli(
         ...daemonOptions,
         stateDir: daemonOptions?.stateDir ?? stateDir,
       });
+    }
+    // The lane group runs the lane diff check directly through its adapter;
+    // it never composes the runtime or loads the installation, so a bad
+    // installation cannot block it and no installation path is printed.
+    if (group === 'lane') {
+      return await laneCommand(restArgv.slice(1), io);
     }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.

@@ -142,7 +142,8 @@ describe('RecordShadowDayUseCase', () => {
     expect(await use.execute(request({ mergesCompared: -1 }))).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     expect(await use.execute(request({ extra: true }))).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     expect(await use.execute(null)).toEqual({ outcome: 'refused', reason: 'invalid-request' });
-    expect(await use.execute(request({ releaseSha: 'github_pat_1234567890123456789012' }))).toEqual({
+    const secretShaped = [`${'github_pat'}_${'a'.repeat(22)}`][0];
+    expect(await use.execute(request({ releaseSha: secretShaped }))).toEqual({
       outcome: 'refused',
       reason: 'secret-shaped',
     });

@@ -7,13 +7,34 @@
  * through unchanged, and `relaunch` without a subcommand is a usage error.
  */
 
-import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { describe, expect, it, afterEach, beforeEach } from 'vitest';
 
 import type { ProjectProfileRecord } from '@fleet/operator-coordination';
 import type { InventoryRelaunchRequest } from '@fleet/work-execution';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
+
+/** Every file under dir (recursive): its name, size and sha256 — the whole on-disk state. */
+async function stateDirSnapshot(dir: string): Promise<string> {
+  const names = await fs.readdir(dir, { recursive: true });
+  const entries = await Promise.all(
+    [...names].sort((left, right) => left.localeCompare(right)).map(async (name) => {
+      const full = path.join(dir, name);
+      const stat = await fs.lstat(full);
+      if (stat.isFile()) {
+        const digest = createHash('sha256').update(await fs.readFile(full)).digest('hex');
+        return `${name} ${stat.size} ${digest}`;
+      }
+      return `${name}/`;
+    }),
+  );
+  return entries.join('\n');
+}
 
 const NOW = '2026-10-31T00:00:00.000Z';
 
@@ -77,7 +98,7 @@ describe('relaunch inventory', () => {
     };
     const runtime = {
       coordination: {
-        listProjectProfiles: {
+        listProjectProfilesReadOnly: {
           listProjectProfiles: async () => ({
             outcome: 'listed',
             profiles: [ACTIVE_PROFILE],
@@ -123,7 +144,7 @@ describe('relaunch inventory', () => {
     let called = false;
     const runtime = {
       coordination: {
-        listProjectProfiles: {
+        listProjectProfilesReadOnly: {
           listProjectProfiles: async () => ({ outcome: 'rejected', reason: 'store unreadable' }),
         },
       },
@@ -142,5 +163,77 @@ describe('relaunch inventory', () => {
     expect(code).toBe(1);
     expect(called).toBe(false);
     expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'records-unreadable' });
+  });
+});
+
+/**
+ * CO29a-ro2 through the real composition (`createFleetCliRuntime`): a corrupt
+ * store file answers unknown or a refusal, and the state dir keeps its exact
+ * names, sizes and sha256 — a read-only command never quarantines and never
+ * writes. All of these fail on the pre-CO29a-ro2 behaviour.
+ */
+describe('relaunch inventory reads that cannot write (CO29a-ro2)', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-relaunch-readonly-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('a corrupt project-profiles.json is refused and never quarantined', async () => {
+    await fs.writeFile(path.join(tempDir, 'project-profiles.json'), '{ not json CANARY-bytes', 'utf8');
+    const before = await stateDirSnapshot(tempDir);
+
+    const { io, out } = collectIo();
+    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    const code = await runCli(['relaunch', 'inventory'], io, runtime);
+
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'records-unreadable' });
+    expect(await stateDirSnapshot(tempDir)).toBe(before);
+  });
+
+  it('a corrupt conductor-halt.json answers unknown and never quarantines', async () => {
+    await fs.writeFile(path.join(tempDir, 'conductor-halt.json'), '{ not json CANARY-bytes', 'utf8');
+    const before = await stateDirSnapshot(tempDir);
+
+    const { io, out } = collectIo();
+    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    const code = await runCli(['relaunch', 'inventory'], io, runtime);
+
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'unknown', reason: 'halt-unreadable' });
+    expect(await stateDirSnapshot(tempDir)).toBe(before);
+  });
+
+  it('a corrupt conductor-driver-lease.json answers unknown and never quarantines', async () => {
+    await fs.writeFile(
+      path.join(tempDir, 'conductor-driver-lease.json'),
+      '{ not json CANARY-bytes',
+      'utf8',
+    );
+    const before = await stateDirSnapshot(tempDir);
+
+    const { io, out } = collectIo();
+    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    const code = await runCli(['relaunch', 'inventory'], io, runtime);
+
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'unknown', reason: 'lease-unreadable' });
+    expect(await stateDirSnapshot(tempDir)).toBe(before);
+  });
+
+  it('absent halt and lease files still inventory normally', async () => {
+    const { io, out } = collectIo();
+    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    const code = await runCli(['relaunch', 'inventory'], io, runtime);
+
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out.join(''));
+    expect(parsed.outcome).toBe('inventoried');
+    expect(parsed.conductor).toEqual({ halted: false, driverLease: 'absent', runCount: 0 });
   });
 });

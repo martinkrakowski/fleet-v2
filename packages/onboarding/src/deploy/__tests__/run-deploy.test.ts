@@ -131,6 +131,43 @@ describe('runCheckedDeploy', () => {
     expect(calls).toEqual(['mergeInProgress:/repo']);
   });
 
+  it('treats an invalid mergeInProgress result as probe-failed, never as no merge', async () => {
+    for (const bad of [null, undefined, 'no'] as unknown[]) {
+      const { probes, calls } = fakeProbes({
+        mergeInProgress: async (repoPath) => {
+          calls.push(`mergeInProgress:${repoPath}`);
+          return bad as never;
+        },
+      });
+      const result = await runCheckedDeploy(sampleRequest(), probes);
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: 'probe-failed',
+        detail: 'probe-failed',
+      });
+      expect(calls).toEqual(['mergeInProgress:/repo']);
+      expect(calls.some((c) => c.startsWith('repoint:'))).toBe(false);
+    }
+  });
+
+  it('treats an invalid currentTarget result as probe-failed and never repoints', async () => {
+    for (const bad of [null, '', '   '] as unknown[]) {
+      const { probes, calls } = fakeProbes({
+        currentTarget: async (link) => {
+          calls.push(`currentTarget:${link}`);
+          return bad as never;
+        },
+      });
+      const result = await runCheckedDeploy(sampleRequest(), probes);
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: 'probe-failed',
+        detail: 'probe-failed',
+      });
+      expect(calls.some((c) => c.startsWith('repoint:'))).toBe(false);
+    }
+  });
+
   it('refuses on commit mismatch without running build or repoint', async () => {
     const { probes, calls } = fakeProbes({
       headCommit: async (repoPath) => {

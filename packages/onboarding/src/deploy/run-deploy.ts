@@ -100,8 +100,14 @@ export async function runCheckedDeploy(
       return refusal('invalid-request', 'invalid-request');
     }
 
-    if (await probes.mergeInProgress(request.repoPath)) {
+    // Only an explicit boolean is a valid merge result: any other value is
+    // a probe failure, never silently "no merge".
+    const mergeBeforeBuild = await probes.mergeInProgress(request.repoPath);
+    if (mergeBeforeBuild === true) {
       return refusal('merge-in-progress', 'merge-in-progress');
+    }
+    if (mergeBeforeBuild !== false) {
+      return refusal('probe-failed', 'probe-failed');
     }
 
     const head = await probes.headCommit(request.repoPath);
@@ -136,11 +142,22 @@ export async function runCheckedDeploy(
       return refusal('probe-failed', 'probe-failed');
     }
 
-    if (await probes.mergeInProgress(request.repoPath)) {
+    // Same explicit-boolean rule for the pre-repoint merge re-check.
+    const mergeBeforeRepoint = await probes.mergeInProgress(request.repoPath);
+    if (mergeBeforeRepoint === true) {
       return refusal('merge-in-progress', 'merge-in-progress before repoint');
     }
+    if (mergeBeforeRepoint !== false) {
+      return refusal('probe-failed', 'probe-failed');
+    }
 
-    previousTarget = await probes.currentTarget(request.installLink);
+    // Only `undefined` (no current target) or a valid non-empty string is
+    // an acceptable previous target; anything else is a probe failure.
+    const target = await probes.currentTarget(request.installLink);
+    if (target !== undefined && !isNonEmptyString(target)) {
+      return refusal('probe-failed', 'probe-failed');
+    }
+    previousTarget = target;
 
     repointAttempted = true;
     await probes.repoint(request.installLink, request.stagingPath);

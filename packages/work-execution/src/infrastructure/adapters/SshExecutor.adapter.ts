@@ -64,6 +64,20 @@ export function sshArgvFor(host: string, argv: readonly string[]): string[] {
   ];
 }
 
+/** A refusal result: nothing was spawned, so there is no exit code, signal or output. */
+function refusal(error: string): CommandRunResult {
+  return { exitCode: null, signal: null, stdout: '', stderr: '', error };
+}
+
+/** The spawn options carried over from the caller's options, omitting unset ones. */
+function spawnOptionsFor(options: CommandRunOptions | undefined): Parameters<typeof runSpawnOutcome>[2] {
+  const picked: Record<string, unknown> = {};
+  for (const key of ['env', 'timeoutMs', 'input', 'maxBufferBytes', 'killProcessTree'] as const) {
+    if (options?.[key] !== undefined) picked[key] = options[key];
+  }
+  return picked as Parameters<typeof runSpawnOutcome>[2];
+}
+
 export class SshExecutor implements CommandExecutorPort {
   constructor(private readonly options: SshExecutorOptions) {}
 
@@ -76,47 +90,24 @@ export class SshExecutor implements CommandExecutorPort {
     const host = this.options.host;
     if (!isSafeSshHost(host)) {
       // Refused before any spawn: an unsafe destination never reaches ssh.
-      return {
-        exitCode: null,
-        signal: null,
-        stdout: '',
-        stderr: '',
-        error: `Refusing to execute on unsafe SSH host: ${host}`,
-      };
+      return refusal(`Refusing to execute on unsafe SSH host: ${host}`);
     }
     if (argv.length === 0) {
-      return {
-        exitCode: null,
-        signal: null,
-        stdout: '',
-        stderr: '',
-        error: 'SshExecutor refuses to run an empty argv',
-      };
+      return refusal('SshExecutor refuses to run an empty argv');
     }
     if (argv.some((arg) => arg.includes('\0'))) {
       // Refused before any spawn, and the argument is never echoed back: a
       // NUL byte cannot travel through a spawned argv.
-      return {
-        exitCode: null,
-        signal: null,
-        stdout: '',
-        stderr: '',
-        error: 'SshExecutor refuses an argument containing a NUL byte',
-      };
+      return refusal('SshExecutor refuses an argument containing a NUL byte');
     }
-    const outcome = await runSpawnOutcome('ssh', sshArgvFor(host, argv), {
-      ...(options?.env !== undefined ? { env: options.env } : {}),
-      ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-      ...(options?.input !== undefined ? { input: options.input } : {}),
-      ...(options?.maxBufferBytes !== undefined ? { maxBufferBytes: options.maxBufferBytes } : {}),
-      ...(options?.killProcessTree !== undefined ? { killProcessTree: options.killProcessTree } : {}),
-    });
+    const outcome = await runSpawnOutcome('ssh', sshArgvFor(host, argv), spawnOptionsFor(options));
+    const { error, ...rest } = outcome;
     return {
-      exitCode: outcome.exitCode,
-      signal: outcome.signal,
-      stdout: outcome.stdout,
-      stderr: outcome.stderr,
-      ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+      exitCode: rest.exitCode,
+      signal: rest.signal,
+      stdout: rest.stdout,
+      stderr: rest.stderr,
+      ...(error !== undefined ? { error } : {}),
     };
   }
 }

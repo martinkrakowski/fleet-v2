@@ -13,8 +13,8 @@
  * Results carry codes only: never a path, the answer or a secret.
  *
  * A single retry session uses the `__retry` stem, is admitted only after the
- * first answer is recorded, and its answer is deleted when the first attempt
- * runs again.
+ * first answer is recorded, and its answer is deleted only once a re-run of
+ * the first attempt has successfully recorded a new first answer.
  */
 
 import { constants as fsConstants, promises as fs } from 'node:fs';
@@ -424,11 +424,6 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     if (!(await claimIntent(request.briefsDir, `${base}.intent.json`, request.sessionKey, claimWindowMs))) {
       return unavailable('session-failed');
     }
-    // A first attempt that runs the seat deletes the recorded retry answer
-    // first, so an old retry answer never survives beside a new first answer.
-    if (!retry && !(await clearRetryAnswer(request.briefsDir, baseStem))) {
-      return unavailable('session-failed');
-    }
     const pinned = await this.checkPinnedCheckout(executor, request);
     if (pinned !== null) return unavailable(pinned);
     if (await isSymbolicLink(promptPath)
@@ -452,9 +447,16 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     if (Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes) {
       return unavailable('session-output-too-large');
     }
-    return (await recordAnswer(answerPath, run.stdout))
-      ? { outcome: 'answered', answer: run.stdout }
-      : unavailable('session-failed');
+    if (!recordAnswer(answerPath, run.stdout)) {
+      return unavailable('session-failed');
+    }
+    // The recorded retry answer is deleted only once the new first answer is
+    // successfully recorded, so a failed first rerun never destroys the saved
+    // retry result.
+    if (!retry && !(await clearRetryAnswer(request.briefsDir, baseStem))) {
+      return unavailable('session-failed');
+    }
+    return { outcome: 'answered', answer: run.stdout };
   }
 
   /** One read-only git call: null when the checkout exists and is at the base commit. */

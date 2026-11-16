@@ -46,6 +46,7 @@ export * from "./PrepareFixAttemptPort.in-port.js";
 export * from "./PreparePullRequestFeedbackFixPort.in-port.js";
 export * from "./ProbeProjectPort.in-port.js";
 export * from "./ReapLaneWorktreesPort.in-port.js";
+export * from "./ReapOrphanReservationsPort.in-port.js";
 export * from "./ReapOrphanSessionsPort.in-port.js";
 export * from "./ReapZombiesPort.in-port.js";
 export * from "./ReconcileAttemptPort.in-port.js";

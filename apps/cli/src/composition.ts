@@ -69,6 +69,8 @@ import {
   MergeRecordRepositoryAdapter,
   ForgeReadAdapter,
   GhForgeMergeReadAdapter,
+  GhReviewThreadHelperAdapter,
+  type ReviewThreadHelperPort,
   InspectAttemptUseCase,
   InspectMergeReadinessUseCase,
   InspectWorkOrderUseCase,
@@ -855,6 +857,8 @@ export interface FleetCliRuntime {
     readonly manageCutover: ManageCutoverUseCase;
     /** CO24comp: PR-feedback fix round preparation and grant-scoped push-to-pr. */
     readonly preparePullRequestFeedbackFix: PreparePullRequestFeedbackFixUseCase;
+    /** OG-8b: the operator-only review thread helper; bound in forge mode github only, never given to the daemon. */
+    readonly reviewThreadHelper: ReviewThreadHelperPort;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -1298,6 +1302,20 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     nowIso: () => new Date().toISOString(),
   });
 
+  // OG-8b: the operator-only review thread helper. Bound only when forge mode
+  // is github; the daemon and the conductor receive no reference to it.
+  const reviewThreadHelper: ReviewThreadHelperPort =
+    forgeMode === 'github'
+      ? new GhReviewThreadHelperAdapter({
+          runGh: (args, timeoutMs) =>
+            (
+              options?.forgeGhRunner ??
+              ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
+                runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
+            )(args, timeoutMs),
+        })
+      : new GhReviewThreadHelperAdapter();
+
   // CO24comp: the PR-feedback fix round reads findings through the same
   // reviewed gh subprocess as the other forge reads, and only when the
   // installation binds github; otherwise the adapter stays unconfigured and
@@ -1394,6 +1412,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       killallTrainPause,
       manageCutover,
       preparePullRequestFeedbackFix,
+      reviewThreadHelper,
       exportLegacyTrainState: new ExportLegacyTrainStateUseCase({
         listMergeQueue: execution.listMergeQueue,
         nowIso: () => new Date().toISOString(),

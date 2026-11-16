@@ -63,6 +63,7 @@ function makePage(overrides: PageOverrides = {}): string {
           state: overrides.state ?? 'OPEN',
           headRefOid: overrides.headRefOid ?? VALID_SHA,
           mergeStateStatus: 'mergeStateStatus' in overrides ? overrides.mergeStateStatus : 'CLEAN',
+          baseRefName: 'main',
           statusCheckRollup: {
             contexts: {
               pageInfo: { hasNextPage: false, endCursor: null },

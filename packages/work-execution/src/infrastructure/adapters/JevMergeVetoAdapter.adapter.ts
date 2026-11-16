@@ -27,6 +27,15 @@
  * `transport`; abort → `timeout`; response bodies over 64 KiB or unparsable
  * JSON → `shape`. Authorization, request bodies and response bodies never
  * appear in thrown errors or returned values.
+ *
+ * An incomplete state (any of the five unread fields is `null` or malformed)
+ * is still sent with the word `unknown` in place of the unread field and an
+ * `unknownFields` list naming it, so a `hold-for-human` observation on the
+ * known fields can still be recorded; the call is paid and settled normally.
+ * However, `merge-safe` is never returned for an incomplete state: it settles
+ * with `unknownReason: 'incomplete-state'` and returns
+ * `{ status: 'unknown', reason: 'incomplete-state' }` in both `shadow` and
+ * `live` modes.
  */
 
 import { createHash } from 'node:crypto';
@@ -173,6 +182,24 @@ function capUtf8(text: string, capBytes: number): string {
   return new TextDecoder().decode(bytes.subarray(0, end));
 }
 
+/** Sent in place of a state field that was not read. Never '0', never ''. */
+const UNKNOWN_STATE_VALUE = 'unknown';
+
+/** A known count is a safe non-negative integer; anything else is unknown. */
+function declaredCount(value: unknown): string | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+}
+
+/** A known text is a non-empty string; anything else is unknown. */
+function declaredText(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? capUtf8(value, 1024) : null;
+}
+
+/** A known list is an array of strings (an empty array is a known "none"); anything else is unknown. */
+function declaredList(value: unknown): readonly string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string') ? [...value] : null;
+}
+
 /** Receipt contextRef: the head binding lives here, never in the state. */
 function vetoContextRef(request: MergeVetoRequest): string {
   return `merge-veto:${request.repository.owner}/${request.repository.repo}#${request.pullRequestNumber}@${request.verifiedHeadOid.slice(0, 12)}`;
@@ -196,6 +223,21 @@ function isDeadlineExceeded(deadlineMs: number, nowMs: number): boolean {
 
 function isValidMergeChoice(choice: unknown): choice is 'merge-safe' | 'hold-for-human' {
   return choice === 'merge-safe' || choice === 'hold-for-human';
+}
+
+type CheckedChoice =
+  | { readonly ok: true; readonly choice: 'merge-safe' | 'hold-for-human' }
+  | { readonly ok: false; readonly reason: 'shape' | 'incomplete-state' };
+
+/** Unknown never yields merge-safe: an incomplete state can only hold or stay unknown. */
+function checkChoice(choice: unknown, incomplete: boolean): CheckedChoice {
+  if (!isValidMergeChoice(choice)) {
+    return { ok: false, reason: 'shape' };
+  }
+  if (incomplete && choice === 'merge-safe') {
+    return { ok: false, reason: 'incomplete-state' };
+  }
+  return { ok: true, choice };
 }
 
 function extractRequestId(rawId: string): string | undefined {
@@ -385,12 +427,13 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
         );
       }
 
-      if (!isValidMergeChoice(validated.choice)) {
+      const checked = checkChoice(validated.choice, state.incomplete);
+      if (!checked.ok) {
         return await this.finishValidationFailureAfterReserve(
           reservationId,
           contextRef,
           servedModel,
-          'shape',
+          checked.reason,
           latencyMs,
           reportedCost,
           requestId,
@@ -401,7 +444,7 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
         reservationId,
         contextRef,
         servedModel,
-        validated.choice,
+        checked.choice,
         validated.confidence,
         request.mode,
         latencyMs,
@@ -421,9 +464,17 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
   private buildState(
     request: MergeVetoRequest,
   ):
-    | { ok: true; stateJson: string; stateSha256: string }
+    | { ok: true; stateJson: string; stateSha256: string; incomplete: boolean }
     | { ok: false } {
     const fields = request.state;
+    const known: Readonly<Record<string, string | readonly string[] | null>> = {
+      hardToUndo: declaredText(fields.hardToUndo),
+      fixRounds: declaredCount(fields.fixRounds),
+      reviewerFamilies: declaredList(fields.reviewerFamilies),
+      replyResolvedThreads: declaredCount(fields.replyResolvedThreads),
+      majorBlockerFindings: declaredCount(fields.majorBlockerFindings),
+    };
+    const unknownFields = Object.keys(known).filter((name) => known[name] === null);
     const built = buildDecisionState(
       {
         tier: fields.tier,
@@ -431,12 +482,13 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
         changedPaths: fields.changedPaths,
         additions: String(fields.additions),
         deletions: String(fields.deletions),
-        hardToUndo: capUtf8(fields.hardToUndo, 1024),
-        fixRounds: String(fields.fixRounds),
-        reviewerFamilies: fields.reviewerFamilies,
-        replyResolvedThreads: String(fields.replyResolvedThreads),
-        majorBlockerFindings: String(fields.majorBlockerFindings),
+        hardToUndo: known.hardToUndo ?? UNKNOWN_STATE_VALUE,
+        fixRounds: known.fixRounds ?? UNKNOWN_STATE_VALUE,
+        reviewerFamilies: known.reviewerFamilies ?? UNKNOWN_STATE_VALUE,
+        replyResolvedThreads: known.replyResolvedThreads ?? UNKNOWN_STATE_VALUE,
+        majorBlockerFindings: known.majorBlockerFindings ?? UNKNOWN_STATE_VALUE,
         headChangedAfterReview: fields.headChangedAfterReview ? 'true' : 'false',
+        ...(unknownFields.length > 0 ? { unknownFields } : {}),
       },
       { perFieldBytes: 8192, totalBytes: 32768 },
       this.hash,
@@ -444,7 +496,12 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     if (!built.ok) {
       return { ok: false };
     }
-    return { ok: true, stateJson: built.stateJson, stateSha256: built.stateSha256 };
+    return {
+      ok: true,
+      stateJson: built.stateJson,
+      stateSha256: built.stateSha256,
+      incomplete: unknownFields.length > 0,
+    };
   }
 
   /** Atomic budget check + durable append; a throwing journal is not usable. */

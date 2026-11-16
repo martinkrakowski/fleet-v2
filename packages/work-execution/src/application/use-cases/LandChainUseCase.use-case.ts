@@ -33,7 +33,7 @@ import type { AttemptRecord } from '../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
 import { MERGE_QUEUE_TERMINAL_STATES } from '../../domain/merge-queue-records.js';
 import type { MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
-import type { LandChainPort, LandChainRefusal, LandChainResult, LandChainUnknown } from '../ports/in/LandChainPort.in-port.js';
+import type { LandChainHaltProgress, LandChainPort, LandChainRefusal, LandChainResult, LandChainUnknown } from '../ports/in/LandChainPort.in-port.js';
 import type { AcceptanceReceiptReadPort } from '../ports/out/AcceptanceReceiptReadPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ChainLandingPort } from '../ports/out/ChainLandingPort.out-port.js';
@@ -311,6 +311,41 @@ export class LandChainUseCase implements LandChainPort {
       return null;
     }
     return (await isRequiredPassHalted(this.deps.halt)) ? refused('halted') : null;
+  }
+
+  /** The apply-phase `halted` refusal with a read-only progress report; never throws, never writes. */
+  private async haltedInApply(
+    command: LandChainCommand,
+    key: string,
+    tip: string,
+    integrationPullRequestNumber: number | null,
+    premergePosted: boolean,
+  ): Promise<LandChainResult> {
+    let landingMark: LandChainHaltProgress['landingMark'] = 'unknown';
+    try {
+      const stored = await this.readLandingMark(command);
+      if (stored.ok) {
+        landingMark =
+          stored.outcome === 'found' &&
+          stored.mark !== undefined &&
+          stored.mark.state === 'landing' &&
+          stored.mark.key === key &&
+          stored.mark.headSha === tip
+            ? 'landing'
+            : 'not-landing';
+      }
+    } catch {
+      landingMark = 'unknown';
+    }
+    return {
+      outcome: 'refused',
+      reason: 'halted',
+      progress: {
+        integrationPullRequestNumber,
+        premergeStatus: premergePosted ? 'posted' : 'not-recorded',
+        landingMark,
+      },
+    };
   }
 
   private async run(command: LandChainCommand): Promise<LandChainResult> {
@@ -780,14 +815,11 @@ export class LandChainUseCase implements LandChainPort {
 
     // The kill switch is re-read immediately before the premerge status: a
     // halt raised while the integration PR was opened still stops this post.
-    // The kill switch is re-read immediately before the premerge status: a
-    // halt raised while the integration PR was opened still stops this post.
-    const preStatusHalt = await this.haltRefusalIfApplying(command);
-    if (preStatusHalt !== null) {
-      return preStatusHalt;
+    if (await isRequiredPassHalted(this.deps.halt)) {
+      return this.haltedInApply(command, key, facts.tip, pullRequestNumber, false);
     }
 
-    const premerge = await this.postPremergeStatus(command, facts, pullRequestNumber);
+    const premerge = await this.postPremergeStatus(command, facts, pullRequestNumber, key);
     if (premerge !== null) {
       return premerge;
     }
@@ -820,7 +852,7 @@ export class LandChainUseCase implements LandChainPort {
     // raised after the earlier pre-apply check still refuses the open or
     // adopt, and an unreadable halt answer refuses it too.
     if (await isRequiredPassHalted(this.deps.halt)) {
-      return { ok: false, fail: refused('halted') };
+      return { ok: false, fail: await this.haltedInApply(command, key, facts.tip, mode === 'adopt' ? open.value[0].number : null, false) };
     }
     const opened = await this.guarded(
       command.deadlineIso,
@@ -873,7 +905,7 @@ export class LandChainUseCase implements LandChainPort {
   }
 
   /** Step 11: the keyed premerge intent, then the `premerge` status; `null` when posted. */
-  private async postPremergeStatus(command: LandChainCommand, facts: LandFacts, pullRequestNumber: number): Promise<Fail | null> {
+  private async postPremergeStatus(command: LandChainCommand, facts: LandFacts, pullRequestNumber: number, key: string): Promise<Fail | null> {
     const head12 = facts.tip.slice(0, 12);
     const premergeKey = `chain-land/${command.chainName}/premerge@${head12}`;
     const premergeDigest = this.deps.computeDigest(
@@ -885,9 +917,9 @@ export class LandChainUseCase implements LandChainPort {
     }
     // The intent append above takes a lock and does disk I/O: the halt is read again after it, with
     // nothing awaited between this read and the post. The intent stays; a resume finds it and posts.
-    const haltedAfterIntent = await this.haltRefusalIfApplying(command);
-    if (haltedAfterIntent !== null) {
-      return haltedAfterIntent;
+    const haltedAfterIntent = await isRequiredPassHalted(this.deps.halt);
+    if (haltedAfterIntent) {
+      return this.haltedInApply(command, key, facts.tip, pullRequestNumber, false);
     }
     const status = await this.guarded(
       command.deadlineIso,
@@ -976,11 +1008,8 @@ export class LandChainUseCase implements LandChainPort {
     }
     // The kill switch is re-read immediately before the enqueue: a halt raised
     // while the mark was recorded still stops this one-way queue write.
-    // The kill switch is re-read immediately before the enqueue: a halt raised
-    // while the mark was recorded still stops this one-way queue write.
-    const preEnqueueHalt = await this.haltRefusalIfApplying(command);
-    if (preEnqueueHalt !== null) {
-      return preEnqueueHalt;
+    if (await isRequiredPassHalted(this.deps.halt)) {
+      return this.haltedInApply(command, key, facts.tip, pullRequestNumber, true);
     }
     const enqueued = await this.guarded(
       command.deadlineIso,

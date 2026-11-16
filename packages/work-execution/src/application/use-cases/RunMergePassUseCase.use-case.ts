@@ -17,7 +17,11 @@ import type {
   RunMergePassResult,
 } from '../ports/in/RunMergePassPort.in-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
-import type { ForgeMergeReadPort, MergeContextSnapshot } from '../ports/out/ForgeMergeReadPort.out-port.js';
+import type {
+  ForgeMergeReadPort,
+  MergeContextSnapshot,
+  ReadForgeMergeResult,
+} from '../ports/out/ForgeMergeReadPort.out-port.js';
 import type { MergeNotificationPort } from '../ports/out/MergeNotificationPort.out-port.js';
 import type { MergeVerificationPort } from '../ports/out/MergeVerificationPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
@@ -203,6 +207,14 @@ function contextStateOf(snapshot: MergeContextSnapshot): MergeContextFact {
     return { state: 'failure', creatorLogin: snapshot.creatorLogin };
   }
   return { state: 'failure', creatorLogin: snapshot.creatorLogin };
+}
+
+/** The observed-base fact: the key exists only when the forge read carried a base (OG-7). */
+function observedBaseFact(read: ReadForgeMergeResult): { readonly observedBaseBranch?: unknown } {
+  if (read.outcome !== 'ok' || read.baseRef === undefined) {
+    return {};
+  }
+  return { observedBaseBranch: read.baseRef };
 }
 
 export class RunMergePassUseCase implements RunMergePassPort {
@@ -936,6 +948,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       macosVerification,
       veto,
       lastForgeOutcome: undefined,
+      ...observedBaseFact(read),
     };
   }
 

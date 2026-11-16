@@ -1236,6 +1236,8 @@ describe('RV3: the WB5a-store-c saved minor-only FAIL receipt end to end', () =>
         ({
           outcome: 'found',
           assessment: assessmentRecord({
+            id: 'assessment-attempt-example-1',
+            projectId: 'project-example-1',
             attemptId: 'attempt-example-1',
             candidateHeadSha: COMMIT_A,
             reviewReceipts: stored,

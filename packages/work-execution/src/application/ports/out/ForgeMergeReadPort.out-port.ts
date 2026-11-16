@@ -54,6 +54,8 @@ export type ReadForgeMergeResult =
       readonly prState: ForgePrState;
       readonly liveHeadSha: string;
       readonly mergeState: ForgeMergeState;
+      /** The base branch the forge reports for the pull request (`baseRefName`); absent when the reader did not observe it. */
+      readonly baseRef?: string;
       readonly contexts: readonly MergeContextSnapshot[];
       readonly unresolvedThreads: number | 'unknown';
     }

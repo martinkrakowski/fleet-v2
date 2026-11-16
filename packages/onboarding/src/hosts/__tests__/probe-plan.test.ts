@@ -761,6 +761,11 @@ describe('runHostProbes', () => {
     expect(
       calls.some((call) => logicalArgv(call.argv).includes('mktemp')),
     ).toBe(false);
+    const writable = lines.find((entry) => entry.check === 'worktree-root-writable');
+    expect(writable?.status).toBe('FAIL');
+    expect(writable?.detail).toBe(
+      'the worktree root contains a control character; no command was run',
+    );
   });
 
   it('plans a FAIL note for a lane-runner root containing NUL', () => {
@@ -886,5 +891,232 @@ describe('runHostProbes', () => {
     expect(calls.map((call) => call.argv)).toEqual([
       ['mktemp', '/srv/r/.fleet-probe.XXXXXX'],
     ]);
+  });
+
+  it('refuses a relative, empty or control-character worktree root before any command, locally and over ssh', async () => {
+    const NOT_ABSOLUTE = 'the worktree root is not an absolute path; no command was run';
+    const CONTROL = 'the worktree root contains a control character; no command was run';
+    const cases: readonly (readonly [string, string])[] = [
+      ['srv/worktrees', NOT_ABSOLUTE],
+      ['./worktrees', NOT_ABSOLUTE],
+      ['', NOT_ABSOLUTE],
+      ['rel\nroot', NOT_ABSOLUTE],
+      ['/srv/a\nb', CONTROL],
+      ['/srv/a\rb', CONTROL],
+      ['/srv/a\u001bb', CONTROL],
+      ['/srv/r\0oot', CONTROL],
+      ['/srv/a\u2028b', CONTROL],
+      ['/srv/a\u202eb', CONTROL],
+    ];
+    for (const [root, detail] of cases) {
+      for (const base of [localSpec, sshSpec]) {
+        const spec = { ...base, worktreeRoot: root };
+        const steps = planHostProbes(spec);
+        expect(steps.some((step) => step.kind === 'mktemp-then-rm')).toBe(false);
+        expect(noteStepOf(steps, 'worktree-root-writable')).toEqual({
+          kind: 'note',
+          scope: 'host',
+          subject: spec.name,
+          check: 'worktree-root-writable',
+          status: 'FAIL',
+          detail,
+        });
+        const { executor, calls } = fakeExecutor(() => succeeded());
+        const lines = await probeHost(spec, executor);
+        expect(lines.find((entry) => entry.check === 'worktree-root-writable')).toEqual({
+          scope: 'host',
+          subject: spec.name,
+          check: 'worktree-root-writable',
+          status: 'FAIL',
+          detail,
+        });
+        expect(
+          calls.some((call) => {
+            const words = logicalArgv(call.argv);
+            return words.includes('mktemp') || words.includes('rm');
+          }),
+        ).toBe(false);
+        expect(hostProbesHaveFailure(lines)).toBe(true);
+      }
+    }
+  });
+
+  it('runs nothing for a hand-built step whose root is refused', async () => {
+    for (const [worktreeRoot, detail] of [
+      ['rel/root', 'the worktree root is not an absolute path; no command was run'],
+      ['/srv/a\nb', 'the worktree root contains a control character; no command was run'],
+      [42 as unknown as string, 'the worktree root is not an absolute path; no command was run'],
+    ] as const) {
+      const { executor, calls } = fakeExecutor(() =>
+        succeeded('rel/root/.fleet-probe.abc123\n'),
+      );
+      const lines = await runHostProbes(
+        [
+          {
+            kind: 'mktemp-then-rm',
+            scope: 'host',
+            subject: 'lanehost',
+            check: 'worktree-root-writable',
+            worktreeRoot,
+            argv: ['mktemp', 'rel/root/.fleet-probe.XXXXXX'],
+            timeoutMs: 1000,
+          },
+        ],
+        executor,
+      );
+      expect(lines).toEqual([
+        {
+          scope: 'host',
+          subject: 'lanehost',
+          check: 'worktree-root-writable',
+          status: 'FAIL',
+          detail,
+        },
+      ]);
+      expect(calls).toEqual([]);
+    }
+  });
+
+  it('refuses each malformed mktemp answer over ssh too and sends no rm', async () => {
+    const root = sshSpec.worktreeRoot;
+    for (const answer of [
+      `${root}/.fleet-probe.abc12;id`,
+      `${root}/$(id)`,
+      `${root}/tmp.abc123`,
+      `${root}/.fleet-probe.abc1234`,
+      `${root}/.fleet-probe.abc12`,
+      `${root}/.fleet-probe.abc-12`,
+      `${root}/a/.fleet-probe.abc123`,
+      `${root}/.fleet-probe.abc123/x`,
+      `${root}x/.fleet-probe.abc123`,
+    ]) {
+      const { executor, calls } = healthyExecutor(
+        sshSpec,
+        (call) => (logicalArgv(call.argv).includes('mktemp') ? succeeded(`${answer}\n`) : {}),
+      );
+      const lines = await probeHost(sshSpec, executor);
+      const writable = lines.find(
+        (line) => line.check === 'worktree-root-writable',
+      );
+      expect(writable?.status).toBe('FAIL');
+      expect(writable?.detail).toContain('nothing was removed');
+      expect(
+        calls.some((call) => logicalArgv(call.argv).includes('mktemp')),
+      ).toBe(true);
+      expect(
+        calls.some((call) => logicalArgv(call.argv).includes('rm')),
+      ).toBe(false);
+    }
+  });
+
+  it('plans a single-slash template and removes the answer over ssh for a root written with a trailing slash', async () => {
+    const spec = { ...sshSpec, worktreeRoot: '/srv/worktrees/' };
+    const mktemp = planHostProbes(spec).find(
+      (step): step is Extract<HostProbeStep, { kind: 'mktemp-then-rm' }> =>
+        step.kind === 'mktemp-then-rm',
+    );
+    expect(logicalArgv(mktemp?.argv ?? [])).toEqual([
+      'mktemp',
+      '/srv/worktrees/.fleet-probe.XXXXXX',
+    ]);
+    expect(mktemp?.argv.slice(0, 9)).toEqual(sshHead('lanehost'));
+
+    const { executor, calls } = healthyExecutor(
+      spec,
+      (call) =>
+        logicalArgv(call.argv).includes('mktemp')
+          ? succeeded('/srv/worktrees/.fleet-probe.abc123\n')
+          : {},
+    );
+    const lines = await probeHost(spec, executor);
+    const writable = lines.find(
+      (line) => line.check === 'worktree-root-writable',
+    );
+    expect(writable?.status).toBe('PASS');
+    const rmCalls = calls.filter((call) => logicalArgv(call.argv).includes('rm'));
+    expect(rmCalls).toHaveLength(1);
+    expect(logicalArgv(rmCalls[0]?.argv ?? [])).toEqual([
+      'rm',
+      '--',
+      '/srv/worktrees/.fleet-probe.abc123',
+    ]);
+  });
+
+  it('treats a root with regex metacharacters as a literal prefix', async () => {
+    const root = '/srv/a.b+c (x)[1]$^*';
+    const spec = { ...localSpec, worktreeRoot: root };
+    const mktemp = planHostProbes(spec).find(
+      (step): step is Extract<HostProbeStep, { kind: 'mktemp-then-rm' }> =>
+        step.kind === 'mktemp-then-rm',
+    );
+    expect(mktemp?.argv).toEqual(['mktemp', `${root}/.fleet-probe.XXXXXX`]);
+
+    const good = fakeExecutor((call) =>
+      call.argv[0] === 'mktemp'
+        ? succeeded(`${root}/.fleet-probe.abc123\n`)
+        : succeeded(),
+    );
+    const goodLines = await probeHost(spec, good.executor);
+    const goodWritable = goodLines.find(
+      (line) => line.check === 'worktree-root-writable',
+    );
+    expect(goodWritable?.status).toBe('PASS');
+    expect(good.calls[good.calls.length - 1]?.argv).toEqual([
+      'rm',
+      '--',
+      `${root}/.fleet-probe.abc123`,
+    ]);
+
+    const sneaky = fakeExecutor((call) =>
+      call.argv[0] === 'mktemp'
+        ? succeeded('/srv/aXb+c (x)[1]$^*/.fleet-probe.abc123\n')
+        : succeeded(),
+    );
+    const sneakyLines = await probeHost(spec, sneaky.executor);
+    const sneakyWritable = sneakyLines.find(
+      (line) => line.check === 'worktree-root-writable',
+    );
+    expect(sneakyWritable?.status).toBe('FAIL');
+    expect(sneakyWritable?.detail).toContain('nothing was removed');
+    expect(
+      sneaky.calls.some((call) => call.argv.includes('rm')),
+    ).toBe(false);
+  });
+
+  it('accepts the filesystem root as a worktree root', async () => {
+    const spec = { ...localSpec, worktreeRoot: '/' };
+    const mktemp = planHostProbes(spec).find(
+      (step): step is Extract<HostProbeStep, { kind: 'mktemp-then-rm' }> =>
+        step.kind === 'mktemp-then-rm',
+    );
+    expect(mktemp?.argv).toEqual(['mktemp', '/.fleet-probe.XXXXXX']);
+
+    const good = fakeExecutor((call) =>
+      call.argv[0] === 'mktemp' ? succeeded('/.fleet-probe.abc123\n') : succeeded(),
+    );
+    const goodLines = await probeHost(spec, good.executor);
+    const goodWritable = goodLines.find(
+      (line) => line.check === 'worktree-root-writable',
+    );
+    expect(goodWritable?.status).toBe('PASS');
+    expect(good.calls[good.calls.length - 1]?.argv).toEqual([
+      'rm',
+      '--',
+      '/.fleet-probe.abc123',
+    ]);
+
+    const sneaky = fakeExecutor((call) =>
+      call.argv[0] === 'mktemp'
+        ? succeeded('/etc/.fleet-probe.abc123\n')
+        : succeeded(),
+    );
+    const sneakyLines = await probeHost(spec, sneaky.executor);
+    const sneakyWritable = sneakyLines.find(
+      (line) => line.check === 'worktree-root-writable',
+    );
+    expect(sneakyWritable?.status).toBe('FAIL');
+    expect(
+      sneaky.calls.some((call) => call.argv.includes('rm')),
+    ).toBe(false);
   });
 });

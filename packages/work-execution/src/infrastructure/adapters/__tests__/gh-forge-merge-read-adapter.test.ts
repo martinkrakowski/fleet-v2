@@ -29,6 +29,7 @@ interface PageOverrides {
   state?: string;
   headRefOid?: string;
   mergeStateStatus?: string | null;
+  baseRefName?: unknown;
   contextsNodes?: unknown[];
   contextsHasNextPage?: boolean;
   contextsEndCursor?: string | null;
@@ -45,6 +46,7 @@ function page(overrides: PageOverrides = {}): string {
           state: overrides.state ?? 'OPEN',
           headRefOid: overrides.headRefOid ?? VALID_SHA,
           mergeStateStatus: 'mergeStateStatus' in overrides ? overrides.mergeStateStatus : 'CLEAN',
+          baseRefName: 'baseRefName' in overrides ? overrides.baseRefName : 'main',
           statusCheckRollup: {
             contexts: {
               pageInfo: {
@@ -133,6 +135,7 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     expect(argv).not.toContain('threadsAfter=');
     const queryArg = argv.find((arg) => arg.startsWith('query='));
     expect(queryArg).toBeDefined();
+    expect(queryArg).toContain('baseRefName');
     expect(queryArg).toContain('$contextsAfter');
     expect(queryArg).toContain('$threadsAfter');
     expect(queryArg).toContain('statusCheckRollup');
@@ -166,6 +169,7 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
       prState: 'open',
       liveHeadSha: VALID_SHA,
       mergeState: 'clean',
+      baseRef: 'main',
       contexts: [
         { name: 'gate', state: 'SUCCESS', isGreen: true, creatorLogin: null },
         { name: 'premerge', state: 'missing', isGreen: false, creatorLogin: null },
@@ -509,6 +513,7 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
             state: 'OPEN',
             headRefOid: VALID_SHA,
             mergeStateStatus: 'CLEAN',
+            baseRefName: 'main',
             statusCheckRollup: {
               contexts: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: 'not-an-array' },
             },
@@ -773,6 +778,7 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
             state: 'OPEN',
             headRefOid: VALID_SHA,
             mergeStateStatus: 'CLEAN',
+            baseRefName: 'main',
             statusCheckRollup: {
               contexts: {
                 pageInfo: { hasNextPage: false, endCursor: null },
@@ -884,6 +890,73 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     expect(result).toEqual({ outcome: 'budget-exhausted' });
     expect(calls).toHaveLength(1);
   });
+
+  it.each(['main', 'chain/example', 'release/1.2_x', 'a'.repeat(255)])(
+    'reports baseRefName %s as baseRef',
+    async (value) => {
+      const { runGh } = makeRunGh({ exitCode: 0, stdout: page({ baseRefName: value }), stderr: '' });
+      const result = await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+      expect(result).toMatchObject({ outcome: 'ok', baseRef: value });
+    },
+  );
+
+  it.each([
+    ['missing', undefined],
+    ['null', null],
+    ['a number', 123],
+    ['a boolean', true],
+    ['an empty string', ''],
+    ['a leading space', ' main'],
+    ['a trailing newline', 'main\n'],
+    ['an inner space', 'a b'],
+    ['a leading dash', '-main'],
+    ['a control character', 'ma\u0000in'],
+    ['an array', ['main']],
+    ['an object', { name: 'main' }],
+    ['256 characters', 'a'.repeat(256)],
+  ])('answers unreadable, with no baseRef, for baseRefName %s', async (_label, value) => {
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: page({ baseRefName: value }), stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+    expect(result).toEqual({
+      outcome: 'unavailable',
+      code: 'unreadable',
+      reason: 'gh api graphql returned an unreadable answer',
+    });
+  });
+
+  it('keeps the head oid answer when the base is also unreadable', async () => {
+    const { runGh } = makeRunGh({
+      exitCode: 0,
+      stdout: page({ headRefOid: 'short', baseRefName: null }),
+      stderr: '',
+    });
+    const result = await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+    expect(result).toEqual({ outcome: 'unavailable', code: 'unknown', reason: 'the head oid is not 40 hex' });
+  });
+
+  it('reports the base of the last page when it differs between pages', async () => {
+    const page1 = page({
+      baseRefName: 'main',
+      contextsNodes: [checkRun('gate', 'SUCCESS')],
+      contextsHasNextPage: true,
+      contextsEndCursor: 'c1',
+    });
+    const page2 = page({
+      baseRefName: 'chain/example',
+      contextsNodes: [statusContext('premerge', 'SUCCESS', 'poster')],
+      contextsHasNextPage: false,
+    });
+    const responses = [page1, page2];
+    const runGh = async () => ({
+      exitCode: 0,
+      stdout: responses.shift() ?? '',
+      stderr: '',
+    });
+
+    const result = await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+
+    expect(result).toMatchObject({ outcome: 'ok', baseRef: 'chain/example' });
+  });
 });
 
 describe('GhForgeMergeReadAdapter.isConfigured', () => {
@@ -930,12 +1003,27 @@ describe('pure GraphQL parsers', () => {
       prState: 'merged',
       liveHeadSha: VALID_SHA,
       mergeState: 'blocked',
+      baseRef: 'main',
     });
   });
 
   it('parseMergePrMeta rejects a head oid that is not 40 hex as unknown', () => {
     const result = parseMergePrMeta(page({ headRefOid: 'short' }));
     expect(result).toEqual({ kind: 'unknown', reason: 'the head oid is not 40 hex' });
+  });
+
+  it('parseMergePrMeta returns the base ref', () => {
+    expect(parseMergePrMeta(page({ baseRefName: 'chain/example' }))).toEqual({
+      kind: 'ok',
+      prState: 'open',
+      liveHeadSha: VALID_SHA,
+      mergeState: 'clean',
+      baseRef: 'chain/example',
+    });
+  });
+
+  it('parseMergePrMeta returns unreadable for a missing baseRefName', () => {
+    expect(parseMergePrMeta(page({ baseRefName: undefined }))).toEqual({ kind: 'unreadable' });
   });
 
   it('parseMergeContextsPage reports pageInfo with hasNextPage true and null endCursor as unknown', () => {

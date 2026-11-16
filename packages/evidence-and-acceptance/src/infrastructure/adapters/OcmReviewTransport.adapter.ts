@@ -12,6 +12,7 @@ import {
   isSafeRelativeFilePath,
   validateReviewAnswerObject,
 } from '../../domain/review-answer-schema.js';
+import { parseReviewStreamGrammar } from '../../domain/review-stream-grammar.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewTransportDiagnostic, ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
@@ -1400,6 +1401,26 @@ function isStreamCutBeforeFinish(hasStepFinish: boolean, lastStepOpen: boolean):
   return !hasStepFinish || lastStepOpen;
 }
 
+/** The fixed raw output of a stream the grammar refused (RVG2). */
+export const STREAM_GRAMMAR_REASON = 'stream-grammar';
+
+/**
+ * RVG2: the result of a reviewer stream no verdict is read from. The fixed
+ * reason travels as the raw output; the result is always `unknown`.
+ */
+function refusedStreamResult(
+  reason: 'stream-incomplete' | typeof STREAM_GRAMMAR_REASON,
+  readOnlyVerified: boolean,
+): IndependentReviewTransportResult {
+  return {
+    rawOutput: reason,
+    readOnlyVerified,
+    result: 'unknown',
+    findings: [],
+    completedAtIso: new Date().toISOString(),
+  };
+}
+
 export function createOcmReviewTransport(
   options: OcmReviewTransportOptions,
 ): (request: RunIndependentReviewRequest) => Promise<IndependentReviewTransportResult> {
@@ -1630,16 +1651,16 @@ export function createOcmReviewTransport(
       );
     }
 
-    // 7. Parse stdout JSON lines for text and tool parts
+    // 7. Read stdout JSON lines for tool parts and step markers (the read-only proof)
     // A missing or non-string stdout reads as empty; the parse loop never throws.
     const spawnStdout = safeRead(() => spawnResult.stdout);
+    const streamText = typeof spawnStdout === 'string' ? spawnStdout : '';
     let readOnlyVoided = false;
     let hasStepStart = false;
     let hasStepFinish = false;
     let lastStepOpen = false;
-    const textParts: string[] = [];
     const toolNames: string[] = [];
-    for (const rawLine of (typeof spawnStdout === 'string' ? spawnStdout : '').split(/\r?\n/)) {
+    for (const rawLine of streamText.split(/\r?\n/)) {
       const line = rawLine.trim();
       if (line === '') continue;
       let parsed: unknown;
@@ -1694,11 +1715,6 @@ export function createOcmReviewTransport(
           }
         }
       }
-
-      const textPart = extractTextPart(parsed);
-      if (textPart !== null) {
-        textParts.push(textPart);
-      }
     }
 
     // 8. Verify head after review and compute readOnlyVerified
@@ -1711,16 +1727,15 @@ export function createOcmReviewTransport(
 
     // 9. Parse verdict, findings, and rawOutput
     if (isStreamCutBeforeFinish(hasStepFinish, lastStepOpen)) {
-      return {
-        rawOutput: 'stream-incomplete',
-        readOnlyVerified,
-        result: 'unknown',
-        findings: [],
-        completedAtIso: new Date().toISOString(),
-      };
+      return refusedStreamResult('stream-incomplete', readOnlyVerified);
     }
-    // Each text part is a whole message part; a part that does not end in a newline must not glue its last line onto the next part's first.
-    const finalText = textParts.join('\n');
+    // RVG2: the verdict text is read only from a stream the strict grammar accepts.
+    const grammar = parseReviewStreamGrammar(streamText);
+    if (!grammar.ok) {
+      return refusedStreamResult(STREAM_GRAMMAR_REASON, readOnlyVerified);
+    }
+    // The grammar joins every text event of the stream with a newline.
+    const finalText = grammar.verdictText;
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.
     const { result, findings, unknownReason } =
       request.kind !== undefined

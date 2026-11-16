@@ -69,10 +69,27 @@ describe('parseReviewStreamGrammar', () => {
     ].join('\n');
     expect(parseReviewStreamGrammar(atCap)).toEqual({ ok: true, verdictText: '' });
 
-    // 50,001st non-blank line, invalid JSON on purpose: refusal comes from
-    // the count, not the parse.
-    const over = atCap + '\n{not json';
+    // One valid tool event over the cap: only the count can refuse it.
+    const over = [
+      stepStart(),
+      ...Array.from({ length: MAX_REVIEW_STREAM_EVENTS - 1 }, () => toolEvent()),
+      stepFinish(),
+    ].join('\n');
+    expect(over.split('\n')).toHaveLength(MAX_REVIEW_STREAM_EVENTS + 1);
     expect(parseReviewStreamGrammar(over)).toEqual(refused);
+  });
+
+  it('returns a frozen refusal that a caller cannot mutate', () => {
+    const first = parseReviewStreamGrammar('') as Record<string, unknown>;
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(() => {
+      first.reason = 'tampered';
+    }).toThrow(TypeError);
+    expect(() => {
+      first.ok = true;
+    }).toThrow(TypeError);
+    expect(parseReviewStreamGrammar('')).toEqual(refused);
+    expect(parseReviewStreamGrammar(null)).toEqual(refused);
   });
 
   it('refuses empty or whitespace-only stream with zero complete steps', () => {
@@ -165,6 +182,39 @@ describe('parseReviewStreamGrammar', () => {
     }
   });
 
+  it('refuses step_start and step_finish whose part.type names another kind', () => {
+    for (const badType of ['tool', 'text', 'step_finish']) {
+      expect(
+        parseReviewStreamGrammar(
+          [stepStart({ part: { type: badType } }), stepFinish()].join('\n'),
+        ),
+      ).toEqual(refused);
+    }
+    for (const badType of ['tool', 'text', 'step_start']) {
+      expect(
+        parseReviewStreamGrammar(
+          [stepStart(), stepFinish({ part: { type: badType } })].join('\n'),
+        ),
+      ).toEqual(refused);
+    }
+  });
+
+  it('refuses a tool event carrying part.type text', () => {
+    const bad = [stepStart(), toolEvent({ part: { type: 'text' } }), stepFinish()].join('\n');
+    expect(parseReviewStreamGrammar(bad)).toEqual(refused);
+    for (const kind of ['tool_use', 'tool_call']) {
+      const other = [stepStart(), JSON.stringify({ type: kind, part: { type: 'text' } }), stepFinish()];
+      expect(parseReviewStreamGrammar(other.join('\n'))).toEqual(refused);
+    }
+  });
+
+  it('refuses a text event whose part.type is step_start or step_finish', () => {
+    for (const badType of ['step_start', 'step_finish', 'tool']) {
+      const bad = [stepStart(), textEvent('x', { part: { type: badType } }), stepFinish()];
+      expect(parseReviewStreamGrammar(bad.join('\n'))).toEqual(refused);
+    }
+  });
+
   it('refuses tool event whose part.type is not tool', () => {
     const bad = [stepStart(), JSON.stringify({ type: 'tool_use', part: { type: 'tool_use' } }), stepFinish()].join('\n');
     expect(parseReviewStreamGrammar(bad)).toEqual(refused);
@@ -224,6 +274,27 @@ describe('parseReviewStreamGrammar', () => {
       expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     });
 
+    it('accepts a prototype key on a step_start line without polluting', () => {
+      const stream = [
+        '{"prototype":{"polluted":true},"type":"step_start"}',
+        textEvent('clean'),
+        stepFinish(),
+      ].join('\n');
+      expect(parseReviewStreamGrammar(stream)).toEqual({ ok: true, verdictText: 'clean' });
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    });
+
+    it('refuses a line whose only type is nested under __proto__', () => {
+      const nested = '{"__proto__":{"type":"step_start"}}';
+      expect(parseReviewStreamGrammar(nested)).toEqual(refused);
+      expect(parseReviewStreamGrammar([nested, textEvent('x'), stepFinish()].join('\n'))).toEqual(
+        refused,
+      );
+      expect(
+        parseReviewStreamGrammar([stepStart(), nested, stepFinish()].join('\n')),
+      ).toEqual(refused);
+    });
+
     it('refuses a non-plain part', () => {
       for (const badPart of ['[]', '"x"', 'null']) {
         const bad = [stepStart(), `{"type":"text","part":${badPart},"text":"x"}`, stepFinish()].join('\n');
@@ -231,14 +302,24 @@ describe('parseReviewStreamGrammar', () => {
       }
     });
 
-    it('refuses a throwing-getter object as non-string without invoking anything on it', () => {
-      const hostile = Object.defineProperty({}, 'length', {
-        get() {
-          throw new Error('boom');
-        },
+    it('refuses a non-string object without invoking any member on it', () => {
+      const calls: string[] = [];
+      const trap = (name: string) => () => {
+        calls.push(name);
+        throw new Error('boom');
+      };
+      const hostile = {
+        toString: trap('toString'),
+        valueOf: trap('valueOf'),
+        toJSON: trap('toJSON'),
+        [Symbol.toPrimitive]: trap('toPrimitive'),
+      };
+      Object.defineProperty(hostile, 'length', {
+        get: trap('length'),
         enumerable: true,
       });
       expect(parseReviewStreamGrammar(hostile)).toEqual(refused);
+      expect(calls).toEqual([]);
     });
 
     it('refuses a Proxy wrapping a string without throwing', () => {

@@ -60,6 +60,7 @@ import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out
 import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
 import type {
   HeldWorkOrderRepositoryPort,
+  RecordHoldIntentResult,
 } from '../ports/out/HeldWorkOrderRepositoryPort.out-port.js';
 import type { LanePlanRepositoryPort } from '../ports/out/LanePlanRepositoryPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
@@ -162,6 +163,27 @@ function compareCodeUnits(left: string, right: string): number {
 }
 
 /** The stale-held notice for a superseded record: ids and codes only. */
+type HoldAttempt =
+  | { readonly ok: true; readonly supersededHeld: SupersededHeldWorkOrder | undefined }
+  | { readonly ok: false; readonly answer: RegisterWorkOrderResult };
+
+interface HoldProgress {
+  staleMayBeGone: boolean;
+  replacementMayExist: boolean;
+}
+
+function recordRefusalAnswer(
+  reason: Extract<RecordHoldIntentResult, { readonly outcome: 'refused' }>['reason'],
+): RegisterWorkOrderResult {
+  if (reason === 'invalid-record') {
+    return INVALID_REQUEST;
+  }
+  if (reason === 'store-full') {
+    return STORE_UNAVAILABLE;
+  }
+  return { outcome: 'refused', reason };
+}
+
 function supersededNotice(record: HeldWorkOrderRecord): SupersededHeldWorkOrder {
   return {
     requestDigest: record.requestDigest,
@@ -847,9 +869,12 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
   /**
    * Keep the overlap-refused registration as held (intent first, then settled)
    * and answer the typed refusal; without a held store it is answered
-   * `held: false`. Never saves the work order. When a superseded stale record
-   * was deleted but the replacement hold cannot be recorded, the stale record
-   * is restored before the store-unavailable (or refused) answer is given.
+   * `held: false`. Never saves the work order. The held store keys one record
+   * per work order id, so a superseded stale record must be deleted before the
+   * replacement can be recorded; if the replacement hold then fails, the
+   * replacement intent is removed and the stale record restored, so the store
+   * ends holding the replacement or the stale record, never neither. A
+   * rollback that cannot be completed is answered `store-unavailable`.
    */
   private async holdAndRefuse(
     context: OverlapContext,
@@ -858,33 +883,11 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
   ): Promise<RegisterWorkOrderResult> {
     const blockerKind: OverlapBlockerKind = blocker.kind;
     const blockerId = blocker.kind === 'open-pr' ? String(blocker.pullRequestNumber) : blocker.workOrderId;
+    const heldRepo = this.deps?.heldWorkOrderRepo;
     let held = false;
     let supersededHeld: SupersededHeldWorkOrder | undefined;
-    const heldRepo = this.deps?.heldWorkOrderRepo;
-    const isLegacyActiveId =
-      blocker.kind === 'active-work-order' && !ID_TOKEN_PATTERN.test(blockerId);
-
-    if (isLegacyActiveId) {
-      try {
-        if (this.deps?.recordAttentionCode !== undefined) {
-          await this.deps.recordAttentionCode('hold-skipped-invalid-blocker-id');
-        } else if (this.deps?.recordAttention !== undefined) {
-          await this.deps.recordAttention('hold-skipped-invalid-blocker-id');
-        } else if (this.deps?.recordAttentionItem !== undefined) {
-          await this.deps.recordAttentionItem(
-            {
-              projectId: context.snapshot.projectId,
-              kind: 'hold-skipped-invalid-blocker-id',
-              subject: { kind: 'work-order', ref: context.workOrderId },
-              workOrderId: context.workOrderId,
-              summary: 'hold-skipped-invalid-blocker-id',
-            },
-            'work-execution',
-          );
-        }
-      } catch {
-        // Attention recording failure does not block or throw
-      }
+    if (blocker.kind === 'active-work-order' && !ID_TOKEN_PATTERN.test(blockerId)) {
+      await this.noteSkippedHold(context);
     } else if (heldRepo !== undefined) {
       const record: HeldWorkOrderRecord = {
         version: 1,
@@ -898,82 +901,128 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
         pathCode,
         heldAtIso: context.nowIso,
       };
-      let staleDeleted = false;
-      try {
-        if (context.staleRecord !== null) {
-          const replaced = await this.replaceStaleHeld(heldRepo, context);
-          if (!replaced.ok) {
-            return STORE_UNAVAILABLE;
-          }
-          supersededHeld = replaced.notice;
-          staleDeleted = replaced.notice !== undefined;
-        }
-        const recorded = await heldRepo.recordHoldIntent(record);
-        if (recorded.outcome === 'refused') {
-          if (staleDeleted) {
-            await this.restoreStaleHeld(heldRepo, context.staleRecord);
-          }
-          return recorded.reason === 'invalid-record'
-            ? INVALID_REQUEST
-            : recorded.reason === 'store-full'
-              ? STORE_UNAVAILABLE
-              : { outcome: 'refused', reason: recorded.reason };
-        }
-        if (recorded.outcome === 'already-held') {
-          held = true;
-        } else {
-          const completed = await heldRepo.completeHoldIntent({
-            intentId: context.intentId,
-            workOrderId: context.workOrderId,
-            requestDigest: context.requestDigest,
-          });
-          if (completed.outcome === 'refused') {
-            if (staleDeleted) {
-              await this.restoreStaleHeld(heldRepo, context.staleRecord);
-            }
-            return completed.reason === 'intent-digest-mismatch'
-              ? { outcome: 'refused', reason: 'intent-digest-mismatch' }
-              : STORE_UNAVAILABLE;
-          }
-          held = true;
-        }
-      } catch {
-        if (staleDeleted) {
-          await this.restoreStaleHeld(heldRepo, context.staleRecord);
-        }
-        return STORE_UNAVAILABLE;
+      const attempt = await this.holdWithRollback(heldRepo, context, record);
+      if (!attempt.ok) {
+        return attempt.answer;
       }
+      held = true;
+      supersededHeld = attempt.supersededHeld;
     }
-    if (blocker.kind === 'open-pr') {
-      return {
-        outcome: 'refused',
-        reason: 'open-pr-overlap',
-        pullRequestNumber: blocker.pullRequestNumber,
-        blockerKind: 'open-pr',
-        blockerId,
-        pathCode,
-        held,
-        requestDigest: context.requestDigest,
-        ...(supersededHeld !== undefined ? { supersededHeld } : {}),
-      };
-    }
-    return {
-      outcome: 'refused',
-      reason: 'active-work-order-overlap',
-      blockerKind: 'active-work-order',
+    const common = {
+      outcome: 'refused' as const,
+      blockerKind,
       blockerId,
       pathCode,
       held,
       requestDigest: context.requestDigest,
       ...(supersededHeld !== undefined ? { supersededHeld } : {}),
     };
+    return blocker.kind === 'open-pr'
+      ? { ...common, reason: 'open-pr-overlap', pullRequestNumber: blocker.pullRequestNumber, blockerKind: 'open-pr' }
+      : { ...common, reason: 'active-work-order-overlap', blockerKind: 'active-work-order' };
+  }
+
+  /** A legacy blocker id is never held; the skip is noted and never blocks or throws. */
+  private async noteSkippedHold(context: OverlapContext): Promise<void> {
+    try {
+      if (this.deps?.recordAttentionCode !== undefined) {
+        await this.deps.recordAttentionCode('hold-skipped-invalid-blocker-id');
+      } else if (this.deps?.recordAttention !== undefined) {
+        await this.deps.recordAttention('hold-skipped-invalid-blocker-id');
+      } else if (this.deps?.recordAttentionItem !== undefined) {
+        await this.deps.recordAttentionItem(
+          {
+            projectId: context.snapshot.projectId,
+            kind: 'hold-skipped-invalid-blocker-id',
+            subject: { kind: 'work-order', ref: context.workOrderId },
+            workOrderId: context.workOrderId,
+            summary: 'hold-skipped-invalid-blocker-id',
+          },
+          'work-execution',
+        );
+      }
+    } catch {
+      // Attention recording failure does not block or throw
+    }
+  }
+
+  /**
+   * Runs the hold; when it fails after a superseded stale record may have been
+   * deleted, rolls the store back to the stale record. A rollback that does not
+   * complete turns the answer into `store-unavailable`.
+   */
+  private async holdWithRollback(
+    heldRepo: HeldWorkOrderRepositoryPort,
+    context: OverlapContext,
+    record: HeldWorkOrderRecord,
+  ): Promise<HoldAttempt> {
+    const progress: HoldProgress = { staleMayBeGone: false, replacementMayExist: false };
+    let attempt: HoldAttempt;
+    try {
+      attempt = await this.holdSteps(heldRepo, context, record, progress);
+    } catch {
+      attempt = { ok: false, answer: STORE_UNAVAILABLE };
+    }
+    if (attempt.ok || !progress.staleMayBeGone || context.staleRecord === null) {
+      return attempt;
+    }
+    const removed = progress.replacementMayExist
+      ? await this.removeReplacement(heldRepo, context)
+      : true;
+    const restored = await this.restoreStaleHeld(heldRepo, context.staleRecord);
+    return removed && restored ? attempt : { ok: false, answer: STORE_UNAVAILABLE };
+  }
+
+  /** The repository calls of a hold, in order: stale delete, replacement intent, completion. */
+  private async holdSteps(
+    heldRepo: HeldWorkOrderRepositoryPort,
+    context: OverlapContext,
+    record: HeldWorkOrderRecord,
+    progress: HoldProgress,
+  ): Promise<HoldAttempt> {
+    let supersededHeld: SupersededHeldWorkOrder | undefined;
+    if (context.staleRecord !== null) {
+      progress.staleMayBeGone = true;
+      const replaced = await this.replaceStaleHeld(heldRepo, context);
+      if (!replaced.ok) {
+        progress.staleMayBeGone = false;
+        return { ok: false, answer: STORE_UNAVAILABLE };
+      }
+      supersededHeld = replaced.notice;
+      progress.staleMayBeGone = replaced.notice !== undefined;
+    }
+    progress.replacementMayExist = true;
+    const recorded = await heldRepo.recordHoldIntent(record);
+    if (recorded.outcome === 'refused') {
+      progress.replacementMayExist = false;
+      return { ok: false, answer: recordRefusalAnswer(recorded.reason) };
+    }
+    if (recorded.outcome === 'recorded') {
+      const completed = await heldRepo.completeHoldIntent({
+        intentId: context.intentId,
+        workOrderId: context.workOrderId,
+        requestDigest: context.requestDigest,
+      });
+      if (completed.outcome === 'refused') {
+        return {
+          ok: false,
+          answer:
+            completed.reason === 'intent-digest-mismatch'
+              ? { outcome: 'refused', reason: 'intent-digest-mismatch' }
+              : STORE_UNAVAILABLE,
+        };
+      }
+    } else {
+      progress.replacementMayExist = false;
+    }
+    return { ok: true, supersededHeld };
   }
 
   /**
    * Replaces the stale held record with the new hold: the record is deleted
-   * first, and only a `deleted` answer reports a supersession. `not-found`
-   * continues silently (a replay already removed it); any other answer or a
-   * throw propagates to the caller's store-unavailable handling.
+   * first, guarded by its own digest, and only a `deleted` answer reports a
+   * supersession. `not-found` continues silently (a replay already removed
+   * it); any other answer is `ok: false` and a throw propagates.
    */
   private async replaceStaleHeld(
     heldRepo: HeldWorkOrderRepositoryPort,
@@ -993,36 +1042,51 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     return { ok: false };
   }
 
+  /** Removes the replacement hold intent this call recorded, guarded by its own digest. */
+  private async removeReplacement(
+    heldRepo: HeldWorkOrderRepositoryPort,
+    context: OverlapContext,
+  ): Promise<boolean> {
+    try {
+      const removed = await heldRepo.deleteHeldWorkOrder(context.workOrderId, context.requestDigest);
+      return removed.outcome === 'deleted' || removed.outcome === 'not-found';
+    } catch {
+      return false;
+    }
+  }
+
   /**
-   * Restores a stale held record when the replacement hold could not be
-   * recorded after the stale record was deleted: an intent-stage record is
-   * re-recorded as itself, a held-stage record is re-recorded as its own
-   * intent and settled back to `held`, reproducing the original record
-   * exactly. Best effort — a failure here cannot change the refusal the
-   * caller already answers.
+   * Puts the stale held record back exactly as it was: an intent-stage record is
+   * re-recorded as itself, a held-stage record as its own intent and settled to
+   * `held`. A record already present and identical counts as restored (the
+   * delete never took effect); a different record in its place, or any refused
+   * or thrown call, is `false`.
    */
   private async restoreStaleHeld(
     heldRepo: HeldWorkOrderRepositoryPort,
-    stale: HeldWorkOrderRecord | null,
-  ): Promise<void> {
-    if (stale === null) {
-      return;
-    }
+    stale: HeldWorkOrderRecord,
+  ): Promise<boolean> {
     try {
-      const restored = stale.stage === 'held' ? { ...stale, stage: 'intent' as const } : stale;
-      const recorded = await heldRepo.recordHoldIntent(restored);
-      if (recorded.outcome !== 'recorded' && recorded.outcome !== 'already-held') {
-        return;
+      const present = await heldRepo.findByWorkOrderId(stale.workOrderId);
+      if (present.outcome !== 'not-found') {
+        return present.outcome === 'found' && JSON.stringify(present.record) === JSON.stringify(stale);
       }
-      if (stale.stage === 'held') {
-        await heldRepo.completeHoldIntent({
-          intentId: stale.intentId,
-          workOrderId: stale.workOrderId,
-          requestDigest: stale.requestDigest,
-        });
+      const asIntent = stale.stage === 'held' ? { ...stale, stage: 'intent' as const } : stale;
+      const recorded = await heldRepo.recordHoldIntent(asIntent);
+      if (recorded.outcome === 'refused') {
+        return false;
       }
+      if (stale.stage === 'intent') {
+        return true;
+      }
+      const settled = await heldRepo.completeHoldIntent({
+        intentId: stale.intentId,
+        workOrderId: stale.workOrderId,
+        requestDigest: stale.requestDigest,
+      });
+      return settled.outcome === 'held';
     } catch {
-      // Best effort: the caller's refusal stands either way.
+      return false;
     }
   }
 

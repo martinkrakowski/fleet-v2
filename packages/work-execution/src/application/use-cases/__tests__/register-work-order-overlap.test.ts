@@ -1491,4 +1491,108 @@ describe('RegisterWorkOrderUseCase stale held record supersession (HR1a)', () =>
     expect(answer.outcome).toBe('registered');
     expect(Object.hasOwn(answer, 'supersededHeld')).toBe(false);
   });
+
+  describe('replacement hold failing after the stale record was deleted', () => {
+    const REFUSED = { outcome: 'refused', reason: 'store-unavailable' } as const;
+
+    const arrange = async (overrides: (inner: HeldWorkOrderRepositoryPort, staleDigest: string) => Partial<HeldWorkOrderRepositoryPort>) => {
+      const inner = new HeldWorkOrderRepositoryAdapter();
+      // The overrides are armed only after the setup holds, so the first hold is a real one.
+      let active: Partial<HeldWorkOrderRepositoryPort> = {};
+      const wrapped = wrapHeld(inner, {
+        recordHoldIntent: (record) => (active.recordHoldIntent ?? ((r) => inner.recordHoldIntent(r)))(record),
+        completeHoldIntent: (input) => (active.completeHoldIntent ?? ((i) => inner.completeHoldIntent(i)))(input),
+        deleteHeldWorkOrder: (id, digest) =>
+          (active.deleteHeldWorkOrder ?? ((a, b) => inner.deleteHeldWorkOrder(a, b)))(id, digest),
+      });
+      const state = setup({ heldWorkOrderRepo: wrapped });
+      const { digest } = await heldBehindWoA(state);
+      await releaseBlocker(state, 'stopped');
+      expect(await state.useCase.registerWorkOrder(request({ workOrderId: 'wo-c' }))).toMatchObject({
+        outcome: 'registered',
+      });
+      const before = await inner.listHeldWorkOrders();
+      expect(before).toMatchObject({ outcome: 'ok', records: [{ workOrderId: 'wo-b', stage: 'held', requestDigest: digest }] });
+      active = overrides(inner, digest);
+      const changed = () => state.useCase.registerWorkOrder(request({ workOrderId: 'wo-b', baseCommit: NEW_BASE }));
+      return { inner, before, changed };
+    };
+
+    const isReplacement = (record: HeldWorkOrderRecord) => record.blockerId === 'wo-c';
+
+    it.each([
+      ['refuses', async () => ({ outcome: 'refused', reason: 'store-unavailable' })],
+      ['throws', async () => {
+        throw new Error('boom');
+      }],
+    ])('restores the stale record byte-identical and leaves no replacement intent when completing the hold %s', async (_label, answer) => {
+      const { inner, before, changed } = await arrange((repo, staleDigest) => ({
+        // Only the replacement's completion fails; the stale record's own settle must work.
+        completeHoldIntent: async (input) =>
+          input.requestDigest === staleDigest ? repo.completeHoldIntent(input) : ((await answer()) as never),
+      }));
+      const result = await changed();
+      expect(result).toEqual(REFUSED);
+      expect(Object.hasOwn(result, 'supersededHeld')).toBe(false);
+      expect(await inner.listHeldWorkOrders()).toEqual(before);
+    });
+
+    it.each([
+      ['refuses', async () => ({ outcome: 'refused', reason: 'store-unavailable' })],
+      ['throws', async () => {
+        throw new Error('boom');
+      }],
+    ])('restores the stale record when recording the replacement intent %s', async (_label, answer) => {
+      const { inner, before, changed } = await arrange((repo) => ({
+        recordHoldIntent: async (record) => (isReplacement(record) ? ((await answer()) as never) : repo.recordHoldIntent(record)),
+      }));
+      const result = await changed();
+      expect(result).toEqual(REFUSED);
+      expect(await inner.listHeldWorkOrders()).toEqual(before);
+    });
+
+    it('answers store-unavailable when completion keeps failing, so the stale record cannot be settled again', async () => {
+      const { inner, changed } = await arrange(() => ({
+        completeHoldIntent: async () => ({ outcome: 'refused', reason: 'store-unavailable' }),
+      }));
+      const result = await changed();
+      expect(result).toEqual(REFUSED);
+      expect(Object.hasOwn(result, 'supersededHeld')).toBe(false);
+      const listed = await inner.listHeldWorkOrders();
+      // Truthful, not clean: the stale record is back as its intent and no replacement remains.
+      expect(listed.outcome === 'ok' && listed.records.map((r) => [r.blockerId, r.stage])).toEqual([['wo-a', 'intent']]);
+    });
+
+    it('answers store-unavailable and says so when the replacement intent cannot be removed after a refused completion', async () => {
+      let deletes = 0;
+      const { inner, changed } = await arrange((repo) => ({
+        completeHoldIntent: async () => ({ outcome: 'refused', reason: 'store-unavailable' }),
+        deleteHeldWorkOrder: async (workOrderId, digest) => {
+          deletes += 1;
+          // The first delete is the stale one; every later one (the replacement's removal) is refused.
+          return deletes === 1 ? repo.deleteHeldWorkOrder(workOrderId, digest) : { outcome: 'refused' };
+        },
+      }));
+      const result = await changed();
+      expect(result).toEqual(REFUSED);
+      expect(Object.hasOwn(result, 'supersededHeld')).toBe(false);
+      const listed = await inner.listHeldWorkOrders();
+      expect(listed.outcome === 'ok' && listed.records.map((r) => [r.blockerId, r.stage])).toEqual([['wo-c', 'intent']]);
+    });
+
+    it('supersedes and leaves exactly one record on the happy path', async () => {
+      const { inner, before, changed } = await arrange(() => ({}));
+      const result = await changed();
+      expect(result).toMatchObject({
+        outcome: 'refused',
+        reason: 'active-work-order-overlap',
+        held: true,
+        supersededHeld: { blockerId: 'wo-a' },
+      });
+      const listed = await inner.listHeldWorkOrders();
+      expect(listed.outcome === 'ok' && listed.records).toHaveLength(1);
+      expect(listed).not.toEqual(before);
+      expect(listed.outcome === 'ok' && listed.records[0]).toMatchObject({ blockerId: 'wo-c', stage: 'held' });
+    });
+  });
 });

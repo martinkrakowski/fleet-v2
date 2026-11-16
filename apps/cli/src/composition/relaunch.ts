@@ -9,6 +9,8 @@
  * the state directory and the two read-only effects (worktree listing and the
  * runner status read).
  */
+import { promises as fs } from 'node:fs';
+
 import {
   AttemptRepositoryAdapter,
   ConductorDriverLeaseAdapter,
@@ -33,6 +35,30 @@ export interface ComposeReadOnlyRelaunchInput {
   readonly computeDigest: (text: string) => string;
   /** The live clock for the plan's deadline check; defaults to the system clock. */
   readonly clock?: () => string;
+  /** Whether the state directory existed, as a directory, before any adapter was composed; false refuses both commands. */
+  readonly stateDirPresentAtStart?: boolean;
+}
+
+/**
+ * Read-only probe for the state directory: true when none is configured (in-memory stores) or when
+ * it exists and is a directory. A mistyped or unmounted path is never an empty installation, and
+ * no relaunch command creates it.
+ */
+function stateAvailableProbe(
+  stateDir: string | undefined,
+  presentAtStart: boolean | undefined,
+): (() => Promise<boolean>) | undefined {
+  if (stateDir === undefined || stateDir.trim().length === 0) return undefined;
+  return async () => {
+    // Other adapters create the state directory while the runtime is built, so the answer taken
+    // before anything was composed is the one that tells a mistyped path from an empty installation.
+    if (presentAtStart === false) return false;
+    try {
+      return (await fs.stat(stateDir)).isDirectory();
+    } catch {
+      return false;
+    }
+  };
 }
 
 export function composeReadOnlyRelaunch(input: ComposeReadOnlyRelaunchInput) {
@@ -45,7 +71,9 @@ export function composeReadOnlyRelaunch(input: ComposeReadOnlyRelaunchInput) {
   const halt = new ConductorHaltAdapter({ stateDir, readOnly: true });
   const driverLease = new ConductorDriverLeaseAdapter({ stateDir, readOnly: true });
 
+  const stateAvailable = stateAvailableProbe(stateDir, input.stateDirPresentAtStart);
   const inventoryRelaunch = new InventoryRelaunchUseCase({
+    ...(stateAvailable === undefined ? {} : { stateAvailable }),
     runRepo,
     attemptRepo,
     workspace,
@@ -59,6 +87,7 @@ export function composeReadOnlyRelaunch(input: ComposeReadOnlyRelaunchInput) {
   // store is the one allowed write, and nothing else holds it.
   const relaunchPlanRepository = new RelaunchPlanRepositoryAdapter({ stateDir });
   const planRelaunch = new PlanRelaunchUseCase({
+    ...(stateAvailable === undefined ? {} : { stateAvailable }),
     inventory: inventoryRelaunch,
     runRepo,
     attemptRepo,

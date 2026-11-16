@@ -65,6 +65,11 @@ export interface InventoryRelaunchDependencies {
   readonly halt: Pick<ConductorHaltPort, 'read'>;
   readonly driverLease: Pick<ConductorDriverLeasePort, 'read'>;
   readonly runnerForAttempt?: RunnerForAttemptPort;
+  /**
+   * Read-only probe: whether the state directory exists and is a directory.
+   * False refuses the inventory (a missing directory is not an empty installation).
+   */
+  readonly stateAvailable?: () => Promise<boolean>;
   /** The digest used for an unrecorded worktree's lane id (12 hex of the path's digest). */
   readonly computeDigest: (text: string) => string;
 }
@@ -230,6 +235,16 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     const deps = this.deps;
     if (!isValidRequest(request)) {
       return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    if (deps.stateAvailable !== undefined) {
+      let available = false;
+      try {
+        available = await deps.stateAvailable();
+      } catch {
+        available = false;
+      }
+      if (!available) return { outcome: 'refused', reason: 'records-unreadable' };
     }
 
     // 1. Read the records. Without them no population can be told, so an

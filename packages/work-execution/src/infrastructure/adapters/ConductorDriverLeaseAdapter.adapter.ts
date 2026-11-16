@@ -142,10 +142,11 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
     try {
       records = await this.readRecordsFromDisk(target);
     } catch (error: unknown) {
-      // CO29a-ro2: a read-only read of unreadable bytes surfaces the port's
-      // typed unreadable error, never an absent lease. A writable read keeps
-      // its own error (it has already quarantined and thrown).
-      if (error instanceof StateFileUnreadableReadOnlyError) {
+      // CO29a-ro2: every read-only read failure other than a true ENOENT (which
+      // readRecordsFromDisk answers as an empty list) surfaces the port's typed
+      // unreadable error, never an absent lease. A writable read keeps its own
+      // error (it has already quarantined and thrown).
+      if (this.options?.readOnly === true) {
         throw new ConductorDriverLeaseUnreadableError({ cause: error });
       }
       throw error;
@@ -231,6 +232,11 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
   private async readRecordsFromDisk(target: string): Promise<readonly ConductorDriverLeaseRecord[]> {
     let buffer: Buffer;
     try {
+      if (this.options?.readOnly === true) {
+        // A symlink (dangling or not) or a non-regular file is unreadable, never absent.
+        const info = await fs.lstat(target);
+        if (!info.isFile()) throw new StateFileUnreadableReadOnlyError(target, 'not a regular file');
+      }
       buffer = await fs.readFile(target);
     } catch (error: unknown) {
       if (

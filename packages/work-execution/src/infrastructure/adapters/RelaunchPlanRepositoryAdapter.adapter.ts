@@ -397,15 +397,16 @@ export class RelaunchPlanRepositoryAdapter implements RelaunchPlanRepositoryPort
         this.inMemoryPlans.set(read.planDigest, deepCopy(read));
         return { outcome: 'saved', planDigest: read.planDigest, plan: read };
       }
+      // A missing or non-directory state directory is never created: read-only stat before any lock.
+      if (!(await isDirectory(path.dirname(target)))) return { outcome: 'refused', reason: 'store-unreadable' };
+      // Decide read-only first: only a save that will write takes the lock.
+      const first = await this.decideOnDisk(target, read);
+      if (first.kind === 'done') return first.result;
       return await withFileLock(`${target}.lock`, async (): Promise<SaveRelaunchPlanResult> => {
-        const current = await this.readFromDisk(target);
-        if (current.status === 'unknown-version') return { outcome: 'refused', reason: 'store-unknown-version' };
-        if (current.status === 'unreadable') return { outcome: 'refused', reason: 'store-unreadable' };
-        const decision = decideSave(current.records, read);
-        if (decision.kind === 'refused') return { outcome: 'refused', reason: decision.reason };
-        if (decision.kind === 'unchanged') {
-          return { outcome: 'unchanged', planDigest: decision.stored.planDigest, plan: decision.stored };
-        }
+        // Re-check under the lock: another writer may have stored the plan since the unlocked read.
+        const again = await this.decideOnDisk(target, read);
+        if (again.kind === 'done') return again.result;
+        const current = { records: again.records };
         const next = [...current.records, read];
         if (Buffer.byteLength(`${JSON.stringify(next, null, 2)}\n`, 'utf8') > MAX_PLAN_STORE_BYTES) {
           return { outcome: 'refused', reason: 'store-limit-exceeded' };
@@ -416,6 +417,25 @@ export class RelaunchPlanRepositoryAdapter implements RelaunchPlanRepositoryPort
     } catch (error: unknown) {
       return { outcome: 'refused', reason: error instanceof StateFileUnknownVersionError ? 'store-unknown-version' : 'store-unreadable' };
     }
+  }
+
+  /** Reads the store and decides the save without writing or locking; `append` carries the records read. */
+  private async decideOnDisk(
+    target: string,
+    read: RelaunchPlanRecord,
+  ): Promise<
+    | { readonly kind: 'done'; readonly result: SaveRelaunchPlanResult }
+    | { readonly kind: 'append'; readonly records: RelaunchPlanRecord[] }
+  > {
+    const current = await this.readFromDisk(target);
+    if (current.status === 'unknown-version') return { kind: 'done', result: { outcome: 'refused', reason: 'store-unknown-version' } };
+    if (current.status === 'unreadable') return { kind: 'done', result: { outcome: 'refused', reason: 'store-unreadable' } };
+    const decision = decideSave(current.records, read);
+    if (decision.kind === 'refused') return { kind: 'done', result: { outcome: 'refused', reason: decision.reason } };
+    if (decision.kind === 'unchanged') {
+      return { kind: 'done', result: { outcome: 'unchanged', planDigest: decision.stored.planDigest, plan: decision.stored } };
+    }
+    return { kind: 'append', records: current.records };
   }
 
   async findByDigest(planDigest: string): Promise<FindRelaunchPlanResult> {
@@ -463,6 +483,15 @@ export class RelaunchPlanRepositoryAdapter implements RelaunchPlanRepositoryPort
     if (inspection.status === 'unreadable') return { status: 'unreadable' };
     if (inspection.records.length > MAX_STORED_PLANS) return { status: 'unreadable' };
     return { status: 'ok', records: [...inspection.records] };
+  }
+}
+
+/** Read-only stat: true only when `dir` exists and is a directory. */
+async function isDirectory(dir: string): Promise<boolean> {
+  try {
+    return (await fs.stat(dir)).isDirectory();
+  } catch {
+    return false;
   }
 }
 

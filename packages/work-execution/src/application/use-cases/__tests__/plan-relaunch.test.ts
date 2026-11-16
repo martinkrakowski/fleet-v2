@@ -577,6 +577,10 @@ describe('PlanRelaunchUseCase', () => {
       ['attempt store throws', (_w, s) => s.fail.add('attempts'), ['store-read-failed']],
       ['work order store throws', (_w, s) => s.fail.add('workOrders'), ['store-read-failed']],
       ['lane plan store throws', (_w, s) => s.fail.add('lanePlans'), ['store-read-failed']],
+      // A reference that cannot be resolved is never planned around (dependency edges and overlap would drop).
+      ['work-order store is empty (missing file)', (w) => (w.workOrders = []), ['inconsistent-records']],
+      ['work-order store lacks one referenced id', (w) => (w.workOrders = w.workOrders.filter((o) => o.id !== 'wo-a')), ['inconsistent-records']],
+      ['an inventoried run is gone at the re-read', (w) => (w.runs = []), ['inconsistent-records']],
     ];
     for (const [name, mutate, reasons] of cases) {
       const { result, state } = await unknown(mutate);

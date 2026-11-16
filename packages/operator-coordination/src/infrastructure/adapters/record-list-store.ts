@@ -43,10 +43,20 @@ export async function readRecordList<T>(
 ): Promise<T[]> {
   let buffer: Buffer;
   try {
+    if (readOnly) {
+      // A symlink (dangling or not) or a non-regular file is unreadable, never an absent store.
+      const info = await fs.lstat(path);
+      if (!info.isFile()) {
+        throw new StateFileUnreadableReadOnlyError(path, 'not a regular file');
+      }
+    }
     buffer = await fs.readFile(path);
   } catch (error: unknown) {
     if (isNotFound(error)) {
       return [];
+    }
+    if (error instanceof StateFileUnreadableReadOnlyError) {
+      throw error;
     }
     throw new Error(`${adapterName} could not read ${path}: ${describe(error)}`);
   }

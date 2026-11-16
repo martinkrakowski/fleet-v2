@@ -579,6 +579,78 @@ describe('relaunch plan (production composition)', () => {
     }
   });
 
+  it.each(['missing', 'file'] as const)(
+    'relaunch inventory and relaunch plan refuse a state directory that is %s, creating and writing nothing',
+    async (kind) => {
+      const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'fleet-v2-relaunch-statedir-')));
+      roots.push(root);
+      const stateDir = path.join(root, 'not-mounted');
+      if (kind === 'file') await fs.writeFile(stateDir, 'not a directory CANARY', 'utf8');
+      const runtime = createFleetCliRuntime({ stateDir });
+
+      const inventoryIo = capture();
+      const inventoryCode = await runCli(['relaunch', 'inventory'], inventoryIo, runtime);
+      expect(inventoryCode).toBe(1);
+      expect(JSON.parse(inventoryIo.out.join(''))).toEqual({ outcome: 'refused', reason: 'records-unreadable' });
+
+      const planned = await plan(runtime);
+      expect(planned.code).toBe(1);
+      // A file cannot hold the profile store, so the listing itself is the first thing unreadable.
+      expect(planned.result).toEqual({
+        outcome: 'unknown',
+        reasons: [kind === 'missing' ? 'store-read-failed' : 'profile-records-unreadable'],
+      });
+
+      // Building the runtime creates a missing directory (the chain store does, for every command);
+      // the relaunch commands themselves write no plan and leave no lock.
+      if (kind === 'missing') {
+        const names = await fs.readdir(stateDir);
+        expect(names).not.toContain('relaunch-plans.json');
+        expect(names.filter((name) => name.endsWith('.lock'))).toEqual([]);
+      } else {
+        expect(await fs.readFile(stateDir, 'utf8')).toBe('not a directory CANARY');
+      }
+      for (const text of [inventoryIo.out.join(''), planned.stdout, planned.stderr]) {
+        expect(text).not.toContain('CANARY');
+        expect(text).not.toContain(root);
+      }
+    },
+  );
+
+  it.each([
+    { file: 'project-profiles.json', inventory: { outcome: 'refused', reason: 'records-unreadable' }, plan: ['profile-records-unreadable'] },
+    { file: 'conductor-halt.json', inventory: { outcome: 'unknown', reason: 'halt-unreadable' }, plan: ['unknown-runner-state', 'unproven-lane-records'] },
+    { file: 'conductor-driver-lease.json', inventory: { outcome: 'unknown', reason: 'lease-unreadable' }, plan: ['driver-lease-unknown'] },
+  ])(
+    'a dangling symlink at $file is unreadable, never absent: both commands answer non-success and change nothing',
+    async ({ file, inventory }) => {
+      const fx = await seededFixture();
+      await fs.rm(path.join(fx.stateDir, file), { force: true });
+      await fs.symlink(path.join(fx.root, 'gone'), path.join(fx.stateDir, file));
+      const stateBefore = await snapshotStateWithHashes(fx.stateDir);
+
+      const inventoryIo = capture();
+      const inventoryCode = await runCli(['relaunch', 'inventory'], inventoryIo, fx.runtime);
+      expect(inventoryCode).toBe(1);
+      expect(JSON.parse(inventoryIo.out.join(''))).toEqual(inventory);
+
+      const planned = await plan(fx.runtime);
+      expect(planned.code).toBe(1);
+      expect(planned.result.outcome).toBe('unknown');
+      await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await snapshotStateWithHashes(fx.stateDir)).toEqual(stateBefore);
+    },
+  );
+
+  it('answers unknown and stores no plan when work-orders.json is missing but a run and attempts reference work orders', async () => {
+    const fx = await seededFixture();
+    await fs.rm(path.join(fx.stateDir, 'work-orders.json'));
+    const planned = await plan(fx.runtime);
+    expect(planned.code).toBe(1);
+    expect(planned.result).toEqual({ outcome: 'unknown', reasons: ['inconsistent-records'] });
+    await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('refuses invalid flags and an exhausted deadline with exit 1 and writes nothing', async () => {
     const fx = await fixture(['free-one']);
     const invalid = { outcome: 'refused', reason: 'invalid-request' };

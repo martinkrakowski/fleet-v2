@@ -433,4 +433,43 @@ describe('RelaunchPlanRepositoryAdapter', () => {
     expect(text).not.toContain(dir);
     expect(text).not.toMatch(/worktreePath|clonePath|worktreeRoot|stateDir/);
   });
+  it('takes no lock on unchanged, unreadable and unknown-version saves: a state directory that refuses new files still answers them', async () => {
+    const dir = await tempDir();
+    const adapter = new RelaunchPlanRepositoryAdapter({ stateDir: dir });
+    const plan = makePlan();
+    expect((await adapter.save(plan)).outcome).toBe('saved');
+    const target = path.join(dir, 'relaunch-plans.json');
+    const stored = await fs.readFile(target, 'utf8');
+    // Read-only directory: creating relaunch-plans.json.lock would fail, so any lock attempt surfaces as a refusal.
+    await fs.chmod(dir, 0o555);
+    try {
+      expect((await adapter.save(plan)).outcome).toBe('unchanged');
+      expect(await fs.readdir(dir)).toEqual(['relaunch-plans.json']);
+    } finally {
+      await fs.chmod(dir, 0o755);
+    }
+    for (const [bytes, reason] of [
+      ['{broken', 'store-unreadable'],
+      [JSON.stringify([{ ...plan, schemaVersion: 2 }]), 'store-unknown-version'],
+    ] as const) {
+      await fs.writeFile(target, bytes, 'utf8');
+      await fs.chmod(dir, 0o555);
+      try {
+        expect(await adapter.save(makePlan([{ laneId: 'lane-z' }]))).toEqual({ outcome: 'refused', reason });
+        expect(await fs.readdir(dir)).toEqual(['relaunch-plans.json']);
+      } finally {
+        await fs.chmod(dir, 0o755);
+      }
+    }
+    expect(stored.length).toBeGreaterThan(0);
+  });
+
+  it('refuses a save into a state directory that does not exist, creating nothing', async () => {
+    const dir = await tempDir();
+    const missing = path.join(dir, 'not-mounted');
+    const adapter = new RelaunchPlanRepositoryAdapter({ stateDir: missing });
+    expect((await adapter.save(makePlan())).outcome).toBe('refused');
+    await expect(fs.stat(missing)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
 });

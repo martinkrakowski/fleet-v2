@@ -951,6 +951,12 @@ function editOnlyModeOf(
 
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
   const stateDir = options?.stateDir;
+  // Taken before any adapter is composed (some create the directory): the relaunch commands refuse
+  // a state directory that did not exist as a directory instead of reading it as an empty installation.
+  const stateDirPresentAtStart =
+    stateDir === undefined || stateDir.trim().length === 0
+      ? undefined
+      : statSync(stateDir, { throwIfNoEntry: false })?.isDirectory() === true;
   // AM5-3: the auto-merge settings binding re-reads a fresh installation on
   // every call (A7); tests inject a loader over a temp file.
   const autoMergeLoad = options?.loadInstallationForAutoMerge ?? (() => loadInstallation());
@@ -1197,6 +1203,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // `planRelaunch` holds it.
   const { inventoryRelaunch, planRelaunch, relaunchPlanRepository } = composeReadOnlyRelaunch({
     stateDir,
+    stateDirPresentAtStart,
     workspace,
     runnerForAttempt,
     computeDigest: sha256HexDigest,

@@ -226,4 +226,23 @@ describe('ConductorDriverLeaseAdapter read-only mode', () => {
     const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
     expect(await readonlyAdapter.read()).toBeNull();
   });
+  it('read-only: a directory at the lease path, or a dangling symlink, is the typed unreadable error, never an absent lease', async () => {
+    const file = path.join(tempDir, 'conductor-driver-lease.json');
+    await fs.mkdir(file);
+    const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
+    const dirError = await readonlyAdapter.read().catch((error: unknown) => error);
+    expect(dirError).toBeInstanceOf(ConductorDriverLeaseUnreadableError);
+    expect((dirError as Error).cause).toBeDefined();
+    await fs.rmdir(file);
+
+    await fs.symlink(path.join(tempDir, 'does-not-exist'), file);
+    const linkError = await readonlyAdapter.read().catch((error: unknown) => error);
+    expect(linkError).toBeInstanceOf(ConductorDriverLeaseUnreadableError);
+    expect((await fs.lstat(file)).isSymbolicLink()).toBe(true);
+
+    // A truly missing file is still an absent lease.
+    await fs.unlink(file);
+    await expect(readonlyAdapter.read()).resolves.toBeNull();
+  });
+
 });

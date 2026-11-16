@@ -36,7 +36,9 @@ export type PlanRelaunchUnknownReason =
   | 'unproven-lane-records'
   | 'unknown-runner-state'
   | 'driver-lease-unknown'
-  | 'store-read-failed';
+  | 'store-read-failed'
+  /** A run or attempt references a record that cannot be found (or vanished between reads): never planned around. */
+  | 'inconsistent-records';
 
 export type PlanRelaunchRefusalReason =
   | 'invalid-request'

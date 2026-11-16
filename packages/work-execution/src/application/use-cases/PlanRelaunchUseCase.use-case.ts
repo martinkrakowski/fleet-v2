@@ -64,6 +64,8 @@ export interface PlanRelaunchDependencies {
   readonly lanePlanRepo: Pick<LanePlanRepositoryPort, 'listLanePlans'>;
   readonly planRepo: Pick<RelaunchPlanRepositoryPort, 'save'>;
   readonly computeDigest: (text: string) => string;
+  /** Read-only probe: whether the state directory exists and is a directory; false is unknown, never an empty plan. */
+  readonly stateAvailable?: () => Promise<boolean>;
   /** The live clock for `deadlineIso` checks; `request.nowIso` when omitted. */
   readonly clock?: () => string;
 }
@@ -370,6 +372,16 @@ export class PlanRelaunchUseCase implements PlanRelaunchPort {
     };
     const budgetExhausted: PlanRelaunchResult = { outcome: 'refused', reason: 'budget-exhausted' };
 
+    if (deps.stateAvailable !== undefined) {
+      let available = false;
+      try {
+        available = await deps.stateAvailable();
+      } catch {
+        available = false;
+      }
+      if (!available) return { outcome: 'unknown', reasons: ['store-read-failed'] };
+    }
+
     // 1–2. The inventory and the records the join needs.
     const gathered = await this.readInputs(validated, exhausted, budgetExhausted);
     if (!gathered.ok) return gathered.result;
@@ -454,6 +466,9 @@ export class PlanRelaunchUseCase implements PlanRelaunchPort {
       lanePlans = await deps.lanePlanRepo.listLanePlans();
     } catch {
       return { ok: false, result: { outcome: 'unknown', reasons: ['store-read-failed'] } };
+    }
+    if (hasDanglingReference(read.rows, runs, attempts, workOrders)) {
+      return { ok: false, result: { outcome: 'unknown', reasons: ['inconsistent-records'] } };
     }
     return { ok: true, inputs: { read, runs, attempts, workOrders, lanePlans } };
   }
@@ -661,6 +676,31 @@ function readLaneRow(raw: unknown): RelaunchLaneRow | null {
   if (typeof laneId !== 'string' || typeof hostName !== 'string') return null;
   if (!(runId === null || typeof runId === 'string') || !(attemptId === null || typeof attemptId === 'string')) return null;
   return { population, laneId, hostName, worktreePath, runId, attemptId, runnerState, ownership };
+}
+
+/**
+ * True when an inventoried lane's run is gone at the re-read, or a run or attempt it holds references a
+ * work order the re-read cannot find (a missing store file, a record that vanished between the reads). A
+ * lane is never planned from partial data: its dependency edges and overlap would silently drop.
+ */
+function hasDanglingReference(
+  rows: readonly RelaunchLaneRow[],
+  runs: readonly LaneRunRecord[],
+  attempts: readonly AttemptRecord[],
+  workOrders: readonly WorkOrderRecord[],
+): boolean {
+  const runById = new Map(runs.map((run) => [run.runId, run]));
+  const attemptById = new Map(attempts.map((attempt) => [attempt.id, attempt]));
+  const workOrderIds = new Set(workOrders.map((workOrder) => workOrder.id));
+  for (const row of rows) {
+    const run = row.runId === null ? null : runById.get(row.runId);
+    // A run the inventory saw that the re-read no longer holds.
+    if (run === undefined) return true;
+    const attempt = row.attemptId === null ? null : (attemptById.get(row.attemptId) ?? null);
+    const workOrderId = run?.workOrderId ?? attempt?.workOrderId ?? null;
+    if (workOrderId !== null && !workOrderIds.has(workOrderId)) return true;
+  }
+  return false;
 }
 
 /**

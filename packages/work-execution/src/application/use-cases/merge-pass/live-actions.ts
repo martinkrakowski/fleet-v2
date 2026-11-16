@@ -35,6 +35,8 @@ import type {
   MergeForgeActionResult,
 } from '../../ports/out/MergeForgeActionPort.out-port.js';
 import type { ForgeMergeReadPort, ReadForgeMergeResult } from '../../ports/out/ForgeMergeReadPort.out-port.js';
+import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
+import { isRequiredPassHalted } from '../chain-pass-halt.js';
 
 export type MergeLiveActionKind = 'merge-pr' | 'update-branch' | 'post-status';
 
@@ -73,6 +75,8 @@ export interface MergeLiveActionDependencies {
   readonly forgeRead: ForgeMergeReadPort;
   /** Mints one ULID per journal entry id and per forge action id. Injected; never minted here. */
   readonly mintId: () => string;
+  /** The operator kill switch: re-read before every live forge action (plan §3.7). */
+  readonly halt: Pick<ConductorHaltPort, 'read'>;
 }
 
 export interface MergeLivePostStatus {
@@ -114,7 +118,7 @@ export type MergeLiveActionOutcome =
   | {
       readonly outcome: 'skipped';
       readonly journalKey: string;
-      readonly reasonCode: 'already-settled' | 'budget-exhausted' | 'intent-in-flight';
+      readonly reasonCode: 'already-settled' | 'budget-exhausted' | 'intent-in-flight' | 'halted';
     }
   | { readonly outcome: 'invalid-request'; readonly reasonCode: string }
   | { readonly outcome: 'journal-refused'; readonly journalKey: string; readonly refusal: LaneRunJournalRefusal }
@@ -732,12 +736,19 @@ async function actLive(
     return intentFailure;
   }
 
-  const forgeResult = await performForgeAction(deps, forgeRequest);
+  // The halt is re-read after the intent append (which takes a lock and does disk I/O) and directly
+  // before the forge call: nothing is awaited between this read and the call.
+  const haltedAfterIntent = await isRequiredPassHalted(deps.halt);
+  const forgeResult = haltedAfterIntent ? null : await performForgeAction(deps, forgeRequest);
 
   let journalOutcome: LaneRunJournalOutcome;
   let reasonCode: string | null;
   let returned: MergeLiveActionOutcome;
-  if (forgeResult.outcome === 'executed') {
+  if (forgeResult === null) {
+    journalOutcome = 'not-started';
+    reasonCode = 'halted';
+    returned = { outcome: 'skipped', journalKey: key, reasonCode: 'halted' };
+  } else if (forgeResult.outcome === 'executed') {
     journalOutcome = 'completed';
     reasonCode = null;
     returned = { outcome: 'acted', journalKey: key, actionId, headSha: forgeResult.headSha };
@@ -814,5 +825,14 @@ export async function performMergeLiveAction(
     }
     return reconcile(deps, valid);
   }
-  return valid.shadowReason !== null ? actShadow(deps, valid, valid.shadowReason) : actLive(deps, valid);
+  if (valid.shadowReason !== null) {
+    // A shadow dry-run reads nothing and writes no live intent: the halt does
+    // not gate it.
+    return actShadow(deps, valid, valid.shadowReason);
+  }
+  // Every live forge kind is one-way: the kill switch gates it, fail closed.
+  if (await isRequiredPassHalted(deps.halt)) {
+    return { outcome: 'skipped', journalKey: valid.key, reasonCode: 'halted' };
+  }
+  return actLive(deps, valid);
 }

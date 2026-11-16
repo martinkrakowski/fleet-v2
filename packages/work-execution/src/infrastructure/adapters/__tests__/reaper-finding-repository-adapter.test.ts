@@ -176,10 +176,20 @@ describe('reaper finding store: file-specific behaviour', () => {
     const lockPath = path.join(stateDir, 'reaper-findings.json.lock');
     // Hold the lock the way a real holder does, then let the upsert time out.
     let releaseHolder: (() => void) | null = null;
-    const holder = withFileLock(lockPath, () => new Promise<void>((resolve) => {
-      releaseHolder = resolve;
-    }));
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // withFileLock calls fn only after acquiring, so the signal below proves
+    // the lock is held before the upsert is attempted; a fixed sleep would
+    // race under load and let the upsert win the lock.
+    let signalAcquired: (() => void) | null = null;
+    const acquired = new Promise<void>((resolve) => {
+      signalAcquired = resolve;
+    });
+    const holder = withFileLock(lockPath, () => {
+      (signalAcquired as (() => void) | null)?.();
+      return new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+    });
+    await acquired;
     await expect(store.upsertFinding(finding(), FINDING_ID)).rejects.toMatchObject({
       name: 'FileLockTimeoutError',
     });

@@ -223,9 +223,9 @@ describe('node deploy filesystem probes', () => {
       const link = join(root, LINK);
       symlinkSync(FIRST, link);
       const rename = vi.fn(async (from: string, to: string) => {
-        expect(readlinkSync(link)).toBe(FIRST);
-        expect(readlinkSync(from)).toBe(SECOND);
-        expect(to).toBe(link);
+        expect(from).toBe(link);
+        expect(to).not.toBe(link);
+        expect(readlinkSync(from)).toBe(FIRST);
         await renameReal(from, to);
       });
       const { repoint } = createNodeDeployFsProbes({ rename });
@@ -233,7 +233,7 @@ describe('node deploy filesystem probes', () => {
       expect(rename).toHaveBeenCalledTimes(1);
     });
 
-    it('repoint removes the temporary link and keeps the old target when the rename fails', async () => {
+    it('repoint keeps the old target and leaves no temporary entry when the rename fails', async () => {
       const root = newDir();
       const link = join(root, LINK);
       symlinkSync(FIRST, link);

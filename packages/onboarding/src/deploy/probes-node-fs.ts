@@ -1,10 +1,12 @@
 /**
  * The node filesystem half of the deploy probes: `digestTree`, `currentTarget`
  * and `repoint`. A digest follows a symlink only once, at the root of a digest;
- * the walk itself never follows a link. `repoint` moves the install link by
- * rename of a temporary symlink in the same directory and never removes the
- * install link. Every failure path rejects; nothing is retried and no unknown
- * state is treated as success.
+ * the walk itself never follows a link. `repoint` never lets POSIX `rename`
+ * overwrite an unknown entry: when the install link is absent the new link is
+ * created with `symlink`, which refuses to overwrite, and when a link exists it
+ * is renamed aside, verified to still be a symlink, and put back if any step
+ * fails. Every failure path rejects; nothing is retried and no unknown state is
+ * treated as success.
  */
 import { createHash, randomBytes, type Hash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -109,25 +111,63 @@ function assertLinkArguments(link: unknown, target: unknown): void {
 
 async function repoint(link: string, target: string, deps?: NodeDeployFsProbesDeps): Promise<void> {
   assertLinkArguments(link, target);
+  if ((await linkState(link)) === 'symlink') {
+    await replaceLink(link, target, deps?.rename ?? rename);
+    return;
+  }
+  await symlink(target, link);
+}
+
+type LinkState = 'absent' | 'symlink';
+
+async function linkState(link: string): Promise<LinkState> {
   try {
     const stats = await lstat(link);
     if (!stats.isSymbolicLink()) {
       throw fixedError('install link path exists and is not a symbolic link');
     }
+    return 'symlink';
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw error;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return 'absent';
     }
-  }
-  const temp = join(dirname(link), `.${basename(link)}.${randomBytes(8).toString('hex')}.tmp`);
-  await symlink(target, temp);
-  const renameFn = deps?.rename ?? rename;
-  try {
-    await renameFn(temp, link);
-  } catch (error) {
-    await rm(temp, { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+function backupNameFor(link: string): string {
+  return join(dirname(link), `.${basename(link)}.${randomBytes(8).toString('hex')}.tmp`);
+}
+
+async function putBackupBack(backup: string, link: string): Promise<void> {
+  await rename(backup, link).catch(() => undefined);
+}
+
+/**
+ * Replaces an existing symlink without ever letting a `rename` overwrite an
+ * unknown entry: the old link is moved aside, verified to still be a symlink,
+ * and the new link is created with `symlink`, which never overwrites. If
+ * anything fails the old link is put back.
+ */
+async function replaceLink(
+  link: string,
+  target: string,
+  renameFn: (from: string, to: string) => Promise<void>,
+): Promise<void> {
+  const backup = backupNameFor(link);
+  await renameFn(link, backup);
+  const moved = await lstat(backup);
+  if (!moved.isSymbolicLink()) {
+    await putBackupBack(backup, link);
+    throw fixedError('install link path exists and is not a symbolic link');
+  }
+  try {
+    await symlink(target, link);
+  } catch (error) {
+    await putBackupBack(backup, link);
+    throw error;
+  }
+  await rm(backup, { force: true }).catch(() => undefined);
 }
 
 export function createNodeDeployFsProbes(deps?: NodeDeployFsProbesDeps): DeployFsProbes {

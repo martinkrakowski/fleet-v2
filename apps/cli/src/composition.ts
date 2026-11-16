@@ -78,9 +78,11 @@ import {
   ListUnregisteredProjectsUseCase,
   OpencodeApiUsageAdapter,
   PrepareBriefPackageUseCase,
+  PreparePullRequestFeedbackFixUseCase,
   PrepareFixAttemptUseCase,
   CancelPreparedAttemptUseCase,
   ProbeProjectUseCase,
+  PullRequestFindingsReadAdapter,
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RepositoryFactsAdapter,
@@ -824,6 +826,8 @@ export interface FleetCliRuntime {
     readonly killallTrainPause: KillallTrainPauseAdapter;
     /** CO30a: `cutover status` and `cutover rollback`; switch and retire are CO30b. */
     readonly manageCutover: ManageCutoverUseCase;
+    /** CO24comp: PR-feedback fix round preparation and grant-scoped push-to-pr. */
+    readonly preparePullRequestFeedbackFix: PreparePullRequestFeedbackFixUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -1263,6 +1267,35 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     nowIso: () => new Date().toISOString(),
   });
 
+  // CO24comp: the PR-feedback fix round reads findings through the same
+  // reviewed gh subprocess as the other forge reads, and only when the
+  // installation binds github; otherwise the adapter stays unconfigured and
+  // every round refuses instead of reaching for a forge the installation
+  // forbids.
+  const pullRequestFindingsRead =
+    forgeMode === 'github' && forgeGithubSection !== undefined
+      ? new PullRequestFindingsReadAdapter({
+          repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo },
+          runGh: (args, timeoutMs) =>
+            (
+              options?.forgeGhRunner ??
+              ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
+                runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
+            )(args, timeoutMs),
+        })
+      : new PullRequestFindingsReadAdapter();
+  const preparePullRequestFeedbackFix = new PreparePullRequestFeedbackFixUseCase({
+    findings: pullRequestFindingsRead,
+    prepareFixAttempt: execution.prepareFixAttempt,
+    executeForgeAction: execution.executeAuthorizedForgeAction,
+    repository:
+      forgeGithubSection !== undefined
+        ? { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo }
+        : { owner: '', repo: '' },
+    nowIso: () => new Date().toISOString(),
+    mintNonce: () => randomBytes(16).toString('hex'),
+  });
+
   // DT10b: the daemon stack (merge pass, tick, status, pause, forge probe).
   const daemon = composeDaemon({
     stateDir,
@@ -1329,6 +1362,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       cutoverJournal,
       killallTrainPause,
       manageCutover,
+      preparePullRequestFeedbackFix,
       exportLegacyTrainState: new ExportLegacyTrainStateUseCase({
         listMergeQueue: execution.listMergeQueue,
         nowIso: () => new Date().toISOString(),

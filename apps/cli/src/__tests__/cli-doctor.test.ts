@@ -82,6 +82,11 @@ function passingProbes(calls?: string[]): DoctorProbes {
       return { outcome: 'pass', reason: 'answered' };
     },
     serverProbe: async () => ({ outcome: 'pass', reason: 'the opencode server answered' }),
+    pinnedBuild: async () => ({
+      pinnedCommit: 'c'.repeat(40),
+      baseTipCommit: 'c'.repeat(40),
+      behindCount: 0,
+    }),
   };
 }
 

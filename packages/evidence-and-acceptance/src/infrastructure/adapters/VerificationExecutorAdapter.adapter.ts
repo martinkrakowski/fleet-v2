@@ -5,7 +5,10 @@
  * locally or through batch-mode ssh on the configured verification host, and
  * maps the completed process outcome onto the evidence result, fail closed:
  * only exit code 0 of a completed check is `pass`; anything missing, killed
- * or ambiguous is `unknown`. No command is ever run through a shell. A
+ * or ambiguous is `unknown`. Locally the command travels as an argv array
+ * and no shell is involved; over ssh the remote command is run through an
+ * explicit `sh -c` with every word single-quoted, so remote programs must be
+ * PATH executables (or absolute paths), not login-shell functions. A
  * procedure that declares coverage passes only when its reader counted at
  * least `minUnits` units in the full output.
  */
@@ -22,6 +25,7 @@ import type {
   ExecuteVerificationCheckResult,
   VerificationExecutorPort,
 } from '../../application/ports/out/VerificationExecutorPort.out-port.js';
+import { sshArgvFor } from './SshExecutor.adapter.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 
 /** Optional coverage the procedure must show; absent means today's exit-0 rule (plan D3). */
@@ -176,14 +180,6 @@ function resolveCoverageDeclaration(
     unitKind: expectedUnitKind,
     minUnits: declaration.minUnits,
   };
-}
-
-/**
- * ssh joins the words after the destination into one remote shell line, so
- * every remote word is POSIX-single-quoted (`'` becomes `'\''`).
- */
-function quotePosixSingleQuoted(word: string): string {
-  return `'${word.replace(/'/g, "'\\''")}'`;
 }
 
 /** An ssh destination that could inject options or split words never spawns. */
@@ -373,6 +369,18 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
       );
     }
 
+    const nulWord = [resolved.command, ...resolved.args, request.candidateHeadSha].find((word) =>
+      word.includes('\0'),
+    );
+    if (nulWord !== undefined) {
+      return receipt(
+        'unknown',
+        null,
+        `verification command contains a NUL byte; refusing to run '${request.procedureName}'`,
+        completedAtIso,
+      );
+    }
+
     if (!SHA_PATTERN.test(request.candidateHeadSha)) {
       return receipt(
         'unknown',
@@ -420,17 +428,7 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
     let argv: readonly string[];
     if (sshHost !== undefined) {
       file = 'ssh';
-      argv = [
-        '-o',
-        'BatchMode=yes',
-        '-o',
-        'ConnectTimeout=15',
-        sshHost,
-        '--',
-        ...[resolved.command, ...resolved.args, request.candidateHeadSha].map(
-          quotePosixSingleQuoted,
-        ),
-      ];
+      argv = sshArgvFor(sshHost, [resolved.command, ...resolved.args, request.candidateHeadSha]);
     } else {
       file = resolved.command;
       argv = [...resolved.args, request.candidateHeadSha];

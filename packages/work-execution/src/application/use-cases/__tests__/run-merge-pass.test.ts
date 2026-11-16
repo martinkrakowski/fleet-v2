@@ -213,41 +213,44 @@ function makeChainEntry(): MergeQueueEntryRecord {
 }
 
 describe('RunMergePassUseCase observed base (OG-7)', () => {
-  it('a chain entry read on its own chain base journals would-merge', async () => {
-    const { useCase, deps, request } = makeUseCase([makeChainEntry()], {
-      ...greenForge,
-      baseRef: 'chain/example',
-    });
+  // A chain entry is never selected by runPass today: orderMergeQueue/findMergeQueueHead
+  // default an omitted base to DEFAULT_BASE_BRANCH (CO3b review fixes, 7748fd4d), and
+  // runPass calls them with no base (OG-7 fix round: runPass is unchanged from
+  // origin/main, by the brief's own rule). observedBaseFact is still correctly wired in
+  // gatherFacts, but it has no effect for a chain entry until a later unit makes runPass
+  // base-partition-aware; that gap is tracked separately and is out of OG-7's scope. The
+  // decider's own chain-base behaviour (base-unobserved, base-mismatch, would-merge,
+  // checks) is pinned directly against decideMergeStep in merge-queue-decider.test.ts
+  // (the observed base gate block, D1-D3), independent of this selection gap.
+  const laneSoloChainCases: ReadonlyArray<[string, ReadForgeMergeResult]> = [
+    ["the entry's own base", { ...greenForge, baseRef: 'chain/example' }],
+    ['no base', greenForge],
+    ['main', { ...greenForge, baseRef: 'main' }],
+    [
+      "the entry's own base with a failed gate",
+      {
+        ...greenForge,
+        baseRef: 'chain/example',
+        contexts: [
+          { name: 'gate', state: 'FAILURE', isGreen: false, creatorLogin: null },
+          { name: 'premerge', state: 'SUCCESS', isGreen: true, creatorLogin: POSTER },
+        ],
+      },
+    ],
+  ];
 
-    const result = await useCase.runMergePass(request);
+  it.each(laneSoloChainCases)(
+    'a lone chain entry is excluded from the pass before any forge read, whatever the forge would report as the base (%s)',
+    async (_label, forgeResult) => {
+      const { useCase, deps, request } = makeUseCase([makeChainEntry()], forgeResult);
 
-    expect(result.entries[0].decision).toBe('journalled');
-    expect(result.entries[0].reasonCode).toBe('would-merge');
-    expect(await journalOf(deps.journal)).toHaveLength(2);
-  });
+      const result = await useCase.runMergePass(request);
 
-  it('a chain entry whose read carries no base waits base-unobserved and journals nothing', async () => {
-    const { useCase, deps, request } = makeUseCase([makeChainEntry()], greenForge);
-
-    const result = await useCase.runMergePass(request);
-
-    expect(result.entries[0].decision).toBe('no-action');
-    expect(result.entries[0].reasonCode).toBe('base-unobserved');
-    expect(await journalOf(deps.journal)).toHaveLength(0);
-  });
-
-  it('a chain entry read on main waits base-mismatch and journals nothing', async () => {
-    const { useCase, deps, request } = makeUseCase([makeChainEntry()], {
-      ...greenForge,
-      baseRef: 'main',
-    });
-
-    const result = await useCase.runMergePass(request);
-
-    expect(result.entries[0].decision).toBe('no-action');
-    expect(result.entries[0].reasonCode).toBe('base-mismatch');
-    expect(await journalOf(deps.journal)).toHaveLength(0);
-  });
+      expect(result.entries).toHaveLength(0);
+      expect(deps.forgeRead.calls).toBe(0);
+      expect(await journalOf(deps.journal)).toHaveLength(0);
+    },
+  );
 
   it('a main entry read on chain/example waits base-mismatch and journals nothing', async () => {
     const { useCase, deps, request } = makeUseCase([makeEntry()], {
@@ -272,23 +275,6 @@ describe('RunMergePassUseCase observed base (OG-7)', () => {
 
     expect(result.entries[0].decision).toBe('journalled');
     expect(result.entries[0].reasonCode).toBe('would-merge');
-  });
-
-  it('a chain entry on its own base with a failed gate reports checks, not a base reason', async () => {
-    const { useCase, deps, request } = makeUseCase([makeChainEntry()], {
-      ...greenForge,
-      baseRef: 'chain/example',
-      contexts: [
-        { name: 'gate', state: 'FAILURE', isGreen: false, creatorLogin: null },
-        { name: 'premerge', state: 'SUCCESS', isGreen: true, creatorLogin: POSTER },
-      ],
-    });
-
-    const result = await useCase.runMergePass(request);
-
-    expect(result.entries[0].decision).toBe('no-action');
-    expect(result.entries[0].reasonCode).toBe('checks');
-    expect(await journalOf(deps.journal)).toHaveLength(0);
   });
 
   it.each([42, null, '', 'Main', 'chain/Example'])(

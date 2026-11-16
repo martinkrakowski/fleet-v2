@@ -362,7 +362,7 @@ describe('conductor reap --reservations (OG22b)', () => {
       .mockResolvedValue(
         okResult({
           unknown: [{ reservationId: 'res-1', attemptId: 'att-1', reason: 'run-state-unknown' }],
-          failed: [{ reservationId: 'res-2', attemptId: 'att-2', reason: 'conflict' }],
+          failed: [{ reservationId: 'res-2', attemptId: 'att-2', reason: 'refused' }],
         }),
       );
     const result = await runConductor(runtime, ['reap', '--reservations', '--yes']);

@@ -7,6 +7,7 @@ import type { AuthorBriefRequest, BuildFactPackFact, AcceptanceSpecProps, BriefC
 import { FACT_PACK_MAX_FACTS } from '@fleet/work-execution';
 import { str, optStr, strOrNull, num, strArr, nested, nestedArr, jsonStrArr, jsonObj, derivedV2Model, briefSeatPlan, safeJsonParse, CliUsageError } from './payload.js';
 import type { CommandHandler, Payload } from './payload.js';
+import type { FleetCliRuntime } from '../composition.js';
 
 export const briefCommands: Readonly<Record<string, CommandHandler>> = {
     prepare: async (p, rt) => {
@@ -109,317 +110,435 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
       });
     },
 
-    // CO17c: `brief author` builds one request, calls the use case once, and
-    // returns its result unchanged. The seat's answer is the only prose: the
-    // handler validates the invocation shape (exit 2 on a malformed one),
-    // never dispatches, writes nothing and prints nothing itself.
-    author: async (p, rt) => {
-      /**
-       * Copy one plain JSON value (string / number / boolean / null / plain
-       * object / array) into fresh containers. Every nested payload value that
-       * reaches the use case goes through this: the payload may be a Proxy, so
-       * returning the original object (as `jsonObj`, `nested` or a parsed
-       * array would) would forward that Proxy to the use case.
-       */
-      const copyJson = <T>(value: T): T => {
-        if (Array.isArray(value)) {
-          return value.map((item) => copyJson(item)) as unknown as T;
-        }
-        if (value !== null && typeof value === 'object') {
-          const source = value as Record<string, unknown>;
-          const copy: Record<string, unknown> = {};
-          for (const key of Object.keys(source)) {
-            copy[key] = copyJson(source[key]);
-          }
-          return copy as unknown as T;
-        }
-        return value;
-      };
-      /** Copy a nested payload value, refusing an unreadable one as usage. */
-      const copyField = <T>(value: T): T => {
-        try {
-          return copyJson(value);
-        } catch {
-          throw new CliUsageError('brief author could not read its arguments');
-        }
-      };
-      /** Read one payload field exactly once; a throwing getter is a usage error. */
-      const field = (key: string): unknown => {
-        try {
-          return p[key];
-        } catch {
-          throw new CliUsageError('brief author could not read its arguments');
-        }
-      };
-      /** Read one field through the shared coercion helper, still exactly once. */
-      const viaHelper = <T>(key: string, read: (payload: Payload) => T): T => read({ [key]: field(key) });
-      /** An optional non-empty string read exactly once. */
-      const opt = (key: string): string | undefined => viaHelper(key, (payload) => optStr(payload, key));
-
-      const required = (key: string): string => {
-        const value = viaHelper(key, (payload) => str(payload, key)).trim();
-        if (value === '') {
-          throw new CliUsageError(`brief author requires --${key}`);
-        }
-        return value;
-      };
-
-      const workOrderId = required('workOrderId');
-      const laneId = required('laneId');
-      const projectId = required('projectId');
-      const taskId = required('taskId');
-      const repository = required('repository');
-      const baseCommit = required('baseCommit');
-      const policyRevision = required('policyRevision');
-      const implementerModel = required('model');
-      const fallbackModel = required('fallbackModel');
-      const independentReviewer = required('independentReviewer');
-      const authorModel = required('authorModel');
-      const checkoutPath = required('checkoutPath');
-      const repositoryPath = required('repositoryPath');
-
-      if (!/^[0-9a-f]{40,64}$/.test(baseCommit)) {
-        throw new CliUsageError('brief author requires --baseCommit as 40 to 64 lowercase hex characters');
-      }
-
-      const worktreePath = required('worktreePath');
-      // Not just the literal `/`: `/.`, `/foo/..`, `//` and friends all
-      // resolve to the filesystem root and are refused the same way.
-      if (!worktreePath.startsWith('/') || resolvePath(worktreePath) === '/') {
-        throw new CliUsageError('brief author requires an absolute --worktreePath that is not the filesystem root');
-      }
-
-      const briefsDir = required('briefsDir');
-      if (!briefsDir.startsWith('/') || briefsDir.split('/').includes('..')) {
-        throw new CliUsageError("brief author requires an absolute --briefsDir with no '..' segment");
-      }
-
-      // The seat answer is the only prose: operator-supplied prose or a
-      // hand-written path is refused before the use case is called.
-      if (opt('proseMarkdown') !== undefined) {
-        throw new CliUsageError('brief author takes the brief from the seat; --proseMarkdown is not accepted');
-      }
-      if (opt('handWrittenBriefPath') !== undefined) {
-        throw new CliUsageError('brief author takes the brief from the seat; --handWrittenBriefPath is not accepted');
-      }
-
-      // Facts: exactly one JSON array, at most FACT_PACK_MAX_FACTS entries,
-      // each copied into a fresh allowlisted object; the length is read once
-      // and a longer array is refused before any element is read.
-      const rawFacts = field('facts');
-      let factsList: readonly unknown[];
-      if (rawFacts === undefined) {
-        throw new CliUsageError("brief author requires a JSON array of fact objects in '--facts'");
-      }
-      if (typeof rawFacts === 'string') {
-        const parsed = safeJsonParse(rawFacts);
-        if (!Array.isArray(parsed)) {
-          throw new CliUsageError("brief author requires a JSON array of fact objects in '--facts'");
-        }
-        factsList = parsed;
-      } else if (Array.isArray(rawFacts)) {
-        factsList = rawFacts;
-      } else {
-        throw new CliUsageError("brief author requires a JSON array of fact objects in '--facts'");
-      }
-      const factCount = factsList.length;
-      if (factCount > FACT_PACK_MAX_FACTS) {
-        throw new CliUsageError('brief author accepts at most 32 facts');
-      }
-      const copiedFacts: BuildFactPackFact[] = [];
-      for (let index = 0; index < factCount; index += 1) {
-        const fact: unknown = factsList[index];
-        if (!(index in factsList) || typeof fact !== 'object' || fact === null || Array.isArray(fact)) {
-          throw new CliUsageError(`brief author fact ${index} is missing`);
-        }
-        const record = fact as Record<string, unknown>;
-        const kind = record['kind'];
-        const label = record['label'];
-        if (typeof kind !== 'string' || typeof label !== 'string' || label === '') {
-          throw new CliUsageError(`brief author fact ${index} is malformed`);
-        }
-        const stringField = (key: string): string => {
-          const value = record[key];
-          if (typeof value !== 'string') {
-            throw new CliUsageError(`brief author fact ${index} is malformed`);
-          }
-          return value;
-        };
-        const numberField = (key: string): number => {
-          const value = record[key];
-          if (typeof value !== 'number') {
-            throw new CliUsageError(`brief author fact ${index} is malformed`);
-          }
-          return value;
-        };
-        // The allowlist copy drops `__proto__`, `constructor` and every other key.
-        if (kind === 'file-list') {
-          copiedFacts.push({ kind, label, pathPrefix: stringField('pathPrefix') });
-        } else if (kind === 'file-range') {
-          copiedFacts.push({
-            kind, label, path: stringField('path'), fromLine: numberField('fromLine'), toLine: numberField('toLine'),
-          });
-        } else if (kind === 'matching-lines') {
-          copiedFacts.push({ kind, label, path: stringField('path'), token: stringField('token') });
-        } else {
-          throw new CliUsageError(`brief author fact ${index} is malformed`);
-        }
-      }
-
-      // The seat tool and the model assignment, as `brief prepare` freezes them.
-      // The decisions are copied into fresh plain objects with an allowlisted
-      // key set: a payload-supplied Proxy or hostile object must not reach the
-      // use case through `contextDecisions`.
-      const rawContextDecisions =
-        viaHelper('contextDecisions', (payload) => nestedArr<BriefContextDecision>(payload, 'contextDecisions')) ?? [];
-      const contextDecisions: BriefContextDecision[] = [];
-      for (let decisionIndex = 0; decisionIndex < rawContextDecisions.length; decisionIndex += 1) {
-        let rawDecision: unknown;
-        try {
-          rawDecision = rawContextDecisions[decisionIndex];
-        } catch {
-          throw new CliUsageError('brief author could not read its arguments');
-        }
-        if (!rawDecision || typeof rawDecision !== 'object' || Array.isArray(rawDecision)) {
-          throw new CliUsageError(
-            "brief author contextDecisions requires a non-empty 'decisionBecause' for each item",
-          );
-        }
-        const record = rawDecision as Record<string, unknown>;
-        const stringField = (key: string): string => {
-          const value = record[key];
-          if (typeof value !== 'string' || value.trim() === '') {
-            throw new CliUsageError(
-              "brief author contextDecisions requires a non-empty 'decisionBecause' for each item",
-            );
-          }
-          return value;
-        };
-        contextDecisions.push({
-          proposalId: stringField('proposalId'),
-          knowledgeEntryId: stringField('knowledgeEntryId'),
-          version: stringField('version'),
-          proposedBecause: stringField('proposedBecause'),
-          accepted: record['accepted'] === true,
-          decisionBecause: stringField('decisionBecause'),
-        });
-      }
-      const nestedAssignment = viaHelper('modelAssignment', (payload) => nested<BriefModelAssignment>(payload, 'modelAssignment'));
-      const rawSeatTool = field('seatTool') ?? nestedAssignment?.seatTool;
-      const seatTool = parseSeatTool(rawSeatTool);
-      if (seatTool === undefined) {
-        throw new CliUsageError(
-          'brief author requires --seatTool naming a declared runner kind (opencode or agy)',
-        );
-      }
-      if (
-        nestedAssignment !== undefined &&
-        nestedAssignment.seatTool !== undefined &&
-        nestedAssignment.seatTool !== seatTool
-      ) {
-        throw new CliUsageError(
-          `'--seatTool ${String(seatTool)}' conflicts with the seat tool in --modelAssignment`,
-        );
-      }
-      // The seat plan is read through the guarded helper, but only from a
-      // fresh plain payload built from single reads: the raw payload object
-      // never reaches it.
-      const seatPlanRaw = briefSeatPlan(
-        {
-          seatPlan: field('seatPlan'),
-          seatPlanFromInstallation: field('seatPlanFromInstallation'),
-        },
-        rt,
-      );
-      // The plan may be the payload's own object (a Proxy's target); only the
-      // copy travels with the request.
-      const seatPlan = seatPlanRaw === undefined ? undefined : copyField(seatPlanRaw);
-      const unhealthy = new Set(unhealthySeatIdsFromCatalog(derivedV2Model(rt)));
-      // `--model` was read once above and `required` guarantees it, so the
-      // seat plan's auto-selection never applies here.
-      const modelSupplied = implementerModel !== '';
-      const planSeatForAssignment =
-        seatPlan !== undefined && nestedAssignment === undefined && !modelSupplied
-          ? seatPlan['first-pass'].find((seat) => !unhealthy.has(seat.id))
-          : undefined;
-      if (
-        seatPlan !== undefined &&
-        nestedAssignment === undefined &&
-        !modelSupplied &&
-        planSeatForAssignment === undefined
-      ) {
-        throw new CliUsageError(
-          'Every first-pass seat of the seat plan is unhealthy; pass --model to choose one',
-        );
-      }
-      let modelAssignment: BriefModelAssignment;
-      if (nestedAssignment !== undefined) {
-        // A shallow spread would still share any nested value the payload's
-        // assignment object carries; copy it like every other nested field.
-        modelAssignment = { ...copyField(nestedAssignment), seatTool };
-      } else if (planSeatForAssignment !== undefined) {
-        modelAssignment = {
-          model: planSeatForAssignment.model,
-          variant: planSeatForAssignment.variant ?? 'default',
-          fallbackModel: fallbackModel || planSeatForAssignment.model,
-          seatTool,
-          ...(planSeatForAssignment.agent !== undefined ? { agent: planSeatForAssignment.agent } : {}),
-        } as BriefModelAssignment;
-      } else {
-        modelAssignment = {
-          model: implementerModel,
-          variant: viaHelper('variant', (payload) => str(payload, 'variant')) || 'default',
-          fallbackModel,
-          seatTool,
-        };
-      }
-
-      const allowedPathPrefixes = viaHelper('allowedPathPrefixes', (payload) => jsonStrArr(payload, 'allowedPathPrefixes', 'brief author'));
-      // `jsonStrArr` may return the payload's own array and `jsonObj` returns
-      // the parsed payload object itself; copy both so no Proxy or shared
-      // object reaches the use case.
-      const acceptanceSpecRaw = viaHelper('acceptanceSpec', (payload) => jsonObj(payload, 'acceptanceSpec', 'brief author'));
-      const acceptanceSpec = acceptanceSpecRaw === undefined ? undefined : copyField(acceptanceSpecRaw);
-      const prepare = {
-        workOrderId,
-        projectId,
-        taskId,
-        laneId,
-        repository,
-        baseCommit,
-        policyRevision,
-        modelAssignment,
-        independentReviewer,
-        ownedPaths: viaHelper('ownedPaths', (payload) => strArr(payload, 'ownedPaths')),
-        allowedPathPrefixes: [...allowedPathPrefixes],
-        permissions: viaHelper('permissions', (payload) => strArr(payload, 'permissions')),
-        acceptanceChecks: viaHelper('acceptanceChecks', (payload) => strArr(payload, 'acceptanceChecks')),
-        acceptanceSpec,
-        stepLimit: viaHelper('stepLimit', (payload) => num(payload, 'stepLimit', 200)),
-        timeLimitSeconds: viaHelper('timeLimitSeconds', (payload) => num(payload, 'timeLimitSeconds', 3600)),
-        resourceBounds: copyField(viaHelper('resourceBounds', (payload) => nested<Record<string, string>>(payload, 'resourceBounds')) ?? {}),
-        expectedArtifacts: viaHelper('expectedArtifacts', (payload) => strArr(payload, 'expectedArtifacts')),
-        ownerDecisionReferences: viaHelper('ownerDecisionReferences', (payload) => strArr(payload, 'ownerDecisionReferences')),
-        contextDecisions,
-        attemptId: opt('attemptId'),
-        worktreePath,
-        ...(seatPlan !== undefined ? { seatPlan } : {}),
-      };
-
-      const authorVariant = opt('authorVariant');
-      const authorAgent = opt('authorAgent');
-      return rt.execution.authorBrief.authorBrief({
-        workOrderId,
-        laneId,
-        prepare: prepare as AuthorBriefRequest['prepare'],
-        factPack: { repositoryPath, commit: baseCommit, facts: copiedFacts },
-        seat: {
-          model: authorModel,
-          ...(authorVariant !== undefined ? { variant: authorVariant } : {}),
-          ...(authorAgent !== undefined ? { agent: authorAgent } : {}),
-        },
-        checkoutPath,
-        briefsDir,
-      });
-    },
+    author: async (p, rt) => authorBriefCommand(p, rt),
 };
+
+// ---------------------------------------------------------------------------
+// CO17c: `brief author` helpers. Every read of an untrusted payload value goes
+// through `readArgument` / `copyUntrusted`: no method of the value is called,
+// no getter runs, and any throw during inspection is a fixed-message usage
+// error that never echoes the thrown text.
+// ---------------------------------------------------------------------------
+
+const UNREADABLE = 'brief author could not read its arguments';
+const FACTS_SHAPE = "brief author requires a JSON array of fact objects in '--facts'";
+const DECISION_SHAPE = "brief author contextDecisions requires a non-empty 'decisionBecause' for each item";
+const COPY_MAX_DEPTH = 16;
+const COPY_MAX_NODES = 5000;
+
+interface CopyBudget {
+  nodes: number;
+}
+
+function refuseUnreadable(): never {
+  throw new CliUsageError(UNREADABLE);
+}
+
+/** One own data property's value; an accessor or a trap that misbehaves is a refusal. */
+function ownDataValue(owner: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+  if (descriptor === undefined) {
+    return undefined;
+  }
+  if (!('value' in descriptor)) {
+    return refuseUnreadable();
+  }
+  return descriptor.value as unknown;
+}
+
+/** A bounded array length read once from a value `Array.isArray` accepted. */
+function readLength(value: object): number {
+  const length = ownDataValue(value, 'length');
+  if (typeof length !== 'number' || !Number.isInteger(length) || length < 0 || length > COPY_MAX_NODES) {
+    return refuseUnreadable();
+  }
+  return length;
+}
+
+function copyArray(value: object, depth: number, budget: CopyBudget): unknown[] {
+  const length = readLength(value);
+  const out: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    out.push(copyNode(ownDataValue(value, String(index)), depth + 1, budget));
+  }
+  return out;
+}
+
+function copyRecord(value: object, depth: number, budget: CopyBudget): Record<string, unknown> {
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return refuseUnreadable();
+  }
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    // defineProperty makes `__proto__` an ordinary own key of the copy.
+    Object.defineProperty(out, key, {
+      value: copyNode(ownDataValue(value, key), depth + 1, budget),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return out;
+}
+
+function copyNode(value: unknown, depth: number, budget: CopyBudget): unknown {
+  budget.nodes += 1;
+  if (depth > COPY_MAX_DEPTH || budget.nodes > COPY_MAX_NODES) {
+    return refuseUnreadable();
+  }
+  if (value === null || value === undefined || typeof value === 'string' || typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : refuseUnreadable();
+  }
+  if (typeof value !== 'object') {
+    return refuseUnreadable();
+  }
+  return Array.isArray(value) ? copyArray(value, depth, budget) : copyRecord(value, depth, budget);
+}
+
+/** Copy one untrusted value into fresh plain containers, or refuse it as usage. */
+function copyUntrusted<T>(value: T): T {
+  try {
+    return copyNode(value, 0, { nodes: 0 }) as T;
+  } catch {
+    return refuseUnreadable();
+  }
+}
+
+/** Read one payload field exactly once; a throwing getter is a usage error. */
+function readArgument(p: Payload, key: string): unknown {
+  try {
+    return p[key];
+  } catch {
+    return refuseUnreadable();
+  }
+}
+
+interface ArgumentReader {
+  /** The field's value, read once and deep-copied into plain data. */
+  safe(key: string): unknown;
+  /** The field through a shared coercion helper, over the safe copy. */
+  via<T>(key: string, read: (payload: Payload) => T): T;
+  opt(key: string): string | undefined;
+  required(key: string): string;
+  raw(key: string): unknown;
+}
+
+function makeReader(p: Payload): ArgumentReader {
+  const safe = (key: string): unknown => copyUntrusted(readArgument(p, key));
+  const via = <T>(key: string, read: (payload: Payload) => T): T => read({ [key]: safe(key) });
+  return {
+    safe,
+    via,
+    raw: (key) => readArgument(p, key),
+    opt: (key) => via(key, (payload) => optStr(payload, key)),
+    required: (key) => {
+      const value = via(key, (payload) => str(payload, key)).trim();
+      if (value === '') {
+        throw new CliUsageError(`brief author requires --${key}`);
+      }
+      return value;
+    },
+  };
+}
+
+interface AuthorScalars {
+  workOrderId: string;
+  laneId: string;
+  projectId: string;
+  taskId: string;
+  repository: string;
+  baseCommit: string;
+  policyRevision: string;
+  implementerModel: string;
+  fallbackModel: string;
+  independentReviewer: string;
+  authorModel: string;
+  checkoutPath: string;
+  repositoryPath: string;
+  worktreePath: string;
+  briefsDir: string;
+}
+
+function readScalars(read: ArgumentReader): AuthorScalars {
+  const workOrderId = read.required('workOrderId');
+  const laneId = read.required('laneId');
+  const projectId = read.required('projectId');
+  const taskId = read.required('taskId');
+  const repository = read.required('repository');
+  const baseCommit = read.required('baseCommit');
+  const policyRevision = read.required('policyRevision');
+  const implementerModel = read.required('model');
+  const fallbackModel = read.required('fallbackModel');
+  const independentReviewer = read.required('independentReviewer');
+  const authorModel = read.required('authorModel');
+  const checkoutPath = read.required('checkoutPath');
+  const repositoryPath = read.required('repositoryPath');
+
+  if (!/^[0-9a-f]{40,64}$/.test(baseCommit)) {
+    throw new CliUsageError('brief author requires --baseCommit as 40 to 64 lowercase hex characters');
+  }
+  const worktreePath = read.required('worktreePath');
+  // Not just the literal `/`: `/.`, `/foo/..`, `//` and friends all
+  // resolve to the filesystem root and are refused the same way.
+  if (!worktreePath.startsWith('/') || resolvePath(worktreePath) === '/') {
+    throw new CliUsageError('brief author requires an absolute --worktreePath that is not the filesystem root');
+  }
+  const briefsDir = read.required('briefsDir');
+  if (!briefsDir.startsWith('/') || briefsDir.split('/').includes('..')) {
+    throw new CliUsageError("brief author requires an absolute --briefsDir with no '..' segment");
+  }
+  // The seat answer is the only prose: operator-supplied prose or a
+  // hand-written path is refused before the use case is called.
+  if (read.opt('proseMarkdown') !== undefined) {
+    throw new CliUsageError('brief author takes the brief from the seat; --proseMarkdown is not accepted');
+  }
+  if (read.opt('handWrittenBriefPath') !== undefined) {
+    throw new CliUsageError('brief author takes the brief from the seat; --handWrittenBriefPath is not accepted');
+  }
+  return {
+    workOrderId, laneId, projectId, taskId, repository, baseCommit, policyRevision, implementerModel,
+    fallbackModel, independentReviewer, authorModel, checkoutPath, repositoryPath, worktreePath, briefsDir,
+  };
+}
+
+/** The facts input as an array: one JSON array, bounded before any element is read. */
+function readFactsList(read: ArgumentReader): readonly unknown[] {
+  const rawFacts = read.raw('facts');
+  if (rawFacts === undefined) {
+    throw new CliUsageError(FACTS_SHAPE);
+  }
+  let source: unknown = rawFacts;
+  if (typeof rawFacts === 'string') {
+    source = safeJsonParse(rawFacts);
+  }
+  if (!Array.isArray(source)) {
+    throw new CliUsageError(FACTS_SHAPE);
+  }
+  let length: number;
+  try {
+    length = readLength(source);
+  } catch {
+    return refuseUnreadable();
+  }
+  if (length > FACT_PACK_MAX_FACTS) {
+    throw new CliUsageError('brief author accepts at most 32 facts');
+  }
+  return copyUntrusted(source) as unknown[];
+}
+
+function malformedFact(index: number): CliUsageError {
+  return new CliUsageError(`brief author fact ${index} is malformed`);
+}
+
+function factString(record: Record<string, unknown>, key: string, index: number): string {
+  const value = record[key];
+  if (typeof value !== 'string') {
+    throw malformedFact(index);
+  }
+  return value;
+}
+
+function factNumber(record: Record<string, unknown>, key: string, index: number): number {
+  const value = record[key];
+  if (typeof value !== 'number') {
+    throw malformedFact(index);
+  }
+  return value;
+}
+
+/** One fact from a safe plain copy; the allowlist drops every other key. */
+function copyFact(fact: unknown, index: number): BuildFactPackFact {
+  if (typeof fact !== 'object' || fact === null || Array.isArray(fact)) {
+    throw new CliUsageError(`brief author fact ${index} is missing`);
+  }
+  const record = fact as Record<string, unknown>;
+  const kind = record['kind'];
+  const label = record['label'];
+  if (typeof kind !== 'string' || typeof label !== 'string' || label === '') {
+    throw malformedFact(index);
+  }
+  if (kind === 'file-list') {
+    return { kind, label, pathPrefix: factString(record, 'pathPrefix', index) };
+  }
+  if (kind === 'file-range') {
+    return {
+      kind, label, path: factString(record, 'path', index),
+      fromLine: factNumber(record, 'fromLine', index), toLine: factNumber(record, 'toLine', index),
+    };
+  }
+  if (kind === 'matching-lines') {
+    return { kind, label, path: factString(record, 'path', index), token: factString(record, 'token', index) };
+  }
+  throw malformedFact(index);
+}
+
+function readFacts(read: ArgumentReader): BuildFactPackFact[] {
+  return readFactsList(read).map((fact, index) => copyFact(fact, index));
+}
+
+/** The seat tool, as `brief prepare` freezes it, and the payload's own assignment. */
+function readSeatTool(
+  read: ArgumentReader,
+): { nestedAssignment: BriefModelAssignment | undefined; seatTool: NonNullable<ReturnType<typeof parseSeatTool>> } {
+  const nestedAssignment = read.via('modelAssignment', (payload) => nested<BriefModelAssignment>(payload, 'modelAssignment'));
+  const seatTool = parseSeatTool(read.safe('seatTool') ?? nestedAssignment?.seatTool);
+  if (seatTool === undefined) {
+    throw new CliUsageError('brief author requires --seatTool naming a declared runner kind (opencode or agy)');
+  }
+  if (
+    nestedAssignment !== undefined &&
+    nestedAssignment.seatTool !== undefined &&
+    nestedAssignment.seatTool !== seatTool
+  ) {
+    throw new CliUsageError(`'--seatTool ${String(seatTool)}' conflicts with the seat tool in --modelAssignment`);
+  }
+  return { nestedAssignment, seatTool };
+}
+
+function decisionString(record: Record<string, unknown>, key: string): string {
+  const value = record[key];
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new CliUsageError(DECISION_SHAPE);
+  }
+  return value;
+}
+
+/** Each decision is rebuilt from an allowlisted key set over a safe plain copy. */
+function readContextDecisions(read: ArgumentReader): BriefContextDecision[] {
+  const raw = read.via('contextDecisions', (payload) => nestedArr<unknown>(payload, 'contextDecisions')) ?? [];
+  return raw.map((decision) => {
+    if (!decision || typeof decision !== 'object' || Array.isArray(decision)) {
+      throw new CliUsageError(DECISION_SHAPE);
+    }
+    const record = decision as Record<string, unknown>;
+    return {
+      proposalId: decisionString(record, 'proposalId'),
+      knowledgeEntryId: decisionString(record, 'knowledgeEntryId'),
+      version: decisionString(record, 'version'),
+      proposedBecause: decisionString(record, 'proposedBecause'),
+      accepted: record['accepted'] === true,
+      decisionBecause: decisionString(record, 'decisionBecause'),
+    };
+  });
+}
+
+type SeatPlanValue = ReturnType<typeof briefSeatPlan>;
+
+function buildModelAssignment(
+  scalars: AuthorScalars,
+  read: ArgumentReader,
+  seat: ReturnType<typeof readSeatTool>,
+  seatPlan: SeatPlanValue,
+  rt: FleetCliRuntime,
+): BriefModelAssignment {
+  const { nestedAssignment, seatTool } = seat;
+  if (nestedAssignment !== undefined) {
+    return { ...nestedAssignment, seatTool };
+  }
+  // `--model` was read once and `required` guarantees it, so the seat plan's
+  // auto-selection by health never applies here.
+  const unhealthy = new Set(unhealthySeatIdsFromCatalog(derivedV2Model(rt)));
+  const planSeat = seatPlan?.['first-pass'].find((candidate) => !unhealthy.has(candidate.id));
+  if (seatPlan !== undefined && scalars.implementerModel === '' && planSeat === undefined) {
+    throw new CliUsageError('Every first-pass seat of the seat plan is unhealthy; pass --model to choose one');
+  }
+  if (seatPlan !== undefined && scalars.implementerModel === '' && planSeat !== undefined) {
+    return {
+      model: planSeat.model,
+      variant: planSeat.variant ?? 'default',
+      fallbackModel: scalars.fallbackModel || planSeat.model,
+      seatTool,
+      ...(planSeat.agent !== undefined ? { agent: planSeat.agent } : {}),
+    } as BriefModelAssignment;
+  }
+  return {
+    model: scalars.implementerModel,
+    variant: read.via('variant', (payload) => str(payload, 'variant')) || 'default',
+    fallbackModel: scalars.fallbackModel,
+    seatTool,
+  };
+}
+
+function readSeatPlan(read: ArgumentReader, rt: FleetCliRuntime): SeatPlanValue {
+  // The plan is read through the guarded helper, but only from a fresh plain
+  // payload built from single reads: the raw payload object never reaches it.
+  const plan = briefSeatPlan(
+    { seatPlan: read.safe('seatPlan'), seatPlanFromInstallation: read.safe('seatPlanFromInstallation') },
+    rt,
+  );
+  return plan === undefined ? undefined : copyUntrusted(plan);
+}
+
+function buildPrepare(
+  scalars: AuthorScalars,
+  read: ArgumentReader,
+  modelAssignment: BriefModelAssignment,
+  contextDecisions: BriefContextDecision[],
+  allowedPathPrefixes: string[],
+  acceptanceSpec: Record<string, unknown> | undefined,
+  seatPlan: SeatPlanValue,
+): AuthorBriefRequest['prepare'] {
+  const prepare = {
+    workOrderId: scalars.workOrderId,
+    projectId: scalars.projectId,
+    taskId: scalars.taskId,
+    laneId: scalars.laneId,
+    repository: scalars.repository,
+    baseCommit: scalars.baseCommit,
+    policyRevision: scalars.policyRevision,
+    modelAssignment,
+    independentReviewer: scalars.independentReviewer,
+    ownedPaths: read.via('ownedPaths', (payload) => strArr(payload, 'ownedPaths')),
+    allowedPathPrefixes,
+    permissions: read.via('permissions', (payload) => strArr(payload, 'permissions')),
+    acceptanceChecks: read.via('acceptanceChecks', (payload) => strArr(payload, 'acceptanceChecks')),
+    acceptanceSpec,
+    stepLimit: read.via('stepLimit', (payload) => num(payload, 'stepLimit', 200)),
+    timeLimitSeconds: read.via('timeLimitSeconds', (payload) => num(payload, 'timeLimitSeconds', 3600)),
+    resourceBounds: read.via('resourceBounds', (payload) => nested<Record<string, string>>(payload, 'resourceBounds')) ?? {},
+    expectedArtifacts: read.via('expectedArtifacts', (payload) => strArr(payload, 'expectedArtifacts')),
+    ownerDecisionReferences: read.via('ownerDecisionReferences', (payload) => strArr(payload, 'ownerDecisionReferences')),
+    contextDecisions,
+    attemptId: read.opt('attemptId'),
+    worktreePath: scalars.worktreePath,
+    ...(seatPlan !== undefined ? { seatPlan } : {}),
+  };
+  return prepare as AuthorBriefRequest['prepare'];
+}
+
+/**
+ * CO17c: `brief author` builds one request, calls the use case once, and
+ * returns its result unchanged. The seat's answer is the only prose: the
+ * handler validates the invocation shape (exit 2 on a malformed one),
+ * never dispatches, writes nothing and prints nothing itself.
+ */
+async function authorBriefCommand(p: Payload, rt: FleetCliRuntime): Promise<unknown> {
+  const read = makeReader(p);
+  const scalars = readScalars(read);
+  const facts = readFacts(read);
+  const seat = readSeatTool(read);
+  const contextDecisions = readContextDecisions(read);
+  const allowedPathPrefixes = read.via('allowedPathPrefixes', (payload) => jsonStrArr(payload, 'allowedPathPrefixes', 'brief author'));
+  const acceptanceSpec = read.via('acceptanceSpec', (payload) => jsonObj(payload, 'acceptanceSpec', 'brief author'));
+  const seatPlan = readSeatPlan(read, rt);
+  const modelAssignment = buildModelAssignment(scalars, read, seat, seatPlan, rt);
+  const authorVariant = read.opt('authorVariant');
+  const authorAgent = read.opt('authorAgent');
+  return rt.execution.authorBrief.authorBrief({
+    workOrderId: scalars.workOrderId,
+    laneId: scalars.laneId,
+    prepare: buildPrepare(scalars, read, modelAssignment, contextDecisions, allowedPathPrefixes, acceptanceSpec, seatPlan),
+    factPack: { repositoryPath: scalars.repositoryPath, commit: scalars.baseCommit, facts },
+    seat: {
+      model: scalars.authorModel,
+      ...(authorVariant !== undefined ? { variant: authorVariant } : {}),
+      ...(authorAgent !== undefined ? { agent: authorAgent } : {}),
+    },
+    checkoutPath: scalars.checkoutPath,
+    briefsDir: scalars.briefsDir,
+  });
+}

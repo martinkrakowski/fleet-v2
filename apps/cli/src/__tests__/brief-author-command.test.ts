@@ -509,6 +509,111 @@ describe('brief author', () => {
     expect(prepare['seatPlan']).not.toBe(seatPlan);
   });
 
+  function validRecordPayload(): Record<string, unknown> {
+    return {
+      workOrderId: 'wo-1',
+      laneId: 'lane-1',
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      repository: 'owner/repo',
+      baseCommit: COMMIT,
+      policyRevision: 'pol-1',
+      model: IMPLEMENTER_MODEL,
+      fallbackModel: 'fallback-model',
+      independentReviewer: 'reviewer-model',
+      authorModel: AUTHOR_MODEL,
+      checkoutPath: '/checkout',
+      repositoryPath: '/repo',
+      worktreePath: '/worktree',
+      briefsDir: '/briefs',
+      seatTool: 'opencode',
+      facts: [{ kind: 'file-list', label: 'Sources', pathPrefix: 'src' }],
+    };
+  }
+
+  it('a Proxy array overriding map cannot forward the original payload object', async () => {
+    const original = { commitRequired: true, secretMarker: 'original' };
+    const hostile = new Proxy(['x'], {
+      get(target, key, receiver) {
+        if (key === 'map') {
+          return () => [original];
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const payload = { ...validRecordPayload(), seatPlan: undefined, acceptanceSpec: { list: hostile } };
+    let captured: AuthorBriefRequest | undefined;
+    const { runtime } = guardsRuntime({
+      authorBrief: async (request) => {
+        captured = request as AuthorBriefRequest;
+        return { outcome: 'authored', attemptId: 'att-1', briefDigest: 'digest-1', sessionKey: 'k' };
+      },
+    });
+    await briefCommands['author'](payload, runtime);
+    const spec = (captured as AuthorBriefRequest).prepare as unknown as { acceptanceSpec: { list: unknown[] } };
+    expect(spec.acceptanceSpec.list).toEqual(['x']);
+    expect(spec.acceptanceSpec.list).not.toContain(original);
+    expect(JSON.stringify(spec.acceptanceSpec)).not.toContain('secretMarker');
+  });
+
+  it('an own __proto__ key cannot change the prototype of the copied object', async () => {
+    const hostile = JSON.parse('{"__proto__":{"polluted":true},"kept":"yes"}') as Record<string, unknown>;
+    const payload = { ...validRecordPayload(), resourceBounds: hostile };
+    let captured: AuthorBriefRequest | undefined;
+    const { runtime } = guardsRuntime({
+      authorBrief: async (request) => {
+        captured = request as AuthorBriefRequest;
+        return { outcome: 'authored', attemptId: 'att-1', briefDigest: 'digest-1', sessionKey: 'k' };
+      },
+    });
+    await briefCommands['author'](payload, runtime);
+    const bounds = ((captured as AuthorBriefRequest).prepare as unknown as { resourceBounds: Record<string, unknown> })
+      .resourceBounds;
+    expect(Object.getPrototypeOf(bounds)).toBe(Object.prototype);
+    expect((bounds as { polluted?: unknown }).polluted).toBeUndefined();
+    expect(bounds['kept']).toBe('yes');
+  });
+
+  it('a throwing facts length getter is a usage error that does not carry the thrown text', async () => {
+    const hostileFacts = new Proxy([], {
+      get(target, key, receiver) {
+        if (key === 'length') {
+          throw new Error('LEAKED-THROW-TEXT');
+        }
+        return Reflect.get(target, key, receiver);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'length') {
+          throw new Error('LEAKED-THROW-TEXT');
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const { runtime, authorCalls } = guardsRuntime();
+    const payload = { ...validRecordPayload(), facts: hostileFacts };
+    let thrown: unknown = null;
+    try {
+      await briefCommands['author'](payload, runtime);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CliUsageError);
+    expect((thrown as CliUsageError).message).not.toContain('LEAKED-THROW-TEXT');
+    expect((thrown as CliUsageError).message).toBe('brief author could not read its arguments');
+    expect(authorCalls).toHaveLength(0);
+  });
+
+  it('with both seatTool and contextDecisions invalid the seat-tool error is reported', async () => {
+    const { io, stderr } = capturingIo();
+    const { runtime, authorCalls } = guardsRuntime();
+    const args = briefAuthorArgs(['--seatTool', 'bogus', '--json', '{"contextDecisions":[{"decisionBecause":""}]}']);
+    const exitCode = await runCli(args, io, runtime);
+    expect(exitCode).toBe(2);
+    expect(stderr.join('')).toContain('--seatTool');
+    expect(stderr.join('')).not.toContain('contextDecisions');
+    expect(authorCalls).toHaveLength(0);
+  });
+
   it('authorModel and the implementer model stay distinct', async () => {
     const { io, stdout } = capturingIo();
     let captured: AuthorBriefRequest | undefined;

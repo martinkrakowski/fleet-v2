@@ -73,12 +73,12 @@ describe('REVIEW_KNOWN_FALSE_POSITIVES (RVP1)', () => {
     expect(REVIEW_KNOWN_FALSE_POSITIVES).toBe(
       'Known false positive (a fixed reviewer rule, not part of the change under review):\n' +
         'In JavaScript, `$` without the `m` flag matches only at the very end of the input. It does not match before a final newline: /^a$/.test("a\\n") is false. (Python and PCRE differ; with the `m` flag `$` does match before a newline.)\n' +
-        'So never report that an anchored JavaScript regular expression without the `m` flag accepts a trailing newline. Report a finding about what a regular expression accepts or rejects only if you can state the exact input string and the flags that prove it.',
+        'So never report that an exact end-anchored literal pattern, such as /^a$/ or /^foo$/, accepts a trailing newline merely for lacking the `m` flag: that one claim is false. Do report a pattern whose own quantifier or character class consumes the newline before `$`, such as /^[^/]+$/.test("name\\n") or /^[\\s\\S]+$/.test("a\\n") (both true without `m`): state the exact input string and the flags that prove it.',
     );
   });
 
-  it('is 566 bytes of ASCII and holds no untrusted marker opener', () => {
-    expect(Buffer.byteLength(REVIEW_KNOWN_FALSE_POSITIVES, 'utf8')).toBe(566);
+  it('is 719 bytes of ASCII and holds no untrusted marker opener', () => {
+    expect(Buffer.byteLength(REVIEW_KNOWN_FALSE_POSITIVES, 'utf8')).toBe(719);
     expect([...REVIEW_KNOWN_FALSE_POSITIVES].every((c) => c === '\n' || (c >= ' ' && c <= '~'))).toBe(true);
     expect(REVIEW_KNOWN_FALSE_POSITIVES).not.toContain('<<<');
   });
@@ -86,6 +86,28 @@ describe('REVIEW_KNOWN_FALSE_POSITIVES (RVP1)', () => {
   it('states a proof that holds in this runtime', () => {
     expect(/^a$/.test('a\n')).toBe(false);
     expect(/^a$/m.test('a\n')).toBe(true);
+  });
+
+  it('forbids only the exact end-anchored literal false claim, not a real quantifier/character-class gap (RVP1 fix)', () => {
+    // The one false claim the block must still catch: an exact end-anchored
+    // literal pattern, with nothing before `$` that could consume a character,
+    // never matches a trailing newline without the `m` flag.
+    expect(/^a$/.test('a\n')).toBe(false);
+
+    // Three real gaps the new wording must not suppress: the pattern's own
+    // quantifier or character class consumes the newline itself, so the
+    // pattern matches a trailing newline even without `m`.
+    expect(/^[^/]+$/.test('name\n')).toBe(true);
+    expect(/^\S+\s*$/.test('a\n')).toBe(true);
+    expect(/^[\s\S]+$/.test('a\n')).toBe(true);
+
+    // The wording itself draws exactly this line.
+    expect(REVIEW_KNOWN_FALSE_POSITIVES).toContain(
+      'an exact end-anchored literal pattern, such as /^a$/ or /^foo$/, accepts a trailing newline merely for lacking the `m` flag: that one claim is false',
+    );
+    expect(REVIEW_KNOWN_FALSE_POSITIVES).toContain(
+      'Do report a pattern whose own quantifier or character class consumes the newline before `$`, such as /^[^/]+$/.test("name\\n") or /^[\\s\\S]+$/.test("a\\n")',
+    );
   });
 });
 

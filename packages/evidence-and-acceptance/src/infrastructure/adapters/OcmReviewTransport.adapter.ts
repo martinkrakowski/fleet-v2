@@ -806,7 +806,7 @@ export const BRIEF_VERIFY_CHECKLIST: string = [
 export const REVIEW_KNOWN_FALSE_POSITIVES: string = [
   'Known false positive (a fixed reviewer rule, not part of the change under review):',
   'In JavaScript, `$` without the `m` flag matches only at the very end of the input. It does not match before a final newline: /^a$/.test("a\\n") is false. (Python and PCRE differ; with the `m` flag `$` does match before a newline.)',
-  'So never report that an anchored JavaScript regular expression without the `m` flag accepts a trailing newline. Report a finding about what a regular expression accepts or rejects only if you can state the exact input string and the flags that prove it.',
+  'So never report that an exact end-anchored literal pattern, such as /^a$/ or /^foo$/, accepts a trailing newline merely for lacking the `m` flag: that one claim is false. Do report a pattern whose own quantifier or character class consumes the newline before `$`, such as /^[^/]+$/.test("name\\n") or /^[\\s\\S]+$/.test("a\\n") (both true without `m`): state the exact input string and the flags that prove it.',
 ].join('\n');
 
 /** The fixed reason a kind with no prompt plan is refused; it never carries the kind value. */

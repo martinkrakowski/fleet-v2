@@ -368,9 +368,12 @@ export class RunMergePassUseCase implements RunMergePassPort {
       if (vetoReport !== null) {
         return vetoReport;
       }
-      // The veto row could not be recorded: it is unknown for this pass and
-      // never blocks (D-JV1), so the pass moves on to the next row exactly as
-      // if the veto had answered unknown. Nothing is stored, nothing re-asked.
+      // No writer, or the veto entry was refused by record validation: the row
+      // is unknown for this pass and never blocks (D-JV1), so the pass moves on
+      // to the next row as if the veto had answered unknown. Nothing is stored,
+      // so a later pass reaches this step again (advice is asked again once per
+      // pass when the entry was refused; never when the writer is absent).
+      // A failed write is NOT this case: it returns its reason code and stops.
       const unrecorded: MergeStepFacts = {
         ...facts,
         veto: { outcome: 'unknown', confidence: null, mode: 'shadow', decisionReceiptId: null },
@@ -477,7 +480,6 @@ export class RunMergePassUseCase implements RunMergePassPort {
     } catch {
       stateResult = { status: 'unavailable', reason: 'state-read-threw' };
     }
-    this.ensureBudget(request);
     let state: MergeVetoStateFields | null = null;
     try {
       if (
@@ -522,7 +524,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
 
   /**
    * Build and persist one veto row. Reports `no-action` / `veto` once the row
-   * is stored; `null` when it could not be (refused entry, failed write).
+   * is stored and the write's reason code when the write fails (the entry stops
+   * for this pass); `null` only when the entry is refused, which is unknown.
    */
   private async persistShadowVeto(
     request: RunMergePassRequest,
@@ -534,8 +537,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
       return null;
     }
     const persisted = await this.persist(request, entry, built.record, null, null);
-    if (persisted.status !== 'written') {
-      return null;
+    if (persisted.status === 'failed') {
+      return this.report(entry, 'no-action', persisted.reasonCode, null);
     }
     return this.report(entry, 'no-action', 'veto', null);
   }

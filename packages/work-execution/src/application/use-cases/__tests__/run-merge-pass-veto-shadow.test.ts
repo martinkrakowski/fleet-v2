@@ -592,21 +592,27 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     });
   });
 
-  /** After the enter-ready write, the next queue write is refused or throws. */
-  function failVetoWrite(queue: Wiring['queue'], how: 'refused' | 'throws'): void {
+  type WriteFailure = 'conflict' | 'refused' | 'throws' | 'lands-then-throws';
+
+  /** After the enter-ready write, the next queue write fails in the given way. */
+  function failVetoWrite(queue: Wiring['queue'], how: WriteFailure): void {
     const original = queue.applyMergeTransition.bind(queue);
     let writes = 0;
     (queue as unknown as Record<string, unknown>).applyMergeTransition = async (
       request: Parameters<MergeQueueRepositoryPort['applyMergeTransition']>[0],
     ) => {
       writes += 1;
-      if (writes >= 2) {
-        if (how === 'throws') {
-          throw new Error('store down');
-        }
-        return { outcome: 'refused', reason: 'revision-conflict' };
+      if (writes < 2) {
+        return original(request);
       }
-      return original(request);
+      if (how === 'throws') {
+        throw new Error('store down');
+      }
+      if (how === 'lands-then-throws') {
+        await original(request);
+        throw new Error('store died after the write');
+      }
+      return { outcome: 'refused', reason: how === 'conflict' ? 'revision-conflict' : 'invalid' };
     };
   }
 
@@ -615,18 +621,23 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     w: Wiring,
     entryId: string,
     result: Awaited<ReturnType<RunMergePassUseCase['runMergePass']>>,
+    adviceCalls: number,
+    report: { decision: string; reasonCode: string } = { decision: 'journalled', reasonCode: 'would-merge' },
   ): void {
     expect(result.outcome).toBe('completed');
-    expect(result.entries[0].decision).toBe('journalled');
-    expect(result.entries[0].reasonCode).toBe('would-merge');
-    expect(w.vetoAdvice.calls).toBeLessThanOrEqual(1);
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({
+      entryId,
+      ...report,
+    });
+    expect(w.vetoAdvice.calls).toBe(adviceCalls);
     expect(storedVeto(w.queue, entryId)).toBeNull();
     const stored = w.queue.records.get(entryId) as MergeQueueEntryRecord;
-    expect(stored.state).not.toBe('merged');
+    expect(stored.state).toBe('ready');
     expect(stored.mergeCommitOid).toBeNull();
   }
 
-  it('a veto that cannot be recorded (writer absent) is unknown for the pass and reaches would-merge', async () => {
+  it('a veto that cannot be recorded (writer absent) is unknown for the pass, reaches would-merge and never asks', async () => {
     const entry = makeEntry();
     const w = wire([entry]);
     let ulid = 0;
@@ -642,11 +653,15 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
       vetoState: w.vetoState,
     });
 
-    const result = await useCase.runMergePass(w.request);
+    const first = await useCase.runMergePass(w.request);
+    expect(first.entries[0]).toMatchObject({ decision: 'journalled', reasonCode: 'would-merge' });
+    // The second pass reaches the same row; its journal entry already exists.
+    const second = await useCase.runMergePass(w.request);
+    expect(second.entries[0]).toMatchObject({ decision: 'no-action', reasonCode: 'already-journalled' });
 
-    expectUnrecordedVetoReachedWouldMerge(w, entry.entryId, result);
-    expect(w.vetoState.calls).toBe(0); // no ask that could never be recorded
+    expect(w.vetoState.calls).toBe(0); // never asked, on any pass
     expect(w.vetoAdvice.calls).toBe(0);
+    expect(storedVeto(w.queue, entry.entryId)).toBeNull();
   });
 
   it('a veto entry the record validation refuses is unknown for the pass and reaches would-merge', async () => {
@@ -663,29 +678,67 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
 
     const result = await w.useCase.runMergePass(w.request);
 
-    expectUnrecordedVetoReachedWouldMerge(w, entry.entryId, result);
-    expect(w.vetoAdvice.calls).toBe(1);
+    expectUnrecordedVetoReachedWouldMerge(w, entry.entryId, result, 1);
   });
 
-  it('a veto write that fails (refused or throwing) is unknown for the pass and reaches would-merge', async () => {
-    for (const how of ['refused', 'throws'] as const) {
-      const entry = makeEntry({ pullRequest: 400 + (how === 'refused' ? 0 : 1) });
+  it('after a refused veto entry advice IS asked again on a later pass (known cost: nothing is stored)', async () => {
+    const entry = makeEntry();
+    const w = wire([entry], greenForge, {
+      vetoAdviceResult: {
+        status: 'answered',
+        choice: 'merge-safe',
+        confidence: 0.9,
+        decisionReceiptId: `receipt-${'x'.repeat(300)}`,
+        mode: 'shadow',
+      },
+    });
+
+    await w.useCase.runMergePass(w.request);
+    expect(w.vetoAdvice.calls).toBe(1);
+    const second = await w.useCase.runMergePass(w.request);
+
+    expectUnrecordedVetoReachedWouldMerge(w, entry.entryId, second, 2, {
+      decision: 'no-action',
+      reasonCode: 'already-journalled',
+    });
+  });
+
+  it('a failed veto write returns its reason code and stops the entry for the pass', async () => {
+    const cases: Array<[WriteFailure, string]> = [
+      ['conflict', 'persist-conflict'],
+      ['refused', 'persist-refused'],
+      ['throws', 'persist-failed'],
+    ];
+    for (const [index, [how, code]] of cases.entries()) {
+      const entry = makeEntry({ pullRequest: 400 + index });
       const w = wire([entry]);
       failVetoWrite(w.queue, how);
 
-      const result = await w.useCase.runMergePass({ ...w.request });
+      const result = await w.useCase.runMergePass(w.request);
 
-      expect(w.vetoAdvice.calls).toBe(1); // asked once; the write then failed
-      expect(result.outcome).toBe('completed');
-      expect(result.entries[0].decision).toBe('journalled');
-      expect(result.entries[0].reasonCode).toBe('would-merge');
+      expect(w.vetoAdvice.calls).toBe(1); // the answer was asked, the write failed
+      expect(result.entries[0].decision).toBe('no-action');
+      expect(result.entries[0].reasonCode).toBe(code);
       expect(storedVeto(w.queue, entry.entryId)).toBeNull();
-      const stored = w.queue.records.get(entry.entryId) as MergeQueueEntryRecord;
-      expect(stored.mergeCommitOid).toBeNull();
     }
   });
 
-  it('a recorded veto is never converted into a pass: a stored hold-for-human stays on the entry', async () => {
+  it('a write that lands and then throws reports persist-failed and gives no same-pass would-merge', async () => {
+    const entry = makeEntry();
+    const w = wire([entry]);
+    failVetoWrite(w.queue, 'lands-then-throws');
+
+    const result = await w.useCase.runMergePass(w.request);
+
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('persist-failed');
+    expect(w.vetoAdvice.calls).toBe(1);
+    // The write did land: the next pass reads the stored veto and asks nothing.
+    expect(storedVeto(w.queue, entry.entryId)).toMatchObject({ outcome: 'merge-safe' });
+    expect(await journalOf(w.journal)).toBe(0);
+  });
+
+  it('a recorded hold-for-human is never replaced or re-asked: the next pass keeps it and only would-merges', async () => {
     const entry = makeEntry();
     const w = wire([entry], greenForge, {
       vetoAdviceResult: {
@@ -698,7 +751,15 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     });
     const first = await w.useCase.runMergePass(w.request);
     expect(first.entries[0].reasonCode).toBe('veto');
-    expect(storedVeto(w.queue, entry.entryId)).toMatchObject({ outcome: 'hold-for-human' });
+    const stored = storedVeto(w.queue, entry.entryId);
+    expect(stored).toMatchObject({ outcome: 'hold-for-human' });
+
+    const second = await w.useCase.runMergePass(w.request);
+
+    expect(second.entries[0]).toMatchObject({ decision: 'journalled', reasonCode: 'would-merge' });
+    expect(storedVeto(w.queue, entry.entryId)).toEqual(stored);
+    expect(w.vetoAdvice.calls).toBe(1);
+    expect(w.vetoState.calls).toBe(1);
   });
 
   /** A clock that lapses the deadline once `lapsed()` is true. */

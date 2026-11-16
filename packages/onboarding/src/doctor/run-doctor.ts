@@ -795,6 +795,47 @@ export async function* runDoctor(
   }
 }
 
+/** Control, separator and bidi characters that must never reach a doctor line. */
+// eslint-disable-next-line no-control-regex
+const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
+
+/** Marker: the probe result could not be read safely. */
+const UNREADABLE_RESULT = Symbol('unreadable-pinned-build-result');
+
+interface PinnedBuildSnapshot {
+  readonly pinnedCommit: unknown;
+  readonly baseTipCommit: unknown;
+  readonly behindCount: unknown;
+  readonly installRootName: unknown;
+}
+
+/**
+ * Copy every field of an untrusted pinned-build result once, so no later
+ * read can run a hostile accessor. A non-object result, or any accessor that
+ * throws, yields `UNREADABLE_RESULT`.
+ */
+function snapshotPinnedBuild(
+  result: unknown,
+): PinnedBuildSnapshot | null | typeof UNREADABLE_RESULT {
+  if (result === undefined || result === null) {
+    return null;
+  }
+  try {
+    if (typeof result !== 'object') {
+      return UNREADABLE_RESULT;
+    }
+    const record = result as Record<string, unknown>;
+    return {
+      pinnedCommit: record.pinnedCommit,
+      baseTipCommit: record.baseTipCommit,
+      behindCount: record.behindCount,
+      installRootName: record.installRootName,
+    };
+  } catch {
+    return UNREADABLE_RESULT;
+  }
+}
+
 /**
  * The pinned-build freshness check: the installed build's commit against the
  * base branch tip. Pure: it consumes only the injected probe result — no
@@ -824,10 +865,23 @@ export async function pinnedBuildLines(probes: DoctorProbes): Promise<DoctorLine
       ),
     ];
   }
-  const probe = await safely(() => probeFn!());
+  // The probe result is untrusted: every field is read inside `safely`, so a
+  // throwing accessor (or a hostile `then`) is a probe failure, never a crash.
+  const probe = await safely(async () => snapshotPinnedBuild(await probeFn!()));
   if (probe === undefined || probe === null) {
     return [
       line('installation', 'build', 'pinned-build', 'UNKNOWN', 'pinned build probe failed'),
+    ];
+  }
+  if (probe === UNREADABLE_RESULT) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'pinned build probe result could not be read',
+      ),
     ];
   }
   const pinnedCommit = normaliseCommit(probe.pinnedCommit);
@@ -854,10 +908,25 @@ export async function pinnedBuildLines(probes: DoctorProbes): Promise<DoctorLine
       ),
     ];
   }
-  const root =
-    typeof probe.installRootName === 'string'
-      ? installRootBasename(probe.installRootName)
-      : '';
+  let root = '';
+  if (probe.installRootName !== undefined) {
+    const rootName =
+      typeof probe.installRootName === 'string'
+        ? installRootBasename(probe.installRootName)
+        : undefined;
+    if (rootName === undefined || UNPRINTABLE.test(rootName)) {
+      return [
+        line(
+          'installation',
+          'build',
+          'pinned-build',
+          'UNKNOWN',
+          'pinned build install root name could not be read',
+        ),
+      ];
+    }
+    root = rootName;
+  }
   const rootSuffix = root === '' ? '' : ` (install root ${root})`;
   if (pinnedCommit === baseTipCommit) {
     return [
@@ -873,7 +942,7 @@ export async function pinnedBuildLines(probes: DoctorProbes): Promise<DoctorLine
   const behind = probe.behindCount;
   if (
     typeof behind !== 'number' ||
-    !Number.isInteger(behind) ||
+    !Number.isSafeInteger(behind) ||
     behind < 0
   ) {
     return [

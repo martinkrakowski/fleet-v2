@@ -1503,4 +1503,120 @@ describe('pinned-build freshness (DB1)', () => {
     expect(pinnedIndex).toBeLessThan(seatIndex);
     expect(calls.indexOf('pinnedBuild')).toBeGreaterThan(calls.indexOf('ghBinary'));
   });
+
+  describe('hostile probe results', () => {
+    const FIELDS = ['pinnedCommit', 'baseTipCommit', 'behindCount', 'installRootName'] as const;
+
+    function withThrowingField(field: (typeof FIELDS)[number]): PinnedBuildProbeResult {
+      const result = {
+        pinnedCommit: SHA_A,
+        baseTipCommit: SHA_B,
+        behindCount: 2,
+        installRootName: 'fleet-install',
+      };
+      Object.defineProperty(result, field, {
+        get(): never {
+          throw new Error(`${field} getter boom`);
+        },
+        enumerable: true,
+      });
+      return result as PinnedBuildProbeResult;
+    }
+
+    async function sweepWith(result: unknown): Promise<DoctorLine[]> {
+      const { probes } = fakeProbes({ pinnedBuild: async () => result as never });
+      return collect(loadedResult(sampleModel()), probes);
+    }
+
+    async function baselineLines(): Promise<DoctorLine[]> {
+      return collect(loadedResult(sampleModel()), fakeProbes().probes);
+    }
+
+    function expectOnlyPinnedUnknown(
+      lines: readonly DoctorLine[],
+      baseline: readonly DoctorLine[],
+    ): void {
+      expect(pinnedLine(lines).status).toBe('UNKNOWN');
+      const others = (all: readonly DoctorLine[]): DoctorLine[] =>
+        all.filter((doctorLine) => doctorLine.check !== 'pinned-build');
+      expect(others(lines)).toEqual(others(baseline));
+    }
+
+    for (const field of FIELDS) {
+      it(`reports UNKNOWN when ${field} is a throwing getter on the returned result`, async () => {
+        const baseline = await baselineLines();
+        const lines = await sweepWith(withThrowingField(field));
+        expectOnlyPinnedUnknown(lines, baseline);
+        expect(pinnedLine(lines).detail).toBe('pinned build probe result could not be read');
+      });
+    }
+
+    it('reports UNKNOWN for a throwing Proxy result and a throwing then', async () => {
+      const baseline = await baselineLines();
+      const proxy = new Proxy(
+        {},
+        {
+          get(): never {
+            throw new Error('proxy boom');
+          },
+        },
+      );
+      expectOnlyPinnedUnknown(await sweepWith(proxy), baseline);
+      const thenable = {
+        get then(): never {
+          throw new Error('then boom');
+        },
+      };
+      expectOnlyPinnedUnknown(await sweepWith(thenable), baseline);
+    });
+
+    it('reports UNKNOWN for results that are not objects', async () => {
+      const baseline = await baselineLines();
+      for (const value of ['a'.repeat(40), 42, true]) {
+        expectOnlyPinnedUnknown(await sweepWith(value), baseline);
+      }
+    });
+
+    it('reports UNKNOWN for wrong-typed and non-finite fields', async () => {
+      const baseline = await baselineLines();
+      const bad: Record<string, unknown>[] = [
+        { pinnedCommit: {}, baseTipCommit: SHA_B, behindCount: 2 },
+        { pinnedCommit: [SHA_A], baseTipCommit: SHA_B, behindCount: 2 },
+        { pinnedCommit: SHA_A, baseTipCommit: 12345678, behindCount: 2 },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: Infinity },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: -Infinity },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: NaN },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: 1e21 },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: [3] },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: 2, installRootName: 5 },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: 2, installRootName: {} },
+        { pinnedCommit: SHA_A, baseTipCommit: SHA_B, behindCount: 2, installRootName: null },
+      ];
+      for (const result of bad) {
+        expectOnlyPinnedUnknown(await sweepWith(result), baseline);
+      }
+    });
+
+    it('reports UNKNOWN when strings carry control characters, never printing them', async () => {
+      const baseline = await baselineLines();
+      const controls = ['\u0000', '\u001b[31m', '\u0007', '\u007f', '\u0085', ' ', '‮'];
+      for (const control of controls) {
+        const lines = await sweepWith({
+          pinnedCommit: SHA_A,
+          baseTipCommit: SHA_B,
+          behindCount: 2,
+          installRootName: `ro${control}ot`,
+        });
+        expectOnlyPinnedUnknown(lines, baseline);
+        expect(pinnedLine(lines).detail).not.toContain(control);
+        const commitLines = await sweepWith({
+          pinnedCommit: `${SHA_A.slice(0, 20)}${control}${SHA_A.slice(20)}`,
+          baseTipCommit: SHA_B,
+          behindCount: 2,
+        });
+        expectOnlyPinnedUnknown(commitLines, baseline);
+        expect(pinnedLine(commitLines).detail).not.toContain(control);
+      }
+    });
+  });
 });

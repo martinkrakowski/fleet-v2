@@ -956,13 +956,13 @@ describe('LandChainUseCase halt gate', () => {
     expect(reads).toBe(0);
   });
 
-  it('a clean landing reads the halt once before every one-way action, four times in all', async () => {
+  it('a clean landing reads the halt once before every one-way action, five times in all', async () => {
     const { result, world } = await run();
     expect(result.outcome).toBe('landed');
-    expect(world.calls.haltReads).toBe(4);
+    expect(world.calls.haltReads).toBe(5);
   });
 
-  it('a halt raised after the integration PR opened refuses before the premerge status is posted', async () => {
+  it('a halt raised before the open or adopt is refused halted with nothing opened', async () => {
     let reads = 0;
     const halt = {
       read: async () => {
@@ -974,13 +974,13 @@ describe('LandChainUseCase halt gate', () => {
     } as unknown as LandChainDependencies['halt'];
     const { result, world } = await run({}, { halt });
     expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
-    expect(world.landing.calls.openOrAdopt).toBe(1);
+    expect(world.landing.calls.openOrAdopt).toBe(0);
     expect(world.calls.performMergeForgeAction).toBe(0);
     expect(world.calls.enqueueMergeEntry).toBe(0);
     expect(reads).toBe(3);
   });
 
-  it('a halt raised after the premerge status refuses before the enqueue', async () => {
+  it('a halt raised after the integration PR opened refuses before the premerge status is posted', async () => {
     let reads = 0;
     const halt = {
       read: async () => {
@@ -993,9 +993,27 @@ describe('LandChainUseCase halt gate', () => {
     const { result, world } = await run({}, { halt });
     expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
     expect(world.landing.calls.openOrAdopt).toBe(1);
-    expect(world.calls.performMergeForgeAction).toBe(1);
+    expect(world.calls.performMergeForgeAction).toBe(0);
     expect(world.calls.enqueueMergeEntry).toBe(0);
     expect(reads).toBe(4);
+  });
+
+  it('a halt raised after the premerge status refuses before the enqueue', async () => {
+    let reads = 0;
+    const halt = {
+      read: async () => {
+        reads += 1;
+        return reads <= 4
+          ? { state: 'clear', record: null }
+          : { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } };
+      },
+    } as unknown as LandChainDependencies['halt'];
+    const { result, world } = await run({}, { halt });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(world.landing.calls.openOrAdopt).toBe(1);
+    expect(world.calls.performMergeForgeAction).toBe(1);
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    expect(reads).toBe(5);
   });
 });
 

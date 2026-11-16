@@ -816,6 +816,12 @@ export class LandChainUseCase implements LandChainPort {
       return { ok: false, fail: refused('integration-pr-ambiguous') };
     }
     const mode = open.value.length === 1 ? ('adopt' as const) : ('open' as const);
+    // The halt is re-read immediately before this one-way action: a halt
+    // raised after the earlier pre-apply check still refuses the open or
+    // adopt, and an unreadable halt answer refuses it too.
+    if (await isRequiredPassHalted(this.deps.halt)) {
+      return { ok: false, fail: refused('halted') };
+    }
     const opened = await this.guarded(
       command.deadlineIso,
       FAIL_FORGE,

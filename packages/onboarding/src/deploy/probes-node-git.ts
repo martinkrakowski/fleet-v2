@@ -142,10 +142,13 @@ async function mergeInProgress(repoPath: string, resolved: ResolvedDeps): Promis
   if (!(lines.length === 6 && lines[5] === '' && lines.slice(0, 5).every((line) => line.length > 0))) {
     throw fixedError('git printed unexpected marker paths');
   }
-  const present = await Promise.all(
-    lines.slice(0, 5).map(async (line) => markerPresent(resolve(root, line))),
-  );
-  return present.some((exists) => exists);
+  let anyPresent = false;
+  for (const line of lines.slice(0, 5)) {
+    if (await markerPresent(resolve(root, line))) {
+      anyPresent = true;
+    }
+  }
+  return anyPresent;
 }
 
 /** Reads and validates the commit id `HEAD` points at. */

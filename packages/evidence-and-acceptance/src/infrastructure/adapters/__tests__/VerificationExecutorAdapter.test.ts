@@ -236,16 +236,24 @@ describe('VerificationExecutorAdapter', () => {
       '!',
       HEAD,
     ];
-    // ssh joins the words after the destination into one line for the remote
-    // login shell: `sh -c '<remoteProgram>'`. Replicate that locally in two
-    // shell parses: first recover the program text the remote shell would
-    // hand to `sh -c`, then parse that text as the inner sh would and echo
-    // every resulting argument NUL-separated.
-    const parsed = spawnSync('/bin/sh', ['-c', "printf '%s\\0' " + remoteProgram], {
+    // ssh joins the words after the destination with spaces into one line
+    // for the remote login shell: `sh -c '<remoteProgram>'`. Replicate that
+    // locally in two shell parses. In each parse the printf format string is
+    // the literal '%s\0' and the parsed words are captured as printf
+    // arguments (`printf '%s\0' "$@"` shape) — the remote command line is
+    // never spliced into a format string. Parse 1 recovers the program text
+    // the remote login shell would hand to `sh -c`; parse 2 parses that text
+    // as the inner sh would and echoes every resulting argument
+    // NUL-separated.
+    const remoteLine = argv.slice(dashDashIndex + 1).join(' ');
+    const parsed = spawnSync('/bin/sh', ['-c', "printf '%s\\0' " + remoteLine], {
       encoding: 'buffer',
     });
     expect(parsed.status).toBe(0);
-    const programText = (parsed.stdout as Buffer).toString('utf8').replace(/\0$/, '');
+    const loginWords = (parsed.stdout as Buffer).toString('utf8').split('\0');
+    expect(loginWords.pop()).toBe('');
+    expect(loginWords).toEqual(['sh', '-c', remoteProgram.slice(1, -1).replace(/'\\''/g, "'")]);
+    const programText = loginWords[loginWords.length - 1];
     const echoed = spawnSync('/bin/sh', ['-c', "printf '%s\\0' " + programText], {
       encoding: 'buffer',
     });

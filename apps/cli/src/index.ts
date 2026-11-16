@@ -761,6 +761,7 @@ Commands:
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared|explain
   forge execute
+  forge threads list|reply|resolve --repository owner/repo --pull-request-number <n> [--thread-id <id>] [--body-file <path>] [--yes]
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
   decisions report --consumer knowledge-ranking
@@ -969,6 +970,7 @@ export async function runCli(
       (group === 'questions' && QUESTIONS_POSITIONAL_SUBCOMMANDS.has(subcommand)) ||
       (group === 'knowledge' && subcommand === 'candidates') ||
       (group === 'cutover' && subcommand === 'shadow') ||
+      (group === 'forge' && subcommand === 'threads') ||
       (group === 'owner-items' && subcommand === 'resolve');
     const payload = parseFlags(rest, {
       allowPositional,

@@ -73,4 +73,5 @@ export * from "./StopAttemptUseCase.use-case.js";
 export * from "./SweepChainsUseCase.use-case.js";
 export * from "./SyncPlanDecisionsUseCase.use-case.js";
 export * from "./VerifyBriefUseCase.use-case.js";
+export * from "./WatchTrainHealthUseCase.use-case.js";
 export * from "./work-order-hold-facts.js";

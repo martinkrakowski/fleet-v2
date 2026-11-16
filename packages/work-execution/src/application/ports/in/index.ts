@@ -70,3 +70,4 @@ export * from "./StopAttemptPort.in-port.js";
 export * from "./SweepChainsPort.in-port.js";
 export * from "./SyncPlanDecisionsPort.in-port.js";
 export * from "./VerifyBriefPort.in-port.js";
+export * from "./WatchTrainHealthPort.in-port.js";

@@ -364,7 +364,9 @@ export function parseLaneUsageLogRow(value: unknown): LaneUsageLogRow | null {
       model !== null && !isTelemetryModelId(model) ||
       !isOptionalSafeText(agent) ||
       !isEnum(source, ['opencode-db', 'opencode-api', 'unavailable'] as const) ||
-      !isOptionalSafeText(reason) ||
+      // The builder always writes null (usage reasons are prompt/detail text);
+      // the parser, and so serialise and append, accept nothing else.
+      reason !== null ||
       !isEnum(costBasis, LANE_USAGE_LOG_COST_BASES) ||
       !isCanonicalIso(recordedAtIso)
     ) {

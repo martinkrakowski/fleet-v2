@@ -160,6 +160,16 @@ describe('LaneUsageLogRow building', () => {
     expect(row?.steps).toBeNull();
   });
 
+  it('refuses a row whose reason is free text with spaces on parse and on serialise', () => {
+    const row = buildLaneUsageLogRow({ attempt: attempt({ id: 'attempt-1' }), nowIso: NOW_ISO });
+    expect(row).not.toBeNull();
+    const withText = { ...(row as object), reason: 'prompt details here' };
+    expect(parseLaneUsageLogRow(withText)).toBeNull();
+    expect(serializeLaneUsageLogRow(withText as never)).toBeNull();
+    expect(parseLaneUsageLogRow({ ...(row as object), reason: 'usage-unavailable' })).toBeNull();
+    expect(parseLaneUsageLogRow({ ...(row as object), reason: null })).not.toBeNull();
+  });
+
   it('never carries the usage reason text, even benign diagnostic detail', () => {
     const row = build({
       usage: meteredUsage({ reason: 'opencode db missing: stderr line one\nstderr line two' }),

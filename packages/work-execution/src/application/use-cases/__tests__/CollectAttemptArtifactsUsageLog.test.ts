@@ -226,8 +226,9 @@ describe('CollectAttemptArtifactsUseCase lane usage log (OG14)', () => {
     });
   });
 
-  it('collects without throwing when usageLog.append is missing or rejects', async () => {
-    const logs: LaneUsageLogPortFake[] = [
+  it('collects without throwing when usageLog.append is missing, rejects or throws', async () => {
+    const logs: Array<LaneUsageLogPortFake | Record<string, never>> = [
+      {},
       makeUsageLog({ reject: true }),
       makeUsageLog({ throw: true }),
       new LaneUsageLogPortFake(),

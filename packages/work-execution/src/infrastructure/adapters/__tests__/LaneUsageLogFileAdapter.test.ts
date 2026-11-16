@@ -197,6 +197,14 @@ describe('LaneUsageLogFileAdapter', () => {
     expect(await adapter.append(row())).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
   });
 
+  it('refuses to append a caller-built row whose reason is free text and writes nothing', async () => {
+    const stateDir = await tempStateDir();
+    const adapter = new LaneUsageLogFileAdapter({ stateDir });
+    const bad = { ...row(), reason: 'prompt details here' } as unknown as LaneUsageLogRow;
+    expect(await adapter.append(bad)).toEqual({ outcome: 'refused', reason: 'invalid-row' });
+    expect(await adapter.read()).toEqual({ outcome: 'read', rows: [] });
+  });
+
   it('reports store-unreadable for read and append when the log path is a symlink to a valid log', async () => {
     const stateDir = await tempStateDir();
     const realDir = await tempStateDir();

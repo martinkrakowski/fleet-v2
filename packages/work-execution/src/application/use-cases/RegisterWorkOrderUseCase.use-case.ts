@@ -58,7 +58,10 @@ import type {
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
-import type { HeldWorkOrderRepositoryPort } from '../ports/out/HeldWorkOrderRepositoryPort.out-port.js';
+import type {
+  HeldWorkOrderRepositoryPort,
+  RecordHoldIntentResult,
+} from '../ports/out/HeldWorkOrderRepositoryPort.out-port.js';
 import type { LanePlanRepositoryPort } from '../ports/out/LanePlanRepositoryPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
 import type { ProjectProfileReadPort } from '../ports/out/ProjectProfileReadPort.out-port.js';
@@ -845,7 +848,9 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
   /**
    * Keep the overlap-refused registration as held (intent first, then settled)
    * and answer the typed refusal; without a held store it is answered
-   * `held: false`. Never saves the work order.
+   * `held: false`. Never saves the work order. When a superseded stale record
+   * was deleted but the replacement hold cannot be recorded, the stale record
+   * is restored before the store-unavailable (or refused) answer is given.
    */
   private async holdAndRefuse(
     context: OverlapContext,
@@ -895,15 +900,28 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
         heldAtIso: context.nowIso,
       };
       try {
+        let staleDeleted = false;
         if (context.staleRecord !== null) {
           const replaced = await this.replaceStaleHeld(heldRepo, context);
           if (!replaced.ok) {
             return STORE_UNAVAILABLE;
           }
           supersededHeld = replaced.notice;
+          staleDeleted = replaced.notice !== undefined;
         }
-        const recorded = await heldRepo.recordHoldIntent(record);
+        let recorded: RecordHoldIntentResult;
+        try {
+          recorded = await heldRepo.recordHoldIntent(record);
+        } catch (error) {
+          if (staleDeleted) {
+            await this.restoreStaleHeld(heldRepo, context.staleRecord);
+          }
+          throw error;
+        }
         if (recorded.outcome === 'refused') {
+          if (staleDeleted) {
+            await this.restoreStaleHeld(heldRepo, context.staleRecord);
+          }
           return recorded.reason === 'invalid-record'
             ? INVALID_REQUEST
             : recorded.reason === 'store-full'
@@ -976,6 +994,39 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       return { ok: true, notice: undefined };
     }
     return { ok: false };
+  }
+
+  /**
+   * Restores a stale held record when the replacement hold could not be
+   * recorded after the stale record was deleted: an intent-stage record is
+   * re-recorded as itself, a held-stage record is re-recorded as its own
+   * intent and settled back to `held`, reproducing the original record
+   * exactly. Best effort — a failure here cannot change the refusal the
+   * caller already answers.
+   */
+  private async restoreStaleHeld(
+    heldRepo: HeldWorkOrderRepositoryPort,
+    stale: HeldWorkOrderRecord | null,
+  ): Promise<void> {
+    if (stale === null) {
+      return;
+    }
+    try {
+      const restored = stale.stage === 'held' ? { ...stale, stage: 'intent' as const } : stale;
+      const recorded = await heldRepo.recordHoldIntent(restored);
+      if (recorded.outcome !== 'recorded' && recorded.outcome !== 'already-held') {
+        return;
+      }
+      if (stale.stage === 'held') {
+        await heldRepo.completeHoldIntent({
+          intentId: stale.intentId,
+          workOrderId: stale.workOrderId,
+          requestDigest: stale.requestDigest,
+        });
+      }
+    } catch {
+      // Best effort: the caller's refusal stands either way.
+    }
   }
 
   /**

@@ -24,6 +24,7 @@ import type { ReviewTally } from '../../domain/review-selection.js';
 import {
   decideReviewReceiptOutcome,
   isAttemptReceiptSubject,
+  isReceiptAboutAssessment,
   latestReceiptPerReviewer,
   reviewKindOf,
   tallyReviews,
@@ -136,6 +137,8 @@ function selectReviewEvidence(assessment: EvidenceAssessmentRecord): {
   readonly reviews: readonly ReviewReceiptRecord[];
   readonly blockers: readonly string[];
   readonly latest: readonly ReviewReceiptRecord[];
+  readonly notAbout: readonly ReviewReceiptRecord[];
+  readonly passable: ReadonlySet<ReviewReceiptRecord>;
 } {
   const reviews: readonly ReviewReceiptRecord[] = assessment.reviewReceipts.filter(
     (receipt) => receipt.candidateHeadSha === assessment.candidateHeadSha,
@@ -164,7 +167,20 @@ function selectReviewEvidence(assessment: EvidenceAssessmentRecord): {
       counted.push(receipt);
     }
   }
-  return { reviews, blockers, latest: latestReceiptPerReviewer(counted) };
+  // CO18a7a: `latest` is selected among the receipts about this assessment
+  // only, so a receipt about another subject never replaces one that is.
+  // `notAbout` holds the receipts the selection over every subject would have
+  // picked and that are not about this assessment: they are still judged, so
+  // they block as before, and they are never the passing review. `passable`
+  // is the part of `latest` that no later receipt of another subject follows.
+  // The tally reads `latest`, so it counts receipts about this assessment only.
+  const latest = latestReceiptPerReviewer(
+    counted.filter((receipt) => isReceiptAboutAssessment(receipt, assessment)),
+  );
+  const ofAnySubject = new Set(latestReceiptPerReviewer(counted));
+  const passable = new Set(latest.filter((receipt) => ofAnySubject.has(receipt)));
+  const notAbout = [...ofAnySubject].filter((receipt) => !passable.has(receipt));
+  return { reviews, blockers, latest, notAbout, passable };
 }
 
 /**
@@ -219,7 +235,7 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly A
       .map((disposition) => disposition.findingId),
   );
   let passing = false;
-  for (const receipt of selection.latest) {
+  for (const receipt of [...selection.latest, ...selection.notAbout]) {
     const decision = decideReviewReceiptOutcome(receipt, outOfScopeResolvedFindingIds, unresolvedFindingIds);
     if (decision.outcome === 'fail') {
       blockers.push(
@@ -243,7 +259,11 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly A
       }
       continue;
     }
-    if (reviewKindOf(receipt) === 'code-review' && isAttemptReceiptSubject(receipt)) {
+    if (
+      reviewKindOf(receipt) === 'code-review' &&
+      isAttemptReceiptSubject(receipt) &&
+      selection.passable.has(receipt)
+    ) {
       passing = true;
     }
   }
@@ -268,6 +288,25 @@ function collectFindingBlockers(assessment: EvidenceAssessmentRecord): readonly 
   return EvidenceAssessment.fromRecord(assessment)
     .unresolvedFindingIds()
     .map((findingId) => acceptanceBlocker('other', `finding '${findingId}' is unresolved`));
+}
+
+const INVALID_RECORD_PREFIX = 'Assessment record is invalid and cannot be assessed: ';
+
+/**
+ * Why the stored record cannot be assessed, or null when the aggregate accepts
+ * it (CO18a7a). Never throws: a record the aggregate cannot even read (for
+ * example a receipt list that is not an array) is `unreadable record`.
+ */
+function invalidStoredRecordReason(assessment: EvidenceAssessmentRecord): string | null {
+  try {
+    const created = EvidenceAssessment.create(assessment);
+    if (created.success && created.value !== undefined) {
+      return null;
+    }
+    return INVALID_RECORD_PREFIX + (created.error?.message ?? 'unknown reason');
+  } catch {
+    return INVALID_RECORD_PREFIX + 'unreadable record';
+  }
 }
 
 export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
@@ -356,6 +395,13 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
         outcome: 'rejected',
         reason: `Assessment is already in terminal state '${assessment.state}'`,
       };
+    }
+
+    // CO18a7a: a stored record the aggregate refuses is a typed rejection
+    // before any aggregate is built, so nothing below can throw on it.
+    const invalidRecordReason = invalidStoredRecordReason(assessment);
+    if (invalidRecordReason !== null) {
+      return { outcome: 'rejected', reason: invalidRecordReason };
     }
 
     // A changed head or policy revision invalidates the evidence collected so

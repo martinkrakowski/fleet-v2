@@ -17,6 +17,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
@@ -37,8 +38,10 @@ import {
   AutoMergeAttemptUseCase,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
+  AuthorBriefUseCase,
   BriefAuthoringAdapter,
   BriefKnowledgeAdapter,
+  BuildFactPackUseCase,
   CiStateAdapter,
   CloseWorkOrderUseCase,
   CutoverJournalAdapter,
@@ -77,6 +80,7 @@ import {
   ProbeProjectUseCase,
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
+  RepositoryFactsAdapter,
   RequestAttemptAcceptanceUseCase,
   ReviewAssessmentAdapter,
   ReviewRequestAdapter,
@@ -773,6 +777,8 @@ export interface FleetCliRuntime {
     readonly inspectAttempt: InspectAttemptUseCase;
     readonly explainAttempt: ExplainAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
+    /** CO17c: one brief-author seat session per brief; the CLI never dispatches. */
+    readonly authorBrief: AuthorBriefUseCase;
     readonly reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
     readonly dispatchAttempt: DispatchAttemptUseCase;
     /** AG-5: the edit-only commit step for a recorded agy edit-only attempt. */
@@ -1115,6 +1121,19 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     readJsonRecord,
   });
 
+  // CO17c: the brief author use case composes from the same execution stack it
+  // freezes through. The fact pack reads through the orchestrator executor
+  // (the role that runs where this process runs) and the brief authoring
+  // adapter is the already-composed instance with no seat command configured.
+  const authorBrief = new AuthorBriefUseCase({
+    factPack: new BuildFactPackUseCase({
+      facts: new RepositoryFactsAdapter({ executor: roleExecutors.orchestrator }),
+      mintNonce: () => randomBytes(16).toString('hex'),
+    }),
+    briefAuthoring: execution.briefAuthoring,
+    prepareBriefPackage: execution.prepareBriefPackage,
+  });
+
   const { conductor } = composeConductor({
     stateDir,
     evidence,
@@ -1278,6 +1297,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     execution: {
       ...execution,
+      authorBrief,
       registerWorkOrder,
       closeWorkOrder,
       listStaleWorkOrders,

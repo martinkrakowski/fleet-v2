@@ -13,7 +13,7 @@
  * logs or throws.
  */
 
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -29,7 +29,7 @@ import type {
   LaneUsageLogPort,
   LaneUsageLogReadResult,
 } from '../../application/ports/out/LaneUsageLogPort.out-port.js';
-import { FileLockTimeoutError, readStoreBytes, withFileLock, writeBytesAtomically } from './file-store.js';
+import { FileLockTimeoutError, withFileLock, writeBytesAtomically } from './file-store.js';
 
 export interface LaneUsageLogFileAdapterOptions {
   /** When set, the rows persist under `<stateDir>/telemetry/`; without it they are held in memory. */
@@ -202,26 +202,48 @@ export class LaneUsageLogFileAdapter implements LaneUsageLogPort {
     return { outcome: 'appended' };
   }
 
-  /** The file's bytes within the size bound; a filesystem error other than absence throws. */
+  /**
+   * The file's bytes within the size bound. The open refuses a symlink
+   * (O_NOFOLLOW) and a non-regular file is refused after fstat on the same
+   * handle, and the read itself takes at most the cap plus one byte, so a
+   * file that grows after the open cannot make it unbounded. A refusal or a
+   * filesystem error other than absence throws; callers report it as
+   * store-unreadable.
+   */
   private async readBounded(target: string): Promise<FileBytes> {
+    let handle: Awaited<ReturnType<typeof fs.open>>;
     try {
-      const stat = await fs.stat(target);
-      if (stat.size > this.maxFileBytes) {
-        return { kind: 'too-large' };
-      }
+      handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     } catch (error: unknown) {
       if (typeof error === 'object' && error !== null && (error as { code?: string }).code === 'ENOENT') {
         return { kind: 'absent' };
       }
       throw error;
     }
-    const bytes = await readStoreBytes(target);
-    if (bytes === null) {
-      return { kind: 'absent' };
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) {
+        throw new Error('lane usage log is not a regular file');
+      }
+      if (stat.size > this.maxFileBytes) {
+        return { kind: 'too-large' };
+      }
+      const limit = this.maxFileBytes + 1;
+      const buffer = Buffer.alloc(limit);
+      let filled = 0;
+      while (filled < limit) {
+        const { bytesRead } = await handle.read(buffer, filled, limit - filled, filled);
+        if (bytesRead === 0) {
+          break;
+        }
+        filled += bytesRead;
+      }
+      if (filled > this.maxFileBytes) {
+        return { kind: 'too-large' };
+      }
+      return { kind: 'bytes', bytes: buffer.subarray(0, filled) };
+    } finally {
+      await handle.close();
     }
-    if (bytes.length > this.maxFileBytes) {
-      return { kind: 'too-large' };
-    }
-    return { kind: 'bytes', bytes };
   }
 }

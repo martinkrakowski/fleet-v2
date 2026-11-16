@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -195,6 +195,27 @@ describe('LaneUsageLogFileAdapter', () => {
     const adapter = new LaneUsageLogFileAdapter({ stateDir });
     expect(await adapter.read()).toEqual({ outcome: 'unreadable', reason: 'store-unreadable' });
     expect(await adapter.append(row())).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
+  });
+
+  it('reports store-unreadable for read and append when the log path is a symlink to a valid log', async () => {
+    const stateDir = await tempStateDir();
+    const realDir = await tempStateDir();
+    const realFile = join(realDir, 'real.jsonl');
+    const good = new LaneUsageLogFileAdapter({ stateDir: realDir, fileName: 'real.jsonl' });
+    expect(await good.append(row())).toEqual({ outcome: 'appended' });
+    await mkdir(join(stateDir, 'telemetry'), { recursive: true });
+    await symlink(realFile, targetPath(stateDir));
+    const adapter = new LaneUsageLogFileAdapter({ stateDir });
+    expect(await adapter.read()).toEqual({ outcome: 'unreadable', reason: 'store-unreadable' });
+    expect(await adapter.append(row('attempt-2'))).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
+  });
+
+  it('reports store-unreadable on read when the log file is larger than the byte cap', async () => {
+    const stateDir = await tempStateDir();
+    await mkdir(join(stateDir, 'telemetry'), { recursive: true });
+    await writeFile(targetPath(stateDir), `{"schemaVersion":1}\n${'x'.repeat(64)}\n`, 'utf8');
+    const adapter = new LaneUsageLogFileAdapter({ stateDir, maxFileBytes: 32, maxRows: 100 });
+    expect(await adapter.read()).toEqual({ outcome: 'unreadable', reason: 'store-unreadable' });
   });
 
   it('returns unreadable invalid-header on a wrong header line', async () => {

@@ -339,6 +339,18 @@ function parseThreadLocation(stdout: string, requestedThreadId: string): ThreadL
   return { number, owner, repo: repository.name };
 }
 
+/** The thread is on the requested pull request; owner and repo compare in lower case. */
+function sameRepositoryPullRequest(location: ThreadLocation, valid: ValidRequest): boolean {
+  if (!REPOSITORY_PATTERN.test(location.owner) || !REPOSITORY_PATTERN.test(location.repo)) {
+    return false;
+  }
+  return (
+    location.number === valid.number &&
+    location.owner.toLowerCase() === valid.owner.toLowerCase() &&
+    location.repo.toLowerCase() === valid.repo.toLowerCase()
+  );
+}
+
 export class GhReviewThreadHelperAdapter implements ReviewThreadHelperPort {
   private readonly runGh: ((args: readonly string[], timeoutMs?: number) => Promise<GhInvocationResult>) | undefined;
   private readonly timeoutMs: number;
@@ -439,7 +451,7 @@ export class GhReviewThreadHelperAdapter implements ReviewThreadHelperPort {
     if ('outcome' in location) {
       return location;
     }
-    if (location.number !== valid.number || location.owner !== valid.owner || location.repo !== valid.repo) {
+    if (!sameRepositoryPullRequest(location, valid)) {
       return refused('thread-not-on-pull-request', 'review thread belongs to another pull request');
     }
     const gh = await this.invoke(
@@ -486,7 +498,7 @@ export class GhReviewThreadHelperAdapter implements ReviewThreadHelperPort {
     if ('outcome' in location) {
       return location;
     }
-    if (location.number !== valid.number || location.owner !== valid.owner || location.repo !== valid.repo) {
+    if (!sameRepositoryPullRequest(location, valid)) {
       return refused('thread-not-on-pull-request', 'review thread belongs to another pull request');
     }
     const gh = await this.invoke(

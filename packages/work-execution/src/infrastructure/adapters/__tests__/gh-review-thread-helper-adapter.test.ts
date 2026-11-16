@@ -390,6 +390,34 @@ describe('GhReviewThreadHelperAdapter', () => {
     expect(argOf(calls[1]!.args, 'threadId=')).toBe('PRRT_1');
   });
 
+  it('a reply mutation response with non-empty errors and partial data is rejected as unavailable', async () => {
+    const erroredReply: GhInvocationResult = {
+      exitCode: 0,
+      stderr: '',
+      stdout: JSON.stringify({
+        data: { addPullRequestReviewThreadReply: { comment: { id: 'IC_1' } } },
+        errors: [{ message: 'comment could not be persisted' }],
+      }),
+    };
+    const { calls, runGh } = scripted(checkAnswer(onThread()), erroredReply);
+    expect(await adapterFor(runGh).replyToReviewThread(replyRequest())).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('a resolve mutation response with non-empty errors and partial data is rejected as unavailable', async () => {
+    const erroredResolve: GhInvocationResult = {
+      exitCode: 0,
+      stderr: '',
+      stdout: JSON.stringify({
+        data: { resolveReviewThread: { thread: { id: 'PRRT_1', isResolved: true } } },
+        errors: [{ message: 'thread state is uncertain' }],
+      }),
+    };
+    const { calls, runGh } = scripted(checkAnswer(onThread()), erroredResolve);
+    expect(await adapterFor(runGh).resolveReviewThread(resolveRequest())).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
+    expect(calls).toHaveLength(2);
+  });
+
   it('the body never appears in the query text', async () => {
     const body = 'DROP TABLE papers; \u2713 unicode too';
     const { calls, runGh } = scripted(checkAnswer(onThread()), REPLY_ANSWER);

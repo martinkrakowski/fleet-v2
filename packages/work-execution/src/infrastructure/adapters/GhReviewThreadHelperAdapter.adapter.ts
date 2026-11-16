@@ -277,6 +277,17 @@ function parseThreadNode(node: unknown): ReviewThreadSummary | null {
   };
 }
 
+/**
+ * A mutation response carrying non-empty GraphQL errors is errored/uncertain
+ * even when partial data looks usable, so it must not be treated as success.
+ */
+function mutationResponseHasErrors(parsed: unknown): boolean {
+  if (!isRecord(parsed)) {
+    return true;
+  }
+  return Array.isArray(parsed.errors) && parsed.errors.length > 0;
+}
+
 /** The parsed ownership-check answer: the thread's own pull request; null when malformed. */
 interface ThreadLocation {
   readonly number: number;
@@ -441,6 +452,9 @@ export class GhReviewThreadHelperAdapter implements ReviewThreadHelperPort {
     } catch {
       return unavailable('unreadable');
     }
+    if (mutationResponseHasErrors(parsed)) {
+      return unavailable('unreadable');
+    }
     const commentId = ownData(ownData(ownData(ownData(parsed, 'data'), 'addPullRequestReviewThreadReply'), 'comment'), 'id');
     if (typeof commentId !== 'string' || commentId.length === 0) {
       return unavailable('unreadable');
@@ -474,6 +488,9 @@ export class GhReviewThreadHelperAdapter implements ReviewThreadHelperPort {
     try {
       parsed = JSON.parse(gh.stdout);
     } catch {
+      return unavailable('unreadable');
+    }
+    if (mutationResponseHasErrors(parsed)) {
       return unavailable('unreadable');
     }
     const thread = ownData(ownData(ownData(parsed, 'data'), 'resolveReviewThread'), 'thread');

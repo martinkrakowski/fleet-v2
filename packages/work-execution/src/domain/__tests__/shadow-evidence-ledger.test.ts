@@ -111,6 +111,26 @@ describe('shadow evidence ledger (SH1)', () => {
       readFailure(ledger, 'unknown-version');
     });
 
+    it('refuses a schema version of 0 with invalid-ledger', () => {
+      const ledger = { ...buildLedger([dayInput(D1, 7)]), schemaVersion: 0 };
+      readFailure(ledger, 'invalid-ledger');
+    });
+
+    it('refuses a fractional schema version with invalid-ledger', () => {
+      const ledger = { ...buildLedger([dayInput(D1, 7)]), schemaVersion: 1.5 };
+      readFailure(ledger, 'invalid-ledger');
+    });
+
+    it('refuses a string schema version with invalid-ledger', () => {
+      const ledger = { ...buildLedger([dayInput(D1, 7)]), schemaVersion: '2' };
+      readFailure(ledger, 'invalid-ledger');
+    });
+
+    it('refuses a negative schema version with invalid-ledger', () => {
+      const ledger = { ...buildLedger([dayInput(D1, 7)]), schemaVersion: -1 };
+      readFailure(ledger, 'invalid-ledger');
+    });
+
     it('refuses null with invalid-ledger', () => {
       readFailure(null, 'invalid-ledger');
     });

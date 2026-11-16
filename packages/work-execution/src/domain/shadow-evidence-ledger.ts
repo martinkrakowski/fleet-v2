@@ -89,7 +89,7 @@ export function readShadowLedger(raw: unknown): ShadowLedgerRead {
   try {
     const version = readRecordSchemaVersion(raw, SHADOW_LEDGER_SCHEMA_VERSION);
     if (!version.ok) {
-      return version.reason === 'unknown-schema-version'
+      return version.reason === 'unknown-schema-version' && isVersionAboveCurrent(raw)
         ? { ok: false, reason: 'unknown-version' }
         : INVALID_LEDGER;
     }
@@ -130,6 +130,27 @@ export function readShadowLedger(raw: unknown): ShadowLedgerRead {
   } catch {
     return INVALID_LEDGER;
   }
+}
+
+/**
+ * True when the ledger's own `schemaVersion` is a positive integer strictly
+ * above the current one — the only case the brief reserves `unknown-version`
+ * for. Any other out-of-window version (`0`, a fraction, a string, a negative
+ * number) is `invalid-ledger`. The version reader has already proved the
+ * property is an enumerable own data property before reporting
+ * `unknown-schema-version`, so reading the descriptor value runs no getter.
+ */
+function isVersionAboveCurrent(raw: unknown): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(raw as object, 'schemaVersion');
+  if (descriptor === undefined || descriptor.get !== undefined) {
+    return false;
+  }
+  const value: unknown = descriptor.value;
+  return (
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value > SHADOW_LEDGER_SCHEMA_VERSION
+  );
 }
 
 /** The capped element count of a real array, or null for any stand-in or oversized array. */

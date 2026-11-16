@@ -150,6 +150,83 @@ export function parseMergeVetoState(stdout: string, expectedHeadOid: string): Me
   }
 }
 
+/** The request fields readMergeVetoState needs once they are valid. */
+interface ValidRequest {
+  readonly owner: string;
+  readonly repo: string;
+  readonly pullRequestNumber: number;
+  readonly headOid: string;
+  readonly deadlineIso: string;
+}
+
+type RequestCheck = { readonly ok: true; readonly fields: ValidRequest } | { readonly ok: false; readonly reason: string };
+
+function isSafePositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
+}
+
+/** Rule 2: read each request field once, then validate it. */
+function validateRequest(request: unknown): RequestCheck {
+  if (!isRecord(request)) return { ok: false, reason: 'invalid-request' };
+  const repository: unknown = request.repository;
+  if (!isRecord(repository)) return { ok: false, reason: 'invalid-request' };
+  const owner: unknown = repository.owner;
+  const repo: unknown = repository.repo;
+  const pullRequestNumber: unknown = request.pullRequestNumber;
+  const headOid: unknown = request.headOid;
+  const deadlineIso: unknown = request.deadlineIso;
+  if (typeof owner !== 'string' || !REPOSITORY_PATTERN.test(owner)) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  if (typeof repo !== 'string' || !REPOSITORY_PATTERN.test(repo)) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  if (!isSafePositiveInteger(pullRequestNumber)) return { ok: false, reason: 'invalid-request' };
+  if (typeof headOid !== 'string' || !HEX_40.test(headOid)) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  if (typeof deadlineIso !== 'string') return { ok: false, reason: 'invalid-request' };
+  return { ok: true, fields: { owner, repo, pullRequestNumber, headOid, deadlineIso } };
+}
+
+/** Rule 3: parse the deadline and refuse an exhausted budget before calling gh. */
+function resolveCallMs(
+  deadlineIso: string,
+  now: () => number,
+  timeoutMs: number,
+): { ok: true; callMs: number } | { ok: false; reason: string } {
+  const deadlineMs = Date.parse(deadlineIso);
+  if (!Number.isFinite(deadlineMs)) return { ok: false, reason: 'invalid-deadline' };
+  const remainingMs = deadlineMs - now();
+  if (remainingMs < BUDGET_MIN_REMAINING_MS) return { ok: false, reason: 'budget-exhausted' };
+  return { ok: true, callMs: Math.min(timeoutMs, remainingMs) };
+}
+
+/** Rules 6-7: check the gh result shape, exit code and stdout size. */
+function readGhStdout(gh: unknown): { ok: true; stdout: string } | { ok: false; reason: string } {
+  if (!isRecord(gh) || typeof gh.exitCode !== 'number') {
+    return { ok: false, reason: 'forge-answer-malformed' };
+  }
+  if (gh.exitCode !== 0) return { ok: false, reason: 'forge-exit-nonzero' };
+  if (typeof gh.stdout !== 'string') return { ok: false, reason: 'forge-answer-malformed' };
+  if (gh.stdout.trim() === '') return { ok: false, reason: 'forge-output-empty' };
+  if (Buffer.byteLength(gh.stdout, 'utf8') > MAX_STDOUT_BYTES) {
+    return { ok: false, reason: 'forge-output-too-large' };
+  }
+  return { ok: true, stdout: gh.stdout };
+}
+
+/** Rule 4: the one allow-listed read-only graphql call. */
+function ghArgs(fields: ValidRequest): string[] {
+  return [
+    'api', 'graphql',
+    '-f', `query=${MERGE_VETO_STATE_QUERY}`,
+    '-f', `owner=${fields.owner}`,
+    '-f', `repo=${fields.repo}`,
+    '-F', `number=${fields.pullRequestNumber}`,
+  ];
+}
+
 type GhRace =
   | { readonly kind: 'ok'; readonly gh: unknown }
   | { readonly kind: 'timed-out' }
@@ -195,49 +272,18 @@ export class GhMergeVetoStateAdapter implements MergeVetoStatePort {
   async readMergeVetoState(request: MergeVetoStateRequest): Promise<MergeVetoStateResult> {
     try {
       if (this.runGh === undefined) return unavailable('not-configured');
-      if (!isRecord(request)) return unavailable('invalid-request');
-      const repository: unknown = request.repository;
-      if (!isRecord(repository)) return unavailable('invalid-request');
-      const owner: unknown = repository.owner;
-      const repo: unknown = repository.repo;
-      const pullRequestNumber: unknown = request.pullRequestNumber;
-      const headOid: unknown = request.headOid;
-      const deadlineIso: unknown = request.deadlineIso;
-      if (typeof owner !== 'string' || !REPOSITORY_PATTERN.test(owner)) return unavailable('invalid-request');
-      if (typeof repo !== 'string' || !REPOSITORY_PATTERN.test(repo)) return unavailable('invalid-request');
-      if (typeof pullRequestNumber !== 'number' || !Number.isSafeInteger(pullRequestNumber) || pullRequestNumber < 1) {
-        return unavailable('invalid-request');
-      }
-      if (typeof headOid !== 'string' || !HEX_40.test(headOid)) return unavailable('invalid-request');
-      if (typeof deadlineIso !== 'string') return unavailable('invalid-request');
+      const check = validateRequest(request);
+      if (!check.ok) return unavailable(check.reason);
+      const budget = resolveCallMs(check.fields.deadlineIso, this.now, this.timeoutMs);
+      if (!budget.ok) return unavailable(budget.reason);
 
-      const deadlineMs = Date.parse(deadlineIso);
-      if (!Number.isFinite(deadlineMs)) return unavailable('invalid-deadline');
-      const remainingMs = deadlineMs - this.now();
-      if (remainingMs < BUDGET_MIN_REMAINING_MS) return unavailable('budget-exhausted');
-      const callMs = Math.min(this.timeoutMs, remainingMs);
-
-      const raced = await raceGh(this.runGh, [
-        'api', 'graphql',
-        '-f', `query=${MERGE_VETO_STATE_QUERY}`,
-        '-f', `owner=${owner}`,
-        '-f', `repo=${repo}`,
-        '-F', `number=${pullRequestNumber}`,
-      ], callMs);
+      const raced = await raceGh(this.runGh, ghArgs(check.fields), budget.callMs);
       if (raced.kind === 'failed') return unavailable('forge-call-failed');
       if (raced.kind === 'timed-out') return unavailable('forge-timeout');
 
-      const gh = raced.gh;
-      if (!isRecord(gh) || typeof gh.exitCode !== 'number') {
-        return unavailable('forge-answer-malformed');
-      }
-      if (gh.exitCode !== 0) return unavailable('forge-exit-nonzero');
-      if (typeof gh.stdout !== 'string') return unavailable('forge-answer-malformed');
-      if (gh.stdout.trim() === '') return unavailable('forge-output-empty');
-      if (Buffer.byteLength(gh.stdout, 'utf8') > MAX_STDOUT_BYTES) {
-        return unavailable('forge-output-too-large');
-      }
-      return parseMergeVetoState(gh.stdout, headOid);
+      const stdout = readGhStdout(raced.gh);
+      if (!stdout.ok) return unavailable(stdout.reason);
+      return parseMergeVetoState(stdout.stdout, check.fields.headOid);
     } catch {
       return unavailable('state-read-failed');
     }

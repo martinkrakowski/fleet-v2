@@ -4,8 +4,20 @@
  * and a compare-and-set landing mark, re-checking every link and unfinished
  * batch after that mark, and only then enqueuing the pull request on the
  * daemon merge queue. A dry run writes nothing. Every rejection is a fixed
- * reason code; unknown stays unknown and nothing throws out of the port.
+ * reason code; unknown stays unknown and nothing throws out of the port. An
+ * apply-phase `halted` refusal additionally carries a read-only `progress`
+ * summary of how far the landing got; pre-apply halts carry none.
  */
+
+/** Read-only report of how far an apply-phase landing got when the kill switch tripped. */
+export interface LandChainHaltProgress {
+  /** The open integration pull request this run found, opened or adopted; null when none is known. */
+  readonly integrationPullRequestNumber: number | null;
+  /** 'posted' only when THIS run's premerge status post succeeded; 'not-recorded' otherwise (an earlier run may have posted). */
+  readonly premergeStatus: 'posted' | 'not-recorded';
+  /** The stored landing mark read at refusal time: 'landing' only for this landing's own key and head in state landing; 'unknown' when the mark could not be read. */
+  readonly landingMark: 'landing' | 'not-landing' | 'unknown';
+}
 
 export type LandChainRefusal =
   | 'invalid-request'
@@ -62,7 +74,7 @@ export type LandChainResult =
       readonly headSha: string;
       readonly entryId: string;
     }
-  | { readonly outcome: 'refused'; readonly reason: LandChainRefusal }
+  | { readonly outcome: 'refused'; readonly reason: LandChainRefusal; readonly progress?: LandChainHaltProgress }
   | { readonly outcome: 'unknown'; readonly reason: LandChainUnknown };
 
 export interface LandChainPort {

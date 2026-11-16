@@ -200,17 +200,25 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
     const head = '5555555555555555555555555555555555555555';
     const storedAccessor = {} as Record<string, unknown>;
     Object.defineProperty(storedAccessor, 'releaseRoot', { enumerable: true, get: () => '/srv/fleet/releases' });
+    const storedThrowing = {} as Record<string, unknown>;
+    Object.defineProperty(storedThrowing, 'releaseRoot', {
+      enumerable: true,
+      get: () => {
+        throw new Error('stored getter ran');
+      },
+    });
     const corruptions: Array<[string, Record<string, unknown>]> = [
       ['wrong primitive', { releaseRoot: 7 }],
       ['object', { releaseRoot: { path: '/srv/fleet/releases' } }],
       ['empty string', { releaseRoot: '' }],
       ['null', { releaseRoot: null }],
       ['accessor', storedAccessor],
+      ['throwing accessor', storedThrowing],
     ];
     for (const [label, corruption] of corruptions) {
       for (const requested of [undefined, '/srv/fleet/releases']) {
         const repo = new InMemoryCoordinationRequestRepo();
-        const grantId = `grant-corrupt-${label.replace(' ', '-')}`;
+        const grantId = `grant-corrupt-${label.replaceAll(' ', '-')}`;
         const base = {
           id: `req-${grantId}`,
           projectId: 'proj-1',

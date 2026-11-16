@@ -83,6 +83,11 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
           : `no recorded request holds grant ${request.authorizationGrantId}`,
       );
     }
+    // CO14 follow-up: read the stored release root descriptor-safely before
+    // anything evaluates the record, so a hostile accessor is a typed refusal.
+    if (readReleaseRoot(recorded).state === 'invalid') {
+      return blocked('release-grant-root-mismatch');
+    }
     const refreshed = await this.refreshFromVerifiedAnswer(recorded);
     const candidate = CoordinationRequest.fromRecord(refreshed);
     // CO14 follow-up: a release grant already durably consumed by exactly the

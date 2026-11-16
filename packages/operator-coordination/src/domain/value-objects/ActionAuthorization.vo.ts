@@ -6,6 +6,7 @@
  * action; it never becomes authority for an unrelated or privileged action.
  */
 
+import { readReleaseRoot } from '../coordination-records.js';
 export interface ActionAuthorizationProps {
   readonly grantId: string;
   readonly projectId: string;
@@ -54,10 +55,8 @@ export class ActionAuthorization {
     if (typeof candidate.consumed !== 'boolean') {
       return { success: false, error: new Error('ActionAuthorization requires a boolean consumed') };
     }
-    if (
-      candidate.releaseRoot !== undefined &&
-      (typeof candidate.releaseRoot !== 'string' || candidate.releaseRoot.trim().length === 0 || candidate.releaseRoot.length > 4096)
-    ) {
+    const releaseRoot = readReleaseRoot(candidate);
+    if (releaseRoot.state === 'invalid') {
       return { success: false, error: new Error('ActionAuthorization requires a bounded releaseRoot when it carries one') };
     }
     return {
@@ -70,7 +69,7 @@ export class ActionAuthorization {
         policyRevision: candidate.policyRevision as string,
         decisionRevision: candidate.decisionRevision as string,
         consumed: candidate.consumed as boolean,
-        ...(candidate.releaseRoot !== undefined ? { releaseRoot: candidate.releaseRoot } : {}),
+        ...(releaseRoot.state === 'valid' ? { releaseRoot: releaseRoot.value } : {}),
       }),
     };
   }

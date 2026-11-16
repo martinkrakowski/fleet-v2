@@ -769,14 +769,18 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         receipt.kind === kind &&
         receipt.attemptId === request.attemptId &&
         receipt.candidateHeadSha === request.candidateHeadSha &&
-        // A brief-check receipt is about the brief, never an attempt subject;
-        // the subject binding applies to the attempt review kinds only.
-        (kind === 'brief-check' ||
-          isAttemptReceiptAbout(receipt, {
-            id: assessmentIdForAttempt(request.attemptId),
-            projectId: request.projectId,
-            attemptId: request.attemptId,
-          })),
+        // A brief-check receipt is about the brief, never the attempt
+        // assessment, so it is bound to the request's project and attempt
+        // directly; every other kind is bound through the full predicate.
+        (kind === 'brief-check'
+          ? isAttemptReceiptSubject(receipt) &&
+            receipt.projectId === request.projectId &&
+            receipt.attemptId === request.attemptId
+          : isAttemptReceiptAbout(receipt, {
+              id: assessmentIdForAttempt(request.attemptId),
+              projectId: request.projectId,
+              attemptId: request.attemptId,
+            })),
       kind,
       false,
     );
@@ -809,9 +813,14 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       only.candidateHeadSha !== request.candidateHeadSha ||
       only.attemptId !== request.attemptId ||
       only.kind === undefined ||
-      // A brief-check receipt is about the brief, never an attempt subject;
-      // the subject binding applies to the attempt review kinds only.
-      (only.kind !== 'brief-check' && !isAttemptReceiptAbout(only, read.assessment))
+      // A brief-check receipt is about the brief, never the attempt
+      // assessment, so it is bound to the assessment's project and attempt
+      // directly; every other kind is bound through the full predicate.
+      (only.kind === 'brief-check'
+        ? !isAttemptReceiptSubject(only) ||
+          only.projectId !== read.assessment.projectId ||
+          only.attemptId !== read.assessment.attemptId
+        : !isAttemptReceiptAbout(only, read.assessment))
     ) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }

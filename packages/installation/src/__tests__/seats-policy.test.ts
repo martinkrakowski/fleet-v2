@@ -1,7 +1,11 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import type { FleetInstallationV2 } from '../types.js';
-import { requireValidInstallationModel } from '../load.js';
+import { loadInstallation, requireValidInstallationModel } from '../load.js';
 import { parseInstallation } from '../parse.js';
 import {
   DEFAULT_SEATS_POLICY,
@@ -212,6 +216,39 @@ describe('policy.seats (SR2)', () => {
       },
     };
     expect(resolveSeatsPolicy(throwingGetter)).toEqual(DEFAULT_SEATS_POLICY);
+  });
+
+  it('pins loadInstallation + resolveSeatsPolicy for policy.seats fixtures and refuses malformed files', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'seats-policy-'));
+    try {
+      const file = join(directory, 'fleet.json');
+      const valid = withSeats({
+        rotate: ['first-pass', 'fix', 'review', 'pre-merge'],
+        cooldownMinutes: 30,
+        observationCooldownMinutes: 10,
+      });
+      writeFileSync(file, JSON.stringify(valid), 'utf8');
+      const loaded = loadInstallation({ file, env: {} });
+      expect(loaded.status).toBe('loaded');
+      if (loaded.status === 'loaded') {
+        expect(resolveSeatsPolicy(loaded.model.policy)).toEqual({
+          rotate: ['first-pass', 'fix', 'review', 'pre-merge'],
+          cooldownMinutes: 30,
+          observationCooldownMinutes: 10,
+        });
+      }
+      const invalid = withSeats({ rotate: ['unknown-role'] });
+      writeFileSync(file, JSON.stringify(invalid), 'utf8');
+      const refused = loadInstallation({ file, env: {} });
+      expect(refused.status).toBe('invalid');
+      if (refused.status === 'invalid') {
+        expect(refused.errors).toEqual([
+          'policy.seats.rotate: must be a list of distinct roles from first-pass, fix, review, pre-merge',
+        ]);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('returns fresh, frozen results', () => {

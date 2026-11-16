@@ -835,4 +835,40 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     expect(w.vetoState.calls).toBe(0);
     expect(w.vetoAdvice.calls).toBe(0);
   });
+
+  it('a state with unknown fields answered incomplete-state stores outcome unknown and the next pass still would-merges', async () => {
+    if (readableState.status !== 'read') {
+      throw new Error('fixture');
+    }
+    const entry = makeEntry();
+    const w = wire([entry], greenForge, {
+      vetoStateResult: {
+        status: 'read',
+        state: {
+          ...readableState.state,
+          hardToUndo: null,
+          fixRounds: null,
+          reviewerFamilies: null,
+          replyResolvedThreads: null,
+          majorBlockerFindings: null,
+        },
+      },
+      vetoAdviceResult: { status: 'unknown', reason: 'incomplete-state' },
+    });
+
+    const first = await w.useCase.runMergePass(w.request);
+    expect(first.entries[0].decision).toBe('no-action');
+    expect(first.entries[0].reasonCode).toBe('veto');
+    expect(w.vetoAdvice.calls).toBe(1);
+    expect(storedVeto(w.queue, entry.entryId)).toEqual({
+      outcome: 'unknown',
+      confidence: null,
+      mode: 'shadow',
+      decisionReceiptId: null,
+    });
+
+    const second = await w.useCase.runMergePass(w.request);
+    expect(second.entries[0].reasonCode).toBe('would-merge');
+    expect(w.vetoAdvice.calls).toBe(1);
+  });
 });

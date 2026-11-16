@@ -1702,7 +1702,7 @@ describe('runDoctor CI runner slots (OG-28c)', () => {
         subject: 'main',
         check: 'ci-runner-slot-2',
         status: 'FAIL',
-        detail: 'slot slot-2 not active; fix: systemctl restart fleet-ci@2.service on ci-alias',
+        detail: 'slot slot-2 not active; fix: sudo systemctl restart fleet-ci@2.service on ci-alias',
       },
     ]);
     expect(recordedHosts).toEqual(['ci-alias', 'ci-alias']);
@@ -1873,6 +1873,37 @@ describe('runDoctor CI runner slots (OG-28c)', () => {
       }
     }
   });
+
+  it('prints the fix line whole or falls back, never redacted or cut', async () => {
+    const FALLBACK =
+      'slot not active; fix: sudo systemctl restart <the unit this slot names under ciRunnerSlots> on this host';
+    const longUnit = `${['u', 'v', 'w', 'x', 'y', 'z', 'q', 'r'].map((c) => c.repeat(20)).join('.')}.service`;
+    const model = sampleModel({
+      host: {
+        transport: 'ssh',
+        sshAlias: 'ci-alias',
+        ciRunnerSlots: [
+          { name: 'sk-runner-01', unit: 'fleet-ci@1.service' },
+          { name: 'slot-2', unit: 'actions-runner-fleet-v2-01.service' },
+          { name: 'slot-3', unit: longUnit },
+          { name: 'slot-4', unit: 'fleet-ci@4.service' },
+        ],
+      },
+    });
+    const { probes } = fakeProbes({ ciRunnerSlot: answering('inactive') });
+    const lines = slotLines(await collect(loadedResult(model), probes));
+    expect(lines.map((doctorLine) => doctorLine.status)).toEqual(['FAIL', 'FAIL', 'FAIL', 'FAIL']);
+    expect(lines.map((doctorLine) => doctorLine.detail)).toEqual([
+      FALLBACK,
+      FALLBACK,
+      FALLBACK,
+      'slot slot-4 not active; fix: sudo systemctl restart fleet-ci@4.service on ci-alias',
+    ]);
+    for (const doctorLine of lines) {
+      expect(doctorLine.detail).not.toContain('[redacted]');
+      expect(doctorLine.detail.length).toBeLessThan(200);
+    }
+  });
 });
 
 describe('runDoctor login-shell canary (SHP1)', () => {
@@ -1976,7 +2007,7 @@ describe('runDoctor login-shell canary (SHP1)', () => {
       (doctorLine) => doctorLine.scope === 'host' && doctorLine.subject === 'main' && doctorLine.check === 'login-shell',
     );
     expect(mainShellLine?.detail).toBe(
-      "login shell does not pass sh -c intact via ci-alias; this host's other lines are not trustworthy",
+      "login shell did not return the canary unchanged via ci-alias (it altered sh -c or printed extra output); this host's other lines are not trustworthy",
     );
     for (const doctorLine of lines) {
       if (
@@ -1984,7 +2015,7 @@ describe('runDoctor login-shell canary (SHP1)', () => {
         doctorLine.subject === 'main' &&
         doctorLine.status === 'UNKNOWN'
       ) {
-        expect(doctorLine.detail).toBe('not probed: login shell does not pass sh -c intact');
+        expect(doctorLine.detail).toBe('not probed: login shell failed the canary');
       }
     }
     expect(hostChecks(lines, 'main').map((entry) => entry.slice(0, entry.lastIndexOf(':')))).toEqual(
@@ -2085,5 +2116,157 @@ describe('runDoctor login-shell canary (SHP1)', () => {
     for (const doctorLine of lines) {
       expect(JSON.stringify(doctorLine)).not.toContain(sentinel);
     }
+  });
+});
+
+describe('runDoctor refused ssh alias (SD6c3)', () => {
+  const ALIAS = 'evil\u001b[31malias';
+  const REFUSED = 'ssh alias refused: not a safe host string; no command was run on this host';
+  const refusedModel = () =>
+    sampleModel({
+      host: {
+        transport: 'ssh',
+        sshAlias: ALIAS,
+        ciRunnerSlots: [{ name: 'slot-1', unit: 'fleet-ci@1.service' }],
+      },
+    });
+  const detailOf = (lines: readonly DoctorLine[], subject: string, check: string) =>
+    lines.find((doctorLine) => doctorLine.subject === subject && doctorLine.check === check);
+
+  it('says the alias was refused and never prints it', async () => {
+    const reached: string[] = [];
+    const { probes } = fakeProbes({
+      hostReachable: async (host) => {
+        reached.push(host);
+        return host !== ALIAS;
+      },
+      loginShell: async (host) => (host === ALIAS ? 'unknown' : 'intact'),
+      ciRunnerSlot: async () => 'inactive',
+    });
+    const lines = await collect(loadedResult(refusedModel()), probes);
+    expect(detailOf(lines, 'main', 'login-shell')).toEqual({
+      scope: 'host',
+      subject: 'main',
+      check: 'login-shell',
+      status: 'UNKNOWN',
+      detail: 'login shell could not be checked via [unsafe ssh alias]',
+    });
+    expect(detailOf(lines, 'main', 'reachable')).toEqual({
+      scope: 'host',
+      subject: 'main',
+      check: 'reachable',
+      status: 'FAIL',
+      detail: REFUSED,
+    });
+    expect(detailOf(lines, 'main', 'ci-runner-slot-1')).toEqual({
+      scope: 'host',
+      subject: 'main',
+      check: 'ci-runner-slot-1',
+      status: 'FAIL',
+      detail: 'slot slot-1 not active; fix: sudo systemctl restart fleet-ci@1.service on [unsafe ssh alias]',
+    });
+    expect(detailOf(lines, 'verifier-host', 'reachable')?.detail).toBe(
+      'reachable via verifier-host (roles: verifier)',
+    );
+    expect(JSON.stringify(lines)).not.toContain('evil');
+    expect(reached).toContain(ALIAS);
+    expect(doctorExitCode(lines)).toBe(1);
+  });
+
+  it('hides a refused alias on the reachable, probe-failed, intact and mangled texts too', async () => {
+    const run1 = fakeProbes();
+    const lines1 = await collect(loadedResult(refusedModel()), run1.probes);
+    expect(detailOf(lines1, 'main', 'reachable')?.detail).toBe(
+      'reachable via [unsafe ssh alias] (roles: orchestrator, lane-runner)',
+    );
+    expect(detailOf(lines1, 'main', 'login-shell')?.detail).toBe(
+      'login shell passes sh -c intact via [unsafe ssh alias]',
+    );
+    expect(JSON.stringify(lines1)).not.toContain('evil');
+
+    const run2 = fakeProbes({
+      hostReachable: async () => {
+        throw new Error('boom');
+      },
+    });
+    const lines2 = await collect(loadedResult(refusedModel()), run2.probes);
+    expect(detailOf(lines2, 'main', 'reachable')?.status).toBe('UNKNOWN');
+    expect(detailOf(lines2, 'main', 'reachable')?.detail).toBe(
+      'reachability probe failed ([unsafe ssh alias])',
+    );
+    expect(JSON.stringify(lines2)).not.toContain('evil');
+
+    const run3 = fakeProbes({
+      loginShell: async (host) => (host === ALIAS ? 'mangled' : 'intact'),
+    });
+    const lines3 = await collect(loadedResult(refusedModel()), run3.probes);
+    expect(detailOf(lines3, 'main', 'login-shell')?.status).toBe('FAIL');
+    expect(detailOf(lines3, 'main', 'login-shell')?.detail).toBe(
+      "login shell did not return the canary unchanged via [unsafe ssh alias] (it altered sh -c or printed extra output); this host's other lines are not trustworthy",
+    );
+    expect(detailOf(lines3, 'main', 'reachable')?.status).toBe('UNKNOWN');
+    expect(detailOf(lines3, 'main', 'reachable')?.detail).toBe(
+      'not probed: login shell failed the canary',
+    );
+    expect(JSON.stringify(lines3)).not.toContain('evil');
+  });
+
+  it('keeps a safe alias and a local host byte-identical', async () => {
+    const unreachable = fakeProbes({
+      hostReachable: async (host) => host !== 'verifier-host',
+    });
+    const lines1 = await collect(loadedResult(sampleModel()), unreachable.probes);
+    expect(detailOf(lines1, 'verifier-host', 'reachable')?.status).toBe('FAIL');
+    expect(detailOf(lines1, 'verifier-host', 'reachable')?.detail).toBe(
+      'not reachable via verifier-host',
+    );
+    expect(detailOf(lines1, 'main', 'reachable')?.detail).toBe(
+      'reachable via local (roles: orchestrator, lane-runner)',
+    );
+
+    const failing = fakeProbes({
+      hostReachable: async () => {
+        throw new Error('boom');
+      },
+    });
+    const lines2 = await collect(loadedResult(sampleModel()), failing.probes);
+    expect(detailOf(lines2, 'verifier-host', 'reachable')?.detail).toBe(
+      'reachability probe failed (verifier-host)',
+    );
+
+    const userAlias = fakeProbes();
+    const lines3 = await collect(
+      loadedResult(sampleModel({ host: { transport: 'ssh', sshAlias: 'user@lane-1.example' } })),
+      userAlias.probes,
+    );
+    expect(detailOf(lines3, 'main', 'reachable')?.detail).toBe(
+      'reachable via user@lane-1.example (roles: orchestrator, lane-runner)',
+    );
+    expect(detailOf(lines3, 'main', 'login-shell')?.detail).toBe(
+      'login shell passes sh -c intact via user@lane-1.example',
+    );
+  });
+
+  it('spawns nothing with a refused alias and reports it refused (real probe path)', async () => {
+    const argvs: Array<readonly string[]> = [];
+    const probes = createNodeDoctorProbes({
+      localExecutor: {
+        async run(argv) {
+          argvs.push(argv);
+          return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+        },
+      },
+    });
+    const lines = await collect(loadedResult(refusedModel()), probes);
+    expect(detailOf(lines, 'main', 'reachable')).toEqual({
+      scope: 'host',
+      subject: 'main',
+      check: 'reachable',
+      status: 'FAIL',
+      detail: REFUSED,
+    });
+    expect(detailOf(lines, 'main', 'login-shell')?.status).toBe('UNKNOWN');
+    expect(argvs.some((argv) => argv.some((word) => word.includes('evil')))).toBe(false);
+    expect(JSON.stringify(lines)).not.toContain('evil');
   });
 });

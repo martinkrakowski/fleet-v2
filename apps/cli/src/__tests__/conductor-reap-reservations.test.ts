@@ -225,6 +225,8 @@ describe('conductor reap --reservations (OG22b)', () => {
 
   it('rejects an unknown flag and a positional without echoing the token', async () => {
     const runtime = createFleetCliRuntime({ stateDir: tempStateDir() });
+    const reservations = vi.spyOn(runtime.conductor.reapOrphanReservations, 'reapOrphanReservations');
+    const dryRun = vi.spyOn(runtime.conductor.reapOrphanReservationsDryRun, 'reapOrphanReservations');
     const secretToken = `--gh${'p_'}${'x'.repeat(30)}`;
     const unknown = await runConductor(runtime, ['reap', '--reservations', '--yes', secretToken]);
     expect(unknown.code).toBe(2);
@@ -235,6 +237,8 @@ describe('conductor reap --reservations (OG22b)', () => {
     expect(positional.code).toBe(2);
     expect(positional.stdout).toEqual([]);
     expect(positional.stderr.join('')).toContain('takes no positional arguments');
+    expect(reservations).not.toHaveBeenCalled();
+    expect(dryRun).not.toHaveBeenCalled();
   });
 
   it('requires --yes without --dry-run, and calls nothing', async () => {
@@ -252,10 +256,14 @@ describe('conductor reap --reservations (OG22b)', () => {
 
   it('needs a durable state directory', async () => {
     const runtime = createFleetCliRuntime();
+    const reservations = vi.spyOn(runtime.conductor.reapOrphanReservations, 'reapOrphanReservations');
+    const dryRun = vi.spyOn(runtime.conductor.reapOrphanReservationsDryRun, 'reapOrphanReservations');
     const result = await runConductor(runtime, ['reap', '--reservations', '--yes'], null);
     expect(result.code).toBe(2);
     expect(result.stdout).toEqual([]);
     expect(result.stderr.join('')).toContain('needs a durable state directory');
+    expect(reservations).not.toHaveBeenCalled();
+    expect(dryRun).not.toHaveBeenCalled();
   });
 
   it('exits 1 and says nothing was released when the outcome is refused or unknown', async () => {

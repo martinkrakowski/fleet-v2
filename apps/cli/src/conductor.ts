@@ -1828,82 +1828,68 @@ interface ReapFlags {
   readonly forceUnsealed: boolean;
 }
 
+type ReapFlagName = '--worktrees' | '--sessions' | '--reservations' | '--dry-run' | '--yes' | '--force-unsealed';
+
+const REAP_FLAG_NAMES: readonly string[] = ['--worktrees', '--sessions', '--reservations', '--dry-run', '--yes', '--force-unsealed'];
+
+/** The usage error for one token that is not a repeatable-once reap flag, or null when it is one. */
+function reapTokenError(token: string): string | null {
+  if (REAP_FLAG_NAMES.includes(token)) {
+    return null;
+  }
+  return token.startsWith('--')
+    ? 'conductor reap: unknown or unsupported flag'
+    : 'conductor reap takes no positional arguments';
+}
+
+/**
+ * The usage error for a flag given a second time. `--force-unsealed` never
+ * echoes the token (C2'): the message names the flag, not the argv value.
+ */
+function reapRepeatError(token: string): string {
+  return token === '--force-unsealed'
+    ? 'conductor reap: --force-unsealed given more than once'
+    : `Repeated flag: ${token}`;
+}
+
+/** The cross-flag usage error once every token has been read, or null. */
+function reapCombinationError(flags: ReapFlags): string | null {
+  return flags.forceUnsealed && (flags.sessions || flags.reservations)
+    ? 'conductor reap: --force-unsealed applies only to --worktrees'
+    : null;
+}
+
 /**
  * `conductor reap`'s private flag reader: exactly one of `--worktrees` or
  * `--sessions`, and `--dry-run`/`--yes`. An unknown flag, a repeated flag or
  * a positional is a usage error.
  */
 function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
-  let worktrees = false;
-  let sessions = false;
-  let reservations = false;
-  let dryRun = false;
-  let yes = false;
-  let forceUnsealed = false;
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index]!;
-    if (token === '--worktrees') {
-      if (worktrees) {
-        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
-        return null;
-      }
-      worktrees = true;
-      continue;
-    }
-    if (token === '--sessions') {
-      if (sessions) {
-        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
-        return null;
-      }
-      sessions = true;
-      continue;
-    }
-    if (token === '--reservations') {
-      if (reservations) {
-        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
-        return null;
-      }
-      reservations = true;
-      continue;
-    }
-    if (token === '--dry-run') {
-      if (dryRun) {
-        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
-        return null;
-      }
-      dryRun = true;
-      continue;
-    }
-    if (token === '--yes') {
-      if (yes) {
-        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
-        return null;
-      }
-      yes = true;
-      continue;
-    }
-    if (token === '--force-unsealed') {
-      // C2': given at most once; a secret-shaped or path-shaped token is
-      // never echoed, so the message names the flag, not the argv value.
-      if (forceUnsealed) {
-        io.stderr(`conductor reap: --force-unsealed given more than once\n${CONDUCTOR_HELP}\n`);
-        return null;
-      }
-      forceUnsealed = true;
-      continue;
-    }
-    if (token.startsWith('--')) {
-      io.stderr(`conductor reap: unknown or unsupported flag\n${CONDUCTOR_HELP}\n`);
+  const seen = new Set<string>();
+  for (const token of argv) {
+    const tokenError = reapTokenError(token);
+    const error = tokenError ?? (seen.has(token) ? reapRepeatError(token) : null);
+    if (error !== null) {
+      io.stderr(`${error}\n${CONDUCTOR_HELP}\n`);
       return null;
     }
-    io.stderr(`conductor reap takes no positional arguments\n${CONDUCTOR_HELP}\n`);
+    seen.add(token);
+  }
+  const has = (name: ReapFlagName): boolean => seen.has(name);
+  const flags: ReapFlags = {
+    worktrees: has('--worktrees'),
+    sessions: has('--sessions'),
+    reservations: has('--reservations'),
+    dryRun: has('--dry-run'),
+    yes: has('--yes'),
+    forceUnsealed: has('--force-unsealed'),
+  };
+  const combinationError = reapCombinationError(flags);
+  if (combinationError !== null) {
+    io.stderr(`${combinationError}\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  if (forceUnsealed && (sessions || reservations)) {
-    io.stderr(`conductor reap: --force-unsealed applies only to --worktrees\n${CONDUCTOR_HELP}\n`);
-    return null;
-  }
-  return { worktrees, sessions, reservations, dryRun, yes, forceUnsealed };
+  return flags;
 }
 
 const RESERVATION_REAP_PREFIX = 'conductor reap --reservations: ';

@@ -340,6 +340,32 @@ describe('ReapOrphanReservationsUseCase', () => {
     expect(nonArray.journalEntries).toHaveLength(0);
   });
 
+  it('reads the reservations length exactly once, so a length that throws on a later read cannot reject the pass', async () => {
+    let lengthReads = 0;
+    const twoFaced = new Proxy([] as CapacityReservationRecord[], {
+      get(target, prop, receiver) {
+        if (prop === 'then') {
+          return undefined;
+        }
+        if (prop === 'length') {
+          lengthReads += 1;
+          if (lengthReads > 1) {
+            throw new Error('second length read');
+          }
+          return 0;
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const harness = makeHarness({ reservationsImpl: () => Promise.resolve(twoFaced as readonly CapacityReservationRecord[]), runs: [] });
+    await expect(run(harness, { dryRun: false, nowIso: NOW })).resolves.toEqual({
+      outcome: 'reaped', dryRun: false, orphans: [], reportOnly: [], released: [], skipped: [], failed: [], journalFailed: [], unknown: [],
+    });
+    expect(lengthReads).toBe(1);
+    expect(harness.releaseCalls).toHaveLength(0);
+    expect(harness.releaseCallsUnfenced).toHaveLength(0);
+  });
+
   it('fails closed as unknown reservations-unreadable when more reservations are held than the scan cap', async () => {
     // 10,001 held reservations: the 10,001st (index 10,000) is a terminal-run
     // orphan that a truncated scan would silently drop while still reporting

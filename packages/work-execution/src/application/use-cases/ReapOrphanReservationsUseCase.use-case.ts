@@ -360,6 +360,36 @@ function revisionOf(attempt: { readonly revision?: unknown } | null | undefined)
   return typeof revision === 'number' && Number.isInteger(revision) && revision >= 0 ? revision : null;
 }
 
+/**
+ * The reservations list copied behind guards with `.length` read exactly once,
+ * so a hostile list cannot answer differently on a later read. A list that is
+ * not an array, whose length read throws, or that is longer than the scan cap
+ * is never partially classified: it answers null and the whole pass fails
+ * closed as unknown with nothing released. An unreadable element copies as
+ * `undefined`, which the classifier already skips.
+ */
+function snapshotReservations(value: unknown): unknown[] | null {
+  if (!safeIsArray(value)) {
+    return null;
+  }
+  let rawLength: unknown;
+  try {
+    rawLength = (value as { readonly length?: unknown }).length;
+  } catch {
+    return null;
+  }
+  if (typeof rawLength === 'number' && rawLength > MAX_ORPHAN_RESERVATION_SCAN) {
+    return null;
+  }
+  const count = typeof rawLength === 'number' && Number.isFinite(rawLength) && rawLength > 0 ? Math.floor(rawLength) : 0;
+  const copy: unknown[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const element = safeElementAt(value as readonly unknown[], index);
+    copy.push(element.ok ? element.value : undefined);
+  }
+  return copy;
+}
+
 const sortByReservationId = <T extends { readonly reservationId: string }>(list: T[]): T[] =>
   list.sort((left, right) => byCodeUnit(left.reservationId, right.reservationId));
 
@@ -377,20 +407,14 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
     // Top-level reads are deadline-guarded and fail closed: an unreadable
     // store refuses the whole pass as unknown before anything is released.
     const reservationsRead = await callStore(() => this.deps.executionJournal.listActiveReservations(), timeoutMs);
-    if (!reservationsRead.ok || !safeIsArray(reservationsRead.value) || !hasReadableLength(reservationsRead.value)) {
-      return { outcome: 'unknown', reason: 'reservations-unreadable' };
-    }
-    // A reservations list longer than the scan cap is never partially
-    // classified: reservations beyond the cap cannot even be named, so the
-    // whole pass fails closed as unknown and nothing is released.
-    if (reservationsRead.value.length > MAX_ORPHAN_RESERVATION_SCAN) {
+    const reservations = reservationsRead.ok ? snapshotReservations(reservationsRead.value) : null;
+    if (reservations === null) {
       return { outcome: 'unknown', reason: 'reservations-unreadable' };
     }
     const runsRead = await callStore(() => this.deps.runRepo.list(), timeoutMs);
     if (!runsRead.ok || !safeIsArray(runsRead.value) || !hasReadableLength(runsRead.value)) {
       return { outcome: 'unknown', reason: 'runs-unreadable' };
     }
-    const reservations: readonly unknown[] = reservationsRead.value;
     const runs: readonly unknown[] = runsRead.value;
 
     const heldAttemptIds = readHeldAttemptIds(reservations);

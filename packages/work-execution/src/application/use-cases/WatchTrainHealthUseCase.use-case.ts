@@ -394,9 +394,13 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     }
   }
 
-  /** Reads an own data property of an object answer as a string. */
+  /** Reads an own data property of an object answer as a string, never coercing a non-string value. */
   private outcomeOf(answer: unknown): string | null {
-    return isPlainObject(answer) ? String(ownValue(answer, 'outcome')) : null;
+    if (!isPlainObject(answer)) {
+      return null;
+    }
+    const outcome = ownValue(answer, 'outcome');
+    return typeof outcome === 'string' ? outcome : null;
   }
 
   /** The evaluated path: list once, raise every target, clear what ended. */

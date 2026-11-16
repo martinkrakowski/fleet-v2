@@ -451,6 +451,40 @@ describe('WatchTrainHealthUseCase', () => {
     expect(raiseCalls).toHaveLength(2);
   });
 
+  it('treats a non-string attention outcome as a failed raise, never coercing or invoking its toString', async () => {
+    let toStringCalls = 0;
+    const throwingOutcome = {
+      toString() {
+        toStringCalls += 1;
+        throw new Error('should never be read');
+      },
+    };
+    const coercesToRaisedOutcome = { toString: () => 'raised' };
+    const { deps, raiseCalls } = makeDeps({
+      stateRead: {
+        outcome: 'ok',
+        snapshot: healthySnapshot({
+          lastTickFinishedAtIso: '2026-11-16T11:00:00.000Z',
+          queue: [entry({ pullRequest: 1, enqueuedAtIso: '2026-11-16T10:00:00.000Z' })],
+        }) as never,
+      },
+      raiseBehavior: (callIndex) =>
+        callIndex === 1
+          ? { outcome: coercesToRaisedOutcome, reasonCode: null }
+          : { outcome: throwingOutcome, reasonCode: null },
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      healthy: false,
+      exitCode: 1,
+      raised: 0,
+      attentionFailures: 2,
+    });
+    expect(raiseCalls).toHaveLength(2);
+    expect(toStringCalls).toBe(0);
+  });
+
   it('clears nothing and sets attentionFailures 1 when list returns unavailable', async () => {
     const { deps, raiseCalls, clearCalls } = makeDeps({
       stateRead: {

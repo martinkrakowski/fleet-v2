@@ -9,6 +9,7 @@
 
 export type LandChainRefusal =
   | 'invalid-request'
+  | 'halted'
   | 'secret-shaped'
   | 'chain-not-found'
   | 'chain-not-started'

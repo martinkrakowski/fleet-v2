@@ -182,6 +182,7 @@ const fullV2File = {
     conductor: {
       enabled: true,
       stopGraceMinutes: 5,
+      premergeMode: 'auto-attest',
       reaper: {
         enabled: true,
         intervalMinutes: 10,

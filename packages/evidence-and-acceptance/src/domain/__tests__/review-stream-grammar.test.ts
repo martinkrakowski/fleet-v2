@@ -5,7 +5,7 @@
  * Pure domain — no I/O, no subprocesses.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   MAX_REVIEW_STREAM_EVENTS,
@@ -77,6 +77,24 @@ describe('parseReviewStreamGrammar', () => {
     ].join('\n');
     expect(over.split('\n')).toHaveLength(MAX_REVIEW_STREAM_EVENTS + 1);
     expect(parseReviewStreamGrammar(over)).toEqual(refused);
+  });
+
+  it('refuses on the event cap without parsing an invalid 50,001st line', () => {
+    const sentinel = '{not json RVG2-over-cap-sentinel';
+    const stream = [
+      stepStart(),
+      ...Array.from({ length: MAX_REVIEW_STREAM_EVENTS - 1 }, () => toolEvent()),
+      sentinel,
+    ].join('\n');
+    expect(stream.split('\n')).toHaveLength(MAX_REVIEW_STREAM_EVENTS + 1);
+    const parse = vi.spyOn(JSON, 'parse');
+    try {
+      expect(parseReviewStreamGrammar(stream)).toEqual(refused);
+      expect(parse).toHaveBeenCalledTimes(MAX_REVIEW_STREAM_EVENTS);
+      expect(parse.mock.calls.some((call) => call[0] === sentinel)).toBe(false);
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   it('returns a frozen refusal that a caller cannot mutate', () => {

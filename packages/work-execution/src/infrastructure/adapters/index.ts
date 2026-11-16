@@ -46,6 +46,7 @@ export * from "./GateReceiptReuseAdapter.adapter.js";
 export * from "./GateSlotBudget.helper.js";
 export * from "./gh-refusal.js";
 export * from "./GhForgeMergeReadAdapter.adapter.js";
+export * from "./GhMergeVetoStateAdapter.adapter.js";
 export * from "./GhReviewThreadHelperAdapter.adapter.js";
 export * from "./GitMirrorPatchIdentityAdapter.adapter.js";
 export * from "./HeldWorkOrderRepositoryAdapter.adapter.js";

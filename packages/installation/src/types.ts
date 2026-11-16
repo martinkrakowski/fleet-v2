@@ -331,9 +331,18 @@ export interface ConductorReaperPolicy {
  * `enabled`; only `enabled` is required. It grants nothing by itself: forge actions still
  * need a policy grant (AM3a), merges also `policy.autoMerge`.
  */
+/** How the conductor handles Tier 2 `premerge` status once an independent pre-merge review passes (CO21). */
+export type ConductorPremergeMode = 'human-gate' | 'auto-attest';
+
+/**
+ * The v2 `policy.conductor` section as written (conductor plan §3.7, §3.9). Off unless
+ * `enabled`; only `enabled` is required. It grants nothing by itself: forge actions still
+ * need a policy grant (AM3a), merges also `policy.autoMerge`.
+ */
 export interface ConductorPolicy {
   readonly enabled: boolean;
   readonly stopGraceMinutes?: number;
+  readonly premergeMode?: ConductorPremergeMode;
   readonly reaper?: ConductorReaperPolicy;
 }
 
@@ -398,6 +407,7 @@ export interface ResolvedConductorReaperPolicy {
 export interface ResolvedConductorPolicy {
   readonly enabled: boolean;
   readonly stopGraceMinutes: number;
+  readonly premergeMode: ConductorPremergeMode;
   readonly reaper: ResolvedConductorReaperPolicy;
 }
 

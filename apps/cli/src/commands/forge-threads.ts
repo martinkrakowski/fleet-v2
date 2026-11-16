@@ -28,9 +28,10 @@ export function strictPullRequestNumber(p: Payload): number | undefined {
 }
 
 const SUBCOMMANDS = new Set(['list', 'reply', 'resolve']);
-// The `(?!\n)` lookahead keeps a trailing newline out: without it `$` would
-// also match just before a final newline and 'owner/repo\n' would validate.
-const REPOSITORY_PATTERN = /^([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})(?!\n)$/;
+// Anchored at both ends without the `m` flag: `$` matches only at the very end
+// of the string (JavaScript's `$` does not match before a final newline), so
+// 'owner/repo\n' fails because a newline is not in the segment character set.
+const REPOSITORY_PATTERN = /^([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})$/;
 const THREAD_ID_PATTERN = /^[A-Za-z0-9_+/=-]{1,256}$/;
 const MAX_BODY_FILE_BYTES = 32000;
 const MAX_BODY_CHARS = 8000;
@@ -50,6 +51,7 @@ function allowedKeys(sub: string): ReadonlySet<string> {
   const keys = new Set(['positional', 'repository', 'pullRequestNumber']);
   if (sub === 'reply' || sub === 'resolve') {
     keys.add('threadId');
+    keys.add('yes');
   }
   if (sub === 'reply') {
     keys.add('bodyFile');
@@ -106,6 +108,18 @@ function readReplyBody(path: string): string {
   return stripped;
 }
 
+/** Reply and resolve write to the forge, so they need an explicit `--yes`, like the other mutating commands. */
+function requireYes(sub: string, payload: Payload): void {
+  if (payload['yes'] === true) {
+    return;
+  }
+  const effect =
+    sub === 'reply'
+      ? 'it posts the body file as a new comment on the review thread on the forge; it changes no branch, no other thread and no pull request state, and a posted comment cannot be unposted by this command.'
+      : 'it marks the review thread resolved on the forge; it posts no comment and changes no branch or pull request state.';
+  throw new CliUsageError(`forge threads ${sub} needs --yes: ${effect}`);
+}
+
 /** Every check runs, in order, before any port call; each failure is a usage error. */
 function validate(payload: Payload): ValidThreadsRequest {
   const sub = firstPositional(payload);
@@ -129,6 +143,7 @@ function validate(payload: Payload): ValidThreadsRequest {
   let threadId: string | null = null;
   if (sub === 'reply' || sub === 'resolve') {
     threadId = threadIdOf(payload);
+    requireYes(sub, payload);
   }
   let body: string | null = null;
   if (sub === 'reply') {

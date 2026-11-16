@@ -87,7 +87,7 @@ function listArgv(extra: string[] = []): string[] {
   return ['forge', 'threads', 'list', '--repository', 'owner/repo', '--pull-request-number', '42', ...extra];
 }
 
-function replyArgv(bodyFile: string, extra: string[] = []): string[] {
+function replyArgv(bodyFile: string, extra: string[] = [], yes = true): string[] {
   return [
     'forge',
     'threads',
@@ -100,11 +100,12 @@ function replyArgv(bodyFile: string, extra: string[] = []): string[] {
     'PRRT_1',
     '--body-file',
     bodyFile,
+    ...(yes ? ['--yes'] : []),
     ...extra,
   ];
 }
 
-function resolveArgv(extra: string[] = []): string[] {
+function resolveArgv(extra: string[] = [], yes = true): string[] {
   return [
     'forge',
     'threads',
@@ -115,6 +116,7 @@ function resolveArgv(extra: string[] = []): string[] {
     '42',
     '--thread-id',
     'PRRT_1',
+    ...(yes ? ['--yes'] : []),
     ...extra,
   ];
 }
@@ -429,6 +431,67 @@ describe('forge threads', () => {
     expect(out.join('') + err.join('')).not.toContain('MARKER-THROW');
   });
 
+  it.each([
+    ['reply without --yes', (file: string) => replyArgv(file, [], false)],
+    ['resolve without --yes', () => resolveArgv([], false)],
+    ['reply with --yes given a value other than true', (file: string) => replyArgv(file, [], false).concat(['--yes', 'false'])],
+  ])('a write without an explicit --yes is a usage error: %s', async (_name, makeArgv) => {
+    const { calls, helper } = recordingStub({ outcome: 'ok', commentId: 'IC_1', isResolved: true });
+    const { io, out, err } = collectIo();
+    const code = await runCli(makeArgv(bodyFile('hello')), io, stubRuntime(helper));
+    expect(code).toBe(2);
+    expect(calls).toHaveLength(0);
+    expect(out.join('')).toBe('');
+    expect(err.join('')).toContain('needs --yes');
+  });
+
+  it('list takes no --yes: passing it is the unknown-flag usage error and nothing is called', async () => {
+    const { calls, helper } = recordingStub({ outcome: 'ok', threads: [] });
+    const { io, out } = collectIo();
+    const code = await runCli(listArgv(['--yes']), io, stubRuntime(helper));
+    expect(code).toBe(2);
+    expect(calls).toHaveLength(0);
+    expect(out.join('')).toBe('');
+  });
+
+  it('a failed ownership check reports mayHavePosted false and sends no mutation', async () => {
+    const recorded: { args: readonly string[] }[] = [];
+    const forgeGhRunner = async (args: readonly string[]) => {
+      recorded.push({ args });
+      return {
+        exitCode: 0,
+        stderr: '',
+        stdout: JSON.stringify({
+          data: {
+            node: {
+              __typename: 'PullRequestReviewThread',
+              id: 'PRRT_1',
+              pullRequest: { number: 999, repository: { name: 'example-repo', owner: { login: 'example-owner' } } },
+            },
+          },
+        }),
+      };
+    };
+    const runtime = createFleetCliRuntime({ installation: makeInstallation(GITHUB_FORGE), forgeGhRunner });
+    const { io, out } = collectIo();
+    const code = await runCli(
+      [
+        'forge', 'threads', 'reply', '--repository', 'example-owner/example-repo', '--pull-request-number', '202',
+        '--thread-id', 'PRRT_1', '--body-file', bodyFile('hello'), '--yes',
+      ],
+      io,
+      runtime,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({
+      outcome: 'refused',
+      code: 'thread-not-on-pull-request',
+      mayHavePosted: false,
+    });
+    expect(recorded).toHaveLength(1);
+    expect(recorded.filter((entry) => entry.args.some((arg) => arg.includes('addPullRequestReviewThreadReply')))).toHaveLength(0);
+  });
+
   it('a missing port method is unavailable', async () => {
     const { io, out } = collectIo();
     const code = await runCli(
@@ -489,6 +552,7 @@ describe('forge threads', () => {
         'PRRT_1',
         '--body-file',
         file,
+        '--yes',
       ],
       io,
       runtime,
@@ -535,7 +599,7 @@ describe('forge threads', () => {
     const runtime = createFleetCliRuntime({ installation: makeInstallation(GITHUB_FORGE), forgeGhRunner });
     const { io, out } = collectIo();
     const code = await runCli(
-      ['forge', 'threads', 'resolve', '--repository', 'example-owner/example-repo', '--pull-request-number', '202', '--thread-id', 'PRRT_1'],
+      ['forge', 'threads', 'resolve', '--repository', 'example-owner/example-repo', '--pull-request-number', '202', '--thread-id', 'PRRT_1', '--yes'],
       io,
       runtime,
     );
@@ -581,6 +645,7 @@ describe('forge threads', () => {
         'PRRT_1',
         '--body-file',
         bodyFile('hello'),
+        '--yes',
       ],
       io,
       runtime,

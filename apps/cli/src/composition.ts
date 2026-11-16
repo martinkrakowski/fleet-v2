@@ -21,6 +21,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
+import { SSH_BINARY_CANDIDATES, resolveSshBinary } from './ssh-binary.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
 import { composeReadOnlyRelaunch } from './composition/relaunch.js';
@@ -488,7 +489,7 @@ function applyGhEnvironmentOverrides(args: readonly string[]): readonly string[]
   return args;
 }
 
-/** Whether `path` is an executable regular file (S4036: absolute gh only). */
+/** Whether `path` is an executable regular file (S4036: absolute gh and ssh only). */
 function isExecutableRegularFile(path: string): boolean {
   try {
     const stats = statSync(path);
@@ -591,21 +592,46 @@ export function readGitHead(worktreePath: string, sshHost?: string): Promise<str
   return readGitHeadLocally(worktreePath);
 }
 
-/** Read HEAD through the reviewed ssh alias (a worktree on another host). */
-export function readGitHeadOverSsh(worktreePath: string, sshHost: string): Promise<string> {
+/**
+ * Read HEAD through the reviewed ssh alias (a worktree on another host). The
+ * login shell parses only `sh -c` plus one single-quoted string; the remote
+ * argv is `['sh', '-c', <twice-quoted command line>], the twin of
+ * `posixQuote` and `sshArgvFor` in
+ * packages/work-execution/src/infrastructure/adapters/SshExecutor.adapter.ts.
+ * The remote programs must stay PATH executables, not login-shell functions
+ * or builtins specific to the login shell: the login shell starts first and
+ * `sh` inherits only its exported environment. fish and csh are not
+ * supported, before or after this change.
+ */
+export function readGitHeadOverSsh(
+  worktreePath: string,
+  sshHost: string,
+  sshCandidates: readonly string[] = SSH_BINARY_CANDIDATES,
+): Promise<string> {
   if (!isSafeSshHost(sshHost)) {
     return Promise.reject(new Error(`Refusing to read HEAD over SSH: unsafe host '${sshHost}'`));
   }
-  const invocation = {
-    command: 'ssh',
-    args: [
-      sshHost,
-      '--',
-      ['git', '-C', worktreePath, 'rev-parse', 'HEAD'].map(posixQuote).join(' '),
-    ],
-  };
+  if (worktreePath === '' || worktreePath.includes('\0')) {
+    return Promise.reject(new Error('Refusing to read HEAD over SSH: unusable worktree path'));
+  }
+  const sshBinary = resolveSshBinary(sshCandidates, isExecutableRegularFile);
+  if (sshBinary === undefined) {
+    return Promise.reject(new Error('Refusing to read HEAD over SSH: ssh not found in fixed locations'));
+  }
+  const words = ['git', '-C', worktreePath, 'rev-parse', 'HEAD'];
+  const args = [
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'ConnectTimeout=15',
+    sshHost,
+    '--',
+    'sh',
+    '-c',
+    posixQuote(words.map(posixQuote).join(' ')),
+  ];
   return new Promise((resolve, reject) => {
-    execFile(invocation.command, invocation.args, { encoding: 'utf8' }, (error, stdout) => {
+    execFile(sshBinary, args, { encoding: 'utf8', timeout: 60_000 }, (error, stdout) => {
       if (error === null) {
         resolve(String(stdout).trim());
         return;

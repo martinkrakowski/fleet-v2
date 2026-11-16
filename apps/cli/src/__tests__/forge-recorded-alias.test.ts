@@ -28,6 +28,12 @@ vi.mock('node:child_process', () => ({
   },
 }));
 
+// The resolver is stubbed so no assertion depends on where this host keeps ssh.
+vi.mock('../ssh-binary.js', () => ({
+  SSH_BINARY_CANDIDATES: ['/usr/bin/ssh'],
+  resolveSshBinary: (candidates: readonly string[]) => candidates[0],
+}));
+
 import type { FleetInstallation, ForgeSectionV2 } from '@fleet/installation';
 import type { AttemptRunnerRecord } from '@fleet/work-execution';
 
@@ -220,13 +226,19 @@ describe('forge head verification resolves the recorded host through the helper'
     expect(result.outcome).toBe('executed');
     expect(execFileMock.mock.calls).toEqual([
       [
-        'ssh',
+        '/usr/bin/ssh',
         [
+          '-o',
+          'BatchMode=yes',
+          '-o',
+          'ConnectTimeout=15',
           'lane.example',
           '--',
-          expect.stringContaining(
-            `'git' '-C' '${WORKTREE_PATH}' 'rev-parse' 'HEAD'`,
-          ),
+          'sh',
+          '-c',
+          "''\\''git'\\'' '\\''-C'\\'' '\\''" +
+            WORKTREE_PATH +
+            "'\\'' '\\''rev-parse'\\'' '\\''HEAD'\\'''",
         ],
         expect.any(Function),
       ],
@@ -277,7 +289,7 @@ describe('forge head verification resolves the recorded host through the helper'
       'HEAD',
     ]);
     expect(
-      execFileMock.mock.calls.some(([file]) => file === 'ssh'),
+      execFileMock.mock.calls.some(([file]) => file === '/usr/bin/ssh'),
     ).toBe(false);
   });
 
@@ -302,10 +314,12 @@ describe('forge head verification resolves the recorded host through the helper'
     const result = (await performAction(runtime)) as { outcome: string };
 
     expect(result.outcome).toBe('refused');
-    expect(execFileMock.mock.calls[0]![0]).toBe('ssh');
-    expect(execFileMock.mock.calls[0]![1]![0]).toBe('legacy.example');
+    expect(execFileMock.mock.calls[0]![0]).toBe('/usr/bin/ssh');
+    expect(execFileMock.mock.calls[0]![1]![4]).toBe('legacy.example');
     expect(
-      execFileMock.mock.calls.some(([, args]) => (args as readonly string[])?.[0] === 'recorded-only.example'),
+      execFileMock.mock.calls.some(
+        ([, args]) => (args as readonly string[] | undefined)?.includes('recorded-only.example') === true,
+      ),
     ).toBe(false);
   });
 
@@ -348,13 +362,19 @@ describe('forge head verification resolves the recorded host through the helper'
     // Only the head read ran — no git fetch/push; the push arguments are never built.
     expect(execFileMock.mock.calls).toEqual([
       [
-        'ssh',
+        '/usr/bin/ssh',
         [
+          '-o',
+          'BatchMode=yes',
+          '-o',
+          'ConnectTimeout=15',
           'lane.example',
           '--',
-          expect.stringContaining(
-            `'git' '-C' '${WORKTREE_PATH}' 'rev-parse' 'HEAD'`,
-          ),
+          'sh',
+          '-c',
+          "''\\''git'\\'' '\\''-C'\\'' '\\''" +
+            WORKTREE_PATH +
+            "'\\'' '\\''rev-parse'\\'' '\\''HEAD'\\'''",
         ],
         expect.any(Function),
       ],
@@ -432,13 +452,19 @@ describe('forge head verification resolves the recorded host through the helper'
     expect(result.headSha).toBe(EXPECTED_HEAD);
     expect(execFileMock.mock.calls).toEqual([
       [
-        'ssh',
+        '/usr/bin/ssh',
         [
+          '-o',
+          'BatchMode=yes',
+          '-o',
+          'ConnectTimeout=15',
           'lane.example',
           '--',
-          expect.stringContaining(
-            `'git' '-C' '${WORKTREE_PATH}' 'rev-parse' 'HEAD'`,
-          ),
+          'sh',
+          '-c',
+          "''\\''git'\\'' '\\''-C'\\'' '\\''" +
+            WORKTREE_PATH +
+            "'\\'' '\\''rev-parse'\\'' '\\''HEAD'\\'''",
         ],
         expect.any(Function),
       ],

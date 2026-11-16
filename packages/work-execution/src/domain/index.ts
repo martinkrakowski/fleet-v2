@@ -43,6 +43,7 @@ export * from "./merge-pass-transitions.js";
 export * from "./merge-queue-decider.js";
 export * from "./merge-queue-operations.js";
 export * from "./merge-queue-records.js";
+export * from "./orphan-reservations.js";
 export * from "./owner-entries.js";
 export * from "./owner-todo.js";
 export * from "./park-class.js";

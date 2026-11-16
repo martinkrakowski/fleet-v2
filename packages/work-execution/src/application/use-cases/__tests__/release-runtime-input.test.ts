@@ -152,25 +152,36 @@ const installRequest = {
 describe('release robustness bar (CO14 follow-up)', () => {
   it('release never throws on runtime input', async () => {
     const { useCase: uc } = useCase();
-    const hostile: unknown[] = [
-      null,
-      42,
-      'install',
-      [],
-      {},
-      { ...installRequest, root: null },
-      { ...installRequest, root: 7 },
-      { ...installRequest, root: '/a/../b' },
-      { ...installRequest, sha: ['a'.repeat(40)] },
-      { ...installRequest, keep: 'many' },
-      { ...installRequest, action: 'deploy' },
-      new Proxy({ ...installRequest }, {}),
-      Object.assign(Object.create({ get root() { throw new Error('getter'); } }), {}),
+    const trap = () => {
+      throw new Error('trap');
+    };
+    // Each hostile input with the exact typed refusal it must return; none may be planned.
+    const hostile: Array<[unknown, 'invalid-request' | 'failed']> = [
+      [null, 'invalid-request'],
+      [42, 'invalid-request'],
+      ['install', 'invalid-request'],
+      [[], 'invalid-request'],
+      [{}, 'invalid-request'],
+      [{ ...installRequest, root: null }, 'invalid-request'],
+      [{ ...installRequest, root: 7 }, 'invalid-request'],
+      [{ ...installRequest, root: '/a/../b' }, 'invalid-request'],
+      [{ ...installRequest, sha: ['a'.repeat(40)] }, 'invalid-request'],
+      [{ ...installRequest, keep: 'many' }, 'invalid-request'],
+      [{ ...installRequest, action: 'deploy' }, 'invalid-request'],
+      [
+        new Proxy({ ...installRequest }, { get: trap, getOwnPropertyDescriptor: trap, ownKeys: trap }),
+        'failed',
+      ],
+      [
+        Object.defineProperty({ ...installRequest }, 'root', { enumerable: true, get: trap }),
+        'invalid-request',
+      ],
+      [Object.assign(Object.create({ get root() { throw new Error('getter'); } }), {}), 'invalid-request'],
     ];
-    for (const request of hostile) {
+    for (const [request, reason] of hostile) {
       const result = await uc.manageRelease(request as never);
-      // A typed result, never an exception.
-      expect(['refused', 'planned']).toContain(result.outcome);
+      // Exactly the typed refusal: an accidentally accepted (planned) hostile request fails.
+      expect(result).toEqual({ outcome: 'refused', reason });
     }
   });
 

@@ -19,7 +19,7 @@ import type {
 } from '../../domain/coordination-records.js';
 import { AuthorizationConsumption } from '../../domain/entities/AuthorizationConsumption.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
-import { isReleaseActionScope, isReleaseRootCoordinate } from '../../domain/coordination-records.js';
+import { isReleaseActionScope, readReleaseRoot, releaseRootsAgree } from '../../domain/coordination-records.js';
 import type {
   RecordAuthorizationConsumptionPort,
   RecordAuthorizationConsumptionRequest,
@@ -39,26 +39,6 @@ const REQUIRED_TEXT_FIELDS = [
   'attemptId',
   'expectedHeadSha',
 ] as const;
-
-/**
- * The own `releaseRoot` of a runtime request, read through its own property
- * descriptor so a hostile accessor, a throwing Proxy trap or an inherited value
- * never runs code. `hostile` is a typed answer, never an exception.
- */
-function readOwnReleaseRoot(request: object): { readonly hostile: boolean; readonly value: unknown } {
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(request, 'releaseRoot');
-    if (descriptor === undefined) {
-      return { hostile: false, value: undefined };
-    }
-    if (!('value' in descriptor)) {
-      return { hostile: true, value: undefined };
-    }
-    return { hostile: false, value: descriptor.value };
-  } catch {
-    return { hostile: true, value: undefined };
-  }
-}
 
 function refused(reason: string): RecordAuthorizationConsumptionResult {
   return { outcome: 'refused', reason };
@@ -141,10 +121,9 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     // CO14 follow-up: a grant bound to one release root is never consumed for
     // another. An invalid coordinate on either side fails closed as a
     // mismatch, never as a match.
-    const recordedRoot = isReleaseRootCoordinate(recorded.releaseRoot) ? recorded.releaseRoot : undefined;
-    const suppliedRoot = readOwnReleaseRoot(request);
-    const requestedRoot = isReleaseRootCoordinate(suppliedRoot.value) ? suppliedRoot.value : undefined;
-    if (suppliedRoot.hostile || recordedRoot !== requestedRoot) {
+    const recordedRoot = readReleaseRoot(recorded);
+    const requestedRoot = readReleaseRoot(request);
+    if (!releaseRootsAgree(recordedRoot, requestedRoot)) {
       return refused('release-grant-root-mismatch');
     }
     // Idempotent replay of the same action: the durable receipt is returned

@@ -196,6 +196,102 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
     expect((await repo.findRequestByGrantId('grant-hostile-1'))?.consumptions).toEqual([]);
   });
 
+  it('refuses both resolve and consume when the STORED releaseRoot is malformed, with the request root omitted or present', async () => {
+    const head = '5555555555555555555555555555555555555555';
+    const storedAccessor = {} as Record<string, unknown>;
+    Object.defineProperty(storedAccessor, 'releaseRoot', { enumerable: true, get: () => '/srv/fleet/releases' });
+    const corruptions: Array<[string, Record<string, unknown>]> = [
+      ['wrong primitive', { releaseRoot: 7 }],
+      ['object', { releaseRoot: { path: '/srv/fleet/releases' } }],
+      ['empty string', { releaseRoot: '' }],
+      ['null', { releaseRoot: null }],
+      ['accessor', storedAccessor],
+    ];
+    for (const [label, corruption] of corruptions) {
+      for (const requested of [undefined, '/srv/fleet/releases']) {
+        const repo = new InMemoryCoordinationRequestRepo();
+        const grantId = `grant-corrupt-${label.replace(' ', '-')}`;
+        const base = {
+          id: `req-${grantId}`,
+          projectId: 'proj-1',
+          kind: 'action-decision',
+          state: 'approved',
+          actionScope: 'release:install',
+          expectedHeadSha: head,
+          proposalDigest: 'digest-c',
+          policyRevision: 'pol-1',
+          decisionRevision: 'dec-1',
+          grantId,
+          consumptions: [],
+          acknowledgements: [],
+          deliveryStatus: 'delivered',
+          deliveryGapReason: null,
+          revision: 1,
+          createdAtIso: '2026-11-10T10:00:00.000Z',
+          updatedAtIso: '2026-11-10T10:00:00.000Z',
+        };
+        const stored = Object.defineProperties(
+          { ...base },
+          Object.getOwnPropertyDescriptors(corruption),
+        ) as unknown as CoordinationRequestRecord;
+        await repo.saveRequest(stored);
+        const root = requested === undefined ? {} : { releaseRoot: requested };
+        const resolved = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).resolveActionAuthorization({
+          projectId: 'proj-1',
+          actionScope: 'release:install',
+          expectedHeadSha: head,
+          ...root,
+        });
+        expect(resolved, `resolve ${label} ${String(requested)}`).toEqual({
+          outcome: 'blocked',
+          reason: 'release-grant-root-mismatch',
+        });
+        const consumed = await new RecordAuthorizationConsumptionUseCase({
+          requestRepo: repo,
+        }).recordAuthorizationConsumption({
+          consumptionId: 'cons-1',
+          grantId,
+          actionId: 'action-1',
+          actionScope: 'release:install',
+          attemptId: 'action-1',
+          expectedHeadSha: head,
+          ...root,
+        });
+        expect(consumed, `consume ${label} ${String(requested)}`).toEqual({
+          outcome: 'refused',
+          reason: 'release-grant-root-mismatch',
+        });
+        expect((await repo.findRequestByGrantId(grantId))?.consumptions).toEqual([]);
+      }
+    }
+  });
+
+  it('rejects, never throws, a decision request with a throwing own releaseRoot getter', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const useCase = new RequestScopedDecisionUseCase({ requestRepo: repo });
+    const request = Object.defineProperty(
+      {
+        requestId: 'req-getter-1',
+        projectId: 'proj-1',
+        kind: 'action-decision',
+        actionScope: 'release:install',
+        expectedHeadSha: '3333333333333333333333333333333333333333',
+        proposalDigest: 'digest-g',
+        policyRevision: 'pol-1',
+      },
+      'releaseRoot',
+      {
+        enumerable: true,
+        get() {
+          throw new Error('hostile getter ran');
+        },
+      },
+    );
+    const result = await useCase.requestScopedDecision(request as never);
+    expect(result.outcome).toBe('rejected');
+    expect(await repo.listRequests('proj-1')).toEqual([]);
+  });
+
   it('refuses a decision request whose releaseRoot is not a bounded absolute path', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
     const useCase = new RequestScopedDecisionUseCase({ requestRepo: repo });

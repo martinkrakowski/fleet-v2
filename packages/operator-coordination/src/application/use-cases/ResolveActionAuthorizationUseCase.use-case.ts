@@ -14,7 +14,7 @@
  */
 
 import { isPolicyGrantRecord } from '../../domain/policy-grants.js';
-import { GRANT_RECORD_VERSION, isReleaseActionScope, isReleaseRootCoordinate } from '../../domain/coordination-records.js';
+import { GRANT_RECORD_VERSION, isReleaseActionScope, readReleaseRoot, releaseRootsAgree } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type {
@@ -36,26 +36,6 @@ export interface ResolveActionAuthorizationDependencies {
 
 function isFilled(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
-}
-
-/**
- * The own `releaseRoot` of a runtime request, read through its own property
- * descriptor so a hostile accessor, a throwing Proxy trap or an inherited value
- * never runs code. `hostile` is a typed answer, never an exception.
- */
-function readOwnReleaseRoot(request: object): { readonly hostile: boolean; readonly value: unknown } {
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(request, 'releaseRoot');
-    if (descriptor === undefined) {
-      return { hostile: false, value: undefined };
-    }
-    if (!('value' in descriptor)) {
-      return { hostile: true, value: undefined };
-    }
-    return { hostile: false, value: descriptor.value };
-  } catch {
-    return { hostile: true, value: undefined };
-  }
 }
 
 function blocked(reason: string): ResolveActionAuthorizationResult {
@@ -159,10 +139,9 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // CO14 follow-up: a release grant bound to one root authorizes only an
     // operation on that root. An invalid coordinate on either side fails
     // closed as a mismatch, never as a match.
-    const recordedRoot = isReleaseRootCoordinate(refreshed.releaseRoot) ? refreshed.releaseRoot : undefined;
-    const suppliedRoot = readOwnReleaseRoot(request);
-    const requestedRoot = isReleaseRootCoordinate(suppliedRoot.value) ? suppliedRoot.value : undefined;
-    if (suppliedRoot.hostile || recordedRoot !== requestedRoot) {
+    const recordedRoot = readReleaseRoot(refreshed);
+    const requestedRoot = readReleaseRoot(request);
+    if (!releaseRootsAgree(recordedRoot, requestedRoot)) {
       return blocked('release-grant-root-mismatch');
     }
     const mergeGrant = candidate.getMergeGrant();
@@ -194,7 +173,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       requestId: candidate.getId(),
       expectedHeadSha: request.expectedHeadSha.trim(),
       policyRevision: candidate.getPolicyRevision(),
-      ...(recordedRoot !== undefined ? { releaseRoot: recordedRoot } : {}),
+      ...(recordedRoot.state === 'valid' ? { releaseRoot: recordedRoot.value } : {}),
     };
   }
 

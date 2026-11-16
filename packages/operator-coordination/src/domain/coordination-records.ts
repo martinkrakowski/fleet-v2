@@ -201,6 +201,47 @@ export function isReleaseRootCoordinate(value: unknown): value is string {
   return !value.split('/').includes('..');
 }
 
+/** A release root read from runtime data: absent, a valid coordinate, or invalid (never conflated). */
+export type ReleaseRootRead =
+  | { readonly state: 'absent' }
+  | { readonly state: 'valid'; readonly value: string }
+  | { readonly state: 'invalid' };
+
+/**
+ * Reads `releaseRoot` from a record through its own property descriptor, so an
+ * accessor, a throwing Proxy trap or an inherited value never runs code. A
+ * missing or `undefined` field is absent; a valid coordinate is valid; anything
+ * else (wrong type, empty, oversized, accessor, hostile) is invalid and must
+ * fail closed, never be treated as absent.
+ */
+export function readReleaseRoot(record: object): ReleaseRootRead {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(record, 'releaseRoot');
+    if (descriptor === undefined) {
+      return { state: 'absent' };
+    }
+    if (!('value' in descriptor)) {
+      return { state: 'invalid' };
+    }
+    if (descriptor.value === undefined) {
+      return { state: 'absent' };
+    }
+    return isReleaseRootCoordinate(descriptor.value)
+      ? { state: 'valid', value: descriptor.value }
+      : { state: 'invalid' };
+  } catch {
+    return { state: 'invalid' };
+  }
+}
+
+/** True when the two reads may authorize one another: both absent, or both valid and equal. */
+export function releaseRootsAgree(a: ReleaseRootRead, b: ReleaseRootRead): boolean {
+  if (a.state === 'invalid' || b.state === 'invalid') {
+    return false;
+  }
+  return a.state === 'absent' ? b.state === 'absent' : b.state === 'valid' && a.value === b.value;
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;

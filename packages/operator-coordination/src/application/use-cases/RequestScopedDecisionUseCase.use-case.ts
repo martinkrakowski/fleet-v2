@@ -17,7 +17,7 @@ import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
 import { CoordinationKind } from '../../domain/value-objects/CoordinationKind.vo.js';
-import { isReleaseRootCoordinate } from '../../domain/coordination-records.js';
+import { readReleaseRoot } from '../../domain/coordination-records.js';
 import type {
   RequestScopedDecisionPort,
   RequestScopedDecisionRequest,
@@ -102,7 +102,8 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     // CO14 follow-up: a release decision may bind its grant to the release
     // root it names. A non-path-shaped, oversized or hostile root is a typed
     // rejection, never a record that matches every root.
-    if (request.releaseRoot !== undefined && !isReleaseRootCoordinate(request.releaseRoot)) {
+    const releaseRoot = readReleaseRoot(request);
+    if (releaseRoot.state === 'invalid') {
       return {
         outcome: 'rejected',
         reason: 'a decision request releaseRoot must be a bounded absolute path without ".." when given',
@@ -159,7 +160,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       ...(request.attemptId !== undefined
         ? { grantRecordVersion: GRANT_RECORD_VERSION, grantAttemptId: request.attemptId.trim() }
         : {}),
-      ...(request.releaseRoot !== undefined ? { releaseRoot: request.releaseRoot } : {}),
+      ...(releaseRoot.state === 'valid' ? { releaseRoot: releaseRoot.value } : {}),
     }).toRecord();
     // The proposal is durable before any decider is asked. A duplicate that
     // raced past the lookup above is refused by the store's revision check and

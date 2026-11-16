@@ -150,6 +150,21 @@ describe('ActionAuthorizationAdapter attempt coordinate', () => {
     expect(grants.get('grant-1')?.consumedByActionId).toBeNull();
   });
 
+  it('refuses a consume that supplies a root against an unbound grant, and still consumes an unbound grant with no root', async () => {
+    // A root the grant never recorded cannot be verified here (the resolve is
+    // what binds a root to a legacy grant), so a supplied root is a mismatch.
+    const unbound = grantsOf(grantEntry({ kind: 'release-swap' }) as ActionAuthorizationGrantEntry);
+    const adapter = new ActionAuthorizationAdapter({ grants: unbound });
+    expect(
+      await adapter.consumeActionAuthorization(consumeRequest({ actionKind: 'release-swap', releaseRoot: ROOT_A })),
+    ).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+    expect(unbound.get('grant-1')?.consumedByActionId).toBeNull();
+    expect(
+      await adapter.consumeActionAuthorization(consumeRequest({ actionKind: 'release-swap' })),
+    ).toEqual({ outcome: 'consumed', actionId: 'action-1' });
+    expect(unbound.get('grant-1')?.consumedByActionId).toBe('action-1');
+  });
+
   it('binds a root-less legacy release grant to the first rooted resolve and keeps it there', async () => {
     const grants = grantsOf(grantEntry({ kind: 'release-swap', attemptId: undefined }) as ActionAuthorizationGrantEntry);
     const adapter = new ActionAuthorizationAdapter({ grants });

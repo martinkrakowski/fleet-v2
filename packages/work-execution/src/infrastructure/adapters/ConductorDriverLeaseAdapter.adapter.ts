@@ -43,14 +43,16 @@ import {
   decideLeaseRenew,
   readConductorDriverLease,
 } from '../../domain/lane-run-lease.js';
-import type {
-  ConductorDriverLeasePort,
-  ConductorDriverLeaseResult,
+import {
+  ConductorDriverLeaseUnreadableError,
+  type ConductorDriverLeasePort,
+  type ConductorDriverLeaseResult,
 } from '../../application/ports/out/ConductorDriverLeasePort.out-port.js';
 import {
   assertStoreWritable,
   inspectRecordListBytes,
   rejectUnreadableStateFile,
+  StateFileUnreadableReadOnlyError,
   withFileLock,
   writeJsonAtomically,
 } from './file-store.js';
@@ -61,7 +63,7 @@ export interface ConductorDriverLeaseAdapterOptions {
   readonly fileName?: string;
   /**
    * CO29a-ro2: read-only mode. The read never quarantines and never writes;
-   * an unreadable lease file is a typed `StateFileUnreadableReadOnlyError`,
+   * an unreadable lease file is the port's typed `ConductorDriverLeaseUnreadableError`,
    * never an absent lease — only a missing file is absent. Every write is
    * refused.
    */
@@ -136,11 +138,19 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
       const current = this.inMemoryLease;
       return current === null ? null : { ...current };
     }
-    const current = currentLeaseOf(await this.readRecordsFromDisk(target));
-    // CO29a-ro2: unreadable bytes propagate as the typed unreadable error,
-    // never an absent lease — a read-only command must not mistake a corrupt
-    // file for "no lease", and a writable read has already quarantined and
-    // thrown.
+    let records: readonly ConductorDriverLeaseRecord[];
+    try {
+      records = await this.readRecordsFromDisk(target);
+    } catch (error: unknown) {
+      // CO29a-ro2: a read-only read of unreadable bytes surfaces the port's
+      // typed unreadable error, never an absent lease. A writable read keeps
+      // its own error (it has already quarantined and thrown).
+      if (error instanceof StateFileUnreadableReadOnlyError) {
+        throw new ConductorDriverLeaseUnreadableError({ cause: error });
+      }
+      throw error;
+    }
+    const current = currentLeaseOf(records);
     return current === null ? null : { ...current };
   }
 

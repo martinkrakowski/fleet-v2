@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ReadOnlyStateStoreError, StateFileUnreadableError, StateFileUnreadableReadOnlyError } from './file-store.js';
+import { ConductorDriverLeaseUnreadableError } from '../../application/ports/out/ConductorDriverLeasePort.out-port.js';
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -204,7 +205,9 @@ describe('ConductorDriverLeaseAdapter read-only mode', () => {
     // CO29a-ro2: a read-only read never turns unreadable bytes into an absent
     // lease; the typed error answers and the exact bytes stay untouched.
     const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
-    await expect(readonlyAdapter.read()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+    const unreadable = await readonlyAdapter.read().catch((error: unknown) => error);
+    expect(unreadable).toBeInstanceOf(ConductorDriverLeaseUnreadableError);
+    expect((unreadable as Error).cause).toBeInstanceOf(StateFileUnreadableReadOnlyError);
     expect(await fs.readFile(file, 'utf8')).toBe(garbage);
     await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
       code: 'ENOENT',

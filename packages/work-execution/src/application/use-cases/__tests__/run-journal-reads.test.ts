@@ -25,7 +25,8 @@ import {
 } from '../../../domain/lane-run-keys.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LANE_RUN_STOP_KEY_MODES } from '../../../domain/lane-run-keys.js';
-import { StateFileUnknownVersionError, StateFileUnreadableReadOnlyError } from '../../../infrastructure/adapters/file-store.js';
+import { ConductorDriverLeaseUnreadableError } from '../../ports/out/ConductorDriverLeasePort.out-port.js';
+import { StateFileUnknownVersionError } from '../../../infrastructure/adapters/file-store.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
 import { ConductorDriverLeaseAdapter } from '../../../infrastructure/adapters/ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from '../../../infrastructure/adapters/ConductorHaltAdapter.adapter.js';
@@ -585,11 +586,11 @@ describe('LaneRunBoardReads.readRun', () => {
 });
 
 describe('LaneRunBoardReads with an unreadable driver lease', () => {
-  it('projects a lease port that throws StateFileUnreadableReadOnlyError as unknown: driverLeaseLapsed null, nothing rejects', async () => {
+  it('projects a lease port that throws ConductorDriverLeaseUnreadableError as unknown: driverLeaseLapsed null, nothing rejects', async () => {
     const h = makeHarness({
       driverLease: {
         read: async () => {
-          throw new StateFileUnreadableReadOnlyError('conductor-driver-lease.json', 'invalid JSON');
+          throw new ConductorDriverLeaseUnreadableError();
         },
       },
     });

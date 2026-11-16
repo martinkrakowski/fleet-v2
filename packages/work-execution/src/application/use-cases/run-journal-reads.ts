@@ -54,7 +54,10 @@ import { readPlainRecordWithOptionalKeys } from '../../domain/plain-record-reads
 import { SECRET_PATTERNS, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
-import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
+import {
+  ConductorDriverLeaseUnreadableError,
+  type ConductorDriverLeasePort,
+} from '../ports/out/ConductorDriverLeasePort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
@@ -780,21 +783,7 @@ function parseJournalByKeyRequest(request: unknown): JournalByKeyRequestParsed {
 type DriverLeaseReadOutcome = Awaited<ReturnType<ConductorDriverLeasePort['read']>> | 'unreadable';
 
 /**
- * True only for the typed unreadable state-file errors the read-only lease
- * adapter throws for a malformed lease file. They are recognised by name:
- * application code may not import infrastructure classes (the hexagen layer
- * rules) and the port exports no error type, so the names are the contract
- * the adapter's own error classes carry in `error.name`.
- */
-function isStateFileUnreadableError(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    (error.name === 'StateFileUnreadableError' || error.name === 'StateFileUnreadableReadOnlyError')
-  );
-}
-
-/**
- * One driver-lease read that maps ONLY the typed unreadable errors to
+ * One driver-lease read that maps ONLY the port's typed unreadable error to
  * 'unreadable'; every other error still rejects as the port throws it
  * (CO29a-ro2: a read-only lease read never answers an absent lease).
  */
@@ -802,7 +791,7 @@ async function readDriverLease(port: Pick<ConductorDriverLeasePort, 'read'>): Pr
   try {
     return await port.read();
   } catch (error: unknown) {
-    if (isStateFileUnreadableError(error)) {
+    if (error instanceof ConductorDriverLeaseUnreadableError) {
       return 'unreadable';
     }
     throw error;

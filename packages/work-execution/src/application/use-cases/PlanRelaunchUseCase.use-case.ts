@@ -569,6 +569,57 @@ interface InventoryRead {
   readonly unknown: readonly PlanRelaunchUnknownReason[];
 }
 
+type InventoryConductor = InventoryRead['conductor'];
+type InventoryDriverLease = 'absent' | 'lapsed' | 'live' | 'unknown';
+
+/** The conductor block of the inventory, validated; null when it is not shaped as promised. */
+function readConductorBlock(
+  conductor: unknown,
+): { readonly halted: boolean; readonly driverLease: InventoryDriverLease; readonly runCount: number } | null {
+  const halted = own(conductor, 'halted');
+  const driverLease = own(conductor, 'driverLease');
+  const runCount = own(conductor, 'runCount');
+  if (typeof halted !== 'boolean' || !inRange(runCount, 0, Number.MAX_SAFE_INTEGER)) return null;
+  if (driverLease !== 'absent' && driverLease !== 'lapsed' && driverLease !== 'live' && driverLease !== 'unknown') {
+    return null;
+  }
+  return { halted, driverLease, runCount: runCount as number };
+}
+
+/** Records every flag; false when a flag is malformed. Counted unknown-flag codes join `unknown`. */
+function noteRiskFlags(flags: readonly unknown[], unknown: Set<PlanRelaunchUnknownReason>): boolean {
+  for (const flag of flags) {
+    const code = own(flag, 'code');
+    const count = own(flag, 'count');
+    if (typeof code !== 'string' || !inRange(count, 0, Number.MAX_SAFE_INTEGER)) return false;
+    if (count > 0 && (UNKNOWN_FLAG_CODES as readonly string[]).includes(code)) {
+      unknown.add(code as PlanRelaunchUnknownReason);
+    }
+  }
+  return true;
+}
+
+/** Validates every host's flags and lanes, appending rows and unknown codes; false when malformed. */
+function accumulateHostRows(
+  hosts: readonly unknown[],
+  unknown: Set<PlanRelaunchUnknownReason>,
+  rows: RelaunchLaneRow[],
+): boolean {
+  for (const host of hosts) {
+    const hostFlags = dense(own(host, 'riskFlags'), 64);
+    const hostLanes = dense(own(host, 'lanes'), Number.MAX_SAFE_INTEGER);
+    if (hostFlags === null || hostLanes === null || !noteRiskFlags(hostFlags, unknown)) return false;
+    for (const lane of hostLanes) {
+      const row = readLaneRow(lane);
+      if (row === null) return false;
+      if (row.runnerState === 'unknown') unknown.add('unknown-runner-state');
+      if (row.ownership === 'unknown') unknown.add('unproven-lane-records');
+      rows.push(row);
+    }
+  }
+  return true;
+}
+
 /** Reads the inventoried result into plain values; null when it is not shaped as the inventory port promises. */
 function readInventory(inventoried: unknown): InventoryRead | null {
   try {
@@ -576,50 +627,19 @@ function readInventory(inventoried: unknown): InventoryRead | null {
     const hosts = dense(own(inventoried, 'hosts'), Number.MAX_SAFE_INTEGER);
     const topFlags = dense(own(inventoried, 'riskFlags'), 64);
     if (conductor === BAD || conductor === ABSENT || hosts === null || topFlags === null) return null;
-    const halted = own(conductor, 'halted');
-    const driverLease = own(conductor, 'driverLease');
-    const runCount = own(conductor, 'runCount');
-    if (typeof halted !== 'boolean' || !inRange(runCount, 0, Number.MAX_SAFE_INTEGER)) return null;
-    if (driverLease !== 'absent' && driverLease !== 'lapsed' && driverLease !== 'live' && driverLease !== 'unknown') {
-      return null;
-    }
+    const block = readConductorBlock(conductor);
+    if (block === null) return null;
     const unknown = new Set<PlanRelaunchUnknownReason>();
-    if (driverLease === 'unknown') unknown.add('driver-lease-unknown');
-    const noteFlags = (flags: readonly unknown[]): boolean => {
-      for (const flag of flags) {
-        const code = own(flag, 'code');
-        const count = own(flag, 'count');
-        if (typeof code !== 'string' || !inRange(count, 0, Number.MAX_SAFE_INTEGER)) return false;
-        if (count > 0 && (UNKNOWN_FLAG_CODES as readonly string[]).includes(code)) {
-          unknown.add(code as PlanRelaunchUnknownReason);
-        }
-      }
-      return true;
-    };
-    if (!noteFlags(topFlags)) return null;
+    if (block.driverLease === 'unknown') unknown.add('driver-lease-unknown');
+    if (!noteRiskFlags(topFlags, unknown)) return null;
     const rows: RelaunchLaneRow[] = [];
-    for (const host of hosts) {
-      const hostFlags = dense(own(host, 'riskFlags'), 64);
-      const hostLanes = dense(own(host, 'lanes'), Number.MAX_SAFE_INTEGER);
-      if (hostFlags === null || hostLanes === null || !noteFlags(hostFlags)) return null;
-      for (const lane of hostLanes) {
-        const row = readLaneRow(lane);
-        if (row === null) return null;
-        if (row.runnerState === 'unknown') unknown.add('unknown-runner-state');
-        if (row.ownership === 'unknown') unknown.add('unproven-lane-records');
-        rows.push(row);
-      }
-    }
-    return {
-      conductor: {
-        halted,
-        driverLease: driverLease === 'unknown' ? 'absent' : driverLease,
-        runCount: runCount as number,
-      },
-      hosts,
-      rows,
-      unknown: [...unknown].sort(byCodeUnit),
+    if (!accumulateHostRows(hosts, unknown, rows)) return null;
+    const planConductor: InventoryConductor = {
+      halted: block.halted,
+      driverLease: block.driverLease === 'unknown' ? 'absent' : block.driverLease,
+      runCount: block.runCount,
     };
+    return { conductor: planConductor, hosts, rows, unknown: [...unknown].sort(byCodeUnit) };
   } catch {
     return null;
   }

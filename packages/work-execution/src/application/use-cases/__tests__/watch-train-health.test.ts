@@ -342,6 +342,29 @@ describe('WatchTrainHealthUseCase', () => {
     }
   });
 
+  it('returns state-unavailable, never state-read-timed-out, when the port rejects with an error that merely looks like the timeout', async () => {
+    const { deps, log, raiseCalls } = makeDeps();
+    const lookalikeDeps = {
+      ...deps,
+      state: {
+        ...deps.state,
+        readTrainHealthState: async (request) => {
+          log.push({ kind: 'port', method: 'readTrainHealthState', arg: request });
+          throw new Error('state-read-timeout');
+        },
+      },
+    } as WatchTrainHealthDependencies;
+    const result = await run(lookalikeDeps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'blind',
+      reasonCode: 'state-unavailable',
+      raised: 1,
+      attentionFailures: 0,
+    });
+    expect(blindRaise(raiseCalls[0])).toBe(true);
+    expect(portCalls(log).filter((call) => call.method === 'readTrainHealthState')).toHaveLength(1);
+  });
+
   it('skips the state read entirely when its own budget is already exhausted', async () => {
     const { deps, log, raiseCalls } = makeDeps({ nowSchedule: [NOW, DEADLINE] });
     const result = await run(deps, baseRequest());

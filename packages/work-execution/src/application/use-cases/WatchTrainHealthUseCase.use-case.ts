@@ -270,6 +270,14 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
       return { outcome: 'blind', reasonCode: 'state-budget-exhausted' };
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // Fresh per call, never a module-level constant: this is what Promise.race
+    // rejects with when the timer fires, and nothing else can produce this
+    // exact value, so checking identity against it (never a message or shape)
+    // can never mistake a real port rejection for a timeout. A module-level
+    // Symbol would also be collision-safe (Symbols are unique even when
+    // declared once), but scoping it to the call keeps two concurrent reads
+    // from ever being able to share one, which is the stronger guarantee.
+    const timeoutSentinel = Symbol('state-read-timeout');
     try {
       const pending = this.deps.state.readTrainHealthState({
         repository: validated.repository,
@@ -281,7 +289,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
         // The race consumes the rejection; this keeps a late failure unhandled.
       });
       const bounded = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error('state-read-timeout')), readBudget.timeoutMs);
+        timer = setTimeout(() => reject(timeoutSentinel), readBudget.timeoutMs);
       });
       const read: unknown = await Promise.race([pending, bounded]);
       const outcome = isPlainObject(read) ? ownValue(read, 'outcome') : undefined;
@@ -293,7 +301,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
       }
       return { outcome: 'blind', reasonCode: 'state-unavailable' };
     } catch (error) {
-      if (error instanceof Error && error.message === 'state-read-timeout') {
+      if (error === timeoutSentinel) {
         return { outcome: 'blind', reasonCode: 'state-read-timed-out' };
       }
       return { outcome: 'blind', reasonCode: 'state-unavailable' };

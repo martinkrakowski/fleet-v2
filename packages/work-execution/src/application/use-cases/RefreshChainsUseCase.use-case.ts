@@ -33,7 +33,7 @@ import type {
 } from '../ports/in/RefreshChainsPort.in-port.js';
 import type { ChainAttentionPort } from '../ports/out/ChainAttentionPort.out-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
-import { isChainPassHalted } from './chain-pass-halt.js';
+import { isRequiredPassHalted } from './chain-pass-halt.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeBranchHeadResult, MergeForgeActionPort, MergeForgeActionResult } from '../ports/out/MergeForgeActionPort.out-port.js';
 
@@ -116,13 +116,12 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       readonly forge: MergeForgeActionPort;
       readonly attention: ChainAttentionPort;
       /**
-       * The conductor halt read (plan §3.7). Optional: absent means not halted
-       * and behaves exactly as before. When present it fails closed: an
-       * unreadable read, a throw and any answer that is not an object whose
-       * `state: 'clear'` agrees with its record refuse the pass before any
-       * forge call or intent write. Read once per pass.
+       * The conductor halt read (plan §3.7). Required and fail-closed: a
+       * missing, null, unreadable, off-contract or throwing halt is halted.
+       * Read at the pass start and again before each started chain in live
+       * mode; never inside one chain.
        */
-      readonly halt?: Pick<ConductorHaltPort, 'read'>;
+      readonly halt: Pick<ConductorHaltPort, 'read'>;
       readonly now?: () => string;
       /** `live` writes and is accepted only when passed explicitly; an omitted or unknown mode is `shadow` (observe only: no intent, no forge write, no attention). */
       readonly mode?: 'shadow' | 'live';
@@ -162,9 +161,10 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     if (listed.status === 'unreadable') {
       return { outcome: 'skipped', reasonCode: 'chains-unreadable', chains: [] };
     }
-    if (await isChainPassHalted(this.deps.halt)) {
-      // Read once per pass, never again inside the per-chain loop: refused
-      // before any forge call and before any intent or outcome write.
+    if (await isRequiredPassHalted(this.deps.halt)) {
+      // The halt is read here at the pass start and again before each started
+      // chain: refused before any forge call and before any intent or outcome
+      // write.
       return { outcome: 'refused', reasonCode: 'halted', chains: [] };
     }
     const head = await this.readMainHead(command);
@@ -177,9 +177,17 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     if (this.deps.mode !== 'live') {
       return this.observe(listed.records, head.headSha);
     }
+    return this.refreshStarted(command, listed.records, head.headSha);
+  }
+
+  private async refreshStarted(
+    command: ValidCommand,
+    records: readonly ChainRecord[],
+    mainSha: string,
+  ): Promise<RefreshChainsResult> {
     const chains: RefreshChainsChainReport[] = [];
     let budgetHit = false;
-    for (const record of listed.records) {
+    for (const record of records) {
       if (record.state !== 'started') {
         continue;
       }
@@ -187,7 +195,10 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
         budgetHit = true;
         break;
       }
-      const decision = await this.refreshOne(command, record, head.headSha, chains);
+      if (await isRequiredPassHalted(this.deps.halt)) {
+        return { outcome: 'refused', reasonCode: 'halted', chains };
+      }
+      const decision = await this.refreshOne(command, record, mainSha, chains);
       if (decision === 'budget-exhausted') {
         budgetHit = true;
         break;

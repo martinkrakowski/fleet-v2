@@ -28,6 +28,8 @@ const DEADLINE = '2026-11-05T10:00:45.000Z';
 const LATE = '2026-11-05T10:00:44.000Z';
 const KEY = `chain-refresh/example@${MAIN.slice(0, 12)}`;
 
+const clearHalt = { read: async () => ({ state: 'clear' as const, record: null }) };
+
 function command(overrides: Record<string, unknown> = {}) {
   return { repository: REPO, projectId: PROJECT, nowIso: NOW, deadlineIso: DEADLINE, ...overrides } as never;
 }
@@ -201,6 +203,7 @@ function harness(script: {
     chains,
     forge,
     attention,
+    halt: clearHalt,
     now: script.nowFn ?? (() => NOW),
     mode: script.mode ?? 'live',
   });
@@ -299,7 +302,7 @@ describe('RefreshChainsUseCase', () => {
       const chains = new FakeChains([startedRecord()], trace);
       const forge = new FakeForge(trace);
       const attention = new FakeAttention();
-      const useCase = new RefreshChainsUseCase({ chains, forge, attention, now: () => NOW, ...extra });
+      const useCase = new RefreshChainsUseCase({ chains, forge, attention, halt: clearHalt, now: () => NOW, ...extra });
       const result = await useCase.runRefreshChains(command());
       expect(result.reasonCode).toBe('shadow-would-refresh-1');
       expect(trace).toEqual(['list', 'head']);

@@ -187,8 +187,13 @@ export function assessmentIdForChain(projectId: string, chainName: string): stri
   return assessmentIdForAttempt(attemptIdForChain(projectId, chainName));
 }
 
-/** The package digest of a frozen brief: exactly 64 lowercase hex characters. */
-export const BRIEF_PACKAGE_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+/**
+ * The package digest of a frozen brief: exactly 64 lowercase hex characters.
+ * The `(?!\n)` guard makes the exact-length requirement hold even if the
+ * `m` flag were ever added (with `m`, a bare `$` accepts a final line
+ * terminator; JavaScript's `$` without `m` does not).
+ */
+export const BRIEF_PACKAGE_DIGEST_PATTERN = /^[0-9a-f]{64}(?!\n)$/;
 
 /** A brief package digest is a string of exactly 64 lowercase hex characters. */
 export function isValidBriefPackageDigest(value: unknown): value is string {

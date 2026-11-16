@@ -390,6 +390,9 @@ export function isAttemptReceiptSubject(receipt: unknown): boolean {
       return false;
     }
     const record = receipt as Record<string, unknown>;
+    if (Object.getOwnPropertyDescriptor(record, '__proto__') !== undefined) {
+      return false;
+    }
     const attemptDescriptor = Object.getOwnPropertyDescriptor(record, 'attemptId');
     if (attemptDescriptor !== undefined && !('value' in attemptDescriptor)) {
       return false;

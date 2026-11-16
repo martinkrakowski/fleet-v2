@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ReceiptSubject, ReviewReceiptRecord } from '../evidence-records.js';
-import { REVIEW_KINDS, assessmentIdForBrief, attemptIdForBrief } from '../evidence-records.js';
+import { REVIEW_KINDS, assessmentIdForBrief, attemptIdForBrief, isValidBriefPackageDigest } from '../evidence-records.js';
 import { ReviewReceipt } from '../entities/ReviewReceipt.js';
 import {
   decideReviewReceiptOutcome,
@@ -564,8 +564,8 @@ describe('isAttemptReceiptSubject', () => {
     expect(isAttemptReceiptSubject(hostile)).toBe(false);
   });
 
-  it('ignores prototype-polluting keys: a JSON-parsed __proto__ with no own subject is a legacy attempt receipt, and one with a non-attempt subject is not', () => {
-    expect(isAttemptReceiptSubject(JSON.parse('{"attemptId":"att-1","__proto__":{"kind":"chain"}}'))).toBe(true);
+  it('ignores prototype-polluting keys: a JSON-parsed __proto__ with no own subject is not an attempt receipt, and one with a non-attempt subject is not either', () => {
+    expect(isAttemptReceiptSubject(JSON.parse('{"attemptId":"att-1","__proto__":{"kind":"chain"}}'))).toBe(false);
     expect(
       isAttemptReceiptSubject(JSON.parse('{"attemptId":"att-1","__proto__":{"kind":"chain"},"subject":{"kind":"chain","projectId":"proj-1","attemptId":null,"chainName":"main","integrationHeadSha":"' + 'a'.repeat(40) + '","briefPackageDigest":null,"baseCommit":null}}')),
     ).toBe(false);
@@ -702,5 +702,14 @@ describe('ReviewReceipt brief-verify invariants', () => {
     expect(attemptIdForBrief('proj-1', DIGEST)).toBe(`brief:proj-1:${DIGEST}`);
     expect(assessmentIdForBrief('proj-1', DIGEST)).toBe(assessmentIdForBrief('proj-1', DIGEST));
     expect(assessmentIdForBrief('proj-1', DIGEST)).not.toBe(attemptIdForBrief('proj-1', DIGEST));
+  });
+
+  it('isValidBriefPackageDigest rejects a 64-hex digest followed by a newline and accepts only the exact 64 lowercase hex characters', () => {
+    expect(isValidBriefPackageDigest(DIGEST)).toBe(true);
+    expect(isValidBriefPackageDigest(`${DIGEST}\n`)).toBe(false);
+    expect(isValidBriefPackageDigest(`\n${DIGEST}`)).toBe(false);
+    expect(isValidBriefPackageDigest(`${DIGEST}\r`)).toBe(false);
+    expect(isValidBriefPackageDigest(DIGEST.slice(0, 63))).toBe(false);
+    expect(isValidBriefPackageDigest(null)).toBe(false);
   });
 });

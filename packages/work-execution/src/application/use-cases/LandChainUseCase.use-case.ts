@@ -778,6 +778,15 @@ export class LandChainUseCase implements LandChainPort {
     }
     const pullRequestNumber = integration.value;
 
+    // The kill switch is re-read immediately before the premerge status: a
+    // halt raised while the integration PR was opened still stops this post.
+    // The kill switch is re-read immediately before the premerge status: a
+    // halt raised while the integration PR was opened still stops this post.
+    const preStatusHalt = await this.haltRefusalIfApplying(command);
+    if (preStatusHalt !== null) {
+      return preStatusHalt;
+    }
+
     const premerge = await this.postPremergeStatus(command, facts, pullRequestNumber);
     if (premerge !== null) {
       return premerge;
@@ -952,6 +961,14 @@ export class LandChainUseCase implements LandChainPort {
     const stillOurs = await this.markIsOurs(command, key, facts.tip);
     if (stillOurs !== null) {
       return stillOurs;
+    }
+    // The kill switch is re-read immediately before the enqueue: a halt raised
+    // while the mark was recorded still stops this one-way queue write.
+    // The kill switch is re-read immediately before the enqueue: a halt raised
+    // while the mark was recorded still stops this one-way queue write.
+    const preEnqueueHalt = await this.haltRefusalIfApplying(command);
+    if (preEnqueueHalt !== null) {
+      return preEnqueueHalt;
     }
     const enqueued = await this.guarded(
       command.deadlineIso,

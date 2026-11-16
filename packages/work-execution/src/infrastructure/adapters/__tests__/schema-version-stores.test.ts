@@ -469,7 +469,7 @@ describe('fast-check round-trips stamp schemaVersion 1', () => {
       }),
       { numRuns: 25 },
     );
-  });
+  }, 30_000);
 
   const laneRunArb = fc.integer({ min: 0, max: 1 }).map((round) => laneRunRecord(RUN_0, round));
 

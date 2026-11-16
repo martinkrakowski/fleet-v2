@@ -60,7 +60,6 @@ import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out
 import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
 import type {
   HeldWorkOrderRepositoryPort,
-  RecordHoldIntentResult,
 } from '../ports/out/HeldWorkOrderRepositoryPort.out-port.js';
 import type { LanePlanRepositoryPort } from '../ports/out/LanePlanRepositoryPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
@@ -899,8 +898,8 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
         pathCode,
         heldAtIso: context.nowIso,
       };
+      let staleDeleted = false;
       try {
-        let staleDeleted = false;
         if (context.staleRecord !== null) {
           const replaced = await this.replaceStaleHeld(heldRepo, context);
           if (!replaced.ok) {
@@ -909,15 +908,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
           supersededHeld = replaced.notice;
           staleDeleted = replaced.notice !== undefined;
         }
-        let recorded: RecordHoldIntentResult;
-        try {
-          recorded = await heldRepo.recordHoldIntent(record);
-        } catch (error) {
-          if (staleDeleted) {
-            await this.restoreStaleHeld(heldRepo, context.staleRecord);
-          }
-          throw error;
-        }
+        const recorded = await heldRepo.recordHoldIntent(record);
         if (recorded.outcome === 'refused') {
           if (staleDeleted) {
             await this.restoreStaleHeld(heldRepo, context.staleRecord);
@@ -937,6 +928,9 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
             requestDigest: context.requestDigest,
           });
           if (completed.outcome === 'refused') {
+            if (staleDeleted) {
+              await this.restoreStaleHeld(heldRepo, context.staleRecord);
+            }
             return completed.reason === 'intent-digest-mismatch'
               ? { outcome: 'refused', reason: 'intent-digest-mismatch' }
               : STORE_UNAVAILABLE;
@@ -944,6 +938,9 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
           held = true;
         }
       } catch {
+        if (staleDeleted) {
+          await this.restoreStaleHeld(heldRepo, context.staleRecord);
+        }
         return STORE_UNAVAILABLE;
       }
     }

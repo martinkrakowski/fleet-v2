@@ -23,6 +23,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
+import { composeReadOnlyRelaunch } from './composition/relaunch.js';
 import { composeKnowledge } from './composition/knowledge.js';
 import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
@@ -71,6 +72,8 @@ import {
   InspectMergeReadinessUseCase,
   InspectWorkOrderUseCase,
   InventoryRelaunchUseCase,
+  PlanRelaunchUseCase,
+  RelaunchPlanRepositoryAdapter,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
   OpencodeApiUsageAdapter,
@@ -668,6 +671,8 @@ export interface FleetCliRuntime {
     readonly updateProjectProfile: UpdateProjectProfileUseCase;
     readonly retireProjectProfile: RetireProjectProfileUseCase;
     readonly listProjectProfiles: ListProjectProfilesUseCase;
+    /** CO29a-ro2: the read-only profile listing the relaunch commands read. */
+    readonly listProjectProfilesReadOnly: ListProjectProfilesUseCase;
     readonly inspectProjectProfile: InspectProjectProfileUseCase;
     readonly recordProjectProbe: RecordProjectProbeUseCase;
     readonly inspectConfiguredCapabilities: InspectConfiguredCapabilitiesUseCase;
@@ -807,6 +812,10 @@ export interface FleetCliRuntime {
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
     /** CO26: the read-only relaunch inventory per lane host. */
     readonly inventoryRelaunch: InventoryRelaunchUseCase;
+    /** CO29a: the immutable relaunch plan store, keyed by canonical plan digest. */
+    readonly relaunchPlanRepository: RelaunchPlanRepositoryAdapter;
+    /** CO29a: build and store the ordered relaunch plan (read-only over the inventory and records). */
+    readonly planRelaunch: PlanRelaunchUseCase;
     /** CO30a: the one cutover record v1 (`cutover.json`). */
     readonly cutoverRecordRepository: CutoverRecordRepositoryAdapter;
     /** CO30a: the keyed cutover journal (`cutover-journal.json`). */
@@ -948,6 +957,12 @@ function editOnlyModeOf(
 
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
   const stateDir = options?.stateDir;
+  // Taken before any adapter is composed (some create the directory): the relaunch commands refuse
+  // a state directory that did not exist as a directory instead of reading it as an empty installation.
+  const stateDirPresentAtStart =
+    stateDir === undefined || stateDir.trim().length === 0
+      ? undefined
+      : statSync(stateDir, { throwIfNoEntry: false })?.isDirectory() === true;
   // AM5-3: the auto-merge settings binding re-reads a fresh installation on
   // every call (A7); tests inject a loader over a temp file.
   const autoMergeLoad = options?.loadInstallationForAutoMerge ?? (() => loadInstallation());
@@ -1198,14 +1213,17 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runJournal: conductor.laneRunJournal,
   });
 
-  // CO26: the read-only relaunch inventory reads the same lane-run stores the
-  // conductor composes, beside closeWorkOrder / listStaleWorkOrders.
-  const inventoryRelaunch = new InventoryRelaunchUseCase({
-    runRepo: conductor.laneRunRepository,
-    attemptRepo: attemptRepository,
+  // CO26 + CO29a: `relaunch inventory` and `relaunch plan` are strictly
+  // read-only; composeReadOnlyRelaunch builds every state adapter they reach
+  // read-only and takes no store from the conductor (CO29a-ro). A corrupt
+  // store file is never quarantined by either command, and unreadable halt
+  // or lease bytes answer unknown instead of a value (CO29a-ro2). The plan
+  // store (relaunch-plans.json) is the one allowed write, and only
+  // `planRelaunch` holds it.
+  const { inventoryRelaunch, planRelaunch, relaunchPlanRepository } = composeReadOnlyRelaunch({
+    stateDir,
+    stateDirPresentAtStart,
     workspace,
-    halt: conductor.halt,
-    driverLease: conductor.driverLease,
     runnerForAttempt,
     computeDigest: sha256HexDigest,
   });
@@ -1303,6 +1321,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       listStaleWorkOrders,
       inspectMergeReadiness,
       inventoryRelaunch,
+      /** CO29a: the immutable relaunch plan store, keyed by canonical plan digest. */
+      relaunchPlanRepository,
+      /** CO29a: build and store the ordered relaunch plan (read-only over the inventory and records). */
+      planRelaunch,
       cutoverRecordRepository,
       cutoverJournal,
       killallTrainPause,

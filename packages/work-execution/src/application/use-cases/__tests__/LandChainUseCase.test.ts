@@ -234,6 +234,8 @@ interface Overrides {
   enqueueDecision?: { outcome: string };
   linkPullRequest?: Record<string, unknown> | 'unavailable' | 'not-found';
   openPullRequests?: { number: number; headSha: string }[] | 'unreadable';
+  /** What reading a head-lookup candidate other than the link PR answers. */
+  candidatePullRequest?: 'not-found' | 'unavailable';
   integrationPullRequest?: Record<string, unknown>;
   reviewReceipt?: 'not-found' | { candidateHeadSha?: string; kind?: string; verdict?: string };
   linkReceipts?: 'none' | 'unavailable' | ((attemptId: string, headSha: string) => unknown);
@@ -443,6 +445,18 @@ function makeWorld(overrides: Overrides = {}): World {
     nowIso: overrides.clock ?? (() => NOW),
     computeDigest: digest,
   };
+  if (overrides.candidatePullRequest !== undefined) {
+    const forgeRead = deps.forgeRead as unknown as {
+      readPullRequest: (request: { ref: { kind: string; number: number } }) => Promise<unknown>;
+    };
+    const inner = forgeRead.readPullRequest.bind(deps.forgeRead);
+    forgeRead.readPullRequest = async (request) => {
+      if (request.ref.kind === 'number' && request.ref.number !== LINK_PR) {
+        return { outcome: overrides.candidatePullRequest, reason: 'down' };
+      }
+      return inner(request);
+    };
+  }
   return { deps, landing, calls };
 }
 
@@ -490,6 +504,19 @@ describe('LandChainUseCase parser', () => {
   it('a secret-shaped project id is secret-shaped', async () => {
     const secret = 'gh' + 'p_' + 'x'.repeat(28);
     expect((await run({ ...BASE_COMMAND, projectId: secret })).result).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
+  });
+
+  it('a secret in a non-enumerable own property is secret-shaped', async () => {
+    const world = makeWorld();
+    const command: Record<string, unknown> = { ...BASE_COMMAND };
+    Object.defineProperty(command, 'note', { value: 'x'.repeat(257), enumerable: false });
+    const result = await new LandChainUseCase(world.deps).execute(command);
+    expect(result).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
+  });
+
+  it('a secret-shaped value on an over-wide command is secret-shaped, not invalid-request', async () => {
+    const result = await run({ ...BASE_COMMAND, extra: 'x'.repeat(257), another: 'y' });
+    expect(result.result).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
   });
 
   it('a malformed field is invalid-request', async () => {
@@ -726,6 +753,15 @@ describe('LandChainUseCase apply', () => {
     expect(result).toEqual({ outcome: 'unknown', reason: 'forge-unavailable' });
   });
 
+  it('a candidate integration pull request that cannot be read is head-lookup-unavailable and does not open', async () => {
+    const notFound = await run({}, { openPullRequests: [{ number: 55, headSha: TIP }], candidatePullRequest: 'not-found' });
+    expect(notFound.result).toEqual({ outcome: 'unknown', reason: 'head-lookup-unavailable' });
+    expect(notFound.world.landing.calls.openOrAdopt).toBe(0);
+    expect(notFound.world.calls.enqueueMergeEntry).toBe(0);
+    const unavailable = await run({ dryRun: true }, { openPullRequests: [{ number: 55, headSha: TIP }], candidatePullRequest: 'unavailable' });
+    expect(unavailable.result).toEqual({ outcome: 'unknown', reason: 'head-lookup-unavailable' });
+  });
+
   it('two open pull requests of the chain onto main refuse integration-pr-ambiguous', async () => {
     const { result, world } = await run({}, { openPullRequests: [{ number: 77, headSha: TIP }, { number: 78, headSha: TIP }] });
     expect(result).toEqual({ outcome: 'refused', reason: 'integration-pr-ambiguous' });
@@ -801,6 +837,45 @@ describe('LandChainUseCase apply', () => {
     expect(world.calls.enqueueMergeEntry).toBe(0);
     const mark = world.landing.marks.get(`${OWNER}/${REPO}#${CHAIN}`);
     expect(mark?.mark.state).toBe('withdrawn');
+  });
+
+  it('a chain receipt that disappears after the landing mark withdraws the mark and is not enqueued', async () => {
+    let reviewReads = 0;
+    const world = makeWorld({ queueEntries: [{ pullRequest: LINK_PR, state: 'merged' }] });
+    const deps: LandChainDependencies = {
+      ...world.deps,
+      laneRuns: { list: async () => [laneRun({ tier: 2 })] as never },
+      reviews: {
+        findReviewReceipt: async () => {
+          reviewReads += 1;
+          if (reviewReads <= 1) {
+            return {
+              outcome: 'found',
+              receipt: { receiptId: 'r1', requestId: REQUEST_ID, kind: 'pre-merge', reviewerModel: 'm', candidateHeadSha: TIP, verdict: 'passed', findings: [] },
+            };
+          }
+          return { outcome: 'not-found' };
+        },
+      } as unknown as LandChainDependencies['reviews'],
+    };
+    const result = await new LandChainUseCase(deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'receipt-missing' });
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    const mark = world.landing.marks.get(`${OWNER}/${REPO}#${CHAIN}`);
+    expect(mark?.mark.state).toBe('withdrawn');
+  });
+
+  it('a stored withdrawn mark for another head is landing-mark-conflict and is never overwritten', async () => {
+    const world = makeWorld();
+    const markId = `${OWNER}/${REPO}#${CHAIN}`;
+    world.landing.marks.set(markId, {
+      revision: 1,
+      mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: `chain-land/${CHAIN}@${OTHER_SHA.slice(0, 12)}`, state: 'withdrawn' },
+    });
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'landing-mark-conflict' });
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    expect(world.landing.marks.get(markId)?.mark).toMatchObject({ headSha: OTHER_SHA, state: 'withdrawn' });
   });
 
   it('a failed withdrawal CAS surfaces landing-mark-stale and does not land', async () => {

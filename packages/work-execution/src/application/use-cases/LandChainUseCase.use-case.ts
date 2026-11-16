@@ -92,19 +92,23 @@ function byteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
-/** True when any own enumerable string value is over-long or secret-shaped. */
-function hasSecretShape(input: object): boolean {
+/**
+ * The secret-shape answer over every own string value, enumerable or not.
+ * A command that cannot even be inspected is not a secret: it stays
+ * `invalid-request`, so the failure is reported distinctly.
+ */
+function secretScan(input: object): 'secret' | 'uninspectable' | 'clean' {
   try {
-    for (const key of Object.keys(input)) {
+    for (const key of Object.getOwnPropertyNames(input)) {
       const value = Object.getOwnPropertyDescriptor(input, key)?.value;
       if (typeof value === 'string' && (byteLength(value) > 256 || containsSecretShape(value))) {
-        return true;
+        return 'secret';
       }
     }
   } catch {
-    return true;
+    return 'uninspectable';
   }
-  return false;
+  return 'clean';
 }
 
 /** The adversarial command parser: no port call, never throws, secret scan before any validation. */
@@ -113,13 +117,15 @@ function parseLandChainCommand(input: unknown): LandChainCommand | LandChainResu
     if (input === null || input === undefined || typeof input !== 'object' || Array.isArray(input)) {
       return refused('invalid-request');
     }
-    if (Object.keys(input).length > COMMAND_MAX_KEYS) {
-      return refused('invalid-request');
-    }
-    // The secret-shape scan runs before any field validation, so a secret is
-    // never answered with a validation code.
-    if (hasSecretShape(input)) {
+    // The secret-shape scan runs before any other rejection, so a secret is
+    // never answered with a validation code — not even the key-count one.
+    // A command that resists inspection is `invalid-request`, never a secret.
+    const scan = secretScan(input);
+    if (scan === 'secret') {
       return refused('secret-shaped');
+    }
+    if (scan === 'uninspectable' || Object.keys(input).length > COMMAND_MAX_KEYS) {
+      return refused('invalid-request');
     }
     const projectIdValue = own(input, 'projectId');
     if (typeof projectIdValue !== 'string' || !PROJECT_ID_PATTERN.test(projectIdValue)) {
@@ -670,8 +676,13 @@ export class LandChainUseCase implements LandChainPort {
       if (!read.ok) {
         return read;
       }
+      if (read.value.outcome !== 'found') {
+        // A candidate whose read is unavailable or not-found leaves the
+        // existing-candidate question unanswerable; fail closed instead of
+        // silently opening another integration pull request.
+        return { ok: false, fail: FAIL_LOOKUP };
+      }
       if (
-        read.value.outcome === 'found' &&
         read.value.pullRequest.state === 'open' &&
         read.value.pullRequest.baseRef === 'main' &&
         read.value.pullRequest.headRef === command.branchName &&
@@ -811,6 +822,10 @@ export class LandChainUseCase implements LandChainPort {
     const recheckLinks = await this.collectLinks(command, facts.tip);
     if (!recheckLinks.ok) {
       return this.withdrawAndReturn(command, key, facts.tip, pullRequestNumber, recheckLinks.fail);
+    }
+    const recheckChain = await this.checkChainReceipt(command, facts.pin, recheckLinks.value.highestTier);
+    if (recheckChain !== null) {
+      return this.withdrawAndReturn(command, key, facts.tip, pullRequestNumber, recheckChain);
     }
     const recheckReceipts = await this.collectLinkReceipts(command, recheckLinks.value.links, facts.tip);
     if (!recheckReceipts.ok) {
@@ -969,7 +984,9 @@ export class LandChainUseCase implements LandChainPort {
       if (!stored.ok) {
         return stored.fail;
       }
-      if (stored.outcome === 'found' && stored.mark !== undefined && stored.mark.state === 'landing' && (stored.mark.headSha !== tip || stored.mark.key !== key)) {
+      if (stored.outcome === 'found' && stored.mark !== undefined && (stored.mark.headSha !== tip || stored.mark.key !== key)) {
+        // A stored mark for another head conflicts whatever its state — a
+        // withdrawn one is still a mark, never silently overwritten.
         return refused('landing-mark-conflict');
       }
       const cas = await this.guarded(

@@ -59,6 +59,7 @@ import {
   type RunTelemetryMarkPort,
   type WorkOrderRecord,
   type StartLaneRunResult,
+  type ReapOrphanReservationsResult,
   CRASHED_START_NOTICE_MINUTES,
   crashedStartNoticeSummary,
   startIncompleteReasonCode,
@@ -116,7 +117,7 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>] [--max-active-runs <n>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
-       fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes] [--force-unsealed]
+       fleet-v2 conductor reap --worktrees|--sessions|--reservations [--dry-run] [--yes] [--force-unsealed]
 
 conductor status --stalled lists the runs held longer than
 policy.daemon.stallAfterMinutes (default 30), oldest first: a parked row is
@@ -152,6 +153,14 @@ finished (cancelled, collected or ended) and none holds a reservation, but
 where the runner still reports a running session; --dry-run lists them and
 aborts nothing, and without it --yes is required; it interrupts those
 sessions and does not delete session records, worktrees, branches or runs.
+conductor reap --reservations lists every held capacity reservation's
+classification and, with --yes, releases only the reservations of finished
+runs (every run that lists the attempt is merged or stopped and the attempt
+is ended, collected or cancelled); --dry-run opens the stores read-only,
+writes nothing and releases nothing, and without it --yes is required. A
+reservation no run lists is reported only and never released here (see
+conductor start --abandon). It deletes no worktrees, branches or runs.
+Notices go to stderr; a release whose outcome is unknown may have completed.
 --max-active-runs on conductor start is the
 active-run cap the start's admission check uses. --pass-concurrency on
 conductor run is how many live runs one pass advances concurrently
@@ -1813,6 +1822,7 @@ async function dryRunCommand(
 interface ReapFlags {
   readonly worktrees: boolean;
   readonly sessions: boolean;
+  readonly reservations: boolean;
   readonly dryRun: boolean;
   readonly yes: boolean;
   readonly forceUnsealed: boolean;
@@ -1826,6 +1836,7 @@ interface ReapFlags {
 function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
   let worktrees = false;
   let sessions = false;
+  let reservations = false;
   let dryRun = false;
   let yes = false;
   let forceUnsealed = false;
@@ -1845,6 +1856,14 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
         return null;
       }
       sessions = true;
+      continue;
+    }
+    if (token === '--reservations') {
+      if (reservations) {
+        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      reservations = true;
       continue;
     }
     if (token === '--dry-run') {
@@ -1880,16 +1899,92 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
     io.stderr(`conductor reap takes no positional arguments\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  if (forceUnsealed && sessions) {
+  if (forceUnsealed && (sessions || reservations)) {
     io.stderr(`conductor reap: --force-unsealed applies only to --worktrees\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { worktrees, sessions, dryRun, yes, forceUnsealed };
+  return { worktrees, sessions, reservations, dryRun, yes, forceUnsealed };
+}
+
+const RESERVATION_REAP_PREFIX = 'conductor reap --reservations: ';
+
+/**
+ * The `--yes` refusal message for the requested reap mode: the same wording
+ * per mode, with the reservations text stating what a release never touches.
+ */
+function reapYesRequiredMessage(flags: ReapFlags): string {
+  if (flags.worktrees) {
+    return `conductor reap --worktrees requires --yes unless --dry-run is given\n${CONDUCTOR_HELP}\n`;
+  }
+  if (flags.sessions) {
+    return `conductor reap --sessions requires --yes unless --dry-run is given; it interrupts sessions with no live attempt and does not delete session records, worktrees, branches or runs\n${CONDUCTOR_HELP}\n`;
+  }
+  return `conductor reap --reservations requires --yes unless --dry-run is given; it releases only the reservations of finished runs, never a reservation no run lists, and does not delete worktrees, branches or runs\n${CONDUCTOR_HELP}\n`;
+}
+
+/** The stderr notice for unclassified reservations, distinguishing an incomplete sweep. */
+function unknownReservationsNotice(
+  unknown: readonly { readonly reason: string }[],
+  releasedCount: number,
+): string {
+  if (releasedCount === 0 && unknown.some((entry) => entry.reason === 'run-state-unknown')) {
+    return `${RESERVATION_REAP_PREFIX}sweep incomplete: a run record is unreadable or the run count exceeds 10,000; nothing released\n`;
+  }
+  return `${RESERVATION_REAP_PREFIX}UNKNOWN: ${unknown.length} reservation(s) could not be classified and were not released\n`;
+}
+
+/** The stderr notices and the exit code of one `conductor reap --reservations` result (OG22b). */
+function reservationReapVerdict(result: ReapOrphanReservationsResult): { readonly notices: string[]; readonly exitCode: number } {
+  if (result.outcome !== 'reaped') {
+    return { notices: [`${RESERVATION_REAP_PREFIX}the sweep was refused or a store is unreadable; nothing released\n`], exitCode: 1 };
+  }
+  const lists = [result.reportOnly, result.released, result.failed, result.journalFailed, result.unknown];
+  if (!lists.every((list) => Array.isArray(list))) {
+    throw new TypeError('malformed reap result');
+  }
+  const ambiguous = result.failed.filter((entry) => entry.reason === 'ambiguous').length;
+  const notPerformed = result.failed.filter((entry) => entry.reason !== 'ambiguous' && entry.reason !== 'not-held').length;
+  const notices: string[] = [];
+  if (result.reportOnly.length > 0) {
+    notices.push(`${RESERVATION_REAP_PREFIX}REPORT ONLY: ${result.reportOnly.length} held reservation(s) are listed by no run and were not released; see conductor start --abandon\n`);
+  }
+  if (result.unknown.length > 0) {
+    notices.push(unknownReservationsNotice(result.unknown, result.released.length));
+  }
+  if (ambiguous > 0) {
+    notices.push(`${RESERVATION_REAP_PREFIX}${ambiguous} release(s) have an unknown outcome and may have completed; run conductor reap --reservations --dry-run to check\n`);
+  }
+  if (notPerformed > 0) {
+    notices.push(`${RESERVATION_REAP_PREFIX}${notPerformed} release(s) were not performed; see failed in the document\n`);
+  }
+  if (result.journalFailed.length > 0) {
+    notices.push(`${RESERVATION_REAP_PREFIX}${result.journalFailed.length} release result(s) could not be journalled\n`);
+  }
+  const failedCount = result.unknown.length + ambiguous + notPerformed + result.journalFailed.length;
+  return { notices, exitCode: failedCount > 0 ? 1 : 0 };
+}
+
+/** `conductor reap --reservations` (OG22b): one JSON document on stdout, notices on stderr. */
+async function reapReservationsCommand(io: CliIo, runtime: FleetCliRuntime, dryRun: boolean, nowIso: string): Promise<number> {
+  try {
+    const useCase = dryRun ? runtime.conductor.reapOrphanReservationsDryRun : runtime.conductor.reapOrphanReservations;
+    const result = await useCase.reapOrphanReservations({ dryRun, nowIso });
+    const verdict = reservationReapVerdict(result);
+    const document = `${JSON.stringify(result)}\n`;
+    io.stdout(document);
+    for (const notice of verdict.notices) {
+      io.stderr(notice);
+    }
+    return verdict.exitCode;
+  } catch {
+    io.stderr(`${RESERVATION_REAP_PREFIX}the sweep failed before a result could be read; outcome unknown\n`);
+    return 1;
+  }
 }
 
 /**
- * `conductor reap` (EX-2b, EX-4): exactly one of `--worktrees` or
- * `--sessions` is required.
+ * `conductor reap` (EX-2b, EX-4, OG22b): exactly one of `--worktrees`,
+ * `--sessions` or `--reservations` is required.
  *
  * `--worktrees` (EX-2b): on explicit request (with `--yes`, or `--dry-run`
  * to only list), remove the clean worktree of every finished lane run and
@@ -1905,6 +2000,12 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
  * `abortWorktreeRun`. The message states it interrupts sessions with no live
  * attempt and does not delete session records, worktrees, branches or runs.
  * Exit 0 when nothing failed or was unknown, otherwise 1.
+ *
+ * `--reservations` (OG22b): on explicit request (with `--yes`, or `--dry-run`
+ * to only list), release the held capacity reservations of finished runs; a
+ * reservation no run lists is reported only and never released. A dry run
+ * reads through read-only stores and releases nothing. Exit 0 when nothing
+ * failed or was unknown, otherwise 1.
  */
 async function reapCommand(
   argv: readonly string[],
@@ -1916,20 +2017,17 @@ async function reapCommand(
   if (flags === null) {
     return 2;
   }
-  if (!flags.worktrees && !flags.sessions) {
-    io.stderr(`conductor reap requires --worktrees or --sessions\n${CONDUCTOR_HELP}\n`);
+  const modeCount = [flags.worktrees, flags.sessions, flags.reservations].filter(Boolean).length;
+  if (modeCount === 0) {
+    io.stderr(`conductor reap requires --worktrees, --sessions or --reservations\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
-  if (flags.worktrees && flags.sessions) {
-    io.stderr(`conductor reap takes only one of --worktrees or --sessions\n${CONDUCTOR_HELP}\n`);
+  if (modeCount > 1) {
+    io.stderr(`conductor reap takes only one of --worktrees, --sessions or --reservations\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
   if (!flags.dryRun && !flags.yes) {
-    io.stderr(
-      flags.worktrees
-        ? `conductor reap --worktrees requires --yes unless --dry-run is given\n${CONDUCTOR_HELP}\n`
-        : `conductor reap --sessions requires --yes unless --dry-run is given; it interrupts sessions with no live attempt and does not delete session records, worktrees, branches or runs\n${CONDUCTOR_HELP}\n`,
-    );
+    io.stderr(reapYesRequiredMessage(flags));
     return 2;
   }
   if (options.stateDir === undefined) {
@@ -1937,6 +2035,9 @@ async function reapCommand(
       `conductor reap needs a durable state directory (--state-dir or FLEET_STATE_DIR)\n${CONDUCTOR_HELP}\n`,
     );
     return 2;
+  }
+  if (flags.reservations) {
+    return await reapReservationsCommand(io, runtime, flags.dryRun, nowIsoOf(options));
   }
   if (flags.sessions) {
     const result = await runtime.conductor.reapOrphanSessions.reapOrphanSessions({

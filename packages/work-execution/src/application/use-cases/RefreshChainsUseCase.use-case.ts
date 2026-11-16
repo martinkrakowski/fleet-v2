@@ -12,6 +12,10 @@
  * stays unknown: an unreadable record, an unreadable `main` head and an
  * ambiguous forge answer are skipped with a reason code, never merged, empty or
  * a pass. The pass stops when fewer than `DAEMON_CALL_MIN_REMAINING_MS` remain.
+ * The operator halt is read fail-closed at the pass start, before each started
+ * chain, and directly before each chain's merge (1 + 2N reads for N started
+ * chains reaching merge); the merge is the only one-way action, so a halt set
+ * during the intent write sends no merge and leaves the intent in flight.
  * No clock is read here except the injected one; reasons, keys and chain names
  * only, never a path or an input value.
  */
@@ -165,9 +169,6 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       return { outcome: 'skipped', reasonCode: 'chains-unreadable', chains: [] };
     }
     if (await isRequiredPassHalted(this.deps.halt)) {
-      // The halt is read here at the pass start and again before each started
-      // chain: refused before any forge call and before any intent or outcome
-      // write.
       // The halt is read here at the pass start, again before each started
       // chain, and directly before each chain's merge (inside `forgeCall`,
       // the only one-way action of `refreshOne`).

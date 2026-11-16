@@ -15,6 +15,7 @@ import type {
   ChainStep,
   ChainTrigger,
   ChainsSection,
+  CiRunnerSlotSection,
   ConductorPolicy,
   ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
@@ -82,6 +83,7 @@ import {
   CAPABILITY_KEYS,
   CHAIN_KEYS,
   CHAIN_STEP_KEYS,
+  CI_RUNNER_SLOT_KEYS,
   CLAIM_TRIAGE_CONSUMER_KEYS,
   CONDUCTOR_KEYS,
   CONDUCTOR_REAPER_DISK_KEYS,
@@ -162,6 +164,12 @@ const PROCEDURE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 /** Container names share the procedure-name shape; see parseHostContainer. */
 const CONTAINER_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const MAX_CONTAINER_NAME_LENGTH = 64;
+/** CI runner slots are bounded so a host cannot declare an unbounded unit list (OG-28a). */
+const MAX_CI_RUNNER_SLOTS = 16;
+/** Slot names share the lowercase identifier shape with an extra separator set. */
+const CI_RUNNER_SLOT_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+/** A slot's unit must be a systemd service unit name ending in `.service`. */
+const CI_RUNNER_SLOT_UNIT_PATTERN = /^[A-Za-z0-9@._:-]{1,128}\.service$/;
 const MAX_INSTALLATION_STATE_DIR_LENGTH = 4096;
 /** The tunnel offset is bounded so a dial port stays far below 65535. */
 const MAX_TUNNEL_OFFSET = 1024;
@@ -1528,6 +1536,89 @@ function parseHostRoleAliases(
   return Object.keys(aliases).length > 0 ? aliases : undefined;
 }
 
+/**
+ * The optional `hosts.<name>.ciRunnerSlots` list: the systemd CI runner units
+ * a host declares (OG-28a). Both local and ssh hosts may carry it. Every
+ * element is read through `readOptionalDataField` and the safe own-property
+ * readers, so a getter never runs, and a rejected value never appears in the
+ * message: slot names and unit names are operator input.
+ */
+function parseHostCiRunnerSlots(
+  entry: JsonObject,
+  hostPath: string,
+  errors: string[],
+): readonly CiRunnerSlotSection[] | undefined {
+  const fieldPath = `${hostPath}.ciRunnerSlots`;
+  // An accessor property is refused, never treated as an absent field.
+  const field = readOptionalDataField(entry, 'ciRunnerSlots');
+  if (field.kind === 'absent') {
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  if (!Array.isArray(field.value)) {
+    errors.push(`${fieldPath}: must be an array`);
+    return undefined;
+  }
+  if (field.value.length > MAX_CI_RUNNER_SLOTS) {
+    errors.push(`${fieldPath}: must have at most 16 entries`);
+    return undefined;
+  }
+  const seenNames = new Set<string>();
+  const slots: CiRunnerSlotSection[] = [];
+  for (const [index, item] of field.value.entries()) {
+    const slotPath = `${fieldPath}[${index}]`;
+    if (!isJsonObject(item)) {
+      errors.push(`${slotPath}: must be an object`);
+      continue;
+    }
+    collectUnknownKeys(item, CI_RUNNER_SLOT_KEYS, slotPath, errors);
+    let name: string | undefined;
+    const nameField = readOptionalDataField(item, 'name');
+    if (nameField.kind === 'absent') {
+      errors.push(`${slotPath}.name: required`);
+    } else if (nameField.kind === 'accessor') {
+      errors.push(`${slotPath}.name: must be a plain data property`);
+    } else {
+      const value = nameField.value;
+      if (typeof value !== 'string' || value.trim() === '') {
+        errors.push(`${slotPath}.name: must be a non-empty string`);
+      } else if (!CI_RUNNER_SLOT_NAME_PATTERN.test(value)) {
+        errors.push(`${slotPath}.name: must match ^[a-z0-9][a-z0-9._-]{0,63}$`);
+      } else if (seenNames.has(value)) {
+        errors.push(`${slotPath}.name: duplicate slot name`);
+      } else {
+        seenNames.add(value);
+        name = value;
+      }
+    }
+    let unit: string | undefined;
+    const unitField = readOptionalDataField(item, 'unit');
+    if (unitField.kind === 'absent') {
+      errors.push(`${slotPath}.unit: required`);
+    } else if (unitField.kind === 'accessor') {
+      errors.push(`${slotPath}.unit: must be a plain data property`);
+    } else {
+      const value = unitField.value;
+      if (typeof value !== 'string' || value.trim() === '') {
+        errors.push(`${slotPath}.unit: must be a non-empty string`);
+      } else if (value.startsWith('-') || !CI_RUNNER_SLOT_UNIT_PATTERN.test(value)) {
+        errors.push(
+          `${slotPath}.unit: must be a systemd service unit name ending in .service and not starting with "-"`,
+        );
+      } else {
+        unit = value;
+      }
+    }
+    if (name !== undefined && unit !== undefined) {
+      slots.push({ name, unit });
+    }
+  }
+  return slots;
+}
+
 function parseHost(
   entry: JsonObject,
   hostPath: string,
@@ -1593,6 +1684,8 @@ function parseHost(
     roles,
     errors,
   );
+  // A host of either transport may declare systemd CI runner slots (OG-28a).
+  const ciRunnerSlots = parseHostCiRunnerSlots(entry, hostPath, errors);
   let runner: HostRunnerSection | undefined;
   if (Object.hasOwn(entry, 'runner')) {
     const runnerValue = entry.runner;
@@ -1624,6 +1717,7 @@ function parseHost(
     worktreeRoot,
     ...(tmpDir !== undefined ? { tmpDir } : {}),
     roles,
+    ...(ciRunnerSlots !== undefined ? { ciRunnerSlots } : {}),
     ...(runner !== undefined ? { runner } : {}),
   };
 }

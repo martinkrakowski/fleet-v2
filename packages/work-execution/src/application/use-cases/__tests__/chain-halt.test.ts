@@ -272,7 +272,7 @@ describe('RefreshChainsUseCase halt gating', () => {
     }
   });
 
-  it('RefreshChainsUseCase reads the halt at the pass start and before each started chain', async () => {
+  it('RefreshChainsUseCase reads the halt at the pass start, before each started chain and before each merge', async () => {
     let reads = 0;
     const countingHalt: Pick<ConductorHaltPort, 'read'> = {
       async read() {
@@ -285,7 +285,7 @@ describe('RefreshChainsUseCase halt gating', () => {
     const firstResult = await first.useCase.runRefreshChains(refreshCommand);
 
     expect(firstResult.outcome).toBe('completed');
-    expect(reads).toBe(2);
+    expect(reads).toBe(3);
 
     const twoStarted = [makeRecord(), makeRecord({ chainName: 'second-thing', branchName: 'chain/second-thing' })];
     let secondReads = 0;
@@ -300,7 +300,7 @@ describe('RefreshChainsUseCase halt gating', () => {
     const secondResult = await second.useCase.runRefreshChains(refreshCommand);
 
     expect(secondResult.outcome).toBe('completed');
-    expect(secondReads).toBe(3);
+    expect(secondReads).toBe(5);
   });
 
   it('a halt raised after the first chain stops the second chain', async () => {

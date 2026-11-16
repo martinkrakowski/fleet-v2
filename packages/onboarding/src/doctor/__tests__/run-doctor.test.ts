@@ -929,7 +929,7 @@ describe('runDoctor gh non-interactive auth check', () => {
   });
 
   it('never leaks a token-shaped env value or account name into any DoctorLine', async () => {
-    const token = 'ghp_secretTokenValue1234567890';
+    const token = ['gh' + 'p', '_', 'secretTokenValue', '1234567890'].join('');
     const { probes } = fakeProbes({
       ...resolvedGh(),
       ghAuth: async () => ({

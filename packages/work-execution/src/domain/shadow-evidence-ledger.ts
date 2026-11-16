@@ -77,12 +77,19 @@ export type ShadowLedgerRead =
 
 /**
  * Read a persisted ledger. Own data properties only: every value comes from
- * its own property descriptor, so no getter ever runs and a Proxy stand-in is
- * refused by the final serializer probe, which reads only proved primitive
- * data values. Cost: linear in the capped input — at most
- * `SHADOW_LEDGER_MAX_DAYS` days times `CUTOVER_SHADOW_CRITERIA.length`
- * verdicts, each with a constant number of descriptor reads; an oversized
- * `days` array is refused from its length before any traversal. Never throws,
+ * its own property descriptor, so no getter ever runs. The ledger returned on
+ * success is always a fresh structure built field by field from the already-
+ * validated primitives — the input is never cloned, with `structuredClone` or
+ * anything else that walks every enumerable property, because a clone of
+ * not-yet-fully-validated input would run any getter hiding on an unchecked
+ * property (an extra enumerable key the field-by-field reads below never
+ * name). A Proxy stand-in either is refused by the shape checks below or
+ * yields exactly the result the plain data would, since every read here goes
+ * through `Object.getOwnPropertyDescriptor`/`Reflect.ownKeys`, never a `get`
+ * trap. Cost: linear in the capped input — at most `SHADOW_LEDGER_MAX_DAYS`
+ * days times `CUTOVER_SHADOW_CRITERIA.length` verdicts, each with a constant
+ * number of descriptor reads; an oversized or non-dense `days` array is
+ * refused from its own keys before any element is traversed. Never throws,
  * never echoes the input.
  */
 export function readShadowLedger(raw: unknown): ShadowLedgerRead {
@@ -126,7 +133,7 @@ export function readShadowLedger(raw: unknown): ShadowLedgerRead {
       readDays.push(day);
     }
     const ledger: ShadowLedger = { schemaVersion: SHADOW_LEDGER_SCHEMA_VERSION, revision, days: readDays };
-    return isCloneableData(raw) ? { ok: true, ledger } : INVALID_LEDGER;
+    return { ok: true, ledger };
   } catch {
     return INVALID_LEDGER;
   }
@@ -153,11 +160,19 @@ function isVersionAboveCurrent(raw: unknown): boolean {
   );
 }
 
-/** The capped element count of a real array, or null for any stand-in or oversized array. */
+/**
+ * The capped element count of a real, dense array, or null for any stand-in,
+ * oversized, sparse, or extra-keyed array. `Object.keys` lists own enumerable
+ * string keys without reading any value, so it runs no getter; comparing its
+ * count to `length` catches both a hole (fewer keys than `length`) and an
+ * extra own enumerable property such as a getter planted beside the indices
+ * (more keys than `length`) — either way, the array is refused before a
+ * single element or any extra property is read, so a getter hiding on it
+ * never runs, here or when the ledger is rebuilt afterward.
+ */
 function boundedArrayLength(value: unknown): number | null {
   // `Array.isArray` follows a Proxy without running a trap; the length is
-  // read from its own descriptor, so no `get` trap ever runs and the final
-  // serializer probe refuses the stand-in.
+  // read from its own descriptor, so no `get` trap ever runs.
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     return null;
   }
@@ -168,6 +183,9 @@ function boundedArrayLength(value: unknown): number | null {
     typeof lengthDescriptor.value !== 'number' ||
     lengthDescriptor.value > SHADOW_LEDGER_MAX_DAYS
   ) {
+    return null;
+  }
+  if (Object.keys(value).length !== lengthDescriptor.value) {
     return null;
   }
   return lengthDescriptor.value;
@@ -300,24 +318,22 @@ function dayNumber(day: string): number | null {
   if (date < 1 || date > new Date(Date.UTC(year, month, 0)).getUTCDate()) {
     return null;
   }
-  return Math.floor(Date.UTC(year, month - 1, date) / DAY_MS);
+  return Math.floor(utcInstant(year, month - 1, date) / DAY_MS);
 }
 
 /**
- * A transparent Proxy over the ledger answers every prototype, key and
- * descriptor read exactly as its target would, so the checks above cannot
- * tell it from data. The structured-clone serializer refuses any Proxy
- * exotic object; at this point every own property is a validated data
- * property with a primitive or plain-data value, so the probe reads no
- * getter. A clone failure here means a stand-in, never data.
+ * The UTC epoch millisecond of `year`-`monthIndex`-`date`, set through
+ * `setUTCFullYear` rather than computed with `Date.UTC`/the multi-argument
+ * `Date` constructor: those two apply the well-known two-digit-year special
+ * case (a `year` of 0-99 is read as 1900-1999), which would sort an early
+ * four-digit year such as `0099` after a later one such as `0100`.
+ * `setUTCFullYear` carries no such special case, so every validated 4-digit
+ * `YYYY` sorts by its own value.
  */
-function isCloneableData(raw: unknown): boolean {
-  try {
-    structuredClone(raw);
-    return true;
-  } catch {
-    return false;
-  }
+function utcInstant(year: number, monthIndex: number, date: number): number {
+  const instant = new Date(0);
+  instant.setUTCFullYear(year, monthIndex, date);
+  return instant.getTime();
 }
 
 export interface ShadowVerdictsInput {
@@ -390,7 +406,16 @@ function readVerdictsInput(raw: unknown): ShadowVerdictsInput | null {
   if (releaseSha !== null && !isValidReleaseSha(releaseSha)) {
     return null;
   }
-  if (mergesCompared !== undefined && !isValidMergesCompared(mergesCompared)) {
+  // The optional-key reader above copies an accessor's descriptor `value`,
+  // which is `undefined` for a getter — indistinguishable, so far, from the
+  // key being genuinely absent. The descriptor on `raw` itself (never its
+  // value) resolves the two: a present getter is a malformed shape, refused
+  // here, rather than silently treated as "mergesCompared not given."
+  if (mergesCompared === undefined) {
+    if (isOwnAccessorKey(raw, 'mergesCompared')) {
+      return null;
+    }
+  } else if (!isValidMergesCompared(mergesCompared)) {
     return null;
   }
   const readVerdictsResult = readVerdicts(verdicts);
@@ -403,6 +428,19 @@ function readVerdictsInput(raw: unknown): ShadowVerdictsInput | null {
     mergesCompared,
     verdicts: readVerdictsResult,
   };
+}
+
+/**
+ * True when `record` has `key` as its own accessor property. Only the
+ * descriptor is inspected, never a `get`/`set` invoked, so a getter never
+ * runs here.
+ */
+function isOwnAccessorKey(record: unknown, key: string): boolean {
+  if (typeof record !== 'object' || record === null) {
+    return false;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  return descriptor !== undefined && (descriptor.get !== undefined || descriptor.set !== undefined);
 }
 
 /** The merge against the stored ledger, after the input shape was accepted. */

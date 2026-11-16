@@ -257,7 +257,14 @@ describe('shadow evidence ledger (SH1)', () => {
       readFailure({ revision: 1, days: [day] }, 'invalid-ledger');
     });
 
-    it('refuses a Proxy over a valid ledger without running any get trap', () => {
+    it('a Proxy over a valid ledger yields exactly the plain data, running no get trap', () => {
+      // Fix-round note: the brief's hostile-input rule allows either outcome
+      // for a transparent Proxy — refused, or an exact match to the plain
+      // data — as long as no `get` trap ever runs. This used to be refused
+      // only because `structuredClone` (removed by the finding-1 fix above)
+      // throws on any Proxy exotic object; every read here now goes through
+      // `Object.getOwnPropertyDescriptor`/`Reflect.ownKeys`, so the Proxy is
+      // indistinguishable from its target and the result matches it exactly.
       const ledger = buildLedger([dayInput(D1, 7)]);
       const traps = { get: 0 };
       const proxy = new Proxy(ledger as unknown as object, {
@@ -266,7 +273,7 @@ describe('shadow evidence ledger (SH1)', () => {
           return Reflect.get(target, property, receiver);
         },
       });
-      readFailure(proxy, 'invalid-ledger');
+      expect(readShadowLedger(proxy)).toEqual({ ok: true, ledger });
       expect(traps.get).toBe(0);
     });
 
@@ -297,6 +304,35 @@ describe('shadow evidence ledger (SH1)', () => {
       const day = { day: D1, releaseSha: null, mergesCompared: null, verdicts: { S1: verdict } };
       readFailure({ revision: 1, days: [day] }, 'invalid-ledger');
       expect(counter.calls).toBe(0);
+    });
+
+    it('never runs a getter planted as an extra enumerable property on the days array', () => {
+      // Fix-round proof (break-and-restore, reasoned rather than re-run): the
+      // earlier code validated `days` only through its length and per-index
+      // descriptor reads, then called `structuredClone(raw)` on the whole,
+      // still-untrusted root object as a Proxy probe. `structuredClone` walks
+      // every enumerable own property of every nested object and array to
+      // clone it — including one neither the length check nor the per-index
+      // loop below ever names — so it would have read this `extra` getter's
+      // value and the counter would have left 0 and become 1. The fix removes
+      // the clone of untrusted input entirely and instead refuses any `days`
+      // array whose own enumerable key count exceeds its `length` (this
+      // `extra` key does), so the getter is never reached in the first place.
+      let counter = 0;
+      const days: unknown[] = [
+        { day: D1, releaseSha: null, mergesCompared: null, verdicts: {} },
+        { day: D2, releaseSha: null, mergesCompared: null, verdicts: {} },
+      ];
+      Object.defineProperty(days, 'extra', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          counter += 1;
+          return 1;
+        },
+      });
+      readFailure({ revision: 1, days }, 'invalid-ledger');
+      expect(counter).toBe(0);
     });
   });
 
@@ -436,9 +472,44 @@ describe('shadow evidence ledger (SH1)', () => {
       expect(counter.calls).toBe(0);
     });
 
+    it('refuses an input whose mergesCompared is an accessor, never reading it as absent', () => {
+      let counter = 0;
+      const input: Record<string, unknown> = {
+        day: D1,
+        releaseSha: null,
+        verdicts: { S1: passVerdict() },
+      };
+      Object.defineProperty(input, 'mergesCompared', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          counter += 1;
+          return 7;
+        },
+      });
+      expect(recordShadowVerdicts(null, input)).toEqual({ ok: false, reason: 'invalid-input' });
+      expect(counter).toBe(0);
+    });
+
     it('refuses a new day sorting before the last stored day with day-out-of-order', () => {
       const ledger = buildLedger([dayInput(D2, 7)]);
       expect(recordShadowVerdicts(ledger, dayInput(D1, 7))).toEqual({ ok: false, reason: 'day-out-of-order' });
+    });
+
+    it('does not let a two-digit year sort after the following century (Date.UTC quirk)', () => {
+      // `Date.UTC`/the multi-argument `Date` constructor treat a year of 0-99
+      // as 1900-1999. With that quirk still in the day-serial computation,
+      // '0099-12-31' would compute as if it were 1999-12-31 and so sort AFTER
+      // '0100-01-01' (year 100, outside the special-cased range and so
+      // unaffected): the second call below would have been wrongly refused
+      // as day-out-of-order. Fixed by computing the serial with
+      // `setUTCFullYear`, which carries no such special case.
+      const first = recordShadowVerdicts(null, dayInput('0099-12-31', 7));
+      if (!first.ok) {
+        throw new Error(`expected ok, got ${first.reason}`);
+      }
+      const second = recordShadowVerdicts(first.ledger, dayInput('0100-01-01', 7));
+      expect(second).toEqual({ ok: true, ledger: expect.objectContaining({ revision: 2 }), changed: true });
     });
 
     it('refuses a differing re-record of a recorded criterion with verdict-conflict', () => {

@@ -5,6 +5,7 @@ import type { LaneRunKeyResult } from '../lane-run-keys.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../lane-run-journal.js';
 import { laneRunIntentEntry, laneRunResultEntry } from '../lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../lane-run-step-facts.js';
+import type { LaneRunReviewKind } from '../lane-run-review-facts.js';
 import {
   LANE_RUN_REVIEW_CONFIRMATION_MAX_ENTRIES,
   laneRunReviewConfirmationFact,
@@ -244,22 +245,25 @@ describe('laneRunReviewConfirmationFact', () => {
     });
   });
 
-  it('ignores seat-busy and review-superseded intents between the pass and the failed', () => {
-    const passedKey = reviewKey('brief-check', { seatIndex: 0 });
-    const busyKey = reviewKey('brief-check', { seatIndex: 0, retry: 1 });
-    const failedKey = reviewKey('brief-check', { seatIndex: 0, retry: 2 });
-    const entries = [
-      intent(passedKey),
-      result(passedKey, 'completed', 'review-passed'),
-      intent(busyKey),
-      result(busyKey, 'completed', 'seat-busy'),
-      intent(failedKey),
-      result(failedKey, 'completed', 'review-failed'),
-    ];
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({
-      priorPassedAtHead: true,
-      confirmingRetries: 0,
-    });
+  describe.each(['seat-busy', 'review-superseded'] as const)('a %s intent', (skipped) => {
+    it.each(['between the pass and the failed', 'after the contradictory failed'] as const)(
+      'placed %s is not a verdict and not a confirming re-review: the fact stays a prior pass with 0 confirming retries',
+      (position) => {
+        const passedKey = reviewKey('brief-check', { seatIndex: 0 });
+        const failedKey = reviewKey('brief-check', { seatIndex: 0, retry: 1 });
+        const skippedKey = reviewKey('brief-check', { seatIndex: 0, retry: 2 });
+        const skippedEntries = [intent(skippedKey), result(skippedKey, 'completed', skipped)];
+        const passed = [intent(passedKey), result(passedKey, 'completed', 'review-passed')];
+        const failed = [intent(failedKey), result(failedKey, 'completed', 'review-failed')];
+        const entries = position === 'between the pass and the failed'
+          ? [...passed, ...skippedEntries, ...failed]
+          : [...passed, ...failed, ...skippedEntries];
+        expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({
+          priorPassedAtHead: true,
+          confirmingRetries: 0,
+        });
+      },
+    );
   });
 
   it('never throws and fails closed on a sparse array with a hole', () => {
@@ -290,11 +294,21 @@ describe('laneRunReviewConfirmationFact', () => {
     }
   });
 
-  it('fails closed on a wrong-kind or empty head12 string', () => {
-    const key = reviewKey('brief-check', { seatIndex: 0 });
-    const entries = [intent(key), result(key, 'completed', 'review-passed')];
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', 'short')).toEqual(NO_CONFIRMATION);
-    expect(laneRunReviewConfirmationFact('not-an-array' as unknown as LaneRunJournalEntryRecord[], RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+  it.each([
+    ['an empty head12 string', () => contradictoryJournal() as unknown, 'brief-check', ''],
+    ['a short head12 string', () => contradictoryJournal() as unknown, 'brief-check', 'short'],
+    ['a wrong kind (gate) over a gate journal that shows a pass then a fail', () => gateContradictoryJournal() as unknown, 'gate', HEAD],
+    ['a non-array array-like holding a contradictory pass and fail', () => ({ ...contradictoryJournal(), length: 4 }) as unknown, 'brief-check', HEAD],
+  ] as const)('fails closed on %s without reading the journal', (_name, build, kind, head12) => {
+    const { proxy, reads } = countingProxy(build() as object, {});
+    const fact = laneRunReviewConfirmationFact(
+      proxy as LaneRunJournalEntryRecord[],
+      RUN_ID,
+      kind as LaneRunReviewKind,
+      head12,
+    );
+    expect(fact).toEqual(NO_CONFIRMATION);
+    expect(reads.size).toBe(0);
   });
 });
 
@@ -307,6 +321,19 @@ function contradictoryJournal(): LaneRunJournalEntryRecord[] {
     result(passedKey, 'completed', 'review-passed'),
     intent(failedKey),
     result(failedKey, 'completed', 'review-failed'),
+  ];
+}
+
+/** A `gate` journal with a pass then a failed at HEAD: only a non-review `kind` could read it. */
+function gateContradictoryJournal(): LaneRunJournalEntryRecord[] {
+  const gateKey = (retry: number | null): string => mustBuild(buildLaneRunStepKey({
+    runId: RUN_ID, round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD, retry,
+  }));
+  return [
+    intent(gateKey(null)),
+    result(gateKey(null), 'completed', 'review-passed'),
+    intent(gateKey(1)),
+    result(gateKey(1), 'completed', 'review-failed'),
   ];
 }
 

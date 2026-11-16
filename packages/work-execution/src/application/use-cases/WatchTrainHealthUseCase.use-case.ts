@@ -251,18 +251,39 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     }
   }
 
-  /** The raw snapshot for the evaluated path, or why the watchdog is blind. */
+  /**
+   * The raw snapshot for the evaluated path, or why the watchdog is blind.
+   * Bounded by its own call budget, not by the adapter's cooperation: an
+   * already-exhausted budget skips the port call entirely, and a port call
+   * that outlives its timeout answers `state-read-timed-out` instead of
+   * hanging this "bounded pass" on an adapter that never resolves.
+   */
   private async readState(
     validated: ValidatedRequest,
     nowIso: string,
   ): Promise<{ outcome: 'ok'; snapshot: unknown } | { outcome: 'blind'; reasonCode: string }> {
+    const readBudget = await this.budget(validated.deadlineIso);
+    if (!readBudget.ok) {
+      return { outcome: 'blind', reasonCode: 'state-unavailable' };
+    }
+    if (!readBudget.allowed) {
+      return { outcome: 'blind', reasonCode: 'state-budget-exhausted' };
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const read: unknown = await this.deps.state.readTrainHealthState({
+      const pending = this.deps.state.readTrainHealthState({
         repository: validated.repository,
         repoDigest: validated.repoDigest,
         nowIso,
         deadlineIso: validated.deadlineIso,
       });
+      pending.catch(() => {
+        // The race consumes the rejection; this keeps a late failure unhandled.
+      });
+      const bounded = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('state-read-timeout')), readBudget.timeoutMs);
+      });
+      const read: unknown = await Promise.race([pending, bounded]);
       const outcome = isPlainObject(read) ? ownValue(read, 'outcome') : undefined;
       if (outcome === 'budget-exhausted') {
         return { outcome: 'blind', reasonCode: 'state-budget-exhausted' };
@@ -271,8 +292,13 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
         return { outcome: 'ok', snapshot: ownValue(read, 'snapshot') };
       }
       return { outcome: 'blind', reasonCode: 'state-unavailable' };
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.message === 'state-read-timeout') {
+        return { outcome: 'blind', reasonCode: 'state-read-timed-out' };
+      }
       return { outcome: 'blind', reasonCode: 'state-unavailable' };
+    } finally {
+      clearTimeout(timer);
     }
   }
 

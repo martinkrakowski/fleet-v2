@@ -22,7 +22,7 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { parseChainName, parseChainRepository } from '../../domain/chain-records.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
-import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isConductorHalted, isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { computeCallBudget, DAEMON_CALL_MIN_REMAINING_MS } from '../../domain/daemon-tick.js';
 import type {
   SweepChainsBranchReport,
@@ -30,6 +30,7 @@ import type {
   SweepChainsResult,
 } from '../ports/in/SweepChainsPort.in-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeForgeActionPort } from '../ports/out/MergeForgeActionPort.out-port.js';
 
 const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
@@ -189,6 +190,33 @@ function isSweepRefusal(value: unknown): value is SweepRefusal {
   return typeof value === 'object' && value !== null && 'kind' in value;
 }
 
+/**
+ * The fail-closed halt read (plan §3.7): an absent dependency keeps today's
+ * behaviour; a provided port without `read`, a throw, and any answer that is
+ * not an object with `state: 'clear'` read as halted.
+ */
+async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
+  if (halt === undefined) {
+    return false;
+  }
+  if (typeof halt.read !== 'function') {
+    return true;
+  }
+  try {
+    const state = await halt.read();
+    if (typeof state !== 'object' || state === null || Array.isArray(state)) {
+      return true;
+    }
+    const tag = (state as { readonly state?: unknown }).state;
+    if (tag === 'clear') {
+      return isConductorHalted(state as Parameters<typeof isConductorHalted>[0]);
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 function refusalResult(refusal: SweepRefusal): SweepChainsResult {
   if (refusal.kind === 'branch') {
     return {
@@ -318,6 +346,12 @@ export class SweepChainsUseCase implements SweepChainsPort {
       readonly chains: Pick<ChainRepositoryPort, 'listChains' | 'recordChainSwept'>;
       readonly forge: MergeForgeActionPort;
       readonly now: () => string;
+      /**
+       * The conductor halt read (plan §3.7). Absent, today's behaviour stands;
+       * provided but unreadable, off-contract or halted, an apply-mode sweep
+       * refuses before any delete and before any swept mark.
+       */
+      readonly halt?: Pick<ConductorHaltPort, 'read'>;
     },
   ) {}
 
@@ -494,6 +528,11 @@ export class SweepChainsUseCase implements SweepChainsPort {
   }
 
   private async apply(command: ValidCommand, planned: readonly PlannedChain[]): Promise<SweepChainsResult> {
+    if (await isHalted(this.deps.halt)) {
+      // Refused before any delete and before any swept mark; the halt is read
+      // once here, never again after a delete was sent.
+      return refusalResult({ kind: 'plain', reasonCode: 'halted' });
+    }
     try {
       if (typeof this.deps.forge?.isConfigured !== 'function' || this.deps.forge.isConfigured() === false) {
         return refusalResult({ kind: 'plain', reasonCode: 'forge-not-configured' });

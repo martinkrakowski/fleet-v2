@@ -23,7 +23,7 @@ import {
   parseChainRepository,
 } from '../../domain/chain-records.js';
 import type { ChainRecord } from '../../domain/chain-records.js';
-import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isConductorHalted, isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { computeCallBudget, DAEMON_CALL_MIN_REMAINING_MS } from '../../domain/daemon-tick.js';
 import type {
   RefreshChainsChainReport,
@@ -33,6 +33,7 @@ import type {
 } from '../ports/in/RefreshChainsPort.in-port.js';
 import type { ChainAttentionPort } from '../ports/out/ChainAttentionPort.out-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeBranchHeadResult, MergeForgeActionPort, MergeForgeActionResult } from '../ports/out/MergeForgeActionPort.out-port.js';
 
 const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
@@ -113,6 +114,12 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       readonly chains: ChainRepositoryPort;
       readonly forge: MergeForgeActionPort;
       readonly attention: ChainAttentionPort;
+      /**
+       * The conductor halt read (plan §3.7). Absent, today's behaviour stands;
+       * provided but unreadable, off-contract or halted, the pass refuses
+       * before any forge call or intent write.
+       */
+      readonly halt?: Pick<ConductorHaltPort, 'read'>;
       readonly now?: () => string;
       /** `live` writes and is accepted only when passed explicitly; an omitted or unknown mode is `shadow` (observe only: no intent, no forge write, no attention). */
       readonly mode?: 'shadow' | 'live';
@@ -144,6 +151,33 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     }).allowed;
   }
 
+  /**
+   * The fail-closed halt read (plan §3.7): an absent dependency keeps today's
+   * behaviour; a provided port without `read`, a throw, and any answer that is
+   * not an object with `state: 'clear'` read as halted.
+   */
+  private async isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
+    if (halt === undefined) {
+      return false;
+    }
+    if (typeof halt.read !== 'function') {
+      return true;
+    }
+    try {
+      const state = await halt.read();
+      if (typeof state !== 'object' || state === null || Array.isArray(state)) {
+        return true;
+      }
+      const tag = (state as { readonly state?: unknown }).state;
+      if (tag === 'clear') {
+        return isConductorHalted(state as Parameters<typeof isConductorHalted>[0]);
+      }
+      return true;
+    } catch {
+      return true;
+    }
+  }
+
   private async run(command: ValidCommand): Promise<RefreshChainsResult> {
     const listed = await this.deps.chains.listChains({
       repository: command.repository,
@@ -151,6 +185,11 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     });
     if (listed.status === 'unreadable') {
       return { outcome: 'skipped', reasonCode: 'chains-unreadable', chains: [] };
+    }
+    if (await this.isHalted(this.deps.halt)) {
+      // Refused before any forge call and before any intent or outcome write;
+      // the halt is read once here, never again inside the per-chain loop.
+      return { outcome: 'refused', reasonCode: 'halted', chains: [] };
     }
     const head = await this.readMainHead(command);
     if (head.outcome === 'not-found') {

@@ -20,7 +20,7 @@ import {
   parseChainRepository,
 } from '../../domain/chain-records.js';
 import type { ChainRecord, ChainRepositoryRef } from '../../domain/chain-records.js';
-import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isConductorHalted, isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type {
   StartChainCommand,
   StartChainDecision,
@@ -29,6 +29,7 @@ import type {
 } from '../ports/in/StartChainPort.in-port.js';
 import { START_CHAIN_REASONS } from '../ports/in/StartChainPort.in-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeForgeActionPort } from '../ports/out/MergeForgeActionPort.out-port.js';
 
 interface ValidCommand {
@@ -100,6 +101,33 @@ function unresolved(record: ChainRecord | null = null): StartChainDecision {
   return { outcome: 'unknown', reason: 'unresolved', record };
 }
 
+/**
+ * The fail-closed halt read (plan §3.7): an absent dependency keeps today's
+ * behaviour; a provided port without `read`, a throw, and any answer that is
+ * not an object with `state: 'clear'` read as halted.
+ */
+async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
+  if (halt === undefined) {
+    return false;
+  }
+  if (typeof halt.read !== 'function') {
+    return true;
+  }
+  try {
+    const state = await halt.read();
+    if (typeof state !== 'object' || state === null || Array.isArray(state)) {
+      return true;
+    }
+    const tag = (state as { readonly state?: unknown }).state;
+    if (tag === 'clear') {
+      return isConductorHalted(state as Parameters<typeof isConductorHalted>[0]);
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 /** The recorded refusal reason when it is one of this port's codes; a generic code otherwise. */
 function recordedRefusalReason(record: ChainRecord): StartChainReason {
   const reason = record.reason;
@@ -110,7 +138,18 @@ function recordedRefusalReason(record: ChainRecord): StartChainReason {
 }
 
 export class StartChainUseCase implements StartChainPort {
-  constructor(private readonly deps: { readonly chains: ChainRepositoryPort; readonly forge: MergeForgeActionPort }) {}
+  constructor(
+    private readonly deps: {
+      readonly chains: ChainRepositoryPort;
+      readonly forge: MergeForgeActionPort;
+      /**
+       * The conductor halt read (plan §3.7). Absent, today's behaviour stands;
+       * provided but unreadable, off-contract or halted, a start refuses
+       * before the intent write and before any forge call.
+       */
+      readonly halt?: Pick<ConductorHaltPort, 'read'>;
+    },
+  ) {}
 
   async startChain(command: StartChainCommand): Promise<StartChainDecision> {
     try {
@@ -164,6 +203,11 @@ export class StartChainUseCase implements StartChainPort {
   }
 
   private async startFresh(command: ValidCommand): Promise<StartChainDecision> {
+    if (await isHalted(this.deps.halt)) {
+      // Refused before the intent write and before any forge call; the halt is
+      // read once here, never again after a forge action was sent.
+      return refused('halted');
+    }
     const created = createChainRecord({
       repository: command.repository,
       chainName: command.chainName,
@@ -189,6 +233,11 @@ export class StartChainUseCase implements StartChainPort {
 
   /** The same key found at `intent-recorded`: a crash or an ambiguous answer left it open; read before any write. */
   private async recover(command: ValidCommand, record: ChainRecord): Promise<StartChainDecision> {
+    if (await isHalted(this.deps.halt)) {
+      // Refused before the branch-head read and before any forge call; an
+      // already-sent forge action is never rolled back (see settleFromHead).
+      return refused('halted', record);
+    }
     const head = await this.readHead(command);
     if (head.outcome === 'not-found') {
       // The branch is provably absent, so the earlier attempt wrote nothing. Retrying is safe: the create is

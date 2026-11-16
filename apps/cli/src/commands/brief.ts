@@ -155,8 +155,8 @@ function readLength(value: object): number {
   return length;
 }
 
-function copyArray(value: object, depth: number, budget: CopyBudget): unknown[] {
-  const length = readLength(value);
+function copyArray(value: object, depth: number, budget: CopyBudget, knownLength?: number): unknown[] {
+  const length = knownLength ?? readLength(value);
   const out: unknown[] = [];
   for (let index = 0; index < length; index += 1) {
     out.push(copyNode(ownDataValue(value, String(index)), depth + 1, budget));
@@ -182,7 +182,7 @@ function copyRecord(value: object, depth: number, budget: CopyBudget): Record<st
   return out;
 }
 
-function copyNode(value: unknown, depth: number, budget: CopyBudget): unknown {
+function copyNode(value: unknown, depth: number, budget: CopyBudget, knownLength?: number): unknown {
   budget.nodes += 1;
   if (depth > COPY_MAX_DEPTH || budget.nodes > COPY_MAX_NODES) {
     return refuseUnreadable();
@@ -196,13 +196,13 @@ function copyNode(value: unknown, depth: number, budget: CopyBudget): unknown {
   if (typeof value !== 'object') {
     return refuseUnreadable();
   }
-  return Array.isArray(value) ? copyArray(value, depth, budget) : copyRecord(value, depth, budget);
+  return Array.isArray(value) ? copyArray(value, depth, budget, knownLength) : copyRecord(value, depth, budget);
 }
 
 /** Copy one untrusted value into fresh plain containers, or refuse it as usage. */
-function copyUntrusted<T>(value: T): T {
+function copyUntrusted<T>(value: T, knownLength?: number): T {
   try {
-    return copyNode(value, 0, { nodes: 0 }) as T;
+    return copyNode(value, 0, { nodes: 0 }, knownLength) as T;
   } catch {
     return refuseUnreadable();
   }
@@ -327,7 +327,7 @@ function readFactsList(read: ArgumentReader): readonly unknown[] {
   if (length > FACT_PACK_MAX_FACTS) {
     throw new CliUsageError('brief author accepts at most 32 facts');
   }
-  return copyUntrusted(source) as unknown[];
+  return copyUntrusted(source, length) as unknown[];
 }
 
 function malformedFact(index: number): CliUsageError {

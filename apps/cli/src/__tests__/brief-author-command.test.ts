@@ -603,6 +603,28 @@ describe('brief author', () => {
     expect(authorCalls).toHaveLength(0);
   });
 
+  it('a valid facts array has its length read exactly once', async () => {
+    let lengthReads = 0;
+    const counted = new Proxy([{ kind: 'file-list', label: 'Sources', pathPrefix: 'src' }], {
+      get(target, key, receiver) {
+        if (key === 'length') {
+          lengthReads += 1;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'length') {
+          lengthReads += 1;
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const { runtime, authorCalls } = guardsRuntime();
+    await briefCommands['author']({ ...validRecordPayload(), facts: counted }, runtime);
+    expect(authorCalls).toHaveLength(1);
+    expect(lengthReads).toBe(1);
+  });
+
   it('with both seatTool and contextDecisions invalid the seat-tool error is reported', async () => {
     const { io, stderr } = capturingIo();
     const { runtime, authorCalls } = guardsRuntime();

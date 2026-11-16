@@ -23,6 +23,7 @@ import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain
 import type { ReviewTally } from '../../domain/review-selection.js';
 import {
   decideReviewReceiptOutcome,
+  isAttemptReceiptSubject,
   latestReceiptPerReviewer,
   reviewKindOf,
   tallyReviews,
@@ -242,7 +243,7 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly A
       }
       continue;
     }
-    if (reviewKindOf(receipt) === 'code-review') {
+    if (reviewKindOf(receipt) === 'code-review' && isAttemptReceiptSubject(receipt)) {
       passing = true;
     }
   }

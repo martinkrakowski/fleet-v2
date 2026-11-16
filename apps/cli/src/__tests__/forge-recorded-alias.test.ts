@@ -222,11 +222,17 @@ describe('forge head verification resolves the recorded host through the helper'
       [
         'ssh',
         [
+          '-o',
+          'BatchMode=yes',
+          '-o',
+          'ConnectTimeout=15',
           'lane.example',
           '--',
-          expect.stringContaining(
-            `'git' '-C' '${WORKTREE_PATH}' 'rev-parse' 'HEAD'`,
-          ),
+          'sh',
+          '-c',
+          "''\\''git'\\'' '\\''-C'\\'' '\\''" +
+            WORKTREE_PATH +
+            "'\\'' '\\''rev-parse'\\'' '\\''HEAD'\\'''",
         ],
         expect.any(Function),
       ],
@@ -303,9 +309,11 @@ describe('forge head verification resolves the recorded host through the helper'
 
     expect(result.outcome).toBe('refused');
     expect(execFileMock.mock.calls[0]![0]).toBe('ssh');
-    expect(execFileMock.mock.calls[0]![1]![0]).toBe('legacy.example');
+    expect(execFileMock.mock.calls[0]![1]![4]).toBe('legacy.example');
     expect(
-      execFileMock.mock.calls.some(([, args]) => (args as readonly string[])?.[0] === 'recorded-only.example'),
+      execFileMock.mock.calls.some(
+        ([, args]) => (args as readonly string[] | undefined)?.includes('recorded-only.example') === true,
+      ),
     ).toBe(false);
   });
 
@@ -350,11 +358,17 @@ describe('forge head verification resolves the recorded host through the helper'
       [
         'ssh',
         [
+          '-o',
+          'BatchMode=yes',
+          '-o',
+          'ConnectTimeout=15',
           'lane.example',
           '--',
-          expect.stringContaining(
-            `'git' '-C' '${WORKTREE_PATH}' 'rev-parse' 'HEAD'`,
-          ),
+          'sh',
+          '-c',
+          "''\\''git'\\'' '\\''-C'\\'' '\\''" +
+            WORKTREE_PATH +
+            "'\\'' '\\''rev-parse'\\'' '\\''HEAD'\\'''",
         ],
         expect.any(Function),
       ],
@@ -434,11 +448,17 @@ describe('forge head verification resolves the recorded host through the helper'
       [
         'ssh',
         [
+          '-o',
+          'BatchMode=yes',
+          '-o',
+          'ConnectTimeout=15',
           'lane.example',
           '--',
-          expect.stringContaining(
-            `'git' '-C' '${WORKTREE_PATH}' 'rev-parse' 'HEAD'`,
-          ),
+          'sh',
+          '-c',
+          "''\\''git'\\'' '\\''-C'\\'' '\\''" +
+            WORKTREE_PATH +
+            "'\\'' '\\''rev-parse'\\'' '\\''HEAD'\\'''",
         ],
         expect.any(Function),
       ],

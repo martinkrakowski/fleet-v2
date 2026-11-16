@@ -52,8 +52,17 @@ describe('apps/cli readGitHead SSH host validation', () => {
     expect(execFileMock).toHaveBeenCalled();
     const [file, args] = execFileMock.mock.calls[0] as [string, readonly string[]];
     expect(file).toBe('ssh');
-    expect(args[0]).toBe('lanehost');
-    expect(args[1]).toBe('--');
+    expect(args).toEqual([
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=15',
+      'lanehost',
+      '--',
+      'sh',
+      '-c',
+      "''\\''git'\\'' '\\''-C'\\'' '\\''/nonexistent/remote/worktree'\\'' '\\''rev-parse'\\'' '\\''HEAD'\\'''",
+    ]);
   });
 
   it('refuses verifyCurrentHeadSha with unsafe worktreeSshHost in runtime', async () => {

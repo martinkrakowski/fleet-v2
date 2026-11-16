@@ -591,21 +591,38 @@ export function readGitHead(worktreePath: string, sshHost?: string): Promise<str
   return readGitHeadLocally(worktreePath);
 }
 
-/** Read HEAD through the reviewed ssh alias (a worktree on another host). */
+/**
+ * Read HEAD through the reviewed ssh alias (a worktree on another host). The
+ * login shell parses only `sh -c` plus one single-quoted string; the remote
+ * argv is `['sh', '-c', <twice-quoted command line>], the twin of
+ * `posixQuote` and `sshArgvFor` in
+ * packages/work-execution/src/infrastructure/adapters/SshExecutor.adapter.ts.
+ * The remote programs must stay PATH executables, not login-shell functions
+ * or builtins specific to the login shell: the login shell starts first and
+ * `sh` inherits only its exported environment. fish and csh are not
+ * supported, before or after this change.
+ */
 export function readGitHeadOverSsh(worktreePath: string, sshHost: string): Promise<string> {
   if (!isSafeSshHost(sshHost)) {
     return Promise.reject(new Error(`Refusing to read HEAD over SSH: unsafe host '${sshHost}'`));
   }
-  const invocation = {
-    command: 'ssh',
-    args: [
-      sshHost,
-      '--',
-      ['git', '-C', worktreePath, 'rev-parse', 'HEAD'].map(posixQuote).join(' '),
-    ],
-  };
+  if (worktreePath === '' || worktreePath.includes('\0')) {
+    return Promise.reject(new Error('Refusing to read HEAD over SSH: unusable worktree path'));
+  }
+  const words = ['git', '-C', worktreePath, 'rev-parse', 'HEAD'];
+  const args = [
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'ConnectTimeout=15',
+    sshHost,
+    '--',
+    'sh',
+    '-c',
+    posixQuote(words.map(posixQuote).join(' ')),
+  ];
   return new Promise((resolve, reject) => {
-    execFile(invocation.command, invocation.args, { encoding: 'utf8' }, (error, stdout) => {
+    execFile('ssh', args, { encoding: 'utf8', timeout: 60_000 }, (error, stdout) => {
       if (error === null) {
         resolve(String(stdout).trim());
         return;

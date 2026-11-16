@@ -17,7 +17,10 @@ import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-po
 import type { ConductorHaltState } from '../../../domain/conductor-halt.js';
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
-import { MERGE_QUEUE_ENTRY_VERSION } from '../../../domain/merge-queue-records.js';
+import {
+  MERGE_QUEUE_ENTRY_VERSION,
+  MERGE_QUEUE_ENTRY_V2_VERSION,
+} from '../../../domain/merge-queue-records.js';
 import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import type { MergeRepoPolicy } from '../../../domain/merge-queue-decider.js';
@@ -204,6 +207,106 @@ const greenForge: ReadForgeMergeResult = {
   contexts: greenContexts(),
   unresolvedThreads: 0,
 };
+
+function makeChainEntry(): MergeQueueEntryRecord {
+  return makeEntry({ version: MERGE_QUEUE_ENTRY_V2_VERSION, baseBranch: 'chain/example' });
+}
+
+describe('RunMergePassUseCase observed base (OG-7)', () => {
+  it('a chain entry read on its own chain base journals would-merge', async () => {
+    const { useCase, deps, request } = makeUseCase([makeChainEntry()], {
+      ...greenForge,
+      baseRef: 'chain/example',
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-merge');
+    expect(await journalOf(deps.journal)).toHaveLength(2);
+  });
+
+  it('a chain entry whose read carries no base waits base-unobserved and journals nothing', async () => {
+    const { useCase, deps, request } = makeUseCase([makeChainEntry()], greenForge);
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('base-unobserved');
+    expect(await journalOf(deps.journal)).toHaveLength(0);
+  });
+
+  it('a chain entry read on main waits base-mismatch and journals nothing', async () => {
+    const { useCase, deps, request } = makeUseCase([makeChainEntry()], {
+      ...greenForge,
+      baseRef: 'main',
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('base-mismatch');
+    expect(await journalOf(deps.journal)).toHaveLength(0);
+  });
+
+  it('a main entry read on chain/example waits base-mismatch and journals nothing', async () => {
+    const { useCase, deps, request } = makeUseCase([makeEntry()], {
+      ...greenForge,
+      baseRef: 'chain/example',
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('base-mismatch');
+    expect(await journalOf(deps.journal)).toHaveLength(0);
+  });
+
+  it('a main entry read on main journals would-merge', async () => {
+    const { useCase, request } = makeUseCase([makeEntry()], {
+      ...greenForge,
+      baseRef: 'main',
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-merge');
+  });
+
+  it('a chain entry on its own base with a failed gate reports checks, not a base reason', async () => {
+    const { useCase, deps, request } = makeUseCase([makeChainEntry()], {
+      ...greenForge,
+      baseRef: 'chain/example',
+      contexts: [
+        { name: 'gate', state: 'FAILURE', isGreen: false, creatorLogin: null },
+        { name: 'premerge', state: 'SUCCESS', isGreen: true, creatorLogin: POSTER },
+      ],
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('checks');
+    expect(await journalOf(deps.journal)).toHaveLength(0);
+  });
+
+  it.each([42, null, '', 'Main', 'chain/Example'])(
+    'passes a malformed base %s through, and the decider waits facts-inconsistent',
+    async (value) => {
+      const { useCase, deps, request } = makeUseCase([makeEntry()], {
+        ...greenForge,
+        baseRef: value as unknown as string,
+      });
+
+      const result = await useCase.runMergePass(request);
+
+      expect(result.entries[0].decision).toBe('no-action');
+      expect(result.entries[0].reasonCode).toBe('facts-inconsistent');
+      expect(await journalOf(deps.journal)).toHaveLength(0);
+    },
+  );
+});
 
 describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
   it('journals one intent and one dry-run result for a green entry in shadow mode', async () => {

@@ -88,6 +88,7 @@ function greenPullRequest(): string {
           state: 'OPEN',
           headRefOid: HEAD,
           mergeStateStatus: 'CLEAN',
+          baseRefName: 'main',
           statusCheckRollup: {
             contexts: {
               pageInfo: { hasNextPage: false, endCursor: null },

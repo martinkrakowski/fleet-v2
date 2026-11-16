@@ -17,7 +17,11 @@ import type {
   RunMergePassResult,
 } from '../ports/in/RunMergePassPort.in-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
-import type { ForgeMergeReadPort, MergeContextSnapshot } from '../ports/out/ForgeMergeReadPort.out-port.js';
+import type {
+  ForgeMergeReadPort,
+  MergeContextSnapshot,
+  ReadForgeMergeResult,
+} from '../ports/out/ForgeMergeReadPort.out-port.js';
 import type { MergeNotificationPort } from '../ports/out/MergeNotificationPort.out-port.js';
 import type { MergeVerificationPort } from '../ports/out/MergeVerificationPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
@@ -34,8 +38,10 @@ import { isRequiredPassHalted } from './chain-pass-halt.js';
 import {
   findMergeQueueHead,
   orderMergeQueue,
+  MERGE_QUEUE_ENTRY_V2_VERSION,
   type MergeQueueEntryRecord,
 } from '../../domain/merge-queue-records.js';
+import { DEFAULT_BASE_BRANCH } from '../../domain/base-branch.js';
 import type { MergeVetoPort } from '../ports/out/MergeVetoPort.out-port.js';
 import type {
   MergeVetoStatePort,
@@ -205,6 +211,14 @@ function contextStateOf(snapshot: MergeContextSnapshot): MergeContextFact {
   return { state: 'failure', creatorLogin: snapshot.creatorLogin };
 }
 
+/** The observed-base fact: the key exists only when the forge read carried a base (OG-7). */
+function observedBaseFact(read: ReadForgeMergeResult): { readonly observedBaseBranch?: unknown } {
+  if (read.outcome !== 'ok' || read.baseRef === undefined) {
+    return {};
+  }
+  return { observedBaseBranch: read.baseRef };
+}
+
 export class RunMergePassUseCase implements RunMergePassPort {
   constructor(private readonly deps: RunMergePassDependencies) {}
 
@@ -254,9 +268,40 @@ export class RunMergePassUseCase implements RunMergePassPort {
     const repoRecords = records.filter(
       (record) => typeof record === 'object' && record !== null && record.repoDigest === request.repoDigest,
     );
-    const ordered = orderMergeQueue(repoRecords, request.repoDigest);
-    const head = findMergeQueueHead(ordered, request.repoDigest);
-    const live = selectEntriesForPass(ordered, head, Date.parse(this.deps.nowIso()));
+    // Each base partition is ordered and headed on its own (CO3b): an entry's
+    // base is the queue it belongs to, so the pass walks every partition the
+    // repository's records carry, never mixing chain entries into main's
+    // ordering. A record whose base cannot be read falls into main's
+    // partition and is dropped there by the ordinary per-record validation.
+    const partitions = new Map<string, MergeQueueEntryRecord[]>();
+    for (const record of repoRecords) {
+      const base =
+        record.version === MERGE_QUEUE_ENTRY_V2_VERSION && typeof record.baseBranch === 'string'
+          ? record.baseBranch
+          : DEFAULT_BASE_BRANCH;
+      const group = partitions.get(base);
+      if (group === undefined) {
+        partitions.set(base, [record]);
+      } else {
+        group.push(record);
+      }
+    }
+    const nowMs = Date.parse(this.deps.nowIso());
+    // Each selected entry keeps its own partition's head: the base decides the
+    // queue, so an entry is never judged against another partition's head.
+    const headsByEntryId = new Map<string, MergeQueueEntryRecord | null>();
+    const live: MergeQueueEntryRecord[] = [];
+    for (const [base, group] of partitions) {
+      const ordered = orderMergeQueue(group, request.repoDigest, base);
+      const head = findMergeQueueHead(ordered, request.repoDigest, base);
+      for (const entry of selectEntriesForPass(ordered, head, nowMs)) {
+        live.push(entry);
+        headsByEntryId.set(entry.entryId, head);
+      }
+    }
+    const headFor = (entry: MergeQueueEntryRecord): MergeQueueEntryRecord | null =>
+      headsByEntryId.get(entry.entryId) ?? null;
+
 
     // D-DT9: the budget is checked before every entry's outbound reads,
     // including the halt re-read below.
@@ -272,7 +317,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       // halt (fail closed).
       const halted = await isRequiredPassHalted(this.deps.halt);
       try {
-        entries.push(await this.actOnEntry(request, entry, head, halted, repoRecords));
+        entries.push(await this.actOnEntry(request, entry, headFor(entry), halted, repoRecords));
       } catch (error) {
         if (error instanceof MergePassBudgetExhausted) {
           return { outcome: 'budget-exhausted', reasonCode: null, entries };
@@ -936,6 +981,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       macosVerification,
       veto,
       lastForgeOutcome: undefined,
+      ...observedBaseFact(read),
     };
   }
 

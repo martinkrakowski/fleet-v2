@@ -13,7 +13,7 @@ import type {
   DoctorableInstallation,
   RunDoctorOptions,
 } from '../run-doctor.js';
-import { createNodeDoctorProbes } from '../probes-node.js';
+import { createNodeDoctorProbes, LOGIN_SHELL_CANARY } from '../probes-node.js';
 
 /** A v2 model: one local runner host, one ssh verifier, two tools, two seats. */
 function sampleModel(overrides?: {
@@ -152,6 +152,10 @@ function fakeProbes(
         behindCount: 0,
         installRootName: 'fleet-install',
       };
+    },
+    loginShell: async (host) => {
+      calls.push(`loginShell:${host}`);
+      return 'intact';
     },
     ...overrides,
   };
@@ -665,6 +669,9 @@ describe('runDoctor', () => {
       },
       pinnedBuild: async () => {
         throw new Error('pinned-build exploded');
+      },
+      loginShell: async () => {
+        throw new Error('shell exploded');
       },
     };
     const { probes } = fakeProbes(throwing);
@@ -1864,6 +1871,219 @@ describe('runDoctor CI runner slots (OG-28c)', () => {
       for (const doctorLine of lines) {
         expect(JSON.stringify(doctorLine)).not.toContain(sentinel);
       }
+    }
+  });
+});
+
+describe('runDoctor login-shell canary (SHP1)', () => {
+  const shellLines = (lines: readonly DoctorLine[]) =>
+    lines.filter((doctorLine) => doctorLine.check === 'login-shell');
+  const hostChecks = (lines: readonly DoctorLine[], subject: string) =>
+    lines
+      .filter((doctorLine) => doctorLine.scope === 'host' && doctorLine.subject === subject)
+      .map((doctorLine) => `${doctorLine.check}:${doctorLine.status}`);
+  const answering = (value: unknown) =>
+    (async () => value) as unknown as NonNullable<DoctorProbes['loginShell']>;
+  const unknownLine = (detail: string) => ({
+    scope: 'host',
+    subject: 'verifier-host',
+    check: 'login-shell',
+    status: 'UNKNOWN',
+    detail,
+  });
+
+  it('reports PASS first among the ssh host lines and no login-shell line for the local host', async () => {
+    const { probes } = fakeProbes();
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(shellLines(lines)).toEqual([
+      {
+        scope: 'host',
+        subject: 'verifier-host',
+        check: 'login-shell',
+        status: 'PASS',
+        detail: 'login shell passes sh -c intact via verifier-host',
+      },
+    ]);
+    expect(hostChecks(lines, 'verifier-host')).toEqual([
+      'login-shell:PASS',
+      'reachable:PASS',
+      'command-sh:PASS',
+      'command-nc:PASS',
+      'command-curl:PASS',
+      'command-ssh:PASS',
+      'worktree-root-writable:PASS',
+    ]);
+    expect(doctorExitCode(lines)).toBe(0);
+  });
+
+  it('calls the canary before every other probe, once per ssh host and never for a local host', async () => {
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(calls[0]).toBe('loginShell:verifier-host');
+    expect(calls.filter((call) => call.startsWith('loginShell:'))).toEqual([
+      'loginShell:verifier-host',
+    ]);
+    expect(lines.length).toBeGreaterThan(0);
+    expect(calls.indexOf('serverProbe:local:4096')).toBeGreaterThan(0);
+  });
+
+  it('reports FAIL, leaves the host remote lines UNKNOWN and unprobed, and exits 1', async () => {
+    const model = sampleModel({
+      host: {
+        transport: 'ssh',
+        sshAlias: 'ci-alias',
+        ciRunnerSlots: [{ name: 'slot-1', unit: 'fleet-ci@1.service' }],
+      },
+    });
+
+    const intactSlotHosts: string[] = [];
+    const intact = fakeProbes({
+      loginShell: answering('intact'),
+      ciRunnerSlot: async (host) => {
+        intactSlotHosts.push(host);
+        return 'active';
+      },
+    });
+    const intactLines = await collect(loadedResult(model), intact.probes);
+    const intactChecks = hostChecks(intactLines, 'main');
+
+    const mangledSlotHosts: string[] = [];
+    const mangled = fakeProbes({
+      loginShell: async (host) => (host === 'ci-alias' ? 'mangled' : 'intact'),
+      ciRunnerSlot: async (host) => {
+        mangledSlotHosts.push(host);
+        return 'active';
+      },
+    });
+    const lines = await collect(loadedResult(model), mangled.probes);
+
+    expect(hostChecks(lines, 'main')).toEqual([
+      'login-shell:FAIL',
+      'reachable:UNKNOWN',
+      'command-sh:UNKNOWN',
+      'command-nc:UNKNOWN',
+      'command-curl:UNKNOWN',
+      'command-ssh:UNKNOWN',
+      'worktree-root-writable:UNKNOWN',
+      'runner-capabilities:PASS',
+      'gate-slot:PASS',
+      'ci-runner-slot-1:UNKNOWN',
+      // The runner host's opencode server answer is not gated by the canary
+      // (that is SHP1b); it is a host line for `main` and follows the slots.
+      'server-answers:PASS',
+    ]);
+    const mainShellLine = lines.find(
+      (doctorLine) => doctorLine.scope === 'host' && doctorLine.subject === 'main' && doctorLine.check === 'login-shell',
+    );
+    expect(mainShellLine?.detail).toBe(
+      "login shell does not pass sh -c intact via ci-alias; this host's other lines are not trustworthy",
+    );
+    for (const doctorLine of lines) {
+      if (
+        doctorLine.scope === 'host' &&
+        doctorLine.subject === 'main' &&
+        doctorLine.status === 'UNKNOWN'
+      ) {
+        expect(doctorLine.detail).toBe('not probed: login shell does not pass sh -c intact');
+      }
+    }
+    expect(hostChecks(lines, 'main').map((entry) => entry.slice(0, entry.lastIndexOf(':')))).toEqual(
+      intactChecks.map((entry) => entry.slice(0, entry.lastIndexOf(':'))),
+    );
+    expect(
+      mangled.calls.filter((call) => /^(hostReachable|commandAvailable|worktreeRootWritable):ci-alias/.test(call)),
+    ).toEqual([]);
+    expect(mangledSlotHosts).toEqual([]);
+    expect(intactSlotHosts).toEqual(['ci-alias']);
+    expect(mangled.calls).toContain('hostReachable:verifier-host');
+    expect(hostChecks(lines, 'verifier-host')[0]).toBe('login-shell:PASS');
+    expect(doctorExitCode(lines)).toBe(1);
+  });
+
+  it('reports UNKNOWN and still probes the host when the canary throws, rejects or answers anything but intact or mangled', async () => {
+    const throwingSync = () => {
+      throw new Error('boom');
+    };
+    const throwingAsync = async () => {
+      throw new Error('boom');
+    };
+    for (const loginShell of [
+      throwingSync as unknown as NonNullable<DoctorProbes['loginShell']>,
+      throwingAsync,
+      answering('unknown'),
+      answering('bogus'),
+      answering(null),
+      answering(undefined),
+      answering(true),
+      answering(['intact']),
+      answering({ outcome: 'intact' }),
+      answering(new String('intact')),
+    ]) {
+      const { probes, calls } = fakeProbes({ loginShell });
+      const lines = await collect(loadedResult(sampleModel()), probes);
+      expect(shellLines(lines)).toEqual([unknownLine('login shell could not be checked via verifier-host')]);
+      expect(calls).toContain('hostReachable:verifier-host');
+      expect(hostChecks(lines, 'verifier-host')[1]).toBe('reachable:PASS');
+      expect(doctorExitCode(lines)).toBe(1);
+    }
+  });
+
+  it('reports UNKNOWN probe-not-available when the probes carry no loginShell or a non-function', async () => {
+    const base = fakeProbes();
+    const { loginShell: _omitted, ...withoutProbe } = base.probes;
+    void _omitted;
+    const missing = await collect(loadedResult(sampleModel()), withoutProbe as DoctorProbes);
+    expect(shellLines(missing)).toEqual([unknownLine('login shell probe not available')]);
+    expect(base.calls).toContain('hostReachable:verifier-host');
+    expect(doctorExitCode(missing)).toBe(1);
+
+    const { probes, calls } = fakeProbes({
+      loginShell: 'nope' as unknown as DoctorProbes['loginShell'],
+    });
+    const notAFunction = await collect(loadedResult(sampleModel()), probes);
+    expect(shellLines(notAFunction)).toEqual([unknownLine('login shell probe not available')]);
+    expect(calls).toContain('hostReachable:verifier-host');
+    expect(doctorExitCode(notAFunction)).toBe(1);
+  });
+
+  it('reports UNKNOWN when reading the loginShell port throws', async () => {
+    const hostile = {
+      ...fakeProbes().probes,
+      get loginShell(): never {
+        throw new Error('getter boom');
+      },
+    } as unknown as DoctorProbes;
+    const lines = await collect(loadedResult(sampleModel()), hostile);
+    expect(shellLines(lines)).toEqual([unknownLine('login shell could not be checked via verifier-host')]);
+    expect(hostChecks(lines, 'verifier-host')[1]).toBe('reachable:PASS');
+    expect(doctorExitCode(lines)).toBe(1);
+  });
+
+  it('never carries remote output into a DoctorLine and reports a polluted echo as FAIL (real probe path)', async () => {
+    const sentinel = ['sentinel', 'value', '7f3a'].join('-');
+    const probes = createNodeDoctorProbes({
+      localExecutor: {
+        async run() {
+          return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+        },
+      },
+      sshExecutor: {
+        async run() {
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: `${sentinel}\n${LOGIN_SHELL_CANARY}`,
+            stderr: sentinel,
+          };
+        },
+      },
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(shellLines(lines)).toHaveLength(1);
+    expect(shellLines(lines)[0]?.status).toBe('FAIL');
+    expect(hostChecks(lines, 'verifier-host')[1]).toBe('reachable:UNKNOWN');
+    for (const doctorLine of lines) {
+      expect(JSON.stringify(doctorLine)).not.toContain(sentinel);
     }
   });
 });

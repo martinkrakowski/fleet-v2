@@ -113,6 +113,7 @@ import {
   ListConductorPassesUseCase,
   ListLaneRunsUseCase,
   ReapLaneWorktreesUseCase,
+  ReapOrphanReservationsUseCase,
   ReapOrphanSessionsUseCase,
   ReapZombiesUseCase,
   ReaperFindingRepositoryAdapter,
@@ -878,6 +879,10 @@ export interface FleetCliRuntime {
     readonly reapLaneWorktrees: ReapLaneWorktreesUseCase;
     /** EX-4: the operator-opt-in orphan-session reap (conductor reap --sessions). */
     readonly reapOrphanSessions: ReapOrphanSessionsUseCase;
+    /** OG22b: the operator-opt-in orphan-reservation reap (conductor reap --reservations --yes). */
+    readonly reapOrphanReservations: ReapOrphanReservationsUseCase;
+    /** OG22b: the same reap over read-only stores, used by --dry-run; it can write nothing. */
+    readonly reapOrphanReservationsDryRun: ReapOrphanReservationsUseCase;
     /** KW4b': the zombie reaper pass. */
     readonly reapZombies: ReapZombiesUseCase;
     /** KW4b': the reaper's findings store (file-backed with a state dir). */

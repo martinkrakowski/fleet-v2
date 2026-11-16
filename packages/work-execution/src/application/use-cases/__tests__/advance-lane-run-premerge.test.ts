@@ -986,4 +986,185 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
       expect(results[0]).toMatchObject({ outcome: 'completed', reasonCode: 'premerge-failure' });
     });
   });
+  describe('G2: premerge pending and head-match pinning', () => {
+    const HEAD_B = 'b'.repeat(40);
+    const HEAD_B12 = 'b'.repeat(12);
+
+    function acceptKeyFor(head12: string, round: number): string {
+      return `${RUN_ID}/r${round}/accept/0@${head12}`;
+    }
+
+    function premergeKeyFor(head12: string, round: number): string {
+      const built = laneRunPremergeKey(RUN_ID, round, head12);
+      expect(built.ok).toBe(true);
+      if (!built.ok) {
+        throw new Error('fixture must build a premerge key');
+      }
+      return built.key;
+    }
+
+    /** Point the forge PR read at another head (makeHarness hardcodes `COMMIT`). */
+    function forgeHead(harness: Harness, headSha: string): void {
+      const original = harness.deps.forgeRead!;
+      const forgeRead = {
+        ...original,
+        readPullRequest: async (
+          ...args: Parameters<typeof original.readPullRequest>
+        ): Promise<Awaited<ReturnType<typeof original.readPullRequest>>> => {
+          const result = await original.readPullRequest(...args);
+          if (result.outcome !== 'found') {
+            return result;
+          }
+          return { ...result, pullRequest: { ...result.pullRequest, headSha } };
+        },
+      };
+      (harness.deps as { forgeRead: typeof forgeRead }).forgeRead = forgeRead;
+    }
+
+    /** A round-1 fix run whose collected head is HEAD_B, with both attempts seeded. */
+    async function fixRoundHarness(
+      options: { readonly premergeMode?: unknown } = {},
+    ): Promise<Harness> {
+      const fixAttempt = attemptFixture({
+        id: 'attempt-fix-1',
+        kind: 'fix',
+        fixNumber: 1,
+        priorAttemptId: 'attempt-example-1',
+        artifacts: { ...COLLECTED_ARTIFACTS, headCommit: HEAD_B },
+      });
+      const record = runRecord({
+        round: 1,
+        attemptIds: ['attempt-example-1', 'attempt-fix-1'],
+        cursors: { 'first-pass': 0, fix: 0, review: null },
+      });
+      const harness = await makeHarness(record, [attemptFixture(), fixAttempt], options);
+      forgeHead(harness, HEAD_B);
+      // The fix attempt's dispatch intent is what places it at round 1; without
+      // it the decider reads the attempt's round as 0 and waits facts-inconsistent.
+      const placed = buildLaneRunStepKey({
+        runId: RUN_ID, round: 1, step: 'dispatch', seatIndex: 0, attemptOrdinal: 2, head12: null, retry: null,
+      });
+      expect(placed.ok).toBe(true);
+      if (!placed.ok) {
+        throw new Error('fixture must build a dispatch key');
+      }
+      await appendIntent(harness, placed.key, 'attempt-fix-1', NOW);
+      await appendResult(harness, placed.key, 'completed', 'dispatch-started', NOW);
+      await conduct(harness, 'merging', NOW);
+      await appendIntent(harness, acceptKeyFor(HEAD_B12, 1), null, NOW);
+      await appendResult(harness, acceptKeyFor(HEAD_B12, 1), 'completed', 'accepted', NOW);
+      harness.setReceiptsAnswer({ outcome: 'passed', receiptsId: RECEIPT_ID, assessedHeadSha: HEAD_B });
+      harness.setForgeAnswer({ outcome: 'executed', headSha: HEAD_B });
+      return harness;
+    }
+
+    /** A round-0 run whose collected attempt head is HEAD_B (no fix round needed). */
+    async function headBHarness(
+      options: { readonly premergeMode?: unknown } = {},
+    ): Promise<Harness> {
+      const attempt = attemptFixture({
+        artifacts: { ...COLLECTED_ARTIFACTS, headCommit: HEAD_B },
+      });
+      const harness = await makeHarness(runRecord(), [attempt], options);
+      forgeHead(harness, HEAD_B);
+      await conduct(harness, 'merging', NOW);
+      // The accept is journalled at the run's actual head (B); a key at another
+      // head would read as a head change after acceptance (G7) and re-enter gating.
+      await appendIntent(harness, acceptKeyFor(HEAD_B12, 0), null, NOW);
+      await appendResult(harness, acceptKeyFor(HEAD_B12, 0), 'completed', 'accepted', NOW);
+      harness.setReceiptsAnswer({ outcome: 'passed', receiptsId: RECEIPT_ID, assessedHeadSha: HEAD_B });
+      harness.setForgeAnswer({ outcome: 'executed', headSha: HEAD_B });
+      return harness;
+    }
+
+    it('G2 (1): a fix round after a failed review posts premerge pending for head B and never success', async () => {
+      // Phase 1: the latest receipt is still the failed one for head A. It names
+      // another head, so it neither grants nor posts anything for head B.
+      const failedHarness = await fixRoundHarness();
+      failedHarness.setReceiptAnswer(failedReceipt([finding('a failed finding at head A', 1)]));
+      const failed = await advance(failedHarness);
+      expect(failed).toMatchObject({ outcome: 'acted', step: 'premerge', result: 'ambiguous', reasonCode: 'review-unknown' });
+      expect(failedHarness.grantRequests).toHaveLength(0);
+      expect(failedHarness.forgeRequests).toHaveLength(0);
+
+      // Phase 2 (a fresh fix-round run): no receipt exists for head B yet, so
+      // the hold posts pending at B under the round-1 key and never success.
+      const pendingHarness = await fixRoundHarness();
+      pendingHarness.setReceiptAnswer({ outcome: 'not-found' });
+      const result = await advance(pendingHarness);
+      expect(result).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+      expect(pendingHarness.forgeRequests).toHaveLength(1);
+      expect(pendingHarness.forgeRequests[0]).toMatchObject({
+        kind: 'post-status',
+        expectedHeadSha: HEAD_B,
+        status: { context: 'premerge', state: 'pending', description: 'waiting for the pre-merge review' },
+      });
+      expect(pendingHarness.forgeRequests.every((request) => request.status?.state !== 'success')).toBe(true);
+      const entries = await pendingHarness.runJournal.listForRun(RUN_ID);
+      expect(
+        entries.filter((entry) => entry.kind === 'intent' && entry.key === premergeKeyFor(HEAD_B12, 1)),
+      ).toHaveLength(1);
+    });
+
+    it('G2 (2): a passed receipt naming another head authorises no grant and no post under auto-attest', async () => {
+      const harness = await mergingHarness(runRecord(), { premergeMode: 'auto-attest' });
+      const passed = passedReceipt();
+      if (passed.outcome !== 'found') {
+        throw new Error('fixture');
+      }
+      harness.setReceiptAnswer({
+        outcome: 'found',
+        receipt: { ...passed.receipt, candidateHeadSha: HEAD_B },
+      });
+      const result = await advance(harness);
+      // The unreadable verdict appends `ambiguous` / `review-unknown` under the
+      // hold's key and parks on the next tick; either way it never posts.
+      expect(result).toMatchObject({ outcome: 'acted', step: 'premerge', result: 'ambiguous', reasonCode: 'review-unknown' });
+      expect(harness.grantRequests).toHaveLength(0);
+      expect(harness.forgeRequests).toHaveLength(0);
+    });
+
+    it('G2 (3): with premergeMode absent (human-gate), a prior passed receipt at another head never settles the hold', async () => {
+      // (a) head A's passed receipt returned for head B: zero grants, zero posts.
+      const carriedHarness = await headBHarness();
+      carriedHarness.setReceiptAnswer(passedReceipt());
+      await advance(carriedHarness);
+      expect(carriedHarness.grantRequests).toHaveLength(0);
+      expect(carriedHarness.forgeRequests).toHaveLength(0);
+
+      // (b) no receipt for head B: the pending hold posts at head B and never success.
+      const pendingHarness = await headBHarness();
+      pendingHarness.setReceiptAnswer({ outcome: 'not-found' });
+      const pending = await advance(pendingHarness);
+      expect(pending).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+      expect(pendingHarness.forgeRequests).toHaveLength(1);
+      expect(pendingHarness.forgeRequests[0]).toMatchObject({
+        kind: 'post-status',
+        expectedHeadSha: HEAD_B,
+        status: { context: 'premerge', state: 'pending', description: 'waiting for the pre-merge review' },
+      });
+
+      // (c) even once head B itself has a passed receipt, human-gate still holds pending.
+      const heldHarness = await headBHarness();
+      heldHarness.setReceiptAnswer({ outcome: 'not-found' });
+      expect(await advance(heldHarness)).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+      heldHarness.setReceiptAnswer({
+        outcome: 'found',
+        receipt: {
+          receiptId: 'pm-example-3',
+          requestId: null,
+          kind: 'pre-merge',
+          reviewerModel: 'reviewer-example-1',
+          candidateHeadSha: HEAD_B,
+          verdict: 'passed',
+          findings: [],
+        },
+      });
+      const held = await advance(heldHarness);
+      expect(held).toEqual({ outcome: 'waiting', reason: 'premerge-pending' });
+      expect(heldHarness.forgeRequests).toHaveLength(1);
+      expect(heldHarness.forgeRequests.every((request) => request.status?.state !== 'success')).toBe(true);
+      expect(heldHarness.grantRequests).toHaveLength(1);
+    });
+  });
 });

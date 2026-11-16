@@ -170,57 +170,41 @@ describe('laneRunReviewFact', () => {
   });
 });
 
+const NO_CONFIRMATION = { priorPassedAtHead: false, confirmingRetries: 0 };
+
 describe('laneRunReviewConfirmationFact', () => {
   it('returns no prior pass and no confirming retries when nothing ran at the head', () => {
-    expect(laneRunReviewConfirmationFact([], RUN_ID, 'brief-check', HEAD)).toEqual({
-      priorPassedAtHead: false,
-      confirmingRetries: 0,
-    });
+    expect(laneRunReviewConfirmationFact([], RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
   });
 
   it('returns no prior pass for a null head12', () => {
     const key = reviewKey('brief-check', { seatIndex: 0 });
     const entries = [intent(key), result(key, 'completed', 'review-passed')];
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', null)).toEqual({
-      priorPassedAtHead: false,
-      confirmingRetries: 0,
-    });
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', null)).toEqual(NO_CONFIRMATION);
   });
 
   it("returns no prior pass at another head's key", () => {
     const otherHeadKey = reviewKey('brief-check', { seatIndex: 0, head12: OTHER_HEAD });
     const entries = [intent(otherHeadKey), result(otherHeadKey, 'completed', 'review-passed')];
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({
-      priorPassedAtHead: false,
-      confirmingRetries: 0,
-    });
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
   });
 
   it("returns no prior pass for another run's entries", () => {
     const otherRunKey = reviewKey('brief-check', { runId: OTHER_RUN_ID, seatIndex: 0 });
     const entries = [intent(otherRunKey, { runId: OTHER_RUN_ID }), result(otherRunKey, 'completed', 'review-passed')];
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({
-      priorPassedAtHead: false,
-      confirmingRetries: 0,
-    });
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
   });
 
   it('returns no prior pass for another review kind', () => {
     const codeReviewKey = reviewKey('code-review', { seatIndex: 0 });
     const entries = [intent(codeReviewKey), result(codeReviewKey, 'completed', 'review-passed')];
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({
-      priorPassedAtHead: false,
-      confirmingRetries: 0,
-    });
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
   });
 
   it('returns no prior pass when the only verdict is a review-failed', () => {
     const key = reviewKey('brief-check', { seatIndex: 0 });
     const entries = [intent(key), result(key, 'completed', 'review-failed')];
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({
-      priorPassedAtHead: false,
-      confirmingRetries: 0,
-    });
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
   });
 
   it('reports a prior pass after a passed then a contradictory failed at the same head', () => {
@@ -280,10 +264,7 @@ describe('laneRunReviewConfirmationFact', () => {
     const sparse: LaneRunJournalEntryRecord[] = new Array(2);
     sparse[1] = validEntry;
     expect(() => laneRunReviewConfirmationFact(sparse, RUN_ID, 'brief-check', HEAD)).not.toThrow();
-    expect(laneRunReviewConfirmationFact(sparse, RUN_ID, 'brief-check', HEAD)).toEqual({
-      priorPassedAtHead: false,
-      confirmingRetries: 0,
-    });
+    expect(laneRunReviewConfirmationFact(sparse, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
   });
 
   it('never throws and fails closed on a non-plain object entry, prototype-polluting key, or throwing getter', () => {
@@ -301,23 +282,14 @@ describe('laneRunReviewConfirmationFact', () => {
     for (const hostile of cases) {
       const entries = [hostile as LaneRunJournalEntryRecord];
       expect(() => laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).not.toThrow();
-      expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({
-        priorPassedAtHead: false,
-        confirmingRetries: 0,
-      });
+      expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
     }
   });
 
   it('fails closed on a wrong-kind or empty head12 string', () => {
     const key = reviewKey('brief-check', { seatIndex: 0 });
     const entries = [intent(key), result(key, 'completed', 'review-passed')];
-    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', 'short')).toEqual({
-      priorPassedAtHead: false,
-      confirmingRetries: 0,
-    });
-    expect(laneRunReviewConfirmationFact('not-an-array' as unknown as LaneRunJournalEntryRecord[], RUN_ID, 'brief-check', HEAD)).toEqual({
-      priorPassedAtHead: false,
-      confirmingRetries: 0,
-    });
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', 'short')).toEqual(NO_CONFIRMATION);
+    expect(laneRunReviewConfirmationFact('not-an-array' as unknown as LaneRunJournalEntryRecord[], RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
   });
 });

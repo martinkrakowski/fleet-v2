@@ -9,7 +9,9 @@
 import type { LaneRunJournalEntryRecord } from './lane-run-journal.js';
 import { parseLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
+import { ownProp } from './lane-run-decider.js';
 import type { LaneRunReviewFact } from './lane-run-decider.js';
+import { isPlainRecordObject } from './record-schema-version.js';
 
 /** The review steps whose journal intents a review fact reads. */
 export type LaneRunReviewKind = 'brief-check' | 'code-review' | 'pre-merge';
@@ -111,27 +113,6 @@ const NO_CONFIRMATION_FACT: LaneRunReviewConfirmationFact = Object.freeze({
   priorPassedAtHead: false,
   confirmingRetries: 0,
 });
-
-/** Defensive plain-object check (see `lane-run-decider.ts`). */
-function isPlainRecordObject(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-/** Own-property descriptor read without invoking getters (see `lane-run-decider.ts`). */
-function ownProp(source: unknown, key: string): unknown {
-  try {
-    if (typeof source !== 'object' || source === null) {
-      return undefined;
-    }
-    return Object.getOwnPropertyDescriptor(source, key)?.value;
-  } catch {
-    return undefined;
-  }
-}
 
 /**
  * The latest non-`ambiguous` result entry for `key`'s reason code, read

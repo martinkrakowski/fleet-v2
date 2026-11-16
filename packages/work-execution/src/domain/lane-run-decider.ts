@@ -97,7 +97,7 @@ function isPlainRecordObject(value: unknown): value is Record<string, unknown> {
 }
 
 /** The receiver's own data property `key`, read without running any accessor. */
-function ownProp(source: unknown, key: string): unknown {
+export function ownProp(source: unknown, key: string): unknown {
   try {
     if (typeof source !== 'object' || source === null) {
       return undefined;

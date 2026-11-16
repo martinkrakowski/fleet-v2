@@ -141,7 +141,7 @@ describe('readGitHeadOverSsh argv and options', () => {
       '-c',
       "''\\''git'\\'' '\\''-C'\\'' '\\''/plain/path'\\'' '\\''rev-parse'\\'' '\\''HEAD'\\'''",
     ]);
-    expect(captured[0]!.options).toMatchObject({ encoding: 'utf8', timeout: 60_000 });
+    expect(captured[0]!.options).toEqual({ encoding: 'utf8', timeout: 60_000 });
   });
 
   it.each(pathKinds)('quotes the remote command line exactly twice for $name', async ({ path }) => {
@@ -158,7 +158,7 @@ describe('readGitHeadOverSsh argv and options', () => {
       '-c',
       twiceQuotedFor[path]!,
     ]);
-    expect(captured[0]!.options).toMatchObject({
+    expect(captured[0]!.options).toEqual({
       encoding: 'utf8',
       timeout: 60_000,
     });
@@ -169,7 +169,7 @@ describe('readGitHeadOverSsh argv and options', () => {
     expect(captured[0]!.args).toContain('-o');
     expect(captured[0]!.args).toContain('BatchMode=yes');
     expect(captured[0]!.args).toContain('ConnectTimeout=15');
-    expect(captured[0]!.options).toMatchObject({ timeout: 60_000 });
+    expect(captured[0]!.options).toEqual({ encoding: 'utf8', timeout: 60_000 });
   });
 });
 

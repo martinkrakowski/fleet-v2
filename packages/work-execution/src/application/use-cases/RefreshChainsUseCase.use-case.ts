@@ -23,7 +23,7 @@ import {
   parseChainRepository,
 } from '../../domain/chain-records.js';
 import type { ChainRecord } from '../../domain/chain-records.js';
-import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isZonedIsoDateTime, readConductorHaltRecord } from '../../domain/conductor-halt.js';
 import { computeCallBudget, DAEMON_CALL_MIN_REMAINING_MS } from '../../domain/daemon-tick.js';
 import type {
   RefreshChainsChainReport,
@@ -153,7 +153,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
   }
 
   /**
-   * The fail-closed halt read (plan §3.7, fix round 1): a missing dependency
+   * The fail-closed halt read (plan §3.7, fix rounds 1 and 2): a missing dependency
    * fails closed; a provided port without `read`, a throw, and any answer
    * that is not an object with `state: 'clear'` — or whose record does not
    * agree with that tag — read as halted.
@@ -181,11 +181,12 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       if (record === null) {
         return false;
       }
-      if (typeof record !== 'object' || Array.isArray(record)) {
-        return true;
-      }
-      const descriptor = Object.getOwnPropertyDescriptor(record, 'halted');
-      return descriptor === undefined || descriptor.value !== false;
+      // A clear marker is believed only when its record is a complete plain
+      // record the domain validator accepts with `halted: false`: version,
+      // `halted` and a zoned `changedAtIso` must all be present and valid.
+      // Anything else — a getter, a missing or invalid field — fails closed.
+      const read = readConductorHaltRecord(record);
+      return !(read.ok && read.record.halted === false);
     } catch {
       return true;
     }
@@ -230,6 +231,9 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
         break;
       }
       const decision = await this.refreshOne(command, record, head.headSha, chains);
+      if (decision === 'halted') {
+        return { outcome: 'refused', reasonCode: 'halted', chains };
+      }
       if (decision === 'budget-exhausted') {
         budgetHit = true;
         break;
@@ -292,7 +296,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     record: ChainRecord,
     mainSha: string,
     chains: RefreshChainsChainReport[],
-  ): Promise<'done' | 'budget-exhausted'> {
+  ): Promise<'done' | 'budget-exhausted' | 'halted'> {
     const key = chainRefreshKey(record.chainName, mainSha);
     if (key === null) {
       this.skip(chains, record.chainName, '');
@@ -314,6 +318,13 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     }
     if (!this.hasBudget(command.deadlineIso)) {
       return 'budget-exhausted';
+    }
+    // Recheck immediately before sending the merge action: the intent write
+    // and reread in prepare() awaited above, so a halt that appeared during
+    // preparation must not let the forge call proceed. The intent stays
+    // recorded (it is a journal write, not an action-implying forge call).
+    if (await this.isHalted(this.deps.halt)) {
+      return 'halted';
     }
     const forge = await this.forgeCall(command, record, key, mainSha);
     if (forge === 'budget-exhausted') {

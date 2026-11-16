@@ -20,7 +20,7 @@ import {
   parseChainRepository,
 } from '../../domain/chain-records.js';
 import type { ChainRecord, ChainRepositoryRef } from '../../domain/chain-records.js';
-import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isZonedIsoDateTime, readConductorHaltRecord } from '../../domain/conductor-halt.js';
 import type {
   StartChainCommand,
   StartChainDecision,
@@ -102,7 +102,7 @@ function unresolved(record: ChainRecord | null = null): StartChainDecision {
 }
 
 /**
- * The fail-closed halt read (plan §3.7, fix round 1): a missing dependency
+ * The fail-closed halt read (plan §3.7, fix rounds 1 and 2): a missing dependency
  * fails closed; a provided port without `read`, a throw, and any answer that
  * is not an object with `state: 'clear'` — or whose record does not agree
  * with that tag — read as halted.
@@ -124,7 +124,7 @@ async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean
       return true;
     }
     // `clear` is believed only when its record agrees: absent (null), or a
-    // plain record whose own `halted` is exactly false. Anything else — a
+    // complete plain record with `halted: false`. Anything else — a
     // malformed record, a getter, `halted: true` — fails closed.
     const record = (state as { readonly record?: unknown }).record;
     if (record === null) {
@@ -133,8 +133,12 @@ async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean
     if (typeof record !== 'object' || Array.isArray(record)) {
       return true;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(record, 'halted');
-    return descriptor === undefined || descriptor.value !== false;
+    // A clear marker is believed only when its record is a complete plain
+    // record the domain validator accepts with `halted: false`: version,
+    // `halted` and a zoned `changedAtIso` must all be present and valid.
+    // Anything else — a getter, a missing or invalid field — fails closed.
+    const read = readConductorHaltRecord(record);
+    return !(read.ok && read.record.halted === false);
   } catch {
     return true;
   }

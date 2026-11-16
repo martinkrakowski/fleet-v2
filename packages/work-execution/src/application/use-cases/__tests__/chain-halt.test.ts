@@ -196,6 +196,9 @@ const failClosedAnswers: readonly [string, HaltAnswer | Error][] = [
   ['a clear tag with a halted record', { state: 'clear', record: { halted: true } }],
   ['a clear tag with a malformed record', { state: 'clear', record: 'nope' }],
   ['a clear tag without a record', { state: 'clear' }],
+  ['a clear tag whose record has only halted false', { state: 'clear', record: { halted: false } }],
+  ['a clear tag whose record has the wrong version', { state: 'clear', record: { version: 2, halted: false, changedAtIso: NOW } }],
+  ['a clear tag whose record has an invalid timestamp', { state: 'clear', record: { version: 1, halted: false, changedAtIso: 'not-a-time' } }],
 ];
 
 const clearHalt = haltFake({ state: 'clear', record: null });
@@ -252,6 +255,26 @@ describe('RefreshChainsUseCase halt gating', () => {
     expect(forge.actionCalls).toBe(1);
     expect(repo.counts.recordChainRefreshIntent).toBe(1);
     expect(repo.counts.recordChainRefreshOutcome).toBe(1);
+  });
+
+  it('RefreshChainsUseCase rechecks the halt after preparation and before the merge action', async () => {
+    let reads = 0;
+    const halt: Pick<ConductorHaltPort, 'read'> = {
+      async read() {
+        reads += 1;
+        return reads >= 3 ? haltedState : { state: 'clear', record: null };
+      },
+    };
+    const { repo, forge, useCase } = makeRefresh({ halt });
+
+    const result = await useCase.runRefreshChains(refreshCommand);
+
+    // Reads: run() gate, loop recheck, then the post-preparation recheck —
+    // the halt appears during the intent write, so the forge call is never
+    // sent, while the intent already recorded stays.
+    expect(result).toEqual({ outcome: 'refused', reasonCode: 'halted', chains: [] });
+    expect(forge.actionCalls).toBe(0);
+    expect(repo.counts.recordChainRefreshOutcome).toBe(0);
   });
 
   it('reports an already-sent forge action as completed when halt appears mid-call', async () => {

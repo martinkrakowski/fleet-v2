@@ -52,6 +52,13 @@ describe('isReceiptAboutAssessment (CO18a7a)', () => {
     expect(isReceiptAboutAssessment(receipt({ projectId: 'proj-2' }), ATTEMPT_ASSESSMENT)).toBe(false);
   });
 
+  it('a receipt recorded on another assessment is not about the assessment, even at the same project, attempt and head', () => {
+    const thisAssessment = { id: 'asm-1', projectId: 'proj-1', attemptId: 'att-1' };
+    expect(isReceiptAboutAssessment(receipt({ assessmentId: 'asm-OTHER' }), thisAssessment)).toBe(false);
+    expect(isReceiptAboutAssessment(receipt({ assessmentId: 'asm-OTHER' }), ATTEMPT_ASSESSMENT)).toBe(false);
+    expect(isReceiptAboutAssessment(receipt({ assessmentId: 'asm-1' }), thisAssessment)).toBe(true);
+  });
+
   it('a chain subject is about the chain assessment of that project and chain name only', () => {
     const own = receipt({ attemptId: 'chain:proj-1:main', subject: chainSubject('main') });
     const other = receipt({ attemptId: 'chain:proj-1:main', subject: chainSubject('other') });

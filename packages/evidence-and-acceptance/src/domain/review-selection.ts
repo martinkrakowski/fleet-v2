@@ -508,7 +508,8 @@ function attemptIdOfSubject(subject: ReceiptSubject): string | null {
 
 /**
  * Whether a stored receipt is about the assessment that holds it (CO18a7a):
- * the receipt's own `projectId` and `attemptId` equal the assessment's, and
+ * the receipt's own `assessmentId`, `projectId` and `attemptId` equal the
+ * assessment's, and
  * its subject (`receiptSubjectOf`; an absent subject reads as the receipt's
  * own attempt) names the same project and stands for the same attempt id. A
  * receipt about another attempt, chain or brief is not evidence for this
@@ -524,7 +525,12 @@ export function isReceiptAboutAssessment(receipt: unknown, assessment: unknown):
     if (typeof projectId !== 'string' || typeof attemptId !== 'string' || attemptId.length === 0) {
       return false;
     }
-    if (ownProp(receipt, 'projectId') !== projectId || ownProp(receipt, 'attemptId') !== attemptId) {
+    const assessmentId = ownProp(assessment, 'id');
+    if (
+      ownProp(receipt, 'assessmentId') !== assessmentId ||
+      ownProp(receipt, 'projectId') !== projectId ||
+      ownProp(receipt, 'attemptId') !== attemptId
+    ) {
       return false;
     }
     const subject = receiptSubjectOf(receipt as { readonly subject?: unknown });

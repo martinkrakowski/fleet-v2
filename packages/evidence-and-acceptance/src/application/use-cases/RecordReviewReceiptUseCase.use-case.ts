@@ -213,20 +213,23 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
       return { outcome: 'rejected', reason: placeholderEvidenceRefusal('Review receipt', placeholderField) };
     }
 
-    const aggregate = EvidenceAssessment.fromRecord(assessment);
-    // KF-33b2: a duplicate receipt id is refused, never appended.
+    // KF-33b2: a duplicate receipt id is refused, never appended. CO18a7b: a
+    // stored assessment the aggregate refuses, and a receipt about another
+    // subject, are the same typed rejection, never a throw.
+    let merged: EvidenceAssessmentRecord;
     try {
+      const aggregate = EvidenceAssessment.fromRecord(assessment);
       aggregate.appendReviewReceipt(
         normalizedReceipt,
         isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString(),
       );
+      merged = aggregate.toRecord();
     } catch (error) {
       return {
         outcome: 'rejected',
         reason: error instanceof Error ? error.message : 'The review receipt could not be appended',
       };
     }
-    const merged = aggregate.toRecord();
     const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
     const updated: EvidenceAssessmentRecord = {
       ...merged,

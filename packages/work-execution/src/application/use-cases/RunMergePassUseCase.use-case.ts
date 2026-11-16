@@ -29,7 +29,8 @@ import type {
 } from '../../domain/merge-queue-decider.js';
 import { decideMergeStep } from '../../domain/merge-queue-decider.js';
 import { computeCallBudget } from '../../domain/daemon-tick.js';
-import { isConductorHalted, isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isRequiredPassHalted } from './chain-pass-halt.js';
 import {
   findMergeQueueHead,
   orderMergeQueue,
@@ -257,22 +258,19 @@ export class RunMergePassUseCase implements RunMergePassPort {
     const head = findMergeQueueHead(ordered, request.repoDigest);
     const live = selectEntriesForPass(ordered, head, Date.parse(this.deps.nowIso()));
 
-    // The kill switch, read once; an unreadable read is a halt (fail closed).
-    // D-DT9: the budget is checked before this outbound read too.
+    // D-DT9: the budget is checked before every entry's outbound reads,
+    // including the halt re-read below.
     if (!callAllowed(this.deps.nowIso(), request.deadlineIso)) {
       return { outcome: 'budget-exhausted', reasonCode: null, entries };
-    }
-    let halted: boolean;
-    try {
-      halted = isConductorHalted(await this.deps.halt.read());
-    } catch {
-      halted = true;
     }
 
     for (const entry of live) {
       if (!callAllowed(this.deps.nowIso(), request.deadlineIso)) {
         return { outcome: 'budget-exhausted', reasonCode: null, entries };
       }
+      // The kill switch, re-read before every entry; an unreadable read is a
+      // halt (fail closed).
+      const halted = await isRequiredPassHalted(this.deps.halt);
       try {
         entries.push(await this.actOnEntry(request, entry, head, halted, repoRecords));
       } catch (error) {

@@ -474,4 +474,80 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
       expect(await journalOf(deps.journal)).toHaveLength(0);
     }
   });
+
+  it('re-reads the halt before each entry: a halt raised after the first entry stops the second', async () => {
+    let reads = 0;
+    const flippingHalt: Pick<ConductorHaltPort, 'read'> = {
+      async read(): Promise<ConductorHaltState> {
+        reads += 1;
+        if (reads === 1) {
+          return haltClear;
+        }
+        return { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } } as unknown as ConductorHaltState;
+      },
+    };
+    const { useCase, deps, request } = makeUseCase(
+      [
+        makeEntry(),
+        makeEntry({ pullRequest: 2, enqueuedAtIso: '2026-11-01T10:05:00.000Z' }),
+      ],
+      greenForge,
+      {},
+      flippingHalt,
+    );
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.outcome).toBe('completed');
+    expect(result.entries).toHaveLength(2);
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-merge');
+    expect(result.entries[1].decision).toBe('no-action');
+    expect(result.entries[1].reasonCode).toBe('halted');
+    expect(result.entries[1].journalKey).toBe(null);
+    expect(await deps.journal.listForKey(`merge/${DIGEST}/2/${HEAD12}/merge-pr`)).toHaveLength(0);
+    expect(reads).toBe(2);
+  });
+
+  it('reads an off-contract halt answer as halted', async () => {
+    const garbageHalt: Pick<ConductorHaltPort, 'read'> = {
+      async read() {
+        return { state: 'garbage' } as unknown as ConductorHaltState;
+      },
+    };
+    const { useCase, deps, request } = makeUseCase([makeEntry()], greenForge, {}, garbageHalt);
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('halted');
+    expect(await journalOf(deps.journal)).toHaveLength(0);
+  });
+
+  it('reads a missing halt dependency as halted', async () => {
+    let ulid = 0;
+    const useCase = new RunMergePassUseCase({
+      queue: queueFake([makeEntry()]),
+      forgeRead: forgeReadFake(greenForge),
+      verification: verificationFake(),
+      journal: new LaneRunJournalAdapter() as LaneRunJournalPort,
+      nowIso: () => NOW,
+      newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
+      halt: undefined as unknown as Pick<ConductorHaltPort, 'read'>,
+    });
+    const request: RunMergePassRequest = {
+      repository: { owner: OWNER, repo: REPO },
+      repoDigest: DIGEST,
+      projectId: 'proj-1',
+      policy: makePolicy(),
+      deadlineIso: DEADLINE,
+    };
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('halted');
+  });
 });

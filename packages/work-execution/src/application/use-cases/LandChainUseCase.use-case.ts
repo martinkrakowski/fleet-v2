@@ -27,6 +27,8 @@ import {
 } from '../../domain/chain-records.js';
 import type { ChainRecord } from '../../domain/chain-records.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
+import { isRequiredPassHalted } from './chain-pass-halt.js';
 import type { AttemptRecord } from '../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
 import { MERGE_QUEUE_TERMINAL_STATES } from '../../domain/merge-queue-records.js';
@@ -228,6 +230,8 @@ export interface LandChainDependencies {
   readonly mintEntryId: () => string;
   readonly nowIso: () => string;
   readonly computeDigest: (text: string) => string;
+  /** The operator kill switch: re-read before applying (plan §3.7); never read on a dry run. */
+  readonly halt: Pick<ConductorHaltPort, 'read'>;
 }
 
 /** The answer of one deadline-guarded outbound call: the deadline fail, the mapped throw fail, or the value. */
@@ -301,7 +305,19 @@ export class LandChainUseCase implements LandChainPort {
     }
   }
 
+  /** Fails closed: a `dryRun` never reads the halt, an apply is refused `halted`. */
+  private async haltRefusalIfApplying(command: LandChainCommand): Promise<LandChainResult | null> {
+    if (command.dryRun) {
+      return null;
+    }
+    return (await isRequiredPassHalted(this.deps.halt)) ? refused('halted') : null;
+  }
+
   private async run(command: LandChainCommand): Promise<LandChainResult> {
+    const preReadHalt = await this.haltRefusalIfApplying(command);
+    if (preReadHalt !== null) {
+      return preReadHalt;
+    }
     const prepared = await this.prepare(command);
     if (!prepared.ok) {
       return prepared.fail;
@@ -338,6 +354,10 @@ export class LandChainUseCase implements LandChainPort {
         action: resolved.mode,
         pullRequestNumber: resolved.pullRequestNumber,
       };
+    }
+    const preApplyHalt = await this.haltRefusalIfApplying(command);
+    if (preApplyHalt !== null) {
+      return preApplyHalt;
     }
     return this.apply(command, { pin: prepared.pin, tip: prepared.tip, tier: collected.value.highestTier, links: receipts.value, title: rendered.title, body: rendered.body });
   }
@@ -758,6 +778,15 @@ export class LandChainUseCase implements LandChainPort {
     }
     const pullRequestNumber = integration.value;
 
+    // The kill switch is re-read immediately before the premerge status: a
+    // halt raised while the integration PR was opened still stops this post.
+    // The kill switch is re-read immediately before the premerge status: a
+    // halt raised while the integration PR was opened still stops this post.
+    const preStatusHalt = await this.haltRefusalIfApplying(command);
+    if (preStatusHalt !== null) {
+      return preStatusHalt;
+    }
+
     const premerge = await this.postPremergeStatus(command, facts, pullRequestNumber);
     if (premerge !== null) {
       return premerge;
@@ -787,6 +816,12 @@ export class LandChainUseCase implements LandChainPort {
       return { ok: false, fail: refused('integration-pr-ambiguous') };
     }
     const mode = open.value.length === 1 ? ('adopt' as const) : ('open' as const);
+    // The halt is re-read immediately before this one-way action: a halt
+    // raised after the earlier pre-apply check still refuses the open or
+    // adopt, and an unreadable halt answer refuses it too.
+    if (await isRequiredPassHalted(this.deps.halt)) {
+      return { ok: false, fail: refused('halted') };
+    }
     const opened = await this.guarded(
       command.deadlineIso,
       FAIL_FORGE,
@@ -847,6 +882,12 @@ export class LandChainUseCase implements LandChainPort {
     const premergeIntent = await this.appendStepIntent(command, premergeKey, premergeDigest);
     if (premergeIntent !== null) {
       return premergeIntent;
+    }
+    // The intent append above takes a lock and does disk I/O: the halt is read again after it, with
+    // nothing awaited between this read and the post. The intent stays; a resume finds it and posts.
+    const haltedAfterIntent = await this.haltRefusalIfApplying(command);
+    if (haltedAfterIntent !== null) {
+      return haltedAfterIntent;
     }
     const status = await this.guarded(
       command.deadlineIso,
@@ -932,6 +973,14 @@ export class LandChainUseCase implements LandChainPort {
     const stillOurs = await this.markIsOurs(command, key, facts.tip);
     if (stillOurs !== null) {
       return stillOurs;
+    }
+    // The kill switch is re-read immediately before the enqueue: a halt raised
+    // while the mark was recorded still stops this one-way queue write.
+    // The kill switch is re-read immediately before the enqueue: a halt raised
+    // while the mark was recorded still stops this one-way queue write.
+    const preEnqueueHalt = await this.haltRefusalIfApplying(command);
+    if (preEnqueueHalt !== null) {
+      return preEnqueueHalt;
     }
     const enqueued = await this.guarded(
       command.deadlineIso,

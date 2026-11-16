@@ -42,6 +42,7 @@ import type {
   MergeDaemonSection,
   MergePolicySection,
   MergeRepositoryPolicy,
+  MergeVetoConsumerSettings,
   MergeVetoPolicy,
   NoDecisionsSection,
   NoForgeSection,
@@ -291,6 +292,7 @@ export const ANSWER_FILE_DECISIONS_KEYS: readonly string[] =
 export const DECISION_CONSUMERS_KEYS = freezeKeys<DecisionConsumers>()([
   'knowledge-ranking',
   'claim-triage',
+  'merge-veto',
 ]);
 
 export const KNOWLEDGE_RANKING_CONSUMER_KEYS: readonly string[] =
@@ -301,6 +303,12 @@ export const CLAIM_TRIAGE_CONSUMER_KEYS: readonly string[] =
     'minConfidence',
     'monthlyBudgetUsd',
     'acknowledgeCandidateClaimsLeaveHost',
+  ]);
+
+export const MERGE_VETO_CONSUMER_KEYS: readonly string[] =
+  freezeKeys<MergeVetoConsumerSettings>()([
+    'monthlyBudgetUsd',
+    'acknowledgePullRequestTitleAndPathsLeaveHost',
   ]);
 
 export const DAEMON_KEYS: readonly string[] = freezeKeys<DaemonSection>()([

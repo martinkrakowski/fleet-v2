@@ -5,6 +5,7 @@ import {
   DECISION_CONSUMERS_KEYS,
   JEV_DECISIONS_KEYS,
   KNOWLEDGE_RANKING_CONSUMER_KEYS,
+  MERGE_VETO_CONSUMER_KEYS,
   NO_DECISIONS_KEYS,
 } from './keys.js';
 import { isPlainRecord, readOwnDataProperty } from './policy-read.js';
@@ -51,6 +52,14 @@ function copyOwnBlock(
   return out;
 }
 
+const CONSUMER_SETTINGS_KEYS: Readonly<
+  Record<(typeof DECISION_CONSUMERS_KEYS)[number], readonly string[]>
+> = Object.freeze({
+  'knowledge-ranking': KNOWLEDGE_RANKING_CONSUMER_KEYS,
+  'claim-triage': CLAIM_TRIAGE_CONSUMER_KEYS,
+  'merge-veto': MERGE_VETO_CONSUMER_KEYS,
+});
+
 /** Copy the optional settings every consumer shares, omitting absent ones. */
 export function copyDecisionConsumers(consumers: DecisionConsumers): DecisionConsumers {
   const out: Record<string, unknown> = {};
@@ -62,14 +71,10 @@ export function copyDecisionConsumers(consumers: DecisionConsumers): DecisionCon
     if (settings === undefined || !isPlainRecord(settings)) {
       continue;
     }
-    const keys =
-      name === 'claim-triage'
-        ? CLAIM_TRIAGE_CONSUMER_KEYS
-        : KNOWLEDGE_RANKING_CONSUMER_KEYS;
     // A present, valid (plain-record) settings block is written even when
     // every settings key is absent: dropping the entry would silently change
     // a valid installation on write.
-    out[name] = copyOwnBlock(settings, keys);
+    out[name] = copyOwnBlock(settings, CONSUMER_SETTINGS_KEYS[name]);
   }
   return out as DecisionConsumers;
 }

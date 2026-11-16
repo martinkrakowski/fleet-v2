@@ -16,7 +16,12 @@ import {
 import { buildMergeGhChildEnv, composeExecutionHosts } from './composition/work-execution-hosts.js';
 import { composeEvidence } from './composition/evidence.js';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
-import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
+import type {
+  AttemptRecord,
+  PreparePullRequestFeedbackFixRequest,
+  PushPullRequestFeedbackFixRequest,
+  WorkOrderRecord,
+} from '@fleet/work-execution';
 import {
   ForgeActionAdapter,
   LaneRun,
@@ -890,6 +895,347 @@ baseRef: 'main',
         expect(ghCalled).toBe(false);
       },
     );
+  });
+
+  describe('CO24comp: PreparePullRequestFeedbackFixUseCase in CLI composition', () => {
+    const HEAD = '1111111111111111111111111111111111111111';
+    const FIXED_HEAD = '2222222222222222222222222222222222222222';
+    const KEY = 'pr-feedback/7@111111111111';
+    const FIX_ATTEMPT_ID = 'pr-feedback-7-111111111111';
+    const BRANCH = 'feat/lane-cli-test';
+    const WORK_ORDER_ID = 'wo-co24-1';
+    const PRIOR_ATTEMPT_ID = 'att-co24-init';
+    const GRANT_ID = 'grant-co24-push';
+
+    const co24Installation: FleetInstallation = {
+      schemaVersion: 2,
+      forge: { mode: 'github', owner: 'org', repo: 'repo' },
+      hosts: {
+        'host-1': {
+          transport: 'local',
+          worktreeRoot: '/tmp/worktrees',
+          roles: ['orchestrator', 'lane-runner', 'verifier'],
+        },
+      },
+    };
+
+    /** The gh stub state: which calls were made, the PR's head on the forge, and the graphql answer mode. */
+    interface Co24GhState {
+      graphqlCalls: number;
+      viewCalls: number;
+      currentPrHead: string;
+      graphqlMode: 'ok' | 'exit-fail' | 'garbage';
+    }
+
+    function co24GhStub(state: Co24GhState) {
+      return async (args: readonly string[]) => {
+        if (args[0] === 'api' && args[1] === 'graphql') {
+          state.graphqlCalls += 1;
+          if (state.graphqlMode === 'exit-fail') {
+            return { exitCode: 1, stdout: '', stderr: 'gh api graphql failed' };
+          }
+          if (state.graphqlMode === 'garbage') {
+            return { exitCode: 0, stdout: 'not json at all', stderr: '' };
+          }
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              data: {
+                repository: {
+                  pullRequest: {
+                    state: 'OPEN',
+                    headRefOid: state.currentPrHead,
+                    headRefName: BRANCH,
+                    headRepository: { name: 'repo', owner: { login: 'org' } },
+                    reviewThreads: {
+                      totalCount: 2,
+                      pageInfo: { hasNextPage: false, endCursor: null },
+                      nodes: [
+                        {
+                          id: 'PRRT_unresolved',
+                          isResolved: false,
+                          path: 'src/widget.ts',
+                          line: 12,
+                          comments: {
+                            nodes: [{ body: 'Rename this.', author: { __typename: 'User' } }],
+                          },
+                        },
+                        {
+                          id: 'PRRT_resolved',
+                          isResolved: true,
+                          path: 'src/other.ts',
+                          line: null,
+                          comments: {
+                            nodes: [{ body: 'Done.', author: { __typename: 'Bot' } }],
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            }),
+            stderr: '',
+          };
+        }
+        if (args[0] === 'pr' && args[1] === 'view') {
+          state.viewCalls += 1;
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              number: 7,
+              state: 'OPEN',
+              headRefOid: state.currentPrHead,
+              headRefName: BRANCH,
+              baseRefName: 'main',
+              mergedAt: null,
+              closedAt: null,
+              mergeCommit: null,
+              mergeStateStatus: 'CLEAN',
+              isCrossRepository: false,
+              headRepositoryOwner: { login: 'org' },
+            }),
+            stderr: '',
+          };
+        }
+        return { exitCode: 1, stdout: '', stderr: 'unexpected gh invocation' };
+      };
+    }
+
+    function prepareRequest(
+      overrides: Partial<PreparePullRequestFeedbackFixRequest> = {},
+    ): PreparePullRequestFeedbackFixRequest {
+      return {
+        repository: { owner: 'org', repo: 'repo' },
+        pullRequestNumber: 7,
+        headSha: HEAD,
+        branchName: BRANCH,
+        workOrderId: WORK_ORDER_ID,
+        priorAttemptId: PRIOR_ATTEMPT_ID,
+        ...overrides,
+      };
+    }
+
+    function pushRequest(
+      overrides: Partial<PushPullRequestFeedbackFixRequest> = {},
+    ): PushPullRequestFeedbackFixRequest {
+      return {
+        repository: { owner: 'org', repo: 'repo' },
+        pullRequestNumber: 7,
+        branchName: BRANCH,
+        expectedHeadSha: HEAD,
+        fixedHeadSha: FIXED_HEAD,
+        workOrderId: WORK_ORDER_ID,
+        attemptId: FIX_ATTEMPT_ID,
+        grantId: GRANT_ID,
+        ...overrides,
+      };
+    }
+
+    it('prepares a fix attempt in attemptRepository from gh api graphql findings and returns already-prepared on replay', async () => {
+      const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: 'ok' as const };
+      const rt = createFleetCliRuntime({ installation: co24Installation, forgeGhRunner: co24GhStub(gh) });
+      await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(WORK_ORDER_ID, HEAD));
+      await rt.execution.attemptRepository.saveAttempt(makeAttempt(PRIOR_ATTEMPT_ID, WORK_ORDER_ID, HEAD));
+
+      const first = await rt.execution.preparePullRequestFeedbackFix.preparePullRequestFeedbackFix(prepareRequest());
+      expect(first).toEqual({ outcome: 'prepared', key: KEY, fixAttemptId: FIX_ATTEMPT_ID, findingCount: 1 });
+
+      const stored = await rt.execution.attemptRepository.findAttemptById(FIX_ATTEMPT_ID);
+      expect(stored).not.toBeNull();
+      expect(stored?.kind).toBe('fix');
+      expect(stored?.fixNumber).toBe(1);
+      expect(stored?.priorAttemptId).toBe(PRIOR_ATTEMPT_ID);
+      expect(stored?.state).toBe('intent-recorded');
+
+      const replay = await rt.execution.preparePullRequestFeedbackFix.preparePullRequestFeedbackFix(prepareRequest());
+      expect(replay).toEqual({ outcome: 'already-prepared', key: KEY, fixAttemptId: FIX_ATTEMPT_ID, findingCount: 1 });
+      expect(gh.graphqlCalls).toBe(2);
+      expect(gh.viewCalls).toBe(0);
+    });
+
+    it('pushes the fixed head through ExecuteAuthorizedForgeActionUseCase, consumes the push-to-pr grant, journals completion, and returns already-pushed on replay', async () => {
+      const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: 'ok' as const };
+      const rt = createFleetCliRuntime({
+        installation: co24Installation,
+        forgeGhRunner: co24GhStub(gh),
+        forgeActionDelegate: {
+          verifyCurrentHeadSha: async () => {
+            // The fix head lands on the forge when the push runs: the pr view
+            // read after this verification shows the fixed head.
+            gh.currentPrHead = FIXED_HEAD;
+            return FIXED_HEAD;
+          },
+        },
+      });
+      await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(WORK_ORDER_ID, HEAD));
+      await rt.execution.attemptRepository.saveAttempt(makeAttempt(PRIOR_ATTEMPT_ID, WORK_ORDER_ID, HEAD));
+      await rt.execution.attemptRepository.saveAttempt({
+        ...makeAttempt(FIX_ATTEMPT_ID, WORK_ORDER_ID, FIXED_HEAD, []),
+        kind: 'fix',
+        fixNumber: 1,
+        priorAttemptId: PRIOR_ATTEMPT_ID,
+      });
+      await rt.coordination.coordinationRequestRepository.saveRequest({
+        ...makeApprovedGrant(GRANT_ID, forgeActionScope('push-to-pr'), FIXED_HEAD),
+        grantRecordVersion: 2,
+        grantAttemptId: FIX_ATTEMPT_ID,
+      });
+
+      const first = await rt.execution.preparePullRequestFeedbackFix.pushPullRequestFeedbackFix(pushRequest());
+      expect(first).toEqual({ outcome: 'pushed', key: KEY, headSha: FIXED_HEAD });
+
+      const grant = await rt.coordination.coordinationRequestRepository.findRequestByGrantId(GRANT_ID);
+      expect(grant?.consumptions).toHaveLength(1);
+      expect(grant?.consumptions[0]?.actionId).toBe(KEY);
+
+      const statuses = (await rt.execution.executionJournal.listJournalEntriesForAttempt(FIX_ATTEMPT_ID)).map(
+        (entry) => entry.status,
+      );
+      expect(statuses).toEqual(['intent-recorded', 'completed']);
+
+      const replay = await rt.execution.preparePullRequestFeedbackFix.pushPullRequestFeedbackFix(pushRequest());
+      expect(replay).toEqual({ outcome: 'already-pushed', key: KEY, headSha: FIXED_HEAD });
+    });
+
+    it('refuses malformed requests with invalid-request before calling gh or touching stores', async () => {
+      const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: 'ok' as const };
+      const rt = createFleetCliRuntime({ installation: co24Installation, forgeGhRunner: co24GhStub(gh) });
+      await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(WORK_ORDER_ID, HEAD));
+      await rt.execution.attemptRepository.saveAttempt(makeAttempt(PRIOR_ATTEMPT_ID, WORK_ORDER_ID, HEAD));
+
+      const badNumber = await rt.execution.preparePullRequestFeedbackFix.preparePullRequestFeedbackFix(
+        prepareRequest({ pullRequestNumber: 0 }),
+      );
+      expect(badNumber).toEqual({ outcome: 'refused', code: 'invalid-request' });
+
+      const badHead = await rt.execution.preparePullRequestFeedbackFix.preparePullRequestFeedbackFix(
+        prepareRequest({ headSha: 'not-a-head-sha' }),
+      );
+      expect(badHead).toEqual({ outcome: 'refused', code: 'invalid-request' });
+
+      const badPush = await rt.execution.preparePullRequestFeedbackFix.pushPullRequestFeedbackFix(
+        pushRequest({ attemptId: 'attempt-not-derived' }),
+      );
+      expect(badPush).toEqual({ outcome: 'refused', key: null, headSha: null, code: 'invalid-request' });
+
+      expect(gh.graphqlCalls).toBe(0);
+      expect(gh.viewCalls).toBe(0);
+      expect(await rt.execution.attemptRepository.listAttemptsByWorkOrder(WORK_ORDER_ID)).toHaveLength(1);
+    });
+
+    it('refuses with repository-mismatch when the request names another repository or forge mode is not github', async () => {
+      const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: 'ok' as const };
+      const rt = createFleetCliRuntime({ installation: co24Installation, forgeGhRunner: co24GhStub(gh) });
+
+      const other = await rt.execution.preparePullRequestFeedbackFix.preparePullRequestFeedbackFix(
+        prepareRequest({ repository: { owner: 'other', repo: 'repo' } }),
+      );
+      expect(other).toEqual({ outcome: 'refused', code: 'repository-mismatch' });
+      const otherPush = await rt.execution.preparePullRequestFeedbackFix.pushPullRequestFeedbackFix(
+        pushRequest({ repository: { owner: 'other', repo: 'repo' } }),
+      );
+      expect(otherPush).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'repository-mismatch' });
+
+      const unconfigured = createFleetCliRuntime();
+      const none = await unconfigured.execution.preparePullRequestFeedbackFix.preparePullRequestFeedbackFix(prepareRequest());
+      expect(none).toEqual({ outcome: 'refused', code: 'repository-mismatch' });
+
+      expect(gh.graphqlCalls).toBe(0);
+      expect(gh.viewCalls).toBe(0);
+    });
+
+    it('refuses push with grant-missing and makes no gh call when grantId is blank', async () => {
+      const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: 'ok' as const };
+      const rt = createFleetCliRuntime({ installation: co24Installation, forgeGhRunner: co24GhStub(gh) });
+      for (const grantId of [undefined, '', '   ']) {
+        const request = { ...pushRequest() } as Record<string, unknown>;
+        if (grantId === undefined) {
+          delete request.grantId;
+        } else {
+          request.grantId = grantId;
+        }
+        const result = await rt.execution.preparePullRequestFeedbackFix.pushPullRequestFeedbackFix(
+          request as unknown as PushPullRequestFeedbackFixRequest,
+        );
+        expect(result).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'grant-missing' });
+      }
+      expect(gh.graphqlCalls).toBe(0);
+      expect(gh.viewCalls).toBe(0);
+    });
+
+    it('refuses with forge-unreadable when gh api graphql fails or returns malformed JSON', async () => {
+      for (const mode of ['exit-fail', 'garbage'] as const) {
+        const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: mode };
+        const rt = createFleetCliRuntime({ installation: co24Installation, forgeGhRunner: co24GhStub(gh) });
+        const prepared = await rt.execution.preparePullRequestFeedbackFix.preparePullRequestFeedbackFix(prepareRequest());
+        expect(prepared).toEqual({ outcome: 'refused', code: 'forge-unreadable' });
+        expect(gh.graphqlCalls).toBe(1);
+      }
+    });
+
+    it('refuses with head-moved when the pull request head on the forge does not match expectedHeadSha', async () => {
+      const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: FIXED_HEAD, graphqlMode: 'ok' as const };
+      const rt = createFleetCliRuntime({ installation: co24Installation, forgeGhRunner: co24GhStub(gh) });
+      await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(WORK_ORDER_ID, HEAD));
+      await rt.execution.attemptRepository.saveAttempt(makeAttempt(PRIOR_ATTEMPT_ID, WORK_ORDER_ID, HEAD));
+
+      const prepared = await rt.execution.preparePullRequestFeedbackFix.preparePullRequestFeedbackFix(prepareRequest());
+      expect(prepared).toEqual({ outcome: 'refused', code: 'head-moved' });
+      expect(gh.graphqlCalls).toBe(1);
+    });
+
+    it('refuses with fix-attempt-refused when the prior attempt is not recorded in attemptRepository', async () => {
+      const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: 'ok' as const };
+      const rt = createFleetCliRuntime({ installation: co24Installation, forgeGhRunner: co24GhStub(gh) });
+      await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(WORK_ORDER_ID, HEAD));
+
+      const result = await rt.execution.preparePullRequestFeedbackFix.preparePullRequestFeedbackFix(prepareRequest());
+      expect(result).toEqual({ outcome: 'refused', code: 'fix-attempt-refused', detail: 'prior-not-found' });
+      expect(gh.graphqlCalls).toBe(1);
+      expect(await rt.execution.attemptRepository.findAttemptById(FIX_ATTEMPT_ID)).toBeNull();
+    });
+
+    it('refuses push with grant-refused and leaves the grant unconsumed when the grant scope or head does not match push-to-pr', async () => {
+      const gh = { graphqlCalls: 0, viewCalls: 0, currentPrHead: HEAD, graphqlMode: 'ok' as const };
+      const rt = createFleetCliRuntime({
+        installation: co24Installation,
+        forgeGhRunner: co24GhStub(gh),
+        forgeActionDelegate: {
+          verifyCurrentHeadSha: async () => {
+            gh.currentPrHead = FIXED_HEAD;
+            return FIXED_HEAD;
+          },
+        },
+      });
+      await rt.execution.workOrderRepository.saveWorkOrder(makeWorkOrder(WORK_ORDER_ID, HEAD));
+      await rt.execution.attemptRepository.saveAttempt(makeAttempt(PRIOR_ATTEMPT_ID, WORK_ORDER_ID, HEAD));
+      await rt.execution.attemptRepository.saveAttempt({
+        ...makeAttempt(FIX_ATTEMPT_ID, WORK_ORDER_ID, FIXED_HEAD, []),
+        kind: 'fix',
+        fixNumber: 1,
+        priorAttemptId: PRIOR_ATTEMPT_ID,
+      });
+      for (const variant of [
+        // A grant for another action kind at the fixed head.
+        { grantId: 'grant-co24-wrong-scope', actionScope: forgeActionScope('push-and-open-pr'), head: FIXED_HEAD },
+        // A push-to-pr grant scoped to another head.
+        { grantId: 'grant-co24-wrong-head', actionScope: forgeActionScope('push-to-pr'), head: HEAD },
+      ]) {
+        await rt.coordination.coordinationRequestRepository.saveRequest({
+          ...makeApprovedGrant(variant.grantId, variant.actionScope, variant.head),
+          grantRecordVersion: 2,
+          grantAttemptId: FIX_ATTEMPT_ID,
+        });
+        const result = await rt.execution.preparePullRequestFeedbackFix.pushPullRequestFeedbackFix(
+          pushRequest({ grantId: variant.grantId }),
+        );
+        expect(result).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'grant-refused' });
+        const stored = await rt.coordination.coordinationRequestRepository.findRequestByGrantId(variant.grantId);
+        expect(stored?.consumptions).toHaveLength(0);
+        expect(stored?.state).toBe('approved');
+      }
+    });
   });
 });
 

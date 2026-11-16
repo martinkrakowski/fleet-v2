@@ -29,6 +29,7 @@ import type {
   StartLaneRunRequest,
   StartLaneRunResult,
 } from '@fleet/work-execution';
+import type { ProjectProfileView } from '@fleet/work-execution';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
@@ -1371,6 +1372,118 @@ describe('conductor start guards (K7-7)', () => {
     expect(result.code).toBe(1);
     expect(parseDocument(result.stdout)).toEqual({ outcome: 'refused', reason: 'halted' });
     expect(fake.startCalls).toHaveLength(0);
+  });
+});
+
+describe('conductor start AcceptanceSpec diagnostics (OG-3)', () => {
+  /**
+   * OG-3: the four `AcceptanceSpec` refusals pinned at the CLI boundary over
+   * the live driver wiring. Every test spies only `profileRead`, `workspace`
+   * and `attemptArtifact`, so no subprocess, clone, worktree or file
+   * placement happens; the reserve, the repositories and the journals stay
+   * real (in-memory), which is what makes the pinned reason the composition's
+   * own answer rather than a fake's.
+   */
+  async function liveStartWithSpec(
+    spec: Record<string, unknown>,
+  ): Promise<{ readonly dir: string; readonly result: RunResult }> {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir, makeInstallation({ conductorEnabled: true }));
+    await runtime.execution.workOrderRepository.saveWorkOrder({
+      id: 'wo-example-1',
+      projectId: 'project-example-1',
+      taskId: 'task-example-1',
+      laneId: 'lane-example-1',
+      repository: 'repo-example-1',
+      baseCommit: 'a'.repeat(40),
+      ownedPaths: ['packages/example/src'],
+      policyRevision: 'policy-example-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    const profile: ProjectProfileView = {
+      projectId: 'project-example-1',
+      status: 'active',
+      repository: 'repo-example-1',
+      clones: { local: { path: '/tmp/fleet-k7-clone', worktreeRoot: '/tmp/fleet-k7-worktrees' } },
+      gateProcedures: [],
+      revision: 1,
+    };
+    vi.spyOn(runtime.conductor.profileRead, 'readProjectProfile').mockResolvedValue(profile);
+    vi.spyOn(runtime.execution.workspace, 'resolveBaseTip').mockResolvedValue({
+      outcome: 'resolved',
+      tip: 'a'.repeat(40),
+    });
+    vi.spyOn(runtime.execution.workspace, 'prepareLaneWorktree').mockResolvedValue({
+      outcome: 'prepared',
+    });
+    vi.spyOn(runtime.execution.attemptArtifact, 'verifyIgnoredPaths').mockResolvedValue({
+      outcome: 'ignored',
+      checkedPaths: ['.lane/brief.md', '.lane/brief-manifest.json'],
+    });
+    vi.spyOn(runtime.execution.attemptArtifact, 'placeFrozenBrief').mockResolvedValue({
+      outcome: 'placed',
+      prosePath: '/tmp/fleet-k7-worktrees/example/.lane/brief.md',
+      manifestPath: '/tmp/fleet-k7-worktrees/example/.lane/brief-manifest.json',
+    });
+    const briefPath = writeBriefRequest(dir, {
+      ...briefFixture(),
+      allowedPathPrefixes: ['packages/example/src'],
+      proseMarkdown: '# Task\n\nExample.\n',
+      acceptanceSpec: spec,
+    });
+    // No `buildDriver` override: `startCommand` composes the live driver,
+    // which is the path the four diagnostics must be pinned against.
+    const result = await runConductor(runtime, ['start', '--brief-request', briefPath, '--tier', '2'], {
+      stateDir: dir,
+    });
+    return { dir, result };
+  }
+
+  it.each([
+    {
+      name: 'shell string',
+      argv: ['yarn test'],
+      reason: 'brief-acceptance-spec-shell: AcceptanceSpec command 1 looks like a shell string; give each argument its own argv entry',
+    },
+    {
+      name: 'shell basename',
+      argv: ['/bin/sh', '-c', 'yarn test'],
+      reason: 'brief-acceptance-spec-shell: AcceptanceSpec command 1 must not run a shell',
+    },
+    {
+      name: 'empty argv',
+      argv: [],
+      reason: 'brief-rejected: AcceptanceSpec command 1 argv must hold 1 to 64 strings',
+    },
+    {
+      name: 'argv[0] not a program',
+      argv: ['--help'],
+      reason: 'brief-rejected: AcceptanceSpec command 1 argv[0] must name a program',
+    },
+  ] as const)('$name is an incomplete brief start, exit 1', async ({ argv, reason }) => {
+    const { result } = await liveStartWithSpec({
+      commitRequired: true,
+      diffCheck: true,
+      commands: [{ argv }],
+    });
+    expect(result.code).toBe(1);
+    const document = parseDocument(result.stdout);
+    expect(document).toMatchObject({ outcome: 'incomplete', step: 'brief', reason });
+    expect(String(document.reason)).not.toContain('redacted');
+  });
+
+  it('a valid AcceptanceSpec still starts, exit 0 (OG-3 pins no change to what is accepted)', async () => {
+    const { result } = await liveStartWithSpec({
+      commitRequired: true,
+      diffCheck: true,
+      commands: [{ argv: ['node', '--eval', 'process.exit(0)'] }],
+    });
+    expect(result.code).toBe(0);
+    expect(parseDocument(result.stdout)).toMatchObject({ outcome: 'started' });
   });
 });
 

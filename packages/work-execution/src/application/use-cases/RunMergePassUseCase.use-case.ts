@@ -35,6 +35,14 @@ import {
   orderMergeQueue,
   type MergeQueueEntryRecord,
 } from '../../domain/merge-queue-records.js';
+import type { MergeVetoPort } from '../ports/out/MergeVetoPort.out-port.js';
+import type {
+  MergeVetoStatePort,
+  MergeVetoStateResult,
+} from '../ports/out/MergeVetoStatePort.out-port.js';
+import type { MergeVetoStateFields } from '../ports/out/MergeVetoPort.out-port.js';
+import type { MergeQueueVetoRecord } from '../../domain/merge-queue-records.js';
+import { buildVetoEntry } from '../../domain/merge-pass-transitions.js';
 import {
   buildDroppedEntry,
   buildParkedEntry,
@@ -68,6 +76,13 @@ export interface RunMergePassDependencies {
   readonly halt: Pick<ConductorHaltPort, 'read'>;
   readonly newUlid: () => string;   // a fresh ULID per journal entry
   readonly nowIso: () => string;    // the pass clock, read fresh
+  /**
+   * The advisory Jev veto (OG-16a), shadow mode only: the state read and the
+   * answer port. Either absent, or a live or off policy, and the veto row
+   * stays today's no-action.
+   */
+  readonly vetoAdvice?: Pick<MergeVetoPort, 'adviseMergeVeto'>;
+  readonly vetoState?: Pick<MergeVetoStatePort, 'readMergeVetoState'>;
 }
 
 /** Inputs are size-bounded: a larger queue or id is refused or truncated, never read whole. */
@@ -80,6 +95,46 @@ const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 const REPO_DIGEST_PATTERN = /^[0-9a-f]{12}$/;
 const NORMAL_CALL_TIMEOUT_MS = 30_000;
 const UPDATE_WINDOW_MS = 60 * 60 * 1000;
+
+/** A plain object answer of the veto state port, nothing more. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * A valid answered veto advice: a known choice, a finite confidence in
+ * [0, 1] and a receipt id that is a non-empty string or absent. Anything
+ * else — a getter that throws, a bad choice, an out-of-range confidence —
+ * is read as `unknown` and never as an answer.
+ */
+function isValidVetoAdvice(advice: unknown): advice is {
+  readonly status: 'answered';
+  readonly choice: 'merge-safe' | 'hold-for-human';
+  readonly confidence: number;
+  readonly decisionReceiptId?: string | null;
+} {
+  try {
+    if (!isPlainObject(advice) || advice.status !== 'answered') {
+      return false;
+    }
+    if (advice.choice !== 'merge-safe' && advice.choice !== 'hold-for-human') {
+      return false;
+    }
+    const confidence: unknown = advice.confidence;
+    if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+      return false;
+    }
+    const receipt: unknown = advice.decisionReceiptId;
+    return receipt === undefined || receipt === null || (typeof receipt === 'string' && receipt.length > 0);
+  } catch {
+    return false;
+  }
+}
+
 
 const CONTEXT_SUCCESS_TOKENS = new Set(['SUCCESS']);
 const CONTEXT_PENDING_TOKENS = new Set([
@@ -306,17 +361,47 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
 
     if (request.policy.shadow === true) {
-      // The action journaled now completes its own open intent with its real
-      // reason (journalShadowAct); every other open shadow intent is closed.
-      const acting =
-        decision.kind === 'act' && decision.execution === 'shadow'
-          ? decision.action === 'premerge-carry'
-            ? 'post-status'
-            : decision.action
-          : null;
-      await this.closeOpenShadowIntents(request, current, acting);
+      await this.closeOpenShadowIntents(request, current, this.actingShadowAction(decision));
+    }
+    if (decision.kind === 'act' && decision.action === 'veto' && this.shadowVetoBound(request)) {
+      const vetoReport = await this.performShadowVeto(request, current, decision.expectedHeadOid);
+      if (vetoReport !== null) {
+        return vetoReport;
+      }
+      // No writer, or the veto entry was refused by record validation: the row
+      // is unknown for this pass and never blocks (D-JV1), so the pass moves on
+      // to the next row as if the veto had answered unknown. Nothing is stored,
+      // so a later pass reaches this step again (advice is asked again once per
+      // pass when the entry was refused; never when the writer is absent).
+      // A failed write is NOT this case: it returns its reason code and stops.
+      const unrecorded: MergeStepFacts = {
+        ...facts,
+        veto: { outcome: 'unknown', confidence: null, mode: 'shadow', decisionReceiptId: null },
+      };
+      decision = decideMergeStep(current, unrecorded, request.policy, this.deps.nowIso());
+      if (request.policy.shadow === true) {
+        await this.closeOpenShadowIntents(request, current, this.actingShadowAction(decision));
+      }
     }
     return this.actOnDecision(request, current, decision);
+  }
+
+  /** The shadow action this decision journals now, if any (its own open intent is completed, not closed). */
+  private actingShadowAction(decision: MergeStepDecision): string | null {
+    return decision.kind === 'act' && decision.execution === 'shadow'
+      ? decision.action === 'premerge-carry'
+        ? 'post-status'
+        : decision.action
+      : null;
+  }
+
+  /** Shadow mode with both advisory veto ports bound (OG-16a). */
+  private shadowVetoBound(request: RunMergePassRequest): boolean {
+    return (
+      request.policy.veto.mode === 'shadow' &&
+      this.deps.vetoAdvice !== undefined &&
+      this.deps.vetoState !== undefined
+    );
   }
 
   /** One action per entry per tick (plan §3.3); shadow mode journals, live defers. */
@@ -326,9 +411,14 @@ export class RunMergePassUseCase implements RunMergePassPort {
     decision: MergeStepDecision,
   ): Promise<MergePassEntryReport> {
     if (decision.kind === 'act') {
-      if (decision.action === 'macos-verify' || decision.action === 'veto') {
+      if (decision.action === 'macos-verify') {
         // Two-way actions this lane never performs (DT9b).
         return this.report(entry, 'no-action', decision.action, null);
+      }
+      if (decision.action === 'veto') {
+        // Live, off or an unbound port pair: the veto row stays a no-action.
+        // (The bound shadow veto is performed by `actOnEntry`.)
+        return this.report(entry, 'no-action', 'veto', null);
       }
       if (decision.execution === 'live') {
         // Do not call the forge: DT9b performs the action with a grant.
@@ -349,6 +439,108 @@ export class RunMergePassUseCase implements RunMergePassPort {
       return this.recordSupersession(request, entry, decision.liveHeadOid);
     }
     return this.report(entry, 'no-action', 'enter-ready', null);
+  }
+
+  /**
+   * The advisory shadow veto (OG-16a): ask the veto state port and the veto
+   * answer port once, record the answer on the entry through the CAS write,
+   * and always return `no-action` — the recorded veto is log-only, the pass's
+   * decision never changes here. Every failure path records `unknown` or
+   * returns its typed refusal, and none blocks or throws.
+   */
+  private async performShadowVeto(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    verifiedHeadOid: string,
+  ): Promise<MergePassEntryReport | null> {
+    const unknownRecord: MergeQueueVetoRecord = {
+      outcome: 'unknown',
+      confidence: null,
+      mode: 'shadow',
+      decisionReceiptId: null,
+    };
+    const vetoState = this.deps.vetoState as Pick<MergeVetoStatePort, 'readMergeVetoState'>;
+    const vetoAdvice = this.deps.vetoAdvice as Pick<MergeVetoPort, 'adviseMergeVeto'>;
+
+    // Without a queue writer the veto row cannot be stored; neither port is
+    // called, and `null` tells the caller the veto is unknown for this pass.
+    if (this.deps.queueWriter === undefined) {
+      return null;
+    }
+
+    this.ensureBudget(request);
+    let stateResult: MergeVetoStateResult;
+    try {
+      stateResult = await vetoState.readMergeVetoState({
+        repository: request.repository,
+        pullRequestNumber: entry.pullRequest,
+        headOid: verifiedHeadOid,
+        deadlineIso: request.deadlineIso,
+      });
+    } catch {
+      stateResult = { status: 'unavailable', reason: 'state-read-threw' };
+    }
+    let state: MergeVetoStateFields | null = null;
+    try {
+      if (
+        stateResult !== null &&
+        typeof stateResult === 'object' &&
+        stateResult.status === 'read' &&
+        isPlainObject(stateResult.state)
+      ) {
+        state = stateResult.state;
+      }
+    } catch {
+      state = null;
+    }
+    if (state === null) {
+      return this.persistShadowVeto(request, entry, unknownRecord);
+    }
+
+    this.ensureBudget(request);
+    let record: MergeQueueVetoRecord = unknownRecord;
+    try {
+      const advice = await vetoAdvice.adviseMergeVeto({
+        repository: request.repository,
+        pullRequestNumber: entry.pullRequest,
+        verifiedHeadOid,
+        mode: 'shadow',
+        state: state,
+        deadlineIso: request.deadlineIso,
+      });
+      if (isValidVetoAdvice(advice)) {
+        record = {
+          outcome: advice.choice,
+          confidence: advice.confidence,
+          mode: 'shadow',
+          decisionReceiptId: advice.decisionReceiptId ?? null,
+        };
+      }
+    } catch {
+      // A thrown veto answer is an unknown answer; it never blocks (D-JV1).
+    }
+    return this.persistShadowVeto(request, entry, record);
+  }
+
+  /**
+   * Build and persist one veto row. Reports `no-action` / `veto` once the row
+   * is stored and the write's reason code when the write fails (the entry stops
+   * for this pass); `null` only when the entry is refused, which is unknown.
+   */
+  private async persistShadowVeto(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    vetoRecord: MergeQueueVetoRecord,
+  ): Promise<MergePassEntryReport | null> {
+    const built = buildVetoEntry(entry, vetoRecord);
+    if (!built.ok) {
+      return null;
+    }
+    const persisted = await this.persist(request, entry, built.record, null, null);
+    if (persisted.status === 'failed') {
+      return this.report(entry, 'no-action', persisted.reasonCode, null);
+    }
+    return this.report(entry, 'no-action', 'veto', null);
   }
 
   /** A park is stored once; the first park of an entry notifies once (§3.3 "first parked"). */
@@ -717,10 +909,16 @@ export class RunMergePassUseCase implements RunMergePassPort {
         : await this.readVerificationReceipt(request, entry);
 
     // The stored veto is used when present; otherwise an unknown veto never
-    // blocks (D-JV1) and the veto question cannot be asked in this lane.
+    // blocks (D-JV1). In shadow mode with both veto ports bound (OG-16a) the
+    // veto row is left undefined so the decider reads the stored record
+    // (`null`) and asks for the advisory veto act; the veto step records it.
     const vetoMode = request.policy.veto.mode;
+    const vetoAdvisory =
+      vetoMode === 'shadow' &&
+      this.deps.vetoAdvice !== undefined &&
+      this.deps.vetoState !== undefined;
     const veto: MergeStepFacts['veto'] =
-      entry.veto !== null || vetoMode === 'off'
+      entry.veto !== null || vetoMode === 'off' || vetoAdvisory
         ? undefined
         : { outcome: 'unknown', confidence: null, mode: vetoMode, decisionReceiptId: null };
 

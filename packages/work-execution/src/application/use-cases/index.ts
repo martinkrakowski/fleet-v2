@@ -48,6 +48,7 @@ export * from "./PrepareFixAttemptUseCase.use-case.js";
 export * from "./PreparePullRequestFeedbackFixUseCase.use-case.js";
 export * from "./ProbeProjectUseCase.use-case.js";
 export * from "./ReapLaneWorktreesUseCase.use-case.js";
+export * from "./ReapOrphanReservationsUseCase.use-case.js";
 export * from "./ReapOrphanSessionsUseCase.use-case.js";
 export * from "./ReapZombiesUseCase.use-case.js";
 export * from "./ReconcileAttemptUseCase.use-case.js";

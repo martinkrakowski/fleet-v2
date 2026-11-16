@@ -3,7 +3,12 @@
  * SshExecutor implements the evidence context's CommandExecutorPort by
  * carrying one argv array to a remote POSIX shell through batch-mode ssh:
  *
- *   ssh -o BatchMode=yes <host> -- <argv quoted for the remote POSIX shell>
+ *   ssh -o BatchMode=yes <host> -- sh -c '<argv quoted for sh>'
+ *
+ * The remote command is always handed to `sh -c` as one single-quoted
+ * argument, so the account's login shell only ever starts `sh` and never
+ * parses the command text itself (a zsh login shell, for example, does not
+ * word-split unquoted variables the way POSIX requires).
  *
  * `input` is written to the ssh client's stdin (carrying it to the remote
  * command's stdin) and stdin is then closed; `timeoutMs` kills the ssh
@@ -36,8 +41,9 @@ export function posixQuote(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
-/** The ssh argv that carries `argv` to `host` in batch mode. */
+/** The ssh argv that carries `argv` to `host` in batch mode via `sh -c`. */
 export function sshArgvFor(host: string, argv: readonly string[]): string[] {
+  const command = argv.map(posixQuote).join(' ');
   return [
     '-o',
     'BatchMode=yes',
@@ -45,7 +51,9 @@ export function sshArgvFor(host: string, argv: readonly string[]): string[] {
     'ConnectTimeout=15',
     host,
     '--',
-    argv.map(posixQuote).join(' '),
+    'sh',
+    '-c',
+    posixQuote(command),
   ];
 }
 

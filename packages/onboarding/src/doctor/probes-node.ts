@@ -19,6 +19,7 @@ import type { SeatModel } from '@fleet/installation';
 import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
 import { GH_BINARY_CANDIDATES, hasGhTokenEnv, type GhAuthObservation } from './gh-binary.js';
+import { sshRemoteArgv } from './ssh-remote.js';
 import type {
   DoctorProbes,
   PinnedBuildProbeResult,
@@ -187,20 +188,6 @@ function resolveRepoRoot(): string | undefined {
   }
 }
 
-/** Build the `ssh <alias> --` wrapper argv with BatchMode and a connect budget. */
-function sshArgv(alias: string, argv: readonly string[]): string[] {
-  return [
-    'ssh',
-    '-o',
-    'BatchMode=yes',
-    '-o',
-    `ConnectTimeout=${SSH_CONNECT_TIMEOUT_S}`,
-    alias,
-    '--',
-    ...argv,
-  ];
-}
-
 /** First field of one non-empty line of text (a sha256 record, a mode, …). */
 function firstField(text: string): string | undefined {
   const line = text
@@ -305,7 +292,13 @@ async function runOnHost(
   if (host === 'local') {
     return deps.localExecutor.run(argv, budget);
   }
-  return deps.sshExecutor.run(sshArgv(host, argv), budget);
+  const remote = sshRemoteArgv(host, argv, SSH_CONNECT_TIMEOUT_S);
+  if (!remote.ok) {
+    // Refused before any spawn; every probe already treats a result with an
+    // `error` as a failed run.
+    return { exitCode: null, signal: null, stdout: '', stderr: '', error: remote.reason };
+  }
+  return deps.sshExecutor.run(remote.argv, budget);
 }
 
 /** The tool descriptor's version argv (`detect`), or undefined for an unknown id. */
@@ -379,8 +372,11 @@ export function serverModelIds(stdout: string): readonly string[] | undefined {
 /**
  * The node doctor probes. Local hosts run argv arrays through the local
  * executor; every other host name is an ssh alias and the same argv travels
- * through `ssh <alias> --` with `BatchMode=yes`. Nothing here reads a
- * credential file's contents.
+ * through `ssh <alias> -- sh -c '<one POSIX-single-quoted command line>'`
+ * with `BatchMode=yes`, so the remote login shell parses only `sh -c` plus
+ * that one string. A refused remote argv (empty, an empty or NUL-bearing
+ * argument, or an unsafe alias) spawns nothing and reports a failed run.
+ * Nothing here reads a credential file's contents.
  */
 export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorProbes {
   const localExecutor = deps.localExecutor ?? createNodeDoctorExecutor();

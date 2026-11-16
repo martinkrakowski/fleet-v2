@@ -159,6 +159,7 @@ function makeUseCase(
   records: readonly MergeQueueEntryRecord[],
   forgeResult: ReadForgeMergeResult,
   policyOverrides: Record<string, unknown> = {},
+  halt: Pick<ConductorHaltPort, 'read'> = haltFake,
 ): { useCase: RunMergePassUseCase; deps: Deps; request: RunMergePassRequest } {
   const journal = new LaneRunJournalAdapter();
   const forgeRead = forgeReadFake(forgeResult);
@@ -169,7 +170,7 @@ function makeUseCase(
     forgeRead,
     verification,
     journal: journal as LaneRunJournalPort,
-    halt: haltFake,
+    halt,
     newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
     nowIso: () => NOW,
   });
@@ -431,5 +432,46 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     expect(result.entries[0].decision).toBe('journalled');
     expect(result.entries[0].reasonCode).toBe('would-merge');
     expect(await journalOf(deps.journal)).toHaveLength(2);
+  });
+
+  it('waits with reason halted and records no journal entry when halted', async () => {
+    // OG-15: a halted marker fails the whole pass closed, entry by entry.
+    const halted: Pick<ConductorHaltPort, 'read'> = {
+      async read() {
+        return { state: 'halted', record: {} } as unknown as ConductorHaltState;
+      },
+    };
+    const { useCase, deps, request } = makeUseCase([makeEntry()], greenForge, {}, halted);
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.outcome).toBe('completed');
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(result.entries[0].reasonCode).toBe('halted');
+    expect(result.entries[0].journalKey).toBe(null);
+    expect(await journalOf(deps.journal)).toHaveLength(0);
+  });
+
+  it('treats an unreadable or throwing halt read as halted', async () => {
+    // Fail closed: `unreadable` and a throw both read as halted, never as clear.
+    for (const answer of [{ state: 'unreadable' } as ConductorHaltState, new Error('store gone')]) {
+      const halt: Pick<ConductorHaltPort, 'read'> = {
+        async read(): Promise<ConductorHaltState> {
+          if (answer instanceof Error) {
+            throw answer;
+          }
+          return answer;
+        },
+      };
+      const { useCase, deps, request } = makeUseCase([makeEntry()], greenForge, {}, halt);
+
+      const result = await useCase.runMergePass(request);
+
+      expect(result.entries).toHaveLength(1);
+      expect(result.entries[0].decision).toBe('no-action');
+      expect(result.entries[0].reasonCode).toBe('halted');
+      expect(await journalOf(deps.journal)).toHaveLength(0);
+    }
   });
 });

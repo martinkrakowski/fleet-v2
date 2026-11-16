@@ -44,7 +44,7 @@ const installation = {
 } as unknown as FleetInstallation;
 
 describe('chain refresh daemon job, shadow composition', () => {
-  it('a tick records a shadow observation and the executor sees zero writes', async () => {
+  async function shadowTick(options: { halted: boolean }) {
     const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-co8-shadow-'));
     dirs.push(stateDir);
     const chains = new ChainRepositoryAdapter({ stateDir });
@@ -88,6 +88,10 @@ describe('chain refresh daemon job, shadow composition', () => {
       },
     });
 
+    if (options.halted) {
+      await runtime.conductor.halt.set({ halted: true, nowIso: NOW });
+    }
+
     const digest = sha256HexDigest(`${REPO.owner}/${REPO.repo}`).slice(0, 12);
     const jobId = `chain-refresh:${digest}`;
     const result = await runtime.daemon.runDaemonTick.runTick({
@@ -118,11 +122,16 @@ describe('chain refresh daemon job, shadow composition', () => {
       jobFilter: [jobId],
       forgeReachable: true,
     });
-    expect(result.outcome).toBe('completed');
 
     const events = await runtime.daemon.events.readAfterCursor(null);
     expect(events.ok).toBe(true);
     const jobEvents = events.ok ? events.events.filter((event) => event.jobId === jobId) : [];
+    return { result, jobEvents, ghCalls, chains };
+  }
+
+  it('a tick records a shadow observation and the executor sees zero writes', async () => {
+    const { result, jobEvents, ghCalls, chains } = await shadowTick({ halted: false });
+    expect(result.outcome).toBe('completed');
     expect(jobEvents).toHaveLength(1);
     expect(jobEvents[0]).toMatchObject({ kind: 'job', outcome: 'skipped', reasonCode: 'shadow-would-refresh-1' });
 
@@ -138,5 +147,12 @@ describe('chain refresh daemon job, shadow composition', () => {
     // The record is untouched: shadow wrote no intent.
     const after = await chains.readChain({ repository: REPO, chainName: 'example', deadlineIso: DEADLINE });
     expect(after.status === 'ok' && after.record.refresh).toBeNull();
+  });
+
+  it('a halted conductor makes the shadow chain-refresh job refuse halted through the real composition', async () => {
+    const { jobEvents, ghCalls } = await shadowTick({ halted: true });
+    expect(jobEvents).toHaveLength(1);
+    expect(jobEvents[0]).toMatchObject({ kind: 'job', outcome: 'refused', reasonCode: 'halted' });
+    expect(ghCalls.some((args) => args.some((arg) => arg.includes('/git/ref/heads/main')))).toBe(false);
   });
 });

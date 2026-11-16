@@ -3,6 +3,11 @@
 // is assembled at run time from harmless parts; no matched value is ever
 // asserted into an expected stream.
 
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { runCli, type CliIo } from "../index.js";
@@ -391,6 +396,74 @@ describe("lane diff-check command", () => {
   it("runCli routes lane diff-check and constructs no adapter on usage", async () => {
     const { io, stdout, stderr } = capturingIo();
     const code = await runCli(["lane", "diff-check"], io);
+    expect(code).toBe(2);
+    expect(stderr).toEqual(["lane diff-check: usage\n"]);
+    expect(stdout).toEqual([]);
+  });
+
+  it("runCli runs lane diff-check on the given worktree and base: clean exits 0, a stray file exits 1 naming its path", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "ldc1-"));
+    try {
+      const git = (...args: string[]): string =>
+        execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+      git("init", "-q");
+      git("config", "user.email", "t@example.invalid");
+      git("config", "user.name", "t");
+      git("config", "commit.gpgsign", "false");
+      mkdirSync(join(repo, "packages/x"), { recursive: true });
+      writeFileSync(join(repo, "packages/x/a.txt"), "one\n");
+      git("add", ".");
+      git("commit", "-q", "-m", "base");
+      const base = git("rev-parse", "HEAD");
+      const argv = (extra: string[] = []): string[] => [
+        "lane",
+        "diff-check",
+        repo,
+        "--allowed-path-prefixes",
+        '["packages/x"]',
+        "--base",
+        base,
+        ...extra,
+      ];
+
+      // Clean worktree: exit 0 is only possible with a trusted base sha, so the
+      // worktree and the base both reached the handler intact.
+      const clean = capturingIo();
+      expect(await runCli(argv(), clean.io)).toBe(0);
+      expect(clean.stdout).toEqual([]);
+      expect(clean.stderr).toEqual([]);
+
+      // A file outside the allowed prefixes in THIS worktree is reported by
+      // path and rule: the handler really scanned the worktree it was given.
+      writeFileSync(join(repo, "stray.txt"), "x\n");
+      const dirty = capturingIo();
+      expect(await runCli(argv(), dirty.io)).toBe(1);
+      expect(dirty.stderr).toEqual([]);
+      expect(dirty.stdout.join("")).toContain("stray.txt");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("runCli keeps the other lane invocations parsing as before", async () => {
+    const lane = capturingIo();
+    expect(await runCli(["lane", "--help"], lane.io)).toBe(0);
+    expect(lane.stdout[0]).toContain("fleet-v2 lane diff-check");
+    const sub = capturingIo();
+    expect(await runCli(["lane", "diff-check", "--help"], sub.io)).toBe(0);
+    expect(sub.stdout[0]).toContain("--allowed-path-prefixes");
+    // The bare `lane` group word with no arguments is still a usage error.
+    const bare = capturingIo();
+    expect(await runCli(["lane"], bare.io)).toBe(2);
+    expect(bare.stderr).toEqual(["lane diff-check: usage\n"]);
+  });
+
+  it("runCli lane diff-check with a missing worktree is still a usage error", async () => {
+    const { io, stdout, stderr } = capturingIo();
+    const code = await runCli(
+      ["lane", "diff-check", "--allowed-path-prefixes", '["packages/x"]', "--base", SHA],
+      io,
+    );
     expect(code).toBe(2);
     expect(stderr).toEqual(["lane diff-check: usage\n"]);
     expect(stdout).toEqual([]);

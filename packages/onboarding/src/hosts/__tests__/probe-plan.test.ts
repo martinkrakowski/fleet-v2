@@ -16,6 +16,7 @@ import {
   hostProbesHaveFailure,
   planHostProbes,
   probeHost,
+  runHostProbes,
 } from '../probe-plan.js';
 import { draftHost } from '../draft.js';
 
@@ -77,12 +78,22 @@ const localSpec: HostProbeSpec = {
   worktreeRoot: '/home/dev/fleet-v2',
 };
 
-/** The `ssh <alias> --` prefix every remote argv of `alias` starts with. */
-function sshPrefixOf(alias: string): string[] {
-  return ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', alias, '--'];
-}
+/** The fixed words every remote argv of `alias` starts with. */
+const sshHead = (alias: string): string[] => [
+  'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', alias, '--', 'sh', '-c',
+];
 
-const SSH_PREFIX = sshPrefixOf('lanehost');
+/** The bare program words of an argv: decodes the twice-quoted ssh form. */
+function logicalArgv(argv: readonly string[]): readonly string[] {
+  if (argv[0] !== 'ssh') {
+    return argv;
+  }
+  const inner = argv[argv.length - 1] ?? '';
+  const joined = inner.slice(1, -1).replaceAll("'\\''", "'");
+  return [...joined.matchAll(/'((?:[^']|'\\'')*)'/g)].map((match) =>
+    (match[1] ?? '').replaceAll("'\\''", "'"),
+  );
+}
 
 /**
  * A fake executor that answers every step of `spec` the way a healthy host
@@ -99,8 +110,8 @@ function healthyExecutor(
     if (Object.keys(override).length > 0) {
       return override;
     }
-    if (call.argv.includes('mktemp')) {
-      return succeeded(`${spec.worktreeRoot}/tmp.probe01\n`);
+    if (logicalArgv(call.argv).includes('mktemp')) {
+      return succeeded(`${spec.worktreeRoot}/.fleet-probe.probe1\n`);
     }
     if (call.argv[0] === 'id') {
       return succeeded(`${uid}\n`);
@@ -158,22 +169,21 @@ describe('planHostProbes', () => {
     ]);
   });
 
-  it('wraps every remote step in BatchMode, ConnectTimeout and -- before the alias', () => {
+  it('wraps every remote step through sh -c with one quoted line', () => {
     const argvs = argvsOf(planHostProbes(sshSpec));
     expect(argvs).toEqual([
-      [...SSH_PREFIX, 'true'],
-      [...SSH_PREFIX, 'sh', '--version'],
-      [...SSH_PREFIX, 'git', '--version'],
-      [...SSH_PREFIX, 'node', '--version'],
-      [...SSH_PREFIX, 'opencode', '--version'],
-      [...SSH_PREFIX, 'mktemp', '/srv/fleet-v2/worktrees/.fleet-probe.XXXXXX'],
+      [...sshHead('lanehost'), "''\\''true'\\'''"],
+      [...sshHead('lanehost'), "''\\''sh'\\'' '\\''--version'\\'''"],
+      [...sshHead('lanehost'), "''\\''git'\\'' '\\''--version'\\'''"],
+      [...sshHead('lanehost'), "''\\''node'\\'' '\\''--version'\\'''"],
+      [...sshHead('lanehost'), "''\\''opencode'\\'' '\\''--version'\\'''"],
       [
-        ...SSH_PREFIX,
-        'curl',
-        '-fsS',
-        '--max-time',
-        '5',
-        'http://127.0.0.1:4166/',
+        ...sshHead('lanehost'),
+        "''\\''mktemp'\\'' '\\''/srv/fleet-v2/worktrees/.fleet-probe.XXXXXX'\\'''",
+      ],
+      [
+        ...sshHead('lanehost'),
+        "''\\''curl'\\'' '\\''-fsS'\\'' '\\''--max-time'\\'' '\\''5'\\'' '\\''http://127.0.0.1:4166/'\\'''",
       ],
     ]);
   });
@@ -192,7 +202,7 @@ describe('planHostProbes', () => {
   it('never builds a shell string: every argv element is a plain token', () => {
     const shellShape = /[;&|`$(){}<>\n]/;
     for (const argv of argvsOf(planHostProbes(sshSpec))) {
-      expect(argv.join(' ')).not.toMatch(shellShape);
+      expect(logicalArgv(argv).join(' ')).not.toMatch(shellShape);
     }
     for (const argv of argvsOf(planHostProbes(localSpec))) {
       expect(argv.join(' ')).not.toMatch(shellShape);
@@ -201,7 +211,7 @@ describe('planHostProbes', () => {
 
   it('plans the opencode server on the host loopback with a five second bound', () => {
     const server = runStepOf(planHostProbes(sshSpec), 'server-loopback');
-    expect(server?.argv).toContain('http://127.0.0.1:4166/');
+    expect(logicalArgv(server?.argv ?? [])).toContain('http://127.0.0.1:4166/');
     expect(server?.failureStatus).toBe('UNKNOWN');
   });
 
@@ -224,9 +234,8 @@ describe('planHostProbes', () => {
     ]);
     const version = runStepOf(steps, 'version-agy');
     expect(version?.argv).toEqual([
-      ...sshPrefixOf('agy-host'),
-      'agy',
-      '--version',
+      ...sshHead('agy-host'),
+      "''\\''agy'\\'' '\\''--version'\\'''",
     ]);
   });
 
@@ -421,8 +430,8 @@ describe('planHostProbes', () => {
 describe('runHostProbes', () => {
   it('creates one path inside the worktree root and removes exactly that path', async () => {
     const { executor, calls } = fakeExecutor((call) => {
-      if (call.argv.includes('mktemp')) {
-        return succeeded('/home/dev/fleet-v2/tmp.a1b2c3\n');
+      if (logicalArgv(call.argv).includes('mktemp')) {
+        return succeeded('/home/dev/fleet-v2/.fleet-probe.a1b2c3\n');
       }
       return succeeded();
     });
@@ -433,7 +442,7 @@ describe('runHostProbes', () => {
       ['git', '--version'],
       ['node', '--version'],
       ['mktemp', '/home/dev/fleet-v2/.fleet-probe.XXXXXX'],
-      ['rm', '--', '/home/dev/fleet-v2/tmp.a1b2c3'],
+      ['rm', '--', '/home/dev/fleet-v2/.fleet-probe.a1b2c3'],
     ]);
     const writable = lines.find(
       (line) => line.check === 'worktree-root-writable',
@@ -444,22 +453,19 @@ describe('runHostProbes', () => {
 
   it('removes the created path through the same ssh transport on a remote host', async () => {
     const { executor, calls } = fakeExecutor((call) => {
-      if (call.argv.includes('mktemp')) {
-        return succeeded('/srv/fleet-v2/worktrees/tmp.zz9\n');
+      if (logicalArgv(call.argv).includes('mktemp')) {
+        return succeeded('/srv/fleet-v2/worktrees/.fleet-probe.zz9abc\n');
       }
       return succeeded();
     });
     await probeHost(sshSpec, executor);
     expect(calls[5]?.argv).toEqual([
-      ...SSH_PREFIX,
-      'mktemp',
-      '/srv/fleet-v2/worktrees/.fleet-probe.XXXXXX',
+      ...sshHead('lanehost'),
+      "''\\''mktemp'\\'' '\\''/srv/fleet-v2/worktrees/.fleet-probe.XXXXXX'\\'''",
     ]);
     expect(calls[6]?.argv).toEqual([
-      ...SSH_PREFIX,
-      'rm',
-      '--',
-      '/srv/fleet-v2/worktrees/tmp.zz9',
+      ...sshHead('lanehost'),
+      "''\\''rm'\\'' '\\''--'\\'' '\\''/srv/fleet-v2/worktrees/.fleet-probe.zz9abc'\\'''",
     ]);
   });
 
@@ -482,7 +488,7 @@ describe('runHostProbes', () => {
 
   it('fails the worktree check when mktemp cannot create a path there', async () => {
     const { executor } = fakeExecutor((call) =>
-      call.argv.includes('mktemp')
+      logicalArgv(call.argv).includes('mktemp')
         ? { exitCode: 1, stderr: 'mktemp: failed to create file via template' }
         : succeeded(),
     );
@@ -496,10 +502,10 @@ describe('runHostProbes', () => {
 
   it('reports a path that was created but not removed, naming the path', async () => {
     const { executor } = fakeExecutor((call) => {
-      if (call.argv.includes('mktemp')) {
-        return succeeded('/home/dev/fleet-v2/tmp.left\n');
+      if (logicalArgv(call.argv).includes('mktemp')) {
+        return succeeded('/home/dev/fleet-v2/.fleet-probe.left12\n');
       }
-      if (call.argv.includes('rm')) {
+      if (logicalArgv(call.argv).includes('rm')) {
         return { exitCode: 1 };
       }
       return succeeded();
@@ -509,12 +515,12 @@ describe('runHostProbes', () => {
       (line) => line.check === 'worktree-root-writable',
     );
     expect(writable?.status).toBe('FAIL');
-    expect(writable?.detail).toContain('/home/dev/fleet-v2/tmp.left');
+    expect(writable?.detail).toContain('/home/dev/fleet-v2/.fleet-probe.left12');
   });
 
   it('reports a version, and treats a shell without --version as unknown, not a failure', async () => {
     const { executor } = fakeExecutor((call) => {
-      if (call.argv[1] === '--version') {
+      if (logicalArgv(call.argv)[1] === '--version') {
         return succeeded('git version 2.43.0\n');
       }
       return succeeded();
@@ -525,7 +531,7 @@ describe('runHostProbes', () => {
     expect(git?.detail).toBe('git: version git version 2.43.0');
 
     const dash = fakeExecutor((call) =>
-      call.argv[0] === 'sh'
+      logicalArgv(call.argv)[0] === 'sh'
         ? { exitCode: 2, stderr: 'sh: 0: Illegal option --' }
         : succeeded(),
     );
@@ -537,7 +543,7 @@ describe('runHostProbes', () => {
 
   it('fails a version check when the command is not there at all', async () => {
     const { executor } = fakeExecutor((call) =>
-      call.argv[0] === 'git' ? { error: 'spawn git ENOENT' } : succeeded(),
+      logicalArgv(call.argv)[0] === 'git' ? { error: 'spawn git ENOENT' } : succeeded(),
     );
     const lines = await probeHost(localSpec, executor);
     expect(lines.find((line) => line.check === 'version-git')?.status).toBe(
@@ -547,7 +553,7 @@ describe('runHostProbes', () => {
 
   it('reports an unanswered loopback server as unknown so the host is still addable', async () => {
     const { executor } = healthyExecutor(sshSpec, (call) =>
-      call.argv.includes('curl')
+      logicalArgv(call.argv).includes('curl')
         ? { exitCode: 7, stderr: 'curl: (7) failed to connect' }
         : {},
     );
@@ -559,7 +565,7 @@ describe('runHostProbes', () => {
 
   it('passes a reachable host and its answered server', async () => {
     const { executor } = fakeExecutor((call) =>
-      call.argv.includes('curl') ? succeeded('opencode 1.2.3\n') : succeeded(),
+      logicalArgv(call.argv).includes('curl') ? succeeded('opencode 1.2.3\n') : succeeded(),
     );
     const lines = await probeHost(sshSpec, executor);
     expect(lines.find((line) => line.check === 'reachable')?.detail).toBe(
@@ -575,7 +581,7 @@ describe('runHostProbes', () => {
     // the lane diff check flags; the redaction rule still catches it.
     const secret = 'sk-testtoken';
     const { executor } = fakeExecutor((call) =>
-      call.argv[0] === 'git'
+      logicalArgv(call.argv)[0] === 'git'
         ? succeeded(`${secret} ${'v'.repeat(400)}\n`)
         : succeeded(),
     );
@@ -654,7 +660,7 @@ describe('runHostProbes', () => {
     const auth = lines.find((line) => line.check === 'file-owner-mode');
     expect(auth?.status).toBe('UNKNOWN');
     expect(auth?.detail).toContain('ownership was not checked');
-    expect(calls.some((call) => call.argv.includes('rm'))).toBe(false);
+    expect(calls.some((call) => logicalArgv(call.argv).includes('rm'))).toBe(false);
   });
 
   it('turns a throwing executor into unknown lines rather than a crash', async () => {
@@ -671,7 +677,7 @@ describe('runHostProbes', () => {
 
   it('refuses when any line failed and not when a line is merely unknown', async () => {
     const { executor } = healthyExecutor(sshSpec, (call) =>
-      call.argv.includes('curl') ? { exitCode: 7 } : {},
+      logicalArgv(call.argv).includes('curl') ? { exitCode: 7 } : {},
     );
     const unknownOnly = await probeHost(sshSpec, executor);
     expect(unknownOnly.some((line) => line.status === 'FAIL')).toBe(false);
@@ -682,5 +688,203 @@ describe('runHostProbes', () => {
       fakeExecutor(() => ({ exitCode: 255 })).executor,
     );
     expect(hostProbesHaveFailure(failing)).toBe(true);
+  });
+
+  it('decodes the planned ssh form back to the bare program words', () => {
+    const reachable = runStepOf(planHostProbes(sshSpec), 'reachable');
+    expect(logicalArgv(reachable?.argv ?? [])).toEqual(['true']);
+
+    const quoted = planHostProbes({
+      ...sshSpec,
+      worktreeRoot: "/srv/it's here",
+    });
+    const mktemp = quoted.find(
+      (step): step is Extract<HostProbeStep, { kind: 'mktemp-then-rm' }> =>
+        step.kind === 'mktemp-then-rm',
+    );
+    expect(logicalArgv(mktemp?.argv ?? [])).toEqual([
+      'mktemp',
+      "/srv/it's here/.fleet-probe.XXXXXX",
+    ]);
+  });
+
+  it('wraps ssh steps through sh -c for a worktree root with a space, a single quote and $(id)', () => {
+    const steps = planHostProbes({
+      ...sshSpec,
+      worktreeRoot: "/srv/a b/it's $(id)",
+    });
+    const mktemp = steps.find(
+      (step): step is Extract<HostProbeStep, { kind: 'mktemp-then-rm' }> =>
+        step.kind === 'mktemp-then-rm',
+    );
+    expect(mktemp?.argv).toEqual([
+      ...sshHead('lanehost'),
+      "''\\''mktemp'\\'' '\\''/srv/a b/it'\\''\\'\\'''\\''s $(id)/.fleet-probe.XXXXXX'\\'''",
+    ]);
+  });
+
+  it('keeps local argvs bare and carries no ssh alias', () => {
+    for (const spec of [localSpec, { ...localSpec, sshAlias: 'lanehost' }]) {
+      const steps = planHostProbes(spec);
+      const mktemp = steps.find(
+        (step): step is Extract<HostProbeStep, { kind: 'mktemp-then-rm' }> =>
+          step.kind === 'mktemp-then-rm',
+      );
+      expect(mktemp?.sshAlias).toBeUndefined();
+      expect(argvsOf(steps)).toEqual([
+        ['true'],
+        ['sh', '--version'],
+        ['git', '--version'],
+        ['node', '--version'],
+        ['mktemp', '/home/dev/fleet-v2/.fleet-probe.XXXXXX'],
+      ]);
+    }
+    const sshMktemp = planHostProbes(sshSpec).find(
+      (step): step is Extract<HostProbeStep, { kind: 'mktemp-then-rm' }> =>
+        step.kind === 'mktemp-then-rm',
+    );
+    expect(sshMktemp?.sshAlias).toBe('lanehost');
+  });
+
+  it('plans a FAIL note and no mktemp run for a worktree root containing NUL', async () => {
+    const spec = { ...sshSpec, worktreeRoot: '/srv/r\0oot' };
+    const steps = planHostProbes(spec);
+    const note = noteStepOf(steps, 'worktree-root-writable');
+    expect(note?.status).toBe('FAIL');
+    expect(note?.detail).not.toContain('/srv/r');
+    expect(
+      steps.some((step) => step.kind === 'mktemp-then-rm'),
+    ).toBe(false);
+    const { executor, calls } = fakeExecutor(() => succeeded());
+    const lines = await probeHost(spec, executor);
+    expect(lines.some((line) => line.status === 'PASS')).toBe(true);
+    expect(
+      calls.some((call) => logicalArgv(call.argv).includes('mktemp')),
+    ).toBe(false);
+  });
+
+  it('plans a FAIL note for a lane-runner root containing NUL', () => {
+    const steps = planHostProbes({
+      ...sshSpec,
+      laneRunnerWorktreeRoot: {
+        hostName: 'lanehost',
+        worktreeRoot: '/srv/other\0root',
+      },
+    });
+    const note = noteStepOf(steps, 'lane-runner-worktree-visible');
+    expect(note?.status).toBe('FAIL');
+    expect(
+      steps.some(
+        (step) =>
+          step.kind === 'run' && step.check === 'lane-runner-worktree-visible',
+      ),
+    ).toBe(false);
+  });
+
+  it('plans a single-slash template and passes for a root written with a trailing slash', async () => {
+    const spec = { ...localSpec, worktreeRoot: '/srv/worktrees/' };
+    const mktemp = planHostProbes(spec).find(
+      (step): step is Extract<HostProbeStep, { kind: 'mktemp-then-rm' }> =>
+        step.kind === 'mktemp-then-rm',
+    );
+    expect(mktemp?.argv).toEqual(['mktemp', '/srv/worktrees/.fleet-probe.XXXXXX']);
+
+    const { executor, calls } = fakeExecutor((call) =>
+      logicalArgv(call.argv).includes('mktemp')
+        ? succeeded('/srv/worktrees/.fleet-probe.abc123\n')
+        : succeeded(),
+    );
+    const lines = await probeHost(spec, executor);
+    const writable = lines.find((entry) => entry.check === 'worktree-root-writable');
+    expect(writable?.status).toBe('PASS');
+    expect(calls[calls.length - 1]?.argv).toEqual([
+      'rm',
+      '--',
+      '/srv/worktrees/.fleet-probe.abc123',
+    ]);
+  });
+
+  it('removes a legitimate answer with a bare rm locally and a quoted sh -c over ssh', async () => {
+    const local = fakeExecutor((call) =>
+      logicalArgv(call.argv).includes('mktemp')
+        ? succeeded('/home/dev/fleet-v2/.fleet-probe.zz9abc\n')
+        : succeeded(),
+    );
+    await probeHost(localSpec, local.executor);
+    expect(local.calls[local.calls.length - 1]?.argv).toEqual([
+      'rm',
+      '--',
+      '/home/dev/fleet-v2/.fleet-probe.zz9abc',
+    ]);
+
+    const ssh = fakeExecutor((call) =>
+      logicalArgv(call.argv).includes('mktemp')
+        ? succeeded('/srv/fleet-v2/worktrees/.fleet-probe.zz9abc\n')
+        : succeeded(),
+    );
+    await probeHost(sshSpec, ssh.executor);
+    const last = ssh.calls.find((call) => logicalArgv(call.argv).includes('rm'));
+    expect(last?.argv).toEqual([
+      ...sshHead('lanehost'),
+      "''\\''rm'\\'' '\\''--'\\'' '\\''/srv/fleet-v2/worktrees/.fleet-probe.zz9abc'\\'''",
+    ]);
+    expect(logicalArgv(last?.argv ?? [])).toEqual([
+      'rm',
+      '--',
+      '/srv/fleet-v2/worktrees/.fleet-probe.zz9abc',
+    ]);
+  });
+
+  it('refuses a mktemp answer that is not exactly root/.fleet-probe.<six alphanumerics>', async () => {
+    const root = localSpec.worktreeRoot;
+    for (const answer of [
+      `${root}/.fleet-probe.abc12;id`,
+      `${root}/$(id)`,
+      `${root}/tmp.abc123`,
+      `${root}/.fleet-probe.abc1234`,
+      `${root}/.fleet-probe.abc12`,
+      `${root}/.fleet-probe.abc-12`,
+      `${root}/a/.fleet-probe.abc123`,
+      `${root}/.fleet-probe.abc123/x`,
+      `${root}x/.fleet-probe.abc123`,
+    ]) {
+      const { executor, calls } = fakeExecutor(() => succeeded(`${answer}\n`));
+      const lines = await probeHost(localSpec, executor);
+      const writable = lines.find(
+        (line) => line.check === 'worktree-root-writable',
+      );
+      expect(writable?.status).toBe('FAIL');
+      expect(writable?.detail).toContain('nothing was removed');
+      expect(
+        calls.some((call) => logicalArgv(call.argv).includes('rm')),
+      ).toBe(false);
+    }
+  });
+
+  it('runs no rm and reports unknown when the step\u2019s ssh alias is refused', async () => {
+    const { executor, calls } = fakeExecutor(() =>
+      succeeded('/srv/r/.fleet-probe.abc123\n'),
+    );
+    const lines = await runHostProbes(
+      [
+        {
+          kind: 'mktemp-then-rm',
+          scope: 'host',
+          subject: 'lanehost',
+          check: 'worktree-root-writable',
+          worktreeRoot: '/srv/r',
+          argv: ['mktemp', '/srv/r/.fleet-probe.XXXXXX'],
+          sshAlias: '-oProxyCommand=x',
+          timeoutMs: 1000,
+        },
+      ],
+      executor,
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.status).toBe('UNKNOWN');
+    expect(lines[0]?.detail).toContain('could not be checked for removal');
+    expect(calls.map((call) => call.argv)).toEqual([
+      ['mktemp', '/srv/r/.fleet-probe.XXXXXX'],
+    ]);
   });
 });

@@ -21,6 +21,7 @@ import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 import { GH_BINARY_CANDIDATES, hasGhTokenEnv, type GhAuthObservation } from './gh-binary.js';
 import { sshRemoteArgv } from './ssh-remote.js';
 import type {
+  CiRunnerSlotState,
   DoctorProbes,
   PinnedBuildProbeResult,
   SeatProbeResult,
@@ -277,6 +278,46 @@ async function readPinnedBuildWithGit(
   }
 
   return { pinnedCommit, baseTipCommit, behindCount, installRootName: basename(repoRoot) };
+}
+
+/**
+ * A systemd service unit name as `ciRunnerSlots[].unit` allows it: a local
+ * copy of the installation parser's rule, so the probe refuses any other
+ * word before it spawns anything.
+ */
+const CI_RUNNER_UNIT = /^[A-Za-z0-9@._:-]{1,128}\.service$/;
+
+/** `systemctl is-active` stdout: one lowercase word, at most one trailing newline. */
+const IS_ACTIVE_STDOUT = /^([a-z]+)\n?$/;
+
+/** The state words that mean systemd answered and the unit is not active. */
+const NOT_ACTIVE_STATES: ReadonlySet<string> = new Set([
+  'inactive',
+  'failed',
+  'activating',
+  'deactivating',
+  'unknown',
+]);
+
+/**
+ * Map one completed `systemctl is-active` run to a slot state. Only the
+ * exit code and one whole-output state word are read; the output itself is
+ * never returned.
+ */
+function ciRunnerSlotState(result: DoctorCommandRunResult): CiRunnerSlotState {
+  if (
+    result.error !== undefined ||
+    result.signal !== null ||
+    typeof result.exitCode !== 'number' ||
+    typeof result.stdout !== 'string'
+  ) {
+    return 'unknown';
+  }
+  const word = IS_ACTIVE_STDOUT.exec(result.stdout)?.[1];
+  if (result.exitCode === 0) {
+    return word === 'active' ? 'active' : 'unknown';
+  }
+  return word !== undefined && NOT_ACTIVE_STATES.has(word) ? 'inactive' : 'unknown';
 }
 
 /** Run one argv on the host's transport; a spawn failure reports as a failed run. */
@@ -561,6 +602,19 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
         deps.baseBranch ?? 'origin/main',
         timeoutMs,
       );
+    },
+
+    async ciRunnerSlot(host, unit): Promise<CiRunnerSlotState> {
+      try {
+        if (unit.startsWith('-') || !CI_RUNNER_UNIT.test(unit)) {
+          return 'unknown';
+        }
+        return ciRunnerSlotState(
+          await runOnHost(executors, host, ['systemctl', 'is-active', unit]),
+        );
+      } catch {
+        return 'unknown';
+      }
     },
 
     async serverProbe(host, port): Promise<ServerProbeResult> {

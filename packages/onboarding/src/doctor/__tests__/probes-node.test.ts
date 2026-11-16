@@ -1009,3 +1009,111 @@ describe('createNodeDoctorProbes pinned-build (DB1)', () => {
     expect(local.calls).toHaveLength(0);
   });
 });
+
+describe('createNodeDoctorProbes ciRunnerSlot (OG-28c)', () => {
+  const UNIT = 'fleet-ci@1.service';
+
+  it('runs systemctl is-active as one local argv with the probe budget and maps active', async () => {
+    const local = fakeExecutor({ stdout: 'active\n' });
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor });
+    await expect(probes.ciRunnerSlot!('local', UNIT)).resolves.toBe('active');
+    expect(local.calls).toHaveLength(1);
+    expect(local.calls[0]?.argv).toEqual(['systemctl', 'is-active', UNIT]);
+    expect(local.calls[0]?.options?.timeoutMs).toBe(10_000);
+
+    const noNewline = fakeExecutor({ stdout: 'active' });
+    const probesNoNewline = createNodeDoctorProbes({ localExecutor: noNewline.executor });
+    await expect(probesNoNewline.ciRunnerSlot!('local', UNIT)).resolves.toBe('active');
+  });
+
+  it('sends the slot probe over ssh as one quoted sh -c word', async () => {
+    const ssh = fakeExecutor({ stdout: 'active\n' });
+    const probes = createNodeDoctorProbes({ localExecutor: ssh.executor });
+    await expect(probes.ciRunnerSlot!('lane-host', UNIT)).resolves.toBe('active');
+    expect(ssh.calls).toHaveLength(1);
+    expect(ssh.calls[0]?.argv).toEqual([
+      'ssh',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=10',
+      'lane-host',
+      '--',
+      'sh',
+      '-c',
+      "''\\''systemctl'\\'' '\\''is-active'\\'' '\\''fleet-ci@1.service'\\'''",
+    ]);
+  });
+
+  it('maps a non-zero exit with a not-active state word to inactive', async () => {
+    for (const word of ['inactive', 'failed', 'activating', 'deactivating', 'unknown']) {
+      const withNewline = fakeExecutor({ exitCode: 3, stdout: `${word}\n` });
+      const probesNewline = createNodeDoctorProbes({ localExecutor: withNewline.executor });
+      await expect(probesNewline.ciRunnerSlot!('local', UNIT)).resolves.toBe('inactive');
+
+      const bare = fakeExecutor({ exitCode: 3, stdout: word });
+      const probesBare = createNodeDoctorProbes({ localExecutor: bare.executor });
+      await expect(probesBare.ciRunnerSlot!('local', UNIT)).resolves.toBe('inactive');
+    }
+  });
+
+  it('maps every other outcome to unknown', async () => {
+    const outcomes: Partial<DoctorCommandRunResult>[] = [
+      { exitCode: 0, stdout: '' },
+      { exitCode: 0, stdout: 'inactive\n' },
+      { exitCode: 0, stdout: 'Active\n' },
+      { exitCode: 0, stdout: 'active\nactive\n' },
+      { exitCode: 0, stdout: 'active\n\n' },
+      { exitCode: 0, stdout: ' active\n' },
+      { exitCode: 3, stdout: 'active\n' },
+      { exitCode: 3, stdout: '' },
+      { exitCode: 3, stdout: 'reloading\n' },
+      { exitCode: 3, stdout: 'inactive\nextra\n' },
+      { exitCode: 255, stdout: '' },
+      { exitCode: null, signal: null, stdout: '', error: 'spawn ENOENT' },
+      { exitCode: null, signal: 'SIGTERM', stdout: 'active\n' },
+      { exitCode: 0, signal: 'SIGTERM', stdout: 'active\n' },
+      { exitCode: 3, stdout: 42 as unknown as string },
+    ];
+    for (const outcome of outcomes) {
+      const fake = fakeExecutor(outcome);
+      const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+      await expect(probes.ciRunnerSlot!('local', UNIT)).resolves.toBe('unknown');
+    }
+  });
+
+  it('refuses a unit that is not a plain service name without running anything', async () => {
+    const fake = fakeExecutor({ stdout: 'active\n' });
+    const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+    for (const unit of [
+      '-x.service',
+      'fleet-ci@1.timer',
+      'a b.service',
+      'x;y.service',
+      'x.service\n',
+      '',
+      `${'a'.repeat(129)}.service`,
+      undefined as unknown as string,
+    ]) {
+      await expect(probes.ciRunnerSlot!('local', unit)).resolves.toBe('unknown');
+      await expect(probes.ciRunnerSlot!('lane-host', unit)).resolves.toBe('unknown');
+    }
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it('maps a throwing executor and an unsafe ssh alias to unknown', async () => {
+    const throwing = createNodeDoctorProbes({
+      localExecutor: {
+        async run() {
+          throw new Error('boom');
+        },
+      },
+    });
+    await expect(throwing.ciRunnerSlot!('local', UNIT)).resolves.toBe('unknown');
+
+    const safe = fakeExecutor({ stdout: 'active\n' });
+    const probes = createNodeDoctorProbes({ localExecutor: safe.executor });
+    await expect(probes.ciRunnerSlot!('bad host', UNIT)).resolves.toBe('unknown');
+    expect(safe.calls).toHaveLength(0);
+  });
+});

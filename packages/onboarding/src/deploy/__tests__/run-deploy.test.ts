@@ -475,26 +475,29 @@ describe('runCheckedDeploy', () => {
     ).toBe(false);
   });
 
-  it('refuses with commit-mismatch before repoint when the re-read HEAD is invalid', async () => {
-    let headCalls = 0;
-    const { probes, calls } = fakeProbes({
-      headCommit: async (repoPath) => {
-        calls.push(`headCommit:${repoPath}`);
-        headCalls += 1;
-        if (headCalls === 1) {
-          return COMMIT_A;
-        }
-        return [null, '', 'not-a-commit'][headCalls - 2] as never;
-      },
-    });
-    const result = await runCheckedDeploy(sampleRequest(), probes);
-    expect(result).toEqual({
-      outcome: 'refused',
-      reason: 'commit-mismatch',
-      detail: 'commit-mismatch before repoint',
-    });
-    expect(calls.some((c) => c.startsWith('repoint:'))).toBe(false);
-  });
+  it.each([null, '', 'not-a-commit'])(
+    'refuses with commit-mismatch before repoint when the re-read HEAD is %s',
+    async (invalidHead) => {
+      let headCalls = 0;
+      const { probes, calls } = fakeProbes({
+        headCommit: async (repoPath) => {
+          calls.push(`headCommit:${repoPath}`);
+          headCalls += 1;
+          if (headCalls === 1) {
+            return COMMIT_A;
+          }
+          return invalidHead as never;
+        },
+      });
+      const result = await runCheckedDeploy(sampleRequest(), probes);
+      expect(result).toEqual({
+        outcome: 'refused',
+        reason: 'commit-mismatch',
+        detail: 'commit-mismatch before repoint',
+      });
+      expect(calls.some((c) => c.startsWith('repoint:'))).toBe(false);
+    },
+  );
 
   it('returns probe-failed when the re-read HEAD throws', async () => {
     let headCalls = 0;

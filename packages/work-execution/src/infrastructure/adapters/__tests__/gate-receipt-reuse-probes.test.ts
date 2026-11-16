@@ -350,8 +350,13 @@ describe('gate receipt probe wrapper over a real process (HD1)', () => {
         const dashWord = await runReceiptProbe(executor, worktree, ['-d/cat', 'only-here.txt'], 4096);
         expect(dashWord).toMatchObject({ exitCode: 0, stdout: 'present-only-in-the-worktree' });
 
-        // Dash-leading arguments reach the program literally.
-        const literal = await runReceiptProbe(executor, worktree, ['printf', '%s|', '--help', '-x'], 4096);
+        // The witness is the shell builtin `printf` (via `sh -c`), so no host binary parses the dash-leading words as its own options.
+        const literal = await runReceiptProbe(
+          executor,
+          worktree,
+          ['sh', '-c', 'printf "%s|" "$@"', 'sh', '--help', '-x'],
+          4096,
+        );
         expect(literal).toMatchObject({ exitCode: 0, stdout: '--help|-x|' });
       } finally {
         await rm(worktree, { recursive: true, force: true });

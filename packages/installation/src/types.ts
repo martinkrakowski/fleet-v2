@@ -786,6 +786,8 @@ export interface HostModel {
   readonly worktreeRoot?: string;
   readonly tmpDir?: string;
   readonly roles: readonly HostRole[];
+  /** Optional systemd CI runner slots carried over from a v2 host (OG-28b). */
+  readonly ciRunnerSlots?: readonly CiRunnerSlotSection[];
   readonly runner?: HostRunnerModel;
 }
 

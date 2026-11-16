@@ -439,3 +439,166 @@ export function validateAllowedPathPrefix(prefix: string): string | null {
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// The `lane diff-check` CLI argument parser (pure). It returns a typed result
+// and never throws: every malformed input is the same `usage` kind, and no
+// usage reason is ever a string taken from the input (a rejected value is
+// never echoed). Cost bounds are hard: past any of them the function returns
+// usage without reading further inputs.
+// ---------------------------------------------------------------------------
+
+/** The trusted base-line allowance: a 40-digit lowercase hex commit sha. */
+const LANE_DIFF_CLI_BASE_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+/** Hard cost bounds for one parsed invocation. */
+const LANE_DIFF_CLI_MAX_TOKENS = 64;
+const LANE_DIFF_CLI_MAX_WORKTREE_LENGTH = 4096;
+const LANE_DIFF_CLI_MAX_PREFIXES = 32;
+const LANE_DIFF_CLI_MAX_PREFIX_LENGTH = 200;
+
+/** Prototype-polluting path segments can never be a prefix. */
+const LANE_DIFF_CLI_FORBIDDEN_PREFIXES = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
+export type LaneDiffCliBaseline =
+  | { readonly allowance: "trusted"; readonly baseCommit: string }
+  | { readonly allowance: "off" };
+
+export type LaneDiffCliArgsParseResult =
+  | { readonly kind: "usage" }
+  | {
+      readonly kind: "ready";
+      readonly worktreePath: string;
+      readonly allowedPathPrefixes: readonly string[];
+      readonly policyProtectedPaths?: readonly string[];
+      readonly baseline: LaneDiffCliBaseline;
+    };
+
+/** A fixed usage refusal; no input string is ever carried or echoed. */
+const LANE_DIFF_CLI_USAGE: LaneDiffCliArgsParseResult = { kind: "usage" };
+
+function usage(): LaneDiffCliArgsParseResult {
+  return LANE_DIFF_CLI_USAGE;
+}
+
+/**
+ * Parse one JSON string into a validated string array. Returns null on
+ * anything malformed: invalid JSON, a non-array, an element that is not a
+ * string (a null element included), a forbidden prototype-polluting element,
+ * or an element past the length cap. `minEntries` is 1 for the required
+ * prefixes, 0 for the optional policy paths; the count cap is shared. The
+ * result array is built with `push`, so no element ever becomes an object
+ * key and `__proto__` cannot pollute anything.
+ */
+function parseLaneDiffStringArray(
+  json: string,
+  minEntries: number,
+): readonly string[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  if (parsed.length < minEntries || parsed.length > LANE_DIFF_CLI_MAX_PREFIXES) {
+    return null;
+  }
+  const entries: string[] = [];
+  for (const element of parsed) {
+    if (typeof element !== "string") return null;
+    if (element.length > LANE_DIFF_CLI_MAX_PREFIX_LENGTH) return null;
+    if (LANE_DIFF_CLI_FORBIDDEN_PREFIXES.has(element)) return null;
+    if (validateAllowedPathPrefix(element) !== null) return null;
+    entries.push(element);
+  }
+  return entries;
+}
+
+/**
+ * Parse the `lane diff-check` argv (everything after the group and
+ * subcommand). One try/catch wraps every read, so a hostile getter, a Proxy
+ * with a throwing get trap, or any other read failure is the same typed
+ * usage result, never a thrown named error.
+ */
+export function parseLaneDiffCliArgs(argv: unknown): LaneDiffCliArgsParseResult {
+  try {
+    // Only a real array of bounded length is parsed; an array-like object, a
+    // non-iterable value, or an enormous length refuses before any index is
+    // read. A hole is not a flag: every element must exist.
+    if (!Array.isArray(argv)) return usage();
+    if (argv.length > LANE_DIFF_CLI_MAX_TOKENS) return usage();
+    for (let index = 0; index < argv.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(argv, index)) return usage();
+      if (typeof argv[index] !== "string") return usage();
+    }
+
+    let worktreePath: string | null = null;
+    let allowedPathPrefixes: readonly string[] | null = null;
+    let policyProtectedPaths: readonly string[] | undefined;
+    let baseline: LaneDiffCliBaseline = { allowance: "off" };
+    let sawBase = false;
+
+    for (let index = 0; index < argv.length; index += 1) {
+      const token: string = argv[index] as string;
+      if (token === "--allowed-path-prefixes" || token === "--policy-protected-paths" || token === "--base") {
+        // Every flag takes exactly one value; a missing, empty, or repeated
+        // value is usage.
+        index += 1;
+        if (index >= argv.length) return usage();
+        const value: string = argv[index] as string;
+        if (value === "") return usage();
+        if (token === "--allowed-path-prefixes") {
+          if (allowedPathPrefixes !== null) return usage();
+          const parsed = parseLaneDiffStringArray(value, 1);
+          if (parsed === null) return usage();
+          allowedPathPrefixes = parsed;
+        } else if (token === "--policy-protected-paths") {
+          if (policyProtectedPaths !== undefined) return usage();
+          const parsed = parseLaneDiffStringArray(value, 0);
+          if (parsed === null) return usage();
+          policyProtectedPaths = parsed;
+        } else {
+          if (sawBase) return usage();
+          sawBase = true;
+          // Only a full 40-digit lowercase hex sha is trusted. Anything else
+          // (a 64-digit sha, uppercase hex, HEAD, a ref name) is allowance
+          // off: the value is never resolved, printed, or carried further.
+          baseline = LANE_DIFF_CLI_BASE_SHA_PATTERN.test(value)
+            ? { allowance: "trusted", baseCommit: value }
+            : { allowance: "off" };
+        }
+        continue;
+      }
+      if (token.startsWith("--")) return usage();
+      // The single positional worktree.
+      if (worktreePath !== null) return usage();
+      if (
+        token.length < 1 ||
+        token.length > LANE_DIFF_CLI_MAX_WORKTREE_LENGTH ||
+        token.includes("\n") ||
+        token.includes("\u0000")
+      ) {
+        return usage();
+      }
+      worktreePath = token;
+    }
+
+    if (worktreePath === null || allowedPathPrefixes === null) return usage();
+    return {
+      kind: "ready",
+      worktreePath,
+      allowedPathPrefixes,
+      ...(policyProtectedPaths !== undefined ? { policyProtectedPaths } : {}),
+      baseline,
+    };
+  } catch {
+    // A throwing getter, a hostile Proxy trap, or any read failure is the
+    // same typed refusal.
+    return usage();
+  }
+}

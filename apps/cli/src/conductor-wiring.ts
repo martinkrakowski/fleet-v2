@@ -368,6 +368,8 @@ export function buildDryRunConductorDriver(
     forgeRepository: fakes.forgeRepository,
     parkNotice: fakes.parkNotice,
     autoMergeEnabled: true,
+    // Dry-run exercises the full merging -> merged path on the fake driver:
+    premergeMode: 'auto-attest',
   });
   return buildConductorDriver({
     driverLease: stores.driverLease,

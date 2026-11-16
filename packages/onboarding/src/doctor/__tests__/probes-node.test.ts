@@ -104,6 +104,7 @@ describe('createNodeDoctorProbes', () => {
       '-c',
       "''\\''true'\\'''",
     ]);
+    expect(local.calls[0]?.options?.timeoutMs).toBe(10_000);
   });
 
   it('sends the commandAvailable probe over ssh as one quoted sh -c word', async () => {
@@ -122,6 +123,7 @@ describe('createNodeDoctorProbes', () => {
       '-c',
       "''\\''sh'\\'' '\\''-c'\\'' '\\''command -v nc'\\'''",
     ]);
+    expect(ssh.calls[0]?.options?.timeoutMs).toBe(10_000);
   });
 
   it('refuses an unsafe ssh host or a NUL-bearing argv without reaching the executor', async () => {
@@ -133,6 +135,20 @@ describe('createNodeDoctorProbes', () => {
     await expect(probes.hostReachable('bad host')).resolves.toBe(false);
     await expect(probes.worktreeRootWritable('-dash-alias')).resolves.toBe(false);
     await expect(probes.fileMode('lane-host', '/bad\0path')).resolves.toBeUndefined();
+    expect(ssh.calls).toHaveLength(0);
+  });
+
+  it('maps a refused ssh alias to the failed answer of commandAvailable, toolVersion and serverProbe without spawning', async () => {
+    const ssh = fakeExecutor({});
+    const probes = createNodeDoctorProbes({ localExecutor: ssh.executor });
+    for (const alias of ['bad host', '-dash-alias', '']) {
+      await expect(probes.commandAvailable(alias, 'sh')).resolves.toBe(false);
+      await expect(probes.toolVersion(alias, 'claude-code')).resolves.toBeUndefined();
+      await expect(probes.serverProbe(alias, 4096)).resolves.toEqual({
+        outcome: 'unknown',
+        reason: 'the server probe could not be run',
+      });
+    }
     expect(ssh.calls).toHaveLength(0);
   });
 
@@ -256,6 +272,21 @@ describe('createNodeDoctorProbes', () => {
     const probes = createNodeDoctorProbes({ localExecutor: local.executor, timeoutMs: 2_500 });
     await probes.commandAvailable('local', 'sh');
     expect(local.calls[0]?.options?.timeoutMs).toBe(2_500);
+  });
+
+  it('passes the configured budget to every ssh probe and the fixed connect budget to reachability', async () => {
+    const fake = fakeExecutor({ stdout: '200' });
+    const probes = createNodeDoctorProbes({ localExecutor: fake.executor, timeoutMs: 2_500 });
+    await probes.hostReachable('lane-host');
+    await probes.commandAvailable('lane-host', 'sh');
+    await probes.toolVersion('lane-host', 'claude-code');
+    await probes.ciRunnerSlot!('lane-host', 'fleet-ci@1.service');
+    await probes.serverProbe('lane-host', 4166);
+    // serverProbe makes two runs: the first answers 200, so the model list is asked too.
+    expect(fake.calls.map((call) => call.options?.timeoutMs)).toEqual([
+      10_000, 2_500, 2_500, 2_500, 2_500, 2_500,
+    ]);
+    expect(fake.calls.map((call) => call.argv[0])).toEqual(['ssh', 'ssh', 'ssh', 'ssh', 'ssh', 'ssh']);
   });
 
   it('resolves the bundled ocm-run binary and its sha256 through the executor', async () => {
@@ -654,13 +685,19 @@ describe('createNodeDoctorProbes', () => {
   it('sends the server probe argv over ssh without a tunnel or credential', async () => {
     const ssh = fakeExecutor(({ argv }) =>
       argv.some((arg) => arg.includes('/api/model'))
-        ? { exitCode: 0, signal: null, stdout: '{"data":{"models":{}}}', stderr: '' }
+        ? {
+            exitCode: 0,
+            signal: null,
+            stdout: '{"data":{"models":{"acme/alpha-1":{"variants":["high"]}}}}',
+            stderr: '',
+          }
         : { exitCode: 0, signal: null, stdout: '200', stderr: '' },
     );
     const probes = createNodeDoctorProbes({ localExecutor: ssh.executor });
     await expect(probes.serverProbe('lane-host', 4166)).resolves.toEqual({
       outcome: 'pass',
       reason: 'the opencode server on 127.0.0.1:4166 answered',
+      models: ['acme/alpha-1', 'acme/alpha-1#high'],
     });
     expect(ssh.calls[0]?.argv).toEqual([
       'ssh',
@@ -674,6 +711,21 @@ describe('createNodeDoctorProbes', () => {
       '-c',
       "''\\''curl'\\'' '\\''-sS'\\'' '\\''--max-time'\\'' '\\''5'\\'' '\\''--noproxy'\\'' '\\''127.0.0.1,localhost'\\'' '\\''-o'\\'' '\\''/dev/null'\\'' '\\''-w'\\'' '\\''%{http_code}'\\'' '\\''http://127.0.0.1:4166/api/info'\\'''",
     ]);
+    expect(ssh.calls).toHaveLength(2);
+    expect(ssh.calls[1]?.argv).toEqual([
+      'ssh',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=10',
+      'lane-host',
+      '--',
+      'sh',
+      '-c',
+      "''\\''curl'\\'' '\\''-sS'\\'' '\\''--max-time'\\'' '\\''5'\\'' '\\''--noproxy'\\'' '\\''127.0.0.1,localhost'\\'' '\\''http://127.0.0.1:4166/api/model'\\'''",
+    ]);
+    expect(ssh.calls[0]?.options?.timeoutMs).toBe(10_000);
+    expect(ssh.calls[1]?.options?.timeoutMs).toBe(10_000);
   });
 
   it('maps a non-zero exit and a spawn error to UNKNOWN without printing a body', async () => {
@@ -696,6 +748,45 @@ describe('createNodeDoctorProbes', () => {
       outcome: 'unknown',
       reason: 'the server probe could not be run',
     });
+  });
+
+  it('maps 401 and 403 to unknown, another status to fail, and an unreadable model list to a pass without models', async () => {
+    for (const code of ['401', '403']) {
+      const locked = fakeExecutor({ stdout: code });
+      const probes = createNodeDoctorProbes({ localExecutor: locked.executor });
+      await expect(probes.serverProbe('local', 4096)).resolves.toEqual({
+        outcome: 'unknown',
+        reason: 'the opencode server on 127.0.0.1:4096 requires authentication',
+      });
+      expect(locked.calls).toHaveLength(1);
+    }
+
+    const broken = fakeExecutor({ stdout: '500' });
+    const brokenProbes = createNodeDoctorProbes({ localExecutor: broken.executor });
+    await expect(brokenProbes.serverProbe('local', 4096)).resolves.toEqual({
+      outcome: 'fail',
+      reason: 'the opencode server on 127.0.0.1:4096 answered HTTP 500',
+    });
+    expect(broken.calls).toHaveLength(1);
+
+    const modelAnswers: DoctorCommandRunResult[] = [
+      { exitCode: 22, signal: null, stdout: '', stderr: '' },
+      { exitCode: null, signal: null, stdout: '', stderr: '', error: 'spawn ENOENT' },
+      { exitCode: 0, signal: null, stdout: 'not json', stderr: '' },
+    ];
+    for (const modelAnswer of modelAnswers) {
+      const fake = fakeExecutor(({ argv }) =>
+        argv.some((arg) => arg.endsWith('/api/model'))
+          ? modelAnswer
+          : { exitCode: 0, signal: null, stdout: '200', stderr: '' },
+      );
+      const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+      await expect(probes.serverProbe('local', 4096)).resolves.toEqual({
+        outcome: 'pass',
+        reason: 'the opencode server on 127.0.0.1:4096 answered',
+      });
+      expect(fake.calls).toHaveLength(2);
+    }
   });
 });
 
@@ -1088,6 +1179,22 @@ describe('createNodeDoctorProbes ciRunnerSlot (OG-28c)', () => {
     }
   });
 
+  it('maps a CRLF answer, a reloading unit and a maintenance unit to unknown', async () => {
+    const outcomes: Partial<DoctorCommandRunResult>[] = [
+      { exitCode: 0, stdout: 'active\r\n' },
+      { exitCode: 0, stdout: 'reloading\n' },
+      { exitCode: 3, stdout: 'inactive\r\n' },
+      { exitCode: 3, stdout: 'maintenance\n' },
+      { exitCode: 0, stdout: 'maintenance\n' },
+    ];
+    for (const outcome of outcomes) {
+      const fake = fakeExecutor(outcome);
+      const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+      await expect(probes.ciRunnerSlot!('local', UNIT)).resolves.toBe('unknown');
+      expect(fake.calls).toHaveLength(1);
+    }
+  });
+
   it('refuses a unit that is not a plain service name without running anything', async () => {
     const fake = fakeExecutor({ stdout: 'active\n' });
     const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
@@ -1174,12 +1281,27 @@ describe('createNodeDoctorProbes loginShell (SHP1)', () => {
     await expect(probes.loginShell!('lane-host')).resolves.toBe('mangled');
   });
 
+  it('answers unknown, never mangled or intact, when the answer exceeds the executor output cap (real /bin/sh)', async () => {
+    const real = createNodeDoctorExecutor();
+    const overflow = await real.run(['/bin/sh', '-c', 'head -c 1100000 /dev/zero']);
+    expect(overflow.exitCode).toBeNull();
+    expect(typeof overflow.error).toBe('string');
+    expect(overflow.stdout).toBe('');
+
+    const probes = createNodeDoctorProbes({
+      sshExecutor: viaRealShell('head -c 1100000 /dev/zero; '),
+    });
+    await expect(probes.loginShell!('lane-host')).resolves.toBe('unknown');
+  });
+
   it('maps an altered echo or a non-zero exit to mangled', async () => {
     const outcomes: Partial<DoctorCommandRunResult>[] = [
       { stdout: '' },
       { stdout: `${C}\n` },
       { stdout: `banner\n${C}` },
       { stdout: C.replace('a  b', 'a b') },
+      // True of the pure mapper only: the real executor never returns 2 MB, it
+      // reports the 1 MiB cap as an error, which is `unknown` (see the test above).
       { stdout: 'x'.repeat(2_000_000) },
       { exitCode: 1, stdout: C },
       { exitCode: 127, stdout: '' },

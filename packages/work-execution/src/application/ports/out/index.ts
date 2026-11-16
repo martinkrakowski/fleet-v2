@@ -81,6 +81,7 @@ export * from "./ReleaseStorePort.out-port.js";
 export * from "./RepositoryFactsPort.out-port.js";
 export * from "./ReviewAssessmentPort.out-port.js";
 export * from "./ReviewRequestPort.out-port.js";
+export * from "./ReviewThreadHelperPort.out-port.js";
 export * from "./RunnerForAttemptPort.out-port.js";
 export * from "./RunnerSelectorPort.out-port.js";
 export * from "./RunTelemetryMarkPort.out-port.js";

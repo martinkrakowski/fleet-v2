@@ -52,7 +52,7 @@ interface Harness {
 
 function harness(options: {
   pack?: BuildFactPackResult;
-  session?: BriefAuthorSessionResult | 'throw' | 'absent';
+  session?: BriefAuthorSessionResult | 'throw' | 'absent' | readonly (BriefAuthorSessionResult | 'throw')[];
   prepare?: PrepareBriefPackageResult;
 } = {}): Harness {
   const packCalls: unknown[] = [];
@@ -71,12 +71,20 @@ function harness(options: {
     ...(options.session === 'absent' ? {} : {
       async authorBriefSession(request: BriefAuthorSessionRequest): Promise<BriefAuthorSessionResult> {
         sessionCalls.push(request);
-        if (options.session === 'throw') {
+        const scripted = options.session;
+        if (scripted !== undefined && scripted !== 'throw' && scripted !== 'absent' && 'length' in scripted) {
+          const step = scripted[Math.min(sessionCalls.length - 1, scripted.length - 1)];
+          if (step === 'throw') {
+            throw new Error('seat exploded at /secret/path');
+          }
+          return step;
+        }
+        if (scripted === 'throw') {
           throw new Error('seat exploded at /secret/path');
         }
-        return options.session === undefined || options.session === 'absent'
+        return scripted === undefined || scripted === 'absent'
           ? { outcome: 'answered', answer: answerOf(DISPATCH) }
-          : options.session;
+          : scripted;
       },
     }),
   };
@@ -308,5 +316,178 @@ describe('AuthorBriefUseCase', () => {
     expect(result).toEqual({ outcome: 'unknown', reason: 'seat-call-failed' });
     expect(JSON.stringify(result)).not.toContain('/secret/path');
     expect(h.prepareCalls).toHaveLength(0);
+  });
+
+  const NARRATED = `Here is the brief you asked for.\n${answerOf(DISPATCH)}`;
+
+  it('retries once when the first answer has text before ===NOTES=== and authors from the retry', async () => {
+    const h = harness({ session: [{ outcome: 'answered', answer: NARRATED }, { outcome: 'answered', answer: answerOf(DISPATCH) }] });
+    const result = await author(h, validRequest());
+    const canonical = `brief-author/wo-1/lane-1@${COMMIT.slice(0, 12)}`;
+    expect(result).toEqual({
+      outcome: 'authored', attemptId: 'attempt-1', briefDigest: 'digest-1',
+      sessionKey: `${canonical}/retry`, failedAttempts: ['text-before-notes-marker'],
+    });
+    expect(h.sessionCalls).toHaveLength(2);
+    const [first, second] = h.sessionCalls as [BriefAuthorSessionRequest, BriefAuthorSessionRequest];
+    expect(first.sessionKey).toBe(canonical);
+    expect('retry' in first).toBe(false);
+    expect(first.prompt).toBe('FACT-PACK-PROMPT');
+    expect(second.sessionKey).toBe(`${canonical}/retry`);
+    expect(second.retry).toBe(true);
+    expect(second.prompt).toBe(`FACT-PACK-PROMPT\nBegin your answer with the ===NOTES=== marker line and put no text before it.`);
+    const strip = (call: BriefAuthorSessionRequest): Record<string, unknown> => {
+      const copy: Record<string, unknown> = { ...call };
+      delete copy.sessionKey;
+      delete copy.prompt;
+      delete copy.retry;
+      return copy;
+    };
+    expect(strip(second)).toEqual(strip(first));
+    expect(h.prepareCalls).toHaveLength(1);
+    expect(h.prepareCalls[0]?.proseMarkdown).toBe(DISPATCH);
+  });
+
+  it('a first-attempt success carries no failedAttempts and makes one seat call', async () => {
+    const h = harness();
+    const result = await author(h, validRequest());
+    expect('failedAttempts' in result).toBe(false);
+    expect(h.sessionCalls).toHaveLength(1);
+    expect(result.outcome === 'authored' && result.sessionKey.endsWith('/retry')).toBe(false);
+  });
+
+  it('refuses with parse-violation after exactly one retry when both answers have text before ===NOTES===', async () => {
+    const h = harness({ session: [{ outcome: 'answered', answer: NARRATED }, { outcome: 'answered', answer: NARRATED }] });
+    expect(await author(h, validRequest())).toEqual({
+      outcome: 'refused', reason: 'parse-violation', detail: 'text-before-notes-marker',
+      failedAttempts: ['text-before-notes-marker', 'text-before-notes-marker'],
+    });
+    expect(h.sessionCalls).toHaveLength(2);
+    expect(h.prepareCalls).toHaveLength(0);
+  });
+
+  it('returns the second failure when the retry answer is different malformed', async () => {
+    const h = harness({ session: [{ outcome: 'answered', answer: NARRATED }, { outcome: 'answered', answer: '===NOTES===\nn\n' }] });
+    expect(await author(h, validRequest())).toEqual({
+      outcome: 'refused', reason: 'parse-violation', detail: 'missing-dispatch-marker',
+      failedAttempts: ['text-before-notes-marker', 'missing-dispatch-marker'],
+    });
+    expect(h.sessionCalls).toHaveLength(2);
+  });
+
+  it('does not retry an empty first answer', async () => {
+    const h = harness({ session: { outcome: 'answered', answer: '' } });
+    expect(await author(h, validRequest())).toEqual({ outcome: 'refused', reason: 'seat-unavailable', detail: 'session-empty' });
+    expect(h.sessionCalls).toHaveLength(1);
+    expect(h.prepareCalls).toHaveLength(0);
+  });
+
+  it('does not retry a first answer missing the dispatch marker', async () => {
+    const h = harness({ session: { outcome: 'answered', answer: `===NOTES===\n${NOTES_TEXT}\n` } });
+    const result = await author(h, validRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'parse-violation', detail: 'missing-dispatch-marker' });
+    expect(h.sessionCalls).toHaveLength(1);
+    expect('failedAttempts' in result).toBe(false);
+    expect(h.prepareCalls).toHaveLength(0);
+  });
+
+  it('does not retry a secret-shaped first answer', async () => {
+    const secret = `AKIA${'ABCDEFGHIJKLMNOP'}`;
+    const h = harness({ session: { outcome: 'answered', answer: answerOf(DISPATCH, `note ${secret}`) } });
+    const result = await author(h, validRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'secret-shaped', detail: null });
+    expect(h.sessionCalls).toHaveLength(1);
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(h.prepareCalls).toHaveLength(0);
+  });
+
+  it('does not retry when the first seat call is unavailable', async () => {
+    const h = harness({ session: { outcome: 'unavailable', reason: 'session-timeout' } });
+    const result = await author(h, validRequest());
+    expect(result).toEqual({ outcome: 'refused', reason: 'seat-unavailable', detail: 'session-timeout' });
+    expect(h.sessionCalls).toHaveLength(1);
+    expect('failedAttempts' in result).toBe(false);
+    expect(h.prepareCalls).toHaveLength(0);
+  });
+
+  it('does not retry when the first seat call throws', async () => {
+    const h = harness({ session: 'throw' });
+    expect(await author(h, validRequest())).toEqual({ outcome: 'unknown', reason: 'seat-call-failed' });
+    expect(h.sessionCalls).toHaveLength(1);
+    expect(h.prepareCalls).toHaveLength(0);
+  });
+
+  it('a retry that is unavailable is returned as the typed second failure', async () => {
+    const h = harness({ session: [{ outcome: 'answered', answer: NARRATED }, { outcome: 'unavailable', reason: 'session-timeout' }] });
+    expect(await author(h, validRequest())).toEqual({
+      outcome: 'refused', reason: 'seat-unavailable', detail: 'session-timeout',
+      failedAttempts: ['text-before-notes-marker', 'session-timeout'],
+    });
+  });
+
+  it('a retry that throws is returned as unknown with both attempts', async () => {
+    const h = harness({ session: [{ outcome: 'answered', answer: NARRATED }, 'throw'] });
+    const result = await author(h, validRequest());
+    expect(result).toEqual({
+      outcome: 'unknown', reason: 'seat-call-failed',
+      failedAttempts: ['text-before-notes-marker', 'seat-call-failed'],
+    });
+    expect(JSON.stringify(result)).not.toContain('/secret/path');
+  });
+
+  it('a retry that is empty is returned as session-empty with both attempts', async () => {
+    const h = harness({ session: [{ outcome: 'answered', answer: NARRATED }, { outcome: 'answered', answer: '  ' }] });
+    expect(await author(h, validRequest())).toEqual({
+      outcome: 'refused', reason: 'seat-unavailable', detail: 'session-empty',
+      failedAttempts: ['text-before-notes-marker', 'session-empty'],
+    });
+  });
+
+  it('a secret-shaped retry answer is refused and carries both attempts', async () => {
+    const h = harness({
+      session: [{ outcome: 'answered', answer: NARRATED }, { outcome: 'answered', answer: answerOf(DISPATCH, `note ${`AKIA${'ABCDEFGHIJKLMNOP'}`}`) }],
+    });
+    const result = await author(h, validRequest());
+    expect(result).toEqual({
+      outcome: 'refused', reason: 'secret-shaped', detail: null,
+      failedAttempts: ['text-before-notes-marker', 'secret-shaped'],
+    });
+    expect(JSON.stringify(result)).not.toContain('AKIA');
+  });
+
+  it('a lint violation after a successful retry carries the failed attempt', async () => {
+    const dispatch = DISPATCH.replace('## Challenge this\nThe file list.', '');
+    const h = harness({ session: [{ outcome: 'answered', answer: NARRATED }, { outcome: 'answered', answer: answerOf(dispatch) }] });
+    expect(await author(h, validRequest())).toEqual({
+      outcome: 'refused', reason: 'lint-violation', detail: 'missing-challenge-this',
+      failedAttempts: ['text-before-notes-marker'],
+    });
+  });
+
+  it('a freeze refusal after a successful retry carries the failed attempt', async () => {
+    const h = harness({
+      session: [{ outcome: 'answered', answer: NARRATED }, { outcome: 'answered', answer: answerOf(DISPATCH) }],
+      prepare: { outcome: 'rejected', reason: 'cannot place /private/path/brief.md' },
+    });
+    expect(await author(h, validRequest())).toEqual({
+      outcome: 'refused', reason: 'freeze-rejected', detail: null,
+      failedAttempts: ['text-before-notes-marker'],
+    });
+    expect(h.sessionCalls).toHaveLength(2);
+  });
+
+  it('retries once when the first answer opens with ===DISPATCH===', async () => {
+    const first = ['===DISPATCH===', DISPATCH, '===NOTES===', NOTES_TEXT].join('\n');
+    const h = harness({ session: [{ outcome: 'answered', answer: first }, { outcome: 'answered', answer: answerOf(DISPATCH) }] });
+    const result = await author(h, validRequest());
+    expect(result.outcome).toBe('authored');
+    expect(h.sessionCalls).toHaveLength(2);
+    expect(result.outcome === 'authored' && result.failedAttempts).toEqual(['text-before-notes-marker']);
+  });
+
+  it('never retries more than once however the seat answers', async () => {
+    const h = harness({ session: [{ outcome: 'answered', answer: NARRATED }] });
+    await author(h, validRequest());
+    expect(h.sessionCalls).toHaveLength(2);
   });
 });

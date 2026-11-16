@@ -68,6 +68,7 @@ export * from "./stall-attention.js";
 export * from "./stall-rules.js";
 export * from "./start-incomplete-fact.js";
 export * from "./state-compaction.js";
+export * from "./train-health-rules.js";
 export * from "./value-objects/index.js";
 export * from "./work-board.js";
 export * from "./work-board-facts.js";

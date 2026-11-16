@@ -35,9 +35,9 @@ export const AUTHOR_BRIEF_REFUSAL_REASONS = [
 export type AuthorBriefRefusalReason = (typeof AUTHOR_BRIEF_REFUSAL_REASONS)[number];
 
 export type AuthorBriefResult =
-  | { readonly outcome: 'authored'; readonly attemptId: string; readonly briefDigest: string; readonly sessionKey: string }
-  | { readonly outcome: 'refused'; readonly reason: AuthorBriefRefusalReason; readonly detail: string | null }
-  | { readonly outcome: 'unknown'; readonly reason: 'seat-call-failed' | 'session-outcome-unknown' };
+  | { readonly outcome: 'authored'; readonly attemptId: string; readonly briefDigest: string; readonly sessionKey: string; /** Codes of the failed seat attempts, present only after a retry. */ readonly failedAttempts?: readonly string[] }
+  | { readonly outcome: 'refused'; readonly reason: AuthorBriefRefusalReason; readonly detail: string | null; /** Codes of the failed seat attempts, present only after a retry. */ readonly failedAttempts?: readonly string[] }
+  | { readonly outcome: 'unknown'; readonly reason: 'seat-call-failed' | 'session-outcome-unknown'; /** Codes of the failed seat attempts, present only after a retry. */ readonly failedAttempts?: readonly string[] };
 
 export interface AuthorBriefPort {
   authorBrief(request: AuthorBriefRequest): Promise<AuthorBriefResult>;

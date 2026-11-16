@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import type { CutoverRecord } from '@fleet/work-execution';
+import { CUTOVER_SHADOW_CRITERIA, type CutoverRecord } from '@fleet/work-execution';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from './composition.js';
 import { runCli, type CliIo } from './index.js';
@@ -178,7 +178,7 @@ describe('fleet-v2 cutover status and rollback', () => {
     });
   });
 
-  it('exits 2 on usage errors and for the unbuilt switch and retire moves', async () => {
+  it('exits 2 on usage errors: bare cutover switch and bare cutover retire lack required flags, beside the status and rollback usage rows', async () => {
     const runtime = runtimeFor();
     const usage: readonly (readonly string[])[] = [
       ['cutover', 'status', '--bogus', 'x'],
@@ -194,7 +194,12 @@ describe('fleet-v2 cutover status and rollback', () => {
       ['cutover', 'rollback', '--expected-revision', '1', '--operation-id', 'op-1', '--bogus', 'x'],
       ['cutover', 'rollback', '--expected-revision', '1', '--operation-id', 'op-1', 'extra'],
       ['cutover', 'switch'],
+      ['cutover', 'switch', '--expected-revision', '0'],
+      ['cutover', 'switch', '--expected-revision', '0', '--operation-id', 'op-1'],
+      ['cutover', 'switch', '--expected-revision', '0', '--operation-id', 'op-1', '--relaunch-plan-digest', 'ZZ'],
+      ['cutover', 'switch', 'extra', '--expected-revision', '0', '--operation-id', 'op-1', '--relaunch-plan-digest', PLAN_DIGEST],
       ['cutover', 'retire'],
+      ['cutover', 'retire', '--expected-revision', '0', '--operation-id', 'op-1'],
     ];
     for (const argv of usage) {
       const result = await run(runtime, argv);
@@ -202,5 +207,80 @@ describe('fleet-v2 cutover status and rollback', () => {
     }
     expect(existsSync(join(stateDir, 'cutover.json'))).toBe(false);
     expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
+  });
+
+  it('cutover switch with its flags refuses shadow-evidence-absent and writes no cutover file', async () => {
+    const runtime = runtimeFor();
+    const result = await run(runtime, [
+      'cutover', 'switch',
+      '--expected-revision', '0',
+      '--operation-id', 'op-1',
+      '--relaunch-plan-digest', PLAN_DIGEST,
+      '--now-iso', NOW,
+    ]);
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-evidence-absent', failed: [...CUTOVER_SHADOW_CRITERIA] });
+    expect(existsSync(join(stateDir, 'cutover.json'))).toBe(false);
+    expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
+    expect(result.out).not.toContain(stateDir);
+  });
+
+  it('cutover retire before a switch refuses not-switched', async () => {
+    const runtime = runtimeFor();
+    const result = await run(runtime, [
+      'cutover', 'retire', '--expected-revision', '1', '--operation-id', 'op-1', '--now-iso', NOW,
+    ]);
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'not-switched' });
+    expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
+  });
+
+  it('cutover retire after the window saves retired and does not print the state directory', async () => {
+    const runtime = runtimeFor();
+    await seedSwitched(runtime, true);
+    const result = await run(runtime, [
+      'cutover', 'retire', '--expected-revision', '1', '--operation-id', 'op-1', '--now-iso', '2026-11-20T12:00:00.000Z',
+    ]);
+    expect(result.code).toBe(0);
+    expect(result.json).toMatchObject({
+      outcome: 'completed',
+      move: 'retire',
+      key: 'cutover/retire@1',
+      replayed: false,
+      state: 'retired',
+      revision: 2,
+    });
+    expect(JSON.parse(readFileSync(join(stateDir, 'killall-train-pause.json'), 'utf8'))).toEqual([
+      expect.objectContaining({ paused: false }),
+    ]);
+    expect(JSON.parse(readFileSync(join(stateDir, 'cutover.json'), 'utf8'))).toMatchObject({ state: 'retired', retiredAtIso: '2026-11-20T12:00:00.000Z' });
+    expect(result.out).not.toContain(stateDir);
+  });
+
+  it('cutover retire names retire, not rollback, in its expected-revision usage error', async () => {
+    const runtime = runtimeFor();
+    const retire = await run(runtime, ['cutover', 'retire', '--expected-revision', '0', '--operation-id', 'op-1']);
+    expect(retire.code).toBe(2);
+    expect(retire.err).toContain('cutover retire requires --expected-revision');
+    expect(retire.err).not.toContain('cutover rollback');
+    const rollback = await run(runtime, ['cutover', 'rollback', '--expected-revision', '0', '--operation-id', 'op-1']);
+    expect(rollback.err).toContain('cutover rollback requires --expected-revision');
+  });
+
+  it('cutover switch validates the operation id before the digest, as the first release did', async () => {
+    const runtime = runtimeFor();
+    const result = await run(runtime, ['cutover', 'switch', '--expected-revision', '0']);
+    expect(result.code).toBe(2);
+    expect(result.err).toContain('cutover switch requires --operation-id');
+    expect(result.err).not.toContain('--relaunch-plan-digest');
+  });
+
+  it('a completed retire prints its keys in the first release order', async () => {
+    const runtime = runtimeFor();
+    await seedSwitched(runtime, true);
+    const result = await run(runtime, [
+      'cutover', 'retire', '--expected-revision', '1', '--operation-id', 'op-1', '--now-iso', '2026-11-20T12:00:00.000Z',
+    ]);
+    expect(Object.keys(result.json ?? {})).toEqual(['outcome', 'move', 'key', 'replayed', 'state', 'revision', 'record']);
   });
 });

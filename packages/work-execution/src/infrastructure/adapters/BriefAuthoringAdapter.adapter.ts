@@ -215,6 +215,8 @@ export interface LockFsOps {
   ): void;
   readFileSync(filePath: string, encoding: BufferEncoding): string;
   renameSync(oldPath: string, newPath: string): void;
+  /** Hard link that fails with EEXIST instead of overwriting; restores a moved lock safely. */
+  linkSync(existingPath: string, newPath: string): void;
   unlinkSync(filePath: string): void;
 }
 
@@ -317,23 +319,94 @@ export function isLockStale(
   return age >= staleAfterMs * CROSS_HOST_FACTOR;
 }
 
+/** Unlink a scratch file, ignoring every failure (a leftover is harmless; see ACQUIRE). */
+function bestEffortUnlink(fsOps: LockFsOps, filePath: string): void {
+  try {
+    fsOps.unlinkSync(filePath);
+  } catch {
+    // A lingering scratch file never sits at the lock path.
+  }
+}
+
+function readIfPresent(fsOps: LockFsOps, filePath: string): string | null | 'unreadable' {
+  try {
+    return fsOps.readFileSync(filePath, 'utf8');
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'ENOENT' ? null : 'unreadable';
+  }
+}
+
 /**
- * ACQUIRE(lockPath):
- * 1. Try `fs.writeFileSync(lockPath, payload, { flag: 'wx' })`. If it succeeds,
- *    record payload {pid, host, ts, token} where token is a fresh randomUUID()
- *    and return owned. The exclusive create is the only step that ever grants
- *    ownership, so two racers can never both own the lock.
- * 2. If it throws EEXIST: read the existing lock payload.
- *    a. If it is NOT stale: return NOT owned.
- *    b. If it IS stale: TAKE OVER atomically:
- *       - re-read the lock and confirm it still holds the exact stale bytes
- *         that were inspected (a foreign writer replaced it otherwise),
- *       - `fs.renameSync(lockPath, graveyard)` moves the stale lock aside —
- *         exactly one racer's rename can succeed; a later racer gets ENOENT,
- *       - re-read the moved bytes: if they are no longer the stale payload,
- *         a live lock was moved by mistake — put it back and lose this round,
- *       - unlink the stale copy and create the lock again with `wx`; on
- *         EEXIST another waiter created first — re-evaluate from step 1.
+ * Remove the takeover guard only while it still carries `guardToken`; any
+ * doubt leaves it in place (it ages out through isLockStale).
+ */
+function releaseGuard(fsOps: LockFsOps, guardPath: string, guardToken: string): void {
+  const raw = readIfPresent(fsOps, guardPath);
+  if (typeof raw === 'string' && parseLockPayload(raw)?.token === guardToken) {
+    bestEffortUnlink(fsOps, guardPath);
+  }
+}
+
+/**
+ * Move `targetPath` aside only if it still holds exactly `examinedRaw`, and
+ * never leave the path absent because of this call. `rename` is by path, so a
+ * different file could slip in between the compare and the move; the moved
+ * bytes are therefore compared again, and a mismatch is restored with `link`
+ * (which refuses to overwrite) rather than `rename` (which would clobber a
+ * lock somebody created in the gap). Returns true only when the examined bytes
+ * were moved aside and removed.
+ */
+function removeIfUnchanged(
+  fsOps: LockFsOps,
+  targetPath: string,
+  examinedRaw: string,
+  scratchPath: string,
+): boolean {
+  if (readIfPresent(fsOps, targetPath) !== examinedRaw) {
+    return false;
+  }
+  try {
+    fsOps.renameSync(targetPath, scratchPath);
+  } catch {
+    return false;
+  }
+  if (readIfPresent(fsOps, scratchPath) === examinedRaw) {
+    bestEffortUnlink(fsOps, scratchPath);
+    return true;
+  }
+  // A different file was moved. Put it back without overwriting anything.
+  try {
+    fsOps.linkSync(scratchPath, targetPath);
+    bestEffortUnlink(fsOps, scratchPath);
+  } catch {
+    // The path is occupied again (or the link failed): the moved copy stays at
+    // the scratch path and this caller reports not-acquired.
+  }
+  return false;
+}
+
+/**
+ * ACQUIRE(lockPath). Ownership is granted only by an exclusive create
+ * (`wx`) of the lock path whose content, re-read afterwards, carries this
+ * caller's own token. Nothing else ever grants it.
+ * 1. Try `wx` create. Success -> re-read and confirm the token -> owned.
+ * 2. On EEXIST read the lock. Unreadable (other than gone) or not stale ->
+ *    NOT owned. Gone -> retry step 1.
+ * 3. Stale: TAKE OVER under a guard. Take `${lockPath}.takeover` by `wx`
+ *    create; if it exists, the guard is itself broken only when it is stale
+ *    (same compare-then-move discipline), otherwise NOT owned. Only the guard
+ *    holder may touch a stale lock, so two takers (and a taker examining an
+ *    earlier read against a lock that has since been replaced) cannot
+ *    interleave their destructive steps.
+ *    - Re-read the lock: gone or not byte-identical to the examined stale
+ *      payload -> release the guard and re-evaluate from step 1; the live
+ *      lock is never touched.
+ *    - Move it aside to a unique name, compare the moved bytes again, and
+ *      restore with `link` (no overwrite) on mismatch (removeIfUnchanged).
+ *    - `wx` create the new lock, re-read it, own it only if the token matches;
+ *      then release the guard (only while it still carries this caller's token).
+ * A crash at any step leaves either a stale lock, an absent lock path, or an
+ * aged guard / scratch file; the next caller resolves each of those.
  */
 export function acquireLock(
   lockPath: string,
@@ -346,96 +419,79 @@ export function acquireLock(
   const currentHost = options?.currentHost ?? os.hostname();
   const myToken = options?.token ?? randomUUID();
   const payload = createLockPayload(now, pid, currentHost, myToken);
+  const guardPath = `${lockPath}.takeover`;
+
+  const tryCreate = (): 'created' | 'exists' | 'failed' => {
+    try {
+      fsOps.writeFileSync(lockPath, payload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    } catch (error) {
+      return (error as NodeJS.ErrnoException)?.code === 'EEXIST' ? 'exists' : 'failed';
+    }
+    // Confirm what is at the path is this caller's own write before claiming it.
+    const written = readIfPresent(fsOps, lockPath);
+    return typeof written === 'string' && parseLockPayload(written)?.token === myToken
+      ? 'created'
+      : 'failed';
+  };
 
   for (let attempt = 0; attempt < MAX_TAKEOVER_ATTEMPTS; attempt += 1) {
-    try {
-      fsOps.writeFileSync(lockPath, payload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    const created = tryCreate();
+    if (created === 'created') {
       return { owned: true, token: myToken, payload };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
-        throw error;
-      }
     }
-
-    let existingRaw: string;
-    try {
-      existingRaw = fsOps.readFileSync(lockPath, 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
-        continue;
-      }
-      throw error;
-    }
-
-    const existingPayload = parseLockPayload(existingRaw);
-    if (!isLockStale(existingPayload, staleAfterMs, now, currentHost)) {
+    if (created === 'failed') {
       return { owned: false };
     }
 
-    // The takeover below moves whatever sits at the lock path, so confirm the
-    // stale bytes are still there first. If another writer replaced them, this
-    // round is lost and the next attempt re-evaluates from the exclusive
-    // create instead of touching a lock it did not inspect.
-    let verifiedRaw: string;
-    try {
-      verifiedRaw = fsOps.readFileSync(lockPath, 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
-        continue;
-      }
-      throw error;
-    }
-    if (verifiedRaw !== existingRaw) {
+    const existingRaw = readIfPresent(fsOps, lockPath);
+    if (existingRaw === null) {
       continue;
     }
+    if (existingRaw === 'unreadable' || !isLockStale(parseLockPayload(existingRaw), staleAfterMs, now, currentHost)) {
+      return { owned: false };
+    }
 
-    const graveyardPath = `${lockPath}.${myToken}.stale`;
+    // Stale: only the takeover-guard holder may touch it.
+    const guardToken = `${myToken}.guard`;
+    const guardPayload = createLockPayload(now, pid, currentHost, guardToken);
+    let guardHeld = false;
     try {
-      fsOps.renameSync(lockPath, graveyardPath);
+      fsOps.writeFileSync(guardPath, guardPayload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      guardHeld = true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
-        // Another reclaimer moved the stale lock first; retry the create.
+      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+        return { owned: false };
+      }
+    }
+    if (!guardHeld) {
+      const guardRaw = readIfPresent(fsOps, guardPath);
+      if (typeof guardRaw === 'string' && isLockStale(parseLockPayload(guardRaw), staleAfterMs, now, currentHost)) {
+        // A crashed taker left its guard behind: break exactly that guard, then retry.
+        removeIfUnchanged(fsOps, guardPath, guardRaw, `${guardPath}.${myToken}.stale`);
         continue;
       }
       return { owned: false };
     }
 
-    // The move is atomic but unconditional: between the verification and the
-    // rename the path could have been replaced by a live lock (a fresher
-    // waiter that won its own takeover). The moved bytes decide: anything
-    // other than the inspected stale payload is put back exactly where it
-    // was, and this round is lost rather than stealing a running owner's
-    // lock.
-    let movedRaw: string | null;
     try {
-      movedRaw = fsOps.readFileSync(graveyardPath, 'utf8');
-    } catch {
-      movedRaw = null;
-    }
-    if (movedRaw !== existingRaw) {
-      try {
-        fsOps.renameSync(graveyardPath, lockPath);
-      } catch {
-        // The moved lock is orphaned at the graveyard path; the next waiter
-        // re-creates the lock from scratch.
+      // Re-check under the guard: a lock that changed since it was judged
+      // stale is somebody else's and must not be touched.
+      if (readIfPresent(fsOps, lockPath) !== existingRaw) {
+        continue;
       }
-      return { owned: false };
-    }
-    try {
-      fsOps.unlinkSync(graveyardPath);
-    } catch {
-      // The stale copy lingers at the graveyard path, never at the lock path.
-    }
-
-    try {
-      fsOps.writeFileSync(lockPath, payload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-      return { owned: true, token: myToken, payload };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
-        throw error;
+      if (!removeIfUnchanged(fsOps, lockPath, existingRaw, `${lockPath}.${myToken}.stale`)) {
+        return { owned: false };
       }
-      // Another waiter created its lock between the move and this create;
-      // re-evaluate from the exclusive create.
+      const takeover = tryCreate();
+      if (takeover === 'created') {
+        return { owned: true, token: myToken, payload };
+      }
+      if (takeover === 'failed') {
+        return { owned: false };
+      }
+      // Somebody created a lock in the gap: re-evaluate it from step 1.
+    } finally {
+      releaseGuard(fsOps, guardPath, guardToken);
     }
   }
   return { owned: false };

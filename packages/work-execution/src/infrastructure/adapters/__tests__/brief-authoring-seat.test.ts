@@ -493,7 +493,7 @@ describe('BriefAuthoringAdapter seat session', () => {
     }
   });
 
-  it('two reclaimers racing a stale lock: loser observes a different token after rename and exactly one returns owned', async () => {
+  it('two reclaimers racing a stale lock: the racer arriving mid-takeover is refused and exactly one returns owned', async () => {
     {
       const s = await setup();
       await fs.mkdir(s.briefsDir, { recursive: true });
@@ -507,6 +507,7 @@ describe('BriefAuthoringAdapter seat session', () => {
         writeFileSync: fsSync.writeFileSync.bind(fsSync),
         readFileSync: fsSync.readFileSync.bind(fsSync),
         renameSync: fsSync.renameSync.bind(fsSync),
+        linkSync: fsSync.linkSync.bind(fsSync),
         unlinkSync: fsSync.unlinkSync.bind(fsSync),
       };
       let winnerResult: AcquireLockResult | undefined;
@@ -524,11 +525,13 @@ describe('BriefAuthoringAdapter seat session', () => {
 
       const loserResult = acquireLock(lockPath, staleAfterMs, { now, fsOps: loserFs });
       expect(winnerResult).toBeDefined();
-      expect(loserResult.owned).toBe(false);
-      expect(winnerResult?.owned).toBe(true);
+      // The first taker holds the takeover guard while it moves the stale lock aside, so
+      // the racer arriving at that moment cannot touch the lock: exactly one owns it.
       expect([loserResult.owned, winnerResult?.owned].filter(Boolean)).toHaveLength(1);
-      if (winnerResult !== undefined && winnerResult.owned) {
-        expect(parseLockPayload(await fs.readFile(lockPath, 'utf8'))?.token).toBe(winnerResult.token);
+      expect(loserResult.owned).toBe(true);
+      expect(winnerResult?.owned).toBe(false);
+      if (loserResult.owned) {
+        expect(parseLockPayload(await fs.readFile(lockPath, 'utf8'))?.token).toBe(loserResult.token);
       }
       expect((await fs.readdir(s.briefsDir)).sort()).toEqual([`${STEM}.lock`]);
     }
@@ -592,6 +595,7 @@ describe('BriefAuthoringAdapter seat session', () => {
         writeFileSync: fsSync.writeFileSync.bind(fsSync),
         readFileSync: fsSync.readFileSync.bind(fsSync),
         renameSync: fsSync.renameSync.bind(fsSync),
+        linkSync: fsSync.linkSync.bind(fsSync),
         unlinkSync: fsSync.unlinkSync.bind(fsSync),
       };
       let winnerResult: AcquireLockResult | undefined;
@@ -737,5 +741,163 @@ describe('BriefAuthoringAdapter seat session', () => {
       });
       expect(s.executor.seatCalls).toHaveLength(1);
     }
+  });
+
+  describe('stale-lock takeover is atomic under every interleaving', () => {
+    const STALE_AFTER_MS = 1_000;
+    const DEAD_PID = 999_999_999;
+    type Op = 'write' | 'read' | 'rename' | 'link' | 'unlink';
+
+    const realOps = (): LockFsOps => ({
+      writeFileSync: fsSync.writeFileSync.bind(fsSync),
+      readFileSync: fsSync.readFileSync.bind(fsSync),
+      renameSync: fsSync.renameSync.bind(fsSync),
+      linkSync: fsSync.linkSync.bind(fsSync),
+      unlinkSync: fsSync.unlinkSync.bind(fsSync),
+    });
+
+    /** Wraps the real fs; `hook` runs before (`phase` 'before') and after each fs call, numbered from 0. */
+    function hookedOps(hook: (index: number, phase: 'before' | 'after', op: Op, target: string) => void): LockFsOps {
+      const real = realOps();
+      let index = -1;
+      const wrap = <A extends unknown[], R>(op: Op, fn: (...args: A) => R, targetOf: (...args: A) => string) =>
+        (...args: A): R => {
+          index += 1;
+          const mine = index;
+          hook(mine, 'before', op, targetOf(...args));
+          const result = fn(...args);
+          hook(mine, 'after', op, targetOf(...args));
+          return result;
+        };
+      return {
+        writeFileSync: wrap('write', real.writeFileSync, (p: string) => p),
+        readFileSync: wrap('read', real.readFileSync, (p: string) => p),
+        renameSync: wrap('rename', real.renameSync, (p: string) => p),
+        linkSync: wrap('link', real.linkSync, (_e: string, n: string) => n),
+        unlinkSync: wrap('unlink', real.unlinkSync, (p: string) => p),
+      };
+    }
+
+    async function staleLock(): Promise<{ lockPath: string; dir: string; now: number; stale: string }> {
+      const s = await setup();
+      await fs.mkdir(s.briefsDir, { recursive: true });
+      const lockPath = path.join(s.briefsDir, `${STEM}.lock`);
+      const now = Date.now();
+      const stale = createLockPayload(now - 2_000_000, DEAD_PID, os.hostname(), 'synthetic-stale-token');
+      await fs.writeFile(lockPath, stale, 'utf8');
+      return { lockPath, dir: s.briefsDir, now, stale };
+    }
+
+    const owners = (results: readonly (AcquireLockResult | undefined)[]) =>
+      results.filter((r): r is Extract<AcquireLockResult, { owned: true }> => r?.owned === true);
+
+    it('A takes over, B (examined the old lock) moves it aside, C creates, B restores: never two owners', async () => {
+      // Subject B is suspended at each of its own fs calls (before and after) while A, then C, run to completion.
+      const probe = await staleLock();
+      let count = 0;
+      acquireLock(probe.lockPath, STALE_AFTER_MS, {
+        now: probe.now, pid: process.pid, fsOps: hookedOps(() => { count += 1; }),
+      });
+      expect(count).toBeGreaterThan(4);
+
+      // A is released at suspension point pa, C at pc >= pa (so C can arrive while A's live lock is moved aside).
+      for (let pa = 0; pa < count * 2; pa += 1) {
+        for (let pc = pa; pc < count * 2; pc += 1) {
+          const { lockPath, dir, now } = await staleLock();
+          const interferers: AcquireLockResult[] = [];
+          const fired = new Set<string>();
+          const fire = (name: 'A' | 'C'): void => {
+            if (!fired.has(name)) {
+              fired.add(name);
+              interferers.push(acquireLock(lockPath, STALE_AFTER_MS, {
+                now, pid: process.pid, token: `synthetic-${name}`, fsOps: realOps(),
+              }));
+            }
+          };
+          const ops = hookedOps((index, phase) => {
+            const slot = index * 2 + (phase === 'before' ? 0 : 1);
+            if (slot === pa) fire('A');
+            if (slot === pc) fire('C');
+          });
+          const b = acquireLock(lockPath, STALE_AFTER_MS, { now, pid: process.pid, token: 'synthetic-B', fsOps: ops });
+          const who = owners([b, ...interferers]);
+          const label = `A at ${pa}, C at ${pc}`;
+          expect(who.length, label).toBeLessThanOrEqual(1);
+          if (who.length === 1) {
+            expect(parseLockPayload(await fs.readFile(lockPath, 'utf8'))?.token, label).toBe(who[0]!.token);
+          }
+          // No guard or scratch file is left behind once every caller returned.
+          expect((await fs.readdir(dir)).filter((n) => n !== `${STEM}.lock`), label).toEqual([]);
+        }
+      }
+    });
+
+    it('two takers on one stale lock: exactly one wins and the other leaves the lock alone', async () => {
+      const { lockPath, now } = await staleLock();
+      const first = acquireLock(lockPath, STALE_AFTER_MS, { now, token: 'synthetic-1' });
+      const second = acquireLock(lockPath, STALE_AFTER_MS, { now, token: 'synthetic-2' });
+      expect(owners([first, second])).toHaveLength(1);
+      expect(first.owned).toBe(true);
+      expect(second.owned).toBe(false);
+      expect(parseLockPayload(await fs.readFile(lockPath, 'utf8'))?.token).toBe('synthetic-1');
+    });
+
+    it('a taker whose examined stale lock is replaced by a live one before its destructive step never disturbs it', async () => {
+      for (const trigger of ['read-lock', 'rename'] as const) {
+        const { lockPath, now } = await staleLock();
+        const live = createLockPayload(now, process.pid, os.hostname(), 'synthetic-live-token');
+        let reads = 0;
+        let swapped = false;
+        const swap = (): void => {
+          if (!swapped) {
+            swapped = true;
+            fsSync.writeFileSync(lockPath, live, 'utf8');
+          }
+        };
+        const ops = hookedOps((_i, phase, op, target) => {
+          if (phase !== 'after') {
+            if (trigger === 'rename' && op === 'rename' && target === lockPath) swap();
+            return;
+          }
+          if (trigger === 'read-lock' && op === 'read' && target === lockPath) {
+            reads += 1;
+            if (reads === 2) swap();
+          }
+        });
+        const result = acquireLock(lockPath, STALE_AFTER_MS, { now, token: 'synthetic-taker', fsOps: ops });
+        expect(result.owned, trigger).toBe(false);
+        expect(await fs.readFile(lockPath, 'utf8'), trigger).toBe(live);
+      }
+    });
+
+    it('a crash at any step leaves a state the next caller resolves with exactly one owner', async () => {
+      const probe = await staleLock();
+      let count = 0;
+      acquireLock(probe.lockPath, STALE_AFTER_MS, {
+        now: probe.now, pid: DEAD_PID, fsOps: hookedOps(() => { count += 1; }),
+      });
+      for (let point = 0; point < count * 2; point += 1) {
+        const { lockPath, now } = await staleLock();
+        const crashing = hookedOps((index, phase) => {
+          if (index * 2 + (phase === 'before' ? 0 : 1) === point) {
+            throw new Error('simulated crash');
+          }
+        });
+        try {
+          acquireLock(lockPath, STALE_AFTER_MS, { now, pid: DEAD_PID, token: 'synthetic-crashed', fsOps: crashing });
+        } catch {
+          // the crashed process is gone; its files stay as they were
+        }
+        // Later callers (the crashed taker's pid is dead) converge on one owner within a few polls.
+        const later = now + STALE_AFTER_MS * CROSS_HOST_FACTOR * 2;
+        const results: AcquireLockResult[] = [];
+        for (let poll = 0; poll < 3 && owners(results).length === 0; poll += 1) {
+          results.push(acquireLock(lockPath, STALE_AFTER_MS, { now: later, token: `synthetic-next-${poll}` }));
+        }
+        const who = owners(results);
+        expect(who, `crash point ${point}`).toHaveLength(1);
+        expect(parseLockPayload(await fs.readFile(lockPath, 'utf8'))?.token, `crash point ${point}`).toBe(who[0]!.token);
+      }
+    });
   });
 });

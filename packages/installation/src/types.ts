@@ -197,6 +197,12 @@ export interface AgyHostRunnerSection extends HostRunnerCommon {
 
 export type HostRunnerSection = OpencodeHostRunnerSection | AgyHostRunnerSection;
 
+/** One systemd CI runner slot declared on a v2 host (OG-28a). */
+export interface CiRunnerSlotSection {
+  readonly name: string;
+  readonly unit: string;
+}
+
 /** One named v2 host (plan section 1). */
 export interface HostSection {
   readonly transport: HostTransport;
@@ -212,6 +218,8 @@ export interface HostSection {
   readonly worktreeRoot: string;
   readonly tmpDir?: string;
   readonly roles: readonly HostRole[];
+  /** Optional systemd CI runner slots the host declares (OG-28a). */
+  readonly ciRunnerSlots?: readonly CiRunnerSlotSection[];
   readonly runner?: HostRunnerSection;
 }
 

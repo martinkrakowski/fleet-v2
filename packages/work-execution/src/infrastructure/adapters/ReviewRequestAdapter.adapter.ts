@@ -792,12 +792,20 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         receipt.candidateHeadSha === request.candidateHeadSha &&
         // A brief-check receipt is about the brief, never the attempt
         // assessment, so it is bound to the request's project and attempt
-        // directly; every other kind is bound through the full predicate.
+        // directly, plus the same assessment id this attempt answers to
+        // (CO18a7d fix round 3 — a matching-request receipt naming a
+        // different assessment is not evidence for this one); every other
+        // kind is bound through the full predicate.
         (kind === 'brief-check'
           ? isAttemptReceiptSubject(receipt) &&
             receipt.projectId === request.projectId &&
             receipt.attemptId === request.attemptId &&
-            isAttemptSubjectBoundTo(receipt, request.projectId, request.attemptId)
+            isAttemptSubjectBoundTo(receipt, request.projectId, request.attemptId) &&
+            isReceiptAboutAssessment(receipt, {
+              id: assessmentIdForAttempt(request.attemptId),
+              projectId: request.projectId,
+              attemptId: request.attemptId,
+            })
           : isAttemptReceiptAbout(receipt, {
               id: assessmentIdForAttempt(request.attemptId),
               projectId: request.projectId,
@@ -837,12 +845,16 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       only.kind === undefined ||
       // A brief-check receipt is about the brief, never the attempt
       // assessment, so it is bound to the assessment's project and attempt
-      // directly; every other kind is bound through the full predicate.
+      // directly, plus the same assessment id being read (CO18a7d fix round
+      // 3 — a matching-request receipt naming a different assessment is not
+      // evidence for this one); every other kind is bound through the full
+      // predicate.
       (only.kind === 'brief-check'
         ? !isAttemptReceiptSubject(only) ||
           only.projectId !== read.assessment.projectId ||
           only.attemptId !== read.assessment.attemptId ||
-          !isAttemptSubjectBoundTo(only, read.assessment.projectId, read.assessment.attemptId)
+          !isAttemptSubjectBoundTo(only, read.assessment.projectId, read.assessment.attemptId) ||
+          !isReceiptAboutAssessment(only, read.assessment)
         : !isAttemptReceiptAbout(only, read.assessment))
     ) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };

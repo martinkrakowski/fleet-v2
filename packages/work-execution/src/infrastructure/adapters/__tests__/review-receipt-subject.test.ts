@@ -227,6 +227,14 @@ describe('ReviewRequestAdapter.findReviewReceipt: the receipt subject (attempt p
 
     expect(await find(receipt({ requestId: REQUEST_ID, kind: 'brief-check', subject: otherProject }))).toEqual(MISMATCH);
   });
+
+  it('answers receipt-mismatch when the brief-check receipt of the request id carries another assessment id', async () => {
+    const result = await find(
+      receipt({ requestId: REQUEST_ID, kind: 'brief-check', subject: subjectOf(), assessmentId: 'assessment-att-OTHER' }),
+    );
+
+    expect(result).toEqual(MISMATCH);
+  });
 });
 
 describe('ReviewRequestAdapter.requestReview: the receipt subject (attempt path)', () => {
@@ -277,6 +285,21 @@ describe('ReviewRequestAdapter.requestReview: the receipt subject (attempt path)
       requestIndependentReview: async (): Promise<RequestIndependentReviewResult> => ({
         outcome: 'reviewed',
         receipt: receipt({ requestId: REQUEST_ID, kind: 'brief-check', subject: OTHER_ATTEMPT }),
+      }),
+    }).requestReview({
+      requestId: REQUEST_ID, kind: 'brief-check', attemptId: 'att-1', projectId: 'proj-1', policyRevision: 'policy-1',
+      implementerModel: 'example-provider/implementer-1', reviewerModel: 'example-provider/reviewer-1',
+      candidateHeadSha: HEAD,
+    });
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'receipt-mismatch' });
+  });
+
+  it('answers unknown receipt-mismatch when the answered brief-check receipt carries another assessment id', async () => {
+    const result = await new ReviewRequestAdapter({
+      requestIndependentReview: async (): Promise<RequestIndependentReviewResult> => ({
+        outcome: 'reviewed',
+        receipt: receipt({ requestId: REQUEST_ID, kind: 'brief-check', subject: subjectOf(), assessmentId: 'assessment-att-OTHER' }),
       }),
     }).requestReview({
       requestId: REQUEST_ID, kind: 'brief-check', attemptId: 'att-1', projectId: 'proj-1', policyRevision: 'policy-1',

@@ -67,6 +67,8 @@ export interface SpawnRunOutcome {
   readonly stderr: string;
   /** Spawn failure, a timeout, or a max-buffer overrun; absent on a clean run. */
   readonly error?: string;
+  /** The OS errno of the spawn failure (for example `ENOENT`); absent otherwise. */
+  readonly errorCode?: string;
 }
 
 export interface SpawnRunOptions {
@@ -211,7 +213,15 @@ export function runSpawnOutcome(
     child.on('error', (failure: NodeJS.ErrnoException) => {
       // Spawn failure (for example ENOENT): reported, never guessed.
       error = failure.message ?? String(failure);
-      settle({ exitCode: null, signal: null, stdout, stderr, error });
+      const errorCode = typeof failure.code === 'string' ? failure.code : undefined;
+      settle({
+        exitCode: null,
+        signal: null,
+        stdout,
+        stderr,
+        error,
+        ...(errorCode !== undefined ? { errorCode } : {}),
+      });
     });
 
     child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {

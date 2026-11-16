@@ -6,6 +6,7 @@ import type {
   ReviewFindingRecord,
   ReviewReceiptRecord,
 } from '../../../domain/evidence-records.js';
+import { assessmentIdForBrief } from '../../../domain/evidence-records.js';
 import type { EvidenceAssessmentRepositoryPort } from '../../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { AttemptOwnerDecisionPort } from '../../ports/out/AttemptOwnerDecisionPort.out-port.js';
 import type { ForgeEvidencePort } from '../../ports/out/ForgeEvidencePort.out-port.js';
@@ -122,6 +123,104 @@ function independentReviewReceiptWithFindings(
     ...overrides,
   };
 }
+
+describe('attempt isolation of head acceptance (PC-1)', () => {
+  const DIGEST = 'd'.repeat(64);
+
+  function briefVerifyReceipt(): ReviewReceiptRecord {
+    return {
+      id: 'rr-1',
+      assessmentId: assessmentIdForBrief('proj-1', DIGEST),
+      projectId: 'proj-1',
+      attemptId: `brief:proj-1:${DIGEST}`,
+      candidateHeadSha: HEAD,
+      reviewerModel: 'seat-a/reviewer',
+      implementerModel: 'seat-b/implementer',
+      readOnlyVerified: true,
+      result: 'pass',
+      findings: [],
+      evidenceRef: 'ref-1',
+      policyRevision: 'pol-1',
+      completedAtIso: '2026-10-15T12:00:00.000Z',
+      kind: 'brief-verify',
+      subject: {
+        kind: 'brief', projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null,
+        briefPackageDigest: DIGEST, baseCommit: HEAD,
+      },
+    };
+  }
+
+  it('never accepts an attempt when a legacy code-review receipt carries a brief: attemptId and no subject', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [independentReviewReceiptWithFindings([], { kind: 'code-review', attemptId: `brief:proj-1:${DIGEST}` })],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers).toContain('no read-only independent review passed for this candidate head');
+    }
+  });
+
+  it('never accepts an attempt when only a passing brief-verify receipt with a brief subject is present', async () => {
+    const record = sampleRecord({ reviewReceipts: [briefVerifyReceipt()] });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers).toContain('no read-only independent review passed for this candidate head');
+    }
+  });
+
+  it('never accepts an attempt when only a passing code-review receipt carrying a chain subject is present', async () => {
+    const subject = {
+      kind: 'chain' as const, projectId: 'proj-1', attemptId: null, chainName: 'main',
+      integrationHeadSha: HEAD, briefPackageDigest: null, baseCommit: null,
+    };
+    const record = sampleRecord({
+      reviewReceipts: [independentReviewReceiptWithFindings([], { kind: 'code-review', subject })],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers).toContain('no read-only independent review passed for this candidate head');
+    }
+  });
+
+  it('still accepts a passing attempt code-review beside a passing brief-verify receipt', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [briefVerifyReceipt(), independentReviewReceiptWithFindings([], { id: 'rr-2', kind: 'code-review' })],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    const useCase = new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+
+    const result = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(result.outcome).toBe('accepted');
+  });
+});
 
 describe('AssessHeadAcceptanceUseCase', () => {
   it('re-assessing a stale record returns stale, not accepted', async () => {

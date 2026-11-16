@@ -98,9 +98,144 @@ describe('SshExecutor argv construction', () => {
       'ConnectTimeout=15',
       'lanehost',
       '--',
-      "'git' '-C' '/worktree with space' 'log' '--format='\\''%h'\\'''",
+      'sh',
+      '-c',
+      posixQuote("'git' '-C' '/worktree with space' 'log' '--format='\\''%h'\\'''"),
     ]);
     expect(posixQuote("it's")).toBe("'it'\\''s'");
+  });
+
+  /**
+   * Runs `argv` through SshExecutor.run() with `node:child_process` mocked
+   * (as in the existing tests) and a child that exits 0 immediately.
+   */
+  async function runWithMockedSpawn(argv: readonly string[]) {
+    // Drop the statically cached module graph so the dynamic import below
+    // re-evaluates with the mock applied (the first caller needs this too).
+    vi.resetModules();
+    const child = Object.assign(new EventEmitter(), {
+      pid: 42_430,
+      stdin: { write: () => true, end: () => {}, on: () => child },
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      kill: vi.fn(),
+    });
+    const spawnMock = vi.fn((..._args: unknown[]) => child);
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+    const executor = new FreshSshExecutor({ host: 'lanehost' });
+    const pending = executor.run(argv);
+    setImmediate(() => child.emit('close', 0, null));
+    const result = await pending;
+    return { spawnMock, result };
+  }
+
+  /** One test per argument kind: the exact sshArgvFor result and the exact last three spawn arguments. */
+  const argumentKinds: ReadonlyArray<{ name: string; argument: string }> = [
+    { name: 'a single quote', argument: "it's" },
+    { name: 'a command substitution', argument: '$(id)' },
+    { name: 'a leading dash', argument: '--flag' },
+    { name: 'an empty string', argument: '' },
+    { name: 'a space', argument: 'a b' },
+    { name: 'a backslash', argument: 'a\\b' },
+    { name: 'a newline', argument: 'a\nb' },
+  ];
+
+  for (const kind of argumentKinds) {
+    it(`carries ${kind.name} through the explicit sh -c unchanged`, async () => {
+      // The exact twice-quoted command line: posixQuote applied to the
+      // space-joined posixQuoted words.
+      const twiceQuoted = posixQuote([kind.argument].map(posixQuote).join(' '));
+      expect(sshArgvFor('lanehost', [kind.argument])).toEqual([
+        '-o',
+        'BatchMode=yes',
+        '-o',
+        'ConnectTimeout=15',
+        'lanehost',
+        '--',
+        'sh',
+        '-c',
+        twiceQuoted,
+      ]);
+      try {
+        const { spawnMock, result } = await runWithMockedSpawn([kind.argument]);
+        expect(result.exitCode).toBe(0);
+        expect(spawnMock).toHaveBeenCalledTimes(1);
+        expect(spawnMock.mock.calls[0][0]).toBe('ssh');
+        expect((spawnMock.mock.calls[0][1] as string[]).slice(-3)).toEqual([
+          'sh',
+          '-c',
+          twiceQuoted,
+        ]);
+      } finally {
+        vi.doUnmock('node:child_process');
+        vi.resetModules();
+      }
+    });
+  }
+
+  it('refuses an empty argv without spawning any subprocess', async () => {
+    const spawnMock = vi.fn();
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    try {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'lanehost' });
+      const result = await executor.run([]);
+      expect(result.exitCode).toBeNull();
+      expect(result.signal).toBeNull();
+      expect(result.error).toContain('empty argv');
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      vi.doUnmock('node:child_process');
+      vi.resetModules();
+    }
+  });
+
+  it('refuses a NUL byte in the first, a middle, and the last argument without spawning', async () => {
+    const spawnMock = vi.fn();
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+    try {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'lanehost' });
+      const cases: readonly string[][] = [
+        ['\0', 'status'],
+        ['git', '\0', 'status'],
+        ['git', 'status', '\0'],
+      ];
+      for (const argv of cases) {
+        const result = await executor.run(argv);
+        expect(result.exitCode).toBeNull();
+        expect(result.signal).toBeNull();
+        expect(result.stdout).toBe('');
+        expect(result.stderr).toBe('');
+        expect(result.error).toContain('NUL');
+        // The refused argument is never echoed back in the error string.
+        expect(result.error).not.toContain('\0');
+      }
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      vi.doUnmock('node:child_process');
+      vi.resetModules();
+    }
+  });
+
+  it('round-trips every argument kind byte-identical through a real /bin/sh', async () => {
+    const args = ["it's", '$(id)', '--flag', '', 'a b', 'a\\b', 'a\nb', '!'];
+    // The remote program is `printf '%s\0' "$@"`: every round-tripped word
+    // reaches printf as one argument and is emitted NUL-terminated, so the
+    // NUL-split output must equal the original argv byte for byte.
+    const sshArgv = sshArgvFor('lanehost', ['printf', '%s\\0', ...args]);
+    // The remote-command part is everything after '--', joined with spaces
+    // the way ssh joins it into one command string for the login shell.
+    const commandStart = sshArgv.indexOf('--') + 1;
+    const remoteCommandLine = sshArgv.slice(commandStart).join(' ');
+    const outcome = await runSpawnOutcome('/bin/sh', ['-c', remoteCommandLine]);
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.error).toBeUndefined();
+    const roundTripped = outcome.stdout.split('\0');
+    // printf terminates every argument with a NUL, including the last.
+    expect(roundTripped[roundTripped.length - 1]).toBe('');
+    expect(roundTripped.slice(0, -1)).toEqual(args);
   });
 
   it('refuses an unsafe host without spawning any subprocess', async () => {

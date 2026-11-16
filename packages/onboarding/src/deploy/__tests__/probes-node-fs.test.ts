@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { rename as renameReal } from 'node:fs/promises';
+import { rename as renameReal, rm as rmReal, symlink as symlinkReal } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -33,6 +33,40 @@ function makeTree(root: string, spec: TreeSpec): void {
       makeTree(entry, value);
     }
   }
+}
+
+type Call = readonly string[];
+
+/** Fake fs layer over the real one: records every call, each step can be made to fail. */
+function recordingOps(failures: { symlink?: Error; rename?: Error; rm?: Error } = {}) {
+  const calls: Call[] = [];
+  return {
+    calls,
+    ops: {
+      symlink: async (target: string, path: string) => {
+        calls.push(['symlink', target, path]);
+        if (failures.symlink) throw failures.symlink;
+        await symlinkReal(target, path);
+      },
+      rename: async (from: string, to: string) => {
+        calls.push(['rename', from, to]);
+        if (failures.rename) throw failures.rename;
+        await renameReal(from, to);
+      },
+      rm: async (path: string, options: { force: true }) => {
+        calls.push(['rm', path]);
+        if (failures.rm) throw failures.rm;
+        await rmReal(path, options);
+      },
+    },
+  };
+}
+
+function expectTempLinkCall(call: Call | undefined, root: string): string {
+  const temp = call?.[2] ?? '';
+  expect(dirname(temp)).toBe(root);
+  expect(basename(temp)).toMatch(/^\.link\.[0-9a-f]{16}\.tmp$/);
+  return temp;
 }
 
 const LINK = 'link';
@@ -218,31 +252,95 @@ describe('node deploy filesystem probes', () => {
       expect(readdirSync(root)).toEqual(['builds', 'link']);
     });
 
-    it('repoint keeps the old link in place until the rename', async () => {
+    it('repoint creates a temporary link, then renames it over the existing link, and never moves the old link', async () => {
       const root = newDir();
       const link = join(root, LINK);
       symlinkSync(FIRST, link);
-      const rename = vi.fn(async (from: string, to: string) => {
-        expect(from).toBe(link);
-        expect(to).not.toBe(link);
-        expect(readlinkSync(from)).toBe(FIRST);
-        await renameReal(from, to);
-      });
-      const { repoint } = createNodeDeployFsProbes({ rename });
+      const { calls, ops } = recordingOps();
+      const { repoint } = createNodeDeployFsProbes(ops);
       await repoint(link, SECOND);
-      expect(rename).toHaveBeenCalledTimes(1);
+      expect(calls).toHaveLength(2);
+      expect(calls[0]?.slice(0, 2)).toEqual(['symlink', SECOND]);
+      const temp = expectTempLinkCall(calls[0], root);
+      expect(calls[1]).toEqual(['rename', temp, link]);
+      expect(calls.some((call) => call[0] === 'rename' && call[1] === link)).toBe(false);
+      expect(calls.some((call) => call[0] === 'rm')).toBe(false);
+      expect(readlinkSync(link)).toBe(SECOND);
     });
 
-    it('repoint keeps the old target and leaves no temporary entry when the rename fails', async () => {
+    it('repoint keeps the old link resolving until the rename and the new link after it', async () => {
+      const root = newDir();
+      const link = join(root, LINK);
+      mkdirSync(join(root, 'builds'));
+      mkdirSync(join(root, 'builds', 'one'));
+      mkdirSync(join(root, 'builds', 'two'));
+      symlinkSync(FIRST, link);
+      const seen: string[] = [];
+      const rename = async (from: string, to: string) => {
+        seen.push(readlinkSync(link), readlinkSync(from));
+        await renameReal(from, to);
+      };
+      const { repoint } = createNodeDeployFsProbes({ rename });
+      seen.push(readlinkSync(link));
+      await repoint(link, SECOND);
+      seen.push(readlinkSync(link));
+      expect(seen).toEqual([FIRST, FIRST, SECOND, SECOND]);
+    });
+
+    it('repoint with no existing link makes the same two calls and creates the link', async () => {
+      const root = newDir();
+      const link = join(root, LINK);
+      const { calls, ops } = recordingOps();
+      const { repoint } = createNodeDeployFsProbes(ops);
+      await repoint(link, FIRST);
+      expect(calls).toHaveLength(2);
+      expect(calls[0]?.slice(0, 2)).toEqual(['symlink', FIRST]);
+      const temp = expectTempLinkCall(calls[0], root);
+      expect(calls[1]).toEqual(['rename', temp, link]);
+      expect(readlinkSync(link)).toBe(FIRST);
+      expect(readdirSync(root)).toEqual(['link']);
+    });
+
+    it('repoint leaves the existing link untouched and leaves nothing behind when the temporary link cannot be created', async () => {
+      const root = newDir();
+      const link = join(root, LINK);
+      symlinkSync(FIRST, link);
+      const error = new Error('symlink refused');
+      const { calls, ops } = recordingOps({ symlink: error });
+      const { repoint } = createNodeDeployFsProbes(ops);
+      await expect(repoint(link, SECOND)).rejects.toBe(error);
+      expect(calls.map((call) => call[0])).toEqual(['symlink']);
+      expect(readlinkSync(link)).toBe(FIRST);
+      expect(readdirSync(root)).toEqual(['link']);
+    });
+
+    it('repoint removes the temporary link and keeps the old target when the rename fails', async () => {
       const root = newDir();
       const link = join(root, LINK);
       symlinkSync(FIRST, link);
       const error = new Error('rename refused');
-      const rename = vi.fn(() => Promise.reject(error));
-      const { repoint } = createNodeDeployFsProbes({ rename });
+      const { calls, ops } = recordingOps({ rename: error });
+      const { repoint } = createNodeDeployFsProbes(ops);
       await expect(repoint(link, SECOND)).rejects.toBe(error);
+      const temp = expectTempLinkCall(calls[0], root);
+      expect(calls[2]).toEqual(['rm', temp]);
       expect(readlinkSync(link)).toBe(FIRST);
-      expect(readdirSync(root).some((name) => name.endsWith('.tmp'))).toBe(false);
+      expect(readdirSync(root)).toEqual(['link']);
+    });
+
+    it('repoint reports both failures when the rename fails and the temporary link cannot be removed', async () => {
+      const root = newDir();
+      const link = join(root, LINK);
+      symlinkSync(FIRST, link);
+      const renameError = new Error('rename refused');
+      const rmError = new Error('rm refused');
+      const { ops } = recordingOps({ rename: renameError, rm: rmError });
+      const { repoint } = createNodeDeployFsProbes(ops);
+      const failure: unknown = await repoint(link, SECOND).catch((caught: unknown) => caught);
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect((failure as AggregateError).message).toContain('could not be removed');
+      expect((failure as AggregateError).errors).toEqual([renameError, rmError]);
+      expect(readlinkSync(link)).toBe(FIRST);
     });
 
     it('repoint rejects when the parent directory is missing', async () => {

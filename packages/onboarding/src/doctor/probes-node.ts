@@ -11,7 +11,7 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
@@ -19,7 +19,12 @@ import type { SeatModel } from '@fleet/installation';
 import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
 import { GH_BINARY_CANDIDATES, hasGhTokenEnv, type GhAuthObservation } from './gh-binary.js';
-import type { DoctorProbes, SeatProbeResult, ServerProbeResult } from './probes.js';
+import type {
+  DoctorProbes,
+  PinnedBuildProbeResult,
+  SeatProbeResult,
+  ServerProbeResult,
+} from './probes.js';
 
 const execFileAsync = promisify(execFileCallback);
 
@@ -155,6 +160,16 @@ export interface NodeDoctorProbesDeps {
     | (() => Readonly<Record<string, string | undefined>>);
   /** Wall-clock budget for the `gh auth status` run. */
   readonly ghAuthTimeoutMs?: number;
+  /**
+   * The base branch the pinned build is compared against, as a `git`
+   * revision the local repository resolves (default `origin/main`).
+   */
+  readonly baseBranch?: string;
+  /**
+   * Overrides the whole pinned-build observation. Injectable for tests and
+   * embedders that know the installed build without a `git` repository.
+   */
+  readonly readPinnedBuild?: () => Promise<PinnedBuildProbeResult | undefined>;
 }
 
 /** Walk up from this module to the repository root that owns `bin/ocm-run`. */
@@ -204,6 +219,72 @@ function succeeded(
   result: DoctorCommandRunResult,
 ): boolean {
   return result.error === undefined && result.exitCode === 0;
+}
+
+/** A full 40-character hex git commit id. */
+const FULL_SHA = /^[0-9a-f]{40}$/;
+
+/** The first non-empty, valid full-hex line of `git rev-parse` output. */
+function revParseCommit(stdout: string): string | undefined {
+  for (const entry of stdout.split(/\r?\n/)) {
+    const line = entry.trim();
+    if (FULL_SHA.test(line)) {
+      return line.toLowerCase();
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Read the pinned-build freshness observation with `git` in the local
+ * repository: the installed build's `HEAD`, the base branch tip, and — when
+ * they differ — the commit distance between them. Every unreadable field is
+ * `undefined`; the check itself stays pure and turns that into `UNKNOWN`.
+ */
+async function readPinnedBuildWithGit(
+  executor: DoctorCommandExecutor,
+  repoRoot: string,
+  baseBranch: string,
+  timeoutMs: number,
+): Promise<PinnedBuildProbeResult> {
+  let pinnedCommit: string | undefined;
+  let baseTipCommit: string | undefined;
+  let behindCount: number | undefined;
+
+  const head = await executor.run(['git', 'rev-parse', 'HEAD'], {
+    cwd: repoRoot,
+    timeoutMs,
+  });
+  if (succeeded(head)) {
+    pinnedCommit = revParseCommit(head.stdout);
+  }
+
+  const base = await executor.run(['git', 'rev-parse', baseBranch], {
+    cwd: repoRoot,
+    timeoutMs,
+  });
+  if (succeeded(base)) {
+    baseTipCommit = revParseCommit(base.stdout);
+  }
+
+  if (pinnedCommit !== undefined && baseTipCommit !== undefined) {
+    if (pinnedCommit === baseTipCommit) {
+      behindCount = 0;
+    } else {
+      const count = await executor.run(
+        ['git', 'rev-list', '--count', `${pinnedCommit}..${baseTipCommit}`],
+        { cwd: repoRoot, timeoutMs },
+      );
+      if (succeeded(count)) {
+        const parsed = count.stdout.trim();
+        if (/^\d+$/.test(parsed)) {
+          behindCount = Number.parseInt(parsed, 10);
+        }
+      }
+    }
+  }
+
+  return { pinnedCommit, baseTipCommit, behindCount, installRootName: basename(repoRoot) };
 }
 
 /** Run one argv on the host's transport; a spawn failure reports as a failed run. */
@@ -464,6 +545,21 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
         };
       }
       return { tokenPresent, authCheck: { outcome: 'fail', reason: 'gh auth status failed' } };
+    },
+
+    async pinnedBuild(): Promise<PinnedBuildProbeResult | undefined> {
+      if (deps.readPinnedBuild !== undefined) {
+        return await deps.readPinnedBuild();
+      }
+      if (repoRoot === undefined) {
+        return { pinnedCommit: undefined, baseTipCommit: undefined, behindCount: undefined };
+      }
+      return readPinnedBuildWithGit(
+        localExecutor,
+        repoRoot,
+        deps.baseBranch ?? 'origin/main',
+        timeoutMs,
+      );
     },
 
     async serverProbe(host, port): Promise<ServerProbeResult> {

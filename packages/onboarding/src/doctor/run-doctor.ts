@@ -23,6 +23,32 @@ import { checkGhAuthNonInteractive } from './gh-binary.js';
 import type { DoctorLine, DoctorStatus } from './types.js';
 import type { DoctorProbes } from './probes.js';
 
+/** A trimmed, lowercase hex git commit id of 7–40 characters. */
+const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
+
+/** A commit id is valid after trimming; comparisons use the lowercase form. */
+function normaliseCommit(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return COMMIT_ID.test(trimmed) ? trimmed.toLowerCase() : undefined;
+}
+
+/** Display form of a commit id: at most 8 hex characters. */
+function shortCommit(commit: string): string {
+  return commit.slice(0, 8);
+}
+
+/**
+ * At most the final path segment of an install root name, so no directory
+ * prefix ever reaches a doctor detail.
+ */
+function installRootBasename(name: string): string {
+  const base = name.split(/[/\\]/).pop() ?? '';
+  return base;
+}
+
 /** A load result doctor can check: absent or loaded, never invalid. */
 export type DoctorableInstallation = Exclude<LoadResult, { status: 'invalid' }>;
 
@@ -710,7 +736,8 @@ async function seatLines(
  * Run every doctor check over a loaded installation, in the order:
  * installation, routing, the seat model list, hosts and their roles, the
  * servers' answers, configured tools, credential files, the bundled runner
- * binary, the reviewed gh binary, then seats. Each yielded line is one
+ * binary, the reviewed gh binary, the pinned build's freshness, then seats.
+ * Each yielded line is one
  * check; the generator awaits probes sequentially so output order is
  * stable. The server answers are computed before the `model-listed` line is
  * yielded (that line needs the union of the servers' model ids), but the
@@ -760,9 +787,126 @@ export async function* runDoctor(
   for (const doctorLine of await ghBinaryLines(probes)) {
     yield doctorLine;
   }
+  for (const doctorLine of await pinnedBuildLines(probes)) {
+    yield doctorLine;
+  }
   for (const doctorLine of await seatLines(result.model, probes, options)) {
     yield doctorLine;
   }
+}
+
+/**
+ * The pinned-build freshness check: the installed build's commit against the
+ * base branch tip. Pure: it consumes only the injected probe result — no
+ * `git` subprocess, no filesystem access. Any unreadable field or failed
+ * probe reports `UNKNOWN`, never `PASS`; a pinned build behind the tip is
+ * `FAIL` with the commit distance.
+ */
+export async function pinnedBuildLines(probes: DoctorProbes): Promise<DoctorLine[]> {
+  let probeFn: DoctorProbes['pinnedBuild'];
+  try {
+    probeFn = probes.pinnedBuild;
+  } catch {
+    // Even reading the port can throw (a hostile getter); that is a probe
+    // failure, never a crash.
+    return [
+      line('installation', 'build', 'pinned-build', 'UNKNOWN', 'pinned build probe failed'),
+    ];
+  }
+  if (probeFn === undefined || typeof probeFn !== 'function') {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'pinned build probe not available',
+      ),
+    ];
+  }
+  const probe = await safely(() => probeFn!());
+  if (probe === undefined || probe === null) {
+    return [
+      line('installation', 'build', 'pinned-build', 'UNKNOWN', 'pinned build probe failed'),
+    ];
+  }
+  const pinnedCommit = normaliseCommit(probe.pinnedCommit);
+  if (pinnedCommit === undefined) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'pinned build commit could not be read',
+      ),
+    ];
+  }
+  const baseTipCommit = normaliseCommit(probe.baseTipCommit);
+  if (baseTipCommit === undefined) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'base branch tip commit could not be read',
+      ),
+    ];
+  }
+  const root =
+    typeof probe.installRootName === 'string'
+      ? installRootBasename(probe.installRootName)
+      : '';
+  const rootSuffix = root === '' ? '' : ` (install root ${root})`;
+  if (pinnedCommit === baseTipCommit) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'PASS',
+        `pinned build matches base branch tip ${shortCommit(pinnedCommit)}${rootSuffix}`,
+      ),
+    ];
+  }
+  const behind = probe.behindCount;
+  if (
+    typeof behind !== 'number' ||
+    !Number.isInteger(behind) ||
+    behind < 0
+  ) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'commit distance between pinned build and base tip could not be determined',
+      ),
+    ];
+  }
+  if (behind === 0) {
+    // Not equal and not behind: the builds have diverged. Never a pass.
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        `pinned build ${shortCommit(pinnedCommit)} and base tip ${shortCommit(baseTipCommit)} have diverged${rootSuffix}`,
+      ),
+    ];
+  }
+  return [
+    line(
+      'installation',
+      'build',
+      'pinned-build',
+      'FAIL',
+      `pinned build is ${behind} commit${behind === 1 ? '' : 's'} behind base branch tip ${shortCommit(baseTipCommit)}${rootSuffix}`,
+    ),
+  ];
 }
 
 /**

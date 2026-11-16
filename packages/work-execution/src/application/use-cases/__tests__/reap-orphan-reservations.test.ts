@@ -716,18 +716,120 @@ describe('ReapOrphanReservationsUseCase', () => {
     expect(harness.journalEntries[1]?.outcome).toBe('refused');
   });
 
-  it('does not release when the fence finds the reservation no longer the one classified', async () => {
-    const harness = orphanHarness({
-      releaseImpl: async (request) => {
-        const stillHeld: readonly string[] = ['res-replacement'];
-        return stillHeld.includes(request.reservationId) ? { outcome: 'released' } : { outcome: 'changed' };
-      },
-    });
-    const result = await run(harness, { dryRun: false, nowIso: NOW });
-    expect(result.outcome).toBe('reaped');
-    if (result.outcome !== 'reaped') return;
-    expect(result.released).toHaveLength(0);
-    expect(result.failed).toEqual([{ reservationId: 'res-1', attemptId: 'att-1', reason: 'changed' }]);
+  it('sends the classified reservation id to the fenced release: a replacement held by the same attempt stays held', async () => {
+    // `held` maps attemptId -> the reservationId that attempt currently holds.
+    const releaseImpl = (held: Map<string, string>) => async (request: FencedReleaseRequest): Promise<unknown> => {
+      if (held.get(request.attemptId) === request.reservationId) {
+        held.delete(request.attemptId);
+        return { outcome: 'released' };
+      }
+      return { outcome: 'changed' };
+    };
+    const expectFencedCall = (harness: Harness): void => {
+      expect(harness.releaseCalls).toEqual([
+        { attemptId: 'att-1', reservationId: 'res-1', attemptRevision: 3, releasedAtIso: NOW, readAttemptRevision: expect.any(Function) },
+      ]);
+    };
+
+    // Run 1 (control): the attempt still holds the classified reservation.
+    const heldControl = new Map([['att-1', 'res-1']]);
+    const control = orphanHarness({ releaseImpl: releaseImpl(heldControl) });
+    const controlResult = await run(control, { dryRun: false, nowIso: NOW });
+    expect(controlResult.outcome).toBe('reaped');
+    if (controlResult.outcome === 'reaped') {
+      expect(controlResult.released.map((entry) => entry.reservationId)).toEqual(['res-1']);
+      expect(controlResult.failed).toEqual([]);
+    }
+    expect(heldControl.size).toBe(0);
+    expect(control.releaseCallsUnfenced).toEqual([]);
+    expectFencedCall(control);
+
+    // Run 2 (replaced): the attempt now holds a replacement, so the fence
+    // refuses to release the classified id.
+    const heldReplaced = new Map([['att-1', 'res-replacement']]);
+    const replaced = orphanHarness({ releaseImpl: releaseImpl(heldReplaced) });
+    const replacedResult = await run(replaced, { dryRun: false, nowIso: NOW });
+    expect(replacedResult.outcome).toBe('reaped');
+    if (replacedResult.outcome === 'reaped') {
+      expect(replacedResult.released).toEqual([]);
+      expect(replacedResult.failed).toEqual([{ reservationId: 'res-1', attemptId: 'att-1', reason: 'changed' }]);
+    }
+    expect(Array.from(heldReplaced.entries())).toEqual([['att-1', 'res-replacement']]);
+    expect(replaced.releaseCallsUnfenced).toEqual([]);
+    expect(replaced.journalEntries.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(replaced.journalEntries[1]?.outcome).toBe('refused');
+    expectFencedCall(replaced);
+  });
+
+  it('refuses an invalid maxReleasesPerPass as invalid-max-releases-per-pass before any store read', async () => {
+    const invalidValues: readonly unknown[] = [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      0,
+      -1,
+      1.5,
+      1001,
+      Number.MAX_SAFE_INTEGER,
+      '5' as never,
+      null as never,
+    ];
+    for (const value of invalidValues) {
+      for (const dryRun of [false, true]) {
+        const harness = orphanHarness({ maxReleasesPerPass: value as never });
+        const result = await run(harness, { dryRun, nowIso: NOW });
+        expect(result).toEqual({ outcome: 'refused', reason: 'invalid-max-releases-per-pass' });
+        expect(harness.listReservationsCalls).toBe(0);
+        expect(harness.listRunsCalls).toBe(0);
+        expect(harness.releaseCalls).toEqual([]);
+        expect(harness.releaseCallsUnfenced).toEqual([]);
+        expect(harness.journalEntries).toEqual([]);
+      }
+    }
+  });
+
+  it('accepts maxReleasesPerPass at both bounds', async () => {
+    for (const maxReleasesPerPass of [1, 1000]) {
+      const harness = orphanHarness({ maxReleasesPerPass });
+      const result = await run(harness, { dryRun: false, nowIso: NOW });
+      expect(result.outcome).toBe('reaped');
+      if (result.outcome === 'reaped') {
+        expect(result.released.map((entry) => entry.reservationId)).toEqual(['res-1']);
+      }
+    }
+  });
+
+  it('reads a reservations list whose length is not a non-negative integer as reservations-unreadable', async () => {
+    const lengthProxy = (length: unknown): unknown =>
+      new Proxy([reservation('res-1', 'att-1')] as unknown[], {
+        get(target, prop, receiver) {
+          if (prop === 'then') {
+            return undefined;
+          }
+          if (prop === 'length') {
+            return length;
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+
+    const invalidLengths: readonly unknown[] = [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5, '1', undefined, null];
+    for (const length of invalidLengths) {
+      const harness = orphanHarness({ reservationsImpl: () => Promise.resolve(lengthProxy(length) as never) });
+      const result = await run(harness, { dryRun: false, nowIso: NOW });
+      expect(result).toEqual({ outcome: 'unknown', reason: 'reservations-unreadable' });
+      expect(harness.listRunsCalls).toBe(0);
+      expect(harness.releaseCalls).toEqual([]);
+      expect(harness.journalEntries).toEqual([]);
+    }
+
+    // Control: the same Proxy with a valid length is reaped normally.
+    const control = orphanHarness({ reservationsImpl: () => Promise.resolve(lengthProxy(1) as never) });
+    const controlResult = await run(control, { dryRun: false, nowIso: NOW });
+    expect(controlResult.outcome).toBe('reaped');
+    if (controlResult.outcome === 'reaped') {
+      expect(controlResult.released.map((entry) => entry.reservationId)).toEqual(['res-1']);
+    }
   });
 
   it('releases nothing and reports every reservation unknown when a run attempt list is hostile', async () => {

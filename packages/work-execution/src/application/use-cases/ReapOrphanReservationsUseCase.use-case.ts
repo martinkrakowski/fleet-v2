@@ -49,7 +49,7 @@ export interface ReapOrphanReservationsDependencies {
   readonly newUlid: () => string;
   /** The deadline of one outbound store call. Default 15 s. */
   readonly storeCallTimeoutMs?: number;
-  /** The largest number of fenced releases one pass attempts. Default 64. */
+  /** The largest number of fenced releases one pass attempts: an integer from 1 to 1000. Default 64. Any other present value refuses the pass as 'invalid-max-releases-per-pass'. */
   readonly maxReleasesPerPass?: number;
 }
 
@@ -58,6 +58,22 @@ const DEFAULT_STORE_CALL_TIMEOUT_MS = 15_000;
 
 /** The default budget of fenced releases per pass. */
 const DEFAULT_MAX_RELEASES_PER_PASS = 64;
+
+/** The largest value `maxReleasesPerPass` may take; anything above refuses. */
+const MAX_RELEASES_PER_PASS_LIMIT = 1_000;
+
+/**
+ * The validated release budget: the default when absent, the value itself when
+ * it is an integer from 1 to the limit, and `null` for every other present
+ * value. Never clamps and never falls back to the default when a value is
+ * present.
+ */
+function resolveMaxReleasesPerPass(raw: unknown): number | null {
+  if (raw === undefined) {
+    return DEFAULT_MAX_RELEASES_PER_PASS;
+  }
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 1 && raw <= MAX_RELEASES_PER_PASS_LIMIT ? raw : null;
+}
 
 /** The forbidden own keys of a request; a request carrying any is refused. */
 const FORBIDDEN_REQUEST_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
@@ -362,10 +378,11 @@ function revisionOf(attempt: { readonly revision?: unknown } | null | undefined)
 
 /**
  * The reservations list copied behind guards with `.length` read exactly once,
- * so a hostile list cannot answer differently on a later read. A list that is
- * not an array, whose length read throws, or that is longer than the scan cap
- * is never partially classified: it answers null and the whole pass fails
- * closed as unknown with nothing released. An unreadable element copies as
+ * so a hostile list cannot answer differently on a later read. Any
+ * non-integer, negative, `NaN`, `Infinity`, or over-cap `length` makes the
+ * list unreadable: it answers null and the whole pass fails closed as unknown
+ * with nothing released. A list that is not an array, or whose length read
+ * throws, is unreadable the same way. An unreadable element copies as
  * `undefined`, which the classifier already skips.
  */
 function snapshotReservations(value: unknown): unknown[] | null {
@@ -378,10 +395,10 @@ function snapshotReservations(value: unknown): unknown[] | null {
   } catch {
     return null;
   }
-  if (typeof rawLength === 'number' && rawLength > MAX_ORPHAN_RESERVATION_SCAN) {
+  if (typeof rawLength !== 'number' || !Number.isInteger(rawLength) || rawLength < 0 || rawLength > MAX_ORPHAN_RESERVATION_SCAN) {
     return null;
   }
-  const count = typeof rawLength === 'number' && Number.isFinite(rawLength) && rawLength > 0 ? Math.floor(rawLength) : 0;
+  const count = rawLength;
   const copy: unknown[] = [];
   for (let index = 0; index < count; index += 1) {
     const element = safeElementAt(value as readonly unknown[], index);
@@ -402,6 +419,10 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
       return { outcome: 'refused', reason: 'invalid-request' };
     }
     const { dryRun, nowIso } = validated;
+    const maxReleasesPerPass = resolveMaxReleasesPerPass(this.deps.maxReleasesPerPass);
+    if (maxReleasesPerPass === null) {
+      return { outcome: 'refused', reason: 'invalid-max-releases-per-pass' };
+    }
     const timeoutMs = this.deps.storeCallTimeoutMs ?? DEFAULT_STORE_CALL_TIMEOUT_MS;
 
     // Top-level reads are deadline-guarded and fail closed: an unreadable
@@ -448,7 +469,6 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
       return { outcome: 'reaped', dryRun: false, orphans, reportOnly, released, skipped, failed, journalFailed, unknown };
     }
 
-    const maxReleasesPerPass = this.deps.maxReleasesPerPass ?? DEFAULT_MAX_RELEASES_PER_PASS;
     let attemptedReleases = 0;
     for (const orphan of orphans) {
       if (attemptedReleases >= maxReleasesPerPass) {

@@ -91,7 +91,7 @@ export type ReapOrphanReservationsResult =
       readonly journalFailed: readonly ReapOrphanReservationJournalFailureEntry[];
       readonly unknown: readonly ReapOrphanReservationUnknownEntry[];
     }
-  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' }
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'invalid-max-releases-per-pass' }
   | { readonly outcome: 'unknown'; readonly reason: 'reservations-unreadable' | 'runs-unreadable' };
 
 export interface ReapOrphanReservationsPort {

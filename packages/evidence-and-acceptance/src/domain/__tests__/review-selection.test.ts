@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ReceiptSubject, ReviewReceiptRecord } from '../evidence-records.js';
 import { REVIEW_KINDS, assessmentIdForBrief, attemptIdForBrief, isValidBriefPackageDigest } from '../evidence-records.js';
+import { assessmentIdForAttempt } from '../assessment-id.js';
 import { ReviewReceipt } from '../entities/ReviewReceipt.js';
 import {
   decideReviewReceiptOutcome,
@@ -588,9 +589,24 @@ describe('isAttemptReceiptSubject', () => {
     ).toBe(true);
   });
 
-  it('returns true for a legacy receipt without a subject and for a hostile object with prototype-polluting own keys and an attempt subject', () => {
+  it('returns true for a legacy receipt without a subject', () => {
     expect(isAttemptReceiptSubject(receipt())).toBe(true);
+  });
+
+  it('returns true for a null-prototype object that carries an attemptId and no subject', () => {
     expect(isAttemptReceiptSubject({ attemptId: 'att-1', __proto__: null })).toBe(true);
+  });
+
+  it('returns false for an object with an OWN __proto__ key, even one carrying an attempt subject', () => {
+    const subject = { kind: 'attempt', projectId: 'proj-1', attemptId: 'att-1', chainName: null, integrationHeadSha: null, briefPackageDigest: null, baseCommit: null };
+    const hostile = JSON.parse(`{"__proto__": {"polluted": true}, "attemptId": "att-1", "subject": ${JSON.stringify(subject)}}`) as unknown;
+    expect(Object.getOwnPropertyDescriptor(hostile, '__proto__')).toBeDefined();
+    expect(Object.getOwnPropertyDescriptor(hostile, 'subject')?.value).toEqual(subject);
+    expect(isAttemptReceiptSubject(hostile)).toBe(false);
+    const defined = {};
+    Object.defineProperty(defined, '__proto__', { value: {}, enumerable: true });
+    Object.defineProperty(defined, 'subject', { value: subject, enumerable: true });
+    expect(isAttemptReceiptSubject(defined)).toBe(false);
   });
 });
 
@@ -700,8 +716,40 @@ describe('ReviewReceipt brief-verify invariants', () => {
 
   it('a brief-verify attemptId mirrors attemptIdForBrief and its assessment mirrors assessmentIdForBrief', () => {
     expect(attemptIdForBrief('proj-1', DIGEST)).toBe(`brief:proj-1:${DIGEST}`);
-    expect(assessmentIdForBrief('proj-1', DIGEST)).toBe(assessmentIdForBrief('proj-1', DIGEST));
+    expect(assessmentIdForBrief('proj-1', DIGEST)).toBe(`assessment-brief:proj-1:${'d'.repeat(64)}`);
     expect(assessmentIdForBrief('proj-1', DIGEST)).not.toBe(attemptIdForBrief('proj-1', DIGEST));
+  });
+
+  it('two briefs differing in either input field get different assessment ids', () => {
+    const base = assessmentIdForBrief('proj-1', DIGEST);
+    expect(assessmentIdForBrief('proj-2', DIGEST)).not.toBe(base);
+    expect(assessmentIdForBrief('proj-1', 'e'.repeat(64))).not.toBe(base);
+    expect(assessmentIdForBrief('proj-2', 'e'.repeat(64))).not.toBe(base);
+    expect(assessmentIdForBrief('proj-2', DIGEST)).toBe(`assessment-brief:proj-2:${DIGEST}`);
+    expect(assessmentIdForBrief('proj-1', 'e'.repeat(64))).toBe(`assessment-brief:proj-1:${'e'.repeat(64)}`);
+  });
+
+  it('a brief assessment id never equals the code-review or pre-merge assessment id of an attempt', () => {
+    const briefId = assessmentIdForBrief('proj-1', DIGEST);
+    for (const attemptId of ['att-1', 'proj-1', DIGEST, 'brief', `${DIGEST}`]) {
+      expect(assessmentIdForAttempt(attemptId)).toBe(`assessment-${attemptId}`);
+      expect(briefId).not.toBe(assessmentIdForAttempt(attemptId));
+    }
+    expect(briefId.startsWith('assessment-brief:')).toBe(true);
+  });
+
+  it.each([
+    ['a trailing newline', `${'a'.repeat(40)}\n`],
+    ['a trailing carriage return', `${'a'.repeat(40)}\r`],
+    ['a leading newline', `\n${'a'.repeat(40)}`],
+    ['uppercase hex', 'A'.repeat(40)],
+    ['39 characters', 'a'.repeat(39)],
+    ['41 characters', 'a'.repeat(41)],
+  ])('refuses a brief subject baseCommit with %s', (_title, baseCommit) => {
+    const subject = { ...briefVerifyProps().subject, baseCommit };
+    const created = ReviewReceipt.create(briefVerifyProps({ subject, candidateHeadSha: baseCommit }));
+    expect(created.success).toBe(false);
+    expect(created.error?.message).toContain('invalid baseCommit');
   });
 
   it('isValidBriefPackageDigest rejects a 64-hex digest followed by a newline and accepts only the exact 64 lowercase hex characters', () => {

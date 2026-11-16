@@ -1,6 +1,7 @@
 /**
  * CO8 guard: no code path can merge yet. Every production construction of
  * `RefreshChainsUseCase` names `mode: 'shadow'`; none omits `mode` or passes `'live'`.
+ * Every production construction also passes the required operator halt.
  */
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
@@ -49,20 +50,33 @@ function constructions(source: string): string[] {
   }
 }
 
+function productionSites(): { file: string; literal: string }[] {
+  const sites: { file: string; literal: string }[] = [];
+  for (const root of ROOTS) {
+    for (const file of productionFiles(path.join(REPO_ROOT, root))) {
+      const source = readFileSync(file, 'utf8');
+      if (!source.includes('new RefreshChainsUseCase(')) continue;
+      for (const literal of constructions(source)) sites.push({ file: path.relative(REPO_ROOT, file), literal });
+    }
+  }
+  return sites;
+}
+
 describe('RefreshChainsUseCase mode guard', () => {
   it('every production construction passes mode shadow and none passes live or omits mode', () => {
-    const sites: { file: string; literal: string }[] = [];
-    for (const root of ROOTS) {
-      for (const file of productionFiles(path.join(REPO_ROOT, root))) {
-        const source = readFileSync(file, 'utf8');
-        if (!source.includes('new RefreshChainsUseCase(')) continue;
-        for (const literal of constructions(source)) sites.push({ file: path.relative(REPO_ROOT, file), literal });
-      }
-    }
+    const sites = productionSites();
     expect(sites.length).toBeGreaterThan(0);
     for (const site of sites) {
       expect([site.file, /mode:\s*'shadow'/.test(site.literal)]).toEqual([site.file, true]);
       expect([site.file, /'live'/.test(site.literal)]).toEqual([site.file, false]);
+    }
+  });
+
+  it('every production construction passes a halt', () => {
+    const sites = productionSites();
+    expect(sites.length).toBeGreaterThan(0);
+    for (const site of sites) {
+      expect([site.file, /\bhalt\b/.test(site.literal)]).toEqual([site.file, true]);
     }
   });
 });

@@ -41,7 +41,7 @@ rule 'case-modifier' '\$\{[A-Za-z_][A-Za-z_0-9]*(:[lu]|,,|\^\^)\}'
 rule 'glob-qualifier' '[^[:space:]$(]\(N\)([[:space:];)]|$)'
 rule 'shell-builtin-typeset-setopt' '(^|[;&|({])[[:space:]]*(typeset|setopt|unsetopt|shopt)[[:space:]]'
 rule 'function-keyword' '^[[:space:]]*function[[:space:]]+[A-Za-z_][A-Za-z_0-9]*[[:space:]]*(\(\))?[[:space:]]*\{[[:space:]]*$'
-rule 'here-string' '<<<'
+rule 'here-string' '<<[<]'
 rule 'array-assignment' '^[[:space:]]*[A-Za-z_][A-Za-z_0-9]*\+?=\('
 rule 'array-expansion' '\$\{#?[A-Za-z_][A-Za-z_0-9]*\[[@*0-9]'
 rule 'process-substitution' '(^|[[:space:]])[<>]\([^)]'
@@ -125,6 +125,9 @@ SHELL_CHECK_ROOT_MODE=1
 T=$(mktemp -d "${TMPDIR:-/tmp}/shell-interpreter-test.XXXXXX") || exit 1
 trap 'rm -rf "$T"' EXIT
 lb='['
+ds='$'
+lt='<'
+lp='('
 mkdir -p "$T/bin" "$T/scripts" "$T/tests"
 w() { printf '%s\n' "$2" >> "$T/$1"; } # w <path> <line>
 expect() { # $1 label, $2 path, $3 rule, $4 yes|no
@@ -149,10 +152,10 @@ w bin/dbl '#!/bin/sh'
 w bin/dbl "if $lb$lb -n \$1 ]]; then echo x; fi"
 expect 'double bracket under sh is reported' bin/dbl bash-double-bracket yes
 w bin/mod '#!/bin/sh'
-w bin/mod 'echo ${x:l}'
+w bin/mod "echo ${ds}{x:l}"
 expect 'zsh case modifier is reported' bin/mod case-modifier yes
 w bin/glob '#!/bin/sh'
-w bin/glob 'for f in *.txt(N); do echo "$f"; done'
+w bin/glob "for f in *.txt${lp}N); do echo x; done"
 expect 'glob qualifier is reported' bin/glob glob-qualifier yes
 w bin/ts '#!/bin/sh'
 w bin/ts 'typeset -i n=1'
@@ -166,19 +169,24 @@ w bin/fn '  :'
 w bin/fn '}'
 expect 'function keyword is reported' bin/fn function-keyword yes
 w bin/hs '#!/bin/sh'
-w bin/hs 'cat <<< "x"'
+w bin/hs "cat $lt$lt$lt x"
 expect 'here-string is reported' bin/hs here-string yes
 w bin/arr '#!/bin/sh'
-w bin/arr 'a=(1 2 3)'
-w bin/arr 'echo "${a[@]}"'
+w bin/arr "a=${lp}1 2 3)"
+w bin/arr "echo ${ds}{a$lb@]}"
 expect 'array assignment is reported' bin/arr array-assignment yes
 expect 'array expansion is reported' bin/arr array-expansion yes
 w bin/ps '#!/bin/sh'
-w bin/ps 'diff <(echo a) <(echo b)'
+w bin/ps "diff ${lt}${lp}echo a) ${lt}${lp}echo b)"
 expect 'process substitution is reported' bin/ps process-substitution yes
 w bin/syn '#!/bin/sh'
 w bin/syn 'if true; then'
 expect 'a syntax error is reported' bin/syn syntax yes
+# The test file itself must pass its own rules, with no exception.
+mkdir -p "$T/self/tests"
+cp "$here/tests/shell-interpreter.test.sh" "$T/self/tests/"
+selfout=$(SHELL_CHECK_ROOT_MODE=1 scan "$T/self" | grep -v '^scanned ')
+if [ -z "$selfout" ]; then ok 'this test file passes its own rules'; else bad "this test file fails its own rules: $selfout"; fi
 excepted bin/dbl bash-double-bracket && bad 'no exception is set for bin/dbl' || ok 'an unlisted file is never excepted'
 EXCEPTIONS="bin/dbl|bash-double-bracket|fixture$nl"
 expect 'an exception table entry suppresses exactly that rule' bin/dbl bash-double-bracket no

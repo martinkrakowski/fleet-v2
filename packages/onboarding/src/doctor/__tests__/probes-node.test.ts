@@ -34,7 +34,13 @@ import type {
   DoctorCommandRunOptions,
   DoctorCommandRunResult,
 } from '../probes-node.js';
-import { createNodeDoctorExecutor, createNodeDoctorProbes, seatProbeArgv } from '../probes-node.js';
+import {
+  createNodeDoctorExecutor,
+  createNodeDoctorProbes,
+  LOGIN_SHELL_CANARY,
+  seatProbeArgv,
+} from '../probes-node.js';
+import { posixQuote } from '../ssh-remote.js';
 
 interface RecordedCall {
   readonly argv: readonly string[];
@@ -1115,5 +1121,113 @@ describe('createNodeDoctorProbes ciRunnerSlot (OG-28c)', () => {
     const probes = createNodeDoctorProbes({ localExecutor: safe.executor });
     await expect(probes.ciRunnerSlot!('bad host', UNIT)).resolves.toBe('unknown');
     expect(safe.calls).toHaveLength(0);
+  });
+});
+
+describe('createNodeDoctorProbes loginShell (SHP1)', () => {
+  const C = LOGIN_SHELL_CANARY;
+
+  it('pins the canary text', () => {
+    expect(LOGIN_SHELL_CANARY).toBe(
+      "fleet-canary a  b $HOME \\n \\\\ 'q' \"d\" * ~ ; -- #x ! line\nend",
+    );
+    expect(LOGIN_SHELL_CANARY).toHaveLength(60);
+  });
+
+  it('sends the canary over ssh as one quoted sh -c word, once, with the probe budget', async () => {
+    const fake = fakeExecutor({ stdout: C });
+    const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+    await expect(probes.loginShell!('lane-host')).resolves.toBe('intact');
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]?.argv).toEqual([
+      'ssh',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=10',
+      'lane-host',
+      '--',
+      'sh',
+      '-c',
+      posixQuote(['printf', '%s', C].map(posixQuote).join(' ')),
+    ]);
+    expect(fake.calls[0]?.options?.timeoutMs).toBe(10_000);
+  });
+
+  const viaRealShell = (prefix: string): DoctorCommandExecutor => {
+    const real = createNodeDoctorExecutor();
+    return {
+      async run(argv, options) {
+        const remoteLine = argv.slice(argv.indexOf('--') + 1).join(' ');
+        return real.run(['/bin/sh', '-c', prefix + remoteLine], options);
+      },
+    };
+  };
+
+  it('answers intact through the real /bin/sh quoted form', async () => {
+    const probes = createNodeDoctorProbes({ sshExecutor: viaRealShell('') });
+    await expect(probes.loginShell!('lane-host')).resolves.toBe('intact');
+  });
+
+  it('answers mangled when the login shell prints a banner before the echo (real /bin/sh)', async () => {
+    const probes = createNodeDoctorProbes({ sshExecutor: viaRealShell('echo banner; ') });
+    await expect(probes.loginShell!('lane-host')).resolves.toBe('mangled');
+  });
+
+  it('maps an altered echo or a non-zero exit to mangled', async () => {
+    const outcomes: Partial<DoctorCommandRunResult>[] = [
+      { stdout: '' },
+      { stdout: `${C}\n` },
+      { stdout: `banner\n${C}` },
+      { stdout: C.replace('a  b', 'a b') },
+      { stdout: 'x'.repeat(2_000_000) },
+      { exitCode: 1, stdout: C },
+      { exitCode: 127, stdout: '' },
+    ];
+    for (const outcome of outcomes) {
+      const fake = fakeExecutor(outcome);
+      const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+      await expect(probes.loginShell!('lane-host')).resolves.toBe('mangled');
+    }
+  });
+
+  it('maps a run that did not complete to unknown', async () => {
+    const outcomes: Partial<DoctorCommandRunResult>[] = [
+      { exitCode: 255, stdout: C },
+      { exitCode: null, signal: null, stdout: '', error: 'spawn ENOENT' },
+      { exitCode: 0, stdout: C, error: 'late' },
+      { exitCode: null, signal: 'SIGTERM', stdout: C },
+      { exitCode: 0, signal: 'SIGTERM', stdout: C },
+      { exitCode: 0, stdout: 42 as unknown as string },
+    ];
+    for (const outcome of outcomes) {
+      const fake = fakeExecutor(outcome);
+      const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+      await expect(probes.loginShell!('lane-host')).resolves.toBe('unknown');
+    }
+  });
+
+  it('answers unknown without running anything for local, an unsafe alias or an exhausted budget', async () => {
+    const fake = fakeExecutor({ stdout: C });
+    const probes = createNodeDoctorProbes({ localExecutor: fake.executor });
+    await expect(probes.loginShell!('local')).resolves.toBe('unknown');
+    await expect(probes.loginShell!('bad host')).resolves.toBe('unknown');
+    await expect(probes.loginShell!('-dash-alias')).resolves.toBe('unknown');
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const budgeted = createNodeDoctorProbes({ localExecutor: fake.executor, timeoutMs });
+      await expect(budgeted.loginShell!('lane-host')).resolves.toBe('unknown');
+    }
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it('maps a throwing executor to unknown', async () => {
+    const probes = createNodeDoctorProbes({
+      localExecutor: {
+        async run() {
+          throw new Error('boom');
+        },
+      },
+    });
+    await expect(probes.loginShell!('lane-host')).resolves.toBe('unknown');
   });
 });

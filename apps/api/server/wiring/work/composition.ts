@@ -65,6 +65,7 @@ import {
   ListUnregisteredProjectsUseCase,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
+  PreparePullRequestFeedbackFixUseCase,
   ProbeProjectUseCase,
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
@@ -77,6 +78,7 @@ import {
 } from "@fleet/work-execution/use-cases";
 import { ProbeLimiter } from "./probe-limiter";
 import { withPendingFixLimit } from "./pending-fix-guard";
+import { composePullRequestFeedbackFix } from "./pr-feedback-fix";
 import { withRunActiveRefusal, type GuardedCancelPreparedResult } from "./cancel-prepared-guard";
 import { withRunOwnedStopRefusal, type GuardedStopAttemptResult } from "./stop-attempt-guard";
 
@@ -155,6 +157,8 @@ export interface WorkComposition {
     ): Promise<GuardedCancelPreparedResult>;
   };
   executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
+  /** CO24c: the PR-feedback fix round, bound to the repository the forge path acts on. */
+  preparePullRequestFeedbackFix: PreparePullRequestFeedbackFixUseCase;
   /** The attempt's recorded implementer seat; never an operator value. */
   readonly resolveAttemptImplementerSeat?: AttemptImplementerSeatResolver;
 }
@@ -310,6 +314,7 @@ function unconfiguredWorkComposition(): WorkComposition {
     prepareFixAttempt: new PrepareFixAttemptUseCase(),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase(),
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase(),
+    preparePullRequestFeedbackFix: new PreparePullRequestFeedbackFixUseCase(),
     // Unconfigured resolves no seat, and says so the same way the use cases
     // do: the HTTP boundary reports 501 instead of inventing a model.
     resolveAttemptImplementerSeat: async () => {
@@ -369,6 +374,14 @@ export function createConfiguredWorkComposition(
     : undefined;
   const runnerProfile = resolveRunnerCapabilityProfile(installationModel?.hosts);
   const forgeMode = resolveInstallationForgeMode(options?.installation);
+  const forgeSection =
+    installationModel?.forge !== undefined && "mode" in installationModel.forge
+      ? installationModel.forge
+      : undefined;
+  const installationRepository =
+    forgeSection?.mode === "github"
+      ? { owner: forgeSection.owner, repo: forgeSection.repo }
+      : undefined;
   // The installation's selected lane-runner host (v2): its presence routes the
   // runner from the host entry and ignores the routing environment (plan
   // section 3). Undefined for v1 and absent installations keeps legacy mode.
@@ -506,6 +519,41 @@ export function createConfiguredWorkComposition(
   const profileRead = new ProjectProfileReadAdapter(crossContext?.projectProfile);
   const probeRecord = new ProjectProbeRecordAdapter(crossContext?.projectProfile);
 
+  const guardedPrepareFixAttempt = withPendingFixLimit(
+    new PrepareFixAttemptUseCase({ attemptRepo }),
+    attemptRepo,
+  );
+  const executeAuthorizedForgeAction = new ExecuteAuthorizedForgeActionUseCase({
+    attemptRepo,
+    workOrderRepo,
+    journal,
+    authorizationPort,
+    forgePort,
+    acceptedReceiptByHead: crossContext?.acceptedReceiptByHead,
+    acceptanceEvidencePort,
+    // Forge actions re-check the attempt's one-way doors through the same
+    // owner-decision resolution acceptance uses.
+    ownerDecisionPort,
+    attemptOwnerDecisionPort,
+    lanePlanRepo,
+    mergeRecordRepo,
+    // WB5b2: a merge's unconfirmed pull-request number is verified through
+    // the host's read-only pull-request read; absent, it stays unverified.
+    ...(crossContext?.forge?.pullRequestRead !== undefined
+      ? { forgeRead: crossContext.forge.pullRequestRead }
+      : {}),
+    // Forge mode `none` (D6) refuses every forge action.
+    ...(forgeMode === "none" ? { forgeMode: "none" as const } : {}),
+  });
+  const preparePullRequestFeedbackFix = composePullRequestFeedbackFix({
+    forgePort,
+    runGh: crossContext?.forge?.runGh,
+    forgeMode,
+    installationRepository,
+    prepareFixAttempt: guardedPrepareFixAttempt,
+    executeForgeAction: executeAuthorizedForgeAction,
+  });
+
   return {
     installation: options?.installation,
     ...(runnerHost !== undefined ? { runnerHost } : {}),
@@ -624,10 +672,7 @@ export function createConfiguredWorkComposition(
       briefKnowledge,
       runnerForAttempt,
     }),
-    prepareFixAttempt: withPendingFixLimit(
-      new PrepareFixAttemptUseCase({ attemptRepo }),
-      attemptRepo,
-    ),
+    prepareFixAttempt: guardedPrepareFixAttempt,
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo,
       workOrderRepo,
@@ -636,28 +681,8 @@ export function createConfiguredWorkComposition(
       allowedSeats,
       computeDigest: sha256HexDigest,
     }),
-    executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({
-      attemptRepo,
-      workOrderRepo,
-      journal,
-      authorizationPort,
-      forgePort,
-      acceptedReceiptByHead: crossContext?.acceptedReceiptByHead,
-      acceptanceEvidencePort,
-      // Forge actions re-check the attempt's one-way doors through the same
-      // owner-decision resolution acceptance uses.
-      ownerDecisionPort,
-      attemptOwnerDecisionPort,
-      lanePlanRepo,
-      mergeRecordRepo,
-      // WB5b2: a merge's unconfirmed pull-request number is verified through
-      // the host's read-only pull-request read; absent, it stays unverified.
-      ...(crossContext?.forge?.pullRequestRead !== undefined
-        ? { forgeRead: crossContext.forge.pullRequestRead }
-        : {}),
-      // Forge mode `none` (D6) refuses every forge action.
-      ...(forgeMode === "none" ? { forgeMode: "none" as const } : {}),
-    }),
+    executeAuthorizedForgeAction,
+    preparePullRequestFeedbackFix,
     // Independence is a fact about the lane, so any boundary that needs the
     // implementer seat reads it from the recorded attempt, never from the
     // request it is answering.

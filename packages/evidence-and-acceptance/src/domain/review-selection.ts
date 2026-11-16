@@ -6,8 +6,8 @@
  * wins, and agreement between reviewers never strengthens a result.
  */
 
-import type { ReviewKind, ReviewFindingRecord, ReviewReceiptRecord, ReviewUnknownReason } from './evidence-records.js';
-import { receiptSubjectOf } from './evidence-records.js';
+import type { ReceiptSubject, ReviewKind, ReviewFindingRecord, ReviewReceiptRecord, ReviewUnknownReason } from './evidence-records.js';
+import { attemptIdForBrief, attemptIdForChain, receiptSubjectOf } from './evidence-records.js';
 
 export interface ReviewTally {
   readonly pass: number;
@@ -487,6 +487,60 @@ export function satisfiesFullyDispositionedReviewPassGate(
     (satisfiesReviewPassGate(receipt) ||
       isFullyDispositioned(receipt, outOfScopeResolvedFindingIds, unresolvedFindingIds))
   );
+}
+
+/**
+ * The attempt id a receipt subject stands for: the attempt's own id, or the
+ * pseudo attempt id of the chain or the brief it names. Null when the subject
+ * lacks the field of its kind.
+ */
+function attemptIdOfSubject(subject: ReceiptSubject): string | null {
+  if (subject.kind === 'attempt') {
+    return subject.attemptId;
+  }
+  if (subject.kind === 'chain') {
+    return subject.chainName === null ? null : attemptIdForChain(subject.projectId, subject.chainName);
+  }
+  return subject.briefPackageDigest === null
+    ? null
+    : attemptIdForBrief(subject.projectId, subject.briefPackageDigest);
+}
+
+/**
+ * Whether a stored receipt is about the assessment that holds it (CO18a7a):
+ * the receipt's own `assessmentId`, `projectId` and `attemptId` equal the
+ * assessment's, and
+ * its subject (`receiptSubjectOf`; an absent subject reads as the receipt's
+ * own attempt) names the same project and stands for the same attempt id. A
+ * receipt about another attempt, chain or brief is not evidence for this
+ * assessment: it never counts and never replaces a receipt that does.
+ *
+ * Reads own data properties only (no getter runs) and never throws: anything
+ * unreadable, malformed or of an unknown subject kind is `false`.
+ */
+export function isReceiptAboutAssessment(receipt: unknown, assessment: unknown): boolean {
+  try {
+    const projectId = ownProp(assessment, 'projectId');
+    const attemptId = ownProp(assessment, 'attemptId');
+    if (typeof projectId !== 'string' || typeof attemptId !== 'string' || attemptId.length === 0) {
+      return false;
+    }
+    const assessmentId = ownProp(assessment, 'id');
+    if (
+      ownProp(receipt, 'assessmentId') !== assessmentId ||
+      ownProp(receipt, 'projectId') !== projectId ||
+      ownProp(receipt, 'attemptId') !== attemptId
+    ) {
+      return false;
+    }
+    const subject = receiptSubjectOf(receipt as { readonly subject?: unknown });
+    if (subject === null || subject.projectId !== projectId) {
+      return false;
+    }
+    return attemptIdOfSubject(subject) === attemptId;
+  } catch {
+    return false;
+  }
 }
 
 /** The last receipt per reviewer model and review kind, in array order. */

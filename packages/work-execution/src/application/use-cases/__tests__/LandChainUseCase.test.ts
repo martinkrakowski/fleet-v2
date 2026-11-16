@@ -470,6 +470,35 @@ function run(input: unknown = BASE_COMMAND, overrides: Overrides = {}): Promise<
   return new LandChainUseCase(world.deps).execute(command).then((result) => ({ result, world }));
 }
 
+const MARK_ID = `${OWNER}/${REPO}#${CHAIN}`;
+const LAND_KEY = `chain-land/${CHAIN}@${TIP.slice(0, 12)}`;
+const LINK_HEAD = 'c'.repeat(40);
+type StoredMark = { revision: number; mark: { headSha: string; pullRequestNumber: number; key: string; state: 'landing' | 'withdrawn' } };
+const keyAt = (sha: string): string => `chain-land/${CHAIN}@${sha.slice(0, 12)}`;
+
+/** A world of `total` listed lane runs of which the first `matching` belong to the chain, each a settled link. */
+function manyLinkWorld(matching: number, total: number): World {
+  const runs = Array.from({ length: total }, (_, at) =>
+    laneRun({ runId: `run-${at}`, prNumber: 100 + at, attemptIds: [`att-${at}`], baseBranch: at < matching ? BRANCH : 'main' }),
+  );
+  const attempts = new Map(Array.from({ length: matching }, (_, at) => [`att-${at}`, attemptRecord({ id: `att-${at}` })] as const));
+  const queueEntries = Array.from({ length: matching }, (_, at) => ({ pullRequest: 100 + at, state: 'merged' }));
+  const world = makeWorld({ laneRuns: runs, attempts, queueEntries });
+  const inner = world.deps.forgeRead.readPullRequest.bind(world.deps.forgeRead);
+  (world.deps as { forgeRead: unknown }).forgeRead = {
+    async readPullRequest(request: { readonly ref: { readonly kind: string; readonly number: number } }) {
+      if (request.ref.number >= 100) {
+        return {
+          outcome: 'found',
+          pullRequest: pullRequestSnapshot({ number: request.ref.number, state: 'merged', headRef: `feat/run`, baseRef: BRANCH, mergedAtIso: NOW, mergeCommitSha: TIP }),
+        };
+      }
+      return inner(request as never);
+    },
+  };
+  return world;
+}
+
 // ---------- the parser ----------
 
 describe('LandChainUseCase parser', () => {
@@ -611,11 +640,50 @@ describe('LandChainUseCase read phase', () => {
     expect(result).toEqual({ outcome: 'refused', reason: 'too-many-links' });
   });
 
-  it('more than 50 listed runs of which only one matches the chain is too-many-links, not a filtered pass', async () => {
-    const mixed = Array.from({ length: 51 }, (_, at) => laneRun({ runId: `run-${at}`, baseBranch: at === 0 ? BRANCH : 'main' }));
-    const { result, world } = await run({}, { laneRuns: mixed });
+  it('51 runs of this chain among 300 listed refuse too-many-links before any link is settled', async () => {
+    const world = manyLinkWorld(51, 300);
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
     expect(result).toEqual({ outcome: 'refused', reason: 'too-many-links' });
     expect(world.calls.enqueueMergeEntry).toBe(0);
+  });
+
+  it('50 runs of this chain among 300 listed runs land normally', async () => {
+    const world = manyLinkWorld(50, 300);
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toMatchObject({ outcome: 'landed', pullRequestNumber: 77 });
+    expect(world.calls.enqueueMergeEntry).toBe(1);
+  });
+
+  it('51 listed runs of which only one matches the chain are not refused as too-many-links', async () => {
+    const mixed = Array.from({ length: 51 }, (_, at) => laneRun({ runId: `run-${at}`, baseBranch: at === 0 ? BRANCH : 'main' }));
+    const { result, world } = await run({}, { laneRuns: mixed });
+    expect(result).toMatchObject({ outcome: 'landed' });
+    expect(world.calls.enqueueMergeEntry).toBe(1);
+  });
+
+  it('a list of 10001 runs is store-unavailable and no queue or attempt read follows', async () => {
+    const huge = Array.from({ length: 10_001 }, (_, at) => laneRun({ runId: `run-${at}`, baseBranch: 'main' }));
+    const world = makeWorld({ laneRuns: huge });
+    let later = 0;
+    (world.deps as { mergeQueue: unknown }).mergeQueue = {
+      listMergeEntries: async () => {
+        later += 1;
+        return [];
+      },
+      enqueueMergeEntry: async () => {
+        later += 1;
+        return {};
+      },
+    };
+    (world.deps as { attempts: unknown }).attempts = {
+      findAttemptById: async () => {
+        later += 1;
+        return null;
+      },
+    };
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'unknown', reason: 'store-unavailable' });
+    expect(later).toBe(0);
   });
 
   it('an attempt lookup that throws is store-unavailable, not link-unsettled', async () => {
@@ -697,23 +765,49 @@ describe('LandChainUseCase read phase', () => {
     expect(result).toEqual({ outcome: 'refused', reason: 'verdict-failed' });
   });
 
+  it('a chain verdict that is unknown, malformed or missing is verdict-unknown and does not open', async () => {
+    for (const verdict of ['unknown', 'garbage', 'maybe-passed', 'PASSED', '']) {
+      const { result, world } = await run({}, { reviewReceipt: { verdict }, laneRuns: [laneRun({ tier: 2 })] });
+      expect(result, verdict).toEqual({ outcome: 'unknown', reason: 'verdict-unknown' });
+      expect(world.landing.calls.openOrAdopt).toBe(0);
+      expect(world.calls.enqueueMergeEntry).toBe(0);
+    }
+  });
+
   it('a pin with no link receipt refuses link-receipt-missing and does not open', async () => {
     const { result, world } = await run({}, { linkReceipts: 'none' });
     expect(result).toEqual({ outcome: 'refused', reason: 'link-receipt-missing' });
     expect(world.landing.calls.openOrAdopt).toBe(0);
   });
 
-  it('a link receipt read at the link head is not accepted', async () => {
-    // The receipt exists only at the link's own head, never at the pinned chain head.
+  it('a link receipt that exists only at the link head, not at the pinned head, is not accepted', async () => {
+    // The link's own head is LINK_HEAD, distinct from the pinned chain head TIP; the receipt sits at LINK_HEAD only.
     const { result, world } = await run(
       {},
       {
+        attempts: new Map([[ATTEMPT_ID, attemptRecord({ artifacts: { headCommit: LINK_HEAD } })]]),
         linkReceipts: (_attemptId: string, headSha: string) =>
-          headSha === OTHER_SHA ? { outcome: 'found', verification: [], review: [preMergeReceipt('pass')] } : { outcome: 'none' },
+          headSha === LINK_HEAD ? { outcome: 'found', verification: [], review: [preMergeReceipt('pass')] } : { outcome: 'none' },
       },
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'link-receipt-missing' });
     expect(world.landing.calls.openOrAdopt).toBe(0);
+  });
+
+  it('a link receipt that exists at the pinned head is accepted although the link head differs', async () => {
+    const heads: string[] = [];
+    const { result } = await run(
+      {},
+      {
+        attempts: new Map([[ATTEMPT_ID, attemptRecord({ artifacts: { headCommit: LINK_HEAD } })]]),
+        linkReceipts: (_attemptId: string, headSha: string) => {
+          heads.push(headSha);
+          return headSha === TIP ? { outcome: 'found', verification: [], review: [preMergeReceipt('pass')] } : { outcome: 'none' };
+        },
+      },
+    );
+    expect(result).toMatchObject({ outcome: 'landed' });
+    expect(heads.every((head) => head === TIP)).toBe(true);
   });
 
   it('a link receipt that is pending or not-applicable is verdict-unknown and does not enqueue', async () => {
@@ -808,6 +902,12 @@ describe('LandChainUseCase apply', () => {
       const { result, world } = await run({}, { enqueueDecision: { outcome, recordEntryId } });
       expect(result).toMatchObject({ outcome: 'landed', entryId: recordEntryId });
       expect(world.calls.enqueued[0].entryId).not.toBe(recordEntryId);
+      // The journal result carries the queue record's id, and a replay answers it too.
+      const entries = world.landing.journal.get(LAND_KEY) ?? [];
+      expect(entries.find((entry) => entry.kind === 'result')?.entryId).toBe(recordEntryId);
+      const replay = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+      expect(replay).toMatchObject({ outcome: 'landed', entryId: recordEntryId });
+      expect(world.calls.enqueueMergeEntry).toBe(1);
     }
   });
 
@@ -976,7 +1076,7 @@ describe('LandChainUseCase apply', () => {
     expect(result).toEqual({ outcome: 'refused', reason: 'landing-mark-conflict' });
   });
 
-  it('an unsettled link after the landing mark is not enqueued', async () => {
+  it('a link receipt removed after the landing mark withdraws the mark and is not enqueued', async () => {
     let read = 0;
     const world = makeWorld({
       linkReceipts: () => {
@@ -1018,17 +1118,277 @@ describe('LandChainUseCase apply', () => {
     expect(mark?.mark.state).toBe('withdrawn');
   });
 
-  it('a stored withdrawn mark for another head is landing-mark-conflict and is never overwritten', async () => {
+  it('a withdrawn mark for another head does not conflict: the chain lands and the stored mark becomes this run\'s', async () => {
     const world = makeWorld();
-    const markId = `${OWNER}/${REPO}#${CHAIN}`;
-    world.landing.marks.set(markId, {
-      revision: 1,
-      mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: `chain-land/${CHAIN}@${OTHER_SHA.slice(0, 12)}`, state: 'withdrawn' },
+    world.landing.marks.set(MARK_ID, {
+      revision: 3,
+      mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: keyAt(OTHER_SHA), state: 'withdrawn' },
     });
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toMatchObject({ outcome: 'landed', headSha: TIP });
+    expect(world.calls.enqueueMergeEntry).toBe(1);
+    expect(world.landing.marks.get(MARK_ID)).toMatchObject({ revision: 4, mark: { headSha: TIP, key: LAND_KEY, state: 'landing', pullRequestNumber: 77 } });
+  });
+
+  it('a withdrawn mark at this head under another key does not conflict', async () => {
+    const world = makeWorld();
+    world.landing.marks.set(MARK_ID, {
+      revision: 1,
+      mark: { headSha: TIP, pullRequestNumber: 5, key: `chain-land/${CHAIN}@elsewhere`, state: 'withdrawn' },
+    });
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toMatchObject({ outcome: 'landed' });
+    expect(world.landing.marks.get(MARK_ID)?.mark).toMatchObject({ key: LAND_KEY, state: 'landing' });
+  });
+
+  it('an active mark for another head is landing-mark-conflict, is never superseded and writes nothing', async () => {
+    const world = makeWorld();
+    const stored: StoredMark = { revision: 3, mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: keyAt(OTHER_SHA), state: 'landing' } };
+    world.landing.marks.set(MARK_ID, stored);
+    let writes = 0;
+    const cas = world.landing.compareAndSetMark.bind(world.landing);
+    world.landing.compareAndSetMark = async (command) => {
+      writes += 1;
+      return cas(command);
+    };
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'landing-mark-conflict' });
+    expect(writes).toBe(0);
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    expect(world.landing.marks.get(MARK_ID)).toEqual({ revision: 3, mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: keyAt(OTHER_SHA), state: 'landing' } });
+  });
+
+  it('a withdrawn mark whose key has a journalled result is landing-mark-conflict and writes nothing', async () => {
+    const world = makeWorld();
+    const otherKey = keyAt(OTHER_SHA);
+    world.landing.marks.set(MARK_ID, { revision: 3, mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: otherKey, state: 'withdrawn' } });
+    world.landing.journal.set(otherKey, [
+      { key: otherKey, kind: 'result', entryId: '0CCCCCCCCCCCCCCCCCCCCCCCCC', recordedAtIso: NOW, digest: 'd', deadlineIso: FUTURE },
+    ]);
     const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
     expect(result).toEqual({ outcome: 'refused', reason: 'landing-mark-conflict' });
     expect(world.calls.enqueueMergeEntry).toBe(0);
-    expect(world.landing.marks.get(markId)?.mark).toMatchObject({ headSha: OTHER_SHA, state: 'withdrawn' });
+    expect(world.landing.marks.get(MARK_ID)).toEqual({ revision: 3, mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: otherKey, state: 'withdrawn' } });
+  });
+
+  it('a stale compare-and-set on replacing a withdrawn mark re-decides once and then lands', async () => {
+    const world = makeWorld();
+    world.landing.marks.set(MARK_ID, { revision: 1, mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: keyAt(OTHER_SHA), state: 'withdrawn' } });
+    const cas = world.landing.compareAndSetMark.bind(world.landing);
+    let calls = 0;
+    world.landing.compareAndSetMark = async (command) => {
+      calls += 1;
+      if (calls === 1) {
+        // A concurrent writer re-withdraws the mark at a newer revision.
+        world.landing.marks.set(MARK_ID, { revision: 2, mark: { headSha: OTHER_SHA, pullRequestNumber: 6, key: keyAt(OTHER_SHA), state: 'withdrawn' } });
+        return { outcome: 'refused', reason: 'stale-revision' };
+      }
+      return cas(command);
+    };
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toMatchObject({ outcome: 'landed' });
+    expect(calls).toBe(2);
+    expect(world.landing.marks.get(MARK_ID)).toMatchObject({ revision: 3, mark: { key: LAND_KEY, state: 'landing' } });
+  });
+
+  it('two stale compare-and-sets on replacing a withdrawn mark answer landing-mark-stale and do not enqueue', async () => {
+    const world = makeWorld();
+    world.landing.marks.set(MARK_ID, { revision: 1, mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: keyAt(OTHER_SHA), state: 'withdrawn' } });
+    let calls = 0;
+    world.landing.compareAndSetMark = async () => {
+      calls += 1;
+      return { outcome: 'refused', reason: 'stale-revision' };
+    };
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'landing-mark-stale' });
+    expect(calls).toBe(2);
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+  });
+
+  it('a withdrawal does nothing when the stored mark belongs to another key, and answers the refusal that caused it', async () => {
+    let read = 0;
+    const world = makeWorld({
+      linkReceipts: () => {
+        read += 1;
+        if (read > 1) {
+          // After this run's mark, another landing's active mark takes the slot.
+          world.landing.marks.set(MARK_ID, { revision: 9, mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: keyAt(OTHER_SHA), state: 'landing' } });
+          return { outcome: 'none' };
+        }
+        return { outcome: 'found', verification: [], review: [preMergeReceipt('pass')] };
+      },
+    });
+    const withdrawals: string[] = [];
+    const cas = world.landing.compareAndSetMark.bind(world.landing);
+    world.landing.compareAndSetMark = async (command) => {
+      if (command.mark.state === 'withdrawn') {
+        withdrawals.push(command.mark.key);
+      }
+      return cas(command);
+    };
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'link-receipt-missing' });
+    expect(withdrawals).toEqual([]);
+    expect(world.landing.marks.get(MARK_ID)).toEqual({ revision: 9, mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: keyAt(OTHER_SHA), state: 'landing' } });
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+  });
+
+  it('a withdrawal is not written when this run\'s key already has a journalled result, and answers landing-mark-conflict', async () => {
+    let read = 0;
+    const world = makeWorld({
+      linkReceipts: () => {
+        read += 1;
+        if (read > 1) {
+          world.landing.journal.set(LAND_KEY, [
+            ...(world.landing.journal.get(LAND_KEY) ?? []),
+            { key: LAND_KEY, kind: 'result', entryId: '0DDDDDDDDDDDDDDDDDDDDDDDDD', recordedAtIso: NOW, digest: 'd', deadlineIso: FUTURE },
+          ]);
+          return { outcome: 'none' };
+        }
+        return { outcome: 'found', verification: [], review: [preMergeReceipt('pass')] };
+      },
+    });
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'landing-mark-conflict' });
+    expect(world.landing.marks.get(MARK_ID)?.mark.state).toBe('landing');
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+  });
+
+  it('a stored mark that changed between this run\'s mark write and its enqueue is landing-mark-conflict with no enqueue', async () => {
+    const world = makeWorld();
+    const append = world.landing.append.bind(world.landing);
+    world.landing.append = async (entry) => {
+      if (entry.key.includes('/enqueue@')) {
+        world.landing.marks.set(MARK_ID, { revision: 9, mark: { headSha: OTHER_SHA, pullRequestNumber: 5, key: keyAt(OTHER_SHA), state: 'landing' } });
+      }
+      return append(entry);
+    };
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'landing-mark-conflict' });
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+  });
+
+  it('a withdrawn mark of this key and head is not replaced when a result appeared after the initial journal read', async () => {
+    const world = makeWorld();
+    const stored: StoredMark = { revision: 3, mark: { headSha: TIP, pullRequestNumber: 77, key: LAND_KEY, state: 'withdrawn' } };
+    world.landing.marks.set(MARK_ID, stored);
+    const append = world.landing.append.bind(world.landing);
+    world.landing.append = async (entry) => {
+      const appended = await append(entry);
+      if (entry.key.includes('/premerge@')) {
+        // A concurrent run sharing this key finishes its landing after this run's initial journal read.
+        world.landing.journal.set(LAND_KEY, [
+          ...(world.landing.journal.get(LAND_KEY) ?? []),
+          { key: LAND_KEY, kind: 'result', entryId: '0EEEEEEEEEEEEEEEEEEEEEEEEE', recordedAtIso: NOW, digest: 'd', deadlineIso: FUTURE },
+        ]);
+      }
+      return appended;
+    };
+    let writes = 0;
+    const cas = world.landing.compareAndSetMark.bind(world.landing);
+    world.landing.compareAndSetMark = async (command) => {
+      writes += 1;
+      return cas(command);
+    };
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'landing-mark-conflict' });
+    expect(writes).toBe(0);
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    expect(world.landing.marks.get(MARK_ID)?.mark.state).toBe('withdrawn');
+  });
+
+  it('a secret-shaped string under an own symbol key is secret-shaped', async () => {
+    const world = makeWorld();
+    const command: Record<PropertyKey, unknown> = { ...BASE_COMMAND };
+    command[Symbol('note')] = 'gh' + 'p_' + 'x'.repeat(28);
+    expect(await new LandChainUseCase(world.deps).execute(command)).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
+  });
+
+  it('a command field that is an accessor is invalid-request and the accessor is never invoked', async () => {
+    for (const field of ['dryRun', 'chainName', 'projectId', 'deadlineIso']) {
+      for (const throws of [false, true]) {
+        const world = makeWorld();
+        let invoked = 0;
+        const command: Record<string, unknown> = { ...BASE_COMMAND };
+        Object.defineProperty(command, field, {
+          enumerable: true,
+          get() {
+            invoked += 1;
+            if (throws) {
+              throw new Error('getter');
+            }
+            return field === 'dryRun' ? true : BASE_COMMAND[field as keyof typeof BASE_COMMAND];
+          },
+        });
+        const result = await new LandChainUseCase(world.deps).execute(command);
+        expect(result, `${field}/${throws}`).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+        expect(invoked).toBe(0);
+        expect(world.calls.enqueueMergeEntry).toBe(0);
+      }
+    }
+  });
+
+  it('a crash after the queue accepted the entry but before the result was journalled is retried without a second live entry', async () => {
+    const world = makeWorld();
+    const live: { entryId: string }[] = [];
+    world.deps.mergeQueue.enqueueMergeEntry = (async (command: { entryId: string }) => {
+      if (live.length === 0) {
+        live.push({ entryId: command.entryId });
+        return { outcome: 'created', entries: [], record: { entryId: command.entryId } };
+      }
+      return { outcome: 'duplicate', entries: [], record: { entryId: live[0].entryId } };
+    }) as never;
+    let openPullRequests: { number: number; headSha: string }[] = [];
+    (world.deps.forge as { findOpenPullRequestsByHead: unknown }).findOpenPullRequestsByHead = async () => ({ outcome: 'read', pullRequests: openPullRequests });
+    const append = world.landing.append.bind(world.landing);
+    let dying = true;
+    world.landing.append = async (entry) => {
+      if (entry.kind === 'result' && dying) {
+        dying = false;
+        throw new Error('process died after the queue accepted the entry');
+      }
+      return append(entry);
+    };
+    const first = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(first).toEqual({ outcome: 'unknown', reason: 'journal-unreadable' });
+    expect(live).toHaveLength(1);
+    openPullRequests = [{ number: 77, headSha: TIP }];
+    const retry = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(retry).toMatchObject({ outcome: 'landed', pullRequestNumber: 77, entryId: live[0].entryId });
+    expect(live).toHaveLength(1);
+  });
+
+  it('a crash before the queue answered (the first enqueue throws) adopts the pull request and enqueues once', async () => {
+    const world = makeWorld();
+    const modes: string[] = [];
+    const open = world.landing.openOrAdopt.bind(world.landing);
+    world.landing.openOrAdopt = async (command) => {
+      modes.push(command.mode);
+      return open(command);
+    };
+    let openPullRequests: { number: number; headSha: string }[] = [];
+    (world.deps.forge as { findOpenPullRequestsByHead: unknown }).findOpenPullRequestsByHead = async () => ({ outcome: 'read', pullRequests: openPullRequests });
+    const enqueue = world.deps.mergeQueue.enqueueMergeEntry.bind(world.deps.mergeQueue);
+    let enqueuesLanded = 0;
+    let crash = true;
+    world.deps.mergeQueue.enqueueMergeEntry = async (command) => {
+      if (crash) {
+        crash = false;
+        throw new Error('process died before the enqueue answered');
+      }
+      enqueuesLanded += 1;
+      return enqueue(command);
+    };
+    const first = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(first).toEqual({ outcome: 'unknown', reason: 'queue-unreadable' });
+    // The pull request the first run opened is now the one open integration pull request.
+    openPullRequests = [{ number: 77, headSha: TIP }];
+    const retry = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(retry).toMatchObject({ outcome: 'landed', pullRequestNumber: 77 });
+    expect(modes).toEqual(['open', 'adopt']);
+    expect(enqueuesLanded).toBe(1);
+    const entries = world.landing.journal.get(LAND_KEY) ?? [];
+    expect(entries.map((entry) => entry.kind)).toEqual(['intent', 'result']);
   });
 
   it('a failed withdrawal CAS surfaces landing-mark-stale and does not land', async () => {

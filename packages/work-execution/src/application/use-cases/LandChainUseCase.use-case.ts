@@ -51,6 +51,8 @@ import {
 
 export const LAND_CHAIN_MAX_LINKS = 50;
 export const LAND_CHAIN_MAX_QUEUE_ENTRIES = 1000;
+/** The bound on the unfiltered lane-run list scanned for the chain's own runs; over it the store is unreadable. */
+const MAX_LANE_RUNS_SCANNED = 10_000;
 const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const COMMAND_MAX_KEYS = 6;
 
@@ -77,12 +79,19 @@ const FAIL_BATCH = unknown('batch-unreadable');
 const FAIL_BUDGET = unknown('budget-exhausted');
 const FAIL_ID = unknown('id-unavailable');
 
+/** What `own` answers for an accessor property: never a valid value, and the accessor is never invoked. */
+const ACCESSOR_FIELD: unique symbol = Symbol('accessor-field');
+
 function own(source: unknown, key: string): unknown {
   try {
     if (typeof source !== 'object' || source === null) {
       return undefined;
     }
-    return Object.getOwnPropertyDescriptor(source, key)?.value;
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (descriptor !== undefined && !('value' in descriptor)) {
+      return ACCESSOR_FIELD;
+    }
+    return descriptor?.value;
   } catch {
     return undefined;
   }
@@ -99,7 +108,7 @@ function byteLength(value: string): number {
  */
 function secretScan(input: object): 'secret' | 'uninspectable' | 'clean' {
   try {
-    for (const key of Object.getOwnPropertyNames(input)) {
+    for (const key of Reflect.ownKeys(input)) {
       const value = Object.getOwnPropertyDescriptor(input, key)?.value;
       if (typeof value === 'string' && (byteLength(value) > 256 || containsSecretShape(value))) {
         return 'secret';
@@ -224,12 +233,15 @@ export interface LandChainDependencies {
 /** The answer of one deadline-guarded outbound call: the deadline fail, the mapped throw fail, or the value. */
 type Guarded<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly fail: Fail };
 
-/** The lane-run list, validated as a dense array; a fake length or a hole is an unreadable store. */
+/** The lane-run list, validated as a dense array; a fake length, a hole or a list over the scan bound is an unreadable store. */
 function readRunList(value: unknown): readonly LaneRunRecord[] | null {
   if (!Array.isArray(value) || !Number.isSafeInteger(value.length)) {
     return null;
   }
-  const checked = Math.min(value.length, LAND_CHAIN_MAX_LINKS + 1);
+  const checked = value.length;
+  if (checked > MAX_LANE_RUNS_SCANNED) {
+    return null;
+  }
   for (let at = 0; at < checked; at += 1) {
     if (!Object.prototype.hasOwnProperty.call(value, String(at))) {
       return null;
@@ -405,12 +417,9 @@ export class LandChainUseCase implements LandChainPort {
     if (allRuns === null) {
       return { ok: false, fail: FAIL_STORE };
     }
-    // The cap is on the listed input itself: read the length once, refuse over it
-    // before filtering, and iterate only to that captured length.
+    // The scan is bounded by `readRunList`; the 50 cap applies to the chain's own
+    // runs, after filtering. The length is read once and each element once.
     const listedLength = allRuns.length;
-    if (listedLength > LAND_CHAIN_MAX_LINKS) {
-      return { ok: false, fail: refused('too-many-links') };
-    }
     const runs: LaneRunRecord[] = [];
     try {
       for (let at = 0; at < listedLength; at += 1) {
@@ -421,6 +430,9 @@ export class LandChainUseCase implements LandChainPort {
       }
     } catch {
       return { ok: false, fail: FAIL_STORE };
+    }
+    if (runs.length > LAND_CHAIN_MAX_LINKS) {
+      return { ok: false, fail: refused('too-many-links') };
     }
     if (runs.length === 0) {
       return { ok: false, fail: refused('no-links') };
@@ -575,7 +587,8 @@ export class LandChainUseCase implements LandChainPort {
     if (receipt.verdict === 'failed') {
       return refused('verdict-failed');
     }
-    if (receipt.verdict === 'unknown') {
+    // Allow-list: only `passed` lands; `unknown` and any malformed verdict is unknown.
+    if (receipt.verdict !== 'passed') {
       return unknown('verdict-unknown');
     }
     return null;
@@ -915,6 +928,11 @@ export class LandChainUseCase implements LandChainPort {
     if (!successorId.ok) {
       return successorId.fail;
     }
+    // The mark is read again immediately before the enqueue: only this run's own active mark lets it through.
+    const stillOurs = await this.markIsOurs(command, key, facts.tip);
+    if (stillOurs !== null) {
+      return stillOurs;
+    }
     const enqueued = await this.guarded(
       command.deadlineIso,
       FAIL_QUEUE,
@@ -944,7 +962,8 @@ export class LandChainUseCase implements LandChainPort {
       return FAIL_QUEUE;
     }
 
-    const appended = await this.appendJournalEntry(command, key, 'result', digest);
+    // The result carries the queue record's own id, so a replay answers the id the first run did.
+    const appended = await this.appendJournalEntry(command, key, 'result', digest, recordedId);
     if (appended !== null) {
       return appended;
     }
@@ -979,8 +998,9 @@ export class LandChainUseCase implements LandChainPort {
     key: string,
     kind: 'intent' | 'result',
     digest: string,
+    entryIdOverride?: string,
   ): Promise<Fail | null> {
-    const minted = this.mintId();
+    const minted = entryIdOverride === undefined ? this.mintId() : { ok: true as const, id: entryIdOverride };
     if (!minted.ok) {
       return minted.fail;
     }
@@ -1052,10 +1072,22 @@ export class LandChainUseCase implements LandChainPort {
       if (!stored.ok) {
         return stored.fail;
       }
-      if (stored.outcome === 'found' && stored.mark !== undefined && (stored.mark.headSha !== tip || stored.mark.key !== key)) {
-        // A stored mark for another head conflicts whatever its state — a
-        // withdrawn one is still a mark, never silently overwritten.
-        return refused('landing-mark-conflict');
+      if (stored.outcome === 'found' && stored.mark !== undefined) {
+        const ours = stored.mark.headSha === tip && stored.mark.key === key;
+        // An active mark for another key or head conflicts and is never superseded.
+        if (!ours && stored.mark.state !== 'withdrawn') {
+          return refused('landing-mark-conflict');
+        }
+        // Every withdrawn mark, this run's own key included, is replaced only when its key's landing is not
+        // journalled as finished: a run sharing the key may have appended its result since the initial read.
+        // A finished own landing cannot be reported from a withdrawn mark (the replay path needs an active
+        // one), so it answers landing-mark-conflict and nothing is written or enqueued.
+        if (stored.mark.state === 'withdrawn') {
+          const settled = await this.markKeyHasResult(command, stored.mark.key);
+          if (settled !== 'none') {
+            return settled === 'result' ? refused('landing-mark-conflict') : settled;
+          }
+        }
       }
       const cas = await this.guarded(
         command.deadlineIso,
@@ -1095,6 +1127,33 @@ export class LandChainUseCase implements LandChainPort {
     return first;
   }
 
+  /** Whether the journal holds a `result` entry for a mark's key: `result`, `none`, or the failure reading it earns. */
+  private async markKeyHasResult(command: LandChainCommand, markKey: string): Promise<'result' | 'none' | Fail> {
+    const entries = await this.journalEntries(command, markKey);
+    if (!entries.ok) {
+      return entries.fail;
+    }
+    return entries.value.some((entry) => entry.kind === 'result') ? 'result' : 'none';
+  }
+
+  /** `null` when the stored mark is this run's key and head in state `landing`, else the failure that stops the enqueue. */
+  private async markIsOurs(command: LandChainCommand, key: string, tip: string): Promise<Fail | null> {
+    const stored = await this.readLandingMark(command);
+    if (!stored.ok) {
+      return stored.fail;
+    }
+    if (
+      stored.outcome !== 'found' ||
+      stored.mark === undefined ||
+      stored.mark.state !== 'landing' ||
+      stored.mark.key !== key ||
+      stored.mark.headSha !== tip
+    ) {
+      return refused('landing-mark-conflict');
+    }
+    return null;
+  }
+
   /** Withdraw the landing mark (one stale-revision retry), then return the re-check failure; a failed withdrawal never lands. */
   private async withdrawAndReturn(
     command: LandChainCommand,
@@ -1103,10 +1162,24 @@ export class LandChainUseCase implements LandChainPort {
     pullRequestNumber: number,
     failure: Fail,
   ): Promise<LandChainResult> {
-    const attempt = async (): Promise<'withdrawn' | 'stale' | 'conflict' | Fail> => {
+    const attempt = async (): Promise<'withdrawn' | 'stale' | 'conflict' | 'not-ours' | Fail> => {
       const stored = await this.readLandingMark(command);
       if (!stored.ok) {
         return stored.fail;
+      }
+      // Only this run's own active mark is withdrawn; any other stored mark is left untouched.
+      if (
+        stored.outcome !== 'found' ||
+        stored.mark === undefined ||
+        stored.mark.state !== 'landing' ||
+        stored.mark.key !== key ||
+        stored.mark.headSha !== tip
+      ) {
+        return 'not-ours';
+      }
+      const settled = await this.markKeyHasResult(command, key);
+      if (settled !== 'none') {
+        return settled === 'result' ? refused('landing-mark-conflict') : settled;
       }
       const cas = await this.guarded(
         command.deadlineIso,
@@ -1130,12 +1203,12 @@ export class LandChainUseCase implements LandChainPort {
     };
 
     const first = await attempt();
-    if (first === 'withdrawn') {
+    if (first === 'withdrawn' || first === 'not-ours') {
       return failure;
     }
     if (first === 'stale') {
       const second = await attempt();
-      if (second === 'withdrawn') {
+      if (second === 'withdrawn' || second === 'not-ours') {
         return failure;
       }
       if (second === 'stale') {

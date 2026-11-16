@@ -40,6 +40,26 @@ const REQUIRED_TEXT_FIELDS = [
   'expectedHeadSha',
 ] as const;
 
+/**
+ * The own `releaseRoot` of a runtime request, read through its own property
+ * descriptor so a hostile accessor, a throwing Proxy trap or an inherited value
+ * never runs code. `hostile` is a typed answer, never an exception.
+ */
+function readOwnReleaseRoot(request: object): { readonly hostile: boolean; readonly value: unknown } {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(request, 'releaseRoot');
+    if (descriptor === undefined) {
+      return { hostile: false, value: undefined };
+    }
+    if (!('value' in descriptor)) {
+      return { hostile: true, value: undefined };
+    }
+    return { hostile: false, value: descriptor.value };
+  } catch {
+    return { hostile: true, value: undefined };
+  }
+}
+
 function refused(reason: string): RecordAuthorizationConsumptionResult {
   return { outcome: 'refused', reason };
 }
@@ -122,8 +142,9 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     // another. An invalid coordinate on either side fails closed as a
     // mismatch, never as a match.
     const recordedRoot = isReleaseRootCoordinate(recorded.releaseRoot) ? recorded.releaseRoot : undefined;
-    const requestedRoot = isReleaseRootCoordinate(request.releaseRoot) ? request.releaseRoot : undefined;
-    if (recordedRoot !== requestedRoot) {
+    const suppliedRoot = readOwnReleaseRoot(request);
+    const requestedRoot = isReleaseRootCoordinate(suppliedRoot.value) ? suppliedRoot.value : undefined;
+    if (suppliedRoot.hostile || recordedRoot !== requestedRoot) {
       return refused('release-grant-root-mismatch');
     }
     // Idempotent replay of the same action: the durable receipt is returned

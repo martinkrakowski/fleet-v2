@@ -38,6 +38,26 @@ function isFilled(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+/**
+ * The own `releaseRoot` of a runtime request, read through its own property
+ * descriptor so a hostile accessor, a throwing Proxy trap or an inherited value
+ * never runs code. `hostile` is a typed answer, never an exception.
+ */
+function readOwnReleaseRoot(request: object): { readonly hostile: boolean; readonly value: unknown } {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(request, 'releaseRoot');
+    if (descriptor === undefined) {
+      return { hostile: false, value: undefined };
+    }
+    if (!('value' in descriptor)) {
+      return { hostile: true, value: undefined };
+    }
+    return { hostile: false, value: descriptor.value };
+  } catch {
+    return { hostile: true, value: undefined };
+  }
+}
+
 function blocked(reason: string): ResolveActionAuthorizationResult {
   return { outcome: 'blocked', reason };
 }
@@ -140,8 +160,9 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // operation on that root. An invalid coordinate on either side fails
     // closed as a mismatch, never as a match.
     const recordedRoot = isReleaseRootCoordinate(refreshed.releaseRoot) ? refreshed.releaseRoot : undefined;
-    const requestedRoot = isReleaseRootCoordinate(request.releaseRoot) ? request.releaseRoot : undefined;
-    if (recordedRoot !== requestedRoot) {
+    const suppliedRoot = readOwnReleaseRoot(request);
+    const requestedRoot = isReleaseRootCoordinate(suppliedRoot.value) ? suppliedRoot.value : undefined;
+    if (suppliedRoot.hostile || recordedRoot !== requestedRoot) {
       return blocked('release-grant-root-mismatch');
     }
     const mergeGrant = candidate.getMergeGrant();

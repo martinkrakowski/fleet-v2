@@ -139,6 +139,17 @@ describe('ActionAuthorizationAdapter attempt coordinate', () => {
     expect(grants.get('grant-1')?.releaseRoot).toBe(ROOT_A);
   });
 
+  it('refuses a consume that omits the release root against a root-bound grant, and leaves it unconsumed', async () => {
+    const grants = grantsOf(
+      grantEntry({ kind: 'release-swap', releaseRoot: ROOT_A }) as ActionAuthorizationGrantEntry,
+    );
+    const adapter = new ActionAuthorizationAdapter({ grants });
+    expect(
+      await adapter.consumeActionAuthorization(consumeRequest({ actionKind: 'release-swap' })),
+    ).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+    expect(grants.get('grant-1')?.consumedByActionId).toBeNull();
+  });
+
   it('binds a root-less legacy release grant to the first rooted resolve and keeps it there', async () => {
     const grants = grantsOf(grantEntry({ kind: 'release-swap', attemptId: undefined }) as ActionAuthorizationGrantEntry);
     const adapter = new ActionAuthorizationAdapter({ grants });

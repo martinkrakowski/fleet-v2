@@ -3,6 +3,7 @@ import type { CoordinationRequestRecord } from '../src/domain/coordination-recor
 import type { CoordinationRequestRepositoryPort } from '../src/application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { RequestScopedDecisionUseCase } from '../src/application/use-cases/RequestScopedDecisionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
+import { RecordAuthorizationConsumptionUseCase } from '../src/application/use-cases/RecordAuthorizationConsumptionUseCase.use-case.js';
 
 class InMemoryCoordinationRequestRepo implements CoordinationRequestRepositoryPort {
   private requests = new Map<string, CoordinationRequestRecord>();
@@ -144,6 +145,55 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
       releaseRoot: '/srv/fleet/other',
     });
     expect(otherRoot).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
+  });
+
+  it('refuses, never throws, when the request carries a throwing own releaseRoot getter', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const head = '4444444444444444444444444444444444444444';
+    await repo.saveRequest({
+      id: 'req-hostile-1',
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'release:install',
+      expectedHeadSha: head,
+      proposalDigest: 'digest-h',
+      policyRevision: 'pol-1',
+      decisionRevision: 'dec-1',
+      grantId: 'grant-hostile-1',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-10T10:00:00.000Z',
+      updatedAtIso: '2026-11-10T10:00:00.000Z',
+    } as CoordinationRequestRecord);
+    const hostile = <T extends object>(base: T): T =>
+      Object.defineProperty({ ...base }, 'releaseRoot', {
+        enumerable: true,
+        get() {
+          throw new Error('hostile getter ran');
+        },
+      }) as T;
+    const resolved = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).resolveActionAuthorization(
+      hostile({ projectId: 'proj-1', actionScope: 'release:install', expectedHeadSha: head }),
+    );
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
+    const consumed = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repo,
+    }).recordAuthorizationConsumption(
+      hostile({
+        consumptionId: 'cons-1',
+        grantId: 'grant-hostile-1',
+        actionId: 'action-1',
+        actionScope: 'release:install',
+        attemptId: 'action-1',
+        expectedHeadSha: head,
+      }),
+    );
+    expect(consumed).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+    expect((await repo.findRequestByGrantId('grant-hostile-1'))?.consumptions).toEqual([]);
   });
 
   it('refuses a decision request whose releaseRoot is not a bounded absolute path', async () => {

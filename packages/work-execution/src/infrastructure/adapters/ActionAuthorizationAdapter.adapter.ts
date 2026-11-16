@@ -900,12 +900,13 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
       }
     }
-    // CO14 follow-up: a grant bound to one release root is never consumed for
-    // another. A consumption that names a root this grant does not carry is a
-    // mismatch too: a root the grant never recorded cannot be verified here.
+    // CO14 follow-up: the supplied and stored roots must match whenever either
+    // is present. A root-bound grant is never consumed for another root, nor by
+    // a consumption that omits the root; a root the grant never recorded cannot
+    // be verified here either.
     if (
-      request.releaseRoot !== undefined &&
-      (grant.releaseRoot === undefined || grant.releaseRoot !== request.releaseRoot)
+      (request.releaseRoot !== undefined || grant.releaseRoot !== undefined) &&
+      grant.releaseRoot !== request.releaseRoot
     ) {
       return { outcome: 'refused', reason: 'release-grant-root-mismatch' };
     }

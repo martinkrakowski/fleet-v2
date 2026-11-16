@@ -323,14 +323,22 @@ describe('release robustness bar (CO14 follow-up)', () => {
 
   it('release output carries ids and codes only', async () => {
     const root = await tempDir('co14b-secret-');
-    const { useCase: uc } = useCase();
+    // Synthetic, obviously fake secret-shaped values, built here and never real.
+    const fakeToken = ['gh', 'p_', 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8'].join('');
+    const fakeKey = ['sk', '-', 'FAKE0synthetic1value2for3tests4only5'].join('');
+    const { useCase: uc } = useCase({ env: () => ({ PATH: '/usr/bin', SNEAKY_TOKEN: fakeToken }) });
     const results = [
       await uc.manageRelease({ ...installRequest, root }),
       await uc.manageRelease({ ...installRequest, root, apply: true, projectId: 'p' }),
       await uc.manageRelease({ ...installRequest, root, apply: true }),
+      // A secret-shaped value supplied as runtime input is refused, never echoed.
+      await uc.manageRelease({ ...installRequest, root, sha: fakeToken }),
+      await uc.manageRelease({ ...installRequest, root, projectId: fakeKey, apply: true }),
     ];
     for (const result of results) {
       const text = JSON.stringify(result);
+      expect(text).not.toContain(fakeToken);
+      expect(text).not.toContain(fakeKey);
       expect(text).not.toContain(root);
       expect(text).not.toContain('TOKEN');
       expect(text).not.toContain('/nonexistent-co14b-source');

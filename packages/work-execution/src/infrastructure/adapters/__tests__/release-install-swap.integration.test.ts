@@ -272,6 +272,30 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
       apply: true,
       projectId: 'p',
     });
+    // An old verified build is already current before the lease is held.
+    await h.grants.saveRequest(releaseGrant('grant-swap-old', 'release:swap', shaA, h.root));
+    const firstSwap = await h.useCase.manageRelease({
+      action: 'swap',
+      root: h.root,
+      sha: shaA,
+      source: null,
+      keep: 5,
+      apply: true,
+      projectId: 'p',
+    });
+    expect(firstSwap.outcome).toBe('applied');
+    expect(await readlinkSha(h.root)).toBe(shaA);
+    await h.grants.saveRequest(releaseGrant('grant-b', 'release:install', shaB, h.root));
+    await h.useCase.manageRelease({
+      action: 'install',
+      root: h.root,
+      sha: shaB,
+      source: h.root,
+      keep: 5,
+      apply: true,
+      projectId: 'p',
+    });
+    const installsRan = h.executor.argvs.length;
     // A driver holds an unexpired lease in the release's own state directory.
     const holder = new ConductorDriverLeaseAdapter({ stateDir: h.stateDir });
     const existing = await holder.read();
@@ -282,21 +306,22 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
       nowIso: NOW,
     });
     expect(held.outcome).toBe('ok');
-    await h.grants.saveRequest(releaseGrant('grant-swap', 'release:swap', shaA, h.root));
+    await h.grants.saveRequest(releaseGrant('grant-swap', 'release:swap', shaB, h.root));
     const refused = await h.useCase.manageRelease({
       action: 'swap',
       root: h.root,
-      sha: shaA,
+      sha: shaB,
       source: null,
       keep: 5,
       apply: true,
       projectId: 'p',
     });
     expect(refused).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
-    // The refused swap repointed nothing: `current` is still where install left it.
-    expect(await readlinkSha(h.root)).toBeNull();
-    // No build was started for the refused release: only the install's four steps ran.
-    expect(h.executor.argvs).toHaveLength(4);
+    // The refused swap repointed nothing: `current` still names the old verified build.
+    expect(await readlinkSha(h.root)).toBe(shaA);
+    expect(await h.store.list({ root: h.root })).toMatchObject({ outcome: 'read', current: shaA });
+    // No build was started for the refused release.
+    expect(h.executor.argvs).toHaveLength(installsRan);
   });
 });
 

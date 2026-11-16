@@ -210,6 +210,27 @@ function isAttemptReceiptAbout(receipt: unknown, owner: unknown): boolean {
   return isAttemptReceiptSubject(receipt) && isReceiptAboutAssessment(receipt, owner);
 }
 
+/**
+ * True when an attempt receipt's subject names `projectId` and `attemptId`.
+ * The subject is read through own data properties only (no getter runs) and a
+ * receipt without a subject reads as one whose subject is its own ids, which
+ * the caller binds separately; a missing, unreadable or non-attempt subject is
+ * never bound. Never throws.
+ */
+function isAttemptSubjectBoundTo(
+  receipt: { readonly subject?: unknown; readonly projectId?: unknown; readonly attemptId?: unknown },
+  projectId: string,
+  attemptId: string,
+): boolean {
+  const subject = receiptSubjectOf(receipt);
+  return (
+    subject !== null &&
+    subject.kind === 'attempt' &&
+    subject.projectId === projectId &&
+    subject.attemptId === attemptId
+  );
+}
+
 /** The fixed out-of-scope reason (KF-33b2): never reviewer text. */
 const OUT_OF_SCOPE_REASON = 'not a file this lane changed (conductor scope rule)';
 
@@ -775,7 +796,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         (kind === 'brief-check'
           ? isAttemptReceiptSubject(receipt) &&
             receipt.projectId === request.projectId &&
-            receipt.attemptId === request.attemptId
+            receipt.attemptId === request.attemptId &&
+            isAttemptSubjectBoundTo(receipt, request.projectId, request.attemptId)
           : isAttemptReceiptAbout(receipt, {
               id: assessmentIdForAttempt(request.attemptId),
               projectId: request.projectId,
@@ -819,7 +841,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       (only.kind === 'brief-check'
         ? !isAttemptReceiptSubject(only) ||
           only.projectId !== read.assessment.projectId ||
-          only.attemptId !== read.assessment.attemptId
+          only.attemptId !== read.assessment.attemptId ||
+          !isAttemptSubjectBoundTo(only, read.assessment.projectId, read.assessment.attemptId)
         : !isAttemptReceiptAbout(only, read.assessment))
     ) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };

@@ -892,7 +892,11 @@ export async function runCli(
     // it never composes the runtime or loads the installation, so a bad
     // installation cannot block it and no installation path is printed.
     if (group === 'lane') {
-      return await laneCommand(restArgv.slice(1), io);
+      // `diff-check` is the lane group's only subcommand and the parser takes
+      // the worktree as its first positional, so the subcommand token must be
+      // stripped here; leaving it in made every real invocation a usage error.
+      const laneRest = restArgv[1] === 'diff-check' ? restArgv.slice(2) : restArgv.slice(1);
+      return await laneCommand(laneRest, io);
     }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.

@@ -2,12 +2,20 @@
  * Pure, probe-injected checked deploy sequencing. The engine spawns nothing,
  * opens no socket and reads no file: every side effect enters through a
  * `DeployProbes` implementation. Any probe throw, missing probe method or
- * invalid probe result becomes a refusal, never a crash, and an attempted
- * but unconfirmed repoint is rolled back to the previous target. Request
- * fields are snapshotted during validation and never re-read afterwards.
+ * invalid probe result becomes a refusal, never a crash. `HEAD` is re-read
+ * once immediately before the repoint, so a commit that moved during the
+ * build is refused. A failed or unverifiable install rollback is reported
+ * as `rollback-failed` or `no-rollback-target`, never as a plain refusal.
+ * Request fields are snapshotted during validation and never re-read
+ * afterwards.
  */
 
-import type { DeployProbes, DeployRequest, DeployResult } from './types.js';
+import type {
+  DeployInstallFailure,
+  DeployProbes,
+  DeployRequest,
+  DeployResult,
+} from './types.js';
 
 /** The probe methods a `DeployProbes` implementation must provide. */
 function probeMethods(): string[] {
@@ -101,11 +109,201 @@ function refusal(reason: string, detail: string): DeployResult {
   return { outcome: 'refused', reason: reason as never, detail };
 }
 
+/** Whether a `HEAD` reading names exactly the expected commit. */
+function headMatches(head: unknown, commit: string): boolean {
+  return (
+    typeof head === 'string' &&
+    head.trim().length > 0 &&
+    /^[0-9a-fA-F]{40,64}$/.test(head.trim()) &&
+    head.trim().toLowerCase() === commit.toLowerCase()
+  );
+}
+
+/**
+ * Restore the install link to its previous target after a failed install:
+ * repoint at most once, verify the restore by reading the target back and
+ * never throw. With no previous target there is nothing to restore, so the
+ * link is left pointing at the unverified build.
+ */
+async function restorePrevious(
+  probes: DeployProbes,
+  link: string,
+  previousTarget: string | undefined,
+): Promise<'restored' | 'rollback-failed' | 'no-rollback-target'> {
+  if (previousTarget === undefined) {
+    return 'no-rollback-target';
+  }
+  try {
+    await probes.repoint(link, previousTarget);
+    const restoredTarget = await probes.currentTarget(link);
+    return restoredTarget === previousTarget ? 'restored' : 'rollback-failed';
+  } catch {
+    return 'rollback-failed';
+  }
+}
+
+/**
+ * Turn a failed install plus the outcome of the restore into the result
+ * the operator sees: a verified restore is a plain refusal; an unknown or
+ * impossible restore is a distinct failed-install outcome.
+ */
+function installFailure(
+  reason: DeployInstallFailure,
+  state: 'restored' | 'rollback-failed' | 'no-rollback-target',
+): DeployResult {
+  if (state === 'restored') {
+    return refusal(reason, reason);
+  }
+  return { outcome: state, reason, detail: `${reason}; ${state}` };
+}
+
+type Refused = DeployResult | undefined;
+
+/** Every probe method must exist; otherwise the run is a probe failure. */
+function probesComplete(probes: DeployProbes): boolean {
+  if (typeof probes !== 'object' || probes === null) {
+    return false;
+  }
+  return probeMethods().every(
+    (method) => typeof probes[method as keyof DeployProbes] === 'function',
+  );
+}
+
+/** Snapshot the request; a throwing getter is a malformed request. */
+function trySnapshot(request: DeployRequest): RequestSnapshot | undefined {
+  try {
+    return snapshotRequest(request);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Only an explicit boolean is a valid merge result: any other value is a
+ * probe failure, never silently "no merge". Returns a refusal or
+ * `undefined` to continue.
+ */
+async function refuseOnMerge(
+  probes: DeployProbes,
+  repoPath: string,
+  mergeDetail: string,
+): Promise<Refused> {
+  const merge = await probes.mergeInProgress(repoPath);
+  if (merge === true) {
+    return refusal('merge-in-progress', mergeDetail);
+  }
+  if (merge !== false) {
+    return refusal('probe-failed', 'probe-failed');
+  }
+  return undefined;
+}
+
+/** Refuse unless `HEAD` names exactly the requested commit. */
+async function refuseOnHead(
+  probes: DeployProbes,
+  req: RequestSnapshot,
+  detail: string,
+): Promise<Refused> {
+  const head = await probes.headCommit(req.repoPath);
+  return headMatches(head, req.commit)
+    ? undefined
+    : refusal('commit-mismatch', detail);
+}
+
+/** Run the build, then every suite in order; stop at the first failure. */
+async function refuseOnBuildOrSuite(
+  probes: DeployProbes,
+  req: RequestSnapshot,
+): Promise<Refused> {
+  const build = await probes.runCommand(req.buildArgv, req.repoPath);
+  if (build === null || build === undefined || build.exitCode !== 0) {
+    return refusal('build-failed', 'build-failed at step 0');
+  }
+  for (let i = 0; i < req.suiteArgvs.length; i++) {
+    const suite = await probes.runCommand(
+      req.suiteArgvs[i] as readonly string[],
+      req.repoPath,
+    );
+    if (suite === null || suite === undefined || suite.exitCode !== 0) {
+      return refusal('suite-failed', `suite-failed at step ${i}`);
+    }
+  }
+  return undefined;
+}
+
+/** A digest probe result must be a non-empty string. */
+function isDigest(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/** Merge re-check, then the `HEAD` re-read, both immediately before repoint. */
+async function refuseBeforeRepoint(
+  probes: DeployProbes,
+  req: RequestSnapshot,
+): Promise<Refused> {
+  const merge = await refuseOnMerge(
+    probes,
+    req.repoPath,
+    'merge-in-progress before repoint',
+  );
+  if (merge !== undefined) {
+    return merge;
+  }
+  return refuseOnHead(probes, req, 'commit-mismatch before repoint');
+}
+
+/** What the install link pointed at before the repoint, if anything. */
+type PreviousTarget =
+  | { readonly refused: DeployResult }
+  | { readonly refused?: undefined; readonly target: string | undefined };
+
+/**
+ * Only `undefined` (no current target) or a valid non-empty string is an
+ * acceptable previous target; anything else is a probe failure.
+ */
+async function readPreviousTarget(
+  probes: DeployProbes,
+  link: string,
+): Promise<PreviousTarget> {
+  const target = await probes.currentTarget(link);
+  if (target !== undefined && !isNonEmptyString(target)) {
+    return { refused: refusal('probe-failed', 'probe-failed') };
+  }
+  return { target };
+}
+
+/**
+ * Compare the installed bytes with the staged bytes; any shortfall restores
+ * the previous target (once) and reports the failed install.
+ */
+async function confirmInstalled(
+  probes: DeployProbes,
+  req: RequestSnapshot,
+  stagedDigest: string,
+  previousTarget: string | undefined,
+): Promise<DeployResult | string> {
+  const installedDigest = await probes.digestTree(req.installLink);
+  let failure: DeployInstallFailure | undefined;
+  if (!isDigest(installedDigest)) {
+    failure = 'probe-failed';
+  } else if (installedDigest !== stagedDigest) {
+    failure = 'bytes-mismatch';
+  }
+  if (failure === undefined) {
+    return installedDigest;
+  }
+  return installFailure(
+    failure,
+    await restorePrevious(probes, req.installLink, previousTarget),
+  );
+}
+
 /**
  * Run the checked deploy in exact order: validate, refuse on merge,
  * verify `HEAD`, build, run suites, digest the staged build, re-check for
- * a merge, repoint atomically, verify installed bytes and roll back on
- * mismatch or an unconfirmed repoint.
+ * a merge, re-read `HEAD`, repoint atomically, verify installed bytes and
+ * report rollback-failed or no-rollback-target on mismatch or an
+ * unconfirmed repoint.
  */
 export async function runCheckedDeploy(
   request: DeployRequest,
@@ -121,135 +319,64 @@ export async function runCheckedDeploy(
   let req: RequestSnapshot | undefined;
 
   try {
-    if (typeof probes !== 'object' || probes === null) {
+    if (!probesComplete(probes)) {
       return refusal('probe-failed', 'probe-failed');
     }
-    const methods = probeMethods();
-    for (const method of methods) {
-      if (typeof probes[method as keyof DeployProbes] !== 'function') {
-        return refusal('probe-failed', 'probe-failed');
-      }
-    }
-
-    try {
-      req = snapshotRequest(request);
-    } catch {
-      // A throwing getter on the request is a malformed request, not a
-      // probe failure.
-      req = undefined;
-    }
+    req = trySnapshot(request);
     if (req === undefined) {
       return refusal('invalid-request', 'invalid-request');
     }
 
-    // Only an explicit boolean is a valid merge result: any other value is
-    // a probe failure, never silently "no merge".
-    const mergeBeforeBuild = await probes.mergeInProgress(req.repoPath);
-    if (mergeBeforeBuild === true) {
-      return refusal('merge-in-progress', 'merge-in-progress');
-    }
-    if (mergeBeforeBuild !== false) {
-      return refusal('probe-failed', 'probe-failed');
-    }
-
-    const head = await probes.headCommit(req.repoPath);
-    if (
-      typeof head !== 'string' ||
-      head.trim().length === 0 ||
-      !/^[0-9a-fA-F]{40,64}$/.test(head.trim())
-    ) {
-      return refusal('commit-mismatch', 'commit-mismatch');
-    }
-    if (head.trim().toLowerCase() !== req.commit.toLowerCase()) {
-      return refusal('commit-mismatch', 'commit-mismatch');
-    }
-
-    const build = await probes.runCommand(req.buildArgv, req.repoPath);
-    if (build === null || build === undefined || build.exitCode !== 0) {
-      return refusal('build-failed', 'build-failed at step 0');
-    }
-
-    for (let i = 0; i < req.suiteArgvs.length; i++) {
-      const suite = await probes.runCommand(
-        req.suiteArgvs[i] as readonly string[],
-        req.repoPath,
-      );
-      if (suite === null || suite === undefined || suite.exitCode !== 0) {
-        return refusal('suite-failed', `suite-failed at step ${i}`);
-      }
+    const refusedBeforeBuild =
+      (await refuseOnMerge(probes, req.repoPath, 'merge-in-progress')) ??
+      (await refuseOnHead(probes, req, 'commit-mismatch')) ??
+      (await refuseOnBuildOrSuite(probes, req));
+    if (refusedBeforeBuild !== undefined) {
+      return refusedBeforeBuild;
     }
 
     const stagedDigest = await probes.digestTree(req.stagingPath);
-    if (typeof stagedDigest !== 'string' || stagedDigest.trim().length === 0) {
+    if (!isDigest(stagedDigest)) {
       return refusal('probe-failed', 'probe-failed');
     }
 
-    // Same explicit-boolean rule for the pre-repoint merge re-check.
-    const mergeBeforeRepoint = await probes.mergeInProgress(req.repoPath);
-    if (mergeBeforeRepoint === true) {
-      return refusal('merge-in-progress', 'merge-in-progress before repoint');
-    }
-    if (mergeBeforeRepoint !== false) {
-      return refusal('probe-failed', 'probe-failed');
+    const refusedBeforeRepoint = await refuseBeforeRepoint(probes, req);
+    if (refusedBeforeRepoint !== undefined) {
+      return refusedBeforeRepoint;
     }
 
-    // Only `undefined` (no current target) or a valid non-empty string is
-    // an acceptable previous target; anything else is a probe failure.
-    const target = await probes.currentTarget(req.installLink);
-    if (target !== undefined && !isNonEmptyString(target)) {
-      return refusal('probe-failed', 'probe-failed');
+    const previous = await readPreviousTarget(probes, req.installLink);
+    if (previous.refused !== undefined) {
+      return previous.refused;
     }
-    previousTarget = target;
+    previousTarget = previous.target;
 
     repointAttempted = true;
     await probes.repoint(req.installLink, req.stagingPath);
 
-    const installedDigest = await probes.digestTree(req.installLink);
-    if (
-      typeof installedDigest !== 'string' ||
-      installedDigest.trim().length === 0
-    ) {
-      // A null, undefined or empty digest is an invalid probe result, not
-      // a mismatch: the repoint is still unconfirmed, so restore the
-      // previous target and refuse as probe-failed.
-      if (previousTarget !== undefined) {
-        try {
-          await probes.repoint(req.installLink, previousTarget);
-        } catch {
-          // A rollback error must not mask `probe-failed`.
-        }
-      }
-      return refusal('probe-failed', 'probe-failed');
-    }
-    if (installedDigest !== stagedDigest) {
-      if (previousTarget !== undefined) {
-        try {
-          await probes.repoint(req.installLink, previousTarget);
-        } catch {
-          // A rollback error must not mask `bytes-mismatch`.
-        }
-      }
-      return refusal('bytes-mismatch', 'bytes-mismatch');
+    const installed = await confirmInstalled(
+      probes,
+      req,
+      stagedDigest,
+      previousTarget,
+    );
+    if (typeof installed !== 'string') {
+      return installed;
     }
 
     repointConfirmed = true;
     return {
       outcome: 'deployed',
-      digest: installedDigest,
+      digest: installed,
       previousTarget,
+      commit: req.commit.toLowerCase(),
     };
   } catch {
-    if (
-      req !== undefined &&
-      repointAttempted &&
-      !repointConfirmed &&
-      previousTarget !== undefined
-    ) {
-      try {
-        await probes.repoint(req.installLink, previousTarget);
-      } catch {
-        // A rollback error must not mask `probe-failed`.
-      }
+    if (req !== undefined && repointAttempted && !repointConfirmed) {
+      return installFailure(
+        'probe-failed',
+        await restorePrevious(probes, req.installLink, previousTarget),
+      );
     }
     return refusal('probe-failed', 'probe-failed');
   }

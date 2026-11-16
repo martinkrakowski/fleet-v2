@@ -13,8 +13,12 @@ import type {
 import {
   REVIEW_KINDS,
   REVIEW_REQUEST_ID_PATTERN,
+  assessmentIdForBrief,
   assessmentIdForChain,
+  attemptIdForBrief,
   attemptIdForChain,
+  isValidBriefPackageDigest,
+  isValidBriefProjectId,
   isValidChainName,
   receiptSubjectOf,
 } from '../../domain/evidence-records.js';
@@ -114,17 +118,76 @@ function nowIsoOf(request: RequestIndependentReviewRequest): string {
   return isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
 }
 
+/** The two pseudo attempt id prefixes belong to chain and brief reviews; the attempt path may not use them. */
+function isReservedAttemptId(value: unknown): boolean {
+  return typeof value === 'string' && (value.startsWith('chain:') || value.startsWith('brief:'));
+}
+
+/** The attempt path of a request: refused for a brief-verify or a reserved pseudo attempt id. */
+function attemptPathSubject(request: RequestIndependentReviewRequest): 'invalid' | undefined {
+  if (request.kind === 'brief-verify' || isReservedAttemptId(request.attemptId)) {
+    return 'invalid';
+  }
+  return undefined;
+}
+
+/** The exact chain condition block, inverted: true when the chain subject matches the request's own ids. */
+function isValidChainSubject(request: RequestIndependentReviewRequest, subject: ReceiptSubject): boolean {
+  return (
+    subject.chainName !== null &&
+    subject.integrationHeadSha !== null &&
+    isValidChainName(subject.chainName) &&
+    subject.attemptId === null &&
+    subject.briefPackageDigest === null &&
+    subject.baseCommit === null &&
+    HEAD_PATTERN.test(subject.integrationHeadSha) &&
+    subject.projectId === request.projectId &&
+    subject.integrationHeadSha === request.candidateHeadSha &&
+    request.attemptId === attemptIdForChain(subject.projectId, subject.chainName) &&
+    request.assessmentId === assessmentIdForChain(subject.projectId, subject.chainName) &&
+    request.kind === 'pre-merge' &&
+    typeof request.requestId === 'string' &&
+    REVIEW_REQUEST_ID_PATTERN.test(request.requestId)
+  );
+}
+
+/** The exact brief condition set: true only when every field of the brief subject agrees with the request. */
+function isValidBriefSubject(request: RequestIndependentReviewRequest, subject: ReceiptSubject): boolean {
+  if (
+    subject.attemptId !== null ||
+    subject.chainName !== null ||
+    subject.integrationHeadSha !== null ||
+    !isValidBriefProjectId(subject.projectId) ||
+    subject.projectId !== request.projectId ||
+    request.kind !== 'brief-verify' ||
+    typeof request.requestId !== 'string' ||
+    !REVIEW_REQUEST_ID_PATTERN.test(request.requestId)
+  ) {
+    return false;
+  }
+  if (!isValidBriefPackageDigest(subject.briefPackageDigest)) {
+    return false;
+  }
+  return (
+    subject.baseCommit !== null &&
+    HEAD_PATTERN.test(subject.baseCommit) &&
+    subject.baseCommit === request.candidateHeadSha &&
+    request.attemptId === attemptIdForBrief(subject.projectId, subject.briefPackageDigest) &&
+    request.assessmentId === assessmentIdForBrief(subject.projectId, subject.briefPackageDigest)
+  );
+}
+
 /**
- * The chain subject of a request: `undefined` when the request carries no
- * subject or names its own attempt (the attempt path), `'invalid'` for a brief,
- * an unknown kind, or a chain subject that does not match the request's own
- * ids (project, pseudo attempt id, assessment id, head), is not a pre-merge
+ * The review subject of a request: `undefined` when the request carries no
+ * subject or names its own attempt (the attempt path), `'invalid'` for an
+ * unknown kind, or a chain or brief subject that does not match the request's
+ * own ids (project, pseudo attempt id, assessment id, head), is not the kind's
  * review, or has no well-formed request id. Read through own properties only.
  */
-function chainSubjectOf(request: RequestIndependentReviewRequest): ReceiptSubject | 'invalid' | undefined {
+function reviewSubjectOf(request: RequestIndependentReviewRequest): ReceiptSubject | 'invalid' | undefined {
   const raw = ownValue(request, 'subject');
   if (raw === undefined) {
-    return undefined;
+    return attemptPathSubject(request);
   }
   const subject = receiptSubjectOf({
     subject: raw,
@@ -135,46 +198,41 @@ function chainSubjectOf(request: RequestIndependentReviewRequest): ReceiptSubjec
     return 'invalid';
   }
   if (subject.kind === 'attempt') {
-    return subject.projectId === request.projectId && subject.attemptId === request.attemptId ? undefined : 'invalid';
-  }
-  if (
-    subject.kind !== 'chain' ||
-    subject.chainName === null ||
-    subject.integrationHeadSha === null ||
-    !isValidChainName(subject.chainName)
-  ) {
+    if (subject.projectId === request.projectId && subject.attemptId === request.attemptId) {
+      return attemptPathSubject(request);
+    }
     return 'invalid';
   }
-  if (
-    subject.attemptId !== null || subject.briefPackageDigest !== null || subject.baseCommit !== null ||
-    !HEAD_PATTERN.test(subject.integrationHeadSha) ||
-    subject.projectId !== request.projectId ||
-    subject.integrationHeadSha !== request.candidateHeadSha ||
-    request.attemptId !== attemptIdForChain(subject.projectId, subject.chainName) ||
-    request.assessmentId !== assessmentIdForChain(subject.projectId, subject.chainName) ||
-    request.kind !== 'pre-merge' ||
-    typeof request.requestId !== 'string' ||
-    !REVIEW_REQUEST_ID_PATTERN.test(request.requestId)
-  ) {
-    return 'invalid';
+  if (subject.kind === 'chain') {
+    return isValidChainSubject(request, subject) ? subject : 'invalid';
   }
-  return subject;
+  if (subject.kind === 'brief') {
+    return isValidBriefSubject(request, subject) ? subject : 'invalid';
+  }
+  return 'invalid';
 }
 
-/** True when a stored receipt is the combined review of exactly this chain at this head. */
-function isChainReceiptOf(receipt: ReviewReceiptRecord, chain: ReceiptSubject): boolean {
+/** True when a stored receipt is the combined review of exactly this subject, matched per kind. */
+function isSubjectReceiptOf(receipt: ReviewReceiptRecord, subject: ReceiptSubject): boolean {
   const stored = receiptSubjectOf(receipt);
-  return (
-    stored !== null &&
-    stored.kind === 'chain' &&
-    stored.projectId === chain.projectId &&
-    stored.chainName === chain.chainName &&
-    stored.integrationHeadSha === chain.integrationHeadSha
-  );
+  if (stored === null || stored.kind !== subject.kind || stored.projectId !== subject.projectId) {
+    return false;
+  }
+  if (subject.kind === 'chain') {
+    return stored.chainName === subject.chainName && stored.integrationHeadSha === subject.integrationHeadSha;
+  }
+  if (subject.kind === 'brief') {
+    return (
+      stored.briefPackageDigest === subject.briefPackageDigest &&
+      stored.baseCommit === subject.baseCommit &&
+      receipt.kind === 'brief-verify'
+    );
+  }
+  return false;
 }
 
-/** Read or create the chain-scoped assessment: one pending record per (project, chain) at the integration head. */
-async function openChainAssessment(
+/** Read or create the subject-scoped assessment: one pending record per subject (chain or brief) at the reviewed head. */
+async function openSubjectAssessment(
   deps: RequestIndependentReviewDependencies,
   request: RequestIndependentReviewRequest,
   nowIso: string,
@@ -213,6 +271,25 @@ type Step<T> = { readonly result: RequestIndependentReviewResult } | { readonly 
 type CompletedReview = Extract<Awaited<ReturnType<IndependentReviewPort['runIndependentReview']>>, { outcome: 'completed' }>;
 
 /**
+ * Equals `MAX_API_REVIEW_BRIEF_BYTES` in `ApiReviewTransport.adapter.ts` (not
+ * imported here: application must not import infrastructure). The two stay
+ * equal by convention so the use case refuses before any reviewer call.
+ */
+const MAX_BRIEF_TEXT_BYTES = 65536;
+
+/**
+ * True when the brief text exceeds 64 KiB UTF-8 bytes. A length shortcut first:
+ * UTF-16 units never exceed bytes, so anything already over the limit in UTF-16
+ * units is over the limit in bytes and needs no encoder.
+ */
+function briefTextTooLarge(text: string): boolean {
+  if (text.length > MAX_BRIEF_TEXT_BYTES) {
+    return true;
+  }
+  return new TextEncoder().encode(text).length > MAX_BRIEF_TEXT_BYTES;
+}
+
+/**
  * The request-shape refusals, in their order: non-empty fields, a known kind with
  * a well-formed requestId, the brief text of a brief-check, and a distinct
  * underlying reviewer model. Null when the request is well-formed.
@@ -249,6 +326,14 @@ function requestShapeRefusal(request: RequestIndependentReviewRequest): RequestI
   // text it must never reach a reviewer or become evidence (SEC-4).
   if (request.kind === 'brief-check' && !isNonEmptyTrimmedString(request.briefText)) {
     return rejectedFor(request, 'invalid-request', 'A brief-check review requires the brief text');
+  }
+  // A brief-verify review carries the same frozen brief; the same rule and the
+  // same 64 KiB bound apply before any reviewer call is spent.
+  if (request.kind === 'brief-verify' && !isNonEmptyTrimmedString(request.briefText)) {
+    return rejectedFor(request, 'invalid-request', 'A brief-verify review requires the brief text');
+  }
+  if (request.kind === 'brief-verify' && typeof request.briefText === 'string' && briefTextTooLarge(request.briefText)) {
+    return rejectedFor(request, 'invalid-request', 'The brief text exceeds the 64 KiB limit');
   }
   if (sharesUnderlyingModel(request.implementerModel, request.reviewerModel)) {
     return rejectedFor(
@@ -298,13 +383,13 @@ function noAssessmentRejection(request: RequestIndependentReviewRequest): Reques
 function isRequestIdReused(
   found: ReviewReceiptRecord,
   request: RequestIndependentReviewRequest,
-  chain: ReceiptSubject | undefined,
+  subject: ReceiptSubject | undefined,
 ): boolean {
   return (
     found.reviewerModel.trim() !== request.reviewerModel.trim() ||
     found.kind !== request.kind ||
     found.candidateHeadSha !== request.candidateHeadSha ||
-    (chain !== undefined && !isChainReceiptOf(found, chain))
+    (subject !== undefined && !isSubjectReceiptOf(found, subject))
   );
 }
 
@@ -318,14 +403,14 @@ function isRequestIdReused(
 async function replayStep(
   deps: RequestIndependentReviewDependencies,
   request: RequestIndependentReviewRequest,
-  chain: ReceiptSubject | undefined,
+  subject: ReceiptSubject | undefined,
 ): Promise<Step<EvidenceAssessmentRecord | null>> {
   if (request.requestId === undefined) {
     return { value: null };
   }
   let existing = await deps.repo.findAssessmentById(request.assessmentId);
-  if (existing === null && chain !== undefined) {
-    existing = await openChainAssessment(deps, request, nowIsoOf(request));
+  if (existing === null && subject !== undefined) {
+    existing = await openSubjectAssessment(deps, request, nowIsoOf(request));
   }
   if (existing === null) {
     return { result: noAssessmentRejection(request) };
@@ -334,7 +419,7 @@ async function replayStep(
   if (found === undefined) {
     return { value: existing };
   }
-  if (isRequestIdReused(found, request, chain)) {
+  if (isRequestIdReused(found, request, subject)) {
     return {
       result: rejectedFor(
         request,
@@ -420,14 +505,14 @@ function receiptCandidateOf(
   request: RequestIndependentReviewRequest,
   run: CompletedReview,
   evidenceRef: string,
-  chain: ReceiptSubject | undefined,
+  subject: ReceiptSubject | undefined,
   existing: EvidenceAssessmentRecord,
 ): ReviewReceiptRecord {
   const kindFields: Partial<ReviewReceiptRecord> =
     request.kind !== undefined ? { kind: request.kind } : {};
   const requestIdFields: Partial<ReviewReceiptRecord> =
     request.requestId !== undefined ? { requestId: request.requestId } : {};
-  const subjectFields: Partial<ReviewReceiptRecord> = chain !== undefined ? { subject: chain } : {};
+  const subjectFields: Partial<ReviewReceiptRecord> = subject !== undefined ? { subject } : {};
   // RV2: the fixed cause code of an unknown answer travels onto the stored
   // receipt; the key is omitted on pass/fail so stored receipts stay identical.
   const unknownReasonFields: Partial<ReviewReceiptRecord> =
@@ -553,13 +638,19 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
     try {
       return await this.runChecked(request);
     } catch (error) {
-      // Only a chain request turns an unexpected failure into the typed rejection; the attempt path
+      // Only a chain or brief request turns an unexpected failure into the typed rejection; the attempt path
       // and the unconfigured/missing-request refusals keep throwing exactly as before.
       const isRefusal = error instanceof Error && error.message === NOT_IMPLEMENTED;
       if (!isRefusal && this.deps !== undefined && typeof request === 'object' && request !== null) {
-        const chain = chainSubjectOf(request);
-        if (chain !== undefined && chain !== 'invalid') {
-          return rejectedFor(request, 'review-unavailable', 'The chain review could not be completed');
+        const subject = reviewSubjectOf(request);
+        if (subject !== undefined && subject !== 'invalid') {
+          return rejectedFor(
+            request,
+            'review-unavailable',
+            subject.kind === 'brief'
+              ? 'The brief verification review could not be completed'
+              : 'The chain review could not be completed',
+          );
         }
       }
       throw error;
@@ -579,11 +670,11 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
     }
     const deps = this.deps;
 
-    // A chain subject takes the combined pre-merge path; any other explicit
-    // subject (a brief, or an attempt that is not the request's own) is refused.
-    // An absent subject is the attempt path, unchanged.
-    const chain = chainSubjectOf(request);
-    if (chain === 'invalid') {
+    // A chain or brief subject takes the subject path; any other explicit subject
+    // (an attempt that is not the request's own) is refused. An absent subject is
+    // the attempt path, refused for a brief-verify or a reserved pseudo attempt id.
+    const subject = reviewSubjectOf(request);
+    if (subject === 'invalid') {
       return rejectedFor(request, 'invalid-request', 'The review subject is not valid for this request');
     }
     const shapeRefusal = requestShapeRefusal(request);
@@ -591,7 +682,7 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       return shapeRefusal;
     }
 
-    const replay = await replayStep(deps, request, chain);
+    const replay = await replayStep(deps, request, subject);
     if ('result' in replay) {
       return replay.result;
     }
@@ -630,7 +721,7 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       candidateHeadSha: request.candidateHeadSha,
       content: run.rawOutput,
     });
-    const candidate = receiptCandidateOf(request, run, archived.evidenceRef, chain, existing);
+    const candidate = receiptCandidateOf(request, run, archived.evidenceRef, subject, existing);
     const validated = validatedReceipt(request, candidate);
     if ('result' in validated) {
       return validated.result;

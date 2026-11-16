@@ -1621,3 +1621,249 @@ describe('pinned-build freshness (DB1)', () => {
     });
   });
 });
+
+describe('runDoctor CI runner slots (OG-28c)', () => {
+  const SLOTS = [
+    { name: 'slot-1', unit: 'fleet-ci@1.service' },
+    { name: 'slot-2', unit: 'fleet-ci@2.service' },
+  ];
+  const localModel = () => sampleModel({ host: { ciRunnerSlots: SLOTS } });
+  const sshModel = () =>
+    sampleModel({ host: { transport: 'ssh', sshAlias: 'ci-alias', ciRunnerSlots: SLOTS } });
+  const slotLines = (lines: readonly DoctorLine[]) =>
+    lines.filter((doctorLine) => doctorLine.check.startsWith('ci-runner-'));
+  const answering = (value: unknown) =>
+    (async () => value) as unknown as NonNullable<DoctorProbes['ciRunnerSlot']>;
+
+  it('reports PASS for each active slot in declared order after the host\'s own lines', async () => {
+    const recorded: string[] = [];
+    const { probes } = fakeProbes({
+      ciRunnerSlot: async (host, unit) => {
+        recorded.push(`ciRunnerSlot:${host}:${unit}`);
+        return 'active';
+      },
+    });
+    const lines = await collect(loadedResult(localModel()), probes);
+    expect(slotLines(lines)).toEqual([
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'ci-runner-slot-1',
+        status: 'PASS',
+        detail: 'slot slot-1 active',
+      },
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'ci-runner-slot-2',
+        status: 'PASS',
+        detail: 'slot slot-2 active',
+      },
+    ]);
+    expect(recorded).toEqual([
+      'ciRunnerSlot:local:fleet-ci@1.service',
+      'ciRunnerSlot:local:fleet-ci@2.service',
+    ]);
+    const runnerCapabilities = lines.findIndex(
+      (doctorLine) => doctorLine.subject === 'main' && doctorLine.check === 'runner-capabilities',
+    );
+    const firstSlot = lines.findIndex((doctorLine) => doctorLine.check === 'ci-runner-slot-1');
+    const firstVerifier = lines.findIndex((doctorLine) => doctorLine.subject === 'verifier-host');
+    expect(firstSlot).toBeGreaterThan(runnerCapabilities);
+    expect(firstSlot).toBeLessThan(firstVerifier);
+  });
+
+  it('reports FAIL with the slot name and the fix line for an inactive slot and exits 1', async () => {
+    const recordedHosts: string[] = [];
+    const { probes } = fakeProbes({
+      ciRunnerSlot: async (host, unit) => {
+        recordedHosts.push(host);
+        return unit === 'fleet-ci@2.service' ? 'inactive' : 'active';
+      },
+    });
+    const lines = await collect(loadedResult(sshModel()), probes);
+    expect(slotLines(lines)).toEqual([
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'ci-runner-slot-1',
+        status: 'PASS',
+        detail: 'slot slot-1 active',
+      },
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'ci-runner-slot-2',
+        status: 'FAIL',
+        detail: 'slot slot-2 not active; fix: systemctl restart fleet-ci@2.service on ci-alias',
+      },
+    ]);
+    expect(recordedHosts).toEqual(['ci-alias', 'ci-alias']);
+    expect(doctorExitCode(slotLines(lines))).toBe(1);
+  });
+
+  it('reports UNKNOWN when the slot probe throws, rejects or answers unknown', async () => {
+    const throwingSync = () => {
+      throw new Error('boom');
+    };
+    const throwingAsync = async () => {
+      throw new Error('boom');
+    };
+    for (const probe of [
+      throwingSync as unknown as NonNullable<DoctorProbes['ciRunnerSlot']>,
+      throwingAsync,
+      (async () => 'unknown') as NonNullable<DoctorProbes['ciRunnerSlot']>,
+    ]) {
+      const { probes } = fakeProbes({ ciRunnerSlot: probe });
+      const lines = await collect(loadedResult(localModel()), probes);
+      expect(slotLines(lines)).toEqual([
+        {
+          scope: 'host',
+          subject: 'main',
+          check: 'ci-runner-slot-1',
+          status: 'UNKNOWN',
+          detail: 'slot slot-1 state could not be read',
+        },
+        {
+          scope: 'host',
+          subject: 'main',
+          check: 'ci-runner-slot-2',
+          status: 'UNKNOWN',
+          detail: 'slot slot-2 state could not be read',
+        },
+      ]);
+      expect(doctorExitCode(slotLines(lines))).toBe(1);
+    }
+  });
+
+  it('reports UNKNOWN for any answer that is not exactly active or inactive', async () => {
+    const sentinel = ['sentinel', 'value', '7f3a'].join('-');
+    for (const value of [
+      undefined,
+      null,
+      'ACTIVE',
+      'active\n',
+      ' inactive',
+      1,
+      true,
+      {},
+      ['active'],
+      sentinel,
+      new Proxy({}, { get() { throw new Error('trap'); } }),
+      { then() { throw new Error('then'); } },
+    ]) {
+      const { probes } = fakeProbes({ ciRunnerSlot: answering(value) });
+      const lines = await collect(loadedResult(localModel()), probes);
+      expect(slotLines(lines)).toEqual([
+        {
+          scope: 'host',
+          subject: 'main',
+          check: 'ci-runner-slot-1',
+          status: 'UNKNOWN',
+          detail: 'slot slot-1 state could not be read',
+        },
+        {
+          scope: 'host',
+          subject: 'main',
+          check: 'ci-runner-slot-2',
+          status: 'UNKNOWN',
+          detail: 'slot slot-2 state could not be read',
+        },
+      ]);
+      expect(JSON.stringify(lines)).not.toContain(sentinel);
+    }
+  });
+
+  it('reports UNKNOWN per configured slot when the probes carry no ciRunnerSlot', async () => {
+    const missing = await collect(loadedResult(localModel()), fakeProbes().probes);
+    expect(slotLines(missing)).toEqual([
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'ci-runner-slot-1',
+        status: 'UNKNOWN',
+        detail: 'slot slot-1 probe not available',
+      },
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'ci-runner-slot-2',
+        status: 'UNKNOWN',
+        detail: 'slot slot-2 probe not available',
+      },
+    ]);
+
+    const notAFunction = await collect(
+      loadedResult(localModel()),
+      fakeProbes({ ciRunnerSlot: 'nope' as unknown as DoctorProbes['ciRunnerSlot'] }).probes,
+    );
+    expect(slotLines(notAFunction)).toEqual(slotLines(missing));
+
+    const hostile = {
+      ...fakeProbes().probes,
+      get ciRunnerSlot(): never {
+        throw new Error('getter boom');
+      },
+    } as unknown as DoctorProbes;
+    const getterLines = await collect(loadedResult(localModel()), hostile);
+    expect(slotLines(getterLines)).toEqual([
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'ci-runner-slot-1',
+        status: 'UNKNOWN',
+        detail: 'slot slot-1 state could not be read',
+      },
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'ci-runner-slot-2',
+        status: 'UNKNOWN',
+        detail: 'slot slot-2 state could not be read',
+      },
+    ]);
+  });
+
+  it('emits no ci-runner line and never calls the probe for a host without slots', async () => {
+    const recorded: string[] = [];
+    const recording = fakeProbes({
+      ciRunnerSlot: async (host, unit) => {
+        recorded.push(`ciRunnerSlot:${host}:${unit}`);
+        return 'active';
+      },
+    }).probes;
+    for (const model of [sampleModel(), sampleModel({ host: { ciRunnerSlots: [] } })]) {
+      const lines = await collect(loadedResult(model), recording);
+      expect(slotLines(lines)).toHaveLength(0);
+      expect(recorded).toEqual([]);
+      expect(lines).toEqual(await collect(loadedResult(model), fakeProbes().probes));
+    }
+  });
+
+  it('never carries systemctl output into a DoctorLine (real probe path)', async () => {
+    const sentinel = ['sentinel', 'value', '7f3a'].join('-');
+    for (const exitCode of [0, 3]) {
+      let systemctlRuns = 0;
+      const probes = createNodeDoctorProbes({
+        localExecutor: {
+          async run(argv) {
+            if (argv[0] === 'systemctl') {
+              systemctlRuns += 1;
+              return { exitCode, signal: null, stdout: `inactive ${sentinel}\n`, stderr: sentinel };
+            }
+            return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+          },
+        },
+      });
+      const lines = await collect(loadedResult(localModel()), probes);
+      expect(systemctlRuns).toBe(2);
+      expect(slotLines(lines)).toHaveLength(2);
+      for (const doctorLine of slotLines(lines)) {
+        expect(doctorLine.status).toBe('UNKNOWN');
+      }
+      for (const doctorLine of lines) {
+        expect(JSON.stringify(doctorLine)).not.toContain(sentinel);
+      }
+    }
+  });
+});

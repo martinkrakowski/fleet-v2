@@ -43,6 +43,9 @@ export interface PinnedBuildProbeResult {
   readonly installRootName?: string;
 }
 
+/** What the CI runner slot probe found about one systemd unit. */
+export type CiRunnerSlotState = 'active' | 'inactive' | 'unknown';
+
 /** Every side effect the doctor performs, injected by the caller. */
 export interface DoctorProbes {
   /** Whether the named host is reachable (an ssh alias or `local`). */
@@ -98,4 +101,11 @@ export interface DoctorProbes {
    * fakes stay compatible; a missing probe reports `UNKNOWN`.
    */
   pinnedBuild?(): Promise<PinnedBuildProbeResult | undefined>;
+  /**
+   * Whether one CI runner slot's systemd unit is active on the host
+   * (`systemctl is-active <unit>`). `unknown` when the state could not be
+   * read; never command output. Optional so existing `DoctorProbes` fakes
+   * stay compatible; a missing probe reports `UNKNOWN` per configured slot.
+   */
+  ciRunnerSlot?(host: string, unit: string): Promise<CiRunnerSlotState>;
 }

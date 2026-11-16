@@ -1,5 +1,5 @@
 // CO-WD2: the merge-train health watch use case.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { WatchTrainHealthUseCase } from '../WatchTrainHealthUseCase.use-case.js';
 import type { WatchTrainHealthDependencies } from '../WatchTrainHealthUseCase.use-case.js';
@@ -369,6 +369,7 @@ describe('WatchTrainHealthUseCase', () => {
       repository: { owner: OWNER, repo: REPO },
       rule: 'findings-truncated',
       pullRequest: null,
+      deadlineIso: DEADLINE,
     });
     expect(raiseCalls).toHaveLength(201);
     expect(clearCalls).toHaveLength(0);
@@ -397,13 +398,13 @@ describe('WatchTrainHealthUseCase', () => {
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({ outcome: 'evaluated', queueOverflow: true, healthy: false, exitCode: 1 });
     expect(raiseCalls).toEqual([
-      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'queue-too-large', pullRequest: null },
-      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'stalled-head', pullRequest: null },
+      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'queue-too-large', pullRequest: null, deadlineIso: DEADLINE },
+      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'stalled-head', pullRequest: null, deadlineIso: DEADLINE },
     ]);
     expect(result.outcome === 'evaluated' && result.findings[0].evidence.headPullRequest).toBe(1);
     expect(result.outcome === 'evaluated' && result.findings.some((f) => f.rule === 'repeated-park')).toBe(false);
     expect(clearCalls).toEqual([
-      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'tick-stale', pullRequest: null },
+      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'tick-stale', pullRequest: null, deadlineIso: DEADLINE },
     ]);
   });
 
@@ -559,7 +560,7 @@ describe('WatchTrainHealthUseCase', () => {
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({ outcome: 'evaluated', healthy: false, exitCode: 1 });
     expect(raiseCalls).toEqual([
-      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'tick-stale', pullRequest: null },
+      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'tick-stale', pullRequest: null, deadlineIso: DEADLINE },
     ]);
   });
 
@@ -577,7 +578,7 @@ describe('WatchTrainHealthUseCase', () => {
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({ outcome: 'evaluated', cleared: 1, healthy: false, exitCode: 1 });
     expect(clearCalls).toEqual([
-      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'stale-queue-entry', pullRequest: 7 },
+      { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'stale-queue-entry', pullRequest: 7, deadlineIso: DEADLINE },
     ]);
   });
 
@@ -605,5 +606,53 @@ describe('WatchTrainHealthUseCase', () => {
     expect((TRAIN_HEALTH_ATTENTION_RULES as readonly TrainHealthAttentionRule[]).slice(0, 5)).toEqual([
       ...TRAIN_HEALTH_RULES,
     ]);
+  });
+
+  it('bounds each attention await with the remaining call budget', async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, log, clearCalls } = makeDeps({
+        stateRead: {
+          outcome: 'ok',
+          snapshot: healthySnapshot({ lastTickFinishedAtIso: '2026-11-16T11:00:00.000Z' }) as never,
+        },
+        openItems: [],
+      });
+      const hanging = new Promise<RaiseTrainHealthAttentionResult>(() => {});
+      const hangDeps = {
+        ...deps,
+        attention: {
+          ...deps.attention,
+          raiseTrainHealthAttention: async (command: TrainHealthAttentionCommand) => {
+          log.push({ kind: 'port', method: 'raiseTrainHealthAttention', arg: command });
+          return hanging;
+        },
+        },
+      } as WatchTrainHealthDependencies;
+      const pending = run(hangDeps, baseRequest());
+      let settledEarly = false;
+      void pending.then(() => {
+        settledEarly = true;
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(settledEarly).toBe(false);
+      await vi.advanceTimersByTimeAsync(400_000);
+      const result = await pending;
+      expect(result).toMatchObject({ outcome: 'evaluated', healthy: false, exitCode: 1, attentionFailures: 1 });
+      const raiseEntries = log.filter(
+        (entry) => entry.kind === 'port' && entry.method === 'raiseTrainHealthAttention',
+      );
+      expect(raiseEntries).toHaveLength(1);
+      expect(raiseEntries[0].kind === 'port' && raiseEntries[0].arg).toEqual({
+        projectId: PROJECT,
+        repository: { owner: OWNER, repo: REPO },
+        rule: 'tick-stale',
+        pullRequest: null,
+        deadlineIso: DEADLINE,
+      });
+      expect(clearCalls).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

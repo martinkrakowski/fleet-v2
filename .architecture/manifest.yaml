@@ -691,7 +691,7 @@ bounded_contexts:
       SeatCatalogPort: "Read the installation's seat catalogue and the seat plan it builds, as a structural subset of the installation: the seats with their tool, model, variant, agent and health, and the implementer, fix and reviewer chains; an absent catalogue is absent and an unreadable one is unknown, never an empty catalogue; it writes nothing and returns ids, models and codes only."
       WatchTrainHealthPort: "One bounded pass reads the train state, evaluates the pure CO-WD1 rules and raises one attention item per finding; an unreadable or unevaluable state is reported as blind and never as healthy, nothing is cleared on unknown, and a cut finding list or a queue over 500 entries raises its own item."
       TrainHealthStateReadPort: "Read-only; live entries only, oldest first, never unavailable only because the queue is long."
-      TrainHealthAttentionPort: "Raise, clear or list the seven train-health item codes keyed by project, repository, rule and pull request."
+      TrainHealthAttentionPort: "Raise, clear or list the seven train-health item codes keyed by project, repository, rule and pull request; every request carries the pass deadline and the caller bounds each await with the remaining call budget."
     adapter_bindings:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
       - { adapter: AttemptRepositoryAdapter, implements: AttemptRepositoryPort, integration: local-transactional-store }

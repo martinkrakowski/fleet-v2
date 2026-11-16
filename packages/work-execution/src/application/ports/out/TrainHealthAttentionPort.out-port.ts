@@ -2,8 +2,10 @@
 /**
  * TrainHealthAttentionPort: raise, clear or list the seven train-health item
  * codes keyed by project, repository, rule and pull request, through operator
- * coordination's attention store. A repeat raise refreshes the open item; a
- * failed raise is reported, never retried blindly. Ids and codes only.
+ * coordination's attention store. Every request carries the pass deadline and
+ * the caller bounds each await with the remaining call budget. A repeat raise
+ * refreshes the open item; a failed raise is reported, never retried blindly.
+ * Ids and codes only.
  */
 
 export const TRAIN_HEALTH_ATTENTION_RULES = [
@@ -23,6 +25,7 @@ export interface TrainHealthAttentionCommand {
   readonly repository: { readonly owner: string; readonly repo: string };
   readonly rule: TrainHealthAttentionRule;
   readonly pullRequest: number | null;
+  readonly deadlineIso: string;
 }
 
 export type RaiseTrainHealthAttentionResult =
@@ -50,5 +53,6 @@ export interface TrainHealthAttentionPort {
   listOpenTrainHealthAttention(query: {
     readonly projectId: string;
     readonly repository: { readonly owner: string; readonly repo: string };
+    readonly deadlineIso: string;
   }): Promise<ListOpenTrainHealthAttentionResult>;
 }

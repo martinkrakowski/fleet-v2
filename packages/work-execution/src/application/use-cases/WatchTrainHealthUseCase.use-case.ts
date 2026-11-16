@@ -33,6 +33,10 @@ import type {
 } from '../ports/in/WatchTrainHealthPort.in-port.js';
 
 const NORMAL_TIMEOUT_MS = 30_000;
+
+/** Success outcomes of the raise and clear attention calls. */
+const RAISE_OK: readonly (string | null)[] = ['raised', 'refreshed', 'reopened'];
+const CLEAR_OK: readonly (string | null)[] = ['cleared', 'unchanged', 'not-found'];
 const OPEN_LIST_MAX = 1000;
 
 export interface WatchTrainHealthDependencies {
@@ -84,6 +88,7 @@ type ClockBudget =
       readonly ok: true;
       readonly nowIso: string;
       readonly allowed: boolean;
+      readonly timeoutMs: number;
       readonly reason: 'budget-exhausted' | 'invalid-budget' | null;
     }
   | { readonly ok: false; readonly reason: 'invalid-clock' };
@@ -222,6 +227,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
         ok: true,
         nowIso,
         allowed: decision.allowed,
+        timeoutMs: decision.allowed ? decision.timeoutMs : 0,
         reason: decision.allowed ? null : decision.reason,
       };
     } catch {
@@ -275,15 +281,18 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
         attentionFailures,
       };
     }
-    const raisedOk = await this.attentionCall(() =>
-      this.deps.attention.raiseTrainHealthAttention({
-        projectId: validated.projectId,
-        repository: validated.repository,
-        rule: 'watchdog-blind',
-        pullRequest: null,
-      }),
+    const raiseAnswer = await this.attentionCall(
+      () =>
+        this.deps.attention.raiseTrainHealthAttention({
+          projectId: validated.projectId,
+          repository: validated.repository,
+          rule: 'watchdog-blind',
+          pullRequest: null,
+          deadlineIso: validated.deadlineIso,
+        }),
+      raiseBudget.timeoutMs,
     );
-    if (raisedOk) {
+    if (RAISE_OK.includes(this.outcomeOf(raiseAnswer))) {
       raised = 1;
     } else {
       attentionFailures = 1;
@@ -314,15 +323,16 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
       return { kind: 'exhausted' };
     }
     try {
-      const answer: unknown = await this.deps.attention.listOpenTrainHealthAttention({
-        projectId: validated.projectId,
-        repository: validated.repository,
-      });
-      if (
-        isPlainObject(answer) &&
-        ownValue(answer, 'outcome') === 'found' &&
-        Array.isArray(ownValue(answer, 'items'))
-      ) {
+      const answer: unknown = await this.attentionCall(
+        () =>
+          this.deps.attention.listOpenTrainHealthAttention({
+            projectId: validated.projectId,
+            repository: validated.repository,
+            deadlineIso: validated.deadlineIso,
+          }),
+        listBudget.timeoutMs,
+      );
+      if (this.outcomeOf(answer) === 'found' && Array.isArray(ownValue(answer, 'items'))) {
         return { kind: 'ok', items: ownValue(answer, 'items') as readonly unknown[], budgetExhausted: false, failed: false };
       }
       return { kind: 'ok', items: [], budgetExhausted: false, failed: true };
@@ -331,7 +341,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     }
   }
 
-  /** One raise target in evaluation order; the summary targets go first. */
+/** One raise target in evaluation order; the summary targets go first. */
   private static raiseTargets(
     evaluation: Extract<TrainHealthEvaluation, { outcome: 'evaluated' }>,
     queueOverflow: boolean,
@@ -349,17 +359,34 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     return targets;
   }
 
-  /** Awaits one attention call and answers whether its outcome is a success. */
-  private async attentionCall(call: () => Promise<unknown>, outcomes: readonly string[] = ['raised', 'refreshed', 'reopened']): Promise<boolean> {
+  /**
+   * Awaits one attention call inside `try/catch`, bounded by the call budget's
+   * `timeoutMs`: a store that never answers answers this helper as `undefined`
+   * once the budget runs out, so the pass always returns. Answers the call's
+   * raw result object, or `undefined` on a throw, a timeout or a non-object.
+   */
+  private async attentionCall(call: () => Promise<unknown>, timeoutMs: number): Promise<unknown> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const answer: unknown = await call();
-      if (!isPlainObject(answer)) {
-        return false;
-      }
-      return outcomes.includes(String(ownValue(answer, 'outcome')));
+      const pending = call();
+      pending.catch(() => {
+        // The race consumes the rejection; this keeps a late failure unhandled.
+      });
+      const bounded = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('attention-call-timeout')), timeoutMs);
+      });
+      const answer: unknown = await Promise.race([pending, bounded]);
+      return isPlainObject(answer) ? answer : undefined;
     } catch {
-      return false;
+      return undefined;
+    } finally {
+      clearTimeout(timer);
     }
+  }
+
+  /** Reads an own data property of an object answer as a string. */
+  private outcomeOf(answer: unknown): string | null {
+    return isPlainObject(answer) ? String(ownValue(answer, 'outcome')) : null;
   }
 
   /** The evaluated path: list once, raise every target, clear what ended. */
@@ -399,15 +426,18 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
         budgetExhausted = true;
         break;
       }
-      const ok = await this.attentionCall(() =>
-        this.deps.attention.raiseTrainHealthAttention({
-          projectId: validated.projectId,
-          repository: validated.repository,
-          rule: target.rule,
-          pullRequest: target.pullRequest,
-        }),
+      const raiseAnswer = await this.attentionCall(
+        () =>
+          this.deps.attention.raiseTrainHealthAttention({
+            projectId: validated.projectId,
+            repository: validated.repository,
+            rule: target.rule,
+            pullRequest: target.pullRequest,
+            deadlineIso: validated.deadlineIso,
+          }),
+        budget.timeoutMs,
       );
-      if (ok) {
+      if (RAISE_OK.includes(this.outcomeOf(raiseAnswer))) {
         raised += 1;
       } else {
         attentionFailures += 1;
@@ -449,17 +479,18 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
           budgetExhausted = true;
           break;
         }
-        const ok = await this.attentionCall(
+        const clearAnswer = await this.attentionCall(
           () =>
             this.deps.attention.clearTrainHealthAttention({
               projectId: validated.projectId,
               repository: validated.repository,
               rule: parsed.rule,
               pullRequest: parsed.pullRequest,
+              deadlineIso: validated.deadlineIso,
             }),
-          ['cleared', 'unchanged', 'not-found'],
+          budget.timeoutMs,
         );
-        if (ok) {
+        if (CLEAR_OK.includes(this.outcomeOf(clearAnswer))) {
           cleared += 1;
         } else {
           attentionFailures += 1;

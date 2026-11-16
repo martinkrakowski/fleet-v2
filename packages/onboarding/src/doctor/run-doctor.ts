@@ -15,6 +15,7 @@ import type {
   LoadResult,
   SeatModel,
 } from '@fleet/installation';
+import { isSafeSshHost } from '@fleet/installation';
 import type { ToolId } from '@fleet/tooling';
 
 import { renderAutoMergeStatus, summariseAutoMerge } from '../policy/auto-merge.js';
@@ -162,6 +163,23 @@ function probeHostOf(name: string, host: HostModel): string {
   return host.transport === 'ssh' ? (host.sshAlias ?? name) : 'local';
 }
 
+/** What a detail prints in place of an ssh alias the transport refuses. */
+const UNSAFE_ALIAS_SHOWN = '[unsafe ssh alias]';
+
+/** Detail of the reachability FAIL line of a host whose ssh alias is refused. */
+const UNSAFE_ALIAS_DETAIL =
+  'ssh alias refused: not a safe host string; no command was run on this host';
+
+/** True when the probe host is an ssh alias the transport refuses before any spawn. */
+function isRefusedAlias(probeHost: string): boolean {
+  return probeHost !== 'local' && !isSafeSshHost(probeHost);
+}
+
+/** The probe host as a detail may print it: never a refused alias. */
+function shownHost(probeHost: string): string {
+  return isRefusedAlias(probeHost) ? UNSAFE_ALIAS_SHOWN : probeHost;
+}
+
 /**
  * One FAIL line per routing variable set while a v2 installation is loaded
  * (plan section 3): the variable is named, never valued, and the detail says
@@ -264,6 +282,10 @@ async function installationLines(
 /** Marker: the injected probes carry no `ciRunnerSlot` method. */
 const NO_SLOT_PROBE = Symbol('no-ci-runner-slot-probe');
 
+/** The inactive-slot detail when the fix line cannot be printed whole. */
+const SLOT_FIX_FALLBACK =
+  'slot not active; fix: sudo systemctl restart <the unit this slot names under ciRunnerSlots> on this host';
+
 /** Status and detail of one slot line; anything but an exact known answer is UNKNOWN. */
 function ciRunnerSlotVerdict(
   state: unknown,
@@ -274,10 +296,10 @@ function ciRunnerSlotVerdict(
     return ['PASS', `slot ${slot.name} active`];
   }
   if (state === 'inactive') {
-    return [
-      'FAIL',
-      `slot ${slot.name} not active; fix: systemctl restart ${slot.unit} on ${probeHost}`,
-    ];
+    // Printed whole or not at all: a fix line the boundary would redact or
+    // cut is replaced, never shown with a hole in the command.
+    const fix = `slot ${slot.name} not active; fix: sudo systemctl restart ${slot.unit} on ${shownHost(probeHost)}`;
+    return ['FAIL', boundDoctorDetail(fix) === fix ? fix : SLOT_FIX_FALLBACK];
   }
   if (state === NO_SLOT_PROBE) {
     return ['UNKNOWN', `slot ${slot.name} probe not available`];
@@ -317,7 +339,7 @@ async function ciRunnerSlotLines(
 const NO_SHELL_PROBE = Symbol('no-login-shell-probe');
 
 /** Detail of every unprobed line of a host whose login shell failed the canary. */
-const NOT_PROBED_DETAIL = 'not probed: login shell does not pass sh -c intact';
+const NOT_PROBED_DETAIL = 'not probed: login shell failed the canary';
 
 /**
  * The login-shell canary answer of every ssh host, keyed by host name; a
@@ -347,18 +369,18 @@ async function loginShellStates(
 /** Status and detail of the login-shell line; the answer is only compared with `===`. */
 function loginShellVerdict(state: unknown, probeHost: string): readonly [DoctorStatus, string] {
   if (state === 'intact') {
-    return ['PASS', `login shell passes sh -c intact via ${probeHost}`];
+    return ['PASS', `login shell passes sh -c intact via ${shownHost(probeHost)}`];
   }
   if (state === 'mangled') {
     return [
       'FAIL',
-      `login shell does not pass sh -c intact via ${probeHost}; this host's other lines are not trustworthy`,
+      `login shell did not return the canary unchanged via ${shownHost(probeHost)} (it altered sh -c or printed extra output); this host's other lines are not trustworthy`,
     ];
   }
   if (state === NO_SHELL_PROBE) {
     return ['UNKNOWN', 'login shell probe not available'];
   }
-  return ['UNKNOWN', `login shell could not be checked via ${probeHost}`];
+  return ['UNKNOWN', `login shell could not be checked via ${shownHost(probeHost)}`];
 }
 
 /** The configuration-derived lines of a host's runner; nothing here is probed. */
@@ -421,6 +443,21 @@ function skippedHostLines(name: string, host: HostModel): DoctorLine[] {
   return lines;
 }
 
+/** Detail of the `reachable` line; a refused alias is named as refused, never printed. */
+function reachableDetail(
+  reachable: boolean | undefined,
+  probeHost: string,
+  roles: string,
+): string {
+  if (reachable === undefined) {
+    return `reachability probe failed (${shownHost(probeHost)})`;
+  }
+  if (reachable) {
+    return `reachable via ${shownHost(probeHost)} (roles: ${roles})`;
+  }
+  return isRefusedAlias(probeHost) ? UNSAFE_ALIAS_DETAIL : `not reachable via ${probeHost}`;
+}
+
 /** Per-host and role lines: reachability, platform tools, worktree root, runner capabilities. */
 async function hostLines(
   model: FleetInstallationModel,
@@ -449,11 +486,7 @@ async function hostLines(
         name,
         'reachable',
         reachable === undefined ? 'UNKNOWN' : reachable ? 'PASS' : 'FAIL',
-        reachable === undefined
-          ? `reachability probe failed (${probeHost})`
-          : reachable
-            ? `reachable via ${probeHost} (roles: ${roles})`
-            : `not reachable via ${probeHost}`,
+        reachableDetail(reachable, probeHost, roles),
       ),
     );
 

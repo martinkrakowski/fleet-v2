@@ -4,8 +4,10 @@
  * state for one pull request at one head. Cost bound: stdout is refused
  * above 1_048_576 bytes before parsing, the query asks for at most 100
  * labels and 100 files, and `changedPaths` is cut to MAX_CHANGED_PATHS.
- * Five fields stay placeholders (MERGE_VETO_UNREAD_FIELDS) until a later
- * unit reads them, so only shadow veto may use this adapter.
+ * The five fields one forge read cannot answer are reported as `null`
+ * (unknown) by MERGE_VETO_UNREAD_FIELDS, never as a guess; a later unit
+ * that reads them replaces the `null`, so only shadow veto may use this
+ * adapter until then.
  */
 
 import type { GhInvocationResult } from './ForgeActionAdapter.adapter.js';
@@ -42,16 +44,16 @@ export const MERGE_VETO_STATE_QUERY = `
 `;
 
 /**
- * The five fields one forge read cannot answer. They are placeholders, not
- * observations: a later unit replaces them before any veto mode other than
- * shadow may use this adapter.
+ * The five fields one forge read cannot answer. They are reported as `null`
+ * (unknown), never as a guess; a later unit that reads them replaces the
+ * `null`.
  */
 export const MERGE_VETO_UNREAD_FIELDS = Object.freeze({
-  hardToUndo: 'not-read',
-  fixRounds: 0,
-  reviewerFamilies: Object.freeze([]) as readonly string[],
-  replyResolvedThreads: 0,
-  majorBlockerFindings: 0,
+  hardToUndo: null,
+  fixRounds: null,
+  reviewerFamilies: null,
+  replyResolvedThreads: null,
+  majorBlockerFindings: null,
 });
 
 const HEX_40 = /^[0-9a-f]{40}$/;

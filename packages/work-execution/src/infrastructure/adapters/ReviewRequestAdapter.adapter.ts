@@ -30,6 +30,8 @@ import {
   assessmentIdForAttempt,
   assessmentIdForChain,
   attemptIdForChain,
+  isAttemptReceiptSubject,
+  isReceiptAboutAssessment,
   receiptSubjectOf,
 } from '@fleet/evidence-and-acceptance';
 import type {
@@ -195,6 +197,37 @@ function isChainReceiptOf(receipt: ReviewReceiptRecord, chain: ChainSubject): bo
     stored.projectId === chain.projectId &&
     stored.chainName === chain.chainName &&
     stored.integrationHeadSha === chain.integrationHeadSha
+  );
+}
+
+/**
+ * True when a stored receipt is about the attempt `owner` names: it is an
+ * attempt receipt (no subject, or a subject of the `attempt` kind) and its own
+ * ids and its subject both name the owner's project and attempt. Own data
+ * properties only (no getter runs), never throws; anything unreadable is false.
+ */
+function isAttemptReceiptAbout(receipt: unknown, owner: unknown): boolean {
+  return isAttemptReceiptSubject(receipt) && isReceiptAboutAssessment(receipt, owner);
+}
+
+/**
+ * True when an attempt receipt's subject names `projectId` and `attemptId`.
+ * The subject is read through own data properties only (no getter runs) and a
+ * receipt without a subject reads as one whose subject is its own ids, which
+ * the caller binds separately; a missing, unreadable or non-attempt subject is
+ * never bound. Never throws.
+ */
+function isAttemptSubjectBoundTo(
+  receipt: { readonly subject?: unknown; readonly projectId?: unknown; readonly attemptId?: unknown },
+  projectId: string,
+  attemptId: string,
+): boolean {
+  const subject = receiptSubjectOf(receipt);
+  return (
+    subject !== null &&
+    subject.kind === 'attempt' &&
+    subject.projectId === projectId &&
+    subject.attemptId === attemptId
   );
 }
 
@@ -756,7 +789,28 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         receipt.requestId === request.requestId &&
         receipt.kind === kind &&
         receipt.attemptId === request.attemptId &&
-        receipt.candidateHeadSha === request.candidateHeadSha,
+        receipt.candidateHeadSha === request.candidateHeadSha &&
+        // A brief-check receipt is about the brief, never the attempt
+        // assessment, so it is bound to the request's project and attempt
+        // directly, plus the same assessment id this attempt answers to
+        // (CO18a7d fix round 3 — a matching-request receipt naming a
+        // different assessment is not evidence for this one); every other
+        // kind is bound through the full predicate.
+        (kind === 'brief-check'
+          ? isAttemptReceiptSubject(receipt) &&
+            receipt.projectId === request.projectId &&
+            receipt.attemptId === request.attemptId &&
+            isAttemptSubjectBoundTo(receipt, request.projectId, request.attemptId) &&
+            isReceiptAboutAssessment(receipt, {
+              id: assessmentIdForAttempt(request.attemptId),
+              projectId: request.projectId,
+              attemptId: request.attemptId,
+            })
+          : isAttemptReceiptAbout(receipt, {
+              id: assessmentIdForAttempt(request.attemptId),
+              projectId: request.projectId,
+              attemptId: request.attemptId,
+            })),
       kind,
       false,
     );
@@ -788,7 +842,20 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       matches.length > 1 ||
       only.candidateHeadSha !== request.candidateHeadSha ||
       only.attemptId !== request.attemptId ||
-      only.kind === undefined
+      only.kind === undefined ||
+      // A brief-check receipt is about the brief, never the attempt
+      // assessment, so it is bound to the assessment's project and attempt
+      // directly, plus the same assessment id being read (CO18a7d fix round
+      // 3 — a matching-request receipt naming a different assessment is not
+      // evidence for this one); every other kind is bound through the full
+      // predicate.
+      (only.kind === 'brief-check'
+        ? !isAttemptReceiptSubject(only) ||
+          only.projectId !== read.assessment.projectId ||
+          only.attemptId !== read.assessment.attemptId ||
+          !isAttemptSubjectBoundTo(only, read.assessment.projectId, read.assessment.attemptId) ||
+          !isReceiptAboutAssessment(only, read.assessment)
+        : !isAttemptReceiptAbout(only, read.assessment))
     ) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
@@ -882,6 +949,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       if (completedAtMs(candidate) >= completedAtMs(latest)) {
         latest = candidate;
       }
+    }
+    // A latest receipt about another subject is never this attempt's verdict
+    // and never yields to an earlier one: the answer is unknown, not a pass.
+    if (!isAttemptReceiptAbout(latest, read.assessment)) {
+      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
     const finalSummary = receiptOfKindSummaryOf(latest, latest.kind, latest.requestId ?? null);
     return finalSummary === null

@@ -37,7 +37,12 @@ import type { ReviewFindingRecord, ReviewKind, ReviewUnknownReason } from '../..
 import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
 import type { RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
-import { DEFAULT_REVIEW_TIMEOUT_MS, MAX_RAW_OUTPUT_LENGTH, ReviewTransportError } from './OcmReviewTransport.adapter.js';
+import {
+  DEFAULT_REVIEW_TIMEOUT_MS,
+  MAX_RAW_OUTPUT_LENGTH,
+  REVIEW_KNOWN_FALSE_POSITIVES,
+  ReviewTransportError,
+} from './OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from './ReviewTransportRouter.js';
 
 /**
@@ -171,6 +176,9 @@ const SYSTEM_PROMPT = [
   'When you cannot tell, answer with result "unknown" rather than guessing.',
   UNTRUSTED_INPUT_RULE,
 ].join('\n');
+
+/** The system text of a conductor review (a request with `kind`): the manual one plus the known false positives (RVP1). */
+const KIND_SYSTEM_PROMPT = SYSTEM_PROMPT + '\n' + REVIEW_KNOWN_FALSE_POSITIVES;
 
 /**
  * One own DATA property. An absent, inherited or accessor-backed field, or a
@@ -696,7 +704,7 @@ export function createApiReviewTransport(
     let answer: ApiReviewGenerateResult;
     try {
       answer = await options.generate({
-        system: SYSTEM_PROMPT,
+        system: kindPlan === undefined ? SYSTEM_PROMPT : KIND_SYSTEM_PROMPT,
         prompt: buildPrompt(request, diff, nonce, kindPlan),
         abortSignal: AbortSignal.timeout(timeoutMs),
       });

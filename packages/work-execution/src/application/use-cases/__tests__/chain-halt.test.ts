@@ -20,7 +20,7 @@ const HEAD = '0123456789abcdef0123456789abcdef01234567';
 
 const haltedState = {
   state: 'halted',
-  record: { halted: true, reason: 'operator-stop', setAtIso: NOW },
+  record: { version: 1, halted: true, changedAtIso: NOW },
 } as unknown as ConductorHaltState;
 
 type HaltAnswer = ConductorHaltState | null | unknown[] | Record<string, unknown>;
@@ -204,12 +204,12 @@ const failClosedAnswers: readonly [string, HaltAnswer | Error][] = [
 const clearHalt = haltFake({ state: 'clear', record: null });
 
 describe('RefreshChainsUseCase halt gating', () => {
-  function makeRefresh(options: { halt?: Pick<ConductorHaltPort, 'read'>; onAction?: () => void; list?: readonly ChainRecord[] } = {}) {
-    const record = (options.list ?? [makeRecord()])[0]!;
-    const repo = repoFake({ list: [record], read: { status: 'ok', record } });
+  function makeRefresh(options: { halt?: Pick<ConductorHaltPort, 'read'>; onAction?: () => void; list?: readonly ChainRecord[]; mode?: 'shadow' | 'live' } = {}) {
+    const records = options.list ?? [makeRecord()];
+    const repo = repoFake({ list: records, read: { status: 'ok', record: records[0]! } });
     const forge = forgeFake({ onAction: options.onAction });
     const attention = attentionFake();
-    const useCase = new RefreshChainsUseCase({ chains: repo, forge, attention, now: () => NOW, mode: 'live', halt: options.halt ?? clearHalt });
+    const useCase = new RefreshChainsUseCase({ chains: repo, forge, attention, now: () => NOW, mode: options.mode ?? 'live', halt: options.halt ?? clearHalt });
     return { repo, forge, attention, useCase };
   }
 
@@ -257,35 +257,137 @@ describe('RefreshChainsUseCase halt gating', () => {
     expect(repo.counts.recordChainRefreshOutcome).toBe(1);
   });
 
-  it('RefreshChainsUseCase runs normally when halt is absent', async () => {
-    const record = makeRecord();
-    const repo = repoFake({ list: [record], read: { status: 'ok', record } });
-    const forge = forgeFake();
-    const useCase = new RefreshChainsUseCase({ chains: repo, forge, attention: attentionFake(), now: () => NOW, mode: 'live' });
+  it('RefreshChainsUseCase refuses halted when the halt dependency is missing', async () => {
+    for (const missing of [undefined, null]) {
+      const repo = repoFake({ list: [makeRecord()], read: { status: 'ok', record: makeRecord() } });
+      const forge = forgeFake();
+      const useCase = new RefreshChainsUseCase({ chains: repo, forge, attention: attentionFake(), now: () => NOW, mode: 'live', halt: missing as never });
+
+      const result = await useCase.runRefreshChains(refreshCommand);
+
+      expect(result).toEqual({ outcome: 'refused', reasonCode: 'halted', chains: [] });
+      expect(forge.headCalls).toBe(0);
+      expect(forge.actionCalls).toBe(0);
+      expect(repo.counts.recordChainRefreshIntent).toBe(0);
+    }
+  });
+
+  it('RefreshChainsUseCase reads the halt at the pass start, before each started chain and before each merge', async () => {
+    let reads = 0;
+    const countingHalt: Pick<ConductorHaltPort, 'read'> = {
+      async read() {
+        reads += 1;
+        return { state: 'clear', record: null };
+      },
+    };
+    const first = makeRefresh({ halt: countingHalt });
+
+    const firstResult = await first.useCase.runRefreshChains(refreshCommand);
+
+    expect(firstResult.outcome).toBe('completed');
+    expect(reads).toBe(3);
+
+    const twoStarted = [makeRecord(), makeRecord({ chainName: 'second-thing', branchName: 'chain/second-thing' })];
+    let secondReads = 0;
+    const secondHalt: Pick<ConductorHaltPort, 'read'> = {
+      async read() {
+        secondReads += 1;
+        return { state: 'clear', record: null };
+      },
+    };
+    const second = makeRefresh({ list: twoStarted, halt: secondHalt });
+
+    const secondResult = await second.useCase.runRefreshChains(refreshCommand);
+
+    expect(secondResult.outcome).toBe('completed');
+    expect(secondReads).toBe(5);
+  });
+
+  it('a halt raised after the first chain stops the second chain', async () => {
+    const mutable = mutableHaltFake();
+    const list = [makeRecord(), makeRecord({ chainName: 'second-thing', branchName: 'chain/second-thing' })];
+    const { repo, forge, useCase } = makeRefresh({ list, halt: mutable.halt, onAction: () => mutable.haltNow() });
+
+    const result = await useCase.runRefreshChains(refreshCommand);
+
+    expect(result).toEqual({
+      outcome: 'refused',
+      reasonCode: 'halted',
+      chains: [{ chainName: 'fix-thing', key: 'chain-refresh/fix-thing@' + HEAD.slice(0, 12), outcome: 'merged' }],
+    });
+    expect(forge.actionCalls).toBe(1);
+    expect(repo.counts.recordChainRefreshIntent).toBe(1);
+    expect(repo.counts.recordChainRefreshOutcome).toBe(1);
+  });
+
+  it('a halt read that fails before a chain refuses the pass', async () => {
+    let reads = 0;
+    const flakyHalt: Pick<ConductorHaltPort, 'read'> = {
+      async read() {
+        reads += 1;
+        if (reads >= 2) {
+          throw new Error('store gone');
+        }
+        return { state: 'clear', record: null };
+      },
+    };
+    const { repo, forge, useCase } = makeRefresh({ halt: flakyHalt });
+
+    const result = await useCase.runRefreshChains(refreshCommand);
+
+    expect(result).toEqual({ outcome: 'refused', reasonCode: 'halted', chains: [] });
+    expect(forge.actionCalls).toBe(0);
+    expect(repo.counts.recordChainRefreshIntent).toBe(0);
+  });
+
+  it('a clear answer with a lifted halted false record runs', async () => {
+    const { forge, useCase } = makeRefresh({ halt: haltFake({ state: 'clear', record: { version: 1, halted: false, changedAtIso: NOW } }) });
 
     const result = await useCase.runRefreshChains(refreshCommand);
 
     expect(result.outcome).toBe('completed');
     expect(result.chains[0].outcome).toBe('merged');
     expect(forge.actionCalls).toBe(1);
-    expect(repo.counts.recordChainRefreshOutcome).toBe(1);
   });
 
-  it('RefreshChainsUseCase reads the halt once per pass', async () => {
+  it('a shadow pass refuses halted before the main head read', async () => {
+    const { forge, useCase } = makeRefresh({ mode: 'shadow', halt: haltFake(haltedState) });
+
+    const result = await useCase.runRefreshChains(refreshCommand);
+
+    expect(result).toEqual({ outcome: 'refused', reasonCode: 'halted', chains: [] });
+    expect(forge.headCalls).toBe(0);
+  });
+
+  it('a shadow pass reads the halt once and writes nothing', async () => {
     let reads = 0;
-    const halt: Pick<ConductorHaltPort, 'read'> = {
+    const countingHalt: Pick<ConductorHaltPort, 'read'> = {
       async read() {
         reads += 1;
         return { state: 'clear', record: null };
       },
     };
-    const { repo, useCase } = makeRefresh({ halt });
+    const { repo, forge, useCase } = makeRefresh({ mode: 'shadow', halt: countingHalt });
 
     const result = await useCase.runRefreshChains(refreshCommand);
 
-    expect(result.outcome).toBe('completed');
+    expect(result.outcome).toBe('skipped');
+    expect(result.reasonCode).toBe('shadow-would-refresh-1');
     expect(reads).toBe(1);
-    expect(repo.counts.recordChainRefreshOutcome).toBe(1);
+    expect(forge.actionCalls).toBe(0);
+    expect(repo.counts.recordChainRefreshIntent).toBe(0);
+  });
+
+  it('a throwing read getter on the halt port refuses halted', async () => {
+    const { forge, useCase } = makeRefresh({
+      halt: Object.defineProperty({}, 'read', { get() { throw new Error('boom'); } }) as never,
+    });
+
+    const result = await useCase.runRefreshChains(refreshCommand);
+
+    expect(result).toEqual({ outcome: 'refused', reasonCode: 'halted', chains: [] });
+    expect(forge.headCalls).toBe(0);
+    expect(forge.actionCalls).toBe(0);
   });
 
   it('reports an already-sent forge action as completed when halt appears mid-call', async () => {

@@ -224,6 +224,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
           chains: durable ? new ChainRepositoryAdapter({ stateDir }) : new ChainRepositoryAdapter(),
           forge: shadowForge,
           attention: chainAttention,
+          halt: input.conductor.halt,
           now,
           mode: 'shadow',
         })

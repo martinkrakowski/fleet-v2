@@ -883,6 +883,12 @@ export class LandChainUseCase implements LandChainPort {
     if (premergeIntent !== null) {
       return premergeIntent;
     }
+    // The intent append above takes a lock and does disk I/O: the halt is read again after it, with
+    // nothing awaited between this read and the post. The intent stays; a resume finds it and posts.
+    const haltedAfterIntent = await this.haltRefusalIfApplying(command);
+    if (haltedAfterIntent !== null) {
+      return haltedAfterIntent;
+    }
     const status = await this.guarded(
       command.deadlineIso,
       FAIL_FORGE,

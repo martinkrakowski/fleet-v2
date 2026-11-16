@@ -956,10 +956,10 @@ describe('LandChainUseCase halt gate', () => {
     expect(reads).toBe(0);
   });
 
-  it('a clean landing reads the halt once before every one-way action, five times in all', async () => {
+  it('a clean landing reads the halt once before every one-way action, six times in all', async () => {
     const { result, world } = await run();
     expect(result.outcome).toBe('landed');
-    expect(world.calls.haltReads).toBe(5);
+    expect(world.calls.haltReads).toBe(6);
   });
 
   it('a halt raised before the open or adopt is refused halted with nothing opened', async () => {
@@ -1003,7 +1003,7 @@ describe('LandChainUseCase halt gate', () => {
     const halt = {
       read: async () => {
         reads += 1;
-        return reads <= 4
+        return reads <= 5
           ? { state: 'clear', record: null }
           : { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } };
       },
@@ -1013,7 +1013,104 @@ describe('LandChainUseCase halt gate', () => {
     expect(world.landing.calls.openOrAdopt).toBe(1);
     expect(world.calls.performMergeForgeAction).toBe(1);
     expect(world.calls.enqueueMergeEntry).toBe(0);
+    expect(reads).toBe(6);
+  });
+
+  /** A halt that reads clear until its -th read, then halted;  is the running count. */
+  function haltFromRead(at: number): { halt: LandChainDependencies['halt']; reads: () => number } {
+    let reads = 0;
+    const halt = {
+      read: async () => {
+        reads += 1;
+        return reads < at
+          ? { state: 'clear', record: null }
+          : { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } };
+      },
+    } as unknown as LandChainDependencies['halt'];
+    return { halt, reads: () => reads };
+  }
+
+  // Reads in a clean landing: 1 first, 2 pre-apply, 3 before open/adopt, 4 before the premerge intent
+  // (the old pre-status read), 5 after the premerge intent and directly before the post, 6 before the enqueue.
+  it.each([
+    { at: 3, open: 0, post: 0, enqueue: 0, journalled: [] as string[] },
+    { at: 4, open: 1, post: 0, enqueue: 0, journalled: [] as string[] },
+    { at: 5, open: 1, post: 0, enqueue: 0, journalled: ['premerge:intent'] },
+    { at: 6, open: 1, post: 1, enqueue: 0, journalled: ['premerge:intent', 'enqueue:intent'] },
+  ])('a halt that trips at read $at stops that action and every later one', async ({ at, open, post, enqueue, journalled }) => {
+    const { halt, reads } = haltFromRead(at);
+    const { result, world } = await run({}, { halt });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(world.landing.calls.openOrAdopt).toBe(open);
+    expect(world.calls.performMergeForgeAction).toBe(post);
+    expect(world.calls.enqueueMergeEntry).toBe(enqueue);
+    expect(reads()).toBe(at);
+    const stepEntries = [...world.landing.journal.entries()]
+      .filter(([key]) => /\/(premerge|enqueue)@/.test(key))
+      .flatMap(([key, entries]) => entries.map((entry) => `${/\/(premerge|enqueue)@/.exec(key)?.[1]}:${entry.kind}`));
+    expect(stepEntries.sort()).toEqual([...journalled].sort());
+  });
+
+  it('a halt set while the premerge intent append is pending refuses before the post', async () => {
+    let appended = false;
+    let reads = 0;
+    const halt = {
+      read: async () => {
+        reads += 1;
+        return appended
+          ? { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } }
+          : { state: 'clear', record: null };
+      },
+    } as unknown as LandChainDependencies['halt'];
+    const world = makeWorld({ halt });
+    const append = world.landing.append.bind(world.landing);
+    world.landing.append = async (entry) => {
+      const answer = await append(entry);
+      appended = appended || entry.key.includes('/premerge@');
+      return answer;
+    };
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(world.landing.calls.openOrAdopt).toBe(1);
+    expect(world.calls.performMergeForgeAction).toBe(0);
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    // first, pre-apply, open, before the intent (clear), then after the intent (halted).
     expect(reads).toBe(5);
+  });
+
+  it('after a trip at the enqueue read, lifting the halt and running again adopts the open PR and lands', async () => {
+    let lifted = false;
+    let reads = 0;
+    const halt = {
+      read: async () => {
+        reads += 1;
+        return lifted || reads < 6
+          ? { state: 'clear', record: null }
+          : { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } };
+      },
+    } as unknown as LandChainDependencies['halt'];
+    const world = makeWorld({ halt });
+    const modes: string[] = [];
+    const open = world.landing.openOrAdopt.bind(world.landing);
+    world.landing.openOrAdopt = async (command) => {
+      modes.push(command.mode);
+      return open(command);
+    };
+    let openPullRequests: { number: number; headSha: string }[] = [];
+    (world.deps.forge as { findOpenPullRequestsByHead: unknown }).findOpenPullRequestsByHead = async () => ({ outcome: 'read', pullRequests: openPullRequests });
+    const first = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(first).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    expect(world.landing.marks.get(MARK_ID)?.mark.state).toBe('landing');
+    openPullRequests = [{ number: 77, headSha: TIP }];
+    lifted = true;
+    const second = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(second).toMatchObject({ outcome: 'landed', pullRequestNumber: 77 });
+    // No second PR is opened: the first run opened, the second adopted.
+    expect(modes).toEqual(['open', 'adopt']);
+    expect(world.calls.enqueueMergeEntry).toBe(1);
+    // The premerge status is posted again on the resume (its intent is present, its post left no result): once per run.
+    expect(world.calls.performMergeForgeAction).toBe(2);
   });
 });
 

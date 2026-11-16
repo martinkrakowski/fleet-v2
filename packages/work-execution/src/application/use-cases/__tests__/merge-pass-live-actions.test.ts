@@ -968,4 +968,49 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
     expect(acted.outcome).toBe('acted');
     expect(forgeAction.requests).toHaveLength(1);
   });
+
+  it('a halt set while the intent append is pending stops the forge call and journals a halted not-started result', async () => {
+    let reads = 0;
+    let intentAppended = false;
+    const { journal, forgeAction, deps } = build({
+      halt: {
+        read: async () => {
+          reads += 1;
+          return intentAppended ? haltedHalt().read() : { state: 'clear', record: null };
+        },
+      },
+    });
+    const append = journal.append.bind(journal);
+    journal.append = async (entry) => {
+      const appended = await append(entry);
+      // The operator halts while the intent append (lock, disk read and write) is in flight.
+      intentAppended = entry.kind === 'intent' ? true : intentAppended;
+      return appended;
+    };
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'halted' });
+    expect(forgeAction.requests).toHaveLength(0);
+    expect(reads).toBe(2);
+    expect(journal.entries.map((entry) => [entry.kind, entry.outcome, entry.reasonCode])).toEqual([
+      ['intent', null, null],
+      ['result', 'not-started', 'halted'],
+    ]);
+  });
+
+  it('a clear halt at both reads acts: two reads, one forge call, the intent before the call', async () => {
+    let reads = 0;
+    const { journal, forgeAction, deps } = build({
+      halt: {
+        read: async () => {
+          reads += 1;
+          return { state: 'clear', record: null };
+        },
+      },
+    });
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result.outcome).toBe('acted');
+    expect(reads).toBe(2);
+    expect(forgeAction.requests).toHaveLength(1);
+    expect(journal.entries.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+  });
 });

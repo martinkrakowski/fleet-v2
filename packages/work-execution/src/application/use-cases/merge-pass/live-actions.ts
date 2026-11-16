@@ -736,12 +736,19 @@ async function actLive(
     return intentFailure;
   }
 
-  const forgeResult = await performForgeAction(deps, forgeRequest);
+  // The halt is re-read after the intent append (which takes a lock and does disk I/O) and directly
+  // before the forge call: nothing is awaited between this read and the call.
+  const haltedAfterIntent = await isRequiredPassHalted(deps.halt);
+  const forgeResult = haltedAfterIntent ? null : await performForgeAction(deps, forgeRequest);
 
   let journalOutcome: LaneRunJournalOutcome;
   let reasonCode: string | null;
   let returned: MergeLiveActionOutcome;
-  if (forgeResult.outcome === 'executed') {
+  if (forgeResult === null) {
+    journalOutcome = 'not-started';
+    reasonCode = 'halted';
+    returned = { outcome: 'skipped', journalKey: key, reasonCode: 'halted' };
+  } else if (forgeResult.outcome === 'executed') {
     journalOutcome = 'completed';
     reasonCode = null;
     returned = { outcome: 'acted', journalKey: key, actionId, headSha: forgeResult.headSha };

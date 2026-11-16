@@ -17,6 +17,7 @@ import type {
   ChainsSection,
   CiRunnerSlotSection,
   ConductorPolicy,
+  ConductorPremergeMode,
   ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
   ConductorReaperRepairs,
@@ -41,6 +42,7 @@ import type {
   MergeDaemonSection,
   MergePolicySection,
   MergeRepositoryPolicy,
+  MergeVetoConsumerSettings,
   MergeVetoPolicy,
   PolicySection,
   ProcedureCoverage,
@@ -105,6 +107,7 @@ import {
   LOCAL_SHELF_KEYS,
   MERGE_KEYS,
   MERGE_REPO_KEYS,
+  MERGE_VETO_CONSUMER_KEYS,
   MERGE_VETO_KEYS,
   NO_DECISIONS_KEYS,
   NO_FORGE_KEYS,
@@ -2300,6 +2303,21 @@ function readConductorMinutes(
   return value;
 }
 
+function readConductorPremergeMode(
+  record: JsonObject,
+  errors: string[],
+): ConductorPremergeMode | undefined {
+  if (!Object.hasOwn(record, 'premergeMode')) {
+    return undefined;
+  }
+  const value = record.premergeMode;
+  if (value !== 'human-gate' && value !== 'auto-attest') {
+    errors.push('policy.conductor.premergeMode: must be one of human-gate, auto-attest');
+    return undefined;
+  }
+  return value;
+}
+
 function parseConductorRepairs(
   reaper: JsonObject,
   errors: string[],
@@ -2518,6 +2536,7 @@ function parseConductorPolicy(
     CONDUCTOR_MINUTE_BOUNDS.stopGraceMinutes,
     errors,
   );
+  const premergeMode = readConductorPremergeMode(value, errors);
   const reaper = parseConductorReaper(value, errors);
   if (errors.length !== before || enabled === undefined) {
     return undefined;
@@ -2525,6 +2544,7 @@ function parseConductorPolicy(
   return {
     enabled,
     ...(stopGraceMinutes !== undefined ? { stopGraceMinutes } : {}),
+    ...(premergeMode !== undefined ? { premergeMode } : {}),
     ...(reaper !== undefined ? { reaper } : {}),
   };
 }
@@ -3235,11 +3255,55 @@ function readRequiredPositiveNumber(
 }
 
 /**
+ * Parse the optional `merge-veto` consumer entry (OG16c1). Absent -> undefined
+ * with no error (not configured). Present -> an object with only known keys, a
+ * required finite `monthlyBudgetUsd` greater than 0 and the acknowledgement
+ * literally true; anything else pushes a named, value-free error and the entry
+ * is not stored.
+ */
+function parseMergeVetoConsumer(
+  consumersValue: JsonObject,
+  errors: string[],
+): MergeVetoConsumerSettings | undefined {
+  if (!Object.hasOwn(consumersValue, 'merge-veto')) {
+    return undefined;
+  }
+  const entry = consumersValue['merge-veto'];
+  const entryPath = 'decisions.consumers.merge-veto';
+  if (!isJsonObject(entry)) {
+    errors.push(`${entryPath}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(entry, MERGE_VETO_CONSUMER_KEYS, entryPath, errors);
+  const monthlyBudgetUsd = readRequiredPositiveNumber(
+    entry,
+    'monthlyBudgetUsd',
+    `${entryPath}.monthlyBudgetUsd`,
+    errors,
+  );
+  const ackPath = `${entryPath}.acknowledgePullRequestTitleAndPathsLeaveHost`;
+  if (!Object.hasOwn(entry, 'acknowledgePullRequestTitleAndPathsLeaveHost')) {
+    errors.push(`${ackPath}: required`);
+    return undefined;
+  }
+  if (entry.acknowledgePullRequestTitleAndPathsLeaveHost !== true) {
+    errors.push(`${ackPath}: must be true`);
+    return undefined;
+  }
+  if (monthlyBudgetUsd === undefined) {
+    return undefined;
+  }
+  return { monthlyBudgetUsd, acknowledgePullRequestTitleAndPathsLeaveHost: true };
+}
+
+/**
  * Parse the optional per-consumer settings map of a decisions block (K3, plan
  * section 2). Unknown consumer names and unknown keys inside an entry are
  * refused; `minConfidence` must be a finite number in [0,1]; a
  * `monthlyBudgetUsd` must be finite and greater than 0; the `claim-triage`
- * acknowledgement must be literally true whenever the entry is present.
+ * acknowledgement must be literally true whenever the entry is present; the
+ * `merge-veto` entry, whenever present, requires a positive finite
+ * `monthlyBudgetUsd` and a literal `true` acknowledgement.
  * Messages name the field, never the value.
  */
 function parseDecisionConsumers(
@@ -3330,6 +3394,10 @@ function parseDecisionConsumers(
         };
       }
     }
+  }
+  const mergeVeto = parseMergeVetoConsumer(consumersValue, errors);
+  if (mergeVeto !== undefined) {
+    consumers['merge-veto'] = mergeVeto;
   }
   return consumers;
 }

@@ -7,7 +7,8 @@ import type { ResolvedConductorPolicy } from './types.js';
 export const CONDUCTOR_REVISION_LENGTH = 12;
 
 /**
- * The canonical JSON the revision hashes: `enabled`, `stopGraceMinutes`, then `reaper` with
+ * The canonical JSON the revision hashes: `enabled`, `stopGraceMinutes`, `premergeMode` (only
+ * when `'auto-attest'`, so `'human-gate'` and absent hash identically), then `reaper` with
  * `enabled`, `intervalMinutes`, `graceMinutes`, `staleStopMinutes`, `repairs` (every kind, in
  * CONDUCTOR_REAPER_REPAIR_KINDS order), `worktrees` (`retentionHours`, `maxRemovalsPerPass`,
  * `passBudgetSeconds`) and `disk` (`minFreePercent`, `clearFreePercent`), no whitespace. Pass a
@@ -21,6 +22,7 @@ export function canonicalConductorJson(policy: ResolvedConductorPolicy): string 
   return JSON.stringify({
     enabled: policy.enabled,
     stopGraceMinutes: policy.stopGraceMinutes,
+    ...(policy.premergeMode === 'auto-attest' ? { premergeMode: 'auto-attest' } : {}),
     reaper: {
       enabled: policy.reaper.enabled,
       intervalMinutes: policy.reaper.intervalMinutes,

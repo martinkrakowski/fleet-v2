@@ -331,9 +331,18 @@ export interface ConductorReaperPolicy {
  * `enabled`; only `enabled` is required. It grants nothing by itself: forge actions still
  * need a policy grant (AM3a), merges also `policy.autoMerge`.
  */
+/** How the conductor handles Tier 2 `premerge` status once an independent pre-merge review passes (CO21). */
+export type ConductorPremergeMode = 'human-gate' | 'auto-attest';
+
+/**
+ * The v2 `policy.conductor` section as written (conductor plan §3.7, §3.9). Off unless
+ * `enabled`; only `enabled` is required. It grants nothing by itself: forge actions still
+ * need a policy grant (AM3a), merges also `policy.autoMerge`.
+ */
 export interface ConductorPolicy {
   readonly enabled: boolean;
   readonly stopGraceMinutes?: number;
+  readonly premergeMode?: ConductorPremergeMode;
   readonly reaper?: ConductorReaperPolicy;
 }
 
@@ -398,6 +407,7 @@ export interface ResolvedConductorReaperPolicy {
 export interface ResolvedConductorPolicy {
   readonly enabled: boolean;
   readonly stopGraceMinutes: number;
+  readonly premergeMode: ConductorPremergeMode;
   readonly reaper: ResolvedConductorReaperPolicy;
 }
 
@@ -663,10 +673,22 @@ export interface ClaimTriageSettings extends ConsumerSettings {
   readonly acknowledgeCandidateClaimsLeaveHost: true;
 }
 
+/**
+ * Settings of the `merge-veto` consumer (OG16c1). Present only when the
+ * operator declares it: a monthly budget of its own and the acknowledgement
+ * that a pull request's title and changed paths leave the host. An absent
+ * entry means the merge veto is not configured; nothing defaults it on.
+ */
+export interface MergeVetoConsumerSettings {
+  readonly monthlyBudgetUsd: number;
+  readonly acknowledgePullRequestTitleAndPathsLeaveHost: true;
+}
+
 /** The per-consumer settings map of a `decisions` block (K3). */
 export interface DecisionConsumers {
   readonly 'knowledge-ranking'?: ConsumerSettings;
   readonly 'claim-triage'?: ClaimTriageSettings;
+  readonly 'merge-veto'?: MergeVetoConsumerSettings;
 }
 
 /** The v2 `decisions` block with the Jev provider (D3). */

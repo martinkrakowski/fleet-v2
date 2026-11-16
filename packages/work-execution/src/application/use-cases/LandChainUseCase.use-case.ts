@@ -474,12 +474,16 @@ export class LandChainUseCase implements LandChainPort {
       return { link: null, fail: unsettled };
     }
 
-    let attempt: AttemptRecord | null;
-    try {
-      attempt = await this.deps.attempts.findAttemptById(lastAttemptId);
-    } catch {
-      attempt = null;
+    const found = await this.guarded<AttemptRecord | null>(
+      command.deadlineIso,
+      FAIL_STORE,
+      () => this.deps.attempts.findAttemptById(lastAttemptId),
+    );
+    if (!found.ok) {
+      return { link: null, fail: found.fail };
     }
+    // Known absence is null (an unsettled link); an unreadable store threw above.
+    const attempt = found.value;
     if (attempt === null) {
       return { link: null, fail: unsettled };
     }
@@ -726,7 +730,7 @@ export class LandChainUseCase implements LandChainPort {
       return refused('intent-digest-mismatch');
     }
     if (finalEntry !== undefined) {
-      return this.replayLanded(command, facts.title, finalEntry, key, facts.tip);
+      return this.replayLanded(command, facts, finalEntry, key);
     }
     if (intentEntry === undefined) {
       const fail = await this.appendJournalEntry(command, key, 'intent', digest);
@@ -753,11 +757,11 @@ export class LandChainUseCase implements LandChainPort {
 
     // Re-check after the mark: any failure withdraws the mark and never enqueues.
     const rechecked = await this.recheckAfterMark(command, facts);
-    if (rechecked !== null) {
-      return this.withdrawAndReturn(command, key, facts.tip, pullRequestNumber, rechecked);
+    if (!rechecked.ok) {
+      return this.withdrawAndReturn(command, key, facts.tip, pullRequestNumber, rechecked.fail);
     }
 
-    return this.enqueueAndRecord(command, facts, key, digest, pullRequestNumber);
+    return this.enqueueAndRecord(command, facts, key, digest, pullRequestNumber, rechecked.value);
   }
 
   /** Step 10: open or adopt the one integration pull request and re-read it; its number, or the failure. */
@@ -862,26 +866,27 @@ export class LandChainUseCase implements LandChainPort {
     return null;
   }
 
-  /** Step 13: links, receipts and batches read again after the mark; `null` when still clean, else the failure to withdraw on. */
-  private async recheckAfterMark(command: LandChainCommand, facts: LandFacts): Promise<Fail | null> {
+  /** Step 13: links, receipts and batches read again after the mark; the re-checked highest tier, else the failure to withdraw on. */
+  private async recheckAfterMark(command: LandChainCommand, facts: LandFacts): Promise<Guarded<1 | 2>> {
     // Re-check after the mark: any failure withdraws the mark and never enqueues.
     const recheckLinks = await this.collectLinks(command, facts.tip);
     if (!recheckLinks.ok) {
-      return recheckLinks.fail;
+      return recheckLinks;
     }
     const recheckChain = await this.checkChainReceipt(command, facts.pin, recheckLinks.value.highestTier);
     if (recheckChain !== null) {
-      return recheckChain;
+      return { ok: false, fail: recheckChain };
     }
     const recheckReceipts = await this.collectLinkReceipts(command, recheckLinks.value.links, facts.tip);
     if (!recheckReceipts.ok) {
-      return recheckReceipts.fail;
+      return recheckReceipts;
     }
     const recheckBatch = await this.checkBatch(command);
     if (recheckBatch !== null) {
-      return recheckBatch;
+      return { ok: false, fail: recheckBatch };
     }
-    return null;
+    // The tier to enqueue under is the re-checked one, never the first read's.
+    return { ok: true, value: recheckLinks.value.highestTier };
   }
 
   /** Steps 14-15: the enqueue with its keyed intent, then the final journal result and the `landed` answer. */
@@ -891,6 +896,7 @@ export class LandChainUseCase implements LandChainPort {
     key: string,
     digest: string,
     pullRequestNumber: number,
+    tier: 1 | 2,
   ): Promise<LandChainResult> {
     const head12 = facts.tip.slice(0, 12);
     const enqueueKey = `chain-land/${command.chainName}/enqueue@${head12}`;
@@ -917,7 +923,7 @@ export class LandChainUseCase implements LandChainPort {
           repository: command.repository,
           pullRequest: pullRequestNumber,
           headOid: facts.tip,
-          tier: facts.tier,
+          tier,
           enqueuedBy: 'conductor',
           runId: null,
           entryId: entryId.id,
@@ -932,6 +938,11 @@ export class LandChainUseCase implements LandChainPort {
     if (enqueued.value.outcome === 'refused') {
       return refused('enqueue-refused');
     }
+    // The queue's own record names the entry (a supersede or a duplicate may not be the minted id).
+    const recordedId = (enqueued.value as { readonly record?: { readonly entryId?: unknown } }).record?.entryId;
+    if (typeof recordedId !== 'string' || recordedId.length === 0) {
+      return FAIL_QUEUE;
+    }
 
     const appended = await this.appendJournalEntry(command, key, 'result', digest);
     if (appended !== null) {
@@ -943,7 +954,7 @@ export class LandChainUseCase implements LandChainPort {
       body: facts.body,
       pullRequestNumber,
       headSha: facts.tip,
-      entryId: entryId.id,
+      entryId: recordedId,
     };
   }
 
@@ -1141,11 +1152,11 @@ export class LandChainUseCase implements LandChainPort {
   /** The answer of an already-recorded final result: the landing stands, forge and queue are not called again. */
   private async replayLanded(
     command: LandChainCommand,
-    title: string,
+    facts: LandFacts,
     finalEntry: { entryId: string },
     key: string,
-    tip: string,
   ): Promise<LandChainResult> {
+    const tip = facts.tip;
     const stored = await this.readLandingMark(command);
     if (!stored.ok) {
       return stored.fail;
@@ -1163,8 +1174,9 @@ export class LandChainUseCase implements LandChainPort {
     }
     return {
       outcome: 'landed',
-      title,
-      body: renderLandChain(command.chainName, stored.mark.headSha, []).body,
+      title: facts.title,
+      // The links were read (no new call on replay) in this run's read phase at the same head the mark names.
+      body: facts.body,
       pullRequestNumber: stored.mark.pullRequestNumber,
       headSha: stored.mark.headSha,
       entryId: finalEntry.entryId,

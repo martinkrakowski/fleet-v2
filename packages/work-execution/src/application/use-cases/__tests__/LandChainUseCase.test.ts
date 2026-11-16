@@ -223,6 +223,7 @@ interface World {
     enqueueMergeEntry: number;
     performMergeForgeAction: number;
     openOrAdopt: number;
+    enqueued: { tier: number; entryId: string; successorEntryId: string }[];
   };
 }
 
@@ -231,7 +232,7 @@ interface Overrides {
   laneRuns?: unknown;
   attempts?: Map<string, Record<string, unknown> | null>;
   queueEntries?: Record<string, unknown>[];
-  enqueueDecision?: { outcome: string };
+  enqueueDecision?: { outcome: string; recordEntryId?: string };
   linkPullRequest?: Record<string, unknown> | 'unavailable' | 'not-found';
   openPullRequests?: { number: number; headSha: string }[] | 'unreadable';
   /** What reading a head-lookup candidate other than the link PR answers. */
@@ -256,6 +257,7 @@ function makeWorld(overrides: Overrides = {}): World {
     enqueueMergeEntry: 0,
     performMergeForgeAction: 0,
     openOrAdopt: 0,
+    enqueued: [],
   };
   const landing = makeLanding();
   // One shared call counter for both the world's and the fake's assertions.
@@ -423,12 +425,14 @@ function makeWorld(overrides: Overrides = {}): World {
     } as unknown as LandChainDependencies['attempts'],
     mergeQueue: {
       listMergeEntries: async () => queueEntries as never,
-      enqueueMergeEntry: async () => {
+      enqueueMergeEntry: async (command: { tier: number; entryId: string; successorEntryId: string }) => {
         calls.enqueueMergeEntry += 1;
+        calls.enqueued.push({ tier: command.tier, entryId: command.entryId, successorEntryId: command.successorEntryId });
         if (overrides.enqueueDecision?.outcome === 'refused') {
           return { outcome: 'refused', reason: 'no' } as never;
         }
-        return { outcome: 'created', entries: [], record: {} } as never;
+        const outcome = overrides.enqueueDecision?.outcome ?? 'created';
+        return { outcome, entries: [], record: { entryId: overrides.enqueueDecision?.recordEntryId ?? command.entryId } } as never;
       },
     } as unknown as LandChainDependencies['mergeQueue'],
     landing: landing as ChainLandingPort, // the fake adds test-only maps
@@ -614,6 +618,45 @@ describe('LandChainUseCase read phase', () => {
     expect(world.calls.enqueueMergeEntry).toBe(0);
   });
 
+  it('an attempt lookup that throws is store-unavailable, not link-unsettled', async () => {
+    const world = makeWorld();
+    const deps: LandChainDependencies = {
+      ...world.deps,
+      attempts: {
+        findAttemptById: async () => {
+          throw new Error('attempt store down');
+        },
+      } as unknown as LandChainDependencies['attempts'],
+    };
+    const result = await new LandChainUseCase(deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'unknown', reason: 'store-unavailable' });
+  });
+
+  it('an attempt lookup is not made once the deadline has passed', async () => {
+    let spent = false;
+    let lookups = 0;
+    const world = makeWorld({ clock: () => (spent ? '2026-11-16T14:00:00.000Z' : NOW) });
+    const deps: LandChainDependencies = {
+      ...world.deps,
+      mergeQueue: {
+        ...world.deps.mergeQueue,
+        listMergeEntries: async () => {
+          spent = true;
+          return [{ pullRequest: LINK_PR, state: 'merged' }] as never;
+        },
+      },
+      attempts: {
+        findAttemptById: async () => {
+          lookups += 1;
+          return attemptRecord() as never;
+        },
+      } as unknown as LandChainDependencies['attempts'],
+    };
+    const result = await new LandChainUseCase(deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'unknown', reason: 'budget-exhausted' });
+    expect(lookups).toBe(0);
+  });
+
   it('a chain with no links is no-links', async () => {
     const { result } = await run({}, { laneRuns: [laneRun({ baseBranch: 'main' })] });
     expect(result).toEqual({ outcome: 'refused', reason: 'no-links' });
@@ -759,6 +802,74 @@ describe('LandChainUseCase apply', () => {
     expect(mark?.mark).toMatchObject({ headSha: TIP, state: 'landing', pullRequestNumber: 77 });
   });
 
+  it('a supersede or duplicate enqueue reports the entry id of the queue record, not the minted one', async () => {
+    for (const outcome of ['supersedes', 'duplicate']) {
+      const recordEntryId = `0RECORD${outcome.toUpperCase()}`.padEnd(26, 'X');
+      const { result, world } = await run({}, { enqueueDecision: { outcome, recordEntryId } });
+      expect(result).toMatchObject({ outcome: 'landed', entryId: recordEntryId });
+      expect(world.calls.enqueued[0].entryId).not.toBe(recordEntryId);
+    }
+  });
+
+  it('a tier-2 link that appears after the landing mark is enqueued as tier 2', async () => {
+    const world = makeWorld();
+    let listed = 0;
+    const second = laneRun({ runId: 'run-2', prNumber: 22, attemptIds: ['att-2'], tier: 2 });
+    const attempts = new Map([[ATTEMPT_ID, attemptRecord()], ['att-2', attemptRecord({ id: 'att-2' })]]);
+    const baseRead = world.deps.forgeRead.readPullRequest.bind(world.deps.forgeRead);
+    const deps: LandChainDependencies = {
+      ...world.deps,
+      laneRuns: { list: async () => (++listed <= 1 ? [laneRun()] : [laneRun(), second]) as never },
+      attempts: { findAttemptById: async (id: string) => (attempts.get(id) ?? null) as never } as unknown as LandChainDependencies['attempts'],
+      mergeQueue: {
+        ...world.deps.mergeQueue,
+        listMergeEntries: async () => [{ pullRequest: LINK_PR, state: 'merged' }, { pullRequest: 22, state: 'merged' }] as never,
+      },
+      forgeRead: {
+        async readPullRequest(request: { readonly ref: { readonly kind: string; readonly number: number } }) {
+          if (request.ref.number === 22) {
+            return { outcome: 'found', pullRequest: pullRequestSnapshot({ number: 22, state: 'merged', headRef: 'feat/run-2', baseRef: BRANCH }) };
+          }
+          return baseRead(request as never);
+        },
+      } as unknown as LandChainDependencies['forgeRead'],
+    };
+    const result = await new LandChainUseCase(deps).execute({ ...BASE_COMMAND });
+    expect(result).toMatchObject({ outcome: 'landed' });
+    expect(world.calls.enqueued).toHaveLength(1);
+    expect(world.calls.enqueued[0].tier).toBe(2);
+  });
+
+  it('a tier-2 link that appears after the landing mark without a chain receipt is receipt-missing and withdraws the mark', async () => {
+    const world = makeWorld();
+    let listed = 0;
+    const second = laneRun({ runId: 'run-2', prNumber: 22, attemptIds: ['att-2'], tier: 2 });
+    const attempts = new Map([[ATTEMPT_ID, attemptRecord()], ['att-2', attemptRecord({ id: 'att-2' })]]);
+    const baseRead = world.deps.forgeRead.readPullRequest.bind(world.deps.forgeRead);
+    const deps: LandChainDependencies = {
+      ...world.deps,
+      laneRuns: { list: async () => (++listed <= 1 ? [laneRun()] : [laneRun(), second]) as never },
+      attempts: { findAttemptById: async (id: string) => (attempts.get(id) ?? null) as never } as unknown as LandChainDependencies['attempts'],
+      mergeQueue: {
+        ...world.deps.mergeQueue,
+        listMergeEntries: async () => [{ pullRequest: LINK_PR, state: 'merged' }, { pullRequest: 22, state: 'merged' }] as never,
+      },
+      reviews: { findReviewReceipt: async () => ({ outcome: 'not-found' }) } as unknown as LandChainDependencies['reviews'],
+      forgeRead: {
+        async readPullRequest(request: { readonly ref: { readonly kind: string; readonly number: number } }) {
+          if (request.ref.number === 22) {
+            return { outcome: 'found', pullRequest: pullRequestSnapshot({ number: 22, state: 'merged', headRef: 'feat/run-2', baseRef: BRANCH }) };
+          }
+          return baseRead(request as never);
+        },
+      } as unknown as LandChainDependencies['forgeRead'],
+    };
+    const result = await new LandChainUseCase(deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'receipt-missing' });
+    expect(world.calls.enqueueMergeEntry).toBe(0);
+    expect(world.landing.marks.get(`${OWNER}/${REPO}#${CHAIN}`)?.mark.state).toBe('withdrawn');
+  });
+
   it('a refused premerge post does not enqueue', async () => {
     const { result, world } = await run({}, { postStatusOutcome: { outcome: 'refused' } });
     expect(result).toEqual({ outcome: 'refused', reason: 'forge-refused' });
@@ -847,6 +958,9 @@ describe('LandChainUseCase apply', () => {
     world.landing.marks.set(`${OWNER}/${REPO}#${CHAIN}`, { revision: 2, mark: { headSha: TIP, pullRequestNumber: 77, key, state: 'landing' } });
     const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
     expect(result).toMatchObject({ outcome: 'landed', pullRequestNumber: 77, headSha: TIP, entryId: '0BBBBBBBBBBBBBBBBBBBBBBBB' });
+    if (result.outcome === 'landed') {
+      expect(result.body.split('\n')).toEqual([`Chain: ${CHAIN}`, `Head: ${TIP}`, `pr ${LINK_PR} attempt ${ATTEMPT_ID} pre-merge pass`]);
+    }
     expect(world.landing.calls.openOrAdopt).toBe(0);
     expect(world.calls.enqueueMergeEntry).toBe(0);
   });

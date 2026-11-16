@@ -22,6 +22,8 @@ import {
   assessmentIdForAttempt,
   type EvidenceAssessmentRecord,
   type InspectAcceptanceEvidencePort,
+  isAttemptReceiptSubject,
+  isReceiptAboutAssessment,
   type ReviewFindingRecord,
   type ReviewReceiptRecord,
   type VerificationReceiptRecord,
@@ -70,15 +72,21 @@ function projectVerification(receipt: VerificationReceiptRecord): VerificationRe
   };
 }
 
-function projectReview(receipt: ReviewReceiptRecord): ReviewReceiptProjection | null {
+/**
+ * A receipt about another subject (another attempt or project, a chain, a
+ * brief, or an unreadable subject) keeps its place and kind but projects the
+ * result `unknown`: it is never this attempt's pass or fail.
+ */
+function projectReview(receipt: ReviewReceiptRecord, assessment: EvidenceAssessmentRecord): ReviewReceiptProjection | null {
   const receiptId = telemetryHashInput(receipt.id);
   if (receiptId === null) {
     return null;
   }
+  const aboutAttempt = isAttemptReceiptSubject(receipt) && isReceiptAboutAssessment(receipt, assessment);
   return {
     receiptId,
     kind: isKnownReviewKind(receipt.kind) ? receipt.kind : 'code-review',
-    result: isKnownReceiptResult(receipt.result) ? receipt.result : 'unknown',
+    result: aboutAttempt && isKnownReceiptResult(receipt.result) ? receipt.result : 'unknown',
     findings: countFindings(receipt.findings),
     completedAtIso: receipt.completedAtIso,
   };
@@ -125,7 +133,7 @@ export class AcceptanceReceiptReadAdapter implements AcceptanceReceiptReadPort {
       return {
         outcome: 'found',
         verification: collectProjections(assessment.verificationReceipts, projectVerification),
-        review: collectProjections(assessment.reviewReceipts, projectReview),
+        review: collectProjections(assessment.reviewReceipts, (receipt) => projectReview(receipt, assessment)),
       };
     } catch {
       return { outcome: 'unavailable', reason: 'evidence-unreadable' };

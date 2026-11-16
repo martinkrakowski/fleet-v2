@@ -30,6 +30,8 @@ import {
   assessmentIdForAttempt,
   assessmentIdForChain,
   attemptIdForChain,
+  isAttemptReceiptSubject,
+  isReceiptAboutAssessment,
   receiptSubjectOf,
 } from '@fleet/evidence-and-acceptance';
 import type {
@@ -196,6 +198,16 @@ function isChainReceiptOf(receipt: ReviewReceiptRecord, chain: ChainSubject): bo
     stored.chainName === chain.chainName &&
     stored.integrationHeadSha === chain.integrationHeadSha
   );
+}
+
+/**
+ * True when a stored receipt is about the attempt `owner` names: it is an
+ * attempt receipt (no subject, or a subject of the `attempt` kind) and its own
+ * ids and its subject both name the owner's project and attempt. Own data
+ * properties only (no getter runs), never throws; anything unreadable is false.
+ */
+function isAttemptReceiptAbout(receipt: unknown, owner: unknown): boolean {
+  return isAttemptReceiptSubject(receipt) && isReceiptAboutAssessment(receipt, owner);
 }
 
 /** The fixed out-of-scope reason (KF-33b2): never reviewer text. */
@@ -756,7 +768,15 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         receipt.requestId === request.requestId &&
         receipt.kind === kind &&
         receipt.attemptId === request.attemptId &&
-        receipt.candidateHeadSha === request.candidateHeadSha,
+        receipt.candidateHeadSha === request.candidateHeadSha &&
+        // A brief-check receipt is about the brief, never an attempt subject;
+        // the subject binding applies to the attempt review kinds only.
+        (kind === 'brief-check' ||
+          isAttemptReceiptAbout(receipt, {
+            id: assessmentIdForAttempt(request.attemptId),
+            projectId: request.projectId,
+            attemptId: request.attemptId,
+          })),
       kind,
       false,
     );
@@ -788,7 +808,10 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       matches.length > 1 ||
       only.candidateHeadSha !== request.candidateHeadSha ||
       only.attemptId !== request.attemptId ||
-      only.kind === undefined
+      only.kind === undefined ||
+      // A brief-check receipt is about the brief, never an attempt subject;
+      // the subject binding applies to the attempt review kinds only.
+      (only.kind !== 'brief-check' && !isAttemptReceiptAbout(only, read.assessment))
     ) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
@@ -882,6 +905,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       if (completedAtMs(candidate) >= completedAtMs(latest)) {
         latest = candidate;
       }
+    }
+    // A latest receipt about another subject is never this attempt's verdict
+    // and never yields to an earlier one: the answer is unknown, not a pass.
+    if (!isAttemptReceiptAbout(latest, read.assessment)) {
+      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
     const finalSummary = receiptOfKindSummaryOf(latest, latest.kind, latest.requestId ?? null);
     return finalSummary === null

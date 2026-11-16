@@ -47,13 +47,15 @@ export function describeDeployResult(result: DeployResult): DeployResultDescript
       return { exitCode: 1, message: UNKNOWN_MESSAGE };
     }
     const outcome = result.outcome;
+    // Both fields are read before any success is decided: a throwing
+    // `reason` getter must yield the unknown result, not exit code 0.
+    const reason: unknown = (result as { readonly reason?: unknown }).reason;
     if (outcome === 'deployed') {
       return {
         exitCode: 0,
         message: 'deployed: the installed build matches the staged build',
       };
     }
-    const reason = result.reason;
     if (outcome === 'refused') {
       if (
         typeof reason === 'string' &&

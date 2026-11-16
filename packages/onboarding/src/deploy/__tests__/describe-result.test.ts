@@ -23,6 +23,17 @@ describe('describeDeployResult', () => {
     });
   });
 
+  it('returns the unknown message for a deployed result with a throwing reason getter', () => {
+    const result = {
+      outcome: 'deployed',
+      commit: 'a'.repeat(40),
+      get reason(): string {
+        throw new Error('no reason');
+      },
+    } as unknown as DeployResult;
+    expect(describeDeployResult(result)).toEqual(UNKNOWN);
+  });
+
   it('describes a refused result with a known reason', () => {
     const result = {
       outcome: 'refused',

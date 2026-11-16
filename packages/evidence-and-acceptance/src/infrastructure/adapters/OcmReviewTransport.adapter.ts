@@ -797,6 +797,18 @@ export const BRIEF_VERIFY_CHECKLIST: string = [
   '(f) each finding names a concrete defect of the brief, and its "file" is the repository file the brief cites wrongly or would change.',
 ].join('\n');
 
+/**
+ * Known false positives every conductor review prompt (a request with `kind`)
+ * carries (RVP1). Trusted, constant text: never interpolated from a request,
+ * never placed inside an untrusted block. The CLI and api transports import
+ * this one constant, so the three transports cannot drift.
+ */
+export const REVIEW_KNOWN_FALSE_POSITIVES: string = [
+  'Known false positive (a fixed reviewer rule, not part of the change under review):',
+  'In JavaScript, `$` without the `m` flag matches only at the very end of the input. It does not match before a final newline: /^a$/.test("a\\n") is false. (Python and PCRE differ; with the `m` flag `$` does match before a newline.)',
+  'So never report that an anchored JavaScript regular expression without the `m` flag accepts a trailing newline. Report a finding about what a regular expression accepts or rejects only if you can state the exact input string and the flags that prove it.',
+].join('\n');
+
 /** The fixed reason a kind with no prompt plan is refused; it never carries the kind value. */
 export const UNSUPPORTED_REVIEW_KIND_REASON = 'unsupported review kind';
 
@@ -955,6 +967,7 @@ function buildKindReviewPrompt(
     `Independent read-only ${request.kind} review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`,
     'This review session is strictly read-only. Do not edit, create, delete, or modify any files.',
     UNTRUSTED_INPUT_RULE,
+    REVIEW_KNOWN_FALSE_POSITIVES,
   ];
 
   if (typeof request.diffSummary === 'string' && request.diffSummary.trim() !== '') {

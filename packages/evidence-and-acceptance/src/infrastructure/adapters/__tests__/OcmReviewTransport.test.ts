@@ -4,10 +4,15 @@ import { describe, expect, it } from 'vitest';
 import type { ReviewFindingRecord } from '../../../domain/evidence-records.js';
 import type { RunIndependentReviewRequest } from '../../../application/ports/out/IndependentReviewPort.out-port.js';
 import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE } from '../../../domain/untrusted-input.js';
+import { REVIEW_KINDS } from '../../../domain/evidence-records.js';
 import { MAX_STRUCTURED_FINDINGS } from '../../../domain/review-answer-schema.js';
 import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js';
 import {
   ALLOWED_PART_TYPES,
+  BRIEF_CHECK_QUESTION,
+  BRIEF_VERIFY_BASE_UNKNOWN_REASON,
+  BRIEF_VERIFY_CHECKLIST,
+  BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON,
   buildReviewerEnv,
   buildReviewPrompt,
   createOcmReviewTransport,
@@ -16,11 +21,13 @@ import {
   isReadOnlyReviewCommand,
   KIND_PROMPT_DIFF_COMPLETE,
   KIND_PROMPT_TOOLS_ONLY,
+  kindPromptPlanOf,
   MAX_FINDING_LINE_LENGTH,
   MAX_OCM_EMBEDDED_DIFF_BYTES,
   MAX_OCM_PROMPT_BYTES,
   PROMPT_TOO_LARGE_REASON,
   MAX_PARSED_FINDINGS,
+  requireKindPromptPlan,
   type OcmReviewTransportSpawn,
   type OcmReviewTransportSpawnResult,
   MAX_RAW_OUTPUT_LENGTH,
@@ -30,6 +37,7 @@ import {
   REVIEW_CHECKLIST,
   REVIEW_REPLY_CONTRACT,
   ReviewTransportError,
+  UNSUPPORTED_REVIEW_KIND_REASON,
   classifySpawnErrorCode,
 } from '../OcmReviewTransport.adapter.js';
 
@@ -2430,6 +2438,317 @@ describe('OcmReviewTransport', () => {
       const result = await transport(kindRequest);
       expect(result.readOnlyVerified).toBe(false);
       expect(result.result).toBe('pass');
+    });
+  });
+
+  describe('CO18a2: per-kind prompt plans and brief-verify', () => {
+    const nonce = '0123456789abcdef';
+    const BRIEF = '1. Add the port.\n2. Wire it.';
+    const verifyRequest = { ...baseRequest, kind: 'brief-verify' as const, briefText: BRIEF };
+    const PASS_STREAM =
+      '{"type":"step_start","part":{"type":"step-start"}}\n' +
+      '{"type":"tool","part":{"tool":"read"}}\n' +
+      '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
+      '{"type":"step_finish"}';
+
+    const makeCounted = (overrides: { readHead?: () => Promise<string>; baseCommit?: string; readDiff?: () => Promise<string | null> } = {}) => {
+      const prompts: string[] = [];
+      let dirCalls = 0;
+      let headCalls = 0;
+      let diffCalls = 0;
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => {
+          dirCalls += 1;
+          return '/tmp/review-dir';
+        },
+        // Overridden reads still count: the override only replaces the value.
+        readHead: overrides.readHead ?? (async () => {
+          headCalls += 1;
+          return baseRequest.candidateHeadSha;
+        }),
+        spawn: async (_file, args) => {
+          prompts.push(args[args.length - 1]);
+          return { exitCode: 0, stdout: PASS_STREAM, stderr: '' };
+        },
+        // A brief-verify review requires the candidate head to be the brief
+        // base commit, so the default base commit matches the request head;
+        // a test that needs a mismatch overrides it.
+        baseCommit: 'baseCommit' in overrides ? overrides.baseCommit : baseRequest.candidateHeadSha,
+        readDiff:
+          'readDiff' in overrides
+            ? async () => {
+                diffCalls += 1;
+                return overrides.readDiff ? overrides.readDiff() : null;
+              }
+            : async () => {
+                diffCalls += 1;
+                return 'diff --git a/f b/f\n+added line\n';
+              },
+        makeNonce: () => nonce,
+      });
+      return {
+        transport,
+        prompts,
+        get dirCalls() {
+          return dirCalls;
+        },
+        get headCalls() {
+          return headCalls;
+        },
+        get diffCalls() {
+          return diffCalls;
+        },
+      };
+    };
+
+    it('every kind in REVIEW_KINDS has its own plan', () => {
+      expect(REVIEW_KINDS.map((kind) => [kind, kindPromptPlanOf(kind)])).toEqual([
+        ['brief-check', { brief: true, diff: true, headIsBase: false, instructions: BRIEF_CHECK_QUESTION }],
+        ['brief-verify', { brief: true, diff: false, headIsBase: true, instructions: BRIEF_VERIFY_CHECKLIST }],
+        ['code-review', { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST }],
+        ['pre-merge', { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST }],
+      ]);
+    });
+
+    it('anything that is not one of the four kinds has no plan', () => {
+      for (const value of [
+        undefined,
+        null,
+        '',
+        'manual',
+        'Code-Review',
+        'code-review ',
+        'constructor',
+        '__proto__',
+        'toString',
+        42,
+        {},
+        ['code-review'],
+      ] as unknown[]) {
+        expect(kindPromptPlanOf(value)).toBeNull();
+        expect(() => requireKindPromptPlan(value)).toThrow(ReviewTransportError);
+        try {
+          requireKindPromptPlan(value);
+          throw new Error('expected requireKindPromptPlan to throw');
+        } catch (error) {
+          expect(error).toBeInstanceOf(ReviewTransportError);
+          expect((error as ReviewTransportError).message).toBe(UNSUPPORTED_REVIEW_KIND_REASON);
+          expect((error as ReviewTransportError).code).toBe('transport-failed');
+        }
+      }
+    });
+
+    it('a brief-verify prompt is exactly the header, the rules, the wrapped brief, the brief-verify checklist and the tools sentence', () => {
+      const prompt = buildReviewPrompt(verifyRequest, nonce);
+      const expected =
+        `Independent read-only brief-verify review for attempt "${baseRequest.attemptId}" at candidate head "${baseRequest.candidateHeadSha}".\n\n` +
+        `This review session is strictly read-only. Do not edit, create, delete, or modify any files.\n\n` +
+        `${UNTRUSTED_INPUT_RULE}\n\n` +
+        `Diff summary:\n` +
+        `<<<UNTRUSTED nonce=${nonce} label="diff summary">>>\n` +
+        `Added verification checks\n` +
+        `<<<END UNTRUSTED nonce=${nonce}>>>\n\n` +
+        `${BRIEF_INPUT_RULE}\n\nBrief:\n` +
+        `<<<UNTRUSTED nonce=${nonce} label="brief">>>\n` +
+        `${BRIEF}\n` +
+        `<<<END UNTRUSTED nonce=${nonce}>>>\n\n` +
+        `${BRIEF_VERIFY_CHECKLIST}`;
+      expect(prompt).toBe(`${expected}\n\n${KIND_PROMPT_TOOLS_ONLY}\n${REVIEW_REPLY_CONTRACT}`);
+      expect(prompt).not.toContain(REVIEW_CHECKLIST);
+      expect(prompt).not.toContain(BRIEF_CHECK_QUESTION);
+    });
+
+    it('a brief-verify prompt has no diff section even when a diff or diffUnavailable is offered', () => {
+      expect(buildReviewPrompt(verifyRequest, nonce, 'diff --git a/f b/f\n+x\n')).toBe(
+        buildReviewPrompt(verifyRequest, nonce),
+      );
+      expect(buildReviewPrompt(verifyRequest, nonce, null, true)).toBe(buildReviewPrompt(verifyRequest, nonce));
+    });
+
+    it('a brief-check prompt is byte-for-byte unchanged', () => {
+      const prompt = buildReviewPrompt({ ...baseRequest, kind: 'brief-check', briefText: BRIEF }, nonce);
+      const expected =
+        `Independent read-only brief-check review for attempt "${baseRequest.attemptId}" at candidate head "${baseRequest.candidateHeadSha}".\n\n` +
+        `This review session is strictly read-only. Do not edit, create, delete, or modify any files.\n\n` +
+        `${UNTRUSTED_INPUT_RULE}\n\n` +
+        `Diff summary:\n` +
+        `<<<UNTRUSTED nonce=${nonce} label="diff summary">>>\n` +
+        `Added verification checks\n` +
+        `<<<END UNTRUSTED nonce=${nonce}>>>\n\n` +
+        `${BRIEF_INPUT_RULE}\n\nBrief:\n` +
+        `<<<UNTRUSTED nonce=${nonce} label="brief">>>\n` +
+        `${BRIEF}\n` +
+        `<<<END UNTRUSTED nonce=${nonce}>>>\n\n` +
+        'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.';
+      expect(prompt).toBe(`${expected}\n\n${KIND_PROMPT_TOOLS_ONLY}\n${REVIEW_REPLY_CONTRACT}`);
+    });
+
+    it('code-review and pre-merge prompts carry REVIEW_CHECKLIST and neither brief instruction', () => {
+      for (const kind of ['code-review', 'pre-merge'] as const) {
+        const prompt = buildReviewPrompt({ ...baseRequest, kind }, nonce);
+        expect(prompt).toContain(REVIEW_CHECKLIST);
+        expect(prompt).not.toContain(BRIEF_VERIFY_CHECKLIST);
+        expect(prompt).not.toContain(BRIEF_CHECK_QUESTION);
+        expect(prompt).not.toContain('label="brief"');
+      }
+    });
+
+    it('a brief-verify prompt without brief text is refused with the fixed message', () => {
+      for (const briefText of [undefined, '', '   ', 42]) {
+        const request =
+          briefText === undefined
+            ? { ...baseRequest, kind: 'brief-verify' as const }
+            : ({ ...baseRequest, kind: 'brief-verify', briefText } as unknown as RunIndependentReviewRequest);
+        expect(() => buildReviewPrompt(request, nonce)).toThrow(ReviewTransportError);
+        try {
+          buildReviewPrompt(request, nonce);
+          throw new Error('expected buildReviewPrompt to throw');
+        } catch (error) {
+          expect((error as ReviewTransportError).message).toBe('a brief-verify review requires the brief text');
+          expect((error as ReviewTransportError).code).toBe('transport-failed');
+        }
+      }
+    });
+
+    it('buildReviewPrompt refuses an unknown kind instead of using another kind’s prompt', () => {
+      for (const kind of ['security-review', null, 'constructor', 42]) {
+        const request = { ...baseRequest, kind } as unknown as RunIndependentReviewRequest;
+        expect(() => buildReviewPrompt(request, nonce)).toThrow(ReviewTransportError);
+        try {
+          buildReviewPrompt(request, nonce);
+          throw new Error('expected buildReviewPrompt to throw');
+        } catch (error) {
+          expect((error as ReviewTransportError).message).toBe(UNSUPPORTED_REVIEW_KIND_REASON);
+        }
+      }
+    });
+
+    it('a brief-verify review reads no diff and spawns the review with the brief-verify prompt', async () => {
+      const counted = makeCounted();
+      const result = await counted.transport(verifyRequest);
+      expect(counted.diffCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(2);
+      expect(counted.prompts[1]).toBe(buildReviewPrompt(verifyRequest, nonce));
+      expect(result.result).toBe('pass');
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('a brief-verify review with no known base commit is refused before any read or spawn', async () => {
+      const counted = makeCounted({ baseCommit: undefined, readDiff: undefined });
+      await expect(counted.transport(verifyRequest)).rejects.toMatchObject({
+        name: 'ReviewTransportError',
+        code: 'transport-failed',
+        message: BRIEF_VERIFY_BASE_UNKNOWN_REASON,
+      });
+      // The refusal carries no request text.
+      expect(BRIEF_VERIFY_BASE_UNKNOWN_REASON).not.toContain(baseRequest.candidateHeadSha);
+      expect(counted.dirCalls).toBe(0);
+      expect(counted.headCalls).toBe(0);
+      expect(counted.diffCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(0);
+    });
+
+    it('a brief-verify review whose candidate head is not the brief base commit is refused before any read or spawn', async () => {
+      const counted = makeCounted({ baseCommit: 'base-sha-1' });
+      await expect(counted.transport(verifyRequest)).rejects.toMatchObject({
+        name: 'ReviewTransportError',
+        code: 'transport-failed',
+        message: BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON,
+      });
+      // The refusal carries no request text: neither head value is echoed.
+      expect(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON).not.toContain('base-sha-1');
+      expect(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON).not.toContain(baseRequest.candidateHeadSha);
+      expect(counted.dirCalls).toBe(0);
+      expect(counted.headCalls).toBe(0);
+      expect(counted.diffCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(0);
+    });
+
+    it('a brief-verify review at the candidate head that matches the brief base commit still passes', async () => {
+      const counted = makeCounted({});
+      const result = await counted.transport(verifyRequest);
+      expect(result.result).toBe('pass');
+      expect(result.readOnlyVerified).toBe(true);
+      expect(counted.prompts).toHaveLength(2);
+    });
+
+    it('a brief-verify review at the wrong head is refused before any spawn, and a head that moves during it voids read-only', async () => {
+      {
+        const { transport, prompts } = makeCounted({ readHead: async () => 'sha-other' });
+        await expect(transport(verifyRequest)).rejects.toThrow(/head mismatch before review/);
+        expect(prompts).toHaveLength(0);
+      }
+      {
+        let head = 0;
+        const { transport } = makeCounted({
+          readHead: async () => {
+            head += 1;
+            return head === 1 ? baseRequest.candidateHeadSha : 'sha-moved';
+          },
+        });
+        const result = await transport(verifyRequest);
+        expect(result.readOnlyVerified).toBe(false);
+      }
+    });
+
+    it('a brief-verify review without brief text is refused and the review is never spawned', async () => {
+      const { transport, prompts } = makeCounted();
+      await expect(transport({ ...verifyRequest, briefText: '  ' })).rejects.toThrow(
+        'a brief-verify review requires the brief text',
+      );
+      expect(prompts).toHaveLength(1);
+    });
+
+    it('a brief-verify prompt over MAX_OCM_PROMPT_BYTES is refused with prompt-too-large', async () => {
+      const { transport, prompts } = makeCounted();
+      const result = await transport({ ...verifyRequest, briefText: 'b'.repeat(MAX_OCM_PROMPT_BYTES) });
+      expect(result.result).toBe('unknown');
+      expect(result.rawOutput).toBe(PROMPT_TOO_LARGE_REASON);
+      expect(prompts).toHaveLength(1);
+    });
+
+    it('an unknown kind is refused before the review directory, the head, the diff or any spawn', async () => {
+      for (const kind of ['security-review', null, 'constructor']) {
+        const counted = makeCounted();
+        const request = { ...baseRequest, kind } as unknown as RunIndependentReviewRequest;
+        await expect(counted.transport(request)).rejects.toMatchObject({
+          name: 'ReviewTransportError',
+          code: 'transport-failed',
+          message: UNSUPPORTED_REVIEW_KIND_REASON,
+        });
+        expect(counted.dirCalls).toBe(0);
+        expect(counted.headCalls).toBe(0);
+        expect(counted.diffCalls).toBe(0);
+        expect(counted.prompts).toHaveLength(0);
+      }
+    });
+
+    it('a request whose kind getter throws is rejected and nothing is spawned', async () => {
+      const counted = makeCounted();
+      const request = Object.defineProperty({ ...baseRequest }, 'kind', {
+        enumerable: true,
+        get() {
+          throw new Error('kind trap');
+        },
+      }) as RunIndependentReviewRequest;
+      await expect(counted.transport(request)).rejects.toThrow('kind trap');
+      expect(counted.dirCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(0);
+    });
+
+    it('code-review and pre-merge still read the diff and refuse an unreadable one', async () => {
+      for (const kind of ['code-review', 'pre-merge'] as const) {
+        const counted = makeCounted({ readDiff: async () => null });
+        const result = await counted.transport({ ...baseRequest, kind });
+        expect(result.result).toBe('unknown');
+        expect(result.rawOutput).toBe('diff-unavailable');
+        expect(counted.diffCalls).toBe(1);
+        expect(counted.prompts).toHaveLength(1);
+      }
     });
   });
 });

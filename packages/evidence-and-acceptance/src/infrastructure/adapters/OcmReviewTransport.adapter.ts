@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
-import type { FindingSeverity, ReviewFindingRecord, ReviewUnknownReason } from '../../domain/evidence-records.js';
+import type { FindingSeverity, ReviewFindingRecord, ReviewKind, ReviewUnknownReason } from '../../domain/evidence-records.js';
 import { isWholeValuePlaceholder } from '../../domain/placeholder-evidence.js';
 import {
   MAX_REVIEW_REPLY_LENGTH,
@@ -215,7 +215,9 @@ export interface OcmReviewTransportOptions {
   readonly makeNonce?: () => string;
   /**
    * The base commit the candidate diff is read against. When set together
-   * with `readDiff`, a kind review prompt embeds the base..head diff.
+   * with `readDiff`, a kind review prompt embeds the base..head diff. A
+   * `headIsBase` kind (brief-verify) additionally requires it: without a
+   * known base commit that review is refused.
    */
   readonly baseCommit?: string;
   /** Read-only diff read through the review location; paired with `baseCommit`. */
@@ -778,6 +780,80 @@ export const REVIEW_CHECKLIST: string = [
   '(g) each finding names a concrete failure scenario.',
 ].join('\n');
 
+/** The question a brief-check review answers. */
+export const BRIEF_CHECK_QUESTION =
+  'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.';
+
+/** The checklist of a pre-dispatch brief verification (CO18): the brief is checked against the code, no change exists yet. */
+export const BRIEF_VERIFY_CHECKLIST: string = [
+  'This is a pre-dispatch verification of the brief itself: no change exists yet, and the candidate head is the base commit the brief was written against.',
+  'Check every item below against the repository at the candidate head and report each item that fails as a finding:',
+  '(a) the contracts, ports and use-case types the brief names match the code at the base commit;',
+  '(b) the keys, request ids, digests and store shapes the brief specifies are deterministic;',
+  '(c) the brief keeps the domain pure and makes every refusal fail closed;',
+  '(d) every file, symbol, line range and gate command the brief cites exists at the base commit as stated;',
+  '(e) the exports and the production composition the brief describes leave no integration gap;',
+  '(f) each finding names a concrete defect of the brief, and its "file" is the repository file the brief cites wrongly or would change.',
+].join('\n');
+
+/** The fixed reason a kind with no prompt plan is refused; it never carries the kind value. */
+export const UNSUPPORTED_REVIEW_KIND_REASON = 'unsupported review kind';
+
+/**
+ * The fixed reason a brief-verify review whose candidate head is not the
+ * brief's base commit is refused; it carries no request text.
+ */
+export const BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON =
+  'a pre-dispatch brief verification requires the candidate head to be the base commit the brief was written against';
+
+/**
+ * The fixed reason a brief-verify review with no known base commit is refused;
+ * it carries no request text. Without a base commit the head/base comparison
+ * cannot run, so the prompt's claim that the candidate head is the brief's
+ * base cannot be verified and the review can never pass.
+ */
+export const BRIEF_VERIFY_BASE_UNKNOWN_REASON =
+  'a pre-dispatch brief verification requires a known base commit';
+
+/** What one review kind's prompt needs: the brief, the base..head diff, and its instruction text. */
+export interface KindPromptPlan {
+  readonly brief: boolean;
+  readonly diff: boolean;
+  /**
+   * Whether the kind's review checks the repository at the candidate head, so
+   * the head must be the base commit the brief was written against; a
+   * different head, or an unknown base commit, is refused before any read or
+   * spawn.
+   */
+  readonly headIsBase: boolean;
+  readonly instructions: string;
+}
+
+// `Record<ReviewKind, ...>`: adding a kind to REVIEW_KINDS fails the build here until it gets its own plan.
+const KIND_PROMPT_PLANS: Readonly<Record<ReviewKind, KindPromptPlan>> = {
+  'brief-check': { brief: true, diff: true, headIsBase: false, instructions: BRIEF_CHECK_QUESTION },
+  'brief-verify': { brief: true, diff: false, headIsBase: true, instructions: BRIEF_VERIFY_CHECKLIST },
+  'code-review': { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST },
+  'pre-merge': { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST },
+};
+
+/** The plan of a kind, or `null` for anything that is not one of the four kinds (own keys only). */
+export function kindPromptPlanOf(kind: unknown): KindPromptPlan | null {
+  if (typeof kind !== 'string' || !Object.hasOwn(KIND_PROMPT_PLANS, kind)) {
+    return null;
+  }
+  return KIND_PROMPT_PLANS[kind as ReviewKind];
+}
+
+/** The plan of a kind, or the typed refusal: an unknown kind never gets another kind's prompt. */
+export function requireKindPromptPlan(kind: unknown): KindPromptPlan {
+  const plan = kindPromptPlanOf(kind);
+  if (plan === null) {
+    throw new ReviewTransportError(UNSUPPORTED_REVIEW_KIND_REASON, 'transport-failed');
+  }
+  return plan;
+}
+
 /** Byte cap for the diff embedded in a kind review prompt. */
 export const MAX_OCM_EMBEDDED_DIFF_BYTES = 120_000;
 
@@ -850,10 +926,22 @@ function buildManualReviewPrompt(request: RunIndependentReviewRequest, nonce: st
   return sections.join('\n\n');
 }
 
+/** The brief block of a kind that carries the brief; a missing or blank brief is refused. */
+function briefInstructions(request: RunIndependentReviewRequest, nonce: string, instructions: string): string {
+  if (typeof request.briefText !== 'string' || request.briefText.trim() === '') {
+    throw new ReviewTransportError(`a ${request.kind} review requires the brief text`, 'transport-failed');
+  }
+  const wrappedBrief = wrapUntrusted({ label: 'brief', text: request.briefText, nonce });
+  return `${BRIEF_INPUT_RULE}\n\nBrief:\n${wrappedBrief}\n\n${instructions}`;
+}
+
 /**
  * The prompt a conductor review (a request with `kind`) receives: the header
- * names the kind, a brief-check carries the frozen brief wrapped as untrusted,
- * and code-review and pre-merge carry the failure-mode checklist.
+ * names the kind, the instructions come from the kind's plan, and a kind with
+ * no plan is refused. `brief-check` and `brief-verify` carry the frozen brief
+ * wrapped as untrusted; `brief-verify` never carries a diff, even when a
+ * caller offers one — the worktree sits at the base commit, so there is no
+ * change to embed.
  */
 function buildKindReviewPrompt(
   request: RunIndependentReviewRequest,
@@ -861,6 +949,7 @@ function buildKindReviewPrompt(
   embeddedDiff?: string | null,
   diffUnavailable?: boolean,
 ): string {
+  const plan = requireKindPromptPlan(request.kind);
   const sections: string[] = [
     `Independent read-only ${request.kind} review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`,
     'This review session is strictly read-only. Do not edit, create, delete, or modify any files.',
@@ -876,38 +965,23 @@ function buildKindReviewPrompt(
     sections.push(`Diff summary:\n${wrappedDiffSummary}`);
   }
 
-  if (request.kind === 'brief-check') {
-    if (typeof request.briefText === 'string' && request.briefText.trim() !== '') {
-      const wrappedBrief = wrapUntrusted({
-        label: 'brief',
-        text: request.briefText,
-        nonce,
-      });
-      sections.push(
-        `${BRIEF_INPUT_RULE}\n\nBrief:\n${wrappedBrief}\n\n` +
-          'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.',
-      );
-    } else {
-      throw new ReviewTransportError('a brief-check review requires the brief text', 'transport-failed');
-    }
-  } else {
-    sections.push(REVIEW_CHECKLIST);
-  }
+  sections.push(plan.brief ? briefInstructions(request, nonce, plan.instructions) : plan.instructions);
+  const offeredDiff = plan.diff ? embeddedDiff : null;
 
   let diffEmbedded = false;
-  if (typeof embeddedDiff === 'string' && embeddedDiff.trim() !== '') {
-    if (Buffer.byteLength(embeddedDiff, 'utf8') > MAX_OCM_EMBEDDED_DIFF_BYTES) {
+  if (typeof offeredDiff === 'string' && offeredDiff.trim() !== '') {
+    if (Buffer.byteLength(offeredDiff, 'utf8') > MAX_OCM_EMBEDDED_DIFF_BYTES) {
       sections.push('The diff was too large to embed; the read-only tools still work against the candidate head.');
     } else {
       const wrappedDiff = wrapUntrusted({
         label: 'diff',
-        text: embeddedDiff,
+        text: offeredDiff,
         nonce,
       });
       sections.push(`Diff:\n${wrappedDiff}`);
       diffEmbedded = true;
     }
-  } else if (diffUnavailable === true) {
+  } else if (plan.diff && diffUnavailable === true) {
     sections.push('The diff was not available; the read-only tools still work against the candidate head.');
   }
 
@@ -1336,6 +1410,25 @@ export function createOcmReviewTransport(
       throw new ReviewTransportError(options.route.reason, options.route.code ?? 'route-unresolved');
     }
 
+    // 0b. A kind with no prompt plan is refused before any read or spawn; a
+    // manual review (no kind) has no plan and keeps the manual prompt.
+    const kindPlan = request.kind === undefined ? undefined : requireKindPromptPlan(request.kind);
+
+    // 0c. A plan whose review checks the repository at the candidate head
+    // (no change exists yet) requires that head to be the base commit the
+    // brief was written against. A different head is refused before any read
+    // or spawn, so a review of a head the brief does not describe can never
+    // pass. Without a known base commit there is nothing to compare against,
+    // so the review is refused too: an unverifiable claim is never a pass.
+    if (kindPlan !== undefined && kindPlan.headIsBase) {
+      if (options.baseCommit === undefined) {
+        throw new ReviewTransportError(BRIEF_VERIFY_BASE_UNKNOWN_REASON, 'transport-failed');
+      }
+      if (request.candidateHeadSha !== options.baseCommit) {
+        throw new ReviewTransportError(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON, 'transport-failed');
+      }
+    }
+
     // 1. Verify reviewer model matches options.model
     if (request.reviewerModel !== options.model) {
       throw new ReviewTransportError(
@@ -1423,10 +1516,11 @@ export function createOcmReviewTransport(
 
     // 5. Build argv and sanitized environment. A kind review embeds the
     // base..head diff read after the pre-review head read, so the reviewer
-    // does not need a shell to see the change.
+    // does not need a shell to see the change. A `brief-verify` review has no
+    // diff: the worktree sits at the base commit, so there is no change to embed.
     const nonce = (options.makeNonce ?? defaultNonce)();
     let embeddedDiff: string | null = null;
-    if (request.kind !== undefined) {
+    if (kindPlan !== undefined && kindPlan.diff) {
       // F68: a kind review with no diff source is refused exactly like an
       // unreadable diff: a review that cannot see the change can still answer
       // PASS, so the transport refuses before the prompt and the spawn.

@@ -423,10 +423,28 @@ describe('parseLaneUsageLogRow', () => {
     expect(parseLaneUsageLogRow({ ...row, worktreeName: 'a'.repeat(100_000) })).toBeNull();
   });
 
-  it('returns null without invoking or propagating a throwing getter', () => {
+  const ROW_KEYS = ['schemaVersion', 'attemptId', 'workOrderId', 'runId', 'worktreeName', 'kind', 'fixNumber', 'outcome', 'stopReason', 'runnerKind', 'billing', 'seatRole', 'model', 'agent', 'source', 'steps', 'wallSeconds', 'runnerMinutes', 'tokensInput', 'tokensOutput', 'tokensReasoning', 'tokensCacheRead', 'tokensCacheWrite', 'costUsd', 'costBasis', 'recordedAtIso', 'reason'];
+
+  it('returns null without invoking any accessor when every row key is a throwing getter', () => {
     let calls = 0;
     const hostile: Record<string, unknown> = {};
-    for (const key of ['schemaVersion', 'attemptId', 'workOrderId', 'runId', 'worktreeName', 'kind', 'fixNumber', 'outcome', 'stopReason', 'runnerKind', 'billing', 'seatRole', 'model', 'agent', 'source', 'steps', 'wallSeconds', 'runnerMinutes', 'tokensInput', 'tokensOutput', 'tokensReasoning', 'tokensCacheRead', 'tokensCacheWrite', 'costUsd', 'costBasis', 'recordedAtIso', 'reason']) {
+    for (const key of ROW_KEYS) {
+      Object.defineProperty(hostile, key, {
+        enumerable: true,
+        get() {
+          calls += 1;
+          throw new Error('getter boom');
+        },
+      });
+    }
+    expect(parseLaneUsageLogRow(hostile)).toBeNull();
+    expect(calls).toBe(0);
+  });
+
+  it('returns null without invoking any accessor when every row key is a getter returning undefined', () => {
+    let calls = 0;
+    const hostile: Record<string, unknown> = {};
+    for (const key of ROW_KEYS) {
       Object.defineProperty(hostile, key, {
         enumerable: true,
         get() {

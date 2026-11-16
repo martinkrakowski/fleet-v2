@@ -221,18 +221,26 @@ function succeeded(
   return result.error === undefined && result.exitCode === 0;
 }
 
-/** A full 40-character hex git commit id. */
-const FULL_SHA = /^[0-9a-f]{40}$/;
-
-/** The first non-empty, valid full-hex line of `git rev-parse` output. */
+/**
+ * The commit from `git rev-parse` stdout: the whole output must be exactly one
+ * 40-character lowercase hex id and at most one trailing newline.
+ */
 function revParseCommit(stdout: string): string | undefined {
-  for (const entry of stdout.split(/\r?\n/)) {
-    const line = entry.trim();
-    if (FULL_SHA.test(line)) {
-      return line.toLowerCase();
-    }
+  const match = /^([0-9a-f]{40})\n?$/.exec(stdout);
+  return match === null ? undefined : match[1];
+}
+
+/**
+ * The count from `git rev-list --count` stdout: the whole output must be one
+ * non-negative safe integer and at most one trailing newline.
+ */
+function revListCount(stdout: string): number | undefined {
+  const match = /^(\d+)\n?$/.exec(stdout);
+  if (match === null) {
+    return undefined;
   }
-  return undefined;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) ? value : undefined;
 }
 
 /**
@@ -276,10 +284,7 @@ async function readPinnedBuildWithGit(
         { cwd: repoRoot, timeoutMs },
       );
       if (succeeded(count)) {
-        const parsed = count.stdout.trim();
-        if (/^\d+$/.test(parsed)) {
-          behindCount = Number.parseInt(parsed, 10);
-        }
+        behindCount = revListCount(count.stdout);
       }
     }
   }

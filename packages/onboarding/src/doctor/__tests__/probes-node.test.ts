@@ -855,6 +855,66 @@ describe('createNodeDoctorProbes pinned-build (DB1)', () => {
     expect(result.baseTipCommit).toBe(TIP);
   });
 
+  it('accepts only one well-formed sha line from git rev-parse', async () => {
+    const bad = [
+      `not-a-sha\n${HEAD}\n`,
+      `${HEAD}\nnot-a-sha\n`,
+      `${HEAD}\n${HEAD}\n`,
+      `\n${HEAD}\n`,
+      `${HEAD}\r\n`,
+      `${HEAD}\n\n`,
+      ` ${HEAD}\n`,
+      `${'A'.repeat(40)}\n`,
+      `${'a'.repeat(39)}\n`,
+      `${'a'.repeat(41)}\n`,
+      '',
+    ];
+    for (const stdout of bad) {
+      const executor: DoctorCommandExecutor = {
+        async run(argv) {
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: argv[2] === 'HEAD' ? stdout : `${TIP}\n`,
+            stderr: '',
+          };
+        },
+      };
+      const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+      const result = (await probes.pinnedBuild!())!;
+      expect(result.pinnedCommit, JSON.stringify(stdout)).toBeUndefined();
+    }
+    for (const stdout of [HEAD, `${HEAD}\n`]) {
+      const executor: DoctorCommandExecutor = {
+        async run(argv) {
+          return { exitCode: 0, signal: null, stdout: argv[2] === 'HEAD' ? stdout : `${TIP}\n`, stderr: '' };
+        },
+      };
+      const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+      expect((await probes.pinnedBuild!())!.pinnedCommit).toBe(HEAD);
+    }
+  });
+
+  it('accepts only one well-formed integer from git rev-list --count', async () => {
+    const run = async (countOut: string) => {
+      const executor: DoctorCommandExecutor = {
+        async run(argv) {
+          if (argv[1] === 'rev-list') {
+            return { exitCode: 0, signal: null, stdout: countOut, stderr: '' };
+          }
+          return { exitCode: 0, signal: null, stdout: argv[2] === 'HEAD' ? `${HEAD}\n` : `${TIP}\n`, stderr: '' };
+        },
+      };
+      const probes = createNodeDoctorProbes({ localExecutor: executor, repoRoot: '/repo' });
+      return (await probes.pinnedBuild!())!.behindCount;
+    };
+    for (const bad of ['3\n4\n', 'x\n3\n', '\n3\n', '3\r\n', '3\n\n', ' 3\n', '', '99999999999999999999\n']) {
+      expect(await run(bad), JSON.stringify(bad)).toBeUndefined();
+    }
+    expect(await run('7\n')).toBe(7);
+    expect(await run('7')).toBe(7);
+  });
+
   it('returns undefined behindCount when git rev-list fails or outputs non-integer', async () => {
     for (const answer of [
       { exitCode: 1, signal: null, stdout: '', stderr: 'boom' },

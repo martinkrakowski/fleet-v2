@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import type { ReviewReceiptRecord } from '../evidence-records.js';
-import { REVIEW_KINDS } from '../evidence-records.js';
+import type { ReceiptSubject, ReviewReceiptRecord } from '../evidence-records.js';
+import { REVIEW_KINDS, assessmentIdForBrief, attemptIdForBrief } from '../evidence-records.js';
+import { ReviewReceipt } from '../entities/ReviewReceipt.js';
 import {
   decideReviewReceiptOutcome,
+  isAttemptReceiptSubject,
   isFullyDispositioned,
   latestReceiptPerReviewer,
   reviewKindOf,
@@ -515,5 +517,190 @@ describe('decideReviewReceiptOutcome diff-facts gate (U4a / D3)', () => {
         decideReviewReceiptOutcome(receipt({ result: 'fail', findings: [blocking] }), undefined, undefined, facts as unknown as ReviewDiffFacts),
       ).toEqual({ outcome: 'fail' });
     }
+  });
+});
+
+describe('isAttemptReceiptSubject', () => {
+  const DIGEST = 'd'.repeat(64);
+  const BASE = 'a'.repeat(40);
+
+  function briefSubject(): ReceiptSubject {
+    return {
+      kind: 'brief', projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null,
+      briefPackageDigest: DIGEST, baseCommit: BASE,
+    };
+  }
+
+  function chainSubject(): ReceiptSubject {
+    return {
+      kind: 'chain', projectId: 'proj-1', attemptId: null, chainName: 'main', integrationHeadSha: BASE,
+      briefPackageDigest: null, baseCommit: null,
+    };
+  }
+
+  it('returns false for null, undefined, primitives and arrays', () => {
+    for (const value of [null, undefined, 42, 'receipt', true, Symbol.iterator, [], [receipt()]]) {
+      expect(isAttemptReceiptSubject(value)).toBe(false);
+    }
+  });
+
+  it('returns false when a getter on subject or attemptId throws or is an accessor', () => {
+    for (const key of ['subject', 'attemptId']) {
+      const throwing = receipt();
+      Object.defineProperty(throwing, key, { get() { throw new Error('boom'); }, enumerable: true });
+      expect(isAttemptReceiptSubject(throwing)).toBe(false);
+      const accessorOnly: Record<string, unknown> = { ...receipt() };
+      Object.defineProperty(accessorOnly, key, { get: () => undefined, enumerable: true });
+      expect(isAttemptReceiptSubject(accessorOnly)).toBe(false);
+    }
+  });
+
+  it('returns false for a Proxy that throws on getOwnPropertyDescriptor, without throwing itself', () => {
+    const hostile = new Proxy(receipt(), {
+      getOwnPropertyDescriptor(): never {
+        throw new Error('boom');
+      },
+    });
+    expect(isAttemptReceiptSubject(hostile)).toBe(false);
+  });
+
+  it('ignores prototype-polluting keys: a JSON-parsed __proto__ with no own subject is a legacy attempt receipt, and one with a non-attempt subject is not', () => {
+    expect(isAttemptReceiptSubject(JSON.parse('{"attemptId":"att-1","__proto__":{"kind":"chain"}}'))).toBe(true);
+    expect(
+      isAttemptReceiptSubject(JSON.parse('{"attemptId":"att-1","__proto__":{"kind":"chain"},"subject":{"kind":"chain","projectId":"proj-1","attemptId":null,"chainName":"main","integrationHeadSha":"' + 'a'.repeat(40) + '","briefPackageDigest":null,"baseCommit":null}}')),
+    ).toBe(false);
+  });
+
+  it('returns false for a chain: or brief: attemptId, even without a subject', () => {
+    expect(isAttemptReceiptSubject(receipt({ attemptId: 'chain:proj-1:main' }))).toBe(false);
+    expect(isAttemptReceiptSubject(receipt({ attemptId: attemptIdForBrief('proj-1', DIGEST) }))).toBe(false);
+  });
+
+  it('returns false for brief and chain subjects, true for an explicit attempt subject', () => {
+    expect(isAttemptReceiptSubject(receipt({ subject: briefSubject() }))).toBe(false);
+    expect(isAttemptReceiptSubject(receipt({ subject: chainSubject() }))).toBe(false);
+    expect(
+      isAttemptReceiptSubject(
+        receipt({
+          subject: { kind: 'attempt', projectId: 'proj-1', attemptId: 'att-1', chainName: null, integrationHeadSha: null, briefPackageDigest: null, baseCommit: null },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('returns true for a legacy receipt without a subject and for a hostile object with prototype-polluting own keys and an attempt subject', () => {
+    expect(isAttemptReceiptSubject(receipt())).toBe(true);
+    expect(isAttemptReceiptSubject({ attemptId: 'att-1', __proto__: null })).toBe(true);
+  });
+});
+
+describe('attempt isolation of the review pass gates', () => {
+  const DIGEST = 'd'.repeat(64);
+  const BASE = 'a'.repeat(40);
+  const finding = {
+    findingId: 'rr-1:f-1',
+    severity: 'major' as const,
+    summary: 's',
+    filePath: 'src/a.ts',
+    line: 1,
+    state: 'out-of-scope' as const,
+    dispositionReason: 'not in scope',
+    dispositionEvidenceRef: 'ref-d',
+  };
+
+  function briefSubject(): ReceiptSubject {
+    return {
+      kind: 'brief', projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null,
+      briefPackageDigest: DIGEST, baseCommit: BASE,
+    };
+  }
+
+  it('a passing brief-verify receipt never satisfies either gate', () => {
+    const briefVerify = receipt({ kind: 'brief-verify', result: 'pass', attemptId: attemptIdForBrief('proj-1', DIGEST), subject: briefSubject() });
+    expect(satisfiesReviewPassGate(briefVerify)).toBe(false);
+    expect(satisfiesFullyDispositionedReviewPassGate(briefVerify, new Set(), new Set())).toBe(false);
+  });
+
+  it('a passing chain receipt never satisfies either gate', () => {
+    const chain = receipt({
+      kind: 'code-review',
+      result: 'pass',
+      attemptId: 'chain:proj-1:main',
+      subject: { kind: 'chain', projectId: 'proj-1', attemptId: null, chainName: 'main', integrationHeadSha: BASE, briefPackageDigest: null, baseCommit: null },
+    });
+    expect(satisfiesReviewPassGate(chain)).toBe(false);
+    expect(satisfiesFullyDispositionedReviewPassGate(chain, new Set(), new Set())).toBe(false);
+  });
+
+  it('a code-review carrying a brief subject never satisfies either gate, even fully dispositioned', () => {
+    const briefSubjectReceipt = receipt({ kind: 'code-review', result: 'fail', findings: [finding], subject: briefSubject() });
+    expect(satisfiesReviewPassGate(briefSubjectReceipt)).toBe(false);
+    expect(
+      satisfiesFullyDispositionedReviewPassGate(briefSubjectReceipt, new Set([finding.findingId]), new Set()),
+    ).toBe(false);
+  });
+
+  it('a code-review with a subject that is not an attempt is never a pass, keeping the legacy attempt receipt passing', () => {
+    expect(satisfiesReviewPassGate(receipt({ result: 'pass' }))).toBe(true);
+    expect(satisfiesReviewPassGate(receipt({ result: 'pass', subject: briefSubject() }))).toBe(false);
+  });
+});
+
+describe('ReviewReceipt brief-verify invariants', () => {
+  const DIGEST = 'd'.repeat(64);
+  const BASE = 'a'.repeat(40);
+
+  function briefVerifyProps(overrides: Partial<Parameters<typeof ReviewReceipt.create>[0]> = {}) {
+    return {
+      id: 'rr-1',
+      assessmentId: assessmentIdForBrief('proj-1', DIGEST),
+      projectId: 'proj-1',
+      attemptId: attemptIdForBrief('proj-1', DIGEST),
+      candidateHeadSha: BASE,
+      reviewerModel: 'seat-a/reviewer',
+      implementerModel: 'seat-b/implementer',
+      readOnlyVerified: true,
+      result: 'pass' as const,
+      findings: [],
+      evidenceRef: 'ref-1',
+      policyRevision: 'pol-1',
+      completedAtIso: '2026-10-15T12:00:00.000Z',
+      kind: 'brief-verify' as const,
+      subject: {
+        kind: 'brief' as const, projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null,
+        briefPackageDigest: DIGEST, baseCommit: BASE,
+      },
+      ...overrides,
+    };
+  }
+
+  it('accepts a valid brief-verify receipt carrying a brief subject', () => {
+    const created = ReviewReceipt.create(briefVerifyProps());
+    expect(created.success).toBe(true);
+  });
+
+  type BriefVerifyOverrides = Partial<Parameters<typeof ReviewReceipt.create>[0]>;
+  const refusals: readonly [string, BriefVerifyOverrides, string][] = [
+    ['brief-verify without a brief subject', { subject: undefined }, 'requires a brief subject'],
+    ['a brief subject under a wrong kind', { kind: 'code-review' }, 'requires the brief-verify kind'],
+    ['an invalid projectId in the brief subject', { subject: { kind: 'brief', projectId: 'proj/1', attemptId: null, chainName: null, integrationHeadSha: null, briefPackageDigest: 'd'.repeat(64), baseCommit: 'a'.repeat(40) } }, 'invalid projectId'],
+    ['an invalid briefPackageDigest in the brief subject', { subject: { kind: 'brief', projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null, briefPackageDigest: 'd'.repeat(63), baseCommit: 'a'.repeat(40) } }, 'invalid briefPackageDigest'],
+    ['an invalid baseCommit in the brief subject', { subject: { kind: 'brief', projectId: 'proj-1', attemptId: null, chainName: null, integrationHeadSha: null, briefPackageDigest: 'd'.repeat(64), baseCommit: 'zzz' } }, 'invalid baseCommit'],
+    ['a projectId that disagrees with the subject', { projectId: 'proj-2' }, 'projectId that disagrees'],
+    ['a candidateHeadSha that disagrees with the subject baseCommit', { candidateHeadSha: 'b'.repeat(40) }, 'candidateHeadSha that disagrees'],
+    ['an attemptId that is not the brief attempt id', { attemptId: 'att-1' }, 'attemptId that is not the brief attempt id'],
+    ['an assessmentId that is not the brief assessment id', { assessmentId: 'asm-1' }, 'assessmentId that is not the brief assessment id'],
+  ];
+  it.each(refusals)('refuses %s with a fixed error, never a throw', (_title, overrides, messagePart) => {
+    const created = ReviewReceipt.create(briefVerifyProps(overrides));
+    expect(created.success).toBe(false);
+    expect(created.error).toBeInstanceOf(Error);
+    expect(created.error?.message).toContain(messagePart);
+  });
+
+  it('a brief-verify attemptId mirrors attemptIdForBrief and its assessment mirrors assessmentIdForBrief', () => {
+    expect(attemptIdForBrief('proj-1', DIGEST)).toBe(`brief:proj-1:${DIGEST}`);
+    expect(assessmentIdForBrief('proj-1', DIGEST)).toBe(assessmentIdForBrief('proj-1', DIGEST));
+    expect(assessmentIdForBrief('proj-1', DIGEST)).not.toBe(attemptIdForBrief('proj-1', DIGEST));
   });
 });

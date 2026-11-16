@@ -38,7 +38,7 @@ export interface VerificationReceiptRecord {
 export type FindingSeverity = 'blocker' | 'major' | 'minor' | 'nit';
 
 /** The review kinds of the conductor plan §3.3; a receipt without one reads as `code-review` (§3.4). */
-export const REVIEW_KINDS = ['brief-check', 'code-review', 'pre-merge'] as const;
+export const REVIEW_KINDS = ['brief-check', 'brief-verify', 'code-review', 'pre-merge'] as const;
 export type ReviewKind = (typeof REVIEW_KINDS)[number];
 
 /**
@@ -185,6 +185,42 @@ export function attemptIdForChain(projectId: string, chainName: string): string 
 /** Deterministic id of the assessment one chain's combined review binds to: project id and chain name only. */
 export function assessmentIdForChain(projectId: string, chainName: string): string {
   return assessmentIdForAttempt(attemptIdForChain(projectId, chainName));
+}
+
+/** The package digest of a frozen brief: exactly 64 lowercase hex characters. */
+export const BRIEF_PACKAGE_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+/** A brief package digest is a string of exactly 64 lowercase hex characters. */
+export function isValidBriefPackageDigest(value: unknown): value is string {
+  return typeof value === 'string' && BRIEF_PACKAGE_DIGEST_PATTERN.test(value);
+}
+
+/**
+ * A brief project id: a trimmed, non-empty string of at most 200 characters
+ * with no `:`, no `/` and no control characters (checked per character so the
+ * `no-control-regex` lint rule stays clean).
+ */
+export function isValidBriefProjectId(value: unknown): boolean {
+  if (typeof value !== 'string' || value !== value.trim() || value.length < 1 || value.length > 200) {
+    return false;
+  }
+  for (const ch of value) {
+    const code = ch.charCodeAt(0);
+    if (code <= 0x1f || code === 0x7f || ch === ':' || ch === '/') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** The pseudo attempt id a frozen brief's verification is bound to; never a path. */
+export function attemptIdForBrief(projectId: string, digest: string): string {
+  return `brief:${projectId}:${digest}`;
+}
+
+/** Deterministic id of the assessment one brief's verification binds to: project id and digest only. */
+export function assessmentIdForBrief(projectId: string, digest: string): string {
+  return assessmentIdForAttempt(attemptIdForBrief(projectId, digest));
 }
 
 function ownValue(source: unknown, key: string): unknown {

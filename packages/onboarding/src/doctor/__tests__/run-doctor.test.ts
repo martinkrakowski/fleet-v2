@@ -928,19 +928,34 @@ describe('runDoctor gh non-interactive auth check', () => {
     }
   });
 
-  it('never leaks a token-shaped env value or account name into any DoctorLine', async () => {
-    const token = ['gh' + 'p', '_', 'secretTokenValue', '1234567890'].join('');
-    const { probes } = fakeProbes({
-      ...resolvedGh(),
-      ghAuth: async () => ({
-        tokenPresent: true,
-        authCheck: { outcome: 'fail', reason: 'gh auth status failed' },
-      }),
-    });
-    const lines = await collect(loadedResult(sampleModel()), probes);
-    for (const line of lines) {
-      expect(line.detail).not.toContain(token);
-      expect(line.detail).not.toContain('octocat');
+  it('never leaks the token, account name or gh output into any DoctorLine (real probe path)', async () => {
+    const placeholder = ['sentinel', 'value', '7f3a'].join('-');
+    const account = ['account', 'name', 'zq9'].join('-');
+    const hostile = `Logged in to github.com account ${account} (${placeholder})\n`;
+    const resolvedBinary = async () => ({ resolved: '/usr/bin/gh', candidates: GH_CANDIDATES });
+    for (const exitCode of [0, 1]) {
+      const serviceEnv: Record<string, string> = {};
+      serviceEnv['GH_TOKEN'] = placeholder;
+      const real = createNodeDoctorProbes({
+        serviceEnv,
+        localExecutor: {
+          async run(argv) {
+            if (argv[0] === '/usr/bin/gh') {
+              return { exitCode, signal: null, stdout: hostile, stderr: hostile };
+            }
+            return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+          },
+        },
+      });
+      const probes: DoctorProbes = { ...real, ghBinary: resolvedBinary };
+      const lines = await collect(loadedResult(sampleModel()), probes);
+      const auth = lines.filter((line) => line.check === 'auth-non-interactive');
+      expect(auth.length).toBeGreaterThan(0);
+      for (const line of lines) {
+        const serialised = JSON.stringify(line);
+        expect(serialised).not.toContain(placeholder);
+        expect(serialised).not.toContain(account);
+      }
     }
   });
 });

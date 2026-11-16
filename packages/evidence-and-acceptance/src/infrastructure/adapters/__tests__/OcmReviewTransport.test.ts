@@ -36,6 +36,7 @@ import {
   parseReviewReplyStrict,
   READ_ONLY_REVIEW_SHELL_COMMANDS,
   REVIEW_CHECKLIST,
+  REVIEW_KNOWN_FALSE_POSITIVES,
   REVIEW_REPLY_CONTRACT,
   ReviewTransportError,
   UNSUPPORTED_REVIEW_KIND_REASON,
@@ -2555,12 +2556,13 @@ describe('OcmReviewTransport', () => {
       }
     });
 
-    it('a brief-verify prompt is exactly the header, the rules, the wrapped brief, the brief-verify checklist and the tools sentence', () => {
+    it('a brief-verify prompt is exactly the header, the rules, the known-false-positives block, the wrapped brief, the brief-verify checklist and the tools sentence', () => {
       const prompt = buildReviewPrompt(verifyRequest, nonce);
       const expected =
         `Independent read-only brief-verify review for attempt "${baseRequest.attemptId}" at candidate head "${baseRequest.candidateHeadSha}".\n\n` +
         `This review session is strictly read-only. Do not edit, create, delete, or modify any files.\n\n` +
         `${UNTRUSTED_INPUT_RULE}\n\n` +
+        `${REVIEW_KNOWN_FALSE_POSITIVES}\n\n` +
         `Diff summary:\n` +
         `<<<UNTRUSTED nonce=${nonce} label="diff summary">>>\n` +
         `Added verification checks\n` +
@@ -2582,12 +2584,13 @@ describe('OcmReviewTransport', () => {
       expect(buildReviewPrompt(verifyRequest, nonce, null, true)).toBe(buildReviewPrompt(verifyRequest, nonce));
     });
 
-    it('a brief-check prompt is byte-for-byte unchanged', () => {
+    it('a brief-check prompt is exactly the header, the rules, the known-false-positives block, the wrapped brief, the question and the tools sentence', () => {
       const prompt = buildReviewPrompt({ ...baseRequest, kind: 'brief-check', briefText: BRIEF }, nonce);
       const expected =
         `Independent read-only brief-check review for attempt "${baseRequest.attemptId}" at candidate head "${baseRequest.candidateHeadSha}".\n\n` +
         `This review session is strictly read-only. Do not edit, create, delete, or modify any files.\n\n` +
         `${UNTRUSTED_INPUT_RULE}\n\n` +
+        `${REVIEW_KNOWN_FALSE_POSITIVES}\n\n` +
         `Diff summary:\n` +
         `<<<UNTRUSTED nonce=${nonce} label="diff summary">>>\n` +
         `Added verification checks\n` +

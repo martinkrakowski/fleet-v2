@@ -25,6 +25,7 @@ import {
   MAX_RAW_OUTPUT_LENGTH,
   parseReviewReply,
   parseReviewReplyStrict,
+  REVIEW_KNOWN_FALSE_POSITIVES,
   REVIEW_REPLY_CONTRACT,
   ReviewTransportError,
   requireKindPromptPlan,
@@ -237,7 +238,7 @@ export function buildEmbeddedReviewPrompt(request: RunIndependentReviewRequest, 
   const plan = cliKindPromptPlan(request.kind);
   const scope =
     'You have no access to the repository. The complete change under review is embedded below as a unified diff. Do not try to read, edit, create or run anything.';
-  const sections: string[] = [header, scope, UNTRUSTED_INPUT_RULE, diffSection];
+  const sections: string[] = [header, scope, UNTRUSTED_INPUT_RULE, REVIEW_KNOWN_FALSE_POSITIVES, diffSection];
 
   const summarySection = wrappedDiffSummarySection();
   if (summarySection !== null) {

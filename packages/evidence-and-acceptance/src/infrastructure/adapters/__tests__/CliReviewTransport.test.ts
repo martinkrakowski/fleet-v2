@@ -24,6 +24,7 @@ import {
 import {
   DEFAULT_REVIEW_TIMEOUT_MS,
   REVIEW_CHECKLIST,
+  REVIEW_KNOWN_FALSE_POSITIVES,
   REVIEW_REPLY_CONTRACT,
   UNSUPPORTED_REVIEW_KIND_REASON,
 } from '../OcmReviewTransport.adapter.js';
@@ -1083,7 +1084,7 @@ describe('CliReviewTransport', () => {
       });
     });
 
-    it('a brief-check embedded prompt is byte-for-byte unchanged', () => {
+    it('a brief-check embedded prompt is exactly the header, the scope, the rules, the known-false-positives block, the diff, the wrapped brief, the question and the reply contract', () => {
       const prompt = buildEmbeddedReviewPrompt(
         { ...BASE_REQUEST, kind: 'brief-check', briefText: BRIEF },
         DIFF,
@@ -1093,6 +1094,7 @@ describe('CliReviewTransport', () => {
         `Independent read-only brief-check review for attempt "${BASE_REQUEST.attemptId}" at candidate head "${BASE_REQUEST.candidateHeadSha}".`,
         'You have no access to the repository. The complete change under review is embedded below as a unified diff. Do not try to read, edit, create or run anything.',
         UNTRUSTED_INPUT_RULE,
+        REVIEW_KNOWN_FALSE_POSITIVES,
         `Diff:\n<<<UNTRUSTED nonce=${NONCE} label="diff">>>\n${DIFF}\n<<<END UNTRUSTED nonce=${NONCE}>>>`,
         `${BRIEF_INPUT_RULE}\n\nBrief:\n<<<UNTRUSTED nonce=${NONCE} label="brief">>>\n${BRIEF}\n<<<END UNTRUSTED nonce=${NONCE}>>>\n\n` +
           'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.',

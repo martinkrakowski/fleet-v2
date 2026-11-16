@@ -1,8 +1,9 @@
 /**
  * The node doctor probes against injected fake executors. Every test asserts
- * the exact argv the probes run (local execFile vs the `ssh <alias> --`
- * wrapper), the timeout budget they pass, and that no probe ever reads a
- * credential file's contents — fileMode only stats.
+ * the exact argv the probes run (local execFile vs the
+ * `ssh <alias> -- sh -c '<quoted command line>'` wrapper), the timeout
+ * budget they pass, and that no probe ever reads a credential file's
+ * contents — fileMode only stats.
  */
 
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -33,7 +34,7 @@ import type {
   DoctorCommandRunOptions,
   DoctorCommandRunResult,
 } from '../probes-node.js';
-import { createNodeDoctorProbes, seatProbeArgv } from '../probes-node.js';
+import { createNodeDoctorExecutor, createNodeDoctorProbes, seatProbeArgv } from '../probes-node.js';
 
 interface RecordedCall {
   readonly argv: readonly string[];
@@ -93,8 +94,58 @@ describe('createNodeDoctorProbes', () => {
       'ConnectTimeout=10',
       'lane-host',
       '--',
-      'true',
+      'sh',
+      '-c',
+      "''\\''true'\\'''",
     ]);
+  });
+
+  it('sends the commandAvailable probe over ssh as one quoted sh -c word', async () => {
+    const ssh = fakeExecutor({});
+    const probes = createNodeDoctorProbes({ localExecutor: ssh.executor });
+    await expect(probes.commandAvailable('lane-host', 'nc')).resolves.toBe(true);
+    expect(ssh.calls[0]?.argv).toEqual([
+      'ssh',
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=10',
+      'lane-host',
+      '--',
+      'sh',
+      '-c',
+      "''\\''sh'\\'' '\\''-c'\\'' '\\''command -v nc'\\'''",
+    ]);
+  });
+
+  it('refuses an unsafe ssh host or a NUL-bearing argv without reaching the executor', async () => {
+    const ssh = fakeExecutor({});
+    const probes = createNodeDoctorProbes({
+      localExecutor: ssh.executor,
+      worktreeRoot: '/worktrees',
+    });
+    await expect(probes.hostReachable('bad host')).resolves.toBe(false);
+    await expect(probes.worktreeRootWritable('-dash-alias')).resolves.toBe(false);
+    await expect(probes.fileMode('lane-host', '/bad\0path')).resolves.toBeUndefined();
+    expect(ssh.calls).toHaveLength(0);
+  });
+
+  it('answers commandAvailable over ssh through the real /bin/sh quoted form', async () => {
+    // The ssh executor is translated, not faked: ssh hands the words after
+    // `--` to the remote login shell as one space-joined command line, so
+    // the translation runs that line through the real local /bin/sh.
+    const real = createNodeDoctorExecutor();
+    const translated: DoctorCommandExecutor = {
+      async run(argv, options) {
+        const split = argv.indexOf('--');
+        return real.run(['/bin/sh', '-c', argv.slice(split + 1).join(' ')], options);
+      },
+    };
+    const probes = createNodeDoctorProbes({ sshExecutor: translated });
+    await expect(probes.commandAvailable('lane-host', 'sh')).resolves.toBe(true);
+    await expect(probes.commandAvailable('lane-host', 'no-such-doctor-tool-anywhere')).resolves.toBe(
+      false,
+    );
   });
 
   it('maps a failing ssh reachability run to false', async () => {
@@ -136,8 +187,9 @@ describe('createNodeDoctorProbes', () => {
       'ConnectTimeout=10',
       'lane-host',
       '--',
-      'claude',
-      '--version',
+      'sh',
+      '-c',
+      "''\\''claude'\\'' '\\''--version'\\'''",
     ]);
   });
 
@@ -595,7 +647,7 @@ describe('createNodeDoctorProbes', () => {
 
   it('sends the server probe argv over ssh without a tunnel or credential', async () => {
     const ssh = fakeExecutor(({ argv }) =>
-      argv.some((arg) => arg.endsWith('/api/model'))
+      argv.some((arg) => arg.includes('/api/model'))
         ? { exitCode: 0, signal: null, stdout: '{"data":{"models":{}}}', stderr: '' }
         : { exitCode: 0, signal: null, stdout: '200', stderr: '' },
     );
@@ -612,17 +664,9 @@ describe('createNodeDoctorProbes', () => {
       'ConnectTimeout=10',
       'lane-host',
       '--',
-      'curl',
-      '-sS',
-      '--max-time',
-      '5',
-      '--noproxy',
-      '127.0.0.1,localhost',
-      '-o',
-      '/dev/null',
-      '-w',
-      '%{http_code}',
-      'http://127.0.0.1:4166/api/info',
+      'sh',
+      '-c',
+      "''\\''curl'\\'' '\\''-sS'\\'' '\\''--max-time'\\'' '\\''5'\\'' '\\''--noproxy'\\'' '\\''127.0.0.1,localhost'\\'' '\\''-o'\\'' '\\''/dev/null'\\'' '\\''-w'\\'' '\\''%{http_code}'\\'' '\\''http://127.0.0.1:4166/api/info'\\'''",
     ]);
   });
 

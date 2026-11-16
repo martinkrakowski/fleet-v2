@@ -556,6 +556,29 @@ describe('relaunch plan (production composition)', () => {
     expect((await plan(rejected)).result).toEqual({ outcome: 'unknown', reasons: ['profile-records-unreadable'] });
   });
 
+  it('relaunch plan on a genuinely corrupt project-profiles.json answers unknown, writes no plan and changes no byte of the state or the worktrees', async () => {
+    const fx = await seededFixture();
+    const profiles = path.join(fx.stateDir, 'project-profiles.json');
+    await fs.writeFile(profiles, '{broken CANARY-bytes', 'utf8');
+    const stateBefore = await snapshotStateWithHashes(fx.stateDir);
+    const worktreesBefore = await snapshotStateWithHashes(fx.worktreeRoot);
+
+    const planned = await plan(fx.runtime);
+
+    expect(planned.code).toBe(1);
+    expect(planned.result).toEqual({ outcome: 'unknown', reasons: ['profile-records-unreadable'] });
+    await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readFile(profiles, 'utf8')).toBe('{broken CANARY-bytes');
+    const stateAfter = await snapshotStateWithHashes(fx.stateDir);
+    expect(stateAfter).toEqual(stateBefore);
+    expect(stateAfter.filter((row) => /quarantine|corrupt|\.bak|\.orig/i.test(row))).toEqual([]);
+    expect(await snapshotStateWithHashes(fx.worktreeRoot)).toEqual(worktreesBefore);
+    for (const text of [planned.stdout, planned.stderr]) {
+      expect(text).not.toContain('CANARY');
+      expect(text).not.toContain(fx.stateDir);
+    }
+  });
+
   it('refuses invalid flags and an exhausted deadline with exit 1 and writes nothing', async () => {
     const fx = await fixture(['free-one']);
     const invalid = { outcome: 'refused', reason: 'invalid-request' };

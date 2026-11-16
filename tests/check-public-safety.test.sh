@@ -335,7 +335,18 @@ case $stderr in
 esac
 clean_stderr "$stderr"
 
-# --- a tracked symlink is scanned by its own text and never followed.
+# Shared assertion: exit 2, stderr names the path, stdout empty, no secret printed.
+expect_refused() { # $1 = title, $2 = path that must be named
+  if [ $rc -eq 2 ] && [ -z "$stdout" ] &&
+    case $stderr in *"$2"*) true ;; *) false ;; esac; then
+    ok "$1"
+  else
+    bad "$1 (rc $rc: $stdout $stderr)"
+  fi
+  no_leak "$stdout$stderr" 'supersecrettoken'
+}
+
+# --- a symlink pointing outside the repository is refused and never read.
 R=$T/link
 new_repo "$R"
 printf 'supersecrettoken\n' >"$T/link.list"
@@ -343,40 +354,88 @@ printf 'supersecrettoken\n' >"$T/outside.txt"
 ln -s "$T/outside.txt" "$R/src/link"
 track "$R" link
 check --root "$R" --list "$T/link.list"
-if [ $rc -eq 0 ] && [ "$stdout" = 'check-public-safety: ok, 2 files, 1 entries' ]; then
-  ok 'a tracked symlink is not followed outside the tree'
-else
-  bad "a tracked symlink is not followed outside the tree (rc $rc: $stdout $stderr)"
-fi
-clean_stderr "$stderr"
+expect_refused 'a tracked symlink to a file outside the repository is refused, not read' 'src/link'
 
-# --- a symlink whose tracked link-target text matches is reported.
-R=$T/linktext
-new_repo "$R"
-printf 'supersecrettoken\n' >"$T/linktext.list"
-ln -s ../../outside/forbidden-supersecrettoken "$R/src/link"
-track "$R" linktext
-check --root "$R" --list "$T/linktext.list"
-if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/link:1 entry #1' ]; then
-  ok 'a symlink matching by its link-target text is reported'
-else
-  bad "a symlink matching by its link-target text is reported (rc $rc: $stdout $stderr)"
-fi
-no_leak "$stdout" 'supersecrettoken'
-clean_stderr "$stderr"
-
-# --- a dangling tracked symlink is scanned as its link text and passes.
+# --- a dangling tracked symlink is refused naming the path, even when its text matches.
 R=$T/dangling
 new_repo "$R"
 printf 'supersecrettoken\n' >"$T/dangling.list"
-ln -s nowhere "$R/src/dangling"
+ln -s ../../outside/forbidden-supersecrettoken "$R/src/dangling"
 track "$R" dangling
 check --root "$R" --list "$T/dangling.list"
+expect_refused 'a dangling tracked symlink is refused naming the path' 'src/dangling'
+
+# --- a symlink loop is refused.
+R=$T/loop
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/loop.list"
+ln -s b "$R/src/a"
+ln -s a "$R/src/b"
+track "$R" loop
+check --root "$R" --list "$T/loop.list"
+expect_refused 'a tracked symlink loop is refused naming the path' 'src/a'
+
+# --- a symlink to a directory is refused.
+R=$T/dirlink
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/dirlink.list"
+ln -s . "$R/src/dirlink"
+track "$R" dirlink
+check --root "$R" --list "$T/dirlink.list"
+expect_refused 'a tracked symlink to a directory is refused naming the path' 'src/dirlink'
+
+# --- a symlink to the list file outside the repository is refused, not skipped.
+R=$T/listlink
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/listlink.list"
+ln -s "$T/listlink.list" "$R/src/listlink"
+track "$R" listlink
+check --root "$R" --list "$T/listlink.list"
+expect_refused 'a tracked symlink to the list file is refused, not skipped' 'src/listlink'
+
+# --- a gitlink (submodule) entry is refused naming the path.
+R=$T/sub
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/sub.list"
+mkdir -p "$R/vendor/mod"
+(
+  cd "$R/vendor/mod" && git init -q && git config user.name T &&
+    git config user.email t@example.invalid && printf 'x\n' >f &&
+    git add f && git commit -qm m
+)
+git -C "$R" add vendor/mod >/dev/null 2>&1
+git -C "$R" commit -qm gitlink >/dev/null
+check --root "$R" --list "$T/sub.list"
+expect_refused 'a tracked submodule entry is refused naming the path' 'vendor/mod'
+
+# --- an in-repo symlink to a regular file is accepted and scanned by its link text only.
+R=$T/inrepo
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/inrepo.list"
+ln -s plain.txt "$R/src/alias"
+track "$R" alias
+check --root "$R" --list "$T/inrepo.list"
 if [ $rc -eq 0 ] && [ "$stdout" = 'check-public-safety: ok, 2 files, 1 entries' ]; then
-  ok 'a dangling tracked symlink is scanned as its link text'
+  ok 'an in-repo symlink to a regular file is accepted'
 else
-  bad "a dangling tracked symlink is scanned as its link text (rc $rc: $stdout $stderr)"
+  bad "an in-repo symlink to a regular file is accepted (rc $rc: $stdout $stderr)"
 fi
+clean_stderr "$stderr"
+
+# --- an in-repo symlink whose link text matches is reported.
+R=$T/linktext
+new_repo "$R"
+printf 'supersecrettoken\n' >"$T/linktext.list"
+printf 'x\n' >"$R/src/forbidden-supersecrettoken"
+ln -s forbidden-supersecrettoken "$R/src/link"
+track "$R" linktext
+check --root "$R" --list "$T/linktext.list"
+if [ $rc -eq 1 ] && [ "$stdout" = 'check-public-safety: src/link:1 entry #1' ]; then
+  ok 'an in-repo symlink matching by its link text is reported'
+else
+  bad "an in-repo symlink matching by its link text is reported (rc $rc: $stdout $stderr)"
+fi
+no_leak "$stdout" 'supersecrettoken'
 clean_stderr "$stderr"
 
 # --- an unreadable tracked file is refused naming the path.

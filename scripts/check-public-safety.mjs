@@ -17,8 +17,11 @@
 // Every tracked file is scanned no matter how large, so no tracked text file
 // is a blind spot; only files whose first 8 KiB contain a NUL byte (binary)
 // are skipped. A tracked symlink is scanned by its own tracked text — the
-// link target path — and the link is never followed, so nothing outside the
-// scanned tree is read and a target's contents never stand in for the link's.
+// link target path — and the link is never followed or opened. It is only
+// accepted when it resolves to a regular file inside the repository (that
+// file is scanned on its own when tracked); a dangling link, a loop, a link
+// leaving the repository, or a link to a directory is an unreadable tracked
+// entry (exit 2). Directory and submodule entries are refused the same way.
 // The list file itself is skipped whenever it lives inside the scanned tree,
 // so it never flags itself. Untracked files are never read.
 //
@@ -82,7 +85,7 @@ function scanTextBytes(name, bytes, entries, findings) {
 // Streams the tracked bytes, so file size is never a blind spot, and never
 // follows a symlink: a tracked symlink's own tracked text is its link target
 // path, and that text is what gets scanned.
-function scanTracked(name, full, entries, findings) {
+function scanTracked(name, full, realRoot, entries, findings) {
   let st;
   try {
     st = lstatSync(full);
@@ -91,14 +94,23 @@ function scanTracked(name, full, entries, findings) {
   }
   if (st.isSymbolicLink()) {
     let target;
+    let resolved;
+    let rst;
     try {
       target = readlinkSync(full, "buffer");
+      resolved = realpathSync(full); // Throws on dangling links and loops.
+      rst = lstatSync(resolved); // Metadata only: the target is never opened.
     } catch {
+      cannotRead(name);
+    }
+    const rel = path.relative(realRoot, resolved);
+    if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel) || !rst.isFile()) {
       cannotRead(name);
     }
     scanTextBytes(name, target, entries, findings);
     return 1;
   }
+  if (!st.isFile()) cannotRead(name); // Directory or submodule entry.
   let fd;
   try {
     fd = openSync(full, "r");
@@ -107,6 +119,7 @@ function scanTracked(name, full, entries, findings) {
   }
   try {
     const chunk = Buffer.alloc(CHUNK);
+    // A read failure (EISDIR, EIO) is an unreadable tracked file, not a pass.
     let pending = Buffer.alloc(0); // Bytes of the line still without its newline.
     let prefix = Buffer.alloc(0); // The first BINARY_WINDOW bytes of the file.
     let lineNo = 0;
@@ -117,7 +130,12 @@ function scanTracked(name, full, entries, findings) {
       matchLine(name, lineNo, text, entries, findings);
     };
     for (;;) {
-      const read = readSync(fd, chunk, 0, CHUNK, null);
+      let read;
+      try {
+        read = readSync(fd, chunk, 0, CHUNK, null);
+      } catch {
+        cannotRead(name);
+      }
       if (read === 0) break;
       const data = chunk.subarray(0, read);
       if (prefix.length < BINARY_WINDOW) {
@@ -271,19 +289,29 @@ try {
     process.exit(2);
   }
 
+  const realRoot = realpathSync(root);
   const findings = [];
   let scanned = 0;
   for (const name of tracked) {
     const full = path.join(root, name);
     // The list never scans itself when it lives inside the scanned tree.
-    let realFile = null;
+    // A symlink is never skipped as the list: it is validated and scanned.
+    let isLink = false;
     try {
-      realFile = realpathSync(full);
+      isLink = lstatSync(full).isSymbolicLink();
     } catch {
-      realFile = null;
+      cannotRead(name);
     }
-    if (realFile !== null && realFile === realList) continue;
-    scanned += scanTracked(name, full, entries, findings);
+    if (!isLink) {
+      let realFile = null;
+      try {
+        realFile = realpathSync(full);
+      } catch {
+        realFile = null;
+      }
+      if (realFile !== null && realFile === realList) continue;
+    }
+    scanned += scanTracked(name, full, realRoot, entries, findings);
   }
   if (findings.length > 0) {
     for (const line of findings) console.log(line);

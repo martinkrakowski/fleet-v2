@@ -512,6 +512,7 @@ bounded_contexts:
             - PatchIdentityPort
             - MergeVerificationPort
             - MergeVetoPort
+            - MergeVetoStatePort
             - MergeNotificationPort
             - MergePolicyPort
             - KillallHaltMarkerPort
@@ -634,6 +635,7 @@ bounded_contexts:
       PatchIdentityPort: "Decide whether an update-branch carry is allowed under the speed-plan file rule and patch-id guard against a bare mirror of the repository with allow-listed argv through the command executor; never touches the live checkout."
       MergeVerificationPort: "Request and read the verification receipt for one exact head through the evidence context's procedure; a receipt naming another head is unknown."
       MergeVetoPort: "Ask one Jev veto question bound to the verified head over the shared decision client and record the answer, confidence, mode and decision receipt id; unknown never blocks."
+      MergeVetoStatePort: "Read the veto state fields (tier, title, changed paths, additions, deletions, hard-to-undo, fix rounds, reviewer families, resolved threads, major blockers, head-changed flag) for one pull request at one exact head, read-only; unreadable or unconfigured state is reported as unavailable, never guessed."
       MergeNotificationPort: "Emit one notification per merged, dropped, first parked, forge-error-exhausted, veto-hold and pause/halt transition through operator coordination with fixed text, ids and codes only."
       MergePolicyPort: "Read policy.merge.repos and policy.daemon from the installation, read-only, at their revision on every call: per repository (owner/repo) its projectId, shadow (default true), unattended, requiredContexts, updateBranch, an optional macosProcedure (absent means none), maxAttempts, checksGraceMinutes and veto, and policy.daemon intervalSeconds, budgetSeconds and settleSeconds (defaults 60, 45 and 20, D-DT9); policyRevision is the digest of the normalized sections; an unreadable or invalid section answers unknown, never a default or an empty registry."
       ImportTrainStatePort: "Import the shell merge train's queue, parked list and chain state into merge-queue entries: dry-run by default, applied only on explicit request with its authority, idempotent by entry identity (repository, pull request, head, base) under a keyed import journal entry; unknown or secret-shaped input is reported and never guessed; imported entries start queued and park reasons are not imported; ids and codes only."

@@ -91,6 +91,7 @@ function deriveModelFromV2(installation: FleetInstallation): ModelOutcome {
       worktreeRoot: host.worktreeRoot,
       ...(host.tmpDir !== undefined ? { tmpDir: host.tmpDir } : {}),
       roles: host.roles,
+      ...(host.ciRunnerSlots !== undefined ? { ciRunnerSlots: [...host.ciRunnerSlots] } : {}),
       ...(host.runner !== undefined ? { runner: deriveHostRunner(host.runner) } : {}),
     };
   }

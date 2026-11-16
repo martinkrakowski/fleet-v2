@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 
 import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import { runSpawnOutcome } from '../spawn-run.js';
+import { posixQuote, sshArgvFor } from '../SshExecutor.adapter.js';
 
 describe('evidence LocalExecutor', () => {
   it('returns stdin input through a real /bin/cat', async () => {
@@ -98,6 +99,180 @@ describe('evidence SshExecutor', () => {
       vi.doUnmock('node:child_process');
       vi.resetModules();
     }
+  });
+});
+
+describe('evidence posixQuote', () => {
+  it('quotes an empty string', () => {
+    expect(posixQuote('')).toBe("''");
+  });
+
+  it('quotes arguments containing spaces', () => {
+    expect(posixQuote('hello world')).toBe("'hello world'");
+  });
+
+  it('escapes embedded single quotes', () => {
+    expect(posixQuote("it's")).toBe("'it'\\''s'");
+  });
+
+  it('keeps dollar expansions inert', () => {
+    expect(posixQuote('$HOME $(id)')).toBe("'$HOME $(id)'");
+  });
+
+  it('keeps newlines inside the quoted argument', () => {
+    expect(posixQuote('line1\nline2')).toBe("'line1\nline2'");
+  });
+
+  it('quotes a leading dash so it is never parsed as an option', () => {
+    expect(posixQuote('-rf')).toBe("'-rf'");
+  });
+});
+
+describe('evidence sshArgvFor (explicit sh -c interpreter)', () => {
+  it('hands the remote command to sh -c as one single-quoted argument', () => {
+    expect(sshArgvFor('verify.internal', ['git', 'status'])).toEqual([
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=15',
+      'verify.internal',
+      '--',
+      'sh',
+      '-c',
+      posixQuote("'git' 'status'"),
+    ]);
+  });
+});
+
+interface FakeSshChild extends EventEmitter {
+  pid: number;
+  exitCode: null;
+  signalCode: null;
+  stdin: { write: (chunk: string) => boolean; end: () => void; on: () => FakeSshChild };
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+  kill: ReturnType<typeof vi.fn>;
+}
+
+function spawnFakeChild(): FakeSshChild {
+  const child: FakeSshChild = Object.assign(new EventEmitter(), {
+    pid: 42_430,
+    exitCode: null,
+    signalCode: null,
+    stdin: { write: () => true, end: () => {}, on: () => child },
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    kill: vi.fn((signal?: NodeJS.Signals) => {
+      if (signal === 'SIGKILL') setImmediate(() => child.emit('close', null, 'SIGKILL'));
+    }),
+  });
+  return child;
+}
+
+async function withSpawnMock<T>(run: (spawnMock: ReturnType<typeof vi.fn>) => Promise<T>): Promise<T> {
+  const spawnMock = vi.fn((..._args: unknown[]) => spawnFakeChild());
+  vi.resetModules();
+  vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+  try {
+    return await run(spawnMock);
+  } finally {
+    vi.doUnmock('node:child_process');
+    vi.resetModules();
+  }
+}
+
+describe('evidence SshExecutor explicit sh -c argv', () => {
+  it('spawns ssh with the remote command handed to sh -c as one quoted argument', async () => {
+    await withSpawnMock(async (spawnMock) => {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'verify.internal' });
+      const pending = executor.run(['echo', '$HOME', "a'b"]);
+      // Emit close on the fake child handed to spawn.
+      const child = spawnMock.mock.results[0]?.value;
+      if (child) setImmediate(() => (child as EventEmitter).emit('close', 0, null));
+      const result = await pending;
+      expect(result.exitCode).toBe(0);
+      expect(spawnMock.mock.calls[0][0]).toBe('ssh');
+      expect(spawnMock.mock.calls[0][1]).toEqual([
+        '-o',
+        'BatchMode=yes',
+        '-o',
+        'ConnectTimeout=15',
+        'verify.internal',
+        '--',
+        'sh',
+        '-c',
+        posixQuote("'echo' '$HOME' 'a'\\''b'"),
+      ]);
+    });
+  });
+});
+
+describe('evidence SshExecutor refusals', () => {
+  it('refuses an unsafe SSH host (empty, leading dash, whitespace) before spawning ssh', async () => {
+    await withSpawnMock(async (spawnMock) => {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      for (const host of ['', '-oProxyCommand=id', 'verify.internal extra']) {
+        const result = await new FreshSshExecutor({ host }).run(['echo', 'hi']);
+        expect(result.exitCode).toBeNull();
+        expect(result.signal).toBeNull();
+        expect(result.error).toContain('unsafe SSH host');
+        expect(spawnMock).not.toHaveBeenCalled();
+      }
+    });
+  });
+
+  it('refuses an empty argv before spawning ssh', async () => {
+    await withSpawnMock(async (spawnMock) => {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'verify.internal' });
+      const result = await executor.run([]);
+      expect(result.exitCode).toBeNull();
+      expect(result.signal).toBeNull();
+      expect(result.error).toContain('empty argv');
+      expect(spawnMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it('reports a spawn error with exitCode null and the error message', async () => {
+    await withSpawnMock(async (spawnMock) => {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'verify.internal' });
+      const pending = executor.run(['echo', 'hi']);
+      const child = spawnMock.mock.results[0].value as EventEmitter;
+      setImmediate(() => child.emit('error', new Error('spawn ssh ENOENT')));
+      const result = await pending;
+      expect(result.exitCode).toBeNull();
+      expect(result.signal).toBeNull();
+      expect(result.error).toBe('spawn ssh ENOENT');
+    });
+  });
+
+  it('propagates a non-zero ssh exit code without masking failure', async () => {
+    await withSpawnMock(async (spawnMock) => {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'verify.internal' });
+      const pending = executor.run(['git', 'status']);
+      const child = spawnMock.mock.results[0].value as EventEmitter;
+      setImmediate(() => child.emit('close', 255, null));
+      const result = await pending;
+      expect(result.exitCode).toBe(255);
+      expect(result.signal).toBeNull();
+    });
+  });
+
+  it('kills the ssh child and reports an error when output exceeds maxBufferBytes', async () => {
+    await withSpawnMock(async (spawnMock) => {
+      const { SshExecutor: FreshSshExecutor } = await import('../SshExecutor.adapter.js');
+      const executor = new FreshSshExecutor({ host: 'verify.internal' });
+      const pending = executor.run(['cat', '/var/log/big'], { maxBufferBytes: 16 });
+      const child = spawnMock.mock.results[0].value as FakeSshChild;
+      setImmediate(() => (child.stdout as EventEmitter).emit('data', 'x'.repeat(64)));
+      const result = await pending;
+      expect(child.kill).toHaveBeenCalled();
+      expect(result.exitCode).toBeNull();
+      expect(result.error).toContain('maxBufferBytes');
+    });
   });
 });
 

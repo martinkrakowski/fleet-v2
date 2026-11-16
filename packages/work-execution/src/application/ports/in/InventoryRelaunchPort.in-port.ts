@@ -109,7 +109,7 @@ export interface RelaunchHostInventory {
 
 /** The conductor's status, as the inventory reads it. */
 export interface RelaunchConductorStatus {
-  /** The halt marker; an unreadable marker reads as halted. */
+  /** The halt marker; an unreadable marker makes the whole answer unknown. */
   readonly halted: boolean;
   /** The driver lease: absent, lapsed or live; unknown when the read throws. */
   readonly driverLease: 'absent' | 'lapsed' | 'live' | 'unknown';
@@ -130,7 +130,17 @@ export type InventoryRelaunchResult =
    * run, attempt or profile records could not be read, so no population can
    * be told; the inventory is refused rather than guessed.
    */
-  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'records-unreadable' };
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'records-unreadable' }
+  /**
+   * CO29a-ro2: unknown stays unknown. The conductor's halt marker or driver
+   * lease could not be read (absent bytes are absent; unreadable bytes are
+   * not a value), so the inventory answers unknown instead of inventing a
+   * halted flag or a lease state.
+   */
+  | {
+      readonly outcome: 'unknown';
+      readonly reason: 'halt-unreadable' | 'lease-unreadable';
+    };
 
 export interface InventoryRelaunchPort {
   inventoryRelaunch(request: InventoryRelaunchRequest): Promise<InventoryRelaunchResult>;

@@ -19,6 +19,7 @@ import type { ToolId } from '@fleet/tooling';
 
 import { renderAutoMergeStatus, summariseAutoMerge } from '../policy/auto-merge.js';
 
+import { checkGhAuthNonInteractive } from './gh-binary.js';
 import type { DoctorLine, DoctorStatus } from './types.js';
 import type { DoctorProbes } from './probes.js';
 
@@ -480,10 +481,40 @@ async function runnerBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
 async function ghBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
   const gh = await safely(() => probes.ghBinary());
   if (gh === undefined) {
-    return [line('gh-binary', 'gh', 'resolved', 'UNKNOWN', 'gh resolution probe failed')];
+    return [
+      line('gh-binary', 'gh', 'resolved', 'UNKNOWN', 'gh resolution probe failed'),
+      line(
+        'gh-binary',
+        'gh',
+        'auth-non-interactive',
+        'UNKNOWN',
+        'gh binary not resolved; non-interactive auth not checked',
+      ),
+    ];
   }
   if (gh.resolved !== undefined) {
-    return [line('gh-binary', 'gh', 'resolved', 'PASS', gh.resolved)];
+    const resolved = line('gh-binary', 'gh', 'resolved', 'PASS', gh.resolved);
+    if (probes.ghAuth === undefined) {
+      return [
+        resolved,
+        line('gh-binary', 'gh', 'auth-non-interactive', 'UNKNOWN', 'gh auth probe not configured'),
+      ];
+    }
+    const authLine = await safely(() =>
+      checkGhAuthNonInteractive(() => probes.ghAuth!(gh.resolved!)),
+    );
+    if (authLine === undefined) {
+      // checkGhAuthNonInteractive never throws; this guard keeps the sweep
+      // alive even if that ever changes.
+      return [
+        resolved,
+        line('gh-binary', 'gh', 'auth-non-interactive', 'UNKNOWN', 'gh non-interactive auth probe failed'),
+      ];
+    }
+    return [
+      resolved,
+      line(authLine.scope, authLine.subject, authLine.check, authLine.status, authLine.detail),
+    ];
   }
   return [
     line(
@@ -492,6 +523,13 @@ async function ghBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
       'resolved',
       'FAIL',
       `gh not found at ${gh.candidates.join(', ')}; conducted runs open PRs through one of these paths`,
+    ),
+    line(
+      'gh-binary',
+      'gh',
+      'auth-non-interactive',
+      'UNKNOWN',
+      'gh binary not resolved; non-interactive auth not checked',
     ),
   ];
 }

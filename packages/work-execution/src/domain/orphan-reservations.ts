@@ -112,11 +112,11 @@ interface ReservationSnapshot {
 
 /** `.length` read once and clamped; a lying or hostile length is bounded. */
 function boundedLength(value: unknown, max: number): number {
-  if (!Array.isArray(value)) {
-    return 0;
-  }
   let raw: unknown;
   try {
+    if (!Array.isArray(value)) {
+      return 0;
+    }
     raw = value.length;
   } catch {
     return 0;
@@ -125,6 +125,18 @@ function boundedLength(value: unknown, max: number): number {
     return 0;
   }
   return Math.min(Math.floor(raw), max);
+}
+
+/** One element read behind a guard; a throwing Proxy get trap reads as a hole. */
+function safeElementAt(
+  list: readonly unknown[],
+  index: number,
+): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
+  try {
+    return { ok: true, value: list[index] };
+  } catch {
+    return { ok: false };
+  }
 }
 
 /** True when the element is absent (an array hole), checked without touching getters. */
@@ -215,6 +227,15 @@ function malformedEntry(reservationId: string, attemptId: string): ClassifiedOrp
   };
 }
 
+/** One input field read behind a guard; a hostile input object reads as absent. */
+function readInputField(input: ClassifyOrphanReservationsInput | undefined, key: string): unknown {
+  try {
+    return (input as Record<string, unknown> | undefined)?.[key];
+  } catch {
+    return undefined;
+  }
+}
+
 /** The attempt ids one run lists, read defensively; [] when the run is malformed. */
 function runAttemptIds(element: unknown): readonly string[] {
   let snap: Record<string, unknown> | null;
@@ -302,13 +323,15 @@ export function classifyOrphanReservations(
   const skipped: ClassifiedOrphanReservation[] = [];
   const unknown: ClassifiedOrphanReservation[] = [];
 
-  const reservations = input?.reservations;
-  const runs = input?.runs;
-  const runStates = input?.runStates;
-  const attemptsById = input?.attemptsById;
-  const nowMs = Date.parse(typeof input?.nowIso === 'string' ? input.nowIso : '');
-  const graceMs = typeof input?.graceMs === 'number' && Number.isFinite(input.graceMs) && input.graceMs >= 0
-    ? input.graceMs
+  const reservations = readInputField(input, 'reservations');
+  const runs = readInputField(input, 'runs');
+  const runStates = readInputField(input, 'runStates') as OrphanReservationRunStates | undefined;
+  const attemptsById = readInputField(input, 'attemptsById') as OrphanReservationAttemptsById | undefined;
+  const nowRaw = readInputField(input, 'nowIso');
+  const nowMs = Date.parse(typeof nowRaw === 'string' ? nowRaw : '');
+  const graceRaw = readInputField(input, 'graceMs');
+  const graceMs = typeof graceRaw === 'number' && Number.isFinite(graceRaw) && graceRaw >= 0
+    ? graceRaw
     : Number.POSITIVE_INFINITY;
 
   const reservationCount = boundedLength(reservations, MAX_ORPHAN_RESERVATION_SCAN);
@@ -317,10 +340,11 @@ export function classifyOrphanReservations(
   // attemptId -> the listing runs' states, read defensively.
   const runsByAttemptId = new Map<string, (LaneRunStateValue | 'unreadable' | undefined)[]>();
   for (let index = 0; index < runCount; index += 1) {
-    const element = (runs as readonly unknown[])[index];
-    if (element === undefined || element === null || isHole(runs as readonly unknown[], index)) {
+    const runElement = safeElementAt(runs as readonly unknown[], index);
+    if (!runElement.ok || runElement.value === undefined || runElement.value === null || isHole(runs as readonly unknown[], index)) {
       continue;
     }
+    const element = runElement.value;
     const attemptIds = runAttemptIds(element);
     if (attemptIds.length === 0) {
       continue;
@@ -335,9 +359,17 @@ export function classifyOrphanReservations(
     } catch {
       runId = null;
     }
-    const state = runId !== null && runStates !== undefined && runStates instanceof Map
-      ? runStates.get(runId)
-      : undefined;
+    // The run's state comes from the caller's map; an unreadable map or a
+    // throwing `get` (a hostile Proxy) reads as undefined — the reservation
+    // then classifies unknown, never released.
+    let state: LaneRunStateValue | 'unreadable' | undefined = undefined;
+    try {
+      if (runId !== null && runStates !== undefined && runStates instanceof Map) {
+        state = runStates.get(runId);
+      }
+    } catch {
+      state = 'unreadable';
+    }
     for (const attemptId of attemptIds) {
       const bucket = runsByAttemptId.get(attemptId);
       if (bucket === undefined) {
@@ -349,10 +381,12 @@ export function classifyOrphanReservations(
   }
 
   for (let index = 0; index < reservationCount; index += 1) {
-    const element = (reservations as readonly unknown[])[index];
-    if (element === undefined || element === null || isHole(reservations as readonly unknown[], index)) {
-      // A hole or a null element cannot even name its reservation; the
-      // fallback id is deterministic so the report stays stable.
+    const elementRead = safeElementAt(reservations as readonly unknown[], index);
+    const element = elementRead.ok ? elementRead.value : undefined;
+    if (!elementRead.ok || element === undefined || element === null || isHole(reservations as readonly unknown[], index)) {
+      // A hole, a null element or a throwing element read cannot even name
+      // its reservation; the fallback id is deterministic so the report
+      // stays stable.
       unknown.push(malformedEntry(`malformed-${index}`, ''));
       continue;
     }

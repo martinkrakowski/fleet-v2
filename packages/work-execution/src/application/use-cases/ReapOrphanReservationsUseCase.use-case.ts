@@ -92,6 +92,47 @@ async function callStore<T>(call: () => Promise<T>, timeoutMs: number): Promise<
   }
 }
 
+/** `Array.isArray` behind a guard: a revoked Proxy throws instead of answering. */
+function safeIsArray(value: unknown): boolean {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
+/** A store array whose `.length` read throws (a hostile Proxy) is unreadable, not empty. */
+function hasReadableLength(value: unknown): boolean {
+  try {
+    void (value as { readonly length?: unknown }).length;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `.length` read once and clamped: a lying or hostile length cannot unbound a loop. */
+function safeLength(value: unknown, max: number): number {
+  try {
+    const raw = (value as { readonly length?: unknown }).length;
+    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), max) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** One element read behind a guard; a throwing Proxy get trap reads as absent. */
+function safeElementAt(
+  list: readonly unknown[],
+  index: number,
+): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
+  try {
+    return { ok: true, value: list[index] };
+  } catch {
+    return { ok: false };
+  }
+}
+
 /**
  * The request read through its own property descriptors: a plain object with
  * a boolean `dryRun` and a canonical `nowIso`, no forbidden own key and no
@@ -100,7 +141,14 @@ async function callStore<T>(call: () => Promise<T>, timeoutMs: number): Promise<
  * `dryRun`, a non-canonical `nowIso` — is invalid.
  */
 function validateRequest(request: unknown): { readonly dryRun: boolean; readonly nowIso: string } | null {
-  if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+  let isRequestArray = false;
+  try {
+    isRequestArray = Array.isArray(request);
+  } catch {
+    // A revoked Proxy throws on the internal slots `Array.isArray` reads.
+    return null;
+  }
+  if (typeof request !== 'object' || request === null || isRequestArray) {
     return null;
   }
   let snap: Record<string, unknown> | null;
@@ -208,11 +256,11 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
     // Top-level reads are deadline-guarded and fail closed: an unreadable
     // store refuses the whole pass as unknown before anything is released.
     const reservationsRead = await callStore(() => this.deps.executionJournal.listActiveReservations(), timeoutMs);
-    if (!reservationsRead.ok || !Array.isArray(reservationsRead.value)) {
+    if (!reservationsRead.ok || !safeIsArray(reservationsRead.value) || !hasReadableLength(reservationsRead.value)) {
       return { outcome: 'unknown', reason: 'reservations-unreadable' };
     }
     const runsRead = await callStore(() => this.deps.runRepo.list(), timeoutMs);
-    if (!runsRead.ok || !Array.isArray(runsRead.value)) {
+    if (!runsRead.ok || !safeIsArray(runsRead.value) || !hasReadableLength(runsRead.value)) {
       return { outcome: 'unknown', reason: 'runs-unreadable' };
     }
     const reservations: readonly unknown[] = reservationsRead.value;
@@ -220,9 +268,18 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
 
     // The attempt ids of the held reservations; each run naming one is read.
     const heldAttemptIds = new Set<string>();
-    const reservationCount = Math.min(reservations.length, MAX_ORPHAN_RESERVATION_SCAN);
+    const reservationCount = safeLength(reservations, MAX_ORPHAN_RESERVATION_SCAN);
     for (let index = 0; index < reservationCount; index += 1) {
-      const snap = snapshotPlainDataRecord(reservations[index]);
+      const element = safeElementAt(reservations, index);
+      if (!element.ok) {
+        continue;
+      }
+      let snap: Record<string, unknown> | null;
+      try {
+        snap = snapshotPlainDataRecord(element.value);
+      } catch {
+        continue;
+      }
       if (snap === null || snap['held'] !== true || typeof snap['attemptId'] !== 'string' || (snap['attemptId'] as string).length === 0) {
         continue;
       }
@@ -233,19 +290,32 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
     // from the run journal; an unreadable journal is 'unreadable' and the
     // classifier refuses to release on it.
     const runStates = new Map<string, ReturnType<typeof laneRunJournalState> | 'unreadable'>();
-    const runCount = Math.min(runs.length, MAX_RUN_SCAN);
+    const runCount = safeLength(runs, MAX_RUN_SCAN);
     for (let index = 0; index < runCount; index += 1) {
-      const runSnap = snapshotPlainDataRecord(runs[index]);
+      const runElement = safeElementAt(runs, index);
+      if (!runElement.ok) {
+        continue;
+      }
+      let runSnap: Record<string, unknown> | null;
+      try {
+        runSnap = snapshotPlainDataRecord(runElement.value);
+      } catch {
+        continue;
+      }
       if (runSnap === null || typeof runSnap['runId'] !== 'string' || (runSnap['runId'] as string).length === 0) {
         continue;
       }
       const runId = runSnap['runId'] as string;
       let lists = false;
       const attemptIds = runSnap['attemptIds'];
-      if (Array.isArray(attemptIds)) {
-        const count = Math.min(attemptIds.length, MAX_ORPHAN_RESERVATION_SCAN);
+      if (safeIsArray(attemptIds)) {
+        const count = safeLength(attemptIds, MAX_ORPHAN_RESERVATION_SCAN);
         for (let attemptIndex = 0; attemptIndex < count; attemptIndex += 1) {
-          const attemptId = attemptIds[attemptIndex];
+          const attemptElement = safeElementAt(attemptIds as readonly unknown[], attemptIndex);
+          if (!attemptElement.ok) {
+            continue;
+          }
+          const attemptId = attemptElement.value;
           if (typeof attemptId === 'string' && heldAttemptIds.has(attemptId)) {
             lists = true;
             break;
@@ -256,11 +326,15 @@ export class ReapOrphanReservationsUseCase implements ReapOrphanReservationsPort
         continue;
       }
       const journalRead = await callStore(() => this.deps.runJournal.listForRun(runId), timeoutMs);
-      if (!journalRead.ok || !Array.isArray(journalRead.value)) {
+      if (!journalRead.ok || !safeIsArray(journalRead.value)) {
         runStates.set(runId, 'unreadable');
         continue;
       }
-      runStates.set(runId, laneRunJournalState(journalRead.value, runId));
+      try {
+        runStates.set(runId, laneRunJournalState(journalRead.value, runId));
+      } catch {
+        runStates.set(runId, 'unreadable');
+      }
     }
 
     // The attempt per held reservation's attempt id: known absence is null,

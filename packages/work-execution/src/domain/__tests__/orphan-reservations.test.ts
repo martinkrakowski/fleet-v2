@@ -287,6 +287,89 @@ describe('classifyOrphanReservations', () => {
     }
   });
 
+  it('handles hostile inputs and malformed reservations without throwing: a revoked Proxy where an array is declared', () => {
+    const { proxy, revoke } = Proxy.revocable([reservation({ id: 'res-revoked' })], {});
+    revoke();
+    // `Array.isArray` on a revoked Proxy throws; the classifier must read it
+    // as a non-array (no classifications, no throw) instead of escaping.
+    const result = classifyOrphanReservations({
+      reservations: proxy as unknown as readonly unknown[],
+      runs: [],
+      runStates: new Map(),
+      attemptsById: new Map(),
+      nowIso: NOW,
+      graceMs: GRACE_MS,
+    });
+    expect(result.orphans).toHaveLength(0);
+    expect(result.reportOnly).toHaveLength(0);
+    expect(result.skipped).toHaveLength(0);
+    expect(result.unknown).toHaveLength(0);
+    // The same revoked Proxy where the runs are declared is read the same way.
+    const runsResult = classifyOrphanReservations({
+      reservations: [reservation({ id: 'res-ok' })],
+      runs: proxy as unknown as readonly unknown[],
+      runStates: new Map(),
+      attemptsById: new Map(),
+      nowIso: NOW,
+      graceMs: GRACE_MS,
+    });
+    expect(runsResult.orphans).toHaveLength(0);
+    expect(runsResult.reportOnly.map((entry) => entry.reservationId)).toEqual(['res-ok']);
+  });
+
+  it('handles hostile inputs and malformed reservations without throwing: traps that throw on element and map reads', () => {
+    // An array-shaped Proxy that answers `length` but throws on element reads.
+    const hostileArray = new Proxy([reservation({ id: 'res-trap' })], {
+      get(target, prop) {
+        if (prop === 'length') {
+          return (target as unknown[]).length;
+        }
+        throw new Error('trap');
+      },
+    });
+    const elementResult = classifyOrphanReservations({
+      reservations: hostileArray as unknown as readonly unknown[],
+      runs: [],
+      runStates: new Map(),
+      attemptsById: new Map(),
+      nowIso: NOW,
+      graceMs: GRACE_MS,
+    });
+    // The unreadable element is malformed with a fallback id, never released.
+    expect(ids(elementResult.unknown)).toEqual(['malformed-0']);
+    // The same Proxy where the runs are declared: the unreadable element is skipped.
+    const runsResult = classifyOrphanReservations({
+      reservations: [reservation({ id: 'res-ok' })],
+      runs: hostileArray as unknown as readonly unknown[],
+      runStates: new Map(),
+      attemptsById: new Map(),
+      nowIso: NOW,
+      graceMs: GRACE_MS,
+    });
+    expect(runsResult.orphans).toHaveLength(0);
+    expect(runsResult.unknown).toHaveLength(0);
+    // A Map Proxy whose `get` throws: the run state is unreadable, so the
+    // reservation is unknown run-state-unknown, never an orphan.
+    const hostileStates = new Proxy(new Map([['run-1', LANE_RUN_TERMINAL_STATES[0]]]), {
+      get(target, prop, receiver) {
+        if (prop === 'get') {
+          return () => {
+            throw new Error('trap');
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as unknown as Map<string, LaneRunStateValue | 'unreadable'>;
+    const statesResult = classify(
+      [reservation({ id: 'res-states' })],
+      [run('run-1', ['att-1'])],
+      { runStates: hostileStates, attemptsById: new Map([['att-1', { state: CAPACITY_RELEASE_STATES[0] }]]) },
+    );
+    expect(ids(statesResult.unknown)).toEqual(['res-states']);
+    expect(statesResult.unknown[0]?.reason).toBe('run-state-unknown');
+    expect(statesResult.orphans).toHaveLength(0);
+  });
+
   it('handles hostile inputs and malformed reservations without throwing: array holes', () => {
     const holes: unknown[] = new Array(3);
     holes[1] = reservation({ id: 'res-hole-ok' });

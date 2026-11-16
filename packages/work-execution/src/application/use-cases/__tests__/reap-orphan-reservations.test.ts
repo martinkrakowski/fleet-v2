@@ -255,6 +255,45 @@ describe('ReapOrphanReservationsUseCase', () => {
     }
   });
 
+  it('refuses a revoked-Proxy request and reads hostile store arrays as unknown, without throwing', async () => {
+    // The request: `Array.isArray` on a revoked Proxy throws; the use case
+    // must refuse it instead of escaping.
+    const revokedRequest = Proxy.revocable({ dryRun: true, nowIso: NOW }, {});
+    revokedRequest.revoke();
+    const requestHarness = makeHarness({
+      reservations: [reservation('res-1', 'att-1')],
+      runs: [runRecord('run-01JB0000000000000000000001', ['att-1'])],
+    });
+    await expect(run(requestHarness, revokedRequest.proxy as unknown as { dryRun: boolean; nowIso: string })).resolves.toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(requestHarness.listReservationsCalls).toBe(0);
+
+    // A store that answers with a Proxy whose traps throw on any read
+    // except `then` (so the promise machinery itself can resolve it) —
+    // `.length`, elements and own-key enumeration all throw.
+    const hostile = new Proxy([reservation('res-1', 'att-1')], {
+      get(_target, prop) {
+        if (prop === 'then') {
+          return undefined;
+        }
+        throw new Error('trap');
+      },
+      ownKeys() { throw new Error('trap'); },
+    });
+    const hostileReservations = makeHarness({ reservationsImpl: () => Promise.resolve(hostile as unknown as readonly CapacityReservationRecord[]), runs: [] });
+    await expect(run(hostileReservations, { dryRun: false, nowIso: NOW })).resolves.toEqual({ outcome: 'unknown', reason: 'reservations-unreadable' });
+
+    const hostileRuns = makeHarness({ reservations: [], runsImpl: () => Promise.resolve(hostile as unknown as readonly Record<string, unknown>[]) });
+    await expect(run(hostileRuns, { dryRun: false, nowIso: NOW })).resolves.toEqual({ outcome: 'unknown', reason: 'runs-unreadable' });
+
+    // A store that answers with a revoked Proxy: the promise machinery
+    // itself refuses to resolve it, and the use case still returns a typed
+    // unknown instead of throwing.
+    const revokedStore = Proxy.revocable([reservation('res-1', 'att-1')], {});
+    revokedStore.revoke();
+    const reservationsHarness = makeHarness({ reservationsImpl: () => Promise.resolve(revokedStore.proxy as unknown as readonly CapacityReservationRecord[]), runs: [] });
+    await expect(run(reservationsHarness, { dryRun: false, nowIso: NOW })).resolves.toEqual({ outcome: 'unknown', reason: 'reservations-unreadable' });
+  });
+
   it('returns unknown reservations-unreadable on throw, timeout, or non-array', async () => {
     const throwing = makeHarness({ reservationsImpl: () => Promise.reject(new Error('down')), runs: [] });
     await expect(run(throwing, { dryRun: false, nowIso: NOW })).resolves.toEqual({ outcome: 'unknown', reason: 'reservations-unreadable' });

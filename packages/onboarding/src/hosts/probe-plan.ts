@@ -176,6 +176,17 @@ export type HostProbeStep =
       readonly detail: string;
     });
 
+/**
+ * The root the probe template and its answer check share: every trailing
+ * slash removed, so a root written as `/srv/worktrees/` plans the same
+ * single-slash template `/srv/worktrees/.fleet-probe.XXXXXX` that the
+ * answer check expects, instead of a double-slash path the check would
+ * refuse while the created file stays behind.
+ */
+function probeRootOf(root: string): string {
+  return root.replace(/\/+$/, '');
+}
+
 /** The version argv of a runner kind's tool descriptor, or undefined. */
 function versionArgvOf(kind: HostRunnerKind): readonly string[] | undefined {
   return BUILT_IN_TOOLS.find((tool) => tool.id === kind)?.detect.argv;
@@ -280,7 +291,7 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
     subject,
     check: 'worktree-root-writable',
     worktreeRoot: spec.worktreeRoot,
-    argv: ['mktemp', `${spec.worktreeRoot}/.fleet-probe.XXXXXX`],
+    argv: ['mktemp', `${probeRootOf(spec.worktreeRoot)}/.fleet-probe.XXXXXX`],
     ...(alias !== undefined ? { sshAlias: alias } : {}),
     timeoutMs: PROBE_TIMEOUT_MS,
   });
@@ -439,13 +450,15 @@ function failureDetail(
  * True when `candidate` is exactly the probe path mktemp was asked to create
  * under `root`: `<root>/.fleet-probe.<six alphanumerics>`, one path segment
  * directly under the root and nothing else, so `mktemp` can never talk this
- * engine into removing anything outside the worktree root.
+ * engine into removing anything outside the worktree root. `root` is taken
+ * through `probeRootOf`, so a root written with a trailing slash matches the
+ * single-slash template the plan builds from the same helper.
  */
 function isProbePath(root: string, candidate: string): boolean {
   if (!candidate.startsWith('/') || candidate.includes('\0')) {
     return false;
   }
-  const prefix = `${root.endsWith('/') ? root.slice(0, -1) : root}/.fleet-probe.`;
+  const prefix = `${probeRootOf(root)}/.fleet-probe.`;
   if (!candidate.startsWith(prefix)) {
     return false;
   }

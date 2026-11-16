@@ -781,6 +781,29 @@ describe('runHostProbes', () => {
     ).toBe(false);
   });
 
+  it('plans a single-slash template and passes for a root written with a trailing slash', async () => {
+    const spec = { ...localSpec, worktreeRoot: '/srv/worktrees/' };
+    const mktemp = planHostProbes(spec).find(
+      (step): step is Extract<HostProbeStep, { kind: 'mktemp-then-rm' }> =>
+        step.kind === 'mktemp-then-rm',
+    );
+    expect(mktemp?.argv).toEqual(['mktemp', '/srv/worktrees/.fleet-probe.XXXXXX']);
+
+    const { executor, calls } = fakeExecutor((call) =>
+      logicalArgv(call.argv).includes('mktemp')
+        ? succeeded('/srv/worktrees/.fleet-probe.abc123\n')
+        : succeeded(),
+    );
+    const lines = await probeHost(spec, executor);
+    const writable = lines.find((entry) => entry.check === 'worktree-root-writable');
+    expect(writable?.status).toBe('PASS');
+    expect(calls[calls.length - 1]?.argv).toEqual([
+      'rm',
+      '--',
+      '/srv/worktrees/.fleet-probe.abc123',
+    ]);
+  });
+
   it('removes a legitimate answer with a bare rm locally and a quoted sh -c over ssh', async () => {
     const local = fakeExecutor((call) =>
       logicalArgv(call.argv).includes('mktemp')

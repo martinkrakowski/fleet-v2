@@ -93,6 +93,8 @@ export * from "./SeatTicketRepositoryPort.out-port.js";
 export * from "./ShadowEvidencePort.out-port.js";
 export * from "./StallAttentionPort.out-port.js";
 export * from "./TelemetryDispositionPort.out-port.js";
+export * from "./TrainHealthAttentionPort.out-port.js";
+export * from "./TrainHealthStateReadPort.out-port.js";
 export * from "./UsagePort.out-port.js";
 export * from "./WorkOrderRepositoryPort.out-port.js";
 export * from "./WorkspacePort.out-port.js";

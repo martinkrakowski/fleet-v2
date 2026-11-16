@@ -95,7 +95,6 @@ function harness(overrides: { now?: () => string } = {}): Harness {
     chains: chains as never,
     forge: forge as unknown as MergeForgeActionPort,
     now: overrides.now ?? (() => NOW),
-    halt: { async read() { return { state: 'clear', record: null }; } },
   });
   return { useCase, chains, forge };
 }

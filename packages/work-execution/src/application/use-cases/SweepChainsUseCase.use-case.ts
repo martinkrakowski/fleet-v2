@@ -191,14 +191,15 @@ function isSweepRefusal(value: unknown): value is SweepRefusal {
 }
 
 /**
- * The fail-closed halt read (plan §3.7, fix rounds 1 and 2): a missing dependency
- * fails closed; a provided port without `read`, a throw, and any answer that
+ * The fail-closed halt read (plan §3.7): an absent dependency is not halted;
+ * a provided port without `read`, a throw, and any answer that
  * is not an object with `state: 'clear'` — or whose record does not agree
  * with that tag — read as halted.
  */
 async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
   if (halt === undefined) {
-    return true;
+    // An absent dependency keeps today's behaviour: not halted.
+    return false;
   }
   if (typeof halt.read !== 'function') {
     return true;
@@ -363,11 +364,12 @@ export class SweepChainsUseCase implements SweepChainsPort {
       readonly forge: MergeForgeActionPort;
       readonly now: () => string;
       /**
-       * The conductor halt read (plan §3.7). Required and fail closed:
-       * missing, unreadable, off-contract or halted, an apply-mode sweep
-       * refuses before any delete and before any swept mark.
+       * The conductor halt read (plan §3.7). Optional: absent means not halted
+       * and behaves exactly as before. When present it fails closed:
+       * unreadable, off-contract or halted, an apply-mode sweep refuses before
+       * any delete and before any swept mark. Read once, at the start of apply.
        */
-      readonly halt: Pick<ConductorHaltPort, 'read'>;
+      readonly halt?: Pick<ConductorHaltPort, 'read'>;
     },
   ) {}
 
@@ -545,8 +547,9 @@ export class SweepChainsUseCase implements SweepChainsPort {
 
   private async apply(command: ValidCommand, planned: readonly PlannedChain[]): Promise<SweepChainsResult> {
     if (await isHalted(this.deps.halt)) {
-      // Refused before any delete and before any swept mark; rechecked below
-      // before every not-yet-sent delete.
+      // Read once per pass: refused before any delete and before any swept
+      // mark. Never re-read per delete, so a delete already sent always
+      // finishes and its chain is recorded as swept.
       return refusalResult({ kind: 'plain', reasonCode: 'halted' });
     }
     try {
@@ -576,12 +579,6 @@ export class SweepChainsUseCase implements SweepChainsPort {
         const nowIso = this.safeNow();
         if (!this.hasBudget(command.deadlineIso, nowIso)) {
           return { outcome: 'budget-exhausted', reasonCode: null, branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
-        }
-        if (await isHalted(this.deps.halt)) {
-          // Recheck before this not-yet-sent delete: deletes already sent stay
-          // reported in `branches`; no further delete and no swept mark goes
-          // out after the halt appeared.
-          return { outcome: 'incomplete', reasonCode: 'halted', branchClass: null, chainName: null, memberRole: null, memberIndex: null, branches };
         }
         let result;
         try {

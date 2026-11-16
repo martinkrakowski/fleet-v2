@@ -203,7 +203,6 @@ function harness(script: {
     attention,
     now: script.nowFn ?? (() => NOW),
     mode: script.mode ?? 'live',
-    halt: { async read() { return { state: 'clear', record: null }; } },
   });
   return { useCase, chains, forge, attention, trace };
 }
@@ -300,14 +299,7 @@ describe('RefreshChainsUseCase', () => {
       const chains = new FakeChains([startedRecord()], trace);
       const forge = new FakeForge(trace);
       const attention = new FakeAttention();
-      const useCase = new RefreshChainsUseCase({
-        chains,
-        forge,
-        attention,
-        now: () => NOW,
-        halt: { async read() { return { state: 'clear', record: null }; } },
-        ...extra,
-      });
+      const useCase = new RefreshChainsUseCase({ chains, forge, attention, now: () => NOW, ...extra });
       const result = await useCase.runRefreshChains(command());
       expect(result.reasonCode).toBe('shadow-would-refresh-1');
       expect(trace).toEqual(['list', 'head']);

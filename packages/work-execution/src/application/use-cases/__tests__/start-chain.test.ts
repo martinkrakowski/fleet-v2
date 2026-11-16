@@ -98,16 +98,7 @@ function harness(script: Script = {}) {
       return script.head ?? { outcome: 'not-found' };
     },
   };
-  return {
-    useCase: new StartChainUseCase({
-      chains,
-      forge,
-      halt: { async read() { return { state: 'clear', record: null }; } },
-    }),
-    calls,
-    outcomes,
-    creates,
-  };
+  return { useCase: new StartChainUseCase({ chains, forge }), calls, outcomes, creates };
 }
 
 describe('StartChainUseCase validation', () => {

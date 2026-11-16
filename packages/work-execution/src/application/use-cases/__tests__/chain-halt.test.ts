@@ -257,24 +257,35 @@ describe('RefreshChainsUseCase halt gating', () => {
     expect(repo.counts.recordChainRefreshOutcome).toBe(1);
   });
 
-  it('RefreshChainsUseCase rechecks the halt after preparation and before the merge action', async () => {
+  it('RefreshChainsUseCase runs normally when halt is absent', async () => {
+    const record = makeRecord();
+    const repo = repoFake({ list: [record], read: { status: 'ok', record } });
+    const forge = forgeFake();
+    const useCase = new RefreshChainsUseCase({ chains: repo, forge, attention: attentionFake(), now: () => NOW, mode: 'live' });
+
+    const result = await useCase.runRefreshChains(refreshCommand);
+
+    expect(result.outcome).toBe('completed');
+    expect(result.chains[0].outcome).toBe('merged');
+    expect(forge.actionCalls).toBe(1);
+    expect(repo.counts.recordChainRefreshOutcome).toBe(1);
+  });
+
+  it('RefreshChainsUseCase reads the halt once per pass', async () => {
     let reads = 0;
     const halt: Pick<ConductorHaltPort, 'read'> = {
       async read() {
         reads += 1;
-        return reads >= 3 ? haltedState : { state: 'clear', record: null };
+        return { state: 'clear', record: null };
       },
     };
-    const { repo, forge, useCase } = makeRefresh({ halt });
+    const { repo, useCase } = makeRefresh({ halt });
 
     const result = await useCase.runRefreshChains(refreshCommand);
 
-    // Reads: run() gate, loop recheck, then the post-preparation recheck —
-    // the halt appears during the intent write, so the forge call is never
-    // sent, while the intent already recorded stays.
-    expect(result).toEqual({ outcome: 'refused', reasonCode: 'halted', chains: [] });
-    expect(forge.actionCalls).toBe(0);
-    expect(repo.counts.recordChainRefreshOutcome).toBe(0);
+    expect(result.outcome).toBe('completed');
+    expect(reads).toBe(1);
+    expect(repo.counts.recordChainRefreshOutcome).toBe(1);
   });
 
   it('reports an already-sent forge action as completed when halt appears mid-call', async () => {
@@ -357,6 +368,18 @@ describe('StartChainUseCase halt gating', () => {
     expect(forge.actionCalls).toBe(1);
   });
 
+  it('StartChainUseCase runs normally when halt is absent', async () => {
+    const repo = repoFake();
+    const forge = forgeFake();
+    const useCase = new StartChainUseCase({ chains: repo, forge });
+
+    const result = await useCase.startChain(makeStartCommand() as never);
+
+    expect(result.outcome).toBe('started');
+    expect(repo.counts.recordChainIntent).toBe(1);
+    expect(forge.actionCalls).toBe(1);
+  });
+
   it('reports an already-sent forge action as completed when halt appears mid-call', async () => {
     const mutable = mutableHaltFake();
     const { repo, forge, useCase } = makeStart({ halt: mutable.halt, onAction: () => mutable.haltNow() });
@@ -433,19 +456,47 @@ describe('SweepChainsUseCase halt gating', () => {
     expect(repo.counts.recordChainSwept).toBe(1);
   });
 
+  it('SweepChainsUseCase runs normally when halt is absent', async () => {
+    const repo = repoFake({ list: [landedRecord] });
+    const forge = forgeFake();
+    const useCase = new SweepChainsUseCase({ chains: repo, forge, now: () => NOW });
+
+    const result = await useCase.runSweepChains(sweepCommand);
+
+    expect(result.outcome).toBe('completed');
+    expect(forge.actionCalls).toBe(2);
+    expect(repo.counts.recordChainSwept).toBe(1);
+  });
+
+  it('SweepChainsUseCase reads the halt once per pass', async () => {
+    let reads = 0;
+    const halt: Pick<ConductorHaltPort, 'read'> = {
+      async read() {
+        reads += 1;
+        return { state: 'clear', record: null };
+      },
+    };
+    const { useCase } = makeSweep({ halt });
+
+    await useCase.runSweepChains(sweepCommand);
+
+    expect(reads).toBe(1);
+  });
+
   it('reports an already-sent forge action as completed when halt appears mid-call', async () => {
     const mutable = mutableHaltFake();
     const { repo, forge, useCase } = makeSweep({ halt: mutable.halt, onAction: () => mutable.haltNow() });
 
     const result = await useCase.runSweepChains(sweepCommand);
 
-    // Fix round 1: the halt is rechecked before each not-yet-sent delete. The
-    // link delete was already sent and stays reported; the chain-branch delete
-    // is never sent and the swept mark is not written.
-    expect(result.outcome).toBe('incomplete');
-    expect(result.reasonCode).toBe('halted');
-    expect(result.branches.map((branch) => [branch.role, branch.outcome])).toEqual([['link', 'deleted']]);
-    expect(forge.actionCalls).toBe(1);
-    expect(repo.counts.recordChainSwept).toBe(0);
+    // The halt is read once at the start of the pass: a halt that appears
+    // after the first delete was sent does not abandon the chain half-swept.
+    expect(result.outcome).toBe('completed');
+    expect(result.branches.map((branch) => [branch.role, branch.outcome])).toEqual([
+      ['link', 'deleted'],
+      ['chain', 'deleted'],
+    ]);
+    expect(forge.actionCalls).toBe(2);
+    expect(repo.counts.recordChainSwept).toBe(1);
   });
 });

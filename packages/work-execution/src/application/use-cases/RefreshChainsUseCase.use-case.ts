@@ -115,12 +115,13 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       readonly forge: MergeForgeActionPort;
       readonly attention: ChainAttentionPort;
       /**
-       * The conductor halt read (plan §3.7). Required and fail closed: a
-       * missing port, an unreadable read, a throw and any answer that is not
-       * an object whose `state: 'clear'` agrees with its record refuse the
-       * pass before any forge call or intent write.
+       * The conductor halt read (plan §3.7). Optional: absent means not halted
+       * and behaves exactly as before. When present it fails closed: an
+       * unreadable read, a throw and any answer that is not an object whose
+       * `state: 'clear'` agrees with its record refuse the pass before any
+       * forge call or intent write. Read once per pass.
        */
-      readonly halt: Pick<ConductorHaltPort, 'read'>;
+      readonly halt?: Pick<ConductorHaltPort, 'read'>;
       readonly now?: () => string;
       /** `live` writes and is accepted only when passed explicitly; an omitted or unknown mode is `shadow` (observe only: no intent, no forge write, no attention). */
       readonly mode?: 'shadow' | 'live';
@@ -153,14 +154,15 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
   }
 
   /**
-   * The fail-closed halt read (plan §3.7, fix rounds 1 and 2): a missing dependency
-   * fails closed; a provided port without `read`, a throw, and any answer
+   * The fail-closed halt read (plan §3.7): an absent dependency is not halted;
+   * a provided port without `read`, a throw, and any answer
    * that is not an object with `state: 'clear'` — or whose record does not
    * agree with that tag — read as halted.
    */
   private async isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
     if (halt === undefined) {
-      return true;
+      // An absent dependency keeps today's behaviour: not halted.
+      return false;
     }
     if (typeof halt.read !== 'function') {
       return true;
@@ -201,8 +203,8 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       return { outcome: 'skipped', reasonCode: 'chains-unreadable', chains: [] };
     }
     if (await this.isHalted(this.deps.halt)) {
-      // Refused before any forge call and before any intent or outcome write;
-      // rechecked before every not-yet-sent action below.
+      // Read once per pass, never again inside the per-chain loop: refused
+      // before any forge call and before any intent or outcome write.
       return { outcome: 'refused', reasonCode: 'halted', chains: [] };
     }
     const head = await this.readMainHead(command);
@@ -221,19 +223,11 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       if (record.state !== 'started') {
         continue;
       }
-      if (await this.isHalted(this.deps.halt)) {
-        // Recheck before this chain's not-yet-sent intent and forge action: a
-        // merge already sent above still settles and is reported in `chains`.
-        return { outcome: 'refused', reasonCode: 'halted', chains };
-      }
       if (!this.hasBudget(command.deadlineIso)) {
         budgetHit = true;
         break;
       }
       const decision = await this.refreshOne(command, record, head.headSha, chains);
-      if (decision === 'halted') {
-        return { outcome: 'refused', reasonCode: 'halted', chains };
-      }
       if (decision === 'budget-exhausted') {
         budgetHit = true;
         break;
@@ -296,7 +290,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     record: ChainRecord,
     mainSha: string,
     chains: RefreshChainsChainReport[],
-  ): Promise<'done' | 'budget-exhausted' | 'halted'> {
+  ): Promise<'done' | 'budget-exhausted'> {
     const key = chainRefreshKey(record.chainName, mainSha);
     if (key === null) {
       this.skip(chains, record.chainName, '');
@@ -318,13 +312,6 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     }
     if (!this.hasBudget(command.deadlineIso)) {
       return 'budget-exhausted';
-    }
-    // Recheck immediately before sending the merge action: the intent write
-    // and reread in prepare() awaited above, so a halt that appeared during
-    // preparation must not let the forge call proceed. The intent stays
-    // recorded (it is a journal write, not an action-implying forge call).
-    if (await this.isHalted(this.deps.halt)) {
-      return 'halted';
     }
     const forge = await this.forgeCall(command, record, key, mainSha);
     if (forge === 'budget-exhausted') {

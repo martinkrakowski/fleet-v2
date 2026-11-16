@@ -102,14 +102,15 @@ function unresolved(record: ChainRecord | null = null): StartChainDecision {
 }
 
 /**
- * The fail-closed halt read (plan §3.7, fix rounds 1 and 2): a missing dependency
- * fails closed; a provided port without `read`, a throw, and any answer that
+ * The fail-closed halt read (plan §3.7): an absent dependency is not halted;
+ * a provided port without `read`, a throw, and any answer that
  * is not an object with `state: 'clear'` — or whose record does not agree
  * with that tag — read as halted.
  */
 async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
   if (halt === undefined) {
-    return true;
+    // An absent dependency keeps today's behaviour: not halted.
+    return false;
   }
   if (typeof halt.read !== 'function') {
     return true;
@@ -159,11 +160,12 @@ export class StartChainUseCase implements StartChainPort {
       readonly chains: ChainRepositoryPort;
       readonly forge: MergeForgeActionPort;
       /**
-       * The conductor halt read (plan §3.7). Required and fail closed:
-       * missing, unreadable, off-contract or halted, a start refuses before
-       * the intent write and before any forge call.
+       * The conductor halt read (plan §3.7). Optional: absent means not halted
+       * and behaves exactly as before. When present it fails closed:
+       * unreadable, off-contract or halted, a start refuses before the intent
+       * write and before any forge call.
        */
-      readonly halt: Pick<ConductorHaltPort, 'read'>;
+      readonly halt?: Pick<ConductorHaltPort, 'read'>;
     },
   ) {}
 

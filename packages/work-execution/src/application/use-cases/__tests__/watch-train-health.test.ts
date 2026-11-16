@@ -228,7 +228,10 @@ describe('WatchTrainHealthUseCase', () => {
   it('stops raising and sets budgetExhausted when clock jumps past deadline after first raise', async () => {
     const late = '2026-11-16T12:10:00.000Z';
     const { deps, log, raiseCalls, clearCalls } = makeDeps({
-      nowSchedule: [NOW, NOW, NOW, late],
+      // One extra NOW accounts for readState's own budget re-check before the
+      // port call (the fix for the unbounded state read): the clock jump to
+      // `late` must still land on raiseAll's second target, not on readState.
+      nowSchedule: [NOW, NOW, NOW, NOW, late],
       stateRead: {
         outcome: 'ok',
         snapshot: healthySnapshot({
@@ -291,6 +294,88 @@ describe('WatchTrainHealthUseCase', () => {
     });
     expect(blindRaise(raiseCalls[0])).toBe(true);
     expect(portCalls(log).filter((call) => call.method.startsWith('list') || call.method.startsWith('clear'))).toHaveLength(0);
+  });
+
+  it('returns ok unchanged when the state read answers inside its own timeout', async () => {
+    const { deps, log } = makeDeps({
+      stateRead: { outcome: 'ok', snapshot: healthySnapshot() } as never,
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({ outcome: 'evaluated', healthy: true, exitCode: 0 });
+    expect(portCalls(log).filter((call) => call.method === 'readTrainHealthState')).toHaveLength(1);
+  });
+
+  it('bounds the state read with its own timeout when the port never resolves', async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, log, raiseCalls } = makeDeps();
+      const hanging = new Promise<TrainHealthStateReadResult>(() => {});
+      const hangDeps = {
+        ...deps,
+        state: {
+          ...deps.state,
+          readTrainHealthState: async (request) => {
+            log.push({ kind: 'port', method: 'readTrainHealthState', arg: request });
+            return hanging;
+          },
+        },
+      } as WatchTrainHealthDependencies;
+      const pending = run(hangDeps, baseRequest());
+      let settledEarly = false;
+      void pending.then(() => {
+        settledEarly = true;
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(settledEarly).toBe(false);
+      await vi.advanceTimersByTimeAsync(400_000);
+      const result = await pending;
+      expect(result).toMatchObject({
+        outcome: 'blind',
+        reasonCode: 'state-read-timed-out',
+        raised: 1,
+        attentionFailures: 0,
+      });
+      expect(blindRaise(raiseCalls[0])).toBe(true);
+      expect(portCalls(log).filter((call) => call.method === 'readTrainHealthState')).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('returns state-unavailable, never state-read-timed-out, when the port rejects with an error that merely looks like the timeout', async () => {
+    const { deps, log, raiseCalls } = makeDeps();
+    const lookalikeDeps = {
+      ...deps,
+      state: {
+        ...deps.state,
+        readTrainHealthState: async (request) => {
+          log.push({ kind: 'port', method: 'readTrainHealthState', arg: request });
+          throw new Error('state-read-timeout');
+        },
+      },
+    } as WatchTrainHealthDependencies;
+    const result = await run(lookalikeDeps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'blind',
+      reasonCode: 'state-unavailable',
+      raised: 1,
+      attentionFailures: 0,
+    });
+    expect(blindRaise(raiseCalls[0])).toBe(true);
+    expect(portCalls(log).filter((call) => call.method === 'readTrainHealthState')).toHaveLength(1);
+  });
+
+  it('skips the state read entirely when its own budget is already exhausted', async () => {
+    const { deps, log, raiseCalls } = makeDeps({ nowSchedule: [NOW, DEADLINE] });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'blind',
+      reasonCode: 'state-budget-exhausted',
+      raised: 0,
+      attentionFailures: 0,
+    });
+    expect(portCalls(log).filter((call) => call.method === 'readTrainHealthState')).toHaveLength(0);
+    expect(raiseCalls).toHaveLength(0);
   });
 
   it('returns blind evaluation-invalid-snapshot when snapshot has queue null', async () => {

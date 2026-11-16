@@ -12,6 +12,10 @@
  * stays unknown: an unreadable record, an unreadable `main` head and an
  * ambiguous forge answer are skipped with a reason code, never merged, empty or
  * a pass. The pass stops when fewer than `DAEMON_CALL_MIN_REMAINING_MS` remain.
+ * The operator halt is read fail-closed at the pass start, before each started
+ * chain, and directly before each chain's merge (1 + 2N reads for N started
+ * chains reaching merge); the merge is the only one-way action, so a halt set
+ * during the intent write sends no merge and leaves the intent in flight.
  * No clock is read here except the injected one; reasons, keys and chain names
  * only, never a path or an input value.
  */
@@ -118,8 +122,11 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       /**
        * The conductor halt read (plan §3.7). Required and fail-closed: a
        * missing, null, unreadable, off-contract or throwing halt is halted.
-       * Read at the pass start and again before each started chain in live
-       * mode; never inside one chain.
+       * Read at the pass start, before each started chain, and directly
+       * before each chain's merge (1 + 2N reads for N started chains
+       * reaching merge; no third read when replayed from a stored terminal
+       * outcome, skipped, or stopped by `prepare`; shadow mode reads it
+       * once).
        */
       readonly halt: Pick<ConductorHaltPort, 'read'>;
       readonly now?: () => string;
@@ -162,9 +169,9 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       return { outcome: 'skipped', reasonCode: 'chains-unreadable', chains: [] };
     }
     if (await isRequiredPassHalted(this.deps.halt)) {
-      // The halt is read here at the pass start and again before each started
-      // chain: refused before any forge call and before any intent or outcome
-      // write.
+      // The halt is read here at the pass start, again before each started
+      // chain, and directly before each chain's merge (inside `forgeCall`,
+      // the only one-way action of `refreshOne`).
       return { outcome: 'refused', reasonCode: 'halted', chains: [] };
     }
     const head = await this.readMainHead(command);
@@ -199,6 +206,9 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
         return { outcome: 'refused', reasonCode: 'halted', chains };
       }
       const decision = await this.refreshOne(command, record, mainSha, chains);
+      if (decision === 'halted') {
+        return { outcome: 'refused', reasonCode: 'halted', chains };
+      }
       if (decision === 'budget-exhausted') {
         budgetHit = true;
         break;
@@ -261,7 +271,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     record: ChainRecord,
     mainSha: string,
     chains: RefreshChainsChainReport[],
-  ): Promise<'done' | 'budget-exhausted'> {
+  ): Promise<'done' | 'budget-exhausted' | 'halted'> {
     const key = chainRefreshKey(record.chainName, mainSha);
     if (key === null) {
       this.skip(chains, record.chainName, '');
@@ -285,8 +295,8 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       return 'budget-exhausted';
     }
     const forge = await this.forgeCall(command, record, key, mainSha);
-    if (forge === 'budget-exhausted') {
-      return 'budget-exhausted';
+    if (forge === 'budget-exhausted' || forge === 'halted') {
+      return forge;
     }
     const outcome = refreshOutcomeOf(forge);
     if (outcome === null) {
@@ -380,7 +390,12 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     record: ChainRecord,
     key: string,
     mainSha: string,
-  ): Promise<Awaited<ReturnType<MergeForgeActionPort['performMergeForgeAction']>> | 'budget-exhausted'> {
+  ): Promise<
+    Awaited<ReturnType<MergeForgeActionPort['performMergeForgeAction']>> | 'budget-exhausted' | 'halted'
+  > {
+    if (await isRequiredPassHalted(this.deps.halt)) {
+      return 'halted';
+    }
     if (!this.hasBudget(command.deadlineIso)) {
       return 'budget-exhausted';
     }

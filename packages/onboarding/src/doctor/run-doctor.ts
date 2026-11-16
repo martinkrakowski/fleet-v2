@@ -261,6 +261,58 @@ async function installationLines(
   return lines;
 }
 
+/** Marker: the injected probes carry no `ciRunnerSlot` method. */
+const NO_SLOT_PROBE = Symbol('no-ci-runner-slot-probe');
+
+/** Status and detail of one slot line; anything but an exact known answer is UNKNOWN. */
+function ciRunnerSlotVerdict(
+  state: unknown,
+  slot: { readonly name: string; readonly unit: string },
+  probeHost: string,
+): readonly [DoctorStatus, string] {
+  if (state === 'active') {
+    return ['PASS', `slot ${slot.name} active`];
+  }
+  if (state === 'inactive') {
+    return [
+      'FAIL',
+      `slot ${slot.name} not active; fix: systemctl restart ${slot.unit} on ${probeHost}`,
+    ];
+  }
+  if (state === NO_SLOT_PROBE) {
+    return ['UNKNOWN', `slot ${slot.name} probe not available`];
+  }
+  return ['UNKNOWN', `slot ${slot.name} state could not be read`];
+}
+
+/**
+ * One line per CI runner slot the host declares (OG-28c), in declared
+ * order. The port read, the call and the answer all happen inside `safely`,
+ * so a throwing getter, a throwing or rejecting probe and a hostile answer
+ * are UNKNOWN, never a crash. The answer is only compared with `===`; no
+ * property of it is read. Details carry the slot name, the unit name and
+ * the probe host only.
+ */
+async function ciRunnerSlotLines(
+  name: string,
+  host: HostModel,
+  probeHost: string,
+  probes: DoctorProbes,
+): Promise<DoctorLine[]> {
+  const lines: DoctorLine[] = [];
+  for (const slot of host.ciRunnerSlots ?? []) {
+    const state: unknown = await safely(async () => {
+      const probe = probes.ciRunnerSlot;
+      return typeof probe === 'function'
+        ? await probe.call(probes, probeHost, slot.unit)
+        : NO_SLOT_PROBE;
+    });
+    const [status, detail] = ciRunnerSlotVerdict(state, slot, probeHost);
+    lines.push(line('host', name, `ci-runner-${slot.name}`, status, detail));
+  }
+  return lines;
+}
+
 /** Per-host and role lines: reachability, platform tools, worktree root, runner capabilities. */
 async function hostLines(
   model: FleetInstallationModel,
@@ -358,6 +410,7 @@ async function hostLines(
         );
       }
     }
+    lines.push(...(await ciRunnerSlotLines(name, host, probeHost, probes)));
   }
   return lines;
 }

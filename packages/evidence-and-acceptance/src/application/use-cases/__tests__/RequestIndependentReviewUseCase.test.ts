@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import type { EvidenceAssessmentRecord } from '../../../domain/evidence-records.js';
+import type { EvidenceAssessmentRecord, ReceiptSubject } from '../../../domain/evidence-records.js';
 import type {
   ArchiveEvidenceRequest,
   ArchiveEvidenceResult,
@@ -22,7 +22,11 @@ import type {
 } from '../../ports/out/EvidenceSeatPolicyPort.out-port.js';
 import type { RequestIndependentReviewRequest } from '../../ports/in/RequestIndependentReviewPort.in-port.js';
 import { ReviewReceipt } from '../../../domain/entities/ReviewReceipt.js';
-import { isValidChainName } from '../../../domain/evidence-records.js';
+import {
+  assessmentIdForBrief,
+  attemptIdForBrief,
+  isValidChainName,
+} from '../../../domain/evidence-records.js';
 import { RequestIndependentReviewUseCase } from '../RequestIndependentReviewUseCase.use-case.js';
 
 const HEAD1 = '1111111111111111111111111111111111111111';
@@ -710,6 +714,450 @@ describe('unknown cause codes on receipts and the chain-name guard (RV2, CO9 #77
     }
     for (const value of ['Chain/x', 'chain/x', 'a/b', 'a--b', '-a', 'a-', '', 'A', 'a b', 'a'.repeat(195), 'a'.repeat(200), 42, null, undefined, {}, ['a']]) {
       expect(isValidChainName(value), String(value)).toBe(false);
+    }
+  });
+});
+
+describe('brief-verify and the brief subject', () => {
+  const PROJECT = 'proj-1';
+  const DIGEST = 'a'.repeat(64);
+  const REQUEST_ID = 'brief-verify:wo-1:aaaaaaaaaaaa';
+  const SUBJECT_REASON = 'The review subject is not valid for this request';
+
+  function briefSubject(overrides: Partial<ReceiptSubject> = {}): ReceiptSubject {
+    return {
+      kind: 'brief',
+      projectId: PROJECT,
+      attemptId: null,
+      chainName: null,
+      integrationHeadSha: null,
+      briefPackageDigest: DIGEST,
+      baseCommit: HEAD1,
+      ...overrides,
+    };
+  }
+
+  function briefRequest(overrides: Record<string, unknown> = {}): RequestIndependentReviewRequest {
+    return {
+      assessmentId: assessmentIdForBrief(PROJECT, DIGEST),
+      projectId: PROJECT,
+      attemptId: attemptIdForBrief(PROJECT, DIGEST),
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      reviewerModel: 'openai/gpt-4o',
+      kind: 'brief-verify',
+      requestId: REQUEST_ID,
+      briefText: 'Do the thing.',
+      subject: briefSubject(),
+      ...overrides,
+    } as RequestIndependentReviewRequest;
+  }
+
+  function buildUseCase(repo: InMemoryAssessmentRepo) {
+    const reviewer = new StubReviewer();
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+    return { useCase, reviewer, archive };
+  }
+
+  /** A copy of a request without the named keys, so a field can be truly absent. */
+  function omit<T extends object, K extends keyof T>(value: T, ...keys: K[]): Omit<T, K> {
+    const copy = { ...value };
+    for (const key of keys) {
+      delete copy[key];
+    }
+    return copy;
+  }
+
+  async function expectInvalidRequest(
+    useCase: RequestIndependentReviewUseCase,
+    request: RequestIndependentReviewRequest,
+    reviewer: StubReviewer,
+    reason?: string,
+  ): Promise<void> {
+    const result = await useCase.requestIndependentReview(request);
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.rejection).toBe('invalid-request');
+      if (reason !== undefined) {
+        expect(result.reason).toBe(reason);
+      }
+    }
+    expect(reviewer.calls).toHaveLength(0);
+  }
+
+  it('accepts a matching brief-verify request', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const result = await useCase.requestIndependentReview(briefRequest());
+
+    expect(result.outcome).toBe('reviewed');
+    if (result.outcome !== 'reviewed') {
+      throw new Error('expected a completed review');
+    }
+    expect(result.receipt.kind).toBe('brief-verify');
+    expect(result.receipt.subject).toEqual(briefSubject());
+    const stored = await repo.findAssessmentById(assessmentIdForBrief(PROJECT, DIGEST));
+    expect(stored).not.toBeNull();
+    expect(stored?.attemptId).toBe(`brief:${PROJECT}:${DIGEST}`);
+    expect(stored?.reviewReceipts).toHaveLength(1);
+    expect(reviewer.calls).toHaveLength(1);
+    expect(reviewer.calls[0]?.kind).toBe('brief-verify');
+    expect(reviewer.calls[0]?.briefText).toBe('Do the thing.');
+  });
+
+  it('refuses brief-verify with no subject before any reviewer call or write', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+    await expectInvalidRequest(useCase, omit(briefRequest(), 'subject') as RequestIndependentReviewRequest, reviewer, SUBJECT_REASON);
+    expect(await repo.findAssessmentById(assessmentIdForBrief(PROJECT, DIGEST))).toBeNull();
+  });
+
+  it('refuses a brief-verify request carrying an attempt subject equal to its own ids', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const attemptSubject: ReceiptSubject = {
+      kind: 'attempt',
+      projectId: PROJECT,
+      attemptId: attemptIdForBrief(PROJECT, DIGEST),
+      chainName: null,
+      integrationHeadSha: null,
+      briefPackageDigest: null,
+      baseCommit: null,
+    };
+    await expectInvalidRequest(useCase, briefRequest({ subject: attemptSubject }), reviewer, SUBJECT_REASON);
+    expect(await repo.findAssessmentById(assessmentIdForBrief(PROJECT, DIGEST))).toBeNull();
+  });
+
+  it('refuses a chain subject on a brief-verify request, and a brief subject under another kind', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const chainSubject: ReceiptSubject = {
+      kind: 'chain',
+      projectId: PROJECT,
+      attemptId: null,
+      chainName: 'main',
+      integrationHeadSha: HEAD1,
+      briefPackageDigest: null,
+      baseCommit: null,
+    };
+    await expectInvalidRequest(useCase, briefRequest({ subject: chainSubject }), reviewer, SUBJECT_REASON);
+    await expectInvalidRequest(useCase, briefRequest({ kind: 'code-review' }), reviewer, SUBJECT_REASON);
+    await expectInvalidRequest(useCase, briefRequest({ kind: 'pre-merge' }), reviewer, SUBJECT_REASON);
+  });
+
+  it('refuses an attempt-path request whose attemptId starts with brief: or chain:', async () => {
+    const reservedIds = [attemptIdForBrief(PROJECT, DIGEST), 'chain:proj-1:main'];
+    const repo = new InMemoryAssessmentRepo(reservedIds.map((attemptId) => sampleRecord({ attemptId })));
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    for (const attemptId of reservedIds) {
+      const request = {
+        assessmentId: 'asm-1',
+        projectId: PROJECT,
+        attemptId,
+        candidateHeadSha: HEAD1,
+        policyRevision: 'pol-1',
+        implementerModel: 'anthropic/claude-3-5-sonnet',
+        reviewerModel: 'openai/gpt-4o',
+        kind: 'code-review',
+        requestId: 'review-01JB0000000000000000000009',
+      };
+      const result = await useCase.requestIndependentReview(request as RequestIndependentReviewRequest);
+      expect(result.outcome).toBe('rejected');
+      if (result.outcome === 'rejected') {
+        expect(result.rejection).toBe('invalid-request');
+        expect(result.reason).toBe(SUBJECT_REASON);
+      }
+      expect(reviewer.calls).toHaveLength(0);
+    }
+
+    // The same reserved attempt id behind an attempt subject is refused the same way.
+    const attemptSubject: ReceiptSubject = {
+      kind: 'attempt',
+      projectId: PROJECT,
+      attemptId: 'chain:proj-1:main',
+      chainName: null,
+      integrationHeadSha: null,
+      briefPackageDigest: null,
+      baseCommit: null,
+    };
+    const withSubject = await useCase.requestIndependentReview(
+      briefRequest({
+        assessmentId: 'asm-1',
+        attemptId: 'chain:proj-1:main',
+        kind: 'code-review',
+        subject: attemptSubject,
+      }),
+    );
+    expect(withSubject.outcome).toBe('rejected');
+    if (withSubject.outcome === 'rejected') {
+      expect(withSubject.reason).toBe(SUBJECT_REASON);
+    }
+
+    // A manual review (no kind, no requestId, no subject) on a reserved id is refused too.
+    const manual = omit(briefRequest({ assessmentId: 'asm-1', attemptId: 'chain:proj-1:main' }), 'requestId', 'kind', 'subject');
+    const manualResult = await useCase.requestIndependentReview(manual as RequestIndependentReviewRequest);
+    expect(manualResult.outcome).toBe('rejected');
+    if (manualResult.outcome === 'rejected') {
+      expect(manualResult.reason).toBe(SUBJECT_REASON);
+    }
+
+    expect(reviewer.calls).toHaveLength(0);
+    const seeded = await repo.findAssessmentById('asm-1');
+    expect(seeded?.revision).toBe(0);
+    expect(seeded?.reviewReceipts).toHaveLength(0);
+  });
+
+  it('refuses a brief subject that disagrees with the request', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const rows: Array<{ name: string; request: RequestIndependentReviewRequest }> = [
+      { name: 'another digest in the subject only', request: briefRequest({ subject: briefSubject({ briefPackageDigest: 'b'.repeat(64) }) }) },
+      { name: 'baseCommit different from candidateHeadSha', request: briefRequest({ subject: briefSubject({ baseCommit: HEAD2 }) }) },
+      { name: 'projectId different from the request', request: briefRequest({ subject: briefSubject({ projectId: 'proj-2' }) }) },
+      { name: 'attemptId not the derived brief id', request: briefRequest({ attemptId: 'att-1' }) },
+      { name: 'assessmentId not the derived one', request: briefRequest({ assessmentId: 'asm-other' }) },
+      { name: 'a non-null chainName', request: briefRequest({ subject: briefSubject({ chainName: 'main' }) }) },
+      { name: 'a non-null integrationHeadSha', request: briefRequest({ subject: briefSubject({ integrationHeadSha: HEAD1 }) }) },
+      { name: 'a requestId that fails the pattern', request: briefRequest({ requestId: 'bad id' }) },
+    ];
+    for (const row of rows) {
+      await expectInvalidRequest(useCase, row.request, reviewer, SUBJECT_REASON);
+    }
+
+    const withoutRequestId = omit(briefRequest(), 'requestId');
+    const result = await useCase.requestIndependentReview(withoutRequestId as RequestIndependentReviewRequest);
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.reason).toBe(SUBJECT_REASON);
+    }
+    expect(reviewer.calls).toHaveLength(0);
+  });
+
+  it('refuses a malformed digest or base commit even when every id agrees with it', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const badDigests = ['a'.repeat(63), 'A'.repeat(64), `a`.repeat(64) + '\n', 'a'.repeat(65)];
+    for (const digest of badDigests) {
+      const request = briefRequest({
+        subject: briefSubject({ briefPackageDigest: digest }),
+        attemptId: attemptIdForBrief(PROJECT, digest),
+        assessmentId: assessmentIdForBrief(PROJECT, digest),
+      });
+      await expectInvalidRequest(useCase, request, reviewer, SUBJECT_REASON);
+    }
+
+    const badBaseCommits = ['1'.repeat(39), 'A'.repeat(40), HEAD1 + '\n'];
+    for (const commit of badBaseCommits) {
+      const request = briefRequest({
+        subject: briefSubject({ baseCommit: commit }),
+        candidateHeadSha: commit,
+      });
+      await expectInvalidRequest(useCase, request, reviewer, SUBJECT_REASON);
+    }
+    expect(reviewer.calls).toHaveLength(0);
+  });
+
+  it('refuses an invalid brief projectId', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const badProjectIds = ['', ' proj-1', 'proj:1', 'proj/1', '\u0001x', 'p'.repeat(201)];
+    for (const projectId of badProjectIds) {
+      const request = briefRequest({
+        subject: briefSubject({ projectId }),
+        projectId,
+        attemptId: attemptIdForBrief(projectId, DIGEST),
+        assessmentId: assessmentIdForBrief(projectId, DIGEST),
+      });
+      await expectInvalidRequest(useCase, request, reviewer, SUBJECT_REASON);
+    }
+    expect(reviewer.calls).toHaveLength(0);
+  });
+
+  it('refuses blank and oversize brief text before any reviewer call', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    for (const briefText of ['', '   ']) {
+      await expectInvalidRequest(
+        useCase,
+        briefRequest({ briefText }),
+        reviewer,
+        'A brief-verify review requires the brief text',
+      );
+    }
+    // The briefText key entirely absent is refused the same way.
+    await expectInvalidRequest(
+      useCase,
+      omit(briefRequest(), 'briefText') as RequestIndependentReviewRequest,
+      reviewer,
+      'A brief-verify review requires the brief text',
+    );
+
+    for (const briefText of ['x'.repeat(65537), 'é'.repeat(32769)]) {
+      await expectInvalidRequest(
+        useCase,
+        briefRequest({ briefText }),
+        reviewer,
+        'The brief text exceeds the 64 KiB limit',
+      );
+    }
+
+    const atLimit = await useCase.requestIndependentReview(briefRequest({ briefText: 'x'.repeat(65536) }));
+    expect(atLimit.outcome).toBe('reviewed');
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
+  it('never encodes a brief text longer than the limit', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase } = buildUseCase(repo);
+    const encode = vi.spyOn(TextEncoder.prototype, 'encode');
+    try {
+      const overLimit = 'x'.repeat(4 * 1024 * 1024);
+      const result = await useCase.requestIndependentReview(briefRequest({ briefText: overLimit }));
+      expect(result.outcome).toBe('rejected');
+      if (result.outcome === 'rejected') {
+        expect(result.rejection).toBe('invalid-request');
+        expect(result.reason).toBe('The brief text exceeds the 64 KiB limit');
+      }
+      expect(encode.mock.calls.every((call) => String(call[0] ?? '').length <= 65536)).toBe(true);
+
+      const measured = 'é'.repeat(32769);
+      await useCase.requestIndependentReview(briefRequest({ briefText: measured }));
+      expect(encode.mock.calls.some((call) => call[0] === measured)).toBe(true);
+    } finally {
+      encode.mockRestore();
+    }
+  });
+
+  it('replays a matching request id without a second reviewer call', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const first = await useCase.requestIndependentReview(briefRequest());
+    expect(first.outcome).toBe('reviewed');
+    const second = await useCase.requestIndependentReview(briefRequest());
+    expect(second.outcome).toBe('reviewed');
+    if (first.outcome === 'reviewed' && second.outcome === 'reviewed') {
+      expect(second.receipt.id).toBe(first.receipt.id);
+    }
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
+  it('replays with another reviewer model as request-id-reused', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    expect((await useCase.requestIndependentReview(briefRequest())).outcome).toBe('reviewed');
+    const result = await useCase.requestIndependentReview(
+      briefRequest({ reviewerModel: 'openai/gpt-4o-mini' }),
+    );
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.rejection).toBe('request-id-reused');
+    }
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
+  it('replays with a changed digest and the old ids as invalid-request', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    expect((await useCase.requestIndependentReview(briefRequest())).outcome).toBe('reviewed');
+    const changedDigest = 'b'.repeat(64);
+    const result = await useCase.requestIndependentReview(
+      briefRequest({
+        subject: briefSubject({ briefPackageDigest: changedDigest }),
+      }),
+    );
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.rejection).toBe('invalid-request');
+    }
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
+  it('a stored receipt for another digest under the same request id is request-id-reused', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    expect((await useCase.requestIndependentReview(briefRequest())).outcome).toBe('reviewed');
+    const stored = await repo.findAssessmentById(assessmentIdForBrief(PROJECT, DIGEST));
+    expect(stored).not.toBeNull();
+    const receipt = stored!.reviewReceipts[0]!;
+    const chainSubject: ReceiptSubject = {
+      kind: 'chain',
+      projectId: PROJECT,
+      attemptId: null,
+      chainName: 'main',
+      integrationHeadSha: HEAD1,
+      briefPackageDigest: null,
+      baseCommit: null,
+    };
+    const changes: Array<Partial<typeof receipt>> = [
+      { subject: { ...(receipt.subject as ReceiptSubject), briefPackageDigest: 'b'.repeat(64) } },
+      { subject: { ...(receipt.subject as ReceiptSubject), baseCommit: HEAD2 } },
+      { subject: { ...(receipt.subject as ReceiptSubject), projectId: 'proj-2' } },
+      { subject: chainSubject },
+      { kind: 'code-review' },
+    ];
+    for (const change of changes) {
+      await repo.saveAssessment({ ...stored!, reviewReceipts: [{ ...receipt, ...change }] });
+      const result = await useCase.requestIndependentReview(briefRequest());
+      expect(result.outcome).toBe('rejected');
+      if (result.outcome === 'rejected') {
+        expect(result.rejection).toBe('request-id-reused');
+      }
+      expect(reviewer.calls).toHaveLength(1);
+      await repo.saveAssessment(stored!);
+    }
+  });
+
+  it('an unexpected store failure on a brief request is the fixed typed rejection', async () => {
+    class ExplodingRepo extends InMemoryAssessmentRepo {
+      async findAssessmentById(): Promise<EvidenceAssessmentRecord | null> {
+        throw new Error('disk exploded at /secret/path');
+      }
+    }
+    const repo = new ExplodingRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const result = await useCase.requestIndependentReview(briefRequest());
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome === 'rejected') {
+      expect(result.rejection).toBe('review-unavailable');
+      expect(result.reason).toBe('The brief verification review could not be completed');
+    }
+    expect(JSON.stringify(result)).not.toContain('/secret/path');
+    expect(reviewer.calls).toHaveLength(0);
+  });
+
+  it('a hostile subject on a brief-verify request is refused, never thrown', async () => {
+    const repo = new InMemoryAssessmentRepo();
+    const { useCase, reviewer } = buildUseCase(repo);
+
+    const hostileRequests: unknown[] = [
+      briefRequest({ subject: { get kind(): string { throw new Error('trap'); } } }),
+      briefRequest({ subject: new Proxy({}, { getOwnPropertyDescriptor() { throw new Error('trap'); } }) }),
+      briefRequest({ subject: JSON.parse('{"__proto__":{"kind":"brief"}}') }),
+    ];
+    for (const hostile of hostileRequests) {
+      const result = await useCase.requestIndependentReview(hostile as RequestIndependentReviewRequest);
+      expect(result.outcome).toBe('rejected');
+      if (result.outcome === 'rejected') {
+        expect(result.rejection).toBe('invalid-request');
+        expect(result.reason).toBe(SUBJECT_REASON);
+      }
+      expect(reviewer.calls).toHaveLength(0);
+      expect(await repo.findAssessmentById(assessmentIdForBrief(PROJECT, DIGEST))).toBeNull();
     }
   });
 });

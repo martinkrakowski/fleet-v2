@@ -9,6 +9,7 @@ export * from "./AuthorBriefUseCase.use-case.js";
 export * from "./AutoMergeAttemptUseCase.use-case.js";
 export * from "./BuildFactPackUseCase.use-case.js";
 export * from "./CancelPreparedAttemptUseCase.use-case.js";
+export * from "./chain-pass-halt.js";
 export * from "./CloseWorkOrderUseCase.use-case.js";
 export * from "./CollectAttemptArtifactsUseCase.use-case.js";
 export * from "./CommitEditOnlyAttemptUseCase.use-case.js";

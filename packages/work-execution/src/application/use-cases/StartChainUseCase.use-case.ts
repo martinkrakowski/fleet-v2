@@ -20,7 +20,7 @@ import {
   parseChainRepository,
 } from '../../domain/chain-records.js';
 import type { ChainRecord, ChainRepositoryRef } from '../../domain/chain-records.js';
-import { isZonedIsoDateTime, readConductorHaltRecord } from '../../domain/conductor-halt.js';
+import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type {
   StartChainCommand,
   StartChainDecision,
@@ -29,6 +29,7 @@ import type {
 } from '../ports/in/StartChainPort.in-port.js';
 import { START_CHAIN_REASONS } from '../ports/in/StartChainPort.in-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
+import { isChainPassHalted } from './chain-pass-halt.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeForgeActionPort } from '../ports/out/MergeForgeActionPort.out-port.js';
 
@@ -99,50 +100,6 @@ function refused(reason: StartChainReason, record: ChainRecord | null = null): S
 
 function unresolved(record: ChainRecord | null = null): StartChainDecision {
   return { outcome: 'unknown', reason: 'unresolved', record };
-}
-
-/**
- * The fail-closed halt read (plan §3.7): an absent dependency is not halted;
- * a provided port without `read`, a throw, and any answer that
- * is not an object with `state: 'clear'` — or whose record does not agree
- * with that tag — read as halted.
- */
-async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
-  if (halt === undefined) {
-    // An absent dependency keeps today's behaviour: not halted.
-    return false;
-  }
-  if (typeof halt.read !== 'function') {
-    return true;
-  }
-  try {
-    const state = await halt.read();
-    if (typeof state !== 'object' || state === null || Array.isArray(state)) {
-      return true;
-    }
-    const tag = (state as { readonly state?: unknown }).state;
-    if (tag !== 'clear') {
-      return true;
-    }
-    // `clear` is believed only when its record agrees: absent (null), or a
-    // complete plain record with `halted: false`. Anything else — a
-    // malformed record, a getter, `halted: true` — fails closed.
-    const record = (state as { readonly record?: unknown }).record;
-    if (record === null) {
-      return false;
-    }
-    if (typeof record !== 'object' || Array.isArray(record)) {
-      return true;
-    }
-    // A clear marker is believed only when its record is a complete plain
-    // record the domain validator accepts with `halted: false`: version,
-    // `halted` and a zoned `changedAtIso` must all be present and valid.
-    // Anything else — a getter, a missing or invalid field — fails closed.
-    const read = readConductorHaltRecord(record);
-    return !(read.ok && read.record.halted === false);
-  } catch {
-    return true;
-  }
 }
 
 /** The recorded refusal reason when it is one of this port's codes; a generic code otherwise. */
@@ -221,7 +178,7 @@ export class StartChainUseCase implements StartChainPort {
   }
 
   private async startFresh(command: ValidCommand): Promise<StartChainDecision> {
-    if (await isHalted(this.deps.halt)) {
+    if (await isChainPassHalted(this.deps.halt)) {
       // Refused before the intent write and before any forge call; the halt is
       // read once here, never again after a forge action was sent.
       return refused('halted');
@@ -251,7 +208,7 @@ export class StartChainUseCase implements StartChainPort {
 
   /** The same key found at `intent-recorded`: a crash or an ambiguous answer left it open; read before any write. */
   private async recover(command: ValidCommand, record: ChainRecord): Promise<StartChainDecision> {
-    if (await isHalted(this.deps.halt)) {
+    if (await isChainPassHalted(this.deps.halt)) {
       // Refused before the branch-head read and before any forge call; an
       // already-sent forge action is never rolled back (see settleFromHead).
       return refused('halted', record);

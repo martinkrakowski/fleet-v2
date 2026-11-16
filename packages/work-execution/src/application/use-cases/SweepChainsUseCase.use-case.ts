@@ -22,7 +22,7 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { parseChainName, parseChainRepository } from '../../domain/chain-records.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
-import { isZonedIsoDateTime, readConductorHaltRecord } from '../../domain/conductor-halt.js';
+import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { computeCallBudget, DAEMON_CALL_MIN_REMAINING_MS } from '../../domain/daemon-tick.js';
 import type {
   SweepChainsBranchReport,
@@ -30,6 +30,7 @@ import type {
   SweepChainsResult,
 } from '../ports/in/SweepChainsPort.in-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
+import { isChainPassHalted } from './chain-pass-halt.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeForgeActionPort } from '../ports/out/MergeForgeActionPort.out-port.js';
 
@@ -188,50 +189,6 @@ type SweepRefusal =
 /** True for a refusal inside the mixed link-plan answer. */
 function isSweepRefusal(value: unknown): value is SweepRefusal {
   return typeof value === 'object' && value !== null && 'kind' in value;
-}
-
-/**
- * The fail-closed halt read (plan §3.7): an absent dependency is not halted;
- * a provided port without `read`, a throw, and any answer that
- * is not an object with `state: 'clear'` — or whose record does not agree
- * with that tag — read as halted.
- */
-async function isHalted(halt?: Pick<ConductorHaltPort, 'read'>): Promise<boolean> {
-  if (halt === undefined) {
-    // An absent dependency keeps today's behaviour: not halted.
-    return false;
-  }
-  if (typeof halt.read !== 'function') {
-    return true;
-  }
-  try {
-    const state = await halt.read();
-    if (typeof state !== 'object' || state === null || Array.isArray(state)) {
-      return true;
-    }
-    const tag = (state as { readonly state?: unknown }).state;
-    if (tag !== 'clear') {
-      return true;
-    }
-    // `clear` is believed only when its record agrees: absent (null), or a
-    // complete plain record with `halted: false`. Anything else — a
-    // malformed record, a getter, `halted: true` — fails closed.
-    const record = (state as { readonly record?: unknown }).record;
-    if (record === null) {
-      return false;
-    }
-    if (typeof record !== 'object' || Array.isArray(record)) {
-      return true;
-    }
-    // A clear marker is believed only when its record is a complete plain
-    // record the domain validator accepts with `halted: false`: version,
-    // `halted` and a zoned `changedAtIso` must all be present and valid.
-    // Anything else — a getter, a missing or invalid field — fails closed.
-    const read = readConductorHaltRecord(record);
-    return !(read.ok && read.record.halted === false);
-  } catch {
-    return true;
-  }
 }
 
 function refusalResult(refusal: SweepRefusal): SweepChainsResult {
@@ -546,7 +503,7 @@ export class SweepChainsUseCase implements SweepChainsPort {
   }
 
   private async apply(command: ValidCommand, planned: readonly PlannedChain[]): Promise<SweepChainsResult> {
-    if (await isHalted(this.deps.halt)) {
+    if (await isChainPassHalted(this.deps.halt)) {
       // Read once per pass: refused before any delete and before any swept
       // mark. Never re-read per delete, so a delete already sent always
       // finishes and its chain is recorded as swept.

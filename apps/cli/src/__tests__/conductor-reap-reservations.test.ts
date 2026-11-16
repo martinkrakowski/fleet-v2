@@ -339,6 +339,69 @@ describe('conductor reap --reservations (OG22b)', () => {
     expect(reap).toHaveBeenCalledWith({ dryRun: false, nowIso: NOW });
   });
 
+  it('never says nothing was released when a release is ambiguous, even with an unknown run state', async () => {
+    const runtime = createFleetCliRuntime({ stateDir: tempStateDir() });
+    vi
+      .spyOn(runtime.conductor.reapOrphanReservations, 'reapOrphanReservations')
+      .mockResolvedValue(
+        okResult({
+          unknown: [{ reservationId: 'res-1', attemptId: 'att-1', reason: 'run-state-unknown' }],
+          failed: [{ reservationId: 'res-2', attemptId: 'att-2', reason: 'ambiguous' }],
+        }),
+      );
+    const result = await runConductor(runtime, ['reap', '--reservations', '--yes']);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toEqual([unknownNotice(1), ambiguousNotice(1)]);
+    expect(result.stderr.join('')).not.toContain('nothing released');
+  });
+
+  it('still says nothing was released for an unknown run state beside a non-ambiguous failure', async () => {
+    const runtime = createFleetCliRuntime({ stateDir: tempStateDir() });
+    vi
+      .spyOn(runtime.conductor.reapOrphanReservations, 'reapOrphanReservations')
+      .mockResolvedValue(
+        okResult({
+          unknown: [{ reservationId: 'res-1', attemptId: 'att-1', reason: 'run-state-unknown' }],
+          failed: [{ reservationId: 'res-2', attemptId: 'att-2', reason: 'conflict' }],
+        }),
+      );
+    const result = await runConductor(runtime, ['reap', '--reservations', '--yes']);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toEqual([SWEEP_INCOMPLETE, notPerformedNotice(1)]);
+    expect(result.stderr.join('')).toContain('nothing released');
+  });
+
+  it('reports one released plus one ambiguous release as possibly completed and exits 1', async () => {
+    const runtime = createFleetCliRuntime({ stateDir: tempStateDir() });
+    vi
+      .spyOn(runtime.conductor.reapOrphanReservations, 'reapOrphanReservations')
+      .mockResolvedValue(
+        okResult({
+          released: [{ reservationId: 'res-1', attemptId: 'att-1' }] as never,
+          failed: [{ reservationId: 'res-2', attemptId: 'att-2', reason: 'ambiguous' }],
+        }),
+      );
+    const result = await runConductor(runtime, ['reap', '--reservations', '--yes']);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toEqual([ambiguousNotice(1)]);
+    expect(result.stderr.join('')).not.toContain('nothing released');
+  });
+
+  it('exits 0 with no notice for one released plus one not-held failure', async () => {
+    const runtime = createFleetCliRuntime({ stateDir: tempStateDir() });
+    vi
+      .spyOn(runtime.conductor.reapOrphanReservations, 'reapOrphanReservations')
+      .mockResolvedValue(
+        okResult({
+          released: [{ reservationId: 'res-1', attemptId: 'att-1' }] as never,
+          failed: [{ reservationId: 'res-2', attemptId: 'att-2', reason: 'not-held' }],
+        }),
+      );
+    const result = await runConductor(runtime, ['reap', '--reservations', '--yes']);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toEqual([]);
+  });
+
   it('prints the UNKNOWN count notice and exits 1 for unclassified reservations', async () => {
     const runtime = createFleetCliRuntime({ stateDir: tempStateDir() });
     const attemptUnreadable = vi

@@ -1860,8 +1860,9 @@ function reapCombinationError(flags: ReapFlags): string | null {
 }
 
 /**
- * `conductor reap`'s private flag reader: exactly one of `--worktrees` or
- * `--sessions`, and `--dry-run`/`--yes`. An unknown flag, a repeated flag or
+ * `conductor reap`'s private flag reader: exactly one of `--worktrees`,
+ * `--sessions` or `--reservations`, plus `--dry-run`, `--yes` and
+ * `--force-unsealed` (valid only with `--worktrees`). An unknown flag, a repeated flag or
  * a positional is a usage error.
  */
 function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
@@ -1908,12 +1909,16 @@ function reapYesRequiredMessage(flags: ReapFlags): string {
   return `conductor reap --reservations requires --yes unless --dry-run is given; it releases only the reservations of finished runs, never a reservation no run lists, and does not delete worktrees, branches or runs\n${CONDUCTOR_HELP}\n`;
 }
 
-/** The stderr notice for unclassified reservations, distinguishing an incomplete sweep. */
+/**
+ * The stderr notice for unclassified reservations, distinguishing an incomplete
+ * sweep. The "nothing released" sentence is printed only when nothing was
+ * released and no release is ambiguous.
+ */
 function unknownReservationsNotice(
   unknown: readonly { readonly reason: string }[],
-  releasedCount: number,
+  nothingReleased: boolean,
 ): string {
-  if (releasedCount === 0 && unknown.some((entry) => entry.reason === 'run-state-unknown')) {
+  if (nothingReleased && unknown.some((entry) => entry.reason === 'run-state-unknown')) {
     return `${RESERVATION_REAP_PREFIX}sweep incomplete: a run record is unreadable or the run count exceeds 10,000; nothing released\n`;
   }
   return `${RESERVATION_REAP_PREFIX}UNKNOWN: ${unknown.length} reservation(s) could not be classified and were not released\n`;
@@ -1935,7 +1940,8 @@ function reservationReapVerdict(result: ReapOrphanReservationsResult): { readonl
     notices.push(`${RESERVATION_REAP_PREFIX}REPORT ONLY: ${result.reportOnly.length} held reservation(s) are listed by no run and were not released; see conductor start --abandon\n`);
   }
   if (result.unknown.length > 0) {
-    notices.push(unknownReservationsNotice(result.unknown, result.released.length));
+    // An ambiguous release may have completed, so "nothing released" is never claimed then.
+    notices.push(unknownReservationsNotice(result.unknown, result.released.length === 0 && ambiguous === 0));
   }
   if (ambiguous > 0) {
     notices.push(`${RESERVATION_REAP_PREFIX}${ambiguous} release(s) have an unknown outcome and may have completed; run conductor reap --reservations --dry-run to check\n`);

@@ -118,6 +118,13 @@ function fakeProbes(
         candidates: ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'],
       };
     },
+    ghAuth: async (binaryPath) => {
+      calls.push(`ghAuth:${binaryPath}`);
+      return {
+        tokenPresent: true,
+        authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+      };
+    },
     seatProbe: async (seat) => {
       calls.push(`seatProbe:${seat.id}`);
       return ALL_SEATS_PASS;
@@ -697,15 +704,14 @@ describe('runDoctor gh-binary check', () => {
       ghBinary: async () => ({ resolved: '/usr/bin/gh', candidates: GH_CANDIDATES }),
     });
     const lines = await collect(loadedResult(sampleModel()), probes);
-    expect(lines.filter((line) => line.scope === 'gh-binary')).toEqual([
-      {
-        scope: 'gh-binary',
-        subject: 'gh',
-        check: 'resolved',
-        status: 'PASS',
-        detail: '/usr/bin/gh',
-      },
-    ]);
+    const ghLines = lines.filter((line) => line.scope === 'gh-binary');
+    expect(ghLines[0]).toEqual({
+      scope: 'gh-binary',
+      subject: 'gh',
+      check: 'resolved',
+      status: 'PASS',
+      detail: '/usr/bin/gh',
+    });
     expect(doctorExitCode(lines)).toBe(0);
   });
 
@@ -735,6 +741,207 @@ describe('runDoctor gh-binary check', () => {
       }),
     );
     expect(doctorExitCode(lines)).toBe(1);
+  });
+});
+
+describe('runDoctor gh non-interactive auth check', () => {
+  const GH_CANDIDATES = ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'];
+
+  const resolvedGh = (): Partial<DoctorProbes> => ({
+    ghBinary: async () => ({ resolved: '/usr/bin/gh', candidates: GH_CANDIDATES }),
+  });
+
+  const authLines = (lines: DoctorLine[]): DoctorLine[] =>
+    lines.filter((line) => line.check === 'auth-non-interactive');
+
+  it('reports PASS when gh authenticates with the service environment token', async () => {
+    const { probes } = fakeProbes({
+      ...resolvedGh(),
+      ghAuth: async () => ({
+        tokenPresent: true,
+        authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+      }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(authLines(lines)).toEqual([
+      {
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'auth-non-interactive',
+        status: 'PASS',
+        detail: 'gh authenticated non-interactively with service environment token',
+      },
+    ]);
+  });
+
+  it('reports FAIL with remedy when no token variable is present', async () => {
+    const { probes } = fakeProbes({
+      ...resolvedGh(),
+      ghAuth: async () => ({
+        tokenPresent: false,
+        authCheck: { outcome: 'fail', reason: 'no GH_TOKEN or GITHUB_TOKEN in service environment' },
+      }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    const [authLine] = authLines(lines);
+    expect(authLine).toMatchObject({ scope: 'gh-binary', subject: 'gh', status: 'FAIL' });
+    expect(authLine?.detail).toContain('no GH_TOKEN or GITHUB_TOKEN in service environment');
+    expect(authLine?.detail).toContain('provide the token through the service environment file');
+  });
+
+  it('reports FAIL when gh auth check fails', async () => {
+    const { probes } = fakeProbes({
+      ...resolvedGh(),
+      ghAuth: async () => ({
+        tokenPresent: true,
+        authCheck: { outcome: 'fail', reason: 'gh auth status failed' },
+      }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(authLines(lines)).toEqual([
+      {
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'auth-non-interactive',
+        status: 'FAIL',
+        detail: 'gh non-interactive auth failed; provide the token through the service environment file',
+      },
+    ]);
+  });
+
+  it('reports UNKNOWN when gh auth check returns unknown', async () => {
+    const { probes } = fakeProbes({
+      ...resolvedGh(),
+      ghAuth: async () => ({
+        tokenPresent: true,
+        authCheck: { outcome: 'unknown', reason: 'gh auth status timed out or could not be run' },
+      }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(authLines(lines)).toEqual([
+      {
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'auth-non-interactive',
+        status: 'UNKNOWN',
+        detail: 'gh non-interactive auth check timed out or could not be run',
+      },
+    ]);
+  });
+
+  it('reports UNKNOWN auth-non-interactive when gh binary is unresolved', async () => {
+    const { probes } = fakeProbes({
+      ghBinary: async () => ({ resolved: undefined, candidates: GH_CANDIDATES }),
+      ghAuth: async () => ({
+        tokenPresent: true,
+        authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+      }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(authLines(lines)).toEqual([
+      {
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'auth-non-interactive',
+        status: 'UNKNOWN',
+        detail: 'gh binary not resolved; non-interactive auth not checked',
+      },
+    ]);
+  });
+
+  it('reports UNKNOWN when the gh resolution probe fails to run', async () => {
+    const { probes } = fakeProbes({
+      ghBinary: async () => undefined,
+      ghAuth: async () => ({
+        tokenPresent: true,
+        authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+      }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(authLines(lines)).toEqual([
+      {
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'auth-non-interactive',
+        status: 'UNKNOWN',
+        detail: 'gh binary not resolved; non-interactive auth not checked',
+      },
+    ]);
+  });
+
+  it('reports UNKNOWN when optional ghAuth probe is omitted', async () => {
+    const { probes } = fakeProbes({ ...resolvedGh(), ghAuth: undefined });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(authLines(lines)).toEqual([
+      {
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'auth-non-interactive',
+        status: 'UNKNOWN',
+        detail: 'gh auth probe not configured',
+      },
+    ]);
+  });
+
+  it('reports UNKNOWN when ghAuth probe throws', async () => {
+    const { probes } = fakeProbes({
+      ...resolvedGh(),
+      ghAuth: async () => {
+        throw new Error('probe exploded');
+      },
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(authLines(lines)).toEqual([
+      {
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'auth-non-interactive',
+        status: 'UNKNOWN',
+        detail: 'gh non-interactive auth probe failed',
+      },
+    ]);
+  });
+
+  it('reports UNKNOWN for null, array, or malformed ghAuth observation', async () => {
+    for (const observation of [
+      null,
+      undefined,
+      [],
+      { tokenPresent: 'yes', authCheck: { outcome: 'pass' } },
+      { tokenPresent: true, authCheck: null },
+      { tokenPresent: true, authCheck: { outcome: 'perhaps' } },
+    ] as unknown[]) {
+      const { probes } = fakeProbes({
+        ...resolvedGh(),
+        ghAuth: async () => observation as never,
+      });
+      const lines = await collect(loadedResult(sampleModel()), probes);
+      expect(authLines(lines)).toEqual([
+        {
+          scope: 'gh-binary',
+          subject: 'gh',
+          check: 'auth-non-interactive',
+          status: 'UNKNOWN',
+          detail: 'gh non-interactive auth probe returned malformed result',
+        },
+      ]);
+    }
+  });
+
+  it('never leaks a token-shaped env value or account name into any DoctorLine', async () => {
+    const token = 'ghp_secretTokenValue1234567890';
+    const { probes } = fakeProbes({
+      ...resolvedGh(),
+      ghAuth: async () => ({
+        tokenPresent: true,
+        authCheck: { outcome: 'fail', reason: 'gh auth status failed' },
+      }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    for (const line of lines) {
+      expect(line.detail).not.toContain(token);
+      expect(line.detail).not.toContain('octocat');
+    }
   });
 });
 

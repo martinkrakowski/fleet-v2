@@ -395,4 +395,20 @@ describe("lane diff-check command", () => {
     expect(stderr).toEqual(["lane diff-check: usage\n"]);
     expect(stdout).toEqual([]);
   });
+
+  it("runCli routes lane diff-check past the subcommand token so a real invocation parses", async () => {
+    const { io, stdout, stderr } = capturingIo();
+    // Before the fix the subcommand token reached the parser as the worktree
+    // positional, so every real `lane diff-check` invocation was a usage
+    // error and the check never ran. The worktree below does not exist, so
+    // the adapter fails closed with an error outcome (exit 1) — but the
+    // request must parse and reach the adapter, not die as usage.
+    const code = await runCli(
+      ["lane", "diff-check", "/nonexistent-wt", "--allowed-path-prefixes", '["packages/x"]'],
+      io,
+    );
+    expect(code).not.toBe(2);
+    expect(stderr).not.toEqual(["lane diff-check: usage\n"]);
+    expect(stdout).toEqual([]);
+  });
 });

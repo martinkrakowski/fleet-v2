@@ -2,12 +2,20 @@
  * Pure, probe-injected checked deploy sequencing. The engine spawns nothing,
  * opens no socket and reads no file: every side effect enters through a
  * `DeployProbes` implementation. Any probe throw, missing probe method or
- * invalid probe result becomes a refusal, never a crash, and an attempted
- * but unconfirmed repoint is rolled back to the previous target. Request
- * fields are snapshotted during validation and never re-read afterwards.
+ * invalid probe result becomes a refusal, never a crash. `HEAD` is re-read
+ * once immediately before the repoint, so a commit that moved during the
+ * build is refused. A failed or unverifiable install rollback is reported
+ * as `rollback-failed` or `no-rollback-target`, never as a plain refusal.
+ * Request fields are snapshotted during validation and never re-read
+ * afterwards.
  */
 
-import type { DeployProbes, DeployRequest, DeployResult } from './types.js';
+import type {
+  DeployInstallFailure,
+  DeployProbes,
+  DeployRequest,
+  DeployResult,
+} from './types.js';
 
 /** The probe methods a `DeployProbes` implementation must provide. */
 function probeMethods(): string[] {
@@ -101,11 +109,60 @@ function refusal(reason: string, detail: string): DeployResult {
   return { outcome: 'refused', reason: reason as never, detail };
 }
 
+/** Whether a `HEAD` reading names exactly the expected commit. */
+function headMatches(head: unknown, commit: string): boolean {
+  return (
+    typeof head === 'string' &&
+    head.trim().length > 0 &&
+    /^[0-9a-fA-F]{40,64}$/.test(head.trim()) &&
+    head.trim().toLowerCase() === commit.toLowerCase()
+  );
+}
+
+/**
+ * Restore the install link to its previous target after a failed install:
+ * repoint at most once, verify the restore by reading the target back and
+ * never throw. With no previous target there is nothing to restore, so the
+ * link is left pointing at the unverified build.
+ */
+async function restorePrevious(
+  probes: DeployProbes,
+  link: string,
+  previousTarget: string | undefined,
+): Promise<'restored' | 'rollback-failed' | 'no-rollback-target'> {
+  if (previousTarget === undefined) {
+    return 'no-rollback-target';
+  }
+  try {
+    await probes.repoint(link, previousTarget);
+    const restoredTarget = await probes.currentTarget(link);
+    return restoredTarget === previousTarget ? 'restored' : 'rollback-failed';
+  } catch {
+    return 'rollback-failed';
+  }
+}
+
+/**
+ * Turn a failed install plus the outcome of the restore into the result
+ * the operator sees: a verified restore is a plain refusal; an unknown or
+ * impossible restore is a distinct failed-install outcome.
+ */
+function installFailure(
+  reason: DeployInstallFailure,
+  state: 'restored' | 'rollback-failed' | 'no-rollback-target',
+): DeployResult {
+  if (state === 'restored') {
+    return refusal(reason, reason);
+  }
+  return { outcome: state, reason, detail: `${reason}; ${state}` };
+}
+
 /**
  * Run the checked deploy in exact order: validate, refuse on merge,
  * verify `HEAD`, build, run suites, digest the staged build, re-check for
- * a merge, repoint atomically, verify installed bytes and roll back on
- * mismatch or an unconfirmed repoint.
+ * a merge, re-read `HEAD`, repoint atomically, verify installed bytes and
+ * report rollback-failed or no-rollback-target on mismatch or an
+ * unconfirmed repoint.
  */
 export async function runCheckedDeploy(
   request: DeployRequest,
@@ -153,14 +210,7 @@ export async function runCheckedDeploy(
     }
 
     const head = await probes.headCommit(req.repoPath);
-    if (
-      typeof head !== 'string' ||
-      head.trim().length === 0 ||
-      !/^[0-9a-fA-F]{40,64}$/.test(head.trim())
-    ) {
-      return refusal('commit-mismatch', 'commit-mismatch');
-    }
-    if (head.trim().toLowerCase() !== req.commit.toLowerCase()) {
+    if (!headMatches(head, req.commit)) {
       return refusal('commit-mismatch', 'commit-mismatch');
     }
 
@@ -193,6 +243,13 @@ export async function runCheckedDeploy(
       return refusal('probe-failed', 'probe-failed');
     }
 
+    // `HEAD` is re-read once immediately before the repoint: a commit
+    // that moved during the build is refused instead of deployed.
+    const headBeforeRepoint = await probes.headCommit(req.repoPath);
+    if (!headMatches(headBeforeRepoint, req.commit)) {
+      return refusal('commit-mismatch', 'commit-mismatch before repoint');
+    }
+
     // Only `undefined` (no current target) or a valid non-empty string is
     // an acceptable previous target; anything else is a probe failure.
     const target = await probes.currentTarget(req.installLink);
@@ -209,27 +266,16 @@ export async function runCheckedDeploy(
       typeof installedDigest !== 'string' ||
       installedDigest.trim().length === 0
     ) {
-      // A null, undefined or empty digest is an invalid probe result, not
-      // a mismatch: the repoint is still unconfirmed, so restore the
-      // previous target and refuse as probe-failed.
-      if (previousTarget !== undefined) {
-        try {
-          await probes.repoint(req.installLink, previousTarget);
-        } catch {
-          // A rollback error must not mask `probe-failed`.
-        }
-      }
-      return refusal('probe-failed', 'probe-failed');
+      return installFailure(
+        'probe-failed',
+        await restorePrevious(probes, req.installLink, previousTarget),
+      );
     }
     if (installedDigest !== stagedDigest) {
-      if (previousTarget !== undefined) {
-        try {
-          await probes.repoint(req.installLink, previousTarget);
-        } catch {
-          // A rollback error must not mask `bytes-mismatch`.
-        }
-      }
-      return refusal('bytes-mismatch', 'bytes-mismatch');
+      return installFailure(
+        'bytes-mismatch',
+        await restorePrevious(probes, req.installLink, previousTarget),
+      );
     }
 
     repointConfirmed = true;
@@ -237,19 +283,18 @@ export async function runCheckedDeploy(
       outcome: 'deployed',
       digest: installedDigest,
       previousTarget,
+      commit: req.commit.toLowerCase(),
     };
   } catch {
     if (
       req !== undefined &&
       repointAttempted &&
-      !repointConfirmed &&
-      previousTarget !== undefined
+      !repointConfirmed
     ) {
-      try {
-        await probes.repoint(req.installLink, previousTarget);
-      } catch {
-        // A rollback error must not mask `probe-failed`.
-      }
+      return installFailure(
+        'probe-failed',
+        await restorePrevious(probes, req.installLink, previousTarget),
+      );
     }
     return refusal('probe-failed', 'probe-failed');
   }

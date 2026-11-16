@@ -421,12 +421,13 @@ describe('runCheckedDeploy', () => {
       outcome: 'deployed',
       digest: 'digest-ok',
       previousTarget: '/previous',
+      commit: COMMIT_A,
     });
     expect(calls.filter((c) => c === 'repoint:/install:/staging')).toHaveLength(
       1,
     );
     // Ordering: merge check, head, build, suites, staging digest, merge
-    // re-check, previous target, repoint, installed digest.
+    // re-check, HEAD re-read, previous target, repoint, installed digest.
     expect(calls).toEqual([
       'mergeInProgress:/repo',
       'headCommit:/repo',
@@ -435,9 +436,252 @@ describe('runCheckedDeploy', () => {
       'runCommand:/repo:yarn test:integration',
       'digestTree:/staging',
       'mergeInProgress:/repo',
+      'headCommit:/repo',
       'currentTarget:/install',
       'repoint:/install:/staging',
       'digestTree:/install',
     ]);
+  });
+
+  it('normalizes an upper-case commit in the deployed result', async () => {
+    const request = sampleRequest({ commit: COMMIT_A.toUpperCase() });
+    const { probes } = fakeProbes({}, request);
+    const result = await runCheckedDeploy(request, probes);
+    expect(result).toEqual({
+      outcome: 'deployed',
+      digest: 'digest-ok',
+      previousTarget: undefined,
+      commit: COMMIT_A,
+    });
+  });
+
+  it('refuses with commit-mismatch before repoint when HEAD moves during the build', async () => {
+    let headCalls = 0;
+    const { probes, calls } = fakeProbes({
+      headCommit: async (repoPath) => {
+        calls.push(`headCommit:${repoPath}`);
+        headCalls += 1;
+        return headCalls === 1 ? COMMIT_A : COMMIT_B;
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'commit-mismatch',
+      detail: 'commit-mismatch before repoint',
+    });
+    expect(
+      calls.some((c) => c.startsWith('repoint:') || c.startsWith('currentTarget:')),
+    ).toBe(false);
+  });
+
+  it('refuses with commit-mismatch before repoint when the re-read HEAD is invalid', async () => {
+    let headCalls = 0;
+    const { probes, calls } = fakeProbes({
+      headCommit: async (repoPath) => {
+        calls.push(`headCommit:${repoPath}`);
+        headCalls += 1;
+        if (headCalls === 1) {
+          return COMMIT_A;
+        }
+        return [null, '', 'not-a-commit'][headCalls - 2] as never;
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'commit-mismatch',
+      detail: 'commit-mismatch before repoint',
+    });
+    expect(calls.some((c) => c.startsWith('repoint:'))).toBe(false);
+  });
+
+  it('returns probe-failed when the re-read HEAD throws', async () => {
+    let headCalls = 0;
+    const { probes, calls } = fakeProbes({
+      headCommit: async (repoPath) => {
+        calls.push(`headCommit:${repoPath}`);
+        headCalls += 1;
+        if (headCalls === 2) {
+          throw new Error('head boom');
+        }
+        return COMMIT_A;
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'probe-failed',
+      detail: 'probe-failed',
+    });
+    expect(calls.some((c) => c.startsWith('repoint:'))).toBe(false);
+  });
+
+  it('reports rollback-failed when the digest differs and the restore repoint throws', async () => {
+    const { probes, calls } = fakeProbes({
+      digestTree: async (path) => {
+        calls.push(`digestTree:${path}`);
+        return path === '/staging' ? 'digest-staged' : 'digest-installed';
+      },
+      currentTarget: async (link) => {
+        calls.push(`currentTarget:${link}`);
+        return '/previous';
+      },
+      repoint: async (link, target) => {
+        calls.push(`repoint:${link}:${target}`);
+        if (target === '/previous') {
+          throw new Error('restore boom');
+        }
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'rollback-failed',
+      reason: 'bytes-mismatch',
+      detail: 'bytes-mismatch; rollback-failed',
+    });
+    expect(
+      calls.filter((c) => c === 'repoint:/install:/previous'),
+    ).toHaveLength(1);
+  });
+
+  it('reports rollback-failed when the restored target does not match the previous target', async () => {
+    let currentTargetCalls = 0;
+    const { probes, calls } = fakeProbes({
+      digestTree: async (path) => {
+        calls.push(`digestTree:${path}`);
+        return path === '/staging' ? 'digest-staged' : 'digest-installed';
+      },
+      currentTarget: async (link) => {
+        calls.push(`currentTarget:${link}`);
+        currentTargetCalls += 1;
+        return currentTargetCalls === 1 ? '/previous' : '/staging';
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'rollback-failed',
+      reason: 'bytes-mismatch',
+      detail: 'bytes-mismatch; rollback-failed',
+    });
+  });
+
+  it('reports rollback-failed when reading back the restored target throws', async () => {
+    let currentTargetCalls = 0;
+    const { probes, calls } = fakeProbes({
+      digestTree: async (path) => {
+        calls.push(`digestTree:${path}`);
+        return path === '/staging' ? 'digest-staged' : 'digest-installed';
+      },
+      currentTarget: async (link) => {
+        calls.push(`currentTarget:${link}`);
+        currentTargetCalls += 1;
+        if (currentTargetCalls === 2) {
+          throw new Error('verify boom');
+        }
+        return '/previous';
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'rollback-failed',
+      reason: 'bytes-mismatch',
+      detail: 'bytes-mismatch; rollback-failed',
+    });
+  });
+
+  it('reports rollback-failed when the post-repoint digest probe throws and the restore throws', async () => {
+    const { probes, calls } = fakeProbes({
+      currentTarget: async (link) => {
+        calls.push(`currentTarget:${link}`);
+        return '/previous';
+      },
+      digestTree: async (path) => {
+        calls.push(`digestTree:${path}`);
+        if (path === '/staging') return 'digest-staged';
+        throw new Error('digest boom');
+      },
+      repoint: async (link, target) => {
+        calls.push(`repoint:${link}:${target}`);
+        if (target === '/previous') {
+          throw new Error('restore boom');
+        }
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'rollback-failed',
+      reason: 'probe-failed',
+      detail: 'probe-failed; rollback-failed',
+    });
+  });
+
+  it('reports no-rollback-target when the digest differs and there is no previous target', async () => {
+    const { probes, calls } = fakeProbes({
+      digestTree: async (path) => {
+        calls.push(`digestTree:${path}`);
+        return path === '/staging' ? 'digest-staged' : 'digest-installed';
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'no-rollback-target',
+      reason: 'bytes-mismatch',
+      detail: 'bytes-mismatch; no-rollback-target',
+    });
+    expect(calls.filter((c) => c.startsWith('repoint:'))).toHaveLength(1);
+    expect(calls.filter((c) => c.startsWith('currentTarget:'))).toHaveLength(1);
+  });
+
+  it('reports no-rollback-target when the forward repoint throws with no previous target', async () => {
+    const { probes, calls } = fakeProbes({
+      repoint: async (link, target) => {
+        calls.push(`repoint:${link}:${target}`);
+        if (target === '/staging') {
+          throw new Error('repoint boom');
+        }
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'no-rollback-target',
+      reason: 'probe-failed',
+      detail: 'probe-failed; no-rollback-target',
+    });
+  });
+
+  it('reports no-rollback-target when the installed digest is invalid with no previous target', async () => {
+    const { probes, calls } = fakeProbes({
+      digestTree: async (path) => {
+        calls.push(`digestTree:${path}`);
+        return path === '/staging' ? 'digest-staged' : (null as never);
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'no-rollback-target',
+      reason: 'probe-failed',
+      detail: 'probe-failed; no-rollback-target',
+    });
+  });
+
+  it('refuses with bytes-mismatch after a verified restore to the previous target', async () => {
+    const { probes, calls } = fakeProbes({
+      digestTree: async (path) => {
+        calls.push(`digestTree:${path}`);
+        return path === '/staging' ? 'digest-staged' : 'digest-installed';
+      },
+      currentTarget: async (link) => {
+        calls.push(`currentTarget:${link}`);
+        return '/previous';
+      },
+    });
+    const result = await runCheckedDeploy(sampleRequest(), probes);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'bytes-mismatch',
+      detail: 'bytes-mismatch',
+    });
+    expect(calls.at(-1)).toBe('currentTarget:/install');
   });
 });

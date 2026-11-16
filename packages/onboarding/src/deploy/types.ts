@@ -1,7 +1,9 @@
 /**
  * Checked deploy types. Pure data: a deploy request names the repository,
  * commit, build and suite commands, staging path and install link; a result
- * is either a verified deploy or a refusal with a reason code. A detail
+ * is a verified deploy, a refusal with a reason code, or one of two
+ * failed-install outcomes (`rollback-failed` or `no-rollback-target`). A
+ * detail
  * never contains command output, paths, commit hashes or tokens — only
  * step numbers and reason codes.
  */
@@ -51,6 +53,9 @@ export type DeployRefusalReason =
   | 'bytes-mismatch'
   | 'probe-failed';
 
+/** Why an install failed after the install link was repointed. */
+export type DeployInstallFailure = 'bytes-mismatch' | 'probe-failed';
+
 /** The outcome of one checked deploy attempt. */
 export type DeployResult =
   | {
@@ -59,10 +64,24 @@ export type DeployResult =
       readonly digest: string;
       /** The target the install link pointed at before the deploy. */
       readonly previousTarget: string | undefined;
+      /** The commit `HEAD` was verified at, in lower case. */
+      readonly commit: string;
     }
   | {
       readonly outcome: 'refused';
       readonly reason: DeployRefusalReason;
       /** Step numbers and reason codes only — never output or secrets. */
+      readonly detail: string;
+    }
+  | {
+      readonly outcome: 'rollback-failed';
+      readonly reason: DeployInstallFailure;
+      /** The install link is in an unknown state. */
+      readonly detail: string;
+    }
+  | {
+      readonly outcome: 'no-rollback-target';
+      readonly reason: DeployInstallFailure;
+      /** The install link may point at an unverified build and was not removed. */
       readonly detail: string;
     };

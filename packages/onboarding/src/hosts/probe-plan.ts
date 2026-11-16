@@ -187,6 +187,31 @@ function probeRootOf(root: string): string {
   return root.replace(/\/+$/, '');
 }
 
+/**
+ * Characters a worktree root may not contain: the C0 and C1 controls
+ * (newline, carriage return, escape and NUL among them) and the Unicode line
+ * separators and bidi controls. The class the doctor engine already keeps
+ * out of its lines.
+ */
+// eslint-disable-next-line no-control-regex
+const UNPROBEABLE_ROOT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
+
+/**
+ * Why a worktree root may not be probed, or `undefined` when it may. A
+ * relative root would let `mktemp` create a file this engine then refuses
+ * to remove, and a root with a line break makes the answer unreadable. The
+ * reason never echoes the root.
+ */
+function worktreeRootRefusal(root: string): string | undefined {
+  if (typeof root !== 'string' || !root.startsWith('/')) {
+    return 'the worktree root is not an absolute path';
+  }
+  if (UNPROBEABLE_ROOT.test(root)) {
+    return 'the worktree root contains a control character';
+  }
+  return undefined;
+}
+
 /** The version argv of a runner kind's tool descriptor, or undefined. */
 function versionArgvOf(kind: HostRunnerKind): readonly string[] | undefined {
   return BUILT_IN_TOOLS.find((tool) => tool.id === kind)?.detect.argv;
@@ -199,6 +224,37 @@ const PLATFORM_VERSION_ARGV: readonly (readonly [string, readonly string[]])[] =
     ['git', ['git', '--version']],
     ['node', ['node', '--version']],
   ];
+
+/**
+ * The worktree-root step: the `mktemp` template step, or a FAIL note that
+ * runs nothing when the root may not be probed.
+ */
+function worktreeRootStep(
+  spec: HostProbeSpec,
+  alias: string | undefined,
+): HostProbeStep {
+  const refusal = worktreeRootRefusal(spec.worktreeRoot);
+  if (refusal !== undefined) {
+    return {
+      kind: 'note',
+      scope: 'host',
+      subject: spec.name,
+      check: 'worktree-root-writable',
+      status: 'FAIL',
+      detail: `${refusal}; no command was run`,
+    };
+  }
+  return {
+    kind: 'mktemp-then-rm',
+    scope: 'host',
+    subject: spec.name,
+    check: 'worktree-root-writable',
+    worktreeRoot: spec.worktreeRoot,
+    argv: ['mktemp', `${probeRootOf(spec.worktreeRoot)}/.fleet-probe.XXXXXX`],
+    ...(alias !== undefined ? { sshAlias: alias } : {}),
+    timeoutMs: PROBE_TIMEOUT_MS,
+  };
+}
 
 /**
  * The ordered probe plan for one host: reachability, the platform and runner
@@ -285,16 +341,7 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
     );
   }
 
-  steps.push({
-    kind: 'mktemp-then-rm',
-    scope: 'host',
-    subject,
-    check: 'worktree-root-writable',
-    worktreeRoot: spec.worktreeRoot,
-    argv: ['mktemp', `${probeRootOf(spec.worktreeRoot)}/.fleet-probe.XXXXXX`],
-    ...(alias !== undefined ? { sshAlias: alias } : {}),
-    timeoutMs: PROBE_TIMEOUT_MS,
-  });
+  steps.push(worktreeRootStep(spec, alias));
 
   const laneRunnerRoot = spec.laneRunnerWorktreeRoot;
   if (laneRunnerRoot !== undefined) {
@@ -566,6 +613,10 @@ async function runMktempStep(
   executor: HostProbeExecutor,
 ): Promise<DoctorLine> {
   const root = step.worktreeRoot;
+  const refusal = worktreeRootRefusal(root);
+  if (refusal !== undefined) {
+    return line(step, 'FAIL', `${refusal}; no command was run`);
+  }
   const created = await safely(() =>
     executor.run(step.argv, { timeoutMs: step.timeoutMs }),
   );

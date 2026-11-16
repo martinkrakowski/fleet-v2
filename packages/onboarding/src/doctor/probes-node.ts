@@ -23,6 +23,7 @@ import { sshRemoteArgv } from './ssh-remote.js';
 import type {
   CiRunnerSlotState,
   DoctorProbes,
+  LoginShellState,
   PinnedBuildProbeResult,
   SeatProbeResult,
   ServerProbeResult,
@@ -320,6 +321,47 @@ function ciRunnerSlotState(result: DoctorCommandRunResult): CiRunnerSlotState {
   return word !== undefined && NOT_ACTIVE_STATES.has(word) ? 'inactive' : 'unknown';
 }
 
+/**
+ * The fixed canary text: adjacent spaces, a dollar word, a backslash-n pair
+ * that is not a newline, two backslashes, both quote kinds, a glob, a tilde,
+ * a semicolon, a double dash, a hash, a bang and one real newline. A login
+ * shell that splits, expands or re-reads any of them changes the echo.
+ */
+export const LOGIN_SHELL_CANARY = [
+  'fleet-canary',
+  'a  b',
+  '$HOME',
+  '\\n',
+  '\\\\',
+  "'q'",
+  '"d"',
+  '*',
+  '~',
+  ';',
+  '--',
+  '#x',
+  '!',
+  'line\nend',
+].join(' ');
+
+/**
+ * Map one completed canary run to a login-shell state. The output is only
+ * compared, never returned. Exit code 255 is ssh's own failure, so it says
+ * nothing about the login shell.
+ */
+function loginShellState(result: DoctorCommandRunResult): LoginShellState {
+  if (
+    result.error !== undefined ||
+    result.signal !== null ||
+    typeof result.exitCode !== 'number' ||
+    result.exitCode === 255 ||
+    typeof result.stdout !== 'string'
+  ) {
+    return 'unknown';
+  }
+  return result.exitCode === 0 && result.stdout === LOGIN_SHELL_CANARY ? 'intact' : 'mangled';
+}
+
 /** Run one argv on the host's transport; a spawn failure reports as a failed run. */
 async function runOnHost(
   deps: Required<
@@ -611,6 +653,19 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
         }
         return ciRunnerSlotState(
           await runOnHost(executors, host, ['systemctl', 'is-active', unit]),
+        );
+      } catch {
+        return 'unknown';
+      }
+    },
+
+    async loginShell(host): Promise<LoginShellState> {
+      try {
+        if (host === 'local' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+          return 'unknown';
+        }
+        return loginShellState(
+          await runOnHost(executors, host, ['printf', '%s', LOGIN_SHELL_CANARY]),
         );
       } catch {
         return 'unknown';

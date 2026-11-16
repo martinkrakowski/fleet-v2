@@ -313,15 +313,134 @@ async function ciRunnerSlotLines(
   return lines;
 }
 
+/** Marker: the injected probes carry no `loginShell` method. */
+const NO_SHELL_PROBE = Symbol('no-login-shell-probe');
+
+/** Detail of every unprobed line of a host whose login shell failed the canary. */
+const NOT_PROBED_DETAIL = 'not probed: login shell does not pass sh -c intact';
+
+/**
+ * The login-shell canary answer of every ssh host, keyed by host name; a
+ * local host has no entry. The port read, the call and the answer all
+ * happen inside `safely`, so a throwing getter and a throwing or rejecting
+ * probe store `undefined`, never crash.
+ */
+async function loginShellStates(
+  model: FleetInstallationModel,
+  probes: DoctorProbes,
+): Promise<ReadonlyMap<string, unknown>> {
+  const states = new Map<string, unknown>();
+  for (const [name, host] of Object.entries(model.hosts)) {
+    if (host.transport !== 'ssh') {
+      continue;
+    }
+    const probeHost = probeHostOf(name, host);
+    const state: unknown = await safely(async () => {
+      const probe = probes.loginShell;
+      return typeof probe === 'function' ? await probe.call(probes, probeHost) : NO_SHELL_PROBE;
+    });
+    states.set(name, state);
+  }
+  return states;
+}
+
+/** Status and detail of the login-shell line; the answer is only compared with `===`. */
+function loginShellVerdict(state: unknown, probeHost: string): readonly [DoctorStatus, string] {
+  if (state === 'intact') {
+    return ['PASS', `login shell passes sh -c intact via ${probeHost}`];
+  }
+  if (state === 'mangled') {
+    return [
+      'FAIL',
+      `login shell does not pass sh -c intact via ${probeHost}; this host's other lines are not trustworthy`,
+    ];
+  }
+  if (state === NO_SHELL_PROBE) {
+    return ['UNKNOWN', 'login shell probe not available'];
+  }
+  return ['UNKNOWN', `login shell could not be checked via ${probeHost}`];
+}
+
+/** The configuration-derived lines of a host's runner; nothing here is probed. */
+function runnerConfigLines(name: string, host: HostModel): DoctorLine[] {
+  const lines: DoctorLine[] = [];
+  if (host.runner !== undefined) {
+    const capabilities = host.runner.capabilities;
+    const status: DoctorStatus =
+      capabilities.source === 'declared' ? 'PASS' : 'UNKNOWN';
+    lines.push(
+      line(
+        'host',
+        name,
+        'runner-capabilities',
+        status,
+        `capability source ${capabilities.source}, filesystemScope ${capabilities.filesystemScope}`,
+      ),
+    );
+    // KF-30b: conducted acceptance gates are throttled only when the host
+    // declares `runner.gateSlot`; without it they run unthrottled next to
+    // hand-run gates. A missing declaration is a config gap, not a failure,
+    // so it reports as a PASS line with a warning detail (the same
+    // convention as accepted-and-ignored v1 fields).
+    if (host.roles.includes('lane-runner') && host.runner.gateSlot === undefined) {
+      lines.push(
+        line(
+          'host',
+          name,
+          'gate-slot',
+          'PASS',
+          'warning: conducted acceptance gates run unthrottled; declare runner.gateSlot to route them through the host-wide gate slot',
+        ),
+      );
+    }
+  }
+  return lines;
+}
+
+/**
+ * The lines of a host whose login shell failed the canary, in the order a
+ * probed host reports them: every remote check UNKNOWN and unprobed, the
+ * runner configuration lines unchanged.
+ */
+function skippedHostLines(name: string, host: HostModel): DoctorLine[] {
+  const skipped = (check: string): DoctorLine =>
+    line('host', name, check, 'UNKNOWN', NOT_PROBED_DETAIL);
+  const checks: string[] = [
+    'reachable',
+    ...PLATFORM_TOOLS.map((tool) => `command-${tool}`),
+    'command-ssh',
+  ];
+  if (host.worktreeRoot !== undefined) {
+    checks.push('worktree-root-writable');
+  }
+  const lines = checks.map((check) => skipped(check));
+  lines.push(...runnerConfigLines(name, host));
+  for (const slot of host.ciRunnerSlots ?? []) {
+    lines.push(skipped(`ci-runner-${slot.name}`));
+  }
+  return lines;
+}
+
 /** Per-host and role lines: reachability, platform tools, worktree root, runner capabilities. */
 async function hostLines(
   model: FleetInstallationModel,
   probes: DoctorProbes,
+  shells: ReadonlyMap<string, unknown>,
 ): Promise<DoctorLine[]> {
   const lines: DoctorLine[] = [];
   for (const [name, host] of Object.entries(model.hosts)) {
     const probeHost = probeHostOf(name, host);
     const roles = host.roles.join(', ');
+
+    if (shells.has(name)) {
+      const shell = shells.get(name);
+      const [status, detail] = loginShellVerdict(shell, probeHost);
+      lines.push(line('host', name, 'login-shell', status, detail));
+      if (shell === 'mangled') {
+        lines.push(...skippedHostLines(name, host));
+        continue;
+      }
+    }
 
     const reachable = await safely(() => probes.hostReachable(probeHost));
     lines.push(
@@ -380,36 +499,7 @@ async function hostLines(
       );
     }
 
-    if (host.runner !== undefined) {
-      const capabilities = host.runner.capabilities;
-      const status: DoctorStatus =
-        capabilities.source === 'declared' ? 'PASS' : 'UNKNOWN';
-      lines.push(
-        line(
-          'host',
-          name,
-          'runner-capabilities',
-          status,
-          `capability source ${capabilities.source}, filesystemScope ${capabilities.filesystemScope}`,
-        ),
-      );
-      // KF-30b: conducted acceptance gates are throttled only when the host
-      // declares `runner.gateSlot`; without it they run unthrottled next to
-      // hand-run gates. A missing declaration is a config gap, not a failure,
-      // so it reports as a PASS line with a warning detail (the same
-      // convention as accepted-and-ignored v1 fields).
-      if (host.roles.includes('lane-runner') && host.runner.gateSlot === undefined) {
-        lines.push(
-          line(
-            'host',
-            name,
-            'gate-slot',
-            'PASS',
-            'warning: conducted acceptance gates run unthrottled; declare runner.gateSlot to route them through the host-wide gate slot',
-          ),
-        );
-      }
-    }
+    lines.push(...runnerConfigLines(name, host));
     lines.push(...(await ciRunnerSlotLines(name, host, probeHost, probes)));
   }
   return lines;
@@ -792,7 +882,8 @@ async function seatLines(
  * binary, the reviewed gh binary, the pinned build's freshness, then seats.
  * Each yielded line is one
  * check; the generator awaits probes sequentially so output order is
- * stable. The server answers are computed before the `model-listed` line is
+ * stable. The login-shell canary of every ssh host is probed before
+ * anything else. The server answers are computed before the `model-listed` line is
  * yielded (that line needs the union of the servers' model ids), but the
  * host lines are yielded before the server lines so every `host` line stays
  * together. When `options.probeServers` is `false`, server probing and the
@@ -803,6 +894,7 @@ export async function* runDoctor(
   probes: DoctorProbes,
   options: RunDoctorOptions,
 ): AsyncGenerator<DoctorLine> {
+  const shells = await loginShellStates(result.model, probes);
   const probeServers = options.probeServers ?? true;
   const serverAnswers = probeServers
     ? await serverLines(result.model, probes)
@@ -820,7 +912,7 @@ export async function* runDoctor(
   if (seatModelCheck !== undefined) {
     yield seatModelCheck;
   }
-  for (const doctorLine of await hostLines(result.model, probes)) {
+  for (const doctorLine of await hostLines(result.model, probes, shells)) {
     yield doctorLine;
   }
   if (serverAnswers !== undefined) {

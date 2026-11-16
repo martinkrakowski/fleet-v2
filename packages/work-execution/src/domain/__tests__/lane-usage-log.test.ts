@@ -228,6 +228,27 @@ describe('worktreeNameFromPath', () => {
     expect(worktreeNameFromPath(`/a/${'x'.repeat(100_000)}`)).toBeNull();
     expect(worktreeNameFromPath('x'.repeat(1_000_000))).toBeNull();
   });
+
+  it('refuses a 513-character final segment and accepts the 512-character one', () => {
+    // The whole scan shares one budget of MAX_TEXT_LENGTH + 1 examined
+    // characters, so a segment one character over the limit is refused even
+    // when a separator sits right before it.
+    expect(worktreeNameFromPath(`/a/${'x'.repeat(513)}`)).toBeNull();
+    expect(worktreeNameFromPath(`wt-${'x'.repeat(509)}`)).toBe(`wt-${'x'.repeat(509)}`);
+    expect(worktreeNameFromPath(`/a/${'x'.repeat(512)}`)).toBe('x'.repeat(512));
+  });
+
+  it('refuses a long trailing separator run instead of scanning it to its start', () => {
+    // Skipping trailing separators shares the same bounded budget as the
+    // rest of the scan: a run far longer than the window is refused, never
+    // walked character by character to its beginning.
+    expect(worktreeNameFromPath(`/a/wt${'/'.repeat(100_000)}`)).toBeNull();
+    // A run of separators *before* the final segment costs nothing: the
+    // backwards scan reaches the segment first.
+    expect(worktreeNameFromPath(`/${'/'.repeat(100_000)}wt`)).toBe('wt');
+    // A short trailing run still yields the final segment.
+    expect(worktreeNameFromPath('/a/wt///')).toBe('wt');
+  });
 });
 
 describe('buildLaneUsageLogRow refusals', () => {

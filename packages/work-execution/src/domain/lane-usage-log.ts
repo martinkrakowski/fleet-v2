@@ -113,12 +113,18 @@ function isEnum<T extends string>(value: unknown, allowed: readonly T[]): value 
 }
 
 /**
- * The worktree name: only the final non-empty segment of `path`. The scan is
- * bounded: it walks backwards from the end of the string and stops once a
- * segment longer than `MAX_TEXT_LENGTH` is proven, so an input of any size
- * costs at most `MAX_TEXT_LENGTH + 1` examined characters — never a split of
- * the whole input. A parent directory, a `..` or `.` segment, a segment with
- * control characters or a secret shape never yields a name. Never throws.
+ * The worktree name: only the final non-empty segment of `path`. The whole
+ * scan is bounded: at most `2 * (MAX_TEXT_LENGTH + 1)` characters are ever
+ * examined, walking backwards from the end — the trailing-separator skip and
+ * the segment collection each hold a `MAX_TEXT_LENGTH + 1` budget, so an
+ * input of any size costs a bounded, constant number of examined characters
+ * and never a split of the whole input. The window is wide enough to prove
+ * any valid segment in full (512 characters plus the separators around it);
+ * a segment longer than `MAX_TEXT_LENGTH`, or one whose proof would need
+ * more examined characters than the budget allows (for instance a very long
+ * run of trailing separators), is refused rather than scanned further. A
+ * parent directory, a `..` or `.` segment, a segment with control
+ * characters or a secret shape never yields a name. Never throws.
  */
 export function worktreeNameFromPath(path: unknown): string | null {
   try {
@@ -126,25 +132,35 @@ export function worktreeNameFromPath(path: unknown): string | null {
       return null;
     }
     const isSeparator = (character: string): boolean => character === '/' || character === '\\';
-    let end = path.length - 1;
-    while (end >= 0 && isSeparator(path[end])) {
-      end -= 1;
+    // One more than the maximum allowed segment: enough to prove a valid
+    // segment in full and to prove any longer one over-long.
+    const scanBudget = MAX_TEXT_LENGTH + 1;
+    let index = path.length - 1;
+    let examined = 0;
+    // Skip trailing separators inside their own budget: a long run of them
+    // exhausts the window and is refused instead of being walked character
+    // by character to its beginning.
+    while (index >= 0 && isSeparator(path[index]) && examined < scanBudget) {
+      index -= 1;
+      examined += 1;
     }
-    if (end < 0) {
+    if (index < 0) {
       return null;
     }
-    // Collect at most MAX_TEXT_LENGTH + 1 characters: one more than allowed,
-    // so an over-long segment is refused without scanning further back.
+    // Collect at most MAX_TEXT_LENGTH characters of the final segment.
     let last = '';
-    let start = end;
-    while (start >= 0 && !isSeparator(path[start]) && last.length <= MAX_TEXT_LENGTH) {
-      last = `${path[start]}${last}`;
-      start -= 1;
+    while (index >= 0 && !isSeparator(path[index]) && last.length < MAX_TEXT_LENGTH) {
+      last = `${path[index]}${last}`;
+      index -= 1;
+      examined += 1;
     }
-    if (start >= 0 && !isSeparator(path[start])) {
+    // The segment is only proven when a separator (or the string start) sits
+    // before it; a non-separator there means the segment is over-long, and
+    // it is refused without scanning further back.
+    if (index >= 0 && !isSeparator(path[index])) {
       return null;
     }
-    if (last === '.' || last === '..' || CONTROL_CHARACTERS.test(last) || containsSecretShape(last)) {
+    if (last === '' || last === '.' || last === '..' || CONTROL_CHARACTERS.test(last) || containsSecretShape(last)) {
       return null;
     }
     return last;

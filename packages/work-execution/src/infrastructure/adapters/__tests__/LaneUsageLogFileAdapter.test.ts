@@ -210,7 +210,7 @@ describe('LaneUsageLogFileAdapter', () => {
     expect(await adapter.append(row('attempt-2'))).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
   });
 
-  it('reports store-unreadable on read when the log file is larger than the byte cap', async () => {
+  it('regression: a read of a file already larger than the byte cap reports store-unreadable (does not prove the grow-after-open bound)', async () => {
     const stateDir = await tempStateDir();
     await mkdir(join(stateDir, 'telemetry'), { recursive: true });
     await writeFile(targetPath(stateDir), `{"schemaVersion":1}\n${'x'.repeat(64)}\n`, 'utf8');

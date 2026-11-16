@@ -147,9 +147,9 @@ function ownDataValue(owner: object, key: string): unknown {
 }
 
 /** A bounded array length read once from a value `Array.isArray` accepted. */
-function readLength(value: object): number {
+function readLength(value: object, max: number = COPY_MAX_NODES): number {
   const length = ownDataValue(value, 'length');
-  if (typeof length !== 'number' || !Number.isInteger(length) || length < 0 || length > COPY_MAX_NODES) {
+  if (typeof length !== 'number' || !Number.isInteger(length) || length < 0 || length > max) {
     return refuseUnreadable();
   }
   return length;
@@ -225,15 +225,48 @@ interface ArgumentReader {
   opt(key: string): string | undefined;
   required(key: string): string;
   raw(key: string): unknown;
+  /** A field that may be a JSON document in a string: parsed first, then copied under the same bounds. */
+  json(key: string): unknown;
+  /** A string list; only primitives are coerced, anything else is a usage error. */
+  strings(key: string): string[];
+  /** A number; an object is a usage error rather than being coerced. */
+  number(key: string, fallback: number): number;
 }
 
 function makeReader(p: Payload): ArgumentReader {
   const safe = (key: string): unknown => copyUntrusted(readArgument(p, key));
   const via = <T>(key: string, read: (payload: Payload) => T): T => read({ [key]: safe(key) });
+  const wrongType = (key: string): never => {
+    throw new CliUsageError(`brief author --${key} has the wrong type`);
+  };
+  const isObjectLike = (value: unknown): boolean =>
+    (typeof value === 'object' && value !== null) || typeof value === 'function';
   return {
     safe,
     via,
     raw: (key) => readArgument(p, key),
+    json: (key) => {
+      const value = readArgument(p, key);
+      if (typeof value !== 'string') {
+        return copyUntrusted(value);
+      }
+      const parsed = safeJsonParse(value);
+      return parsed === undefined ? value : copyUntrusted(parsed);
+    },
+    strings: (key) => {
+      const value = safe(key);
+      if (Array.isArray(value) && value.some((item) => item === undefined || item === null || isObjectLike(item))) {
+        return wrongType(key);
+      }
+      if (isObjectLike(value) && !Array.isArray(value)) {
+        return wrongType(key);
+      }
+      return strArr({ [key]: value }, key);
+    },
+    number: (key, fallback) => {
+      const value = safe(key);
+      return isObjectLike(value) ? wrongType(key) : num({ [key]: value }, key, fallback);
+    },
     opt: (key) => via(key, (payload) => optStr(payload, key)),
     required: (key) => {
       const value = via(key, (payload) => str(payload, key)).trim();
@@ -315,13 +348,17 @@ function readFactsList(read: ArgumentReader): readonly unknown[] {
   if (typeof rawFacts === 'string') {
     source = safeJsonParse(rawFacts);
   }
-  if (!Array.isArray(source)) {
-    throw new CliUsageError(FACTS_SHAPE);
-  }
   let length: number;
   try {
-    length = readLength(source);
-  } catch {
+    if (!Array.isArray(source)) {
+      throw new CliUsageError(FACTS_SHAPE);
+    }
+    // The count limit wins over the copy bound, so only an integer is required here.
+    length = readLength(source, Number.MAX_SAFE_INTEGER);
+  } catch (error) {
+    if (error instanceof CliUsageError && error.message === FACTS_SHAPE) {
+      throw error;
+    }
     return refuseUnreadable();
   }
   if (length > FACT_PACK_MAX_FACTS) {
@@ -467,7 +504,7 @@ function readSeatPlan(read: ArgumentReader, rt: FleetCliRuntime): SeatPlanValue 
   // The plan is read through the guarded helper, but only from a fresh plain
   // payload built from single reads: the raw payload object never reaches it.
   const plan = briefSeatPlan(
-    { seatPlan: read.safe('seatPlan'), seatPlanFromInstallation: read.safe('seatPlanFromInstallation') },
+    { seatPlan: read.json('seatPlan'), seatPlanFromInstallation: read.safe('seatPlanFromInstallation') },
     rt,
   );
   return plan === undefined ? undefined : copyUntrusted(plan);
@@ -492,16 +529,16 @@ function buildPrepare(
     policyRevision: scalars.policyRevision,
     modelAssignment,
     independentReviewer: scalars.independentReviewer,
-    ownedPaths: read.via('ownedPaths', (payload) => strArr(payload, 'ownedPaths')),
+    ownedPaths: read.strings('ownedPaths'),
     allowedPathPrefixes,
-    permissions: read.via('permissions', (payload) => strArr(payload, 'permissions')),
-    acceptanceChecks: read.via('acceptanceChecks', (payload) => strArr(payload, 'acceptanceChecks')),
+    permissions: read.strings('permissions'),
+    acceptanceChecks: read.strings('acceptanceChecks'),
     acceptanceSpec,
-    stepLimit: read.via('stepLimit', (payload) => num(payload, 'stepLimit', 200)),
-    timeLimitSeconds: read.via('timeLimitSeconds', (payload) => num(payload, 'timeLimitSeconds', 3600)),
+    stepLimit: read.number('stepLimit', 200),
+    timeLimitSeconds: read.number('timeLimitSeconds', 3600),
     resourceBounds: read.via('resourceBounds', (payload) => nested<Record<string, string>>(payload, 'resourceBounds')) ?? {},
-    expectedArtifacts: read.via('expectedArtifacts', (payload) => strArr(payload, 'expectedArtifacts')),
-    ownerDecisionReferences: read.via('ownerDecisionReferences', (payload) => strArr(payload, 'ownerDecisionReferences')),
+    expectedArtifacts: read.strings('expectedArtifacts'),
+    ownerDecisionReferences: read.strings('ownerDecisionReferences'),
     contextDecisions,
     attemptId: read.opt('attemptId'),
     worktreePath: scalars.worktreePath,
@@ -522,8 +559,8 @@ async function authorBriefCommand(p: Payload, rt: FleetCliRuntime): Promise<unkn
   const facts = readFacts(read);
   const seat = readSeatTool(read);
   const contextDecisions = readContextDecisions(read);
-  const allowedPathPrefixes = read.via('allowedPathPrefixes', (payload) => jsonStrArr(payload, 'allowedPathPrefixes', 'brief author'));
-  const acceptanceSpec = read.via('acceptanceSpec', (payload) => jsonObj(payload, 'acceptanceSpec', 'brief author'));
+  const allowedPathPrefixes = jsonStrArr({ allowedPathPrefixes: read.json('allowedPathPrefixes') }, 'allowedPathPrefixes', 'brief author');
+  const acceptanceSpec = jsonObj({ acceptanceSpec: read.json('acceptanceSpec') }, 'acceptanceSpec', 'brief author');
   const seatPlan = readSeatPlan(read, rt);
   const modelAssignment = buildModelAssignment(scalars, read, seat, seatPlan, rt);
   const authorVariant = read.opt('authorVariant');

@@ -531,47 +531,124 @@ describe('brief author', () => {
     };
   }
 
+  async function authorAndCapture(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    let captured: AuthorBriefRequest | undefined;
+    const { runtime } = guardsRuntime({
+      authorBrief: async (request) => {
+        captured = request as AuthorBriefRequest;
+        return { outcome: 'authored', attemptId: 'att-1', briefDigest: 'digest-1', sessionKey: 'k' };
+      },
+    });
+    await briefCommands['author'](payload, runtime);
+    return (captured as AuthorBriefRequest).prepare as unknown as Record<string, unknown>;
+  }
+
   it('a Proxy array overriding map cannot forward the original payload object', async () => {
     const original = { commitRequired: true, secretMarker: 'original' };
+    let mapInvoked = false;
     const hostile = new Proxy(['x'], {
       get(target, key, receiver) {
         if (key === 'map') {
-          return () => [original];
+          return () => {
+            mapInvoked = true;
+            return [original];
+          };
         }
         return Reflect.get(target, key, receiver);
       },
     });
-    const payload = { ...validRecordPayload(), seatPlan: undefined, acceptanceSpec: { list: hostile } };
-    let captured: AuthorBriefRequest | undefined;
-    const { runtime } = guardsRuntime({
-      authorBrief: async (request) => {
-        captured = request as AuthorBriefRequest;
-        return { outcome: 'authored', attemptId: 'att-1', briefDigest: 'digest-1', sessionKey: 'k' };
-      },
-    });
-    await briefCommands['author'](payload, runtime);
-    const spec = (captured as AuthorBriefRequest).prepare as unknown as { acceptanceSpec: { list: unknown[] } };
-    expect(spec.acceptanceSpec.list).toEqual(['x']);
-    expect(spec.acceptanceSpec.list).not.toContain(original);
-    expect(JSON.stringify(spec.acceptanceSpec)).not.toContain('secretMarker');
+    const spec = { commitRequired: true, list: hostile, inner: { deep: hostile } };
+    const prepare = await authorAndCapture({ ...validRecordPayload(), acceptanceSpec: spec });
+    const received = prepare['acceptanceSpec'] as { list: unknown; inner: { deep: unknown } };
+    expect(received).not.toBe(spec);
+    expect(received.inner).not.toBe(spec.inner);
+    expect(received.list).not.toBe(hostile);
+    expect(received.inner.deep).not.toBe(hostile);
+    expect(Object.getPrototypeOf(received)).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(received.inner)).toBe(Object.prototype);
+    expect(Array.isArray(received.list)).toBe(true);
+    expect(received.list).toEqual(['x']);
+    expect(received.list).not.toContain(original);
+    expect(JSON.stringify(received)).not.toContain('secretMarker');
+    expect(mapInvoked).toBe(false);
   });
 
   it('an own __proto__ key cannot change the prototype of the copied object', async () => {
-    const hostile = JSON.parse('{"__proto__":{"polluted":true},"kept":"yes"}') as Record<string, unknown>;
-    const payload = { ...validRecordPayload(), resourceBounds: hostile };
-    let captured: AuthorBriefRequest | undefined;
-    const { runtime } = guardsRuntime({
-      authorBrief: async (request) => {
-        captured = request as AuthorBriefRequest;
-        return { outcome: 'authored', attemptId: 'att-1', briefDigest: 'digest-1', sessionKey: 'k' };
-      },
-    });
-    await briefCommands['author'](payload, runtime);
-    const bounds = ((captured as AuthorBriefRequest).prepare as unknown as { resourceBounds: Record<string, unknown> })
-      .resourceBounds;
+    const hostile = JSON.parse('{"__proto__":{"polluted":true},"kept":"yes","inner":{"__proto__":{"x":1}}}') as Record<string, unknown>;
+    const prepare = await authorAndCapture({ ...validRecordPayload(), resourceBounds: hostile });
+    const bounds = prepare['resourceBounds'] as Record<string, unknown>;
+    expect(bounds).not.toBe(hostile);
+    expect(bounds['inner']).not.toBe(hostile['inner']);
     expect(Object.getPrototypeOf(bounds)).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(bounds['inner'])).toBe(Object.prototype);
     expect((bounds as { polluted?: unknown }).polluted).toBeUndefined();
+    expect(Object.hasOwn(bounds, '__proto__')).toBe(true);
     expect(bounds['kept']).toBe('yes');
+  });
+
+  it.each([
+    ['ownedPaths', { ownedPaths: [{ toString: 1 }] }],
+    ['permissions', { permissions: [{ valueOf: 1 }] }],
+    ['acceptanceChecks', { acceptanceChecks: [{ toString: 1, valueOf: 1 }] }],
+    ['expectedArtifacts', { expectedArtifacts: [{ toString: 1 }] }],
+    ['ownerDecisionReferences', { ownerDecisionReferences: [{ toString: 1 }] }],
+    ['stepLimit', { stepLimit: { toString: 1 } }],
+    ['timeLimitSeconds', { timeLimitSeconds: { valueOf: 1 } }],
+  ])('an object carrying toString in %s is a usage error and the use case is not called', async (field, json) => {
+    const { io, stdout, stderr } = capturingIo();
+    const { runtime, authorCalls } = guardsRuntime();
+    const exitCode = await runCli(briefAuthorArgs(['--json', JSON.stringify(json)]), io, runtime);
+    expect(exitCode).toBe(2);
+    expect(stderr.join('')).toContain(`brief author --${field} has the wrong type`);
+    expect(stdout).toHaveLength(0);
+    expect(authorCalls).toHaveLength(0);
+  });
+
+  it('a revoked Proxy as facts is a usage error', async () => {
+    const { proxy, revoke } = Proxy.revocable([], {});
+    revoke();
+    const { runtime, authorCalls } = guardsRuntime();
+    let thrown: unknown = null;
+    try {
+      await briefCommands['author']({ ...validRecordPayload(), facts: proxy }, runtime);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CliUsageError);
+    expect(authorCalls).toHaveLength(0);
+  });
+
+  it('an acceptanceSpec JSON string nested 3000 deep is refused exactly as the object form', async () => {
+    const depth = 3000;
+    const text = '{"a":'.repeat(depth) + '1' + '}'.repeat(depth);
+    const run = async (value: unknown): Promise<string> => {
+      const { runtime, authorCalls } = guardsRuntime();
+      let message = '';
+      try {
+        await briefCommands['author']({ ...validRecordPayload(), acceptanceSpec: value }, runtime);
+      } catch (error) {
+        expect(error).toBeInstanceOf(CliUsageError);
+        message = (error as CliUsageError).message;
+      }
+      expect(authorCalls).toHaveLength(0);
+      return message;
+    };
+    let objectForm: unknown = 1;
+    for (let level = 0; level < 40; level += 1) {
+      objectForm = { a: objectForm };
+    }
+    const fromString = await run(text);
+    expect(fromString).toBe('brief author could not read its arguments');
+    expect(await run(objectForm)).toBe(fromString);
+  });
+
+  it('more than 5000 facts reports the at-most-32 limit, not an unreadable argument', async () => {
+    const { io, stderr } = capturingIo();
+    const { runtime, authorCalls } = guardsRuntime();
+    const exitCode = await runCli(briefAuthorArgs(['--facts', JSON.stringify(Array.from({ length: 6000 }, () => 0))]), io, runtime);
+    expect(exitCode).toBe(2);
+    expect(stderr.join('')).toContain('at most 32 facts');
+    expect(authorCalls).toHaveLength(0);
   });
 
   it('a throwing facts length getter is a usage error that does not carry the thrown text', async () => {

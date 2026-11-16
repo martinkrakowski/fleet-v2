@@ -1244,12 +1244,31 @@ describe('review rules per kind', () => {
     assertDecision(noBudget, record({}), decide(record({}), noBudget), { kind: 'enter', to: 'fixing' });
   });
 
-  it.each(['brief-check', 'code-review'] as const)('V9c2: %s failed with a malformed confirmingRetries falls through to afterFailure, never loops', (kind) => {
-    const malformed = reviewFacts(kind, {
-      verdict: 'failed', seatIndex: 0, retries: 0, priorPassedAtHead: true,
-      confirmingRetries: 1.5 as unknown as number,
+  it.each(['brief-check', 'code-review'] as const)('V9a2: %s failed after a prior pass with confirmingRetries absent reads as 0 and confirms once', (kind) => {
+    const absent = reviewFacts(kind, { verdict: 'failed', seatIndex: 0, retries: 0, priorPassedAtHead: true });
+    expect('confirmingRetries' in absent[kind === 'brief-check' ? 'briefCheck' : 'codeReview']).toBe(false);
+    expect(decide(record({}), absent)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
     });
-    assertDecision(malformed, record({}), decide(record({}), malformed), { kind: 'enter', to: 'fixing' });
+  });
+
+  const invalidConfirmingRetries: ReadonlyArray<readonly [string, unknown]> = [
+    ['null', null],
+    ['a non-integer 1.5', 1.5],
+    ['a negative -1', -1],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['the string "0"', '0'],
+    ['a boolean false', false],
+  ];
+  describe.each(['brief-check', 'code-review'] as const)('V9c2: %s failed after a prior pass', (kind) => {
+    it.each(invalidConfirmingRetries)('with confirmingRetries %s enters fixing (afterFailure), granting no confirming retry', (_label, value) => {
+      const malformed = reviewFacts(kind, {
+        verdict: 'failed', seatIndex: 0, retries: 0, priorPassedAtHead: true,
+        confirmingRetries: value as number,
+      });
+      assertDecision(malformed, record({}), decide(record({}), malformed), { kind: 'enter', to: 'fixing' });
+    });
   });
 });
 

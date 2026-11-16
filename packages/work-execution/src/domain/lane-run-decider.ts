@@ -108,6 +108,17 @@ export function ownProp(source: unknown, key: string): unknown {
   }
 }
 
+/**
+ * RV5: true only when no confirming re-review has been spent at this head. A
+ * missing count (`undefined`) reads as 0; any other value — `null`, a
+ * non-number, `NaN`, a non-integer, a negative number or a count of 1 or more —
+ * is not 0 and grants no confirming retry, so bad data falls through to
+ * `afterFailure`.
+ */
+function noConfirmingRetrySpent(confirmingRetries: unknown): boolean {
+  return confirmingRetries === undefined || confirmingRetries === 0;
+}
+
 const SEVERITY_VALUES: readonly string[] = ['blocker', 'major', 'minor', 'nit'];
 const CARRIED_MINORS_MAX = 50;
 
@@ -816,12 +827,9 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
      */
     const confirmingRetryDecision = (kind: 'brief-check' | 'code-review'): LaneRunDecision => {
       const review = kind === 'brief-check' ? facts.briefCheck : facts.codeReview;
-      const confirmingRetries = review.confirmingRetries ?? 0;
       if (
         review.priorPassedAtHead === true &&
-        typeof confirmingRetries === 'number' &&
-        Number.isSafeInteger(confirmingRetries) &&
-        confirmingRetries === 0 &&
+        noConfirmingRetrySpent(review.confirmingRetries) &&
         review.seatIndex !== null &&
         Number.isSafeInteger(review.retries) &&
         review.retries >= 0 &&

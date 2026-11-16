@@ -5,7 +5,11 @@ import type { LaneRunKeyResult } from '../lane-run-keys.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../lane-run-journal.js';
 import { laneRunIntentEntry, laneRunResultEntry } from '../lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../lane-run-step-facts.js';
-import { laneRunReviewConfirmationFact, laneRunReviewFact } from '../lane-run-review-facts.js';
+import {
+  LANE_RUN_REVIEW_CONFIRMATION_MAX_ENTRIES,
+  laneRunReviewConfirmationFact,
+  laneRunReviewFact,
+} from '../lane-run-review-facts.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const OTHER_RUN_ID = 'run-01JB0000000000000000000001';
@@ -291,5 +295,167 @@ describe('laneRunReviewConfirmationFact', () => {
     const entries = [intent(key), result(key, 'completed', 'review-passed')];
     expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', 'short')).toEqual(NO_CONFIRMATION);
     expect(laneRunReviewConfirmationFact('not-an-array' as unknown as LaneRunJournalEntryRecord[], RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+  });
+});
+
+/** A journal holding a pass then a contradictory failed of `brief-check` at HEAD: alone it yields a confirmation fact. */
+function contradictoryJournal(): LaneRunJournalEntryRecord[] {
+  const passedKey = reviewKey('brief-check', { seatIndex: 0 });
+  const failedKey = reviewKey('brief-check', { seatIndex: 0, retry: 1 });
+  return [
+    intent(passedKey),
+    result(passedKey, 'completed', 'review-passed'),
+    intent(failedKey),
+    result(failedKey, 'completed', 'review-failed'),
+  ];
+}
+
+const PRIOR_PASS = { priorPassedAtHead: true, confirmingRetries: 0 };
+
+/** Wraps `target` so every trap invocation is counted per trap and property. */
+function countingProxy<T extends object>(target: T, overrides: ProxyHandler<T>): { proxy: T; reads: Map<string, number> } {
+  const reads = new Map<string, number>();
+  const count = (trap: string, prop: PropertyKey): void => {
+    const name = `${trap}:${String(prop)}`;
+    reads.set(name, (reads.get(name) ?? 0) + 1);
+  };
+  const proxy = new Proxy(target, {
+    get(t, prop, receiver) {
+      count('get', prop);
+      return overrides.get ? overrides.get(t, prop, receiver) : Reflect.get(t, prop, receiver);
+    },
+    getOwnPropertyDescriptor(t, prop) {
+      count('getOwnPropertyDescriptor', prop);
+      return overrides.getOwnPropertyDescriptor ? overrides.getOwnPropertyDescriptor(t, prop) : Reflect.getOwnPropertyDescriptor(t, prop);
+    },
+  });
+  return { proxy, reads };
+}
+
+function indexReadsOf(reads: Map<string, number>): number {
+  let total = 0;
+  for (const [name, n] of reads) {
+    if (/:\d+$/.test(name)) {
+      total += n;
+    }
+  }
+  return total;
+}
+
+describe('laneRunReviewConfirmationFact hostile journals (Proxy, array-like, enormous length, large input)', () => {
+  it('the contradictory journal used below yields a prior pass when well-formed', () => {
+    expect(laneRunReviewConfirmationFact(contradictoryJournal(), RUN_ID, 'brief-check', HEAD)).toEqual(PRIOR_PASS);
+  });
+
+  it('never throws and grants no confirmation for a Proxy journal whose get trap throws', () => {
+    const hostile = new Proxy(contradictoryJournal(), {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(() => laneRunReviewConfirmationFact(hostile, RUN_ID, 'brief-check', HEAD)).not.toThrow();
+    expect(laneRunReviewConfirmationFact(hostile, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+  });
+
+  it('grants no confirmation when a Proxy entry whose getPrototypeOf trap throws sits beside a contradictory pass and fail', () => {
+    const hostileEntry = new Proxy({}, {
+      getPrototypeOf() {
+        throw new Error('boom');
+      },
+    });
+    const entries = [...contradictoryJournal(), hostileEntry as LaneRunJournalEntryRecord];
+    expect(() => laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).not.toThrow();
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+  });
+
+  it('grants no confirmation for a journal whose only entry is a Proxy whose getOwnPropertyDescriptor trap throws', () => {
+    const passedKey = reviewKey('brief-check', { seatIndex: 0 });
+    const hostileEntry = new Proxy({ kind: 'intent', runId: RUN_ID, key: passedKey }, {
+      getOwnPropertyDescriptor() {
+        throw new Error('boom');
+      },
+    });
+    const entries = [hostileEntry as LaneRunJournalEntryRecord];
+    expect(() => laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).not.toThrow();
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+  });
+
+  it('grants no confirmation for array-like objects (correct, short, negative or enormous length) holding a contradictory pass and fail', () => {
+    const journal = contradictoryJournal();
+    const arrayLikes: unknown[] = [
+      { ...journal, length: journal.length },
+      { ...journal, length: 2 },
+      { ...journal, length: -1 },
+      { ...journal, length: Number.MAX_SAFE_INTEGER },
+      { ...journal, length: Number.POSITIVE_INFINITY },
+    ];
+    for (const arrayLike of arrayLikes) {
+      const entries = arrayLike as LaneRunJournalEntryRecord[];
+      expect(() => laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).not.toThrow();
+      expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+    }
+  });
+
+  it('grants no confirmation for a real array whose length was set past its entries (trailing holes)', () => {
+    const entries = contradictoryJournal();
+    entries.length = 10;
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+  });
+
+  it('reads the length of an array Proxy reporting 2**32 - 1 entries exactly once, reads no entry, and grants no confirmation', () => {
+    const { proxy, reads } = countingProxy(contradictoryJournal(), {
+      get: (t, prop, receiver) => (prop === 'length' ? 2 ** 32 - 1 : Reflect.get(t, prop, receiver)),
+    });
+    const started = performance.now();
+    expect(laneRunReviewConfirmationFact(proxy, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(reads.get('get:length')).toBe(1);
+    expect(indexReadsOf(reads)).toBe(0);
+  });
+
+  it(`reads no entry of an array Proxy whose every index looks present when it reports one more than the ${LANE_RUN_REVIEW_CONFIRMATION_MAX_ENTRIES} entry cap, and grants no confirmation`, () => {
+    const filler = { kind: 'result', runId: RUN_ID, key: 'filler', outcome: 'completed', reasonCode: null };
+    const { proxy, reads } = countingProxy(contradictoryJournal(), {
+      get: (t, prop, receiver) => {
+        if (prop === 'length') {
+          return LANE_RUN_REVIEW_CONFIRMATION_MAX_ENTRIES + 1;
+        }
+        return typeof prop === 'string' && /^\d+$/.test(prop) && Number(prop) >= t.length ? filler : Reflect.get(t, prop, receiver);
+      },
+      getOwnPropertyDescriptor: (t, prop) => (
+        typeof prop === 'string' && /^\d+$/.test(prop)
+          ? { value: Reflect.get(t, prop) ?? filler, writable: true, enumerable: true, configurable: true }
+          : Reflect.getOwnPropertyDescriptor(t, prop)
+      ),
+    });
+    expect(laneRunReviewConfirmationFact(proxy, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+    expect(indexReadsOf(reads)).toBe(0);
+  });
+
+  it(`grants no confirmation for a real journal of ${LANE_RUN_REVIEW_CONFIRMATION_MAX_ENTRIES + 1} entries (one past the cap) that starts with a contradictory pass and fail, within one second`, () => {
+    const entries = contradictoryJournal();
+    const filler = result(reviewKey('code-review', { seatIndex: 0 }), 'completed', 'review-passed');
+    while (entries.length <= LANE_RUN_REVIEW_CONFIRMATION_MAX_ENTRIES) {
+      entries.push(filler);
+    }
+    const started = performance.now();
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual(NO_CONFIRMATION);
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
+
+  it('counts 20000 confirming intents of one key after a contradictory failed within two seconds (linear, not quadratic)', () => {
+    const entries = contradictoryJournal();
+    const confirmKey = reviewKey('brief-check', { seatIndex: 0, retry: 2 });
+    const confirmIntent = intent(confirmKey);
+    for (let n = 0; n < 20_000; n += 1) {
+      entries.push(confirmIntent);
+    }
+    entries.push(result(confirmKey, 'completed', 'review-failed'));
+    const started = performance.now();
+    expect(laneRunReviewConfirmationFact(entries, RUN_ID, 'brief-check', HEAD)).toEqual({
+      priorPassedAtHead: true,
+      confirmingRetries: 20_000,
+    });
+    expect(performance.now() - started).toBeLessThan(2_000);
   });
 });

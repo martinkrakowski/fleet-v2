@@ -22,7 +22,7 @@ import type { AssessmentStateValue } from '../value-objects/AssessmentState.vo.j
 import { AssessmentState } from '../value-objects/AssessmentState.vo.js';
 import { EvidenceResult } from '../value-objects/EvidenceResult.vo.js';
 import { FindingState } from '../value-objects/FindingState.vo.js';
-import { decideReviewReceiptOutcome, isMinorOrNitSeverity } from '../review-selection.js';
+import { decideReviewReceiptOutcome, isMinorOrNitSeverity, isReceiptAboutAssessment } from '../review-selection.js';
 import { FindingDisposition } from './FindingDisposition.js';
 import { ReviewReceipt } from './ReviewReceipt.js';
 import { VerificationReceipt } from './VerificationReceipt.js';
@@ -341,6 +341,9 @@ export class EvidenceAssessment {
     }
     if (validated.value.getAssessmentId() !== this.record.id) {
       throw new Error('Review receipt belongs to a different assessment');
+    }
+    if (!isReceiptAboutAssessment(validated.value.toRecord(), this.record)) {
+      throw new Error('Review receipt is about a different subject than this assessment');
     }
     // KF-33b2: two receipts with one id make their receipt-scoped finding ids
     // collide (unresolvable), so a duplicate id refuses instead of appending.

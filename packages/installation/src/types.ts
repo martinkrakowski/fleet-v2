@@ -673,10 +673,22 @@ export interface ClaimTriageSettings extends ConsumerSettings {
   readonly acknowledgeCandidateClaimsLeaveHost: true;
 }
 
+/**
+ * Settings of the `merge-veto` consumer (OG16c1). Present only when the
+ * operator declares it: a monthly budget of its own and the acknowledgement
+ * that a pull request's title and changed paths leave the host. An absent
+ * entry means the merge veto is not configured; nothing defaults it on.
+ */
+export interface MergeVetoConsumerSettings {
+  readonly monthlyBudgetUsd: number;
+  readonly acknowledgePullRequestTitleAndPathsLeaveHost: true;
+}
+
 /** The per-consumer settings map of a `decisions` block (K3). */
 export interface DecisionConsumers {
   readonly 'knowledge-ranking'?: ConsumerSettings;
   readonly 'claim-triage'?: ClaimTriageSettings;
+  readonly 'merge-veto'?: MergeVetoConsumerSettings;
 }
 
 /** The v2 `decisions` block with the Jev provider (D3). */

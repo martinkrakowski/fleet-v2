@@ -16,3 +16,5 @@ export * from './init/plan.js';
 export * from './deploy/types.js';
 export * from './deploy/run-deploy.js';
 export * from './deploy/describe-result.js';
+export * from './deploy/probes-node-fs.js';
+export * from './deploy/probes-node-git.js';

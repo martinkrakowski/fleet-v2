@@ -7,10 +7,12 @@
 import { describe, expect, it } from 'vitest';
 
 import type { GhInvocationResult } from '../ForgeActionAdapter.adapter.js';
+import type { MergeVetoStateFields } from '../../../application/ports/out/MergeVetoPort.out-port.js';
 import {
   GhMergeVetoStateAdapter,
   MAX_CHANGED_PATHS,
   MERGE_VETO_STATE_QUERY,
+  MERGE_VETO_UNREAD_FIELDS,
   parseMergeVetoState,
 } from '../GhMergeVetoStateAdapter.adapter.js';
 
@@ -71,21 +73,21 @@ function adapterWith(stdout: string): { adapter: GhMergeVetoStateAdapter; calls:
   return { adapter, calls: fake.calls };
 }
 
-const READ_STATE = {
+const READ_STATE: MergeVetoStateFields = {
   tier: '1',
   title: 'feat: add widget',
   changedPaths: ['a.ts', 'b/c.ts'],
   additions: 12,
   deletions: 3,
-  hardToUndo: 'not-read',
-  fixRounds: 0,
-  reviewerFamilies: [],
-  replyResolvedThreads: 0,
-  majorBlockerFindings: 0,
+  hardToUndo: null,
+  fixRounds: null,
+  reviewerFamilies: null,
+  replyResolvedThreads: null,
+  majorBlockerFindings: null,
   headChangedAfterReview: false,
 };
 
-type ReadResult = { status: 'read'; state: typeof READ_STATE };
+type ReadResult = { status: 'read'; state: MergeVetoStateFields };
 
 function asRead(result: { readonly status: string }): ReadResult {
   if (result.status !== 'read') throw new Error(`expected a read answer, got ${result.status}`);
@@ -93,6 +95,18 @@ function asRead(result: { readonly status: string }): ReadResult {
 }
 
 describe('parseMergeVetoState', () => {
+  it('reports the five fields the forge cannot answer as null, never as a zero or an empty list', () => {
+    const state = asRead(parseMergeVetoState(answer(), HEAD)).state;
+    const unread = ['hardToUndo', 'fixRounds', 'reviewerFamilies', 'replyResolvedThreads', 'majorBlockerFindings'] as const;
+    for (const key of unread) {
+      expect(state[key]).toBeNull();
+    }
+    expect(MERGE_VETO_UNREAD_FIELDS).toEqual({
+      hardToUndo: null, fixRounds: null, reviewerFamilies: null, replyResolvedThreads: null, majorBlockerFindings: null,
+    });
+    expect(Object.isFrozen(MERGE_VETO_UNREAD_FIELDS)).toBe(true);
+  });
+
   it('maps a well-formed answer to the full state', () => {
     expect(parseMergeVetoState(answer(), HEAD)).toEqual({ status: 'read', state: READ_STATE });
   });

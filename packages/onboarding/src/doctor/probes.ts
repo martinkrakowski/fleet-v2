@@ -46,6 +46,14 @@ export interface PinnedBuildProbeResult {
 /** What the CI runner slot probe found about one systemd unit. */
 export type CiRunnerSlotState = 'active' | 'inactive' | 'unknown';
 
+/**
+ * What the login-shell canary found about one ssh host: `intact` when the
+ * host's login shell handed `sh -c '<single-quoted line>'` through byte for
+ * byte, `mangled` when it answered anything else, `unknown` when the check
+ * could not be made.
+ */
+export type LoginShellState = 'intact' | 'mangled' | 'unknown';
+
 /** Every side effect the doctor performs, injected by the caller. */
 export interface DoctorProbes {
   /** Whether the named host is reachable (an ssh alias or `local`). */
@@ -108,4 +116,11 @@ export interface DoctorProbes {
    * stay compatible; a missing probe reports `UNKNOWN` per configured slot.
    */
   ciRunnerSlot?(host: string, unit: string): Promise<CiRunnerSlotState>;
+  /**
+   * The login-shell canary of one ssh host: a fixed string sent through the
+   * same transport as every other remote probe and compared byte for byte.
+   * Never command output. Optional so existing `DoctorProbes` fakes stay
+   * compatible; a missing probe reports `UNKNOWN` per ssh host.
+   */
+  loginShell?(host: string): Promise<LoginShellState>;
 }

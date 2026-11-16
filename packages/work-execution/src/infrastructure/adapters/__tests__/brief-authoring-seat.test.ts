@@ -1,9 +1,9 @@
 // Lane CO17: BriefAuthoringAdapter seat session tests (fake executor, real temp directories).
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import type { BriefAuthorSessionRequest } from '../../../application/ports/out/BriefAuthoringPort.out-port.js';
 import type {
@@ -16,6 +16,9 @@ import { BriefAuthoringAdapter } from '../BriefAuthoringAdapter.adapter.js';
 const COMMIT = 'c'.repeat(40);
 const SESSION_KEY = `brief-author/wo-1/lane-1@${COMMIT.slice(0, 12)}`;
 const STEM = `brief-author__wo-1__lane-1@${COMMIT.slice(0, 12)}`;
+const RETRY_KEY = `${SESSION_KEY}/retry`;
+const RETRY_STEM = `${STEM}__retry`;
+const RETRY_FIELDS = { sessionKey: RETRY_KEY, retry: true as const, prompt: 'RETRY PROMPT' };
 const SEAT_COMMAND = ['seat-bin', '--model', '{model}', '--prompt', '{promptFile}'] as const;
 
 const roots: string[] = [];
@@ -32,10 +35,13 @@ interface Call {
 class FakeExecutor implements CommandExecutorPort {
   public readonly calls: Call[] = [];
   public head = COMMIT;
+  /** Runs at the start of every executor call (the checkout check and the seat alike). */
+  public onCall: (() => Promise<void>) | undefined;
   public seat: CommandRunResult = { exitCode: 0, signal: null, stdout: '===NOTES===\nn\n===DISPATCH===\nbody\n', stderr: '' };
 
   public async run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
     this.calls.push({ argv, options });
+    await this.onCall?.();
     if (argv.includes('rev-parse')) {
       return { exitCode: 0, signal: null, stdout: `${this.head}\n`, stderr: '' };
     }
@@ -335,4 +341,229 @@ describe('BriefAuthoringAdapter seat session', () => {
     ]);
     expect(s.executor.seatCalls).toHaveLength(1);
   });
+
+  it('a retry runs its own seat session under the retry stem and leaves the first record untouched', async () => {
+    const s = await setup();
+    const adapter = adapterFor(s.executor);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'FIRST', stderr: '' };
+    await adapter.authorBriefSession(s.request);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'SECOND', stderr: '' };
+    const retry = await adapter.authorBriefSession({
+      ...s.request, sessionKey: RETRY_KEY, retry: true as const, prompt: 'RETRY PROMPT',
+    });
+    expect(retry).toEqual({ outcome: 'answered', answer: 'SECOND' });
+    expect(s.executor.seatCalls).toHaveLength(2);
+    expect(await fs.readFile(path.join(s.briefsDir, `${STEM}.answer.md`), 'utf8')).toBe('FIRST');
+    expect(await fs.readFile(path.join(s.briefsDir, `${RETRY_STEM}.answer.md`), 'utf8')).toBe('SECOND');
+    expect(await fs.readFile(path.join(s.briefsDir, `${RETRY_STEM}.prompt.md`), 'utf8')).toBe('RETRY PROMPT');
+    const intent = JSON.parse(await fs.readFile(path.join(s.briefsDir, `${RETRY_STEM}.intent.json`), 'utf8')) as Record<string, unknown>;
+    expect(intent.sessionKey).toBe(RETRY_KEY);
+  });
+
+  it('a repeat of the retry returns the recorded retry answer and runs no third session', async () => {
+    const s = await setup();
+    const adapter = adapterFor(s.executor);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'FIRST', stderr: '' };
+    await adapter.authorBriefSession(s.request);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'SECOND', stderr: '' };
+    const retryRequest = { ...s.request, sessionKey: RETRY_KEY, retry: true as const, prompt: 'RETRY PROMPT' };
+    await adapter.authorBriefSession(retryRequest);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'THIRD', stderr: '' };
+    const again = await adapter.authorBriefSession(retryRequest);
+    expect(again).toEqual({ outcome: 'answered', answer: 'SECOND' });
+    expect(s.executor.seatCalls).toHaveLength(2);
+  });
+
+  it('a retry key without retry true, and retry true with the plain key, are refused', async () => {
+    const s = await setup();
+    const adapter = adapterFor(s.executor);
+    const wrongKey = await adapter.authorBriefSession({ ...s.request, sessionKey: RETRY_KEY });
+    expect(wrongKey).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    const wrongFlag = await adapter.authorBriefSession({ ...s.request, retry: true });
+    expect(wrongFlag).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+    expect(await fs.readdir(s.briefsDir).catch(() => [])).toEqual([]);
+  });
+
+  it('a retry with no recorded first answer is refused and runs nothing', async () => {
+    const s = await setup();
+    const adapter = adapterFor(s.executor);
+    const retryRequest = { ...s.request, sessionKey: RETRY_KEY, retry: true as const, prompt: 'RETRY PROMPT' };
+    const refused = await adapter.authorBriefSession(retryRequest);
+    expect(refused).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+    expect(await fs.readdir(s.briefsDir).catch(() => [])).toEqual([]);
+    await fs.mkdir(s.briefsDir, { recursive: true });
+    await fs.writeFile(path.join(s.briefsDir, `${RETRY_STEM}.answer.md`), 'OLD', 'utf8');
+    const refusedAgain = await adapter.authorBriefSession(retryRequest);
+    expect(refusedAgain).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+  });
+
+  it('a first attempt that runs again deletes the recorded retry answer', async () => {
+    const s = await setup();
+    const adapter = adapterFor(s.executor);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'FIRST', stderr: '' };
+    await adapter.authorBriefSession(s.request);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'SECOND', stderr: '' };
+    const retryRequest = { ...s.request, sessionKey: RETRY_KEY, retry: true as const, prompt: 'RETRY PROMPT' };
+    await adapter.authorBriefSession(retryRequest);
+    await fs.rm(path.join(s.briefsDir, `${STEM}.answer.md`));
+    await fs.rm(path.join(s.briefsDir, `${STEM}.intent.json`));
+    await fs.rm(path.join(s.briefsDir, `${RETRY_STEM}.intent.json`));
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'FIRST-AGAIN', stderr: '' };
+    const rerun = await adapter.authorBriefSession(s.request);
+    expect(rerun).toEqual({ outcome: 'answered', answer: 'FIRST-AGAIN' });
+    await expect(fs.access(path.join(s.briefsDir, `${RETRY_STEM}.answer.md`))).rejects.toThrow();
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'SECOND-AGAIN', stderr: '' };
+    const retryAgain = await adapter.authorBriefSession(retryRequest);
+    expect(retryAgain).toEqual({ outcome: 'answered', answer: 'SECOND-AGAIN' });
+    expect(s.executor.seatCalls).toHaveLength(4);
+  });
+
+  it('a replayed first answer leaves the recorded retry answer in place', async () => {
+    const s = await setup();
+    const adapter = adapterFor(s.executor);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'FIRST', stderr: '' };
+    await adapter.authorBriefSession(s.request);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'SECOND', stderr: '' };
+    await adapter.authorBriefSession({
+      ...s.request, sessionKey: RETRY_KEY, retry: true as const, prompt: 'RETRY PROMPT',
+    });
+    const replay = await adapter.authorBriefSession(s.request);
+    expect(replay).toEqual({ outcome: 'answered', answer: 'FIRST' });
+    expect(await fs.readFile(path.join(s.briefsDir, `${RETRY_STEM}.answer.md`), 'utf8')).toBe('SECOND');
+    expect(s.executor.seatCalls).toHaveLength(2);
+  });
+
+  it('a retry value other than true is refused', async () => {
+    const s = await setup();
+    const result = await adapterFor(s.executor)
+      .authorBriefSession({ ...s.request, retry: false as unknown as true });
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+  });
+
+  it('a retry key for a different brief is refused', async () => {
+    const s = await setup();
+    const adapter = adapterFor(s.executor);
+    const otherBrief = await adapter.authorBriefSession({
+      ...s.request, sessionKey: `brief-author/wo-2/lane-1@${COMMIT.slice(0, 12)}/retry`, retry: true as const,
+    });
+    expect(otherBrief).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    const doubledSuffix = await adapter.authorBriefSession({
+      ...s.request, sessionKey: `${RETRY_KEY}/retry`, retry: true as const,
+    });
+    expect(doubledSuffix).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+  });
+  async function recordFirstAndRetry(s: Setup): Promise<BriefAuthoringAdapter> {
+    const adapter = adapterFor(s.executor);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'FIRST', stderr: '' };
+    await adapter.authorBriefSession(s.request);
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'SECOND', stderr: '' };
+    await adapter.authorBriefSession({ ...s.request, ...RETRY_FIELDS });
+    return adapter;
+  }
+
+  /** Make the first attempt runnable again: its answer and both intents are gone, the retry answer stays. */
+  async function reopenFirstAttempt(s: Setup): Promise<void> {
+    await fs.rm(path.join(s.briefsDir, `${STEM}.answer.md`));
+    await fs.rm(path.join(s.briefsDir, `${STEM}.intent.json`));
+    await fs.rm(path.join(s.briefsDir, `${RETRY_STEM}.intent.json`));
+  }
+
+  async function exists(file: string): Promise<boolean> {
+    return fs.access(file).then(() => true, () => false);
+  }
+
+  /** Fail the next write-open of any file ending in `suffix`: by rejecting, or by writing other bytes. */
+  function breakWriteOf(suffix: string, mode: 'reject' | 'corrupt') {
+    const original = fs.open.bind(fs);
+    return vi.spyOn(fs, 'open').mockImplementation(async (file, flags, fileMode) => {
+      const writing = typeof flags === 'number' && (flags & fsConstants.O_CREAT) !== 0;
+      if (!writing || !String(file).endsWith(suffix)) {
+        return original(file, flags, fileMode);
+      }
+      if (mode === 'reject') {
+        throw new Error('injected write failure');
+      }
+      const handle = await original(file, flags, fileMode);
+      handle.writeFile = async () => fs.writeFile(String(file), 'CORRUPT', 'utf8');
+      return handle;
+    });
+  }
+
+  it('a first attempt removes a stale retry answer before the checkout check and the seat, and a later retry runs the seat', async () => {
+    const s = await setup();
+    const adapter = await recordFirstAndRetry(s);
+    await reopenFirstAttempt(s);
+    const retryAnswer = path.join(s.briefsDir, `${RETRY_STEM}.answer.md`);
+    expect(await exists(retryAnswer)).toBe(true);
+    const presentAtCall: boolean[] = [];
+    s.executor.onCall = async () => { presentAtCall.push(await exists(retryAnswer)); };
+    const callsBefore = s.executor.calls.length;
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'FIRST-AGAIN', stderr: '' };
+    expect(await adapter.authorBriefSession(s.request)).toEqual({ outcome: 'answered', answer: 'FIRST-AGAIN' });
+    expect(s.executor.calls.length - callsBefore).toBe(2);
+    expect(presentAtCall).toEqual([false, false]);
+    s.executor.onCall = undefined;
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'SECOND-AGAIN', stderr: '' };
+    expect(await adapter.authorBriefSession({ ...s.request, ...RETRY_FIELDS }))
+      .toEqual({ outcome: 'answered', answer: 'SECOND-AGAIN' });
+    expect(s.executor.seatCalls).toHaveLength(4);
+  });
+
+  it('a stale retry answer that cannot be removed refuses the first attempt and runs no seat', async () => {
+    const s = await setup();
+    const adapter = await recordFirstAndRetry(s);
+    await reopenFirstAttempt(s);
+    const retryAnswer = path.join(s.briefsDir, `${RETRY_STEM}.answer.md`);
+    await fs.rm(retryAnswer);
+    await fs.mkdir(retryAnswer);
+    await fs.writeFile(path.join(retryAnswer, 'keep'), 'x', 'utf8');
+    const callsBefore = s.executor.calls.length;
+    s.executor.seat = { exitCode: 0, signal: null, stdout: 'FIRST-AGAIN', stderr: '' };
+    expect(await adapter.authorBriefSession(s.request)).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+    expect(s.executor.calls).toHaveLength(callsBefore);
+    expect(await exists(path.join(s.briefsDir, `${STEM}.answer.md`))).toBe(false);
+    expect(await exists(path.join(retryAnswer, 'keep'))).toBe(true);
+  });
+
+  it.each([['rejects', 'reject'], ['reads back other bytes', 'corrupt']] as const)(
+    'a first answer write that %s is session-failed and records no answer',
+    async (_name, mode) => {
+      const s = await setup();
+      const spy = breakWriteOf(`${STEM}.answer.md`, mode);
+      try {
+        const result = await adapterFor(s.executor).authorBriefSession(s.request);
+        expect(result).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+      } finally {
+        spy.mockRestore();
+      }
+      expect(s.executor.seatCalls).toHaveLength(1);
+      expect(await exists(path.join(s.briefsDir, `${STEM}.answer.md`))).toBe(false);
+    },
+  );
+
+  it.each([['rejects', 'reject'], ['reads back other bytes', 'corrupt']] as const)(
+    'a retry answer write that %s is session-failed, records no retry answer and keeps the first answer',
+    async (_name, mode) => {
+      const s = await setup();
+      const adapter = adapterFor(s.executor);
+      s.executor.seat = { exitCode: 0, signal: null, stdout: 'FIRST', stderr: '' };
+      await adapter.authorBriefSession(s.request);
+      s.executor.seat = { exitCode: 0, signal: null, stdout: 'SECOND', stderr: '' };
+      const spy = breakWriteOf(`${RETRY_STEM}.answer.md`, mode);
+      try {
+        const result = await adapter.authorBriefSession({ ...s.request, ...RETRY_FIELDS });
+        expect(result).toEqual({ outcome: 'unavailable', reason: 'session-failed' });
+      } finally {
+        spy.mockRestore();
+      }
+      expect(s.executor.seatCalls).toHaveLength(2);
+      expect(await exists(path.join(s.briefsDir, `${RETRY_STEM}.answer.md`))).toBe(false);
+      expect(await fs.readFile(path.join(s.briefsDir, `${STEM}.answer.md`), 'utf8')).toBe('FIRST');
+    },
+  );
 });

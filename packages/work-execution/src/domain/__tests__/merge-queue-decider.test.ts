@@ -255,6 +255,51 @@ describe('observed base gate (between rows 8 and 9)', () => {
     expectWait(decision, 'base-unobserved');
   });
 
+  it('parks checks on a failed gate for a chain entry observed on its own base', () => {
+    const decision = decideMergeStep(
+      makeChainEntry(),
+      makeOpenFacts(observed({
+        contexts: { gate: { state: 'failure' }, premerge: { state: 'success', creatorLogin: POSTER } },
+        headObservedAtIso: minutesBeforeNow(5),
+      })),
+      makePolicy(),
+      NOW,
+    );
+    expect(decision).toEqual({
+      kind: 'park', reason: 'checks', detail: 'gate', backoff: true,
+      notBeforeIso: computeMergeBackoffIso(NOW, 0), nextAttempt: 1,
+    });
+  });
+
+  it('parks checks on a premerge by the wrong creator for a chain entry observed on its own base', () => {
+    const decision = decideMergeStep(
+      makeChainEntry(),
+      makeOpenFacts(observed({
+        contexts: { gate: { state: 'success' }, premerge: { state: 'success', creatorLogin: 'someone-else' } },
+        headObservedAtIso: minutesBeforeNow(5),
+      })),
+      makePolicy(),
+      NOW,
+    );
+    expect(decision).toEqual({
+      kind: 'park', reason: 'checks', detail: 'premerge', backoff: true,
+      notBeforeIso: computeMergeBackoffIso(NOW, 0), nextAttempt: 1,
+    });
+  });
+
+  it('parks threads for a chain entry observed on its own base', () => {
+    const decision = decideMergeStep(
+      makeChainEntry(),
+      makeOpenFacts(observed({ unresolvedThreads: { status: 'known', count: 2 } })),
+      makePolicy(),
+      NOW,
+    );
+    expectPark(decision, 'threads');
+    if (decision.kind === 'park') {
+      expect(decision.backoff).toBe(false);
+    }
+  });
+
   it('updates a chain entry that is BEHIND its own base', () => {
     const decision = decideMergeStep(makeChainEntry(), makeOpenFacts(behind(observed())), makePolicy(), NOW);
     if (decision.kind !== 'act') {

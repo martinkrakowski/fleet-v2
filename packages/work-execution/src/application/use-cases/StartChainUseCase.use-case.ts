@@ -29,6 +29,8 @@ import type {
 } from '../ports/in/StartChainPort.in-port.js';
 import { START_CHAIN_REASONS } from '../ports/in/StartChainPort.in-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
+import { isChainPassHalted } from './chain-pass-halt.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeForgeActionPort } from '../ports/out/MergeForgeActionPort.out-port.js';
 
 interface ValidCommand {
@@ -110,7 +112,19 @@ function recordedRefusalReason(record: ChainRecord): StartChainReason {
 }
 
 export class StartChainUseCase implements StartChainPort {
-  constructor(private readonly deps: { readonly chains: ChainRepositoryPort; readonly forge: MergeForgeActionPort }) {}
+  constructor(
+    private readonly deps: {
+      readonly chains: ChainRepositoryPort;
+      readonly forge: MergeForgeActionPort;
+      /**
+       * The conductor halt read (plan §3.7). Optional: absent means not halted
+       * and behaves exactly as before. When present it fails closed:
+       * unreadable, off-contract or halted, a start refuses before the intent
+       * write and before any forge call.
+       */
+      readonly halt?: Pick<ConductorHaltPort, 'read'>;
+    },
+  ) {}
 
   async startChain(command: StartChainCommand): Promise<StartChainDecision> {
     try {
@@ -164,6 +178,11 @@ export class StartChainUseCase implements StartChainPort {
   }
 
   private async startFresh(command: ValidCommand): Promise<StartChainDecision> {
+    if (await isChainPassHalted(this.deps.halt)) {
+      // Refused before the intent write and before any forge call; the halt is
+      // read once here, never again after a forge action was sent.
+      return refused('halted');
+    }
     const created = createChainRecord({
       repository: command.repository,
       chainName: command.chainName,
@@ -189,6 +208,11 @@ export class StartChainUseCase implements StartChainPort {
 
   /** The same key found at `intent-recorded`: a crash or an ambiguous answer left it open; read before any write. */
   private async recover(command: ValidCommand, record: ChainRecord): Promise<StartChainDecision> {
+    if (await isChainPassHalted(this.deps.halt)) {
+      // Refused before the branch-head read and before any forge call; an
+      // already-sent forge action is never rolled back (see settleFromHead).
+      return refused('halted', record);
+    }
     const head = await this.readHead(command);
     if (head.outcome === 'not-found') {
       // The branch is provably absent, so the earlier attempt wrote nothing. Retrying is safe: the create is

@@ -35,6 +35,7 @@ export const START_CHAIN_REASONS = [
   'action-key-conflict',
   'intent-refused',
   'forge-refused',
+  'halted',
   'branch-exists-at-other-commit',
   'unresolved',
 ] as const;

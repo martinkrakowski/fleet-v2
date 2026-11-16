@@ -33,6 +33,8 @@ import type {
 } from '../ports/in/RefreshChainsPort.in-port.js';
 import type { ChainAttentionPort } from '../ports/out/ChainAttentionPort.out-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
+import { isChainPassHalted } from './chain-pass-halt.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeBranchHeadResult, MergeForgeActionPort, MergeForgeActionResult } from '../ports/out/MergeForgeActionPort.out-port.js';
 
 const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
@@ -113,6 +115,14 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       readonly chains: ChainRepositoryPort;
       readonly forge: MergeForgeActionPort;
       readonly attention: ChainAttentionPort;
+      /**
+       * The conductor halt read (plan §3.7). Optional: absent means not halted
+       * and behaves exactly as before. When present it fails closed: an
+       * unreadable read, a throw and any answer that is not an object whose
+       * `state: 'clear'` agrees with its record refuse the pass before any
+       * forge call or intent write. Read once per pass.
+       */
+      readonly halt?: Pick<ConductorHaltPort, 'read'>;
       readonly now?: () => string;
       /** `live` writes and is accepted only when passed explicitly; an omitted or unknown mode is `shadow` (observe only: no intent, no forge write, no attention). */
       readonly mode?: 'shadow' | 'live';
@@ -151,6 +161,11 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     });
     if (listed.status === 'unreadable') {
       return { outcome: 'skipped', reasonCode: 'chains-unreadable', chains: [] };
+    }
+    if (await isChainPassHalted(this.deps.halt)) {
+      // Read once per pass, never again inside the per-chain loop: refused
+      // before any forge call and before any intent or outcome write.
+      return { outcome: 'refused', reasonCode: 'halted', chains: [] };
     }
     const head = await this.readMainHead(command);
     if (head.outcome === 'not-found') {

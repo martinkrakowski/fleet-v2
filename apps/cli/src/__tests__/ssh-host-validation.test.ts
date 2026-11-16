@@ -22,6 +22,12 @@ vi.mock('node:child_process', () => ({
   },
 }));
 
+// The resolver is stubbed so no assertion depends on where this host keeps ssh.
+vi.mock('../ssh-binary.js', () => ({
+  SSH_BINARY_CANDIDATES: ['/usr/bin/ssh'],
+  resolveSshBinary: (candidates: readonly string[]) => candidates[0],
+}));
+
 import { readGitHead, createFleetCliRuntime } from '../composition.js';
 
 describe('apps/cli readGitHead SSH host validation', () => {
@@ -51,9 +57,18 @@ describe('apps/cli readGitHead SSH host validation', () => {
     expect(head).toBe('abc1234567890');
     expect(execFileMock).toHaveBeenCalled();
     const [file, args] = execFileMock.mock.calls[0] as [string, readonly string[]];
-    expect(file).toBe('ssh');
-    expect(args[0]).toBe('lanehost');
-    expect(args[1]).toBe('--');
+    expect(file).toBe('/usr/bin/ssh');
+    expect(args).toEqual([
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=15',
+      'lanehost',
+      '--',
+      'sh',
+      '-c',
+      "''\\''git'\\'' '\\''-C'\\'' '\\''/nonexistent/remote/worktree'\\'' '\\''rev-parse'\\'' '\\''HEAD'\\'''",
+    ]);
   });
 
   it('refuses verifyCurrentHeadSha with unsafe worktreeSshHost in runtime', async () => {

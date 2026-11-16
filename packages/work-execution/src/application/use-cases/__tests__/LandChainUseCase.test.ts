@@ -973,7 +973,7 @@ describe('LandChainUseCase halt gate', () => {
       },
     } as unknown as LandChainDependencies['halt'];
     const { result, world } = await run({}, { halt });
-    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: null, premergeStatus: 'not-recorded', landingMark: 'not-landing' } });
     expect(world.landing.calls.openOrAdopt).toBe(0);
     expect(world.calls.performMergeForgeAction).toBe(0);
     expect(world.calls.enqueueMergeEntry).toBe(0);
@@ -991,7 +991,7 @@ describe('LandChainUseCase halt gate', () => {
       },
     } as unknown as LandChainDependencies['halt'];
     const { result, world } = await run({}, { halt });
-    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: 77, premergeStatus: 'not-recorded', landingMark: 'not-landing' } });
     expect(world.landing.calls.openOrAdopt).toBe(1);
     expect(world.calls.performMergeForgeAction).toBe(0);
     expect(world.calls.enqueueMergeEntry).toBe(0);
@@ -1009,7 +1009,7 @@ describe('LandChainUseCase halt gate', () => {
       },
     } as unknown as LandChainDependencies['halt'];
     const { result, world } = await run({}, { halt });
-    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: 77, premergeStatus: 'posted', landingMark: 'landing' } });
     expect(world.landing.calls.openOrAdopt).toBe(1);
     expect(world.calls.performMergeForgeAction).toBe(1);
     expect(world.calls.enqueueMergeEntry).toBe(0);
@@ -1033,18 +1033,56 @@ describe('LandChainUseCase halt gate', () => {
   // Reads in a clean landing: 1 first, 2 pre-apply, 3 before open/adopt, 4 before the premerge intent
   // (the old pre-status read), 5 after the premerge intent and directly before the post, 6 before the enqueue.
   it.each([
-    { at: 3, open: 0, post: 0, enqueue: 0, journalled: [] as string[] },
-    { at: 4, open: 1, post: 0, enqueue: 0, journalled: [] as string[] },
-    { at: 5, open: 1, post: 0, enqueue: 0, journalled: ['premerge:intent'] },
-    { at: 6, open: 1, post: 1, enqueue: 0, journalled: ['premerge:intent', 'enqueue:intent'] },
-  ])('a halt that trips at read $at stops that action and every later one', async ({ at, open, post, enqueue, journalled }) => {
+    {
+      at: 3,
+      open: 0,
+      post: 0,
+      enqueue: 0,
+      journalled: [] as string[],
+      progress: { integrationPullRequestNumber: null, premergeStatus: 'not-recorded', landingMark: 'not-landing' },
+      mark: undefined,
+    },
+    {
+      at: 4,
+      open: 1,
+      post: 0,
+      enqueue: 0,
+      journalled: [],
+      progress: { integrationPullRequestNumber: 77, premergeStatus: 'not-recorded', landingMark: 'not-landing' },
+      mark: undefined,
+    },
+    {
+      at: 5,
+      open: 1,
+      post: 0,
+      enqueue: 0,
+      journalled: ['premerge:intent'],
+      progress: { integrationPullRequestNumber: 77, premergeStatus: 'not-recorded', landingMark: 'not-landing' },
+      mark: undefined,
+    },
+    {
+      at: 6,
+      open: 1,
+      post: 1,
+      enqueue: 0,
+      journalled: ['premerge:intent', 'enqueue:intent'],
+      progress: { integrationPullRequestNumber: 77, premergeStatus: 'posted', landingMark: 'landing' },
+      mark: { mark: { state: 'landing', pullRequestNumber: 77, headSha: TIP, key: LAND_KEY } },
+    },
+  ])('a halt that trips at read $at stops that action and every later one', async ({ at, open, post, enqueue, journalled, progress, mark }) => {
     const { halt, reads } = haltFromRead(at);
     const { result, world } = await run({}, { halt });
-    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted', progress });
     expect(world.landing.calls.openOrAdopt).toBe(open);
     expect(world.calls.performMergeForgeAction).toBe(post);
     expect(world.calls.enqueueMergeEntry).toBe(enqueue);
     expect(reads()).toBe(at);
+    expect(world.landing.journal.get(LAND_KEY)?.map((entry) => entry.kind)).toEqual(['intent']);
+    if (mark === undefined) {
+      expect(world.landing.marks.get(MARK_ID)).toBeUndefined();
+    } else {
+      expect(world.landing.marks.get(MARK_ID)).toMatchObject(mark);
+    }
     const stepEntries = [...world.landing.journal.entries()]
       .filter(([key]) => /\/(premerge|enqueue)@/.test(key))
       .flatMap(([key, entries]) => entries.map((entry) => `${/\/(premerge|enqueue)@/.exec(key)?.[1]}:${entry.kind}`));
@@ -1070,7 +1108,7 @@ describe('LandChainUseCase halt gate', () => {
       return answer;
     };
     const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
-    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: 77, premergeStatus: 'not-recorded', landingMark: 'not-landing' } });
     expect(world.landing.calls.openOrAdopt).toBe(1);
     expect(world.calls.performMergeForgeAction).toBe(0);
     expect(world.calls.enqueueMergeEntry).toBe(0);
@@ -1099,7 +1137,7 @@ describe('LandChainUseCase halt gate', () => {
     let openPullRequests: { number: number; headSha: string }[] = [];
     (world.deps.forge as { findOpenPullRequestsByHead: unknown }).findOpenPullRequestsByHead = async () => ({ outcome: 'read', pullRequests: openPullRequests });
     const first = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
-    expect(first).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(first).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: 77, premergeStatus: 'posted', landingMark: 'landing' } });
     expect(world.calls.enqueueMergeEntry).toBe(0);
     expect(world.landing.marks.get(MARK_ID)?.mark.state).toBe('landing');
     openPullRequests = [{ number: 77, headSha: TIP }];
@@ -1111,6 +1149,58 @@ describe('LandChainUseCase halt gate', () => {
     expect(world.calls.enqueueMergeEntry).toBe(1);
     // The premerge status is posted again on the resume (its intent is present, its post left no result): once per run.
     expect(world.calls.performMergeForgeAction).toBe(2);
+  });
+
+  it('a trip before adopting an already open integration pull request names that pull request', async () => {
+    const { halt } = haltFromRead(3);
+    const { result, world } = await run({}, { halt, openPullRequests: [{ number: 55, headSha: TIP }] });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: 55, premergeStatus: 'not-recorded', landingMark: 'not-landing' } });
+    expect(world.landing.calls.openOrAdopt).toBe(0);
+  });
+
+  it('an unreadable landing mark at the trip is reported unknown', async () => {
+    const { halt } = haltFromRead(4);
+    const { result, world } = await run({}, { halt, journalFail: 'mark' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: 77, premergeStatus: 'not-recorded', landingMark: 'unknown' } });
+    expect(world.calls.performMergeForgeAction).toBe(0);
+  });
+
+  it('a throwing landing mark read at the trip is reported unknown and nothing is thrown', async () => {
+    const world = makeWorld({ halt: haltFromRead(4).halt });
+    world.landing.readMark = async () => {
+      throw new Error('boom');
+    };
+    const result = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: 77, premergeStatus: 'not-recorded', landingMark: 'unknown' } });
+    expect(world.calls.performMergeForgeAction).toBe(0);
+  });
+
+  it('a second run halted before its own post reports the mark the first run left', async () => {
+    let reads = 0;
+    const halt = {
+      read: async () => {
+        reads += 1;
+        return reads === 6 || reads >= 10
+          ? { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } }
+          : { state: 'clear', record: null };
+      },
+    } as unknown as LandChainDependencies['halt'];
+    const world = makeWorld({ halt });
+    let openPullRequests: { number: number; headSha: string }[] = [];
+    (world.deps.forge as { findOpenPullRequestsByHead: unknown }).findOpenPullRequestsByHead = async () => ({ outcome: 'read', pullRequests: openPullRequests });
+    const first = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(first).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: 77, premergeStatus: 'posted', landingMark: 'landing' } });
+    openPullRequests = [{ number: 77, headSha: TIP }];
+    const second = await new LandChainUseCase(world.deps).execute({ ...BASE_COMMAND });
+    expect(second).toEqual({ outcome: 'refused', reason: 'halted', progress: { integrationPullRequestNumber: 77, premergeStatus: 'not-recorded', landingMark: 'landing' } });
+  });
+
+  it('a refusal before the apply phase and a non-halt refusal carry no progress', async () => {
+    const first = await run({}, { halt: haltFromRead(1).halt });
+    expect(first.result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect('progress' in first.result).toBe(false);
+    const second = await run({}, { postStatusOutcome: { outcome: 'refused' } });
+    expect('progress' in second.result).toBe(false);
   });
 });
 

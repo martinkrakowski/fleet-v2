@@ -249,6 +249,8 @@ export function buildLiveConductorDriver(
     forgeRepository: forgeRepositoryOf(runtime.installation),
     parkNotice: conductor.parkNotice,
     autoMergeEnabled: conductor.autoMergeEnabled,
+    // CO21: policy.conductor.premergeMode; absent or malformed resolves to 'human-gate'.
+    premergeMode: policy.premergeMode,
   });
   const start = new StartLaneRunUseCase({
     workOrderRepo: execution.workOrderRepository,

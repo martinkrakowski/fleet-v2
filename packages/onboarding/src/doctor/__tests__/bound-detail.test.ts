@@ -51,6 +51,11 @@ function seatModel(reason: string): DoctorProbes {
     }),
     seatProbe: async () => result,
     serverProbe: async () => ({ outcome: 'pass', reason: 'the opencode server answered' }),
+    pinnedBuild: async () => ({
+      pinnedCommit: 'c'.repeat(40),
+      baseTipCommit: 'c'.repeat(40),
+      behindCount: 0,
+    }),
   };
 }
 

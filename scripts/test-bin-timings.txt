@@ -9,6 +9,7 @@ tests/agy-round.test.sh 3 3
 tests/agy-run-ephemeral-home.test.sh 1 1
 tests/agy-run.test.sh 17 17
 tests/check-duplication.test.sh 1 1
+tests/check-public-safety.test.sh 2 2
 tests/e2e-ssh-fixture.test.sh 1 1
 tests/fleet-host-bootstrap-chmod.test.sh 1 1
 tests/fleet-host-bootstrap.test.sh 3 3

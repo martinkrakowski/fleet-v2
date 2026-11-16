@@ -20,6 +20,7 @@ import type {
   ConductorPolicy,
   ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
+  CiRunnerSlotSection,
   ConductorReaperRepairKind,
   ConductorReaperWorktreePolicy,
   ConsumerSettings,
@@ -155,7 +156,14 @@ export const HOST_KEYS: readonly string[] = freezeKeys<HostSection>()([
   'container',
   'roleAliases',
   'roles',
+  'ciRunnerSlots',
   'runner',
+]);
+
+/** One `hosts.<name>.ciRunnerSlots` entry's keys in the writer's order (OG-28a). */
+export const CI_RUNNER_SLOT_KEYS: readonly string[] = freezeKeys<CiRunnerSlotSection>()([
+  'name',
+  'unit',
 ]);
 
 /** The host roles in canonical order. */

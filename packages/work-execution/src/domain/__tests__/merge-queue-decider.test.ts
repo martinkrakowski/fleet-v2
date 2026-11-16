@@ -401,6 +401,53 @@ describe('premerge carry (row 13)', () => {
     const decision = decideMergeStep(updateEntry(), makeOpenFacts(carryFacts({ premergeCarry: { status: 'unknown' } })), makePolicy(), NOW);
     expectWait(decision, 'premerge-carry-unknown');
   });
+
+  it('G2 (4): waits premerge-carry-unknown on a Tier 2 update entry with premerge missing and unknown carry', () => {
+    const decision = decideMergeStep(
+      updateEntry(),
+      makeOpenFacts({
+        contexts: { gate: { state: 'success' }, premerge: { state: 'missing' } },
+        premergeCarry: { status: 'unknown' },
+      }),
+      makePolicy(),
+      NOW,
+    );
+    expectWait(decision, 'premerge-carry-unknown');
+    expect(decision.kind).not.toBe('act');
+  });
+
+  it('G2 (5): parks premerge without backoff on a Tier 2 update entry with premerge missing and ineligible carry', () => {
+    const decision = decideMergeStep(
+      updateEntry(),
+      makeOpenFacts({
+        contexts: { gate: { state: 'success' }, premerge: { state: 'missing' } },
+        premergeCarry: { status: 'ineligible' },
+      }),
+      makePolicy(),
+      NOW,
+    );
+    expectPark(decision, 'premerge');
+    expect(decision.kind).not.toBe('act');
+    if (decision.kind === 'park') {
+      expect(decision.backoff).toBe(false);
+    }
+  });
+
+  it('G2 (6): waits checks-pending on premerge pending at a new head even when the carried receipt names the old head', () => {
+    const decision = decideMergeStep(
+      updateEntry({ headOid: HEAD_2, premergeReceiptHeadOid: HEAD }),
+      makeOpenFacts({
+        pr: { status: 'open', headOid: HEAD_2, mergeStateStatus: 'CLEAN' },
+        reReadHeadOid: HEAD_2,
+        contexts: { gate: { state: 'success' }, premerge: { state: 'pending' } },
+        premergeCarry: { status: 'eligible', receiptHeadOid: HEAD },
+      }),
+      makePolicy(),
+      NOW,
+    );
+    expectWait(decision, 'checks-pending');
+    expect(decision.kind).not.toBe('act');
+  });
 });
 
 describe('disjointness (row 14)', () => {

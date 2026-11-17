@@ -1447,13 +1447,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ...(readShadowEvidence === undefined ? {} : { readShadowEvidence }),
   });
 
-<<<<<<< HEAD
   const reviewLocator = reviewLocatorRef.locator;
   if (reviewLocator === undefined) {
     throw new Error('The work context is not wired for review location');
   }
 
-=======
   // SH8a: `cutover shadow record-day` — the shadow day-writer. Durable-state
   // only: without a state directory there is no ledger to write and no fleet
   // stores to check, so the use case stays undefined exactly like every other
@@ -1510,7 +1508,6 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         settings: { excludeBatchMerges: false },
       })
     : undefined;
->>>>>>> origin/main
   return {
     installation: options?.installation,
     reviewLocator,

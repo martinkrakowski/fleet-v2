@@ -537,6 +537,45 @@ describe('MergeQueueRepositoryAdapter', () => {
     expect((await fs.readFile(filePath)).toString('utf8')).toBe('{ truncated');
   });
 
+  it('a query whose trap throws a Proxy with a throwing getPrototypeOf yields MergeQueueDeadlineError', async () => {
+    const filePath = await writeTruncated(stateDir);
+    const adapter = new MergeQueueRepositoryAdapter({ stateDir });
+    // Rethrow the same proxy from getPrototypeOf so an unguarded instanceof
+    // lets this object escape the catch instead of MergeQueueDeadlineError.
+    const hostile: object = new Proxy(Object.create(null), {
+      getPrototypeOf(): never {
+        throw hostile;
+      },
+    });
+    const query = new Proxy(
+      { deadlineIso: futureDeadline(), repository: { owner: 'fleet', repo: 'v2' } },
+      {
+        get(): never {
+          throw hostile;
+        },
+        getOwnPropertyDescriptor(): never {
+          throw hostile;
+        },
+        ownKeys(): never {
+          throw hostile;
+        },
+        getPrototypeOf(): never {
+          throw hostile;
+        },
+      },
+    );
+    const escaped: unknown = await adapter.listMergeEntries(query as never).then(
+      (value) => value,
+      (error: unknown) => error,
+    );
+    if (escaped === hostile) {
+      throw new Error('hostile proxy escaped listMergeEntries');
+    }
+    expect(escaped).toBeInstanceOf(MergeQueueDeadlineError);
+    expect(escaped instanceof Error ? escaped.message : '').toBe(DEADLINE_MESSAGE);
+    expect((await fs.readFile(filePath)).toString('utf8')).toBe('{ truncated');
+  });
+
   it('prototype-polluting own keys on query or query.repository throw MergeQueueDeadlineError and never pollute Object.prototype', async () => {
     const filePath = await writeTruncated(stateDir);
     const adapter = new MergeQueueRepositoryAdapter({ stateDir });

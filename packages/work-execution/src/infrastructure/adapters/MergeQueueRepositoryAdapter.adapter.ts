@@ -283,11 +283,12 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
    * prototype-polluting own key, a malformed `repository`, or a deadline that
    * is not a fresh zoned instant throws `MergeQueueDeadlineError` before the
    * store is read. Callers read an empty list as nothing queued.
-   * Cost: O(N) in the number of stored entries. Query shape validation is O(1):
-   * `Reflect.ownKeys` is read once per object. A query with more own keys than
-   * `LIST_QUERY_ALLOWED_KEYS.length`, or a repository with more own keys than
-   * `LIST_QUERY_REPOSITORY_ALLOWED_KEYS.length`, is refused before any property
-   * descriptor is read.
+   * Cost: O(N) in the number of stored entries. Key enumeration is linear in
+   * the query's own key count (an engine operation): `Reflect.ownKeys` must
+   * enumerate every own key before the count check, so the query check cannot
+   * be O(1). The descriptor scan and everything after it are bounded by the
+   * allowed-key count (`LIST_QUERY_ALLOWED_KEYS.length` on the query,
+   * `LIST_QUERY_REPOSITORY_ALLOWED_KEYS.length` on `repository`).
    */
   async listMergeEntries(query: MergeQueueListQuery): Promise<readonly MergeQueueEntryRecord[]> {
     const targetDigest = this.readListTargetDigest(query);
@@ -302,13 +303,21 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
   /**
    * The digest to filter by, or `undefined` when the list is unscoped.
    * Reflective reads sit inside the try so a throwing Proxy trap becomes
-   * `MergeQueueDeadlineError` and never reaches the store.
+   * `MergeQueueDeadlineError` and never reaches the store. `instanceof` walks
+   * the caught value's prototype, so it sits in its own try: a Proxy whose
+   * `getPrototypeOf` trap throws is not a `MergeQueueDeadlineError`.
    */
   private readListTargetDigest(query: MergeQueueListQuery): string | undefined {
     try {
       return this.readListTargetDigestUnchecked(query);
     } catch (error: unknown) {
-      if (error instanceof MergeQueueDeadlineError) {
+      let isDeadlineError = false;
+      try {
+        isDeadlineError = error instanceof MergeQueueDeadlineError;
+      } catch {
+        isDeadlineError = false;
+      }
+      if (isDeadlineError) {
         throw error;
       }
       throw new MergeQueueDeadlineError();

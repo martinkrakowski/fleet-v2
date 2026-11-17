@@ -80,16 +80,27 @@ const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
 const BRIEF_TEXT_MAX_BYTES = 64 * 1024;
 const DIFF_SUMMARY_MAX_BYTES = 2048;
 /**
- * Cost bound for a brief receipt scan: the length is read once and a longer
- * list is unreadable, so the loop never exceeds this count. An array-like with
- * a lying length is not an array and is not iterated.
+ * Cost bound for a brief receipt scan. The length is the array's own `length`
+ * data descriptor, read once; a longer list is unreadable and is not iterated.
+ * Later loops use that captured number and never read `.length` again.
  */
 const MAX_BRIEF_RECEIPTS_READ = 256;
 /**
- * Cost bound for findings on a brief receipt: the length is read once and a
- * longer list is a mismatch, not a scan.
+ * Cost bound for findings on a brief receipt. The length is the array's own
+ * `length` data descriptor, read once; a longer list is a mismatch, not a scan.
+ * The density loop uses that same captured number.
  */
 const MAX_BRIEF_FINDINGS_READ = 1024;
+/**
+ * Sentinel in `capturedArrayLength` for a `length` descriptor that was refused
+ * (accessor, non-integer, negative, or a throw). A real length is never negative.
+ */
+const NO_CAPTURED_LENGTH = -1;
+/**
+ * One captured `length` per array object. The cap check and every later loop
+ * share this number, so a Proxy cannot report a small length and then a huge one.
+ */
+const capturedArrayLength = new WeakMap<object, number>();
 
 /** A chain subject, validated. */
 interface ChainSubject {
@@ -148,9 +159,16 @@ function ownProperty(value: unknown, key: string): { readonly value: unknown } |
  * descriptor or a proxy trap is `invalid` and the getter never runs. Cost: a
  * fixed set of keys (no loop over caller-supplied names). `projectId` is at
  * most 200 characters before any per-character or secret scan, and the digest
- * and head are fixed-length patterns. Never throws.
+ * and head are fixed-length patterns. When `requireRequestProjectId` is set
+ * (a review request, not a find), the request's own `projectId` must be present
+ * and equal the subject's; an absent id is invalid. Never throws.
  */
-function readBriefSubject(request: unknown, subject: unknown, sameProject: boolean): SubjectRead {
+function readBriefSubject(
+  request: unknown,
+  subject: unknown,
+  sameProject: boolean,
+  requireRequestProjectId: boolean,
+): SubjectRead {
   try {
     const projectRead = ownProperty(subject, 'projectId');
     const digestRead = ownProperty(subject, 'briefPackageDigest');
@@ -178,9 +196,13 @@ function readBriefSubject(request: unknown, subject: unknown, sameProject: boole
     if (typeof projectId !== 'string' || !isValidBriefProjectId(projectId) || containsSecretShape(projectId)) {
       return { kind: 'invalid' };
     }
-    // Split so the digest predicate narrows on its own: a failed `||` does not
-    // always narrow the second operand, and `attemptIdForBrief` needs a string.
-    if (!sameProject) {
+    // A review request must name this project itself. A find carries no project
+    // id, so only that path still treats an absent id as "no disagreement".
+    if (requireRequestProjectId) {
+      if (requestProjectRead === undefined || requestProjectRead === 'unreadable' || requestProjectRead.value !== projectId) {
+        return { kind: 'invalid' };
+      }
+    } else if (!sameProject) {
       return { kind: 'invalid' };
     }
     if (!isValidBriefPackageDigest(briefPackageDigest)) {
@@ -206,7 +228,11 @@ function readBriefSubject(request: unknown, subject: unknown, sameProject: boole
  * `invalid` and the getter never runs). `invalid` is a malformed subject or one
  * that disagrees with the request.
  */
-function readSubject(request: { readonly projectId?: unknown; readonly attemptId?: unknown; readonly candidateHeadSha?: unknown }): SubjectRead {
+function readSubject(
+  request: { readonly projectId?: unknown; readonly attemptId?: unknown; readonly candidateHeadSha?: unknown },
+  options?: { readonly requireBriefProjectId?: boolean },
+): SubjectRead {
+  const requireBriefProjectId = options?.requireBriefProjectId === true;
   const subjectProperty = ownProperty(request, 'subject');
   if (subjectProperty === 'unreadable') {
     // Present but not a plain data property (an accessor, a hostile object): never "absent".
@@ -222,6 +248,7 @@ function readSubject(request: { readonly projectId?: unknown; readonly attemptId
     return { kind: 'invalid' };
   }
   // A find request carries no project id; only a request that names one must agree with the subject.
+  // A brief review request is the exception: `requireBriefProjectId` makes an absent id invalid.
   const requestProjectId = ownValue(request, 'projectId');
   const sameProject = requestProjectId === undefined || requestProjectId === projectId;
   if (kind === 'attempt') {
@@ -232,7 +259,7 @@ function readSubject(request: { readonly projectId?: unknown; readonly attemptId
       : { kind: 'invalid' };
   }
   if (kind === 'brief') {
-    return readBriefSubject(request, subject, sameProject);
+    return readBriefSubject(request, subject, sameProject, requireBriefProjectId);
   }
   if (kind !== 'chain') {
     return { kind: 'invalid' };
@@ -468,14 +495,19 @@ interface BriefRequestFields {
 
 /**
  * Own-data fields of a brief-verify request. Null when any check fails.
- * Cost: a fixed set of keys. `briefText` whose UTF-16 length is over 65536
- * code units is refused before trim or a byte scan; only a shorter string is
- * trimmed and then measured, capped at `BRIEF_TEXT_MAX_BYTES` (over-size text
- * is refused, never forwarded). Secret scans run only after the value is a
- * string. Never throws.
+ * The request's own `projectId` must be present and equal `subjectProjectId`;
+ * an absent id is not a match. Cost: a fixed set of keys. `briefText` whose
+ * UTF-16 length is over 65536 code units is refused before trim or a byte
+ * scan; only a shorter string is trimmed and then measured, capped at
+ * `BRIEF_TEXT_MAX_BYTES` (over-size text is refused, never forwarded). Secret
+ * scans run only after the value is a string. Never throws.
  */
-function readBriefRequestFields(request: unknown): BriefRequestFields | null {
+function readBriefRequestFields(request: unknown, subjectProjectId: string): BriefRequestFields | null {
   try {
+    const projectRead = ownProperty(request, 'projectId');
+    if (projectRead === undefined || projectRead === 'unreadable' || projectRead.value !== subjectProjectId) {
+      return null;
+    }
     const optional = snapshotOptionalFields(request, ['briefText', 'diffSummary', 'nowIso']);
     const requestId = ownValue(request, 'requestId');
     const policyRevision = ownValue(request, 'policyRevision');
@@ -542,39 +574,110 @@ function readBriefRequestId(request: unknown): string | null {
   }
 }
 
+/** One array plus the `length` already read from its own data descriptor. */
+interface BoundedList {
+  readonly list: readonly unknown[];
+  readonly length: number;
+}
+
 /**
- * The assessment's receipt list when it is a dense array no longer than
- * `MAX_BRIEF_RECEIPTS_READ`. The length is read once; a longer list, a hole,
- * a non-array or an array-like with a lying length is null and is not iterated.
+ * The own `length` data descriptor, read at most once for this array object.
+ * An accessor, a non-integer, a negative, or a throwing descriptor is refused
+ * and remembered, so a later call does not read `length` again. The integer
+ * itself is kept even when a caller then rejects it for a cap.
  */
-function readBoundedReceiptList(value: unknown): readonly ReviewReceiptRecord[] | null {
+function capturedArrayLengthOf(value: readonly unknown[]): number | null {
+  const cached = capturedArrayLength.get(value);
+  if (cached !== undefined) {
+    return cached === NO_CAPTURED_LENGTH ? null : cached;
+  }
   try {
-    if (!Array.isArray(value) || value.length > MAX_BRIEF_RECEIPTS_READ) {
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    if (
+      lengthDescriptor === undefined ||
+      lengthDescriptor.get !== undefined ||
+      !('value' in lengthDescriptor) ||
+      typeof lengthDescriptor.value !== 'number' ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0
+    ) {
+      capturedArrayLength.set(value, NO_CAPTURED_LENGTH);
       return null;
     }
-    for (let index = 0; index < value.length; index += 1) {
-      if (!Object.prototype.hasOwnProperty.call(value, index)) {
-        return null;
-      }
-      const element = value[index];
-      if (typeof element !== 'object' || element === null) {
-        return null;
-      }
+    capturedArrayLength.set(value, lengthDescriptor.value);
+    return lengthDescriptor.value;
+  } catch {
+    capturedArrayLength.set(value, NO_CAPTURED_LENGTH);
+    return null;
+  }
+}
+
+/**
+ * A real array whose captured length is within `cap`, or null. The length is
+ * not read again. Callers iterate with `length` and `ownElement`; a plain
+ * `.length` read on `list` would let a Proxy lie on the next access.
+ */
+function readBoundedList(value: unknown, cap: number): BoundedList | null {
+  try {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+      return null;
     }
-    return value as readonly ReviewReceiptRecord[];
+    const length = capturedArrayLengthOf(value);
+    if (length === null || length > cap) {
+      return null;
+    }
+    return { list: value, length };
   } catch {
     return null;
   }
 }
 
-/** True when `findings` is an array no longer than `MAX_BRIEF_FINDINGS_READ`. The length is read once. Never throws. */
+/** The own data-property element at `index`. A hole, an accessor or a throwing descriptor is undefined. */
+function ownElement(array: readonly unknown[], index: number): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
+    return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The assessment's receipt list when it is a dense array no longer than
+ * `MAX_BRIEF_RECEIPTS_READ`. Length comes from `readBoundedList` (one captured
+ * integer). A longer list, a hole, a non-array, an accessor length or an
+ * array-like is null and is not iterated.
+ */
+function readBoundedReceiptList(value: unknown): BoundedList | null {
+  try {
+    const bounded = readBoundedList(value, MAX_BRIEF_RECEIPTS_READ);
+    if (bounded === null) {
+      return null;
+    }
+    for (let index = 0; index < bounded.length; index += 1) {
+      const element = ownElement(bounded.list, index);
+      if (typeof element !== 'object' || element === null) {
+        return null;
+      }
+    }
+    return bounded;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when `findings` is an array no longer than `MAX_BRIEF_FINDINGS_READ`.
+ * The length is the one captured for that array, never a second `.length` read.
+ * Never throws.
+ */
 function briefFindingsAreBounded(receipt: unknown): boolean {
   try {
     const findings = ownProperty(receipt, 'findings');
-    if (findings === 'unreadable' || findings === undefined || !Array.isArray(findings.value)) {
+    if (findings === 'unreadable' || findings === undefined) {
       return false;
     }
-    return findings.value.length <= MAX_BRIEF_FINDINGS_READ;
+    return readBoundedList(findings.value, MAX_BRIEF_FINDINGS_READ) !== null;
   } catch {
     return false;
   }
@@ -586,22 +689,23 @@ type BriefVerifyScan =
 
 /**
  * Own-data `brief-verify` receipts, in list order. A hole or an unreadable
- * `kind` stops the scan. The loop is bounded by `list.length`, which
- * `readBoundedReceiptList` already capped. Never throws.
+ * `kind` stops the scan. `length` is the number `readBoundedReceiptList`
+ * already captured; this loop does not read `.length`. Never throws.
  */
-function collectBriefVerifyReceipts(list: readonly ReviewReceiptRecord[]): BriefVerifyScan {
+function collectBriefVerifyReceipts(list: readonly unknown[], length: number): BriefVerifyScan {
   const receipts: ReviewReceiptRecord[] = [];
-  for (let index = 0; index < list.length; index += 1) {
-    const receipt = list[index];
-    if (receipt === undefined) {
+  for (let index = 0; index < length; index += 1) {
+    const receipt = ownElement(list, index);
+    if (typeof receipt !== 'object' || receipt === null) {
       return { outcome: 'unreadable' };
     }
-    const kindRead = ownProperty(receipt, 'kind');
+    const record = receipt as ReviewReceiptRecord;
+    const kindRead = ownProperty(record, 'kind');
     if (kindRead === 'unreadable') {
       return { outcome: 'unreadable' };
     }
     if (kindRead !== undefined && kindRead.value === 'brief-verify') {
-      receipts.push(receipt);
+      receipts.push(record);
     }
   }
   return { outcome: 'list', receipts };
@@ -794,18 +898,17 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
  * True when `findings` is a dense array of plain objects whose every finding
  * carries one of the four declared severities: a sparse array, a non-array, a
  * hole or a corrupt severity is invalid transport output, never a summary
- * (RV3: a corrupt severity never maps to a verdict).
+ * (RV3: a corrupt severity never maps to a verdict). The loop bound is the
+ * length captured for this array, never a fresh `.length` read.
  */
 function findingsAreDense(findings: unknown): boolean {
   try {
-    if (!Array.isArray(findings)) {
+    const bounded = readBoundedList(findings, Number.MAX_SAFE_INTEGER);
+    if (bounded === null) {
       return false;
     }
-    for (let index = 0; index < findings.length; index += 1) {
-      if (!Object.prototype.hasOwnProperty.call(findings, index)) {
-        return false;
-      }
-      const finding = findings[index];
+    for (let index = 0; index < bounded.length; index += 1) {
+      const finding = ownElement(bounded.list, index);
       if (!isPlainObject(finding)) {
         return false;
       }
@@ -826,6 +929,33 @@ function findingsAreDense(findings: unknown): boolean {
 }
 
 /**
+ * The summary's finding list, copied from own data elements up to the length
+ * already captured for this array. Null when the findings are not dense.
+ * Does not read `.length` and does not call `map` (both would re-enter a Proxy).
+ */
+function copyBoundedFindings(findings: unknown): ReviewReceiptSummary['findings'] | null {
+  if (!findingsAreDense(findings)) {
+    return null;
+  }
+  const bounded = readBoundedList(findings, Number.MAX_SAFE_INTEGER);
+  if (bounded === null) {
+    return null;
+  }
+  const copied: Array<ReviewReceiptSummary['findings'][number]> = [];
+  for (let index = 0; index < bounded.length; index += 1) {
+    const finding = ownElement(bounded.list, index) as ReviewReceiptSummary['findings'][number];
+    copied.push({
+      findingId: finding.findingId,
+      severity: finding.severity,
+      summary: finding.summary,
+      filePath: finding.filePath,
+      line: finding.line,
+    });
+  }
+  return copied;
+}
+
+/**
  * One shared summary builder used by requestReview and findReviewReceipt. The kind and request id are the
  * values the caller has already matched on the receipt; nothing is defaulted here. Null when the
  * receipt's findings are not a dense array of plain objects: the caller treats that as a mismatch.
@@ -835,7 +965,8 @@ function receiptOfKindSummaryOf(
   kind: ReviewReceiptSummary['kind'],
   requestId: string | null,
 ): ReviewReceiptOfKind | null {
-  if (!findingsAreDense(receipt.findings)) {
+  const findings = copyBoundedFindings(receipt.findings);
+  if (findings === null) {
     return null;
   }
   return {
@@ -847,13 +978,7 @@ function receiptOfKindSummaryOf(
     // RV3: an unverified stored receipt never maps to a verdict; it reads
     // `unknown` so every downstream decider keeps it unknown (fail closed).
     verdict: receipt.readOnlyVerified === true ? mapVerdict(receipt.result) : 'unknown',
-    findings: receipt.findings.map((finding) => ({
-      findingId: finding.findingId,
-      severity: finding.severity,
-      summary: finding.summary,
-      filePath: finding.filePath,
-      line: finding.line,
-    })),
+    findings,
     // The fixed cause code travels only on an unknown receipt whose code is
     // one of the declared tokens and a journal-legal lowercase code; the key
     // is omitted otherwise, so existing assertions without it stay identical.
@@ -1142,7 +1267,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
    * `delegate-failed`, inside `dispatchReview`.
    */
   private async requestBriefReview(request: ReviewRequest, brief: BriefSubject): Promise<ReviewRequestResult> {
-    const fields = readBriefRequestFields(request);
+    const fields = readBriefRequestFields(request, brief.projectId);
     if (fields === null) {
       return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
@@ -1179,7 +1304,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
   }
 
   async requestReview(request: ReviewRequest): Promise<ReviewRequestResult> {
-    const subject = readSubject(request);
+    const subject = readSubject(request, { requireBriefProjectId: true });
     if (subject.kind === 'invalid') {
       return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
@@ -1352,16 +1477,17 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     }
     const matches: ReviewReceiptRecord[] = [];
     for (let index = 0; index < list.length; index += 1) {
-      const receipt = list[index];
-      if (receipt === undefined) {
+      const receipt = ownElement(list.list, index);
+      if (typeof receipt !== 'object' || receipt === null) {
         return { outcome: 'unavailable', reason: 'unreadable' };
       }
-      const idRead = ownProperty(receipt, 'requestId');
+      const record = receipt as ReviewReceiptRecord;
+      const idRead = ownProperty(record, 'requestId');
       if (idRead === 'unreadable') {
         return { outcome: 'unavailable', reason: 'unreadable' };
       }
       if (idRead !== undefined && idRead.value === requestId) {
-        matches.push(receipt);
+        matches.push(record);
       }
     }
     if (matches.length === 0) {
@@ -1433,7 +1559,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (list === null) {
       return { outcome: 'unavailable', reason: 'unreadable' };
     }
-    const collected = collectBriefVerifyReceipts(list);
+    const collected = collectBriefVerifyReceipts(list.list, list.length);
     if (collected.outcome === 'unreadable') {
       return { outcome: 'unavailable', reason: 'unreadable' };
     }

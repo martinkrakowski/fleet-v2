@@ -2593,14 +2593,16 @@ describe('RecordShadowDayUseCase', () => {
     expect(unknownReasons.get('S5')).toBe('shell-events-unavailable');
   });
 
-  it('reports S5 unevaluated (shell-facts-invalid) when shell event timestamps are invalid', async () => {
+  it('maps the shared day-end extraction refusal to S5 and S6 unevaluated (shell-facts-invalid)', async () => {
     const harness = wiredHarness(cleanFixture(DAY), {});
     setPremergeCarry(harness, constantPremergeCarry('carry'));
-    // The use case's extraction is defensive: `parseShellTrainEvents` never
-    // emits an unparseable `atIso`, and the extractor cannot refuse its
-    // output, so the `shell-facts-invalid` path is unreachable through the
-    // real parser. The reason mapping is pinned here by making the shared
-    // day-end extraction refuse once, the way a future parser change would.
+    // No invalid timestamp can reach the use case through the real parser:
+    // `parseShellTrainEvents` validates every `at` as a calendar date-time and
+    // demotes anything else to an unknown line (shell-events-unavailable), and
+    // `extractShadowShellFacts` re-validates each `atIso` on its own input. So
+    // the `shell-facts-invalid` path is unreachable through the real pipeline;
+    // this test pins the reason mapping by making the shared day-end
+    // extraction refuse once, the way a future parser change would.
     const prototype = RecordShadowDayUseCase.prototype as unknown as {
       extractBoundedShellFacts: (context: unknown, shell: unknown) => unknown;
     };
@@ -2678,6 +2680,31 @@ describe('RecordShadowDayUseCase', () => {
     // The deadline was already reached, so the resolver was never consulted.
     expect(calls.decisions).toEqual([]);
     expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('aborts with deadline-exceeded when the deadline expires while the premergeCarry resolver is awaited', async () => {
+    // The rerun path: the day is already recorded, so a rerun whose facts and
+    // answers are identical answers `unchanged` — unless the deadline expires
+    // while the resolver is awaited, in which case `call`'s re-check after
+    // the awaited return aborts the run before the value is used.
+    const harness = wiredHarness(carryFixture(), {});
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    const afterFirst = harness.evidence.stored;
+
+    // The clock is still on time when the resolver is called, and advances
+    // past the deadline before the resolver returns.
+    setPremergeCarry(harness, (input) => {
+      harness.setNow(new Date(Date.parse(input.deadlineIso) + 60_000).toISOString());
+      return Promise.resolve('carry');
+    });
+    const result = await useCase.execute(makeRequest({ deadlineIso: DEADLINE }));
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    // The ledger is untouched: the resolver's value was never used.
+    expect(harness.evidence.stored).toEqual(afterFirst);
   });
 
   it('answers unchanged on an S5 rerun with identical facts and answers, without a second CAS', async () => {

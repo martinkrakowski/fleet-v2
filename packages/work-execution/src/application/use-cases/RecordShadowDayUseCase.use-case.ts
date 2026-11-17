@@ -387,16 +387,24 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * Every outbound call goes through here: the deadline is checked first and
    * a reached deadline aborts the whole run (`DeadlineReachedError`), while a
    * dependency throw is reported to the caller as `threw` — never propagated.
+   * The deadline is re-checked once the awaited return lands, before its value
+   * is used: the port may have run past the deadline while awaited, and that
+   * expiry must abort the run the same way a pre-call expiry does.
    */
   private async call<T>(deadlineIso: string | undefined, make: () => Promise<T>): Promise<{ readonly kind: 'value'; readonly value: T } | { readonly kind: 'threw' }> {
     if (this.deadlineReached(deadlineIso)) {
       throw new DeadlineReachedError();
     }
+    let value: T;
     try {
-      return { kind: 'value', value: await make() };
+      value = await make();
     } catch {
       return { kind: 'threw' };
     }
+    if (this.deadlineReached(deadlineIso)) {
+      throw new DeadlineReachedError();
+    }
+    return { kind: 'value', value };
   }
 
   /** The day resolution: the day to record, or the refusal reason. */

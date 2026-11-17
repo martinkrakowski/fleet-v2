@@ -264,6 +264,65 @@ describe('SpdSayHostAudibleAlertAdapter.speak refusals', () => {
     expect(runs).toBe(0);
   });
 
+  it('refuses a revoked Proxy request with zero probes and zero spawns', async () => {
+    const { proxy, revoke } = Proxy.revocable({ sentence: 'all clear' }, {});
+    revoke();
+    let probes = 0;
+    let runs = 0;
+    const adapter = adapterWith({
+      isExecutable: () => {
+        probes += 1;
+        return true;
+      },
+      run: async () => {
+        runs += 1;
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    });
+    expect(await adapter.speak(proxy)).toEqual(REFUSED);
+    expect(probes).toBe(0);
+    expect(runs).toBe(0);
+  });
+
+  it('refuses a request with a custom prototype even with an own sentence', async () => {
+    let probes = 0;
+    let runs = 0;
+    const custom = Object.create({ marker: 'custom' }) as Record<string, unknown>;
+    custom.sentence = 'all clear';
+    const adapter = adapterWith({
+      isExecutable: () => {
+        probes += 1;
+        return true;
+      },
+      run: async () => {
+        runs += 1;
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    });
+    expect(await adapter.speak(custom)).toEqual(REFUSED);
+    expect(probes).toBe(0);
+    expect(runs).toBe(0);
+  });
+
+  it('refuses a candidate list whose later entry is malformed before probing or spawning', async () => {
+    let probes = 0;
+    let runs = 0;
+    const adapter = new SpdSayHostAudibleAlertAdapter({
+      candidates: ['/tmp/executable', 123] as unknown as readonly string[],
+      isExecutable: () => {
+        probes += 1;
+        return true;
+      },
+      run: async () => {
+        runs += 1;
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    });
+    expect(await adapter.speak({ sentence: 'all clear' })).toEqual(REFUSED);
+    expect(probes).toBe(0);
+    expect(runs).toBe(0);
+  });
+
   it('refuses sentence longer than 120 characters without resolving or spawning', async () => {
     let probes = 0;
     let runs = 0;

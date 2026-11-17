@@ -13,6 +13,7 @@ import { types } from 'node:util';
 
 import type { SpawnRunOptions, SpawnRunOutcome } from './spawn-run';
 import { allowListedChildEnv, runSpawnOutcome } from './spawn-run';
+import { isPlainRecordObject } from '../../domain/record-schema-version';
 import { TRAIN_HEALTH_SENTENCE_MAX_LENGTH } from '../../domain/train-health-announcements';
 import type {
   HostAudibleAlertPort,
@@ -90,47 +91,68 @@ function hasPollutingKey(source: object): boolean {
 }
 
 /**
- * Parse one request object. Total: it never throws. Cost is constant time
+ * Parse one request object. Total: it never throws — any throw while reading
+ * the request (for example a revoked Proxy) reads as
+ * `{ ok: false, reasonCode: 'invalid-request' }`. Cost is constant time
  * bounded by `TRAIN_HEALTH_SENTENCE_MAX_LENGTH` (the sentence validation cap).
  * The sentence is read through its own descriptor, so getters and Proxy
  * `get` traps never run.
  */
 export function parseHostAudibleAlertRequest(request: unknown): SpdSayRequestParsing {
-  if (isHostileRequestShape(request)) {
+  try {
+    if (isHostileRequestShape(request)) {
+      return { ok: false, reasonCode: 'invalid-request' };
+    }
+    return validateHostAudibleAlertSentence(ownValue(request, 'sentence'));
+  } catch {
+    // A revoked (or otherwise hostile) Proxy may throw on any touch; refuse it
+    // rather than letting the throw map onto `spawn-failed`.
     return { ok: false, reasonCode: 'invalid-request' };
   }
-  return validateHostAudibleAlertSentence(ownValue(request, 'sentence'));
 }
 
 /**
- * The request must be a plain (non-array, non-Proxy) object without a
- * prototype-polluting own key. `isProxy` observes no trap and no getter.
+ * The request must be a plain record (prototype `Object.prototype` or `null`,
+ * non-array, non-Proxy) whose own keys are exactly `['sentence']` and without
+ * a prototype-polluting own key. `isProxy` observes no trap and no getter.
  */
 function isHostileRequestShape(request: unknown): boolean {
-  if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+  if (!isPlainRecordObject(request)) {
     return true;
   }
-  if (types.isProxy(request) || hasPollutingKey(request)) {
+  if (types.isProxy(request)) {
     return true;
   }
-  return false;
+  if (hasPollutingKey(request)) {
+    return true;
+  }
+  return Object.getOwnPropertyNames(request).some((key) => key !== 'sentence');
 }
 
 /**
  * Whether the injected candidate list may be traversed: a plain (non-Proxy)
- * array within the cap, without a polluting own key, hole, or accessor
- * element. `isProxy` observes no trap and no getter.
+ * array within the cap whose length is read once from its own descriptor and
+ * whose every entry is a string read from its own data descriptor, without a
+ * polluting own key, hole, or accessor element. The WHOLE list is validated
+ * before any entry is probed. `isProxy` observes no trap and no getter.
  */
 function isTraversableCandidateList(candidates: unknown): boolean {
   if (!Array.isArray(candidates) || types.isProxy(candidates)) {
     return false;
   }
-  if (candidates.length > SPD_SAY_MAX_CANDIDATES || hasPollutingKey(candidates)) {
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(candidates, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor) || typeof lengthDescriptor.value !== 'number') {
     return false;
   }
-  for (let index = 0; index < candidates.length; index += 1) {
+  if (lengthDescriptor.value > SPD_SAY_MAX_CANDIDATES || hasPollutingKey(candidates)) {
+    return false;
+  }
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(candidates, index);
     if (descriptor === undefined || !('value' in descriptor) || ('get' in descriptor || 'set' in descriptor)) {
+      return false;
+    }
+    if (typeof descriptor.value !== 'string') {
       return false;
     }
   }
@@ -179,8 +201,10 @@ type BinaryResolution =
   | { readonly ok: false; readonly reasonCode: 'invalid-request' | 'binary-missing' };
 
 /**
- * Resolve the binary from the candidate list, read only through own
- * descriptors (no getter runs, no Proxy trap runs). Cost is linear in the
+ * Resolve the binary from the candidate list. The WHOLE list is validated
+ * first (see `isTraversableCandidateList`), read only through own
+ * descriptors (no getter runs, no Proxy trap runs); only then is any entry
+ * probed. Cost is linear in the
  * list length, capped by `SPD_SAY_MAX_CANDIDATES` (16).
  */
 function resolveBinary(candidates: unknown, isExecutable: (candidate: string) => boolean): BinaryResolution {

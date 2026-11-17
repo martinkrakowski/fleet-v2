@@ -18,6 +18,12 @@ export interface RequestScopedDecisionRequest {
   readonly policyRevision: string;
   /** The attempt the decision's grant is for (CO24e); recorded with the grant so consumption is bound to it. */
   readonly attemptId?: string;
+  /**
+   * The release root the decision's grant is bound to (CO14 follow-up); only a
+   * release decision carries one. Recorded with the grant so a resolve or
+   * consumption naming another root is refused.
+   */
+  readonly releaseRoot?: string;
   readonly nowIso?: string;
 }
 

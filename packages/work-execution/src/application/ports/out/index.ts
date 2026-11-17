@@ -91,6 +91,7 @@ export * from "./RunTelemetryPort.out-port.js";
 export * from "./SeatCatalogPort.out-port.js";
 export * from "./SeatObservationRepositoryPort.out-port.js";
 export * from "./SeatTicketRepositoryPort.out-port.js";
+export * from "./ShadowAttestationPort.out-port.js";
 export * from "./ShadowEvidencePort.out-port.js";
 export * from "./StallAttentionPort.out-port.js";
 export * from "./TelemetryDispositionPort.out-port.js";

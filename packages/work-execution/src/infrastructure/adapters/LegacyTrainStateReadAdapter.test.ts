@@ -128,4 +128,109 @@ describe('LegacyTrainStateReadAdapter', () => {
     await expect(() => new LegacyTrainStateReadAdapter({ batchFileName: '..' })).toThrow();
     await expect(() => new LegacyTrainStateReadAdapter({ queueFileName: 'parked' })).toThrow();
   });
+
+  describe('inprogress head', () => {
+    it('reads the in-progress head when present', async () => {
+      const dir = await makeTempDir();
+      const inprogressLines = [lineFor(42, FIRST_HEAD)];
+      await fs.writeFile(join(dir, 'inprogress'), `${inprogressLines.join('\n')}\n`);
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+      expect(result.inprogress).toEqual({ status: 'read', lines: inprogressLines });
+    });
+
+    it('reports known absence when the in-progress head is missing', async () => {
+      const dir = await makeTempDir();
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+      expect(result.inprogress).toEqual({ status: 'absent' });
+    });
+
+    it('reports unreadable when the in-progress head is a directory', async () => {
+      const dir = await makeTempDir();
+      await fs.mkdir(join(dir, 'inprogress'));
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+      expect(result.inprogress).toEqual({ status: 'unreadable' });
+    });
+  });
+
+  describe('enabled batches', () => {
+    it('reads batches/enabled when present', async () => {
+      const dir = await makeTempDir();
+      const enabledLines = ['example-1', 'example-2'];
+      await fs.mkdir(join(dir, 'batches'));
+      await fs.writeFile(join(dir, 'batches', 'enabled'), `${enabledLines.join('\n')}\n`);
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+      expect(result.batchesEnabled).toEqual({ status: 'read', lines: enabledLines });
+    });
+
+    it('reports known absence when batches/enabled is missing', async () => {
+      const dir = await makeTempDir();
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+      expect(result.batchesEnabled).toEqual({ status: 'absent' });
+    });
+
+    it('reports known absence when the whole batches directory is missing', async () => {
+      const dir = await makeTempDir();
+
+      const result = await new LegacyTrainStateReadAdapter({ batchesDirName: 'batch-buckets' }).readLegacyTrainState({
+        stateDir: dir,
+      });
+
+      expect(result.batchesEnabled).toEqual({ status: 'absent' });
+    });
+  });
+
+  describe('events log', () => {
+    it('reads a few event lines exactly', async () => {
+      const dir = await makeTempDir();
+      const events = ['event-one', 'event-two', 'event-three'];
+      await fs.writeFile(join(dir, 'events.jsonl'), `${events.join('\n')}\n`);
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainEvents({ stateDir: dir });
+
+      expect(result).toEqual({ status: 'read', lines: events });
+    });
+
+    it('reports known absence when the events log is missing', async () => {
+      const dir = await makeTempDir();
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainEvents({ stateDir: dir });
+
+      expect(result).toEqual({ status: 'absent' });
+    });
+
+    it('reports unreadable when the events log is a symlink, even to a real file', async () => {
+      const dir = await makeTempDir();
+      await fs.writeFile(join(dir, 'small-real-file'), 'event-one\n');
+      await fs.symlink(join(dir, 'small-real-file'), join(dir, 'events.jsonl'));
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainEvents({ stateDir: dir });
+
+      expect(result).toEqual({ status: 'unreadable' });
+    });
+
+    it('reports too-large without reading when the events log exceeds the byte cap', async () => {
+      const dir = await makeTempDir();
+      await fs.writeFile(join(dir, 'events.jsonl'), 'event-seventeen!\n');
+
+      const result = await new LegacyTrainStateReadAdapter({ eventsMaxBytes: 16 }).readLegacyTrainEvents({
+        stateDir: dir,
+      });
+
+      expect(result).toEqual({ status: 'too-large' });
+    });
+
+    it('refuses an events file-name option that collides with an existing source', () => {
+      expect(() => new LegacyTrainStateReadAdapter({ eventsFileName: 'queue' })).toThrow();
+    });
+  });
 });

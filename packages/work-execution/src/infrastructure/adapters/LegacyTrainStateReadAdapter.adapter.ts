@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import type {
   LegacyTrainChainsRead,
+  LegacyTrainEventsRead,
   LegacyTrainFileRead,
   LegacyTrainStateRead,
   LegacyTrainStateReadOptions,
@@ -15,6 +16,10 @@ export interface LegacyTrainStateReadAdapterOptions {
   readonly parkedFileName?: string;
   readonly chainsDirName?: string;
   readonly batchFileName?: string;
+  readonly inprogressFileName?: string;
+  readonly batchesDirName?: string;
+  readonly eventsFileName?: string;
+  readonly eventsMaxBytes?: number;
 }
 
 /** A configured file name may not escape the state directory it belongs to. */
@@ -37,29 +42,79 @@ export class LegacyTrainStateReadAdapter implements LegacyTrainStateReadPort {
   private readonly parkedFileName: string;
   private readonly chainsDirName: string;
   private readonly batchFileName: string;
+  private readonly inprogressFileName: string;
+  private readonly batchesDirName: string;
+  private readonly eventsFileName: string;
+  private readonly eventsMaxBytes: number;
 
   constructor(options: LegacyTrainStateReadAdapterOptions = {}) {
     this.queueFileName = options.queueFileName ?? 'queue';
     this.parkedFileName = options.parkedFileName ?? 'parked';
     this.chainsDirName = options.chainsDirName ?? 'chains';
     this.batchFileName = options.batchFileName ?? 'batch';
-    const names = [this.queueFileName, this.parkedFileName, this.chainsDirName, this.batchFileName];
+    this.inprogressFileName = options.inprogressFileName ?? 'inprogress';
+    this.batchesDirName = options.batchesDirName ?? 'batches';
+    this.eventsFileName = options.eventsFileName ?? 'events.jsonl';
+    this.eventsMaxBytes = options.eventsMaxBytes ?? 33_554_432;
+    const names = [
+      this.queueFileName,
+      this.parkedFileName,
+      this.chainsDirName,
+      this.batchFileName,
+      this.inprogressFileName,
+      this.batchesDirName,
+      this.eventsFileName,
+    ];
     for (const name of names) {
       assertSafeName(name);
     }
     if (new Set(names).size !== names.length) {
       throw new Error('legacy train state source names must not collide');
     }
+    if (
+      !Number.isSafeInteger(this.eventsMaxBytes) ||
+      this.eventsMaxBytes < 1 ||
+      this.eventsMaxBytes > 67_108_864
+    ) {
+      throw new Error('legacy train state events max bytes must be an integer between 1 and 67108864');
+    }
   }
 
   async readLegacyTrainState(options: LegacyTrainStateReadOptions): Promise<LegacyTrainStateRead> {
-    const [queue, parked, chains, batch] = await Promise.all([
+    const [queue, parked, chains, batch, inprogress, batchesEnabled] = await Promise.all([
       this.readSourceFile(this.queueFileName, options.stateDir),
       this.readSourceFile(this.parkedFileName, options.stateDir),
       this.readChains(this.chainsDirName, options.stateDir),
       this.readSourceFile(this.batchFileName, options.stateDir),
+      this.readSourceFile(this.inprogressFileName, options.stateDir),
+      this.readSourceFile('enabled', join(options.stateDir, this.batchesDirName)),
     ]);
-    return Object.freeze({ queue, parked, chains, batch });
+    return Object.freeze({ queue, parked, chains, batch, inprogress, batchesEnabled });
+  }
+
+  async readLegacyTrainEvents(options: LegacyTrainStateReadOptions): Promise<LegacyTrainEventsRead> {
+    const eventsPath = join(options.stateDir, this.eventsFileName);
+    let stats: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      stats = await fs.lstat(eventsPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { status: 'absent' };
+      }
+      return { status: 'unreadable' };
+    }
+    if (!stats.isFile()) {
+      return { status: 'unreadable' };
+    }
+    if (stats.size > this.eventsMaxBytes) {
+      return { status: 'too-large' };
+    }
+    try {
+      const text = await fs.readFile(eventsPath, 'utf8');
+      return { status: 'read', lines: Object.freeze(splitLines(text)) };
+    } catch {
+      return { status: 'unreadable' };
+    }
   }
 
   private async readSourceFile(name: string, stateDir: string): Promise<LegacyTrainFileRead> {

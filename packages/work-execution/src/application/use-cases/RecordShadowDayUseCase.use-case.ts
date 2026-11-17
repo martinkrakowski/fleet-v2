@@ -719,6 +719,12 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         starvedJobs: outcome.tickHealth.starvedJobs,
       });
     }
+    /**
+     * The S9 canonical summary includes these counts. A day recorded before
+     * this change will return `verdict-conflict` if re-recorded. No live
+     * shadow days are recorded yet (live recording starts only after the
+     * digest format is final).
+     */
     if (outcome.stateIntegrity !== undefined) {
       return JSON.stringify({
         ...base,

@@ -44,6 +44,26 @@ import { readExactPlainRecord } from '../../../domain/plain-record-reads.js';
  */
 export const SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS = 10_000;
 
+/**
+ * Cap on every stored run a shadow-day reader will read. This is the
+ * candidates cap of `readShadowConformanceRuns` (the domain's
+ * `SHADOW_CONFORMANCE_MAX_RUNS`), named here so SH18b's head reader applies
+ * the same bound. An over-cap list is refused before any element is read.
+ */
+export const SHADOW_FACTS_MAX_RUNS = SHADOW_CONFORMANCE_MAX_RUNS;
+
+/**
+ * Cap on one run's `attemptIds` walk. An over-cap list is refused before any
+ * attempt is read.
+ */
+export const SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN = 100;
+
+/**
+ * Cap on one head's review-receipts list. An over-cap list is refused before
+ * any receipt is read.
+ */
+export const SHADOW_FACTS_MAX_RECEIPTS_PER_HEAD = SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN;
+
 /** The read-only dependencies the conducted-run facts need. */
 export interface ShadowConformanceRunsDependencies {
   readonly runs: Pick<LaneRunRepositoryPort, 'list'>;
@@ -53,8 +73,12 @@ export interface ShadowConformanceRunsDependencies {
   readonly nowIso: () => string;
 }
 
-/** Why the whole conducted-run answer is `unknown`. */
-export type ShadowConformanceRunsUnknown =
+/**
+ * Why a shadow-day facts read is `unknown`. The common union every
+ * shadow-day reader (SH18a's runs reader, SH18b's head reader) refuses
+ * with; a reader narrows it by only producing its own codes.
+ */
+export type ShadowConductedFactsUnknown =
   | 'invalid-request'
   | 'runs-unreadable'
   | 'journal-unreadable'
@@ -63,7 +87,12 @@ export type ShadowConformanceRunsUnknown =
   | 'receipts-unavailable'
   | 'too-many-runs'
   | 'too-many-journal-entries'
+  | 'too-many-attempts'
+  | 'too-many-receipts'
   | 'deadline-exceeded';
+
+/** Why the whole conducted-run answer is `unknown`. */
+export type ShadowConformanceRunsUnknown = ShadowConductedFactsUnknown;
 
 export type ShadowConformanceRunsRead =
   | { readonly status: 'ok'; readonly runs: readonly ShadowConformanceRun[] }
@@ -86,25 +115,28 @@ const refused = (reason: ShadowConformanceRunsUnknown): ShadowConformanceRunsRea
  * a value copied out of it, a run or journal record, a repository ref) that
  * throws is turned into this fixed, message-free refusal; the reader's outer
  * catch turns it into the typed `unknown` result, so the reader never rejects
- * on hostile input.
+ * on hostile input. Generic over the refusing reader's reason union.
  */
-class FactsRefusal extends Error {
-  constructor(readonly reason: ShadowConformanceRunsUnknown) {
+export class FactsRefusal<R extends ShadowConductedFactsUnknown = ShadowConductedFactsUnknown> extends Error {
+  constructor(readonly reason: R) {
     super('shadow-conformance-facts-refusal');
   }
 }
 
 /** Refuse with `reason`; always throws, so the caller's flow stops here. */
-const refusal = (reason: ShadowConformanceRunsUnknown): never => {
+function refusal<R extends ShadowConductedFactsUnknown>(reason: R): never {
   throw new FactsRefusal(reason);
-};
+}
 
 /**
  * Read caller-supplied structure through `read`; any throw becomes the
  * refusal for `reason` (an interior refusal keeps its own reason). Cost:
  * the cost of `read`.
  */
-function readOrRefuse<T>(reason: ShadowConformanceRunsUnknown, read: () => T): T {
+export function readOrRefuse<T, R extends ShadowConductedFactsUnknown>(
+  reason: R,
+  read: () => T,
+): T {
   try {
     return read();
   } catch (error) {
@@ -120,7 +152,7 @@ function readOrRefuse<T>(reason: ShadowConformanceRunsUnknown, read: () => T): T
  * at or past `deadlineIso` (instant comparison, never string comparison)
  * reads as past the deadline. Cost: O(1).
  */
-function isPastDeadline(nowIso: () => string, deadlineIso: string): boolean {
+export function isPastDeadline(nowIso: () => string, deadlineIso: string): boolean {
   let now: string;
   try {
     now = nowIso();
@@ -175,9 +207,10 @@ function ownKeysAreIndices(value: readonly unknown[], length: number): boolean {
  * (`SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS`, `MAX_ARRAY_LENGTH`) are named
  * constants. A real, dense array is required: a wrong primitive, a
  * non-iterable object, an array-like, a hole, an accessor, an over-cap
- * length or a foreign own key is refused before any traversal.
+ * length or a foreign own key is refused before any traversal. `null` reads
+ * as "not a merged pull-request list" — the caller refuses the request.
  */
-function readMergedPullRequestIds(value: unknown): ReadonlySet<number> | null {
+export function readMergedPullRequestIds(value: unknown): ReadonlySet<number> | null {
   if (!Array.isArray(value)) {
     return null;
   }
@@ -235,6 +268,9 @@ async function readJournalLists(
 ): Promise<JournalListsRead> {
   const listForRuns = readOrRefuse('journal-unreadable', () => journal.listForRuns);
   if (listForRuns !== undefined) {
+    if (isPast()) {
+      return { ok: false, reason: 'deadline-exceeded' };
+    }
     let grouped: ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>;
     try {
       grouped = await listForRuns.call(journal, runIds);
@@ -246,8 +282,15 @@ async function readJournalLists(
     }
     readOrRefuse('journal-unreadable', () => {
       for (const runId of runIds) {
-        const entries = grouped.get(runId);
-        if (!grouped.has(runId) || !Array.isArray(entries)) {
+        if (!grouped.has(runId)) {
+          refusal('journal-unreadable');
+        }
+      }
+      // Every mapped value is validated, not only the requested ids: a
+      // grouped map carrying a malformed extra entry is an unreadable
+      // journal, not a shorter answer.
+      for (const entries of grouped.values()) {
+        if (!Array.isArray(entries)) {
           refusal('journal-unreadable');
         }
       }
@@ -290,6 +333,9 @@ async function resolveLatestCollectedHead(
 ): Promise<HeadResolutionRead> {
   const attemptIds = readOrRefuse('runs-unreadable', () => run.attemptIds);
   const attemptCount = readOrRefuse('runs-unreadable', () => attemptIds.length);
+  if (attemptCount > SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN) {
+    return { ok: false, reason: 'too-many-attempts' };
+  }
   for (let index = attemptCount - 1; index >= 0; index -= 1) {
     if (isPast()) {
       return { ok: false, reason: 'deadline-exceeded' };
@@ -335,6 +381,9 @@ async function readHeadReceipts(
     return null;
   });
   if (found !== null) {
+    if (found.reviews.length > SHADOW_FACTS_MAX_RECEIPTS_PER_HEAD) {
+      return { ok: false, reason: 'too-many-receipts' };
+    }
     return { ok: true, reviews: found.reviews };
   }
   const outcome = readOrRefuse('receipts-unavailable', () => read.outcome);
@@ -370,7 +419,8 @@ function toConformanceReviewReceipt(receipt: ReviewReceiptProjection) {
  * from a repository ref becomes the typed `unknown` result — never a
  * rejection. Cost: linear in the capped input; the caps
  * (`SHADOW_CONFORMANCE_MAX_RUNS`, `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`,
- * `SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS`) are named constants.
+ * `SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS`, `SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN`,
+ * `SHADOW_FACTS_MAX_RECEIPTS_PER_HEAD`) are named constants.
  */
 export async function readShadowConformanceRuns(
   deps: ShadowConformanceRunsDependencies,
@@ -429,29 +479,34 @@ async function readConformanceRunsOrRefuse(
     return refusal('deadline-exceeded');
   }
 
-  const runIds = readOrRefuse('runs-unreadable', () => candidates.map((run) => run.runId));
+  // `runId` is read off each candidate exactly once, here, and reused
+  // everywhere below.
+  const candidateRuns = readOrRefuse('runs-unreadable', () =>
+    candidates.map((run) => ({ run, runId: run.runId })),
+  );
+  const runIds = candidateRuns.map((candidate) => candidate.runId);
   const journals = await readJournalLists(readOrRefuse('journal-unreadable', () => deps.journal), runIds, isPast);
   if (!journals.ok) {
     return refusal(journals.reason);
   }
   const cappedEntries = new Map<string, readonly LaneRunJournalEntryRecord[]>();
-  for (const run of candidates) {
-    const runId = readOrRefuse('runs-unreadable', () => run.runId);
-    const entries = readOrRefuse('journal-unreadable', () => journals.byRunId.get(runId));
+  for (const candidate of candidateRuns) {
+    const entries = readOrRefuse('journal-unreadable', () => journals.byRunId.get(candidate.runId));
+    // A missing map entry is an unreadable journal, not an entry-count
+    // problem — and never defaulted to empty.
     if (entries === undefined) {
-      return refusal('too-many-journal-entries');
+      return refusal('journal-unreadable');
     }
     const entryCount = readOrRefuse('journal-unreadable', () => entries.length);
     if (entryCount > SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN) {
       return refusal('too-many-journal-entries');
     }
-    cappedEntries.set(runId, entries);
+    cappedEntries.set(candidate.runId, entries);
   }
 
   const runs: ShadowConformanceRun[] = [];
-  for (const run of candidates) {
-    const runId = readOrRefuse('runs-unreadable', () => run.runId);
-    const head = await resolveLatestCollectedHead(readOrRefuse('attempt-unreadable', () => deps.attempts), run, isPast);
+  for (const candidate of candidateRuns) {
+    const head = await resolveLatestCollectedHead(readOrRefuse('attempt-unreadable', () => deps.attempts), candidate.run, isPast);
     if (!head.ok) {
       return refusal(head.reason);
     }
@@ -466,13 +521,16 @@ async function readConformanceRunsOrRefuse(
     if (!receipts.ok) {
       return refusal(receipts.reason);
     }
-    const entryRecords = cappedEntries.get(runId) ?? [];
+    const entryRecords = readOrRefuse('journal-unreadable', () => cappedEntries.get(candidate.runId));
+    if (entryRecords === undefined) {
+      return refusal('journal-unreadable');
+    }
     const journal = readOrRefuse('journal-unreadable', () => entryRecords.map(toConformanceJournalEntry));
     const reviewReceipts = readOrRefuse('receipts-unavailable', () => receipts.reviews.map(toConformanceReviewReceipt));
-    const tier = readOrRefuse('runs-unreadable', () => run.tier);
-    const pullRequest = readOrRefuse('runs-unreadable', () => run.prNumber!);
+    const tier = readOrRefuse('runs-unreadable', () => candidate.run.tier);
+    const pullRequest = readOrRefuse('runs-unreadable', () => candidate.run.prNumber!);
     runs.push({
-      runId,
+      runId: candidate.runId,
       tier,
       pullRequest,
       headOid: head.headOid,

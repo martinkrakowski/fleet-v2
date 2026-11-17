@@ -9,6 +9,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN,
+  SHADOW_FACTS_MAX_RECEIPTS_PER_HEAD,
   SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS,
   readShadowConformanceRuns,
   type ShadowConformanceRunsDependencies,
@@ -147,6 +149,7 @@ interface ReadCalls {
   attemptsRead: string[];
   receiptsRead: number;
   listForRunRead: string[];
+  listForRunsCalls: number;
 }
 
 /**
@@ -166,7 +169,7 @@ function makeDeps(options: {
   receipts?: () => ReadReceiptsForHeadResult | undefined;
   nowIso?: () => string;
 }): ShadowConformanceRunsDependencies & { calls: ReadCalls } {
-  const calls: ReadCalls = { runsList: 0, attemptsRead: [], receiptsRead: 0, listForRunRead: [] };
+  const calls: ReadCalls = { runsList: 0, attemptsRead: [], receiptsRead: 0, listForRunRead: [], listForRunsCalls: 0 };
   const runsList = (): Promise<readonly LaneRunRecord[]> => {
     calls.runsList += 1;
     if (options.runsNonArray === true) {
@@ -207,6 +210,7 @@ function makeDeps(options: {
     return Promise.resolve(groupedMap.get(runId) ?? []);
   };
   const listForRuns = (runIds: readonly string[]): Promise<unknown> => {
+    calls.listForRunsCalls += 1;
     if (options.journalByRun instanceof Error) {
       return Promise.reject(options.journalByRun);
     }
@@ -234,6 +238,19 @@ function makeDeps(options: {
     receipts: receiptsPort,
     nowIso: options.nowIso ?? ((): string => BEFORE_DEADLINE),
     calls,
+  };
+}
+
+/**
+ * A fake clock that is before the deadline for the first `pastFrom - 1`
+ * `nowIso` calls and at the deadline from the `pastFrom`-th call on: it
+ * advances per call, so the deadline passes mid-read.
+ */
+function clockPastFromCall(pastFrom: number): () => string {
+  let calls = 0;
+  return () => {
+    calls += 1;
+    return calls >= pastFrom ? AT_DEADLINE : BEFORE_DEADLINE;
   };
 }
 
@@ -352,6 +369,23 @@ describe('readShadowConformanceRuns', () => {
       expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
     });
 
+    it('a review receipts list over the per-head cap yields unknown/too-many-receipts', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({
+          outcome: 'found',
+          verification: [],
+          review: Array.from(
+            { length: SHADOW_FACTS_MAX_RECEIPTS_PER_HEAD + 1 },
+            () => receipt('code-review', 'pass'),
+          ),
+        }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'too-many-receipts' });
+    });
+
     it('a run whose PR is not in the set is omitted and never read', async () => {
       const deps = makeDeps({
         runs: [
@@ -374,6 +408,16 @@ describe('readShadowConformanceRuns', () => {
       const deps = makeDeps({
         runs: [collectedRun({ attemptIds: [ATTEMPT_1] })],
         attempts: new Map([[ATTEMPT_1, makeAttempt(ATTEMPT_1, null)]]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'head-unresolved' });
+    });
+
+    it('a collected headCommit that is not 40-hex yields unknown/head-unresolved', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf('short-head'))]]),
         receipts: () => ({ outcome: 'none' }),
       });
       const result = await readShadowConformanceRuns(deps, request());
@@ -455,6 +499,33 @@ describe('readShadowConformanceRuns', () => {
       expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
     });
 
+    it('a listForRuns yield that is an array (not a Map) yields unknown/journal-unreadable', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        journalNonMap: [],
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+    });
+
+    it('a grouped Map value that is a string — on an unrequested run id — yields unknown/journal-unreadable', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        journalByRun: new Map([
+          [RUN_MERGED, []],
+          [RUN_OTHER, 'not-an-array' as unknown as readonly LaneRunJournalEntryRecord[]],
+        ]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      // Every value in the grouped Map is validated, not only the requested
+      // ids: a malformed extra entry refuses the whole answer.
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+    });
+
     it('a non-array listForRun yield yields unknown/journal-unreadable', async () => {
       const deps = makeDeps({
         runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
@@ -492,6 +563,24 @@ describe('readShadowConformanceRuns', () => {
       expect(result).toEqual({ status: 'unknown', reason: 'too-many-journal-entries' });
     });
 
+    it('attemptIds over the per-run cap yield unknown/too-many-attempts before any attempt read', async () => {
+      const deps = makeDeps({
+        runs: [
+          collectedRun({
+            attemptIds: Array.from(
+              { length: SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN + 1 },
+              (_, index) => `attempt-01JB${String(index).padStart(22, '0')}`,
+            ),
+          }),
+        ],
+        attempts: new Map(),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'too-many-attempts' });
+      expect(deps.calls.attemptsRead).toEqual([]);
+    });
+
     it('candidates over the run cap yield unknown/too-many-runs', async () => {
       const runs = Array.from(
         { length: SHADOW_CONFORMANCE_MAX_RUNS + 1 },
@@ -526,8 +615,9 @@ describe('readShadowConformanceRuns', () => {
       const deps = makeDeps({});
       const revoking = { ...deps, runs: { list: () => Promise.resolve(proxy) } };
       const result = await readShadowConformanceRuns(revoking, request());
-      // The revoked Proxy makes even `Array.isArray` throw; the outer catch
-      // maps every unexpected error to the catch-all unreadable-source code.
+      // The revocation fires at the thenability check inside the fake (the
+      // `get` of `then` throws), so the interior catch maps it — and the
+      // outer catch stands behind it: rethrowing there fails this test.
       expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
       expect(JSON.stringify(result)).not.toContain('undefined');
     });
@@ -538,13 +628,20 @@ describe('readShadowConformanceRuns', () => {
       const deps = makeDeps({ withListForRuns: false, runs: [collectedRun()] });
       const revoking = { ...deps, journal: { listForRun: () => Promise.resolve(proxy) } };
       const result = await readShadowConformanceRuns(revoking, request());
-      // Whether the revoked Proxy makes `Array.isArray` throw (outer catch,
-      // catch-all `runs-unreadable`) or merely read as a non-array, the
-      // answer is a typed unknown and never a rejection.
-      expect(result.status).toBe('unknown');
-      expect(
-        result.status === 'unknown' && ['runs-unreadable', 'journal-unreadable'].includes(result.reason),
-      ).toBe(true);
+      // The revoked Proxy reads as a non-array here; the interior journal
+      // read refuses it with the journal code — exactly one code, never a
+      // rejection.
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+    });
+
+    it('runs.list() rejecting a non-Error (42) yields unknown/runs-unreadable and nothing rejects', async () => {
+      const deps = makeDeps({});
+      const throwing = { ...deps, runs: { list: (): Promise<never> => Promise.reject(42) } };
+      const result = await readShadowConformanceRuns(throwing, request());
+      // The interior catch maps the non-Error rejection; the outer catch
+      // stands behind it — rethrowing there fails this test.
+      expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
+      expect(JSON.stringify(result)).not.toContain('42');
     });
 
     it('a port method throwing a non-Error value yields a typed unknown and nothing rejects', async () => {
@@ -575,16 +672,19 @@ describe('readShadowConformanceRuns', () => {
       expect(deps.calls.receiptsRead).toBe(0);
     });
 
-    it('a now past the deadline instant in a different offset yields unknown/deadline-exceeded (instant comparison)', async () => {
+    it('a now past the deadline instant but before it lexically yields unknown/deadline-exceeded (instant comparison)', async () => {
       const deps = makeDeps({
         runs: [collectedRun()],
         attempts: new Map(),
         receipts: () => ({ outcome: 'none' }),
-        nowIso: () => '2026-12-01T01:30:00.000+02:00',
+        // 2026-11-29T23:00:00Z: past the deadline instant
+        // (2026-11-29T22:00:00Z) but lexically smaller, so a string
+        // comparison would wrongly read as before the deadline and pass.
+        nowIso: () => '2026-11-29T23:00:00.000Z',
       });
       const result = await readShadowConformanceRuns(
         deps,
-        request({ deadlineIso: '2026-11-30T00:00:00.000Z' }),
+        request({ deadlineIso: '2026-11-30T00:00:00.000+02:00' }),
       );
       expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
       expect(deps.calls.runsList).toBe(0);
@@ -628,6 +728,51 @@ describe('readShadowConformanceRuns', () => {
       const result = await readShadowConformanceRuns(deps, request());
       expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
     });
+
+    it('the deadline passing during the fallback per-run journal reads yields unknown/deadline-exceeded', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'none' }),
+        withListForRuns: false,
+        // Call 1: the initial check; call 2: before the journal reads; call 3:
+        // the per-run check inside the fallback loop — past from there.
+        nowIso: clockPastFromCall(3),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+      expect(deps.calls.listForRunRead).toEqual([]);
+    });
+
+    it('the deadline passing before the grouped journal read yields unknown/deadline-exceeded with no grouped read', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'none' }),
+        // Calls 1-2: the initial and pre-journal checks; call 3: the check
+        // immediately before the grouped `listForRuns` call — past there.
+        nowIso: clockPastFromCall(3),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+      expect(deps.calls.listForRunsCalls).toBe(0);
+      expect(deps.calls.attemptsRead).toEqual([]);
+    });
+
+    it('the deadline passing during the head-resolution walk yields unknown/deadline-exceeded', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'none' }),
+        // Calls 1-3: initial, pre-journal and grouped-journal checks; call 4:
+        // the per-attempt check at the top of the head walk — past there.
+        nowIso: clockPastFromCall(4),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+      expect(deps.calls.attemptsRead).toEqual([]);
+      expect(deps.calls.receiptsRead).toBe(0);
+    });
   });
 
   describe('fakes', () => {
@@ -665,6 +810,13 @@ describe('readShadowConformanceRuns hostile input', () => {
   it('refuses undefined with unknown/invalid-request', async () => {
     const result = await readShadowConformanceRuns(makeDeps({}), undefined);
     expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+  });
+
+  it('refuses a malformed deadlineIso with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    const result = await readShadowConformanceRuns(deps, request({ deadlineIso: 'not-a-zoned-instant' }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
   });
 
   it('refuses a number where the request record is due with unknown/invalid-request', async () => {

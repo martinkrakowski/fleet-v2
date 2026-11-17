@@ -5,6 +5,7 @@
  */
 import { existsSync } from 'node:fs';
 
+import { isValidBriefPackageDigest, isValidBriefProjectId } from '@fleet/evidence-and-acceptance';
 import {
   AgyRunnerAdapter,
   AttemptArtifactAdapter,
@@ -23,6 +24,7 @@ import {
   WorkspaceAdapter,
   isSafeSshHost,
   resolveRunnerCapabilityProfile,
+  type AttemptRecord,
   type ExecutionRunnerHost,
   type ExecutorForRecordedHostResult,
   type ForgeActionDelegate,
@@ -86,6 +88,155 @@ export interface ComposeExecutionHostsInput {
   readonly issueMergeGrantUseCase?: IssueMergeGrantUseCase;
 }
 
+/**
+ * `brief:` + a project id of at most 200 characters + `:` + a 64-hex digest.
+ * A longer id is refused before any slice of the body or any repository read.
+ * The length is read once.
+ */
+export const MAX_BRIEF_ATTEMPT_ID_LENGTH = 'brief:'.length + 200 + 1 + 64;
+
+/**
+ * A longer attempt list cannot prove a unique match, so the locator returns
+ * null (the same result as two matches). The length is read once and the
+ * scan never exceeds that count.
+ */
+export const MAX_BRIEF_ATTEMPTS_READ = 4096;
+
+const BRIEF_ATTEMPT_PREFIX = 'brief:';
+const BRIEF_DIGEST_LENGTH = 64;
+
+interface BriefAttemptStore {
+  findAttemptById(attemptId: string): Promise<AttemptRecord | null>;
+  listAllAttempts(): Promise<readonly AttemptRecord[]>;
+}
+
+interface BriefWorkOrderStore {
+  findWorkOrderById(workOrderId: string): Promise<{ readonly projectId: string } | null>;
+}
+
+type BriefAttemptIdClass =
+  | { readonly kind: 'other' }
+  | { readonly kind: 'malformed' }
+  | { readonly kind: 'brief'; readonly projectId: string; readonly digest: string };
+
+/**
+ * A string that is not `brief:` stays `other`. A `brief:` string that is not
+ * exactly `brief:<projectId>:<64 lowercase hex>` is `malformed`. Non-strings
+ * are `other` and are never read (a throwing getter or a Proxy trap must not
+ * run). The body is sliced only after the length cap.
+ */
+function classifyBriefAttemptId(attemptId: unknown): BriefAttemptIdClass {
+  if (typeof attemptId !== 'string' || !attemptId.startsWith(BRIEF_ATTEMPT_PREFIX)) {
+    return { kind: 'other' };
+  }
+  if (attemptId.length > MAX_BRIEF_ATTEMPT_ID_LENGTH) {
+    return { kind: 'malformed' };
+  }
+  const body = attemptId.slice(BRIEF_ATTEMPT_PREFIX.length);
+  const splitAt = body.lastIndexOf(':');
+  if (splitAt <= 0) {
+    return { kind: 'malformed' };
+  }
+  const projectId = body.slice(0, splitAt);
+  const digest = body.slice(splitAt + 1);
+  // The digest is the whole suffix after the final `:`, and that suffix is
+  // exactly 64 characters. Anything else is a different shape.
+  if (digest.length !== BRIEF_DIGEST_LENGTH) {
+    return { kind: 'malformed' };
+  }
+  if (!isValidBriefProjectId(projectId) || !isValidBriefPackageDigest(digest)) {
+    return { kind: 'malformed' };
+  }
+  return { kind: 'brief', projectId, digest };
+}
+
+/**
+ * Exactly one attempt whose `briefDigest` is `digest` and whose work order's
+ * project is `projectId`. Zero matches and several matches both return null.
+ * Taking the first match is order-dependent and forbidden: two attempts of
+ * one work order, or two work orders that share a brief digest, must not
+ * pick one arbitrarily. A list longer than `MAX_BRIEF_ATTEMPTS_READ` cannot
+ * prove uniqueness, so it returns null too. The length is read once and the
+ * loop stops at that count. A repository failure is NOT "no attempt": a throw
+ * while listing or reading a work order, or a list whose shape the locator
+ * cannot read, propagates as the locator's failure, never as a null that
+ * would read as "No attempt is recorded for ...". Only a successfully read
+ * store with zero (or several) matches returns null.
+ */
+async function findUniqueBriefAttempt(
+  projectId: string,
+  digest: string,
+  attemptRepository: BriefAttemptStore,
+  workOrderRepository: BriefWorkOrderStore,
+): Promise<AttemptRecord | null> {
+  const listed = await attemptRepository.listAllAttempts();
+  if (!Array.isArray(listed)) {
+    throw new Error('The attempt repository returned a list that cannot be read');
+  }
+  const count = listed.length;
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new Error('The attempt repository returned a list whose length cannot be read');
+  }
+  // Over the cap the list cannot prove a unique match, so the result is null
+  // (fail closed), never a throw and never a partial scan of the list.
+  if (count > MAX_BRIEF_ATTEMPTS_READ) {
+    return null;
+  }
+  let match: AttemptRecord | null = null;
+  for (let index = 0; index < count; index += 1) {
+    const attempt = listed[index];
+    if (attempt === undefined || attempt === null || typeof attempt !== 'object') {
+      continue;
+    }
+    if (attempt.briefDigest !== digest) {
+      continue;
+    }
+    const workOrderId = attempt.workOrderId;
+    if (typeof workOrderId !== 'string') {
+      continue;
+    }
+    const workOrder = await workOrderRepository.findWorkOrderById(workOrderId);
+    if (workOrder === undefined) {
+      throw new Error('The work order repository returned a record that cannot be read');
+    }
+    if (workOrder?.projectId !== projectId) {
+      continue;
+    }
+    if (match !== null) {
+      return null;
+    }
+    match = attempt;
+  }
+  return match;
+}
+
+/**
+ * The review locator's attempt read. A well-formed `brief:<projectId>:<digest>`
+ * id resolves through `findUniqueBriefAttempt`. A malformed or unmatched
+ * `brief:` id returns null and is not passed to `findAttemptById`, so an
+ * attempt stored under that same string is not a match. Every other string
+ * keeps `findAttemptById`. A non-string returns null without a repository
+ * read. A repository failure (a throw, or a list the locator cannot read)
+ * propagates to `locate`'s caller instead of reading as "no attempt".
+ */
+export async function findAttemptForReview(
+  attemptId: unknown,
+  attemptRepository: BriefAttemptStore,
+  workOrderRepository: BriefWorkOrderStore,
+): Promise<AttemptRecord | null> {
+  const parsed = classifyBriefAttemptId(attemptId);
+  if (parsed.kind === 'malformed') {
+    return null;
+  }
+  if (parsed.kind === 'brief') {
+    return findUniqueBriefAttempt(parsed.projectId, parsed.digest, attemptRepository, workOrderRepository);
+  }
+  if (typeof attemptId !== 'string') {
+    return null;
+  }
+  return attemptRepository.findAttemptById(attemptId);
+}
+
 export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
   const {
     stateDir,
@@ -129,9 +280,14 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
   });
   // The review locator reads attempt records and recorded-host executors from
   // this work context; it is filled in here so the router bound above only
-  // runs after composition finishes.
+  // runs after composition finishes. A `brief:<projectId>:<digest>` id
+  // resolves to the one recorded attempt with that digest whose work order
+  // is that project. Exactly one match is returned; zero or several return
+  // null. Taking the first match is order-dependent and forbidden. A
+  // malformed or unmatched `brief:` id returns null and is not looked up
+  // with findAttemptById.
   reviewLocatorRef.locator = new AttemptReviewLocator({
-    findAttempt: (attemptId) => attemptRepository.findAttemptById(attemptId),
+    findAttempt: (attemptId) => findAttemptForReview(attemptId, attemptRepository, workOrderRepository),
     executorForHost,
     hosts: options?.installation?.hosts,
     legacyRoute: {

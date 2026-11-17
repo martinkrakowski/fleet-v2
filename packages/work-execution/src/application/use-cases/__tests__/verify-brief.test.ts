@@ -813,6 +813,7 @@ describe('VerifyBriefUseCase', () => {
         implementerModel: 'impl-model',
         reviewerModel: REVIEWER,
         briefText: base.prose,
+        briefManifestRaw: base.manifestJson,
       },
     ]);
 
@@ -868,6 +869,33 @@ describe('VerifyBriefUseCase', () => {
       reason: 'review-unverified',
       detail: 'receipt-mismatch',
     });
+  });
+
+  it('sends a brief-verify request whose briefManifestRaw is the raw manifest bytes the digest covers', async () => {
+    const base = fixture();
+    const deps = depsWith({
+      reviews: (request) => Promise.resolve({
+        outcome: 'receipt',
+        receipt: {
+          receiptId: 'receipt-1',
+          requestId: request.requestId,
+          kind: 'brief-verify',
+          reviewerModel: REVIEWER,
+          candidateHeadSha: COMMIT,
+          verdict: 'passed',
+          findings: [],
+        },
+      }),
+    });
+    const result = await new VerifyBriefUseCase(deps).verifyBrief(base.request);
+    expect(result.outcome).toBe('verified');
+    expect(deps.reviewRequests).toHaveLength(1);
+    expect(deps.reviewRequests[0]?.briefManifestRaw).toBe(base.manifestJson);
+    // The manifest bytes the request carries are exactly the bytes the
+    // verification digest covers (`prose + '\n' + manifestRaw` is the
+    // fixture's `briefDigest`), so the reviewer is bound to the same package
+    // the digest identifies.
+    expect(`${base.prose}\n${deps.reviewRequests[0]?.briefManifestRaw}`).toBe(`${base.prose}\n${base.manifestJson}`);
   });
 
   it('fails closed as unverified when a passing receipt omits or empties candidateHeadSha or reviewerModel', async () => {

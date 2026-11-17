@@ -2,9 +2,9 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { CUTOVER_SHADOW_CRITERIA, type CutoverRecord } from '@fleet/work-execution';
+import { CUTOVER_SHADOW_CRITERIA, buildMergeKey, type CutoverRecord } from '@fleet/work-execution';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from './composition.js';
 import { runCli, type CliIo } from './index.js';
@@ -282,5 +282,120 @@ describe('fleet-v2 cutover status and rollback', () => {
       'cutover', 'retire', '--expected-revision', '1', '--operation-id', 'op-1', '--now-iso', '2026-11-20T12:00:00.000Z',
     ]);
     expect(Object.keys(result.json ?? {})).toEqual(['outcome', 'move', 'key', 'replayed', 'state', 'revision', 'record']);
+  });
+});
+
+describe('cutover shadow record-day merge-queue digest (RD1)', () => {
+  it('records S1 pass when the live fleet/v2 entry shares the journal digest 7c155c1db6b3', async () => {
+    // enqueue and listMergeEntries judge deadlines against Date.now(), while
+    // record-day's list deadline is daemonNow plus 60s. Pin both clocks to the
+    // same instant so the brief's deadline stays in the future.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-17T12:00:00.000Z'));
+    try {
+      const legacyDir = join(stateDir, 'legacy');
+      mkdirSync(legacyDir, { recursive: true });
+      const headOid = 'a'.repeat(40);
+      // Shell events reject a fractional second (`AT_PATTERN` is seconds and
+      // `Z` only). This is the same instant as 2026-11-16T10:00:00.000Z.
+      writeFileSync(
+        join(legacyDir, 'events.jsonl'),
+        `${JSON.stringify({
+          at: '2026-11-16T10:00:00Z',
+          kind: 'result',
+          outcome: 'merged',
+          pr: 101,
+          headOid,
+          detail: '',
+        })}\n`,
+      );
+
+      const runtime = createFleetCliRuntime({
+        stateDir,
+        daemonNow: () => '2026-11-17T12:00:00.000Z',
+        daemonSleep: async () => {},
+      });
+      const enqueued = await runtime.execution.mergeQueueRepository.enqueueMergeEntry({
+        repository: { owner: 'fleet', repo: 'v2' },
+        pullRequest: 101,
+        headOid,
+        tier: 2,
+        enqueuedBy: 'cli',
+        runId: null,
+        entryId: '01JB0000000000000000000001',
+        successorEntryId: '01JB0000000000000000000002',
+        enqueuedAtIso: '2026-11-16T09:00:00.000Z',
+        deadlineIso: '2026-11-17T12:05:00.000Z',
+      });
+      expect(enqueued.outcome).toBe('created');
+
+      const built = buildMergeKey({
+        repoDigest: '7c155c1db6b3',
+        pullRequest: 101,
+        head12: headOid.slice(0, 12),
+        action: 'merge-pr',
+        attemptOrdinal: null,
+        retry: null,
+        retryProof: null,
+      });
+      if (!built.ok) {
+        throw new Error(`fixture merge key refused: ${built.error}`);
+      }
+      // S1 counts only a dry-run result whose reason is would-merge. Any other
+      // outcome on this merge key is live-action-in-shadow and cannot pass.
+      const intent = await runtime.conductor.laneRunJournal.append({
+        version: 1,
+        entryId: '01JB0000000000000000000003',
+        kind: 'intent',
+        key: built.key,
+        runId: null,
+        recordedAtIso: '2026-11-16T09:59:00.000Z',
+        mode: null,
+        expectedRevision: null,
+        mintedId: null,
+        outcome: null,
+        reasonCode: null,
+        detail: null,
+        grantId: null,
+        state: null,
+      });
+      expect(intent.outcome).toBe('appended');
+      const resultEntry = await runtime.conductor.laneRunJournal.append({
+        version: 1,
+        entryId: '01JB0000000000000000000004',
+        kind: 'result',
+        key: built.key,
+        runId: null,
+        recordedAtIso: '2026-11-16T10:00:00.000Z',
+        mode: null,
+        expectedRevision: null,
+        mintedId: null,
+        outcome: 'dry-run',
+        reasonCode: 'would-merge',
+        detail: null,
+        grantId: null,
+        state: null,
+      });
+      expect(resultEntry.outcome).toBe('appended');
+
+      const result = await run(runtime, [
+        'cutover',
+        'shadow',
+        'record-day',
+        '--repository',
+        'fleet/v2',
+        '--legacy-state-dir',
+        legacyDir,
+        '--day',
+        '2026-11-16',
+      ]);
+      expect(result.code).toBe(0);
+      expect(result.json).toMatchObject({
+        outcome: 'recorded',
+        recorded: { S1: 'pass' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

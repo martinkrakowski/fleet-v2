@@ -99,11 +99,6 @@ const LIST_QUERY_ALLOWED_KEYS = ['deadlineIso', 'repository'] as const;
  */
 const LIST_QUERY_REPOSITORY_ALLOWED_KEYS = ['owner', 'repo'] as const;
 
-/** The 12-character repo digest `enqueueMergeEntry` stores and `listMergeEntries` matches. */
-function computeRepoDigest(repository: { readonly owner: string; readonly repo: string }): string {
-  return sha256HexDigest(`${repository.owner}/${repository.repo}`).slice(0, 12);
-}
-
 /**
  * A plain object whose prototype is `Object.prototype` or `null`.
  * `getPrototypeOf` is the only prototype read, so a Proxy `get` trap does not run.
@@ -207,6 +202,17 @@ export function duplicateMergeQueueIdentityListError(records: readonly MergeQueu
   return undefined;
 }
 
+/**
+ * The 12-hex repository digest used to key merge-queue entries, daemon
+ * repository refs, and shadow day-writer filters (`O(owner.length + repo.length)`).
+ */
+export function mergeQueueRepositoryDigest(repository: {
+  readonly owner: string;
+  readonly repo: string;
+}): string {
+  return sha256HexDigest(`${repository.owner}/${repository.repo}`).slice(0, 12);
+}
+
 type MergeMutationDecision =
   | MergeEnqueueDecision
   | MergeDropDecision
@@ -223,7 +229,7 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
     if (deadlineRefusal !== null) {
       return deadlineRefusal;
     }
-    const repoDigest = computeRepoDigest(command.repository);
+    const repoDigest = mergeQueueRepositoryDigest(command.repository);
     const { repository, pullRequest, headOid, tier, enqueuedBy, runId, entryId, successorEntryId, enqueuedAtIso } = command;
     const input: MergeEnqueueInput = {
       repository,
@@ -348,7 +354,7 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
       return undefined;
     }
     const repository = readQueryRepository(repositoryDescriptor.value);
-    const targetDigest = computeRepoDigest(repository);
+    const targetDigest = mergeQueueRepositoryDigest(repository);
     return targetDigest;
   }
 

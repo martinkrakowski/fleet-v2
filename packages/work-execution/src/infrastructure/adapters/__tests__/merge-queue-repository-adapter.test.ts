@@ -42,7 +42,7 @@ function command(headOid: string) {
 
 const DEADLINE_MESSAGE = 'merge queue list refused an expired or malformed deadline';
 
-/** The same 12-character digest `computeRepoDigest` stores. */
+/** The same 12-character digest `mergeQueueRepositoryDigest` stores. */
 function digestOf(owner: string, repo: string): string {
   return createHash('sha256').update(`${owner}/${repo}`, 'utf8').digest('hex').slice(0, 12);
 }
@@ -489,6 +489,45 @@ describe('MergeQueueRepositoryAdapter', () => {
     });
     await expectDeadlineRefusal(adapter.listMergeEntries(withDeadlineGetter as never));
     expect(deadlineGets).toBe(0);
+    expect((await fs.readFile(filePath)).toString('utf8')).toBe('{ truncated');
+  });
+
+  it('a getter on an unknown string key or a symbol key within the query key cap never runs and throws MergeQueueDeadlineError', async () => {
+    const filePath = await writeTruncated(stateDir);
+    const adapter = new MergeQueueRepositoryAdapter({ stateDir });
+    // The list-query cap is two own keys. `repository` is omitted so the
+    // accessor is the second key and the key-count refusal does not fire
+    // before the accessor check. A valid `deadlineIso` stays, so a missing
+    // deadline check cannot refuse in its place.
+    let unknownStringGets = 0;
+    const withUnknownStringGetter: { deadlineIso: string } = { deadlineIso: futureDeadline() };
+    Object.defineProperty(withUnknownStringGetter, 'unknown', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        unknownStringGets += 1;
+        throw new Error('unknown string getter');
+      },
+    });
+    expect(Reflect.ownKeys(withUnknownStringGetter)).toHaveLength(2);
+    await expectDeadlineRefusal(adapter.listMergeEntries(withUnknownStringGetter));
+    expect(unknownStringGets).toBe(0);
+
+    let symbolGets = 0;
+    const withSymbolGetter: { deadlineIso: string } = { deadlineIso: futureDeadline() };
+    Object.defineProperty(withSymbolGetter, Symbol('unknown'), {
+      enumerable: true,
+      configurable: true,
+      get() {
+        symbolGets += 1;
+        throw new Error('symbol getter');
+      },
+    });
+    const symbolKeys = Reflect.ownKeys(withSymbolGetter);
+    expect(symbolKeys).toHaveLength(2);
+    expect(symbolKeys.some((key) => typeof key === 'symbol')).toBe(true);
+    await expectDeadlineRefusal(adapter.listMergeEntries(withSymbolGetter));
+    expect(symbolGets).toBe(0);
     expect((await fs.readFile(filePath)).toString('utf8')).toBe('{ truncated');
   });
 

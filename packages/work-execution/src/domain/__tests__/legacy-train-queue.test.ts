@@ -160,32 +160,63 @@ describe('parseLegacyTrainQueue', () => {
 
 const PARKED_HEAD = FIRST_HEAD;
 const PARKED_BASE = 'main';
+const PARKED_REASON = 'stalled';
+const PARKED_ATTEMPT = '2';
+const PARKED_NOT_BEFORE = '1735689600';
 
-function parkedLine(overrides: Partial<Record<'pr' | 'head' | 'base', string>> = {}): string {
+function parkedLine(
+  overrides: Partial<Record<'pr' | 'head' | 'reason' | 'attempt' | 'notBefore' | 'base', string>> = {},
+): string {
   const fields = {
     pr: '7',
     head: PARKED_HEAD,
+    reason: PARKED_REASON,
+    attempt: PARKED_ATTEMPT,
+    notBefore: PARKED_NOT_BEFORE,
     base: PARKED_BASE,
     ...overrides,
   };
-  return [fields.pr, fields.head, fields.base].join(' ');
+  return [fields.pr, fields.head, fields.reason, fields.attempt, fields.notBefore, fields.base].join(' ');
 }
 
 function unknownParkedLine(line: number): { ok: false; line: number; reason: 'unknown-line' } {
   return { ok: false, line, reason: 'unknown-line' };
 }
 
-function parkedEntry(line: number, base: string): {
+function parkedEntry(
+  line: number,
+  overrides: Partial<{ reason: string; attempt: number; notBefore: number; base: string }> = {},
+): {
   ok: true;
-  entry: { line: number; pullRequest: number; headOid: string; base: string };
+  entry: {
+    line: number;
+    pullRequest: number;
+    headOid: string;
+    reason: string;
+    attempt: number;
+    notBefore: number;
+    base: string;
+  };
 } {
-  return { ok: true, entry: { line, pullRequest: 7, headOid: PARKED_HEAD, base } };
+  return {
+    ok: true,
+    entry: {
+      line,
+      pullRequest: 7,
+      headOid: PARKED_HEAD,
+      reason: PARKED_REASON,
+      attempt: 2,
+      notBefore: 1735689600,
+      base: PARKED_BASE,
+      ...overrides,
+    },
+  };
 }
 
 describe('parseLegacyTrainParkedQueue', () => {
-  it('parses a well-formed three-field parked line into its validated fields', () => {
+  it('parses a well-formed six-field parked line into its validated fields', () => {
     const result = parseLegacyTrainParkedQueue(`${parkedLine()}\n`);
-    expect(result).toEqual({ ok: true, lines: [parkedEntry(1, 'main')] });
+    expect(result).toEqual({ ok: true, lines: [parkedEntry(1)] });
     if (result.ok) {
       expect(Object.isFrozen(result.lines)).toBe(true);
       const first = result.lines[0];
@@ -205,19 +236,47 @@ describe('parseLegacyTrainParkedQueue', () => {
     expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
   });
 
+  it('reports an over-length reason field as an unknown line', () => {
+    const result = parseLegacyTrainParkedQueue(parkedLine({ reason: 'x'.repeat(129) }));
+    expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
+  });
+
+  it('reports a negative attempt field as an unknown line', () => {
+    const result = parseLegacyTrainParkedQueue(parkedLine({ attempt: '-1' }));
+    expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
+  });
+
+  it('reports a malformed notBefore field as an unknown line', () => {
+    const result = parseLegacyTrainParkedQueue(parkedLine({ notBefore: '2026-11-17T00:00:00Z' }));
+    expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
+  });
+
   it('reports a bad base as an unknown line', () => {
     const result = parseLegacyTrainParkedQueue(parkedLine({ base: 'chain/Bad' }));
     expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
   });
 
-  it('reports a six-field parked line as unknown', () => {
-    const result = parseLegacyTrainParkedQueue(`${parkedLine()} reason 2 1735689600\n`);
+  it('reports a three-field queue/inprogress line fed to the parked parser as unknown', () => {
+    const result = parseLegacyTrainParkedQueue(`7 ${PARKED_HEAD} main\n`);
+    expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
+  });
+
+  it('reports a seven-field parked line as unknown', () => {
+    const result = parseLegacyTrainParkedQueue(`${parkedLine()} extra\n`);
     expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
   });
 
   it('reports a two-field parked line as unknown', () => {
     const result = parseLegacyTrainParkedQueue(`7 ${PARKED_HEAD}\n`);
     expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
+  });
+
+  it('refuses a secret-shaped reason field wholesale without echoing it', () => {
+    const secret = fakeSecretShape();
+    const result = parseLegacyTrainParkedQueue(parkedLine({ reason: secret }));
+    expect(result).toEqual({ ok: false, reason: 'secret-shaped' });
+    expect(Object.keys(result)).toEqual(['ok', 'reason']);
+    expect(JSON.stringify(result)).not.toContain(secret);
   });
 
   it('refuses a document with a secret-shaped line wholesale without echoing it', () => {
@@ -282,10 +341,10 @@ describe('parseLegacyTrainParkedQueue', () => {
     expect(result).toEqual({
       ok: true,
       lines: [
-        parkedEntry(1, 'main'),
+        parkedEntry(1),
         unknownParkedLine(2),
         unknownParkedLine(3),
-        parkedEntry(4, 'chain/example-1'),
+        parkedEntry(4, { base: 'chain/example-1' }),
       ],
     });
   });

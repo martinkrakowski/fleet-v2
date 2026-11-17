@@ -202,27 +202,38 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
   /**
    * Classifies every deduped entry into a disposition. A non-`main` base
    * yields `not-importable-base`; an entry already live in the fleet queue
-   * yields `already-queued`. Otherwise, if the SAME (pullRequest, headOid)
-   * pair also appears in the `inprogress` source (regardless of which
-   * source won the dedup above), the legacy shell train is actively merging
-   * it right now: that pair is `legacy-in-progress`, never an ordinary
-   * `would-import` candidate, and it is never pushed to `candidates` — so
-   * `apply: true` can never enqueue it alongside whatever the legacy train
-   * is doing. A pair that is `inprogress` on its own (no `queue` entry for
-   * the same pair) is unaffected: that is the normal, ongoing state the S8
-   * shadow-intake evaluator reads, not a switch-day hazard.
+   * yields `already-queued`. Otherwise, if the entry's PULL REQUEST NUMBER —
+   * not the full (pullRequest, headOid) pair — appears anywhere in the
+   * `inprogress` source, the legacy shell train is actively merging that PR
+   * right now: the real shell (tick.sh) MOVES a line from `queue` to
+   * `inprogress` when a pass starts, appending it to the in-progress file
+   * and omitting it from the rewritten queue, so a PR the shell is actively
+   * merging normally appears in `inprogress` ALONE, never duplicated into
+   * both files (queue+inprogress together is only a rare crash-leftover
+   * artifact, per the shell's own comment). The real shell's own hazard
+   * check is PR-number-scoped too (`grep -q "^$pr " "$INPROG"` in
+   * tick.sh's queue rewrite): `enqueue.sh` only refuses a second QUEUE line
+   * for a PR number already in the queue file, never checks `inprogress`,
+   * so it can append a fresh queue line for a PR number whose older head is
+   * still in progress — same PR, two different heads, two different pair
+   * keys. Keying this hazard by the full pair would miss that case, so any
+   * key sharing its PR number with an `inprogress` entry is
+   * `legacy-in-progress`, never an ordinary `would-import` candidate, and
+   * it is never pushed to `candidates` — so `apply: true` can never enqueue
+   * a PR the legacy train is actively merging, whatever head is on the
+   * fleet-side entry. The (pullRequest, headOid) pair stays the identity
+   * for everything else here (dedup, `already-queued`); only this hazard
+   * check is scoped to the PR number alone.
    */
   private classifyEntries(
     parsedBySource: Readonly<Record<Source, readonly LegacyTrainQueueLine[]>>,
     liveEntries: readonly MergeQueueEntryRecord[],
     repository: ImportTrainStateRequest['repository'],
   ): ClassifiedEntries {
-    const pairsBySource: Record<Source, Set<string>> = { queue: new Set(), inprogress: new Set(), parked: new Set() };
-    for (const source of SOURCES) {
-      for (const line of parsedBySource[source]) {
-        if (line.ok) {
-          pairsBySource[source].add(pairKey(line.entry));
-        }
+    const inProgressPullRequests = new Set<number>();
+    for (const line of parsedBySource.inprogress) {
+      if (line.ok) {
+        inProgressPullRequests.add(line.entry.pullRequest);
       }
     }
 
@@ -231,7 +242,6 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
     const candidates: LegacyTrainQueueEntry[] = [];
     const allKeys: ImportTrainStateKey[] = [];
     for (const { source, entry } of this.dedupeBySource(parsedBySource)) {
-      const pair = pairKey(entry);
       let disposition: ImportTrainStateKey['disposition'];
       if (entry.base !== 'main') {
         disposition = 'not-importable-base';
@@ -239,7 +249,7 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       } else if (this.isAlreadyLive(entry, liveEntries, repository)) {
         disposition = 'already-queued';
         alreadyQueued += 1;
-      } else if (pairsBySource.queue.has(pair) && pairsBySource.inprogress.has(pair)) {
+      } else if (inProgressPullRequests.has(entry.pullRequest)) {
         disposition = 'legacy-in-progress';
       } else {
         disposition = 'would-import';

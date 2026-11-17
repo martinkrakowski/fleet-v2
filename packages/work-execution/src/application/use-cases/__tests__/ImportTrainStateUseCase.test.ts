@@ -387,7 +387,11 @@ describe('ImportTrainStateUseCase', () => {
     ]);
   });
 
-  it('an in-progress-only PR is an import candidate with source inprogress', async () => {
+  it('an in-progress-only PR is legacy-in-progress, with source inprogress, and apply never enqueues it', async () => {
+    // The real shell (tick.sh) MOVES a line from queue to inprogress when a pass starts, rather than
+    // duplicating it into both: a PR the legacy train is actively merging normally appears in
+    // inprogress ALONE. That must still be legacy-in-progress, never an ordinary would-import
+    // candidate — queue+inprogress together is only a rare crash-leftover case, not the normal one.
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(
       readState([], { inprogress: { status: 'read', lines: [`7 ${HEAD_B} main`] } }),
@@ -401,14 +405,12 @@ describe('ImportTrainStateUseCase', () => {
       authority: 'owner-grant-1',
     });
 
-    expect(result).toMatchObject({ outcome: 'applied', imported: 1, inprogressLines: 1 });
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0, inprogressLines: 1 });
     expect(result.outcome === 'applied' && result.keys).toEqual([
-      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'would-import' },
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'legacy-in-progress' },
     ]);
     const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
-    expect(entries).toHaveLength(1);
-    expect(entries[0]!.pullRequest).toBe(7);
-    expect(entries[0]!.headOid).toBe(HEAD_B);
+    expect(entries).toHaveLength(0);
   });
 
   it('a pair in both queue and inprogress is legacy-in-progress, source queue wins, and apply never enqueues it', async () => {
@@ -437,7 +439,7 @@ describe('ImportTrainStateUseCase', () => {
     expect(entries).toHaveLength(0);
   });
 
-  it('a pair in inprogress only (no queue) is unaffected: still would-import', async () => {
+  it('a pair in inprogress only (no queue) is still legacy-in-progress: the normal case, not the rare one', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(
       readState([], { inprogress: { status: 'read', lines: [MAIN_B] } }),
@@ -451,12 +453,41 @@ describe('ImportTrainStateUseCase', () => {
       authority: 'owner-grant-1',
     });
 
-    expect(result).toMatchObject({ outcome: 'applied', imported: 1 });
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
     expect(result.outcome === 'applied' && result.keys).toEqual([
-      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'would-import' },
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'legacy-in-progress' },
     ]);
     const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
-    expect(entries).toHaveLength(1);
+    expect(entries).toHaveLength(0);
+  });
+
+  it('a PR with two different heads, one queued and one in progress, disposes BOTH keys legacy-in-progress', async () => {
+    // enqueue.sh only refuses a second queue line for a PR NUMBER already in the queue file; it never
+    // checks inprogress. So a PR can get a fresh queue line (a new push) while its older head is still
+    // in progress: same PR, two distinct (pullRequest, headOid) pairs. The hazard must be checked by PR
+    // number alone, or the new-head queue entry would slip through as would-import.
+    const queue = new MergeQueueRepositoryAdapter();
+    const queueLine = `7 ${HEAD_A} main`; // PR 7, a new head, freshly re-enqueued
+    const inProgressLine = `7 ${HEAD_B} main`; // PR 7, the older head the legacy shell is still merging
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([queueLine], { inprogress: { status: 'read', lines: [inProgressLine] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      authority: 'owner-grant-1',
+    });
+
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
+    expect(result.outcome === 'applied' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_A, base: 'main', source: 'queue', disposition: 'legacy-in-progress' },
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'legacy-in-progress' },
+    ]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(0);
   });
 
   it('a pair in queue only (no inprogress) is unaffected: still would-import', async () => {

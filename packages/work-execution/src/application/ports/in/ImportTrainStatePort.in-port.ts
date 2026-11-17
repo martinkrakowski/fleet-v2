@@ -27,18 +27,24 @@ export const IMPORT_KEYS_MAX = 500;
  * entry already live in the fleet queue yields `already-queued`.
  *
  * `legacy-in-progress` is a distinct case from both of those: it fires when
- * the SAME (pullRequest, headOid) pair appears in BOTH the `queue` source
- * and the `inprogress` source, regardless of which of the two wins the
- * dedup above (today that is always `queue`, since it precedes `inprogress`
- * in source order). That co-occurrence means the legacy shell train is
- * actively merging this PR right now — importing it would let the fleet
- * queue and the legacy train act on it at the same time. It is deliberately
- * not folded into `already-queued`: `already-queued` means the entry is
- * already live in the FLEET queue, a different fact entirely. A pair that
- * is `inprogress` on its own, with no matching `queue` entry, is NOT
- * `legacy-in-progress` — that is the normal, ongoing state the S8
- * shadow-intake evaluator reads and still yields `would-import`. Nothing
- * disposed `legacy-in-progress` is ever enqueued, even under `apply: true`.
+ * the entry's PULL REQUEST NUMBER — not the full (pullRequest, headOid)
+ * pair — appears anywhere in the `inprogress` source, whether or not the
+ * same pair also appears in `queue`. The real shell (tick.sh) MOVES a line
+ * from `queue` to `inprogress` when it starts merging a PR, rather than
+ * duplicating it into both; a PR appearing in BOTH `queue` and `inprogress`
+ * for the same pair is only a rare crash-leftover artifact, not the normal
+ * case. The normal case is a PR appearing in `inprogress` ALONE, and that
+ * still means the legacy shell train is actively merging it right now —
+ * importing it would let the fleet queue and the legacy train act on it at
+ * the same time. The check is scoped to the PR number, not the pair,
+ * because the shell's own `enqueue.sh` can append a fresh `queue` line for
+ * a PR number whose older head is still `inprogress` (same PR, a different
+ * head): that queue entry's pair never matches the `inprogress` pair, so a
+ * pair-level check would miss it, but it is still the same PR the legacy
+ * train is merging. `legacy-in-progress` is deliberately not folded into
+ * `already-queued`: `already-queued` means the entry is already live in
+ * the FLEET queue, a different fact entirely. Nothing disposed
+ * `legacy-in-progress` is ever enqueued, even under `apply: true`.
  */
 export interface ImportTrainStateKey {
   readonly pullRequest: number;

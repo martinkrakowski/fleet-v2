@@ -21,6 +21,9 @@ import {
   ChainRepositoryAdapter,
   RefreshChainsUseCase,
   RunDaemonTickUseCase,
+  TrainHealthAttentionAdapter,
+  TrainHealthStateReadAdapter,
+  WatchTrainHealthUseCase,
   RunMergePassUseCase,
   computeCallBudget,
   isZonedIsoDateTime,
@@ -33,7 +36,9 @@ import {
   type MergePolicyPort,
   type MergePolicySource,
   type MergeForgeActionPort,
-  type MergeQueueRepositoryAdapter,
+  MergeQueueRepositoryAdapter,
+  type HostAudibleAlertPort,
+  type WatchTrainHealthPort,
   type SetDaemonPausePort,
   type SetDaemonPauseRequest,
   type SetDaemonPauseResult,
@@ -73,6 +78,18 @@ export interface ComposeDaemonInput {
       actor: string,
     ) => Promise<unknown>;
   };
+  /** The coordination attention store delegates for train-health watchdog items (CO-WD5a). */
+  readonly trainHealthAttention: {
+    readonly recordAttentionItem: (body: unknown, actor: string) => Promise<unknown>;
+    readonly clearAttentionItem: (
+      request: unknown,
+      via: 'cli' | 'web' | 'machine',
+      actor: string,
+    ) => Promise<unknown>;
+    readonly listAttentionItems: (request: { readonly projectId?: string; readonly state: 'open' }) => Promise<unknown>;
+  };
+  /** Optional audible alert port; omitted by default so nothing is armed unless explicitly configured. */
+  readonly trainHealthAlert?: Pick<HostAudibleAlertPort, 'speak'>;
 }
 
 export interface ComposedDaemon {
@@ -89,6 +106,8 @@ export interface ComposedDaemon {
   readonly runDaemonTick: RunDaemonTickUseCase;
   readonly inspectDaemonStatus: InspectDaemonStatusPort;
   readonly setDaemonPause: SetDaemonPausePort;
+  /** CO-WD5a: one bounded train-health watchdog pass; no schedule, no I/O at construction. */
+  readonly watchTrainHealth: WatchTrainHealthPort;
   readonly probeForge: (input: { readonly nowIso: string; readonly deadlineIso: string }) => Promise<boolean>;
   readonly now: () => string;
   readonly newUlid: () => string;
@@ -307,6 +326,31 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     }
   };
 
+  // CO-WD5a: the train-health watchdog reads only through read-only handles,
+  // so a corrupt status or queue file is never quarantined by a watch pass.
+  // When durable the merge queue is re-opened read-only instead of using the
+  // writable repository, whose `listMergeEntries` would quarantine a corrupt
+  // queue file on run 1 and let run 2 read ENOENT as an empty queue.
+  const queueReadOnly = durable ? new MergeQueueRepositoryAdapter({ stateDir, readOnly: true }) : input.mergeQueueRepository;
+  const trainHealthState = new TrainHealthStateReadAdapter({
+    status: statusReadOnly,
+    queue: queueReadOnly,
+    forge: input.mergeForgeRead,
+    now,
+  });
+  const trainHealthAttention = new TrainHealthAttentionAdapter({
+    recordAttentionItem: input.trainHealthAttention.recordAttentionItem,
+    clearAttentionItem: (request, via, actor) =>
+      input.trainHealthAttention.clearAttentionItem(request, via as 'cli' | 'web' | 'machine', actor),
+    listAttentionItems: input.trainHealthAttention.listAttentionItems,
+  });
+  const watchTrainHealth = new WatchTrainHealthUseCase({
+    state: trainHealthState,
+    attention: trainHealthAttention,
+    now,
+    ...(input.trainHealthAlert !== undefined ? { alert: input.trainHealthAlert } : {}),
+  });
+
   return {
     durable,
     mergePolicy,
@@ -319,6 +363,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     runDaemonTick,
     inspectDaemonStatus,
     setDaemonPause,
+    watchTrainHealth,
     probeForge,
     now,
     newUlid: () => newUlid(),

@@ -641,6 +641,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     }
     const stateCheck = await this.readStateCheck(context.deadlineIso);
     const evaluation = evaluateShadowStateIntegrity({
+      day: context.day,
       stateCheck,
       journal: journal.entries.map((entry) => this.sampledEntry(entry)),
       sampledAtIso: this.deps.nowIso(),
@@ -670,6 +671,9 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * The canonical summary one verdict's digest is computed over: keys in the
    * fixed order `criterion`, `day`, `status`, `reason`, then the evaluator's
    * own numeric counts — for S1 also `excludeBatchMerges`, after the counts.
+   * S8 is the exception: its eight counts are live samples with no per-item
+   * timestamp, so they are excluded and S8's digest hashes only
+   * `{ criterion, day, status, reason }`.
    *
    * `mergeSet` (S1 only), `intake` (S8 only), `tickHealth` (S12 only) and
    * `stateIntegrity` (S9 only) are mutually exclusive, so at most one count
@@ -698,18 +702,19 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         excludeBatchMerges: this.deps.settings.excludeBatchMerges,
       });
     }
+    /**
+     * All eight S8 counts are live queue/shell/import snapshots with no
+     * per-item timestamp (only `takenAtIso`), not data scoped to UTC day
+     * `D`, so any queue movement between two `record-day` runs for the same
+     * closed day would change the digest while verdict and reason stay
+     * equal. They are therefore excluded from S8's digest, which hashes
+     * only `{ criterion, day, status, reason }`; `outcome.intake` stays on
+     * the outcome as a non-digested diagnostic. This changes the S8 digest
+     * format (allowed because no live shadow day has been recorded yet;
+     * live recording starts only after the digest format is final).
+     */
     if (outcome.intake !== undefined) {
-      return JSON.stringify({
-        ...base,
-        aFleetCount: outcome.intake.aFleetCount,
-        aShellCount: outcome.intake.aShellCount,
-        aCompared: outcome.intake.aCompared,
-        aDivergences: outcome.intake.aDivergences,
-        bFleetCount: outcome.intake.bFleetCount,
-        bShellCount: outcome.intake.bShellCount,
-        bCompared: outcome.intake.bCompared,
-        bDivergences: outcome.intake.bDivergences,
-      });
+      return JSON.stringify(base);
     }
     if (outcome.tickHealth !== undefined) {
       return JSON.stringify({
@@ -720,22 +725,30 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       });
     }
     /**
-     * The S9 canonical summary includes these counts. A day recorded before
-     * this change will return `verdict-conflict` if re-recorded. No live
-     * shadow days are recorded yet (live recording starts only after the
-     * digest format is final).
+     * S9's digest carries only the five day-scoped, closed-day-deterministic
+     * counts: `journalKeys`, `duplicateIntents`, `duplicateResults`,
+     * `resultsAfterFinal` and `orphanResults`. The evaluator scopes those to
+     * the recorded UTC day `D` over the `Date.parse` interval `[D, D+1)`, so
+     * journal activity after `D` no longer changes them between two
+     * `record-day` runs for the same closed day. Excluded from the digest and
+     * kept on `outcome.stateIntegrity` as non-digested diagnostics:
+     * `stateChecked` and `stateBad` (live `checkState()` samples) and
+     * `unreconciledIntents` (a live `sampledAtIso` grace-window sample) — any
+     * of them can change between two runs while verdict and reason stay equal.
+     * `status` and `reason` stay live in `base`, so a pass/fail flip through
+     * `stateBad` or `unreconciled-intent` remains a deliberate
+     * `verdict-conflict`. This changes the S9 digest format (allowed because
+     * no live shadow day has been recorded yet; live recording starts only
+     * after the digest format is final).
      */
     if (outcome.stateIntegrity !== undefined) {
       return JSON.stringify({
         ...base,
-        stateChecked: outcome.stateIntegrity.stateChecked,
-        stateBad: outcome.stateIntegrity.stateBad,
         journalKeys: outcome.stateIntegrity.journalKeys,
         duplicateIntents: outcome.stateIntegrity.duplicateIntents,
         duplicateResults: outcome.stateIntegrity.duplicateResults,
         resultsAfterFinal: outcome.stateIntegrity.resultsAfterFinal,
         orphanResults: outcome.stateIntegrity.orphanResults,
-        unreconciledIntents: outcome.stateIntegrity.unreconciledIntents,
       });
     }
     return JSON.stringify(base);

@@ -1,7 +1,13 @@
 // SH13a: pure extractor of shell merges, head moves and carry decisions from the events log.
+// SH13b: the S5' premerge carry-replay evaluator over those decisions.
 import { describe, expect, it } from 'vitest';
 
-import { extractShadowShellFacts, SHADOW_SHELL_FACTS_MAX_EVENTS } from '../shadow-day-shell-facts.js';
+import {
+  evaluateShadowPremergeCarry,
+  extractShadowShellFacts,
+  SHADOW_CARRY_MAX_DECISIONS,
+  SHADOW_SHELL_FACTS_MAX_EVENTS,
+} from '../shadow-day-shell-facts.js';
 import type { ShellTrainEvent } from '../shell-train-events.js';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -412,5 +418,417 @@ describe('extractShadowShellFacts: hostile input', () => {
     const facts = expectOk([event()]);
     expect(facts.merges).not.toEqual([event()]);
     expect(facts.merges).toEqual([{ pullRequest: 42, headOid: HEAD, atIso: AT }]);
+  });
+});
+
+const DAY = '2026-11-16';
+const PREV_DAY = '2026-11-15';
+const PR = 1234;
+
+/** A synthetic carry decision shaped exactly like S5' reads one. */
+function decision(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    pullRequest: PR,
+    oldHeadOid: OLD_HEAD,
+    newHeadOid: HEAD,
+    atIso: AT,
+    shellCarry: 'carried',
+    fleetCarry: 'carry',
+    ...overrides,
+  };
+}
+
+/** A synthetic S5' input with nothing to compare. */
+function carryInput(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { day: DAY, unknownLines: 0, decisions: [], anomalies: [], ...overrides };
+}
+
+function expectCarry(value: unknown, expected: Record<string, unknown>): void {
+  expect(evaluateShadowPremergeCarry(value)).toEqual({
+    status: 'unknown',
+    reason: 'invalid-input',
+    compared: 0,
+    laxCarries: 0,
+    stricterNoCarries: 0,
+    ...expected,
+  });
+}
+
+describe('evaluateShadowPremergeCarry: evaluation', () => {
+  it('equal carried and not-carried decisions on D pass with compared 2', () => {
+    const result = evaluateShadowPremergeCarry(
+      carryInput({
+        decisions: [
+          decision({ shellCarry: 'carried', fleetCarry: 'carry' }),
+          decision({ pullRequest: 9, newHeadOid: 'fedcba9876543210fedcba9876543210fedcba98', shellCarry: 'not-carried', fleetCarry: 'no-carry' }),
+        ],
+      }),
+    );
+    expect(result).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 2, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('fleet carry where the shell did not fails with laxCarries 1', () => {
+    const result = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+    );
+    expect(result).toEqual({ status: 'fail', reason: 'carry-decision-differs', compared: 1, laxCarries: 1, stricterNoCarries: 0 });
+  });
+
+  it('fleet no-carry where the shell carried fails with stricterNoCarries 1', () => {
+    const result = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ shellCarry: 'carried', fleetCarry: 'no-carry' })] }),
+    );
+    expect(result).toEqual({ status: 'fail', reason: 'carry-decision-differs', compared: 1, laxCarries: 0, stricterNoCarries: 1 });
+  });
+
+  it('51 differing decisions on D fail with the full count 51, no truncation at 50', () => {
+    const decisions = Array.from({ length: 51 }, (_, index) =>
+      decision({
+        pullRequest: index + 1,
+        newHeadOid: `fedcba9876543210fedcba9876543210fedcba${index.toString(16).padStart(2, '0')}`,
+        shellCarry: 'not-carried',
+        fleetCarry: 'carry',
+      }),
+    );
+    const result = evaluateShadowPremergeCarry(carryInput({ decisions }));
+    expect(result).toEqual({ status: 'fail', reason: 'carry-decision-differs', compared: 51, laxCarries: 51, stricterNoCarries: 0 });
+  });
+
+  it('a differing decision on D-1 is not counted and passes', () => {
+    const result = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ atIso: `${PREV_DAY}T12:00:00Z`, shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+    );
+    expect(result).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 0, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('a non-Z offset atIso near midnight is scoped by UTC instant, not written date', () => {
+    // `2026-11-16T23:30:00-02:00` is 2026-11-17T01:30Z: outside D, never counted.
+    const outside = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ atIso: '2026-11-16T23:30:00-02:00', shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+    );
+    expect(outside).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 0, laxCarries: 0, stricterNoCarries: 0 });
+    // `2026-11-15T23:00:00-02:00` is 2026-11-16T01:00Z: inside D, counted.
+    const inside = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ atIso: '2026-11-15T23:00:00-02:00', shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+    );
+    expect(inside).toEqual({ status: 'fail', reason: 'carry-decision-differs', compared: 1, laxCarries: 1, stricterNoCarries: 0 });
+  });
+
+  it('unknownLines greater than zero returns unknown/shell-incomplete', () => {
+    expectCarry(carryInput({ unknownLines: 3 }), { status: 'unknown', reason: 'shell-incomplete' });
+    expectCarry(carryInput({ unknownLines: 1, decisions: [decision()] }), { status: 'unknown', reason: 'shell-incomplete' });
+  });
+
+  it('unknownLines not a count returns unknown/invalid-input', () => {
+    expectCarry(carryInput({ unknownLines: -1 }), { status: 'unknown', reason: 'invalid-input' });
+    expectCarry(carryInput({ unknownLines: 1.5 }), { status: 'unknown', reason: 'invalid-input' });
+    expectCarry(carryInput({ unknownLines: '0' }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('fleetCarry unknown on D returns unknown/fleet-carry-unknown', () => {
+    expectCarry(carryInput({ decisions: [decision({ fleetCarry: 'unknown' })] }), {
+      status: 'unknown',
+      reason: 'fleet-carry-unknown',
+    });
+  });
+
+  it('unpaired-update anomaly on D returns unknown/carry-pairing-incomplete', () => {
+    expectCarry(carryInput({ anomalies: [{ atIso: AT, code: 'unpaired-update' }] }), {
+      status: 'unknown',
+      reason: 'carry-pairing-incomplete',
+    });
+  });
+
+  it('unpaired-update anomaly on D-1 is ignored', () => {
+    const result = evaluateShadowPremergeCarry(
+      carryInput({ anomalies: [{ atIso: `${PREV_DAY}T12:00:00Z`, code: 'unpaired-update' }], decisions: [decision()] }),
+    );
+    expect(result).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 1, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('unclassified-update anomaly on D returns unknown/carry-pairing-incomplete', () => {
+    expectCarry(carryInput({ anomalies: [{ atIso: AT, code: 'unclassified-update' }] }), {
+      status: 'unknown',
+      reason: 'carry-pairing-incomplete',
+    });
+  });
+
+  it('unresolved-merge anomaly on D is ignored by S5', () => {
+    const result = evaluateShadowPremergeCarry(
+      carryInput({ anomalies: [{ atIso: AT, code: 'unresolved-merge' }], decisions: [decision()] }),
+    );
+    expect(result).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 1, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('identical duplicate newHeadOid with equal shellCarry and fleetCarry counts as one decision', () => {
+    const result = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ shellCarry: 'not-carried', fleetCarry: 'no-carry' }), decision({ shellCarry: 'not-carried', fleetCarry: 'no-carry' })] }),
+    );
+    expect(result).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 1, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('duplicate newHeadOid with differing shellCarry or fleetCarry returns unknown/carry-facts-conflicting', () => {
+    expectCarry(
+      carryInput({ decisions: [decision({ shellCarry: 'carried', fleetCarry: 'carry' }), decision({ shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+      { status: 'unknown', reason: 'carry-facts-conflicting' },
+    );
+    expectCarry(
+      carryInput({ decisions: [decision({ shellCarry: 'carried', fleetCarry: 'carry' }), decision({ shellCarry: 'carried', fleetCarry: 'no-carry' })] }),
+      { status: 'unknown', reason: 'carry-facts-conflicting' },
+    );
+  });
+
+  it('no decisions on D with unknownLines 0 and no incomplete anomalies passes with compared 0', () => {
+    const result = evaluateShadowPremergeCarry(carryInput());
+    expect(result).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 0, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('a decisions list over SHADOW_CARRY_MAX_DECISIONS is refused as invalid-input', () => {
+    const overCap = Array.from({ length: SHADOW_CARRY_MAX_DECISIONS + 1 }, (_, index) => decision({ pullRequest: index + 1 }));
+    expectCarry(carryInput({ decisions: overCap }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('one input with both a lax and a stricter difference reports both exact counts', () => {
+    // Pins "count every difference, not only the first": stopping after the
+    // first difference would report laxCarries 1 with stricterNoCarries 0.
+    const result = evaluateShadowPremergeCarry(
+      carryInput({
+        decisions: [
+          decision({ shellCarry: 'not-carried', fleetCarry: 'carry' }),
+          decision({ pullRequest: 9, newHeadOid: 'fedcba9876543210fedcba9876543210fedcba98', shellCarry: 'carried', fleetCarry: 'no-carry' }),
+        ],
+      }),
+    );
+    expect(result).toEqual({ status: 'fail', reason: 'carry-decision-differs', compared: 2, laxCarries: 1, stricterNoCarries: 1 });
+  });
+
+  it('a decisions list of exactly the cap length is accepted, and cap + 1 is refused', () => {
+    // Pins `>` against `>=`: the cap itself is legal, one more is not. The
+    // at-cap list shares one newHeadOid with equal carries, so it dedupes to
+    // a single compared decision.
+    const element = decision();
+    const atCap = Array.from({ length: SHADOW_CARRY_MAX_DECISIONS }, () => element);
+    const accepted = evaluateShadowPremergeCarry(carryInput({ decisions: atCap }));
+    expect(accepted).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 1, laxCarries: 0, stricterNoCarries: 0 });
+    const overCap = Array.from({ length: SHADOW_CARRY_MAX_DECISIONS + 1 }, () => element);
+    expectCarry(carryInput({ decisions: overCap }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('an anomalies list over SHADOW_SHELL_FACTS_MAX_EVENTS is refused as invalid-input', () => {
+    const element = { atIso: AT, code: 'unpaired-update' };
+    const overCap = Array.from({ length: SHADOW_SHELL_FACTS_MAX_EVENTS + 1 }, () => element);
+    expectCarry(carryInput({ anomalies: overCap }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('a decision at exactly D T00:00:00Z is inside the day and one at exactly D+1 T00:00:00Z is outside', () => {
+    // Pins the half-open window: [D, D+1). A closed-window mutation would
+    // also count the midnight-boundary decision of the next day.
+    const atStart = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ atIso: `${DAY}T00:00:00Z`, shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+    );
+    expect(atStart).toEqual({ status: 'fail', reason: 'carry-decision-differs', compared: 1, laxCarries: 1, stricterNoCarries: 0 });
+    const atNextStart = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ atIso: '2026-11-17T00:00:00Z', shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+    );
+    expect(atNextStart).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 0, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('a fleetCarry unknown on D-1 is ignored and day D passes', () => {
+    // Pins "day-scoped before the fleet-unknown check": scoping after it
+    // would turn the off-day unknown into unknown/fleet-carry-unknown.
+    const result = evaluateShadowPremergeCarry(
+      carryInput({
+        decisions: [
+          decision({ pullRequest: 9, newHeadOid: 'fedcba9876543210fedcba9876543210fedcba98' }),
+          decision({ atIso: `${PREV_DAY}T12:00:00Z`, fleetCarry: 'unknown' }),
+        ],
+      }),
+    );
+    expect(result).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 1, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('a decisions list over the cap is refused before any element is read', () => {
+    // The Proxy passes every descriptor check (the getOwnPropertyDescriptor
+    // and ownKeys traps are untouched), so the over-cap length is refused
+    // from the length descriptor and own key count alone: no index read —
+    // and no `get` trap — ever happens.
+    let indexGets = 0;
+    const element = decision();
+    const overCap = Array.from({ length: SHADOW_CARRY_MAX_DECISIONS + 1 }, () => element);
+    const proxy = new Proxy(overCap, {
+      get(target, property) {
+        if (typeof property === 'string' && /^\d+$/.test(property)) {
+          indexGets += 1;
+        }
+        return Reflect.get(target, property);
+      },
+    });
+    expectCarry(carryInput({ decisions: proxy }), { status: 'unknown', reason: 'invalid-input' });
+    expect(indexGets).toBe(0);
+  });
+
+  it('JSON.stringify of an evaluation carries no head oid or pull request number from the input', () => {
+    const result = evaluateShadowPremergeCarry(carryInput({ decisions: [decision({ shellCarry: 'not-carried', fleetCarry: 'carry' })] }));
+    const text = JSON.stringify(result);
+    expect(text).not.toContain(HEAD);
+    expect(text).not.toContain(OLD_HEAD);
+    expect(text).not.toContain('1234');
+  });
+});
+
+describe('evaluateShadowPremergeCarry: hostile input', () => {
+  it('mutating one returned refusal leaves later calls unpoisoned', () => {
+    // The refusals are fresh objects per call: mutating one must never turn a
+    // later refusal into the mutated verdict.
+    const invalid = evaluateShadowPremergeCarry(null) as unknown as Record<string, unknown>;
+    invalid.status = 'pass';
+    const incomplete = evaluateShadowPremergeCarry(carryInput({ unknownLines: 2 })) as unknown as Record<string, unknown>;
+    incomplete.status = 'pass';
+    expectCarry(null, { status: 'unknown', reason: 'invalid-input' });
+    expectCarry(carryInput({ unknownLines: 2 }), { status: 'unknown', reason: 'shell-incomplete' });
+  });
+
+  it('refuses null', () => {
+    expectCarry(null, { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('refuses undefined', () => {
+    expectCarry(undefined, { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('refuses a wrong primitive (a number where a string is due)', () => {
+    expectCarry(carryInput({ day: 17 }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('refuses a string where a list is due', () => {
+    expectCarry(carryInput({ decisions: 'not-a-list' }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('refuses a real non-iterable object where a list is due (no length, no iterator)', () => {
+    expectCarry(carryInput({ decisions: { 0: decision() } }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('refuses an array hole (a sparse array)', () => {
+    const holey: unknown[] = [decision()];
+    holey.length = 2;
+    expectCarry(carryInput({ decisions: holey }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('refuses a real array-like object (length and index, but not an array)', () => {
+    const arrayLike = { length: 1, 0: decision() };
+    expectCarry(carryInput({ decisions: arrayLike }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('refuses an enormous length (a sparse array of length 2**32 - 1) before any traversal', () => {
+    const huge: unknown[] = [];
+    Object.defineProperty(huge, 'length', { value: 2 ** 32 - 1, writable: false });
+    expectCarry(carryInput({ decisions: huge }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('never runs a getter on an item', () => {
+    let calls = 0;
+    const item: Record<string, unknown> = decision();
+    Object.defineProperty(item, 'shellCarry', { get() { calls += 1; return 'carried'; }, enumerable: true });
+    expectCarry(carryInput({ decisions: [item] }), { status: 'unknown', reason: 'invalid-input' });
+    expect(calls).toBe(0);
+  });
+
+  it('never runs a getter on the root', () => {
+    let calls = 0;
+    const root: Record<string, unknown> = carryInput({ decisions: [decision()] });
+    Object.defineProperty(root, 'day', { get() { calls += 1; return DAY; }, enumerable: true });
+    expectCarry(root, { status: 'unknown', reason: 'invalid-input' });
+    expect(calls).toBe(0);
+  });
+
+  it('accepts a Proxy over a valid input with no get trap run, yielding the plain result', () => {
+    const plain = carryInput({ decisions: [decision({ shellCarry: 'not-carried', fleetCarry: 'no-carry' })] });
+    let getTraps = 0;
+    const proxy = new Proxy(plain, {
+      get(target, property, receiver) {
+        getTraps += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(evaluateShadowPremergeCarry(proxy)).toEqual(evaluateShadowPremergeCarry(plain));
+    expect(getTraps).toBe(0);
+  });
+
+  it('a decisions Proxy whose get reports 0 for length still sees the differing decision and fails', () => {
+    const list = [decision({ shellCarry: 'not-carried', fleetCarry: 'carry' })];
+    const proxy = new Proxy(list, {
+      get(target, property) {
+        if (property === 'length') {
+          return 0;
+        }
+        return Reflect.get(target, property);
+      },
+    });
+    expectCarry(carryInput({ decisions: proxy }), {
+      status: 'fail', reason: 'carry-decision-differs', compared: 1, laxCarries: 1, stricterNoCarries: 0,
+    });
+  });
+
+  it('an anomalies Proxy whose get reports 0 for length still sees the pairing anomaly', () => {
+    const list = [{ atIso: AT, code: 'unpaired-update' }];
+    const proxy = new Proxy(list, {
+      get(target, property) {
+        if (property === 'length') {
+          return 0;
+        }
+        return Reflect.get(target, property);
+      },
+    });
+    expectCarry(carryInput({ anomalies: proxy }), { status: 'unknown', reason: 'carry-pairing-incomplete' });
+  });
+
+  it('a decisions Proxy whose getPrototypeOf trap throws gives invalid-input, never throwing', () => {
+    const proxy = new Proxy([decision()], {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf');
+      },
+    });
+    expectCarry(carryInput({ decisions: proxy }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('a decisions Proxy whose ownKeys trap throws gives invalid-input, never throwing', () => {
+    const proxy = new Proxy([decision()], {
+      ownKeys() {
+        throw new Error('hostile ownKeys');
+      },
+    });
+    expectCarry(carryInput({ decisions: proxy }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('refuses an own __proto__ key even when the key count is exact', () => {
+    // Exactly the six allowed decision keys, with `pullRequest` replaced by
+    // `__proto__`: the key count passes, so the refusal must come from the
+    // polluting-key check itself, never from a count mismatch.
+    const item = JSON.parse(JSON.stringify(decision())) as Record<string, unknown>;
+    delete item.pullRequest;
+    Object.defineProperty(item, '__proto__', { value: null, enumerable: true, configurable: true });
+    expect(Object.keys(item)).toHaveLength(6);
+    expectCarry(carryInput({ decisions: [item] }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('is not satisfied by a constant verdict', () => {
+    // A constant pass verdict would pass where the fleet and shell disagree.
+    const result = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+    );
+    expect(result.status).toBe('fail');
+  });
+
+  it('is not satisfied by an identity echo of the input', () => {
+    // An identity echo would return the raw input rather than an evaluation.
+    const value = carryInput({ decisions: [decision()] });
+    expect(evaluateShadowPremergeCarry(value)).not.toEqual(value);
+    expect(evaluateShadowPremergeCarry(value)).toEqual({
+      status: 'pass',
+      reason: 'carry-decisions-equal',
+      compared: 1,
+      laxCarries: 0,
+      stricterNoCarries: 0,
+    });
   });
 });

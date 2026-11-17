@@ -421,19 +421,18 @@ function expectedS1Digest(day: string, status: string, reason: string, counts: {
 
 /**
  * The canonical S9 summary digest, rebuilt here exactly as the use case
- * builds it: S9 carries its evaluator's state-integrity counts into the
- * digest, so two evaluations landing on the same {status, reason} pair are
- * no longer indistinguishable to it.
+ * builds it: S9 carries only the five day-scoped, closed-day-deterministic
+ * journal counts into the digest, so two evaluations landing on the same
+ * {status, reason} pair with the same day-scoped journal shape are
+ * indistinguishable to it, while the live samples (`stateChecked`, `stateBad`,
+ * `unreconciledIntents`) are not.
  */
 function expectedS9Digest(day: string, status: string, reason: string, counts: {
-  stateChecked: number;
-  stateBad: number;
   journalKeys: number;
   duplicateIntents: number;
   duplicateResults: number;
   resultsAfterFinal: number;
   orphanResults: number;
-  unreconciledIntents: number;
 }): string {
   return sha256HexDigest(
     JSON.stringify({
@@ -441,14 +440,11 @@ function expectedS9Digest(day: string, status: string, reason: string, counts: {
       day,
       status,
       reason,
-      stateChecked: counts.stateChecked,
-      stateBad: counts.stateBad,
       journalKeys: counts.journalKeys,
       duplicateIntents: counts.duplicateIntents,
       duplicateResults: counts.duplicateResults,
       resultsAfterFinal: counts.resultsAfterFinal,
       orphanResults: counts.orphanResults,
-      unreconciledIntents: counts.unreconciledIntents,
     }),
   );
 }
@@ -479,34 +475,17 @@ function expectedS12Digest(day: string, status: string, reason: string, counts: 
 
 /**
  * The canonical S8 summary digest, rebuilt here exactly as the use case
- * builds it (SH7b fix round 2): S8, like S1, now carries its evaluator's
- * own comparison counts into the digest, so two evaluations landing on the
- * same {status, reason} pair are no longer indistinguishable to it.
+ * builds it: S8 excludes its eight live-sample counts (they have no
+ * per-item timestamp and are not scoped to UTC day `D`), so its digest
+ * hashes only `{ criterion, day, status, reason }`.
  */
-function expectedS8Digest(day: string, status: string, reason: string, counts: {
-  aFleetCount: number;
-  aShellCount: number;
-  aCompared: number;
-  aDivergences: number;
-  bFleetCount: number;
-  bShellCount: number;
-  bCompared: number;
-  bDivergences: number;
-}): string {
+function expectedS8Digest(day: string, status: string, reason: string): string {
   return sha256HexDigest(
     JSON.stringify({
       criterion: 'S8',
       day,
       status,
       reason,
-      aFleetCount: counts.aFleetCount,
-      aShellCount: counts.aShellCount,
-      aCompared: counts.aCompared,
-      aDivergences: counts.aDivergences,
-      bFleetCount: counts.bFleetCount,
-      bShellCount: counts.bShellCount,
-      bCompared: counts.bCompared,
-      bDivergences: counts.bDivergences,
     }),
   );
 }
@@ -556,30 +535,18 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecord?.verdicts.S8).toEqual({
       verdict: 'pass',
       reason: 'intake-equal',
-      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
-        aFleetCount: 1,
-        aShellCount: 1,
-        aCompared: 1,
-        aDivergences: 0,
-        bFleetCount: 1,
-        bShellCount: 1,
-        bCompared: 1,
-        bDivergences: 0,
-      }),
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal'),
       recordedAtIso: RECORDED_AT_ISO,
     });
     expect(dayRecord?.verdicts.S9).toEqual({
       verdict: 'pass',
       reason: 'state-consistent',
       digest: expectedS9Digest(DAY, 'pass', 'state-consistent', {
-        stateChecked: 5,
-        stateBad: 0,
         journalKeys: 1,
         duplicateIntents: 0,
         duplicateResults: 0,
         resultsAfterFinal: 0,
         orphanResults: 0,
-        unreconciledIntents: 0,
       }),
       recordedAtIso: RECORDED_AT_ISO,
     });
@@ -591,7 +558,7 @@ describe('RecordShadowDayUseCase', () => {
     expectNotImplementedUnevaluated(result.unevaluated);
   });
 
-  it('two S9 evaluations with the same pass/state-consistent and different stateChecked get different digests', async () => {
+  it('two S9 evaluations with the same pass/state-consistent and different stateChecked get the same digest', async () => {
     const fewerFixture = cleanFixture(DAY);
     fewerFixture.stateCheck = { checked: 5, bad: 0 };
     const moreFixture = cleanFixture(DAY);
@@ -608,17 +575,17 @@ describe('RecordShadowDayUseCase', () => {
     const digestFewer = harnessFewer.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S9?.digest;
     const digestMore = harnessMore.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S9?.digest;
     const shared = {
-      stateBad: 0,
       journalKeys: 1,
       duplicateIntents: 0,
       duplicateResults: 0,
       resultsAfterFinal: 0,
       orphanResults: 0,
-      unreconciledIntents: 0,
     };
-    expect(digestFewer).toBe(expectedS9Digest(DAY, 'pass', 'state-consistent', { stateChecked: 5, ...shared }));
-    expect(digestMore).toBe(expectedS9Digest(DAY, 'pass', 'state-consistent', { stateChecked: 10, ...shared }));
-    expect(digestFewer).not.toBe(digestMore);
+    expect(digestFewer).toBe(expectedS9Digest(DAY, 'pass', 'state-consistent', shared));
+    expect(digestMore).toBe(expectedS9Digest(DAY, 'pass', 'state-consistent', shared));
+    // The live state-check sample is excluded from the S9 digest, so the two
+    // runs hash the same summary despite different `stateChecked`.
+    expect(digestFewer).toBe(digestMore);
   });
 
   it('two S9 evaluations whose duplicateIntents and duplicateResults are swapped get different digests', async () => {
@@ -630,12 +597,9 @@ describe('RecordShadowDayUseCase', () => {
     // resultsAfterFinal stays 2 either way. Swapping the two fields in the
     // summary makes each digest equal the other's expected summary.
     const shared = {
-      stateChecked: 5,
-      stateBad: 0,
       journalKeys: 5,
       resultsAfterFinal: 2,
       orphanResults: 0,
-      unreconciledIntents: 0,
     };
     const intents1Results2 = { ...shared, duplicateIntents: 1, duplicateResults: 2 };
     const intents2Results1 = { ...shared, duplicateIntents: 2, duplicateResults: 1 };
@@ -682,6 +646,112 @@ describe('RecordShadowDayUseCase', () => {
       digest: expectedTwo,
       recordedAtIso: RECORDED_AT_ISO,
     });
+  });
+
+  it('answers unchanged when only next-day journal entries and the live state check changed between two S9 passes', async () => {
+    const fixture = cleanFixture(DAY);
+    const harness = makeHarness(fixture, NOW);
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    await useCase.execute(makeRequest());
+    const afterFirst = harness.evidence.stored;
+    const casCallsAfterFirst = harness.evidence.calls.cas;
+
+    // Next-day journal activity on a non-merge key (S1 is untouched) and a
+    // changed live state-check sample: both are outside S9's day-scoped
+    // digest, so the re-run answers unchanged instead of verdict-conflict.
+    fixture.journalEntries.push(
+      journalEntry({ kind: 'intent', key: 'k-next-day', recordedAtIso: '2026-11-17T01:00:00Z' }),
+      journalEntry({ kind: 'result', key: 'k-next-day', outcome: 'completed', recordedAtIso: '2026-11-17T01:01:00Z' }),
+    );
+    fixture.stateCheck = { checked: 9, bad: 0 };
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+    expectRecorded(result);
+    expect(result.outcome).toBe('unchanged');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S9).toEqual({
+      verdict: 'pass',
+      reason: 'state-consistent',
+      digest: expectedS9Digest(DAY, 'pass', 'state-consistent', {
+        journalKeys: 1,
+        duplicateIntents: 0,
+        duplicateResults: 0,
+        resultsAfterFinal: 0,
+        orphanResults: 0,
+      }),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(harness.evidence.calls.cas).toBe(casCallsAfterFirst);
+    expect(harness.evidence.stored).toEqual(afterFirst);
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('answers unchanged when a same-key result lands just after the day boundary between two S9 passes', async () => {
+    // Proves the `ms < dayEndMs` filter: without it, the appended D+1 result
+    // on k-d would be a result-after-final sequence anomaly (and would add
+    // day-foreign counts to the digest), turning this re-run into a
+    // verdict-conflict instead of unchanged.
+    const fixture = cleanFixture(DAY);
+    fixture.journalEntries.push(...syntheticKey('k-d', ['intent', 'completed']));
+    const harness = makeHarness(fixture, NOW);
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    await useCase.execute(makeRequest());
+
+    fixture.journalEntries.push(
+      journalEntry({ kind: 'result', key: 'k-d', outcome: 'refused', recordedAtIso: '2026-11-17T01:00:00Z' }),
+    );
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+    expectRecorded(result);
+    expect(result.outcome).toBe('unchanged');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S9).toEqual({
+      verdict: 'pass',
+      reason: 'state-consistent',
+      digest: expectedS9Digest(DAY, 'pass', 'state-consistent', {
+        journalKeys: 2,
+        duplicateIntents: 0,
+        duplicateResults: 0,
+        resultsAfterFinal: 0,
+        orphanResults: 0,
+      }),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+  });
+
+  it('refuses an in-day S9 journal change between runs with verdict-conflict and leaves the ledger untouched', async () => {
+    const fixture = cleanFixture(DAY);
+    const harness = makeHarness(fixture, NOW);
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    await useCase.execute(makeRequest());
+    const before = harness.evidence.stored;
+
+    // A new key with entries inside day D changes S9's day-scoped journalKeys
+    // (1 -> 2) while verdict and reason stay equal: the digest differs, so the
+    // re-run is refused and the ledger stays untouched.
+    fixture.journalEntries.push(...syntheticKey('k-in-day', ['intent', 'completed']));
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'verdict-conflict' });
+    expect(harness.evidence.stored).toEqual(before);
+    expect(harness.evidence.stored?.revision).toBe(1);
+  });
+
+  it('refuses an S9 pass->fail state-check flip between runs with verdict-conflict and leaves the ledger untouched', async () => {
+    const fixture = cleanFixture(DAY);
+    const harness = makeHarness(fixture, NOW);
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    await useCase.execute(makeRequest());
+    const before = harness.evidence.stored;
+
+    // stateChecked/stateBad are excluded from the S9 digest, but the live
+    // status/reason in the digest base still flip (pass/state-consistent ->
+    // fail/state-check-failed), so the re-run is a deliberate
+    // verdict-conflict, not a silent overwrite.
+    fixture.stateCheck = { checked: 5, bad: 1 };
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'verdict-conflict' });
+    expect(harness.evidence.stored).toEqual(before);
+    expect(harness.evidence.stored?.revision).toBe(1);
   });
 
   it('answers unchanged when the same inputs are recorded a second time, without a second (no-op) compareAndSet call', async () => {
@@ -870,21 +940,12 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecord?.verdicts.S8).toEqual({
       verdict: 'fail',
       reason: 'enqueue-coverage-divergence',
-      digest: expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
-        aFleetCount: 1,
-        aShellCount: 2,
-        aCompared: 1,
-        aDivergences: 1,
-        bFleetCount: 1,
-        bShellCount: 2,
-        bCompared: 1,
-        bDivergences: 1,
-      }),
+      digest: expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence'),
       recordedAtIso: RECORDED_AT_ISO,
     });
   });
 
-  it('two S8 evaluations with the same status/reason but different comparison counts get different digests (SH7b fix round 2)', async () => {
+  it('two S8 evaluations with the same status/reason but different live queue counts get the same digest (live-sample counts are excluded from S8)', async () => {
     const HEAD_C = 'd'.repeat(40);
 
     const fixtureA = cleanFixture(DAY);
@@ -900,16 +961,7 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecordA?.verdicts.S8).toEqual({
       verdict: 'fail',
       reason: 'enqueue-coverage-divergence',
-      digest: expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
-        aFleetCount: 1,
-        aShellCount: 2,
-        aCompared: 1,
-        aDivergences: 1,
-        bFleetCount: 1,
-        bShellCount: 2,
-        bCompared: 1,
-        bDivergences: 1,
-      }),
+      digest: expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence'),
       recordedAtIso: RECORDED_AT_ISO,
     });
 
@@ -926,25 +978,80 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecordB?.verdicts.S8).toEqual({
       verdict: 'fail',
       reason: 'enqueue-coverage-divergence',
-      digest: expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
-        aFleetCount: 1,
-        aShellCount: 3,
-        aCompared: 1,
-        aDivergences: 2,
-        bFleetCount: 1,
-        bShellCount: 3,
-        bCompared: 1,
-        bDivergences: 2,
-      }),
+      digest: expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence'),
       recordedAtIso: RECORDED_AT_ISO,
     });
 
     // Same {status, reason} pair in both ('fail'/'enqueue-coverage-divergence'),
-    // but the underlying shell-side coverage changed (one missing key vs
-    // two): the digests must differ, or a day-writer re-run against changed
-    // evidence like this would wrongly report 'unchanged' (the SH7b fix
-    // round 2 finding this fix closes).
-    expect(dayRecordA?.verdicts.S8?.digest).not.toBe(dayRecordB?.verdicts.S8?.digest);
+    // even though the underlying shell-side coverage changed (one missing
+    // key vs two): the eight live counts are excluded from S8's digest, so
+    // the digests must be equal and a re-run against moved live queue state
+    // no longer reports a spurious 'verdict-conflict' for the same verdict.
+    expect(dayRecordA?.verdicts.S8?.digest).toBe(dayRecordB?.verdicts.S8?.digest);
+  });
+
+  it('answers unchanged when only the live queue grew between two S8 passes with the same verdict (live-sample counts excluded from the S8 digest)', async () => {
+    const fixture = cleanFixture(DAY);
+    const harness = makeHarness(fixture, NOW);
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    await useCase.execute(makeRequest());
+    const afterFirst = harness.evidence.stored;
+    const casCallsAfterFirst = harness.evidence.calls.cas;
+    const s1VerdictBefore = afterFirst?.days.find((entry) => entry.day === DAY)?.verdicts.S1;
+
+    // A later deadline: the two S8 samples' real (faked) 150s wall-clock
+    // gaps of two runs would otherwise cross this request's deadline.
+    fixture.shellState = {
+      ...fixture.shellState,
+      queue: { status: 'read', lines: [`7 ${HEAD_A} main`, `8 ${HEAD_B} main`] },
+    };
+    fixture.queueEntries.push({
+      entryId: ulid(3),
+      pullRequest: 8,
+      headOid: HEAD_B,
+      state: 'queued',
+      repository: REPOSITORY,
+      repoDigest: REPO_DIGEST,
+    } as unknown as MergeQueueEntryRecord);
+    fixture.importKeys.push({ pullRequest: 8, headOid: HEAD_B, base: 'main', source: 'queue', disposition: 'would-import' });
+
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+    expectRecorded(result);
+    expect(result.recorded.S8).toBe('pass');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toEqual({
+      verdict: 'pass',
+      reason: 'intake-equal',
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal'),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    // The idempotent re-run must not call compareAndSet again: doing so
+    // with `next` at the same revision as `expectedRevision` would be a
+    // malformed CAS request per ShadowEvidencePort's contract.
+    expect(harness.evidence.calls.cas).toBe(casCallsAfterFirst);
+    expect(harness.evidence.stored).toEqual(afterFirst);
+    // Queued entries are not merged PRs in S1's merge set, so S1's digest is unaffected.
+    expect(dayRecord?.verdicts.S1).toEqual(s1VerdictBefore);
+  });
+
+  it('refuses an S8 pass->fail verdict flip between runs with verdict-conflict and leaves the ledger untouched', async () => {
+    const fixture = cleanFixture(DAY);
+    const harness = makeHarness(fixture, NOW);
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    await useCase.execute(makeRequest());
+    const before = harness.evidence.stored;
+
+    // A shell live entry the fleet queue never sees, so S8 flips from
+    // 'pass'/'intake-equal' to 'fail'/'enqueue-coverage-divergence'.
+    fixture.shellState = {
+      ...fixture.shellState,
+      queue: { status: 'read', lines: [`7 ${HEAD_A} main`, `8 ${HEAD_B} main`] },
+    };
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'verdict-conflict' });
+    expect(harness.evidence.stored).toEqual(before);
+    expect(harness.evidence.stored?.revision).toBe(1);
   });
 
   it('two days with the same S12 pass/ticks-within-budget and different tick counts get different digests', async () => {
@@ -1036,16 +1143,7 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecord?.verdicts.S8).toEqual({
       verdict: 'pass',
       reason: 'intake-equal',
-      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
-        aFleetCount: 1,
-        aShellCount: 1,
-        aCompared: 1,
-        aDivergences: 0,
-        bFleetCount: 1,
-        bShellCount: 1,
-        bCompared: 1,
-        bDivergences: 0,
-      }),
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal'),
       recordedAtIso: RECORDED_AT_ISO,
     });
     expectNotImplementedUnevaluated(result.unevaluated);
@@ -1073,16 +1171,7 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecord?.verdicts.S8).toEqual({
       verdict: 'pass',
       reason: 'intake-equal',
-      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
-        aFleetCount: 1,
-        aShellCount: 1,
-        aCompared: 1,
-        aDivergences: 0,
-        bFleetCount: 1,
-        bShellCount: 1,
-        bCompared: 1,
-        bDivergences: 0,
-      }),
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal'),
       recordedAtIso: RECORDED_AT_ISO,
     });
     expectNotImplementedUnevaluated(result.unevaluated);
@@ -1115,16 +1204,7 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecord?.verdicts.S8).toEqual({
       verdict: 'pass',
       reason: 'intake-equal',
-      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
-        aFleetCount: 1,
-        aShellCount: 1,
-        aCompared: 1,
-        aDivergences: 0,
-        bFleetCount: 1,
-        bShellCount: 1,
-        bCompared: 1,
-        bDivergences: 0,
-      }),
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal'),
       recordedAtIso: RECORDED_AT_ISO,
     });
     expectNotImplementedUnevaluated(result.unevaluated);
@@ -1152,16 +1232,7 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecord?.verdicts.S8).toEqual({
       verdict: 'pass',
       reason: 'intake-equal',
-      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
-        aFleetCount: 1,
-        aShellCount: 1,
-        aCompared: 1,
-        aDivergences: 0,
-        bFleetCount: 1,
-        bShellCount: 1,
-        bCompared: 1,
-        bDivergences: 0,
-      }),
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal'),
       recordedAtIso: RECORDED_AT_ISO,
     });
     expectNotImplementedUnevaluated(result.unevaluated);

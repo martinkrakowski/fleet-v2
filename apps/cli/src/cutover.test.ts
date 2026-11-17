@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { CUTOVER_SHADOW_CRITERIA, buildMergeKey, type CutoverRecord } from '@fleet/work-execution';
+import {
+  CUTOVER_SHADOW_CRITERIA,
+  ShadowEvidenceAdapter,
+  buildMergeKey,
+  type CutoverRecord,
+  type ShadowLedger,
+} from '@fleet/work-execution';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from './composition.js';
 import { runCli, type CliIo } from './index.js';
@@ -499,6 +505,15 @@ describe('cutover switch reads the recorded shadow ledger (SH8b)', () => {
     expect(out).not.toContain(stateDir);
   }
 
+  /** Every relative name under the state directory, including a `.lock` or `quarantine` entry. */
+  function stateNames(): string[] {
+    return readdirSync(stateDir, { encoding: 'utf8', recursive: true }).sort();
+  }
+
+  function lockOrQuarantineNames(names: readonly string[]): string[] {
+    return names.filter((name) => name.endsWith('.lock') || name.split(/[/\\]/).includes('quarantine'));
+  }
+
   it('cutover switch in memory (no state directory) refuses shadow-evidence-absent', async () => {
     const result = await run(runtimeFor(undefined), switchArgv());
     expect(result.code).toBe(1);
@@ -692,6 +707,81 @@ describe('cutover switch reads the recorded shadow ledger (SH8b)', () => {
     const result = await runSwitch();
     expect(result.code).toBe(1);
     expect(result.json).toEqual({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
+    expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
+    expect(existsSync(join(stateDir, 'cutover.json'))).toBe(false);
+    expect(readFileSync(join(stateDir, 'cutover-shadow.json'), 'utf8')).toBe(bytes);
+    expect(result.out).not.toContain(stateDir);
+  });
+
+  it('cutover switch preflight over a corrupt ledger leaves the state directory listing and ledger bytes unchanged and the reader refuses every write', async () => {
+    const bytes = '{ not json';
+    writeFileSync(join(stateDir, 'cutover-shadow.json'), bytes);
+    // read() never locks or quarantines. readOnly is what refuses compareAndSet
+    // on the instance switch actually read, before any lock file is created.
+    const readers: ShadowEvidenceAdapter[] = [];
+    const originalRead = ShadowEvidenceAdapter.prototype.read;
+    const spy = vi.spyOn(ShadowEvidenceAdapter.prototype, 'read').mockImplementation(function (
+      this: ShadowEvidenceAdapter,
+      options?: { readonly deadlineIso?: string },
+    ) {
+      readers.push(this);
+      return originalRead.call(this, options);
+    });
+    try {
+      const runtime = runtimeFor();
+      const before = stateNames();
+      const result = await run(runtime, switchArgv());
+      expect(result.code).toBe(1);
+      expect(result.json).toEqual({ outcome: 'unknown', reason: 'shadow-evidence-unreadable' });
+      expect(stateNames()).toEqual(before);
+      expect(lockOrQuarantineNames(stateNames())).toEqual([]);
+      expect(readFileSync(join(stateDir, 'cutover-shadow.json'), 'utf8')).toBe(bytes);
+      expectNoCutoverWrites(result.out);
+
+      expect(readers.length).toBeGreaterThan(0);
+      for (const reader of readers) {
+        expect(
+          await reader.compareAndSet({
+            expectedRevision: 0,
+            next: ledgerWith() as unknown as ShadowLedger,
+          }),
+        ).toEqual({ outcome: 'refused', reason: 'read-only' });
+      }
+      expect(stateNames()).toEqual(before);
+      expect(lockOrQuarantineNames(stateNames())).toEqual([]);
+      expect(readFileSync(join(stateDir, 'cutover-shadow.json'), 'utf8')).toBe(bytes);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('cutover switch preflight over a valid ledger leaves no lock file', async () => {
+    const bytes = writeLedger(ledgerWith());
+    const runtime = runtimeFor();
+    const before = stateNames();
+    const result = await run(runtime, switchArgv());
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
+    expect(stateNames()).toEqual(before);
+    expect(lockOrQuarantineNames(stateNames())).toEqual([]);
+    expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
+    expect(readFileSync(join(stateDir, 'cutover-shadow.json'), 'utf8')).toBe(bytes);
+    expect(result.out).not.toContain(stateDir);
+  });
+
+  it('cutover switch when the daemon clock throws during the ledger read returns unknown shadow-evidence-unreadable and writes no journal', async () => {
+    const bytes = writeLedger(ledgerWith());
+    const runtime = createFleetCliRuntime({
+      stateDir,
+      daemonNow: () => {
+        throw new Error('daemon clock failed');
+      },
+    });
+    const before = stateNames();
+    const result = await run(runtime, switchArgv());
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'shadow-evidence-unreadable' });
+    expect(stateNames()).toEqual(before);
     expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
     expect(existsSync(join(stateDir, 'cutover.json'))).toBe(false);
     expect(readFileSync(join(stateDir, 'cutover-shadow.json'), 'utf8')).toBe(bytes);

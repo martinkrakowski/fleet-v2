@@ -504,6 +504,11 @@ function readBriefRequestFields(request: unknown): BriefRequestFields | null {
       return null;
     }
     const briefText = optional.briefText;
+    // Not a type predicate: a non-string is refused here, and a string still
+    // refuses on `.length > 65536` inside `briefTextIsRefused` before any byte count.
+    if (typeof briefText !== 'string') {
+      return null;
+    }
     if (briefTextIsRefused(briefText)) {
       return null;
     }

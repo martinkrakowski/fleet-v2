@@ -506,6 +506,14 @@ export interface WatchdogRepositoryReport {
   readonly healthy?: boolean;
   /** Present only for `outcome: 'blind' | 'refused'`. */
   readonly reasonCode?: string;
+  /** CO-WD9a: sentences the alert port spoke (0 when no alert is wired). */
+  readonly announced: number;
+  /** CO-WD9a: speak calls that failed; > 0 forces exit code 1. */
+  readonly announceFailures: number;
+  /** CO-WD9a: sentences the decision suppressed. */
+  readonly announceSuppressed: number;
+  /** CO-WD9a: sentences the budget left unspoken (best-effort; never changes exit code). */
+  readonly announceUnspoken: number;
 }
 
 /**
@@ -541,6 +549,10 @@ function refusedRepo(repoDigest: string): WatchdogRepositoryReport {
     raised: 0,
     cleared: 0,
     attentionFailures: 0,
+    announced: 0,
+    announceFailures: 0,
+    announceSuppressed: 0,
+    announceUnspoken: 0,
   };
 }
 
@@ -608,21 +620,29 @@ export function watchdogRepositoryReport(repoDigest: unknown, answer: unknown): 
     if (findings === null) {
       return refusedRepo(safeDigest);
     }
+    const announceFailures = nonNegInt(ownValue(answer, 'announceFailures'));
     const report: WatchdogRepositoryReport = {
       repoDigest: safeDigest,
       outcome,
-      // Exit 0 requires ALL of: evaluated, own exitCode 0, healthy true, zero findings.
+      // Exit 0 requires ALL of: evaluated, own exitCode 0, healthy true, zero
+      // findings and zero announce failures (a failure to speak is a failure
+      // to alert; it must never be reported as healthy).
       exitCode:
         outcome === 'evaluated' &&
         ownValue(answer, 'exitCode') === 0 &&
         ownValue(answer, 'healthy') === true &&
-        findings.length === 0
+        findings.length === 0 &&
+        announceFailures === 0
           ? 0
           : 1,
       findings,
       raised: nonNegInt(ownValue(answer, 'raised')),
       cleared: nonNegInt(ownValue(answer, 'cleared')),
       attentionFailures: nonNegInt(ownValue(answer, 'attentionFailures')),
+      announced: nonNegInt(ownValue(answer, 'announced')),
+      announceFailures,
+      announceSuppressed: nonNegInt(ownValue(answer, 'announceSuppressed')),
+      announceUnspoken: nonNegInt(ownValue(answer, 'announceUnspoken')),
     };
     if (outcome === 'evaluated') {
       return { ...report, healthy: ownValue(answer, 'healthy') === true };
@@ -688,17 +708,28 @@ async function runWatchdog(
       .catch(() => null);
     repositories.push(watchdogRepositoryReport(ref.repoDigest, answer));
   }
-  const exitCode = repositories.some((r) => r.exitCode === 1) ? 1 : 0;
+  // CO-WD9a: the alert mode is composition state; an invalid mode never masks
+  // the passes above (they always run) but must never read as healthy.
+  const audibleAlert = runtime.daemon.audibleAlertMode;
+  const alertInvalid = audibleAlert === 'invalid';
+  const exitCode = alertInvalid || repositories.some((r) => r.exitCode === 1) ? 1 : 0;
 
   if (parsed.json) {
     io.stdout(
-      `${JSON.stringify({ outcome: 'completed', exitCode, repositoryCount: repositories.length, repositories })}\n`,
+      `${JSON.stringify({
+        outcome: 'completed',
+        exitCode,
+        ...(alertInvalid ? { reasonCode: 'audible-alert-invalid' } : {}),
+        repositoryCount: repositories.length,
+        repositories,
+        audibleAlert,
+      })}\n`,
     );
     return exitCode;
   }
-  let text = '';
+  let text = `watchdog audible-alert=${audibleAlert}\n`;
   for (const r of repositories) {
-    text += `watchdog ${r.repoDigest} ${watchdogVerdict(r)} findings=${r.findings.length} raised=${r.raised} cleared=${r.cleared}\n`;
+    text += `watchdog ${r.repoDigest} ${watchdogVerdict(r)} findings=${r.findings.length} raised=${r.raised} cleared=${r.cleared} announced=${r.announced}\n`;
     for (const finding of r.findings) {
       text += `finding ${finding.key}\n`;
     }

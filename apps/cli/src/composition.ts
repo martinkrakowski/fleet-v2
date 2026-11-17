@@ -149,6 +149,7 @@ import {
   type TelemetryDispositionAdapter,
   type TelemetryResourceInput,
   type RunTelemetryMarkPort,
+  type HostAudibleAlertPort,
 } from '@fleet/work-execution';
 
 import {
@@ -260,6 +261,8 @@ export interface FleetCliRuntimeOptions {
   readonly daemonNow?: () => string;
   /** The daemon wake-settle sleep (tests only); production waits with a timer. */
   readonly daemonSleep?: (ms: number) => Promise<void>;
+  /** The host audible alert (tests only); production resolves it from FLEET_AUDIBLE_ALERT. */
+  readonly daemonAudibleAlert?: Pick<HostAudibleAlertPort, 'speak'>;
   /** Agent, model and variant handed to the live runner subprocess. */
   readonly runnerAgent?: string;
   readonly runnerModel?: string;

@@ -2,8 +2,9 @@
 // health) shadow-criterion evaluators, pure over one UTC day's worth of
 // already-collected facts. Pure: no filesystem, no subprocess, no clock.
 // Never throws, never echoes an input value; every exported function takes
-// `unknown` at its boundary and returns a typed `ShadowCriterionEvaluation`
-// whose refusal carries a named reason code. S12 returns
+// `unknown` at its boundary and returns a typed evaluation whose refusal
+// carries a named reason code. S9 returns `ShadowStateIntegrityEvaluation`,
+// adding the eight state-integrity counts. S12 returns
 // `ShadowTickHealthEvaluation`, adding `totalTicks`, `budgetOverruns` and
 // `starvedJobs`.
 
@@ -456,38 +457,85 @@ function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyT
 
 
 /**
+ * S9's evaluation: the shared verdict plus the day's state-integrity counts.
+ * `stateChecked` and `stateBad` come from the state-check sample. The other
+ * six count distinct journal keys and how many of those keys show each
+ * anomaly. An early `unknown` refusal carries zeros. `state-check-failed`
+ * carries the state-check counts and zeros for the six journal counts. A
+ * journal verdict carries all eight, including anomalies that were not the
+ * first failure — `reason` stays the first failing tally in map order.
+ */
+export type ShadowStateIntegrityEvaluation = ShadowCriterionEvaluation & {
+  readonly stateChecked: number;
+  readonly stateBad: number;
+  readonly journalKeys: number;
+  readonly duplicateIntents: number;
+  readonly duplicateResults: number;
+  readonly resultsAfterFinal: number;
+  readonly orphanResults: number;
+  readonly unreconciledIntents: number;
+};
+
+/** The eight S9 counts. Early refusals share this frozen zero value. */
+type StateIntegrityCounts = Omit<ShadowStateIntegrityEvaluation, 'status' | 'reason'>;
+
+const ZERO_STATE_COUNTS: StateIntegrityCounts = Object.freeze({
+  stateChecked: 0,
+  stateBad: 0,
+  journalKeys: 0,
+  duplicateIntents: 0,
+  duplicateResults: 0,
+  resultsAfterFinal: 0,
+  orphanResults: 0,
+  unreconciledIntents: 0,
+});
+
+/**
+ * A fresh, frozen evaluation built from a status, a reason and the eight
+ * counts — never a shared object, so a caller mutating one returned
+ * evaluation cannot corrupt another call's result.
+ */
+function stateIntegrityResult(
+  status: ShadowCriterionEvaluation['status'],
+  reason: string,
+  counts: StateIntegrityCounts,
+): ShadowStateIntegrityEvaluation {
+  return Object.freeze({ status, reason, ...counts });
+}
+
+/**
  * S9, conductor state integrity, over `{ stateCheck, journal, sampledAtIso }`.
  * `journal` must be supplied in true append order — the order
  * `listForRun`/`listForKey`/`listForKeyPrefix` return it, never re-sorted by
  * `recordedAtIso` — since an entry's position in that array, not its
  * timestamp, is the authority for any ordering check below (two entries can
- * share one timestamp). Cost: linear in the capped input — at most
- * `SHADOW_MAX_HEALTH_ITEMS` journal entries are walked, and an oversized,
- * sparse or non-dense `journal` array is refused from its own `length`
- * before any entry is traversed. Every value is read through its own
- * property descriptor, so no getter ever runs and a Proxy stand-in either is
- * refused or yields exactly the plain data's verdict. Never throws, never
- * echoes the input.
+ * share one timestamp). Cost: linear in the capped input
+ * (`SHADOW_MAX_HEALTH_ITEMS`): at most that many journal entries are walked,
+ * and an oversized, sparse or non-dense `journal` is refused from its own
+ * `length` descriptor before any entry is traversed. Every value is read
+ * through its own property descriptor, so no getter ever runs and a Proxy
+ * stand-in either is refused or yields exactly the plain data's verdict.
+ * Never throws, never echoes the input.
  */
-export function evaluateShadowStateIntegrity(input: unknown): ShadowCriterionEvaluation {
+export function evaluateShadowStateIntegrity(input: unknown): ShadowStateIntegrityEvaluation {
   try {
     return judgeDayStateIntegrity(input);
   } catch {
     // Same revoked-Proxy / throwing-trap case as the tick evaluator above.
-    return UNKNOWN('invalid-input');
+    return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
   }
 }
 
-function judgeDayStateIntegrity(input: unknown): ShadowCriterionEvaluation {
+function judgeDayStateIntegrity(input: unknown): ShadowStateIntegrityEvaluation {
   const snapshot = readExactPlainRecord(input, ['stateCheck', 'journal', 'sampledAtIso']);
   if (snapshot === null) {
-    return UNKNOWN('invalid-input');
+    return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
   }
   let stateCheck: { checked?: unknown; bad?: unknown } | null = null;
   if (snapshot.stateCheck !== null) {
     const stateCheckSnapshot = readExactPlainRecord(snapshot.stateCheck, ['checked', 'bad']);
     if (stateCheckSnapshot === null) {
-      return UNKNOWN('invalid-input');
+      return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
     }
     // Read the validated snapshot below, never the raw `snapshot.stateCheck`
     // input again: that input may carry an enumerable getter or be a Proxy
@@ -499,17 +547,21 @@ function judgeDayStateIntegrity(input: unknown): ShadowCriterionEvaluation {
     stateCheck = stateCheckSnapshot as { checked?: unknown; bad?: unknown };
   }
   if (stateCheck === null || stateCheck.checked === 0) {
-    return UNKNOWN('state-check-unavailable');
+    return stateIntegrityResult('unknown', 'state-check-unavailable', ZERO_STATE_COUNTS);
   }
   if (!isCount(stateCheck.checked) || !isCount(stateCheck.bad)) {
-    return UNKNOWN('invalid-input');
+    return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
   }
   if (stateCheck.bad > 0) {
-    return FAIL('state-check-failed');
+    return stateIntegrityResult('fail', 'state-check-failed', {
+      ...ZERO_STATE_COUNTS,
+      stateChecked: stateCheck.checked,
+      stateBad: stateCheck.bad,
+    });
   }
   const journal = readBoundedArray(snapshot.journal, SHADOW_MAX_HEALTH_ITEMS);
   if (journal === null) {
-    return UNKNOWN('invalid-input');
+    return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
   }
   const entries: SampledJournalEntry[] = [];
   // `journal.length` below is the length `readBoundedArray` already read
@@ -518,14 +570,19 @@ function judgeDayStateIntegrity(input: unknown): ShadowCriterionEvaluation {
   for (let index = 0; index < journal.length; index += 1) {
     const entry = readSampledEntry(ownElement(journal.array, index), index);
     if (entry === null) {
-      return UNKNOWN('invalid-input');
+      return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
     }
     entries.push(entry);
   }
   if (typeof snapshot.sampledAtIso !== 'string' || !isZonedIsoDateTime(snapshot.sampledAtIso)) {
-    return UNKNOWN('invalid-input');
+    return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
   }
-  return judgeJournalIntegrity(entries, new Date(snapshot.sampledAtIso).toISOString());
+  return judgeJournalIntegrity(
+    entries,
+    new Date(snapshot.sampledAtIso).toISOString(),
+    stateCheck.checked,
+    stateCheck.bad,
+  );
 }
 
 /** A non-negative safe integer count. */
@@ -550,64 +607,237 @@ function isControlKeyKind(key: string): boolean {
   return kind === 'stop' || kind === 'resume' || kind === 'request' || kind === 'reaper';
 }
 
-/** The S9 journal rules, over already-validated entries. */
-function judgeJournalIntegrity(entries: readonly SampledJournalEntry[], sampledAtIso: string): ShadowCriterionEvaluation {
-  const tallies = tallyJournal(entries);
+/** A key recorded more than one intent. */
+function isDuplicateIntent(tally: KeyTally): boolean {
+  return tally.intents > 1;
+}
+
+/** A key recorded more than one closing result. */
+function isDuplicateResult(tally: KeyTally): boolean {
+  return tally.finalResults > 1;
+}
+
+/**
+ * Once a key has a closing ("final") result, the real journal store
+ * refuses to append anything further for that key at write time
+ * (lane-run-journal.ts's `resultRefusal`/`isClosedByFinalResult`, reason
+ * `result-after-final`). That refusal is decided from APPEND ORDER, not
+ * from `recordedAtIso` — two entries can share one timestamp — so this
+ * compares `position`, not timestamps: a result of any outcome recorded
+ * at a later position than the key's earliest closing result represents
+ * that otherwise-impossible state, distinct from two closing results
+ * (`isDuplicateResult`).
+ */
+function isResultAfterFinal(tally: KeyTally): boolean {
+  const finalResultPosition = tally.finalResultPosition;
+  const latestResultPosition = tally.latestResultPosition;
+  return (
+    finalResultPosition !== null &&
+    latestResultPosition !== null &&
+    latestResultPosition > finalResultPosition
+  );
+}
+
+/**
+ * A result's earliest position is before the key's intent. Both sides are
+ * aggregates over the whole key, so the answer does not depend on the order
+ * the entries are walked.
+ */
+function resultPredatesIntent(tally: KeyTally): boolean {
+  const intentPosition = tally.intentPosition;
+  const earliestResultPosition = tally.earliestResultPosition;
+  return (
+    intentPosition !== null &&
+    earliestResultPosition !== null &&
+    earliestResultPosition < intentPosition
+  );
+}
+
+/**
+ * A result with no intent at all, or one appended before the key's intent,
+ * breaks the journal contract's required order: the real store's
+ * `resultRefusal` only ever finds an intent among entries already appended
+ * (earlier position) than the result being appended.
+ */
+function isOrphanResult(tally: KeyTally): boolean {
+  if (!tally.hasResult) {
+    return false;
+  }
+  if (tally.intents === 0) {
+    return true;
+  }
+  return resultPredatesIntent(tally);
+}
+
+/**
+ * This tally's first sequence anomaly, in the check order S9 has always
+ * used: duplicate-intent, then duplicate-result, then result-after-final,
+ * then orphan-result. Null when this tally has none of them.
+ */
+function tallySequenceReason(
+  duplicateIntents: number,
+  duplicateResults: number,
+  resultsAfterFinal: number,
+  orphanResults: number,
+): string | null {
+  if (duplicateIntents > 0) {
+    return 'journal-duplicate-intent';
+  }
+  if (duplicateResults > 0) {
+    return 'journal-duplicate-result';
+  }
+  if (resultsAfterFinal > 0) {
+    return 'journal-result-after-final';
+  }
+  if (orphanResults > 0) {
+    return 'journal-orphan-result';
+  }
+  return null;
+}
+
+/**
+ * The first failing reason wins. A candidate is recorded only while none
+ * has been; a null candidate never replaces a reason and never invents one.
+ */
+function adoptFirstReason(reason: string | null, candidate: string | null): string | null {
+  if (reason === null) {
+    return candidate;
+  }
+  return reason;
+}
+
+/** One key's four sequence anomalies, or those same fields summed across the map. */
+interface SequenceAnomalyCounts {
+  readonly duplicateIntents: number;
+  readonly duplicateResults: number;
+  readonly resultsAfterFinal: number;
+  readonly orphanResults: number;
+  readonly reason: string | null;
+}
+
+/** The 0/1 contribution of one tally, with that tally's own first sequence reason. */
+function sequenceAnomalyStep(tally: KeyTally): SequenceAnomalyCounts {
+  const duplicateIntents = isDuplicateIntent(tally) ? 1 : 0;
+  const duplicateResults = isDuplicateResult(tally) ? 1 : 0;
+  const resultsAfterFinal = isResultAfterFinal(tally) ? 1 : 0;
+  const orphanResults = isOrphanResult(tally) ? 1 : 0;
+  return {
+    duplicateIntents,
+    duplicateResults,
+    resultsAfterFinal,
+    orphanResults,
+    reason: tallySequenceReason(duplicateIntents, duplicateResults, resultsAfterFinal, orphanResults),
+  };
+}
+
+/**
+ * Loop 1, over `tallies.values()` (map insertion order). Every sequence
+ * predicate is counted on every key. `reason` is the first failing tally's
+ * first anomaly in the check order above.
+ */
+function countJournalSequenceAnomalies(tallies: ReadonlyMap<string, KeyTally>): SequenceAnomalyCounts {
+  let duplicateIntents = 0;
+  let duplicateResults = 0;
+  let resultsAfterFinal = 0;
+  let orphanResults = 0;
+  let reason: string | null = null;
   for (const tally of tallies.values()) {
-    if (tally.intents > 1) {
-      return FAIL('journal-duplicate-intent');
-    }
-    if (tally.finalResults > 1) {
-      return FAIL('journal-duplicate-result');
-    }
-    // Once a key has a closing ("final") result, the real journal store
-    // refuses to append anything further for that key at write time
-    // (lane-run-journal.ts's `resultRefusal`/`isClosedByFinalResult`, reason
-    // `result-after-final`). That refusal is decided from APPEND ORDER, not
-    // from `recordedAtIso` — two entries can share one timestamp — so this
-    // compares `position`, not timestamps: a result of any outcome recorded
-    // at a later position than the key's earliest closing result represents
-    // that otherwise-impossible state, distinct from two closing results
-    // (`journal-duplicate-result` above).
-    if (
-      tally.finalResultPosition !== null &&
-      tally.latestResultPosition !== null &&
-      tally.latestResultPosition > tally.finalResultPosition
-    ) {
-      return FAIL('journal-result-after-final');
-    }
-    // A result with no intent at all, or one appended before the key's
-    // intent, breaks the journal contract's required order: the real store's
-    // `resultRefusal` only ever finds an intent among entries already
-    // appended (earlier position) than the result being appended. Both sides
-    // of this comparison are aggregates over the whole key (a count and a
-    // minimum position), so the verdict is the same no matter what order
-    // this function itself happens to walk the entries in.
-    const resultPredatesIntent = tally.intentPosition !== null && tally.earliestResultPosition !== null
-      && tally.earliestResultPosition < tally.intentPosition;
-    if (tally.hasResult && (tally.intents === 0 || resultPredatesIntent)) {
-      return FAIL('journal-orphan-result');
-    }
+    const step = sequenceAnomalyStep(tally);
+    duplicateIntents += step.duplicateIntents;
+    duplicateResults += step.duplicateResults;
+    resultsAfterFinal += step.resultsAfterFinal;
+    orphanResults += step.orphanResults;
+    reason = adoptFirstReason(reason, step.reason);
   }
+  return { duplicateIntents, duplicateResults, resultsAfterFinal, orphanResults, reason };
+}
+
+/** The sample was taken more than `SHADOW_OPEN_INTENT_GRACE_MS` after the intent. */
+function isPastOpenIntentGrace(sampledAtIso: string, intentIso: string): boolean {
+  return new Date(sampledAtIso).getTime() - new Date(intentIso).getTime() > SHADOW_OPEN_INTENT_GRACE_MS;
+}
+
+/**
+ * Whether this key is an open intent older than the grace window.
+ * Control-kind keys (stop, resume, request, reaper) are exempt: see
+ * `isControlKeyKind`. This also covers a request-channel key whose only
+ * result is `not-started` — that result does not close the key
+ * (`isFinalResultEntry`, matching the real writer's `isClosedByFinalResult`),
+ * so `finalResults` stays 0 there too, and without this exemption it would
+ * otherwise still reach the grace check. The grace period is wall-clock,
+ * not append order: how long the sample was taken after the intent's own
+ * timestamp.
+ */
+function isUnreconciledOpenIntent(key: string, tally: KeyTally, sampledAtIso: string): boolean {
+  const intentIso = tally.intentIso;
+  if (tally.intents === 0 || tally.finalResults > 0 || intentIso === null) {
+    return false;
+  }
+  if (isControlKeyKind(key)) {
+    return false;
+  }
+  return isPastOpenIntentGrace(sampledAtIso, intentIso);
+}
+
+/** Loop 2's total. `unreconciled-intent` is recorded only while `reasonSoFar` is still null. */
+interface UnreconciledIntentAnomalies {
+  readonly unreconciledIntents: number;
+  readonly reason: string | null;
+}
+
+/**
+ * Loop 2, over `tallies.entries()` (the same map order as loop 1). It still
+ * runs when loop 1 already chose the reason, so every over-grace open intent
+ * is counted; the reason changes only while it is still null.
+ */
+function countUnreconciledIntents(
+  tallies: ReadonlyMap<string, KeyTally>,
+  sampledAtIso: string,
+  reasonSoFar: string | null,
+): UnreconciledIntentAnomalies {
+  let unreconciledIntents = 0;
+  let reason = reasonSoFar;
   for (const [key, tally] of tallies.entries()) {
-    if (tally.intents === 0 || tally.finalResults > 0 || tally.intentIso === null) {
-      continue;
-    }
-    // Control-kind keys (stop, resume, request, reaper) are exempt: see
-    // `isControlKeyKind` above. This also covers a request-channel key whose
-    // only result is `not-started` — that result does not close the key
-    // (`isFinalResultEntry` above, matching the real writer's
-    // `isClosedByFinalResult`), so `finalResults` stays 0 there too, and
-    // without this exemption it would otherwise still reach the grace check
-    // below.
-    if (isControlKeyKind(key)) {
-      continue;
-    }
-    // The open-intent grace period is genuinely wall-clock, not append
-    // order: how long the sample was taken after the intent's own timestamp.
-    if (new Date(sampledAtIso).getTime() - new Date(tally.intentIso).getTime() > SHADOW_OPEN_INTENT_GRACE_MS) {
-      return FAIL('unreconciled-intent');
+    if (isUnreconciledOpenIntent(key, tally, sampledAtIso)) {
+      unreconciledIntents += 1;
+      reason = adoptFirstReason(reason, 'unreconciled-intent');
     }
   }
-  return PASS('state-consistent');
+  return { unreconciledIntents, reason };
+}
+
+/**
+ * The S9 journal rules, over already-validated entries. Every anomaly predicate
+ * is counted on every key. `reason` stays the first failure in map order, with
+ * the per-tally check order unchanged: loop 1 (over `tallies.values()`) is
+ * duplicate-intent, then duplicate-result, then result-after-final, then
+ * orphan-result; loop 2 (over `tallies.entries()`) supplies `unreconciled-intent`
+ * only when loop 1 found nothing. Loop 2 still counts every over-grace open
+ * intent when loop 1 already chose the reason. The loops are
+ * `countJournalSequenceAnomalies` and `countUnreconciledIntents`, so each
+ * function stays under Sonar's cognitive-complexity limit of 15.
+ */
+function judgeJournalIntegrity(
+  entries: readonly SampledJournalEntry[],
+  sampledAtIso: string,
+  stateChecked: number,
+  stateBad: number,
+): ShadowStateIntegrityEvaluation {
+  const tallies = tallyJournal(entries);
+  const sequence = countJournalSequenceAnomalies(tallies);
+  const unreconciled = countUnreconciledIntents(tallies, sampledAtIso, sequence.reason);
+  const counts: StateIntegrityCounts = {
+    stateChecked,
+    stateBad,
+    journalKeys: tallies.size,
+    duplicateIntents: sequence.duplicateIntents,
+    duplicateResults: sequence.duplicateResults,
+    resultsAfterFinal: sequence.resultsAfterFinal,
+    orphanResults: sequence.orphanResults,
+    unreconciledIntents: unreconciled.unreconciledIntents,
+  };
+  if (unreconciled.reason !== null) {
+    return stateIntegrityResult('fail', unreconciled.reason, counts);
+  }
+  return stateIntegrityResult('pass', 'state-consistent', counts);
 }

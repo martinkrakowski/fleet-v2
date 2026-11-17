@@ -320,12 +320,21 @@ describe('shadow day intake (S8)', () => {
   });
 
   it('a non-main base in importPresent is tolerated shape-wise and compared on its own merit', () => {
+    // The key is well-formed ('chain/a' parses as a declared base branch), so
+    // it is never rejected as samples-invalid: that is the "tolerated
+    // shape-wise" half. But comparison B restricts the shell side to
+    // main-based entries only (a chain-base entry can never be imported), so
+    // an importPresent entry whose own base is 'chain/a' can never match
+    // anything there: it is compared on its own merit (its full identity,
+    // base included) rather than silently matched against the shell's
+    // same-pullRequest main entry. The divergence is identical in both
+    // samples, so it is persistent and fails as import-divergence.
     const shellLive = [key(1)];
     const input = twoSamples(
-      { shellLive, fleetLive: [key(1)], importPresent: [key(1, HEAD, 'main')] },
-      { shellLive, fleetLive: [key(1)], importPresent: [key(1, HEAD, 'main')] },
+      { shellLive, fleetLive: [key(1)], importPresent: [key(1, HEAD, 'chain/a')] },
+      { shellLive, fleetLive: [key(1)], importPresent: [key(1, HEAD, 'chain/a')] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'pass', reason: 'intake-equal' });
+    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'import-divergence' });
   });
 
   it('a sample with extra keys is samples-invalid', () => {

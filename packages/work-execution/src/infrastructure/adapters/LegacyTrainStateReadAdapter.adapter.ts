@@ -1,5 +1,5 @@
 // Lane CO5: read-only reader for the legacy shell merge-train state directory.
-import { promises as fs, constants as fsConstants, type Dirent } from 'node:fs';
+import { promises as fs, constants as fsConstants, type Dirent, type Stats } from 'node:fs';
 import { join } from 'node:path';
 
 import type {
@@ -87,7 +87,7 @@ export class LegacyTrainStateReadAdapter implements LegacyTrainStateReadPort {
       this.readChains(this.chainsDirName, options.stateDir),
       this.readSourceFile(this.batchFileName, options.stateDir),
       this.readSourceFile(this.inprogressFileName, options.stateDir),
-      this.readSourceFile('enabled', join(options.stateDir, this.batchesDirName)),
+      this.readBatchesEnabled(options.stateDir),
     ]);
     return Object.freeze({ queue, parked, chains, batch, inprogress, batchesEnabled });
   }
@@ -128,6 +128,34 @@ export class LegacyTrainStateReadAdapter implements LegacyTrainStateReadPort {
     } finally {
       await handle.close().catch(() => undefined);
     }
+  }
+
+  /**
+   * Read `batches/enabled`, but refuse it the same way an unreadable file is
+   * refused today when the `batches` directory COMPONENT itself is not a real
+   * directory. `readSourceFile`'s O_NOFOLLOW only protects the final path
+   * component (`enabled`): if `batchesDirName` is itself a symlink out of
+   * stateDir, the open still traverses it to reach whatever `enabled` sits at
+   * the far end. lstat (never follows) inspects that intermediate component on
+   * its own, before any descent into it, matching how `pathCrossesSymbolicLink`
+   * elsewhere in this package inspects a path's own components rather than
+   * trusting a single leaf-only check.
+   */
+  private async readBatchesEnabled(stateDir: string): Promise<LegacyTrainFileRead> {
+    const batchesDir = join(stateDir, this.batchesDirName);
+    let batchesDirStat: Stats;
+    try {
+      batchesDirStat = await fs.lstat(batchesDir);
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') {
+        return { status: 'absent' };
+      }
+      return { status: 'unreadable' };
+    }
+    if (!batchesDirStat.isDirectory()) {
+      return { status: 'unreadable' };
+    }
+    return this.readSourceFile('enabled', batchesDir);
   }
 
   /**

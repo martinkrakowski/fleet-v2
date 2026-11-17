@@ -228,6 +228,28 @@ describe('LegacyTrainStateReadAdapter', () => {
       expect(result.batchesEnabled).toEqual({ status: 'unreadable' });
       expect(JSON.stringify(result)).not.toContain('outside-secret');
     });
+
+    it('reports unreadable instead of following a batches directory that is itself a symlink out of stateDir', async () => {
+      const dir = await makeTempDir();
+      const realBatchesHome = await makeTempDir();
+      const realBatchesDir = join(realBatchesHome, 'real-batches');
+      await fs.mkdir(realBatchesDir);
+      const enabledLines = ['escaped-1', 'escaped-2'];
+      await fs.writeFile(join(realBatchesDir, 'enabled'), `${enabledLines.join('\n')}\n`);
+
+      // stateDir/batches is a symlink to a real directory elsewhere that
+      // itself holds a perfectly normal `enabled` file. Before the fix the
+      // existing per-leaf-file O_NOFOLLOW open still traversed this
+      // intermediate symlinked directory component and would have returned
+      // the escaped content below.
+      await fs.symlink(realBatchesDir, join(dir, 'batches'));
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+      expect(result.batchesEnabled).toEqual({ status: 'unreadable' });
+      expect(JSON.stringify(result)).not.toContain('escaped-1');
+      expect(JSON.stringify(result)).not.toContain('escaped-2');
+    });
   });
 
   describe('events log', () => {

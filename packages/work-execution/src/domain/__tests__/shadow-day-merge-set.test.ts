@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildMergeKey } from '../lane-run-keys.js';
+import { buildMergeKey, type MergeKeyOneWayAction } from '../lane-run-keys.js';
 import { evaluateShadowMergeSet, SHADOW_DAY_BOUNDARY_GRACE_MS } from '../shadow-day-merge-set.js';
 
 const DAY = '2026-11-10';
@@ -15,8 +15,8 @@ function inDayIso(minutes: number, second = 0): string {
   return `${DAY}T${hour}:${minute}:${String(second).padStart(2, '0')}.000Z`;
 }
 
-function mergeKey(digest: string, pullRequest: number, head12: string): string {
-  const built = buildMergeKey({ repoDigest: digest, pullRequest, head12, action: 'merge-pr', attemptOrdinal: null, retry: null });
+function mergeKey(digest: string, pullRequest: number, head12: string, action: MergeKeyOneWayAction = 'merge-pr'): string {
+  const built = buildMergeKey({ repoDigest: digest, pullRequest, head12, action, attemptOrdinal: null, retry: null });
   if (!built.ok) {
     throw new Error('fixture key refused');
   }
@@ -144,7 +144,7 @@ describe('evaluateShadowMergeSet (S1)', () => {
   it('fails live-action-in-shadow for a live update-branch result even when the sets also diverge', () => {
     const input = dayInput({
       fleet: {
-        results: [fleetResult({ key: mergeKey(DIGEST, 7, 'aaaaaaaaaaaa'), reasonCode: 'would-update-branch' }), fleetResult({ outcome: 'merged', key: mergeKey(DIGEST, 9, 'bbbbbbbbbbbb') })],
+        results: [fleetResult({ key: mergeKey(DIGEST, 9, 'bbbbbbbbbbbb', 'update-branch'), outcome: 'merged', reasonCode: 'would-update-branch' })],
         entries: [fleetEntry()],
       },
     });

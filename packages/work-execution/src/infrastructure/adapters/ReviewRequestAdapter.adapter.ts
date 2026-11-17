@@ -28,12 +28,17 @@ import {
   type ReviewUnavailableCode,
   type ReviewUnknownReason,
   assessmentIdForAttempt,
+  assessmentIdForBrief,
   assessmentIdForChain,
+  attemptIdForBrief,
   attemptIdForChain,
   isAttemptReceiptSubject,
   isReceiptAboutAssessment,
+  isValidBriefPackageDigest,
+  isValidBriefProjectId,
   receiptSubjectOf,
 } from '@fleet/evidence-and-acceptance';
+import { containsSecretShape } from '@fleet/shared';
 import type {
   FindLatestReceiptOfKindRequest,
   FindLatestReceiptOfKindResult,
@@ -74,18 +79,39 @@ const HEAD_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
 const BRIEF_TEXT_MAX_BYTES = 64 * 1024;
 const DIFF_SUMMARY_MAX_BYTES = 2048;
+/**
+ * Cost bound for a brief receipt scan. One operation reads the array's own
+ * `length` data descriptor once into a local, refuses a longer list, and
+ * every loop in that operation uses the local. The next operation reads
+ * `length` again. A longer list is unreadable and is not iterated.
+ */
+const MAX_BRIEF_RECEIPTS_READ = 256;
+/**
+ * Cost bound for findings on a brief receipt. One operation reads the array's
+ * own `length` data descriptor once into a local and refuses a longer list
+ * as a mismatch. Density and the copy use that same local. The next operation
+ * reads `length` again.
+ */
+const MAX_BRIEF_FINDINGS_READ = 1024;
 
-/** A chain subject, validated: the only subject kind besides the attempt that this adapter serves. */
+/** A chain subject, validated. */
 interface ChainSubject {
   readonly projectId: string;
   readonly chainName: string;
   readonly integrationHeadSha: string;
 }
 
+/** A brief subject, validated: one frozen brief package at its base commit. */
+interface BriefSubject {
+  readonly projectId: string;
+  readonly briefPackageDigest: string;
+  readonly baseCommit: string;
+}
+
 type SubjectRead =
   | { readonly kind: 'absent' }
   | { readonly kind: 'chain'; readonly chain: ChainSubject }
-  | { readonly kind: 'brief' }
+  | { readonly kind: 'brief'; readonly brief: BriefSubject }
   | { readonly kind: 'invalid' };
 
 /** A data property of `value`; a getter is never invoked. */
@@ -121,12 +147,93 @@ function ownProperty(value: unknown, key: string): { readonly value: unknown } |
 }
 
 /**
+ * A brief subject, read only through `ownProperty`. An accessor, a throwing
+ * descriptor or a proxy trap is `invalid` and the getter never runs. Cost: a
+ * fixed set of keys (no loop over caller-supplied names). `projectId` is at
+ * most 200 characters before any per-character or secret scan, and the digest
+ * and head are fixed-length patterns. When `requireRequestProjectId` is set
+ * (a review request, not a find), the request's own `projectId` — read by
+ * `ownProperty` — must be a data property whose value is exactly the subject's
+ * id. Absent (`undefined`), an accessor or a failing descriptor (`'unreadable'`),
+ * or a `.value` that is not that string is invalid. A find still treats an
+ * absent id as no disagreement, and an unreadable id as invalid. Never throws.
+ */
+function readBriefSubject(
+  request: unknown,
+  subject: unknown,
+  sameProject: boolean,
+  requireRequestProjectId: boolean,
+): SubjectRead {
+  try {
+    const projectRead = ownProperty(subject, 'projectId');
+    const digestRead = ownProperty(subject, 'briefPackageDigest');
+    const baseRead = ownProperty(subject, 'baseCommit');
+    const chainNameRead = ownProperty(subject, 'chainName');
+    const integrationRead = ownProperty(subject, 'integrationHeadSha');
+    const attemptRead = ownProperty(request, 'attemptId');
+    const headRead = ownProperty(request, 'candidateHeadSha');
+    const requestProjectRead = ownProperty(request, 'projectId');
+    // Chain fields must be absent. An own property, including an accessor, is present.
+    if (
+      projectRead === undefined || projectRead === 'unreadable' ||
+      digestRead === undefined || digestRead === 'unreadable' ||
+      baseRead === undefined || baseRead === 'unreadable' ||
+      chainNameRead !== undefined || integrationRead !== undefined ||
+      attemptRead === undefined || attemptRead === 'unreadable' ||
+      headRead === undefined || headRead === 'unreadable'
+    ) {
+      return { kind: 'invalid' };
+    }
+    const projectId = projectRead.value;
+    const briefPackageDigest = digestRead.value;
+    const baseCommit = baseRead.value;
+    if (typeof projectId !== 'string' || !isValidBriefProjectId(projectId) || containsSecretShape(projectId)) {
+      return { kind: 'invalid' };
+    }
+    // `ownProperty` returns undefined when absent, 'unreadable' for an accessor
+    // or a failing descriptor, and { value } for a data property. A review
+    // request must name this project itself. A find carries no project id, so
+    // only that path still treats an absent id as "no disagreement".
+    if (requireRequestProjectId) {
+      if (
+        requestProjectRead === undefined ||
+        requestProjectRead === 'unreadable' ||
+        typeof requestProjectRead.value !== 'string' ||
+        requestProjectRead.value !== projectId
+      ) {
+        return { kind: 'invalid' };
+      }
+    } else if (requestProjectRead === 'unreadable' || !sameProject) {
+      return { kind: 'invalid' };
+    }
+    if (!isValidBriefPackageDigest(briefPackageDigest)) {
+      return { kind: 'invalid' };
+    }
+    if (typeof baseCommit !== 'string' || !HEAD_PATTERN.test(baseCommit) || baseCommit !== headRead.value) {
+      return { kind: 'invalid' };
+    }
+    if (attemptRead.value !== attemptIdForBrief(projectId, briefPackageDigest)) {
+      return { kind: 'invalid' };
+    }
+    return { kind: 'brief', brief: { projectId, briefPackageDigest, baseCommit } };
+  } catch {
+    return { kind: 'invalid' };
+  }
+}
+
+/**
  * The request's subject, read through own properties. An explicit attempt
  * subject must restate the request's own attempt, project and head; it then
- * reads as `absent` (the attempt path). `invalid` is a malformed subject or one
+ * reads as `absent` (the attempt path). A brief subject is read with
+ * `ownProperty` only (an accessor, a throwing descriptor or a proxy trap is
+ * `invalid` and the getter never runs). `invalid` is a malformed subject or one
  * that disagrees with the request.
  */
-function readSubject(request: { readonly projectId?: unknown; readonly attemptId?: unknown; readonly candidateHeadSha?: unknown }): SubjectRead {
+function readSubject(
+  request: { readonly projectId?: unknown; readonly attemptId?: unknown; readonly candidateHeadSha?: unknown },
+  options?: { readonly requireBriefProjectId?: boolean },
+): SubjectRead {
+  const requireBriefProjectId = options?.requireBriefProjectId === true;
   const subjectProperty = ownProperty(request, 'subject');
   if (subjectProperty === 'unreadable') {
     // Present but not a plain data property (an accessor, a hostile object): never "absent".
@@ -142,6 +249,7 @@ function readSubject(request: { readonly projectId?: unknown; readonly attemptId
     return { kind: 'invalid' };
   }
   // A find request carries no project id; only a request that names one must agree with the subject.
+  // A brief review request is the exception: `requireBriefProjectId` makes an absent id invalid.
   const requestProjectId = ownValue(request, 'projectId');
   const sameProject = requestProjectId === undefined || requestProjectId === projectId;
   if (kind === 'attempt') {
@@ -152,7 +260,7 @@ function readSubject(request: { readonly projectId?: unknown; readonly attemptId
       : { kind: 'invalid' };
   }
   if (kind === 'brief') {
-    return { kind: 'brief' };
+    return readBriefSubject(request, subject, sameProject, requireBriefProjectId);
   }
   if (kind !== 'chain') {
     return { kind: 'invalid' };
@@ -198,6 +306,38 @@ function isChainReceiptOf(receipt: ReviewReceiptRecord, chain: ChainSubject): bo
     stored.chainName === chain.chainName &&
     stored.integrationHeadSha === chain.integrationHeadSha
   );
+}
+
+/** The evidence context's stored subject of a brief receipt, as this adapter sends it. */
+function evidenceBriefSubject(brief: BriefSubject) {
+  return {
+    kind: 'brief' as const,
+    projectId: brief.projectId,
+    attemptId: null,
+    chainName: null,
+    integrationHeadSha: null,
+    briefPackageDigest: brief.briefPackageDigest,
+    baseCommit: brief.baseCommit,
+  };
+}
+
+/** True when a stored receipt is the brief-verify review of exactly this brief at this base commit. Never throws. */
+function isBriefReceiptOf(receipt: ReviewReceiptRecord, brief: BriefSubject): boolean {
+  try {
+    const stored = receiptSubjectOf(receipt);
+    return (
+      ownValue(receipt, 'kind') === 'brief-verify' &&
+      ownValue(receipt, 'attemptId') === attemptIdForBrief(brief.projectId, brief.briefPackageDigest) &&
+      ownValue(receipt, 'candidateHeadSha') === brief.baseCommit &&
+      stored !== null &&
+      stored.kind === 'brief' &&
+      stored.projectId === brief.projectId &&
+      stored.briefPackageDigest === brief.briefPackageDigest &&
+      stored.baseCommit === brief.baseCommit
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -314,9 +454,355 @@ function isPlainObject(value: unknown): boolean {
   return prototype === Object.prototype || prototype === null;
 }
 
-/** A brief longer than 64 KiB is a refusal, never a truncated forward. */
+/**
+ * UTF-8 size of a brief, for the `BRIEF_TEXT_MAX_BYTES` cap only.
+ * `.length` counts UTF-16 code units, and every code unit encodes to at least
+ * one UTF-8 byte, so a string longer than 65536 code units is over 64 KiB.
+ * That length is read once and the string is not scanned. Only a string at or
+ * under that many code units reaches `Buffer.byteLength`, and then only once.
+ * The early return is a lower bound (the code-unit count), never a truncation.
+ */
 function briefTextByteLength(briefText: string): number {
+  if (briefText.length > BRIEF_TEXT_MAX_BYTES) {
+    return briefText.length;
+  }
   return Buffer.byteLength(briefText, 'utf8');
+}
+
+/**
+ * True when brief text must be refused. A UTF-16 length over 65536 code units
+ * is already over 64 KiB of UTF-8, so that length is read once and neither
+ * trim nor `Buffer.byteLength` runs. A shorter string is trimmed, then measured
+ * once. Never throws.
+ */
+function briefTextIsRefused(briefText: unknown): boolean {
+  if (typeof briefText !== 'string' || briefText.length > BRIEF_TEXT_MAX_BYTES) {
+    return true;
+  }
+  if (!isNonEmptyTrimmed(briefText)) {
+    return true;
+  }
+  return briefTextByteLength(briefText) > BRIEF_TEXT_MAX_BYTES;
+}
+
+interface BriefRequestFields {
+  readonly requestId: string;
+  readonly policyRevision: string;
+  readonly implementerModel: string;
+  readonly reviewerModel: string;
+  readonly briefText: string;
+  readonly nowIso?: string;
+}
+
+/**
+ * Own-data fields of a brief-verify request. Null when any check fails.
+ * The request's own `projectId` must be present and equal `subjectProjectId`;
+ * an absent id is not a match. Cost: a fixed set of keys. `briefText` whose
+ * UTF-16 length is over 65536 code units is refused before trim or a byte
+ * scan; only a shorter string is trimmed and then measured, capped at
+ * `BRIEF_TEXT_MAX_BYTES` (over-size text is refused, never forwarded). Secret
+ * scans run only after the value is a string. Never throws.
+ */
+function readBriefRequestFields(request: unknown, subjectProjectId: string): BriefRequestFields | null {
+  try {
+    const projectRead = ownProperty(request, 'projectId');
+    if (projectRead === undefined || projectRead === 'unreadable' || projectRead.value !== subjectProjectId) {
+      return null;
+    }
+    const optional = snapshotOptionalFields(request, ['briefText', 'diffSummary', 'nowIso']);
+    const requestId = ownValue(request, 'requestId');
+    const policyRevision = ownValue(request, 'policyRevision');
+    const implementerModel = ownValue(request, 'implementerModel');
+    const reviewerModel = ownValue(request, 'reviewerModel');
+    if (optional === null || ownValue(request, 'kind') !== 'brief-verify') {
+      return null;
+    }
+    if (typeof requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(requestId) || containsSecretShape(requestId)) {
+      return null;
+    }
+    if (typeof policyRevision !== 'string' || !isNonEmptyTrimmed(policyRevision) || containsSecretShape(policyRevision)) {
+      return null;
+    }
+    if (typeof implementerModel !== 'string' || !isNonEmptyTrimmed(implementerModel) || containsSecretShape(implementerModel)) {
+      return null;
+    }
+    if (typeof reviewerModel !== 'string' || !isNonEmptyTrimmed(reviewerModel) || containsSecretShape(reviewerModel)) {
+      return null;
+    }
+    const nowIso = optional.nowIso;
+    if (nowIso !== undefined && typeof nowIso !== 'string') {
+      return null;
+    }
+    if (optional.diffSummary !== undefined) {
+      return null;
+    }
+    const briefText = optional.briefText;
+    // Not a type predicate: a non-string is refused here, and a string still
+    // refuses on `.length > 65536` inside `briefTextIsRefused` before any byte count.
+    if (typeof briefText !== 'string') {
+      return null;
+    }
+    if (briefTextIsRefused(briefText)) {
+      return null;
+    }
+    return {
+      requestId,
+      policyRevision,
+      implementerModel,
+      reviewerModel,
+      briefText,
+      ...(typeof nowIso === 'string' ? { nowIso } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** A brief find's request id: pattern-valid, not secret-shaped. Null when it is not. Never throws. */
+function readBriefRequestId(request: unknown): string | null {
+  try {
+    const read = ownProperty(request, 'requestId');
+    if (read === 'unreadable' || read === undefined || typeof read.value !== 'string') {
+      return null;
+    }
+    const requestId = read.value;
+    if (!REVIEW_REQUEST_ID_PATTERN.test(requestId) || containsSecretShape(requestId)) {
+      return null;
+    }
+    return requestId;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One array plus the `length` read from its own data descriptor for this
+ * operation. Nothing is stored on the array: the next operation reads again.
+ */
+interface BoundedList {
+  readonly list: readonly unknown[];
+  readonly length: number;
+}
+
+/**
+ * The own `length` data descriptor, read for this call only. An accessor, a
+ * non-integer, a negative, or a throwing descriptor is null. The number is not
+ * remembered, so a later operation on the same array reads `length` again.
+ */
+function ownArrayLength(value: readonly unknown[]): number | null {
+  try {
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    if (
+      lengthDescriptor === undefined ||
+      lengthDescriptor.get !== undefined ||
+      !('value' in lengthDescriptor) ||
+      typeof lengthDescriptor.value !== 'number' ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0
+    ) {
+      return null;
+    }
+    return lengthDescriptor.value;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A real array whose length, read once in this call, is within `cap`, or null.
+ * Callers iterate with the returned `length` and `ownElement`. A plain
+ * `.length` read on `list` would let a Proxy lie on the next access. A later
+ * operation calls this again and reads `length` afresh.
+ */
+function readBoundedList(value: unknown, cap: number): BoundedList | null {
+  try {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+      return null;
+    }
+    const length = ownArrayLength(value);
+    if (length === null || length > cap) {
+      return null;
+    }
+    return { list: value, length };
+  } catch {
+    return null;
+  }
+}
+
+/** The own data-property element at `index`. A hole, an accessor or a throwing descriptor is undefined. */
+function ownElement(array: readonly unknown[], index: number): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
+    return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The assessment's receipt list when it is a dense array no longer than
+ * `MAX_BRIEF_RECEIPTS_READ`. Length is the local from `readBoundedList` (one
+ * descriptor read for this operation). A longer list, a hole, a non-array, an
+ * accessor length or an array-like is null and is not iterated.
+ */
+function readBoundedReceiptList(value: unknown): BoundedList | null {
+  try {
+    const bounded = readBoundedList(value, MAX_BRIEF_RECEIPTS_READ);
+    if (bounded === null) {
+      return null;
+    }
+    for (let index = 0; index < bounded.length; index += 1) {
+      const element = ownElement(bounded.list, index);
+      if (typeof element !== 'object' || element === null) {
+        return null;
+      }
+    }
+    return bounded;
+  } catch {
+    return null;
+  }
+}
+
+type BriefVerifyScan =
+  | { readonly outcome: 'list'; readonly receipts: readonly ReviewReceiptRecord[] }
+  | { readonly outcome: 'unreadable' };
+
+/**
+ * Own-data `brief-verify` receipts, in list order. A hole or an unreadable
+ * `kind` stops the scan. `length` is the number this operation already read;
+ * this loop does not read `.length`. Never throws.
+ */
+function collectBriefVerifyReceipts(list: readonly unknown[], length: number): BriefVerifyScan {
+  const receipts: ReviewReceiptRecord[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const receipt = ownElement(list, index);
+    if (typeof receipt !== 'object' || receipt === null) {
+      return { outcome: 'unreadable' };
+    }
+    const record = receipt as ReviewReceiptRecord;
+    const kindRead = ownProperty(record, 'kind');
+    if (kindRead === 'unreadable') {
+      return { outcome: 'unreadable' };
+    }
+    if (kindRead !== undefined && kindRead.value === 'brief-verify') {
+      receipts.push(record);
+    }
+  }
+  return { outcome: 'list', receipts };
+}
+
+/**
+ * True when every collected receipt is this brief's, in list order. An
+ * undefined slot is not a match. Never throws: `isBriefReceiptOf` catches.
+ */
+function everyReceiptIsThisBrief(receipts: readonly ReviewReceiptRecord[], brief: BriefSubject): boolean {
+  for (let index = 0; index < receipts.length; index += 1) {
+    const candidate = receipts[index];
+    if (candidate === undefined || !isBriefReceiptOf(candidate, brief)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+type LatestBriefPick =
+  | { readonly outcome: 'latest'; readonly receipt: ReviewReceiptRecord }
+  | { readonly outcome: 'not-found' }
+  | { readonly outcome: 'unreadable' };
+
+/**
+ * The receipt with the greatest completion instant. Ties keep the later one
+ * (`>=`, the same order as the chain path). An empty list is not-found; an
+ * undefined slot is unreadable. Throws when `completedAtMs` throws; the caller
+ * maps that to unreadable.
+ */
+function pickLatestBriefReceipt(receipts: readonly ReviewReceiptRecord[]): LatestBriefPick {
+  const latest = receipts[0];
+  if (latest === undefined) {
+    return { outcome: 'not-found' };
+  }
+  let chosen = latest;
+  for (let index = 1; index < receipts.length; index += 1) {
+    const candidate = receipts[index];
+    if (candidate === undefined) {
+      return { outcome: 'unreadable' };
+    }
+    if (completedAtMs(candidate) >= completedAtMs(chosen)) {
+      chosen = candidate;
+    }
+  }
+  return { outcome: 'latest', receipt: chosen };
+}
+
+type BriefLatestRequestId =
+  | { readonly outcome: 'id'; readonly requestId: string | null }
+  | { readonly outcome: 'unreadable' }
+  | { readonly outcome: 'mismatch' };
+
+/**
+ * The request id on a latest brief receipt. Absent or null is null, matching
+ * the chain path's `requestId ?? null` (a manual receipt). A non-string is a
+ * mismatch. An accessor is unreadable. The outcome is a tag, so a stored id
+ * whose text is `unreadable` or `mismatch` stays an id. Never throws.
+ */
+function readBriefLatestRequestId(receipt: ReviewReceiptRecord): BriefLatestRequestId {
+  const requestIdRead = ownProperty(receipt, 'requestId');
+  if (requestIdRead === 'unreadable') {
+    return { outcome: 'unreadable' };
+  }
+  const rawRequestId = requestIdRead === undefined ? undefined : requestIdRead.value;
+  if (rawRequestId !== undefined && rawRequestId !== null && typeof rawRequestId !== 'string') {
+    return { outcome: 'mismatch' };
+  }
+  return { outcome: 'id', requestId: typeof rawRequestId === 'string' ? rawRequestId : null };
+}
+
+/**
+ * Subject match, then the latest receipt's summary. The match runs outside
+ * the try, as it did inline: a failure there is a mismatch, not unreadable.
+ * A throw from picking or summarizing is unreadable. Same order, same results.
+ */
+function summarizeLatestBriefReceipts(
+  receipts: readonly ReviewReceiptRecord[],
+  brief: BriefSubject,
+): FindLatestReceiptOfKindResult {
+  if (!everyReceiptIsThisBrief(receipts, brief)) {
+    return { outcome: 'unavailable', reason: 'receipt-mismatch' };
+  }
+  try {
+    const picked = pickLatestBriefReceipt(receipts);
+    if (picked.outcome === 'not-found') {
+      return { outcome: 'not-found' };
+    }
+    if (picked.outcome === 'unreadable') {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    // One length read for this summary. The request-id check stays after it,
+    // and the copy below reuses this local instead of reading `length` again.
+    const boundedFindings = readReceiptFindings(picked.receipt, 'brief-verify');
+    if (boundedFindings === null) {
+      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
+    }
+    const requestId = readBriefLatestRequestId(picked.receipt);
+    if (requestId.outcome === 'unreadable') {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    if (requestId.outcome === 'mismatch') {
+      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
+    }
+    const latestSummary = receiptOfKindSummaryOf(
+      picked.receipt,
+      'brief-verify',
+      requestId.requestId,
+      boundedFindings,
+    );
+    if (latestSummary === null) {
+      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
+    }
+    return { outcome: 'found', receipt: latestSummary };
+  } catch {
+    return { outcome: 'unavailable', reason: 'unreadable' };
+  }
 }
 
 /**
@@ -397,31 +883,72 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
 }
 
 /**
- * True when `findings` is a dense array of plain objects whose every finding
- * carries one of the four declared severities: a sparse array, a non-array, a
- * hole or a corrupt severity is invalid transport output, never a summary
- * (RV3: a corrupt severity never maps to a verdict).
+ * Findings for this summary, length read once. A brief receipt reads `findings`
+ * through `ownProperty` (an accessor is a mismatch and the getter never runs)
+ * and refuses a list longer than `MAX_BRIEF_FINDINGS_READ`. Any other kind
+ * reads the property directly, capped only by a safe integer. Never caches:
+ * the next summary reads `length` again. A brief read never throws; a direct
+ * read still throws when the property getter throws, as it did before.
  */
-function findingsAreDense(findings: unknown): boolean {
-  try {
-    if (!Array.isArray(findings)) {
-      return false;
+function readReceiptFindings(receipt: ReviewReceiptRecord, kind: ReviewReceiptSummary['kind']): BoundedList | null {
+  if (kind === 'brief-verify') {
+    const findings = ownProperty(receipt, 'findings');
+    if (findings === 'unreadable' || findings === undefined) {
+      return null;
     }
-    for (let index = 0; index < findings.length; index += 1) {
-      if (!Object.prototype.hasOwnProperty.call(findings, index)) {
-        return false;
-      }
-      const finding = findings[index];
+    return readBoundedList(findings.value, MAX_BRIEF_FINDINGS_READ);
+  }
+  return readBoundedList(receipt.findings, Number.MAX_SAFE_INTEGER);
+}
+
+/** The summary fields of one finding. The set is fixed: five keys, no caller-supplied names. */
+const FINDING_SUMMARY_FIELDS = ['findingId', 'severity', 'summary', 'filePath', 'line'] as const;
+
+type FindingSummaryFields = {
+  readonly [Key in (typeof FINDING_SUMMARY_FIELDS)[number]]: unknown;
+};
+
+function isDeclaredSeverity(severity: unknown): severity is 'blocker' | 'major' | 'minor' | 'nit' {
+  return severity === 'blocker' || severity === 'major' || severity === 'minor' || severity === 'nit';
+}
+
+/**
+ * The five summary fields, each from its own data descriptor. An accessor is
+ * null and the getter never runs. An absent field is `undefined` (nothing is
+ * read off the prototype). Cost: the fixed key list above, once. Never throws.
+ */
+function readFindingSummaryFields(finding: unknown): FindingSummaryFields | null {
+  // Partial keeps the readonly modifiers, so the loop cannot assign. Drop them
+  // on this local only; the returned value is still FindingSummaryFields.
+  const read: { -readonly [K in keyof FindingSummaryFields]?: FindingSummaryFields[K] } = {};
+  for (const key of FINDING_SUMMARY_FIELDS) {
+    const property = ownProperty(finding, key);
+    if (property === 'unreadable') {
+      return null;
+    }
+    read[key] = property === undefined ? undefined : property.value;
+  }
+  return read as FindingSummaryFields;
+}
+
+/**
+ * True when every index below `length` is a plain object whose summary fields
+ * are own data properties and whose severity is one of the four declared
+ * values. Each field is read by its own data descriptor during this pass: an
+ * accessor is not dense and the getter never runs. `length` is the local this
+ * operation already read: the loop does not read `.length`. A hole, an
+ * accessor or a corrupt severity is invalid transport output, never a summary
+ * (RV3: a corrupt severity never maps to a verdict). Never throws.
+ */
+function findingsAreDense(list: readonly unknown[], length: number): boolean {
+  try {
+    for (let index = 0; index < length; index += 1) {
+      const finding = ownElement(list, index);
       if (!isPlainObject(finding)) {
         return false;
       }
-      const severity = (finding as { severity?: unknown }).severity;
-      if (
-        severity !== 'blocker' &&
-        severity !== 'major' &&
-        severity !== 'minor' &&
-        severity !== 'nit'
-      ) {
+      const fields = readFindingSummaryFields(finding);
+      if (fields === null || !isDeclaredSeverity(fields.severity)) {
         return false;
       }
     }
@@ -429,6 +956,33 @@ function findingsAreDense(findings: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The summary's finding list, copied from the data descriptors already
+ * accepted by the density pass, up to `length`. Null when the findings are
+ * not dense or a field is an accessor (the getter never runs). Does not read
+ * `.length` and does not call `map` (both would re-enter a Proxy).
+ */
+function copyBoundedFindings(list: readonly unknown[], length: number): ReviewReceiptSummary['findings'] | null {
+  if (!findingsAreDense(list, length)) {
+    return null;
+  }
+  const copied: Array<ReviewReceiptSummary['findings'][number]> = [];
+  for (let index = 0; index < length; index += 1) {
+    const fields = readFindingSummaryFields(ownElement(list, index));
+    if (fields === null || !isDeclaredSeverity(fields.severity)) {
+      return null;
+    }
+    copied.push({
+      findingId: fields.findingId as string,
+      severity: fields.severity,
+      summary: fields.summary as string,
+      filePath: fields.filePath as string | null,
+      line: fields.line as number | null,
+    });
+  }
+  return copied;
 }
 
 /**
@@ -440,8 +994,16 @@ function receiptOfKindSummaryOf(
   receipt: ReviewReceiptRecord,
   kind: ReviewReceiptSummary['kind'],
   requestId: string | null,
+  preparedFindings?: BoundedList,
 ): ReviewReceiptOfKind | null {
-  if (!findingsAreDense(receipt.findings)) {
+  // `preparedFindings` is the one length read already done for this operation.
+  // Otherwise this summary reads `length` once itself.
+  const bounded = preparedFindings ?? readReceiptFindings(receipt, kind);
+  if (bounded === null) {
+    return null;
+  }
+  const findings = copyBoundedFindings(bounded.list, bounded.length);
+  if (findings === null) {
     return null;
   }
   return {
@@ -453,13 +1015,7 @@ function receiptOfKindSummaryOf(
     // RV3: an unverified stored receipt never maps to a verdict; it reads
     // `unknown` so every downstream decider keeps it unknown (fail closed).
     verdict: receipt.readOnlyVerified === true ? mapVerdict(receipt.result) : 'unknown',
-    findings: receipt.findings.map((finding) => ({
-      findingId: finding.findingId,
-      severity: finding.severity,
-      summary: finding.summary,
-      filePath: finding.filePath,
-      line: finding.line,
-    })),
+    findings,
     // The fixed cause code travels only on an unknown receipt whose code is
     // one of the declared tokens and a journal-legal lowercase code; the key
     // is omitted otherwise, so existing assertions without it stay identical.
@@ -584,8 +1140,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
   }
 
   /**
-   * D1C: one bounded dispatch of an independent review, shared by the attempt
-   * and the chain paths. A throwing delegate is `unknown`/`delegate-failed`.
+   * D1C: one bounded dispatch of an independent review, shared by the attempt,
+   * the chain and the brief paths. A throwing delegate is `unknown`/`delegate-failed`.
    * The delegate's answer is validated through own properties: a null,
    * non-object, unknown-outcome, throwing-getter or reviewed-without-receipt
    * answer is an unavailable review, never an exception and never a retry. A
@@ -740,12 +1296,58 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     );
   }
 
-  async requestReview(request: ReviewRequest): Promise<ReviewRequestResult> {
-    const subject = readSubject(request);
-    if (ownValue(request, 'kind') === 'brief-verify' || subject.kind === 'brief') {
-      return { outcome: 'refused', reason: 'subject-not-implemented', detail: null };
+  /**
+   * The brief-verify review of a frozen brief at its base commit. Validation
+   * failure is `invalid-request`; a missing delegate is `not-configured`.
+   * A throw while reading the delegate's reply is `no-receipt` /
+   * `review-unavailable`. The delegate itself throwing is `unknown` /
+   * `delegate-failed`, inside `dispatchReview`.
+   */
+  private async requestBriefReview(request: ReviewRequest, brief: BriefSubject): Promise<ReviewRequestResult> {
+    const fields = readBriefRequestFields(request, brief.projectId);
+    if (fields === null) {
+      return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
+    if (!this.delegates.requestIndependentReview) {
+      return { outcome: 'refused', reason: 'not-configured', detail: null };
+    }
+    try {
+      return await this.dispatchReview(
+        {
+          assessmentId: assessmentIdForBrief(brief.projectId, brief.briefPackageDigest),
+          projectId: brief.projectId,
+          attemptId: attemptIdForBrief(brief.projectId, brief.briefPackageDigest),
+          candidateHeadSha: brief.baseCommit,
+          policyRevision: fields.policyRevision,
+          implementerModel: fields.implementerModel,
+          reviewerModel: fields.reviewerModel,
+          kind: 'brief-verify',
+          requestId: fields.requestId,
+          subject: evidenceBriefSubject(brief),
+          briefText: fields.briefText,
+          ...(fields.nowIso !== undefined ? { nowIso: fields.nowIso } : {}),
+        },
+        { requestId: fields.requestId, candidateHeadSha: brief.baseCommit },
+        (receipt) =>
+          ownValue(receipt, 'requestId') === fields.requestId &&
+          isBriefReceiptOf(receipt, brief),
+        'brief-verify',
+        false,
+      );
+    } catch {
+      return { outcome: 'no-receipt', reason: 'review-unavailable', detail: null };
+    }
+  }
+
+  async requestReview(request: ReviewRequest): Promise<ReviewRequestResult> {
+    const subject = readSubject(request, { requireBriefProjectId: true });
     if (subject.kind === 'invalid') {
+      return { outcome: 'refused', reason: 'invalid-request', detail: null };
+    }
+    if (subject.kind === 'brief') {
+      return this.requestBriefReview(request, subject.brief);
+    }
+    if (ownValue(request, 'kind') === 'brief-verify') {
       return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
     if (subject.kind === 'chain') {
@@ -766,7 +1368,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (!this.delegates.requestIndependentReview) {
       return { outcome: 'refused', reason: 'not-configured', detail: null };
     }
-    // isValidReviewRequest accepted the kind, so it is one of the three stored review kinds here.
+    // isValidReviewRequest accepted the kind. brief-verify was refused above, so this is an attempt kind.
     const kind = request.kind as ReviewKind;
     return this.dispatchReview(
       {
@@ -818,8 +1420,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
 
   async findReviewReceipt(request: FindReviewReceiptRequest): Promise<FindReviewReceiptResult> {
     const subject = readSubject(request);
-    if (subject.kind === 'brief' || subject.kind === 'invalid') {
+    if (subject.kind === 'invalid') {
       return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    if (subject.kind === 'brief') {
+      return this.findBriefReceipt(request, subject.brief);
     }
     if (subject.kind === 'chain') {
       return this.findChainReceipt(request, subject.chain);
@@ -887,6 +1492,57 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       : { outcome: 'found', receipt: summary };
   }
 
+  /** The brief's receipt for one request id, from the brief's own assessment. Never throws. */
+  private async findBriefReceipt(request: FindReviewReceiptRequest, brief: BriefSubject): Promise<FindReviewReceiptResult> {
+    const requestId = readBriefRequestId(request);
+    if (requestId === null) {
+      return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    let read: AssessmentRead;
+    try {
+      read = await this.readAssessmentOf(attemptIdForBrief(brief.projectId, brief.briefPackageDigest));
+    } catch {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    if (read.outcome !== 'assessment') {
+      return read;
+    }
+    const list = readBoundedReceiptList(ownValue(read.assessment, 'reviewReceipts'));
+    if (list === null) {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    const matches: ReviewReceiptRecord[] = [];
+    for (let index = 0; index < list.length; index += 1) {
+      const receipt = ownElement(list.list, index);
+      if (typeof receipt !== 'object' || receipt === null) {
+        return { outcome: 'unavailable', reason: 'unreadable' };
+      }
+      const record = receipt as ReviewReceiptRecord;
+      const idRead = ownProperty(record, 'requestId');
+      if (idRead === 'unreadable') {
+        return { outcome: 'unavailable', reason: 'unreadable' };
+      }
+      if (idRead !== undefined && idRead.value === requestId) {
+        matches.push(record);
+      }
+    }
+    if (matches.length === 0) {
+      return { outcome: 'not-found' };
+    }
+    const only = matches[0];
+    if (only === undefined || matches.length > 1 || !isBriefReceiptOf(only, brief)) {
+      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
+    }
+    try {
+      const summary = summaryOf(only, 'brief-verify', requestId);
+      return summary === null
+        ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+        : { outcome: 'found', receipt: summary };
+    } catch {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+  }
+
   private async findLatestChainReceiptOfKind(
     request: FindLatestReceiptOfKindRequest,
     chain: ChainSubject,
@@ -914,11 +1570,54 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       : { outcome: 'found', receipt: latestSummary };
   }
 
+  /**
+   * The latest brief-verify receipt of this brief. Any other shape on that
+   * list is a mismatch. The scan, the subject match and the selection live in
+   * helpers so this method stays within the complexity limit. Never throws.
+   */
+  private async findLatestBriefReceiptOfKind(
+    request: FindLatestReceiptOfKindRequest,
+    brief: BriefSubject,
+  ): Promise<FindLatestReceiptOfKindResult> {
+    if (ownValue(request, 'kind') !== 'brief-verify') {
+      return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    let read: AssessmentRead;
+    try {
+      read = await this.readAssessmentOf(attemptIdForBrief(brief.projectId, brief.briefPackageDigest));
+    } catch {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    if (read.outcome !== 'assessment') {
+      return read;
+    }
+    const list = readBoundedReceiptList(ownValue(read.assessment, 'reviewReceipts'));
+    if (list === null) {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    const collected = collectBriefVerifyReceipts(list.list, list.length);
+    if (collected.outcome === 'unreadable') {
+      return { outcome: 'unavailable', reason: 'unreadable' };
+    }
+    if (collected.receipts.length === 0) {
+      return { outcome: 'not-found' };
+    }
+    return summarizeLatestBriefReceipts(collected.receipts, brief);
+  }
+
   async findLatestReceiptOfKind(
     request: FindLatestReceiptOfKindRequest,
   ): Promise<FindLatestReceiptOfKindResult> {
     const subject = readSubject(request);
-    if (subject.kind === 'brief' || subject.kind === 'invalid') {
+    if (subject.kind === 'invalid') {
+      return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    if (subject.kind === 'brief') {
+      return ownValue(request, 'kind') === 'brief-verify'
+        ? this.findLatestBriefReceiptOfKind(request, subject.brief)
+        : { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    if (ownValue(request, 'kind') === 'brief-verify') {
       return { outcome: 'unavailable', reason: 'invalid-request' };
     }
     if (subject.kind === 'chain') {

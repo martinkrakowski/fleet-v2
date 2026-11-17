@@ -110,7 +110,7 @@ function isCount(value: unknown): value is number {
 }
 
 /** One shell train event record as this evaluator reads it, or null when out of shape. */
-function readShellEvent(raw: unknown): ShellTrainEvent | null {
+export function readShellEvent(raw: unknown): ShellTrainEvent | null {
   const record = readExactPlainRecord(raw, SHELL_EVENT_KEYS);
   if (record === null) {
     return null;

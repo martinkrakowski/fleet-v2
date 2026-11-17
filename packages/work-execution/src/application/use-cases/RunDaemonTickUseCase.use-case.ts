@@ -14,7 +14,7 @@
  */
 
 import { containsSecretShape } from '@fleet/shared';
-import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isZonedIsoDateTime, readConductorHaltRecord } from '../../domain/conductor-halt.js';
 import type { ConductorHaltState } from '../../domain/conductor-halt.js';
 import {
   DAEMON_CALL_MIN_REMAINING_MS,
@@ -139,6 +139,8 @@ export interface DaemonJobRegistryDependencies {
   readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
   /** The chain-sweep use case; absent registers no chain-sweep job (lane CO11). */
   readonly chainSweep?: SweepChainsPort;
+  /** Confirms an operator halt before a halted chain-refresh refusal is recorded as skipped; absent = never skipped. */
+  readonly halt?: Pick<ConductorHaltPort, 'read'>;
 }
 
 /** One journal key a merge pass reported as journalled, with the queue entry it acts on. */
@@ -410,13 +412,51 @@ function toChainRefreshJobOutcome(result: RefreshChainsResult): DaemonJobOutcome
   }
 }
 
-/** One chain-refresh job instance: wraps the refresh use case for one repository (lane CO8). */
+/** Chain outcomes that count as settled work before a mid-pass halt. */
+const SETTLED_CHAIN_OUTCOMES = new Set(['merged', 'up-to-date', 'conflict', 'branch-gone']);
+
+/**
+ * True only for a halt marker that positively reads as an operator halt:
+ * `state === 'halted'` with a record that parses and has `halted === true`.
+ * An unreadable, clear, off-contract, missing or throwing read is false.
+ */
+async function isOperatorHaltConfirmed(halt: Pick<ConductorHaltPort, 'read'> | null | undefined): Promise<boolean> {
+  try {
+    if (halt === undefined || halt === null) return false;
+    const state: unknown = await halt.read();
+    if (!isRecord(state) || state.state !== 'halted') return false;
+    const read = readConductorHaltRecord(state.record);
+    return read.ok && read.record.halted === true;
+  } catch {
+    return false;
+  }
+}
+
+/** A confirmed-halted chain-refresh result → the skipped outcome, counting chains settled before the halt. */
+function haltedSkipOutcome(result: RefreshChainsResult): DaemonJobOutcome {
+  const chains: unknown = isRecord(result) ? result.chains : undefined;
+  if (!Array.isArray(chains)) {
+    return { outcome: 'refused', reasonCode: 'chain-refresh-malformed' };
+  }
+  const settled = (chains as readonly unknown[]).filter(
+    (entry) => isRecord(entry) && typeof entry.outcome === 'string' && SETTLED_CHAIN_OUTCOMES.has(entry.outcome),
+  ).length;
+  return { outcome: 'skipped', reasonCode: settled > 0 ? `halted-after-${settled}` : 'halted' };
+}
+
+/**
+ * One chain-refresh job instance: wraps the refresh use case for one repository (lane CO8).
+ * A `'refused'` / `'halted'` result becomes `'skipped'` (`'halted'` or `'halted-after-<n>'`)
+ * only when the halt dependency positively confirms an operator halt; any other refusal,
+ * or an unconfirmed halt, stays refused.
+ */
 class ChainRefreshJob implements DaemonJobPort {
   constructor(
     private readonly repository: DaemonRepositoryRef,
     private readonly refresh: RefreshChainsPort,
     readonly jobId: string,
     readonly leaseScope: string,
+    private readonly halt: Pick<ConductorHaltPort, 'read'> | undefined,
   ) {}
 
   async pass(request: DaemonJobPassRequest): Promise<DaemonJobOutcome> {
@@ -426,7 +466,11 @@ class ChainRefreshJob implements DaemonJobPort {
       nowIso: request.nowIso,
       deadlineIso: request.deadlineIso,
     });
-    return toChainRefreshJobOutcome(result);
+    const outcome = toChainRefreshJobOutcome(result);
+    if (outcome.outcome !== 'refused' || outcome.reasonCode !== 'halted') {
+      return outcome;
+    }
+    return (await isOperatorHaltConfirmed(this.halt)) ? haltedSkipOutcome(result) : outcome;
   }
 }
 
@@ -579,7 +623,9 @@ export class DaemonJobRegistry {
           continue;
         }
         refreshSeen.add(repository.repoDigest);
-        instances.push(new ChainRefreshJob(repository, this.deps.chainRefresh, parsed.jobId, parsed.leaseScope));
+        instances.push(
+          new ChainRefreshJob(repository, this.deps.chainRefresh, parsed.jobId, parsed.leaseScope, this.deps.halt),
+        );
       }
     }
     if (this.deps.chainSweep !== undefined) {
@@ -794,6 +840,7 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       ...(this.deps.chainRefreshMode !== undefined ? { chainRefreshMode: this.deps.chainRefreshMode } : {}),
       ...(this.deps.chainAttention !== undefined ? { chainAttention: this.deps.chainAttention } : {}),
       ...(this.deps.chainSweep !== undefined ? { chainSweep: this.deps.chainSweep } : {}),
+      halt: this.deps.halt,
     }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
     await this.settle(ctx, plan.settleDelayMs);

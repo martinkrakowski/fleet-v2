@@ -10,7 +10,12 @@ import { sha256HexDigest, type GhInvocationResult, type DaemonStatusRecord } fro
 import { loadInstallation, type FleetInstallation } from '@fleet/installation';
 
 import { createFleetCliRuntime, type FleetCliRuntime, type FleetCliRuntimeOptions } from './composition.js';
-import { DAEMON_HELP, daemonCommand, daemonHelpRequested } from './daemon.js';
+import {
+  DAEMON_HELP,
+  daemonCommand,
+  daemonHelpRequested,
+  watchdogRepositoryReport,
+} from './daemon.js';
 import { mergePolicySourceFromLoad, toDaemonRepositoryRefs } from './composition/daemon.js';
 import { runCli, type CliIo } from './index.js';
 
@@ -855,6 +860,467 @@ describe('daemon watchdog composition (CO-WD5a)', () => {
       deadlineIso: new Date(Date.now() + 60_000).toISOString(),
     }) as Promise<Record<string, unknown>>);
     expect(result).toMatchObject({ outcome: 'evaluated', healthy: true, exitCode: 0, findings: [] });
+  });
+});
+
+describe('daemon watchdog CLI (CO-WD5b)', () => {
+  function watchdogHarness(nowIso: string): Harness {
+    return harness([REPO_A], { daemonNow: () => nowIso });
+  }
+
+  async function writeTickStatus(h: Harness, finishedAtIso: string): Promise<void> {
+    const written = await h.runtime.daemon.status.write({
+      tickId: `tick-0${'1'.repeat(25)}`,
+      startedAtIso: finishedAtIso,
+      finishedAtIso,
+      paused: false,
+      halted: false,
+      forgeReachable: true,
+      jobs: [
+        {
+          jobId: `merge-pass:${digestOf(REPO_A)}`,
+          outcome: 'completed',
+          reasonCode: null,
+          leaseFence: 1,
+          durationMs: 5,
+          nextNotBeforeIso: null,
+          consecutiveBudgetExhausted: 0,
+        },
+      ] as DaemonStatusRecord['jobs'],
+      repositories: [],
+      notifierCursor: null,
+    });
+    expect(written.ok).toBe(true);
+  }
+
+  /** A runtime whose watchdog port answers the given stubbed pass, keeping every other port real. */
+  function withWatch(source: Harness | FleetCliRuntime, impl: () => Promise<unknown>): FleetCliRuntime {
+    const runtime: FleetCliRuntime = (source as Harness).runtime ?? (source as FleetCliRuntime);
+    return {
+      ...runtime,
+      daemon: { ...runtime.daemon, watchTrainHealth: { watchTrainHealth: impl } },
+    } as unknown as FleetCliRuntime;
+  }
+
+  /** A runtime whose merge policy answers the given stubbed answer, keeping every other port real. */
+  function withPolicy(source: Harness | FleetCliRuntime, answer: unknown): FleetCliRuntime {
+    const runtime: FleetCliRuntime = (source as Harness).runtime ?? (source as FleetCliRuntime);
+    return {
+      ...runtime,
+      daemon: { ...runtime.daemon, mergePolicy: { readMergePolicy: async () => answer } },
+    } as unknown as FleetCliRuntime;
+  }
+
+  const VALID_ANSWER = {
+    outcome: 'evaluated',
+    exitCode: 0,
+    healthy: true,
+    findings: [{ rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 7 }],
+    unknownForgeStates: 0,
+    truncated: false,
+    queueOverflow: false,
+    raised: 1,
+    cleared: 0,
+    attentionFailures: 0,
+    budgetExhausted: false,
+    announced: 0,
+    announceFailures: 0,
+    announceSuppressed: 0,
+    announceUnspoken: 0,
+  };
+
+  const EXPECTED_EVALUATED = {
+    repoDigest: 'd0',
+    outcome: 'evaluated',
+    exitCode: 0,
+    healthy: true,
+    findings: [{ rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 7 }],
+    raised: 1,
+    cleared: 0,
+    attentionFailures: 0,
+  };
+
+  function refusedLike(report: unknown, digest: string): void {
+    expect(report).toMatchObject({
+      repoDigest: digest,
+      outcome: 'refused',
+      exitCode: 1,
+      reasonCode: 'watch-failed',
+      findings: [],
+      raised: 0,
+      cleared: 0,
+      attentionFailures: 0,
+    });
+  }
+
+  it('(g) rejects --budget-seconds 0, --budget-seconds 3601, --budget-seconds -1, duplicates, --json --json, --json=true and unknown flags with exit 2, DAEMON_HELP on stderr and no status store written', async () => {
+    for (const extra of [
+      ['--budget-seconds', '0'],
+      ['--budget-seconds', '3601'],
+      ['--budget-seconds', '-1'],
+      ['--budget-seconds', '60', '--budget-seconds', '60'],
+      ['--json', '--json'],
+      ['--json=true'],
+      ['--explode'],
+      ['--budget-seconds'],
+    ]) {
+      const h = watchdogHarness(new Date().toISOString());
+      const answer = await run(h.runtime, ['daemon', 'watchdog', ...extra]);
+      expect(answer.code, JSON.stringify(extra)).toBe(2);
+      expect(answer.err, JSON.stringify(extra)).toContain('Invalid daemon watchdog arguments');
+      expect(answer.err, JSON.stringify(extra)).toContain(DAEMON_HELP);
+      expect(answer.out, JSON.stringify(extra)).toBe('');
+      expect(existsSync(path.join(h.stateDir, 'daemon', 'status.json')), JSON.stringify(extra)).toBe(false);
+    }
+  });
+
+  it('(h) without a durable state directory refuses with exit 2 before reading the clock or the policy', async () => {
+    const runtime = createFleetCliRuntime({
+      installation: installation([REPO_A]),
+      forgeGhRunner: ghStub().run,
+      daemonNow: () => new Date().toISOString(),
+    });
+    const answer = await run(runtime, ['daemon', 'watchdog']);
+    expect(answer.code).toBe(2);
+    expect(answer.err).toContain('daemon watchdog needs a durable state directory');
+    expect(answer.err).toContain(DAEMON_HELP);
+  });
+
+  it('(i) refuses with policy-invalid and exit 1 when the merge policy is unknown and never echoes the installation path', async () => {
+    const stateDir = tempDir();
+    const unknown = createFleetCliRuntime({
+      stateDir,
+      forgeGhRunner: ghStub().run,
+      daemonNow: () => new Date().toISOString(),
+      loadInstallationForMergePolicy: () => ({ status: 'invalid', file: '/private/install.json', errors: ['bad'] }),
+    });
+    const answer = await run(unknown, ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out)).toMatchObject({ outcome: 'refused', exitCode: 1, reasonCode: 'policy-invalid' });
+    expect(answer.out).not.toContain('/private');
+  });
+
+  it('(j) in text mode a stale train prints `watchdog <digest> unhealthy findings=1` and the `finding train-health:tick-stale` key', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    await writeTickStatus(h, new Date(Date.parse(nowIso) - 10 * 60_000).toISOString());
+    const answer = await run(h.runtime, ['daemon', 'watchdog']);
+    expect(answer.code).toBe(1);
+    expect(answer.out).toContain(`watchdog ${digestOf(REPO_A)} unhealthy findings=1`);
+    expect(answer.out).toContain('finding train-health:tick-stale');
+  });
+
+  it('(k) in json mode across a full stale pass neither stdout nor stderr contains the state directory path', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    await writeTickStatus(h, new Date(Date.parse(nowIso) - 10 * 60_000).toISOString());
+    const answer = await run(h.runtime, ['daemon', 'watchdog', '--json']);
+    expect(answer.out).not.toContain(h.stateDir);
+    expect(answer.err).not.toContain(h.stateDir);
+    expect(answer.out).not.toContain('/tmp');
+  });
+
+  it('(l) `daemon --help` lists the daemon watchdog line', async () => {
+    const h = watchdogHarness(new Date().toISOString());
+    const answer = await run(h.runtime, ['daemon', '--help']);
+    expect(answer.out).toContain('daemon watchdog [--budget-seconds <n>] [--json]');
+  });
+
+  it('a throwing or invalid clock refuses with invalid-clock and exit 1 before any watch runs', async () => {
+    const h = harness([REPO_A], { daemonNow: () => 'not-a-time' });
+    let watched = 0;
+    const answer = await run(withWatch(h, async () => {
+      watched += 1;
+      return null;
+    }), ['daemon', 'watchdog']);
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out)).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' });
+    expect(watched).toBe(0);
+  });
+
+  it('an invalid policy budget refuses with invalid-budget and exit 1 without running any watch', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const real = await h.runtime.daemon.mergePolicy.readMergePolicy();
+    if (real.outcome !== 'known') {
+      throw new Error('the fixture policy should be known');
+    }
+    let watched = 0;
+    const answer = await run(withWatch(withPolicy(h, { ...real, daemon: { ...real.daemon, budgetSeconds: 0 } }), async () => {
+      watched += 1;
+      return null;
+    }), ['daemon', 'watchdog']);
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out)).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-budget' });
+    expect(watched).toBe(0);
+  });
+
+  it('more than 32 configured repositories refuse with too-many-repositories and exit 1 before any watch runs', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const real = await h.runtime.daemon.mergePolicy.readMergePolicy();
+    if (real.outcome !== 'known') {
+      throw new Error('the fixture policy should be known');
+    }
+    const repos = Array.from({ length: 33 }, (_, index) => ({
+      ...real.repositories[0],
+      repo: `${REPO_A}-${index}`,
+    }));
+    let watched = 0;
+    const answer = await run(withWatch(withPolicy(h, { ...real, repositories: repos }), async () => {
+      watched += 1;
+      return null;
+    }), ['daemon', 'watchdog']);
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out)).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'too-many-repositories' });
+    expect(watched).toBe(0);
+  });
+
+  it('zero configured repositories complete with exit 0, repositoryCount 0 and an empty repositories list', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const real = await h.runtime.daemon.mergePolicy.readMergePolicy();
+    if (real.outcome !== 'known') {
+      throw new Error('the fixture policy should be known');
+    }
+    const answer = await run(withPolicy(h, { ...real, repositories: [] }), ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(0);
+    expect(lastJson(answer.out)).toEqual({ outcome: 'completed', exitCode: 0, repositoryCount: 0, repositories: [] });
+  });
+
+  it('a throwing watch and a null watch both fail closed to a watch-failed repo entry with exit 1', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const throwing = await run(withWatch(h, async () => {
+      throw new Error(`secret ${h.stateDir}`);
+    }), ['daemon', 'watchdog', '--json']);
+    expect(throwing.code).toBe(1);
+    expect(lastJson(throwing.out).repositories).toEqual([
+      {
+        repoDigest: digestOf(REPO_A),
+        outcome: 'refused',
+        exitCode: 1,
+        reasonCode: 'watch-failed',
+        findings: [],
+        raised: 0,
+        cleared: 0,
+        attentionFailures: 0,
+      },
+    ]);
+    expect(throwing.out).not.toContain(h.stateDir);
+
+    const nulled = await run(withWatch(h, async () => null), ['daemon', 'watchdog', '--json']);
+    expect(nulled.code).toBe(1);
+    expect(lastJson(nulled.out).repositories).toEqual(lastJson(throwing.out).repositories);
+  });
+
+  it('a budget-exhausted pass reports outcome budget-exhausted with exitCode 1 and an empty findings list', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(withWatch(h, async () => ({ outcome: 'budget-exhausted', exitCode: 1 })), [
+      'daemon',
+      'watchdog',
+      '--json',
+    ]);
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out).repositories).toEqual([
+      {
+        repoDigest: digestOf(REPO_A),
+        outcome: 'budget-exhausted',
+        exitCode: 1,
+        findings: [],
+        raised: 0,
+        cleared: 0,
+        attentionFailures: 0,
+      },
+    ]);
+  });
+
+  it('a malformed finding key becomes train-health:unknown, a non-integer pullRequest becomes null and a wrong-rule falls back to unknown', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(
+      withWatch(h, async () => ({
+        ...VALID_ANSWER,
+        healthy: false,
+        exitCode: 1,
+        findings: [{ rule: 'TICK!', key: 'BAD KEY', pullRequest: 'seven' }],
+      })),
+      ['daemon', 'watchdog', '--json'],
+    );
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out).repositories).toEqual([
+      {
+        repoDigest: digestOf(REPO_A),
+        outcome: 'evaluated',
+        exitCode: 1,
+        healthy: false,
+        findings: [{ rule: 'unknown', key: 'train-health:unknown', pullRequest: null }],
+        raised: 1,
+        cleared: 0,
+        attentionFailures: 0,
+      },
+    ]);
+  });
+
+  it('watchdogRepositoryReport(null) refuses with watch-failed and exit 1 without throwing', () => {
+    refusedLike(watchdogRepositoryReport('d0', null), 'd0');
+  });
+
+  it('watchdogRepositoryReport(undefined) refuses with watch-failed and exit 1 without throwing', () => {
+    refusedLike(watchdogRepositoryReport('d0', undefined), 'd0');
+  });
+
+  it('wrong primitives are refused: a number where a digest string is due is redacted to unknown and a string where findings are due refuses', () => {
+    const wrongDigest = watchdogRepositoryReport(42, VALID_ANSWER);
+    expect(wrongDigest.repoDigest).toBe('unknown');
+    expect(wrongDigest.outcome).toBe('evaluated');
+    expect(wrongDigest.exitCode).toBe(0);
+    refusedLike(watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: 'abc' }), 'd0');
+  });
+
+  it('a non-iterable object where findings are due refuses with watch-failed', () => {
+    refusedLike(watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: {} }), 'd0');
+  });
+
+  it('an array hole in findings maps that slot to the unknown finding instead of throwing or echoing the hole', () => {
+    const sparse: unknown[] = [{ rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 1 }];
+    // eslint-disable-next-line no-sparse-arrays
+    sparse[2] = { rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 2 };
+    const report = watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: sparse });
+    expect(report.outcome).toBe('evaluated');
+    expect(report.findings).toEqual([
+      { rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 1 },
+      { rule: 'unknown', key: 'train-health:unknown', pullRequest: null },
+      { rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 2 },
+    ]);
+  });
+
+  it('an array-like object in place of findings refuses with watch-failed', () => {
+    const arrayLike = { length: 1, 0: { rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 1 } };
+    refusedLike(watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: arrayLike }), 'd0');
+  });
+
+  it('an enormous findings length (2**32 - 1) is refused before any traversal with findings []', () => {
+    const enormous: unknown[] = [];
+    Object.defineProperty(enormous, 'length', { value: 2 ** 32 - 1, enumerable: false, writable: true });
+    Object.defineProperty(enormous, 0, {
+      enumerable: true,
+      get() {
+        throw new Error('traversal reached a hostile slot');
+      },
+    });
+    refusedLike(watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: enormous }), 'd0');
+  });
+
+  it('a getter on the answer root and on a finding item never runs: the call counter stays 0 and the report refuses', () => {
+    let rootCalls = 0;
+    const root: Record<string, unknown> = {};
+    Object.defineProperty(root, 'outcome', {
+      enumerable: true,
+      get() {
+        rootCalls += 1;
+        return 'evaluated';
+      },
+    });
+    refusedLike(watchdogRepositoryReport('d0', root), 'd0');
+    expect(rootCalls).toBe(0);
+
+    let itemCalls = 0;
+    const item: Record<string, unknown> = {};
+    Object.defineProperty(item, 'key', {
+      enumerable: true,
+      get() {
+        itemCalls += 1;
+        return 'train-health:tick-stale';
+      },
+    });
+    const report = watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: [item] });
+    expect(report.findings).toEqual([{ rule: 'unknown', key: 'train-health:unknown', pullRequest: null }]);
+    expect(itemCalls).toBe(0);
+  });
+
+  it('a Proxy over a valid answer yields exactly the plain-data result and no get trap runs', () => {
+    let getTraps = 0;
+    const proxied = new Proxy(VALID_ANSWER, {
+      get(target, key) {
+        getTraps += 1;
+        return Reflect.get(target, key);
+      },
+    });
+    const report = watchdogRepositoryReport('d0', proxied);
+    expect(report).toMatchObject(EXPECTED_EVALUATED);
+    expect(getTraps).toBe(0);
+  });
+
+  it('a revoked Proxy as the answer refuses with watch-failed and nothing throws', () => {
+    const { proxy, revoke } = Proxy.revocable({ ...VALID_ANSWER }, {});
+    revoke();
+    refusedLike(watchdogRepositoryReport('d0', proxy), 'd0');
+  });
+
+  it('a revoked Proxy in place of findings refuses with watch-failed and nothing throws', () => {
+    const findings = [{ rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 1 }];
+    const { proxy, revoke } = Proxy.revocable(findings, {});
+    revoke();
+    refusedLike(watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: proxy }), 'd0');
+  });
+
+  it('a prototype-polluting own __proto__ key from JSON.parse neither pollutes Object.prototype nor reaches the verdict', () => {
+    const hostile = JSON.parse(
+      '{"__proto__":{"polluted":true},"outcome":"blind","exitCode":1,"reasonCode":"status-unreadable","raised":0,"cleared":0,"attentionFailures":0}',
+    ) as Record<string, unknown>;
+    const report = watchdogRepositoryReport('d0', hostile);
+    expect(report).toMatchObject({
+      repoDigest: 'd0',
+      outcome: 'blind',
+      exitCode: 1,
+      reasonCode: 'status-unreadable',
+      findings: [],
+      raised: 0,
+    });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+
+    const keys = JSON.parse(
+      '{"constructor":1,"prototype":1,"outcome":"evaluated","exitCode":0,"healthy":true,"findings":[],"raised":0,"cleared":0,"attentionFailures":0}',
+    ) as Record<string, unknown>;
+    expect(watchdogRepositoryReport('d0', keys)).toMatchObject({ outcome: 'evaluated', exitCode: 0 });
+  });
+
+  it('the verdict is not a constant: an evaluated healthy answer and a blind answer produce different outcomes and exit codes', () => {
+    const healthy = watchdogRepositoryReport('d0', VALID_ANSWER);
+    const blind = watchdogRepositoryReport('d0', {
+      outcome: 'blind',
+      exitCode: 1,
+      reasonCode: 'status-unreadable',
+      findings: [],
+      raised: 0,
+      cleared: 0,
+      attentionFailures: 0,
+    });
+    expect(healthy).toMatchObject(EXPECTED_EVALUATED);
+    expect(blind).toMatchObject({ outcome: 'blind', exitCode: 1, reasonCode: 'status-unreadable' });
+    expect(healthy.outcome).not.toBe(blind.outcome);
+    expect(healthy.exitCode).not.toBe(blind.exitCode);
+  });
+
+  it('the report is not an identity echo: a hostile reasonCode, an off-pattern key, a non-integer pullRequest and unknown fields are normalized away', () => {
+    const hostile = {
+      ...VALID_ANSWER,
+      reasonCode: '../../etc/passwd',
+      findings: [{ rule: 'tick-stale', key: 'not-a-key', pullRequest: 'seven', evidence: { path: '/tmp/secret' } }],
+      extraField: 'echo-me-not',
+    };
+    const report = watchdogRepositoryReport('d0', hostile);
+    expect(report).toMatchObject({
+      repoDigest: 'd0',
+      outcome: 'evaluated',
+      exitCode: 0,
+      findings: [{ rule: 'tick-stale', key: 'train-health:unknown', pullRequest: null }],
+    });
+    expect(JSON.stringify(report)).not.toContain('echo-me-not');
+    expect(JSON.stringify(report)).not.toContain('/tmp/secret');
+    expect(JSON.stringify(report)).not.toContain('etc/passwd');
   });
 });
 

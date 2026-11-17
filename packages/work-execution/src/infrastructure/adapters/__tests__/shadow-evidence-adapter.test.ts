@@ -136,6 +136,23 @@ describe('ShadowEvidenceAdapter', () => {
     expect(await fs.access(target).then(() => true, () => false)).toBe(false);
   });
 
+  it('refuses a request whose own-keys read throws as invalid-request, never unreadable (SH2)', async () => {
+    const adapter = new ShadowEvidenceAdapter({ stateDir: tempDir });
+    const hostileRequest = new Proxy(
+      { expectedRevision: 0, next: dayLedger(1) },
+      {
+        ownKeys() {
+          throw new Error('boom');
+        },
+      },
+    );
+    expect(await adapter.compareAndSet(hostileRequest)).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+    });
+    expect(await fs.access(target).then(() => true, () => false)).toBe(false);
+  });
+
   it('reports unknown-version and refuses to overwrite it, bytes unchanged', async () => {
     const adapter = new ShadowEvidenceAdapter({ stateDir: tempDir });
     const newer = JSON.stringify({ ...dayLedger(1), schemaVersion: SHADOW_LEDGER_SCHEMA_VERSION + 1 });

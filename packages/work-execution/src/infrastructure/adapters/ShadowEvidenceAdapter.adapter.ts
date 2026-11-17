@@ -134,7 +134,17 @@ export class ShadowEvidenceAdapter implements ShadowEvidencePort {
     } catch {
       return refused('read-only');
     }
-    const snapshot = snapshotPlainDataRecord(request);
+    // Reading the request's own shape happens before any file I/O. A hostile
+    // request (e.g. a Proxy whose `ownKeys` trap throws) must be refused as
+    // `invalid-request`, never fall through to the outer catch below, which
+    // is reserved for a problem reading the STORED ledger, not the caller's
+    // input.
+    let snapshot: Record<string, unknown> | null;
+    try {
+      snapshot = snapshotPlainDataRecord(request);
+    } catch {
+      return refused('invalid-request');
+    }
     if (snapshot === null || Object.keys(snapshot).some((key) => !CAS_KEYS.includes(key))) {
       return refused('invalid-request');
     }

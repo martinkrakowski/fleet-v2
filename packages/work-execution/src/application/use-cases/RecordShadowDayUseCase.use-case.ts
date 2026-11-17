@@ -15,7 +15,11 @@ import { CUTOVER_SHADOW_CRITERIA, type CutoverShadowCriterion } from '../../doma
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { isMergeQueueEntryLive } from '../../domain/merge-queue-records.js';
 import { evaluateShadowMergeSet, type ShadowDayMergeSetEvaluation } from '../../domain/shadow-day-merge-set.js';
-import { evaluateShadowStateIntegrity, evaluateShadowTickHealth } from '../../domain/shadow-day-health.js';
+import {
+  evaluateShadowStateIntegrity,
+  evaluateShadowTickHealth,
+  type ShadowTickHealthEvaluation,
+} from '../../domain/shadow-day-health.js';
 import {
   recordShadowVerdicts,
   type ShadowCriterionEvaluation,
@@ -101,6 +105,8 @@ type CriterionOutcome =
       readonly mergeSet?: ShadowDayMergeSetEvaluation;
       /** Present only for S8: the intake evaluation the comparison counts come from. */
       readonly intake?: ShadowIntakeEvaluation;
+      /** Present only for S12: the tick-health evaluation the counts come from. */
+      readonly tickHealth?: ShadowTickHealthEvaluation;
     }
   | { readonly criterion: CutoverShadowCriterion; readonly kind: 'unevaluated'; readonly reason: string };
 
@@ -653,7 +659,8 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       return unevaluatedOutcome('S12', 'daemon-events-unavailable');
     }
     const events = read.value.events.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
-    return { criterion: 'S12', kind: 'evaluated', evaluation: evaluateShadowTickHealth({ day: context.day, events }) };
+    const evaluation = evaluateShadowTickHealth({ day: context.day, events });
+    return { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
   }
 
   /**
@@ -661,12 +668,14 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * fixed order `criterion`, `day`, `status`, `reason`, then the evaluator's
    * own numeric counts — for S1 also `excludeBatchMerges`, after the counts.
    *
-   * `mergeSet` (S1 only) and `intake` (S8 only) are each set by exactly one
-   * criterion builder (`evaluateMergeSetCriterion`, `evaluateIntakeCriterion`
-   * respectively) and never both on the same outcome, so checking `mergeSet`
-   * first can never silently shadow a real `intake` value: an outcome with
-   * `intake` set always has `mergeSet === undefined`, by construction, not
-   * by this ordering.
+   * `mergeSet` (S1 only), `intake` (S8 only) and `tickHealth` (S12 only) are
+   * mutually exclusive, so at most one count field is ever set on any
+   * outcome. Each is set by exactly one criterion builder
+   * (`evaluateMergeSetCriterion`, `evaluateIntakeCriterion`,
+   * `evaluateTickHealthCriterion` respectively) and never more than one on
+   * the same outcome, so checking them in this order can never silently
+   * shadow another: an outcome with `intake` or `tickHealth` set always has
+   * the earlier fields `undefined`, by construction, not by this ordering.
    */
   private canonicalSummary(context: DayContext, outcome: Extract<CriterionOutcome, { kind: 'evaluated' }>): string {
     const base = {
@@ -696,6 +705,14 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         bShellCount: outcome.intake.bShellCount,
         bCompared: outcome.intake.bCompared,
         bDivergences: outcome.intake.bDivergences,
+      });
+    }
+    if (outcome.tickHealth !== undefined) {
+      return JSON.stringify({
+        ...base,
+        totalTicks: outcome.tickHealth.totalTicks,
+        budgetOverruns: outcome.tickHealth.budgetOverruns,
+        starvedJobs: outcome.tickHealth.starvedJobs,
       });
     }
     return JSON.stringify(base);

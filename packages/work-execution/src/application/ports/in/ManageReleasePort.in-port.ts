@@ -37,11 +37,15 @@ export type ManageReleaseRefusal =
   | 'authority-required'
   | 'authority-refused'
   | 'authority-unknown'
+  | /** The grant is bound to another release root than the one this release names. */ 'release-grant-root-mismatch'
+  | /** The root's driver state directory cannot be determined (CLI binding). */ 'release-root-state-dir-unknown'
   | 'current-moved'
   | 'driver-lease-live'
   | 'lease-unknown'
   | 'not-found'
   | 'build-failed'
+  | /** The grant was consumed before the build, and the build then failed; a retry resumes the same operation. */ 'build-failed-grant-spent'
+  | /** Another run holds this operation (same action, sha and root). */ 'release-in-progress'
   | 'verify-failed'
   | 'store-unreadable'
   | 'failed';
@@ -61,7 +65,8 @@ export interface ManageReleaseApplied {
   readonly outcome: 'applied';
   readonly action: ReleaseAction;
   readonly target: string;
-  readonly current: string;
+  /** The current link after the action: the new build for a swap or a rollback, the unmoved current for an install. */
+  readonly current: string | null;
   readonly kept: readonly string[];
   readonly pruned: readonly string[];
   /** `unreadable` means the retention cleanup did not complete; never a silent success. */

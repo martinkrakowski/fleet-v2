@@ -5,8 +5,8 @@ import {
   evaluateShadowTickHealth,
   SHADOW_OPEN_INTENT_GRACE_MS,
   SHADOW_MIN_TICKS_PER_DAY,
+  type ShadowTickHealthEvaluation,
 } from '../shadow-day-health.js';
-import type { ShadowCriterionEvaluation } from '../shadow-evidence-ledger.js';
 
 const DAY = '2026-11-10';
 const PREV_23 = (minute: number): string => `2026-11-09T23:${String(minute).padStart(2, '0')}:00.000Z`;
@@ -73,7 +73,7 @@ function starveEvent(spec: { iso: string; counter: number; outcome?: string; rea
   });
 }
 
-function s12(input: unknown): ShadowCriterionEvaluation {
+function s12(input: unknown): ShadowTickHealthEvaluation {
   return evaluateShadowTickHealth(input);
 }
 
@@ -83,15 +83,33 @@ function dayInput(events: unknown[]): Record<string, unknown> {
 
 describe('evaluateShadowTickHealth (S12)', () => {
   it('passes 1,440 clean evenly-spread ticks with no budget issues', () => {
-    expect(s12(dayInput(cleanDay(1440)))).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
+    expect(s12(dayInput(cleanDay(1440)))).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 1440,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
   });
 
   it('fails with too-few-ticks at exactly 719 ticks', () => {
-    expect(s12(dayInput(cleanDay(719)))).toEqual({ status: 'fail', reason: 'too-few-ticks' });
+    expect(s12(dayInput(cleanDay(719)))).toEqual({
+      status: 'fail',
+      reason: 'too-few-ticks',
+      totalTicks: 719,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
   });
 
   it('passes at the 720-tick boundary', () => {
-    expect(s12(dayInput(cleanDay(720)))).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
+    expect(s12(dayInput(cleanDay(720)))).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 720,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
   });
 
   it('fails tick-budget-overrun when exactly 2% of 800 ticks had a budget-exhausted job', () => {
@@ -103,7 +121,13 @@ describe('evaluateShadowTickHealth (S12)', () => {
         outcome: 'budget-exhausted',
       });
     }
-    expect(s12(dayInput(events))).toEqual({ status: 'fail', reason: 'tick-budget-overrun' });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'fail',
+      reason: 'tick-budget-overrun',
+      totalTicks: 800,
+      budgetOverruns: 16,
+      starvedJobs: 0,
+    });
   });
 
   it('passes at the exactly-1% boundary (8 of 800 ticks budget-exhausted)', () => {
@@ -115,7 +139,13 @@ describe('evaluateShadowTickHealth (S12)', () => {
         outcome: 'budget-exhausted',
       });
     }
-    expect(s12(dayInput(events))).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 800,
+      budgetOverruns: 8,
+      starvedJobs: 0,
+    });
   });
 
   it('fails job-starved for 10 consecutive budget-exhausted outcomes spanning midnight, last inside day D', () => {
@@ -124,7 +154,13 @@ describe('evaluateShadowTickHealth (S12)', () => {
       events.push(starveEvent({ iso: PREV_23(45 + i), counter: i }));
     }
     events.push(starveEvent({ iso: DAY_AT(0), counter: 9 }));
-    expect(s12(dayInput(events))).toEqual({ status: 'fail', reason: 'job-starved' });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'fail',
+      reason: 'job-starved',
+      totalTicks: 721,
+      budgetOverruns: 1,
+      starvedJobs: 1,
+    });
   });
 
   it('passes with only 9 consecutive budget-exhausted outcomes spanning midnight', () => {
@@ -133,7 +169,13 @@ describe('evaluateShadowTickHealth (S12)', () => {
       events.push(starveEvent({ iso: PREV_23(45 + i), counter: i }));
     }
     events.push(starveEvent({ iso: DAY_AT(0), counter: 8 }));
-    expect(s12(dayInput(events))).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 721,
+      budgetOverruns: 1,
+      starvedJobs: 0,
+    });
   });
 
   it('passes a 10-run of budget-exhausted outcomes entirely on D-1 with no member inside day D', () => {
@@ -141,7 +183,13 @@ describe('evaluateShadowTickHealth (S12)', () => {
     for (let i = 0; i < 10; i += 1) {
       events.push(starveEvent({ iso: PREV_23(50 + i), counter: i }));
     }
-    expect(s12(dayInput(events))).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 720,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
   });
 
   it('fails job-starved when a skip preserves the run: 9 exhausted, a skip, then 1 exhausted', () => {
@@ -151,7 +199,13 @@ describe('evaluateShadowTickHealth (S12)', () => {
     }
     events.push(starveEvent({ iso: PREV_23(49), counter: 100, outcome: 'skipped', reasonCode: 'lease-skip' }));
     events.push(starveEvent({ iso: DAY_AT(0), counter: 101 }));
-    expect(s12(dayInput(events))).toEqual({ status: 'fail', reason: 'job-starved' });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'fail',
+      reason: 'job-starved',
+      totalTicks: 721,
+      budgetOverruns: 1,
+      starvedJobs: 1,
+    });
   });
 
   it('passes when 8 exhausted, a skip, then 1 exhausted keep the run under the threshold', () => {
@@ -161,12 +215,24 @@ describe('evaluateShadowTickHealth (S12)', () => {
     }
     events.push(starveEvent({ iso: PREV_23(49), counter: 100, outcome: 'skipped', reasonCode: 'lease-skip' }));
     events.push(starveEvent({ iso: DAY_AT(0), counter: 101 }));
-    expect(s12(dayInput(events))).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 721,
+      budgetOverruns: 1,
+      starvedJobs: 0,
+    });
   });
 
   it('reports unknown/daemon-events-invalid with one malformed event in an otherwise clean day', () => {
     const events = [...cleanDay(720), { nope: true }];
-    expect(s12(dayInput(events))).toEqual({ status: 'unknown', reason: 'daemon-events-invalid' });
+    expect(s12(dayInput(events))).toEqual({
+      status: 'unknown',
+      reason: 'daemon-events-invalid',
+      totalTicks: 0,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
   });
 
   it('is not satisfiable by a constant verdict: clean and overrun days differ', () => {
@@ -178,16 +244,170 @@ describe('evaluateShadowTickHealth (S12)', () => {
       outcome: 'budget-exhausted',
       recordedAtIso: DAY_AT(i),
     }))]));
-    expect(clean.status).toBe('pass');
-    expect(overrun).toEqual({ status: 'fail', reason: 'tick-budget-overrun' });
+    expect(clean).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 720,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+    expect(overrun).toEqual({
+      status: 'fail',
+      reason: 'tick-budget-overrun',
+      totalTicks: 730,
+      budgetOverruns: 10,
+      starvedJobs: 0,
+    });
   });
 
   it('never echoes its input', () => {
     const input = dayInput(cleanDay(720));
     const result = s12(input) as unknown as Record<string, unknown>;
-    expect(Object.keys(result).sort()).toEqual(['reason', 'status']);
+    expect(Object.keys(result).sort()).toEqual(['budgetOverruns', 'reason', 'starvedJobs', 'status', 'totalTicks']);
     expect(result).not.toHaveProperty('day');
     expect(result).not.toHaveProperty('events');
+  });
+
+  it('returns zero tick-health counts for invalid-input', () => {
+    const zero = { totalTicks: 0, budgetOverruns: 0, starvedJobs: 0 };
+    expect(s12(null)).toEqual({ status: 'unknown', reason: 'invalid-input', ...zero });
+    expect(s12(undefined)).toEqual({ status: 'unknown', reason: 'invalid-input', ...zero });
+    expect(s12({ day: 42, events: [] })).toEqual({ status: 'unknown', reason: 'invalid-input', ...zero });
+  });
+
+  it('returns zero tick-health counts for daemon-events-invalid', () => {
+    const zero = { totalTicks: 0, budgetOverruns: 0, starvedJobs: 0 };
+    expect(s12({ day: DAY, events: 'nope' })).toEqual({ status: 'unknown', reason: 'daemon-events-invalid', ...zero });
+    expect(s12({ day: DAY, events: {} })).toEqual({ status: 'unknown', reason: 'daemon-events-invalid', ...zero });
+    expect(s12(dayInput([...cleanDay(1), { nope: true }]))).toEqual({
+      status: 'unknown',
+      reason: 'daemon-events-invalid',
+      ...zero,
+    });
+  });
+
+  it('returns zero tick-health counts for a revoked Proxy', () => {
+    const { proxy, revoke } = Proxy.revocable(dayInput(cleanDay(720)), {});
+    revoke();
+    expect(evaluateShadowTickHealth(proxy)).toEqual({
+      status: 'unknown',
+      reason: 'invalid-input',
+      totalTicks: 0,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+  });
+
+  it('returns zero tick-health counts for a Proxy whose ownKeys trap throws', () => {
+    const proxy = new Proxy(dayInput(cleanDay(720)), {
+      ownKeys() {
+        throw new Error('trap');
+      },
+    });
+    expect(evaluateShadowTickHealth(proxy)).toEqual({
+      status: 'unknown',
+      reason: 'invalid-input',
+      totalTicks: 0,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+  });
+
+  it('reports computed budgetOverruns and starvedJobs on too-few-ticks', () => {
+    const events = Array.from({ length: 10 }, (_, i) => jobEvent({
+      eventId: eventId(i + 1),
+      tickId: tickId(i + 1),
+      jobId: `chain-refresh:${DIGEST}`,
+      outcome: 'budget-exhausted',
+      recordedAtIso: DAY_AT(i),
+    }));
+    expect(s12(dayInput(events))).toEqual({
+      status: 'fail',
+      reason: 'too-few-ticks',
+      totalTicks: 10,
+      budgetOverruns: 10,
+      starvedJobs: 1,
+    });
+  });
+
+  it('reports starvedJobs 2 when two jobs each have a starved run', () => {
+    const events = cleanDay(720, 400);
+    const jobs = [
+      { jobId: `chain-refresh:${DIGEST}`, inDayMinute: 0, counterBase: 200_000 },
+      { jobId: `merge-pass:${DIGEST}`, inDayMinute: 1, counterBase: 200_100 },
+    ];
+    for (const spec of jobs) {
+      for (let i = 0; i < 9; i += 1) {
+        events.push(jobEvent({
+          eventId: eventId(spec.counterBase + i),
+          tickId: tickId(spec.counterBase + i),
+          jobId: spec.jobId,
+          outcome: 'budget-exhausted',
+          recordedAtIso: PREV_23(30 + i),
+        }));
+      }
+      events.push(jobEvent({
+        eventId: eventId(spec.counterBase + 9),
+        tickId: tickId(spec.counterBase + 9),
+        jobId: spec.jobId,
+        outcome: 'budget-exhausted',
+        recordedAtIso: DAY_AT(spec.inDayMinute),
+      }));
+    }
+    expect(s12(dayInput(events))).toEqual({
+      status: 'fail',
+      reason: 'job-starved',
+      totalTicks: 722,
+      budgetOverruns: 2,
+      starvedJobs: 2,
+    });
+  });
+
+  it('two pass/ticks-within-budget inputs with different tick counts carry different totalTicks', () => {
+    const fewer = s12(dayInput(cleanDay(720)));
+    const more = s12(dayInput(cleanDay(721)));
+    expect(fewer).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 720,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+    expect(more).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 721,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+    expect(fewer.totalTicks).not.toBe(more.totalTicks);
+  });
+
+  it('two fail/too-few-ticks inputs with different tick counts carry different totalTicks', () => {
+    const fewer = s12(dayInput(cleanDay(10)));
+    const more = s12(dayInput(cleanDay(11)));
+    expect(fewer).toEqual({
+      status: 'fail',
+      reason: 'too-few-ticks',
+      totalTicks: 10,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+    expect(more).toEqual({
+      status: 'fail',
+      reason: 'too-few-ticks',
+      totalTicks: 11,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+    expect(fewer.totalTicks).not.toBe(more.totalTicks);
+  });
+
+  it('returns a frozen ShadowTickHealthEvaluation', () => {
+    const pass = s12(dayInput(cleanDay(720)));
+    const refused = s12(null);
+    expect(Object.isFrozen(pass)).toBe(true);
+    expect(Object.isFrozen(refused)).toBe(true);
   });
 });
 
@@ -668,6 +888,15 @@ describe('hostile input', () => {
         const result = evaluate(hostile.input);
         expect(result.status).toBe('unknown');
         expect(result.reason).toBe(expected);
+        if (label === 'S12') {
+          expect(result).toEqual({
+            status: 'unknown',
+            reason: expected,
+            totalTicks: 0,
+            budgetOverruns: 0,
+            starvedJobs: 0,
+          });
+        }
         if (hostile.calls !== undefined) {
           expect(hostile.calls()).toBe(0);
         }
@@ -706,7 +935,13 @@ describe('hostile input', () => {
   it('S12 refuses a revoked Proxy instead of throwing', () => {
     const { proxy, revoke } = Proxy.revocable(dayInput(cleanDay(720)), {});
     revoke();
-    expect(evaluateShadowTickHealth(proxy)).toEqual({ status: 'unknown', reason: 'invalid-input' });
+    expect(evaluateShadowTickHealth(proxy)).toEqual({
+      status: 'unknown',
+      reason: 'invalid-input',
+      totalTicks: 0,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
   });
 
   it('S9 refuses a revoked Proxy instead of throwing', () => {
@@ -721,7 +956,13 @@ describe('hostile input', () => {
         throw new Error('trap');
       },
     });
-    expect(evaluateShadowTickHealth(proxy)).toEqual({ status: 'unknown', reason: 'invalid-input' });
+    expect(evaluateShadowTickHealth(proxy)).toEqual({
+      status: 'unknown',
+      reason: 'invalid-input',
+      totalTicks: 0,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
   });
 
   it('S9 refuses a Proxy whose getOwnPropertyDescriptor trap throws', () => {
@@ -823,7 +1064,13 @@ describe('hostile input', () => {
       },
     });
     const honestResult = s12(dayInput(honestEvents));
-    expect(honestResult).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
+    expect(honestResult).toEqual({
+      status: 'pass',
+      reason: 'ticks-within-budget',
+      totalTicks: 720,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
     expect(s12(dayInput(lyingEvents))).toEqual(honestResult);
     expect(getTraps).toBe(0);
   });

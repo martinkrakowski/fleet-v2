@@ -2593,7 +2593,7 @@ describe('RecordShadowDayUseCase', () => {
     expect(unknownReasons.get('S5')).toBe('shell-events-unavailable');
   });
 
-  it('maps the shared day-end extraction refusal to S5 and S6 unevaluated (shell-facts-invalid)', async () => {
+  it('pins the shell-facts-invalid reason mapping for S5 and S6 when the shared day-end extraction refuses (the NaN-`atIso` branch itself is unreachable through the real pipeline)', async () => {
     const harness = wiredHarness(cleanFixture(DAY), {});
     setPremergeCarry(harness, constantPremergeCarry('carry'));
     // No invalid timestamp can reach the use case through the real parser:
@@ -2619,21 +2619,29 @@ describe('RecordShadowDayUseCase', () => {
     }
   });
 
-  it('keeps closed day D S5 unchanged when a D+1 shell update event would otherwise alter carry facts', async () => {
-    // D's S5 passes on the one carried decision. A D+1 carried update pair
-    // for the same pull request, if not filtered to the day's own end, would
-    // add a second carry decision and a D+1 pairing anomaly to the shared
-    // facts — a digest change on a closed day.
+  it('keeps closed day D S5 unchanged when a carry intent on D is only completed by a D+1 result', async () => {
+    // The evaluator day-scopes the decisions it receives itself, so a
+    // complete D+1 decision pair would be scoped away either way and would
+    // not discriminate this filter for S5. The discriminating input is an
+    // intent ON D whose classifying `result` lands on D+1: without the
+    // day-end filter the D+1 result would pair with the day's own intent,
+    // adding a carry decision (and a head move) for a pairing the closed
+    // day never saw; with the filter the D+1 result is dropped and the
+    // intent stays pending, so the closed day's carry facts are exactly the
+    // in-day decision and the recorded verdict and digest stand. (The old
+    // comment claimed a digest change on a closed day: a digest change is
+    // exactly what must NOT happen — that claim was wrong.)
     const fixture = carryFixture();
     const harness = wiredHarness(fixture, {});
-    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const calls = { decisions: [] as unknown[], deadlines: [] as string[] };
+    setPremergeCarry(harness, constantPremergeCarry('carry', calls));
     const useCase = new RecordShadowDayUseCase(harness.deps);
     const first = await useCase.execute(makeRequest());
     expectRecorded(first);
     expect(first.recorded.S5).toBe('pass');
     const before = harness.evidence.stored;
 
-    fixture.shellLines.push(...shellCarryPair('2026-11-17T00:30:00Z', '2026-11-17T01:00:00Z', 12, HEAD_D, HEAD_E, true));
+    fixture.shellLines.push(...shellCarryPair(`${DAY}T23:30:00Z`, '2026-11-17T00:30:00Z', 12, HEAD_D, HEAD_E, true));
     const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
 
     expectRecorded(result);
@@ -2641,6 +2649,49 @@ describe('RecordShadowDayUseCase', () => {
     expect(result.recorded.S5).toBe('pass');
     expect(result.unevaluated.map((entry) => entry.criterion)).not.toContain('S5');
     expect(harness.evidence.stored).toEqual(before);
+    // Only the day's own decision was ever resolved (once per run); the
+    // D+1-completed pairing never reached the resolver.
+    const inDayDecision = {
+      pullRequest: 12, oldHeadOid: HEAD_B, newHeadOid: HEAD_D, atIso: `${DAY}T09:05:00Z`, shellCarry: 'carried',
+    };
+    expect(calls.decisions).toEqual([inDayDecision, inDayDecision]);
+  });
+
+  it('reports S5 unevaluated (carry-pairing-incomplete) on an in-day unpaired update', async () => {
+    // An `updated` result on D with no pending intent to pair is a pairing
+    // anomaly on the recorded day itself: the shell's carry facts for D are
+    // incomplete, so S5 is unevaluated, never a pass. Dropping the anomalies
+    // from the evaluator's input would leave only the resolved decision and
+    // this test would see a pass instead.
+    const fixture = carryFixture();
+    fixture.shellLines.push(JSON.stringify({ at: `${DAY}T15:00:00Z`, kind: 'result', outcome: 'updated', pr: 13, headOid: HEAD_E, detail: 'premerge carried (success)' }));
+    const harness = wiredHarness(fixture, {});
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+
+    expectRecorded(result);
+    expect(result.recorded.S5).toBeUndefined();
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S5')).toBe('carry-pairing-incomplete');
+    expect(harness.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S5).toBeUndefined();
+  });
+
+  it('calls the premergeCarry resolver only for in-day decisions, once despite a D-1 decision', async () => {
+    // Only the day's own decisions need the fleet's answer: a D-1 decision
+    // is in the extracted facts (the day-end filter has no lower bound) but
+    // is day-scoped away before resolution, so the resolver is called
+    // exactly once — for the D decision.
+    const fixture = carryFixture();
+    fixture.shellLines.push(...shellCarryPair('2026-11-15T09:04:00Z', '2026-11-15T09:05:00Z', 12, HEAD_B, HEAD_D, true));
+    const calls = { decisions: [] as unknown[], deadlines: [] as string[] };
+    const harness = wiredHarness(fixture, {});
+    setPremergeCarry(harness, constantPremergeCarry('carry', calls));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+
+    expectRecorded(result);
+    expect(result.recorded.S5).toBe('pass');
+    expect(calls.decisions).toHaveLength(1);
+    expect((calls.decisions[0] as { atIso: string }).atIso).toBe(`${DAY}T09:05:00Z`);
   });
 
   it('reports S5 unevaluated (fleet-carry-unknown) when premergeCarry throws or returns unknown', async () => {
@@ -2686,7 +2737,12 @@ describe('RecordShadowDayUseCase', () => {
     // The rerun path: the day is already recorded, so a rerun whose facts and
     // answers are identical answers `unchanged` — unless the deadline expires
     // while the resolver is awaited, in which case `call`'s re-check after
-    // the awaited return aborts the run before the value is used.
+    // the awaited return aborts the run before the value is used. The rerun
+    // uses the later 12:20 deadline: the rerun starts at 12:02:30 and the S8
+    // sample sleep moves the clock to exactly 12:05:00, so with the default
+    // deadline the second intake pre-check would abort before the resolver
+    // was ever consulted; with 12:20 only the resolver's own delay crosses
+    // the deadline.
     const harness = wiredHarness(carryFixture(), {});
     setPremergeCarry(harness, constantPremergeCarry('carry'));
     const useCase = new RecordShadowDayUseCase(harness.deps);
@@ -2694,14 +2750,18 @@ describe('RecordShadowDayUseCase', () => {
     expectRecorded(first);
     const afterFirst = harness.evidence.stored;
 
+    let resolverCalls = 0;
     // The clock is still on time when the resolver is called, and advances
     // past the deadline before the resolver returns.
     setPremergeCarry(harness, (input) => {
+      resolverCalls += 1;
       harness.setNow(new Date(Date.parse(input.deadlineIso) + 60_000).toISOString());
       return Promise.resolve('carry');
     });
-    const result = await useCase.execute(makeRequest({ deadlineIso: DEADLINE }));
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
 
+    // The post-await re-check really fired on the resolver's awaited value.
+    expect(resolverCalls).toBe(1);
     expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
     // The ledger is untouched: the resolver's value was never used.
     expect(harness.evidence.stored).toEqual(afterFirst);
@@ -2711,7 +2771,10 @@ describe('RecordShadowDayUseCase', () => {
     // The rejection path: `call` must re-check the deadline even when the
     // awaited operation REJECTS, otherwise S5 would become unevaluated
     // (`fleet-carry-unknown`) and a rerun could answer `unchanged` instead
-    // of aborting with `deadline-exceeded`.
+    // of aborting with `deadline-exceeded`. The rerun uses the later 12:20
+    // deadline (see the fulfilled twin above): with the default 12:05 one,
+    // the rerun's S8 sample sleep lands the clock exactly on the deadline
+    // and the intake pre-check aborts before the resolver is consulted.
     const harness = wiredHarness(carryFixture(), {});
     setPremergeCarry(harness, constantPremergeCarry('carry'));
     const useCase = new RecordShadowDayUseCase(harness.deps);
@@ -2719,16 +2782,40 @@ describe('RecordShadowDayUseCase', () => {
     expectRecorded(first);
     const afterFirst = harness.evidence.stored;
 
+    let resolverCalls = 0;
     // The clock is still on time when the resolver is called, and advances
     // past the deadline before the resolver rejects.
     setPremergeCarry(harness, (input) => {
+      resolverCalls += 1;
       harness.setNow(new Date(Date.parse(input.deadlineIso) + 60_000).toISOString());
       return Promise.reject(new Error('resolver failed'));
     });
-    const result = await useCase.execute(makeRequest({ deadlineIso: DEADLINE }));
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
 
+    expect(resolverCalls).toBe(1);
     expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
     expect(harness.evidence.stored).toEqual(afterFirst);
+  });
+
+  it('reports recorded when the ledger save lands after the deadline passes', async () => {
+    // The ledger write is the one call exempt from `call`'s post-await
+    // deadline re-check: once `compareAndSet` returns, the write has LANDED
+    // durably even if the deadline passed while it was awaited, so its real
+    // result is reported — a post-deadline `deadline-exceeded` would claim
+    // nothing was written. The pre-write check still aborts before anything
+    // is sent (pinned by the reached-before test above).
+    const harness = wiredHarness(carryFixture(), {});
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const inner = harness.deps.evidence.compareAndSet.bind(harness.deps.evidence);
+    harness.deps.evidence.compareAndSet = (request) => {
+      // The deadline passes while the write is awaited; the save lands.
+      harness.setNow(new Date(Date.parse(DEADLINE) + 60_000).toISOString());
+      return inner(request);
+    };
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+
+    expectRecorded(result);
+    expect(result.recorded.S5).toBe('pass');
   });
 
   it('aborts with deadline-exceeded when the ledger read rejects after the deadline passes', async () => {

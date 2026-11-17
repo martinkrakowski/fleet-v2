@@ -76,7 +76,7 @@ import type {
   LegacyTrainStateReadPort,
 } from '../ports/out/LegacyTrainStateReadPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
-import type { ShadowEvidencePort } from '../ports/out/ShadowEvidencePort.out-port.js';
+import type { ShadowEvidencePort, ShadowLedgerCasResult } from '../ports/out/ShadowEvidencePort.out-port.js';
 import { isValidRepositoryRef } from './ImportTrainStateUseCase.use-case.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1309,7 +1309,12 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * Record the day's verdicts and save the ledger by compare-and-set. On a
    * revision conflict the ledger is re-read once and the record step retried
    * exactly once; a second conflict is `ledger-busy`. Nothing is written on
-   * any refusal or unknown outcome.
+   * any refusal or unknown outcome. The `compareAndSet` itself is the one
+   * call exempt from `call`'s post-await deadline re-check: a write that
+   * LANDED past the deadline is already durable, so its actual result
+   * (saved, conflict, refusal) is reported as-is — a post-deadline
+   * `deadline-exceeded` here would claim nothing was written. The deadline
+   * is still checked before the write is sent.
    */
   private async writeDay(
     context: DayContext,
@@ -1346,13 +1351,27 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         // ledger's own, unchanged revision without calling compareAndSet.
         return this.finalResult(context, written.ledger, false, built);
       }
-      const saved = await this.call(context.deadlineIso, () =>
-        this.deps.evidence.compareAndSet({
-          expectedRevision: current === null ? 0 : current.revision,
-          next: written.ledger,
-          deadlineIso: context.deadlineIso,
-        }),
-      );
+      // The pre-write deadline check stands: past the deadline, nothing is
+      // sent. But the write itself is exempt from `call`'s post-await
+      // re-check — once `compareAndSet` returns, the write has LANDED (or
+      // been refused) durably, and reporting its actual result is the only
+      // answer consistent with the header's no-write-on-unknown guarantee.
+      if (this.deadlineReached(context.deadlineIso)) {
+        throw new DeadlineReachedError();
+      }
+      let saved: { readonly kind: 'value'; readonly value: ShadowLedgerCasResult } | { readonly kind: 'threw' };
+      try {
+        saved = {
+          kind: 'value',
+          value: await this.deps.evidence.compareAndSet({
+            expectedRevision: current === null ? 0 : current.revision,
+            next: written.ledger,
+            deadlineIso: context.deadlineIso,
+          }),
+        };
+      } catch {
+        saved = { kind: 'threw' };
+      }
       if (saved.kind === 'threw') {
         return unknownResult('ledger-unreadable');
       }

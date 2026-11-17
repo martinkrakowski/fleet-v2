@@ -732,6 +732,52 @@ describe('hostile input', () => {
     });
     expect(evaluateShadowStateIntegrity(proxy)).toEqual({ status: 'unknown', reason: 'invalid-input' });
   });
+
+  it('S9 never runs an enumerable getter on the nested stateCheck object (SH5b)', () => {
+    let getterCalls = 0;
+    const hostileStateCheck: Record<string, unknown> = { bad: 0 };
+    Object.defineProperty(hostileStateCheck, 'checked', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterCalls += 1;
+        return 5;
+      },
+    });
+    const result = evaluateShadowStateIntegrity(stateInput({ stateCheck: hostileStateCheck }));
+    // The getter never runs: validation reads `checked`'s own property
+    // descriptor, which is an accessor with no stored `value`, so the
+    // validated snapshot carries `checked: undefined`, never the getter's
+    // lying `5`.
+    expect(getterCalls).toBe(0);
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-input' });
+    expect(result).toEqual(evaluateShadowStateIntegrity(stateInput({ stateCheck: { checked: undefined, bad: 0 } })));
+  });
+
+  it('S9 over a Proxy stateCheck with a lying get trap yields the honest plain result with no get trap (SH5b)', () => {
+    const plainStateCheck = { checked: 0, bad: 0 };
+    let getTraps = 0;
+    const hostileStateCheck = new Proxy(plainStateCheck, {
+      get(target, key, receiver) {
+        getTraps += 1;
+        if (key === 'checked') {
+          return 5;
+        }
+        if (key === 'bad') {
+          return 0;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const result = evaluateShadowStateIntegrity(stateInput({ stateCheck: hostileStateCheck }));
+    // No `get` trap runs: validation reads `checked`/`bad` through
+    // `Object.getOwnPropertyDescriptor`, which the Proxy does not intercept,
+    // so the real target values (0, 0) are copied into the snapshot, never
+    // the trap's lying `5`.
+    expect(getTraps).toBe(0);
+    expect(result).toEqual({ status: 'unknown', reason: 'state-check-unavailable' });
+    expect(result).toEqual(evaluateShadowStateIntegrity(stateInput({ stateCheck: plainStateCheck })));
+  });
 });
 
 describe('constants', () => {

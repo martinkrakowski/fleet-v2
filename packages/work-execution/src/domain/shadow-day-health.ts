@@ -413,10 +413,21 @@ function judgeDayStateIntegrity(input: unknown): ShadowCriterionEvaluation {
   if (snapshot === null) {
     return UNKNOWN('invalid-input');
   }
-  if (snapshot.stateCheck !== null && readExactPlainRecord(snapshot.stateCheck, ['checked', 'bad']) === null) {
-    return UNKNOWN('invalid-input');
+  let stateCheck: { checked?: unknown; bad?: unknown } | null = null;
+  if (snapshot.stateCheck !== null) {
+    const stateCheckSnapshot = readExactPlainRecord(snapshot.stateCheck, ['checked', 'bad']);
+    if (stateCheckSnapshot === null) {
+      return UNKNOWN('invalid-input');
+    }
+    // Read the validated snapshot below, never the raw `snapshot.stateCheck`
+    // input again: that input may carry an enumerable getter or be a Proxy
+    // with a lying `get` trap, and a plain property access on it would run
+    // that getter or trap, trusting a value `readExactPlainRecord` never
+    // vouched for. The snapshot's own values were already copied through
+    // `Object.getOwnPropertyDescriptor`, so reading them here triggers
+    // nothing.
+    stateCheck = stateCheckSnapshot as { checked?: unknown; bad?: unknown };
   }
-  const stateCheck = snapshot.stateCheck as { checked?: unknown; bad?: unknown } | null;
   if (stateCheck === null || stateCheck.checked === 0) {
     return UNKNOWN('state-check-unavailable');
   }

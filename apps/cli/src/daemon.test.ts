@@ -1548,6 +1548,104 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     ]);
   });
 
+  // --- CO-WD9b: the deterministic throttle scenario tests -----------------
+
+  /**
+   * Builds a harness whose `daemonNow` reads a mutable `clock` and whose
+   * audible alert is a fake port recording every speak request, plus a helper
+   * that replays one stale-tick watchdog pass at the current `clock` and
+   * returns the open `train-tick-stale` item's `lastRaisedAtIso`. The
+   * coordination attention store stamps `lastRaisedAtIso` from the real clock
+   * rather than `daemonNow`, so the helper reads the stamp back instead of
+   * deriving it; epoch buckets (`floor(ms / 600_000)`), never elapsed time,
+   * decide whether a target is due.
+   */
+  function throttleHarness(): {
+    readonly setClock: (iso: string) => void;
+    readonly spoken: Array<{ readonly sentence: string }>;
+    readonly replayStalePass: () => Promise<{
+      readonly answer: { readonly code: number; readonly out: string };
+      readonly lastRaisedAtIso: string;
+    }>;
+  } {
+    let clock = new Date().toISOString();
+    const spoken: Array<{ readonly sentence: string }> = [];
+    const h = harness([REPO_A], {
+      daemonNow: () => clock,
+      daemonAudibleAlert: {
+        speak: async (request: { readonly sentence: string }) => {
+          spoken.push(request);
+          return { outcome: 'spoken' as const };
+        },
+      },
+    });
+    const replayStalePass = async (): Promise<{
+      readonly answer: { readonly code: number; readonly out: string };
+      readonly lastRaisedAtIso: string;
+    }> => {
+      await writeTickStatus(h, new Date(Date.parse(clock) - 10 * 60_000).toISOString());
+      const answer = await run(h.runtime, ['daemon', 'watchdog', '--json']);
+      const listed = (await h.runtime.coordination.listAttentionItems.listAttentionItems({ state: 'open' })) as {
+        readonly items: ReadonlyArray<{
+          readonly item: { readonly kind: string; readonly lastRaisedAtIso: string };
+        }>;
+      };
+      const stale = listed.items.find((entry) => entry.item.kind === 'train-tick-stale');
+      expect(stale, 'the stale tick item must still be open').toBeDefined();
+      return { answer, lastRaisedAtIso: (stale as { readonly item: { readonly lastRaisedAtIso: string } }).item.lastRaisedAtIso };
+    };
+    return { setClock: (iso) => { clock = iso; }, spoken, replayStalePass };
+  }
+
+  it('(b) the first stale pass speaks the throttled sentence once and reports announced 1 with audibleAlert spd-say', async () => {
+    const throttle = throttleHarness();
+    const first = await throttle.replayStalePass();
+
+    expect(first.answer.code).toBe(1);
+    expect(lastJson(first.answer.out)).toMatchObject({ outcome: 'completed', exitCode: 1, audibleAlert: 'spd-say' });
+    expect(lastJson(first.answer.out).repositories).toMatchObject([
+      { outcome: 'evaluated', healthy: false, announced: 1, announceFailures: 0, announceSuppressed: 0, announceUnspoken: 0 },
+    ]);
+    expect(throttle.spoken).toEqual([{ sentence: 'The merge train has stopped ticking.' }]);
+  });
+
+  it('(c) a second stale pass in the same epoch bucket is not due: nothing further speaks and every announce counter stays 0', async () => {
+    const throttle = throttleHarness();
+    const first = await throttle.replayStalePass();
+    // `lastRaisedAtIso` was stamped during the first pass, so re-reading the
+    // clock there keeps `floor(now / 600_000) === floor(last / 600_000)`.
+    throttle.setClock(first.lastRaisedAtIso);
+    const second = await throttle.replayStalePass();
+
+    expect(second.answer.code).toBe(1);
+    expect(lastJson(second.answer.out).repositories).toMatchObject([
+      { outcome: 'evaluated', healthy: false, announced: 0, announceFailures: 0, announceSuppressed: 0, announceUnspoken: 0 },
+    ]);
+    expect(throttle.spoken, 'the same-epoch-bucket pass must not speak again').toHaveLength(1);
+  });
+
+  it('(d) a stale pass in the next epoch bucket speaks the same sentence again', async () => {
+    const throttle = throttleHarness();
+    const first = await throttle.replayStalePass();
+    // Replay pass (c): same epoch bucket, so nothing further speaks and the
+    // item's stamp is refreshed.
+    throttle.setClock(first.lastRaisedAtIso);
+    const second = await throttle.replayStalePass();
+    // +600_000 ms is always the next epoch bucket, so `isDue` returns true.
+    throttle.setClock(new Date(Date.parse(second.lastRaisedAtIso) + 600_000).toISOString());
+    const third = await throttle.replayStalePass();
+
+    expect(third.answer.code).toBe(1);
+    expect(lastJson(third.answer.out).repositories).toMatchObject([
+      { outcome: 'evaluated', healthy: false, announced: 1, announceFailures: 0, announceSuppressed: 0 },
+    ]);
+    expect(third.lastRaisedAtIso >= second.lastRaisedAtIso).toBe(true);
+    expect(throttle.spoken).toEqual([
+      { sentence: 'The merge train has stopped ticking.' },
+      { sentence: 'The merge train has stopped ticking.' },
+    ]);
+  });
+
   it('(e) a speak that throws on a stale tick keeps the pass, exits 1 with announceFailures 1 and leaves train-tick-stale open', async () => {
     const nowIso = new Date().toISOString();
     let speakCalls = 0;

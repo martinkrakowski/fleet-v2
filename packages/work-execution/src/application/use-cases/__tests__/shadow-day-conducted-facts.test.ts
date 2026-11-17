@@ -634,6 +634,32 @@ describe('readShadowConformanceRuns', () => {
       expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
     });
 
+    it('a run field getter throwing a non-Error after all port calls yields a typed unknown and nothing rejects', async () => {
+      const run = collectedRun({ attemptIds: [ATTEMPT_2] });
+      const hostileRun = {
+        ...run,
+        get tier(): number {
+          throw 42;
+        },
+      } as unknown as LaneRunRecord;
+      const deps = makeDeps({
+        runs: [hostileRun],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      // Every read of caller-supplied structure after the port calls sits in
+      // a per-read inner catch (`readOrRefuse`), so the `42` from the getter
+      // never reaches the outer catch: the inner mapping of the tier read
+      // refuses with runs-unreadable — the typed unknown, never a rejection.
+      expect(result.status).toBe('unknown');
+      expect(result.status === 'unknown' && result.reason).toBe('runs-unreadable');
+      expect(deps.calls.runsList).toBe(1);
+      expect(deps.calls.attemptsRead).toEqual([ATTEMPT_2]);
+      expect(deps.calls.receiptsRead).toBe(1);
+      expect(JSON.stringify(result)).not.toContain('42');
+    });
+
     it('runs.list() rejecting a non-Error (42) yields unknown/runs-unreadable and nothing rejects', async () => {
       const deps = makeDeps({});
       const throwing = { ...deps, runs: { list: (): Promise<never> => Promise.reject(42) } };
@@ -729,19 +755,21 @@ describe('readShadowConformanceRuns', () => {
       expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
     });
 
-    it('the deadline passing during the fallback per-run journal reads yields unknown/deadline-exceeded', async () => {
+    it('the deadline passing between the fallback per-run journal reads yields unknown/deadline-exceeded after one read', async () => {
       const deps = makeDeps({
-        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] }), collectedRun({ runId: RUN_OTHER })],
         attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
         receipts: () => ({ outcome: 'none' }),
         withListForRuns: false,
-        // Call 1: the initial check; call 2: before the journal reads; call 3:
-        // the per-run check inside the fallback loop — past from there.
-        nowIso: clockPastFromCall(3),
+        // Calls 1-3: the initial check, the pre-journal check and the
+        // per-run check before the FIRST `listForRun` — still before the
+        // deadline; call 4: the per-run check before the second
+        // `listForRun` — past from there.
+        nowIso: clockPastFromCall(4),
       });
       const result = await readShadowConformanceRuns(deps, request());
       expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
-      expect(deps.calls.listForRunRead).toEqual([]);
+      expect(deps.calls.listForRunRead).toEqual([RUN_MERGED]);
     });
 
     it('the deadline passing before the grouped journal read yields unknown/deadline-exceeded with no grouped read', async () => {
@@ -759,18 +787,23 @@ describe('readShadowConformanceRuns', () => {
       expect(deps.calls.attemptsRead).toEqual([]);
     });
 
-    it('the deadline passing during the head-resolution walk yields unknown/deadline-exceeded', async () => {
+    it('the deadline passing between the attempt reads of the head walk yields unknown/deadline-exceeded after one attempt read', async () => {
       const deps = makeDeps({
-        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
-        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        runs: [collectedRun({ attemptIds: [ATTEMPT_1, ATTEMPT_2] })],
+        attempts: new Map([
+          [ATTEMPT_2, makeAttempt(ATTEMPT_2, null)],
+          [ATTEMPT_1, makeAttempt(ATTEMPT_1, artifactsOf(HEAD_2))],
+        ]),
         receipts: () => ({ outcome: 'none' }),
-        // Calls 1-3: initial, pre-journal and grouped-journal checks; call 4:
-        // the per-attempt check at the top of the head walk — past there.
-        nowIso: clockPastFromCall(4),
+        // Calls 1-4: the initial, pre-journal and grouped-journal checks,
+        // then the per-attempt check before the FIRST `findAttemptById` —
+        // still before the deadline; call 5: the per-attempt check before
+        // the second attempt read — past from there.
+        nowIso: clockPastFromCall(5),
       });
       const result = await readShadowConformanceRuns(deps, request());
       expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
-      expect(deps.calls.attemptsRead).toEqual([]);
+      expect(deps.calls.attemptsRead).toEqual([ATTEMPT_2]);
       expect(deps.calls.receiptsRead).toBe(0);
     });
   });

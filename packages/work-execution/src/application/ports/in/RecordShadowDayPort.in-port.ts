@@ -1,6 +1,6 @@
-// Lane SH7a: the day-writer's inbound contract. For one UTC day the use case
-// evaluates every shadow criterion the chain can currently compute (S1, S9,
-// S12), records each definite pass/fail verdict into the shadow-evidence
+// Lane SH7b: the day-writer's inbound contract. For one UTC day the use case
+// evaluates every shadow criterion the chain can currently compute (S1, S8,
+// S9, S12), records each definite pass/fail verdict into the shadow-evidence
 // ledger by compare-and-set, and reports every other criterion as
 // unevaluated — never as a pass, never as a silent fail.
 import type { CutoverShadowCriterion } from '../../../domain/cutover-records.js';

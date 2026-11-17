@@ -1,4 +1,4 @@
-// Lane SH7a: RecordShadowDayUseCase exercised directly with fakes for every
+// Lane SH7b: RecordShadowDayUseCase exercised directly with fakes for every
 // dependency — no CLI, no composition (that is SH8a).
 import { describe, expect, it } from 'vitest';
 
@@ -9,7 +9,8 @@ import { buildMergeKey } from '../../../domain/lane-run-keys.js';
 import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.js';
 import type { ShadowLedger } from '../../../domain/shadow-evidence-ledger.js';
 import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifactAdapter.adapter.js';
-import type { LegacyTrainEventsRead } from '../../ports/out/LegacyTrainStateReadPort.out-port.js';
+import type { ImportTrainStateKey, ImportTrainStateResult } from '../../ports/in/ImportTrainStatePort.in-port.js';
+import type { LegacyTrainEventsRead, LegacyTrainStateRead } from '../../ports/out/LegacyTrainStateReadPort.out-port.js';
 import type { ShadowLedgerReadResult } from '../../ports/out/ShadowEvidencePort.out-port.js';
 import type { RecordShadowDayRequest, RecordShadowDayResult } from '../../ports/in/RecordShadowDayPort.in-port.js';
 import {
@@ -30,7 +31,7 @@ const NOW = '2026-11-17T12:00:00.000Z';
 const DEADLINE = '2026-11-17T12:05:00.000Z';
 const PAST_DEADLINE = '2026-11-17T11:00:00.000Z';
 const NOT_IMPLEMENTED: readonly CutoverShadowCriterion[] = [
-  'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S8', 'S10', 'S11', 'S13',
+  'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S10', 'S11', 'S13',
 ];
 
 /** A valid ULID-shaped id carrying `n` (O1b-1 pattern: `[0-7][Crockford]{25}`). */
@@ -114,6 +115,50 @@ interface Fixture {
   readonly journalEntries: LaneRunJournalEntryRecord[];
   readonly queueEntries: MergeQueueEntryRecord[];
   readonly daemonEvents: DaemonEventRecord[];
+  /** The S8 shell-state read, overridable per test. */
+  shellState: LegacyTrainStateRead;
+  /** The S8 import dry-run's keys, overridable per test. */
+  importKeys: ImportTrainStateKey[];
+}
+
+/** The S8 shell state matching the clean fixture: one live entry on `main`. */
+function cleanShellState(): LegacyTrainStateRead {
+  return {
+    queue: { status: 'read', lines: [`7 ${HEAD_A} main`] },
+    parked: { status: 'read', lines: [] },
+    chains: { status: 'absent' },
+    batch: { status: 'absent' },
+    inprogress: { status: 'read', lines: [] },
+    batchesEnabled: { status: 'read', lines: [] },
+  };
+}
+
+/** The S8 import dry-run keys matching the clean fixture: the same single entry. */
+function cleanImportKeys(): ImportTrainStateKey[] {
+  return [{ pullRequest: 7, headOid: HEAD_A, base: 'main', source: 'queue', disposition: 'would-import' }];
+}
+
+/** A refused import dry-run answer for S8's sample. */
+function refusedImport(): ImportTrainStateResult {
+  return { outcome: 'refused', reason: 'legacy-unreadable' };
+}
+
+/** A successful dry-run answer over `keys`. */
+function dryRunImport(keys: readonly ImportTrainStateKey[]): ImportTrainStateResult {
+  return {
+    outcome: 'dry-run',
+    wouldImport: keys.length,
+    unknownLineNumbers: [],
+    notImportableBase: 0,
+    alreadyQueued: 0,
+    parkedLines: 0,
+    chainFiles: 0,
+    batchLines: 0,
+    inprogressLines: 0,
+    unknownBySource: { queue: [], parked: [], inprogress: [] },
+    keys,
+    keysTruncated: false,
+  };
 }
 
 /** A clean fixture for `day`: one shell merge exactly matched by the fleet side. */
@@ -144,7 +189,14 @@ function cleanFixture(day: string): Fixture {
   for (let index = 0; index < 800; index += 1) {
     daemonEvents.push(daemonJobEvent(index, day));
   }
-  return { shellLines, journalEntries, queueEntries, daemonEvents };
+  return {
+    shellLines,
+    journalEntries,
+    queueEntries,
+    daemonEvents,
+    shellState: cleanShellState(),
+    importKeys: cleanImportKeys(),
+  };
 }
 
 interface Harness {
@@ -163,19 +215,24 @@ interface Harness {
     calls: { read: number; cas: number };
     stored: ShadowLedger | null;
   };
-  readonly otherCalls: { legacy: number; queue: number; journal: number; daemon: number; checkState: number };
+  readonly otherCalls: { legacy: number; legacyState: number; queue: number; journal: number; daemon: number; checkState: number; import: number };
+  /** The `ms` value of every fake `sleep` call, in order. */
+  readonly sleeps: readonly number[];
   setNow(iso: string): void;
   setLedgerRead(result: ShadowLedgerReadResult): void;
+  setImportDryRun(result: ImportTrainStateResult): void;
   forceConflicts(): void;
 }
 
 function makeHarness(fixture: Fixture, nowIso: string): Harness {
   let now = nowIso;
   let ledgerReadOverride: ShadowLedgerReadResult | null = null;
+  let importOverride: ImportTrainStateResult | null = null;
   let stored: ShadowLedger | null = null;
   let forceConflict = false;
   const evidenceCalls = { read: 0, cas: 0 };
-  const otherCalls = { legacy: 0, queue: 0, journal: 0, daemon: 0, checkState: 0 };
+  const sleeps: number[] = [];
+  const otherCalls = { legacy: 0, legacyState: 0, queue: 0, journal: 0, daemon: 0, checkState: 0, import: 0 };
 
   const evidence = {
     read: async (): Promise<ShadowLedgerReadResult> => {
@@ -215,7 +272,8 @@ function makeHarness(fixture: Fixture, nowIso: string): Harness {
     },
     legacy: {
       readLegacyTrainState: async () => {
-        throw new Error('not used by this use case');
+        otherCalls.legacyState += 1;
+        return fixture.shellState;
       },
       readLegacyTrainEvents: async (): Promise<LegacyTrainEventsRead> => {
         otherCalls.legacy += 1;
@@ -244,6 +302,18 @@ function makeHarness(fixture: Fixture, nowIso: string): Harness {
       otherCalls.checkState += 1;
       return { checked: 5, bad: 0 };
     },
+    importDryRun: {
+      importTrainState: async () => {
+        otherCalls.import += 1;
+        return importOverride ?? dryRunImport(fixture.importKeys);
+      },
+    },
+    // The fake gap advances the harness clock so the two samples'
+    // `takenAtIso` values are really `sampleGapMs` apart.
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      now = new Date(Date.parse(now) + ms).toISOString();
+    },
     computeDigest: sha256HexDigest,
     repoDigestOf: () => REPO_DIGEST,
     releaseSha: async () => RELEASE,
@@ -255,11 +325,15 @@ function makeHarness(fixture: Fixture, nowIso: string): Harness {
     deps,
     evidence,
     otherCalls,
+    sleeps,
     setNow: (iso) => {
       now = iso;
     },
     setLedgerRead: (result) => {
       ledgerReadOverride = result;
+    },
+    setImportDryRun: (result) => {
+      importOverride = result;
     },
     forceConflicts: () => {
       forceConflict = true;
@@ -309,7 +383,7 @@ function expectedS1Digest(day: string, status: string, reason: string, counts: {
   );
 }
 
-function expectedSimpleDigest(criterion: 'S9' | 'S12', day: string, status: string, reason: string): string {
+function expectedSimpleDigest(criterion: 'S8' | 'S9' | 'S12', day: string, status: string, reason: string): string {
   return sha256HexDigest(JSON.stringify({ criterion, day, status, reason }));
 }
 
@@ -334,6 +408,7 @@ describe('RecordShadowDayUseCase', () => {
     expect(result.outcome).toBe('recorded');
     expect(result.recorded).toEqual({
       S1: 'pass',
+      S8: 'pass',
       S9: 'pass',
       S12: 'pass',
     });
@@ -352,6 +427,7 @@ describe('RecordShadowDayUseCase', () => {
         divergences: 0,
       }),
     );
+    expect(dayRecord?.verdicts.S8?.digest).toBe(expectedSimpleDigest('S8', DAY, 'pass', 'intake-equal'));
     expect(dayRecord?.verdicts.S9?.digest).toBe(expectedSimpleDigest('S9', DAY, 'pass', 'state-consistent'));
     expect(dayRecord?.verdicts.S12?.digest).toBe(expectedSimpleDigest('S12', DAY, 'pass', 'ticks-within-budget'));
     expectNotImplementedUnevaluated(result.unevaluated);
@@ -366,7 +442,10 @@ describe('RecordShadowDayUseCase', () => {
     const casCallsAfterFirst = harness.evidence.calls.cas;
     expect(casCallsAfterFirst).toBe(1);
 
-    const result = await useCase.execute(makeRequest());
+    // A later deadline: the two S8 samples' real (faked) 150s wall-clock
+    // gaps of two runs would otherwise cross this request's deadline.
+    const request = makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' });
+    const result = await useCase.execute(request);
     expectRecorded(result);
     expect(result.outcome).toBe('unchanged');
     expect(result.revision).toBe(1);
@@ -411,7 +490,7 @@ describe('RecordShadowDayUseCase', () => {
     const before = harness.evidence.stored?.days[0].verdicts.S1;
 
     fixture.shellLines.push(shellResultLine(`${DAY}T11:00:00Z`, 8, HEAD_B));
-    const result = await useCase.execute(makeRequest());
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
 
     expect(result).toEqual({ outcome: 'refused', reason: 'verdict-conflict' });
     expect(harness.evidence.stored?.days[0].verdicts.S1).toEqual(before);
@@ -425,7 +504,7 @@ describe('RecordShadowDayUseCase', () => {
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
     expectRecorded(result);
 
-    expect(result.recorded).toEqual({ S9: 'pass', S12: 'pass' });
+    expect(result.recorded).toEqual({ S8: 'pass', S9: 'pass', S12: 'pass' });
     const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
     expect(reasons.get('S1')).toBe('shell-events-unavailable');
     expectNotImplementedUnevaluated(result.unevaluated);
@@ -502,7 +581,7 @@ describe('RecordShadowDayUseCase', () => {
     expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
     expect(harness.evidence.calls.read).toBe(0);
     expect(harness.evidence.calls.cas).toBe(0);
-    expect(harness.otherCalls).toEqual({ legacy: 0, queue: 0, journal: 0, daemon: 0, checkState: 0 });
+    expect(harness.otherCalls).toEqual({ legacy: 0, legacyState: 0, queue: 0, journal: 0, daemon: 0, checkState: 0, import: 0 });
   });
 
   it('evaluates S9 only for yesterday and records S1 and S12 for an older day', async () => {
@@ -516,7 +595,53 @@ describe('RecordShadowDayUseCase', () => {
     expect(result.recorded).toEqual({ S1: 'pass', S12: 'pass' });
     const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
     expect(reasons.get('S9')).toBe('snapshot-only-for-yesterday');
+    expect(reasons.get('S8')).toBe('snapshot-only-for-yesterday');
     expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('records S8 as a fail when a divergence persists across both samples', async () => {
+    const fixture = cleanFixture(DAY);
+    // A shell live entry the fleet queue never sees, in BOTH samples.
+    fixture.shellState = {
+      ...fixture.shellState,
+      queue: { status: 'read', lines: [`7 ${HEAD_A} main`, `8 ${HEAD_B} main`] },
+    };
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S8).toBe('fail');
+    const stored = harness.evidence.stored;
+    const dayRecord = stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(dayRecord?.verdicts.S8?.digest).toBe(
+      expectedSimpleDigest('S8', DAY, 'fail', 'enqueue-coverage-divergence'),
+    );
+  });
+
+  it('reports S8 unevaluated when the import dry-run is refused, still recording S1, S9 and S12', async () => {
+    const fixture = cleanFixture(DAY);
+    const harness = makeHarness(fixture, NOW);
+    harness.setImportDryRun(refusedImport());
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    expect(result.recorded).toEqual({ S1: 'pass', S9: 'pass', S12: 'pass' });
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S8')).toBe('import-unavailable');
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('sleeps exactly once, for exactly the default 150000 ms gap, between the two S8 samples', async () => {
+    const fixture = cleanFixture(DAY);
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S8).toBe('pass');
+    expect(harness.sleeps).toEqual([150_000]);
+    // Both samples were really taken: one shell-state and one import dry-run
+    // read per sample.
+    expect(harness.otherCalls.legacyState).toBe(2);
+    expect(harness.otherCalls.import).toBe(2);
   });
 
   it('refuses a malformed day as invalid-request', async () => {

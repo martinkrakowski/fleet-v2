@@ -44,6 +44,14 @@ import {
   SHADOW_GATE_CONTEXT,
   SHADOW_GATE_MAX_HEADS,
 } from '../../../domain/shadow-day-gate-agreement.js';
+
+/**
+ * The per-run cap on distinct pushed heads, applied before any per-head work
+ * (verdict lookup, attempt reads, forge calls). Together with
+ * `SHADOW_GATE_MAX_HEADS` it bounds one run's contribution, so the read stays
+ * linear in the capped input even before the total-head cap is reached.
+ */
+export const SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN = 500;
 import { isZonedIsoDateTime } from '../../../domain/conductor-halt.js';
 import { readExactPlainRecord } from '../../../domain/plain-record-reads.js';
 import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
@@ -168,8 +176,11 @@ interface PushedHead {
  * `result` record of a completed `open-pr` or `push` step recorded inside
  * `[start, end)`. An entry of another valid kind is not a pushed head; a
  * malformed record (an unknown kind, an unreadable field) is a refusal, not
- * a silent skip. Every field is read through its own data-property
- * descriptor, so no getter runs. Cost: O(1).
+ * a silent skip. The `recordedAtIso` must be a zoned ISO datetime before
+ * `Date.parse` runs: a date-only value (or any other non-zoned string)
+ * refuses with the unreadable reason instead of passing through the window
+ * check. Every field is read through its own data-property descriptor, so no
+ * getter runs. Cost: O(1).
  */
 function pushedHeadOf(
   entry: LaneRunJournalEntryRecord,
@@ -198,6 +209,9 @@ function pushedHeadOf(
     return null;
   }
   const recordedAtIso = readStoreField('journal-unreadable', entry, 'recordedAtIso');
+  if (typeof recordedAtIso !== 'string' || !isZonedIsoDateTime(recordedAtIso)) {
+    refuse('journal-unreadable');
+  }
   const atMs = Date.parse(recordedAtIso as string);
   if (Number.isNaN(atMs) || atMs < windowStartMs || atMs >= windowEndMs) {
     return null;
@@ -206,42 +220,39 @@ function pushedHeadOf(
 }
 
 /**
- * The conductor's verdict at one `head12`: the last (append order) `result`
- * entry with parsed step `gate`, the same `head12`, outcome `completed` and
- * reason code `gate-passed` (pass) or `gate-failed` (fail); every other
- * record at that head — other kinds, `gate-congested` and non-final results
- * — is ignored. A malformed record is a refusal, not a silent skip. No
- * verdict is null. Cost: linear in the capped entries.
+ * One journal entry as the conductor's verdict at its own `head12`, or null
+ * when the entry is not a final `result` record of a completed `gate` step
+ * with reason code `gate-passed` (pass) or `gate-failed` (fail): other
+ * kinds, `gate-congested` and non-final results are ignored. A malformed
+ * record is a refusal, not a silent skip. Every field is read through its
+ * own data-property descriptor, so no getter runs. Cost: O(1).
  */
-function verdictOf(
-  entries: readonly LaneRunJournalEntryRecord[],
-  head12: string,
-): 'pass' | 'fail' | null {
-  let verdict: 'pass' | 'fail' | null = null;
-  for (const entry of entries) {
-    const kind = readStoreField('journal-unreadable', entry, 'kind');
-    if (!isJournalEntryKind(kind)) {
-      refuse('journal-unreadable');
-    }
-    if (kind !== 'result') {
-      continue;
-    }
-    const key = readStoreField('journal-unreadable', entry, 'key');
-    const parsed = readOrRefuse('journal-unreadable', () => parseLaneRunKey(key));
-    if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'gate' || parsed.head12 !== head12) {
-      continue;
-    }
-    if (readStoreField('journal-unreadable', entry, 'outcome') !== 'completed') {
-      continue;
-    }
-    const reasonCode = readStoreField('journal-unreadable', entry, 'reasonCode');
-    if (reasonCode === 'gate-passed') {
-      verdict = 'pass';
-    } else if (reasonCode === 'gate-failed') {
-      verdict = 'fail';
-    }
+function gateVerdictOf(
+  entry: LaneRunJournalEntryRecord,
+): { readonly head12: string; readonly verdict: 'pass' | 'fail' } | null {
+  const kind = readStoreField('journal-unreadable', entry, 'kind');
+  if (!isJournalEntryKind(kind)) {
+    refuse('journal-unreadable');
   }
-  return verdict;
+  if (kind !== 'result') {
+    return null;
+  }
+  const key = readStoreField('journal-unreadable', entry, 'key');
+  const parsed = readOrRefuse('journal-unreadable', () => parseLaneRunKey(key));
+  if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'gate' || parsed.head12 === null) {
+    return null;
+  }
+  if (readStoreField('journal-unreadable', entry, 'outcome') !== 'completed') {
+    return null;
+  }
+  const reasonCode = readStoreField('journal-unreadable', entry, 'reasonCode');
+  if (reasonCode === 'gate-passed') {
+    return { head12: parsed.head12, verdict: 'pass' };
+  }
+  if (reasonCode === 'gate-failed') {
+    return { head12: parsed.head12, verdict: 'fail' };
+  }
+  return null;
 }
 
 /**
@@ -337,8 +348,19 @@ function runIdsOf(runRecords: readonly LaneRunRecord[]): readonly RunWithId[] {
 }
 
 /**
- * One run's journal entries as its verdicted heads. Cost: linear in the
- * capped entries.
+ * One run's journal entries as its verdicted heads, in ONE linear pass: the
+ * entries are read into a private array (the journal-entry array is read
+ * once, each entry through its own data-property descriptor, so a
+ * store-provided array is never traversed with `for...of`, `.map` or spread
+ * and no getter can run — an accessor-backed or missing entry refuses,
+ * never a silent skip), then a single pass over the entries builds (a) the
+ * distinct pushed heads with their earliest push time inside the window and
+ * (b) the last (append order) verdict per `head12`. Each distinct head is
+ * looked up in O(1), so the journal is never rescanned per head. More than
+ * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN` entries refuses; more than
+ * `SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN` distinct pushed heads refuses
+ * before any per-head work. Cost: one linear pass in the capped entries;
+ * the per-run head cap is a named constant.
  */
 function runHeadsOf(
   run: LaneRunRecord,
@@ -355,10 +377,7 @@ function runHeadsOf(
     refuse('too-many-journal-entries');
   }
   const heads = new Map<string, PushedHead>();
-  // The journal-entry array is read once, each entry through its own
-  // data-property descriptor, into a private array: a store-provided array is
-  // never traversed with `for...of`, `.map` or spread, so no getter can run.
-  // An accessor-backed or missing entry refuses — never a silent skip.
+  const verdictsByHead = new Map<string, 'pass' | 'fail'>();
   const entryRecords: LaneRunJournalEntryRecord[] = [];
   for (let index = 0; index < entryCount; index += 1) {
     const element = readStoreField('journal-unreadable', entries, String(index));
@@ -369,18 +388,25 @@ function runHeadsOf(
   }
   for (const entry of entryRecords) {
     const pushed = pushedHeadOf(entry, windowStartMs, windowEndMs);
-    if (pushed === null) {
-      continue;
+    if (pushed !== null) {
+      const earliest = heads.get(pushed.head12);
+      if (earliest === undefined || pushed.pushedAtMs < earliest.pushedAtMs) {
+        heads.set(pushed.head12, pushed);
+      }
     }
-    const earliest = heads.get(pushed.head12);
-    if (earliest === undefined || pushed.pushedAtMs < earliest.pushedAtMs) {
-      heads.set(pushed.head12, pushed);
+    const gate = gateVerdictOf(entry);
+    if (gate !== null) {
+      verdictsByHead.set(gate.head12, gate.verdict);
     }
   }
+  if (heads.size > SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN) {
+    refuse('too-many-run-heads');
+  }
+  // Only pushed heads matter: a verdict at a head that never reached the
+  // pull request is ignored. Each head is one O(1) map lookup.
   const verdicts = new Map<string, 'pass' | 'fail'>();
-  for (const head12 of heads.keys()) {
-    const verdict = verdictOf(entryRecords, head12);
-    if (verdict !== null) {
+  for (const [head12, verdict] of verdictsByHead) {
+    if (heads.has(head12)) {
       verdicts.set(head12, verdict);
     }
   }
@@ -511,8 +537,12 @@ async function readCiGate(
  * the same commit. The whole read runs inside the outer refusal catch, so
  * any throw from the request, from a value copied out of it, or from a run
  * record becomes the typed `unknown` result — never a rejection. Cost:
- * linear in the capped input; the caps (`SHADOW_FACTS_MAX_RUNS`,
+ * linear in the capped input — one pass over each run's capped journal
+ * (every distinct head is then looked up in O(1), never by rescanning the
+ * journal), linear in the capped attempts, and one forge call per distinct
+ * sha; the caps (`SHADOW_FACTS_MAX_RUNS`,
  * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`,
+ * `SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN`,
  * `SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN`, `SHADOW_GATE_MAX_HEADS`) are named
  * constants.
  */

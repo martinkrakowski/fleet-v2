@@ -16,7 +16,10 @@ export type {
   ShadowConformanceRunsRead,
   ShadowConformanceRunsUnknown,
 } from './conducted-facts.js';
-export { readShadowGateHeads } from './gate-heads.js';
+export {
+  readShadowGateHeads,
+  SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN,
+} from './gate-heads.js';
 export type {
   ShadowGateHeadsDependencies,
   ShadowGateHeadsRequest,

@@ -18,6 +18,9 @@ import {
   SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN,
 } from '../../../domain/shadow-day-conformance.js';
 import {
+  SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN,
+} from '../shadow-day/index.js';
+import {
   SHADOW_GATE_CONTEXT,
   SHADOW_GATE_MAX_HEADS,
 } from '../../../domain/shadow-day-gate-agreement.js';
@@ -990,6 +993,99 @@ describe('readShadowGateHeads', () => {
       const result = await readShadowGateHeads(fakes.deps, request());
       expect(result).toEqual({ status: 'unknown', reason: 'too-many-runs' });
       expect(getterRuns).toBe(0);
+    });
+
+    it('refuses an enormous sparse journal-entry list before any traversal, with zero element reads', async () => {
+      let getterRuns = 0;
+      const hostileEntries: unknown[] = new Array(2 ** 32 - 1);
+      Object.defineProperty(hostileEntries, 0, {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return null;
+        },
+      });
+      const fakes = makeFakes({
+        runRecords: [makeRun(RUN_1)],
+        journals: new Map([[RUN_1, hostileEntries as unknown as readonly LaneRunJournalEntryRecord[]]]),
+      });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'too-many-journal-entries' });
+      expect(getterRuns).toBe(0);
+    });
+
+    it('refuses a date-only recordedAtIso with the unreadable reason instead of passing it through the window check', async () => {
+      const entries = [
+        makeEntry(stepKey(RUN_1, 'push', HEAD_12_1), '2026-11-27' as unknown as string),
+        makeEntry(stepKey(RUN_1, 'gate', HEAD_12_1), '2026-11-27T11:00:00.000Z', { reasonCode: 'gate-passed' }),
+      ];
+      const fakes = makeFakes({
+        runRecords: [makeRun(RUN_1, { attemptIds: [ATTEMPT_1] })],
+        journals: new Map([[RUN_1, entries]]),
+        attemptsById: new Map([[ATTEMPT_1, makeAttempt(ATTEMPT_1, HEAD_1)]]),
+      });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+    });
+
+    it('reads many distinct heads with one journal pass (linear entry reads), the journal read once', async () => {
+      const headCount = 60;
+      const entries: LaneRunJournalEntryRecord[] = [];
+      const attemptsById = new Map<string, AttemptRecord>();
+      const attemptIds: string[] = [];
+      for (let index = 0; index < headCount; index += 1) {
+        const headSha = index.toString(16).padStart(4, '0') + 'f'.repeat(36);
+        const attemptId = 'attempt-' + index.toString().padStart(4, '0') + '-example';
+        entries.push(makeEntry(stepKey(RUN_1, 'push', headSha.slice(0, 12)), WINDOW_START_ISO));
+        entries.push(makeEntry(stepKey(RUN_1, 'gate', headSha.slice(0, 12)), WINDOW_START_ISO, { reasonCode: 'gate-passed' }));
+        attemptIds.push(attemptId);
+        attemptsById.set(attemptId, makeAttempt(attemptId, headSha));
+      }
+      // A counting fake: every descriptor read of every journal-entry record
+      // goes through this Proxy trap, so the entry-read count is observable.
+      let entryReads = 0;
+      const counting = (record: LaneRunJournalEntryRecord): LaneRunJournalEntryRecord =>
+        new Proxy(record, {
+          getOwnPropertyDescriptor(target, property) {
+            entryReads += 1;
+            return Reflect.getOwnPropertyDescriptor(target, property);
+          },
+        });
+      const countedEntries = entries.map(counting) as unknown as readonly LaneRunJournalEntryRecord[];
+      const fakes = makeFakes({
+        runRecords: [makeRun(RUN_1, { attemptIds })],
+        journals: new Map([[RUN_1, countedEntries]]),
+        attemptsById,
+      });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result.status).toBe('ok');
+      if (result.status === 'ok') {
+        expect(result.heads).toHaveLength(headCount);
+      }
+      expect(fakes.listForRunCalls).toEqual([RUN_1]);
+      // Linear: a bounded number of reads per entry. The per-head rescan of
+      // the whole journal (the quadratic bound) would need about
+      // `headCount * entries.length` extra entry reads and fails this.
+      expect(entryReads).toBeLessThan(20 * entries.length);
+      expect(entryReads).toBeGreaterThanOrEqual(entries.length);
+    });
+
+    it('refuses more distinct pushed heads in one run than the per-run cap, before any per-head work', async () => {
+      const entries: LaneRunJournalEntryRecord[] = [];
+      for (let index = 0; index <= SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN; index += 1) {
+        const head12 = index.toString(16).padStart(4, '0') + 'f'.repeat(8);
+        entries.push(makeEntry(stepKey(RUN_1, 'push', head12), WINDOW_START_ISO));
+        entries.push(makeEntry(stepKey(RUN_1, 'gate', head12), WINDOW_START_ISO, { reasonCode: 'gate-passed' }));
+      }
+      const fakes = makeFakes({
+        runRecords: [makeRun(RUN_1, { attemptIds: [ATTEMPT_1] })],
+        journals: new Map([[RUN_1, entries]]),
+        attemptsById: new Map([[ATTEMPT_1, makeAttempt(ATTEMPT_1, HEAD_1)]]),
+      });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'too-many-run-heads' });
+      expect(fakes.attemptCalls).toEqual([]);
+      expect(fakes.forgeCalls).toEqual([]);
     });
 
     it('refuses a string where a list is expected (runs list and journal list)', async () => {

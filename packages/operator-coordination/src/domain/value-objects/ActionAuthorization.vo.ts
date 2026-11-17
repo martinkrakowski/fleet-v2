@@ -6,6 +6,7 @@
  * action; it never becomes authority for an unrelated or privileged action.
  */
 
+import { readReleaseRoot } from '../coordination-records.js';
 export interface ActionAuthorizationProps {
   readonly grantId: string;
   readonly projectId: string;
@@ -14,6 +15,11 @@ export interface ActionAuthorizationProps {
   readonly policyRevision: string;
   readonly decisionRevision: string;
   readonly consumed: boolean;
+  /**
+   * The release root the grant is bound to (CO14 follow-up); only a release
+   * grant carries one. A grant for one root authorizes only that root.
+   */
+  readonly releaseRoot?: string;
 }
 
 const REQUIRED_FIELDS = [
@@ -49,6 +55,10 @@ export class ActionAuthorization {
     if (typeof candidate.consumed !== 'boolean') {
       return { success: false, error: new Error('ActionAuthorization requires a boolean consumed') };
     }
+    const releaseRoot = readReleaseRoot(candidate);
+    if (releaseRoot.state === 'invalid') {
+      return { success: false, error: new Error('ActionAuthorization requires a bounded releaseRoot when it carries one') };
+    }
     return {
       success: true,
       value: new ActionAuthorization({
@@ -59,6 +69,7 @@ export class ActionAuthorization {
         policyRevision: candidate.policyRevision as string,
         decisionRevision: candidate.decisionRevision as string,
         consumed: candidate.consumed as boolean,
+        ...(releaseRoot.state === 'valid' ? { releaseRoot: releaseRoot.value } : {}),
       }),
     };
   }
@@ -94,7 +105,8 @@ export class ActionAuthorization {
       this.props.expectedHeadSha === other.props.expectedHeadSha &&
       this.props.policyRevision === other.props.policyRevision &&
       this.props.decisionRevision === other.props.decisionRevision &&
-      this.props.consumed === other.props.consumed
+      this.props.consumed === other.props.consumed &&
+      this.props.releaseRoot === other.props.releaseRoot
     );
   }
 }

@@ -24,7 +24,7 @@ import {
   RunMergePassUseCase,
   computeCallBudget,
   isZonedIsoDateTime,
-  sha256HexDigest,
+  mergeQueueRepositoryDigest,
   type DaemonRepositoryRef,
   type GhForgeMergeReadAdapter,
   type GhInvocationResult,
@@ -112,7 +112,7 @@ export function toDaemonRepositoryRefs(
   return answer.repositories.map((entry) => ({
     owner: entry.owner,
     repo: entry.repo,
-    repoDigest: sha256HexDigest(`${entry.owner}/${entry.repo}`).slice(0, 12),
+    repoDigest: mergeQueueRepositoryDigest(entry),
     projectId: entry.projectId,
     policy: {
       policyRevision: answer.policyRevision,

@@ -1180,14 +1180,16 @@ describe('ReviewRequestAdapter with a chain subject', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('refuses the brief subject and the brief-verify kind as subject-not-implemented', async () => {
+  it('refuses a mismatched brief subject and a brief-verify kind with no brief subject as invalid-request', async () => {
     const { calls, requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: chainReceipt() });
     const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    // Chain attempt id, pre-merge kind and diff summary: not a valid brief request.
     expect(await adapter.requestReview(chainRequest({ subject: BRIEF_SUBJECT }))).toEqual({
-      outcome: 'refused', reason: 'subject-not-implemented', detail: null,
+      outcome: 'refused', reason: 'invalid-request', detail: null,
     });
+    // brief-verify with no brief subject.
     expect(await adapter.requestReview(makeReviewRequest({ kind: 'brief-verify' }))).toEqual({
-      outcome: 'refused', reason: 'subject-not-implemented', detail: null,
+      outcome: 'refused', reason: 'invalid-request', detail: null,
     });
     expect(calls).toHaveLength(0);
   });

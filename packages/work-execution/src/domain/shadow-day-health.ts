@@ -217,8 +217,9 @@ function pushJobEvent(byJob: Map<string, JobSequence[]>, event: DaemonEventRecor
 
 /** One sampled journal entry's S9-relevant fields, or null when out of shape. */
 interface SampledJournalEntry {
-  readonly key: string;
-  readonly kind: 'intent' | 'result';
+  /** intent and result: the entry's key; conduct: null, matching the journal contract exactly. */
+  readonly key: string | null;
+  readonly kind: 'intent' | 'result' | 'conduct';
   /** A known outcome string on a `result` entry; `null` on every other kind, matching the journal contract exactly. */
   readonly outcome: string | null;
   readonly recordedAtIso: string;
@@ -235,15 +236,26 @@ function readSampledEntry(raw: unknown): SampledJournalEntry | null {
   const { key, kind, outcome, recordedAtIso } = snapshot;
   // A kind the journal contract does not name is refused, never silently
   // ignored: an unrecognized entry must turn the day `unknown` rather than
-  // disappear from the tally. S9 samples only intent and result entries; a
-  // conduct entry carries no key, so it cannot be judged here.
-  if (kind !== 'intent' && kind !== 'result') {
-    return null;
-  }
-  if (typeof key !== 'string' || key.length === 0) {
+  // disappear from the tally. A `conduct` entry is a normal part of a real
+  // journal (a conduct entry for an entered state) and is accepted here, but
+  // it carries no key, so it is excluded from the keyed intent/result
+  // tallying below rather than judged against any key.
+  if (kind !== 'intent' && kind !== 'result' && kind !== 'conduct') {
     return null;
   }
   if (typeof recordedAtIso !== 'string' || !isZonedIsoDateTime(recordedAtIso)) {
+    return null;
+  }
+  if (kind === 'conduct') {
+    // The journal contract requires `key: null` and `outcome: null` on every
+    // conduct entry (lane-run-journal.ts); anything else there is malformed,
+    // exactly as for intent and result below.
+    if (key !== null || outcome !== null) {
+      return null;
+    }
+    return { key: null, kind, outcome: null, recordedAtIso: new Date(recordedAtIso).toISOString() };
+  }
+  if (typeof key !== 'string' || key.length === 0) {
     return null;
   }
   // The journal contract carries a real outcome string only on a `result`
@@ -270,21 +282,37 @@ interface KeyTally {
   hasResult: boolean;
   /** The earliest `recordedAtIso` among this key's `result` entries, any outcome, or null with none. */
   earliestResultIso: string | null;
+  /** The earliest `recordedAtIso` among this key's non-`ambiguous` ("final") results, or null with none. */
+  finalResultIso: string | null;
+  /** The latest `recordedAtIso` among this key's `result` entries, any outcome, or null with none. */
+  latestResultIso: string | null;
 }
 
 /**
  * The per-key tallies. Every field is an order-independent aggregate (a
- * count, or a minimum timestamp) over the whole entry set for that key, so
- * the verdict never depends on the position an entry happens to occupy in
- * the input array — only on each entry's own `kind`, `outcome` and
- * `recordedAtIso`.
+ * count, or a minimum/maximum timestamp) over the whole entry set for that
+ * key, so the verdict never depends on the position an entry happens to
+ * occupy in the input array — only on each entry's own `kind`, `outcome` and
+ * `recordedAtIso`. A `conduct` entry carries no key (`entry.key === null`)
+ * and is excluded here: it has nothing to tally against any key's sequence.
  */
 function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyTally> {
   const tallies = new Map<string, KeyTally>();
   for (const entry of entries) {
+    if (entry.key === null) {
+      continue;
+    }
     let tally = tallies.get(entry.key);
     if (tally === undefined) {
-      tally = { intents: 0, intentIso: null, nonAmbiguousResults: 0, hasResult: false, earliestResultIso: null };
+      tally = {
+        intents: 0,
+        intentIso: null,
+        nonAmbiguousResults: 0,
+        hasResult: false,
+        earliestResultIso: null,
+        finalResultIso: null,
+        latestResultIso: null,
+      };
       tallies.set(entry.key, tally);
     }
     if (entry.kind === 'intent') {
@@ -298,8 +326,14 @@ function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyT
       if (tally.earliestResultIso === null || entry.recordedAtIso < tally.earliestResultIso) {
         tally.earliestResultIso = entry.recordedAtIso;
       }
+      if (tally.latestResultIso === null || entry.recordedAtIso > tally.latestResultIso) {
+        tally.latestResultIso = entry.recordedAtIso;
+      }
       if (entry.outcome !== 'ambiguous') {
         tally.nonAmbiguousResults += 1;
+        if (tally.finalResultIso === null || entry.recordedAtIso < tally.finalResultIso) {
+          tally.finalResultIso = entry.recordedAtIso;
+        }
       }
     }
   }
@@ -375,6 +409,20 @@ function judgeJournalIntegrity(entries: readonly SampledJournalEntry[], sampledA
     }
     if (tally.nonAmbiguousResults > 1) {
       return FAIL('journal-duplicate-result');
+    }
+    // Once a key has a final (non-`ambiguous`) result, the real journal
+    // store refuses to append anything further for that key at write time
+    // (lane-run-journal.ts's `resultRefusal`/`isClosedByFinalResult`, reason
+    // `result-after-final`). A result of any outcome recorded after the
+    // key's earliest final result represents that otherwise-impossible
+    // state, so it is flagged here too, distinct from two non-`ambiguous`
+    // results (`journal-duplicate-result` above).
+    if (
+      tally.finalResultIso !== null &&
+      tally.latestResultIso !== null &&
+      tally.latestResultIso > tally.finalResultIso
+    ) {
+      return FAIL('journal-result-after-final');
     }
     // A result with no intent at all, or one recorded before the key's
     // earliest intent, breaks the journal contract's required order. Both

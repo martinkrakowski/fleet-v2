@@ -195,6 +195,11 @@ function journalEntry(key: string, kind: string, outcome: string | null, recorde
   return { key, kind, outcome, recordedAtIso };
 }
 
+/** A `conduct` entry, as the real journal shapes it: no key, no outcome. */
+function conductEntry(recordedAtIso: string): Record<string, unknown> {
+  return { key: null, kind: 'conduct', outcome: null, recordedAtIso };
+}
+
 function stateInput(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     stateCheck: { checked: 5, bad: 0 },
@@ -295,13 +300,37 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
   });
 
   it('passes a key whose intent precedes both results chronologically even when the array lists a result before the intent', () => {
+    // The ambiguous result is chronologically earliest of the two results
+    // and the completed (final) result is latest — the only order a real
+    // journal allows at append time — even though the array itself lists
+    // the completed result before the ambiguous one and the intent last.
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [
-        journalEntry('k8', 'result', 'ambiguous', '2026-11-10T09:10:00.000Z'),
-        journalEntry('k8', 'result', 'completed', '2026-11-10T09:05:00.000Z'),
+        journalEntry('k8', 'result', 'completed', '2026-11-10T09:10:00.000Z'),
+        journalEntry('k8', 'result', 'ambiguous', '2026-11-10T09:05:00.000Z'),
         journalEntry('k8', 'intent', null, '2026-11-10T09:00:00.000Z'),
       ],
     }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+  });
+
+  it('accepts a normal conduct entry (key null, outcome null) and excludes it from tallying, evaluating the rest normally', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        conductEntry(PREV_23(40)),
+        journalEntry('k9', 'intent', null, PREV_23(50)),
+        journalEntry('k9', 'result', 'completed', PREV_23(51)),
+      ],
+    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+  });
+
+  it('fails journal-result-after-final when an ambiguous result is recorded after the key\'s final result', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k10', 'intent', null, PREV_23(50)),
+        journalEntry('k10', 'result', 'completed', PREV_23(51)),
+        journalEntry('k10', 'result', 'ambiguous', PREV_23(52)),
+      ],
+    }))).toEqual({ status: 'fail', reason: 'journal-result-after-final' });
   });
 
   it('reports unknown/state-check-unavailable when stateCheck is null', () => {

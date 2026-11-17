@@ -260,6 +260,13 @@ function expectClockBeforeEveryPort(log: readonly LogEntry[]): void {
   }
 }
 
+/** Runs queued promise reactions without moving the fake clock. */
+async function drainMicrotasks(turns: number): Promise<void> {
+  for (let turn = 0; turn < turns; turn += 1) {
+    await Promise.resolve();
+  }
+}
+
 describe('WatchTrainHealthUseCase', () => {
   it('refuses null request with zero port calls', async () => {
     const { deps, log } = makeDeps();
@@ -1274,5 +1281,142 @@ describe('WatchTrainHealthUseCase', () => {
     expect(malformedResult).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' });
     expect(malformed.speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
     expect(malformed.raiseCalls).toHaveLength(0);
+  });
+
+  it('hung speak on an advancing clock with a 60s deadline still raises every due target and reports the unspoken sentences', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+    try {
+      // Three due sentences, each hung speak capped at 10s, raise reserve 32s.
+      // A speak starts only while remaining - 10s stays at least 32s:
+      // 60s speaks, 50s speaks, 40s stops. The one sentence not started is reported.
+      const deadlineIso = new Date(Date.parse(NOW) + 60_000).toISOString();
+      const { deps, speakCalls, raiseCalls } = makeDeps({
+        alertMode: 'on',
+        now: () => new Date(Date.now()).toISOString(),
+        alertSpeak: () => new Promise<never>(() => {}),
+        stateRead: okState(healthySnapshot({ lastTickFinishedAtIso: NOW, queue: closedEntries(3) })) as never,
+        openItems: [],
+      });
+      const pending = run(deps, baseRequest({ deadlineIso }));
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+      await drainMicrotasks(30);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await drainMicrotasks(30);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await drainMicrotasks(30);
+      const result = await pending;
+      expect(result).toMatchObject({
+        outcome: 'evaluated',
+        announced: 0,
+        announceFailures: 2,
+        announceSuppressed: 1,
+        raised: 3,
+        budgetExhausted: false,
+      });
+      expect(raiseCalls).toHaveLength(3);
+      expect(speakCalls).toEqual([{ sentence: staleSentence(1) }, { sentence: staleSentence(2) }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('budget exhausted before any speak reports nothing spoken and every planned sentence unspoken', async () => {
+    const late = '2026-11-16T12:10:00.000Z';
+    // Reads: watch, readState, list, then the announce budget, which is already past the deadline.
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      nowSchedule: [NOW, NOW, NOW, late],
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 0,
+      announceFailures: 0,
+      announceSuppressed: 1,
+      budgetExhausted: true,
+      raised: 0,
+      healthy: false,
+      exitCode: 1,
+    });
+    expect(speakCalls).toHaveLength(0);
+    expect(raiseCalls).toHaveLength(0);
+  });
+
+  it('speak returning refused counts one announceFailures and raise still happens', async () => {
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      alertSpeak: () => ({ outcome: 'refused', reasonCode: 'invalid-request' }),
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 0,
+      announceFailures: 1,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+  });
+
+  it('speak returning invalid-request counts one announceFailures and raise still happens', async () => {
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      alertSpeak: () => ({ outcome: 'refused', reasonCode: 'invalid-request' }),
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 0,
+      announceFailures: 1,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+  });
+
+  it('a speak result whose outcome is a getter never runs and counts one announceFailures', async () => {
+    let outcomeReads = 0;
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      alertSpeak: () => {
+        const answer: { outcome?: string } = {};
+        Object.defineProperty(answer, 'outcome', {
+          enumerable: true,
+          configurable: true,
+          get() {
+            outcomeReads += 1;
+            return 'spoken';
+          },
+        });
+        return answer;
+      },
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(outcomeReads).toBe(0);
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 0,
+      announceFailures: 1,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
   });
 });

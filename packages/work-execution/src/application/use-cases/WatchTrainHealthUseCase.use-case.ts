@@ -30,7 +30,11 @@ import type {
   TrainHealthAnnouncementOpenItem,
   TrainHealthAnnouncementTarget,
 } from '../../domain/train-health-announcements.js';
-import { DAEMON_REPO_DIGEST_PATTERN, computeCallBudget } from '../../domain/daemon-tick.js';
+import {
+  DAEMON_CALL_MIN_REMAINING_MS,
+  DAEMON_REPO_DIGEST_PATTERN,
+  computeCallBudget,
+} from '../../domain/daemon-tick.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type { TrainHealthStateReadPort } from '../ports/out/TrainHealthStateReadPort.out-port.js';
 import type { HostAudibleAlertPort } from '../ports/out/HostAudibleAlertPort.out-port.js';
@@ -47,6 +51,21 @@ import type {
 } from '../ports/in/WatchTrainHealthPort.in-port.js';
 
 const NORMAL_TIMEOUT_MS = 30_000;
+
+/**
+ * Alerting is best-effort and must not starve raising. A hung `speak` is cut
+ * at this cap instead of the 30 s call budget, so speech cannot consume the
+ * time the durable attention items still need.
+ */
+const SPEAK_TIMEOUT_MS = 10_000;
+
+/**
+ * Time kept for raising. One full raise timeout, plus the minimum remaining
+ * `computeCallBudget` requires before it will start the next attention call.
+ * Speaking stops once a speak at `SPEAK_TIMEOUT_MS` would leave less than
+ * this; the sentences not started count as not spoken, and raising still runs.
+ */
+const RAISE_BUDGET_RESERVE_MS = NORMAL_TIMEOUT_MS + DAEMON_CALL_MIN_REMAINING_MS;
 
 /** Success outcomes of the raise and clear attention calls. */
 const RAISE_OK: readonly (string | null)[] = ['raised', 'refreshed', 'reopened'];
@@ -105,6 +124,7 @@ type ClockBudget =
       readonly nowIso: string;
       readonly allowed: boolean;
       readonly timeoutMs: number;
+      readonly remainingMs: number;
       readonly reason: 'budget-exhausted' | 'invalid-budget' | null;
     }
   | { readonly ok: false; readonly reason: 'invalid-clock' };
@@ -306,6 +326,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
         nowIso,
         allowed: decision.allowed,
         timeoutMs: decision.allowed ? decision.timeoutMs : 0,
+        remainingMs: decision.remainingMs,
         reason: decision.allowed ? null : decision.reason,
       };
     } catch {
@@ -558,7 +579,9 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     }
     if (!clock.allowed) {
       const planned = this.decisionOf(targets, listed, clock.nowIso);
-      return announcedOk(0, 0, planned.suppressed, true);
+      // Nothing was spoken. Report the planned sentences as unspoken, not the
+      // decision's suppressed count (targets that were never given a sentence).
+      return announcedOk(0, 0, planned.sentences.length, true);
     }
     return this.announce(targets, listed, validated, clock.nowIso);
   }
@@ -653,6 +676,8 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
    * Speaks each sentence inside the call budget. Anything other than an own
    * data property `outcome === 'spoken'` counts as one failure and the loop
    * continues. An invalid clock refuses the whole pass; a spent budget stops.
+   * Each speak is capped at `SPEAK_TIMEOUT_MS`, and speech stops while enough
+   * time remains to raise, counting the sentences not started as unspoken.
    */
   private async speakSentences(
     validated: ValidatedRequest,
@@ -665,6 +690,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     }
     let announced = 0;
     let announceFailures = 0;
+    let index = 0;
     for (const sentence of sentences) {
       const budget = await this.budget(validated.deadlineIso);
       if (!budget.ok) {
@@ -673,12 +699,19 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
       if (!budget.allowed) {
         return announcedOk(announced, announceFailures, announceSuppressed, true);
       }
-      const spoken = await this.oneSpeak(alert, sentence, budget.timeoutMs);
+      const timeoutMs = Math.min(SPEAK_TIMEOUT_MS, budget.timeoutMs);
+      // Leave the raise reserve. This is not an exhausted deadline: raising still runs.
+      if (budget.remainingMs - timeoutMs < RAISE_BUDGET_RESERVE_MS) {
+        const unspoken = sentences.length - index;
+        return announcedOk(announced, announceFailures, announceSuppressed + unspoken, false);
+      }
+      const spoken = await this.oneSpeak(alert, sentence, timeoutMs);
       if (spoken) {
         announced += 1;
-        continue;
+      } else {
+        announceFailures += 1;
       }
-      announceFailures += 1;
+      index += 1;
     }
     return announcedOk(announced, announceFailures, announceSuppressed, false);
   }

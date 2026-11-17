@@ -4,9 +4,9 @@
 // accepted on the command and never forwarded. A raise result carries
 // `previousRaisedAtIso` exactly as the delegate answer stored it before the
 // overwrite: the answer must carry it as an own data property on every success
-// outcome — exactly null for `raised`, and for `refreshed` and `reopened` the
-// stored record's last raise time, null or a zoned ISO string (anything else,
-// including a missing or accessor-backed field, is a failed raise).
+// outcome — exactly null for `raised`, and for `refreshed` and `reopened` a
+// zoned ISO string, the stored record's last raise time (anything else,
+// including null, a missing or accessor-backed field, is a failed raise).
 
 import { describe, expect, it } from 'vitest';
 
@@ -326,7 +326,7 @@ describe('TrainHealthAttentionAdapter', () => {
         calls.push({ body, actor });
         const outcome = outcomes[index];
         index += 1;
-        return { outcome, previousRaisedAtIso: null };
+        return { outcome, previousRaisedAtIso: RAISED_AT };
       },
     });
     const raw = command();
@@ -335,12 +335,12 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(await adapter.raiseTrainHealthAttention(raw)).toEqual({
       outcome: 'refreshed',
       reasonCode: null,
-      previousRaisedAtIso: null,
+      previousRaisedAtIso: RAISED_AT,
     });
     expect(await adapter.raiseTrainHealthAttention(raw)).toEqual({
       outcome: 'reopened',
       reasonCode: null,
-      previousRaisedAtIso: null,
+      previousRaisedAtIso: RAISED_AT,
     });
     expect(calls).toEqual([
       { actor: 'train-watchdog', body: projectBody('tick-stale') },
@@ -461,7 +461,7 @@ describe('TrainHealthAttentionAdapter', () => {
     });
   });
 
-  it('returns the closed record last raise time on reopen, and null when the store keeps none', async () => {
+  it('returns the closed record last raise time on reopen, and refuses unreadable when the store keeps none', async () => {
     const CLOSED_RAISED_AT = '2026-11-15T10:00:00.000Z';
     const adapter = new TrainHealthAttentionAdapter({
       recordAttentionItem: async () => ({
@@ -479,9 +479,28 @@ describe('TrainHealthAttentionAdapter', () => {
       recordAttentionItem: async () => ({ outcome: 'reopened', previousRaisedAtIso: null }),
     });
     expect(await withoutStoredTime.raiseTrainHealthAttention(command())).toEqual({
-      outcome: 'reopened',
-      reasonCode: null,
-      previousRaisedAtIso: null,
+      outcome: 'refused',
+      reasonCode: 'unreadable',
+    });
+  });
+
+  it('a refreshed result with previousRaisedAtIso null is a failed raise', async () => {
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => ({ outcome: 'refreshed', previousRaisedAtIso: null }),
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'unreadable',
+    });
+  });
+
+  it('a refreshed result whose previousRaisedAtIso is an unzoned string is a failed raise', async () => {
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => ({ outcome: 'refreshed', previousRaisedAtIso: '2026-11-16T01:02:03' }),
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'unreadable',
     });
   });
 
@@ -842,6 +861,61 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(requests).toEqual([{ projectId: PROJECT, state: 'open' }]);
     expectNoDeadline(requests);
     expect(itemReads).toBe(0);
+  });
+
+  it('skips a proxy entry whose get or ownKeys trap throws and still lists the other valid items', async () => {
+    const query = listQuery();
+    const hostileProxy = new Proxy(
+      { item: { projectId: PROJECT, kind: 'train-tick-stale', subject: { kind: 'project', ref: PROJECT }, summary: 'x', lastRaisedAtIso: RAISED_AT } },
+      {
+        get(): never {
+          throw new Error('boom');
+        },
+        getOwnPropertyDescriptor(): never {
+          throw new Error('boom');
+        },
+        ownKeys(): never {
+          throw new Error('boom');
+        },
+      },
+    );
+    const requests: unknown[] = [];
+    const adapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async (request) => {
+        requests.push(request);
+        return { items: [projectEntry('tick-stale'), hostileProxy, projectEntry('queue-too-large')] };
+      },
+    });
+    expect(await adapter.listOpenTrainHealthAttention(query)).toEqual({
+      outcome: 'found',
+      items: [
+        { rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: RAISED_AT },
+        { rule: 'queue-too-large', pullRequest: null, lastRaisedAtIso: RAISED_AT },
+      ],
+    });
+    expect(requests).toEqual([{ projectId: PROJECT, state: 'open' }]);
+  });
+
+  it('skips pr entries whose pull-request suffix is #0 or #01', async () => {
+    const query = listQuery();
+    const requests: unknown[] = [];
+    const adapter = new TrainHealthAttentionAdapter({
+      listAttentionItems: async (request) => {
+        requests.push(request);
+        return {
+          items: [
+            prEntry('stale-queue-entry', `${OWNER}/${REPO}#0`),
+            prEntry('repeated-park', `${OWNER}/${REPO}#01`),
+            prEntry('stale-queue-entry', `${OWNER}/${REPO}#12`),
+          ],
+        };
+      },
+    });
+    expect(await adapter.listOpenTrainHealthAttention(query)).toEqual({
+      outcome: 'found',
+      items: [{ rule: 'stale-queue-entry', pullRequest: 12, lastRaisedAtIso: RAISED_AT }],
+    });
+    expect(requests).toEqual([{ projectId: PROJECT, state: 'open' }]);
   });
 
   it('returns unavailable when list answer is null, items is not an array, delegate throws, or items exceeds 5000 entries', async () => {

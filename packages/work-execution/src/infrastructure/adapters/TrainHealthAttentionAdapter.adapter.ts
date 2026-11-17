@@ -10,13 +10,15 @@
  * answer, which the delegate produces inside its own locked read-modify-write:
  * the stored `lastRaisedAtIso` captured immediately before the overwrite, a
  * zoned ISO string exactly as stored and never re-formatted. The adapter makes
- * no second read of its own. It is null when the outcome is `raised` (no prior
- * open or closed record). For `refreshed` and `reopened` the answer must carry
- * `previousRaisedAtIso` as null or a zoned ISO string, returned exactly as
- * stored and never re-formatted. On every success outcome the answer must
- * carry `previousRaisedAtIso` as an own data property — exactly `null` for
- * `raised`, and null or a zoned ISO string for `refreshed` and `reopened`;
- * anything else is a failed raise, and the adapter never synthesizes a value.
+ * no second read of its own. It is null only when the outcome is `raised` (no
+ * prior open or closed record). For `refreshed` and `reopened` the answer must
+ * carry `previousRaisedAtIso` as a zoned ISO string — a prior record existed,
+ * so there is a stored time — returned exactly as stored and never
+ * re-formatted. On every success outcome the answer must
+ * carry `previousRaisedAtIso` as an own data property: exactly `null` for
+ * `raised`, and a zoned ISO string for `refreshed` and `reopened`; anything
+ * else, including null on a refreshed or reopened answer, is a failed raise,
+ * and the adapter never synthesizes a value.
  *
  * Project-scoped items use subject `{ kind: 'project', ref: projectId }`
  * because that store subject cannot carry owner/repo. A list keeps such an
@@ -318,9 +320,11 @@ function mapAttentionAnswer<T extends string>(answer: unknown, accepted: readonl
  * The raise answer's `previousRaisedAtIso`, read under the delegate's lock as
  * part of the same answer that raised the item. Every success outcome must
  * carry it as an own data property: exactly `null` for `raised` (no prior
- * record), and null or a zoned ISO string for `refreshed` and `reopened`,
- * returned exactly as stored. A missing, accessor-backed or wrong-typed field
- * is a failed raise, never synthesized. Never re-formatted, never throws.
+ * record), and a zoned ISO string for `refreshed` and `reopened` (a prior
+ * record existed, so a stored time does), returned exactly as stored. A
+ * missing, accessor-backed, wrong-typed or null field on a refreshed or
+ * reopened answer is a failed raise, never synthesized. Never re-formatted,
+ * never throws.
  */
 function previousRaisedAtIsoOf(answer: unknown): { readonly ok: true; readonly value: string | null } | { readonly ok: false } {
   try {
@@ -347,9 +351,17 @@ function mapRaiseAnswer(answer: unknown): RaiseTrainHealthAttentionResult {
   if (!previous.ok) {
     return refusedUnreadable();
   }
-  // `raised` means no prior record: the contract requires exactly `null`,
-  // never a timestamp masquerading as a first raise.
-  if (mapped.outcome === 'raised' && previous.value !== null) {
+  if (mapped.outcome === 'raised') {
+    // `raised` means no prior record: the contract requires exactly `null`,
+    // never a timestamp masquerading as a first raise.
+    if (previous.value !== null) {
+      return refusedUnreadable();
+    }
+    return { ...mapped, previousRaisedAtIso: null };
+  }
+  // `refreshed` and `reopened` mean a prior open or closed record existed, so
+  // the answer must carry its stored last-raise time; null is a failed raise.
+  if (previous.value === null) {
     return refusedUnreadable();
   }
   return { ...mapped, previousRaisedAtIso: previous.value };

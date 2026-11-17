@@ -1024,6 +1024,14 @@ async function readVerifiedReleaseFiles(request: InspectRequest): Promise<Releas
   if (presence !== 'directory') {
     return { outcome: 'unreadable' };
   }
+  // The first marker read is sandwiched between two `lstat`s of the build
+  // directory: a concurrent install may swap in a replacement directory with
+  // its own valid marker for the same sha between the first pin and the
+  // marker read, and only the identity match refuses that replacement.
+  const before = await pinBuildDirectory(buildDir);
+  if (before === null) {
+    return { outcome: 'unreadable' };
+  }
   const marker = await readMarker(path.join(buildDir, MARKER_NAME), request.sha);
   if (marker === 'absent') {
     return { outcome: 'not-found' };
@@ -1034,13 +1042,14 @@ async function readVerifiedReleaseFiles(request: InspectRequest): Promise<Releas
   // The accepted marker pins this directory's identity: a concurrent install,
   // swap or prune may replace `<root>/<sha>` after the marker read, and the
   // files of the replacement tree must not be judged under the old
-  // verification. The identity is re-checked after every file read.
+  // verification. The identity is re-checked after every file read, and the
+  // final marker re-read must still equal the accepted marker.
   const pinned = await pinBuildDirectory(buildDir);
-  if (pinned === null) {
+  if (pinned === null || pinned.dev !== before.dev || pinned.ino !== before.ino) {
     return { outcome: 'unreadable' };
   }
   const files = await readReleaseFileFacts(buildDir, pinned.real, request.paths);
-  if (!(await pinnedBuildDirectoryHolds(buildDir, pinned, request.sha))) {
+  if (!(await pinnedBuildDirectoryHolds(buildDir, pinned, marker))) {
     return { outcome: 'unreadable' };
   }
   return { outcome: 'read', files };
@@ -1072,13 +1081,15 @@ async function pinBuildDirectory(buildDir: string): Promise<PinnedBuildDirectory
 
 /**
  * Constant time aside from one `lstat` and one marker read. The build
- * directory must still be the pinned inode and the marker must still be
- * accepted; any error or mismatch refuses the whole call.
+ * directory must still be the pinned inode and the final marker re-read must
+ * still parse and EQUAL the accepted marker field for field; any error,
+ * mismatch or changed marker (for example a new `builtAtIso`) refuses the
+ * whole call.
  */
 async function pinnedBuildDirectoryHolds(
   buildDir: string,
   pinned: PinnedBuildDirectory,
-  sha: string,
+  accepted: ReleaseBuildRecord,
 ): Promise<boolean> {
   try {
     const stat = await fs.lstat(buildDir);
@@ -1088,11 +1099,16 @@ async function pinnedBuildDirectoryHolds(
     if (stat.dev !== pinned.dev || stat.ino !== pinned.ino) {
       return false;
     }
-    const marker = await readMarker(path.join(buildDir, MARKER_NAME), sha);
-    return marker !== 'absent' && marker !== null;
+    const marker = await readMarker(path.join(buildDir, MARKER_NAME), accepted.sha);
+    return marker !== 'absent' && marker !== null && sameBuildRecord(marker, accepted);
   } catch {
     return false;
   }
+}
+
+/** Every field of the parsed marker must still be the accepted one. */
+function sameBuildRecord(a: ReleaseBuildRecord, b: ReleaseBuildRecord): boolean {
+  return a.sha === b.sha && a.builtAtIso === b.builtAtIso;
 }
 
 /** Constant time aside from one `lstat`. A symlink or non-directory is `missing`. */

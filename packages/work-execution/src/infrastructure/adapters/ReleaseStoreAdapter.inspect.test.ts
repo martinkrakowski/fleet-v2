@@ -316,6 +316,54 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
     expect(swapped).toBe(true);
   });
 
+  it('reports unreadable when the build directory identity differs between the two lstats around the first marker read', async () => {
+    await verifiedWith({ 'plain.test.ts': 'ok\n' });
+    const buildDir = path.join(root, A);
+    let swapped = false;
+    hookRealpath(async (target) => {
+      if (!swapped && target === buildDir) {
+        swapped = true;
+        // A concurrent install replaces the whole tree, marker included,
+        // after the first lstat pinned it and before the marker read. The
+        // replacement carries its own valid marker for the same sha, so only
+        // the sandwiched identity check can refuse it.
+        await fs.rm(buildDir, { recursive: true });
+        await fs.mkdir(buildDir);
+        await fs.writeFile(
+          path.join(buildDir, '.fleet-release-verified'),
+          JSON.stringify({ version: 1, sha: A, builtAtIso: AT }),
+        );
+        await fs.writeFile(path.join(buildDir, 'plain.test.ts'), 'quarantined(\n');
+      }
+    });
+    expect(await adapter.inspectReleaseFiles({ root, sha: A, paths: ['plain.test.ts'] })).toEqual({
+      outcome: 'unreadable',
+    });
+    expect(swapped).toBe(true);
+  });
+
+  it('reports unreadable when the marker builtAtIso is changed to another valid value during inspection', async () => {
+    await verifiedWith({ 'plain.test.ts': 'ok\n' });
+    const markerFile = path.join(root, A, '.fleet-release-verified');
+    let changed = false;
+    hookRealpath(async (target) => {
+      if (!changed && target === path.join(root, A, 'plain.test.ts')) {
+        changed = true;
+        // Same sha, still a valid ISO value: the final re-read is accepted as
+        // a marker, so only the equality with the marker accepted at the
+        // start can refuse the call.
+        await fs.writeFile(
+          markerFile,
+          JSON.stringify({ version: 1, sha: A, builtAtIso: '2026-11-02T09:00:00.000Z' }),
+        );
+      }
+    });
+    expect(await adapter.inspectReleaseFiles({ root, sha: A, paths: ['plain.test.ts'] })).toEqual({
+      outcome: 'unreadable',
+    });
+    expect(changed).toBe(true);
+  });
+
   it('reports unreadable when the marker is changed during the read', async () => {
     await verifiedWith({ 'plain.test.ts': 'ok\n' });
     const marker = path.join(root, A, '.fleet-release-verified');

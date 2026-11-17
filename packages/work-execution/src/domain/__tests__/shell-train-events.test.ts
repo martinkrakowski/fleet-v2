@@ -5,6 +5,7 @@ import {
   parseShellTrainEvents,
   SHELL_EVENTS_MAX_LINES,
   SHELL_EVENT_MAX_LINE_LENGTH,
+  SHELL_EVENT_SECRET_SCAN_MAX_LENGTH,
   SHELL_DETAIL_CODES,
   SHELL_TRAIN_EVENT_KINDS,
 } from '../shell-train-events.js';
@@ -295,18 +296,38 @@ describe('parseShellTrainEvents', () => {
     expect(result.unknownLines).toEqual([1]);
   });
 
-  it('does not detect a secret shape that starts only after the length cap', () => {
-    // The secret-shape scan runs against the capped prefix, not the full raw
-    // string (SH3 cost-bound fix round): a secret shape placed entirely
-    // beyond SHELL_EVENT_MAX_LINE_LENGTH characters falls outside that
-    // prefix, so it is not detected. The line is still correctly refused as
-    // unknown by the length check right after it — not a new gap, the same
-    // boundary the length cap already draws for every other line. If the
-    // scan ever regressed to reading the full raw string again, this would
-    // start failing (secretShapedLines would become 1).
-    const beyondCapSecret = `${'x'.repeat(SHELL_EVENT_MAX_LINE_LENGTH)}${fakeSecretShape()}`;
-    expect(beyondCapSecret.length).toBeGreaterThan(SHELL_EVENT_MAX_LINE_LENGTH);
-    const result = parseShellTrainEvents([eventJson(), beyondCapSecret]);
+  it('detects a secret shape starting just after the line-length cap, within the secret-scan bound', () => {
+    // SH3 fix round 3: a fresh review correctly found that bounding the
+    // secret-shape scan to the ordinary SHELL_EVENT_MAX_LINE_LENGTH prefix
+    // re-broke the brief's own unconditional requirement — a secret shape
+    // starting just past that 4,096-character boundary was silently missed.
+    // The scan now runs against the much larger, independent
+    // SHELL_EVENT_SECRET_SCAN_MAX_LENGTH bound, so a secret shape placed
+    // right after the line-length boundary (well within the secret-scan
+    // bound) IS detected and counted, even though the line is still
+    // over-length and therefore still reported as unknown for that separate
+    // reason.
+    const justOverLineCapSecret = `${'x'.repeat(SHELL_EVENT_MAX_LINE_LENGTH)}${fakeSecretShape()}`;
+    expect(justOverLineCapSecret.length).toBeGreaterThan(SHELL_EVENT_MAX_LINE_LENGTH);
+    expect(justOverLineCapSecret.length).toBeLessThan(SHELL_EVENT_SECRET_SCAN_MAX_LENGTH);
+    const result = parseShellTrainEvents([eventJson(), justOverLineCapSecret]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.secretShapedLines).toBe(1);
+  });
+
+  it('does not detect a secret shape that starts only after the secret-scan bound', () => {
+    // The secret-shape scan runs against its own, far larger capped prefix,
+    // not the full raw string (SH3 fix round 3): a secret shape placed
+    // entirely beyond SHELL_EVENT_SECRET_SCAN_MAX_LENGTH characters falls
+    // outside that prefix, so it is not detected. The line is still
+    // correctly refused as unknown by the ordinary length check. Built with
+    // repeat() so the test itself does no slow work — this is the new, far
+    // larger acceptable bound, not a regression of the one above.
+    const beyondScanBoundSecret = `${'x'.repeat(SHELL_EVENT_SECRET_SCAN_MAX_LENGTH)}${fakeSecretShape()}`;
+    expect(beyondScanBoundSecret.length).toBeGreaterThan(SHELL_EVENT_SECRET_SCAN_MAX_LENGTH);
+    const result = parseShellTrainEvents([eventJson(), beyondScanBoundSecret]);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.unknownLines).toEqual([1]);
@@ -484,5 +505,6 @@ describe('parseShellTrainEvents', () => {
     ]);
     expect(SHELL_EVENTS_MAX_LINES).toBe(200_000);
     expect(SHELL_EVENT_MAX_LINE_LENGTH).toBe(4_096);
+    expect(SHELL_EVENT_SECRET_SCAN_MAX_LENGTH).toBe(1_048_576);
   });
 });

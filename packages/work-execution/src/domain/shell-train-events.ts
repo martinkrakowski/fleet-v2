@@ -8,12 +8,22 @@
  *
  * Cost bound: linear in the capped input — at most `SHELL_EVENTS_MAX_LINES`
  * lines, each read a constant number of times, with at most
- * `SHELL_EVENT_MAX_LINE_LENGTH` characters of each line actually scanned.
- * This holds for the secret-shape check too: it runs against the line's first
- * `SHELL_EVENT_MAX_LINE_LENGTH`-character prefix, never the full raw string,
- * so an arbitrarily long raw line costs no more to scan than a capped one. A
- * secret shape that appears only beyond that prefix is not detected, which is
- * the same boundary the length cap already draws for every other line.
+ * `SHELL_EVENT_MAX_LINE_LENGTH` characters of each line actually read for
+ * ordinary parsing (JSON.parse and field validation).
+ *
+ * The secret-shape check runs under its OWN, much larger bound,
+ * `SHELL_EVENT_SECRET_SCAN_MAX_LENGTH`: the brief requires every
+ * secret-shaped raw line to be counted in `secretShapedLines`, with no
+ * exception for length, so the scan must reach further than the ordinary
+ * line-length cap to still catch a secret shape in a merely-oversized (but
+ * not extreme) line — the scan's cost is bounded to that larger prefix,
+ * never the full raw string, so an arbitrarily long raw line still costs no
+ * more to scan than that fixed ceiling. A secret shape that appears only
+ * beyond `SHELL_EVENT_SECRET_SCAN_MAX_LENGTH` characters — far past any
+ * practically-sized line, since no legitimate shell log line approaches 1
+ * MiB and every registered secret pattern is short — is not detected; that
+ * is the one bound this parser leaves generously capped rather than fully
+ * unbounded.
  */
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
@@ -34,8 +44,30 @@ export type ShellDetailCode = (typeof SHELL_DETAIL_CODES)[number];
 
 /** The line cap; a longer list is refused before any element is read. */
 export const SHELL_EVENTS_MAX_LINES = 200_000;
-/** The per-line cap; a longer line is an unknown line, never read further. */
+/**
+ * The per-line cap governing ORDINARY line-length validity: a raw line
+ * longer than this is an unknown line, never read further for JSON parsing
+ * or field validation. Distinct from, and unrelated to,
+ * `SHELL_EVENT_SECRET_SCAN_MAX_LENGTH` below, which bounds a different
+ * concern (the secret-shape scan's cost) and does not change what this
+ * constant governs.
+ */
 export const SHELL_EVENT_MAX_LINE_LENGTH = 4_096;
+/**
+ * The cost bound for the secret-shape scan SPECIFICALLY — distinct from,
+ * and far larger than, `SHELL_EVENT_MAX_LINE_LENGTH` above. The brief
+ * requires every secret-shaped raw line to increment `secretShapedLines`,
+ * with no exception for length, so the scan must reach further than the
+ * ordinary line-length cap to catch a secret shape in a merely-oversized
+ * (but not extreme) line. 1 MiB is generous relative to any legitimate
+ * shell log line and to the short, fixed shape of every registered secret
+ * pattern, so a real secret is always found well within this bound when
+ * present at all. It still bounds the worst-case regex cost to a fixed
+ * ceiling rather than leaving it fully unbounded: a line longer than this
+ * gets a bounded, not unbounded, amount of scanning before being correctly
+ * reported as unknown regardless.
+ */
+export const SHELL_EVENT_SECRET_SCAN_MAX_LENGTH = 1_048_576;
 
 export interface ShellTrainEvent {
   readonly line: number;
@@ -262,13 +294,21 @@ export function parseShellTrainEvents(input: unknown): ShellTrainEventsParse {
       // Secret-shape detection runs before, and independently of, the length
       // check below: every secret-shaped raw line is counted in
       // `secretShapedLines`, whether or not it is ALSO over the length cap.
-      // The scan itself is bounded to the first SHELL_EVENT_MAX_LINE_LENGTH
-      // characters (not the full raw string): an over-length line is still
-      // correctly reported as unknown by the length check right after, but
-      // the regex cost of getting there never grows past the cap, however
-      // long the actual raw line is.
+      // The scan itself is bounded to the first
+      // SHELL_EVENT_SECRET_SCAN_MAX_LENGTH characters (not the full raw
+      // string, and NOT the much smaller SHELL_EVENT_MAX_LINE_LENGTH, which
+      // governs ordinary line-length validity in the check right after this
+      // one and is a separate concern from the secret-shape scan's cost
+      // bound): a line that is over the ordinary length cap but still
+      // within the secret-scan bound is correctly detected as secret-shaped
+      // here, before the length check reports it as unknown for its own,
+      // independent reason — while the regex cost of getting there never
+      // grows past SHELL_EVENT_SECRET_SCAN_MAX_LENGTH, however long the
+      // actual raw line is.
       const secretShapeScanInput =
-        raw.length > SHELL_EVENT_MAX_LINE_LENGTH ? raw.slice(0, SHELL_EVENT_MAX_LINE_LENGTH) : raw;
+        raw.length > SHELL_EVENT_SECRET_SCAN_MAX_LENGTH
+          ? raw.slice(0, SHELL_EVENT_SECRET_SCAN_MAX_LENGTH)
+          : raw;
       if (isSecretShaped(secretShapeScanInput)) {
         unknownLines.push(index);
         secretShapedLines += 1;

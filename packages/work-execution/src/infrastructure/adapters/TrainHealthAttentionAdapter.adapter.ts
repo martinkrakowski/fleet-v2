@@ -6,6 +6,16 @@
  * surface has no deadline field, and the caller bounds the await. The
  * adapter keeps no state and never throws.
  *
+ * A raise answer's `previousRaisedAtIso` is read from that same delegate
+ * answer, which the delegate produces inside its own locked read-modify-write:
+ * the stored `lastRaisedAtIso` captured immediately before the overwrite, a
+ * zoned ISO string exactly as stored and never re-formatted. The adapter makes
+ * no second read of its own. It is null when the outcome is `raised` (no prior
+ * open or closed record). For `reopened` it is the closed record's last raise
+ * time when the store keeps `lastRaisedAtIso` on cleared records (operator
+ * coordination's store does); an answer that carries no usable value maps to
+ * null.
+ *
  * Project-scoped items use subject `{ kind: 'project', ref: projectId }`
  * because that store subject cannot carry owner/repo. A list keeps such an
  * item only when its fixed summary names this repository.
@@ -302,6 +312,35 @@ function mapAttentionAnswer<T extends string>(answer: unknown, accepted: readonl
   }
 }
 
+/**
+ * The raise answer's `previousRaisedAtIso`, read under the delegate's lock as
+ * part of the same answer that refreshed the item. `raised` has no prior
+ * record, so it is null; for `refreshed` and `reopened` the answer's value is
+ * returned exactly as stored when it is a zoned ISO string, and null when the
+ * store keeps no previous raise time (a closed record whose
+ * `lastRaisedAtIso` was dropped). Never re-formatted, never throws.
+ */
+function previousRaisedAtIsoOf(answer: unknown, outcome: string): string | null {
+  try {
+    if (outcome === 'raised') {
+      return null;
+    }
+    const value = ownValue(answer, 'previousRaisedAtIso');
+    return isZonedIsoDateTime(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Map one raise answer, adding `previousRaisedAtIso` from the same answer. */
+function mapRaiseAnswer(answer: unknown): RaiseTrainHealthAttentionResult {
+  const mapped = mapAttentionAnswer(answer, RAISE_OUTCOMES);
+  if (mapped.outcome === 'refused') {
+    return mapped;
+  }
+  return { ...mapped, previousRaisedAtIso: previousRaisedAtIsoOf(answer, mapped.outcome) };
+}
+
 function raiseBody(command: Snapshot): {
   readonly projectId: string;
   readonly kind: string;
@@ -462,7 +501,7 @@ export class TrainHealthAttentionAdapter implements TrainHealthAttentionPort {
         return { outcome: 'refused', reasonCode: 'not-configured' };
       }
       const answer = await recordAttentionItem(raiseBody(command), TRAIN_HEALTH_ATTENTION_ACTOR);
-      return mapAttentionAnswer(answer, RAISE_OUTCOMES);
+      return mapRaiseAnswer(answer);
     } catch {
       return refusedUnreadable();
     }

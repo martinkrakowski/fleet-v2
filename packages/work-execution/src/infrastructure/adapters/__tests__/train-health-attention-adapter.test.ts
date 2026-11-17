@@ -1,7 +1,11 @@
 // TrainHealthAttentionAdapter tests (lane CO-WD4): the adapter delegates
 // in-process to operator coordination's record, clear and list attention
 // ports. Summaries are fixed text from ids and codes. The pass deadline is
-// accepted on the command and never forwarded.
+// accepted on the command and never forwarded. A raise result carries
+// `previousRaisedAtIso` exactly as the delegate answer stored it before the
+// overwrite: null for `raised`, and for `reopened` the closed record's last
+// raise time when the store keeps `lastRaisedAtIso` on cleared records
+// (operator coordination's store does), otherwise null.
 
 import { describe, expect, it } from 'vitest';
 
@@ -99,10 +103,12 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(await adapter.raiseTrainHealthAttention(truncated)).toEqual({
       outcome: 'raised',
       reasonCode: null,
+      previousRaisedAtIso: null,
     });
     expect(await adapter.raiseTrainHealthAttention(tooLarge)).toEqual({
       outcome: 'raised',
       reasonCode: null,
+      previousRaisedAtIso: null,
     });
     expect(calls).toEqual([
       { actor: 'train-watchdog', body: projectBody('findings-truncated') },
@@ -206,6 +212,7 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(await adapter.raiseTrainHealthAttention(raw)).toEqual({
       outcome: 'raised',
       reasonCode: null,
+      previousRaisedAtIso: null,
     });
     expect(calls).toEqual([
       {
@@ -234,6 +241,7 @@ describe('TrainHealthAttentionAdapter', () => {
       expect(await extra.raiseTrainHealthAttention(projectRule)).toEqual({
         outcome: 'raised',
         reasonCode: null,
+        previousRaisedAtIso: null,
       });
       expect(seen).toEqual([{ actor: 'train-watchdog', body: projectBody(rule) }]);
       expectNoDeadline(seen);
@@ -260,6 +268,7 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(await adapter.raiseTrainHealthAttention(raw)).toEqual({
       outcome: 'raised',
       reasonCode: null,
+      previousRaisedAtIso: null,
     });
     expect(calls).toEqual([
       {
@@ -287,6 +296,7 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(await park.raiseTrainHealthAttention(parkCommand)).toEqual({
       outcome: 'raised',
       reasonCode: null,
+      previousRaisedAtIso: null,
     });
     expect(repeated).toEqual([
       { actor: 'train-watchdog', body: prBody('repeated-park', 4) },
@@ -319,16 +329,84 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(await adapter.raiseTrainHealthAttention(raw)).toEqual({
       outcome: 'refreshed',
       reasonCode: null,
+      previousRaisedAtIso: null,
     });
     expect(await adapter.raiseTrainHealthAttention(raw)).toEqual({
       outcome: 'reopened',
       reasonCode: null,
+      previousRaisedAtIso: null,
     });
     expect(calls).toEqual([
       { actor: 'train-watchdog', body: projectBody('tick-stale') },
       { actor: 'train-watchdog', body: projectBody('tick-stale') },
     ]);
     expectNoDeadline(calls);
+  });
+
+  it('returns previousRaisedAtIso null on the first raise of an item', async () => {
+    const calls: { body: unknown; actor: string }[] = [];
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async (body, actor) => {
+        calls.push({ body, actor });
+        return { outcome: 'raised', previousRaisedAtIso: null };
+      },
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'raised',
+      reasonCode: null,
+      previousRaisedAtIso: null,
+    });
+    expect(calls).toEqual([{ actor: 'train-watchdog', body: projectBody('tick-stale') }]);
+  });
+
+  it('returns previousRaisedAtIso of the first raise on a second raise, stored as given', async () => {
+    const SECOND = '2026-11-16T09:02:03.000Z';
+    let storedIso: string | null = null;
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => {
+        const previous = storedIso;
+        storedIso = previous === null ? RAISED_AT : SECOND;
+        if (previous === null) {
+          return { outcome: 'raised', previousRaisedAtIso: null };
+        }
+        return { outcome: 'refreshed', previousRaisedAtIso: previous };
+      },
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'raised',
+      reasonCode: null,
+      previousRaisedAtIso: null,
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refreshed',
+      reasonCode: null,
+      previousRaisedAtIso: RAISED_AT,
+    });
+    expect(storedIso).toBe(SECOND);
+  });
+
+  it('returns the closed record last raise time on reopen, and null when the store keeps none', async () => {
+    const CLOSED_RAISED_AT = '2026-11-15T10:00:00.000Z';
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => ({
+        outcome: 'reopened',
+        previousRaisedAtIso: CLOSED_RAISED_AT,
+      }),
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'reopened',
+      reasonCode: null,
+      previousRaisedAtIso: CLOSED_RAISED_AT,
+    });
+
+    const withoutStoredTime = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => ({ outcome: 'reopened', previousRaisedAtIso: null }),
+    });
+    expect(await withoutStoredTime.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'reopened',
+      reasonCode: null,
+      previousRaisedAtIso: null,
+    });
   });
 
   it('refuses with delegate code on refused raise or clear answer', async () => {

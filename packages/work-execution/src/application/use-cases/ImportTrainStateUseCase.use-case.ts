@@ -3,11 +3,13 @@ import type { LegacyTrainQueueEntry } from '../../domain/legacy-train-queue.js';
 import { parseLegacyTrainQueue } from '../../domain/legacy-train-queue.js';
 import { isMergeQueueEntryLive } from '../../domain/merge-queue-records.js';
 import type {
+  ImportTrainStateKey,
   ImportTrainStatePort,
   ImportTrainStateReport,
   ImportTrainStateRequest,
   ImportTrainStateResult,
 } from '../ports/in/ImportTrainStatePort.in-port.js';
+import { IMPORT_KEYS_MAX } from '../ports/in/ImportTrainStatePort.in-port.js';
 import type { LegacyTrainStateReadPort } from '../ports/out/LegacyTrainStateReadPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 
@@ -43,18 +45,33 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       state.queue.status === 'unreadable' ||
       state.parked.status === 'unreadable' ||
       state.chains.status === 'unreadable' ||
-      state.batch.status === 'unreadable'
+      state.batch.status === 'unreadable' ||
+      state.inprogress === undefined ||
+      state.inprogress.status === 'unreadable'
     ) {
       return { outcome: 'refused', reason: 'legacy-unreadable' };
     }
 
-    const queueLines = state.queue.status === 'read' ? state.queue.lines : [];
-    const parsed = parseLegacyTrainQueue(queueLines.join('\n'));
-    if (!parsed.ok) {
-      return {
-        outcome: 'refused',
-        reason: parsed.reason === 'secret-shaped' ? 'secret-shaped' : 'legacy-unreadable',
-      };
+    const sourceLines: Readonly<Record<'queue' | 'inprogress' | 'parked', readonly string[]>> = {
+      queue: state.queue.status === 'read' ? state.queue.lines : [],
+      inprogress: state.inprogress.status === 'read' ? state.inprogress.lines : [],
+      parked: state.parked.status === 'read' ? state.parked.lines : [],
+    };
+
+    // Each source is parsed with the same strict parser; a secret-shaped line
+    // in any of the three refuses the import wholesale.
+    const parsedBySource = {
+      queue: parseLegacyTrainQueue(sourceLines.queue.join('\n')),
+      inprogress: parseLegacyTrainQueue(sourceLines.inprogress.join('\n')),
+      parked: parseLegacyTrainQueue(sourceLines.parked.join('\n')),
+    } as const;
+    for (const parsed of Object.values(parsedBySource)) {
+      if (!parsed.ok) {
+        return {
+          outcome: 'refused',
+          reason: parsed.reason === 'secret-shaped' ? 'secret-shaped' : 'legacy-unreadable',
+        };
+      }
     }
 
     const deadlineIso = new Date(Date.parse(this.deps.nowIso()) + 60_000).toISOString();
@@ -62,42 +79,91 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       isMergeQueueEntryLive,
     );
 
-    const unknownLineNumbers: number[] = [];
-    let notImportableBase = 0;
-    let alreadyQueued = 0;
-    const candidates: LegacyTrainQueueEntry[] = [];
-
-    for (const line of parsed.lines) {
-      if (!line.ok) {
-        unknownLineNumbers.push(line.line);
+    const sources = ['queue', 'inprogress', 'parked'] as const;
+    const unknownBySource: Record<(typeof sources)[number], number[]> = { queue: [], inprogress: [], parked: [] };
+    for (const source of sources) {
+      const parsed = parsedBySource[source];
+      if (!parsed.ok) {
         continue;
       }
-      const entry = line.entry;
-      if (entry.base !== 'main') {
-        notImportableBase += 1;
-        continue;
-      }
-      const alreadyLive = liveEntries.some(
-        (record) =>
-          record.repository.owner === request.repository.owner &&
-          record.repository.repo === request.repository.repo &&
-          record.pullRequest === entry.pullRequest &&
-          record.headOid === entry.headOid,
-      );
-      if (alreadyLive) {
-        alreadyQueued += 1;
-      } else {
-        candidates.push(entry);
+      for (const line of parsed.lines) {
+        if (!line.ok) {
+          unknownBySource[source].push(line.line);
+        }
       }
     }
 
+    // Dedupe by the (pullRequest, headOid) pair across all three sources, in
+    // source order queue, then inprogress, then parked: the first source in
+    // that order wins and is recorded as the key's source.
+    const seenPairs = new Set<string>();
+    const deduped: { readonly source: (typeof sources)[number]; readonly entry: LegacyTrainQueueEntry }[] = [];
+    for (const source of sources) {
+      const parsed = parsedBySource[source];
+      if (!parsed.ok) {
+        continue;
+      }
+      for (const line of parsed.lines) {
+        if (!line.ok) {
+          continue;
+        }
+        const entry = line.entry;
+        const pair = `${entry.pullRequest}:${entry.headOid}`;
+        if (seenPairs.has(pair)) {
+          continue;
+        }
+        seenPairs.add(pair);
+        deduped.push({ source, entry });
+      }
+    }
+
+    let notImportableBase = 0;
+    let alreadyQueued = 0;
+    const candidates: LegacyTrainQueueEntry[] = [];
+    const allKeys: ImportTrainStateKey[] = [];
+    for (const { source, entry } of deduped) {
+      let disposition: ImportTrainStateKey['disposition'];
+      if (entry.base !== 'main') {
+        disposition = 'not-importable-base';
+        notImportableBase += 1;
+      } else {
+        const alreadyLive = liveEntries.some(
+          (record) =>
+            record.repository.owner === request.repository.owner &&
+            record.repository.repo === request.repository.repo &&
+            record.pullRequest === entry.pullRequest &&
+            record.headOid === entry.headOid,
+        );
+        if (alreadyLive) {
+          disposition = 'already-queued';
+          alreadyQueued += 1;
+        } else {
+          disposition = 'would-import';
+          candidates.push(entry);
+        }
+      }
+      allKeys.push({
+        pullRequest: entry.pullRequest,
+        headOid: entry.headOid,
+        base: entry.base,
+        source,
+        disposition,
+      });
+    }
+    const keys = allKeys.slice(0, IMPORT_KEYS_MAX);
+    const keysTruncated = allKeys.length > IMPORT_KEYS_MAX;
+
     const report: ImportTrainStateReport = {
-      unknownLineNumbers,
+      unknownLineNumbers: unknownBySource.queue,
       notImportableBase,
       alreadyQueued,
       parkedLines: state.parked.status === 'read' ? state.parked.lines.length : 0,
       chainFiles: state.chains.status === 'read' ? state.chains.chains.length : 0,
       batchLines: state.batch.status === 'read' ? state.batch.lines.length : 0,
+      inprogressLines: state.inprogress.status === 'read' ? state.inprogress.lines.length : 0,
+      unknownBySource,
+      keys,
+      keysTruncated,
     };
 
     if (!request.apply) {

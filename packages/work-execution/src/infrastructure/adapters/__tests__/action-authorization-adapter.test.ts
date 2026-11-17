@@ -100,6 +100,130 @@ function expectNoDisallowedText(value: unknown): void {
 }
 
 describe('ActionAuthorizationAdapter attempt coordinate', () => {
+  const ROOT_A = '/srv/fleet/releases-a';
+  const ROOT_B = '/srv/fleet/releases-b';
+
+  function releaseResolveRequest(overrides: Partial<ResolveActionAuthorizationRequest> = {}): ResolveActionAuthorizationRequest {
+    return resolveRequest({ actionKind: 'release-swap', ...overrides });
+  }
+
+  it('resolves a release grant only for the root it names, and consumes only that root', async () => {
+    const grants = grantsOf(
+      grantEntry({ kind: 'release-swap', releaseRoot: ROOT_A }) as ActionAuthorizationGrantEntry,
+    );
+    const adapter = new ActionAuthorizationAdapter({ grants });
+    expect(await adapter.resolveActionAuthorization(releaseResolveRequest({ releaseRoot: ROOT_A }))).toEqual({
+      outcome: 'granted',
+      authorizationGrantId: 'grant-1',
+      releaseRoot: ROOT_A,
+    });
+    // A grant bound to one root never resolves for another root.
+    expect(await adapter.resolveActionAuthorization(releaseResolveRequest({ releaseRoot: ROOT_B }))).toEqual({
+      outcome: 'blocked',
+      reason: 'release-grant-root-mismatch',
+    });
+    // The consumption compares the same coordinate: another root is refused
+    // and the grant stays unconsumed.
+    expect(
+      await adapter.consumeActionAuthorization(
+        consumeRequest({ actionKind: 'release-swap', releaseRoot: ROOT_B }),
+      ),
+    ).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+    expect(grants.get('grant-1')?.consumedByActionId).toBeNull();
+    expect(
+      await adapter.consumeActionAuthorization(
+        consumeRequest({ actionKind: 'release-swap', releaseRoot: ROOT_A }),
+      ),
+    ).toEqual({ outcome: 'consumed', actionId: 'action-1' });
+    expect(grants.get('grant-1')?.consumedByActionId).toBe('action-1');
+    expect(grants.get('grant-1')?.releaseRoot).toBe(ROOT_A);
+  });
+
+  it('refuses a consume that omits the release root against a root-bound grant, and leaves it unconsumed', async () => {
+    const grants = grantsOf(
+      grantEntry({ kind: 'release-swap', releaseRoot: ROOT_A }) as ActionAuthorizationGrantEntry,
+    );
+    const adapter = new ActionAuthorizationAdapter({ grants });
+    expect(
+      await adapter.consumeActionAuthorization(consumeRequest({ actionKind: 'release-swap' })),
+    ).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+    expect(grants.get('grant-1')?.consumedByActionId).toBeNull();
+  });
+
+  it('refuses a consume that supplies a root against an unbound grant, and still consumes an unbound grant with no root', async () => {
+    // A root the grant never recorded cannot be verified here (the resolve is
+    // what binds a root to a legacy grant), so a supplied root is a mismatch.
+    const unbound = grantsOf(grantEntry({ kind: 'release-swap' }) as ActionAuthorizationGrantEntry);
+    const adapter = new ActionAuthorizationAdapter({ grants: unbound });
+    expect(
+      await adapter.consumeActionAuthorization(consumeRequest({ actionKind: 'release-swap', releaseRoot: ROOT_A })),
+    ).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+    expect(unbound.get('grant-1')?.consumedByActionId).toBeNull();
+    expect(
+      await adapter.consumeActionAuthorization(consumeRequest({ actionKind: 'release-swap' })),
+    ).toEqual({ outcome: 'consumed', actionId: 'action-1' });
+    expect(unbound.get('grant-1')?.consumedByActionId).toBe('action-1');
+  });
+
+  it('binds a root-less legacy release grant to the first rooted resolve and keeps it there', async () => {
+    const grants = grantsOf(grantEntry({ kind: 'release-swap', attemptId: undefined }) as ActionAuthorizationGrantEntry);
+    const adapter = new ActionAuthorizationAdapter({ grants });
+    expect(await adapter.resolveActionAuthorization(releaseResolveRequest({ releaseRoot: ROOT_A }))).toEqual({
+      outcome: 'granted',
+      authorizationGrantId: 'grant-1',
+      releaseRoot: ROOT_A,
+    });
+    expect(grants.get('grant-1')?.releaseRoot).toBe(ROOT_A);
+    // The root is now part of the grant's coordinates: another root never
+    // resolves it, and a second resolve for the same root stays idempotent.
+    expect(await adapter.resolveActionAuthorization(releaseResolveRequest({ releaseRoot: ROOT_B }))).toEqual({
+      outcome: 'blocked',
+      reason: 'release-grant-root-mismatch',
+    });
+    expect(await adapter.resolveActionAuthorization(releaseResolveRequest({ releaseRoot: ROOT_A }))).toMatchObject({
+      outcome: 'granted',
+      authorizationGrantId: 'grant-1',
+    });
+  });
+
+  it('resumes a release grant consumed by the same deterministic action id and refuses a different action', async () => {
+    const consumed = grantEntry({ kind: 'release-swap', releaseRoot: ROOT_A }) as ActionAuthorizationGrantEntry;
+    consumed.consumedByActionId = 'release-swap-aaaa';
+    const grants = grantsOf(consumed);
+    const adapter = new ActionAuthorizationAdapter({ grants });
+    // The retry after a crash between the consumption and the write resolves
+    // the same grant idempotently; a different action id never resumes it.
+    expect(
+      await adapter.resolveActionAuthorization(
+        releaseResolveRequest({ releaseRoot: ROOT_A, actionId: 'release-swap-aaaa' }),
+      ),
+    ).toMatchObject({ outcome: 'granted', authorizationGrantId: 'grant-1' });
+    expect(
+      await adapter.resolveActionAuthorization(
+        releaseResolveRequest({ releaseRoot: ROOT_A, actionId: 'release-swap-bbbb' }),
+      ),
+    ).toEqual({ outcome: 'blocked', reason: 'no-matching-grant' });
+    expect(grants.get('grant-1')?.consumedByActionId).toBe('release-swap-aaaa');
+  });
+
+  it('refuses a hostile or wrong-typed release root as a typed refusal, never a match', async () => {
+    const grants = grantsOf(grantEntry({ kind: 'release-swap', releaseRoot: ROOT_A }) as ActionAuthorizationGrantEntry);
+    const adapter = new ActionAuthorizationAdapter({ grants });
+    for (const hostileRoot of ['relative/path', '/srv/../etc', '/srv/x\0y', `/${'r'.repeat(4097)}`, 7, null, []]) {
+      expect(
+        await adapter.resolveActionAuthorization(
+          releaseResolveRequest({ releaseRoot: hostileRoot as never }),
+        ),
+      ).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    }
+    // A malformed stored root makes the whole grant record unreadable.
+    expect(
+      parseActionAuthorizationGrantEntry({
+        ...grantEntry({ kind: 'release-swap' }),
+        releaseRoot: 'relative/path',
+      }),
+    ).toEqual({ ok: false, reason: 'malformed' });
+  });
   it('refuses consume on attempt mismatch and leaves the grant unconsumed', async () => {
     const grants = grantsOf();
     const adapter = new ActionAuthorizationAdapter({ grants });

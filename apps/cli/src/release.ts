@@ -14,6 +14,7 @@
 
 import {
   ActionAuthorizationAdapter,
+  ConductorDriverLeaseAdapter,
   LocalExecutor,
   ManageReleaseUseCase,
   ReleaseStoreAdapter,
@@ -46,6 +47,14 @@ export interface ReleaseCommandDependencies {
   readonly env: () => Record<string, string | undefined>;
   /** Defaults to the local filesystem store. */
   readonly store?: ReleaseStorePort;
+  /**
+   * The state directory of the driver this call acts for (CO14b fix round 8).
+   * `ManageReleaseUseCase` uses it only to bind a previously-unbound root to
+   * this driver, and only after authorization has already granted — see
+   * `ManageReleaseUseCase.bindRootIfUnbound`. `releaseHandler` below always
+   * supplies the same value it already resolved for the lease adapter.
+   */
+  readonly stateDir: string;
 }
 
 /**
@@ -69,9 +78,20 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
         // its `release:<action>` scope and exact head and consumed once — so the
         // attempt coordinate is passed through only when the caller carries one.
         attemptId: request.attemptId,
+        // CO14 follow-up: the release root travels with the grant coordinates,
+        // so a grant for one root never authorizes another; and the
+        // deterministic action id travels as the resume key, so a grant
+        // consumed by exactly this action id (a crash between the consumption
+        // and the release's write) resolves again idempotently.
+        releaseRoot: request.releaseRoot,
+        resumeActionId: request.actionId,
       });
       return result.outcome === 'authorized'
-        ? { outcome: 'granted', authorizationGrantId: result.grantId }
+        ? {
+            outcome: 'granted',
+            authorizationGrantId: result.grantId,
+            ...(result.releaseRoot !== undefined ? { releaseRoot: result.releaseRoot } : {}),
+          }
         : { outcome: 'blocked', reason: result.reason };
     },
     consumeGrant: async (request) => {
@@ -86,6 +106,7 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
         actionScope,
         attemptId: request.attemptId ?? request.actionId,
         expectedHeadSha: request.expectedHeadSha,
+        releaseRoot: request.releaseRoot,
       });
       return result.outcome === 'consumed'
         ? { outcome: 'consumed', actionId: request.actionId }
@@ -99,17 +120,103 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     if (Object.hasOwn(payload, 'action')) {
       throw new CliUsageError('Unknown release option: --action');
     }
-    return manageReleaseFromPayload(
+    // CO14 follow-up: the release reads the lease of the state directory of
+    // the driver that serves this root — the one the installation records —
+    // never the process-wide one, so a release under another state directory
+    // cannot miss a live lease. A root whose driver state directory cannot be
+    // determined is refused before anything is read, built or written.
+    const root = payload['root'];
+    if (typeof root !== 'string') {
+      throw new CliUsageError("release requires --root <absolute path without '..'>");
+    }
+    const stateDir = resolveRootStateDir(root, rt.installation as ReleaseDriverConfiguration | undefined);
+    if (stateDir === null) {
+      return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+    }
+    // A root bound to another installation's driver is not served by this one:
+    // its lease would be read from the wrong directory, so it is refused
+    // here, before anything is read, built or written. A root with no
+    // binding yet is bound to this driver after its first applied release
+    // (first binding wins) — but NOT here: see the round 8 note below. An
+    // unreadable binding is unknown.
+    const store = new ReleaseStoreAdapter();
+    const checkable = root.startsWith('/') && !root.split('/').includes('..') && root.length <= 4096;
+    const binding = checkable ? await store.readDriverBinding({ root }) : ({ outcome: 'unbound' } as const);
+    if (binding.outcome === 'unreadable' || (binding.outcome === 'bound' && binding.stateDir !== stateDir)) {
+      return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+    }
+    // CO14b fix round 8: the actual bind-when-unbound WRITE used to happen
+    // right here, gated only on `checkable`, an actual apply and the binding
+    // reading `unbound` — entirely BEFORE authorization was ever checked.
+    // That let an unauthorized apply request (wrong or missing project, no
+    // matching grant) against a fresh unbound root permanently bind it to
+    // this driver before being refused for lack of authority, which could
+    // make the root unusable for whichever driver should actually have
+    // served it. The write is now `ManageReleaseUseCase.bindRootIfUnbound`,
+    // called only after its own grant resolution has granted and only before
+    // its first mutating write (`beginOperation`) — preserving the original
+    // round-3 property (the bind still happens before any mutating action)
+    // while closing that gap. `releaseHandler` keeps only the read-only
+    // checks above (the unresolvable-state-dir refusal and the already-
+    // bound-mismatch refusal), which write nothing either way.
+    return await manageReleaseFromPayload(
       { ...payload, action },
       {
-        lease: rt.conductor.driverLease,
+        lease: new ConductorDriverLeaseAdapter({ stateDir }),
         authorization: releaseAuthorization(rt),
         executor: new LocalExecutor(),
         nowIso: () => new Date().toISOString(),
         env: () => process.env, // the use case passes only a filtered allowlist to the git child
+        store,
+        stateDir,
       },
     );
   };
+}
+
+export interface ReleaseDriverConfiguration {
+  /** The installation's daemon section, whose `stateDir` names the driver state directory. */
+  readonly daemon?: { readonly stateDir?: string };
+}
+
+/**
+ * CO14 follow-up: the pure binding of a release root to the state directory
+ * of the driver that serves it. The state directory comes from the
+ * installation configuration the runtime composed with (`daemon.stateDir`);
+ * a missing, non-absolute or blank one cannot be determined, and the caller
+ * refuses with `release-root-state-dir-unknown`. No filesystem or environment
+ * access of its own.
+ */
+export function resolveRootStateDir(
+  root: string,
+  configuration: ReleaseDriverConfiguration | undefined,
+): string | null {
+  if (typeof root !== 'string' || root === '') {
+    return null;
+  }
+  try {
+    // CO14b fix round 3: `configuration` itself may be hostile (an accessor or
+    // a Proxy `get` trap on the `daemon` key), so it is descriptor-checked the
+    // same way `stateDir` already is below; a getter or setter on `daemon` is
+    // never invoked.
+    const configurationDescriptor =
+      typeof configuration === 'object' && configuration !== null
+        ? Object.getOwnPropertyDescriptor(configuration, 'daemon')
+        : undefined;
+    const daemon =
+      configurationDescriptor !== undefined && !configurationDescriptor.get && !configurationDescriptor.set
+        ? configurationDescriptor.value
+        : undefined;
+    if (typeof daemon !== 'object' || daemon === null) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(daemon, 'stateDir');
+    const value = descriptor !== undefined && !descriptor.get && !descriptor.set ? descriptor.value : undefined;
+    return typeof value === 'string' && value.startsWith('/') && value.trim() !== '' ? value : null;
+  } catch {
+    // A hostile configuration never resolves to a state directory.
+    return null;
+  }
 }
 
 export const releaseCommands: Readonly<Record<string, CommandHandler>> = {
@@ -130,6 +237,7 @@ export async function manageReleaseFromPayload(
     executor: deps.executor,
     nowIso: deps.nowIso,
     env: deps.env,
+    stateDir: deps.stateDir,
   });
   return await useCase.manageRelease(request);
 }

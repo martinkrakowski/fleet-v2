@@ -66,6 +66,55 @@
  * is false in exactly that race (a build's own predecessor is never itself),
  * so the fresh call is correctly refused `current-moved` rather than
  * falsely reporting `applied` for a repoint it never itself performed.
+ *
+ * CO14b fix round 10 (Fable's pre-merge pass, two findings): round 8's
+ * `resolveTarget` adopted ANY open rollback intent's recorded sha
+ * unconditionally. Intents never expire on their own -- only the claim does,
+ * after `CLAIM_STALE_MS` -- so a rollback left open by a crash during
+ * `prune` (after the repoint itself already landed) poisoned every later
+ * rollback forever (finding 1): each one was hijacked to the stale target,
+ * failed `stillTargets`'s `current-moved` check against whatever `current`
+ * had since become, and refused. Worse, if a LATER, independently and freshly
+ * authorized rollback request happened to compute that same stale sha as its
+ * own legitimate target (an ordinary coincidence -- `previousBuild` of
+ * wherever `current` has moved back to), `peekOperation` found the same
+ * stale intent by its sha, adopted the OLD opId as a "resume", and
+ * `resolveGrant`'s idempotent-replay path let the ORIGINAL, already-consumed
+ * grant authorize this SECOND, logically distinct repoint with no fresh
+ * grant at all (finding 2).
+ *
+ * The fix: every intent now carries `repointed` (`ReleaseStorePort.
+ * markRepointed`, `ReleaseOpenOperationPeek.repointed`), set once, by
+ * `fencedRepoint`, immediately after its own repoint lands or is confirmed
+ * already there -- before `prune` or `completeOperation`. `resolveTarget`
+ * adopts an open intent whose `repointed` is still `false` exactly as before
+ * (safe already: the ordinary `current !== plannedCurrent` check downstream
+ * still gates it). An intent whose `repointed` is `true` is adopted only
+ * when `current`, read fresh right now, still equals its own recorded sha;
+ * otherwise the intent is stale -- it is retired on the spot (never merely
+ * skipped, so it can never be rediscovered) and the target is computed
+ * fresh, exactly as if no intent were open.
+ *
+ * That reactive check alone closes finding 1 and finding 2's literal
+ * scenario, because by the time a later request's own fresh `current` is
+ * read, it has already diverged from the stale sha. It does not by itself
+ * close the one residual case Fable flagged without resolving: `current`
+ * later, coincidentally, cycling back to EXACTLY that stale sha through
+ * entirely unrelated, separately authorized repoints (not the crashed
+ * attempt's own work) -- at that instant the reactive check alone cannot
+ * tell "still genuinely mid-flight" from "coincidentally revisited", and
+ * would wrongly adopt a no-op target instead of the correct fresh one.
+ * `fencedRepoint` therefore also retires any OTHER open rollback intent
+ * (`retireOtherStaleRollbackIntent`) the instant its OWN repoint confirms
+ * `current` is at ITS target: `current` cannot be at two shas at once, and
+ * only this process can repoint while holding the driver lease, so any
+ * other open rollback intent for a different sha is proven stale right
+ * then, not merely apparently so. Retiring it there -- the first moment it
+ * is disproven, regardless of what `current` does afterward -- means it can
+ * never survive to be coincidentally rediscovered later. The two mechanisms
+ * are complementary: the reactive check handles a request that arrives while
+ * `current` has already diverged; the proactive one guarantees a diverged
+ * intent never lingers to be revisited.
  */
 
 import { containsSecretShape } from '@fleet/shared';
@@ -481,7 +530,16 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       return { outcome: 'unreadable' };
     }
     if (open.outcome === 'open') {
-      return { outcome: 'resolved', target: open.sha, previous: open.sha };
+      if (!open.repointed || current === open.sha) {
+        return { outcome: 'resolved', target: open.sha, previous: open.sha };
+      }
+      // CO14b fix round 10 (finding 1): the intent's own mutation already
+      // happened, but current has since moved away from it -- stale. Retire
+      // it now, not merely skip it, so it can never poison a later rollback
+      // too: a later call's own `peekAnyOpenOperation` must never find it
+      // again. Falls through to the ordinary fresh computation below, as if
+      // no intent were open.
+      await this.retireRollbackIntent(request.root, open.opId, open.sha);
     }
     const previous = previousBuild(builds, current);
     return { outcome: 'resolved', target: previous, previous };
@@ -567,6 +625,21 @@ export class ManageReleaseUseCase implements ManageReleasePort {
           return { refusal: repointRefusal(repointed.outcome) };
         }
       }
+      // CO14b fix round 10: `current` is now confirmed to be at `target`,
+      // under this same lease -- either this call's own repoint just landed,
+      // or (a genuine resume) it was already there. Mark THIS rollback's own
+      // intent so a later, unrelated call can tell "the mutation already
+      // ran" from "it never did" (`resolveTarget`); and retire any OTHER
+      // open rollback intent, proven stale right now (current cannot be at
+      // two shas at once, and only this process can repoint while holding
+      // the driver lease, so nothing else can be concurrently mid-repoint to
+      // keep that other intent genuinely live). Both are best effort: a
+      // failure here never blocks this call's own result, and leaves the
+      // next repoint, or `resolveTarget`'s own reactive check, to catch it.
+      if (request.action === 'rollback') {
+        await this.markRepointedBestEffort(request.root, operation.opId, target);
+      }
+      await this.retireOtherStaleRollbackIntent(request.root, target);
       // The repoint stands from here on (this attempt's own, or the crashed
       // one this call resumed): a prune that throws is an unfinished prune of
       // an applied release, never a refusal a caller would retry.
@@ -584,6 +657,50 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       }
     } finally {
       await this.releaseLease(held);
+    }
+  }
+
+  /**
+   * CO14b fix round 10: mark this rollback's own intent repointed, once its
+   * mutation is confirmed landed. Best effort -- a failure here is corrected
+   * next time either `resolveTarget`'s own current-vs-sha check runs (an
+   * unmarked intent is always adopted, which stays safe because the ordinary
+   * `current !== plannedCurrent` check still gates it) or this same mark is
+   * attempted again on a later call.
+   */
+  private async markRepointedBestEffort(root: string, opId: string, sha: string): Promise<void> {
+    try {
+      await this.deps.store.markRepointed({ root, action: 'rollback', sha, opId });
+    } catch {
+      // Best effort; see the comment above.
+    }
+  }
+
+  /**
+   * CO14b fix round 10 (finding 2's residual case): retire any OTHER open
+   * rollback intent once this call has confirmed `current` is at `target`.
+   * Never touches this call's own intent, whose sha is exactly `target`.
+   * Best effort: an unreadable peek, or a failing retirement, simply leaves
+   * the stale intent for `resolveTarget`'s own reactive check to catch
+   * instead, the next time a rollback is requested.
+   */
+  private async retireOtherStaleRollbackIntent(root: string, target: string): Promise<void> {
+    try {
+      const open = await this.deps.store.peekAnyOpenOperation({ root, action: 'rollback' });
+      if (open.outcome === 'open' && open.sha !== target) {
+        await this.retireRollbackIntent(root, open.opId, open.sha);
+      }
+    } catch {
+      // Best effort; see the comment above.
+    }
+  }
+
+  /** Best effort: cancel a rollback intent proven stale, releasing its claim too. */
+  private async retireRollbackIntent(root: string, opId: string, sha: string): Promise<void> {
+    try {
+      await this.deps.store.cancelOperation({ root, action: 'rollback', sha, opId });
+    } catch {
+      // The claim goes stale by itself; a later call re-evaluates from scratch.
     }
   }
 

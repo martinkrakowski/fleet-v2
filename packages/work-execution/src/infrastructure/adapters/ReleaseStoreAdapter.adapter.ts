@@ -238,7 +238,17 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       try {
         await fs.writeFile(
           names.intent,
-          JSON.stringify({ version: 1, opId, action: input.action, sha: input.sha, createdAtIso: input.nowIso }),
+          JSON.stringify({
+            version: 1,
+            opId,
+            action: input.action,
+            sha: input.sha,
+            createdAtIso: input.nowIso,
+            // CO14b fix round 10: every fresh intent starts unrepointed; only
+            // `markRepointed` ever flips this, once, after the one real
+            // mutation this intent stands for has actually landed.
+            repointed: false,
+          }),
           { flag: 'wx' },
         );
       } catch (error) {
@@ -331,7 +341,9 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     try {
       const text = await readSmall(path.join(opsDir, matches[0].name));
       const parsed = parseOpIdAndSha(text);
-      return parsed === null ? { outcome: 'unreadable' } : { outcome: 'open', opId: parsed.opId, sha: parsed.sha };
+      return parsed === null
+        ? { outcome: 'unreadable' }
+        : { outcome: 'open', opId: parsed.opId, sha: parsed.sha, repointed: parsed.repointed };
     } catch {
       return { outcome: 'unreadable' };
     }
@@ -355,6 +367,42 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
 
   async releaseOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
     return this.endOperation(input, async () => undefined);
+  }
+
+  /**
+   * CO14b fix round 10: rewrite this operation's own still-open intent with
+   * `repointed: true`, preserving its opId/action/sha/createdAtIso exactly.
+   * Only the exact opId that owns the intent may mark it -- the same
+   * defensive style as `endOperation`'s own `recorded !== input.opId` guard
+   * -- and a missing intent is `not-found`, never a write.
+   */
+  async markRepointed(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    if (!SHA_PATTERN.test(input.sha) || !OP_ID_PATTERN.test(input.opId)) {
+      return { outcome: 'unreadable' };
+    }
+    const names = opNames(input.root, input.action, input.sha);
+    try {
+      const record = parseIntentRecord(await readSmall(names.intent));
+      if (record === null) {
+        return { outcome: 'not-found' };
+      }
+      if (record.opId !== input.opId) {
+        // Another operation owns this intent now; this run has nothing to mark.
+        return { outcome: 'unreadable' };
+      }
+      const marker = JSON.stringify({
+        version: 1,
+        opId: record.opId,
+        action: record.action,
+        sha: record.sha,
+        createdAtIso: record.createdAtIso,
+        repointed: true,
+      });
+      await writeAtomically(path.dirname(names.intent), path.basename(names.intent), marker);
+      return { outcome: 'ok' };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
   }
 
   /** Runs `change` only while the intent still names this operation id; the claim is always released. */
@@ -496,8 +544,13 @@ function parseOpId(text: string | null): string | null {
   }
 }
 
-/** Like `parseOpId`, but also recovers the intent's own recorded sha (CO14b round 8). */
-function parseOpIdAndSha(text: string | null): { readonly opId: string; readonly sha: string } | null {
+/**
+ * Like `parseOpId`, but also recovers the intent's own recorded sha (CO14b
+ * round 8) and whether its repoint has already landed (CO14b round 10).
+ */
+function parseOpIdAndSha(
+  text: string | null,
+): { readonly opId: string; readonly sha: string; readonly repointed: boolean } | null {
   if (text === null) {
     return null;
   }
@@ -506,11 +559,45 @@ function parseOpIdAndSha(text: string | null): { readonly opId: string; readonly
     if (typeof parsed !== 'object' || parsed === null) {
       return null;
     }
-    const record = parsed as { opId?: unknown; sha?: unknown };
-    const opId = record.opId;
-    const sha = record.sha;
-    return typeof opId === 'string' && OP_ID_PATTERN.test(opId) && typeof sha === 'string' && SHA_PATTERN.test(sha)
-      ? { opId, sha }
+    const record = parsed as { opId?: unknown; sha?: unknown; repointed?: unknown };
+    const { opId, sha, repointed } = record;
+    return typeof opId === 'string' &&
+      OP_ID_PATTERN.test(opId) &&
+      typeof sha === 'string' &&
+      SHA_PATTERN.test(sha) &&
+      typeof repointed === 'boolean'
+      ? { opId, sha, repointed }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The intent's full recorded fields (CO14b round 10, for `markRepointed`,
+ * which must preserve `createdAtIso` and not merely know the opId and sha).
+ * `null` when the file is absent, unparseable or missing a required field.
+ */
+function parseIntentRecord(
+  text: string | null,
+): { readonly opId: string; readonly action: string; readonly sha: string; readonly createdAtIso: string } | null {
+  if (text === null) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== 'object' || parsed === null) {
+      return null;
+    }
+    const record = parsed as { opId?: unknown; action?: unknown; sha?: unknown; createdAtIso?: unknown };
+    const { opId, action, sha, createdAtIso } = record;
+    return typeof opId === 'string' &&
+      OP_ID_PATTERN.test(opId) &&
+      typeof action === 'string' &&
+      typeof sha === 'string' &&
+      SHA_PATTERN.test(sha) &&
+      typeof createdAtIso === 'string'
+      ? { opId, action, sha, createdAtIso }
       : null;
   } catch {
     return null;

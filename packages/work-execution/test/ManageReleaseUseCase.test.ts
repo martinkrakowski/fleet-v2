@@ -164,7 +164,7 @@ class FakeStore implements ReleaseStorePort {
   }
 
   /** In-memory release operations: one open intent per (action, sha), a claim while a run holds it. */
-  readonly operations = new Map<string, { opId: string; claimed: boolean }>();
+  readonly operations = new Map<string, { opId: string; claimed: boolean; repointed: boolean }>();
   readonly completed: string[] = [];
   private operationCount = 0;
   orphanPasses = 0;
@@ -179,8 +179,24 @@ class FakeStore implements ReleaseStorePort {
       open.claimed = true;
       return { outcome: 'resumed', opId: open.opId };
     }
-    this.operations.set(key, { opId: input.opId, claimed: true });
+    this.operations.set(key, { opId: input.opId, claimed: true, repointed: false });
     return { outcome: 'started', opId: input.opId };
+  }
+
+  readonly markRepointedCalls: ReleaseOperationRef[] = [];
+
+  /** CO14b fix round 10: only the exact opId that owns the intent may mark it. */
+  async markRepointed(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    this.markRepointedCalls.push(input);
+    const open = this.operations.get(`${input.action}-${input.sha}`);
+    if (open === undefined) {
+      return { outcome: 'not-found' };
+    }
+    if (open.opId !== input.opId) {
+      return { outcome: 'unreadable' };
+    }
+    open.repointed = true;
+    return { outcome: 'ok' };
   }
 
   async peekOperation(input: { action: string; sha: string }): Promise<{ outcome: 'open'; opId: string } | { outcome: 'none' }> {
@@ -240,11 +256,11 @@ class FakeStore implements ReleaseStorePort {
   /** Scans the in-memory operations map for an open intent of `action`, without knowing its sha. */
   async peekAnyOpenOperation(input: {
     action: string;
-  }): Promise<{ outcome: 'open'; opId: string; sha: string } | { outcome: 'none' }> {
+  }): Promise<{ outcome: 'open'; opId: string; sha: string; repointed: boolean } | { outcome: 'none' }> {
     const prefix = `${input.action}-`;
     for (const [key, value] of this.operations) {
       if (key.startsWith(prefix)) {
-        return { outcome: 'open', opId: value.opId, sha: key.slice(prefix.length) };
+        return { outcome: 'open', opId: value.opId, sha: key.slice(prefix.length), repointed: value.repointed };
       }
     }
     return { outcome: 'none' };
@@ -1063,6 +1079,188 @@ describe('ManageReleaseUseCase', () => {
       // Y's own freshly begun intent is cleanly cancelled, not left open:
       // X's own operation is gone (completed above), and Y's own is gone too.
       expect(store.operations.size).toBe(0);
+    },
+  );
+
+  /**
+   * Seeds the FakeStore directly with the exact state a real crash leaves,
+   * rather than deriving it from a live call: the rollback to `sha` already
+   * repointed `current` for real, its intent is still open under a fresh
+   * opId with `repointed: true` (the real adapter's `markRepointed` already
+   * ran), and its claim is released (the process died before
+   * `completeOperation`/`cancelOperation` ever ran). Round 7/8/9's own
+   * crash tests reach an analogous state by throwing from an instrumented
+   * `store.repoint` -- but `repointed: true` specifically can never be
+   * reached that way under round 10's fix: `markRepointed` and everything
+   * after it inside `fencedRepoint` is best effort (wrapped in its own
+   * `try`/`catch`), by design, so a THROWN exception can never propagate
+   * from there to crash the whole operation -- only an actual process death
+   * can, which a unit test cannot literally reproduce. Seeding the state
+   * directly tests the one thing that matters: what a LATER call does when
+   * it finds exactly this on disk.
+   */
+  function seedCrashedRollback(store: FakeStore, sha: string, current: string): string {
+    const opId = store.newOperationId();
+    store.current = current;
+    store.operations.set(`rollback-${sha}`, { opId, claimed: false, repointed: true });
+    return opId;
+  }
+
+  it(
+    'a stale rollback intent whose own repoint already landed is retired, never poisoning ' +
+      'every later rollback forever (CO14b round 10, finding 1)',
+    async () => {
+      // Oldest-to-newest: A, B, C, D. The crashed rollback already
+      // repointed C -> B for real, then died before `prune`/`complete`.
+      const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4)], null);
+      const firstOpId = seedCrashedRollback(store, B, B);
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization: alwaysGrants(),
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+      expect(store.current).toBe(B);
+      expect(store.operations.size).toBe(1);
+
+      // "The operator sees current=B, accepts that, and moves on -- does
+      // other installs/swaps, eventually landing on current=D": a real,
+      // unrelated swap. Its own `fencedRepoint` call, confirming `current`
+      // is now at D, proves the open rollback intent (sha=B) stale right
+      // then and retires it proactively (CO14b round 10).
+      const swapped = await manage(useCase, applyRequest({ action: 'swap', sha: D, source: null }));
+      expect(swapped).toMatchObject({ outcome: 'applied', action: 'swap', target: D, current: D });
+      expect(store.current).toBe(D);
+      // Retired, not merely ignored: a later call's own `peekAnyOpenOperation`
+      // can never rediscover it.
+      expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({ outcome: 'none' });
+      expect(store.operations.size).toBe(0);
+
+      // Before round 10, EVERY later rollback was hijacked to the stale B
+      // and refused `current-moved` forever (finding 1). A plan-only call
+      // now must report the CORRECT fresh target (previousBuild(D) === C),
+      // never the stale B.
+      const planned = await manage(useCase, request({ action: 'rollback', sha: null, source: null }));
+      expect(planned).toMatchObject({ outcome: 'planned', action: 'rollback', target: C, previous: C, current: D });
+
+      // And an apply of that same fresh rollback actually succeeds, using a
+      // brand-new operation id -- never the stale one from the crash.
+      const fresh = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(fresh).toMatchObject({ outcome: 'applied', action: 'rollback', target: C, current: C });
+      expect(store.current).toBe(C);
+      expect(store.completed).not.toContain(firstOpId);
+    },
+  );
+
+  it(
+    'a stale repointed rollback intent never lets its already-consumed grant replay to ' +
+      'authorize a second, independently requested repoint (CO14b round 10, finding 2)',
+    async () => {
+      // Oldest-to-newest: A, B, C. The crashed rollback already repointed
+      // C -> B for real, consuming a real grant under its own opId, then
+      // died before `prune`/`complete`.
+      const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3)], null);
+      const firstOpId = seedCrashedRollback(store, B, B);
+      const staleActionId = `release-rollback-${B}-${firstOpId}`;
+      const consumes: string[] = [];
+      const authorization: ActionAuthorizationPort = {
+        resolveActionAuthorization: async (req) => ({
+          outcome: 'granted',
+          authorizationGrantId: GRANT,
+          ...(req.releaseRoot !== undefined ? { releaseRoot: req.releaseRoot } : {}),
+        }),
+        consumeActionAuthorization: async (req) => {
+          consumes.push(req.actionId);
+          return { outcome: 'consumed', actionId: req.actionId };
+        },
+      };
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization,
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+
+      // "the operator runs other operations and eventually swap C (current=C
+      // again)": a real, independently authorized swap -- NOT a resume of
+      // anything -- whose own `fencedRepoint` call proactively retires the
+      // stale rollback intent (sha=B), proven stale the instant `current`
+      // is confirmed at C.
+      const swapped = await manage(useCase, applyRequest({ action: 'swap', sha: C, source: null }));
+      expect(swapped).toMatchObject({ outcome: 'applied', action: 'swap', target: C, current: C });
+      expect(store.current).toBe(C);
+      expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({ outcome: 'none' });
+      expect(consumes).toHaveLength(1);
+      expect(consumes[0]).not.toBe(staleActionId);
+
+      // A fresh rollback request now independently computes
+      // previousBuild(C) === B -- the SAME target the crashed attempt had,
+      // by the exact coincidence the finding describes -- but it must get
+      // its OWN, freshly resolved and freshly consumed grant, never a
+      // replay of the stale one.
+      const fresh = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(fresh).toMatchObject({ outcome: 'applied', action: 'rollback', target: B, current: B });
+      expect(store.current).toBe(B);
+      expect(consumes).toHaveLength(2);
+      // The discriminating assertion: under the finding-2 bug, this fresh
+      // request would reuse the stale intent's own opId (found by its sha,
+      // B), so its actionId would be IDENTICAL to the crashed attempt's --
+      // the replay itself. Under the fix, a brand-new opId is used.
+      expect(consumes[1]).not.toBe(staleActionId);
+      // Exactly two real repoints happened in total: the unrelated swap's
+      // own (to C) and this fresh, properly authorized rollback's own (to
+      // B) -- never an extra repoint slipped in by a grant replay of the
+      // stale, already-spent consumption.
+      expect(store.calls.filter((call) => call.startsWith('repoint ')).length).toBe(2);
+    },
+  );
+
+  it(
+    "current coincidentally cycling back to a retired rollback intent's own sha never " +
+      'resurrects it (CO14b round 10, finding 2 residual case)',
+    async () => {
+      // Oldest-to-newest: A, B, C, D. The crashed rollback already
+      // repointed C -> B for real, then died before `prune`/`complete`.
+      const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4)], null);
+      seedCrashedRollback(store, B, B);
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization: alwaysGrants(),
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+
+      // Two real, unrelated repoints: first AWAY from B -- proactively
+      // retiring the stale intent (CO14b round 10) the instant it is proven
+      // stale -- then BACK to EXACTLY B again, through an entirely separate,
+      // freshly authorized swap, never through the crashed rollback's own
+      // work.
+      const away = await manage(useCase, applyRequest({ action: 'swap', sha: D, source: null }));
+      expect(away).toMatchObject({ outcome: 'applied', target: D, current: D });
+      expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({ outcome: 'none' });
+      const back = await manage(useCase, applyRequest({ action: 'swap', sha: B, source: null }));
+      expect(back).toMatchObject({ outcome: 'applied', target: B, current: B });
+      expect(store.current).toBe(B);
+
+      // A fresh rollback request now, with `current` coincidentally back at
+      // EXACTLY the retired intent's own sha. `resolveTarget`'s reactive
+      // check alone (current === the old sha) cannot tell this apart from a
+      // genuine resume; the proactive retirement above is what guarantees
+      // there is nothing left to (mis)adopt. The CORRECT fresh target is
+      // previousBuild(B) === A, never B itself -- a build's own predecessor
+      // is never itself.
+      const fresh = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(fresh).toMatchObject({ outcome: 'applied', action: 'rollback', target: A, current: A });
+      expect(store.current).toBe(A);
     },
   );
 

@@ -193,6 +193,8 @@ describe('release operation record', () => {
         outcome: 'open',
         opId: first.opId,
         sha: SHA,
+        // CO14b fix round 10: every fresh intent starts unrepointed.
+        repointed: false,
       });
       // A different action for the same root is a different lookup entirely.
       expect(await store.peekAnyOpenOperation({ root, action: 'swap' })).toEqual({ outcome: 'none' });

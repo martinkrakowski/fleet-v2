@@ -157,6 +157,22 @@ export interface ReleaseStorePort {
   completeOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult>;
   /** Drop an operation that consumed nothing: the intent and the claim are removed. */
   cancelOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult>;
+  /**
+   * CO14b fix round 10 (finding 1 and finding 2): record, on this operation's
+   * own still-open intent, that its repoint has actually landed -- called
+   * only once, immediately after `store.repoint` succeeds (or is confirmed
+   * already achieved), before `prune` or `completeOperation`. Only the exact
+   * opId that owns the intent may mark it (the same defensive style as
+   * `completeOperation`/`cancelOperation`'s own opId guard); a mismatched or
+   * already-gone intent is never rewritten. `peekAnyOpenOperation`'s
+   * `repointed` flag is read back from this later: it tells a future caller
+   * "this intent's mutation already ran" from "it never did", which is the
+   * difference between a crash recoverable by the ordinary `current !==
+   * plannedCurrent` check alone and one that additionally needs `current` to
+   * still match the intent's own recorded sha before it may be adopted
+   * again.
+   */
+  markRepointed(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult>;
   /** Release this run's claim and keep the intent, so the same operation id can resume. */
   releaseOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult>;
   /** The driver state directory this root is bound to; `unbound` before the first applied release. */
@@ -185,7 +201,19 @@ export type ReleaseDriverBinding =
   | { readonly outcome: 'unreadable' };
 
 export type ReleaseOpenOperationPeek =
-  | { readonly outcome: 'open'; readonly opId: string; readonly sha: string }
+  | {
+      readonly outcome: 'open';
+      readonly opId: string;
+      readonly sha: string;
+      /**
+       * CO14b fix round 10: whether THIS intent's own repoint has already
+       * landed (set once, by `markRepointed`, right after it does). `false`
+       * for an intent whose mutation never ran yet -- adopting its target is
+       * then exactly as safe as before round 10, because the ordinary
+       * `current !== plannedCurrent` check downstream still gates it.
+       */
+      readonly repointed: boolean;
+    }
   | { readonly outcome: 'none' }
   | { readonly outcome: 'unreadable' };
 

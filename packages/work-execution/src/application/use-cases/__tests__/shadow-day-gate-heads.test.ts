@@ -299,6 +299,53 @@ describe('readShadowGateHeads', () => {
     expect(fakes.attemptCalls).toEqual([]);
   });
 
+  it('ignores an intent-kind record with a push key and a completed outcome', async () => {
+    const entries = [
+      makeEntry(stepKey(RUN_1, 'push', HEAD_12_1), '2026-11-27T10:00:00.000Z', { kind: 'intent' }),
+      makeEntry(stepKey(RUN_1, 'gate', HEAD_12_1), '2026-11-27T11:00:00.000Z', { reasonCode: 'gate-passed' }),
+    ];
+    const fakes = makeFakes({
+      runRecords: [makeRun(RUN_1, { attemptIds: [ATTEMPT_1] })],
+      journals: new Map([[RUN_1, entries]]),
+      attemptsById: new Map([[ATTEMPT_1, makeAttempt(ATTEMPT_1, HEAD_1)]]),
+    });
+    const result = await readShadowGateHeads(fakes.deps, request());
+    expect(result).toEqual({ status: 'ok', heads: [] });
+    expect(fakes.attemptCalls).toEqual([]);
+  });
+
+  it('ignores an intent-kind record with a gate key and a completed outcome as a verdict', async () => {
+    const entries = [
+      makeEntry(stepKey(RUN_1, 'push', HEAD_12_1), '2026-11-27T10:00:00.000Z'),
+      makeEntry(stepKey(RUN_1, 'gate', HEAD_12_1), '2026-11-27T11:00:00.000Z', {
+        kind: 'intent',
+        reasonCode: 'gate-passed',
+      }),
+    ];
+    const fakes = makeFakes({
+      runRecords: [makeRun(RUN_1, { attemptIds: [ATTEMPT_1] })],
+      journals: new Map([[RUN_1, entries]]),
+      attemptsById: new Map([[ATTEMPT_1, makeAttempt(ATTEMPT_1, HEAD_1)]]),
+    });
+    const result = await readShadowGateHeads(fakes.deps, request());
+    expect(result).toEqual({ status: 'ok', heads: [] });
+    expect(fakes.attemptCalls).toEqual([]);
+  });
+
+  it('refuses journal-unreadable for a malformed record whose kind is not a journal kind', async () => {
+    const entries = [
+      makeEntry(stepKey(RUN_1, 'push', HEAD_12_1), '2026-11-27T10:00:00.000Z', {
+        kind: 'diary' as unknown as 'result',
+      }),
+    ];
+    const fakes = makeFakes({
+      runRecords: [makeRun(RUN_1, { attemptIds: [ATTEMPT_1] })],
+      journals: new Map([[RUN_1, entries]]),
+    });
+    const result = await readShadowGateHeads(fakes.deps, request());
+    expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+  });
+
   it('carries conductorVerdict fail for a gate-failed head', async () => {
     const entries = [
       makeEntry(stepKey(RUN_1, 'push', HEAD_12_1), '2026-11-27T12:00:00.000Z'),
@@ -481,6 +528,22 @@ describe('readShadowGateHeads', () => {
       const result = await readShadowGateHeads(fakes.deps, request());
       expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
     }
+  });
+
+  it('refuses runs-unreadable, without running the getter, when a run record field is an accessor', async () => {
+    let getterRuns = 0;
+    const hostileRun = { ...makeRun(RUN_1) } as Record<string, unknown>;
+    Object.defineProperty(hostileRun, 'runId', {
+      enumerable: true,
+      get() {
+        getterRuns += 1;
+        return RUN_1;
+      },
+    });
+    const fakes = makeFakes({ runRecords: [hostileRun as unknown as LaneRunRecord] });
+    const result = await readShadowGateHeads(fakes.deps, request());
+    expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
+    expect(getterRuns).toBe(0);
   });
 
   it('refuses runs-unreadable, without rejecting, for a revoked Proxy from runs.list', async () => {

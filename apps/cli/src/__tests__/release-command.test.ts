@@ -477,7 +477,17 @@ describe('release command', () => {
     );
     expect(err.join('')).toBe('');
     expect(code).toBe(1);
-    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+    // CO14c-1 fix round 1: the missing root is its own reason, with an
+    // operator message that names the configured root path (the same root
+    // here) and tells the operator to create it before the first install.
+    const refused = JSON.parse(out.join('')) as { message?: string };
+    expect(refused).toEqual({
+      outcome: 'refused',
+      reason: 'release-root-missing',
+      message: expect.any(String),
+    });
+    expect(refused.message).toContain('create the release root before the first install');
+    expect(refused.message).toContain(root);
     // Nothing was created under the missing root's parent.
     expect(await stat(root).then(() => true, () => false)).toBe(false);
   });
@@ -501,6 +511,67 @@ describe('release command', () => {
     expect(code).toBe(1);
     expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
   });
+
+  it(
+    'CO14c-1 fix round 1: a configured served root that does not exist on disk is refused, ' +
+      'even though --root exists (the configured root is resolved on disk, never trusted as a string)',
+    async () => {
+      const base = await mkdtemp(join(tmpdir(), 'co14c-config-missing-base-'));
+      // `--root` exists on disk: a real directory.
+      const root = join(base, 'served');
+      await mkdir(root, { recursive: true });
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14c-config-missing-state-'));
+      // The configured served root does NOT exist on disk, so only its
+      // lexical string could ever be compared; the pre-check resolves it on
+      // disk instead and refuses. (A configured root whose lexical string
+      // equalled --root's real path while missing on disk cannot exist: the
+      // realpath of an existing `--root` is itself an existing path. So the
+      // property pinned here is that the configured root is always resolved
+      // on disk — a missing one refuses, never falls back to a string
+      // comparison.)
+      const configured = join(base, 'served-configured');
+      const rt = await runtimeServingRoot(configured, stateDir);
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', root, '--sha', SHA, '--source', root],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(err.join('')).toBe('');
+      expect(code).toBe(1);
+      expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+    },
+  );
+
+  it(
+    "CO14c-1 fix round 1: an uncheckable --root with an installation that has no daemon.cliPath " +
+      "is the usage error, not a root refusal",
+    async () => {
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14c-uncheckable-state-'));
+      // The installation records a driver state directory but no
+      // `daemon.cliPath`.
+      const rt = createFleetCliRuntime({
+        stateDir,
+        installation: { daemon: { stateDir } } as never,
+      });
+      // A relative root is uncheckable, so the whole root pre-check —
+      // including the missing-`cliPath` refusal — is gated off, and the
+      // request falls through unchanged. It is `parseRequest`, inside
+      // `manageReleaseFromPayload` (the CLI usage layer), that decides this
+      // outcome: a `CliUsageError`, which `runCli` reports as exit 2.
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', 'release-root-relative', '--sha', SHA, '--source', 'source'],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(code).toBe(2);
+      expect(out.join('')).toBe('');
+      expect(err.join('')).toContain("--root <absolute path without '..'>");
+    },
+  );
 
   it('install with a live driver lease is refused', async () => {
     const d = deps(LIVE_LEASE);

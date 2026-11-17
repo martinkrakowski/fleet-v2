@@ -135,31 +135,50 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     if (stateDir === null) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
     }
-    // CO14c-1: the served root is extracted lexically from the installation's
-    // `daemon.cliPath` (`<root>/current/apps/cli/dist/bin.js`); a missing or
-    // malformed one leaves the served root unknown. Whether the entry point
-    // exists on disk plays no part in the parse itself.
-    const configuredRoot = configuredReleaseRoot(rt.installation as ReleaseDriverConfiguration | undefined);
-    if (configuredRoot === null) {
-      return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
-    }
     const checkable = root.startsWith('/') && !root.split('/').includes('..') && root.length <= 4096;
-    // CO14c-1: `--root` must be the root the daemon actually serves. The
-    // pre-check runs only when the `checkable` predicate holds, so an
+    // CO14c-1: `--root` must be the root the daemon actually serves. The whole
+    // root pre-check — the lexical parse of the installation's
+    // `daemon.cliPath` (`<root>/current/apps/cli/dist/bin.js`, where a missing
+    // or malformed one leaves the served root unknown; whether the entry point
+    // exists on disk plays no part in the parse itself) and the `realpath`
+    // comparison — runs only when the `checkable` predicate holds, so an
     // uncheckable root (`..` or relative) still falls through to
     // `parseRequest`'s usage error unchanged. Otherwise `--root` and the
-    // configured root must both exist on disk (any nonexistent root —
-    // including on `install --apply`, since the operator pre-creates the
-    // root — refuses here) and resolve to the same real path: a symlinked
-    // root is accepted only when it resolves to the configured root. The
-    // failure is a typed refusal that never echoes a path.
+    // configured root must both exist on disk and resolve to the same real
+    // path: a symlinked root is accepted only when it resolves to the
+    // configured root, and the configured root is resolved on disk, never
+    // trusted as a string. The failure is a typed refusal that never echoes a
+    // path — except the missing-root refusal below, whose operator message
+    // names the configured root path itself.
     if (checkable) {
+      const configuredRoot = configuredReleaseRoot(rt.installation as ReleaseDriverConfiguration | undefined);
+      if (configuredRoot === null) {
+        return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+      }
+      let realRoot: string;
       try {
-        const [realRoot, realConfiguredRoot] = await Promise.all([realpath(root), realpath(configuredRoot)]);
+        realRoot = await realpath(root);
+      } catch {
+        // CO14c-1 fix round 1: the configured root parsed, so the served root
+        // is known; a `--root` that does not exist is the operator's missing
+        // release root. It gets its own reason, with a message telling the
+        // operator to create the release root before the first install. The
+        // message names the configured root path (never any file contents),
+        // and the exit code stays the refusals' own.
+        return {
+          outcome: 'refused',
+          reason: 'release-root-missing' as const,
+          message: `create the release root before the first install; the configured release root is ${configuredRoot}`,
+        };
+      }
+      try {
+        const realConfiguredRoot = await realpath(configuredRoot);
         if (realRoot !== realConfiguredRoot) {
           return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
         }
       } catch {
+        // The configured root must be resolved on disk, never compared as a
+        // string: a configured root that does not exist there refuses.
         return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
       }
     }

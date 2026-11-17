@@ -64,6 +64,7 @@ export * from "./run-telemetry-spans.js";
 export * from "./seat-selection.js";
 export * from "./shadow-comparators.js";
 export * from "./shadow-evidence-ledger.js";
+export * from "./shell-train-events.js";
 export * from "./snapshot-sections.js";
 export * from "./stall-attention.js";
 export * from "./stall-rules.js";

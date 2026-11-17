@@ -13,8 +13,10 @@
  * no second read of its own. It is null when the outcome is `raised` (no prior
  * open or closed record). For `refreshed` and `reopened` the answer must carry
  * `previousRaisedAtIso` as null or a zoned ISO string, returned exactly as
- * stored and never re-formatted; anything else is a failed raise, and the
- * adapter never synthesizes a value.
+ * stored and never re-formatted. On every success outcome the answer must
+ * carry `previousRaisedAtIso` as an own data property — exactly `null` for
+ * `raised`, and null or a zoned ISO string for `refreshed` and `reopened`;
+ * anything else is a failed raise, and the adapter never synthesizes a value.
  *
  * Project-scoped items use subject `{ kind: 'project', ref: projectId }`
  * because that store subject cannot carry owner/repo. A list keeps such an
@@ -314,16 +316,14 @@ function mapAttentionAnswer<T extends string>(answer: unknown, accepted: readonl
 
 /**
  * The raise answer's `previousRaisedAtIso`, read under the delegate's lock as
- * part of the same answer that refreshed the item. `raised` has no prior
- * record, so it is null. For `refreshed` and `reopened` the answer's value is
- * returned exactly as stored when it is null or a zoned ISO string; anything
- * else is a failed raise, never synthesized. Never re-formatted, never throws.
+ * part of the same answer that raised the item. Every success outcome must
+ * carry it as an own data property: exactly `null` for `raised` (no prior
+ * record), and null or a zoned ISO string for `refreshed` and `reopened`,
+ * returned exactly as stored. A missing, accessor-backed or wrong-typed field
+ * is a failed raise, never synthesized. Never re-formatted, never throws.
  */
-function previousRaisedAtIsoOf(answer: unknown, outcome: string): { readonly ok: true; readonly value: string | null } | { readonly ok: false } {
+function previousRaisedAtIsoOf(answer: unknown): { readonly ok: true; readonly value: string | null } | { readonly ok: false } {
   try {
-    if (outcome === 'raised') {
-      return { ok: true, value: null };
-    }
     const value = ownValue(answer, 'previousRaisedAtIso');
     if (value === null) {
       return { ok: true, value: null };
@@ -343,7 +343,7 @@ function mapRaiseAnswer(answer: unknown): RaiseTrainHealthAttentionResult {
   if (mapped.outcome === 'refused') {
     return mapped;
   }
-  const previous = previousRaisedAtIsoOf(answer, mapped.outcome);
+  const previous = previousRaisedAtIsoOf(answer);
   if (!previous.ok) {
     return refusedUnreadable();
   }

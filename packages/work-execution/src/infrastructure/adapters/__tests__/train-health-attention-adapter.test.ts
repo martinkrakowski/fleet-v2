@@ -3,9 +3,10 @@
 // ports. Summaries are fixed text from ids and codes. The pass deadline is
 // accepted on the command and never forwarded. A raise result carries
 // `previousRaisedAtIso` exactly as the delegate answer stored it before the
-// overwrite: null for `raised`, and for `refreshed` and `reopened` the stored
-// record's last raise time, which must be null or a zoned ISO string (anything
-// else is a failed raise).
+// overwrite: the answer must carry it as an own data property on every success
+// outcome — exactly null for `raised`, and for `refreshed` and `reopened` the
+// stored record's last raise time, null or a zoned ISO string (anything else,
+// including a missing or accessor-backed field, is a failed raise).
 
 import { describe, expect, it } from 'vitest';
 
@@ -85,7 +86,7 @@ describe('TrainHealthAttentionAdapter', () => {
     const adapter = new TrainHealthAttentionAdapter({
       recordAttentionItem: async (body, actor) => {
         calls.push({ body, actor });
-        return { outcome: 'raised' };
+        return { outcome: 'raised', previousRaisedAtIso: null };
       },
     });
     const truncated = command({ rule: 'findings-truncated', pullRequest: null });
@@ -202,7 +203,7 @@ describe('TrainHealthAttentionAdapter', () => {
     const adapter = new TrainHealthAttentionAdapter({
       recordAttentionItem: async (body, actor) => {
         calls.push({ body, actor });
-        return { outcome: 'raised' };
+        return { outcome: 'raised', previousRaisedAtIso: null };
       },
     });
     const raw = command({ rule: 'tick-stale', pullRequest: null });
@@ -238,7 +239,7 @@ describe('TrainHealthAttentionAdapter', () => {
       const extra = new TrainHealthAttentionAdapter({
         recordAttentionItem: async (body, actor) => {
           seen.push({ body, actor });
-          return { outcome: 'raised' };
+          return { outcome: 'raised', previousRaisedAtIso: null };
         },
       });
       const projectRule = command({ rule, pullRequest: null });
@@ -258,7 +259,7 @@ describe('TrainHealthAttentionAdapter', () => {
     const adapter = new TrainHealthAttentionAdapter({
       recordAttentionItem: async (body, actor) => {
         calls.push({ body, actor });
-        return { outcome: 'raised' };
+        return { outcome: 'raised', previousRaisedAtIso: null };
       },
     });
     const raw = command({ rule: 'stale-queue-entry', pullRequest: 12 });
@@ -293,7 +294,7 @@ describe('TrainHealthAttentionAdapter', () => {
     const park = new TrainHealthAttentionAdapter({
       recordAttentionItem: async (body, actor) => {
         repeated.push({ body, actor });
-        return { outcome: 'raised' };
+        return { outcome: 'raised', previousRaisedAtIso: null };
       },
     });
     const parkCommand = command({ rule: 'repeated-park', pullRequest: 4 });
@@ -362,6 +363,41 @@ describe('TrainHealthAttentionAdapter', () => {
       previousRaisedAtIso: null,
     });
     expect(calls).toEqual([{ actor: 'train-watchdog', body: projectBody('tick-stale') }]);
+  });
+
+  it('a delegate raised result with no previousRaisedAtIso is a failed raise', async () => {
+    const calls: { body: unknown; actor: string }[] = [];
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async (body, actor) => {
+        calls.push({ body, actor });
+        return { outcome: 'raised' };
+      },
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'unreadable',
+    });
+    expect(calls).toEqual([{ actor: 'train-watchdog', body: projectBody('tick-stale') }]);
+  });
+
+  it('a delegate raised result with an accessor-backed previousRaisedAtIso is a failed raise, and the getter is never called', async () => {
+    let getterCalls = 0;
+    const answer: { outcome: 'raised'; previousRaisedAtIso?: string | null } = { outcome: 'raised' };
+    Object.defineProperty(answer, 'previousRaisedAtIso', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return null;
+      },
+    });
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => answer,
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'unreadable',
+    });
+    expect(getterCalls).toBe(0);
   });
 
   it('returns previousRaisedAtIso of the first raise on a second raise, stored as given', async () => {

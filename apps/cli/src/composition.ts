@@ -1417,6 +1417,11 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       recordAttentionItem: (body, actor) => coordination.recordAttentionItem.recordAttentionItem(body, actor),
       clearAttentionItem: (request, via, actor) => coordination.clearAttentionItem.clearAttentionItem(request, via, actor),
     },
+    trainHealthAttention: {
+      recordAttentionItem: (body, actor) => coordination.recordAttentionItem.recordAttentionItem(body, actor),
+      clearAttentionItem: (request, via, actor) => coordination.clearAttentionItem.clearAttentionItem(request, via, actor),
+      listAttentionItems: (request) => coordination.listAttentionItems.listAttentionItems(request),
+    },
   });
 
   // CO30a: `cutover status` reads the pause stores through read-only handles so a corrupt file is

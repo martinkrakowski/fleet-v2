@@ -216,9 +216,63 @@ describe('extractShadowShellFacts: extraction', () => {
   it('line not ascending is refused as invalid-input', () => {
     expectInvalid([event({ line: 2 }), event({ line: 1 })]);
   });
+
+  it('two events with the same line number are refused as invalid-input', () => {
+    // `line` must be strictly ascending; equal lines fail the `<=` check.
+    expectInvalid([event({ line: 1 }), event({ line: 1 })]);
+  });
+
+  it('collects incomplete head moves for PRs 9, 3 and 9 again as the sorted unique [3, 9]', () => {
+    const facts = expectOk([
+      event({ line: 1, kind: 'head-moved', outcome: 'moved', pullRequest: 9, headOid: HEAD, fromHeadOid: null, detailCode: 'head-moved-from' }),
+      event({ line: 2, kind: 'head-moved', outcome: 'moved', pullRequest: 3, headOid: HEAD, fromHeadOid: null, detailCode: 'head-moved-from' }),
+      event({ line: 3, kind: 'head-moved', outcome: 'moved', pullRequest: 9, headOid: HEAD, fromHeadOid: null, detailCode: 'head-moved-from' }),
+    ]);
+    expect(facts.headMoves).toEqual([]);
+    // Out of order (9 before 3, 9 twice): sorted and deduplicated.
+    expect(facts.headMovesIncompleteFor).toEqual([3, 9]);
+  });
+
+  it('a merged result with a null headOid emits unresolved-merge', () => {
+    // `readShellEvent` does not refuse this input: it validates `headOid`
+    // only when it is non-null, so the extractor handles the null itself.
+    const facts = expectOk([event({ headOid: null })]);
+    expect(facts.merges).toEqual([]);
+    expect(facts.anomalies).toEqual([{ atIso: AT, code: 'unresolved-merge' }]);
+  });
+
+  it('an updated result with a null pullRequest emits unpaired-update only', () => {
+    const facts = expectOk([event({ outcome: 'updated', pullRequest: null, headOid: HEAD, detailCode: 'premerge-carried' })]);
+    expect(facts.headMoves).toEqual([]);
+    expect(facts.carryDecisions).toEqual([]);
+    expect(facts.anomalies).toEqual([{ atIso: AT, code: 'unpaired-update' }]);
+    // With no pullRequest there is nothing to record as incomplete.
+    expect(facts.headMovesIncompleteFor).toEqual([]);
+  });
+
+  it('an update intent with a null headOid deletes that pull request pending intent', () => {
+    const facts = expectOk([
+      event({ line: 1, kind: 'intent', outcome: 'update-branch', pullRequest: 7, headOid: OLD_HEAD }),
+      event({ line: 2, kind: 'intent', outcome: 'update-branch', pullRequest: 7, headOid: null }),
+      event({ line: 3, outcome: 'updated', pullRequest: 7, headOid: HEAD, detailCode: 'premerge-carried' }),
+    ]);
+    // The null-headOid intent removed the pending OLD_HEAD intent, so the
+    // update that produced HEAD started from an unread head: no pairing.
+    expect(facts.headMoves).toEqual([]);
+    expect(facts.carryDecisions).toEqual([]);
+    expect(facts.anomalies).toEqual([{ atIso: AT, code: 'unpaired-update' }]);
+    expect(facts.headMovesIncompleteFor).toEqual([7]);
+  });
 });
 
 describe('extractShadowShellFacts: hostile input', () => {
+  it('refuses an Array subclass instance holding valid events', () => {
+    class EventList extends Array<unknown> {}
+    const list = new EventList();
+    list.push(event(), event({ line: 2, pullRequest: null }));
+    expectInvalid(list);
+  });
+
   it('refuses null', () => {
     expectInvalid(null);
   });
@@ -231,8 +285,12 @@ describe('extractShadowShellFacts: hostile input', () => {
     expectInvalid(17);
   });
 
-  it('refuses a non-iterable object where a list is due', () => {
+  it('refuses an array-like object where a list is due', () => {
     expectInvalid({ length: 1, 0: event() });
+  });
+
+  it('refuses a plain empty object where a list is due', () => {
+    expectInvalid({});
   });
 
   it('refuses a Proxy whose getOwnPropertyDescriptor reports NaN for length', () => {
@@ -325,6 +383,19 @@ describe('extractShadowShellFacts: hostile input', () => {
     const hostile = new Proxy(event(), {
       getPrototypeOf() {
         throw new Error('hostile getPrototypeOf');
+      },
+    });
+    expectInvalid([hostile]);
+  });
+
+  it('refuses an element whose Proxy trap throws inside readShellEvent, never throwing', () => {
+    // `readShellEvent`'s own try/catch already refuses this (the trap throw
+    // happens inside `readExactPlainRecord`, before any field check); the
+    // extractor's catch around `readShellEvent` is the second line of
+    // defence and is never reached for this input.
+    const hostile = new Proxy(event(), {
+      ownKeys() {
+        throw new Error('hostile ownKeys');
       },
     });
     expectInvalid([hostile]);

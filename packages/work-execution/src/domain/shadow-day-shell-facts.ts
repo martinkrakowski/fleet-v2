@@ -172,11 +172,21 @@ function readHeadMovedEvent(
   }
 }
 
-/** An `intent`/`update-branch` event: the newest intent per pull request is kept. */
+/**
+ * An `intent`/`update-branch` event: the newest intent per pull request is
+ * kept; an intent with a null `headOid` for a non-null pull request deletes
+ * any pending intent for that pull request (the update that follows started
+ * from an unread head and must not pair with the older intent).
+ */
 function readUpdateIntentEvent(event: ShellTrainEvent, pendingUpdates: Map<number, string>): void {
-  if (event.pullRequest !== null && event.headOid !== null) {
-    pendingUpdates.set(event.pullRequest, event.headOid);
+  if (event.pullRequest === null) {
+    return;
   }
+  if (event.headOid === null) {
+    pendingUpdates.delete(event.pullRequest);
+    return;
+  }
+  pendingUpdates.set(event.pullRequest, event.headOid);
 }
 
 /** A `result`/`updated` event: pairs with its pending intent or is unpaired. */

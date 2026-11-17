@@ -159,45 +159,33 @@ describe('parseLegacyTrainQueue', () => {
 });
 
 const PARKED_HEAD = FIRST_HEAD;
-const PARKED_REASON = 'too-many-conflicts';
+const PARKED_BASE = 'main';
 
-function parkedLine(overrides: Partial<Record<'pr' | 'head' | 'reason' | 'attempt' | 'notBefore' | 'base', string>> = {}): string {
+function parkedLine(overrides: Partial<Record<'pr' | 'head' | 'base', string>> = {}): string {
   const fields = {
     pr: '7',
     head: PARKED_HEAD,
-    reason: PARKED_REASON,
-    attempt: '2',
-    notBefore: '1735689600',
-    base: 'main',
+    base: PARKED_BASE,
     ...overrides,
   };
-  return [fields.pr, fields.head, fields.reason, fields.attempt, fields.notBefore, fields.base].join(' ');
+  return [fields.pr, fields.head, fields.base].join(' ');
 }
 
 function unknownParkedLine(line: number): { ok: false; line: number; reason: 'unknown-line' } {
   return { ok: false, line, reason: 'unknown-line' };
 }
 
+function parkedEntry(line: number, base: string): {
+  ok: true;
+  entry: { line: number; pullRequest: number; headOid: string; base: string };
+} {
+  return { ok: true, entry: { line, pullRequest: 7, headOid: PARKED_HEAD, base } };
+}
+
 describe('parseLegacyTrainParkedQueue', () => {
-  it('parses a well-formed six-field parked line into all six validated fields', () => {
+  it('parses a well-formed three-field parked line into its validated fields', () => {
     const result = parseLegacyTrainParkedQueue(`${parkedLine()}\n`);
-    expect(result).toEqual({
-      ok: true,
-      lines: [
-        {
-          ok: true,
-          entry: {
-            line: 1,
-            pullRequest: 7,
-            headOid: PARKED_HEAD,
-            reason: PARKED_REASON,
-            attempt: 2,
-            notBeforeEpochSeconds: 1735689600,
-            base: 'main',
-          },
-        },
-      ],
-    });
+    expect(result).toEqual({ ok: true, lines: [parkedEntry(1, 'main')] });
     if (result.ok) {
       expect(Object.isFrozen(result.lines)).toBe(true);
       const first = result.lines[0];
@@ -217,39 +205,24 @@ describe('parseLegacyTrainParkedQueue', () => {
     expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
   });
 
-  it('reports an over-length reason as an unknown line', () => {
-    const result = parseLegacyTrainParkedQueue(parkedLine({ reason: 'r'.repeat(129) }));
-    expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
-  });
-
-  it('reports a negative attempt as an unknown line', () => {
-    const result = parseLegacyTrainParkedQueue(parkedLine({ attempt: '-1' }));
-    expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
-  });
-
-  it('reports a malformed notBefore as an unknown line (epoch seconds assumed, not ISO)', () => {
-    const result = parseLegacyTrainParkedQueue(parkedLine({ notBefore: '2026-11-17T00:00:00Z' }));
-    expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
-  });
-
   it('reports a bad base as an unknown line', () => {
     const result = parseLegacyTrainParkedQueue(parkedLine({ base: 'chain/Bad' }));
     expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
   });
 
-  it('reports a three-field queue-format line as unknown to the parked parser', () => {
-    const result = parseLegacyTrainParkedQueue(`${MAIN_LINE}\n`);
+  it('reports a six-field parked line as unknown', () => {
+    const result = parseLegacyTrainParkedQueue(`${parkedLine()} reason 2 1735689600\n`);
     expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
   });
 
-  it('reports a seven-field parked line as unknown', () => {
-    const result = parseLegacyTrainParkedQueue(`${parkedLine()} extra\n`);
+  it('reports a two-field parked line as unknown', () => {
+    const result = parseLegacyTrainParkedQueue(`7 ${PARKED_HEAD}\n`);
     expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
   });
 
-  it('refuses a document with a secret-shaped reason wholesale without echoing it', () => {
+  it('refuses a document with a secret-shaped line wholesale without echoing it', () => {
     const secret = fakeSecretShape();
-    const result = parseLegacyTrainParkedQueue(parkedLine({ reason: secret }));
+    const result = parseLegacyTrainParkedQueue(parkedLine({ head: secret }));
     expect(result).toEqual({ ok: false, reason: 'secret-shaped' });
     expect(Object.keys(result)).toEqual(['ok', 'reason']);
     expect(JSON.stringify(result)).not.toContain(secret);
@@ -257,7 +230,7 @@ describe('parseLegacyTrainParkedQueue', () => {
 
   it('refuses a mixed document containing a secret-shaped neighbour instead of returning parsed entries', () => {
     const secret = fakeSecretShape();
-    const result = parseLegacyTrainParkedQueue([parkedLine(), parkedLine({ reason: secret })].join('\n'));
+    const result = parseLegacyTrainParkedQueue([parkedLine(), `8 ${secret} main`].join('\n'));
     expect(result).toEqual({ ok: false, reason: 'secret-shaped' });
     expect(JSON.stringify(result)).not.toContain(secret);
   });
@@ -282,10 +255,10 @@ describe('parseLegacyTrainParkedQueue', () => {
   it('distinguishes different documents and never echoes the raw input', () => {
     const result = parseLegacyTrainParkedQueue(parkedLine());
     expect(result).not.toEqual(parkedLine());
-    const other = parseLegacyTrainParkedQueue(parkedLine({ attempt: '3' }));
+    const other = parseLegacyTrainParkedQueue(parkedLine({ base: 'chain/example-1' }));
     expect(other).not.toEqual(result);
     if (result.ok && result.lines[0].ok) {
-      expect(result.lines[0].entry.attempt).toBe(2);
+      expect(result.lines[0].entry.base).toBe('main');
     }
   });
 
@@ -309,32 +282,10 @@ describe('parseLegacyTrainParkedQueue', () => {
     expect(result).toEqual({
       ok: true,
       lines: [
-        {
-          ok: true,
-          entry: {
-            line: 1,
-            pullRequest: 7,
-            headOid: PARKED_HEAD,
-            reason: PARKED_REASON,
-            attempt: 2,
-            notBeforeEpochSeconds: 1735689600,
-            base: 'main',
-          },
-        },
+        parkedEntry(1, 'main'),
         unknownParkedLine(2),
         unknownParkedLine(3),
-        {
-          ok: true,
-          entry: {
-            line: 4,
-            pullRequest: 7,
-            headOid: PARKED_HEAD,
-            reason: PARKED_REASON,
-            attempt: 2,
-            notBeforeEpochSeconds: 1735689600,
-            base: 'chain/example-1',
-          },
-        },
+        parkedEntry(4, 'chain/example-1'),
       ],
     });
   });

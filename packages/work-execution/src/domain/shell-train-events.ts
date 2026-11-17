@@ -236,48 +236,69 @@ function readPlainRecord(root: unknown): Record<string, unknown> | null {
 }
 
 export function parseShellTrainEvents(input: unknown): ShellTrainEventsParse {
-  const lengthResult = realArrayLength(input);
-  if ('reason' in lengthResult) {
-    return { ok: false, reason: lengthResult.reason };
+  try {
+    const lengthResult = realArrayLength(input);
+    if ('reason' in lengthResult) {
+      return { ok: false, reason: lengthResult.reason };
+    }
+    const length = lengthResult.length;
+
+    const events: ShellTrainEvent[] = [];
+    const unknownLines: number[] = [];
+    let secretShapedLines = 0;
+    const list = input as readonly unknown[];
+
+    for (let index = 0; index < length; index += 1) {
+      const raw = ownElement(list, index);
+      if (typeof raw !== 'string') {
+        unknownLines.push(index);
+        continue;
+      }
+      // Secret-shape detection runs before, and independently of, the length
+      // check below: every secret-shaped raw line is counted in
+      // `secretShapedLines`, whether or not it is ALSO over the length cap.
+      if (isSecretShaped(raw)) {
+        unknownLines.push(index);
+        secretShapedLines += 1;
+        continue;
+      }
+      if (raw.length > SHELL_EVENT_MAX_LINE_LENGTH) {
+        unknownLines.push(index);
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        unknownLines.push(index);
+        continue;
+      }
+      const root = readPlainRecord(parsed);
+      const event = root === null ? null : readEvent(index, root);
+      if (event === null) {
+        unknownLines.push(index);
+        continue;
+      }
+      events.push(event);
+    }
+
+    return Object.freeze({
+      ok: true,
+      events: Object.freeze(events),
+      unknownLines: Object.freeze(unknownLines),
+      secretShapedLines,
+    });
+  } catch {
+    // Any unexpected throw from a hostile input (for example a Proxy whose
+    // getPrototypeOf trap throws, surfaced by realArrayLength's own
+    // defensive check above) must never escape this boundary: the contract
+    // is to take `unknown` and never throw. Reuse 'not-a-list' rather than
+    // inventing a new reason code — the same catch-all shape this package
+    // already uses for a hostile throw (see readSuppliedKey/
+    // readGateReceiptKeyComponents in gate-receipt-key.ts and the
+    // detectStalls wrapper in stall-rules.ts) — because an input that throws
+    // before a single line can be read never behaved like a readable array
+    // in the first place, which is exactly what 'not-a-list' already means.
+    return { ok: false, reason: 'not-a-list' };
   }
-  const length = lengthResult.length;
-
-  const events: ShellTrainEvent[] = [];
-  const unknownLines: number[] = [];
-  let secretShapedLines = 0;
-  const list = input as readonly unknown[];
-
-  for (let index = 0; index < length; index += 1) {
-    const raw = ownElement(list, index);
-    if (typeof raw !== 'string' || raw.length > SHELL_EVENT_MAX_LINE_LENGTH) {
-      unknownLines.push(index);
-      continue;
-    }
-    if (isSecretShaped(raw)) {
-      unknownLines.push(index);
-      secretShapedLines += 1;
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      unknownLines.push(index);
-      continue;
-    }
-    const root = readPlainRecord(parsed);
-    const event = root === null ? null : readEvent(index, root);
-    if (event === null) {
-      unknownLines.push(index);
-      continue;
-    }
-    events.push(event);
-  }
-
-  return Object.freeze({
-    ok: true,
-    events: Object.freeze(events),
-    unknownLines: Object.freeze(unknownLines),
-    secretShapedLines,
-  });
 }

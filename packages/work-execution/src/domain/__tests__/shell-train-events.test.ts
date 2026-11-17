@@ -111,31 +111,125 @@ describe('parseShellTrainEvents', () => {
     expect(JSON.stringify(result)).not.toContain(path);
   });
 
-  it('reports a bad line individually without refusing the file', () => {
-    const result = parseShellTrainEvents([
-      eventJson(),
-      'not json at all',
-      eventJson({ kind: 'slurp' }),
-      eventJson({ at: '2026-13-05T10:00:00Z' }),
-      eventJson({ at: '2026-02-30T10:00:00Z' }),
-      eventJson({ headOid: HEAD.toUpperCase() }),
-      eventJson({ extra: 'ignored' }),
-      eventJson({ pr: 'x' }),
-      7,
-      null,
-      eventJson({ outcome: '-leading-dash' }),
-      eventJson({ detail: 3 }),
-      eventJson({ headOid: `${HEAD}0` }),
-    ]);
+  // The following rules were previously bundled into one
+  // "reports a bad line individually without refusing the file" test. Split
+  // one rule per test (2026-11-16, SH3 fix round) so a regression in any one
+  // rule identifies itself instead of being hidden behind the others' passes.
+  // Each pairs a known-good line at index 0 with the one bad line at index 1,
+  // confirming the file is parsed rather than refused outright.
 
+  it('refuses a line that is not parsable JSON at all', () => {
+    const result = parseShellTrainEvents([eventJson(), 'not json at all']);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.unknownLines).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-    expect(result.secretShapedLines).toBe(0);
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses an unrecognized event kind', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ kind: 'slurp' })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses a calendar-invalid at with an out-of-range month', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ at: '2026-13-05T10:00:00Z' })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses a calendar-invalid at with a day past the month\'s length', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ at: '2026-02-30T10:00:00Z' })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses an uppercase headOid', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ headOid: HEAD.toUpperCase() })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses a line with one extra unrecognized key named extra', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ extra: 'ignored' })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses a non-numeric pr', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ pr: 'x' })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses a raw line that is a number, not a string', () => {
+    const result = parseShellTrainEvents([eventJson(), 7]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses a raw line that is null, not a string', () => {
+    const result = parseShellTrainEvents([eventJson(), null]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses an outcome with a leading dash', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ outcome: '-leading-dash' })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses a non-string detail', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ detail: 3 })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses a headOid one character longer than 40 hex', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ headOid: `${HEAD}0` })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
   });
 
   it('counts a secret-shaped line exactly once and never echoes it', () => {
     const result = parseShellTrainEvents([eventJson(), fakeSecretShape()]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.secretShapedLines).toBe(1);
+    expect(JSON.stringify(result)).not.toContain('A'.repeat(20));
+  });
+
+  it('counts a secret-shaped line in secretShapedLines even when it is also over the length cap', () => {
+    // A line can be refused as unknown for two independent reasons at once
+    // (too long AND secret-shaped); secretShapedLines must still count it,
+    // regardless of which other reason also makes it unknown (SH3 finding 2).
+    const overLongSecret = `${fakeSecretShape()}${'x'.repeat(SHELL_EVENT_MAX_LINE_LENGTH)}`;
+    expect(overLongSecret.length).toBeGreaterThan(SHELL_EVENT_MAX_LINE_LENGTH);
+    const result = parseShellTrainEvents([eventJson(), overLongSecret]);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.unknownLines).toEqual([1]);
@@ -292,6 +386,23 @@ describe('parseShellTrainEvents', () => {
     const result = parseShellTrainEvents(proxy);
     expect(result).toEqual(parseShellTrainEvents(valid));
     expect(trapCalls).toBe(0);
+  });
+
+  it('returns a typed refusal instead of throwing for a Proxy whose getPrototypeOf trap throws', () => {
+    // SH3 finding 1: the boundary check at realArrayLength calls
+    // Object.getPrototypeOf(value) directly, so a Proxy wrapping a genuine
+    // array whose getPrototypeOf trap throws must not escape as an
+    // exception. The parser's contract is to take `unknown` and never throw.
+    const hostile = new Proxy([eventJson()], {
+      getPrototypeOf() {
+        throw new Error('trap');
+      },
+    });
+    let result: ReturnType<typeof parseShellTrainEvents> | undefined;
+    expect(() => {
+      result = parseShellTrainEvents(hostile);
+    }).not.toThrow();
+    expect(result).toEqual({ ok: false, reason: 'not-a-list' });
   });
 
   it('is not satisfiable by a constant verdict or an identity echo', () => {

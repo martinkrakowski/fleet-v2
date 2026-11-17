@@ -306,7 +306,7 @@ describe('cutover shadow report (CO32)', () => {
     };
     await fs.writeFile(path.join(stateDir, 'merge-queue.json'), JSON.stringify([parkedEntry]));
     await fs.writeFile(path.join(stateDir, 'queue'), '');
-    await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} main\n`);
+    await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} conflict 0 0 main\n`);
 
     const result = await cli(runtime, shadowReportArgs(stateDir));
     expect(result.code).toBe(0);
@@ -353,7 +353,7 @@ describe('cutover shadow report (CO32)', () => {
     await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
     await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
     const secret = ['sk', '-', 'aB3cD5eF7gH9iJ1kL2mN3'].join('');
-    await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} main\n${secret}\n`);
+    await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} conflict 0 0 main\n${secret}\n`);
 
     const result = await cli(runtime, shadowReportArgs(stateDir));
     expect(result.code).toBe(1);
@@ -371,8 +371,10 @@ describe('cutover shadow report (CO32)', () => {
     const runtime = createFleetCliRuntime({ stateDir });
     await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
     await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
-    const badLine = 'not a parked line';
-    await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} main\n${badLine}\n`);
+    // A 6-field line with one malformed field (`attempt` not an integer)
+    // lands in unknownLines, same as before the wiring change.
+    const badLine = `7 ${HEAD_A} conflict x 0 main`;
+    await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} conflict 0 0 main\n${badLine}\n`);
 
     const result = await cli(runtime, shadowReportArgs(stateDir));
     expect(result.code).toBe(1);
@@ -383,6 +385,27 @@ describe('cutover shadow report (CO32)', () => {
     expect(body.complete).toBe(false);
     expect(body.shell.unknownLines).toEqual([2]);
     expect(result.out).not.toContain(badLine);
+  });
+
+  it('reports a 3-field queue-style line fed to the parked source as unknown (the parked parser is 6-field)', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    // The old 3-field `pr sha base` shape is wrong for the parked source; the
+    // parked parser must reject it as unknown rather than silently accepting
+    // it (which would mean the old 3-field parser is still wired in).
+    const oldStyleLine = `7 ${HEAD_A} main`;
+    await fs.writeFile(path.join(stateDir, 'parked'), `${oldStyleLine}\n`);
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(1);
+    const body = JSON.parse(result.out) as { outcome: string; complete: boolean; shell: { unknownLines: number[] } };
+    expect(body.outcome).toBe('unknown');
+    expect(body.complete).toBe(false);
+    expect(body.shell.unknownLines).toEqual([1]);
+    expect(result.out).not.toContain(oldStyleLine);
   });
 
   it('reports an unreadable chains directory as null and incomplete, never as zero', async () => {

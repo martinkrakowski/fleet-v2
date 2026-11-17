@@ -22,6 +22,7 @@ import type { CommandHandler } from './payload.js';
 import {
   compareShadowEnqueueSets,
   isMergeQueueEntryLive,
+  parseLegacyTrainParkedQueue,
   parseLegacyTrainQueue,
   type LegacyTrainQueueLine,
 } from '@fleet/work-execution';
@@ -204,7 +205,11 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
     }
     let parkedLines: readonly LegacyTrainQueueLine[] = [];
     if (parked.status === 'read') {
-      const parsedParked = parseLegacyTrainQueue(parked.lines.join('\n'));
+      // Parked lines are the shell's 6-field `pr head reason attempt notBefore
+      // base` record (SH4d), not the queue's 3-field `pr sha base` shape — so
+      // they parse with the parked-specific parser, which is a superset of the
+      // queue entry for accounting purposes.
+      const parsedParked = parseLegacyTrainParkedQueue(parked.lines.join('\n'));
       if (!parsedParked.ok) {
         return {
           outcome: 'refused',
@@ -212,7 +217,7 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
           kind: 'enqueue-set',
         };
       }
-      parkedLines = parsedParked.lines;
+      parkedLines = parsedParked.lines.map((line) => (line.ok ? { ok: true as const, entry: line.entry } : line));
     }
 
     // The train head (`inprogress`) is part of the shell's enqueue set: it has

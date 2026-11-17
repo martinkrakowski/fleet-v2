@@ -159,6 +159,27 @@
  * retires it for real. `fencedRepoint`'s own proactive cleanup needs no
  * equivalent gate: it runs only from `applyOperation`, itself reachable only
  * from `apply()`, which `run()` never calls for a plan-only request.
+ *
+ * CO14b fix round 12 (Luna, a consistency finding): round 11's own fresh
+ * re-read inside `resolveTarget` fixed what `target` the stale-intent branch
+ * resolves to, but `run()` still built the rest of a plan-only result --
+ * `current` and `kept` (and, through `kept`, `wouldPrune`) -- from the
+ * listing it captured itself, before `resolveTarget` ever ran. When
+ * `resolveTarget` had re-read fresh, that outer snapshot could already be
+ * stale: the plan then reported an old `current`/`kept` alongside a `target`
+ * that was actually resolved against newer reality -- an internally
+ * inconsistent picture, never a mix a caller should see. The fix:
+ * `resolveTarget` now also returns the `builds`/`current` it actually used
+ * to compute `target` -- its own fresh re-read when it performed one, or
+ * simply the listing `run()` passed in when it did not need to -- and
+ * `run()` builds `kept` and the plan's `current`/`wouldPrune` from that
+ * returned listing, never its own separately-held copy. The apply path needs
+ * no equivalent change: `fencedRepoint` already revalidates everything it
+ * needs under the lease from its own fresh read, and the one place the outer
+ * listing still reaches `apply()` (`alreadyBuilt`, computed from `kept`) only
+ * ever matters for `install`, whose target is always the request's own named
+ * sha -- a case `resolveTarget` never re-reads for, so the outer and the
+ * resolved listing are always identical there.
  */
 
 import { containsSecretShape } from '@fleet/shared';
@@ -277,13 +298,19 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (listing.outcome !== 'read') {
       return refuse('store-unreadable');
     }
-    const { builds, current } = listing;
-    const kept = builds.map((build) => build.sha);
-    const resolved = await this.resolveTarget(request, builds, current);
+    const resolved = await this.resolveTarget(request, listing.builds, listing.current);
     if (resolved.outcome === 'unreadable') {
       return refuse('store-unreadable');
     }
-    const { target, previous } = resolved;
+    // CO14b fix round 12: `resolved.builds`/`resolved.current` are whichever
+    // listing `resolveTarget` actually used to compute `target` -- its own
+    // fresh re-read when it performed one (the stale-intent branch above),
+    // or simply `listing` unchanged when it did not need to. `kept` and the
+    // plan below are built from THAT listing, never from `listing` directly,
+    // so a plan never mixes an old `current`/`kept` with a `target` already
+    // resolved against newer reality.
+    const { target, previous, builds, current } = resolved;
+    const kept = builds.map((build) => build.sha);
     if (target === null || (request.action === 'swap' && !kept.includes(target))) {
       return refuse('not-found');
     }
@@ -304,7 +331,13 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (live) {
       return refuse('driver-lease-live');
     }
-    return this.apply(request, target, current, alreadyBuilt);
+    // The apply path is unaffected by which listing resolved `target`:
+    // `fencedRepoint` revalidates everything it needs itself, under the
+    // lease, from its own fresh read; the one remaining use of a listing
+    // here, `alreadyBuilt`, only matters for `install`, whose target
+    // (the request's own named sha) `resolveTarget` never re-reads for, so
+    // `listing.current` is passed exactly as before.
+    return this.apply(request, target, listing.current, alreadyBuilt);
   }
 
   /**
@@ -552,17 +585,31 @@ export class ManageReleaseUseCase implements ManageReleasePort {
    * repoint has already moved `current` out from under it. A plan reports
    * this recovered target too, so it reflects what a resume would really do,
    * never a value a resume could never actually use.
+   *
+   * CO14b fix round 12: also returns `builds`/`current` -- whichever listing
+   * this call actually used to compute `target`, its own fresh re-read when
+   * the stale-intent branch below performed one, or simply the caller's own
+   * `builds`/`current` echoed back unchanged otherwise. The caller builds
+   * everything else it reports from THIS returned listing, never a
+   * separately-held copy of its own that may already be stale by the time
+   * this function returns.
    */
   private async resolveTarget(
     request: ValidRequest,
     builds: readonly ReleaseBuildRecord[],
     current: string | null,
   ): Promise<
-    | { readonly outcome: 'resolved'; readonly target: string | null; readonly previous: string | null }
+    | {
+        readonly outcome: 'resolved';
+        readonly target: string | null;
+        readonly previous: string | null;
+        readonly builds: readonly ReleaseBuildRecord[];
+        readonly current: string | null;
+      }
     | { readonly outcome: 'unreadable' }
   > {
     if (request.action !== 'rollback') {
-      return { outcome: 'resolved', target: request.sha, previous: previousBuild(builds, current) };
+      return { outcome: 'resolved', target: request.sha, previous: previousBuild(builds, current), builds, current };
     }
     let open: ReleaseOpenOperationPeek;
     try {
@@ -577,8 +624,10 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       if (!open.repointed) {
         // Never proven to have done anything yet; adopted exactly as before
         // round 10 -- safe already, because the ordinary `current !==
-        // plannedCurrent` check downstream still gates it.
-        return { outcome: 'resolved', target: open.sha, previous: open.sha };
+        // plannedCurrent` check downstream still gates it. No fresh read
+        // was needed, so the caller's own listing is still the right one to
+        // report back.
+        return { outcome: 'resolved', target: open.sha, previous: open.sha, builds, current };
       }
       // CO14b fix round 11 (finding 1): `open.repointed` alone does not
       // settle whether this intent is still live -- it may ALREADY be
@@ -594,7 +643,9 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         return { outcome: 'unreadable' };
       }
       if (fresh.current === open.sha) {
-        return { outcome: 'resolved', target: open.sha, previous: open.sha };
+        // CO14b fix round 12: this was decided against `fresh`, not the
+        // caller's own listing, so `fresh` is the listing returned too.
+        return { outcome: 'resolved', target: open.sha, previous: open.sha, builds: fresh.builds, current: fresh.current };
       }
       // Proven stale under the fresh read: retire it now, not merely skip
       // it, so it can never poison a later rollback too: a later call's own
@@ -610,10 +661,13 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         await this.retireRollbackIntent(request.root, open.opId, open.sha);
       }
       const previous = previousBuild(fresh.builds, fresh.current);
-      return { outcome: 'resolved', target: previous, previous };
+      // CO14b fix round 12: `target` is resolved against `fresh`, so the
+      // listing returned is `fresh` too -- never the caller's older
+      // `builds`/`current`, which this branch has just proven stale.
+      return { outcome: 'resolved', target: previous, previous, builds: fresh.builds, current: fresh.current };
     }
     const previous = previousBuild(builds, current);
-    return { outcome: 'resolved', target: previous, previous };
+    return { outcome: 'resolved', target: previous, previous, builds, current };
   }
 
   /**

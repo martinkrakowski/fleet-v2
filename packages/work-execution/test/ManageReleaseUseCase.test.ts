@@ -1258,6 +1258,93 @@ describe('ManageReleaseUseCase', () => {
     },
   );
 
+  /**
+   * CO14b fix round 12: a store whose successive `list()` reads answer a
+   * SCRIPTED sequence of FULL listings (`current` AND `builds`, unlike
+   * round 11's `ScriptedListStore`, which only scripts `current`). This
+   * round's finding is specifically about `builds`/`current` together: an
+   * install or a prune elsewhere can change the kept set between `run()`'s
+   * own first read and `resolveTarget`'s internal fresh re-read, not only
+   * `current` alone.
+   */
+  class ScriptedFullListingStore extends FakeStore {
+    private listCalls = 0;
+
+    constructor(private readonly sequence: ReadonlyArray<{ current: string | null; builds: ReleaseBuildRecord[] }>) {
+      super(sequence[0]?.builds ?? [], sequence[0]?.current ?? null);
+    }
+
+    async list(): Promise<ReleaseStoreListing> {
+      if (this.unreadable) {
+        return { outcome: 'unreadable' };
+      }
+      const index = Math.min(this.listCalls, this.sequence.length - 1);
+      this.listCalls += 1;
+      const snapshot = this.sequence[index];
+      return { outcome: 'read', current: snapshot.current, builds: [...snapshot.builds] };
+    }
+  }
+
+  it(
+    "reports a plan-only rollback consistently from whichever listing resolveTarget actually " +
+      "used -- never run()'s own earlier, now-stale snapshot (CO14b round 12)",
+    async () => {
+      // run()'s own first `list()` read sees an OLD reality: builds A..E,
+      // current B. Between that read and resolveTarget's own fresh re-read
+      // (triggered below by an open, repointed:true rollback-to-C intent
+      // that is no longer live), an unrelated install added F and a prune
+      // elsewhere removed A: the fresh read sees builds B..F, current E.
+      const stale = { current: B, builds: [build('a', 1), build('b', 2), build('c', 3), build('d', 4), build('e', 5)] };
+      const fresh = { current: E, builds: [build('b', 2), build('c', 3), build('d', 4), build('e', 5), build('f', 6)] };
+      const store = new ScriptedFullListingStore([stale, fresh]);
+      const openOpId = store.newOperationId();
+      store.operations.set(`rollback-${C}`, { opId: openOpId, claimed: false, repointed: true });
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization: alwaysGrants(),
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+
+      // The fresh read shows current = E, not matching the open intent's
+      // own sha (C), so it is proven stale right here: the target is
+      // recomputed fresh -- previousBuild([B..F], E) = D -- and the WHOLE
+      // plan must report consistently from that SAME fresh listing, never a
+      // `current` (B) or a `kept` set (still including A) carried over from
+      // run()'s own earlier snapshot.
+      const planned = await manage(useCase, request({ action: 'rollback', sha: null, source: null, keep: 2 }));
+      expect(planned).toMatchObject({
+        outcome: 'planned',
+        action: 'rollback',
+        target: D,
+        previous: D,
+        current: E,
+      });
+      if (planned.outcome === 'planned') {
+        expect(planned.kept).toEqual([B, C, D, E, F]);
+        // Under the pre-round-12 bug, `wouldPrune` was computed from the
+        // STALE outer builds (A..E, keep 2): protected = {current-target D,
+        // previousBuild C, newest-2 D&E} = {C,D,E}, leaving [A, B] to prune
+        // -- A included, even though A was not even part of the fresh
+        // reality `target` was actually resolved against. Fixed, it is
+        // computed from the SAME fresh listing (B..F) that produced
+        // `target`: protected = {C,D,E,F}, leaving only [B].
+        expect(planned.wouldPrune).toEqual([B]);
+      }
+      // A plan writes nothing: the stale-looking intent survives untouched
+      // (it is only ever retired on a genuine apply).
+      expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({
+        outcome: 'open',
+        opId: openOpId,
+        sha: C,
+        repointed: true,
+      });
+    },
+  );
+
   it(
     'a stale rollback intent whose own repoint already landed is retired, never poisoning ' +
       'every later rollback forever (CO14b round 10, finding 1)',

@@ -127,17 +127,19 @@ describe('release root state directory binding (CO14 follow-up)', () => {
       );
       expect(err.join('')).toBe('');
       expect(code).toBe(1);
-      // CO14c-1 fix round 1: the missing root is its own reason, with an
-      // operator message that names the configured root path (the same root
-      // here) and tells the operator to create it before the first install.
+      // CO14c-1 fix round 2: the missing root keeps its own reason, but the
+      // message echoes no path — it says only that the release root does not
+      // exist and must be created before the first install, and points to the
+      // runbook step.
       const refused = JSON.parse(out.join('')) as { message?: string };
       expect(refused).toEqual({
         outcome: 'refused',
         reason: 'release-root-missing',
-        message: expect.any(String),
+        message: "the release root does not exist; create it before the first install " +
+          "(runbook: cutover, step 'Before the first release install')",
       });
-      expect(refused.message).toContain('create the release root before the first install');
-      expect(refused.message).toContain(root);
+      expect(refused.message).not.toContain(root);
+      expect(refused.message).not.toContain(base);
       expect(bindSpy).not.toHaveBeenCalled();
       expect(await readdir(base)).toEqual([]);
       bindSpy.mockRestore();

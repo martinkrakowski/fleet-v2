@@ -11,6 +11,25 @@ import { mkdir, mkdtemp, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+/**
+ * CO14c-1 fix round 2: the fs seam used to force a `realpath` failure. The
+ * wrapper delegates to the real `node:fs/promises` unless a failure is armed
+ * (and armed failures are consumed once), so every other test in this file
+ * keeps the real filesystem behavior.
+ */
+const realpathFailure = vi.hoisted(() => ({ code: null as string | null }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const injectedRealpath = (path: string) => {
+    const code = realpathFailure.code;
+    if (code !== null) {
+      throw Object.assign(new Error(`injected realpath failure (${code})`), { code });
+    }
+    return actual.realpath(path);
+  };
+  return { ...actual, realpath: Object.assign(injectedRealpath, { native: actual.realpath }) };
+});
+
 import {
   ConductorDriverLeaseAdapter,
   ReleaseStoreAdapter,
@@ -477,19 +496,54 @@ describe('release command', () => {
     );
     expect(err.join('')).toBe('');
     expect(code).toBe(1);
-    // CO14c-1 fix round 1: the missing root is its own reason, with an
-    // operator message that names the configured root path (the same root
-    // here) and tells the operator to create it before the first install.
+    // CO14c-1 fix round 2: the missing root keeps its own reason, but the
+    // message echoes no path — it says only that the release root does not
+    // exist and must be created before the first install, and points to the
+    // runbook step.
     const refused = JSON.parse(out.join('')) as { message?: string };
     expect(refused).toEqual({
       outcome: 'refused',
       reason: 'release-root-missing',
-      message: expect.any(String),
+      message: "the release root does not exist; create it before the first install " +
+        "(runbook: cutover, step 'Before the first release install')",
     });
-    expect(refused.message).toContain('create the release root before the first install');
-    expect(refused.message).toContain(root);
+    expect(refused.message).not.toContain(root);
+    expect(refused.message).not.toContain(base);
     // Nothing was created under the missing root's parent.
     expect(await stat(root).then(() => true, () => false)).toBe(false);
+  });
+
+  it('CO14c-1 fix round 2: a realpath failing with EACCES on --root gives release-root-state-dir-unknown', async () => {
+    // Seam: this suite's fs seam is its `node:fs/promises` module mock (see
+    // the top of the file): the test arms one injected `EACCES` failure on
+    // `realpath` and delegates everything else to the real module. (A
+    // chmod-000 directory was not used: these tests can run as root, where
+    // permission bits do not refuse, so the module seam is deterministic.)
+    const base = await mkdtemp(join(tmpdir(), 'co14c-eacces-base-'));
+    const root = join(base, 'releases');
+    await mkdir(root, { recursive: true });
+    const stateDir = await mkdtemp(join(tmpdir(), 'co14c-eacces-state-'));
+    const rt = await runtimeServingRoot(root, stateDir);
+    try {
+      realpathFailure.code = 'EACCES';
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', root, '--sha', SHA, '--source', root],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(err.join('')).toBe('');
+      expect(code).toBe(1);
+      // `EACCES` is not a missing root: the refusal is the unknown-state-dir
+      // one, with no message (so no path echo).
+      expect(JSON.parse(out.join(''))).toEqual({
+        outcome: 'refused',
+        reason: 'release-root-state-dir-unknown',
+      });
+    } finally {
+      realpathFailure.code = null;
+    }
   });
 
   it('CO14c-1: an existing root that is not the configured root is refused (realpath mismatch)', async () => {

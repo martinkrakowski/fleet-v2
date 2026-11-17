@@ -41,6 +41,24 @@ const DEFAULT_KEEP = 5;
 const MIN_KEEP = 2;
 const MAX_KEEP = 64;
 
+/**
+ * CO14c-1 fix round 2: the operator message of the `release-root-missing`
+ * refusal. It names no path — not the root, not the configured root — and
+ * only says that the release root does not exist and must be created before
+ * the first install, pointing to the cutover runbook's
+ * "Before the first `release install`" step.
+ */
+const RELEASE_ROOT_MISSING_MESSAGE =
+  "the release root does not exist; create it before the first install " +
+  "(runbook: cutover, step 'Before the first release install')";
+
+/** Whether a thrown value carries exactly the given `errno`-style code. */
+function isErrnoExceptionWithCode(value: unknown, code: string): boolean {
+  return (
+    typeof value === 'object' && value !== null && 'code' in value && (value as { code?: unknown }).code === code
+  );
+}
+
 export interface ReleaseCommandDependencies {
   readonly lease: ConductorDriverLeasePort;
   readonly authorization: ActionAuthorizationPort;
@@ -148,8 +166,8 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     // path: a symlinked root is accepted only when it resolves to the
     // configured root, and the configured root is resolved on disk, never
     // trusted as a string. The failure is a typed refusal that never echoes a
-    // path — except the missing-root refusal below, whose operator message
-    // names the configured root path itself.
+    // path (the missing-root refusal's message points to the runbook step
+    // instead — see the fix-round-2 note below).
     if (checkable) {
       const configuredRoot = configuredReleaseRoot(rt.installation as ReleaseDriverConfiguration | undefined);
       if (configuredRoot === null) {
@@ -158,18 +176,24 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
       let realRoot: string;
       try {
         realRoot = await realpath(root);
-      } catch {
-        // CO14c-1 fix round 1: the configured root parsed, so the served root
-        // is known; a `--root` that does not exist is the operator's missing
-        // release root. It gets its own reason, with a message telling the
-        // operator to create the release root before the first install. The
-        // message names the configured root path (never any file contents),
-        // and the exit code stays the refusals' own.
-        return {
-          outcome: 'refused',
-          reason: 'release-root-missing' as const,
-          message: `create the release root before the first install; the configured release root is ${configuredRoot}`,
-        };
+      } catch (error) {
+        // CO14c-1 fix round 2: only a missing `--root` (realpath `ENOENT`) is
+        // the operator's missing release root. Every other failure —
+        // `EACCES`, `ELOOP`, `ENOTDIR`, a non-errno throw — leaves the root
+        // unknown and refuses with `release-root-state-dir-unknown`, so an
+        // unreadable root can never be mistaken for a missing one. The
+        // `release-root-missing` message says only that the release root does
+        // not exist and must be created before the first install, and points
+        // to the runbook step; it never echoes a path, and the exit code
+        // stays the refusals' own.
+        if (isErrnoExceptionWithCode(error, 'ENOENT')) {
+          return {
+            outcome: 'refused',
+            reason: 'release-root-missing' as const,
+            message: RELEASE_ROOT_MISSING_MESSAGE,
+          };
+        }
+        return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
       }
       try {
         const realConfiguredRoot = await realpath(configuredRoot);

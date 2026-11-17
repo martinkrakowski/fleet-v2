@@ -670,6 +670,9 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * The canonical summary one verdict's digest is computed over: keys in the
    * fixed order `criterion`, `day`, `status`, `reason`, then the evaluator's
    * own numeric counts — for S1 also `excludeBatchMerges`, after the counts.
+   * S8 is the exception: its eight counts are live samples with no per-item
+   * timestamp, so they are excluded and S8's digest hashes only
+   * `{ criterion, day, status, reason }`.
    *
    * `mergeSet` (S1 only), `intake` (S8 only), `tickHealth` (S12 only) and
    * `stateIntegrity` (S9 only) are mutually exclusive, so at most one count
@@ -698,18 +701,19 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         excludeBatchMerges: this.deps.settings.excludeBatchMerges,
       });
     }
+    /**
+     * All eight S8 counts are live queue/shell/import snapshots with no
+     * per-item timestamp (only `takenAtIso`), not data scoped to UTC day
+     * `D`, so any queue movement between two `record-day` runs for the same
+     * closed day would change the digest while verdict and reason stay
+     * equal. They are therefore excluded from S8's digest, which hashes
+     * only `{ criterion, day, status, reason }`; `outcome.intake` stays on
+     * the outcome as a non-digested diagnostic. This changes the S8 digest
+     * format (allowed because no live shadow day has been recorded yet;
+     * live recording starts only after the digest format is final).
+     */
     if (outcome.intake !== undefined) {
-      return JSON.stringify({
-        ...base,
-        aFleetCount: outcome.intake.aFleetCount,
-        aShellCount: outcome.intake.aShellCount,
-        aCompared: outcome.intake.aCompared,
-        aDivergences: outcome.intake.aDivergences,
-        bFleetCount: outcome.intake.bFleetCount,
-        bShellCount: outcome.intake.bShellCount,
-        bCompared: outcome.intake.bCompared,
-        bDivergences: outcome.intake.bDivergences,
-      });
+      return JSON.stringify(base);
     }
     if (outcome.tickHealth !== undefined) {
       return JSON.stringify({

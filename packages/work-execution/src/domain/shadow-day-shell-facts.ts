@@ -1,4 +1,7 @@
+import { isZonedIsoDateTime } from './conductor-halt.js';
 import type { ShadowShellHeadMove, ShadowShellMerge } from './shadow-day-conformance.js';
+import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
+import { readExactPlainRecord } from './plain-record-reads.js';
 import { readShellEvent } from './shadow-day-merge-set.js';
 import { SHELL_EVENTS_MAX_LINES } from './shell-train-events.js';
 import type { ShellTrainEvent } from './shell-train-events.js';
@@ -226,4 +229,302 @@ function readUpdatedEvent(
   } else if (event.detailCode !== 'premerge-reposted') {
     anomalies.push({ atIso: event.atIso, code: 'unclassified-update' });
   }
+}
+
+/**
+ * The carry-decision cap for S5'. Each carry decision is paired from exactly
+ * one update intent and one result in the shell's events log, so a log of
+ * `SHADOW_SHELL_FACTS_MAX_EVENTS` events can carry at most half that many
+ * decisions. Deriving the cap from the extractor's event cap keeps the two
+ * from drifting: the extractor can never emit more decisions than events, and
+ * the evaluator refuses a list above this bound.
+ */
+export const SHADOW_CARRY_MAX_DECISIONS = SHADOW_SHELL_FACTS_MAX_EVENTS / 2;
+
+/** The S5' evaluation adds the replay counters to the shared criterion shape. */
+export type ShadowPremergeCarryEvaluation = ShadowCriterionEvaluation & {
+  readonly compared: number;
+  readonly laxCarries: number;
+  readonly stricterNoCarries: number;
+};
+
+interface ScopedDecision {
+  readonly newHeadOid: string;
+  readonly atIso: string;
+  readonly shellCarry: 'carried' | 'not-carried';
+  readonly fleetCarry: 'carry' | 'no-carry' | 'unknown';
+}
+
+interface ParsedCarryInput {
+  readonly ok: true;
+  readonly day: string;
+  readonly decisions: readonly ScopedDecision[];
+  readonly anomalies: readonly ShadowShellAnomaly[];
+}
+
+const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const HEAD_OID_PATTERN = /^[0-9a-f]{40}$/;
+const CARRY_INPUT_KEYS = ['day', 'unknownLines', 'decisions', 'anomalies'] as const;
+const CARRY_DECISION_KEYS = ['pullRequest', 'oldHeadOid', 'newHeadOid', 'atIso', 'shellCarry', 'fleetCarry'] as const;
+const CARRY_ANOMALY_KEYS = ['atIso', 'code'] as const;
+const PAIRING_ANOMALY_CODES: readonly ShadowShellAnomalyCode[] = ['unpaired-update', 'unclassified-update'];
+const DAY_MS = 86_400_000;
+
+/**
+ * A FRESH unknown result per call: a returned refusal must never be a shared,
+ * mutable singleton, or one caller's mutation of it would poison every later
+ * call into accepting the mutated verdict.
+ */
+const REFUSAL = (reason: string): ShadowPremergeCarryEvaluation => ({
+  status: 'unknown',
+  reason,
+  compared: 0,
+  laxCarries: 0,
+  stricterNoCarries: 0,
+});
+const INVALID_PARSE = { ok: false, reason: 'invalid' } as const;
+const SHELL_INCOMPLETE_PARSE = { ok: false, reason: 'shell-incomplete' } as const;
+
+/**
+ * S5' (OD-3b): replay the shell train's premerge carry decisions through
+ * fleet-v2's answer and require the two to agree. Cost: linear in the capped
+ * input — at most `SHADOW_CARRY_MAX_DECISIONS` decisions plus
+ * `SHADOW_SHELL_FACTS_MAX_EVENTS` anomalies, each read through its own data
+ * property descriptors, so no getter and no Proxy `get` trap ever runs; the
+ * list caps are checked from the length descriptors before any element is
+ * read. Never throws; every refusal is the typed unknown result with the
+ * named reason, and no input value is ever echoed into the result.
+ */
+export function evaluateShadowPremergeCarry(input: unknown): ShadowPremergeCarryEvaluation {
+  try {
+    return evaluateCarry(input);
+  } catch {
+    return REFUSAL('invalid-input');
+  }
+}
+
+/** Validate, then scope to the day and compare, in the brief's rule order. */
+function evaluateCarry(input: unknown): ShadowPremergeCarryEvaluation {
+  const parsed = parseCarryInput(input);
+  if (!parsed.ok) {
+    return parsed.reason === 'invalid' ? REFUSAL('invalid-input') : REFUSAL('shell-incomplete');
+  }
+  const start = Date.parse(`${parsed.day}T00:00:00.000Z`);
+  const end = start + DAY_MS;
+  const dayDecisions = parsed.decisions.filter((decision) => inDayWindow(decision.atIso, start, end));
+  const dayAnomalies = parsed.anomalies.filter((anomaly) => inDayWindow(anomaly.atIso, start, end));
+  if (dayAnomalies.some((anomaly) => PAIRING_ANOMALY_CODES.includes(anomaly.code))) {
+    return REFUSAL('carry-pairing-incomplete');
+  }
+  if (dayDecisions.some((decision) => decision.fleetCarry === 'unknown')) {
+    return REFUSAL('fleet-carry-unknown');
+  }
+  const deduped = dedupeByNewHead(dayDecisions);
+  if (deduped === null) {
+    return REFUSAL('carry-facts-conflicting');
+  }
+  return compareCarries(deduped);
+}
+
+/** The whole input, validated down to typed decisions and anomalies. */
+function parseCarryInput(input: unknown): ParsedCarryInput | { ok: false; reason: 'invalid' | 'shell-incomplete' } {
+  const record = readExactPlainRecord(input, CARRY_INPUT_KEYS);
+  if (record === null) {
+    return INVALID_PARSE;
+  }
+  const day = readCarryDay(record.day);
+  if (day === null) {
+    return INVALID_PARSE;
+  }
+  const unknownLines = record.unknownLines;
+  if (!isCarryCount(unknownLines)) {
+    return INVALID_PARSE;
+  }
+  const boundedDecisions = boundedCarryList(record.decisions, SHADOW_CARRY_MAX_DECISIONS);
+  const boundedAnomalies = boundedCarryList(record.anomalies, SHADOW_SHELL_FACTS_MAX_EVENTS);
+  if (boundedDecisions === null || boundedAnomalies === null) {
+    return INVALID_PARSE;
+  }
+  const readDecisions = collectCarryItems(boundedDecisions.list, boundedDecisions.length, readCarryDecision);
+  const readAnomalies = collectCarryItems(boundedAnomalies.list, boundedAnomalies.length, readCarryAnomaly);
+  if (readDecisions === null || readAnomalies === null) {
+    return INVALID_PARSE;
+  }
+  // An incomplete shell record is never evidence either way.
+  if (unknownLines > 0) {
+    return SHELL_INCOMPLETE_PARSE;
+  }
+  return { ok: true, day, decisions: readDecisions, anomalies: readAnomalies };
+}
+
+/** A real UTC calendar day `YYYY-MM-DD` in years 2000-9999, or null. */
+function readCarryDay(value: unknown): string | null {
+  if (typeof value !== 'string' || !DAY_PATTERN.test(value) || Number(value.slice(0, 4)) < 2000) {
+    return null;
+  }
+  const instant = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(instant.getTime()) || instant.toISOString().slice(0, 10) !== value) {
+    return null;
+  }
+  return value;
+}
+
+/** A non-negative safe integer count. */
+function isCarryCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * A real, dense array of `Array.prototype` within `cap`, refused from its own
+ * length descriptor and own key count alone, before any element is touched.
+ */
+function boundedCarryList(
+  value: unknown,
+  cap: number,
+): { list: readonly unknown[]; length: number } | null {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    return null;
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  const length = lengthDescriptor?.value;
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined ||
+    typeof length !== 'number' ||
+    !Number.isSafeInteger(length) ||
+    length < 0 ||
+    length > cap ||
+    Reflect.ownKeys(value).length !== length + 1
+  ) {
+    return null;
+  }
+  // The length is captured here and never read off the list again: a Proxy
+  // `get` trap could otherwise answer a different `.length` inside the loop.
+  return { list: value as readonly unknown[], length };
+}
+
+/** The own data-property element at `index`; a hole or an accessor reads as undefined. */
+function carryElement(list: readonly unknown[], index: number): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(list, String(index));
+  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+/** Every element through `read`, or null at the first one out of shape. */
+function collectCarryItems<T>(
+  list: readonly unknown[],
+  length: number,
+  read: (raw: unknown) => T | null,
+): readonly T[] | null {
+  const out: T[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const item = read(carryElement(list, index));
+    if (item === null) {
+      return null;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+/** One carry decision as S5' reads it, or null when out of shape. */
+function readCarryDecision(raw: unknown): ScopedDecision | null {
+  const record = readExactPlainRecord(raw, CARRY_DECISION_KEYS);
+  if (record === null) {
+    return null;
+  }
+  const { pullRequest, oldHeadOid, newHeadOid, atIso, shellCarry, fleetCarry } = record;
+  if (
+    !isCarryCount(pullRequest) ||
+    typeof oldHeadOid !== 'string' ||
+    !HEAD_OID_PATTERN.test(oldHeadOid) ||
+    typeof newHeadOid !== 'string' ||
+    !HEAD_OID_PATTERN.test(newHeadOid) ||
+    !isZonedIsoDateTime(atIso)
+  ) {
+    return null;
+  }
+  if (shellCarry !== 'carried' && shellCarry !== 'not-carried') {
+    return null;
+  }
+  if (fleetCarry !== 'carry' && fleetCarry !== 'no-carry' && fleetCarry !== 'unknown') {
+    return null;
+  }
+  return { newHeadOid, atIso, shellCarry, fleetCarry };
+}
+
+/** One anomaly as S5' reads it, or null when out of shape. */
+function readCarryAnomaly(raw: unknown): ShadowShellAnomaly | null {
+  const record = readExactPlainRecord(raw, CARRY_ANOMALY_KEYS);
+  if (record === null) {
+    return null;
+  }
+  const { atIso, code } = record;
+  if (
+    !isZonedIsoDateTime(atIso) ||
+    !SHADOW_SHELL_ANOMALY_CODES.includes(code as ShadowShellAnomalyCode)
+  ) {
+    return null;
+  }
+  return { atIso, code: code as ShadowShellAnomalyCode };
+}
+
+/** Whether the instant `atIso` names falls inside the half-open day window. */
+function inDayWindow(atIso: string, start: number, end: number): boolean {
+  const instant = new Date(atIso).getTime();
+  return instant >= start && instant < end;
+}
+
+/**
+ * Decisions sharing a `newHeadOid` collapse into one when both the shell and
+ * the fleet carry agree; any disagreement is a conflict, since the same head
+ * cannot carry two different answers.
+ */
+function dedupeByNewHead(decisions: readonly ScopedDecision[]): readonly ScopedDecision[] | null {
+  const byHead = new Map<string, ScopedDecision>();
+  for (const decision of decisions) {
+    const seen = byHead.get(decision.newHeadOid);
+    if (seen === undefined) {
+      byHead.set(decision.newHeadOid, decision);
+      continue;
+    }
+    if (seen.shellCarry !== decision.shellCarry || seen.fleetCarry !== decision.fleetCarry) {
+      return null;
+    }
+  }
+  return [...byHead.values()];
+}
+
+/**
+ * The equality check itself: one linear pass over the deduped decisions, in
+ * which the fleet is lax (carrying where the shell did not) or stricter
+ * (not carrying where the shell did) — either breaks the equality criterion.
+ */
+function compareCarries(decisions: readonly ScopedDecision[]): ShadowPremergeCarryEvaluation {
+  let laxCarries = 0;
+  let stricterNoCarries = 0;
+  for (const decision of decisions) {
+    if (decision.fleetCarry === 'carry' && decision.shellCarry === 'not-carried') {
+      laxCarries += 1;
+    }
+    if (decision.fleetCarry === 'no-carry' && decision.shellCarry === 'carried') {
+      stricterNoCarries += 1;
+    }
+  }
+  if (laxCarries > 0 || stricterNoCarries > 0) {
+    return {
+      status: 'fail',
+      reason: 'carry-decision-differs',
+      compared: decisions.length,
+      laxCarries,
+      stricterNoCarries,
+    };
+  }
+  return {
+    status: 'pass',
+    reason: 'carry-decisions-equal',
+    compared: decisions.length,
+    laxCarries: 0,
+    stricterNoCarries: 0,
+  };
 }

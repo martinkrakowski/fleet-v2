@@ -10,7 +10,11 @@ import { isZonedIsoDateTime } from './conductor-halt.js';
 import { isMergeHex40 } from './merge-queue-records.js';
 import { readExactPlainRecord } from './plain-record-reads.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
-import { compareShadowEnqueueSets, type ShadowComparisonResult } from './shadow-comparators.js';
+import {
+  compareShadowEnqueueSets,
+  type ShadowComparisonResult,
+  type ShadowDivergenceCode,
+} from './shadow-comparators.js';
 
 /**
  * The minimum time two samples must be apart for their agreement to count as
@@ -182,38 +186,150 @@ function validateSample(raw: unknown): ValidatedSample | null {
   };
 }
 
+/** One enqueue-set comparison: the comparator's result plus the exact sides it compared. */
+interface ComparisonSides {
+  readonly result: ShadowComparisonResult;
+  readonly fleet: readonly ValidatedKey[];
+  readonly shell: readonly ValidatedKey[];
+}
+
 /**
  * One sample's two comparisons: `A` is the live-coverage comparison of the
  * fleet queue against the whole shell live set; `B` is the import-fidelity
  * comparison of the import dry-run against the shell entries on `main` only,
  * since a chain-base entry can never be imported.
  */
-function sampleComparisons(sample: ValidatedSample): { readonly a: ShadowComparisonResult; readonly b: ShadowComparisonResult } {
+function sampleComparisons(sample: ValidatedSample): { readonly a: ComparisonSides; readonly b: ComparisonSides } {
   const shellMain = sample.shellLive.filter((key) => key.base === 'main');
   return {
-    a: compareShadowEnqueueSets({ fleet: sample.fleetLive, shell: sample.shellLive }),
-    b: compareShadowEnqueueSets({ fleet: sample.importPresent ?? [], shell: shellMain }),
+    a: { result: compareShadowEnqueueSets({ fleet: sample.fleetLive, shell: sample.shellLive }), fleet: sample.fleetLive, shell: sample.shellLive },
+    b: { result: compareShadowEnqueueSets({ fleet: sample.importPresent ?? [], shell: shellMain }), fleet: sample.importPresent ?? [], shell: shellMain },
   };
 }
 
+/** The comparator's identity of one validated key: ids only, never a value. */
+function keyOf(key: ValidatedKey): string {
+  return `${key.pullRequest}@${key.headOid}@${key.base}`;
+}
+
+/** The `(key, code)` identity of one listed divergence. */
+function divergenceId(divergence: { readonly key: string; readonly code: ShadowDivergenceCode }): string {
+  return `${divergence.key}\u0000${divergence.code}`;
+}
+
+/** The distinct key ids of one comparison's sides, as a set. */
+function keyIds(sides: readonly (readonly ValidatedKey[])[]): Set<string> {
+  const ids = new Set<string>();
+  for (const side of sides) {
+    for (const key of side) {
+      ids.add(keyOf(key));
+    }
+  }
+  return ids;
+}
+
+/** The key ids present on both samples' sides of one comparison. */
+function sharedKeyIds(first: ComparisonSides, second: ComparisonSides): Set<string> {
+  const firstIds = keyIds([first.fleet, first.shell]);
+  const shared = new Set<string>();
+  for (const id of keyIds([second.fleet, second.shell])) {
+    if (firstIds.has(id)) {
+      shared.add(id);
+    }
+  }
+  return shared;
+}
+
+/** The keys whose id is a candidate, keeping every occurrence of each. */
+function restrictedTo(keys: readonly ValidatedKey[], candidates: ReadonlySet<string>): readonly ValidatedKey[] {
+  return keys.filter((key) => candidates.has(keyOf(key)));
+}
+
+/** One side's distinct keys: how often each occurs, and one representative. */
+interface SideEntry {
+  readonly count: number;
+  readonly representative: ValidatedKey;
+}
+
+function sideIndex(keys: readonly ValidatedKey[]): Map<string, SideEntry> {
+  const index = new Map<string, SideEntry>();
+  for (const key of keys) {
+    const id = keyOf(key);
+    const known = index.get(id);
+    index.set(id, known === undefined ? { count: 1, representative: key } : { count: known.count + 1, representative: known.representative });
+  }
+  return index;
+}
+
 /**
- * True when the two comparisons share at least one (key, code) divergence.
- * Each comparison lists at most `SHADOW_DIVERGENCE_MAX` divergences (sorted
- * by key) and sets `truncated` for the rest, so a shared divergence can sit
- * beyond the cap and be unlisted in either sample. Truncation is therefore
- * fail-closed wherever the other sample's list shows divergences of its own:
- * only a sample whose complete divergence list is empty can prove that
- * nothing was shared, because an empty list is never truncated.
+ * The divergence of one candidate key between two sides, or null when the
+ * key is not a divergence. Set kinds compare membership only, so the
+ * comparator judges a key in isolation: a singleton comparison reproduces
+ * the code the full comparison gives that key. A key repeated within one
+ * side takes the comparator's duplicate verdict `invalid-item` instead.
  */
-function sharedDivergence(first: ShadowComparisonResult, second: ShadowComparisonResult): boolean {
-  if (first.truncated && second.divergences.length > 0) {
-    return true;
+function enqueueDivergenceCode(fleetEntry: SideEntry | null, shellEntry: SideEntry | null): ShadowDivergenceCode | null {
+  if ((fleetEntry?.count ?? 0) > 1 || (shellEntry?.count ?? 0) > 1) {
+    return 'invalid-item';
   }
-  if (second.truncated && first.divergences.length > 0) {
-    return true;
+  const result = compareShadowEnqueueSets({
+    fleet: fleetEntry === null ? [] : [fleetEntry.representative],
+    shell: shellEntry === null ? [] : [shellEntry.representative],
+  });
+  return result.divergences.length > 0 ? (result.divergences[0]?.code ?? null) : null;
+}
+
+/**
+ * Every `(key, code)` divergence of one enqueue-set comparison restricted to
+ * the candidate keys, including any the comparator's listing cap leaves
+ * unlisted: the exact persistence test needs the complete divergence set,
+ * not its first `SHADOW_DIVERGENCE_MAX` entries.
+ */
+function enqueueDivergenceCodes(fleet: readonly ValidatedKey[], shell: readonly ValidatedKey[]): Map<string, ShadowDivergenceCode> {
+  const fleetSide = sideIndex(fleet);
+  const shellSide = sideIndex(shell);
+  const codes = new Map<string, ShadowDivergenceCode>();
+  for (const [id, fleetEntry] of fleetSide) {
+    const code = enqueueDivergenceCode(fleetEntry, shellSide.get(id) ?? null);
+    if (code !== null) {
+      codes.set(id, code);
+    }
   }
-  const codes = new Set(first.divergences.map((divergence) => `${divergence.key}\u0000${divergence.code}`));
-  return second.divergences.some((divergence) => codes.has(`${divergence.key}\u0000${divergence.code}`));
+  for (const [id, shellEntry] of shellSide) {
+    if (!fleetSide.has(id)) {
+      const code = enqueueDivergenceCode(null, shellEntry);
+      if (code !== null) {
+        codes.set(id, code);
+      }
+    }
+  }
+  return codes;
+}
+
+/**
+ * True when the two comparisons share at least one (key, code) divergence —
+ * and only then: a divergence in a single sample is a snapshot artifact, and
+ * a shared pair hidden beyond the listing cap still counts. When neither
+ * list is truncated the listed entries are complete and their intersection
+ * decides. When either is truncated, the listed subset cannot decide either
+ * way, so the exact divergence set of the candidate keys — the keys both
+ * samples carry, the only keys a shared pair can name — is derived per key
+ * from the comparator itself and intersected.
+ */
+function sharedDivergence(first: ComparisonSides, second: ComparisonSides): boolean {
+  if (!first.result.truncated && !second.result.truncated) {
+    const listed = new Set(first.result.divergences.map(divergenceId));
+    return second.result.divergences.some((divergence) => listed.has(divergenceId(divergence)));
+  }
+  const candidates = sharedKeyIds(first, second);
+  const firstCodes = enqueueDivergenceCodes(restrictedTo(first.fleet, candidates), restrictedTo(first.shell, candidates));
+  const secondCodes = enqueueDivergenceCodes(restrictedTo(second.fleet, candidates), restrictedTo(second.shell, candidates));
+  for (const [id, code] of firstCodes) {
+    if (secondCodes.get(id) === code) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** True when a chain-base shell key appears in both samples' live sets. */
@@ -243,10 +359,11 @@ function persistentChainBase(first: readonly ValidatedKey[], second: readonly Va
  * (`import-unknown-lines`, checked before the B comparison), a persistent
  * import-fidelity divergence fails (`import-divergence`), a chain-base shell
  * key present in both samples fails (`chain-base-not-importable`), and
- * otherwise the intake is equal. A comparison whose divergence list is
- * truncated counts as divergent whenever the other sample shows divergences
- * of its own: a divergence beyond the listing cap cannot be ruled out as
- * non-persistent.
+ * otherwise the intake is equal. Persistence is decided exactly: when a
+ * comparison's divergence list is truncated by the listing cap, a shared
+ * pair is looked for among the exact per-key divergences of the keys both
+ * samples carry — never inferred from truncation alone, which would fail
+ * without any shared (key, code) pair.
  *
  * Cost: linear in the capped input — at most two samples, each with four
  * lists capped at `SHADOW_INTAKE_MAX_KEYS` keys, each key and field read once

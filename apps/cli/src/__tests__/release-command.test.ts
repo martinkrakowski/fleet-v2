@@ -7,7 +7,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -53,6 +53,18 @@ const NO_GRANT: ActionAuthorizationPort = {
   resolveActionAuthorization: async () => ({ outcome: 'blocked', reason: 'no recorded decision' }),
   consumeActionAuthorization: async () => ({ outcome: 'refused', reason: 'no grant' }),
 };
+
+/** Every resolve is granted for `root`, and every consumption of that grant succeeds. */
+function grantingAuthorization(root: string): ActionAuthorizationPort {
+  return {
+    resolveActionAuthorization: async (request) => ({
+      outcome: 'granted',
+      authorizationGrantId: `grant-${request.actionId}`,
+      releaseRoot: root,
+    }),
+    consumeActionAuthorization: async (request) => ({ outcome: 'consumed', actionId: request.actionId }),
+  };
+}
 
 function deps(lease: ConductorDriverLeaseRecord | null = null): {
   lease: ConductorDriverLeasePort;
@@ -112,7 +124,11 @@ describe('release command', () => {
       // ever ran for a given call.
       const leaseReadSpy = vi.spyOn(ConductorDriverLeaseAdapter.prototype, 'read');
 
-      const payload = { root, sha: SHA, source: SOURCE };
+      // CO14b fix round 4: the early bind this race protects is now gated on an actual
+      // apply (plan-only calls never bind), so the payload must really be an apply — with
+      // a project, or it would bail at 'authority-required' before ever reading the lease —
+      // for this to still exercise the race it claims to.
+      const payload = { root, sha: SHA, source: SOURCE, apply: true, project: PROJECT };
       const install = releaseCommands['install'];
       if (install === undefined) throw new Error('install command not registered');
 
@@ -129,6 +145,75 @@ describe('release command', () => {
 
       expect(readSpy).toHaveBeenCalledTimes(2);
       expect(bindSpy).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it(
+    'CO14b fix round 4 investigation: two appliers configured with the SAME state directory ' +
+      "cannot both land -- the driver lease's own CAS serializes them, not the binding, which " +
+      'tells both callers they match',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'co14b-same-state-root-'));
+      const sharedStateDir = await mkdtemp(join(tmpdir(), 'co14b-same-state-shared-'));
+      const SHA_X = 'b'.repeat(40);
+      const SHA_Y = 'c'.repeat(40);
+
+      // Two already-verified builds under the same root, so a swap to either needs no build
+      // of its own and the two callers' only shared mutable resource is `current` and the lease
+      // that guards repointing it.
+      const store = new ReleaseStoreAdapter();
+      for (const sha of [SHA_X, SHA_Y]) {
+        const staging = await store.prepare({ root, sha });
+        if (staging.outcome !== 'prepared') throw new Error('prepare failed');
+        const entry = join(staging.buildDir, 'apps', 'cli', 'dist');
+        await mkdir(entry, { recursive: true });
+        await writeFile(join(entry, 'bin.js'), '// built\n');
+        expect(
+          await store.markVerified({ root, sha, buildId: staging.buildId, builtAtIso: NOW }),
+        ).toEqual({ outcome: 'ok' });
+      }
+
+      // Both appliers are configured with the SAME state directory, so once each passes the
+      // (mocked) binding check below with a value that matches its own configuration, the
+      // binding layer alone cannot tell them apart -- A's hypothetical fresh `wx` create and
+      // B's hypothetical EEXIST re-read would report the identical stateDir either way. What
+      // is NOT mocked is the lease: each gets its own real `ConductorDriverLeaseAdapter`
+      // pointed at that one real, shared state directory, exactly as `releaseHandler`
+      // constructs it per call.
+      const depsFor = (): {
+        lease: ConductorDriverLeaseAdapter;
+        authorization: ActionAuthorizationPort;
+        executor: RecordingExecutor;
+        nowIso: () => string;
+        env: () => Record<string, string | undefined>;
+        store: ReleaseStoreAdapter;
+      } => ({
+        lease: new ConductorDriverLeaseAdapter({ stateDir: sharedStateDir }),
+        authorization: grantingAuthorization(root),
+        executor: new RecordingExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        store: new ReleaseStoreAdapter(),
+      });
+
+      const [resultA, resultB] = await Promise.all([
+        manageReleaseFromPayload({ action: 'swap', root, sha: SHA_X, apply: true, project: PROJECT }, depsFor()),
+        manageReleaseFromPayload({ action: 'swap', root, sha: SHA_Y, apply: true, project: PROJECT }, depsFor()),
+      ]);
+
+      // Both callers were configured identically (same shared state directory), so if the
+      // binding's coincidental match were the real safety net, nothing would stop both from
+      // landing. Exactly one actually applies; the other is refused specifically by the
+      // lease's own CAS (decideLeaseAcquire's `lease-held`, read fresh under the state
+      // directory's exclusive lock file), surfaced here as `driver-lease-live` --
+      // proving the lease adapter, not the binding, is what keeps two same-state-dir
+      // appliers from both landing.
+      const results = [resultA, resultB];
+      const applied = results.filter((r) => (r as { outcome: string }).outcome === 'applied');
+      const refused = results.filter((r) => (r as { outcome: string }).outcome === 'refused');
+      expect(applied).toHaveLength(1);
+      expect(refused).toHaveLength(1);
+      expect((refused[0] as { reason: string }).reason).toBe('driver-lease-live');
     },
   );
 

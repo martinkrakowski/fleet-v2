@@ -8,11 +8,11 @@
  * the root and starts no build.
  */
 
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ConductorDriverLeaseAdapter, ReleaseStoreAdapter } from '@fleet/work-execution';
 
@@ -63,6 +63,38 @@ describe('release root state directory binding (CO14 follow-up)', () => {
     // Nothing was created under the root.
     expect(await readdir(root)).toEqual([]);
   });
+
+  it(
+    'CO14b fix round 4: a plan-only call on a fresh unbound root never binds the driver, ' +
+      'and creates nothing under the root',
+    async () => {
+      const base = await tempDir('co14b-plan-only-base-');
+      // A root that does not exist yet: a bind here would be the first thing to create it.
+      const root = join(base, 'release-root');
+      const stateDir = await tempDir('co14b-plan-only-state-');
+      const rt: FleetCliRuntime = createFleetCliRuntime({
+        stateDir,
+        installation: installationWithDaemonStateDir(stateDir) as never,
+      });
+      const bindSpy = vi.spyOn(ReleaseStoreAdapter.prototype, 'bindDriver');
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', root, '--sha', SHA, '--source', root],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(err.join('')).toBe('');
+      expect(code).toBe(0);
+      expect(JSON.parse(out.join('')).outcome).toBe('planned');
+      // The early race-protection bind is for an apply only; a plan-only call never reaches it.
+      expect(bindSpy).not.toHaveBeenCalled();
+      // No bind means no `fs.mkdir(root, { recursive: true })` and no `.release-driver`
+      // marker: the root itself was never created on disk.
+      await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' });
+      bindSpy.mockRestore();
+    },
+  );
 
   it('a release under another state directory cannot miss a live lease', async () => {
     const root = await tempDir('co14-release-root-');

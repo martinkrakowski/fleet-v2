@@ -142,7 +142,16 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     // means no two drivers can concurrently apply to the same previously-
     // unbound root — a bind that happens only after applying would let both
     // racers apply before either result is recorded.
-    if (binding.outcome === 'unbound') {
+    // CO14b fix round 4: that race protection is only ever needed for a call
+    // that will actually APPLY. A plan-only call never mutates anything (the
+    // file's own doc comment: "Without --apply each prints the plan and
+    // writes nothing"), so binding an unbound root here — which itself
+    // creates the root directory and writes the `.release-driver` marker —
+    // would make a plan-only request a real filesystem write, breaking that
+    // contract. Skip the early bind entirely when this call is not an apply;
+    // the already-bound refusal path above (a binding that exists and
+    // mismatches) is unchanged either way, since it never writes anything.
+    if (binding.outcome === 'unbound' && parseApply(payload['apply'])) {
       const bound = await store.bindDriver({ root, stateDir });
       if (bound.outcome !== 'bound' || bound.stateDir !== stateDir) {
         // Another process's bind won the race first (or the bind itself is

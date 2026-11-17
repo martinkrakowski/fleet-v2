@@ -18,7 +18,8 @@
  * facts for named files of one verified build, still never a path or content.
  */
 
-import { constants as fsConstants, promises as fs, type Dirent, type FileHandle, type Stats } from 'node:fs';
+import { constants as fsConstants, promises as fs, type Dirent, type Stats } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 

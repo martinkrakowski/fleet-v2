@@ -239,7 +239,7 @@ describe('cutover shadow report (CO32)', () => {
 
     const noSub = await cli(runtime, ['cutover', 'shadow']);
     expect(noSub.code).toBe(2);
-    expect(noSub.err).toContain('cutover shadow requires the report subcommand');
+    expect(noSub.err).toContain('cutover shadow requires a subcommand: fleet-v2 cutover shadow report or fleet-v2 cutover shadow record-day');
   });
 
   it('counts only the live entries of the named repository', async () => {

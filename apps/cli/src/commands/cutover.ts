@@ -218,7 +218,7 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
     if (sub !== 'report' && sub !== 'record-day') {
       throw new CliUsageError(
         sub === ''
-          ? 'cutover shadow requires the report subcommand: fleet-v2 cutover shadow report'
+          ? 'cutover shadow requires a subcommand: fleet-v2 cutover shadow report or fleet-v2 cutover shadow record-day'
           : 'cutover shadow has no such subcommand: the two shadow subcommands are report and record-day',
       );
     }

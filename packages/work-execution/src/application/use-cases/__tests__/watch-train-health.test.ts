@@ -910,7 +910,7 @@ describe('WatchTrainHealthUseCase', () => {
     expect(missing.speakCalls).toHaveLength(0);
   });
 
-  it('new finding (no open item) -> speak called once with { sentence } for that finding, in order list, speak, raise', async () => {
+  it('new finding (no open item) -> speak called once with { sentence } for that finding, in order list, raise, speak', async () => {
     const { deps, log, speakCalls, raiseCalls, clearCalls } = makeDeps({
       alertMode: 'on',
       stateRead: okState(stalledHeadSnapshot()) as never,
@@ -930,8 +930,8 @@ describe('WatchTrainHealthUseCase', () => {
     expect(portMethods(log)).toEqual([
       'readTrainHealthState',
       'listOpenTrainHealthAttention',
-      'speak',
       'raiseTrainHealthAttention',
+      'speak',
     ]);
     expect(raiseCalls.map((call) => call.rule)).toEqual(['stalled-head']);
     expect(clearCalls).toHaveLength(0);
@@ -1061,10 +1061,12 @@ describe('WatchTrainHealthUseCase', () => {
 
   it('clock jumping past deadline before second speak -> one speak, budgetExhausted true, every port call preceded by clock read', async () => {
     const late = '2026-11-16T12:10:00.000Z';
-    // Reads: watch, readState, list, decision, first speak, second speak.
+    // Reorder: raises finish before speech. Reads are watch, readState, list,
+    // decision, raise tick-stale, raise stalled-head, first speak, second speak.
+    // The jump lands on the second speak. The sentence not started is unspoken.
     const { deps, log, speakCalls, raiseCalls, clearCalls } = makeDeps({
       alertMode: 'on',
-      nowSchedule: [NOW, NOW, NOW, NOW, NOW, late],
+      nowSchedule: [NOW, NOW, NOW, NOW, NOW, NOW, NOW, late],
       stateRead: okState(tickAndStalledSnapshot()) as never,
       openItems: [],
     });
@@ -1073,19 +1075,19 @@ describe('WatchTrainHealthUseCase', () => {
       outcome: 'evaluated',
       announced: 1,
       announceFailures: 0,
-      announceSuppressed: 0,
+      announceSuppressed: 1,
       budgetExhausted: true,
-      raised: 0,
+      raised: 2,
       healthy: false,
       exitCode: 1,
     });
     expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
-    expect(raiseCalls).toHaveLength(0);
+    expect(raiseCalls).toHaveLength(2);
     expect(clearCalls).toHaveLength(0);
     expectClockBeforeEveryPort(log);
   });
 
-  it("blind path with alert -> list, speak { sentence: 'The merge train watchdog cannot read the train state.' }, raise, and no clear", async () => {
+  it("blind path with alert -> list, raise, speak { sentence: 'The merge train watchdog cannot read the train state.' }, and no clear", async () => {
     const { deps, log, speakCalls, raiseCalls, clearCalls, listCalls } = makeDeps({
       alertMode: 'on',
       stateRead: blindStateRead() as never,
@@ -1108,8 +1110,8 @@ describe('WatchTrainHealthUseCase', () => {
     expect(portMethods(log)).toEqual([
       'readTrainHealthState',
       'listOpenTrainHealthAttention',
-      'speak',
       'raiseTrainHealthAttention',
+      'speak',
     ]);
     expectClockBeforeEveryPort(log);
   });
@@ -1261,8 +1263,9 @@ describe('WatchTrainHealthUseCase', () => {
     };
     const thrown = makeDeps({
       ...base,
+      // Reorder: watch, readState, list, decision, two raises, first speak, then the second speak.
       nowBehavior: (index) => {
-        if (index >= 5) {
+        if (index >= 7) {
           throw new Error('clock');
         }
         return NOW;
@@ -1271,25 +1274,25 @@ describe('WatchTrainHealthUseCase', () => {
     const thrownResult = await run(thrown.deps, baseRequest());
     expect(thrownResult).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' });
     expect(thrown.speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
-    expect(thrown.raiseCalls).toHaveLength(0);
+    expect(thrown.raiseCalls).toHaveLength(2);
 
     const malformed = makeDeps({
       ...base,
-      nowBehavior: (index) => (index >= 5 ? 'not-a-clock' : NOW),
+      nowBehavior: (index) => (index >= 7 ? 'not-a-clock' : NOW),
     });
     const malformedResult = await run(malformed.deps, baseRequest());
     expect(malformedResult).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' });
     expect(malformed.speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
-    expect(malformed.raiseCalls).toHaveLength(0);
+    expect(malformed.raiseCalls).toHaveLength(2);
   });
 
-  it('hung speak on an advancing clock with a 60s deadline still raises every due target and reports the unspoken sentences', async () => {
+  it('hung speak on an advancing clock with a 60s deadline still raises every due target', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(NOW));
     try {
-      // Three due sentences, each hung speak capped at 10s, raise reserve 32s.
-      // A speak starts only while remaining - 10s stays at least 32s:
-      // 60s speaks, 50s speaks, 40s stops. The one sentence not started is reported.
+      // Reorder: the three raises finish while the clock is still at the start,
+      // so the reserve no longer stops the third speak. Each hung speak is
+      // capped at 10s and all three fit in the 60s deadline. Nothing is left unspoken.
       const deadlineIso = new Date(Date.parse(NOW) + 60_000).toISOString();
       const { deps, speakCalls, raiseCalls } = makeDeps({
         alertMode: 'on',
@@ -1303,6 +1306,9 @@ describe('WatchTrainHealthUseCase', () => {
       void pending.then(() => {
         settled = true;
       });
+      await drainMicrotasks(60);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(10_000);
       await drainMicrotasks(30);
       expect(settled).toBe(false);
       await vi.advanceTimersByTimeAsync(10_000);
@@ -1314,13 +1320,17 @@ describe('WatchTrainHealthUseCase', () => {
       expect(result).toMatchObject({
         outcome: 'evaluated',
         announced: 0,
-        announceFailures: 2,
-        announceSuppressed: 1,
+        announceFailures: 3,
+        announceSuppressed: 0,
         raised: 3,
         budgetExhausted: false,
       });
       expect(raiseCalls).toHaveLength(3);
-      expect(speakCalls).toEqual([{ sentence: staleSentence(1) }, { sentence: staleSentence(2) }]);
+      expect(speakCalls).toEqual([
+        { sentence: staleSentence(1) },
+        { sentence: staleSentence(2) },
+        { sentence: staleSentence(3) },
+      ]);
     } finally {
       vi.useRealTimers();
     }
@@ -1418,5 +1428,117 @@ describe('WatchTrainHealthUseCase', () => {
     });
     expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
     expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+  });
+
+  it('60s deadline, three due targets, two speaks that never answer, and a first raise that hangs for its 30s timeout still starts every raise the no-alert path would start', async () => {
+    const deadlineIso = new Date(Date.parse(NOW) + 60_000).toISOString();
+    const stateRead = okState(
+      healthySnapshot({ lastTickFinishedAtIso: NOW, queue: closedEntries(3) }),
+    ) as never;
+    const runPass = async (withAlert: boolean) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(NOW));
+      const made = makeDeps({
+        ...(withAlert ? { alertMode: 'on' as const } : {}),
+        now: () => new Date(Date.now()).toISOString(),
+        raiseBehavior: (callIndex) =>
+          callIndex === 1 ? new Promise<never>(() => {}) : { outcome: 'raised', reasonCode: null },
+        ...(withAlert
+          ? {
+              alertSpeak: (callIndex: number) =>
+                callIndex <= 2 ? new Promise<never>(() => {}) : { outcome: 'spoken' },
+            }
+          : {}),
+        stateRead,
+        openItems: [],
+      });
+      const pending = run(made.deps, baseRequest({ deadlineIso }));
+      await drainMicrotasks(60);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await drainMicrotasks(30);
+      if (withAlert) {
+        await vi.advanceTimersByTimeAsync(10_000);
+        await drainMicrotasks(30);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await drainMicrotasks(30);
+      }
+      const result = await pending;
+      vi.useRealTimers();
+      return { made, result };
+    };
+    try {
+      const absent = await runPass(false);
+      const present = await runPass(true);
+      expect(present.made.raiseCalls).toEqual(absent.made.raiseCalls);
+      expect(present.made.raiseCalls).toHaveLength(3);
+      expect(absent.made.raiseCalls).toHaveLength(3);
+      expect(present.made.raiseCalls.map((call) => call.pullRequest)).toEqual([1, 2, 3]);
+      expect(present.made.speakCalls).toHaveLength(3);
+      expect(present.result).toMatchObject({
+        outcome: 'evaluated',
+        announced: 1,
+        announceFailures: 2,
+        raised: 2,
+      });
+      expect(absent.result).toMatchObject({ outcome: 'evaluated', raised: 2 });
+      const methods = portMethods(present.made.log);
+      const lastRaise = methods.lastIndexOf('raiseTrainHealthAttention');
+      const firstSpeak = methods.indexOf('speak');
+      expect(firstSpeak).toBeGreaterThan(lastRaise);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('with an alert port present vs absent, the same raise calls happen in the same order', async () => {
+    const three = okState(
+      healthySnapshot({ lastTickFinishedAtIso: NOW, queue: closedEntries(3) }),
+    ) as never;
+    const absent = makeDeps({ stateRead: three, openItems: [] });
+    const present = makeDeps({ alertMode: 'on', stateRead: three, openItems: [] });
+    await run(absent.deps, baseRequest());
+    await run(present.deps, baseRequest());
+    expect(present.raiseCalls).toEqual(absent.raiseCalls);
+    expect(present.raiseCalls.map((call) => call.pullRequest)).toEqual([1, 2, 3]);
+
+    const blindAbsent = makeDeps({ stateRead: blindStateRead() as never });
+    const blindPresent = makeDeps({ alertMode: 'on', stateRead: blindStateRead() as never, openItems: [] });
+    await run(blindAbsent.deps, baseRequest());
+    await run(blindPresent.deps, baseRequest());
+    expect(blindPresent.raiseCalls).toEqual(blindAbsent.raiseCalls);
+    expect(blindRaise(blindPresent.raiseCalls[0])).toBe(true);
+  });
+
+  it('speaking happens after raising', async () => {
+    const evaluated = makeDeps({
+      alertMode: 'on',
+      stateRead: okState(tickAndStalledSnapshot()) as never,
+      openItems: [],
+    });
+    await run(evaluated.deps, baseRequest());
+    const methods = portMethods(evaluated.log);
+    const lastRaise = methods.lastIndexOf('raiseTrainHealthAttention');
+    const firstSpeak = methods.indexOf('speak');
+    expect(lastRaise).toBeGreaterThanOrEqual(0);
+    expect(firstSpeak).toBeGreaterThan(lastRaise);
+    expect(methods.filter((method) => method === 'raiseTrainHealthAttention')).toHaveLength(2);
+    expect(methods.filter((method) => method === 'speak')).toHaveLength(2);
+    expect(evaluated.speakCalls.map((call) => call.sentence)).toEqual([
+      SENTENCE_TICK_STALE,
+      SENTENCE_STALLED_HEAD,
+    ]);
+
+    const blind = makeDeps({
+      alertMode: 'on',
+      stateRead: blindStateRead() as never,
+      openItems: [],
+    });
+    await run(blind.deps, baseRequest());
+    expect(portMethods(blind.log)).toEqual([
+      'readTrainHealthState',
+      'listOpenTrainHealthAttention',
+      'raiseTrainHealthAttention',
+      'speak',
+    ]);
   });
 });

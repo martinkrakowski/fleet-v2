@@ -18,9 +18,6 @@ import {
   SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN,
 } from '../../../domain/shadow-day-conformance.js';
 import {
-  SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN,
-} from '../shadow-day/index.js';
-import {
   SHADOW_GATE_CONTEXT,
   SHADOW_GATE_MAX_HEADS,
 } from '../../../domain/shadow-day-gate-agreement.js';
@@ -223,7 +220,17 @@ function makeFakes(overrides: FakesOverrides = {}): Fakes {
     },
     nowIso: overrides.nowIso ?? ((): string => NOW_ISO),
   } as ShadowGateHeadsDependencies;
-  return { deps, forgeCalls, listForRunCalls, attemptCalls, runsListCalls };
+  // `runsListCalls` is exposed through a getter over the closure-held counter,
+  // so an assertion such as `toBe(0)` reads the live count and can fail.
+  return {
+    deps,
+    forgeCalls,
+    listForRunCalls,
+    attemptCalls,
+    get runsListCalls(): number {
+      return runsListCalls;
+    },
+  };
 }
 
 /** One run pushing and passing one head, with its attempt carrying the full sha. */
@@ -771,6 +778,8 @@ describe('readShadowGateHeads', () => {
       expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
       expect(fakes.forgeCalls).toEqual([]);
       expect(fakes.attemptCalls).toEqual([]);
+      expect(fakes.runsListCalls).toBe(0);
+      expect(fakes.listForRunCalls).toEqual([]);
     }
   });
 
@@ -802,6 +811,48 @@ describe('readShadowGateHeads', () => {
     });
     const result = await readShadowGateHeads(fakes.deps, request());
     expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+    expect(fakes.forgeCalls).toEqual([]);
+  });
+
+  it('refuses deadline-exceeded with zero listForRuns calls when the clock crosses the deadline just before the journal read', async () => {
+    const first = passingRun(RUN_1, ATTEMPT_1, HEAD_12_1, HEAD_1, '2026-11-27T10:00:00.000Z');
+    let runsListed = false;
+    let listForRunsCalls = 0;
+    const fakes = makeFakes({
+      runRecords: [first.run],
+      runsList: async () => {
+        runsListed = true;
+        return [first.run];
+      },
+      listForRuns: async () => {
+        listForRunsCalls += 1;
+        return new Map([[first.run.runId, first.entries]]);
+      },
+      nowIso: (): string => (runsListed ? '2026-12-01T00:00:00.000Z' : NOW_ISO),
+    });
+    const result = await readShadowGateHeads(fakes.deps, request());
+    expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+    expect(listForRunsCalls).toBe(0);
+    expect(fakes.attemptCalls).toEqual([]);
+    expect(fakes.forgeCalls).toEqual([]);
+  });
+
+  it('refuses deadline-exceeded with zero findAttemptById calls when the clock crosses the deadline just before the attempt read', async () => {
+    const first = passingRun(RUN_1, ATTEMPT_1, HEAD_12_1, HEAD_1, '2026-11-27T10:00:00.000Z');
+    let journalsRead = false;
+    const fakes = makeFakes({
+      runRecords: [first.run],
+      journals: new Map([[first.run.runId, first.entries]]),
+      attemptsById: new Map([[ATTEMPT_1, first.attempt]]),
+      listForRuns: async () => {
+        journalsRead = true;
+        return new Map([[first.run.runId, first.entries]]);
+      },
+      nowIso: (): string => (journalsRead ? '2026-12-01T00:00:00.000Z' : NOW_ISO),
+    });
+    const result = await readShadowGateHeads(fakes.deps, request());
+    expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+    expect(fakes.attemptCalls).toEqual([]);
     expect(fakes.forgeCalls).toEqual([]);
   });
 
@@ -1127,24 +1178,6 @@ describe('readShadowGateHeads', () => {
       expect(entryReads).toBeGreaterThanOrEqual(entries.length);
     });
 
-    it('refuses more distinct pushed heads in one run than the per-run cap, before any per-head work', async () => {
-      const entries: LaneRunJournalEntryRecord[] = [];
-      for (let index = 0; index <= SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN; index += 1) {
-        const head12 = index.toString(16).padStart(4, '0') + 'f'.repeat(8);
-        entries.push(makeEntry(stepKey(RUN_1, 'push', head12), WINDOW_START_ISO));
-        entries.push(makeEntry(stepKey(RUN_1, 'gate', head12), WINDOW_START_ISO, { reasonCode: 'gate-passed' }));
-      }
-      const fakes = makeFakes({
-        runRecords: [makeRun(RUN_1, { attemptIds: [ATTEMPT_1] })],
-        journals: new Map([[RUN_1, entries]]),
-        attemptsById: new Map([[ATTEMPT_1, makeAttempt(ATTEMPT_1, HEAD_1)]]),
-      });
-      const result = await readShadowGateHeads(fakes.deps, request());
-      expect(result).toEqual({ status: 'unknown', reason: 'too-many-run-heads' });
-      expect(fakes.attemptCalls).toEqual([]);
-      expect(fakes.forgeCalls).toEqual([]);
-    });
-
     it('refuses a string where a list is expected (runs list and journal list)', async () => {
       const stringRuns = makeFakes({ runsList: async () => 'example-runs-string' as unknown as LaneRunRecord[] });
       expect(await readShadowGateHeads(stringRuns.deps, request())).toEqual({
@@ -1160,6 +1193,111 @@ describe('readShadowGateHeads', () => {
         status: 'unknown',
         reason: 'journal-unreadable',
       });
+    });
+
+    it('refuses journal-unreadable when a Proxy reports a non-safe-integer length (NaN) instead of reading it as empty', async () => {
+      const entries: LaneRunJournalEntryRecord[] = [
+        makeEntry(stepKey(RUN_1, 'push', HEAD_12_1), WINDOW_START_ISO),
+      ];
+      const hostile = new Proxy(entries, {
+        getOwnPropertyDescriptor(target, key) {
+          if (key === 'length') {
+            return { value: Number.NaN, writable: true, enumerable: false, configurable: false };
+          }
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+      });
+      const fakes = makeFakes({
+        runRecords: [makeRun(RUN_1)],
+        journals: new Map([[RUN_1, hostile as unknown as readonly LaneRunJournalEntryRecord[]]]),
+      });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+    });
+
+    it('refuses head-unresolved when an attempt carries a 64-hex sha, which is not a gate head oid', async () => {
+      const sha64 = 'e'.repeat(64);
+      const entries = [
+        makeEntry(stepKey(RUN_1, 'push', sha64.slice(0, 12)), '2026-11-27T10:00:00.000Z'),
+        makeEntry(stepKey(RUN_1, 'gate', sha64.slice(0, 12)), '2026-11-27T11:00:00.000Z', { reasonCode: 'gate-passed' }),
+      ];
+      const fakes = makeFakes({
+        runRecords: [makeRun(RUN_1, { attemptIds: [ATTEMPT_1] })],
+        journals: new Map([[RUN_1, entries]]),
+        attemptsById: new Map([[ATTEMPT_1, makeAttempt(ATTEMPT_1, sha64)]]),
+      });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'head-unresolved' });
+    });
+
+    it('returns a typed unknown, without rejecting, when a Proxy revoked inside its own then trap escapes every inner catch', async () => {
+      const { proxy, revoke } = Proxy.revocable(
+        new Map<string, readonly LaneRunJournalEntryRecord[]>(),
+        {
+          get(target, key, receiver) {
+            if (key === 'then') {
+              revoke();
+            }
+            return Reflect.get(target, key, receiver);
+          },
+        },
+      );
+      const fakes = makeFakes({ listForRuns: async () => proxy as never });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result.status).toBe('unknown');
+    });
+
+    it('reads a journal-entries array length exactly once, through its descriptor and never a get trap', async () => {
+      const first = passingRun(RUN_1, ATTEMPT_1, HEAD_12_1, HEAD_1, '2026-11-27T10:00:00.000Z');
+      let lengthDescriptorReads = 0;
+      let lengthGetTraps = 0;
+      const proxied = new Proxy(
+        first.entries as unknown as readonly LaneRunJournalEntryRecord[],
+        {
+          get(target, key, receiver) {
+            if (key === 'length') {
+              lengthGetTraps += 1;
+            }
+            return Reflect.get(target, key, receiver);
+          },
+          getOwnPropertyDescriptor(target, key) {
+            if (key === 'length') {
+              lengthDescriptorReads += 1;
+            }
+            return Reflect.getOwnPropertyDescriptor(target, key);
+          },
+        },
+      );
+      const fakes = makeFakes({
+        runRecords: [first.run],
+        journals: new Map([[first.run.runId, proxied]]),
+        attemptsById: new Map([[ATTEMPT_1, first.attempt]]),
+      });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result.status).toBe('ok');
+      expect(lengthDescriptorReads).toBe(1);
+      expect(lengthGetTraps).toBe(0);
+    });
+
+    it('refuses attempt-unreadable, without running the getter, when attempt.artifacts is an accessor', async () => {
+      let getterRuns = 0;
+      const hostileAttempt = makeAttempt(ATTEMPT_1, HEAD_1) as unknown as Record<string, unknown>;
+      Object.defineProperty(hostileAttempt, 'artifacts', {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return null;
+        },
+      });
+      const first = passingRun(RUN_1, ATTEMPT_1, HEAD_12_1, HEAD_1, '2026-11-27T10:00:00.000Z');
+      const fakes = makeFakes({
+        runRecords: [first.run],
+        journals: new Map([[first.run.runId, first.entries]]),
+        attemptsById: new Map([[ATTEMPT_1, hostileAttempt as unknown as AttemptRecord]]),
+      });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'attempt-unreadable' });
+      expect(getterRuns).toBe(0);
     });
   });
 });

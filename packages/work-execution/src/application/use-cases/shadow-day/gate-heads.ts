@@ -45,16 +45,9 @@ import {
   SHADOW_GATE_MAX_HEADS,
 } from '../../../domain/shadow-day-gate-agreement.js';
 
-/**
- * The per-run cap on distinct pushed heads, applied before any per-head work
- * (verdict lookup, attempt reads, forge calls). Together with
- * `SHADOW_GATE_MAX_HEADS` it bounds one run's contribution, so the read stays
- * linear in the capped input even before the total-head cap is reached.
- */
-export const SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN = 500;
 import { isZonedIsoDateTime } from '../../../domain/conductor-halt.js';
 import { readExactPlainRecord } from '../../../domain/plain-record-reads.js';
-import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import { isValidRepositoryRef } from '../ImportTrainStateUseCase.use-case.js';
 import {
   SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN,
@@ -131,6 +124,37 @@ function readStoreField<R extends ShadowConductedFactsUnknown>(
     refuse(reason);
   }
   return descriptor?.value;
+}
+
+/**
+ * One store array's `length` through its own data-property descriptor: only
+ * a non-negative safe integer passes, so a Proxy reporting `length: NaN` (or
+ * any other non-integer) is refused, never read as empty. Cost: O(1).
+ */
+function readArrayLengthOrRefuse<R extends ShadowConductedFactsUnknown>(
+  reason: R,
+  record: unknown,
+): number {
+  const length = readStoreField(reason, record, 'length');
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
+    refuse(reason);
+  }
+  return length;
+}
+
+/** Whether `commit` is exactly a 40-hex full sha, matching SH11's `isMergeHex40`. Cost: O(1). */
+const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+/**
+ * The head12 of an exactly 40-hex full sha (SH11's `isMergeHex40` rule), or
+ * null for anything else — a 64-hex sha is not a gate head oid, so it must
+ * not match. Cost: O(1).
+ */
+function head12OfFullSha(commit: unknown): string | null {
+  if (typeof commit !== 'string' || !FULL_SHA_PATTERN.test(commit)) {
+    return null;
+  }
+  return commit.slice(0, 12);
 }
 
 /** Whether `kind` is one of the journal's entry kinds. Cost: O(1). */
@@ -368,10 +392,9 @@ function runIdsOf(runRecords: readonly LaneRunRecord[]): readonly RunWithId[] {
  * distinct pushed heads with their earliest push time inside the window and
  * (b) the last (append order) verdict per `head12`. Each distinct head is
  * looked up in O(1), so the journal is never rescanned per head. More than
- * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN` entries refuses; more than
- * `SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN` distinct pushed heads refuses
- * before any per-head work. Cost: one linear pass in the capped entries;
- * the per-run head cap is a named constant.
+ * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN` entries refuses. Cost: one
+ * linear pass in the capped entries; every distinct head is then looked up
+ * in O(1), never by rescanning the journal.
  */
 function runHeadsOf(
   run: LaneRunRecord,
@@ -380,10 +403,7 @@ function runHeadsOf(
   windowStartMs: number,
   windowEndMs: number,
 ): RunHeads {
-  const entryCount = readStoreField('journal-unreadable', entries, 'length');
-  if (typeof entryCount !== 'number') {
-    refuse('journal-unreadable');
-  }
+  const entryCount = readArrayLengthOrRefuse('journal-unreadable', entries);
   if (entryCount > SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN) {
     refuse('too-many-journal-entries');
   }
@@ -409,9 +429,6 @@ function runHeadsOf(
     if (gate !== null) {
       verdictsByHead.set(gate.head12, gate.verdict);
     }
-  }
-  if (heads.size > SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN) {
-    refuse('too-many-run-heads');
   }
   // Only pushed heads matter: a verdict at a head that never reached the
   // pull request is ignored. Each head is one O(1) map lookup.
@@ -446,10 +463,7 @@ async function readHeadShas(
     if (!Array.isArray(attemptIds)) {
       refuse('runs-unreadable');
     }
-    const attemptCount = readStoreField('runs-unreadable', attemptIds, 'length');
-    if (typeof attemptCount !== 'number') {
-      refuse('runs-unreadable');
-    }
+    const attemptCount = readArrayLengthOrRefuse('runs-unreadable', attemptIds);
     if (attemptCount > SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN) {
       refuse('too-many-attempts');
     }
@@ -480,7 +494,7 @@ async function readHeadShas(
         continue;
       }
       const headCommit = readStoreField('attempt-unreadable', artifacts, 'headCommit');
-      const matched = readOrRefuse('attempt-unreadable', () => head12Of(headCommit));
+      const matched = readOrRefuse('attempt-unreadable', () => head12OfFullSha(headCommit));
       if (matched === null) {
         continue;
       }
@@ -553,7 +567,6 @@ async function readCiGate(
  * journal), linear in the capped attempts, and one forge call per distinct
  * sha; the caps (`SHADOW_FACTS_MAX_RUNS`,
  * `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`,
- * `SHADOW_GATE_MAX_PUSHED_HEADS_PER_RUN`,
  * `SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN`, `SHADOW_GATE_MAX_HEADS`) are named
  * constants.
  */
@@ -645,10 +658,7 @@ async function readRunRecordsOrRefuse(
     refuse('runs-unreadable');
   }
   const runRecords: readonly LaneRunRecord[] = listed;
-  const runCount = readStoreField('runs-unreadable', runRecords, 'length');
-  if (typeof runCount !== 'number') {
-    refuse('runs-unreadable');
-  }
+  const runCount = readArrayLengthOrRefuse('runs-unreadable', runRecords);
   if (runCount > SHADOW_FACTS_MAX_RUNS) {
     refuse('too-many-runs');
   }

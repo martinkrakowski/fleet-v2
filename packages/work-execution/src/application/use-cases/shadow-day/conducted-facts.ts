@@ -89,7 +89,6 @@ export type ShadowConductedFactsUnknown =
   | 'too-many-journal-entries'
   | 'too-many-attempts'
   | 'too-many-receipts'
-  | 'too-many-run-heads'
   | 'too-many-heads'
   | 'forge-read-missing'
   | 'forge-unavailable'

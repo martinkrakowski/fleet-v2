@@ -149,10 +149,11 @@ describe('chain refresh daemon job, shadow composition', () => {
     expect(after.status === 'ok' && after.record.refresh).toBeNull();
   });
 
-  it('a halted conductor makes the shadow chain-refresh job refuse halted through the real composition', async () => {
-    const { jobEvents, ghCalls } = await shadowTick({ halted: true });
+  it('a halted conductor skips the shadow chain-refresh job as halted through the real composition and the tick exits 0', async () => {
+    const { result, jobEvents, ghCalls } = await shadowTick({ halted: true });
+    expect(result).toMatchObject({ outcome: 'completed', exitCode: 0 });
     expect(jobEvents).toHaveLength(1);
-    expect(jobEvents[0]).toMatchObject({ kind: 'job', outcome: 'refused', reasonCode: 'halted' });
+    expect(jobEvents[0]).toMatchObject({ kind: 'job', outcome: 'skipped', reasonCode: 'halted' });
     expect(ghCalls.some((args) => args.some((arg) => arg.includes('/git/ref/heads/main')))).toBe(false);
   });
 });

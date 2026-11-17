@@ -331,9 +331,14 @@ class FakeAuthorization implements ActionAuthorizationPort {
       return this.answer;
     }
     const grant = this.grant;
+    // A grant already consumed by THIS actionId is a resume replaying its own
+    // earlier, deterministic id (CO14b round 7): the real recorded-grant store
+    // resolves it idempotently rather than refusing its own resumed operation.
+    // Consumed by any OTHER actionId still blocks, which is what keeps "a
+    // consumed grant never authorizes a second release" true.
     if (
       grant === null ||
-      this.consumedBy !== null ||
+      (this.consumedBy !== null && this.consumedBy !== request.actionId) ||
       grant.kind !== request.actionKind ||
       grant.sha !== request.expectedHeadSha ||
       grant.projectId !== request.projectId
@@ -360,7 +365,11 @@ class FakeAuthorization implements ActionAuthorizationPort {
     if (this.consumeAnswer !== null) {
       return this.consumeAnswer;
     }
-    if (this.consumedBy !== null || request.authorizationGrantId !== GRANT) {
+    // Same replay allowance as resolve, just above: a second consumption
+    // attempt under the SAME actionId (a resumed operation) replays as
+    // consumed instead of refusing, matching the real store's documented
+    // idempotent-consumption guarantee.
+    if ((this.consumedBy !== null && this.consumedBy !== request.actionId) || request.authorizationGrantId !== GRANT) {
       return { outcome: 'refused', reason: 'already consumed' };
     }
     this.consumedBy = request.actionId;
@@ -682,6 +691,87 @@ describe('ManageReleaseUseCase', () => {
     });
     expect(made.authorization.consumes).toEqual([]);
     expect(store.current).toBe(B);
+  });
+
+  it('a swap still repoints normally when the fresh plan is not yet at target', async () => {
+    // Guards the CO14b round 7 short-circuit: an ordinary (non-resumed) swap
+    // whose `current` genuinely differs from `target` must still call
+    // `store.repoint`, exactly once.
+    const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C);
+    const made = granted(SWAP, A, { store });
+    const repoint = store.repoint.bind(store);
+    let repointCalls = 0;
+    store.repoint = async (input) => {
+      repointCalls += 1;
+      return repoint(input);
+    };
+    const result = await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }));
+    expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: A, current: A });
+    expect(repointCalls).toBe(1);
+    expect(store.current).toBe(A);
+  });
+
+  it('a resumed swap that already repointed before the crash never repoints twice (CO14b round 7)', async () => {
+    // Luna's finding: a swap repoints `current` successfully, then the
+    // process crashes before `completeOperation` writes the `.done` marker.
+    // On resume, `stillTargets` legitimately re-validates the already-achieved
+    // state as a good plan (current === plannedCurrent, target is kept), so
+    // without a short-circuit `store.repoint` would run a second, redundant
+    // time against a target it already reached.
+    const store = new FakeStore([build('a', 1), build('b', 2)], B);
+    const made = granted(SWAP, A, { store });
+
+    // Instrument `repoint` to do its real work (the rename lands for real,
+    // exactly as a crash right after a successful OS-level rename would leave
+    // it) and then throw, so nothing downstream of the call — not even this
+    // same `fencedRepoint` invocation's own `if (repointed.outcome !== 'ok')`
+    // check — ever runs. This is what lets the operation's intent survive
+    // unclaimed under the same opId (via the normal `releaseOperation` path
+    // `apply()` already takes for any failure once `operation.consumed` is
+    // true), the same mechanism the existing "a grant spent for one
+    // operation..." test above relies on, just triggered one step later.
+    const repoint = store.repoint.bind(store);
+    let repointCalls = 0;
+    store.repoint = async (input) => {
+      repointCalls += 1;
+      const applied = await repoint(input);
+      if (repointCalls === 1) {
+        throw new Error('crash immediately after the repoint rename landed');
+      }
+      return applied;
+    };
+
+    const crashed = await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }));
+    expect(crashed).toEqual({ outcome: 'refused', reason: 'failed' });
+    // The rename landed for real before the crash; the intent survives,
+    // unclaimed, under the same opId — no `.done` marker, exactly a crashed
+    // run's residue, never a hand-rolled store mutation.
+    expect(store.current).toBe(A);
+    expect(store.operations.size).toBe(1);
+    expect(repointCalls).toBe(1);
+    const firstId = made.authorization.consumes[0].actionId;
+    expect(made.authorization.consumedBy).toBe(firstId);
+    const firstOpId = [...store.operations.values()][0]?.opId;
+
+    // Resume through the normal beginOperation/EEXIST-resumed path: the same
+    // request, dispatched again, finds the open-but-unclaimed intent and
+    // reuses its opId.
+    const resumed = await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }));
+    expect(resumed).toMatchObject({ outcome: 'applied', action: 'swap', target: A, current: A, kept: [A, B], pruned: [] });
+    // `store.repoint` is never called again: the resumed call's `fresh.current`
+    // already equals `target`, so the short-circuit skips it. One call total
+    // across both attempts.
+    expect(repointCalls).toBe(1);
+    // The grant's consumption replays idempotently under the same actionId
+    // (never a second, different one), and the operation is then properly
+    // completed: claim released, intent moved out of the open map (the
+    // fake's stand-in for the real store's `.done` marker).
+    expect(made.authorization.consumes[1].actionId).toBe(firstId);
+    expect(store.operations.size).toBe(0);
+    expect(store.completed).toEqual([firstOpId]);
+    // The orphan-temps pass is unconditional cleanup, not part of the plan:
+    // it still runs on the already-achieved resume, same as on the original.
+    expect(store.orphanPasses).toBe(2);
   });
 
   it('refuses driver-lease-live while the conductor driver lease is live', async () => {

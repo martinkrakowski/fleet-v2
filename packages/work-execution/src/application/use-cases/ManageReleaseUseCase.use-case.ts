@@ -383,10 +383,22 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       if (!stillTargets(request.action, fresh.builds, fresh.current, plannedCurrent, target)) {
         return { refusal: 'current-moved' };
       }
+      // A resumed operation (the same opId, read back through beginOperation's
+      // EEXIST path) re-plans from whatever `fresh` shows right now. When that
+      // already sits at `target`, this exact opId's own earlier attempt almost
+      // certainly repointed it before crashing short of `completeOperation`:
+      // the repoint below is skipped, never the consumption (already correctly
+      // idempotent by design) or the prune (a crash between a successful
+      // repoint and a successful prune means the prune never ran the first
+      // time either, and it is exactly as idempotent against a fresh listing
+      // as repoint is). `stillTargets` needs no change for this: it already
+      // answers true for an already-achieved state, which is a valid plan.
+      const alreadyAtTarget = fresh.current === target;
       const kept = fresh.builds.map((build) => build.sha);
       // Only this process holds the lease, so no repoint has a temp link in
       // flight: an orphan is a crashed run's. The pass is fenced under the
-      // same lease and is best effort.
+      // same lease and is best effort, and runs unconditionally: it is cleanup
+      // independent of this run's history, never part of the plan it executes.
       try {
         await this.deps.store.removeOrphanCurrentTemps({ root: request.root, fence: () => this.stillHolds(held) });
       } catch {
@@ -397,16 +409,19 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       if (consumed !== null) {
         return { refusal: consumed };
       }
-      const repointed = await this.deps.store.repoint({
-        root: request.root,
-        sha: target,
-        fence: () => this.stillHolds(held),
-      });
-      if (repointed.outcome !== 'ok') {
-        return { refusal: repointRefusal(repointed.outcome) };
+      if (!alreadyAtTarget) {
+        const repointed = await this.deps.store.repoint({
+          root: request.root,
+          sha: target,
+          fence: () => this.stillHolds(held),
+        });
+        if (repointed.outcome !== 'ok') {
+          return { refusal: repointRefusal(repointed.outcome) };
+        }
       }
-      // The repoint stands from here on: a prune that throws is an unfinished
-      // prune of an applied release, never a refusal a caller would retry.
+      // The repoint stands from here on (this attempt's own, or the crashed
+      // one this call resumed): a prune that throws is an unfinished prune of
+      // an applied release, never a refusal a caller would retry.
       try {
         return {
           kept,

@@ -53,10 +53,17 @@ import {
 } from '../../domain/shadow-day-health.js';
 import {
   recordShadowVerdicts,
+  SHADOW_RELEASE_SHA_PATTERN,
   type ShadowCriterionEvaluation,
   type ShadowCriterionVerdict,
   type ShadowLedger,
 } from '../../domain/shadow-evidence-ledger.js';
+import {
+  evaluateShadowOneTimeCriteria,
+  SHADOW_ONE_TIME_CRITERIA,
+  SHADOW_ONE_TIME_REQUIREMENTS,
+} from '../../domain/shadow-attestations.js';
+import { isPlainRecordObject } from '../../domain/record-schema-version.js';
 import { parseLegacyTrainParkedQueue, parseLegacyTrainQueue } from '../../domain/legacy-train-queue.js';
 import { evaluateShadowIntake, type ShadowIntakeEvaluation } from '../../domain/shadow-day-intake.js';
 import { parseShellTrainEvents, type ShellTrainEvent } from '../../domain/shell-train-events.js';
@@ -76,6 +83,8 @@ import type {
   LegacyTrainStateReadPort,
 } from '../ports/out/LegacyTrainStateReadPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
+import type { ReleaseStorePort } from '../ports/out/ReleaseStorePort.out-port.js';
+import type { ShadowAttestationPort } from '../ports/out/ShadowAttestationPort.out-port.js';
 import type { ShadowEvidencePort, ShadowLedgerCasResult } from '../ports/out/ShadowEvidencePort.out-port.js';
 import { isValidRepositoryRef } from './ImportTrainStateUseCase.use-case.js';
 
@@ -94,7 +103,7 @@ const DEFAULT_SAMPLE_GAP_MS = 150_000;
 
 /** Every criterion no evaluator implements yet; later units add the rest. */
 const NOT_IMPLEMENTED_CRITERIA: readonly CutoverShadowCriterion[] = [
-  'S2', 'S3', 'S10', 'S11', 'S13',
+  'S13',
 ];
 
 export interface RecordShadowDayDependencies {
@@ -140,6 +149,18 @@ export interface RecordShadowDayDependencies {
     readonly decision: ShadowShellCarryDecision;
     readonly deadlineIso: string;
   }) => Promise<'carry' | 'no-carry' | 'unknown'>;
+  /**
+   * The one-time shadow criteria's sources (S2, S3, S10, S11): the sticky
+   * attestation ledger store and the verified-build file inspector for the
+   * one release root the day's pinned sha is verified under. Optional until
+   * SH19c wires them into composition; when absent, all four report
+   * `not-wired`.
+   */
+  readonly oneTime?: {
+    readonly attestations: Pick<ShadowAttestationPort, 'read'>;
+    readonly releaseStore: Pick<ReleaseStorePort, 'inspectReleaseFiles'>;
+    readonly releaseRoot: string;
+  };
 }
 
 /** Thrown by `call` when the deadline is already reached; aborts the whole run. */
@@ -179,6 +200,14 @@ type CriterionOutcome =
       readonly chainsRetired?: ShadowChainsRetiredEvaluation;
       /** Present only for S5': the premerge-carry replay evaluation. */
       readonly premergeCarry?: ShadowPremergeCarryEvaluation;
+      /** Present only for S2: the one-time criterion evaluation. */
+      readonly s2?: ShadowCriterionEvaluation;
+      /** Present only for S3: the one-time criterion evaluation. */
+      readonly s3?: ShadowCriterionEvaluation;
+      /** Present only for S10: the one-time criterion evaluation. */
+      readonly s10?: ShadowCriterionEvaluation;
+      /** Present only for S11: the one-time criterion evaluation. */
+      readonly s11?: ShadowCriterionEvaluation;
     }
   | { readonly criterion: CutoverShadowCriterion; readonly kind: 'unevaluated'; readonly reason: string };
 
@@ -286,6 +315,77 @@ function unevaluatedOutcome(criterion: CutoverShadowCriterion, reason: string): 
   return { criterion, kind: 'unevaluated', reason };
 }
 
+/** The `CriterionOutcome` sibling field each one-time criterion's evaluation is recorded under. */
+const ONE_TIME_OUTCOME_FIELDS: Readonly<
+  Record<(typeof SHADOW_ONE_TIME_CRITERIA)[number], 's2' | 's3' | 's10' | 's11'>
+> = Object.freeze({ S2: 's2', S3: 's3', S10: 's10', S11: 's11' });
+
+/**
+ * One required-test report as `evaluateShadowOneTimeCriteria` consumes it:
+ * the positional `files[i]` fact zipped to the request's `paths[i]`.
+ */
+interface ReleaseTestReport {
+  readonly path: string;
+  readonly present: boolean;
+  readonly quarantined: boolean | null;
+}
+
+/**
+ * One own data property of an untrusted object: `Object.getOwnPropertyDescriptor`
+ * never runs a getter (only `.value` is taken) and, on a plain record, never
+ * throws for a missing key. A Proxy stand-in is refused by the caller's
+ * `isPlainRecordObject` guard or by the try/catch around the whole read.
+ */
+function ownDataProperty(value: object, key: string): unknown {
+  return Object.getOwnPropertyDescriptor(value, key)?.value;
+}
+
+/**
+ * Zip SH17's positional release-file facts onto the deduplicated required
+ * test paths. Every read goes through `Object.getOwnPropertyDescriptor` (the
+ * array's own `length` descriptor, so no Proxy `get` trap runs) and a
+ * `try/catch`, so a hostile container never throws out of `execute`. Any bad
+ * outer result (`null`, primitive, non-plain, getter-bearing), `threw`
+ * outcome, non-array `files`, length mismatch, non-plain item, or
+ * non-`boolean`/non-`null` flag yields `null` — unevaluated, never an empty
+ * list (an empty list would report every required test absent, a fail that
+ * an unreadable tree must never produce).
+ */
+function zipReleaseTests(paths: readonly string[], inspection: unknown): readonly ReleaseTestReport[] | null {
+  try {
+    if (!isPlainRecordObject(inspection)) {
+      return null;
+    }
+    if (ownDataProperty(inspection, 'outcome') !== 'read') {
+      return null;
+    }
+    const files = ownDataProperty(inspection, 'files');
+    if (!Array.isArray(files)) {
+      return null;
+    }
+    const length = Object.getOwnPropertyDescriptor(files, 'length')?.value;
+    if (typeof length !== 'number' || length !== paths.length) {
+      return null;
+    }
+    const reports: ReleaseTestReport[] = [];
+    for (let index = 0; index < paths.length; index += 1) {
+      const item = Object.getOwnPropertyDescriptor(files, String(index))?.value;
+      if (!isPlainRecordObject(item)) {
+        return null;
+      }
+      const present = ownDataProperty(item, 'present');
+      const quarantined = ownDataProperty(item, 'quarantined');
+      if (typeof present !== 'boolean' || !(quarantined === null || typeof quarantined === 'boolean')) {
+        return null;
+      }
+      reports.push({ path: paths[index] ?? '', present, quarantined });
+    }
+    return reports;
+  } catch {
+    return null;
+  }
+}
+
 function unknownResult(reason: 'ledger-unreadable' | 'ledger-unknown-version' | 'ledger-busy' | 'deadline-exceeded'): RecordShadowDayResult {
   return { outcome: 'unknown', reason };
 }
@@ -366,6 +466,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       await this.evaluateConformanceCriterion(context, shellFacts),
       await this.evaluateChainsRetiredCriterion(context, intake.chains),
       await this.evaluatePremergeCarryCriterion(context, shellFacts),
+      ...(await this.evaluateOneTimeCriteria(context, releaseSha)),
     ];
     const built = this.buildVerdicts(context, outcomes);
     return this.writeDay(context, ledger.ledger, releaseSha, built);
@@ -1054,6 +1155,88 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
   }
 
   /**
+   * S2, S3, S10 and S11: the one-time criteria, judged from the sticky
+   * attestation ledger plus the day's pinned release tree. Re-evaluated and
+   * recorded on EVERY day with no "already passed" shortcut, because
+   * `readCutoverShadowEvidence` requires all thirteen criteria to pass on
+   * each of the three consecutive days. The ledger read and the release
+   * inspection both go through `call`, so a reached deadline — before or
+   * after the awaited value — aborts the whole run.
+   *
+   * The outer port results are untrusted: a bad outer `attestations.read`
+   * result (`null`, primitive, non-plain, getter-bearing) becomes a
+   * non-null invalid value so the evaluator answers `attestations-unreadable`
+   * for all four (never a pass), and a bad outer `inspectReleaseFiles`
+   * result makes `releaseTests = null` (`release-tree-unreadable`, never an
+   * empty list). `inspectReleaseFiles` is skipped — never trusted — when
+   * the sha is absent or malformed, the release root is empty, or the
+   * optional method is absent.
+   */
+  private async evaluateOneTimeCriteria(context: DayContext, releaseSha: string | null): Promise<readonly CriterionOutcome[]> {
+    const oneTime = this.deps.oneTime;
+    if (oneTime === undefined) {
+      return SHADOW_ONE_TIME_CRITERIA.map((criterion) => unevaluatedOutcome(criterion, 'not-wired'));
+    }
+
+    const read = await this.call(context.deadlineIso, () =>
+      oneTime.attestations.read({ deadlineIso: context.deadlineIso }),
+    );
+    let attestationsInput: unknown = {};
+    if (read.kind === 'value') {
+      try {
+        if (isPlainRecordObject(read.value)) {
+          const status = ownDataProperty(read.value, 'status');
+          if (status === 'missing') {
+            attestationsInput = null;
+          } else if (status === 'ok') {
+            const ledger = ownDataProperty(read.value, 'ledger');
+            if (ledger !== undefined) {
+              attestationsInput = ledger;
+            }
+          }
+        }
+      } catch {
+        attestationsInput = {};
+      }
+    }
+
+    // The deduplicated union of every criterion's required test paths, in
+    // the criteria's own fixed order; SH17's `files` are positional, so
+    // `files[i]` answers `requiredTestPaths[i]`.
+    const requiredTestPaths = [
+      ...new Set(SHADOW_ONE_TIME_CRITERIA.flatMap((criterion) => [...SHADOW_ONE_TIME_REQUIREMENTS[criterion].tests])),
+    ];
+    let releaseTests: readonly ReleaseTestReport[] | null = null;
+    const inspectReleaseFiles = oneTime.releaseStore.inspectReleaseFiles;
+    if (
+      releaseSha !== null &&
+      SHADOW_RELEASE_SHA_PATTERN.test(releaseSha) &&
+      oneTime.releaseRoot.trim() !== '' &&
+      inspectReleaseFiles !== undefined
+    ) {
+      const inspection = await this.call(context.deadlineIso, () =>
+        inspectReleaseFiles({ root: oneTime.releaseRoot, sha: releaseSha, paths: requiredTestPaths }),
+      );
+      releaseTests = inspection.kind === 'value' ? zipReleaseTests(requiredTestPaths, inspection.value) : null;
+    }
+
+    const evaluations = evaluateShadowOneTimeCriteria({
+      day: context.day,
+      releaseSha,
+      attestations: attestationsInput,
+      releaseTests,
+    });
+    return SHADOW_ONE_TIME_CRITERIA.map((criterion): CriterionOutcome => {
+      const evaluation = evaluations[criterion];
+      if (evaluation.status === 'unknown') {
+        return unevaluatedOutcome(criterion, evaluation.reason);
+      }
+      const field = ONE_TIME_OUTCOME_FIELDS[criterion];
+      return { criterion, kind: 'evaluated', evaluation, [field]: evaluation } as CriterionOutcome;
+    });
+  }
+
+  /**
    * The canonical summary one verdict's digest is computed over: keys in the
    * fixed order `criterion`, `day`, `status`, `reason`, then the evaluator's
    * own numeric counts — for S1 also `excludeBatchMerges`, after the counts.
@@ -1063,14 +1246,15 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    *
    * `mergeSet` (S1 only), `intake` (S8 only), `tickHealth` (S12 only),
    * `stateIntegrity` (S9 only), `gateAgreement` (S4' only), `conformance`
-   * (S6' only), `chainsRetired` (S7 only) and `premergeCarry` (S5' only)
+   * (S6' only), `chainsRetired` (S7 only), `premergeCarry` (S5' only) and
+   * the four one-time fields `s2`/`s3`/`s10`/`s11` (S2/S3/S10/S11 only)
    * are mutually exclusive, so at
    * most one count field is ever set on any outcome. Each is set by exactly
    * one criterion builder (`evaluateMergeSetCriterion`,
    * `evaluateIntakeCriterion`, `evaluateTickHealthCriterion`,
    * `evaluateStateIntegrityCriterion`, `evaluateGateAgreementCriterion`,
-   * `evaluateConformanceCriterion`, `evaluateChainsRetiredCriterion` and
-   * `evaluatePremergeCarryCriterion`
+   * `evaluateConformanceCriterion`, `evaluateChainsRetiredCriterion`,
+   * `evaluatePremergeCarryCriterion` and `evaluateOneTimeCriteria`
    * respectively) and never more than one on the same outcome, so checking
    * them in this order can never silently shadow another: an outcome with a
    * later field set always has the earlier fields `undefined`, by
@@ -1215,6 +1399,29 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
      */
     if (outcome.premergeCarry !== undefined) {
       return JSON.stringify({ ...base, compared: outcome.premergeCarry.compared });
+    }
+    /**
+     * S2, S3, S10 and S11 hash only `{ criterion, day, status, reason }`
+     * (like S8): their evaluation is closed-day deterministic — the sticky
+     * ledger's facts are compared against the recorded day itself and the
+     * test facts belong to the day's own pinned release — but the digests
+     * stay base-only so a re-recording of an attestation or a release
+     * inspection between two runs never changes a recorded day's digest.
+     * The sibling fields stay on the outcome as non-digested diagnostics.
+     * This is a new digest format (allowed because no live shadow day has
+     * been recorded yet).
+     */
+    if (outcome.s2 !== undefined) {
+      return JSON.stringify(base);
+    }
+    if (outcome.s3 !== undefined) {
+      return JSON.stringify(base);
+    }
+    if (outcome.s10 !== undefined) {
+      return JSON.stringify(base);
+    }
+    if (outcome.s11 !== undefined) {
+      return JSON.stringify(base);
     }
     return JSON.stringify(base);
   }

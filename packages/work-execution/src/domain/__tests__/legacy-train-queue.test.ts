@@ -247,10 +247,18 @@ describe('parseLegacyTrainParkedQueue', () => {
     expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
   });
 
-  it('reports a secret-shaped reason as an unknown line without echoing it', () => {
+  it('refuses a document with a secret-shaped reason wholesale without echoing it', () => {
     const secret = fakeSecretShape();
     const result = parseLegacyTrainParkedQueue(parkedLine({ reason: secret }));
-    expect(result).toEqual({ ok: true, lines: [unknownParkedLine(1)] });
+    expect(result).toEqual({ ok: false, reason: 'secret-shaped' });
+    expect(Object.keys(result)).toEqual(['ok', 'reason']);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it('refuses a mixed document containing a secret-shaped neighbour instead of returning parsed entries', () => {
+    const secret = fakeSecretShape();
+    const result = parseLegacyTrainParkedQueue([parkedLine(), parkedLine({ reason: secret })].join('\n'));
+    expect(result).toEqual({ ok: false, reason: 'secret-shaped' });
     expect(JSON.stringify(result)).not.toContain(secret);
   });
 

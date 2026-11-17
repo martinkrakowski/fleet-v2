@@ -46,7 +46,7 @@ export type LegacyTrainParkedLine =
   | { readonly ok: false; readonly line: number; readonly reason: 'unknown-line' };
 
 export type LegacyTrainParkedParse =
-  | { readonly ok: false; readonly reason: 'not-text' | 'too-large' }
+  | { readonly ok: false; readonly reason: 'not-text' | 'too-large' | 'secret-shaped' }
   | { readonly ok: true; readonly lines: readonly LegacyTrainParkedLine[] };
 
 const PULL_REQUEST_PATTERN = /^[1-9][0-9]*$/;
@@ -113,10 +113,11 @@ function parseLine(line: number, piece: string): LegacyTrainQueueLine {
  * capped at `PARKED_DOCUMENT_CAP` characters and `REASON_MAX_LENGTH` per
  * reason field, refused before any traversal beyond the cap.
  *
- * Secret-shape detection is applied per field (head, reason, base) rather
- * than to the whole document: every field of every line is checked, so a
- * secret anywhere yields that line as unknown, never a stored or echoed
- * value.
+ * Secret-shape detection refuses the whole document (CO4), exactly as the
+ * queue parser does: a secret-shaped value anywhere — in particular in the
+ * free-text `reason` field — yields `ok: false, reason: 'secret-shaped'`
+ * and never a mixed document the caller could proceed with. No secret-
+ * shaped value is ever echoed or stored.
  */
 export function parseLegacyTrainParkedQueue(input: unknown): LegacyTrainParkedParse {
   if (typeof input !== 'string') {
@@ -125,6 +126,10 @@ export function parseLegacyTrainParkedQueue(input: unknown): LegacyTrainParkedPa
 
   if (input.length > PARKED_DOCUMENT_CAP) {
     return { ok: false, reason: 'too-large' };
+  }
+
+  if (containsSecretShape(input)) {
+    return { ok: false, reason: 'secret-shaped' };
   }
 
   const lines = splitDocumentLines(input).map((piece, index) => parseParkedLine(index + 1, piece));
@@ -144,17 +149,13 @@ function parseParkedLine(line: number, piece: string): LegacyTrainParkedLine {
     return { ok: false, line, reason: 'unknown-line' };
   }
 
-  if (reason.length > REASON_MAX_LENGTH || !REASON_PATTERN.test(reason) || containsSecretShape(reason)) {
+  if (reason.length > REASON_MAX_LENGTH || !REASON_PATTERN.test(reason)) {
     return { ok: false, line, reason: 'unknown-line' };
   }
 
   const attempt = parseNonNegativeSafeInteger(attemptField);
   const notBefore = parseNonNegativeSafeInteger(notBeforeField);
   if (attempt === undefined || notBefore === undefined) {
-    return { ok: false, line, reason: 'unknown-line' };
-  }
-
-  if (containsSecretShape(headOid) || containsSecretShape(baseField)) {
     return { ok: false, line, reason: 'unknown-line' };
   }
 

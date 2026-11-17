@@ -7,7 +7,7 @@ import { mkdtempSync, promises as fs, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { createFleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
@@ -66,32 +66,47 @@ describe('cutover shadow record-day (SH8a)', () => {
     // A clean fixture: the shell queue exists and holds nothing (synthetic).
     await fs.writeFile(path.join(fixtureDir, 'queue'), '');
     const runtime = runtimeFor(stateDir);
-    // Pinned once and passed explicitly to both invocations: without this, a
-    // real UTC-midnight crossing between the two calls would make the second
-    // one resolve to a different default day than the first (each computes
-    // "yesterday" from the real wall clock independently), so it would record
-    // a new entry instead of reporting unchanged. See the too-early test
-    // below for the same real-Date.now() style used in this file.
-    const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    // Pin the system clock to a fixed instant comfortably clear of any UTC
+    // midnight boundary (local use-case composition resolves `nowIso` through
+    // `daemon.now`, which defaults to `() => new Date().toISOString()`, so
+    // faking `Date` here reaches the use case's own too-early check too).
+    // Without this, computing "yesterday" from the REAL wall clock makes the
+    // test flaky in the first `EARLY_GRACE_MS` (15 minutes) after a real UTC
+    // midnight: "yesterday" is still the right day value, but the use case
+    // refuses it as too-early, so the expected `recorded` outcome fails.
+    // Pinning the clock removes that real-wall-clock dependency entirely,
+    // rather than further narrowing the already-narrow window.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      // Computed once from the pinned clock and passed explicitly to both
+      // invocations: without this, a midnight crossing between the two calls
+      // would make the second one resolve to a different default day than
+      // the first (each computes "yesterday" independently), so it would
+      // record a new entry instead of reporting unchanged.
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-    const first = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
-    expect(first.code).toBe(0);
-    const firstBody = JSON.parse(first.out) as {
-      outcome: string;
-      day: string;
-      revision: number;
-      recorded: Record<string, string>;
-      unevaluated: ReadonlyArray<{ criterion: string; reason: string }>;
-    };
-    expect(firstBody.outcome).toBe('recorded');
-    expect(firstBody.revision).toBe(1);
-    await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).resolves.toBeUndefined();
+      const first = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
+      expect(first.code).toBe(0);
+      const firstBody = JSON.parse(first.out) as {
+        outcome: string;
+        day: string;
+        revision: number;
+        recorded: Record<string, string>;
+        unevaluated: ReadonlyArray<{ criterion: string; reason: string }>;
+      };
+      expect(firstBody.outcome).toBe('recorded');
+      expect(firstBody.revision).toBe(1);
+      await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).resolves.toBeUndefined();
 
-    const second = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
-    expect(second.code).toBe(0);
-    const secondBody = JSON.parse(second.out) as { outcome: string; revision: number };
-    expect(secondBody.outcome).toBe('unchanged');
-    expect(secondBody.revision).toBe(1);
+      const second = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
+      expect(second.code).toBe(0);
+      const secondBody = JSON.parse(second.out) as { outcome: string; revision: number };
+      expect(secondBody.outcome).toBe('unchanged');
+      expect(secondBody.revision).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('refuses with state-dir-required when no durable state directory is configured', async () => {

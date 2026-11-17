@@ -920,7 +920,7 @@ describe('RecordShadowDayUseCase', () => {
     fixture.importKeys.push({ pullRequest: 8, headOid: HEAD_B, base: 'main', source: 'queue', disposition: 'would-import' });
 
     const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
-    expect(result.outcome).toBe('unchanged');
+    expectRecorded(result);
     expect(result.recorded.S8).toBe('pass');
     const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
     expect(dayRecord?.verdicts.S8).toEqual({

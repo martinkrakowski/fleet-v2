@@ -135,7 +135,22 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     if (binding.outcome === 'unreadable' || (binding.outcome === 'bound' && binding.stateDir !== stateDir)) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
     }
-    const result = await manageReleaseFromPayload(
+    // CO14b fix round 3: an unbound root is bound to this driver BEFORE the
+    // release is applied, not after. bindDriver's exclusive-create (`wx`) is
+    // the mutual-exclusion point: only one racing driver can ever win it for
+    // a given unbound root. Gating the apply itself on winning that bind
+    // means no two drivers can concurrently apply to the same previously-
+    // unbound root — a bind that happens only after applying would let both
+    // racers apply before either result is recorded.
+    if (binding.outcome === 'unbound') {
+      const bound = await store.bindDriver({ root, stateDir });
+      if (bound.outcome !== 'bound' || bound.stateDir !== stateDir) {
+        // Another process's bind won the race first (or the bind itself is
+        // unreadable): this driver never served the root, so it never applies.
+        return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+      }
+    }
+    return await manageReleaseFromPayload(
       { ...payload, action },
       {
         lease: new ConductorDriverLeaseAdapter({ stateDir }),
@@ -146,10 +161,6 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
         store,
       },
     );
-    if (result.outcome === 'applied' && binding.outcome === 'unbound') {
-      await store.bindDriver({ root, stateDir });
-    }
-    return result;
   };
 }
 
@@ -174,7 +185,18 @@ export function resolveRootStateDir(
     return null;
   }
   try {
-    const daemon = configuration?.daemon;
+    // CO14b fix round 3: `configuration` itself may be hostile (an accessor or
+    // a Proxy `get` trap on the `daemon` key), so it is descriptor-checked the
+    // same way `stateDir` already is below; a getter or setter on `daemon` is
+    // never invoked.
+    const configurationDescriptor =
+      typeof configuration === 'object' && configuration !== null
+        ? Object.getOwnPropertyDescriptor(configuration, 'daemon')
+        : undefined;
+    const daemon =
+      configurationDescriptor !== undefined && !configurationDescriptor.get && !configurationDescriptor.set
+        ? configurationDescriptor.value
+        : undefined;
     if (typeof daemon !== 'object' || daemon === null) {
       return null;
     }

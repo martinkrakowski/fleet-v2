@@ -6,18 +6,20 @@
  * store adapter reads an empty store and nothing touches the filesystem.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type {
-  ActionAuthorizationPort,
-  CommandExecutorPort,
-  CommandRunOptions,
-  CommandRunResult,
-  ConductorDriverLeaseRecord,
-  ConductorDriverLeasePort,
+import {
+  ConductorDriverLeaseAdapter,
+  ReleaseStoreAdapter,
+  type ActionAuthorizationPort,
+  type CommandExecutorPort,
+  type CommandRunOptions,
+  type CommandRunResult,
+  type ConductorDriverLeaseRecord,
+  type ConductorDriverLeasePort,
 } from '@fleet/work-execution';
 
 import { CliUsageError } from '../commands/payload.js';
@@ -71,6 +73,65 @@ function deps(lease: ConductorDriverLeaseRecord | null = null): {
 const installPayload = { action: 'install', root: ROOT, sha: SHA, source: SOURCE };
 
 describe('release command', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it(
+    'CO14b fix round 3: a concurrent-apply race refuses the loser before it ever reaches ' +
+      'manageReleaseFromPayload, and the winner still proceeds',
+    async () => {
+      const root = '/race-fleet-release-root-co14b';
+      const stateDirA = await mkdtemp(join(tmpdir(), 'co14b-race-state-a-'));
+      const stateDirB = await mkdtemp(join(tmpdir(), 'co14b-race-state-b-'));
+      // Two drivers, configured with DIFFERENT state directories, racing the same unbound root.
+      const rtA = createFleetCliRuntime({
+        stateDir: stateDirA,
+        installation: { daemon: { stateDir: stateDirA } } as never,
+      });
+      const rtB = createFleetCliRuntime({
+        stateDir: stateDirB,
+        installation: { daemon: { stateDir: stateDirB } } as never,
+      });
+
+      // Both racers read the root as unbound, exactly as they would before either has written
+      // the binding file.
+      const readSpy = vi
+        .spyOn(ReleaseStoreAdapter.prototype, 'readDriverBinding')
+        .mockResolvedValue({ outcome: 'unbound' });
+      // A's bindDriver call wins the exclusive-create. B's own bindDriver call then loses the
+      // race and, as the real adapter's EEXIST-reread does, reports A's stateDir — not B's own.
+      const bindSpy = vi
+        .spyOn(ReleaseStoreAdapter.prototype, 'bindDriver')
+        .mockResolvedValueOnce({ outcome: 'bound', stateDir: stateDirA })
+        .mockResolvedValueOnce({ outcome: 'bound', stateDir: stateDirA });
+      // `leaseIsLive()` calls `lease.read()` unconditionally, for a plan or an apply alike, as
+      // the very first thing `ManageReleaseUseCase.run` does once a request parses (see the
+      // 'planned' result's `lease: 'free'` field in the plan test above). Its call count is
+      // therefore a direct, source-independent witness of whether `manageReleaseFromPayload`
+      // ever ran for a given call.
+      const leaseReadSpy = vi.spyOn(ConductorDriverLeaseAdapter.prototype, 'read');
+
+      const payload = { root, sha: SHA, source: SOURCE };
+      const install = releaseCommands['install'];
+      if (install === undefined) throw new Error('install command not registered');
+
+      const winnerResult = await install(payload, rtA);
+      expect(winnerResult).not.toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+      expect(leaseReadSpy).toHaveBeenCalledTimes(1);
+
+      const loserResult = await install(payload, rtB);
+      expect(loserResult).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+      // The loser's own bindDriver call lost the race (it saw A's stateDir, not its own), so the
+      // apply logic — witnessed by the lease check — is never reached for it: the call count is
+      // unchanged from right after the winner's call.
+      expect(leaseReadSpy).toHaveBeenCalledTimes(1);
+
+      expect(readSpy).toHaveBeenCalledTimes(2);
+      expect(bindSpy).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it('install without apply returns the plan and runs no command', async () => {
     const d = deps();
     const result = await manageReleaseFromPayload(installPayload, d);
@@ -115,6 +176,12 @@ describe('release command', () => {
 
   it('the registered release group refuses apply on a runtime with no recorded grant', async () => {
     const stateDir = await mkdtemp(join(tmpdir(), 'co14-cli-release-'));
+    // CO14b fix round 3: the release handler now binds an unbound root to this
+    // driver BEFORE calling into the authorization check, so the root must be
+    // a real, writable directory for that bind to succeed (and the test to
+    // reach the authorization refusal it means to exercise) rather than the
+    // nonexistent ROOT sentinel under `/`, which a bind could never write to.
+    const root = await mkdtemp(join(tmpdir(), 'co14-cli-release-root-'));
     const rt = createFleetCliRuntime({
       stateDir,
       installation: {
@@ -133,7 +200,7 @@ describe('release command', () => {
     const out: string[] = [];
     const err: string[] = [];
     const code = await runCli(
-      ['release', 'install', '--root', ROOT, '--sha', SHA, '--source', SOURCE, '--project', PROJECT, '--apply'],
+      ['release', 'install', '--root', root, '--sha', SHA, '--source', SOURCE, '--project', PROJECT, '--apply'],
       { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
       rt,
     );

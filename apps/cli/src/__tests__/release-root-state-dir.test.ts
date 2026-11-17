@@ -155,4 +155,26 @@ describe('release root state directory binding (CO14 follow-up)', () => {
     };
     expect(resolveRootStateDir('/srv/releases', getterConfiguration)).toBeNull();
   });
+
+  it(
+    'CO14b fix round 3: a hostile `daemon` getter on the configuration itself is never invoked, ' +
+      'not merely one that throws',
+    () => {
+      // Unlike the throwing getter above (which a bare try/catch happens to mask whether or not
+      // it is actually read), this getter succeeds and returns a value as `stateDir` so that a
+      // plain `configuration?.daemon` property access — which invokes any getter it finds —
+      // would NOT be caught by the surrounding try/catch and would resolve a state directory.
+      // Only a descriptor check on `configuration`'s own `daemon` key, like the existing
+      // descriptor check on `stateDir`, can keep this getter from running at all.
+      let daemonGetterCalls = 0;
+      const configuration = {
+        get daemon(): { stateDir: string } {
+          daemonGetterCalls += 1;
+          return { stateDir: '/srv/state-from-hostile-getter' };
+        },
+      };
+      expect(resolveRootStateDir('/srv/releases', configuration)).toBeNull();
+      expect(daemonGetterCalls).toBe(0);
+    },
+  );
 });

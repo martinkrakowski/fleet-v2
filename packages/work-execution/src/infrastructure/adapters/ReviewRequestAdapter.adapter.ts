@@ -901,12 +901,42 @@ function readReceiptFindings(receipt: ReviewReceiptRecord, kind: ReviewReceiptSu
   return readBoundedList(receipt.findings, Number.MAX_SAFE_INTEGER);
 }
 
+/** The summary fields of one finding. The set is fixed: five keys, no caller-supplied names. */
+const FINDING_SUMMARY_FIELDS = ['findingId', 'severity', 'summary', 'filePath', 'line'] as const;
+
+type FindingSummaryFields = {
+  readonly [Key in (typeof FINDING_SUMMARY_FIELDS)[number]]: unknown;
+};
+
+function isDeclaredSeverity(severity: unknown): severity is 'blocker' | 'major' | 'minor' | 'nit' {
+  return severity === 'blocker' || severity === 'major' || severity === 'minor' || severity === 'nit';
+}
+
 /**
- * True when every index below `length` is a plain object with one of the four
- * declared severities. `length` is the local this operation already read: the
- * loop does not read `.length`. A hole or a corrupt severity is invalid
- * transport output, never a summary (RV3: a corrupt severity never maps to a
- * verdict). Never throws.
+ * The five summary fields, each from its own data descriptor. An accessor is
+ * null and the getter never runs. An absent field is `undefined` (nothing is
+ * read off the prototype). Cost: the fixed key list above, once. Never throws.
+ */
+function readFindingSummaryFields(finding: unknown): FindingSummaryFields | null {
+  const read: Partial<FindingSummaryFields> = {};
+  for (const key of FINDING_SUMMARY_FIELDS) {
+    const property = ownProperty(finding, key);
+    if (property === 'unreadable') {
+      return null;
+    }
+    read[key] = property === undefined ? undefined : property.value;
+  }
+  return read as FindingSummaryFields;
+}
+
+/**
+ * True when every index below `length` is a plain object whose summary fields
+ * are own data properties and whose severity is one of the four declared
+ * values. Each field is read by its own data descriptor during this pass: an
+ * accessor is not dense and the getter never runs. `length` is the local this
+ * operation already read: the loop does not read `.length`. A hole, an
+ * accessor or a corrupt severity is invalid transport output, never a summary
+ * (RV3: a corrupt severity never maps to a verdict). Never throws.
  */
 function findingsAreDense(list: readonly unknown[], length: number): boolean {
   try {
@@ -915,13 +945,8 @@ function findingsAreDense(list: readonly unknown[], length: number): boolean {
       if (!isPlainObject(finding)) {
         return false;
       }
-      const severity = (finding as { severity?: unknown }).severity;
-      if (
-        severity !== 'blocker' &&
-        severity !== 'major' &&
-        severity !== 'minor' &&
-        severity !== 'nit'
-      ) {
+      const fields = readFindingSummaryFields(finding);
+      if (fields === null || !isDeclaredSeverity(fields.severity)) {
         return false;
       }
     }
@@ -932,9 +957,10 @@ function findingsAreDense(list: readonly unknown[], length: number): boolean {
 }
 
 /**
- * The summary's finding list, copied from own data elements up to `length`.
- * Null when the findings are not dense. Does not read `.length` and does not
- * call `map` (both would re-enter a Proxy).
+ * The summary's finding list, copied from the data descriptors already
+ * accepted by the density pass, up to `length`. Null when the findings are
+ * not dense or a field is an accessor (the getter never runs). Does not read
+ * `.length` and does not call `map` (both would re-enter a Proxy).
  */
 function copyBoundedFindings(list: readonly unknown[], length: number): ReviewReceiptSummary['findings'] | null {
   if (!findingsAreDense(list, length)) {
@@ -942,13 +968,16 @@ function copyBoundedFindings(list: readonly unknown[], length: number): ReviewRe
   }
   const copied: Array<ReviewReceiptSummary['findings'][number]> = [];
   for (let index = 0; index < length; index += 1) {
-    const finding = ownElement(list, index) as ReviewReceiptSummary['findings'][number];
+    const fields = readFindingSummaryFields(ownElement(list, index));
+    if (fields === null || !isDeclaredSeverity(fields.severity)) {
+      return null;
+    }
     copied.push({
-      findingId: finding.findingId,
-      severity: finding.severity,
-      summary: finding.summary,
-      filePath: finding.filePath,
-      line: finding.line,
+      findingId: fields.findingId as string,
+      severity: fields.severity,
+      summary: fields.summary as string,
+      filePath: fields.filePath as string | null,
+      line: fields.line as number | null,
     });
   }
   return copied;

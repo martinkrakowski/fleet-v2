@@ -3,7 +3,7 @@
 // oversized or unreadable answer is unavailable, never `missing`, and the
 // result carries the asked head and a closed code only.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { GhInvocationResult } from './ForgeActionAdapter.adapter.js';
 import {
@@ -648,19 +648,42 @@ describe('readCommitContext', () => {
   });
 
   it('returns context-timed-out when the deadline expires between pages', async () => {
-    let calls = 0;
-    const adapter = makeAdapter({
-      runGh: async (args) => {
-        calls += 1;
-        if (args.some((arg) => arg.startsWith('after='))) {
-          return new Promise<GhInvocationResult>(() => undefined);
-        }
-        return ok(page({ nodes: [check('gate', 'COMPLETED', 'SUCCESS')], hasNextPage: true, endCursor: CURSOR }));
-      },
-    });
-    const result = await read(adapter, { headSha: HEAD, contextName: 'gate', timeoutMs: 50 });
-    expect(result).toEqual(unavailable('context-timed-out'));
-    expect(calls).toBe(2);
-    expect(JSON.stringify(result)).not.toContain(CURSOR);
+    // Page 1 takes 40 ms and page 2 takes 20 ms against one 50 ms deadline.
+    // The deadline expires during page 2, whose own cost is under the budget.
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const adapter = makeAdapter({
+        runGh: (args) =>
+          new Promise<GhInvocationResult>((resolve) => {
+            calls += 1;
+            const laterPage = args.some((arg) => arg.startsWith('after='));
+            setTimeout(() => {
+              resolve(
+                laterPage
+                  ? ok(page({ nodes: [check('gate', 'COMPLETED', 'SUCCESS')] }))
+                  : ok(
+                      page({
+                        nodes: [check('gate', 'COMPLETED', 'SUCCESS')],
+                        hasNextPage: true,
+                        endCursor: CURSOR,
+                      }),
+                    ),
+              );
+            }, laterPage ? 20 : 40);
+          }),
+      });
+      const pending = read(adapter, { headSha: HEAD, contextName: 'gate', timeoutMs: 50 });
+      await vi.advanceTimersByTimeAsync(40);
+      expect(calls).toBe(2);
+      await vi.advanceTimersByTimeAsync(20);
+      const result = await pending;
+      expect(result).toEqual(unavailable('context-timed-out'));
+      expect(calls).toBe(2);
+      expect(JSON.stringify(result)).not.toContain(CURSOR);
+    } finally {
+      await vi.advanceTimersByTimeAsync(1_000);
+      vi.useRealTimers();
+    }
   });
 });

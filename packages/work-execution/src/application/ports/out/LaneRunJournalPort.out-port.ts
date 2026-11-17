@@ -28,4 +28,11 @@ export interface LaneRunJournalPort {
   listForRuns?(runIds: readonly string[]): Promise<ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>>;
   /** The intent and results of one key, in append order (request and reaper keys have no run); [] when none. */
   listForKey(key: string): Promise<readonly LaneRunJournalEntryRecord[]>;
+  /**
+   * Optional prefix read: every entry whose `key` starts with `prefix`, in
+   * append order, from a single underlying read of the store. An invalid
+   * prefix (per the adapter's validation) returns [] rather than throwing or
+   * refusing.
+   */
+  listForKeyPrefix?(prefix: string): Promise<readonly LaneRunJournalEntryRecord[]>;
 }

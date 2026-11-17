@@ -62,13 +62,14 @@ function cleanDay(count: number, startCounter = 1): Record<string, unknown>[] {
   return events;
 }
 
-function starveEvent(minuteOnPrevDayOrDay: { iso: string; counter: number; outcome?: string }): Record<string, unknown> {
+function starveEvent(spec: { iso: string; counter: number; outcome?: string; reasonCode?: string }): Record<string, unknown> {
   return jobEvent({
-    eventId: eventId(100_000 + minuteOnPrevDayOrDay.counter),
-    tickId: tickId(100_000 + minuteOnPrevDayOrDay.counter),
+    eventId: eventId(100_000 + spec.counter),
+    tickId: tickId(100_000 + spec.counter),
     jobId: `chain-refresh:${DIGEST}`,
-    outcome: minuteOnPrevDayOrDay.outcome ?? 'budget-exhausted',
-    recordedAtIso: minuteOnPrevDayOrDay.iso,
+    outcome: spec.outcome ?? 'budget-exhausted',
+    reasonCode: spec.outcome === 'skipped' ? spec.reasonCode ?? 'lease-skip' : spec.reasonCode ?? null,
+    recordedAtIso: spec.iso,
   });
 }
 
@@ -143,6 +144,26 @@ describe('evaluateShadowTickHealth (S12)', () => {
     expect(s12(dayInput(events))).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
   });
 
+  it('fails job-starved when a skip preserves the run: 9 exhausted, a skip, then 1 exhausted', () => {
+    const events = cleanDay(720, 400);
+    for (let i = 0; i < 9; i += 1) {
+      events.push(starveEvent({ iso: PREV_23(40 + i), counter: i }));
+    }
+    events.push(starveEvent({ iso: PREV_23(49), counter: 100, outcome: 'skipped', reasonCode: 'lease-skip' }));
+    events.push(starveEvent({ iso: DAY_AT(0), counter: 101 }));
+    expect(s12(dayInput(events))).toEqual({ status: 'fail', reason: 'job-starved' });
+  });
+
+  it('passes when 8 exhausted, a skip, then 1 exhausted keep the run under the threshold', () => {
+    const events = cleanDay(720, 400);
+    for (let i = 0; i < 8; i += 1) {
+      events.push(starveEvent({ iso: PREV_23(40 + i), counter: i }));
+    }
+    events.push(starveEvent({ iso: PREV_23(49), counter: 100, outcome: 'skipped', reasonCode: 'lease-skip' }));
+    events.push(starveEvent({ iso: DAY_AT(0), counter: 101 }));
+    expect(s12(dayInput(events))).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
+  });
+
   it('reports unknown/daemon-events-invalid with one malformed event in an otherwise clean day', () => {
     const events = [...cleanDay(720), { nope: true }];
     expect(s12(dayInput(events))).toEqual({ status: 'unknown', reason: 'daemon-events-invalid' });
@@ -203,6 +224,27 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k1', 'result', 'completed', PREV_23(52)),
       ],
     }))).toEqual({ status: 'fail', reason: 'journal-duplicate-intent' });
+  });
+
+  it('reports unknown for a misspelled journal kind instead of silently ignoring it', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [journalEntry('k1', 'invent', 'completed', PREV_23(50))],
+    }))).toEqual({ status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('reports unknown for an unrecognized journal outcome instead of silently ignoring it', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [journalEntry('k1', 'intent', 'finshed', PREV_23(50))],
+    }))).toEqual({ status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('fails journal-orphan-result when a result appears before its matching intent', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k1', 'result', 'completed', PREV_23(51)),
+        journalEntry('k1', 'intent', 'completed', PREV_23(52)),
+      ],
+    }))).toEqual({ status: 'fail', reason: 'journal-orphan-result' });
   });
 
   it('fails journal-orphan-result for a key with a result but no intent', () => {

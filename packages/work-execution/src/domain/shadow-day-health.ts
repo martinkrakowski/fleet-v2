@@ -9,6 +9,8 @@ import { isZonedIsoDateTime } from './conductor-halt.js';
 import { readDaemonEventRecord } from './daemon-events.js';
 import type { DaemonEventRecord } from './daemon-events.js';
 import { DAEMON_STARVED_CONSECUTIVE_TICKS } from './daemon-tick.js';
+import { LANE_RUN_JOURNAL_OUTCOMES } from './lane-run-journal.js';
+import type { LaneRunJournalOutcome } from './lane-run-journal.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
 import { readExactPlainRecord } from './plain-record-reads.js';
 
@@ -89,12 +91,17 @@ function fallsInDay(record: DaemonEventRecord, day: string): boolean {
  * True when the per-job, time-ordered outcome sequence carries a run of at
  * least `DAEMON_STARVED_CONSECUTIVE_TICKS` consecutive `budget-exhausted`
  * outcomes with at least one member inside day `day` — so a streak spanning
- * midnight is still caught.
+ * midnight is still caught. A `skipped` outcome is transparent, matching the
+ * daemon-tick starvation counter: a skip neither breaks nor extends the
+ * exhausted run, so the count survives a skip.
  */
 function hasStarvedRun(sequence: readonly JobSequence[]): boolean {
   let run = 0;
   let runTouchesDay = false;
   for (const item of sequence) {
+    if (item.outcome === 'skipped') {
+      continue;
+    }
     if (item.outcome !== 'budget-exhausted') {
       run = 0;
       runTouchesDay = false;
@@ -225,6 +232,16 @@ function readSampledEntry(raw: unknown): SampledJournalEntry | null {
     return null;
   }
   const { key, kind, outcome, recordedAtIso } = snapshot;
+  // A kind or outcome the journal contract does not name is refused, never
+  // silently ignored: an unrecognized entry must turn the day `unknown`
+  // rather than disappear from the tally. S9 samples only intent and result
+  // entries; a conduct entry carries no key, so it cannot be judged here.
+  if (kind !== 'intent' && kind !== 'result') {
+    return null;
+  }
+  if (!LANE_RUN_JOURNAL_OUTCOMES.includes(outcome as LaneRunJournalOutcome)) {
+    return null;
+  }
   if (typeof key !== 'string' || key.length === 0 || typeof kind !== 'string' || kind.length === 0) {
     return null;
   }
@@ -243,6 +260,8 @@ interface KeyTally {
   intentIso: string | null;
   nonAmbiguousResults: number;
   hasResult: boolean;
+  /** A result appeared before any intent for the key — the journal contract rejects it. */
+  resultBeforeIntent: boolean;
 }
 
 /** The per-key tallies, in first-appearance order. */
@@ -251,7 +270,7 @@ function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyT
   for (const entry of entries) {
     let tally = tallies.get(entry.key);
     if (tally === undefined) {
-      tally = { intents: 0, intentIso: null, nonAmbiguousResults: 0, hasResult: false };
+      tally = { intents: 0, intentIso: null, nonAmbiguousResults: 0, hasResult: false, resultBeforeIntent: false };
       tallies.set(entry.key, tally);
     }
     if (entry.kind === 'intent') {
@@ -262,6 +281,9 @@ function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyT
     }
     if (entry.kind === 'result') {
       tally.hasResult = true;
+      if (tally.intents === 0) {
+        tally.resultBeforeIntent = true;
+      }
       if (entry.outcome !== 'ambiguous') {
         tally.nonAmbiguousResults += 1;
       }
@@ -341,6 +363,9 @@ function judgeJournalIntegrity(entries: readonly SampledJournalEntry[], sampledA
       return FAIL('journal-duplicate-result');
     }
     if (tally.hasResult && tally.intents === 0) {
+      return FAIL('journal-orphan-result');
+    }
+    if (tally.resultBeforeIntent) {
       return FAIL('journal-orphan-result');
     }
   }

@@ -333,4 +333,26 @@ describe('shadow day intake (S8)', () => {
     const input = { samples: [extra, sample({ takenAtIso: T10 })] };
     expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
   });
+
+  it('a returned fail verdict is frozen: an attempt to flip it to pass throws and does not corrupt a later unrelated fail call', () => {
+    const divergentA = twoSamples({ shellLive: [key(1)], fleetLive: [] }, { shellLive: [key(1)], fleetLive: [] });
+    const first = evaluateShadowIntake(divergentA);
+    expect(first).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(() => {
+      (first as { status: string }).status = 'pass';
+    }).toThrow();
+
+    // This is the test that actually proves the bug is fixed, not just that
+    // freezing happened: a second, unrelated call with different inputs
+    // that lands on the SAME verdict shape must report its own true result,
+    // not a shape corrupted by the mutation attempted on the first call's
+    // result above. Before the fix, `enqueue-coverage-divergence` was one
+    // shared, unfrozen object reused across every call, so the attempted
+    // mutation above would have silently rewritten it and this call would
+    // wrongly report 'pass'.
+    const divergentB = twoSamples({ shellLive: [key(2)], fleetLive: [] }, { shellLive: [key(2)], fleetLive: [] });
+    const second = evaluateShadowIntake(divergentB);
+    expect(second).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+  });
 });

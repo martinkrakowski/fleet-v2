@@ -33,14 +33,22 @@ export const SHADOW_INTAKE_MAX_KEYS = 10_000;
 const SAMPLE_KEYS = ['takenAtIso', 'complete', 'shellLive', 'fleetLive', 'importPresent', 'importUnknownLines'] as const;
 const KEY_FIELD_NAMES = ['pullRequest', 'headOid', 'base'] as const;
 
-const SAMPLES_INVALID: ShadowCriterionEvaluation = { status: 'unknown', reason: 'samples-invalid' };
-const SHELL_STATE_INCOMPLETE: ShadowCriterionEvaluation = { status: 'unknown', reason: 'shell-state-incomplete' };
-const IMPORT_UNAVAILABLE: ShadowCriterionEvaluation = { status: 'unknown', reason: 'import-unavailable' };
-const COVERAGE_DIVERGENCE: ShadowCriterionEvaluation = { status: 'fail', reason: 'enqueue-coverage-divergence' };
-const UNKNOWN_LINES: ShadowCriterionEvaluation = { status: 'fail', reason: 'import-unknown-lines' };
-const IMPORT_DIVERGENCE: ShadowCriterionEvaluation = { status: 'fail', reason: 'import-divergence' };
-const CHAIN_BASE: ShadowCriterionEvaluation = { status: 'fail', reason: 'chain-base-not-importable' };
-const INTAKE_EQUAL: ShadowCriterionEvaluation = { status: 'pass', reason: 'intake-equal' };
+// Every verdict below is a single shared object reused across every call to
+// `evaluateShadowIntake`, never freshly constructed per call: `Object.freeze`
+// here, at the point of declaration (not at the point of return), is what
+// guarantees a caller mutating a returned verdict — say, flipping `status`
+// from 'fail' to 'pass' — can never corrupt a later, unrelated call's result
+// through that same shared reference. This matches the frozen-constant
+// pattern `shadow-comparators.ts` already uses for its own shared result
+// objects (`Object.freeze({ ... })`).
+const SAMPLES_INVALID: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'samples-invalid' });
+const SHELL_STATE_INCOMPLETE: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'shell-state-incomplete' });
+const IMPORT_UNAVAILABLE: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'import-unavailable' });
+const COVERAGE_DIVERGENCE: ShadowCriterionEvaluation = Object.freeze({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+const UNKNOWN_LINES: ShadowCriterionEvaluation = Object.freeze({ status: 'fail', reason: 'import-unknown-lines' });
+const IMPORT_DIVERGENCE: ShadowCriterionEvaluation = Object.freeze({ status: 'fail', reason: 'import-divergence' });
+const CHAIN_BASE: ShadowCriterionEvaluation = Object.freeze({ status: 'fail', reason: 'chain-base-not-importable' });
+const INTAKE_EQUAL: ShadowCriterionEvaluation = Object.freeze({ status: 'pass', reason: 'intake-equal' });
 
 /** One observed enqueue key: the pull request, its head and its base branch. */
 interface ValidatedKey {

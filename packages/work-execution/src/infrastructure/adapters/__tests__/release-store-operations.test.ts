@@ -182,6 +182,36 @@ describe('release operation record', () => {
     },
   );
 
+  it(
+    'CO14b fix round 8: finds an open intent for an action without already knowing its sha, ' +
+      'and never guesses when more than one is open',
+    async () => {
+      expect(await store.peekAnyOpenOperation({ root, action: 'rollback' })).toEqual({ outcome: 'none' });
+      const first = await begin(T0, 'rollback');
+      if (first.outcome !== 'started') throw new Error('expected started');
+      expect(await store.peekAnyOpenOperation({ root, action: 'rollback' })).toEqual({
+        outcome: 'open',
+        opId: first.opId,
+        sha: SHA,
+      });
+      // A different action for the same root is a different lookup entirely.
+      expect(await store.peekAnyOpenOperation({ root, action: 'swap' })).toEqual({ outcome: 'none' });
+      // A second open intent for the SAME action under one root is an
+      // invariant violation beginOperation's own exclusive claim should make
+      // impossible: never guess which one is real.
+      const otherSha = 'b'.repeat(40);
+      const second = await store.beginOperation({
+        root,
+        action: 'rollback',
+        sha: otherSha,
+        opId: store.newOperationId(),
+        nowIso: T0,
+      });
+      expect(second).toMatchObject({ outcome: 'started' });
+      expect(await store.peekAnyOpenOperation({ root, action: 'rollback' })).toEqual({ outcome: 'unreadable' });
+    },
+  );
+
   it('binds a root to its driver state directory; the first binding wins', async () => {
     expect(await store.readDriverBinding({ root })).toEqual({ outcome: 'unbound' });
     expect(await store.bindDriver({ root, stateDir: '/srv/a' })).toEqual({ outcome: 'bound', stateDir: '/srv/a' });

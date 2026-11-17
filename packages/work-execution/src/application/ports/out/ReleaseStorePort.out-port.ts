@@ -133,6 +133,24 @@ export interface ReleaseStorePort {
     readonly action: ReleaseOperationAction;
     readonly sha: string;
   }): Promise<{ readonly outcome: 'open'; readonly opId: string } | { readonly outcome: 'none' } | { readonly outcome: 'unreadable' }>;
+  /**
+   * CO14b fix round 8: find an open intent for `action` under this root
+   * WITHOUT already knowing its sha. Only rollback needs this: its target is
+   * never the request's own named value (unlike install and swap, whose
+   * target is always the request's fixed sha), so once a crashed attempt's
+   * own repoint has already moved `current`, a fresh recomputation can no
+   * longer reproduce that attempt's real target, and `peekOperation` itself
+   * cannot be asked without already having a (possibly wrong) sha in hand.
+   * Read-only; writes nothing. `none` when no intent is open for `action`;
+   * `unreadable` when more than one is found (an invariant violation
+   * `beginOperation`'s own exclusive claim should make impossible, so this
+   * never guesses which one is real) or an intent file cannot be read or
+   * parsed.
+   */
+  peekAnyOpenOperation(input: {
+    readonly root: string;
+    readonly action: ReleaseOperationAction;
+  }): Promise<ReleaseOpenOperationPeek>;
   /** A fresh, unique operation id (32 hex characters); never derivable from action and sha. */
   newOperationId(): string;
   /** Record the operation's result: the intent becomes a completed record and the claim is released. */
@@ -164,6 +182,11 @@ export type ReleaseOperationBegin =
 export type ReleaseDriverBinding =
   | { readonly outcome: 'bound'; readonly stateDir: string }
   | { readonly outcome: 'unbound' }
+  | { readonly outcome: 'unreadable' };
+
+export type ReleaseOpenOperationPeek =
+  | { readonly outcome: 'open'; readonly opId: string; readonly sha: string }
+  | { readonly outcome: 'none' }
   | { readonly outcome: 'unreadable' };
 
 export type ReleaseOrphanCurrentTempsResult =

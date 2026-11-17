@@ -116,6 +116,9 @@ function useCase(
       executor,
       nowIso: () => NOW,
       env: () => ({ PATH: '/usr/bin', SNEAKY_TOKEN: 'x' }),
+      // CO14b fix round 8: only the bind-when-unbound step reads this; any
+      // fixed value works for this suite, which is about input validation.
+      stateDir: '/co14b-release-runtime-input-state',
       ...overrides,
     }),
   };

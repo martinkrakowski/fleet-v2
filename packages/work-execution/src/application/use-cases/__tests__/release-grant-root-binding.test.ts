@@ -128,6 +128,10 @@ function releaseUseCase(grants: CoordinationRequestRepositoryAdapter): ManageRel
     executor: new NoBuildExecutor(),
     nowIso: () => NOW,
     env: () => ({}),
+    // CO14b fix round 8: `stateDir` only matters to the bind-when-unbound
+    // step; this suite is about grant/root matching, not binding, so any
+    // fixed value works.
+    stateDir: '/co14b-grant-root-binding-state',
   });
 }
 

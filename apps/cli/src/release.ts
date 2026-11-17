@@ -47,6 +47,14 @@ export interface ReleaseCommandDependencies {
   readonly env: () => Record<string, string | undefined>;
   /** Defaults to the local filesystem store. */
   readonly store?: ReleaseStorePort;
+  /**
+   * The state directory of the driver this call acts for (CO14b fix round 8).
+   * `ManageReleaseUseCase` uses it only to bind a previously-unbound root to
+   * this driver, and only after authorization has already granted — see
+   * `ManageReleaseUseCase.bindRootIfUnbound`. `releaseHandler` below always
+   * supplies the same value it already resolved for the lease adapter.
+   */
+  readonly stateDir: string;
 }
 
 /**
@@ -126,50 +134,31 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
     }
     // A root bound to another installation's driver is not served by this one:
-    // its lease would be read from the wrong directory, so it is refused. A
-    // root with no binding yet is bound to this driver after its first applied
-    // release (first binding wins). An unreadable binding is unknown.
+    // its lease would be read from the wrong directory, so it is refused
+    // here, before anything is read, built or written. A root with no
+    // binding yet is bound to this driver after its first applied release
+    // (first binding wins) — but NOT here: see the round 8 note below. An
+    // unreadable binding is unknown.
     const store = new ReleaseStoreAdapter();
     const checkable = root.startsWith('/') && !root.split('/').includes('..') && root.length <= 4096;
     const binding = checkable ? await store.readDriverBinding({ root }) : ({ outcome: 'unbound' } as const);
     if (binding.outcome === 'unreadable' || (binding.outcome === 'bound' && binding.stateDir !== stateDir)) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
     }
-    // CO14b fix round 3: an unbound root is bound to this driver BEFORE the
-    // release is applied, not after. bindDriver's exclusive-create (`wx`) is
-    // the mutual-exclusion point: only one racing driver can ever win it for
-    // a given unbound root. Gating the apply itself on winning that bind
-    // means no two drivers can concurrently apply to the same previously-
-    // unbound root — a bind that happens only after applying would let both
-    // racers apply before either result is recorded.
-    // CO14b fix round 4: that race protection is only ever needed for a call
-    // that will actually APPLY. A plan-only call never mutates anything (the
-    // file's own doc comment: "Without --apply each prints the plan and
-    // writes nothing"), so binding an unbound root here — which itself
-    // creates the root directory and writes the `.release-driver` marker —
-    // would make a plan-only request a real filesystem write, breaking that
-    // contract. Skip the early bind entirely when this call is not an apply;
-    // the already-bound refusal path above (a binding that exists and
-    // mismatches) is unchanged either way, since it never writes anything.
-    // CO14b fix round 5: `checkable` is also the only condition under which
-    // `binding` was genuinely read rather than assumed `unbound`. When the
-    // root is not checkable (relative, containing `..`, or over 4096 chars),
-    // treating that assumed `unbound` as real and binding anyway would call
-    // `store.bindDriver`, which does a real `fs.mkdir(root, { recursive: true
-    // })` plus writes the `.release-driver` marker, using an unvalidated
-    // root, before `manageReleaseFromPayload`'s own `parseRequest` ever gets
-    // to refuse it. Gate the early bind on `checkable` too, so an invalid
-    // root falls straight through to that existing validation, which refuses
-    // it without writing anything, exactly as before this bind-before-apply
-    // logic was added.
-    if (checkable && binding.outcome === 'unbound' && parseApply(payload['apply'])) {
-      const bound = await store.bindDriver({ root, stateDir });
-      if (bound.outcome !== 'bound' || bound.stateDir !== stateDir) {
-        // Another process's bind won the race first (or the bind itself is
-        // unreadable): this driver never served the root, so it never applies.
-        return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
-      }
-    }
+    // CO14b fix round 8: the actual bind-when-unbound WRITE used to happen
+    // right here, gated only on `checkable`, an actual apply and the binding
+    // reading `unbound` — entirely BEFORE authorization was ever checked.
+    // That let an unauthorized apply request (wrong or missing project, no
+    // matching grant) against a fresh unbound root permanently bind it to
+    // this driver before being refused for lack of authority, which could
+    // make the root unusable for whichever driver should actually have
+    // served it. The write is now `ManageReleaseUseCase.bindRootIfUnbound`,
+    // called only after its own grant resolution has granted and only before
+    // its first mutating write (`beginOperation`) — preserving the original
+    // round-3 property (the bind still happens before any mutating action)
+    // while closing that gap. `releaseHandler` keeps only the read-only
+    // checks above (the unresolvable-state-dir refusal and the already-
+    // bound-mismatch refusal), which write nothing either way.
     return await manageReleaseFromPayload(
       { ...payload, action },
       {
@@ -179,6 +168,7 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
         nowIso: () => new Date().toISOString(),
         env: () => process.env, // the use case passes only a filtered allowlist to the git child
         store,
+        stateDir,
       },
     );
   };
@@ -247,6 +237,7 @@ export async function manageReleaseFromPayload(
     executor: deps.executor,
     nowIso: deps.nowIso,
     env: deps.env,
+    stateDir: deps.stateDir,
   });
   return await useCase.manageRelease(request);
 }

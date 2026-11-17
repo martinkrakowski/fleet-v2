@@ -35,6 +35,17 @@
  * step runs on a filtered environment that never hands the operator's full
  * environment (tokens, credentials) to a child. Nothing is echoed from a command, and no result carries a path or a
  * grant id; an unfinished prune is reported, never smoothed over.
+ *
+ * CO14b fix round 8: two further guarantees. First, a previously-unbound root
+ * is bound to this driver's state directory (`bindRootIfUnbound`) only AFTER
+ * the grant above has resolved and BEFORE the first write any apply makes
+ * (`beginOperation`) — never before authorization, which an unauthorized
+ * caller could otherwise exploit to permanently claim a root for this driver.
+ * Second, a rollback's target — never named by the request itself, unlike
+ * install and swap — is recovered from a crashed attempt's own still-open
+ * intent when one exists (`resolveTarget`), rather than being recomputed
+ * fresh from `current`, which a crashed attempt's own successful repoint may
+ * already have moved out from under that recomputation.
  */
 
 import { containsSecretShape } from '@fleet/shared';
@@ -56,6 +67,8 @@ import type { CommandExecutorPort, CommandRunOptions } from '../ports/out/Comman
 import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
 import type {
   ReleaseBuildRecord,
+  ReleaseDriverBinding,
+  ReleaseOpenOperationPeek,
   ReleaseOperationBegin,
   ReleaseStorePort,
   ReleaseStorePruneResult,
@@ -71,6 +84,15 @@ export interface ManageReleaseDependencies {
   /** The operator environment the composition root supplies; only a filtered
    *  allowlist of it reaches the git child, never the operator's full set. */
   readonly env: () => Record<string, string | undefined>;
+  /**
+   * CO14b fix round 8: the state directory of the driver this use case acts
+   * for, used only to bind a previously-unbound root to it (never to read a
+   * lease directly: the lease port the caller supplies is already bound to
+   * this same directory). Relocated here from `releaseHandler` (apps/cli/src/
+   * release.ts), which used to perform the bind itself before authorization
+   * was ever checked -- a security gap: see `bindRootIfUnbound`.
+   */
+  readonly stateDir: string;
 }
 
 const REQUEST_KEYS = ['action', 'root', 'sha', 'source', 'keep', 'apply', 'projectId'] as const;
@@ -144,8 +166,11 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     }
     const { builds, current } = listing;
     const kept = builds.map((build) => build.sha);
-    const previous = previousBuild(builds, current);
-    const target = request.action === 'rollback' ? previous : request.sha;
+    const resolved = await this.resolveTarget(request, builds, current);
+    if (resolved.outcome === 'unreadable') {
+      return refuse('store-unreadable');
+    }
+    const { target, previous } = resolved;
     if (target === null || (request.action === 'swap' && !kept.includes(target))) {
       return refuse('not-found');
     }
@@ -200,6 +225,22 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     const grant = await this.resolveGrant(request, target, opId);
     if (typeof grant !== 'string') {
       return refuse(grant.refusal);
+    }
+    // CO14b fix round 8 (finding 1): bind a previously-unbound root to this
+    // driver's state directory only now -- AFTER authorization is confirmed,
+    // BEFORE `beginOperation` (the first write any apply makes). Relocated
+    // from `releaseHandler` (apps/cli/src/release.ts), which used to do this
+    // write before any authorization check at all: an unauthorized caller
+    // (wrong or missing project, no matching grant) could permanently claim
+    // an unbound root for itself before ever being refused, making the root
+    // unusable for whichever driver should actually have served it. Moving
+    // the bind here keeps the original round-3 property (the bind still
+    // happens before any mutating action, closing the concurrent-driver
+    // race) while closing that gap: an unauthorized request never reaches
+    // this line.
+    const bindRefusal = await this.bindRootIfUnbound(request.root);
+    if (bindRefusal !== null) {
+      return refuse(bindRefusal);
     }
     let begun: ReleaseOperationBegin;
     try {
@@ -348,6 +389,76 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     } catch {
       return { refusal: 'authority-unknown' };
     }
+  }
+
+  /**
+   * CO14b fix round 8 (finding 1): bind this root to `deps.stateDir` when it
+   * has none yet (first binding wins); confirm a mismatch when it is already
+   * bound elsewhere. Called only from `apply()`, only after authorization has
+   * already granted -- see the call site's comment. Writes at most once per
+   * previously-unbound root.
+   */
+  private async bindRootIfUnbound(root: string): Promise<ManageReleaseRefusal | null> {
+    let binding: ReleaseDriverBinding;
+    try {
+      binding = await this.deps.store.readDriverBinding({ root });
+    } catch {
+      return 'release-root-state-dir-unknown';
+    }
+    if (binding.outcome === 'unreadable') {
+      return 'release-root-state-dir-unknown';
+    }
+    if (binding.outcome === 'bound') {
+      return binding.stateDir === this.deps.stateDir ? null : 'release-root-state-dir-unknown';
+    }
+    try {
+      const bound = await this.deps.store.bindDriver({ root, stateDir: this.deps.stateDir });
+      return bound.outcome === 'bound' && bound.stateDir === this.deps.stateDir
+        ? null
+        : 'release-root-state-dir-unknown';
+    } catch {
+      return 'release-root-state-dir-unknown';
+    }
+  }
+
+  /**
+   * CO14b fix round 8 (finding 2): the target and the informational
+   * `previous` field, for a plan or an apply alike. Install and swap always
+   * target the request's own named sha, never ambiguous. Rollback is
+   * different: its target is never named by the request, so it is normally
+   * `previousBuild(builds, current)` -- but when a crashed rollback's own
+   * intent is still open, that intent's recorded sha is reused instead of
+   * being recomputed, because a fresh `previousBuild` call can no longer
+   * reproduce it once that crashed attempt's own (possibly successful)
+   * repoint has already moved `current` out from under it. A plan reports
+   * this recovered target too, so it reflects what a resume would really do,
+   * never a value a resume could never actually use.
+   */
+  private async resolveTarget(
+    request: ValidRequest,
+    builds: readonly ReleaseBuildRecord[],
+    current: string | null,
+  ): Promise<
+    | { readonly outcome: 'resolved'; readonly target: string | null; readonly previous: string | null }
+    | { readonly outcome: 'unreadable' }
+  > {
+    if (request.action !== 'rollback') {
+      return { outcome: 'resolved', target: request.sha, previous: previousBuild(builds, current) };
+    }
+    let open: ReleaseOpenOperationPeek;
+    try {
+      open = await this.deps.store.peekAnyOpenOperation({ root: request.root, action: 'rollback' });
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+    if (open.outcome === 'unreadable') {
+      return { outcome: 'unreadable' };
+    }
+    if (open.outcome === 'open') {
+      return { outcome: 'resolved', target: open.sha, previous: open.sha };
+    }
+    const previous = previousBuild(builds, current);
+    return { outcome: 'resolved', target: previous, previous };
   }
 
   /**
@@ -637,7 +748,18 @@ function stillTargets(
     return false;
   }
   if (action === 'rollback') {
-    return previousBuild(builds, current) === target;
+    // CO14b fix round 8 (finding 2): a resumed rollback's target can already
+    // equal `current` when the crashed attempt it resumes already repointed
+    // for real before crashing. A fresh previousBuild(builds, current) could
+    // never reproduce that: a build's own predecessor is never itself, so on
+    // an ORDINARY (non-resumed) call this disjunct can never be the one that
+    // makes the check pass -- `current !== plannedCurrent` above already
+    // refused whenever current moved to anything else, and when it hasn't
+    // moved at all, target (computed fresh from plannedCurrent) is never
+    // equal to it either. It activates only for the resumed case, where
+    // `resolveTarget` recovered `target` from the crashed attempt's own open
+    // intent rather than recomputing it.
+    return current === target || previousBuild(builds, current) === target;
   }
   return builds.some((build) => build.sha === target);
 }

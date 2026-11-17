@@ -7,7 +7,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -32,6 +32,7 @@ const SOURCE = '/nonexistent-fleet-v2-source-co14';
 const SHA = 'a'.repeat(40);
 const NOW = '2026-11-06T10:00:00.000Z';
 const PROJECT = 'fleet-v2';
+const DEFAULT_STATE_DIR = '/nonexistent-fleet-v2-driver-state-co14b';
 
 const LIVE_LEASE: ConductorDriverLeaseRecord = {
   version: 1,
@@ -72,6 +73,7 @@ function deps(lease: ConductorDriverLeaseRecord | null = null): {
   executor: RecordingExecutor;
   nowIso: () => string;
   env: () => Record<string, string | undefined>;
+  stateDir: string;
 } {
   return {
     lease: { read: async () => lease } as unknown as ConductorDriverLeasePort,
@@ -79,6 +81,7 @@ function deps(lease: ConductorDriverLeaseRecord | null = null): {
     executor: new RecordingExecutor(),
     nowIso: () => NOW,
     env: () => ({ PATH: '/usr/bin' }),
+    stateDir: DEFAULT_STATE_DIR,
   };
 }
 
@@ -90,21 +93,26 @@ describe('release command', () => {
   });
 
   it(
-    'CO14b fix round 3: a concurrent-apply race refuses the loser before it ever reaches ' +
-      'manageReleaseFromPayload, and the winner still proceeds',
+    'CO14b fix round 8: two different drivers race the SAME unbound root; the loser is still ' +
+      'refused by the binding, but only once BOTH are genuinely authorized -- the original ' +
+      'round 3 race protection, now reached only after authorization (finding 1)',
     async () => {
+      // Historical note: through round 7, this test went through
+      // `releaseCommands['install']` with NO grant recorded, and witnessed
+      // the race by `ConductorDriverLeaseAdapter.prototype.read`'s call
+      // count: the loser was refused by `releaseHandler`'s own bind-before-
+      // apply write, entirely before `manageReleaseFromPayload` ever ran, so
+      // the lease was never even read for it. Round 8 moved that bind to
+      // AFTER authorization (see the two tests below, and the use-case-level
+      // tests in ManageReleaseUseCase.test.ts): an unauthorized request now
+      // never reaches the bind at all, so two UNAUTHORIZED racers are no
+      // longer distinguishable this way -- both are refused identically
+      // (`authority-refused`), before either's bind is ever attempted. This
+      // test is rewritten to race two GENUINELY authorized callers instead,
+      // which is the only way the binding race remains observable.
       const root = '/race-fleet-release-root-co14b';
-      const stateDirA = await mkdtemp(join(tmpdir(), 'co14b-race-state-a-'));
-      const stateDirB = await mkdtemp(join(tmpdir(), 'co14b-race-state-b-'));
-      // Two drivers, configured with DIFFERENT state directories, racing the same unbound root.
-      const rtA = createFleetCliRuntime({
-        stateDir: stateDirA,
-        installation: { daemon: { stateDir: stateDirA } } as never,
-      });
-      const rtB = createFleetCliRuntime({
-        stateDir: stateDirB,
-        installation: { daemon: { stateDir: stateDirB } } as never,
-      });
+      const stateDirA = '/race-fleet-release-state-a-co14b';
+      const stateDirB = '/race-fleet-release-state-b-co14b';
 
       // Both racers read the root as unbound, exactly as they would before either has written
       // the binding file.
@@ -117,34 +125,85 @@ describe('release command', () => {
         .spyOn(ReleaseStoreAdapter.prototype, 'bindDriver')
         .mockResolvedValueOnce({ outcome: 'bound', stateDir: stateDirA })
         .mockResolvedValueOnce({ outcome: 'bound', stateDir: stateDirA });
-      // `leaseIsLive()` calls `lease.read()` unconditionally, for a plan or an apply alike, as
-      // the very first thing `ManageReleaseUseCase.run` does once a request parses (see the
-      // 'planned' result's `lease: 'free'` field in the plan test above). Its call count is
-      // therefore a direct, source-independent witness of whether `manageReleaseFromPayload`
-      // ever ran for a given call.
-      const leaseReadSpy = vi.spyOn(ConductorDriverLeaseAdapter.prototype, 'read');
 
-      // CO14b fix round 4: the early bind this race protects is now gated on an actual
-      // apply (plan-only calls never bind), so the payload must really be an apply — with
-      // a project, or it would bail at 'authority-required' before ever reading the lease —
-      // for this to still exercise the race it claims to.
-      const payload = { root, sha: SHA, source: SOURCE, apply: true, project: PROJECT };
-      const install = releaseCommands['install'];
-      if (install === undefined) throw new Error('install command not registered');
+      const payload = { action: 'install', root, sha: SHA, source: SOURCE, apply: true, project: PROJECT };
+      const depsFor = (stateDir: string): ReturnType<typeof deps> => ({
+        ...deps(),
+        authorization: grantingAuthorization(root),
+        stateDir,
+      });
 
-      const winnerResult = await install(payload, rtA);
+      const winnerResult = await manageReleaseFromPayload(payload, depsFor(stateDirA));
+      // The winner's bind matched its own state directory, so it is never refused for the
+      // binding reason (whatever it is ultimately refused or applied for afterward).
       expect(winnerResult).not.toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
-      expect(leaseReadSpy).toHaveBeenCalledTimes(1);
 
-      const loserResult = await install(payload, rtB);
+      const loserResult = await manageReleaseFromPayload(payload, depsFor(stateDirB));
+      // The loser's own bindDriver call lost the race (it saw A's stateDir, not its own).
       expect(loserResult).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
-      // The loser's own bindDriver call lost the race (it saw A's stateDir, not its own), so the
-      // apply logic — witnessed by the lease check — is never reached for it: the call count is
-      // unchanged from right after the winner's call.
-      expect(leaseReadSpy).toHaveBeenCalledTimes(1);
 
       expect(readSpy).toHaveBeenCalledTimes(2);
       expect(bindSpy).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it(
+    'CO14b fix round 8 (finding 1): an unauthorized apply on a fresh, unbound root never ' +
+      'calls bindDriver, and never creates the root directory',
+    async () => {
+      const base = await mkdtemp(join(tmpdir(), 'co14b-r8-no-auth-base-'));
+      const root = join(base, 'release-root');
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14b-r8-no-auth-state-'));
+      const bindSpy = vi.spyOn(ReleaseStoreAdapter.prototype, 'bindDriver');
+      const result = await manageReleaseFromPayload(
+        { action: 'install', root, sha: SHA, source: SOURCE, apply: true, project: PROJECT },
+        { ...deps(), store: new ReleaseStoreAdapter(), stateDir },
+      );
+      // No project / no matching grant: refused for lack of authority, never for a binding reason.
+      expect(result).toEqual({ outcome: 'refused', reason: 'authority-refused' });
+      expect(bindSpy).not.toHaveBeenCalled();
+      // No bind means no `fs.mkdir(root, { recursive: true })` and no `.release-driver` marker:
+      // the root directory itself was never created on disk.
+      await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
+
+  it(
+    'CO14b fix round 8 (finding 1): a genuinely authorized apply on a fresh, unbound root ' +
+      'still binds it correctly',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'co14b-r8-auth-root-'));
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14b-r8-auth-state-'));
+      const store = new ReleaseStoreAdapter();
+      // A pre-seeded verified build, so a swap needs no real build of its own.
+      const staging = await store.prepare({ root, sha: SHA });
+      if (staging.outcome !== 'prepared') throw new Error('prepare failed');
+      const entry = join(staging.buildDir, 'apps', 'cli', 'dist');
+      await mkdir(entry, { recursive: true });
+      await writeFile(join(entry, 'bin.js'), '// built\n');
+      expect(await store.markVerified({ root, sha: SHA, buildId: staging.buildId, builtAtIso: NOW })).toEqual({
+        outcome: 'ok',
+      });
+      expect(await store.readDriverBinding({ root })).toEqual({ outcome: 'unbound' });
+
+      const result = await manageReleaseFromPayload(
+        { action: 'swap', root, sha: SHA, apply: true, project: PROJECT },
+        {
+          // A swap goes through the fenced repoint, which needs a real
+          // acquire/renew/release lease -- `deps()`'s bare `{ read }` stub
+          // (sufficient for every other test in this file, none of which
+          // reaches that path) is not enough here.
+          lease: new ConductorDriverLeaseAdapter({ stateDir }),
+          authorization: grantingAuthorization(root),
+          executor: new RecordingExecutor(),
+          nowIso: () => NOW,
+          env: () => ({ PATH: '/usr/bin' }),
+          store,
+          stateDir,
+        },
+      );
+      expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: SHA });
+      expect(await store.readDriverBinding({ root })).toEqual({ outcome: 'bound', stateDir });
     },
   );
 
@@ -187,6 +246,7 @@ describe('release command', () => {
         nowIso: () => string;
         env: () => Record<string, string | undefined>;
         store: ReleaseStoreAdapter;
+        stateDir: string;
       } => ({
         lease: new ConductorDriverLeaseAdapter({ stateDir: sharedStateDir }),
         authorization: grantingAuthorization(root),
@@ -194,6 +254,12 @@ describe('release command', () => {
         nowIso: () => NOW,
         env: () => ({ PATH: '/usr/bin' }),
         store: new ReleaseStoreAdapter(),
+        // CO14b fix round 8: the bind-when-unbound write now lives in the use
+        // case, keyed off this same field -- both appliers share it here
+        // exactly as they share `sharedStateDir` for their lease adapters
+        // above, so the binding layer still cannot tell them apart (the
+        // point of this test).
+        stateDir: sharedStateDir,
       });
 
       const [resultA, resultB] = await Promise.all([
@@ -261,11 +327,13 @@ describe('release command', () => {
 
   it('the registered release group refuses apply on a runtime with no recorded grant', async () => {
     const stateDir = await mkdtemp(join(tmpdir(), 'co14-cli-release-'));
-    // CO14b fix round 3: the release handler now binds an unbound root to this
-    // driver BEFORE calling into the authorization check, so the root must be
-    // a real, writable directory for that bind to succeed (and the test to
-    // reach the authorization refusal it means to exercise) rather than the
-    // nonexistent ROOT sentinel under `/`, which a bind could never write to.
+    // A real, writable root (rather than the nonexistent ROOT sentinel under
+    // `/`). CO14b fix round 8: the bind-when-unbound write now happens only
+    // AFTER authorization grants (ManageReleaseUseCase.bindRootIfUnbound), so
+    // this runtime's empty coordination store refuses the apply for lack of
+    // authority before the bind is ever attempted either way; a real root is
+    // kept here only so a future lane that adds a recorded grant to this test
+    // exercises the same bind path the two tests above cover directly.
     const root = await mkdtemp(join(tmpdir(), 'co14-cli-release-root-'));
     const rt = createFleetCliRuntime({
       stateDir,

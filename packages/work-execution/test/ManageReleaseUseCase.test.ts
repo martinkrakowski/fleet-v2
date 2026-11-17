@@ -52,6 +52,7 @@ const SOURCE = '/srv/fleet-v2';
 const NOW = '2026-11-06T10:00:00.000Z';
 const PROJECT = 'fleet-v2';
 const GRANT = 'grant-release-0001';
+const STATE_DIR = '/srv/fleet-v2-driver-state';
 
 const sha = (digit: string): string => digit.repeat(40);
 const A = sha('a');
@@ -216,12 +217,37 @@ class FakeStore implements ReleaseStorePort {
     return { outcome: 'cleaned', removed: 0, findings: 0 };
   }
 
-  async readDriverBinding(): Promise<ReleaseDriverBinding> {
-    return { outcome: 'unbound' };
+  /** Stateful enough to simulate "first binding wins" across repeated calls on one store. */
+  binding: ReleaseDriverBinding = { outcome: 'unbound' };
+  readonly bindCalls: Array<{ root: string; stateDir: string }> = [];
+  readonly readBindingCalls: string[] = [];
+
+  async readDriverBinding(input: { root: string }): Promise<ReleaseDriverBinding> {
+    this.readBindingCalls.push(input.root);
+    return this.binding;
   }
 
-  async bindDriver(input: { stateDir: string }): Promise<ReleaseDriverBinding> {
-    return { outcome: 'bound', stateDir: input.stateDir };
+  async bindDriver(input: { root: string; stateDir: string }): Promise<ReleaseDriverBinding> {
+    this.bindCalls.push({ root: input.root, stateDir: input.stateDir });
+    if (this.binding.outcome === 'bound') {
+      // The real adapter's EEXIST re-read: the first binding wins.
+      return this.binding;
+    }
+    this.binding = { outcome: 'bound', stateDir: input.stateDir };
+    return this.binding;
+  }
+
+  /** Scans the in-memory operations map for an open intent of `action`, without knowing its sha. */
+  async peekAnyOpenOperation(input: {
+    action: string;
+  }): Promise<{ outcome: 'open'; opId: string; sha: string } | { outcome: 'none' }> {
+    const prefix = `${input.action}-`;
+    for (const [key, value] of this.operations) {
+      if (key.startsWith(prefix)) {
+        return { outcome: 'open', opId: value.opId, sha: key.slice(prefix.length) };
+      }
+    }
+    return { outcome: 'none' };
   }
 }
 
@@ -418,6 +444,7 @@ function make(
     executor?: FakeExecutor;
     authorization?: FakeAuthorization;
     clock?: () => string;
+    stateDir?: string;
   } = {},
 ): Made {
   const store = options.store ?? new FakeStore();
@@ -438,6 +465,7 @@ function make(
       GH_TOKEN: 'tk_gh',
       FLEET_NTFY_TOKEN: 'tk_operator',
     }),
+    stateDir: options.stateDir ?? STATE_DIR,
   });
   return { useCase, store, executor, lease, authorization };
 }
@@ -445,6 +473,18 @@ function make(
 /** A use case whose recorded grant matches `kind` at `target`. */
 function granted(kind: string, target: string, options: Parameters<typeof make>[0] = {}): Made {
   return make({ ...options, authorization: new FakeAuthorization({ kind, sha: target, projectId: PROJECT }) });
+}
+
+/** Grants and consumes unconditionally, echoing back whatever root the request names. */
+function alwaysGrants(): ActionAuthorizationPort {
+  return {
+    resolveActionAuthorization: async (req) => ({
+      outcome: 'granted',
+      authorizationGrantId: GRANT,
+      ...(req.releaseRoot !== undefined ? { releaseRoot: req.releaseRoot } : {}),
+    }),
+    consumeActionAuthorization: async (req) => ({ outcome: 'consumed', actionId: req.actionId }),
+  };
 }
 
 async function manage(useCase: ManageReleaseUseCase, input: unknown): Promise<ManageReleaseResult> {
@@ -568,6 +608,66 @@ describe('ManageReleaseUseCase', () => {
     expect(executor.runs).toEqual([]);
     expect(lease.events).toEqual([]);
   });
+
+  it(
+    'CO14b fix round 8 (finding 1): an unauthorized apply against a fresh, unbound root ' +
+      'never binds it, and the root is refused for lack of authority, never for a binding reason',
+    async () => {
+      // No project, so this is refused even before a grant is resolved, and
+      // the bind-after-auth step (which runs only after a grant resolves) is
+      // never reached either way.
+      const noProject = make();
+      expect(await manage(noProject.useCase, request({ apply: true, projectId: null }))).toEqual({
+        outcome: 'refused',
+        reason: 'authority-required',
+      });
+      expect(noProject.store.bindCalls).toEqual([]);
+      expect(noProject.store.readBindingCalls).toEqual([]);
+
+      // A project is named, but no matching grant exists: refused for lack of
+      // authority, and `bindDriver` is never called -- the root stays unbound.
+      const noGrant = make();
+      expect(await manage(noGrant.useCase, applyRequest())).toEqual({
+        outcome: 'refused',
+        reason: 'authority-refused',
+      });
+      expect(noGrant.store.bindCalls).toEqual([]);
+      expect(noGrant.store.binding).toEqual({ outcome: 'unbound' });
+    },
+  );
+
+  it(
+    'CO14b fix round 8 (finding 1): a genuinely authorized apply on a fresh, unbound root ' +
+      'still binds it, to this driver\'s own state directory',
+    async () => {
+      const { useCase, store } = granted(INSTALL, A, { stateDir: STATE_DIR });
+      expect(store.binding).toEqual({ outcome: 'unbound' });
+      const result = await manage(useCase, applyRequest());
+      expect(result.outcome).toBe('applied');
+      expect(store.bindCalls).toEqual([{ root: ROOT, stateDir: STATE_DIR }]);
+      expect(store.binding).toEqual({ outcome: 'bound', stateDir: STATE_DIR });
+      // A second, separately authorized apply on the now-bound root reads
+      // the binding but never writes it again (it already matches).
+      const again = granted(INSTALL, A, { store, stateDir: STATE_DIR });
+      expect((await manage(again.useCase, applyRequest())).outcome).toBe('applied');
+      expect(store.bindCalls).toHaveLength(1);
+    },
+  );
+
+  it(
+    'refuses release-root-state-dir-unknown when the root is already bound to a different state directory',
+    async () => {
+      const store = new FakeStore();
+      store.binding = { outcome: 'bound', stateDir: '/some/other/driver' };
+      const { useCase } = granted(INSTALL, A, { store, stateDir: STATE_DIR });
+      expect(await manage(useCase, applyRequest())).toEqual({
+        outcome: 'refused',
+        reason: 'release-root-state-dir-unknown',
+      });
+      expect(store.bindCalls).toEqual([]);
+      expect(store.calls).toEqual([]);
+    },
+  );
 
   it('refuses authority-refused for a grant that names another action, another sha or another project', async () => {
     for (const grant of [
@@ -773,6 +873,96 @@ describe('ManageReleaseUseCase', () => {
     // it still runs on the already-achieved resume, same as on the original.
     expect(store.orphanPasses).toBe(2);
   });
+
+  it(
+    'a resumed rollback resumes ITS OWN recorded target, never a freshly (and wrongly) ' +
+      'recomputed one (CO14b round 8, finding 2)',
+    async () => {
+      // Oldest-to-newest: C, A, B. Rolling back from B lands on A. If a retry
+      // recomputed its target fresh from `current` AFTER the real repoint to
+      // A had already landed, it would derive A's own predecessor -- C -- an
+      // entirely different, unintended rollback.
+      const store = new FakeStore([build('c', 1), build('a', 2), build('b', 3)], B);
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization: alwaysGrants(),
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+
+      const repoint = store.repoint.bind(store);
+      let repointCalls = 0;
+      store.repoint = async (input) => {
+        repointCalls += 1;
+        const applied = await repoint(input);
+        if (repointCalls === 1) {
+          // The real rename landed for real before this throws, exactly as a
+          // process crash right after a successful OS-level rename would.
+          throw new Error('crash immediately after the repoint rename landed');
+        }
+        return applied;
+      };
+
+      const crashed = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(crashed).toEqual({ outcome: 'refused', reason: 'failed' });
+      expect(store.current).toBe(A);
+      expect(store.operations.size).toBe(1);
+      expect(repointCalls).toBe(1);
+      const firstOpId = [...store.operations.values()][0]?.opId;
+
+      // Resume with the SAME original rollback request (rollback never takes
+      // --sha). The fix must recover and reuse A -- the crashed attempt's own
+      // recorded target -- rather than recomputing one fresh from `current`
+      // (which is now A, so a fresh computation would derive C).
+      const resumed = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(resumed).toMatchObject({ outcome: 'applied', action: 'rollback', target: A, current: A });
+      // Only one real repoint happened in total, across both attempts.
+      expect(repointCalls).toBe(1);
+      // `current` was never silently moved to C.
+      expect(store.current).toBe(A);
+      // The ORIGINAL crashed operation completed; no second, different-target
+      // operation was ever started.
+      expect(store.operations.size).toBe(0);
+      expect(store.completed).toEqual([firstOpId]);
+    },
+  );
+
+  it(
+    'a plan-only rollback reports an in-flight crashed rollback\'s real target, ' +
+      'never a freshly (and wrongly) recomputed one (CO14b round 8, finding 2)',
+    async () => {
+      const store = new FakeStore([build('c', 1), build('a', 2), build('b', 3)], B);
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization: alwaysGrants(),
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+      const repoint = store.repoint.bind(store);
+      let repointCalls = 0;
+      store.repoint = async (input) => {
+        repointCalls += 1;
+        const applied = await repoint(input);
+        if (repointCalls === 1) {
+          throw new Error('crash immediately after the repoint rename landed');
+        }
+        return applied;
+      };
+      await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(store.current).toBe(A);
+      // A plan-only call now, against the same store: it must report the
+      // crashed attempt's real, recorded target (A), not a fresh
+      // previousBuild(builds, current=A), which would wrongly say C.
+      const planned = await manage(useCase, request({ action: 'rollback', sha: null, source: null }));
+      expect(planned).toMatchObject({ outcome: 'planned', action: 'rollback', target: A, previous: A, current: A });
+    },
+  );
 
   it('refuses driver-lease-live while the conductor driver lease is live', async () => {
     const { useCase, store, executor } = granted(INSTALL, A, { lease: LIVE_LEASE });

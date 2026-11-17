@@ -148,6 +148,10 @@ async function harness(storeOverride?: ReleaseStoreAdapter): Promise<Harness> {
     executor,
     nowIso: () => NOW,
     env: () => ({ PATH: '/usr/bin' }),
+    // CO14b fix round 8: the same state directory this harness already uses
+    // for the lease adapter above -- the bind-when-unbound step binds the
+    // root to it too, now that it runs only after authorization grants.
+    stateDir,
   });
   return { useCase, authorization, executor, lease: new ConductorDriverLeaseAdapter({ stateDir }), store: new ReleaseStoreAdapter(), grants, root, stateDir };
 }
@@ -330,6 +334,7 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
       executor: h.executor,
       nowIso: () => NOW,
       env: () => ({ PATH: '/usr/bin' }),
+      stateDir: h.stateDir,
     });
     const crashed = await crashingUseCase.manageRelease({
       action: 'swap', root: h.root, sha: shaA, source: null, keep: 5, apply: true, projectId: 'p',

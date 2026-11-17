@@ -24,6 +24,7 @@ import { randomBytes } from 'node:crypto';
 import type {
   ReleaseBuildRecord,
   ReleaseDriverBinding,
+  ReleaseOpenOperationPeek,
   ReleaseOperationBegin,
   ReleaseOperationRef,
   ReleaseOrphanCurrentTempsResult,
@@ -298,6 +299,44 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     }
   }
 
+  /**
+   * CO14b fix round 8: the one open intent for `action` under this root,
+   * found by scanning `.release-ops` for `${action}-*.intent` rather than by
+   * already knowing its sha. `beginOperation`'s own exclusive create and
+   * single claim per (action, sha) key make two simultaneously open intents
+   * for the same action impossible in normal operation, so finding more than
+   * one is treated as `unreadable` rather than guessed at.
+   */
+  async peekAnyOpenOperation(input: {
+    readonly root: string;
+    readonly action: 'install' | 'swap' | 'rollback';
+  }): Promise<ReleaseOpenOperationPeek> {
+    const opsDir = path.join(input.root, OPS_DIR);
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(opsDir, { withFileTypes: true });
+    } catch (error) {
+      return isErrno(error, 'ENOENT') ? { outcome: 'none' } : { outcome: 'unreadable' };
+    }
+    const prefix = `${input.action}-`;
+    const matches = entries.filter(
+      (entry) => entry.isFile() && entry.name.startsWith(prefix) && entry.name.endsWith('.intent'),
+    );
+    if (matches.length === 0) {
+      return { outcome: 'none' };
+    }
+    if (matches.length > 1) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      const text = await readSmall(path.join(opsDir, matches[0].name));
+      const parsed = parseOpIdAndSha(text);
+      return parsed === null ? { outcome: 'unreadable' } : { outcome: 'open', opId: parsed.opId, sha: parsed.sha };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
   newOperationId(): string {
     return randomBytes(16).toString('hex');
   }
@@ -452,6 +491,27 @@ function parseOpId(text: string | null): string | null {
     const parsed: unknown = JSON.parse(text);
     const opId = typeof parsed === 'object' && parsed !== null ? (parsed as { opId?: unknown }).opId : undefined;
     return typeof opId === 'string' && OP_ID_PATTERN.test(opId) ? opId : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Like `parseOpId`, but also recovers the intent's own recorded sha (CO14b round 8). */
+function parseOpIdAndSha(text: string | null): { readonly opId: string; readonly sha: string } | null {
+  if (text === null) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== 'object' || parsed === null) {
+      return null;
+    }
+    const record = parsed as { opId?: unknown; sha?: unknown };
+    const opId = record.opId;
+    const sha = record.sha;
+    return typeof opId === 'string' && OP_ID_PATTERN.test(opId) && typeof sha === 'string' && SHA_PATTERN.test(sha)
+      ? { opId, sha }
+      : null;
   } catch {
     return null;
   }

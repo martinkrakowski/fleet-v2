@@ -964,6 +964,108 @@ describe('ManageReleaseUseCase', () => {
     },
   );
 
+  it(
+    "a genuinely new rollback operation that merely finds the goal already met is refused, " +
+      'never falsely applied for work it never itself did (CO14b round 9, completion race)',
+    async () => {
+      // Oldest-to-newest: C, A, B. Call X rolls back for real from B to A.
+      // Call Y is a SEPARATE, independently and validly authorized rollback
+      // request -- its own real grant, not a replay of X -- that races in
+      // after X's lease is released but before X's own `completeOperation`
+      // has run. If Y's own `peekOperation` happens only once X's intent is
+      // already gone, Y begins a brand-new operation (`'started'`, never
+      // `'resumed'`) under its own fresh opId, even though `fresh.current`
+      // already sits at A from X's work. Before round 9, `stillTargets`'s
+      // `current === target` disjunct and `fencedRepoint`'s `alreadyAtTarget`
+      // skip did not care whose work it was: Y would consume its own real
+      // grant and report `applied` without ever calling `store.repoint`. The
+      // round 9 fix gates both short-circuits on `begun.outcome === 'resumed'`
+      // for THIS call, so Y's fresh operation instead takes the ordinary
+      // rollback check -- previousBuild(builds, current=A) is C, not A -- and
+      // is correctly refused `current-moved`.
+      const store = new FakeStore([build('c', 1), build('a', 2), build('b', 3)], B);
+      const authorization = alwaysGrants();
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization,
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+
+      // X runs to a REAL, successful repoint and prune (no crash this time),
+      // but `completeOperation` is intercepted so X's own intent stays open
+      // in the store even after X's call has already returned `applied` --
+      // exactly "lease released, intent not yet completed".
+      let deferredComplete: (() => Promise<unknown>) | null = null;
+      const realComplete = store.completeOperation.bind(store);
+      store.completeOperation = async (ref) => {
+        deferredComplete = () => realComplete(ref);
+        return { outcome: 'ok' };
+      };
+
+      const x = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(x).toMatchObject({ outcome: 'applied', action: 'rollback', target: A, current: A });
+      expect(store.current).toBe(A);
+      // X's lease was released (the fenced repoint's `finally`), but its own
+      // intent is still open: `completeOperation` was intercepted, never for
+      // real run.
+      expect(store.operations.size).toBe(1);
+      expect(deferredComplete).not.toBeNull();
+
+      // Y races in now: intercept `peekOperation` -- the first thing Y's own
+      // `apply()` reads from the operations table -- to run X's deferred
+      // completion exactly once, right before Y looks. This simulates X
+      // finishing between its own lease release and Y's own planning step,
+      // without any real concurrency.
+      const realPeek = store.peekOperation.bind(store);
+      store.peekOperation = async (input) => {
+        if (deferredComplete !== null) {
+          const complete = deferredComplete;
+          deferredComplete = null;
+          await complete();
+        }
+        return realPeek(input);
+      };
+      const beginOutcomes: string[] = [];
+      const realBegin = store.beginOperation.bind(store);
+      store.beginOperation = async (input) => {
+        const begun = await realBegin(input);
+        beginOutcomes.push(begun.outcome);
+        return begun;
+      };
+      let repointCallsForY = 0;
+      const realRepoint = store.repoint.bind(store);
+      store.repoint = async (input) => {
+        repointCallsForY += 1;
+        return realRepoint(input);
+      };
+      const consumesForY: string[] = [];
+      const realConsume = authorization.consumeActionAuthorization.bind(authorization);
+      authorization.consumeActionAuthorization = async (req) => {
+        consumesForY.push(req.actionId);
+        return realConsume(req);
+      };
+
+      const y = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      // Y's own `beginOperation` genuinely started a fresh operation: X's
+      // intent was already gone by the time Y looked.
+      expect(beginOutcomes).toEqual(['started']);
+      // Y is refused, never falsely `applied`: it never performed the
+      // mutation it would otherwise have claimed, and never spent its own
+      // grant for work it did not do.
+      expect(y).toEqual({ outcome: 'refused', reason: 'current-moved' });
+      expect(repointCallsForY).toBe(0);
+      expect(consumesForY).toEqual([]);
+      expect(store.current).toBe(A);
+      // Y's own freshly begun intent is cleanly cancelled, not left open:
+      // X's own operation is gone (completed above), and Y's own is gone too.
+      expect(store.operations.size).toBe(0);
+    },
+  );
+
   it('refuses driver-lease-live while the conductor driver lease is live', async () => {
     const { useCase, store, executor } = granted(INSTALL, A, { lease: LIVE_LEASE });
     expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });

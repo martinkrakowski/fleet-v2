@@ -46,6 +46,26 @@
  * intent when one exists (`resolveTarget`), rather than being recomputed
  * fresh from `current`, which a crashed attempt's own successful repoint may
  * already have moved out from under that recomputation.
+ *
+ * CO14b fix round 9: round 8's "already at target" short-circuits (the
+ * rollback disjunct in `stillTargets`, and `fencedRepoint`'s skip of
+ * `store.repoint`) are now gated on `begun.outcome === 'resumed'`
+ * (`OperationContext.isResume`), never available to a freshly `'started'`
+ * operation. Luna's finding: a crashed-looking gap is not the only way a
+ * fresh listing can already show `current === target` — a SEPARATE,
+ * independently and validly authorized rollback request can race in after a
+ * first call has repointed to the same target and released its lease, but
+ * before that first call's own `completeOperation` has run. If the second
+ * call's own `peekOperation` happens only after the first call's intent is
+ * gone, the second call begins a brand-new operation (`'started'`) under its
+ * own fresh opId — never a resume of the first call's — and must not be
+ * allowed to treat the first call's prior work as its own just because the
+ * goal happens to already be met. Gating on `isResume` makes a fresh
+ * operation that finds `current` already at its rollback target fall through
+ * to the ordinary check (`previousBuild(builds, current) === target`), which
+ * is false in exactly that race (a build's own predecessor is never itself),
+ * so the fresh call is correctly refused `current-moved` rather than
+ * falsely reporting `applied` for a repoint it never itself performed.
  */
 
 import { containsSecretShape } from '@fleet/shared';
@@ -260,7 +280,13 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (begun.outcome === 'unreadable') {
       return refuse('store-unreadable');
     }
-    const operation: OperationContext = { opId: begun.opId, consumed: false };
+    const operation: OperationContext = {
+      opId: begun.opId,
+      consumed: false,
+      // CO14b fix round 9: only a genuine resume of a pre-existing intent may
+      // later treat "current already at target" as its own prior work.
+      isResume: begun.outcome === 'resumed',
+    };
     let result: ManageReleaseResult;
     try {
       result = await this.applyOperation(request, target, plannedCurrent, alreadyBuilt, operation, grant);
@@ -491,7 +517,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       if (fresh.outcome !== 'read') {
         return { refusal: 'store-unreadable' };
       }
-      if (!stillTargets(request.action, fresh.builds, fresh.current, plannedCurrent, target)) {
+      if (!stillTargets(request.action, fresh.builds, fresh.current, plannedCurrent, target, operation.isResume)) {
         return { refusal: 'current-moved' };
       }
       // A resumed operation (the same opId, read back through beginOperation's
@@ -504,7 +530,18 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       // time either, and it is exactly as idempotent against a fresh listing
       // as repoint is). `stillTargets` needs no change for this: it already
       // answers true for an already-achieved state, which is a valid plan.
-      const alreadyAtTarget = fresh.current === target;
+      //
+      // CO14b fix round 9: this skip is gated on `operation.isResume` too.
+      // `fresh.current === target` alone is not evidence that THIS call's own
+      // operation did that work: a separate, freshly `'started'` operation can
+      // legitimately observe it, for instance when a different, independently
+      // authorized request already drove `current` there and released its
+      // lease before this call's own `peekOperation` ran. Only a genuine
+      // resume (`begun.outcome === 'resumed'`, the same opId read back) may
+      // treat an already-achieved target as its own prior work; a fresh
+      // operation still falls through to `store.repoint`, which is a no-op
+      // write when `current` already matches (repoint is idempotent).
+      const alreadyAtTarget = operation.isResume && fresh.current === target;
       const kept = fresh.builds.map((build) => build.sha);
       // Only this process holds the lease, so no repoint has a temp link in
       // flight: an orphan is a crashed run's. The pass is fenced under the
@@ -743,6 +780,7 @@ function stillTargets(
   current: string | null,
   plannedCurrent: string | null,
   target: string,
+  isResume: boolean,
 ): boolean {
   if (current !== plannedCurrent) {
     return false;
@@ -759,7 +797,22 @@ function stillTargets(
     // equal to it either. It activates only for the resumed case, where
     // `resolveTarget` recovered `target` from the crashed attempt's own open
     // intent rather than recomputing it.
-    return current === target || previousBuild(builds, current) === target;
+    //
+    // CO14b fix round 9 (Luna): that "never for an ordinary call" argument
+    // assumed the only way to reach this disjunct with current === target is
+    // THIS call's own crashed-and-resumed attempt. It is not: a SEPARATE,
+    // independently authorized rollback request can race in after a first
+    // call already repointed to this same target and released its lease, but
+    // before that first call's own intent completed. If this call's own
+    // `peekOperation` runs only once the first call's intent is gone, this
+    // call begins a genuinely fresh (`'started'`) operation under its own
+    // opId, finds `current` already at `target`, and the un-gated disjunct
+    // would wrongly let it claim that prior work as its own. `isResume` (true
+    // only when `begun.outcome === 'resumed'` for THIS call) closes that: a
+    // fresh operation gets no benefit from the disjunct and must pass the
+    // ordinary `previousBuild` check instead, which is false here (a build's
+    // own predecessor is never itself), so it is correctly refused.
+    return (isResume && current === target) || previousBuild(builds, current) === target;
   }
   return builds.some((build) => build.sha === target);
 }
@@ -785,10 +838,20 @@ function allowlisted(
   return picked;
 }
 
-/** One apply's operation: its unique id, and whether the grant may have been spent for it. */
+/**
+ * One apply's operation: its unique id, whether the grant may have been
+ * spent for it, and whether THIS call's own `beginOperation` resumed a
+ * pre-existing intent (`'resumed'`) rather than starting a fresh one
+ * (`'started'`). CO14b fix round 9: `isResume` is the only thing allowed to
+ * unlock the "already at target" short-circuits in `fencedRepoint` and
+ * `stillTargets` -- never `fresh.current === target` alone, which a freshly
+ * started operation can observe too when a separate, independently
+ * authorized call already did the work and released its lease first.
+ */
 interface OperationContext {
   readonly opId: string;
   consumed: boolean;
+  readonly isResume: boolean;
 }
 
 /**

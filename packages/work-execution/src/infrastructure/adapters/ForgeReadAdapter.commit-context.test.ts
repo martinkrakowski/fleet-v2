@@ -569,4 +569,98 @@ describe('readCommitContext', () => {
   it('returns unreadable-contexts when hasNextPage is true and endCursor is absent', async () => {
     expect(await readContexts([checkNode()], { hasNextPage: true })).toEqual(unavailable('unreadable-contexts'));
   });
+
+  it('returns unreadable-contexts when pageInfo.hasNextPage is the string "true" or the number 1', async () => {
+    // A non-empty cursor would be followed if a non-boolean were treated as truthy.
+    const stringTrue = await readContexts([checkNode()], { hasNextPage: 'true', endCursor: CURSOR });
+    const numberOne = await readContexts([checkNode()], { hasNextPage: 1, endCursor: CURSOR });
+    expect(stringTrue).toEqual(unavailable('unreadable-contexts'));
+    expect(numberOne).toEqual(unavailable('unreadable-contexts'));
+    expect(JSON.stringify(stringTrue)).not.toContain(CURSOR);
+    expect(JSON.stringify(numberOne)).not.toContain(CURSOR);
+  });
+
+  it('returns unreadable-contexts when pageInfo.endCursor is null while hasNextPage is true', async () => {
+    expect(await readContexts([checkNode()], { hasNextPage: true, endCursor: null })).toEqual(
+      unavailable('unreadable-contexts'),
+    );
+  });
+
+  it('returns invalid-request when the request is a class instance with valid own fields', async () => {
+    class GateRequest {
+      readonly headSha = HEAD;
+      readonly contextName = 'gate';
+    }
+    const request = new GateRequest();
+    expect(Object.getPrototypeOf(request)).not.toBe(Object.prototype);
+    expect(Object.getPrototypeOf(request)).not.toBe(null);
+    expect(Object.hasOwn(request, 'headSha')).toBe(true);
+    expect(Object.hasOwn(request, 'contextName')).toBe(true);
+    let calls = 0;
+    const adapter = makeAdapter({
+      runGh: async () => {
+        calls += 1;
+        return ok(page({ nodes: [check('gate', 'COMPLETED', 'SUCCESS')] }));
+      },
+    });
+    expect(await read(adapter, request as never)).toEqual(unavailable('invalid-request'));
+    expect(calls).toBe(0);
+  });
+
+  it('returns invalid-request when the request is Object.create(someProto) with valid own fields', async () => {
+    const proto = { inherited: 'proto-field' };
+    const request = Object.assign(Object.create(proto), { headSha: HEAD, contextName: 'gate' }) as {
+      readonly headSha: string;
+      readonly contextName: string;
+    };
+    expect(Object.getPrototypeOf(request)).toBe(proto);
+    expect(Object.getPrototypeOf(request)).not.toBe(Object.prototype);
+    expect(Object.hasOwn(request, 'headSha')).toBe(true);
+    expect(Object.hasOwn(request, 'contextName')).toBe(true);
+    let calls = 0;
+    const adapter = makeAdapter({
+      runGh: async () => {
+        calls += 1;
+        return ok(page({ nodes: [check('gate', 'COMPLETED', 'SUCCESS')] }));
+      },
+    });
+    const result = await read(adapter, request as never);
+    expect(result).toEqual(unavailable('invalid-request'));
+    expect(JSON.stringify(result)).not.toContain('proto-field');
+    expect(calls).toBe(0);
+  });
+
+  it('returns context-failed when runGh rejects', async () => {
+    const adapter = makeAdapter({
+      runGh: () => Promise.reject(new Error('spawn failed at /home/someone/bin/gh')),
+    });
+    const result = await read(adapter, GATE);
+    expect(result).toEqual(unavailable('context-failed'));
+    expect(JSON.stringify(result)).not.toContain('/home/someone');
+  });
+
+  it('returns unavailable when gh stdout is not a string', async () => {
+    const stdout: unknown = JSON.parse(page({ nodes: [check('gate', 'COMPLETED', 'SUCCESS')] }));
+    const adapter = makeAdapter({
+      runGh: async () => ({ exitCode: 0, stdout, stderr: '' }) as never,
+    });
+    expect(await read(adapter, GATE)).toEqual(unavailable('context-too-large'));
+  });
+
+  it('returns context-timed-out when the deadline expires between pages', async () => {
+    let calls = 0;
+    const adapter = makeAdapter({
+      runGh: async (args) => {
+        calls += 1;
+        if (args.some((arg) => arg.startsWith('after='))) {
+          return new Promise<GhInvocationResult>(() => undefined);
+        }
+        return ok(page({ nodes: [check('gate', 'COMPLETED', 'SUCCESS')], hasNextPage: true, endCursor: CURSOR }));
+      },
+    });
+    const result = await read(adapter, { headSha: HEAD, contextName: 'gate', timeoutMs: 50 });
+    expect(result).toEqual(unavailable('context-timed-out'));
+    expect(calls).toBe(2);
+    expect(JSON.stringify(result)).not.toContain(CURSOR);
+  });
 });

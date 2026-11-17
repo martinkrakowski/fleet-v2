@@ -10,6 +10,7 @@ import type {
 } from '../../domain/lane-run-journal.js';
 import {
   buildLaneRunStepKey,
+  buildMergeKey,
   laneRunPremergeKey,
   laneRunStopForceKey,
   laneRunStopKey,
@@ -362,6 +363,103 @@ describe('LaneRunJournalAdapter', () => {
 
       const escaping = new LaneRunJournalAdapter({ stateDir: tempDir, fileName: '../x.json' });
       await expect(escaping.listForRun(RUN_ID)).rejects.toThrow(/unsafe state file name/);
+    });
+  });
+
+  describe('listForKeyPrefix (SH6: every entry under a key prefix from one read)', () => {
+    const DIGEST = '0123456789ab';
+    const OTHER_DIGEST = 'fedcba098765';
+    const PREFIX = `merge/${DIGEST}/`;
+
+    function mergeKeyFor(digest: string, pullRequest: number): string {
+      const built = buildMergeKey({
+        repoDigest: digest,
+        pullRequest,
+        head12: DIGEST,
+        action: 'merge-pr',
+        attemptOrdinal: null,
+        retry: null,
+      });
+      if (!built.ok) {
+        throw new Error(built.error);
+      }
+      return built.key;
+    }
+
+    function mergeIntent(pullRequest: number, digest: string = DIGEST): LaneRunJournalEntryRecord {
+      return baseEntry('intent', { key: mergeKeyFor(digest, pullRequest), runId: RUN_ID, mintedId: nextUlid() });
+    }
+
+    describe.each(['memory', 'file'] as const)('%s store', (mode) => {
+      it('returns entries in append order, only for the requested digest', async () => {
+        const adapter = adapterFor(mode);
+        const first = mergeIntent(1);
+        const conduct = conductEntry();
+        const second = mergeIntent(2);
+        const other = mergeIntent(3, OTHER_DIGEST);
+        for (const entry of [first, conduct, second, other]) {
+          await adapter.append(entry);
+        }
+
+        const listed = await adapter.listForKeyPrefix(PREFIX);
+        expect(listed.map((entry) => entry.entryId)).toEqual([first.entryId, second.entryId]);
+        expect(listed.every((entry) => entry.key !== null && entry.key.startsWith(PREFIX))).toBe(true);
+      });
+
+      it('returns fresh copies; mutating a returned entry does not change the store', async () => {
+        const adapter = adapterFor(mode);
+        await adapter.append(mergeIntent(1));
+
+        const listed = await adapter.listForKeyPrefix(PREFIX);
+        expect(listed).toHaveLength(1);
+        (listed[0] as unknown as { key: string }).key = 'tampered-key';
+
+        const again = await adapter.listForKeyPrefix(PREFIX);
+        expect(again).toHaveLength(1);
+        expect(again[0]!.key).toBe(mergeKeyFor(DIGEST, 1));
+      });
+
+      it.each([
+        ['the empty string', ''],
+        ['a family with no trailing slash', 'merge'],
+        ['an uppercase family', 'MERGE/'],
+        ['a path-traversal-shaped digest', 'merge/../'],
+        ['a 13-hex-character digest', 'merge/0123456789abc/'],
+      ])('returns [] rather than throwing for an invalid prefix: %s', async (_label, prefix) => {
+        const adapter = adapterFor(mode);
+        await adapter.append(mergeIntent(1));
+        expect(await adapter.listForKeyPrefix(prefix as string)).toEqual([]);
+      });
+
+      it('returns [] for a non-string prefix', async () => {
+        const adapter = adapterFor(mode);
+        await adapter.append(mergeIntent(1));
+        expect(await adapter.listForKeyPrefix(123 as unknown as string)).toEqual([]);
+      });
+    });
+
+    it('reads the backing file once per call, in file mode', async () => {
+      const adapter = new LaneRunJournalAdapter({ stateDir: tempDir });
+      await adapter.append(mergeIntent(1));
+      await adapter.append(mergeIntent(2));
+
+      // The adapter's one store read for a scan is `readEntriesFromDisk`; the
+      // filter runs on the already-read list, never once per entry.
+      const readSpy = vi.spyOn(
+        adapter as unknown as { readEntriesFromDisk: (target: string) => Promise<LaneRunJournalEntryRecord[]> },
+        'readEntriesFromDisk',
+      );
+      try {
+        const listed = await adapter.listForKeyPrefix(PREFIX);
+        expect(readSpy).toHaveBeenCalledTimes(1);
+        expect(listed.map((entry) => entry.entryId)).toEqual(
+          (await adapter.listForRun(RUN_ID)).flatMap((entry) =>
+            entry.key !== null && entry.key.startsWith(PREFIX) ? [entry.entryId] : [],
+          ),
+        );
+      } finally {
+        readSpy.mockRestore();
+      }
     });
   });
 

@@ -224,3 +224,117 @@ describe('DaemonJobRegistry chain-refresh invalid mode (CO8a)', () => {
     expect(outcome).toEqual({ outcome: 'refused', reasonCode: 'chain-refresh-attention-unavailable' });
   });
 });
+
+describe('DaemonJobRegistry chain-refresh under an operator halt', () => {
+  const HALTED = { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } } as const;
+  const haltedRefusal: RefreshChainsResult = { outcome: 'refused', reasonCode: 'halted', chains: [] };
+
+  async function haltedJob(result: RefreshChainsResult, halt?: { readonly answer: unknown }) {
+    let reads = 0;
+    const read = async () => {
+      reads += 1;
+      if (halt?.answer instanceof Error) throw halt.answer;
+      return halt?.answer;
+    };
+    const refresh = new FakeRefresh();
+    refresh.result = result;
+    const registry = new DaemonJobRegistry({
+      mergePass: {} as never,
+      chainRefresh: refresh,
+      ...(halt === undefined ? {} : { halt: { read } as never }),
+    });
+    const outcome = await registry.instances([repoRef(DIGEST_A)])[1]!.pass({ nowIso: NOW, deadlineIso: DEADLINE });
+    return { outcome, reads };
+  }
+
+  it('a halted refusal with a confirmed operator halt is skipped as halted', async () => {
+    const { outcome, reads } = await haltedJob(haltedRefusal, { answer: HALTED });
+    expect(outcome).toEqual({ outcome: 'skipped', reasonCode: 'halted' });
+    expect(reads).toBe(1);
+  });
+
+  it('chains settled before a mid-pass halt are counted in the reason code', async () => {
+    const result: RefreshChainsResult = {
+      outcome: 'refused',
+      reasonCode: 'halted',
+      chains: [
+        { chainName: 'a', key: 'k', outcome: 'merged' },
+        { chainName: 'b', key: 'k', outcome: 'up-to-date' },
+        { chainName: 'c', key: 'k', outcome: 'skipped' },
+      ],
+    };
+    const { outcome, reads } = await haltedJob(result, { answer: HALTED });
+    expect(outcome).toEqual({ outcome: 'skipped', reasonCode: 'halted-after-2' });
+    expect(reads).toBe(1);
+  });
+
+  it.each([
+    ['unreadable', { state: 'unreadable' }],
+    ['clear', { state: 'clear', record: null }],
+    ['a malformed record', { state: 'halted', record: { halted: true } }],
+    ['halted: false', { state: 'halted', record: { version: 1, halted: false, changedAtIso: NOW } }],
+    ['null', null],
+    ['an array', []],
+    ['a throw', new Error('read failed')],
+  ] as readonly [string, unknown][])('a halted refusal stays refused when the halt read is %s', async (_label, answer) => {
+    const { outcome, reads } = await haltedJob(haltedRefusal, { answer });
+    expect(outcome).toEqual({ outcome: 'refused', reasonCode: 'halted' });
+    expect(reads).toBe(1);
+  });
+
+  it('a halted refusal stays refused when the registry has no halt', async () => {
+    const { outcome, reads } = await haltedJob(haltedRefusal);
+    expect(outcome).toEqual({ outcome: 'refused', reasonCode: 'halted' });
+    expect(reads).toBe(0);
+  });
+
+  it('a halted refusal whose chains is not an array is refused as malformed', async () => {
+    const { outcome } = await haltedJob(
+      { outcome: 'refused', reasonCode: 'halted', chains: 'x' as never },
+      { answer: HALTED },
+    );
+    expect(outcome).toEqual({ outcome: 'refused', reasonCode: 'chain-refresh-malformed' });
+  });
+
+  it.each([
+    ['invalid-request', 'invalid-request'],
+    ['halted-ish', 'halted-ish'],
+    [7, 'job-failed'],
+  ] as readonly [string, unknown][])('every other refusal reason stays refused and never reads the halt', async (given, expected) => {
+    const { outcome, reads } = await haltedJob(
+      { outcome: 'refused', reasonCode: given as never, chains: [] },
+      { answer: HALTED },
+    );
+    expect(outcome).toEqual({ outcome: 'refused', reasonCode: expected });
+    expect(reads).toBe(0);
+  });
+
+  it('a completed or skipped result never reads the halt', async () => {
+    const completed = await haltedJob({ outcome: 'completed', reasonCode: null, chains: [] }, { answer: HALTED });
+    expect(completed.outcome).toEqual({ outcome: 'completed', progressed: false });
+    expect(completed.reads).toBe(0);
+    const skipped = await haltedJob(
+      { outcome: 'skipped', reasonCode: 'main-unreadable', chains: [] },
+      { answer: HALTED },
+    );
+    expect(skipped.outcome).toEqual({ outcome: 'skipped', reasonCode: 'main-unreadable' });
+    expect(skipped.reads).toBe(0);
+  });
+
+  it('a conflict and a branch-gone chain count as settled, an unknown chain outcome does not', async () => {
+    const { outcome } = await haltedJob(
+      {
+        outcome: 'refused',
+        reasonCode: 'halted',
+        chains: [
+          { chainName: 'a', key: 'k', outcome: 'conflict' },
+          { chainName: 'b', key: 'k', outcome: 'branch-gone' },
+          { chainName: 'c', key: 'k', outcome: 'weird' },
+          null,
+        ] as never,
+      },
+      { answer: HALTED },
+    );
+    expect(outcome).toEqual({ outcome: 'skipped', reasonCode: 'halted-after-2' });
+  });
+});

@@ -67,6 +67,12 @@ const OTHER_STORE_FILE_NAMES = [
 /** A configured file name may not escape the state directory it belongs to. */
 const SAFE_FILE_NAME = /^[A-Za-z0-9._-]{1,128}$/;
 
+/**
+ * A valid key prefix for `listForKeyPrefix`: a lowercase key family (`merge/`)
+ * optionally followed by a 12-hex repository digest and its slash.
+ */
+const KEY_PREFIX_PATTERN = /^[a-z][a-z0-9-]{0,31}\/([0-9a-f]{12}\/)?$/;
+
 /** Fresh copies: entries hold only primitives, so a spread is a full copy. */
 function copyEntry(entry: LaneRunJournalEntryRecord): LaneRunJournalEntryRecord {
   return { ...entry, schemaVersion: LANE_RUN_JOURNAL_STORE_VERSION_POLICY.writerVersion };
@@ -175,6 +181,16 @@ export class LaneRunJournalAdapter implements LaneRunJournalPort {
     }
     const entries = await this.entriesForScan();
     return entries.filter((entry) => entry.key === key).map(copyEntry);
+  }
+
+  async listForKeyPrefix(prefix: string): Promise<readonly LaneRunJournalEntryRecord[]> {
+    if (typeof prefix !== 'string' || !KEY_PREFIX_PATTERN.test(prefix)) {
+      return [];
+    }
+    const entries = await this.entriesForScan();
+    return entries
+      .filter((entry) => typeof entry.key === 'string' && entry.key.startsWith(prefix))
+      .map(copyEntry);
   }
 
   private get statePath(): string | null {

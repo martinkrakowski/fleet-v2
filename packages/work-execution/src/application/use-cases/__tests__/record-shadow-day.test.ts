@@ -5,12 +5,17 @@ import { describe, expect, it } from 'vitest';
 import type { CutoverShadowCriterion } from '../../../domain/cutover-records.js';
 import type { DaemonEventRecord } from '../../../domain/daemon-events.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
-import { buildMergeKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, buildMergeKey, laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
 import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.js';
 import type { ShadowLedger } from '../../../domain/shadow-evidence-ledger.js';
 import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifactAdapter.adapter.js';
 import type { ImportTrainStateKey, ImportTrainStateResult } from '../../ports/in/ImportTrainStatePort.in-port.js';
+import type { ChainRepositoryPort } from '../../ports/out/ChainRepositoryPort.out-port.js';
 import type { LegacyTrainEventsRead, LegacyTrainStateRead } from '../../ports/out/LegacyTrainStateReadPort.out-port.js';
+import type {
+  ShadowConformanceRunsDependencies,
+  ShadowGateHeadsDependencies,
+} from '../shadow-day/index.js';
 import type { ShadowLedgerReadResult } from '../../ports/out/ShadowEvidencePort.out-port.js';
 import type { RecordShadowDayRequest, RecordShadowDayResult } from '../../ports/in/RecordShadowDayPort.in-port.js';
 import {
@@ -39,7 +44,7 @@ const PAST_DEADLINE = '2026-11-17T11:00:00.000Z';
  */
 const RECORDED_AT_ISO = '2026-11-17T12:02:30.000Z';
 const NOT_IMPLEMENTED: readonly CutoverShadowCriterion[] = [
-  'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S10', 'S11', 'S13',
+  'S2', 'S3', 'S5', 'S10', 'S11', 'S13',
 ];
 
 /** A valid ULID-shaped id carrying `n` (O1b-1 pattern: `[0-7][Crockford]{25}`). */
@@ -488,6 +493,387 @@ function expectedS8Digest(day: string, status: string, reason: string): string {
       reason,
     }),
   );
+}
+
+/**
+ * The canonical S4' summary digest, rebuilt here exactly as the use case
+ * builds it: four day-scoped counts plus `headsDigest`, the digest over
+ * every head's four identifying fields in the reader's own order
+ * (`pushedAtIso`, then `headOid`). `unsettled` is excluded: an unsettled
+ * head always leaves the day unevaluated, so every head on an evaluated day
+ * is settled.
+ */
+function expectedS4Digest(
+  day: string,
+  status: string,
+  reason: string,
+  counts: { compared: number; agreeing: number; falsePasses: number; stricterFails: number },
+  heads: readonly { headOid: string; conductorVerdict: string; pushedAtIso: string; ciGate: string }[],
+): string {
+  const ordered = [...heads].sort((a, b) =>
+    a.pushedAtIso !== b.pushedAtIso ? (a.pushedAtIso < b.pushedAtIso ? -1 : 1) : a.headOid < b.headOid ? -1 : a.headOid > b.headOid ? 1 : 0,
+  );
+  const headsDigest = sha256HexDigest(
+    JSON.stringify(
+      ordered.map((head) => ({
+        headOid: head.headOid,
+        conductorVerdict: head.conductorVerdict,
+        pushedAtIso: head.pushedAtIso,
+        ciGate: head.ciGate,
+      })),
+    ),
+  );
+  return sha256HexDigest(
+    JSON.stringify({
+      criterion: 'S4',
+      day,
+      status,
+      reason,
+      compared: counts.compared,
+      agreeing: counts.agreeing,
+      falsePasses: counts.falsePasses,
+      stricterFails: counts.stricterFails,
+      headsDigest,
+    }),
+  );
+}
+
+/**
+ * The canonical S6' summary digest: base only — every S6' count depends on
+ * `readShadowConformanceRuns`, which reads live stores not time-bounded to
+ * day `D`, so the counts are excluded and stay on the outcome as
+ * non-digested diagnostics.
+ */
+function expectedS6Digest(day: string, status: string, reason: string): string {
+  return sha256HexDigest(JSON.stringify({ criterion: 'S6', day, status, reason }));
+}
+
+/** The canonical S7 summary digest: base only, like S8 — both counts are live. */
+function expectedS7Digest(day: string, status: string, reason: string): string {
+  return sha256HexDigest(JSON.stringify({ criterion: 'S7', day, status, reason }));
+}
+
+/* -------------------------------------------------------------------------
+ * SH19a: fakes for the conducted-facts readers (SH18a/SH18b) and the chain
+ * store, driving the REAL `readShadowGateHeads` and `readShadowConformanceRuns`
+ * application readers — no `vi.mock`.
+ * ------------------------------------------------------------------------- */
+
+/** A distinct 40-hex head oid carrying `n` in its tail. */
+function oid(n: number): string {
+  return `${'9'.repeat(36)}${n.toString(16).padStart(4, '0')}`;
+}
+
+/** A valid lane-run id (`run-` + ULID). */
+function runId(n: number): string {
+  return `run-${ulid(n)}`;
+}
+
+/** A step key `<runId>/r1/<step>/0@<head12>` as the readers parse it. */
+function stepKey(id: string, step: 'push' | 'gate', headOid: string): string {
+  const built = buildLaneRunStepKey({
+    runId: id,
+    round: 1,
+    step,
+    seatIndex: 0,
+    attemptOrdinal: null,
+    head12: headOid.slice(0, 12),
+    retry: null,
+  });
+  if (!built.ok) {
+    throw new Error(`fixture step key refused: ${built.error}`);
+  }
+  return built.key;
+}
+
+/** The premerge receipt key `<runId>/r1/premerge@<head12>`. */
+function premergeKey(id: string, headOid: string): string {
+  const built = laneRunPremergeKey(id, 1, headOid.slice(0, 12));
+  if (!built.ok) {
+    throw new Error(`fixture premerge key refused: ${built.error}`);
+  }
+  return built.key;
+}
+
+/** One conducted gate head the S4' reader assembles. */
+interface GateHeadSpec {
+  readonly headOid: string;
+  readonly conductorVerdict: 'pass' | 'fail';
+  readonly pushedAtIso: string;
+  readonly ciGate: string;
+}
+
+/** One conducted run the S6' reader assembles. */
+interface ConformanceRunSpec {
+  readonly pr: number;
+  readonly tier: 1 | 2;
+  readonly headOid: string;
+  /** `null` omits the premerge entry (rule 5 then refuses). */
+  readonly premergeAtIso: string | null;
+}
+
+interface ConductedOptions {
+  readonly gateHeads?: readonly GateHeadSpec[];
+  readonly conformanceRuns?: readonly ConformanceRunSpec[];
+  /** `unavailable` makes every forge read refuse (`forge-unavailable`). */
+  readonly forgeOutcome?: 'found' | 'unavailable';
+  /** Per-sha CI state override, for a later CI change between two runs. */
+  readonly ciOverride?: Map<string, string>;
+  /** The receipts read throws (`receipts-unavailable`). */
+  readonly receiptsThrow?: boolean;
+}
+
+/**
+ * The combined conducted-facts dependency set: one store of runs, journals,
+ * attempts, receipts and forge reads that the REAL readers consume. Every
+ * conformance run's journal carries a `gate-passed` result at its own head
+ * (rule 2) and — when `premergeAtIso` is set — a premerge success posted
+ * before the merge (rule 5); every gate head's journal carries a completed
+ * `push` (so the head reached the pull request) and its conductor gate
+ * verdict. Conformance runs pass rules 3/4 through default passing receipts.
+ */
+function conductedFacts(options: ConductedOptions): ShadowConformanceRunsDependencies & ShadowGateHeadsDependencies {
+  const runs: Record<string, unknown>[] = [];
+  const journals = new Map<string, LaneRunJournalEntryRecord[]>();
+  const attempts = new Map<string, { readonly artifacts: { readonly headCommit: string } | null }>();
+  const receiptsByAttempt = new Map<string, readonly { kind: string; result: string }[]>();
+  const ciBySha = new Map<string, string>();
+  for (const spec of options.gateHeads ?? []) {
+    ciBySha.set(spec.headOid, spec.ciGate);
+  }
+  let nextRun = 0;
+
+  for (const spec of options.conformanceRuns ?? []) {
+    const id = runId(100 + (nextRun += 1));
+    runs.push({ runId: id, prNumber: spec.pr, tier: spec.tier, attemptIds: [`att-${spec.pr}`] });
+    attempts.set(`att-${spec.pr}`, { artifacts: { headCommit: spec.headOid } });
+    const entries = [
+      journalEntry({
+        kind: 'result',
+        key: stepKey(id, 'gate', spec.headOid),
+        outcome: 'completed',
+        reasonCode: 'gate-passed',
+        recordedAtIso: `${DAY}T08:00:00Z`,
+      }),
+    ];
+    if (spec.premergeAtIso !== null) {
+      entries.push(
+        journalEntry({
+          kind: 'result',
+          key: premergeKey(id, spec.headOid),
+          outcome: 'completed',
+          reasonCode: 'premerge-success',
+          recordedAtIso: spec.premergeAtIso,
+        }),
+      );
+    }
+    journals.set(id, entries);
+    const reviews: { kind: string; result: string }[] = [{ kind: 'code-review', result: 'pass' }];
+    if (spec.tier === 2) {
+      reviews.push({ kind: 'pre-merge', result: 'pass' });
+    }
+    receiptsByAttempt.set(`att-${spec.pr}`, reviews);
+  }
+
+  for (const [index, spec] of (options.gateHeads ?? []).entries()) {
+    const id = runId(100 + (nextRun += 1));
+    runs.push({ runId: id, prNumber: 100_000 + index, tier: 1, attemptIds: [`att-g${index}`] });
+    attempts.set(`att-g${index}`, { artifacts: { headCommit: spec.headOid } });
+    journals.set(id, [
+      journalEntry({
+        kind: 'result',
+        key: stepKey(id, 'push', spec.headOid),
+        outcome: 'completed',
+        recordedAtIso: spec.pushedAtIso,
+      }),
+      journalEntry({
+        kind: 'result',
+        key: stepKey(id, 'gate', spec.headOid),
+        outcome: 'completed',
+        reasonCode: spec.conductorVerdict === 'pass' ? 'gate-passed' : 'gate-failed',
+        recordedAtIso: spec.pushedAtIso,
+      }),
+    ]);
+  }
+
+  return {
+    runs: { list: async () => runs } as unknown as ShadowConformanceRunsDependencies['runs'],
+    journal: {
+      listForRuns: async (ids: readonly string[]) => {
+        const grouped = new Map<string, readonly LaneRunJournalEntryRecord[]>();
+        for (const id of ids) {
+          const entries = journals.get(id);
+          if (entries === undefined) {
+            throw new Error(`fixture journal missing for ${id.length} char id`);
+          }
+          grouped.set(id, entries);
+        }
+        return grouped;
+      },
+    } as unknown as ShadowConformanceRunsDependencies['journal'],
+    attempts: {
+      findAttemptById: async (attemptId: string) => attempts.get(attemptId) ?? null,
+    } as unknown as ShadowConformanceRunsDependencies['attempts'],
+    receipts: {
+      readReceiptsForHead: async (attemptId: string, headSha: string) => {
+        if (options.receiptsThrow) {
+          throw new Error('receipt store failed');
+        }
+        return {
+          outcome: 'found' as const,
+          verification: [],
+          review: (receiptsByAttempt.get(attemptId) ?? []).map((receipt) => ({
+            kind: receipt.kind,
+            result: receipt.result,
+            headSha,
+          })),
+        };
+      },
+    } as unknown as ShadowConformanceRunsDependencies['receipts'],
+    forge: {
+      readCommitContext: async (command: { headSha: string }) => {
+        if (options.forgeOutcome === 'unavailable') {
+          return { outcome: 'unavailable' };
+        }
+        return {
+          outcome: 'found' as const,
+          headSha: command.headSha,
+          state: options.ciOverride?.get(command.headSha) ?? ciBySha.get(command.headSha) ?? 'success',
+        };
+      },
+    } as unknown as ShadowGateHeadsDependencies['forge'],
+    nowIso: () => NOW,
+  };
+}
+
+/** The chain store S7 lists: one fake record per given state, or a failing store. */
+function chainStore(
+  statesOrFailure: readonly string[] | 'throws' | 'unreadable',
+): Pick<ChainRepositoryPort, 'listChains'> {
+  return {
+    listChains: async () => {
+      if (statesOrFailure === 'throws') {
+        throw new Error('chain store failed');
+      }
+      if (statesOrFailure === 'unreadable') {
+        return { status: 'unreadable' as const, reason: 'store-unreadable' };
+      }
+      return {
+        status: 'ok' as const,
+        records: statesOrFailure.map((state) => ({ state })) as never,
+      };
+    },
+  };
+}
+
+/** The five merged pull requests whose conducted runs pass S6's floor. */
+const CONFORMANCE_PRS: readonly { pr: number; tier: 1 | 2 }[] = [
+  { pr: 7, tier: 1 },
+  { pr: 8, tier: 1 },
+  { pr: 9, tier: 1 },
+  { pr: 10, tier: 2 },
+  { pr: 11, tier: 2 },
+];
+
+function conformanceHeadOid(pr: number): string {
+  return oid(500 + pr);
+}
+
+function conformanceMergeAtIso(pr: number): string {
+  return `${DAY}T09:${String(10 + pr).padStart(2, '0')}:00Z`;
+}
+
+/**
+ * A clean fixture extended to five in-window shell merges (pr 7 from the
+ * clean fixture at 10:00, pr 8..11 earlier), each matched by a fleet journal
+ * merge entry, so S1 still passes while S6' has five merged runs.
+ */
+function conformingFixture(): Fixture {
+  const fixture = cleanFixture(DAY);
+  for (const { pr } of CONFORMANCE_PRS) {
+    if (pr === 7) {
+      continue;
+    }
+    const headOid = conformanceHeadOid(pr);
+    const atIso = conformanceMergeAtIso(pr);
+    fixture.shellLines.push(shellResultLine(atIso, pr, headOid));
+    const key = mergeKeyFor(pr, headOid);
+    fixture.journalEntries.push(
+      journalEntry({
+        kind: 'intent',
+        key,
+        recordedAtIso: new Date(Date.parse(atIso) - 60_000).toISOString(),
+      }),
+      journalEntry({
+        kind: 'result',
+        key,
+        outcome: 'dry-run',
+        reasonCode: 'would-merge',
+        recordedAtIso: new Date(Date.parse(atIso) + 30_000).toISOString(),
+      }),
+    );
+    // S1 resolves a journaled would-merge's head against the LIVE queue
+    // entries, so each extra merged pull request must also be live — on all
+    // three S8 sides at once (shell queue line, fleet queue entry, import
+    // dry-run key), or S8 would report a divergence instead.
+    fixture.queueEntries.push({
+      entryId: ulid(20 + pr),
+      pullRequest: pr,
+      headOid,
+      state: 'queued',
+      repository: REPOSITORY,
+      repoDigest: REPO_DIGEST,
+    } as unknown as MergeQueueEntryRecord);
+    fixture.shellState = {
+      ...fixture.shellState,
+      queue: { status: 'read', lines: [...fixture.shellState.queue.status === 'read' ? fixture.shellState.queue.lines : [], `${pr} ${headOid} main`] },
+    };
+    fixture.importKeys.push({ pullRequest: pr, headOid, base: 'main', source: 'queue', disposition: 'would-import' });
+  }
+  return fixture;
+}
+
+function conformanceRunSpecs(): ConformanceRunSpec[] {
+  return CONFORMANCE_PRS.map(({ pr, tier }) => ({
+    pr,
+    tier,
+    headOid: pr === 7 ? HEAD_A : conformanceHeadOid(pr),
+    premergeAtIso: `${DAY}T08:0${pr - 7}:00Z`,
+  }));
+}
+
+/** Thirty agreeing gate heads (conductor pass, CI success), pushed on day D. */
+function agreeingGateHeads(seed: number, count = 30): GateHeadSpec[] {
+  return Array.from({ length: count }, (_, index) => ({
+    headOid: oid(seed + index),
+    conductorVerdict: 'pass' as const,
+    pushedAtIso: `${DAY}T07:${String(index).padStart(2, '0')}:00Z`,
+    ciGate: 'success',
+  }));
+}
+
+/**
+ * `RecordShadowDayDependencies` declares the optional new dependencies
+ * readonly, so tests set them through these escape hatches.
+ */
+function setConducted(
+  harness: Harness,
+  facts: ShadowConformanceRunsDependencies & ShadowGateHeadsDependencies,
+  repository: { readonly owner: string; readonly repo: string } = REPOSITORY,
+): void {
+  (harness.deps as { conducted?: NonNullable<RecordShadowDayDependencies['conducted']> }).conducted = { repository, facts };
+}
+
+function setChains(harness: Harness, chains: Pick<ChainRepositoryPort, 'listChains'> | undefined): void {
+  (harness.deps as { chains?: Pick<ChainRepositoryPort, 'listChains'> }).chains = chains;
+}
+
+/** The fully wired harness for the passing fixture. */
+function wiredHarness(fixture: Fixture, options: ConductedOptions = {}, chainStates: readonly string[] = ['landed', 'refused']): Harness {
+  const harness = makeHarness(fixture, NOW);
+  setConducted(harness, conductedFacts(options));
+  setChains(harness, chainStore(chainStates));
+  return harness;
 }
 
 /** Every not-yet-built criterion is always in `unevaluated`, exactly once. */
@@ -1395,5 +1781,469 @@ describe('RecordShadowDayUseCase', () => {
         expect(evaluated.has(criterion)).toBe(false);
       }
     }
+  });
+
+  /* ----------------------------------------------------------------------
+   * SH19a: S4', S6' and S7.
+   * ---------------------------------------------------------------------- */
+
+  it('records S1, S4, S6, S7, S8, S9 and S12 as passes in one CAS when every new dependency is wired', async () => {
+    const gateHeads = agreeingGateHeads(0);
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads,
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    expect(result.outcome).toBe('recorded');
+    expect(result.recorded).toEqual({
+      S1: 'pass',
+      S4: 'pass',
+      S6: 'pass',
+      S7: 'pass',
+      S8: 'pass',
+      S9: 'pass',
+      S12: 'pass',
+    });
+    expect(result.revision).toBe(1);
+    expect(harness.evidence.calls.cas).toBe(1);
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S4).toEqual({
+      verdict: 'pass',
+      reason: 'gate-verdicts-agree',
+      digest: expectedS4Digest(DAY, 'pass', 'gate-verdicts-agree', {
+        compared: 30,
+        agreeing: 30,
+        falsePasses: 0,
+        stricterFails: 0,
+      }, gateHeads),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(dayRecord?.verdicts.S6).toEqual({
+      verdict: 'pass',
+      reason: 'conducted-runs-conform',
+      digest: expectedS6Digest(DAY, 'pass', 'conducted-runs-conform'),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(dayRecord?.verdicts.S7).toEqual({
+      verdict: 'pass',
+      reason: 'chains-not-kept',
+      digest: expectedS7Digest(DAY, 'pass', 'chains-not-kept'),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('keeps the S1, S8, S9 and S12 digests byte-identical to origin/main when no new dependency is wired', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded).toEqual({ S1: 'pass', S8: 'pass', S9: 'pass', S12: 'pass' });
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S1?.digest).toBe(expectedS1Digest(DAY, 'pass', 'merge-set-equal', {
+      mergesCompared: 1,
+      excludedBatchMerges: 0,
+      compared: 1,
+      divergences: 0,
+    }));
+    expect(dayRecord?.verdicts.S8?.digest).toBe(expectedS8Digest(DAY, 'pass', 'intake-equal'));
+    expect(dayRecord?.verdicts.S9?.digest).toBe(expectedS9Digest(DAY, 'pass', 'state-consistent', {
+      journalKeys: 1,
+      duplicateIntents: 0,
+      duplicateResults: 0,
+      resultsAfterFinal: 0,
+      orphanResults: 0,
+    }));
+    expect(dayRecord?.verdicts.S12?.digest).toBe(expectedS12Digest(DAY, 'pass', 'ticks-within-budget', {
+      totalTicks: 800,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    }));
+  });
+
+  it('answers unchanged on a rerun with identical facts and every new dependency wired, without a second CAS', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    await useCase.execute(makeRequest());
+    const afterFirst = harness.evidence.stored;
+    const casCallsAfterFirst = harness.evidence.calls.cas;
+
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+    expectRecorded(result);
+    expect(result.outcome).toBe('unchanged');
+    expect(result.revision).toBe(1);
+    expect(harness.evidence.calls.cas).toBe(casCallsAfterFirst);
+    expect(harness.evidence.stored).toEqual(afterFirst);
+  });
+
+  it('reports S4 and S6 as not-wired when the conducted dependency is absent, leaving the others unchanged', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    setChains(harness, chainStore(['landed', 'refused']));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded).toEqual({ S1: 'pass', S7: 'pass', S8: 'pass', S9: 'pass', S12: 'pass' });
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S4')).toBe('not-wired');
+    expect(reasons.get('S6')).toBe('not-wired');
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('reports S7 as not-wired when the chains dependency is absent, leaving S4 and S6 passing', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setChains(harness, undefined);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded).toEqual({
+      S1: 'pass', S4: 'pass', S6: 'pass', S8: 'pass', S9: 'pass', S12: 'pass',
+    });
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S7')).toBe('not-wired');
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('reports S4 and S6 as repository-not-conducted when the request repository differs from the conducted repository', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setConducted(
+      harness,
+      conductedFacts({ gateHeads: agreeingGateHeads(0), conformanceRuns: conformanceRunSpecs() }),
+      { owner: 'other', repo: 'train' },
+    );
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded).toEqual({
+      S1: 'pass', S7: 'pass', S8: 'pass', S9: 'pass', S12: 'pass',
+    });
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S4')).toBe('repository-not-conducted');
+    expect(reasons.get('S6')).toBe('repository-not-conducted');
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('reports S4 unevaluated with the reader reason when the forge read is unavailable, still passing S6', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+      forgeOutcome: 'unavailable',
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S4).toBeUndefined();
+    expect(result.recorded.S6).toBe('pass');
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S4')).toBe('forge-unavailable');
+  });
+
+  it('reports S4 unevaluated (gate-comparison-incomplete) for more than 50 diverging heads through the real evaluator', async () => {
+    const diverging = Array.from({ length: 51 }, (_, index) => ({
+      headOid: oid(2_000 + index),
+      conductorVerdict: 'fail' as const,
+      pushedAtIso: `${DAY}T07:${String(index).padStart(2, '0')}:00Z`,
+      ciGate: 'success',
+    }));
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: diverging,
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S4).toBeUndefined();
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S4')).toBe('gate-comparison-incomplete');
+  });
+
+  it('reports S4 unevaluated (gate-heads-unsettled), never a pass, when a passing evaluation carries one unsettled head', async () => {
+    const gateHeads = [
+      ...agreeingGateHeads(0),
+      { headOid: oid(900), conductorVerdict: 'pass' as const, pushedAtIso: `${DAY}T07:30:00Z`, ciGate: 'pending' },
+    ];
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads,
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S4).toBeUndefined();
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S4')).toBe('gate-heads-unsettled');
+  });
+
+  it('reports S4 unevaluated (gate-heads-unsettled) when a failing evaluation carries one unsettled head', async () => {
+    const gateHeads = [
+      { headOid: oid(901), conductorVerdict: 'fail' as const, pushedAtIso: `${DAY}T07:00:00Z`, ciGate: 'success' },
+      { headOid: oid(900), conductorVerdict: 'pass' as const, pushedAtIso: `${DAY}T07:01:00Z`, ciGate: 'pending' },
+    ];
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads,
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S4).toBeUndefined();
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S4')).toBe('gate-heads-unsettled');
+  });
+
+  it('gives two S4 passes with equal counts but different head oids different digests', async () => {
+    const headsA = agreeingGateHeads(0);
+    const headsB = agreeingGateHeads(1_000);
+    const harnessA = wiredHarness(conformingFixture(), { gateHeads: headsA, conformanceRuns: conformanceRunSpecs() });
+    const harnessB = wiredHarness(conformingFixture(), { gateHeads: headsB, conformanceRuns: conformanceRunSpecs() });
+    const resultA = await new RecordShadowDayUseCase(harnessA.deps).execute(makeRequest());
+    const resultB = await new RecordShadowDayUseCase(harnessB.deps).execute(makeRequest());
+    expectRecorded(resultA);
+    expectRecorded(resultB);
+    expect(resultA.recorded.S4).toBe('pass');
+    expect(resultB.recorded.S4).toBe('pass');
+    const digestA = harnessA.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S4?.digest;
+    const digestB = harnessB.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S4?.digest;
+    const counts = { compared: 30, agreeing: 30, falsePasses: 0, stricterFails: 0 };
+    expect(digestA).toBe(expectedS4Digest(DAY, 'pass', 'gate-verdicts-agree', counts, headsA));
+    expect(digestB).toBe(expectedS4Digest(DAY, 'pass', 'gate-verdicts-agree', counts, headsB));
+    expect(digestA).not.toBe(digestB);
+  });
+
+  it('refuses a rerun whose S4 head later changed CI state with verdict-conflict and leaves the ledger untouched', async () => {
+    const ciOverride = new Map<string, string>();
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+      ciOverride,
+    });
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    expect(first.recorded.S4).toBe('pass');
+    const before = harness.evidence.stored;
+
+    // A later CI change on one settled head flips S4 from pass to a false
+    // pass on day D while the counts' shape changes too: a deliberate
+    // verdict-conflict, never a silent overwrite.
+    ciOverride.set(oid(0), 'failure');
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'verdict-conflict' });
+    expect(harness.evidence.stored).toEqual(before);
+    expect(harness.evidence.stored?.revision).toBe(1);
+  });
+
+  it('records S4 as a fail (gate-false-pass) for a false pass pushed on day D', async () => {
+    const gateHeads = [
+      { headOid: oid(7), conductorVerdict: 'pass' as const, pushedAtIso: `${DAY}T07:00:00Z`, ciGate: 'failure' },
+    ];
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads,
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S4).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S4).toEqual({
+      verdict: 'fail',
+      reason: 'gate-false-pass',
+      digest: expectedS4Digest(DAY, 'fail', 'gate-false-pass', {
+        compared: 1,
+        agreeing: 0,
+        falsePasses: 1,
+        stricterFails: 0,
+      }, gateHeads),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+  });
+
+  it('reports S6 unevaluated (shell-events-unavailable) when the shell events read is unavailable', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    delete (harness.deps.legacy as unknown as Partial<Record<string, unknown>>).readLegacyTrainEvents;
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S6).toBeUndefined();
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S6')).toBe('shell-events-unavailable');
+  });
+
+  it('reports S6 unevaluated (shell-events-unavailable) when the shell events carry unknown lines', async () => {
+    const fixture = conformingFixture();
+    fixture.shellLines.push('not an event line');
+    const harness = wiredHarness(fixture, {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S6).toBeUndefined();
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S6')).toBe('shell-events-unavailable');
+  });
+
+  it('keeps closed day D S6 unchanged when a D+1 incomplete head move would otherwise alter the facts (day-end filter)', async () => {
+    // The run's collected head differs from the merged head with no linking
+    // head move, so S6 fails with `merged-head-unlinked`. A D+1 incomplete
+    // head move for the same pull request, if not filtered to the day's own
+    // end, would list the pull request in `headMovesIncompleteFor` and flip
+    // the outcome to unknown (`head-moves-incomplete`) — a verdict change on
+    // a closed day.
+    const fixture = cleanFixture(DAY);
+    const harness = wiredHarness(fixture, {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: [{ pr: 7, tier: 1, headOid: HEAD_B, premergeAtIso: null }],
+    });
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    expect(first.recorded.S6).toBe('fail');
+    const before = harness.evidence.stored;
+
+    fixture.shellLines.push(
+      JSON.stringify({ at: '2026-11-17T01:00:00Z', kind: 'head-moved', outcome: 'moved', pr: 7, headOid: HEAD_A, detail: 'x' }),
+    );
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expectRecorded(result);
+    expect(result.outcome).toBe('unchanged');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S6).toEqual({
+      verdict: 'fail',
+      reason: 'merged-head-unlinked',
+      digest: expectedS6Digest(DAY, 'fail', 'merged-head-unlinked'),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(harness.evidence.stored).toEqual(before);
+  });
+
+  it('reports S6 unevaluated (shell-merges-incomplete) for an unresolved merge inside the trailing window', async () => {
+    const fixture = conformingFixture();
+    fixture.shellLines.push(
+      JSON.stringify({ at: '2026-11-15T10:00:00Z', kind: 'result', outcome: 'merged', pr: 0, headOid: '' }),
+    );
+    const harness = wiredHarness(fixture, {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S6).toBeUndefined();
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S6')).toBe('shell-merges-incomplete');
+  });
+
+  it('reports S6 unevaluated with the reader reason when the receipts read is unavailable', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+      receiptsThrow: true,
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S6).toBeUndefined();
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S6')).toBe('receipts-unavailable');
+  });
+
+  it('reports S7 unevaluated (chain-state-unreadable), never a pass, when either side is unreadable', async () => {
+    // The chain store throws.
+    const throwing = wiredHarness(cleanFixture(DAY), {});
+    setChains(throwing, chainStore('throws'));
+    const thrownResult = await new RecordShadowDayUseCase(throwing.deps).execute(makeRequest());
+    expectRecorded(thrownResult);
+    const thrownReasons = new Map(thrownResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(thrownReasons.get('S7')).toBe('chain-state-unreadable');
+
+    // The chain store answers unreadable.
+    const unreadable = wiredHarness(cleanFixture(DAY), {});
+    setChains(unreadable, chainStore('unreadable'));
+    const unreadableResult = await new RecordShadowDayUseCase(unreadable.deps).execute(makeRequest());
+    expectRecorded(unreadableResult);
+    const unreadableReasons = new Map(unreadableResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(unreadableReasons.get('S7')).toBe('chain-state-unreadable');
+
+    // The shell side's chains read is unreadable.
+    const shellUnreadableFixture = cleanFixture(DAY);
+    shellUnreadableFixture.shellState = {
+      ...shellUnreadableFixture.shellState,
+      chains: { status: 'unreadable' },
+    };
+    const shellUnreadable = wiredHarness(shellUnreadableFixture, {});
+    const shellResult = await new RecordShadowDayUseCase(shellUnreadable.deps).execute(makeRequest());
+    expectRecorded(shellResult);
+    const shellReasons = new Map(shellResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(shellReasons.get('S7')).toBe('chain-state-unreadable');
+  });
+
+  it('gives two S7 runs with different live fleet and shell counts and the same verdict the same digest', async () => {
+    // Side A: one inactive fleet chain and one active shell chain
+    // (fleetActive 0, shellActive 1). Side B: three fleet chains, one active
+    // (fleetActive 1), shell absent (shellActive 0). Same status/reason, so
+    // the base-only digest must be equal.
+    const shellActiveFixture = cleanFixture(DAY);
+    shellActiveFixture.shellState = {
+      ...shellActiveFixture.shellState,
+      chains: { status: 'read', chains: [{ name: 'chain-a', lines: [] }] },
+    };
+    const harnessA = wiredHarness(shellActiveFixture, {}, ['landed']);
+    const harnessB = wiredHarness(cleanFixture(DAY), {}, ['landed', 'refused', 'started']);
+    const resultA = await new RecordShadowDayUseCase(harnessA.deps).execute(makeRequest());
+    const resultB = await new RecordShadowDayUseCase(harnessB.deps).execute(makeRequest());
+    expectRecorded(resultA);
+    expectRecorded(resultB);
+    expect(resultA.recorded.S7).toBe('fail');
+    expect(resultB.recorded.S7).toBe('fail');
+    const digestA = harnessA.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S7?.digest;
+    const digestB = harnessB.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S7?.digest;
+    expect(digestA).toBe(expectedS7Digest(DAY, 'fail', 'chain-active-while-retired'));
+    expect(digestB).toBe(expectedS7Digest(DAY, 'fail', 'chain-active-while-retired'));
+    expect(digestA).toBe(digestB);
+  });
+
+  it('fails S7 (chain-active-while-retired) for an active shell or fleet chain, and defers an older day', async () => {
+    // An active shell chain fails the day even with no fleet chains.
+    const shellActiveFixture = cleanFixture(DAY);
+    shellActiveFixture.shellState = {
+      ...shellActiveFixture.shellState,
+      chains: { status: 'read', chains: [{ name: 'chain-a', lines: [] }] },
+    };
+    const shellHarness = wiredHarness(shellActiveFixture, {}, ['landed', 'refused']);
+    const shellResult = await new RecordShadowDayUseCase(shellHarness.deps).execute(makeRequest());
+    expectRecorded(shellResult);
+    expect(shellResult.recorded.S7).toBe('fail');
+    const shellDay = shellHarness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(shellDay?.verdicts.S7?.reason).toBe('chain-active-while-retired');
+
+    // An active fleet chain fails the day too.
+    const fleetHarness = wiredHarness(cleanFixture(DAY), {}, ['landed', 'intent-recorded']);
+    const fleetResult = await new RecordShadowDayUseCase(fleetHarness.deps).execute(makeRequest());
+    expectRecorded(fleetResult);
+    expect(fleetResult.recorded.S7).toBe('fail');
+
+    // An older day is only ever deferred: no live snapshot is taken for it.
+    const olderDay = '2026-11-15';
+    const olderHarness = wiredHarness(cleanFixture(olderDay), {}, ['landed', 'refused']);
+    const olderResult = await new RecordShadowDayUseCase(olderHarness.deps).execute(makeRequest({ day: olderDay }));
+    expectRecorded(olderResult);
+    const reasons = new Map(olderResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S7')).toBe('snapshot-only-for-yesterday');
+  });
+
+  it('reads the shell events once and the shell state exactly twice per run with every new dependency wired', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(harness.otherCalls.legacy).toBe(1);
+    expect(harness.otherCalls.legacyState).toBe(2);
   });
 });

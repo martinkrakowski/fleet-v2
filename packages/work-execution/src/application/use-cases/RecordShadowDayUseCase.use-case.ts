@@ -1,8 +1,10 @@
 // Lane SH7b: the shadow day-writer. For one UTC day it evaluates every
 // criterion this chain can currently compute from data that already exists —
-// S1 (merge set, SH5a), S8 (two-sample intake, yesterday only, SH5c), S9
-// (state integrity, yesterday only, SH5b) and S12 (daemon tick health, SH5b)
-// — records each definite pass/fail verdict into
+// S1 (merge set, SH5a), S4' (gate agreement, SH11 over SH18b's head reader),
+// S6' (conducted conformance, SH12a/SH12b over SH18a's runs reader and
+// SH13a's shell facts), S7 (chains retired, SH14), S8 (two-sample intake,
+// yesterday only, SH5c), S9 (state integrity, yesterday only, SH5b) and S12
+// (daemon tick health, SH5b) — records each definite pass/fail verdict into
 // the SH1/SH2 shadow-evidence ledger by compare-and-set, and reports every
 // other criterion as unevaluated: never a pass, never a silent fail. Nothing
 // is ever written to the ledger on any refused or unknown outcome. Every
@@ -15,6 +17,27 @@ import { CUTOVER_SHADOW_CRITERIA, type CutoverShadowCriterion } from '../../doma
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { isMergeQueueEntryLive } from '../../domain/merge-queue-records.js';
 import { evaluateShadowMergeSet, type ShadowDayMergeSetEvaluation } from '../../domain/shadow-day-merge-set.js';
+import {
+  evaluateShadowGateAgreement,
+  type ShadowGateAgreementEvaluation,
+  type ShadowGateHeadFact,
+} from '../../domain/shadow-day-gate-agreement.js';
+import {
+  evaluateShadowConductedConformance,
+  type ShadowConformanceEvaluation,
+} from '../../domain/shadow-day-conformance.js';
+import { extractShadowShellFacts } from '../../domain/shadow-day-shell-facts.js';
+import {
+  evaluateShadowChainsRetired,
+  SHADOW_CHAINS_POLICY,
+  type ShadowChainsRetiredEvaluation,
+} from '../../domain/shadow-day-chains-retired.js';
+import {
+  readShadowConformanceRuns,
+  readShadowGateHeads,
+  type ShadowConformanceRunsDependencies,
+  type ShadowGateHeadsDependencies,
+} from './shadow-day/index.js';
 import {
   evaluateShadowStateIntegrity,
   evaluateShadowTickHealth,
@@ -37,9 +60,14 @@ import type {
   RecordShadowDayResult,
   RecordShadowDayUnevaluated,
 } from '../ports/in/RecordShadowDayPort.in-port.js';
+import type { ChainListResult, ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
 import type { DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
-import type { LegacyTrainFileRead, LegacyTrainStateReadPort } from '../ports/out/LegacyTrainStateReadPort.out-port.js';
+import type {
+  LegacyTrainChainsRead,
+  LegacyTrainFileRead,
+  LegacyTrainStateReadPort,
+} from '../ports/out/LegacyTrainStateReadPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { ShadowEvidencePort } from '../ports/out/ShadowEvidencePort.out-port.js';
 import { isValidRepositoryRef } from './ImportTrainStateUseCase.use-case.js';
@@ -59,7 +87,7 @@ const DEFAULT_SAMPLE_GAP_MS = 150_000;
 
 /** Every criterion no evaluator implements yet; later units add the rest. */
 const NOT_IMPLEMENTED_CRITERIA: readonly CutoverShadowCriterion[] = [
-  'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S10', 'S11', 'S13',
+  'S2', 'S3', 'S5', 'S10', 'S11', 'S13',
 ];
 
 export interface RecordShadowDayDependencies {
@@ -79,6 +107,22 @@ export interface RecordShadowDayDependencies {
   readonly nowIso: () => string;
   /** The owner-accepted OD-1 default (false, fail-closed) is pinned in composition; this use case only receives it. */
   readonly settings: { readonly excludeBatchMerges: boolean; readonly sampleGapMs?: number };
+  /**
+   * The conducted-facts readers (SH18a's runs reader, SH18b's head reader)
+   * and the one repository they are conducted for. Optional until SH19c
+   * wires them into composition; when absent, S4 and S6 report
+   * `not-wired`, and when the request's repository differs, they report
+   * `repository-not-conducted`.
+   */
+  readonly conducted?: {
+    readonly repository: { readonly owner: string; readonly repo: string };
+    readonly facts: ShadowConformanceRunsDependencies & ShadowGateHeadsDependencies;
+  };
+  /**
+   * The chain-record store S7 lists. Optional until SH19c wires it into
+   * composition; when absent, S7 reports `not-wired`.
+   */
+  readonly chains?: Pick<ChainRepositoryPort, 'listChains'>;
 }
 
 /** Thrown by `call` when the deadline is already reached; aborts the whole run. */
@@ -110,6 +154,12 @@ type CriterionOutcome =
       readonly tickHealth?: ShadowTickHealthEvaluation;
       /** Present only for S9: the state-integrity evaluation the counts come from. */
       readonly stateIntegrity?: ShadowStateIntegrityEvaluation;
+      /** Present only for S4': the gate-agreement evaluation and every head it was computed over. */
+      readonly gateAgreement?: { readonly evaluation: ShadowGateAgreementEvaluation; readonly heads: readonly ShadowGateHeadFact[] };
+      /** Present only for S6': the conducted-conformance evaluation. */
+      readonly conformance?: ShadowConformanceEvaluation;
+      /** Present only for S7: the chains-retired evaluation. */
+      readonly chainsRetired?: ShadowChainsRetiredEvaluation;
     }
   | { readonly criterion: CutoverShadowCriterion; readonly kind: 'unevaluated'; readonly reason: string };
 
@@ -266,11 +316,18 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     }
     const releaseSha = await this.readRelease(context.deadlineIso);
     const journal = await this.readJournal(context);
+    // The shell events are read once and shared by S1 and S6', so
+    // `readLegacyTrainEvents` is never called twice in one run.
+    const shell = await this.readShellEvents(context);
+    const intake = await this.evaluateIntakeCriterion(context);
     const outcomes = [
-      await this.evaluateMergeSetCriterion(context, journal),
-      await this.evaluateIntakeCriterion(context),
+      await this.evaluateMergeSetCriterion(context, journal, shell),
+      intake.outcome,
       await this.evaluateStateIntegrityCriterion(context, journal),
       await this.evaluateTickHealthCriterion(context),
+      await this.evaluateGateAgreementCriterion(context),
+      await this.evaluateConformanceCriterion(context, shell),
+      await this.evaluateChainsRetiredCriterion(context, intake.chains),
     ];
     const built = this.buildVerdicts(context, outcomes);
     return this.writeDay(context, ledger.ledger, releaseSha, built);
@@ -376,7 +433,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     return new Date(Date.parse(this.deps.nowIso()) + 60_000).toISOString();
   }
 
-  /** The parsed shell train events, or the reason S1 is unevaluated. */
+  /** The parsed shell train events, or the reason S1/S6' is unevaluated. */
   private async readShellEvents(
     context: DayContext,
   ): Promise<{ readonly events: readonly ShellTrainEvent[]; readonly unknownLines: number } | string> {
@@ -421,8 +478,11 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
   }
 
   /** S1: the day's merge set, shell events against the fleet's journaled would-merges. */
-  private async evaluateMergeSetCriterion(context: DayContext, journal: JournalRead): Promise<CriterionOutcome> {
-    const shell = await this.readShellEvents(context);
+  private async evaluateMergeSetCriterion(
+    context: DayContext,
+    journal: JournalRead,
+    shell: { readonly events: readonly ShellTrainEvent[]; readonly unknownLines: number } | string,
+  ): Promise<CriterionOutcome> {
     if (typeof shell === 'string') {
       return unevaluatedOutcome('S1', shell);
     }
@@ -521,9 +581,18 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * (`'absent'`): that is a confident, known-empty read, exactly as
    * `cutover.ts`'s own handling of `shellState.batch.status`/
    * `batchesEnabled.status` treats it (`status === 'absent' ? 0 : ...`).
+   *
+   * The shell state's `chains` read is returned beside the sample (not added
+   * to it, because `evaluateShadowIntake` reads samples with
+   * `readExactPlainRecord`'s exact-key rule): S7 consumes it as the shell
+   * side's chain names, taken from the second sample — the read closest to
+   * recording.
    */
-  private async intakeSample(context: DayContext): Promise<IntakeSample> {
+  private async intakeSample(
+    context: DayContext,
+  ): Promise<{ readonly sample: IntakeSample; readonly chains: LegacyTrainChainsRead | undefined }> {
     const takenAtIso = this.deps.nowIso();
+    let chains: LegacyTrainChainsRead | undefined;
     let queueKeys: readonly IntakeKey[] = [];
     let parkedKeys: readonly IntakeKey[] = [];
     let inprogressKeys: readonly IntakeKey[] = [];
@@ -533,6 +602,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       () => this.deps.legacy.readLegacyTrainState({ stateDir: context.legacyStateDir }),
     );
     if (stateRead.kind === 'value') {
+      chains = stateRead.value.chains;
       const queueParsed = this.parsedShellSource(stateRead.value.queue, false);
       const parkedParsed = this.parsedShellSource(stateRead.value.parked, true);
       const inprogressParsed = this.parsedShellSource(stateRead.value.inprogress, false);
@@ -595,14 +665,22 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       // must not be allowed to manufacture a persistent, false divergence.
       complete = complete && !importRead.value.keysTruncated;
     }
-    return { takenAtIso, complete, shellLive, fleetLive, importPresent, importUnknownLines };
+    return { sample: { takenAtIso, complete, shellLive, fleetLive, importPresent, importUnknownLines }, chains };
   }
 
-  /** S8: the two-sample intake check, sampled only while the day is still yesterday. */
-  private async evaluateIntakeCriterion(context: DayContext): Promise<CriterionOutcome> {
+  /**
+   * S8: the two-sample intake check, sampled only while the day is still
+   * yesterday. The second sample's shell `chains` read rides along for S7,
+   * so S7 never needs a third `readLegacyTrainState` call; it is `undefined`
+   * when S8 short-circuits (then S7 short-circuits on its own day check
+   * too) or when the sample's state read failed.
+   */
+  private async evaluateIntakeCriterion(
+    context: DayContext,
+  ): Promise<{ readonly outcome: CriterionOutcome; readonly chains: LegacyTrainChainsRead | undefined }> {
     const nowSerial = Math.floor(Date.parse(this.deps.nowIso()) / DAY_MS);
     if (context.day !== utcDayOfSerial(nowSerial - 1)) {
-      return unevaluatedOutcome('S8', 'snapshot-only-for-yesterday');
+      return { outcome: unevaluatedOutcome('S8', 'snapshot-only-for-yesterday'), chains: undefined };
     }
     const first = await this.intakeSample(context);
     // A real wall-clock gap, matching SH5c's persistence intent: two
@@ -610,8 +688,11 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // divergence that resolves itself immediately after.
     await this.deps.sleep(this.deps.settings.sampleGapMs ?? DEFAULT_SAMPLE_GAP_MS);
     const second = await this.intakeSample(context);
-    const evaluation = evaluateShadowIntake({ samples: [first, second] });
-    return { criterion: 'S8', kind: 'evaluated', evaluation, intake: evaluation };
+    const evaluation = evaluateShadowIntake({ samples: [first.sample, second.sample] });
+    return {
+      outcome: { criterion: 'S8', kind: 'evaluated', evaluation, intake: evaluation },
+      chains: second.chains,
+    };
   }
 
   /** The state-check sample, or null when unavailable. */
@@ -667,6 +748,183 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     return { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
   }
 
+  /** The request's repository is exactly the repository the conducted facts were read for. */
+  private repositoryIsConducted(context: DayContext): boolean {
+    const conducted = this.deps.conducted;
+    return (
+      conducted !== undefined &&
+      conducted.repository.owner === context.repository.owner &&
+      conducted.repository.repo === context.repository.repo
+    );
+  }
+
+  /**
+   * S4': conductor gate verdicts against the CI `gate` context over the
+   * trailing three UTC days, through SH18b's head reader and SH11's
+   * evaluator. An unsettled head (any CI state but success/failure) blocks
+   * the day regardless of the evaluation's status: a `fail` recorded with
+   * pending heads is not closed-day stable — `too-few-agreeing-heads` can
+   * flip to pass and a `gate-false-pass` would carry a different
+   * `headsDigest`, each a permanent day-wide `verdict-conflict`.
+   */
+  private async evaluateGateAgreementCriterion(context: DayContext): Promise<CriterionOutcome> {
+    const conducted = this.deps.conducted;
+    if (conducted === undefined) {
+      return unevaluatedOutcome('S4', 'not-wired');
+    }
+    if (!this.repositoryIsConducted(context)) {
+      return unevaluatedOutcome('S4', 'repository-not-conducted');
+    }
+    const read = await this.call(context.deadlineIso, () =>
+      readShadowGateHeads(conducted.facts, {
+        day: context.day,
+        repository: context.repository,
+        deadlineIso: this.queryDeadline(context),
+      }),
+    );
+    // Defensive: the real reader never rejects (it turns every internal
+    // failure into a typed `unknown` result); this guards future changes.
+    if (read.kind === 'threw') {
+      return unevaluatedOutcome('S4', 'gate-heads-read-failed');
+    }
+    if (read.value.status === 'unknown') {
+      return unevaluatedOutcome('S4', read.value.reason);
+    }
+    const evaluation = evaluateShadowGateAgreement({ day: context.day, heads: read.value.heads });
+    if (evaluation.unsettled > 0) {
+      return unevaluatedOutcome('S4', 'gate-heads-unsettled');
+    }
+    if (evaluation.status === 'unknown') {
+      return unevaluatedOutcome('S4', evaluation.reason);
+    }
+    return {
+      criterion: 'S4',
+      kind: 'evaluated',
+      evaluation,
+      gateAgreement: { evaluation, heads: read.value.heads },
+    };
+  }
+
+  /**
+   * S6': conducted-run conformance over the day's shell merges, through
+   * SH13a's shell-facts extractor and SH18a's runs reader. The shell events
+   * are first filtered to the recorded day's own end, so a later event on
+   * D+1 can never alter `headMovesIncompleteFor` or the extracted facts of a
+   * closed day. The window `[D-2 00:00Z, D+1 00:00Z)` bounds both the
+   * `unresolved-merge` anomaly check and the merged pull requests passed to
+   * the reader.
+   */
+  private async evaluateConformanceCriterion(
+    context: DayContext,
+    shell: { readonly events: readonly ShellTrainEvent[]; readonly unknownLines: number } | string,
+  ): Promise<CriterionOutcome> {
+    const conducted = this.deps.conducted;
+    if (conducted === undefined) {
+      return unevaluatedOutcome('S6', 'not-wired');
+    }
+    if (!this.repositoryIsConducted(context)) {
+      return unevaluatedOutcome('S6', 'repository-not-conducted');
+    }
+    if (typeof shell === 'string' || shell.unknownLines > 0) {
+      return unevaluatedOutcome('S6', 'shell-events-unavailable');
+    }
+    const daySerial = serialOfUtcDay(context.day);
+    const windowEndMs = (daySerial + 1) * DAY_MS;
+    const boundedEvents: ShellTrainEvent[] = [];
+    for (const event of shell.events) {
+      const atMs = Date.parse(event.atIso);
+      // Defensive: `parseShellTrainEvents` only emits valid `atIso`; this
+      // guards future changes to that parser rather than silently dropping
+      // an unparseable instant from a closed day's evidence.
+      if (Number.isNaN(atMs)) {
+        return unevaluatedOutcome('S6', 'shell-facts-invalid');
+      }
+      if (atMs < windowEndMs) {
+        boundedEvents.push(event);
+      }
+    }
+    const extracted = extractShadowShellFacts(boundedEvents);
+    // Defensive: unreachable on `parseShellTrainEvents`'s own output (each
+    // event is already in shape); this guards future parser changes rather
+    // than passing an empty fact set as real evidence.
+    if (!extracted.ok) {
+      return unevaluatedOutcome('S6', 'shell-facts-invalid');
+    }
+    const facts = extracted.facts;
+    const windowStartMs = (daySerial - 2) * DAY_MS;
+    const inWindow = (atIso: string): boolean => {
+      const instant = Date.parse(atIso);
+      return instant >= windowStartMs && instant < windowEndMs;
+    };
+    if (facts.anomalies.some((anomaly) => anomaly.code === 'unresolved-merge' && inWindow(anomaly.atIso))) {
+      return unevaluatedOutcome('S6', 'shell-merges-incomplete');
+    }
+    const mergedPullRequests = [...new Set(facts.merges.filter((merge) => inWindow(merge.atIso)).map((merge) => merge.pullRequest))];
+    const read = await this.call(context.deadlineIso, () =>
+      readShadowConformanceRuns(conducted.facts, { mergedPullRequests, deadlineIso: this.queryDeadline(context) }),
+    );
+    // Defensive: the real reader never rejects (it turns every internal
+    // failure into a typed `unknown` result); this guards future changes.
+    if (read.kind === 'threw') {
+      return unevaluatedOutcome('S6', 'conformance-runs-read-failed');
+    }
+    if (read.value.status === 'unknown') {
+      return unevaluatedOutcome('S6', read.value.reason);
+    }
+    const evaluation = evaluateShadowConductedConformance({
+      day: context.day,
+      runs: read.value.runs,
+      merges: facts.merges,
+      headMoves: facts.headMoves,
+      headMovesIncompleteFor: facts.headMovesIncompleteFor,
+    });
+    return { criterion: 'S6', kind: 'evaluated', evaluation, conformance: evaluation };
+  }
+
+  /**
+   * S7: chains are not kept (OD-5), checked against the fleet's chain-record
+   * states and the shell train's chain names. Both sides are live counts
+   * (like S8), so this is evaluated only while the day is still yesterday,
+   * using the chains read S8's second intake sample already carried — never
+   * a third `readLegacyTrainState` call. A side that could not be read is
+   * `null`, never `[]`: `evaluateShadowChainsRetired` reports
+   * `chain-state-unreadable` for it and the day stays unevaluated.
+   */
+  private async evaluateChainsRetiredCriterion(
+    context: DayContext,
+    shellChains: LegacyTrainChainsRead | undefined,
+  ): Promise<CriterionOutcome> {
+    const nowSerial = Math.floor(Date.parse(this.deps.nowIso()) / DAY_MS);
+    if (context.day !== utcDayOfSerial(nowSerial - 1)) {
+      return unevaluatedOutcome('S7', 'snapshot-only-for-yesterday');
+    }
+    const chains = this.deps.chains;
+    if (chains === undefined) {
+      return unevaluatedOutcome('S7', 'not-wired');
+    }
+    const list: { readonly kind: 'value'; readonly value: ChainListResult } | { readonly kind: 'threw' } = await this.call(
+      context.deadlineIso,
+      () => chains.listChains({ repository: context.repository, deadlineIso: this.queryDeadline(context) }),
+    );
+    const fleetChainStates =
+      list.kind === 'value' && list.value.status === 'ok' ? list.value.records.map((record) => record.state) : null;
+    const shellChainNames =
+      shellChains === undefined || shellChains.status === 'unreadable'
+        ? null
+        : shellChains.status === 'absent'
+          ? []
+          : shellChains.chains.map((chain) => chain.name);
+    const evaluation = evaluateShadowChainsRetired({
+      policy: SHADOW_CHAINS_POLICY,
+      fleetChainStates,
+      shellChainNames,
+    });
+    if (evaluation.status === 'unknown') {
+      return unevaluatedOutcome('S7', evaluation.reason);
+    }
+    return { criterion: 'S7', kind: 'evaluated', evaluation, chainsRetired: evaluation };
+  }
+
   /**
    * The canonical summary one verdict's digest is computed over: keys in the
    * fixed order `criterion`, `day`, `status`, `reason`, then the evaluator's
@@ -675,15 +933,18 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * timestamp, so they are excluded and S8's digest hashes only
    * `{ criterion, day, status, reason }`.
    *
-   * `mergeSet` (S1 only), `intake` (S8 only), `tickHealth` (S12 only) and
-   * `stateIntegrity` (S9 only) are mutually exclusive, so at most one count
-   * field is ever set on any outcome. Each is set by exactly one criterion
-   * builder (`evaluateMergeSetCriterion`, `evaluateIntakeCriterion`,
-   * `evaluateTickHealthCriterion` and `evaluateStateIntegrityCriterion`
+   * `mergeSet` (S1 only), `intake` (S8 only), `tickHealth` (S12 only),
+   * `stateIntegrity` (S9 only), `gateAgreement` (S4' only), `conformance`
+   * (S6' only) and `chainsRetired` (S7 only) are mutually exclusive, so at
+   * most one count field is ever set on any outcome. Each is set by exactly
+   * one criterion builder (`evaluateMergeSetCriterion`,
+   * `evaluateIntakeCriterion`, `evaluateTickHealthCriterion`,
+   * `evaluateStateIntegrityCriterion`, `evaluateGateAgreementCriterion`,
+   * `evaluateConformanceCriterion` and `evaluateChainsRetiredCriterion`
    * respectively) and never more than one on the same outcome, so checking
-   * them in this order can never silently shadow another: an outcome with
-   * `intake`, `tickHealth` or `stateIntegrity` set always has the earlier
-   * fields `undefined`, by construction, not by this ordering.
+   * them in this order can never silently shadow another: an outcome with a
+   * later field set always has the earlier fields `undefined`, by
+   * construction, not by this ordering.
    */
   private canonicalSummary(context: DayContext, outcome: Extract<CriterionOutcome, { kind: 'evaluated' }>): string {
     const base = {
@@ -750,6 +1011,65 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         resultsAfterFinal: outcome.stateIntegrity.resultsAfterFinal,
         orphanResults: outcome.stateIntegrity.orphanResults,
       });
+    }
+    /**
+     * S4' carries its four day-scoped counts (`compared`, `agreeing`,
+     * `falsePasses`, `stricterFails`) plus `headsDigest`, a digest over
+     * every head's four identifying fields (`headOid`, `conductorVerdict`,
+     * `pushedAtIso`, `ciGate`). `unsettled` is dropped: an `unsettled > 0`
+     * day is always unevaluated (`gate-heads-unsettled`), so every head on
+     * an evaluated day is settled, and a later CI change on any head is a
+     * deliberate `verdict-conflict` rather than a silent overwrite. This is
+     * a new digest format (allowed because no live shadow day has been
+     * recorded yet; live recording starts only after the digest format is
+     * final).
+     */
+    if (outcome.gateAgreement !== undefined) {
+      const headsDigest = this.deps.computeDigest(
+        JSON.stringify(
+          outcome.gateAgreement.heads.map((head) => ({
+            headOid: head.headOid,
+            conductorVerdict: head.conductorVerdict,
+            pushedAtIso: head.pushedAtIso,
+            ciGate: head.ciGate,
+          })),
+        ),
+      );
+      return JSON.stringify({
+        ...base,
+        compared: outcome.gateAgreement.evaluation.compared,
+        agreeing: outcome.gateAgreement.evaluation.agreeing,
+        falsePasses: outcome.gateAgreement.evaluation.falsePasses,
+        stricterFails: outcome.gateAgreement.evaluation.stricterFails,
+        headsDigest,
+      });
+    }
+    /**
+     * S6' hashes only `{ criterion, day, status, reason }` (like S8): every
+     * S6' count (`mergedRuns`, `conforming`, `conformingTier1`,
+     * `conformingTier2`, `nonconformingOnDay` and all six `byCode` counts)
+     * depends on `readShadowConformanceRuns`, which reads live stores not
+     * time-bounded to day `D` — runs list, latest collected attempt heads
+     * and review receipts — so any of them can change between two
+     * `record-day` runs for the same closed day while the verdict stays
+     * equal. `outcome.conformance` stays on the outcome as a non-digested
+     * diagnostic. This is a new digest format (allowed because no live
+     * shadow day has been recorded yet).
+     */
+    if (outcome.conformance !== undefined) {
+      return JSON.stringify(base);
+    }
+    /**
+     * S7 hashes only `{ criterion, day, status, reason }` (like S8):
+     * `fleetActive` and `shellActive` are live counts of active chain
+     * records and shell chain files, both changeable between two runs for
+     * the same closed day while the verdict stays equal.
+     * `outcome.chainsRetired` stays on the outcome as a non-digested
+     * diagnostic. This is a new digest format (allowed because no live
+     * shadow day has been recorded yet).
+     */
+    if (outcome.chainsRetired !== undefined) {
+      return JSON.stringify(base);
     }
     return JSON.stringify(base);
   }

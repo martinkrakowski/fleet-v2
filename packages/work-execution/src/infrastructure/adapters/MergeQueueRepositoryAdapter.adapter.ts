@@ -120,6 +120,17 @@ export function duplicateMergeQueueIdentityListError(records: readonly MergeQueu
   return undefined;
 }
 
+/**
+ * The 12-hex repository digest used to key merge-queue entries, daemon
+ * repository refs, and shadow day-writer filters (`O(owner.length + repo.length)`).
+ */
+export function mergeQueueRepositoryDigest(repository: {
+  readonly owner: string;
+  readonly repo: string;
+}): string {
+  return sha256HexDigest(`${repository.owner}/${repository.repo}`).slice(0, 12);
+}
+
 type MergeMutationDecision =
   | MergeEnqueueDecision
   | MergeDropDecision
@@ -136,7 +147,7 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
     if (deadlineRefusal !== null) {
       return deadlineRefusal;
     }
-    const repoDigest = sha256HexDigest(`${command.repository.owner}/${command.repository.repo}`).slice(0, 12);
+    const repoDigest = mergeQueueRepositoryDigest(command.repository);
     const { repository, pullRequest, headOid, tier, enqueuedBy, runId, entryId, successorEntryId, enqueuedAtIso } = command;
     const input: MergeEnqueueInput = {
       repository,

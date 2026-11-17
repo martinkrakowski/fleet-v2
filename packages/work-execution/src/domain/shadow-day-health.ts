@@ -3,7 +3,9 @@
 // already-collected facts. Pure: no filesystem, no subprocess, no clock.
 // Never throws, never echoes an input value; every exported function takes
 // `unknown` at its boundary and returns a typed `ShadowCriterionEvaluation`
-// whose refusal carries a named reason code.
+// whose refusal carries a named reason code. S12 returns
+// `ShadowTickHealthEvaluation`, adding `totalTicks`, `budgetOverruns` and
+// `starvedJobs`.
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { readDaemonEventRecord } from './daemon-events.js';
@@ -135,39 +137,82 @@ function hasStarvedRun(sequence: readonly JobSequence[]): boolean {
 }
 
 /**
+ * S12's evaluation: the shared verdict plus the day's tick-health counts.
+ * `totalTicks` is the number of distinct in-day tick ids, `budgetOverruns`
+ * is how many of those ticks carried a `budget-exhausted` job, and
+ * `starvedJobs` is how many jobs had a starved run touching the day. An
+ * early refusal carries zeros; a reached verdict carries the counts computed
+ * before that verdict, so `too-few-ticks` still reports overruns and starved
+ * jobs.
+ */
+export type ShadowTickHealthEvaluation = ShadowCriterionEvaluation & {
+  readonly totalTicks: number;
+  readonly budgetOverruns: number;
+  readonly starvedJobs: number;
+};
+
+/** The three S12 counts, computed together before any verdict is chosen. */
+interface TickHealthCounts {
+  readonly totalTicks: number;
+  readonly budgetOverruns: number;
+  readonly starvedJobs: number;
+}
+
+const ZERO_TICK_HEALTH_COUNTS: TickHealthCounts = Object.freeze({
+  totalTicks: 0,
+  budgetOverruns: 0,
+  starvedJobs: 0,
+});
+
+/**
+ * A fresh, frozen evaluation built from a status/reason template plus the
+ * three tick-health counts — never a shared object, so a caller mutating one
+ * returned evaluation cannot corrupt another call's result.
+ */
+function withTickHealthCounts(template: ShadowCriterionEvaluation, counts: TickHealthCounts): ShadowTickHealthEvaluation {
+  return Object.freeze({
+    status: template.status,
+    reason: template.reason,
+    totalTicks: counts.totalTicks,
+    budgetOverruns: counts.budgetOverruns,
+    starvedJobs: counts.starvedJobs,
+  });
+}
+
+/**
  * S12, daemon tick health, over `{ day, events }` where `events` spans
  * D-1 23:00Z to D+1 00:00Z (assembled by the caller; never re-derived here).
- * Cost: linear in the capped input plus one sort of the collected job
- * events — at most `SHADOW_MAX_HEALTH_ITEMS` records are walked or sorted,
- * and an oversized, sparse or non-dense `events` array is refused from its
- * own `length` before any element is traversed. Every value is read through
+ * Cost: linear in the capped input plus a sort of each job's events — at
+ * most `SHADOW_MAX_HEALTH_ITEMS` records are walked or sorted, and an
+ * oversized, sparse or non-dense `events` array is refused from its own
+ * `length` before any element is traversed. Every value is read through
  * its own property descriptor, so no getter ever runs and a Proxy stand-in
  * either is refused or yields exactly the plain data's verdict. Never
  * throws, never echoes the input.
  */
-export function evaluateShadowTickHealth(input: unknown): ShadowCriterionEvaluation {
+export function evaluateShadowTickHealth(input: unknown): ShadowTickHealthEvaluation {
   try {
     return judgeDayTickHealth(input);
   } catch {
     // A revoked Proxy, or one whose getPrototypeOf/ownKeys/descriptor trap
     // throws, can make even the descriptor readers throw; the never-throws
     // contract turns that into a typed refusal.
-    return UNKNOWN('invalid-input');
+    return withTickHealthCounts(UNKNOWN('invalid-input'), ZERO_TICK_HEALTH_COUNTS);
   }
 }
 
-function judgeDayTickHealth(input: unknown): ShadowCriterionEvaluation {
+function judgeDayTickHealth(input: unknown): ShadowTickHealthEvaluation {
   const snapshot = readExactPlainRecord(input, ['day', 'events']);
   if (snapshot === null) {
-    return UNKNOWN('invalid-input');
+    return withTickHealthCounts(UNKNOWN('invalid-input'), ZERO_TICK_HEALTH_COUNTS);
   }
   const day = readUtcDay(snapshot.day);
   if (day === null) {
-    return UNKNOWN('invalid-input');
+    return withTickHealthCounts(UNKNOWN('invalid-input'), ZERO_TICK_HEALTH_COUNTS);
   }
   const events = readBoundedArray(snapshot.events, SHADOW_MAX_HEALTH_ITEMS);
   if (events === null) {
-    return UNKNOWN('daemon-events-invalid');
+    return withTickHealthCounts(UNKNOWN('daemon-events-invalid'), ZERO_TICK_HEALTH_COUNTS);
   }
   const jobEvents: DaemonEventRecord[] = [];
   // `events.length` below is the length `readBoundedArray` already read
@@ -176,7 +221,7 @@ function judgeDayTickHealth(input: unknown): ShadowCriterionEvaluation {
   for (let index = 0; index < events.length; index += 1) {
     const read = readDaemonEventRecord(ownElement(events.array, index));
     if (!read.ok) {
-      return UNKNOWN('daemon-events-invalid');
+      return withTickHealthCounts(UNKNOWN('daemon-events-invalid'), ZERO_TICK_HEALTH_COUNTS);
     }
     const job = asJobEvent(read.record);
     if (job !== null) {
@@ -186,8 +231,8 @@ function judgeDayTickHealth(input: unknown): ShadowCriterionEvaluation {
   return judgeTickHealth(jobEvents, day);
 }
 
-/** The S12 rules, over already-validated job events. */
-function judgeTickHealth(jobEvents: readonly DaemonEventRecord[], day: string): ShadowCriterionEvaluation {
+/** The S12 rules, over already-validated job events. All three counts are computed before any verdict return. */
+function judgeTickHealth(jobEvents: readonly DaemonEventRecord[], day: string): ShadowTickHealthEvaluation {
   const inDayTicks = new Set<string>();
   const overBudgetTicks = new Set<string>();
   const byJob = new Map<string, JobSequence[]>();
@@ -201,25 +246,30 @@ function judgeTickHealth(jobEvents: readonly DaemonEventRecord[], day: string): 
     pushJobEvent(byJob, event, day);
   }
   const totalTicks = inDayTicks.size;
-  if (totalTicks < SHADOW_MIN_TICKS_PER_DAY) {
-    return FAIL('too-few-ticks');
-  }
-  let overBudget = 0;
+  let budgetOverruns = 0;
   for (const tickId of overBudgetTicks) {
     if (inDayTicks.has(tickId)) {
-      overBudget += 1;
+      budgetOverruns += 1;
     }
   }
-  if (overBudget * 100 > totalTicks) {
-    return FAIL('tick-budget-overrun');
-  }
+  let starvedJobs = 0;
   for (const sequence of byJob.values()) {
     sequence.sort((a, b) => (a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : 0));
     if (hasStarvedRun(sequence)) {
-      return FAIL('job-starved');
+      starvedJobs += 1;
     }
   }
-  return PASS('ticks-within-budget');
+  const counts: TickHealthCounts = { totalTicks, budgetOverruns, starvedJobs };
+  if (totalTicks < SHADOW_MIN_TICKS_PER_DAY) {
+    return withTickHealthCounts(FAIL('too-few-ticks'), counts);
+  }
+  if (budgetOverruns * 100 > totalTicks) {
+    return withTickHealthCounts(FAIL('tick-budget-overrun'), counts);
+  }
+  if (starvedJobs > 0) {
+    return withTickHealthCounts(FAIL('job-starved'), counts);
+  }
+  return withTickHealthCounts(PASS('ticks-within-budget'), counts);
 }
 
 /** Append one event to its job's sequence, ordered later by `(recordedAtIso, eventId)`. */

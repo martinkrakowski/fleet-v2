@@ -6,7 +6,12 @@ import * as path from 'node:path';
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { sha256HexDigest, type GhInvocationResult, type DaemonStatusRecord } from '@fleet/work-execution';
+import {
+  sha256HexDigest,
+  SpdSayHostAudibleAlertAdapter,
+  type GhInvocationResult,
+  type DaemonStatusRecord,
+} from '@fleet/work-execution';
 import { loadInstallation, type FleetInstallation } from '@fleet/installation';
 
 import { createFleetCliRuntime, type FleetCliRuntime, type FleetCliRuntimeOptions } from './composition.js';
@@ -1613,6 +1618,73 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     expect(lines[1]).toBe(
       `watchdog ${digestOf(REPO_A)} healthy findings=0 raised=0 cleared=0 announced=0`,
     );
+  });
+
+  it('(fix) with an invalid FLEET_AUDIBLE_ALERT value no SpdSay adapter is composed: no speak ever runs even on an unhealthy train, and the reported mode is invalid', async () => {
+    // Composition has no injectable seam for observing adapter construction, so
+    // the test observes the smallest visible effect: the adapter prototype's
+    // `speak`. A composition that builds an adapter for an invalid value and
+    // hands it to an unhealthy train must reach this spy; the pass must stay at 0.
+    const speakSpy = vi.spyOn(SpdSayHostAudibleAlertAdapter.prototype, 'speak');
+    try {
+      vi.stubEnv('FLEET_AUDIBLE_ALERT', 'banana');
+      // A real (not stubbed) unhealthy pass: a stale tick makes the evaluated
+      // train unhealthy, so a wrongly composed adapter would actually speak.
+      const nowIso = new Date().toISOString();
+      const h = watchdogHarness(nowIso);
+      await writeTickStatus(h, new Date(Date.parse(nowIso) - 10 * 60_000).toISOString());
+      const answer = await run(h.runtime, ['daemon', 'watchdog', '--json']);
+      expect(answer.code).toBe(1);
+      expect(lastJson(answer.out)).toMatchObject({
+        outcome: 'completed',
+        exitCode: 1,
+        audibleAlert: 'invalid',
+        reasonCode: 'audible-alert-invalid',
+      });
+      expect(speakSpy, 'an invalid mode must compose no adapter at all').toHaveBeenCalledTimes(0);
+    } finally {
+      speakSpy.mockRestore();
+    }
+  });
+
+  it('(fix) an injected fake alert port makes the reported audibleAlert spd-say without any real binary', async () => {
+    const recorded: Array<{ readonly sentence: string }> = [];
+    const h = harness([REPO_A], {
+      daemonNow: () => new Date().toISOString(),
+      daemonAudibleAlert: {
+        speak: async (request: { readonly sentence: string }) => {
+          recorded.push(request);
+          return { outcome: 'spoken' as const };
+        },
+      },
+    });
+    const answer = await run(withWatch(h, async () => VALID_ANSWER), ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(0);
+    expect(lastJson(answer.out)).toMatchObject({ outcome: 'completed', exitCode: 0, audibleAlert: 'spd-say' });
+    expect(recorded, 'the fake port records every speak request').toEqual([]);
+  });
+
+  it('(fix) the composition reads FLEET_AUDIBLE_ALERT from options.env only: set there it enables spd-say while process.env stays empty', async () => {
+    // The file-level beforeEach stubs process.env to '', so process.env cannot
+    // supply the value; only the runtime's own `env` option can.
+    const h = harness([REPO_A], {
+      daemonNow: () => new Date().toISOString(),
+      env: { FLEET_AUDIBLE_ALERT: 'spd-say' },
+    });
+    const answer = await run(withWatch(h, async () => VALID_ANSWER), ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(0);
+    expect(lastJson(answer.out)).toMatchObject({ outcome: 'completed', exitCode: 0, audibleAlert: 'spd-say' });
+  });
+
+  it('(fix) the composition reads FLEET_AUDIBLE_ALERT from options.env only: an empty options.env keeps the mode off even when process.env carries spd-say', async () => {
+    vi.stubEnv('FLEET_AUDIBLE_ALERT', 'spd-say');
+    const h = harness([REPO_A], {
+      daemonNow: () => new Date().toISOString(),
+      env: {},
+    });
+    const answer = await run(withWatch(h, async () => VALID_ANSWER), ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(0);
+    expect(lastJson(answer.out)).toMatchObject({ outcome: 'completed', exitCode: 0, audibleAlert: 'off' });
   });
 
   it('(f) resolveAudibleAlertMode(null) is invalid', () => {

@@ -1,8 +1,11 @@
 // Lane SH15a: the pure shadow attestation ledger. One-time facts (S2 forge
 // backoff, S2 canary parks, S3 wake after outage) are recorded once and stay
-// recorded. The day ledger is not reused. Pure: no filesystem, no subprocess,
-// no clock. Never throws, never echoes an input value; every exported
-// function takes `unknown` at its boundary and returns a typed refusal.
+// recorded. The day ledger is not reused.
+// Lane SH15b: the pure one-time criteria evaluator. S2, S3, S10 and S11 are
+// judged from the day's release-tree test facts plus that sticky ledger.
+// Pure: no filesystem, no subprocess, no clock. Never throws, never echoes an
+// input value; every exported function takes `unknown` at its boundary and
+// returns a typed refusal.
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
@@ -16,6 +19,7 @@ import {
   dayNumber,
   isSecretShaped,
   isVersionAboveCurrent,
+  type ShadowCriterionEvaluation,
 } from './shadow-evidence-ledger.js';
 
 export const SHADOW_ATTESTATION_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
@@ -241,40 +245,42 @@ function readAttestationList(value: unknown): readonly ShadowAttestation[] | nul
   return collectAttestations(bounded);
 }
 
-/**
- * A real, dense array of at most `SHADOW_ATTESTATION_FACTS.length` elements,
- * or null. The length comes from its own descriptor and is refused before
- * `Object.keys` when it is over the cap, so an enormous sparse length is
- * never traversed. Cost: linear in the number of own keys, which the cap
- * bounds.
- */
+/** The attestation list, capped at `SHADOW_ATTESTATION_FACTS.length`. Cost: linear in that cap. */
 function readBoundedAttestations(value: unknown): BoundedAttestations | null {
+  return readBoundedArray(value, SHADOW_ATTESTATION_FACTS.length);
+}
+
+/**
+ * A real, dense array of at most `cap` elements, or null. The length comes
+ * from its own descriptor and is refused before `Object.keys` when it is
+ * over the cap, so an enormous sparse length is never traversed. Cost:
+ * linear in the number of own keys, which `cap` bounds.
+ */
+function readBoundedArray(value: unknown, cap: number): BoundedAttestations | null {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     return null;
   }
-  const length = ownArrayLength(value);
+  const length = ownArrayLength(value, cap);
   if (length === null || Object.keys(value).length !== length) {
     return null;
   }
   return { array: value, length };
 }
 
-function ownArrayLength(value: readonly unknown[]): number | null {
+/** The own data-property `length` when it is a safe integer in `[0, cap]`. Cost: O(1). */
+function ownArrayLength(value: readonly unknown[], cap: number): number | null {
   const descriptor = Object.getOwnPropertyDescriptor(value, 'length');
   if (descriptor === undefined || descriptor.get !== undefined) {
     return null;
   }
   const length: unknown = descriptor.value;
-  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
-    return null;
-  }
-  if (length > SHADOW_ATTESTATION_FACTS.length) {
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || length > cap) {
     return null;
   }
   return length;
 }
 
-function ownAttestationElement(array: readonly unknown[], index: number): unknown {
+function ownArrayElement(array: readonly unknown[], index: number): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
   if (descriptor === undefined || descriptor.get !== undefined || !('value' in descriptor)) {
     return undefined;
@@ -286,7 +292,7 @@ function collectAttestations(bounded: BoundedAttestations): readonly ShadowAttes
   const attestations: ShadowAttestation[] = [];
   let previousIndex = -1;
   for (let index = 0; index < bounded.length; index += 1) {
-    const next = readNextAttestation(ownAttestationElement(bounded.array, index), previousIndex);
+    const next = readNextAttestation(ownArrayElement(bounded.array, index), previousIndex);
     if (next === null) {
       return null;
     }
@@ -419,4 +425,390 @@ function readMatchingString(value: unknown, pattern: RegExp): string | null {
     return null;
   }
   return value;
+}
+
+/** Frozen so a caller cannot empty it and skip criteria; `evaluateAll` also fails closed below. */
+export const SHADOW_ONE_TIME_CRITERIA = Object.freeze(['S2', 'S3', 'S10', 'S11'] as const);
+
+type ShadowOneTimeCriterion = (typeof SHADOW_ONE_TIME_CRITERIA)[number];
+
+interface ShadowOneTimeRequirement {
+  readonly tests: readonly string[];
+  readonly facts: readonly string[];
+}
+
+/**
+ * Test paths reserved for the S2a (DT14 park-reason e2e), S10 (kill -9 e2e)
+ * and S11 (golden brief corpus) units, which must create exactly these files;
+ * until they exist the criteria fail as `required-test-absent`.
+ */
+export const SHADOW_ONE_TIME_REQUIREMENTS: Readonly<Record<ShadowOneTimeCriterion, ShadowOneTimeRequirement>> =
+  Object.freeze({
+    S2: Object.freeze({
+      tests: Object.freeze(['apps/cli/src/__tests__/e2e/shadow-park-reasons.e2e.test.ts']),
+      facts: Object.freeze(['s2-forge-error-backoff', 's2-canary-parks']),
+    }),
+    S3: Object.freeze({
+      tests: Object.freeze<readonly string[]>([]),
+      facts: Object.freeze(['s3-wake-after-outage']),
+    }),
+    S10: Object.freeze({
+      tests: Object.freeze(['apps/cli/src/__tests__/e2e/shadow-kill-recovery.e2e.test.ts']),
+      facts: Object.freeze<readonly string[]>([]),
+    }),
+    S11: Object.freeze({
+      tests: Object.freeze(['packages/work-execution/src/domain/__tests__/shadow-brief-corpus.test.ts']),
+      facts: Object.freeze<readonly string[]>([]),
+    }),
+  });
+
+/** Release-tree reports above this count are refused before any element is read. */
+export const SHADOW_ONE_TIME_MAX_TESTS = 16;
+
+export interface ShadowReleaseTestFact {
+  readonly path: string;
+  readonly present: boolean;
+  readonly quarantined: boolean | null;
+}
+
+const ONE_TIME_INPUT_KEYS: readonly string[] = ['day', 'releaseSha', 'attestations', 'releaseTests'];
+const RELEASE_TEST_KEYS: readonly string[] = ['path', 'present', 'quarantined'];
+
+// Shared verdict objects, frozen at declaration so a caller cannot flip one
+// result into a later call's result. Lower rank wins: any fail beats any
+// unknown, `required-test-absent` beats `required-test-quarantined`, and the
+// unknown codes follow the order in `bindingVerdict` / `reportVerdict`.
+const ABSENT_RANK = 0;
+const QUARANTINE_RANK = 1;
+const UNPINNED_RANK = 2;
+const TREE_UNREADABLE_RANK = 3;
+const UNREPORTED_RANK = 4;
+const TEST_UNREADABLE_RANK = 5;
+const NOT_YET_RANK = 6;
+const PRESENT_RANK = 7;
+
+const INVALID_INPUT: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'invalid-input' });
+/** Fail-closed seed: a criterion the loop never visits must never report pass. */
+const NOT_EVALUATED: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'not-evaluated' });
+const ATTESTATIONS_UNREADABLE: ShadowCriterionEvaluation = Object.freeze({
+  status: 'unknown',
+  reason: 'attestations-unreadable',
+});
+const RELEASE_UNPINNED: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'release-unpinned' });
+const RELEASE_TREE_UNREADABLE: ShadowCriterionEvaluation = Object.freeze({
+  status: 'unknown',
+  reason: 'release-tree-unreadable',
+});
+const RELEASE_TEST_UNREPORTED: ShadowCriterionEvaluation = Object.freeze({
+  status: 'unknown',
+  reason: 'release-test-unreported',
+});
+const TEST_ABSENT: ShadowCriterionEvaluation = Object.freeze({ status: 'fail', reason: 'required-test-absent' });
+const TEST_QUARANTINED: ShadowCriterionEvaluation = Object.freeze({
+  status: 'fail',
+  reason: 'required-test-quarantined',
+});
+const TEST_UNREADABLE: ShadowCriterionEvaluation = Object.freeze({
+  status: 'unknown',
+  reason: 'release-test-unreadable',
+});
+const NOT_YET_OBSERVED: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'not-yet-observed' });
+const EVIDENCE_PRESENT: ShadowCriterionEvaluation = Object.freeze({
+  status: 'pass',
+  reason: 'one-time-evidence-present',
+});
+
+const UNKNOWN_RANK: Readonly<Record<string, number>> = Object.freeze({
+  'release-unpinned': UNPINNED_RANK,
+  'release-tree-unreadable': TREE_UNREADABLE_RANK,
+  'release-test-unreported': UNREPORTED_RANK,
+  'release-test-unreadable': TEST_UNREADABLE_RANK,
+  'not-yet-observed': NOT_YET_RANK,
+});
+
+type ShadowOneTimeEvaluations = Readonly<Record<ShadowOneTimeCriterion, ShadowCriterionEvaluation>>;
+
+interface OneTimeFacts {
+  readonly daySerial: number;
+  readonly releaseSha: string | null;
+  readonly attestations: readonly ShadowAttestation[] | null;
+  readonly tests: ReadonlyMap<string, ShadowReleaseTestFact> | null;
+}
+
+type FieldRead<T> = { readonly ok: true; readonly value: T } | { readonly ok: false };
+
+/**
+ * Evaluate S2, S3, S10 and S11 for one day. Test facts are bound to the day's
+ * pinned release sha. An attestation counts on every later day regardless of
+ * the release it was observed under (`observedDay` compared with `dayNumber`).
+ * `attestations === null` means the store is absent. `releaseTests === null`
+ * means the release tree could not be read. A fail beats any unknown.
+ * Cost: linear in the capped input. The caps are the named constants
+ * `SHADOW_ONE_TIME_MAX_TESTS` (refused from the array's own `length` before
+ * any element is traversed) and `SHADOW_ATTESTATION_FACTS.length` (inside
+ * `readShadowAttestations`). Own data properties only, so no getter ever
+ * runs. A Proxy stand-in is refused by the shape checks or yields exactly
+ * the plain data, because every read goes through
+ * `Object.getOwnPropertyDescriptor` and `Reflect.ownKeys`, never a `get`
+ * trap. Never throws, never echoes an input value.
+ */
+export function evaluateShadowOneTimeCriteria(input: unknown): ShadowOneTimeEvaluations {
+  try {
+    return evaluateOneTime(input);
+  } catch {
+    return everyCriterion(INVALID_INPUT);
+  }
+}
+
+/** The four evaluations, or one shared refusal. Cost: linear in the capped input. */
+function evaluateOneTime(input: unknown): ShadowOneTimeEvaluations {
+  const snapshot = readExactPlainRecord(input, ONE_TIME_INPUT_KEYS);
+  if (snapshot === null) {
+    return everyCriterion(INVALID_INPUT);
+  }
+  const fields = readOneTimeFields(snapshot);
+  if (fields === null) {
+    return everyCriterion(INVALID_INPUT);
+  }
+  const attestations = readAttestationField(snapshot.attestations);
+  if (!attestations.ok) {
+    return everyCriterion(ATTESTATIONS_UNREADABLE);
+  }
+  return evaluateAll({ ...fields, attestations: attestations.value });
+}
+
+/** The same verdict on every criterion. Cost: O(1). */
+function everyCriterion(verdict: ShadowCriterionEvaluation): ShadowOneTimeEvaluations {
+  return { S2: verdict, S3: verdict, S10: verdict, S11: verdict };
+}
+
+/**
+ * Day, release sha and release tests, or null when any shape is invalid.
+ * Cost: linear in `SHADOW_ONE_TIME_MAX_TESTS`.
+ */
+function readOneTimeFields(snapshot: Record<string, unknown>): Omit<OneTimeFacts, 'attestations'> | null {
+  const daySerial = readDaySerial(snapshot.day);
+  const release = readReleaseSha(snapshot.releaseSha);
+  const tests = readReleaseTestField(snapshot.releaseTests);
+  if (daySerial === null || release === null || !tests.ok) {
+    return null;
+  }
+  return { daySerial, releaseSha: release.releaseSha, tests: tests.value };
+}
+
+/** A real calendar day serial, or null. Cost: linear in the day string. */
+function readDaySerial(value: unknown): number | null {
+  if (typeof value !== 'string' || !DAY_PATTERN.test(value) || isSecretShaped(value)) {
+    return null;
+  }
+  return dayNumber(value);
+}
+
+/**
+ * `null` is an absent store. Anything `readShadowAttestations` refuses is
+ * unreadable. Cost: linear in `SHADOW_ATTESTATION_FACTS.length`.
+ */
+function readAttestationField(value: unknown): FieldRead<readonly ShadowAttestation[] | null> {
+  if (value === null) {
+    return { ok: true, value: null };
+  }
+  const read = readShadowAttestations(value);
+  if (!read.ok) {
+    return { ok: false };
+  }
+  return { ok: true, value: read.ledger.attestations };
+}
+
+/**
+ * `null` means the release tree could not be read. An over-cap, sparse,
+ * non-array or ill-shaped list is refused. Cost: linear in
+ * `SHADOW_ONE_TIME_MAX_TESTS`, and an over-cap length is refused before any
+ * element is read.
+ */
+function readReleaseTestField(value: unknown): FieldRead<ReadonlyMap<string, ShadowReleaseTestFact> | null> {
+  if (value === null) {
+    return { ok: true, value: null };
+  }
+  const bounded = readBoundedArray(value, SHADOW_ONE_TIME_MAX_TESTS);
+  if (bounded === null) {
+    return { ok: false };
+  }
+  return collectReleaseTests(bounded);
+}
+
+/** One map of path to fact, or a refusal when an element or a duplicate path is invalid. Cost: linear in the cap. */
+function collectReleaseTests(bounded: BoundedAttestations): FieldRead<ReadonlyMap<string, ShadowReleaseTestFact>> {
+  const tests = new Map<string, ShadowReleaseTestFact>();
+  for (let index = 0; index < bounded.length; index += 1) {
+    const fact = readReleaseTest(ownArrayElement(bounded.array, index));
+    if (fact === null || tests.has(fact.path)) {
+      return { ok: false };
+    }
+    tests.set(fact.path, fact);
+  }
+  return { ok: true, value: tests };
+}
+
+/** One release-test fact, or null. Cost: linear in the path string. */
+function readReleaseTest(raw: unknown): ShadowReleaseTestFact | null {
+  const snapshot = readExactPlainRecord(raw, RELEASE_TEST_KEYS);
+  if (snapshot === null) {
+    return null;
+  }
+  return releaseTestFromSnapshot(snapshot);
+}
+
+/** The three fields, or null when a field has the wrong shape. Cost: linear in the path string. */
+function releaseTestFromSnapshot(snapshot: Record<string, unknown>): ShadowReleaseTestFact | null {
+  const path = readTestPath(snapshot.path);
+  const present = snapshot.present;
+  const quarantined = snapshot.quarantined;
+  if (path === null || typeof present !== 'boolean' || !isQuarantineFlag(quarantined)) {
+    return null;
+  }
+  return { path, present, quarantined };
+}
+
+/** `quarantined` is a boolean or null. Cost: O(1). */
+function isQuarantineFlag(value: unknown): value is boolean | null {
+  return value === null || typeof value === 'boolean';
+}
+
+/** A non-empty path that carries no secret shape, or null. Cost: linear in the path string. */
+function readTestPath(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || isSecretShaped(value)) {
+    return null;
+  }
+  return value;
+}
+
+/** Each criterion from its requirement row. Cost: linear in the capped input. */
+function evaluateAll(facts: OneTimeFacts): ShadowOneTimeEvaluations {
+  const evaluations: Record<ShadowOneTimeCriterion, ShadowCriterionEvaluation> = {
+    S2: NOT_EVALUATED,
+    S3: NOT_EVALUATED,
+    S10: NOT_EVALUATED,
+    S11: NOT_EVALUATED,
+  };
+  for (const criterion of SHADOW_ONE_TIME_CRITERIA) {
+    evaluations[criterion] = evaluateCriterion(SHADOW_ONE_TIME_REQUIREMENTS[criterion], facts);
+  }
+  return evaluations;
+}
+
+/** The worse of the criterion's test verdict and its fact verdict. Cost: linear in the capped input. */
+function evaluateCriterion(requirement: ShadowOneTimeRequirement, facts: OneTimeFacts): ShadowCriterionEvaluation {
+  return worse(evaluateTests(requirement.tests, facts), evaluateFacts(requirement.facts, facts));
+}
+
+/** The worst required-test verdict, or pass when the criterion has no tests. Cost: linear in the row. */
+function evaluateTests(paths: readonly string[], facts: OneTimeFacts): ShadowCriterionEvaluation {
+  let verdict: ShadowCriterionEvaluation = EVIDENCE_PRESENT;
+  for (const path of paths) {
+    verdict = worse(verdict, evaluateTest(path, facts));
+  }
+  return verdict;
+}
+
+/** Binding and report are both computed so a fail is not hidden by an earlier unknown. Cost: O(1). */
+function evaluateTest(path: string, facts: OneTimeFacts): ShadowCriterionEvaluation {
+  return worse(reportVerdict(facts.tests, path), bindingVerdict(facts));
+}
+
+/** Unknowns that apply before a report is trusted. Cost: O(1). */
+function bindingVerdict(facts: OneTimeFacts): ShadowCriterionEvaluation {
+  if (facts.releaseSha === null) {
+    return RELEASE_UNPINNED;
+  }
+  if (facts.tests === null) {
+    return RELEASE_TREE_UNREADABLE;
+  }
+  return EVIDENCE_PRESENT;
+}
+
+/** The reported test, or pass when the tree itself was unreadable. Cost: O(1). */
+function reportVerdict(
+  tests: ReadonlyMap<string, ShadowReleaseTestFact> | null,
+  path: string,
+): ShadowCriterionEvaluation {
+  if (tests === null) {
+    return EVIDENCE_PRESENT;
+  }
+  const reported = tests.get(path);
+  if (reported === undefined) {
+    return RELEASE_TEST_UNREPORTED;
+  }
+  return judgeReported(reported);
+}
+
+/** Absent beats quarantined; a null quarantine flag is unreadable only when the file is present. Cost: O(1). */
+function judgeReported(reported: ShadowReleaseTestFact): ShadowCriterionEvaluation {
+  if (!reported.present) {
+    return TEST_ABSENT;
+  }
+  if (reported.quarantined === true) {
+    return TEST_QUARANTINED;
+  }
+  if (reported.quarantined === null) {
+    return TEST_UNREADABLE;
+  }
+  return EVIDENCE_PRESENT;
+}
+
+/** Not-yet-observed when any required fact has no attestation on or before the day. Cost: linear in the capped ledger. */
+function evaluateFacts(required: readonly string[], facts: OneTimeFacts): ShadowCriterionEvaluation {
+  for (const fact of required) {
+    if (!observedByDay(fact, facts.attestations, facts.daySerial)) {
+      return NOT_YET_OBSERVED;
+    }
+  }
+  return EVIDENCE_PRESENT;
+}
+
+/** True when `fact` was attested on or before `daySerial`, under any release. Cost: linear in the capped ledger. */
+function observedByDay(fact: string, attestations: readonly ShadowAttestation[] | null, daySerial: number): boolean {
+  if (attestations === null) {
+    return false;
+  }
+  for (const attestation of attestations) {
+    if (matchesObservedFact(attestation, fact, daySerial)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** The fact matches and its observed day is on or before the evaluation day. Cost: O(1). */
+function matchesObservedFact(attestation: ShadowAttestation, fact: string, daySerial: number): boolean {
+  return attestation.fact === fact && observedOnOrBefore(attestation.observedDay, daySerial);
+}
+
+/** `dayNumber` comparison; a day the ledger already accepted cannot fail it. Cost: O(1). */
+function observedOnOrBefore(observedDay: string, daySerial: number): boolean {
+  const observed = dayNumber(observedDay);
+  return observed !== null && observed <= daySerial;
+}
+
+/** The lower-ranked verdict. Cost: O(1). */
+function worse(left: ShadowCriterionEvaluation, right: ShadowCriterionEvaluation): ShadowCriterionEvaluation {
+  return verdictRank(left) <= verdictRank(right) ? left : right;
+}
+
+/** Fail, then unknown, then pass. Cost: O(1). */
+function verdictRank(verdict: ShadowCriterionEvaluation): number {
+  if (verdict.status === 'pass') {
+    return PRESENT_RANK;
+  }
+  if (verdict.status === 'fail') {
+    return failRank(verdict.reason);
+  }
+  return UNKNOWN_RANK[verdict.reason] ?? NOT_YET_RANK;
+}
+
+/** `required-test-absent` outranks `required-test-quarantined`. Cost: O(1). */
+function failRank(reason: string): number {
+  if (reason === 'required-test-absent') {
+    return ABSENT_RANK;
+  }
+  return QUARANTINE_RANK;
 }

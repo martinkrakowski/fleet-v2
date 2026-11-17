@@ -558,6 +558,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'merge-records.json',
       'held-work-orders.json',
       'cutover.json',
+      'cutover-shadow.json',
     ]);
   });
 });

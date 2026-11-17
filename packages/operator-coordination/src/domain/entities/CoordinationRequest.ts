@@ -46,7 +46,7 @@ type MutableCoordinationRequestRecord = Omit<
 
 const MAX_GRANT_ATTEMPT_ID_LENGTH = 256;
 // eslint-disable-next-line no-control-regex
-const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
+export const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
 
 function readOwnDataValue(record: object, key: string): unknown {
   let descriptor: PropertyDescriptor | undefined;

@@ -799,6 +799,17 @@ describe('daemon watchdog composition (CO-WD5a)', () => {
     expect(result).toMatchObject({ outcome: 'evaluated', healthy: true, exitCode: 0 });
   });
 
+  it('a live durable queue entry is forge-read: a green forge answer yields no unknown forge states (fix-1 mutation: a forge reader answering ok:false fails here)', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    await enqueue(h.runtime, REPO_A, 7);
+    await writeTickStatus(h, nowIso);
+    const result = await watch(h, 'proj-alpha');
+    // The gh stub answers a green open pull request for the graphql read, so a
+    // pass that really reaches the forge reports zero unknown forge states.
+    expect(result).toMatchObject({ outcome: 'evaluated', healthy: true, exitCode: 0, findings: [], unknownForgeStates: 0 });
+  });
+
   it('a corrupt merge-queue file reads blind on two consecutive runs and its bytes stay on disk with no quarantine directory', async () => {
     const nowIso = new Date().toISOString();
     const h = watchdogHarness(nowIso);
@@ -817,12 +828,33 @@ describe('daemon watchdog composition (CO-WD5a)', () => {
     const h = watchdogHarness(nowIso);
     await writeTickStatus(h, new Date(Date.parse(nowIso) - 10 * 60_000).toISOString());
     const result = await watch(h, 'proj-alpha');
+    // The fixture is unhealthy, so "speaks nothing" is not vacuous.
     expect(result).toMatchObject({
+      healthy: false,
       announced: 0,
       announceFailures: 0,
       announceSuppressed: 0,
       announceUnspoken: 0,
     });
+  });
+
+  it('with no state directory the composed watchdog is the documented in-memory one: durable false and a pass evaluates healthy touching no disk (fix-3 mutation: forcing the durable read-only queue fails here)', async () => {
+    const nowIso = new Date().toISOString();
+    const gh = ghStub();
+    const runtime = createFleetCliRuntime({
+      installation: installation([REPO_A]),
+      forgeGhRunner: gh.run,
+      daemonNow: () => nowIso,
+    });
+    expect(runtime.daemon.durable).toBe(false);
+    await writeTickStatus({ stateDir: '', gh, runtime } as Harness, nowIso);
+    const result = await (runtime.daemon.watchTrainHealth.watchTrainHealth({
+      projectId: 'proj-alpha',
+      repository: { owner: OWNER, repo: REPO_A },
+      repoDigest: digestOf(REPO_A),
+      deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+    }) as Promise<Record<string, unknown>>);
+    expect(result).toMatchObject({ outcome: 'evaluated', healthy: true, exitCode: 0, findings: [] });
   });
 });
 

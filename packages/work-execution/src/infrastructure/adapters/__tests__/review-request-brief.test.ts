@@ -1,5 +1,6 @@
 // Brief-verify review subject (CO18a3a). Every refusal is a typed result.
-// Cost bounds pinned here: briefText above 64 KiB, project id above 200
+// Cost bounds pinned here: briefText above 64 KiB, including a multi-megabyte
+// brief refused on UTF-16 length before a byte scan, project id above 200
 // characters, a receipt list or findings array whose length is 2^32-1, and an
 // array-like whose length is Number.MAX_SAFE_INTEGER. Those cases return
 // without iterating the claimed length.
@@ -644,6 +645,16 @@ describe('brief-verify invalid-request', () => {
     })()],
   ])('requestReview refuses %s with invalid-request and calls no delegate', async (_label, request) => {
     await refused(request);
+  });
+
+  it('refuses a multi-megabyte briefText with invalid-request, the same code as an over-size brief', async () => {
+    const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    const overSize = await adapter.requestReview(briefRequest({ briefText: 'a'.repeat(64 * 1024 + 1) }));
+    const huge = await adapter.requestReview(briefRequest({ briefText: 'a'.repeat(4 * 1024 * 1024) }));
+    expect(overSize).toEqual({ outcome: 'refused', reason: 'invalid-request', detail: null });
+    expect(huge).toEqual(overSize);
+    expect(calls).toHaveLength(0);
   });
 
   it('requestReview refuses a briefPackageDigest accessor with invalid-request and does not invoke the getter', async () => {

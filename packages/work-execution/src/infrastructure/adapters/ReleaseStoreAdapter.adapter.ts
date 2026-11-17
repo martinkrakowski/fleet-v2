@@ -529,6 +529,13 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
    * (`RELEASE_INSPECT_MAX_FILE_BYTES`). Never throws: a bad request or an
    * unexpected failure is `unreadable`, and an unjudgeable file is
    * `quarantined: null`.
+   *
+   * Threat model: the release root is owned by the operator. These checks
+   * defend against concurrent release-store operations (install, swap,
+   * prune) and accidental symlinks; they do not defend against an actor
+   * with write access to the release root, who could forge a verified
+   * marker. Without `openat` a residual race window is narrowed by the
+   * build-directory and per-file identity re-checks, not eliminated.
    */
   async inspectReleaseFiles(input: unknown): Promise<ReleaseFilesInspection> {
     try {
@@ -1024,7 +1031,68 @@ async function readVerifiedReleaseFiles(request: InspectRequest): Promise<Releas
   if (marker === null) {
     return { outcome: 'unreadable' };
   }
-  return { outcome: 'read', files: await readReleaseFileFacts(buildDir, request.paths) };
+  // The accepted marker pins this directory's identity: a concurrent install,
+  // swap or prune may replace `<root>/<sha>` after the marker read, and the
+  // files of the replacement tree must not be judged under the old
+  // verification. The identity is re-checked after every file read.
+  const pinned = await pinBuildDirectory(buildDir);
+  if (pinned === null) {
+    return { outcome: 'unreadable' };
+  }
+  const files = await readReleaseFileFacts(buildDir, pinned.real, request.paths);
+  if (!(await pinnedBuildDirectoryHolds(buildDir, pinned, request.sha))) {
+    return { outcome: 'unreadable' };
+  }
+  return { outcome: 'read', files };
+}
+
+/** The pinned identity of the accepted build directory: its inode and real path. */
+interface PinnedBuildDirectory {
+  readonly dev: number;
+  readonly ino: number;
+  readonly real: string;
+}
+
+/**
+ * Constant time aside from one `lstat` and one `realpath`. The build directory
+ * must still be a real directory (not a symlink) at the moment it is pinned.
+ * Any failure is unreadable, not `not-found`: the marker was just accepted.
+ */
+async function pinBuildDirectory(buildDir: string): Promise<PinnedBuildDirectory | null> {
+  try {
+    const stat = await fs.lstat(buildDir);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      return null;
+    }
+    return { dev: stat.dev, ino: stat.ino, real: await fs.realpath(buildDir) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Constant time aside from one `lstat` and one marker read. The build
+ * directory must still be the pinned inode and the marker must still be
+ * accepted; any error or mismatch refuses the whole call.
+ */
+async function pinnedBuildDirectoryHolds(
+  buildDir: string,
+  pinned: PinnedBuildDirectory,
+  sha: string,
+): Promise<boolean> {
+  try {
+    const stat = await fs.lstat(buildDir);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      return false;
+    }
+    if (stat.dev !== pinned.dev || stat.ino !== pinned.ino) {
+      return false;
+    }
+    const marker = await readMarker(path.join(buildDir, MARKER_NAME), sha);
+    return marker !== 'absent' && marker !== null;
+  } catch {
+    return false;
+  }
 }
 
 /** Constant time aside from one `lstat`. A symlink or non-directory is `missing`. */
@@ -1041,11 +1109,15 @@ async function locateBuildDirectory(buildDir: string): Promise<'directory' | 'mi
 }
 
 /**
- * One fact per path, in request order. Cost is linear in `paths.length`
- * (already capped) and in each file's capped bytes.
+ * One fact per path, in request order, judged against the pinned build
+ * directory's real path. Cost is linear in `paths.length` (already capped)
+ * and in each file's capped bytes.
  */
-async function readReleaseFileFacts(buildDir: string, paths: readonly string[]): Promise<readonly ReleaseFileFact[]> {
-  const buildReal = await fs.realpath(buildDir);
+async function readReleaseFileFacts(
+  buildDir: string,
+  buildReal: string,
+  paths: readonly string[],
+): Promise<readonly ReleaseFileFact[]> {
   const files: ReleaseFileFact[] = [];
   for (const relative of paths) {
     files.push(await inspectOneReleaseFile(buildDir, buildReal, relative));
@@ -1200,7 +1272,15 @@ async function openedFileMatchesPath(target: string, buildReal: string, opened: 
     if (!located.isFile()) {
       return false;
     }
-    return located.dev === opened.dev && located.ino === opened.ino;
+    if (located.dev !== opened.dev || located.ino !== opened.ino) {
+      return false;
+    }
+    // A parent component swapped back and forth between the first `realpath`
+    // and `lstat(resolved)` can make an outside inode match the handle. A
+    // second resolution must name exactly the path the matched inode was
+    // found at; any difference or error refuses the handle.
+    const reResolved = await fs.realpath(target);
+    return reResolved === resolved;
   } catch {
     return false;
   }

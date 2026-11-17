@@ -29,6 +29,7 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
@@ -291,6 +292,97 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
     expect(await adapter.inspectReleaseFiles({ root, sha: A, paths: ['a.test.ts'] })).toEqual({ outcome: 'unreadable' });
   });
 
+  it('reports unreadable when the build directory is replaced between the marker read and the file reads', async () => {
+    await verifiedWith({ 'plain.test.ts': 'ok\n' });
+    const buildDir = path.join(root, A);
+    let swapped = false;
+    hookRealpath(async (target) => {
+      if (!swapped && target === buildDir) {
+        swapped = true;
+        // A concurrent install replaces the whole verified tree, marker
+        // included, after the marker was accepted and before the files.
+        await fs.rm(buildDir, { recursive: true });
+        await fs.mkdir(buildDir);
+        await fs.writeFile(
+          path.join(buildDir, '.fleet-release-verified'),
+          JSON.stringify({ version: 1, sha: A, builtAtIso: AT }),
+        );
+        await fs.writeFile(path.join(buildDir, 'plain.test.ts'), 'quarantined(\n');
+      }
+    });
+    expect(await adapter.inspectReleaseFiles({ root, sha: A, paths: ['plain.test.ts'] })).toEqual({
+      outcome: 'unreadable',
+    });
+    expect(swapped).toBe(true);
+  });
+
+  it('reports unreadable when the marker is changed during the read', async () => {
+    await verifiedWith({ 'plain.test.ts': 'ok\n' });
+    const marker = path.join(root, A, '.fleet-release-verified');
+    let changed = false;
+    hookRealpath(async (target) => {
+      if (!changed && target === path.join(root, A)) {
+        changed = true;
+        await fs.writeFile(marker, JSON.stringify({ version: 1, sha: sha('b'), builtAtIso: AT }));
+      }
+    });
+    expect(await adapter.inspectReleaseFiles({ root, sha: A, paths: ['plain.test.ts'] })).toEqual({
+      outcome: 'unreadable',
+    });
+    expect(changed).toBe(true);
+  });
+
+  it('reports unjudgeable when a second realpath differs from the first for the opened file', async () => {
+    const { sha: id } = await verifiedWith({ 'plain.test.ts': 'ok\n' });
+    const target = path.join(root, A, 'plain.test.ts');
+    let resolutions = 0;
+    hookRealpath((resolved) => {
+      if (resolved === target) {
+        resolutions += 1;
+        if (resolutions === 2) {
+          return path.join(root, A, 'plain.other.test.ts');
+        }
+      }
+      return undefined;
+    });
+    expect(await adapter.inspectReleaseFiles({ root, sha: id, paths: ['plain.test.ts'] })).toEqual({
+      outcome: 'read',
+      files: [{ present: true, quarantined: null }],
+    });
+    expect(resolutions).toBeGreaterThanOrEqual(2);
+  });
+
+  it('reads a proxied paths length exactly once and never iterates past the first length', async () => {
+    const { sha: id } = await verifiedWith({ 'plain.test.ts': 'ok\n' });
+    const paths = ['plain.test.ts'];
+    let lengthReads = 0;
+    const proxied = new Proxy(paths, {
+      get(target, key, receiver) {
+        if (key === 'length') {
+          lengthReads += 1;
+          if (lengthReads > 1) {
+            return 99;
+          }
+        }
+        return Reflect.get(target, key, receiver);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'length') {
+          lengthReads += 1;
+          if (lengthReads > 1) {
+            return { value: 99, writable: true, enumerable: true, configurable: true };
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    expect(await adapter.inspectReleaseFiles({ root, sha: id, paths: proxied })).toEqual({
+      outcome: 'read',
+      files: [{ present: true, quarantined: false }],
+    });
+    expect(lengthReads).toBe(1);
+  });
+
   const malformed: ReadonlyArray<readonly [string, (dir: string) => unknown]> = [
     ['a relative root', () => ({ root: 'releases', sha: A, paths: ['a.test.ts'] })],
     ['a 39-hex sha', (dir) => ({ root: dir, sha: 'a'.repeat(39), paths: ['a.test.ts'] })],
@@ -473,6 +565,21 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
 });
 
 type Opened = Awaited<ReturnType<typeof fs.open>>;
+
+/**
+ * A test hook around `fs.realpath`: the hook runs after each real resolution
+ * and may return a replacement result (a swap, a changed tree, a diverging
+ * second resolution). Restored by `afterEach` via `restoreAllMocks`.
+ */
+function hookRealpath(hook: (target: string, result: string) => string | void | Promise<string | void>): void {
+  const original = fs.realpath.bind(fs) as unknown as (target: string) => Promise<string>;
+  const wrapped = (async (target: string) => {
+    const result = await original(target);
+    const override = await hook(target, result);
+    return typeof override === 'string' ? override : result;
+  }) as unknown as typeof fs.realpath;
+  vi.spyOn(fs, 'realpath').mockImplementation(wrapped);
+}
 
 /** The opened descriptor's inode is not the inode of the path on disk. */
 function shiftedIno(handle: Opened): Opened {

@@ -127,6 +127,18 @@ describe('ShadowAttestationAdapter', () => {
     ).toEqual({ outcome: 'conflict', currentRevision: 1 });
   });
 
+  it('reports a conflict before validating a structurally invalid next on the disk path, never refused', async () => {
+    const adapter = new ShadowAttestationAdapter({ stateDir: tempDir });
+    await adapter.compareAndSet({ expectedRevision: 0, next: attestationLedger(1) });
+    expect(
+      await adapter.compareAndSet({
+        expectedRevision: 5,
+        next: { ...attestationLedger(2), attestations: 'nope' } as unknown as ShadowAttestationLedger,
+      }),
+    ).toEqual({ outcome: 'conflict', currentRevision: 1 });
+    expect(await adapter.read()).toEqual({ status: 'ok', ledger: attestationLedger(1) });
+  });
+
   it('refuses a next ledger whose revision is not expectedRevision + 1 or that is structurally invalid', async () => {
     const adapter = new ShadowAttestationAdapter({ stateDir: tempDir });
     expect(
@@ -212,6 +224,76 @@ describe('ShadowAttestationAdapter', () => {
       reason: 'invalid-request',
     });
     expect(await fs.access(target).then(() => true, () => false)).toBe(false);
+  });
+
+  it('refuses a class-instance request as invalid-request with no I/O', async () => {
+    const adapter = new ShadowAttestationAdapter({ stateDir: tempDir });
+    const validNext = attestationLedger(1);
+    class InstanceRequest {
+      revision = 1;
+      next = validNext;
+    }
+    expect(await adapter.compareAndSet(new InstanceRequest() as never)).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+    });
+    expect(await fs.access(target).then(() => true, () => false)).toBe(false);
+  });
+
+  it('refuses a deadline already in the past before any store read, even an unreadable one', async () => {
+    await fs.writeFile(target, '{ not json');
+    const adapter = new ShadowAttestationAdapter({ stateDir: tempDir, nowIso: () => '2026-11-16T12:00:00.000Z' });
+    // The file on disk is unreadable, so a read would answer 'unreadable'; the
+    // deadline refusal must win BEFORE that read, and no fs call may happen.
+    const spies = [
+      vi.spyOn(fs, 'lstat'),
+      vi.spyOn(fs, 'open'),
+      vi.spyOn(fs, 'readFile'),
+      vi.spyOn(fs, 'mkdir'),
+    ];
+    try {
+      expect(
+        await adapter.compareAndSet({
+          expectedRevision: 0,
+          next: attestationLedger(1),
+          deadlineIso: '2026-11-16T11:00:00.000Z',
+        }),
+      ).toEqual({ outcome: 'refused', reason: 'deadline-exceeded' });
+      for (const spy of spies) {
+        expect(spy).not.toHaveBeenCalled();
+      }
+    } finally {
+      for (const spy of spies) {
+        spy.mockRestore();
+      }
+    }
+    expect(await fs.readFile(target, 'utf8')).toBe('{ not json');
+  });
+
+  it('writes a successful compare-and-set through a temp file and rename, never the target directly', async () => {
+    const adapter = new ShadowAttestationAdapter({ stateDir: tempDir });
+    await adapter.compareAndSet({ expectedRevision: 0, next: attestationLedger(1) });
+    const writeFileSpy = vi.spyOn(fs, 'writeFile');
+    const renameSpy = vi.spyOn(fs, 'rename');
+    try {
+      expect(await adapter.compareAndSet({ expectedRevision: 1, next: attestationLedger(2) })).toEqual({
+        outcome: 'saved',
+        ledger: attestationLedger(2),
+      });
+      expect(renameSpy).toHaveBeenCalledTimes(1);
+      const [renamedFrom, renamedTo] = renameSpy.mock.calls[0];
+      expect(renamedTo).toBe(target);
+      expect(renamedFrom).not.toBe(target);
+      // Every direct writeFile call (the lock takes its own file handle) aims
+      // at a temp path, never the store itself.
+      for (const [writtenPath] of writeFileSpy.mock.calls) {
+        expect(writtenPath).not.toBe(target);
+      }
+      expect(JSON.parse(await fs.readFile(target, 'utf8'))).toMatchObject({ revision: 2 });
+    } finally {
+      writeFileSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
   });
 
   it('reports unknown-version and refuses to overwrite it, bytes unchanged', async () => {
@@ -325,20 +407,37 @@ describe('ShadowAttestationAdapter', () => {
     expect((read as { ledger: ShadowAttestationLedger }).ledger.revision).toBe(1);
   });
 
-  it('refuses a file name that is unsafe or collides with another store', () => {
-    for (const fileName of [
-      'cutover-shadow.json',
-      'cutover.json',
-      'cutover-journal.json',
-      'killall-train-pause.json',
-      '../x.json',
-      'a/b.json',
-      '',
-    ]) {
-      expect(() => new ShadowAttestationAdapter({ stateDir: tempDir, fileName })).toThrow();
-    }
-    expect(() => new ShadowAttestationAdapter({ stateDir: tempDir, fileName: 'cutover-shadow-attestations-alt.json' }))
-      .not.toThrow();
+  it.each([
+    // Every name in ShadowAttestationAdapter's private OTHER_STORE_FILE_NAMES
+    // list, spelled out here so dropping any one entry from that list fails
+    // this test.
+    'work-orders.json',
+    'attempts.json',
+    'journal.json',
+    'reservations.json',
+    'lane-runs.json',
+    'run-journal.json',
+    'conductor-driver-lease.json',
+    'conductor-halt.json',
+    'killall-halt.json',
+    'killall-train-pause.json',
+    'cutover.json',
+    'cutover-journal.json',
+    'merge-queue.json',
+    'merge-records.json',
+    'cutover-shadow.json',
+  ])('refuses a file name that collides with another store (%s)', (fileName) => {
+    expect(() => new ShadowAttestationAdapter({ stateDir: tempDir, fileName })).toThrow();
+  });
+
+  it.each(['../x.json', 'a/b.json', '', '.', '..'])('refuses an unsafe file name (%s)', (fileName) => {
+    expect(() => new ShadowAttestationAdapter({ stateDir: tempDir, fileName })).toThrow();
+  });
+
+  it('accepts a safe file name that collides with no other store', () => {
+    expect(() =>
+      new ShadowAttestationAdapter({ stateDir: tempDir, fileName: 'cutover-shadow-attestations-alt.json' }),
+    ).not.toThrow();
   });
 
   it('is described to `fleet-v2 state` as the single-record store cutover-shadow-attestations.json', async () => {

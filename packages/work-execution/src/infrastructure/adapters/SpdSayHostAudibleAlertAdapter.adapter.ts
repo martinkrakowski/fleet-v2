@@ -133,8 +133,12 @@ function isHostileRequestShape(request: unknown): boolean {
  * Whether the injected candidate list may be traversed: a plain (non-Proxy)
  * array within the cap whose length is read once from its own descriptor and
  * whose every entry is a string read from its own data descriptor, without a
- * polluting own key, hole, or accessor element. The WHOLE list is validated
- * before any entry is probed. `isProxy` observes no trap and no getter.
+ * polluting own key, hole, or accessor element. The list must carry no own
+ * accessor property and no own key other than the canonical indices and
+ * `length` (this covers an own `Symbol.iterator` override, whose getter or
+ * data property would otherwise let iteration yield unvalidated paths). The
+ * WHOLE list is validated before any entry is probed. `isProxy` observes no
+ * trap and no getter.
  */
 function isTraversableCandidateList(candidates: unknown): boolean {
   if (!Array.isArray(candidates) || types.isProxy(candidates)) {
@@ -144,10 +148,28 @@ function isTraversableCandidateList(candidates: unknown): boolean {
   if (lengthDescriptor === undefined || !('value' in lengthDescriptor) || typeof lengthDescriptor.value !== 'number') {
     return false;
   }
-  if (lengthDescriptor.value > SPD_SAY_MAX_CANDIDATES || hasPollutingKey(candidates)) {
+  const length = lengthDescriptor.value;
+  if (length > SPD_SAY_MAX_CANDIDATES || hasPollutingKey(candidates)) {
     return false;
   }
-  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+  for (const key of Reflect.ownKeys(candidates)) {
+    // Only the canonical indices and `length` may be own keys; any other key
+    // (including a `Symbol.iterator` override) is refused.
+    if (typeof key === 'symbol' || (key !== 'length' && !/^(0|[1-9][0-9]*)$/.test(key))) {
+      return false;
+    }
+    if (key !== 'length' && Number(key) >= length) {
+      return false;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(candidates, key);
+    if (descriptor === undefined || !('value' in descriptor) || ('get' in descriptor || 'set' in descriptor)) {
+      return false;
+    }
+    if (key !== 'length' && typeof descriptor.value !== 'string') {
+      return false;
+    }
+  }
+  for (let index = 0; index < length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(candidates, index);
     if (descriptor === undefined || !('value' in descriptor) || ('get' in descriptor || 'set' in descriptor)) {
       return false;
@@ -204,18 +226,24 @@ type BinaryResolution =
  * Resolve the binary from the candidate list. The WHOLE list is validated
  * first (see `isTraversableCandidateList`), read only through own
  * descriptors (no getter runs, no Proxy trap runs); only then is any entry
- * probed. Cost is linear in the
+ * probed. The caller's array is never iterated: each validated entry is
+ * copied by own data descriptor (indices `0 .. length-1`, length captured
+ * once) into a NEW local array, and only that copy is used, with an index
+ * loop, for probing — so an own `Symbol.iterator` override can never yield a
+ * path that was not validated. Cost is linear in the
  * list length, capped by `SPD_SAY_MAX_CANDIDATES` (16).
  */
 function resolveBinary(candidates: unknown, isExecutable: (candidate: string) => boolean): BinaryResolution {
   if (!isTraversableCandidateList(candidates)) {
     return { ok: false, reasonCode: 'invalid-request' };
   }
-  const list = candidates as readonly unknown[];
-  for (const candidate of list) {
-    if (typeof candidate !== 'string') {
-      return { ok: false, reasonCode: 'invalid-request' };
-    }
+  const length = (Object.getOwnPropertyDescriptor(candidates, 'length') as PropertyDescriptor).value as number;
+  const validated: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    validated.push((Object.getOwnPropertyDescriptor(candidates, index) as PropertyDescriptor).value as string);
+  }
+  for (let index = 0; index < validated.length; index += 1) {
+    const candidate = validated[index];
     // A relative candidate is ignored even when the probe would accept it.
     if (!isAbsoluteCandidate(candidate)) {
       continue;

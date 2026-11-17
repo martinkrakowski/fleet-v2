@@ -462,6 +462,89 @@ describe('SpdSayHostAudibleAlertAdapter.speak refusals', () => {
     expect(probes).toBe(0);
     expect(runs).toBe(0);
   });
+
+  it('refuses a valid candidates array with an own Symbol.iterator getter without running the getter or probing', async () => {
+    let probes = 0;
+    let runs = 0;
+    let iteratorGetterCalls = 0;
+    const candidates: string[] = [scriptPath];
+    Object.defineProperty(candidates, Symbol.iterator, {
+      configurable: true,
+      enumerable: false,
+      get() {
+        iteratorGetterCalls += 1;
+        return function* () {
+          yield '/tmp/evil-unvalidated';
+        };
+      },
+    });
+    const adapter = new SpdSayHostAudibleAlertAdapter({
+      candidates: candidates as readonly string[],
+      isExecutable: () => {
+        probes += 1;
+        return true;
+      },
+      run: async () => {
+        runs += 1;
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    });
+    expect(await adapter.speak({ sentence: 'all clear' })).toEqual(REFUSED);
+    expect(iteratorGetterCalls).toBe(0);
+    expect(probes).toBe(0);
+    expect(runs).toBe(0);
+  });
+
+  it('refuses a candidates array whose Symbol.iterator is an overridden data property yielding an unvalidated path', async () => {
+    let probes = 0;
+    let runs = 0;
+    const candidates: string[] = [scriptPath];
+    Object.defineProperty(candidates, Symbol.iterator, {
+      configurable: true,
+      enumerable: false,
+      value: function* () {
+        yield '/tmp/evil-unvalidated';
+      },
+    });
+    const adapter = new SpdSayHostAudibleAlertAdapter({
+      candidates: candidates as readonly string[],
+      isExecutable: () => {
+        probes += 1;
+        return true;
+      },
+      run: async () => {
+        runs += 1;
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    });
+    expect(await adapter.speak({ sentence: 'all clear' })).toEqual(REFUSED);
+    expect(probes).toBe(0);
+    expect(runs).toBe(0);
+  });
+
+  it('probes exactly the validated paths of a normal valid array, in order', async () => {
+    const probed: string[] = [];
+    const runs: string[][] = [];
+    const first = path.join(workDir, 'first-probe');
+    const second = path.join(workDir, 'second-probe');
+    writeFileSync(first, '#!/bin/sh\n', { mode: 0o755 });
+    writeFileSync(second, '#!/bin/sh\n', { mode: 0o755 });
+    const adapter = new SpdSayHostAudibleAlertAdapter({
+      candidates: [first, second],
+      isExecutable: (candidate) => {
+        probed.push(candidate);
+        // Probe every validated path in order, but only accept the second.
+        return candidate === second;
+      },
+      run: async (file, args) => {
+        runs.push([file, ...args]);
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    });
+    expect(await adapter.speak({ sentence: 'all clear' })).toEqual({ outcome: 'spoken' });
+    expect(probed).toEqual([first, second]);
+    expect(runs).toEqual([[second, 'all clear']]);
+  });
 });
 
 describe('SpdSayHostAudibleAlertAdapter binary resolution', () => {

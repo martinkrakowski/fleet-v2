@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../src/domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../src/application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { RequestScopedDecisionUseCase } from '../src/application/use-cases/RequestScopedDecisionUseCase.use-case.js';
+import { ResolveActionAuthorizationUseCase } from '../src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
+import { RecordAuthorizationConsumptionUseCase } from '../src/application/use-cases/RecordAuthorizationConsumptionUseCase.use-case.js';
 
 class InMemoryCoordinationRequestRepo implements CoordinationRequestRepositoryPort {
   private requests = new Map<string, CoordinationRequestRecord>();
@@ -95,5 +97,226 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
     // Verify existing record was untouched
     const stored = await repo.findRequestById('req-dup-1');
     expect(stored).toEqual(existing);
+  });
+
+  it('records and persists the release root a release decision names, and resolves it only for that root', async () => {
+    // The ordinary decision flow: the request records the proposal first, then
+    // the verified answer approves it; the recorded grant carries the release
+    // root the decision named.
+    const repo = new InMemoryCoordinationRequestRepo();
+    const useCase = new RequestScopedDecisionUseCase({
+      requestRepo: repo,
+      decisionTransport: {
+        readDecisionAnswer: async () => ({
+          state: 'approved',
+          decisionRevision: 'dec-root-1',
+          grantId: 'grant-root-1',
+        }),
+      },
+    });
+    const requested = await useCase.requestScopedDecision({
+      requestId: 'req-root-1',
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      actionScope: 'release:install',
+      expectedHeadSha: '3333333333333333333333333333333333333333',
+      proposalDigest: 'digest-root',
+      policyRevision: 'pol-1',
+      releaseRoot: '/srv/fleet/releases',
+    });
+    expect(requested.outcome).toBe('requested');
+    const recorded = await repo.findRequestById('req-root-1');
+    expect(recorded?.releaseRoot).toBe('/srv/fleet/releases');
+    expect(recorded?.state).toBe('approved');
+    expect(recorded?.grantId).toBe('grant-root-1');
+    // The recorded grant resolves for the root it names and for no other.
+    const resolver = new ResolveActionAuthorizationUseCase({ requestRepo: repo });
+    const resolve = await resolver.resolveActionAuthorization({
+      projectId: 'proj-1',
+      actionScope: 'release:install',
+      expectedHeadSha: '3333333333333333333333333333333333333333',
+      releaseRoot: '/srv/fleet/releases',
+    });
+    expect(resolve.outcome).toBe('authorized');
+    const otherRoot = await resolver.resolveActionAuthorization({
+      projectId: 'proj-1',
+      actionScope: 'release:install',
+      expectedHeadSha: '3333333333333333333333333333333333333333',
+      releaseRoot: '/srv/fleet/other',
+    });
+    expect(otherRoot).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
+  });
+
+  it('refuses, never throws, when the request carries a throwing own releaseRoot getter', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const head = '4444444444444444444444444444444444444444';
+    await repo.saveRequest({
+      id: 'req-hostile-1',
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'release:install',
+      expectedHeadSha: head,
+      proposalDigest: 'digest-h',
+      policyRevision: 'pol-1',
+      decisionRevision: 'dec-1',
+      grantId: 'grant-hostile-1',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-10T10:00:00.000Z',
+      updatedAtIso: '2026-11-10T10:00:00.000Z',
+    } as CoordinationRequestRecord);
+    const hostile = <T extends object>(base: T): T =>
+      Object.defineProperty({ ...base }, 'releaseRoot', {
+        enumerable: true,
+        get() {
+          throw new Error('hostile getter ran');
+        },
+      }) as T;
+    const resolved = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).resolveActionAuthorization(
+      hostile({ projectId: 'proj-1', actionScope: 'release:install', expectedHeadSha: head }),
+    );
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
+    const consumed = await new RecordAuthorizationConsumptionUseCase({
+      requestRepo: repo,
+    }).recordAuthorizationConsumption(
+      hostile({
+        consumptionId: 'cons-1',
+        grantId: 'grant-hostile-1',
+        actionId: 'action-1',
+        actionScope: 'release:install',
+        attemptId: 'action-1',
+        expectedHeadSha: head,
+      }),
+    );
+    expect(consumed).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+    expect((await repo.findRequestByGrantId('grant-hostile-1'))?.consumptions).toEqual([]);
+  });
+
+  it('refuses both resolve and consume when the STORED releaseRoot is malformed, with the request root omitted or present', async () => {
+    const head = '5555555555555555555555555555555555555555';
+    const storedAccessor = {} as Record<string, unknown>;
+    Object.defineProperty(storedAccessor, 'releaseRoot', { enumerable: true, get: () => '/srv/fleet/releases' });
+    const storedThrowing = {} as Record<string, unknown>;
+    Object.defineProperty(storedThrowing, 'releaseRoot', {
+      enumerable: true,
+      get: () => {
+        throw new Error('stored getter ran');
+      },
+    });
+    const corruptions: Array<[string, Record<string, unknown>]> = [
+      ['wrong primitive', { releaseRoot: 7 }],
+      ['object', { releaseRoot: { path: '/srv/fleet/releases' } }],
+      ['empty string', { releaseRoot: '' }],
+      ['null', { releaseRoot: null }],
+      ['accessor', storedAccessor],
+      ['throwing accessor', storedThrowing],
+    ];
+    for (const [label, corruption] of corruptions) {
+      for (const requested of [undefined, '/srv/fleet/releases']) {
+        const repo = new InMemoryCoordinationRequestRepo();
+        const grantId = `grant-corrupt-${label.replaceAll(' ', '-')}`;
+        const base = {
+          id: `req-${grantId}`,
+          projectId: 'proj-1',
+          kind: 'action-decision',
+          state: 'approved',
+          actionScope: 'release:install',
+          expectedHeadSha: head,
+          proposalDigest: 'digest-c',
+          policyRevision: 'pol-1',
+          decisionRevision: 'dec-1',
+          grantId,
+          consumptions: [],
+          acknowledgements: [],
+          deliveryStatus: 'delivered',
+          deliveryGapReason: null,
+          revision: 1,
+          createdAtIso: '2026-11-10T10:00:00.000Z',
+          updatedAtIso: '2026-11-10T10:00:00.000Z',
+        };
+        const stored = Object.defineProperties(
+          { ...base },
+          Object.getOwnPropertyDescriptors(corruption),
+        ) as unknown as CoordinationRequestRecord;
+        await repo.saveRequest(stored);
+        const root = requested === undefined ? {} : { releaseRoot: requested };
+        const resolved = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).resolveActionAuthorization({
+          projectId: 'proj-1',
+          actionScope: 'release:install',
+          expectedHeadSha: head,
+          ...root,
+        });
+        expect(resolved, `resolve ${label} ${String(requested)}`).toEqual({
+          outcome: 'blocked',
+          reason: 'release-grant-root-mismatch',
+        });
+        const consumed = await new RecordAuthorizationConsumptionUseCase({
+          requestRepo: repo,
+        }).recordAuthorizationConsumption({
+          consumptionId: 'cons-1',
+          grantId,
+          actionId: 'action-1',
+          actionScope: 'release:install',
+          attemptId: 'action-1',
+          expectedHeadSha: head,
+          ...root,
+        });
+        expect(consumed, `consume ${label} ${String(requested)}`).toEqual({
+          outcome: 'refused',
+          reason: 'release-grant-root-mismatch',
+        });
+        expect((await repo.findRequestByGrantId(grantId))?.consumptions).toEqual([]);
+      }
+    }
+  });
+
+  it('rejects, never throws, a decision request with a throwing own releaseRoot getter', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const useCase = new RequestScopedDecisionUseCase({ requestRepo: repo });
+    const request = Object.defineProperty(
+      {
+        requestId: 'req-getter-1',
+        projectId: 'proj-1',
+        kind: 'action-decision',
+        actionScope: 'release:install',
+        expectedHeadSha: '3333333333333333333333333333333333333333',
+        proposalDigest: 'digest-g',
+        policyRevision: 'pol-1',
+      },
+      'releaseRoot',
+      {
+        enumerable: true,
+        get() {
+          throw new Error('hostile getter ran');
+        },
+      },
+    );
+    const result = await useCase.requestScopedDecision(request as never);
+    expect(result.outcome).toBe('rejected');
+    expect(await repo.listRequests('proj-1')).toEqual([]);
+  });
+
+  it('refuses a decision request whose releaseRoot is not a bounded absolute path', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const useCase = new RequestScopedDecisionUseCase({ requestRepo: repo });
+    for (const hostileRoot of ['relative/path', '/srv/../etc', '/srv/x\0y', `/${'r'.repeat(4097)}`, 7]) {
+      const result = await useCase.requestScopedDecision({
+        requestId: `req-bad-${String(hostileRoot).length}`,
+        projectId: 'proj-1',
+        kind: 'action-decision',
+        actionScope: 'release:install',
+        expectedHeadSha: '3333333333333333333333333333333333333333',
+        proposalDigest: 'digest-bad',
+        policyRevision: 'pol-1',
+        releaseRoot: hostileRoot as never,
+      });
+      expect(result.outcome).toBe('rejected');
+    }
+    // Nothing was recorded for any of the refused roots.
+    expect(await repo.listRequests('proj-1')).toEqual([]);
   });
 });

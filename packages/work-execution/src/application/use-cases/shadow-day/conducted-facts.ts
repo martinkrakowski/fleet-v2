@@ -82,6 +82,40 @@ const refused = (reason: ShadowConformanceRunsUnknown): ShadowConformanceRunsRea
 });
 
 /**
+ * The interior refusal: any read of caller-supplied structure (the request,
+ * a value copied out of it, a run or journal record, a repository ref) that
+ * throws is turned into this fixed, message-free refusal; the reader's outer
+ * catch turns it into the typed `unknown` result, so the reader never rejects
+ * on hostile input.
+ */
+class FactsRefusal extends Error {
+  constructor(readonly reason: ShadowConformanceRunsUnknown) {
+    super('shadow-conformance-facts-refusal');
+  }
+}
+
+/** Refuse with `reason`; always throws, so the caller's flow stops here. */
+const refusal = (reason: ShadowConformanceRunsUnknown): never => {
+  throw new FactsRefusal(reason);
+};
+
+/**
+ * Read caller-supplied structure through `read`; any throw becomes the
+ * refusal for `reason` (an interior refusal keeps its own reason). Cost:
+ * the cost of `read`.
+ */
+function readOrRefuse<T>(reason: ShadowConformanceRunsUnknown, read: () => T): T {
+  try {
+    return read();
+  } catch (error) {
+    if (error instanceof FactsRefusal) {
+      throw error;
+    }
+    throw new FactsRefusal(reason);
+  }
+}
+
+/**
  * The deadline check: a `nowIso` that throws, is not a zoned ISO time, or is
  * at or past `deadlineIso` (instant comparison, never string comparison)
  * reads as past the deadline. Cost: O(1).
@@ -199,7 +233,7 @@ async function readJournalLists(
   runIds: readonly string[],
   isPast: () => boolean,
 ): Promise<JournalListsRead> {
-  const listForRuns = journal.listForRuns;
+  const listForRuns = readOrRefuse('journal-unreadable', () => journal.listForRuns);
   if (listForRuns !== undefined) {
     let grouped: ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>;
     try {
@@ -210,12 +244,14 @@ async function readJournalLists(
     if (!(grouped instanceof Map)) {
       return { ok: false, reason: 'journal-unreadable' };
     }
-    for (const runId of runIds) {
-      const entries = grouped.get(runId);
-      if (!grouped.has(runId) || !Array.isArray(entries)) {
-        return { ok: false, reason: 'journal-unreadable' };
+    readOrRefuse('journal-unreadable', () => {
+      for (const runId of runIds) {
+        const entries = grouped.get(runId);
+        if (!grouped.has(runId) || !Array.isArray(entries)) {
+          refusal('journal-unreadable');
+        }
       }
-    }
+    });
     return { ok: true, byRunId: grouped };
   }
   const byRunId = new Map<string, readonly LaneRunJournalEntryRecord[]>();
@@ -252,11 +288,13 @@ async function resolveLatestCollectedHead(
   run: LaneRunRecord,
   isPast: () => boolean,
 ): Promise<HeadResolutionRead> {
-  for (let index = run.attemptIds.length - 1; index >= 0; index -= 1) {
+  const attemptIds = readOrRefuse('runs-unreadable', () => run.attemptIds);
+  const attemptCount = readOrRefuse('runs-unreadable', () => attemptIds.length);
+  for (let index = attemptCount - 1; index >= 0; index -= 1) {
     if (isPast()) {
       return { ok: false, reason: 'deadline-exceeded' };
     }
-    const attemptId = run.attemptIds[index]!;
+    const attemptId = readOrRefuse('attempt-unreadable', () => attemptIds[index]!);
     let attempt: AttemptRecord | null;
     try {
       attempt = await attempts.findAttemptById(attemptId);
@@ -266,8 +304,8 @@ async function resolveLatestCollectedHead(
     if (attempt === null) {
       return { ok: false, reason: 'attempt-unreadable' };
     }
-    const headCommit = attempt.artifacts?.headCommit;
-    if (attempt.artifacts !== null && typeof headCommit === 'string' && HEAD_HEX_40_PATTERN.test(headCommit)) {
+    const headCommit = readOrRefuse('attempt-unreadable', () => (attempt.artifacts === null ? null : attempt.artifacts.headCommit));
+    if (headCommit !== null && typeof headCommit === 'string' && HEAD_HEX_40_PATTERN.test(headCommit)) {
       return { ok: true, attemptId, headOid: headCommit };
     }
   }
@@ -290,10 +328,17 @@ async function readHeadReceipts(
   } catch {
     return { ok: false, reason: 'receipts-unavailable' };
   }
-  if (read.outcome === 'found') {
-    return { ok: true, reviews: read.review };
+  const found = readOrRefuse('receipts-unavailable', (): { readonly found: true; readonly reviews: readonly ReviewReceiptProjection[] } | null => {
+    if (read.outcome === 'found') {
+      return { found: true, reviews: read.review };
+    }
+    return null;
+  });
+  if (found !== null) {
+    return { ok: true, reviews: found.reviews };
   }
-  if (read.outcome === 'none') {
+  const outcome = readOrRefuse('receipts-unavailable', () => read.outcome);
+  if (outcome === 'none') {
     return { ok: true, reviews: [] };
   }
   return { ok: false, reason: 'receipts-unavailable' };
@@ -320,7 +365,10 @@ function toConformanceReviewReceipt(receipt: ReviewReceiptProjection) {
  * Read the conducted-run conformance facts for the runs whose pull requests
  * the shell merged in the window: each run's latest collected head, the
  * review receipts of that attempt at that head, and the run's journal.
- * Cost: linear in the capped input; the caps
+ * The whole read runs inside the outer refusal catch, so any throw from the
+ * request, from a value copied out of it, from a run or journal record, or
+ * from a repository ref becomes the typed `unknown` result — never a
+ * rejection. Cost: linear in the capped input; the caps
  * (`SHADOW_CONFORMANCE_MAX_RUNS`, `SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`,
  * `SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS`) are named constants.
  */
@@ -328,73 +376,104 @@ export async function readShadowConformanceRuns(
   deps: ShadowConformanceRunsDependencies,
   request: unknown,
 ): Promise<ShadowConformanceRunsRead> {
-  const snapshot = readExactPlainRecord(request, REQUEST_KEYS);
-  if (snapshot === null) {
-    return refused('invalid-request');
+  try {
+    return await readConformanceRunsOrRefuse(deps, request);
+  } catch (error) {
+    if (error instanceof FactsRefusal) {
+      return refused(error.reason);
+    }
+    throw error;
   }
-  const mergedPullRequests = readMergedPullRequestIds(snapshot.mergedPullRequests);
+}
+
+/** The interior read: every `unknown` outcome is a `FactsRefusal`. */
+async function readConformanceRunsOrRefuse(
+  deps: ShadowConformanceRunsDependencies,
+  request: unknown,
+): Promise<ShadowConformanceRunsRead> {
+  const snapshot = readOrRefuse('invalid-request', () => readExactPlainRecord(request, REQUEST_KEYS));
+  if (snapshot === null) {
+    return refusal('invalid-request');
+  }
+  const mergedPullRequests = readOrRefuse('invalid-request', () => readMergedPullRequestIds(snapshot.mergedPullRequests));
   if (mergedPullRequests === null) {
-    return refused('invalid-request');
+    return refusal('invalid-request');
   }
   if (typeof snapshot.deadlineIso !== 'string' || !isZonedIsoDateTime(snapshot.deadlineIso)) {
-    return refused('invalid-request');
+    return refusal('invalid-request');
   }
   const deadlineIso = snapshot.deadlineIso;
-  const isPast = (): boolean => isPastDeadline(deps.nowIso, deadlineIso);
+  const isPast = (): boolean => isPastDeadline(readOrRefuse('deadline-exceeded', () => deps.nowIso), deadlineIso);
   if (isPast()) {
-    return refused('deadline-exceeded');
+    return refusal('deadline-exceeded');
   }
 
   let runRecords: readonly LaneRunRecord[];
   try {
     runRecords = await deps.runs.list();
   } catch {
-    return refused('runs-unreadable');
+    return refusal('runs-unreadable');
   }
   if (!Array.isArray(runRecords)) {
-    return refused('runs-unreadable');
+    return refusal('runs-unreadable');
   }
-  const candidates = selectCandidateRuns(runRecords, mergedPullRequests);
+  const candidates = readOrRefuse('runs-unreadable', () => selectCandidateRuns(runRecords, mergedPullRequests));
   if (candidates.length > SHADOW_CONFORMANCE_MAX_RUNS) {
-    return refused('too-many-runs');
+    return refusal('too-many-runs');
   }
   if (isPast()) {
-    return refused('deadline-exceeded');
+    return refusal('deadline-exceeded');
   }
 
-  const runIds = candidates.map((run) => run.runId);
-  const journals = await readJournalLists(deps.journal, runIds, isPast);
+  const runIds = readOrRefuse('runs-unreadable', () => candidates.map((run) => run.runId));
+  const journals = await readJournalLists(readOrRefuse('journal-unreadable', () => deps.journal), runIds, isPast);
   if (!journals.ok) {
-    return refused(journals.reason);
+    return refusal(journals.reason);
   }
+  const cappedEntries = new Map<string, readonly LaneRunJournalEntryRecord[]>();
   for (const run of candidates) {
-    const entries = journals.byRunId.get(run.runId);
-    if (entries === undefined || entries.length > SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN) {
-      return refused('too-many-journal-entries');
+    const runId = readOrRefuse('runs-unreadable', () => run.runId);
+    const entries = readOrRefuse('journal-unreadable', () => journals.byRunId.get(runId));
+    if (entries === undefined) {
+      return refusal('too-many-journal-entries');
     }
+    const entryCount = readOrRefuse('journal-unreadable', () => entries.length);
+    if (entryCount > SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN) {
+      return refusal('too-many-journal-entries');
+    }
+    cappedEntries.set(runId, entries);
   }
 
   const runs: ShadowConformanceRun[] = [];
   for (const run of candidates) {
-    const head = await resolveLatestCollectedHead(deps.attempts, run, isPast);
+    const runId = readOrRefuse('runs-unreadable', () => run.runId);
+    const head = await resolveLatestCollectedHead(readOrRefuse('attempt-unreadable', () => deps.attempts), run, isPast);
     if (!head.ok) {
-      return refused(head.reason);
+      return refusal(head.reason);
     }
     if (isPast()) {
-      return refused('deadline-exceeded');
+      return refusal('deadline-exceeded');
     }
-    const receipts = await readHeadReceipts(deps.receipts, head.attemptId, head.headOid);
+    const receipts = await readHeadReceipts(
+      readOrRefuse('receipts-unavailable', () => deps.receipts),
+      head.attemptId,
+      head.headOid,
+    );
     if (!receipts.ok) {
-      return refused(receipts.reason);
+      return refusal(receipts.reason);
     }
-    const entries = journals.byRunId.get(run.runId) ?? [];
+    const entryRecords = cappedEntries.get(runId) ?? [];
+    const journal = readOrRefuse('journal-unreadable', () => entryRecords.map(toConformanceJournalEntry));
+    const reviewReceipts = readOrRefuse('receipts-unavailable', () => receipts.reviews.map(toConformanceReviewReceipt));
+    const tier = readOrRefuse('runs-unreadable', () => run.tier);
+    const pullRequest = readOrRefuse('runs-unreadable', () => run.prNumber!);
     runs.push({
-      runId: run.runId,
-      tier: run.tier,
-      pullRequest: run.prNumber!,
+      runId,
+      tier,
+      pullRequest,
       headOid: head.headOid,
-      reviewReceipts: receipts.reviews.map(toConformanceReviewReceipt),
-      journal: entries.map(toConformanceJournalEntry),
+      reviewReceipts,
+      journal,
     });
   }
   runs.sort((a, b) => (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));

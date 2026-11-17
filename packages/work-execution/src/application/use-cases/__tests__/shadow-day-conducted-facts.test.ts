@@ -748,6 +748,51 @@ describe('readShadowConformanceRuns hostile input', () => {
     expect(getCalls).toBe(0);
   });
 
+  it('a request Proxy whose ownKeys trap throws yields unknown/invalid-request and nothing rejects', async () => {
+    const deps = makeDeps({});
+    let ownKeysCalls = 0;
+    const proxied = new Proxy(request(), {
+      ownKeys: () => {
+        ownKeysCalls += 1;
+        throw new Error(UNREADABLE_ERROR);
+      },
+    });
+    const result = await readShadowConformanceRuns(deps, proxied);
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+    expect(ownKeysCalls).toBeLessThanOrEqual(1);
+    expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
+  });
+
+  it('a request Proxy whose getPrototypeOf trap throws yields unknown/invalid-request and nothing rejects', async () => {
+    const deps = makeDeps({});
+    const proxied = new Proxy(request(), {
+      getPrototypeOf: () => {
+        throw new Error(UNREADABLE_ERROR);
+      },
+    });
+    const result = await readShadowConformanceRuns(deps, proxied);
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+    expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
+  });
+
+  it('a repository ref whose ownKeys trap throws yields a typed result and nothing rejects', async () => {
+    const deps = makeDeps({
+      runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+      attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+      receipts: () => ({ outcome: 'none' }),
+    });
+    const proxiedRuns = new Proxy(deps.runs, {
+      ownKeys: () => {
+        throw new Error(UNREADABLE_ERROR);
+      },
+    });
+    const result = await readShadowConformanceRuns({ ...deps, runs: proxiedRuns }, request());
+    expect(result.status).toBe('ok');
+    expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
+  });
+
   it('refuses a prototype-polluting own key from JSON.parse with unknown/invalid-request', async () => {
     const deps = makeDeps({});
     const hostile = JSON.parse(

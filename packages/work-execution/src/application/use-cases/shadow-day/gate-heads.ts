@@ -355,7 +355,19 @@ function runHeadsOf(
     refuse('too-many-journal-entries');
   }
   const heads = new Map<string, PushedHead>();
-  for (const entry of entries) {
+  // The journal-entry array is read once, each entry through its own
+  // data-property descriptor, into a private array: a store-provided array is
+  // never traversed with `for...of`, `.map` or spread, so no getter can run.
+  // An accessor-backed or missing entry refuses — never a silent skip.
+  const entryRecords: LaneRunJournalEntryRecord[] = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    const element = readStoreField('journal-unreadable', entries, String(index));
+    if (element === undefined || element === null) {
+      refuse('journal-unreadable');
+    }
+    entryRecords.push(element as LaneRunJournalEntryRecord);
+  }
+  for (const entry of entryRecords) {
     const pushed = pushedHeadOf(entry, windowStartMs, windowEndMs);
     if (pushed === null) {
       continue;
@@ -367,7 +379,7 @@ function runHeadsOf(
   }
   const verdicts = new Map<string, 'pass' | 'fail'>();
   for (const head12 of heads.keys()) {
-    const verdict = verdictOf(entries, head12);
+    const verdict = verdictOf(entryRecords, head12);
     if (verdict !== null) {
       verdicts.set(head12, verdict);
     }
@@ -599,7 +611,19 @@ async function readRunRecordsOrRefuse(
   if (isPast()) {
     refuse('deadline-exceeded');
   }
-  return runRecords;
+  // The stored runs are read once, each element through its own data-property
+  // descriptor, into a private array: a store-provided array is never
+  // traversed with `for...of`, `.map` or spread, so no getter can run. An
+  // accessor-backed or missing element refuses — never a silent skip.
+  const runList: LaneRunRecord[] = [];
+  for (let index = 0; index < runCount; index += 1) {
+    const element = readStoreField('runs-unreadable', runRecords, String(index));
+    if (element === undefined || element === null) {
+      refuse('runs-unreadable');
+    }
+    runList.push(element as LaneRunRecord);
+  }
+  return runList;
 }
 
 /**

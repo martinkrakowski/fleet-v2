@@ -939,5 +939,74 @@ describe('readShadowGateHeads', () => {
       expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
       expect((globalThis as Record<string, unknown>).polluted).toBeUndefined();
     });
+
+    it('refuses runs-unreadable, without running the getter, for a getter at index 0 of the runs array', async () => {
+      let getterRuns = 0;
+      const hostileRuns: unknown[] = [makeRun(RUN_1)];
+      Object.defineProperty(hostileRuns, 0, {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return makeRun(RUN_1);
+        },
+      });
+      const fakes = makeFakes({ runsList: async () => hostileRuns as unknown as LaneRunRecord[] });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
+      expect(getterRuns).toBe(0);
+    });
+
+    it('refuses journal-unreadable, without running the getter, for a getter at index 0 of a journal-entry array', async () => {
+      let getterRuns = 0;
+      const pushKey = stepKey(RUN_1, 'push', HEAD_12_1);
+      const hostileEntries: unknown[] = [makeEntry(pushKey, WINDOW_START_ISO)];
+      Object.defineProperty(hostileEntries, 0, {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return makeEntry(pushKey, WINDOW_START_ISO);
+        },
+      });
+      const fakes = makeFakes({
+        runRecords: [makeRun(RUN_1)],
+        journals: new Map([[RUN_1, hostileEntries as unknown as readonly LaneRunJournalEntryRecord[]]]),
+      });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+      expect(getterRuns).toBe(0);
+    });
+
+    it('refuses an enormous sparse runs list before any traversal, with zero element reads', async () => {
+      let getterRuns = 0;
+      const hostileRuns: unknown[] = new Array(2 ** 32 - 1);
+      Object.defineProperty(hostileRuns, 0, {
+        enumerable: true,
+        get() {
+          getterRuns += 1;
+          return null;
+        },
+      });
+      const fakes = makeFakes({ runsList: async () => hostileRuns as unknown as LaneRunRecord[] });
+      const result = await readShadowGateHeads(fakes.deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'too-many-runs' });
+      expect(getterRuns).toBe(0);
+    });
+
+    it('refuses a string where a list is expected (runs list and journal list)', async () => {
+      const stringRuns = makeFakes({ runsList: async () => 'example-runs-string' as unknown as LaneRunRecord[] });
+      expect(await readShadowGateHeads(stringRuns.deps, request())).toEqual({
+        status: 'unknown',
+        reason: 'runs-unreadable',
+      });
+      const first = passingRun(RUN_1, ATTEMPT_1, HEAD_12_1, HEAD_1, '2026-11-27T10:00:00.000Z');
+      const stringJournal = makeFakes({
+        runRecords: [first.run],
+        journals: new Map([[first.run.runId, 'example-entries-string' as unknown as readonly LaneRunJournalEntryRecord[]]]),
+      });
+      expect(await readShadowGateHeads(stringJournal.deps, request())).toEqual({
+        status: 'unknown',
+        reason: 'journal-unreadable',
+      });
+    });
   });
 });

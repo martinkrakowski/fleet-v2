@@ -67,6 +67,55 @@ async function seedSwitched(runtime: FleetCliRuntime, trainPauseSetByCutover: bo
   await runtime.execution.killallTrainPause.set({ paused: true, nowIso: SWITCHED_AT });
 }
 
+const DEFAULT_RELEASE_SHA = 'a'.repeat(40);
+const DEFAULT_VERDICT_DIGEST = 'b'.repeat(64);
+
+function makeDayVerdicts(
+  recordedAtIso: string,
+  overrides: Readonly<Record<string, unknown>> = {},
+): Record<string, unknown> {
+  const verdicts: Record<string, unknown> = {};
+  for (const criterion of CUTOVER_SHADOW_CRITERIA) {
+    if (criterion in overrides) {
+      if (overrides[criterion] !== undefined) {
+        verdicts[criterion] = overrides[criterion];
+      }
+      continue;
+    }
+    verdicts[criterion] = {
+      verdict: 'pass',
+      reason: 'ok',
+      digest: DEFAULT_VERDICT_DIGEST,
+      recordedAtIso,
+    };
+  }
+  return verdicts;
+}
+
+function ledgerWith(
+  overrides: {
+    readonly schemaVersion?: number;
+    readonly revision?: number;
+    readonly days?: readonly Record<string, unknown>[];
+    readonly releaseSha?: string | null;
+    readonly mergesPerDay?: number | null;
+  } = {},
+): Record<string, unknown> {
+  const releaseSha = overrides.releaseSha === undefined ? DEFAULT_RELEASE_SHA : overrides.releaseSha;
+  const mergesCompared = overrides.mergesPerDay === undefined ? 10 : overrides.mergesPerDay;
+  const defaultDays = ['2026-11-03', '2026-11-04', '2026-11-05'].map((day) => ({
+    day,
+    releaseSha,
+    mergesCompared,
+    verdicts: makeDayVerdicts(NOW),
+  }));
+  return {
+    schemaVersion: overrides.schemaVersion ?? 1,
+    revision: overrides.revision ?? 1,
+    days: overrides.days ?? defaultDays,
+  };
+}
+
 const ROLLBACK = ['cutover', 'rollback', '--expected-revision', '1', '--operation-id', 'op-1', '--now-iso', NOW] as const;
 
 describe('fleet-v2 cutover status and rollback', () => {
@@ -397,5 +446,255 @@ describe('cutover shadow record-day merge-queue digest (RD1)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('cutover switch reads the recorded shadow ledger (SH8b)', () => {
+  const OTHER_RELEASE_SHA = 'c'.repeat(40);
+  const ALL_CRITERIA = [...CUTOVER_SHADOW_CRITERIA];
+
+  function shadowDays(
+    dates: readonly string[],
+    options: {
+      readonly releaseSha?: string | null;
+      readonly releaseShas?: readonly (string | null)[];
+      readonly mergesCompared?: number | null;
+      readonly verdictsFor?: (day: string, index: number) => Record<string, unknown>;
+    } = {},
+  ): Record<string, unknown>[] {
+    const releaseSha = options.releaseSha === undefined ? DEFAULT_RELEASE_SHA : options.releaseSha;
+    const mergesCompared = options.mergesCompared === undefined ? 10 : options.mergesCompared;
+    return dates.map((day, index) => ({
+      day,
+      releaseSha: options.releaseShas === undefined ? releaseSha : options.releaseShas[index],
+      mergesCompared,
+      verdicts: options.verdictsFor === undefined ? makeDayVerdicts(NOW) : options.verdictsFor(day, index),
+    }));
+  }
+
+  function switchArgv(nowIso: string = NOW, extra: readonly string[] = []): string[] {
+    return [
+      'cutover', 'switch',
+      '--expected-revision', '0',
+      '--operation-id', 'op-1',
+      '--relaunch-plan-digest', PLAN_DIGEST,
+      '--now-iso', nowIso,
+      ...extra,
+    ];
+  }
+
+  function writeLedger(ledger: Record<string, unknown>): string {
+    const bytes = `${JSON.stringify(ledger)}\n`;
+    writeFileSync(join(stateDir, 'cutover-shadow.json'), bytes);
+    return bytes;
+  }
+
+  async function runSwitch(nowIso: string = NOW, extra: readonly string[] = []) {
+    return run(runtimeFor(), switchArgv(nowIso, extra));
+  }
+
+  function expectNoCutoverWrites(out: string): void {
+    expect(existsSync(join(stateDir, 'cutover.json'))).toBe(false);
+    expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
+    expect(out).not.toContain(stateDir);
+  }
+
+  it('cutover switch in memory (no state directory) refuses shadow-evidence-absent', async () => {
+    const result = await run(runtimeFor(undefined), switchArgv());
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({
+      outcome: 'refused',
+      reason: 'shadow-evidence-absent',
+      failed: ALL_CRITERIA,
+    });
+  });
+
+  it('cutover switch with fewer than 3 recorded days refuses shadow-evidence-absent', async () => {
+    writeLedger(ledgerWith({ days: shadowDays(['2026-11-04', '2026-11-05']) }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-evidence-absent', failed: ALL_CRITERIA });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with releaseSha null on 3 consecutive all-pass days refuses shadow-evidence-absent', async () => {
+    writeLedger(ledgerWith({ releaseSha: null }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-evidence-absent', failed: ALL_CRITERIA });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with differing releaseSha across 3 consecutive all-pass days refuses shadow-evidence-absent', async () => {
+    writeLedger(ledgerWith({
+      days: shadowDays(['2026-11-03', '2026-11-04', '2026-11-05'], {
+        releaseShas: [DEFAULT_RELEASE_SHA, DEFAULT_RELEASE_SHA, OTHER_RELEASE_SHA],
+      }),
+    }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-evidence-absent', failed: ALL_CRITERIA });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with a stale newest day refuses shadow-evidence-absent', async () => {
+    writeLedger(ledgerWith({ days: shadowDays(['2026-11-01', '2026-11-02', '2026-11-03']) }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-evidence-absent', failed: ALL_CRITERIA });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with a stale ledger and a matching back-dated --now-iso still refuses shadow-evidence-absent', async () => {
+    writeLedger(ledgerWith({ days: shadowDays(['2026-11-01', '2026-11-02', '2026-11-03']) }));
+    const result = await runSwitch('2026-11-03T12:00:00.000Z');
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-evidence-absent', failed: ALL_CRITERIA });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch whose newest day is after --now-iso refuses shadow-criteria-failed naming all 13 criteria', async () => {
+    writeLedger(ledgerWith());
+    const result = await runSwitch('2026-11-04T12:00:00.000Z');
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: ALL_CRITERIA });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with 3 consecutive all-pass days under 20 total merges refuses shadow-criteria-failed naming all 13 criteria', async () => {
+    writeLedger(ledgerWith({ mergesPerDay: 6 }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: ALL_CRITERIA });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with 3 non-consecutive all-pass days and at least 20 merges refuses shadow-criteria-failed naming all 13 criteria', async () => {
+    writeLedger(ledgerWith({ days: shadowDays(['2026-11-01', '2026-11-03', '2026-11-05']) }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: ALL_CRITERIA });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with S4 recorded fail on one day refuses shadow-criteria-failed with failed S4', async () => {
+    writeLedger(ledgerWith({
+      days: shadowDays(['2026-11-03', '2026-11-04', '2026-11-05'], {
+        verdictsFor: (_day, index) =>
+          index === 1
+            ? makeDayVerdicts(NOW, {
+                S4: {
+                  verdict: 'fail',
+                  reason: 'drift',
+                  digest: DEFAULT_VERDICT_DIGEST,
+                  recordedAtIso: NOW,
+                },
+              })
+            : makeDayVerdicts(NOW),
+      }),
+    }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: ['S4'] });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with S13 omitted on one day refuses shadow-criteria-failed with failed S13', async () => {
+    writeLedger(ledgerWith({
+      days: shadowDays(['2026-11-03', '2026-11-04', '2026-11-05'], {
+        verdictsFor: (_day, index) =>
+          index === 1 ? makeDayVerdicts(NOW, { S13: undefined }) : makeDayVerdicts(NOW),
+      }),
+    }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: ['S13'] });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with unparseable bytes in cutover-shadow.json returns unknown shadow-evidence-unreadable', async () => {
+    const bytes = '{ not json';
+    writeFileSync(join(stateDir, 'cutover-shadow.json'), bytes);
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'shadow-evidence-unreadable' });
+    expect(readFileSync(join(stateDir, 'cutover-shadow.json'), 'utf8')).toBe(bytes);
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with a null ledger in cutover-shadow.json returns unknown shadow-evidence-unreadable', async () => {
+    writeFileSync(join(stateDir, 'cutover-shadow.json'), 'null\n');
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'shadow-evidence-unreadable' });
+    expect(readFileSync(join(stateDir, 'cutover-shadow.json'), 'utf8')).toBe('null\n');
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with a criterion verdict unknown returns unknown shadow-evidence-unreadable', async () => {
+    writeLedger(ledgerWith({
+      days: shadowDays(['2026-11-03', '2026-11-04', '2026-11-05'], {
+        verdictsFor: () =>
+          makeDayVerdicts(NOW, {
+            S4: {
+              verdict: 'unknown',
+              reason: 'drift',
+              digest: DEFAULT_VERDICT_DIGEST,
+              recordedAtIso: NOW,
+            },
+          }),
+      }),
+    }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'shadow-evidence-unreadable' });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with duplicate day entries returns unknown shadow-evidence-unreadable', async () => {
+    writeLedger(ledgerWith({ days: shadowDays(['2026-11-03', '2026-11-03']) }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'shadow-evidence-unreadable' });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with non-array days returns unknown shadow-evidence-unreadable', async () => {
+    writeFileSync(
+      join(stateDir, 'cutover-shadow.json'),
+      `${JSON.stringify({ schemaVersion: 1, revision: 1, days: { bad: true } })}\n`,
+    );
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'shadow-evidence-unreadable' });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with schemaVersion 99 returns unknown shadow-evidence-unknown-version', async () => {
+    const bytes = writeLedger(ledgerWith({ schemaVersion: 99 }));
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'shadow-evidence-unknown-version' });
+    expect(readFileSync(join(stateDir, 'cutover-shadow.json'), 'utf8')).toBe(bytes);
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with a deadline already past returns unknown deadline-exceeded', async () => {
+    writeLedger(ledgerWith());
+    const result = await runSwitch(NOW, ['--deadline-iso', '2026-11-05T11:00:00.000Z']);
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    expectNoCutoverWrites(result.out);
+  });
+
+  it('cutover switch with a valid 3-day 20-merge shared-release all-pass ledger stops at unrecorded-lanes-unknown and writes no journal', async () => {
+    const bytes = writeLedger(ledgerWith());
+    const result = await runSwitch();
+    expect(result.code).toBe(1);
+    expect(result.json).toEqual({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
+    expect(existsSync(join(stateDir, 'cutover-journal.json'))).toBe(false);
+    expect(existsSync(join(stateDir, 'cutover.json'))).toBe(false);
+    expect(readFileSync(join(stateDir, 'cutover-shadow.json'), 'utf8')).toBe(bytes);
+    expect(result.out).not.toContain(stateDir);
   });
 });

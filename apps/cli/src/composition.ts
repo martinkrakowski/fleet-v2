@@ -98,6 +98,7 @@ import {
   StopAttemptUseCase,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
+  composeCutoverShadowEvidence,
   consumptionId,
   forgeActionScope,
   isSafeSshHost,
@@ -1003,6 +1004,41 @@ function editOnlyModeOf(
   return host.runner.agyMode === 'edit-only' ? 'edit-only' : 'not-edit-only';
 }
 
+type ShadowEvidenceRead =
+  | { readonly status: 'ok'; readonly evidence: unknown }
+  | { readonly status: 'absent' }
+  | { readonly status: 'unreadable' }
+  | { readonly status: 'unknown-version' };
+
+/**
+ * SH8b: the reader `cutover switch` binds when a durable state directory
+ * exists. The stored ledger is composed here and judged by
+ * `readCutoverShadowEvidence` inside the use case; this function does not
+ * re-implement the 3-day, 20-merge, or S1–S13 rules. `nowIso` is the daemon
+ * clock and is read when the switch runs, never the operator's `--now-iso`.
+ * Unreadable and unknown-version stay unknown. Every other non-ok result is
+ * absence. A throw from the store propagates so the use case reports
+ * `shadow-evidence-unreadable`; this mapping never echoes the ledger.
+ */
+function readStoredShadowEvidence(
+  evidence: ShadowEvidenceAdapter,
+  nowIso: () => string,
+): () => Promise<ShadowEvidenceRead> {
+  return async () => {
+    const read = await evidence.read();
+    if (read.status === 'unreadable') return { status: 'unreadable' };
+    if (read.status === 'unknown-version') return { status: 'unknown-version' };
+    if (read.status !== 'ok') return { status: 'absent' };
+    // OD-4: each 3-day window must be bound to one pinned non-null release sha.
+    const composed = composeCutoverShadowEvidence(read.ledger, nowIso(), {
+      requireSingleRelease: true,
+    });
+    return composed.status === 'ok'
+      ? { status: 'ok', evidence: composed.evidence }
+      : { status: 'absent' };
+  };
+}
+
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
   const stateDir = options?.stateDir;
   // Taken before any adapter is composed (some create the directory): the relaunch commands refuse
@@ -1385,6 +1421,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const killallTrainPause = new KillallTrainPauseAdapter({ stateDir });
   const daemonPauseRead = durableCutover ? new DaemonPauseAdapter({ stateDir, readOnly: true }) : daemon.pause;
   const trainPauseRead = durableCutover ? new KillallTrainPauseAdapter({ stateDir, readOnly: true }) : killallTrainPause;
+  // SH8b: read-only ledger for `cutover switch`. In-memory mode has no durable
+  // ledger, so the reader stays undefined and the use case refuses. This does
+  // not wire `countUnrecordedLanes` and does not start the shadow daemon.
+  const shadowEvidence = durableCutover ? new ShadowEvidenceAdapter({ stateDir, readOnly: true }) : undefined;
+  const readShadowEvidence =
+    shadowEvidence === undefined ? undefined : readStoredShadowEvidence(shadowEvidence, daemon.now);
   const manageCutover = new ManageCutoverUseCase({
     cutoverRepo: cutoverRecordRepository,
     cutoverJournal,
@@ -1396,6 +1438,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     computeDigest: sha256HexDigest,
     mintEntryId: daemon.newUlid,
     nowIso: daemon.now,
+    ...(readShadowEvidence === undefined ? {} : { readShadowEvidence }),
   });
 
   // SH8a: `cutover shadow record-day` — the shadow day-writer. Durable-state

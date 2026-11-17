@@ -89,6 +89,9 @@ export type ShadowConductedFactsUnknown =
   | 'too-many-journal-entries'
   | 'too-many-attempts'
   | 'too-many-receipts'
+  | 'too-many-heads'
+  | 'forge-read-missing'
+  | 'forge-unavailable'
   | 'deadline-exceeded';
 
 /** Why the whole conducted-run answer is `unknown`. */

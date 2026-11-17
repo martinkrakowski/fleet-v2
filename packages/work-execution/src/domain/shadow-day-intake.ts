@@ -49,6 +49,7 @@ const UNKNOWN_LINES: ShadowCriterionEvaluation = Object.freeze({ status: 'fail',
 const IMPORT_DIVERGENCE: ShadowCriterionEvaluation = Object.freeze({ status: 'fail', reason: 'import-divergence' });
 const CHAIN_BASE: ShadowCriterionEvaluation = Object.freeze({ status: 'fail', reason: 'chain-base-not-importable' });
 const INTAKE_EQUAL: ShadowCriterionEvaluation = Object.freeze({ status: 'pass', reason: 'intake-equal' });
+const COMPARATOR_DROPPED_ITEMS: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'comparator-dropped-items' });
 
 /** One observed enqueue key: the pull request, its head and its base branch. */
 interface ValidatedKey {
@@ -340,6 +341,29 @@ function sharedDivergence(first: ComparisonSides, second: ComparisonSides): bool
   return false;
 }
 
+/**
+ * True when the comparator's own `fleetCount`/`shellCount` do not match the
+ * number of keys handed to it on that side: the comparator silently rejected
+ * at least one item as secret-shaped that this evaluator's own `validateKey`
+ * had already accepted as a structurally well-formed key. `compareShadowEnqueueSets`'s
+ * own secret-shape scan is unanchored (`sk-[A-Za-z0-9_-]{20,}` with no word
+ * boundary, among others), so it flags far more than real secrets, including
+ * an entirely ordinary `chain/<name>` base that merely happens to contain
+ * that shape as a substring. A comparison in that state cannot be trusted for
+ * persistence: the dropped item's own divergence — a `missing-in-fleet` or
+ * `missing-in-shell` keyed by its real identity — is replaced by a positional
+ * `invalid-item` entry keyed by the item's index, not its identity. Since the
+ * two samples' arrays need not line up index-for-index, that substitution can
+ * hide a real, persistent divergence (a false pass) or make two unrelated
+ * drops at the same index look like one persistent divergence (a false
+ * fail). Checked against the exact arrays given to the comparator for this
+ * comparison, never against the sample's unfiltered list, so a prior filter
+ * (comparison B's main-only shell side) is never mistaken for a drop.
+ */
+function comparatorDroppedItems(sides: ComparisonSides): boolean {
+  return sides.result.fleetCount !== sides.fleet.length || sides.result.shellCount !== sides.shell.length;
+}
+
 /** True when a chain-base shell key appears in both samples' live sets. */
 function persistentChainBase(first: readonly ValidatedKey[], second: readonly ValidatedKey[]): boolean {
   const chainKeys = (keys: readonly ValidatedKey[]) =>
@@ -362,16 +386,22 @@ function persistentChainBase(first: readonly ValidatedKey[], second: readonly Va
  * Checks, in order: the input must be exactly two well-shaped samples with a
  * sufficient gap (`samples-invalid`); both shell reads must be complete
  * (`shell-state-incomplete`); both import dry-runs must have been available
- * (`import-unavailable`); then a persistent live-coverage divergence fails
- * (`enqueue-coverage-divergence`), any unparseable import line fails
- * (`import-unknown-lines`, checked before the B comparison), a persistent
- * import-fidelity divergence fails (`import-divergence`), a chain-base shell
- * key present in both samples fails (`chain-base-not-importable`), and
- * otherwise the intake is equal. Persistence is decided exactly: when a
- * comparison's divergence list is truncated by the listing cap, a shared
- * pair is looked for among the exact per-key divergences of the keys both
- * samples carry — never inferred from truncation alone, which would fail
- * without any shared (key, code) pair.
+ * (`import-unavailable`); then, before either comparison's divergences are
+ * trusted, the comparator's own `fleetCount`/`shellCount` must account for
+ * every key handed to it on that side (`comparator-dropped-items`, checked
+ * right before comparison A is used and again right before comparison B is
+ * used: a miscount means the comparator silently rejected a structurally
+ * valid key as secret-shaped, which breaks the positional identity the
+ * persistence check below relies on); then a persistent live-coverage
+ * divergence fails (`enqueue-coverage-divergence`), any unparseable import
+ * line fails (`import-unknown-lines`, checked before the B comparison), a
+ * persistent import-fidelity divergence fails (`import-divergence`), a
+ * chain-base shell key present in both samples fails
+ * (`chain-base-not-importable`), and otherwise the intake is equal.
+ * Persistence is decided exactly: when a comparison's divergence list is
+ * truncated by the listing cap, a shared pair is looked for among the exact
+ * per-key divergences of the keys both samples carry — never inferred from
+ * truncation alone, which would fail without any shared (key, code) pair.
  *
  * Cost: linear in the capped input — at most two samples, each with four
  * lists capped at `SHADOW_INTAKE_MAX_KEYS` keys, each key and field read once
@@ -407,11 +437,17 @@ export function evaluateShadowIntake(input: unknown): ShadowCriterionEvaluation 
     }
     const firstComparison = sampleComparisons(first);
     const secondComparison = sampleComparisons(second);
+    if (comparatorDroppedItems(firstComparison.a) || comparatorDroppedItems(secondComparison.a)) {
+      return COMPARATOR_DROPPED_ITEMS;
+    }
     if (sharedDivergence(firstComparison.a, secondComparison.a)) {
       return COVERAGE_DIVERGENCE;
     }
     if (first.importUnknownLines > 0 || second.importUnknownLines > 0) {
       return UNKNOWN_LINES;
+    }
+    if (comparatorDroppedItems(firstComparison.b) || comparatorDroppedItems(secondComparison.b)) {
+      return COMPARATOR_DROPPED_ITEMS;
     }
     if (sharedDivergence(firstComparison.b, secondComparison.b)) {
       return IMPORT_DIVERGENCE;

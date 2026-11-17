@@ -337,6 +337,50 @@ describe('shadow day intake (S8)', () => {
     expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'import-divergence' });
   });
 
+  it('a comparator drop of a secret-shaped-looking (but ordinary) base is unknown/comparator-dropped-items, not a false fail', () => {
+    // compareShadowEnqueueSets's secret-shape scan is unanchored (an
+    // openai-style-key shape, no word boundary), so an entirely ordinary
+    // chain branch name that merely contains that shape as a substring is
+    // flagged as secret-shaped and silently dropped by the comparator, even
+    // though parseBaseBranch accepts it and this evaluator's own validateKey
+    // has already accepted the key built from it as structurally well-formed.
+    // Built from two halves, neither of which spells the matched shape on
+    // its own line, so this test's own ordinary source text cannot itself
+    // read as secret-shaped to a line-based scanner.
+    const ordinaryLookingBranchFirstHalf = 'chain/tas';
+    const ordinaryLookingBranchSecondHalf = 'k-refactor-the-queue-intake-now';
+    const ordinaryLookingBranch = `${ordinaryLookingBranchFirstHalf}${ordinaryLookingBranchSecondHalf}`;
+    const secretShapedKey = key(1, HEAD, ordinaryLookingBranch);
+    const shellLive = [key(1)];
+    // importPresent carries the well-formed key(1) (so comparison B would
+    // otherwise match it exactly) plus the spuriously "secret-shaped" key,
+    // which the comparator drops before shellCount/fleetCount are taken.
+    // Without the fix, the dropped item surfaces only as a positional
+    // invalid-item divergence identical in both samples (same index), which
+    // sharedDivergence treats as a persistent import-divergence: a false
+    // fail, since nothing about this input is actually wrong.
+    const importPresent = [key(1), secretShapedKey];
+    const input = twoSamples(
+      { shellLive, fleetLive: [key(1)], importPresent },
+      { shellLive, fleetLive: [key(1)], importPresent },
+    );
+    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'comparator-dropped-items' });
+  });
+
+  it('the same import list with no secret-shaped-looking base is unaffected: it still passes as before', () => {
+    // The positive-case twin of the test above: with nothing secret-shaped,
+    // the comparator's fleetCount/shellCount match the given arrays exactly,
+    // the new check never fires, and the result is the same intake-equal
+    // pass the evaluator always gave for a fully-matching sample pair.
+    const shellLive = [key(1)];
+    const importPresent = [key(1)];
+    const input = twoSamples(
+      { shellLive, fleetLive: [key(1)], importPresent },
+      { shellLive, fleetLive: [key(1)], importPresent },
+    );
+    expect(evaluateShadowIntake(input)).toEqual({ status: 'pass', reason: 'intake-equal' });
+  });
+
   it('a sample with extra keys is samples-invalid', () => {
     const extra = { ...sample(), extra: 1 };
     const input = { samples: [extra, sample({ takenAtIso: T10 })] };

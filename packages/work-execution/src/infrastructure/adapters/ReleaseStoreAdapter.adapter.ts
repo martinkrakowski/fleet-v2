@@ -23,6 +23,11 @@ import { randomBytes } from 'node:crypto';
 
 import type {
   ReleaseBuildRecord,
+  ReleaseDriverBinding,
+  ReleaseOpenOperationPeek,
+  ReleaseOperationBegin,
+  ReleaseOperationRef,
+  ReleaseOrphanCurrentTempsResult,
   ReleaseStoreListing,
   ReleaseStorePort,
   ReleaseStagingResult,
@@ -43,6 +48,14 @@ const MARKER_NAME = '.fleet-release-verified';
 const CLI_ENTRY = ['apps', 'cli', 'dist', 'bin.js'];
 const MARKER_MAX_BYTES = 4096;
 const CURRENT_NAME = 'current';
+/** The temp link name an interrupted repoint can leave behind (CO14 follow-up). */
+const CURRENT_TEMP_PATTERN = /^\.current\..+\.tmp$/;
+
+const OPS_DIR = '.release-ops';
+const DRIVER_BINDING_NAME = '.release-driver';
+const OP_ID_PATTERN = /^[0-9a-f]{32}$/;
+/** A claim older than this is a crashed run's; the longest build budget is well inside it. */
+const CLAIM_STALE_MS = 2 * 60 * 60 * 1000;
 
 type CurrentRead = { readonly ok: true; readonly sha: string | null } | { readonly ok: false };
 type BuildsRead = { readonly ok: true; readonly builds: readonly ReleaseBuildRecord[] } | { readonly ok: false };
@@ -194,6 +207,421 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       return { outcome: 'unreadable' };
     }
   }
+
+  async beginOperation(input: {
+    readonly root: string;
+    readonly action: 'install' | 'swap' | 'rollback';
+    readonly sha: string;
+    readonly opId: string;
+    readonly nowIso: string;
+  }): Promise<ReleaseOperationBegin> {
+    if (!SHA_PATTERN.test(input.sha) || !isZonedIso(input.nowIso) || !OP_ID_PATTERN.test(input.opId)) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      const names = opNames(input.root, input.action, input.sha);
+      await fs.mkdir(path.dirname(names.intent), { recursive: true });
+      const opId = input.opId;
+      // CO14b fix round 5: `completeOperation` renames the intent to this
+      // opId's `.done` marker, so once that marker exists the intent file
+      // itself is gone and the exclusive-create below would otherwise
+      // succeed FRESH for a stale, already-used opId — treating it as a
+      // legitimate new start and letting the caller ride that completed
+      // operation's already-consumed grant through `resumeActionId`, instead
+      // of being independently authorized. Checked before the
+      // exclusive-create attempt, so a stale opId is refused before any
+      // write at all, not only after a write has already happened.
+      if ((await lstatOrNull(names.done(opId))) !== null) {
+        return { outcome: 'busy' };
+      }
+      let started = true;
+      try {
+        await fs.writeFile(
+          names.intent,
+          JSON.stringify({
+            version: 1,
+            opId,
+            action: input.action,
+            sha: input.sha,
+            createdAtIso: input.nowIso,
+            // CO14b fix round 10: every fresh intent starts unrepointed; only
+            // `markRepointed` ever flips this, once, after the one real
+            // mutation this intent stands for has actually landed.
+            repointed: false,
+          }),
+          { flag: 'wx' },
+        );
+      } catch (error) {
+        if (errorCode(error) !== 'EEXIST') {
+          throw error;
+        }
+        const existing = parseOpId(await readSmall(names.intent));
+        if (existing === null) {
+          return { outcome: 'unreadable' };
+        }
+        if (existing !== opId) {
+          // Another run recorded a different operation first: it owns the intent.
+          return { outcome: 'busy' };
+        }
+        started = false;
+      }
+      if (!(await takeClaim(names.claim, input.nowIso))) {
+        return { outcome: 'busy' };
+      }
+      // CO14b fix round 6: round 5's pre-create `.done` check above only guards the
+      // FRESH-create branch at its own starting instant. A second call can still
+      // reach here on the EEXIST/"resumed" branch (existing === opId) after the
+      // first call's `completeOperation` has, in the meantime, renamed this exact
+      // opId's intent to its `.done` marker and released its claim via
+      // `endOperation`'s cleanup — letting this call's own `takeClaim` above
+      // succeed on a claim nothing else holds, and letting it report a "resumed"
+      // grant for an opId whose work is already done. Re-check `.done` for both
+      // branches uniformly, immediately before the final return, and release the
+      // claim this call just took (mirroring `cancelOperation`'s convention) before
+      // reporting it as stale rather than live.
+      if ((await lstatOrNull(names.done(opId))) !== null) {
+        await fs.rm(names.claim, { force: true });
+        return { outcome: 'busy' };
+      }
+      return { outcome: started ? 'started' : 'resumed', opId };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  async peekOperation(input: {
+    readonly root: string;
+    readonly action: 'install' | 'swap' | 'rollback';
+    readonly sha: string;
+  }): Promise<{ readonly outcome: 'open'; readonly opId: string } | { readonly outcome: 'none' } | { readonly outcome: 'unreadable' }> {
+    if (!SHA_PATTERN.test(input.sha)) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      const text = await readSmall(opNames(input.root, input.action, input.sha).intent);
+      if (text === null) {
+        return { outcome: 'none' };
+      }
+      const opId = parseOpId(text);
+      return opId === null ? { outcome: 'unreadable' } : { outcome: 'open', opId };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  /**
+   * CO14b fix round 8: the one open intent for `action` under this root,
+   * found by scanning `.release-ops` for `${action}-*.intent` rather than by
+   * already knowing its sha. `beginOperation`'s own exclusive create and
+   * single claim per (action, sha) key make two simultaneously open intents
+   * for the same action impossible in normal operation, so finding more than
+   * one is treated as `unreadable` rather than guessed at.
+   */
+  async peekAnyOpenOperation(input: {
+    readonly root: string;
+    readonly action: 'install' | 'swap' | 'rollback';
+  }): Promise<ReleaseOpenOperationPeek> {
+    const opsDir = path.join(input.root, OPS_DIR);
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(opsDir, { withFileTypes: true });
+    } catch (error) {
+      return isErrno(error, 'ENOENT') ? { outcome: 'none' } : { outcome: 'unreadable' };
+    }
+    const prefix = `${input.action}-`;
+    const matches = entries.filter(
+      (entry) => entry.isFile() && entry.name.startsWith(prefix) && entry.name.endsWith('.intent'),
+    );
+    if (matches.length === 0) {
+      return { outcome: 'none' };
+    }
+    if (matches.length > 1) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      const text = await readSmall(path.join(opsDir, matches[0].name));
+      const parsed = parseOpIdAndSha(text);
+      return parsed === null
+        ? { outcome: 'unreadable' }
+        : { outcome: 'open', opId: parsed.opId, sha: parsed.sha, repointed: parsed.repointed };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  newOperationId(): string {
+    return randomBytes(16).toString('hex');
+  }
+
+  async completeOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    return this.endOperation(input, async (names) => {
+      await fs.rename(names.intent, names.done(input.opId));
+    });
+  }
+
+  async cancelOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    return this.endOperation(input, async (names) => {
+      await fs.rm(names.intent, { force: true });
+    });
+  }
+
+  async releaseOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    return this.endOperation(input, async () => undefined);
+  }
+
+  /**
+   * CO14b fix round 10: rewrite this operation's own still-open intent with
+   * `repointed: true`, preserving its opId/action/sha/createdAtIso exactly.
+   * Only the exact opId that owns the intent may mark it -- the same
+   * defensive style as `endOperation`'s own `recorded !== input.opId` guard
+   * -- and a missing intent is `not-found`, never a write.
+   */
+  async markRepointed(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+    if (!SHA_PATTERN.test(input.sha) || !OP_ID_PATTERN.test(input.opId)) {
+      return { outcome: 'unreadable' };
+    }
+    const names = opNames(input.root, input.action, input.sha);
+    try {
+      const record = parseIntentRecord(await readSmall(names.intent));
+      if (record === null) {
+        return { outcome: 'not-found' };
+      }
+      if (record.opId !== input.opId) {
+        // Another operation owns this intent now; this run has nothing to mark.
+        return { outcome: 'unreadable' };
+      }
+      const marker = JSON.stringify({
+        version: 1,
+        opId: record.opId,
+        action: record.action,
+        sha: record.sha,
+        createdAtIso: record.createdAtIso,
+        repointed: true,
+      });
+      await writeAtomically(path.dirname(names.intent), path.basename(names.intent), marker);
+      return { outcome: 'ok' };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  /** Runs `change` only while the intent still names this operation id; the claim is always released. */
+  private async endOperation(
+    input: ReleaseOperationRef,
+    change: (names: ReturnType<typeof opNames>) => Promise<void>,
+  ): Promise<ReleaseStoreWriteResult> {
+    if (!SHA_PATTERN.test(input.sha) || !OP_ID_PATTERN.test(input.opId)) {
+      return { outcome: 'unreadable' };
+    }
+    const names = opNames(input.root, input.action, input.sha);
+    try {
+      const recorded = parseOpId(await readSmall(names.intent));
+      if (recorded !== null && recorded !== input.opId) {
+        // Another operation owns this intent now; this run's claim is not its to remove.
+        return { outcome: 'unreadable' };
+      }
+      if (recorded === null) {
+        return { outcome: 'not-found' };
+      }
+      await change(names);
+      await fs.rm(names.claim, { force: true });
+      return { outcome: 'ok' };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  async readDriverBinding(input: { readonly root: string }): Promise<ReleaseDriverBinding> {
+    try {
+      const text = await readSmall(path.join(input.root, DRIVER_BINDING_NAME));
+      if (text === null) {
+        return { outcome: 'unbound' };
+      }
+      const stateDir = text.trim();
+      return stateDir.startsWith('/') && stateDir.length <= MARKER_MAX_BYTES
+        ? { outcome: 'bound', stateDir }
+        : { outcome: 'unreadable' };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  async bindDriver(input: { readonly root: string; readonly stateDir: string }): Promise<ReleaseDriverBinding> {
+    if (!input.stateDir.startsWith('/') || input.stateDir.length > MARKER_MAX_BYTES) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      await fs.mkdir(input.root, { recursive: true });
+      try {
+        await fs.writeFile(path.join(input.root, DRIVER_BINDING_NAME), input.stateDir, { flag: 'wx' });
+        return { outcome: 'bound', stateDir: input.stateDir };
+      } catch (error) {
+        if (errorCode(error) !== 'EEXIST') {
+          throw error;
+        }
+        return await this.readDriverBinding({ root: input.root });
+      }
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
+
+  async removeOrphanCurrentTemps(input: {
+    readonly root: string;
+    readonly fence?: () => Promise<boolean>;
+  }): Promise<ReleaseOrphanCurrentTempsResult> {
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(input.root, { withFileTypes: true });
+    } catch {
+      return { outcome: 'unknown' };
+    }
+    let removed = 0;
+    let findings = 0;
+    for (const entry of entries) {
+      if (!CURRENT_TEMP_PATTERN.test(entry.name)) {
+        continue;
+      }
+      // A temp-named directory or file is a finding: it is reported, never removed.
+      if (!entry.isSymbolicLink()) {
+        findings += 1;
+        continue;
+      }
+      // One removal after another; a failing removal or a failed fence is an unknown root.
+      if (input.fence !== undefined && !(await passesFence(input.fence))) {
+        return { outcome: 'unknown' };
+      }
+      try {
+        await fs.rm(path.join(input.root, entry.name), { force: true });
+        removed += 1;
+      } catch {
+        return { outcome: 'unknown' };
+      }
+    }
+    return { outcome: 'cleaned', removed, findings };
+  }
+}
+
+function opNames(root: string, action: string, sha: string) {
+  const base = path.join(root, OPS_DIR, `${action}-${sha}`);
+  return {
+    intent: `${base}.intent`,
+    claim: `${base}.claim`,
+    done: (opId: string) => `${base}.${opId}.done`,
+  };
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error ? String((error as { code: unknown }).code) : undefined;
+}
+
+/** The text of a small file; null when it does not exist; any other failure throws. */
+async function readSmall(file: string): Promise<string | null> {
+  try {
+    const text = await fs.readFile(file, 'utf8');
+    if (text.length > MARKER_MAX_BYTES) {
+      throw new Error('too large');
+    }
+    return text;
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function parseOpId(text: string | null): string | null {
+  if (text === null) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    const opId = typeof parsed === 'object' && parsed !== null ? (parsed as { opId?: unknown }).opId : undefined;
+    return typeof opId === 'string' && OP_ID_PATTERN.test(opId) ? opId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Like `parseOpId`, but also recovers the intent's own recorded sha (CO14b
+ * round 8) and whether its repoint has already landed (CO14b round 10).
+ */
+function parseOpIdAndSha(
+  text: string | null,
+): { readonly opId: string; readonly sha: string; readonly repointed: boolean } | null {
+  if (text === null) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== 'object' || parsed === null) {
+      return null;
+    }
+    const record = parsed as { opId?: unknown; sha?: unknown; repointed?: unknown };
+    const { opId, sha, repointed } = record;
+    return typeof opId === 'string' &&
+      OP_ID_PATTERN.test(opId) &&
+      typeof sha === 'string' &&
+      SHA_PATTERN.test(sha) &&
+      typeof repointed === 'boolean'
+      ? { opId, sha, repointed }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The intent's full recorded fields (CO14b round 10, for `markRepointed`,
+ * which must preserve `createdAtIso` and not merely know the opId and sha).
+ * `null` when the file is absent, unparseable or missing a required field.
+ */
+function parseIntentRecord(
+  text: string | null,
+): { readonly opId: string; readonly action: string; readonly sha: string; readonly createdAtIso: string } | null {
+  if (text === null) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== 'object' || parsed === null) {
+      return null;
+    }
+    const record = parsed as { opId?: unknown; action?: unknown; sha?: unknown; createdAtIso?: unknown };
+    const { opId, action, sha, createdAtIso } = record;
+    return typeof opId === 'string' &&
+      OP_ID_PATTERN.test(opId) &&
+      typeof action === 'string' &&
+      typeof sha === 'string' &&
+      SHA_PATTERN.test(sha) &&
+      typeof createdAtIso === 'string'
+      ? { opId, action, sha, createdAtIso }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Exclusive claim; a claim older than the stale window (a crashed run's) is taken over once. */
+async function takeClaim(claim: string, nowIso: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await fs.writeFile(claim, nowIso, { flag: 'wx' });
+      return true;
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw error;
+      }
+    }
+    const claimedAt = Date.parse((await readSmall(claim)) ?? '');
+    if (Number.isNaN(claimedAt) || Date.parse(nowIso) - claimedAt < CLAIM_STALE_MS) {
+      return false;
+    }
+    await fs.rm(claim, { force: true });
+  }
+  return false;
 }
 
 async function passesFence(fence: () => Promise<boolean>): Promise<boolean> {
@@ -286,9 +714,11 @@ async function removeOrphans(root: string): Promise<boolean> {
   try {
     const entries = await fs.readdir(root, { withFileTypes: true });
     const dirs = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
-    // One delete after another, stopping at the first failure.
+    // One delete after another, stopping at the first failure. An orphaned
+    // `.current.<...>.tmp` link an interrupted repoint left is removed too;
+    // a temp-named entry that is not a link is left in place, never removed.
     await entries
-      .filter((entry) => isOrphan(entry, dirs))
+      .filter((entry) => isOrphan(entry, dirs) || (entry.isSymbolicLink() && CURRENT_TEMP_PATTERN.test(entry.name)))
       .reduce(
         (previous, entry) =>
           previous.then(() => fs.rm(path.join(root, entry.name), { recursive: true, force: true })),

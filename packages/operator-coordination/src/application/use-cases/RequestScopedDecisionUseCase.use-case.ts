@@ -15,8 +15,9 @@
 
 import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
-import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
+import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
 import { CoordinationKind } from '../../domain/value-objects/CoordinationKind.vo.js';
+import { readReleaseRoot } from '../../domain/coordination-records.js';
 import type {
   RequestScopedDecisionPort,
   RequestScopedDecisionRequest,
@@ -39,9 +40,8 @@ function isFilled(value: unknown): value is string {
 // applies to a recorded attempt (C0, DEL/C1, U+061C, U+200E/F, U+2028/9,
 // U+202A–E, U+2066–9 and U+FEFF). A value carrying any of them is refused
 // here, typed, so it can never reach the record builder and make it throw.
-const ATTEMPT_CONTROL_CHARACTER =
-  // eslint-disable-next-line no-control-regex
-  /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
+// The screen is imported from the entity so the two cannot drift.
+const ATTEMPT_CONTROL_CHARACTER = CONTROL_CHARACTER;
 
 // The record builder refuses an attempt longer than this; screen it here so an
 // over-long value is a typed rejection, never a throw from the record builder.
@@ -99,6 +99,16 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         reason: 'a decision request attemptId must be at most 256 characters',
       };
     }
+    // CO14 follow-up: a release decision may bind its grant to the release
+    // root it names. A non-path-shaped, oversized or hostile root is a typed
+    // rejection, never a record that matches every root.
+    const releaseRoot = readReleaseRoot(request);
+    if (releaseRoot.state === 'invalid') {
+      return {
+        outcome: 'rejected',
+        reason: 'a decision request releaseRoot must be a bounded absolute path without ".." when given',
+      };
+    }
     const kind = CoordinationKind.create(request.kind);
     if (!kind.success || kind.value === undefined) {
       return {
@@ -150,6 +160,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       ...(request.attemptId !== undefined
         ? { grantRecordVersion: GRANT_RECORD_VERSION, grantAttemptId: request.attemptId.trim() }
         : {}),
+      ...(releaseRoot.state === 'valid' ? { releaseRoot: releaseRoot.value } : {}),
     }).toRecord();
     // The proposal is durable before any decider is asked. A duplicate that
     // raced past the lookup above is refused by the store's revision check and

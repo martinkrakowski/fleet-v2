@@ -641,6 +641,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     }
     const stateCheck = await this.readStateCheck(context.deadlineIso);
     const evaluation = evaluateShadowStateIntegrity({
+      day: context.day,
       stateCheck,
       journal: journal.entries.map((entry) => this.sampledEntry(entry)),
       sampledAtIso: this.deps.nowIso(),
@@ -724,22 +725,30 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       });
     }
     /**
-     * The S9 canonical summary includes these counts. A day recorded before
-     * this change will return `verdict-conflict` if re-recorded. No live
-     * shadow days are recorded yet (live recording starts only after the
-     * digest format is final).
+     * S9's digest carries only the five day-scoped, closed-day-deterministic
+     * counts: `journalKeys`, `duplicateIntents`, `duplicateResults`,
+     * `resultsAfterFinal` and `orphanResults`. The evaluator scopes those to
+     * the recorded UTC day `D` over the `Date.parse` interval `[D, D+1)`, so
+     * journal activity after `D` no longer changes them between two
+     * `record-day` runs for the same closed day. Excluded from the digest and
+     * kept on `outcome.stateIntegrity` as non-digested diagnostics:
+     * `stateChecked` and `stateBad` (live `checkState()` samples) and
+     * `unreconciledIntents` (a live `sampledAtIso` grace-window sample) — any
+     * of them can change between two runs while verdict and reason stay equal.
+     * `status` and `reason` stay live in `base`, so a pass/fail flip through
+     * `stateBad` or `unreconciled-intent` remains a deliberate
+     * `verdict-conflict`. This changes the S9 digest format (allowed because
+     * no live shadow day has been recorded yet; live recording starts only
+     * after the digest format is final).
      */
     if (outcome.stateIntegrity !== undefined) {
       return JSON.stringify({
         ...base,
-        stateChecked: outcome.stateIntegrity.stateChecked,
-        stateBad: outcome.stateIntegrity.stateBad,
         journalKeys: outcome.stateIntegrity.journalKeys,
         duplicateIntents: outcome.stateIntegrity.duplicateIntents,
         duplicateResults: outcome.stateIntegrity.duplicateResults,
         resultsAfterFinal: outcome.stateIntegrity.resultsAfterFinal,
         orphanResults: outcome.stateIntegrity.orphanResults,
-        unreconciledIntents: outcome.stateIntegrity.unreconciledIntents,
       });
     }
     return JSON.stringify(base);

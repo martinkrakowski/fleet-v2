@@ -5,8 +5,12 @@
  *
  * A grant authorizes exactly one action, exactly once. A grant that was not
  * recorded, is not approved, no longer matches its expected commit, or was
- * already consumed is refused rather than recorded again, and this port never
- * turns a consumed grant into authority for a second, unrelated action.
+ * already consumed by another action is refused rather than recorded again,
+ * and this port never turns a consumed grant into authority for a second,
+ * unrelated action. The same action replayed with its own consumption id is
+ * observed idempotently: its recorded receipt is returned unchanged and
+ * nothing is recorded twice, so a caller that crashed between its consumption
+ * and its own write can replay and complete (CO14 follow-up).
  */
 
 import type {
@@ -15,7 +19,7 @@ import type {
 } from '../../domain/coordination-records.js';
 import { AuthorizationConsumption } from '../../domain/entities/AuthorizationConsumption.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
-import { isReleaseActionScope } from '../../domain/coordination-records.js';
+import { isReleaseActionScope, readReleaseRoot, releaseRootsAgree } from '../../domain/coordination-records.js';
 import type {
   RecordAuthorizationConsumptionPort,
   RecordAuthorizationConsumptionRequest,
@@ -87,11 +91,20 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     }
     const existing = recorded.consumptions[0];
     if (existing !== undefined) {
-      // One grant, one action: a second, unrelated action is never authorized,
-      // and the same action is never recorded twice.
-      return refused(alreadyAuthorizedMessage(grantId, existing.actionId, request.actionId.trim()));
-    }
-    if (recorded.state !== 'approved') {
+      // One grant, one action: a second, unrelated action is never recorded,
+      // and the same action is never recorded twice. The same action replayed
+      // with its own consumption id is observed idempotently — the durable
+      // receipt is returned unchanged — so a caller that crashes between its
+      // consumption and its own write can replay and proceed (CO14 follow-up).
+      // The replay return sits after every coordinate check, so a moved scope,
+      // head or root is refused even when the receipt already exists.
+      if (
+        existing.actionId !== request.actionId.trim() ||
+        existing.consumptionId !== request.consumptionId.trim()
+      ) {
+        return refused(alreadyAuthorizedMessage(grantId, existing.actionId, request.actionId.trim()));
+      }
+    } else if (recorded.state !== 'approved') {
       return refused(`grant ${grantId} is ${recorded.state}, which authorizes no action`);
     }
     const suppliedScope = request.actionScope.trim();
@@ -104,6 +117,20 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
       return refused(
         `grant ${grantId} was recorded for commit ${recorded.expectedHeadSha ?? 'none'}, not ${request.expectedHeadSha.trim()}`,
       );
+    }
+    // CO14 follow-up: a grant bound to one release root is never consumed for
+    // another. An invalid coordinate on either side fails closed as a
+    // mismatch, never as a match.
+    const recordedRoot = readReleaseRoot(recorded);
+    const requestedRoot = readReleaseRoot(request);
+    if (!releaseRootsAgree(recordedRoot, requestedRoot)) {
+      return refused('release-grant-root-mismatch');
+    }
+    // Idempotent replay of the same action: the durable receipt is returned
+    // unchanged and nothing is recorded twice, so a release that crashed
+    // between its consumption and its own write can complete on the next pass.
+    if (existing !== undefined) {
+      return { outcome: 'consumed', consumption: existing };
     }
     // A grant that records an attempt, owner or policy, authorizes no other
     // (CO24e). A version-2 record without one authorizes nothing. A legacy grant

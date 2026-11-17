@@ -60,9 +60,9 @@ export interface ShadowLedger {
   readonly days: readonly ShadowDayRecord[];
 }
 
-const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+export const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const MAX_REVISION = 1_000_000_000;
+export const MAX_REVISION = 1_000_000_000;
 const CRITERION_SET: ReadonlySet<string> = new Set(CUTOVER_SHADOW_CRITERIA);
 const EVIDENCE_DAYS = 3;
 const LEDGER_DAY_KEYS: readonly string[] = ['day', 'releaseSha', 'mergesCompared', 'verdicts'];
@@ -147,7 +147,7 @@ export function readShadowLedger(raw: unknown): ShadowLedgerRead {
  * property is an enumerable own data property before reporting
  * `unknown-schema-version`, so reading the descriptor value runs no getter.
  */
-function isVersionAboveCurrent(raw: unknown): boolean {
+export function isVersionAboveCurrent(raw: unknown): boolean {
   const descriptor = Object.getOwnPropertyDescriptor(raw as object, 'schemaVersion');
   if (descriptor === undefined || descriptor.get !== undefined) {
     return false;
@@ -300,12 +300,12 @@ function ownDataValue(record: unknown, key: string): unknown {
 }
 
 /** Both secret registries, as the comparators check them (CO31 precedent). */
-function isSecretShaped(text: string): boolean {
+export function isSecretShaped(text: string): boolean {
   return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
 }
 
 /** The UTC day serial of a real calendar `YYYY-MM-DD` date, or null. */
-function dayNumber(day: string): number | null {
+export function dayNumber(day: string): number | null {
   if (!DAY_PATTERN.test(day)) {
     return null;
   }

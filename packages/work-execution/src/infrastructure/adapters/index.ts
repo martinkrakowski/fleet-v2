@@ -102,6 +102,7 @@ export * from "./seat-store-bytes.js";
 export * from "./SeatCatalogAdapter.adapter.js";
 export * from "./SeatObservationRepositoryAdapter.adapter.js";
 export * from "./SeatTicketRepositoryAdapter.adapter.js";
+export * from "./ShadowAttestationAdapter.adapter.js";
 export * from "./ShadowEvidenceAdapter.adapter.js";
 export * from "./SingleRecordStore.helper.js";
 export * from "./spawn-run.js";

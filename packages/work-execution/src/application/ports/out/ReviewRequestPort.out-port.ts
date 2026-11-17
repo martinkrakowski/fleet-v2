@@ -2,10 +2,10 @@
 
 import type { ReviewKind, ReviewUnknownReason } from '@fleet/evidence-and-acceptance';
 
-/** The kinds a request may name: the stored review kinds plus `brief-verify` (the manifest contract), which is refused at runtime until the brief subject is implemented. */
+/** The kinds a request may name: the stored review kinds, including an active `brief-verify` for a brief subject. */
 export type ReviewRequestKind = ReviewKind | 'brief-verify';
 
-/** The stored review kinds, which a receipt can carry (`brief-verify` is never stored yet). */
+/** The stored review kinds a receipt can carry, including `brief-verify`. */
 export type StoredReviewRequestKind = ReviewKind;
 
 export const REVIEW_SUBJECT_KINDS = ['attempt', 'chain', 'brief'] as const;
@@ -18,7 +18,7 @@ export type ReviewSubject =
 
 export interface ReviewRequest {
   readonly requestId: string;
-  /** `brief-verify` is typed in and refused at runtime (`subject-not-implemented`) until CO18. */
+  /** Active review kind. `brief-verify` reviews a brief subject at its base commit. */
   readonly kind: ReviewRequestKind;
   readonly attemptId: string;
   readonly projectId: string;
@@ -28,12 +28,15 @@ export interface ReviewRequest {
    * Absent: the attempt `attemptId` at `candidateHeadSha`. A `chain` subject
    * names the combined review of a chain at its integration head, which must
    * equal `candidateHeadSha`; the attempt fields then only mirror the subject.
+   * A `brief` subject is active: it names the `brief-verify` review of a frozen
+   * brief package at its base commit, which must equal `candidateHeadSha`, and
+   * `attemptId` is that brief's pseudo attempt id.
    */
   readonly subject?: ReviewSubject;
   readonly policyRevision: string;
   readonly implementerModel: string;
   readonly reviewerModel: string;
-  /** The frozen brief; only forwarded with `kind: 'brief-check'`, capped at 64 KiB. */
+  /** The frozen brief; forwarded with `kind: 'brief-check'` and required for an active `kind: 'brief-verify'`, capped at 64 KiB. */
   readonly briefText?: string;
   /** Only forwarded with a chain subject: the scope in a few words (no path, no diff text), capped at 2 KiB. */
   readonly diffSummary?: string;

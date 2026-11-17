@@ -16,6 +16,11 @@ export interface RecordAuthorizationConsumptionRequest {
   readonly actionKind?: string;
   readonly attemptId: string;
   readonly expectedHeadSha: string;
+  /**
+   * The release root the consumption names (CO14 follow-up). A grant bound to
+   * one root is never consumed for another.
+   */
+  readonly releaseRoot?: string;
   readonly nowIso?: string;
 }
 

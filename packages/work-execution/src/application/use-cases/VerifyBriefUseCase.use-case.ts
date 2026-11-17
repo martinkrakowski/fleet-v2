@@ -15,7 +15,7 @@
 
 import { readPlainRecord, type PlainRecordSchema } from '@fleet/shared';
 import { lintBrief } from '../../domain/brief-answer.js';
-import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
+import { attemptIdForBrief, isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import {
   isFixedProtectedPath,
   pathUnderPrefix,
@@ -580,7 +580,7 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
     const reviewRequest: ReviewRequest = {
       requestId,
       kind: 'brief-verify',
-      attemptId: pkg.getAttemptId(),
+      attemptId: attemptIdForBrief(workOrderRecord.projectId, pkg.getBriefDigest()),
       projectId: workOrderRecord.projectId,
       candidateHeadSha: workOrderRecord.baseCommit,
       subject: {

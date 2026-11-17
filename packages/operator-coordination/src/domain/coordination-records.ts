@@ -185,6 +185,63 @@ export function isReleaseActionScope(actionScope: string): boolean {
   return (RELEASE_ACTION_SCOPES as readonly string[]).includes(actionScope);
 }
 
+/**
+ * The release root a release grant (CO14, follow-up) is bound to. A grant
+ * recorded for root R authorizes only an operation on root R. Pure: bounded
+ * absolute path text with no control character and no `..` segment; anything
+ * else is not a root coordinate.
+ */
+export function isReleaseRootCoordinate(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4096) {
+    return false;
+  }
+  if (!value.startsWith('/') || /[\p{C}]/u.test(value)) {
+    return false;
+  }
+  return !value.split('/').includes('..');
+}
+
+/** A release root read from runtime data: absent, a valid coordinate, or invalid (never conflated). */
+export type ReleaseRootRead =
+  | { readonly state: 'absent' }
+  | { readonly state: 'valid'; readonly value: string }
+  | { readonly state: 'invalid' };
+
+/**
+ * Reads `releaseRoot` from a record through its own property descriptor, so an
+ * accessor, a throwing Proxy trap or an inherited value never runs code. A
+ * missing or `undefined` field is absent; a valid coordinate is valid; anything
+ * else (wrong type, empty, oversized, accessor, hostile) is invalid and must
+ * fail closed, never be treated as absent.
+ */
+export function readReleaseRoot(record: object): ReleaseRootRead {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(record, 'releaseRoot');
+    if (descriptor === undefined) {
+      return { state: 'absent' };
+    }
+    if (!('value' in descriptor)) {
+      return { state: 'invalid' };
+    }
+    if (descriptor.value === undefined) {
+      return { state: 'absent' };
+    }
+    return isReleaseRootCoordinate(descriptor.value)
+      ? { state: 'valid', value: descriptor.value }
+      : { state: 'invalid' };
+  } catch {
+    return { state: 'invalid' };
+  }
+}
+
+/** True when the two reads may authorize one another: both absent, or both valid and equal. */
+export function releaseRootsAgree(a: ReleaseRootRead, b: ReleaseRootRead): boolean {
+  if (a.state === 'invalid' || b.state === 'invalid') {
+    return false;
+  }
+  return a.state === 'absent' ? b.state === 'absent' : b.state === 'valid' && a.value === b.value;
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;
@@ -216,6 +273,12 @@ export interface CoordinationRequestRecord {
    * without it authorizes nothing at consumption.
    */
   readonly grantAttemptId?: string;
+  /**
+   * The release root the grant is bound to (CO14 follow-up); only a release
+   * grant carries one. A resolve or consumption naming another root is
+   * refused, so a grant for one root never authorizes another.
+   */
+  readonly releaseRoot?: string;
 }
 
 /** Bounded attention and staleness summary; reading it rewrites nothing. */

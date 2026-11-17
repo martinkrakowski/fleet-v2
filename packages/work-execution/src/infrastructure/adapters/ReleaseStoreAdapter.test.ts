@@ -288,6 +288,54 @@ describe('ReleaseStoreAdapter', () => {
     await expect(fs.lstat(buildDir)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('markRepointed flips repointed only for the exact opId that owns the intent (CO14b round 10)', async () => {
+    const opId = 'a'.repeat(32);
+    const begun = await adapter.beginOperation({ root, action: 'rollback', sha: B, opId, nowIso: at(1) });
+    expect(begun).toEqual({ outcome: 'started', opId });
+    expect(await adapter.peekAnyOpenOperation({ root, action: 'rollback' })).toEqual({
+      outcome: 'open',
+      opId,
+      sha: B,
+      repointed: false,
+    });
+
+    // A missing intent is `not-found`, never a write.
+    expect(await adapter.markRepointed({ root, action: 'rollback', sha: C, opId })).toEqual({ outcome: 'not-found' });
+    // A mismatched opId never rewrites someone else's intent.
+    const otherOpId = 'b'.repeat(32);
+    expect(await adapter.markRepointed({ root, action: 'rollback', sha: B, opId: otherOpId })).toEqual({
+      outcome: 'unreadable',
+    });
+    expect(await adapter.peekAnyOpenOperation({ root, action: 'rollback' })).toEqual({
+      outcome: 'open',
+      opId,
+      sha: B,
+      repointed: false,
+    });
+
+    expect(await adapter.markRepointed({ root, action: 'rollback', sha: B, opId })).toEqual({ outcome: 'ok' });
+    expect(await adapter.peekAnyOpenOperation({ root, action: 'rollback' })).toEqual({
+      outcome: 'open',
+      opId,
+      sha: B,
+      repointed: true,
+    });
+
+    // A genuine resume (same opId, EEXIST branch) never loses the flag or
+    // the intent's own recorded createdAtIso.
+    const resumed = await adapter.beginOperation({ root, action: 'rollback', sha: B, opId, nowIso: at(2) });
+    expect(resumed).toEqual({ outcome: 'resumed', opId });
+    expect(await adapter.peekAnyOpenOperation({ root, action: 'rollback' })).toEqual({
+      outcome: 'open',
+      opId,
+      sha: B,
+      repointed: true,
+    });
+
+    expect(await adapter.completeOperation({ root, action: 'rollback', sha: B, opId })).toEqual({ outcome: 'ok' });
+    expect(await adapter.peekAnyOpenOperation({ root, action: 'rollback' })).toEqual({ outcome: 'none' });
+  });
+
   it('discards an incomplete staging dir and its archive', async () => {
     const { buildId, buildDir, archivePath, homeDir } = await staged(A);
     await fs.writeFile(path.join(buildDir, 'partial.txt'), 'stale');

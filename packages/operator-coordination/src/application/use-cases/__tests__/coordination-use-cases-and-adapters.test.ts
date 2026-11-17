@@ -1717,15 +1717,18 @@ describe('RecordAuthorizationConsumptionUseCase', () => {
     expect(repo.requests.get('request-1')?.consumptions).toHaveLength(1);
   });
 
-  it('refuses to record the same action twice', async () => {
+  it('observes the same action replay idempotently and records it never twice', async () => {
     const repo = new StubRequestRepository([
       requestRecord({ consumptions: [consumptionRecord()] }),
     ]);
     const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: repo }).execute(
       consumptionRequest,
     );
-    expect(result.outcome).toBe('refused');
-    expect(result.outcome === 'refused' && result.reason).toContain('already authorized');
+    // CO14 follow-up: the same action replayed with its own consumption id
+    // observes the durable receipt unchanged — nothing is recorded twice — so
+    // a caller that crashed between its consumption and its write can replay.
+    expect(result).toEqual({ outcome: 'consumed', consumption: consumptionRecord() });
+    expect(repo.requests.get('request-1')?.consumptions).toHaveLength(1);
   });
 
   it('refuses an unrecorded grant, an unapproved state and a moved head', async () => {

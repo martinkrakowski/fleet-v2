@@ -12,13 +12,16 @@
  * but present in the shell parked list, so the parked list's `pr sha base`
  * lines are parsed with the same queue parser and merged into the shell set.
  * A parked list that is unreadable or secret-shaped refuses the report —
- * comparing without it would silently mis-report parked PRs.
+ * comparing without it would silently mis-report parked PRs. The train's
+ * in-progress head (`inprogress`) is parsed the same way and counted on the
+ * shell side; fleet entries are keyed by their own recorded base branch.
  */
 
 import { firstPositional, str, CliUsageError, type Payload } from './payload.js';
 import type { CommandHandler } from './payload.js';
 import {
   compareShadowEnqueueSets,
+  isMergeQueueEntryLive,
   parseLegacyTrainQueue,
   type LegacyTrainQueueLine,
 } from '@fleet/work-execution';
@@ -212,21 +215,55 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
       parkedLines = parsedParked.lines;
     }
 
-    const understood = parsed.lines
-      .concat(parkedLines)
-      .filter((line): line is Extract<LegacyTrainQueueLine, { ok: true }> => line.ok);
-    const unknownLines = parsed.lines
-      .concat(parkedLines)
-      .filter((line) => !line.ok)
-      .map((line) => line.line);
+    // The train head (`inprogress`) is part of the shell's enqueue set: it has
+    // left the queue but has not merged. Parse it with the same queue parser
+    // and merge it into the same accounting as the parked lines — a missing
+    // field is unknown evidence (an older adapter), an unreadable or
+    // secret-shaped head refuses the report.
+    const inprogress = shellState.inprogress;
+    if (inprogress === undefined) {
+      return { outcome: 'unknown', reason: 'shell-state-incomplete', kind: 'enqueue-set' };
+    }
+    if (inprogress.status === 'unreadable') {
+      return { outcome: 'refused', reason: 'shell-queue-unreadable', kind: 'enqueue-set' };
+    }
+    let inprogressLines: readonly LegacyTrainQueueLine[] = [];
+    if (inprogress.status === 'read') {
+      const parsedInprogress = parseLegacyTrainQueue(inprogress.lines.join('\n'));
+      if (!parsedInprogress.ok) {
+        return {
+          outcome: 'refused',
+          reason: parsedInprogress.reason === 'secret-shaped' ? 'secret-shaped' : 'shell-queue-unreadable',
+          kind: 'enqueue-set',
+        };
+      }
+      inprogressLines = parsedInprogress.lines;
+    }
+
+    const allLines = parsed.lines.concat(parkedLines, inprogressLines);
+    const understood = allLines.filter(
+      (line): line is Extract<LegacyTrainQueueLine, { ok: true }> => line.ok,
+    );
+    const unknownLines = allLines.filter((line) => !line.ok).map((line) => line.line);
 
     const deadlineIso = new Date(Date.now() + 60_000).toISOString();
-    const view = await runtime.execution.listMergeQueue.list({ repository, deadlineIso });
-    const fleet = view.entries.map((entry) => ({
-      pullRequest: entry.pullRequest,
-      headOid: entry.headOid,
-      base: 'main',
-    }));
+    // The fleet list use case partitions the queue by base (an omitted base
+    // selects `main`), so the read goes through the repository port and every
+    // live entry is compared under its own recorded base, `main` when it has
+    // none.
+    const records = await runtime.execution.mergeQueueRepository.listMergeEntries({ repository, deadlineIso });
+    const fleet = records
+      .filter(
+        (entry) =>
+          isMergeQueueEntryLive(entry) &&
+          entry.repository.owner === repository.owner &&
+          entry.repository.repo === repository.repo,
+      )
+      .map((entry) => ({
+        pullRequest: entry.pullRequest,
+        headOid: entry.headOid,
+        base: entry.baseBranch ?? 'main',
+      }));
     const shell = understood.map((line) => ({
       pullRequest: line.entry.pullRequest,
       headOid: line.entry.headOid,
@@ -250,6 +287,16 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
         : shellState.batch.status === 'absent'
           ? 0
           : null;
+    const inprogressCount = inprogress.status === 'read' ? inprogress.lines.length : 0;
+    const batchesEnabled = shellState.batchesEnabled;
+    const batchesEnabledLines =
+      batchesEnabled === undefined
+        ? null
+        : batchesEnabled.status === 'read'
+          ? batchesEnabled.lines.length
+          : batchesEnabled.status === 'absent'
+            ? 0
+            : null;
 
     // An incomplete comparison is never a pass: it answers `unknown` (exit 1)
     // and `equal` is false, so matching entries beside an unparseable shell
@@ -257,12 +304,13 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
     const complete =
       unknownLines.length === 0 &&
       shellState.chains.status !== 'unreadable' &&
-      shellState.batch.status !== 'unreadable';
+      shellState.batch.status !== 'unreadable' &&
+      batchesEnabled !== undefined &&
+      batchesEnabled.status !== 'unreadable';
     return {
       outcome: complete ? 'completed' : 'unknown',
       ...(complete ? {} : { reason: 'shell-state-incomplete' }),
       kind: 'enqueue-set',
-      fleetBase: 'main',
       equal: complete && result.equal,
       complete,
       compared: result.compared,
@@ -274,8 +322,10 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
         queue: 'read',
         unknownLines,
         parkedLines: shellState.parked.status === 'read' ? shellState.parked.lines.length : 0,
+        inprogressLines: inprogressCount,
         chainFiles,
         batchLines,
+        batchesEnabledLines,
       },
     };
   },

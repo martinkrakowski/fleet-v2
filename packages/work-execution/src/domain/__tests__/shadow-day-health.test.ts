@@ -429,16 +429,38 @@ function stateInput(overrides: Record<string, unknown> = {}): Record<string, unk
   };
 }
 
+/** Every S9 count. Early refusals expect this set unchanged. */
+const S9_ZERO = {
+  stateChecked: 0,
+  stateBad: 0,
+  journalKeys: 0,
+  duplicateIntents: 0,
+  duplicateResults: 0,
+  resultsAfterFinal: 0,
+  orphanResults: 0,
+  unreconciledIntents: 0,
+};
+
+/** A full S9 evaluation: `counts` overrides `S9_ZERO`, and `toEqual` sees all eight. */
+function s9Eval(
+  status: 'pass' | 'fail' | 'unknown',
+  reason: string,
+  counts: Partial<typeof S9_ZERO> = {},
+): { status: 'pass' | 'fail' | 'unknown'; reason: string } & typeof S9_ZERO {
+  return { status, reason, ...S9_ZERO, ...counts };
+}
+
 describe('evaluateShadowStateIntegrity (S9)', () => {
   it('passes a fully clean day', () => {
-    expect(evaluateShadowStateIntegrity(stateInput())).toEqual({ status: 'pass', reason: 'state-consistent' });
+    expect(evaluateShadowStateIntegrity(stateInput())).toEqual(
+      s9Eval('pass', 'state-consistent', { stateChecked: 5 }),
+    );
   });
 
   it('fails state-check-failed when stateCheck.bad is 1', () => {
-    expect(evaluateShadowStateIntegrity(stateInput({ stateCheck: { checked: 5, bad: 1 } }))).toEqual({
-      status: 'fail',
-      reason: 'state-check-failed',
-    });
+    expect(evaluateShadowStateIntegrity(stateInput({ stateCheck: { checked: 5, bad: 1 } }))).toEqual(
+      s9Eval('fail', 'state-check-failed', { stateChecked: 5, stateBad: 1 }),
+    );
   });
 
   it('fails journal-duplicate-intent for a key with two intent entries', () => {
@@ -448,19 +470,23 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k1', 'intent', null, PREV_23(51)),
         journalEntry('k1', 'result', 'completed', PREV_23(52)),
       ],
-    }))).toEqual({ status: 'fail', reason: 'journal-duplicate-intent' });
+    }))).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateIntents: 1,
+    }));
   });
 
   it('reports unknown for a misspelled journal kind instead of silently ignoring it', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [journalEntry('k1', 'invent', 'completed', PREV_23(50))],
-    }))).toEqual({ status: 'unknown', reason: 'invalid-input' });
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
   });
 
   it('reports unknown for an unrecognized journal outcome instead of silently ignoring it', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [journalEntry('k1', 'intent', 'finshed', PREV_23(50))],
-    }))).toEqual({ status: 'unknown', reason: 'invalid-input' });
+    }))).toEqual(s9Eval('unknown', 'invalid-input'));
   });
 
   it('fails journal-orphan-result when a result appears before its matching intent', () => {
@@ -469,13 +495,21 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k1', 'result', 'completed', PREV_23(51)),
         journalEntry('k1', 'intent', null, PREV_23(52)),
       ],
-    }))).toEqual({ status: 'fail', reason: 'journal-orphan-result' });
+    }))).toEqual(s9Eval('fail', 'journal-orphan-result', {
+      stateChecked: 5,
+      journalKeys: 1,
+      orphanResults: 1,
+    }));
   });
 
   it('fails journal-orphan-result for a key with a result but no intent', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [journalEntry('k2', 'result', 'completed', PREV_23(50))],
-    }))).toEqual({ status: 'fail', reason: 'journal-orphan-result' });
+    }))).toEqual(s9Eval('fail', 'journal-orphan-result', {
+      stateChecked: 5,
+      journalKeys: 1,
+      orphanResults: 1,
+    }));
   });
 
   it('fails journal-duplicate-result for a key with two non-ambiguous results', () => {
@@ -485,19 +519,28 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k3', 'result', 'completed', PREV_23(51)),
         journalEntry('k3', 'result', 'refused', PREV_23(52)),
       ],
-    }))).toEqual({ status: 'fail', reason: 'journal-duplicate-result' });
+    }))).toEqual(s9Eval('fail', 'journal-duplicate-result', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateResults: 1,
+      resultsAfterFinal: 1,
+    }));
   });
 
   it('fails unreconciled-intent when an intent has been open for 16 minutes before the sample', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [journalEntry('k4', 'intent', null, '2026-11-10T23:44:00.000Z')],
-    }))).toEqual({ status: 'fail', reason: 'unreconciled-intent' });
+    }))).toEqual(s9Eval('fail', 'unreconciled-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      unreconciledIntents: 1,
+    }));
   });
 
   it('passes when an intent has been open for only 14 minutes', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [journalEntry('k5', 'intent', null, '2026-11-10T23:46:00.000Z')],
-    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+    }))).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
   });
 
   it('passes a lone operator stop intent open for 16 minutes: control keys are never pending', () => {
@@ -512,7 +555,7 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
     const STOP_KEY = 'run-01JB0000000000000000000000/stop@web';
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [journalEntry(STOP_KEY, 'intent', null, '2026-11-10T23:44:00.000Z')],
-    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+    }))).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
   });
 
   it('passes when an ambiguous result is followed later by a real final result', () => {
@@ -522,7 +565,7 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k6', 'result', 'ambiguous', '2026-11-10T10:05:00.000Z'),
         journalEntry('k6', 'result', 'completed', '2026-11-10T10:10:00.000Z'),
       ],
-    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+    }))).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
   });
 
   it('accepts a null-outcome intent entry, as the real journal model shapes it, and evaluates it rather than refusing it as malformed', () => {
@@ -531,7 +574,12 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k7', 'intent', null, PREV_23(50)),
         journalEntry('k7', 'intent', null, PREV_23(51)),
       ],
-    }))).toEqual({ status: 'fail', reason: 'journal-duplicate-intent' });
+    }))).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateIntents: 1,
+      unreconciledIntents: 1,
+    }));
   });
 
   it('passes a key whose intent precedes both results in true append order even though the results\' timestamps are not in position order', () => {
@@ -551,7 +599,7 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k8', 'result', 'ambiguous', '2026-11-10T09:00:00.000Z'),
         journalEntry('k8', 'result', 'completed', '2026-11-10T09:05:00.000Z'),
       ],
-    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+    }))).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
   });
 
   it('fails journal-result-after-final when a completed result and a later ambiguous result share one timestamp, in real append order', () => {
@@ -568,7 +616,11 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k12', 'result', 'completed', sameIso),
         journalEntry('k12', 'result', 'ambiguous', sameIso),
       ],
-    }))).toEqual({ status: 'fail', reason: 'journal-result-after-final' });
+    }))).toEqual(s9Eval('fail', 'journal-result-after-final', {
+      stateChecked: 5,
+      journalKeys: 1,
+      resultsAfterFinal: 1,
+    }));
   });
 
   it('accepts a normal conduct entry (key null, outcome null) and excludes it from tallying, evaluating the rest normally', () => {
@@ -578,7 +630,7 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k9', 'intent', null, PREV_23(50)),
         journalEntry('k9', 'result', 'completed', PREV_23(51)),
       ],
-    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+    }))).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
   });
 
   it('fails journal-result-after-final when an ambiguous result is recorded after the key\'s final result', () => {
@@ -588,7 +640,11 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k10', 'result', 'completed', PREV_23(51)),
         journalEntry('k10', 'result', 'ambiguous', PREV_23(52)),
       ],
-    }))).toEqual({ status: 'fail', reason: 'journal-result-after-final' });
+    }))).toEqual(s9Eval('fail', 'journal-result-after-final', {
+      stateChecked: 5,
+      journalKeys: 1,
+      resultsAfterFinal: 1,
+    }));
   });
 
   it('passes a not-started result on a request-channel key followed by a later final result', () => {
@@ -604,7 +660,7 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry(REQUEST_KEY, 'result', 'not-started', PREV_23(51)),
         journalEntry(REQUEST_KEY, 'result', 'completed', PREV_23(52)),
       ],
-    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+    }))).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
   });
 
   it('passes a request-channel key whose only result is not-started, 16 minutes old: reconciled, not an open intent', () => {
@@ -620,7 +676,7 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry(REQUEST_KEY, 'intent', null, '2026-11-10T23:44:00.000Z'),
         journalEntry(REQUEST_KEY, 'result', 'not-started', '2026-11-10T23:45:00.000Z'),
       ],
-    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+    }))).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
   });
 
   it('fails for a not-started result on a non-request key followed by a later result (the carve-out is request-channel only)', () => {
@@ -635,36 +691,143 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k11', 'result', 'not-started', PREV_23(51)),
         journalEntry('k11', 'result', 'completed', PREV_23(52)),
       ],
-    }))).toEqual({ status: 'fail', reason: 'journal-duplicate-result' });
+    }))).toEqual(s9Eval('fail', 'journal-duplicate-result', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateResults: 1,
+      resultsAfterFinal: 1,
+    }));
   });
 
   it('reports unknown/state-check-unavailable when stateCheck is null', () => {
-    expect(evaluateShadowStateIntegrity(stateInput({ stateCheck: null }))).toEqual({
-      status: 'unknown',
-      reason: 'state-check-unavailable',
-    });
+    expect(evaluateShadowStateIntegrity(stateInput({ stateCheck: null }))).toEqual(
+      s9Eval('unknown', 'state-check-unavailable'),
+    );
   });
 
   it('reports unknown/state-check-unavailable when no stores were checked', () => {
-    expect(evaluateShadowStateIntegrity(stateInput({ stateCheck: { checked: 0, bad: 0 } }))).toEqual({
-      status: 'unknown',
-      reason: 'state-check-unavailable',
-    });
+    expect(evaluateShadowStateIntegrity(stateInput({ stateCheck: { checked: 0, bad: 0 } }))).toEqual(
+      s9Eval('unknown', 'state-check-unavailable'),
+    );
   });
 
   it('is not satisfiable by a constant verdict: clean and failing journals differ', () => {
     const clean = evaluateShadowStateIntegrity(stateInput());
     const failing = evaluateShadowStateIntegrity(stateInput({ stateCheck: { checked: 5, bad: 1 } }));
-    expect(clean.status).toBe('pass');
-    expect(failing).toEqual({ status: 'fail', reason: 'state-check-failed' });
+    expect(clean).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5 }));
+    expect(failing).toEqual(s9Eval('fail', 'state-check-failed', { stateChecked: 5, stateBad: 1 }));
   });
 
   it('never echoes its input', () => {
     const input = stateInput();
     const result = evaluateShadowStateIntegrity(input) as unknown as Record<string, unknown>;
-    expect(Object.keys(result).sort()).toEqual(['reason', 'status']);
+    expect(Object.keys(result).sort()).toEqual([
+      'duplicateIntents',
+      'duplicateResults',
+      'journalKeys',
+      'orphanResults',
+      'reason',
+      'resultsAfterFinal',
+      'stateBad',
+      'stateChecked',
+      'status',
+      'unreconciledIntents',
+    ]);
     expect(result).not.toHaveProperty('journal');
     expect(result).not.toHaveProperty('stateCheck');
+    expect(result).not.toHaveProperty('sampledAtIso');
+  });
+
+  it('two pass/state-consistent inputs with different stateChecked or journalKeys carry different counts', () => {
+    const empty = evaluateShadowStateIntegrity(stateInput());
+    const moreChecked = evaluateShadowStateIntegrity(stateInput({ stateCheck: { checked: 10, bad: 0 } }));
+    const withKey = evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k', 'intent', null, PREV_23(50)),
+        journalEntry('k', 'result', 'completed', PREV_23(51)),
+      ],
+    }));
+    expect(empty).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5 }));
+    expect(moreChecked).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 10 }));
+    expect(withKey).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
+    expect(empty.stateChecked).not.toBe(moreChecked.stateChecked);
+    expect(empty.journalKeys).not.toBe(withKey.journalKeys);
+  });
+
+  it('two fail/journal-duplicate-intent inputs with different anomaly counts carry different counts', () => {
+    const oneKey = [
+      journalEntry('k1', 'intent', null, '2026-11-10T23:50:00.000Z'),
+      journalEntry('k1', 'intent', null, '2026-11-10T23:51:00.000Z'),
+      journalEntry('k1', 'result', 'completed', '2026-11-10T23:52:00.000Z'),
+    ];
+    const twoKeys = [
+      ...oneKey,
+      journalEntry('k2', 'intent', null, '2026-11-10T23:50:00.000Z'),
+      journalEntry('k2', 'intent', null, '2026-11-10T23:51:00.000Z'),
+      journalEntry('k2', 'result', 'completed', '2026-11-10T23:52:00.000Z'),
+    ];
+    const one = evaluateShadowStateIntegrity(stateInput({ journal: oneKey }));
+    const two = evaluateShadowStateIntegrity(stateInput({ journal: twoKeys }));
+    expect(one).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateIntents: 1,
+    }));
+    expect(two).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 2,
+      duplicateIntents: 2,
+    }));
+    expect(one.duplicateIntents).not.toBe(two.duplicateIntents);
+  });
+
+  it('counts every anomaly across keys independently and keeps the first failing tally reason in map and check order', () => {
+    // k-open is inserted first, so a single pass that treated unreconciled-intent
+    // as just another per-key check would name it the reason. Loop 1 runs first
+    // and finds k-dup's duplicate intent, so that reason wins while every other
+    // anomaly is still counted.
+    const result = evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k-open', 'intent', null, '2026-11-10T23:44:00.000Z'),
+        journalEntry('k-dup', 'intent', null, '2026-11-10T23:50:00.000Z'),
+        journalEntry('k-dup', 'intent', null, '2026-11-10T23:51:00.000Z'),
+        journalEntry('k-dup', 'result', 'completed', '2026-11-10T23:52:00.000Z'),
+        journalEntry('k-dup-result', 'intent', null, '2026-11-10T23:40:00.000Z'),
+        journalEntry('k-dup-result', 'result', 'completed', '2026-11-10T23:41:00.000Z'),
+        journalEntry('k-dup-result', 'result', 'refused', '2026-11-10T23:42:00.000Z'),
+        journalEntry('k-after', 'intent', null, '2026-11-10T23:30:00.000Z'),
+        journalEntry('k-after', 'result', 'completed', '2026-11-10T23:31:00.000Z'),
+        journalEntry('k-after', 'result', 'ambiguous', '2026-11-10T23:32:00.000Z'),
+        journalEntry('k-orphan', 'result', 'completed', '2026-11-10T23:20:00.000Z'),
+      ],
+    }));
+    expect(result).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 5,
+      duplicateIntents: 1,
+      duplicateResults: 1,
+      resultsAfterFinal: 2,
+      orphanResults: 1,
+      unreconciledIntents: 1,
+    }));
+  });
+
+  it('returns all-zero counts for invalid-input and state-check-unavailable', () => {
+    expect(evaluateShadowStateIntegrity(null)).toEqual(s9Eval('unknown', 'invalid-input'));
+    expect(evaluateShadowStateIntegrity(undefined)).toEqual(s9Eval('unknown', 'invalid-input'));
+    expect(evaluateShadowStateIntegrity(stateInput({ stateCheck: null }))).toEqual(
+      s9Eval('unknown', 'state-check-unavailable'),
+    );
+    expect(evaluateShadowStateIntegrity(stateInput({ stateCheck: { checked: 0, bad: 0 } }))).toEqual(
+      s9Eval('unknown', 'state-check-unavailable'),
+    );
+  });
+
+  it('S9 refuses: a prototype-polluting prototype key', () => {
+    const input = JSON.parse(
+      `{"prototype": 1, "stateCheck": {"checked": 1, "bad": 0}, "journal": [], "sampledAtIso": "${SAMPLE_AT}"}`,
+    );
+    expect(evaluateShadowStateIntegrity(input)).toEqual(s9Eval('unknown', 'invalid-input'));
   });
 });
 
@@ -897,6 +1060,9 @@ describe('hostile input', () => {
             starvedJobs: 0,
           });
         }
+        if (label === 'S9') {
+          expect(result).toEqual(s9Eval('unknown', expected));
+        }
         if (hostile.calls !== undefined) {
           expect(hostile.calls()).toBe(0);
         }
@@ -928,7 +1094,13 @@ describe('hostile input', () => {
         return Reflect.get(target, key, receiver);
       },
     });
-    expect(evaluateShadowStateIntegrity(proxy)).toEqual(evaluateShadowStateIntegrity(plain));
+    const expected = s9Eval('fail', 'unreconciled-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      unreconciledIntents: 1,
+    });
+    expect(evaluateShadowStateIntegrity(plain)).toEqual(expected);
+    expect(evaluateShadowStateIntegrity(proxy)).toEqual(expected);
     expect(getTraps).toBe(0);
   });
 
@@ -947,7 +1119,7 @@ describe('hostile input', () => {
   it('S9 refuses a revoked Proxy instead of throwing', () => {
     const { proxy, revoke } = Proxy.revocable(stateInput({}), {});
     revoke();
-    expect(evaluateShadowStateIntegrity(proxy)).toEqual({ status: 'unknown', reason: 'invalid-input' });
+    expect(evaluateShadowStateIntegrity(proxy)).toEqual(s9Eval('unknown', 'invalid-input'));
   });
 
   it('S12 refuses a Proxy whose ownKeys trap throws', () => {
@@ -971,7 +1143,7 @@ describe('hostile input', () => {
         throw new Error('trap');
       },
     });
-    expect(evaluateShadowStateIntegrity(proxy)).toEqual({ status: 'unknown', reason: 'invalid-input' });
+    expect(evaluateShadowStateIntegrity(proxy)).toEqual(s9Eval('unknown', 'invalid-input'));
   });
 
   it('S9 never runs an enumerable getter on the nested stateCheck object (SH5b)', () => {
@@ -991,7 +1163,7 @@ describe('hostile input', () => {
     // validated snapshot carries `checked: undefined`, never the getter's
     // lying `5`.
     expect(getterCalls).toBe(0);
-    expect(result).toEqual({ status: 'unknown', reason: 'invalid-input' });
+    expect(result).toEqual(s9Eval('unknown', 'invalid-input'));
     expect(result).toEqual(evaluateShadowStateIntegrity(stateInput({ stateCheck: { checked: undefined, bad: 0 } })));
   });
 
@@ -1016,7 +1188,7 @@ describe('hostile input', () => {
     // so the real target values (0, 0) are copied into the snapshot, never
     // the trap's lying `5`.
     expect(getTraps).toBe(0);
-    expect(result).toEqual({ status: 'unknown', reason: 'state-check-unavailable' });
+    expect(result).toEqual(s9Eval('unknown', 'state-check-unavailable'));
     expect(result).toEqual(evaluateShadowStateIntegrity(stateInput({ stateCheck: plainStateCheck })));
   });
 
@@ -1043,7 +1215,12 @@ describe('hostile input', () => {
       },
     });
     const honestResult = evaluateShadowStateIntegrity(stateInput({ journal: honestJournal }));
-    expect(honestResult).toEqual({ status: 'fail', reason: 'journal-duplicate-intent' });
+    expect(honestResult).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateIntents: 1,
+      unreconciledIntents: 1,
+    }));
     expect(evaluateShadowStateIntegrity(stateInput({ journal: lyingJournal }))).toEqual(honestResult);
     expect(getTraps).toBe(0);
   });

@@ -16,7 +16,7 @@ import { LANE_RUN_JOURNAL_OUTCOMES } from './lane-run-journal.js';
 import type { LaneRunJournalOutcome } from './lane-run-journal.js';
 import { parseLaneRunKey } from './lane-run-keys.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
-import { readExactPlainRecord } from './plain-record-reads.js';
+import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
 
 /** The plan's DT §3.1 tick floor: about half the ~1,440 ticks a 60-second day produces. */
 export const SHADOW_MIN_TICKS_PER_DAY = 720;
@@ -397,6 +397,20 @@ interface KeyTally {
   finalResultPosition: number | null;
   /** The latest position among this key's `result` entries, any outcome, or null with none. */
   latestResultPosition: number | null;
+  /** True when any of this key's entries falls inside the scoping day's `[start, end)` bounds (always true when unscoped). */
+  touchesDay: boolean;
+}
+
+/** The half-open UTC-millisecond bounds `[start, end)` of one recorded day. */
+interface DayBounds {
+  readonly start: number;
+  readonly end: number;
+}
+
+/** The `[D, D+1)` bounds of UTC day `day` in epoch milliseconds, via `Date.parse` — never string prefixes. */
+function dayBounds(day: string): DayBounds {
+  const start = Date.parse(`${day}T00:00:00.000Z`);
+  return { start, end: start + 86_400_000 };
 }
 
 /**
@@ -408,13 +422,25 @@ interface KeyTally {
  * order is never the authority here, only `kind`, `outcome` and `position`
  * are. A `conduct` entry carries no key (`entry.key === null`) and is
  * excluded here: it has nothing to tally against any key's sequence.
+ *
+ * `bounds` scopes `touchesDay`, not the tallies themselves: when it is null
+ * every key's `touchesDay` stays true (unscoped, so every key is reportable);
+ * when it carries a day's `[start, end)` bounds, a key's `touchesDay` is true
+ * exactly when one of that key's own entries parses into the half-open
+ * interval. Sequence checks that must be day-scoped filter the entries and
+ * then restrict the tallied map to keys with `touchesDay === true`.
  */
-function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyTally> {
+function tallyJournal(
+  entries: readonly SampledJournalEntry[],
+  bounds: DayBounds | null,
+): Map<string, KeyTally> {
   const tallies = new Map<string, KeyTally>();
   for (const entry of entries) {
     if (entry.key === null) {
       continue;
     }
+    const ms = bounds === null ? Number.NaN : Date.parse(entry.recordedAtIso);
+    const inDay = bounds === null || (ms >= bounds.start && ms < bounds.end);
     let tally = tallies.get(entry.key);
     if (tally === undefined) {
       tally = {
@@ -426,8 +452,12 @@ function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyT
         earliestResultPosition: null,
         finalResultPosition: null,
         latestResultPosition: null,
+        touchesDay: false,
       };
       tallies.set(entry.key, tally);
+    }
+    if (inDay) {
+      tally.touchesDay = true;
     }
     if (entry.kind === 'intent') {
       tally.intents += 1;
@@ -504,18 +534,39 @@ function stateIntegrityResult(
 }
 
 /**
- * S9, conductor state integrity, over `{ stateCheck, journal, sampledAtIso }`.
+ * S9, conductor state integrity, over `{ stateCheck, journal, sampledAtIso }`
+ * plus the optional recorded UTC day `day`.
+ *
  * `journal` must be supplied in true append order — the order
  * `listForRun`/`listForKey`/`listForKeyPrefix` return it, never re-sorted by
  * `recordedAtIso` — since an entry's position in that array, not its
  * timestamp, is the authority for any ordering check below (two entries can
- * share one timestamp). Cost: linear in the capped input
- * (`SHADOW_MAX_HEALTH_ITEMS`): at most that many journal entries are walked,
- * and an oversized, sparse or non-dense `journal` is refused from its own
- * `length` descriptor before any entry is traversed. Every value is read
- * through its own property descriptor, so no getter ever runs and a Proxy
- * stand-in either is refused or yields exactly the plain data's verdict.
- * Never throws, never echoes the input.
+ * share one timestamp).
+ *
+ * When the `day` key is present it must be a real UTC calendar day
+ * `YYYY-MM-DD`; anything else (including `null`/`undefined` under a present
+ * key, or an enumerable getter, whose copied value is `undefined`) is refused
+ * with `unknown`/`invalid-input`. With `day` set, the sequence anomalies and
+ * `journalKeys` are scoped to the half-open instant interval `[D, D+1)`
+ * computed with `Date.parse` (never string prefixes): only keys with an entry
+ * falling inside that interval are counted, entries at or after `D+1 00:00Z`
+ * are excluded, while earlier entries are kept so a `D-1` intent closed by a
+ * `D` result stays paired instead of becoming a false `orphan-result`. With
+ * `day` absent the whole journal is counted, preserving the unscoped behaviour
+ * for direct callers. `unreconciledIntents` is always computed over the FULL
+ * journal, never scoped to `D`: scoping it would be fail-open (an intent at
+ * `D` 23:55 recorded at `D+1` 00:05 would never be flagged again), and the
+ * full scope keeps an intent at `D` 23:59 closed at `D+1` 00:01 from being a
+ * false fail. Malformed entries anywhere in `journal` — even outside `D` —
+ * still refuse as `invalid-input` before any scoping.
+ *
+ * Cost: linear in the capped input (`SHADOW_MAX_HEALTH_ITEMS`): at most that
+ * many journal entries are walked (once, plus one constant-time `Date.parse`
+ * per entry for the bounds), and an oversized, sparse or non-dense `journal`
+ * is refused from its own `length` descriptor before any entry is traversed.
+ * Every value is read through its own property descriptor, so no getter ever
+ * runs and a Proxy stand-in either is refused or yields exactly the plain
+ * data's verdict. Never throws, never echoes the input.
  */
 export function evaluateShadowStateIntegrity(input: unknown): ShadowStateIntegrityEvaluation {
   try {
@@ -527,9 +578,24 @@ export function evaluateShadowStateIntegrity(input: unknown): ShadowStateIntegri
 }
 
 function judgeDayStateIntegrity(input: unknown): ShadowStateIntegrityEvaluation {
-  const snapshot = readExactPlainRecord(input, ['stateCheck', 'journal', 'sampledAtIso']);
+  const snapshot = readPlainRecordWithOptionalKeys(
+    input,
+    ['stateCheck', 'journal', 'sampledAtIso'],
+    ['day'],
+  );
   if (snapshot === null) {
     return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
+  }
+  // `day` is optional: present-and-invalid refuses, absent stays unscoped.
+  // An enumerable getter on `day` is copied as `undefined` by
+  // `readPlainRecordWithOptionalKeys`, so `readUtcDay` refuses it — the
+  // getter itself never runs.
+  let day: string | null = null;
+  if (Object.hasOwn(snapshot, 'day')) {
+    day = readUtcDay(snapshot.day);
+    if (day === null) {
+      return stateIntegrityResult('unknown', 'invalid-input', ZERO_STATE_COUNTS);
+    }
   }
   let stateCheck: { checked?: unknown; bad?: unknown } | null = null;
   if (snapshot.stateCheck !== null) {
@@ -582,6 +648,7 @@ function judgeDayStateIntegrity(input: unknown): ShadowStateIntegrityEvaluation 
     new Date(snapshot.sampledAtIso).toISOString(),
     stateCheck.checked,
     stateCheck.bad,
+    day,
   );
 }
 
@@ -816,20 +883,52 @@ function countUnreconciledIntents(
  * intent when loop 1 already chose the reason. The loops are
  * `countJournalSequenceAnomalies` and `countUnreconciledIntents`, so each
  * function stays under Sonar's cognitive-complexity limit of 15.
+ *
+ * `day` scopes the sequence counts and `journalKeys` but never
+ * `unreconciledIntents`. The full-journal tallies are always computed and
+ * drive loop 2; when `day` is set, loop 1 runs over `scopedTallies`: the
+ * entries are first filtered to instants before `D+1 00:00Z` (keeping earlier
+ * entries, so a `D-1` intent closed by a `D` result stays paired and does not
+ * become a false `orphan-result`), tallied, and then restricted to keys whose
+ * `touchesDay` is true — keys with no entry inside `[D, D+1)` disappear from
+ * the sequence counts and from `journalKeys`. When `day` is null the full
+ * tallies drive both loops.
  */
 function judgeJournalIntegrity(
   entries: readonly SampledJournalEntry[],
   sampledAtIso: string,
   stateChecked: number,
   stateBad: number,
+  day: string | null,
 ): ShadowStateIntegrityEvaluation {
-  const tallies = tallyJournal(entries);
-  const sequence = countJournalSequenceAnomalies(tallies);
-  const unreconciled = countUnreconciledIntents(tallies, sampledAtIso, sequence.reason);
+  const bounds = day === null ? null : dayBounds(day);
+  const fullTallies = tallyJournal(entries, bounds);
+  let sequence: SequenceAnomalyCounts;
+  let journalKeys: number;
+  if (bounds === null) {
+    sequence = countJournalSequenceAnomalies(fullTallies);
+    journalKeys = fullTallies.size;
+  } else {
+    const scopedEntries = entries.filter((entry) => Date.parse(entry.recordedAtIso) < bounds.end);
+    const scopedAll = tallyJournal(scopedEntries, bounds);
+    const scopedTallies = new Map<string, KeyTally>();
+    for (const [key, tally] of scopedAll.entries()) {
+      if (tally.touchesDay) {
+        scopedTallies.set(key, tally);
+      }
+    }
+    sequence = countJournalSequenceAnomalies(scopedTallies);
+    journalKeys = scopedTallies.size;
+  }
+  // Loop 2 always runs over the full tallies: `unreconciledIntents` is never
+  // day-scoped (scoping it would be fail-open), and a full-journal intent at
+  // `D` 23:59 closed at `D+1` 00:01 has `finalResults > 0`, so it is not a
+  // false fail.
+  const unreconciled = countUnreconciledIntents(fullTallies, sampledAtIso, sequence.reason);
   const counts: StateIntegrityCounts = {
     stateChecked,
     stateBad,
-    journalKeys: tallies.size,
+    journalKeys,
     duplicateIntents: sequence.duplicateIntents,
     duplicateResults: sequence.duplicateResults,
     resultsAfterFinal: sequence.resultsAfterFinal,

@@ -971,6 +971,273 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
   );
 });
 
+describe('evaluateShadowStateIntegrity (S9) day scoping', () => {
+  it('counts only entries whose instants fall inside [D, D+1), mapped through Date.parse', () => {
+    const result = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [
+        // Inside: the inclusive start boundary D 00:00:00.000Z.
+        journalEntry('k-start', 'intent', null, `${DAY}T00:00:00.000Z`),
+        journalEntry('k-start', 'result', 'completed', `${DAY}T00:01:00.000Z`),
+        // Outside: the day before D.
+        journalEntry('k-before', 'intent', null, PREV_23(50)),
+        journalEntry('k-before', 'result', 'completed', PREV_23(51)),
+        // Outside: the exclusive end boundary D+1 00:00:00.000Z.
+        journalEntry('k-after', 'intent', null, '2026-11-11T00:00:00.000Z'),
+        journalEntry('k-after', 'result', 'completed', '2026-11-11T00:00:30.000Z'),
+        // Inside: a non-UTC offset (`2026-11-09T23:30:00-02:00` is D 01:30Z).
+        journalEntry('k-offset', 'intent', null, '2026-11-09T23:30:00-02:00'),
+        journalEntry('k-offset', 'result', 'completed', '2026-11-09T23:40:00-02:00'),
+      ],
+    }));
+    expect(result).toEqual(s9Eval('pass', 'state-consistent', {
+      stateChecked: 5,
+      journalKeys: 2,
+    }));
+  });
+
+  it('counts a D-1 intent closed by a D result as one day-touching key with no orphan result', () => {
+    const result = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [
+        journalEntry('k-cross', 'intent', null, '2026-11-09T23:59:00.000Z'),
+        journalEntry('k-cross', 'result', 'completed', `${DAY}T00:00:30.000Z`),
+      ],
+    }));
+    expect(result).toEqual(s9Eval('pass', 'state-consistent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      orphanResults: 0,
+    }));
+  });
+
+  it('stays pass for an intent at D 23:59 closed at D+1 00:01, and a D+1 append does not change the counts', () => {
+    const base = {
+      day: DAY,
+      sampledAtIso: '2026-11-11T12:00:00.000Z',
+    };
+    const first = evaluateShadowStateIntegrity(stateInput({
+      ...base,
+      journal: [
+        journalEntry('k-late', 'intent', null, `${DAY}T23:59:00.000Z`),
+        journalEntry('k-late', 'result', 'completed', '2026-11-11T00:01:00.000Z'),
+      ],
+    }));
+    expect(first).toEqual(s9Eval('pass', 'state-consistent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      unreconciledIntents: 0,
+    }));
+    const second = evaluateShadowStateIntegrity(stateInput({
+      ...base,
+      journal: [
+        journalEntry('k-late', 'intent', null, `${DAY}T23:59:00.000Z`),
+        journalEntry('k-late', 'result', 'completed', '2026-11-11T00:01:00.000Z'),
+        journalEntry('k-late', 'result', 'ambiguous', '2026-11-11T02:00:00.000Z'),
+      ],
+    }));
+    expect(second).toEqual(first);
+  });
+
+  it('still fails a stale open intent dated D-2 with unreconciled-intent even with day: D (unscoped grace check)', () => {
+    const result = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [journalEntry('k-stale', 'intent', null, '2026-11-08T10:00:00.000Z')],
+    }));
+    expect(result).toEqual(s9Eval('fail', 'unreconciled-intent', {
+      stateChecked: 5,
+      journalKeys: 0,
+      unreconciledIntents: 1,
+    }));
+  });
+
+  it('refuses a malformed entry (a bad kind) dated outside D with invalid-input', () => {
+    const result = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [{ key: 'k-bad', kind: 'nope', outcome: null, recordedAtIso: '2026-11-08T10:00:00.000Z' }],
+    }));
+    expect(result).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('excludes an entry at exactly D+1 00:00:00.000Z from the scoped tallies, leaving every count unchanged', () => {
+    const dayEntries = [
+      journalEntry('k', 'intent', null, `${DAY}T01:00:00.000Z`),
+      journalEntry('k', 'result', 'completed', `${DAY}T01:01:00.000Z`),
+    ];
+    const withoutBoundary = evaluateShadowStateIntegrity(stateInput({ day: DAY, journal: dayEntries }));
+    const withBoundary = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [
+        ...dayEntries,
+        // A duplicate intent at exactly dayEndMs. A `<=` end comparison would
+        // pull it into the scoped tally and flip the verdict to
+        // journal-duplicate-intent; the half-open interval excludes it.
+        journalEntry('k', 'intent', null, '2026-11-11T00:00:00.000Z'),
+      ],
+    }));
+    expect(withoutBoundary).toEqual(s9Eval('pass', 'state-consistent', {
+      stateChecked: 5,
+      journalKeys: 1,
+    }));
+    expect(withBoundary).toEqual(withoutBoundary);
+  });
+
+  it('counts a duplicate-intent key instanced at D+1T00:30:00+02:00, inside D as an instant but outside as a string', () => {
+    const result = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [
+        // 2026-11-10T22:30:00Z / 22:40Z / 22:50Z: inside [D, D+1) as
+        // instants. A string-prefix comparison would read these as D+1 and
+        // exclude both the key and its anomaly.
+        journalEntry('k-offset', 'intent', null, '2026-11-11T00:30:00+02:00'),
+        journalEntry('k-offset', 'intent', null, '2026-11-11T00:40:00+02:00'),
+        journalEntry('k-offset', 'result', 'completed', '2026-11-11T00:50:00+02:00'),
+      ],
+    }));
+    // The touches-day test: journalKeys counts the key. The scoped-entries
+    // filter: the duplicate intent is tallied and names the reason.
+    expect(result).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateIntents: 1,
+    }));
+  });
+
+  it('does not count a duplicate-intent key instanced at DT23:30:00-02:00, outside D as an instant but inside as a string', () => {
+    const result = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [
+        // 2026-11-11T01:30:00Z / 01:40Z / 01:50Z: outside [D, D+1) as
+        // instants. A string-prefix comparison would read these as inside D
+        // and count both the key and its anomaly.
+        journalEntry('k-offset', 'intent', null, '2026-11-10T23:30:00-02:00'),
+        journalEntry('k-offset', 'intent', null, '2026-11-10T23:40:00-02:00'),
+        journalEntry('k-offset', 'result', 'completed', '2026-11-10T23:50:00-02:00'),
+      ],
+    }));
+    // Neither the touches-day test (journalKeys stays 0) nor the
+    // scoped-entries filter (no anomaly tallied) sees the key.
+    expect(result).toEqual(s9Eval('pass', 'state-consistent', {
+      stateChecked: 5,
+      journalKeys: 0,
+      duplicateIntents: 0,
+    }));
+  });
+
+  it('excludes keys whose duplicate-intent sequences lie entirely before D or entirely at or after D+1', () => {
+    const dupSeq = (key: string, at: (minute: number) => string) => [
+      journalEntry(key, 'intent', null, at(0)),
+      journalEntry(key, 'intent', null, at(1)),
+      journalEntry(key, 'result', 'completed', at(2)),
+    ];
+    const result = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [
+        // Exists only before D: a duplicate-intent sequence entirely on D-1.
+        ...dupSeq('k-before', (minute) => `2026-11-09T2${minute}:00:00.000Z`),
+        // Exists only at or after D+1: a duplicate-intent sequence entirely
+        // on D+1.
+        ...dupSeq('k-after', (minute) => `2026-11-11T0${minute}:00:00.000Z`),
+      ],
+    }));
+    expect(result).toEqual(s9Eval('pass', 'state-consistent', {
+      stateChecked: 5,
+      journalKeys: 0,
+      duplicateIntents: 0,
+      duplicateResults: 0,
+      resultsAfterFinal: 0,
+      orphanResults: 0,
+    }));
+  });
+
+  it('is not satisfiable by a constant verdict under day scoping either', () => {
+    const clean = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [
+        journalEntry('k', 'intent', null, `${DAY}T01:00:00.000Z`),
+        journalEntry('k', 'result', 'completed', `${DAY}T01:01:00.000Z`),
+      ],
+    }));
+    const duplicated = evaluateShadowStateIntegrity(stateInput({
+      day: DAY,
+      journal: [
+        journalEntry('k', 'intent', null, `${DAY}T01:00:00.000Z`),
+        journalEntry('k', 'intent', null, `${DAY}T01:02:00.000Z`),
+        journalEntry('k', 'result', 'completed', `${DAY}T01:03:00.000Z`),
+      ],
+    }));
+    expect(clean).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
+    expect(duplicated).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateIntents: 1,
+    }));
+  });
+});
+
+describe('evaluateShadowStateIntegrity (S9) hostile day input', () => {
+  it('S9 refuses a present day: null — a present day key must carry a valid day, null is not absence', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({ day: null }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('S9 refuses a present day: undefined under a present day key', () => {
+    const input: Record<string, unknown> = stateInput();
+    input.day = undefined;
+    expect(evaluateShadowStateIntegrity(input)).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('S9 refuses a day: 42 (a number where a string is due)', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({ day: 42 }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it("S9 refuses an impossible calendar day '2026-02-30'", () => {
+    expect(evaluateShadowStateIntegrity(stateInput({ day: '2026-02-30' }))).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it("S9 refuses a full timestamp where a day is due: '2026-11-16T00:00:00Z'", () => {
+    expect(evaluateShadowStateIntegrity(stateInput({ day: '2026-11-16T00:00:00Z' }))).toEqual(
+      s9Eval('unknown', 'invalid-input'),
+    );
+  });
+
+  it('S9 never runs an enumerable getter on day (SH10a)', () => {
+    let calls = 0;
+    const input: Record<string, unknown> = stateInput();
+    Object.defineProperty(input, 'day', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return DAY;
+      },
+    });
+    const result = evaluateShadowStateIntegrity(input);
+    expect(calls).toBe(0);
+    expect(result).toEqual(s9Eval('unknown', 'invalid-input'));
+  });
+
+  it('S9 over a Proxy root carrying day yields the plain result with no get trap (SH10a)', () => {
+    const plain = stateInput({
+      day: DAY,
+      journal: [
+        journalEntry('k', 'intent', null, `${DAY}T01:00:00.000Z`),
+        journalEntry('k', 'result', 'completed', `${DAY}T01:01:00.000Z`),
+      ],
+    });
+    let getTraps = 0;
+    const proxy = new Proxy(plain, {
+      get(target, key, receiver) {
+        getTraps += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const expected = s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 });
+    expect(evaluateShadowStateIntegrity(plain)).toEqual(expected);
+    expect(evaluateShadowStateIntegrity(proxy)).toEqual(expected);
+    expect(getTraps).toBe(0);
+  });
+});
+
 /** A built hostile input plus an optional getter-call probe. */
 interface Hostile {
   readonly input: unknown;

@@ -7,12 +7,15 @@
  *
  * Announcement counters, on `evaluated` and `blind` only. `announced` is how
  * many sentences the alert port spoke. `announceFailures` is how many speak
- * attempts did not come back `spoken`. `announceSuppressed` is the announcement
- * decision's own suppressed count: due targets that were not given a sentence.
+ * attempts did not come back `spoken`, plus each success raise whose
+ * `previousRaisedAtIso` was neither null nor a zoned ISO string: that target
+ * is not spoken. `announceSuppressed` is the announcement decision's own
+ * suppressed count: due targets that were not given a sentence.
  * `announceUnspoken` is sentences that decision produced which this pass did
  * not start because the call budget ran out. A speech failure is
- * `announceFailures`, never either of the other two. A missing alert port
- * reports all four as 0. Ids and codes only.
+ * `announceFailures`, never either of the other two, and so is an unusable
+ * `previousRaisedAtIso`. A missing alert port reports all four as 0. Ids and
+ * codes only.
  */
 import type { TrainHealthFinding, TrainHealthThresholds } from '../../../domain/train-health-rules.js';
 

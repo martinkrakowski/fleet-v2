@@ -73,6 +73,30 @@ interface FakeOptions {
   readonly alertMode?: 'on' | 'missing-speak';
   readonly alertSpeak?: (callIndex: number, arg: { readonly sentence: string }) => unknown;
   readonly respeakMinutes?: number;
+  /** Timestamp the fake stores when a raise refreshes an item. Defaults to the pass clock. */
+  readonly refreshAtIso?: string;
+}
+
+function attentionKey(rule: unknown, pullRequest: unknown): string {
+  return `${String(rule)}:${String(pullRequest)}`;
+}
+
+/** Own data `lastRaisedAtIso` values from the initial open list, keyed by rule and pull request. */
+function initialRaisedAt(items: readonly unknown[]): Map<string, string | null> {
+  const raised = new Map<string, string | null>();
+  for (const item of items) {
+    if (typeof item !== 'object' || item === null) {
+      continue;
+    }
+    const rule = Object.getOwnPropertyDescriptor(item, 'rule')?.value;
+    const pullRequest = Object.getOwnPropertyDescriptor(item, 'pullRequest')?.value;
+    const lastRaisedAtIso = Object.getOwnPropertyDescriptor(item, 'lastRaisedAtIso')?.value;
+    if (typeof rule !== 'string') {
+      continue;
+    }
+    raised.set(attentionKey(rule, pullRequest), typeof lastRaisedAtIso === 'string' ? lastRaisedAtIso : null);
+  }
+  return raised;
 }
 
 /** One attention port fake with one ordered log shared with the clock. */
@@ -83,6 +107,8 @@ function makeDeps(options: FakeOptions = {}): {
   clearCalls: readonly TrainHealthAttentionCommand[];
   listCalls: readonly unknown[];
   speakCalls: readonly { sentence: string }[];
+  /** The timestamp stored after a raise refreshed the item, or undefined when it was never raised. */
+  lastRaisedAtIso: (rule: string, pullRequest: number | null) => string | null | undefined;
 } {
   const log: LogEntry[] = [];
   const nowSchedule = options.nowSchedule ?? [NOW];
@@ -94,6 +120,27 @@ function makeDeps(options: FakeOptions = {}): {
   const clearCalls: TrainHealthAttentionCommand[] = [];
   const listCalls: unknown[] = [];
   const speakCalls: { sentence: string }[] = [];
+  const raisedAt = initialRaisedAt(options.openItems ?? []);
+  const refreshAtIso = options.refreshAtIso ?? options.nowSchedule?.[0] ?? NOW;
+  // Copies, so a raise can refresh `lastRaisedAtIso` without mutating the caller's array.
+  // A list after that raise sees the new time; a list before it sees the previous one.
+  const liveItems: unknown[] = (options.openItems ?? []).map((item) => {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      return item;
+    }
+    return { ...(item as Record<string, unknown>) };
+  });
+  function refreshLive(rule: string, pullRequest: number | null, iso: string): void {
+    for (const item of liveItems) {
+      if (typeof item !== 'object' || item === null) {
+        continue;
+      }
+      const record = item as Record<string, unknown>;
+      if (record.rule === rule && record.pullRequest === pullRequest) {
+        record.lastRaisedAtIso = iso;
+      }
+    }
+  }
   let speakIndex = 0;
   let alert: WatchTrainHealthDependencies['alert'];
   if (options.alertMode === 'missing-speak') {
@@ -141,7 +188,20 @@ function makeDeps(options: FakeOptions = {}): {
           }
           return answer as RaiseTrainHealthAttentionResult;
         }
-        return { outcome: 'raised', reasonCode: null };
+        const key = attentionKey(command.rule, command.pullRequest);
+        let previousRaisedAtIso: string | null = null;
+        let outcome: 'raised' | 'refreshed' = 'raised';
+        if (raisedAt.has(key)) {
+          const stored = raisedAt.get(key) ?? null;
+          if (stored !== null) {
+            previousRaisedAtIso = stored;
+            outcome = 'refreshed';
+          }
+        }
+        // The raise really refreshes the stored time. The result keeps the previous one.
+        raisedAt.set(key, refreshAtIso);
+        refreshLive(command.rule, command.pullRequest, refreshAtIso);
+        return { outcome, reasonCode: null, previousRaisedAtIso };
       },
       clearTrainHealthAttention: async (command) => {
         log.push({ kind: 'port', method: 'clearTrainHealthAttention', arg: command });
@@ -167,7 +227,7 @@ function makeDeps(options: FakeOptions = {}): {
           }
           return answer as ListOpenTrainHealthAttentionResult;
         }
-        return { outcome: 'found', items: (options.openItems ?? []) as readonly OpenTrainHealthAttentionItem[] };
+        return { outcome: 'found', items: liveItems as readonly OpenTrainHealthAttentionItem[] };
       },
     },
     now:
@@ -184,7 +244,21 @@ function makeDeps(options: FakeOptions = {}): {
     ...(alert === undefined ? {} : { alert }),
     ...(options.respeakMinutes === undefined ? {} : { respeakMinutes: options.respeakMinutes }),
   };
-  return { deps, log, raiseCalls, clearCalls, listCalls, speakCalls };
+  return {
+    deps,
+    log,
+    raiseCalls,
+    clearCalls,
+    listCalls,
+    speakCalls,
+    lastRaisedAtIso: (rule, pullRequest) => {
+      const key = attentionKey(rule, pullRequest);
+      if (!raisedAt.has(key)) {
+        return undefined;
+      }
+      return raisedAt.get(key) ?? null;
+    },
+  };
 }
 
 function portCalls(log: readonly LogEntry[]): readonly { method: string; arg: unknown }[] {
@@ -258,6 +332,11 @@ const ADVANCE_STEP_MS = 1_000;
 
 function isoAt(index: number): string {
   return new Date(Date.parse(NOW) + index * ADVANCE_STEP_MS).toISOString();
+}
+
+/** One second later on every `now()` read, starting at `baseIso`. */
+function isoFrom(baseIso: string, index: number): string {
+  return new Date(Date.parse(baseIso) + index * ADVANCE_STEP_MS).toISOString();
 }
 
 /**
@@ -1124,7 +1203,7 @@ describe('WatchTrainHealthUseCase', () => {
     expectClockBeforeEveryPort(log);
   });
 
-  it("blind path with alert -> raise, list, speak { sentence: 'The merge train watchdog cannot read the train state.' }, and no clear", async () => {
+  it("blind path with alert -> raise, speak { sentence: 'The merge train watchdog cannot read the train state.' }, and no clear or list", async () => {
     const { deps, log, speakCalls, raiseCalls, clearCalls, listCalls } = makeDeps({
       alertMode: 'on',
       stateRead: blindStateRead() as never,
@@ -1141,13 +1220,12 @@ describe('WatchTrainHealthUseCase', () => {
       attentionFailures: 0,
     });
     expect(speakCalls).toEqual([{ sentence: SENTENCE_WATCHDOG_BLIND }]);
-    expect(listCalls).toHaveLength(1);
+    expect(listCalls).toHaveLength(0);
     expect(clearCalls).toHaveLength(0);
     expect(blindRaise(raiseCalls[0])).toBe(true);
     expect(portMethods(log)).toEqual([
       'readTrainHealthState',
       'raiseTrainHealthAttention',
-      'listOpenTrainHealthAttention',
       'speak',
     ]);
     expectClockBeforeEveryPort(log);
@@ -1169,24 +1247,30 @@ describe('WatchTrainHealthUseCase', () => {
       raised: 1,
     });
     expect(speakCalls).toHaveLength(0);
-    expect(listCalls).toHaveLength(1);
+    expect(listCalls).toHaveLength(0);
     expect(clearCalls).toHaveLength(0);
     expect(blindRaise(raiseCalls[0])).toBe(true);
   });
 
-  it('blind path with an unavailable open list -> one attentionFailures, watchdog sentence still spoken, no clear', async () => {
-    const { deps, speakCalls, raiseCalls, clearCalls } = makeDeps({
+  it('blind path with alert does not list open items, speaks the watchdog sentence, and clears nothing', async () => {
+    let listAttempts = 0;
+    const { deps, speakCalls, raiseCalls, clearCalls, listCalls } = makeDeps({
       alertMode: 'on',
       stateRead: blindStateRead() as never,
-      listBehavior: () => ({ outcome: 'unavailable' }),
+      listBehavior: () => {
+        listAttempts += 1;
+        throw new Error('list must not run on the blind path');
+      },
     });
     const result = await run(deps, baseRequest());
+    expect(listAttempts).toBe(0);
+    expect(listCalls).toHaveLength(0);
     expect(result).toMatchObject({
       outcome: 'blind',
       announced: 1,
       announceFailures: 0,
       announceSuppressed: 0,
-      attentionFailures: 1,
+      attentionFailures: 0,
       raised: 1,
     });
     expect(speakCalls).toEqual([{ sentence: SENTENCE_WATCHDOG_BLIND }]);
@@ -1482,7 +1566,9 @@ describe('WatchTrainHealthUseCase', () => {
         ...(withAlert ? { alertMode: 'on' as const } : {}),
         now: () => new Date(Date.now()).toISOString(),
         raiseBehavior: (callIndex) =>
-          callIndex === 1 ? new Promise<never>(() => {}) : { outcome: 'raised', reasonCode: null },
+          callIndex === 1
+            ? new Promise<never>(() => {})
+            : { outcome: 'raised', reasonCode: null, previousRaisedAtIso: null },
         ...(withAlert
           ? {
               alertSpeak: (callIndex: number) =>
@@ -1577,7 +1663,6 @@ describe('WatchTrainHealthUseCase', () => {
     expect(portMethods(blind.log)).toEqual([
       'readTrainHealthState',
       'raiseTrainHealthAttention',
-      'listOpenTrainHealthAttention',
       'speak',
     ]);
   });
@@ -1623,6 +1708,7 @@ describe('WatchTrainHealthUseCase', () => {
     expect(raiseBudgets(blindPresent.log, blindDeadline)).toEqual(raiseBudgets(blindAbsent.log, blindDeadline));
     expect(raiseBudgets(blindAbsent.log, blindDeadline)).toEqual([2_000]);
     expect(portMethods(blindAbsent.log)).not.toContain('listOpenTrainHealthAttention');
+    expect(portMethods(blindPresent.log)).not.toContain('listOpenTrainHealthAttention');
     expect(blindAbsentResult).toMatchObject({ outcome: 'blind', raised: 1 });
     expect(blindPresentResult).toMatchObject({ outcome: 'blind', raised: 1 });
 
@@ -1643,7 +1729,10 @@ describe('WatchTrainHealthUseCase', () => {
     const midPresentResult = await run(midPresent.deps, midRequest);
     expect(midPresent.log.slice(0, midAbsent.log.length)).toEqual(midAbsent.log);
     expect(midPresent.raiseCalls).toEqual(midAbsent.raiseCalls);
-    expect(midPresent.raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+    // Findings are sorted by key, so the one raise that still fits is stalled-head
+    // on both paths. tick-stale is the later target and the budget stops before it.
+    expect(midAbsent.raiseCalls.map((call) => call.rule)).toEqual(['stalled-head']);
+    expect(midPresent.raiseCalls.map((call) => call.rule)).toEqual(['stalled-head']);
     expect(raiseBudgets(midPresent.log, midDeadline)).toEqual(raiseBudgets(midAbsent.log, midDeadline));
     expect(raiseBudgets(midAbsent.log, midDeadline)).toEqual([2_000]);
     expect(midAbsentResult).toMatchObject({ outcome: 'evaluated', raised: 1, budgetExhausted: true });
@@ -1680,7 +1769,7 @@ describe('WatchTrainHealthUseCase', () => {
     for (const index of blindSpeaks) {
       expect(index).toBeGreaterThan(lastBlindRaise);
     }
-    expect(blindMethods.indexOf('listOpenTrainHealthAttention')).toBeGreaterThan(lastBlindRaise);
+    expect(blindMethods).not.toContain('listOpenTrainHealthAttention');
   });
 
   it('announceSuppressed equals decision.suppressed when speaking is cut short by budget, and announceUnspoken counts the rest', async () => {
@@ -1714,5 +1803,236 @@ describe('WatchTrainHealthUseCase', () => {
     expect(decision.suppressed).toBe(3);
     expect(result).toMatchObject({ announceUnspoken: 2 });
     expect(speakCalls).toEqual([{ sentence: staleSentence(1) }]);
+  });
+
+  it('blind path: the watchdog-blind item last raised in the previous bucket is announced even though the raise refreshes it', async () => {
+    // The clock advances one second on every read, including the read that budgets the raise.
+    const made = makeDeps({
+      alertMode: 'on',
+      nowBehavior: (index) => isoAt(index),
+      stateRead: blindStateRead() as never,
+      openItems: [{ rule: 'watchdog-blind', pullRequest: null, lastRaisedAtIso: PREVIOUS_BUCKET }],
+    });
+    const result = await run(made.deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'blind',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      announceUnspoken: 0,
+      raised: 1,
+      attentionFailures: 0,
+    });
+    expect(made.speakCalls).toEqual([{ sentence: SENTENCE_WATCHDOG_BLIND }]);
+    expect(made.listCalls).toHaveLength(0);
+    expect(made.clearCalls).toHaveLength(0);
+    expect(blindRaise(made.raiseCalls[0])).toBe(true);
+    // The stored time moved to this pass. A post-raise read would see NOW, the same
+    // bucket as the decision clock, and would suppress the respeak.
+    expect(made.lastRaisedAtIso('watchdog-blind', null)).toBe(NOW);
+    expect(portMethods(made.log)).toEqual([
+      'readTrainHealthState',
+      'raiseTrainHealthAttention',
+      'speak',
+    ]);
+    expectClockBeforeEveryPort(made.log);
+  });
+
+  it('blind path: last raised in the same bucket is suppressed', async () => {
+    const made = makeDeps({
+      alertMode: 'on',
+      nowBehavior: (index) => isoFrom(SAME_BUCKET_NOW, index),
+      refreshAtIso: SAME_BUCKET_NOW,
+      stateRead: blindStateRead() as never,
+      openItems: [{ rule: 'watchdog-blind', pullRequest: null, lastRaisedAtIso: ONE_MINUTE_EARLIER }],
+    });
+    const result = await run(made.deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'blind',
+      announced: 0,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      announceUnspoken: 0,
+      raised: 1,
+    });
+    expect(made.speakCalls).toHaveLength(0);
+    expect(made.listCalls).toHaveLength(0);
+    expect(made.clearCalls).toHaveLength(0);
+    expect(blindRaise(made.raiseCalls[0])).toBe(true);
+    expect(made.lastRaisedAtIso('watchdog-blind', null)).toBe(SAME_BUCKET_NOW);
+    expect(portMethods(made.log)).not.toContain('listOpenTrainHealthAttention');
+    expect(portMethods(made.log)).not.toContain('speak');
+  });
+
+  it('normal path: one due finding last raised in the previous bucket is announced, and one last raised in the same bucket is suppressed, even though each raise refreshes the stored timestamp', async () => {
+    const previous = makeDeps({
+      alertMode: 'on',
+      nowBehavior: (index) => isoAt(index),
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [{ rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: PREVIOUS_BUCKET }],
+    });
+    const previousResult = await run(previous.deps, baseRequest());
+    expect(previousResult).toMatchObject({
+      outcome: 'evaluated',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(previous.speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(previous.raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+    expect(previous.lastRaisedAtIso('tick-stale', null)).toBe(NOW);
+    const previousMethods = portMethods(previous.log);
+    expect(previousMethods.filter((method) => method === 'listOpenTrainHealthAttention')).toEqual([
+      'listOpenTrainHealthAttention',
+    ]);
+    expect(previousMethods.indexOf('listOpenTrainHealthAttention')).toBeLessThan(
+      previousMethods.indexOf('raiseTrainHealthAttention'),
+    );
+    expect(previousMethods.indexOf('speak')).toBeGreaterThan(previousMethods.lastIndexOf('raiseTrainHealthAttention'));
+
+    const same = makeDeps({
+      alertMode: 'on',
+      nowBehavior: (index) => isoFrom(SAME_BUCKET_NOW, index),
+      refreshAtIso: SAME_BUCKET_NOW,
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [{ rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: ONE_MINUTE_EARLIER }],
+    });
+    const sameResult = await run(same.deps, baseRequest());
+    expect(sameResult).toMatchObject({
+      outcome: 'evaluated',
+      announced: 0,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      announceUnspoken: 0,
+      raised: 1,
+    });
+    expect(same.speakCalls).toHaveLength(0);
+    expect(same.raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+    expect(same.lastRaisedAtIso('tick-stale', null)).toBe(SAME_BUCKET_NOW);
+  });
+
+  it('parity with and without an alert port, including a deadline crossed during an in-flight raise (raise timeout longer than the remaining budget), for the normal path and the blind path', async () => {
+    const normalTimeoutMs = 30_000;
+    const remainingMs = 5_000;
+    async function inFlight(blind: boolean, withAlert: boolean) {
+      vi.setSystemTime(new Date(NOW));
+      const deadlineIso = new Date(Date.parse(NOW) + remainingMs).toISOString();
+      const budgets: number[] = [];
+      const made = makeDeps({
+        ...(withAlert ? { alertMode: 'on' as const } : {}),
+        now: () => new Date(Date.now()).toISOString(),
+        stateRead: (blind ? blindStateRead() : okState(tickAndStalledSnapshot())) as never,
+        openItems: [],
+        raiseBehavior: () => {
+          const remaining = Date.parse(deadlineIso) - Date.now();
+          budgets.push(Math.min(normalTimeoutMs, remaining));
+          return new Promise<never>(() => {});
+        },
+      });
+      const pending = run(made.deps, baseRequest({ deadlineIso }));
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+      await drainMicrotasks(60);
+      expect(settled).toBe(false);
+      expect(budgets).toEqual([remainingMs]);
+      await vi.advanceTimersByTimeAsync(remainingMs - 1);
+      await drainMicrotasks(20);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await drainMicrotasks(40);
+      const result = await pending;
+      return { made, result, budgets: [...budgets] };
+    }
+    vi.useFakeTimers();
+    try {
+      const normalAbsent = await inFlight(false, false);
+      const normalPresent = await inFlight(false, true);
+      expect(portMethods(normalPresent.made.log).filter((method) => method !== 'speak')).toEqual(
+        portMethods(normalAbsent.made.log).filter((method) => method !== 'speak'),
+      );
+      expect(portMethods(normalPresent.made.log)).toEqual([
+        'readTrainHealthState',
+        'listOpenTrainHealthAttention',
+        'raiseTrainHealthAttention',
+      ]);
+      expect(normalPresent.made.raiseCalls).toEqual(normalAbsent.made.raiseCalls);
+      expect(normalPresent.made.raiseCalls.map((call) => call.rule)).toEqual(['stalled-head']);
+      expect(normalPresent.budgets).toEqual(normalAbsent.budgets);
+      expect(normalPresent.budgets).toEqual([remainingMs]);
+      expect(normalPresent.budgets[0]).toBeLessThan(normalTimeoutMs);
+      expect(normalPresent.made.speakCalls).toHaveLength(0);
+      expect(normalAbsent.result).toMatchObject({ outcome: 'evaluated', raised: 0, attentionFailures: 1 });
+      expect(normalPresent.result).toMatchObject({ outcome: 'evaluated', raised: 0, attentionFailures: 1 });
+
+      const blindAbsent = await inFlight(true, false);
+      const blindPresent = await inFlight(true, true);
+      expect(portMethods(blindPresent.made.log).filter((method) => method !== 'speak')).toEqual(
+        portMethods(blindAbsent.made.log).filter((method) => method !== 'speak'),
+      );
+      expect(portMethods(blindPresent.made.log)).toEqual([
+        'readTrainHealthState',
+        'raiseTrainHealthAttention',
+      ]);
+      expect(portMethods(blindAbsent.made.log)).not.toContain('listOpenTrainHealthAttention');
+      expect(portMethods(blindPresent.made.log)).not.toContain('listOpenTrainHealthAttention');
+      expect(blindPresent.made.raiseCalls).toEqual(blindAbsent.made.raiseCalls);
+      expect(blindRaise(blindPresent.made.raiseCalls[0])).toBe(true);
+      expect(blindPresent.budgets).toEqual(blindAbsent.budgets);
+      expect(blindPresent.budgets).toEqual([remainingMs]);
+      expect(blindPresent.budgets[0]).toBeLessThan(normalTimeoutMs);
+      expect(blindPresent.made.speakCalls).toHaveLength(0);
+      expect(blindAbsent.result).toMatchObject({ outcome: 'blind', raised: 0, attentionFailures: 1 });
+      expect(blindPresent.result).toMatchObject({ outcome: 'blind', raised: 0, attentionFailures: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a raise result with a malformed previousRaisedAtIso (accessor, number, unzoned string) is not spoken and counts one announceFailures', async () => {
+    let accessorReads = 0;
+    const cases: Array<(callIndex: number, arg: unknown) => unknown> = [
+      () => {
+        const answer: { outcome: 'refreshed'; reasonCode: null; previousRaisedAtIso?: string } = {
+          outcome: 'refreshed',
+          reasonCode: null,
+        };
+        Object.defineProperty(answer, 'previousRaisedAtIso', {
+          enumerable: true,
+          configurable: true,
+          get() {
+            accessorReads += 1;
+            throw new Error('accessor');
+          },
+        });
+        return answer;
+      },
+      () => ({ outcome: 'refreshed', reasonCode: null, previousRaisedAtIso: 12 }),
+      () => ({ outcome: 'refreshed', reasonCode: null, previousRaisedAtIso: '2026-11-16T12:02:00.000' }),
+    ];
+    for (const raiseBehavior of cases) {
+      const { deps, speakCalls, raiseCalls } = makeDeps({
+        alertMode: 'on',
+        nowBehavior: (index) => isoAt(index),
+        raiseBehavior,
+        stateRead: okState(tickStaleSnapshot()) as never,
+        openItems: [],
+      });
+      const result = await run(deps, baseRequest());
+      expect(result).toMatchObject({
+        outcome: 'evaluated',
+        announced: 0,
+        announceFailures: 1,
+        announceSuppressed: 0,
+        announceUnspoken: 0,
+        raised: 1,
+        attentionFailures: 0,
+      });
+      expect(speakCalls).toHaveLength(0);
+      expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+    }
+    expect(accessorReads).toBe(0);
   });
 });

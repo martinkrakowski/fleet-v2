@@ -4,12 +4,20 @@
  * that reads the train state through TrainHealthStateReadPort, evaluates it
  * with the pure CO-WD1 rules, raises one attention item per finding through
  * TrainHealthAttentionPort and clears open items whose condition ended.
- * When an alert port is present, the pass decides what to say from the open
- * items read before any raise (same inputs as a pre-raise decision, so
- * suppression and respeak do not change), raises and clears exactly as it
- * does without an alert, then speaks those precomputed sentences with
- * whatever budget remains. It keeps no memory of what it said or of
- * dismissals. Without an alert port the pass behaves as CO-WD2 and reports
+ * With or without an alert port, a pass makes the same raise-side calls, in
+ * the same order, on the same budgets. Alerting uses time and I/O only after
+ * raising and, on the evaluated path, after clearing. The decision clock is a
+ * reading the no-alert path already took, passed in, never a fresh `now()`
+ * before a raise. On the evaluated path the open-item input is the pre-raise
+ * list both paths already read for clearing, so suppression and respeak stay
+ * that snapshot's. On the blind path the no-alert path lists nothing, so the
+ * alert reads the open list only after the `watchdog-blind` raise and decides
+ * from the record the port returns, at the raise's clock: that record is the
+ * pre-pass snapshot when the port does not rewrite it, which is what keeps
+ * same-bucket suppression and next-bucket respeak. `announceSuppressed` is
+ * the decision's own suppressed count. Sentences the budget does not let the
+ * pass start are `announceUnspoken`. The pass keeps no memory of what it said
+ * or of dismissals. Without an alert port it behaves as CO-WD2 and reports
  * zero announcement counters. Unknown is never healthy: an
  * unreadable or unevaluable state raises `watchdog-blind` and clears nothing;
  * a cut finding list and a queue too long to assess fully each raise their
@@ -165,10 +173,14 @@ function isAttentionRule(value: string): value is TrainHealthAttentionRule {
   return (TRAIN_HEALTH_ATTENTION_RULES as readonly string[]).includes(value);
 }
 
-/** The result of one open-list read, before any raise. */
+/**
+ * One open-list read. `nowIso` is the budget read that authorized it (or found
+ * it exhausted). The evaluated path takes this before any raise; the blind
+ * path takes it, when an alert is present, only after the raise.
+ */
 type ListOpenResult =
-  | { readonly kind: 'ok'; readonly items: readonly unknown[]; readonly budgetExhausted: boolean; readonly failed: boolean }
-  | { readonly kind: 'exhausted' }
+  | { readonly kind: 'ok'; readonly items: readonly unknown[]; readonly budgetExhausted: boolean; readonly failed: boolean; readonly nowIso: string }
+  | { readonly kind: 'exhausted'; readonly nowIso: string }
   | { readonly kind: 'refused' };
 
 /** The result of raising every target of one pass. */
@@ -176,16 +188,33 @@ type RaiseAllResult =
   | { readonly kind: 'ok'; readonly raised: number; readonly attentionFailures: number; readonly budgetExhausted: boolean }
   | { readonly kind: 'refused'; readonly reason: 'invalid-clock' };
 
+/** The blind path's one raise, including the clock reading that budgeted it. */
+type BlindRaiseResult =
+  | {
+      readonly kind: 'ok';
+      readonly raised: number;
+      readonly attentionFailures: number;
+      readonly budgetExhausted: boolean;
+      readonly nowIso: string;
+    }
+  | { readonly kind: 'refused'; readonly reason: 'invalid-clock' };
+
 /** The result of clearing every resolved open item of one pass. */
 type ClearResolvedResult =
   | { readonly kind: 'ok'; readonly cleared: number; readonly attentionFailures: number; readonly budgetExhausted: boolean }
   | { readonly kind: 'refused'; readonly reason: 'invalid-clock' };
 
-/** Announcement counters carried on an evaluated or blind result. */
+/**
+ * Announcement counters carried on an evaluated or blind result.
+ * `announceSuppressed` is the decision's suppressed count, never a budget gap.
+ * `announceUnspoken` is sentences that decision produced but this pass did not
+ * start because the budget ran out.
+ */
 interface AnnouncedCounts {
   readonly announced: number;
   readonly announceFailures: number;
   readonly announceSuppressed: number;
+  readonly announceUnspoken: number;
 }
 
 /** The result of the announcement step, including a mid-loop invalid clock. */
@@ -193,34 +222,28 @@ type AnnounceCounts =
   | (AnnouncedCounts & { readonly kind: 'ok'; readonly budgetExhausted: boolean })
   | { readonly kind: 'refused'; readonly reason: 'invalid-clock' };
 
-/**
- * The pre-raise announcement decision. `silent` skips speech (no alert, or the
- * open-list read already exhausted the budget). `spent` means the decision
- * clock itself cannot start a call: every planned sentence is unspoken and
- * raising sees an exhausted budget. `ready` holds the sentences to speak
- * after attention work.
- */
-type AnnouncementPlan =
-  | { readonly kind: 'refused'; readonly reason: 'invalid-clock' }
-  | { readonly kind: 'silent' }
-  | { readonly kind: 'spent'; readonly unspoken: number }
-  | { readonly kind: 'ready'; readonly sentences: readonly string[]; readonly suppressed: number };
-
-type SpeakablePlan = Exclude<AnnouncementPlan, { readonly kind: 'refused' }>;
-
 const SILENT_ANNOUNCED: AnnouncedCounts = {
   announced: 0,
   announceFailures: 0,
   announceSuppressed: 0,
+  announceUnspoken: 0,
 };
 
 function announcedOk(
   announced: number,
   announceFailures: number,
   announceSuppressed: number,
+  announceUnspoken: number,
   budgetExhausted: boolean,
 ): AnnounceCounts {
-  return { kind: 'ok', announced, announceFailures, announceSuppressed, budgetExhausted };
+  return {
+    kind: 'ok',
+    announced,
+    announceFailures,
+    announceSuppressed,
+    announceUnspoken,
+    budgetExhausted,
+  };
 }
 
 function blindResult(
@@ -239,6 +262,7 @@ function blindResult(
     announced: spoken.announced,
     announceFailures: spoken.announceFailures,
     announceSuppressed: spoken.announceSuppressed,
+    announceUnspoken: spoken.announceUnspoken,
   };
 }
 
@@ -404,10 +428,10 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
 
   /**
    * The blind path: raise exactly `watchdog-blind` and clear nothing. Without
-   * an alert this lists nothing, matching CO-WD2. With an alert it lists open
-   * items first (a failed list is not known state and counts one attention
-   * failure), decides the sentence from that pre-raise list, raises, then
-   * speaks with whatever budget remains.
+   * an alert this lists nothing, matching CO-WD2. With an alert the raise runs
+   * first, on the same budget as the no-alert path. The open-list read is
+   * alert-only, so it happens after that raise and cannot spend the raise.
+   * Still clears nothing.
    */
   private async blindPass(
     validated: ValidatedRequest,
@@ -419,30 +443,35 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     return this.blindPassWithAlert(validated, reasonCode);
   }
 
-  /** Blind path with an alert: list, decide, raise `watchdog-blind`, then speak. Still clears nothing. */
+  /**
+   * Blind path with an alert: raise `watchdog-blind`, then list, then speak.
+   * The decision uses the raise's clock reading and the list the port returns
+   * after the raise. That list is the pre-pass open-item record when the port
+   * does not rewrite it on raise (suppression and respeak compare
+   * `lastRaisedAtIso` with the raise's `nowIso`). A failed list is not known
+   * state and counts one attention failure. Still clears nothing.
+   */
   private async blindPassWithAlert(
     validated: ValidatedRequest,
     reasonCode: string,
   ): Promise<WatchTrainHealthResult> {
+    const raised = await this.attemptBlindRaise(validated);
+    if (raised.kind === 'refused') {
+      return refuse(raised.reason);
+    }
     const listed = await this.listOpen(validated);
     if (listed.kind === 'refused') {
       return refuse('invalid-clock');
     }
     const listFailure = listed.kind === 'ok' && listed.failed ? 1 : 0;
-    const planned = await this.planAnnouncement(
+    const budgetExhausted = raised.budgetExhausted || listed.kind === 'exhausted';
+    const spoken = await this.announceAfterAttention(
       validated,
       [{ rule: 'watchdog-blind', pullRequest: null }],
       listed,
-      listed.kind === 'exhausted',
+      raised.nowIso,
+      budgetExhausted,
     );
-    if (planned.kind === 'refused') {
-      return refuse(planned.reason);
-    }
-    const raised = await this.attemptBlindRaise(validated);
-    if (raised.kind === 'refused') {
-      return refuse(raised.reason);
-    }
-    const spoken = await this.speakPlan(validated, planned, raised.budgetExhausted);
     if (spoken.kind === 'refused') {
       return refuse(spoken.reason);
     }
@@ -468,20 +497,38 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     );
   }
 
-  /** The blind raise's own budget check and port call. Does not speak. */
-  private async attemptBlindRaise(validated: ValidatedRequest): Promise<RaiseAllResult> {
+  /** The blind raise's own budget check and port call. Does not speak or list. */
+  private async attemptBlindRaise(validated: ValidatedRequest): Promise<BlindRaiseResult> {
     const raiseBudget = await this.budget(validated.deadlineIso);
     if (!raiseBudget.ok) {
       return { kind: 'refused', reason: raiseBudget.reason };
     }
     if (!raiseBudget.allowed) {
-      return { kind: 'ok', raised: 0, attentionFailures: 0, budgetExhausted: true };
+      return {
+        kind: 'ok',
+        raised: 0,
+        attentionFailures: 0,
+        budgetExhausted: true,
+        nowIso: raiseBudget.nowIso,
+      };
     }
     const raisedOk = await this.raiseBlindFinding(validated, raiseBudget.timeoutMs);
     if (raisedOk) {
-      return { kind: 'ok', raised: 1, attentionFailures: 0, budgetExhausted: false };
+      return {
+        kind: 'ok',
+        raised: 1,
+        attentionFailures: 0,
+        budgetExhausted: false,
+        nowIso: raiseBudget.nowIso,
+      };
     }
-    return { kind: 'ok', raised: 0, attentionFailures: 1, budgetExhausted: false };
+    return {
+      kind: 'ok',
+      raised: 0,
+      attentionFailures: 1,
+      budgetExhausted: false,
+      nowIso: raiseBudget.nowIso,
+    };
   }
 
   private async raiseBlindFinding(validated: ValidatedRequest, timeoutMs: number): Promise<boolean> {
@@ -499,14 +546,18 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     return RAISE_OK.includes(this.outcomeOf(raiseAnswer));
   }
 
-  /** Reads the open list once, before any raise, so CO-WD7 sees pre-pass times. */
+  /**
+   * One budget-checked open-list read. The evaluated path calls this before
+   * any raise; that result is the pre-raise snapshot both paths already pay
+   * for. The blind path calls it only with an alert, and only after the raise.
+   */
   private async listOpen(validated: ValidatedRequest): Promise<ListOpenResult> {
     const listBudget = await this.budget(validated.deadlineIso);
     if (!listBudget.ok) {
       return { kind: 'refused' };
     }
     if (!listBudget.allowed) {
-      return { kind: 'exhausted' };
+      return { kind: 'exhausted', nowIso: listBudget.nowIso };
     }
     try {
       const answer: unknown = await this.attentionCall(
@@ -519,11 +570,17 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
         listBudget.timeoutMs,
       );
       if (this.outcomeOf(answer) === 'found' && Array.isArray(ownValue(answer, 'items'))) {
-        return { kind: 'ok', items: ownValue(answer, 'items') as readonly unknown[], budgetExhausted: false, failed: false };
+        return {
+          kind: 'ok',
+          items: ownValue(answer, 'items') as readonly unknown[],
+          budgetExhausted: false,
+          failed: false,
+          nowIso: listBudget.nowIso,
+        };
       }
-      return { kind: 'ok', items: [], budgetExhausted: false, failed: true };
+      return { kind: 'ok', items: [], budgetExhausted: false, failed: true, nowIso: listBudget.nowIso };
     } catch {
-      return { kind: 'ok', items: [], budgetExhausted: false, failed: true };
+      return { kind: 'ok', items: [], budgetExhausted: false, failed: true, nowIso: listBudget.nowIso };
     }
   }
 
@@ -589,54 +646,29 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
   }
 
   /**
-   * Decides the sentences from the pre-raise targets and open list. The
-   * decision clock is this budget read, taken before any raise, so suppression
-   * and respeak match a decision made at this moment. No alert, or a budget
-   * already exhausted by the open-list read, decides nothing and speaks nothing.
-   * Speaking itself happens later, after raising and clearing.
+   * Decides and speaks only after raising (and, on the evaluated path, after
+   * clearing). `nowIso` is a clock reading the no-alert path already took:
+   * the clearing list's read on the evaluated path, the raise's read on the
+   * blind path. This method adds no clock read of its own before speaking.
+   * `announceSuppressed` stays the decision's suppressed count. Sentences not
+   * started because the budget cannot cover another speak are
+   * `announceUnspoken`.
    */
-  private async planAnnouncement(
+  private async announceAfterAttention(
     validated: ValidatedRequest,
     targets: readonly AttentionTarget[],
     listed: ListOpenResult,
-    budgetExhausted: boolean,
-  ): Promise<AnnouncementPlan> {
-    if (!this.alertEnabled() || budgetExhausted) {
-      return { kind: 'silent' };
-    }
-    const clock = await this.budget(validated.deadlineIso);
-    if (!clock.ok) {
-      return { kind: 'refused', reason: clock.reason };
-    }
-    const planned = this.decisionOf(targets, listed, clock.nowIso);
-    if (!clock.allowed) {
-      // Nothing can be spoken. The count is the planned sentences, not the
-      // decision's suppressed count (targets that were never given a sentence).
-      return { kind: 'spent', unspoken: planned.sentences.length };
-    }
-    return { kind: 'ready', sentences: planned.sentences, suppressed: planned.suppressed };
-  }
-
-  /**
-   * Speaks a ready plan after attention work, or reports the counters for a
-   * plan that will not speak. A budget already spent reports every planned
-   * sentence as unspoken and does not call the port.
-   */
-  private async speakPlan(
-    validated: ValidatedRequest,
-    plan: SpeakablePlan,
+    nowIso: string,
     budgetExhausted: boolean,
   ): Promise<AnnounceCounts> {
-    if (plan.kind === 'silent') {
-      return announcedOk(0, 0, 0, budgetExhausted);
+    if (!this.alertEnabled()) {
+      return announcedOk(0, 0, 0, 0, budgetExhausted);
     }
-    if (plan.kind === 'spent') {
-      return announcedOk(0, 0, plan.unspoken, true);
-    }
+    const planned = this.decisionOf(targets, listed, nowIso);
     if (budgetExhausted) {
-      return announcedOk(0, 0, plan.sentences.length, true);
+      return announcedOk(0, 0, planned.suppressed, planned.sentences.length, true);
     }
-    return this.speakSentences(validated, plan.sentences, plan.suppressed);
+    return this.speakSentences(validated, planned.sentences, planned.suppressed);
   }
 
   /** The pure decision: both outcomes speak `sentences`; only `decided` carries `suppressed`. */
@@ -716,8 +748,9 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
    * raising and clearing. Anything other than an own data property
    * `outcome === 'spoken'` counts as one failure and the loop continues. An
    * invalid clock refuses the whole pass. When the remaining budget cannot
-   * cover another speak, the loop stops and the sentences not started count
-   * as unspoken. Each speak is capped at `SPEAK_TIMEOUT_MS`.
+   * cover another speak, the loop stops. Sentences not started are
+   * `announceUnspoken`; `announceSuppressed` is left as the decision set it.
+   * Each speak is capped at `SPEAK_TIMEOUT_MS`.
    */
   private async speakSentences(
     validated: ValidatedRequest,
@@ -726,7 +759,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
   ): Promise<AnnounceCounts> {
     const alert = this.deps.alert;
     if (alert === undefined || typeof alert.speak !== 'function') {
-      return announcedOk(0, 0, 0, false);
+      return announcedOk(0, 0, 0, 0, false);
     }
     let announced = 0;
     let announceFailures = 0;
@@ -737,7 +770,8 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
         return { kind: 'refused', reason: budget.reason };
       }
       if (!budget.allowed) {
-        return this.unspokenStop(announced, announceFailures, announceSuppressed, sentences.length, index);
+        const unspoken = sentences.length - index;
+        return announcedOk(announced, announceFailures, announceSuppressed, unspoken, true);
       }
       const timeoutMs = Math.min(SPEAK_TIMEOUT_MS, budget.timeoutMs);
       const spoken = await this.oneSpeak(alert, sentence, timeoutMs);
@@ -748,26 +782,7 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
       }
       index += 1;
     }
-    return announcedOk(announced, announceFailures, announceSuppressed, false);
-  }
-
-  /**
-   * Sentences not started because the budget cannot cover another speak.
-   * When nothing was spoken, that count replaces the decision's suppressed
-   * count: those targets were never given a sentence.
-   */
-  private unspokenStop(
-    announced: number,
-    announceFailures: number,
-    announceSuppressed: number,
-    sentenceCount: number,
-    index: number,
-  ): AnnounceCounts {
-    const unspoken = sentenceCount - index;
-    if (announced === 0 && announceFailures === 0) {
-      return announcedOk(0, 0, unspoken, true);
-    }
-    return announcedOk(announced, announceFailures, announceSuppressed + unspoken, true);
+    return announcedOk(announced, announceFailures, announceSuppressed, 0, false);
   }
 
   /** One bounded `speak`. `attentionCall` already drops non-objects, throws and timeouts. */
@@ -797,16 +812,9 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     const targetKeys = new Set(
       targets.map((target) => targetKey(target.rule, target.pullRequest)),
     );
-
-    // Decide before any raise, from this pre-raise list. Attention then runs
-    // on the same budget as the no-alert path; speech uses whatever remains.
-    const planned = await this.planAnnouncement(validated, targets, listed, budgetExhausted);
-    if (planned.kind === 'refused') {
-      return refuse(planned.reason);
-    }
-    if (planned.kind === 'spent') {
-      budgetExhausted = true;
-    }
+    // The list budget's clock. Both paths already took this read. The decision
+    // uses it later and does not read `now()` again before the raises.
+    const decisionNowIso = listed.nowIso;
 
     const raiseResult = await this.raiseAll(validated, targets, budgetExhausted);
     if (raiseResult.kind === 'refused') {
@@ -831,7 +839,14 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
     attentionFailures += clearResult.attentionFailures;
     budgetExhausted = clearResult.budgetExhausted;
 
-    const spoken = await this.speakPlan(validated, planned, budgetExhausted);
+    // Same pre-raise list the clear used. Speech cannot move a raise budget.
+    const spoken = await this.announceAfterAttention(
+      validated,
+      targets,
+      listed,
+      decisionNowIso,
+      budgetExhausted,
+    );
     if (spoken.kind === 'refused') {
       return refuse(spoken.reason);
     }
@@ -859,15 +874,16 @@ export class WatchTrainHealthUseCase implements WatchTrainHealthPort {
       announced: spoken.announced,
       announceFailures: spoken.announceFailures,
       announceSuppressed: spoken.announceSuppressed,
+      announceUnspoken: spoken.announceUnspoken,
     };
   }
 
   /**
    * Raises every target in evaluation order, re-checking the budget before
-   * each call. Already-exhausted on entry (the open-list read ran out, or the
-   * announcement decision clock was already past the deadline) raises nothing.
-   * Speech does not run before this, so a speaker cannot change which raises
-   * start.
+   * each call. Already-exhausted on entry (the open-list read ran out) raises
+   * nothing. Speech does not run before this, and the alert path adds no clock
+   * read before it, so a speaker cannot change which raises start or what
+   * budget they see.
    */
   private async raiseAll(
     validated: ValidatedRequest,

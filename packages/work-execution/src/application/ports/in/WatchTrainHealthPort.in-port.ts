@@ -3,7 +3,16 @@
  * WatchTrainHealthPort: one bounded merge-train health watch pass. An
  * unreadable or unevaluable state is reported as blind and never as healthy,
  * nothing is cleared on unknown, and a cut finding list or a queue over 500
- * entries raises its own attention item. Ids and codes only.
+ * entries raises its own attention item.
+ *
+ * Announcement counters, on `evaluated` and `blind` only. `announced` is how
+ * many sentences the alert port spoke. `announceFailures` is how many speak
+ * attempts did not come back `spoken`. `announceSuppressed` is the announcement
+ * decision's own suppressed count: due targets that were not given a sentence.
+ * `announceUnspoken` is sentences that decision produced which this pass did
+ * not start because the call budget ran out. A speech failure is
+ * `announceFailures`, never either of the other two. A missing alert port
+ * reports all four as 0. Ids and codes only.
  */
 import type { TrainHealthFinding, TrainHealthThresholds } from '../../../domain/train-health-rules.js';
 
@@ -33,6 +42,7 @@ export type WatchTrainHealthResult =
       readonly announced: number;
       readonly announceFailures: number;
       readonly announceSuppressed: number;
+      readonly announceUnspoken: number;
     }
   | {
       readonly outcome: 'blind';
@@ -44,6 +54,7 @@ export type WatchTrainHealthResult =
       readonly announced: number;
       readonly announceFailures: number;
       readonly announceSuppressed: number;
+      readonly announceUnspoken: number;
     }
   | { readonly outcome: 'budget-exhausted'; readonly exitCode: 1 }
   | {

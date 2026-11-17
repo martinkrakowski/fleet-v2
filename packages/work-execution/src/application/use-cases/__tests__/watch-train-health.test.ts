@@ -15,6 +15,7 @@ import type {
 } from '../../ports/out/TrainHealthAttentionPort.out-port.js';
 import { TRAIN_HEALTH_ATTENTION_RULES } from '../../ports/out/TrainHealthAttentionPort.out-port.js';
 import { TRAIN_HEALTH_RULES } from '../../../domain/train-health-rules.js';
+import { decideTrainHealthAnnouncements } from '../../../domain/train-health-announcements.js';
 
 const NOW = '2026-11-16T12:00:00.000Z';
 const DEADLINE = '2026-11-16T12:05:00.000Z';
@@ -250,6 +251,40 @@ function summarySentence(kept: number): string {
 
 function portMethods(log: readonly LogEntry[]): string[] {
   return portCalls(log).map((call) => call.method);
+}
+
+/** One second later on every `now()` read, starting at `NOW`. */
+const ADVANCE_STEP_MS = 1_000;
+
+function isoAt(index: number): string {
+  return new Date(Date.parse(NOW) + index * ADVANCE_STEP_MS).toISOString();
+}
+
+/**
+ * Deadline at which clock read `readIndex` still has exactly the 2s minimum
+ * and the next read is budget-exhausted.
+ */
+function deadlineTightAt(readIndex: number): string {
+  return new Date(Date.parse(NOW) + readIndex * ADVANCE_STEP_MS + 2_000).toISOString();
+}
+
+/** Timeout each raise call actually received, derived from the `now()` before it. */
+function raiseBudgets(log: readonly LogEntry[], deadlineIso: string): number[] {
+  let nowOrdinal = -1;
+  let lastNowIso = '';
+  const budgets: number[] = [];
+  for (const entry of log) {
+    if (entry.kind === 'now') {
+      nowOrdinal += 1;
+      lastNowIso = isoAt(nowOrdinal);
+      continue;
+    }
+    if (entry.kind === 'port' && entry.method === 'raiseTrainHealthAttention') {
+      const remaining = Date.parse(deadlineIso) - Date.parse(lastNowIso);
+      budgets.push(Math.min(30_000, remaining));
+    }
+  }
+  return budgets;
 }
 
 function expectClockBeforeEveryPort(log: readonly LogEntry[]): void {
@@ -1061,12 +1096,13 @@ describe('WatchTrainHealthUseCase', () => {
 
   it('clock jumping past deadline before second speak -> one speak, budgetExhausted true, every port call preceded by clock read', async () => {
     const late = '2026-11-16T12:10:00.000Z';
-    // Reorder: raises finish before speech. Reads are watch, readState, list,
-    // decision, raise tick-stale, raise stalled-head, first speak, second speak.
-    // The jump lands on the second speak. The sentence not started is unspoken.
+    // Raises finish before speech, and the decision adds no clock read.
+    // Reads: watch, readState, list, raise tick-stale, raise stalled-head,
+    // first speak, second speak. The jump lands on the second speak.
+    // The sentence not started is unspoken, not suppressed.
     const { deps, log, speakCalls, raiseCalls, clearCalls } = makeDeps({
       alertMode: 'on',
-      nowSchedule: [NOW, NOW, NOW, NOW, NOW, NOW, NOW, late],
+      nowSchedule: [NOW, NOW, NOW, NOW, NOW, NOW, late],
       stateRead: okState(tickAndStalledSnapshot()) as never,
       openItems: [],
     });
@@ -1075,7 +1111,8 @@ describe('WatchTrainHealthUseCase', () => {
       outcome: 'evaluated',
       announced: 1,
       announceFailures: 0,
-      announceSuppressed: 1,
+      announceSuppressed: 0,
+      announceUnspoken: 1,
       budgetExhausted: true,
       raised: 2,
       healthy: false,
@@ -1087,7 +1124,7 @@ describe('WatchTrainHealthUseCase', () => {
     expectClockBeforeEveryPort(log);
   });
 
-  it("blind path with alert -> list, raise, speak { sentence: 'The merge train watchdog cannot read the train state.' }, and no clear", async () => {
+  it("blind path with alert -> raise, list, speak { sentence: 'The merge train watchdog cannot read the train state.' }, and no clear", async () => {
     const { deps, log, speakCalls, raiseCalls, clearCalls, listCalls } = makeDeps({
       alertMode: 'on',
       stateRead: blindStateRead() as never,
@@ -1109,8 +1146,8 @@ describe('WatchTrainHealthUseCase', () => {
     expect(blindRaise(raiseCalls[0])).toBe(true);
     expect(portMethods(log)).toEqual([
       'readTrainHealthState',
-      'listOpenTrainHealthAttention',
       'raiseTrainHealthAttention',
+      'listOpenTrainHealthAttention',
       'speak',
     ]);
     expectClockBeforeEveryPort(log);
@@ -1263,9 +1300,9 @@ describe('WatchTrainHealthUseCase', () => {
     };
     const thrown = makeDeps({
       ...base,
-      // Reorder: watch, readState, list, decision, two raises, first speak, then the second speak.
+      // Reads: watch, readState, list, two raises, first speak, then the second speak.
       nowBehavior: (index) => {
-        if (index >= 7) {
+        if (index >= 6) {
           throw new Error('clock');
         }
         return NOW;
@@ -1278,7 +1315,7 @@ describe('WatchTrainHealthUseCase', () => {
 
     const malformed = makeDeps({
       ...base,
-      nowBehavior: (index) => (index >= 7 ? 'not-a-clock' : NOW),
+      nowBehavior: (index) => (index >= 6 ? 'not-a-clock' : NOW),
     });
     const malformedResult = await run(malformed.deps, baseRequest());
     expect(malformedResult).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' });
@@ -1338,10 +1375,12 @@ describe('WatchTrainHealthUseCase', () => {
 
   it('budget exhausted before any speak reports nothing spoken and every planned sentence unspoken', async () => {
     const late = '2026-11-16T12:10:00.000Z';
-    // Reads: watch, readState, list, then the announce budget, which is already past the deadline.
+    // The decision adds no clock read. Reads: watch, readState, list, raise,
+    // then the speak budget, which is already past the deadline. The raise
+    // still happens. The unspoken sentence is not counted as suppressed.
     const { deps, speakCalls, raiseCalls } = makeDeps({
       alertMode: 'on',
-      nowSchedule: [NOW, NOW, NOW, late],
+      nowSchedule: [NOW, NOW, NOW, NOW, late],
       stateRead: okState(tickStaleSnapshot()) as never,
       openItems: [],
     });
@@ -1350,14 +1389,15 @@ describe('WatchTrainHealthUseCase', () => {
       outcome: 'evaluated',
       announced: 0,
       announceFailures: 0,
-      announceSuppressed: 1,
+      announceSuppressed: 0,
+      announceUnspoken: 1,
       budgetExhausted: true,
-      raised: 0,
+      raised: 1,
       healthy: false,
       exitCode: 1,
     });
     expect(speakCalls).toHaveLength(0);
-    expect(raiseCalls).toHaveLength(0);
+    expect(raiseCalls).toHaveLength(1);
   });
 
   it('speak returning refused counts one announceFailures and raise still happens', async () => {
@@ -1536,9 +1576,143 @@ describe('WatchTrainHealthUseCase', () => {
     await run(blind.deps, baseRequest());
     expect(portMethods(blind.log)).toEqual([
       'readTrainHealthState',
-      'listOpenTrainHealthAttention',
       'raiseTrainHealthAttention',
+      'listOpenTrainHealthAttention',
       'speak',
     ]);
+  });
+
+  it('with or without an alert, raise-side calls and budgets match near the deadline', async () => {
+    const advancing = { nowBehavior: (index: number) => isoAt(index) };
+
+    const dueDeadline = deadlineTightAt(3);
+    const dueAbsent = makeDeps({
+      ...advancing,
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [],
+    });
+    const duePresent = makeDeps({
+      ...advancing,
+      alertMode: 'on',
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [],
+    });
+    const dueAbsentResult = await run(dueAbsent.deps, baseRequest({ deadlineIso: dueDeadline }));
+    const duePresentResult = await run(duePresent.deps, baseRequest({ deadlineIso: dueDeadline }));
+    expect(duePresent.log.slice(0, dueAbsent.log.length)).toEqual(dueAbsent.log);
+    expect(duePresent.raiseCalls).toEqual(dueAbsent.raiseCalls);
+    expect(duePresent.raiseCalls).toHaveLength(1);
+    expect(raiseBudgets(duePresent.log, dueDeadline)).toEqual(raiseBudgets(dueAbsent.log, dueDeadline));
+    expect(raiseBudgets(dueAbsent.log, dueDeadline)).toEqual([2_000]);
+    expect(dueAbsentResult).toMatchObject({ outcome: 'evaluated', raised: 1 });
+    expect(duePresentResult).toMatchObject({ outcome: 'evaluated', raised: 1, announced: 0, announceUnspoken: 1 });
+
+    const blindDeadline = deadlineTightAt(2);
+    const blindAbsent = makeDeps({ ...advancing, stateRead: blindStateRead() as never });
+    const blindPresent = makeDeps({
+      ...advancing,
+      alertMode: 'on',
+      stateRead: blindStateRead() as never,
+      openItems: [],
+    });
+    const blindAbsentResult = await run(blindAbsent.deps, baseRequest({ deadlineIso: blindDeadline }));
+    const blindPresentResult = await run(blindPresent.deps, baseRequest({ deadlineIso: blindDeadline }));
+    expect(blindPresent.log.slice(0, blindAbsent.log.length)).toEqual(blindAbsent.log);
+    expect(blindPresent.raiseCalls).toEqual(blindAbsent.raiseCalls);
+    expect(blindRaise(blindPresent.raiseCalls[0])).toBe(true);
+    expect(raiseBudgets(blindPresent.log, blindDeadline)).toEqual(raiseBudgets(blindAbsent.log, blindDeadline));
+    expect(raiseBudgets(blindAbsent.log, blindDeadline)).toEqual([2_000]);
+    expect(portMethods(blindAbsent.log)).not.toContain('listOpenTrainHealthAttention');
+    expect(blindAbsentResult).toMatchObject({ outcome: 'blind', raised: 1 });
+    expect(blindPresentResult).toMatchObject({ outcome: 'blind', raised: 1 });
+
+    const midDeadline = deadlineTightAt(3);
+    const midAbsent = makeDeps({
+      ...advancing,
+      stateRead: okState(tickAndStalledSnapshot()) as never,
+      openItems: [],
+    });
+    const midPresent = makeDeps({
+      ...advancing,
+      alertMode: 'on',
+      stateRead: okState(tickAndStalledSnapshot()) as never,
+      openItems: [],
+    });
+    const midRequest = baseRequest({ deadlineIso: midDeadline });
+    const midAbsentResult = await run(midAbsent.deps, midRequest);
+    const midPresentResult = await run(midPresent.deps, midRequest);
+    expect(midPresent.log.slice(0, midAbsent.log.length)).toEqual(midAbsent.log);
+    expect(midPresent.raiseCalls).toEqual(midAbsent.raiseCalls);
+    expect(midPresent.raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+    expect(raiseBudgets(midPresent.log, midDeadline)).toEqual(raiseBudgets(midAbsent.log, midDeadline));
+    expect(raiseBudgets(midAbsent.log, midDeadline)).toEqual([2_000]);
+    expect(midAbsentResult).toMatchObject({ outcome: 'evaluated', raised: 1, budgetExhausted: true });
+    expect(midPresentResult).toMatchObject({ outcome: 'evaluated', raised: 1, budgetExhausted: true });
+  });
+
+  it('speaking happens only after the last raise call', async () => {
+    const evaluated = makeDeps({
+      alertMode: 'on',
+      nowBehavior: (index) => isoAt(index),
+      stateRead: okState(tickAndStalledSnapshot()) as never,
+      openItems: [],
+    });
+    await run(evaluated.deps, baseRequest());
+    const evaluatedMethods = portMethods(evaluated.log);
+    const lastEvaluatedRaise = evaluatedMethods.lastIndexOf('raiseTrainHealthAttention');
+    const evaluatedSpeaks = evaluatedMethods.flatMap((method, index) => (method === 'speak' ? [index] : []));
+    expect(evaluatedSpeaks.length).toBeGreaterThan(0);
+    for (const index of evaluatedSpeaks) {
+      expect(index).toBeGreaterThan(lastEvaluatedRaise);
+    }
+
+    const blind = makeDeps({
+      alertMode: 'on',
+      nowBehavior: (index) => isoAt(index),
+      stateRead: blindStateRead() as never,
+      openItems: [],
+    });
+    await run(blind.deps, baseRequest());
+    const blindMethods = portMethods(blind.log);
+    const lastBlindRaise = blindMethods.lastIndexOf('raiseTrainHealthAttention');
+    const blindSpeaks = blindMethods.flatMap((method, index) => (method === 'speak' ? [index] : []));
+    expect(blindSpeaks.length).toBeGreaterThan(0);
+    for (const index of blindSpeaks) {
+      expect(index).toBeGreaterThan(lastBlindRaise);
+    }
+    expect(blindMethods.indexOf('listOpenTrainHealthAttention')).toBeGreaterThan(lastBlindRaise);
+  });
+
+  it('announceSuppressed equals decision.suppressed when speaking is cut short by budget, and announceUnspoken counts the rest', async () => {
+    const deadlineIso = deadlineTightAt(8);
+    const { deps, speakCalls } = makeDeps({
+      alertMode: 'on',
+      nowBehavior: (index) => isoAt(index),
+      stateRead: okState(healthySnapshot({ lastTickFinishedAtIso: NOW, queue: closedEntries(5) })) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest({ deadlineIso }));
+    const decision = decideTrainHealthAnnouncements({
+      targets: [1, 2, 3, 4, 5].map((pullRequest) => ({ rule: 'stale-queue-entry', pullRequest })),
+      openItemsKnown: true,
+      openItems: [],
+      nowIso: isoAt(2),
+    });
+    expect(decision.outcome).toBe('decided');
+    if (decision.outcome !== 'decided') {
+      return;
+    }
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: decision.suppressed,
+      announceUnspoken: decision.sentences.length - 1,
+      budgetExhausted: true,
+      raised: 5,
+    });
+    expect(decision.suppressed).toBe(3);
+    expect(result).toMatchObject({ announceUnspoken: 2 });
+    expect(speakCalls).toEqual([{ sentence: staleSentence(1) }]);
   });
 });

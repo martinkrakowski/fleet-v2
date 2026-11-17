@@ -93,9 +93,11 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       }
     }
 
-    // Dedupe by the (pullRequest, headOid) pair across all three sources, in
-    // source order queue, then inprogress, then parked: the first source in
-    // that order wins and is recorded as the key's source.
+    // Dedupe by the (pullRequest, headOid, base) triple across all three
+    // sources, in source order queue, then inprogress, then parked: the first
+    // source in that order wins and is recorded as the key's source. The base
+    // is part of the identity so that the same PR/head on a different base is
+    // never silently dropped because an earlier source held it on another base.
     const seenPairs = new Set<string>();
     const deduped: { readonly source: (typeof sources)[number]; readonly entry: LegacyTrainQueueEntry }[] = [];
     for (const source of sources) {
@@ -108,7 +110,7 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
           continue;
         }
         const entry = line.entry;
-        const pair = `${entry.pullRequest}:${entry.headOid}`;
+        const pair = `${entry.pullRequest}:${entry.headOid}:${entry.base}`;
         if (seenPairs.has(pair)) {
           continue;
         }
@@ -126,6 +128,10 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       if (entry.base !== 'main') {
         disposition = 'not-importable-base';
         notImportableBase += 1;
+      } else if (source === 'inprogress') {
+        // The legacy train is already merging this PR; enqueueing it would let
+        // both trains act on it. It is reported, never an import candidate.
+        disposition = 'in-progress';
       } else {
         const alreadyLive = liveEntries.some(
           (record) =>

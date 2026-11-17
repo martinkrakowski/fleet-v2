@@ -17,13 +17,18 @@ export type ImportTrainStateRefusal =
 /** Cap on the number of import keys listed in a report; the rest are truncated. */
 export const IMPORT_KEYS_MAX = 500;
 
-/** One deduplicated import candidate and how this run would treat it. */
+/**
+ * One deduplicated entry and how this run would treat it. The import contract
+ * covers queue, parked and chain state: an entry the legacy train is currently
+ * merging (`inprogress`) is reported but never an import candidate, because
+ * enqueueing it would let both trains act on the same PR.
+ */
 export interface ImportTrainStateKey {
   readonly pullRequest: number;
   readonly headOid: string;
   readonly base: string;
   readonly source: 'queue' | 'parked' | 'inprogress';
-  readonly disposition: 'would-import' | 'already-queued' | 'not-importable-base';
+  readonly disposition: 'would-import' | 'already-queued' | 'not-importable-base' | 'in-progress';
 }
 
 export interface ImportTrainStateReport {

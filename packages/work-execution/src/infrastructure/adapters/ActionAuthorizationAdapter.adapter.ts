@@ -780,20 +780,57 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
     if (grants.size > MAX_ACTION_AUTHORIZATION_GRANTS) {
       return { outcome: 'blocked', reason: 'too-large' };
     }
-    // Every record is read before any is matched: one unreadable or unknown-version
-    // record fails the whole store closed instead of being skipped.
+    const scan = this.scanGrantsForMatch(grants, request);
+    if ('blocked' in scan) {
+      return scan.blocked;
+    }
+    const { match, rootConflict, consumedByOther } = scan;
+    if (match === undefined) {
+      return {
+        outcome: 'blocked',
+        reason: !consumedByOther && rootConflict ? 'release-grant-root-mismatch' : 'no-matching-grant',
+      };
+    }
+    this.bindGrantInPlace(grants, match, request);
+    return {
+      outcome: 'granted',
+      authorizationGrantId: match.id,
+      ...(match.grant.releaseRoot !== undefined
+        ? { releaseRoot: match.grant.releaseRoot }
+        : request.releaseRoot !== undefined
+          ? { releaseRoot: request.releaseRoot }
+          : {}),
+    };
+  }
+
+  /**
+   * Every record is read before any is matched: one unreadable or unknown-version
+   * record fails the whole store closed instead of being skipped.
+   */
+  private scanGrantsForMatch(
+    grants: Map<string, ActionAuthorizationGrantEntry>,
+    request: ResolveActionAuthorizationRequest,
+  ):
+    | { readonly blocked: ResolveActionAuthorizationResult }
+    | {
+        readonly match: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry } | undefined;
+        readonly rootConflict: boolean;
+        readonly consumedByOther: boolean;
+      } {
     let match: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry } | undefined;
     let rootConflict = false;
     let consumedByOther = false;
     for (const [rawGrantId, rawEntry] of grants) {
       if (!isSafeId(rawGrantId, MAX_GRANT_ID_LENGTH, true)) {
-        return { outcome: 'blocked', reason: 'invalid-grant-record' };
+        return { blocked: { outcome: 'blocked', reason: 'invalid-grant-record' } };
       }
       const parsed = parseActionAuthorizationGrantEntry(rawEntry);
       if (!parsed.ok) {
         return {
-          outcome: 'blocked',
-          reason: parsed.reason === 'unknown-schema-version' ? 'unknown-grant-schema-version' : 'invalid-grant-record',
+          blocked: {
+            outcome: 'blocked',
+            reason: parsed.reason === 'unknown-schema-version' ? 'unknown-grant-schema-version' : 'invalid-grant-record',
+          },
         };
       }
       const grant = parsed.grant;
@@ -810,50 +847,36 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         rootConflict = true;
         continue;
       }
-      if (grant.consumedByActionId === null) {
-        match = { id: rawGrantId, grant };
-        continue;
-      }
-      // CO14 follow-up: a release grant already consumed by exactly this
-      // resolve's deterministic action id resolves again idempotently, so a
-      // crash between the consumption and the release's write is recoverable
-      // on the next pass. A different action id never resumes a consumed grant.
-      if (RELEASE_ACTION_KINDS.includes(grant.kind as never) && grant.consumedByActionId === request.actionId) {
+      if (isResolvableGrant(grant, request)) {
         match = { id: rawGrantId, grant };
         continue;
       }
       consumedByOther = true;
     }
-    if (match === undefined) {
-      return {
-        outcome: 'blocked',
-        reason: !consumedByOther && rootConflict ? 'release-grant-root-mismatch' : 'no-matching-grant',
-      };
+    return { match, rootConflict, consumedByOther };
+  }
+
+  private bindGrantInPlace(
+    grants: Map<string, ActionAuthorizationGrantEntry>,
+    match: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry },
+    request: ResolveActionAuthorizationRequest,
+  ): void {
+    if (match.grant.attemptId !== undefined && !(request.releaseRoot !== undefined && match.grant.releaseRoot === undefined)) {
+      return;
     }
-    if (match.grant.attemptId === undefined || (request.releaseRoot !== undefined && match.grant.releaseRoot === undefined)) {
-      // A legacy grant binds to the first attempt that resolves it, and a
-      // release grant without a recorded root binds to the first root that
-      // resolves it (CO14 follow-up); both bindings persist in place, so a
-      // bound grant can never be moved to another attempt or root afterwards.
-      const needsAttempt = match.grant.attemptId === undefined;
-      grants.set(match.id, {
-        schemaVersion: needsAttempt ? ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION : match.grant.schemaVersion,
-        attemptId: match.grant.attemptId ?? request.attemptId,
-        ...(request.releaseRoot !== undefined ? { releaseRoot: request.releaseRoot } : {}),
-        expectedHeadSha: match.grant.expectedHeadSha,
-        kind: match.grant.kind,
-        consumedByActionId: match.grant.consumedByActionId,
-      });
-    }
-    return {
-      outcome: 'granted',
-      authorizationGrantId: match.id,
-      ...(match.grant.releaseRoot !== undefined
-        ? { releaseRoot: match.grant.releaseRoot }
-        : request.releaseRoot !== undefined
-          ? { releaseRoot: request.releaseRoot }
-          : {}),
-    };
+    // A legacy grant binds to the first attempt that resolves it, and a
+    // release grant without a recorded root binds to the first root that
+    // resolves it (CO14 follow-up); both bindings persist in place, so a
+    // bound grant can never be moved to another attempt or root afterwards.
+    const needsAttempt = match.grant.attemptId === undefined;
+    grants.set(match.id, {
+      schemaVersion: needsAttempt ? ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION : match.grant.schemaVersion,
+      attemptId: match.grant.attemptId ?? request.attemptId,
+      ...(request.releaseRoot !== undefined ? { releaseRoot: request.releaseRoot } : {}),
+      expectedHeadSha: match.grant.expectedHeadSha,
+      kind: match.grant.kind,
+      consumedByActionId: match.grant.consumedByActionId,
+    });
   }
 
   private consumeLocally(
@@ -932,4 +955,17 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
       reason: `Authorization grant already consumed by action ${grant.consumedByActionId}`,
     };
   }
+}
+
+/**
+ * An unconsumed grant resolves. CO14 follow-up: a release grant already consumed
+ * by exactly this resolve's deterministic action id resolves again idempotently,
+ * so a crash between the consumption and the release's write is recoverable on
+ * the next pass. A different action id never resumes a consumed grant.
+ */
+function isResolvableGrant(grant: ActionAuthorizationGrantEntry, request: ResolveActionAuthorizationRequest): boolean {
+  if (grant.consumedByActionId === null) {
+    return true;
+  }
+  return RELEASE_ACTION_KINDS.includes(grant.kind as never) && grant.consumedByActionId === request.actionId;
 }

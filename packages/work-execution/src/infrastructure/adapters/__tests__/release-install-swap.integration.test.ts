@@ -45,12 +45,24 @@ afterEach(async () => {
   await Promise.all(pending.map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-/** The executor stand-in: the build step leaves the CLI entry the marker check requires. */
+/**
+ * The executor stand-in: the build step leaves the CLI entry the marker check
+ * requires. It is told how to behave: `failStep` makes the first argv whose
+ * leading words match it exit non-zero (the build is then not performed), and
+ * `skipBuildOutput` lets `yarn build` succeed without leaving the CLI entry,
+ * so only the verify step can catch it.
+ */
 class ScriptedBuildExecutor implements CommandExecutorPort {
   readonly argvs: string[][] = [];
+  failStep: readonly string[] | null = null;
+  skipBuildOutput = false;
   async run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
     this.argvs.push([...argv]);
-    if (argv[0] === 'yarn' && argv[1] === 'build' && options?.cwd !== undefined) {
+    const failing = this.failStep;
+    if (failing !== null && failing.every((word, i) => argv[i] === word)) {
+      return { exitCode: 1, signal: null, stdout: '', stderr: 'scripted failure' };
+    }
+    if (argv[0] === 'yarn' && argv[1] === 'build' && options?.cwd !== undefined && !this.skipBuildOutput) {
       const entry = join(options.cwd, 'apps', 'cli', 'dist');
       await mkdir(entry, { recursive: true });
       await writeFile(join(entry, 'bin.js'), '// built\n');
@@ -309,6 +321,35 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     // The same rollback again, with the grant already spent: refused, current unmoved.
     expect(await apply('rollback', null)).toEqual({ outcome: 'refused', reason: 'authority-refused' });
     expect(await readlinkSha(h.root)).toBe(shaC);
+  });
+
+  describe.each([
+    { step: ['git', '-c'], label: 'archive', ran: 1 },
+    { step: ['tar'], label: 'extract', ran: 2 },
+    { step: ['yarn', 'install'], label: 'install', ran: 3 },
+    { step: ['yarn', 'build'], label: 'build', ran: 4 },
+  ])('a failing $label step', ({ step, ran }) => {
+    it('refuses the install, stops the sequence there, leaves no build and moves nothing', async () => {
+      h.executor.failStep = step;
+      await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
+      const result = await apply('install', shaA);
+      expect(result).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
+      // The reviewed sequence ran in order and stopped at the failing step.
+      const expected = [['git', '-c'], ['tar'], ['yarn', 'install'], ['yarn', 'build']];
+      expect(h.executor.argvs).toHaveLength(ran);
+      h.executor.argvs.forEach((argv, i) => expect(argv.slice(0, expected[i].length)).toEqual(expected[i]));
+      expect(await h.store.list({ root: h.root })).toMatchObject({ outcome: 'read', current: null, builds: [] });
+      expect(await readlinkSha(h.root)).toBeNull();
+      // The grant is spent: a failed build is never silently retried under it.
+      expect((await h.grants.findRequestByGrantId('grant-a'))?.consumptions).toHaveLength(1);
+    });
+  });
+
+  it('a build that succeeds but leaves no verifiable CLI entry is refused and installs nothing', async () => {
+    h.executor.skipBuildOutput = true;
+    await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
+    expect(await apply('install', shaA)).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
+    expect(await h.store.list({ root: h.root })).toMatchObject({ outcome: 'read', current: null, builds: [] });
   });
 
   it('install of a pruned sha with a spent grant is refused and no build script runs', async () => {

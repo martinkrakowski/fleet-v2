@@ -93,7 +93,6 @@ describe('cutover shadow report (CO32)', () => {
     const body = JSON.parse(result.out) as {
       outcome: string;
       kind: string;
-      fleetBase: string;
       equal: boolean;
       complete: boolean;
       compared: number;
@@ -101,12 +100,31 @@ describe('cutover shadow report (CO32)', () => {
       shellCount: number;
       truncated: boolean;
       divergences: unknown[];
-      shell: { queue: string; parkedLines: number; chainFiles: number | null; batchLines: number | null };
+      shell: {
+        queue: string;
+        parkedLines: number;
+        inprogressLines: number;
+        chainFiles: number | null;
+        batchLines: number | null;
+        batchesEnabledLines: number | null;
+      };
     };
     expect(body.outcome).toBe('completed');
     expect(body.kind).toBe('enqueue-set');
-    expect(body.fleetBase).toBe('main');
     expect(body.equal).toBe(true);
+    expect(body.complete).toBe(true);
+    expect(body.compared).toBe(1);
+    expect(body.fleetCount).toBe(1);
+    expect(body.shellCount).toBe(1);
+    expect(body.truncated).toBe(false);
+    expect(body.divergences).toEqual([]);
+    expect(body.shell.queue).toBe('read');
+    expect(body.shell.parkedLines).toBe(0);
+    expect(body.shell.inprogressLines).toBe(0);
+    expect(body.shell.chainFiles).toBe(0);
+    expect(body.shell.batchLines).toBe(0);
+    expect(body.shell.batchesEnabledLines).toBe(0);
+    expect(body).not.toHaveProperty('fleetBase');
     expect(body.complete).toBe(true);
     expect(body.compared).toBe(1);
     expect(body.fleetCount).toBe(1);
@@ -410,6 +428,183 @@ describe('cutover shadow report (CO32)', () => {
     expect(body.outcome).toBe('unknown');
     expect(body.complete).toBe(false);
     expect(body.shell.batchLines).toBeNull();
+    expect(result.out).not.toContain(stateDir);
+  });
+
+  it('counts an in-progress head PR present on both sides as a match', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    // The fleet queue holds 7@HEAD_A (the train head) and 9@HEAD_B; the shell
+    // has already moved 7 into `inprogress`, so only 9 remains in the queue.
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 9, HEAD_B, ulid(2));
+    await fs.writeFile(path.join(stateDir, 'queue'), `9 ${HEAD_B} main\n`);
+    await fs.writeFile(path.join(stateDir, 'inprogress'), `7 ${HEAD_A} main\n`);
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(0);
+    const body = JSON.parse(result.out) as {
+      outcome: string;
+      equal: boolean;
+      complete: boolean;
+      fleetCount: number;
+      shellCount: number;
+      divergences: unknown[];
+      shell: { inprogressLines: number };
+    };
+    expect(body.outcome).toBe('completed');
+    expect(body.equal).toBe(true);
+    expect(body.complete).toBe(true);
+    expect(body.fleetCount).toBe(2);
+    expect(body.shellCount).toBe(2);
+    expect(body.divergences).toEqual([]);
+    expect(body.shell.inprogressLines).toBe(1);
+  });
+
+  it('refuses when the in-progress head file is unreadable', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    // A directory at the in-progress path makes readFile fail with EISDIR,
+    // which the legacy reader adapter reports as `unreadable`.
+    await fs.mkdir(path.join(stateDir, 'inprogress'));
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.out)).toEqual({
+      outcome: 'refused',
+      reason: 'shell-queue-unreadable',
+      kind: 'enqueue-set',
+    });
+    expect(result.out).not.toContain(stateDir);
+  });
+
+  it('reports unknown when the in-progress field is missing from the port answer', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    // Simulate an older adapter that predates the in-progress head read: the
+    // field itself is missing, so the head count is unknown evidence, never
+    // empty.
+    const real = runtime.execution.legacyTrainState;
+    const original = real.readLegacyTrainState.bind(real);
+    (real as { readLegacyTrainState: unknown }).readLegacyTrainState = async (
+      options: Parameters<typeof real.readLegacyTrainState>[0],
+    ) => {
+      const state = { ...(await original(options)) } as Record<string, unknown>;
+      delete state.inprogress;
+      return state as unknown as Awaited<ReturnType<typeof original>>;
+    };
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.out)).toEqual({
+      outcome: 'unknown',
+      reason: 'shell-state-incomplete',
+      kind: 'enqueue-set',
+    });
+    expect(result.out).not.toContain(stateDir);
+  });
+
+  it('keys a fleet entry recorded on chain/x against the shell side by that base', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    // A v2 record that carries its own baseBranch; seeded into the store the
+    // adapter reloads on first use, as in the parked test above.
+    const chainEntry = {
+      version: 2,
+      entryId: ulid(1),
+      repository: { owner: 'fleet', repo: 'v2' },
+      repoDigest: 'a'.repeat(12),
+      pullRequest: 9,
+      headOid: HEAD_B,
+      state: 'parked',
+      reason: 'conflict',
+      attempt: 0,
+      notBeforeIso: null,
+      enqueuedAtIso: '2026-11-01T10:00:00.000Z',
+      enqueuedBy: 'cli',
+      supersedes: null,
+      runId: null,
+      attemptId: null,
+      workOrderId: null,
+      tier: 2,
+      verifiedHeadOid: null,
+      verifiedBy: null,
+      policyRevision: null,
+      premergeReceiptHeadOid: null,
+      veto: null,
+      mergeCommitOid: null,
+      mergedAtIso: null,
+      revision: 1,
+      baseBranch: 'chain/x',
+    };
+    await fs.writeFile(path.join(stateDir, 'merge-queue.json'), JSON.stringify([chainEntry]));
+    await fs.writeFile(path.join(stateDir, 'queue'), `9 ${HEAD_B} chain/x\n`);
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(0);
+    const body = JSON.parse(result.out) as {
+      outcome: string;
+      equal: boolean;
+      compared: number;
+      divergences: Array<{ key: string }>;
+      shell: { inprogressLines: number };
+    };
+    expect(body.outcome).toBe('completed');
+    expect(body.equal).toBe(true);
+    expect(body.compared).toBe(1);
+    expect(body.divergences).toEqual([]);
+    expect(body.shell.inprogressLines).toBe(0);
+  });
+
+  it('reports the batches-enabled line count in a fixture with known enabled bases', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    await fs.mkdir(path.join(stateDir, 'batches'));
+    await fs.writeFile(path.join(stateDir, 'batches', 'enabled'), 'chain/alpha\nchain/beta\nchain/gamma\n');
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(0);
+    const body = JSON.parse(result.out) as {
+      outcome: string;
+      complete: boolean;
+      shell: { batchesEnabledLines: number };
+    };
+    expect(body.outcome).toBe('completed');
+    expect(body.complete).toBe(true);
+    expect(body.shell.batchesEnabledLines).toBe(3);
+  });
+
+  it('reports an unreadable batches-enabled source as null and incomplete, never as zero', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    // A regular file where the batches directory is expected makes the
+    // batches-enabled read report `unreadable`.
+    await fs.writeFile(path.join(stateDir, 'batches'), 'not a directory');
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(1);
+    const body = JSON.parse(result.out) as {
+      outcome: string;
+      complete: boolean;
+      shell: { batchesEnabledLines: number | null };
+    };
+    expect(body.outcome).toBe('unknown');
+    expect(body.complete).toBe(false);
+    expect(body.shell.batchesEnabledLines).toBeNull();
     expect(result.out).not.toContain(stateDir);
   });
 });

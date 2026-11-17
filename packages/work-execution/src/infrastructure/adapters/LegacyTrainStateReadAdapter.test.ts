@@ -1,13 +1,17 @@
 // Lane CO5: read-only legacy shell merge-train state reader adapter.
+import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { LegacyTrainStateReadAdapter } from './LegacyTrainStateReadAdapter.adapter.js';
 
 const FIRST_HEAD = '0123456789abcdef0123456789abcdef01234567';
 const SECOND_HEAD = '0123456789abcdef0123456789abcdef01234568';
+
+const execFileAsync = promisify(execFile);
 
 function lineFor(pullRequest: number, head: string, base = 'main'): string {
   return `${pullRequest} ${head} ${base}`;
@@ -156,6 +160,30 @@ describe('LegacyTrainStateReadAdapter', () => {
 
       expect(result.inprogress).toEqual({ status: 'unreadable' });
     });
+
+    it('reports unreadable instead of following an in-progress symlink that escapes the state directory', async () => {
+      const dir = await makeTempDir();
+      const outside = await makeTempDir();
+      await fs.writeFile(join(outside, 'secret'), 'outside-secret\n');
+      await fs.symlink(join(outside, 'secret'), join(dir, 'inprogress'));
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+      expect(result.inprogress).toEqual({ status: 'unreadable' });
+      expect(JSON.stringify(result)).not.toContain('outside-secret');
+    });
+
+    it('does not hang when the in-progress head is a fifo with no writer', async () => {
+      const dir = await makeTempDir();
+      await execFileAsync('mkfifo', [join(dir, 'inprogress')]);
+
+      const result = await Promise.race([
+        new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('read blocked on a fifo')), 2_000)),
+      ]);
+
+      expect(result.inprogress).toEqual({ status: 'unreadable' });
+    });
   });
 
   describe('enabled batches', () => {
@@ -186,6 +214,19 @@ describe('LegacyTrainStateReadAdapter', () => {
       });
 
       expect(result.batchesEnabled).toEqual({ status: 'absent' });
+    });
+
+    it('reports unreadable instead of following an enabled-batches symlink that escapes the state directory', async () => {
+      const dir = await makeTempDir();
+      const outside = await makeTempDir();
+      await fs.writeFile(join(outside, 'secret'), 'outside-secret\n');
+      await fs.mkdir(join(dir, 'batches'));
+      await fs.symlink(join(outside, 'secret'), join(dir, 'batches', 'enabled'));
+
+      const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+      expect(result.batchesEnabled).toEqual({ status: 'unreadable' });
+      expect(JSON.stringify(result)).not.toContain('outside-secret');
     });
   });
 

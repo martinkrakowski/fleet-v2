@@ -118,19 +118,11 @@ export class LegacyTrainStateReadAdapter implements LegacyTrainStateReadPort {
       if (stats.size > this.eventsMaxBytes) {
         return { status: 'too-large' };
       }
-      const buffer = Buffer.alloc(this.eventsMaxBytes + 1);
-      let read = 0;
-      while (read < buffer.length) {
-        const { bytesRead } = await handle.read(buffer, read, buffer.length - read, read);
-        if (bytesRead === 0) {
-          break;
-        }
-        read += bytesRead;
-      }
-      if (read > this.eventsMaxBytes) {
+      const buffer = await readHandleBytes(handle, this.eventsMaxBytes + 1);
+      if (buffer.length > this.eventsMaxBytes) {
         return { status: 'too-large' };
       }
-      return { status: 'read', lines: Object.freeze(splitLines(buffer.subarray(0, read).toString('utf8'))) };
+      return { status: 'read', lines: Object.freeze(splitLines(buffer.toString('utf8'))) };
     } catch {
       return { status: 'unreadable' };
     } finally {
@@ -138,15 +130,33 @@ export class LegacyTrainStateReadAdapter implements LegacyTrainStateReadPort {
     }
   }
 
+  /**
+   * Read a small state file without racing the legacy writer and without ever
+   * blocking: the open refuses a symlink at the final component (O_NOFOLLOW)
+   * and does not wait on a FIFO (O_NONBLOCK), and the content is only read
+   * once the descriptor has been confirmed to be a regular file.
+   */
   private async readSourceFile(name: string, stateDir: string): Promise<LegacyTrainFileRead> {
+    const path = join(stateDir, name);
+    let handle: fs.FileHandle;
     try {
-      const text = await fs.readFile(join(stateDir, name), 'utf8');
-      return { status: 'read', lines: Object.freeze(splitLines(text)) };
+      handle = await fs.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (errorCode(error) === 'ENOENT') {
         return { status: 'absent' };
       }
       return { status: 'unreadable' };
+    }
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile()) {
+        return { status: 'unreadable' };
+      }
+      return { status: 'read', lines: Object.freeze(splitLines((await readHandleBytes(handle)).toString('utf8'))) };
+    } catch {
+      return { status: 'unreadable' };
+    } finally {
+      await handle.close().catch(() => undefined);
     }
   }
 
@@ -183,6 +193,30 @@ function splitLines(text: string): string[] {
     pieces.pop();
   }
   return pieces;
+}
+
+/**
+ * Read the whole descriptor into memory in chunks, at most `limit` bytes
+ * when a limit is given (an unbounded read to EOF otherwise). The descriptor
+ * is expected to be opened with O_NONBLOCK, so a FIFO can never make this wait.
+ */
+async function readHandleBytes(handle: fs.FileHandle, limit?: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const size = limit === undefined ? 65_536 : Math.min(65_536, limit - total);
+    if (size <= 0) {
+      break;
+    }
+    const chunk = Buffer.alloc(size);
+    const { bytesRead } = await handle.read(chunk, 0, size, total);
+    if (bytesRead === 0) {
+      break;
+    }
+    chunks.push(chunk.subarray(0, bytesRead));
+    total += bytesRead;
+  }
+  return Buffer.concat(chunks);
 }
 
 function errorCode(error: unknown): string | undefined {

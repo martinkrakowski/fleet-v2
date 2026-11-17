@@ -144,27 +144,26 @@ export class ShadowEvidenceAdapter implements ShadowEvidencePort {
     }
     const deadline = readDeadline(snapshot.deadlineIso);
     if (deadline.kind === 'invalid') return refused('invalid-request');
-    const deadlineReached = deadline.kind === 'at' && this.deadlineReached(deadline.ms);
     if (snapshot.next === undefined || snapshot.next === null) return refused('invalid-request');
-    const nextRead = readShadowLedger(snapshot.next);
-    if (!nextRead.ok) return refused('invalid-ledger');
-    const next = nextRead.ledger;
-    if (next.revision !== expectedRevision + 1) return refused('invalid-request');
-    if (deadlineReached) return refused('deadline-exceeded');
+    if (deadline.kind === 'at' && this.deadlineReached(deadline.ms)) return refused('deadline-exceeded');
 
     const target = this.target;
     if (target === null) {
       // No await between the decision and the store: two racing writes cannot both pass.
       const stop = this.precondition(this.memoryState(), expectedRevision, deadline);
       if (stop !== null) return stop;
-      this.inMemoryLedger = next;
-      return { outcome: 'saved', ledger: next };
+      const resolved = this.resolveNext(snapshot.next, expectedRevision);
+      if ('outcome' in resolved) return resolved;
+      this.inMemoryLedger = resolved.ledger;
+      return { outcome: 'saved', ledger: resolved.ledger };
     }
     return withFileLock(`${target}.lock`, async (): Promise<ShadowLedgerCasResult> => {
       const stop = this.precondition(await this.load(), expectedRevision, deadline);
       if (stop !== null) return stop;
-      await writeJsonAtomically(target, { ...next, schemaVersion: SHADOW_LEDGER_SCHEMA_VERSION });
-      return { outcome: 'saved', ledger: next };
+      const resolved = this.resolveNext(snapshot.next, expectedRevision);
+      if ('outcome' in resolved) return resolved;
+      await writeJsonAtomically(target, { ...resolved.ledger, schemaVersion: SHADOW_LEDGER_SCHEMA_VERSION });
+      return { outcome: 'saved', ledger: resolved.ledger };
     });
   }
 
@@ -183,6 +182,14 @@ export class ShadowEvidenceAdapter implements ShadowEvidencePort {
       return { outcome: 'conflict', currentRevision };
     }
     return null;
+  }
+
+  /** `request.next` validated against `readShadowLedger`, then pinned to `expectedRevision + 1`. */
+  private resolveNext(rawNext: unknown, expectedRevision: number): { ledger: ShadowLedger } | ShadowLedgerCasResult {
+    const nextRead = readShadowLedger(rawNext);
+    if (!nextRead.ok) return refused('invalid-ledger');
+    if (nextRead.ledger.revision !== expectedRevision + 1) return refused('invalid-request');
+    return { ledger: nextRead.ledger };
   }
 
   private memoryState(): ShadowLedgerReadResult {

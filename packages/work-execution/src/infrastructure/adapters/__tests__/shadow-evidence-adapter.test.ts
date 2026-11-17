@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ShadowLedger } from '../../../domain/shadow-evidence-ledger.js';
 import { SHADOW_LEDGER_SCHEMA_VERSION } from '../../../domain/shadow-evidence-ledger.js';
@@ -243,10 +243,18 @@ describe('ShadowEvidenceAdapter', () => {
   });
 
   it('in-memory mode never touches the filesystem', async () => {
+    const openSpy = vi.spyOn(fs, 'open');
+    const readFileSpy = vi.spyOn(fs, 'readFile');
+    const lstatSpy = vi.spyOn(fs, 'lstat');
     const adapter = new ShadowEvidenceAdapter();
     expect(await adapter.read()).toEqual({ status: 'missing' });
     await adapter.compareAndSet({ expectedRevision: 0, next: dayLedger(1) });
     expect(await adapter.read()).toEqual({ status: 'ok', ledger: dayLedger(1) });
-    expect(await fs.readdir(tempDir)).toEqual([]);
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(readFileSpy).not.toHaveBeenCalled();
+    expect(lstatSpy).not.toHaveBeenCalled();
+    openSpy.mockRestore();
+    readFileSpy.mockRestore();
+    lstatSpy.mockRestore();
   });
 });

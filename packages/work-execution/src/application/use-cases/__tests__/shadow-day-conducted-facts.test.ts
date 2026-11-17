@@ -1,0 +1,792 @@
+/**
+ * SH18a tests: `readShadowConformanceRuns`, the fail-closed reader of the
+ * conducted-run facts S6' evaluates. In-memory fakes implementing only the
+ * picked read members (no mutator exists on any fake); fixture values are
+ * `example-*`. Hostile input never throws: every refusal is a typed
+ * `unknown` result with a code, and no error message is echoed.
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import {
+  SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS,
+  readShadowConformanceRuns,
+  type ShadowConformanceRunsDependencies,
+} from '../shadow-day/index.js';
+import {
+  SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN,
+  SHADOW_CONFORMANCE_MAX_RUNS,
+} from '../../../domain/shadow-day-conformance.js';
+import { LANE_RUN_RECORD_VERSION, type LaneRunRecord } from '../../../domain/lane-run-records.js';
+import {
+  LANE_RUN_JOURNAL_ENTRY_VERSION,
+  type LaneRunJournalEntryRecord,
+} from '../../../domain/lane-run-journal.js';
+import type { AttemptRecord, CollectedAttemptArtifacts } from '../../../domain/execution-records.js';
+import type {
+  ReadReceiptsForHeadResult,
+  ReviewReceiptProjection,
+} from '../../ports/out/AcceptanceReceiptReadPort.out-port.js';
+
+const RUN_MERGED = 'run-01JB0000000000000000000000';
+const RUN_OTHER = 'run-01JC0000000000000000000000';
+const RUN_UNMERGED = 'run-01JD0000000000000000000000';
+const PR = 41;
+const OTHER_PR = 42;
+const HEAD_1 = 'a'.repeat(40);
+const HEAD_2 = 'b'.repeat(40);
+const ATTEMPT_1 = 'attempt-01JB0000000000000000000000';
+const ATTEMPT_2 = 'attempt-01JC0000000000000000000000';
+const WORK_ORDER_ID = 'example-work-order-1';
+const WORKTREE_PATH = '/example/worktree';
+const ENTRY_RECORDED_AT = '2026-11-28T12:00:00.000Z';
+const DEADLINE_ISO = '2026-11-30T00:00:00.000Z';
+/** Before the deadline by instant. */
+const BEFORE_DEADLINE = '2026-11-29T23:00:00.000Z';
+/** Equal to the deadline instant (the `>=` rule). */
+const AT_DEADLINE = '2026-11-30T00:00:00.000Z';
+const UNREADABLE_ERROR = 'example-unreadable-store-error';
+
+function request(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    mergedPullRequests: [PR],
+    deadlineIso: DEADLINE_ISO,
+    ...overrides,
+  };
+}
+
+function makeRun(overrides: Partial<LaneRunRecord> = {}): LaneRunRecord {
+  return {
+    version: LANE_RUN_RECORD_VERSION,
+    runId: RUN_MERGED,
+    workOrderId: WORK_ORDER_ID,
+    tier: 2,
+    seatPlanRef: 'a'.repeat(64),
+    cursors: { 'first-pass': null, fix: null, review: null },
+    round: 0,
+    attemptIds: [],
+    prNumber: null,
+    parked: null,
+    parkCount: 0,
+    lease: null,
+    revision: 1,
+    runPolicyRevision: 'policy-1',
+    ...overrides,
+  };
+}
+
+function collectedRun(overrides: Partial<LaneRunRecord> = {}): LaneRunRecord {
+  return makeRun({ attemptIds: [ATTEMPT_1, ATTEMPT_2], prNumber: PR, ...overrides });
+}
+
+function makeAttempt(
+  id: string,
+  artifacts: CollectedAttemptArtifacts | null,
+): AttemptRecord {
+  return {
+    id,
+    workOrderId: WORK_ORDER_ID,
+    kind: 'initial',
+    fixNumber: 0,
+    priorAttemptId: null,
+    worktreePath: WORKTREE_PATH,
+    baseCommit: HEAD_1,
+    state: 'collected',
+    outcome: 'done',
+    briefDigest: null,
+    briefPackagePath: null,
+    sessionId: null,
+    completionReceipt: null,
+    artifacts,
+    createdAtIso: ENTRY_RECORDED_AT,
+    updatedAtIso: ENTRY_RECORDED_AT,
+  };
+}
+
+function artifactsOf(headCommit: string): CollectedAttemptArtifacts {
+  return { headCommit, commitsSinceBase: [], collectedArtifactPaths: [], notes: 'missing' };
+}
+
+function journalEntry(
+  runId: string,
+  kind: LaneRunJournalEntryRecord['kind'],
+): LaneRunJournalEntryRecord {
+  return {
+    version: LANE_RUN_JOURNAL_ENTRY_VERSION,
+    entryId: `01JB00000000000000000000${kind === 'result' ? 'Z' : 'Y'}`,
+    kind,
+    key: null,
+    runId,
+    recordedAtIso: ENTRY_RECORDED_AT,
+    mode: null,
+    expectedRevision: null,
+    mintedId: null,
+    outcome: kind === 'result' ? 'completed' : null,
+    reasonCode: null,
+    detail: null,
+    grantId: null,
+    state: 'merged',
+  };
+}
+
+function receipt(
+  kind: ReviewReceiptProjection['kind'],
+  result: ReviewReceiptProjection['result'],
+): ReviewReceiptProjection {
+  return {
+    receiptId: 'example-receipt-id' as unknown as ReviewReceiptProjection['receiptId'],
+    kind,
+    result,
+    findings: { blocker: 0, major: 0, minor: 0, nit: 0 },
+    completedAtIso: ENTRY_RECORDED_AT,
+  };
+}
+
+interface ReadCalls {
+  runsList: number;
+  attemptsRead: string[];
+  receiptsRead: number;
+  listForRunRead: string[];
+}
+
+/**
+ * Deps whose every fake implements exactly the read member it names, and
+ * nothing else. An `Error` option makes the port throw; a missing option
+ * falls back to the empty read. `journalNonMap` makes the journal port
+ * return a non-`Map` (grouped path) or a non-array (per-run path).
+ */
+function makeDeps(options: {
+  runs?: readonly LaneRunRecord[] | Error;
+  runsNonArray?: boolean;
+  attempts?: ReadonlyMap<string, AttemptRecord | null> | Error;
+  journalByRun?: ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]> | Error;
+  journalNonMap?: unknown;
+  journalMissingKey?: boolean;
+  withListForRuns?: boolean;
+  receipts?: () => ReadReceiptsForHeadResult | undefined;
+  nowIso?: () => string;
+}): ShadowConformanceRunsDependencies & { calls: ReadCalls } {
+  const calls: ReadCalls = { runsList: 0, attemptsRead: [], receiptsRead: 0, listForRunRead: [] };
+  const runsList = (): Promise<readonly LaneRunRecord[]> => {
+    calls.runsList += 1;
+    if (options.runsNonArray === true) {
+      return Promise.resolve({ notAnArray: true } as unknown as readonly LaneRunRecord[]);
+    }
+    if (options.runs instanceof Error) {
+      return Promise.reject(options.runs);
+    }
+    return Promise.resolve(options.runs ?? []);
+  };
+  const attempts = {
+    findAttemptById: (attemptId: string): Promise<AttemptRecord | null> => {
+      calls.attemptsRead.push(attemptId);
+      if (options.attempts instanceof Error) {
+        return Promise.reject(options.attempts);
+      }
+      return Promise.resolve(options.attempts?.get(attemptId) ?? null);
+    },
+  };
+  const receiptsPort = {
+    readReceiptsForHead: (): Promise<ReadReceiptsForHeadResult> => {
+      calls.receiptsRead += 1;
+      const outcome = options.receipts?.();
+      return outcome === undefined
+        ? Promise.reject(new Error(UNREADABLE_ERROR))
+        : Promise.resolve(outcome);
+    },
+  };
+  const groupedMap = options.journalByRun instanceof Map ? options.journalByRun : new Map();
+  const listForRun = (runId: string): Promise<unknown> => {
+    calls.listForRunRead.push(runId);
+    if (options.journalByRun instanceof Error) {
+      return Promise.reject(options.journalByRun);
+    }
+    if (options.journalNonMap !== undefined) {
+      return Promise.resolve(options.journalNonMap);
+    }
+    return Promise.resolve(groupedMap.get(runId) ?? []);
+  };
+  const listForRuns = (runIds: readonly string[]): Promise<unknown> => {
+    if (options.journalByRun instanceof Error) {
+      return Promise.reject(options.journalByRun);
+    }
+    if (options.journalNonMap !== undefined) {
+      return Promise.resolve(options.journalNonMap);
+    }
+    if (options.journalMissingKey === true) {
+      return Promise.resolve(new Map(groupedMap));
+    }
+    const grouped = new Map(groupedMap);
+    for (const runId of runIds) {
+      if (!grouped.has(runId)) {
+        grouped.set(runId, []);
+      }
+    }
+    return Promise.resolve(grouped);
+  };
+  return {
+    runs: { list: runsList },
+    journal:
+      options.withListForRuns === false
+        ? ({ listForRun } as unknown as ShadowConformanceRunsDependencies['journal'])
+        : ({ listForRun, listForRuns } as unknown as ShadowConformanceRunsDependencies['journal']),
+    attempts: attempts as ShadowConformanceRunsDependencies['attempts'],
+    receipts: receiptsPort,
+    nowIso: options.nowIso ?? ((): string => BEFORE_DEADLINE),
+    calls,
+  };
+}
+
+describe('readShadowConformanceRuns', () => {
+  describe('conformance runs', () => {
+    it('a run whose PR merged yields its latest collected head, receipts and journal, sorted by runId', async () => {
+      const deps = makeDeps({
+        runs: [
+          collectedRun(),
+          makeRun({ runId: RUN_OTHER, prNumber: OTHER_PR, attemptIds: [ATTEMPT_2] }),
+          collectedRun({ runId: RUN_UNMERGED, attemptIds: [ATTEMPT_2] }),
+        ],
+        attempts: new Map([
+          [ATTEMPT_1, makeAttempt(ATTEMPT_1, null)],
+          [ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_1))],
+        ]),
+        journalByRun: new Map([
+          [RUN_MERGED, [journalEntry(RUN_MERGED, 'conduct'), journalEntry(RUN_MERGED, 'result')]],
+          [RUN_UNMERGED, [journalEntry(RUN_UNMERGED, 'conduct')]],
+        ]),
+        receipts: () => ({
+          outcome: 'found',
+          verification: [],
+          review: [receipt('brief-check', 'pass'), receipt('code-review', 'fail')],
+        }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({
+        status: 'ok',
+        runs: [
+          {
+            runId: RUN_MERGED,
+            tier: 2,
+            pullRequest: PR,
+            headOid: HEAD_1,
+            reviewReceipts: [
+              { kind: 'brief-check', result: 'pass' },
+              { kind: 'code-review', result: 'fail' },
+            ],
+            journal: [
+              { kind: 'conduct', key: null, recordedAtIso: ENTRY_RECORDED_AT, outcome: null, reasonCode: null, state: 'merged' },
+              { kind: 'result', key: null, recordedAtIso: ENTRY_RECORDED_AT, outcome: 'completed', reasonCode: null, state: 'merged' },
+            ],
+          },
+          {
+            runId: RUN_UNMERGED,
+            tier: 2,
+            pullRequest: PR,
+            headOid: HEAD_1,
+            reviewReceipts: [
+              { kind: 'brief-check', result: 'pass' },
+              { kind: 'code-review', result: 'fail' },
+            ],
+            journal: [
+              { kind: 'conduct', key: null, recordedAtIso: ENTRY_RECORDED_AT, outcome: null, reasonCode: null, state: 'merged' },
+            ],
+          },
+        ],
+      });
+    });
+
+    it('the latest attempt without artifacts falls back to the previous attempt head', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun()],
+        attempts: new Map([
+          [ATTEMPT_1, makeAttempt(ATTEMPT_1, artifactsOf(HEAD_1))],
+          [ATTEMPT_2, makeAttempt(ATTEMPT_2, null)],
+        ]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result.status).toBe('ok');
+      if (result.status === 'ok') {
+        expect(result.runs[0]?.headOid).toBe(HEAD_1);
+      }
+    });
+
+    it('receipts none yields an empty reviewReceipts list', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({
+        status: 'ok',
+        runs: [{
+          runId: RUN_MERGED,
+          tier: 2,
+          pullRequest: PR,
+          headOid: HEAD_2,
+          reviewReceipts: [],
+          journal: [],
+        }],
+      });
+    });
+
+    it('receipts unavailable yields unknown/receipts-unavailable and echoes no error text', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'unavailable', reason: 'evidence-unreadable' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'receipts-unavailable' });
+      expect(JSON.stringify(result)).not.toContain('evidence-unreadable');
+    });
+
+    it('a throwing receipt read yields unknown/receipts-unavailable and echoes no thrown message', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'receipts-unavailable' });
+      expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
+    });
+
+    it('a run whose PR is not in the set is omitted and never read', async () => {
+      const deps = makeDeps({
+        runs: [
+          collectedRun(),
+          makeRun({ runId: RUN_OTHER, prNumber: OTHER_PR, attemptIds: [ATTEMPT_1] }),
+        ],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result.status).toBe('ok');
+      if (result.status === 'ok') {
+        expect(result.runs.map((run) => run.runId)).toEqual([RUN_MERGED]);
+      }
+      expect(deps.calls.attemptsRead).toEqual([ATTEMPT_2]);
+      expect(deps.calls.receiptsRead).toBe(1);
+    });
+
+    it('a run with no collected head yields unknown/head-unresolved', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_1] })],
+        attempts: new Map([[ATTEMPT_1, makeAttempt(ATTEMPT_1, null)]]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'head-unresolved' });
+    });
+
+    it('findAttemptById returning null for an id in attemptIds yields unknown/attempt-unreadable even when an older attempt has a collected head', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun()],
+        attempts: new Map([[ATTEMPT_1, makeAttempt(ATTEMPT_1, artifactsOf(HEAD_1))]]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'attempt-unreadable' });
+      expect(deps.calls.attemptsRead).toEqual([ATTEMPT_2]);
+    });
+
+    it('a throwing findAttemptById yields unknown/attempt-unreadable', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun()],
+        attempts: new Error(UNREADABLE_ERROR),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'attempt-unreadable' });
+      expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
+    });
+  });
+
+  describe('journal and candidates', () => {
+    it('without listForRuns the reader falls back to listForRun once per candidate', async () => {
+      const deps = makeDeps({
+        runs: [
+          collectedRun(),
+          collectedRun({ runId: RUN_OTHER, attemptIds: [ATTEMPT_2] }),
+        ],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        journalByRun: new Map(),
+        receipts: () => ({ outcome: 'none' }),
+        withListForRuns: false,
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result.status).toBe('ok');
+      expect(deps.calls.listForRunRead).toEqual([RUN_MERGED, RUN_OTHER]);
+    });
+
+    it('a listForRuns Map missing a requested runId yields unknown/journal-unreadable', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        journalByRun: new Map(),
+        journalMissingKey: true,
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+    });
+
+    it('a listForRuns non-Map yield yields unknown/journal-unreadable', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        journalNonMap: { notAMap: true },
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+    });
+
+    it('a non-array listForRuns value yields unknown/journal-unreadable', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        journalByRun: new Map([
+          [RUN_MERGED, { notAnArray: true } as unknown as readonly LaneRunJournalEntryRecord[]],
+        ]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+    });
+
+    it('a non-array listForRun yield yields unknown/journal-unreadable', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        journalNonMap: { notAnArray: true },
+        withListForRuns: false,
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+    });
+
+    it('a throwing listForRun yields unknown/journal-unreadable', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        journalByRun: new Error(UNREADABLE_ERROR),
+        withListForRuns: false,
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+      expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
+    });
+
+    it('a candidate journal over the entry cap yields unknown/too-many-journal-entries', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        journalByRun: new Map([
+          [RUN_MERGED, Array.from({ length: SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN + 1 }, () => journalEntry(RUN_MERGED, 'conduct'))],
+        ]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'too-many-journal-entries' });
+    });
+
+    it('candidates over the run cap yield unknown/too-many-runs', async () => {
+      const runs = Array.from(
+        { length: SHADOW_CONFORMANCE_MAX_RUNS + 1 },
+        (_, index) => collectedRun({ runId: `run-01JB00000000000000000${String(index).padStart(5, '0')}` }),
+      );
+      const deps = makeDeps({
+        runs,
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'too-many-runs' });
+      expect(deps.calls.attemptsRead).toEqual([]);
+    });
+
+    it('a throwing runs.list yields unknown/runs-unreadable', async () => {
+      const deps = makeDeps({ runs: new Error(UNREADABLE_ERROR) });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
+      expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
+    });
+
+    it('a non-array runs.list yield yields unknown/runs-unreadable', async () => {
+      const deps = makeDeps({ runsNonArray: true });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
+    });
+  });
+
+  describe('deadline', () => {
+    it('a now past the deadline yields unknown/deadline-exceeded with zero outbound calls', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun()],
+        attempts: new Map(),
+        receipts: () => ({ outcome: 'none' }),
+        nowIso: () => AT_DEADLINE,
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+      expect(deps.calls.runsList).toBe(0);
+      expect(deps.calls.attemptsRead).toEqual([]);
+      expect(deps.calls.receiptsRead).toBe(0);
+    });
+
+    it('a now past the deadline instant in a different offset yields unknown/deadline-exceeded (instant comparison)', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun()],
+        attempts: new Map(),
+        receipts: () => ({ outcome: 'none' }),
+        nowIso: () => '2026-12-01T01:30:00.000+02:00',
+      });
+      const result = await readShadowConformanceRuns(
+        deps,
+        request({ deadlineIso: '2026-11-30T00:00:00.000Z' }),
+      );
+      expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+      expect(deps.calls.runsList).toBe(0);
+    });
+
+    it('a now before the deadline only in instant terms yields ok (a lexical comparison would refuse)', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'none' }),
+        nowIso: () => '2026-11-29T23:30:00.000Z',
+      });
+      const result = await readShadowConformanceRuns(
+        deps,
+        request({ deadlineIso: '2026-11-29T22:00:00.000-02:00' }),
+      );
+      expect(result.status).toBe('ok');
+    });
+
+    it('a throwing nowIso yields unknown/deadline-exceeded with zero outbound calls', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun()],
+        attempts: new Map(),
+        receipts: () => ({ outcome: 'none' }),
+        nowIso: () => {
+          throw new Error(UNREADABLE_ERROR);
+        },
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+      expect(deps.calls.runsList).toBe(0);
+    });
+
+    it('a non-zoned nowIso yield yields unknown/deadline-exceeded', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun()],
+        attempts: new Map(),
+        receipts: () => ({ outcome: 'none' }),
+        nowIso: () => 'not-a-zoned-instant',
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+    });
+  });
+
+  describe('fakes', () => {
+    it('no fake has a mutating method; only the picked read members exist', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({ outcome: 'none' }),
+      });
+      expect(Object.keys(deps.runs).sort()).toEqual(['list']);
+      expect(Object.keys(deps.attempts).sort()).toEqual(['findAttemptById']);
+      expect(Object.keys(deps.receipts).sort()).toEqual(['readReceiptsForHead']);
+      expect(Object.keys(deps.journal).sort()).toEqual(['listForRun', 'listForRuns']);
+      expect(await readShadowConformanceRuns(deps, request())).toEqual({
+        status: 'ok',
+        runs: [{
+          runId: RUN_MERGED,
+          tier: 2,
+          pullRequest: PR,
+          headOid: HEAD_2,
+          reviewReceipts: [],
+          journal: [],
+        }],
+      });
+    });
+  });
+});
+
+describe('readShadowConformanceRuns hostile input', () => {
+  it('refuses null with unknown/invalid-request', async () => {
+    const result = await readShadowConformanceRuns(makeDeps({}), null);
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+  });
+
+  it('refuses undefined with unknown/invalid-request', async () => {
+    const result = await readShadowConformanceRuns(makeDeps({}), undefined);
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+  });
+
+  it('refuses a number where the request record is due with unknown/invalid-request', async () => {
+    const result = await readShadowConformanceRuns(makeDeps({}), 42);
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+  });
+
+  it('refuses a string where the merged list is due with unknown/invalid-request', async () => {
+    const result = await readShadowConformanceRuns(makeDeps({}), request({ mergedPullRequests: '41' }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+  });
+
+  it('refuses a non-iterable object where the merged list is due with unknown/invalid-request', async () => {
+    const result = await readShadowConformanceRuns(makeDeps({}), request({ mergedPullRequests: { [0]: PR } }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+  });
+
+  it('refuses an array-like object where the merged list is due with unknown/invalid-request', async () => {
+    const result = await readShadowConformanceRuns(
+      makeDeps({}),
+      request({ mergedPullRequests: { length: 1, 0: PR } }),
+    );
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+  });
+
+  it('refuses a foreign own key on the merged list (e.g. a constructor key) with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    const items: number[] = [PR];
+    Object.defineProperty(items, 'constructor', { enumerable: true, value: Object });
+    const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: items }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+  });
+
+  it('refuses a sparse array (a hole) with unknown/invalid-request', async () => {
+    const sparse: number[] = [PR];
+    sparse.length = 2;
+    const result = await readShadowConformanceRuns(makeDeps({}), request({ mergedPullRequests: sparse }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+  });
+
+  it('refuses an enormous length before any traversal with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    const sparse: number[] = [];
+    sparse.length = 2 ** 32 - 1;
+    const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: sparse }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+  });
+
+  it('refuses a dense list over the request cap with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    const overCap = Array.from(
+      { length: SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS + 1 },
+      (_, index) => index + 1,
+    );
+    const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: overCap }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+  });
+
+  it('refuses a non-integer or sub-1 pull request id with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    for (const bad of [0, -3, 2.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: [bad] }));
+      expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    }
+    expect(deps.calls.runsList).toBe(0);
+  });
+
+  it('refuses a getter on a merged item without running it (unknown/invalid-request)', async () => {
+    const deps = makeDeps({});
+    const items: number[] = [PR];
+    let itemGetCalls = 0;
+    Object.defineProperty(items, 0, {
+      enumerable: true,
+      get: () => {
+        itemGetCalls += 1;
+        return PR;
+      },
+    });
+    const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: items }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(itemGetCalls).toBe(0);
+  });
+
+  it('refuses a getter on the request root without running it (unknown/invalid-request)', async () => {
+    const deps = makeDeps({});
+    let rootGetCalls = 0;
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, 'mergedPullRequests', {
+      enumerable: true,
+      get: () => {
+        rootGetCalls += 1;
+        return [PR];
+      },
+    });
+    const result = await readShadowConformanceRuns(deps, hostile);
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(rootGetCalls).toBe(0);
+  });
+
+  it('a Proxy over a valid request yields exactly the plain result and runs no get trap', async () => {
+    const deps = makeDeps({
+      runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+      attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+      receipts: () => ({ outcome: 'none' }),
+    });
+    const plain = request();
+    let getCalls = 0;
+    const proxied = new Proxy(plain, {
+      get: (target, property) => {
+        getCalls += 1;
+        return Reflect.get(target, property);
+      },
+    });
+    const plainResult = await readShadowConformanceRuns(deps, plain);
+    const proxiedResult = await readShadowConformanceRuns(deps, proxied);
+    expect(proxiedResult).toEqual(plainResult);
+    expect(getCalls).toBe(0);
+  });
+
+  it('refuses a prototype-polluting own key from JSON.parse with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    const hostile = JSON.parse(
+      `{"__proto__":{},"constructor":1,"prototype":2,"mergedPullRequests":[${PR}],"deadlineIso":"${DEADLINE_ISO}"}`,
+    ) as Record<string, unknown>;
+    const result = await readShadowConformanceRuns(deps, hostile);
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+  });
+
+  it('the reader is not a constant: the same deps flip the answer when the request changes', async () => {
+    const deps = makeDeps({
+      runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+      attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+      receipts: () => ({ outcome: 'none' }),
+    });
+    const okResult = await readShadowConformanceRuns(deps, request());
+    const refusedResult = await readShadowConformanceRuns(deps, request({ mergedPullRequests: 'no' }));
+    expect(okResult.status).toBe('ok');
+    expect(refusedResult).toEqual({ status: 'unknown', reason: 'invalid-request' });
+  });
+
+  it('the reader is not an identity echo: the ok result carries exactly the evaluator facts', async () => {
+    const deps = makeDeps({
+      runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+      attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+      receipts: () => ({ outcome: 'none' }),
+    });
+    const result = await readShadowConformanceRuns(deps, request());
+    expect(JSON.parse(JSON.stringify(result))).toEqual({
+      status: 'ok',
+      runs: [{
+        runId: RUN_MERGED,
+        tier: 2,
+        pullRequest: PR,
+        headOid: HEAD_2,
+        reviewReceipts: [],
+        journal: [],
+      }],
+    });
+  });
+});

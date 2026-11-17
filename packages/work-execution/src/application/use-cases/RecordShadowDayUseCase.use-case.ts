@@ -306,10 +306,19 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (read.kind === 'threw') {
       return 'merge-entries-unavailable';
     }
-    return read.value.filter(isMergeQueueEntryLive).map((entry) => ({
-      pullRequest: entry.pullRequest,
-      headOid: entry.headOid,
-    }));
+    // Defensive: MergeQueueRepositoryAdapter#listMergeEntries does not
+    // itself filter by the query's `repository` (infrastructure/adapters,
+    // outside this unit's scope) — it returns every stored entry regardless
+    // of the query. Filter here by `repoDigest` so a call scoped to this
+    // repository is never contaminated by another repository's live
+    // entries in S1's merge-set comparison.
+    return read.value
+      .filter((entry) => entry.repoDigest === context.repoDigest)
+      .filter(isMergeQueueEntryLive)
+      .map((entry) => ({
+        pullRequest: entry.pullRequest,
+        headOid: entry.headOid,
+      }));
   }
 
   /** S1: the day's merge set, shell events against the fleet's journaled would-merges. */
@@ -538,6 +547,16 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       if (!written.ok) {
         return this.recordRefusal(written.reason);
       }
+      if (!written.changed) {
+        // Idempotent re-run: `written.ledger.revision` is the same revision
+        // already stored, so calling `compareAndSet` here would send
+        // `next.revision === expectedRevision` — a malformed request per
+        // ShadowEvidencePort.compareAndSet's contract (`next.revision` must
+        // be `expectedRevision + 1`), which the real adapter correctly
+        // refuses as `invalid-request`. Report `unchanged` over the
+        // ledger's own, unchanged revision without calling compareAndSet.
+        return this.finalResult(context, written.ledger, false, built);
+      }
       const saved = await this.call(context.deadlineIso, () =>
         this.deps.evidence.compareAndSet({
           expectedRevision: current === null ? 0 : current.revision,
@@ -549,7 +568,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         return unknownResult('ledger-unreadable');
       }
       if (saved.value.outcome === 'saved') {
-        return this.finalResult(context, saved.value.ledger, written.changed, built);
+        return this.finalResult(context, saved.value.ledger, true, built);
       }
       if (saved.value.outcome === 'refused') {
         return this.casRefusal(saved.value.reason);

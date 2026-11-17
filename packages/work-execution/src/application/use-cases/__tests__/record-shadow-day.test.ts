@@ -137,6 +137,7 @@ function cleanFixture(day: string): Fixture {
       headOid: HEAD_A,
       state: 'queued',
       repository: REPOSITORY,
+      repoDigest: REPO_DIGEST,
     },
   ] as unknown as MergeQueueEntryRecord[];
   const daemonEvents: DaemonEventRecord[] = [];
@@ -154,7 +155,11 @@ interface Harness {
       expectedRevision: number;
       next: ShadowLedger;
       deadlineIso?: string;
-    }) => Promise<{ outcome: 'saved'; ledger: ShadowLedger } | { outcome: 'conflict'; currentRevision: number | null }>;
+    }) => Promise<
+      | { outcome: 'saved'; ledger: ShadowLedger }
+      | { outcome: 'conflict'; currentRevision: number | null }
+      | { outcome: 'refused'; reason: 'invalid-request' }
+    >;
     calls: { read: number; cas: number };
     stored: ShadowLedger | null;
   };
@@ -185,6 +190,14 @@ function makeHarness(fixture: Fixture, nowIso: string): Harness {
       const currentRevision = stored === null ? 0 : stored.revision;
       if (forceConflict || currentRevision !== request.expectedRevision) {
         return { outcome: 'conflict' as const, currentRevision };
+      }
+      // Mirrors ShadowEvidenceAdapter#resolveNext: `next.revision` must be
+      // exactly `expectedRevision + 1`. An idempotent no-op CAS call (the
+      // bug this fix round closes) is refused here exactly as the real
+      // adapter refuses it, so a regression fails this fake the same way
+      // it would fail against the real adapter.
+      if (request.next.revision !== request.expectedRevision + 1) {
+        return { outcome: 'refused' as const, reason: 'invalid-request' as const };
       }
       stored = request.next;
       return { outcome: 'saved' as const, ledger: request.next };
@@ -344,19 +357,50 @@ describe('RecordShadowDayUseCase', () => {
     expectNotImplementedUnevaluated(result.unevaluated);
   });
 
-  it('answers unchanged when the same inputs are recorded a second time', async () => {
+  it('answers unchanged when the same inputs are recorded a second time, without a second (no-op) compareAndSet call', async () => {
     const fixture = cleanFixture(DAY);
     const harness = makeHarness(fixture, NOW);
     const useCase = new RecordShadowDayUseCase(harness.deps);
     await useCase.execute(makeRequest());
     const afterFirst = harness.evidence.stored;
+    const casCallsAfterFirst = harness.evidence.calls.cas;
+    expect(casCallsAfterFirst).toBe(1);
 
     const result = await useCase.execute(makeRequest());
     expectRecorded(result);
     expect(result.outcome).toBe('unchanged');
     expect(result.revision).toBe(1);
+    // The idempotent re-run must not call compareAndSet again: doing so
+    // with `next` at the same revision as `expectedRevision` would be a
+    // malformed CAS request per ShadowEvidencePort's contract.
+    expect(harness.evidence.calls.cas).toBe(casCallsAfterFirst);
     expect(harness.evidence.stored).toEqual(afterFirst);
     expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it("filters a live queue entry from another repository out of S1's merge set, compensating for MergeQueueRepositoryAdapter#listMergeEntries not filtering by the query's repository itself", async () => {
+    const fixture = cleanFixture(DAY);
+    // Same pull request, same 12-char head prefix as the real live entry,
+    // but a different full head and a different repository/repoDigest. If
+    // this use case did not defensively filter the adapter's (unfiltered)
+    // result by repoDigest, this entry would land in the same
+    // `pullRequest:head12` bucket as the real entry inside
+    // `evaluateShadowMergeSet`'s head-resolution index, making the lookup
+    // ambiguous and turning a genuine pass into a false
+    // `fail`/`fleet-head-ambiguous` verdict.
+    const contaminatingHead = `${'a'.repeat(12)}${'c'.repeat(28)}`;
+    fixture.queueEntries.push({
+      entryId: ulid(3),
+      pullRequest: 7,
+      headOid: contaminatingHead,
+      state: 'queued',
+      repository: { owner: 'foreign', repo: 'other' },
+      repoDigest: 'fedcba987654',
+    } as unknown as MergeQueueEntryRecord);
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S1).toBe('pass');
   });
 
   it('refuses a changed re-run with verdict-conflict and leaves the ledger untouched', async () => {

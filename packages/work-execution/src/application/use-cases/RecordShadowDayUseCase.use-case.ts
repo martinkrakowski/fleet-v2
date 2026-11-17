@@ -387,9 +387,10 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * Every outbound call goes through here: the deadline is checked first and
    * a reached deadline aborts the whole run (`DeadlineReachedError`), while a
    * dependency throw is reported to the caller as `threw` — never propagated.
-   * The deadline is re-checked once the awaited return lands, before its value
-   * is used: the port may have run past the deadline while awaited, and that
-   * expiry must abort the run the same way a pre-call expiry does.
+   * The deadline is re-checked once the awaited outcome lands — fulfilled or
+   * rejected — before anything is derived from it: the port may have run past
+   * the deadline while awaited, and that expiry must abort the run the same
+   * way a pre-call expiry does, even when the operation itself threw.
    */
   private async call<T>(deadlineIso: string | undefined, make: () => Promise<T>): Promise<{ readonly kind: 'value'; readonly value: T } | { readonly kind: 'threw' }> {
     if (this.deadlineReached(deadlineIso)) {
@@ -399,6 +400,9 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     try {
       value = await make();
     } catch {
+      if (this.deadlineReached(deadlineIso)) {
+        throw new DeadlineReachedError();
+      }
       return { kind: 'threw' };
     }
     if (this.deadlineReached(deadlineIso)) {

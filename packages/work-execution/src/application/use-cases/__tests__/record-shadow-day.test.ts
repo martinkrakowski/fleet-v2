@@ -2707,6 +2707,50 @@ describe('RecordShadowDayUseCase', () => {
     expect(harness.evidence.stored).toEqual(afterFirst);
   });
 
+  it('aborts with deadline-exceeded when the premergeCarry resolver rejects after the deadline passes', async () => {
+    // The rejection path: `call` must re-check the deadline even when the
+    // awaited operation REJECTS, otherwise S5 would become unevaluated
+    // (`fleet-carry-unknown`) and a rerun could answer `unchanged` instead
+    // of aborting with `deadline-exceeded`.
+    const harness = wiredHarness(carryFixture(), {});
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    const afterFirst = harness.evidence.stored;
+
+    // The clock is still on time when the resolver is called, and advances
+    // past the deadline before the resolver rejects.
+    setPremergeCarry(harness, (input) => {
+      harness.setNow(new Date(Date.parse(input.deadlineIso) + 60_000).toISOString());
+      return Promise.reject(new Error('resolver failed'));
+    });
+    const result = await useCase.execute(makeRequest({ deadlineIso: DEADLINE }));
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    expect(harness.evidence.stored).toEqual(afterFirst);
+  });
+
+  it('aborts with deadline-exceeded when the ledger read rejects after the deadline passes', async () => {
+    // The same rule for another port that goes through `call`: a rejection
+    // landing after the deadline must abort the run, not surface as the
+    // port's own threw-handling.
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    const afterFirst = harness.evidence.stored;
+
+    harness.deps.evidence.read = () => {
+      harness.setNow(new Date(Date.parse(DEADLINE) + 60_000).toISOString());
+      return Promise.reject(new Error('ledger read failed'));
+    };
+    const result = await useCase.execute(makeRequest({ deadlineIso: DEADLINE }));
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    expect(harness.evidence.stored).toEqual(afterFirst);
+  });
+
   it('answers unchanged on an S5 rerun with identical facts and answers, without a second CAS', async () => {
     const harness = wiredHarness(carryFixture(), {});
     setPremergeCarry(harness, constantPremergeCarry('carry'));

@@ -119,6 +119,20 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       }
     }
 
+    // A pair the legacy train is currently merging must never be imported,
+    // even when an earlier source (the queue) also lists it: deduplication
+    // keeps the first source for reporting, but the in-progress presence
+    // overrides the disposition so both trains never act on the same PR.
+    const inprogressPairs = new Set<string>();
+    const inprogressParsed = parsedBySource.inprogress;
+    if (inprogressParsed.ok) {
+      for (const line of inprogressParsed.lines) {
+        if (line.ok) {
+          inprogressPairs.add(`${line.entry.pullRequest}:${line.entry.headOid}`);
+        }
+      }
+    }
+
     let notImportableBase = 0;
     let alreadyQueued = 0;
     const candidates: LegacyTrainQueueEntry[] = [];
@@ -128,7 +142,7 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       if (entry.base !== 'main') {
         disposition = 'not-importable-base';
         notImportableBase += 1;
-      } else if (source === 'inprogress') {
+      } else if (source === 'inprogress' || inprogressPairs.has(`${entry.pullRequest}:${entry.headOid}`)) {
         // The legacy train is already merging this PR; enqueueing it would let
         // both trains act on it. It is reported, never an import candidate.
         disposition = 'in-progress';

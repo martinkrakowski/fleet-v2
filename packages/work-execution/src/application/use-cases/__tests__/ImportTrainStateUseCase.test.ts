@@ -408,7 +408,7 @@ describe('ImportTrainStateUseCase', () => {
     expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
   });
 
-  it('a pair in both queue and inprogress is imported from the queue, not the legacy merge', async () => {
+  it('a pair in both queue and inprogress is never imported while the legacy merge holds it', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(
       readState([MAIN_B], { inprogress: { status: 'read', lines: [MAIN_B] } }),
@@ -422,10 +422,11 @@ describe('ImportTrainStateUseCase', () => {
       authority: 'owner-grant-1',
     });
 
-    expect(result).toMatchObject({ outcome: 'applied', imported: 1 });
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
     expect(result.outcome === 'applied' && result.keys).toEqual([
-      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'queue', disposition: 'would-import' },
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'queue', disposition: 'in-progress' },
     ]);
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
   });
 
   it('a pair in both queue and parked is one key whose source is queue', async () => {

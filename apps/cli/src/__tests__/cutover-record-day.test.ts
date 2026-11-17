@@ -66,8 +66,15 @@ describe('cutover shadow record-day (SH8a)', () => {
     // A clean fixture: the shell queue exists and holds nothing (synthetic).
     await fs.writeFile(path.join(fixtureDir, 'queue'), '');
     const runtime = runtimeFor(stateDir);
+    // Pinned once and passed explicitly to both invocations: without this, a
+    // real UTC-midnight crossing between the two calls would make the second
+    // one resolve to a different default day than the first (each computes
+    // "yesterday" from the real wall clock independently), so it would record
+    // a new entry instead of reporting unchanged. See the too-early test
+    // below for the same real-Date.now() style used in this file.
+    const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-    const first = await cli(runtime, recordDayArgs(fixtureDir));
+    const first = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
     expect(first.code).toBe(0);
     const firstBody = JSON.parse(first.out) as {
       outcome: string;
@@ -80,7 +87,7 @@ describe('cutover shadow record-day (SH8a)', () => {
     expect(firstBody.revision).toBe(1);
     await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).resolves.toBeUndefined();
 
-    const second = await cli(runtime, recordDayArgs(fixtureDir));
+    const second = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
     expect(second.code).toBe(0);
     const secondBody = JSON.parse(second.out) as { outcome: string; revision: number };
     expect(secondBody.outcome).toBe('unchanged');

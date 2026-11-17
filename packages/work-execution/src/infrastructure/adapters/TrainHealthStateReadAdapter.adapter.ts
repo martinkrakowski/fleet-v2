@@ -50,6 +50,14 @@ const DEFAULT_MAX_FORGE_READS = 10;
 const MAX_FORGE_READS_LIMIT = 50;
 /** The use case races the whole read against at most this long. */
 const NORMAL_TIMEOUT_MS = 30_000;
+/**
+ * Forge reads share one window that ends this long after the read started,
+ * and sooner when the request deadline is sooner. WatchTrainHealthUseCase
+ * races the whole read against at most NORMAL_TIMEOUT_MS and answers
+ * state-read-timed-out when that race loses, so a forge call that hangs
+ * until the deadline it was given must still finish inside that 30 s race.
+ */
+const FORGE_READ_WINDOW_MS = 20_000;
 const KNOWN_FORGE_STATES: readonly TrainHealthForgeState[] = ['open', 'closed', 'merged'];
 
 interface RepositoryRef {
@@ -327,6 +335,16 @@ function toQueueEntry(
   };
 }
 
+/** `min(request deadline, readStart + FORGE_READ_WINDOW_MS)`. An unparseable input is unchanged. */
+function effectiveForgeDeadline(deadlineIso: string, readStartIso: string): string {
+  const requestedMs = Date.parse(deadlineIso);
+  const windowEndMs = Date.parse(readStartIso) + FORGE_READ_WINDOW_MS;
+  if (!Number.isFinite(requestedMs) || !Number.isFinite(windowEndMs)) {
+    return deadlineIso;
+  }
+  return new Date(Math.min(requestedMs, windowEndMs)).toISOString();
+}
+
 function okSnapshot(
   queue: readonly TrainHealthQueueEntry[],
   lastTickFinishedAtIso: string | undefined,
@@ -366,6 +384,11 @@ export class TrainHealthStateReadAdapter implements TrainHealthStateReadPort {
     if (parsed.outcome !== 'ok') {
       return parsed;
     }
+    const readStartIso = this.readClock();
+    if (readStartIso === null) {
+      return unavailable('invalid-clock');
+    }
+    const forgeDeadlineIso = effectiveForgeDeadline(parsed.deadlineIso, readStartIso);
     const tick = await this.readTick(parsed.deadlineIso);
     if (tick.outcome !== 'ok') {
       return tick;
@@ -374,7 +397,7 @@ export class TrainHealthStateReadAdapter implements TrainHealthStateReadPort {
     if (queue.outcome !== 'ok') {
       return queue;
     }
-    const entries = await this.readForgeStates(parsed.repository, queue.live, parsed.deadlineIso);
+    const entries = await this.readForgeStates(parsed.repository, queue.live, forgeDeadlineIso);
     return okSnapshot(entries, tick.lastTickFinishedAtIso, queue.lastMergedAtIso);
   }
 
@@ -504,8 +527,8 @@ export class TrainHealthStateReadAdapter implements TrainHealthStateReadPort {
     if (allowance.outcome !== 'ok') {
       return { stop: true };
     }
-    const answer = await this.callForge(repository, entry, allowance.nowIso, deadlineIso);
-    return { stop: false, forgeState: mapForgeState(answer) };
+    const forgeState = await this.callForge(repository, entry, allowance.nowIso, deadlineIso);
+    return { stop: false, forgeState };
   }
 
   private async callForge(
@@ -513,9 +536,9 @@ export class TrainHealthStateReadAdapter implements TrainHealthStateReadPort {
     entry: LiveEntry,
     nowIso: string,
     deadlineIso: string,
-  ): Promise<unknown> {
+  ): Promise<TrainHealthForgeState> {
     try {
-      return await this.options.forge.readForgeMerge({
+      const answer = await this.options.forge.readForgeMerge({
         repository,
         pullRequestNumber: entry.pullRequest,
         headSha: entry.headOid,
@@ -523,8 +546,9 @@ export class TrainHealthStateReadAdapter implements TrainHealthStateReadPort {
         nowIso,
         deadlineIso,
       });
+      return mapForgeState(answer);
     } catch {
-      return null;
+      return 'unknown';
     }
   }
 }

@@ -588,13 +588,83 @@ describe('evaluateShadowPremergeCarry: evaluation', () => {
     expectCarry(carryInput({ decisions: overCap }), { status: 'unknown', reason: 'invalid-input' });
   });
 
-  it('a decisions list over the cap is refused before any element is read', () => {
-    let calls = 0;
+  it('one input with both a lax and a stricter difference reports both exact counts', () => {
+    // Pins "count every difference, not only the first": stopping after the
+    // first difference would report laxCarries 1 with stricterNoCarries 0.
+    const result = evaluateShadowPremergeCarry(
+      carryInput({
+        decisions: [
+          decision({ shellCarry: 'not-carried', fleetCarry: 'carry' }),
+          decision({ pullRequest: 9, newHeadOid: 'fedcba9876543210fedcba9876543210fedcba98', shellCarry: 'carried', fleetCarry: 'no-carry' }),
+        ],
+      }),
+    );
+    expect(result).toEqual({ status: 'fail', reason: 'carry-decision-differs', compared: 2, laxCarries: 1, stricterNoCarries: 1 });
+  });
+
+  it('a decisions list of exactly the cap length is accepted, and cap + 1 is refused', () => {
+    // Pins `>` against `>=`: the cap itself is legal, one more is not. The
+    // at-cap list shares one newHeadOid with equal carries, so it dedupes to
+    // a single compared decision.
     const element = decision();
-    Object.defineProperty(element, 'atIso', { get() { calls += 1; return AT; }, enumerable: true });
+    const atCap = Array.from({ length: SHADOW_CARRY_MAX_DECISIONS }, () => element);
+    const accepted = evaluateShadowPremergeCarry(carryInput({ decisions: atCap }));
+    expect(accepted).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 1, laxCarries: 0, stricterNoCarries: 0 });
     const overCap = Array.from({ length: SHADOW_CARRY_MAX_DECISIONS + 1 }, () => element);
     expectCarry(carryInput({ decisions: overCap }), { status: 'unknown', reason: 'invalid-input' });
-    expect(calls).toBe(0);
+  });
+
+  it('an anomalies list over SHADOW_SHELL_FACTS_MAX_EVENTS is refused as invalid-input', () => {
+    const element = { atIso: AT, code: 'unpaired-update' };
+    const overCap = Array.from({ length: SHADOW_SHELL_FACTS_MAX_EVENTS + 1 }, () => element);
+    expectCarry(carryInput({ anomalies: overCap }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('a decision at exactly D T00:00:00Z is inside the day and one at exactly D+1 T00:00:00Z is outside', () => {
+    // Pins the half-open window: [D, D+1). A closed-window mutation would
+    // also count the midnight-boundary decision of the next day.
+    const atStart = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ atIso: `${DAY}T00:00:00Z`, shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+    );
+    expect(atStart).toEqual({ status: 'fail', reason: 'carry-decision-differs', compared: 1, laxCarries: 1, stricterNoCarries: 0 });
+    const atNextStart = evaluateShadowPremergeCarry(
+      carryInput({ decisions: [decision({ atIso: '2026-11-17T00:00:00Z', shellCarry: 'not-carried', fleetCarry: 'carry' })] }),
+    );
+    expect(atNextStart).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 0, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('a fleetCarry unknown on D-1 is ignored and day D passes', () => {
+    // Pins "day-scoped before the fleet-unknown check": scoping after it
+    // would turn the off-day unknown into unknown/fleet-carry-unknown.
+    const result = evaluateShadowPremergeCarry(
+      carryInput({
+        decisions: [
+          decision({ pullRequest: 9, newHeadOid: 'fedcba9876543210fedcba9876543210fedcba98' }),
+          decision({ atIso: `${PREV_DAY}T12:00:00Z`, fleetCarry: 'unknown' }),
+        ],
+      }),
+    );
+    expect(result).toEqual({ status: 'pass', reason: 'carry-decisions-equal', compared: 1, laxCarries: 0, stricterNoCarries: 0 });
+  });
+
+  it('a decisions list over the cap is refused before any element is read', () => {
+    // The Proxy passes every descriptor check (the getOwnPropertyDescriptor
+    // and ownKeys traps are untouched), so the over-cap length is refused
+    // from the length descriptor and own key count alone: no index read —
+    // and no `get` trap — ever happens.
+    let indexGets = 0;
+    const element = decision();
+    const overCap = Array.from({ length: SHADOW_CARRY_MAX_DECISIONS + 1 }, () => element);
+    const proxy = new Proxy(overCap, {
+      get(target, property) {
+        if (typeof property === 'string' && /^\d+$/.test(property)) {
+          indexGets += 1;
+        }
+        return Reflect.get(target, property);
+      },
+    });
+    expectCarry(carryInput({ decisions: proxy }), { status: 'unknown', reason: 'invalid-input' });
+    expect(indexGets).toBe(0);
   });
 
   it('JSON.stringify of an evaluation carries no head oid or pull request number from the input', () => {
@@ -607,6 +677,17 @@ describe('evaluateShadowPremergeCarry: evaluation', () => {
 });
 
 describe('evaluateShadowPremergeCarry: hostile input', () => {
+  it('mutating one returned refusal leaves later calls unpoisoned', () => {
+    // The refusals are fresh objects per call: mutating one must never turn a
+    // later refusal into the mutated verdict.
+    const invalid = evaluateShadowPremergeCarry(null) as Record<string, unknown>;
+    invalid.status = 'pass';
+    const incomplete = evaluateShadowPremergeCarry(carryInput({ unknownLines: 2 })) as Record<string, unknown>;
+    incomplete.status = 'pass';
+    expectCarry(null, { status: 'unknown', reason: 'invalid-input' });
+    expectCarry(carryInput({ unknownLines: 2 }), { status: 'unknown', reason: 'shell-incomplete' });
+  });
+
   it('refuses null', () => {
     expectCarry(null, { status: 'unknown', reason: 'invalid-input' });
   });
@@ -623,8 +704,8 @@ describe('evaluateShadowPremergeCarry: hostile input', () => {
     expectCarry(carryInput({ decisions: 'not-a-list' }), { status: 'unknown', reason: 'invalid-input' });
   });
 
-  it('refuses a non-iterable object where a list is due', () => {
-    expectCarry(carryInput({ decisions: { length: 1, 0: decision() } }), { status: 'unknown', reason: 'invalid-input' });
+  it('refuses a real non-iterable object where a list is due (no length, no iterator)', () => {
+    expectCarry(carryInput({ decisions: { 0: decision() } }), { status: 'unknown', reason: 'invalid-input' });
   });
 
   it('refuses an array hole (a sparse array)', () => {
@@ -633,7 +714,7 @@ describe('evaluateShadowPremergeCarry: hostile input', () => {
     expectCarry(carryInput({ decisions: holey }), { status: 'unknown', reason: 'invalid-input' });
   });
 
-  it('refuses an array-like object', () => {
+  it('refuses a real array-like object (length and index, but not an array)', () => {
     const arrayLike = { length: 1, 0: decision() };
     expectCarry(carryInput({ decisions: arrayLike }), { status: 'unknown', reason: 'invalid-input' });
   });
@@ -719,9 +800,14 @@ describe('evaluateShadowPremergeCarry: hostile input', () => {
     expectCarry(carryInput({ decisions: proxy }), { status: 'unknown', reason: 'invalid-input' });
   });
 
-  it('refuses a prototype-polluting own key produced by JSON.parse', () => {
+  it('refuses an own __proto__ key even when the key count is exact', () => {
+    // Exactly the six allowed decision keys, with `pullRequest` replaced by
+    // `__proto__`: the key count passes, so the refusal must come from the
+    // polluting-key check itself, never from a count mismatch.
     const item = JSON.parse(JSON.stringify(decision())) as Record<string, unknown>;
+    delete item.pullRequest;
     Object.defineProperty(item, '__proto__', { value: null, enumerable: true, configurable: true });
+    expect(Object.keys(item)).toHaveLength(6);
     expectCarry(carryInput({ decisions: [item] }), { status: 'unknown', reason: 'invalid-input' });
   });
 

@@ -231,7 +231,14 @@ function readUpdatedEvent(
   }
 }
 
-/** The carry-decision cap for S5'; see the constant's comment for why it cannot drift. */
+/**
+ * The carry-decision cap for S5'. Each carry decision is paired from exactly
+ * one update intent and one result in the shell's events log, so a log of
+ * `SHADOW_SHELL_FACTS_MAX_EVENTS` events can carry at most half that many
+ * decisions. Deriving the cap from the extractor's event cap keeps the two
+ * from drifting: the extractor can never emit more decisions than events, and
+ * the evaluator refuses a list above this bound.
+ */
 export const SHADOW_CARRY_MAX_DECISIONS = SHADOW_SHELL_FACTS_MAX_EVENTS / 2;
 
 /** The S5' evaluation adds the replay counters to the shared criterion shape. */
@@ -263,6 +270,11 @@ const CARRY_ANOMALY_KEYS = ['atIso', 'code'] as const;
 const PAIRING_ANOMALY_CODES: readonly ShadowShellAnomalyCode[] = ['unpaired-update', 'unclassified-update'];
 const DAY_MS = 86_400_000;
 
+/**
+ * A FRESH unknown result per call: a returned refusal must never be a shared,
+ * mutable singleton, or one caller's mutation of it would poison every later
+ * call into accepting the mutated verdict.
+ */
 const REFUSAL = (reason: string): ShadowPremergeCarryEvaluation => ({
   status: 'unknown',
   reason,
@@ -270,8 +282,6 @@ const REFUSAL = (reason: string): ShadowPremergeCarryEvaluation => ({
   laxCarries: 0,
   stricterNoCarries: 0,
 });
-const INVALID_EVAL = REFUSAL('invalid-input');
-const SHELL_INCOMPLETE_EVAL = REFUSAL('shell-incomplete');
 const INVALID_PARSE = { ok: false, reason: 'invalid' } as const;
 const SHELL_INCOMPLETE_PARSE = { ok: false, reason: 'shell-incomplete' } as const;
 
@@ -289,7 +299,7 @@ export function evaluateShadowPremergeCarry(input: unknown): ShadowPremergeCarry
   try {
     return evaluateCarry(input);
   } catch {
-    return INVALID_EVAL;
+    return REFUSAL('invalid-input');
   }
 }
 
@@ -297,7 +307,7 @@ export function evaluateShadowPremergeCarry(input: unknown): ShadowPremergeCarry
 function evaluateCarry(input: unknown): ShadowPremergeCarryEvaluation {
   const parsed = parseCarryInput(input);
   if (!parsed.ok) {
-    return parsed.reason === 'invalid' ? INVALID_EVAL : SHELL_INCOMPLETE_EVAL;
+    return parsed.reason === 'invalid' ? REFUSAL('invalid-input') : REFUSAL('shell-incomplete');
   }
   const start = Date.parse(`${parsed.day}T00:00:00.000Z`);
   const end = start + DAY_MS;

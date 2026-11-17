@@ -181,6 +181,16 @@ describe('evaluateShadowChainsRetired', () => {
     expect(evaluateShadowChainsRetired(retired([], names))).toEqual(fail(0, SHADOW_CHAINS_MAX_ITEMS));
   });
 
+  it('a plain dense over-cap fleet list is unknown/invalid-input', () => {
+    const overCap = Array.from({ length: SHADOW_CHAINS_MAX_ITEMS + 1 }, () => 'landed');
+    expect(evaluateShadowChainsRetired(retired(overCap, []))).toEqual(INVALID);
+  });
+
+  it('a plain dense over-cap shell list is unknown/invalid-input', () => {
+    const overCap = Array.from({ length: SHADOW_CHAINS_MAX_ITEMS + 1 }, () => 'n');
+    expect(evaluateShadowChainsRetired(retired([], overCap))).toEqual(INVALID);
+  });
+
   it('a record that is not the exact three keys is unknown/invalid-input', () => {
     expect(
       evaluateShadowChainsRetired({ policy: { chainsKept: false }, fleetChainStates: [] }),

@@ -12,6 +12,7 @@ import type { DaemonEventProjectionPort } from '../../ports/out/DaemonEventProje
 import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { ForgeMergeReadPort } from '../../ports/out/ForgeMergeReadPort.out-port.js';
+import type { RefreshChainsPort } from '../../ports/in/RefreshChainsPort.in-port.js';
 import type {
   ChainAttentionCommand,
   ChainAttentionPort,
@@ -238,6 +239,7 @@ function makeHarness(overrides: {
   readonly newUlid?: () => string;
   readonly chainRefreshMode?: 'shadow' | 'invalid';
   readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
+  readonly chainRefresh?: RefreshChainsPort;
 } = {}): Harness {
   const status = new FakeStatus();
   if (overrides.previousStatus !== undefined) {
@@ -284,6 +286,7 @@ function makeHarness(overrides: {
       }),
     ...(overrides.chainRefreshMode !== undefined ? { chainRefreshMode: overrides.chainRefreshMode } : {}),
     ...(overrides.chainAttention !== undefined ? { chainAttention: overrides.chainAttention } : {}),
+    ...(overrides.chainRefresh !== undefined ? { chainRefresh: overrides.chainRefresh } : {}),
   };
   const useCase = new RunDaemonTickUseCase(deps);
   const run = (requestOverrides: Partial<RunDaemonTickRequest> = {}) =>
@@ -1171,5 +1174,60 @@ describe('RunDaemonTickUseCase invalid chain-refresh mode (CO8a)', () => {
 
     expect(result.exitCode).toBe(1);
     expect(result.status?.jobs[1]).toMatchObject({ outcome: 'refused', reasonCode: 'chain-refresh-attention-failed' });
+  });
+});
+
+describe('RunDaemonTickUseCase chain refresh under an operator halt (OG7b5)', () => {
+  const HALTED: ConductorHaltState = { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } };
+  const refreshJobId = `chain-refresh:${DIGEST_A}`;
+
+  function refreshAnswering(reasonCode: string): RefreshChainsPort {
+    return { runRefreshChains: async () => ({ outcome: 'refused', reasonCode, chains: [] }) };
+  }
+
+  it('a halted chain-refresh job is recorded skipped, the tick exits 0 and the status is healthy', async () => {
+    const h = makeHarness({ chainRefresh: refreshAnswering('halted') });
+    h.halt.state = HALTED;
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.status?.exitCode).toBe(0);
+    expect(result.status?.halted).toBe(true);
+    expect(result.status?.jobs[1]).toMatchObject({ jobId: refreshJobId, outcome: 'skipped', reasonCode: 'halted' });
+    expect(result.status?.jobs[0]).toMatchObject({ outcome: 'completed' });
+    const status = result.status;
+    if (status === null) {
+      throw new Error('expected a status record');
+    }
+    expect(evaluateDaemonStatusHealth(status, NOW)).toMatchObject({ healthy: true, exitCode: 0, reasons: [], refusedJobIds: [] });
+    expect(h.events.events.filter((event) => event.jobId === refreshJobId)).toEqual([
+      expect.objectContaining({ kind: 'job', outcome: 'skipped', reasonCode: 'halted' }),
+    ]);
+  });
+
+  it('a halted refusal with an unreadable halt marker stays refused and the tick exits 1', async () => {
+    const h = makeHarness({ chainRefresh: refreshAnswering('halted') });
+    h.halt.state = { state: 'unreadable' };
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.status?.jobs[1]).toMatchObject({ outcome: 'refused', reasonCode: 'halted' });
+    const status = result.status;
+    if (status === null) {
+      throw new Error('expected a status record');
+    }
+    expect(evaluateDaemonStatusHealth(status, NOW).reasons).toEqual(['job-refused']);
+  });
+
+  it('another refusal reason still exits 1 while the conductor is halted', async () => {
+    const h = makeHarness({ chainRefresh: refreshAnswering('invalid-request') });
+    h.halt.state = HALTED;
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.status?.jobs[1]).toMatchObject({ outcome: 'refused', reasonCode: 'invalid-request' });
   });
 });

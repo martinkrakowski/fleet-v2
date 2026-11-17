@@ -101,6 +101,7 @@ import {
   consumptionId,
   forgeActionScope,
   isSafeSshHost,
+  mergeQueueRepositoryDigest,
   observationEventKind,
   resolveExecutionRunnerHost,
   resolveInstallationForgeMode,
@@ -1443,7 +1444,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         computeDigest: sha256HexDigest,
         // The same repository derivation MergeQueueRepositoryAdapter and the
         // daemon's mergePolicySource use — never a second formula.
-        repoDigestOf: (repository) => sha256HexDigest(`${repository.owner}/${repository.repo}`).slice(0, 12),
+        repoDigestOf: mergeQueueRepositoryDigest,
         // OD-4: release binding is not yet built; SH8b and a later unit revisit
         // this constant once a release sha source exists.
         releaseSha: async () => null,

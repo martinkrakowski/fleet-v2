@@ -101,6 +101,22 @@ function journalEntry(init: JournalEntryInit): LaneRunJournalEntryRecord {
   } as LaneRunJournalEntryRecord;
 }
 
+type SyntheticStep = 'intent' | 'completed' | 'refused' | 'ambiguous';
+
+/**
+ * Entries for one non-merge key, in append order. S1 skips a key
+ * `parseLaneRunKey` does not accept; S9 still tallies it.
+ */
+function syntheticKey(key: string, steps: readonly SyntheticStep[]): LaneRunJournalEntryRecord[] {
+  const recordedAtIso = `${DAY}T11:00:00.000Z`;
+  return steps.map((step) => journalEntry({
+    kind: step === 'intent' ? 'intent' : 'result',
+    key,
+    ...(step === 'intent' ? {} : { outcome: step }),
+    recordedAtIso,
+  }));
+}
+
 function daemonJobEvent(index: number, day: string): DaemonEventRecord {
   const hour = String(Math.floor(index / 60) % 24).padStart(2, '0');
   const minute = String(index % 60).padStart(2, '0');
@@ -123,6 +139,8 @@ interface Fixture {
   readonly journalEntries: LaneRunJournalEntryRecord[];
   readonly queueEntries: MergeQueueEntryRecord[];
   readonly daemonEvents: DaemonEventRecord[];
+  /** The S9 state-check sample, overridable so two passes can differ only in `checked`. */
+  stateCheck: { checked: number; bad: number };
   /** The S8 shell-state read, overridable per test. */
   shellState: LegacyTrainStateRead;
   /** The S8 import dry-run's keys, overridable per test. */
@@ -202,6 +220,7 @@ function cleanFixture(day: string): Fixture {
     journalEntries,
     queueEntries,
     daemonEvents,
+    stateCheck: { checked: 5, bad: 0 },
     shellState: cleanShellState(),
     importKeys: cleanImportKeys(),
   };
@@ -314,7 +333,7 @@ function makeHarness(fixture: Fixture, nowIso: string): Harness {
     },
     checkState: async () => {
       otherCalls.checkState += 1;
-      return { checked: 5, bad: 0 };
+      return fixture.stateCheck;
     },
     importDryRun: {
       importTrainState: async () => {
@@ -400,8 +419,62 @@ function expectedS1Digest(day: string, status: string, reason: string, counts: {
   );
 }
 
-function expectedSimpleDigest(criterion: 'S9' | 'S12', day: string, status: string, reason: string): string {
-  return sha256HexDigest(JSON.stringify({ criterion, day, status, reason }));
+/**
+ * The canonical S9 summary digest, rebuilt here exactly as the use case
+ * builds it: S9 carries its evaluator's state-integrity counts into the
+ * digest, so two evaluations landing on the same {status, reason} pair are
+ * no longer indistinguishable to it.
+ */
+function expectedS9Digest(day: string, status: string, reason: string, counts: {
+  stateChecked: number;
+  stateBad: number;
+  journalKeys: number;
+  duplicateIntents: number;
+  duplicateResults: number;
+  resultsAfterFinal: number;
+  orphanResults: number;
+  unreconciledIntents: number;
+}): string {
+  return sha256HexDigest(
+    JSON.stringify({
+      criterion: 'S9',
+      day,
+      status,
+      reason,
+      stateChecked: counts.stateChecked,
+      stateBad: counts.stateBad,
+      journalKeys: counts.journalKeys,
+      duplicateIntents: counts.duplicateIntents,
+      duplicateResults: counts.duplicateResults,
+      resultsAfterFinal: counts.resultsAfterFinal,
+      orphanResults: counts.orphanResults,
+      unreconciledIntents: counts.unreconciledIntents,
+    }),
+  );
+}
+
+/**
+ * The canonical S12 summary digest, rebuilt here exactly as the use case
+ * builds it: S12 carries its evaluator's tick-health counts into the digest,
+ * so two evaluations landing on the same {status, reason} pair are no longer
+ * indistinguishable to it.
+ */
+function expectedS12Digest(day: string, status: string, reason: string, counts: {
+  totalTicks: number;
+  budgetOverruns: number;
+  starvedJobs: number;
+}): string {
+  return sha256HexDigest(
+    JSON.stringify({
+      criterion: 'S12',
+      day,
+      status,
+      reason,
+      totalTicks: counts.totalTicks,
+      budgetOverruns: counts.budgetOverruns,
+      starvedJobs: counts.starvedJobs,
+    }),
+  );
 }
 
 /**
@@ -495,9 +568,120 @@ describe('RecordShadowDayUseCase', () => {
       }),
       recordedAtIso: RECORDED_AT_ISO,
     });
-    expect(dayRecord?.verdicts.S9?.digest).toBe(expectedSimpleDigest('S9', DAY, 'pass', 'state-consistent'));
-    expect(dayRecord?.verdicts.S12?.digest).toBe(expectedSimpleDigest('S12', DAY, 'pass', 'ticks-within-budget'));
+    expect(dayRecord?.verdicts.S9).toEqual({
+      verdict: 'pass',
+      reason: 'state-consistent',
+      digest: expectedS9Digest(DAY, 'pass', 'state-consistent', {
+        stateChecked: 5,
+        stateBad: 0,
+        journalKeys: 1,
+        duplicateIntents: 0,
+        duplicateResults: 0,
+        resultsAfterFinal: 0,
+        orphanResults: 0,
+        unreconciledIntents: 0,
+      }),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(dayRecord?.verdicts.S12?.digest).toBe(expectedS12Digest(DAY, 'pass', 'ticks-within-budget', {
+      totalTicks: 800,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    }));
     expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('two S9 evaluations with the same pass/state-consistent and different stateChecked get different digests', async () => {
+    const fewerFixture = cleanFixture(DAY);
+    fewerFixture.stateCheck = { checked: 5, bad: 0 };
+    const moreFixture = cleanFixture(DAY);
+    moreFixture.stateCheck = { checked: 10, bad: 0 };
+    const harnessFewer = makeHarness(fewerFixture, NOW);
+    const harnessMore = makeHarness(moreFixture, NOW);
+    const resultFewer = await new RecordShadowDayUseCase(harnessFewer.deps).execute(makeRequest());
+    const resultMore = await new RecordShadowDayUseCase(harnessMore.deps).execute(makeRequest());
+    expectRecorded(resultFewer);
+    expectRecorded(resultMore);
+    expect(resultFewer.recorded.S9).toBe('pass');
+    expect(resultMore.recorded.S9).toBe('pass');
+
+    const digestFewer = harnessFewer.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S9?.digest;
+    const digestMore = harnessMore.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S9?.digest;
+    const shared = {
+      stateBad: 0,
+      journalKeys: 1,
+      duplicateIntents: 0,
+      duplicateResults: 0,
+      resultsAfterFinal: 0,
+      orphanResults: 0,
+      unreconciledIntents: 0,
+    };
+    expect(digestFewer).toBe(expectedS9Digest(DAY, 'pass', 'state-consistent', { stateChecked: 5, ...shared }));
+    expect(digestMore).toBe(expectedS9Digest(DAY, 'pass', 'state-consistent', { stateChecked: 10, ...shared }));
+    expect(digestFewer).not.toBe(digestMore);
+  });
+
+  it('two S9 evaluations whose duplicateIntents and duplicateResults are swapped get different digests', async () => {
+    // Pins a swap of those two fields in canonicalSummary. The clean fixture
+    // contributes one reconciled key. Each side then adds four keys so every
+    // other count matches: one side is 1 duplicate intent and 2 duplicate
+    // results, the other is those two counts swapped. A result-after-final
+    // that is not itself a duplicate result pads the smaller side, so
+    // resultsAfterFinal stays 2 either way. Swapping the two fields in the
+    // summary makes each digest equal the other's expected summary.
+    const shared = {
+      stateChecked: 5,
+      stateBad: 0,
+      journalKeys: 5,
+      resultsAfterFinal: 2,
+      orphanResults: 0,
+      unreconciledIntents: 0,
+    };
+    const intents1Results2 = { ...shared, duplicateIntents: 1, duplicateResults: 2 };
+    const intents2Results1 = { ...shared, duplicateIntents: 2, duplicateResults: 1 };
+    const withKeys = (keys: readonly (readonly [string, readonly SyntheticStep[]])[]): Fixture => {
+      const fixture = cleanFixture(DAY);
+      for (const [key, steps] of keys) {
+        fixture.journalEntries.push(...syntheticKey(key, steps));
+      }
+      return fixture;
+    };
+    const harnessOne = makeHarness(withKeys([
+      ['k-di', ['intent', 'intent', 'completed']],
+      ['k-dr-1', ['intent', 'completed', 'refused']],
+      ['k-dr-2', ['intent', 'completed', 'refused']],
+      ['k-quiet', ['intent', 'completed']],
+    ]), NOW);
+    const harnessTwo = makeHarness(withKeys([
+      ['k-di-1', ['intent', 'intent', 'completed']],
+      ['k-di-2', ['intent', 'intent', 'completed']],
+      ['k-dr', ['intent', 'completed', 'refused']],
+      ['k-raf', ['intent', 'completed', 'ambiguous']],
+    ]), NOW);
+    const resultOne = await new RecordShadowDayUseCase(harnessOne.deps).execute(makeRequest());
+    const resultTwo = await new RecordShadowDayUseCase(harnessTwo.deps).execute(makeRequest());
+    expectRecorded(resultOne);
+    expectRecorded(resultTwo);
+    expect(resultOne.recorded.S9).toBe('fail');
+    expect(resultTwo.recorded.S9).toBe('fail');
+
+    const dayOne = harnessOne.evidence.stored?.days.find((entry) => entry.day === DAY);
+    const dayTwo = harnessTwo.evidence.stored?.days.find((entry) => entry.day === DAY);
+    const expectedOne = expectedS9Digest(DAY, 'fail', 'journal-duplicate-intent', intents1Results2);
+    const expectedTwo = expectedS9Digest(DAY, 'fail', 'journal-duplicate-intent', intents2Results1);
+    expect(expectedOne).not.toBe(expectedTwo);
+    expect(dayOne?.verdicts.S9).toEqual({
+      verdict: 'fail',
+      reason: 'journal-duplicate-intent',
+      digest: expectedOne,
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(dayTwo?.verdicts.S9).toEqual({
+      verdict: 'fail',
+      reason: 'journal-duplicate-intent',
+      digest: expectedTwo,
+      recordedAtIso: RECORDED_AT_ISO,
+    });
   });
 
   it('answers unchanged when the same inputs are recorded a second time, without a second (no-op) compareAndSet call', async () => {
@@ -761,6 +945,62 @@ describe('RecordShadowDayUseCase', () => {
     // evidence like this would wrongly report 'unchanged' (the SH7b fix
     // round 2 finding this fix closes).
     expect(dayRecordA?.verdicts.S8?.digest).not.toBe(dayRecordB?.verdicts.S8?.digest);
+  });
+
+  it('two days with the same S12 pass/ticks-within-budget and different tick counts get different digests', async () => {
+    const fewerDay = DAY;
+    const moreDay = '2026-11-15';
+    const fewerFixture = cleanFixture(fewerDay);
+    const moreFixture = cleanFixture(moreDay);
+    const fewer = { ...fewerFixture, daemonEvents: fewerFixture.daemonEvents.slice(0, 720) };
+    const more = { ...moreFixture, daemonEvents: moreFixture.daemonEvents.slice(0, 721) };
+    const harnessFewer = makeHarness(fewer, NOW);
+    const harnessMore = makeHarness(more, NOW);
+    const resultFewer = await new RecordShadowDayUseCase(harnessFewer.deps).execute(makeRequest({ day: fewerDay }));
+    const resultMore = await new RecordShadowDayUseCase(harnessMore.deps).execute(makeRequest({ day: moreDay }));
+    expectRecorded(resultFewer);
+    expectRecorded(resultMore);
+    expect(resultFewer.recorded.S12).toBe('pass');
+    expect(resultMore.recorded.S12).toBe('pass');
+
+    const digestFewer = harnessFewer.evidence.stored?.days.find((entry) => entry.day === fewerDay)?.verdicts.S12?.digest;
+    const digestMore = harnessMore.evidence.stored?.days.find((entry) => entry.day === moreDay)?.verdicts.S12?.digest;
+    expect(digestFewer).toBe(expectedS12Digest(fewerDay, 'pass', 'ticks-within-budget', {
+      totalTicks: 720,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    }));
+    expect(digestMore).toBe(expectedS12Digest(moreDay, 'pass', 'ticks-within-budget', {
+      totalTicks: 721,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    }));
+    expect(digestFewer).not.toBe(digestMore);
+  });
+
+  it('equivalent S12 event sets in different orders produce the same digest', async () => {
+    const forward = cleanFixture(DAY);
+    const reversed = {
+      ...cleanFixture(DAY),
+      daemonEvents: cleanFixture(DAY).daemonEvents.slice().reverse(),
+    };
+    const harnessForward = makeHarness(forward, NOW);
+    const harnessReversed = makeHarness(reversed, NOW);
+    const resultForward = await new RecordShadowDayUseCase(harnessForward.deps).execute(makeRequest());
+    const resultReversed = await new RecordShadowDayUseCase(harnessReversed.deps).execute(makeRequest());
+    expectRecorded(resultForward);
+    expectRecorded(resultReversed);
+
+    const expected = expectedS12Digest(DAY, 'pass', 'ticks-within-budget', {
+      totalTicks: 800,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+    const digestForward = harnessForward.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S12?.digest;
+    const digestReversed = harnessReversed.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S12?.digest;
+    expect(digestForward).toBe(expected);
+    expect(digestReversed).toBe(expected);
+    expect(digestForward).toBe(digestReversed);
   });
 
   it('reports S8 unevaluated when the import dry-run is refused, still recording S1, S9 and S12', async () => {

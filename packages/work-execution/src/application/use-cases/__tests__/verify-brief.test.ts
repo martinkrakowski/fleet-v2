@@ -1,6 +1,7 @@
 // Lane CO18: VerifyBriefUseCase tests.
 import { describe, expect, it } from 'vitest';
 
+import { attemptIdForBrief } from '@fleet/evidence-and-acceptance';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type {
   AttemptArtifactPort,
@@ -799,7 +800,7 @@ describe('VerifyBriefUseCase', () => {
       {
         requestId: `brief-verify:${WORK_ORDER_ID}:${base.briefDigest.slice(0, 12)}`,
         kind: 'brief-verify',
-        attemptId: ATTEMPT_ID,
+        attemptId: attemptIdForBrief('proj-1', base.briefDigest),
         projectId: 'proj-1',
         candidateHeadSha: COMMIT,
         subject: {
@@ -956,6 +957,17 @@ describe('VerifyBriefUseCase', () => {
     expect(localResult.outcome).toBe('verified');
     expect(localDeps.manifestReads[0]?.recordedHost).toBeUndefined();
     expect(localDeps.fileReads[0]?.recordedHost).toBeUndefined();
+  });
+
+  it('returns unverified review-unverified with detail review-thrown when requestReview throws', async () => {
+    const thrown = await new VerifyBriefUseCase(depsWith({
+      reviews: () => Promise.reject(new Error('transport down')),
+    })).verifyBrief(fixture().request);
+    expect(thrown).toEqual({
+      outcome: 'unverified',
+      reason: 'review-unverified',
+      detail: 'review-thrown',
+    });
   });
 
   it('fails closed with digest-computation-failed when computeDigest is omitted rather than defaulting to the FNV test helper', async () => {

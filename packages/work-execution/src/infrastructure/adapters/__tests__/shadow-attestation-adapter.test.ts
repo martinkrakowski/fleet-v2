@@ -230,9 +230,12 @@ describe('ShadowAttestationAdapter', () => {
     const adapter = new ShadowAttestationAdapter({ stateDir: tempDir });
     const validNext = attestationLedger(1);
     class InstanceRequest {
-      revision = 1;
+      expectedRevision = 0;
       next = validNext;
     }
+    // Every field name and value is one the plain-object path would accept
+    // (`expectedRevision: 0` with a valid `next`), so the only reason left for
+    // the refusal is that the request is a class instance, not a plain object.
     expect(await adapter.compareAndSet(new InstanceRequest() as never)).toEqual({
       outcome: 'refused',
       reason: 'invalid-request',
@@ -471,6 +474,38 @@ describe('ShadowAttestationAdapter', () => {
         schemaVersion: SHADOW_ATTESTATION_SCHEMA_VERSION,
         revision: 1,
         attestations: [{ fact: 'no-such-fact' }],
+      }).status,
+    ).toBe('unreadable');
+    // Not spied: the adapter imports `readShadowAttestations` as a static ESM
+    // binding, so `vi.spyOn` on the module export cannot intercept the call.
+    // Instead this input is distinctive to the domain reader: the facts are in
+    // decreasing fact order (`SHADOW_ATTESTATION_FACTS` index must strictly
+    // increase), a rule only `readShadowAttestations` enforces. An inline copy
+    // in the adapter — plausibly checking only the fact names and record shape
+    // — would accept this ledger and fail the test, so the inspection provably
+    // goes through the domain reader.
+    expect(
+      inspectSingleShadowAttestations({
+        schemaVersion: SHADOW_ATTESTATION_SCHEMA_VERSION,
+        revision: 1,
+        attestations: [
+          {
+            fact: SHADOW_ATTESTATION_FACTS[2],
+            observedDay: DAY,
+            releaseSha: RELEASE_SHA,
+            reason: 'ok',
+            digest: DIGEST,
+            recordedAtIso: '2026-02-03T00:00:00.000Z',
+          },
+          {
+            fact: SHADOW_ATTESTATION_FACTS[0],
+            observedDay: DAY,
+            releaseSha: RELEASE_SHA,
+            reason: 'ok',
+            digest: DIGEST,
+            recordedAtIso: '2026-02-04T00:00:00.000Z',
+          },
+        ],
       }).status,
     ).toBe('unreadable');
   });

@@ -130,30 +130,52 @@ function intakeKeyIdentity(key: IntakeKey): string {
 }
 
 /**
- * `shellLive`'s sources (the shell's queue, parked and in-progress lines)
- * can legitimately name the same live PR twice: `cutover.ts`'s own doc
- * comment on the `inprogress` field records the crash-leftover case where a
- * PR has left the queue but not yet merged, while a stale `queue` line for
- * it lingers from an earlier crash. That is one live PR, not two, so this
- * dedupes by the same `(pullRequest, headOid, base)` identity
- * `shadow-day-intake.ts`'s `keyOf` already uses, keeping the first
- * occurrence — before `shellLive` is used in any comparison. Left
- * undeduplicated, `compareShadowEnqueueSets` would see the repeat as a
- * same-side duplicate and report it as an `invalid-item` divergence, which
- * can make S8 record a false divergence from a normal, documented shell
- * state alone.
+ * `shellLive`'s `queue` and `inprogress` sources can legitimately name the
+ * same live PR twice: `cutover.ts`'s own doc comment on the `inprogress`
+ * field records the crash-leftover case where a PR has left the queue but
+ * not yet merged, while a stale `queue` line for it lingers from an earlier
+ * crash. That is one live PR, not two — but it is the ONLY documented,
+ * legitimate cross-source overlap, so this collapses exactly that: one
+ * `queue`/`inprogress` pair per shared `(pullRequest, headOid, base)`
+ * identity (`intakeKeyIdentity`), nothing more.
+ *
+ * `parked` keys are never touched here: they pass straight into the result
+ * exactly as parsed, whether or not their identity also appears in `queue`
+ * or `inprogress`, because no doc comment names that combination as a
+ * known, legitimate overlap. A key repeated WITHIN one source alone (two
+ * `queue` lines naming the same PR, say) is likewise never touched, for the
+ * same reason — and that repeat is the genuine anomaly
+ * `compareShadowEnqueueSets`'s own duplicate detection (`invalid-item`)
+ * exists to catch. Collapsing either of those would silently hide a real
+ * divergence and let S8 record a false pass.
+ *
+ * Implemented as a multiset intersection: each `inprogress` key is dropped
+ * only while an as-yet-unmatched `queue` occurrence of the same identity
+ * remains, so a key present N times in each source is collapsed by exactly
+ * N pairs — never more, and never for an identity `queue` does not also
+ * carry.
  */
-function dedupeIntakeKeys(keys: readonly IntakeKey[]): readonly IntakeKey[] {
-  const seen = new Set<string>();
-  const deduped: IntakeKey[] = [];
-  for (const key of keys) {
+function mergeShellLiveSources(
+  queueKeys: readonly IntakeKey[],
+  parkedKeys: readonly IntakeKey[],
+  inprogressKeys: readonly IntakeKey[],
+): readonly IntakeKey[] {
+  const unmatchedQueueCount = new Map<string, number>();
+  for (const key of queueKeys) {
     const identity = intakeKeyIdentity(key);
-    if (!seen.has(identity)) {
-      seen.add(identity);
-      deduped.push(key);
-    }
+    unmatchedQueueCount.set(identity, (unmatchedQueueCount.get(identity) ?? 0) + 1);
   }
-  return deduped;
+  const keptInprogress: IntakeKey[] = [];
+  for (const key of inprogressKeys) {
+    const identity = intakeKeyIdentity(key);
+    const remaining = unmatchedQueueCount.get(identity) ?? 0;
+    if (remaining > 0) {
+      unmatchedQueueCount.set(identity, remaining - 1);
+      continue;
+    }
+    keptInprogress.push(key);
+  }
+  return [...parkedKeys, ...queueKeys, ...keptInprogress];
 }
 
 /** One S8 intake sample, shaped exactly for `evaluateShadowIntake`. */
@@ -469,47 +491,46 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
   /**
    * One S8 sample, assembled the same way the shadow-report command
    * assembles its shell live set: queue, parked and in-progress lines
-   * combined into `shellLive`; the fleet queue's live entries for this
-   * repository into `fleetLive` (each under its own recorded base, `main`
-   * when it has none); the import dry-run's would-import/already-queued
-   * keys into `importPresent`, null when the dry-run is refused or
-   * unavailable. The `complete` flag is false when any shell source has an
-   * unknown line or is genuinely unknown (unreadable, or the field itself
-   * missing), or `batchesEnabled` is unreadable or missing — never a
-   * guessed pass, but also never a false incomplete for the ordinary case
-   * where a source file legitimately does not exist (`'absent'`): that is a
-   * confident, known-empty read, exactly as `cutover.ts`'s own handling of
-   * `shellState.batch.status`/`batchesEnabled.status` treats it
-   * (`status === 'absent' ? 0 : ...`). `shellLive` is deduplicated by
-   * `(pullRequest, headOid, base)` identity right before it is returned:
-   * `cutover.ts`'s own doc comment on the `inprogress` field notes that the
-   * same PR/head can legitimately appear in both `queue` and `inprogress`
-   * after a crash (left the queue, has not yet merged, with a stale `queue`
-   * line still lingering) — a real, single live PR, not two. Left
-   * undeduplicated, `compareShadowEnqueueSets` sees that as a same-side
-   * duplicate and reports it as an `invalid-item` divergence instead of
-   * recognising one live entry, which can make S8 record a false
-   * divergence from this alone.
+   * parsed separately, then combined into `shellLive` by
+   * `mergeShellLiveSources`, which collapses ONLY the one documented
+   * cross-source overlap (`cutover.ts`'s own doc comment on the
+   * `inprogress` field: the same PR/head can legitimately appear in both
+   * `queue` and `inprogress` after a crash — one live PR, not two) and
+   * leaves every other repeat untouched, including a key repeated within a
+   * single source alone and any repeat involving `parked` — those are the
+   * genuine anomalies `compareShadowEnqueueSets`'s own `invalid-item`
+   * detection exists to catch, and collapsing them here would silently hide
+   * that anomaly and let S8 record a false pass. The fleet queue's live
+   * entries for this repository go into `fleetLive` (each under its own
+   * recorded base, `main` when it has none); the import dry-run's
+   * would-import/already-queued keys go into `importPresent`, null when the
+   * dry-run is refused or unavailable. The `complete` flag is false when any
+   * shell source has an unknown line or is genuinely unknown (unreadable, or
+   * the field itself missing), or `batchesEnabled` is unreadable or missing
+   * — never a guessed pass, but also never a false incomplete for the
+   * ordinary case where a source file legitimately does not exist
+   * (`'absent'`): that is a confident, known-empty read, exactly as
+   * `cutover.ts`'s own handling of `shellState.batch.status`/
+   * `batchesEnabled.status` treats it (`status === 'absent' ? 0 : ...`).
    */
   private async intakeSample(context: DayContext): Promise<IntakeSample> {
     const takenAtIso = this.deps.nowIso();
-    const shellLiveRaw: IntakeKey[] = [];
+    let queueKeys: readonly IntakeKey[] = [];
+    let parkedKeys: readonly IntakeKey[] = [];
+    let inprogressKeys: readonly IntakeKey[] = [];
     let complete = true;
     const stateRead = await this.call(
       context.deadlineIso,
       () => this.deps.legacy.readLegacyTrainState({ stateDir: context.legacyStateDir }),
     );
     if (stateRead.kind === 'value') {
-      const sources: readonly (readonly [LegacyTrainFileRead | undefined, boolean])[] = [
-        [stateRead.value.queue, false],
-        [stateRead.value.parked, true],
-        [stateRead.value.inprogress, false],
-      ];
-      for (const [read, parked] of sources) {
-        const parsed = this.parsedShellSource(read, parked);
-        complete = complete && !parsed.incomplete;
-        shellLiveRaw.push(...parsed.keys);
-      }
+      const queueParsed = this.parsedShellSource(stateRead.value.queue, false);
+      const parkedParsed = this.parsedShellSource(stateRead.value.parked, true);
+      const inprogressParsed = this.parsedShellSource(stateRead.value.inprogress, false);
+      complete = complete && !queueParsed.incomplete && !parkedParsed.incomplete && !inprogressParsed.incomplete;
+      queueKeys = queueParsed.keys;
+      parkedKeys = parkedParsed.keys;
+      inprogressKeys = inprogressParsed.keys;
       const batchesEnabled = stateRead.value.batchesEnabled;
       // A deny-list of the one genuinely-unknown status ('unreadable'), not
       // an allow-list of 'read' alone: 'absent' is a confident known-empty
@@ -521,7 +542,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     } else {
       complete = false;
     }
-    const shellLive = dedupeIntakeKeys(shellLiveRaw);
+    const shellLive = mergeShellLiveSources(queueKeys, parkedKeys, inprogressKeys);
     const fleetRead = await this.call(context.deadlineIso, () =>
       this.deps.queue.listMergeEntries({ repository: context.repository, deadlineIso: this.queryDeadline(context) }),
     );

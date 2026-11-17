@@ -890,6 +890,100 @@ describe('RecordShadowDayUseCase', () => {
     expectNotImplementedUnevaluated(result.unevaluated);
   });
 
+  it('keeps the documented queue/inprogress overlap collapsed to one entry, not two — same key in BOTH queue and inprogress, nowhere else (SH7b fix round 5; re-verifying round 4\'s own case still holds under the narrowed fix)', async () => {
+    const fixture = cleanFixture(DAY);
+    // Identical to round 4's own case: the clean fixture's queue already
+    // names PR 7 on `main`; naming it again on `inprogress` reproduces the
+    // documented crash-leftover overlap, nowhere else.
+    fixture.shellState = {
+      ...fixture.shellState,
+      inprogress: { status: 'read', lines: [`7 ${HEAD_A} main`] },
+    };
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    // Collapsed to one entry: the shell side carries PR 7 exactly once,
+    // identical to the clean fixture's own single-entry comparison, so S8
+    // reaches the same real pass — not a false divergence from a normal,
+    // documented shell state alone.
+    expect(result.recorded).toEqual({ S1: 'pass', S8: 'pass', S9: 'pass', S12: 'pass' });
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toEqual({
+      verdict: 'pass',
+      reason: 'intake-equal',
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
+        aFleetCount: 1,
+        aShellCount: 1,
+        aCompared: 1,
+        aDivergences: 0,
+        bFleetCount: 1,
+        bShellCount: 1,
+        bCompared: 1,
+        bDivergences: 0,
+      }),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('does NOT collapse the same key appearing TWICE within queue alone, nowhere else — a genuine duplicate, not the documented overlap, must still trip compareShadowEnqueueSets\'s invalid-item detection (SH7b fix round 5)', async () => {
+    const fixture = cleanFixture(DAY);
+    // The SAME queue line twice: not a queue/inprogress overlap (inprogress
+    // stays empty), and not a parked/queue overlap either — a plain,
+    // same-source repeat, which is the genuine anomaly
+    // `compareShadowEnqueueSets`'s own duplicate detection is designed to
+    // catch. Left broadly deduplicated (round 4's bug), this would collapse
+    // to one entry and S8 would wrongly record a clean pass, hiding a real
+    // anomaly in the shell's own queue file.
+    fixture.shellState = {
+      ...fixture.shellState,
+      queue: { status: 'read', lines: [`7 ${HEAD_A} main`, `7 ${HEAD_A} main`] },
+    };
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    // Both occurrences reach the comparator untouched, so its own
+    // same-side duplicate detection fires: PR 7's identity is excluded from
+    // both sides' maps and reported as an `invalid-item` divergence,
+    // persistent across both samples, which fails S8 with a real
+    // `enqueue-coverage-divergence` — never a false pass from a silently
+    // hidden duplicate.
+    expect(result.recorded.S8).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8?.verdict).toBe('fail');
+    expect(dayRecord?.verdicts.S8?.reason).toBe('enqueue-coverage-divergence');
+  });
+
+  it('does NOT collapse the same key appearing in both parked and queue — an undocumented, unapproved cross-source overlap, must still trip the same invalid-item detection (SH7b fix round 5)', async () => {
+    const fixture = cleanFixture(DAY);
+    // PR 7/HEAD_A/main named on `parked` (the shell's 6-field record: `pr
+    // head reason attempt notBefore base`) AND on `queue` (unchanged from
+    // the clean fixture), nowhere on `inprogress`. Only the queue/inprogress
+    // combination is documented as a legitimate overlap (`cutover.ts`'s own
+    // doc comment on the `inprogress` field) — a parked/queue repeat is not
+    // that case, and must be treated exactly like any other genuine
+    // duplicate.
+    fixture.shellState = {
+      ...fixture.shellState,
+      parked: { status: 'read', lines: [`7 ${HEAD_A} retry-timeout 0 0 main`] },
+    };
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    // Same mechanics as the within-queue duplicate above: both occurrences
+    // reach the comparator untouched, PR 7's identity is excluded from both
+    // sides' maps and reported `invalid-item`, persistent across both
+    // samples, failing S8 for real — never silently hidden by a dedupe that
+    // reaches past the one documented combination.
+    expect(result.recorded.S8).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8?.verdict).toBe('fail');
+    expect(dayRecord?.verdicts.S8?.reason).toBe('enqueue-coverage-divergence');
+  });
+
   it('reports S8 unevaluated, not a false import-divergence, when the import dry-run report is truncated (SH7b finding 2)', async () => {
     const fixture = cleanFixture(DAY);
     // Two shell live entries on `main`, both samples; the import dry-run is

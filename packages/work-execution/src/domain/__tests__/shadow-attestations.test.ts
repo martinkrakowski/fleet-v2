@@ -1114,6 +1114,45 @@ describe('evaluateShadowOneTimeCriteria (SH15b)', () => {
     expect(SHADOW_ONE_TIME_REQUIREMENTS.S11.facts).toEqual([]);
   });
 
+  it('SHADOW_ONE_TIME_CRITERIA is frozen', () => {
+    expect(Object.isFrozen(SHADOW_ONE_TIME_CRITERIA)).toBe(true);
+  });
+
+  it('a criterion that is not evaluated is never pass', () => {
+    // The frozen export cannot be emptied, so the skip is exercised through
+    // the iterator protocol instead: the loop still runs the module's own
+    // entry point, but visits every criterion except S3. The frozen export
+    // itself is never mutated.
+    const skip = 'S3';
+    const originalIterator = Array.prototype[Symbol.iterator];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the protocol hook is deliberately any-shaped
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the protocol hook is deliberately any-shaped
+    Array.prototype[Symbol.iterator] = function* (this: any): Generator<any, undefined, any> {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the protocol hook is deliberately any-shaped
+      const items: Iterator<any> = originalIterator.call(this);
+      let skipping = true;
+      for (let next = items.next(); !next.done; next = items.next()) {
+        if (skipping && this === SHADOW_ONE_TIME_CRITERIA && next.value === skip) {
+          skipping = false;
+          continue;
+        }
+        yield next.value;
+      }
+    };
+    let result: ReturnType<typeof evaluateShadowOneTimeCriteria>;
+    try {
+      result = evaluateShadowOneTimeCriteria(passingInput());
+    } finally {
+      Array.prototype[Symbol.iterator] = originalIterator;
+    }
+    expect(Object.isFrozen(SHADOW_ONE_TIME_CRITERIA)).toBe(true);
+    expect(SHADOW_ONE_TIME_CRITERIA).toEqual(['S2', 'S3', 'S10', 'S11']);
+    expect(result.S2).toEqual({ status: 'pass', reason: 'one-time-evidence-present' });
+    expect(result.S3.status).not.toBe('pass');
+    expect(result.S10).toEqual({ status: 'pass', reason: 'one-time-evidence-present' });
+    expect(result.S11).toEqual({ status: 'pass', reason: 'one-time-evidence-present' });
+  });
+
   it('is not satisfiable by a constant verdict', () => {
     const passing = evaluateShadowOneTimeCriteria(passingInput());
     const failing = evaluateShadowOneTimeCriteria(

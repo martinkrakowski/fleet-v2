@@ -427,7 +427,8 @@ function readMatchingString(value: unknown, pattern: RegExp): string | null {
   return value;
 }
 
-export const SHADOW_ONE_TIME_CRITERIA = ['S2', 'S3', 'S10', 'S11'] as const;
+/** Frozen so a caller cannot empty it and skip criteria; `evaluateAll` also fails closed below. */
+export const SHADOW_ONE_TIME_CRITERIA = Object.freeze(['S2', 'S3', 'S10', 'S11'] as const);
 
 type ShadowOneTimeCriterion = (typeof SHADOW_ONE_TIME_CRITERIA)[number];
 
@@ -487,6 +488,8 @@ const NOT_YET_RANK = 6;
 const PRESENT_RANK = 7;
 
 const INVALID_INPUT: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'invalid-input' });
+/** Fail-closed seed: a criterion the loop never visits must never report pass. */
+const NOT_EVALUATED: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'not-evaluated' });
 const ATTESTATIONS_UNREADABLE: ShadowCriterionEvaluation = Object.freeze({
   status: 'unknown',
   reason: 'attestations-unreadable',
@@ -682,10 +685,10 @@ function readTestPath(value: unknown): string | null {
 /** Each criterion from its requirement row. Cost: linear in the capped input. */
 function evaluateAll(facts: OneTimeFacts): ShadowOneTimeEvaluations {
   const evaluations: Record<ShadowOneTimeCriterion, ShadowCriterionEvaluation> = {
-    S2: EVIDENCE_PRESENT,
-    S3: EVIDENCE_PRESENT,
-    S10: EVIDENCE_PRESENT,
-    S11: EVIDENCE_PRESENT,
+    S2: NOT_EVALUATED,
+    S3: NOT_EVALUATED,
+    S10: NOT_EVALUATED,
+    S11: NOT_EVALUATED,
   };
   for (const criterion of SHADOW_ONE_TIME_CRITERIA) {
     evaluations[criterion] = evaluateCriterion(SHADOW_ONE_TIME_REQUIREMENTS[criterion], facts);

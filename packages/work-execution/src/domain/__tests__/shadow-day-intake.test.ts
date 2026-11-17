@@ -225,10 +225,33 @@ describe('shadow day intake (S8)', () => {
     expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
   });
 
-  it('a getter on the samples list never runs', () => {
+  it('a getter nested inside the samples-list stand-in never runs', () => {
     const counter = { calls: 0 };
     const withGetter = withCountingGetter({ length: 2, 0: sample(), 1: sample() }, 'samples', counter);
     expect(evaluateShadowIntake({ samples: withGetter })).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(counter.calls).toBe(0);
+  });
+
+  it("a getter on the root's own samples property never runs", () => {
+    // Luna finding (SH5c): the test above plants its getter inside the value
+    // nested at `samples`, never on the root input's own `samples` property.
+    // This is the root-level case the file's own "Hostile input" paragraph
+    // calls for: `readExactPlainRecord` must read `samples` only through its
+    // own property descriptor, never through a plain `value.samples` access
+    // that would run an accessor. If the root object's own `samples` key is
+    // an accessor rather than a plain data property, the getter must never
+    // run and the result must still be `samples-invalid`.
+    const counter = { calls: 0 };
+    const validSamples = [sample(), sample({ takenAtIso: T10 })];
+    const root: Record<string, unknown> = {};
+    Object.defineProperty(root, 'samples', {
+      enumerable: true,
+      get() {
+        counter.calls += 1;
+        return validSamples;
+      },
+    });
+    expect(evaluateShadowIntake(root)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
     expect(counter.calls).toBe(0);
   });
 

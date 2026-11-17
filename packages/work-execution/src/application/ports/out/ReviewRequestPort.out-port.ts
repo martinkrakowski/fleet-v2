@@ -38,6 +38,14 @@ export interface ReviewRequest {
   readonly reviewerModel: string;
   /** The frozen brief; forwarded with `kind: 'brief-check'` and required for an active `kind: 'brief-verify'`, capped at 64 KiB. */
   readonly briefText?: string;
+  /**
+   * Required for an active `kind: 'brief-verify'`: the raw manifest bytes the
+   * frozen brief digest covers. The frozen-brief digest is
+   * `computeBriefPackageDigest({ prose, manifestRaw })` — `prose + '\n' +
+   * manifestRaw` — so a `brief-verify` request that carries only the prose
+   * can never be bound to the subject's `briefPackageDigest` and is refused.
+   */
+  readonly briefManifestRaw?: string;
   /** Only forwarded with a chain subject: the scope in a few words (no path, no diff text), capped at 2 KiB. */
   readonly diffSummary?: string;
   readonly nowIso?: string;

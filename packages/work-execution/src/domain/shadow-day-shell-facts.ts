@@ -330,13 +330,13 @@ function parseCarryInput(input: unknown): ParsedCarryInput | { ok: false; reason
   if (!isCarryCount(unknownLines)) {
     return INVALID_PARSE;
   }
-  const decisions = boundedCarryList(record.decisions, SHADOW_CARRY_MAX_DECISIONS);
-  const anomalies = boundedCarryList(record.anomalies, SHADOW_SHELL_FACTS_MAX_EVENTS);
-  if (decisions === null || anomalies === null) {
+  const boundedDecisions = boundedCarryList(record.decisions, SHADOW_CARRY_MAX_DECISIONS);
+  const boundedAnomalies = boundedCarryList(record.anomalies, SHADOW_SHELL_FACTS_MAX_EVENTS);
+  if (boundedDecisions === null || boundedAnomalies === null) {
     return INVALID_PARSE;
   }
-  const readDecisions = collectCarryItems(decisions, readCarryDecision);
-  const readAnomalies = collectCarryItems(anomalies, readCarryAnomaly);
+  const readDecisions = collectCarryItems(boundedDecisions.list, boundedDecisions.length, readCarryDecision);
+  const readAnomalies = collectCarryItems(boundedAnomalies.list, boundedAnomalies.length, readCarryAnomaly);
   if (readDecisions === null || readAnomalies === null) {
     return INVALID_PARSE;
   }
@@ -368,7 +368,10 @@ function isCarryCount(value: unknown): value is number {
  * A real, dense array of `Array.prototype` within `cap`, refused from its own
  * length descriptor and own key count alone, before any element is touched.
  */
-function boundedCarryList(value: unknown, cap: number): readonly unknown[] | null {
+function boundedCarryList(
+  value: unknown,
+  cap: number,
+): { list: readonly unknown[]; length: number } | null {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     return null;
   }
@@ -386,7 +389,9 @@ function boundedCarryList(value: unknown, cap: number): readonly unknown[] | nul
   ) {
     return null;
   }
-  return value as readonly unknown[];
+  // The length is captured here and never read off the list again: a Proxy
+  // `get` trap could otherwise answer a different `.length` inside the loop.
+  return { list: value as readonly unknown[], length };
 }
 
 /** The own data-property element at `index`; a hole or an accessor reads as undefined. */
@@ -398,10 +403,11 @@ function carryElement(list: readonly unknown[], index: number): unknown {
 /** Every element through `read`, or null at the first one out of shape. */
 function collectCarryItems<T>(
   list: readonly unknown[],
+  length: number,
   read: (raw: unknown) => T | null,
 ): readonly T[] | null {
   const out: T[] = [];
-  for (let index = 0; index < list.length; index += 1) {
+  for (let index = 0; index < length; index += 1) {
     const item = read(carryElement(list, index));
     if (item === null) {
       return null;

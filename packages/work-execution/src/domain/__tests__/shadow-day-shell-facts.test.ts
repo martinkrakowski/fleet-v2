@@ -673,6 +673,52 @@ describe('evaluateShadowPremergeCarry: hostile input', () => {
     expect(getTraps).toBe(0);
   });
 
+  it('a decisions Proxy whose get reports 0 for length still sees the differing decision and fails', () => {
+    const list = [decision({ shellCarry: 'not-carried', fleetCarry: 'carry' })];
+    const proxy = new Proxy(list, {
+      get(target, property) {
+        if (property === 'length') {
+          return 0;
+        }
+        return Reflect.get(target, property);
+      },
+    });
+    expectCarry(carryInput({ decisions: proxy }), {
+      status: 'fail', reason: 'carry-decision-differs', compared: 1, laxCarries: 1, stricterNoCarries: 0,
+    });
+  });
+
+  it('an anomalies Proxy whose get reports 0 for length still sees the pairing anomaly', () => {
+    const list = [{ atIso: AT, code: 'unpaired-update' }];
+    const proxy = new Proxy(list, {
+      get(target, property) {
+        if (property === 'length') {
+          return 0;
+        }
+        return Reflect.get(target, property);
+      },
+    });
+    expectCarry(carryInput({ anomalies: proxy }), { status: 'unknown', reason: 'carry-pairing-incomplete' });
+  });
+
+  it('a decisions Proxy whose getPrototypeOf trap throws gives invalid-input, never throwing', () => {
+    const proxy = new Proxy([decision()], {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf');
+      },
+    });
+    expectCarry(carryInput({ decisions: proxy }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('a decisions Proxy whose ownKeys trap throws gives invalid-input, never throwing', () => {
+    const proxy = new Proxy([decision()], {
+      ownKeys() {
+        throw new Error('hostile ownKeys');
+      },
+    });
+    expectCarry(carryInput({ decisions: proxy }), { status: 'unknown', reason: 'invalid-input' });
+  });
+
   it('refuses a prototype-polluting own key produced by JSON.parse', () => {
     const item = JSON.parse(JSON.stringify(decision())) as Record<string, unknown>;
     Object.defineProperty(item, '__proto__', { value: null, enumerable: true, configurable: true });

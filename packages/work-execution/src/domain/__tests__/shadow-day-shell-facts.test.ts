@@ -680,9 +680,9 @@ describe('evaluateShadowPremergeCarry: hostile input', () => {
   it('mutating one returned refusal leaves later calls unpoisoned', () => {
     // The refusals are fresh objects per call: mutating one must never turn a
     // later refusal into the mutated verdict.
-    const invalid = evaluateShadowPremergeCarry(null) as Record<string, unknown>;
+    const invalid = evaluateShadowPremergeCarry(null) as unknown as Record<string, unknown>;
     invalid.status = 'pass';
-    const incomplete = evaluateShadowPremergeCarry(carryInput({ unknownLines: 2 })) as Record<string, unknown>;
+    const incomplete = evaluateShadowPremergeCarry(carryInput({ unknownLines: 2 })) as unknown as Record<string, unknown>;
     incomplete.status = 'pass';
     expectCarry(null, { status: 'unknown', reason: 'invalid-input' });
     expectCarry(carryInput({ unknownLines: 2 }), { status: 'unknown', reason: 'shell-incomplete' });

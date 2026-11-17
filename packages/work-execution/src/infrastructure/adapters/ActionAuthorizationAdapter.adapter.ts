@@ -27,6 +27,7 @@ import type {
   ResolveActionAuthorizationResult,
 } from '../../application/ports/out/ActionAuthorizationPort.out-port.js';
 import { readRecordSchemaVersion } from '../../domain/record-schema-version.js';
+import { RELEASE_ACTION_KINDS } from '../../domain/coordination-keys.js';
 
 /** The stored grant record version this adapter writes; `1` (or absent) is still read. */
 export const ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION = 2 as const;
@@ -40,6 +41,11 @@ export interface ActionAuthorizationGrantEntry {
   readonly schemaVersion?: 1 | 2;
   /** Attempt the grant is bound to; absent only on a legacy `1` grant. */
   readonly attemptId?: string;
+  /**
+   * The release root the grant is bound to (CO14 follow-up); only a release
+   * grant carries one. A resolve or consumption naming another root is refused.
+   */
+  readonly releaseRoot?: string;
   /** Head the grant applies to; a moved head is out of scope. */
   readonly expectedHeadSha: string;
   /** Action kind the grant was issued for. */
@@ -77,6 +83,13 @@ export interface ActionAuthorizationDelegate {
 }
 
 const FORGE_ACTION_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status'] as const;
+/**
+ * Every action kind a request at this boundary may name (CO14): the forge
+ * kinds and the three release kinds. A release grant is resolved and consumed
+ * through the same port as a forge grant; the scope gate that keeps the two
+ * apart lives in the release delegate, not here.
+ */
+const ACTION_KINDS = [...FORGE_ACTION_KINDS, ...RELEASE_ACTION_KINDS] as const;
 
 const MAX_GRANT_ID_LENGTH = 256;
 const MAX_ACTION_ID_LENGTH = 512;
@@ -84,6 +97,7 @@ const MAX_SCOPE_ID_LENGTH = 256;
 const MAX_HEAD_LENGTH = 64;
 const MAX_POLICY_REVISION_LENGTH = 256;
 const MAX_REASON_LENGTH = 300;
+const MAX_ROOT_LENGTH = 4096;
 
 const PATH_SHAPE = /(?:^|[\s"'(=])(?:\/[A-Za-z0-9._-]+){2,}|[A-Za-z]:\\/;
 const SAFE_HEAD_TOKEN = /^[A-Za-z0-9._-]+$/;
@@ -201,7 +215,14 @@ export function parseActionAuthorizationGrantEntry(raw: unknown): ParsedActionAu
   }
 }
 
-const GRANT_FIELD_KEYS = ['schemaVersion', 'attemptId', 'expectedHeadSha', 'kind', 'consumedByActionId'] as const;
+const GRANT_FIELD_KEYS = [
+  'schemaVersion',
+  'attemptId',
+  'releaseRoot',
+  'expectedHeadSha',
+  'kind',
+  'consumedByActionId',
+] as const;
 
 /**
  * One snapshot of the stored grant: each field's own descriptor is read exactly
@@ -254,12 +275,37 @@ function parseGrantUnchecked(source: unknown): ParsedActionAuthorizationGrantRea
   if (attempt.state === 'invalid') {
     return { ok: false, reason: 'malformed' };
   }
+  // CO14 follow-up: a release grant may carry the root it is bound to. A
+  // present-but-hostile root is a malformed record, never a root that matches
+  // everything.
+  const root = ownDataDescriptor(record, 'releaseRoot');
+  if (root.state === 'invalid') {
+    return { ok: false, reason: 'malformed' };
+  }
+  let releaseRoot: string | undefined;
+  if (root.state === 'data' && root.value !== undefined) {
+    if (typeof root.value !== 'string') {
+      return { ok: false, reason: 'malformed' };
+    }
+    const value = root.value;
+    if (
+      value.length === 0 ||
+      value.length > MAX_ROOT_LENGTH ||
+      !value.startsWith('/') ||
+      value.includes('\0') ||
+      /[\p{C}]/u.test(value) ||
+      value.split('/').includes('..')
+    ) {
+      return { ok: false, reason: 'malformed' };
+    }
+    releaseRoot = value;
+  }
   const attemptDeclared =
     schemaVersion === 2 || (attempt.state === 'data' && attempt.value !== undefined);
 
   const read = readPlainRecord(record, {
     schemaVersion: { kind: 'integer', min: 1, max: 2, optional: true },
-    kind: { kind: 'literal', values: FORGE_ACTION_KINDS },
+    kind: { kind: 'literal', values: ACTION_KINDS },
     expectedHeadSha: { kind: 'string', maxLength: MAX_HEAD_LENGTH },
     ...(attemptDeclared ? { attemptId: { kind: 'string' as const, maxLength: MAX_SCOPE_ID_LENGTH } } : {}),
   });
@@ -284,6 +330,7 @@ function parseGrantUnchecked(source: unknown): ParsedActionAuthorizationGrantRea
     grant: {
       schemaVersion,
       ...(attemptDeclared && attemptId !== undefined ? { attemptId } : {}),
+      ...(releaseRoot !== undefined ? { releaseRoot } : {}),
       expectedHeadSha,
       kind,
       consumedByActionId: consumed.value,
@@ -301,13 +348,43 @@ function failureOf(reason: string): RequestFailure {
   return reason === 'too-long' ? 'too-large' : 'invalid-request';
 }
 
+/**
+ * A bounded release root coordinate (CO14 follow-up): an absolute path-shaped
+ * runtime input, read descriptor-safely. It is validated here so a
+ * wrong-typed, oversized or hostile root is a typed refusal, never a thrown
+ * error and never an empty root that matches anything. A root is a path by
+ * design, so the path-shape output rule does not apply to it; it is never
+ * echoed into a result, message or log.
+ */
+function readOptionalRootPath(source: object, key: string): Validated<string | undefined> {
+  const field = ownDataDescriptor(source, key);
+  if (field.state === 'absent' || (field.state === 'data' && field.value === undefined)) {
+    return { ok: true, value: undefined };
+  }
+  if (field.state === 'invalid' || typeof field.value !== 'string') {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  const value = field.value;
+  if (
+    value.length === 0 ||
+    value.length > MAX_ROOT_LENGTH ||
+    !value.startsWith('/') ||
+    value.includes('\0') ||
+    /[\p{C}]/u.test(value) ||
+    value.split('/').includes('..')
+  ) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  return { ok: true, value };
+}
+
 function readResolveRequest(request: unknown): Validated<ResolveActionAuthorizationRequest> {
   const read = readPlainRecord(request, {
     actionId: { kind: 'string', maxLength: MAX_ACTION_ID_LENGTH },
     projectId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
     workOrderId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
     attemptId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
-    actionKind: { kind: 'literal', values: FORGE_ACTION_KINDS },
+    actionKind: { kind: 'literal', values: ACTION_KINDS },
     expectedHeadSha: { kind: 'string', maxLength: MAX_HEAD_LENGTH },
     policyRevision: { kind: 'string', maxLength: MAX_POLICY_REVISION_LENGTH },
   });
@@ -325,7 +402,22 @@ function readResolveRequest(request: unknown): Validated<ResolveActionAuthorizat
   ) {
     return { ok: false, reason: 'invalid-request' };
   }
-  return { ok: true, value: { ...value } };
+  const releaseRoot = readOptionalRootPath(request as object, 'releaseRoot');
+  if (!releaseRoot.ok) {
+    return releaseRoot;
+  }
+  // CO14 follow-up: the resolve carries the deterministic action id it is
+  // resuming, so a grant already durably consumed by exactly this action id
+  // resolves again and a crash between the consumption and the release's own
+  // write is recoverable on the next pass.
+  return {
+    ok: true,
+    value: {
+      ...value,
+      ...(releaseRoot.value !== undefined ? { releaseRoot: releaseRoot.value } : {}),
+      resumeActionId: value.actionId,
+    },
+  };
 }
 
 function readOptionalRequestString(
@@ -354,7 +446,7 @@ function readConsumeRequest(request: unknown): Validated<ConsumeActionAuthorizat
   const read = readPlainRecord(request, {
     authorizationGrantId: { kind: 'string', maxLength: MAX_GRANT_ID_LENGTH },
     actionId: { kind: 'string', maxLength: MAX_ACTION_ID_LENGTH },
-    actionKind: { kind: 'literal', values: FORGE_ACTION_KINDS },
+    actionKind: { kind: 'literal', values: ACTION_KINDS },
   });
   if (!read.ok) {
     return { ok: false, reason: failureOf(read.reason) };
@@ -378,6 +470,10 @@ function readConsumeRequest(request: unknown): Validated<ConsumeActionAuthorizat
   if (!attemptId.ok) {
     return attemptId;
   }
+  const releaseRoot = readOptionalRootPath(source, 'releaseRoot');
+  if (!releaseRoot.ok) {
+    return releaseRoot;
+  }
   return {
     ok: true,
     value: {
@@ -386,6 +482,7 @@ function readConsumeRequest(request: unknown): Validated<ConsumeActionAuthorizat
       actionKind: required.actionKind,
       ...(expectedHeadSha.value !== undefined ? { expectedHeadSha: expectedHeadSha.value } : {}),
       ...(attemptId.value !== undefined ? { attemptId: attemptId.value } : {}),
+      ...(releaseRoot.value !== undefined ? { releaseRoot: releaseRoot.value } : {}),
     },
   };
 }
@@ -486,7 +583,17 @@ function readDelegateResolveResult(
     if (!granted.ok || !isSafeId(granted.value.authorizationGrantId, MAX_GRANT_ID_LENGTH, true)) {
       return null;
     }
-    return { outcome: 'granted', authorizationGrantId: granted.value.authorizationGrantId as string };
+    // A release grant's root binding travels with the granted answer; an
+    // invalid one makes the whole answer unreadable.
+    const root = readOptionalRootPath(answer as object, 'releaseRoot');
+    if (!root.ok) {
+      return null;
+    }
+    return {
+      outcome: 'granted',
+      authorizationGrantId: granted.value.authorizationGrantId as string,
+      ...(root.value !== undefined ? { releaseRoot: root.value } : {}),
+    };
   }
   const withReason = readPlainRecord(answer, {
     reason: { kind: 'string', maxLength: MAX_REASON_LENGTH },
@@ -673,45 +780,103 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
     if (grants.size > MAX_ACTION_AUTHORIZATION_GRANTS) {
       return { outcome: 'blocked', reason: 'too-large' };
     }
-    // Every record is read before any is matched: one unreadable or unknown-version
-    // record fails the whole store closed instead of being skipped.
+    const scan = this.scanGrantsForMatch(grants, request);
+    if ('blocked' in scan) {
+      return scan.blocked;
+    }
+    const { match, rootConflict, consumedByOther } = scan;
+    if (match === undefined) {
+      return {
+        outcome: 'blocked',
+        reason: !consumedByOther && rootConflict ? 'release-grant-root-mismatch' : 'no-matching-grant',
+      };
+    }
+    this.bindGrantInPlace(grants, match, request);
+    return {
+      outcome: 'granted',
+      authorizationGrantId: match.id,
+      ...(match.grant.releaseRoot !== undefined
+        ? { releaseRoot: match.grant.releaseRoot }
+        : request.releaseRoot !== undefined
+          ? { releaseRoot: request.releaseRoot }
+          : {}),
+    };
+  }
+
+  /**
+   * Every record is read before any is matched: one unreadable or unknown-version
+   * record fails the whole store closed instead of being skipped.
+   */
+  private scanGrantsForMatch(
+    grants: Map<string, ActionAuthorizationGrantEntry>,
+    request: ResolveActionAuthorizationRequest,
+  ):
+    | { readonly blocked: ResolveActionAuthorizationResult }
+    | {
+        readonly match: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry } | undefined;
+        readonly rootConflict: boolean;
+        readonly consumedByOther: boolean;
+      } {
     let match: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry } | undefined;
+    let rootConflict = false;
+    let consumedByOther = false;
     for (const [rawGrantId, rawEntry] of grants) {
       if (!isSafeId(rawGrantId, MAX_GRANT_ID_LENGTH, true)) {
-        return { outcome: 'blocked', reason: 'invalid-grant-record' };
+        return { blocked: { outcome: 'blocked', reason: 'invalid-grant-record' } };
       }
       const parsed = parseActionAuthorizationGrantEntry(rawEntry);
       if (!parsed.ok) {
         return {
-          outcome: 'blocked',
-          reason: parsed.reason === 'unknown-schema-version' ? 'unknown-grant-schema-version' : 'invalid-grant-record',
+          blocked: {
+            outcome: 'blocked',
+            reason: parsed.reason === 'unknown-schema-version' ? 'unknown-grant-schema-version' : 'invalid-grant-record',
+          },
         };
       }
       const grant = parsed.grant;
-      if (
-        match === undefined &&
-        grant.consumedByActionId === null &&
+      const structural =
         grant.kind === request.actionKind &&
         grant.expectedHeadSha === request.expectedHeadSha &&
-        (grant.attemptId === undefined || grant.attemptId === request.attemptId)
-      ) {
-        match = { id: rawGrantId, grant };
+        (grant.attemptId === undefined || grant.attemptId === request.attemptId);
+      if (!structural) {
+        continue;
       }
+      if (grant.releaseRoot !== undefined && grant.releaseRoot !== request.releaseRoot) {
+        // CO14 follow-up: a grant bound to one root never resolves for
+        // another; the mismatch is a typed refusal, never a silent skip.
+        rootConflict = true;
+        continue;
+      }
+      if (isResolvableGrant(grant, request)) {
+        match = { id: rawGrantId, grant };
+        continue;
+      }
+      consumedByOther = true;
     }
-    if (match === undefined) {
-      return { outcome: 'blocked', reason: 'no-matching-grant' };
+    return { match, rootConflict, consumedByOther };
+  }
+
+  private bindGrantInPlace(
+    grants: Map<string, ActionAuthorizationGrantEntry>,
+    match: { readonly id: string; readonly grant: ActionAuthorizationGrantEntry },
+    request: ResolveActionAuthorizationRequest,
+  ): void {
+    if (match.grant.attemptId !== undefined && !(request.releaseRoot !== undefined && match.grant.releaseRoot === undefined)) {
+      return;
     }
-    if (match.grant.attemptId === undefined) {
-      // A legacy grant binds to the first attempt that resolves it.
-      grants.set(match.id, {
-        schemaVersion: ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION,
-        attemptId: request.attemptId,
-        expectedHeadSha: match.grant.expectedHeadSha,
-        kind: match.grant.kind,
-        consumedByActionId: null,
-      });
-    }
-    return { outcome: 'granted', authorizationGrantId: match.id };
+    // A legacy grant binds to the first attempt that resolves it, and a
+    // release grant without a recorded root binds to the first root that
+    // resolves it (CO14 follow-up); both bindings persist in place, so a
+    // bound grant can never be moved to another attempt or root afterwards.
+    const needsAttempt = match.grant.attemptId === undefined;
+    grants.set(match.id, {
+      schemaVersion: needsAttempt ? ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION : match.grant.schemaVersion,
+      attemptId: match.grant.attemptId ?? request.attemptId,
+      ...(request.releaseRoot !== undefined ? { releaseRoot: request.releaseRoot } : {}),
+      expectedHeadSha: match.grant.expectedHeadSha,
+      kind: match.grant.kind,
+      consumedByActionId: match.grant.consumedByActionId,
+    });
   }
 
   private consumeLocally(
@@ -758,12 +923,23 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
       }
     }
+    // CO14 follow-up: the supplied and stored roots must match whenever either
+    // is present. A root-bound grant is never consumed for another root, nor by
+    // a consumption that omits the root; a root the grant never recorded cannot
+    // be verified here either.
+    if (
+      (request.releaseRoot !== undefined || grant.releaseRoot !== undefined) &&
+      grant.releaseRoot !== request.releaseRoot
+    ) {
+      return { outcome: 'refused', reason: 'release-grant-root-mismatch' };
+    }
     if (grant.consumedByActionId === null) {
       const boundAttemptId = grant.attemptId ?? request.attemptId;
       grants.set(request.authorizationGrantId, {
         // A record without an attempt stays a legacy `1` record: `2` requires `attemptId`.
         schemaVersion: boundAttemptId !== undefined ? ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION : 1,
         ...(boundAttemptId !== undefined ? { attemptId: boundAttemptId } : {}),
+        ...(grant.releaseRoot !== undefined ? { releaseRoot: grant.releaseRoot } : {}),
         expectedHeadSha: grant.expectedHeadSha,
         kind: grant.kind,
         consumedByActionId: request.actionId,
@@ -779,4 +955,17 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
       reason: `Authorization grant already consumed by action ${grant.consumedByActionId}`,
     };
   }
+}
+
+/**
+ * An unconsumed grant resolves. CO14 follow-up: a release grant already consumed
+ * by exactly this resolve's deterministic action id resolves again idempotently,
+ * so a crash between the consumption and the release's write is recoverable on
+ * the next pass. A different action id never resumes a consumed grant.
+ */
+function isResolvableGrant(grant: ActionAuthorizationGrantEntry, request: ResolveActionAuthorizationRequest): boolean {
+  if (grant.consumedByActionId === null) {
+    return true;
+  }
+  return RELEASE_ACTION_KINDS.includes(grant.kind as never) && grant.consumedByActionId === request.actionId;
 }

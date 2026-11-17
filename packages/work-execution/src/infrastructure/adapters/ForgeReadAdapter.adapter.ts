@@ -13,11 +13,14 @@ import type {
   ListOpenPullRequestsByBaseRequest,
   ListOpenPullRequestsByBaseResult,
   OpenPullRequestSummary,
+  CommitContextUnavailableReason,
   PullRequestCiCost,
   PullRequestCiCostUnavailableReason,
   PullRequestChangedFilesUnknownReason,
   PullRequestRef,
   PullRequestSnapshot,
+  ReadCommitContextRequest,
+  ReadCommitContextResult,
   ReadPullRequestChangedFilesRequest,
   ReadPullRequestChangedFilesResult,
   ReadPullRequestCiCostRequest,
@@ -32,6 +35,7 @@ import {
   screenRepoRelativePath,
 } from '../../domain/held-work-order.js';
 import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import { isPlainRecordObject } from '../../domain/record-schema-version.js';
 import type { ContainsCommitRequest, ContainsCommitResult } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
 import type { ForgeAncestryPort } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
@@ -78,7 +82,10 @@ const UNAVAILABLE_UNREADABLE_COMPARE: ContainsCommitResult = {
   reason: 'gh api compare returned an unreadable answer',
 };
 
-function isValidRepository(repository: { readonly owner?: unknown; readonly repo?: unknown }): boolean {
+function isValidRepository(repository: {
+  readonly owner?: unknown;
+  readonly repo?: unknown;
+}): repository is { readonly owner: string; readonly repo: string } {
   return (
     typeof repository.owner === 'string' &&
     typeof repository.repo === 'string' &&
@@ -388,10 +395,13 @@ function isPlainArray(value: unknown): value is readonly unknown[] {
   return Array.isArray(value) && !(value as unknown[]).some((_, index) => !(index in (value as unknown[])));
 }
 
+/**
+ * A plain record only: prototype exactly `Object.prototype` or `null`, and
+ * not an array. The same rule `readExactPlainRecord` uses (`isPlainRecordObject`).
+ * A class instance is unreadable, never a match.
+ */
 function objectAt(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
+  return isPlainRecordObject(value) ? value : null;
 }
 
 function isoMsOf(value: unknown): number | null {
@@ -538,6 +548,390 @@ export function parsePullRequestCiCostPage(
     return { kind: 'fail', reason: 'partial-ci-cost' };
   }
   return { kind: 'page', headSha, suites, hasMore, endCursor };
+}
+
+// --- SH10: one named check context at one exact commit ----------------------
+
+/** Pagination pages above this are never read again: the answer stays partial. */
+export const MAX_COMMIT_CONTEXT_PAGES = 10;
+
+/** The GraphQL query: one page of one commit's check-rollup contexts. */
+export const COMMIT_CONTEXT_QUERY = `query($owner: String!, $repo: String!, $oid: GitObjectID!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    object(oid: $oid) {
+      ... on Commit {
+        oid
+        statusCheckRollup {
+          contexts(first: 100, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              __typename
+              ... on CheckRun { name status conclusion }
+              ... on StatusContext { context state }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/** A context name: bounded, not flag-shaped, and never secret-shaped. */
+const CONTEXT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,119}$/;
+
+/** One matched node's closed state. `missing` and `ambiguous` are decided across pages. */
+export type CommitContextNodeState = 'success' | 'failure' | 'pending' | 'other';
+
+/** The pure parse of one GraphQL page of the commit-context read. */
+export type CommitContextPageParse =
+  | {
+      readonly kind: 'page';
+      readonly states: readonly CommitContextNodeState[];
+      readonly hasMore: boolean;
+      readonly endCursor: string | null;
+    }
+  | { readonly kind: 'not-found' }
+  | { readonly kind: 'no-rollup' }
+  | { readonly kind: 'fail'; readonly reason: 'unreadable-contexts' };
+
+const UNREADABLE_CONTEXT_PAGE: CommitContextPageParse = { kind: 'fail', reason: 'unreadable-contexts' };
+
+type GraphqlStdoutKind = 'timed-out' | 'failed' | 'too-large';
+
+type GraphqlStdoutRead = { readonly kind: 'stdout'; readonly stdout: string } | { readonly kind: GraphqlStdoutKind };
+
+/**
+ * True when a context name is a plain bounded identifier and not secret-shaped.
+ * The same `containsSecretShape` + `LANE_DIFF_SECRET_PATTERNS` pair as a workflow name.
+ */
+function isSafeContextName(value: unknown): value is string {
+  if (typeof value !== 'string' || !CONTEXT_NAME_PATTERN.test(value)) {
+    return false;
+  }
+  return !containsSecretShape(value) && !LANE_DIFF_SECRET_PATTERNS.some((entry) => entry.regex.test(value));
+}
+
+function jsonRecord(stdout: unknown): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = typeof stdout === 'string' ? JSON.parse(stdout) : stdout;
+  } catch {
+    return null;
+  }
+  return objectAt(parsed);
+}
+
+function graphqlDataRecord(stdout: unknown): Record<string, unknown> | null {
+  const root = jsonRecord(stdout);
+  if (root === null) {
+    return null;
+  }
+  if ('errors' in root && (!Array.isArray(root.errors) || root.errors.length > 0)) {
+    return null;
+  }
+  return objectAt(root.data);
+}
+
+/** The commit object, `absent` when page 0 names no such object, or null when unreadable. */
+function commitRecord(
+  data: Record<string, unknown>,
+  pageIndex: number,
+): Record<string, unknown> | 'absent' | null {
+  const repository = objectAt(data.repository);
+  if (repository === null) {
+    return null;
+  }
+  if (repository.object === null) {
+    return pageIndex === 0 ? 'absent' : null;
+  }
+  return objectAt(repository.object);
+}
+
+/** The contexts connection, `no-rollup` only on page 0, or null when unreadable. */
+function rollupContexts(
+  commit: Record<string, unknown>,
+  pageIndex: number,
+): Record<string, unknown> | 'no-rollup' | null {
+  if (commit.statusCheckRollup === null) {
+    return pageIndex === 0 ? 'no-rollup' : null;
+  }
+  const rollup = objectAt(commit.statusCheckRollup);
+  if (rollup === null) {
+    return null;
+  }
+  return objectAt(rollup.contexts);
+}
+
+/**
+ * `pageInfo` is strict. `hasNextPage` is a boolean and `endCursor` is present.
+ * The brief's cursor is `string | null`: null is allowed only when there is
+ * no next page. A missing key, an empty cursor or any other type is unreadable.
+ */
+function pageCursor(pageInfo: unknown): { readonly hasMore: boolean; readonly endCursor: string | null } | null {
+  const info = objectAt(pageInfo);
+  if (info === null || !Object.hasOwn(info, 'hasNextPage') || !Object.hasOwn(info, 'endCursor')) {
+    return null;
+  }
+  if (typeof info.hasNextPage !== 'boolean') {
+    return null;
+  }
+  return cursorWhen(info.hasNextPage, info.endCursor);
+}
+
+function cursorWhen(
+  hasNextPage: boolean,
+  endCursor: unknown,
+): { readonly hasMore: boolean; readonly endCursor: string | null } | null {
+  if (typeof endCursor === 'string' && endCursor.length > 0) {
+    return { hasMore: hasNextPage, endCursor };
+  }
+  if (endCursor === null && !hasNextPage) {
+    return { hasMore: false, endCursor: null };
+  }
+  return null;
+}
+
+function mapCheckRun(status: string, conclusion: string | null): CommitContextNodeState {
+  if (status !== 'COMPLETED') {
+    return 'pending';
+  }
+  if (conclusion === 'SUCCESS') {
+    return 'success';
+  }
+  if (conclusion === 'FAILURE') {
+    return 'failure';
+  }
+  return 'other';
+}
+
+function mapStatusState(state: string): CommitContextNodeState {
+  if (state === 'SUCCESS') {
+    return 'success';
+  }
+  if (state === 'FAILURE' || state === 'ERROR') {
+    return 'failure';
+  }
+  if (state === 'PENDING' || state === 'EXPECTED') {
+    return 'pending';
+  }
+  return 'other';
+}
+
+/** A matched state, a well-typed non-match, or a field the page cannot trust. */
+type ContextNodeRead = CommitContextNodeState | 'skip' | 'unreadable';
+
+function isStringOrNull(value: unknown): value is string | null {
+  return value === null || typeof value === 'string';
+}
+
+/** Own data only. A missing key is `undefined`, never a value inherited from the prototype. */
+function ownField(node: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(node, key) ? node[key] : undefined;
+}
+
+/** A missing or wrong-typed `name`, `status` or `conclusion` fails the page, on every CheckRun. */
+function checkRunRead(node: Record<string, unknown>, contextName: string): ContextNodeRead {
+  const name = ownField(node, 'name');
+  const status = ownField(node, 'status');
+  const conclusion = ownField(node, 'conclusion');
+  if (typeof name !== 'string' || typeof status !== 'string' || !isStringOrNull(conclusion)) {
+    return 'unreadable';
+  }
+  if (name !== contextName) {
+    return 'skip';
+  }
+  return mapCheckRun(status, conclusion);
+}
+
+/** A missing or wrong-typed `context` or `state` fails the page, on every StatusContext. */
+function statusContextRead(node: Record<string, unknown>, contextName: string): ContextNodeRead {
+  const context = ownField(node, 'context');
+  const state = ownField(node, 'state');
+  if (typeof context !== 'string' || typeof state !== 'string') {
+    return 'unreadable';
+  }
+  if (context !== contextName) {
+    return 'skip';
+  }
+  return mapStatusState(state);
+}
+
+function matchedNodeState(node: Record<string, unknown>, contextName: string): ContextNodeRead {
+  const typename = ownField(node, '__typename');
+  if (typeof typename !== 'string') {
+    return 'unreadable';
+  }
+  if (typename === 'CheckRun') {
+    return checkRunRead(node, contextName);
+  }
+  if (typename === 'StatusContext') {
+    return statusContextRead(node, contextName);
+  }
+  // The brief skips any other typename; it is not a match and not a failure.
+  return 'skip';
+}
+
+function matchedStates(nodes: readonly unknown[], contextName: string): CommitContextNodeState[] | null {
+  const states: CommitContextNodeState[] = [];
+  for (const node of nodes) {
+    const record = objectAt(node);
+    if (record === null) {
+      return null;
+    }
+    const read = matchedNodeState(record, contextName);
+    if (read === 'unreadable') {
+      return null;
+    }
+    if (read !== 'skip') {
+      states.push(read);
+    }
+  }
+  return states;
+}
+
+/**
+ * The pure parse of one page. A present non-empty `errors` array, a field of
+ * the wrong type, an oid other than `headSha`, or a broken cursor is
+ * unreadable. A null commit object or a null rollup is known only on page 0;
+ * a later page that loses either is unreadable. A node that is not a plain
+ * object fails the page. A CheckRun or StatusContext with a missing or
+ * wrong-typed field fails the page; a missing field is never a non-match.
+ * Any other typename is skipped.
+ */
+export function parseCommitContextPage(
+  stdout: unknown,
+  headSha: string,
+  contextName: string,
+  pageIndex: number,
+): CommitContextPageParse {
+  const data = graphqlDataRecord(stdout);
+  if (data === null) {
+    return UNREADABLE_CONTEXT_PAGE;
+  }
+  const commit = commitRecord(data, pageIndex);
+  if (commit === 'absent') {
+    return { kind: 'not-found' };
+  }
+  if (commit === null || commit.oid !== headSha) {
+    return UNREADABLE_CONTEXT_PAGE;
+  }
+  const contexts = rollupContexts(commit, pageIndex);
+  if (contexts === 'no-rollup') {
+    return { kind: 'no-rollup' };
+  }
+  if (contexts === null || !isPlainArray(contexts.nodes)) {
+    return UNREADABLE_CONTEXT_PAGE;
+  }
+  const states = matchedStates(contexts.nodes, contextName);
+  if (states === null) {
+    return UNREADABLE_CONTEXT_PAGE;
+  }
+  const cursor = pageCursor(contexts.pageInfo);
+  if (cursor === null) {
+    return UNREADABLE_CONTEXT_PAGE;
+  }
+  return { kind: 'page', states, hasMore: cursor.hasMore, endCursor: cursor.endCursor };
+}
+
+/** Read-only `gh api graphql` argv: `-f`/`-F` bindings, then an optional cursor. */
+function graphqlPageArgs(
+  query: string,
+  owner: string,
+  repo: string,
+  bindings: readonly (readonly [string, string])[],
+  cursor: string | null,
+): string[] {
+  const args = ['api', 'graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `repo=${repo}`];
+  for (const [flag, assignment] of bindings) {
+    args.push(flag, assignment);
+  }
+  if (cursor !== null) {
+    args.push('-f', `after=${cursor}`);
+  }
+  return args;
+}
+
+const CI_COST_TRANSPORT: { readonly [Key in GraphqlStdoutKind]: PullRequestCiCostUnavailableReason } = {
+  'timed-out': 'ci-cost-timed-out',
+  failed: 'ci-cost-failed',
+  'too-large': 'ci-cost-too-large',
+};
+
+const CONTEXT_TRANSPORT: { readonly [Key in GraphqlStdoutKind]: CommitContextUnavailableReason } = {
+  'timed-out': 'context-timed-out',
+  failed: 'context-failed',
+  'too-large': 'context-too-large',
+};
+
+function isPlainDataRequest(request: unknown): request is Record<string, unknown> {
+  if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+    return false;
+  }
+  const prototype: unknown = Object.getPrototypeOf(request);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** The CI-cost request screen, plus the head and the context name. Null means the request may proceed. */
+function screenCommitContextRequest(request: unknown): ReadCommitContextResult | null {
+  if (!isPlainDataRequest(request)) {
+    return { outcome: 'unavailable', reason: 'invalid-request' };
+  }
+  const timeoutMs = request.timeoutMs;
+  if (typeof request.headSha !== 'string' || !HEX_40.test(request.headSha) || !isSafeContextName(request.contextName)) {
+    return { outcome: 'unavailable', reason: 'invalid-request' };
+  }
+  if (timeoutMs === undefined) {
+    return null;
+  }
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs)) {
+    return { outcome: 'unavailable', reason: 'invalid-request' };
+  }
+  if (timeoutMs <= 0) {
+    return { outcome: 'unavailable', reason: 'context-timed-out' };
+  }
+  return null;
+}
+
+function commitContextFromStates(headSha: string, states: readonly CommitContextNodeState[]): ReadCommitContextResult {
+  const first = states[0];
+  if (first === undefined) {
+    return { outcome: 'found', headSha, state: 'missing' };
+  }
+  for (const state of states) {
+    if (state !== first) {
+      return { outcome: 'found', headSha, state: 'ambiguous' };
+    }
+  }
+  return { outcome: 'found', headSha, state: first };
+}
+
+/**
+ * One parsed page folded into the running match list. Null means the caller
+ * follows a present cursor; every other answer is final.
+ */
+function commitContextPageDecision(
+  page: CommitContextPageParse,
+  headSha: string,
+  matched: CommitContextNodeState[],
+  pageIndex: number,
+): ReadCommitContextResult | null {
+  if (page.kind === 'not-found') {
+    return { outcome: 'not-found' };
+  }
+  if (page.kind === 'fail') {
+    return { outcome: 'unavailable', reason: 'unreadable-contexts' };
+  }
+  if (page.kind === 'no-rollup') {
+    return { outcome: 'found', headSha, state: 'missing' };
+  }
+  matched.push(...page.states);
+  if (!page.hasMore) {
+    return commitContextFromStates(headSha, matched);
+  }
+  if (page.endCursor === null || pageIndex + 1 >= MAX_COMMIT_CONTEXT_PAGES) {
+    return { outcome: 'unavailable', reason: 'partial-contexts' };
+  }
+  return null;
 }
 
 // --- PT1ca: read-only open-PR changed files ---------------------------------
@@ -746,46 +1140,23 @@ export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
       if (!isValidRepository(repository)) {
         return { outcome: 'unavailable', reason: 'invalid-repository' };
       }
-      const effectiveTimeoutMs = timeoutMs === undefined ? this.timeoutMs : Math.min(this.timeoutMs, timeoutMs);
-      const deadlineMs = Date.now() + effectiveTimeoutMs;
+      const deadlineMs = this.readDeadlineMs(timeoutMs);
       const perPageTotals = new Map<string, { checkRuns: number; billedMinutes: number }>();
       let headSha: string | null = null;
       let cursor: string | null = null;
       for (let pageIndex = 0; pageIndex < MAX_CI_COST_PAGES; pageIndex += 1) {
-        const remainingMs = deadlineMs - Date.now();
-        if (remainingMs <= 0) {
-          return { outcome: 'unavailable', reason: 'ci-cost-timed-out' };
+        const args = graphqlPageArgs(
+          PULL_REQUEST_CI_COST_QUERY,
+          repository.owner,
+          repository.repo,
+          [['-F', `number=${String(pullRequestNumber)}`]],
+          cursor,
+        );
+        const fetched = await this.readGraphqlStdout(args, deadlineMs - Date.now());
+        if (fetched.kind !== 'stdout') {
+          return { outcome: 'unavailable', reason: CI_COST_TRANSPORT[fetched.kind] };
         }
-        const args: string[] = [
-          'api',
-          'graphql',
-          '-f',
-          `query=${PULL_REQUEST_CI_COST_QUERY}`,
-          '-f',
-          `owner=${repository.owner}`,
-          '-f',
-          `repo=${repository.repo}`,
-          '-F',
-          `number=${String(pullRequestNumber)}`,
-        ];
-        if (cursor !== null) {
-          args.push('-f', `after=${cursor}`);
-        }
-        const raced = await this.runGhWithinDeadline(args, remainingMs);
-        if (raced.kind === 'timed-out') {
-          return { outcome: 'unavailable', reason: 'ci-cost-timed-out' };
-        }
-        if (raced.kind === 'failed') {
-          return { outcome: 'unavailable', reason: 'ci-cost-failed' };
-        }
-        const gh = raced.gh;
-        if (gh.exitCode !== 0) {
-          return { outcome: 'unavailable', reason: 'ci-cost-failed' };
-        }
-        if (typeof gh.stdout !== 'string' || Buffer.byteLength(gh.stdout, 'utf8') > READ_MAX_STDOUT_BYTES) {
-          return { outcome: 'unavailable', reason: 'ci-cost-too-large' };
-        }
-        const page = parsePullRequestCiCostPage(gh.stdout, pullRequestNumber, pageIndex, headSha);
+        const page = parsePullRequestCiCostPage(fetched.stdout, pullRequestNumber, pageIndex, headSha);
         if (page.kind === 'not-found') {
           return { outcome: 'not-found' };
         }
@@ -837,6 +1208,32 @@ export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
         cursor = page.endCursor;
       }
       return { outcome: 'unavailable', reason: 'partial-ci-cost' };
+    } catch {
+      return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+  }
+
+  /**
+   * The state of the context named exactly `contextName` at commit `headSha`,
+   * every page read (SH10). One fully paginated read-only GraphQL query, `-f`
+   * for every variable, never a mutating flag. An unreadable or partial answer
+   * is unavailable, never `missing`, and no stderr, cursor or other context
+   * name is ever echoed.
+   */
+  async readCommitContext(request: ReadCommitContextRequest): Promise<ReadCommitContextResult> {
+    try {
+      const rejected = screenCommitContextRequest(request);
+      if (rejected !== null) {
+        return rejected;
+      }
+      if (this.runGh === undefined) {
+        return { outcome: 'unavailable', reason: 'forge-not-configured' };
+      }
+      const repository = request.repository ?? { owner: this.owner, repo: this.repo };
+      if (!isValidRepository(repository)) {
+        return { outcome: 'unavailable', reason: 'invalid-repository' };
+      }
+      return await this.paginateCommitContext(request.headSha, request.contextName, repository, request.timeoutMs);
     } catch {
       return { outcome: 'unavailable', reason: 'invalid-request' };
     }
@@ -917,6 +1314,87 @@ export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
     } catch {
       return unknownChangedFiles('invalid-request');
     }
+  }
+
+  /** Absolute deadline for one paginated read: `min(adapter timeout, timeoutMs)` from now. */
+  private readDeadlineMs(timeoutMs: number | undefined): number {
+    const effectiveTimeoutMs = timeoutMs === undefined ? this.timeoutMs : Math.min(this.timeoutMs, timeoutMs);
+    return Date.now() + effectiveTimeoutMs;
+  }
+
+  /**
+   * One read-only graphql page inside the remaining deadline. A non-positive
+   * remainder, a lost race, a non-zero exit or an oversized stdout never
+   * reaches the parser.
+   */
+  private async readGraphqlStdout(args: readonly string[], remainingMs: number): Promise<GraphqlStdoutRead> {
+    if (remainingMs <= 0) {
+      return { kind: 'timed-out' };
+    }
+    const raced = await this.runGhWithinDeadline(args, remainingMs);
+    if (raced.kind === 'timed-out') {
+      return { kind: 'timed-out' };
+    }
+    if (raced.kind !== 'ok' || raced.gh.exitCode !== 0) {
+      return { kind: 'failed' };
+    }
+    const stdout: unknown = raced.gh.stdout;
+    if (typeof stdout !== 'string' || Buffer.byteLength(stdout, 'utf8') > READ_MAX_STDOUT_BYTES) {
+      return { kind: 'too-large' };
+    }
+    return { kind: 'stdout', stdout };
+  }
+
+  private async paginateCommitContext(
+    headSha: string,
+    contextName: string,
+    repository: { readonly owner: string; readonly repo: string },
+    timeoutMs: number | undefined,
+  ): Promise<ReadCommitContextResult> {
+    const deadlineMs = this.readDeadlineMs(timeoutMs);
+    const matched: CommitContextNodeState[] = [];
+    let cursor: string | null = null;
+    for (let pageIndex = 0; pageIndex < MAX_COMMIT_CONTEXT_PAGES; pageIndex += 1) {
+      const step = await this.oneCommitContextPage(
+        headSha,
+        contextName,
+        repository,
+        deadlineMs,
+        cursor,
+        pageIndex,
+        matched,
+      );
+      if (step.kind === 'done') {
+        return step.result;
+      }
+      cursor = step.cursor;
+    }
+    return { outcome: 'unavailable', reason: 'partial-contexts' };
+  }
+
+  private async oneCommitContextPage(
+    headSha: string,
+    contextName: string,
+    repository: { readonly owner: string; readonly repo: string },
+    deadlineMs: number,
+    cursor: string | null,
+    pageIndex: number,
+    matched: CommitContextNodeState[],
+  ): Promise<{ readonly kind: 'done'; readonly result: ReadCommitContextResult } | { readonly kind: 'next'; readonly cursor: string }> {
+    const args = graphqlPageArgs(COMMIT_CONTEXT_QUERY, repository.owner, repository.repo, [['-f', `oid=${headSha}`]], cursor);
+    const fetched = await this.readGraphqlStdout(args, deadlineMs - Date.now());
+    if (fetched.kind !== 'stdout') {
+      return { kind: 'done', result: { outcome: 'unavailable', reason: CONTEXT_TRANSPORT[fetched.kind] } };
+    }
+    const page = parseCommitContextPage(fetched.stdout, headSha, contextName, pageIndex);
+    const decision = commitContextPageDecision(page, headSha, matched, pageIndex);
+    if (decision !== null) {
+      return { kind: 'done', result: decision };
+    }
+    if (page.kind !== 'page' || page.endCursor === null) {
+      return { kind: 'done', result: { outcome: 'unavailable', reason: 'unreadable-contexts' } };
+    }
+    return { kind: 'next', cursor: page.endCursor };
   }
 
   /**

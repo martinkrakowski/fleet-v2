@@ -130,6 +130,44 @@ export type ReadPullRequestCiCostResult =
   | { readonly outcome: 'not-found' }
   | { readonly outcome: 'unavailable'; readonly reason: PullRequestCiCostUnavailableReason };
 
+// --- SH10: one named check context at one exact commit ----------------------
+
+/** One named check context at one exact commit. */
+export interface ReadCommitContextRequest {
+  readonly headSha: string;
+  readonly contextName: string;
+  readonly repository?: ForgeRepositoryRef;
+  /** Optional per-read timeout cap (ms), as for `ReadPullRequestRequest`. */
+  readonly timeoutMs?: number;
+}
+
+/**
+ * `missing` means every page was read and no node carried that name, or the
+ * commit has no rollup. `ambiguous` means the name matched more than one
+ * state. Neither is a pass.
+ */
+export type CommitContextState = 'success' | 'failure' | 'pending' | 'missing' | 'other' | 'ambiguous';
+
+/** Fixed reason codes only: never a path, a stderr line, a cursor or a context name. */
+export type CommitContextUnavailableReason =
+  | 'forge-not-configured'
+  | 'invalid-request'
+  | 'invalid-repository'
+  | 'context-timed-out'
+  | 'context-failed'
+  | 'context-too-large'
+  | 'partial-contexts'
+  | 'unreadable-contexts';
+
+/**
+ * The state of the context named exactly `contextName` at commit `headSha`.
+ * An unreadable or partial answer is `unavailable`, never `missing`.
+ */
+export type ReadCommitContextResult =
+  | { readonly outcome: 'found'; readonly headSha: string; readonly state: CommitContextState }
+  | { readonly outcome: 'not-found' }
+  | { readonly outcome: 'unavailable'; readonly reason: CommitContextUnavailableReason };
+
 // --- PT1ca: read-only open-PR changed files ---------------------------------
 
 export { MAX_PULL_REQUEST_CHANGED_FILES } from '../../../domain/held-work-order.js';
@@ -178,6 +216,12 @@ export interface ForgeReadPort {
    * answer is unavailable, never an empty list or zero.
    */
   readPullRequestCiCost?(request: ReadPullRequestCiCostRequest): Promise<ReadPullRequestCiCostResult>;
+  /**
+   * The state of the context named exactly `contextName` at commit `headSha`,
+   * every page read; mutates nothing. An unreadable or partial answer is
+   * unavailable, never `missing`.
+   */
+  readCommitContext?(request: ReadCommitContextRequest): Promise<ReadCommitContextResult>;
   /** Read one pull request's state; mutates nothing. */
   readPullRequest(request: ReadPullRequestRequest): Promise<ReadPullRequestResult>;
   /**

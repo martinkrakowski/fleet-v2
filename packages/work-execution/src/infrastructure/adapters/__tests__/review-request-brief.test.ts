@@ -1,8 +1,10 @@
 // Brief-verify review subject (CO18a3a). Every refusal is a typed result.
-// Cost bounds pinned here: briefText above 64 KiB, project id above 200
-// characters, a receipt list or findings array whose length is 2^32-1, and an
-// array-like whose length is Number.MAX_SAFE_INTEGER. Those cases return
-// without iterating the claimed length.
+// Cost bounds pinned here: briefText above 64 KiB, including a multi-megabyte
+// brief refused on UTF-16 length before a byte scan, project id above 200
+// characters, a dense receipt list of 257 (256 is read) and a dense findings
+// array of 1025 (1024 is read), a receipt list or findings array whose length
+// is 2^32-1, and an array-like whose length is Number.MAX_SAFE_INTEGER. The
+// over-cap cases return without iterating the claimed length.
 import { describe, expect, it } from 'vitest';
 
 import { assessmentIdForBrief, attemptIdForBrief } from '@fleet/evidence-and-acceptance';
@@ -76,6 +78,14 @@ function finding(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** A dense plain findings array. Index `i` is `f-${i}`, so the cap boundary is visible in the summary. */
+function denseFindings(count: number): ReviewReceiptRecord['findings'] {
+  return Array.from({ length: count }, (_, index) => finding({
+    findingId: `f-${index}`,
+    summary: `finding ${index}`,
+  })) as ReviewReceiptRecord['findings'];
+}
+
 function briefReceipt(overrides: Partial<ReviewReceiptRecord> = {}): ReviewReceiptRecord {
   return {
     id: 'rr-brief-1',
@@ -96,6 +106,24 @@ function briefReceipt(overrides: Partial<ReviewReceiptRecord> = {}): ReviewRecei
     subject: storedSubject(),
     ...overrides,
   } as ReviewReceiptRecord;
+}
+
+/**
+ * A dense plain brief-receipt array. Every entry matches this brief. Only the
+ * last carries `REQUEST_ID` and the stored receipt id, so a list the cap
+ * accepts resolves to `EXPECTED_SUMMARY` on both lookups. One past the cap is
+ * the same shape and would resolve the same way if the cap check were skipped.
+ */
+function denseBriefReceipts(count: number): ReviewReceiptRecord[] {
+  return Array.from({ length: count }, (_, index) => {
+    if (index === count - 1) {
+      return briefReceipt();
+    }
+    return briefReceipt({
+      id: `rr-other-${index}`,
+      requestId: `other-request-${index}`,
+    });
+  });
 }
 
 function briefAssessment(receipts: readonly ReviewReceiptRecord[]): EvidenceAssessmentRecord {
@@ -147,6 +175,14 @@ function briefRequest(overrides: Partial<ReviewRequest> = {}): ReviewRequest {
   };
 }
 
+/** Attempt id is `attemptIdForBrief` of this digest, so a bad digest is refused by the format check alone. */
+function briefRequestForDigest(briefPackageDigest: string): ReviewRequest {
+  return briefRequest({
+    attemptId: attemptIdForBrief(PROJECT, briefPackageDigest),
+    subject: briefSubject({ briefPackageDigest }),
+  });
+}
+
 function forProject(projectId: string, overrides: Partial<ReviewRequest> = {}): ReviewRequest {
   return briefRequest({
     projectId,
@@ -174,6 +210,42 @@ function briefLatest(overrides: Partial<FindLatestReceiptOfKindRequest> = {}): F
     subject: briefSubject(),
     ...overrides,
   };
+}
+
+/**
+ * A Proxy of `target` whose `length` is the real length on the first read and
+ * one billion on every later read. The counter counts both `get` and
+ * `getOwnPropertyDescriptor` for `length`.
+ */
+function proxyWhoseLengthGrows<T extends object>(target: T): { readonly proxy: T; readonly lengthReads: () => number } {
+  let reads = 0;
+  const proxy = new Proxy(target, {
+    get(inner, property, receiver) {
+      if (property === 'length') {
+        reads += 1;
+        return reads === 1 ? Reflect.get(inner, property, receiver) : 1000000000;
+      }
+      return Reflect.get(inner, property, receiver);
+    },
+    getOwnPropertyDescriptor(inner, property) {
+      if (property === 'length') {
+        reads += 1;
+        const descriptor = Reflect.getOwnPropertyDescriptor(inner, property);
+        if (reads > 1 && descriptor !== undefined && 'value' in descriptor) {
+          return { ...descriptor, value: 1000000000 };
+        }
+        return descriptor;
+      }
+      return Reflect.getOwnPropertyDescriptor(inner, property);
+    },
+  });
+  return { proxy: proxy as T, lengthReads: () => reads };
+}
+
+/** Copy `value` with `key` absent, so an accessor can be installed without `delete` on a readonly field. */
+function omitKey<T extends object>(value: T, key: keyof T & string): T {
+  const record = value as unknown as Record<string, unknown>;
+  return Object.fromEntries(Object.entries(record).filter(([name]) => name !== key)) as unknown as T;
 }
 
 function reviewing(result: RequestIndependentReviewResult | 'throw') {
@@ -541,7 +613,7 @@ describe('brief-verify invalid-request', () => {
     ['a numeric request', 4],
     ['a string request', 'brief'],
   ])('requestReview refuses %s with invalid-request and calls no delegate', async (_label, request) => {
-    await refused(request as ReviewRequest);
+    await refused(request as unknown as ReviewRequest);
   });
 
   it('requestReview refuses a sparse-array subject with invalid-request and calls no delegate', async () => {
@@ -640,6 +712,51 @@ describe('brief-verify invalid-request', () => {
     await refused(request);
   });
 
+  it('requestReview refuses a valid brief subject when the top-level projectId is absent', async () => {
+    await refused(omitKey(briefRequest(), 'projectId'));
+  });
+
+  it('requestReview refuses a top-level projectId accessor with invalid-request and does not invoke the getter', async () => {
+    let invoked = false;
+    const request = omitKey(briefRequest(), 'projectId');
+    Object.defineProperty(request, 'projectId', {
+      enumerable: true,
+      get() {
+        invoked = true;
+        return PROJECT;
+      },
+    });
+    await refused(request);
+    expect(invoked).toBe(false);
+  });
+
+  it('requestReview refuses a non-string top-level projectId with invalid-request and calls no delegate', async () => {
+    const request = briefRequest();
+    Object.defineProperty(request, 'projectId', { value: 7, enumerable: true });
+    await refused(request);
+  });
+
+  it.each([
+    ['an uppercase brief digest', 'AB'.repeat(32)],
+    ['a wrong-length brief digest', 'ab'.repeat(31)],
+    ['a non-hex brief digest', 'g'.repeat(64)],
+  ])(
+    'requestReview refuses %s with invalid-request and calls no delegate when its attempt id is attemptIdForBrief of that digest',
+    async (_label, digest) => {
+      await refused(briefRequestForDigest(digest));
+    },
+  );
+
+  it('refuses a multi-megabyte briefText with invalid-request, the same code as an over-size brief', async () => {
+    const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    const overSize = await adapter.requestReview(briefRequest({ briefText: 'a'.repeat(64 * 1024 + 1) }));
+    const huge = await adapter.requestReview(briefRequest({ briefText: 'a'.repeat(4 * 1024 * 1024) }));
+    expect(overSize).toEqual({ outcome: 'refused', reason: 'invalid-request', detail: null });
+    expect(huge).toEqual(overSize);
+    expect(calls).toHaveLength(0);
+  });
+
   it('requestReview refuses a briefPackageDigest accessor with invalid-request and does not invoke the getter', async () => {
     let invoked = false;
     const subject = { kind: 'brief' as const, projectId: PROJECT, baseCommit: HEAD };
@@ -674,8 +791,7 @@ describe('brief-verify invalid-request', () => {
 
   it('requestReview refuses a throwing briefText getter with invalid-request and does not invoke it', async () => {
     let invoked = false;
-    const request = briefRequest() as ReviewRequest & Record<string, unknown>;
-    delete request.briefText;
+    const request = omitKey(briefRequest(), 'briefText');
     Object.defineProperty(request, 'briefText', {
       enumerable: true,
       get() {
@@ -705,8 +821,7 @@ describe('brief-verify invalid-request', () => {
 
   it('requestReview refuses a kind accessor on a brief subject with invalid-request and does not invoke it', async () => {
     let invoked = false;
-    const request = briefRequest() as ReviewRequest & Record<string, unknown>;
-    delete request.kind;
+    const request = omitKey(briefRequest(), 'kind');
     Object.defineProperty(request, 'kind', {
       enumerable: true,
       get() {
@@ -739,7 +854,7 @@ describe('brief find unavailable invalid-request', () => {
     ['an undefined find request', undefined],
     ['a numeric find request', 4],
   ])('findReviewReceipt returns unavailable invalid-request for %s and does not inspect', async (_label, request) => {
-    await unavailableFind(request as FindReviewReceiptRequest);
+    await unavailableFind(request as unknown as FindReviewReceiptRequest);
   });
 
   it.each([
@@ -747,7 +862,7 @@ describe('brief find unavailable invalid-request', () => {
     ['an undefined latest request', undefined],
     ['a numeric latest request', 9],
   ])('findLatestReceiptOfKind returns unavailable invalid-request for %s and does not inspect', async (_label, request) => {
-    await unavailableLatest(request as FindLatestReceiptOfKindRequest);
+    await unavailableLatest(request as unknown as FindLatestReceiptOfKindRequest);
   });
 
   it('findReviewReceipt returns unavailable invalid-request for a secret-shaped request id and does not inspect', async () => {
@@ -760,8 +875,7 @@ describe('brief find unavailable invalid-request', () => {
 
   it('findReviewReceipt returns unavailable invalid-request when requestId is an accessor and does not invoke it', async () => {
     let invoked = false;
-    const request = briefFind() as FindReviewReceiptRequest & Record<string, unknown>;
-    delete request.requestId;
+    const request = omitKey(briefFind(), 'requestId');
     Object.defineProperty(request, 'requestId', {
       enumerable: true,
       get() {
@@ -857,6 +971,25 @@ describe('brief delegate configuration and failures', () => {
     expect(await adapter.findLatestReceiptOfKind(briefLatest())).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
   });
 
+  it('findReviewReceipt returns unavailable unreadable and does not throw when the inspection outcome getter throws', async () => {
+    let invoked = false;
+    const inspected = {
+      outcome: 'found' as const,
+      assessment: briefAssessment([briefReceipt()]),
+    };
+    Object.defineProperty(inspected, 'outcome', {
+      enumerable: true,
+      get() {
+        invoked = true;
+        throw new Error('boom');
+      },
+    });
+    const inspectAcceptanceEvidence = async (): Promise<InspectAcceptanceEvidenceResult> => inspected;
+    const result = await new ReviewRequestAdapter({ inspectAcceptanceEvidence }).findReviewReceipt(briefFind());
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
+    expect(invoked).toBe(true);
+  });
+
   it.each([
     ['null', null],
     ['undefined', undefined],
@@ -932,6 +1065,56 @@ describe('brief delegate configuration and failures', () => {
     expect(result).toEqual(MISMATCH_UNKNOWN);
   });
 
+  it('requestReview returns unknown receipt-mismatch for 1025 dense findings and a receipt for 1024, and lookups return unavailable receipt-mismatch for 1025 and found for 1024', async () => {
+    const acceptedFindings = denseFindings(1024);
+    const acceptedReceipt = briefReceipt({ findings: acceptedFindings });
+    const { requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: acceptedReceipt });
+    const requested = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());
+    expect(requested.outcome).toBe('receipt');
+    if (requested.outcome === 'receipt') {
+      expect(requested.receipt.findings).toHaveLength(1024);
+      expect(requested.receipt.findings[0]).toEqual({
+        findingId: 'f-0',
+        severity: 'major',
+        summary: 'finding 0',
+        filePath: 'src/a.ts',
+        line: 4,
+      });
+      expect(requested.receipt.findings[1023]).toEqual({
+        findingId: 'f-1023',
+        severity: 'major',
+        summary: 'finding 1023',
+        filePath: 'src/a.ts',
+        line: 4,
+      });
+    }
+
+    const { inspectAcceptanceEvidence } = inspecting([acceptedReceipt]);
+    const acceptedAdapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+    const found = await acceptedAdapter.findReviewReceipt(briefFind());
+    const latest = await acceptedAdapter.findLatestReceiptOfKind(briefLatest());
+    expect(found.outcome).toBe('found');
+    expect(latest.outcome).toBe('found');
+    if (found.outcome === 'found' && latest.outcome === 'found') {
+      expect(found.receipt.findings).toHaveLength(1024);
+      expect(latest.receipt.findings).toHaveLength(1024);
+    }
+
+    const refusedReceipt = briefReceipt({ findings: denseFindings(1025) });
+    const refusedReview = reviewing({ outcome: 'reviewed', receipt: refusedReceipt });
+    const refused = await new ReviewRequestAdapter({
+      requestIndependentReview: refusedReview.requestIndependentReview,
+    }).requestReview(briefRequest());
+    expect(refused).toEqual(MISMATCH_UNKNOWN);
+
+    const refusedLookup = inspecting([refusedReceipt]);
+    const refusedAdapter = new ReviewRequestAdapter({
+      inspectAcceptanceEvidence: refusedLookup.inspectAcceptanceEvidence,
+    });
+    expect(await refusedAdapter.findReviewReceipt(briefFind())).toEqual(MISMATCH_UNAVAILABLE);
+    expect(await refusedAdapter.findLatestReceiptOfKind(briefLatest())).toEqual(MISMATCH_UNAVAILABLE);
+  });
+
   it('requestReview returns unknown receipt-mismatch for an array-like findings object with an enormous length', async () => {
     const { requestIndependentReview } = reviewing({
       outcome: 'reviewed',
@@ -945,8 +1128,7 @@ describe('brief delegate configuration and failures', () => {
 
   it('requestReview returns unknown receipt-mismatch when the receipt kind is an accessor and does not invoke it', async () => {
     let invoked = false;
-    const receipt = briefReceipt() as ReviewReceiptRecord & Record<string, unknown>;
-    delete receipt.kind;
+    const receipt = omitKey(briefReceipt(), 'kind');
     Object.defineProperty(receipt, 'kind', {
       enumerable: true,
       get() {
@@ -958,6 +1140,36 @@ describe('brief delegate configuration and failures', () => {
     const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());
     expect(result).toEqual(MISMATCH_UNKNOWN);
     expect(invoked).toBe(false);
+  });
+
+  it('requestReview returns unknown receipt-mismatch and lookups return unavailable receipt-mismatch for an accessor on each finding field, and the getter call count stays 0', async () => {
+    const fields = ['findingId', 'severity', 'summary', 'filePath', 'line'] as const;
+    for (const key of fields) {
+      let calls = 0;
+      const hostile: Record<string, unknown> = { ...finding() };
+      Object.defineProperty(hostile, key, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          calls += 1;
+          throw new Error('boom');
+        },
+      });
+      const receipt = briefReceipt({
+        findings: [hostile] as unknown as ReviewReceiptRecord['findings'],
+      });
+      const { requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt });
+      const requested = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());
+      expect(requested).toEqual(MISMATCH_UNKNOWN);
+      expect(calls).toBe(0);
+
+      const { inspectAcceptanceEvidence } = inspecting([receipt]);
+      const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+      expect(await adapter.findReviewReceipt(briefFind())).toEqual(MISMATCH_UNAVAILABLE);
+      expect(calls).toBe(0);
+      expect(await adapter.findLatestReceiptOfKind(briefLatest())).toEqual(MISMATCH_UNAVAILABLE);
+      expect(calls).toBe(0);
+    }
   });
 
   it('findReviewReceipt returns unavailable receipt-mismatch for non-dense findings', async () => {
@@ -1018,6 +1230,34 @@ describe('brief delegate configuration and failures', () => {
     expect(result).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
   });
 
+  it('findReviewReceipt and findLatestReceiptOfKind return unavailable unreadable for 257 dense plain brief receipts and found for 256', async () => {
+    const accepted = inspecting(denseBriefReceipts(256));
+    const acceptedAdapter = new ReviewRequestAdapter({
+      inspectAcceptanceEvidence: accepted.inspectAcceptanceEvidence,
+    });
+    expect(await acceptedAdapter.findReviewReceipt(briefFind())).toEqual({
+      outcome: 'found',
+      receipt: EXPECTED_SUMMARY,
+    });
+    expect(await acceptedAdapter.findLatestReceiptOfKind(briefLatest())).toEqual({
+      outcome: 'found',
+      receipt: EXPECTED_SUMMARY,
+    });
+
+    const refused = inspecting(denseBriefReceipts(257));
+    const refusedAdapter = new ReviewRequestAdapter({
+      inspectAcceptanceEvidence: refused.inspectAcceptanceEvidence,
+    });
+    expect(await refusedAdapter.findReviewReceipt(briefFind())).toEqual({
+      outcome: 'unavailable',
+      reason: 'unreadable',
+    });
+    expect(await refusedAdapter.findLatestReceiptOfKind(briefLatest())).toEqual({
+      outcome: 'unavailable',
+      reason: 'unreadable',
+    });
+  });
+
   it('findReviewReceipt returns unavailable unreadable for an array-like receipt list with an enormous length', async () => {
     const assessment = briefAssessment([]);
     (assessment as { reviewReceipts: unknown }).reviewReceipts = { length: Number.MAX_SAFE_INTEGER };
@@ -1065,6 +1305,97 @@ describe('brief delegate configuration and failures', () => {
     const result = await new ReviewRequestAdapter({ inspectAcceptanceEvidence }).findLatestReceiptOfKind(briefLatest());
     expect(result).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
     expect(invoked).toBe(false);
+  });
+
+  it('a Proxy over a receipts array whose length reads small first and huge later is read once and findReviewReceipt returns the brief receipt', async () => {
+    const { proxy, lengthReads } = proxyWhoseLengthGrows([briefReceipt()]);
+    const assessment = briefAssessment([]);
+    (assessment as { reviewReceipts: unknown }).reviewReceipts = proxy;
+    const inspectAcceptanceEvidence = async (): Promise<InspectAcceptanceEvidenceResult> => ({
+      outcome: 'found',
+      assessment,
+    });
+    const result = await new ReviewRequestAdapter({ inspectAcceptanceEvidence }).findReviewReceipt(briefFind());
+    expect(lengthReads()).toBe(1);
+    expect(result).toEqual({ outcome: 'found', receipt: EXPECTED_SUMMARY });
+  });
+
+  it('a Proxy over a receipts array whose length reads small first and huge later is read once and findLatestReceiptOfKind returns the brief receipt', async () => {
+    const { proxy, lengthReads } = proxyWhoseLengthGrows([briefReceipt()]);
+    const assessment = briefAssessment([]);
+    (assessment as { reviewReceipts: unknown }).reviewReceipts = proxy;
+    const inspectAcceptanceEvidence = async (): Promise<InspectAcceptanceEvidenceResult> => ({
+      outcome: 'found',
+      assessment,
+    });
+    const result = await new ReviewRequestAdapter({ inspectAcceptanceEvidence }).findLatestReceiptOfKind(briefLatest());
+    expect(lengthReads()).toBe(1);
+    expect(result).toEqual({ outcome: 'found', receipt: EXPECTED_SUMMARY });
+  });
+
+  it('a Proxy over findings whose length reads small first and huge later is read once and requestReview returns the receipt', async () => {
+    const { proxy, lengthReads } = proxyWhoseLengthGrows([finding()]);
+    const { requestIndependentReview } = reviewing({
+      outcome: 'reviewed',
+      receipt: briefReceipt({ findings: proxy as unknown as ReviewReceiptRecord['findings'] }),
+    });
+    const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());
+    expect(lengthReads()).toBe(1);
+    expect(result).toEqual({ outcome: 'receipt', receipt: EXPECTED_SUMMARY });
+  });
+
+  it('findReviewReceipt finds a receipt appended to the same reviewReceipts array after an empty lookup returned not-found', async () => {
+    const reviewReceipts: ReviewReceiptRecord[] = [];
+    const assessment = briefAssessment(reviewReceipts);
+    const inspectAcceptanceEvidence = async (): Promise<InspectAcceptanceEvidenceResult> => ({
+      outcome: 'found',
+      assessment,
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const first = await adapter.findReviewReceipt(briefFind());
+    expect(first).toEqual({ outcome: 'not-found' });
+
+    reviewReceipts.push(briefReceipt());
+    const second = await adapter.findReviewReceipt(briefFind());
+    expect(second).toEqual({ outcome: 'found', receipt: EXPECTED_SUMMARY });
+  });
+
+  it('a second summary includes a finding appended to the same findings array', async () => {
+    const findings = [finding()];
+    const receipt = briefReceipt({ findings: findings as ReviewReceiptRecord['findings'] });
+    const review = () => {
+      const { requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt });
+      return new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());
+    };
+
+    const first = await review();
+    expect(first).toEqual({ outcome: 'receipt', receipt: EXPECTED_SUMMARY });
+
+    findings.push(finding({ findingId: 'f-2', summary: 'added finding' }));
+    const second = await review();
+    expect(second).toEqual({
+      outcome: 'receipt',
+      receipt: {
+        ...EXPECTED_SUMMARY,
+        findings: [
+          {
+            findingId: 'f-1',
+            severity: 'major',
+            summary: 'example finding',
+            filePath: 'src/a.ts',
+            line: 4,
+          },
+          {
+            findingId: 'f-2',
+            severity: 'major',
+            summary: 'added finding',
+            filePath: 'src/a.ts',
+            line: 4,
+          },
+        ],
+      },
+    });
   });
 
   it('findLatestReceiptOfKind returns unavailable unreadable for the same hostile receipt lists', async () => {

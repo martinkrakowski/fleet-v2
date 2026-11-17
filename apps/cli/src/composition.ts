@@ -98,9 +98,11 @@ import {
   StopAttemptUseCase,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
+  composeCutoverShadowEvidence,
   consumptionId,
   forgeActionScope,
   isSafeSshHost,
+  mergeQueueRepositoryDigest,
   observationEventKind,
   resolveExecutionRunnerHost,
   resolveInstallationForgeMode,
@@ -114,6 +116,9 @@ import {
   LaneRunRepositoryAdapter,
   ListConductorPassesUseCase,
   ListLaneRunsUseCase,
+  RecordShadowDayUseCase,
+  ShadowEvidenceAdapter,
+  WORK_EXECUTION_STATE_FILES,
   ReapLaneWorktreesUseCase,
   ReapOrphanReservationsUseCase,
   ReapOrphanSessionsUseCase,
@@ -164,6 +169,7 @@ import {
   RequestIndependentReviewUseCase,
   RequestVerificationUseCase,
   VerificationExecutorAdapter,
+  EVIDENCE_AND_ACCEPTANCE_STATE_FILES,
 } from '@fleet/evidence-and-acceptance';
 
 import {
@@ -181,6 +187,7 @@ import {
   RecordContextSelectionUseCase,
   RecordKnowledgeReuseUseCase,
   SupersedeKnowledgeEntryUseCase,
+  BRIEF_KNOWLEDGE_STATE_FILES,
 } from '@fleet/brief-knowledge';
 
 import {
@@ -222,6 +229,7 @@ import {
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
   UpdateProjectProfileUseCase,
+  OPERATOR_COORDINATION_STATE_FILES,
 } from '@fleet/operator-coordination';
 import {
   loadInstallation,
@@ -861,6 +869,8 @@ export interface FleetCliRuntime {
     readonly killallTrainPause: KillallTrainPauseAdapter;
     /** CO30a: `cutover status` and `cutover rollback`; switch and retire are CO30b. */
     readonly manageCutover: ManageCutoverUseCase;
+    /** SH8a: the shadow day-writer behind `cutover shadow record-day`; undefined without a durable state directory. */
+    readonly recordShadowDay?: RecordShadowDayUseCase;
     /** CO24comp: PR-feedback fix round preparation and grant-scoped push-to-pr. */
     readonly preparePullRequestFeedbackFix: PreparePullRequestFeedbackFixUseCase;
     /** OG-8b: the operator-only review thread helper; bound in forge mode github only, never given to the daemon. */
@@ -998,6 +1008,41 @@ function editOnlyModeOf(
   const host = hosts?.[hostName];
   if (host === undefined || host.runner?.kind !== 'agy') return 'unknown';
   return host.runner.agyMode === 'edit-only' ? 'edit-only' : 'not-edit-only';
+}
+
+type ShadowEvidenceRead =
+  | { readonly status: 'ok'; readonly evidence: unknown }
+  | { readonly status: 'absent' }
+  | { readonly status: 'unreadable' }
+  | { readonly status: 'unknown-version' };
+
+/**
+ * SH8b: the reader `cutover switch` binds when a durable state directory
+ * exists. The stored ledger is composed here and judged by
+ * `readCutoverShadowEvidence` inside the use case; this function does not
+ * re-implement the 3-day, 20-merge, or S1–S13 rules. `nowIso` is the daemon
+ * clock and is read when the switch runs, never the operator's `--now-iso`.
+ * Unreadable and unknown-version stay unknown. Every other non-ok result is
+ * absence. A throw from the store propagates so the use case reports
+ * `shadow-evidence-unreadable`; this mapping never echoes the ledger.
+ */
+function readStoredShadowEvidence(
+  evidence: ShadowEvidenceAdapter,
+  nowIso: () => string,
+): () => Promise<ShadowEvidenceRead> {
+  return async () => {
+    const read = await evidence.read();
+    if (read.status === 'unreadable') return { status: 'unreadable' };
+    if (read.status === 'unknown-version') return { status: 'unknown-version' };
+    if (read.status !== 'ok') return { status: 'absent' };
+    // OD-4: each 3-day window must be bound to one pinned non-null release sha.
+    const composed = composeCutoverShadowEvidence(read.ledger, nowIso(), {
+      requireSingleRelease: true,
+    });
+    return composed.status === 'ok'
+      ? { status: 'ok', evidence: composed.evidence }
+      : { status: 'absent' };
+  };
 }
 
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
@@ -1382,6 +1427,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const killallTrainPause = new KillallTrainPauseAdapter({ stateDir });
   const daemonPauseRead = durableCutover ? new DaemonPauseAdapter({ stateDir, readOnly: true }) : daemon.pause;
   const trainPauseRead = durableCutover ? new KillallTrainPauseAdapter({ stateDir, readOnly: true }) : killallTrainPause;
+  // SH8b: read-only ledger for `cutover switch`. In-memory mode has no durable
+  // ledger, so the reader stays undefined and the use case refuses. This does
+  // not wire `countUnrecordedLanes` and does not start the shadow daemon.
+  const shadowEvidence = durableCutover ? new ShadowEvidenceAdapter({ stateDir, readOnly: true }) : undefined;
+  const readShadowEvidence =
+    shadowEvidence === undefined ? undefined : readStoredShadowEvidence(shadowEvidence, daemon.now);
   const manageCutover = new ManageCutoverUseCase({
     cutoverRepo: cutoverRecordRepository,
     cutoverJournal,
@@ -1393,13 +1444,73 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     computeDigest: sha256HexDigest,
     mintEntryId: daemon.newUlid,
     nowIso: daemon.now,
+    ...(readShadowEvidence === undefined ? {} : { readShadowEvidence }),
   });
 
+<<<<<<< HEAD
   const reviewLocator = reviewLocatorRef.locator;
   if (reviewLocator === undefined) {
     throw new Error('The work context is not wired for review location');
   }
 
+=======
+  // SH8a: `cutover shadow record-day` — the shadow day-writer. Durable-state
+  // only: without a state directory there is no ledger to write and no fleet
+  // stores to check, so the use case stays undefined exactly like every other
+  // durable-only use case in this composition (in-memory mode is disposable).
+  const recordShadowDay =
+    durableCutover && stateDir !== undefined && stateDir.trim().length > 0
+      ? new RecordShadowDayUseCase({
+        // SH2's composition created no ShadowEvidenceAdapter elsewhere, so this
+        // is the one writable instance over the ledger store it owns.
+        evidence: new ShadowEvidenceAdapter({ stateDir }),
+        // The same read-only shell-train reader the shadow report composes:
+        // reuse the instance rather than point a second one at the same files.
+        legacy: execution.legacyTrainState,
+        queue: execution.mergeQueueRepository,
+        // S8's dry-run seat: the existing import use case, apply never set.
+        importDryRun: execution.importTrainState,
+        sleep:
+          options?.daemonSleep ??
+          ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+        journal: conductor.laneRunJournal,
+        daemonEvents: daemon.events,
+        // S9's state integrity sample: the same four-context check the
+        // `state check` logic in state.ts runs, over each package's own
+        // state-file descriptor list, counting the genuinely-unknown statuses.
+        checkState: async () => {
+          const checks = await Promise.all(
+            [
+              ...WORK_EXECUTION_STATE_FILES,
+              ...EVIDENCE_AND_ACCEPTANCE_STATE_FILES,
+              ...BRIEF_KNOWLEDGE_STATE_FILES,
+              ...OPERATOR_COORDINATION_STATE_FILES,
+            ].map((descriptor) => descriptor.check(stateDir)),
+          );
+          return {
+            checked: checks.length,
+            bad: checks.filter(
+              (check) =>
+                check.result.status === 'unreadable' ||
+                check.result.status === 'read-error' ||
+                check.result.status === 'unknown-version',
+            ).length,
+          };
+        },
+        computeDigest: sha256HexDigest,
+        // The same repository derivation MergeQueueRepositoryAdapter and the
+        // daemon's mergePolicySource use — never a second formula.
+        repoDigestOf: mergeQueueRepositoryDigest,
+        // OD-4: release binding is not yet built; SH8b and a later unit revisit
+        // this constant once a release sha source exists.
+        releaseSha: async () => null,
+        nowIso: daemon.now,
+        // OD-1: the owner-accepted default is false, fail-closed; this use case
+        // only receives it.
+        settings: { excludeBatchMerges: false },
+      })
+    : undefined;
+>>>>>>> origin/main
   return {
     installation: options?.installation,
     reviewLocator,
@@ -1424,6 +1535,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       killallTrainPause,
       manageCutover,
       preparePullRequestFeedbackFix,
+      /** SH8a: `cutover shadow record-day`; undefined without a durable state directory. */
+      ...(recordShadowDay !== undefined ? { recordShadowDay } : {}),
       reviewThreadHelper,
       exportLegacyTrainState: new ExportLegacyTrainStateUseCase({
         listMergeQueue: execution.listMergeQueue,

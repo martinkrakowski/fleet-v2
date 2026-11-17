@@ -151,7 +151,18 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     // contract. Skip the early bind entirely when this call is not an apply;
     // the already-bound refusal path above (a binding that exists and
     // mismatches) is unchanged either way, since it never writes anything.
-    if (binding.outcome === 'unbound' && parseApply(payload['apply'])) {
+    // CO14b fix round 5: `checkable` is also the only condition under which
+    // `binding` was genuinely read rather than assumed `unbound`. When the
+    // root is not checkable (relative, containing `..`, or over 4096 chars),
+    // treating that assumed `unbound` as real and binding anyway would call
+    // `store.bindDriver`, which does a real `fs.mkdir(root, { recursive: true
+    // })` plus writes the `.release-driver` marker, using an unvalidated
+    // root, before `manageReleaseFromPayload`'s own `parseRequest` ever gets
+    // to refuse it. Gate the early bind on `checkable` too, so an invalid
+    // root falls straight through to that existing validation, which refuses
+    // it without writing anything, exactly as before this bind-before-apply
+    // logic was added.
+    if (checkable && binding.outcome === 'unbound' && parseApply(payload['apply'])) {
       const bound = await store.bindDriver({ root, stateDir });
       if (bound.outcome !== 'bound' || bound.stateDir !== stateDir) {
         // Another process's bind won the race first (or the bind itself is

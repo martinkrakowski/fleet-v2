@@ -96,6 +96,56 @@ describe('release root state directory binding (CO14 follow-up)', () => {
     },
   );
 
+  it(
+    'CO14b fix round 5: an apply request with an invalid root never reaches bindDriver, ' +
+      'and creates nothing on disk, even though the root is unbound',
+    async () => {
+      const base = await tempDir('co14b-invalid-root-base-');
+      const sourceDir = await tempDir('co14b-invalid-root-source-');
+      const stateDir = await tempDir('co14b-invalid-root-state-');
+      const rt: FleetCliRuntime = createFleetCliRuntime({
+        stateDir,
+        installation: installationWithDaemonStateDir(stateDir) as never,
+      });
+      // A literal `..` segment (not resolved away, unlike `path.join`), so
+      // `checkable` is false even though the resolved target is harmless.
+      const dotDotRoot = `${base}/escape/../escape`;
+      const bindSpyA = vi.spyOn(ReleaseStoreAdapter.prototype, 'bindDriver');
+      const outA: string[] = [];
+      const errA: string[] = [];
+      const codeA = await runCli(
+        ['release', 'install', '--root', dotDotRoot, '--sha', SHA, '--source', sourceDir, '--apply'],
+        { stdout: (text) => outA.push(text), stderr: (text) => errA.push(text) },
+        rt,
+      );
+      expect(codeA).toBe(2);
+      expect(outA.join('')).toBe('');
+      expect(errA.join('')).toContain("--root <absolute path without '..'>");
+      expect(bindSpyA).not.toHaveBeenCalled();
+      // Nothing was created: not the resolved target, not the raw base.
+      await expect(stat(join(base, 'escape'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readdir(base)).toEqual([]);
+      bindSpyA.mockRestore();
+
+      // A relative root is also uncheckable, for the same reason.
+      const relativeRoot = 'release-root-relative';
+      const bindSpyB = vi.spyOn(ReleaseStoreAdapter.prototype, 'bindDriver');
+      const outB: string[] = [];
+      const errB: string[] = [];
+      const codeB = await runCli(
+        ['release', 'install', '--root', relativeRoot, '--sha', SHA, '--source', sourceDir, '--apply'],
+        { stdout: (text) => outB.push(text), stderr: (text) => errB.push(text) },
+        rt,
+      );
+      expect(codeB).toBe(2);
+      expect(outB.join('')).toBe('');
+      expect(errB.join('')).toContain("--root <absolute path without '..'>");
+      expect(bindSpyB).not.toHaveBeenCalled();
+      await expect(stat(relativeRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      bindSpyB.mockRestore();
+    },
+  );
+
   it('a release under another state directory cannot miss a live lease', async () => {
     const root = await tempDir('co14-release-root-');
     const servingStateDir = await tempDir('co14-state-a-');

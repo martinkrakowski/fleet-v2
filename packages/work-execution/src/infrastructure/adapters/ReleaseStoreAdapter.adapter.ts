@@ -221,6 +221,18 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       const names = opNames(input.root, input.action, input.sha);
       await fs.mkdir(path.dirname(names.intent), { recursive: true });
       const opId = input.opId;
+      // CO14b fix round 5: `completeOperation` renames the intent to this
+      // opId's `.done` marker, so once that marker exists the intent file
+      // itself is gone and the exclusive-create below would otherwise
+      // succeed FRESH for a stale, already-used opId — treating it as a
+      // legitimate new start and letting the caller ride that completed
+      // operation's already-consumed grant through `resumeActionId`, instead
+      // of being independently authorized. Checked before the
+      // exclusive-create attempt, so a stale opId is refused before any
+      // write at all, not only after a write has already happened.
+      if ((await lstatOrNull(names.done(opId))) !== null) {
+        return { outcome: 'busy' };
+      }
       let started = true;
       try {
         await fs.writeFile(

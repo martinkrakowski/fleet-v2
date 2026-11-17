@@ -96,6 +96,34 @@ describe('release operation record', () => {
     expect((await begin(T_FRESH)).outcome).toBe('started');
   });
 
+  it(
+    'CO14b fix round 5: a completed opId can never be reused for a fresh operation, ' +
+      'but a genuinely new opId still starts normally',
+    async () => {
+      const staleOpId = store.newOperationId();
+      const first = await store.beginOperation({ root, action: 'swap', sha: SHA, opId: staleOpId, nowIso: T0 });
+      expect(first).toEqual({ outcome: 'started', opId: staleOpId });
+      // Completing renames the intent to `<base>.<opId>.done`: the intent file
+      // itself is now gone, so a naive exclusive-create under this same
+      // opId would otherwise succeed FRESH, as if it were a brand-new start.
+      expect(
+        await store.completeOperation({ root, action: 'swap', sha: SHA, opId: staleOpId }),
+      ).toEqual({ outcome: 'ok' });
+      // Reusing the now-completed opId is refused, not a fresh 'started'.
+      expect(
+        await store.beginOperation({ root, action: 'swap', sha: SHA, opId: staleOpId, nowIso: T_FRESH }),
+      ).toEqual({ outcome: 'busy' });
+      // The refused attempt wrote no fresh intent of its own.
+      expect(await store.peekOperation({ root, action: 'swap', sha: SHA })).toEqual({ outcome: 'none' });
+      // A genuinely new opId for the same action and sha, with no `.done`
+      // marker of its own, still starts normally.
+      const freshOpId = store.newOperationId();
+      expect(
+        await store.beginOperation({ root, action: 'swap', sha: SHA, opId: freshOpId, nowIso: T_FRESH }),
+      ).toEqual({ outcome: 'started', opId: freshOpId });
+    },
+  );
+
   it('binds a root to its driver state directory; the first binding wins', async () => {
     expect(await store.readDriverBinding({ root })).toEqual({ outcome: 'unbound' });
     expect(await store.bindDriver({ root, stateDir: '/srv/a' })).toEqual({ outcome: 'bound', stateDir: '/srv/a' });

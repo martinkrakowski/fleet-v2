@@ -26,6 +26,7 @@ import { toDaemonRepositoryRefs } from './composition/daemon.js';
 export const DAEMON_HELP = `Usage: fleet-v2 daemon <subcommand> (state: --state-dir <dir> or FLEET_STATE_DIR)
   daemon tick [--budget-seconds <n>] [--job <id>]...   run one bounded tick
   daemon status [--json]                               report the last tick's health (read-only)
+  daemon watchdog [--budget-seconds <n>] [--json]         check merge-train health once and raise attention items
   daemon pause                                         pause the daemon
   daemon resume                                        resume the daemon
 Exit codes: 0 completed or healthy, 1 refused, unhealthy or unknown, 2 usage error.`;
@@ -37,7 +38,7 @@ export interface DaemonCliOptions {
 
 const MAX_ARGV = 256;
 const MAX_JOB_FILTER = 64;
-const SUBCOMMANDS: readonly string[] = ['tick', 'status', 'pause', 'resume'];
+const SUBCOMMANDS: readonly string[] = ['tick', 'status', 'watchdog', 'pause', 'resume'];
 const HELP_TOKENS: readonly string[] = ['help', '--help', '-h'];
 const SAFE_REASON_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
@@ -87,6 +88,18 @@ interface ParsedTickArgs {
   readonly jobs: readonly string[];
 }
 
+/** A tick/watchdog budget: a decimal integer in `1..DAEMON_MAX_BUDGET_SECONDS`; else null. */
+function parseBudgetSecondsValue(value: string): number | null {
+  if (!/^[0-9]{1,5}$/.test(value)) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > DAEMON_MAX_BUDGET_SECONDS) {
+    return null;
+  }
+  return parsed;
+}
+
 /** Strict `tick` flags; null for any usage error. */
 function parseTickArgs(args: readonly string[]): ParsedTickArgs | null {
   let budgetSeconds: number | undefined;
@@ -115,11 +128,11 @@ function parseTickArgs(args: readonly string[]): ParsedTickArgs | null {
       value = args[index];
     }
     if (name === '--budget-seconds') {
-      if (budgetSeconds !== undefined || !/^[0-9]{1,5}$/.test(value)) {
+      if (budgetSeconds !== undefined) {
         return null;
       }
-      const parsed = Number(value);
-      if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > DAEMON_MAX_BUDGET_SECONDS) {
+      const parsed = parseBudgetSecondsValue(value);
+      if (parsed === null) {
         return null;
       }
       budgetSeconds = parsed;
@@ -144,9 +157,55 @@ function parseStatusArgs(args: readonly string[]): { readonly json: boolean } | 
   return args.length === 1 && args[0] === '--json' ? { json: true } : null;
 }
 
+/** Strict `watchdog` flags; null for any usage error. */
+function parseWatchdogArgs(
+  args: readonly string[],
+): { readonly budgetSeconds: number | undefined; readonly json: boolean } | null {
+  let budgetSeconds: number | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    const equals = token.indexOf('=');
+    const name = token.startsWith('--') && equals > 0 ? token.slice(0, equals) : token;
+    const value: string | undefined = name === token ? undefined : token.slice(equals + 1);
+    if (name !== '--budget-seconds' && name !== '--json') {
+      return null;
+    }
+    if (name === '--json') {
+      if (value !== undefined || json) {
+        return null;
+      }
+      json = true;
+      continue;
+    }
+    if (budgetSeconds !== undefined) {
+      return null;
+    }
+    if (value === undefined) {
+      index += 1;
+      if (index >= args.length) {
+        return null;
+      }
+      const parsed = parseBudgetSecondsValue(args[index]);
+      if (parsed === null) {
+        return null;
+      }
+      budgetSeconds = parsed;
+      continue;
+    }
+    const parsed = parseBudgetSecondsValue(value);
+    if (parsed === null) {
+      return null;
+    }
+    budgetSeconds = parsed;
+  }
+  return { budgetSeconds, json };
+}
+
 type ParsedDaemonArgs =
   | { readonly kind: 'tick'; readonly tick: ParsedTickArgs }
   | { readonly kind: 'status'; readonly json: boolean }
+  | { readonly kind: 'watchdog'; readonly budgetSeconds: number | undefined; readonly json: boolean }
   | { readonly kind: 'pause' | 'resume' };
 
 /** Checks that need no parsing: an exit code for invalid, empty, help and unknown-subcommand argv, else null. */
@@ -179,6 +238,10 @@ function parseSubcommandArgs(subcommand: string, args: readonly string[]): Parse
   if (subcommand === 'status') {
     const status = parseStatusArgs(args);
     return status === null ? null : { kind: 'status', json: status.json };
+  }
+  if (subcommand === 'watchdog') {
+    const watchdog = parseWatchdogArgs(args);
+    return watchdog === null ? null : { kind: 'watchdog', ...watchdog };
   }
   return args.length > 0 ? null : { kind: subcommand === 'pause' ? 'pause' : 'resume' };
 }
@@ -224,6 +287,9 @@ async function dispatch(
   }
   if (parsed.kind === 'status') {
     return await runStatus(io, runtime, parsed.json, nowIso);
+  }
+  if (parsed.kind === 'watchdog') {
+    return await runWatchdog(io, runtime, parsed, nowIso);
   }
   return await runPause(io, runtime, parsed.kind === 'pause', nowIso);
 }
@@ -413,4 +479,230 @@ async function runPause(io: CliIo, runtime: FleetCliRuntime, paused: boolean, no
   }
   io.stdout(`${JSON.stringify({ outcome: 'refused', reasonCode: result.reasonCode })}\n`);
   return 1;
+}
+
+/** The findings cap of the watchdog report, matching the use case's `TRAIN_HEALTH_FINDINGS_MAX`. */
+export const MAX_WATCHDOG_FINDINGS = 200;
+/** A normalized finding key: `train-health:<rule>` optionally suffixed by a pull request number. */
+const FINDING_KEY_PATTERN = /^train-health:[a-z-]{1,40}(:[0-9]{1,10})?$/;
+/** The watchdog runs one watch pass per configured repository, at most this many. */
+export const MAX_WATCHDOG_REPOSITORIES = 32;
+
+export interface WatchdogFinding {
+  readonly rule: string;
+  readonly key: string;
+  readonly pullRequest: number | null;
+}
+
+export interface WatchdogRepositoryReport {
+  readonly repoDigest: string;
+  readonly outcome: 'evaluated' | 'blind' | 'budget-exhausted' | 'refused';
+  readonly exitCode: 0 | 1;
+  readonly findings: readonly WatchdogFinding[];
+  readonly raised: number;
+  readonly cleared: number;
+  readonly attentionFailures: number;
+  /** Present only for `outcome: 'evaluated'`. */
+  readonly healthy?: boolean;
+  /** Present only for `outcome: 'blind' | 'refused'`. */
+  readonly reasonCode?: string;
+}
+
+/**
+ * Reads an own data property by descriptor: never a prototype property, never a
+ * getter (`'value' in desc` excludes accessor descriptors), never an inherited
+ * or synthesized member. Returns `undefined` when the property is absent, a
+ * hole, an accessor, or the source is not an object. No optional chaining on
+ * caller-supplied values.
+ */
+function ownValue(source: unknown, key: string | number): unknown {
+  if (typeof source !== 'object' || source === null) {
+    return undefined;
+  }
+  const desc = Object.getOwnPropertyDescriptor(source, key);
+  return desc !== undefined && 'value' in desc ? desc.value : undefined;
+}
+
+function safeFindingKey(value: unknown): string {
+  return typeof value === 'string' && FINDING_KEY_PATTERN.test(value) ? value : 'train-health:unknown';
+}
+
+function nonNegInt(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function refusedRepo(repoDigest: string): WatchdogRepositoryReport {
+  return {
+    repoDigest,
+    outcome: 'refused',
+    exitCode: 1,
+    reasonCode: 'watch-failed',
+    findings: [],
+    raised: 0,
+    cleared: 0,
+    attentionFailures: 0,
+  };
+}
+
+/**
+ * One finding slot, normalized. Cost: constant per slot.
+ */
+function normalizeFinding(item: unknown): WatchdogFinding {
+  if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+    return { rule: 'unknown', key: 'train-health:unknown', pullRequest: null };
+  }
+  const pr = ownValue(item, 'pullRequest');
+  return {
+    rule: safeReason(ownValue(item, 'rule'), 'unknown'),
+    key: safeFindingKey(ownValue(item, 'key')),
+    pullRequest: typeof pr === 'number' && Number.isSafeInteger(pr) ? pr : null,
+  };
+}
+
+/**
+ * The answer's findings, normalized. Cost: linear in the capped input, bounded
+ * by `MAX_WATCHDOG_FINDINGS = 200`; the length is checked before any traversal,
+ * so an enormous reported length is refused without touching a single slot.
+ * Returns null (refuse) for a present-but-not-array `findings`.
+ */
+function normalizeFindings(answer: object): readonly WatchdogFinding[] | null {
+  const findingsRaw = ownValue(answer, 'findings');
+  if (findingsRaw === undefined) {
+    return [];
+  }
+  if (!Array.isArray(findingsRaw)) {
+    return null;
+  }
+  const findingsLength = ownValue(findingsRaw, 'length');
+  if (
+    typeof findingsLength !== 'number' ||
+    !Number.isSafeInteger(findingsLength) ||
+    findingsLength < 0 ||
+    findingsLength > MAX_WATCHDOG_FINDINGS
+  ) {
+    return null;
+  }
+  const findings: WatchdogFinding[] = [];
+  for (let index = 0; index < findingsLength; index += 1) {
+    findings.push(normalizeFinding(ownValue(findingsRaw, index)));
+  }
+  return findings;
+}
+
+/**
+ * One repository's watchdog answer, normalized against hostile input. Cost:
+ * linear in the capped input, bounded by `MAX_WATCHDOG_FINDINGS = 200`.
+ * Never throws: every refusal is the typed `watch-failed` report.
+ */
+export function watchdogRepositoryReport(repoDigest: unknown, answer: unknown): WatchdogRepositoryReport {
+  const safeDigest = typeof repoDigest === 'string' ? repoDigest : 'unknown';
+  try {
+    if (typeof answer !== 'object' || answer === null || Array.isArray(answer)) {
+      return refusedRepo(safeDigest);
+    }
+    const outcome = ownValue(answer, 'outcome');
+    if (outcome !== 'evaluated' && outcome !== 'blind' && outcome !== 'budget-exhausted' && outcome !== 'refused') {
+      return refusedRepo(safeDigest);
+    }
+    const findings = normalizeFindings(answer);
+    if (findings === null) {
+      return refusedRepo(safeDigest);
+    }
+    const report: WatchdogRepositoryReport = {
+      repoDigest: safeDigest,
+      outcome,
+      // Exit 0 requires ALL of: evaluated, own exitCode 0, healthy true, zero findings.
+      exitCode:
+        outcome === 'evaluated' &&
+        ownValue(answer, 'exitCode') === 0 &&
+        ownValue(answer, 'healthy') === true &&
+        findings.length === 0
+          ? 0
+          : 1,
+      findings,
+      raised: nonNegInt(ownValue(answer, 'raised')),
+      cleared: nonNegInt(ownValue(answer, 'cleared')),
+      attentionFailures: nonNegInt(ownValue(answer, 'attentionFailures')),
+    };
+    if (outcome === 'evaluated') {
+      return { ...report, healthy: ownValue(answer, 'healthy') === true };
+    }
+    if (outcome === 'blind' || outcome === 'refused') {
+      return { ...report, reasonCode: safeReason(ownValue(answer, 'reasonCode'), 'unknown') };
+    }
+    return report;
+  } catch {
+    return refusedRepo(safeDigest);
+  }
+}
+
+/** The text verdict of one repository report: no nested ternaries, no echo of unknown outcomes. */
+function watchdogVerdict(r: WatchdogRepositoryReport): string {
+  if (r.outcome === 'evaluated') {
+    return r.healthy === true ? 'healthy' : 'unhealthy';
+  }
+  return r.outcome;
+}
+
+/**
+ * One `daemon watchdog` pass: read the merge policy, share one deadline across
+ * every configured repository and watch each train once. Output carries ids,
+ * fixed reason codes, keys and counts only — never paths, error text or
+ * finding evidence.
+ */
+async function runWatchdog(
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  parsed: { readonly budgetSeconds: number | undefined; readonly json: boolean },
+  nowIso: string,
+): Promise<number> {
+  const refuse = (reasonCode: string): number => {
+    io.stdout(`${JSON.stringify({ outcome: 'refused', exitCode: 1, reasonCode })}\n`);
+    return 1;
+  };
+
+  const policyAnswer = await runtime.daemon.mergePolicy.readMergePolicy().catch(() => null);
+  if (policyAnswer === null || policyAnswer.outcome !== 'known') {
+    return refuse(safeReason(policyAnswer?.reason, 'policy-unreadable'));
+  }
+
+  const deadlineIso = computeTickDeadlineIso(nowIso, parsed.budgetSeconds ?? policyAnswer.daemon.budgetSeconds);
+  if (deadlineIso === null) {
+    return refuse('invalid-budget');
+  }
+
+  const refs = toDaemonRepositoryRefs(policyAnswer);
+  if (refs.length > MAX_WATCHDOG_REPOSITORIES) {
+    return refuse('too-many-repositories');
+  }
+
+  const repositories: WatchdogRepositoryReport[] = [];
+  for (const ref of refs) {
+    const answer = await runtime.daemon.watchTrainHealth
+      .watchTrainHealth({
+        projectId: ref.projectId,
+        repository: { owner: ref.owner, repo: ref.repo },
+        repoDigest: ref.repoDigest,
+        deadlineIso,
+      })
+      .catch(() => null);
+    repositories.push(watchdogRepositoryReport(ref.repoDigest, answer));
+  }
+  const exitCode = repositories.some((r) => r.exitCode === 1) ? 1 : 0;
+
+  if (parsed.json) {
+    io.stdout(
+      `${JSON.stringify({ outcome: 'completed', exitCode, repositoryCount: repositories.length, repositories })}\n`,
+    );
+    return exitCode;
+  }
+  let text = '';
+  for (const r of repositories) {
+    text += `watchdog ${r.repoDigest} ${watchdogVerdict(r)} findings=${r.findings.length} raised=${r.raised} cleared=${r.cleared}\n`;
+    for (const finding of r.findings) {
+      text += `finding ${finding.key}\n`;
+    }
+  }
+  io.stdout(text);
+  return exitCode;
 }

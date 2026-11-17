@@ -16,3 +16,11 @@ export type {
   ShadowConformanceRunsRead,
   ShadowConformanceRunsUnknown,
 } from './conducted-facts.js';
+export {
+  readShadowGateHeads,
+} from './gate-heads.js';
+export type {
+  ShadowGateHeadsDependencies,
+  ShadowGateHeadsRequest,
+  ShadowGateHeadsResult,
+} from './gate-heads.js';

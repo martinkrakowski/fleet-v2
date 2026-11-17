@@ -160,6 +160,19 @@ describe('extractShadowShellFacts: extraction', () => {
     expect(facts.headMovesIncompleteFor).toEqual([7]);
   });
 
+  it('a result/merged clears the pending intent before anything else', () => {
+    const facts = expectOk([
+      event({ line: 1, kind: 'intent', outcome: 'update-branch', pullRequest: 7, headOid: OLD_HEAD }),
+      event({ line: 2, outcome: 'merged', pullRequest: 7, headOid: HEAD }),
+      event({ line: 3, outcome: 'updated', pullRequest: 7, headOid: HEAD, detailCode: 'premerge-carried' }),
+    ]);
+    expect(facts.merges).toHaveLength(1);
+    expect(facts.headMoves).toEqual([]);
+    expect(facts.carryDecisions).toEqual([]);
+    expect(facts.anomalies).toEqual([{ atIso: AT, code: 'unpaired-update' }]);
+    expect(facts.headMovesIncompleteFor).toEqual([7]);
+  });
+
   it('two intents then one result pairs from the second intent', () => {
     const newerHead = 'fedcba9876543210fedcba9876543210fedcba98';
     const facts = expectOk([
@@ -222,6 +235,34 @@ describe('extractShadowShellFacts: hostile input', () => {
     expectInvalid({ length: 1, 0: event() });
   });
 
+  it('refuses a Proxy whose getOwnPropertyDescriptor reports NaN for length', () => {
+    const plain = [event()];
+    const proxy = new Proxy(plain, {
+      getOwnPropertyDescriptor(target, property) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+        if (property === 'length' && descriptor) {
+          return { ...descriptor, value: Number.NaN };
+        }
+        return descriptor;
+      },
+    });
+    expectInvalid(proxy);
+  });
+
+  it('refuses an array with an extra own enumerable key', () => {
+    const list: unknown[] = [event()];
+    (list as unknown as Record<string, unknown>).extra = 'hostile';
+    expectInvalid(list);
+  });
+
+  it('refuses a string where the event list is due', () => {
+    expectInvalid('not-a-list');
+  });
+
+  it('refuses a number where a string field is due', () => {
+    expectInvalid([event({ atIso: 17 as unknown as string })]);
+  });
+
   it('refuses a sparse array with a hole', () => {
     const holey: unknown[] = [event()];
     holey.length = 2;
@@ -278,6 +319,15 @@ describe('extractShadowShellFacts: hostile input', () => {
     const item = JSON.parse(JSON.stringify(event())) as Record<string, unknown>;
     Object.defineProperty(item, '__proto__', { value: null, enumerable: true, configurable: true });
     expectInvalid([item]);
+  });
+
+  it('refuses an element that is a Proxy with a throwing getPrototypeOf trap', () => {
+    const hostile = new Proxy(event(), {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf');
+      },
+    });
+    expectInvalid([hostile]);
   });
 
   it('is not satisfied by a constant verdict', () => {

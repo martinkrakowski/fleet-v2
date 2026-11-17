@@ -44,9 +44,11 @@ export type ShadowShellFactsExtraction =
  * shell train's parsed events log. Cost: linear in the capped input —
  * O(SHADOW_SHELL_FACTS_MAX_EVENTS) element reads at worst, each element
  * validated by `readShellEvent`; the list cap is checked from the length
- * descriptor before any element is read. Never throws; every refusal is the
- * typed `invalid-input` result. Reads only own data-property descriptors, so
- * no getter on the list root or on any element ever runs.
+ * descriptor before any element is read. Sorting `headMovesIncompleteFor`
+ * costs O(k log k) in the number of distinct incomplete pull requests, k
+ * bounded by the event cap. Never throws; every refusal is the typed
+ * `invalid-input` result. Reads only own data-property descriptors, so no
+ * getter on the list root or on any element ever runs.
  */
 export function extractShadowShellFacts(events: unknown): ShadowShellFactsExtraction {
   try {
@@ -71,19 +73,24 @@ function readEventList(events: unknown): readonly ShellTrainEvent[] | null {
     return null;
   }
   const lengthDescriptor = Object.getOwnPropertyDescriptor(events, 'length');
+  const length = lengthDescriptor?.value;
   if (
     lengthDescriptor === undefined ||
     lengthDescriptor.get !== undefined ||
     lengthDescriptor.set !== undefined ||
-    typeof lengthDescriptor.value !== 'number' ||
-    lengthDescriptor.value > SHADOW_SHELL_FACTS_MAX_EVENTS ||
-    false
+    typeof length !== 'number' ||
+    !Number.isSafeInteger(length) ||
+    length < 0 ||
+    length > SHADOW_SHELL_FACTS_MAX_EVENTS
   ) {
+    return null;
+  }
+  if (Reflect.ownKeys(events).length !== length + 1) {
     return null;
   }
   const out: ShellTrainEvent[] = [];
   let previousLine = -1;
-  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+  for (let index = 0; index < length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(events, String(index));
     if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
       return null;
@@ -107,6 +114,9 @@ function extractFacts(events: readonly ShellTrainEvent[]): ShadowShellFacts {
   const anomalies: ShadowShellAnomaly[] = [];
   const pendingUpdates = new Map<number, string>();
   for (const event of events) {
+    if (event.kind === 'result' && event.pullRequest !== null && event.outcome !== 'updated') {
+      pendingUpdates.delete(event.pullRequest);
+    }
     if (event.kind === 'result' && event.outcome === 'merged') {
       readMergedEvent(event, merges, anomalies);
     } else if (event.kind === 'head-moved') {
@@ -115,8 +125,6 @@ function extractFacts(events: readonly ShellTrainEvent[]): ShadowShellFacts {
       readUpdateIntentEvent(event, pendingUpdates);
     } else if (event.kind === 'result' && event.outcome === 'updated') {
       readUpdatedEvent(event, headMoves, carryDecisions, anomalies, incomplete, pendingUpdates);
-    } else if (event.kind === 'result' && event.pullRequest !== null) {
-      pendingUpdates.delete(event.pullRequest);
     }
   }
   return {

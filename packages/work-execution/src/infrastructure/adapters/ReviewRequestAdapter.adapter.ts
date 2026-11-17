@@ -160,8 +160,11 @@ function ownProperty(value: unknown, key: string): { readonly value: unknown } |
  * fixed set of keys (no loop over caller-supplied names). `projectId` is at
  * most 200 characters before any per-character or secret scan, and the digest
  * and head are fixed-length patterns. When `requireRequestProjectId` is set
- * (a review request, not a find), the request's own `projectId` must be present
- * and equal the subject's; an absent id is invalid. Never throws.
+ * (a review request, not a find), the request's own `projectId` — read by
+ * `ownProperty` — must be a data property whose value is exactly the subject's
+ * id. Absent (`undefined`), an accessor or a failing descriptor (`'unreadable'`),
+ * or a `.value` that is not that string is invalid. A find still treats an
+ * absent id as no disagreement, and an unreadable id as invalid. Never throws.
  */
 function readBriefSubject(
   request: unknown,
@@ -185,8 +188,7 @@ function readBriefSubject(
       baseRead === undefined || baseRead === 'unreadable' ||
       chainNameRead !== undefined || integrationRead !== undefined ||
       attemptRead === undefined || attemptRead === 'unreadable' ||
-      headRead === undefined || headRead === 'unreadable' ||
-      requestProjectRead === 'unreadable'
+      headRead === undefined || headRead === 'unreadable'
     ) {
       return { kind: 'invalid' };
     }
@@ -196,13 +198,20 @@ function readBriefSubject(
     if (typeof projectId !== 'string' || !isValidBriefProjectId(projectId) || containsSecretShape(projectId)) {
       return { kind: 'invalid' };
     }
-    // A review request must name this project itself. A find carries no project
-    // id, so only that path still treats an absent id as "no disagreement".
+    // `ownProperty` returns undefined when absent, 'unreadable' for an accessor
+    // or a failing descriptor, and { value } for a data property. A review
+    // request must name this project itself. A find carries no project id, so
+    // only that path still treats an absent id as "no disagreement".
     if (requireRequestProjectId) {
-      if (requestProjectRead === undefined || requestProjectRead === 'unreadable' || requestProjectRead.value !== projectId) {
+      if (
+        requestProjectRead === undefined ||
+        requestProjectRead === 'unreadable' ||
+        typeof requestProjectRead.value !== 'string' ||
+        requestProjectRead.value !== projectId
+      ) {
         return { kind: 'invalid' };
       }
-    } else if (!sameProject) {
+    } else if (requestProjectRead === 'unreadable' || !sameProject) {
       return { kind: 'invalid' };
     }
     if (!isValidBriefPackageDigest(briefPackageDigest)) {

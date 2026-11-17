@@ -689,6 +689,26 @@ describe('brief-verify invalid-request', () => {
     await refused(omitKey(briefRequest(), 'projectId'));
   });
 
+  it('requestReview refuses a top-level projectId accessor with invalid-request and does not invoke the getter', async () => {
+    let invoked = false;
+    const request = omitKey(briefRequest(), 'projectId');
+    Object.defineProperty(request, 'projectId', {
+      enumerable: true,
+      get() {
+        invoked = true;
+        return PROJECT;
+      },
+    });
+    await refused(request);
+    expect(invoked).toBe(false);
+  });
+
+  it('requestReview refuses a non-string top-level projectId with invalid-request and calls no delegate', async () => {
+    const request = briefRequest();
+    Object.defineProperty(request, 'projectId', { value: 7, enumerable: true });
+    await refused(request);
+  });
+
   it.each([
     ['an uppercase brief digest', 'AB'.repeat(32)],
     ['a wrong-length brief digest', 'ab'.repeat(31)],

@@ -71,6 +71,7 @@ import { mergeCommands } from './merge.js';
 import { relaunchCommands } from './relaunch.js';
 import { releaseCommands } from './release.js';
 import { cutoverCommands } from './commands/cutover.js';
+import { laneCommand } from './commands/lane.js';
 import { tuiCommand } from './tui/command.js';
 
 export { resolveRunnerSettings };
@@ -714,7 +715,9 @@ killall halt marker; --lift clears the pause then the marker. Run
 
 The cutover group reports the shadow comparison of the fleet-v2 merge queue
 against the shell train's recorded queue for one repository (read-only, ids and
-codes only). Run 'fleet-v2 cutover --help'.
+codes only), and moves the cutover record: 'switch' is the one-way door through
+the shadow criteria evidence, and 'retire' closes the record after the 14-day
+rollback window. Run 'fleet-v2 cutover --help'.
 The report group prints the weekly run-journal service report (read-only, one
 JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 
@@ -725,6 +728,13 @@ population (conducted, attempt-recorded, unrecorded). It writes nothing,
 journals nothing and mutates no worktree.
 
 The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
+
+The lane group runs the lane diff check over one worktree (read-only, findings
+carry path, line and rule name only): lane diff-check <worktree>
+--allowed-path-prefixes '<json array>' [--base <value>]
+[--policy-protected-paths '<json array>']. Only a 40-digit lowercase hex base
+sha enables the base-line allowance; any other base value is never a clean
+exit. Run 'fleet-v2 lane diff-check --help'.
 
 Commands:
   work-order register|inspect|close|stale|rerun
@@ -743,11 +753,16 @@ Commands:
   relaunch inventory [--host <name>]
   release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
+  cutover shadow record-day --repository owner/repo --legacy-state-dir <path> [--day YYYY-MM-DD]
+  cutover switch --expected-revision <n> --operation-id <id> --relaunch-plan-digest <64 hex> [--now-iso <iso>] [--deadline-iso <iso>]
+  cutover retire --expected-revision <n> --operation-id <id> [--now-iso <iso>] [--deadline-iso <iso>]
+  lane diff-check <worktree> --allowed-path-prefixes '<json array>' [--base <value>]
   tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared|explain
   forge execute
+  forge threads list|reply|resolve --repository owner/repo --pull-request-number <n> [--thread-id <id>] [--body-file <path>] [--yes]
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
   decisions report --consumer knowledge-ranking
@@ -875,6 +890,16 @@ export async function runCli(
         stateDir: daemonOptions?.stateDir ?? stateDir,
       });
     }
+    // The lane group runs the lane diff check directly through its adapter;
+    // it never composes the runtime or loads the installation, so a bad
+    // installation cannot block it and no installation path is printed.
+    if (group === 'lane') {
+      // `diff-check` is the lane group's only subcommand and the parser takes
+      // the worktree as its first positional, so the subcommand token must be
+      // stripped here; leaving it in made every real invocation a usage error.
+      const laneRest = restArgv[1] === 'diff-check' ? restArgv.slice(2) : restArgv.slice(1);
+      return await laneCommand(laneRest, io);
+    }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.
     let activeRuntime: FleetCliRuntime;
@@ -946,6 +971,7 @@ export async function runCli(
       (group === 'questions' && QUESTIONS_POSITIONAL_SUBCOMMANDS.has(subcommand)) ||
       (group === 'knowledge' && subcommand === 'candidates') ||
       (group === 'cutover' && subcommand === 'shadow') ||
+      (group === 'forge' && subcommand === 'threads') ||
       (group === 'owner-items' && subcommand === 'resolve');
     const payload = parseFlags(rest, {
       allowPositional,

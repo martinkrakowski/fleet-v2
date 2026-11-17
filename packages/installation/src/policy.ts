@@ -18,12 +18,16 @@ import type {
   ChainRole,
   ChainStep,
   ChainsSection,
+  ConductorPremergeMode,
   ConductorReaperRepairKind,
   FleetInstallationModel,
   LiveTailContent,
+  MergePolicyInvalidReason,
   MergePolicyRead,
   MergeVetoMode,
   PolicySection,
+  ProjectPrepareArgvInvalidReason,
+  ProjectPrepareArgvRead,
   ResolvedConductorPolicy,
   ResolvedConductorReaperDiskPolicy,
   ResolvedConductorReaperPolicy,
@@ -532,10 +536,24 @@ function freshDefaultConductorReaper(): ResolvedConductorReaperPolicy {
   });
 }
 
+function readResolvedConductorPremergeMode(
+  block: Record<string, unknown>,
+): ConductorPremergeMode | undefined {
+  if (!Object.hasOwn(block, 'premergeMode')) {
+    return 'human-gate';
+  }
+  const value = readOwnDataProperty(block, 'premergeMode');
+  if (value === 'human-gate' || value === 'auto-attest') {
+    return value;
+  }
+  return undefined;
+}
+
 function freshDefaultConductorPolicy(): ResolvedConductorPolicy {
   return Object.freeze({
     enabled: false,
     stopGraceMinutes: 45,
+    premergeMode: 'human-gate',
     reaper: freshDefaultConductorReaper(),
   });
 }
@@ -572,6 +590,10 @@ export function resolveConductorPolicy(policy: PolicySection | undefined): Resol
     CONDUCTOR_MINUTE_BOUNDS.stopGraceMinutes,
   );
   if (Object.hasOwn(block, 'stopGraceMinutes') && stopGraceMinutes === undefined) {
+    return freshDefaultConductorPolicy();
+  }
+  const premergeMode = readResolvedConductorPremergeMode(block);
+  if (premergeMode === undefined) {
     return freshDefaultConductorPolicy();
   }
   let reaper: ResolvedConductorReaperPolicy | undefined;
@@ -639,6 +661,7 @@ export function resolveConductorPolicy(policy: PolicySection | undefined): Resol
   return Object.freeze({
     enabled,
     stopGraceMinutes: stopGraceMinutes ?? 45,
+    premergeMode,
     reaper: reaper ?? freshDefaultConductorReaper(),
   });
 }
@@ -724,6 +747,9 @@ export const MERGE_POLICY_BOUNDS = Object.freeze({
   settleSeconds: Object.freeze({ min: 0, max: 600 }),
   stallAfterMinutes: Object.freeze({ min: 1, max: 1440 }),
   autoResumeMax: Object.freeze({ min: 0, max: 32 }),
+  /** CO22: per-repository prepare argv bounds. */
+  prepareMaxArgs: 32,
+  prepareArgMaxLength: 256,
 });
 
 /** The defaults of an absent `policy.daemon` (D-DT9). */
@@ -754,6 +780,20 @@ export const DEFAULT_MERGE_REPOSITORY_SETTINGS = Object.freeze({
 
 const MERGE_VETO_MODES: ReadonlySet<string> = new Set(['off', 'shadow', 'live']);
 const MERGE_REPOSITORY_KEY_PATTERN = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/;
+
+/**
+ * CO22: a prepare token never carries whitespace, an ASCII control character,
+ * or a shell metacharacter, operator, quoting or expansion character — the
+ * argv is executed directly, never through a shell, so no token may need
+ * quoting. The same regex backs `parse.ts` and the policy reader.
+ */
+// The control-character range is the point of the check (an argv token never
+// carries one), so the no-control-regex lint rule is disabled on purpose.
+export const PREPARE_FORBIDDEN_CHAR_RE =
+  // eslint-disable-next-line no-control-regex
+  /[\s\u0000-\u001f\u007f;&|`$<>()\\'"*?!~#{}[\]]/u;
+/** CO22: `argv[0]` never traverses a parent directory. */
+export const PREPARE_PARENT_TRAVERSAL_RE = /(?:^|[\\/])\.\.(?:[\\/]|$)/u;
 
 /** The owner and repo of a `policy.merge.repos` key, or undefined when the key is not `<owner>/<repo>`. */
 export function parseMergeRepositoryKey(
@@ -825,6 +865,58 @@ function readMergeRequiredContexts(value: unknown): MergeReadResult<readonly str
     contexts.push(read.value);
   }
   return mergeOk(Object.freeze(contexts));
+}
+
+/**
+ * CO22: validate a per-project prepare argv. Absent stays absent; anything
+ * else must be an own-data-property array of 1..32 non-blank tokens of at
+ * most 256 characters each, without whitespace, control characters or shell
+ * metacharacters, whose first token is an executable name or path (no flag
+ * prefix, no `..` traversal, no secret shape). Array length is checked before
+ * iterating, so an adversarial array fails in O(1) without scanning elements;
+ * a getter never runs because indices are read through the own-data-property
+ * descriptor. On any violation the whole argv is refused, never passed
+ * through partially.
+ */
+function readPrepareArgv(raw: unknown): MergeReadResult<readonly string[] | undefined> {
+  if (raw === undefined) {
+    return mergeOk(undefined);
+  }
+  if (!Array.isArray(raw)) {
+    return MERGE_INVALID;
+  }
+  if (raw.length < 1 || raw.length > MERGE_POLICY_BOUNDS.prepareMaxArgs) {
+    return MERGE_INVALID;
+  }
+  const argv: string[] = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(raw, index);
+    const item: unknown = descriptor?.value;
+    if (descriptor === undefined || !('value' in descriptor)) {
+      return MERGE_INVALID;
+    }
+    if (
+      typeof item !== 'string' ||
+      item.trim().length === 0 ||
+      item.length > MERGE_POLICY_BOUNDS.prepareArgMaxLength
+    ) {
+      return MERGE_INVALID;
+    }
+    if (containsSecretShape(item)) {
+      return MERGE_SECRET;
+    }
+    if (PREPARE_FORBIDDEN_CHAR_RE.test(item)) {
+      return MERGE_INVALID;
+    }
+    if (
+      index === 0 &&
+      (item.startsWith('-') || item === '.' || item === '..' || PREPARE_PARENT_TRAVERSAL_RE.test(item))
+    ) {
+      return MERGE_INVALID;
+    }
+    argv.push(item);
+  }
+  return mergeOk(Object.freeze(argv));
 }
 
 function readMergeVeto(
@@ -977,6 +1069,14 @@ function readMergeRepository(
   if (!veto.ok) {
     return veto;
   }
+  // CO22: `prepare` is absent-preserving — omitted on the resolved entry when
+  // the written entry omits it, a frozen argv when present.
+  const prepare = Object.hasOwn(entry, 'prepare')
+    ? readPrepareArgv(readOwnDataProperty(entry, 'prepare'))
+    : mergeOk(undefined);
+  if (!prepare.ok) {
+    return prepare;
+  }
   return mergeOk(
     Object.freeze({
       owner: parts.owner,
@@ -991,6 +1091,7 @@ function readMergeRepository(
       maxAttempts: maxAttempts.value,
       checksGraceMinutes: checksGraceMinutes.value,
       veto: veto.value,
+      ...(prepare.value !== undefined ? { prepare: prepare.value } : {}),
     }),
   );
 }
@@ -1178,6 +1279,9 @@ export function canonicalMergePolicyJson(input: {
       macosProcedure: repository.macosProcedure,
       maxAttempts: repository.maxAttempts,
       projectId: repository.projectId,
+      // CO22: a prepared repository changes the revision; an omitted one keeps
+      // the digest byte-identical to pre-CO22 revisions.
+      ...(repository.prepare !== undefined ? { prepare: [...repository.prepare] } : {}),
       requiredContexts: [...repository.requiredContexts].sort(compareBytewise),
       shadow: repository.shadow,
       unattended: repository.unattended,
@@ -1208,4 +1312,76 @@ export function mergePolicyRevision(input: {
   readonly daemon: ResolvedMergeDaemonPolicy;
 }): string {
   return createHash('sha256').update(canonicalMergePolicyJson(input)).digest('hex').slice(0, 12);
+}
+
+/** The refusal codes `resolveMergePolicy` can return; anything else is unreadable (fail closed). */
+const MERGE_POLICY_INVALID_REASONS: readonly MergePolicyInvalidReason[] = Object.freeze([
+  'policy-merge-invalid',
+  'policy-daemon-invalid',
+  'policy-too-large',
+  'policy-secret-shape',
+  'policy-unreadable',
+]);
+
+/**
+ * CO22: the per-project prepare argv for one project id, read from the merge
+ * policy. Never throws under any input — hostile values, unparsed casts,
+ * throwing getters and `Proxy` traps all come back as a typed refusal — and
+ * never echoes a rejected value. Exactly one repository entry may name the
+ * project: zero matches resolve with a null repository key and null argv, two
+ * or more refuse as ambiguous, and an argv that cannot be validated by
+ * `resolveMergePolicy` is never passed through.
+ */
+export function readProjectPrepareArgv(
+  policy: PolicySection | undefined,
+  projectId: string,
+): ProjectPrepareArgvRead {
+  try {
+    if (typeof projectId !== 'string') {
+      return Object.freeze({ outcome: 'invalid', reason: 'project-id-invalid' });
+    }
+    if (containsSecretShape(projectId)) {
+      return Object.freeze({ outcome: 'invalid', reason: 'policy-secret-shape' });
+    }
+    const bounds = MERGE_POLICY_BOUNDS.projectIdLength;
+    if (
+      projectId.trim().length === 0 ||
+      projectId !== projectId.trim() ||
+      projectId.length > bounds.max
+    ) {
+      return Object.freeze({ outcome: 'invalid', reason: 'project-id-invalid' });
+    }
+    const resolved = resolveMergePolicy(policy);
+    if (resolved.outcome === 'invalid') {
+      const reason: ProjectPrepareArgvInvalidReason = MERGE_POLICY_INVALID_REASONS.includes(
+        resolved.reason as MergePolicyInvalidReason,
+      )
+        ? (resolved.reason as ProjectPrepareArgvInvalidReason)
+        : 'policy-unreadable';
+      return Object.freeze({ outcome: 'invalid', reason });
+    }
+    const matches = resolved.repositories.filter((entry) => entry.projectId === projectId);
+    if (matches.length > 1) {
+      return Object.freeze({ outcome: 'invalid', reason: 'project-id-ambiguous' });
+    }
+    if (matches.length === 0) {
+      return Object.freeze({
+        outcome: 'resolved',
+        projectId,
+        repositoryKey: null,
+        argv: null,
+        policyRevision: resolved.policyRevision,
+      });
+    }
+    const match = matches[0];
+    return Object.freeze({
+      outcome: 'resolved',
+      projectId,
+      repositoryKey: match.repositoryKey,
+      argv: match.prepare ?? null,
+      policyRevision: resolved.policyRevision,
+    });
+  } catch {
+    return Object.freeze({ outcome: 'invalid', reason: 'policy-unreadable' });
+  }
 }

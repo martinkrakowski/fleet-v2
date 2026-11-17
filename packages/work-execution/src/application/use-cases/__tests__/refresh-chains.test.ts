@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import { LANE_DIFF_SECRET_PATTERNS, SECRET_PATTERNS } from '@fleet/shared';
 import { applyChainOutcome, applyChainRefreshIntent, applyChainRefreshOutcome, createChainRecord } from '../../../domain/chain-records.js';
 import type { ChainRecord } from '../../../domain/chain-records.js';
+import type { ConductorHaltState } from '../../../domain/conductor-halt.js';
 import type { ChainRepositoryPort } from '../../ports/out/ChainRepositoryPort.out-port.js';
+import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
 import type { ChainListResult, ChainRecordDecision, ChainRecordRead } from '../../ports/out/ChainRepositoryPort.out-port.js';
 import type {
   ChainAttentionCommand,
@@ -27,6 +29,28 @@ const NOW = '2026-11-05T10:00:00.000Z';
 const DEADLINE = '2026-11-05T10:00:45.000Z';
 const LATE = '2026-11-05T10:00:44.000Z';
 const KEY = `chain-refresh/example@${MAIN.slice(0, 12)}`;
+
+const clearHalt = { read: async () => ({ state: 'clear' as const, record: null }) };
+
+class FakeHalt implements Pick<ConductorHaltPort, 'read'> {
+  halted = false;
+  failing = false;
+  reads = 0;
+  onRead?: (reads: number) => void;
+
+  constructor(private readonly trace: string[]) {}
+
+  async read(): Promise<ConductorHaltState> {
+    this.trace.push('halt');
+    this.reads += 1;
+    this.onRead?.(this.reads);
+    if (this.failing) throw new Error('halt-read-failed');
+    if (this.halted) {
+      return { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } } as ConductorHaltState;
+    }
+    return { state: 'clear', record: null };
+  }
+}
 
 function command(overrides: Record<string, unknown> = {}) {
   return { repository: REPO, projectId: PROJECT, nowIso: NOW, deadlineIso: DEADLINE, ...overrides } as never;
@@ -53,6 +77,8 @@ function conflictAtOldKey(): Partial<ChainRecord> {
 
 class FakeChains implements ChainRepositoryPort {
   readonly calls: string[] = [];
+  readonly intentWrites: string[] = [];
+  onIntent?: (chainName: string) => void;
   records: ChainRecord[];
   listScript: ChainListResult | 'throw' | undefined;
   readScript: ChainRecordRead | 'throw' | undefined;
@@ -91,11 +117,17 @@ class FakeChains implements ChainRepositoryPort {
     if (this.intentScript !== undefined) return this.intentScript;
     const record = this.byName(command.chainName);
     if (record === undefined) return { outcome: 'refused', reason: 'chain-not-found' };
+    if (record.refresh?.key === command.key) {
+      this.onIntent?.(command.chainName);
+      return { outcome: 'already-recorded' };
+    }
     this.records = this.records.map((r) =>
       r.chainName === command.chainName
         ? applyChainRefreshIntent(r, { key: command.key, mainSha: command.mainSha, atIso: command.atIso })
         : r,
     );
+    this.intentWrites.push(command.key);
+    this.onIntent?.(command.chainName);
     return { outcome: 'recorded' };
   }
 
@@ -108,6 +140,10 @@ class FakeChains implements ChainRepositoryPort {
     if (record === undefined) return { outcome: 'refused', reason: 'chain-not-found' };
     this.records = this.records.map((r) => (r.chainName === command.chainName ? applyChainRefreshOutcome(r, command.outcome, command.atIso) : r));
     return { outcome: 'recorded' };
+  }
+
+  async recordChainSwept(): Promise<ChainRecordDecision> {
+    return { outcome: 'refused', reason: 'not used' };
   }
 
   async recordChainIntent(): Promise<ChainRecordDecision> {
@@ -180,8 +216,10 @@ function harness(script: {
   clear?: FakeAttention['clearScript'];
   nowFn?: () => string;
   mode?: 'shadow' | 'live';
+  tracedHalt?: boolean;
 } = {}) {
   const trace: string[] = [];
+  const halt = script.tracedHalt === true ? new FakeHalt(trace) : null;
   const chains = new FakeChains(script.records ?? [startedRecord()], trace);
   chains.listScript = script.list;
   chains.readScript = script.read;
@@ -197,10 +235,11 @@ function harness(script: {
     chains,
     forge,
     attention,
+    halt: halt ?? clearHalt,
     now: script.nowFn ?? (() => NOW),
     mode: script.mode ?? 'live',
   });
-  return { useCase, chains, forge, attention, trace };
+  return { useCase, chains, forge, attention, trace, halt };
 }
 
 describe('RefreshChainsUseCase validation', () => {
@@ -295,7 +334,7 @@ describe('RefreshChainsUseCase', () => {
       const chains = new FakeChains([startedRecord()], trace);
       const forge = new FakeForge(trace);
       const attention = new FakeAttention();
-      const useCase = new RefreshChainsUseCase({ chains, forge, attention, now: () => NOW, ...extra });
+      const useCase = new RefreshChainsUseCase({ chains, forge, attention, halt: clearHalt, now: () => NOW, ...extra });
       const result = await useCase.runRefreshChains(command());
       expect(result.reasonCode).toBe('shadow-would-refresh-1');
       expect(trace).toEqual(['list', 'head']);
@@ -381,6 +420,131 @@ describe('RefreshChainsUseCase', () => {
     expect(result.chains).toEqual([{ chainName: 'one', key: `chain-refresh/one@${MAIN.slice(0, 12)}`, outcome: 'merged' }]);
     expect(h.chains.calls.filter((call) => call === 'intent')).toHaveLength(1);
     expect(h.chains.records.some((r) => r.chainName === 'two' && r.refresh !== null)).toBe(false);
+  });
+});
+
+describe('RefreshChainsUseCase halt re-read before the merge (OG7b6)', () => {
+  it('a clear live pass reads the halt at the pass start, before the chain and directly before the merge', async () => {
+    const h = harness({ tracedHalt: true });
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result.outcome).toBe('completed');
+    expect(h.trace).toEqual(['list', 'halt', 'head', 'halt', 'intent', 'read', 'halt', 'forge', 'outcome']);
+  });
+
+  it('a halt set during the intent write sends no merge and leaves the intent in flight', async () => {
+    const h = harness({ tracedHalt: true });
+    h.chains.onIntent = () => {
+      h.halt!.halted = true;
+    };
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result).toEqual({ outcome: 'refused', reasonCode: 'halted', chains: [] });
+    expect(h.trace).toEqual(['list', 'halt', 'head', 'halt', 'intent', 'read', 'halt']);
+    expect(h.chains.records[0]!.refresh).toEqual({ key: KEY, mainSha: MAIN, outcome: 'in-flight', updatedAtIso: NOW });
+    expect(h.chains.intentWrites).toEqual([KEY]);
+    expect(h.attention.raises).toHaveLength(0);
+    expect(h.attention.clears).toHaveLength(0);
+  });
+
+  it('after the halt is lifted the next pass sends the merge once under the same key and writes no second intent', async () => {
+    const h = harness({ tracedHalt: true });
+    h.chains.onIntent = () => {
+      h.halt!.halted = true;
+    };
+    const firstResult = await h.useCase.runRefreshChains(command());
+    expect(firstResult.reasonCode).toBe('halted');
+    const firstLen = h.trace.length;
+    h.halt!.halted = false;
+    h.chains.onIntent = () => {};
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result).toEqual({
+      outcome: 'completed',
+      reasonCode: null,
+      chains: [{ chainName: 'example', key: KEY, outcome: 'merged' }],
+    });
+    expect(h.forge.calls.filter((call) => call === 'forge')).toHaveLength(1);
+    expect(h.chains.intentWrites).toEqual([KEY]);
+    expect(h.chains.records[0]!.refresh?.outcome).toBe('merged');
+    expect(h.trace.slice(firstLen)).toEqual(['list', 'halt', 'head', 'halt', 'intent', 'read', 'halt', 'forge', 'outcome']);
+  });
+
+  it('a halt read that throws directly before the merge sends no merge', async () => {
+    const h = harness({ tracedHalt: true });
+    h.chains.onIntent = () => {
+      h.halt!.failing = true;
+    };
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result).toEqual({ outcome: 'refused', reasonCode: 'halted', chains: [] });
+    expect(h.trace).toEqual(['list', 'halt', 'head', 'halt', 'intent', 'read', 'halt']);
+    expect(h.chains.records[0]!.refresh?.outcome).toBe('in-flight');
+  });
+
+  it('a halt set during the intent write of the second chain keeps the report of the first and sends one merge', async () => {
+    const SECOND_KEY = 'chain-refresh/second@' + MAIN.slice(0, 12);
+    const h = harness({ tracedHalt: true, records: [startedRecord('example'), startedRecord('second')] });
+    h.chains.onIntent = (name) => {
+      if (name === 'second') h.halt!.halted = true;
+    };
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result).toEqual({
+      outcome: 'refused',
+      reasonCode: 'halted',
+      chains: [{ chainName: 'example', key: KEY, outcome: 'merged' }],
+    });
+    expect(h.forge.calls.filter((call) => call === 'forge')).toHaveLength(1);
+    expect(h.chains.intentWrites).toEqual([KEY, SECOND_KEY]);
+  });
+
+  it('a halt set while the merge is in flight still records the outcome and is not read again', async () => {
+    const h = harness({ tracedHalt: true });
+    h.forge.onForged = () => {
+      h.halt!.halted = true;
+    };
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result).toEqual({
+      outcome: 'completed',
+      reasonCode: null,
+      chains: [{ chainName: 'example', key: KEY, outcome: 'merged' }],
+    });
+    expect(h.trace).toEqual(['list', 'halt', 'head', 'halt', 'intent', 'read', 'halt', 'forge', 'outcome']);
+  });
+
+  it('a chain replayed from a stored outcome costs no merge-time halt read', async () => {
+    const h = harness({
+      tracedHalt: true,
+      records: [startedRecord('example', { refresh: { key: KEY, mainSha: MAIN, outcome: 'merged', updatedAtIso: NOW } })],
+    });
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result.outcome).toBe('completed');
+    expect(h.trace).toEqual(['list', 'halt', 'head', 'halt']);
+    expect(h.halt!.reads).toBe(2);
+  });
+
+  it('a budget spent during the halt read sends no merge', async () => {
+    let late = false;
+    const h = harness({ tracedHalt: true, nowFn: () => (late ? LATE : NOW) });
+    h.halt!.onRead = (reads) => {
+      if (reads === 3) late = true;
+    };
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result).toEqual({ outcome: 'budget-exhausted', reasonCode: null, chains: [] });
+    expect(h.trace).toEqual(['list', 'halt', 'head', 'halt', 'intent', 'read', 'halt']);
+  });
+
+  const rows: [string, Parameters<typeof harness>[0], string[]][] = [
+    ['a refused intent write', { intent: { outcome: 'refused', reason: 'stale-revision' } }, ['list', 'halt', 'head', 'halt', 'intent']],
+    ['a record re-read that is not found', { read: { status: 'not-found' } }, ['list', 'halt', 'head', 'halt', 'intent', 'read']],
+    ['a merge call that throws', { forge: 'throw' }, ['list', 'halt', 'head', 'halt', 'intent', 'read', 'halt', 'forge']],
+    [
+      'a refused outcome write',
+      { outcome: { outcome: 'refused', reason: 'stale-revision' } },
+      ['list', 'halt', 'head', 'halt', 'intent', 'read', 'halt', 'forge', 'outcome'],
+    ],
+  ];
+  it.each(rows)('an existing skip path is unchanged and reads the halt only when the merge is reached: %s', async (_label, script, expectedTrace) => {
+    const h = harness({ tracedHalt: true, ...script });
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result).toEqual({ outcome: 'completed', reasonCode: null, chains: [{ chainName: 'example', key: KEY, outcome: 'skipped' }] });
+    expect(h.trace).toEqual(expectedTrace);
   });
 });
 

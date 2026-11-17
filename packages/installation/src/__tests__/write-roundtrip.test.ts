@@ -31,6 +31,7 @@ import {
   LOCAL_SHELF_KEYS,
   MERGE_KEYS,
   MERGE_REPO_KEYS,
+  MERGE_VETO_CONSUMER_KEYS,
   MERGE_VETO_KEYS,
   NO_DECISIONS_KEYS,
   NO_FORGE_KEYS,
@@ -94,6 +95,7 @@ const fullV2File = {
         verifier: 'verify-override.example',
       },
       roles: ['lane-runner', 'verifier'],
+      ciRunnerSlots: [{ name: 'primary', unit: 'fleet-ci@0.service' }],
       runner: {
         kind: 'opencode',
         port: 46010,
@@ -181,6 +183,7 @@ const fullV2File = {
     conductor: {
       enabled: true,
       stopGraceMinutes: 5,
+      premergeMode: 'auto-attest',
       reaper: {
         enabled: true,
         intervalMinutes: 10,
@@ -227,6 +230,7 @@ const fullV2File = {
           maxAttempts: 3,
           checksGraceMinutes: 10,
           veto: { mode: 'shadow', holdConfidence: 0.8 },
+          prepare: ['yarn', 'install', '--immutable'],
         },
         'example-owner/second-repo': { projectId: 'second-project' },
       },
@@ -270,6 +274,10 @@ const fullV2File = {
         minConfidence: 0.8,
         monthlyBudgetUsd: 6,
         acknowledgeCandidateClaimsLeaveHost: true,
+      },
+      'merge-veto': {
+        monthlyBudgetUsd: 4,
+        acknowledgePullRequestTitleAndPathsLeaveHost: true,
       },
     },
   },
@@ -459,6 +467,8 @@ describe('writeInstallationV2 round trip (shared key lists)', () => {
       [fullWritten, KNOWLEDGE_RANKING_CONSUMER_KEYS, ['decisions', 'consumers', 'knowledge-ranking']],
       [fixtureRoot, CLAIM_TRIAGE_CONSUMER_KEYS, ['decisions', 'consumers', 'claim-triage']],
       [fullWritten, CLAIM_TRIAGE_CONSUMER_KEYS, ['decisions', 'consumers', 'claim-triage']],
+      [fixtureRoot, MERGE_VETO_CONSUMER_KEYS, ['decisions', 'consumers', 'merge-veto']],
+      [fullWritten, MERGE_VETO_CONSUMER_KEYS, ['decisions', 'consumers', 'merge-veto']],
       [fixtureRoot, DAEMON_KEYS, ['daemon']],
       [fullWritten, DAEMON_KEYS, ['daemon']],
       [shelfLocalFile as unknown as Record<string, unknown>, LOCAL_SHELF_KEYS, ['shelf']],

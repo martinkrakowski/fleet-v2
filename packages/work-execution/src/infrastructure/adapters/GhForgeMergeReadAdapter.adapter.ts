@@ -42,6 +42,9 @@ const PAGE_SIZE = 100;
 const HEX_40 = /^[0-9a-f]{40}$/;
 const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+$/;
 
+/** A base ref name as the forge reports it: 1-255 of letters, digits, `.`, `_`, `/`, `-`, never a leading dash. */
+const BASE_REF_PATTERN = /^[A-Za-z0-9._/][A-Za-z0-9._/-]{0,254}$/;
+
 const MERGE_READ_QUERY = `
   query MergeRead(
     $owner: String!, $repo: String!, $number: Int!,
@@ -52,6 +55,7 @@ const MERGE_READ_QUERY = `
         state
         headRefOid
         mergeStateStatus
+        baseRefName
         statusCheckRollup {
           contexts(first: ${PAGE_SIZE}, after: $contextsAfter) {
             pageInfo { hasNextPage endCursor }
@@ -107,7 +111,7 @@ export type MergeThreadsPageResult =
   | { readonly kind: 'unknown'; readonly reason: string };
 
 export type MergePrMetaResult =
-  | { readonly kind: 'ok'; readonly prState: ForgePrState; readonly liveHeadSha: string; readonly mergeState: ForgeMergeState }
+  | { readonly kind: 'ok'; readonly prState: ForgePrState; readonly liveHeadSha: string; readonly mergeState: ForgeMergeState; readonly baseRef: string }
   | { readonly kind: 'unreadable' }
   | { readonly kind: 'unknown'; readonly reason: string };
 
@@ -115,6 +119,7 @@ interface MergePrMetaPayload {
   readonly prState: ForgePrState;
   readonly liveHeadSha: string;
   readonly mergeState: ForgeMergeState;
+  readonly baseRef: string;
 }
 
 function isValidRepository(repository: { readonly owner?: unknown; readonly repo?: unknown }): boolean {
@@ -303,7 +308,7 @@ export function parseReviewThreadsPage(stdout: string): MergeThreadsPageResult {
   return { kind: 'page', unresolved, hasNextPage: pageInfo.hasNextPage, endCursor: pageInfo.endCursor };
 }
 
-/** Pure parse of the PR-level meta (`state`, `headRefOid`, `mergeStateStatus`). */
+/** Pure parse of the PR-level meta (`state`, `headRefOid`, `mergeStateStatus`, `baseRefName`). */
 export function parseMergePrMeta(stdout: string): MergePrMetaResult {
   const pullRequest = readPullRequest(stdout);
   if (pullRequest === undefined) {
@@ -324,8 +329,12 @@ export function parseMergePrMeta(stdout: string): MergePrMetaResult {
   if (typeof headRefOid !== 'string' || !HEX_40.test(headRefOid)) {
     return { kind: 'unknown', reason: 'the head oid is not 40 hex' };
   }
+  const baseRef = pullRequest.baseRefName;
+  if (typeof baseRef !== 'string' || !BASE_REF_PATTERN.test(baseRef)) {
+    return { kind: 'unreadable' };
+  }
   const mergeState = parseMergeStateStatus(pullRequest.mergeStateStatus);
-  return { kind: 'ok', prState, liveHeadSha: headRefOid, mergeState };
+  return { kind: 'ok', prState, liveHeadSha: headRefOid, mergeState, baseRef };
 }
 
 function guardRequest(
@@ -543,6 +552,7 @@ export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
       prState: meta.prState,
       liveHeadSha: meta.liveHeadSha,
       mergeState: meta.mergeState,
+      baseRef: meta.baseRef,
       contexts: resolvedContexts,
       unresolvedThreads: threads.unknown ? 'unknown' : threads.unresolved,
     };

@@ -15,12 +15,40 @@ import type {
   LoadResult,
   SeatModel,
 } from '@fleet/installation';
+import { isSafeSshHost } from '@fleet/installation';
 import type { ToolId } from '@fleet/tooling';
 
 import { renderAutoMergeStatus, summariseAutoMerge } from '../policy/auto-merge.js';
 
+import { checkGhAuthNonInteractive } from './gh-binary.js';
 import type { DoctorLine, DoctorStatus } from './types.js';
 import type { DoctorProbes } from './probes.js';
+
+/** A trimmed, lowercase hex git commit id of 7–40 characters. */
+const COMMIT_ID = /^[0-9a-f]{7,40}$/i;
+
+/** A commit id is valid after trimming; comparisons use the lowercase form. */
+function normaliseCommit(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return COMMIT_ID.test(trimmed) ? trimmed.toLowerCase() : undefined;
+}
+
+/** Display form of a commit id: at most 8 hex characters. */
+function shortCommit(commit: string): string {
+  return commit.slice(0, 8);
+}
+
+/**
+ * At most the final path segment of an install root name, so no directory
+ * prefix ever reaches a doctor detail.
+ */
+function installRootBasename(name: string): string {
+  const base = name.split(/[/\\]/).pop() ?? '';
+  return base;
+}
 
 /** A load result doctor can check: absent or loaded, never invalid. */
 export type DoctorableInstallation = Exclude<LoadResult, { status: 'invalid' }>;
@@ -135,6 +163,23 @@ function probeHostOf(name: string, host: HostModel): string {
   return host.transport === 'ssh' ? (host.sshAlias ?? name) : 'local';
 }
 
+/** What a detail prints in place of an ssh alias the transport refuses. */
+const UNSAFE_ALIAS_SHOWN = '[unsafe ssh alias]';
+
+/** Detail of the reachability FAIL line of a host whose ssh alias is refused. */
+const UNSAFE_ALIAS_DETAIL =
+  'ssh alias refused: not a safe host string; no command was run on this host';
+
+/** True when the probe host is an ssh alias the transport refuses before any spawn. */
+function isRefusedAlias(probeHost: string): boolean {
+  return probeHost !== 'local' && !isSafeSshHost(probeHost);
+}
+
+/** The probe host as a detail may print it: never a refused alias. */
+function shownHost(probeHost: string): string {
+  return isRefusedAlias(probeHost) ? UNSAFE_ALIAS_SHOWN : probeHost;
+}
+
 /**
  * One FAIL line per routing variable set while a v2 installation is loaded
  * (plan section 3): the variable is named, never valued, and the detail says
@@ -234,15 +279,205 @@ async function installationLines(
   return lines;
 }
 
+/** Marker: the injected probes carry no `ciRunnerSlot` method. */
+const NO_SLOT_PROBE = Symbol('no-ci-runner-slot-probe');
+
+/** The inactive-slot detail when the fix line cannot be printed whole. */
+const SLOT_FIX_FALLBACK =
+  'slot not active; fix: sudo systemctl restart <the unit this slot names under ciRunnerSlots> on this host';
+
+/** Status and detail of one slot line; anything but an exact known answer is UNKNOWN. */
+function ciRunnerSlotVerdict(
+  state: unknown,
+  slot: { readonly name: string; readonly unit: string },
+  probeHost: string,
+): readonly [DoctorStatus, string] {
+  if (state === 'active') {
+    return ['PASS', `slot ${slot.name} active`];
+  }
+  if (state === 'inactive') {
+    // Printed whole or not at all: a fix line the boundary would redact or
+    // cut is replaced, never shown with a hole in the command.
+    const fix = `slot ${slot.name} not active; fix: sudo systemctl restart ${slot.unit} on ${shownHost(probeHost)}`;
+    return ['FAIL', boundDoctorDetail(fix) === fix ? fix : SLOT_FIX_FALLBACK];
+  }
+  if (state === NO_SLOT_PROBE) {
+    return ['UNKNOWN', `slot ${slot.name} probe not available`];
+  }
+  return ['UNKNOWN', `slot ${slot.name} state could not be read`];
+}
+
+/**
+ * One line per CI runner slot the host declares (OG-28c), in declared
+ * order. The port read, the call and the answer all happen inside `safely`,
+ * so a throwing getter, a throwing or rejecting probe and a hostile answer
+ * are UNKNOWN, never a crash. The answer is only compared with `===`; no
+ * property of it is read. Details carry the slot name, the unit name and
+ * the probe host only.
+ */
+async function ciRunnerSlotLines(
+  name: string,
+  host: HostModel,
+  probeHost: string,
+  probes: DoctorProbes,
+): Promise<DoctorLine[]> {
+  const lines: DoctorLine[] = [];
+  for (const slot of host.ciRunnerSlots ?? []) {
+    const state: unknown = await safely(async () => {
+      const probe = probes.ciRunnerSlot;
+      return typeof probe === 'function'
+        ? await probe.call(probes, probeHost, slot.unit)
+        : NO_SLOT_PROBE;
+    });
+    const [status, detail] = ciRunnerSlotVerdict(state, slot, probeHost);
+    lines.push(line('host', name, `ci-runner-${slot.name}`, status, detail));
+  }
+  return lines;
+}
+
+/** Marker: the injected probes carry no `loginShell` method. */
+const NO_SHELL_PROBE = Symbol('no-login-shell-probe');
+
+/** Detail of every unprobed line of a host whose login shell failed the canary. */
+const NOT_PROBED_DETAIL = 'not probed: login shell failed the canary';
+
+/**
+ * The login-shell canary answer of every ssh host, keyed by host name; a
+ * local host has no entry. The port read, the call and the answer all
+ * happen inside `safely`, so a throwing getter and a throwing or rejecting
+ * probe store `undefined`, never crash.
+ */
+async function loginShellStates(
+  model: FleetInstallationModel,
+  probes: DoctorProbes,
+): Promise<ReadonlyMap<string, unknown>> {
+  const states = new Map<string, unknown>();
+  for (const [name, host] of Object.entries(model.hosts)) {
+    if (host.transport !== 'ssh') {
+      continue;
+    }
+    const probeHost = probeHostOf(name, host);
+    const state: unknown = await safely(async () => {
+      const probe = probes.loginShell;
+      return typeof probe === 'function' ? await probe.call(probes, probeHost) : NO_SHELL_PROBE;
+    });
+    states.set(name, state);
+  }
+  return states;
+}
+
+/** Status and detail of the login-shell line; the answer is only compared with `===`. */
+function loginShellVerdict(state: unknown, probeHost: string): readonly [DoctorStatus, string] {
+  if (state === 'intact') {
+    return ['PASS', `login shell passes sh -c intact via ${shownHost(probeHost)}`];
+  }
+  if (state === 'mangled') {
+    return [
+      'FAIL',
+      `login shell did not return the canary unchanged via ${shownHost(probeHost)} (it altered sh -c or printed extra output); this host's other lines are not trustworthy`,
+    ];
+  }
+  if (state === NO_SHELL_PROBE) {
+    return ['UNKNOWN', 'login shell probe not available'];
+  }
+  return ['UNKNOWN', `login shell could not be checked via ${shownHost(probeHost)}`];
+}
+
+/** The configuration-derived lines of a host's runner; nothing here is probed. */
+function runnerConfigLines(name: string, host: HostModel): DoctorLine[] {
+  const lines: DoctorLine[] = [];
+  if (host.runner !== undefined) {
+    const capabilities = host.runner.capabilities;
+    const status: DoctorStatus =
+      capabilities.source === 'declared' ? 'PASS' : 'UNKNOWN';
+    lines.push(
+      line(
+        'host',
+        name,
+        'runner-capabilities',
+        status,
+        `capability source ${capabilities.source}, filesystemScope ${capabilities.filesystemScope}`,
+      ),
+    );
+    // KF-30b: conducted acceptance gates are throttled only when the host
+    // declares `runner.gateSlot`; without it they run unthrottled next to
+    // hand-run gates. A missing declaration is a config gap, not a failure,
+    // so it reports as a PASS line with a warning detail (the same
+    // convention as accepted-and-ignored v1 fields).
+    if (host.roles.includes('lane-runner') && host.runner.gateSlot === undefined) {
+      lines.push(
+        line(
+          'host',
+          name,
+          'gate-slot',
+          'PASS',
+          'warning: conducted acceptance gates run unthrottled; declare runner.gateSlot to route them through the host-wide gate slot',
+        ),
+      );
+    }
+  }
+  return lines;
+}
+
+/**
+ * The lines of a host whose login shell failed the canary, in the order a
+ * probed host reports them: every remote check UNKNOWN and unprobed, the
+ * runner configuration lines unchanged.
+ */
+function skippedHostLines(name: string, host: HostModel): DoctorLine[] {
+  const skipped = (check: string): DoctorLine =>
+    line('host', name, check, 'UNKNOWN', NOT_PROBED_DETAIL);
+  const checks: string[] = [
+    'reachable',
+    ...PLATFORM_TOOLS.map((tool) => `command-${tool}`),
+    'command-ssh',
+  ];
+  if (host.worktreeRoot !== undefined) {
+    checks.push('worktree-root-writable');
+  }
+  const lines = checks.map((check) => skipped(check));
+  lines.push(...runnerConfigLines(name, host));
+  for (const slot of host.ciRunnerSlots ?? []) {
+    lines.push(skipped(`ci-runner-${slot.name}`));
+  }
+  return lines;
+}
+
+/** Detail of the `reachable` line; a refused alias is named as refused, never printed. */
+function reachableDetail(
+  reachable: boolean | undefined,
+  probeHost: string,
+  roles: string,
+): string {
+  if (reachable === undefined) {
+    return `reachability probe failed (${shownHost(probeHost)})`;
+  }
+  if (reachable) {
+    return `reachable via ${shownHost(probeHost)} (roles: ${roles})`;
+  }
+  return isRefusedAlias(probeHost) ? UNSAFE_ALIAS_DETAIL : `not reachable via ${probeHost}`;
+}
+
 /** Per-host and role lines: reachability, platform tools, worktree root, runner capabilities. */
 async function hostLines(
   model: FleetInstallationModel,
   probes: DoctorProbes,
+  shells: ReadonlyMap<string, unknown>,
 ): Promise<DoctorLine[]> {
   const lines: DoctorLine[] = [];
   for (const [name, host] of Object.entries(model.hosts)) {
     const probeHost = probeHostOf(name, host);
     const roles = host.roles.join(', ');
+
+    if (shells.has(name)) {
+      const shell = shells.get(name);
+      const [status, detail] = loginShellVerdict(shell, probeHost);
+      lines.push(line('host', name, 'login-shell', status, detail));
+      if (shell === 'mangled') {
+        lines.push(...skippedHostLines(name, host));
+        continue;
+      }
+    }
 
     const reachable = await safely(() => probes.hostReachable(probeHost));
     lines.push(
@@ -251,11 +486,7 @@ async function hostLines(
         name,
         'reachable',
         reachable === undefined ? 'UNKNOWN' : reachable ? 'PASS' : 'FAIL',
-        reachable === undefined
-          ? `reachability probe failed (${probeHost})`
-          : reachable
-            ? `reachable via ${probeHost} (roles: ${roles})`
-            : `not reachable via ${probeHost}`,
+        reachableDetail(reachable, probeHost, roles),
       ),
     );
 
@@ -301,36 +532,8 @@ async function hostLines(
       );
     }
 
-    if (host.runner !== undefined) {
-      const capabilities = host.runner.capabilities;
-      const status: DoctorStatus =
-        capabilities.source === 'declared' ? 'PASS' : 'UNKNOWN';
-      lines.push(
-        line(
-          'host',
-          name,
-          'runner-capabilities',
-          status,
-          `capability source ${capabilities.source}, filesystemScope ${capabilities.filesystemScope}`,
-        ),
-      );
-      // KF-30b: conducted acceptance gates are throttled only when the host
-      // declares `runner.gateSlot`; without it they run unthrottled next to
-      // hand-run gates. A missing declaration is a config gap, not a failure,
-      // so it reports as a PASS line with a warning detail (the same
-      // convention as accepted-and-ignored v1 fields).
-      if (host.roles.includes('lane-runner') && host.runner.gateSlot === undefined) {
-        lines.push(
-          line(
-            'host',
-            name,
-            'gate-slot',
-            'PASS',
-            'warning: conducted acceptance gates run unthrottled; declare runner.gateSlot to route them through the host-wide gate slot',
-          ),
-        );
-      }
-    }
+    lines.push(...runnerConfigLines(name, host));
+    lines.push(...(await ciRunnerSlotLines(name, host, probeHost, probes)));
   }
   return lines;
 }
@@ -480,10 +683,40 @@ async function runnerBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
 async function ghBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
   const gh = await safely(() => probes.ghBinary());
   if (gh === undefined) {
-    return [line('gh-binary', 'gh', 'resolved', 'UNKNOWN', 'gh resolution probe failed')];
+    return [
+      line('gh-binary', 'gh', 'resolved', 'UNKNOWN', 'gh resolution probe failed'),
+      line(
+        'gh-binary',
+        'gh',
+        'auth-non-interactive',
+        'UNKNOWN',
+        'gh binary not resolved; non-interactive auth not checked',
+      ),
+    ];
   }
   if (gh.resolved !== undefined) {
-    return [line('gh-binary', 'gh', 'resolved', 'PASS', gh.resolved)];
+    const resolved = line('gh-binary', 'gh', 'resolved', 'PASS', gh.resolved);
+    if (probes.ghAuth === undefined) {
+      return [
+        resolved,
+        line('gh-binary', 'gh', 'auth-non-interactive', 'UNKNOWN', 'gh auth probe not configured'),
+      ];
+    }
+    const authLine = await safely(() =>
+      checkGhAuthNonInteractive(() => probes.ghAuth!(gh.resolved!)),
+    );
+    if (authLine === undefined) {
+      // checkGhAuthNonInteractive never throws; this guard keeps the sweep
+      // alive even if that ever changes.
+      return [
+        resolved,
+        line('gh-binary', 'gh', 'auth-non-interactive', 'UNKNOWN', 'gh non-interactive auth probe failed'),
+      ];
+    }
+    return [
+      resolved,
+      line(authLine.scope, authLine.subject, authLine.check, authLine.status, authLine.detail),
+    ];
   }
   return [
     line(
@@ -492,6 +725,13 @@ async function ghBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
       'resolved',
       'FAIL',
       `gh not found at ${gh.candidates.join(', ')}; conducted runs open PRs through one of these paths`,
+    ),
+    line(
+      'gh-binary',
+      'gh',
+      'auth-non-interactive',
+      'UNKNOWN',
+      'gh binary not resolved; non-interactive auth not checked',
     ),
   ];
 }
@@ -672,9 +912,11 @@ async function seatLines(
  * Run every doctor check over a loaded installation, in the order:
  * installation, routing, the seat model list, hosts and their roles, the
  * servers' answers, configured tools, credential files, the bundled runner
- * binary, the reviewed gh binary, then seats. Each yielded line is one
+ * binary, the reviewed gh binary, the pinned build's freshness, then seats.
+ * Each yielded line is one
  * check; the generator awaits probes sequentially so output order is
- * stable. The server answers are computed before the `model-listed` line is
+ * stable. The login-shell canary of every ssh host is probed before
+ * anything else. The server answers are computed before the `model-listed` line is
  * yielded (that line needs the union of the servers' model ids), but the
  * host lines are yielded before the server lines so every `host` line stays
  * together. When `options.probeServers` is `false`, server probing and the
@@ -685,6 +927,7 @@ export async function* runDoctor(
   probes: DoctorProbes,
   options: RunDoctorOptions,
 ): AsyncGenerator<DoctorLine> {
+  const shells = await loginShellStates(result.model, probes);
   const probeServers = options.probeServers ?? true;
   const serverAnswers = probeServers
     ? await serverLines(result.model, probes)
@@ -702,7 +945,7 @@ export async function* runDoctor(
   if (seatModelCheck !== undefined) {
     yield seatModelCheck;
   }
-  for (const doctorLine of await hostLines(result.model, probes)) {
+  for (const doctorLine of await hostLines(result.model, probes, shells)) {
     yield doctorLine;
   }
   if (serverAnswers !== undefined) {
@@ -722,9 +965,195 @@ export async function* runDoctor(
   for (const doctorLine of await ghBinaryLines(probes)) {
     yield doctorLine;
   }
+  for (const doctorLine of await pinnedBuildLines(probes)) {
+    yield doctorLine;
+  }
   for (const doctorLine of await seatLines(result.model, probes, options)) {
     yield doctorLine;
   }
+}
+
+/** Control, separator and bidi characters that must never reach a doctor line. */
+// eslint-disable-next-line no-control-regex
+const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
+
+/** Marker: the probe result could not be read safely. */
+const UNREADABLE_RESULT = Symbol('unreadable-pinned-build-result');
+
+interface PinnedBuildSnapshot {
+  readonly pinnedCommit: unknown;
+  readonly baseTipCommit: unknown;
+  readonly behindCount: unknown;
+  readonly installRootName: unknown;
+}
+
+/**
+ * Copy every field of an untrusted pinned-build result once, so no later
+ * read can run a hostile accessor. A non-object result, or any accessor that
+ * throws, yields `UNREADABLE_RESULT`.
+ */
+function snapshotPinnedBuild(
+  result: unknown,
+): PinnedBuildSnapshot | null | typeof UNREADABLE_RESULT {
+  if (result === undefined || result === null) {
+    return null;
+  }
+  try {
+    if (typeof result !== 'object') {
+      return UNREADABLE_RESULT;
+    }
+    const record = result as Record<string, unknown>;
+    return {
+      pinnedCommit: record.pinnedCommit,
+      baseTipCommit: record.baseTipCommit,
+      behindCount: record.behindCount,
+      installRootName: record.installRootName,
+    };
+  } catch {
+    return UNREADABLE_RESULT;
+  }
+}
+
+/**
+ * The pinned-build freshness check: the installed build's commit against the
+ * base branch tip. Pure: it consumes only the injected probe result — no
+ * `git` subprocess, no filesystem access. Any unreadable field or failed
+ * probe reports `UNKNOWN`, never `PASS`; a pinned build behind the tip is
+ * `FAIL` with the commit distance.
+ */
+export async function pinnedBuildLines(probes: DoctorProbes): Promise<DoctorLine[]> {
+  let probeFn: DoctorProbes['pinnedBuild'];
+  try {
+    probeFn = probes.pinnedBuild;
+  } catch {
+    // Even reading the port can throw (a hostile getter); that is a probe
+    // failure, never a crash.
+    return [
+      line('installation', 'build', 'pinned-build', 'UNKNOWN', 'pinned build probe failed'),
+    ];
+  }
+  if (probeFn === undefined || typeof probeFn !== 'function') {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'pinned build probe not available',
+      ),
+    ];
+  }
+  // The probe result is untrusted: every field is read inside `safely`, so a
+  // throwing accessor (or a hostile `then`) is a probe failure, never a crash.
+  const probe = await safely(async () => snapshotPinnedBuild(await probeFn!()));
+  if (probe === undefined || probe === null) {
+    return [
+      line('installation', 'build', 'pinned-build', 'UNKNOWN', 'pinned build probe failed'),
+    ];
+  }
+  if (probe === UNREADABLE_RESULT) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'pinned build probe result could not be read',
+      ),
+    ];
+  }
+  const pinnedCommit = normaliseCommit(probe.pinnedCommit);
+  if (pinnedCommit === undefined) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'pinned build commit could not be read',
+      ),
+    ];
+  }
+  const baseTipCommit = normaliseCommit(probe.baseTipCommit);
+  if (baseTipCommit === undefined) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'base branch tip commit could not be read',
+      ),
+    ];
+  }
+  let root = '';
+  if (probe.installRootName !== undefined) {
+    const rootName =
+      typeof probe.installRootName === 'string'
+        ? installRootBasename(probe.installRootName)
+        : undefined;
+    if (rootName === undefined || UNPRINTABLE.test(rootName)) {
+      return [
+        line(
+          'installation',
+          'build',
+          'pinned-build',
+          'UNKNOWN',
+          'pinned build install root name could not be read',
+        ),
+      ];
+    }
+    root = rootName;
+  }
+  const rootSuffix = root === '' ? '' : ` (install root ${root})`;
+  if (pinnedCommit === baseTipCommit) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'PASS',
+        `pinned build matches base branch tip ${shortCommit(pinnedCommit)}${rootSuffix}`,
+      ),
+    ];
+  }
+  const behind = probe.behindCount;
+  if (
+    typeof behind !== 'number' ||
+    !Number.isSafeInteger(behind) ||
+    behind < 0
+  ) {
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        'commit distance between pinned build and base tip could not be determined',
+      ),
+    ];
+  }
+  if (behind === 0) {
+    // Not equal and not behind: the builds have diverged. Never a pass.
+    return [
+      line(
+        'installation',
+        'build',
+        'pinned-build',
+        'UNKNOWN',
+        `pinned build ${shortCommit(pinnedCommit)} and base tip ${shortCommit(baseTipCommit)} have diverged${rootSuffix}`,
+      ),
+    ];
+  }
+  return [
+    line(
+      'installation',
+      'build',
+      'pinned-build',
+      'FAIL',
+      `pinned build is ${behind} commit${behind === 1 ? '' : 's'} behind base branch tip ${shortCommit(baseTipCommit)}${rootSuffix}`,
+    ),
+  ];
 }
 
 /**

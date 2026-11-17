@@ -11,15 +11,23 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import type { SeatModel } from '@fleet/installation';
 import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
-import { GH_BINARY_CANDIDATES } from './gh-binary.js';
-import type { DoctorProbes, SeatProbeResult, ServerProbeResult } from './probes.js';
+import { GH_BINARY_CANDIDATES, hasGhTokenEnv, type GhAuthObservation } from './gh-binary.js';
+import { sshRemoteArgv } from './ssh-remote.js';
+import type {
+  CiRunnerSlotState,
+  DoctorProbes,
+  LoginShellState,
+  PinnedBuildProbeResult,
+  SeatProbeResult,
+  ServerProbeResult,
+} from './probes.js';
 
 const execFileAsync = promisify(execFileCallback);
 
@@ -55,6 +63,9 @@ export interface DoctorCommandExecutor {
 
 /** Default wall-clock budget for a platform probe command. */
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
+
+/** Default wall-clock budget for the bounded `gh auth status` run. */
+const DEFAULT_GH_AUTH_TIMEOUT_MS = 5_000;
 
 /** Default wall-clock budget for the one-step seat probe (a live model call). */
 const DEFAULT_SEAT_TIMEOUT_MS = 60_000;
@@ -142,6 +153,26 @@ export interface NodeDoctorProbesDeps {
    * to `GH_BINARY_CANDIDATES`; injectable for tests and embedders.
    */
   readonly ghBinaryCandidates?: readonly string[];
+  /**
+   * The service environment the `gh` auth probe inspects for a token
+   * variable, given directly or as a reader. Defaults to `process.env`;
+   * a reader that throws rejects so the doctor reports `UNKNOWN`.
+   */
+  readonly serviceEnv?:
+    | Readonly<Record<string, string | undefined>>
+    | (() => Readonly<Record<string, string | undefined>>);
+  /** Wall-clock budget for the `gh auth status` run. */
+  readonly ghAuthTimeoutMs?: number;
+  /**
+   * The base branch the pinned build is compared against, as a `git`
+   * revision the local repository resolves (default `origin/main`).
+   */
+  readonly baseBranch?: string;
+  /**
+   * Overrides the whole pinned-build observation. Injectable for tests and
+   * embedders that know the installed build without a `git` repository.
+   */
+  readonly readPinnedBuild?: () => Promise<PinnedBuildProbeResult | undefined>;
 }
 
 /** Walk up from this module to the repository root that owns `bin/ocm-run`. */
@@ -157,20 +188,6 @@ function resolveRepoRoot(): string | undefined {
     }
     current = parent;
   }
-}
-
-/** Build the `ssh <alias> --` wrapper argv with BatchMode and a connect budget. */
-function sshArgv(alias: string, argv: readonly string[]): string[] {
-  return [
-    'ssh',
-    '-o',
-    'BatchMode=yes',
-    '-o',
-    `ConnectTimeout=${SSH_CONNECT_TIMEOUT_S}`,
-    alias,
-    '--',
-    ...argv,
-  ];
 }
 
 /** First field of one non-empty line of text (a sha256 record, a mode, …). */
@@ -193,6 +210,158 @@ function succeeded(
   return result.error === undefined && result.exitCode === 0;
 }
 
+/**
+ * The commit from `git rev-parse` stdout: the whole output must be exactly one
+ * 40-character lowercase hex id and at most one trailing newline.
+ */
+function revParseCommit(stdout: string): string | undefined {
+  const match = /^([0-9a-f]{40})\n?$/.exec(stdout);
+  return match === null ? undefined : match[1];
+}
+
+/**
+ * The count from `git rev-list --count` stdout: the whole output must be one
+ * non-negative safe integer and at most one trailing newline.
+ */
+function revListCount(stdout: string): number | undefined {
+  const match = /^(\d+)\n?$/.exec(stdout);
+  if (match === null) {
+    return undefined;
+  }
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
+/**
+ * Read the pinned-build freshness observation with `git` in the local
+ * repository: the installed build's `HEAD`, the base branch tip, and — when
+ * they differ — the commit distance between them. Every unreadable field is
+ * `undefined`; the check itself stays pure and turns that into `UNKNOWN`.
+ */
+async function readPinnedBuildWithGit(
+  executor: DoctorCommandExecutor,
+  repoRoot: string,
+  baseBranch: string,
+  timeoutMs: number,
+): Promise<PinnedBuildProbeResult> {
+  let pinnedCommit: string | undefined;
+  let baseTipCommit: string | undefined;
+  let behindCount: number | undefined;
+
+  const head = await executor.run(['git', 'rev-parse', 'HEAD'], {
+    cwd: repoRoot,
+    timeoutMs,
+  });
+  if (succeeded(head)) {
+    pinnedCommit = revParseCommit(head.stdout);
+  }
+
+  const base = await executor.run(['git', 'rev-parse', baseBranch], {
+    cwd: repoRoot,
+    timeoutMs,
+  });
+  if (succeeded(base)) {
+    baseTipCommit = revParseCommit(base.stdout);
+  }
+
+  if (pinnedCommit !== undefined && baseTipCommit !== undefined) {
+    if (pinnedCommit === baseTipCommit) {
+      behindCount = 0;
+    } else {
+      const count = await executor.run(
+        ['git', 'rev-list', '--count', `${pinnedCommit}..${baseTipCommit}`],
+        { cwd: repoRoot, timeoutMs },
+      );
+      if (succeeded(count)) {
+        behindCount = revListCount(count.stdout);
+      }
+    }
+  }
+
+  return { pinnedCommit, baseTipCommit, behindCount, installRootName: basename(repoRoot) };
+}
+
+/**
+ * A systemd service unit name as `ciRunnerSlots[].unit` allows it: a local
+ * copy of the installation parser's rule, so the probe refuses any other
+ * word before it spawns anything.
+ */
+const CI_RUNNER_UNIT = /^[A-Za-z0-9@._:-]{1,128}\.service$/;
+
+/** `systemctl is-active` stdout: one lowercase word, at most one trailing newline. */
+const IS_ACTIVE_STDOUT = /^([a-z]+)\n?$/;
+
+/** The state words that mean systemd answered and the unit is not active. */
+const NOT_ACTIVE_STATES: ReadonlySet<string> = new Set([
+  'inactive',
+  'failed',
+  'activating',
+  'deactivating',
+  'unknown',
+]);
+
+/**
+ * Map one completed `systemctl is-active` run to a slot state. Only the
+ * exit code and one whole-output state word are read; the output itself is
+ * never returned.
+ */
+function ciRunnerSlotState(result: DoctorCommandRunResult): CiRunnerSlotState {
+  if (
+    result.error !== undefined ||
+    result.signal !== null ||
+    typeof result.exitCode !== 'number' ||
+    typeof result.stdout !== 'string'
+  ) {
+    return 'unknown';
+  }
+  const word = IS_ACTIVE_STDOUT.exec(result.stdout)?.[1];
+  if (result.exitCode === 0) {
+    return word === 'active' ? 'active' : 'unknown';
+  }
+  return word !== undefined && NOT_ACTIVE_STATES.has(word) ? 'inactive' : 'unknown';
+}
+
+/**
+ * The fixed canary text: adjacent spaces, a dollar word, a backslash-n pair
+ * that is not a newline, two backslashes, both quote kinds, a glob, a tilde,
+ * a semicolon, a double dash, a hash, a bang and one real newline. A login
+ * shell that splits, expands or re-reads any of them changes the echo.
+ */
+export const LOGIN_SHELL_CANARY = [
+  'fleet-canary',
+  'a  b',
+  '$HOME',
+  '\\n',
+  '\\\\',
+  "'q'",
+  '"d"',
+  '*',
+  '~',
+  ';',
+  '--',
+  '#x',
+  '!',
+  'line\nend',
+].join(' ');
+
+/**
+ * Map one completed canary run to a login-shell state. The output is only
+ * compared, never returned. Exit code 255 is ssh's own failure, so it says
+ * nothing about the login shell.
+ */
+function loginShellState(result: DoctorCommandRunResult): LoginShellState {
+  if (
+    result.error !== undefined ||
+    result.signal !== null ||
+    typeof result.exitCode !== 'number' ||
+    result.exitCode === 255 ||
+    typeof result.stdout !== 'string'
+  ) {
+    return 'unknown';
+  }
+  return result.exitCode === 0 && result.stdout === LOGIN_SHELL_CANARY ? 'intact' : 'mangled';
+}
+
 /** Run one argv on the host's transport; a spawn failure reports as a failed run. */
 async function runOnHost(
   deps: Required<
@@ -206,7 +375,13 @@ async function runOnHost(
   if (host === 'local') {
     return deps.localExecutor.run(argv, budget);
   }
-  return deps.sshExecutor.run(sshArgv(host, argv), budget);
+  const remote = sshRemoteArgv(host, argv, SSH_CONNECT_TIMEOUT_S);
+  if (!remote.ok) {
+    // Refused before any spawn; every probe already treats a result with an
+    // `error` as a failed run.
+    return { exitCode: null, signal: null, stdout: '', stderr: '', error: remote.reason };
+  }
+  return deps.sshExecutor.run(remote.argv, budget);
 }
 
 /** The tool descriptor's version argv (`detect`), or undefined for an unknown id. */
@@ -280,8 +455,11 @@ export function serverModelIds(stdout: string): readonly string[] | undefined {
 /**
  * The node doctor probes. Local hosts run argv arrays through the local
  * executor; every other host name is an ssh alias and the same argv travels
- * through `ssh <alias> --` with `BatchMode=yes`. Nothing here reads a
- * credential file's contents.
+ * through `ssh <alias> -- sh -c '<one POSIX-single-quoted command line>'`
+ * with `BatchMode=yes`, so the remote login shell parses only `sh -c` plus
+ * that one string. A refused remote argv (empty, an empty or NUL-bearing
+ * argument, or an unsafe alias) spawns nothing and reports a failed run.
+ * Nothing here reads a credential file's contents.
  */
 export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorProbes {
   const localExecutor = deps.localExecutor ?? createNodeDoctorExecutor();
@@ -292,6 +470,10 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
   const executors = { localExecutor, sshExecutor, timeoutMs };
   const repoRoot = deps.repoRoot ?? resolveRepoRoot();
   const worktreeRoot = deps.worktreeRoot ?? '.';
+  const ghAuthTimeoutMs = deps.ghAuthTimeoutMs ?? DEFAULT_GH_AUTH_TIMEOUT_MS;
+
+  const readServiceEnv = (): Readonly<Record<string, string | undefined>> =>
+    typeof deps.serviceEnv === 'function' ? deps.serviceEnv() : deps.serviceEnv ?? process.env;
 
   return {
     async hostReachable(host) {
@@ -410,6 +592,83 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
         return { resolved: undefined, candidates };
       } catch {
         return undefined;
+      }
+    },
+
+    async ghAuth(binaryPath): Promise<GhAuthObservation> {
+      const env = readServiceEnv();
+      const tokenPresent = hasGhTokenEnv(env);
+      // Without a token in the service environment `gh` falls back to the
+      // desktop keyring, which blocks a non-interactive session; never
+      // spawn it in that case.
+      if (!tokenPresent) {
+        return {
+          tokenPresent,
+          authCheck: { outcome: 'fail', reason: 'no GH_TOKEN or GITHUB_TOKEN in service environment' },
+        };
+      }
+      if (binaryPath.trim() === '' || ghAuthTimeoutMs <= 0) {
+        return {
+          tokenPresent,
+          authCheck: { outcome: 'unknown', reason: 'gh auth status could not be run' },
+        };
+      }
+      const result = await localExecutor.run([binaryPath, 'auth', 'status'], {
+        timeoutMs: ghAuthTimeoutMs,
+      });
+      if (result.error !== undefined || result.signal !== null || result.exitCode === null) {
+        return {
+          tokenPresent,
+          authCheck: { outcome: 'unknown', reason: 'gh auth status timed out or could not be run' },
+        };
+      }
+      if (result.exitCode === 0) {
+        return {
+          tokenPresent,
+          authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+        };
+      }
+      return { tokenPresent, authCheck: { outcome: 'fail', reason: 'gh auth status failed' } };
+    },
+
+    async pinnedBuild(): Promise<PinnedBuildProbeResult | undefined> {
+      if (deps.readPinnedBuild !== undefined) {
+        return await deps.readPinnedBuild();
+      }
+      if (repoRoot === undefined) {
+        return { pinnedCommit: undefined, baseTipCommit: undefined, behindCount: undefined };
+      }
+      return readPinnedBuildWithGit(
+        localExecutor,
+        repoRoot,
+        deps.baseBranch ?? 'origin/main',
+        timeoutMs,
+      );
+    },
+
+    async ciRunnerSlot(host, unit): Promise<CiRunnerSlotState> {
+      try {
+        if (unit.startsWith('-') || !CI_RUNNER_UNIT.test(unit)) {
+          return 'unknown';
+        }
+        return ciRunnerSlotState(
+          await runOnHost(executors, host, ['systemctl', 'is-active', unit]),
+        );
+      } catch {
+        return 'unknown';
+      }
+    },
+
+    async loginShell(host): Promise<LoginShellState> {
+      try {
+        if (host === 'local' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+          return 'unknown';
+        }
+        return loginShellState(
+          await runOnHost(executors, host, ['printf', '%s', LOGIN_SHELL_CANARY]),
+        );
+      } catch {
+        return 'unknown';
       }
     },
 

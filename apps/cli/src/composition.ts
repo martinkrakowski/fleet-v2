@@ -17,11 +17,14 @@
  */
 
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
+import { SSH_BINARY_CANDIDATES, resolveSshBinary } from './ssh-binary.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
+import { composeReadOnlyRelaunch } from './composition/relaunch.js';
 import { composeKnowledge } from './composition/knowledge.js';
 import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
@@ -37,8 +40,10 @@ import {
   AutoMergeAttemptUseCase,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
+  AuthorBriefUseCase,
   BriefAuthoringAdapter,
   BriefKnowledgeAdapter,
+  BuildFactPackUseCase,
   CiStateAdapter,
   CloseWorkOrderUseCase,
   CutoverJournalAdapter,
@@ -64,19 +69,26 @@ import {
   MergeRecordRepositoryAdapter,
   ForgeReadAdapter,
   GhForgeMergeReadAdapter,
+  GhReviewThreadHelperAdapter,
+  type ReviewThreadHelperPort,
   InspectAttemptUseCase,
   InspectMergeReadinessUseCase,
   InspectWorkOrderUseCase,
   InventoryRelaunchUseCase,
+  PlanRelaunchUseCase,
+  RelaunchPlanRepositoryAdapter,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
   OpencodeApiUsageAdapter,
   PrepareBriefPackageUseCase,
+  PreparePullRequestFeedbackFixUseCase,
   PrepareFixAttemptUseCase,
   CancelPreparedAttemptUseCase,
   ProbeProjectUseCase,
+  PullRequestFindingsReadAdapter,
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
+  RepositoryFactsAdapter,
   RequestAttemptAcceptanceUseCase,
   ReviewAssessmentAdapter,
   ReviewRequestAdapter,
@@ -102,7 +114,11 @@ import {
   LaneRunRepositoryAdapter,
   ListConductorPassesUseCase,
   ListLaneRunsUseCase,
+  RecordShadowDayUseCase,
+  ShadowEvidenceAdapter,
+  WORK_EXECUTION_STATE_FILES,
   ReapLaneWorktreesUseCase,
+  ReapOrphanReservationsUseCase,
   ReapOrphanSessionsUseCase,
   ReapZombiesUseCase,
   ReaperFindingRepositoryAdapter,
@@ -150,6 +166,7 @@ import {
   RequestIndependentReviewUseCase,
   RequestVerificationUseCase,
   VerificationExecutorAdapter,
+  EVIDENCE_AND_ACCEPTANCE_STATE_FILES,
 } from '@fleet/evidence-and-acceptance';
 
 import {
@@ -167,6 +184,7 @@ import {
   RecordContextSelectionUseCase,
   RecordKnowledgeReuseUseCase,
   SupersedeKnowledgeEntryUseCase,
+  BRIEF_KNOWLEDGE_STATE_FILES,
 } from '@fleet/brief-knowledge';
 
 import {
@@ -208,6 +226,7 @@ import {
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
   UpdateProjectProfileUseCase,
+  OPERATOR_COORDINATION_STATE_FILES,
 } from '@fleet/operator-coordination';
 import {
   loadInstallation,
@@ -479,7 +498,7 @@ function applyGhEnvironmentOverrides(args: readonly string[]): readonly string[]
   return args;
 }
 
-/** Whether `path` is an executable regular file (S4036: absolute gh only). */
+/** Whether `path` is an executable regular file (S4036: absolute gh and ssh only). */
 function isExecutableRegularFile(path: string): boolean {
   try {
     const stats = statSync(path);
@@ -582,21 +601,46 @@ export function readGitHead(worktreePath: string, sshHost?: string): Promise<str
   return readGitHeadLocally(worktreePath);
 }
 
-/** Read HEAD through the reviewed ssh alias (a worktree on another host). */
-export function readGitHeadOverSsh(worktreePath: string, sshHost: string): Promise<string> {
+/**
+ * Read HEAD through the reviewed ssh alias (a worktree on another host). The
+ * login shell parses only `sh -c` plus one single-quoted string; the remote
+ * argv is `['sh', '-c', <twice-quoted command line>], the twin of
+ * `posixQuote` and `sshArgvFor` in
+ * packages/work-execution/src/infrastructure/adapters/SshExecutor.adapter.ts.
+ * The remote programs must stay PATH executables, not login-shell functions
+ * or builtins specific to the login shell: the login shell starts first and
+ * `sh` inherits only its exported environment. fish and csh are not
+ * supported, before or after this change.
+ */
+export function readGitHeadOverSsh(
+  worktreePath: string,
+  sshHost: string,
+  sshCandidates: readonly string[] = SSH_BINARY_CANDIDATES,
+): Promise<string> {
   if (!isSafeSshHost(sshHost)) {
     return Promise.reject(new Error(`Refusing to read HEAD over SSH: unsafe host '${sshHost}'`));
   }
-  const invocation = {
-    command: 'ssh',
-    args: [
-      sshHost,
-      '--',
-      ['git', '-C', worktreePath, 'rev-parse', 'HEAD'].map(posixQuote).join(' '),
-    ],
-  };
+  if (worktreePath === '' || worktreePath.includes('\0')) {
+    return Promise.reject(new Error('Refusing to read HEAD over SSH: unusable worktree path'));
+  }
+  const sshBinary = resolveSshBinary(sshCandidates, isExecutableRegularFile);
+  if (sshBinary === undefined) {
+    return Promise.reject(new Error('Refusing to read HEAD over SSH: ssh not found in fixed locations'));
+  }
+  const words = ['git', '-C', worktreePath, 'rev-parse', 'HEAD'];
+  const args = [
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'ConnectTimeout=15',
+    sshHost,
+    '--',
+    'sh',
+    '-c',
+    posixQuote(words.map(posixQuote).join(' ')),
+  ];
   return new Promise((resolve, reject) => {
-    execFile(invocation.command, invocation.args, { encoding: 'utf8' }, (error, stdout) => {
+    execFile(sshBinary, args, { encoding: 'utf8', timeout: 60_000 }, (error, stdout) => {
       if (error === null) {
         resolve(String(stdout).trim());
         return;
@@ -664,6 +708,8 @@ export interface FleetCliRuntime {
     readonly updateProjectProfile: UpdateProjectProfileUseCase;
     readonly retireProjectProfile: RetireProjectProfileUseCase;
     readonly listProjectProfiles: ListProjectProfilesUseCase;
+    /** CO29a-ro2: the read-only profile listing the relaunch commands read. */
+    readonly listProjectProfilesReadOnly: ListProjectProfilesUseCase;
     readonly inspectProjectProfile: InspectProjectProfileUseCase;
     readonly recordProjectProbe: RecordProjectProbeUseCase;
     readonly inspectConfiguredCapabilities: InspectConfiguredCapabilitiesUseCase;
@@ -773,6 +819,8 @@ export interface FleetCliRuntime {
     readonly inspectAttempt: InspectAttemptUseCase;
     readonly explainAttempt: ExplainAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
+    /** CO17c: one brief-author seat session per brief; the CLI never dispatches. */
+    readonly authorBrief: AuthorBriefUseCase;
     readonly reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
     readonly dispatchAttempt: DispatchAttemptUseCase;
     /** AG-5: the edit-only commit step for a recorded agy edit-only attempt. */
@@ -801,6 +849,10 @@ export interface FleetCliRuntime {
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
     /** CO26: the read-only relaunch inventory per lane host. */
     readonly inventoryRelaunch: InventoryRelaunchUseCase;
+    /** CO29a: the immutable relaunch plan store, keyed by canonical plan digest. */
+    readonly relaunchPlanRepository: RelaunchPlanRepositoryAdapter;
+    /** CO29a: build and store the ordered relaunch plan (read-only over the inventory and records). */
+    readonly planRelaunch: PlanRelaunchUseCase;
     /** CO30a: the one cutover record v1 (`cutover.json`). */
     readonly cutoverRecordRepository: CutoverRecordRepositoryAdapter;
     /** CO30a: the keyed cutover journal (`cutover-journal.json`). */
@@ -809,6 +861,12 @@ export interface FleetCliRuntime {
     readonly killallTrainPause: KillallTrainPauseAdapter;
     /** CO30a: `cutover status` and `cutover rollback`; switch and retire are CO30b. */
     readonly manageCutover: ManageCutoverUseCase;
+    /** SH8a: the shadow day-writer behind `cutover shadow record-day`; undefined without a durable state directory. */
+    readonly recordShadowDay?: RecordShadowDayUseCase;
+    /** CO24comp: PR-feedback fix round preparation and grant-scoped push-to-pr. */
+    readonly preparePullRequestFeedbackFix: PreparePullRequestFeedbackFixUseCase;
+    /** OG-8b: the operator-only review thread helper; bound in forge mode github only, never given to the daemon. */
+    readonly reviewThreadHelper: ReviewThreadHelperPort;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -833,6 +891,10 @@ export interface FleetCliRuntime {
     readonly reapLaneWorktrees: ReapLaneWorktreesUseCase;
     /** EX-4: the operator-opt-in orphan-session reap (conductor reap --sessions). */
     readonly reapOrphanSessions: ReapOrphanSessionsUseCase;
+    /** OG22b: the operator-opt-in orphan-reservation reap (conductor reap --reservations --yes). */
+    readonly reapOrphanReservations: ReapOrphanReservationsUseCase;
+    /** OG22b: the same reap over read-only stores, used by --dry-run; it can write nothing. */
+    readonly reapOrphanReservationsDryRun: ReapOrphanReservationsUseCase;
     /** KW4b': the zombie reaper pass. */
     readonly reapZombies: ReapZombiesUseCase;
     /** KW4b': the reaper's findings store (file-backed with a state dir). */
@@ -942,6 +1004,12 @@ function editOnlyModeOf(
 
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
   const stateDir = options?.stateDir;
+  // Taken before any adapter is composed (some create the directory): the relaunch commands refuse
+  // a state directory that did not exist as a directory instead of reading it as an empty installation.
+  const stateDirPresentAtStart =
+    stateDir === undefined || stateDir.trim().length === 0
+      ? undefined
+      : statSync(stateDir, { throwIfNoEntry: false })?.isDirectory() === true;
   // AM5-3: the auto-merge settings binding re-reads a fresh installation on
   // every call (A7); tests inject a loader over a temp file.
   const autoMergeLoad = options?.loadInstallationForAutoMerge ?? (() => loadInstallation());
@@ -1115,6 +1183,19 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     readJsonRecord,
   });
 
+  // CO17c: the brief author use case composes from the same execution stack it
+  // freezes through. The fact pack reads through the orchestrator executor
+  // (the role that runs where this process runs) and the brief authoring
+  // adapter is the already-composed instance with no seat command configured.
+  const authorBrief = new AuthorBriefUseCase({
+    factPack: new BuildFactPackUseCase({
+      facts: new RepositoryFactsAdapter({ executor: roleExecutors.orchestrator }),
+      mintNonce: () => randomBytes(16).toString('hex'),
+    }),
+    briefAuthoring: execution.briefAuthoring,
+    prepareBriefPackage: execution.prepareBriefPackage,
+  });
+
   const { conductor } = composeConductor({
     stateDir,
     evidence,
@@ -1179,14 +1260,17 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runJournal: conductor.laneRunJournal,
   });
 
-  // CO26: the read-only relaunch inventory reads the same lane-run stores the
-  // conductor composes, beside closeWorkOrder / listStaleWorkOrders.
-  const inventoryRelaunch = new InventoryRelaunchUseCase({
-    runRepo: conductor.laneRunRepository,
-    attemptRepo: attemptRepository,
+  // CO26 + CO29a: `relaunch inventory` and `relaunch plan` are strictly
+  // read-only; composeReadOnlyRelaunch builds every state adapter they reach
+  // read-only and takes no store from the conductor (CO29a-ro). A corrupt
+  // store file is never quarantined by either command, and unreadable halt
+  // or lease bytes answer unknown instead of a value (CO29a-ro2). The plan
+  // store (relaunch-plans.json) is the one allowed write, and only
+  // `planRelaunch` holds it.
+  const { inventoryRelaunch, planRelaunch, relaunchPlanRepository } = composeReadOnlyRelaunch({
+    stateDir,
+    stateDirPresentAtStart,
     workspace,
-    halt: conductor.halt,
-    driverLease: conductor.driverLease,
     runnerForAttempt,
     computeDigest: sha256HexDigest,
   });
@@ -1224,6 +1308,49 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const inspectMergeReadiness = new InspectMergeReadinessUseCase({
     mergeRead: mergeForgeRead,
     nowIso: () => new Date().toISOString(),
+  });
+
+  // OG-8b: the operator-only review thread helper. Bound only when forge mode
+  // is github; the daemon and the conductor receive no reference to it.
+  const reviewThreadHelper: ReviewThreadHelperPort =
+    forgeMode === 'github'
+      ? new GhReviewThreadHelperAdapter({
+          runGh: (args, timeoutMs) =>
+            (
+              options?.forgeGhRunner ??
+              ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
+                runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
+            )(args, timeoutMs),
+        })
+      : new GhReviewThreadHelperAdapter();
+
+  // CO24comp: the PR-feedback fix round reads findings through the same
+  // reviewed gh subprocess as the other forge reads, and only when the
+  // installation binds github; otherwise the adapter stays unconfigured and
+  // every round refuses instead of reaching for a forge the installation
+  // forbids.
+  const pullRequestFindingsRead =
+    forgeMode === 'github' && forgeGithubSection !== undefined
+      ? new PullRequestFindingsReadAdapter({
+          repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo },
+          runGh: (args, timeoutMs) =>
+            (
+              options?.forgeGhRunner ??
+              ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
+                runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
+            )(args, timeoutMs),
+        })
+      : new PullRequestFindingsReadAdapter();
+  const preparePullRequestFeedbackFix = new PreparePullRequestFeedbackFixUseCase({
+    findings: pullRequestFindingsRead,
+    prepareFixAttempt: execution.prepareFixAttempt,
+    executeForgeAction: execution.executeAuthorizedForgeAction,
+    repository:
+      forgeGithubSection !== undefined
+        ? { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo }
+        : { owner: '', repo: '' },
+    nowIso: () => new Date().toISOString(),
+    mintNonce: () => randomBytes(16).toString('hex'),
   });
 
   // DT10b: the daemon stack (merge pass, tick, status, pause, forge probe).
@@ -1270,6 +1397,62 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     nowIso: daemon.now,
   });
 
+  // SH8a: `cutover shadow record-day` — the shadow day-writer. Durable-state
+  // only: without a state directory there is no ledger to write and no fleet
+  // stores to check, so the use case stays undefined exactly like every other
+  // durable-only use case in this composition (in-memory mode is disposable).
+  const recordShadowDay =
+    durableCutover && stateDir !== undefined && stateDir.trim().length > 0
+      ? new RecordShadowDayUseCase({
+        // SH2's composition created no ShadowEvidenceAdapter elsewhere, so this
+        // is the one writable instance over the ledger store it owns.
+        evidence: new ShadowEvidenceAdapter({ stateDir }),
+        // The same read-only shell-train reader the shadow report composes:
+        // reuse the instance rather than point a second one at the same files.
+        legacy: execution.legacyTrainState,
+        queue: execution.mergeQueueRepository,
+        // S8's dry-run seat: the existing import use case, apply never set.
+        importDryRun: execution.importTrainState,
+        sleep:
+          options?.daemonSleep ??
+          ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+        journal: conductor.laneRunJournal,
+        daemonEvents: daemon.events,
+        // S9's state integrity sample: the same four-context check the
+        // `state check` logic in state.ts runs, over each package's own
+        // state-file descriptor list, counting the genuinely-unknown statuses.
+        checkState: async () => {
+          const checks = await Promise.all(
+            [
+              ...WORK_EXECUTION_STATE_FILES,
+              ...EVIDENCE_AND_ACCEPTANCE_STATE_FILES,
+              ...BRIEF_KNOWLEDGE_STATE_FILES,
+              ...OPERATOR_COORDINATION_STATE_FILES,
+            ].map((descriptor) => descriptor.check(stateDir)),
+          );
+          return {
+            checked: checks.length,
+            bad: checks.filter(
+              (check) =>
+                check.result.status === 'unreadable' ||
+                check.result.status === 'read-error' ||
+                check.result.status === 'unknown-version',
+            ).length,
+          };
+        },
+        computeDigest: sha256HexDigest,
+        // The same repository derivation MergeQueueRepositoryAdapter and the
+        // daemon's mergePolicySource use — never a second formula.
+        repoDigestOf: (repository) => sha256HexDigest(`${repository.owner}/${repository.repo}`).slice(0, 12),
+        // OD-4: release binding is not yet built; SH8b and a later unit revisit
+        // this constant once a release sha source exists.
+        releaseSha: async () => null,
+        nowIso: daemon.now,
+        // OD-1: the owner-accepted default is false, fail-closed; this use case
+        // only receives it.
+        settings: { excludeBatchMerges: false },
+      })
+    : undefined;
   return {
     installation: options?.installation,
     daemon,
@@ -1278,15 +1461,24 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     execution: {
       ...execution,
+      authorBrief,
       registerWorkOrder,
       closeWorkOrder,
       listStaleWorkOrders,
       inspectMergeReadiness,
       inventoryRelaunch,
+      /** CO29a: the immutable relaunch plan store, keyed by canonical plan digest. */
+      relaunchPlanRepository,
+      /** CO29a: build and store the ordered relaunch plan (read-only over the inventory and records). */
+      planRelaunch,
       cutoverRecordRepository,
       cutoverJournal,
       killallTrainPause,
       manageCutover,
+      preparePullRequestFeedbackFix,
+      /** SH8a: `cutover shadow record-day`; undefined without a durable state directory. */
+      ...(recordShadowDay !== undefined ? { recordShadowDay } : {}),
+      reviewThreadHelper,
       exportLegacyTrainState: new ExportLegacyTrainStateUseCase({
         listMergeQueue: execution.listMergeQueue,
         nowIso: () => new Date().toISOString(),

@@ -127,9 +127,9 @@ function fakeExecutor(behaviour: FakeExecutorBehaviour = {}): {
             stderr: "probe failure",
           };
         }
-        const template = argv.find((token) =>
-          token.includes(".fleet-probe.XXXXXX"),
-        );
+        const template = argv
+          .join(" ")
+          .match(/[^\s']*\.fleet-probe\.XXXXXX/)?.[0];
         if (template !== undefined) {
           return {
             exitCode: 0,
@@ -191,7 +191,9 @@ describe("fleet-v2 hosts add --from-descriptor", () => {
     expect(code).toBe(0);
     expect(stdout).toContain("written");
     // The probe ran through ssh with BatchMode and the alias after `--`.
-    const reachability = calls.find((argv) => argv.includes("true"));
+    const reachability = calls.find(
+      (argv) => argv[argv.length - 1] === "''\\''true'\\'''",
+    );
     expect(reachability?.slice(0, 5)).toEqual([
       "ssh",
       "-o",
@@ -201,6 +203,9 @@ describe("fleet-v2 hosts add --from-descriptor", () => {
     ]);
     expect(reachability?.[5]).toBe("m");
     expect(reachability?.[6]).toBe("--");
+    expect(reachability?.[7]).toBe("sh");
+    expect(reachability?.[8]).toBe("-c");
+    expect(reachability?.[9]).toBe("''\\''true'\\'''");
     const parsed = readInstallationFile(file) as {
       hosts: Record<
         string,

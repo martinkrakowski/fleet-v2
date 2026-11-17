@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
-import type { FindingSeverity, ReviewFindingRecord, ReviewUnknownReason } from '../../domain/evidence-records.js';
+import type { FindingSeverity, ReviewFindingRecord, ReviewKind, ReviewUnknownReason } from '../../domain/evidence-records.js';
 import { isWholeValuePlaceholder } from '../../domain/placeholder-evidence.js';
 import {
   MAX_REVIEW_REPLY_LENGTH,
@@ -12,6 +12,7 @@ import {
   isSafeRelativeFilePath,
   validateReviewAnswerObject,
 } from '../../domain/review-answer-schema.js';
+import { parseReviewStreamGrammar } from '../../domain/review-stream-grammar.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewTransportDiagnostic, ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
@@ -42,6 +43,44 @@ export function isTimeoutError(error: unknown): boolean {
     return typeof candidate.message === 'string' && /timed?\s*out|timeout/i.test(candidate.message);
   } catch {
     return false;
+  }
+}
+
+/**
+ * Spawn errnos that are permanent OS failures: the same command cannot
+ * succeed on a retry. Classified `transport-failed` — journalled downstream
+ * as `review-no-receipt` and counted against the review retry budget (never
+ * described as non-retryable).
+ */
+const PERMANENT_SPAWN_ERRNOS: ReadonlySet<string> = new Set([
+  'E2BIG',
+  'ENOENT',
+  'EACCES',
+  'ENOEXEC',
+]);
+
+/**
+ * Classify a thrown spawn error. A timeout shape is `timeout`; a permanent
+ * spawn errno is `transport-failed` (journalled downstream as
+ * `review-no-receipt` and counted against the review retry budget); anything
+ * else is `transport`. Hostile shapes (null, primitives, arrays, non-string
+ * codes, throwing getters) read as `transport` without ever throwing.
+ */
+export function classifySpawnErrorCode(error: unknown): 'timeout' | 'transport-failed' | 'transport' {
+  try {
+    if (isTimeoutError(error)) {
+      return 'timeout';
+    }
+    if (typeof error !== 'object' || error === null || Array.isArray(error)) {
+      return 'transport';
+    }
+    const code = safeRead(() => (error as { readonly code?: unknown }).code);
+    if (typeof code === 'string' && PERMANENT_SPAWN_ERRNOS.has(code)) {
+      return 'transport-failed';
+    }
+    return 'transport';
+  } catch {
+    return 'transport';
   }
 }
 
@@ -139,6 +178,8 @@ export interface OcmReviewTransportSpawnResult {
   readonly stderr: string;
   /** Set only when the spawn ended because its wall-clock budget ran out. */
   readonly timedOut?: boolean;
+  /** The OS errno of a spawn failure (for example `ENOENT`); absent otherwise. */
+  readonly errorCode?: string;
 }
 
 export type OcmReviewTransportSpawn = (
@@ -175,7 +216,9 @@ export interface OcmReviewTransportOptions {
   readonly makeNonce?: () => string;
   /**
    * The base commit the candidate diff is read against. When set together
-   * with `readDiff`, a kind review prompt embeds the base..head diff.
+   * with `readDiff`, a kind review prompt embeds the base..head diff. A
+   * `headIsBase` kind (brief-verify) additionally requires it: without a
+   * known base commit that review is refused.
    */
   readonly baseCommit?: string;
   /** Read-only diff read through the review location; paired with `baseCommit`. */
@@ -738,6 +781,92 @@ export const REVIEW_CHECKLIST: string = [
   '(g) each finding names a concrete failure scenario.',
 ].join('\n');
 
+/** The question a brief-check review answers. */
+export const BRIEF_CHECK_QUESTION =
+  'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.';
+
+/** The checklist of a pre-dispatch brief verification (CO18): the brief is checked against the code, no change exists yet. */
+export const BRIEF_VERIFY_CHECKLIST: string = [
+  'This is a pre-dispatch verification of the brief itself: no change exists yet, and the candidate head is the base commit the brief was written against.',
+  'Check every item below against the repository at the candidate head and report each item that fails as a finding:',
+  '(a) the contracts, ports and use-case types the brief names match the code at the base commit;',
+  '(b) the keys, request ids, digests and store shapes the brief specifies are deterministic;',
+  '(c) the brief keeps the domain pure and makes every refusal fail closed;',
+  '(d) every file, symbol, line range and gate command the brief cites exists at the base commit as stated;',
+  '(e) the exports and the production composition the brief describes leave no integration gap;',
+  '(f) each finding names a concrete defect of the brief, and its "file" is the repository file the brief cites wrongly or would change.',
+].join('\n');
+
+/**
+ * Known false positives every conductor review prompt (a request with `kind`)
+ * carries (RVP1). Trusted, constant text: never interpolated from a request,
+ * never placed inside an untrusted block. The CLI and api transports import
+ * this one constant, so the three transports cannot drift.
+ */
+export const REVIEW_KNOWN_FALSE_POSITIVES: string = [
+  'Known false positive (a fixed reviewer rule, not part of the change under review):',
+  'In JavaScript, `$` without the `m` flag matches only at the very end of the input. It does not match before a final newline: /^a$/.test("a\\n") is false. (Python and PCRE differ; with the `m` flag `$` does match before a newline.)',
+  'So never report that an exact end-anchored literal pattern, such as /^a$/ or /^foo$/, accepts a trailing newline merely for lacking the `m` flag: that one claim is false. Do report a pattern whose own quantifier or character class consumes the newline before `$`, such as /^[^/]+$/.test("name\\n") or /^[\\s\\S]+$/.test("a\\n") (both true without `m`): state the exact input string and the flags that prove it.',
+].join('\n');
+
+/** The fixed reason a kind with no prompt plan is refused; it never carries the kind value. */
+export const UNSUPPORTED_REVIEW_KIND_REASON = 'unsupported review kind';
+
+/**
+ * The fixed reason a brief-verify review whose candidate head is not the
+ * brief's base commit is refused; it carries no request text.
+ */
+export const BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON =
+  'a pre-dispatch brief verification requires the candidate head to be the base commit the brief was written against';
+
+/**
+ * The fixed reason a brief-verify review with no known base commit is refused;
+ * it carries no request text. Without a base commit the head/base comparison
+ * cannot run, so the prompt's claim that the candidate head is the brief's
+ * base cannot be verified and the review can never pass.
+ */
+export const BRIEF_VERIFY_BASE_UNKNOWN_REASON =
+  'a pre-dispatch brief verification requires a known base commit';
+
+/** What one review kind's prompt needs: the brief, the base..head diff, and its instruction text. */
+export interface KindPromptPlan {
+  readonly brief: boolean;
+  readonly diff: boolean;
+  /**
+   * Whether the kind's review checks the repository at the candidate head, so
+   * the head must be the base commit the brief was written against; a
+   * different head, or an unknown base commit, is refused before any read or
+   * spawn.
+   */
+  readonly headIsBase: boolean;
+  readonly instructions: string;
+}
+
+// `Record<ReviewKind, ...>`: adding a kind to REVIEW_KINDS fails the build here until it gets its own plan.
+const KIND_PROMPT_PLANS: Readonly<Record<ReviewKind, KindPromptPlan>> = {
+  'brief-check': { brief: true, diff: true, headIsBase: false, instructions: BRIEF_CHECK_QUESTION },
+  'brief-verify': { brief: true, diff: false, headIsBase: true, instructions: BRIEF_VERIFY_CHECKLIST },
+  'code-review': { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST },
+  'pre-merge': { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST },
+};
+
+/** The plan of a kind, or `null` for anything that is not one of the four kinds (own keys only). */
+export function kindPromptPlanOf(kind: unknown): KindPromptPlan | null {
+  if (typeof kind !== 'string' || !Object.hasOwn(KIND_PROMPT_PLANS, kind)) {
+    return null;
+  }
+  return KIND_PROMPT_PLANS[kind as ReviewKind];
+}
+
+/** The plan of a kind, or the typed refusal: an unknown kind never gets another kind's prompt. */
+export function requireKindPromptPlan(kind: unknown): KindPromptPlan {
+  const plan = kindPromptPlanOf(kind);
+  if (plan === null) {
+    throw new ReviewTransportError(UNSUPPORTED_REVIEW_KIND_REASON, 'transport-failed');
+  }
+  return plan;
+}
+
 /** Byte cap for the diff embedded in a kind review prompt. */
 export const MAX_OCM_EMBEDDED_DIFF_BYTES = 120_000;
 
@@ -745,6 +874,16 @@ export const MAX_OCM_EMBEDDED_DIFF_BYTES = 120_000;
 export const DIFF_UNAVAILABLE_REASON = 'diff-unavailable';
 /** The fixed reason a review is refused because the diff under review exceeded the embedding limit. */
 export const DIFF_TRUNCATED_REASON = 'diff-truncated';
+
+/**
+ * Byte cap for the whole review prompt (instructions + brief + diff) before it
+ * travels as a single `argv` element to `ocm-run` / `opencode run`. Linux caps
+ * one argv element at 131,072 bytes; this leaves headroom below that limit.
+ */
+export const MAX_OCM_PROMPT_BYTES = 125_000;
+
+/** The fixed reason a review is refused because the built prompt exceeded the single-argument limit. */
+export const PROMPT_TOO_LARGE_REASON = 'prompt-too-large';
 
 export type DiffEmbedding =
   | { readonly kind: 'embedded'; readonly diff: string }
@@ -800,10 +939,22 @@ function buildManualReviewPrompt(request: RunIndependentReviewRequest, nonce: st
   return sections.join('\n\n');
 }
 
+/** The brief block of a kind that carries the brief; a missing or blank brief is refused. */
+function briefInstructions(request: RunIndependentReviewRequest, nonce: string, instructions: string): string {
+  if (typeof request.briefText !== 'string' || request.briefText.trim() === '') {
+    throw new ReviewTransportError(`a ${request.kind} review requires the brief text`, 'transport-failed');
+  }
+  const wrappedBrief = wrapUntrusted({ label: 'brief', text: request.briefText, nonce });
+  return `${BRIEF_INPUT_RULE}\n\nBrief:\n${wrappedBrief}\n\n${instructions}`;
+}
+
 /**
  * The prompt a conductor review (a request with `kind`) receives: the header
- * names the kind, a brief-check carries the frozen brief wrapped as untrusted,
- * and code-review and pre-merge carry the failure-mode checklist.
+ * names the kind, the instructions come from the kind's plan, and a kind with
+ * no plan is refused. `brief-check` and `brief-verify` carry the frozen brief
+ * wrapped as untrusted; `brief-verify` never carries a diff, even when a
+ * caller offers one — the worktree sits at the base commit, so there is no
+ * change to embed.
  */
 function buildKindReviewPrompt(
   request: RunIndependentReviewRequest,
@@ -811,10 +962,12 @@ function buildKindReviewPrompt(
   embeddedDiff?: string | null,
   diffUnavailable?: boolean,
 ): string {
+  const plan = requireKindPromptPlan(request.kind);
   const sections: string[] = [
     `Independent read-only ${request.kind} review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`,
     'This review session is strictly read-only. Do not edit, create, delete, or modify any files.',
     UNTRUSTED_INPUT_RULE,
+    REVIEW_KNOWN_FALSE_POSITIVES,
   ];
 
   if (typeof request.diffSummary === 'string' && request.diffSummary.trim() !== '') {
@@ -826,38 +979,23 @@ function buildKindReviewPrompt(
     sections.push(`Diff summary:\n${wrappedDiffSummary}`);
   }
 
-  if (request.kind === 'brief-check') {
-    if (typeof request.briefText === 'string' && request.briefText.trim() !== '') {
-      const wrappedBrief = wrapUntrusted({
-        label: 'brief',
-        text: request.briefText,
-        nonce,
-      });
-      sections.push(
-        `${BRIEF_INPUT_RULE}\n\nBrief:\n${wrappedBrief}\n\n` +
-          'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.',
-      );
-    } else {
-      throw new ReviewTransportError('a brief-check review requires the brief text', 'transport-failed');
-    }
-  } else {
-    sections.push(REVIEW_CHECKLIST);
-  }
+  sections.push(plan.brief ? briefInstructions(request, nonce, plan.instructions) : plan.instructions);
+  const offeredDiff = plan.diff ? embeddedDiff : null;
 
   let diffEmbedded = false;
-  if (typeof embeddedDiff === 'string' && embeddedDiff.trim() !== '') {
-    if (Buffer.byteLength(embeddedDiff, 'utf8') > MAX_OCM_EMBEDDED_DIFF_BYTES) {
+  if (typeof offeredDiff === 'string' && offeredDiff.trim() !== '') {
+    if (Buffer.byteLength(offeredDiff, 'utf8') > MAX_OCM_EMBEDDED_DIFF_BYTES) {
       sections.push('The diff was too large to embed; the read-only tools still work against the candidate head.');
     } else {
       const wrappedDiff = wrapUntrusted({
         label: 'diff',
-        text: embeddedDiff,
+        text: offeredDiff,
         nonce,
       });
       sections.push(`Diff:\n${wrappedDiff}`);
       diffEmbedded = true;
     }
-  } else if (diffUnavailable === true) {
+  } else if (plan.diff && diffUnavailable === true) {
     sections.push('The diff was not available; the read-only tools still work against the candidate head.');
   }
 
@@ -1259,6 +1397,7 @@ export async function defaultSpawn(
     stdout: outcome.stdout,
     stderr: outcome.stderr !== '' ? outcome.stderr : outcome.error ?? '',
     ...(timedOut ? { timedOut: true } : {}),
+    ...(outcome.errorCode !== undefined ? { errorCode: outcome.errorCode } : {}),
   };
 }
 
@@ -1275,6 +1414,26 @@ function isStreamCutBeforeFinish(hasStepFinish: boolean, lastStepOpen: boolean):
   return !hasStepFinish || lastStepOpen;
 }
 
+/** The fixed raw output of a stream the grammar refused (RVG2). */
+export const STREAM_GRAMMAR_REASON = 'stream-grammar';
+
+/**
+ * RVG2: the result of a reviewer stream no verdict is read from. The fixed
+ * reason travels as the raw output; the result is always `unknown`.
+ */
+function refusedStreamResult(
+  reason: 'stream-incomplete' | typeof STREAM_GRAMMAR_REASON,
+  readOnlyVerified: boolean,
+): IndependentReviewTransportResult {
+  return {
+    rawOutput: reason,
+    readOnlyVerified,
+    result: 'unknown',
+    findings: [],
+    completedAtIso: new Date().toISOString(),
+  };
+}
+
 export function createOcmReviewTransport(
   options: OcmReviewTransportOptions,
 ): (request: RunIndependentReviewRequest) => Promise<IndependentReviewTransportResult> {
@@ -1283,6 +1442,25 @@ export function createOcmReviewTransport(
     // the fixed reason; an absent code (an older locator) is route-unresolved.
     if (options.route !== undefined && options.route.kind === 'none') {
       throw new ReviewTransportError(options.route.reason, options.route.code ?? 'route-unresolved');
+    }
+
+    // 0b. A kind with no prompt plan is refused before any read or spawn; a
+    // manual review (no kind) has no plan and keeps the manual prompt.
+    const kindPlan = request.kind === undefined ? undefined : requireKindPromptPlan(request.kind);
+
+    // 0c. A plan whose review checks the repository at the candidate head
+    // (no change exists yet) requires that head to be the base commit the
+    // brief was written against. A different head is refused before any read
+    // or spawn, so a review of a head the brief does not describe can never
+    // pass. Without a known base commit there is nothing to compare against,
+    // so the review is refused too: an unverifiable claim is never a pass.
+    if (kindPlan !== undefined && kindPlan.headIsBase) {
+      if (options.baseCommit === undefined) {
+        throw new ReviewTransportError(BRIEF_VERIFY_BASE_UNKNOWN_REASON, 'transport-failed');
+      }
+      if (request.candidateHeadSha !== options.baseCommit) {
+        throw new ReviewTransportError(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON, 'transport-failed');
+      }
     }
 
     // 1. Verify reviewer model matches options.model
@@ -1328,8 +1506,9 @@ export function createOcmReviewTransport(
     // when idle (two reads) and 75 when a session still runs past
     // `OCM_WAIT_MAX`; a cut-short wait (a timeout) writes no review intent, so
     // the next pass can dispatch. Exit 75 or `timedOut` is `seat-busy`; any
-    // other non-zero exit, an unreadable exit code or a thrown spawn is the
-    // existing `transport`/`timeout` code. None of these spawn the review.
+    // other non-zero exit, an unreadable exit code or a thrown spawn classifies
+    // as `timeout`, `transport-failed` (a permanent spawn errno) or `transport`.
+    // None of these spawn the review.
     const timeoutMs = options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     const reviewEnv = buildReviewerEnv(options);
     const waitSpawnFn = options.spawn ?? defaultSpawn;
@@ -1340,13 +1519,14 @@ export function createOcmReviewTransport(
         OCM_WAIT_MAX: String(Math.max(1, Math.ceil(timeoutMs / 1000))),
       }, { timeoutMs });
     } catch (error) {
-      // RV4: a thrown spawn always classifies as `timeout` or `transport`. Its
-      // message is never passed through — it may carry a secret or a path —
-      // and a typed ReviewTransportError thrown by the spawn is classified like
-      // any other throw, never rethrown with its own code or message.
+      // RV4: a thrown spawn classifies as `timeout`, `transport-failed` (a
+      // permanent spawn errno) or `transport`. Its message is never passed
+      // through — it may carry a secret or a path — and a typed
+      // ReviewTransportError thrown by the spawn is classified like any other
+      // throw, never rethrown with its own code or message.
       throw new ReviewTransportError(
         'reviewer process failed',
-        isTimeoutError(error) ? 'timeout' : 'transport',
+        classifySpawnErrorCode(error),
         transportFailureDiagnostic(error),
       );
     }
@@ -1356,19 +1536,25 @@ export function createOcmReviewTransport(
     }
     if (waitExitCode !== 0) {
       const waitTimedOut = spawnTimedOut(waitResult);
+      const waitErrorCode = safeRead(() => waitResult.errorCode);
       throw new ReviewTransportError(
         `reviewer process failed with exit code ${String(waitExitCode)}`,
-        waitTimedOut ? 'timeout' : 'transport',
+        waitTimedOut
+          ? 'timeout'
+          : typeof waitErrorCode === 'string' && PERMANENT_SPAWN_ERRNOS.has(waitErrorCode)
+            ? 'transport-failed'
+            : 'transport',
         spawnDiagnosticOf(waitResult),
       );
     }
 
     // 5. Build argv and sanitized environment. A kind review embeds the
     // base..head diff read after the pre-review head read, so the reviewer
-    // does not need a shell to see the change.
+    // does not need a shell to see the change. A `brief-verify` review has no
+    // diff: the worktree sits at the base commit, so there is no change to embed.
     const nonce = (options.makeNonce ?? defaultNonce)();
     let embeddedDiff: string | null = null;
-    if (request.kind !== undefined) {
+    if (kindPlan !== undefined && kindPlan.diff) {
       // F68: a kind review with no diff source is refused exactly like an
       // unreadable diff: a review that cannot see the change can still answer
       // PASS, so the transport refuses before the prompt and the spawn.
@@ -1408,6 +1594,23 @@ export function createOcmReviewTransport(
       embeddedDiff = embedding.diff;
     }
     const prompt = buildReviewPrompt(request, nonce, embeddedDiff);
+    // The prompt travels as one argv element; Linux caps a single argument at
+    // 131,072 bytes, and a larger prompt makes the spawn report E2BIG as a
+    // child `error` event — classified as `transport-failed`, which is
+    // journalled downstream as `review-no-receipt` and counts against the
+    // review retry budget. An oversize prompt is refused here instead: no
+    // process is spawned, nothing throws, and the review refuses cleanly (the
+    // caller should split the lane, not retry).
+    if (Buffer.byteLength(prompt, 'utf8') > MAX_OCM_PROMPT_BYTES) {
+      const after = await options.readHead(dir);
+      return {
+        rawOutput: PROMPT_TOO_LARGE_REASON,
+        readOnlyVerified: before === request.candidateHeadSha && after === request.candidateHeadSha,
+        result: 'unknown',
+        findings: [],
+        completedAtIso: new Date().toISOString(),
+      };
+    }
     const argv: string[] = [
       '--dir',
       dir,
@@ -1429,13 +1632,14 @@ export function createOcmReviewTransport(
       });
     } catch (error) {
       // Every throw from the review spawn is classified: a timeout shape is a
-      // `timeout`, anything else a `transport` failure. A typed
-      // ReviewTransportError thrown by the spawn does not travel as-is — its
-      // message could expose a secret or a path, and its code would bypass the
-      // thrown-spawn classification; the fixed message travels instead.
+      // `timeout`, a permanent spawn errno a `transport-failed`, anything else
+      // a `transport` failure. A typed ReviewTransportError thrown by the
+      // spawn does not travel as-is — its message could expose a secret or a
+      // path, and its code would bypass the thrown-spawn classification; the
+      // fixed message travels instead.
       throw new ReviewTransportError(
         'reviewer process failed',
-        isTimeoutError(error) ? 'timeout' : 'transport',
+        classifySpawnErrorCode(error),
         transportFailureDiagnostic(error),
       );
     }
@@ -1448,23 +1652,28 @@ export function createOcmReviewTransport(
         // worktree is busy too. The fixed message carries no stderr and no path.
         throw new ReviewTransportError('review seat busy', 'seat-busy', diagnostic);
       }
+      const spawnErrorCode = safeRead(() => spawnResult.errorCode);
       throw new ReviewTransportError(
         `reviewer process failed with exit code ${String(spawnExitCode)}`,
-        timedOut ? 'timeout' : 'transport',
+        timedOut
+          ? 'timeout'
+          : typeof spawnErrorCode === 'string' && PERMANENT_SPAWN_ERRNOS.has(spawnErrorCode)
+            ? 'transport-failed'
+            : 'transport',
         diagnostic,
       );
     }
 
-    // 7. Parse stdout JSON lines for text and tool parts
+    // 7. Read stdout JSON lines for tool parts and step markers (the read-only proof)
     // A missing or non-string stdout reads as empty; the parse loop never throws.
     const spawnStdout = safeRead(() => spawnResult.stdout);
+    const streamText = typeof spawnStdout === 'string' ? spawnStdout : '';
     let readOnlyVoided = false;
     let hasStepStart = false;
     let hasStepFinish = false;
     let lastStepOpen = false;
-    const textParts: string[] = [];
     const toolNames: string[] = [];
-    for (const rawLine of (typeof spawnStdout === 'string' ? spawnStdout : '').split(/\r?\n/)) {
+    for (const rawLine of streamText.split(/\r?\n/)) {
       const line = rawLine.trim();
       if (line === '') continue;
       let parsed: unknown;
@@ -1519,11 +1728,6 @@ export function createOcmReviewTransport(
           }
         }
       }
-
-      const textPart = extractTextPart(parsed);
-      if (textPart !== null) {
-        textParts.push(textPart);
-      }
     }
 
     // 8. Verify head after review and compute readOnlyVerified
@@ -1536,16 +1740,15 @@ export function createOcmReviewTransport(
 
     // 9. Parse verdict, findings, and rawOutput
     if (isStreamCutBeforeFinish(hasStepFinish, lastStepOpen)) {
-      return {
-        rawOutput: 'stream-incomplete',
-        readOnlyVerified,
-        result: 'unknown',
-        findings: [],
-        completedAtIso: new Date().toISOString(),
-      };
+      return refusedStreamResult('stream-incomplete', readOnlyVerified);
     }
-    // Each text part is a whole message part; a part that does not end in a newline must not glue its last line onto the next part's first.
-    const finalText = textParts.join('\n');
+    // RVG2: the verdict text is read only from a stream the strict grammar accepts.
+    const grammar = parseReviewStreamGrammar(streamText);
+    if (!grammar.ok) {
+      return refusedStreamResult(STREAM_GRAMMAR_REASON, readOnlyVerified);
+    }
+    // The grammar joins every text event of the stream with a newline.
+    const finalText = grammar.verdictText;
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.
     const { result, findings, unknownReason } =
       request.kind !== undefined

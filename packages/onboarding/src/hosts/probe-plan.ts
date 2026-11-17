@@ -4,11 +4,13 @@
  * executes that list through the doctor engine's argv executor.
  *
  * Every step is an argv array, never a shell string, and every remote step
- * travels as `ssh -o BatchMode=yes -o ConnectTimeout=N <alias> -- …` with the
- * alias checked against the strict safe-host rule before any step is built.
- * The opencode server is asked on the host's own loopback through that ssh
- * call, never through a local forward, so a probe leaves no tunnel open and
- * no other host's server can answer.
+ * travels as `ssh -o BatchMode=yes -o ConnectTimeout=N <alias> -- sh -c
+ * '<one quoted line>'` built by `sshRemoteArgv`, with the alias checked
+ * against the strict safe-host rule before any step is built. The
+ * worktree check's `rm` travels that way too. The opencode server is asked
+ * on the host's own loopback through that ssh call, never through a local
+ * forward, so a probe leaves no tunnel open and no other host's server can
+ * answer.
  *
  * Two steps need more than one command and are expressed as their own kinds:
  * the worktree-root check creates one path with
@@ -29,6 +31,7 @@ import type {
 import { BUILT_IN_TOOLS } from '@fleet/tooling';
 
 import { boundDoctorDetail } from '../doctor/run-doctor.js';
+import { sshRemoteArgv } from '../doctor/ssh-remote.js';
 import type {
   DoctorCommandExecutor,
   DoctorCommandRunResult,
@@ -150,10 +153,10 @@ export type HostProbeStep =
   | (HostProbeStepBase & {
       readonly kind: 'mktemp-then-rm';
       readonly worktreeRoot: string;
-      /** The `mktemp -p <worktreeRoot>` argv. */
+      /** The `mktemp <worktreeRoot>/.fleet-probe.XXXXXX` argv. */
       readonly argv: readonly string[];
-      /** The transport prefix the derived `rm` argv must also travel through. */
-      readonly transportPrefix: readonly string[];
+      /** The ssh alias the derived `rm` also travels to; absent for a local host. */
+      readonly sshAlias?: string;
       readonly timeoutMs: number;
     })
   | (HostProbeStepBase & {
@@ -173,17 +176,40 @@ export type HostProbeStep =
       readonly detail: string;
     });
 
-/** The `ssh <alias> --` prefix with BatchMode and a connect budget. */
-function sshPrefixOf(alias: string): string[] {
-  return [
-    'ssh',
-    '-o',
-    'BatchMode=yes',
-    '-o',
-    `ConnectTimeout=${SSH_CONNECT_TIMEOUT_S}`,
-    alias,
-    '--',
-  ];
+/**
+ * The root the probe template and its answer check share: every trailing
+ * slash removed, so a root written as `/srv/worktrees/` plans the same
+ * single-slash template `/srv/worktrees/.fleet-probe.XXXXXX` that the
+ * answer check expects, instead of a double-slash path the check would
+ * refuse while the created file stays behind.
+ */
+function probeRootOf(root: string): string {
+  return root.replace(/\/+$/, '');
+}
+
+/**
+ * Characters a worktree root may not contain: the C0 and C1 controls
+ * (newline, carriage return, escape and NUL among them) and the Unicode line
+ * separators and bidi controls. The class the doctor engine already keeps
+ * out of its lines.
+ */
+// eslint-disable-next-line no-control-regex
+const UNPROBEABLE_ROOT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
+
+/**
+ * Why a worktree root may not be probed, or `undefined` when it may. A
+ * relative root would let `mktemp` create a file this engine then refuses
+ * to remove, and a root with a line break makes the answer unreadable. The
+ * reason never echoes the root.
+ */
+function worktreeRootRefusal(root: string): string | undefined {
+  if (typeof root !== 'string' || !root.startsWith('/')) {
+    return 'the worktree root is not an absolute path';
+  }
+  if (UNPROBEABLE_ROOT.test(root)) {
+    return 'the worktree root contains a control character';
+  }
+  return undefined;
 }
 
 /** The version argv of a runner kind's tool descriptor, or undefined. */
@@ -198,6 +224,37 @@ const PLATFORM_VERSION_ARGV: readonly (readonly [string, readonly string[]])[] =
     ['git', ['git', '--version']],
     ['node', ['node', '--version']],
   ];
+
+/**
+ * The worktree-root step: the `mktemp` template step, or a FAIL note that
+ * runs nothing when the root may not be probed.
+ */
+function worktreeRootStep(
+  spec: HostProbeSpec,
+  alias: string | undefined,
+): HostProbeStep {
+  const refusal = worktreeRootRefusal(spec.worktreeRoot);
+  if (refusal !== undefined) {
+    return {
+      kind: 'note',
+      scope: 'host',
+      subject: spec.name,
+      check: 'worktree-root-writable',
+      status: 'FAIL',
+      detail: `${refusal}; no command was run`,
+    };
+  }
+  return {
+    kind: 'mktemp-then-rm',
+    scope: 'host',
+    subject: spec.name,
+    check: 'worktree-root-writable',
+    worktreeRoot: spec.worktreeRoot,
+    argv: ['mktemp', `${probeRootOf(spec.worktreeRoot)}/.fleet-probe.XXXXXX`],
+    ...(alias !== undefined ? { sshAlias: alias } : {}),
+    timeoutMs: PROBE_TIMEOUT_MS,
+  };
+}
 
 /**
  * The ordered probe plan for one host: reachability, the platform and runner
@@ -227,11 +284,8 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
       },
     ];
   }
-  const transportPrefix = alias === undefined ? [] : sshPrefixOf(alias);
-  const remote = (argv: readonly string[]): string[] => [
-    ...transportPrefix,
-    ...argv,
-  ];
+  // The early return above stays before any wrapping, so an unsafe alias
+  // keeps its own FAIL note instead of a per-step refusal note.
   const steps: HostProbeStep[] = [];
 
   steps.push({
@@ -241,7 +295,7 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
     check: 'reachable',
     label: alias ?? 'local',
     outcome: 'reachable',
-    argv: remote(['true']),
+    argv: ['true'],
     failureStatus: 'FAIL',
     timeoutMs: SSH_CONNECT_TIMEOUT_S * 1000,
   });
@@ -254,7 +308,7 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
       check: `version-${tool}`,
       label: tool,
       outcome: 'version',
-      argv: remote(argv),
+      argv,
       failureStatus: 'FAIL',
       timeoutMs: PROBE_TIMEOUT_MS,
     });
@@ -280,23 +334,14 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
             check: `version-${runner.kind}`,
             label: runner.kind,
             outcome: 'version',
-            argv: remote(runnerArgv),
+            argv: runnerArgv,
             failureStatus: 'FAIL',
             timeoutMs: PROBE_TIMEOUT_MS,
           },
     );
   }
 
-  steps.push({
-    kind: 'mktemp-then-rm',
-    scope: 'host',
-    subject,
-    check: 'worktree-root-writable',
-    worktreeRoot: spec.worktreeRoot,
-    argv: remote(['mktemp', `${spec.worktreeRoot}/.fleet-probe.XXXXXX`]),
-    transportPrefix,
-    timeoutMs: PROBE_TIMEOUT_MS,
-  });
+  steps.push(worktreeRootStep(spec, alias));
 
   const laneRunnerRoot = spec.laneRunnerWorktreeRoot;
   if (laneRunnerRoot !== undefined) {
@@ -307,7 +352,7 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
       check: 'lane-runner-worktree-visible',
       label: `lane-runner worktree root ${laneRunnerRoot.worktreeRoot} on ${laneRunnerRoot.hostName}`,
       outcome: 'directory',
-      argv: remote(['test', '-d', laneRunnerRoot.worktreeRoot]),
+      argv: ['test', '-d', laneRunnerRoot.worktreeRoot],
       failureStatus: 'FAIL',
       timeoutMs: PROBE_TIMEOUT_MS,
     });
@@ -325,13 +370,13 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
       check: 'server-loopback',
       label: `opencode server on 127.0.0.1:${runner.port}`,
       outcome: 'server',
-      argv: remote([
+      argv: [
         'curl',
         '-fsS',
         '--max-time',
         '5',
         `http://127.0.0.1:${runner.port}/`,
-      ]),
+      ],
       failureStatus: 'UNKNOWN',
       timeoutMs: SERVER_TIMEOUT_MS,
     });
@@ -384,7 +429,34 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
     }
   }
 
-  return steps;
+  return alias === undefined ? steps : steps.map((step) => wrapForSsh(step, alias));
+}
+
+/**
+ * The ssh transport form of one planned step: its logical argv carried as
+ * `sh -c` plus one quoted line through `sshRemoteArgv`. A refusal becomes a
+ * FAIL note, never a partially quoted command.
+ */
+function wrapForSsh(step: HostProbeStep, alias: string): HostProbeStep {
+  if (step.kind !== 'run' && step.kind !== 'mktemp-then-rm') {
+    return step;
+  }
+  const built = sshRemoteArgv(alias, step.argv, SSH_CONNECT_TIMEOUT_S);
+  if (built.ok) {
+    return {
+      ...step,
+      argv: built.argv,
+      ...(step.kind === 'mktemp-then-rm' ? { sshAlias: alias } : {}),
+    };
+  }
+  return {
+    kind: 'note',
+    scope: step.scope,
+    subject: step.subject,
+    check: step.check,
+    status: 'FAIL',
+    detail: `the ssh command for this probe was refused (${built.reason}); no command was run`,
+  };
 }
 
 /** First non-empty line of text, trimmed. */
@@ -422,23 +494,22 @@ function failureDetail(
 }
 
 /**
- * True when `candidate` is a path directly inside `root`: an absolute path
- * under the root with no empty, `.` or `..` segment, so `mktemp` can never
- * talk this engine into removing something outside the worktree root.
+ * True when `candidate` is exactly the probe path mktemp was asked to create
+ * under `root`: `<root>/.fleet-probe.<six alphanumerics>`, one path segment
+ * directly under the root and nothing else, so `mktemp` can never talk this
+ * engine into removing anything outside the worktree root. `root` is taken
+ * through `probeRootOf`, so a root written with a trailing slash matches the
+ * single-slash template the plan builds from the same helper.
  */
-function isInsideRoot(root: string, candidate: string): boolean {
+function isProbePath(root: string, candidate: string): boolean {
   if (!candidate.startsWith('/') || candidate.includes('\0')) {
     return false;
   }
-  const prefix = `${root.endsWith('/') ? root.slice(0, -1) : root}/`;
+  const prefix = `${probeRootOf(root)}/.fleet-probe.`;
   if (!candidate.startsWith(prefix)) {
     return false;
   }
-  const segments = candidate.slice(prefix.length).split('/');
-  return (
-    segments.length > 0 &&
-    segments.every((part) => part !== '' && part !== '.' && part !== '..')
-  );
+  return /^[A-Za-z0-9]{6}$/.test(candidate.slice(prefix.length));
 }
 
 /** Run a probe; a throw becomes `undefined` and reports as unknown. */
@@ -515,10 +586,25 @@ async function runStep(
   return line(step, step.failureStatus, failureDetail(step, result));
 }
 
+/** The `rm` of the created path: bare locally, through `sshRemoteArgv` for an ssh step. */
+function rmCommandOf(
+  step: Extract<HostProbeStep, { kind: 'mktemp-then-rm' }>,
+  answer: string,
+): readonly string[] | undefined {
+  const rmArgv = ['rm', '--', answer];
+  if (step.sshAlias === undefined) {
+    return rmArgv;
+  }
+  const built = sshRemoteArgv(step.sshAlias, rmArgv, SSH_CONNECT_TIMEOUT_S);
+  return built.ok ? built.argv : undefined;
+}
+
 /**
- * The worktree-root step: create one path with `mktemp -p <root>`, then
- * remove exactly that path with `rm --`. A path the answer does not place
- * inside the root is refused and nothing is removed; a path that cannot be
+ * The worktree-root step: create one path with the template form
+ * `mktemp <root>/.fleet-probe.XXXXXX` — which works with both GNU and BSD
+ * mktemp — then remove exactly that path with `rm --`. Only an answer of
+ * exactly `<root>/.fleet-probe.<six alphanumerics>` is ever removed; any
+ * other answer is refused and nothing is removed. A path that cannot be
  * removed is reported with the path left behind, so the operator can delete
  * it by hand.
  */
@@ -527,6 +613,10 @@ async function runMktempStep(
   executor: HostProbeExecutor,
 ): Promise<DoctorLine> {
   const root = step.worktreeRoot;
+  const refusal = worktreeRootRefusal(root);
+  if (refusal !== undefined) {
+    return line(step, 'FAIL', `${refusal}; no command was run`);
+  }
   const created = await safely(() =>
     executor.run(step.argv, { timeoutMs: step.timeoutMs }),
   );
@@ -556,15 +646,23 @@ async function runMktempStep(
   if (answer === undefined) {
     return line(step, 'FAIL', `${root}: mktemp printed no path`);
   }
-  if (!isInsideRoot(root, answer)) {
+  if (!isProbePath(root, answer)) {
     return line(
       step,
       'FAIL',
       `${root}: mktemp answered with a path outside the worktree root; nothing was removed`,
     );
   }
+  const rmCommand = rmCommandOf(step, answer);
+  if (rmCommand === undefined) {
+    return line(
+      step,
+      'UNKNOWN',
+      `${root}: the created path could not be checked for removal`,
+    );
+  }
   const removed = await safely(() =>
-    executor.run([...step.transportPrefix, 'rm', '--', answer], {
+    executor.run(rmCommand, {
       timeoutMs: step.timeoutMs,
     }),
   );

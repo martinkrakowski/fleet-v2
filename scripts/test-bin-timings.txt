@@ -9,6 +9,7 @@ tests/agy-round.test.sh 3 3
 tests/agy-run-ephemeral-home.test.sh 1 1
 tests/agy-run.test.sh 17 17
 tests/check-duplication.test.sh 1 1
+tests/check-public-safety.test.sh 2 2
 tests/e2e-ssh-fixture.test.sh 1 1
 tests/fleet-host-bootstrap-chmod.test.sh 1 1
 tests/fleet-host-bootstrap.test.sh 3 3
@@ -19,4 +20,5 @@ tests/lane-diff-check-lint-suppression.test.sh 2 2
 tests/lane-diff-check.test.sh 43 43
 tests/ocm-run.test.sh 187 187
 tests/seams.test.sh 1 1
+tests/shell-interpreter.test.sh 2 2
 tests/test-bin-shard.test.sh 5 5

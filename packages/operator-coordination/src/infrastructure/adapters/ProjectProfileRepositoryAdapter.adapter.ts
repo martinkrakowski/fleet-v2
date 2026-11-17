@@ -20,13 +20,20 @@ import type { ProjectProfileRepositoryPort } from '../../application/ports/out/P
 import { ProjectProfileRevisionConflictError } from '../../application/ports/out/ProjectProfileRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
-import { withFileLock, writeJsonAtomically } from './file-store.js';
+import { assertStoreWritable, withFileLock, writeJsonAtomically } from './file-store.js';
 import { readRecordList } from './record-list-store.js';
 
 export interface ProjectProfileRepositoryAdapterOptions {
   /** When set, profiles are persisted here and reloaded on first use. */
   readonly stateDir?: string;
   readonly fileName?: string;
+  /**
+   * CO29a-ro2: read-only mode. The reader never quarantines — an unreadable
+   * store file throws the typed `StateFileUnreadableReadOnlyError` and keeps
+   * the exact bytes untouched — and every write is refused. The default
+   * (writable) reader still quarantines corrupt bytes.
+   */
+  readonly readOnly?: boolean;
   /** Emitter for post-save change signals; defaults to a no-op adapter. */
   readonly changeSignal?: ChangeSignalPort;
 }
@@ -66,6 +73,7 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
   }
 
   async saveProfile(record: ProjectProfileRecord): Promise<void> {
+    assertStoreWritable(this.options?.readOnly === true, 'ProjectProfileRepositoryAdapter');
     const target = this.statePath;
     if (target === null) {
       const validated = ProjectProfile.fromRecord(record).toRecord();
@@ -179,6 +187,7 @@ export class ProjectProfileRepositoryAdapter implements ProjectProfileRepository
       path,
       'ProjectProfileRepositoryAdapter',
       parseProjectProfileStateRecord,
+      this.options?.readOnly === true,
     );
     const map = new Map<string, ProjectProfileRecord>();
     for (const profile of records) {

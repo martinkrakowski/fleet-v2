@@ -581,3 +581,173 @@ describe('JevMergeVetoAdapter', () => {
     expect(captured).toEqual([]);
   });
 });
+
+describe('JevMergeVetoAdapter unknown state fields (OG16c2)', () => {
+  const UNKNOWN_FIVE = {
+    hardToUndo: null,
+    fixRounds: null,
+    reviewerFamilies: null,
+    replyResolvedThreads: null,
+    majorBlockerFindings: null,
+  };
+  const FIVE_NAMES = ['hardToUndo', 'fixRounds', 'reviewerFamilies', 'replyResolvedThreads', 'majorBlockerFindings'];
+  const KNOWN_SENT = {
+    tier: '2',
+    title: 'Fix date parsing',
+    changedPaths: ['src/utils/date.ts'],
+    additions: '12',
+    deletions: '4',
+    hardToUndo: 'None',
+    fixRounds: '1',
+    reviewerFamilies: ['grok', 'luna'],
+    replyResolvedThreads: '1',
+    majorBlockerFindings: '0',
+    headChangedAfterReview: 'false',
+  };
+  type Captured = Array<{ url: unknown; init?: RequestInit }>;
+
+  function sentState(captured: Captured): Record<string, unknown> {
+    const body = JSON.parse(captured[0].init?.body as string) as { state: string };
+    return JSON.parse(body.state) as Record<string, unknown>;
+  }
+  function withState(state: Record<string, unknown>): MergeVetoRequest {
+    return { ...REQUEST, state: { ...REQUEST.state, ...state } as never };
+  }
+
+  it('sends a fully known state exactly as before, with no unknownFields key', async () => {
+    const captured: Captured = [];
+    const { adapter } = makeAdapter({ capturedRequests: captured });
+    const result = await adapter.adviseMergeVeto(REQUEST);
+    expect(result).toMatchObject({ status: 'answered', choice: 'merge-safe' });
+    expect(sentState(captured)).toEqual(KNOWN_SENT);
+    expect(Object.keys(sentState(captured))).toEqual(Object.keys(KNOWN_SENT));
+  });
+
+  it('sends each unread field as the word unknown and names it in unknownFields', async () => {
+    const captured: Captured = [];
+    const { adapter } = makeAdapter({ capturedRequests: captured });
+    await adapter.adviseMergeVeto(withState(UNKNOWN_FIVE));
+    const sent = sentState(captured);
+    expect(sent).toEqual({
+      ...KNOWN_SENT,
+      hardToUndo: 'unknown',
+      fixRounds: 'unknown',
+      reviewerFamilies: 'unknown',
+      replyResolvedThreads: 'unknown',
+      majorBlockerFindings: 'unknown',
+      unknownFields: FIVE_NAMES,
+    });
+    expect(Object.keys(sent)).toEqual([...Object.keys(KNOWN_SENT), 'unknownFields']);
+    for (const name of ['fixRounds', 'replyResolvedThreads', 'majorBlockerFindings']) {
+      expect(sent[name]).not.toBe('0');
+    }
+  });
+
+  it('never answers merge-safe for a state with unknown fields', async () => {
+    for (const mode of ['shadow', 'live'] as const) {
+      const { adapter, journal, events } = makeAdapter();
+      const result = await adapter.adviseMergeVeto({ ...withState(UNKNOWN_FIVE), mode });
+      expect(result).toEqual({ status: 'unknown', reason: 'incomplete-state' });
+      expect(events).toEqual(['reserve', 'fetch', 'settle']);
+      const receipt = journal.settles[0].receipt;
+      expect(receipt.unknownReason).toBe('incomplete-state');
+      expect(receipt.estimated).toBe(false);
+      expect(receipt.costUsd).toBeCloseTo(0.000026376, 12);
+      expect(receipt.requestId).toBe('gen-fixture-merge-veto');
+    }
+  });
+
+  it.each(FIVE_NAMES.map((name) => [name]))('one unknown field is enough to refuse merge-safe (%s)', async (name) => {
+    const captured: Captured = [];
+    const { adapter } = makeAdapter({ capturedRequests: captured });
+    const result = await adapter.adviseMergeVeto(withState({ [name]: null }));
+    expect(result).toEqual({ status: 'unknown', reason: 'incomplete-state' });
+    expect(sentState(captured).unknownFields).toEqual([name]);
+  });
+
+  it('still reports hold-for-human for a state with unknown fields', async () => {
+    const events: string[] = [];
+    const { adapter } = makeAdapter({ fetch: fetchAnswering([HOLD_FOR_HUMAN_CHOICE_PAYLOAD], events) });
+    expect(await adapter.adviseMergeVeto(withState(UNKNOWN_FIVE))).toEqual({
+      status: 'answered',
+      choice: 'hold-for-human',
+      confidence: 0.95,
+      decisionReceiptId: 'gen-fixture-merge-veto-hold',
+      mode: 'shadow',
+    });
+  });
+
+  it.each([
+    ['fixRounds', undefined],
+    ['fixRounds', -1],
+    ['fixRounds', 1.5],
+    ['fixRounds', Number.NaN],
+    ['fixRounds', '0'],
+    ['replyResolvedThreads', Number.POSITIVE_INFINITY],
+    ['majorBlockerFindings', {}],
+    ['hardToUndo', ''],
+    ['hardToUndo', 7],
+    ['reviewerFamilies', 'grok'],
+    ['reviewerFamilies', [1]],
+    ['reviewerFamilies', {}],
+  ] as ReadonlyArray<readonly [string, unknown]>)('treats a malformed field value as unknown, never as a number (%s)', async (name, value) => {
+    const captured: Captured = [];
+    const { adapter } = makeAdapter({ capturedRequests: captured });
+    const result = await adapter.adviseMergeVeto(withState({ [name]: value }));
+    expect(sentState(captured)[name]).toBe('unknown');
+    expect(sentState(captured).unknownFields).toEqual([name]);
+    expect(result).toEqual({ status: 'unknown', reason: 'incomplete-state' });
+  });
+
+  it('keeps a known zero and a known empty list as known', async () => {
+    const captured: Captured = [];
+    const { adapter } = makeAdapter({ capturedRequests: captured });
+    const result = await adapter.adviseMergeVeto(
+      withState({ fixRounds: 0, replyResolvedThreads: 0, majorBlockerFindings: 0, reviewerFamilies: [] }),
+    );
+    const sent = sentState(captured);
+    expect(sent.fixRounds).toBe('0');
+    expect(sent.reviewerFamilies).toEqual([]);
+    expect(sent).not.toHaveProperty('unknownFields');
+    expect(result).toMatchObject({ status: 'answered', choice: 'merge-safe' });
+  });
+
+  it('a Hard to undo text that is the word unknown is a known text', async () => {
+    const captured: Captured = [];
+    const { adapter } = makeAdapter({ capturedRequests: captured });
+    const result = await adapter.adviseMergeVeto(withState({ hardToUndo: 'unknown' }));
+    expect(sentState(captured)).not.toHaveProperty('unknownFields');
+    expect(result).toMatchObject({ status: 'answered', choice: 'merge-safe' });
+  });
+
+  it('a state field getter that throws answers unknown before any key read, reservation or fetch', async () => {
+    const keyReads: string[] = [];
+    const state = Object.defineProperty({ ...REQUEST.state }, 'fixRounds', {
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const { adapter, journal, events } = makeAdapter({
+      readKey: async () => {
+        keyReads.push('readKey');
+        return KEY_TEXT;
+      },
+    });
+    expect(await adapter.adviseMergeVeto({ ...REQUEST, state })).toEqual({ status: 'unknown', reason: 'transport' });
+    expect(events).toEqual([]);
+    expect(journal.reserves).toHaveLength(0);
+    expect(keyReads).toEqual([]);
+  });
+
+  it('a secret-shaped known field still refuses the whole state', async () => {
+    const { adapter, events } = makeAdapter();
+    // Built at run time so no credential-shaped literal is added to the file.
+    const secretShaped = ['sk', 'abcdefghijklmnopqrstuvwx'].join('-');
+    const result = await adapter.adviseMergeVeto(
+      withState({ reviewerFamilies: [`rotate the token ${secretShaped} today`] }),
+    );
+    expect(result).toEqual({ status: 'unknown', reason: 'redaction-refused' });
+    expect(events).toEqual([]);
+  });
+});

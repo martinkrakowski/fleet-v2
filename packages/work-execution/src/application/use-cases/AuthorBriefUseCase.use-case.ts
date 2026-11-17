@@ -16,7 +16,7 @@ import type {
 } from '../ports/in/AuthorBriefPort.in-port.js';
 import type { BuildFactPackFact, BuildFactPackPort } from '../ports/in/BuildFactPackPort.in-port.js';
 import type { PrepareBriefPackagePort, PrepareBriefPackageRequest } from '../ports/in/PrepareBriefPackagePort.in-port.js';
-import type { BriefAuthoringPort, BriefAuthorSessionResult } from '../ports/out/BriefAuthoringPort.out-port.js';
+import type { BriefAuthoringPort, BriefAuthorSessionRequest, BriefAuthorSessionResult } from '../ports/out/BriefAuthoringPort.out-port.js';
 
 export interface AuthorBriefDependencies {
   readonly factPack: BuildFactPackPort;
@@ -28,6 +28,17 @@ const COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
 const FACT_KINDS: ReadonlySet<string> = new Set(['file-list', 'file-range', 'matching-lines']);
 
 const INVALID_REQUEST: AuthorBriefResult = { outcome: 'refused', reason: 'invalid-request', detail: null };
+
+const RETRY_INSTRUCTION = 'Begin your answer with the ===NOTES=== marker line and put no text before it.';
+
+type SeatAttempt =
+  | { readonly ok: true; readonly parsed: { dispatch: string; notes: string } }
+  | { readonly ok: false; readonly result: AuthorBriefResult; readonly code: string; readonly retryable: boolean };
+
+/** Attach the failed-attempt codes to a result that follows a retry. */
+function withFailedAttempts(result: AuthorBriefResult, failedAttempts: readonly string[]): AuthorBriefResult {
+  return { ...result, failedAttempts };
+}
 
 function refuse(reason: AuthorBriefRefusalReason, detail: string | null): AuthorBriefResult {
   return { outcome: 'refused', reason, detail };
@@ -125,6 +136,48 @@ export class AuthorBriefUseCase implements AuthorBriefPort {
     return this.run(snapshot);
   }
 
+  /** One seat session and its typed mapping; every failure carries its code and whether it alone permits a retry. */
+  private async askSeat(
+    seat: (r: BriefAuthorSessionRequest) => Promise<BriefAuthorSessionResult>,
+    request: Snapshot,
+    sessionKey: string,
+    prompt: string,
+    retry: boolean,
+  ): Promise<SeatAttempt> {
+    const { workOrderId, laneId, commit } = request;
+    let session: BriefAuthorSessionResult;
+    try {
+      session = await seat({
+        sessionKey, workOrderId, laneId, baseCommit: commit,
+        checkoutPath: request.checkoutPath, briefsDir: request.briefsDir,
+        prompt, model: request.model,
+        ...(request.variant !== undefined ? { variant: request.variant } : {}),
+        ...(request.agent !== undefined ? { agent: request.agent } : {}),
+        ...(retry ? { retry: true as const } : {}),
+      });
+    } catch {
+      return { ok: false, result: { outcome: 'unknown', reason: 'seat-call-failed' }, code: 'seat-call-failed', retryable: false };
+    }
+    if (session.outcome !== 'answered') {
+      return { ok: false, result: refuse('seat-unavailable', session.reason), code: session.reason, retryable: false };
+    }
+    if (typeof session.answer !== 'string' || session.answer.trim().length === 0) {
+      return { ok: false, result: refuse('seat-unavailable', 'session-empty'), code: 'session-empty', retryable: false };
+    }
+    const parsed = parseBriefAnswer(session.answer);
+    if (!parsed.ok) {
+      return parsed.reason === 'secret-shaped'
+        ? { ok: false, result: refuse('secret-shaped', null), code: 'secret-shaped', retryable: false }
+        : {
+            ok: false,
+            result: refuse('parse-violation', parsed.reason),
+            code: parsed.reason,
+            retryable: parsed.reason === 'text-before-notes-marker',
+          };
+    }
+    return { ok: true, parsed: { dispatch: parsed.dispatch, notes: parsed.notes } };
+  }
+
   private async run(request: Snapshot): Promise<AuthorBriefResult> {
     const { workOrderId, laneId, commit } = request;
 
@@ -145,34 +198,27 @@ export class AuthorBriefUseCase implements AuthorBriefPort {
     if (authoring.authorBriefSession === undefined) {
       return refuse('seat-unavailable', 'session-not-supported');
     }
-    let session: BriefAuthorSessionResult;
-    try {
-      session = await authoring.authorBriefSession({
-        sessionKey, workOrderId, laneId, baseCommit: commit,
-        checkoutPath: request.checkoutPath, briefsDir: request.briefsDir,
-        prompt: pack.prompt, model: request.model,
-        ...(request.variant !== undefined ? { variant: request.variant } : {}),
-        ...(request.agent !== undefined ? { agent: request.agent } : {}),
-      });
-    } catch {
-      return { outcome: 'unknown', reason: 'seat-call-failed' };
+    const seat = authoring.authorBriefSession.bind(authoring);
+    let attempt = await this.askSeat(seat, request, sessionKey, pack.prompt, false);
+    let failedAttempts: readonly string[] = [];
+    let answeredKey = sessionKey;
+    if (!attempt.ok && attempt.retryable) {
+      const first = attempt.code;
+      const second = await this.askSeat(seat, request, `${sessionKey}/retry`, `${pack.prompt}\n${RETRY_INSTRUCTION}`, true);
+      failedAttempts = second.ok ? [first] : [first, second.code];
+      answeredKey = `${sessionKey}/retry`;
+      attempt = second;
     }
-    if (session.outcome !== 'answered') {
-      return refuse('seat-unavailable', session.reason);
+    if (!attempt.ok) {
+      return failedAttempts.length > 0 ? withFailedAttempts(attempt.result, failedAttempts) : attempt.result;
     }
-    if (typeof session.answer !== 'string' || session.answer.trim().length === 0) {
-      return refuse('seat-unavailable', 'session-empty');
-    }
+    const parsed = attempt.parsed;
+    const tag = (result: AuthorBriefResult): AuthorBriefResult =>
+      failedAttempts.length > 0 ? withFailedAttempts(result, failedAttempts) : result;
 
-    const parsed = parseBriefAnswer(session.answer);
-    if (!parsed.ok) {
-      return parsed.reason === 'secret-shaped'
-        ? refuse('secret-shaped', null)
-        : refuse('parse-violation', parsed.reason);
-    }
     const lint = lintBrief(parsed.dispatch);
     if (!lint.ok) {
-      return refuse('lint-violation', lint.findings[0]?.rule ?? null);
+      return tag(refuse('lint-violation', lint.findings[0]?.rule ?? null));
     }
 
     // Only the dispatch text is frozen: the notes never leave `parsed`.
@@ -180,16 +226,16 @@ export class AuthorBriefUseCase implements AuthorBriefPort {
     try {
       frozen = await this.prepareBriefPackage.prepareBriefPackage({ ...request.prepare, proseMarkdown: parsed.dispatch });
     } catch {
-      return { outcome: 'unknown', reason: 'session-outcome-unknown' };
+      return tag({ outcome: 'unknown', reason: 'session-outcome-unknown' });
     }
     if (frozen.outcome !== 'prepared') {
-      return refuse('freeze-rejected', frozen.reasonClass ?? null);
+      return tag(refuse('freeze-rejected', frozen.reasonClass ?? null));
     }
-    return {
+    return tag({
       outcome: 'authored',
       attemptId: frozen.prepared.attemptId,
       briefDigest: frozen.prepared.briefDigest,
-      sessionKey,
-    };
+      sessionKey: answeredKey,
+    });
   }
 }

@@ -14,7 +14,7 @@
  */
 
 import { containsSecretShape } from '@fleet/shared';
-import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { isZonedIsoDateTime, readConductorHaltRecord } from '../../domain/conductor-halt.js';
 import type { ConductorHaltState } from '../../domain/conductor-halt.js';
 import {
   DAEMON_CALL_MIN_REMAINING_MS,
@@ -23,6 +23,7 @@ import {
   DAEMON_REPO_DIGEST_PATTERN,
   DAEMON_TICK_ID_PATTERN,
   chainRefreshJobId,
+  chainSweepJobId,
   computeCallBudget,
   computeTickDeadlineIso,
   decideDaemonJobLease,
@@ -77,6 +78,7 @@ import type {
 } from '../ports/in/RunDaemonTickPort.in-port.js';
 import type { RunMergePassPort, RunMergePassResult } from '../ports/in/RunMergePassPort.in-port.js';
 import type { RefreshChainsPort, RefreshChainsResult } from '../ports/in/RefreshChainsPort.in-port.js';
+import type { SweepChainsPort, SweepChainsResult } from '../ports/in/SweepChainsPort.in-port.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
@@ -113,6 +115,8 @@ export interface RunDaemonTickDependencies {
   readonly chainRefreshMode?: 'shadow' | 'invalid';
   /** Raises the channel-level attention item when `chainRefreshMode` is `invalid`. */
   readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
+  /** The chain-sweep use case; absent registers no chain-sweep job (lane CO11). */
+  readonly chainSweep?: SweepChainsPort;
   /** The tick clock; production real time, tests a fake. Absent means the system clock. */
   readonly now?: () => string;
   /** The tick sleep, awaited for the wake settle delay. Absent means a `setTimeout` promise. */
@@ -133,6 +137,10 @@ export interface DaemonJobRegistryDependencies {
   readonly chainRefreshMode?: 'shadow' | 'invalid';
   /** Raises the policy-level attention item when `chainRefreshMode` is `invalid`. */
   readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
+  /** The chain-sweep use case; absent registers no chain-sweep job (lane CO11). */
+  readonly chainSweep?: SweepChainsPort;
+  /** Confirms an operator halt before a halted chain-refresh refusal is recorded as skipped; absent = never skipped. */
+  readonly halt?: Pick<ConductorHaltPort, 'read'>;
 }
 
 /** One journal key a merge pass reported as journalled, with the queue entry it acts on. */
@@ -404,13 +412,51 @@ function toChainRefreshJobOutcome(result: RefreshChainsResult): DaemonJobOutcome
   }
 }
 
-/** One chain-refresh job instance: wraps the refresh use case for one repository (lane CO8). */
+/** Chain outcomes that count as settled work before a mid-pass halt. */
+const SETTLED_CHAIN_OUTCOMES = new Set(['merged', 'up-to-date', 'conflict', 'branch-gone']);
+
+/**
+ * True only for a halt marker that positively reads as an operator halt:
+ * `state === 'halted'` with a record that parses and has `halted === true`.
+ * An unreadable, clear, off-contract, missing or throwing read is false.
+ */
+async function isOperatorHaltConfirmed(halt: Pick<ConductorHaltPort, 'read'> | null | undefined): Promise<boolean> {
+  try {
+    if (halt === undefined || halt === null) return false;
+    const state: unknown = await halt.read();
+    if (!isRecord(state) || state.state !== 'halted') return false;
+    const read = readConductorHaltRecord(state.record);
+    return read.ok && read.record.halted === true;
+  } catch {
+    return false;
+  }
+}
+
+/** A confirmed-halted chain-refresh result → the skipped outcome, counting chains settled before the halt. */
+function haltedSkipOutcome(result: RefreshChainsResult): DaemonJobOutcome {
+  const chains: unknown = isRecord(result) ? result.chains : undefined;
+  if (!Array.isArray(chains)) {
+    return { outcome: 'refused', reasonCode: 'chain-refresh-malformed' };
+  }
+  const settled = (chains as readonly unknown[]).filter(
+    (entry) => isRecord(entry) && typeof entry.outcome === 'string' && SETTLED_CHAIN_OUTCOMES.has(entry.outcome),
+  ).length;
+  return { outcome: 'skipped', reasonCode: settled > 0 ? `halted-after-${settled}` : 'halted' };
+}
+
+/**
+ * One chain-refresh job instance: wraps the refresh use case for one repository (lane CO8).
+ * A `'refused'` / `'halted'` result becomes `'skipped'` (`'halted'` or `'halted-after-<n>'`)
+ * only when the halt dependency positively confirms an operator halt; any other refusal,
+ * or an unconfirmed halt, stays refused.
+ */
 class ChainRefreshJob implements DaemonJobPort {
   constructor(
     private readonly repository: DaemonRepositoryRef,
     private readonly refresh: RefreshChainsPort,
     readonly jobId: string,
     readonly leaseScope: string,
+    private readonly halt: Pick<ConductorHaltPort, 'read'> | undefined,
   ) {}
 
   async pass(request: DaemonJobPassRequest): Promise<DaemonJobOutcome> {
@@ -420,10 +466,67 @@ class ChainRefreshJob implements DaemonJobPort {
       nowIso: request.nowIso,
       deadlineIso: request.deadlineIso,
     });
-    return toChainRefreshJobOutcome(result);
+    const outcome = toChainRefreshJobOutcome(result);
+    if (outcome.outcome !== 'refused' || outcome.reasonCode !== 'halted') {
+      return outcome;
+    }
+    return (await isOperatorHaltConfirmed(this.halt)) ? haltedSkipOutcome(result) : outcome;
   }
 }
 
+/** CO11's pass result → the DaemonJobOutcome the tick records; a malformed result is refused. */
+function toChainSweepJobOutcome(result: SweepChainsResult): DaemonJobOutcome {
+  if (!isRecord(result)) {
+    return { outcome: 'refused', reasonCode: 'chain-sweep-malformed' };
+  }
+  switch (result.outcome) {
+    case 'completed':
+      return { outcome: 'completed', progressed: false };
+    case 'budget-exhausted':
+      return { outcome: 'budget-exhausted', progressed: false };
+    case 'dry-run':
+      // A composed sweep job always runs in apply mode; a dry-run answer is a
+      // malformed job, never a skip.
+      return { outcome: 'refused', reasonCode: 'chain-sweep-malformed' };
+    case 'incomplete':
+      return {
+        outcome: 'refused',
+        reasonCode: isSafeReasonCode(result.reasonCode) ? result.reasonCode : 'chain-sweep-incomplete',
+      };
+    case 'refused':
+      return {
+        outcome: 'refused',
+        reasonCode: isSafeReasonCode(result.reasonCode) ? result.reasonCode : 'job-failed',
+      };
+    default:
+      return { outcome: 'refused', reasonCode: 'chain-sweep-malformed' };
+  }
+}
+
+/**
+ * One chain-sweep job instance: wraps the sweep use case for one repository in
+ * apply mode (lane CO11). The use case still refuses every delete when the
+ * record, the membership or a branch fails its contract.
+ */
+class ChainSweepJob implements DaemonJobPort {
+  constructor(
+    private readonly repository: DaemonRepositoryRef,
+    private readonly sweep: SweepChainsPort,
+    readonly jobId: string,
+    readonly leaseScope: string,
+  ) {}
+
+  async pass(request: DaemonJobPassRequest): Promise<DaemonJobOutcome> {
+    const result = await this.sweep.runSweepChains({
+      repository: { owner: this.repository.owner, repo: this.repository.repo },
+      projectId: this.repository.projectId,
+      nowIso: request.nowIso,
+      deadlineIso: request.deadlineIso,
+      mode: 'apply',
+    });
+    return toChainSweepJobOutcome(result);
+  }
+}
 /**
  * CO8a: one chain-refresh job instance when `policy.daemon.chainRefresh` is
  * `invalid`. The job never touches the forge: it raises one policy-level
@@ -520,7 +623,23 @@ export class DaemonJobRegistry {
           continue;
         }
         refreshSeen.add(repository.repoDigest);
-        instances.push(new ChainRefreshJob(repository, this.deps.chainRefresh, parsed.jobId, parsed.leaseScope));
+        instances.push(
+          new ChainRefreshJob(repository, this.deps.chainRefresh, parsed.jobId, parsed.leaseScope, this.deps.halt),
+        );
+      }
+    }
+    if (this.deps.chainSweep !== undefined) {
+      const sweepSeen = new Set<string>();
+      for (const repository of repositories) {
+        if (!isUsableRepository(repository) || sweepSeen.has(repository.repoDigest)) {
+          continue;
+        }
+        const parsed = parseDaemonJobId(chainSweepJobId(repository.repoDigest));
+        if (parsed === null || parsed.kind !== 'chain-sweep') {
+          continue;
+        }
+        sweepSeen.add(repository.repoDigest);
+        instances.push(new ChainSweepJob(repository, this.deps.chainSweep, parsed.jobId, parsed.leaseScope));
       }
     }
     return instances;
@@ -720,6 +839,8 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       ...(this.deps.chainRefresh !== undefined ? { chainRefresh: this.deps.chainRefresh } : {}),
       ...(this.deps.chainRefreshMode !== undefined ? { chainRefreshMode: this.deps.chainRefreshMode } : {}),
       ...(this.deps.chainAttention !== undefined ? { chainAttention: this.deps.chainAttention } : {}),
+      ...(this.deps.chainSweep !== undefined ? { chainSweep: this.deps.chainSweep } : {}),
+      halt: this.deps.halt,
     }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
     await this.settle(ctx, plan.settleDelayMs);

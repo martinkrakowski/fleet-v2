@@ -20,6 +20,7 @@ import type {
   ConductorPolicy,
   ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
+  CiRunnerSlotSection,
   ConductorReaperRepairKind,
   ConductorReaperWorktreePolicy,
   ConsumerSettings,
@@ -41,6 +42,7 @@ import type {
   MergeDaemonSection,
   MergePolicySection,
   MergeRepositoryPolicy,
+  MergeVetoConsumerSettings,
   MergeVetoPolicy,
   NoDecisionsSection,
   NoForgeSection,
@@ -155,7 +157,14 @@ export const HOST_KEYS: readonly string[] = freezeKeys<HostSection>()([
   'container',
   'roleAliases',
   'roles',
+  'ciRunnerSlots',
   'runner',
+]);
+
+/** One `hosts.<name>.ciRunnerSlots` entry's keys in the writer's order (OG-28a). */
+export const CI_RUNNER_SLOT_KEYS: readonly string[] = freezeKeys<CiRunnerSlotSection>()([
+  'name',
+  'unit',
 ]);
 
 /** The host roles in canonical order. */
@@ -283,6 +292,7 @@ export const ANSWER_FILE_DECISIONS_KEYS: readonly string[] =
 export const DECISION_CONSUMERS_KEYS = freezeKeys<DecisionConsumers>()([
   'knowledge-ranking',
   'claim-triage',
+  'merge-veto',
 ]);
 
 export const KNOWLEDGE_RANKING_CONSUMER_KEYS: readonly string[] =
@@ -293,6 +303,12 @@ export const CLAIM_TRIAGE_CONSUMER_KEYS: readonly string[] =
     'minConfidence',
     'monthlyBudgetUsd',
     'acknowledgeCandidateClaimsLeaveHost',
+  ]);
+
+export const MERGE_VETO_CONSUMER_KEYS: readonly string[] =
+  freezeKeys<MergeVetoConsumerSettings>()([
+    'monthlyBudgetUsd',
+    'acknowledgePullRequestTitleAndPathsLeaveHost',
   ]);
 
 export const DAEMON_KEYS: readonly string[] = freezeKeys<DaemonSection>()([
@@ -337,6 +353,7 @@ export const AUTO_MERGE_KEYS: readonly string[] = freezeKeys<AutoMergePolicy>()(
 export const CONDUCTOR_KEYS: readonly string[] = freezeKeys<ConductorPolicy>()([
   'enabled',
   'stopGraceMinutes',
+  'premergeMode',
   'reaper',
 ]);
 
@@ -408,6 +425,7 @@ export const MERGE_REPO_KEYS: readonly string[] = freezeKeys<MergeRepositoryPoli
   'maxAttempts',
   'checksGraceMinutes',
   'veto',
+  'prepare',
 ]);
 
 export const MERGE_VETO_KEYS: readonly string[] = freezeKeys<MergeVetoPolicy>()([

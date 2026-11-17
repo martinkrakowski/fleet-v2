@@ -33,11 +33,16 @@
 import { randomBytes, createHash } from 'node:crypto';
 
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
-import type { ReviewFindingRecord, ReviewUnknownReason } from '../../domain/evidence-records.js';
+import type { ReviewFindingRecord, ReviewKind, ReviewUnknownReason } from '../../domain/evidence-records.js';
 import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
 import type { RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
-import { DEFAULT_REVIEW_TIMEOUT_MS, MAX_RAW_OUTPUT_LENGTH, ReviewTransportError } from './OcmReviewTransport.adapter.js';
+import {
+  DEFAULT_REVIEW_TIMEOUT_MS,
+  MAX_RAW_OUTPUT_LENGTH,
+  REVIEW_KNOWN_FALSE_POSITIVES,
+  ReviewTransportError,
+} from './OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from './ReviewTransportRouter.js';
 
 /**
@@ -171,6 +176,9 @@ const SYSTEM_PROMPT = [
   'When you cannot tell, answer with result "unknown" rather than guessing.',
   UNTRUSTED_INPUT_RULE,
 ].join('\n');
+
+/** The system text of a conductor review (a request with `kind`): the manual one plus the known false positives (RVP1). */
+const KIND_SYSTEM_PROMPT = SYSTEM_PROMPT + '\n' + REVIEW_KNOWN_FALSE_POSITIVES;
 
 /**
  * One own DATA property. An absent, inherited or accessor-backed field, or a
@@ -534,6 +542,51 @@ function classifyProviderFailure(error: unknown): { readonly reason: string; rea
   return { reason: 'the reviewer endpoint could not be reached', code: 'transport' };
 }
 
+/** The fixed reason a kind with no plan is refused; it never carries the kind value. */
+export const API_UNSUPPORTED_REVIEW_KIND_REASON = 'unsupported review kind';
+
+/** The fixed reason this transport refuses a kind that needs the repository rather than a diff. */
+export const API_NO_REPOSITORY_REASON =
+  'this review kind needs a reviewer that can read the repository; a single-turn api reviewer cannot';
+
+/** What one review kind needs from this transport: whether it reviews the base..head diff, and its fixed prompt line. */
+export interface ApiKindPlan {
+  readonly diff: boolean;
+  readonly kindLine: string;
+}
+
+// `Record<ReviewKind, ...>`: adding a kind to REVIEW_KINDS fails the build here until it gets its own plan.
+const API_KIND_PLANS: Readonly<Record<ReviewKind, ApiKindPlan>> = {
+  'brief-check': { diff: true, kindLine: 'Review kind: brief-check' },
+  'brief-verify': { diff: false, kindLine: 'Review kind: brief-verify' },
+  'code-review': { diff: true, kindLine: 'Review kind: code-review' },
+  'pre-merge': { diff: true, kindLine: 'Review kind: pre-merge' },
+};
+
+/** The plan of a kind, or `null` for anything that is not one of the four kinds (own keys only). */
+export function apiKindPlanOf(kind: unknown): ApiKindPlan | null {
+  if (typeof kind !== 'string' || !Object.hasOwn(API_KIND_PLANS, kind)) {
+    return null;
+  }
+  return API_KIND_PLANS[kind as ReviewKind];
+}
+
+/**
+ * The plan of a kind this transport serves, or the typed refusal. An unknown
+ * kind never gets a prompt, and a kind without a diff (brief-verify) is
+ * refused: this reviewer sees only an embedded diff, never the repository.
+ */
+export function requireApiKindPlan(kind: unknown): ApiKindPlan {
+  const plan = apiKindPlanOf(kind);
+  if (plan === null) {
+    throw new ReviewTransportError(API_UNSUPPORTED_REVIEW_KIND_REASON, 'transport-failed');
+  }
+  if (!plan.diff) {
+    throw new ReviewTransportError(API_NO_REPOSITORY_REASON, 'transport-failed');
+  }
+  return plan;
+}
+
 /**
  * Diff first, instructions last.
  *
@@ -544,7 +597,12 @@ function classifyProviderFailure(error: unknown): { readonly reason: string; rea
  * caller-supplied nonce. The brief rule stays immediately above the brief block
  * because it says "below".
  */
-function buildPrompt(request: RunIndependentReviewRequest, diff: string, nonce: string): string {
+function buildPrompt(
+  request: RunIndependentReviewRequest,
+  diff: string,
+  nonce: string,
+  kindPlan: ApiKindPlan | undefined,
+): string {
   const sections: string[] = [wrapUntrusted({ label: 'diff', text: diff, nonce })];
   if (request.briefText !== undefined && request.briefText.trim() !== '') {
     sections.push(BRIEF_INPUT_RULE, wrapUntrusted({ label: 'brief', text: request.briefText, nonce }));
@@ -553,8 +611,8 @@ function buildPrompt(request: RunIndependentReviewRequest, diff: string, nonce: 
     `Implementer model: ${request.implementerModel}`,
     `Head under review: ${request.candidateHeadSha}`,
   );
-  if (request.kind !== undefined) {
-    sections.push(`Review kind: ${request.kind}`);
+  if (kindPlan !== undefined) {
+    sections.push(kindPlan.kindLine);
   }
   if (request.diffSummary !== undefined && request.diffSummary.trim() !== '') {
     sections.push(`Scope: ${request.diffSummary.trim()}`);
@@ -591,6 +649,12 @@ export function createApiReviewTransport(
     if (options.generate === undefined) {
       throw new ReviewTransportError('The api review transport has no provider call bound', 'transport-missing');
     }
+
+    // A kind with no plan, or one this transport cannot serve (brief-verify
+    // needs the repository), is refused before the head, the diff or the
+    // provider call. The kind is read ONCE here; a manual review (no kind) has no plan.
+    const kind: unknown = request.kind;
+    const kindPlan = kind === undefined ? undefined : requireApiKindPlan(kind);
 
     const head = await options.location.readHead();
     if (head === null) {
@@ -640,8 +704,8 @@ export function createApiReviewTransport(
     let answer: ApiReviewGenerateResult;
     try {
       answer = await options.generate({
-        system: SYSTEM_PROMPT,
-        prompt: buildPrompt(request, diff, nonce),
+        system: kindPlan === undefined ? SYSTEM_PROMPT : KIND_SYSTEM_PROMPT,
+        prompt: buildPrompt(request, diff, nonce, kindPlan),
         abortSignal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {

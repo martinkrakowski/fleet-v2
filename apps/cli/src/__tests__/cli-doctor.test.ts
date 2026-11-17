@@ -73,11 +73,20 @@ function passingProbes(calls?: string[]): DoctorProbes {
       resolved: '/usr/bin/gh',
       candidates: GH_BINARY_CANDIDATES,
     }),
+    ghAuth: async () => ({
+      tokenPresent: true,
+      authCheck: { outcome: 'pass', reason: 'gh auth status succeeded' },
+    }),
     seatProbe: async () => {
       calls?.push('seatProbe');
       return { outcome: 'pass', reason: 'answered' };
     },
     serverProbe: async () => ({ outcome: 'pass', reason: 'the opencode server answered' }),
+    pinnedBuild: async () => ({
+      pinnedCommit: 'c'.repeat(40),
+      baseTipCommit: 'c'.repeat(40),
+      behindCount: 0,
+    }),
   };
 }
 
@@ -295,7 +304,7 @@ function hostProbeExecutor(listening: (port: number) => boolean): {
     executor: {
       async run(argv) {
         calls.push([...argv]);
-        const template = argv.find((token) => token.includes('.fleet-probe.XXXXXX'));
+        const template = argv.join(' ').match(/[^\s']*\.fleet-probe\.XXXXXX/)?.[0];
         if (template !== undefined) {
           return { exitCode: 0, signal: null, stdout: template.replace('XXXXXX', 'probe1'), stderr: '' };
         }

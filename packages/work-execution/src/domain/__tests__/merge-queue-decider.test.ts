@@ -6,7 +6,7 @@ import {
   decideMergeStep,
 } from '../merge-queue-decider.js';
 import type { MergeRepoPolicy, MergeStepDecision, MergeStepFacts } from '../merge-queue-decider.js';
-import { MERGE_QUEUE_ENTRY_VERSION } from '../merge-queue-records.js';
+import { MERGE_QUEUE_ENTRY_VERSION, MERGE_QUEUE_ENTRY_V2_VERSION } from '../merge-queue-records.js';
 import type { MergeQueueEntryRecord } from '../merge-queue-records.js';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -52,6 +52,16 @@ function makeEntry(overrides: Partial<MergeQueueEntryRecord> = {}): MergeQueueEn
     revision: 1,
     ...overrides,
   };
+}
+
+/** A secret-shaped fake assembled from inert pieces (never a literal in this file). */
+function fakeSecret(): string {
+  return `sk-${'a'.repeat(20)}`;
+}
+
+/** A v2 entry queued against a chain base. */
+function makeChainEntry(overrides: Partial<MergeQueueEntryRecord> = {}): MergeQueueEntryRecord {
+  return makeEntry({ version: MERGE_QUEUE_ENTRY_V2_VERSION, baseBranch: 'chain/example', ...overrides });
 }
 
 function makePolicy(overrides: Record<string, unknown> = {}): MergeRepoPolicy {
@@ -214,6 +224,133 @@ describe('update row (row 9)', () => {
   });
 });
 
+describe('observed base gate (between rows 8 and 9)', () => {
+  function behind(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return { pr: { status: 'open', headOid: HEAD, mergeStateStatus: 'BEHIND' }, ...overrides };
+  }
+
+  function observed(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return { observedBaseBranch: 'chain/example', ...overrides };
+  }
+
+  it('updates a v1 entry with no observed base when the pull request is BEHIND', () => {
+    const decision = decideMergeStep(makeEntry(), makeOpenFacts(behind()), makePolicy(), NOW);
+    expect(decision).toEqual({
+      kind: 'act', action: 'update-branch', execution: 'live', shadowReason: null,
+      expectedHeadOid: HEAD, receiptHeadOid: null, procedure: null, vetoShadow: null,
+    });
+  });
+
+  it('merges a ready v1 entry with no observed base when the pull request is CLEAN', () => {
+    const decision = decideMergeStep(makeReadyEntry(), makeOpenFacts(), makePolicy(), NOW);
+    expect(decision).toEqual({
+      kind: 'act', action: 'merge-pr', execution: 'live', shadowReason: null,
+      expectedHeadOid: HEAD, receiptHeadOid: null, procedure: null, vetoShadow: null,
+    });
+  });
+
+  it('waits base-unobserved for a chain entry when facts omit observedBaseBranch', () => {
+    const entry = makeChainEntry({ state: 'ready', verifiedHeadOid: HEAD, verifiedBy: 'contexts', policyRevision: 'rev-1' });
+    const decision = decideMergeStep(entry, makeOpenFacts(), makePolicy(), NOW);
+    expectWait(decision, 'base-unobserved');
+  });
+
+  it('parks checks on a failed gate for a chain entry observed on its own base', () => {
+    const decision = decideMergeStep(
+      makeChainEntry(),
+      makeOpenFacts(observed({
+        contexts: { gate: { state: 'failure' }, premerge: { state: 'success', creatorLogin: POSTER } },
+        headObservedAtIso: minutesBeforeNow(5),
+      })),
+      makePolicy(),
+      NOW,
+    );
+    expect(decision).toEqual({
+      kind: 'park', reason: 'checks', detail: 'gate', backoff: true,
+      notBeforeIso: computeMergeBackoffIso(NOW, 0), nextAttempt: 1,
+    });
+  });
+
+  it('parks checks on a premerge by the wrong creator for a chain entry observed on its own base', () => {
+    const decision = decideMergeStep(
+      makeChainEntry(),
+      makeOpenFacts(observed({
+        contexts: { gate: { state: 'success' }, premerge: { state: 'success', creatorLogin: 'someone-else' } },
+        headObservedAtIso: minutesBeforeNow(5),
+      })),
+      makePolicy(),
+      NOW,
+    );
+    expect(decision).toEqual({
+      kind: 'park', reason: 'checks', detail: 'premerge', backoff: true,
+      notBeforeIso: computeMergeBackoffIso(NOW, 0), nextAttempt: 1,
+    });
+  });
+
+  it('parks threads for a chain entry observed on its own base', () => {
+    const decision = decideMergeStep(
+      makeChainEntry(),
+      makeOpenFacts(observed({ unresolvedThreads: { status: 'known', count: 2 } })),
+      makePolicy(),
+      NOW,
+    );
+    expectPark(decision, 'threads');
+    if (decision.kind === 'park') {
+      expect(decision.backoff).toBe(false);
+    }
+  });
+
+  it('updates a chain entry that is BEHIND its own base', () => {
+    const decision = decideMergeStep(makeChainEntry(), makeOpenFacts(behind(observed())), makePolicy(), NOW);
+    if (decision.kind !== 'act') {
+      expect(decision.kind).toBe('act');
+    } else {
+      expect(decision.action).toBe('update-branch');
+    }
+  });
+
+  it('merges a ready chain entry that is CLEAN against its own base', () => {
+    const entry = makeChainEntry({ state: 'ready', verifiedHeadOid: HEAD, verifiedBy: 'contexts', policyRevision: 'rev-1' });
+    const decision = decideMergeStep(entry, makeOpenFacts(observed()), makePolicy(), NOW);
+    if (decision.kind !== 'act') {
+      expect(decision.kind).toBe('act');
+    } else {
+      expect(decision.action).toBe('merge-pr');
+    }
+  });
+
+  it('waits base-mismatch and does not update when the observed base is main', () => {
+    const decision = decideMergeStep(makeChainEntry(), makeOpenFacts(behind({ observedBaseBranch: 'main' })), makePolicy(), NOW);
+    expectWait(decision, 'base-mismatch');
+  });
+
+  it('waits base-mismatch and does not merge a CLEAN v1 entry observed on chain/example', () => {
+    const entry = makeReadyEntry();
+    const decision = decideMergeStep(entry, makeOpenFacts(observed()), makePolicy(), NOW);
+    expectWait(decision, 'base-mismatch');
+  });
+
+  it('waits facts-inconsistent for a secret-shaped observed base and does not echo it', () => {
+    const secret = fakeSecret();
+    const decision = decideMergeStep(makeChainEntry(), makeOpenFacts(observed({ observedBaseBranch: secret })), makePolicy(), NOW);
+    expectWait(decision, 'facts-inconsistent');
+    const wrongCase = decideMergeStep(makeChainEntry(), makeOpenFacts(observed({ observedBaseBranch: 'Main' })), makePolicy(), NOW);
+    expectWait(wrongCase, 'facts-inconsistent');
+  });
+
+  it('waits facts-inconsistent for an accessor observed base', () => {
+    const facts = makeOpenFacts();
+    Object.defineProperty(facts, 'observedBaseBranch', { get() { return 'chain/example'; }, enumerable: true, configurable: true });
+    const decision = decideMergeStep(makeChainEntry(), facts, makePolicy(), NOW);
+    expectWait(decision, 'facts-inconsistent');
+  });
+
+  it('waits facts-inconsistent for a null entry', () => {
+    const decision = decideMergeStep(null, makeOpenFacts(), makePolicy(), NOW);
+    expectWait(decision, 'facts-inconsistent');
+  });
+});
+
 describe('checks pending (row 10)', () => {
   it('waits checks-pending on a pending gate', () => {
     const decision = decideMergeStep(makeEntry(), makeOpenFacts({ contexts: { gate: { state: 'pending' }, premerge: { state: 'success', creatorLogin: POSTER } } }), makePolicy(), NOW);
@@ -308,6 +445,53 @@ describe('premerge carry (row 13)', () => {
   it('waits premerge-carry-unknown', () => {
     const decision = decideMergeStep(updateEntry(), makeOpenFacts(carryFacts({ premergeCarry: { status: 'unknown' } })), makePolicy(), NOW);
     expectWait(decision, 'premerge-carry-unknown');
+  });
+
+  it('G2 (4): waits premerge-carry-unknown on a Tier 2 update entry with premerge missing and unknown carry', () => {
+    const decision = decideMergeStep(
+      updateEntry(),
+      makeOpenFacts({
+        contexts: { gate: { state: 'success' }, premerge: { state: 'missing' } },
+        premergeCarry: { status: 'unknown' },
+      }),
+      makePolicy(),
+      NOW,
+    );
+    expectWait(decision, 'premerge-carry-unknown');
+    expect(decision.kind).not.toBe('act');
+  });
+
+  it('G2 (5): parks premerge without backoff on a Tier 2 update entry with premerge missing and ineligible carry', () => {
+    const decision = decideMergeStep(
+      updateEntry(),
+      makeOpenFacts({
+        contexts: { gate: { state: 'success' }, premerge: { state: 'missing' } },
+        premergeCarry: { status: 'ineligible' },
+      }),
+      makePolicy(),
+      NOW,
+    );
+    expectPark(decision, 'premerge');
+    expect(decision.kind).not.toBe('act');
+    if (decision.kind === 'park') {
+      expect(decision.backoff).toBe(false);
+    }
+  });
+
+  it('G2 (6): waits checks-pending on premerge pending at a new head even when the carried receipt names the old head', () => {
+    const decision = decideMergeStep(
+      updateEntry({ headOid: HEAD_2, premergeReceiptHeadOid: HEAD }),
+      makeOpenFacts({
+        pr: { status: 'open', headOid: HEAD_2, mergeStateStatus: 'CLEAN' },
+        reReadHeadOid: HEAD_2,
+        contexts: { gate: { state: 'success' }, premerge: { state: 'pending' } },
+        premergeCarry: { status: 'eligible', receiptHeadOid: HEAD },
+      }),
+      makePolicy(),
+      NOW,
+    );
+    expectWait(decision, 'checks-pending');
+    expect(decision.kind).not.toBe('act');
   });
 });
 

@@ -6,7 +6,8 @@
  * wins, and agreement between reviewers never strengthens a result.
  */
 
-import type { ReviewKind, ReviewFindingRecord, ReviewReceiptRecord, ReviewUnknownReason } from './evidence-records.js';
+import type { ReceiptSubject, ReviewKind, ReviewFindingRecord, ReviewReceiptRecord, ReviewUnknownReason } from './evidence-records.js';
+import { attemptIdForBrief, attemptIdForChain, receiptSubjectOf } from './evidence-records.js';
 
 export interface ReviewTally {
   readonly pass: number;
@@ -371,19 +372,70 @@ export function decideReviewReceiptOutcome(
 }
 
 /**
+ * Whether a receipt is about an attempt, read through own data properties only
+ * (no getter runs, never throws — a `Proxy` trap that throws on
+ * `getOwnPropertyDescriptor` reads as `false`). A receipt whose `attemptId`
+ * starts with `chain:`/`brief:`, or whose subject is present and not of the
+ * `attempt` kind, is a chain or brief receipt, never an attempt one. A receipt
+ * without a subject is the legacy attempt shape and counts when its
+ * `attemptId` is not a pseudo chain/brief id.
+ *
+ * Cost bound: the function reads exactly two own property descriptors
+ * (`attemptId`, `subject`) and never walks the record, so it is O(1) whatever
+ * the input's size; `receiptSubjectOf` reads a fixed field set the same way.
+ */
+export function isAttemptReceiptSubject(receipt: unknown): boolean {
+  try {
+    if (typeof receipt !== 'object' || receipt === null || Array.isArray(receipt)) {
+      return false;
+    }
+    const record = receipt as Record<string, unknown>;
+    if (Object.getOwnPropertyDescriptor(record, '__proto__') !== undefined) {
+      return false;
+    }
+    const attemptDescriptor = Object.getOwnPropertyDescriptor(record, 'attemptId');
+    if (attemptDescriptor !== undefined && !('value' in attemptDescriptor)) {
+      return false;
+    }
+    if (typeof attemptDescriptor?.value === 'string') {
+      const attemptId = attemptDescriptor.value;
+      if (attemptId.startsWith('chain:') || attemptId.startsWith('brief:')) {
+        return false;
+      }
+    }
+    const subjectDescriptor = Object.getOwnPropertyDescriptor(record, 'subject');
+    if (subjectDescriptor !== undefined && !('value' in subjectDescriptor)) {
+      return false;
+    }
+    if (subjectDescriptor?.value !== undefined) {
+      return receiptSubjectOf(record)?.kind === 'attempt';
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Whether a receipt satisfies the acceptance review gate as the passing review
  * (§3.4, RV3): only receipts whose kind is absent or `code-review` count, and
- * the receipt's severity-derived outcome must be `pass` — a `pass` receipt
- * with no unresolved blocking finding, a `fail` receipt whose findings are all
- * `minor`/`nit` or resolved out-of-scope, and a fully dispositioned fail
- * alike. A receipt of another kind (e.g. `brief-check`) never satisfies the
- * gate on its own; an `unknown` receipt (including a 0-finding fail) never
- * does.
+ * only receipts that are about an attempt — a `brief-verify` or `chain`
+ * receipt (or any receipt whose subject is not the attempt) never satisfies
+ * the gate, whatever its kind. The receipt's severity-derived outcome must be
+ * `pass` — a `pass` receipt with no unresolved blocking finding, a `fail`
+ * receipt whose findings are all `minor`/`nit` or resolved out-of-scope, and a
+ * fully dispositioned fail alike. A receipt of another kind (e.g.
+ * `brief-check`) never satisfies the gate on its own; an `unknown` receipt
+ * (including a 0-finding fail) never does.
  */
 export function satisfiesReviewPassGate(
   receipt: Pick<ReviewReceiptRecord, 'kind' | 'result'>,
 ): boolean {
-  return reviewKindOf(receipt) === 'code-review' && decideReviewReceiptOutcome(receipt).outcome === 'pass';
+  return (
+    reviewKindOf(receipt) === 'code-review' &&
+    isAttemptReceiptSubject(receipt) &&
+    decideReviewReceiptOutcome(receipt).outcome === 'pass'
+  );
 }
 
 /**
@@ -419,8 +471,10 @@ export function isFullyDispositioned(
  * dispositioned failing `code-review` (KF-33b3, RV3): like `satisfiesReviewPassGate`
  * for a `pass` — which under RV3 already covers a fail whose every finding is
  * resolved out-of-scope — a fully dispositioned failing `code-review` counts.
- * The kind rule is unchanged: a fully dispositioned failing `brief-check` (or
- * any non-`code-review` kind) never satisfies the gate on its own.
+ * The kind and subject rules are unchanged: a fully dispositioned failing
+ * `brief-check` (or any non-`code-review` kind), and a `brief-verify` or
+ * `chain` receipt (or any receipt whose subject is not the attempt) never
+ * satisfy the gate on their own.
  */
 export function satisfiesFullyDispositionedReviewPassGate(
   receipt: Pick<ReviewReceiptRecord, 'kind' | 'result' | 'findings'>,
@@ -429,9 +483,64 @@ export function satisfiesFullyDispositionedReviewPassGate(
 ): boolean {
   return (
     reviewKindOf(receipt) === 'code-review' &&
+    isAttemptReceiptSubject(receipt) &&
     (satisfiesReviewPassGate(receipt) ||
       isFullyDispositioned(receipt, outOfScopeResolvedFindingIds, unresolvedFindingIds))
   );
+}
+
+/**
+ * The attempt id a receipt subject stands for: the attempt's own id, or the
+ * pseudo attempt id of the chain or the brief it names. Null when the subject
+ * lacks the field of its kind.
+ */
+function attemptIdOfSubject(subject: ReceiptSubject): string | null {
+  if (subject.kind === 'attempt') {
+    return subject.attemptId;
+  }
+  if (subject.kind === 'chain') {
+    return subject.chainName === null ? null : attemptIdForChain(subject.projectId, subject.chainName);
+  }
+  return subject.briefPackageDigest === null
+    ? null
+    : attemptIdForBrief(subject.projectId, subject.briefPackageDigest);
+}
+
+/**
+ * Whether a stored receipt is about the assessment that holds it (CO18a7a):
+ * the receipt's own `assessmentId`, `projectId` and `attemptId` equal the
+ * assessment's, and
+ * its subject (`receiptSubjectOf`; an absent subject reads as the receipt's
+ * own attempt) names the same project and stands for the same attempt id. A
+ * receipt about another attempt, chain or brief is not evidence for this
+ * assessment: it never counts and never replaces a receipt that does.
+ *
+ * Reads own data properties only (no getter runs) and never throws: anything
+ * unreadable, malformed or of an unknown subject kind is `false`.
+ */
+export function isReceiptAboutAssessment(receipt: unknown, assessment: unknown): boolean {
+  try {
+    const projectId = ownProp(assessment, 'projectId');
+    const attemptId = ownProp(assessment, 'attemptId');
+    if (typeof projectId !== 'string' || typeof attemptId !== 'string' || attemptId.length === 0) {
+      return false;
+    }
+    const assessmentId = ownProp(assessment, 'id');
+    if (
+      ownProp(receipt, 'assessmentId') !== assessmentId ||
+      ownProp(receipt, 'projectId') !== projectId ||
+      ownProp(receipt, 'attemptId') !== attemptId
+    ) {
+      return false;
+    }
+    const subject = receiptSubjectOf(receipt as { readonly subject?: unknown });
+    if (subject === null || subject.projectId !== projectId) {
+      return false;
+    }
+    return attemptIdOfSubject(subject) === attemptId;
+  } catch {
+    return false;
+  }
 }
 
 /** The last receipt per reviewer model and review kind, in array order. */

@@ -15,11 +15,17 @@ export interface MergeVetoStateFields {
   readonly changedPaths: readonly string[];
   readonly additions: number;
   readonly deletions: number;
-  readonly hardToUndo: string;
-  readonly fixRounds: number;
-  readonly reviewerFamilies: readonly string[];
-  readonly replyResolvedThreads: number;
-  readonly majorBlockerFindings: number;
+  /**
+   * The next five fields are `null` when the state reader could not read them.
+   * `null` means UNKNOWN: it is never zero, never "none" and never an empty
+   * list. An advice adapter must not answer `merge-safe` for a state that
+   * carries a `null`; it answers `unknown` / `incomplete-state` instead.
+   */
+  readonly hardToUndo: string | null;
+  readonly fixRounds: number | null;
+  readonly reviewerFamilies: readonly string[] | null;
+  readonly replyResolvedThreads: number | null;
+  readonly majorBlockerFindings: number | null;
   readonly headChangedAfterReview: boolean;
 }
 
@@ -34,7 +40,8 @@ export interface MergeVetoRequest {
 
 export type MergeVetoUnknownReason =
   | 'redaction-refused' | 'budget' | 'not-configured'
-  | 'timeout' | 'transport' | 'shape' | 'low-confidence' | 'deadline';
+  | 'timeout' | 'transport' | 'shape' | 'low-confidence' | 'deadline'
+  | 'incomplete-state';
 
 export type MergeVetoAdvice =
   | { status: 'answered'; choice: 'merge-safe' | 'hold-for-human';

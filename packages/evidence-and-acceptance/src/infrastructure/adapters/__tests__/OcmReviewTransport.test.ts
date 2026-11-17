@@ -4,10 +4,16 @@ import { describe, expect, it } from 'vitest';
 import type { ReviewFindingRecord } from '../../../domain/evidence-records.js';
 import type { RunIndependentReviewRequest } from '../../../application/ports/out/IndependentReviewPort.out-port.js';
 import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE } from '../../../domain/untrusted-input.js';
+import { REVIEW_KINDS } from '../../../domain/evidence-records.js';
 import { MAX_STRUCTURED_FINDINGS } from '../../../domain/review-answer-schema.js';
+import { MAX_REVIEW_STREAM_EVENTS, MAX_REVIEW_STREAM_LENGTH } from '../../../domain/review-stream-grammar.js';
 import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js';
 import {
   ALLOWED_PART_TYPES,
+  BRIEF_CHECK_QUESTION,
+  BRIEF_VERIFY_BASE_UNKNOWN_REASON,
+  BRIEF_VERIFY_CHECKLIST,
+  BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON,
   buildReviewerEnv,
   buildReviewPrompt,
   createOcmReviewTransport,
@@ -16,9 +22,13 @@ import {
   isReadOnlyReviewCommand,
   KIND_PROMPT_DIFF_COMPLETE,
   KIND_PROMPT_TOOLS_ONLY,
+  kindPromptPlanOf,
   MAX_FINDING_LINE_LENGTH,
   MAX_OCM_EMBEDDED_DIFF_BYTES,
+  MAX_OCM_PROMPT_BYTES,
+  PROMPT_TOO_LARGE_REASON,
   MAX_PARSED_FINDINGS,
+  requireKindPromptPlan,
   type OcmReviewTransportSpawn,
   type OcmReviewTransportSpawnResult,
   MAX_RAW_OUTPUT_LENGTH,
@@ -26,8 +36,11 @@ import {
   parseReviewReplyStrict,
   READ_ONLY_REVIEW_SHELL_COMMANDS,
   REVIEW_CHECKLIST,
+  REVIEW_KNOWN_FALSE_POSITIVES,
   REVIEW_REPLY_CONTRACT,
   ReviewTransportError,
+  UNSUPPORTED_REVIEW_KIND_REASON,
+  classifySpawnErrorCode,
 } from '../OcmReviewTransport.adapter.js';
 
 function extractPromptNonce(prompt: string): string {
@@ -346,6 +359,7 @@ describe('OcmReviewTransport', () => {
 
   it('one edit tool event → readOnlyVerified false', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"tool","part":{"tool":"edit"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
@@ -375,6 +389,7 @@ describe('OcmReviewTransport', () => {
 
   it('head changed after → false', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
       '{"type":"step_finish"}',
@@ -749,6 +764,7 @@ describe('OcmReviewTransport', () => {
 
   it('PASS with a blocker finding in the block → fail', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"FINDING: blocker src/security.ts:42 Hardcoded secret token in auth flow\\n```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[{\\"severity\\":\\"blocker\\",\\"file\\":\\"src/security.ts\\",\\"line\\":42,\\"summary\\":\\"Hardcoded secret token in auth flow\\"}]}\\n```\\n"}}',
       '{"type":"step_finish"}',
@@ -885,6 +901,7 @@ describe('OcmReviewTransport', () => {
 
   it('finding parsing with and without line', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       JSON.stringify({
         type: 'text',
@@ -963,7 +980,7 @@ describe('OcmReviewTransport', () => {
     ]);
   });
 
-  it('skips unparsable JSON lines gracefully but voids readOnlyVerified', async () => {
+  it('an unparsable JSON line refuses the review as stream-grammar and voids readOnlyVerified', async () => {
     const recordedFixture = [
       '{"type":"step_start"}',
       '--- opencode debug header ---',
@@ -991,7 +1008,8 @@ describe('OcmReviewTransport', () => {
     });
 
     const result = await transport(baseRequest);
-    expect(result.result).toBe('pass');
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-grammar');
     expect(result.readOnlyVerified).toBe(false);
   });
 
@@ -1053,7 +1071,7 @@ describe('OcmReviewTransport', () => {
     expect(result.result).toBe('pass');
   });
 
-  it('unknown event type voids readOnlyVerified', async () => {
+  it('unknown event type refuses the review as stream-grammar and voids readOnlyVerified', async () => {
     const recordedFixture = [
       '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
@@ -1079,11 +1097,12 @@ describe('OcmReviewTransport', () => {
     });
 
     const result = await transport(baseRequest);
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-grammar');
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
   });
 
-  it('no step_start voids readOnlyVerified', async () => {
+  it('no step_start refuses the review as stream-grammar and voids readOnlyVerified', async () => {
     const recordedFixture = [
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
@@ -1107,8 +1126,9 @@ describe('OcmReviewTransport', () => {
     });
 
     const result = await transport(baseRequest);
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-grammar');
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
   });
 
   it('tool event with no readable name voids readOnlyVerified', async () => {
@@ -1231,6 +1251,7 @@ describe('OcmReviewTransport', () => {
   it('caps rawOutput at the last 20000 characters', async () => {
     const prefix = 'x'.repeat(25000);
     const recordedFixture = [
+      '{"type":"step_start"}',
       `{"type":"text","part":{"text":"${prefix}"}}`,
       '{"type":"text","part":{"text":"\\n```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
       '{"type":"step_finish"}',
@@ -1293,7 +1314,7 @@ describe('OcmReviewTransport', () => {
     expect(spawnCalled).toBe(false);
   });
 
-  it('{type:"text",part:{type:"patch"}} voids readOnlyVerified', async () => {
+  it('{type:"text",part:{type:"patch"}} refuses the review as stream-grammar and voids readOnlyVerified', async () => {
     const recordedFixture = [
       '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
@@ -1319,11 +1340,12 @@ describe('OcmReviewTransport', () => {
     });
 
     const result = await transport(baseRequest);
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-grammar');
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
   });
 
-  it('{type:"step_finish",part:{type:"file"}} voids readOnlyVerified', async () => {
+  it('{type:"step_finish",part:{type:"file"}} refuses the review as stream-grammar and voids readOnlyVerified', async () => {
     const recordedFixture = [
       '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
@@ -1348,11 +1370,12 @@ describe('OcmReviewTransport', () => {
     });
 
     const result = await transport(baseRequest);
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-grammar');
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
   });
 
-  it('{type:"text",part:{type:"snapshot"}} voids readOnlyVerified', async () => {
+  it('{type:"text",part:{type:"snapshot"}} refuses the review as stream-grammar and voids readOnlyVerified', async () => {
     const recordedFixture = [
       '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
@@ -1378,8 +1401,9 @@ describe('OcmReviewTransport', () => {
     });
 
     const result = await transport(baseRequest);
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-grammar');
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
   });
 
   it('allowed part types (step-start, step_finish, tool, text) preserve readOnlyVerified true', async () => {
@@ -1858,6 +1882,7 @@ describe('OcmReviewTransport', () => {
       const withMajorFinding = {
         exitCode: 0,
         stdout:
+          '{"type":"step_start"}\n' +
           '{"type":"tool","part":{"tool":"read"}}\n' +
           '{"type":"text","part":{"text":"FINDING: major src/api.ts:11 Request without validation\\n' +
           '```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[{\\"severity\\":\\"major\\",\\"file\\":\\"src/api.ts\\",\\"line\\":11,\\"summary\\":\\"Request without validation\\"}]}\\n```\\n"}}\n' +
@@ -2327,6 +2352,37 @@ describe('OcmReviewTransport', () => {
       expect(spawnCalls).toBe(1);
     });
 
+    it('a prompt over MAX_OCM_PROMPT_BYTES is refused with prompt-too-large and never spawns the review', async () => {
+      let spawnCalls = 0;
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async () => {
+          spawnCalls += 1;
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+        baseCommit: 'base-sha-1',
+        // The diff stays under the embedding cap; the brief pushes the whole
+        // prompt (instructions + brief + diff) over the prompt cap.
+        readDiff: async () => 'x'.repeat(MAX_OCM_EMBEDDED_DIFF_BYTES - 100),
+        makeNonce: () => nonce,
+      });
+      const oversizedBrief = { ...kindRequest, briefText: 'b'.repeat(10_000) };
+      expect(Buffer.byteLength(buildReviewPrompt(oversizedBrief, nonce, 'x'.repeat(MAX_OCM_EMBEDDED_DIFF_BYTES - 100)), 'utf8')).toBeGreaterThan(MAX_OCM_PROMPT_BYTES);
+
+      const result = await transport(oversizedBrief);
+
+      expect(result.result).toBe('unknown');
+      expect(result.rawOutput).toBe(PROMPT_TOO_LARGE_REASON);
+      expect(result.findings).toEqual([]);
+      // Only the idle `--wait` ran; the review itself never spawned.
+      expect(spawnCalls).toBe(1);
+    });
+
     it('a kind review with no readDiff or no baseCommit is refused with diff-unavailable', async () => {
       for (const missing of [{ baseCommit: 'base-sha-1' }, { readDiff: async () => 'diff text' }]) {
         let spawnCalls = 0;
@@ -2396,6 +2452,319 @@ describe('OcmReviewTransport', () => {
       const result = await transport(kindRequest);
       expect(result.readOnlyVerified).toBe(false);
       expect(result.result).toBe('pass');
+    });
+  });
+
+  describe('CO18a2: per-kind prompt plans and brief-verify', () => {
+    const nonce = '0123456789abcdef';
+    const BRIEF = '1. Add the port.\n2. Wire it.';
+    const verifyRequest = { ...baseRequest, kind: 'brief-verify' as const, briefText: BRIEF };
+    const PASS_STREAM =
+      '{"type":"step_start","part":{"type":"step-start"}}\n' +
+      '{"type":"tool","part":{"tool":"read"}}\n' +
+      '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
+      '{"type":"step_finish"}';
+
+    const makeCounted = (overrides: { readHead?: () => Promise<string>; baseCommit?: string; readDiff?: () => Promise<string | null> } = {}) => {
+      const prompts: string[] = [];
+      let dirCalls = 0;
+      let headCalls = 0;
+      let diffCalls = 0;
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => {
+          dirCalls += 1;
+          return '/tmp/review-dir';
+        },
+        // Overridden reads still count: the override only replaces the value.
+        readHead: overrides.readHead ?? (async () => {
+          headCalls += 1;
+          return baseRequest.candidateHeadSha;
+        }),
+        spawn: async (_file, args) => {
+          prompts.push(args[args.length - 1]);
+          return { exitCode: 0, stdout: PASS_STREAM, stderr: '' };
+        },
+        // A brief-verify review requires the candidate head to be the brief
+        // base commit, so the default base commit matches the request head;
+        // a test that needs a mismatch overrides it.
+        baseCommit: 'baseCommit' in overrides ? overrides.baseCommit : baseRequest.candidateHeadSha,
+        readDiff:
+          'readDiff' in overrides
+            ? async () => {
+                diffCalls += 1;
+                return overrides.readDiff ? overrides.readDiff() : null;
+              }
+            : async () => {
+                diffCalls += 1;
+                return 'diff --git a/f b/f\n+added line\n';
+              },
+        makeNonce: () => nonce,
+      });
+      return {
+        transport,
+        prompts,
+        get dirCalls() {
+          return dirCalls;
+        },
+        get headCalls() {
+          return headCalls;
+        },
+        get diffCalls() {
+          return diffCalls;
+        },
+      };
+    };
+
+    it('every kind in REVIEW_KINDS has its own plan', () => {
+      expect(REVIEW_KINDS.map((kind) => [kind, kindPromptPlanOf(kind)])).toEqual([
+        ['brief-check', { brief: true, diff: true, headIsBase: false, instructions: BRIEF_CHECK_QUESTION }],
+        ['brief-verify', { brief: true, diff: false, headIsBase: true, instructions: BRIEF_VERIFY_CHECKLIST }],
+        ['code-review', { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST }],
+        ['pre-merge', { brief: false, diff: true, headIsBase: false, instructions: REVIEW_CHECKLIST }],
+      ]);
+    });
+
+    it('anything that is not one of the four kinds has no plan', () => {
+      for (const value of [
+        undefined,
+        null,
+        '',
+        'manual',
+        'Code-Review',
+        'code-review ',
+        'constructor',
+        '__proto__',
+        'toString',
+        42,
+        {},
+        ['code-review'],
+      ] as unknown[]) {
+        expect(kindPromptPlanOf(value)).toBeNull();
+        expect(() => requireKindPromptPlan(value)).toThrow(ReviewTransportError);
+        try {
+          requireKindPromptPlan(value);
+          throw new Error('expected requireKindPromptPlan to throw');
+        } catch (error) {
+          expect(error).toBeInstanceOf(ReviewTransportError);
+          expect((error as ReviewTransportError).message).toBe(UNSUPPORTED_REVIEW_KIND_REASON);
+          expect((error as ReviewTransportError).code).toBe('transport-failed');
+        }
+      }
+    });
+
+    it('a brief-verify prompt is exactly the header, the rules, the known-false-positives block, the wrapped brief, the brief-verify checklist and the tools sentence', () => {
+      const prompt = buildReviewPrompt(verifyRequest, nonce);
+      const expected =
+        `Independent read-only brief-verify review for attempt "${baseRequest.attemptId}" at candidate head "${baseRequest.candidateHeadSha}".\n\n` +
+        `This review session is strictly read-only. Do not edit, create, delete, or modify any files.\n\n` +
+        `${UNTRUSTED_INPUT_RULE}\n\n` +
+        `${REVIEW_KNOWN_FALSE_POSITIVES}\n\n` +
+        `Diff summary:\n` +
+        `<<<UNTRUSTED nonce=${nonce} label="diff summary">>>\n` +
+        `Added verification checks\n` +
+        `<<<END UNTRUSTED nonce=${nonce}>>>\n\n` +
+        `${BRIEF_INPUT_RULE}\n\nBrief:\n` +
+        `<<<UNTRUSTED nonce=${nonce} label="brief">>>\n` +
+        `${BRIEF}\n` +
+        `<<<END UNTRUSTED nonce=${nonce}>>>\n\n` +
+        `${BRIEF_VERIFY_CHECKLIST}`;
+      expect(prompt).toBe(`${expected}\n\n${KIND_PROMPT_TOOLS_ONLY}\n${REVIEW_REPLY_CONTRACT}`);
+      expect(prompt).not.toContain(REVIEW_CHECKLIST);
+      expect(prompt).not.toContain(BRIEF_CHECK_QUESTION);
+    });
+
+    it('a brief-verify prompt has no diff section even when a diff or diffUnavailable is offered', () => {
+      expect(buildReviewPrompt(verifyRequest, nonce, 'diff --git a/f b/f\n+x\n')).toBe(
+        buildReviewPrompt(verifyRequest, nonce),
+      );
+      expect(buildReviewPrompt(verifyRequest, nonce, null, true)).toBe(buildReviewPrompt(verifyRequest, nonce));
+    });
+
+    it('a brief-check prompt is exactly the header, the rules, the known-false-positives block, the wrapped brief, the question and the tools sentence', () => {
+      const prompt = buildReviewPrompt({ ...baseRequest, kind: 'brief-check', briefText: BRIEF }, nonce);
+      const expected =
+        `Independent read-only brief-check review for attempt "${baseRequest.attemptId}" at candidate head "${baseRequest.candidateHeadSha}".\n\n` +
+        `This review session is strictly read-only. Do not edit, create, delete, or modify any files.\n\n` +
+        `${UNTRUSTED_INPUT_RULE}\n\n` +
+        `${REVIEW_KNOWN_FALSE_POSITIVES}\n\n` +
+        `Diff summary:\n` +
+        `<<<UNTRUSTED nonce=${nonce} label="diff summary">>>\n` +
+        `Added verification checks\n` +
+        `<<<END UNTRUSTED nonce=${nonce}>>>\n\n` +
+        `${BRIEF_INPUT_RULE}\n\nBrief:\n` +
+        `<<<UNTRUSTED nonce=${nonce} label="brief">>>\n` +
+        `${BRIEF}\n` +
+        `<<<END UNTRUSTED nonce=${nonce}>>>\n\n` +
+        'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.';
+      expect(prompt).toBe(`${expected}\n\n${KIND_PROMPT_TOOLS_ONLY}\n${REVIEW_REPLY_CONTRACT}`);
+    });
+
+    it('code-review and pre-merge prompts carry REVIEW_CHECKLIST and neither brief instruction', () => {
+      for (const kind of ['code-review', 'pre-merge'] as const) {
+        const prompt = buildReviewPrompt({ ...baseRequest, kind }, nonce);
+        expect(prompt).toContain(REVIEW_CHECKLIST);
+        expect(prompt).not.toContain(BRIEF_VERIFY_CHECKLIST);
+        expect(prompt).not.toContain(BRIEF_CHECK_QUESTION);
+        expect(prompt).not.toContain('label="brief"');
+      }
+    });
+
+    it('a brief-verify prompt without brief text is refused with the fixed message', () => {
+      for (const briefText of [undefined, '', '   ', 42]) {
+        const request =
+          briefText === undefined
+            ? { ...baseRequest, kind: 'brief-verify' as const }
+            : ({ ...baseRequest, kind: 'brief-verify', briefText } as unknown as RunIndependentReviewRequest);
+        expect(() => buildReviewPrompt(request, nonce)).toThrow(ReviewTransportError);
+        try {
+          buildReviewPrompt(request, nonce);
+          throw new Error('expected buildReviewPrompt to throw');
+        } catch (error) {
+          expect((error as ReviewTransportError).message).toBe('a brief-verify review requires the brief text');
+          expect((error as ReviewTransportError).code).toBe('transport-failed');
+        }
+      }
+    });
+
+    it('buildReviewPrompt refuses an unknown kind instead of using another kind’s prompt', () => {
+      for (const kind of ['security-review', null, 'constructor', 42]) {
+        const request = { ...baseRequest, kind } as unknown as RunIndependentReviewRequest;
+        expect(() => buildReviewPrompt(request, nonce)).toThrow(ReviewTransportError);
+        try {
+          buildReviewPrompt(request, nonce);
+          throw new Error('expected buildReviewPrompt to throw');
+        } catch (error) {
+          expect((error as ReviewTransportError).message).toBe(UNSUPPORTED_REVIEW_KIND_REASON);
+        }
+      }
+    });
+
+    it('a brief-verify review reads no diff and spawns the review with the brief-verify prompt', async () => {
+      const counted = makeCounted();
+      const result = await counted.transport(verifyRequest);
+      expect(counted.diffCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(2);
+      expect(counted.prompts[1]).toBe(buildReviewPrompt(verifyRequest, nonce));
+      expect(result.result).toBe('pass');
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('a brief-verify review with no known base commit is refused before any read or spawn', async () => {
+      const counted = makeCounted({ baseCommit: undefined, readDiff: undefined });
+      await expect(counted.transport(verifyRequest)).rejects.toMatchObject({
+        name: 'ReviewTransportError',
+        code: 'transport-failed',
+        message: BRIEF_VERIFY_BASE_UNKNOWN_REASON,
+      });
+      // The refusal carries no request text.
+      expect(BRIEF_VERIFY_BASE_UNKNOWN_REASON).not.toContain(baseRequest.candidateHeadSha);
+      expect(counted.dirCalls).toBe(0);
+      expect(counted.headCalls).toBe(0);
+      expect(counted.diffCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(0);
+    });
+
+    it('a brief-verify review whose candidate head is not the brief base commit is refused before any read or spawn', async () => {
+      const counted = makeCounted({ baseCommit: 'base-sha-1' });
+      await expect(counted.transport(verifyRequest)).rejects.toMatchObject({
+        name: 'ReviewTransportError',
+        code: 'transport-failed',
+        message: BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON,
+      });
+      // The refusal carries no request text: neither head value is echoed.
+      expect(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON).not.toContain('base-sha-1');
+      expect(BRIEF_VERIFY_HEAD_BASE_MISMATCH_REASON).not.toContain(baseRequest.candidateHeadSha);
+      expect(counted.dirCalls).toBe(0);
+      expect(counted.headCalls).toBe(0);
+      expect(counted.diffCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(0);
+    });
+
+    it('a brief-verify review at the candidate head that matches the brief base commit still passes', async () => {
+      const counted = makeCounted({});
+      const result = await counted.transport(verifyRequest);
+      expect(result.result).toBe('pass');
+      expect(result.readOnlyVerified).toBe(true);
+      expect(counted.prompts).toHaveLength(2);
+    });
+
+    it('a brief-verify review at the wrong head is refused before any spawn, and a head that moves during it voids read-only', async () => {
+      {
+        const { transport, prompts } = makeCounted({ readHead: async () => 'sha-other' });
+        await expect(transport(verifyRequest)).rejects.toThrow(/head mismatch before review/);
+        expect(prompts).toHaveLength(0);
+      }
+      {
+        let head = 0;
+        const { transport } = makeCounted({
+          readHead: async () => {
+            head += 1;
+            return head === 1 ? baseRequest.candidateHeadSha : 'sha-moved';
+          },
+        });
+        const result = await transport(verifyRequest);
+        expect(result.readOnlyVerified).toBe(false);
+      }
+    });
+
+    it('a brief-verify review without brief text is refused and the review is never spawned', async () => {
+      const { transport, prompts } = makeCounted();
+      await expect(transport({ ...verifyRequest, briefText: '  ' })).rejects.toThrow(
+        'a brief-verify review requires the brief text',
+      );
+      expect(prompts).toHaveLength(1);
+    });
+
+    it('a brief-verify prompt over MAX_OCM_PROMPT_BYTES is refused with prompt-too-large', async () => {
+      const { transport, prompts } = makeCounted();
+      const result = await transport({ ...verifyRequest, briefText: 'b'.repeat(MAX_OCM_PROMPT_BYTES) });
+      expect(result.result).toBe('unknown');
+      expect(result.rawOutput).toBe(PROMPT_TOO_LARGE_REASON);
+      expect(prompts).toHaveLength(1);
+    });
+
+    it('an unknown kind is refused before the review directory, the head, the diff or any spawn', async () => {
+      for (const kind of ['security-review', null, 'constructor']) {
+        const counted = makeCounted();
+        const request = { ...baseRequest, kind } as unknown as RunIndependentReviewRequest;
+        await expect(counted.transport(request)).rejects.toMatchObject({
+          name: 'ReviewTransportError',
+          code: 'transport-failed',
+          message: UNSUPPORTED_REVIEW_KIND_REASON,
+        });
+        expect(counted.dirCalls).toBe(0);
+        expect(counted.headCalls).toBe(0);
+        expect(counted.diffCalls).toBe(0);
+        expect(counted.prompts).toHaveLength(0);
+      }
+    });
+
+    it('a request whose kind getter throws is rejected and nothing is spawned', async () => {
+      const counted = makeCounted();
+      const request = Object.defineProperty({ ...baseRequest }, 'kind', {
+        enumerable: true,
+        get() {
+          throw new Error('kind trap');
+        },
+      }) as RunIndependentReviewRequest;
+      await expect(counted.transport(request)).rejects.toThrow('kind trap');
+      expect(counted.dirCalls).toBe(0);
+      expect(counted.prompts).toHaveLength(0);
+    });
+
+    it('code-review and pre-merge still read the diff and refuse an unreadable one', async () => {
+      for (const kind of ['code-review', 'pre-merge'] as const) {
+        const counted = makeCounted({ readDiff: async () => null });
+        const result = await counted.transport({ ...baseRequest, kind });
+        expect(result.result).toBe('unknown');
+        expect(result.rawOutput).toBe('diff-unavailable');
+        expect(counted.diffCalls).toBe(1);
+        expect(counted.prompts).toHaveLength(1);
+      }
     });
   });
 });
@@ -3220,6 +3589,7 @@ describe('RV4: busy worktree transport (seat-busy)', () => {
   };
 
   const PASS_JSON =
+    '{"type":"step_start"}\n' +
     '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
     '{"type":"step_finish"}';
 
@@ -3449,5 +3819,271 @@ describe('RV4: busy worktree transport (seat-busy)', () => {
     expect(Buffer.byteLength(diagnostic?.stderr ?? '', 'utf8')).toBeLessThanOrEqual(2048);
     // The cap keeps the leading bytes, not the tail.
     expect(diagnostic?.stderr).toMatch(/^x{2048}$/);
+  });
+});
+
+describe('RS2: permanent spawn errno classification (transport-failed)', () => {
+  const request: RunIndependentReviewRequest = {
+    attemptId: 'att-errno',
+    candidateHeadSha: 'sha-errno-head',
+    implementerModel: 'provider-a/implementer',
+    reviewerModel: 'provider-b/reviewer',
+  };
+
+  const makeTransport = (spawn: OcmReviewTransportSpawn) =>
+    createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: request.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => request.candidateHeadSha,
+      spawn,
+    });
+
+  const ERRNOS = ['E2BIG', 'ENOENT', 'EACCES', 'ENOEXEC'] as const;
+
+  it('a resolved null-exit spawn with a permanent errno rejects transport-failed on --wait and on the reviewer call', async () => {
+    for (const errno of ERRNOS) {
+      // --wait site: the first (and only) spawn resolves with the errno.
+      const waitOnly = makeTransport(async () => ({
+        exitCode: null,
+        stdout: '',
+        stderr: 'x',
+        errorCode: errno,
+      }));
+      const waitRejection = await waitOnly(request).catch((error: unknown) => error);
+      expect(waitRejection).toBeInstanceOf(ReviewTransportError);
+      expect((waitRejection as ReviewTransportError).code).toBe('transport-failed');
+      expect((waitRejection as ReviewTransportError).message).toBe(
+        'reviewer process failed with exit code null',
+      );
+
+      // Reviewer site: --wait exits 0, the review spawn resolves with the errno.
+      let calls = 0;
+      const reviewOnly = makeTransport(async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        return { exitCode: null, stdout: '', stderr: 'x', errorCode: errno };
+      });
+      const reviewRejection = await reviewOnly(request).catch((error: unknown) => error);
+      expect(reviewRejection).toBeInstanceOf(ReviewTransportError);
+      expect((reviewRejection as ReviewTransportError).code).toBe('transport-failed');
+      expect((reviewRejection as ReviewTransportError).message).toBe(
+        'reviewer process failed with exit code null',
+      );
+      expect(calls).toBe(2);
+    }
+  });
+
+  it('a thrown spawn error with a permanent errno code rejects transport-failed on --wait and on the reviewer call', async () => {
+    for (const errno of ERRNOS) {
+      const errnoError = Object.assign(new Error('boom'), { code: errno });
+
+      // --wait site.
+      const waitOnly = makeTransport(async () => {
+        throw errnoError;
+      });
+      const waitRejection = await waitOnly(request).catch((error: unknown) => error);
+      expect(waitRejection).toBeInstanceOf(ReviewTransportError);
+      expect((waitRejection as ReviewTransportError).code).toBe('transport-failed');
+      expect((waitRejection as ReviewTransportError).message).toBe('reviewer process failed');
+
+      // Reviewer site.
+      const reviewOnly = makeTransport(async (_file: string, args: readonly string[]) => {
+        if (args[0] === '--wait') {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        throw errnoError;
+      });
+      const reviewRejection = await reviewOnly(request).catch((error: unknown) => error);
+      expect(reviewRejection).toBeInstanceOf(ReviewTransportError);
+      expect((reviewRejection as ReviewTransportError).code).toBe('transport-failed');
+      expect((reviewRejection as ReviewTransportError).message).toBe('reviewer process failed');
+    }
+  });
+
+  it('a resolved null exit without errorCode, with a transient errorCode, or with a non-string errorCode stays transport', async () => {
+    const resolved: Array<Record<string, unknown>> = [
+      { exitCode: null, stdout: '', stderr: 'x' },
+      { exitCode: null, stdout: '', stderr: 'x', errorCode: 'ECONNRESET' },
+      { exitCode: null, stdout: '', stderr: 'x', errorCode: 123 as never },
+    ];
+    for (const shape of resolved) {
+      const transport = makeTransport(async () => shape as unknown as OcmReviewTransportSpawnResult);
+      const rejection = await transport(request).catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(ReviewTransportError);
+      expect((rejection as ReviewTransportError).code).toBe('transport');
+      expect((rejection as ReviewTransportError).message).toBe(
+        'reviewer process failed with exit code null',
+      );
+    }
+  });
+
+  it('classifySpawnErrorCode keeps timeout shapes as timeout', () => {
+    expect(classifySpawnErrorCode(Object.assign(new Error('the command timed out'), { name: 'AbortError' }))).toBe('timeout');
+    expect(classifySpawnErrorCode(Object.assign(new Error('boom'), { code: 'ETIMEDOUT' }))).toBe('timeout');
+    expect(classifySpawnErrorCode(new Error('wait timed out before the exit'))).toBe('timeout');
+  });
+
+  it('classifySpawnErrorCode never throws on hostile thrown values and reads transport', () => {
+    expect(classifySpawnErrorCode(null)).toBe('transport');
+    expect(classifySpawnErrorCode('EACCES')).toBe('transport');
+    expect(classifySpawnErrorCode(['EACCES'])).toBe('transport');
+    expect(classifySpawnErrorCode({ code: 123 })).toBe('transport');
+    expect(classifySpawnErrorCode({
+      get code(): string {
+        throw new Error('code getter boom');
+      },
+    })).toBe('transport');
+  });
+
+  it('a thrown non-string code rejects transport with the fixed message', async () => {
+    const transport = makeTransport(async () => {
+      throw Object.assign(new Error('boom'), { code: 123 });
+    });
+    const rejection = await transport(request).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(ReviewTransportError);
+    expect((rejection as ReviewTransportError).code).toBe('transport');
+    expect((rejection as ReviewTransportError).message).toBe('reviewer process failed');
+  });
+});
+
+describe('RVG2: the reviewer stream must match the grammar', () => {
+  const request: RunIndependentReviewRequest = {
+    attemptId: 'att-rvg2',
+    candidateHeadSha: 'sha-rvg2-head',
+    implementerModel: 'provider-a/implementer',
+    reviewerModel: 'provider-b/reviewer',
+  };
+  const START = '{"type":"step_start"}';
+  const FINISH = '{"type":"step_finish"}';
+  const READ = '{"type":"tool","part":{"tool":"read"}}';
+  const PASS_BLOCK = jsonReply('PASS');
+  const PASS_TEXT = JSON.stringify({ type: 'text', part: { text: PASS_BLOCK } });
+
+  const options = {
+    ocmRunBin: '/test/ocm-run',
+    remotePort: 4096,
+    agent: 'reviewer',
+    model: request.reviewerModel,
+    resolveReviewDir: async () => '/tmp/review-dir',
+    readHead: async () => request.candidateHeadSha,
+  };
+
+  const run = async (stdout: unknown) => {
+    let reviewSpawns = 0;
+    const transport = createOcmReviewTransport({
+      ...options,
+      spawn: async (_file, args) => {
+        if (args[0] === '--wait') {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        reviewSpawns += 1;
+        return { exitCode: 0, stdout, stderr: '' } as OcmReviewTransportSpawnResult;
+      },
+    });
+    const result = await transport(request);
+    expect(reviewSpawns).toBe(1);
+    return result;
+  };
+
+  it.each([
+    ['a text event before the first step_start', [PASS_TEXT, START, FINISH]],
+    ['a text event after the final step_finish', [START, FINISH, PASS_TEXT]],
+    ['a step_start inside an open step', [START, START, PASS_TEXT, FINISH]],
+    ['a second step_finish with no open step', [START, PASS_TEXT, FINISH, FINISH]],
+    ['a JSON line that is an array', [START, '[]', PASS_TEXT, FINISH]],
+    ['a text event whose part is an array', [START, JSON.stringify({ type: 'text', part: [], text: PASS_BLOCK }), FINISH]],
+  ])('%s refuses the review as stream-grammar although a PASS block is present', async (_name, lines) => {
+    const result = await run(lines.join('\n'));
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-grammar');
+    expect(result.findings).toEqual([]);
+    expect('unknownReason' in result).toBe(false);
+  });
+
+  it('a stream one character over MAX_REVIEW_STREAM_LENGTH refuses as stream-grammar', async () => {
+    const valid = [START, READ, PASS_TEXT, FINISH].join('\n');
+    const atCap = valid + ' '.repeat(MAX_REVIEW_STREAM_LENGTH - valid.length);
+    expect((await run(atCap)).result).toBe('pass');
+    const over = await run(atCap + ' ');
+    expect(over.result).toBe('unknown');
+    expect(over.rawOutput).toBe('stream-grammar');
+  });
+
+  it('a stream one event over MAX_REVIEW_STREAM_EVENTS refuses as stream-grammar', async () => {
+    const tools = (count: number): string[] => Array.from({ length: count }, () => READ);
+    const atCap = [START, ...tools(MAX_REVIEW_STREAM_EVENTS - 3), PASS_TEXT, FINISH].join('\n');
+    expect((await run(atCap)).result).toBe('pass');
+    const over = await run([START, ...tools(MAX_REVIEW_STREAM_EVENTS - 2), PASS_TEXT, FINISH].join('\n'));
+    expect(over.result).toBe('unknown');
+    expect(over.rawOutput).toBe('stream-grammar');
+  });
+
+  it('a cut stream stays stream-incomplete even when it also breaks the grammar', async () => {
+    const result = await run([PASS_TEXT, START].join('\n'));
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-incomplete');
+  });
+
+  it('a non-string stdout refuses as stream-incomplete without throwing', async () => {
+    for (const bad of [undefined, null, 42, [START, PASS_TEXT, FINISH]]) {
+      const result = await run(bad);
+      expect(result.result).toBe('unknown');
+      expect(result.rawOutput).toBe('stream-incomplete');
+    }
+  });
+
+  it('a throwing stdout getter refuses as stream-incomplete without throwing', async () => {
+    const hostile = {
+      exitCode: 0,
+      stderr: '',
+      get stdout(): string {
+        throw new Error('stdout getter boom');
+      },
+    } as OcmReviewTransportSpawnResult;
+    const transport = createOcmReviewTransport({
+      ...options,
+      spawn: async (_file, args) => (args[0] === '--wait' ? { exitCode: 0, stdout: '', stderr: '' } : hostile),
+    });
+    const result = await transport(request);
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('stream-incomplete');
+  });
+
+  it('a conformant two-step stream passes and its raw output is every text event joined by a newline', async () => {
+    const note = JSON.stringify({ type: 'text', part: { text: 'Read the change.' } });
+    const result = await run([START, READ, note, FINISH, START, PASS_TEXT, FINISH].join('\n'));
+    expect(result.result).toBe('pass');
+    expect(result.readOnlyVerified).toBe(true);
+    expect(result.rawOutput).toBe('Read the change.\n' + PASS_BLOCK);
+  });
+
+  it('a grammar refusal keeps the read-only proof computed from the tools and the head', async () => {
+    const clean = await run([PASS_TEXT, START, READ, FINISH].join('\n'));
+    expect(clean.rawOutput).toBe('stream-grammar');
+    expect(clean.readOnlyVerified).toBe(true);
+    const edited = await run([PASS_TEXT, START, '{"type":"tool","part":{"tool":"edit"}}', FINISH].join('\n'));
+    expect(edited.rawOutput).toBe('stream-grammar');
+    expect(edited.readOnlyVerified).toBe(false);
+  });
+
+  it('a brief-verify review whose stream breaks the grammar is refused as stream-grammar, and a conformant one passes', async () => {
+    const verify = async (stdout: string) =>
+      createOcmReviewTransport({
+        ...options,
+        baseCommit: request.candidateHeadSha,
+        spawn: async (_file, args) =>
+          args[0] === '--wait' ? { exitCode: 0, stdout: '', stderr: '' } : { exitCode: 0, stdout, stderr: '' },
+      })({ ...request, kind: 'brief-verify', briefText: '1. Add the port.' });
+    const refused = await verify([PASS_TEXT, START, READ, FINISH].join('\n'));
+    expect(refused.result).toBe('unknown');
+    expect(refused.rawOutput).toBe('stream-grammar');
+    expect(refused.findings).toEqual([]);
+    expect('unknownReason' in refused).toBe(false);
+    expect((await verify([START, READ, PASS_TEXT, FINISH].join('\n'))).result).toBe('pass');
   });
 });

@@ -1,0 +1,378 @@
+import { describe, expect, it } from 'vitest';
+
+import { buildMergeKey, type MergeKeyOneWayAction } from '../lane-run-keys.js';
+import { evaluateShadowMergeSet, SHADOW_DAY_BOUNDARY_GRACE_MS } from '../shadow-day-merge-set.js';
+
+const DAY = '2026-11-10';
+const DIGEST = '0123456789ab';
+const OTHER_DIGEST = 'ffeeddccbbaa';
+const HEAD_A = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0';
+const HEAD_C = 'f0e9d8c7b6a5f4e3d2c1b0a99887766554433221';
+
+function inDayIso(minutes: number, second = 0): string {
+  const hour = String(Math.floor(minutes / 60)).padStart(2, '0');
+  const minute = String(minutes % 60).padStart(2, '0');
+  return `${DAY}T${hour}:${minute}:${String(second).padStart(2, '0')}.000Z`;
+}
+
+function mergeKey(digest: string, pullRequest: number, head12: string, action: MergeKeyOneWayAction = 'merge-pr'): string {
+  const built = buildMergeKey({ repoDigest: digest, pullRequest, head12, action, attemptOrdinal: null, retry: null });
+  if (!built.ok) {
+    throw new Error('fixture key refused');
+  }
+  return built.key;
+}
+
+function shellEvent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    line: 1,
+    atIso: inDayIso(600),
+    kind: 'result',
+    outcome: 'merged',
+    pullRequest: 7,
+    headOid: HEAD_A,
+    detailCode: 'none',
+    fromHeadOid: null,
+    ...overrides,
+  };
+}
+
+function fleetResult(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    key: mergeKey(DIGEST, 7, HEAD_A.slice(0, 12)),
+    outcome: 'dry-run',
+    reasonCode: 'would-merge',
+    recordedAtIso: inDayIso(600, 10),
+    ...overrides,
+  };
+}
+
+function fleetEntry(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { pullRequest: 7, headOid: HEAD_A, ...overrides };
+}
+
+function dayInput(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    day: DAY,
+    repoDigest: DIGEST,
+    excludeBatchMerges: false,
+    shell: { events: [shellEvent()], unknownLines: 0 },
+    fleet: { results: [fleetResult()], entries: [fleetEntry()] },
+    ...overrides,
+  };
+}
+
+const PASS_DAY = { status: 'pass', reason: 'merge-set-equal', mergesCompared: 1, excludedBatchMerges: 0, compared: 1, divergences: 0 };
+
+describe('evaluateShadowMergeSet (S1)', () => {
+  it('passes a day where the shell and fleet sets are equal, with the correct mergesCompared count', () => {
+    const input = dayInput({
+      shell: { events: [shellEvent(), shellEvent({ line: 2, atIso: inDayIso(700), pullRequest: 8, headOid: HEAD_C })], unknownLines: 0 },
+      fleet: {
+        results: [fleetResult(), fleetResult({ key: mergeKey(DIGEST, 8, HEAD_C.slice(0, 12)), recordedAtIso: inDayIso(700, 10) })],
+        entries: [fleetEntry(), fleetEntry({ pullRequest: 8, headOid: HEAD_C })],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual({ ...PASS_DAY, mergesCompared: 2, compared: 2 });
+  });
+
+  it('fails with merge-set-divergence for a shell merge with no corresponding fleet would-merge', () => {
+    const input = dayInput({ fleet: { results: [], entries: [fleetEntry()] } });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
+  });
+
+  it('fails with merge-set-divergence for a fleet would-merge the shell never actually merged', () => {
+    const input = dayInput({ shell: { events: [], unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
+  });
+
+  it('fails with merge-set-divergence for a head mismatch between the merged head and the resolved head', () => {
+    const input = dayInput({
+      fleet: {
+        results: [fleetResult({ key: mergeKey(DIGEST, 7, HEAD_C.slice(0, 12)) })],
+        entries: [fleetEntry({ headOid: HEAD_C })],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence' });
+  });
+
+  it('passes a shell merge at 23:59:55 UTC matched against a fleet would-merge recorded at 00:00:05 the next day', () => {
+    const input = dayInput({
+      shell: { events: [shellEvent({ atIso: `${DAY}T23:59:55Z` })], unknownLines: 0 },
+      fleet: { results: [fleetResult({ recordedAtIso: '2026-11-11T00:00:05.000Z' })], entries: [fleetEntry()] },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+  });
+
+  it('passes when a divergence falls ONLY inside the grace margin, not within the day itself', () => {
+    const input = dayInput({
+      shell: {
+        events: [
+          shellEvent(),
+          shellEvent({ line: 2, pullRequest: 9, headOid: HEAD_C, atIso: '2026-11-09T23:59:55Z' }),
+          shellEvent({ line: 3, pullRequest: 10, headOid: 'b0a9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7', atIso: '2026-11-11T00:00:05Z' }),
+        ],
+        unknownLines: 0,
+      },
+      fleet: { results: [fleetResult()], entries: [fleetEntry()] },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual({ ...PASS_DAY, mergesCompared: 1 });
+  });
+
+  it('counts an unmatched batch-member merge as a normal divergence with excludeBatchMerges false', () => {
+    const batchEvent = shellEvent({ pullRequest: 9, headOid: HEAD_C, detailCode: 'batch-member' });
+    const input = dayInput({ shell: { events: [shellEvent(), batchEvent], unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence' });
+  });
+
+  it('passes the same batch fixture with excludeBatchMerges true, with excludedBatchMerges 1', () => {
+    const batchEvent = shellEvent({ pullRequest: 9, headOid: HEAD_C, detailCode: 'batch-member' });
+    const input = dayInput({
+      excludeBatchMerges: true,
+      shell: { events: [shellEvent(), batchEvent], unknownLines: 0 },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual({ ...PASS_DAY, excludedBatchMerges: 1 });
+  });
+
+  it('fails live-action-in-shadow for a live merge-pr result inside day D, before the set comparison runs', () => {
+    const input = dayInput({
+      fleet: { results: [fleetResult({ outcome: 'merged' })], entries: [fleetEntry()] },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'live-action-in-shadow' });
+  });
+
+  it('fails live-action-in-shadow for a live update-branch result even when the sets also diverge', () => {
+    const input = dayInput({
+      fleet: {
+        results: [fleetResult({ key: mergeKey(DIGEST, 9, 'bbbbbbbbbbbb', 'update-branch'), outcome: 'merged', reasonCode: 'would-update-branch' })],
+        entries: [fleetEntry()],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'live-action-in-shadow' });
+  });
+
+  it('fails fleet-head-unresolved for a would-merge whose head12 matches no entry record', () => {
+    const input = dayInput({ fleet: { results: [fleetResult({ key: mergeKey(DIGEST, 99, '999999999999') })], entries: [fleetEntry()] } });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'fleet-head-unresolved' });
+  });
+
+  it('fails fleet-head-ambiguous when two entries for the same PR carry different full heads sharing a 12-char prefix', () => {
+    const sharedPrefix = 'a1b2c3d4e5f6';
+    const headX = `${sharedPrefix}${'1'.repeat(28)}`;
+    const headY = `${sharedPrefix}${'2'.repeat(28)}`;
+    const input = dayInput({
+      fleet: {
+        results: [fleetResult({ key: mergeKey(DIGEST, 7, sharedPrefix) })],
+        entries: [fleetEntry({ headOid: headX }), fleetEntry({ headOid: headY })],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'fleet-head-ambiguous' });
+  });
+
+  it('resolves correctly through the index for a single matching entry (the normal case, indexing unchanged)', () => {
+    const input = dayInput();
+    expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+  });
+
+  it('is not ambiguous when the same PR has two entries with DIFFERENT 12-char prefixes (indexed by PR+prefix, not PR alone)', () => {
+    const input = dayInput({
+      fleet: {
+        results: [fleetResult()],
+        entries: [fleetEntry(), fleetEntry({ headOid: HEAD_C })],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+  });
+
+  it('ignores results belonging to a DIFFERENT repo digest entirely', () => {
+    const input = dayInput({
+      fleet: {
+        results: [
+          fleetResult(),
+          fleetResult({ key: mergeKey(OTHER_DIGEST, 7, HEAD_C.slice(0, 12)), outcome: 'merged' }),
+          fleetResult({ key: mergeKey(OTHER_DIGEST, 8, HEAD_C.slice(0, 12)) }),
+        ],
+        entries: [fleetEntry()],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+  });
+
+  it('passes a day with zero shell merges and zero fleet would-merges, with mergesCompared 0', () => {
+    expect(evaluateShadowMergeSet(dayInput({ shell: { events: [], unknownLines: 0 }, fleet: { results: [], entries: [] } })))
+      .toEqual({ ...PASS_DAY, mergesCompared: 0, compared: 0 });
+  });
+
+  it('returns shell-events-incomplete when the shell record is not a full day', () => {
+    expect(evaluateShadowMergeSet(dayInput({ shell: { events: [], unknownLines: 3 } })))
+      .toMatchObject({ status: 'unknown', reason: 'shell-events-incomplete' });
+  });
+
+  it('uses the declared grace constant on both ends of the day window', () => {
+    expect(SHADOW_DAY_BOUNDARY_GRACE_MS).toBe(600_000);
+  });
+
+  it('a constant verdict would fail: an equal day and a divergent day never share one status', () => {
+    const pass = evaluateShadowMergeSet(dayInput());
+    const fail = evaluateShadowMergeSet(dayInput({ shell: { events: [], unknownLines: 0 } }));
+    expect(pass.status).toBe('pass');
+    expect(fail.status).toBe('fail');
+  });
+
+  it('an identity echo of the input would fail: the result carries no input value', () => {
+    const result = evaluateShadowMergeSet(dayInput());
+    const text = JSON.stringify(result) ?? '';
+    expect(text).not.toContain(DAY);
+    expect(text).not.toContain(HEAD_A);
+    expect(Object.keys(result).sort()).toEqual(['compared', 'divergences', 'excludedBatchMerges', 'mergesCompared', 'reason', 'status']);
+  });
+
+  it('judges a fleet result by its instant, not its written date: an offset-carried instant on day D fails live-action-in-shadow', () => {
+    const input = dayInput({
+      fleet: { results: [fleetResult({ outcome: 'merged', recordedAtIso: '2026-11-09T23:00:00.000-02:00' })], entries: [fleetEntry()] },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'live-action-in-shadow' });
+  });
+
+  it('judges a divergence by its instant, not its written date: a would-merge written on the previous day but landing on day D counts', () => {
+    const input = dayInput({
+      fleet: { results: [fleetResult({ recordedAtIso: '2026-11-09T23:05:00.000-01:00' })], entries: [fleetEntry()] },
+      shell: { events: [], unknownLines: 0 },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
+  });
+
+  it('does not certify a pass when the comparator truncated its divergence list', () => {
+    const graceHead = (pullRequest: number): string => pullRequest.toString(16).padStart(8, '0').repeat(5);
+    const graceEvents = [1, ...Array.from({ length: 10 }, (_, i) => 10 + i), ...Array.from({ length: 40 }, (_, i) => 100 + i)]
+      .map((pullRequest, index) => shellEvent({
+        line: index + 1,
+        pullRequest,
+        headOid: graceHead(pullRequest),
+        atIso: '2026-11-09T23:59:55Z',
+      }));
+    const events = [...graceEvents, shellEvent({ line: 99, pullRequest: 2, headOid: HEAD_C })];
+    const input = dayInput({ shell: { events, unknownLines: 0 }, fleet: { results: [], entries: [] } });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'unknown', reason: 'merge-set-comparison-truncated', mergesCompared: 1 });
+  });
+});
+
+describe('evaluateShadowMergeSet hostile input', () => {
+  const INVALID = { status: 'unknown', reason: 'invalid-input', mergesCompared: 0, excludedBatchMerges: 0, compared: 0, divergences: 0 };
+
+  it('null is refused as invalid-input', () => {
+    expect(evaluateShadowMergeSet(null)).toEqual(INVALID);
+  });
+
+  it('undefined is refused as invalid-input', () => {
+    expect(evaluateShadowMergeSet(undefined)).toEqual(INVALID);
+  });
+
+  it('a wrong primitive (a number where a string is due) is refused', () => {
+    expect(evaluateShadowMergeSet(dayInput({ day: 20261110 }))).toEqual(INVALID);
+  });
+
+  it('a string unknownLines ("0") is refused as invalid-input, never treated as the number 0 or as shell-events-incomplete', () => {
+    const input = dayInput({ shell: { events: [], unknownLines: '0' } });
+    expect(evaluateShadowMergeSet(input)).toEqual(INVALID);
+  });
+
+  it('a genuine positive integer unknownLines still produces shell-events-incomplete, not invalid-input', () => {
+    const input = dayInput({ shell: { events: [], unknownLines: 1 } });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'unknown', reason: 'shell-events-incomplete' });
+  });
+
+  it('a string where a list is due is refused', () => {
+    const input = dayInput();
+    (input.shell as Record<string, unknown>).events = 'merged';
+    expect(evaluateShadowMergeSet(input)).toEqual(INVALID);
+  });
+
+  it('a non-iterable object where a list is due is refused', () => {
+    const input = dayInput();
+    (input.fleet as Record<string, unknown>).entries = { pullRequest: 7, headOid: HEAD_A };
+    expect(evaluateShadowMergeSet(input)).toEqual(INVALID);
+  });
+
+  it('a sparse array with a hole is refused', () => {
+    const events = [shellEvent()] as unknown[];
+    delete events[0];
+    const input = dayInput({ shell: { events, unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(input)).toEqual(INVALID);
+  });
+
+  it('an array-like object is refused', () => {
+    const arrayLike = { length: 1, 0: shellEvent() };
+    const input = dayInput({ shell: { events: arrayLike, unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(input)).toEqual(INVALID);
+  });
+
+  it('an enormous sparse length is refused before any traversal', () => {
+    const enormous: unknown[] = [];
+    Object.defineProperty(enormous, 'length', { value: 2 ** 32 - 1 });
+    const input = dayInput({ shell: { events: enormous, unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(input)).toEqual(INVALID);
+  });
+
+  it('a getter on the root never runs and is refused', () => {
+    let calls = 0;
+    const input: Record<string, unknown> = dayInput();
+    Object.defineProperty(input, 'shell', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return { events: [], unknownLines: 0 };
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual(INVALID);
+    expect(calls).toBe(0);
+  });
+
+  it('a getter on an item never runs and is refused', () => {
+    let calls = 0;
+    const event: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(shellEvent())) {
+      event[key] = value;
+    }
+    Object.defineProperty(event, 'outcome', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return 'merged';
+      },
+    });
+    const input = dayInput({ shell: { events: [event], unknownLines: 0 } });
+    expect(evaluateShadowMergeSet(input)).toEqual(INVALID);
+    expect(calls).toBe(0);
+  });
+
+  it('a Proxy over a valid input yields exactly the plain data result with no get trap run', () => {
+    let gets = 0;
+    const valid = dayInput();
+    const proxied = new Proxy(valid, {
+      get(target, property, receiver) {
+        gets += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(evaluateShadowMergeSet(proxied)).toEqual(PASS_DAY);
+    expect(gets).toBe(0);
+  });
+
+  it('a Proxy over an invalid input is refused exactly like the plain invalid data', () => {
+    const proxied = new Proxy(new Date(0), {});
+    expect(evaluateShadowMergeSet(proxied)).toEqual(INVALID);
+  });
+
+  it('a JSON-parsed __proto__ own key is refused', () => {
+    const parsed: Record<string, unknown> = JSON.parse(JSON.stringify(dayInput()));
+    Object.defineProperty(parsed, '__proto__', { value: { polluted: true }, enumerable: true, writable: true, configurable: true });
+    expect(evaluateShadowMergeSet(parsed)).toEqual(INVALID);
+  });
+
+  it('a JSON-parsed constructor own key on a nested record is refused', () => {
+    const parsed: Record<string, unknown> = JSON.parse(JSON.stringify(dayInput()));
+    Object.defineProperty(parsed.fleet, 'constructor', { value: { polluted: true }, enumerable: true, writable: true, configurable: true });
+    expect(evaluateShadowMergeSet(parsed)).toEqual(INVALID);
+  });
+});

@@ -25,10 +25,12 @@ import {
   MAX_RAW_OUTPUT_LENGTH,
   parseReviewReply,
   parseReviewReplyStrict,
-  REVIEW_CHECKLIST,
+  REVIEW_KNOWN_FALSE_POSITIVES,
   REVIEW_REPLY_CONTRACT,
   ReviewTransportError,
+  requireKindPromptPlan,
 } from './OcmReviewTransport.adapter.js';
+import type { KindPromptPlan } from './OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from './ReviewTransportRouter.js';
 import { runSpawnOutcome } from './spawn-run.js';
 import type { SpawnRunOutcome, SpawnRunOptions } from './spawn-run.js';
@@ -181,6 +183,23 @@ export function substituteReviewArgv(
   });
 }
 
+/** The fixed reason the CLI transport refuses a kind that needs the repository rather than a diff. */
+export const CLI_NO_REPOSITORY_REASON =
+  'this review kind needs a reviewer that can read the repository; a single-turn CLI reviewer cannot';
+
+/**
+ * The plan of a conductor kind for the CLI transport. An unknown kind is
+ * refused, and so is a kind without a diff (brief-verify): the CLI reviewer
+ * sees only an embedded diff, never the repository.
+ */
+function cliKindPromptPlan(kind: unknown): KindPromptPlan {
+  const plan = requireKindPromptPlan(kind);
+  if (!plan.diff) {
+    throw new ReviewTransportError(CLI_NO_REPOSITORY_REASON, 'transport-failed');
+  }
+  return plan;
+}
+
 export function buildEmbeddedReviewPrompt(request: RunIndependentReviewRequest, diff: string, nonce: string): string {
   // Every lane-written text in this prompt goes through `wrapUntrusted`.
   const wrappedDiff = wrapUntrusted({ label: 'diff', text: diff, nonce });
@@ -216,9 +235,10 @@ export function buildEmbeddedReviewPrompt(request: RunIndependentReviewRequest, 
   }
 
   const header = `Independent read-only ${request.kind} review for attempt "${request.attemptId}" at candidate head "${request.candidateHeadSha}".`;
+  const plan = cliKindPromptPlan(request.kind);
   const scope =
     'You have no access to the repository. The complete change under review is embedded below as a unified diff. Do not try to read, edit, create or run anything.';
-  const sections: string[] = [header, scope, UNTRUSTED_INPUT_RULE, diffSection];
+  const sections: string[] = [header, scope, UNTRUSTED_INPUT_RULE, REVIEW_KNOWN_FALSE_POSITIVES, diffSection];
 
   const summarySection = wrappedDiffSummarySection();
   if (summarySection !== null) {
@@ -236,7 +256,7 @@ export function buildEmbeddedReviewPrompt(request: RunIndependentReviewRequest, 
       throw new Error('a brief-check review requires the brief text');
     }
   } else {
-    sections.push(REVIEW_CHECKLIST);
+    sections.push(plan.instructions);
   }
 
   sections.push(REVIEW_REPLY_CONTRACT);
@@ -329,6 +349,12 @@ export function createCliReviewTransport(
       throw new Error(
         `reviewer model mismatch: request specified "${request.reviewerModel}" but transport configured for "${options.model}"`,
       );
+    }
+
+    // 1b. An unknown kind, or a kind this transport cannot serve (brief-verify
+    // needs the repository), is refused before any read, scratch dir or spawn.
+    if (request.kind !== undefined) {
+      cliKindPromptPlan(request.kind);
     }
 
     // 2. Verify head before review

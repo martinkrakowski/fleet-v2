@@ -15,7 +15,9 @@ import type {
   ChainStep,
   ChainTrigger,
   ChainsSection,
+  CiRunnerSlotSection,
   ConductorPolicy,
+  ConductorPremergeMode,
   ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
   ConductorReaperRepairs,
@@ -40,6 +42,7 @@ import type {
   MergeDaemonSection,
   MergePolicySection,
   MergeRepositoryPolicy,
+  MergeVetoConsumerSettings,
   MergeVetoPolicy,
   PolicySection,
   ProcedureCoverage,
@@ -67,6 +70,8 @@ import {
   CONDUCTOR_REAPER_WORKTREE_BOUNDS,
   DEFAULT_MERGE_DAEMON_POLICY,
   MERGE_POLICY_BOUNDS,
+  PREPARE_FORBIDDEN_CHAR_RE,
+  PREPARE_PARENT_TRAVERSAL_RE,
   parseMergeRepositoryKey,
 } from './policy.js';
 import { readOwnDataProperty } from './policy-read.js';
@@ -80,6 +85,7 @@ import {
   CAPABILITY_KEYS,
   CHAIN_KEYS,
   CHAIN_STEP_KEYS,
+  CI_RUNNER_SLOT_KEYS,
   CLAIM_TRIAGE_CONSUMER_KEYS,
   CONDUCTOR_KEYS,
   CONDUCTOR_REAPER_DISK_KEYS,
@@ -101,6 +107,7 @@ import {
   LOCAL_SHELF_KEYS,
   MERGE_KEYS,
   MERGE_REPO_KEYS,
+  MERGE_VETO_CONSUMER_KEYS,
   MERGE_VETO_KEYS,
   NO_DECISIONS_KEYS,
   NO_FORGE_KEYS,
@@ -160,6 +167,12 @@ const PROCEDURE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 /** Container names share the procedure-name shape; see parseHostContainer. */
 const CONTAINER_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const MAX_CONTAINER_NAME_LENGTH = 64;
+/** CI runner slots are bounded so a host cannot declare an unbounded unit list (OG-28a). */
+const MAX_CI_RUNNER_SLOTS = 16;
+/** Slot names share the lowercase identifier shape with an extra separator set. */
+const CI_RUNNER_SLOT_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+/** A slot's unit must be a systemd service unit name ending in `.service`. */
+const CI_RUNNER_SLOT_UNIT_PATTERN = /^[A-Za-z0-9@._:-]{1,128}\.service$/;
 const MAX_INSTALLATION_STATE_DIR_LENGTH = 4096;
 /** The tunnel offset is bounded so a dial port stays far below 65535. */
 const MAX_TUNNEL_OFFSET = 1024;
@@ -1526,6 +1539,124 @@ function parseHostRoleAliases(
   return Object.keys(aliases).length > 0 ? aliases : undefined;
 }
 
+/**
+ * The optional `hosts.<name>.ciRunnerSlots` list: the systemd CI runner units
+ * a host declares (OG-28a). Both local and ssh hosts may carry it. Every
+ * element is read through `readOptionalDataField` and the safe own-property
+ * readers, so a getter never runs, and a rejected value never appears in the
+ * message: slot names and unit names are operator input.
+ */
+function parseHostCiRunnerSlots(
+  entry: JsonObject,
+  hostPath: string,
+  errors: string[],
+): readonly CiRunnerSlotSection[] | undefined {
+  const fieldPath = `${hostPath}.ciRunnerSlots`;
+  // An accessor property is refused, never treated as an absent field.
+  const field = readOptionalDataField(entry, 'ciRunnerSlots');
+  if (field.kind === 'absent') {
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  if (!Array.isArray(field.value)) {
+    errors.push(`${fieldPath}: must be an array`);
+    return undefined;
+  }
+  if (field.value.length > MAX_CI_RUNNER_SLOTS) {
+    errors.push(`${fieldPath}: must have at most 16 entries`);
+    return undefined;
+  }
+  const seenNames = new Set<string>();
+  const slots: CiRunnerSlotSection[] = [];
+  // Index reads go through own property descriptors: a getter at an index, or
+  // a hole, is refused and never invoked.
+  for (let index = 0; index < field.value.length; index += 1) {
+    const slotPath = `${fieldPath}[${index}]`;
+    const descriptor = Object.getOwnPropertyDescriptor(field.value, index);
+    const item: unknown = descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+    const slot = parseCiRunnerSlotEntry(item, slotPath, seenNames, errors);
+    if (slot !== undefined) {
+      slots.push(slot);
+    }
+  }
+  return slots;
+}
+
+function parseCiRunnerSlotEntry(
+  item: unknown,
+  slotPath: string,
+  seenNames: Set<string>,
+  errors: string[],
+): CiRunnerSlotSection | undefined {
+  if (!isJsonObject(item)) {
+    errors.push(`${slotPath}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(item, CI_RUNNER_SLOT_KEYS, slotPath, errors);
+  const name = readCiRunnerSlotName(item, slotPath, seenNames, errors);
+  const unit = readCiRunnerSlotUnit(item, slotPath, errors);
+  return name !== undefined && unit !== undefined ? { name, unit } : undefined;
+}
+
+function readCiRunnerSlotName(
+  item: JsonObject,
+  slotPath: string,
+  seenNames: Set<string>,
+  errors: string[],
+): string | undefined {
+  const field = readOptionalDataField(item, 'name');
+  if (field.kind === 'absent') {
+    errors.push(`${slotPath}.name: required`);
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${slotPath}.name: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (typeof value !== 'string' || value.trim() === '') {
+    errors.push(`${slotPath}.name: must be a non-empty string`);
+    return undefined;
+  }
+  if (!CI_RUNNER_SLOT_NAME_PATTERN.test(value)) {
+    errors.push(`${slotPath}.name: must match ^[a-z0-9][a-z0-9._-]{0,63}$`);
+    return undefined;
+  }
+  if (seenNames.has(value)) {
+    errors.push(`${slotPath}.name: duplicate slot name`);
+    return undefined;
+  }
+  seenNames.add(value);
+  return value;
+}
+
+function readCiRunnerSlotUnit(item: JsonObject, slotPath: string, errors: string[]): string | undefined {
+  const field = readOptionalDataField(item, 'unit');
+  if (field.kind === 'absent') {
+    errors.push(`${slotPath}.unit: required`);
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${slotPath}.unit: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (typeof value !== 'string' || value.trim() === '') {
+    errors.push(`${slotPath}.unit: must be a non-empty string`);
+    return undefined;
+  }
+  if (value.startsWith('-') || !CI_RUNNER_SLOT_UNIT_PATTERN.test(value)) {
+    errors.push(
+      `${slotPath}.unit: must be a systemd service unit name ending in .service and not starting with "-"`,
+    );
+    return undefined;
+  }
+  return value;
+}
+
 function parseHost(
   entry: JsonObject,
   hostPath: string,
@@ -1591,6 +1722,8 @@ function parseHost(
     roles,
     errors,
   );
+  // A host of either transport may declare systemd CI runner slots (OG-28a).
+  const ciRunnerSlots = parseHostCiRunnerSlots(entry, hostPath, errors);
   let runner: HostRunnerSection | undefined;
   if (Object.hasOwn(entry, 'runner')) {
     const runnerValue = entry.runner;
@@ -1622,6 +1755,7 @@ function parseHost(
     worktreeRoot,
     ...(tmpDir !== undefined ? { tmpDir } : {}),
     roles,
+    ...(ciRunnerSlots !== undefined ? { ciRunnerSlots } : {}),
     ...(runner !== undefined ? { runner } : {}),
   };
 }
@@ -2169,6 +2303,21 @@ function readConductorMinutes(
   return value;
 }
 
+function readConductorPremergeMode(
+  record: JsonObject,
+  errors: string[],
+): ConductorPremergeMode | undefined {
+  if (!Object.hasOwn(record, 'premergeMode')) {
+    return undefined;
+  }
+  const value = record.premergeMode;
+  if (value !== 'human-gate' && value !== 'auto-attest') {
+    errors.push('policy.conductor.premergeMode: must be one of human-gate, auto-attest');
+    return undefined;
+  }
+  return value;
+}
+
 function parseConductorRepairs(
   reaper: JsonObject,
   errors: string[],
@@ -2387,6 +2536,7 @@ function parseConductorPolicy(
     CONDUCTOR_MINUTE_BOUNDS.stopGraceMinutes,
     errors,
   );
+  const premergeMode = readConductorPremergeMode(value, errors);
   const reaper = parseConductorReaper(value, errors);
   if (errors.length !== before || enabled === undefined) {
     return undefined;
@@ -2394,6 +2544,7 @@ function parseConductorPolicy(
   return {
     enabled,
     ...(stopGraceMinutes !== undefined ? { stopGraceMinutes } : {}),
+    ...(premergeMode !== undefined ? { premergeMode } : {}),
     ...(reaper !== undefined ? { reaper } : {}),
   };
 }
@@ -2651,12 +2802,77 @@ function readMergeProjectId(entry: JsonObject, path: string, errors: string[]): 
   return readMergeText(entry, 'projectId', path, MERGE_POLICY_BOUNDS.projectIdLength, errors);
 }
 
+/**
+ * CO22: validate a per-project prepare argv as written. The rules mirror the
+ * policy reader (`readPrepareArgv`): 1..32 own-data-property string tokens of
+ * 1..256 characters, no whitespace, control characters, shell metacharacters
+ * or secret shape, and an `argv[0]` that is an executable name or path rather
+ * than a flag, a dot directory or a `..` traversal. Array length is checked
+ * before any element is touched, so a hostile array fails in O(1). Each
+ * offending element is reported by index and code only — the token is never
+ * echoed — and the whole argv is refused the moment any element fails, so an
+ * unvalidated argv is never passed through.
+ */
+export function parsePrepareArgv(
+  value: unknown,
+  path: string,
+  errors: string[],
+): readonly string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    errors.push(`${path}: must be an array`);
+    return undefined;
+  }
+  const maxArgs = MERGE_POLICY_BOUNDS.prepareMaxArgs;
+  if (value.length < 1 || value.length > maxArgs) {
+    errors.push(`${path}: must hold 1 to ${maxArgs} entries`);
+    return undefined;
+  }
+  const out: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    const item: unknown = descriptor?.value;
+    if (
+      descriptor === undefined ||
+      !('value' in descriptor) ||
+      typeof item !== 'string' ||
+      item.trim().length === 0
+    ) {
+      errors.push(`${path}[${index}]: must be a non-empty string`);
+      continue;
+    }
+    if (item.length > MERGE_POLICY_BOUNDS.prepareArgMaxLength) {
+      errors.push(`${path}[${index}]: must be at most ${MERGE_POLICY_BOUNDS.prepareArgMaxLength} characters`);
+      continue;
+    }
+    if (containsSecretShape(item)) {
+      errors.push(`${path}[${index}]: must not look like a credential or secret`);
+      continue;
+    }
+    if (PREPARE_FORBIDDEN_CHAR_RE.test(item)) {
+      errors.push(`${path}[${index}]: must not contain whitespace, control characters or shell metacharacters`);
+      continue;
+    }
+    if (
+      index === 0 &&
+      (item.startsWith('-') || item === '.' || item === '..' || PREPARE_PARENT_TRAVERSAL_RE.test(item))
+    ) {
+      errors.push(`${path}[0]: must be an executable name or path without flag prefix or parent traversal`);
+      continue;
+    }
+    out.push(item);
+  }
+  return out.length === value.length ? out : undefined;
+}
+
 function buildMergeRepositoryPolicy(
   projectId: string,
   fields: MergeRepositoryFields,
 ): MergeRepositoryPolicy {
   const { shadow, unattended, requiredContexts, updateBranch } = fields;
-  const { macosProcedure, maxAttempts, checksGraceMinutes, veto } = fields;
+  const { macosProcedure, maxAttempts, checksGraceMinutes, veto, prepare } = fields;
   return {
     projectId,
     ...(shadow !== undefined ? { shadow } : {}),
@@ -2667,6 +2883,7 @@ function buildMergeRepositoryPolicy(
     ...(maxAttempts !== undefined ? { maxAttempts } : {}),
     ...(checksGraceMinutes !== undefined ? { checksGraceMinutes } : {}),
     ...(veto !== undefined ? { veto } : {}),
+    ...(prepare !== undefined ? { prepare } : {}),
   };
 }
 
@@ -2712,6 +2929,9 @@ function parseMergeRepository(
       ),
     ),
     veto: ifPresent(entry, 'veto', () => parseMergeVeto(entry, path, errors)),
+    prepare: ifPresent(entry, 'prepare', () =>
+      parsePrepareArgv(entry.prepare, `${path}.prepare`, errors),
+    ),
   };
   if (errors.length !== before || projectId === undefined) {
     return undefined;
@@ -3035,11 +3255,55 @@ function readRequiredPositiveNumber(
 }
 
 /**
+ * Parse the optional `merge-veto` consumer entry (OG16c1). Absent -> undefined
+ * with no error (not configured). Present -> an object with only known keys, a
+ * required finite `monthlyBudgetUsd` greater than 0 and the acknowledgement
+ * literally true; anything else pushes a named, value-free error and the entry
+ * is not stored.
+ */
+function parseMergeVetoConsumer(
+  consumersValue: JsonObject,
+  errors: string[],
+): MergeVetoConsumerSettings | undefined {
+  if (!Object.hasOwn(consumersValue, 'merge-veto')) {
+    return undefined;
+  }
+  const entry = consumersValue['merge-veto'];
+  const entryPath = 'decisions.consumers.merge-veto';
+  if (!isJsonObject(entry)) {
+    errors.push(`${entryPath}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(entry, MERGE_VETO_CONSUMER_KEYS, entryPath, errors);
+  const monthlyBudgetUsd = readRequiredPositiveNumber(
+    entry,
+    'monthlyBudgetUsd',
+    `${entryPath}.monthlyBudgetUsd`,
+    errors,
+  );
+  const ackPath = `${entryPath}.acknowledgePullRequestTitleAndPathsLeaveHost`;
+  if (!Object.hasOwn(entry, 'acknowledgePullRequestTitleAndPathsLeaveHost')) {
+    errors.push(`${ackPath}: required`);
+    return undefined;
+  }
+  if (entry.acknowledgePullRequestTitleAndPathsLeaveHost !== true) {
+    errors.push(`${ackPath}: must be true`);
+    return undefined;
+  }
+  if (monthlyBudgetUsd === undefined) {
+    return undefined;
+  }
+  return { monthlyBudgetUsd, acknowledgePullRequestTitleAndPathsLeaveHost: true };
+}
+
+/**
  * Parse the optional per-consumer settings map of a decisions block (K3, plan
  * section 2). Unknown consumer names and unknown keys inside an entry are
  * refused; `minConfidence` must be a finite number in [0,1]; a
  * `monthlyBudgetUsd` must be finite and greater than 0; the `claim-triage`
- * acknowledgement must be literally true whenever the entry is present.
+ * acknowledgement must be literally true whenever the entry is present; the
+ * `merge-veto` entry, whenever present, requires a positive finite
+ * `monthlyBudgetUsd` and a literal `true` acknowledgement.
  * Messages name the field, never the value.
  */
 function parseDecisionConsumers(
@@ -3130,6 +3394,10 @@ function parseDecisionConsumers(
         };
       }
     }
+  }
+  const mergeVeto = parseMergeVetoConsumer(consumersValue, errors);
+  if (mergeVeto !== undefined) {
+    consumers['merge-veto'] = mergeVeto;
   }
   return consumers;
 }

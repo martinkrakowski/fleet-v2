@@ -12,6 +12,7 @@ import {
   AGY_NO_SHELL_PREAMBLE,
   AGY_REVIEW_ARGV_TEMPLATE,
   buildEmbeddedReviewPrompt,
+  CLI_NO_REPOSITORY_REASON,
   CLI_REVIEW_ARGV_TEMPLATES,
   CLI_REVIEWER_ENV_ALLOWLIST,
   createCliReviewTransport,
@@ -20,7 +21,13 @@ import {
   type CliReviewSpawn,
   type CliReviewTransportOptions,
 } from '../CliReviewTransport.adapter.js';
-import { DEFAULT_REVIEW_TIMEOUT_MS, REVIEW_CHECKLIST, REVIEW_REPLY_CONTRACT } from '../OcmReviewTransport.adapter.js';
+import {
+  DEFAULT_REVIEW_TIMEOUT_MS,
+  REVIEW_CHECKLIST,
+  REVIEW_KNOWN_FALSE_POSITIVES,
+  REVIEW_REPLY_CONTRACT,
+  UNSUPPORTED_REVIEW_KIND_REASON,
+} from '../OcmReviewTransport.adapter.js';
 import type { ReviewLocation } from '../ReviewTransportRouter.js';
 import type { SpawnRunOptions } from '../spawn-run.js';
 
@@ -991,6 +998,145 @@ describe('CliReviewTransport', () => {
       }
       expect(capturedEnv).not.toHaveProperty(planted);
       expect(CLI_REVIEWER_ENV_ALLOWLIST).not.toContain(planted);
+    });
+  });
+
+  describe('CO18a2: explicit kinds, brief-verify refused', () => {
+    const BRIEF = '1. Add the port.\n2. Wire it.';
+
+    const countedLocation = (diff: string | null = DIFF) => {
+      const calls = { head: 0, status: 0, diff: 0 };
+      const location = makeLocation({
+        readHead: async () => {
+          calls.head += 1;
+          return BASE_REQUEST.candidateHeadSha;
+        },
+        readStatus: async () => {
+          calls.status += 1;
+          return '';
+        },
+        readDiff: async () => {
+          calls.diff += 1;
+          return diff;
+        },
+      });
+      return { location, calls };
+    };
+
+    it('a brief-verify request is refused before the head, the status, the diff, the scratch dir or a spawn', async () => {
+      const { location, calls } = countedLocation();
+      const { transport, spawnCalls, scratchDirs } = buildHarness({ location });
+      await expect(transport({ ...BASE_REQUEST, kind: 'brief-verify', briefText: BRIEF })).rejects.toMatchObject({
+        name: 'ReviewTransportError',
+        code: 'transport-failed',
+        message: CLI_NO_REPOSITORY_REASON,
+      });
+      expect(calls).toEqual({ head: 0, status: 0, diff: 0 });
+      expect(spawnCalls).toHaveLength(0);
+      expect(scratchDirs).toHaveLength(0);
+    });
+
+    it('buildEmbeddedReviewPrompt refuses brief-verify with or without brief text', () => {
+      expect(() =>
+        buildEmbeddedReviewPrompt({ ...BASE_REQUEST, kind: 'brief-verify', briefText: BRIEF }, DIFF, NONCE),
+      ).toThrow(CLI_NO_REPOSITORY_REASON);
+      expect(() => buildEmbeddedReviewPrompt({ ...BASE_REQUEST, kind: 'brief-verify' }, DIFF, NONCE)).toThrow(
+        CLI_NO_REPOSITORY_REASON,
+      );
+    });
+
+    it('an unknown kind is refused before anything is read or spawned', async () => {
+      for (const kind of ['security-review', null, 'constructor']) {
+        const { location, calls } = countedLocation();
+        const { transport, spawnCalls, scratchDirs } = buildHarness({ location });
+        const request = { ...BASE_REQUEST, kind } as unknown as RunIndependentReviewRequest;
+        await expect(transport(request)).rejects.toMatchObject({
+          name: 'ReviewTransportError',
+          code: 'transport-failed',
+          message: UNSUPPORTED_REVIEW_KIND_REASON,
+        });
+        expect(calls).toEqual({ head: 0, status: 0, diff: 0 });
+        expect(spawnCalls).toHaveLength(0);
+        expect(scratchDirs).toHaveLength(0);
+      }
+    });
+
+    it('buildEmbeddedReviewPrompt refuses an unknown kind instead of using the checklist', () => {
+      for (const kind of ['security-review', null, 'constructor']) {
+        const request = { ...BASE_REQUEST, kind } as unknown as RunIndependentReviewRequest;
+        expect(() => buildEmbeddedReviewPrompt(request, DIFF, NONCE)).toThrow(
+          UNSUPPORTED_REVIEW_KIND_REASON,
+        );
+      }
+    });
+
+    it('through IndependentReviewAdapter a brief-verify request is unavailable with code transport-failed', async () => {
+      const { location } = countedLocation();
+      const { transport } = buildHarness({ location });
+      const adapter = new IndependentReviewAdapter({ runReview: transport });
+
+      const result = await adapter.runIndependentReview({ ...BASE_REQUEST, kind: 'brief-verify', briefText: BRIEF });
+
+      expect(result).toMatchObject({
+        outcome: 'unavailable',
+        code: 'transport-failed',
+        reason: CLI_NO_REPOSITORY_REASON,
+      });
+    });
+
+    it('a brief-check embedded prompt is exactly the header, the scope, the rules, the known-false-positives block, the diff, the wrapped brief, the question and the reply contract', () => {
+      const prompt = buildEmbeddedReviewPrompt(
+        { ...BASE_REQUEST, kind: 'brief-check', briefText: BRIEF },
+        DIFF,
+        NONCE,
+      );
+      const expected = [
+        `Independent read-only brief-check review for attempt "${BASE_REQUEST.attemptId}" at candidate head "${BASE_REQUEST.candidateHeadSha}".`,
+        'You have no access to the repository. The complete change under review is embedded below as a unified diff. Do not try to read, edit, create or run anything.',
+        UNTRUSTED_INPUT_RULE,
+        REVIEW_KNOWN_FALSE_POSITIVES,
+        `Diff:\n<<<UNTRUSTED nonce=${NONCE} label="diff">>>\n${DIFF}\n<<<END UNTRUSTED nonce=${NONCE}>>>`,
+        `${BRIEF_INPUT_RULE}\n\nBrief:\n<<<UNTRUSTED nonce=${NONCE} label="brief">>>\n${BRIEF}\n<<<END UNTRUSTED nonce=${NONCE}>>>\n\n` +
+          'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.',
+        REVIEW_REPLY_CONTRACT,
+      ].join('\n\n');
+      expect(prompt).toBe(expected);
+    });
+
+    it('brief-check, code-review and pre-merge still read the diff once and refuse a null or blank one', async () => {
+      for (const kind of ['brief-check', 'code-review', 'pre-merge'] as const) {
+        const briefCheck = { ...(kind === 'brief-check' ? { kind, briefText: BRIEF } : { kind }) };
+        {
+          const { location, calls } = countedLocation(null);
+          const { transport, spawnCalls } = buildHarness({ location });
+          await expect(transport({ ...BASE_REQUEST, ...briefCheck })).rejects.toThrow(
+            /cannot read the diff under review/,
+          );
+          expect(calls.diff).toBe(1);
+          expect(spawnCalls).toHaveLength(0);
+        }
+        {
+          const { location, calls } = countedLocation('  \n');
+          const { transport, spawnCalls } = buildHarness({ location });
+          await expect(transport({ ...BASE_REQUEST, ...briefCheck })).rejects.toThrow(/empty; nothing to review/);
+          expect(calls.diff).toBe(1);
+          expect(spawnCalls).toHaveLength(0);
+        }
+      }
+    });
+
+    it('a request whose kind getter throws is rejected and nothing is read or spawned', async () => {
+      const { location, calls } = countedLocation();
+      const { transport, spawnCalls } = buildHarness({ location });
+      const request = Object.defineProperty({ ...BASE_REQUEST }, 'kind', {
+        enumerable: true,
+        get() {
+          throw new Error('kind trap');
+        },
+      }) as unknown as RunIndependentReviewRequest;
+      await expect(transport(request)).rejects.toThrow('kind trap');
+      expect(calls).toEqual({ head: 0, status: 0, diff: 0 });
+      expect(spawnCalls).toHaveLength(0);
     });
   });
 });

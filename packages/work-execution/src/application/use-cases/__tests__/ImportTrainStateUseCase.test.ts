@@ -11,6 +11,10 @@ const HEAD_B = '0123456789abcdef0123456789abcdef01234568';
 const MAIN_A = `42 ${HEAD_A} main`;
 const MAIN_B = `7 ${HEAD_B} main`;
 const CHAIN_LINE = `9 ${'c'.repeat(40)} chain/example-1`;
+// Real shell parked records (SH4d): `pr head reason attempt notBefore base`.
+// notBefore is the shell's epoch-seconds now(), never an ISO timestamp.
+const PARKED_B = `7 ${HEAD_B} flaky-tests 2 1000 main`;
+const PARKED_CHAIN = `9 ${'c'.repeat(40)} chain-conflict 2 1000 chain/example-1`;
 
 /** Successive ULID literals matching /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/. */
 function createMintUlid(): () => string {
@@ -43,8 +47,29 @@ function readState(queueLines: string[], overrides: Partial<LegacyTrainStateRead
     parked: { status: 'read', lines: [] },
     chains: { status: 'read', chains: [] },
     batch: { status: 'read', lines: [] },
+    inprogress: { status: 'read', lines: [] },
     ...overrides,
   };
+}
+
+/** The report shape every non-refused result now carries; `keys` varies by fixture. */
+function emptyReportExtras(keys: readonly unknown[] = []): Record<string, unknown> {
+  return {
+    inprogressLines: 0,
+    unknownBySource: { queue: [], parked: [], inprogress: [] },
+    keys,
+    keysTruncated: false,
+  };
+}
+
+function keyFor(
+  pullRequest: number,
+  headOid: string,
+  base: string,
+  disposition: 'would-import' | 'already-queued' | 'not-importable-base' | 'legacy-in-progress',
+  source: 'queue' | 'parked' | 'inprogress' = 'queue',
+): Record<string, unknown> {
+  return { pullRequest, headOid, base, source, disposition };
 }
 
 function makeUseCase(reader: LegacyTrainStateReadPort, queue: MergeQueueRepositoryAdapter): ImportTrainStateUseCase {
@@ -78,6 +103,7 @@ describe('ImportTrainStateUseCase', () => {
       parkedLines: 0,
       chainFiles: 0,
       batchLines: 0,
+      ...emptyReportExtras([keyFor(42, HEAD_A, 'main', 'would-import'), keyFor(7, HEAD_B, 'main', 'would-import')]),
     });
     expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
   });
@@ -115,6 +141,10 @@ describe('ImportTrainStateUseCase', () => {
       parkedLines: 0,
       chainFiles: 0,
       batchLines: 0,
+      ...emptyReportExtras([
+        keyFor(42, HEAD_A, 'main', 'already-queued'),
+        keyFor(7, HEAD_B, 'main', 'would-import'),
+      ]),
     });
   });
 
@@ -135,6 +165,7 @@ describe('ImportTrainStateUseCase', () => {
       parkedLines: 0,
       chainFiles: 0,
       batchLines: 0,
+      ...emptyReportExtras([keyFor(42, HEAD_A, 'main', 'would-import'), keyFor(7, HEAD_B, 'main', 'would-import')]),
     });
 
     const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
@@ -157,11 +188,15 @@ describe('ImportTrainStateUseCase', () => {
       parkedLines: 0,
       chainFiles: 0,
       batchLines: 0,
+      ...emptyReportExtras([
+        keyFor(42, HEAD_A, 'main', 'already-queued'),
+        keyFor(7, HEAD_B, 'main', 'already-queued'),
+      ]),
     });
     expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toHaveLength(2);
   });
 
-  it('apply counts a store duplicate the snapshot missed as alreadyQueued', async () => {
+  it('apply dedupes identical queue lines into one import', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A, MAIN_A]));
     const useCase = makeUseCase(reader, queue);
@@ -179,10 +214,20 @@ describe('ImportTrainStateUseCase', () => {
       refused: 0,
       unknownLineNumbers: [],
       notImportableBase: 0,
-      alreadyQueued: 1,
+      alreadyQueued: 0,
       parkedLines: 0,
       chainFiles: 0,
       batchLines: 0,
+      ...emptyReportExtras(),
+      keys: [
+        {
+          pullRequest: 42,
+          headOid: HEAD_A,
+          base: 'main',
+          source: 'queue',
+          disposition: 'would-import',
+        },
+      ],
     });
     expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toHaveLength(1);
   });
@@ -260,6 +305,23 @@ describe('ImportTrainStateUseCase', () => {
       parkedLines: 0,
       chainFiles: 0,
       batchLines: 0,
+      ...emptyReportExtras(),
+      keys: [
+        {
+          pullRequest: 42,
+          headOid: HEAD_A,
+          base: 'main',
+          source: 'queue',
+          disposition: 'would-import',
+        },
+        {
+          pullRequest: 9,
+          headOid: 'c'.repeat(40),
+          base: 'chain/example-1',
+          source: 'queue',
+          disposition: 'not-importable-base',
+        },
+      ],
     });
     const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
     expect(entries).toHaveLength(1);
@@ -307,5 +369,430 @@ describe('ImportTrainStateUseCase', () => {
       authority: null,
     });
     expect(badDir).toEqual({ outcome: 'refused', reason: 'invalid-state-dir' });
+  });
+
+  it('a parked-only PR is listed as would-import with source parked', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], { parked: { status: 'read', lines: [PARKED_B] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: false,
+      authority: null,
+    });
+
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 1, parkedLines: 1 });
+    expect(result.outcome === 'dry-run' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'parked', disposition: 'would-import' },
+    ]);
+  });
+
+  it('an in-progress-only PR is legacy-in-progress, with source inprogress, and apply never enqueues it', async () => {
+    // The real shell (tick.sh) MOVES a line from queue to inprogress when a pass starts, rather than
+    // duplicating it into both: a PR the legacy train is actively merging normally appears in
+    // inprogress ALONE. That must still be legacy-in-progress, never an ordinary would-import
+    // candidate — queue+inprogress together is only a rare crash-leftover case, not the normal one.
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], { inprogress: { status: 'read', lines: [`7 ${HEAD_B} main`] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      authority: 'owner-grant-1',
+    });
+
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0, inprogressLines: 1 });
+    expect(result.outcome === 'applied' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'legacy-in-progress' },
+    ]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(0);
+  });
+
+  it('a pair in both queue and inprogress is legacy-in-progress, source queue wins, and apply never enqueues it', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([MAIN_B], { inprogress: { status: 'read', lines: [MAIN_B] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      authority: 'owner-grant-1',
+    });
+
+    // The legacy shell train is actively merging this PR right now (it is
+    // live in BOTH the queue and the in-progress file): it must never be
+    // reported as an ordinary would-import candidate, and apply must never
+    // enqueue it alongside whatever the legacy train is doing.
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
+    expect(result.outcome === 'applied' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'queue', disposition: 'legacy-in-progress' },
+    ]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(0);
+  });
+
+  it('a pair in inprogress only (no queue) is still legacy-in-progress: the normal case, not the rare one', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], { inprogress: { status: 'read', lines: [MAIN_B] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      authority: 'owner-grant-1',
+    });
+
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
+    expect(result.outcome === 'applied' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'legacy-in-progress' },
+    ]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(0);
+  });
+
+  it('a PR with two different heads, one queued and one in progress, disposes BOTH keys legacy-in-progress', async () => {
+    // enqueue.sh only refuses a second queue line for a PR NUMBER already in the queue file; it never
+    // checks inprogress. So a PR can get a fresh queue line (a new push) while its older head is still
+    // in progress: same PR, two distinct (pullRequest, headOid) pairs. The hazard must be checked by PR
+    // number alone, or the new-head queue entry would slip through as would-import.
+    const queue = new MergeQueueRepositoryAdapter();
+    const queueLine = `7 ${HEAD_A} main`; // PR 7, a new head, freshly re-enqueued
+    const inProgressLine = `7 ${HEAD_B} main`; // PR 7, the older head the legacy shell is still merging
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([queueLine], { inprogress: { status: 'read', lines: [inProgressLine] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      authority: 'owner-grant-1',
+    });
+
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
+    expect(result.outcome === 'applied' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_A, base: 'main', source: 'queue', disposition: 'legacy-in-progress' },
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'legacy-in-progress' },
+    ]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(0);
+  });
+
+  it('a pair in queue only (no inprogress) is unaffected: still would-import', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_B]));
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      authority: 'owner-grant-1',
+    });
+
+    expect(result).toMatchObject({ outcome: 'applied', imported: 1 });
+    expect(result.outcome === 'applied' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'queue', disposition: 'would-import' },
+    ]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(1);
+  });
+
+  it('a pair in both queue and parked is one key whose source is queue', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([MAIN_B], { parked: { status: 'read', lines: [PARKED_B] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: false,
+      authority: null,
+    });
+
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 1 });
+    expect(result.outcome === 'dry-run' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'queue', disposition: 'would-import' },
+    ]);
+  });
+
+  it('the same PR and head on two different bases across sources still dedupes to one key', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const chainLine = `7 ${HEAD_B} chain/foo`;
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([chainLine], { parked: { status: 'read', lines: [PARKED_B] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: false,
+      authority: null,
+    });
+
+    // The queue entry (chain/foo) and the parked entry (main) share the same
+    // (pullRequest, headOid) pair, so base must not split them into two
+    // candidates: exactly one key results, and the earlier source (queue)
+    // wins per the source-order rule, carrying its own base through.
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 0, notImportableBase: 1 });
+    expect(result.outcome === 'dry-run' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'chain/foo', source: 'queue', disposition: 'not-importable-base' },
+    ]);
+  });
+
+  it('a parked or in-progress entry on a chain base is not importable', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], {
+        parked: { status: 'read', lines: [PARKED_CHAIN] },
+        inprogress: { status: 'read', lines: [`11 ${'d'.repeat(40)} chain/other`] },
+      }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: false,
+      authority: null,
+    });
+
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 0, notImportableBase: 2 });
+    expect(result.outcome === 'dry-run' && result.keys).toEqual([
+      { pullRequest: 11, headOid: 'd'.repeat(40), base: 'chain/other', source: 'inprogress', disposition: 'not-importable-base' },
+      { pullRequest: 9, headOid: 'c'.repeat(40), base: 'chain/example-1', source: 'parked', disposition: 'not-importable-base' },
+    ]);
+  });
+
+  it('501 distinct keys are capped at 500 with keysTruncated', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const many = Array.from({ length: 501 }, (_, i) => `${100 + i} ${String(i).padStart(40, '0')} main`);
+    const reader = new FakeLegacyTrainStateReadPort(readState(many));
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: false,
+      authority: null,
+    });
+
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 501, keysTruncated: true });
+    if (result.outcome !== 'dry-run') {
+      throw new Error('expected dry-run');
+    }
+    expect(result.keys).toHaveLength(500);
+    expect(result.keys[0]).toEqual({
+      pullRequest: 100,
+      headOid: '0'.repeat(40),
+      base: 'main',
+      source: 'queue',
+      disposition: 'would-import',
+    });
+    expect(result.keys[499]).toMatchObject({ pullRequest: 599 });
+  });
+
+  it('a missing inprogress state refuses legacy-unreadable', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const state = readState([MAIN_A]);
+    delete (state as { inprogress?: unknown }).inprogress;
+    const reader = new FakeLegacyTrainStateReadPort(state);
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: false,
+      authority: null,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'legacy-unreadable' });
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('an unreadable inprogress state refuses legacy-unreadable', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([MAIN_A], { inprogress: { status: 'unreadable' } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      authority: 'owner-grant-1',
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'legacy-unreadable' });
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('a secret-shaped line in parked or inprogress refuses wholesale', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const secret = `gh${'p_'}${'A'.repeat(30)}`;
+    const useCase = makeUseCase(
+      new FakeLegacyTrainStateReadPort(readState([MAIN_A], { parked: { status: 'read', lines: [secret] } })),
+      queue,
+    );
+    const parkedRefusal = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: false,
+      authority: null,
+    });
+    expect(parkedRefusal).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
+
+    const inprogressRefusal = await makeUseCase(
+      new FakeLegacyTrainStateReadPort(readState([MAIN_A], { inprogress: { status: 'read', lines: [secret] } })),
+      new MergeQueueRepositoryAdapter(),
+    ).importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false, authority: null });
+    expect(inprogressRefusal).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
+  });
+
+  it('apply imports a parked entry once, then reports it already-queued', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([MAIN_A], { parked: { status: 'read', lines: [PARKED_B] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+    const request = { repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' } as const;
+
+    const first = await useCase.importTrainState(request);
+    expect(first).toMatchObject({ outcome: 'applied', imported: 2 });
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(2);
+    expect(entries.some((entry) => entry.pullRequest === 7 && entry.headOid === HEAD_B)).toBe(true);
+
+    const second = await useCase.importTrainState(request);
+    expect(second).toMatchObject({ outcome: 'applied', imported: 0, alreadyQueued: 2 });
+    expect(second.outcome === 'applied' && second.keys).toEqual([
+      { pullRequest: 42, headOid: HEAD_A, base: 'main', source: 'queue', disposition: 'already-queued' },
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'parked', disposition: 'already-queued' },
+    ]);
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toHaveLength(2);
+  });
+
+  it('unknownBySource reports each source independently', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const garbage = 'NOT-A-QUEUE-LINE';
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([MAIN_A, garbage], {
+        parked: { status: 'read', lines: [PARKED_B, garbage] },
+        inprogress: { status: 'read', lines: [garbage] },
+      }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: false,
+      authority: null,
+    });
+
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 2 });
+    expect(result.outcome === 'dry-run' && result.unknownBySource).toEqual({
+      queue: [2],
+      parked: [2],
+      inprogress: [1],
+    });
+    expect(result.outcome === 'dry-run' && result.unknownLineNumbers).toEqual([2]);
+  });
+
+  it('a real 6-field parked line imports with its disposition and persisted entry', async () => {
+    // The real shell parked file is `pr head reason attempt notBefore base`
+    // (tick.sh). Before SH4f this use case parsed it with the 3-field queue
+    // parser, so every real parked line was an unknown line and never an
+    // import candidate. The extra reason/attempt/notBefore fields are parsed
+    // and validated but the shared import logic needs only pr/head/base.
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], { parked: { status: 'read', lines: [PARKED_B] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const dryRun = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false, authority: null });
+    expect(dryRun).toMatchObject({ outcome: 'dry-run', wouldImport: 1, unknownBySource: { parked: [] } });
+    expect(dryRun.outcome === 'dry-run' && dryRun.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'parked', disposition: 'would-import' },
+    ]);
+
+    const applied = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' });
+    expect(applied).toMatchObject({ outcome: 'applied', imported: 1 });
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ pullRequest: 7, headOid: HEAD_B });
+  });
+
+  it('a parked line with any one of its 6 fields wrong is an unknown parked line', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], {
+        parked: {
+          status: 'read',
+          lines: [
+            `0x7 ${HEAD_B} reason 1 1000 main`, // bad pr
+            `7 nothex40 reason 1 1000 main`, // bad head
+            `7 ${HEAD_B} ${'r'.repeat(129)} 1 1000 main`, // reason over 128 chars
+            `7 ${HEAD_B} reason -1 1000 main`, // bad attempt
+            `7 ${HEAD_B} reason 1 2026-11-17T00:00:00Z main`, // notBefore is epoch seconds, never ISO
+            `7 ${HEAD_B} reason 1 1000 chain/Bad`, // bad base
+            `7 ${HEAD_B} reason 1 1000`, // only 5 fields
+            `7 ${HEAD_B} reason 1 1000 main extra`, // 7 fields
+            `7 ${HEAD_B} main`, // the old 3-field queue shape is NOT a parked record
+          ],
+        },
+      }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false, authority: null });
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 0 });
+    expect(result.outcome === 'dry-run' && result.unknownBySource).toEqual({
+      queue: [],
+      inprogress: [],
+      parked: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    });
+    expect(result.outcome === 'dry-run' && result.keys).toEqual([]);
+  });
+
+  it('a parked entry sharing a pair with an inprogress entry dedupes with source inprogress', async () => {
+    // Source-order rule from SH4c: queue > inprogress > parked wins.
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], {
+        inprogress: { status: 'read', lines: [`7 ${HEAD_B} main`] },
+        parked: { status: 'read', lines: [PARKED_B] },
+      }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' });
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
+    expect(result.outcome === 'applied' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'legacy-in-progress' },
+    ]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(0);
   });
 });

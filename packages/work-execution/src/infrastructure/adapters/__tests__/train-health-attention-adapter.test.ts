@@ -400,6 +400,16 @@ describe('TrainHealthAttentionAdapter', () => {
     expect(getterCalls).toBe(0);
   });
 
+  it('a delegate raised result whose previousRaisedAtIso is a string is a failed raise', async () => {
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: async () => ({ outcome: 'raised', previousRaisedAtIso: RAISED_AT }),
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refused',
+      reasonCode: 'unreadable',
+    });
+  });
+
   it('returns previousRaisedAtIso of the first raise on a second raise, stored as given', async () => {
     const SECOND = '2026-11-16T09:02:03.000Z';
     let storedIso: string | null = null;

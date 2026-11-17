@@ -347,6 +347,11 @@ function mapRaiseAnswer(answer: unknown): RaiseTrainHealthAttentionResult {
   if (!previous.ok) {
     return refusedUnreadable();
   }
+  // `raised` means no prior record: the contract requires exactly `null`,
+  // never a timestamp masquerading as a first raise.
+  if (mapped.outcome === 'raised' && previous.value !== null) {
+    return refusedUnreadable();
+  }
   return { ...mapped, previousRaisedAtIso: previous.value };
 }
 

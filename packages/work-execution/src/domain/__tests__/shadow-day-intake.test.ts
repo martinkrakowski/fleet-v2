@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { evaluateShadowIntake, SHADOW_INTAKE_MIN_GAP_MS } from '../shadow-day-intake.js';
+import { SHADOW_DIVERGENCE_MAX } from '../shadow-comparators.js';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const T0 = '2026-11-17T10:00:00Z';
@@ -13,6 +14,11 @@ const T_PLUS_60S = '2026-11-17T10:01:00Z';
 /** One enqueue key built from inert pieces. */
 function key(pullRequest: number, headOid: string = HEAD, base: string = 'main') {
   return { pullRequest, headOid, base };
+}
+
+/** `count` keys whose pull requests run `from`..`from + count - 1`. */
+function rangeKeys(from: number, count: number) {
+  return Array.from({ length: count }, (_, index) => key(from + index));
 }
 
 /** One sample; every field is an own data property. */
@@ -71,6 +77,28 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [] },
     );
     expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+  });
+
+  it('a shared divergence beyond the 50-entry cap in both samples still fails as enqueue-coverage-divergence', () => {
+    const transient = rangeKeys(10, SHADOW_DIVERGENCE_MAX + 10);
+    const shared = key(70);
+    const input = twoSamples(
+      { shellLive: [shared], fleetLive: transient, importPresent: [shared] },
+      { shellLive: [...transient, shared], fleetLive: [], importPresent: [...transient, shared] },
+    );
+    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+  });
+
+  it('a shared import divergence beyond the 50-entry cap in both samples still fails as import-divergence', () => {
+    const parked = rangeKeys(10, SHADOW_DIVERGENCE_MAX + 11);
+    const shared = key(999);
+    const transientFirst = rangeKeys(80, SHADOW_DIVERGENCE_MAX + 10);
+    const transientSecond = rangeKeys(500, SHADOW_DIVERGENCE_MAX + 10);
+    const input = twoSamples(
+      { shellLive: [...parked, shared], fleetLive: [...parked, shared], importPresent: [...parked, ...transientFirst] },
+      { shellLive: [...parked, shared], fleetLive: [...parked, shared], importPresent: [...parked, ...transientSecond] },
+    );
+    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'import-divergence' });
   });
 
   it('the import dry-run missing a parked key in both samples fails as import-divergence', () => {

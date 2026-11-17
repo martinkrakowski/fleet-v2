@@ -196,8 +196,22 @@ function sampleComparisons(sample: ValidatedSample): { readonly a: ShadowCompari
   };
 }
 
-/** True when the two comparisons share at least one (key, code) divergence. */
+/**
+ * True when the two comparisons share at least one (key, code) divergence.
+ * Each comparison lists at most `SHADOW_DIVERGENCE_MAX` divergences (sorted
+ * by key) and sets `truncated` for the rest, so a shared divergence can sit
+ * beyond the cap and be unlisted in either sample. Truncation is therefore
+ * fail-closed wherever the other sample's list shows divergences of its own:
+ * only a sample whose complete divergence list is empty can prove that
+ * nothing was shared, because an empty list is never truncated.
+ */
 function sharedDivergence(first: ShadowComparisonResult, second: ShadowComparisonResult): boolean {
+  if (first.truncated && second.divergences.length > 0) {
+    return true;
+  }
+  if (second.truncated && first.divergences.length > 0) {
+    return true;
+  }
   const codes = new Set(first.divergences.map((divergence) => `${divergence.key}\u0000${divergence.code}`));
   return second.divergences.some((divergence) => codes.has(`${divergence.key}\u0000${divergence.code}`));
 }
@@ -229,7 +243,10 @@ function persistentChainBase(first: readonly ValidatedKey[], second: readonly Va
  * (`import-unknown-lines`, checked before the B comparison), a persistent
  * import-fidelity divergence fails (`import-divergence`), a chain-base shell
  * key present in both samples fails (`chain-base-not-importable`), and
- * otherwise the intake is equal.
+ * otherwise the intake is equal. A comparison whose divergence list is
+ * truncated counts as divergent whenever the other sample shows divergences
+ * of its own: a divergence beyond the listing cap cannot be ruled out as
+ * non-persistent.
  *
  * Cost: linear in the capped input — at most two samples, each with four
  * lists capped at `SHADOW_INTAKE_MAX_KEYS` keys, each key and field read once

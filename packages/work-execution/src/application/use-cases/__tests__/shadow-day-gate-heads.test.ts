@@ -276,6 +276,63 @@ describe('readShadowGateHeads', () => {
     expect(result.heads.every((head) => head.conductorVerdict === 'pass' && head.ciGate === 'success')).toBe(true);
   });
 
+  it('breaks ties on equal pushedAtIso by headOid order', async () => {
+    // Inserted in descending headOid order on purpose: a missing or wrong
+    // `headOid` tie-breaker would leave them unsorted and fail this test.
+    const first = passingRun(RUN_1, ATTEMPT_1, HEAD_12_2, HEAD_2, '2026-11-27T12:00:00.000Z');
+    const second = passingRun(RUN_2, ATTEMPT_2, HEAD_12_1, HEAD_1, '2026-11-27T12:00:00.000Z');
+    const fakes = makeFakes({
+      runRecords: [first.run, second.run],
+      journals: new Map([
+        [first.run.runId, first.entries],
+        [second.run.runId, second.entries],
+      ]),
+      attemptsById: new Map([
+        [ATTEMPT_1, first.attempt],
+        [ATTEMPT_2, second.attempt],
+      ]),
+    });
+    const result = await readShadowGateHeads(fakes.deps, request());
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') {
+      return;
+    }
+    expect(result.heads.map((head) => head.pushedAtIso)).toEqual([
+      '2026-11-27T12:00:00.000Z',
+      '2026-11-27T12:00:00.000Z',
+    ]);
+    expect(result.heads.map((head) => head.headOid)).toEqual([HEAD_1, HEAD_2]);
+  });
+
+  it('refuses deadline-exceeded with zero runs.list calls when the deadline passes after the initial check', async () => {
+    let reads = 0;
+    const fakes = makeFakes({
+      nowIso: (): string => {
+        reads += 1;
+        return reads === 1 ? NOW_ISO : '2026-12-01T00:00:00.000Z';
+      },
+    });
+    const result = await readShadowGateHeads(fakes.deps, request());
+    expect(result).toEqual({ status: 'unknown', reason: 'deadline-exceeded' });
+    expect(fakes.runsListCalls).toBe(0);
+    expect(fakes.forgeCalls).toEqual([]);
+  });
+
+  it('refuses journal-unreadable when listForRuns returns more entries than were requested', async () => {
+    const first = passingRun(RUN_1, ATTEMPT_1, HEAD_12_1, HEAD_1, '2026-11-27T10:00:00.000Z');
+    const extra = passingRun(RUN_2, ATTEMPT_2, HEAD_12_2, HEAD_2, '2026-11-27T12:00:00.000Z');
+    const fakes = makeFakes({
+      runRecords: [first.run],
+      listForRuns: async () =>
+        new Map<string, readonly LaneRunJournalEntryRecord[]>([
+          [RUN_1, first.entries],
+          [RUN_2, extra.entries],
+        ]),
+    });
+    const result = await readShadowGateHeads(fakes.deps, request());
+    expect(result).toEqual({ status: 'unknown', reason: 'journal-unreadable' });
+  });
+
   it('omits a head pushed on D-3, outside the trailing window', async () => {
     const first = passingRun(RUN_1, ATTEMPT_1, HEAD_12_1, HEAD_1, BEFORE_WINDOW_ISO);
     const fakes = makeFakes({

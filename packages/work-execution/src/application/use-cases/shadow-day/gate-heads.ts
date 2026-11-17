@@ -258,7 +258,8 @@ function gateVerdictOf(
 /**
  * Every requested run's journal in one call through `listForRuns` when the
  * port carries it, else one `listForRun` per run. A throw, a non-`Map`, a
- * missing requested id, a non-array entry list or a past deadline refuses
+ * result holding more entries than were requested, a missing requested id, a
+ * non-array entry list for a requested run or a past deadline refuses
  * the whole answer — never a defaulted empty list. Cost: linear in the
  * capped runs; the cap (`SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN`) is checked
  * by the caller per run.
@@ -283,19 +284,29 @@ async function readRunJournals(
       refuse('journal-unreadable');
     }
     const map = grouped as Map<unknown, unknown>;
+    // The result is bounded before any traversal: a Map holding more entries
+    // than were requested is refused outright, and only the requested run ids
+    // are then validated and read, each by an O(1) key lookup — the scan can
+    // never grow with unrequested keys.
+    if (map.size > runIds.length) {
+      refuse('journal-unreadable');
+    }
     readOrRefuse('journal-unreadable', () => {
       for (const runId of runIds) {
         if (!map.has(runId)) {
           refuse('journal-unreadable');
         }
       }
-      for (const entries of map.values()) {
-        if (!Array.isArray(entries)) {
-          refuse('journal-unreadable');
-        }
-      }
     });
-    return map as ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>;
+    const byRunId = new Map<string, readonly LaneRunJournalEntryRecord[]>();
+    for (const runId of runIds) {
+      const entries = map.get(runId);
+      if (!Array.isArray(entries)) {
+        refuse('journal-unreadable');
+      }
+      byRunId.set(runId, entries as readonly LaneRunJournalEntryRecord[]);
+    }
+    return byRunId;
   }
   const byRunId = new Map<string, readonly LaneRunJournalEntryRecord[]>();
   for (const runId of runIds) {
@@ -621,6 +632,9 @@ async function readRunRecordsOrRefuse(
   runs: Pick<LaneRunRepositoryPort, 'list'>,
   isPast: () => boolean,
 ): Promise<readonly LaneRunRecord[]> {
+  if (isPast()) {
+    refuse('deadline-exceeded');
+  }
   let listed: readonly LaneRunRecord[];
   try {
     listed = await runs.list();
@@ -637,9 +651,6 @@ async function readRunRecordsOrRefuse(
   }
   if (runCount > SHADOW_FACTS_MAX_RUNS) {
     refuse('too-many-runs');
-  }
-  if (isPast()) {
-    refuse('deadline-exceeded');
   }
   // The stored runs are read once, each element through its own data-property
   // descriptor, into a private array: a store-provided array is never

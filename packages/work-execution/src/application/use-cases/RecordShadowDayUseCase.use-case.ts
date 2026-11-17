@@ -23,7 +23,7 @@ import {
   type ShadowLedger,
 } from '../../domain/shadow-evidence-ledger.js';
 import { parseLegacyTrainParkedQueue, parseLegacyTrainQueue } from '../../domain/legacy-train-queue.js';
-import { evaluateShadowIntake } from '../../domain/shadow-day-intake.js';
+import { evaluateShadowIntake, type ShadowIntakeEvaluation } from '../../domain/shadow-day-intake.js';
 import { parseShellTrainEvents, type ShellTrainEvent } from '../../domain/shell-train-events.js';
 import type { ImportTrainStatePort } from '../ports/in/ImportTrainStatePort.in-port.js';
 import type {
@@ -99,6 +99,8 @@ type CriterionOutcome =
       readonly evaluation: ShadowCriterionEvaluation;
       /** Present only for S1: the merge-set evaluation the counts come from. */
       readonly mergeSet?: ShadowDayMergeSetEvaluation;
+      /** Present only for S8: the intake evaluation the comparison counts come from. */
+      readonly intake?: ShadowIntakeEvaluation;
     }
   | { readonly criterion: CutoverShadowCriterion; readonly kind: 'unevaluated'; readonly reason: string };
 
@@ -517,7 +519,8 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // divergence that resolves itself immediately after.
     await this.deps.sleep(this.deps.settings.sampleGapMs ?? DEFAULT_SAMPLE_GAP_MS);
     const second = await this.intakeSample(context);
-    return { criterion: 'S8', kind: 'evaluated', evaluation: evaluateShadowIntake({ samples: [first, second] }) };
+    const evaluation = evaluateShadowIntake({ samples: [first, second] });
+    return { criterion: 'S8', kind: 'evaluated', evaluation, intake: evaluation };
   }
 
   /** The state-check sample, or null when unavailable. */
@@ -575,6 +578,13 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * The canonical summary one verdict's digest is computed over: keys in the
    * fixed order `criterion`, `day`, `status`, `reason`, then the evaluator's
    * own numeric counts — for S1 also `excludeBatchMerges`, after the counts.
+   *
+   * `mergeSet` (S1 only) and `intake` (S8 only) are each set by exactly one
+   * criterion builder (`evaluateMergeSetCriterion`, `evaluateIntakeCriterion`
+   * respectively) and never both on the same outcome, so checking `mergeSet`
+   * first can never silently shadow a real `intake` value: an outcome with
+   * `intake` set always has `mergeSet === undefined`, by construction, not
+   * by this ordering.
    */
   private canonicalSummary(context: DayContext, outcome: Extract<CriterionOutcome, { kind: 'evaluated' }>): string {
     const base = {
@@ -583,17 +593,30 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       status: outcome.evaluation.status,
       reason: outcome.evaluation.reason,
     };
-    if (outcome.mergeSet === undefined) {
-      return JSON.stringify(base);
+    if (outcome.mergeSet !== undefined) {
+      return JSON.stringify({
+        ...base,
+        mergesCompared: outcome.mergeSet.mergesCompared,
+        excludedBatchMerges: outcome.mergeSet.excludedBatchMerges,
+        compared: outcome.mergeSet.compared,
+        divergences: outcome.mergeSet.divergences,
+        excludeBatchMerges: this.deps.settings.excludeBatchMerges,
+      });
     }
-    return JSON.stringify({
-      ...base,
-      mergesCompared: outcome.mergeSet.mergesCompared,
-      excludedBatchMerges: outcome.mergeSet.excludedBatchMerges,
-      compared: outcome.mergeSet.compared,
-      divergences: outcome.mergeSet.divergences,
-      excludeBatchMerges: this.deps.settings.excludeBatchMerges,
-    });
+    if (outcome.intake !== undefined) {
+      return JSON.stringify({
+        ...base,
+        aFleetCount: outcome.intake.aFleetCount,
+        aShellCount: outcome.intake.aShellCount,
+        aCompared: outcome.intake.aCompared,
+        aDivergences: outcome.intake.aDivergences,
+        bFleetCount: outcome.intake.bFleetCount,
+        bShellCount: outcome.intake.bShellCount,
+        bCompared: outcome.intake.bCompared,
+        bDivergences: outcome.intake.bDivergences,
+      });
+    }
+    return JSON.stringify(base);
   }
 
   /** The definite verdicts, the unevaluated reasons and S1's merge count. */

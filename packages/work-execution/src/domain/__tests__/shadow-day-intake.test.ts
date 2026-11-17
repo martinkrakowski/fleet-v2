@@ -58,7 +58,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: shellLive, importPresent: [key(1), key(2)] },
       { shellLive, fleetLive: shellLive, importPresent: [key(1), key(2)] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'pass', reason: 'intake-equal' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'pass', reason: 'intake-equal' });
   });
 
   it('a divergence present in sample 1 only, resolved by sample 2, is not persistent and passes', () => {
@@ -67,7 +67,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [], importPresent: [] },
       { shellLive, fleetLive: [key(1)], importPresent: [key(1)] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'pass', reason: 'intake-equal' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'pass', reason: 'intake-equal' });
   });
 
   it('the same divergence present in both samples fails as enqueue-coverage-divergence', () => {
@@ -76,7 +76,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [] },
       { shellLive, fleetLive: [] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'fail', reason: 'enqueue-coverage-divergence' });
   });
 
   it('a shared divergence beyond the 50-entry cap in both samples still fails as enqueue-coverage-divergence', () => {
@@ -85,7 +85,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive: missing, fleetLive: [], importPresent: missing },
       { shellLive: missing, fleetLive: [], importPresent: missing },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'fail', reason: 'enqueue-coverage-divergence' });
   });
 
   it('a shared import divergence beyond the 50-entry cap in both samples still fails as import-divergence', () => {
@@ -94,7 +94,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive: parked, fleetLive: parked, importPresent: [] },
       { shellLive: parked, fleetLive: parked, importPresent: [] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'import-divergence' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'fail', reason: 'import-divergence' });
   });
 
   it('a truncated sample beside a single different divergence in the other sample is not persistent and passes', () => {
@@ -102,7 +102,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive: rangeKeys(10, SHADOW_DIVERGENCE_MAX + 1), fleetLive: [], importPresent: [] },
       { shellLive: [key(999)], fleetLive: [], importPresent: [] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'pass', reason: 'intake-equal' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'pass', reason: 'intake-equal' });
   });
 
   it('a divergence hidden beyond the cap in one sample and listed in the other is persistent and fails', () => {
@@ -111,7 +111,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive: first, fleetLive: [], importPresent: [] },
       { shellLive: [key(10 + SHADOW_DIVERGENCE_MAX)], fleetLive: [], importPresent: [] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'fail', reason: 'enqueue-coverage-divergence' });
   });
 
   it('the import dry-run missing a parked key in both samples fails as import-divergence', () => {
@@ -120,7 +120,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [key(1)], importPresent: [] },
       { shellLive, fleetLive: [key(1)], importPresent: [] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'import-divergence' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'fail', reason: 'import-divergence' });
   });
 
   it('a chain-base shell key present in both samples fails as chain-base-not-importable', () => {
@@ -129,7 +129,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [key(1, HEAD, 'chain/a')], importPresent: [] },
       { shellLive, fleetLive: [key(1, HEAD, 'chain/a')], importPresent: [] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'chain-base-not-importable' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'fail', reason: 'chain-base-not-importable' });
   });
 
   it('a chain-base shell key present in only one sample is a snapshot artifact and passes', () => {
@@ -137,27 +137,27 @@ describe('shadow day intake (S8)', () => {
       { shellLive: [key(1, HEAD, 'chain/a')], fleetLive: [key(1, HEAD, 'chain/a')], importPresent: [] },
       { shellLive: [], fleetLive: [], importPresent: [] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'pass', reason: 'intake-equal' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'pass', reason: 'intake-equal' });
   });
 
   it('a gap between the two samples of only 60 seconds is samples-invalid', () => {
     const input = twoSamples({}, { takenAtIso: T_PLUS_60S });
     expect(SHADOW_INTAKE_MIN_GAP_MS).toBe(120_000);
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('either sample marked incomplete is shell-state-incomplete', () => {
     const oneIncomplete = twoSamples({ complete: false });
-    expect(evaluateShadowIntake(oneIncomplete)).toEqual({ status: 'unknown', reason: 'shell-state-incomplete' });
+    expect(evaluateShadowIntake(oneIncomplete)).toMatchObject({ status: 'unknown', reason: 'shell-state-incomplete' });
     const otherIncomplete = twoSamples({}, { complete: false });
-    expect(evaluateShadowIntake(otherIncomplete)).toEqual({ status: 'unknown', reason: 'shell-state-incomplete' });
+    expect(evaluateShadowIntake(otherIncomplete)).toMatchObject({ status: 'unknown', reason: 'shell-state-incomplete' });
   });
 
   it('either sample with importPresent null is import-unavailable', () => {
     const firstNull = twoSamples({ importPresent: null });
-    expect(evaluateShadowIntake(firstNull)).toEqual({ status: 'unknown', reason: 'import-unavailable' });
+    expect(evaluateShadowIntake(firstNull)).toMatchObject({ status: 'unknown', reason: 'import-unavailable' });
     const secondNull = twoSamples({}, { importPresent: null });
-    expect(evaluateShadowIntake(secondNull)).toEqual({ status: 'unknown', reason: 'import-unavailable' });
+    expect(evaluateShadowIntake(secondNull)).toMatchObject({ status: 'unknown', reason: 'import-unavailable' });
   });
 
   it('importUnknownLines wins: fail/import-unknown-lines is returned before the B divergence check', () => {
@@ -166,69 +166,69 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [key(1)], importPresent: [], importUnknownLines: 2 },
       { shellLive, fleetLive: [key(1)], importPresent: [], importUnknownLines: 2 },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'import-unknown-lines' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'fail', reason: 'import-unknown-lines' });
   });
 
   it('non-persistent B divergence with unknown lines still fails on the unknown lines', () => {
     const input = twoSamples({ importPresent: [key(1)], importUnknownLines: 1 }, { importPresent: [] });
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'import-unknown-lines' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'fail', reason: 'import-unknown-lines' });
   });
 
   it('a wrong primitive (a number where the record is due) is samples-invalid', () => {
-    expect(evaluateShadowIntake(7)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(7)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('null is samples-invalid', () => {
-    expect(evaluateShadowIntake(null)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(null)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('undefined is samples-invalid', () => {
-    expect(evaluateShadowIntake(undefined)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(undefined)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('a string where the samples list is due is samples-invalid', () => {
-    expect(evaluateShadowIntake({ samples: 'nope' })).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake({ samples: 'nope' })).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('a number where takenAtIso is due is samples-invalid', () => {
     const input = twoSamples({ takenAtIso: 1_000 });
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('a non-iterable object where the samples list is due is samples-invalid', () => {
-    expect(evaluateShadowIntake({ samples: { length: 2 } })).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake({ samples: { length: 2 } })).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('an array hole in the samples list is samples-invalid', () => {
     const sparse: unknown[] = [sample(), sample()];
     delete sparse[1];
-    expect(evaluateShadowIntake({ samples: sparse })).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake({ samples: sparse })).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('an array hole in a key list is samples-invalid', () => {
     const sparse: unknown[] = [key(1)];
     delete sparse[0];
     const input = twoSamples({ shellLive: sparse }, { shellLive: sparse });
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('an array-like object { length: 2, 0: … } is samples-invalid', () => {
     const arrayLike = { length: 2, 0: sample(), 1: sample() };
-    expect(evaluateShadowIntake({ samples: arrayLike })).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake({ samples: arrayLike })).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('an enormous sparse length (2**32 - 1) is refused before any traversal', () => {
     const enormous: unknown[] = [];
     Object.defineProperty(enormous, 'length', { value: 2 ** 32 - 1 });
-    expect(evaluateShadowIntake({ samples: enormous })).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake({ samples: enormous })).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
     const input = twoSamples({ shellLive: enormous });
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('a getter nested inside the samples-list stand-in never runs', () => {
     const counter = { calls: 0 };
     const withGetter = withCountingGetter({ length: 2, 0: sample(), 1: sample() }, 'samples', counter);
-    expect(evaluateShadowIntake({ samples: withGetter })).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake({ samples: withGetter })).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
     expect(counter.calls).toBe(0);
   });
 
@@ -251,7 +251,7 @@ describe('shadow day intake (S8)', () => {
         return validSamples;
       },
     });
-    expect(evaluateShadowIntake(root)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(root)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
     expect(counter.calls).toBe(0);
   });
 
@@ -259,7 +259,7 @@ describe('shadow day intake (S8)', () => {
     const counter = { calls: 0 };
     const first = withCountingGetter(sample(), 'shellLive', counter);
     const input = { samples: [first, sample({ takenAtIso: T10 })] };
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
     expect(counter.calls).toBe(0);
   });
 
@@ -267,7 +267,7 @@ describe('shadow day intake (S8)', () => {
     const counter = { calls: 0 };
     const badKey = withCountingGetter({ pullRequest: 1, headOid: HEAD, base: 'main' }, 'pullRequest', counter);
     const input = twoSamples({ shellLive: [badKey] }, { shellLive: [badKey] });
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
     expect(counter.calls).toBe(0);
   });
 
@@ -280,7 +280,7 @@ describe('shadow day intake (S8)', () => {
         return Reflect.get(_target, property, receiver);
       },
     });
-    expect(evaluateShadowIntake(proxy)).toEqual({ status: 'pass', reason: 'intake-equal' });
+    expect(evaluateShadowIntake(proxy)).toMatchObject({ status: 'pass', reason: 'intake-equal' });
     expect(getTraps).toBe(0);
   });
 
@@ -292,7 +292,7 @@ describe('shadow day intake (S8)', () => {
         return undefined;
       },
     });
-    expect(evaluateShadowIntake(proxy)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(proxy)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
     expect(getTraps).toBe(0);
   });
 
@@ -322,21 +322,21 @@ describe('shadow day intake (S8)', () => {
       { shellLive: lyingShellLive, fleetLive: honestShellLive, importPresent: honestShellLive },
     );
     const honestResult = evaluateShadowIntake(honestInput);
-    expect(honestResult).toEqual({ status: 'pass', reason: 'intake-equal' });
+    expect(honestResult).toMatchObject({ status: 'pass', reason: 'intake-equal' });
     expect(evaluateShadowIntake(proxiedInput)).toEqual(honestResult);
     expect(getTraps).toBe(0);
   });
 
   it('a prototype-polluting __proto__ own key from JSON.parse is refused and never merged', () => {
     const polluted = JSON.parse(`{"samples": ${JSON.stringify([sample(), sample({ takenAtIso: T10 })])}, "__proto__": {"polluted": true}}`);
-    expect(evaluateShadowIntake(polluted)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(polluted)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
   it('a key with a prototype-polluting own key is refused', () => {
     const badKey = JSON.parse(`{"pullRequest": 1, "headOid": "${HEAD}", "base": "main", "constructor": "x"}`);
     const input = twoSamples({ shellLive: [badKey] }, { shellLive: [badKey] });
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('a constant-verdict function would fail: a passing input and a failing input give different verdicts', () => {
@@ -345,32 +345,32 @@ describe('shadow day intake (S8)', () => {
       { shellLive: [key(1)], fleetLive: [key(1)], importPresent: [key(1)] },
     );
     const failing = twoSamples({ shellLive: [key(1)], fleetLive: [] }, { shellLive: [key(1)], fleetLive: [] });
-    expect(evaluateShadowIntake(passing)).toEqual({ status: 'pass', reason: 'intake-equal' });
-    expect(evaluateShadowIntake(failing)).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(evaluateShadowIntake(passing)).toMatchObject({ status: 'pass', reason: 'intake-equal' });
+    expect(evaluateShadowIntake(failing)).toMatchObject({ status: 'fail', reason: 'enqueue-coverage-divergence' });
     expect(evaluateShadowIntake(passing)).not.toEqual(evaluateShadowIntake(failing));
   });
 
   it('an identity echo would fail: the result never contains the input', () => {
     const input = twoSamples({ shellLive: [key(1)], fleetLive: [] }, { shellLive: [key(1)], fleetLive: [] });
     const result = evaluateShadowIntake(input);
-    expect(result).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(result).toMatchObject({ status: 'fail', reason: 'enqueue-coverage-divergence' });
     expect(JSON.stringify(result)).not.toContain('0123456789abcdef');
     expect(JSON.stringify(result)).not.toContain('samples');
   });
 
   it('an extra sample (three) is samples-invalid', () => {
     const input = { samples: [sample(), sample({ takenAtIso: T10 }), sample()] };
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('a single sample is samples-invalid', () => {
-    expect(evaluateShadowIntake({ samples: [sample()] })).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake({ samples: [sample()] })).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('a malformed key (missing headOid) is samples-invalid', () => {
     const badKey = { pullRequest: 1, base: 'main' };
     const input = twoSamples({ shellLive: [badKey] }, { shellLive: [badKey] });
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('a non-main base in importPresent is tolerated shape-wise and compared on its own merit', () => {
@@ -388,7 +388,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [key(1)], importPresent: [key(1, HEAD, 'chain/a')] },
       { shellLive, fleetLive: [key(1)], importPresent: [key(1, HEAD, 'chain/a')] },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'fail', reason: 'import-divergence' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'fail', reason: 'import-divergence' });
   });
 
   it('a comparator drop of a secret-shaped-looking (but ordinary) base is unknown/comparator-dropped-items, not a false fail', () => {
@@ -418,7 +418,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [key(1)], importPresent },
       { shellLive, fleetLive: [key(1)], importPresent },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'comparator-dropped-items' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'comparator-dropped-items' });
   });
 
   it('the same import list with no secret-shaped-looking base is unaffected: it still passes as before', () => {
@@ -432,7 +432,7 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [key(1)], importPresent },
       { shellLive, fleetLive: [key(1)], importPresent },
     );
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'pass', reason: 'intake-equal' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'pass', reason: 'intake-equal' });
   });
 
   it('a comparator drop on comparison A (the live-coverage side) is unknown/comparator-dropped-items, not a false pass', () => {
@@ -455,19 +455,19 @@ describe('shadow day intake (S8)', () => {
     const fleetLive = [key(1), secretShapedKey];
     const importPresent = [key(1)];
     const input = twoSamples({ shellLive, fleetLive, importPresent }, { shellLive, fleetLive, importPresent });
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'comparator-dropped-items' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'comparator-dropped-items' });
   });
 
   it('a sample with extra keys is samples-invalid', () => {
     const extra = { ...sample(), extra: 1 };
     const input = { samples: [extra, sample({ takenAtIso: T10 })] };
-    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
+    expect(evaluateShadowIntake(input)).toMatchObject({ status: 'unknown', reason: 'samples-invalid' });
   });
 
   it('a returned fail verdict is frozen: an attempt to flip it to pass throws and does not corrupt a later unrelated fail call', () => {
     const divergentA = twoSamples({ shellLive: [key(1)], fleetLive: [] }, { shellLive: [key(1)], fleetLive: [] });
     const first = evaluateShadowIntake(divergentA);
-    expect(first).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(first).toMatchObject({ status: 'fail', reason: 'enqueue-coverage-divergence' });
     expect(Object.isFrozen(first)).toBe(true);
     expect(() => {
       (first as { status: string }).status = 'pass';
@@ -483,6 +483,59 @@ describe('shadow day intake (S8)', () => {
     // wrongly report 'pass'.
     const divergentB = twoSamples({ shellLive: [key(2)], fleetLive: [] }, { shellLive: [key(2)], fleetLive: [] });
     const second = evaluateShadowIntake(divergentB);
-    expect(second).toEqual({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(second).toMatchObject({ status: 'fail', reason: 'enqueue-coverage-divergence' });
+  });
+
+  it('carries S8 comparison counts (SH7b fix round 2), and two inputs sharing a status/reason can carry different counts', () => {
+    // intake-equal over a single matched key on both sides.
+    const small = twoSamples(
+      { shellLive: [key(1)], fleetLive: [key(1)], importPresent: [key(1)] },
+      { shellLive: [key(1)], fleetLive: [key(1)], importPresent: [key(1)] },
+    );
+    const smallResult = evaluateShadowIntake(small);
+    expect(smallResult).toMatchObject({
+      status: 'pass',
+      reason: 'intake-equal',
+      aFleetCount: 1,
+      aShellCount: 1,
+      aCompared: 1,
+      aDivergences: 0,
+      bFleetCount: 1,
+      bShellCount: 1,
+      bCompared: 1,
+      bDivergences: 0,
+    });
+
+    // Same status/reason (pass/intake-equal), but three matched keys instead
+    // of one: the real bug this fix round closes would make this
+    // indistinguishable from `smallResult` in the use case's digest, since
+    // both land on the same {status, reason} pair.
+    const largeKeys = rangeKeys(1, 3);
+    const largeResult = evaluateShadowIntake(
+      twoSamples(
+        { shellLive: largeKeys, fleetLive: largeKeys, importPresent: largeKeys },
+        { shellLive: largeKeys, fleetLive: largeKeys, importPresent: largeKeys },
+      ),
+    );
+    expect(largeResult).toMatchObject({ status: 'pass', reason: 'intake-equal', aCompared: 3, bCompared: 3 });
+    expect(largeResult.aCompared).not.toBe(smallResult.aCompared);
+    expect(largeResult.bCompared).not.toBe(smallResult.bCompared);
+
+    // enqueue-coverage-divergence over a single persistent missing key.
+    const oneDiverging = evaluateShadowIntake(
+      twoSamples({ shellLive: [key(1)], fleetLive: [] }, { shellLive: [key(1)], fleetLive: [] }),
+    );
+    expect(oneDiverging).toMatchObject({ status: 'fail', reason: 'enqueue-coverage-divergence', aDivergences: 1 });
+
+    // Same status/reason as `oneDiverging`, but two persistent missing keys
+    // instead of one: again the same digest-blind pair without this fix.
+    const twoDiverging = evaluateShadowIntake(
+      twoSamples(
+        { shellLive: [key(1), key(2)], fleetLive: [] },
+        { shellLive: [key(1), key(2)], fleetLive: [] },
+      ),
+    );
+    expect(twoDiverging).toMatchObject({ status: 'fail', reason: 'enqueue-coverage-divergence', aDivergences: 2 });
+    expect(twoDiverging.aDivergences).not.toBe(oneDiverging.aDivergences);
   });
 });

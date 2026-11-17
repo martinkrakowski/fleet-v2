@@ -51,6 +51,79 @@ const CHAIN_BASE: ShadowCriterionEvaluation = Object.freeze({ status: 'fail', re
 const INTAKE_EQUAL: ShadowCriterionEvaluation = Object.freeze({ status: 'pass', reason: 'intake-equal' });
 const COMPARATOR_DROPPED_ITEMS: ShadowCriterionEvaluation = Object.freeze({ status: 'unknown', reason: 'comparator-dropped-items' });
 
+/**
+ * One comparison side's counts for S8's evidence digest: the comparator's
+ * own `fleetCount`/`shellCount`/`compared`, and the length of its (capped)
+ * `divergences` list — a count, never the full list, mirroring S1's own
+ * choice (`ShadowDayMergeSetEvaluation` in `shadow-day-merge-set.ts`) to
+ * record divergence COUNTS in the digest rather than every divergence's
+ * identity.
+ */
+interface ShadowIntakeSideCounts {
+  readonly fleetCount: number;
+  readonly shellCount: number;
+  readonly compared: number;
+  readonly divergences: number;
+}
+
+const ZERO_SIDE_COUNTS: ShadowIntakeSideCounts = Object.freeze({ fleetCount: 0, shellCount: 0, compared: 0, divergences: 0 });
+
+/**
+ * The evaluation every caller of this unit receives, with S8's own
+ * comparison counts attached — mirroring S1's `ShadowDayMergeSetEvaluation`
+ * pattern exactly. S8 runs two comparisons per sample pair
+ * (`sampleComparisons`'s `a`, the live-coverage comparison of the fleet
+ * queue against the whole shell live set, and `b`, the import-fidelity
+ * comparison of the import dry-run against the shell entries on `main`), so
+ * this type carries both sides' counts, taken from the SECOND sample's
+ * comparisons: the second sample is the one closest to the moment of
+ * recording, and in every case this evaluator actually decides on
+ * persistence (both samples sharing the same divergence), the two samples'
+ * counts agree by construction — the second sample's counts are never a
+ * cherry-picked, less-representative choice than the first's. Zero on every
+ * case decided before a comparison is computed at all (`SAMPLES_INVALID`,
+ * `SHELL_STATE_INCOMPLETE`, `IMPORT_UNAVAILABLE`), exactly as
+ * `ShadowDayMergeSetEvaluation`'s own `INVALID()` reports every count as
+ * zero when S1 never got far enough to compute one either.
+ */
+export type ShadowIntakeEvaluation = ShadowCriterionEvaluation & {
+  readonly aFleetCount: number;
+  readonly aShellCount: number;
+  readonly aCompared: number;
+  readonly aDivergences: number;
+  readonly bFleetCount: number;
+  readonly bShellCount: number;
+  readonly bCompared: number;
+  readonly bDivergences: number;
+};
+
+/** One comparison's counts, read off its own result. */
+function sideCountsOf(result: ShadowComparisonResult): ShadowIntakeSideCounts {
+  return { fleetCount: result.fleetCount, shellCount: result.shellCount, compared: result.compared, divergences: result.divergences.length };
+}
+
+/**
+ * A fresh, frozen evaluation built from a named status/reason template plus
+ * the two sides' counts — never a shared object: this guarantees a caller
+ * mutating one returned evaluation can never corrupt another, unrelated
+ * call's result, matching this file's own frozen-constant pattern for the
+ * plain `{status, reason}` templates above.
+ */
+function withCounts(template: ShadowCriterionEvaluation, a: ShadowIntakeSideCounts, b: ShadowIntakeSideCounts): ShadowIntakeEvaluation {
+  return Object.freeze({
+    status: template.status,
+    reason: template.reason,
+    aFleetCount: a.fleetCount,
+    aShellCount: a.shellCount,
+    aCompared: a.compared,
+    aDivergences: a.divergences,
+    bFleetCount: b.fleetCount,
+    bShellCount: b.shellCount,
+    bCompared: b.compared,
+    bDivergences: b.divergences,
+  });
+}
+
 /** One observed enqueue key: the pull request, its head and its base branch. */
 interface ValidatedKey {
   readonly pullRequest: number;
@@ -431,57 +504,64 @@ function persistentChainBase(first: readonly ValidatedKey[], second: readonly Va
  * Never throws, never echoes an input value, never runs a getter or reaches a
  * `get` trap.
  */
-export function evaluateShadowIntake(input: unknown): ShadowCriterionEvaluation {
+export function evaluateShadowIntake(input: unknown): ShadowIntakeEvaluation {
   try {
     const samplesRaw = readExactPlainRecord(input, ['samples']);
     if (samplesRaw === null) {
-      return SAMPLES_INVALID;
+      return withCounts(SAMPLES_INVALID, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
     }
     // `pair.length` below is the length `boundedList` already read from the
     // descriptor, never a plain `.length` read on `pair.list` (which may be
     // a Proxy whose `get` trap can lie about it); see `validateKeys` above.
     const pair = boundedList(samplesRaw.samples, 2);
     if (pair === null || pair.length !== 2) {
-      return SAMPLES_INVALID;
+      return withCounts(SAMPLES_INVALID, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
     }
     const first = validateSample(ownElement(pair.list, 0));
     const second = validateSample(ownElement(pair.list, 1));
     if (first === null || second === null) {
-      return SAMPLES_INVALID;
+      return withCounts(SAMPLES_INVALID, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
     }
     const firstMs = Date.parse(first.takenAtIso);
     const secondMs = Date.parse(second.takenAtIso);
     if (Math.abs(secondMs - firstMs) < SHADOW_INTAKE_MIN_GAP_MS) {
-      return SAMPLES_INVALID;
+      return withCounts(SAMPLES_INVALID, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
     }
     if (!first.complete || !second.complete) {
-      return SHELL_STATE_INCOMPLETE;
+      return withCounts(SHELL_STATE_INCOMPLETE, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
     }
     if (first.importPresent === null || second.importPresent === null) {
-      return IMPORT_UNAVAILABLE;
+      return withCounts(IMPORT_UNAVAILABLE, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
     }
     const firstComparison = sampleComparisons(first);
     const secondComparison = sampleComparisons(second);
+    // Both sides' counts for the digest (see `ShadowIntakeEvaluation`'s doc
+    // comment): taken once, from the second sample's two comparisons, and
+    // reused for every return site below this point — every one of them is
+    // reached only after both comparisons for both samples are already
+    // computed.
+    const aCounts = sideCountsOf(secondComparison.a.result);
+    const bCounts = sideCountsOf(secondComparison.b.result);
     if (comparatorDroppedItems(firstComparison.a) || comparatorDroppedItems(secondComparison.a)) {
-      return COMPARATOR_DROPPED_ITEMS;
+      return withCounts(COMPARATOR_DROPPED_ITEMS, aCounts, bCounts);
     }
     if (sharedDivergence(firstComparison.a, secondComparison.a)) {
-      return COVERAGE_DIVERGENCE;
+      return withCounts(COVERAGE_DIVERGENCE, aCounts, bCounts);
     }
     if (first.importUnknownLines > 0 || second.importUnknownLines > 0) {
-      return UNKNOWN_LINES;
+      return withCounts(UNKNOWN_LINES, aCounts, bCounts);
     }
     if (comparatorDroppedItems(firstComparison.b) || comparatorDroppedItems(secondComparison.b)) {
-      return COMPARATOR_DROPPED_ITEMS;
+      return withCounts(COMPARATOR_DROPPED_ITEMS, aCounts, bCounts);
     }
     if (sharedDivergence(firstComparison.b, secondComparison.b)) {
-      return IMPORT_DIVERGENCE;
+      return withCounts(IMPORT_DIVERGENCE, aCounts, bCounts);
     }
     if (persistentChainBase(first.shellLive, second.shellLive)) {
-      return CHAIN_BASE;
+      return withCounts(CHAIN_BASE, aCounts, bCounts);
     }
-    return INTAKE_EQUAL;
+    return withCounts(INTAKE_EQUAL, aCounts, bCounts);
   } catch {
-    return SAMPLES_INVALID;
+    return withCounts(SAMPLES_INVALID, ZERO_SIDE_COUNTS, ZERO_SIDE_COUNTS);
   }
 }

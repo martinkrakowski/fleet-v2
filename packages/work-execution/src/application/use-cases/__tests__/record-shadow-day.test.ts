@@ -392,8 +392,42 @@ function expectedS1Digest(day: string, status: string, reason: string, counts: {
   );
 }
 
-function expectedSimpleDigest(criterion: 'S8' | 'S9' | 'S12', day: string, status: string, reason: string): string {
+function expectedSimpleDigest(criterion: 'S9' | 'S12', day: string, status: string, reason: string): string {
   return sha256HexDigest(JSON.stringify({ criterion, day, status, reason }));
+}
+
+/**
+ * The canonical S8 summary digest, rebuilt here exactly as the use case
+ * builds it (SH7b fix round 2): S8, like S1, now carries its evaluator's
+ * own comparison counts into the digest, so two evaluations landing on the
+ * same {status, reason} pair are no longer indistinguishable to it.
+ */
+function expectedS8Digest(day: string, status: string, reason: string, counts: {
+  aFleetCount: number;
+  aShellCount: number;
+  aCompared: number;
+  aDivergences: number;
+  bFleetCount: number;
+  bShellCount: number;
+  bCompared: number;
+  bDivergences: number;
+}): string {
+  return sha256HexDigest(
+    JSON.stringify({
+      criterion: 'S8',
+      day,
+      status,
+      reason,
+      aFleetCount: counts.aFleetCount,
+      aShellCount: counts.aShellCount,
+      aCompared: counts.aCompared,
+      aDivergences: counts.aDivergences,
+      bFleetCount: counts.bFleetCount,
+      bShellCount: counts.bShellCount,
+      bCompared: counts.bCompared,
+      bDivergences: counts.bDivergences,
+    }),
+  );
 }
 
 /** Every not-yet-built criterion is always in `unevaluated`, exactly once. */
@@ -436,7 +470,18 @@ describe('RecordShadowDayUseCase', () => {
         divergences: 0,
       }),
     );
-    expect(dayRecord?.verdicts.S8?.digest).toBe(expectedSimpleDigest('S8', DAY, 'pass', 'intake-equal'));
+    expect(dayRecord?.verdicts.S8?.digest).toBe(
+      expectedS8Digest(DAY, 'pass', 'intake-equal', {
+        aFleetCount: 1,
+        aShellCount: 1,
+        aCompared: 1,
+        aDivergences: 0,
+        bFleetCount: 1,
+        bShellCount: 1,
+        bCompared: 1,
+        bDivergences: 0,
+      }),
+    );
     expect(dayRecord?.verdicts.S9?.digest).toBe(expectedSimpleDigest('S9', DAY, 'pass', 'state-consistent'));
     expect(dayRecord?.verdicts.S12?.digest).toBe(expectedSimpleDigest('S12', DAY, 'pass', 'ticks-within-budget'));
     expectNotImplementedUnevaluated(result.unevaluated);
@@ -623,7 +668,75 @@ describe('RecordShadowDayUseCase', () => {
     const dayRecord = stored?.days.find((entry) => entry.day === DAY);
     expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
     expect(dayRecord?.verdicts.S8?.digest).toBe(
-      expectedSimpleDigest('S8', DAY, 'fail', 'enqueue-coverage-divergence'),
+      expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
+        aFleetCount: 1,
+        aShellCount: 2,
+        aCompared: 1,
+        aDivergences: 1,
+        bFleetCount: 1,
+        bShellCount: 2,
+        bCompared: 1,
+        bDivergences: 1,
+      }),
+    );
+  });
+
+  it('two S8 evaluations with the same status/reason but different comparison counts get different digests (SH7b fix round 2)', async () => {
+    const HEAD_C = 'd'.repeat(40);
+
+    const fixtureA = cleanFixture(DAY);
+    fixtureA.shellState = {
+      ...fixtureA.shellState,
+      queue: { status: 'read', lines: [`7 ${HEAD_A} main`, `8 ${HEAD_B} main`] },
+    };
+    const harnessA = makeHarness(fixtureA, NOW);
+    const resultA = await new RecordShadowDayUseCase(harnessA.deps).execute(makeRequest());
+    expectRecorded(resultA);
+    expect(resultA.recorded.S8).toBe('fail');
+    const dayRecordA = harnessA.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecordA?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
+
+    const fixtureB = cleanFixture(DAY);
+    fixtureB.shellState = {
+      ...fixtureB.shellState,
+      queue: { status: 'read', lines: [`7 ${HEAD_A} main`, `8 ${HEAD_B} main`, `9 ${HEAD_C} main`] },
+    };
+    const harnessB = makeHarness(fixtureB, NOW);
+    const resultB = await new RecordShadowDayUseCase(harnessB.deps).execute(makeRequest());
+    expectRecorded(resultB);
+    expect(resultB.recorded.S8).toBe('fail');
+    const dayRecordB = harnessB.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecordB?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
+
+    // Same {status, reason} pair in both ('fail'/'enqueue-coverage-divergence'),
+    // but the underlying shell-side coverage changed (one missing key vs
+    // two): the digests must differ, or a day-writer re-run against changed
+    // evidence like this would wrongly report 'unchanged' (the SH7b fix
+    // round 2 finding this fix closes).
+    expect(dayRecordA?.verdicts.S8?.digest).not.toBe(dayRecordB?.verdicts.S8?.digest);
+    expect(dayRecordA?.verdicts.S8?.digest).toBe(
+      expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
+        aFleetCount: 1,
+        aShellCount: 2,
+        aCompared: 1,
+        aDivergences: 1,
+        bFleetCount: 1,
+        bShellCount: 2,
+        bCompared: 1,
+        bDivergences: 1,
+      }),
+    );
+    expect(dayRecordB?.verdicts.S8?.digest).toBe(
+      expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
+        aFleetCount: 1,
+        aShellCount: 3,
+        aCompared: 1,
+        aDivergences: 2,
+        bFleetCount: 1,
+        bShellCount: 3,
+        bCompared: 1,
+        bDivergences: 2,
+      }),
     );
   });
 

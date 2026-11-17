@@ -34,6 +34,27 @@ export type ReleaseStorePruneResult =
   /** An unfinished prune; `removed` names any builds it did take out first. */
   | { readonly outcome: 'unreadable'; readonly removed?: readonly string[] };
 
+/**
+ * One named file of a verified build. `quarantined` is `null` when the file
+ * cannot be judged, and is never `false` in that case. Consumers must require
+ * `present === true && quarantined === false`.
+ */
+export type ReleaseFileFact = {
+  readonly present: boolean;
+  readonly quarantined: boolean | null;
+};
+
+/**
+ * Positional facts for one verified build. `files[i]` answers the request's
+ * `paths[i]`. No file content and no path crosses this result. Membership is
+ * by location under the verified build's marker only; the store has no
+ * content integrity check.
+ */
+export type ReleaseFilesInspection =
+  | { readonly outcome: 'read'; readonly files: readonly ReleaseFileFact[] }
+  | { readonly outcome: 'not-found' }
+  | { readonly outcome: 'unreadable' };
+
 /** A fresh staging directory created by this `prepare` call; the paths stay inside the application. */
 export type ReleaseStagingResult =
   | {
@@ -179,6 +200,23 @@ export interface ReleaseStorePort {
   readDriverBinding(input: { readonly root: string }): Promise<ReleaseDriverBinding>;
   /** Bind the root to a driver state directory when it has none (first binding wins). */
   bindDriver(input: { readonly root: string; readonly stateDir: string }): Promise<ReleaseDriverBinding>;
+  /**
+   * Read-only facts for named repository-relative paths of one verified build.
+   * Cost is linear in `paths.length`, capped by `RELEASE_INSPECT_MAX_PATHS`,
+   * and each file is capped by `RELEASE_INSPECT_MAX_FILE_BYTES`. `files[i]`
+   * answers `paths[i]`. A file that cannot be judged is `quarantined: null`,
+   * never `false`; consumers must require `present === true && quarantined ===
+   * false`. Membership is by location under the verified build's marker only
+   * (the store has no content integrity check). `not-found` when `<root>/<sha>`
+   * is not a verified build or its marker is absent. `unreadable` when the
+   * marker is corrupt or invalid, or the root or build cannot be read. Content
+   * and paths never cross.
+   */
+  inspectReleaseFiles?(input: {
+    readonly root: string;
+    readonly sha: string;
+    readonly paths: readonly string[];
+  }): Promise<ReleaseFilesInspection>;
 }
 
 export type ReleaseOperationAction = 'install' | 'swap' | 'rollback';

@@ -87,6 +87,18 @@ export class MergeQueueDeadlineError extends Error {
 /** Own keys a list query refuses so they cannot pollute `Object.prototype`. */
 const POLLUTING_OWN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
+/**
+ * Own keys a `MergeQueueListQuery` may carry. Shape checks never scan past
+ * `LIST_QUERY_ALLOWED_KEYS.length`.
+ */
+const LIST_QUERY_ALLOWED_KEYS = ['deadlineIso', 'repository'] as const;
+
+/**
+ * Own keys a list-query `repository` may carry. Shape checks never scan past
+ * `LIST_QUERY_REPOSITORY_ALLOWED_KEYS.length`.
+ */
+const LIST_QUERY_REPOSITORY_ALLOWED_KEYS = ['owner', 'repo'] as const;
+
 /** The 12-character repo digest `enqueueMergeEntry` stores and `listMergeEntries` matches. */
 function computeRepoDigest(repository: { readonly owner: string; readonly repo: string }): string {
   return sha256HexDigest(`${repository.owner}/${repository.repo}`).slice(0, 12);
@@ -110,11 +122,18 @@ function isDataDescriptor(descriptor: PropertyDescriptor | undefined): descripto
 }
 
 /**
- * Refuse a prototype-polluting own key or any accessor. Values are not read:
- * `Reflect.ownKeys` and `Object.getOwnPropertyDescriptor` do not run getters.
+ * Refuse a prototype-polluting own key or any accessor. `Reflect.ownKeys` is
+ * read once. More own keys than `maxOwnKeys` is the same refusal as a polluted
+ * query, and it is thrown before any descriptor is read, so the scan stays
+ * within that constant. Values are not read: `Reflect.ownKeys` and
+ * `Object.getOwnPropertyDescriptor` do not run getters.
  */
-function assertNoPollutingKeyOrAccessor(value: object): void {
-  for (const key of Reflect.ownKeys(value)) {
+function assertNoPollutingKeyOrAccessor(value: object, maxOwnKeys: number): void {
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > maxOwnKeys) {
+    throw new MergeQueueDeadlineError();
+  }
+  for (const key of keys) {
     if (typeof key === 'string' && POLLUTING_OWN_KEYS.has(key)) {
       throw new MergeQueueDeadlineError();
     }
@@ -143,7 +162,7 @@ function readQueryRepository(value: unknown): { readonly owner: string; readonly
   if (!isPlainQueryObject(value)) {
     throw new MergeQueueDeadlineError();
   }
-  assertNoPollutingKeyOrAccessor(value);
+  assertNoPollutingKeyOrAccessor(value, LIST_QUERY_REPOSITORY_ALLOWED_KEYS.length);
   return {
     owner: readNonEmptyEnumerableString(value, 'owner'),
     repo: readNonEmptyEnumerableString(value, 'repo'),
@@ -264,7 +283,11 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
    * prototype-polluting own key, a malformed `repository`, or a deadline that
    * is not a fresh zoned instant throws `MergeQueueDeadlineError` before the
    * store is read. Callers read an empty list as nothing queued.
-   * Cost: O(N) in the number of stored entries; O(1) for query shape validation.
+   * Cost: O(N) in the number of stored entries. Query shape validation is O(1):
+   * `Reflect.ownKeys` is read once per object. A query with more own keys than
+   * `LIST_QUERY_ALLOWED_KEYS.length`, or a repository with more own keys than
+   * `LIST_QUERY_REPOSITORY_ALLOWED_KEYS.length`, is refused before any property
+   * descriptor is read.
    */
   async listMergeEntries(query: MergeQueueListQuery): Promise<readonly MergeQueueEntryRecord[]> {
     const targetDigest = this.readListTargetDigest(query);
@@ -296,7 +319,7 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
     if (!isPlainQueryObject(query)) {
       throw new MergeQueueDeadlineError();
     }
-    assertNoPollutingKeyOrAccessor(query);
+    assertNoPollutingKeyOrAccessor(query, LIST_QUERY_ALLOWED_KEYS.length);
     const deadlineDescriptor = Object.getOwnPropertyDescriptor(query, 'deadlineIso');
     if (
       !isDataDescriptor(deadlineDescriptor) ||

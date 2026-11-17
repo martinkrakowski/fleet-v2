@@ -563,4 +563,26 @@ describe('MergeQueueRepositoryAdapter', () => {
     }
     expect((await fs.readFile(filePath)).toString('utf8')).toBe('{ truncated');
   });
+
+  it('a query with 10000 extra own keys is refused with MergeQueueDeadlineError before any descriptor is read', async () => {
+    const filePath = await writeTruncated(stateDir);
+    const adapter = new MergeQueueRepositoryAdapter({ stateDir });
+    const bloated: Record<string, unknown> = {
+      deadlineIso: futureDeadline(),
+      repository: { owner: 'fleet', repo: 'v2' },
+    };
+    for (let index = 0; index < 10_000; index += 1) {
+      bloated[`extra${index}`] = index;
+    }
+    let descriptorReads = 0;
+    const query = new Proxy(bloated, {
+      getOwnPropertyDescriptor(target, property) {
+        descriptorReads += 1;
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+    });
+    await expectDeadlineRefusal(adapter.listMergeEntries(query as never));
+    expect(descriptorReads).toBe(0);
+    expect((await fs.readFile(filePath)).toString('utf8')).toBe('{ truncated');
+  });
 });

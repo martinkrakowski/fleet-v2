@@ -174,6 +174,22 @@ describe('parseShellTrainEvents', () => {
     expect(result.events).toHaveLength(1);
   });
 
+  it('refuses a pr below the allowed range', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ pr: -1 })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('refuses a pr above the allowed range', () => {
+    const result = parseShellTrainEvents([eventJson(), eventJson({ pr: 1_000_000_001 })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.events).toHaveLength(1);
+  });
+
   it('refuses a raw line that is a number, not a string', () => {
     const result = parseShellTrainEvents([eventJson(), 7]);
     expect(result.ok).toBe(true);
@@ -324,6 +340,14 @@ describe('parseShellTrainEvents', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.events[0]?.pullRequest).toBeNull();
+  });
+
+  it('accepts pr at the exact upper boundary of the allowed range', () => {
+    const result = parseShellTrainEvents([eventJson({ pr: 1_000_000_000 })]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([]);
+    expect(result.events[0]?.pullRequest).toBe(1_000_000_000);
   });
 
   it('refuses null as not-a-list', () => {

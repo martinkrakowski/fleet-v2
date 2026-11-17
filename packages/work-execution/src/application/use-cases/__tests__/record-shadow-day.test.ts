@@ -221,6 +221,8 @@ interface Harness {
   setNow(iso: string): void;
   setLedgerRead(result: ShadowLedgerReadResult): void;
   setImportDryRun(result: ImportTrainStateResult): void;
+  /** Makes the fleet queue's `listMergeEntries` throw on every subsequent call, for S8's fleet-read-threw case. */
+  setQueueThrows(): void;
   forceConflicts(): void;
 }
 
@@ -228,6 +230,7 @@ function makeHarness(fixture: Fixture, nowIso: string): Harness {
   let now = nowIso;
   let ledgerReadOverride: ShadowLedgerReadResult | null = null;
   let importOverride: ImportTrainStateResult | null = null;
+  let queueThrows = false;
   let stored: ShadowLedger | null = null;
   let forceConflict = false;
   const evidenceCalls = { read: 0, cas: 0 };
@@ -283,6 +286,9 @@ function makeHarness(fixture: Fixture, nowIso: string): Harness {
     queue: {
       listMergeEntries: async () => {
         otherCalls.queue += 1;
+        if (queueThrows) {
+          throw new Error('fleet queue read failed');
+        }
         return fixture.queueEntries;
       },
     },
@@ -334,6 +340,9 @@ function makeHarness(fixture: Fixture, nowIso: string): Harness {
     },
     setImportDryRun: (result) => {
       importOverride = result;
+    },
+    setQueueThrows: () => {
+      queueThrows = true;
     },
     forceConflicts: () => {
       forceConflict = true;
@@ -628,6 +637,82 @@ describe('RecordShadowDayUseCase', () => {
     expect(result.recorded).toEqual({ S1: 'pass', S9: 'pass', S12: 'pass' });
     const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
     expect(reasons.get('S8')).toBe('import-unavailable');
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('reports S8 unevaluated, not a false pass, when batchesEnabled is absent (SH7b finding 1)', async () => {
+    const fixture = cleanFixture(DAY);
+    // 'absent' is just as unconfident as 'unreadable': both samples' shell
+    // reads are otherwise clean, so only the missing batchesEnabled file
+    // can be what makes S8 incomplete here.
+    fixture.shellState = { ...fixture.shellState, batchesEnabled: { status: 'absent' } };
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    expect(result.recorded).toEqual({ S1: 'pass', S9: 'pass', S12: 'pass' });
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S8')).toBe('shell-state-incomplete');
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('reports S8 unevaluated, not a false import-divergence, when the import dry-run report is truncated (SH7b finding 2)', async () => {
+    const fixture = cleanFixture(DAY);
+    // Two shell live entries on `main`, both samples; the import dry-run is
+    // truncated and reports only one of them, which (uncorrected) would
+    // make `importPresent` permanently miss the second and manufacture a
+    // persistent import-fidelity divergence instead of surfacing that the
+    // report was capped.
+    fixture.shellState = {
+      ...fixture.shellState,
+      queue: { status: 'read', lines: [`7 ${HEAD_A} main`, `8 ${HEAD_B} main`] },
+    };
+    const harness = makeHarness(fixture, NOW);
+    const truncatedKeys: ImportTrainStateKey[] = [
+      { pullRequest: 7, headOid: HEAD_A, base: 'main', source: 'queue', disposition: 'would-import' },
+    ];
+    // Built directly, not via `dryRunImport` + spread: spreading its
+    // declared union return type (`ImportTrainStateResult`) onto a new
+    // literal fails type-checking, since one union member (`refused`) has
+    // no `keysTruncated` field to merge an override onto.
+    const truncatedImport: ImportTrainStateResult = {
+      outcome: 'dry-run',
+      wouldImport: truncatedKeys.length,
+      unknownLineNumbers: [],
+      notImportableBase: 0,
+      alreadyQueued: 0,
+      parkedLines: 0,
+      chainFiles: 0,
+      batchLines: 0,
+      inprogressLines: 0,
+      unknownBySource: { queue: [], parked: [], inprogress: [] },
+      keys: truncatedKeys,
+      keysTruncated: true,
+    };
+    harness.setImportDryRun(truncatedImport);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S8')).toBe('shell-state-incomplete');
+    expect(result.recorded.S8).toBeUndefined();
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('reports S8 unevaluated, not a false coverage-divergence failure, when the fleet queue read throws on both samples (SH7b finding 3)', async () => {
+    const fixture = cleanFixture(DAY);
+    // The clean fixture's shell AND import sides already report PR 7 live;
+    // with the fleet read throwing on every sample, an empty `fleetLive`
+    // (uncorrected) would be mistaken for "genuinely zero live entries" and
+    // manufacture a persistent, false coverage divergence against that key.
+    const harness = makeHarness(fixture, NOW);
+    harness.setQueueThrows();
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S8')).toBe('shell-state-incomplete');
+    expect(result.recorded.S8).toBeUndefined();
     expectNotImplementedUnevaluated(result.unevaluated);
   });
 

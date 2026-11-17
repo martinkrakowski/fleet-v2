@@ -450,13 +450,25 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         shellLive.push(...parsed.keys);
       }
       const batchesEnabled = stateRead.value.batchesEnabled;
-      complete = complete && batchesEnabled !== undefined && batchesEnabled.status !== 'unreadable';
+      // An allow-list of the one genuinely-confident status ('read'), not a
+      // deny-list of the bad ones: 'absent' is just as unconfident as
+      // 'unreadable' (both mean the doc comment's "unreadable or missing"),
+      // and this form is immune to a future fourth status appearing here
+      // with no matching exclusion.
+      complete = complete && batchesEnabled !== undefined && batchesEnabled.status === 'read';
     } else {
       complete = false;
     }
     const fleetRead = await this.call(context.deadlineIso, () =>
       this.deps.queue.listMergeEntries({ repository: context.repository, deadlineIso: this.queryDeadline(context) }),
     );
+    if (fleetRead.kind === 'threw') {
+      // A failed fleet-queue read is missing evidence, not a confident
+      // "zero live entries": leaving `complete` true here would let a
+      // divergence against the shell/import sides record a false S8
+      // failure instead of surfacing that the fleet side was unavailable.
+      complete = false;
+    }
     const fleetLive =
       fleetRead.kind === 'threw'
         ? []
@@ -485,6 +497,10 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         .map((key) => ({ pullRequest: key.pullRequest, headOid: key.headOid, base: key.base }));
       const unknown = importRead.value.unknownBySource;
       importUnknownLines = unknown.queue.length + unknown.parked.length + unknown.inprogress.length;
+      // A truncated dry-run report's listed keys are not the full live set:
+      // this sample's import evidence cannot be trusted as complete, so it
+      // must not be allowed to manufacture a persistent, false divergence.
+      complete = complete && !importRead.value.keysTruncated;
     }
     return { takenAtIso, complete, shellLive, fleetLive, importPresent, importUnknownLines };
   }

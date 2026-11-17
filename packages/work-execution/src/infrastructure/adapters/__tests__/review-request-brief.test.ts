@@ -439,13 +439,24 @@ describe('ReviewRequestAdapter brief-verify request', () => {
     expect(calls[0]?.briefText).toBe(' x ');
   });
 
-  it('accepts a real prose+manifest package whose digest matches the subject digest and forwards both parts to the reviewer', async () => {
+  it('forwards the brief prose to the reviewer, not the manifest, after the request passes digest binding over prose and manifest', async () => {
+    // The manifest is never forwarded: the adapter uses `briefManifestRaw`
+    // only to recompute the package digest and refuses the request when it
+    // does not match the subject digest. What reaches the reviewer is the
+    // prose plus a subject carrying the package digest of BOTH parts, so
+    // this assertion pins the manifest's role as digest-binding input rather
+    // than reviewer payload: the digest the subject carries changes when one
+    // byte of the manifest changes, with the prose unchanged.
+    const otherManifestDigest = digestOfPackageOrNull(BRIEF_TEXT, `${BRIEF_MANIFEST} `);
+    expect(otherManifestDigest).not.toBe(DIGEST);
     const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
     const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());
     expect(result.outcome).toBe('receipt');
     expect(calls).toHaveLength(1);
     expect(calls[0]?.briefText).toBe(BRIEF_TEXT);
     expect(calls[0]?.kind).toBe('brief-verify');
+    expect('briefManifestRaw' in calls[0]).toBe(false);
+    expect(calls[0]?.subject).toEqual(STORED_EVIDENCE_SUBJECT);
   });
 
   it('refuses a brief text with one character changed from the digest the request carries, and requests no review', async () => {

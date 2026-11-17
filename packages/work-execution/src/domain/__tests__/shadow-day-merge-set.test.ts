@@ -156,6 +156,34 @@ describe('evaluateShadowMergeSet (S1)', () => {
     expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'fleet-head-unresolved' });
   });
 
+  it('fails fleet-head-ambiguous when two entries for the same PR carry different full heads sharing a 12-char prefix', () => {
+    const sharedPrefix = 'a1b2c3d4e5f6';
+    const headX = `${sharedPrefix}${'1'.repeat(28)}`;
+    const headY = `${sharedPrefix}${'2'.repeat(28)}`;
+    const input = dayInput({
+      fleet: {
+        results: [fleetResult({ key: mergeKey(DIGEST, 7, sharedPrefix) })],
+        entries: [fleetEntry({ headOid: headX }), fleetEntry({ headOid: headY })],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'fleet-head-ambiguous' });
+  });
+
+  it('resolves correctly through the index for a single matching entry (the normal case, indexing unchanged)', () => {
+    const input = dayInput();
+    expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+  });
+
+  it('is not ambiguous when the same PR has two entries with DIFFERENT 12-char prefixes (indexed by PR+prefix, not PR alone)', () => {
+    const input = dayInput({
+      fleet: {
+        results: [fleetResult()],
+        entries: [fleetEntry(), fleetEntry({ headOid: HEAD_C })],
+      },
+    });
+    expect(evaluateShadowMergeSet(input)).toEqual(PASS_DAY);
+  });
+
   it('ignores results belonging to a DIFFERENT repo digest entirely', () => {
     const input = dayInput({
       fleet: {

@@ -440,11 +440,41 @@ function judgeShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluation {
 }
 
 /**
+ * An index of fleet entries by `${pullRequest}:${head12}`, built once over
+ * `entries` before any result is resolved, so that `resolveHead` below does
+ * a single Map lookup per result instead of rescanning `entries` in full
+ * for every result — the join that makes the whole evaluator's cost linear
+ * rather than `O(results × entries)`. Grouping is by the PAIR, not by PR
+ * alone: two different full heads for the same PR with two different
+ * 12-char prefixes must land in two different buckets, since a given
+ * result's head12 can only ever be ambiguous against heads that share
+ * *its own* prefix.
+ */
+function indexFleetEntries(entries: readonly { pullRequest: number; headOid: string }[]): Map<string, Set<string>> {
+  const index = new Map<string, Set<string>>();
+  for (const entry of entries) {
+    const head12 = head12Of(entry.headOid);
+    if (head12 === null) {
+      continue;
+    }
+    const key = `${entry.pullRequest}:${head12}`;
+    const heads = index.get(key);
+    if (heads === undefined) {
+      index.set(key, new Set([entry.headOid]));
+    } else {
+      heads.add(entry.headOid);
+    }
+  }
+  return index;
+}
+
+/**
  * The fleet side of the merge set: every journaled `merge-pr` result with
  * outcome `dry-run`, a `would-merge` reason and a time inside the window.
  * Each key carries only a 12-character head, so it joins to a head record
- * sharing the PR whose own 12-char prefix matches; an unmatched PR is a
- * blocking refusal and so is an ambiguous one.
+ * sharing the PR whose own 12-char prefix matches, through the index built
+ * once at the top of this function; an unmatched PR is a blocking refusal
+ * and so is an ambiguous one.
  */
 function resolveFleetSet(
   results: readonly Record<string, unknown>[],
@@ -454,6 +484,7 @@ function resolveFleetSet(
   start: number,
   end: number,
 ): { readonly items: readonly FleetMergeItem[] } | { readonly refusal: ShadowCriterionEvaluation } {
+  const index = indexFleetEntries(entries);
   const items: FleetMergeItem[] = [];
   for (const result of results) {
     const key = result.key as string;
@@ -466,7 +497,7 @@ function resolveFleetSet(
     ) {
       continue;
     }
-    const headOid = resolveHead(entries, parsed.pullRequest, parsed.head12);
+    const headOid = resolveHead(index, parsed.pullRequest, parsed.head12);
     if (headOid === null) {
       return { refusal: { status: 'fail', reason: 'fleet-head-unresolved' } };
     }
@@ -480,22 +511,20 @@ function resolveFleetSet(
 
 /**
  * The full head oid whose 12-char prefix matches `head12` on pull request
- * `pullRequest`: the oid when exactly one distinct head matches, `''` when
- * several distinct heads share the prefix, and null when none does.
+ * `pullRequest`, read from the pre-built `${pullRequest}:${head12}` index:
+ * the oid when exactly one distinct head matches, `''` when several
+ * distinct heads share the prefix, and null when none does.
  */
-function resolveHead(entries: readonly { pullRequest: number; headOid: string }[], pullRequest: number, head12: string): string | null {
-  let resolved: string | null = null;
-  for (const entry of entries) {
-    if (entry.pullRequest !== pullRequest || head12Of(entry.headOid) !== head12) {
-      continue;
-    }
-    if (resolved === null) {
-      resolved = entry.headOid;
-    } else if (resolved !== entry.headOid) {
-      return '';
-    }
+function resolveHead(index: ReadonlyMap<string, ReadonlySet<string>>, pullRequest: number, head12: string): string | null {
+  const heads = index.get(`${pullRequest}:${head12}`);
+  if (heads === undefined || heads.size === 0) {
+    return null;
   }
-  return resolved;
+  if (heads.size > 1) {
+    return '';
+  }
+  const [only] = heads;
+  return only;
 }
 
 /**

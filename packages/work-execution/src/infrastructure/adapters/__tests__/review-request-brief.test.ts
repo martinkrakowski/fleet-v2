@@ -1209,6 +1209,60 @@ describe('brief delegate configuration and failures', () => {
     expect(result).toEqual({ outcome: 'receipt', receipt: EXPECTED_SUMMARY });
   });
 
+  it('findReviewReceipt finds a receipt appended to the same reviewReceipts array after an empty lookup returned not-found', async () => {
+    const reviewReceipts: ReviewReceiptRecord[] = [];
+    const assessment = briefAssessment(reviewReceipts);
+    const inspectAcceptanceEvidence = async (): Promise<InspectAcceptanceEvidenceResult> => ({
+      outcome: 'found',
+      assessment,
+    });
+    const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
+
+    const first = await adapter.findReviewReceipt(briefFind());
+    expect(first).toEqual({ outcome: 'not-found' });
+
+    reviewReceipts.push(briefReceipt());
+    const second = await adapter.findReviewReceipt(briefFind());
+    expect(second).toEqual({ outcome: 'found', receipt: EXPECTED_SUMMARY });
+  });
+
+  it('a second summary includes a finding appended to the same findings array', async () => {
+    const findings = [finding()];
+    const receipt = briefReceipt({ findings: findings as ReviewReceiptRecord['findings'] });
+    const review = () => {
+      const { requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt });
+      return new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());
+    };
+
+    const first = await review();
+    expect(first).toEqual({ outcome: 'receipt', receipt: EXPECTED_SUMMARY });
+
+    findings.push(finding({ findingId: 'f-2', summary: 'added finding' }));
+    const second = await review();
+    expect(second).toEqual({
+      outcome: 'receipt',
+      receipt: {
+        ...EXPECTED_SUMMARY,
+        findings: [
+          {
+            findingId: 'f-1',
+            severity: 'major',
+            summary: 'example finding',
+            filePath: 'src/a.ts',
+            line: 4,
+          },
+          {
+            findingId: 'f-2',
+            severity: 'major',
+            summary: 'added finding',
+            filePath: 'src/a.ts',
+            line: 4,
+          },
+        ],
+      },
+    });
+  });
+
   it('findLatestReceiptOfKind returns unavailable unreadable for the same hostile receipt lists', async () => {
     const sparse: ReviewReceiptRecord[] = [];
     sparse.length = 2;

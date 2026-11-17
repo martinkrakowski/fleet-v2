@@ -80,27 +80,19 @@ const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
 const BRIEF_TEXT_MAX_BYTES = 64 * 1024;
 const DIFF_SUMMARY_MAX_BYTES = 2048;
 /**
- * Cost bound for a brief receipt scan. The length is the array's own `length`
- * data descriptor, read once; a longer list is unreadable and is not iterated.
- * Later loops use that captured number and never read `.length` again.
+ * Cost bound for a brief receipt scan. One operation reads the array's own
+ * `length` data descriptor once into a local, refuses a longer list, and
+ * every loop in that operation uses the local. The next operation reads
+ * `length` again. A longer list is unreadable and is not iterated.
  */
 const MAX_BRIEF_RECEIPTS_READ = 256;
 /**
- * Cost bound for findings on a brief receipt. The length is the array's own
- * `length` data descriptor, read once; a longer list is a mismatch, not a scan.
- * The density loop uses that same captured number.
+ * Cost bound for findings on a brief receipt. One operation reads the array's
+ * own `length` data descriptor once into a local and refuses a longer list
+ * as a mismatch. Density and the copy use that same local. The next operation
+ * reads `length` again.
  */
 const MAX_BRIEF_FINDINGS_READ = 1024;
-/**
- * Sentinel in `capturedArrayLength` for a `length` descriptor that was refused
- * (accessor, non-integer, negative, or a throw). A real length is never negative.
- */
-const NO_CAPTURED_LENGTH = -1;
-/**
- * One captured `length` per array object. The cap check and every later loop
- * share this number, so a Proxy cannot report a small length and then a huge one.
- */
-const capturedArrayLength = new WeakMap<object, number>();
 
 /** A chain subject, validated. */
 interface ChainSubject {
@@ -583,23 +575,21 @@ function readBriefRequestId(request: unknown): string | null {
   }
 }
 
-/** One array plus the `length` already read from its own data descriptor. */
+/**
+ * One array plus the `length` read from its own data descriptor for this
+ * operation. Nothing is stored on the array: the next operation reads again.
+ */
 interface BoundedList {
   readonly list: readonly unknown[];
   readonly length: number;
 }
 
 /**
- * The own `length` data descriptor, read at most once for this array object.
- * An accessor, a non-integer, a negative, or a throwing descriptor is refused
- * and remembered, so a later call does not read `length` again. The integer
- * itself is kept even when a caller then rejects it for a cap.
+ * The own `length` data descriptor, read for this call only. An accessor, a
+ * non-integer, a negative, or a throwing descriptor is null. The number is not
+ * remembered, so a later operation on the same array reads `length` again.
  */
-function capturedArrayLengthOf(value: readonly unknown[]): number | null {
-  const cached = capturedArrayLength.get(value);
-  if (cached !== undefined) {
-    return cached === NO_CAPTURED_LENGTH ? null : cached;
-  }
+function ownArrayLength(value: readonly unknown[]): number | null {
   try {
     const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
     if (
@@ -610,28 +600,26 @@ function capturedArrayLengthOf(value: readonly unknown[]): number | null {
       !Number.isSafeInteger(lengthDescriptor.value) ||
       lengthDescriptor.value < 0
     ) {
-      capturedArrayLength.set(value, NO_CAPTURED_LENGTH);
       return null;
     }
-    capturedArrayLength.set(value, lengthDescriptor.value);
     return lengthDescriptor.value;
   } catch {
-    capturedArrayLength.set(value, NO_CAPTURED_LENGTH);
     return null;
   }
 }
 
 /**
- * A real array whose captured length is within `cap`, or null. The length is
- * not read again. Callers iterate with `length` and `ownElement`; a plain
- * `.length` read on `list` would let a Proxy lie on the next access.
+ * A real array whose length, read once in this call, is within `cap`, or null.
+ * Callers iterate with the returned `length` and `ownElement`. A plain
+ * `.length` read on `list` would let a Proxy lie on the next access. A later
+ * operation calls this again and reads `length` afresh.
  */
 function readBoundedList(value: unknown, cap: number): BoundedList | null {
   try {
     if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
       return null;
     }
-    const length = capturedArrayLengthOf(value);
+    const length = ownArrayLength(value);
     if (length === null || length > cap) {
       return null;
     }
@@ -653,9 +641,9 @@ function ownElement(array: readonly unknown[], index: number): unknown {
 
 /**
  * The assessment's receipt list when it is a dense array no longer than
- * `MAX_BRIEF_RECEIPTS_READ`. Length comes from `readBoundedList` (one captured
- * integer). A longer list, a hole, a non-array, an accessor length or an
- * array-like is null and is not iterated.
+ * `MAX_BRIEF_RECEIPTS_READ`. Length is the local from `readBoundedList` (one
+ * descriptor read for this operation). A longer list, a hole, a non-array, an
+ * accessor length or an array-like is null and is not iterated.
  */
 function readBoundedReceiptList(value: unknown): BoundedList | null {
   try {
@@ -675,31 +663,14 @@ function readBoundedReceiptList(value: unknown): BoundedList | null {
   }
 }
 
-/**
- * True when `findings` is an array no longer than `MAX_BRIEF_FINDINGS_READ`.
- * The length is the one captured for that array, never a second `.length` read.
- * Never throws.
- */
-function briefFindingsAreBounded(receipt: unknown): boolean {
-  try {
-    const findings = ownProperty(receipt, 'findings');
-    if (findings === 'unreadable' || findings === undefined) {
-      return false;
-    }
-    return readBoundedList(findings.value, MAX_BRIEF_FINDINGS_READ) !== null;
-  } catch {
-    return false;
-  }
-}
-
 type BriefVerifyScan =
   | { readonly outcome: 'list'; readonly receipts: readonly ReviewReceiptRecord[] }
   | { readonly outcome: 'unreadable' };
 
 /**
  * Own-data `brief-verify` receipts, in list order. A hole or an unreadable
- * `kind` stops the scan. `length` is the number `readBoundedReceiptList`
- * already captured; this loop does not read `.length`. Never throws.
+ * `kind` stops the scan. `length` is the number this operation already read;
+ * this loop does not read `.length`. Never throws.
  */
 function collectBriefVerifyReceipts(list: readonly unknown[], length: number): BriefVerifyScan {
   const receipts: ReviewReceiptRecord[] = [];
@@ -806,7 +777,10 @@ function summarizeLatestBriefReceipts(
     if (picked.outcome === 'unreadable') {
       return { outcome: 'unavailable', reason: 'unreadable' };
     }
-    if (!briefFindingsAreBounded(picked.receipt)) {
+    // One length read for this summary. The request-id check stays after it,
+    // and the copy below reuses this local instead of reading `length` again.
+    const boundedFindings = readReceiptFindings(picked.receipt, 'brief-verify');
+    if (boundedFindings === null) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
     const requestId = readBriefLatestRequestId(picked.receipt);
@@ -816,7 +790,12 @@ function summarizeLatestBriefReceipts(
     if (requestId.outcome === 'mismatch') {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
-    const latestSummary = receiptOfKindSummaryOf(picked.receipt, 'brief-verify', requestId.requestId);
+    const latestSummary = receiptOfKindSummaryOf(
+      picked.receipt,
+      'brief-verify',
+      requestId.requestId,
+      boundedFindings,
+    );
     if (latestSummary === null) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
@@ -904,20 +883,35 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
 }
 
 /**
- * True when `findings` is a dense array of plain objects whose every finding
- * carries one of the four declared severities: a sparse array, a non-array, a
- * hole or a corrupt severity is invalid transport output, never a summary
- * (RV3: a corrupt severity never maps to a verdict). The loop bound is the
- * length captured for this array, never a fresh `.length` read.
+ * Findings for this summary, length read once. A brief receipt reads `findings`
+ * through `ownProperty` (an accessor is a mismatch and the getter never runs)
+ * and refuses a list longer than `MAX_BRIEF_FINDINGS_READ`. Any other kind
+ * reads the property directly, capped only by a safe integer. Never caches:
+ * the next summary reads `length` again. A brief read never throws; a direct
+ * read still throws when the property getter throws, as it did before.
  */
-function findingsAreDense(findings: unknown): boolean {
-  try {
-    const bounded = readBoundedList(findings, Number.MAX_SAFE_INTEGER);
-    if (bounded === null) {
-      return false;
+function readReceiptFindings(receipt: ReviewReceiptRecord, kind: ReviewReceiptSummary['kind']): BoundedList | null {
+  if (kind === 'brief-verify') {
+    const findings = ownProperty(receipt, 'findings');
+    if (findings === 'unreadable' || findings === undefined) {
+      return null;
     }
-    for (let index = 0; index < bounded.length; index += 1) {
-      const finding = ownElement(bounded.list, index);
+    return readBoundedList(findings.value, MAX_BRIEF_FINDINGS_READ);
+  }
+  return readBoundedList(receipt.findings, Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * True when every index below `length` is a plain object with one of the four
+ * declared severities. `length` is the local this operation already read: the
+ * loop does not read `.length`. A hole or a corrupt severity is invalid
+ * transport output, never a summary (RV3: a corrupt severity never maps to a
+ * verdict). Never throws.
+ */
+function findingsAreDense(list: readonly unknown[], length: number): boolean {
+  try {
+    for (let index = 0; index < length; index += 1) {
+      const finding = ownElement(list, index);
       if (!isPlainObject(finding)) {
         return false;
       }
@@ -938,21 +932,17 @@ function findingsAreDense(findings: unknown): boolean {
 }
 
 /**
- * The summary's finding list, copied from own data elements up to the length
- * already captured for this array. Null when the findings are not dense.
- * Does not read `.length` and does not call `map` (both would re-enter a Proxy).
+ * The summary's finding list, copied from own data elements up to `length`.
+ * Null when the findings are not dense. Does not read `.length` and does not
+ * call `map` (both would re-enter a Proxy).
  */
-function copyBoundedFindings(findings: unknown): ReviewReceiptSummary['findings'] | null {
-  if (!findingsAreDense(findings)) {
-    return null;
-  }
-  const bounded = readBoundedList(findings, Number.MAX_SAFE_INTEGER);
-  if (bounded === null) {
+function copyBoundedFindings(list: readonly unknown[], length: number): ReviewReceiptSummary['findings'] | null {
+  if (!findingsAreDense(list, length)) {
     return null;
   }
   const copied: Array<ReviewReceiptSummary['findings'][number]> = [];
-  for (let index = 0; index < bounded.length; index += 1) {
-    const finding = ownElement(bounded.list, index) as ReviewReceiptSummary['findings'][number];
+  for (let index = 0; index < length; index += 1) {
+    const finding = ownElement(list, index) as ReviewReceiptSummary['findings'][number];
     copied.push({
       findingId: finding.findingId,
       severity: finding.severity,
@@ -973,8 +963,15 @@ function receiptOfKindSummaryOf(
   receipt: ReviewReceiptRecord,
   kind: ReviewReceiptSummary['kind'],
   requestId: string | null,
+  preparedFindings?: BoundedList,
 ): ReviewReceiptOfKind | null {
-  const findings = copyBoundedFindings(receipt.findings);
+  // `preparedFindings` is the one length read already done for this operation.
+  // Otherwise this summary reads `length` once itself.
+  const bounded = preparedFindings ?? readReceiptFindings(receipt, kind);
+  if (bounded === null) {
+    return null;
+  }
+  const findings = copyBoundedFindings(bounded.list, bounded.length);
   if (findings === null) {
     return null;
   }
@@ -1302,8 +1299,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         { requestId: fields.requestId, candidateHeadSha: brief.baseCommit },
         (receipt) =>
           ownValue(receipt, 'requestId') === fields.requestId &&
-          isBriefReceiptOf(receipt, brief) &&
-          briefFindingsAreBounded(receipt),
+          isBriefReceiptOf(receipt, brief),
         'brief-verify',
         false,
       );
@@ -1503,7 +1499,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       return { outcome: 'not-found' };
     }
     const only = matches[0];
-    if (only === undefined || matches.length > 1 || !isBriefReceiptOf(only, brief) || !briefFindingsAreBounded(only)) {
+    if (only === undefined || matches.length > 1 || !isBriefReceiptOf(only, brief)) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
     try {

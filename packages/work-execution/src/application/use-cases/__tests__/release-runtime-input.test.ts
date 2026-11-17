@@ -366,19 +366,19 @@ describe('release robustness bar (CO14 follow-up)', () => {
     await uc.manageRelease({ action: 'install', root, sha: SHA_A, source: root, keep: 5, apply: true, projectId: 'p' });
     expect(executor.invocations.length).toBeGreaterThan(0);
     for (const { argv, options } of executor.invocations) {
-      const env = options?.env ?? {};
+      const childVars = options?.env ?? {};
       if (argv[0] === 'git') {
-        expect(env['GIT_ALLOW_PROTOCOL']).toBe('none');
-        expect(env['GIT_NO_LAZY_FETCH']).toBe('1');
-        expect(env['GIT_TERMINAL_PROMPT']).toBe('0');
-        expect(env['GIT_CONFIG_NOSYSTEM']).toBe('1');
+        expect(childVars['GIT_ALLOW_PROTOCOL']).toBe('none');
+        expect(childVars['GIT_NO_LAZY_FETCH']).toBe('1');
+        expect(childVars['GIT_TERMINAL_PROMPT']).toBe('0');
+        expect(childVars['GIT_CONFIG_NOSYSTEM']).toBe('1');
         expect(argv).toContain('core.hooksPath=/dev/null');
         expect(argv).toContain('core.fsmonitor=false');
       }
       // No operator environment value beyond the allowlist reaches a child,
       // and nothing the child sees is the operator's home.
-      expect(Object.keys(env).every((key) => ['PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ', 'YARN_NM_MODE', 'COREPACK_ENABLE_DOWNLOAD_PROMPT', 'GIT_ALLOW_PROTOCOL', 'GIT_NO_LAZY_FETCH', 'GIT_TERMINAL_PROMPT', 'GIT_CONFIG_NOSYSTEM', 'HOME'].includes(key))).toBe(true);
-      expect(env['SNEAKY_TOKEN']).toBeUndefined();
+      expect(Object.keys(childVars).every((key) => ['PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ', 'YARN_NM_MODE', 'COREPACK_ENABLE_DOWNLOAD_PROMPT', 'GIT_ALLOW_PROTOCOL', 'GIT_NO_LAZY_FETCH', 'GIT_TERMINAL_PROMPT', 'GIT_CONFIG_NOSYSTEM', 'HOME'].includes(key))).toBe(true);
+      expect(childVars['SNEAKY_TOKEN']).toBeUndefined();
     }
   });
 

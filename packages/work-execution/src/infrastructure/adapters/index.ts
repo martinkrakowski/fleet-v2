@@ -104,6 +104,7 @@ export * from "./SeatObservationRepositoryAdapter.adapter.js";
 export * from "./SeatTicketRepositoryAdapter.adapter.js";
 export * from "./ShadowAttestationAdapter.adapter.js";
 export * from "./ShadowEvidenceAdapter.adapter.js";
+export * from "./single-record-cas-store.js";
 export * from "./SingleRecordStore.helper.js";
 export * from "./spawn-run.js";
 export * from "./SpdSayHostAudibleAlertAdapter.adapter.js";

@@ -28,6 +28,7 @@ import { parseKillallHaltMarkerStateRecord } from './KillallHaltMarkerAdapter.ad
 import { parseKillallTrainPauseStateRecord } from './KillallTrainPauseAdapter.adapter.js';
 import { inspectSingleCutoverRecord } from './CutoverRecordRepositoryAdapter.adapter.js';
 import { inspectSingleShadowLedger } from './ShadowEvidenceAdapter.adapter.js';
+import { inspectSingleShadowAttestations } from './ShadowAttestationAdapter.adapter.js';
 import {
   parseVersionedJournalEntryStateRecord,
   parseVersionedReservationStateRecord,
@@ -133,4 +134,5 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   ),
   describeSingleRecordStore('cutover.json', inspectSingleCutoverRecord),
   describeSingleRecordStore('cutover-shadow.json', inspectSingleShadowLedger),
+  describeSingleRecordStore('cutover-shadow-attestations.json', inspectSingleShadowAttestations),
 ];

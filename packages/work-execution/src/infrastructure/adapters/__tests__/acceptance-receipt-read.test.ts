@@ -13,6 +13,7 @@ import type {
   VerificationReceiptRecord,
 } from '@fleet/evidence-and-acceptance';
 import {
+  attemptIdForBrief,
   EvidenceAssessmentRepositoryAdapter,
   InspectAcceptanceEvidenceUseCase,
   StateFileUnreadableReadOnlyError,
@@ -386,5 +387,38 @@ describe('AcceptanceReceiptReadAdapter', () => {
     await expect(adapter.readReceiptsForHead(EXAMPLE_ATTEMPT, EXAMPLE_HEAD)).rejects.toThrow(
       'Not implemented: AcceptanceReceiptReadAdapter.readReceiptsForHead',
     );
+  });
+
+  it('a `brief-verify` receipt is never projected as `code-review`', async () => {
+    const projectId = 'proj-brief';
+    const digest = 'ab'.repeat(32);
+    const briefAttemptId = attemptIdForBrief(projectId, digest);
+    const inspector = new RecordingInspector([
+      {
+        outcome: 'found',
+        assessment: makeAssessment({
+          id: `assessment-${briefAttemptId}`,
+          attemptId: briefAttemptId,
+          candidateHeadSha: EXAMPLE_HEAD,
+          reviewReceipts: [
+            makeReviewReceipt({
+              kind: 'brief-verify',
+              attemptId: briefAttemptId,
+              candidateHeadSha: EXAMPLE_HEAD,
+            }),
+          ],
+        }),
+      },
+    ]);
+    const adapter = new AcceptanceReceiptReadAdapter({ inspector });
+
+    const result = await adapter.readReceiptsForHead(EXAMPLE_ATTEMPT, EXAMPLE_HEAD);
+
+    // The brief assessment is at this head, but it is not this attempt's.
+    // Dropping `matchesAttemptAtHead` would project the unknown kind as
+    // `code-review` and this equality would fail. A reader that never calls
+    // the inspector would also report `none`; the request log catches that.
+    expect(result).toEqual({ outcome: 'none' });
+    expect(inspector.requests.length).toBeGreaterThan(0);
   });
 });

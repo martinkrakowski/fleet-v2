@@ -110,6 +110,7 @@ export * from "./StallAttentionAdapter.adapter.js";
 export * from "./state-files.js";
 export * from "./SystemdUserSchedulerAdapter.adapter.js";
 export * from "./TelemetryDispositionAdapter.adapter.js";
+export * from "./TrainHealthStateReadAdapter.adapter.js";
 export * from "./WorkOrderRepositoryAdapter.adapter.js";
 export * from "./WorkspaceAdapter.adapter.js";
 export * from "./WorktreePoolAdapter.adapter.js";

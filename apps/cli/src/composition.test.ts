@@ -1553,7 +1553,13 @@ describe("conductor reaper merged-worktree repair through production composition
 });
 
 const BRIEF_PROJECT_ID = 'proj-brief-co18a3b';
-const BRIEF_DIGEST = 'ab'.repeat(32);
+// The end-to-end brief-verify request below binds its `briefText` to the
+// digest the subject carries: the prose-only digest the adapter computes with
+// `computeBriefPackageDigest` and the SHA-256 function the composition roots
+// inject. The test text must digest to `BRIEF_DIGEST` or the request is
+// refused as a mismatch.
+const BRIEF_TEXT = 'Review the frozen brief package for this project.';
+const BRIEF_DIGEST = createHash('sha256').update(BRIEF_TEXT, 'utf8').digest('hex');
 const OTHER_DIGEST = 'cd'.repeat(32);
 const IMPLEMENTER_MODEL = 'example-provider/glm-5.3';
 const REVIEWER_MODEL = 'example-provider/grok-4.7';
@@ -1760,7 +1766,7 @@ describe('CO18a3b brief-verify attempt resolution', () => {
           policyRevision: 'pol-1',
           implementerModel: IMPLEMENTER_MODEL,
           reviewerModel: REVIEWER_MODEL,
-          briefText: 'Review the frozen brief package for this project.',
+          briefText: BRIEF_TEXT,
         };
         const requested = await runtime.conductor.reviewRequest.requestReview(review);
         expect(requested).toMatchObject({

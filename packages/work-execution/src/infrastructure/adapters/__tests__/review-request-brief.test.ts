@@ -21,10 +21,11 @@ import type {
   FindReviewReceiptRequest,
   ReviewRequest,
 } from '../../../application/ports/out/ReviewRequestPort.out-port.js';
+import { computeBriefPackageDigest } from '../../../domain/value-objects/BriefPackage.vo.js';
+import { sha256HexDigest } from '../AttemptArtifactAdapter.adapter.js';
 import { ReviewRequestAdapter } from '../ReviewRequestAdapter.adapter.js';
 
 const PROJECT = 'proj-1';
-const DIGEST = 'ab'.repeat(32);
 const HEAD = 'a'.repeat(40);
 const OTHER_HEAD = 'b'.repeat(40);
 const REQUEST_ID = 'brief-verify:wo-1:0123456789ab';
@@ -33,9 +34,27 @@ const IMPLEMENTER = 'impl-model';
 const REVIEWER = 'reviewer-model';
 const PRIMARY = 'example-provider/grok-4.7';
 const FALLBACK = 'example-provider/fallback-seat';
+const BRIEF_TEXT = 'Review the frozen brief.';
+
+/**
+ * The prose-only digest `computeBriefPackageDigest` binds for a test prose
+ * with the SHA-256 digest function every production composition root injects,
+ * or null when that formula refuses the prose (empty, over 64 KiB, or
+ * secret-shaped). The same function the adapter itself binds with.
+ */
+function digestOfProseOrNull(prose: string): string | null {
+  const computed = computeBriefPackageDigest({ prose }, sha256HexDigest);
+  return computed.ok ? computed.briefDigest : null;
+}
+
+const fixtureDigest = digestOfProseOrNull(BRIEF_TEXT);
+if (fixtureDigest === null) {
+  throw new Error('the fixture brief text must digest');
+}
+/** The digest a matching brief-verify request carries: the prose-only digest of `BRIEF_TEXT`. */
+const DIGEST = fixtureDigest;
 const ATTEMPT = attemptIdForBrief(PROJECT, DIGEST);
 const ASSESSMENT_ID = assessmentIdForBrief(PROJECT, DIGEST);
-const BRIEF_TEXT = 'Review the frozen brief.';
 const INVALID = { outcome: 'refused', reason: 'invalid-request', detail: null } as const;
 const UNAVAILABLE_INVALID = { outcome: 'unavailable', reason: 'invalid-request' } as const;
 const MISMATCH_UNKNOWN = { outcome: 'unknown', reason: 'receipt-mismatch' } as const;
@@ -160,19 +179,54 @@ function briefSubject(overrides: {
 }
 
 function briefRequest(overrides: Partial<ReviewRequest> = {}): ReviewRequest {
+  // The subject digest is derived from the request's own brief text through
+  // the same prose-only formula the adapter binds with, so a request that
+  // overrides `briefText` stays self-consistent. Text the formula refuses
+  // (empty, over 64 KiB, secret-shaped) keeps the fixture digest and is
+  // refused by the adapter's own checks first.
+  const briefText = typeof overrides.briefText === 'string' ? overrides.briefText : BRIEF_TEXT;
   return {
     requestId: REQUEST_ID,
     kind: 'brief-verify',
     attemptId: ATTEMPT,
     projectId: PROJECT,
     candidateHeadSha: HEAD,
-    subject: briefSubject(),
+    subject: briefSubject({ briefPackageDigest: digestOfProseOrNull(briefText) ?? DIGEST }),
     policyRevision: POLICY,
     implementerModel: IMPLEMENTER,
     reviewerModel: REVIEWER,
     briefText: BRIEF_TEXT,
     ...overrides,
   };
+}
+
+/**
+ * A brief-verify request whose brief text is `text`, bound to that text's
+ * prose-only digest through the attempt id and the subject. A matching
+ * delegate receipt is `briefReceiptForDigest` of the same digest.
+ */
+function briefRequestForText(text: string): { readonly digest: string; readonly request: ReviewRequest } {
+  const digest = digestOfProseOrNull(text);
+  if (digest === null) {
+    throw new Error('the test brief text must digest');
+  }
+  return {
+    digest,
+    request: briefRequest({
+      briefText: text,
+      attemptId: attemptIdForBrief(PROJECT, digest),
+      subject: briefSubject({ briefPackageDigest: digest }),
+    }),
+  };
+}
+
+/** A passing brief receipt bound to one brief digest: attempt id, assessment id and subject all follow it. */
+function briefReceiptForDigest(briefPackageDigest: string): ReviewReceiptRecord {
+  return briefReceipt({
+    attemptId: attemptIdForBrief(PROJECT, briefPackageDigest),
+    assessmentId: assessmentIdForBrief(PROJECT, briefPackageDigest),
+    subject: storedSubject({ briefPackageDigest }),
+  });
 }
 
 /** Attempt id is `attemptIdForBrief` of this digest, so a bad digest is refused by the format check alone. */
@@ -363,17 +417,41 @@ describe('ReviewRequestAdapter brief-verify request', () => {
     const exact = 'a'.repeat(64 * 1024);
     const multibyte = 'é'.repeat(32 * 1024);
     for (const briefText of [exact, multibyte]) {
-      const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
-      const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest({ briefText }));
+      const { digest, request } = briefRequestForText(briefText);
+      const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceiptForDigest(digest) });
+      const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(request);
       expect(result.outcome).toBe('receipt');
       expect(calls[0]?.briefText).toBe(briefText);
     }
   });
 
   it('accepts a briefText that is non-empty after trim', async () => {
-    const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
-    await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest({ briefText: ' x ' }));
+    const { digest, request } = briefRequestForText(' x ');
+    const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceiptForDigest(digest) });
+    await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(request);
     expect(calls[0]?.briefText).toBe(' x ');
+  });
+
+  it('accepts a brief text whose prose digest matches the subject digest and forwards it to the reviewer', async () => {
+    const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
+    const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());
+    expect(result.outcome).toBe('receipt');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.briefText).toBe(BRIEF_TEXT);
+    expect(calls[0]?.kind).toBe('brief-verify');
+  });
+
+  it('refuses a brief text with one character changed from the digest the request carries, and requests no review', async () => {
+    // One character different from `BRIEF_TEXT`'s last '.', with the subject
+    // digest still naming `BRIEF_TEXT`: the digest the request carries no
+    // longer identifies the text a reviewer would judge.
+    const changed = `${BRIEF_TEXT.slice(0, -1)}!`;
+    const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
+    const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(
+      briefRequest({ briefText: changed, subject: briefSubject() }),
+    );
+    expect(result).toEqual(INVALID);
+    expect(calls).toHaveLength(0);
   });
 
   it('forwards a projectId of __proto__, constructor, or prototype as data and does not pollute Object.prototype', async () => {

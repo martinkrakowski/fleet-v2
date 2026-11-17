@@ -56,6 +56,8 @@ import type {
 import { parseChainName } from '../../domain/chain-records.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
 import { screenTransportText } from '../../domain/review-transport-screen.js';
+import { computeBriefPackageDigest } from '../../domain/value-objects/BriefPackage.vo.js';
+import { sha256HexDigest } from './AttemptArtifactAdapter.adapter.js';
 
 /**
  * D1C: the API-transport unavailable codes of an `review-unavailable`
@@ -1306,6 +1308,22 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
   private async requestBriefReview(request: ReviewRequest, brief: BriefSubject): Promise<ReviewRequestResult> {
     const fields = readBriefRequestFields(request, brief.projectId);
     if (fields === null) {
+      return { outcome: 'refused', reason: 'invalid-request', detail: null };
+    }
+    // Bind the brief text to the digest the subject names before anything is
+    // forwarded to a reviewer. The digest was produced by
+    // `computeBriefPackageDigest` with the SHA-256 function every production
+    // composition root injects; that formula binds the prose plus the manifest
+    // (`prose + '\n' + manifestRaw`) — a package of several parts. The request
+    // carries only the prose, so the binding below is exactly what that
+    // formula binds of the parts the request can present: the prose-only
+    // digest of the text. A package whose digest also covers a manifest or
+    // structured inputs can never equal a prose-only digest, so such a request
+    // is refused here (fail closed) rather than judged on text the digest does
+    // not identify. Cost: one digest over at most 64 KiB of text (already
+    // refused above when larger).
+    const textDigest = computeBriefPackageDigest({ prose: fields.briefText }, sha256HexDigest);
+    if (!textDigest.ok || textDigest.briefDigest !== brief.briefPackageDigest) {
       return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
     if (!this.delegates.requestIndependentReview) {

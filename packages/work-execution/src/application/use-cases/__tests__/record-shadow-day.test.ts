@@ -101,6 +101,22 @@ function journalEntry(init: JournalEntryInit): LaneRunJournalEntryRecord {
   } as LaneRunJournalEntryRecord;
 }
 
+type SyntheticStep = 'intent' | 'completed' | 'refused' | 'ambiguous';
+
+/**
+ * Entries for one non-merge key, in append order. S1 skips a key
+ * `parseLaneRunKey` does not accept; S9 still tallies it.
+ */
+function syntheticKey(key: string, steps: readonly SyntheticStep[]): LaneRunJournalEntryRecord[] {
+  const recordedAtIso = `${DAY}T11:00:00.000Z`;
+  return steps.map((step) => journalEntry({
+    kind: step === 'intent' ? 'intent' : 'result',
+    key,
+    ...(step === 'intent' ? {} : { outcome: step }),
+    recordedAtIso,
+  }));
+}
+
 function daemonJobEvent(index: number, day: string): DaemonEventRecord {
   const hour = String(Math.floor(index / 60) % 24).padStart(2, '0');
   const minute = String(index % 60).padStart(2, '0');
@@ -603,6 +619,69 @@ describe('RecordShadowDayUseCase', () => {
     expect(digestFewer).toBe(expectedS9Digest(DAY, 'pass', 'state-consistent', { stateChecked: 5, ...shared }));
     expect(digestMore).toBe(expectedS9Digest(DAY, 'pass', 'state-consistent', { stateChecked: 10, ...shared }));
     expect(digestFewer).not.toBe(digestMore);
+  });
+
+  it('two S9 evaluations whose duplicateIntents and duplicateResults are swapped get different digests', async () => {
+    // Pins a swap of those two fields in canonicalSummary. The clean fixture
+    // contributes one reconciled key. Each side then adds four keys so every
+    // other count matches: one side is 1 duplicate intent and 2 duplicate
+    // results, the other is those two counts swapped. A result-after-final
+    // that is not itself a duplicate result pads the smaller side, so
+    // resultsAfterFinal stays 2 either way. Swapping the two fields in the
+    // summary makes each digest equal the other's expected summary.
+    const shared = {
+      stateChecked: 5,
+      stateBad: 0,
+      journalKeys: 5,
+      resultsAfterFinal: 2,
+      orphanResults: 0,
+      unreconciledIntents: 0,
+    };
+    const intents1Results2 = { ...shared, duplicateIntents: 1, duplicateResults: 2 };
+    const intents2Results1 = { ...shared, duplicateIntents: 2, duplicateResults: 1 };
+    const withKeys = (keys: readonly (readonly [string, readonly SyntheticStep[]])[]): Fixture => {
+      const fixture = cleanFixture(DAY);
+      for (const [key, steps] of keys) {
+        fixture.journalEntries.push(...syntheticKey(key, steps));
+      }
+      return fixture;
+    };
+    const harnessOne = makeHarness(withKeys([
+      ['k-di', ['intent', 'intent', 'completed']],
+      ['k-dr-1', ['intent', 'completed', 'refused']],
+      ['k-dr-2', ['intent', 'completed', 'refused']],
+      ['k-quiet', ['intent', 'completed']],
+    ]), NOW);
+    const harnessTwo = makeHarness(withKeys([
+      ['k-di-1', ['intent', 'intent', 'completed']],
+      ['k-di-2', ['intent', 'intent', 'completed']],
+      ['k-dr', ['intent', 'completed', 'refused']],
+      ['k-raf', ['intent', 'completed', 'ambiguous']],
+    ]), NOW);
+    const resultOne = await new RecordShadowDayUseCase(harnessOne.deps).execute(makeRequest());
+    const resultTwo = await new RecordShadowDayUseCase(harnessTwo.deps).execute(makeRequest());
+    expectRecorded(resultOne);
+    expectRecorded(resultTwo);
+    expect(resultOne.recorded.S9).toBe('fail');
+    expect(resultTwo.recorded.S9).toBe('fail');
+
+    const dayOne = harnessOne.evidence.stored?.days.find((entry) => entry.day === DAY);
+    const dayTwo = harnessTwo.evidence.stored?.days.find((entry) => entry.day === DAY);
+    const expectedOne = expectedS9Digest(DAY, 'fail', 'journal-duplicate-intent', intents1Results2);
+    const expectedTwo = expectedS9Digest(DAY, 'fail', 'journal-duplicate-intent', intents2Results1);
+    expect(expectedOne).not.toBe(expectedTwo);
+    expect(dayOne?.verdicts.S9).toEqual({
+      verdict: 'fail',
+      reason: 'journal-duplicate-intent',
+      digest: expectedOne,
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(dayTwo?.verdicts.S9).toEqual({
+      verdict: 'fail',
+      reason: 'journal-duplicate-intent',
+      digest: expectedTwo,
+      recordedAtIso: RECORDED_AT_ISO,
+    });
   });
 
   it('answers unchanged when the same inputs are recorded a second time, without a second (no-op) compareAndSet call', async () => {

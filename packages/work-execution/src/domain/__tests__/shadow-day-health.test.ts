@@ -829,6 +829,146 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
     );
     expect(evaluateShadowStateIntegrity(input)).toEqual(s9Eval('unknown', 'invalid-input'));
   });
+
+  it('a key with both a duplicate intent and a duplicate result fails as journal-duplicate-intent', () => {
+    // Pins tallySequenceReason's order: duplicate-intent is checked before
+    // duplicate-result. Both anomalies are present on this one key, so
+    // reversing those two checks would name journal-duplicate-result.
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k', 'intent', null, PREV_23(50)),
+        journalEntry('k', 'intent', null, PREV_23(51)),
+        journalEntry('k', 'result', 'completed', PREV_23(52)),
+        journalEntry('k', 'result', 'refused', PREV_23(53)),
+      ],
+    }))).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateIntents: 1,
+      duplicateResults: 1,
+      resultsAfterFinal: 1,
+    }));
+  });
+
+  it('a key with both a duplicate result and a result-after-final fails as journal-duplicate-result', () => {
+    // Pins tallySequenceReason's order: duplicate-result is checked before
+    // result-after-final. Reversing those two checks would name
+    // journal-result-after-final while both counts stay 1.
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k', 'intent', null, PREV_23(50)),
+        journalEntry('k', 'result', 'completed', PREV_23(51)),
+        journalEntry('k', 'result', 'refused', PREV_23(52)),
+      ],
+    }))).toEqual(s9Eval('fail', 'journal-duplicate-result', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateResults: 1,
+      resultsAfterFinal: 1,
+    }));
+  });
+
+  it('a key with both an orphan result and a duplicate result fails as journal-duplicate-result', () => {
+    // Pins tallySequenceReason's order: duplicate-result is checked before
+    // orphan-result. The result appended before the intent is an orphan, and
+    // the second closing result is a duplicate; checking the orphan first
+    // would name journal-orphan-result.
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k', 'result', 'completed', PREV_23(50)),
+        journalEntry('k', 'intent', null, PREV_23(51)),
+        journalEntry('k', 'result', 'refused', PREV_23(52)),
+      ],
+    }))).toEqual(s9Eval('fail', 'journal-duplicate-result', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateResults: 1,
+      resultsAfterFinal: 1,
+      orphanResults: 1,
+    }));
+  });
+
+  it('a key with both an orphan result and a result-after-final fails as journal-result-after-final', () => {
+    // Pins tallySequenceReason's order: result-after-final is checked before
+    // orphan-result. One closing result followed by an ambiguous result is
+    // not a duplicate result, so the orphan is the only other candidate;
+    // checking it first would name journal-orphan-result.
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k', 'result', 'completed', PREV_23(50)),
+        journalEntry('k', 'intent', null, PREV_23(51)),
+        journalEntry('k', 'result', 'ambiguous', PREV_23(52)),
+      ],
+    }))).toEqual(s9Eval('fail', 'journal-result-after-final', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateResults: 0,
+      resultsAfterFinal: 1,
+      orphanResults: 1,
+    }));
+  });
+
+  it('counts one key that is both a duplicate intent and an orphan in both counts', () => {
+    // Pins suppression of one count by the other. The result precedes both
+    // intents, so the key is an orphan and, with two intents, a duplicate
+    // intent. Dropping either predicate when the other matches would leave
+    // that count at 0.
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k', 'result', 'completed', PREV_23(50)),
+        journalEntry('k', 'intent', null, PREV_23(51)),
+        journalEntry('k', 'intent', null, PREV_23(52)),
+      ],
+    }))).toEqual(s9Eval('fail', 'journal-duplicate-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      duplicateIntents: 1,
+      orphanResults: 1,
+    }));
+  });
+
+  it('does not flag an open intent exactly one grace window old, and does flag one 1 ms older', () => {
+    // Pins `>` versus `>=` in isPastOpenIntentGrace. The sample is taken
+    // exactly SHADOW_OPEN_INTENT_GRACE_MS after the intent, which is not yet
+    // past, and one millisecond later, which is.
+    const exactly = '2026-11-10T23:45:00.000Z';
+    const pastByOneMs = '2026-11-10T23:44:59.999Z';
+    expect(Date.parse(SAMPLE_AT) - Date.parse(exactly)).toBe(SHADOW_OPEN_INTENT_GRACE_MS);
+    expect(Date.parse(SAMPLE_AT) - Date.parse(pastByOneMs)).toBe(SHADOW_OPEN_INTENT_GRACE_MS + 1);
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [journalEntry('k-grace', 'intent', null, exactly)],
+    }))).toEqual(s9Eval('pass', 'state-consistent', { stateChecked: 5, journalKeys: 1 }));
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [journalEntry('k-grace', 'intent', null, pastByOneMs)],
+    }))).toEqual(s9Eval('fail', 'unreconciled-intent', {
+      stateChecked: 5,
+      journalKeys: 1,
+      unreconciledIntents: 1,
+    }));
+  });
+
+  it.each([
+    ['checked', -1],
+    ['checked', 1.5],
+    ['checked', Number.MAX_SAFE_INTEGER + 1],
+    ['bad', -1],
+    ['bad', 1.5],
+    ['bad', Number.MAX_SAFE_INTEGER + 1],
+  ] as const)(
+    'S9 refuses stateCheck.%s=%s the same as a wrong-typed count',
+    (field, value) => {
+      // Pins isCount's range: a negative, a non-integer (1.5) and a value
+      // above Number.MAX_SAFE_INTEGER are each refused with the same
+      // unknown/invalid-input zeros as a string where a count is due.
+      const stateCheck = { checked: 5, bad: 0, [field]: value };
+      const refused = evaluateShadowStateIntegrity(stateInput({ stateCheck }));
+      const wrongTyped = evaluateShadowStateIntegrity(stateInput({
+        stateCheck: { checked: 'many', bad: 0 },
+      }));
+      expect(wrongTyped).toEqual(s9Eval('unknown', 'invalid-input'));
+      expect(refused).toEqual(wrongTyped);
+    },
+  );
 });
 
 /** A built hostile input plus an optional getter-call probe. */

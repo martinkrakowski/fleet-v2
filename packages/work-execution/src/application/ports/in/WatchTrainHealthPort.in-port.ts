@@ -30,6 +30,9 @@ export type WatchTrainHealthResult =
       readonly cleared: number;
       readonly attentionFailures: number;
       readonly budgetExhausted: boolean;
+      readonly announced: number;
+      readonly announceFailures: number;
+      readonly announceSuppressed: number;
     }
   | {
       readonly outcome: 'blind';
@@ -38,6 +41,9 @@ export type WatchTrainHealthResult =
       readonly findings: readonly TrainHealthFinding[];
       readonly raised: number;
       readonly attentionFailures: number;
+      readonly announced: number;
+      readonly announceFailures: number;
+      readonly announceSuppressed: number;
     }
   | { readonly outcome: 'budget-exhausted'; readonly exitCode: 1 }
   | {

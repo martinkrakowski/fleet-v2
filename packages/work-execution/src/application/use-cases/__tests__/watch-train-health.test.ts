@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { WatchTrainHealthUseCase } from '../WatchTrainHealthUseCase.use-case.js';
 import type { WatchTrainHealthDependencies } from '../WatchTrainHealthUseCase.use-case.js';
+import type { HostAudibleAlertResult } from '../../ports/out/HostAudibleAlertPort.out-port.js';
 import type { TrainHealthStateReadResult } from '../../ports/out/TrainHealthStateReadPort.out-port.js';
 import type {
   ClearTrainHealthAttentionResult,
@@ -17,6 +18,16 @@ import { TRAIN_HEALTH_RULES } from '../../../domain/train-health-rules.js';
 
 const NOW = '2026-11-16T12:00:00.000Z';
 const DEADLINE = '2026-11-16T12:05:00.000Z';
+/** 12:02 and 12:03 share the 10-minute bucket that starts at 12:00. */
+const SAME_BUCKET_NOW = '2026-11-16T12:03:00.000Z';
+const ONE_MINUTE_EARLIER = '2026-11-16T12:02:00.000Z';
+const PREVIOUS_BUCKET = '2026-11-16T11:59:00.000Z';
+const SENTENCE_TICK_STALE = 'The merge train has stopped ticking.';
+const SENTENCE_STALLED_HEAD = 'The head of the merge train is stalled.';
+const SENTENCE_WATCHDOG_BLIND = 'The merge train watchdog cannot read the train state.';
+const SENTENCE_TRUNCATED = 'The merge train has more problems than the watchdog can list.';
+const SENTENCE_QUEUE = 'The merge train queue is too long to check completely.';
+const SENTENCE_FALLBACK = 'The merge train watchdog cannot decide what to announce.';
 const DIGEST = '0123456789ab';
 const OWNER = 'acme';
 const REPO = 'train';
@@ -57,6 +68,10 @@ interface FakeOptions {
   readonly listBehavior?: (callIndex: number) => unknown;
   readonly nowSchedule?: readonly string[];
   readonly now?: () => string;
+  readonly nowBehavior?: (index: number) => string;
+  readonly alertMode?: 'on' | 'missing-speak';
+  readonly alertSpeak?: (callIndex: number, arg: { readonly sentence: string }) => unknown;
+  readonly respeakMinutes?: number;
 }
 
 /** One attention port fake with one ordered log shared with the clock. */
@@ -66,6 +81,7 @@ function makeDeps(options: FakeOptions = {}): {
   raiseCalls: readonly TrainHealthAttentionCommand[];
   clearCalls: readonly TrainHealthAttentionCommand[];
   listCalls: readonly unknown[];
+  speakCalls: readonly { sentence: string }[];
 } {
   const log: LogEntry[] = [];
   const nowSchedule = options.nowSchedule ?? [NOW];
@@ -76,6 +92,29 @@ function makeDeps(options: FakeOptions = {}): {
   const raiseCalls: TrainHealthAttentionCommand[] = [];
   const clearCalls: TrainHealthAttentionCommand[] = [];
   const listCalls: unknown[] = [];
+  const speakCalls: { sentence: string }[] = [];
+  let speakIndex = 0;
+  let alert: WatchTrainHealthDependencies['alert'];
+  if (options.alertMode === 'missing-speak') {
+    alert = {} as WatchTrainHealthDependencies['alert'];
+  }
+  if (options.alertMode === 'on') {
+    alert = {
+      speak: async (request) => {
+        log.push({ kind: 'port', method: 'speak', arg: request });
+        speakCalls.push(request);
+        speakIndex += 1;
+        if (options.alertSpeak) {
+          const answer = options.alertSpeak(speakIndex, request);
+          if (answer instanceof Error) {
+            throw answer;
+          }
+          return answer as HostAudibleAlertResult;
+        }
+        return { outcome: 'spoken' };
+      },
+    };
+  }
   const deps: WatchTrainHealthDependencies = {
     state: {
       readTrainHealthState: async (request) => {
@@ -134,13 +173,17 @@ function makeDeps(options: FakeOptions = {}): {
       options.now ??
       (() => {
         log.push({ kind: 'now' });
-        const value =
-          nowIndex < nowSchedule.length ? nowSchedule[nowIndex] : nowSchedule[nowSchedule.length - 1];
+        const index = nowIndex;
         nowIndex += 1;
-        return value;
+        if (options.nowBehavior) {
+          return options.nowBehavior(index);
+        }
+        return index < nowSchedule.length ? nowSchedule[index] : nowSchedule[nowSchedule.length - 1];
       }),
+    ...(alert === undefined ? {} : { alert }),
+    ...(options.respeakMinutes === undefined ? {} : { respeakMinutes: options.respeakMinutes }),
   };
-  return { deps, log, raiseCalls, clearCalls, listCalls };
+  return { deps, log, raiseCalls, clearCalls, listCalls, speakCalls };
 }
 
 function portCalls(log: readonly LogEntry[]): readonly { method: string; arg: unknown }[] {
@@ -166,6 +209,55 @@ async function run(deps: WatchTrainHealthDependencies, request: unknown) {
 
 function blindStateRead(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { outcome: 'unavailable', reasonCode: 'db-down', ...overrides };
+}
+
+function okState(snapshot: Record<string, unknown>): Record<string, unknown> {
+  return { outcome: 'ok', snapshot };
+}
+
+function tickStaleSnapshot(): Record<string, unknown> {
+  return healthySnapshot({ lastTickFinishedAtIso: '2026-11-16T11:00:00.000Z' });
+}
+
+function stalledHeadSnapshot(): Record<string, unknown> {
+  return healthySnapshot({
+    queue: [entry({ pullRequest: 7, enqueuedAtIso: '2026-11-16T10:00:00.000Z' })],
+  });
+}
+
+function tickAndStalledSnapshot(): Record<string, unknown> {
+  return healthySnapshot({
+    lastTickFinishedAtIso: '2026-11-16T11:00:00.000Z',
+    queue: [entry({ pullRequest: 7, enqueuedAtIso: '2026-11-16T10:00:00.000Z' })],
+  });
+}
+
+function closedEntries(count: number): Record<string, unknown>[] {
+  const entries: Record<string, unknown>[] = [];
+  for (let pullRequest = 1; pullRequest <= count; pullRequest += 1) {
+    entries.push(entry({ pullRequest, forgeState: 'closed' }));
+  }
+  return entries;
+}
+
+function staleSentence(pullRequest: number): string {
+  return `Pull request ${String(pullRequest)} is closed or merged but still on the merge train.`;
+}
+
+function summarySentence(kept: number): string {
+  return `${String(kept)} more merge train problems are not announced.`;
+}
+
+function portMethods(log: readonly LogEntry[]): string[] {
+  return portCalls(log).map((call) => call.method);
+}
+
+function expectClockBeforeEveryPort(log: readonly LogEntry[]): void {
+  for (let index = 0; index < log.length; index += 1) {
+    if (log[index].kind === 'port') {
+      expect(log[index - 1]).toEqual({ kind: 'now' });
+    }
+  }
 }
 
 describe('WatchTrainHealthUseCase', () => {
@@ -242,7 +334,7 @@ describe('WatchTrainHealthUseCase', () => {
       openItems: [],
     });
     const result = await run(deps, baseRequest());
-    expect(result).toMatchObject({ outcome: 'evaluated', budgetExhausted: true, healthy: false, exitCode: 1 });
+    expect(result).toMatchObject({ outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0, budgetExhausted: true, healthy: false, exitCode: 1 });
     expect(raiseCalls).toHaveLength(1);
     expect(clearCalls).toHaveLength(0);
     const seen = log;
@@ -257,7 +349,7 @@ describe('WatchTrainHealthUseCase', () => {
     const { deps, log, raiseCalls } = makeDeps({ stateRead: blindStateRead() as never });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'blind',
+      outcome: 'blind', announced: 0, announceFailures: 0, announceSuppressed: 0,
       exitCode: 1,
       reasonCode: 'state-unavailable',
       raised: 1,
@@ -272,7 +364,7 @@ describe('WatchTrainHealthUseCase', () => {
     const { deps, log, raiseCalls } = makeDeps({ stateRead: new Error('boom') });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'blind',
+      outcome: 'blind', announced: 0, announceFailures: 0, announceSuppressed: 0,
       reasonCode: 'state-unavailable',
       raised: 1,
       attentionFailures: 0,
@@ -287,7 +379,7 @@ describe('WatchTrainHealthUseCase', () => {
     });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'blind',
+      outcome: 'blind', announced: 0, announceFailures: 0, announceSuppressed: 0,
       reasonCode: 'state-budget-exhausted',
       raised: 1,
       attentionFailures: 0,
@@ -301,7 +393,7 @@ describe('WatchTrainHealthUseCase', () => {
       stateRead: { outcome: 'ok', snapshot: healthySnapshot() } as never,
     });
     const result = await run(deps, baseRequest());
-    expect(result).toMatchObject({ outcome: 'evaluated', healthy: true, exitCode: 0 });
+    expect(result).toMatchObject({ outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0, healthy: true, exitCode: 0 });
     expect(portCalls(log).filter((call) => call.method === 'readTrainHealthState')).toHaveLength(1);
   });
 
@@ -330,7 +422,7 @@ describe('WatchTrainHealthUseCase', () => {
       await vi.advanceTimersByTimeAsync(400_000);
       const result = await pending;
       expect(result).toMatchObject({
-        outcome: 'blind',
+        outcome: 'blind', announced: 0, announceFailures: 0, announceSuppressed: 0,
         reasonCode: 'state-read-timed-out',
         raised: 1,
         attentionFailures: 0,
@@ -356,7 +448,7 @@ describe('WatchTrainHealthUseCase', () => {
     } as WatchTrainHealthDependencies;
     const result = await run(lookalikeDeps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'blind',
+      outcome: 'blind', announced: 0, announceFailures: 0, announceSuppressed: 0,
       reasonCode: 'state-unavailable',
       raised: 1,
       attentionFailures: 0,
@@ -369,7 +461,7 @@ describe('WatchTrainHealthUseCase', () => {
     const { deps, log, raiseCalls } = makeDeps({ nowSchedule: [NOW, DEADLINE] });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'blind',
+      outcome: 'blind', announced: 0, announceFailures: 0, announceSuppressed: 0,
       reasonCode: 'state-budget-exhausted',
       raised: 0,
       attentionFailures: 0,
@@ -384,7 +476,7 @@ describe('WatchTrainHealthUseCase', () => {
     });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'blind',
+      outcome: 'blind', announced: 0, announceFailures: 0, announceSuppressed: 0,
       reasonCode: 'evaluation-invalid-snapshot',
       raised: 1,
       attentionFailures: 0,
@@ -404,7 +496,7 @@ describe('WatchTrainHealthUseCase', () => {
     });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'blind',
+      outcome: 'blind', announced: 0, announceFailures: 0, announceSuppressed: 0,
       reasonCode: 'evaluation-invalid-clock',
       raised: 1,
       attentionFailures: 0,
@@ -419,7 +511,7 @@ describe('WatchTrainHealthUseCase', () => {
     const { deps, log, raiseCalls } = makeDeps({});
     const result = await run(deps, baseRequest({ thresholds: { tickStaleMinutes: 0 } }));
     expect(result).toMatchObject({
-      outcome: 'blind',
+      outcome: 'blind', announced: 0, announceFailures: 0, announceSuppressed: 0,
       reasonCode: 'evaluation-invalid-thresholds',
       raised: 1,
       attentionFailures: 0,
@@ -446,7 +538,7 @@ describe('WatchTrainHealthUseCase', () => {
       ],
     });
     const result = await run(deps, baseRequest());
-    expect(result).toMatchObject({ outcome: 'evaluated', truncated: true, healthy: false, exitCode: 1 });
+    expect(result).toMatchObject({ outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0, truncated: true, healthy: false, exitCode: 1 });
     expect(result.outcome === 'evaluated' && result.findings.length === 200).toBe(true);
     expect(result.outcome === 'evaluated' && result.findings.some((f) => f.rule === 'stalled-head')).toBe(false);
     expect(raiseCalls[0]).toEqual({
@@ -481,7 +573,7 @@ describe('WatchTrainHealthUseCase', () => {
       ],
     });
     const result = await run(deps, baseRequest());
-    expect(result).toMatchObject({ outcome: 'evaluated', queueOverflow: true, healthy: false, exitCode: 1 });
+    expect(result).toMatchObject({ outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0, queueOverflow: true, healthy: false, exitCode: 1 });
     expect(raiseCalls).toEqual([
       { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'queue-too-large', pullRequest: null, deadlineIso: DEADLINE },
       { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'stalled-head', pullRequest: null, deadlineIso: DEADLINE },
@@ -504,7 +596,7 @@ describe('WatchTrainHealthUseCase', () => {
     });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'evaluated',
+      outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0,
       queueOverflow: false,
       healthy: true,
       exitCode: 0,
@@ -527,7 +619,7 @@ describe('WatchTrainHealthUseCase', () => {
     });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'evaluated',
+      outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0,
       healthy: false,
       exitCode: 1,
       raised: 0,
@@ -560,7 +652,7 @@ describe('WatchTrainHealthUseCase', () => {
     });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'evaluated',
+      outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0,
       healthy: false,
       exitCode: 1,
       raised: 0,
@@ -581,7 +673,7 @@ describe('WatchTrainHealthUseCase', () => {
     });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'evaluated',
+      outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0,
       healthy: false,
       exitCode: 1,
       raised: 1,
@@ -602,7 +694,7 @@ describe('WatchTrainHealthUseCase', () => {
       ],
     });
     const result = await run(deps, baseRequest());
-    expect(result).toMatchObject({ outcome: 'evaluated', healthy: false, attentionFailures: 5 });
+    expect(result).toMatchObject({ outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0, healthy: false, attentionFailures: 5 });
     expect(clearCalls).toHaveLength(0);
   });
 
@@ -622,7 +714,7 @@ describe('WatchTrainHealthUseCase', () => {
     });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'evaluated',
+      outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0,
       healthy: false,
       exitCode: 1,
       cleared: 1,
@@ -645,7 +737,7 @@ describe('WatchTrainHealthUseCase', () => {
       ],
     });
     const result = await run(deps, baseRequest());
-    expect(result).toMatchObject({ outcome: 'evaluated', healthy: false, exitCode: 1 });
+    expect(result).toMatchObject({ outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0, healthy: false, exitCode: 1 });
     expect(result.outcome === 'evaluated' && result.unknownForgeStates).toBe(1);
     expect(clearCalls.map((call) => call.rule)).toEqual(['tick-stale', 'watchdog-blind']);
   });
@@ -654,7 +746,7 @@ describe('WatchTrainHealthUseCase', () => {
     const { deps, log, raiseCalls, clearCalls, listCalls } = makeDeps();
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'evaluated',
+      outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0,
       healthy: true,
       exitCode: 0,
       raised: 0,
@@ -677,7 +769,7 @@ describe('WatchTrainHealthUseCase', () => {
       openItems: [],
     });
     const result = await run(deps, baseRequest());
-    expect(result).toMatchObject({ outcome: 'evaluated', healthy: false, exitCode: 1 });
+    expect(result).toMatchObject({ outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0, healthy: false, exitCode: 1 });
     expect(raiseCalls).toEqual([
       { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'tick-stale', pullRequest: null, deadlineIso: DEADLINE },
     ]);
@@ -695,7 +787,7 @@ describe('WatchTrainHealthUseCase', () => {
       ],
     });
     const result = await run(deps, baseRequest());
-    expect(result).toMatchObject({ outcome: 'evaluated', cleared: 1, healthy: false, exitCode: 1 });
+    expect(result).toMatchObject({ outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0, cleared: 1, healthy: false, exitCode: 1 });
     expect(clearCalls).toEqual([
       { projectId: PROJECT, repository: { owner: OWNER, repo: REPO }, rule: 'stale-queue-entry', pullRequest: 7, deadlineIso: DEADLINE },
     ]);
@@ -711,7 +803,7 @@ describe('WatchTrainHealthUseCase', () => {
     });
     const result = await run(deps, baseRequest());
     expect(result).toMatchObject({
-      outcome: 'evaluated',
+      outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0,
       healthy: true,
       exitCode: 0,
       raised: 0,
@@ -757,7 +849,7 @@ describe('WatchTrainHealthUseCase', () => {
       expect(settledEarly).toBe(false);
       await vi.advanceTimersByTimeAsync(400_000);
       const result = await pending;
-      expect(result).toMatchObject({ outcome: 'evaluated', healthy: false, exitCode: 1, attentionFailures: 1 });
+      expect(result).toMatchObject({ outcome: 'evaluated', announced: 0, announceFailures: 0, announceSuppressed: 0, healthy: false, exitCode: 1, attentionFailures: 1 });
       const raiseEntries = log.filter(
         (entry) => entry.kind === 'port' && entry.method === 'raiseTrainHealthAttention',
       );
@@ -773,5 +865,414 @@ describe('WatchTrainHealthUseCase', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('no alert dependency -> zero speaks, counters 0, and blind path makes no list call', async () => {
+    const evaluated = makeDeps({ stateRead: okState(tickStaleSnapshot()) as never });
+    const evaluatedResult = await run(evaluated.deps, baseRequest());
+    expect(evaluatedResult).toMatchObject({
+      outcome: 'evaluated',
+      announced: 0,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(evaluated.speakCalls).toHaveLength(0);
+    expect(portMethods(evaluated.log)).not.toContain('speak');
+
+    const blind = makeDeps({ stateRead: blindStateRead() as never });
+    const blindResult = await run(blind.deps, baseRequest());
+    expect(blindResult).toMatchObject({
+      outcome: 'blind',
+      announced: 0,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(portMethods(blind.log).filter((method) => method.startsWith('list'))).toHaveLength(0);
+
+    const missing = makeDeps({ alertMode: 'missing-speak', stateRead: blindStateRead() as never });
+    const missingResult = await run(missing.deps, baseRequest());
+    expect(missingResult).toMatchObject({
+      outcome: 'blind',
+      announced: 0,
+      announceFailures: 0,
+      announceSuppressed: 0,
+    });
+    expect(portMethods(missing.log).filter((method) => method.startsWith('list'))).toHaveLength(0);
+    expect(missing.speakCalls).toHaveLength(0);
+  });
+
+  it('new finding (no open item) -> speak called once with { sentence } for that finding, in order list, speak, raise', async () => {
+    const { deps, log, speakCalls, raiseCalls, clearCalls } = makeDeps({
+      alertMode: 'on',
+      stateRead: okState(stalledHeadSnapshot()) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 1,
+      healthy: false,
+      exitCode: 1,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_STALLED_HEAD }]);
+    expect(portMethods(log)).toEqual([
+      'readTrainHealthState',
+      'listOpenTrainHealthAttention',
+      'speak',
+      'raiseTrainHealthAttention',
+    ]);
+    expect(raiseCalls.map((call) => call.rule)).toEqual(['stalled-head']);
+    expect(clearCalls).toHaveLength(0);
+    expectClockBeforeEveryPort(log);
+  });
+
+  it('open item for same finding raised 1 minute ago in same 10-minute bucket -> not spoken, still raised', async () => {
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      nowSchedule: [SAME_BUCKET_NOW],
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [{ rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: ONE_MINUTE_EARLIER }],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 0,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(speakCalls).toHaveLength(0);
+    expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+  });
+
+  it('open item for same finding with clock in next bucket -> spoken', async () => {
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [{ rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: PREVIOUS_BUCKET }],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+  });
+
+  it('five due targets -> two sentences plus the summary sentence, announceSuppressed 3', async () => {
+    const five = makeDeps({
+      alertMode: 'on',
+      stateRead: okState(healthySnapshot({ lastTickFinishedAtIso: NOW, queue: closedEntries(5) })) as never,
+      openItems: [],
+    });
+    const fiveResult = await run(five.deps, baseRequest());
+    expect(fiveResult).toMatchObject({
+      outcome: 'evaluated',
+      announced: 3,
+      announceFailures: 0,
+      announceSuppressed: 3,
+      raised: 5,
+    });
+    expect(five.speakCalls).toEqual([
+      { sentence: staleSentence(1) },
+      { sentence: staleSentence(2) },
+      { sentence: summarySentence(3) },
+    ]);
+
+    const unknown = makeDeps({
+      alertMode: 'on',
+      stateRead: okState(healthySnapshot({ lastTickFinishedAtIso: NOW, queue: closedEntries(5) })) as never,
+      listBehavior: () => ({ outcome: 'unavailable' }),
+    });
+    const unknownResult = await run(unknown.deps, baseRequest());
+    expect(unknownResult).toMatchObject({
+      outcome: 'evaluated',
+      announced: 3,
+      announceFailures: 0,
+      announceSuppressed: 3,
+      attentionFailures: 1,
+      raised: 5,
+    });
+    expect(unknown.speakCalls).toEqual(five.speakCalls);
+    expect(unknown.clearCalls).toHaveLength(0);
+  });
+
+  it('speak that throws, speak returning failed nonzero-exit, and speak returning null each count one announceFailures and raise still happens', async () => {
+    const behaviors: Array<(callIndex: number, arg: { readonly sentence: string }) => unknown> = [
+      () => new Error('boom'),
+      () => ({ outcome: 'failed', reasonCode: 'nonzero-exit' }),
+      () => null,
+    ];
+    for (const alertSpeak of behaviors) {
+      const { deps, speakCalls, raiseCalls } = makeDeps({
+        alertMode: 'on',
+        alertSpeak,
+        stateRead: okState(tickStaleSnapshot()) as never,
+        openItems: [],
+      });
+      const result = await run(deps, baseRequest());
+      expect(result).toMatchObject({
+        outcome: 'evaluated',
+        announced: 0,
+        announceFailures: 1,
+        announceSuppressed: 0,
+        raised: 1,
+        exitCode: 1,
+      });
+      expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+      expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+    }
+  });
+
+  it('speak returning unavailable binary-missing counts one announceFailures', async () => {
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      alertSpeak: () => ({ outcome: 'unavailable', reasonCode: 'binary-missing' }),
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 0,
+      announceFailures: 1,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(raiseCalls).toHaveLength(1);
+  });
+
+  it('clock jumping past deadline before second speak -> one speak, budgetExhausted true, every port call preceded by clock read', async () => {
+    const late = '2026-11-16T12:10:00.000Z';
+    // Reads: watch, readState, list, decision, first speak, second speak.
+    const { deps, log, speakCalls, raiseCalls, clearCalls } = makeDeps({
+      alertMode: 'on',
+      nowSchedule: [NOW, NOW, NOW, NOW, NOW, late],
+      stateRead: okState(tickAndStalledSnapshot()) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      budgetExhausted: true,
+      raised: 0,
+      healthy: false,
+      exitCode: 1,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(raiseCalls).toHaveLength(0);
+    expect(clearCalls).toHaveLength(0);
+    expectClockBeforeEveryPort(log);
+  });
+
+  it("blind path with alert -> list, speak { sentence: 'The merge train watchdog cannot read the train state.' }, raise, and no clear", async () => {
+    const { deps, log, speakCalls, raiseCalls, clearCalls, listCalls } = makeDeps({
+      alertMode: 'on',
+      stateRead: blindStateRead() as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'blind',
+      reasonCode: 'state-unavailable',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 1,
+      attentionFailures: 0,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_WATCHDOG_BLIND }]);
+    expect(listCalls).toHaveLength(1);
+    expect(clearCalls).toHaveLength(0);
+    expect(blindRaise(raiseCalls[0])).toBe(true);
+    expect(portMethods(log)).toEqual([
+      'readTrainHealthState',
+      'listOpenTrainHealthAttention',
+      'speak',
+      'raiseTrainHealthAttention',
+    ]);
+    expectClockBeforeEveryPort(log);
+  });
+
+  it('blind path with open watchdog-blind item raised in same bucket -> not spoken, raised', async () => {
+    const { deps, speakCalls, raiseCalls, clearCalls, listCalls } = makeDeps({
+      alertMode: 'on',
+      nowSchedule: [SAME_BUCKET_NOW],
+      stateRead: blindStateRead() as never,
+      openItems: [{ rule: 'watchdog-blind', pullRequest: null, lastRaisedAtIso: ONE_MINUTE_EARLIER }],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'blind',
+      announced: 0,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(speakCalls).toHaveLength(0);
+    expect(listCalls).toHaveLength(1);
+    expect(clearCalls).toHaveLength(0);
+    expect(blindRaise(raiseCalls[0])).toBe(true);
+  });
+
+  it('blind path with an unavailable open list -> one attentionFailures, watchdog sentence still spoken, no clear', async () => {
+    const { deps, speakCalls, raiseCalls, clearCalls } = makeDeps({
+      alertMode: 'on',
+      stateRead: blindStateRead() as never,
+      listBehavior: () => ({ outcome: 'unavailable' }),
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'blind',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      attentionFailures: 1,
+      raised: 1,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_WATCHDOG_BLIND }]);
+    expect(clearCalls).toHaveLength(0);
+    expect(blindRaise(raiseCalls[0])).toBe(true);
+  });
+
+  it('respeakMinutes 1 changes the bucket', async () => {
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      respeakMinutes: 1,
+      nowSchedule: [SAME_BUCKET_NOW],
+      stateRead: okState(tickStaleSnapshot()) as never,
+      openItems: [{ rule: 'tick-stale', pullRequest: null, lastRaisedAtIso: ONE_MINUTE_EARLIER }],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 1,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+  });
+
+  it('invalid respeakMinutes (0) makes decision refuse and the fallback sentence is spoken', async () => {
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      respeakMinutes: 0,
+      stateRead: okState(healthySnapshot({ lastTickFinishedAtIso: NOW, queue: closedEntries(5) })) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      announced: 1,
+      announceFailures: 0,
+      announceSuppressed: 0,
+      raised: 5,
+    });
+    expect(speakCalls).toEqual([{ sentence: SENTENCE_FALLBACK }]);
+    expect(raiseCalls).toHaveLength(5);
+  });
+
+  it('queue overflow and truncation targets are announced', async () => {
+    const { deps, speakCalls, raiseCalls } = makeDeps({
+      alertMode: 'on',
+      stateRead: okState(healthySnapshot({
+        lastTickFinishedAtIso: NOW,
+        queue: closedEntries(501),
+      })) as never,
+      openItems: [],
+    });
+    const result = await run(deps, baseRequest());
+    expect(result).toMatchObject({
+      outcome: 'evaluated',
+      queueOverflow: true,
+      truncated: true,
+      announced: 3,
+      announceFailures: 0,
+      announceSuppressed: 200,
+    });
+    expect(speakCalls).toEqual([
+      { sentence: SENTENCE_TRUNCATED },
+      { sentence: SENTENCE_QUEUE },
+      { sentence: summarySentence(200) },
+    ]);
+    expect(raiseCalls[0].rule).toBe('queue-too-large');
+    expect(raiseCalls[1].rule).toBe('findings-truncated');
+  });
+
+  it('a never-answering speak is cut by the budget timeout and counts one announceFailures', async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, speakCalls, raiseCalls } = makeDeps({
+        alertMode: 'on',
+        alertSpeak: () => new Promise<never>(() => {}),
+        stateRead: okState(tickStaleSnapshot()) as never,
+        openItems: [],
+      });
+      const pending = run(deps, baseRequest());
+      let settledEarly = false;
+      void pending.then(() => {
+        settledEarly = true;
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(settledEarly).toBe(false);
+      await vi.advanceTimersByTimeAsync(400_000);
+      const result = await pending;
+      expect(result).toMatchObject({
+        outcome: 'evaluated',
+        announced: 0,
+        announceFailures: 1,
+        announceSuppressed: 0,
+        raised: 1,
+      });
+      expect(speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+      expect(raiseCalls.map((call) => call.rule)).toEqual(['tick-stale']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clock invalid mid speak loop -> refused invalid-clock', async () => {
+    const base = {
+      alertMode: 'on' as const,
+      stateRead: okState(tickAndStalledSnapshot()) as never,
+      openItems: [],
+    };
+    const thrown = makeDeps({
+      ...base,
+      nowBehavior: (index) => {
+        if (index >= 5) {
+          throw new Error('clock');
+        }
+        return NOW;
+      },
+    });
+    const thrownResult = await run(thrown.deps, baseRequest());
+    expect(thrownResult).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' });
+    expect(thrown.speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(thrown.raiseCalls).toHaveLength(0);
+
+    const malformed = makeDeps({
+      ...base,
+      nowBehavior: (index) => (index >= 5 ? 'not-a-clock' : NOW),
+    });
+    const malformedResult = await run(malformed.deps, baseRequest());
+    expect(malformedResult).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' });
+    expect(malformed.speakCalls).toEqual([{ sentence: SENTENCE_TICK_STALE }]);
+    expect(malformed.raiseCalls).toHaveLength(0);
   });
 });

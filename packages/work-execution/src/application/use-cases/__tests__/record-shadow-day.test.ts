@@ -10,12 +10,17 @@ import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.
 import type { ShadowLedger } from '../../../domain/shadow-evidence-ledger.js';
 import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifactAdapter.adapter.js';
 import type { ImportTrainStateKey, ImportTrainStateResult } from '../../ports/in/ImportTrainStatePort.in-port.js';
-import type { ChainRepositoryPort } from '../../ports/out/ChainRepositoryPort.out-port.js';
+import type { ChainListCommand, ChainRepositoryPort } from '../../ports/out/ChainRepositoryPort.out-port.js';
 import type { LegacyTrainEventsRead, LegacyTrainStateRead } from '../../ports/out/LegacyTrainStateReadPort.out-port.js';
 import type {
   ShadowConformanceRunsDependencies,
   ShadowGateHeadsDependencies,
 } from '../shadow-day/index.js';
+import {
+  readShadowConformanceRuns,
+} from '../shadow-day/index.js';
+import { extractShadowShellFacts } from '../../../domain/shadow-day-shell-facts.js';
+import { parseShellTrainEvents } from '../../../domain/shell-train-events.js';
 import type { ShadowLedgerReadResult } from '../../ports/out/ShadowEvidencePort.out-port.js';
 import type { RecordShadowDayRequest, RecordShadowDayResult } from '../../ports/in/RecordShadowDayPort.in-port.js';
 import {
@@ -621,6 +626,13 @@ interface ConductedOptions {
   readonly ciOverride?: Map<string, string>;
   /** The receipts read throws (`receipts-unavailable`). */
   readonly receiptsThrow?: boolean;
+  /**
+   * Collects, one per forge `readCommitContext` call, the deadline the
+   * `readShadowGateHeads` reader derived for it (`nowIso` + `timeoutMs`):
+   * the reader never hands a fake port the raw `deadlineIso`, only this
+   * derived timeout, so the deadline is recorded reconstructed.
+   */
+  readonly forgeDeadlines?: string[];
 }
 
 /**
@@ -731,7 +743,10 @@ function conductedFacts(options: ConductedOptions): ShadowConformanceRunsDepende
       },
     } as unknown as ShadowConformanceRunsDependencies['receipts'],
     forge: {
-      readCommitContext: async (command: { headSha: string }) => {
+      readCommitContext: async (command: { headSha: string; timeoutMs?: number }) => {
+        if (options.forgeDeadlines !== undefined && typeof command.timeoutMs === 'number') {
+          options.forgeDeadlines.push(new Date(Date.parse(NOW) + command.timeoutMs).toISOString());
+        }
         if (options.forgeOutcome === 'unavailable') {
           return { outcome: 'unavailable' };
         }
@@ -746,12 +761,18 @@ function conductedFacts(options: ConductedOptions): ShadowConformanceRunsDepende
   };
 }
 
-/** The chain store S7 lists: one fake record per given state, or a failing store. */
+/**
+ * The chain store S7 lists: one fake record per given state, or a failing
+ * store. `deadlineRecorder` (fix round: the deadline must be asserted)
+ * collects the `deadlineIso` of every `listChains` call in order.
+ */
 function chainStore(
   statesOrFailure: readonly string[] | 'throws' | 'unreadable',
+  deadlineRecorder?: string[],
 ): Pick<ChainRepositoryPort, 'listChains'> {
   return {
-    listChains: async () => {
+    listChains: async (command: ChainListCommand) => {
+      deadlineRecorder?.push(command.deadlineIso);
       if (statesOrFailure === 'throws') {
         throw new Error('chain store failed');
       }
@@ -2120,6 +2141,13 @@ describe('RecordShadowDayUseCase', () => {
       digest: expectedS6Digest(DAY, 'fail', 'merged-head-unlinked'),
       recordedAtIso: RECORDED_AT_ISO,
     });
+    // The rerun really re-evaluated S6: the filter excluded the D+1 event, so
+    // the evaluated 'fail' verdict came back (not a skipped criterion riding
+    // on the stored one). If the filter regressed to admitting every event,
+    // the rerun would yield S6 unevaluated and this pair of assertions would
+    // fail while the plain 'unchanged' above would still pass.
+    expect(result.recorded.S6).toBe('fail');
+    expect(result.unevaluated.map((entry) => entry.criterion)).not.toContain('S6');
     expect(harness.evidence.stored).toEqual(before);
   });
 
@@ -2245,5 +2273,150 @@ describe('RecordShadowDayUseCase', () => {
     expectRecorded(result);
     expect(harness.otherCalls.legacy).toBe(1);
     expect(harness.otherCalls.legacyState).toBe(2);
+  });
+
+  it('refuses a rerun whose S4 verdict stays a fail while a settled head changed CI state between runs', async () => {
+    // Two pushed heads whose conductor passed them but whose CI gates failed
+    // them: two false passes on day D, so S4 records fail (gate-false-pass).
+    const failingHeads: GateHeadSpec[] = [
+      { headOid: oid(7), conductorVerdict: 'pass', pushedAtIso: `${DAY}T07:00:00Z`, ciGate: 'failure' },
+      { headOid: oid(8), conductorVerdict: 'pass', pushedAtIso: `${DAY}T07:30:00Z`, ciGate: 'failure' },
+    ];
+    const ciOverride = new Map<string, string>();
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: failingHeads,
+      conformanceRuns: conformanceRunSpecs(),
+      ciOverride,
+    });
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    expect(first.recorded.S4).toBe('fail');
+    const before = harness.evidence.stored;
+
+    // One settled head's CI state changes between runs, through the forge
+    // override the reader reads. Its conductor verdict is unchanged, so the
+    // day's S4 verdict stays a fail for the remaining false pass — and the
+    // digest covers the heads' own fields (`headsDigest`), so the changed
+    // head alone makes the rerun a verdict-conflict, never a silent
+    // overwrite. (Among the two settled CI states the evaluator keeps —
+    // success and failure — a single-head change also moves that head's own
+    // classification, which is exactly why the heads must be in the digest.)
+    ciOverride.set(oid(7), 'success');
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'verdict-conflict' });
+    expect(harness.evidence.stored).toEqual(before);
+  });
+
+  it("reports S7 unevaluated (chain-state-unreadable) when S8's state read throws so chains is undefined", async () => {
+    const harness = wiredHarness(cleanFixture(DAY), {});
+    (harness.deps.legacy as unknown as { readLegacyTrainState: () => Promise<never> }).readLegacyTrainState =
+      async () => {
+        throw new Error('legacy state read failed');
+      };
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S7')).toBe('chain-state-unreadable');
+  });
+
+  it('keeps closed day D S6 passing with unchanged anomalies when a D+1 shell event would change the facts (day-end filter)', async () => {
+    // D's S6 passes on the five conducted runs. A D+1 `result`/`updated`
+    // event for pr 7 is an unpaired update: admitting it (dropping the
+    // day-end filter) would put pr 7 in `headMovesIncompleteFor` and add a
+    // D+1 `unpaired-update` anomaly, flipping the closed day's S6 to unknown
+    // (`head-moves-incomplete`). The filter must exclude it from both.
+    const fixture = conformingFixture();
+    const harness = wiredHarness(fixture, {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    expect(first.recorded.S6).toBe('pass');
+    const before = harness.evidence.stored;
+
+    const dPlusOneEvent = JSON.stringify({
+      at: '2026-11-17T01:00:00Z',
+      kind: 'result',
+      outcome: 'updated',
+      pr: 7,
+      headOid: HEAD_B,
+      detail: 'x',
+    });
+    // Mutation proof: with the day's own bound applied here, the D+1 event is
+    // excluded and the facts carry no anomaly for it; without the bound the
+    // facts change in both the incomplete-head-move and anomaly fields.
+    const parsed = parseShellTrainEvents([...fixture.shellLines, dPlusOneEvent]);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      const dayEndMs = Date.parse('2026-11-17T00:00:00.000Z');
+      const bounded = parsed.events.filter((event) => Date.parse(event.atIso) < dayEndMs);
+      const unbounded = extractShadowShellFacts(parsed.events);
+      const boundedFacts = extractShadowShellFacts(bounded);
+      expect(unbounded.ok && boundedFacts.ok).toBe(true);
+      if (unbounded.ok && boundedFacts.ok) {
+        expect(unbounded.facts.headMovesIncompleteFor).toEqual([7]);
+        expect(unbounded.facts.anomalies).toEqual([{ atIso: '2026-11-17T01:00:00Z', code: 'unpaired-update' }]);
+        expect(boundedFacts.facts.headMovesIncompleteFor).toEqual([]);
+        expect(boundedFacts.facts.anomalies).toEqual([]);
+      }
+    }
+
+    fixture.shellLines.push(dPlusOneEvent);
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expectRecorded(result);
+    expect(result.outcome).toBe('unchanged');
+    expect(result.recorded.S6).toBe('pass');
+    expect(result.unevaluated.map((entry) => entry.criterion)).not.toContain('S6');
+    expect(harness.evidence.stored).toEqual(before);
+  });
+
+  it('passes the request deadline to the chain store and to both conducted-facts readers', async () => {
+    const chainDeadlines: string[] = [];
+    const forgeDeadlines: string[] = [];
+    const harness = wiredHarness(
+      conformingFixture(),
+      {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+        forgeDeadlines,
+      },
+      ['landed', 'refused'],
+    );
+    setChains(harness, chainStore(['landed', 'refused'], chainDeadlines));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S4).toBe('pass');
+    expect(result.recorded.S6).toBe('pass');
+    expect(result.recorded.S7).toBe('pass');
+    const requestDeadline = makeRequest().deadlineIso as string;
+
+    // `listChains` receives the request's deadline directly.
+    expect(chainDeadlines).toEqual([requestDeadline]);
+
+    // The gate-heads reader never hands a fake port the raw deadline, only
+    // the forge timeout derived from it, so its recorded instant — the
+    // reader's own clock plus that timeout — must reconstruct the deadline.
+    expect(forgeDeadlines.length).toBeGreaterThan(0);
+    for (const derived of forgeDeadlines) {
+      expect(derived).toBe(requestDeadline);
+    }
+
+    // The conformance-runs reader compares the deadline it receives against
+    // its own clock and surfaces it to no fake port, so its receipt of the
+    // deadline is pinned reader-level: a past value is refused with
+    // `deadline-exceeded` and the request's own deadline is not.
+    const facts = conductedFacts({ conformanceRuns: conformanceRunSpecs() });
+    const late = await readShadowConformanceRuns(facts, { mergedPullRequests: [7], deadlineIso: PAST_DEADLINE });
+    expect(late.status).toBe('unknown');
+    if (late.status === 'unknown') {
+      expect(late.reason).toBe('deadline-exceeded');
+    }
+    const onTime = await readShadowConformanceRuns(facts, { mergedPullRequests: [7], deadlineIso: requestDeadline });
+    expect(onTime.status).toBe('ok');
   });
 });

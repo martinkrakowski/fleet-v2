@@ -319,9 +319,13 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // The shell events are read once and shared by S1 and S6', so
     // `readLegacyTrainEvents` is never called twice in one run.
     const shell = await this.readShellEvents(context);
+    // S1's live reads follow the journal and shell reads directly, so intake's
+    // 150 s settle sleep cannot push them minutes past the evidence they
+    // reconcile against.
+    const mergeSet = await this.evaluateMergeSetCriterion(context, journal, shell);
     const intake = await this.evaluateIntakeCriterion(context);
     const outcomes = [
-      await this.evaluateMergeSetCriterion(context, journal, shell),
+      mergeSet,
       intake.outcome,
       await this.evaluateStateIntegrityCriterion(context, journal),
       await this.evaluateTickHealthCriterion(context),

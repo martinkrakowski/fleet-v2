@@ -285,6 +285,12 @@ function verdictFor(score: Score): ShadowConformanceEvaluation {
   return conformanceResult('pass', 'conducted-runs-conform', score.counts);
 }
 
+/**
+ * Builds the rule context. Cost: linear in `headMoves` and
+ * `headMovesIncompleteFor`, each capped by
+ * `SHADOW_CONFORMANCE_MAX_SHELL_FACTS`: it groups the capped head moves and
+ * builds a set from the capped incomplete list.
+ */
 function contextOf(parsed: ParsedInput): RuleContext {
   return {
     headMoves: parsed.headMoves,
@@ -500,7 +506,11 @@ function ruleHeadLinkage(run: ShadowConformanceRun, merge: ShadowShellMerge, con
   return 'merged-head-unlinked';
 }
 
-/** True when a bounded breadth-first path links the run head to the merge head. */
+/**
+ * True when a bounded breadth-first path links the run head to the merge head.
+ * Cost: linear in the capped head moves (`SHADOW_CONFORMANCE_MAX_SHELL_FACTS`)
+ * and bounded by `SHADOW_CONFORMANCE_MAX_HOPS` hops.
+ */
 function linkedWithinHops(run: ShadowConformanceRun, merge: ShadowShellMerge, context: RuleContext): boolean {
   const moves = context.headMovesByPullRequest.get(run.pullRequest);
   if (moves === undefined) return false;

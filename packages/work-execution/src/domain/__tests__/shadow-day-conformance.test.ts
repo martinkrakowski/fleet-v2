@@ -1057,7 +1057,7 @@ describe('hostile input', () => {
     expect(json).not.toContain(String(pullFor(8)));
   });
 
-  it('no input yields pass', () => {
+  it('each non-passing input set (rule 2-5 breakage, merge ambiguity, a stray on D, null) does not pass', () => {
     // A floor-meeting day now passes, including one with a D-1 break added
     // on top. This loop keeps only sets that must not pass.
     const base = conforming(6, 1, iso(DAY, 16));
@@ -1202,6 +1202,27 @@ describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
     const base = added();
     const key = oneWayKey(base.run.runId, 'open-pr', base.run.headOid, null);
     const broken = extendJournal(base, [conductAt('gating', at), intentAt(key, at)]);
+    expect(evaluate(onTop(broken))).toEqual(
+      scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }),
+    );
+  });
+
+  it('a merge intent while the state is not merging yields fail/stray-one-way-action', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'merge', base.run.headOid, null);
+    const broken = extendJournal(base, [conductAt('gating', at), intentAt(key, at)]);
+    expect(evaluate(onTop(broken))).toEqual(
+      scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }),
+    );
+  });
+
+  it('a conduct entry with state null makes a following one-way intent stray', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'open-pr', base.run.headOid, null);
+    const broken = extendJournal(base, [
+      { kind: 'conduct', key: null, recordedAtIso: at, outcome: null, reasonCode: null, state: null },
+      intentAt(key, at),
+    ]);
     expect(evaluate(onTop(broken))).toEqual(
       scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }),
     );

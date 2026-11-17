@@ -7,8 +7,13 @@
  * result; the parser never throws.
  *
  * Cost bound: linear in the capped input — at most `SHELL_EVENTS_MAX_LINES`
- * lines, each at most `SHELL_EVENT_MAX_LINE_LENGTH` characters, each read a
- * constant number of times.
+ * lines, each read a constant number of times, with at most
+ * `SHELL_EVENT_MAX_LINE_LENGTH` characters of each line actually scanned.
+ * This holds for the secret-shape check too: it runs against the line's first
+ * `SHELL_EVENT_MAX_LINE_LENGTH`-character prefix, never the full raw string,
+ * so an arbitrarily long raw line costs no more to scan than a capped one. A
+ * secret shape that appears only beyond that prefix is not detected, which is
+ * the same boundary the length cap already draws for every other line.
  */
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
@@ -257,7 +262,14 @@ export function parseShellTrainEvents(input: unknown): ShellTrainEventsParse {
       // Secret-shape detection runs before, and independently of, the length
       // check below: every secret-shaped raw line is counted in
       // `secretShapedLines`, whether or not it is ALSO over the length cap.
-      if (isSecretShaped(raw)) {
+      // The scan itself is bounded to the first SHELL_EVENT_MAX_LINE_LENGTH
+      // characters (not the full raw string): an over-length line is still
+      // correctly reported as unknown by the length check right after, but
+      // the regex cost of getting there never grows past the cap, however
+      // long the actual raw line is.
+      const secretShapeScanInput =
+        raw.length > SHELL_EVENT_MAX_LINE_LENGTH ? raw.slice(0, SHELL_EVENT_MAX_LINE_LENGTH) : raw;
+      if (isSecretShaped(secretShapeScanInput)) {
         unknownLines.push(index);
         secretShapedLines += 1;
         continue;

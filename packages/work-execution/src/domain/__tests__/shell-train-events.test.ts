@@ -279,6 +279,39 @@ describe('parseShellTrainEvents', () => {
     expect(result.unknownLines).toEqual([1]);
   });
 
+  it('does not detect a secret shape that starts only after the length cap', () => {
+    // The secret-shape scan runs against the capped prefix, not the full raw
+    // string (SH3 cost-bound fix round): a secret shape placed entirely
+    // beyond SHELL_EVENT_MAX_LINE_LENGTH characters falls outside that
+    // prefix, so it is not detected. The line is still correctly refused as
+    // unknown by the length check right after it — not a new gap, the same
+    // boundary the length cap already draws for every other line. If the
+    // scan ever regressed to reading the full raw string again, this would
+    // start failing (secretShapedLines would become 1).
+    const beyondCapSecret = `${'x'.repeat(SHELL_EVENT_MAX_LINE_LENGTH)}${fakeSecretShape()}`;
+    expect(beyondCapSecret.length).toBeGreaterThan(SHELL_EVENT_MAX_LINE_LENGTH);
+    const result = parseShellTrainEvents([eventJson(), beyondCapSecret]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.secretShapedLines).toBe(0);
+  });
+
+  it('still correctly refuses a non-secret-shaped line far longer than the cap as unknown', () => {
+    // Many times the length cap, built with one repeat() call so the test
+    // itself does no slow work. Behaviour is unchanged by the cost-bound fix:
+    // still reported as unknown, never counted as secret-shaped, exactly like
+    // any other over-length line — the fix bounds the secret-shape scan's
+    // cost, it does not change what gets classified as unknown.
+    const veryLong = 'q'.repeat(SHELL_EVENT_MAX_LINE_LENGTH * 10);
+    const result = parseShellTrainEvents([eventJson(), veryLong]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.secretShapedLines).toBe(0);
+    expect(result.events).toHaveLength(1);
+  });
+
   it('stores MERGED as merged', () => {
     const result = parseShellTrainEvents([eventJson({ outcome: 'MERGED' })]);
     expect(result.ok).toBe(true);

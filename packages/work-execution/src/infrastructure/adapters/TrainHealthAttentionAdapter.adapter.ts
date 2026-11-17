@@ -11,10 +11,10 @@
  * the stored `lastRaisedAtIso` captured immediately before the overwrite, a
  * zoned ISO string exactly as stored and never re-formatted. The adapter makes
  * no second read of its own. It is null when the outcome is `raised` (no prior
- * open or closed record). For `reopened` it is the closed record's last raise
- * time when the store keeps `lastRaisedAtIso` on cleared records (operator
- * coordination's store does); an answer that carries no usable value maps to
- * null.
+ * open or closed record). For `refreshed` and `reopened` the answer must carry
+ * `previousRaisedAtIso` as null or a zoned ISO string, returned exactly as
+ * stored and never re-formatted; anything else is a failed raise, and the
+ * adapter never synthesizes a value.
  *
  * Project-scoped items use subject `{ kind: 'project', ref: projectId }`
  * because that store subject cannot carry owner/repo. A list keeps such an
@@ -315,20 +315,25 @@ function mapAttentionAnswer<T extends string>(answer: unknown, accepted: readonl
 /**
  * The raise answer's `previousRaisedAtIso`, read under the delegate's lock as
  * part of the same answer that refreshed the item. `raised` has no prior
- * record, so it is null; for `refreshed` and `reopened` the answer's value is
- * returned exactly as stored when it is a zoned ISO string, and null when the
- * store keeps no previous raise time (a closed record whose
- * `lastRaisedAtIso` was dropped). Never re-formatted, never throws.
+ * record, so it is null. For `refreshed` and `reopened` the answer's value is
+ * returned exactly as stored when it is null or a zoned ISO string; anything
+ * else is a failed raise, never synthesized. Never re-formatted, never throws.
  */
-function previousRaisedAtIsoOf(answer: unknown, outcome: string): string | null {
+function previousRaisedAtIsoOf(answer: unknown, outcome: string): { readonly ok: true; readonly value: string | null } | { readonly ok: false } {
   try {
     if (outcome === 'raised') {
-      return null;
+      return { ok: true, value: null };
     }
     const value = ownValue(answer, 'previousRaisedAtIso');
-    return isZonedIsoDateTime(value) ? value : null;
+    if (value === null) {
+      return { ok: true, value: null };
+    }
+    if (isZonedIsoDateTime(value)) {
+      return { ok: true, value };
+    }
+    return { ok: false };
   } catch {
-    return null;
+    return { ok: false };
   }
 }
 
@@ -338,7 +343,11 @@ function mapRaiseAnswer(answer: unknown): RaiseTrainHealthAttentionResult {
   if (mapped.outcome === 'refused') {
     return mapped;
   }
-  return { ...mapped, previousRaisedAtIso: previousRaisedAtIsoOf(answer, mapped.outcome) };
+  const previous = previousRaisedAtIsoOf(answer, mapped.outcome);
+  if (!previous.ok) {
+    return refusedUnreadable();
+  }
+  return { ...mapped, previousRaisedAtIso: previous.value };
 }
 
 function raiseBody(command: Snapshot): {

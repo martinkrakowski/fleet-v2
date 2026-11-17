@@ -3,11 +3,16 @@
 // ports. Summaries are fixed text from ids and codes. The pass deadline is
 // accepted on the command and never forwarded. A raise result carries
 // `previousRaisedAtIso` exactly as the delegate answer stored it before the
-// overwrite: null for `raised`, and for `reopened` the closed record's last
-// raise time when the store keeps `lastRaisedAtIso` on cleared records
-// (operator coordination's store does), otherwise null.
+// overwrite: null for `raised`, and for `refreshed` and `reopened` the stored
+// record's last raise time, which must be null or a zoned ISO string (anything
+// else is a failed raise).
 
 import { describe, expect, it } from 'vitest';
+
+import {
+  AttentionItemRepositoryAdapter,
+  RecordAttentionItemUseCase,
+} from '@fleet/operator-coordination';
 
 import type { TrainHealthAttentionCommand } from '../../../application/ports/out/TrainHealthAttentionPort.out-port.js';
 import {
@@ -320,7 +325,7 @@ describe('TrainHealthAttentionAdapter', () => {
         calls.push({ body, actor });
         const outcome = outcomes[index];
         index += 1;
-        return { outcome };
+        return { outcome, previousRaisedAtIso: null };
       },
     });
     const raw = command();
@@ -383,6 +388,31 @@ describe('TrainHealthAttentionAdapter', () => {
       previousRaisedAtIso: RAISED_AT,
     });
     expect(storedIso).toBe(SECOND);
+  });
+
+  it('returns the first raise time from the REAL RecordAttentionItemUseCase on a second raise', async () => {
+    const FIRST_AT = '2026-11-16T01:02:03.000Z';
+    const SECOND_AT = '2026-11-16T09:02:03.000Z';
+    const at = [FIRST_AT, SECOND_AT];
+    const delegate = new RecordAttentionItemUseCase({
+      itemRepo: new AttentionItemRepositoryAdapter(),
+      clock: { nowIso: () => at.shift() ?? SECOND_AT },
+      ids: { newItemId: () => 'att-real-1' },
+    });
+    const adapter = new TrainHealthAttentionAdapter({
+      recordAttentionItem: (body, actor) => delegate.recordAttentionItem(body, actor),
+    });
+
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'raised',
+      reasonCode: null,
+      previousRaisedAtIso: null,
+    });
+    expect(await adapter.raiseTrainHealthAttention(command())).toEqual({
+      outcome: 'refreshed',
+      reasonCode: null,
+      previousRaisedAtIso: FIRST_AT,
+    });
   });
 
   it('returns the closed record last raise time on reopen, and null when the store keeps none', async () => {

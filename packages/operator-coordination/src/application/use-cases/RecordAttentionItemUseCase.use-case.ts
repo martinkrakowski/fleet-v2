@@ -127,7 +127,7 @@ export class RecordAttentionItemUseCase implements RecordAttentionItemPort {
     //    revision conflict means the minted item id is already taken.
     try {
       const stored = await this.deps.itemRepo.save(candidate.toRecord(), 0);
-      return { outcome: 'raised', item: stored.item, revision: stored.revision };
+      return { outcome: 'raised', item: stored.item, revision: stored.revision, previousRaisedAtIso: null };
     } catch (error) {
       if (error instanceof AttentionItemKeyConflictError) {
         const holder = await this.raiseOnHolder(candidate, nowIso);
@@ -186,7 +186,7 @@ export class RecordAttentionItemUseCase implements RecordAttentionItemPort {
       holder.item.workOrderId === record.workOrderId &&
       holder.item.raisedBy === record.raisedBy
     ) {
-      return { outcome: 'refreshed', item: holder.item, revision: holder.revision };
+      return { outcome: 'refreshed', item: holder.item, revision: holder.revision, previousRaisedAtIso: holder.item.lastRaisedAtIso };
     }
     // An out-of-order raise of an occurrence the stored summary already
     // supersedes (e.g. park 1 re-raised after park 2 was stored) is stale: it
@@ -201,7 +201,7 @@ export class RecordAttentionItemUseCase implements RecordAttentionItemPort {
       storedOrdinal !== null &&
       raiseOrdinal <= storedOrdinal
     ) {
-      return { outcome: 'refreshed', item: holder.item, revision: holder.revision };
+      return { outcome: 'refreshed', item: holder.item, revision: holder.revision, previousRaisedAtIso: holder.item.lastRaisedAtIso };
     }
     const reopened = holder.item.state === 'cleared';
     const loaded = AttentionItem.create(holder.item);
@@ -212,6 +212,9 @@ export class RecordAttentionItemUseCase implements RecordAttentionItemPort {
         reason: 'RecordAttentionItem the stored item could not be read',
       };
     }
+    // The stored item's last-raised time, captured before raiseAgain overwrites
+    // it; this is the raise that the save below replaces.
+    const previousRaisedAtIso = loaded.value.toRecord().lastRaisedAtIso;
     const again = loaded.value.raiseAgain(
       {
         kind: record.kind,
@@ -227,7 +230,7 @@ export class RecordAttentionItemUseCase implements RecordAttentionItemPort {
     }
     try {
       const stored = await this.deps!.itemRepo.save(again.value.toRecord(), holder.revision);
-      return { outcome: reopened ? 'reopened' : 'refreshed', item: stored.item, revision: stored.revision };
+      return { outcome: reopened ? 'reopened' : 'refreshed', item: stored.item, revision: stored.revision, previousRaisedAtIso };
     } catch (error) {
       if (error instanceof AttentionItemRevisionConflictError) {
         return {

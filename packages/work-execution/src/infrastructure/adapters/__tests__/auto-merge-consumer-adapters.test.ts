@@ -242,7 +242,7 @@ describe('AutoMergeOwnerRoutingAdapter', () => {
       recordAttentionItem: async (body, actor) => {
         receivedBody = body;
         receivedActor = actor;
-        return { outcome: 'raised', item: attentionItem(), revision: 1 };
+        return { outcome: 'raised', item: attentionItem(), revision: 1, previousRaisedAtIso: null };
       },
     };
     const adapter = new AutoMergeOwnerRoutingAdapter({ recordAttentionItem: delegate });
@@ -392,7 +392,7 @@ describe('AutoMergeOwnerRoutingAdapter', () => {
     const attention: AttentionPortDelegate = {
       recordAttentionItem: async (body) => {
         capturedSummary = (body as RecordAttentionItemBody).summary;
-        return { outcome: 'raised', item: attentionItem(), revision: 1 };
+        return { outcome: 'raised', item: attentionItem(), revision: 1, previousRaisedAtIso: null };
       },
     };
     const ask: AskPortDelegate = {

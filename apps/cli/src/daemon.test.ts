@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
-import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { sha256HexDigest, type GhInvocationResult, type DaemonStatusRecord } from '@fleet/work-execution';
 import { loadInstallation, type FleetInstallation } from '@fleet/installation';
@@ -16,7 +16,11 @@ import {
   daemonHelpRequested,
   watchdogRepositoryReport,
 } from './daemon.js';
-import { mergePolicySourceFromLoad, toDaemonRepositoryRefs } from './composition/daemon.js';
+import {
+  mergePolicySourceFromLoad,
+  resolveAudibleAlertMode,
+  toDaemonRepositoryRefs,
+} from './composition/daemon.js';
 import { runCli, type CliIo } from './index.js';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -36,6 +40,12 @@ afterAll(() => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+});
+
+// CO-WD9a: no test in this file may ever start a real speech program, even when
+// a developer has FLEET_AUDIBLE_ALERT set in their own shell.
+beforeEach(() => {
+  vi.stubEnv('FLEET_AUDIBLE_ALERT', '');
 });
 
 function tempDir(): string {
@@ -1116,7 +1126,13 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     }
     const answer = await run(withPolicy(h, { ...real, repositories: [] }), ['daemon', 'watchdog', '--json']);
     expect(answer.code).toBe(0);
-    expect(lastJson(answer.out)).toEqual({ outcome: 'completed', exitCode: 0, repositoryCount: 0, repositories: [] });
+    expect(lastJson(answer.out)).toEqual({
+      outcome: 'completed',
+      exitCode: 0,
+      repositoryCount: 0,
+      repositories: [],
+      audibleAlert: 'off',
+    });
   });
 
   it('a throwing watch and a null watch both fail closed to a watch-failed repo entry with exit 1', async () => {
@@ -1136,6 +1152,10 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
         raised: 0,
         cleared: 0,
         attentionFailures: 0,
+        announced: 0,
+        announceFailures: 0,
+        announceSuppressed: 0,
+        announceUnspoken: 0,
       },
     ]);
     expect(throwing.out).not.toContain(h.stateDir);
@@ -1163,6 +1183,10 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
         raised: 0,
         cleared: 0,
         attentionFailures: 0,
+        announced: 0,
+        announceFailures: 0,
+        announceSuppressed: 0,
+        announceUnspoken: 0,
       },
     ]);
   });
@@ -1190,6 +1214,10 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
         raised: 0,
         cleared: 0,
         attentionFailures: 0,
+        announced: 0,
+        announceFailures: 0,
+        announceSuppressed: 0,
+        announceUnspoken: 0,
       },
     ]);
   });
@@ -1271,6 +1299,10 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
         raised: 0,
         cleared: 0,
         attentionFailures: 0,
+        announced: 0,
+        announceFailures: 0,
+        announceSuppressed: 0,
+        announceUnspoken: 0,
       },
     ]);
   });
@@ -1495,6 +1527,185 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     expect(JSON.stringify(report)).not.toContain('echo-me-not');
     expect(JSON.stringify(report)).not.toContain('/tmp/secret');
     expect(JSON.stringify(report)).not.toContain('etc/passwd');
+  });
+
+  // --- CO-WD9a: the opt-in audible alert ---------------------------------
+
+  it('(a) with no injected alert and FLEET_AUDIBLE_ALERT empty the JSON reports audibleAlert off, zero speaks and the ordinary exit code', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    await writeTickStatus(h, new Date(Date.parse(nowIso) - 10 * 60_000).toISOString());
+    const answer = await run(h.runtime, ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out)).toMatchObject({ outcome: 'completed', exitCode: 1, audibleAlert: 'off' });
+    expect(lastJson(answer.out).repositories).toMatchObject([
+      { outcome: 'evaluated', healthy: false, announced: 0, announceFailures: 0, announceSuppressed: 0, announceUnspoken: 0 },
+    ]);
+  });
+
+  it('(e) a speak that throws on a stale tick keeps the pass, exits 1 with announceFailures 1 and leaves train-tick-stale open', async () => {
+    const nowIso = new Date().toISOString();
+    let speakCalls = 0;
+    const h = harness([REPO_A], {
+      daemonNow: () => nowIso,
+      daemonAudibleAlert: {
+        speak: async () => {
+          speakCalls += 1;
+          throw new Error('speaker exploded');
+        },
+      },
+    });
+    await writeTickStatus(h, new Date(Date.parse(nowIso) - 10 * 60_000).toISOString());
+    const answer = await run(h.runtime, ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out).repositories).toMatchObject([
+      { outcome: 'evaluated', healthy: false, announced: 0, announceFailures: 1 },
+    ]);
+    expect(speakCalls).toBeGreaterThanOrEqual(1);
+    const listed = (await h.runtime.coordination.listAttentionItems.listAttentionItems({ state: 'open' })) as {
+      readonly items: ReadonlyArray<{ readonly item: { readonly kind: string } }>;
+    };
+    expect(listed.items.filter((entry) => entry.item.kind === 'train-tick-stale')).toHaveLength(1);
+  });
+
+  it('(e) an announceUnspoken of 1 on a healthy evaluated pass exits 0 and reports announceUnspoken 1 (unspoken skips are best-effort)', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(
+      withWatch(h, async () => ({ ...VALID_ANSWER, announceUnspoken: 1 })),
+      ['daemon', 'watchdog', '--json'],
+    );
+    expect(answer.code).toBe(0);
+    expect(lastJson(answer.out)).toMatchObject({ outcome: 'completed', exitCode: 0, audibleAlert: 'off' });
+    expect(lastJson(answer.out).repositories).toMatchObject([
+      { outcome: 'evaluated', healthy: true, announceUnspoken: 1, exitCode: 0 },
+    ]);
+  });
+
+  it('(g) with FLEET_AUDIBLE_ALERT=banana a healthy train still exits 1 with reasonCode audible-alert-invalid and never echoes the value', async () => {
+    vi.stubEnv('FLEET_AUDIBLE_ALERT', 'banana');
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    await writeTickStatus(h, nowIso);
+    const answer = await run(h.runtime, ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out)).toMatchObject({
+      outcome: 'completed',
+      exitCode: 1,
+      audibleAlert: 'invalid',
+      reasonCode: 'audible-alert-invalid',
+    });
+    expect(lastJson(answer.out).repositories).toMatchObject([
+      { outcome: 'evaluated', healthy: true, announced: 0, announceFailures: 0 },
+    ]);
+    expect(answer.out).not.toContain('banana');
+    expect(answer.err).not.toContain('banana');
+  });
+
+  it('(h) in text mode the first line is `watchdog audible-alert=off` and each repository line ends with ` announced=0`', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    await writeTickStatus(h, nowIso);
+    const answer = await run(h.runtime, ['daemon', 'watchdog']);
+    expect(answer.code).toBe(0);
+    const lines = answer.out.trim().split('\n');
+    expect(lines[0]).toBe('watchdog audible-alert=off');
+    expect(lines[1]).toBe(
+      `watchdog ${digestOf(REPO_A)} healthy findings=0 raised=0 cleared=0 announced=0`,
+    );
+  });
+
+  it('(f) resolveAudibleAlertMode(null) is invalid', () => {
+    expect(resolveAudibleAlertMode(null)).toBe('invalid');
+  });
+
+  it('(f) resolveAudibleAlertMode(undefined) is invalid', () => {
+    expect(resolveAudibleAlertMode(undefined)).toBe('invalid');
+  });
+
+  it('(f) resolveAudibleAlertMode refuses wrong primitives: 42, a bare string, on, 1, padded and uppercased values', () => {
+    for (const env of [42, 'spd-say', 'on', '1', ' spd-say', 'SPD-SAY']) {
+      expect(resolveAudibleAlertMode(env), JSON.stringify(env)).toBe('invalid');
+    }
+  });
+
+  it('(f) resolveAudibleAlertMode pins exact match: padded, trailing, uppercased, on, 1 and numeric values are invalid', () => {
+    for (const value of [' spd-say', 'spd-say ', 'SPD-SAY', 'on', '1', 42]) {
+      const env = { FLEET_AUDIBLE_ALERT: value } as Record<string, unknown>;
+      expect(resolveAudibleAlertMode(env), String(value)).toBe('invalid');
+    }
+  });
+
+  it('(f) resolveAudibleAlertMode answers off for a plain empty object and for an array-like object without the own key', () => {
+    expect(resolveAudibleAlertMode({})).toBe('off');
+    expect(resolveAudibleAlertMode({ length: 1, 0: 'spd-say' })).toBe('off');
+  });
+
+  it('(f) resolveAudibleAlertMode refuses a sparse array (an array hole where an env object is due)', () => {
+    // eslint-disable-next-line no-sparse-arrays
+    const sparse = [,];
+    expect(resolveAudibleAlertMode(sparse)).toBe('invalid');
+  });
+
+  it('(f) resolveAudibleAlertMode refuses an enormous sparse array of length 2**32 - 1 before any traversal', () => {
+    const enormous = new Array(2 ** 32 - 1);
+    expect(resolveAudibleAlertMode(enormous)).toBe('invalid');
+  });
+
+  it('(f) a getter on FLEET_AUDIBLE_ALERT never runs: the call counter stays 0 and the mode is invalid', () => {
+    let calls = 0;
+    const env: Record<string, unknown> = {};
+    Object.defineProperty(env, 'FLEET_AUDIBLE_ALERT', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return 'spd-say';
+      },
+    });
+    expect(resolveAudibleAlertMode(env)).toBe('invalid');
+    expect(calls, 'no getter may run').toBe(0);
+  });
+
+  it('(f) a Proxy over a valid env yields exactly the plain-data verdict with no get trap, and a revoked Proxy is invalid', () => {
+    let getTraps = 0;
+    const proxied = new Proxy({ FLEET_AUDIBLE_ALERT: 'spd-say' }, {
+      get(target, key) {
+        getTraps += 1;
+        return Reflect.get(target, key);
+      },
+    });
+    expect(resolveAudibleAlertMode(proxied)).toBe('spd-say');
+    expect(getTraps, 'no get trap may run').toBe(0);
+
+    const { proxy, revoke } = Proxy.revocable({ FLEET_AUDIBLE_ALERT: 'spd-say' }, {});
+    revoke();
+    expect(resolveAudibleAlertMode(proxy)).toBe('invalid');
+  });
+
+  it('(f) a prototype-polluting own __proto__ key from JSON.parse answers off without polluting Object.prototype', () => {
+    const hostile = JSON.parse(
+      '{"__proto__":{"polluted":true},"constructor":1,"prototype":1}',
+    ) as Record<string, unknown>;
+    expect(resolveAudibleAlertMode(hostile)).toBe('off');
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(({} as Record<string, unknown>).constructor).toBe(Object);
+  });
+
+  it('(f) the mode is not a constant: spd-say, off and invalid are three distinct verdicts', () => {
+    const spoken = resolveAudibleAlertMode({ FLEET_AUDIBLE_ALERT: 'spd-say' });
+    const silent = resolveAudibleAlertMode({});
+    const broken = resolveAudibleAlertMode({ FLEET_AUDIBLE_ALERT: 'banana' });
+    expect(spoken).toBe('spd-say');
+    expect(silent).toBe('off');
+    expect(broken).toBe('invalid');
+    expect(new Set([spoken, silent, broken]).size).toBe(3);
+  });
+
+  it('(f) the mode is not an identity echo: hostile inputs never come back as themselves', () => {
+    expect(resolveAudibleAlertMode({ FLEET_AUDIBLE_ALERT: 'banana' })).not.toBe('banana');
+    expect(resolveAudibleAlertMode(42)).not.toBe(42);
+    expect(resolveAudibleAlertMode('spd-say')).not.toBe('spd-say');
+    expect(resolveAudibleAlertMode(null)).not.toBe(null);
   });
 });
 

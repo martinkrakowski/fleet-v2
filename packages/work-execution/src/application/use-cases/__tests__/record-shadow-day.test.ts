@@ -30,6 +30,14 @@ const DAY = '2026-11-16';
 const NOW = '2026-11-17T12:00:00.000Z';
 const DEADLINE = '2026-11-17T12:05:00.000Z';
 const PAST_DEADLINE = '2026-11-17T11:00:00.000Z';
+/**
+ * `buildVerdicts`'s `recordedAtIso` for any single `execute()` call against
+ * a fresh harness started at `NOW`: exactly one S8 sample pair is taken, so
+ * the fake clock advances by exactly one `sleep(150_000)` (the default
+ * sample gap) before verdicts are built, and nothing else advances it.
+ * `NOW` plus 150 real seconds is `2026-11-17T12:02:30.000Z`.
+ */
+const RECORDED_AT_ISO = '2026-11-17T12:02:30.000Z';
 const NOT_IMPLEMENTED: readonly CutoverShadowCriterion[] = [
   'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S10', 'S11', 'S13',
 ];
@@ -461,17 +469,21 @@ describe('RecordShadowDayUseCase', () => {
     const dayRecord = stored?.days.find((entry) => entry.day === DAY);
     expect(dayRecord?.mergesCompared).toBe(1);
     expect(dayRecord?.releaseSha).toBe(RELEASE);
-    expect(dayRecord?.verdicts.S1).toMatchObject({ verdict: 'pass', reason: 'merge-set-equal' });
-    expect(dayRecord?.verdicts.S1?.digest).toBe(
-      expectedS1Digest(DAY, 'pass', 'merge-set-equal', {
+    expect(dayRecord?.verdicts.S1).toEqual({
+      verdict: 'pass',
+      reason: 'merge-set-equal',
+      digest: expectedS1Digest(DAY, 'pass', 'merge-set-equal', {
         mergesCompared: 1,
         excludedBatchMerges: 0,
         compared: 1,
         divergences: 0,
       }),
-    );
-    expect(dayRecord?.verdicts.S8?.digest).toBe(
-      expectedS8Digest(DAY, 'pass', 'intake-equal', {
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(dayRecord?.verdicts.S8).toEqual({
+      verdict: 'pass',
+      reason: 'intake-equal',
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
         aFleetCount: 1,
         aShellCount: 1,
         aCompared: 1,
@@ -481,7 +493,8 @@ describe('RecordShadowDayUseCase', () => {
         bCompared: 1,
         bDivergences: 0,
       }),
-    );
+      recordedAtIso: RECORDED_AT_ISO,
+    });
     expect(dayRecord?.verdicts.S9?.digest).toBe(expectedSimpleDigest('S9', DAY, 'pass', 'state-consistent'));
     expect(dayRecord?.verdicts.S12?.digest).toBe(expectedSimpleDigest('S12', DAY, 'pass', 'ticks-within-budget'));
     expectNotImplementedUnevaluated(result.unevaluated);
@@ -559,6 +572,10 @@ describe('RecordShadowDayUseCase', () => {
     expectRecorded(result);
 
     expect(result.recorded).toEqual({ S8: 'pass', S9: 'pass', S12: 'pass' });
+    // S1 never evaluated on this path, so `mergesCompared` stays at its
+    // unset default rather than a stale or guessed count.
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.mergesCompared).toBeNull();
     const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
     expect(reasons.get('S1')).toBe('shell-events-unavailable');
     expectNotImplementedUnevaluated(result.unevaluated);
@@ -666,9 +683,10 @@ describe('RecordShadowDayUseCase', () => {
     expect(result.recorded.S8).toBe('fail');
     const stored = harness.evidence.stored;
     const dayRecord = stored?.days.find((entry) => entry.day === DAY);
-    expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
-    expect(dayRecord?.verdicts.S8?.digest).toBe(
-      expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
+    expect(dayRecord?.verdicts.S8).toEqual({
+      verdict: 'fail',
+      reason: 'enqueue-coverage-divergence',
+      digest: expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
         aFleetCount: 1,
         aShellCount: 2,
         aCompared: 1,
@@ -678,7 +696,8 @@ describe('RecordShadowDayUseCase', () => {
         bCompared: 1,
         bDivergences: 1,
       }),
-    );
+      recordedAtIso: RECORDED_AT_ISO,
+    });
   });
 
   it('two S8 evaluations with the same status/reason but different comparison counts get different digests (SH7b fix round 2)', async () => {
@@ -694,7 +713,21 @@ describe('RecordShadowDayUseCase', () => {
     expectRecorded(resultA);
     expect(resultA.recorded.S8).toBe('fail');
     const dayRecordA = harnessA.evidence.stored?.days.find((entry) => entry.day === DAY);
-    expect(dayRecordA?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
+    expect(dayRecordA?.verdicts.S8).toEqual({
+      verdict: 'fail',
+      reason: 'enqueue-coverage-divergence',
+      digest: expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
+        aFleetCount: 1,
+        aShellCount: 2,
+        aCompared: 1,
+        aDivergences: 1,
+        bFleetCount: 1,
+        bShellCount: 2,
+        bCompared: 1,
+        bDivergences: 1,
+      }),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
 
     const fixtureB = cleanFixture(DAY);
     fixtureB.shellState = {
@@ -706,28 +739,10 @@ describe('RecordShadowDayUseCase', () => {
     expectRecorded(resultB);
     expect(resultB.recorded.S8).toBe('fail');
     const dayRecordB = harnessB.evidence.stored?.days.find((entry) => entry.day === DAY);
-    expect(dayRecordB?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
-
-    // Same {status, reason} pair in both ('fail'/'enqueue-coverage-divergence'),
-    // but the underlying shell-side coverage changed (one missing key vs
-    // two): the digests must differ, or a day-writer re-run against changed
-    // evidence like this would wrongly report 'unchanged' (the SH7b fix
-    // round 2 finding this fix closes).
-    expect(dayRecordA?.verdicts.S8?.digest).not.toBe(dayRecordB?.verdicts.S8?.digest);
-    expect(dayRecordA?.verdicts.S8?.digest).toBe(
-      expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
-        aFleetCount: 1,
-        aShellCount: 2,
-        aCompared: 1,
-        aDivergences: 1,
-        bFleetCount: 1,
-        bShellCount: 2,
-        bCompared: 1,
-        bDivergences: 1,
-      }),
-    );
-    expect(dayRecordB?.verdicts.S8?.digest).toBe(
-      expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
+    expect(dayRecordB?.verdicts.S8).toEqual({
+      verdict: 'fail',
+      reason: 'enqueue-coverage-divergence',
+      digest: expectedS8Digest(DAY, 'fail', 'enqueue-coverage-divergence', {
         aFleetCount: 1,
         aShellCount: 3,
         aCompared: 1,
@@ -737,7 +752,15 @@ describe('RecordShadowDayUseCase', () => {
         bCompared: 1,
         bDivergences: 2,
       }),
-    );
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+
+    // Same {status, reason} pair in both ('fail'/'enqueue-coverage-divergence'),
+    // but the underlying shell-side coverage changed (one missing key vs
+    // two): the digests must differ, or a day-writer re-run against changed
+    // evidence like this would wrongly report 'unchanged' (the SH7b fix
+    // round 2 finding this fix closes).
+    expect(dayRecordA?.verdicts.S8?.digest).not.toBe(dayRecordB?.verdicts.S8?.digest);
   });
 
   it('reports S8 unevaluated when the import dry-run is refused, still recording S1, S9 and S12', async () => {
@@ -753,19 +776,117 @@ describe('RecordShadowDayUseCase', () => {
     expectNotImplementedUnevaluated(result.unevaluated);
   });
 
-  it('reports S8 unevaluated, not a false pass, when batchesEnabled is absent (SH7b finding 1)', async () => {
+  it("evaluates S8 normally, not forced into shell-state-incomplete, when batchesEnabled: { status: 'absent' } (SH7b fix round 4 — corrects the round-2 'finding 1' test above, which wrongly asserted this same ordinary case as incomplete)", async () => {
     const fixture = cleanFixture(DAY);
-    // 'absent' is just as unconfident as 'unreadable': both samples' shell
-    // reads are otherwise clean, so only the missing batchesEnabled file
-    // can be what makes S8 incomplete here.
+    // The field itself is present (not undefined, which is the genuinely
+    // unknown case per its own doc comment) and reports 'absent': a shell
+    // with no batching configured has no `batches/enabled` file at all, a
+    // confident known-empty read exactly like `cutover.ts`'s own handling
+    // of this field (`batchesEnabled.status === 'absent' ? 0 : ...`), never
+    // "unreadable or missing" (only 'unreadable' and `undefined` are that).
+    // Both samples' shell reads are otherwise clean, so S8 must reach a
+    // real comparison, not an early incomplete-bailout.
     fixture.shellState = { ...fixture.shellState, batchesEnabled: { status: 'absent' } };
     const harness = makeHarness(fixture, NOW);
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
     expectRecorded(result);
 
-    expect(result.recorded).toEqual({ S1: 'pass', S9: 'pass', S12: 'pass' });
-    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
-    expect(reasons.get('S8')).toBe('shell-state-incomplete');
+    expect(result.recorded).toEqual({ S1: 'pass', S8: 'pass', S9: 'pass', S12: 'pass' });
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toEqual({
+      verdict: 'pass',
+      reason: 'intake-equal',
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
+        aFleetCount: 1,
+        aShellCount: 1,
+        aCompared: 1,
+        aDivergences: 0,
+        bFleetCount: 1,
+        bShellCount: 1,
+        bCompared: 1,
+        bDivergences: 0,
+      }),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it("evaluates S8 normally, not forced into shell-state-incomplete, when inprogress: { status: 'absent' } (an idle shell train with no in-progress head file, not unknown evidence; SH7b fix round 4)", async () => {
+    const fixture = cleanFixture(DAY);
+    // The field itself is present (not undefined) and reports 'absent': an
+    // idle shell train has no in-progress head file at all, a confident
+    // known-empty read, never "unreadable or missing" — only 'unreadable'
+    // triggers incomplete for this source, matching `parsedShellSource`'s
+    // corrected handling and `cutover.ts`'s own treatment of this field.
+    fixture.shellState = { ...fixture.shellState, inprogress: { status: 'absent' } };
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    expect(result.recorded).toEqual({ S1: 'pass', S8: 'pass', S9: 'pass', S12: 'pass' });
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    // A real pass reached by comparison, not an early incomplete-bailout:
+    // the full verdict (status, reason, digest and its counts) matches the
+    // clean fixture's own S8 verdict exactly, since an absent `inprogress`
+    // contributes the same zero keys the clean fixture's empty-lines
+    // `inprogress` already contributed.
+    expect(dayRecord?.verdicts.S8).toEqual({
+      verdict: 'pass',
+      reason: 'intake-equal',
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
+        aFleetCount: 1,
+        aShellCount: 1,
+        aCompared: 1,
+        aDivergences: 0,
+        bFleetCount: 1,
+        bShellCount: 1,
+        bCompared: 1,
+        bDivergences: 0,
+      }),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('deduplicates shellLive to one entry, not two, when the same (pullRequest, headOid, base) key appears in both queue and inprogress — the documented crash-leftover case, a single live PR, not a real duplicate (SH7b fix round 4)', async () => {
+    const fixture = cleanFixture(DAY);
+    // `cutover.ts`'s own doc comment on the `inprogress` field: the shell
+    // train head "has left the queue but has not merged", so the SAME
+    // PR/head can legitimately still be named by a stale `queue` line left
+    // over from an earlier crash. The clean fixture's queue already names
+    // PR 7 on `main`; naming it again on `inprogress` reproduces exactly
+    // that overlap, not two distinct live PRs.
+    fixture.shellState = {
+      ...fixture.shellState,
+      inprogress: { status: 'read', lines: [`7 ${HEAD_A} main`] },
+    };
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+
+    // Undeduplicated, the comparator would see PR 7 twice on the shell side
+    // and report it as an `invalid-item` divergence shared by both
+    // samples, which fails S8 with a false `enqueue-coverage-divergence`
+    // from this documented overlap alone. Deduplicated, the shell side
+    // carries PR 7 exactly once — identical to the clean fixture's own
+    // single-entry comparison — and S8 reaches the same real pass.
+    expect(result.recorded).toEqual({ S1: 'pass', S8: 'pass', S9: 'pass', S12: 'pass' });
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toEqual({
+      verdict: 'pass',
+      reason: 'intake-equal',
+      digest: expectedS8Digest(DAY, 'pass', 'intake-equal', {
+        aFleetCount: 1,
+        aShellCount: 1,
+        aCompared: 1,
+        aDivergences: 0,
+        bFleetCount: 1,
+        bShellCount: 1,
+        bCompared: 1,
+        bDivergences: 0,
+      }),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
     expectNotImplementedUnevaluated(result.unevaluated);
   });
 

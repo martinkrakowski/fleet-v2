@@ -121,6 +121,41 @@ interface IntakeKey {
   readonly base: string;
 }
 
+/**
+ * One intake key's identity, matching `shadow-day-intake.ts`'s own `keyOf`
+ * exactly (`${pullRequest}@${headOid}@${base}`): ids only, never echoed.
+ */
+function intakeKeyIdentity(key: IntakeKey): string {
+  return `${key.pullRequest}@${key.headOid}@${key.base}`;
+}
+
+/**
+ * `shellLive`'s sources (the shell's queue, parked and in-progress lines)
+ * can legitimately name the same live PR twice: `cutover.ts`'s own doc
+ * comment on the `inprogress` field records the crash-leftover case where a
+ * PR has left the queue but not yet merged, while a stale `queue` line for
+ * it lingers from an earlier crash. That is one live PR, not two, so this
+ * dedupes by the same `(pullRequest, headOid, base)` identity
+ * `shadow-day-intake.ts`'s `keyOf` already uses, keeping the first
+ * occurrence — before `shellLive` is used in any comparison. Left
+ * undeduplicated, `compareShadowEnqueueSets` would see the repeat as a
+ * same-side duplicate and report it as an `invalid-item` divergence, which
+ * can make S8 record a false divergence from a normal, documented shell
+ * state alone.
+ */
+function dedupeIntakeKeys(keys: readonly IntakeKey[]): readonly IntakeKey[] {
+  const seen = new Set<string>();
+  const deduped: IntakeKey[] = [];
+  for (const key of keys) {
+    const identity = intakeKeyIdentity(key);
+    if (!seen.has(identity)) {
+      seen.add(identity);
+      deduped.push(key);
+    }
+  }
+  return deduped;
+}
+
 /** One S8 intake sample, shaped exactly for `evaluateShadowIntake`. */
 interface IntakeSample {
   readonly takenAtIso: string;
@@ -389,10 +424,17 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
 
   /**
    * One shell train source (queue, parked or inprogress) reduced to the
-   * intake keys it contributes plus whether it was incomplete: missing,
-   * unreadable or holding an unparseable line all count as incomplete, so
-   * the sample's `complete` flag fails closed exactly the way the shadow
-   * report's assembly does. Parked lines are the shell's 6-field record,
+   * intake keys it contributes plus whether it was incomplete. A missing
+   * field (`undefined`) or an `'unreadable'` read is genuinely unknown
+   * evidence and counts as incomplete; an `'absent'` read is a confident,
+   * known-empty source (no entries) exactly as `cutover.ts`'s own handling
+   * of these same fields treats it (`status === 'absent' ? 0 : ...`), so it
+   * contributes zero keys and does NOT mark the sample incomplete. An
+   * unparseable line still counts as incomplete, so the sample's `complete`
+   * flag fails closed on real unknowns without fabricating one for the
+   * ordinary "file doesn't exist" case (an idle shell train has no
+   * `inprogress` file; a shell with no batching configured has no
+   * `batches/enabled` file). Parked lines are the shell's 6-field record,
    * parsed with the parked parser, as the shadow report does; queue and
    * inprogress lines parse with the queue parser.
    */
@@ -400,8 +442,11 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     read: LegacyTrainFileRead | undefined,
     parked: boolean,
   ): { readonly keys: readonly IntakeKey[]; readonly incomplete: boolean } {
-    if (read === undefined || read.status !== 'read') {
+    if (read === undefined || read.status === 'unreadable') {
       return { keys: [], incomplete: true };
+    }
+    if (read.status === 'absent') {
+      return { keys: [], incomplete: false };
     }
     const parsed = parked
       ? parseLegacyTrainParkedQueue(read.lines.join('\n'))
@@ -429,12 +474,26 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * when it has none); the import dry-run's would-import/already-queued
    * keys into `importPresent`, null when the dry-run is refused or
    * unavailable. The `complete` flag is false when any shell source has an
-   * unknown line, is unreadable or is missing, or `batchesEnabled` is
-   * unreadable or missing — never a guessed pass.
+   * unknown line or is genuinely unknown (unreadable, or the field itself
+   * missing), or `batchesEnabled` is unreadable or missing — never a
+   * guessed pass, but also never a false incomplete for the ordinary case
+   * where a source file legitimately does not exist (`'absent'`): that is a
+   * confident, known-empty read, exactly as `cutover.ts`'s own handling of
+   * `shellState.batch.status`/`batchesEnabled.status` treats it
+   * (`status === 'absent' ? 0 : ...`). `shellLive` is deduplicated by
+   * `(pullRequest, headOid, base)` identity right before it is returned:
+   * `cutover.ts`'s own doc comment on the `inprogress` field notes that the
+   * same PR/head can legitimately appear in both `queue` and `inprogress`
+   * after a crash (left the queue, has not yet merged, with a stale `queue`
+   * line still lingering) — a real, single live PR, not two. Left
+   * undeduplicated, `compareShadowEnqueueSets` sees that as a same-side
+   * duplicate and reports it as an `invalid-item` divergence instead of
+   * recognising one live entry, which can make S8 record a false
+   * divergence from this alone.
    */
   private async intakeSample(context: DayContext): Promise<IntakeSample> {
     const takenAtIso = this.deps.nowIso();
-    const shellLive: IntakeKey[] = [];
+    const shellLiveRaw: IntakeKey[] = [];
     let complete = true;
     const stateRead = await this.call(
       context.deadlineIso,
@@ -449,18 +508,20 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       for (const [read, parked] of sources) {
         const parsed = this.parsedShellSource(read, parked);
         complete = complete && !parsed.incomplete;
-        shellLive.push(...parsed.keys);
+        shellLiveRaw.push(...parsed.keys);
       }
       const batchesEnabled = stateRead.value.batchesEnabled;
-      // An allow-list of the one genuinely-confident status ('read'), not a
-      // deny-list of the bad ones: 'absent' is just as unconfident as
-      // 'unreadable' (both mean the doc comment's "unreadable or missing"),
-      // and this form is immune to a future fourth status appearing here
-      // with no matching exclusion.
-      complete = complete && batchesEnabled !== undefined && batchesEnabled.status === 'read';
+      // A deny-list of the one genuinely-unknown status ('unreadable'), not
+      // an allow-list of 'read' alone: 'absent' is a confident known-empty
+      // read for this field too (the field itself still being present, per
+      // its own doc comment, is checked separately by `!== undefined`),
+      // matching `cutover.ts`'s own treatment of this exact field
+      // (`batchesEnabled.status === 'absent' ? 0 : ...`).
+      complete = complete && batchesEnabled !== undefined && batchesEnabled.status !== 'unreadable';
     } else {
       complete = false;
     }
+    const shellLive = dedupeIntakeKeys(shellLiveRaw);
     const fleetRead = await this.call(context.deadlineIso, () =>
       this.deps.queue.listMergeEntries({ repository: context.repository, deadlineIso: this.queryDeadline(context) }),
     );

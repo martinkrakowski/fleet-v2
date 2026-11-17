@@ -106,6 +106,7 @@ export * from "./ShadowAttestationAdapter.adapter.js";
 export * from "./ShadowEvidenceAdapter.adapter.js";
 export * from "./SingleRecordStore.helper.js";
 export * from "./spawn-run.js";
+export * from "./SpdSayHostAudibleAlertAdapter.adapter.js";
 export * from "./SshExecutor.adapter.js";
 export * from "./StallAttentionAdapter.adapter.js";
 export * from "./state-files.js";

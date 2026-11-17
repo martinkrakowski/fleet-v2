@@ -547,6 +547,7 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
       pkg,
       workOrderRecord,
       proseRaw,
+      manifestRaw,
       implementerModel: implementerModels[0]!,
       digest12,
     });
@@ -569,10 +570,11 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
     readonly pkg: BriefPackage;
     readonly workOrderRecord: WorkOrderRecord;
     readonly proseRaw: string;
+    readonly manifestRaw: string;
     readonly implementerModel: string;
     readonly digest12: string;
   }): Promise<VerifyBriefResult | null> {
-    const { reviews, pkg, workOrderRecord, proseRaw, implementerModel, digest12 } = context;
+    const { reviews, pkg, workOrderRecord, proseRaw, manifestRaw, implementerModel, digest12 } = context;
     if (typeof reviews?.requestReview !== 'function') {
       return unverified('review-unverified', 'missing-request-review');
     }
@@ -593,6 +595,7 @@ export class VerifyBriefUseCase implements VerifyBriefPort {
       implementerModel,
       reviewerModel: pkg.getIndependentReviewer(),
       briefText: proseRaw,
+      briefManifestRaw: manifestRaw,
     };
     let reviewResult: unknown;
     try {

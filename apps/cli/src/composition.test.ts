@@ -1,5 +1,5 @@
 import { describe, expect, it, afterAll } from 'vitest';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, promises as fs, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,7 +13,13 @@ import {
   assessmentIdForAttempt,
   buildGhChildEnvironment,
 } from './composition.js';
-import { buildMergeGhChildEnv, composeExecutionHosts } from './composition/work-execution-hosts.js';
+import {
+  buildMergeGhChildEnv,
+  composeExecutionHosts,
+  findAttemptForReview,
+  MAX_BRIEF_ATTEMPT_ID_LENGTH,
+  MAX_BRIEF_ATTEMPTS_READ,
+} from './composition/work-execution-hosts.js';
 import { composeEvidence } from './composition/evidence.js';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type {
@@ -26,12 +32,14 @@ import {
   ForgeActionAdapter,
   LaneRun,
   buildArtifactManifest,
+  computeBriefPackageDigest,
   laneRunConductEntry,
   nextAttemptRevision,
   serializeArtifactManifest,
   type LaneRunRecord,
   type SubprocessRunner,
 } from '@fleet/work-execution';
+import { assessmentIdForBrief, attemptIdForBrief } from '@fleet/evidence-and-acceptance';
 import type { FleetInstallation } from '@fleet/installation';
 
 function makeHeadH(): string {
@@ -1543,4 +1551,684 @@ describe("conductor reaper merged-worktree repair through production composition
   },
   420_000,
 );
+});
+
+const BRIEF_PROJECT_ID = 'proj-brief-co18a3b';
+// The end-to-end brief-verify request below binds its `briefText` and its
+// `briefManifestRaw` to the digest the subject carries: the frozen-brief
+// package digest `computeBriefPackageDigest({ prose, manifestRaw })` computes
+// with the SHA-256 function the composition roots inject (`prose + '\n' +
+// manifestRaw`). The test package must digest to `BRIEF_DIGEST` or the
+// request is refused as a mismatch.
+const BRIEF_TEXT = 'Review the frozen brief package for this project.';
+const BRIEF_MANIFEST = '{"schemaVersion":2,"attemptId":"attempt-brief-1"}';
+const BRIEF_DIGEST = (() => {
+  const computed = computeBriefPackageDigest(
+    { prose: BRIEF_TEXT, manifestRaw: BRIEF_MANIFEST },
+    (content) => createHash('sha256').update(content, 'utf8').digest('hex'),
+  );
+  if (!computed.ok) {
+    throw new Error('the fixture brief package must digest');
+  }
+  return computed.briefDigest;
+})();
+const OTHER_DIGEST = 'cd'.repeat(32);
+const IMPLEMENTER_MODEL = 'example-provider/glm-5.3';
+const REVIEWER_MODEL = 'example-provider/grok-4.7';
+const BRIEF_PASS_STREAM =
+  '{"type":"step_start","part":{"type":"step-start"}}\n' +
+  '{"type":"text","part":{"type":"text","text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
+  '{"type":"step_finish"}';
+
+/** Malformed `brief:` ids: none of these is `brief:<projectId>:<64 lowercase hex>`. */
+const MALFORMED_BRIEF_IDS = [
+  'brief:',
+  'brief:not-a-digest',
+  `brief:${BRIEF_PROJECT_ID}:${'ab'.repeat(31)}`,
+  `brief:${BRIEF_PROJECT_ID}:${'AB'.repeat(32)}`,
+  `brief:proj/name:${BRIEF_DIGEST}`,
+  `brief: ${BRIEF_PROJECT_ID}:${BRIEF_DIGEST}`,
+  `brief:${BRIEF_PROJECT_ID}\u0001x:${BRIEF_DIGEST}`,
+];
+
+function briefReviewInstallation(repoDir: string): FleetInstallation {
+  const seats: NonNullable<FleetInstallation['seats']>[number][] = [
+    {
+      id: 'implementer',
+      tool: 'opencode',
+      model: IMPLEMENTER_MODEL,
+      agent: 'example-agent',
+      roles: ['implementer'],
+      costClass: 'plan-quota',
+    },
+    {
+      id: 'reviewer',
+      tool: 'opencode',
+      model: REVIEWER_MODEL,
+      agent: 'example-agent',
+      roles: ['reviewer'],
+      costClass: 'paid',
+    },
+  ];
+  return {
+    schemaVersion: 2,
+    hosts: {
+      'this-machine': {
+        transport: 'local',
+        worktreeRoot: repoDir,
+        tmpDir: path.join(repoDir, '.tmp'),
+        roles: ['orchestrator', 'lane-runner', 'verifier'],
+        runner: {
+          kind: 'opencode',
+          port: 46000,
+          capabilities: {
+            networkEgressRestricted: false,
+            cpuAndMemoryLimited: false,
+            processTreeTermination: false,
+            filesystemScope: 'inherited-directory',
+          },
+        },
+      },
+    },
+    tools: ['opencode'],
+    seats,
+    chains: {
+      implementer: [{ seatId: 'implementer' }],
+      reviewer: [{ seatId: 'reviewer' }],
+    },
+    forge: { mode: 'none' },
+  };
+}
+
+function orderFor(id: string, projectId: string): WorkOrderRecord {
+  return { ...makeWorkOrder(id, makeHeadH()), projectId };
+}
+
+function recordedAttempt(
+  id: string,
+  workOrderId: string,
+  worktreePath: string,
+  briefDigest: string,
+  baseCommit: string,
+): AttemptRecord {
+  return {
+    ...makeAttempt(id, workOrderId, baseCommit),
+    worktreePath,
+    baseCommit,
+    briefDigest,
+    runner: {
+      kind: 'opencode',
+      remotePort: 46000,
+      host: null,
+      hostName: 'this-machine',
+      agent: 'example-agent',
+      model: IMPLEMENTER_MODEL,
+      variant: null,
+    },
+  };
+}
+
+function gitAt(cwd: string, args: readonly string[]): string {
+  return String(execFileSync('git', [...args], { cwd, encoding: 'utf8' })).trim();
+}
+
+interface BriefLookupLog {
+  findIds: string[];
+  listed: number;
+}
+
+function briefLookup(options: {
+  readonly attempts?: readonly AttemptRecord[];
+  readonly orders?: ReadonlyMap<string, WorkOrderRecord>;
+  readonly list?: () => Promise<readonly AttemptRecord[]>;
+  readonly findThrows?: boolean;
+}): {
+  readonly log: BriefLookupLog;
+  readonly attempts: {
+    findAttemptById(attemptId: string): Promise<AttemptRecord | null>;
+    listAllAttempts(): Promise<readonly AttemptRecord[]>;
+  };
+  readonly orders: {
+    findWorkOrderById(workOrderId: string): Promise<WorkOrderRecord | null>;
+  };
+} {
+  const log: BriefLookupLog = { findIds: [], listed: 0 };
+  const orders = options.orders ?? new Map<string, WorkOrderRecord>();
+  return {
+    log,
+    attempts: {
+      async findAttemptById(attemptId: string): Promise<AttemptRecord | null> {
+        log.findIds.push(attemptId);
+        if (options.findThrows === true) {
+          throw new Error('findAttemptById must not run');
+        }
+        return (options.attempts ?? []).find((attempt) => attempt.id === attemptId) ?? null;
+      },
+      async listAllAttempts(): Promise<readonly AttemptRecord[]> {
+        log.listed += 1;
+        if (options.list !== undefined) {
+          return options.list();
+        }
+        return options.attempts ?? [];
+      },
+    },
+    orders: {
+      async findWorkOrderById(workOrderId: string): Promise<WorkOrderRecord | null> {
+        return orders.get(workOrderId) ?? null;
+      },
+    },
+  };
+}
+
+describe('CO18a3b brief-verify attempt resolution', () => {
+  it(
+    'requests, finds and replays a brief-verify review without a second reviewSpawn and leaves attempt acceptance unaffected',
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), 'fleet-cli-brief-verify-'));
+      try {
+        const repoDir = path.join(root, 'repo');
+        const stateDir = path.join(root, 'state');
+        await fs.mkdir(repoDir);
+        await fs.mkdir(stateDir);
+        gitAt(repoDir, ['init', '-q']);
+        gitAt(repoDir, ['config', 'user.email', 'lane@example.invalid']);
+        gitAt(repoDir, ['config', 'user.name', 'lane']);
+        await fs.writeFile(path.join(repoDir, 'a.txt'), 'one\n');
+        gitAt(repoDir, ['add', 'a.txt']);
+        gitAt(repoDir, ['commit', '-q', '-m', 'base']);
+        const head = gitAt(repoDir, ['rev-parse', 'HEAD']);
+
+        const spawnCalls: Array<{ readonly args: readonly string[] }> = [];
+        const runtime = createFleetCliRuntime({
+          stateDir,
+          installation: briefReviewInstallation(repoDir),
+          reviewSpawn: async (_file: string, args: readonly string[]) => {
+            spawnCalls.push({ args });
+            return { exitCode: 0, stdout: BRIEF_PASS_STREAM, stderr: '' };
+          },
+        });
+
+        const attemptId = 'attempt-brief-1';
+        const briefAttemptId = attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST);
+        await runtime.execution.workOrderRepository.saveWorkOrder(orderFor('wo-brief-1', BRIEF_PROJECT_ID));
+        await runtime.execution.attemptRepository.saveAttempt(
+          recordedAttempt(attemptId, 'wo-brief-1', repoDir, BRIEF_DIGEST, head),
+        );
+
+        const acceptanceRequest = {
+          assessmentId: assessmentIdForAttempt(attemptId),
+          candidateHeadSha: head,
+          policyRevision: 'pol-1',
+        };
+        const before = await runtime.evidence.assessHeadAcceptance.assessHeadAcceptance(acceptanceRequest);
+        expect(before).toEqual({ outcome: 'rejected', reason: 'Assessment not found' });
+
+        const review = {
+          requestId: 'brief-verify-co18a3b',
+          kind: 'brief-verify' as const,
+          attemptId: briefAttemptId,
+          projectId: BRIEF_PROJECT_ID,
+          candidateHeadSha: head,
+          subject: {
+            kind: 'brief' as const,
+            projectId: BRIEF_PROJECT_ID,
+            briefPackageDigest: BRIEF_DIGEST,
+            baseCommit: head,
+          },
+          policyRevision: 'pol-1',
+          implementerModel: IMPLEMENTER_MODEL,
+          reviewerModel: REVIEWER_MODEL,
+          briefText: BRIEF_TEXT,
+          briefManifestRaw: BRIEF_MANIFEST,
+        };
+        const requested = await runtime.conductor.reviewRequest.requestReview(review);
+        expect(requested).toMatchObject({
+          outcome: 'receipt',
+          receipt: { kind: 'brief-verify', requestId: review.requestId, verdict: 'passed' },
+        });
+        expect(spawnCalls).toHaveLength(2);
+        const waitSpawn = spawnCalls[0];
+        const reviewSpawn = spawnCalls[1];
+        if (waitSpawn === undefined || reviewSpawn === undefined) {
+          throw new Error('expected the idle wait and the review spawn');
+        }
+        expect(waitSpawn.args.slice(0, 3)).toEqual(['--wait', '--dir', repoDir]);
+        expect(reviewSpawn.args[reviewSpawn.args.indexOf('--dir') + 1]).toBe(repoDir);
+
+        const found = await runtime.conductor.reviewRequest.findReviewReceipt({
+          attemptId: briefAttemptId,
+          requestId: review.requestId,
+          candidateHeadSha: head,
+          subject: review.subject,
+        });
+        expect(found).toMatchObject({
+          outcome: 'found',
+          receipt: { kind: 'brief-verify', requestId: review.requestId },
+        });
+        expect(spawnCalls).toHaveLength(2);
+
+        const replayed = await runtime.conductor.reviewRequest.requestReview(review);
+        expect(replayed).toMatchObject({
+          outcome: 'receipt',
+          receipt: { kind: 'brief-verify', requestId: review.requestId },
+        });
+        expect(spawnCalls).toHaveLength(2);
+
+        const after = await runtime.evidence.assessHeadAcceptance.assessHeadAcceptance(acceptanceRequest);
+        expect(after).toEqual(before);
+        expect(
+          await runtime.evidence.evidenceAssessmentRepository.findAssessmentById(
+            assessmentIdForAttempt(attemptId),
+          ),
+        ).toBeNull();
+        const briefAssessment = await runtime.evidence.evidenceAssessmentRepository.findAssessmentById(
+          assessmentIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST),
+        );
+        expect(briefAssessment?.attemptId).toBe(briefAttemptId);
+        expect(briefAssessment?.reviewReceipts).toHaveLength(1);
+        expect(briefAssessment?.reviewReceipts[0]?.kind).toBe('brief-verify');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'locate throws when no attempt matches a well-formed brief id and does not fall back to another attempt',
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), 'fleet-cli-brief-miss-'));
+      try {
+        const runtime = createFleetCliRuntime({
+          installation: briefReviewInstallation(root),
+        });
+        const briefAttemptId = attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST);
+        const storedPath = path.join(root, 'stored');
+        await fs.mkdir(storedPath);
+        await runtime.execution.workOrderRepository.saveWorkOrder(orderFor('wo-stored', BRIEF_PROJECT_ID));
+        // The attempt's own id is the brief id, but its digest is different.
+        // findAttemptById of that string must not count as a match.
+        await runtime.execution.attemptRepository.saveAttempt(
+          recordedAttempt(briefAttemptId, 'wo-stored', storedPath, OTHER_DIGEST, makeHeadH()),
+        );
+
+        await expect(runtime.reviewLocator.locate(briefAttemptId)).rejects.toThrow(
+          `No attempt is recorded for ${briefAttemptId}`,
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'locate throws for a malformed brief id and does not accept an attempt stored under that string',
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), 'fleet-cli-brief-malformed-'));
+      try {
+        const runtime = createFleetCliRuntime({
+          installation: briefReviewInstallation(root),
+        });
+        const storedId = MALFORMED_BRIEF_IDS[0] ?? 'brief:';
+        const storedPath = path.join(root, 'stored');
+        await fs.mkdir(storedPath);
+        await runtime.execution.workOrderRepository.saveWorkOrder(orderFor('wo-stored', BRIEF_PROJECT_ID));
+        await runtime.execution.attemptRepository.saveAttempt(
+          recordedAttempt(storedId, 'wo-stored', storedPath, BRIEF_DIGEST, makeHeadH()),
+        );
+
+        for (const attemptId of MALFORMED_BRIEF_IDS) {
+          await expect(runtime.reviewLocator.locate(attemptId)).rejects.toThrow(
+            `No attempt is recorded for ${attemptId}`,
+          );
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'locate throws when two attempts share the brief digest and project, and still locates an ordinary attempt id',
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), 'fleet-cli-brief-ambiguous-'));
+      try {
+        const runtime = createFleetCliRuntime({
+          installation: briefReviewInstallation(root),
+        });
+        const pathA = path.join(root, 'a');
+        const pathB = path.join(root, 'b');
+        const pathOrdinary = path.join(root, 'ordinary');
+        await fs.mkdir(pathA);
+        await fs.mkdir(pathB);
+        await fs.mkdir(pathOrdinary);
+        await runtime.execution.workOrderRepository.saveWorkOrder(orderFor('wo-shared', BRIEF_PROJECT_ID));
+        await runtime.execution.attemptRepository.saveAttempt(
+          recordedAttempt('attempt-brief-a', 'wo-shared', pathA, BRIEF_DIGEST, makeHeadH()),
+        );
+        await runtime.execution.attemptRepository.saveAttempt(
+          recordedAttempt('attempt-brief-b', 'wo-shared', pathB, BRIEF_DIGEST, makeHeadH()),
+        );
+        await runtime.execution.attemptRepository.saveAttempt(
+          recordedAttempt('attempt-ordinary', 'wo-shared', pathOrdinary, OTHER_DIGEST, makeHeadH()),
+        );
+
+        const ordinary = await runtime.reviewLocator.locate('attempt-ordinary');
+        expect(ordinary.worktreePath).toBe(pathOrdinary);
+        await expect(runtime.reviewLocator.locate(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST))).rejects.toThrow(
+          `No attempt is recorded for ${attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST)}`,
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'locate returns the recorded worktree for an ordinary attempt id',
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), 'fleet-cli-brief-ordinary-'));
+      try {
+        const runtime = createFleetCliRuntime({
+          installation: briefReviewInstallation(root),
+        });
+        const worktreePath = path.join(root, 'worktree');
+        await fs.mkdir(worktreePath);
+        const baseCommit = makeHeadH();
+        await runtime.execution.workOrderRepository.saveWorkOrder(orderFor('wo-ordinary', BRIEF_PROJECT_ID));
+        await runtime.execution.attemptRepository.saveAttempt(
+          recordedAttempt('attempt-ordinary', 'wo-ordinary', worktreePath, OTHER_DIGEST, baseCommit),
+        );
+
+        const location = await runtime.reviewLocator.locate('attempt-ordinary');
+        expect(location.worktreePath).toBe(worktreePath);
+        expect(location.baseCommit).toBe(baseCommit);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it('returns null for a null attempt id and does not read the repository', async () => {
+    const lookup = briefLookup({ findThrows: true, list: async () => { throw new Error('listed'); } });
+    await expect(findAttemptForReview(null, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+  });
+
+  it('returns null for an undefined attempt id and does not read the repository', async () => {
+    const lookup = briefLookup({ findThrows: true, list: async () => { throw new Error('listed'); } });
+    await expect(findAttemptForReview(undefined, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+  });
+
+  it('rejects when the attempt list is a non-iterable store shape instead of reading it as no attempt, and does not iterate it', async () => {
+    const head = makeHeadH();
+    const match = { ...makeAttempt('attempt-match', 'wo-match', head), briefDigest: BRIEF_DIGEST };
+    let iterated = false;
+    const list = {
+      length: 1,
+      0: match,
+      [Symbol.iterator](): never {
+        iterated = true;
+        throw new Error('iterated');
+      },
+    };
+    const lookup = briefLookup({
+      findThrows: true,
+      orders: new Map([['wo-match', orderFor('wo-match', BRIEF_PROJECT_ID)]]),
+      list: async () => list as unknown as readonly AttemptRecord[],
+    });
+
+    await expect(
+      findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
+    ).rejects.toThrow('cannot be read');
+    expect(iterated).toBe(false);
+    expect(lookup.log.listed).toBe(1);
+    expect(lookup.log.findIds).toEqual([]);
+  });
+
+  it('rejects when listing attempts throws instead of reading the failure as no attempt', async () => {
+    const lookup = briefLookup({ findThrows: true, list: async () => { throw new Error('store unavailable'); } });
+    await expect(
+      findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
+    ).rejects.toThrow('store unavailable');
+    expect(lookup.log.listed).toBe(1);
+    expect(lookup.log.findIds).toEqual([]);
+  });
+
+  it('rejects when reading the matching attempt work order throws instead of reading the failure as no attempt', async () => {
+    const head = makeHeadH();
+    const match = { ...makeAttempt('attempt-match', 'wo-match', head), briefDigest: BRIEF_DIGEST };
+    const lookup = briefLookup({
+      attempts: [match],
+      findThrows: true,
+      orders: new Map([['wo-match', orderFor('wo-match', BRIEF_PROJECT_ID)]]),
+    });
+    lookup.orders.findWorkOrderById = async () => {
+      throw new Error('work order store unavailable');
+    };
+    await expect(
+      findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
+    ).rejects.toThrow('work order store unavailable');
+    expect(lookup.log.listed).toBe(1);
+    expect(lookup.log.findIds).toEqual([]);
+  });
+
+  it('returns the one matching attempt when the attempt list has holes', async () => {
+    const head = makeHeadH();
+    const decoy = { ...makeAttempt('attempt-decoy', 'wo-decoy', head), briefDigest: BRIEF_DIGEST };
+    const match = { ...makeAttempt('attempt-match', 'wo-match', head), briefDigest: BRIEF_DIGEST };
+    const listed: AttemptRecord[] = [];
+    listed[0] = decoy;
+    listed[3] = match;
+    const lookup = briefLookup({
+      attempts: listed,
+      findThrows: true,
+      orders: new Map([
+        ['wo-decoy', orderFor('wo-decoy', 'other-project')],
+        ['wo-match', orderFor('wo-match', BRIEF_PROJECT_ID)],
+      ]),
+    });
+
+    await expect(
+      findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
+    ).resolves.toBe(match);
+    expect(lookup.log.findIds).toEqual([]);
+  });
+
+  it('returns null for a non-string primitive attempt id and does not read the repository', async () => {
+    const lookup = briefLookup({ findThrows: true, list: async () => { throw new Error('listed'); } });
+    const values: unknown[] = [1, true, false, 1n, Symbol('attempt')];
+    for (const value of values) {
+      await expect(findAttemptForReview(value, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    }
+    expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+  });
+
+  it('returns null for an object with throwing getters and does not read the repository', async () => {
+    const hostile: object = {};
+    for (const key of ['toString', 'startsWith', 'length', 'slice', 'trim']) {
+      Object.defineProperty(hostile, key, {
+        get() {
+          throw new Error(key);
+        },
+      });
+    }
+    const lookup = briefLookup({ findThrows: true, list: async () => { throw new Error('listed'); } });
+    await expect(findAttemptForReview(hostile, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+  });
+
+  it('returns null for a Proxy whose traps throw and does not read the repository', async () => {
+    const proxy = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('get');
+        },
+        ownKeys() {
+          throw new Error('ownKeys');
+        },
+      },
+    );
+    const lookup = briefLookup({ findThrows: true, list: async () => { throw new Error('listed'); } });
+    await expect(findAttemptForReview(proxy, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+  });
+
+  it('returns null for an array-like with an enormous length and does not read it', async () => {
+    let reads = 0;
+    const arrayLike = new Proxy(
+      { length: Number.MAX_SAFE_INTEGER },
+      {
+        get(target, prop) {
+          reads += 1;
+          if (prop === 'length') {
+            return target.length;
+          }
+          throw new Error(`read ${String(prop)}`);
+        },
+      },
+    );
+    const lookup = briefLookup({ findThrows: true, list: async () => { throw new Error('listed'); } });
+    await expect(findAttemptForReview(arrayLike, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    expect(reads).toBe(0);
+    expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+  });
+
+  it('returns null for prototype-polluting keys, looks the key strings up by attempt id, and does not pollute Object.prototype', async () => {
+    const constructorBefore = Object.prototype.constructor;
+    const hostile = {};
+    for (const key of ['__proto__', 'constructor', 'prototype']) {
+      Object.defineProperty(hostile, key, {
+        value: { polluted: true },
+        enumerable: true,
+        configurable: true,
+      });
+    }
+    const lookup = briefLookup({});
+    await expect(findAttemptForReview(hostile, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+
+    for (const key of ['__proto__', 'constructor', 'prototype']) {
+      await expect(findAttemptForReview(key, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    }
+    expect(lookup.log.findIds).toEqual(['__proto__', 'constructor', 'prototype']);
+    expect(lookup.log.listed).toBe(0);
+    expect(Object.prototype.constructor).toBe(constructorBefore);
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+  });
+
+  it('returns null for a brief id longer than the length cap without listing attempts or calling findAttemptById', async () => {
+    const huge = `brief:${'a'.repeat(2_000_000)}:${BRIEF_DIGEST}`;
+    expect(huge.length).toBeGreaterThan(MAX_BRIEF_ATTEMPT_ID_LENGTH);
+    const lookup = briefLookup({ findThrows: true, list: async () => { throw new Error('listed'); } });
+    const started = Date.now();
+    await expect(findAttemptForReview(huge, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+  });
+
+  it('returns null for a malformed brief id without calling findAttemptById', async () => {
+    // findAttemptById is NOT a throwing stub here: if the locator fell back to
+    // it for a malformed `brief:` id, it would return the attempt stored under
+    // that very string, and `resolves.toBeNull()` below would fail.
+    const lookup = briefLookup({
+      attempts: [makeAttempt('brief:', 'wo-stored', makeHeadH())],
+    });
+    for (const attemptId of MALFORMED_BRIEF_IDS) {
+      await expect(findAttemptForReview(attemptId, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    }
+    expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+  });
+
+  it('returns null for attempts stored under the exact ids "brief:" and "brief:" with a malformed digest, and never calls findAttemptById', async () => {
+    const malformedDigestId = `brief:${BRIEF_PROJECT_ID}:${'zz'.repeat(32)}`;
+    const lookup = briefLookup({
+      attempts: [
+        makeAttempt('brief:', 'wo-stored', makeHeadH()),
+        makeAttempt(malformedDigestId, 'wo-stored', makeHeadH()),
+      ],
+    });
+    await expect(findAttemptForReview('brief:', lookup.attempts, lookup.orders)).resolves.toBeNull();
+    await expect(findAttemptForReview(malformedDigestId, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    // Spy call count 0: no fallback lookup of either string happened.
+    expect(lookup.log.findIds.length).toBe(0);
+    expect(lookup.log.findIds).toEqual([]);
+    expect(lookup.log.listed).toBe(0);
+  });
+
+  it('returns the single attempt whose brief digest and project match', async () => {
+    const head = makeHeadH();
+    const decoy = { ...makeAttempt('attempt-decoy', 'wo-decoy', head), briefDigest: BRIEF_DIGEST };
+    const match = { ...makeAttempt('attempt-match', 'wo-match', head), briefDigest: BRIEF_DIGEST };
+    const lookup = briefLookup({
+      attempts: [decoy, match],
+      findThrows: true,
+      orders: new Map([
+        ['wo-decoy', orderFor('wo-decoy', 'other-project')],
+        ['wo-match', orderFor('wo-match', BRIEF_PROJECT_ID)],
+      ]),
+    });
+
+    // A constant null fails this test: the matching attempt is returned by identity.
+    await expect(
+      findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
+    ).resolves.toBe(match);
+    expect(lookup.log.findIds).toEqual([]);
+    expect(lookup.log.listed).toBe(1);
+  });
+
+  it('returns null when two work orders in one project share the brief digest', async () => {
+    const head = makeHeadH();
+    const first = { ...makeAttempt('attempt-a', 'wo-a', head), briefDigest: BRIEF_DIGEST };
+    const second = { ...makeAttempt('attempt-b', 'wo-b', head), briefDigest: BRIEF_DIGEST };
+    const lookup = briefLookup({
+      attempts: [first, second],
+      findThrows: true,
+      orders: new Map([
+        ['wo-a', orderFor('wo-a', BRIEF_PROJECT_ID)],
+        ['wo-b', orderFor('wo-b', BRIEF_PROJECT_ID)],
+      ]),
+    });
+
+    await expect(
+      findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
+    ).resolves.toBeNull();
+    expect(lookup.log.findIds).toEqual([]);
+    expect(lookup.log.listed).toBe(1);
+  });
+
+  it('returns null, without throwing, for 4,097 attempts of which exactly one matches, and does not call findAttemptById', async () => {
+    const head = makeHeadH();
+    const match = { ...makeAttempt('attempt-match', 'wo-match', head), briefDigest: BRIEF_DIGEST };
+    const filler = { ...makeAttempt('attempt-filler', 'wo-filler', head), briefDigest: OTHER_DIGEST };
+    const listed = Array.from({ length: MAX_BRIEF_ATTEMPTS_READ + 1 }, () => filler);
+    listed[0] = match;
+    const lookup = briefLookup({
+      attempts: listed,
+      findThrows: true,
+      orders: new Map([['wo-match', orderFor('wo-match', BRIEF_PROJECT_ID)]]),
+    });
+
+    // Over the cap the list cannot prove uniqueness, so the result is null,
+    // the same as two matches: no throw, and no scan past the cap.
+    await expect(
+      findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
+    ).resolves.toBeNull();
+    expect(lookup.log.listed).toBe(1);
+    expect(lookup.log.findIds).toEqual([]);
+  });
+
+  it('returns the attempt findAttemptById records for an ordinary attempt id', async () => {
+    const attempt = makeAttempt('attempt-ordinary', 'wo-ordinary', makeHeadH());
+    const lookup = briefLookup({ attempts: [attempt] });
+    await expect(findAttemptForReview(attempt.id, lookup.attempts, lookup.orders)).resolves.toBe(attempt);
+    expect(lookup.log.findIds).toEqual([attempt.id]);
+    expect(lookup.log.listed).toBe(0);
+  });
 });

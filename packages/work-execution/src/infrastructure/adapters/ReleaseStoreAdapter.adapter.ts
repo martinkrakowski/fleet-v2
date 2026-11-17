@@ -14,16 +14,19 @@
  * unparseable marker or a `current` that is not a link into the root is
  * `unreadable`, never an empty or shorter store. A partial prune is
  * `unreadable`, never a clean success. Results carry shas and codes,
- * never a path.
+ * never a path. `inspectReleaseFiles` adds positional present and quarantined
+ * facts for named files of one verified build, still never a path or content.
  */
 
-import { promises as fs, type Dirent, type Stats } from 'node:fs';
+import { constants as fsConstants, promises as fs, type Dirent, type FileHandle, type Stats } from 'node:fs';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 import type {
   ReleaseBuildRecord,
   ReleaseDriverBinding,
+  ReleaseFileFact,
+  ReleaseFilesInspection,
   ReleaseOpenOperationPeek,
   ReleaseOperationBegin,
   ReleaseOperationRef,
@@ -34,7 +37,7 @@ import type {
   ReleaseStorePruneResult,
   ReleaseStoreWriteResult,
 } from '../../application/ports/out/ReleaseStorePort.out-port.js';
-import { isCalendarDateTime } from '../../domain/plain-record-reads.js';
+import { isCalendarDateTime, readExactPlainRecord } from '../../domain/plain-record-reads.js';
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const STAGING_PREFIX = '.staging-';
@@ -47,6 +50,18 @@ const ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const MARKER_NAME = '.fleet-release-verified';
 const CLI_ENTRY = ['apps', 'cli', 'dist', 'bin.js'];
 const MARKER_MAX_BYTES = 4096;
+/** Cap on named paths in one `inspectReleaseFiles` call. Linear cost stops here. */
+const RELEASE_INSPECT_MAX_PATHS = 16;
+/** A larger file cannot be judged; its bytes are never read. */
+const RELEASE_INSPECT_MAX_FILE_BYTES = 1_048_576;
+/** Bare substring, so `quarantined(` and `import { quarantined as q }` both match. */
+const RELEASE_QUARANTINE_MARKER = 'quarantined';
+/** Cap on one repository-relative path, in characters. */
+const RELEASE_INSPECT_MAX_PATH_LENGTH = 256;
+/** No leading slash, no `.` or `..` segment, no backslash. */
+const RELEASE_INSPECT_PATH_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]*(\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/;
+const RELEASE_INSPECT_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
+const INSPECT_INPUT_KEYS = ['root', 'sha', 'paths'] as const;
 const CURRENT_NAME = 'current';
 /** The temp link name an interrupted repoint can leave behind (CO14 follow-up). */
 const CURRENT_TEMP_PATTERN = /^\.current\..+\.tmp$/;
@@ -500,6 +515,26 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     }
     return { outcome: 'cleaned', removed, findings };
   }
+
+  /**
+   * Report whether each named path of one verified build is present and
+   * quarantined. Cost is linear in the capped path count
+   * (`RELEASE_INSPECT_MAX_PATHS`) and in the capped bytes of each file
+   * (`RELEASE_INSPECT_MAX_FILE_BYTES`). Never throws: a bad request or an
+   * unexpected failure is `unreadable`, and an unjudgeable file is
+   * `quarantined: null`.
+   */
+  async inspectReleaseFiles(input: unknown): Promise<ReleaseFilesInspection> {
+    try {
+      const request = readInspectRequest(input);
+      if (request === null) {
+        return { outcome: 'unreadable' };
+      }
+      return await readVerifiedReleaseFiles(request);
+    } catch {
+      return { outcome: 'unreadable' };
+    }
+  }
 }
 
 function opNames(root: string, action: string, sha: string) {
@@ -857,4 +892,301 @@ function isZonedIso(value: string): boolean {
 
 function randomSuffix(): string {
   return `${process.pid}.${randomBytes(6).toString('hex')}`;
+}
+
+interface InspectRequest {
+  readonly root: string;
+  readonly sha: string;
+  readonly paths: readonly string[];
+}
+
+/**
+ * The plain request, or null when it is not exactly `{ root, sha, paths }`.
+ * Cost is linear in the capped path count (`RELEASE_INSPECT_MAX_PATHS`).
+ * Own data descriptors only: no getter and no `get` trap runs. A reflective
+ * trap may throw; the caller turns that into `unreadable`.
+ */
+function readInspectRequest(input: unknown): InspectRequest | null {
+  const record = readExactPlainRecord(input, INSPECT_INPUT_KEYS);
+  if (record === null) {
+    return null;
+  }
+  const root = record['root'];
+  const sha = record['sha'];
+  if (!isAbsoluteRoot(root) || !isReleaseSha(sha)) {
+    return null;
+  }
+  const paths = readInspectPaths(record['paths']);
+  if (paths === null) {
+    return null;
+  }
+  return { root, sha, paths };
+}
+
+/** Constant time. Does not traverse the capped path list. */
+function isAbsoluteRoot(root: unknown): root is string {
+  return typeof root === 'string' && path.isAbsolute(root);
+}
+
+/** Constant time. Does not traverse the capped path list. */
+function isReleaseSha(sha: unknown): sha is string {
+  return typeof sha === 'string' && SHA_PATTERN.test(sha);
+}
+
+/**
+ * Copy `paths` through own data descriptors. Cost is linear in the capped
+ * length (`RELEASE_INSPECT_MAX_PATHS`). The length is read once, before any
+ * index, so a sparse array of length `2**32 - 1` is refused without traversal.
+ */
+function readInspectPaths(paths: unknown): readonly string[] | null {
+  if (!Array.isArray(paths)) {
+    return null;
+  }
+  const count = readInspectPathCount(paths);
+  if (count === null) {
+    return null;
+  }
+  const out: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const item = readInspectPathAt(paths, index);
+    if (item === null) {
+      return null;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+/** Constant time. Reads the `length` data descriptor once and never `paths.length`. */
+function readInspectPathCount(paths: readonly unknown[]): number | null {
+  const descriptor = Object.getOwnPropertyDescriptor(paths, 'length');
+  if (!isDataDescriptor(descriptor)) {
+    return null;
+  }
+  const value: unknown = descriptor.value;
+  return isInspectPathCount(value) ? value : null;
+}
+
+/** Constant time. The count must be an integer from 1 through `RELEASE_INSPECT_MAX_PATHS`. */
+function isInspectPathCount(length: unknown): length is number {
+  if (typeof length !== 'number' || !Number.isInteger(length)) {
+    return false;
+  }
+  return length >= 1 && length <= RELEASE_INSPECT_MAX_PATHS;
+}
+
+/** Constant time. An array hole or a getter has no own data descriptor and is refused. */
+function readInspectPathAt(paths: readonly unknown[], index: number): string | null {
+  const descriptor = Object.getOwnPropertyDescriptor(paths, String(index));
+  if (!isDataDescriptor(descriptor)) {
+    return null;
+  }
+  const value: unknown = descriptor.value;
+  return isReleaseRelativePath(value) ? value : null;
+}
+
+/** Constant time. A data descriptor has no getter and no setter. */
+function isDataDescriptor(descriptor: PropertyDescriptor | undefined): descriptor is PropertyDescriptor {
+  return descriptor !== undefined && descriptor.get === undefined && descriptor.set === undefined;
+}
+
+/** Constant time. The path cap is `RELEASE_INSPECT_MAX_PATH_LENGTH`. */
+function isReleaseRelativePath(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > RELEASE_INSPECT_MAX_PATH_LENGTH) {
+    return false;
+  }
+  return RELEASE_INSPECT_PATH_PATTERN.test(value);
+}
+
+/**
+ * The verified build's file facts. Cost is linear in the capped path count
+ * and in each file's capped bytes (`RELEASE_INSPECT_MAX_FILE_BYTES`).
+ */
+async function readVerifiedReleaseFiles(request: InspectRequest): Promise<ReleaseFilesInspection> {
+  const buildDir = path.join(request.root, request.sha);
+  const presence = await locateBuildDirectory(buildDir);
+  if (presence === 'missing') {
+    return { outcome: 'not-found' };
+  }
+  if (presence !== 'directory') {
+    return { outcome: 'unreadable' };
+  }
+  const marker = await readMarker(path.join(buildDir, MARKER_NAME), request.sha);
+  if (marker === 'absent') {
+    return { outcome: 'not-found' };
+  }
+  if (marker === null) {
+    return { outcome: 'unreadable' };
+  }
+  return { outcome: 'read', files: await readReleaseFileFacts(buildDir, request.paths) };
+}
+
+/** Constant time aside from one `lstat`. A symlink or non-directory is `missing`. */
+async function locateBuildDirectory(buildDir: string): Promise<'directory' | 'missing' | 'unreadable'> {
+  try {
+    const stat = await lstatOrNull(buildDir);
+    if (stat === null || stat.isSymbolicLink() || !stat.isDirectory()) {
+      return 'missing';
+    }
+    return 'directory';
+  } catch (error) {
+    return isMissingErrno(error) ? 'missing' : 'unreadable';
+  }
+}
+
+/**
+ * One fact per path, in request order. Cost is linear in `paths.length`
+ * (already capped) and in each file's capped bytes.
+ */
+async function readReleaseFileFacts(buildDir: string, paths: readonly string[]): Promise<readonly ReleaseFileFact[]> {
+  const buildReal = await fs.realpath(buildDir);
+  const files: ReleaseFileFact[] = [];
+  for (const relative of paths) {
+    files.push(await inspectOneReleaseFile(buildDir, buildReal, relative));
+  }
+  return files;
+}
+
+/**
+ * One path. Cost is linear in the capped file bytes. A failure of this path
+ * alone is unjudgeable (`quarantined: null`), never a throw and never `false`.
+ */
+async function inspectOneReleaseFile(buildDir: string, buildReal: string, relative: string): Promise<ReleaseFileFact> {
+  try {
+    return await inspectOneReleaseFileUnchecked(buildDir, buildReal, relative);
+  } catch {
+    return unjudgeableFact();
+  }
+}
+
+/** Constant time aside from the bounded read of one file. */
+async function inspectOneReleaseFileUnchecked(
+  buildDir: string,
+  buildReal: string,
+  relative: string,
+): Promise<ReleaseFileFact> {
+  const target = path.join(buildDir, relative);
+  const kind = await classifyReleaseTarget(target);
+  if (kind === 'absent') {
+    return absentFact();
+  }
+  if (kind !== 'file') {
+    return unjudgeableFact();
+  }
+  const containment = await parentContainment(target, buildReal);
+  if (containment === 'absent') {
+    return absentFact();
+  }
+  if (containment !== 'inside') {
+    return unjudgeableFact();
+  }
+  return readReleaseFileBounded(target);
+}
+
+/** Constant time aside from one `lstat`. `ENOTDIR` is absence; `lstatOrNull` rethrows it. */
+async function classifyReleaseTarget(target: string): Promise<'file' | 'absent' | 'unjudgeable'> {
+  try {
+    return classifyReleaseStat(await lstatOrNull(target));
+  } catch (error) {
+    return isErrno(error, 'ENOTDIR') ? 'absent' : 'unjudgeable';
+  }
+}
+
+/** Constant time. A symlink is not followed and is not a regular file. */
+function classifyReleaseStat(stat: Stats | null): 'file' | 'absent' | 'unjudgeable' {
+  if (stat === null) {
+    return 'absent';
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    return 'unjudgeable';
+  }
+  return 'file';
+}
+
+/**
+ * Constant time aside from one `realpath` of the parent. An in-build directory
+ * symlink whose real path leaves the build is `escape`.
+ */
+async function parentContainment(
+  target: string,
+  buildReal: string,
+): Promise<'inside' | 'escape' | 'absent' | 'unreadable'> {
+  try {
+    const parentReal = await fs.realpath(path.dirname(target));
+    return staysWithin(buildReal, parentReal) ? 'inside' : 'escape';
+  } catch (error) {
+    return isMissingErrno(error) ? 'absent' : 'unreadable';
+  }
+}
+
+/** Constant time. `candidateReal` must be `rootReal` or a path under it. */
+function staysWithin(rootReal: string, candidateReal: string): boolean {
+  const relative = path.relative(rootReal, candidateReal);
+  if (relative === '') {
+    return true;
+  }
+  if (path.isAbsolute(relative)) {
+    return false;
+  }
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`);
+}
+
+/**
+ * Read one regular file through an `O_NOFOLLOW` handle. Cost is linear in the
+ * capped byte count (`RELEASE_INSPECT_MAX_FILE_BYTES`). The handle is closed
+ * before this returns.
+ */
+async function readReleaseFileBounded(target: string): Promise<ReleaseFileFact> {
+  let handle: FileHandle;
+  try {
+    handle = await fs.open(target, RELEASE_INSPECT_OPEN_FLAGS);
+  } catch (error) {
+    return isMissingErrno(error) ? absentFact() : unjudgeableFact();
+  }
+  try {
+    return await readHandleFact(handle);
+  } catch {
+    return unjudgeableFact();
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/** Linear in the capped byte count. A file over the cap is not read. */
+async function readHandleFact(handle: FileHandle): Promise<ReleaseFileFact> {
+  const stat = await handle.stat();
+  if (!stat.isFile() || stat.size > RELEASE_INSPECT_MAX_FILE_BYTES) {
+    return unjudgeableFact();
+  }
+  const text = await readCappedText(handle);
+  if (text === null) {
+    return unjudgeableFact();
+  }
+  return { present: true, quarantined: text.includes(RELEASE_QUARANTINE_MARKER) };
+}
+
+/** Linear in the capped byte count. More than `RELEASE_INSPECT_MAX_FILE_BYTES` is unjudgeable. */
+async function readCappedText(handle: FileHandle): Promise<string | null> {
+  const cap = RELEASE_INSPECT_MAX_FILE_BYTES;
+  const buffer = Buffer.alloc(cap + 1);
+  const { bytesRead } = await handle.read(buffer, 0, cap + 1, 0);
+  if (bytesRead > cap) {
+    return null;
+  }
+  return buffer.toString('utf8', 0, bytesRead);
+}
+
+/** Constant time. `ENOENT` and `ENOTDIR` mean the path is not present. */
+function isMissingErrno(error: unknown): boolean {
+  return isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR');
+}
+
+/** Constant time. */
+function absentFact(): ReleaseFileFact {
+  return { present: false, quarantined: false };
+}
+
+/** Constant time. */
+function unjudgeableFact(): ReleaseFileFact {
+  return { present: true, quarantined: null };
 }

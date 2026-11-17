@@ -299,18 +299,41 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
     }))).toEqual({ status: 'fail', reason: 'journal-duplicate-intent' });
   });
 
-  it('passes a key whose intent precedes both results chronologically even when the array lists a result before the intent', () => {
-    // The ambiguous result is chronologically earliest of the two results
-    // and the completed (final) result is latest — the only order a real
-    // journal allows at append time — even though the array itself lists
-    // the completed result before the ambiguous one and the intent last.
+  it('passes a key whose intent precedes both results in true append order even though the results\' timestamps are not in position order', () => {
+    // A real journal never accepts a result before its key's intent — the
+    // array's own POSITION is the only order the real store ever produces or
+    // checks against. Here the array is in the one order the real journal
+    // writer could have produced (intent, then the ambiguous result, then
+    // the final result), but the timestamps attached to those same entries
+    // are NOT monotonic with that position order (the intent's own clock
+    // reading is latest, the ambiguous result's is earliest): a timestamp-
+    // based evaluator would wrongly call the earliest result's timestamp
+    // earlier than the intent's and fail this as an orphan result. The
+    // evaluator must use position, not recordedAtIso, to get this right.
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [
-        journalEntry('k8', 'result', 'completed', '2026-11-10T09:10:00.000Z'),
-        journalEntry('k8', 'result', 'ambiguous', '2026-11-10T09:05:00.000Z'),
-        journalEntry('k8', 'intent', null, '2026-11-10T09:00:00.000Z'),
+        journalEntry('k8', 'intent', null, '2026-11-10T09:10:00.000Z'),
+        journalEntry('k8', 'result', 'ambiguous', '2026-11-10T09:00:00.000Z'),
+        journalEntry('k8', 'result', 'completed', '2026-11-10T09:05:00.000Z'),
       ],
     }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+  });
+
+  it('fails journal-result-after-final when a completed result and a later ambiguous result share one timestamp, in real append order', () => {
+    // The real journal store's `resultRefusal` is decided from append order
+    // alone, never from `recordedAtIso`: two entries can carry the exact
+    // same timestamp. Here the completed (closing) result is appended
+    // before the ambiguous result, at the same recorded timestamp — a
+    // timestamp-only comparison (`latestResultIso > finalResultIso`) cannot
+    // tell them apart and would wrongly pass this; position can.
+    const sameIso = '2026-11-10T09:20:00.000Z';
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k12', 'intent', null, PREV_23(50)),
+        journalEntry('k12', 'result', 'completed', sameIso),
+        journalEntry('k12', 'result', 'ambiguous', sameIso),
+      ],
+    }))).toEqual({ status: 'fail', reason: 'journal-result-after-final' });
   });
 
   it('accepts a normal conduct entry (key null, outcome null) and excludes it from tallying, evaluating the rest normally', () => {
@@ -331,6 +354,37 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry('k10', 'result', 'ambiguous', PREV_23(52)),
       ],
     }))).toEqual({ status: 'fail', reason: 'journal-result-after-final' });
+  });
+
+  it('passes a not-started result on a request-channel key followed by a later final result', () => {
+    // The request channel (O2c, lane-run-journal.ts's `isClosedByFinalResult`)
+    // treats `not-started` as non-final: it never moves the request, so the
+    // real journal writer still accepts a later final result for the same
+    // key. REQUEST_KEY below is a real `request/<ULID>` key, the same shape
+    // `parseLaneRunKey` and the writer both require.
+    const REQUEST_KEY = 'request/01JB0000000000000000000000';
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry(REQUEST_KEY, 'intent', null, PREV_23(50)),
+        journalEntry(REQUEST_KEY, 'result', 'not-started', PREV_23(51)),
+        journalEntry(REQUEST_KEY, 'result', 'completed', PREV_23(52)),
+      ],
+    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+  });
+
+  it('fails for a not-started result on a non-request key followed by a later result (the carve-out is request-channel only)', () => {
+    // The carve-out above is specific to the request channel: on every other
+    // key kind, `not-started` closes the key exactly like any other
+    // non-`ambiguous` outcome. Both results here count as closing, so this
+    // is caught as two closing results for one key, the same as any other
+    // duplicate-final case.
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k11', 'intent', null, PREV_23(50)),
+        journalEntry('k11', 'result', 'not-started', PREV_23(51)),
+        journalEntry('k11', 'result', 'completed', PREV_23(52)),
+      ],
+    }))).toEqual({ status: 'fail', reason: 'journal-duplicate-result' });
   });
 
   it('reports unknown/state-check-unavailable when stateCheck is null', () => {

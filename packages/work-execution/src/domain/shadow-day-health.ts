@@ -11,6 +11,7 @@ import type { DaemonEventRecord } from './daemon-events.js';
 import { DAEMON_STARVED_CONSECUTIVE_TICKS } from './daemon-tick.js';
 import { LANE_RUN_JOURNAL_OUTCOMES } from './lane-run-journal.js';
 import type { LaneRunJournalOutcome } from './lane-run-journal.js';
+import { parseLaneRunKey } from './lane-run-keys.js';
 import type { ShadowCriterionEvaluation } from './shadow-evidence-ledger.js';
 import { readExactPlainRecord } from './plain-record-reads.js';
 
@@ -215,7 +216,15 @@ function pushJobEvent(byJob: Map<string, JobSequence[]>, event: DaemonEventRecor
   });
 }
 
-/** One sampled journal entry's S9-relevant fields, or null when out of shape. */
+/**
+ * One sampled journal entry's S9-relevant fields, or null when out of shape.
+ * `position` is this entry's index in the caller's `journal` array, which the
+ * real journal store's read APIs (`listForRun`, `listForKey`,
+ * `listForKeyPrefix`) always return in true append order. It is the
+ * authoritative order for anything that depends on order — never
+ * `recordedAtIso` alone, since two entries can legitimately share one
+ * timestamp.
+ */
 interface SampledJournalEntry {
   /** intent and result: the entry's key; conduct: null, matching the journal contract exactly. */
   readonly key: string | null;
@@ -223,12 +232,20 @@ interface SampledJournalEntry {
   /** A known outcome string on a `result` entry; `null` on every other kind, matching the journal contract exactly. */
   readonly outcome: string | null;
   readonly recordedAtIso: string;
+  /** This entry's index in the caller's `journal` array (true append order). */
+  readonly position: number;
 }
 
 const SAMPLED_ENTRY_KEYS: readonly string[] = ['key', 'kind', 'outcome', 'recordedAtIso'];
 
-/** One journal entry, or null when any field is out of shape. */
-function readSampledEntry(raw: unknown): SampledJournalEntry | null {
+/**
+ * One journal entry, or null when any field is out of shape. `position` is
+ * this entry's index in the caller's `journal` array; it is not read from
+ * the raw entry itself, since the journal contract carries no sequence field
+ * of its own — order lives only in the array position a true-append-order
+ * read gives each entry.
+ */
+function readSampledEntry(raw: unknown, position: number): SampledJournalEntry | null {
   const snapshot = readExactPlainRecord(raw, SAMPLED_ENTRY_KEYS);
   if (snapshot === null) {
     return null;
@@ -253,7 +270,7 @@ function readSampledEntry(raw: unknown): SampledJournalEntry | null {
     if (key !== null || outcome !== null) {
       return null;
     }
-    return { key: null, kind, outcome: null, recordedAtIso: new Date(recordedAtIso).toISOString() };
+    return { key: null, kind, outcome: null, recordedAtIso: new Date(recordedAtIso).toISOString(), position };
   }
   if (typeof key !== 'string' || key.length === 0) {
     return null;
@@ -266,35 +283,60 @@ function readSampledEntry(raw: unknown): SampledJournalEntry | null {
     if (typeof outcome !== 'string' || !LANE_RUN_JOURNAL_OUTCOMES.includes(outcome as LaneRunJournalOutcome)) {
       return null;
     }
-    return { key, kind, outcome, recordedAtIso: new Date(recordedAtIso).toISOString() };
+    return { key, kind, outcome, recordedAtIso: new Date(recordedAtIso).toISOString(), position };
   }
   if (outcome !== null) {
     return null;
   }
-  return { key, kind, outcome: null, recordedAtIso: new Date(recordedAtIso).toISOString() };
+  return { key, kind, outcome: null, recordedAtIso: new Date(recordedAtIso).toISOString(), position };
+}
+
+/**
+ * Whether a sampled `result` entry closes its key, mirroring the real
+ * journal writer's own rule exactly (`lane-run-journal.ts`'s
+ * `isClosedByFinalResult`): every outcome except `ambiguous` closes it,
+ * except `not-started` on a request-channel key — identified the same way
+ * the writer identifies it, `parseLaneRunKey(key)?.kind === 'request'` —
+ * which the writer treats as non-final, so a later final result is still
+ * allowed there.
+ */
+function isFinalResultEntry(entry: SampledJournalEntry): boolean {
+  if (entry.outcome === 'ambiguous') {
+    return false;
+  }
+  if (entry.outcome === 'not-started') {
+    return parseLaneRunKey(entry.key)?.kind !== 'request';
+  }
+  return true;
 }
 
 /** One key's journal tallies. */
 interface KeyTally {
   intents: number;
+  /** The `recordedAtIso` of this key's earliest-position intent; used only for the wall-clock grace check below. */
   intentIso: string | null;
-  nonAmbiguousResults: number;
+  /** The position of this key's earliest intent, or null with none. */
+  intentPosition: number | null;
+  /** How many of this key's results close it (see `isFinalResultEntry`). */
+  finalResults: number;
   hasResult: boolean;
-  /** The earliest `recordedAtIso` among this key's `result` entries, any outcome, or null with none. */
-  earliestResultIso: string | null;
-  /** The earliest `recordedAtIso` among this key's non-`ambiguous` ("final") results, or null with none. */
-  finalResultIso: string | null;
-  /** The latest `recordedAtIso` among this key's `result` entries, any outcome, or null with none. */
-  latestResultIso: string | null;
+  /** The earliest position among this key's `result` entries, any outcome, or null with none. */
+  earliestResultPosition: number | null;
+  /** The earliest position among this key's closing ("final") results, or null with none. */
+  finalResultPosition: number | null;
+  /** The latest position among this key's `result` entries, any outcome, or null with none. */
+  latestResultPosition: number | null;
 }
 
 /**
- * The per-key tallies. Every field is an order-independent aggregate (a
- * count, or a minimum/maximum timestamp) over the whole entry set for that
- * key, so the verdict never depends on the position an entry happens to
- * occupy in the input array — only on each entry's own `kind`, `outcome` and
- * `recordedAtIso`. A `conduct` entry carries no key (`entry.key === null`)
- * and is excluded here: it has nothing to tally against any key's sequence.
+ * The per-key tallies. Every field is a count or a minimum/maximum over the
+ * whole entry set for that key, so the verdict never depends on which order
+ * this function itself walks `entries` in — but it DOES depend on each
+ * entry's own `position`, the true-append-order index the caller's `journal`
+ * array gave it: two entries can share one `recordedAtIso`, so timestamp
+ * order is never the authority here, only `kind`, `outcome` and `position`
+ * are. A `conduct` entry carries no key (`entry.key === null`) and is
+ * excluded here: it has nothing to tally against any key's sequence.
  */
 function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyTally> {
   const tallies = new Map<string, KeyTally>();
@@ -307,32 +349,34 @@ function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyT
       tally = {
         intents: 0,
         intentIso: null,
-        nonAmbiguousResults: 0,
+        intentPosition: null,
+        finalResults: 0,
         hasResult: false,
-        earliestResultIso: null,
-        finalResultIso: null,
-        latestResultIso: null,
+        earliestResultPosition: null,
+        finalResultPosition: null,
+        latestResultPosition: null,
       };
       tallies.set(entry.key, tally);
     }
     if (entry.kind === 'intent') {
       tally.intents += 1;
-      if (tally.intentIso === null || entry.recordedAtIso < tally.intentIso) {
+      if (tally.intentPosition === null || entry.position < tally.intentPosition) {
+        tally.intentPosition = entry.position;
         tally.intentIso = entry.recordedAtIso;
       }
     }
     if (entry.kind === 'result') {
       tally.hasResult = true;
-      if (tally.earliestResultIso === null || entry.recordedAtIso < tally.earliestResultIso) {
-        tally.earliestResultIso = entry.recordedAtIso;
+      if (tally.earliestResultPosition === null || entry.position < tally.earliestResultPosition) {
+        tally.earliestResultPosition = entry.position;
       }
-      if (tally.latestResultIso === null || entry.recordedAtIso > tally.latestResultIso) {
-        tally.latestResultIso = entry.recordedAtIso;
+      if (tally.latestResultPosition === null || entry.position > tally.latestResultPosition) {
+        tally.latestResultPosition = entry.position;
       }
-      if (entry.outcome !== 'ambiguous') {
-        tally.nonAmbiguousResults += 1;
-        if (tally.finalResultIso === null || entry.recordedAtIso < tally.finalResultIso) {
-          tally.finalResultIso = entry.recordedAtIso;
+      if (isFinalResultEntry(entry)) {
+        tally.finalResults += 1;
+        if (tally.finalResultPosition === null || entry.position < tally.finalResultPosition) {
+          tally.finalResultPosition = entry.position;
         }
       }
     }
@@ -343,12 +387,17 @@ function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyT
 
 /**
  * S9, conductor state integrity, over `{ stateCheck, journal, sampledAtIso }`.
- * Cost: linear in the capped input — at most `SHADOW_MAX_HEALTH_ITEMS`
- * journal entries are walked, and an oversized, sparse or non-dense `journal`
- * array is refused from its own `length` before any entry is traversed.
- * Every value is read through its own property descriptor, so no getter ever
- * runs and a Proxy stand-in either is refused or yields exactly the plain
- * data's verdict. Never throws, never echoes the input.
+ * `journal` must be supplied in true append order — the order
+ * `listForRun`/`listForKey`/`listForKeyPrefix` return it, never re-sorted by
+ * `recordedAtIso` — since an entry's position in that array, not its
+ * timestamp, is the authority for any ordering check below (two entries can
+ * share one timestamp). Cost: linear in the capped input — at most
+ * `SHADOW_MAX_HEALTH_ITEMS` journal entries are walked, and an oversized,
+ * sparse or non-dense `journal` array is refused from its own `length`
+ * before any entry is traversed. Every value is read through its own
+ * property descriptor, so no getter ever runs and a Proxy stand-in either is
+ * refused or yields exactly the plain data's verdict. Never throws, never
+ * echoes the input.
  */
 export function evaluateShadowStateIntegrity(input: unknown): ShadowCriterionEvaluation {
   try {
@@ -383,7 +432,7 @@ function judgeDayStateIntegrity(input: unknown): ShadowCriterionEvaluation {
   }
   const entries: SampledJournalEntry[] = [];
   for (let index = 0; index < journal.length; index += 1) {
-    const entry = readSampledEntry(ownElement(journal, index));
+    const entry = readSampledEntry(ownElement(journal, index), index);
     if (entry === null) {
       return UNKNOWN('invalid-input');
     }
@@ -407,38 +456,44 @@ function judgeJournalIntegrity(entries: readonly SampledJournalEntry[], sampledA
     if (tally.intents > 1) {
       return FAIL('journal-duplicate-intent');
     }
-    if (tally.nonAmbiguousResults > 1) {
+    if (tally.finalResults > 1) {
       return FAIL('journal-duplicate-result');
     }
-    // Once a key has a final (non-`ambiguous`) result, the real journal
-    // store refuses to append anything further for that key at write time
+    // Once a key has a closing ("final") result, the real journal store
+    // refuses to append anything further for that key at write time
     // (lane-run-journal.ts's `resultRefusal`/`isClosedByFinalResult`, reason
-    // `result-after-final`). A result of any outcome recorded after the
-    // key's earliest final result represents that otherwise-impossible
-    // state, so it is flagged here too, distinct from two non-`ambiguous`
-    // results (`journal-duplicate-result` above).
+    // `result-after-final`). That refusal is decided from APPEND ORDER, not
+    // from `recordedAtIso` — two entries can share one timestamp — so this
+    // compares `position`, not timestamps: a result of any outcome recorded
+    // at a later position than the key's earliest closing result represents
+    // that otherwise-impossible state, distinct from two closing results
+    // (`journal-duplicate-result` above).
     if (
-      tally.finalResultIso !== null &&
-      tally.latestResultIso !== null &&
-      tally.latestResultIso > tally.finalResultIso
+      tally.finalResultPosition !== null &&
+      tally.latestResultPosition !== null &&
+      tally.latestResultPosition > tally.finalResultPosition
     ) {
       return FAIL('journal-result-after-final');
     }
-    // A result with no intent at all, or one recorded before the key's
-    // earliest intent, breaks the journal contract's required order. Both
-    // sides of this comparison are aggregates over the whole key (a count
-    // and a minimum timestamp), so the verdict is the same no matter how
-    // the entries were ordered in the input array.
-    const resultPredatesIntent = tally.intentIso !== null && tally.earliestResultIso !== null
-      && tally.earliestResultIso < tally.intentIso;
+    // A result with no intent at all, or one appended before the key's
+    // intent, breaks the journal contract's required order: the real store's
+    // `resultRefusal` only ever finds an intent among entries already
+    // appended (earlier position) than the result being appended. Both sides
+    // of this comparison are aggregates over the whole key (a count and a
+    // minimum position), so the verdict is the same no matter what order
+    // this function itself happens to walk the entries in.
+    const resultPredatesIntent = tally.intentPosition !== null && tally.earliestResultPosition !== null
+      && tally.earliestResultPosition < tally.intentPosition;
     if (tally.hasResult && (tally.intents === 0 || resultPredatesIntent)) {
       return FAIL('journal-orphan-result');
     }
   }
   for (const tally of tallies.values()) {
-    if (tally.intents === 0 || tally.nonAmbiguousResults > 0 || tally.intentIso === null) {
+    if (tally.intents === 0 || tally.finalResults > 0 || tally.intentIso === null) {
       continue;
     }
+    // The open-intent grace period is genuinely wall-clock, not append
+    // order: how long the sample was taken after the intent's own timestamp.
     if (new Date(sampledAtIso).getTime() - new Date(tally.intentIso).getTime() > SHADOW_OPEN_INTENT_GRACE_MS) {
       return FAIL('unreconciled-intent');
     }

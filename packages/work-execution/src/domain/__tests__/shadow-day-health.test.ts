@@ -191,7 +191,7 @@ describe('evaluateShadowTickHealth (S12)', () => {
   });
 });
 
-function journalEntry(key: string, kind: string, outcome: string, recordedAtIso: string): Record<string, unknown> {
+function journalEntry(key: string, kind: string, outcome: string | null, recordedAtIso: string): Record<string, unknown> {
   return { key, kind, outcome, recordedAtIso };
 }
 
@@ -219,8 +219,8 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
   it('fails journal-duplicate-intent for a key with two intent entries', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [
-        journalEntry('k1', 'intent', 'completed', PREV_23(50)),
-        journalEntry('k1', 'intent', 'completed', PREV_23(51)),
+        journalEntry('k1', 'intent', null, PREV_23(50)),
+        journalEntry('k1', 'intent', null, PREV_23(51)),
         journalEntry('k1', 'result', 'completed', PREV_23(52)),
       ],
     }))).toEqual({ status: 'fail', reason: 'journal-duplicate-intent' });
@@ -242,7 +242,7 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [
         journalEntry('k1', 'result', 'completed', PREV_23(51)),
-        journalEntry('k1', 'intent', 'completed', PREV_23(52)),
+        journalEntry('k1', 'intent', null, PREV_23(52)),
       ],
     }))).toEqual({ status: 'fail', reason: 'journal-orphan-result' });
   });
@@ -256,7 +256,7 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
   it('fails journal-duplicate-result for a key with two non-ambiguous results', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [
-        journalEntry('k3', 'intent', 'completed', PREV_23(50)),
+        journalEntry('k3', 'intent', null, PREV_23(50)),
         journalEntry('k3', 'result', 'completed', PREV_23(51)),
         journalEntry('k3', 'result', 'refused', PREV_23(52)),
       ],
@@ -265,22 +265,41 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
 
   it('fails unreconciled-intent when an intent has been open for 16 minutes before the sample', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
-      journal: [journalEntry('k4', 'intent', 'completed', '2026-11-10T23:44:00.000Z')],
+      journal: [journalEntry('k4', 'intent', null, '2026-11-10T23:44:00.000Z')],
     }))).toEqual({ status: 'fail', reason: 'unreconciled-intent' });
   });
 
   it('passes when an intent has been open for only 14 minutes', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
-      journal: [journalEntry('k5', 'intent', 'completed', '2026-11-10T23:46:00.000Z')],
+      journal: [journalEntry('k5', 'intent', null, '2026-11-10T23:46:00.000Z')],
     }))).toEqual({ status: 'pass', reason: 'state-consistent' });
   });
 
   it('passes when an ambiguous result is followed later by a real final result', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [
-        journalEntry('k6', 'intent', 'completed', '2026-11-10T10:00:00.000Z'),
+        journalEntry('k6', 'intent', null, '2026-11-10T10:00:00.000Z'),
         journalEntry('k6', 'result', 'ambiguous', '2026-11-10T10:05:00.000Z'),
         journalEntry('k6', 'result', 'completed', '2026-11-10T10:10:00.000Z'),
+      ],
+    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+  });
+
+  it('accepts a null-outcome intent entry, as the real journal model shapes it, and evaluates it rather than refusing it as malformed', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k7', 'intent', null, PREV_23(50)),
+        journalEntry('k7', 'intent', null, PREV_23(51)),
+      ],
+    }))).toEqual({ status: 'fail', reason: 'journal-duplicate-intent' });
+  });
+
+  it('passes a key whose intent precedes both results chronologically even when the array lists a result before the intent', () => {
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry('k8', 'result', 'ambiguous', '2026-11-10T09:10:00.000Z'),
+        journalEntry('k8', 'result', 'completed', '2026-11-10T09:05:00.000Z'),
+        journalEntry('k8', 'intent', null, '2026-11-10T09:00:00.000Z'),
       ],
     }))).toEqual({ status: 'pass', reason: 'state-consistent' });
   });
@@ -456,13 +475,13 @@ function s12Hostile(kind: HostileKind): Hostile {
 
 function s9Hostile(kind: HostileKind): Hostile {
   const hole = (): unknown[] => {
-    const array = [journalEntry('k', 'intent', 'completed', PREV_23(1)), journalEntry('k', 'result', 'completed', PREV_23(2))];
+    const array = [journalEntry('k', 'intent', null, PREV_23(1)), journalEntry('k', 'result', 'completed', PREV_23(2))];
     delete array[0];
     return array;
   };
   const huge = (): unknown[] => {
     const array: unknown[] = [];
-    array[2 ** 32 - 2] = journalEntry('k', 'intent', 'completed', PREV_23(1));
+    array[2 ** 32 - 2] = journalEntry('k', 'intent', null, PREV_23(1));
     return array;
   };
   const getterOn = (key: 'sampledAtIso' | 'item'): Hostile => {
@@ -484,7 +503,7 @@ function s9Hostile(kind: HostileKind): Hostile {
       enumerable: true,
       get() {
         calls += 1;
-        return journalEntry('k', 'intent', 'completed', PREV_23(1));
+        return journalEntry('k', 'intent', null, PREV_23(1));
       },
     });
     journal.length = 1;
@@ -509,11 +528,11 @@ function s9Hostile(kind: HostileKind): Hostile {
     case 'hole':
       return { input: { stateCheck: { checked: 1, bad: 0 }, journal: hole(), sampledAtIso: SAMPLE_AT } };
     case 'array-like':
-      return { input: { stateCheck: { checked: 1, bad: 0 }, journal: { length: 1, 0: journalEntry('k', 'intent', 'completed', PREV_23(1)) }, sampledAtIso: SAMPLE_AT } };
+      return { input: { stateCheck: { checked: 1, bad: 0 }, journal: { length: 1, 0: journalEntry('k', 'intent', null, PREV_23(1)) }, sampledAtIso: SAMPLE_AT } };
     case 'huge':
       return { input: { stateCheck: { checked: 1, bad: 0 }, journal: huge(), sampledAtIso: SAMPLE_AT } };
     case 'over-cap':
-      return { input: { stateCheck: { checked: 1, bad: 0 }, journal: new Array(500_001).fill(journalEntry('k', 'intent', 'completed', PREV_23(1))), sampledAtIso: SAMPLE_AT } };
+      return { input: { stateCheck: { checked: 1, bad: 0 }, journal: new Array(500_001).fill(journalEntry('k', 'intent', null, PREV_23(1))), sampledAtIso: SAMPLE_AT } };
     case 'root-getter':
       return getterOn('sampledAtIso');
     case 'item-getter':
@@ -557,7 +576,7 @@ describe('hostile input', () => {
 
   it('S9 over a Proxy of a valid input yields the plain result with no get trap', () => {
     const plain = stateInput({
-      journal: [journalEntry('k', 'intent', 'completed', PREV_23(59))],
+      journal: [journalEntry('k', 'intent', null, PREV_23(59))],
     });
     let getTraps = 0;
     const proxy = new Proxy(plain, {

@@ -2094,14 +2094,32 @@ describe('CO18a3b brief-verify attempt resolution', () => {
   });
 
   it('returns null for a malformed brief id without calling findAttemptById', async () => {
+    // findAttemptById is NOT a throwing stub here: if the locator fell back to
+    // it for a malformed `brief:` id, it would return the attempt stored under
+    // that very string, and `resolves.toBeNull()` below would fail.
     const lookup = briefLookup({
-      findThrows: true,
       attempts: [makeAttempt('brief:', 'wo-stored', makeHeadH())],
     });
     for (const attemptId of MALFORMED_BRIEF_IDS) {
       await expect(findAttemptForReview(attemptId, lookup.attempts, lookup.orders)).resolves.toBeNull();
     }
     expect(lookup.log).toEqual({ findIds: [], listed: 0 });
+  });
+
+  it('returns null for attempts stored under the exact ids "brief:" and "brief:" with a malformed digest, and never calls findAttemptById', async () => {
+    const malformedDigestId = `brief:${BRIEF_PROJECT_ID}:${'zz'.repeat(32)}`;
+    const lookup = briefLookup({
+      attempts: [
+        makeAttempt('brief:', 'wo-stored', makeHeadH()),
+        makeAttempt(malformedDigestId, 'wo-stored', makeHeadH()),
+      ],
+    });
+    await expect(findAttemptForReview('brief:', lookup.attempts, lookup.orders)).resolves.toBeNull();
+    await expect(findAttemptForReview(malformedDigestId, lookup.attempts, lookup.orders)).resolves.toBeNull();
+    // Spy call count 0: no fallback lookup of either string happened.
+    expect(lookup.log.findIds.length).toBe(0);
+    expect(lookup.log.findIds).toEqual([]);
+    expect(lookup.log.listed).toBe(0);
   });
 
   it('returns the single attempt whose brief digest and project match', async () => {

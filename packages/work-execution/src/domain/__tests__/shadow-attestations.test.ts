@@ -1,11 +1,16 @@
 // Lane SH15a: tests for the pure shadow attestation ledger. Each refusal code
 // has a titled test, and the hostile-input cases name the input they refuse.
+// Lane SH15b: tests for the one-time S2, S3, S10 and S11 evaluator.
 import { describe, expect, it } from 'vitest';
 
 import { MAX_REVISION } from '../shadow-evidence-ledger.js';
 import {
   SHADOW_ATTESTATION_FACTS,
   SHADOW_ATTESTATION_SCHEMA_VERSION,
+  SHADOW_ONE_TIME_CRITERIA,
+  SHADOW_ONE_TIME_MAX_TESTS,
+  SHADOW_ONE_TIME_REQUIREMENTS,
+  evaluateShadowOneTimeCriteria,
   readShadowAttestations,
   recordShadowAttestation,
   type ShadowAttestationLedger,
@@ -682,5 +687,488 @@ describe('shadow attestation ledger (SH15a)', () => {
       expect(again.ledger).not.toBe(atCap);
       expect(atCap.revision).toBe(MAX_REVISION);
     });
+  });
+});
+
+const S2_TEST = 'apps/cli/src/__tests__/e2e/shadow-park-reasons.e2e.test.ts';
+const S10_TEST = 'apps/cli/src/__tests__/e2e/shadow-kill-recovery.e2e.test.ts';
+const S11_TEST = 'packages/work-execution/src/domain/__tests__/shadow-brief-corpus.test.ts';
+const DAY = D2;
+const D3 = '2026-02-03';
+
+const PRESENT = ['pass', 'one-time-evidence-present'] as const;
+const ABSENT = ['fail', 'required-test-absent'] as const;
+const QUARANTINED = ['fail', 'required-test-quarantined'] as const;
+const TEST_UNREADABLE = ['unknown', 'release-test-unreadable'] as const;
+const UNPINNED = ['unknown', 'release-unpinned'] as const;
+const TREE_UNREADABLE = ['unknown', 'release-tree-unreadable'] as const;
+const UNREPORTED = ['unknown', 'release-test-unreported'] as const;
+const NOT_YET = ['unknown', 'not-yet-observed'] as const;
+const LEDGER_UNREADABLE = ['unknown', 'attestations-unreadable'] as const;
+const INVALID = ['unknown', 'invalid-input'] as const;
+
+type CriterionCode = readonly ['pass' | 'fail' | 'unknown', string];
+
+function releaseTest(path: string, present = true, quarantined: boolean | null = false): Record<string, unknown> {
+  return { path, present, quarantined };
+}
+
+function presentTests(): Record<string, unknown>[] {
+  return [releaseTest(S2_TEST), releaseTest(S10_TEST), releaseTest(S11_TEST)];
+}
+
+function ledgerOf(
+  facts: readonly { readonly fact: string; readonly observedDay?: string; readonly releaseSha?: string | null }[],
+): ShadowAttestationLedger {
+  let current: ShadowAttestationLedger | null = null;
+  for (const fact of facts) {
+    current = requireLedger(
+      recordShadowAttestation(
+        current,
+        rawAttestation({
+          fact: fact.fact,
+          observedDay: fact.observedDay ?? D1,
+          releaseSha: fact.releaseSha === undefined ? RELEASE_SHA : fact.releaseSha,
+        }),
+      ),
+    );
+  }
+  if (current === null) {
+    throw new Error('expected attestations');
+  }
+  return current;
+}
+
+/** Forge and canary on D1, wake on the evaluation day itself, so both `<` and `=` count. */
+function factsOnOrBeforeDay(): ShadowAttestationLedger {
+  return ledgerOf([
+    { fact: FORGE, observedDay: D1 },
+    { fact: CANARY, observedDay: D1 },
+    { fact: WAKE, observedDay: DAY },
+  ]);
+}
+
+function passingInput(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    day: DAY,
+    releaseSha: RELEASE_SHA,
+    attestations: factsOnOrBeforeDay(),
+    releaseTests: presentTests(),
+    ...overrides,
+  };
+}
+
+function paddedTests(count: number): Record<string, unknown>[] {
+  const tests = presentTests();
+  for (let index = tests.length; index < count; index += 1) {
+    tests.push(releaseTest(`packages/work-execution/src/domain/__tests__/extra-${index}.test.ts`));
+  }
+  return tests;
+}
+
+function expectCodes(
+  input: unknown,
+  codes: { readonly S2: CriterionCode; readonly S3: CriterionCode; readonly S10: CriterionCode; readonly S11: CriterionCode },
+): void {
+  expect(evaluateShadowOneTimeCriteria(input)).toEqual({
+    S2: { status: codes.S2[0], reason: codes.S2[1] },
+    S3: { status: codes.S3[0], reason: codes.S3[1] },
+    S10: { status: codes.S10[0], reason: codes.S10[1] },
+    S11: { status: codes.S11[0], reason: codes.S11[1] },
+  });
+}
+
+function expectInvalidInput(input: unknown): void {
+  expectCodes(input, { S2: INVALID, S3: INVALID, S10: INVALID, S11: INVALID });
+}
+
+function expectUnreadableAttestations(input: unknown): void {
+  expectCodes(input, {
+    S2: LEDGER_UNREADABLE,
+    S3: LEDGER_UNREADABLE,
+    S10: LEDGER_UNREADABLE,
+    S11: LEDGER_UNREADABLE,
+  });
+}
+
+function pollutedEvaluation(key: string): unknown {
+  const json = JSON.stringify(passingInput());
+  return JSON.parse(`${json.slice(0, -1)},"${key}":{"polluted":true}}`);
+}
+
+describe('evaluateShadowOneTimeCriteria (SH15b)', () => {
+  it('passes all four when every required test is present and not quarantined and every fact is attested on or before the day', () => {
+    const result = evaluateShadowOneTimeCriteria(passingInput());
+    expect(result).toEqual({
+      S2: { status: 'pass', reason: 'one-time-evidence-present' },
+      S3: { status: 'pass', reason: 'one-time-evidence-present' },
+      S10: { status: 'pass', reason: 'one-time-evidence-present' },
+      S11: { status: 'pass', reason: 'one-time-evidence-present' },
+    });
+    expect(Object.isFrozen(result.S2)).toBe(true);
+  });
+
+  it('fails S2 with required-test-absent when its test is absent', () => {
+    expectCodes(passingInput({ releaseTests: [releaseTest(S2_TEST, false), releaseTest(S10_TEST), releaseTest(S11_TEST)] }), {
+      S2: ABSENT,
+      S3: PRESENT,
+      S10: PRESENT,
+      S11: PRESENT,
+    });
+  });
+
+  it('fails S10 with required-test-quarantined when its test is quarantined', () => {
+    expectCodes(
+      passingInput({ releaseTests: [releaseTest(S2_TEST), releaseTest(S10_TEST, true, true), releaseTest(S11_TEST)] }),
+      { S2: PRESENT, S3: PRESENT, S10: QUARANTINED, S11: PRESENT },
+    );
+  });
+
+  it('S11 with quarantined null is unknown/release-test-unreadable', () => {
+    expectCodes(
+      passingInput({ releaseTests: [releaseTest(S2_TEST), releaseTest(S10_TEST), releaseTest(S11_TEST, true, null)] }),
+      { S2: PRESENT, S3: PRESENT, S10: PRESENT, S11: TEST_UNREADABLE },
+    );
+  });
+
+  it('releaseSha null yields unknown/release-unpinned for S2, S10 and S11 while S3 passes', () => {
+    expectCodes(passingInput({ releaseSha: null }), {
+      S2: UNPINNED,
+      S3: PRESENT,
+      S10: UNPINNED,
+      S11: UNPINNED,
+    });
+  });
+
+  it('releaseTests null yields unknown/release-tree-unreadable for the three test-bound criteria', () => {
+    expectCodes(passingInput({ releaseTests: null }), {
+      S2: TREE_UNREADABLE,
+      S3: PRESENT,
+      S10: TREE_UNREADABLE,
+      S11: TREE_UNREADABLE,
+    });
+  });
+
+  it('a null releaseSha and a null releaseTests yield release-unpinned, which outranks release-tree-unreadable', () => {
+    expectCodes(passingInput({ releaseSha: null, releaseTests: null }), {
+      S2: UNPINNED,
+      S3: PRESENT,
+      S10: UNPINNED,
+      S11: UNPINNED,
+    });
+  });
+
+  it('an S3 attestation dated the next day is unknown/not-yet-observed', () => {
+    expectCodes(
+      passingInput({
+        attestations: ledgerOf([
+          { fact: FORGE, observedDay: D1 },
+          { fact: CANARY, observedDay: D1 },
+          { fact: WAKE, observedDay: D3 },
+        ]),
+      }),
+      { S2: PRESENT, S3: NOT_YET, S10: PRESENT, S11: PRESENT },
+    );
+  });
+
+  it('an S3 attestation under another release sha still passes', () => {
+    expectCodes(
+      passingInput({
+        attestations: ledgerOf([
+          { fact: FORGE, observedDay: D1 },
+          { fact: CANARY, observedDay: D1 },
+          { fact: WAKE, observedDay: D1, releaseSha: OTHER_RELEASE_SHA },
+        ]),
+      }),
+      { S2: PRESENT, S3: PRESENT, S10: PRESENT, S11: PRESENT },
+    );
+  });
+
+  it('S2 is unknown/not-yet-observed when only one of its two facts is attested', () => {
+    expectCodes(
+      passingInput({
+        attestations: ledgerOf([
+          { fact: FORGE, observedDay: D1 },
+          { fact: WAKE, observedDay: DAY },
+        ]),
+      }),
+      { S2: NOT_YET, S3: PRESENT, S10: PRESENT, S11: PRESENT },
+    );
+  });
+
+  it('S2 with its test absent and its facts missing is fail/required-test-absent', () => {
+    expectCodes(
+      passingInput({
+        attestations: ledgerOf([{ fact: WAKE, observedDay: DAY }]),
+        releaseTests: [releaseTest(S2_TEST, false), releaseTest(S10_TEST), releaseTest(S11_TEST)],
+      }),
+      { S2: ABSENT, S3: PRESENT, S10: PRESENT, S11: PRESENT },
+    );
+  });
+
+  it('S2 absent while the release is unpinned is fail/required-test-absent, which wins over release-unpinned', () => {
+    expectCodes(
+      passingInput({
+        releaseSha: null,
+        releaseTests: [releaseTest(S2_TEST, false), releaseTest(S10_TEST), releaseTest(S11_TEST)],
+      }),
+      { S2: ABSENT, S3: PRESENT, S10: UNPINNED, S11: UNPINNED },
+    );
+  });
+
+  it('S2 with present false and quarantined true is fail/required-test-absent', () => {
+    expectCodes(
+      passingInput({ releaseTests: [releaseTest(S2_TEST, false, true), releaseTest(S10_TEST), releaseTest(S11_TEST)] }),
+      { S2: ABSENT, S3: PRESENT, S10: PRESENT, S11: PRESENT },
+    );
+  });
+
+  it('S2 quarantined with its facts missing is fail/required-test-quarantined', () => {
+    expectCodes(
+      passingInput({
+        attestations: ledgerOf([{ fact: WAKE, observedDay: DAY }]),
+        releaseTests: [releaseTest(S2_TEST, true, true), releaseTest(S10_TEST), releaseTest(S11_TEST)],
+      }),
+      { S2: QUARANTINED, S3: PRESENT, S10: PRESENT, S11: PRESENT },
+    );
+  });
+
+  it('a store absent (attestations null) yields not-yet-observed for S2 and S3', () => {
+    expectCodes(passingInput({ attestations: null }), {
+      S2: NOT_YET,
+      S3: NOT_YET,
+      S10: PRESENT,
+      S11: PRESENT,
+    });
+  });
+
+  it('a malformed ledger is unknown/attestations-unreadable for all four', () => {
+    expectUnreadableAttestations(passingInput({ attestations: { nope: true } }));
+  });
+
+  it('a number where the attestation ledger is due is unknown/attestations-unreadable', () => {
+    expectUnreadableAttestations(passingInput({ attestations: 1 }));
+  });
+
+  it('a required test path not reported is unknown/release-test-unreported', () => {
+    expectCodes(passingInput({ releaseTests: [releaseTest(S10_TEST), releaseTest(S11_TEST)] }), {
+      S2: UNREPORTED,
+      S3: PRESENT,
+      S10: PRESENT,
+      S11: PRESENT,
+    });
+  });
+
+  it('more than SHADOW_ONE_TIME_MAX_TESTS release tests is unknown/invalid-input', () => {
+    expect(paddedTests(SHADOW_ONE_TIME_MAX_TESTS + 1)).toHaveLength(SHADOW_ONE_TIME_MAX_TESTS + 1);
+    expectInvalidInput(passingInput({ releaseTests: paddedTests(SHADOW_ONE_TIME_MAX_TESTS + 1) }));
+  });
+
+  it('exactly SHADOW_ONE_TIME_MAX_TESTS release tests is accepted when the required paths are reported', () => {
+    expect(paddedTests(SHADOW_ONE_TIME_MAX_TESTS)).toHaveLength(SHADOW_ONE_TIME_MAX_TESTS);
+    expectCodes(passingInput({ releaseTests: paddedTests(SHADOW_ONE_TIME_MAX_TESTS) }), {
+      S2: PRESENT,
+      S3: PRESENT,
+      S10: PRESENT,
+      S11: PRESENT,
+    });
+  });
+
+  it('refuses duplicate release-test paths with invalid-input', () => {
+    expectInvalidInput(
+      passingInput({
+        releaseTests: [releaseTest(S2_TEST), releaseTest(S2_TEST), releaseTest(S10_TEST), releaseTest(S11_TEST)],
+      }),
+    );
+  });
+
+  it('refuses a calendar-invalid day with invalid-input', () => {
+    expectInvalidInput(passingInput({ day: '2026-02-31' }));
+  });
+
+  it('refuses a release sha of the wrong shape with invalid-input', () => {
+    expectInvalidInput(passingInput({ releaseSha: 'z'.repeat(40) }));
+  });
+
+  it('refuses input missing attestations with invalid-input', () => {
+    const input = passingInput();
+    delete input.attestations;
+    expectInvalidInput(input);
+  });
+
+  it('refuses input missing releaseTests with invalid-input', () => {
+    const input = passingInput();
+    delete input.releaseTests;
+    expectInvalidInput(input);
+  });
+
+  it('refuses a secret-shaped release-test path with invalid-input and does not echo it', () => {
+    const result = evaluateShadowOneTimeCriteria(
+      passingInput({ releaseTests: [releaseTest(SECRET_TEXT), releaseTest(S10_TEST), releaseTest(S11_TEST)] }),
+    );
+    expect(result).toEqual({
+      S2: { status: 'unknown', reason: 'invalid-input' },
+      S3: { status: 'unknown', reason: 'invalid-input' },
+      S10: { status: 'unknown', reason: 'invalid-input' },
+      S11: { status: 'unknown', reason: 'invalid-input' },
+    });
+    expect(JSON.stringify(result).includes('sk-')).toBe(false);
+  });
+
+  it('SHADOW_ONE_TIME_REQUIREMENTS is frozen and names exactly the reserved paths', () => {
+    expect(SHADOW_ONE_TIME_CRITERIA).toEqual(['S2', 'S3', 'S10', 'S11']);
+    expect(SHADOW_ONE_TIME_MAX_TESTS).toBe(16);
+    expect(Object.isFrozen(SHADOW_ONE_TIME_REQUIREMENTS)).toBe(true);
+    for (const criterion of SHADOW_ONE_TIME_CRITERIA) {
+      expect(Object.isFrozen(SHADOW_ONE_TIME_REQUIREMENTS[criterion])).toBe(true);
+      expect(Object.isFrozen(SHADOW_ONE_TIME_REQUIREMENTS[criterion].tests)).toBe(true);
+      expect(Object.isFrozen(SHADOW_ONE_TIME_REQUIREMENTS[criterion].facts)).toBe(true);
+    }
+    expect(SHADOW_ONE_TIME_REQUIREMENTS.S2.tests).toEqual([S2_TEST]);
+    expect(SHADOW_ONE_TIME_REQUIREMENTS.S2.facts).toEqual([FORGE, CANARY]);
+    expect(SHADOW_ONE_TIME_REQUIREMENTS.S3.tests).toEqual([]);
+    expect(SHADOW_ONE_TIME_REQUIREMENTS.S3.facts).toEqual([WAKE]);
+    expect(SHADOW_ONE_TIME_REQUIREMENTS.S10.tests).toEqual([S10_TEST]);
+    expect(SHADOW_ONE_TIME_REQUIREMENTS.S10.facts).toEqual([]);
+    expect(SHADOW_ONE_TIME_REQUIREMENTS.S11.tests).toEqual([S11_TEST]);
+    expect(SHADOW_ONE_TIME_REQUIREMENTS.S11.facts).toEqual([]);
+  });
+
+  it('is not satisfiable by a constant verdict', () => {
+    const passing = evaluateShadowOneTimeCriteria(passingInput());
+    const failing = evaluateShadowOneTimeCriteria(
+      passingInput({ releaseTests: [releaseTest(S2_TEST, false), releaseTest(S10_TEST), releaseTest(S11_TEST)] }),
+    );
+    expect(passing.S2).toEqual({ status: 'pass', reason: 'one-time-evidence-present' });
+    expect(failing.S2).toEqual({ status: 'fail', reason: 'required-test-absent' });
+    expect(passing).not.toEqual(failing);
+  });
+
+  it('is not an identity echo of the input', () => {
+    const input = passingInput();
+    const result = evaluateShadowOneTimeCriteria(input);
+    expect(result).not.toBe(input);
+    expect(result).not.toEqual(input);
+    const encoded = JSON.stringify(result);
+    expect(encoded.includes(RELEASE_SHA)).toBe(false);
+    expect(encoded.includes(DAY)).toBe(false);
+    expect(encoded.includes(S2_TEST)).toBe(false);
+    expect(encoded.includes(DIGEST)).toBe(false);
+    expect(result.S2).toEqual({ status: 'pass', reason: 'one-time-evidence-present' });
+  });
+
+  it('refuses null with invalid-input', () => {
+    expectInvalidInput(null);
+  });
+
+  it('refuses undefined with invalid-input', () => {
+    expectInvalidInput(undefined);
+  });
+
+  it('refuses a number where a string is due (day and releaseSha) with invalid-input', () => {
+    expectInvalidInput(passingInput({ day: 20260202 }));
+    expectInvalidInput(passingInput({ releaseSha: 1 }));
+  });
+
+  it('refuses a string where the releaseTests list is due with invalid-input', () => {
+    expectInvalidInput(passingInput({ releaseTests: S2_TEST }));
+  });
+
+  it('refuses a non-iterable object where the releaseTests list is due with invalid-input', () => {
+    let calls = 0;
+    const list: Record<string, unknown> = {};
+    Object.defineProperty(list, 'path', {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return S2_TEST;
+      },
+    });
+    expectInvalidInput(passingInput({ releaseTests: list }));
+    expect(calls).toBe(0);
+  });
+
+  it('refuses a releaseTests array with a hole with invalid-input', () => {
+    const kept = releaseTest(S2_TEST);
+    const calls = plantGetter(kept, 'present', true);
+    const tests: unknown[] = [kept, releaseTest(S10_TEST), releaseTest(S11_TEST)];
+    delete tests[1];
+    expectInvalidInput(passingInput({ releaseTests: tests }));
+    expect(calls()).toBe(0);
+  });
+
+  it('refuses an array-like object where the releaseTests list is due with invalid-input', () => {
+    const arrayLike: Record<string, unknown> = { length: 1 };
+    const calls = plantGetter(arrayLike, '0', releaseTest(S2_TEST));
+    expectInvalidInput(passingInput({ releaseTests: arrayLike }));
+    expect(calls()).toBe(0);
+  });
+
+  it('refuses an enormous sparse length (2**32 - 1) before any traversal with invalid-input', () => {
+    const sparse: unknown[] = [];
+    Object.defineProperty(sparse, 'length', { value: 2 ** 32 - 1 });
+    const calls = plantGetter(sparse, '0', releaseTest(S2_TEST));
+    expectInvalidInput(passingInput({ releaseTests: sparse }));
+    expect(calls()).toBe(0);
+  });
+
+  it('never runs a getter on the root and refuses it with invalid-input', () => {
+    const input = passingInput();
+    const calls = plantGetter(input, 'day', DAY);
+    expectInvalidInput(input);
+    expect(calls()).toBe(0);
+  });
+
+  it('never runs a getter on a release-test item and refuses it with invalid-input', () => {
+    const item = releaseTest(S2_TEST);
+    const calls = plantGetter(item, 'present', true);
+    expectInvalidInput(passingInput({ releaseTests: [item, releaseTest(S10_TEST), releaseTest(S11_TEST)] }));
+    expect(calls()).toBe(0);
+  });
+
+  it('never runs a getter on the attestations ledger and returns attestations-unreadable', () => {
+    const ledger = factsOnOrBeforeDay();
+    const calls = plantGetter(ledger, 'revision', ledger.revision);
+    expectUnreadableAttestations(passingInput({ attestations: ledger }));
+    expect(calls()).toBe(0);
+  });
+
+  it('a Proxy over a valid input yields exactly the plain data and runs no get trap', () => {
+    const input = passingInput();
+    const plain = evaluateShadowOneTimeCriteria(input);
+    expect(evaluateShadowOneTimeCriteria(new Proxy(input, {}))).toEqual(plain);
+    let gets = 0;
+    const counted = new Proxy(input, {
+      get(target, property, receiver) {
+        gets += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(evaluateShadowOneTimeCriteria(counted)).toEqual(plain);
+    expect(gets).toBe(0);
+  });
+
+  it('refuses a Proxy whose ownKeys trap throws with invalid-input', () => {
+    const proxy = new Proxy(passingInput(), {
+      ownKeys() {
+        throw new Error('trap');
+      },
+    });
+    expectInvalidInput(proxy);
+  });
+
+  it('refuses a prototype-polluting __proto__ key produced by JSON.parse with invalid-input', () => {
+    expectInvalidInput(pollutedEvaluation('__proto__'));
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'polluted')).toBeUndefined();
+  });
+
+  it('refuses a prototype-polluting constructor key produced by JSON.parse with invalid-input', () => {
+    expectInvalidInput(pollutedEvaluation('constructor'));
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'polluted')).toBeUndefined();
+  });
+
+  it('refuses a prototype-polluting prototype key produced by JSON.parse with invalid-input', () => {
+    expectInvalidInput(pollutedEvaluation('prototype'));
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'polluted')).toBeUndefined();
   });
 });

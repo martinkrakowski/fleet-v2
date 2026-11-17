@@ -29,6 +29,8 @@ import {
   type ReleaseStorePort,
 } from '@fleet/work-execution';
 
+import { realpath } from 'node:fs/promises';
+
 import { CliUsageError } from './commands/payload.js';
 import type { CommandHandler, Payload } from './commands/payload.js';
 import type { FleetCliRuntime } from './composition.js';
@@ -38,6 +40,24 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const DEFAULT_KEEP = 5;
 const MIN_KEEP = 2;
 const MAX_KEEP = 64;
+
+/**
+ * CO14c-1 fix round 2: the operator message of the `release-root-missing`
+ * refusal. It names no path — not the root, not the configured root — and
+ * only says that the release root does not exist and must be created before
+ * the first install, pointing to the cutover runbook's
+ * "Before the first `release install`" step.
+ */
+const RELEASE_ROOT_MISSING_MESSAGE =
+  "the release root does not exist; create it before the first install " +
+  "(runbook: cutover, step 'Before the first release install')";
+
+/** Whether a thrown value carries exactly the given `errno`-style code. */
+function isErrnoExceptionWithCode(value: unknown, code: string): boolean {
+  return (
+    typeof value === 'object' && value !== null && 'code' in value && (value as { code?: unknown }).code === code
+  );
+}
 
 export interface ReleaseCommandDependencies {
   readonly lease: ConductorDriverLeasePort;
@@ -133,6 +153,59 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     if (stateDir === null) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
     }
+    const checkable = root.startsWith('/') && !root.split('/').includes('..') && root.length <= 4096;
+    // CO14c-1: `--root` must be the root the daemon actually serves. The whole
+    // root pre-check — the lexical parse of the installation's
+    // `daemon.cliPath` (`<root>/current/apps/cli/dist/bin.js`, where a missing
+    // or malformed one leaves the served root unknown; whether the entry point
+    // exists on disk plays no part in the parse itself) and the `realpath`
+    // comparison — runs only when the `checkable` predicate holds, so an
+    // uncheckable root (`..` or relative) still falls through to
+    // `parseRequest`'s usage error unchanged. Otherwise `--root` and the
+    // configured root must both exist on disk and resolve to the same real
+    // path: a symlinked root is accepted only when it resolves to the
+    // configured root, and the configured root is resolved on disk, never
+    // trusted as a string. The failure is a typed refusal that never echoes a
+    // path (the missing-root refusal's message points to the runbook step
+    // instead — see the fix-round-2 note below).
+    if (checkable) {
+      const configuredRoot = configuredReleaseRoot(rt.installation as ReleaseDriverConfiguration | undefined);
+      if (configuredRoot === null) {
+        return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+      }
+      let realRoot: string;
+      try {
+        realRoot = await realpath(root);
+      } catch (error) {
+        // CO14c-1 fix round 2: only a missing `--root` (realpath `ENOENT`) is
+        // the operator's missing release root. Every other failure —
+        // `EACCES`, `ELOOP`, `ENOTDIR`, a non-errno throw — leaves the root
+        // unknown and refuses with `release-root-state-dir-unknown`, so an
+        // unreadable root can never be mistaken for a missing one. The
+        // `release-root-missing` message says only that the release root does
+        // not exist and must be created before the first install, and points
+        // to the runbook step; it never echoes a path, and the exit code
+        // stays the refusals' own.
+        if (isErrnoExceptionWithCode(error, 'ENOENT')) {
+          return {
+            outcome: 'refused',
+            reason: 'release-root-missing' as const,
+            message: RELEASE_ROOT_MISSING_MESSAGE,
+          };
+        }
+        return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+      }
+      try {
+        const realConfiguredRoot = await realpath(configuredRoot);
+        if (realRoot !== realConfiguredRoot) {
+          return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+        }
+      } catch {
+        // The configured root must be resolved on disk, never compared as a
+        // string: a configured root that does not exist there refuses.
+        return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+      }
+    }
     // A root bound to another installation's driver is not served by this one:
     // its lease would be read from the wrong directory, so it is refused
     // here, before anything is read, built or written. A root with no
@@ -140,7 +213,6 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     // (first binding wins) — but NOT here: see the round 8 note below. An
     // unreadable binding is unknown.
     const store = new ReleaseStoreAdapter();
-    const checkable = root.startsWith('/') && !root.split('/').includes('..') && root.length <= 4096;
     const binding = checkable ? await store.readDriverBinding({ root }) : ({ outcome: 'unbound' } as const);
     if (binding.outcome === 'unreadable' || (binding.outcome === 'bound' && binding.stateDir !== stateDir)) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
@@ -175,8 +247,102 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
 }
 
 export interface ReleaseDriverConfiguration {
-  /** The installation's daemon section, whose `stateDir` names the driver state directory. */
-  readonly daemon?: { readonly stateDir?: string };
+  /**
+   * The installation's daemon section, whose `stateDir` names the driver state
+   * directory and whose `cliPath` is the served CLI entry point, from which
+   * the served release root is extracted lexically (CO14c-1).
+   */
+  readonly daemon?: { readonly stateDir?: string; readonly cliPath?: string };
+}
+
+/** The exact entry suffix a served `daemon.cliPath` must end with (ReleaseStoreAdapter's `CLI_ENTRY`). */
+const CLI_ENTRY_SUFFIX = '/current/apps/cli/dist/bin.js';
+
+/** The named cap on a configured `daemon.cliPath` length; the parser is linear in this. */
+const MAX_CLI_PATH_LENGTH = 4096;
+
+/**
+ * CO14c-1: the typed result of the pure `daemon.cliPath` parser. Refusals carry
+ * the release's named unknown-state-dir reason; success carries the extracted
+ * lexical `<root>` prefix of `<root>/current/apps/cli/dist/bin.js`.
+ */
+export type ConfiguredCliPath =
+  | { readonly outcome: 'ok'; readonly root: string }
+  | { readonly outcome: 'refused'; readonly reason: 'release-root-state-dir-unknown' };
+
+const CLI_PATH_REFUSED: ConfiguredCliPath = { outcome: 'refused', reason: 'release-root-state-dir-unknown' };
+
+/**
+ * CO14c-1: the pure lexical parse of the configured `daemon.cliPath`. It
+ * accepts only a string ending with the exact suffix
+ * `/current/apps/cli/dist/bin.js` (matching `ReleaseStoreAdapter`'s
+ * `CLI_ENTRY`); the configured root is the prefix before that suffix, so a
+ * root that itself contains a `current` segment is unambiguous. The prefix
+ * must be non-empty, absolute, and free of `\0`, empty (`//`), `.` and `..`
+ * segments. Whether the entry point exists on disk is irrelevant here. The
+ * input is taken as `unknown` and never thrown from: anything that is not a
+ * plain string value — a wrong primitive, a non-plain object, a getter or a
+ * `Proxy` (neither ever invoked nor trapped, since the parse reads no
+ * property at all) — refuses. Cost: linear in the capped input, at most
+ * `MAX_CLI_PATH_LENGTH` characters inspected once each; the cap is a named
+ * constant, and an over-cap input refuses before any traversal.
+ */
+export function parseConfiguredCliPath(value: unknown): ConfiguredCliPath {
+  try {
+    if (typeof value !== 'string' || value.length > MAX_CLI_PATH_LENGTH) {
+      return CLI_PATH_REFUSED;
+    }
+    if (!value.endsWith(CLI_ENTRY_SUFFIX)) {
+      return CLI_PATH_REFUSED;
+    }
+    const root = value.slice(0, value.length - CLI_ENTRY_SUFFIX.length);
+    if (!root.startsWith('/') || root.includes('\0')) {
+      return CLI_PATH_REFUSED;
+    }
+    // The leading segment is empty by construction (the prefix starts with
+    // `/`); any other empty segment is a `//`, and `.` / `..` segments are
+    // refused so the lexical prefix is the literal root.
+    const segments = root.split('/');
+    for (let index = 1; index < segments.length; index += 1) {
+      const segment = segments[index];
+      if (segment === '' || segment === '.' || segment === '..') {
+        return CLI_PATH_REFUSED;
+      }
+    }
+    return { outcome: 'ok', root };
+  } catch {
+    return CLI_PATH_REFUSED;
+  }
+}
+
+/**
+ * CO14c-1: the configured release root, read from the installation's
+ * `daemon.cliPath` through own data-property descriptors only (matching
+ * `resolveRootStateDir`'s descriptor checks on `configuration` and `daemon`,
+ * so a getter or a `Proxy` trap is never invoked). `null` when the
+ * configuration is missing or hostile or the `cliPath` fails the lexical
+ * parse. No filesystem access of its own.
+ */
+function configuredReleaseRoot(configuration: ReleaseDriverConfiguration | undefined): string | null {
+  try {
+    const configurationDescriptor =
+      typeof configuration === 'object' && configuration !== null
+        ? Object.getOwnPropertyDescriptor(configuration, 'daemon')
+        : undefined;
+    const daemon =
+      configurationDescriptor !== undefined && !configurationDescriptor.get && !configurationDescriptor.set
+        ? configurationDescriptor.value
+        : undefined;
+    if (typeof daemon !== 'object' || daemon === null) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(daemon, 'cliPath');
+    const value = descriptor !== undefined && !descriptor.get && !descriptor.set ? descriptor.value : undefined;
+    const parsed = parseConfiguredCliPath(value);
+    return parsed.outcome === 'ok' ? parsed.root : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

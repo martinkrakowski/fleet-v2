@@ -7,9 +7,28 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+/**
+ * CO14c-1 fix round 2: the fs seam used to force a `realpath` failure. The
+ * wrapper delegates to the real `node:fs/promises` unless a failure is armed
+ * (and armed failures are consumed once), so every other test in this file
+ * keeps the real filesystem behavior.
+ */
+const realpathFailure = vi.hoisted(() => ({ code: null as string | null }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const injectedRealpath = (path: string) => {
+    const code = realpathFailure.code;
+    if (code !== null) {
+      throw Object.assign(new Error(`injected realpath failure (${code})`), { code });
+    }
+    return actual.realpath(path);
+  };
+  return { ...actual, realpath: Object.assign(injectedRealpath, { native: actual.realpath }) };
+});
 
 import {
   ConductorDriverLeaseAdapter,
@@ -23,9 +42,14 @@ import {
 } from '@fleet/work-execution';
 
 import { CliUsageError } from '../commands/payload.js';
-import { createFleetCliRuntime } from '../composition.js';
+import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
-import { manageReleaseFromPayload, releaseAuthorization, releaseCommands } from '../release.js';
+import {
+  manageReleaseFromPayload,
+  parseConfiguredCliPath,
+  releaseAuthorization,
+  releaseCommands,
+} from '../release.js';
 
 const ROOT = '/nonexistent-fleet-release-root-co14';
 const SOURCE = '/nonexistent-fleet-v2-source-co14';
@@ -343,7 +367,9 @@ describe('release command', () => {
         hosts: {},
         daemon: {
           nodePath: '/usr/bin/node',
-          cliPath: '/usr/bin/fleet-v2',
+          // CO14c-1: the entry point must be the served root's own, so the
+          // handler can extract the root lexically and re-check `--root`.
+          cliPath: `${root}/current/apps/cli/dist/bin.js`,
           stateDir,
           unitDir: join(stateDir, 'units'),
           installationFile: join(stateDir, 'fleet.json'),
@@ -385,6 +411,221 @@ describe('release command', () => {
       }),
     ).toEqual({ outcome: 'blocked', reason: 'not a release action' });
   });
+
+  /** A real runtime whose installation serves `root` through `daemon.cliPath`. */
+  async function runtimeServingRoot(root: string, stateDir: string): Promise<FleetCliRuntime> {
+    return createFleetCliRuntime({
+      stateDir,
+      installation: {
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {},
+        daemon: {
+          nodePath: '/usr/bin/node',
+          cliPath: `${root}/current/apps/cli/dist/bin.js`,
+          stateDir,
+          unitDir: join(stateDir, 'units'),
+          installationFile: join(stateDir, 'fleet.json'),
+        },
+      } as never,
+    });
+  }
+
+  it(
+    'CO14c-1: a symlinked --root that resolves to the configured root is accepted, ' +
+      'and request.root is preserved verbatim (never rewritten to its realpath)',
+    async () => {
+      const base = await mkdtemp(join(tmpdir(), 'co14c-symlink-base-'));
+      const root = join(base, 'releases');
+      await mkdir(root, { recursive: true });
+      const link = join(base, 'root-link');
+      await symlink(root, link);
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14c-symlink-state-'));
+      const rt = await runtimeServingRoot(root, stateDir);
+      // The store sees the symlink path verbatim: the handler never substitutes
+      // the realpath, which would strand a crashed operation's consumed grant.
+      const listSpy = vi.spyOn(ReleaseStoreAdapter.prototype, 'list');
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', link, '--sha', SHA, '--source', link],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(err.join('')).toBe('');
+      expect(code).toBe(0);
+      expect(JSON.parse(out.join('')).outcome).toBe('planned');
+      expect(listSpy).toHaveBeenCalledWith({ root: link });
+      listSpy.mockRestore();
+    },
+  );
+
+  it('CO14c-1: a symlink to an unrelated directory, with no bin.js entry there, is refused', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'co14c-unrelated-base-'));
+    const root = join(base, 'releases');
+    await mkdir(root, { recursive: true });
+    const unrelated = join(base, 'unrelated');
+    await mkdir(unrelated, { recursive: true });
+    const link = join(base, 'root-link');
+    await symlink(unrelated, link);
+    const stateDir = await mkdtemp(join(tmpdir(), 'co14c-unrelated-state-'));
+    const rt = await runtimeServingRoot(root, stateDir);
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await runCli(
+      ['release', 'install', '--root', link, '--sha', SHA, '--source', link],
+      { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+      rt,
+    );
+    expect(err.join('')).toBe('');
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+  });
+
+  it('CO14c-1: a nonexistent root is refused even on install --apply (the operator pre-creates it)', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'co14c-missing-base-'));
+    const root = join(base, 'releases');
+    const stateDir = await mkdtemp(join(tmpdir(), 'co14c-missing-state-'));
+    const rt = await runtimeServingRoot(root, stateDir);
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await runCli(
+      ['release', 'install', '--root', root, '--sha', SHA, '--source', root, '--project', PROJECT, '--apply'],
+      { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+      rt,
+    );
+    expect(err.join('')).toBe('');
+    expect(code).toBe(1);
+    // CO14c-1 fix round 2: the missing root keeps its own reason, but the
+    // message echoes no path — it says only that the release root does not
+    // exist and must be created before the first install, and points to the
+    // runbook step.
+    const refused = JSON.parse(out.join('')) as { message?: string };
+    expect(refused).toEqual({
+      outcome: 'refused',
+      reason: 'release-root-missing',
+      message: "the release root does not exist; create it before the first install " +
+        "(runbook: cutover, step 'Before the first release install')",
+    });
+    expect(refused.message).not.toContain(root);
+    expect(refused.message).not.toContain(base);
+    // Nothing was created under the missing root's parent.
+    expect(await stat(root).then(() => true, () => false)).toBe(false);
+  });
+
+  it('CO14c-1 fix round 2: a realpath failing with EACCES on --root gives release-root-state-dir-unknown', async () => {
+    // Seam: this suite's fs seam is its `node:fs/promises` module mock (see
+    // the top of the file): the test arms one injected `EACCES` failure on
+    // `realpath` and delegates everything else to the real module. (A
+    // chmod-000 directory was not used: these tests can run as root, where
+    // permission bits do not refuse, so the module seam is deterministic.)
+    const base = await mkdtemp(join(tmpdir(), 'co14c-eacces-base-'));
+    const root = join(base, 'releases');
+    await mkdir(root, { recursive: true });
+    const stateDir = await mkdtemp(join(tmpdir(), 'co14c-eacces-state-'));
+    const rt = await runtimeServingRoot(root, stateDir);
+    try {
+      realpathFailure.code = 'EACCES';
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', root, '--sha', SHA, '--source', root],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(err.join('')).toBe('');
+      expect(code).toBe(1);
+      // `EACCES` is not a missing root: the refusal is the unknown-state-dir
+      // one, with no message (so no path echo).
+      expect(JSON.parse(out.join(''))).toEqual({
+        outcome: 'refused',
+        reason: 'release-root-state-dir-unknown',
+      });
+    } finally {
+      realpathFailure.code = null;
+    }
+  });
+
+  it('CO14c-1: an existing root that is not the configured root is refused (realpath mismatch)', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'co14c-mismatch-base-'));
+    const servedRoot = join(base, 'served');
+    const otherRoot = join(base, 'other');
+    await mkdir(servedRoot, { recursive: true });
+    await mkdir(otherRoot, { recursive: true });
+    const stateDir = await mkdtemp(join(tmpdir(), 'co14c-mismatch-state-'));
+    const rt = await runtimeServingRoot(servedRoot, stateDir);
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await runCli(
+      ['release', 'install', '--root', otherRoot, '--sha', SHA, '--source', otherRoot],
+      { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+      rt,
+    );
+    expect(err.join('')).toBe('');
+    expect(code).toBe(1);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+  });
+
+  it(
+    'CO14c-1 fix round 1: a configured served root that does not exist on disk is refused, ' +
+      'even though --root exists (the configured root is resolved on disk, never trusted as a string)',
+    async () => {
+      const base = await mkdtemp(join(tmpdir(), 'co14c-config-missing-base-'));
+      // `--root` exists on disk: a real directory.
+      const root = join(base, 'served');
+      await mkdir(root, { recursive: true });
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14c-config-missing-state-'));
+      // The configured served root does NOT exist on disk, so only its
+      // lexical string could ever be compared; the pre-check resolves it on
+      // disk instead and refuses. (A configured root whose lexical string
+      // equalled --root's real path while missing on disk cannot exist: the
+      // realpath of an existing `--root` is itself an existing path. So the
+      // property pinned here is that the configured root is always resolved
+      // on disk — a missing one refuses, never falls back to a string
+      // comparison.)
+      const configured = join(base, 'served-configured');
+      const rt = await runtimeServingRoot(configured, stateDir);
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', root, '--sha', SHA, '--source', root],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(err.join('')).toBe('');
+      expect(code).toBe(1);
+      expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+    },
+  );
+
+  it(
+    "CO14c-1 fix round 1: an uncheckable --root with an installation that has no daemon.cliPath " +
+      "is the usage error, not a root refusal",
+    async () => {
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14c-uncheckable-state-'));
+      // The installation records a driver state directory but no
+      // `daemon.cliPath`.
+      const rt = createFleetCliRuntime({
+        stateDir,
+        installation: { daemon: { stateDir } } as never,
+      });
+      // A relative root is uncheckable, so the whole root pre-check —
+      // including the missing-`cliPath` refusal — is gated off, and the
+      // request falls through unchanged. It is `parseRequest`, inside
+      // `manageReleaseFromPayload` (the CLI usage layer), that decides this
+      // outcome: a `CliUsageError`, which `runCli` reports as exit 2.
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', 'release-root-relative', '--sha', SHA, '--source', 'source'],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(code).toBe(2);
+      expect(out.join('')).toBe('');
+      expect(err.join('')).toContain("--root <absolute path without '..'>");
+    },
+  );
 
   it('install with a live driver lease is refused', async () => {
     const d = deps(LIVE_LEASE);
@@ -437,5 +678,143 @@ describe('release command', () => {
     }
     expect(results[2]).toEqual({ outcome: 'refused', reason: 'not-found' });
     expect(results[3]).toEqual({ outcome: 'refused', reason: 'not-found' });
+  });
+});
+
+describe('parseConfiguredCliPath (CO14c-1)', () => {
+  const VALID_ROOT = '/srv/current/releases';
+  const VALID = `${VALID_ROOT}/current/apps/cli/dist/bin.js`;
+  const REFUSAL = { outcome: 'refused', reason: 'release-root-state-dir-unknown' };
+
+  it('accepts a lexically valid configured entry point and extracts its root prefix', () => {
+    expect(parseConfiguredCliPath(VALID)).toEqual({ outcome: 'ok', root: VALID_ROOT });
+  });
+
+  it('accepts a root that itself contains a `current` segment (the parse is lexical, not segment-matching)', () => {
+    expect(parseConfiguredCliPath('/srv/current/releases/current/apps/cli/dist/bin.js')).toEqual({
+      outcome: 'ok',
+      root: '/srv/current/releases',
+    });
+  });
+
+  it('accepts the entry point lexically even when nothing exists on disk', () => {
+    expect(parseConfiguredCliPath('/nonexistent-co14c/current/apps/cli/dist/bin.js')).toEqual({
+      outcome: 'ok',
+      root: '/nonexistent-co14c',
+    });
+  });
+
+  it('refuses null', () => {
+    expect(parseConfiguredCliPath(null)).toEqual(REFUSAL);
+  });
+
+  it('refuses undefined', () => {
+    expect(parseConfiguredCliPath(undefined)).toEqual(REFUSAL);
+  });
+
+  it('refuses a wrong primitive (a number where a string is due)', () => {
+    expect(parseConfiguredCliPath(4096)).toEqual(REFUSAL);
+  });
+
+  it('refuses a boolean where a string is due', () => {
+    expect(parseConfiguredCliPath(true)).toEqual(REFUSAL);
+  });
+
+  it('refuses an array where a string is due', () => {
+    expect(parseConfiguredCliPath([VALID])).toEqual(REFUSAL);
+  });
+
+  it('refuses a sparse array (an array hole where a string is due)', () => {
+    const sparse: unknown[] = new Array(3);
+    sparse[2] = VALID;
+    expect(parseConfiguredCliPath(sparse)).toEqual(REFUSAL);
+  });
+
+  it('refuses an array-like object where a string is due', () => {
+    expect(parseConfiguredCliPath({ length: 1, 0: VALID })).toEqual(REFUSAL);
+  });
+
+  it('refuses an enormous length before any traversal', () => {
+    const enormous: unknown[] = new Array(2 ** 32 - 1);
+    expect(parseConfiguredCliPath(enormous)).toEqual(REFUSAL);
+  });
+
+  it('refuses a string over the named length cap before any traversal', () => {
+    const longRoot = `/${'a'.repeat(4096)}`;
+    expect(parseConfiguredCliPath(`${longRoot}/current/apps/cli/dist/bin.js`)).toEqual(REFUSAL);
+  });
+
+  it('refuses a hostile object and never invokes a getter on it', () => {
+    let getterCalls = 0;
+    const hostile = {
+      get toStringValue(): string {
+        getterCalls += 1;
+        return VALID;
+      },
+    };
+    expect(parseConfiguredCliPath(hostile)).toEqual(REFUSAL);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('refuses a Proxy over a valid-shaped input and runs no get trap', () => {
+    let getTraps = 0;
+    const proxy = new Proxy(
+      { value: VALID },
+      {
+        get(target, key) {
+          getTraps += 1;
+          return Reflect.get(target, key);
+        },
+      },
+    );
+    expect(parseConfiguredCliPath(proxy)).toEqual(REFUSAL);
+    expect(getTraps).toBe(0);
+  });
+
+  it('refuses an object whose own key is prototype-polluting (via JSON.parse)', () => {
+    const polluting: Record<string, unknown> = JSON.parse('{"__proto__": {}, "value": "/srv"}');
+    expect(parseConfiguredCliPath(polluting)).toEqual(REFUSAL);
+    expect(Object.keys(polluting)).toContain('value');
+  });
+
+  it('refuses a value missing the exact `/current/apps/cli/dist/bin.js` suffix', () => {
+    expect(parseConfiguredCliPath('/usr/bin/fleet-v2')).toEqual(REFUSAL);
+    expect(parseConfiguredCliPath('/srv/current/apps/cli/dist/bin.mjs')).toEqual(REFUSAL);
+  });
+
+  it('refuses an empty or relative prefix', () => {
+    expect(parseConfiguredCliPath('/current/apps/cli/dist/bin.js')).toEqual(REFUSAL);
+    expect(parseConfiguredCliPath('srv/current/apps/cli/dist/bin.js')).toEqual(REFUSAL);
+  });
+
+  it('refuses a prefix with a `..` segment', () => {
+    expect(parseConfiguredCliPath('/srv/../etc/current/apps/cli/dist/bin.js')).toEqual(REFUSAL);
+  });
+
+  it('refuses a prefix with a `.` segment', () => {
+    expect(parseConfiguredCliPath('/srv/./releases/current/apps/cli/dist/bin.js')).toEqual(REFUSAL);
+  });
+
+  it('refuses a prefix with an empty (`//`) segment', () => {
+    expect(parseConfiguredCliPath('/srv//releases/current/apps/cli/dist/bin.js')).toEqual(REFUSAL);
+  });
+
+  it('refuses a prefix with a NUL byte', () => {
+    expect(parseConfiguredCliPath('/srv\0/releases/current/apps/cli/dist/bin.js')).toEqual(REFUSAL);
+  });
+
+  it('is not satisfiable by a constant refusal: a valid input succeeds', () => {
+    // A function that always returned REFUSAL would fail this assertion.
+    expect(parseConfiguredCliPath(VALID)).toEqual({ outcome: 'ok', root: VALID_ROOT });
+  });
+
+  it('is not an identity echo of its input: the result is the prefix, not the whole string', () => {
+    const parsed = parseConfiguredCliPath(VALID);
+    if (parsed.outcome !== 'ok') throw new Error('expected ok');
+    expect(parsed.root).not.toBe(VALID);
+    expect(parsed.root).toBe(VALID_ROOT);
+    // And a refusal does not echo its input either.
+    const refused = parseConfiguredCliPath('/srv/current/apps/cli/dist/bin.js/../bin.js');
+    expect(refused).toEqual(REFUSAL);
   });
 });

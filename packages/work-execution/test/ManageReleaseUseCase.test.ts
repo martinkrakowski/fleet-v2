@@ -1503,6 +1503,129 @@ describe('ManageReleaseUseCase', () => {
     },
   );
 
+  function round14UseCase(store: FakeStore, authorization: ActionAuthorizationPort = alwaysGrants()): ManageReleaseUseCase {
+    return new ManageReleaseUseCase({
+      store,
+      lease: new FakeLease(null),
+      authorization,
+      executor: new FakeExecutor(),
+      nowIso: () => NOW,
+      env: () => ({ PATH: '/usr/bin' }),
+      stateDir: STATE_DIR,
+    });
+  }
+
+  it(
+    'an unrepointed stale rollback intent left behind by a swap to a newer build is retired and the target ' +
+      'recomputed fresh, apply and plan alike (CO14b round 14, finding 1)',
+    async () => {
+      // A<B<C<D, current C. A rollback to B began its intent and died before
+      // its repoint (repointed: false); the operator then swapped to D.
+      const store = new SpyStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4)], D);
+      const staleOpId = store.newOperationId();
+      store.operations.set(`rollback-${B}`, { opId: staleOpId, claimed: false, repointed: false });
+      const useCase = round14UseCase(store);
+
+      const planned = await manage(useCase, request({ action: 'rollback', sha: null, source: null }));
+      expect(planned).toMatchObject({ outcome: 'planned', target: C, previous: C, current: D });
+      expect(store.cancelCalls).toBe(0);
+      expect(store.operations.has(`rollback-${B}`)).toBe(true);
+
+      const applied = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(applied).toMatchObject({ outcome: 'applied', action: 'rollback', target: C, current: C });
+      expect(store.current).toBe(C);
+      expect(store.operations.has(`rollback-${B}`)).toBe(false);
+      expect(store.cancelCalls).toBe(1);
+    },
+  );
+
+  it('a repointed:false rollback intent that is still legitimately resumable is still adopted (CO14b round 14)', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C);
+    const opId = store.newOperationId();
+    store.operations.set(`rollback-${B}`, { opId, claimed: false, repointed: false });
+    const consumes: string[] = [];
+    const authorization: ActionAuthorizationPort = {
+      resolveActionAuthorization: async (req) => ({
+        outcome: 'granted',
+        authorizationGrantId: GRANT,
+        ...(req.releaseRoot !== undefined ? { releaseRoot: req.releaseRoot } : {}),
+      }),
+      consumeActionAuthorization: async (req) => {
+        consumes.push(req.actionId);
+        return { outcome: 'consumed', actionId: req.actionId };
+      },
+    };
+    const result = await manage(
+      round14UseCase(store, authorization),
+      applyRequest({ action: 'rollback', sha: null, source: null }),
+    );
+    expect(result).toMatchObject({ outcome: 'applied', action: 'rollback', target: B, current: B });
+    expect(consumes).toEqual([`release-rollback-${B}-${opId}`]);
+  });
+
+  it(
+    'a rollback that dies right after the rename is already marked repointed, so a swap back retires it and a ' +
+      'later rollback never replays the spent grant (CO14b round 14, finding 2)',
+    async () => {
+      class DiesAfterRename extends FakeStore {
+        dieNext = true;
+        async repoint(input: { root: string; sha: string; fence?: () => Promise<boolean> }) {
+          const result = await super.repoint(input);
+          if (this.dieNext && result.outcome === 'ok') {
+            this.dieNext = false;
+            throw new Error('process died after the rename');
+          }
+          return result;
+        }
+      }
+      const store = new DiesAfterRename([build('a', 1), build('b', 2), build('c', 3)], C);
+      const consumes: string[] = [];
+      const authorization: ActionAuthorizationPort = {
+        resolveActionAuthorization: async (req) => ({
+          outcome: 'granted',
+          authorizationGrantId: GRANT,
+          ...(req.releaseRoot !== undefined ? { releaseRoot: req.releaseRoot } : {}),
+        }),
+        consumeActionAuthorization: async (req) => {
+          consumes.push(req.actionId);
+          return { outcome: 'consumed', actionId: req.actionId };
+        },
+      };
+      const useCase = round14UseCase(store, authorization);
+
+      const died = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(died.outcome).toBe('refused');
+      expect(store.current).toBe(B);
+      const crashed = await store.peekAnyOpenOperation({ action: 'rollback' });
+      expect(crashed).toMatchObject({ outcome: 'open', sha: B, repointed: true });
+      const staleActionId = `release-rollback-${B}-${(crashed as { opId: string }).opId}`;
+
+      // Swap back to C: the marked intent is proven stale and retired.
+      const swapped = await manage(useCase, applyRequest({ action: 'swap', sha: C, source: null }));
+      expect(swapped).toMatchObject({ outcome: 'applied', target: C, current: C });
+      expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({ outcome: 'none' });
+
+      const again = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      expect(again).toMatchObject({ outcome: 'applied', target: B, current: B });
+      expect(consumes.filter((id) => id === staleActionId)).toHaveLength(1);
+    },
+  );
+
+  it('a failing cancelOperation refuses the rollback and never opens a second intent (CO14b round 14, finding 3)', async () => {
+    class FailingCancel extends FakeStore {
+      async cancelOperation(): Promise<ReleaseStoreWriteResult> {
+        return { outcome: 'unreadable' };
+      }
+    }
+    const store = new FailingCancel([build('a', 1), build('b', 2), build('c', 3), build('d', 4)], D);
+    store.operations.set(`rollback-${B}`, { opId: store.newOperationId(), claimed: false, repointed: false });
+    const result = await manage(round14UseCase(store), applyRequest({ action: 'rollback', sha: null, source: null }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
+    expect(store.operations.size).toBe(1);
+    expect(store.current).toBe(D);
+    expect(store.calls.filter((call) => call.startsWith('repoint '))).toEqual([]);
+  });
+
   it('refuses driver-lease-live while the conductor driver lease is live', async () => {
     const { useCase, store, executor } = granted(INSTALL, A, { lease: LIVE_LEASE });
     expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });

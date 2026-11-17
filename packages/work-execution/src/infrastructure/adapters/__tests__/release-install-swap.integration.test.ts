@@ -350,6 +350,8 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     await h.grants.saveRequest(releaseGrant('grant-a', 'release:install', shaA, h.root));
     expect(await apply('install', shaA)).toEqual({ outcome: 'refused', reason: 'build-failed-grant-spent' });
     expect(await h.store.list({ root: h.root })).toMatchObject({ outcome: 'read', current: null, builds: [] });
+    // The grant is spent: a build that cannot be verified is never silently retried under it.
+    expect((await h.grants.findRequestByGrantId('grant-a'))?.consumptions).toHaveLength(1);
   });
 
   it('install of a pruned sha with a spent grant is refused and no build script runs', async () => {

@@ -621,14 +621,6 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       return { outcome: 'unreadable' };
     }
     if (open.outcome === 'open') {
-      if (!open.repointed) {
-        // Never proven to have done anything yet; adopted exactly as before
-        // round 10 -- safe already, because the ordinary `current !==
-        // plannedCurrent` check downstream still gates it. No fresh read
-        // was needed, so the caller's own listing is still the right one to
-        // report back.
-        return { outcome: 'resolved', target: open.sha, previous: open.sha, builds, current };
-      }
       // CO14b fix round 11 (finding 1): `open.repointed` alone does not
       // settle whether this intent is still live -- it may ALREADY be
       // stale right now even though the `current` this function was
@@ -642,7 +634,17 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       if (fresh.outcome !== 'read') {
         return { outcome: 'unreadable' };
       }
-      if (fresh.current === open.sha) {
+      // CO14b fix round 14 (finding 1): an intent that never reached its
+      // repoint (`repointed: false`) is adopted only while it still describes
+      // the live state: `current` is already at its sha, or its sha is
+      // exactly what a rollback from the FRESH `current` would target. An
+      // authorized swap that moved `current` on since the intent began makes
+      // it stale for good (an unmarked intent is skipped by the swap's own
+      // cleanup), so it is retired below and the target recomputed.
+      const adoptable = open.repointed
+        ? fresh.current === open.sha
+        : fresh.current === open.sha || previousBuild(fresh.builds, fresh.current) === open.sha;
+      if (adoptable) {
         // CO14b fix round 12: this was decided against `fresh`, not the
         // caller's own listing, so `fresh` is the listing returned too.
         return { outcome: 'resolved', target: open.sha, previous: open.sha, builds: fresh.builds, current: fresh.current };
@@ -657,8 +659,13 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       // contract, the round-4 lesson) -- the write happens only on a
       // genuine apply; a plan-only call still falls through to report the
       // correct, fresh target below, it simply never performs the write.
-      if (request.apply) {
-        await this.retireRollbackIntent(request.root, open.opId, open.sha);
+      //
+      // CO14b fix round 14 (finding 3): a failed retire refuses the request.
+      // Proceeding would open a second rollback intent, and
+      // `peekAnyOpenOperation` reports two open intents as unreadable for
+      // every later rollback.
+      if (request.apply && !(await this.retireRollbackIntent(request.root, open.opId, open.sha))) {
+        return { outcome: 'unreadable' };
       }
       const previous = previousBuild(fresh.builds, fresh.current);
       // CO14b fix round 12: `target` is resolved against `fresh`, so the
@@ -741,6 +748,25 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         return { refusal: consumed };
       }
       if (!alreadyAtTarget) {
+        // CO14b fix round 14 (finding 2): write-ahead. The intent is marked
+        // BEFORE the rename, so a process that dies anywhere after it leaves
+        // an intent that says the repoint may have landed. A later adopter
+        // then needs `current` to equal the intent's sha, else retires it
+        // (fail-closed: a fresh plan, never a replay of the spent grant). A
+        // mark that cannot be written refuses before the rename; the grant is
+        // already consumed, so the intent stays for the same operation to
+        // resume.
+        if (request.action === 'rollback') {
+          const marked = await this.deps.store.markRepointed({
+            root: request.root,
+            action: 'rollback',
+            sha: target,
+            opId: operation.opId,
+          });
+          if (marked.outcome !== 'ok') {
+            return { refusal: 'store-unreadable' };
+          }
+        }
         const repointed = await this.deps.store.repoint({
           root: request.root,
           sha: target,
@@ -827,12 +853,18 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     }
   }
 
-  /** Best effort: cancel a rollback intent proven stale, releasing its claim too. */
-  private async retireRollbackIntent(root: string, opId: string, sha: string): Promise<void> {
+  /**
+   * Cancel a rollback intent proven stale, releasing its claim too. True when
+   * the intent is gone (cancelled, or already absent); false when the store
+   * could not retire it. Callers that must not leave a second intent behind
+   * (`resolveTarget`) refuse on false; the best-effort caller ignores it.
+   */
+  private async retireRollbackIntent(root: string, opId: string, sha: string): Promise<boolean> {
     try {
-      await this.deps.store.cancelOperation({ root, action: 'rollback', sha, opId });
+      const cancelled = await this.deps.store.cancelOperation({ root, action: 'rollback', sha, opId });
+      return cancelled.outcome === 'ok' || cancelled.outcome === 'not-found';
     } catch {
-      // The claim goes stale by itself; a later call re-evaluates from scratch.
+      return false;
     }
   }
 

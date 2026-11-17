@@ -96,8 +96,8 @@ function unavailable(reason: string): ReadCommitContextResult {
 const GATE = { headSha: HEAD, contextName: 'gate' } as const;
 const CLOSED_PAGE = { hasNextPage: false, endCursor: null } as const;
 
-function contextsBody(nodes: readonly unknown[], pageInfo: unknown): string {
-  return JSON.stringify({
+function contextValue(nodes: readonly unknown[], pageInfo: unknown): unknown {
+  return {
     data: {
       repository: {
         object: {
@@ -106,7 +106,11 @@ function contextsBody(nodes: readonly unknown[], pageInfo: unknown): string {
         },
       },
     },
-  });
+  };
+}
+
+function contextsBody(nodes: readonly unknown[], pageInfo: unknown): string {
+  return JSON.stringify(contextValue(nodes, pageInfo));
 }
 
 function readContexts(nodes: readonly unknown[], pageInfo: unknown): Promise<ReadCommitContextResult> {
@@ -281,6 +285,16 @@ describe('readCommitContext', () => {
     });
     const adapter = makeAdapter({ runGh: async () => ok(body) });
     expect(await read(adapter, GATE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a node has valid own fields but a custom prototype', () => {
+    const node = Object.assign(Object.create({ not: 'plain' }), checkNode());
+    expect(Object.getPrototypeOf(node)).not.toBe(Object.prototype);
+    expect(Object.getPrototypeOf(node)).not.toBe(null);
+    expect(parseCommitContextPage(contextValue([node], CLOSED_PAGE), HEAD, 'gate', 0)).toEqual({
+      kind: 'fail',
+      reason: 'unreadable-contexts',
+    });
   });
 
   it('returns unreadable-contexts when the nodes array is sparse', () => {
@@ -489,6 +503,40 @@ describe('readCommitContext', () => {
 
   it('returns unreadable-contexts when a node __typename is not a string', async () => {
     const node = { __typename: 7, name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' };
+    expect(await readContexts([node], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a CheckRun node is missing status', async () => {
+    const node = { __typename: 'CheckRun', name: 'gate', conclusion: 'SUCCESS' };
+    expect(await readContexts([node], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a CheckRun node is missing conclusion', async () => {
+    const node = { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED' };
+    expect(await readContexts([node], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a CheckRun node is missing name', async () => {
+    const node = { __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' };
+    expect(await readContexts([node], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a StatusContext node is missing context', async () => {
+    const node = { __typename: 'StatusContext', state: 'SUCCESS' };
+    expect(await readContexts([node], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a StatusContext node is missing state', async () => {
+    const node = { __typename: 'StatusContext', context: 'gate' };
+    expect(await readContexts([node], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when pageInfo is missing hasNextPage', async () => {
+    expect(await readContexts([checkNode()], { endCursor: null })).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a node is missing __typename', async () => {
+    const node = { name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' };
     expect(await readContexts([node], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
   });
 

@@ -35,6 +35,7 @@ import {
   screenRepoRelativePath,
 } from '../../domain/held-work-order.js';
 import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import { isPlainRecordObject } from '../../domain/record-schema-version.js';
 import type { ContainsCommitRequest, ContainsCommitResult } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
 import type { ForgeAncestryPort } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
@@ -394,10 +395,13 @@ function isPlainArray(value: unknown): value is readonly unknown[] {
   return Array.isArray(value) && !(value as unknown[]).some((_, index) => !(index in (value as unknown[])));
 }
 
+/**
+ * A plain record only: prototype exactly `Object.prototype` or `null`, and
+ * not an array. The same rule `readExactPlainRecord` uses (`isPlainRecordObject`).
+ * A class instance is unreadable, never a match.
+ */
 function objectAt(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
+  return isPlainRecordObject(value) ? value : null;
 }
 
 function isoMsOf(value: unknown): number | null {
@@ -720,11 +724,16 @@ function isStringOrNull(value: unknown): value is string | null {
   return value === null || typeof value === 'string';
 }
 
-/** A wrong-typed `name`, `status` or `conclusion` fails the page, on every CheckRun. */
+/** Own data only. A missing key is `undefined`, never a value inherited from the prototype. */
+function ownField(node: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(node, key) ? node[key] : undefined;
+}
+
+/** A missing or wrong-typed `name`, `status` or `conclusion` fails the page, on every CheckRun. */
 function checkRunRead(node: Record<string, unknown>, contextName: string): ContextNodeRead {
-  const name = node.name;
-  const status = node.status;
-  const conclusion = node.conclusion;
+  const name = ownField(node, 'name');
+  const status = ownField(node, 'status');
+  const conclusion = ownField(node, 'conclusion');
   if (typeof name !== 'string' || typeof status !== 'string' || !isStringOrNull(conclusion)) {
     return 'unreadable';
   }
@@ -734,10 +743,10 @@ function checkRunRead(node: Record<string, unknown>, contextName: string): Conte
   return mapCheckRun(status, conclusion);
 }
 
-/** A wrong-typed `context` or `state` fails the page, on every StatusContext. */
+/** A missing or wrong-typed `context` or `state` fails the page, on every StatusContext. */
 function statusContextRead(node: Record<string, unknown>, contextName: string): ContextNodeRead {
-  const context = node.context;
-  const state = node.state;
+  const context = ownField(node, 'context');
+  const state = ownField(node, 'state');
   if (typeof context !== 'string' || typeof state !== 'string') {
     return 'unreadable';
   }
@@ -748,7 +757,7 @@ function statusContextRead(node: Record<string, unknown>, contextName: string): 
 }
 
 function matchedNodeState(node: Record<string, unknown>, contextName: string): ContextNodeRead {
-  const typename = node.__typename;
+  const typename = ownField(node, '__typename');
   if (typeof typename !== 'string') {
     return 'unreadable';
   }
@@ -784,8 +793,10 @@ function matchedStates(nodes: readonly unknown[], contextName: string): CommitCo
  * The pure parse of one page. A present non-empty `errors` array, a field of
  * the wrong type, an oid other than `headSha`, or a broken cursor is
  * unreadable. A null commit object or a null rollup is known only on page 0;
- * a later page that loses either is unreadable. A CheckRun or StatusContext
- * with a wrong-typed field fails the page. Any other typename is skipped.
+ * a later page that loses either is unreadable. A node that is not a plain
+ * object fails the page. A CheckRun or StatusContext with a missing or
+ * wrong-typed field fails the page; a missing field is never a non-match.
+ * Any other typename is skipped.
  */
 export function parseCommitContextPage(
   stdout: unknown,

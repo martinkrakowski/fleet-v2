@@ -18,6 +18,7 @@ import { evaluateShadowMergeSet, type ShadowDayMergeSetEvaluation } from '../../
 import {
   evaluateShadowStateIntegrity,
   evaluateShadowTickHealth,
+  type ShadowStateIntegrityEvaluation,
   type ShadowTickHealthEvaluation,
 } from '../../domain/shadow-day-health.js';
 import {
@@ -107,6 +108,8 @@ type CriterionOutcome =
       readonly intake?: ShadowIntakeEvaluation;
       /** Present only for S12: the tick-health evaluation the counts come from. */
       readonly tickHealth?: ShadowTickHealthEvaluation;
+      /** Present only for S9: the state-integrity evaluation the counts come from. */
+      readonly stateIntegrity?: ShadowStateIntegrityEvaluation;
     }
   | { readonly criterion: CutoverShadowCriterion; readonly kind: 'unevaluated'; readonly reason: string };
 
@@ -642,7 +645,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       journal: journal.entries.map((entry) => this.sampledEntry(entry)),
       sampledAtIso: this.deps.nowIso(),
     });
-    return { criterion: 'S9', kind: 'evaluated', evaluation };
+    return { criterion: 'S9', kind: 'evaluated', evaluation, stateIntegrity: evaluation };
   }
 
   /** Whether the instant `iso` names falls in the S12 window `[D-1 23:00Z, D+1 00:00Z)`. */
@@ -668,14 +671,15 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * fixed order `criterion`, `day`, `status`, `reason`, then the evaluator's
    * own numeric counts — for S1 also `excludeBatchMerges`, after the counts.
    *
-   * `mergeSet` (S1 only), `intake` (S8 only) and `tickHealth` (S12 only) are
-   * mutually exclusive, so at most one count field is ever set on any
-   * outcome. Each is set by exactly one criterion builder
-   * (`evaluateMergeSetCriterion`, `evaluateIntakeCriterion`,
-   * `evaluateTickHealthCriterion` respectively) and never more than one on
-   * the same outcome, so checking them in this order can never silently
-   * shadow another: an outcome with `intake` or `tickHealth` set always has
-   * the earlier fields `undefined`, by construction, not by this ordering.
+   * `mergeSet` (S1 only), `intake` (S8 only), `tickHealth` (S12 only) and
+   * `stateIntegrity` (S9 only) are mutually exclusive, so at most one count
+   * field is ever set on any outcome. Each is set by exactly one criterion
+   * builder (`evaluateMergeSetCriterion`, `evaluateIntakeCriterion`,
+   * `evaluateTickHealthCriterion` and `evaluateStateIntegrityCriterion`
+   * respectively) and never more than one on the same outcome, so checking
+   * them in this order can never silently shadow another: an outcome with
+   * `intake`, `tickHealth` or `stateIntegrity` set always has the earlier
+   * fields `undefined`, by construction, not by this ordering.
    */
   private canonicalSummary(context: DayContext, outcome: Extract<CriterionOutcome, { kind: 'evaluated' }>): string {
     const base = {
@@ -713,6 +717,25 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         totalTicks: outcome.tickHealth.totalTicks,
         budgetOverruns: outcome.tickHealth.budgetOverruns,
         starvedJobs: outcome.tickHealth.starvedJobs,
+      });
+    }
+    /**
+     * The S9 canonical summary includes these counts. A day recorded before
+     * this change will return `verdict-conflict` if re-recorded. No live
+     * shadow days are recorded yet (live recording starts only after the
+     * digest format is final).
+     */
+    if (outcome.stateIntegrity !== undefined) {
+      return JSON.stringify({
+        ...base,
+        stateChecked: outcome.stateIntegrity.stateChecked,
+        stateBad: outcome.stateIntegrity.stateBad,
+        journalKeys: outcome.stateIntegrity.journalKeys,
+        duplicateIntents: outcome.stateIntegrity.duplicateIntents,
+        duplicateResults: outcome.stateIntegrity.duplicateResults,
+        resultsAfterFinal: outcome.stateIntegrity.resultsAfterFinal,
+        orphanResults: outcome.stateIntegrity.orphanResults,
+        unreconciledIntents: outcome.stateIntegrity.unreconciledIntents,
       });
     }
     return JSON.stringify(base);

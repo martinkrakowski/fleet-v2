@@ -49,6 +49,7 @@ Checks the operator can run today, each of which is not itself a completed switc
 - `cutover shadow report` — only when `outcome` is `completed`, `equal` is true, and `complete` is true.
 - `merge import` without `--apply`.
 - `state check`.
+- Before the first `release install`: create the release root directory yourself — the install never creates it, and a missing root is refused (`release-root-missing`). The installation's `daemon.cliPath` must be `<root>/current/apps/cli/dist/bin.js`, and the `--root` you pass must resolve to that same root.
 - `release install` without `--apply` — it writes nothing; `--apply` is deployment authority and still does not record a cutover switch.
 - `hosts daemon install --scheduler systemd` without `--apply` — it prints `would-write` and the enable and linger lines, and does not run them.
 - `relaunch inventory` is the only relaunch command. `relaunch plan` and `relaunch apply` are not commands (exit 2).

@@ -56,6 +56,8 @@ import type {
 import { parseChainName } from '../../domain/chain-records.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
 import { screenTransportText } from '../../domain/review-transport-screen.js';
+import { computeBriefPackageDigest } from '../../domain/value-objects/BriefPackage.vo.js';
+import { sha256HexDigest } from './AttemptArtifactAdapter.adapter.js';
 
 /**
  * D1C: the API-transport unavailable codes of an `review-unavailable`
@@ -491,6 +493,8 @@ interface BriefRequestFields {
   readonly implementerModel: string;
   readonly reviewerModel: string;
   readonly briefText: string;
+  /** The raw manifest bytes the frozen-brief digest covers; required for a `brief-verify` request. */
+  readonly briefManifestRaw: string;
   readonly nowIso?: string;
 }
 
@@ -509,7 +513,7 @@ function readBriefRequestFields(request: unknown, subjectProjectId: string): Bri
     if (projectRead === undefined || projectRead === 'unreadable' || projectRead.value !== subjectProjectId) {
       return null;
     }
-    const optional = snapshotOptionalFields(request, ['briefText', 'diffSummary', 'nowIso']);
+    const optional = snapshotOptionalFields(request, ['briefText', 'briefManifestRaw', 'diffSummary', 'nowIso']);
     const requestId = ownValue(request, 'requestId');
     const policyRevision = ownValue(request, 'policyRevision');
     const implementerModel = ownValue(request, 'implementerModel');
@@ -545,12 +549,20 @@ function readBriefRequestFields(request: unknown, subjectProjectId: string): Bri
     if (briefTextIsRefused(briefText)) {
       return null;
     }
+    // The manifest bytes are required: the frozen-brief digest covers
+    // `prose + '\n' + manifestRaw`, so a request without them cannot be bound
+    // to the subject's digest at all. A non-string is refused here.
+    const briefManifestRaw = optional.briefManifestRaw;
+    if (typeof briefManifestRaw !== 'string' || !isNonEmptyTrimmed(briefManifestRaw)) {
+      return null;
+    }
     return {
       requestId,
       policyRevision,
       implementerModel,
       reviewerModel,
       briefText,
+      briefManifestRaw,
       ...(typeof nowIso === 'string' ? { nowIso } : {}),
     };
   } catch {
@@ -1306,6 +1318,23 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
   private async requestBriefReview(request: ReviewRequest, brief: BriefSubject): Promise<ReviewRequestResult> {
     const fields = readBriefRequestFields(request, brief.projectId);
     if (fields === null) {
+      return { outcome: 'refused', reason: 'invalid-request', detail: null };
+    }
+    // Bind the whole frozen brief package — the prose plus the raw manifest
+    // bytes — to the digest the subject names before anything is forwarded to
+    // a reviewer. The digest was produced by `computeBriefPackageDigest`
+    // ({ prose, manifestRaw }) with the SHA-256 function every production
+    // composition root injects: `prose + '\n' + manifestRaw`, a package of
+    // several parts. The request must carry both parts; a prose-only digest
+    // can never equal such a package digest, so a request without
+    // `briefManifestRaw` is refused above. Cost: one digest over at most
+    // 64 KiB of prose plus 256 KiB of manifest (the formula refuses either
+    // when larger).
+    const packageDigest = computeBriefPackageDigest(
+      { prose: fields.briefText, manifestRaw: fields.briefManifestRaw },
+      sha256HexDigest,
+    );
+    if (!packageDigest.ok || packageDigest.briefDigest !== brief.briefPackageDigest) {
       return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
     if (!this.delegates.requestIndependentReview) {

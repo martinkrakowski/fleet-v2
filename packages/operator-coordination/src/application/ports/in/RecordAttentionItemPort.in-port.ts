@@ -31,8 +31,12 @@ export interface RecordAttentionItemBody {
 export type RecordAttentionItemRefusalCode = 'request' | 'clock' | 'id-taken' | 'conflict' | 'store-unreadable' | AttentionItemRefusalCode;
 
 export type RecordAttentionItemResult =
-  | { readonly outcome: 'raised' | 'refreshed' | 'reopened'; readonly item: AttentionItemRecord; readonly revision: number }
+  | { readonly outcome: 'raised'; readonly item: AttentionItemRecord; readonly revision: number; readonly previousRaisedAtIso: null }
+  | { readonly outcome: 'refreshed' | 'reopened'; readonly item: AttentionItemRecord; readonly revision: number; readonly previousRaisedAtIso: string }
   | { readonly outcome: 'refused'; readonly code: RecordAttentionItemRefusalCode; readonly reason: string };
+// `previousRaisedAtIso` on a refreshed or reopened result is the stored item's
+// `lastRaisedAtIso` captured before `raiseAgain` overwrites it, in the same
+// load-and-CAS-save that produced the answer.
 
 export interface RecordAttentionItemPort {
   /** `body` is untrusted. `actor` is who raises it, supplied by the composition root, never the body. */

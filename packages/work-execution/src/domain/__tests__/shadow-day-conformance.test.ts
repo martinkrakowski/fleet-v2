@@ -10,9 +10,11 @@ import {
   SHADOW_CONFORMANCE_MIN_TIER1,
   SHADOW_CONFORMANCE_MIN_TIER2,
   SHADOW_NONCONFORMANCE_CODES,
+  SHADOW_ONE_WAY_STEP_STATES,
   evaluateShadowConductedConformance,
 } from '../shadow-day-conformance.js';
 import type { ShadowNonconformanceCode } from '../shadow-day-conformance.js';
+import { LANE_RUN_STATES } from '../value-objects/LaneRunState.vo.js';
 
 const DAY = '2026-11-16';
 const DAY_MINUS_1 = '2026-11-15';
@@ -49,6 +51,13 @@ interface RunRecord {
 interface MergeRecord {
   readonly pullRequest: number;
   readonly headOid: string;
+  readonly atIso: string;
+}
+
+interface MoveRecord {
+  readonly pullRequest: number;
+  readonly fromHeadOid: string;
+  readonly toHeadOid: string;
   readonly atIso: string;
 }
 
@@ -208,7 +217,7 @@ function passing(): Fixture[] {
 function inputFrom(fixtures: readonly Fixture[], extras?: {
   readonly day?: string;
   readonly extraMerges?: readonly MergeRecord[];
-  readonly headMoves?: readonly Record<string, unknown>[];
+  readonly headMoves?: readonly MoveRecord[];
   readonly headMovesIncompleteFor?: readonly number[];
 }): Record<string, unknown> {
   const merges: MergeRecord[] = [];
@@ -247,7 +256,7 @@ function zeroCodes(overrides: Partial<Record<ShadowNonconformanceCode, number>> 
 }
 
 function scored(
-  status: 'unknown' | 'fail',
+  status: 'unknown' | 'fail' | 'pass',
   reason: string,
   counts: ScoreCounts = {},
   codes: Partial<Record<ShadowNonconformanceCode, number>> = {},
@@ -274,6 +283,76 @@ function evaluate(input: unknown) {
   return evaluateShadowConductedConformance(input);
 }
 
+type OneWayFixtureStep = 'prepare' | 'dispatch' | 'open-pr' | 'push' | 'merge' | 'park';
+
+function move(pullRequest: number, fromN: number, toN: number, atIso: string): MoveRecord {
+  return { pullRequest, fromHeadOid: headFor(fromN), toHeadOid: headFor(toN), atIso };
+}
+
+function retarget(fixture: Fixture, headOid: string): Fixture {
+  const merge = fixture.merge;
+  if (merge === null) throw new Error('fixture merge missing');
+  return { run: fixture.run, merge: { ...merge, headOid } };
+}
+
+function oneWayKey(
+  runId: string,
+  step: OneWayFixtureStep,
+  headOid: string | null,
+  attemptOrdinal: number | null,
+  seatIndex = 0,
+): string {
+  const built = buildLaneRunStepKey({
+    runId,
+    round: 0,
+    step,
+    seatIndex,
+    attemptOrdinal,
+    head12: headOid === null ? null : head12(headOid),
+    retry: null,
+  });
+  if (!built.ok) throw new Error('fixture one-way key refused');
+  return built.key;
+}
+
+function intentAt(key: string, recordedAtIso: string): JournalEntry {
+  return { kind: 'intent', key, recordedAtIso, outcome: null, reasonCode: null, state: null };
+}
+
+function conductAt(state: string, recordedAtIso: string): JournalEntry {
+  return { kind: 'conduct', key: null, recordedAtIso, outcome: null, reasonCode: null, state };
+}
+
+function extendJournal(fixture: Fixture, entries: readonly JournalEntry[]): Fixture {
+  return withJournal(fixture, [...fixture.run.journal, ...entries]);
+}
+
+function hopChain(pullRequest: number, hops: number, atIso: string): { moves: MoveRecord[]; end: string } {
+  const moves: MoveRecord[] = [];
+  let fromN = 6;
+  let end = headFor(6);
+  for (let hop = 0; hop < hops; hop += 1) {
+    const toN = 1000 + hop;
+    moves.push(move(pullRequest, fromN, toN, atIso));
+    fromN = toN;
+    end = headFor(toN);
+  }
+  return { moves, end };
+}
+
+function withMoves(fixture: Fixture, moves: readonly MoveRecord[], incomplete: readonly number[] = []): Record<string, unknown> {
+  return inputFrom([...passing(), fixture], { headMoves: moves, headMovesIncompleteFor: incomplete });
+}
+
+function expectCodesOnly(result: unknown, ...forbidden: readonly string[]): void {
+  const json = JSON.stringify(result);
+  for (const value of forbidden) expect(json).not.toContain(value);
+}
+
+const SIX_PASS: ScoreCounts = { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 };
+const SIX_WINDOW: ScoreCounts = { ...PASSING_COUNTS, mergedRuns: 6 };
+const SIX_FAIL: ScoreCounts = { ...SIX_WINDOW, nonconformingOnDay: 1 };
+
 describe('S6\' conformance evaluator (SH12a)', () => {
   it('exports the floor minimums, the six codes and the input caps', () => {
     expect(SHADOW_CONFORMANCE_MIN_RUNS).toBe(5);
@@ -293,13 +372,13 @@ describe('S6\' conformance evaluator (SH12a)', () => {
     ]);
   });
 
-  it('3 Tier 1 and 2 Tier 2 conforming runs merged across D-2..D yield unknown/rules-incomplete', () => {
+  it('3 Tier 1 and 2 Tier 2 conforming runs merged across D-2..D yield pass/conducted-runs-conform', () => {
     const fixtures = passing();
     for (const fixture of fixtures) {
       if (fixture.run.tier !== 1) continue;
       expect(fixture.run.reviewReceipts.some((item) => item.kind === 'pre-merge')).toBe(false);
     }
-    expect(evaluate(inputFrom(fixtures))).toEqual(scored('unknown', 'rules-incomplete', PASSING_COUNTS));
+    expect(evaluate(inputFrom(fixtures))).toEqual(scored('pass', 'conducted-runs-conform', PASSING_COUNTS));
   });
 
   it('4 conforming runs yield fail/too-few-conforming-runs', () => {
@@ -355,7 +434,7 @@ describe('S6\' conformance evaluator (SH12a)', () => {
       ...base.run.journal,
     ]);
     expect(evaluate(onTop(both))).toEqual(
-      scored('unknown', 'rules-incomplete', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
+      scored('pass', 'conducted-runs-conform', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
     );
   });
 
@@ -383,7 +462,7 @@ describe('S6\' conformance evaluator (SH12a)', () => {
     const added = conforming(6, 1, iso(DAY, 16));
     expect(added.run.reviewReceipts.some((item) => item.kind === 'pre-merge')).toBe(false);
     expect(evaluate(onTop(added))).toEqual(
-      scored('unknown', 'rules-incomplete', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
+      scored('pass', 'conducted-runs-conform', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
     );
   });
 
@@ -422,7 +501,7 @@ describe('S6\' conformance evaluator (SH12a)', () => {
     const base = conforming(6, 1, iso(DAY, 12));
     const broken = premergeAt(base, '2026-11-16T13:00:00.000+02:00');
     expect(evaluate(onTop(broken))).toEqual(
-      scored('unknown', 'rules-incomplete', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
+      scored('pass', 'conducted-runs-conform', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
     );
   });
 
@@ -456,8 +535,8 @@ describe('S6\' conformance evaluator (SH12a)', () => {
     const broken = withoutGate(conforming(6, 1, iso(DAY_MINUS_1, 18)));
     expect(evaluate(onTop(broken))).toEqual(
       scored(
-        'unknown',
-        'rules-incomplete',
+        'pass',
+        'conducted-runs-conform',
         { mergedRuns: 6, conforming: 5, conformingTier1: 3, conformingTier2: 2 },
         { 'gate-not-passed': 1 },
       ),
@@ -478,7 +557,7 @@ describe('S6\' conformance evaluator (SH12a)', () => {
       atIso: iso(DAY_MINUS_3, 23, 59, 59),
     };
     expect(evaluate(inputFrom(fixtures, { extraMerges: [outside] }))).toEqual(
-      scored('unknown', 'rules-incomplete', PASSING_COUNTS),
+      scored('pass', 'conducted-runs-conform', PASSING_COUNTS),
     );
   });
 
@@ -491,24 +570,24 @@ describe('S6\' conformance evaluator (SH12a)', () => {
 
   it('a run whose pull request did not merge in W is ignored', () => {
     const unmerged: Fixture = { ...conforming(6, 2, iso(DAY, 16)), merge: null };
-    expect(evaluate(inputFrom([...passing(), unmerged]))).toEqual(scored('unknown', 'rules-incomplete', PASSING_COUNTS));
+    expect(evaluate(inputFrom([...passing(), unmerged]))).toEqual(scored('pass', 'conducted-runs-conform', PASSING_COUNTS));
   });
 
   it('a merge at 23:59:59Z on D-3 is outside W', () => {
     const outside = conforming(6, 2, iso(DAY_MINUS_3, 23, 59, 59));
-    expect(evaluate(inputFrom([...passing(), outside]))).toEqual(scored('unknown', 'rules-incomplete', PASSING_COUNTS));
+    expect(evaluate(inputFrom([...passing(), outside]))).toEqual(scored('pass', 'conducted-runs-conform', PASSING_COUNTS));
   });
 
   it('a merge at 00:00:00Z on D-2 is inside W', () => {
     const early = conforming(6, 1, iso(DAY_MINUS_2, 0, 0, 0));
     expect(evaluate(onTop(early))).toEqual(
-      scored('unknown', 'rules-incomplete', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
+      scored('pass', 'conducted-runs-conform', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
     );
   });
 
   it('a merge at 00:00:00Z on D+1 is outside W', () => {
     const late = conforming(6, 1, '2026-11-17T00:00:00.000Z');
-    expect(evaluate(onTop(late))).toEqual(scored('unknown', 'rules-incomplete', PASSING_COUNTS));
+    expect(evaluate(onTop(late))).toEqual(scored('pass', 'conducted-runs-conform', PASSING_COUNTS));
   });
 
   it('counts a merge on D-2 when that day falls in the previous month', () => {
@@ -521,14 +600,14 @@ describe('S6\' conformance evaluator (SH12a)', () => {
       conforming(6, 1, '2026-02-26T23:59:59.000Z'),
     ];
     expect(evaluate(inputFrom(fixtures, { day: '2026-03-01' }))).toEqual(
-      scored('unknown', 'rules-incomplete', PASSING_COUNTS),
+      scored('pass', 'conducted-runs-conform', PASSING_COUNTS),
     );
   });
 
   it('places a merge by its UTC instant when the offset shifts the calendar day', () => {
     const shiftedDay = conforming(6, 1, '2026-11-17T01:30:00.000+02:00');
     expect(evaluate(onTop(shiftedDay))).toEqual(
-      scored('unknown', 'rules-incomplete', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
+      scored('pass', 'conducted-runs-conform', { mergedRuns: 6, conforming: 6, conformingTier1: 4, conformingTier2: 2 }),
     );
   });
 });
@@ -690,7 +769,7 @@ describe('validation', () => {
       { kind: 'conduct', key: null, recordedAtIso: iso(DAY_MINUS_2, 11), outcome: null, reasonCode: null, state: null },
     ]);
     expect(evaluate(inputFrom([withConduct, ...fixtures.slice(1)]))).toEqual(
-      scored('unknown', 'rules-incomplete', PASSING_COUNTS),
+      scored('pass', 'conducted-runs-conform', PASSING_COUNTS),
     );
   });
 
@@ -898,7 +977,7 @@ describe('hostile input', () => {
     const rejected = proxied.status === 'unknown' && proxied.reason === 'invalid-input';
     expect(same || rejected).toBe(true);
     expect(gets).toBe(0);
-    expect(plainResult.reason).toBe('rules-incomplete');
+    expect(plainResult.reason).toBe('conducted-runs-conform');
   });
 
   it('refuses a prototype-polluting __proto__ key produced by JSON.parse', () => {
@@ -926,7 +1005,7 @@ describe('hostile input', () => {
   it('a constant verdict would fail', () => {
     const five = evaluate(inputFrom(passing()));
     const four = evaluate(inputFrom(passing().slice(0, 4)));
-    expect(five.reason).toBe('rules-incomplete');
+    expect(five.reason).toBe('conducted-runs-conform');
     expect(four.reason).toBe('too-few-conforming-runs');
     expect(five.reason).not.toBe(four.reason);
     expect(five.status).not.toBe(four.status);
@@ -953,7 +1032,7 @@ describe('hostile input', () => {
       headMovesIncompleteFor: [pullFor(8)],
     });
     const result = evaluate(input);
-    expect(result.reason).toBe('rules-incomplete');
+    expect(result.reason).toBe('conducted-runs-conform');
     const json = JSON.stringify(result);
     expect(Object.keys(result).sort()).toEqual([
       'byCode',
@@ -978,11 +1057,19 @@ describe('hostile input', () => {
     expect(json).not.toContain(String(pullFor(8)));
   });
 
-  it('no input yields pass in this unit', () => {
+  it('no input yields pass', () => {
+    // A floor-meeting day now passes, including one with a D-1 break added
+    // on top. This loop keeps only sets that must not pass.
     const base = conforming(6, 1, iso(DAY, 16));
     const tier2 = conforming(6, 2, iso(DAY, 16));
+    const first = conforming(1, 1, iso(DAY, 12));
+    const second = conforming(2, 2, iso(DAY, 14));
+    const shared: Fixture = { run: { ...second.run, pullRequest: first.run.pullRequest }, merge: null };
+    const d1Kept = passing().filter((fixture) => fixture.merge?.atIso.startsWith(DAY_MINUS_1) !== true);
+    const d1Breakage = inputFrom([...d1Kept, withoutGate(conforming(2, 1, iso(DAY_MINUS_1, 12)))]);
+    const d1Alone = inputFrom([withoutGate(conforming(6, 1, iso(DAY_MINUS_1, 18)))]);
+    const severalRuns = inputFrom([first, shared]);
     const inputs = [
-      inputFrom(passing()),
       inputFrom(passing().slice(0, 4)),
       inputFrom([1, 2, 3, 4, 5].map((n) => conforming(n, 1, iso(DAY, 8)))),
       onTop(withoutGate(base)),
@@ -991,12 +1078,14 @@ describe('hostile input', () => {
       onTop(noCodeReview(tier2)),
       onTop(failedCodeReview(tier2)),
       onTop(noPreMergeReceipt(tier2)),
-      onTop(conforming(7, 1, iso(DAY, 18))),
       onTop(premergeAt(base, shifted(iso(DAY, 16), 1000))),
       onTop(premergeAt(base, shifted(iso(DAY, 16), -60 * 60 * 1000), 'premerge-failure')),
       inputFrom([conforming(1, 1, iso(DAY, 12))], {
         extraMerges: [{ pullRequest: pullFor(1), headOid: headFor(1), atIso: iso(DAY, 18) }],
       }),
+      d1Breakage,
+      d1Alone,
+      severalRuns,
       null,
     ];
     for (const input of inputs) {
@@ -1004,6 +1093,613 @@ describe('hostile input', () => {
       expect(result.status).not.toBe('pass');
       expect(result.reason).not.toBe('conducted-runs-conform');
     }
+  });
+
+});
+
+describe('rule 1 head linkage and rule 6 one-way discipline (SH12b)', () => {
+  const at = iso(DAY, 15);
+
+  function added(): Fixture {
+    return conforming(6, 1, iso(DAY, 16));
+  }
+
+  it('the merged head reached through two shell head moves is linked', () => {
+    const base = added();
+    const linked = retarget(base, headFor(61));
+    const moves = [
+      move(base.run.pullRequest, 6, 60, at),
+      move(base.run.pullRequest, 60, 61, '2026-11-16T18:00:00.000+02:00'),
+    ];
+    expect(evaluate(withMoves(linked, moves))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+  });
+
+  it('a linked head stays conforming when its pull request is also in headMovesIncompleteFor', () => {
+    const base = added();
+    const linked = retarget(base, headFor(61));
+    const moves = [move(base.run.pullRequest, 6, 60, at), move(base.run.pullRequest, 60, 61, iso(DAY, 16))];
+    expect(evaluate(withMoves(linked, moves, [base.run.pullRequest]))).toEqual(
+      scored('pass', 'conducted-runs-conform', SIX_PASS),
+    );
+  });
+
+  it('the same head conforms even when the pull request is in headMovesIncompleteFor', () => {
+    const base = added();
+    expect(evaluate(withMoves(base, [], [base.run.pullRequest]))).toEqual(
+      scored('pass', 'conducted-runs-conform', SIX_PASS),
+    );
+  });
+
+  it('moves out of order in time (a move after the merge) yield fail/merged-head-unlinked', () => {
+    const base = added();
+    const linked = retarget(base, headFor(61));
+    const moves = [
+      move(base.run.pullRequest, 6, 60, at),
+      move(base.run.pullRequest, 60, 61, '2026-11-16T15:30:00.000-02:00'),
+    ];
+    const result = evaluate(withMoves(linked, moves));
+    expect(result).toEqual(scored('fail', 'merged-head-unlinked', SIX_FAIL, { 'merged-head-unlinked': 1 }));
+    expectCodesOnly(result, base.run.runId, base.run.headOid, headFor(60), headFor(61), String(base.run.pullRequest));
+  });
+
+  it('a broken chain whose pull request is in headMovesIncompleteFor yields unknown/head-moves-incomplete', () => {
+    const base = added();
+    const linked = retarget(base, headFor(61));
+    const result = evaluate(withMoves(linked, [move(base.run.pullRequest, 6, 60, at)], [base.run.pullRequest]));
+    expect(result).toEqual(scored('unknown', 'head-moves-incomplete', SIX_WINDOW));
+    expectCodesOnly(result, base.run.runId, base.run.headOid, headFor(61), String(base.run.pullRequest));
+  });
+
+  it('a two-move cycle is unlinked and does not loop', () => {
+    const base = added();
+    const linked = retarget(base, headFor(61));
+    const moves = [
+      move(base.run.pullRequest, 6, 60, at),
+      move(base.run.pullRequest, 60, 6, iso(DAY, 15, 30)),
+    ];
+    expect(evaluate(withMoves(linked, moves))).toEqual(
+      scored('fail', 'merged-head-unlinked', SIX_FAIL, { 'merged-head-unlinked': 1 }),
+    );
+  });
+
+  it('a path longer than SHADOW_CONFORMANCE_MAX_HOPS yields fail/merged-head-unlinked', () => {
+    const base = added();
+    const chain = hopChain(base.run.pullRequest, SHADOW_CONFORMANCE_MAX_HOPS + 1, at);
+    expect(evaluate(withMoves(retarget(base, chain.end), chain.moves))).toEqual(
+      scored('fail', 'merged-head-unlinked', SIX_FAIL, { 'merged-head-unlinked': 1 }),
+    );
+  });
+
+  it('a path of SHADOW_CONFORMANCE_MAX_HOPS head moves is linked', () => {
+    const base = added();
+    const chain = hopChain(base.run.pullRequest, SHADOW_CONFORMANCE_MAX_HOPS, at);
+    expect(evaluate(withMoves(retarget(base, chain.end), chain.moves))).toEqual(
+      scored('pass', 'conducted-runs-conform', SIX_PASS),
+    );
+  });
+
+  it('head moves of another pull request never link', () => {
+    const base = added();
+    const linked = retarget(base, headFor(61));
+    const moves = [move(pullFor(99), 6, 60, at), move(pullFor(99), 60, 61, iso(DAY, 15, 30))];
+    expect(evaluate(withMoves(linked, moves))).toEqual(
+      scored('fail', 'merged-head-unlinked', SIX_FAIL, { 'merged-head-unlinked': 1 }),
+    );
+  });
+
+  it('a second open-pr intent with the same key yields fail/stray-one-way-action', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'open-pr', base.run.headOid, null);
+    const once = extendJournal(base, [conductAt('opening-pr', at), intentAt(key, at)]);
+    const twice = extendJournal(base, [conductAt('opening-pr', at), intentAt(key, at), intentAt(key, at)]);
+    expect(evaluate(onTop(once))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+    const result = evaluate(onTop(twice));
+    expect(result).toEqual(scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }));
+    expectCodesOnly(result, base.run.runId, key, String(base.run.pullRequest));
+  });
+
+  it('an open-pr intent while the state is gating yields fail/stray-one-way-action', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'open-pr', base.run.headOid, null);
+    const broken = extendJournal(base, [conductAt('gating', at), intentAt(key, at)]);
+    expect(evaluate(onTop(broken))).toEqual(
+      scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }),
+    );
+  });
+
+  it('a push intent while opening-pr yields fail/stray-one-way-action', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'push', base.run.headOid, null);
+    const broken = extendJournal(base, [conductAt('opening-pr', at), intentAt(key, at)]);
+    expect(evaluate(onTop(broken))).toEqual(
+      scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }),
+    );
+  });
+
+  it('a prepare intent from ready and a dispatch intent from dispatching conforms', () => {
+    const base = added();
+    const prepare = oneWayKey(base.run.runId, 'prepare', null, 1);
+    const dispatch = oneWayKey(base.run.runId, 'dispatch', null, 1);
+    const run = extendJournal(base, [intentAt(prepare, at), conductAt('dispatching', at), intentAt(dispatch, at)]);
+    expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+  });
+
+  it('two park intents sharing one key are not stray', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null, 1);
+    const run = extendJournal(base, [conductAt('running', at), intentAt(key, at), intentAt(key, at)]);
+    expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+  });
+
+  it('a park intent while the state is merged, stopped or parked yields fail/stray-one-way-action', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'park', null, null);
+    for (const state of ['merged', 'stopped', 'parked']) {
+      const broken = extendJournal(base, [conductAt(state, at), intentAt(key, at)]);
+      expect(evaluate(onTop(broken))).toEqual(
+        scored('fail', 'stray-one-way-action', SIX_FAIL, { 'stray-one-way-action': 1 }),
+      );
+    }
+  });
+
+  it('an entry with an unparseable key is ignored', () => {
+    const base = added();
+    const run = extendJournal(base, [intentAt('not-a-lane-run-key', at)]);
+    expect(evaluate(onTop(run))).toEqual(scored('pass', 'conducted-runs-conform', SIX_PASS));
+  });
+
+  it('rule 1 and rule 6 failing together on D yield fail/merged-head-unlinked', () => {
+    const base = added();
+    const key = oneWayKey(base.run.runId, 'open-pr', base.run.headOid, null);
+    const extended = extendJournal(base, [conductAt('opening-pr', at), intentAt(key, at), intentAt(key, at)]);
+    const broken = retarget(extended, headFor(61));
+    expect(evaluate(withMoves(broken, []))).toEqual(
+      scored('fail', 'merged-head-unlinked', SIX_FAIL, { 'merged-head-unlinked': 1 }),
+    );
+  });
+
+  it('a rule-1 failure plus a rule-2 failure yields fail/merged-head-unlinked', () => {
+    const broken = retarget(withoutGate(added()), headFor(61));
+    expect(evaluate(withMoves(broken, []))).toEqual(
+      scored('fail', 'merged-head-unlinked', SIX_FAIL, { 'merged-head-unlinked': 1 }),
+    );
+  });
+
+  it('a stray one-way action on a run merged on D-1 is not a failure of D and is excluded from the counts', () => {
+    const base = conforming(6, 1, iso(DAY_MINUS_1, 18));
+    const key = oneWayKey(base.run.runId, 'push', base.run.headOid, null);
+    const broken = extendJournal(base, [
+      conductAt('opening-pr', iso(DAY_MINUS_1, 17)),
+      intentAt(key, iso(DAY_MINUS_1, 17)),
+    ]);
+    expect(evaluate(onTop(broken))).toEqual(
+      scored('pass', 'conducted-runs-conform', SIX_WINDOW, { 'stray-one-way-action': 1 }),
+    );
+  });
+
+  it('SHADOW_ONE_WAY_STEP_STATES is frozen and its park row has exactly the allowed states', () => {
+    expect(Object.isFrozen(SHADOW_ONE_WAY_STEP_STATES)).toBe(true);
+    const steps = ['prepare', 'dispatch', 'open-pr', 'push', 'merge', 'park'] as const;
+    for (const step of steps) expect(Object.isFrozen(SHADOW_ONE_WAY_STEP_STATES[step])).toBe(true);
+    expect([...SHADOW_ONE_WAY_STEP_STATES.prepare]).toEqual(['ready', 'dispatching', 'seat-failed', 'fixing']);
+    expect([...SHADOW_ONE_WAY_STEP_STATES.dispatch]).toEqual(['ready', 'dispatching', 'seat-failed', 'fixing']);
+    expect([...SHADOW_ONE_WAY_STEP_STATES['open-pr']]).toEqual(['opening-pr']);
+    expect([...SHADOW_ONE_WAY_STEP_STATES.push]).toEqual(['pushing']);
+    expect([...SHADOW_ONE_WAY_STEP_STATES.merge]).toEqual(['merging']);
+    const blocked = ['merged', 'stopped', 'parked'];
+    const park = [...SHADOW_ONE_WAY_STEP_STATES.park];
+    expect(park).toEqual(LANE_RUN_STATES.filter((state) => !blocked.includes(state)));
+    expect(park).toHaveLength(LANE_RUN_STATES.length - blocked.length);
+    for (const state of blocked) expect(park).not.toContain(state);
+  });
+});
+
+describe('hostile headMoves and journal (rule 1 and rule 6)', () => {
+  function shell(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return { day: DAY, runs: [], merges: [], headMoves: [], headMovesIncompleteFor: [], ...overrides };
+  }
+
+  function runWith(journal: unknown): Record<string, unknown> {
+    return { ...conforming(1, 1, iso(DAY, 12)).run, journal };
+  }
+
+  function validMove(): MoveRecord {
+    return move(pullFor(1), 1, 2, iso(DAY, 9));
+  }
+
+  function enormousList(): { readonly list: unknown[]; readonly calls: () => number } {
+    let calls = 0;
+    const list: unknown[] = [];
+    Object.defineProperty(list, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return true;
+      },
+    });
+    list[2 ** 32 - 2] = true;
+    return { list, calls: () => calls };
+  }
+
+  function jsonOwnKey(key: '__proto__' | 'constructor' | 'prototype', fields: string): unknown {
+    return JSON.parse(`{"${key}":{"admin":true},${fields}}`);
+  }
+
+  const moveFields =
+    `"pullRequest":${pullFor(1)},"fromHeadOid":"${headFor(1)}","toHeadOid":"${headFor(2)}","atIso":"${iso(DAY, 9)}"`;
+  const journalFields =
+    `"kind":"intent","key":"not-a-key","recordedAtIso":"${iso(DAY, 9)}","outcome":null,"reasonCode":null,"state":null`;
+
+  it('refuses null headMoves', () => {
+    expect(evaluate(shell({ headMoves: null }))).toEqual(refused());
+  });
+
+  it('refuses undefined headMoves', () => {
+    expect(evaluate(shell({ headMoves: undefined }))).toEqual(refused());
+  });
+
+  it('refuses a number where a head-move string is due', () => {
+    const item = { ...validMove(), fromHeadOid: 12 };
+    expect(evaluate(shell({ headMoves: [item] }))).toEqual(refused());
+  });
+
+  it('refuses a string where the headMoves list is due', () => {
+    expect(evaluate(shell({ headMoves: 'headMoves' }))).toEqual(refused());
+  });
+
+  it('refuses a non-iterable object where the headMoves list is due', () => {
+    expect(evaluate(shell({ headMoves: { nested: true } }))).toEqual(refused());
+  });
+
+  it('refuses an array hole in headMoves', () => {
+    const headMoves = [validMove()];
+    delete headMoves[0];
+    expect(evaluate(shell({ headMoves }))).toEqual(refused());
+  });
+
+  it('refuses an array-like object where the headMoves list is due', () => {
+    const headMoves = { length: 1, 0: validMove() };
+    expect(evaluate(shell({ headMoves }))).toEqual(refused());
+  });
+
+  it('refuses an enormous sparse headMoves length before any traversal', () => {
+    const probe = enormousList();
+    expect(evaluate(shell({ headMoves: probe.list }))).toEqual(refused());
+    expect(probe.calls()).toBe(0);
+  });
+
+  it('never runs a getter on a headMoves item', () => {
+    let calls = 0;
+    const headMoves: unknown[] = [];
+    Object.defineProperty(headMoves, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return validMove();
+      },
+    });
+    headMoves.length = 1;
+    expect(evaluate(shell({ headMoves }))).toEqual(refused());
+    expect(calls).toBe(0);
+  });
+
+  it('never runs a getter on a head-move field', () => {
+    let calls = 0;
+    const record = { ...validMove() } as Record<string, unknown>;
+    const fromHeadOid = record.fromHeadOid;
+    delete record.fromHeadOid;
+    Object.defineProperty(record, 'fromHeadOid', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return fromHeadOid;
+      },
+    });
+    expect(evaluate(shell({ headMoves: [record] }))).toEqual(refused());
+    expect(calls).toBe(0);
+  });
+
+  it('never runs a getter on the root headMoves property', () => {
+    let calls = 0;
+    const input = shell();
+    Object.defineProperty(input, 'headMoves', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return [];
+      },
+    });
+    expect(evaluate(input)).toEqual(refused());
+    expect(calls).toBe(0);
+  });
+
+  it('a Proxy over a valid headMoves list yields the plain result and runs no get trap', () => {
+    const plain = inputFrom(passing());
+    let gets = 0;
+    const headMoves = new Proxy([] as unknown[], {
+      get(target, prop, receiver) {
+        gets += 1;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const proxied = evaluate({ ...plain, headMoves });
+    const plainResult = evaluate(plain);
+    const same = JSON.stringify(proxied) === JSON.stringify(plainResult);
+    const rejected = proxied.status === 'unknown' && proxied.reason === 'invalid-input';
+    expect(same || rejected).toBe(true);
+    expect(gets).toBe(0);
+    expect(plainResult.reason).toBe('conducted-runs-conform');
+  });
+
+  it('refuses a prototype-polluting __proto__ key on a head move produced by JSON.parse', () => {
+    const input = shell({ headMoves: [jsonOwnKey('__proto__', moveFields)] });
+    expect(evaluate(input)).toEqual(refused());
+    expect(Object.prototype).not.toHaveProperty('admin');
+  });
+
+  it('refuses a prototype-polluting constructor key on a head move produced by JSON.parse', () => {
+    expect(evaluate(shell({ headMoves: [jsonOwnKey('constructor', moveFields)] }))).toEqual(refused());
+  });
+
+  it('refuses a prototype-polluting prototype key on a head move produced by JSON.parse', () => {
+    expect(evaluate(shell({ headMoves: [jsonOwnKey('prototype', moveFields)] }))).toEqual(refused());
+  });
+
+  it('refuses null journal', () => {
+    expect(evaluate(shell({ runs: [runWith(null)] }))).toEqual(refused());
+  });
+
+  it('refuses undefined journal', () => {
+    expect(evaluate(shell({ runs: [runWith(undefined)] }))).toEqual(refused());
+  });
+
+  it('refuses a number where a journal key string is due', () => {
+    const base = conforming(1, 1, iso(DAY, 12));
+    const entry = { ...base.run.journal[0], key: 12 };
+    expect(evaluate(shell({ runs: [runWith([entry])] }))).toEqual(refused());
+  });
+
+  it('refuses a string where the journal list is due', () => {
+    expect(evaluate(shell({ runs: [runWith('journal')] }))).toEqual(refused());
+  });
+
+  it('refuses a non-iterable object where the journal list is due', () => {
+    expect(evaluate(shell({ runs: [runWith({ nested: true })] }))).toEqual(refused());
+  });
+
+  it('refuses an array hole in a journal', () => {
+    const base = conforming(1, 1, iso(DAY, 12));
+    const journal = [...base.run.journal];
+    delete journal[0];
+    expect(evaluate(shell({ runs: [runWith(journal)] }))).toEqual(refused());
+  });
+
+  it('refuses an array-like object where the journal list is due', () => {
+    const base = conforming(1, 1, iso(DAY, 12));
+    const journal = { length: 1, 0: base.run.journal[0] };
+    expect(evaluate(shell({ runs: [runWith(journal)] }))).toEqual(refused());
+  });
+
+  it('refuses an enormous sparse journal length before any traversal', () => {
+    const probe = enormousList();
+    expect(evaluate(shell({ runs: [runWith(probe.list)] }))).toEqual(refused());
+    expect(probe.calls()).toBe(0);
+  });
+
+  it('never runs a getter on a journal item', () => {
+    let calls = 0;
+    const journal: unknown[] = [];
+    Object.defineProperty(journal, '0', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return conforming(1, 1, iso(DAY, 12)).run.journal[0];
+      },
+    });
+    journal.length = 1;
+    expect(evaluate(shell({ runs: [runWith(journal)] }))).toEqual(refused());
+    expect(calls).toBe(0);
+  });
+
+  it('never runs a getter on a journal field', () => {
+    let calls = 0;
+    const base = conforming(1, 1, iso(DAY, 12));
+    const entry = { ...base.run.journal[0] } as Record<string, unknown>;
+    const key = entry.key;
+    delete entry.key;
+    Object.defineProperty(entry, 'key', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return key;
+      },
+    });
+    expect(evaluate(shell({ runs: [runWith([entry])] }))).toEqual(refused());
+    expect(calls).toBe(0);
+  });
+
+  it('never runs a getter on a run journal property', () => {
+    let calls = 0;
+    const run = { ...conforming(1, 1, iso(DAY, 12)).run } as Record<string, unknown>;
+    const journal = run.journal;
+    delete run.journal;
+    Object.defineProperty(run, 'journal', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        calls += 1;
+        return journal;
+      },
+    });
+    expect(evaluate(shell({ runs: [run] }))).toEqual(refused());
+    expect(calls).toBe(0);
+  });
+
+  it('a Proxy over a valid journal yields the plain result and runs no get trap', () => {
+    const plain = inputFrom(passing());
+    const runs = [...(plain.runs as RunRecord[])];
+    const first = runs[0];
+    if (first === undefined) throw new Error('fixture missing');
+    let gets = 0;
+    const journal = new Proxy([...first.journal], {
+      get(target, prop, receiver) {
+        gets += 1;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    runs[0] = { ...first, journal: journal as unknown as RunRecord['journal'] };
+    const proxied = evaluate({ ...plain, runs });
+    const plainResult = evaluate(plain);
+    const same = JSON.stringify(proxied) === JSON.stringify(plainResult);
+    const rejected = proxied.status === 'unknown' && proxied.reason === 'invalid-input';
+    expect(same || rejected).toBe(true);
+    expect(gets).toBe(0);
+  });
+
+  it('refuses a prototype-polluting __proto__ key on a journal entry produced by JSON.parse', () => {
+    const entry = jsonOwnKey('__proto__', journalFields);
+    expect(evaluate(shell({ runs: [runWith([entry])] }))).toEqual(refused());
+    expect(Object.prototype).not.toHaveProperty('admin');
+  });
+
+  it('refuses a prototype-polluting constructor key on a journal entry produced by JSON.parse', () => {
+    const entry = jsonOwnKey('constructor', journalFields);
+    expect(evaluate(shell({ runs: [runWith([entry])] }))).toEqual(refused());
+  });
+
+  it('refuses a prototype-polluting prototype key on a journal entry produced by JSON.parse', () => {
+    const entry = jsonOwnKey('prototype', journalFields);
+    expect(evaluate(shell({ runs: [runWith([entry])] }))).toEqual(refused());
+  });
+});
+
+describe('capped list length, density and prototype guards', () => {
+  function shell(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return { day: DAY, runs: [], merges: [], headMoves: [], headMovesIncompleteFor: [], ...overrides };
+  }
+
+  function withRunList(
+    run: RunRecord,
+    key: 'journal' | 'reviewReceipts',
+    list: readonly unknown[],
+  ): Record<string, unknown> {
+    return { ...run, [key]: list } as Record<string, unknown>;
+  }
+
+  interface CappedList {
+    readonly name: string;
+    readonly cap: number;
+    readonly element: unknown;
+    readonly place: (list: readonly unknown[]) => Record<string, unknown>;
+  }
+
+  function cappedLists(): readonly CappedList[] {
+    const run = conforming(1, 1, iso(DAY, 12)).run;
+    const entry = run.journal[0];
+    if (entry === undefined) throw new Error('fixture journal missing');
+    const merge = { pullRequest: pullFor(1), headOid: headFor(1), atIso: iso(DAY, 12) };
+    return [
+      { name: 'runs', cap: SHADOW_CONFORMANCE_MAX_RUNS, element: run, place: (list) => shell({ runs: list }) },
+      { name: 'merges', cap: SHADOW_CONFORMANCE_MAX_SHELL_FACTS, element: merge, place: (list) => shell({ merges: list }) },
+      {
+        name: 'headMoves',
+        cap: SHADOW_CONFORMANCE_MAX_SHELL_FACTS,
+        element: move(pullFor(1), 1, 2, iso(DAY, 9)),
+        place: (list) => shell({ headMoves: list }),
+      },
+      {
+        name: 'headMovesIncompleteFor',
+        cap: SHADOW_CONFORMANCE_MAX_SHELL_FACTS,
+        element: pullFor(1),
+        place: (list) => shell({ headMovesIncompleteFor: list }),
+      },
+      {
+        name: 'journal',
+        cap: SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN,
+        element: entry,
+        place: (list) => shell({ runs: [withRunList(run, 'journal', list)] }),
+      },
+      {
+        name: 'reviewReceipts',
+        cap: SHADOW_CONFORMANCE_MAX_ENTRIES_PER_RUN,
+        element: { kind: 'code-review', result: 'pass' },
+        place: (list) => shell({ runs: [withRunList(run, 'reviewReceipts', list)] }),
+      },
+    ];
+  }
+
+  for (const spec of cappedLists()) {
+    it(`refuses a dense ${spec.name} list of cap + 1 with invalid-input`, () => {
+      const list = Array(spec.cap + 1).fill(spec.element);
+      expect(list).toHaveLength(spec.cap + 1);
+      expect(evaluate(spec.place(list))).toEqual(refused());
+    });
+
+    it(`does not refuse a dense ${spec.name} list of exactly the cap for length`, () => {
+      const list = Array(spec.cap).fill(spec.element);
+      expect(list).toHaveLength(spec.cap);
+      expect(evaluate(spec.place(list))).toEqual(scored('fail', 'too-few-conforming-runs'));
+    });
+  }
+
+  it('refuses an array with an extra own non-index property under the cap', () => {
+    const merge = { pullRequest: pullFor(1), headOid: headFor(1), atIso: iso(DAY, 12) };
+    expect(evaluate(shell({ merges: [merge] })).reason).not.toBe('invalid-input');
+    const merges = [merge];
+    Object.defineProperty(merges, 'note', { value: true, enumerable: true, configurable: true });
+    expect(merges.length).toBeLessThanOrEqual(SHADOW_CONFORMANCE_MAX_SHELL_FACTS);
+    expect(Object.keys(merges).length).not.toBe(merges.length);
+    expect(evaluate(shell({ merges }))).toEqual(refused());
+  });
+
+  it('refuses an array hole under the cap', () => {
+    const merge = { pullRequest: pullFor(1), headOid: headFor(1), atIso: iso(DAY, 12) };
+    expect(evaluate(shell({ merges: [merge, merge] })).reason).not.toBe('invalid-input');
+    const merges = [merge, merge];
+    delete merges[1];
+    expect(merges.length).toBeLessThanOrEqual(SHADOW_CONFORMANCE_MAX_SHELL_FACTS);
+    expect(Object.keys(merges).length).not.toBe(merges.length);
+    expect(evaluate(shell({ merges }))).toEqual(refused());
+  });
+
+  it('refuses an Array subclass instance under the cap with invalid-input', () => {
+    const run = conforming(1, 1, iso(DAY, 12)).run;
+    expect(evaluate(shell({ runs: [run] })).reason).not.toBe('invalid-input');
+    class RunList extends Array {}
+    const runs = RunList.from([run]);
+    expect(runs.length).toBeLessThanOrEqual(SHADOW_CONFORMANCE_MAX_RUNS);
+    expect(Object.getPrototypeOf(runs)).not.toBe(Array.prototype);
+    expect(evaluate(shell({ runs }))).toEqual(refused());
+  });
+
+  it('refuses a null-prototype array under the cap with invalid-input', () => {
+    const run = conforming(1, 1, iso(DAY, 12)).run;
+    const runs = [run];
+    Object.setPrototypeOf(runs, null);
+    expect(runs.length).toBeLessThanOrEqual(SHADOW_CONFORMANCE_MAX_RUNS);
+    expect(Object.getPrototypeOf(runs)).toBeNull();
+    expect(evaluate(shell({ runs }))).toEqual(refused());
+  });
+
+  it('a revoked Proxy passed as a list yields invalid-input', () => {
+    const { proxy, revoke } = Proxy.revocable([conforming(1, 1, iso(DAY, 12)).run], {});
+    revoke();
+    expect(evaluate(shell({ runs: proxy }))).toEqual(refused());
+  });
+
+  it('a Proxy whose ownKeys trap throws, passed as a list, yields invalid-input', () => {
+    const runs = new Proxy([conforming(1, 1, iso(DAY, 12)).run], {
+      ownKeys() {
+        throw new Error('ownKeys trap');
+      },
+    });
+    expect(evaluate(shell({ runs }))).toEqual(refused());
   });
 });
 

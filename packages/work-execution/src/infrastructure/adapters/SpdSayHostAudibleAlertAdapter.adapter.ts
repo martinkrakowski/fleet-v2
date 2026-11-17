@@ -73,6 +73,13 @@ export function validateHostAudibleAlertSentence(sentence: unknown): SpdSaySente
   if (!SENTENCE_CHARACTER_PATTERN.test(sentence)) {
     return { ok: false, reasonCode: 'invalid-request' };
   }
+  // Option injection: `-` is in the fixed set, but argv is exactly
+  // `[sentence]` with no `--` separator, so a sentence starting with `-`
+  // would reach the child as an option (`-h`, `-C`, `-S`, `-e`, `--help`).
+  // Refuse any sentence whose FIRST character is `-`.
+  if (sentence.startsWith('-')) {
+    return { ok: false, reasonCode: 'invalid-request' };
+  }
   return { ok: true, sentence };
 }
 
@@ -258,7 +265,10 @@ function resolveBinary(candidates: unknown, isExecutable: (candidate: string) =>
 /** The child environment: the allow list plus the one validated runtime dir. */
 function childEnv(runtimeDir: string | undefined): Record<string, string> {
   const env = allowListedChildEnv('local');
-  if (runtimeDir !== undefined && RUNTIME_DIR_PATTERN.test(runtimeDir)) {
+  // `RegExp.test` coerces its argument to a string, so a non-string value
+  // (for example an array like `['/run/user/1000']`) could pass the pattern
+  // test; require a real string first.
+  if (typeof runtimeDir === 'string' && RUNTIME_DIR_PATTERN.test(runtimeDir)) {
     env.XDG_RUNTIME_DIR = runtimeDir;
   }
   return env;

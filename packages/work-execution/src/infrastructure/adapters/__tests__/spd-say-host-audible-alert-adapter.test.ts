@@ -140,6 +140,16 @@ describe('validateHostAudibleAlertSentence', () => {
       expect(validateHostAudibleAlertSentence(bad)).toEqual(INVALID);
     }
   });
+
+  it('refuses a sentence whose first character is a hyphen (option injection)', () => {
+    for (const bad of ['-h', '-C', '--help', '-e x']) {
+      expect(validateHostAudibleAlertSentence(bad)).toEqual(INVALID);
+    }
+  });
+
+  it('accepts a sentence with a hyphen that is not the first character', () => {
+    expect(validateHostAudibleAlertSentence('all-clear')).toEqual({ ok: true, sentence: 'all-clear' });
+  });
 });
 
 describe('parseHostAudibleAlertRequest', () => {
@@ -197,10 +207,15 @@ describe('parseHostAudibleAlertRequest', () => {
 describe('SpdSayHostAudibleAlertAdapter.speak refusals', () => {
   it('refuses malformed or hostile input with zero isExecutable and zero spawn calls', async () => {
     let probes = 0;
+    let spawns = 0;
     const adapter = adapterWith({
       isExecutable: () => {
         probes += 1;
         return true;
+      },
+      run: async () => {
+        spawns += 1;
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
       },
     });
     for (const bad of [
@@ -229,6 +244,7 @@ describe('SpdSayHostAudibleAlertAdapter.speak refusals', () => {
       expect(await adapter.speak(bad)).toEqual(REFUSED);
     }
     expect(probes).toBe(0);
+    expect(spawns).toBe(0);
   });
 
   it('refuses a hostile request without running its sentence getter', async () => {
@@ -428,10 +444,12 @@ describe('SpdSayHostAudibleAlertAdapter.speak refusals', () => {
     const sparse: unknown[] = new Array(2);
     sparse[0] = scriptPath;
     const accessorList: string[] = [];
+    let accessorCalls = 0;
     Object.defineProperty(accessorList, 0, {
       enumerable: true,
       configurable: true,
       get() {
+        accessorCalls += 1;
         return scriptPath;
       },
     });
@@ -458,6 +476,61 @@ describe('SpdSayHostAudibleAlertAdapter.speak refusals', () => {
         },
       });
       expect(await adapter.speak({ sentence: 'all clear' })).toEqual(REFUSED);
+    }
+    // The candidate-element getter never ran while the list was inspected.
+    expect(accessorCalls).toBe(0);
+    expect(probes).toBe(0);
+    expect(runs).toBe(0);
+  });
+
+  it('refuses a sparse candidates array of length 2**32 - 1 without probing or spawning', async () => {
+    let probes = 0;
+    let runs = 0;
+    const sparse: unknown[] = new Array(2 ** 32 - 1);
+    sparse[0] = scriptPath;
+    const adapter = new SpdSayHostAudibleAlertAdapter({
+      candidates: sparse as readonly string[],
+      isExecutable: () => {
+        probes += 1;
+        return true;
+      },
+      run: async () => {
+        runs += 1;
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    });
+    expect(await adapter.speak({ sentence: 'all clear' })).toEqual(REFUSED);
+    expect(probes).toBe(0);
+    expect(runs).toBe(0);
+  });
+
+  it('refuses a request with an unexpected extra own key without spawning', async () => {
+    let runs = 0;
+    const adapter = adapterWith({
+      run: async () => {
+        runs += 1;
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    });
+    expect(await adapter.speak({ sentence: 'all clear', extra: 1 })).toEqual(REFUSED);
+    expect(runs).toBe(0);
+  });
+
+  it('refuses a sentence starting with a hyphen (option injection) with zero spawns', async () => {
+    let runs = 0;
+    let probes = 0;
+    const adapter = adapterWith({
+      isExecutable: () => {
+        probes += 1;
+        return true;
+      },
+      run: async () => {
+        runs += 1;
+        return { exitCode: 0, signal: null, stdout: '', stderr: '' };
+      },
+    });
+    for (const sentence of ['-h', '-C', '--help', '-e x']) {
+      expect(await adapter.speak({ sentence })).toEqual(REFUSED);
     }
     expect(probes).toBe(0);
     expect(runs).toBe(0);
@@ -606,6 +679,8 @@ describe('SpdSayHostAudibleAlertAdapter binary resolution', () => {
     expect(await adapter.speak({ sentence: 'first sentence' })).toEqual({ outcome: 'spoken' });
     expect(await adapter.speak({ sentence: 'first sentence' })).toEqual({ outcome: 'spoken' });
     expect(probeCalls.length).toBe(2);
+    // Two real spawns are recorded: each run appended its four lines.
+    expect(seenLines().filter((line) => line === '1')).toHaveLength(2);
   });
 });
 
@@ -640,6 +715,13 @@ describe('SpdSayHostAudibleAlertAdapter spawn handling', () => {
       expect(await adapter.speak({ sentence: 'all clear' })).toEqual({ outcome: 'spoken' });
       expect(seenLines()).toEqual(['1', 'all clear', expected, 'unset']);
     }
+  });
+
+  it('does not forward XDG_RUNTIME_DIR when runtimeDir returns a non-string', async () => {
+    rmSync(seenPath, { force: true });
+    const adapter = adapterWith({ runtimeDir: (() => ['/run/user/1000']) as unknown as () => string | undefined });
+    expect(await adapter.speak({ sentence: 'all clear' })).toEqual({ outcome: 'spoken' });
+    expect(seenLines()).toEqual(['1', 'all clear', 'unset', 'unset']);
   });
 
   it('does not leak FLEET_TEST_MARKER from process.env to real script', async () => {

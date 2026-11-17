@@ -1106,6 +1106,158 @@ describe('ManageReleaseUseCase', () => {
     return opId;
   }
 
+  /**
+   * CO14b fix round 11 (finding 1): a store whose successive `list()` reads
+   * answer a SCRIPTED sequence of `current` values (the last entry repeats),
+   * so a test can simulate another call's repoint landing between two of
+   * THIS call's own reads -- the exact "stale snapshot vs. a later fresh
+   * read" race the finding describes. Only `list()` is scripted; every other
+   * method still behaves exactly as `FakeStore`'s.
+   */
+  class ScriptedListStore extends FakeStore {
+    private listCalls = 0;
+
+    constructor(
+      builds: ReleaseBuildRecord[],
+      private readonly currentSequence: ReadonlyArray<string | null>,
+    ) {
+      super(builds, currentSequence[0] ?? null);
+    }
+
+    async list(): Promise<ReleaseStoreListing> {
+      if (this.unreadable) {
+        return { outcome: 'unreadable' };
+      }
+      const index = Math.min(this.listCalls, this.currentSequence.length - 1);
+      this.listCalls += 1;
+      return { outcome: 'read', current: this.currentSequence[index], builds: [...this.builds] };
+    }
+  }
+
+  /** CO14b fix round 11 (finding 3): counts `cancelOperation` calls, to prove a write never happens. */
+  class SpyStore extends FakeStore {
+    cancelCalls = 0;
+
+    async cancelOperation(input: ReleaseOperationRef): Promise<ReleaseStoreWriteResult> {
+      this.cancelCalls += 1;
+      return super.cancelOperation(input);
+    }
+  }
+
+  it(
+    'never retires a live, just-repointed rollback intent when the retire decision reads a fresh ' +
+      'current instead of the stale snapshot run() captured earlier (CO14b round 11, finding 1)',
+    async () => {
+      // Oldest-to-newest: A, B, C. X is a separate rollback intent (C -> B)
+      // whose own repoint has already landed for real (repointed: true),
+      // but whose claim was released, not completed. Y (this call) is a
+      // SEPARATE, freshly dispatched rollback request: its own `run()`
+      // captures `current` while it is still C -- X's repoint has not
+      // landed from Y's point of view yet -- but by the time Y's own
+      // retire decision runs (the fresh read my round-11 fix performs),
+      // X's repoint HAS landed. That is the exact ordering the finding
+      // describes.
+      const store = new ScriptedListStore([build('a', 1), build('b', 2), build('c', 3)], [C, B]);
+      const xOpId = store.newOperationId();
+      store.operations.set(`rollback-${B}`, { opId: xOpId, claimed: false, repointed: true });
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization: alwaysGrants(),
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+
+      const result = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
+      // Y's own apply correctly refuses -- its plannedCurrent (C, from its
+      // own stale snapshot) no longer matches the real, now-fresh current
+      // (B) -- but that is `stillTargets`'s own ordinary safety net, not
+      // the thing under test here.
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'current-moved' });
+      // X's own legitimate intent must survive untouched: never retired
+      // just because Y's STALE snapshot made it look like a mismatch.
+      expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({
+        outcome: 'open',
+        opId: xOpId,
+        sha: B,
+        repointed: true,
+      });
+    },
+  );
+
+  it(
+    'never cancels a not-yet-repointed rollback intent for a different sha, during a no-op ' +
+      "swap's own proactive cleanup (CO14b round 11, finding 2)",
+    async () => {
+      // current is already C; a rollback-to-B intent exists but has not
+      // reached its own repoint step yet (repointed: false) -- it may be a
+      // different, legitimate, still-pending operation.
+      const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C);
+      store.operations.set(`rollback-${B}`, { opId: 'pending-rollback-op', claimed: false, repointed: false });
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization: alwaysGrants(),
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+
+      // A no-op swap to C (current is already C) reaches `fencedRepoint`'s
+      // own proactive cleanup once its (no-op) repoint is confirmed.
+      const result = await manage(useCase, applyRequest({ action: 'swap', sha: C, source: null }));
+      expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: C, current: C });
+      // The pending, not-yet-repointed rollback-to-B intent must survive
+      // untouched: a differing sha alone never proves it stale.
+      expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({
+        outcome: 'open',
+        opId: 'pending-rollback-op',
+        sha: B,
+        repointed: false,
+      });
+    },
+  );
+
+  it(
+    'reports the correct fresh target but never mutates the store for a plan-only rollback that ' +
+      'finds a genuinely stale repointed intent (CO14b round 11, finding 3)',
+    async () => {
+      // Oldest-to-newest: A, B, C, D. The crashed rollback already
+      // repointed B -> ... no: repointed TO B for real (current is now D,
+      // moved on by other activity), then died before `prune`/`complete`.
+      // The intent is genuinely, provably stale right now.
+      const store = new SpyStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4)], null);
+      const staleOpId = seedCrashedRollback(store, B, D);
+      const useCase = new ManageReleaseUseCase({
+        store,
+        lease: new FakeLease(null),
+        authorization: alwaysGrants(),
+        executor: new FakeExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        stateDir: STATE_DIR,
+      });
+
+      // A plan-only request (apply: false, the default of `request()`).
+      const planned = await manage(useCase, request({ action: 'rollback', sha: null, source: null }));
+      // The plan reports the CORRECT, fresh target -- previousBuild(D) ===
+      // C -- never the stale B.
+      expect(planned).toMatchObject({ outcome: 'planned', action: 'rollback', target: C, previous: C, current: D });
+      // A plan prints and writes nothing: the stale intent survives
+      // untouched, and `cancelOperation` is never called.
+      expect(store.cancelCalls).toBe(0);
+      expect(await store.peekAnyOpenOperation({ action: 'rollback' })).toEqual({
+        outcome: 'open',
+        opId: staleOpId,
+        sha: B,
+        repointed: true,
+      });
+    },
+  );
+
   it(
     'a stale rollback intent whose own repoint already landed is retired, never poisoning ' +
       'every later rollback forever (CO14b round 10, finding 1)',

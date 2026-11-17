@@ -115,6 +115,50 @@
  * are complementary: the reactive check handles a request that arrives while
  * `current` has already diverged; the proactive one guarantees a diverged
  * intent never lingers to be revisited.
+ *
+ * CO14b fix round 11 (Luna, three findings): round 10's own implementation
+ * of that design had gaps.
+ *
+ * Finding 1: `resolveTarget`'s reactive check compared `open.repointed`'s
+ * sha against `current` -- but that `current` was the STALE snapshot `run()`
+ * captured before `resolveTarget` ever ran, never a fresh read taken at the
+ * point of the retire decision itself. Race: call X marks its own intent
+ * `repointed: true` and its repoint genuinely lands AFTER call Y's `run()`
+ * already captured Y's (now-stale) `current` but BEFORE Y's `resolveTarget`
+ * runs its retire check. Y, judging X's live, just-succeeded intent against
+ * its own older snapshot, could wrongly conclude it is stale and retire a
+ * recovery intent X might still need. The fix: once an intent's own
+ * `repointed` is `true`, the retire decision re-reads `current` FRESH (a new
+ * `store.list` call, the same "revalidate under the lease" idiom
+ * `fencedRepoint` already uses before its own repoint) rather than reusing
+ * `run()`'s earlier snapshot; the recomputed fallback target is likewise
+ * read fresh, never from the stale snapshot.
+ *
+ * Finding 2: `fencedRepoint`'s proactive cleanup (`retireOtherStaleRollbackIntent`)
+ * retired any OTHER open rollback intent whose sha merely differed from this
+ * call's own target -- with no check of that OTHER intent's own `repointed`
+ * flag. A rollback-to-B intent that is still `repointed: false` (it has not
+ * reached its own repoint step yet) is not proven stale by anything: it may
+ * be a different, legitimate, still-pending operation with every right to
+ * exist. The fix: the proactive cleanup retires another open intent only
+ * when that intent's OWN `repointed` is `true` -- proven stale (current
+ * cannot be at two shas at once, and only this process can repoint while
+ * holding the lease) -- never merely because its sha differs. The two
+ * findings' fixes are complementary, not alternatives: an intent is retired
+ * only when it is BOTH `repointed: true` AND, per a fresh read, no longer
+ * matching current reality.
+ *
+ * Finding 3 (a repeat of the round-4 lesson): the reactive retire-on-stale
+ * logic could reach `cancelOperation` -- a store write -- even for a
+ * plan-only request (`request.apply === false`), violating this file's own
+ * documented contract that a plan prints and writes nothing. The fix: the
+ * write itself is gated on `request.apply === true`; a plan-only request
+ * that discovers a stale intent still computes and reports the correct,
+ * fresh target (so the plan stays accurate), it simply never performs the
+ * retiring write -- the next genuine apply to reach the same decision
+ * retires it for real. `fencedRepoint`'s own proactive cleanup needs no
+ * equivalent gate: it runs only from `applyOperation`, itself reachable only
+ * from `apply()`, which `run()` never calls for a plan-only request.
  */
 
 import { containsSecretShape } from '@fleet/shared';
@@ -530,16 +574,43 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       return { outcome: 'unreadable' };
     }
     if (open.outcome === 'open') {
-      if (!open.repointed || current === open.sha) {
+      if (!open.repointed) {
+        // Never proven to have done anything yet; adopted exactly as before
+        // round 10 -- safe already, because the ordinary `current !==
+        // plannedCurrent` check downstream still gates it.
         return { outcome: 'resolved', target: open.sha, previous: open.sha };
       }
-      // CO14b fix round 10 (finding 1): the intent's own mutation already
-      // happened, but current has since moved away from it -- stale. Retire
-      // it now, not merely skip it, so it can never poison a later rollback
-      // too: a later call's own `peekAnyOpenOperation` must never find it
-      // again. Falls through to the ordinary fresh computation below, as if
-      // no intent were open.
-      await this.retireRollbackIntent(request.root, open.opId, open.sha);
+      // CO14b fix round 11 (finding 1): `open.repointed` alone does not
+      // settle whether this intent is still live -- it may ALREADY be
+      // stale right now even though the `current` this function was
+      // handed (captured by `run()`, before this call) is too old to show
+      // it: another call's repoint can land between that snapshot and this
+      // decision. Re-read `current` FRESH, under no lease, the same
+      // "revalidate" idiom `fencedRepoint` uses before its own repoint, so
+      // the retire decision is never made against a snapshot older than
+      // the intent's own repoint.
+      const fresh = await this.deps.store.list({ root: request.root });
+      if (fresh.outcome !== 'read') {
+        return { outcome: 'unreadable' };
+      }
+      if (fresh.current === open.sha) {
+        return { outcome: 'resolved', target: open.sha, previous: open.sha };
+      }
+      // Proven stale under the fresh read: retire it now, not merely skip
+      // it, so it can never poison a later rollback too: a later call's own
+      // `peekAnyOpenOperation` must never find it again.
+      //
+      // CO14b fix round 11 (finding 3): retiring is a STORE WRITE
+      // (`cancelOperation`), and this function runs for a plan-only request
+      // too. A plan prints and writes nothing (this file's own documented
+      // contract, the round-4 lesson) -- the write happens only on a
+      // genuine apply; a plan-only call still falls through to report the
+      // correct, fresh target below, it simply never performs the write.
+      if (request.apply) {
+        await this.retireRollbackIntent(request.root, open.opId, open.sha);
+      }
+      const previous = previousBuild(fresh.builds, fresh.current);
+      return { outcome: 'resolved', target: previous, previous };
     }
     const previous = previousBuild(builds, current);
     return { outcome: 'resolved', target: previous, previous };
@@ -687,7 +758,14 @@ export class ManageReleaseUseCase implements ManageReleasePort {
   private async retireOtherStaleRollbackIntent(root: string, target: string): Promise<void> {
     try {
       const open = await this.deps.store.peekAnyOpenOperation({ root, action: 'rollback' });
-      if (open.outcome === 'open' && open.sha !== target) {
+      // CO14b fix round 11 (finding 2): a differing sha alone proves nothing
+      // -- an intent whose OWN `repointed` is still `false` has not reached
+      // its own repoint step yet and may be a different, legitimate,
+      // still-pending operation with every right to exist. Only an intent
+      // that is BOTH for a different sha AND already `repointed: true` is
+      // provably contradicted by `current` being confirmed, right here,
+      // at THIS call's own target instead.
+      if (open.outcome === 'open' && open.sha !== target && open.repointed) {
         await this.retireRollbackIntent(root, open.opId, open.sha);
       }
     } catch {

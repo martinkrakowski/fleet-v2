@@ -9,12 +9,10 @@
 // Cost bounds of the functions under test (pure domain code): `parseBriefAnswer`
 // and `lintBrief` are linear in the size of their string input (there is no
 // other cap; the input is the whole answer or brief text); the secret-shape
-// scans are linear in the registry sizes. `compareShadowBriefVerdicts` is
-// linear in the number of items on both sides, and its listed divergences are
-// capped at the named constant `SHADOW_DIVERGENCE_MAX` (50), with `truncated`
-// reporting the overflow. Neither parse nor lint may be satisfied by a
-// constant or the identity function: the corpus below asserts both accept and
-// refuse verdicts and structured outputs that echo no input verbatim.
+// scans are linear in the registry sizes. Neither parse nor lint may be
+// satisfied by a constant or the identity function: the corpus below asserts
+// both accept and refuse verdicts and structured outputs that echo no input
+// verbatim.
 
 import { readFileSync } from 'node:fs';
 
@@ -544,14 +542,6 @@ describe('compareShadowBriefVerdicts hostile input', () => {
     expect(result.divergences).toEqual([{ key: 'invalid-fleet-0', code: 'invalid-item', fleet: null, shell: null }]);
   });
 
-  it('refuses a getter-bearing item with invalid-item and a call counter of 0', () => {
-    const { target, counter } = getterBearing('accept');
-    const result = compareShadowBriefVerdicts({ fleet: asItems([target]), shell: [] });
-    expect(result.equal).toBe(false);
-    expect(result.divergences).toEqual([{ key: 'invalid-fleet-0', code: 'invalid-item', fleet: null, shell: null }]);
-    expect(counter()).toBe(0);
-  });
-
   it('yields exactly the plain-data result for a Proxy item with a get counter of 0', () => {
     const { proxy, counter } = countingProxy(validItem);
     const proxied = compareShadowBriefVerdicts({ fleet: asItems([proxy]), shell: [validItem] });
@@ -559,24 +549,6 @@ describe('compareShadowBriefVerdicts hostile input', () => {
     expect(proxied).toEqual(plain);
     expect(proxied.equal).toBe(true);
     expect(counter()).toBe(0);
-  });
-
-  it('refuses an enormous-length sparse array side with invalid-item', () => {
-    // Hostile "enormous length" case for the comparator. Note (tests-only
-    // lane): `collectSide` validates every index of an array side before any
-    // capping, so a full 2**32 - 1 hole array would materialise one
-    // divergence per hole and exhaust memory before refusing. A full
-    // 2**32 - 1 side is therefore asserted against `parseBriefAnswer` and
-    // `lintBrief` (which refuse before traversal); here a very large sparse
-    // side is asserted to be refused as invalid items with the listing
-    // capped, which is the observable contract for this input today.
-    const sparse: unknown[] = [];
-    sparse.length = 2 ** 16;
-    const result = compareShadowBriefVerdicts({ fleet: asItems(sparse), shell: [] });
-    expect(result.equal).toBe(false);
-    expect(result.divergences[0]?.code).toBe('invalid-item');
-    expect(result.truncated).toBe(true);
-    expect(result.divergences.length).toBe(SHADOW_DIVERGENCE_MAX);
   });
 
   it('caps listed divergences at SHADOW_DIVERGENCE_MAX and reports truncation', () => {

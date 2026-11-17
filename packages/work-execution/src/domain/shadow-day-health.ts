@@ -449,6 +449,23 @@ function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+/**
+ * Whether `key` is one of the control kinds the real journal writer treats
+ * as never pending (`lane-run-journal.ts`'s `pendingStepIntent` /
+ * `laneRunJournalPendingIntent`, and its comment: "Control keys (stop,
+ * resume, request, reaper) are never pending: they are not external
+ * actions."). A key of one of these kinds may legitimately carry an intent
+ * that never gets any result at all — most commonly an operator stop — so
+ * the open-intent grace check below must never flag one as
+ * `unreconciled-intent` regardless of its age. A key that is not even a
+ * recognized lane-run key (for example a synthetic test key) is not a
+ * control key by this rule and stays subject to the grace check as before.
+ */
+function isControlKeyKind(key: string): boolean {
+  const kind = parseLaneRunKey(key)?.kind;
+  return kind === 'stop' || kind === 'resume' || kind === 'request' || kind === 'reaper';
+}
+
 /** The S9 journal rules, over already-validated entries. */
 function judgeJournalIntegrity(entries: readonly SampledJournalEntry[], sampledAtIso: string): ShadowCriterionEvaluation {
   const tallies = tallyJournal(entries);
@@ -488,8 +505,18 @@ function judgeJournalIntegrity(entries: readonly SampledJournalEntry[], sampledA
       return FAIL('journal-orphan-result');
     }
   }
-  for (const tally of tallies.values()) {
+  for (const [key, tally] of tallies.entries()) {
     if (tally.intents === 0 || tally.finalResults > 0 || tally.intentIso === null) {
+      continue;
+    }
+    // Control-kind keys (stop, resume, request, reaper) are exempt: see
+    // `isControlKeyKind` above. This also covers a request-channel key whose
+    // only result is `not-started` — that result does not close the key
+    // (`isFinalResultEntry` above, matching the real writer's
+    // `isClosedByFinalResult`), so `finalResults` stays 0 there too, and
+    // without this exemption it would otherwise still reach the grace check
+    // below.
+    if (isControlKeyKind(key)) {
       continue;
     }
     // The open-intent grace period is genuinely wall-clock, not append

@@ -280,6 +280,21 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
     }))).toEqual({ status: 'pass', reason: 'state-consistent' });
   });
 
+  it('passes a lone operator stop intent open for 16 minutes: control keys are never pending', () => {
+    // A stop intent legitimately never gets a matching result at all — the
+    // real journal model (`lane-run-journal.ts`'s `pendingStepIntent`, and
+    // its comment: "Control keys (stop, resume, request, reaper) are never
+    // pending: they are not external actions.") never expects a result for
+    // this key, so the open-intent grace deadline must not apply to it. An
+    // operator stop is a normal, common action; without this exemption any
+    // day where one happened more than 15 minutes before the sample would
+    // wrongly fail S9 outright.
+    const STOP_KEY = 'run-01JB0000000000000000000000/stop@web';
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [journalEntry(STOP_KEY, 'intent', null, '2026-11-10T23:44:00.000Z')],
+    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+  });
+
   it('passes when an ambiguous result is followed later by a real final result', () => {
     expect(evaluateShadowStateIntegrity(stateInput({
       journal: [
@@ -368,6 +383,22 @@ describe('evaluateShadowStateIntegrity (S9)', () => {
         journalEntry(REQUEST_KEY, 'intent', null, PREV_23(50)),
         journalEntry(REQUEST_KEY, 'result', 'not-started', PREV_23(51)),
         journalEntry(REQUEST_KEY, 'result', 'completed', PREV_23(52)),
+      ],
+    }))).toEqual({ status: 'pass', reason: 'state-consistent' });
+  });
+
+  it('passes a request-channel key whose only result is not-started, 16 minutes old: reconciled, not an open intent', () => {
+    // A `not-started` result on the request channel does not close the key
+    // (`isFinalResultEntry` above, matching the real writer's
+    // `isClosedByFinalResult`), so `finalResults` stays 0 for it — but a
+    // request-channel key is a control key (`isControlKeyKind`) and is
+    // exempt from the open-intent grace check regardless, so this must not
+    // be flagged as an open, unresolved intent.
+    const REQUEST_KEY = 'request/01JB0000000000000000000001';
+    expect(evaluateShadowStateIntegrity(stateInput({
+      journal: [
+        journalEntry(REQUEST_KEY, 'intent', null, '2026-11-10T23:44:00.000Z'),
+        journalEntry(REQUEST_KEY, 'result', 'not-started', '2026-11-10T23:45:00.000Z'),
       ],
     }))).toEqual({ status: 'pass', reason: 'state-consistent' });
   });

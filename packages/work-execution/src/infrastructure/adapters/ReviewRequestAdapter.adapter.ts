@@ -918,7 +918,9 @@ function isDeclaredSeverity(severity: unknown): severity is 'blocker' | 'major' 
  * read off the prototype). Cost: the fixed key list above, once. Never throws.
  */
 function readFindingSummaryFields(finding: unknown): FindingSummaryFields | null {
-  const read: Partial<FindingSummaryFields> = {};
+  // Partial keeps the readonly modifiers, so the loop cannot assign. Drop them
+  // on this local only; the returned value is still FindingSummaryFields.
+  const read: { -readonly [K in keyof FindingSummaryFields]?: FindingSummaryFields[K] } = {};
   for (const key of FINDING_SUMMARY_FIELDS) {
     const property = ownProperty(finding, key);
     if (property === 'unreadable') {

@@ -1156,7 +1156,7 @@ describe('brief delegate configuration and failures', () => {
         },
       });
       const receipt = briefReceipt({
-        findings: [hostile] as ReviewReceiptRecord['findings'],
+        findings: [hostile] as unknown as ReviewReceiptRecord['findings'],
       });
       const { requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt });
       const requested = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());

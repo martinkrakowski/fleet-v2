@@ -818,7 +818,13 @@ describe('TrainHealthStateReadAdapter', () => {
         }, waitMs);
       });
     });
+    // The queue store accepts a deadline only when it is ahead of Date.now().
+    // The request deadline is anchored at CLOCK, so the fake clock has to start
+    // there or listMergeEntries refuses and forge is never called. waitFor
+    // advances fake time by `interval` before every check; interval 0 lets the
+    // status and queue reads finish without consuming the forge window.
     vi.useFakeTimers();
+    vi.setSystemTime(new Date(CLOCK));
     try {
       let settled = false;
       const pending = adapterFor({
@@ -831,9 +837,12 @@ describe('TrainHealthStateReadAdapter', () => {
           settled = true;
           return result;
         });
-      for (let step = 0; step < 10; step += 1) {
-        await Promise.resolve();
-      }
+      await vi.waitFor(
+        () => {
+          expect(readForgeMerge).toHaveBeenCalledTimes(1);
+        },
+        { interval: 0 },
+      );
       expect(readForgeMerge).toHaveBeenCalledTimes(1);
       expect(readForgeMerge.mock.calls[0]?.[0].deadlineIso).toBe(windowDeadline);
       expect(settled).toBe(false);

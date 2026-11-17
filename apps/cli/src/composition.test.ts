@@ -2203,7 +2203,7 @@ describe('CO18a3b brief-verify attempt resolution', () => {
     expect(lookup.log.listed).toBe(1);
   });
 
-  it('rejects, after reading the list once, when the attempt list exceeds the read cap even if one attempt matches, and does not call findAttemptById', async () => {
+  it('returns null, without throwing, for 4,097 attempts of which exactly one matches, and does not call findAttemptById', async () => {
     const head = makeHeadH();
     const match = { ...makeAttempt('attempt-match', 'wo-match', head), briefDigest: BRIEF_DIGEST };
     const filler = { ...makeAttempt('attempt-filler', 'wo-filler', head), briefDigest: OTHER_DIGEST };
@@ -2215,9 +2215,11 @@ describe('CO18a3b brief-verify attempt resolution', () => {
       orders: new Map([['wo-match', orderFor('wo-match', BRIEF_PROJECT_ID)]]),
     });
 
+    // Over the cap the list cannot prove uniqueness, so the result is null,
+    // the same as two matches: no throw, and no scan past the cap.
     await expect(
       findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
-    ).rejects.toThrow('cannot be read');
+    ).resolves.toBeNull();
     expect(lookup.log.listed).toBe(1);
     expect(lookup.log.findIds).toEqual([]);
   });

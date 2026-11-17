@@ -174,8 +174,13 @@ async function findUniqueBriefAttempt(
     throw new Error('The attempt repository returned a list that cannot be read');
   }
   const count = listed.length;
-  if (!Number.isSafeInteger(count) || count < 0 || count > MAX_BRIEF_ATTEMPTS_READ) {
+  if (!Number.isSafeInteger(count) || count < 0) {
     throw new Error('The attempt repository returned a list whose length cannot be read');
+  }
+  // Over the cap the list cannot prove a unique match, so the result is null
+  // (fail closed), never a throw and never a partial scan of the list.
+  if (count > MAX_BRIEF_ATTEMPTS_READ) {
+    return null;
   }
   let match: AttemptRecord | null = null;
   for (let index = 0; index < count; index += 1) {

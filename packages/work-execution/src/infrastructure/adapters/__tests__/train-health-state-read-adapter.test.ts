@@ -969,4 +969,221 @@ describe('TrainHealthStateReadAdapter', () => {
 
     expect(result).toEqual({ outcome: 'unavailable', reasonCode: 'read-failed' });
   });
+
+  it('accepts a listing of exactly MERGE_QUEUE_ORDER_CAP entries', async () => {
+    const { records } = await seed([{ pullRequest: 7, repository: OTHER_REPOSITORY }]);
+    const template = records[0];
+    if (template === undefined) {
+      throw new Error('expected a real queue record');
+    }
+    const listed = Array.from({ length: MERGE_QUEUE_ORDER_CAP }, (_, index) => {
+      if (index === MERGE_QUEUE_ORDER_CAP - 1) {
+        return {
+          ...template,
+          repoDigest: REPO_DIGEST,
+          pullRequest: 7,
+          headOid: headFor(7),
+        };
+      }
+      return {
+        ...template,
+        pullRequest: index + 1,
+        headOid: headFor(index + 1),
+      };
+    });
+    const readForgeMerge = openForge();
+    const result = await adapterFor({
+      status: missingStatus(),
+      queue: asQueue(async () => listed),
+      forge: asForge(readForgeMerge),
+    }).readTrainHealthState(healthRequest());
+
+    assertOk(result);
+    expect(listed).toHaveLength(MERGE_QUEUE_ORDER_CAP);
+    expect(result.snapshot.queue).toEqual([
+      {
+        pullRequest: 7,
+        state: 'queued',
+        forgeState: 'open',
+        enqueuedAtIso: template.enqueuedAtIso,
+        attempt: 0,
+      },
+    ]);
+    expect(readForgeMerge).toHaveBeenCalledTimes(1);
+  });
+
+  it('orders two live entries with the same enqueuedAtIso by the smaller pull request first', async () => {
+    const { records } = await seed([{ pullRequest: 7 }]);
+    const template = records[0];
+    if (template === undefined) {
+      throw new Error('expected a real queue record');
+    }
+    const listed = [
+      { ...template, pullRequest: 20, headOid: headFor(20), enqueuedAtIso: ENQUEUED },
+      { ...template, pullRequest: 4, headOid: headFor(4), enqueuedAtIso: ENQUEUED },
+    ];
+    const result = await adapterFor({
+      status: missingStatus(),
+      queue: asQueue(async () => listed),
+      forge: asForge(openForge()),
+    }).readTrainHealthState(healthRequest());
+
+    assertOk(result);
+    expect(result.snapshot.queue.map((entry) => entry.enqueuedAtIso)).toEqual([ENQUEUED, ENQUEUED]);
+    expect(result.snapshot.queue.map((entry) => entry.pullRequest)).toEqual([4, 20]);
+  });
+
+  it('falls back to 10 forge reads when maxForgeReads is negative', async () => {
+    const specs = Array.from({ length: 11 }, (_, index) => ({
+      pullRequest: index + 1,
+      enqueuedAtIso: new Date(Date.parse(ENQUEUED) + index * 1_000).toISOString(),
+    }));
+    const { queue } = await seed(specs);
+    const readForgeMerge = openForge();
+    const result = await adapterFor({
+      status: missingStatus(),
+      queue,
+      forge: asForge(readForgeMerge),
+      maxForgeReads: -5,
+    }).readTrainHealthState(healthRequest());
+
+    assertOk(result);
+    expect(result.snapshot.queue).toHaveLength(11);
+    expect(readForgeMerge).toHaveBeenCalledTimes(10);
+    expect(result.snapshot.queue.slice(0, 10).every((entry) => entry.forgeState === 'open')).toBe(true);
+    expect(result.snapshot.queue[10]?.forgeState).toBe('unknown');
+  });
+
+  it('maps a non-ok forge answer that still carries a known prState to forgeState unknown', async () => {
+    const { queue } = await seed([
+      { pullRequest: 1, enqueuedAtIso: '2026-11-01T11:00:00.000Z' },
+      { pullRequest: 2, enqueuedAtIso: '2026-11-01T11:01:00.000Z' },
+      { pullRequest: 3, enqueuedAtIso: '2026-11-01T11:02:00.000Z' },
+    ]);
+    const script = [
+      { outcome: 'not-found', prState: 'open' },
+      { outcome: 'unavailable', code: 'unreadable', reason: 'down', prState: 'closed' },
+      { outcome: 'budget-exhausted', prState: 'merged' },
+    ];
+    let index = 0;
+    const readForgeMerge = vi.fn(async (_request: ReadForgeMergeRequest) => {
+      const answer = script[index];
+      index += 1;
+      if (answer === undefined) {
+        throw new Error('unexpected forge call');
+      }
+      return answer;
+    });
+    const result = await adapterFor({
+      status: missingStatus(),
+      queue,
+      forge: asForge(readForgeMerge),
+    }).readTrainHealthState(healthRequest());
+
+    assertOk(result);
+    expect(result.snapshot.queue.map((entry) => entry.forgeState)).toEqual([
+      'unknown',
+      'unknown',
+      'unknown',
+    ]);
+    expect(result.snapshot.queue.map((entry) => entry.state)).toEqual([
+      'queued',
+      'queued',
+      'queued',
+    ]);
+    expect(readForgeMerge).toHaveBeenCalledTimes(3);
+  });
+
+  it('leaves lastMergedAtIso absent when a queued or dropped record carries mergedAtIso', async () => {
+    const { records } = await seed([{ pullRequest: 7 }]);
+    const template = records[0];
+    if (template === undefined) {
+      throw new Error('expected a real queue record');
+    }
+    // The port keeps only live entries, and an absent lastMergedAtIso means no
+    // merge time. mergedAtIso counts only when the queue record state is merged.
+    const listed = [
+      {
+        ...template,
+        pullRequest: 3,
+        headOid: headFor(3),
+        state: 'dropped',
+        mergedAtIso: '2026-11-05T00:00:00.000Z',
+      },
+      {
+        ...template,
+        pullRequest: 8,
+        headOid: headFor(8),
+        state: 'queued',
+        mergedAtIso: '2026-11-04T00:00:00.000Z',
+      },
+    ];
+    const result = await adapterFor({
+      status: missingStatus(),
+      queue: asQueue(async () => listed),
+      forge: asForge(openForge()),
+    }).readTrainHealthState(healthRequest());
+
+    assertOk(result);
+    expect(result.snapshot.queue).toEqual([
+      {
+        pullRequest: 8,
+        state: 'queued',
+        forgeState: 'open',
+        enqueuedAtIso: template.enqueuedAtIso,
+        attempt: 0,
+      },
+    ]);
+    expect(Object.hasOwn(result.snapshot, 'lastMergedAtIso')).toBe(false);
+  });
+
+  it('reads tick status and the queue against the request deadline after the forge window has passed', async () => {
+    const { records } = await seed([{ pullRequest: 7 }]);
+    const template = records[0];
+    if (template === undefined) {
+      throw new Error('expected a real queue record');
+    }
+    const readStart = '2026-11-01T12:00:00.000Z';
+    const pastWindow = '2026-11-01T12:00:25.000Z';
+    const requestDeadline = '2026-11-01T12:02:00.000Z';
+    // now() order: read start, status budget, queue budget, then each forge budget.
+    // The forge window ends 20s after the read start. From the status budget on,
+    // the clock is past that window, while the request deadline is still minutes
+    // away. Tick and queue take the request deadline; only forge takes the window.
+    let reads = 0;
+    const now = () => {
+      reads += 1;
+      return reads === 1 ? readStart : pastWindow;
+    };
+    const statusRead = vi.fn(async () => ({ status: 'missing' as const }));
+    const listMergeEntries = vi.fn(async (_query: MergeQueueListQuery) => [template]);
+    const readForgeMerge = openForge();
+    const result = await adapterFor({
+      status: asStatus(statusRead),
+      queue: asQueue(listMergeEntries),
+      forge: asForge(readForgeMerge),
+      now,
+    }).readTrainHealthState(healthRequest({ deadlineIso: requestDeadline }));
+
+    assertOk(result);
+    expect(Date.parse(pastWindow)).toBeGreaterThan(
+      Date.parse(effectiveForgeDeadline(readStart, requestDeadline)),
+    );
+    expect(statusRead).toHaveBeenCalledTimes(1);
+    expect(listMergeEntries).toHaveBeenCalledTimes(1);
+    expect(listMergeEntries.mock.calls[0]?.[0]).toEqual({
+      repository: { owner: REPOSITORY.owner, repo: REPOSITORY.repo },
+      deadlineIso: requestDeadline,
+    });
+    expect(readForgeMerge).not.toHaveBeenCalled();
+    expect(result.snapshot.queue).toEqual([
+      {
+        pullRequest: 7,
+        state: 'queued',
+        forgeState: 'unknown',
+        enqueuedAtIso: template.enqueuedAtIso,
+        attempt: 0,
+      },
+    ]);
+  });
 });

@@ -397,7 +397,7 @@ function zipReleaseTests(paths: readonly string[], inspection: unknown): readonl
       return null;
     }
     const length = Object.getOwnPropertyDescriptor(files, 'length')?.value;
-    if (typeof length !== 'number' || length !== paths.length) {
+    if (typeof length !== 'number' || !Number.isSafeInteger(length) || length !== paths.length) {
       return null;
     }
     const reports: ReleaseTestReport[] = [];
@@ -1230,7 +1230,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       ...new Set(SHADOW_ONE_TIME_CRITERIA.flatMap((criterion) => [...SHADOW_ONE_TIME_REQUIREMENTS[criterion].tests])),
     ];
     let releaseTests: readonly ReleaseTestReport[] | null = null;
-    const inspectReleaseFiles = oneTime.releaseStore.inspectReleaseFiles;
+    const inspectReleaseFiles = oneTime.releaseStore.inspectReleaseFiles?.bind(oneTime.releaseStore);
     if (
       releaseSha !== null &&
       SHADOW_RELEASE_SHA_PATTERN.test(releaseSha) &&

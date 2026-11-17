@@ -975,9 +975,14 @@ function attestationLedger(observedDay: string = DAY): ShadowAttestationLedger {
   return ledger as ShadowAttestationLedger;
 }
 
-/** Every required test present under the verified build, never quarantined. */
-function presentReleaseFiles(): { readonly path: string; readonly present: boolean; readonly quarantined: boolean | null }[] {
-  return REQUIRED_TEST_PATHS.map((path) => ({ path, present: true, quarantined: false }));
+/** Every required test present under the verified build, never quarantined.
+ *
+ * SH17's real `files` items are POSITIONAL and carry no `path`, so the fake's
+ * items must not carry one either — the use case zips `files[i]` onto
+ * `paths[i]` itself.
+ */
+function presentReleaseFiles(): { readonly present: boolean; readonly quarantined: boolean | null }[] {
+  return REQUIRED_TEST_PATHS.map(() => ({ present: true, quarantined: false }));
 }
 
 interface OneTimeCalls {
@@ -3212,9 +3217,9 @@ describe('RecordShadowDayUseCase', () => {
     (harness.deps as { releaseSha: () => Promise<string | null> }).releaseSha = async () => 'not-a-sha';
     setOneTime(harness, oneTime);
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
-    // The malformed sha is refused upstream as invalid-request before any
-    // criterion is evaluated — nothing is recorded at all, and the inspector
-    // is never consulted.
+    // The malformed sha is refused by writeDay's verdict write —
+    // `recordShadowVerdicts` rejects the input as invalid-input — so nothing
+    // is recorded at all and the inspector is never consulted.
     expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     expect(harness.evidence.stored).toBeNull();
     expect(oneTime.calls.inspect).toBe(0);
@@ -3289,7 +3294,7 @@ describe('RecordShadowDayUseCase', () => {
     });
     const cases: unknown[] = [
       { outcome: 'read', files: 'nope' },
-      { outcome: 'read', files: [{ path: 'x', present: true, quarantined: false }] },
+      { outcome: 'read', files: [{ present: true, quarantined: false }] },
       { outcome: 'read', files: [null, null, null] },
       { outcome: 'read', files: [nonPlainItem, nonPlainItem, nonPlainItem] },
       { outcome: 'read', files: [getterItem, getterItem, getterItem] },
@@ -3316,9 +3321,9 @@ describe('RecordShadowDayUseCase', () => {
       inspect: () => ({
         outcome: 'read',
         files: [
-          { path: REQUIRED_TEST_PATHS[0], present: false, quarantined: false },
-          { path: REQUIRED_TEST_PATHS[1], present: true, quarantined: true },
-          { path: REQUIRED_TEST_PATHS[2], present: true, quarantined: null },
+          { present: false, quarantined: false },
+          { present: true, quarantined: true },
+          { present: true, quarantined: null },
         ],
       }),
     });
@@ -3418,6 +3423,10 @@ describe('RecordShadowDayUseCase', () => {
         expect(dayRecord.verdicts[criterion]?.verdict).toBe('pass');
       }
     }
+    // No already-passed shortcut also means the sources were read again:
+    // one store read and one release inspection per recorded day.
+    expect(oneTime.calls.read).toBe(2);
+    expect(oneTime.calls.inspect).toBe(2);
   });
 
   it('keeps S1, S4, S5, S6, S7, S8, S9 and S12 digests byte-identical whether oneTime is present or absent', async () => {
@@ -3442,5 +3451,215 @@ describe('RecordShadowDayUseCase', () => {
     for (const criterion of ['S1', 'S4', 'S5', 'S6', 'S7', 'S8', 'S9', 'S12'] as const) {
       expect(withDay?.verdicts[criterion]?.digest).toBe(withoutDay?.verdicts[criterion]?.digest);
     }
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) when files is too LONG, array-like but not an array, or the outcome is not read despite valid files', async () => {
+    const present = presentReleaseFiles();
+    const arrayLike = {
+      length: present.length,
+      ...Object.fromEntries(present.map((item, index) => [String(index), item])),
+    };
+    const cases: unknown[] = [
+      // One extra item: a too-long array must be refused exactly like a too-short one.
+      { outcome: 'read', files: [...present, { present: true, quarantined: false }] },
+      // Array-like ({length, 0, 1, ...}) that is not a real array is refused.
+      { outcome: 'read', files: arrayLike },
+      // A non-'read' outcome carrying valid-looking files is refused.
+      { outcome: 'unreadable', files: present },
+    ];
+    for (const inspectResult of cases) {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }), inspect: () => inspectResult });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('release-tree-unreadable');
+      expect(reasons.get('S10')).toBe('release-tree-unreadable');
+      expect(reasons.get('S11')).toBe('release-tree-unreadable');
+    }
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) when an item is a class instance or a proxy whose own present/quarantined are accessors', async () => {
+    class ReleaseFile {}
+    const classItem = new ReleaseFile();
+    Object.defineProperty(classItem, 'present', { value: true, enumerable: true, writable: true, configurable: true });
+    Object.defineProperty(classItem, 'quarantined', { value: false, enumerable: true, writable: true, configurable: true });
+
+    let getterCalls = 0;
+    const accessorTarget: Record<string, unknown> = {};
+    Object.defineProperty(accessorTarget, 'present', {
+      get() {
+        getterCalls += 1;
+        return true;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(accessorTarget, 'quarantined', {
+      get() {
+        getterCalls += 1;
+        return false;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const proxyItem: unknown = new Proxy(accessorTarget, {});
+
+    const cases: unknown[] = [
+      { outcome: 'read', files: [classItem, classItem, classItem] },
+      { outcome: 'read', files: [proxyItem, proxyItem, proxyItem] },
+    ];
+    for (const inspectResult of cases) {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }), inspect: () => inspectResult });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('release-tree-unreadable');
+      expect(reasons.get('S10')).toBe('release-tree-unreadable');
+      expect(reasons.get('S11')).toBe('release-tree-unreadable');
+      // The proxy's own getters must never have run.
+      expect(getterCalls).toBe(0);
+    }
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) with a getter count of 0 when the outer inspection result is non-plain or its outcome/files are accessors returning valid values', async () => {
+    class InspectionResult {}
+    const nonPlain = new InspectionResult();
+    Object.defineProperty(nonPlain, 'outcome', { value: 'read', enumerable: true, writable: true, configurable: true });
+    Object.defineProperty(nonPlain, 'files', { value: presentReleaseFiles(), enumerable: true, writable: true, configurable: true });
+
+    let getterCalls = 0;
+    const getterBearing: Record<string, unknown> = { outcome: 'read' };
+    Object.defineProperty(getterBearing, 'files', {
+      get() {
+        getterCalls += 1;
+        return presentReleaseFiles();
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    for (const inspectResult of [nonPlain as unknown, getterBearing as unknown]) {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }), inspect: () => inspectResult });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('release-tree-unreadable');
+      expect(reasons.get('S10')).toBe('release-tree-unreadable');
+      expect(reasons.get('S11')).toBe('release-tree-unreadable');
+      // The files getter returned a fully valid list, so only the accessor
+      // guard can explain the refusal — and it must never have run it.
+      expect(getterCalls).toBe(0);
+    }
+  });
+
+  it('reports all four one-time criteria attestations-unreadable when an ok attestation result carries an extra key', async () => {
+    const extraKey = { status: 'ok', ledger: attestationLedger(), extra: 'nope' };
+    const oneTime = makeOneTime({ read: () => extraKey });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('attestations-unreadable');
+    expect(reasons.get('S3')).toBe('attestations-unreadable');
+    expect(reasons.get('S10')).toBe('attestations-unreadable');
+    expect(reasons.get('S11')).toBe('attestations-unreadable');
+  });
+
+  it('never calls inspectReleaseFiles and reports S2, S10, S11 unevaluated (release-tree-unreadable) when the release root is empty', async () => {
+    const oneTime = makeOneTime({ releaseRoot: '   ' });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('release-tree-unreadable');
+    expect(reasons.get('S10')).toBe('release-tree-unreadable');
+    expect(reasons.get('S11')).toBe('release-tree-unreadable');
+    // An empty root is a misconfiguration, never a readable tree: the
+    // inspector must not be consulted at all.
+    expect(oneTime.calls.inspect).toBe(0);
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) when an item carries a non-boolean quarantined flag such as a string', async () => {
+    const oneTime = makeOneTime({
+      read: () => ({ status: 'ok', ledger: attestationLedger() }),
+      inspect: () => ({
+        outcome: 'read',
+        files: presentReleaseFiles().map((item, index) =>
+          index === 0 ? { present: true, quarantined: 'yes' } : item,
+        ),
+      }),
+    });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    // One bad flag poisons the whole zip: releaseTests is null, so every
+    // test-dependent criterion is unevaluated, never partially judged.
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('release-tree-unreadable');
+    expect(reasons.get('S10')).toBe('release-tree-unreadable');
+    expect(reasons.get('S11')).toBe('release-tree-unreadable');
+  });
+
+  it('aborts with deadline-exceeded when the deadline expires during inspectReleaseFiles, fulfilled or rejected', async () => {
+    const run = async (fulfilled: boolean): Promise<void> => {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }) });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const useCase = new RecordShadowDayUseCase(harness.deps);
+      const first = await useCase.execute(makeRequest());
+      expectRecorded(first);
+      const afterFirst = harness.evidence.stored;
+
+      // The clock is still on time when the inspector is called, and advances
+      // past the deadline before its value settles. The call counter keeps
+      // counting, so the test proves the inspector WAS consulted.
+      const inspect = oneTime.calls.inspect;
+      (oneTime.releaseStore as { inspectReleaseFiles: unknown }).inspectReleaseFiles = async () => {
+        oneTime.calls.inspect += 1;
+        harness.setNow(new Date(Date.parse('2026-11-17T12:20:00.000Z') + 60_000).toISOString());
+        if (fulfilled) {
+          return { outcome: 'read', files: presentReleaseFiles() };
+        }
+        throw new Error('release store failed');
+      };
+      const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+      expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+      expect(oneTime.calls.inspect).toBe(inspect + 1);
+      expect(harness.evidence.stored).toEqual(afterFirst);
+    };
+
+    await run(true);
+    await run(false);
   });
 });

@@ -30,7 +30,7 @@ import {
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
 /** Parse `--repository owner/repo`; usage error when absent or malformed. */
-function repositoryFromPayload(p: Payload): { owner: string; repo: string } {
+function repositoryFromPayload(p: Payload, subcommand: string): { owner: string; repo: string } {
   const raw = str(p, 'repository').trim();
   const segments = raw.split('/');
   if (
@@ -43,16 +43,21 @@ function repositoryFromPayload(p: Payload): { owner: string; repo: string } {
     segments[1] === '.' ||
     segments[1] === '..'
   ) {
-    throw new CliUsageError('cutover shadow report requires --repository as owner/repo');
+    throw new CliUsageError(`cutover shadow ${subcommand} requires --repository as owner/repo`);
   }
   return { owner: segments[0], repo: segments[1] };
 }
 
 /** Usage error for a flag or positional the subcommand does not take; the value is never echoed. */
-function rejectUnexpectedInput(p: Payload, subcommand: string, allowed: readonly string[]): void {
+function rejectUnexpectedInput(
+  p: Payload,
+  subcommand: string,
+  allowed: readonly string[],
+  allowedPositionals = 0,
+): void {
   for (const key of Object.keys(p)) {
     if (key === 'positional') {
-      if (Array.isArray(p[key]) && p[key].length > 0) {
+      if (Array.isArray(p[key]) && p[key].length > allowedPositionals) {
         throw new CliUsageError(`cutover ${subcommand} takes no positional arguments`);
       }
     } else if (!allowed.includes(key)) {
@@ -112,6 +117,46 @@ function relaunchPlanDigestFlag(p: Payload): string {
 
 type CutoverRuntime = Parameters<CommandHandler>[1];
 
+/**
+ * The optional `--day YYYY-MM-DD` flag. Only the syntax is checked here: the
+ * use case owns the day's meaning (too early, too old, ordering), so this
+ * wiring never re-validates a well-formed day.
+ */
+function optionalDayFlag(p: Payload): string | undefined {
+  const value = p['day'];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new CliUsageError('--day requires a value');
+  }
+  return value;
+}
+
+/**
+ * SH8a: `cutover shadow record-day`. The flags are the report's two plus an
+ * optional `--day`; anything else is a usage error. Without a durable state
+ * directory the composed use case is undefined and the command refuses with
+ * `state-dir-required`; otherwise the use case's result is returned UNCHANGED
+ * — `recorded` and `unchanged` complete (0), every other outcome exits 1.
+ */
+async function recordShadowDayHandler(payload: Payload, runtime: CutoverRuntime): Promise<unknown> {
+  rejectUnexpectedInput(payload, 'shadow record-day', ['repository', 'legacyStateDir', 'day'], 1);
+  const repository = repositoryFromPayload(payload, 'record-day');
+  const stateDir = str(payload, 'legacyStateDir').trim();
+  if (stateDir === '') {
+    throw new CliUsageError('cutover shadow record-day requires --legacy-state-dir');
+  }
+  const day = optionalDayFlag(payload);
+  const recordShadowDay = runtime.execution.recordShadowDay;
+  if (recordShadowDay === undefined) {
+    return { outcome: 'refused', reason: 'state-dir-required' };
+  }
+  return recordShadowDay.execute({
+    repository,
+    legacyStateDir: stateDir,
+    ...(day === undefined ? {} : { day }),
+  });
+}
+
 /** Reads the shared flags of a revisioned move and runs it; the use case result is returned unchanged. */
 async function executeMove(
   payload: Payload,
@@ -170,10 +215,17 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
 
   shadow: async (payload, runtime) => {
     const sub = firstPositional(payload);
-    if (sub !== 'report') {
-      throw new CliUsageError('cutover shadow requires the report subcommand: fleet-v2 cutover shadow report');
+    if (sub !== 'report' && sub !== 'record-day') {
+      throw new CliUsageError(
+        sub === ''
+          ? 'cutover shadow requires the report subcommand: fleet-v2 cutover shadow report'
+          : 'cutover shadow has no such subcommand: the two shadow subcommands are report and record-day',
+      );
     }
-    const repository = repositoryFromPayload(payload);
+    if (sub === 'record-day') {
+      return recordShadowDayHandler(payload, runtime);
+    }
+    const repository = repositoryFromPayload(payload, 'report');
     const stateDir = str(payload, 'legacyStateDir').trim();
     if (stateDir === '') {
       throw new CliUsageError('cutover shadow report requires --legacy-state-dir');

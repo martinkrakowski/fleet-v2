@@ -82,6 +82,34 @@ function plantGetter(target: object, key: string, value: unknown): () => number 
   return () => calls;
 }
 
+/**
+ * A dense array one longer than `SHADOW_ATTESTATION_FACTS`. Index 1 is an
+ * enumerable getter. Index 0 counts `getPrototypeOf`: element reads use
+ * property descriptors, so that getter stays 0 even when the array is walked,
+ * and this counter stays 0 only when the length cap returns first.
+ */
+function overCapAttestations(): {
+  readonly attestations: unknown[];
+  readonly getterCalls: () => number;
+  readonly elementReads: () => number;
+} {
+  let elementReads = 0;
+  const attestations: unknown[] = [
+    new Proxy(rawAttestation(), {
+      getPrototypeOf(target) {
+        elementReads += 1;
+        return Reflect.getPrototypeOf(target);
+      },
+    }),
+  ];
+  const limit = SHADOW_ATTESTATION_FACTS.length + 1;
+  for (let index = attestations.length; index < limit; index += 1) {
+    attestations.push(rawAttestation());
+  }
+  const getterCalls = plantGetter(attestations, '1', rawAttestation());
+  return { attestations, getterCalls, elementReads: () => elementReads };
+}
+
 function pollutedAttestation(key: string): unknown {
   return JSON.parse(
     `{"fact":"${FORGE}","observedDay":"${D1}","releaseSha":null,"reason":"ok","digest":"${DIGEST}","recordedAtIso":"${RECORDED_AT}","${key}":{"polluted":true}}`,
@@ -270,6 +298,36 @@ describe('shadow attestation ledger (SH15a)', () => {
       expect(gets).toBe(0);
     });
 
+    it('refuses an Array subclass attestations list holding valid entries with invalid-ledger', () => {
+      class Sub extends Array<Record<string, unknown>> {}
+      const attestations = Sub.from([rawAttestation()]);
+      expect(attestations).toBeInstanceOf(Sub);
+      expect(attestations).toHaveLength(1);
+      expectReadFailure(ledgerWith(attestations), 'invalid-ledger');
+    });
+
+    it('refuses a null-prototype attestations array holding valid entries with invalid-ledger', () => {
+      const attestations = Object.setPrototypeOf([rawAttestation()], null);
+      expect(Object.getPrototypeOf(attestations)).toBeNull();
+      expect(attestations).toHaveLength(1);
+      expectReadFailure(ledgerWith(attestations), 'invalid-ledger');
+    });
+
+    it('a Proxy over a valid attestations array yields exactly the plain data and runs no get trap', () => {
+      const valid = [rawAttestation()];
+      const plain = readShadowAttestations(ledgerWith(valid));
+      expect(readShadowAttestations(ledgerWith(new Proxy([...valid], {})))).toEqual(plain);
+      let gets = 0;
+      const counted = new Proxy([...valid], {
+        get(target, property, receiver) {
+          gets += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      expect(readShadowAttestations(ledgerWith(counted))).toEqual(plain);
+      expect(gets).toBe(0);
+    });
+
     it('refuses a Proxy whose ownKeys trap throws with invalid-ledger', () => {
       const proxy = new Proxy(ledgerWith([]), {
         ownKeys() {
@@ -386,6 +444,15 @@ describe('shadow attestation ledger (SH15a)', () => {
         'invalid-ledger',
       );
       expect(calls()).toBe(0);
+    });
+
+    it('refuses an attestations array over the cap before any element is read with invalid-ledger', () => {
+      const over = overCapAttestations();
+      expect(over.attestations.length).toBe(SHADOW_ATTESTATION_FACTS.length + 1);
+      expect(Object.keys(over.attestations)).toHaveLength(over.attestations.length);
+      expectReadFailure(ledgerWith(over.attestations), 'invalid-ledger');
+      expect(over.getterCalls()).toBe(0);
+      expect(over.elementReads()).toBe(0);
     });
   });
 
@@ -575,6 +642,19 @@ describe('shadow attestation ledger (SH15a)', () => {
       const calls = plantGetter(sparse, '0', rawAttestation());
       expectWriteFailure(ledgerWith(sparse), rawAttestation(), 'invalid-ledger');
       expect(calls()).toBe(0);
+    });
+
+    it('refuses a stored ledger whose attestations array is over the cap before any element is read with invalid-ledger', () => {
+      const over = overCapAttestations();
+      expect(over.attestations.length).toBe(SHADOW_ATTESTATION_FACTS.length + 1);
+      expect(Object.keys(over.attestations)).toHaveLength(over.attestations.length);
+      expectWriteFailure(
+        ledgerWith(over.attestations),
+        rawAttestation({ fact: WAKE, observedDay: D2 }),
+        'invalid-ledger',
+      );
+      expect(over.getterCalls()).toBe(0);
+      expect(over.elementReads()).toBe(0);
     });
 
     it('never runs a getter on the ledger root and refuses it with invalid-ledger', () => {

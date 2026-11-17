@@ -611,7 +611,14 @@ export function watchdogRepositoryReport(repoDigest: unknown, answer: unknown): 
     const report: WatchdogRepositoryReport = {
       repoDigest: safeDigest,
       outcome,
-      exitCode: outcome === 'evaluated' && ownValue(answer, 'exitCode') === 0 ? 0 : 1,
+      // Exit 0 requires ALL of: evaluated, own exitCode 0, healthy true, zero findings.
+      exitCode:
+        outcome === 'evaluated' &&
+        ownValue(answer, 'exitCode') === 0 &&
+        ownValue(answer, 'healthy') === true &&
+        findings.length === 0
+          ? 0
+          : 1,
       findings,
       raised: nonNegInt(ownValue(answer, 'raised')),
       cleared: nonNegInt(ownValue(answer, 'cleared')),

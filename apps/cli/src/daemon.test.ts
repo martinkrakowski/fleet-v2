@@ -911,15 +911,16 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     } as unknown as FleetCliRuntime;
   }
 
+  /** The healthy fixture: zero findings, so exit 0 requires nothing else. */
   const VALID_ANSWER = {
     outcome: 'evaluated',
     exitCode: 0,
     healthy: true,
-    findings: [{ rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 7 }],
+    findings: [] as Array<{ rule: string; key: string; pullRequest: number | null }>,
     unknownForgeStates: 0,
     truncated: false,
     queueOverflow: false,
-    raised: 1,
+    raised: 0,
     cleared: 0,
     attentionFailures: 0,
     budgetExhausted: false,
@@ -929,13 +930,16 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     announceUnspoken: 0,
   };
 
+  /** The unhealthy fixture: evaluated but the train is not healthy. */
+  const UNHEALTHY_ANSWER = { ...VALID_ANSWER, healthy: false, exitCode: 1 as number };
+
   const EXPECTED_EVALUATED = {
     repoDigest: 'd0',
     outcome: 'evaluated',
     exitCode: 0,
     healthy: true,
-    findings: [{ rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 7 }],
-    raised: 1,
+    findings: [],
+    raised: 0,
     cleared: 0,
     attentionFailures: 0,
   };
@@ -975,15 +979,35 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
   });
 
   it('(h) without a durable state directory refuses with exit 2 before reading the clock or the policy', async () => {
-    const runtime = createFleetCliRuntime({
+    let clockCalls = 0;
+    let policyCalls = 0;
+    const base = createFleetCliRuntime({
       installation: installation([REPO_A]),
       forgeGhRunner: ghStub().run,
       daemonNow: () => new Date().toISOString(),
     });
+    const runtime: FleetCliRuntime = {
+      ...base,
+      daemon: {
+        ...base.daemon,
+        now: () => {
+          clockCalls += 1;
+          return base.daemon.now();
+        },
+        mergePolicy: {
+          readMergePolicy: () => {
+            policyCalls += 1;
+            return base.daemon.mergePolicy.readMergePolicy();
+          },
+        },
+      },
+    };
     const answer = await run(runtime, ['daemon', 'watchdog']);
     expect(answer.code).toBe(2);
     expect(answer.err).toContain('daemon watchdog needs a durable state directory');
     expect(answer.err).toContain(DAEMON_HELP);
+    expect(clockCalls, 'the clock must not be read').toBe(0);
+    expect(policyCalls, 'the policy must not be read').toBe(0);
   });
 
   it('(i) refuses with policy-invalid and exit 1 when the merge policy is unknown and never echoes the installation path', async () => {
@@ -1027,14 +1051,21 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
   });
 
   it('a throwing or invalid clock refuses with invalid-clock and exit 1 before any watch runs', async () => {
-    const h = harness([REPO_A], { daemonNow: () => 'not-a-time' });
     let watched = 0;
-    const answer = await run(withWatch(h, async () => {
-      watched += 1;
-      return null;
-    }), ['daemon', 'watchdog']);
-    expect(answer.code).toBe(1);
-    expect(lastJson(answer.out)).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' });
+    for (const brokenNow of [
+      () => 'not-a-time',
+      () => {
+        throw new Error(`clock exploded at ${new Date().toISOString()}`);
+      },
+    ]) {
+      const h = harness([REPO_A], { daemonNow: brokenNow });
+      const answer = await run(withWatch(h, async () => {
+        watched += 1;
+        return null;
+      }), ['daemon', 'watchdog']);
+      expect(answer.code, String(brokenNow)).toBe(1);
+      expect(lastJson(answer.out), String(brokenNow)).toEqual({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' });
+    }
     expect(watched).toBe(0);
   });
 
@@ -1156,7 +1187,88 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
         exitCode: 1,
         healthy: false,
         findings: [{ rule: 'unknown', key: 'train-health:unknown', pullRequest: null }],
-        raised: 1,
+        raised: 0,
+        cleared: 0,
+        attentionFailures: 0,
+      },
+    ]);
+  });
+
+  it('an evaluated answer with exitCode 0 but healthy missing exits 1 and prints the unhealthy verdict', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const withoutHealthy = {
+      outcome: 'evaluated',
+      exitCode: 0,
+      findings: [] as Array<{ rule: string; key: string; pullRequest: number | null }>,
+      raised: 0,
+      cleared: 0,
+      attentionFailures: 0,
+    };
+    const answer = await run(withWatch(h, async () => withoutHealthy), ['daemon', 'watchdog']);
+    expect(answer.code).toBe(1);
+    expect(answer.out).toContain(`watchdog ${digestOf(REPO_A)} unhealthy`);
+  });
+
+  it('an evaluated answer with exitCode 0 but healthy false exits 1 and prints the unhealthy verdict', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(withWatch(h, async () => UNHEALTHY_ANSWER), ['daemon', 'watchdog']);
+    expect(answer.code).toBe(1);
+    expect(answer.out).toContain(`watchdog ${digestOf(REPO_A)} unhealthy`);
+  });
+
+  it('a healthy evaluated answer with one finding exits 1 and prints the healthy verdict with the finding key', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(
+      withWatch(h, async () => ({
+        ...VALID_ANSWER,
+        findings: [{ rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 7 }],
+      })),
+      ['daemon', 'watchdog'],
+    );
+    expect(answer.code).toBe(1);
+    expect(answer.out).toContain(`watchdog ${digestOf(REPO_A)} healthy findings=1`);
+    expect(answer.out).toContain('finding train-health:tick-stale');
+  });
+
+  it('an evaluated answer whose own exitCode is missing or non-zero exits 1 even when healthy with zero findings', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const withoutExitCode = { ...VALID_ANSWER } as Partial<typeof VALID_ANSWER>;
+    delete withoutExitCode.exitCode;
+    for (const answer of [withoutExitCode, { ...VALID_ANSWER, exitCode: 3 }]) {
+      const result = await run(withWatch(h, async () => answer), ['daemon', 'watchdog']);
+      expect(result.code, JSON.stringify(answer)).toBe(1);
+      expect(result.out, JSON.stringify(answer)).toContain(`watchdog ${digestOf(REPO_A)} healthy findings=0`);
+    }
+  });
+
+  it('a healthy evaluated answer whose exitCode disagrees (exitCode 1) exits 1', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(withWatch(h, async () => ({ ...VALID_ANSWER, exitCode: 1 })), ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out).repositories).toMatchObject([{ outcome: 'evaluated', exitCode: 1, healthy: true }]);
+  });
+
+  it('a refused answer from the watch feeds the exit-code path and exits 1 with its reason code', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(
+      withWatch(h, async () => ({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' })),
+      ['daemon', 'watchdog', '--json'],
+    );
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out).repositories).toEqual([
+      {
+        repoDigest: digestOf(REPO_A),
+        outcome: 'refused',
+        exitCode: 1,
+        reasonCode: 'invalid-clock',
+        findings: [],
+        raised: 0,
         cleared: 0,
         attentionFailures: 0,
       },
@@ -1201,16 +1313,59 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     refusedLike(watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: arrayLike }), 'd0');
   });
 
-  it('an enormous findings length (2**32 - 1) is refused before any traversal with findings []', () => {
-    const enormous: unknown[] = [];
-    Object.defineProperty(enormous, 'length', { value: 2 ** 32 - 1, enumerable: false, writable: true });
-    Object.defineProperty(enormous, 0, {
+  it('a Proxy reporting its own length descriptor as 2**32 - 1 is refused before any traversal and no element is read', () => {
+    const target: unknown[] = [];
+    Object.defineProperty(target, 'length', { value: 2 ** 32 - 1, enumerable: false, writable: true });
+    Object.defineProperty(target, 0, {
       enumerable: true,
       get() {
         throw new Error('traversal reached a hostile slot');
       },
     });
-    refusedLike(watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: enormous }), 'd0');
+    let getTraps = 0;
+    let elementReads = 0;
+    const proxied = new Proxy(target, {
+      get(t, key) {
+        getTraps += 1;
+        return Reflect.get(t, key);
+      },
+      getOwnPropertyDescriptor(t, key) {
+        if (typeof key === 'string' && /^[0-9]+$/.test(key)) {
+          elementReads += 1;
+        }
+        return Reflect.getOwnPropertyDescriptor(t, key);
+      },
+    });
+    refusedLike(watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: proxied }), 'd0');
+    expect(getTraps, 'no property get may run').toBe(0);
+    expect(elementReads, 'no element may be read').toBe(0);
+  });
+
+  it('exactly 200 findings are accepted and 201 are refused with watch-failed', () => {
+    const finding = (index: number) => ({ rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: index + 1 });
+    const atCap = watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: Array.from({ length: 200 }, (_, i) => finding(i)) });
+    expect(atCap.outcome).toBe('evaluated');
+    expect(atCap.findings.length).toBe(200);
+    refusedLike(
+      watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: Array.from({ length: 201 }, (_, i) => finding(i)) }),
+      'd0',
+    );
+  });
+
+  it('a Proxy-wrapped findings array has its length read only via ownValue: no get of length runs', () => {
+    let lengthGets = 0;
+    const findings = [{ rule: 'tick-stale', key: 'train-health:tick-stale', pullRequest: 1 }];
+    const proxied = new Proxy(findings, {
+      get(target, key) {
+        if (key === 'length') {
+          lengthGets += 1;
+        }
+        return Reflect.get(target, key);
+      },
+    });
+    const report = watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: proxied });
+    expect(report.findings).toEqual(findings);
+    expect(lengthGets, 'length is read through the own-property descriptor, never a get').toBe(0);
   });
 
   it('a getter on the answer root and on a finding item never runs: the call counter stays 0 and the report refuses', () => {
@@ -1238,6 +1393,24 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     const report = watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: [item] });
     expect(report.findings).toEqual([{ rule: 'unknown', key: 'train-health:unknown', pullRequest: null }]);
     expect(itemCalls).toBe(0);
+  });
+
+  it('getters on a finding item rule, key and pullRequest never run and the finding is refused with exit 1', () => {
+    let calls = 0;
+    const item: Record<string, unknown> = {};
+    for (const field of ['rule', 'key', 'pullRequest']) {
+      Object.defineProperty(item, field, {
+        enumerable: true,
+        get() {
+          calls += 1;
+          return field === 'pullRequest' ? 7 : 'train-health:tick-stale';
+        },
+      });
+    }
+    const report = watchdogRepositoryReport('d0', { ...VALID_ANSWER, findings: [item] });
+    expect(calls, 'no finding-item getter may run').toBe(0);
+    expect(report.findings).toEqual([{ rule: 'unknown', key: 'train-health:unknown', pullRequest: null }]);
+    expect(report.exitCode, 'a finding item that cannot be read is refused').toBe(1);
   });
 
   it('a Proxy over a valid answer yields exactly the plain-data result and no get trap runs', () => {
@@ -1315,7 +1488,8 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     expect(report).toMatchObject({
       repoDigest: 'd0',
       outcome: 'evaluated',
-      exitCode: 0,
+      // One finding, so even a healthy answer with exitCode 0 exits 1.
+      exitCode: 1,
       findings: [{ rule: 'tick-stale', key: 'train-health:unknown', pullRequest: null }],
     });
     expect(JSON.stringify(report)).not.toContain('echo-me-not');

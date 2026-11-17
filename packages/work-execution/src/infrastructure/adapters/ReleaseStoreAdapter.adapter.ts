@@ -257,6 +257,21 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       if (!(await takeClaim(names.claim, input.nowIso))) {
         return { outcome: 'busy' };
       }
+      // CO14b fix round 6: round 5's pre-create `.done` check above only guards the
+      // FRESH-create branch at its own starting instant. A second call can still
+      // reach here on the EEXIST/"resumed" branch (existing === opId) after the
+      // first call's `completeOperation` has, in the meantime, renamed this exact
+      // opId's intent to its `.done` marker and released its claim via
+      // `endOperation`'s cleanup — letting this call's own `takeClaim` above
+      // succeed on a claim nothing else holds, and letting it report a "resumed"
+      // grant for an opId whose work is already done. Re-check `.done` for both
+      // branches uniformly, immediately before the final return, and release the
+      // claim this call just took (mirroring `cancelOperation`'s convention) before
+      // reporting it as stale rather than live.
+      if ((await lstatOrNull(names.done(opId))) !== null) {
+        await fs.rm(names.claim, { force: true });
+        return { outcome: 'busy' };
+      }
       return { outcome: started ? 'started' : 'resumed', opId };
     } catch {
       return { outcome: 'unreadable' };

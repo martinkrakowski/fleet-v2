@@ -5,11 +5,12 @@
  * completed operation is never resumed. The driver binding of a root.
  */
 
+import { promises as fs } from 'node:fs';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ReleaseStoreAdapter } from '../ReleaseStoreAdapter.adapter.js';
 
@@ -117,6 +118,63 @@ describe('release operation record', () => {
       expect(await store.peekOperation({ root, action: 'swap', sha: SHA })).toEqual({ outcome: 'none' });
       // A genuinely new opId for the same action and sha, with no `.done`
       // marker of its own, still starts normally.
+      const freshOpId = store.newOperationId();
+      expect(
+        await store.beginOperation({ root, action: 'swap', sha: SHA, opId: freshOpId, nowIso: T_FRESH }),
+      ).toEqual({ outcome: 'started', opId: freshOpId });
+    },
+  );
+
+  it(
+    'CO14b fix round 6: a stale completed opId is refused on the resumed-claim path too, ' +
+      'and its claim is not left orphaned',
+    async () => {
+      const opId = store.newOperationId();
+      const first = await store.beginOperation({ root, action: 'swap', sha: SHA, opId, nowIso: T0 });
+      expect(first).toEqual({ outcome: 'started', opId });
+
+      // Reproduce Luna's round-6 race as a deterministic sequence of awaited
+      // calls, not real concurrency: intercept the one `readFile` of the
+      // intent file that the EEXIST/"resumed" branch below makes to learn the
+      // existing opId (it still names this same opId at that instant, so that
+      // branch is taken), and run the first operation's `completeOperation`
+      // immediately after that read resolves -- the exact window, in the real
+      // race, between a second caller's existing-opId read and its own
+      // `takeClaim`: the intent gets renamed to its `.done` marker and the
+      // first call's claim gets released before this call's `takeClaim` runs.
+      const realReadFile = fs.readFile;
+      let intercepted = false;
+      let completeResult: Awaited<ReturnType<typeof store.completeOperation>> | undefined;
+      const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation(
+        (async (filePath: Parameters<typeof fs.readFile>[0], encoding: Parameters<typeof fs.readFile>[1]) => {
+          const result = await realReadFile(filePath, encoding);
+          if (!intercepted && typeof filePath === 'string' && filePath.endsWith('.intent')) {
+            intercepted = true;
+            completeResult = await store.completeOperation({ root, action: 'swap', sha: SHA, opId });
+          }
+          return result;
+        }) as unknown as typeof fs.readFile,
+      );
+
+      let second: Awaited<ReturnType<typeof store.beginOperation>>;
+      try {
+        second = await store.beginOperation({ root, action: 'swap', sha: SHA, opId, nowIso: T_FRESH });
+      } finally {
+        readFileSpy.mockRestore();
+      }
+
+      expect(intercepted).toBe(true);
+      expect(completeResult).toEqual({ outcome: 'ok' });
+      // Without the round-6 check this would be 'resumed': the intent read
+      // above still named this opId, so the EEXIST branch takes the
+      // started-false path, and `takeClaim` succeeds cleanly because the
+      // first call's own claim was just released by the race above. The
+      // round-6 check catches the now-completed opId and refuses it instead.
+      expect(second).toEqual({ outcome: 'busy' });
+
+      // The claim this call took before being refused was released, not left
+      // orphaned: a fresh opId for the same action and sha can still take the
+      // claim cleanly right away.
       const freshOpId = store.newOperationId();
       expect(
         await store.beginOperation({ root, action: 'swap', sha: SHA, opId: freshOpId, nowIso: T_FRESH }),

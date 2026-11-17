@@ -5,8 +5,10 @@
  * list that optionally persists to `<stateDir>/merge-queue.json` under the
  * shared exclusive lock with an atomic rename, the exact bytes quarantined
  * when the file is unreadable. It never shares another store's file. The
- * adapter mints no ids and computes only the repo digest; deadlines are
- * validated from a fresh clock at check time.
+ * adapter mints no ids and computes only the repo digest. A list keeps every
+ * stored entry when `repository` is omitted, and otherwise keeps entries whose
+ * stored digest matches that repository. Deadlines are validated from a fresh
+ * clock at check time.
  */
 
 import { promises as fs } from 'node:fs';
@@ -82,6 +84,72 @@ export class MergeQueueDeadlineError extends Error {
   }
 }
 
+/** Own keys a list query refuses so they cannot pollute `Object.prototype`. */
+const POLLUTING_OWN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+/** The 12-character repo digest `enqueueMergeEntry` stores and `listMergeEntries` matches. */
+function computeRepoDigest(repository: { readonly owner: string; readonly repo: string }): string {
+  return sha256HexDigest(`${repository.owner}/${repository.repo}`).slice(0, 12);
+}
+
+/**
+ * A plain object whose prototype is `Object.prototype` or `null`.
+ * `getPrototypeOf` is the only prototype read, so a Proxy `get` trap does not run.
+ */
+function isPlainQueryObject(value: unknown): value is object {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** True for an own data property. An accessor is refused so its getter never runs. */
+function isDataDescriptor(descriptor: PropertyDescriptor | undefined): descriptor is PropertyDescriptor {
+  return descriptor !== undefined && descriptor.get === undefined && descriptor.set === undefined;
+}
+
+/**
+ * Refuse a prototype-polluting own key or any accessor. Values are not read:
+ * `Reflect.ownKeys` and `Object.getOwnPropertyDescriptor` do not run getters.
+ */
+function assertNoPollutingKeyOrAccessor(value: object): void {
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key === 'string' && POLLUTING_OWN_KEYS.has(key)) {
+      throw new MergeQueueDeadlineError();
+    }
+    if (!isDataDescriptor(Object.getOwnPropertyDescriptor(value, key))) {
+      throw new MergeQueueDeadlineError();
+    }
+  }
+}
+
+/** An own enumerable string data property that is not empty. */
+function readNonEmptyEnumerableString(value: object, key: string): string {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (
+    !isDataDescriptor(descriptor) ||
+    descriptor.enumerable !== true ||
+    typeof descriptor.value !== 'string' ||
+    descriptor.value.length === 0
+  ) {
+    throw new MergeQueueDeadlineError();
+  }
+  return descriptor.value;
+}
+
+/** `owner` and `repo` from a plain repository object, or a deadline refusal. */
+function readQueryRepository(value: unknown): { readonly owner: string; readonly repo: string } {
+  if (!isPlainQueryObject(value)) {
+    throw new MergeQueueDeadlineError();
+  }
+  assertNoPollutingKeyOrAccessor(value);
+  return {
+    owner: readNonEmptyEnumerableString(value, 'owner'),
+    repo: readNonEmptyEnumerableString(value, 'repo'),
+  };
+}
+
 /** The reader's record parser, shared with `fleet-v2 state check`. Never throws. */
 export function parseMergeQueueStateRecord(raw: unknown): MergeQueueEntryRecord | undefined {
   try {
@@ -136,7 +204,7 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
     if (deadlineRefusal !== null) {
       return deadlineRefusal;
     }
-    const repoDigest = sha256HexDigest(`${command.repository.owner}/${command.repository.repo}`).slice(0, 12);
+    const repoDigest = computeRepoDigest(command.repository);
     const { repository, pullRequest, headOid, tier, enqueuedBy, runId, entryId, successorEntryId, enqueuedAtIso } = command;
     const input: MergeEnqueueInput = {
       repository,
@@ -189,15 +257,67 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
     );
   }
 
+  /**
+   * Entries for `query.repository`, matched on the same 12-character
+   * `repoDigest` `enqueueMergeEntry` stores, or every stored entry when
+   * `repository` is omitted or `undefined`. A non-plain query, a getter, a
+   * prototype-polluting own key, a malformed `repository`, or a deadline that
+   * is not a fresh zoned instant throws `MergeQueueDeadlineError` before the
+   * store is read. Callers read an empty list as nothing queued.
+   * Cost: O(N) in the number of stored entries; O(1) for query shape validation.
+   */
   async listMergeEntries(query: MergeQueueListQuery): Promise<readonly MergeQueueEntryRecord[]> {
-    if (!this.isFreshDeadline(query.deadlineIso)) {
+    const targetDigest = this.readListTargetDigest(query);
+    const target = this.statePath;
+    const entries = target === null ? this.inMemoryEntries : await this.readRecordsFromDisk(target);
+    if (targetDigest === undefined) {
+      return target === null ? [...entries] : entries;
+    }
+    return entries.filter((entry) => entry.repoDigest === targetDigest);
+  }
+
+  /**
+   * The digest to filter by, or `undefined` when the list is unscoped.
+   * Reflective reads sit inside the try so a throwing Proxy trap becomes
+   * `MergeQueueDeadlineError` and never reaches the store.
+   */
+  private readListTargetDigest(query: MergeQueueListQuery): string | undefined {
+    try {
+      return this.readListTargetDigestUnchecked(query);
+    } catch (error: unknown) {
+      if (error instanceof MergeQueueDeadlineError) {
+        throw error;
+      }
       throw new MergeQueueDeadlineError();
     }
-    const target = this.statePath;
-    if (target === null) {
-      return [...this.inMemoryEntries];
+  }
+
+  private readListTargetDigestUnchecked(query: unknown): string | undefined {
+    if (!isPlainQueryObject(query)) {
+      throw new MergeQueueDeadlineError();
     }
-    return this.readRecordsFromDisk(target);
+    assertNoPollutingKeyOrAccessor(query);
+    const deadlineDescriptor = Object.getOwnPropertyDescriptor(query, 'deadlineIso');
+    if (
+      !isDataDescriptor(deadlineDescriptor) ||
+      typeof deadlineDescriptor.value !== 'string' ||
+      !this.isFreshDeadline(deadlineDescriptor.value)
+    ) {
+      throw new MergeQueueDeadlineError();
+    }
+    const repositoryDescriptor = Object.getOwnPropertyDescriptor(query, 'repository');
+    if (repositoryDescriptor === undefined) {
+      return undefined;
+    }
+    if (!isDataDescriptor(repositoryDescriptor)) {
+      throw new MergeQueueDeadlineError();
+    }
+    if (repositoryDescriptor.value === undefined) {
+      return undefined;
+    }
+    const repository = readQueryRepository(repositoryDescriptor.value);
+    const targetDigest = computeRepoDigest(repository);
+    return targetDigest;
   }
 
   /**

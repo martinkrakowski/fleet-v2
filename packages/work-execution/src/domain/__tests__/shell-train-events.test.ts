@@ -19,6 +19,22 @@ function fakeSecretShape(): string {
   return `gh${'p_'}${'A'.repeat(30)}`;
 }
 
+/**
+ * Matches ONLY the canonical `LANE_DIFF_SECRET_PATTERNS` registry's
+ * `github-fine-grained-token` rule (`github_pat_...`) — not any of the
+ * legacy six that `containsSecretShape` scans. The legacy `github-token`
+ * rule is `\bgh[pousr]_[A-Za-z0-9]{20,}\b`, which needs a literal "gh"
+ * substring immediately followed by one of p/o/u/s/r then "_"; the word
+ * "github" has no "gh" substring at all (g-i-t-h-u-b: the "g" and "h" are
+ * never adjacent), so it never matches. Nor does this shape contain any of
+ * the other five legacy shapes (`sk-`, `AKIA`, `xox[abprs]-`, `eyJ...`, a
+ * private-key block). This is deliberately NOT `fakeSecretShape()`, which
+ * matches both registries and so cannot prove the canonical one is wired in.
+ */
+function fakeCanonicalOnlySecretShape(): string {
+  return `github_pat_${'B'.repeat(25)}`;
+}
+
 function eventJson(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
     at: AT,
@@ -238,6 +254,22 @@ describe('parseShellTrainEvents', () => {
     expect(result.unknownLines).toEqual([1]);
     expect(result.secretShapedLines).toBe(1);
     expect(JSON.stringify(result)).not.toContain('A'.repeat(20));
+  });
+
+  it('counts a secret shape that matches ONLY the canonical LANE_DIFF_SECRET_PATTERNS registry, not the legacy six', () => {
+    // fakeSecretShape() (ghp_...) matches BOTH the legacy containsSecretShape
+    // scan and the canonical LANE_DIFF_SECRET_PATTERNS scan, so the test above
+    // would still pass even if the canonical-registry OR were deleted outright
+    // (the legacy scan alone would still catch it). fakeCanonicalOnlySecretShape()
+    // (github_pat_...) matches ONLY the canonical registry's
+    // github-fine-grained-token rule, so removing that OR while leaving the
+    // legacy scan intact would make THIS test fail.
+    const result = parseShellTrainEvents([eventJson(), fakeCanonicalOnlySecretShape()]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.unknownLines).toEqual([1]);
+    expect(result.secretShapedLines).toBe(1);
+    expect(JSON.stringify(result)).not.toContain('B'.repeat(20));
   });
 
   it('counts a secret-shaped line in secretShapedLines even when it is also over the length cap', () => {

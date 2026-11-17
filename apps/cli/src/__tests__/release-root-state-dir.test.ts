@@ -36,9 +36,15 @@ afterEach(async () => {
   await Promise.all(pending.map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-function installationWithDaemonStateDir(stateDir: string): ReleaseDriverConfiguration {
+function installationWithDaemonStateDir(stateDir: string, root?: string): ReleaseDriverConfiguration {
   return {
-    daemon: { stateDir },
+    daemon: {
+      stateDir,
+      // CO14c-1: when the served root is given, the daemon's `cliPath` names
+      // the entry point inside it, so the handler can extract the root
+      // lexically and re-check `--root` against it.
+      ...(root !== undefined ? { cliPath: `${root}/current/apps/cli/dist/bin.js` } : {}),
+    },
   } as ReleaseDriverConfiguration;
 }
 
@@ -69,12 +75,14 @@ describe('release root state directory binding (CO14 follow-up)', () => {
       'and creates nothing under the root',
     async () => {
       const base = await tempDir('co14b-plan-only-base-');
-      // A root that does not exist yet: a bind here would be the first thing to create it.
+      // CO14c-1: the operator pre-creates the release root, so the plan-only
+      // call finds it existing; nothing under it is ever written.
       const root = join(base, 'release-root');
+      await mkdir(root, { recursive: true });
       const stateDir = await tempDir('co14b-plan-only-state-');
       const rt: FleetCliRuntime = createFleetCliRuntime({
         stateDir,
-        installation: installationWithDaemonStateDir(stateDir) as never,
+        installation: installationWithDaemonStateDir(stateDir, root) as never,
       });
       const bindSpy = vi.spyOn(ReleaseStoreAdapter.prototype, 'bindDriver');
       const out: string[] = [];
@@ -89,9 +97,39 @@ describe('release root state directory binding (CO14 follow-up)', () => {
       expect(JSON.parse(out.join('')).outcome).toBe('planned');
       // The early race-protection bind is for an apply only; a plan-only call never reaches it.
       expect(bindSpy).not.toHaveBeenCalled();
-      // No bind means no `fs.mkdir(root, { recursive: true })` and no `.release-driver`
-      // marker: the root itself was never created on disk.
-      await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' });
+      // No bind means no `.release-driver` marker and no build staging: the
+      // pre-created root itself stays empty on disk.
+      expect(await readdir(root)).toEqual([]);
+      bindSpy.mockRestore();
+    },
+  );
+
+  it(
+    'CO14c-1: a nonexistent root is refused before anything is read, built or written, ' +
+      'even on a plan-only call',
+    async () => {
+      const base = await tempDir('co14c-nonexistent-base-');
+      // The operator pre-creates the release root; a missing one is refused at
+      // the CLI pre-check, never created.
+      const root = join(base, 'release-root');
+      const stateDir = await tempDir('co14c-nonexistent-state-');
+      const rt: FleetCliRuntime = createFleetCliRuntime({
+        stateDir,
+        installation: installationWithDaemonStateDir(stateDir, root) as never,
+      });
+      const bindSpy = vi.spyOn(ReleaseStoreAdapter.prototype, 'bindDriver');
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        ['release', 'install', '--root', root, '--sha', SHA, '--source', root],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        rt,
+      );
+      expect(err.join('')).toBe('');
+      expect(code).toBe(1);
+      expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+      expect(bindSpy).not.toHaveBeenCalled();
+      expect(await readdir(base)).toEqual([]);
       bindSpy.mockRestore();
     },
   );
@@ -105,7 +143,7 @@ describe('release root state directory binding (CO14 follow-up)', () => {
       const stateDir = await tempDir('co14b-invalid-root-state-');
       const rt: FleetCliRuntime = createFleetCliRuntime({
         stateDir,
-        installation: installationWithDaemonStateDir(stateDir) as never,
+        installation: installationWithDaemonStateDir(stateDir, base) as never,
       });
       // A literal `..` segment (not resolved away, unlike `path.join`), so
       // `checkable` is false even though the resolved target is harmless.
@@ -154,7 +192,7 @@ describe('release root state directory binding (CO14 follow-up)', () => {
     // serving the root; the process's own state directory is B.
     const rt: FleetCliRuntime = createFleetCliRuntime({
       stateDir: otherStateDir,
-      installation: installationWithDaemonStateDir(servingStateDir) as never,
+      installation: installationWithDaemonStateDir(servingStateDir, root) as never,
     });
     // A live driver lease is held in the serving state directory A.
     const holder = new ConductorDriverLeaseAdapter({ stateDir: servingStateDir });
@@ -198,7 +236,7 @@ describe('release root state directory binding (CO14 follow-up)', () => {
     const before = await readdir(root);
     const rt: FleetCliRuntime = createFleetCliRuntime({
       stateDir: ownDir,
-      installation: installationWithDaemonStateDir(ownDir) as never,
+      installation: installationWithDaemonStateDir(ownDir, root) as never,
     });
     const out: string[] = [];
     const code = await runCli(
@@ -212,7 +250,7 @@ describe('release root state directory binding (CO14 follow-up)', () => {
     // The same root under the driver it is bound to is served: the plan is printed.
     const servedRt: FleetCliRuntime = createFleetCliRuntime({
       stateDir: ownDir,
-      installation: installationWithDaemonStateDir(boundDir) as never,
+      installation: installationWithDaemonStateDir(boundDir, root) as never,
     });
     const planOut: string[] = [];
     await runCli(

@@ -29,6 +29,8 @@ import {
   type ReleaseStorePort,
 } from '@fleet/work-execution';
 
+import { realpath } from 'node:fs/promises';
+
 import { CliUsageError } from './commands/payload.js';
 import type { CommandHandler, Payload } from './commands/payload.js';
 import type { FleetCliRuntime } from './composition.js';
@@ -133,6 +135,34 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     if (stateDir === null) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
     }
+    // CO14c-1: the served root is extracted lexically from the installation's
+    // `daemon.cliPath` (`<root>/current/apps/cli/dist/bin.js`); a missing or
+    // malformed one leaves the served root unknown. Whether the entry point
+    // exists on disk plays no part in the parse itself.
+    const configuredRoot = configuredReleaseRoot(rt.installation as ReleaseDriverConfiguration | undefined);
+    if (configuredRoot === null) {
+      return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+    }
+    const checkable = root.startsWith('/') && !root.split('/').includes('..') && root.length <= 4096;
+    // CO14c-1: `--root` must be the root the daemon actually serves. The
+    // pre-check runs only when the `checkable` predicate holds, so an
+    // uncheckable root (`..` or relative) still falls through to
+    // `parseRequest`'s usage error unchanged. Otherwise `--root` and the
+    // configured root must both exist on disk (any nonexistent root —
+    // including on `install --apply`, since the operator pre-creates the
+    // root — refuses here) and resolve to the same real path: a symlinked
+    // root is accepted only when it resolves to the configured root. The
+    // failure is a typed refusal that never echoes a path.
+    if (checkable) {
+      try {
+        const [realRoot, realConfiguredRoot] = await Promise.all([realpath(root), realpath(configuredRoot)]);
+        if (realRoot !== realConfiguredRoot) {
+          return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+        }
+      } catch {
+        return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
+      }
+    }
     // A root bound to another installation's driver is not served by this one:
     // its lease would be read from the wrong directory, so it is refused
     // here, before anything is read, built or written. A root with no
@@ -140,7 +170,6 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     // (first binding wins) — but NOT here: see the round 8 note below. An
     // unreadable binding is unknown.
     const store = new ReleaseStoreAdapter();
-    const checkable = root.startsWith('/') && !root.split('/').includes('..') && root.length <= 4096;
     const binding = checkable ? await store.readDriverBinding({ root }) : ({ outcome: 'unbound' } as const);
     if (binding.outcome === 'unreadable' || (binding.outcome === 'bound' && binding.stateDir !== stateDir)) {
       return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
@@ -175,8 +204,102 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
 }
 
 export interface ReleaseDriverConfiguration {
-  /** The installation's daemon section, whose `stateDir` names the driver state directory. */
-  readonly daemon?: { readonly stateDir?: string };
+  /**
+   * The installation's daemon section, whose `stateDir` names the driver state
+   * directory and whose `cliPath` is the served CLI entry point, from which
+   * the served release root is extracted lexically (CO14c-1).
+   */
+  readonly daemon?: { readonly stateDir?: string; readonly cliPath?: string };
+}
+
+/** The exact entry suffix a served `daemon.cliPath` must end with (ReleaseStoreAdapter's `CLI_ENTRY`). */
+const CLI_ENTRY_SUFFIX = '/current/apps/cli/dist/bin.js';
+
+/** The named cap on a configured `daemon.cliPath` length; the parser is linear in this. */
+const MAX_CLI_PATH_LENGTH = 4096;
+
+/**
+ * CO14c-1: the typed result of the pure `daemon.cliPath` parser. Refusals carry
+ * the release's named unknown-state-dir reason; success carries the extracted
+ * lexical `<root>` prefix of `<root>/current/apps/cli/dist/bin.js`.
+ */
+export type ConfiguredCliPath =
+  | { readonly outcome: 'ok'; readonly root: string }
+  | { readonly outcome: 'refused'; readonly reason: 'release-root-state-dir-unknown' };
+
+const CLI_PATH_REFUSED: ConfiguredCliPath = { outcome: 'refused', reason: 'release-root-state-dir-unknown' };
+
+/**
+ * CO14c-1: the pure lexical parse of the configured `daemon.cliPath`. It
+ * accepts only a string ending with the exact suffix
+ * `/current/apps/cli/dist/bin.js` (matching `ReleaseStoreAdapter`'s
+ * `CLI_ENTRY`); the configured root is the prefix before that suffix, so a
+ * root that itself contains a `current` segment is unambiguous. The prefix
+ * must be non-empty, absolute, and free of `\0`, empty (`//`), `.` and `..`
+ * segments. Whether the entry point exists on disk is irrelevant here. The
+ * input is taken as `unknown` and never thrown from: anything that is not a
+ * plain string value — a wrong primitive, a non-plain object, a getter or a
+ * `Proxy` (neither ever invoked nor trapped, since the parse reads no
+ * property at all) — refuses. Cost: linear in the capped input, at most
+ * `MAX_CLI_PATH_LENGTH` characters inspected once each; the cap is a named
+ * constant, and an over-cap input refuses before any traversal.
+ */
+export function parseConfiguredCliPath(value: unknown): ConfiguredCliPath {
+  try {
+    if (typeof value !== 'string' || value.length > MAX_CLI_PATH_LENGTH) {
+      return CLI_PATH_REFUSED;
+    }
+    if (!value.endsWith(CLI_ENTRY_SUFFIX)) {
+      return CLI_PATH_REFUSED;
+    }
+    const root = value.slice(0, value.length - CLI_ENTRY_SUFFIX.length);
+    if (!root.startsWith('/') || root.includes('\0')) {
+      return CLI_PATH_REFUSED;
+    }
+    // The leading segment is empty by construction (the prefix starts with
+    // `/`); any other empty segment is a `//`, and `.` / `..` segments are
+    // refused so the lexical prefix is the literal root.
+    const segments = root.split('/');
+    for (let index = 1; index < segments.length; index += 1) {
+      const segment = segments[index];
+      if (segment === '' || segment === '.' || segment === '..') {
+        return CLI_PATH_REFUSED;
+      }
+    }
+    return { outcome: 'ok', root };
+  } catch {
+    return CLI_PATH_REFUSED;
+  }
+}
+
+/**
+ * CO14c-1: the configured release root, read from the installation's
+ * `daemon.cliPath` through own data-property descriptors only (matching
+ * `resolveRootStateDir`'s descriptor checks on `configuration` and `daemon`,
+ * so a getter or a `Proxy` trap is never invoked). `null` when the
+ * configuration is missing or hostile or the `cliPath` fails the lexical
+ * parse. No filesystem access of its own.
+ */
+function configuredReleaseRoot(configuration: ReleaseDriverConfiguration | undefined): string | null {
+  try {
+    const configurationDescriptor =
+      typeof configuration === 'object' && configuration !== null
+        ? Object.getOwnPropertyDescriptor(configuration, 'daemon')
+        : undefined;
+    const daemon =
+      configurationDescriptor !== undefined && !configurationDescriptor.get && !configurationDescriptor.set
+        ? configurationDescriptor.value
+        : undefined;
+    if (typeof daemon !== 'object' || daemon === null) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(daemon, 'cliPath');
+    const value = descriptor !== undefined && !descriptor.get && !descriptor.set ? descriptor.value : undefined;
+    const parsed = parseConfiguredCliPath(value);
+    return parsed.outcome === 'ok' ? parsed.root : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

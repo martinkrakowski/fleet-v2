@@ -124,6 +124,7 @@ import {
   ResumeLaneRunUseCase,
   type ProjectProfileReadPort,
   type AttemptRecord,
+  type AttemptReviewLocator,
   type ExecutionRunnerHost,
   type EvaluateAttemptGatePort,
   type EnqueueMergeUseCase,
@@ -688,6 +689,11 @@ function runGitCommand(args: readonly string[]): Promise<string> {
 export interface FleetCliRuntime {
   /** The parsed installation the runtime was composed with, if any. */
   readonly installation?: FleetInstallation;
+  /**
+   * Locates the worktree a review reads. A `brief:<projectId>:<digest>` id
+   * resolves to the one recorded attempt for that brief (CO18a3b).
+   */
+  readonly reviewLocator: AttemptReviewLocator;
   /** DT10b: the daemon stores, tick and status use cases, pause port and forge probe. */
   readonly daemon: ComposedDaemon;
   readonly coordination: {
@@ -1389,8 +1395,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     nowIso: daemon.now,
   });
 
+  const reviewLocator = reviewLocatorRef.locator;
+  if (reviewLocator === undefined) {
+    throw new Error('The work context is not wired for review location');
+  }
+
   return {
     installation: options?.installation,
+    reviewLocator,
     daemon,
     coordination,
     knowledge,

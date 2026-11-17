@@ -148,6 +148,14 @@ function briefRequest(overrides: Partial<ReviewRequest> = {}): ReviewRequest {
   };
 }
 
+/** Attempt id is `attemptIdForBrief` of this digest, so a bad digest is refused by the format check alone. */
+function briefRequestForDigest(briefPackageDigest: string): ReviewRequest {
+  return briefRequest({
+    attemptId: attemptIdForBrief(PROJECT, briefPackageDigest),
+    subject: briefSubject({ briefPackageDigest }),
+  });
+}
+
 function forProject(projectId: string, overrides: Partial<ReviewRequest> = {}): ReviewRequest {
   return briefRequest({
     projectId,
@@ -647,6 +655,17 @@ describe('brief-verify invalid-request', () => {
     await refused(request);
   });
 
+  it.each([
+    ['an uppercase brief digest', 'AB'.repeat(32)],
+    ['a wrong-length brief digest', 'ab'.repeat(31)],
+    ['a non-hex brief digest', 'g'.repeat(64)],
+  ])(
+    'requestReview refuses %s with invalid-request and calls no delegate when its attempt id is attemptIdForBrief of that digest',
+    async (_label, digest) => {
+      await refused(briefRequestForDigest(digest));
+    },
+  );
+
   it('refuses a multi-megabyte briefText with invalid-request, the same code as an over-size brief', async () => {
     const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
     const adapter = new ReviewRequestAdapter({ requestIndependentReview });
@@ -869,6 +888,25 @@ describe('brief delegate configuration and failures', () => {
     const adapter = new ReviewRequestAdapter({ inspectAcceptanceEvidence });
     expect(await adapter.findReviewReceipt(briefFind())).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
     expect(await adapter.findLatestReceiptOfKind(briefLatest())).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
+  });
+
+  it('findReviewReceipt returns unavailable unreadable and does not throw when the inspection outcome getter throws', async () => {
+    let invoked = false;
+    const inspected = {
+      outcome: 'found' as const,
+      assessment: briefAssessment([briefReceipt()]),
+    };
+    Object.defineProperty(inspected, 'outcome', {
+      enumerable: true,
+      get() {
+        invoked = true;
+        throw new Error('boom');
+      },
+    });
+    const inspectAcceptanceEvidence = async (): Promise<InspectAcceptanceEvidenceResult> => inspected;
+    const result = await new ReviewRequestAdapter({ inspectAcceptanceEvidence }).findReviewReceipt(briefFind());
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'unreadable' });
+    expect(invoked).toBe(true);
   });
 
   it.each([

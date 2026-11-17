@@ -116,6 +116,7 @@ describe('RecordAttentionItemUseCase', () => {
         clearance: null,
       }),
       revision: 1,
+      previousRaisedAtIso: null,
     });
     expect(i.calls).toBe(1);
     const stored = await repo.get('att-example-1');
@@ -143,6 +144,7 @@ describe('RecordAttentionItemUseCase', () => {
         state: 'open',
       }),
       revision: 2,
+      previousRaisedAtIso: NOW_ISO,
     });
     expect(i.calls).toBe(2);
     expect(await repo.list()).toHaveLength(1);
@@ -173,6 +175,7 @@ describe('RecordAttentionItemUseCase', () => {
         clearance: null,
       }),
       revision: 3,
+      previousRaisedAtIso: NOW_ISO,
     });
     expect(await repo.list()).toHaveLength(1);
   });
@@ -297,6 +300,7 @@ describe('RecordAttentionItemUseCase', () => {
       outcome: 'refreshed',
       item: expect.objectContaining({ itemId: 'att-direct-1' }),
       revision: 2,
+      previousRaisedAtIso: NOW_ISO,
     });
     expect(lookups).toBe(2);
     expect(await real.list()).toHaveLength(1);
@@ -371,6 +375,7 @@ describe('RecordAttentionItemUseCase', () => {
         raisedCount: 2,
       }),
       revision: 2,
+      previousRaisedAtIso: NOW_ISO,
     });
 
     const stored = await repo.get('att-example-1');

@@ -62,6 +62,11 @@ const RELEASE_INSPECT_MAX_PATH_LENGTH = 256;
 /** No leading slash, no `.` or `..` segment, no backslash. */
 const RELEASE_INSPECT_PATH_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]*(\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/;
 const RELEASE_INSPECT_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
+/**
+ * One `FileHandle.read` may return fewer bytes than this. The inspect loop
+ * keeps reading until EOF or until the byte cap is passed.
+ */
+const RELEASE_INSPECT_READ_CHUNK = 65_536;
 const INSPECT_INPUT_KEYS = ['root', 'sha', 'paths'] as const;
 const CURRENT_NAME = 'current';
 /** The temp link name an interrupted repoint can leave behind (CO14 follow-up). */
@@ -1081,7 +1086,7 @@ async function inspectOneReleaseFileUnchecked(
   if (containment !== 'inside') {
     return unjudgeableFact();
   }
-  return readReleaseFileBounded(target);
+  return readReleaseFileBounded(target, buildReal);
 }
 
 /** Constant time aside from one `lstat`. `ENOTDIR` is absence; `lstatOrNull` rethrows it. */
@@ -1135,9 +1140,10 @@ function staysWithin(rootReal: string, candidateReal: string): boolean {
 /**
  * Read one regular file through an `O_NOFOLLOW` handle. Cost is linear in the
  * capped byte count (`RELEASE_INSPECT_MAX_FILE_BYTES`). The handle is closed
- * before this returns.
+ * before this returns. The opened descriptor is accepted only when it still
+ * names the same inode inside the build (`openedFileMatchesPath`).
  */
-async function readReleaseFileBounded(target: string): Promise<ReleaseFileFact> {
+async function readReleaseFileBounded(target: string, buildReal: string): Promise<ReleaseFileFact> {
   let handle: FileHandle;
   try {
     handle = await fs.open(target, RELEASE_INSPECT_OPEN_FLAGS);
@@ -1145,7 +1151,7 @@ async function readReleaseFileBounded(target: string): Promise<ReleaseFileFact> 
     return isMissingErrno(error) ? absentFact() : unjudgeableFact();
   }
   try {
-    return await readHandleFact(handle);
+    return await readHandleFact(handle, target, buildReal);
   } catch {
     return unjudgeableFact();
   } finally {
@@ -1153,10 +1159,19 @@ async function readReleaseFileBounded(target: string): Promise<ReleaseFileFact> 
   }
 }
 
-/** Linear in the capped byte count. A file over the cap is not read. */
-async function readHandleFact(handle: FileHandle): Promise<ReleaseFileFact> {
-  const stat = await handle.stat();
-  if (!stat.isFile() || stat.size > RELEASE_INSPECT_MAX_FILE_BYTES) {
+/**
+ * Linear in the capped byte count. A file over the cap is not read. A handle
+ * that is not the inode just resolved under the build is unjudgeable.
+ */
+async function readHandleFact(handle: FileHandle, target: string, buildReal: string): Promise<ReleaseFileFact> {
+  const opened = await handle.stat();
+  if (!opened.isFile()) {
+    return unjudgeableFact();
+  }
+  if (!(await openedFileMatchesPath(target, buildReal, opened))) {
+    return unjudgeableFact();
+  }
+  if (opened.size > RELEASE_INSPECT_MAX_FILE_BYTES) {
     return unjudgeableFact();
   }
   const text = await readCappedText(handle);
@@ -1166,15 +1181,53 @@ async function readHandleFact(handle: FileHandle): Promise<ReleaseFileFact> {
   return { present: true, quarantined: text.includes(RELEASE_QUARANTINE_MARKER) };
 }
 
-/** Linear in the capped byte count. More than `RELEASE_INSPECT_MAX_FILE_BYTES` is unjudgeable. */
+/**
+ * Parent-swap race. `O_NOFOLLOW` guards only the final component, so a parent
+ * directory replaced by a symlink between the earlier `realpath` and `fs.open`
+ * lets this handle read a file outside the build. Re-resolve the requested
+ * path, require it still inside the verified build (the same `staysWithin`
+ * rule), and require `lstat` of that real path to be a regular file with the
+ * same inode identity (`dev` and `ino`) as `opened`. Any mismatch or error
+ * refuses the handle. Cost is constant aside from one `realpath` and one `lstat`.
+ */
+async function openedFileMatchesPath(target: string, buildReal: string, opened: Stats): Promise<boolean> {
+  try {
+    const resolved = await fs.realpath(target);
+    if (!staysWithin(buildReal, resolved)) {
+      return false;
+    }
+    const located = await fs.lstat(resolved);
+    if (!located.isFile()) {
+      return false;
+    }
+    return located.dev === opened.dev && located.ino === opened.ino;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Linear in the capped byte count. More than `RELEASE_INSPECT_MAX_FILE_BYTES`
+ * is unjudgeable. One `read` may return fewer bytes than requested, so this
+ * accumulates until EOF (`bytesRead === 0`) or until `cap + 1` bytes are in
+ * hand, then judges exactly the bytes read.
+ */
 async function readCappedText(handle: FileHandle): Promise<string | null> {
   const cap = RELEASE_INSPECT_MAX_FILE_BYTES;
   const buffer = Buffer.alloc(cap + 1);
-  const { bytesRead } = await handle.read(buffer, 0, cap + 1, 0);
-  if (bytesRead > cap) {
+  let filled = 0;
+  while (filled <= cap) {
+    const want = Math.min(RELEASE_INSPECT_READ_CHUNK, cap + 1 - filled);
+    const { bytesRead } = await handle.read(buffer, filled, want, filled);
+    if (bytesRead === 0) {
+      break;
+    }
+    filled += bytesRead;
+  }
+  if (filled > cap) {
     return null;
   }
-  return buffer.toString('utf8', 0, bytesRead);
+  return buffer.toString('utf8', 0, filled);
 }
 
 /** Constant time. `ENOENT` and `ENOTDIR` mean the path is not present. */

@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ReleaseStoreAdapter } from './ReleaseStoreAdapter.adapter.js';
 
@@ -146,6 +146,93 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
       outcome: 'read',
       files: [{ present: true, quarantined: null }],
     });
+  });
+
+  it('does not report an outside file as clean when its directory is swapped for a symlink between the check and the open', async () => {
+    const clean = 'assert.equal(1, 1)\n';
+    expect(clean.includes('quarantined')).toBe(false);
+    const outside = path.join(tempDir, 'outside');
+    await fs.mkdir(outside);
+    await fs.writeFile(path.join(outside, 'file.test.ts'), clean);
+    const { sha: id, buildDir } = await verifiedWith({ 'dir/file.test.ts': 'quarantined(\n' });
+    const parent = path.join(buildDir, 'dir');
+    const realpath = fs.realpath.bind(fs);
+    let swapped = false;
+    const spy = vi.spyOn(fs, 'realpath').mockImplementation(async (candidate: Parameters<typeof fs.realpath>[0]) => {
+      const resolved = await realpath(candidate);
+      if (!swapped && typeof candidate === 'string' && path.resolve(candidate) === path.resolve(parent)) {
+        swapped = true;
+        await fs.rm(parent, { recursive: true, force: true });
+        await fs.symlink(outside, parent);
+      }
+      return resolved;
+    });
+    try {
+      // The open follows the swapped parent. The outside file has no marker, so
+      // accepting those bytes would report quarantined: false. The re-check must
+      // refuse it (null). The in-build file contains the marker, so a missed swap
+      // would report true instead of null.
+      expect(await adapter.inspectReleaseFiles({ root, sha: id, paths: ['dir/file.test.ts'] })).toEqual({
+        outcome: 'read',
+        files: [{ present: true, quarantined: null }],
+      });
+      expect(swapped).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('reports unjudgeable when the opened handle inode differs from the re-resolved path', async () => {
+    const clean = 'assert.equal(1, 1)\n';
+    expect(clean.includes('quarantined')).toBe(false);
+    const { sha: id, buildDir } = await verifiedWith({ 'plain.test.ts': clean });
+    const target = path.join(buildDir, 'plain.test.ts');
+    const realOpen = fs.open.bind(fs);
+    const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await realOpen(...args);
+      if (path.resolve(String(args[0])) !== path.resolve(target)) {
+        return handle;
+      }
+      return shiftedIno(handle);
+    });
+    try {
+      // Path stays inside the build and the bytes are clean. Dropping the
+      // dev/ino comparison would report quarantined: false.
+      expect(await adapter.inspectReleaseFiles({ root, sha: id, paths: ['plain.test.ts'] })).toEqual({
+        outcome: 'read',
+        files: [{ present: true, quarantined: null }],
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('reports quarantined when the marker appears after the first short read', async () => {
+    const firstChunk = 'x'.repeat(8);
+    const marker = 'quarantined';
+    expect(firstChunk.includes(marker)).toBe(false);
+    const body = `${firstChunk}${marker}\n`;
+    expect(Buffer.byteLength(body)).toBeLessThan(MAX_FILE_BYTES);
+    const { sha: id, buildDir } = await verifiedWith({ 'late.test.ts': body });
+    const target = path.join(buildDir, 'late.test.ts');
+    const realOpen = fs.open.bind(fs);
+    const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await realOpen(...args);
+      if (path.resolve(String(args[0])) !== path.resolve(target)) {
+        return handle;
+      }
+      return shortReads(handle, firstChunk.length);
+    });
+    try {
+      // Each read returns at most the first chunk, which has no marker. One
+      // read would report quarantined: false; the loop must keep going.
+      expect(await adapter.inspectReleaseFiles({ root, sha: id, paths: ['late.test.ts'] })).toEqual({
+        outcome: 'read',
+        files: [{ present: true, quarantined: true }],
+      });
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('reports three mixed paths in request order, which a constant verdict cannot', async () => {
@@ -384,6 +471,53 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
     return parsed;
   }
 });
+
+type Opened = Awaited<ReturnType<typeof fs.open>>;
+
+/** The opened descriptor's inode is not the inode of the path on disk. */
+function shiftedIno(handle: Opened): Opened {
+  return new Proxy(handle, {
+    get(opened, key) {
+      if (key === 'stat') {
+        return async () => {
+          const stat = await handle.stat();
+          return new Proxy(stat, {
+            get(node, property, receiver) {
+              if (property === 'ino') {
+                return node.ino + 1;
+              }
+              const value: unknown = Reflect.get(node, property, receiver);
+              return typeof value === 'function' ? (value as (...methodArgs: unknown[]) => unknown).bind(node) : value;
+            },
+          });
+        };
+      }
+      return bindMember(opened, key);
+    },
+  }) as Opened;
+}
+
+/** Each `read` returns at most `maxBytes`, including a short last chunk. */
+function shortReads(handle: Opened, maxBytes: number): Opened {
+  return new Proxy(handle, {
+    get(opened, key) {
+      if (key === 'read') {
+        return (buffer: Buffer, offset?: number, length?: number, position?: number | null) => {
+          const start = typeof offset === 'number' ? offset : 0;
+          const want = typeof length === 'number' ? Math.min(length, maxBytes) : maxBytes;
+          const at = typeof position === 'number' ? position : 0;
+          return handle.read(buffer, start, want, at);
+        };
+      }
+      return bindMember(opened, key);
+    },
+  }) as Opened;
+}
+
+function bindMember(opened: object, key: string | symbol): unknown {
+  const value: unknown = Reflect.get(opened, key);
+  return typeof value === 'function' ? (value as (...methodArgs: unknown[]) => unknown).bind(opened) : value;
+}
 
 interface BuildSnapshot {
   readonly listing: readonly string[];

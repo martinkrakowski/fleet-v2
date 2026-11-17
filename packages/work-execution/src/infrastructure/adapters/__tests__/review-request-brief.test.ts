@@ -176,6 +176,12 @@ function briefLatest(overrides: Partial<FindLatestReceiptOfKindRequest> = {}): F
   };
 }
 
+/** Copy `value` with `key` absent, so an accessor can be installed without `delete` on a readonly field. */
+function omitKey<T extends object>(value: T, key: keyof T & string): T {
+  const record = value as unknown as Record<string, unknown>;
+  return Object.fromEntries(Object.entries(record).filter(([name]) => name !== key)) as unknown as T;
+}
+
 function reviewing(result: RequestIndependentReviewResult | 'throw') {
   const calls: RequestIndependentReviewRequest[] = [];
   const requestIndependentReview = async (request: RequestIndependentReviewRequest) => {
@@ -541,7 +547,7 @@ describe('brief-verify invalid-request', () => {
     ['a numeric request', 4],
     ['a string request', 'brief'],
   ])('requestReview refuses %s with invalid-request and calls no delegate', async (_label, request) => {
-    await refused(request as ReviewRequest);
+    await refused(request as unknown as ReviewRequest);
   });
 
   it('requestReview refuses a sparse-array subject with invalid-request and calls no delegate', async () => {
@@ -674,8 +680,7 @@ describe('brief-verify invalid-request', () => {
 
   it('requestReview refuses a throwing briefText getter with invalid-request and does not invoke it', async () => {
     let invoked = false;
-    const request = briefRequest() as ReviewRequest & Record<string, unknown>;
-    delete request.briefText;
+    const request = omitKey(briefRequest(), 'briefText');
     Object.defineProperty(request, 'briefText', {
       enumerable: true,
       get() {
@@ -705,8 +710,7 @@ describe('brief-verify invalid-request', () => {
 
   it('requestReview refuses a kind accessor on a brief subject with invalid-request and does not invoke it', async () => {
     let invoked = false;
-    const request = briefRequest() as ReviewRequest & Record<string, unknown>;
-    delete request.kind;
+    const request = omitKey(briefRequest(), 'kind');
     Object.defineProperty(request, 'kind', {
       enumerable: true,
       get() {
@@ -739,7 +743,7 @@ describe('brief find unavailable invalid-request', () => {
     ['an undefined find request', undefined],
     ['a numeric find request', 4],
   ])('findReviewReceipt returns unavailable invalid-request for %s and does not inspect', async (_label, request) => {
-    await unavailableFind(request as FindReviewReceiptRequest);
+    await unavailableFind(request as unknown as FindReviewReceiptRequest);
   });
 
   it.each([
@@ -747,7 +751,7 @@ describe('brief find unavailable invalid-request', () => {
     ['an undefined latest request', undefined],
     ['a numeric latest request', 9],
   ])('findLatestReceiptOfKind returns unavailable invalid-request for %s and does not inspect', async (_label, request) => {
-    await unavailableLatest(request as FindLatestReceiptOfKindRequest);
+    await unavailableLatest(request as unknown as FindLatestReceiptOfKindRequest);
   });
 
   it('findReviewReceipt returns unavailable invalid-request for a secret-shaped request id and does not inspect', async () => {
@@ -760,8 +764,7 @@ describe('brief find unavailable invalid-request', () => {
 
   it('findReviewReceipt returns unavailable invalid-request when requestId is an accessor and does not invoke it', async () => {
     let invoked = false;
-    const request = briefFind() as FindReviewReceiptRequest & Record<string, unknown>;
-    delete request.requestId;
+    const request = omitKey(briefFind(), 'requestId');
     Object.defineProperty(request, 'requestId', {
       enumerable: true,
       get() {
@@ -945,8 +948,7 @@ describe('brief delegate configuration and failures', () => {
 
   it('requestReview returns unknown receipt-mismatch when the receipt kind is an accessor and does not invoke it', async () => {
     let invoked = false;
-    const receipt = briefReceipt() as ReviewReceiptRecord & Record<string, unknown>;
-    delete receipt.kind;
+    const receipt = omitKey(briefReceipt(), 'kind');
     Object.defineProperty(receipt, 'kind', {
       enumerable: true,
       get() {

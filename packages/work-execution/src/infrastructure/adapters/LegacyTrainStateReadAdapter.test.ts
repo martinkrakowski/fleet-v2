@@ -299,6 +299,60 @@ describe('LegacyTrainStateReadAdapter', () => {
         spy.mockRestore();
       }
     });
+
+    it('detects a batches directory swapped to a different real directory between the directory check and the read, and discards whatever was read', async () => {
+      const dir = await makeTempDir();
+      const realBatchesDir = join(dir, 'batches');
+      await fs.mkdir(realBatchesDir);
+      await fs.writeFile(join(realBatchesDir, 'enabled'), 'real-1\n');
+
+      const swapHome = await makeTempDir();
+      const swappedBatchesDir = join(swapHome, 'swapped-batches');
+      await fs.mkdir(swappedBatchesDir);
+      await fs.writeFile(join(swappedBatchesDir, 'enabled'), 'swapped-real-1\n');
+
+      // This covers the OTHER half of the comparison from the symlink-swap
+      // test above: the swap target here is a different REAL directory (not
+      // a symlink), with its own normal `enabled` file, so the "after"
+      // check sees `kind: 'directory'` just as the "before" check did. Only
+      // the device/inode comparison — not the directory-vs-non-directory
+      // check — can tell the two directories apart. The spy swaps the path
+      // by rename as a side effect of the first lstat call for this path,
+      // once, then lets every later call (including the "after" check) see
+      // the real filesystem state.
+      const realLstat = fs.lstat.bind(fs);
+      let batchesDirLstatCalls = 0;
+      const spy = vi.spyOn(fs, 'lstat').mockImplementation(async (path: Parameters<typeof fs.lstat>[0]) => {
+        const stat = await realLstat(path as string);
+        if (path === realBatchesDir) {
+          batchesDirLstatCalls += 1;
+          if (batchesDirLstatCalls === 1) {
+            await fs.rm(realBatchesDir, { recursive: true, force: true });
+            await fs.rename(swappedBatchesDir, realBatchesDir);
+          }
+        }
+        return stat;
+      });
+
+      try {
+        const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+        // The swapped-in directory is just as real a directory as the
+        // original, so a check that only asked "is this still a directory"
+        // would pass it straight through. Only the device/inode comparison
+        // tells the two directories apart: removing just the
+        // `after.dev !== before.dev || after.ino !== before.ino` half of
+        // the guard (leaving `after.kind !== 'directory'` alone) would make
+        // this assertion fail, because the swapped-in directory would then
+        // satisfy every remaining check and its content would be returned
+        // instead of being discarded.
+        expect(result.batchesEnabled).toEqual({ status: 'unreadable' });
+        expect(JSON.stringify(result)).not.toContain('swapped-real-1');
+        expect(batchesDirLstatCalls).toBeGreaterThanOrEqual(2);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 
   describe('events log', () => {

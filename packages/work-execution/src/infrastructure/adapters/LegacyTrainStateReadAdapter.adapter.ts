@@ -155,14 +155,23 @@ export class LegacyTrainStateReadAdapter implements LegacyTrainStateReadPort {
    * To narrow the window as far as this adapter can without an unstable API,
    * the `batches` component is lstat'd again immediately after the read,
    * and its device and inode are compared against the first lstat. A swap
-   * left in place afterwards (the likely case: nothing requires an attacker
-   * to revert it) shows up as a non-directory on the second lstat; a swap to
-   * a different real directory and back shows up as a different inode.
-   * Either mismatch discards whatever was just read and reports
-   * `unreadable`, so content read during a race in this narrow window never
-   * reaches the caller. This cannot stop the one read that happens inside
-   * that window from touching the wrong file on disk — it can only stop
-   * that file's content from being returned.
+   * to a symlink, left in place afterwards, shows up as a non-directory on
+   * the second lstat; a swap to a different real directory, left in place,
+   * is still a directory but with a different device or inode. Either
+   * mismatch discards whatever was just read and reports `unreadable`.
+   *
+   * This detects a swap that is STILL IN PLACE when the "after" check runs.
+   * It does not detect a swap that is reverted to the exact original
+   * directory (the same device and inode) before the "after" check
+   * completes: swap the real `batches` directory aside, put a symlink in
+   * its place, let the read above follow the symlink, then rename the
+   * original directory back into place before the "after" lstat — that
+   * lstat then reports the same device and inode as the first one, the
+   * comparison passes, and the content already read through the symlink
+   * does reach the caller. This is a known, accepted residual gap of this
+   * detect-after-the-fact approach: it requires precise timing against this
+   * one read, and is consistent with every other sibling read in this
+   * adapter never re-verifying a path between check and use.
    */
   private async readBatchesEnabled(stateDir: string): Promise<LegacyTrainFileRead> {
     const batchesDir = join(stateDir, this.batchesDirName);

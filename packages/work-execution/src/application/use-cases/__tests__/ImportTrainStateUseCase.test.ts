@@ -62,7 +62,7 @@ function keyFor(
   pullRequest: number,
   headOid: string,
   base: string,
-  disposition: 'would-import' | 'already-queued' | 'not-importable-base' | 'in-progress',
+  disposition: 'would-import' | 'already-queued' | 'not-importable-base',
   source: 'queue' | 'parked' | 'inprogress' = 'queue',
 ): Record<string, unknown> {
   return { pullRequest, headOid, base, source, disposition };
@@ -387,7 +387,7 @@ describe('ImportTrainStateUseCase', () => {
     ]);
   });
 
-  it('an in-progress-only PR is listed but never an import candidate', async () => {
+  it('an in-progress-only PR is an import candidate with source inprogress', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(
       readState([], { inprogress: { status: 'read', lines: [`7 ${HEAD_B} main`] } }),
@@ -401,14 +401,17 @@ describe('ImportTrainStateUseCase', () => {
       authority: 'owner-grant-1',
     });
 
-    expect(result).toMatchObject({ outcome: 'applied', imported: 0, inprogressLines: 1 });
+    expect(result).toMatchObject({ outcome: 'applied', imported: 1, inprogressLines: 1 });
     expect(result.outcome === 'applied' && result.keys).toEqual([
-      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'in-progress' },
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'would-import' },
     ]);
-    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.pullRequest).toBe(7);
+    expect(entries[0]!.headOid).toBe(HEAD_B);
   });
 
-  it('a pair in both queue and inprogress is never imported while the legacy merge holds it', async () => {
+  it('a pair in both queue and inprogress dedupes to one key, source queue wins', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(
       readState([MAIN_B], { inprogress: { status: 'read', lines: [MAIN_B] } }),
@@ -422,11 +425,12 @@ describe('ImportTrainStateUseCase', () => {
       authority: 'owner-grant-1',
     });
 
-    expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
+    expect(result).toMatchObject({ outcome: 'applied', imported: 1 });
     expect(result.outcome === 'applied' && result.keys).toEqual([
-      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'queue', disposition: 'in-progress' },
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'queue', disposition: 'would-import' },
     ]);
-    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(1);
   });
 
   it('a pair in both queue and parked is one key whose source is queue', async () => {
@@ -449,7 +453,7 @@ describe('ImportTrainStateUseCase', () => {
     ]);
   });
 
-  it('the same PR and head on different bases dedupes per base, not per pair', async () => {
+  it('the same PR and head on two different bases across sources still dedupes to one key', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const chainLine = `7 ${HEAD_B} chain/foo`;
     const reader = new FakeLegacyTrainStateReadPort(
@@ -464,10 +468,13 @@ describe('ImportTrainStateUseCase', () => {
       authority: null,
     });
 
-    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 1, notImportableBase: 1 });
+    // The queue entry (chain/foo) and the parked entry (main) share the same
+    // (pullRequest, headOid) pair, so base must not split them into two
+    // candidates: exactly one key results, and the earlier source (queue)
+    // wins per the source-order rule, carrying its own base through.
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 0, notImportableBase: 1 });
     expect(result.outcome === 'dry-run' && result.keys).toEqual([
       { pullRequest: 7, headOid: HEAD_B, base: 'chain/foo', source: 'queue', disposition: 'not-importable-base' },
-      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'parked', disposition: 'would-import' },
     ]);
   });
 

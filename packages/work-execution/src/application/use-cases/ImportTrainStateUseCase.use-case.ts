@@ -93,11 +93,12 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       }
     }
 
-    // Dedupe by the (pullRequest, headOid, base) triple across all three
-    // sources, in source order queue, then inprogress, then parked: the first
-    // source in that order wins and is recorded as the key's source. The base
-    // is part of the identity so that the same PR/head on a different base is
-    // never silently dropped because an earlier source held it on another base.
+    // Dedupe by the pair (pullRequest, headOid) across all three sources, in
+    // source order queue, then inprogress, then parked: the first source in
+    // that order wins and is recorded as the key's source. The base is NOT
+    // part of the identity: the same PR/head seen on two different bases
+    // across sources still yields exactly one key, so that one logical PR is
+    // never reported as two distinct, non-duplicate import candidates.
     const seenPairs = new Set<string>();
     const deduped: { readonly source: (typeof sources)[number]; readonly entry: LegacyTrainQueueEntry }[] = [];
     for (const source of sources) {
@@ -110,26 +111,12 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
           continue;
         }
         const entry = line.entry;
-        const pair = `${entry.pullRequest}:${entry.headOid}:${entry.base}`;
+        const pair = `${entry.pullRequest}:${entry.headOid}`;
         if (seenPairs.has(pair)) {
           continue;
         }
         seenPairs.add(pair);
         deduped.push({ source, entry });
-      }
-    }
-
-    // A pair the legacy train is currently merging must never be imported,
-    // even when an earlier source (the queue) also lists it: deduplication
-    // keeps the first source for reporting, but the in-progress presence
-    // overrides the disposition so both trains never act on the same PR.
-    const inprogressPairs = new Set<string>();
-    const inprogressParsed = parsedBySource.inprogress;
-    if (inprogressParsed.ok) {
-      for (const line of inprogressParsed.lines) {
-        if (line.ok) {
-          inprogressPairs.add(`${line.entry.pullRequest}:${line.entry.headOid}`);
-        }
       }
     }
 
@@ -142,10 +129,6 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       if (entry.base !== 'main') {
         disposition = 'not-importable-base';
         notImportableBase += 1;
-      } else if (source === 'inprogress' || inprogressPairs.has(`${entry.pullRequest}:${entry.headOid}`)) {
-        // The legacy train is already merging this PR; enqueueing it would let
-        // both trains act on it. It is reported, never an import candidate.
-        disposition = 'in-progress';
       } else {
         const alreadyLive = liveEntries.some(
           (record) =>

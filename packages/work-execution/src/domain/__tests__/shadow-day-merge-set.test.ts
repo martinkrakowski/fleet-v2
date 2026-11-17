@@ -244,6 +244,16 @@ describe('evaluateShadowMergeSet hostile input', () => {
     expect(evaluateShadowMergeSet(dayInput({ day: 20261110 }))).toEqual(INVALID);
   });
 
+  it('a string unknownLines ("0") is refused as invalid-input, never treated as the number 0 or as shell-events-incomplete', () => {
+    const input = dayInput({ shell: { events: [], unknownLines: '0' } });
+    expect(evaluateShadowMergeSet(input)).toEqual(INVALID);
+  });
+
+  it('a genuine positive integer unknownLines still produces shell-events-incomplete, not invalid-input', () => {
+    const input = dayInput({ shell: { events: [], unknownLines: 1 } });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'unknown', reason: 'shell-events-incomplete' });
+  });
+
   it('a string where a list is due is refused', () => {
     const input = dayInput();
     (input.shell as Record<string, unknown>).events = 'merged';

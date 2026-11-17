@@ -252,67 +252,124 @@ export function evaluateShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluat
   }
 }
 
-function judgeShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluation {
+interface ParsedMergeSetSnapshot {
+  readonly kind: 'ok';
+  readonly day: string;
+  readonly repoDigest: string;
+  readonly excludeBatchMerges: boolean;
+  readonly shellEvents: readonly ShellTrainEvent[];
+  readonly fleetResults: readonly Record<string, unknown>[];
+  readonly fleetEntries: readonly { pullRequest: number; headOid: string }[];
+}
+
+type ParsedMergeSetInput = ParsedMergeSetSnapshot | { readonly kind: 'invalid' } | { readonly kind: 'shell-incomplete' };
+
+const INVALID_PARSE: ParsedMergeSetInput = { kind: 'invalid' };
+const SHELL_INCOMPLETE_PARSE: ParsedMergeSetInput = { kind: 'shell-incomplete' };
+
+/** Every `events` element read through `readShellEvent`, or null at the first one out of shape. */
+function collectShellEvents(events: readonly unknown[]): readonly ShellTrainEvent[] | null {
+  const shellEvents: ShellTrainEvent[] = [];
+  for (let index = 0; index < events.length; index += 1) {
+    const event = readShellEvent(ownElement(events, index));
+    if (event === null) {
+      return null;
+    }
+    shellEvents.push(event);
+  }
+  return shellEvents;
+}
+
+/** Every `results` element read through `readFleetResult`, or null at the first one out of shape. */
+function collectFleetResults(results: readonly unknown[]): readonly Record<string, unknown>[] | null {
+  const fleetResults: Record<string, unknown>[] = [];
+  for (let index = 0; index < results.length; index += 1) {
+    const result = readFleetResult(ownElement(results, index));
+    if (result === null) {
+      return null;
+    }
+    fleetResults.push(result);
+  }
+  return fleetResults;
+}
+
+/** Every `entries` element read through `readFleetEntry`, or null at the first one out of shape. */
+function collectFleetEntries(entries: readonly unknown[]): readonly { pullRequest: number; headOid: string }[] | null {
+  const fleetEntries: { pullRequest: number; headOid: string }[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = readFleetEntry(ownElement(entries, index));
+    if (entry === null) {
+      return null;
+    }
+    fleetEntries.push(entry);
+  }
+  return fleetEntries;
+}
+
+/**
+ * The whole `{ day, repoDigest, excludeBatchMerges, shell, fleet }` snapshot,
+ * validated and read down to typed arrays, or the refusal it reads as:
+ * `'invalid'` for anything structurally wrong, `'shell-incomplete'` only once
+ * `shell.unknownLines` is confirmed to be a genuine non-negative safe integer
+ * greater than zero. The type is checked before the value: a malformed
+ * `unknownLines` (a string, a negative number, a fraction) is `'invalid'`,
+ * never `'shell-incomplete'` — that reason means specifically "the count is a
+ * valid number greater than zero," not "the field has the wrong shape."
+ */
+function parseMergeSetInput(input: unknown): ParsedMergeSetInput {
   const snapshot = readExactPlainRecord(input, INPUT_KEYS);
   if (snapshot === null) {
-    return INVALID();
+    return INVALID_PARSE;
   }
   const day = readUtcDay(snapshot.day);
   const repoDigest = snapshot.repoDigest;
   if (day === null || typeof repoDigest !== 'string' || !REPO_DIGEST_PATTERN.test(repoDigest)) {
-    return INVALID();
+    return INVALID_PARSE;
   }
   if (typeof snapshot.excludeBatchMerges !== 'boolean') {
-    return INVALID();
+    return INVALID_PARSE;
   }
+  const excludeBatchMerges = snapshot.excludeBatchMerges;
   const shell = readExactPlainRecord(snapshot.shell, SHELL_INPUT_KEYS);
   const fleet = readExactPlainRecord(snapshot.fleet, FLEET_INPUT_KEYS);
   if (shell === null || fleet === null) {
-    return INVALID();
+    return INVALID_PARSE;
   }
   const events = boundedArray(shell.events, SHADOW_MERGE_SET_MAX_ITEMS);
   const results = boundedArray(fleet.results, SHADOW_MERGE_SET_MAX_ITEMS);
   const entries = boundedArray(fleet.entries, SHADOW_MERGE_SET_MAX_ITEMS);
   if (events === null || results === null || entries === null) {
-    return INVALID();
+    return INVALID_PARSE;
   }
-  const shellEvents: ShellTrainEvent[] = [];
-  for (let index = 0; index < events.length; index += 1) {
-    const event = readShellEvent(ownElement(events, index));
-    if (event === null) {
-      return INVALID();
-    }
-    shellEvents.push(event);
+  const shellEvents = collectShellEvents(events);
+  if (shellEvents === null) {
+    return INVALID_PARSE;
+  }
+  const unknownLines = shell.unknownLines;
+  if (!isCount(unknownLines)) {
+    return INVALID_PARSE;
   }
   // An incomplete shell record is never evidence either way.
-  if (shell.unknownLines !== 0) {
-    return evaluation({ status: 'unknown', reason: 'shell-events-incomplete' }, 0, 0, 0, 0);
+  if (unknownLines > 0) {
+    return SHELL_INCOMPLETE_PARSE;
   }
-  const fleetResults: Record<string, unknown>[] = [];
-  for (let index = 0; index < results.length; index += 1) {
-    const result = readFleetResult(ownElement(results, index));
-    if (result === null) {
-      return INVALID();
-    }
-    fleetResults.push(result);
+  const fleetResults = collectFleetResults(results);
+  if (fleetResults === null) {
+    return INVALID_PARSE;
   }
-  const fleetEntries: { pullRequest: number; headOid: string }[] = [];
-  for (let index = 0; index < entries.length; index += 1) {
-    const entry = readFleetEntry(ownElement(entries, index));
-    if (entry === null) {
-      return INVALID();
-    }
-    fleetEntries.push(entry);
+  const fleetEntries = collectFleetEntries(entries);
+  if (fleetEntries === null) {
+    return INVALID_PARSE;
   }
+  return { kind: 'ok', day, repoDigest, excludeBatchMerges, shellEvents, fleetResults, fleetEntries };
+}
 
-  const dayStart = new Date(`${day}T00:00:00.000Z`).getTime();
-  const start = dayStart - SHADOW_DAY_BOUNDARY_GRACE_MS;
-  const end = dayStart + DAY_MS + SHADOW_DAY_BOUNDARY_GRACE_MS;
-
-  const shellItems = shellSet(shellEvents, day, start, end, snapshot.excludeBatchMerges);
-
-  // DT §4.3(1): a live one-way action during shadow is itself a blocking
-  // divergence, checked before the set comparison below even runs.
+/**
+ * Whether any fleet result is a live one-way action during shadow day `day`
+ * (DT §4.3(1)): a blocking divergence, checked before the set comparison
+ * below even runs.
+ */
+function hasLiveActionInShadow(fleetResults: readonly Record<string, unknown>[], repoDigest: string, day: string): boolean {
   for (const result of fleetResults) {
     const key = result.key as string;
     if (
@@ -320,21 +377,24 @@ function judgeShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluation {
       && inDay(result.recordedAtIso as string, day)
       && result.outcome !== 'dry-run'
     ) {
-      return evaluation({ status: 'fail', reason: 'live-action-in-shadow' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, 0, 0);
+      return true;
     }
   }
+  return false;
+}
 
-  const fleetItems = resolveFleetSet(fleetResults, fleetEntries, repoDigest, day, start, end);
-  if ('refusal' in fleetItems) {
-    return evaluation(fleetItems.refusal, shellItems.mergesCompared, shellItems.excludedBatchMerges, 0, 0);
-  }
-
+/** The comparator's verdict over an already-resolved fleet set and the shell set, plus the day's counts. */
+function judgeComparison(
+  fleetItems: readonly FleetMergeItem[],
+  shellItems: { readonly items: readonly ShellMergeItem[]; readonly excludedBatchMerges: number; readonly mergesCompared: number },
+  day: string,
+): ShadowDayMergeSetEvaluation {
   const comparison = compareShadowMergeSets({
-    fleet: fleetItems.items.map((item) => ({ pullRequest: item.pullRequest, headOid: item.headOid })),
+    fleet: fleetItems.map((item) => ({ pullRequest: item.pullRequest, headOid: item.headOid })),
     shell: shellItems.items.map((item) => ({ pullRequest: item.pullRequest, headOid: item.headOid })),
   });
 
-  const surviving = survivingDivergences(comparison.divergences, fleetItems.items, shellItems.items, day);
+  const surviving = survivingDivergences(comparison.divergences, fleetItems, shellItems.items, day);
   // The comparator caps its divergence list; beyond the cap an omitted
   // divergence may yet be same-day, so an all-grace listed set can never
   // certify a pass — the verdict stays open instead.
@@ -345,6 +405,38 @@ function judgeShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluation {
     return evaluation({ status: 'fail', reason: 'merge-set-divergence' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, comparison.compared, surviving);
   }
   return evaluation({ status: 'pass', reason: 'merge-set-equal' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, comparison.compared, 0);
+}
+
+/** The S1 rules, over an already-validated snapshot: the shell/fleet set comparison and its divergence verdict. */
+function evaluateMergeSet(parsed: ParsedMergeSetSnapshot): ShadowDayMergeSetEvaluation {
+  const { day, repoDigest, excludeBatchMerges, shellEvents, fleetResults, fleetEntries } = parsed;
+  const dayStart = new Date(`${day}T00:00:00.000Z`).getTime();
+  const start = dayStart - SHADOW_DAY_BOUNDARY_GRACE_MS;
+  const end = dayStart + DAY_MS + SHADOW_DAY_BOUNDARY_GRACE_MS;
+
+  const shellItems = shellSet(shellEvents, day, start, end, excludeBatchMerges);
+
+  if (hasLiveActionInShadow(fleetResults, repoDigest, day)) {
+    return evaluation({ status: 'fail', reason: 'live-action-in-shadow' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, 0, 0);
+  }
+
+  const fleetItems = resolveFleetSet(fleetResults, fleetEntries, repoDigest, day, start, end);
+  if ('refusal' in fleetItems) {
+    return evaluation(fleetItems.refusal, shellItems.mergesCompared, shellItems.excludedBatchMerges, 0, 0);
+  }
+
+  return judgeComparison(fleetItems.items, shellItems, day);
+}
+
+function judgeShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluation {
+  const parsed = parseMergeSetInput(input);
+  if (parsed.kind === 'invalid') {
+    return INVALID();
+  }
+  if (parsed.kind === 'shell-incomplete') {
+    return evaluation({ status: 'unknown', reason: 'shell-events-incomplete' }, 0, 0, 0, 0);
+  }
+  return evaluateMergeSet(parsed);
 }
 
 /**

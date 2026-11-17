@@ -177,9 +177,15 @@ function inWindow(iso: string, start: number, end: number): boolean {
   return instant >= start && instant < end;
 }
 
-/** Whether the ISO string's own calendar day is `day` (the grace margin is not the day). */
+/**
+ * Whether the instant the ISO string names falls on UTC day `day` — read off
+ * the instant itself, never off the written date: a zoned time whose offset
+ * carries it across midnight belongs to the day its instant falls on, and
+ * the grace margin is not the day.
+ */
 function inDay(iso: string, day: string): boolean {
-  return iso.slice(0, 10) === day;
+  const instant = new Date(iso);
+  return !Number.isNaN(instant.getTime()) && instant.toISOString().slice(0, 10) === day;
 }
 
 /**
@@ -329,6 +335,12 @@ function judgeShadowMergeSet(input: unknown): ShadowDayMergeSetEvaluation {
   });
 
   const surviving = survivingDivergences(comparison.divergences, fleetItems.items, shellItems.items, day);
+  // The comparator caps its divergence list; beyond the cap an omitted
+  // divergence may yet be same-day, so an all-grace listed set can never
+  // certify a pass — the verdict stays open instead.
+  if (comparison.truncated && surviving === 0) {
+    return evaluation({ status: 'unknown', reason: 'merge-set-comparison-truncated' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, comparison.compared, surviving);
+  }
   if (surviving > 0) {
     return evaluation({ status: 'fail', reason: 'merge-set-divergence' }, shellItems.mergesCompared, shellItems.excludedBatchMerges, comparison.compared, surviving);
   }

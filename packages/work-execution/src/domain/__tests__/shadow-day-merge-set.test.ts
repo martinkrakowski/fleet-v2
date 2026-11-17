@@ -198,6 +198,35 @@ describe('evaluateShadowMergeSet (S1)', () => {
     expect(text).not.toContain(HEAD_A);
     expect(Object.keys(result).sort()).toEqual(['compared', 'divergences', 'excludedBatchMerges', 'mergesCompared', 'reason', 'status']);
   });
+
+  it('judges a fleet result by its instant, not its written date: an offset-carried instant on day D fails live-action-in-shadow', () => {
+    const input = dayInput({
+      fleet: { results: [fleetResult({ outcome: 'merged', recordedAtIso: '2026-11-09T23:00:00.000-02:00' })], entries: [fleetEntry()] },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'live-action-in-shadow' });
+  });
+
+  it('judges a divergence by its instant, not its written date: a would-merge written on the previous day but landing on day D counts', () => {
+    const input = dayInput({
+      fleet: { results: [fleetResult({ recordedAtIso: '2026-11-09T23:05:00.000-01:00' })], entries: [fleetEntry()] },
+      shell: { events: [], unknownLines: 0 },
+    });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'fail', reason: 'merge-set-divergence', divergences: 1 });
+  });
+
+  it('does not certify a pass when the comparator truncated its divergence list', () => {
+    const graceHead = (pullRequest: number): string => pullRequest.toString(16).padStart(8, '0').repeat(5);
+    const graceEvents = [1, ...Array.from({ length: 10 }, (_, i) => 10 + i), ...Array.from({ length: 40 }, (_, i) => 100 + i)]
+      .map((pullRequest, index) => shellEvent({
+        line: index + 1,
+        pullRequest,
+        headOid: graceHead(pullRequest),
+        atIso: '2026-11-09T23:59:55Z',
+      }));
+    const events = [...graceEvents, shellEvent({ line: 99, pullRequest: 2, headOid: HEAD_C })];
+    const input = dayInput({ shell: { events, unknownLines: 0 }, fleet: { results: [], entries: [] } });
+    expect(evaluateShadowMergeSet(input)).toMatchObject({ status: 'unknown', reason: 'merge-set-comparison-truncated', mergesCompared: 1 });
+  });
 });
 
 describe('evaluateShadowMergeSet hostile input', () => {

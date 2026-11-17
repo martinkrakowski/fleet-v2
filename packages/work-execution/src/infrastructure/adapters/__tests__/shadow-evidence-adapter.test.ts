@@ -254,18 +254,35 @@ describe('ShadowEvidenceAdapter', () => {
   });
 
   it('in-memory mode never touches the filesystem', async () => {
-    const openSpy = vi.spyOn(fs, 'open');
-    const readFileSpy = vi.spyOn(fs, 'readFile');
-    const lstatSpy = vi.spyOn(fs, 'lstat');
-    const adapter = new ShadowEvidenceAdapter();
-    expect(await adapter.read()).toEqual({ status: 'missing' });
-    await adapter.compareAndSet({ expectedRevision: 0, next: dayLedger(1) });
-    expect(await adapter.read()).toEqual({ status: 'ok', ledger: dayLedger(1) });
-    expect(openSpy).not.toHaveBeenCalled();
-    expect(readFileSpy).not.toHaveBeenCalled();
-    expect(lstatSpy).not.toHaveBeenCalled();
-    openSpy.mockRestore();
-    readFileSpy.mockRestore();
-    lstatSpy.mockRestore();
+    // Every fs/promises function ShadowEvidenceAdapter's code paths can reach:
+    // readBoundedStoreBytes (lstat, open), withFileLock including its
+    // lock-timeout diagnostics in readLockHolderInfo (mkdir, open, readFile,
+    // unlink, stat) and writeJsonAtomically (mkdir, writeFile, rename, rm). A
+    // regression that made memory mode fall through to disk I/O on any one of
+    // these must fail this test, not just on the three it used to check.
+    const spies = [
+      vi.spyOn(fs, 'open'),
+      vi.spyOn(fs, 'readFile'),
+      vi.spyOn(fs, 'lstat'),
+      vi.spyOn(fs, 'stat'),
+      vi.spyOn(fs, 'mkdir'),
+      vi.spyOn(fs, 'writeFile'),
+      vi.spyOn(fs, 'rename'),
+      vi.spyOn(fs, 'unlink'),
+      vi.spyOn(fs, 'rm'),
+    ];
+    try {
+      const adapter = new ShadowEvidenceAdapter();
+      expect(await adapter.read()).toEqual({ status: 'missing' });
+      await adapter.compareAndSet({ expectedRevision: 0, next: dayLedger(1) });
+      expect(await adapter.read()).toEqual({ status: 'ok', ledger: dayLedger(1) });
+      for (const spy of spies) {
+        expect(spy).not.toHaveBeenCalled();
+      }
+    } finally {
+      for (const spy of spies) {
+        spy.mockRestore();
+      }
+    }
   });
 });

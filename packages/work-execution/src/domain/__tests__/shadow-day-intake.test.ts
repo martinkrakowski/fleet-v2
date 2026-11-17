@@ -296,6 +296,37 @@ describe('shadow day intake (S8)', () => {
     expect(getTraps).toBe(0);
   });
 
+  it('a Proxy over a nested list (shellLive) with a lying length trap never reaches the trap: the result matches the honest array', () => {
+    // The earlier Proxy tests cover only the root request object. `boundedList`
+    // validates a NESTED list's `length` from its own property descriptor and
+    // returns that length alongside the array (never the array alone), and
+    // `validateKeys` iterates on that returned length, never `list.length` as
+    // a plain property read. So even a nested list whose `get` trap lies
+    // about `length` (claiming 0 for a two-element array) is never consulted:
+    // a plain `.length` read on it would have, letting the evaluator silently
+    // skip both elements and turn a real divergence into a false pass.
+    const honestShellLive = [key(1), key(2)];
+    let getTraps = 0;
+    const lyingShellLive = new Proxy(honestShellLive, {
+      get(target, property, receiver) {
+        getTraps += 1;
+        return property === 'length' ? 0 : Reflect.get(target, property, receiver);
+      },
+    });
+    const honestInput = twoSamples(
+      { shellLive: honestShellLive, fleetLive: honestShellLive, importPresent: honestShellLive },
+      { shellLive: honestShellLive, fleetLive: honestShellLive, importPresent: honestShellLive },
+    );
+    const proxiedInput = twoSamples(
+      { shellLive: lyingShellLive, fleetLive: honestShellLive, importPresent: honestShellLive },
+      { shellLive: lyingShellLive, fleetLive: honestShellLive, importPresent: honestShellLive },
+    );
+    const honestResult = evaluateShadowIntake(honestInput);
+    expect(honestResult).toEqual({ status: 'pass', reason: 'intake-equal' });
+    expect(evaluateShadowIntake(proxiedInput)).toEqual(honestResult);
+    expect(getTraps).toBe(0);
+  });
+
   it('a prototype-polluting __proto__ own key from JSON.parse is refused and never merged', () => {
     const polluted = JSON.parse(`{"samples": ${JSON.stringify([sample(), sample({ takenAtIso: T10 })])}, "__proto__": {"polluted": true}}`);
     expect(evaluateShadowIntake(polluted)).toEqual({ status: 'unknown', reason: 'samples-invalid' });
@@ -402,6 +433,29 @@ describe('shadow day intake (S8)', () => {
       { shellLive, fleetLive: [key(1)], importPresent },
     );
     expect(evaluateShadowIntake(input)).toEqual({ status: 'pass', reason: 'intake-equal' });
+  });
+
+  it('a comparator drop on comparison A (the live-coverage side) is unknown/comparator-dropped-items, not a false pass', () => {
+    // The A-side twin of the drop-detection test above, which only exercises
+    // comparison B (the import-fidelity side, via importPresent). Here the
+    // same secret-shaped-looking (but ordinary) base is carried by
+    // fleetLive instead, so compareShadowEnqueueSets drops it from
+    // comparison A (fleetLive vs shellLive), the live-coverage comparison.
+    // Without the A-side comparatorDroppedItems check (the one right before
+    // comparison A's divergences are trusted, ahead of the B-side check),
+    // the dropped item would leave fleetLive matching shellLive after the
+    // comparator's own internal filter, and — with importPresent/shellLive
+    // otherwise equal too — the evaluator would wrongly report
+    // pass/intake-equal instead of unknown/comparator-dropped-items.
+    const ordinaryLookingBranchFirstHalf = 'chain/tas';
+    const ordinaryLookingBranchSecondHalf = 'k-refactor-the-live-queue-now';
+    const ordinaryLookingBranch = `${ordinaryLookingBranchFirstHalf}${ordinaryLookingBranchSecondHalf}`;
+    const secretShapedKey = key(2, HEAD, ordinaryLookingBranch);
+    const shellLive = [key(1)];
+    const fleetLive = [key(1), secretShapedKey];
+    const importPresent = [key(1)];
+    const input = twoSamples({ shellLive, fleetLive, importPresent }, { shellLive, fleetLive, importPresent });
+    expect(evaluateShadowIntake(input)).toEqual({ status: 'unknown', reason: 'comparator-dropped-items' });
   });
 
   it('a sample with extra keys is samples-invalid', () => {

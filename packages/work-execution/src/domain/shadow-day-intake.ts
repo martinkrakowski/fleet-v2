@@ -69,15 +69,32 @@ interface ValidatedSample {
 }
 
 /**
+ * One array validated by `boundedList`: the array itself, plus the length
+ * already read from its own property descriptor. Every caller uses THIS
+ * length for its iteration bound and never reads `.length` on `list` again:
+ * a plain `.length` property read on a Proxy-wrapped array invokes its `get`
+ * trap, which can lie (report a shorter length than the real one, or zero),
+ * letting a caller silently skip elements it should have compared. Returning
+ * the array alone and leaving callers to read its `.length` was exactly that
+ * mistake — fixed here so it cannot recur at a new call site.
+ */
+interface BoundedList {
+  readonly list: readonly unknown[];
+  readonly length: number;
+}
+
+/**
  * The capped element list of a real, dense array, or null for any stand-in,
  * sparse, oversized, accessor-polluted or extra-keyed array. `Object.keys`
  * lists own enumerable string keys without reading any value, so it runs no
  * getter; comparing its count to `length` catches both a hole (fewer keys
  * than `length`) and an extra own enumerable property such as a getter
  * planted beside the indices — either way the array is refused from its
- * `length`/keys before a single element is read.
+ * `length`/keys before a single element is read. Returns the length read
+ * from the descriptor alongside the array (see `BoundedList`): no caller may
+ * read `.length` on the returned array as a plain property access again.
  */
-function boundedList(value: unknown, cap: number): readonly unknown[] | null {
+function boundedList(value: unknown, cap: number): BoundedList | null {
   // `Array.isArray` follows a Proxy without running a trap; the length is
   // read from its own descriptor, so no `get` trap ever runs.
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
@@ -95,7 +112,7 @@ function boundedList(value: unknown, cap: number): readonly unknown[] | null {
   if (Object.keys(value).length !== lengthDescriptor.value) {
     return null;
   }
-  return value as readonly unknown[];
+  return { list: value as readonly unknown[], length: lengthDescriptor.value };
 }
 
 /** The own enumerable data-property element at `index`, or undefined for a hole or an accessor. */
@@ -131,15 +148,20 @@ function validateKey(raw: unknown): ValidatedKey | null {
   return { pullRequest, headOid, base: parsedBase };
 }
 
-/** Every element of a bounded list as a key, or null when any is out of shape. */
+/**
+ * Every element of a bounded list as a key, or null when any is out of
+ * shape. Iterates on the length `boundedList` already read from the
+ * descriptor, never `list.length` as a plain property access: `list` may be
+ * a Proxy, and a plain `.length` read on it would invoke its `get` trap.
+ */
 function validateKeys(raw: unknown, arrayCap: number): readonly ValidatedKey[] | null {
-  const list = boundedList(raw, arrayCap);
-  if (list === null) {
+  const bounded = boundedList(raw, arrayCap);
+  if (bounded === null) {
     return null;
   }
   const keys: ValidatedKey[] = [];
-  for (let index = 0; index < list.length; index += 1) {
-    const key = validateKey(ownElement(list, index));
+  for (let index = 0; index < bounded.length; index += 1) {
+    const key = validateKey(ownElement(bounded.list, index));
     if (key === null) {
       return null;
     }
@@ -415,12 +437,15 @@ export function evaluateShadowIntake(input: unknown): ShadowCriterionEvaluation 
     if (samplesRaw === null) {
       return SAMPLES_INVALID;
     }
+    // `pair.length` below is the length `boundedList` already read from the
+    // descriptor, never a plain `.length` read on `pair.list` (which may be
+    // a Proxy whose `get` trap can lie about it); see `validateKeys` above.
     const pair = boundedList(samplesRaw.samples, 2);
     if (pair === null || pair.length !== 2) {
       return SAMPLES_INVALID;
     }
-    const first = validateSample(ownElement(pair, 0));
-    const second = validateSample(ownElement(pair, 1));
+    const first = validateSample(ownElement(pair.list, 0));
+    const second = validateSample(ownElement(pair.list, 1));
     if (first === null || second === null) {
       return SAMPLES_INVALID;
     }

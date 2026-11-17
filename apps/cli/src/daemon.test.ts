@@ -1774,10 +1774,10 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
   });
 
   it('(f) the mode is not an identity echo: hostile inputs never come back as themselves', () => {
-    expect(resolveAudibleAlertMode({ FLEET_AUDIBLE_ALERT: 'banana' })).not.toBe('banana');
-    expect(resolveAudibleAlertMode(42)).not.toBe(42);
-    expect(resolveAudibleAlertMode('spd-say')).not.toBe('spd-say');
-    expect(resolveAudibleAlertMode(null)).not.toBe(null);
+    expect(resolveAudibleAlertMode({ FLEET_AUDIBLE_ALERT: 'banana' })).toBe('invalid');
+    expect(resolveAudibleAlertMode(42)).toBe('invalid');
+    expect(resolveAudibleAlertMode('spd-say')).toBe('invalid');
+    expect(resolveAudibleAlertMode(null)).toBe('invalid');
   });
 });
 

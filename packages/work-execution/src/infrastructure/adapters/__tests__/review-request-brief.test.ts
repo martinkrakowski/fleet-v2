@@ -35,23 +35,26 @@ const REVIEWER = 'reviewer-model';
 const PRIMARY = 'example-provider/grok-4.7';
 const FALLBACK = 'example-provider/fallback-seat';
 const BRIEF_TEXT = 'Review the frozen brief.';
+/** The raw manifest bytes the fixture's frozen-brief digest covers alongside `BRIEF_TEXT`. */
+const BRIEF_MANIFEST = '{"schemaVersion":2,"attemptId":"a-1"}';
 
 /**
- * The prose-only digest `computeBriefPackageDigest` binds for a test prose
- * with the SHA-256 digest function every production composition root injects,
- * or null when that formula refuses the prose (empty, over 64 KiB, or
- * secret-shaped). The same function the adapter itself binds with.
+ * The frozen-brief package digest `computeBriefPackageDigest` binds for a
+ * test prose and manifest with the SHA-256 digest function every production
+ * composition root injects, or null when that formula refuses the package
+ * (empty or over-size prose or manifest, or secret-shaped). The same
+ * function the adapter itself binds with.
  */
-function digestOfProseOrNull(prose: string): string | null {
-  const computed = computeBriefPackageDigest({ prose }, sha256HexDigest);
+function digestOfPackageOrNull(prose: string, manifestRaw: string): string | null {
+  const computed = computeBriefPackageDigest({ prose, manifestRaw }, sha256HexDigest);
   return computed.ok ? computed.briefDigest : null;
 }
 
-const fixtureDigest = digestOfProseOrNull(BRIEF_TEXT);
+const fixtureDigest = digestOfPackageOrNull(BRIEF_TEXT, BRIEF_MANIFEST);
 if (fixtureDigest === null) {
-  throw new Error('the fixture brief text must digest');
+  throw new Error('the fixture brief package must digest');
 }
-/** The digest a matching brief-verify request carries: the prose-only digest of `BRIEF_TEXT`. */
+/** The digest a matching brief-verify request carries: the package digest of `BRIEF_TEXT` plus `BRIEF_MANIFEST`. */
 const DIGEST = fixtureDigest;
 const ATTEMPT = attemptIdForBrief(PROJECT, DIGEST);
 const ASSESSMENT_ID = assessmentIdForBrief(PROJECT, DIGEST);
@@ -179,34 +182,38 @@ function briefSubject(overrides: {
 }
 
 function briefRequest(overrides: Partial<ReviewRequest> = {}): ReviewRequest {
-  // The subject digest is derived from the request's own brief text through
-  // the same prose-only formula the adapter binds with, so a request that
-  // overrides `briefText` stays self-consistent. Text the formula refuses
-  // (empty, over 64 KiB, secret-shaped) keeps the fixture digest and is
-  // refused by the adapter's own checks first.
+  // The subject digest is derived from the request's own brief package — the
+  // prose plus the raw manifest bytes — through the same formula the adapter
+  // binds with, so a request that overrides `briefText` or `briefManifestRaw`
+  // stays self-consistent. A package the formula refuses (empty, over 64 KiB
+  // of prose, secret-shaped) keeps the fixture digest and is refused by the
+  // adapter's own checks first.
   const briefText = typeof overrides.briefText === 'string' ? overrides.briefText : BRIEF_TEXT;
+  const briefManifestRaw = typeof overrides.briefManifestRaw === 'string' ? overrides.briefManifestRaw : BRIEF_MANIFEST;
   return {
     requestId: REQUEST_ID,
     kind: 'brief-verify',
     attemptId: ATTEMPT,
     projectId: PROJECT,
     candidateHeadSha: HEAD,
-    subject: briefSubject({ briefPackageDigest: digestOfProseOrNull(briefText) ?? DIGEST }),
+    subject: briefSubject({ briefPackageDigest: digestOfPackageOrNull(briefText, briefManifestRaw) ?? DIGEST }),
     policyRevision: POLICY,
     implementerModel: IMPLEMENTER,
     reviewerModel: REVIEWER,
     briefText: BRIEF_TEXT,
+    briefManifestRaw: BRIEF_MANIFEST,
     ...overrides,
   };
 }
 
 /**
  * A brief-verify request whose brief text is `text`, bound to that text's
- * prose-only digest through the attempt id and the subject. A matching
- * delegate receipt is `briefReceiptForDigest` of the same digest.
+ * package digest (with the fixture manifest) through the attempt id and the
+ * subject. A matching delegate receipt is `briefReceiptForDigest` of the same
+ * digest.
  */
 function briefRequestForText(text: string): { readonly digest: string; readonly request: ReviewRequest } {
-  const digest = digestOfProseOrNull(text);
+  const digest = digestOfPackageOrNull(text, BRIEF_MANIFEST);
   if (digest === null) {
     throw new Error('the test brief text must digest');
   }
@@ -432,7 +439,7 @@ describe('ReviewRequestAdapter brief-verify request', () => {
     expect(calls[0]?.briefText).toBe(' x ');
   });
 
-  it('accepts a brief text whose prose digest matches the subject digest and forwards it to the reviewer', async () => {
+  it('accepts a real prose+manifest package whose digest matches the subject digest and forwards both parts to the reviewer', async () => {
     const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
     const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(briefRequest());
     expect(result.outcome).toBe('receipt');
@@ -450,6 +457,38 @@ describe('ReviewRequestAdapter brief-verify request', () => {
     const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(
       briefRequest({ briefText: changed, subject: briefSubject() }),
     );
+    expect(result).toEqual(INVALID);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses a request whose briefManifestRaw differs by one byte from the digest the subject carries, and requests no review', async () => {
+    // One byte different from `BRIEF_MANIFEST`, with the subject digest still
+    // naming the fixture package: the digest no longer identifies the
+    // manifest a reviewer would be bound to, so the request is refused before
+    // any reviewer call.
+    const changedManifest = BRIEF_MANIFEST.replace('":2,', '":3,');
+    const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
+    const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(
+      briefRequest({ briefManifestRaw: changedManifest, subject: briefSubject() }),
+    );
+    expect(result).toEqual(INVALID);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses a request with no briefManifestRaw and requests no review', async () => {
+    // The frozen-brief digest covers prose plus manifest, so a request that
+    // carries only the prose cannot be bound to the subject digest at all.
+    const request = omitKey(briefRequest(), 'briefManifestRaw');
+    const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
+    const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(request);
+    expect(result).toEqual(INVALID);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses a request whose briefManifestRaw is not a string and requests no review', async () => {
+    const request = briefRequest({ briefManifestRaw: 7 as unknown as string });
+    const { calls, requestIndependentReview } = reviewing({ outcome: 'reviewed', receipt: briefReceipt() });
+    const result = await new ReviewRequestAdapter({ requestIndependentReview }).requestReview(request);
     expect(result).toEqual(INVALID);
     expect(calls).toHaveLength(0);
   });
@@ -767,6 +806,14 @@ describe('brief-verify invalid-request', () => {
     })() as unknown as string })],
     ['a non-iterable briefText', briefRequest({ briefText: { length: 1 } as unknown as string })],
     ['a numeric briefText', briefRequest({ briefText: 7 as unknown as string })],
+    ['a missing briefManifestRaw', (() => {
+      const request = briefRequest();
+      const rest = { ...request };
+      delete rest.briefManifestRaw;
+      return rest;
+    })()],
+    ['an empty briefManifestRaw', briefRequest({ briefManifestRaw: '' })],
+    ['a numeric briefManifestRaw', briefRequest({ briefManifestRaw: 7 as unknown as string })],
     ['a diffSummary', briefRequest({ diffSummary: 'scope' })],
     ['an empty diffSummary', briefRequest({ diffSummary: '' })],
     ['a numeric nowIso', briefRequest({ nowIso: 7 as unknown as string })],

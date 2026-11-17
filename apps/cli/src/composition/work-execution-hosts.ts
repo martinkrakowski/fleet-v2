@@ -157,8 +157,11 @@ function classifyBriefAttemptId(attemptId: unknown): BriefAttemptIdClass {
  * one work order, or two work orders that share a brief digest, must not
  * pick one arbitrarily. A list longer than `MAX_BRIEF_ATTEMPTS_READ` cannot
  * prove uniqueness, so it returns null too. The length is read once and the
- * loop stops at that count. A throw while reading a record or a work order
- * returns null (fail closed) and never propagates.
+ * loop stops at that count. A repository failure is NOT "no attempt": a throw
+ * while listing or reading a work order, or a list whose shape the locator
+ * cannot read, propagates as the locator's failure, never as a null that
+ * would read as "No attempt is recorded for ...". Only a successfully read
+ * store with zero (or several) matches returns null.
  */
 async function findUniqueBriefAttempt(
   projectId: string,
@@ -166,41 +169,40 @@ async function findUniqueBriefAttempt(
   attemptRepository: BriefAttemptStore,
   workOrderRepository: BriefWorkOrderStore,
 ): Promise<AttemptRecord | null> {
-  try {
-    const listed = await attemptRepository.listAllAttempts();
-    if (!Array.isArray(listed)) {
-      return null;
-    }
-    const count = listed.length;
-    if (!Number.isSafeInteger(count) || count < 0 || count > MAX_BRIEF_ATTEMPTS_READ) {
-      return null;
-    }
-    let match: AttemptRecord | null = null;
-    for (let index = 0; index < count; index += 1) {
-      const attempt = listed[index];
-      if (attempt === undefined || attempt === null || typeof attempt !== 'object') {
-        continue;
-      }
-      if (attempt.briefDigest !== digest) {
-        continue;
-      }
-      const workOrderId = attempt.workOrderId;
-      if (typeof workOrderId !== 'string') {
-        continue;
-      }
-      const workOrder = await workOrderRepository.findWorkOrderById(workOrderId);
-      if (workOrder?.projectId !== projectId) {
-        continue;
-      }
-      if (match !== null) {
-        return null;
-      }
-      match = attempt;
-    }
-    return match;
-  } catch {
-    return null;
+  const listed = await attemptRepository.listAllAttempts();
+  if (!Array.isArray(listed)) {
+    throw new Error('The attempt repository returned a list that cannot be read');
   }
+  const count = listed.length;
+  if (!Number.isSafeInteger(count) || count < 0 || count > MAX_BRIEF_ATTEMPTS_READ) {
+    throw new Error('The attempt repository returned a list whose length cannot be read');
+  }
+  let match: AttemptRecord | null = null;
+  for (let index = 0; index < count; index += 1) {
+    const attempt = listed[index];
+    if (attempt === undefined || attempt === null || typeof attempt !== 'object') {
+      continue;
+    }
+    if (attempt.briefDigest !== digest) {
+      continue;
+    }
+    const workOrderId = attempt.workOrderId;
+    if (typeof workOrderId !== 'string') {
+      continue;
+    }
+    const workOrder = await workOrderRepository.findWorkOrderById(workOrderId);
+    if (workOrder === undefined) {
+      throw new Error('The work order repository returned a record that cannot be read');
+    }
+    if (workOrder?.projectId !== projectId) {
+      continue;
+    }
+    if (match !== null) {
+      return null;
+    }
+    match = attempt;
+  }
+  return match;
 }
 
 /**
@@ -208,7 +210,9 @@ async function findUniqueBriefAttempt(
  * id resolves through `findUniqueBriefAttempt`. A malformed or unmatched
  * `brief:` id returns null and is not passed to `findAttemptById`, so an
  * attempt stored under that same string is not a match. Every other string
- * keeps `findAttemptById`. A non-string returns null without a repository read.
+ * keeps `findAttemptById`. A non-string returns null without a repository
+ * read. A repository failure (a throw, or a list the locator cannot read)
+ * propagates to `locate`'s caller instead of reading as "no attempt".
  */
 export async function findAttemptForReview(
   attemptId: unknown,

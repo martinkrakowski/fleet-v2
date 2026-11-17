@@ -32,6 +32,7 @@ import {
   ForgeActionAdapter,
   LaneRun,
   buildArtifactManifest,
+  computeBriefPackageDigest,
   laneRunConductEntry,
   nextAttemptRevision,
   serializeArtifactManifest,
@@ -1553,13 +1554,24 @@ describe("conductor reaper merged-worktree repair through production composition
 });
 
 const BRIEF_PROJECT_ID = 'proj-brief-co18a3b';
-// The end-to-end brief-verify request below binds its `briefText` to the
-// digest the subject carries: the prose-only digest the adapter computes with
-// `computeBriefPackageDigest` and the SHA-256 function the composition roots
-// inject. The test text must digest to `BRIEF_DIGEST` or the request is
-// refused as a mismatch.
+// The end-to-end brief-verify request below binds its `briefText` and its
+// `briefManifestRaw` to the digest the subject carries: the frozen-brief
+// package digest `computeBriefPackageDigest({ prose, manifestRaw })` computes
+// with the SHA-256 function the composition roots inject (`prose + '\n' +
+// manifestRaw`). The test package must digest to `BRIEF_DIGEST` or the
+// request is refused as a mismatch.
 const BRIEF_TEXT = 'Review the frozen brief package for this project.';
-const BRIEF_DIGEST = createHash('sha256').update(BRIEF_TEXT, 'utf8').digest('hex');
+const BRIEF_MANIFEST = '{"schemaVersion":2,"attemptId":"attempt-brief-1"}';
+const BRIEF_DIGEST = (() => {
+  const computed = computeBriefPackageDigest(
+    { prose: BRIEF_TEXT, manifestRaw: BRIEF_MANIFEST },
+    (content) => createHash('sha256').update(content, 'utf8').digest('hex'),
+  );
+  if (!computed.ok) {
+    throw new Error('the fixture brief package must digest');
+  }
+  return computed.briefDigest;
+})();
 const OTHER_DIGEST = 'cd'.repeat(32);
 const IMPLEMENTER_MODEL = 'example-provider/glm-5.3';
 const REVIEWER_MODEL = 'example-provider/grok-4.7';
@@ -1767,6 +1779,7 @@ describe('CO18a3b brief-verify attempt resolution', () => {
           implementerModel: IMPLEMENTER_MODEL,
           reviewerModel: REVIEWER_MODEL,
           briefText: BRIEF_TEXT,
+          briefManifestRaw: BRIEF_MANIFEST,
         };
         const requested = await runtime.conductor.reviewRequest.requestReview(review);
         expect(requested).toMatchObject({
@@ -1952,7 +1965,7 @@ describe('CO18a3b brief-verify attempt resolution', () => {
     expect(lookup.log).toEqual({ findIds: [], listed: 0 });
   });
 
-  it('returns null when the attempt list is a non-iterable and does not iterate it', async () => {
+  it('rejects when the attempt list is a non-iterable store shape instead of reading it as no attempt, and does not iterate it', async () => {
     const head = makeHeadH();
     const match = { ...makeAttempt('attempt-match', 'wo-match', head), briefDigest: BRIEF_DIGEST };
     let iterated = false;
@@ -1972,8 +1985,35 @@ describe('CO18a3b brief-verify attempt resolution', () => {
 
     await expect(
       findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
-    ).resolves.toBeNull();
+    ).rejects.toThrow('cannot be read');
     expect(iterated).toBe(false);
+    expect(lookup.log.listed).toBe(1);
+    expect(lookup.log.findIds).toEqual([]);
+  });
+
+  it('rejects when listing attempts throws instead of reading the failure as no attempt', async () => {
+    const lookup = briefLookup({ findThrows: true, list: async () => { throw new Error('store unavailable'); } });
+    await expect(
+      findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
+    ).rejects.toThrow('store unavailable');
+    expect(lookup.log.listed).toBe(1);
+    expect(lookup.log.findIds).toEqual([]);
+  });
+
+  it('rejects when reading the matching attempt work order throws instead of reading the failure as no attempt', async () => {
+    const head = makeHeadH();
+    const match = { ...makeAttempt('attempt-match', 'wo-match', head), briefDigest: BRIEF_DIGEST };
+    const lookup = briefLookup({
+      attempts: [match],
+      findThrows: true,
+      orders: new Map([['wo-match', orderFor('wo-match', BRIEF_PROJECT_ID)]]),
+    });
+    lookup.orders.findWorkOrderById = async () => {
+      throw new Error('work order store unavailable');
+    };
+    await expect(
+      findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
+    ).rejects.toThrow('work order store unavailable');
     expect(lookup.log.listed).toBe(1);
     expect(lookup.log.findIds).toEqual([]);
   });
@@ -2163,7 +2203,7 @@ describe('CO18a3b brief-verify attempt resolution', () => {
     expect(lookup.log.listed).toBe(1);
   });
 
-  it('returns null, after reading the list once, when the attempt list exceeds the read cap even if one attempt matches, and does not call findAttemptById', async () => {
+  it('rejects, after reading the list once, when the attempt list exceeds the read cap even if one attempt matches, and does not call findAttemptById', async () => {
     const head = makeHeadH();
     const match = { ...makeAttempt('attempt-match', 'wo-match', head), briefDigest: BRIEF_DIGEST };
     const filler = { ...makeAttempt('attempt-filler', 'wo-filler', head), briefDigest: OTHER_DIGEST };
@@ -2177,7 +2217,7 @@ describe('CO18a3b brief-verify attempt resolution', () => {
 
     await expect(
       findAttemptForReview(attemptIdForBrief(BRIEF_PROJECT_ID, BRIEF_DIGEST), lookup.attempts, lookup.orders),
-    ).resolves.toBeNull();
+    ).rejects.toThrow('cannot be read');
     expect(lookup.log.listed).toBe(1);
     expect(lookup.log.findIds).toEqual([]);
   });

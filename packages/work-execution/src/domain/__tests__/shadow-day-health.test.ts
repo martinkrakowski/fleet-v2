@@ -527,6 +527,36 @@ describe('hostile input', () => {
     expect(evaluateShadowStateIntegrity(proxy)).toEqual(evaluateShadowStateIntegrity(plain));
     expect(getTraps).toBe(0);
   });
+
+  it('S12 refuses a revoked Proxy instead of throwing', () => {
+    const { proxy, revoke } = Proxy.revocable(dayInput(cleanDay(720)), {});
+    revoke();
+    expect(evaluateShadowTickHealth(proxy)).toEqual({ status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('S9 refuses a revoked Proxy instead of throwing', () => {
+    const { proxy, revoke } = Proxy.revocable(stateInput({}), {});
+    revoke();
+    expect(evaluateShadowStateIntegrity(proxy)).toEqual({ status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('S12 refuses a Proxy whose ownKeys trap throws', () => {
+    const proxy = new Proxy(dayInput(cleanDay(720)), {
+      ownKeys() {
+        throw new Error('trap');
+      },
+    });
+    expect(evaluateShadowTickHealth(proxy)).toEqual({ status: 'unknown', reason: 'invalid-input' });
+  });
+
+  it('S9 refuses a Proxy whose getOwnPropertyDescriptor trap throws', () => {
+    const proxy = new Proxy(stateInput({}), {
+      getOwnPropertyDescriptor() {
+        throw new Error('trap');
+      },
+    });
+    expect(evaluateShadowStateIntegrity(proxy)).toEqual({ status: 'unknown', reason: 'invalid-input' });
+  });
 });
 
 describe('constants', () => {

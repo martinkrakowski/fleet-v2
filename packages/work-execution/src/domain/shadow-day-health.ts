@@ -121,6 +121,17 @@ function hasStarvedRun(sequence: readonly JobSequence[]): boolean {
  * throws, never echoes the input.
  */
 export function evaluateShadowTickHealth(input: unknown): ShadowCriterionEvaluation {
+  try {
+    return judgeDayTickHealth(input);
+  } catch {
+    // A revoked Proxy, or one whose getPrototypeOf/ownKeys/descriptor trap
+    // throws, can make even the descriptor readers throw; the never-throws
+    // contract turns that into a typed refusal.
+    return UNKNOWN('invalid-input');
+  }
+}
+
+function judgeDayTickHealth(input: unknown): ShadowCriterionEvaluation {
   const snapshot = readExactPlainRecord(input, ['day', 'events']);
   if (snapshot === null) {
     return UNKNOWN('invalid-input');
@@ -270,6 +281,15 @@ function tallyJournal(entries: readonly SampledJournalEntry[]): Map<string, KeyT
  * data's verdict. Never throws, never echoes the input.
  */
 export function evaluateShadowStateIntegrity(input: unknown): ShadowCriterionEvaluation {
+  try {
+    return judgeDayStateIntegrity(input);
+  } catch {
+    // Same revoked-Proxy / throwing-trap case as the tick evaluator above.
+    return UNKNOWN('invalid-input');
+  }
+}
+
+function judgeDayStateIntegrity(input: unknown): ShadowCriterionEvaluation {
   const snapshot = readExactPlainRecord(input, ['stateCheck', 'journal', 'sampledAtIso']);
   if (snapshot === null) {
     return UNKNOWN('invalid-input');

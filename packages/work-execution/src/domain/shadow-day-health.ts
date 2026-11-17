@@ -29,12 +29,29 @@ const FAIL = (reason: string): ShadowCriterionEvaluation => ({ status: 'fail', r
 const PASS = (reason: string): ShadowCriterionEvaluation => ({ status: 'pass', reason });
 
 /**
+ * One array validated by `readBoundedArray`: the array itself, plus the
+ * length already read from its own property descriptor. Every caller uses
+ * THIS length for its iteration bound and never reads `.length` on `array`
+ * again: a plain `.length` property read on a Proxy-wrapped array invokes
+ * its `get` trap, which can lie (report a shorter length than the real one,
+ * or zero), letting a caller silently skip entries it should have walked —
+ * turning a real failure into a false pass, or hiding a starved tail.
+ */
+interface BoundedArray {
+  readonly array: readonly unknown[];
+  readonly length: number;
+}
+
+/**
  * The capped element count of a real, dense array, or null for any stand-in.
  * Reads only the `length` own descriptor and `Object.keys` (no values), so no
  * getter and no Proxy `get` trap ever runs; an oversized or sparse array is
- * refused from its length alone, before any element is touched.
+ * refused from its length alone, before any element is touched. Returns the
+ * length read from the descriptor alongside the array (see `BoundedArray`):
+ * no caller may read `.length` on the returned array as a plain property
+ * access again.
  */
-function readBoundedArray(value: unknown, cap: number): readonly unknown[] | null {
+function readBoundedArray(value: unknown, cap: number): BoundedArray | null {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     return null;
   }
@@ -51,7 +68,7 @@ function readBoundedArray(value: unknown, cap: number): readonly unknown[] | nul
   if (Object.keys(value).length !== lengthDescriptor.value) {
     return null;
   }
-  return value as readonly unknown[];
+  return { array: value as readonly unknown[], length: lengthDescriptor.value };
 }
 
 /** The own data-property element at `index`; a hole or an accessor reads as undefined. */
@@ -153,8 +170,11 @@ function judgeDayTickHealth(input: unknown): ShadowCriterionEvaluation {
     return UNKNOWN('daemon-events-invalid');
   }
   const jobEvents: DaemonEventRecord[] = [];
+  // `events.length` below is the length `readBoundedArray` already read
+  // from the descriptor, never a plain `.length` read on `events.array`
+  // (which may be a Proxy whose `get` trap can lie about it).
   for (let index = 0; index < events.length; index += 1) {
-    const read = readDaemonEventRecord(ownElement(events, index));
+    const read = readDaemonEventRecord(ownElement(events.array, index));
     if (!read.ok) {
       return UNKNOWN('daemon-events-invalid');
     }
@@ -442,8 +462,11 @@ function judgeDayStateIntegrity(input: unknown): ShadowCriterionEvaluation {
     return UNKNOWN('invalid-input');
   }
   const entries: SampledJournalEntry[] = [];
+  // `journal.length` below is the length `readBoundedArray` already read
+  // from the descriptor, never a plain `.length` read on `journal.array`
+  // (which may be a Proxy whose `get` trap can lie about it).
   for (let index = 0; index < journal.length; index += 1) {
-    const entry = readSampledEntry(ownElement(journal, index), index);
+    const entry = readSampledEntry(ownElement(journal.array, index), index);
     if (entry === null) {
       return UNKNOWN('invalid-input');
     }

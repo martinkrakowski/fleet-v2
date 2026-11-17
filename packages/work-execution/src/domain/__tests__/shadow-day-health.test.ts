@@ -778,6 +778,55 @@ describe('hostile input', () => {
     expect(result).toEqual({ status: 'unknown', reason: 'state-check-unavailable' });
     expect(result).toEqual(evaluateShadowStateIntegrity(stateInput({ stateCheck: plainStateCheck })));
   });
+
+  it('S9 over a Proxy journal array with a lying length-0 get trap still returns the honest fail, not a false pass (SH5b)', () => {
+    // `readBoundedArray` validates the journal array's `length` through its
+    // own property descriptor (`getOwnPropertyDescriptor`, never `get`) and
+    // returns that length alongside the array (see `BoundedArray` in
+    // shadow-day-health.ts). The S9 journal loop iterates on THAT returned
+    // length, never a plain `.length` read on the array value itself — so
+    // even a journal array whose `get` trap lies about `length` (claiming 0
+    // for a two-entry array) is never consulted for its length: a plain
+    // `.length` read on it would have been, letting the loop silently skip
+    // both entries and turn this real `fail/journal-duplicate-intent` into
+    // a false `pass/state-consistent`.
+    const honestJournal = [
+      journalEntry('k1', 'intent', null, PREV_23(50)),
+      journalEntry('k1', 'intent', null, PREV_23(51)),
+    ];
+    let getTraps = 0;
+    const lyingJournal = new Proxy(honestJournal, {
+      get(target, property, receiver) {
+        getTraps += 1;
+        return property === 'length' ? 0 : Reflect.get(target, property, receiver);
+      },
+    });
+    const honestResult = evaluateShadowStateIntegrity(stateInput({ journal: honestJournal }));
+    expect(honestResult).toEqual({ status: 'fail', reason: 'journal-duplicate-intent' });
+    expect(evaluateShadowStateIntegrity(stateInput({ journal: lyingJournal }))).toEqual(honestResult);
+    expect(getTraps).toBe(0);
+  });
+
+  it('S12 over a Proxy events array with a lying length-0 get trap still returns the honest pass, not a false fail (SH5b)', () => {
+    // The S12 twin of the test above: the daemon-tick evaluator's events
+    // loop also iterates on the length `readBoundedArray` returns, never a
+    // plain `.length` read on the events value. Without that fix, the
+    // lying trap below (claiming 0 for a 720-event clean day) would make
+    // the loop skip every event, so `totalTicks` would stay 0 and this real
+    // `pass/ticks-within-budget` would wrongly become `fail/too-few-ticks`.
+    const honestEvents = cleanDay(720);
+    let getTraps = 0;
+    const lyingEvents = new Proxy(honestEvents, {
+      get(target, property, receiver) {
+        getTraps += 1;
+        return property === 'length' ? 0 : Reflect.get(target, property, receiver);
+      },
+    });
+    const honestResult = s12(dayInput(honestEvents));
+    expect(honestResult).toEqual({ status: 'pass', reason: 'ticks-within-budget' });
+    expect(s12(dayInput(lyingEvents))).toEqual(honestResult);
+    expect(getTraps).toBe(0);
+  });
 });
 
 describe('constants', () => {

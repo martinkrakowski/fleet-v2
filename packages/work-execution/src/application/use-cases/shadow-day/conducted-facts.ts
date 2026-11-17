@@ -211,6 +211,18 @@ function ownKeysAreIndices(value: readonly unknown[], length: number): boolean {
  * as "not a merged pull-request list" — the caller refuses the request.
  */
 export function readMergedPullRequestIds(value: unknown): ReadonlySet<number> | null {
+  // A hostile container (e.g. a Proxy whose `ownKeys` or `getOwnPropertyDescriptor`
+  // trap throws) must produce the typed refusal `null`, never a propagated throw —
+  // the caller refuses the request, so any throw reads as "not a merged
+  // pull-request list".
+  try {
+    return readMergedPullRequestIdsOrThrow(value);
+  } catch {
+    return null;
+  }
+}
+
+function readMergedPullRequestIdsOrThrow(value: unknown): ReadonlySet<number> | null {
   if (!Array.isArray(value)) {
     return null;
   }

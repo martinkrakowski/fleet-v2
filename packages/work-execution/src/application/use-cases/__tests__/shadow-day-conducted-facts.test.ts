@@ -12,6 +12,7 @@ import {
   SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN,
   SHADOW_FACTS_MAX_RECEIPTS_PER_HEAD,
   SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS,
+  readMergedPullRequestIds,
   readShadowConformanceRuns,
   type ShadowConformanceRunsDependencies,
 } from '../shadow-day/index.js';
@@ -367,6 +368,25 @@ describe('readShadowConformanceRuns', () => {
       const result = await readShadowConformanceRuns(deps, request());
       expect(result).toEqual({ status: 'unknown', reason: 'receipts-unavailable' });
       expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
+    });
+
+    it('a found receipt result whose review value is malformed reaches the outer catch as a typed unknown, never a rejection', async () => {
+      const deps = makeDeps({
+        runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
+        attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
+        receipts: () => ({
+          outcome: 'found',
+          verification: [],
+          // The `found` `review` value is read at the per-head cap check
+          // outside the interior refusal wraps, so a `get` trap that throws
+          // reaches the reader's outer catch — the typed `unknown` result,
+          // never a rejection.
+          review: new Proxy([], { get: () => { throw 42; } }),
+        }) as unknown as ReadReceiptsForHeadResult,
+      });
+      const result = await readShadowConformanceRuns(deps, request());
+      expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
+      expect(JSON.stringify(result)).not.toContain('42');
     });
 
     it('a review receipts list over the per-head cap yields unknown/too-many-receipts', async () => {
@@ -1036,6 +1056,14 @@ describe('readShadowConformanceRuns hostile input', () => {
     const result = await readShadowConformanceRuns(deps, hostile);
     expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
     expect(deps.calls.runsList).toBe(0);
+  });
+
+  it('readMergedPullRequestIds called directly with a Proxy whose ownKeys trap throws returns null and never throws', () => {
+    const hostile = new Proxy([PR], {
+      ownKeys: () => { throw 42; },
+    });
+    expect(() => readMergedPullRequestIds(hostile)).not.toThrow();
+    expect(readMergedPullRequestIds(hostile)).toBeNull();
   });
 
   it('the reader is not a constant: the same deps flip the answer when the request changes', async () => {

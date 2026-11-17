@@ -658,20 +658,36 @@ function rollupContexts(
   return objectAt(rollup.contexts);
 }
 
+/**
+ * `pageInfo` is strict. `hasNextPage` is a boolean and `endCursor` is present.
+ * The brief's cursor is `string | null`: null is allowed only when there is
+ * no next page. A missing key, an empty cursor or any other type is unreadable.
+ */
 function pageCursor(pageInfo: unknown): { readonly hasMore: boolean; readonly endCursor: string | null } | null {
   const info = objectAt(pageInfo);
-  if (info === null || typeof info.hasNextPage !== 'boolean') {
+  if (info === null || !Object.hasOwn(info, 'hasNextPage') || !Object.hasOwn(info, 'endCursor')) {
     return null;
   }
-  const rawCursor = info.endCursor;
-  const endCursor = typeof rawCursor === 'string' && rawCursor.length > 0 ? rawCursor : null;
-  if (info.hasNextPage && endCursor === null) {
+  if (typeof info.hasNextPage !== 'boolean') {
     return null;
   }
-  return { hasMore: info.hasNextPage, endCursor };
+  return cursorWhen(info.hasNextPage, info.endCursor);
 }
 
-function mapCheckRun(status: unknown, conclusion: unknown): CommitContextNodeState {
+function cursorWhen(
+  hasNextPage: boolean,
+  endCursor: unknown,
+): { readonly hasMore: boolean; readonly endCursor: string | null } | null {
+  if (typeof endCursor === 'string' && endCursor.length > 0) {
+    return { hasMore: hasNextPage, endCursor };
+  }
+  if (endCursor === null && !hasNextPage) {
+    return { hasMore: false, endCursor: null };
+  }
+  return null;
+}
+
+function mapCheckRun(status: string, conclusion: string | null): CommitContextNodeState {
   if (status !== 'COMPLETED') {
     return 'pending';
   }
@@ -684,7 +700,7 @@ function mapCheckRun(status: unknown, conclusion: unknown): CommitContextNodeSta
   return 'other';
 }
 
-function mapStatusState(state: unknown): CommitContextNodeState {
+function mapStatusState(state: string): CommitContextNodeState {
   if (state === 'SUCCESS') {
     return 'success';
   }
@@ -697,14 +713,53 @@ function mapStatusState(state: unknown): CommitContextNodeState {
   return 'other';
 }
 
-function matchedNodeState(node: Record<string, unknown>, contextName: string): CommitContextNodeState | null {
-  if (node.__typename === 'CheckRun') {
-    return node.name === contextName ? mapCheckRun(node.status, node.conclusion) : null;
+/** A matched state, a well-typed non-match, or a field the page cannot trust. */
+type ContextNodeRead = CommitContextNodeState | 'skip' | 'unreadable';
+
+function isStringOrNull(value: unknown): value is string | null {
+  return value === null || typeof value === 'string';
+}
+
+/** A wrong-typed `name`, `status` or `conclusion` fails the page, on every CheckRun. */
+function checkRunRead(node: Record<string, unknown>, contextName: string): ContextNodeRead {
+  const name = node.name;
+  const status = node.status;
+  const conclusion = node.conclusion;
+  if (typeof name !== 'string' || typeof status !== 'string' || !isStringOrNull(conclusion)) {
+    return 'unreadable';
   }
-  if (node.__typename === 'StatusContext') {
-    return node.context === contextName ? mapStatusState(node.state) : null;
+  if (name !== contextName) {
+    return 'skip';
   }
-  return null;
+  return mapCheckRun(status, conclusion);
+}
+
+/** A wrong-typed `context` or `state` fails the page, on every StatusContext. */
+function statusContextRead(node: Record<string, unknown>, contextName: string): ContextNodeRead {
+  const context = node.context;
+  const state = node.state;
+  if (typeof context !== 'string' || typeof state !== 'string') {
+    return 'unreadable';
+  }
+  if (context !== contextName) {
+    return 'skip';
+  }
+  return mapStatusState(state);
+}
+
+function matchedNodeState(node: Record<string, unknown>, contextName: string): ContextNodeRead {
+  const typename = node.__typename;
+  if (typeof typename !== 'string') {
+    return 'unreadable';
+  }
+  if (typename === 'CheckRun') {
+    return checkRunRead(node, contextName);
+  }
+  if (typename === 'StatusContext') {
+    return statusContextRead(node, contextName);
+  }
+  // The brief skips any other typename; it is not a match and not a failure.
+  return 'skip';
 }
 
 function matchedStates(nodes: readonly unknown[], contextName: string): CommitContextNodeState[] | null {
@@ -714,9 +769,12 @@ function matchedStates(nodes: readonly unknown[], contextName: string): CommitCo
     if (record === null) {
       return null;
     }
-    const state = matchedNodeState(record, contextName);
-    if (state !== null) {
-      states.push(state);
+    const read = matchedNodeState(record, contextName);
+    if (read === 'unreadable') {
+      return null;
+    }
+    if (read !== 'skip') {
+      states.push(read);
     }
   }
   return states;
@@ -726,8 +784,8 @@ function matchedStates(nodes: readonly unknown[], contextName: string): CommitCo
  * The pure parse of one page. A present non-empty `errors` array, a field of
  * the wrong type, an oid other than `headSha`, or a broken cursor is
  * unreadable. A null commit object or a null rollup is known only on page 0;
- * a later page that loses either is unreadable. Any typename other than
- * CheckRun or StatusContext is skipped.
+ * a later page that loses either is unreadable. A CheckRun or StatusContext
+ * with a wrong-typed field fails the page. Any other typename is skipped.
  */
 export function parseCommitContextPage(
   stdout: unknown,

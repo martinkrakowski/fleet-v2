@@ -94,6 +94,32 @@ function unavailable(reason: string): ReadCommitContextResult {
 }
 
 const GATE = { headSha: HEAD, contextName: 'gate' } as const;
+const CLOSED_PAGE = { hasNextPage: false, endCursor: null } as const;
+
+function contextsBody(nodes: readonly unknown[], pageInfo: unknown): string {
+  return JSON.stringify({
+    data: {
+      repository: {
+        object: {
+          oid: HEAD,
+          statusCheckRollup: { contexts: { pageInfo, nodes } },
+        },
+      },
+    },
+  });
+}
+
+function readContexts(nodes: readonly unknown[], pageInfo: unknown): Promise<ReadCommitContextResult> {
+  return read(makeAdapter({ runGh: async () => ok(contextsBody(nodes, pageInfo)) }), GATE);
+}
+
+function checkNode(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', ...overrides };
+}
+
+function statusNode(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { __typename: 'StatusContext', context: 'gate', state: 'SUCCESS', ...overrides };
+}
 
 describe('readCommitContext', () => {
   it('returns success for one CheckRun gate whose conclusion is SUCCESS', async () => {
@@ -439,5 +465,60 @@ describe('readCommitContext', () => {
       expect(arg).not.toBe('--method');
       expect(arg).not.toContain('mutation');
     }
+  });
+
+  it('returns unreadable-contexts when a CheckRun name is not a string', async () => {
+    expect(await readContexts([checkNode({ name: 7 })], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a CheckRun status is not a string', async () => {
+    expect(await readContexts([checkNode({ status: 7 })], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a CheckRun conclusion is not a string or null', async () => {
+    expect(await readContexts([checkNode({ conclusion: 7 })], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a StatusContext context is not a string', async () => {
+    expect(await readContexts([statusNode({ context: 7 })], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a StatusContext state is not a string', async () => {
+    expect(await readContexts([statusNode({ state: 7 })], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when a node __typename is not a string', async () => {
+    const node = { __typename: 7, name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' };
+    expect(await readContexts([node], CLOSED_PAGE)).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns missing when a node has an unknown __typename', async () => {
+    const result = await readContexts([{ __typename: 'CheckSuite' }], CLOSED_PAGE);
+    expect(result).toEqual(found('missing'));
+    expect(JSON.stringify(result)).not.toContain('CheckSuite');
+  });
+
+  it('returns success when hasNextPage is false and endCursor is null', async () => {
+    expect(await readContexts([checkNode()], CLOSED_PAGE)).toEqual(found('success'));
+  });
+
+  it('returns unreadable-contexts when pageInfo omits endCursor', async () => {
+    expect(await readContexts([checkNode()], { hasNextPage: false })).toEqual(unavailable('unreadable-contexts'));
+  });
+
+  it('returns unreadable-contexts when pageInfo endCursor is not a string or null', async () => {
+    expect(await readContexts([checkNode()], { hasNextPage: false, endCursor: 7 })).toEqual(
+      unavailable('unreadable-contexts'),
+    );
+  });
+
+  it('returns unreadable-contexts when pageInfo hasNextPage is not a boolean', async () => {
+    expect(await readContexts([checkNode()], { hasNextPage: 'false', endCursor: null })).toEqual(
+      unavailable('unreadable-contexts'),
+    );
+  });
+
+  it('returns unreadable-contexts when hasNextPage is true and endCursor is absent', async () => {
+    expect(await readContexts([checkNode()], { hasNextPage: true })).toEqual(unavailable('unreadable-contexts'));
   });
 });

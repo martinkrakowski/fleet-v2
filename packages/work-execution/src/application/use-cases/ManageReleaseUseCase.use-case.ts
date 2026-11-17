@@ -790,7 +790,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       if (request.action === 'rollback') {
         await this.markRepointedBestEffort(request.root, operation.opId, target);
       }
-      await this.retireOtherStaleRollbackIntent(request.root, target);
+      await this.retireOtherStaleRollbackIntent(request.root, operation.opId);
       // The repoint stands from here on (this attempt's own, or the crashed
       // one this call resumed): a prune that throws is an unfinished prune of
       // an applied release, never a refusal a caller would retry.
@@ -814,9 +814,9 @@ export class ManageReleaseUseCase implements ManageReleasePort {
   /**
    * CO14b fix round 10: mark this rollback's own intent repointed, once its
    * mutation is confirmed landed. Best effort -- a failure here is corrected
-   * next time either `resolveTarget`'s own current-vs-sha check runs (an
-   * unmarked intent is always adopted, which stays safe because the ordinary
-   * `current !== plannedCurrent` check still gates it) or this same mark is
+   * next time either `resolveTarget`'s own check runs (a marked intent is
+   * adopted only while `current` equals its sha; an unmarked one only while
+   * it still describes the live state, per round 14) or this same mark is
    * attempted again on a later call.
    */
   private async markRepointedBestEffort(root: string, opId: string, sha: string): Promise<void> {
@@ -828,24 +828,27 @@ export class ManageReleaseUseCase implements ManageReleasePort {
   }
 
   /**
-   * CO14b fix round 10 (finding 2's residual case): retire any OTHER open
-   * rollback intent once this call has confirmed `current` is at `target`.
-   * Never touches this call's own intent, whose sha is exactly `target`.
-   * Best effort: an unreadable peek, or a failing retirement, simply leaves
-   * the stale intent for `resolveTarget`'s own reactive check to catch
-   * instead, the next time a rollback is requested.
+   * CO14b fix round 10 (finding 2's residual case), round 15: retire any
+   * OTHER open, marked rollback intent once this call has confirmed `current`
+   * is at its target. "Other" is decided by opId, never by sha: a stale
+   * marked intent whose sha equals this call's target (a swap landing on the
+   * very build an abandoned rollback aimed at) would otherwise survive and be
+   * adopted by a later rollback through the `repointed && current === sha`
+   * branch, replaying its spent grant as a silent no-op. This call's own
+   * intent (same opId) is never touched. Best effort, deliberately: the
+   * repoint has already landed, so a refusal here would misreport an applied
+   * release. An unreadable peek or failing retirement leaves the intent open
+   * (the residual risk: a later rollback may adopt it; no second intent is
+   * ever opened, so the round-14 two-open-intents case cannot arise here).
    */
-  private async retireOtherStaleRollbackIntent(root: string, target: string): Promise<void> {
+  private async retireOtherStaleRollbackIntent(root: string, ownOpId: string): Promise<void> {
     try {
       const open = await this.deps.store.peekAnyOpenOperation({ root, action: 'rollback' });
-      // CO14b fix round 11 (finding 2): a differing sha alone proves nothing
-      // -- an intent whose OWN `repointed` is still `false` has not reached
-      // its own repoint step yet and may be a different, legitimate,
-      // still-pending operation with every right to exist. Only an intent
-      // that is BOTH for a different sha AND already `repointed: true` is
-      // provably contradicted by `current` being confirmed, right here,
-      // at THIS call's own target instead.
-      if (open.outcome === 'open' && open.sha !== target && open.repointed) {
+      // Round 11 (finding 2): an intent whose own `repointed` is still `false`
+      // has not reached its repoint and may be a legitimate pending operation;
+      // only a marked one is provably contradicted by `current` being
+      // confirmed here.
+      if (open.outcome === 'open' && open.opId !== ownOpId && open.repointed) {
         await this.retireRollbackIntent(root, open.opId, open.sha);
       }
     } catch {

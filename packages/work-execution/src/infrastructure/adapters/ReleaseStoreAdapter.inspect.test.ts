@@ -301,7 +301,9 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
         swapped = true;
         // A concurrent install replaces the whole verified tree, marker
         // included, after the marker was accepted and before the files.
-        await fs.rm(buildDir, { recursive: true });
+        // Rename (as a real install does) keeps the old inode alive, so the
+        // new directory cannot reuse its identity.
+        await fs.rename(buildDir, buildDir + '.replaced-old');
         await fs.mkdir(buildDir);
         await fs.writeFile(
           path.join(buildDir, '.fleet-release-verified'),
@@ -326,8 +328,10 @@ describe('ReleaseStoreAdapter.inspectReleaseFiles', () => {
         // A concurrent install replaces the whole tree, marker included,
         // after the first lstat pinned it and before the marker read. The
         // replacement carries its own valid marker for the same sha, so only
-        // the sandwiched identity check can refuse it.
-        await fs.rm(buildDir, { recursive: true });
+        // the sandwiched identity check can refuse it. Rename (as a real
+        // install does) keeps the old inode alive, so the new directory cannot
+        // reuse its identity.
+        await fs.rename(buildDir, buildDir + '.replaced-old');
         await fs.mkdir(buildDir);
         await fs.writeFile(
           path.join(buildDir, '.fleet-release-verified'),

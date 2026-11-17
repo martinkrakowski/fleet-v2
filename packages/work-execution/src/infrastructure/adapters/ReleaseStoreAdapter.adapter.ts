@@ -535,7 +535,10 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
    * prune) and accidental symlinks; they do not defend against an actor
    * with write access to the release root, who could forge a verified
    * marker. Without `openat` a residual race window is narrowed by the
-   * build-directory and per-file identity re-checks, not eliminated.
+   * build-directory and per-file identity re-checks, not eliminated. A
+   * directory deleted and recreated can reuse its inode number, so identity
+   * checks detect a rename-swap (the store's install mode) but not
+   * delete-then-recreate; final marker equality still applies.
    */
   async inspectReleaseFiles(input: unknown): Promise<ReleaseFilesInspection> {
     try {

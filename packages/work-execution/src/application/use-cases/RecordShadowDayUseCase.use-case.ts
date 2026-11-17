@@ -341,6 +341,39 @@ function ownDataProperty(value: object, key: string): unknown {
 }
 
 /**
+ * Read an outer `attestations.read` result as an EXACT plain record:
+ * `status: 'missing'` must carry exactly the own data key `status`, and
+ * `status: 'ok'` must carry exactly the own data keys `status` and `ledger`.
+ * Every key check goes through `Reflect.ownKeys` and
+ * `Object.getOwnPropertyDescriptor`, so no accessor ever runs and nothing
+ * throws out of `execute`. Any extra key, accessor, wrong type or non-plain
+ * object yields the invalid-attestations seed `{}`, which the domain
+ * evaluator refuses as `attestations-unreadable` for all four criteria —
+ * never a pass, never an absent store.
+ */
+function readAttestationResult(value: unknown): unknown {
+  if (!isPlainRecordObject(value)) {
+    return {};
+  }
+  const names = Reflect.ownKeys(value);
+  const status = ownDataProperty(value, 'status');
+  if (status === 'missing') {
+    if (names.length === 1 && names[0] === 'status') {
+      return null;
+    }
+    return {};
+  }
+  if (status === 'ok') {
+    if (names.length === 2 && names.includes('ledger')) {
+      const ledger = ownDataProperty(value, 'ledger');
+      return ledger === undefined ? {} : ledger;
+    }
+    return {};
+  }
+  return {};
+}
+
+/**
  * Zip SH17's positional release-file facts onto the deduplicated required
  * test paths. Every read goes through `Object.getOwnPropertyDescriptor` (the
  * array's own `length` descriptor, so no Proxy `get` trap runs) and a
@@ -1184,17 +1217,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     let attestationsInput: unknown = {};
     if (read.kind === 'value') {
       try {
-        if (isPlainRecordObject(read.value)) {
-          const status = ownDataProperty(read.value, 'status');
-          if (status === 'missing') {
-            attestationsInput = null;
-          } else if (status === 'ok') {
-            const ledger = ownDataProperty(read.value, 'ledger');
-            if (ledger !== undefined) {
-              attestationsInput = ledger;
-            }
-          }
-        }
+        attestationsInput = readAttestationResult(read.value);
       } catch {
         attestationsInput = {};
       }

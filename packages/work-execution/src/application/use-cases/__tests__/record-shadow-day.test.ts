@@ -3108,6 +3108,48 @@ describe('RecordShadowDayUseCase', () => {
     }
   });
 
+  it('reports all four one-time criteria attestations-unreadable with a getter count of 0 when a missing attestation result carries a getter', async () => {
+    let getterCalls = 0;
+    const getterBearingMissing: Record<string, unknown> = {
+      status: 'missing',
+      get ledger() {
+        getterCalls += 1;
+        return {};
+      },
+    };
+    const oneTime = makeOneTime({ read: () => getterBearingMissing });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('attestations-unreadable');
+    expect(reasons.get('S3')).toBe('attestations-unreadable');
+    expect(reasons.get('S10')).toBe('attestations-unreadable');
+    expect(reasons.get('S11')).toBe('attestations-unreadable');
+    expect(getterCalls).toBe(0);
+  });
+
+  it('reports all four one-time criteria attestations-unreadable when a missing attestation result carries an extra key', async () => {
+    const extraKey: Record<string, unknown> = { status: 'missing', extra: 'nope' };
+    const oneTime = makeOneTime({ read: () => extraKey });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('attestations-unreadable');
+    expect(reasons.get('S3')).toBe('attestations-unreadable');
+    expect(reasons.get('S10')).toBe('attestations-unreadable');
+    expect(reasons.get('S11')).toBe('attestations-unreadable');
+  });
+
   it('reports S2 and S3 unevaluated (not-yet-observed) when attestations are missing or observed after the day', async () => {
     // The store reports nothing stored.
     const missing = makeOneTime();
@@ -3161,7 +3203,7 @@ describe('RecordShadowDayUseCase', () => {
     expect(oneTime.calls.inspect).toBe(0);
   });
 
-  it('reports S2, S3, S10, S11 unevaluated (invalid-input) and skips inspectReleaseFiles when releaseSha is malformed', async () => {
+  it('refuses the request and records nothing when releaseSha is malformed', async () => {
     const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }) });
     const harness = wiredHarness(conformingFixture(), {
       gateHeads: agreeingGateHeads(0),
@@ -3170,9 +3212,9 @@ describe('RecordShadowDayUseCase', () => {
     (harness.deps as { releaseSha: () => Promise<string | null> }).releaseSha = async () => 'not-a-sha';
     setOneTime(harness, oneTime);
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
-    // The malformed sha is refused at the ledger write (invalid-request) —
-    // nothing is recorded at all — but the evaluator still answered
-    // invalid-input and the inspector was never consulted.
+    // The malformed sha is refused upstream as invalid-request before any
+    // criterion is evaluated — nothing is recorded at all, and the inspector
+    // is never consulted.
     expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     expect(harness.evidence.stored).toBeNull();
     expect(oneTime.calls.inspect).toBe(0);

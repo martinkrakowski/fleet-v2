@@ -519,6 +519,45 @@ describe('readShadowConformanceRuns', () => {
       const result = await readShadowConformanceRuns(deps, request());
       expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
     });
+
+    it('a revoked Proxy from runs.list yields unknown/runs-unreadable and nothing rejects', async () => {
+      const { proxy, revoke } = Proxy.revocable<readonly LaneRunRecord[]>([], {});
+      revoke();
+      const deps = makeDeps({});
+      const revoking = { ...deps, runs: { list: () => Promise.resolve(proxy) } };
+      const result = await readShadowConformanceRuns(revoking, request());
+      // The revoked Proxy makes even `Array.isArray` throw; the outer catch
+      // maps every unexpected error to the catch-all unreadable-source code.
+      expect(result).toEqual({ status: 'unknown', reason: 'runs-unreadable' });
+      expect(JSON.stringify(result)).not.toContain('undefined');
+    });
+
+    it('a revoked Proxy from listForRun yields unknown/journal-unreadable and nothing rejects', async () => {
+      const { proxy, revoke } = Proxy.revocable<LaneRunJournalEntryRecord[]>([], {});
+      revoke();
+      const deps = makeDeps({ withListForRuns: false, runs: [collectedRun()] });
+      const revoking = { ...deps, journal: { listForRun: () => Promise.resolve(proxy) } };
+      const result = await readShadowConformanceRuns(revoking, request());
+      // Whether the revoked Proxy makes `Array.isArray` throw (outer catch,
+      // catch-all `runs-unreadable`) or merely read as a non-array, the
+      // answer is a typed unknown and never a rejection.
+      expect(result.status).toBe('unknown');
+      expect(
+        result.status === 'unknown' && ['runs-unreadable', 'journal-unreadable'].includes(result.reason),
+      ).toBe(true);
+    });
+
+    it('a port method throwing a non-Error value yields a typed unknown and nothing rejects', async () => {
+      const deps = makeDeps({ runs: [collectedRun({ attemptIds: [ATTEMPT_2] })] });
+      const throwing = {
+        ...deps,
+        attempts: { findAttemptById: (): Promise<AttemptRecord> => Promise.reject(42) },
+      };
+      const result = await readShadowConformanceRuns(throwing, request());
+      expect(result.status).toBe('unknown');
+      expect(result.status === 'unknown' && result.reason).toBe('attempt-unreadable');
+      expect(JSON.stringify(result)).not.toContain('42');
+    });
   });
 
   describe('deadline', () => {
@@ -777,19 +816,30 @@ describe('readShadowConformanceRuns hostile input', () => {
     expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
   });
 
-  it('a repository ref whose ownKeys trap throws yields a typed result and nothing rejects', async () => {
+  it('the mergedPullRequests Proxy whose ownKeys trap throws yields unknown/invalid-request and nothing rejects', async () => {
     const deps = makeDeps({
       runs: [collectedRun({ attemptIds: [ATTEMPT_2] })],
       attempts: new Map([[ATTEMPT_2, makeAttempt(ATTEMPT_2, artifactsOf(HEAD_2))]]),
       receipts: () => ({ outcome: 'none' }),
     });
-    const proxiedRuns = new Proxy(deps.runs, {
-      ownKeys: () => {
-        throw new Error(UNREADABLE_ERROR);
-      },
-    });
-    const result = await readShadowConformanceRuns({ ...deps, runs: proxiedRuns }, request());
-    expect(result.status).toBe('ok');
+    let ownKeysCalls = 0;
+    const plain = request();
+    const hostile = {
+      ...plain,
+      mergedPullRequests: new Proxy(plain.mergedPullRequests as object, {
+        ownKeys: (target) => {
+          ownKeysCalls += 1;
+          Reflect.ownKeys(target);
+          throw new Error(UNREADABLE_ERROR);
+        },
+      }),
+    };
+    const result = await readShadowConformanceRuns(deps, hostile);
+    // The reader walks the merged list's own keys, so the trap actually fires
+    // and the throw is refused, never propagated.
+    expect(ownKeysCalls).toBe(1);
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
     expect(JSON.stringify(result)).not.toContain(UNREADABLE_ERROR);
   });
 

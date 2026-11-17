@@ -382,7 +382,11 @@ export async function readShadowConformanceRuns(
     if (error instanceof FactsRefusal) {
       return refused(error.reason);
     }
-    throw error;
+    // Every unexpected error — e.g. a revoked Proxy from `runs.list()` or from
+    // the fallback `listForRun()` whose `Array.isArray` throws — becomes the
+    // documented typed `unknown` result, never a rejection. The code names an
+    // unreadable source: `runs-unreadable`.
+    return refused('runs-unreadable');
   }
 }
 

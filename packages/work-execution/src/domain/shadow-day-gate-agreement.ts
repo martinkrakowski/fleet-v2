@@ -404,29 +404,35 @@ function hasIncompleteDivergence(divergences: readonly ShadowDivergence[]): bool
   return false;
 }
 
-/** Cost: O(1) once the tallies exist. False pass on D outranks the agreeing-head floor. */
-function decide(compared: number, tallies: DivergenceTally, unsettled: number): ShadowGateAgreementEvaluation {
-  const agreeing = compared - tallies.falsePasses - tallies.stricterFails - tallies.valueDiffers;
-  const counts: GateCounts = {
+/** Cost: O(1). Agreeing is `compared` minus the tallied divergence kinds. */
+function countsFrom(compared: number, tallies: DivergenceTally, unsettled: number): GateCounts {
+  return {
     compared,
-    agreeing,
+    agreeing: compared - tallies.falsePasses - tallies.stricterFails - tallies.valueDiffers,
     falsePasses: tallies.falsePasses,
     stricterFails: tallies.stricterFails,
     unsettled,
   };
+}
+
+/** Cost: O(1) once the tallies exist. False pass on D outranks the agreeing-head floor. */
+function decide(compared: number, tallies: DivergenceTally, unsettled: number): ShadowGateAgreementEvaluation {
+  const counts = countsFrom(compared, tallies, unsettled);
   if (tallies.falsePassOnDay) {
     return evaluation('fail', 'gate-false-pass', counts);
   }
-  if (agreeing < SHADOW_GATE_MIN_AGREEING_HEADS) {
+  if (counts.agreeing < SHADOW_GATE_MIN_AGREEING_HEADS) {
     return evaluation('fail', 'too-few-agreeing-heads', counts);
   }
   return evaluation('pass', 'gate-verdicts-agree', counts);
 }
 
 /**
- * Cost: linear in the comparator's listed divergences. A truncated list, or
- * a code that means the two sides were not the heads just built, is incomplete
- * and contributes no counts.
+ * Cost: linear in the comparator's listed divergences. Truncation stays
+ * fail-closed (`unknown/gate-comparison-incomplete`) and carries a fresh
+ * result whose counts are what the comparator computed: `compared`, the
+ * divergence tallies up to the cap, and the unsettled count. A listed code
+ * that means the two sides were not the heads just built contributes no counts.
  */
 function verdictFromComparison(
   comparison: ShadowComparisonResult,
@@ -434,12 +440,19 @@ function verdictFromComparison(
   day: CalendarDay,
   unsettled: number,
 ): ShadowGateAgreementEvaluation {
-  if (comparison.truncated || hasIncompleteDivergence(comparison.divergences)) {
+  if (hasIncompleteDivergence(comparison.divergences)) {
     return INCOMPLETE;
   }
   const tallies = tallyDivergences(comparison.divergences, kept, day);
   if (tallies === null) {
     return INCOMPLETE;
+  }
+  if (comparison.truncated) {
+    return evaluation(
+      'unknown',
+      'gate-comparison-incomplete',
+      countsFrom(comparison.compared, tallies, unsettled),
+    );
   }
   return decide(comparison.compared, tallies, unsettled);
 }

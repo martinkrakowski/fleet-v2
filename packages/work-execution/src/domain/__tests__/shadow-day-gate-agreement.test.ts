@@ -259,12 +259,43 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
   });
 
   it('more divergences than SHADOW_DIVERGENCE_MAX is unknown/gate-comparison-incomplete', () => {
-    const heads = Array.from({ length: SHADOW_DIVERGENCE_MAX + 1 }, (_, index) =>
+    // The comparator lists only SHADOW_DIVERGENCE_MAX divergences. `compared`
+    // stays the full total, so agreeing is the remainder past that cap.
+    const headCount = SHADOW_DIVERGENCE_MAX + 1;
+    const heads = Array.from({ length: headCount }, (_, index) =>
       head(index + 1, { ciGate: 'failure', pushedAtIso: at(DAY, '00:00:00') }),
     );
     expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(
-      verdict('unknown', 'gate-comparison-incomplete'),
+      verdict('unknown', 'gate-comparison-incomplete', {
+        compared: headCount,
+        agreeing: headCount - SHADOW_DIVERGENCE_MAX,
+        falsePasses: SHADOW_DIVERGENCE_MAX,
+      }),
     );
+  });
+
+  it('two truncated inputs with different underlying counts produce results whose counts differ', () => {
+    const falsePasses = (count: number): ShadowGateHeadFact[] =>
+      Array.from({ length: count }, (_, index) =>
+        head(index + 1, { ciGate: 'failure', pushedAtIso: at(DAY, '00:00:00') }),
+      );
+    const fewer = evaluateShadowGateAgreement(gateInput(falsePasses(SHADOW_DIVERGENCE_MAX + 1)));
+    const more = evaluateShadowGateAgreement(gateInput(falsePasses(SHADOW_DIVERGENCE_MAX + 2)));
+    expect(fewer).toEqual(
+      verdict('unknown', 'gate-comparison-incomplete', {
+        compared: SHADOW_DIVERGENCE_MAX + 1,
+        agreeing: 1,
+        falsePasses: SHADOW_DIVERGENCE_MAX,
+      }),
+    );
+    expect(more).toEqual(
+      verdict('unknown', 'gate-comparison-incomplete', {
+        compared: SHADOW_DIVERGENCE_MAX + 2,
+        agreeing: 2,
+        falsePasses: SHADOW_DIVERGENCE_MAX,
+      }),
+    );
+    expect(fewer).not.toEqual(more);
   });
 
   it('an empty heads list is fail/too-few-agreeing-heads', () => {

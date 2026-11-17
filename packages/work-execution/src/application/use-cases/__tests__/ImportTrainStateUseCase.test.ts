@@ -11,6 +11,10 @@ const HEAD_B = '0123456789abcdef0123456789abcdef01234568';
 const MAIN_A = `42 ${HEAD_A} main`;
 const MAIN_B = `7 ${HEAD_B} main`;
 const CHAIN_LINE = `9 ${'c'.repeat(40)} chain/example-1`;
+// Real shell parked records (SH4d): `pr head reason attempt notBefore base`.
+// notBefore is the shell's epoch-seconds now(), never an ISO timestamp.
+const PARKED_B = `7 ${HEAD_B} flaky-tests 2 1000 main`;
+const PARKED_CHAIN = `9 ${'c'.repeat(40)} chain-conflict 2 1000 chain/example-1`;
 
 /** Successive ULID literals matching /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/. */
 function createMintUlid(): () => string {
@@ -370,7 +374,7 @@ describe('ImportTrainStateUseCase', () => {
   it('a parked-only PR is listed as would-import with source parked', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(
-      readState([], { parked: { status: 'read', lines: [`7 ${HEAD_B} main`] } }),
+      readState([], { parked: { status: 'read', lines: [PARKED_B] } }),
     );
     const useCase = makeUseCase(reader, queue);
 
@@ -513,7 +517,7 @@ describe('ImportTrainStateUseCase', () => {
   it('a pair in both queue and parked is one key whose source is queue', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(
-      readState([MAIN_B], { parked: { status: 'read', lines: [MAIN_B] } }),
+      readState([MAIN_B], { parked: { status: 'read', lines: [PARKED_B] } }),
     );
     const useCase = makeUseCase(reader, queue);
 
@@ -534,7 +538,7 @@ describe('ImportTrainStateUseCase', () => {
     const queue = new MergeQueueRepositoryAdapter();
     const chainLine = `7 ${HEAD_B} chain/foo`;
     const reader = new FakeLegacyTrainStateReadPort(
-      readState([chainLine], { parked: { status: 'read', lines: [MAIN_B] } }),
+      readState([chainLine], { parked: { status: 'read', lines: [PARKED_B] } }),
     );
     const useCase = makeUseCase(reader, queue);
 
@@ -559,7 +563,7 @@ describe('ImportTrainStateUseCase', () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(
       readState([], {
-        parked: { status: 'read', lines: [CHAIN_LINE] },
+        parked: { status: 'read', lines: [PARKED_CHAIN] },
         inprogress: { status: 'read', lines: [`11 ${'d'.repeat(40)} chain/other`] },
       }),
     );
@@ -668,7 +672,7 @@ describe('ImportTrainStateUseCase', () => {
   it('apply imports a parked entry once, then reports it already-queued', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(
-      readState([MAIN_A], { parked: { status: 'read', lines: [`7 ${HEAD_B} main`] } }),
+      readState([MAIN_A], { parked: { status: 'read', lines: [PARKED_B] } }),
     );
     const useCase = makeUseCase(reader, queue);
     const request = { repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' } as const;
@@ -693,7 +697,7 @@ describe('ImportTrainStateUseCase', () => {
     const garbage = 'NOT-A-QUEUE-LINE';
     const reader = new FakeLegacyTrainStateReadPort(
       readState([MAIN_A, garbage], {
-        parked: { status: 'read', lines: [`7 ${HEAD_B} main`, garbage] },
+        parked: { status: 'read', lines: [PARKED_B, garbage] },
         inprogress: { status: 'read', lines: [garbage] },
       }),
     );
@@ -713,5 +717,82 @@ describe('ImportTrainStateUseCase', () => {
       inprogress: [1],
     });
     expect(result.outcome === 'dry-run' && result.unknownLineNumbers).toEqual([2]);
+  });
+
+  it('a real 6-field parked line imports with its disposition and persisted entry', async () => {
+    // The real shell parked file is `pr head reason attempt notBefore base`
+    // (tick.sh). Before SH4f this use case parsed it with the 3-field queue
+    // parser, so every real parked line was an unknown line and never an
+    // import candidate. The extra reason/attempt/notBefore fields are parsed
+    // and validated but the shared import logic needs only pr/head/base.
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], { parked: { status: 'read', lines: [PARKED_B] } }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const dryRun = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false, authority: null });
+    expect(dryRun).toMatchObject({ outcome: 'dry-run', wouldImport: 1, unknownBySource: { parked: [] } });
+    expect(dryRun.outcome === 'dry-run' && dryRun.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'parked', disposition: 'would-import' },
+    ]);
+
+    const applied = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' });
+    expect(applied).toMatchObject({ outcome: 'applied', imported: 1 });
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ pullRequest: 7, headOid: HEAD_B });
+  });
+
+  it('a parked line with any one of its 6 fields wrong is an unknown parked line', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], {
+        parked: {
+          status: 'read',
+          lines: [
+            `0x7 ${HEAD_B} reason 1 1000 main`, // bad pr
+            `7 nothex40 reason 1 1000 main`, // bad head
+            `7 ${HEAD_B} ${'r'.repeat(129)} 1 1000 main`, // reason over 128 chars
+            `7 ${HEAD_B} reason -1 1000 main`, // bad attempt
+            `7 ${HEAD_B} reason 1 2026-11-17T00:00:00Z main`, // notBefore is epoch seconds, never ISO
+            `7 ${HEAD_B} reason 1 1000 chain/Bad`, // bad base
+            `7 ${HEAD_B} reason 1 1000`, // only 5 fields
+            `7 ${HEAD_B} reason 1 1000 main extra`, // 7 fields
+            `7 ${HEAD_B} main`, // the old 3-field queue shape is NOT a parked record
+          ],
+        },
+      }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false, authority: null });
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 0 });
+    expect(result.outcome === 'dry-run' && result.unknownBySource).toEqual({
+      queue: [],
+      inprogress: [],
+      parked: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    });
+    expect(result.outcome === 'dry-run' && result.keys).toEqual([]);
+  });
+
+  it('a parked entry sharing a pair with an inprogress entry dedupes with source inprogress', async () => {
+    // Source-order rule from SH4c: queue > inprogress > parked wins.
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(
+      readState([], {
+        inprogress: { status: 'read', lines: [`7 ${HEAD_B} main`] },
+        parked: { status: 'read', lines: [PARKED_B] },
+      }),
+    );
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' });
+    expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
+    expect(result.outcome === 'applied' && result.keys).toEqual([
+      { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'legacy-in-progress' },
+    ]);
+    const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
+    expect(entries).toHaveLength(0);
   });
 });

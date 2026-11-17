@@ -1,6 +1,10 @@
 // Lane CO5: import of the legacy shell merge-train queue state.
-import type { LegacyTrainQueueEntry, LegacyTrainQueueLine } from '../../domain/legacy-train-queue.js';
-import { parseLegacyTrainQueue } from '../../domain/legacy-train-queue.js';
+import type {
+  LegacyTrainParkedLine,
+  LegacyTrainQueueEntry,
+  LegacyTrainQueueLine,
+} from '../../domain/legacy-train-queue.js';
+import { parseLegacyTrainParkedQueue, parseLegacyTrainQueue } from '../../domain/legacy-train-queue.js';
 import type { MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
 import { isMergeQueueEntryLive } from '../../domain/merge-queue-records.js';
 import type {
@@ -28,12 +32,18 @@ export interface ImportTrainStateDependencies {
   readonly nowIso: () => string;
 }
 
-/** The parsed, per-source lines once every source is confirmed readable. */
+/** The parsed, per-source lines once every source is confirmed readable. Queue and inprogress use the 3-field parser; parked uses its own 6-field one (SH4d/SH4f). */
+type ParsedBySource = {
+  readonly queue: readonly LegacyTrainQueueLine[];
+  readonly inprogress: readonly LegacyTrainQueueLine[];
+  readonly parked: readonly LegacyTrainParkedLine[];
+};
+
 type ParseLegacyStateResult =
   | { readonly ok: false; readonly refusal: ImportTrainStateRefusal }
   | {
       readonly ok: true;
-      readonly parsedBySource: Readonly<Record<Source, readonly LegacyTrainQueueLine[]>>;
+      readonly parsedBySource: ParsedBySource;
       readonly unknownBySource: Record<Source, number[]>;
       readonly parkedLines: number;
       readonly chainFiles: number;
@@ -140,8 +150,27 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       parked: state.parked.status === 'read' ? state.parked.lines : [],
     };
 
-    const parsedBySource: Partial<Record<Source, readonly LegacyTrainQueueLine[]>> = {};
+    const parsedBySource: {
+      queue?: readonly LegacyTrainQueueLine[];
+      inprogress?: readonly LegacyTrainQueueLine[];
+      parked?: readonly LegacyTrainParkedLine[];
+    } = {};
     for (const source of SOURCES) {
+      // The parked file is the shell's 6-field `pr head reason attempt notBefore
+      // base` record (SH4d), a genuinely different shape from the 3-field
+      // `pr sha base` queue/inprogress line, so it gets its own parser. The
+      // queue and inprogress sources keep the original parser, unchanged.
+      if (source === 'parked') {
+        const parsed = parseLegacyTrainParkedQueue(sourceLines[source].join('\n'));
+        if (!parsed.ok) {
+          return {
+            ok: false,
+            refusal: parsed.reason === 'secret-shaped' ? 'secret-shaped' : 'legacy-unreadable',
+          };
+        }
+        parsedBySource[source] = parsed.lines;
+        continue;
+      }
       const parsed = parseLegacyTrainQueue(sourceLines[source].join('\n'));
       if (!parsed.ok) {
         return {
@@ -163,7 +192,7 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
 
     return {
       ok: true,
-      parsedBySource: parsedBySource as Record<Source, readonly LegacyTrainQueueLine[]>,
+      parsedBySource: parsedBySource as ParsedBySource,
       unknownBySource,
       parkedLines: state.parked.status === 'read' ? state.parked.lines.length : 0,
       chainFiles: state.chains.status === 'read' ? state.chains.chains.length : 0,
@@ -180,7 +209,7 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
    * across sources still yields exactly one key, so that one logical PR is
    * never reported as two distinct, non-duplicate import candidates.
    */
-  private dedupeBySource(parsedBySource: Readonly<Record<Source, readonly LegacyTrainQueueLine[]>>): DedupedEntry[] {
+  private dedupeBySource(parsedBySource: ParsedBySource): DedupedEntry[] {
     const seenPairs = new Set<string>();
     const deduped: DedupedEntry[] = [];
     for (const source of SOURCES) {
@@ -226,7 +255,7 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
    * check is scoped to the PR number alone.
    */
   private classifyEntries(
-    parsedBySource: Readonly<Record<Source, readonly LegacyTrainQueueLine[]>>,
+    parsedBySource: ParsedBySource,
     liveEntries: readonly MergeQueueEntryRecord[],
     repository: ImportTrainStateRequest['repository'],
   ): ClassifiedEntries {

@@ -1,10 +1,11 @@
 // Lane SH7b: the shadow day-writer. For one UTC day it evaluates every
 // criterion this chain can currently compute from data that already exists —
 // S1 (merge set, SH5a), S4' (gate agreement, SH11 over SH18b's head reader),
-// S6' (conducted conformance, SH12a/SH12b over SH18a's runs reader and
-// SH13a's shell facts), S7 (chains retired, SH14), S8 (two-sample intake,
-// yesterday only, SH5c), S9 (state integrity, yesterday only, SH5b) and S12
-// (daemon tick health, SH5b) — records each definite pass/fail verdict into
+// S5' (premerge carry replay, SH19b over SH13a's shell facts and the fleet's
+// carry answer), S6' (conducted conformance, SH12a/SH12b over SH18a's runs
+// reader and SH13a's shell facts), S7 (chains retired, SH14), S8 (two-sample
+// intake, yesterday only, SH5c), S9 (state integrity, yesterday only, SH5b)
+// and S12 (daemon tick health, SH5b) — records each definite pass/fail verdict into
 // the SH1/SH2 shadow-evidence ledger by compare-and-set, and reports every
 // other criterion as unevaluated: never a pass, never a silent fail. Nothing
 // is ever written to the ledger on any refused or unknown outcome. Every
@@ -26,7 +27,13 @@ import {
   evaluateShadowConductedConformance,
   type ShadowConformanceEvaluation,
 } from '../../domain/shadow-day-conformance.js';
-import { extractShadowShellFacts } from '../../domain/shadow-day-shell-facts.js';
+import {
+  evaluateShadowPremergeCarry,
+  extractShadowShellFacts,
+  type ShadowPremergeCarryEvaluation,
+  type ShadowShellCarryDecision,
+  type ShadowShellFacts,
+} from '../../domain/shadow-day-shell-facts.js';
 import {
   evaluateShadowChainsRetired,
   SHADOW_CHAINS_POLICY,
@@ -87,7 +94,7 @@ const DEFAULT_SAMPLE_GAP_MS = 150_000;
 
 /** Every criterion no evaluator implements yet; later units add the rest. */
 const NOT_IMPLEMENTED_CRITERIA: readonly CutoverShadowCriterion[] = [
-  'S2', 'S3', 'S5', 'S10', 'S11', 'S13',
+  'S2', 'S3', 'S10', 'S11', 'S13',
 ];
 
 export interface RecordShadowDayDependencies {
@@ -123,6 +130,16 @@ export interface RecordShadowDayDependencies {
    * composition; when absent, S7 reports `not-wired`.
    */
   readonly chains?: Pick<ChainRepositoryPort, 'listChains'>;
+  /**
+   * The fleet's answer to one shell premerge-carry decision (S5'). Optional
+   * until SH19c wires it into composition; when absent, S5 reports
+   * `not-wired`.
+   */
+  readonly premergeCarry?: (input: {
+    readonly repository: { readonly owner: string; readonly repo: string };
+    readonly decision: ShadowShellCarryDecision;
+    readonly deadlineIso: string;
+  }) => Promise<'carry' | 'no-carry' | 'unknown'>;
 }
 
 /** Thrown by `call` when the deadline is already reached; aborts the whole run. */
@@ -160,8 +177,20 @@ type CriterionOutcome =
       readonly conformance?: ShadowConformanceEvaluation;
       /** Present only for S7: the chains-retired evaluation. */
       readonly chainsRetired?: ShadowChainsRetiredEvaluation;
+      /** Present only for S5': the premerge-carry replay evaluation. */
+      readonly premergeCarry?: ShadowPremergeCarryEvaluation;
     }
   | { readonly criterion: CutoverShadowCriterion; readonly kind: 'unevaluated'; readonly reason: string };
+
+/**
+ * The day-end shell facts shared by S6' and S5': the extractor's output over
+ * the events bounded to the recorded day's own end, or the reason they are
+ * unavailable. Extracted once per run, so a D+1 event can never alter a
+ * closed day's facts and `readLegacyTrainEvents` is never called twice.
+ */
+type BoundedShellFacts =
+  | { readonly ok: false; readonly reason: 'shell-events-unavailable' | 'shell-facts-invalid' }
+  | { readonly ok: true; readonly facts: ShadowShellFacts; readonly unknownLines: number };
 
 /** The ledger read: usable, or a finished refusal/unknown answer. */
 type LedgerRead =
@@ -316,9 +345,13 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     }
     const releaseSha = await this.readRelease(context.deadlineIso);
     const journal = await this.readJournal(context);
-    // The shell events are read once and shared by S1 and S6', so
+    // The shell events are read once and shared by S1, S6' and S5', so
     // `readLegacyTrainEvents` is never called twice in one run.
     const shell = await this.readShellEvents(context);
+    // The day-end facts are extracted once and shared by S6' and S5', so a
+    // D+1 event can never alter a closed day's carry decisions, incomplete
+    // head moves or anomalies.
+    const shellFacts = this.extractBoundedShellFacts(context, shell);
     // S1's live reads follow the journal and shell reads directly, so intake's
     // 150 s settle sleep cannot push them minutes past the evidence they
     // reconcile against.
@@ -330,8 +363,9 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       await this.evaluateStateIntegrityCriterion(context, journal),
       await this.evaluateTickHealthCriterion(context),
       await this.evaluateGateAgreementCriterion(context),
-      await this.evaluateConformanceCriterion(context, shell),
+      await this.evaluateConformanceCriterion(context, shellFacts),
       await this.evaluateChainsRetiredCriterion(context, intake.chains),
+      await this.evaluatePremergeCarryCriterion(context, shellFacts),
     ];
     const built = this.buildVerdicts(context, outcomes);
     return this.writeDay(context, ledger.ledger, releaseSha, built);
@@ -811,16 +845,16 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
 
   /**
    * S6': conducted-run conformance over the day's shell merges, through
-   * SH13a's shell-facts extractor and SH18a's runs reader. The shell events
-   * are first filtered to the recorded day's own end, so a later event on
-   * D+1 can never alter `headMovesIncompleteFor` or the extracted facts of a
-   * closed day. The window `[D-2 00:00Z, D+1 00:00Z)` bounds both the
-   * `unresolved-merge` anomaly check and the merged pull requests passed to
-   * the reader.
+   * SH13a's shell-facts extractor and SH18a's runs reader. The shell facts
+   * were extracted once in `run()` from the events bounded to the recorded
+   * day's own end, so a later event on D+1 can never alter
+   * `headMovesIncompleteFor` or the extracted facts of a closed day. The
+   * window `[D-2 00:00Z, D+1 00:00Z)` bounds both the `unresolved-merge`
+   * anomaly check and the merged pull requests passed to the reader.
    */
   private async evaluateConformanceCriterion(
     context: DayContext,
-    shell: { readonly events: readonly ShellTrainEvent[]; readonly unknownLines: number } | string,
+    shellFacts: BoundedShellFacts,
   ): Promise<CriterionOutcome> {
     const conducted = this.deps.conducted;
     if (conducted === undefined) {
@@ -829,32 +863,12 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (!this.repositoryIsConducted(context)) {
       return unevaluatedOutcome('S6', 'repository-not-conducted');
     }
-    if (typeof shell === 'string' || shell.unknownLines > 0) {
-      return unevaluatedOutcome('S6', 'shell-events-unavailable');
+    if (!shellFacts.ok) {
+      return unevaluatedOutcome('S6', shellFacts.reason);
     }
+    const facts = shellFacts.facts;
     const daySerial = serialOfUtcDay(context.day);
     const windowEndMs = (daySerial + 1) * DAY_MS;
-    const boundedEvents: ShellTrainEvent[] = [];
-    for (const event of shell.events) {
-      const atMs = Date.parse(event.atIso);
-      // Defensive: `parseShellTrainEvents` only emits valid `atIso`; this
-      // guards future changes to that parser rather than silently dropping
-      // an unparseable instant from a closed day's evidence.
-      if (Number.isNaN(atMs)) {
-        return unevaluatedOutcome('S6', 'shell-facts-invalid');
-      }
-      if (atMs < windowEndMs) {
-        boundedEvents.push(event);
-      }
-    }
-    const extracted = extractShadowShellFacts(boundedEvents);
-    // Defensive: unreachable on `parseShellTrainEvents`'s own output (each
-    // event is already in shape); this guards future parser changes rather
-    // than passing an empty fact set as real evidence.
-    if (!extracted.ok) {
-      return unevaluatedOutcome('S6', 'shell-facts-invalid');
-    }
-    const facts = extracted.facts;
     const windowStartMs = (daySerial - 2) * DAY_MS;
     const inWindow = (atIso: string): boolean => {
       const instant = Date.parse(atIso);
@@ -883,6 +897,104 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       headMovesIncompleteFor: facts.headMovesIncompleteFor,
     });
     return { criterion: 'S6', kind: 'evaluated', evaluation, conformance: evaluation };
+  }
+
+  /**
+   * The day-end shell facts, extracted once per run and shared by S6' and
+   * S5'. The shell events are filtered to the recorded day's own end, so a
+   * later event on D+1 can never alter a closed day's `carryDecisions`,
+   * `headMovesIncompleteFor` or `anomalies`. An unavailable shell read, a
+   * shell record with unknown lines, an unparseable event instant or an
+   * extractor refusal all leave the facts unavailable with the reason S6'
+   * and S5' report unchanged from their pre-hoist behavior.
+   */
+  private extractBoundedShellFacts(
+    context: DayContext,
+    shell: { readonly events: readonly ShellTrainEvent[]; readonly unknownLines: number } | string,
+  ): BoundedShellFacts {
+    if (typeof shell === 'string' || shell.unknownLines > 0) {
+      return { ok: false, reason: 'shell-events-unavailable' };
+    }
+    const windowEndMs = (serialOfUtcDay(context.day) + 1) * DAY_MS;
+    const boundedEvents: ShellTrainEvent[] = [];
+    for (const event of shell.events) {
+      const atMs = Date.parse(event.atIso);
+      // Defensive: `parseShellTrainEvents` only emits valid `atIso`; this
+      // guards future changes to that parser rather than silently dropping
+      // an unparseable instant from a closed day's evidence.
+      if (Number.isNaN(atMs)) {
+        return { ok: false, reason: 'shell-facts-invalid' };
+      }
+      if (atMs < windowEndMs) {
+        boundedEvents.push(event);
+      }
+    }
+    const extracted = extractShadowShellFacts(boundedEvents);
+    // Defensive: unreachable on `parseShellTrainEvents`'s own output (each
+    // event is already in shape); this guards future parser changes rather
+    // than passing an empty fact set as real evidence.
+    if (!extracted.ok) {
+      return { ok: false, reason: 'shell-facts-invalid' };
+    }
+    return { ok: true, facts: extracted.facts, unknownLines: shell.unknownLines };
+  }
+
+  /**
+   * S5' (OD-3b): the shell train's premerge carry decisions replayed through
+   * the fleet's answer, via SH13a's shell facts (already extracted in
+   * `run()` from the events bounded to the day's own end) and the optional
+   * `premergeCarry` resolver. Only the day's own decisions are resolved: a
+   * decision the resolver throws on, or answers with anything but
+   * `carry`/`no-carry`, counts as `unknown`, which the evaluator refuses
+   * with `fleet-carry-unknown` rather than guessing. The decisions and
+   * anomalies handed to the evaluator are fresh plain objects built from the
+   * extracted facts, never caller-supplied structures.
+   */
+  private async evaluatePremergeCarryCriterion(
+    context: DayContext,
+    shellFacts: BoundedShellFacts,
+  ): Promise<CriterionOutcome> {
+    const premergeCarry = this.deps.premergeCarry;
+    if (premergeCarry === undefined) {
+      return unevaluatedOutcome('S5', 'not-wired');
+    }
+    if (!shellFacts.ok) {
+      return unevaluatedOutcome('S5', shellFacts.reason);
+    }
+    const dayStartMs = serialOfUtcDay(context.day) * DAY_MS;
+    const dayEndMs = dayStartMs + DAY_MS;
+    const decisions: { readonly pullRequest: number; readonly oldHeadOid: string; readonly newHeadOid: string; readonly atIso: string; readonly shellCarry: 'carried' | 'not-carried'; readonly fleetCarry: 'carry' | 'no-carry' | 'unknown' }[] = [];
+    for (const decision of shellFacts.facts.carryDecisions) {
+      const atMs = Date.parse(decision.atIso);
+      if (Number.isNaN(atMs) || atMs < dayStartMs || atMs >= dayEndMs) {
+        continue;
+      }
+      const answered = await this.call(context.deadlineIso, () =>
+        premergeCarry({ repository: context.repository, decision, deadlineIso: this.queryDeadline(context) }),
+      );
+      const fleetCarry = answered.kind === 'threw' || (answered.value !== 'carry' && answered.value !== 'no-carry')
+        ? 'unknown'
+        : answered.value;
+      decisions.push({
+        pullRequest: decision.pullRequest,
+        oldHeadOid: decision.oldHeadOid,
+        newHeadOid: decision.newHeadOid,
+        atIso: decision.atIso,
+        shellCarry: decision.shellCarry,
+        fleetCarry,
+      });
+    }
+    const anomalies = shellFacts.facts.anomalies.map((anomaly) => ({ atIso: anomaly.atIso, code: anomaly.code }));
+    const evaluation = evaluateShadowPremergeCarry({
+      day: context.day,
+      unknownLines: shellFacts.unknownLines,
+      decisions,
+      anomalies,
+    });
+    if (evaluation.status === 'unknown') {
+      return unevaluatedOutcome('S5', evaluation.reason);
+    }
+    return { criterion: 'S5', kind: 'evaluated', evaluation, premergeCarry: evaluation };
   }
 
   /**
@@ -939,12 +1051,14 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    *
    * `mergeSet` (S1 only), `intake` (S8 only), `tickHealth` (S12 only),
    * `stateIntegrity` (S9 only), `gateAgreement` (S4' only), `conformance`
-   * (S6' only) and `chainsRetired` (S7 only) are mutually exclusive, so at
+   * (S6' only), `chainsRetired` (S7 only) and `premergeCarry` (S5' only)
+   * are mutually exclusive, so at
    * most one count field is ever set on any outcome. Each is set by exactly
    * one criterion builder (`evaluateMergeSetCriterion`,
    * `evaluateIntakeCriterion`, `evaluateTickHealthCriterion`,
    * `evaluateStateIntegrityCriterion`, `evaluateGateAgreementCriterion`,
-   * `evaluateConformanceCriterion` and `evaluateChainsRetiredCriterion`
+   * `evaluateConformanceCriterion`, `evaluateChainsRetiredCriterion` and
+   * `evaluatePremergeCarryCriterion`
    * respectively) and never more than one on the same outcome, so checking
    * them in this order can never silently shadow another: an outcome with a
    * later field set always has the earlier fields `undefined`, by
@@ -1074,6 +1188,21 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
      */
     if (outcome.chainsRetired !== undefined) {
       return JSON.stringify(base);
+    }
+    /**
+     * S5' hashes `compared` with the base: it is the count of deduped,
+     * day-scoped carry decisions the evaluator compared, so it is closed-day
+     * deterministic — a day with zero carry decisions records `pass`
+     * (`carry-decisions-equal`) with `compared: 0` and counts toward the
+     * evidence window. `laxCarries` and `stricterNoCarries` depend on the
+     * (possibly absent) `premergeCarry` resolver's answers between two runs
+     * and stay on `outcome.premergeCarry` as non-digested diagnostics, so a
+     * resolver-less rerun of an evaluated day cannot silently become a
+     * verdict conflict. This is a new digest format (allowed because no live
+     * shadow day has been recorded yet).
+     */
+    if (outcome.premergeCarry !== undefined) {
+      return JSON.stringify({ ...base, compared: outcome.premergeCarry.compared });
     }
     return JSON.stringify(base);
   }

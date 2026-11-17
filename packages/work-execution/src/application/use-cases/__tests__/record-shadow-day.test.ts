@@ -35,6 +35,8 @@ const REPO_DIGEST = '0123456789ab';
 const LEGACY_STATE_DIR = '/state/legacy';
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
+const HEAD_D = 'd'.repeat(40);
+const HEAD_E = 'e'.repeat(40);
 const RELEASE = 'c'.repeat(40);
 const DAY = '2026-11-16';
 const NOW = '2026-11-17T12:00:00.000Z';
@@ -49,7 +51,7 @@ const PAST_DEADLINE = '2026-11-17T11:00:00.000Z';
  */
 const RECORDED_AT_ISO = '2026-11-17T12:02:30.000Z';
 const NOT_IMPLEMENTED: readonly CutoverShadowCriterion[] = [
-  'S2', 'S3', 'S5', 'S10', 'S11', 'S13',
+  'S2', 'S3', 'S10', 'S11', 'S13',
 ];
 
 /** A valid ULID-shaped id carrying `n` (O1b-1 pattern: `[0-7][Crockford]{25}`). */
@@ -558,6 +560,17 @@ function expectedS7Digest(day: string, status: string, reason: string): string {
   return sha256HexDigest(JSON.stringify({ criterion: 'S7', day, status, reason }));
 }
 
+/**
+ * The canonical S5' summary digest: the base plus `compared` only — the count
+ * of deduped, day-scoped carry decisions the evaluator compared, which is
+ * closed-day deterministic (zero on a day with no carry decisions).
+ * `laxCarries` and `stricterNoCarries` depend on the resolver's answers
+ * between runs and stay on the outcome as non-digested diagnostics.
+ */
+function expectedS5Digest(day: string, status: string, reason: string, compared: number): string {
+  return sha256HexDigest(JSON.stringify({ criterion: 'S5', day, status, reason, compared }));
+}
+
 /* -------------------------------------------------------------------------
  * SH19a: fakes for the conducted-facts readers (SH18a/SH18b) and the chain
  * store, driving the REAL `readShadowGateHeads` and `readShadowConformanceRuns`
@@ -887,6 +900,69 @@ function setConducted(
 
 function setChains(harness: Harness, chains: Pick<ChainRepositoryPort, 'listChains'> | undefined): void {
   (harness.deps as { chains?: Pick<ChainRepositoryPort, 'listChains'> }).chains = chains;
+}
+
+type PremergeCarryAnswer = 'carry' | 'no-carry' | 'unknown';
+
+function setPremergeCarry(
+  harness: Harness,
+  premergeCarry: NonNullable<RecordShadowDayDependencies['premergeCarry']> | undefined,
+): void {
+  (harness.deps as { premergeCarry?: RecordShadowDayDependencies['premergeCarry'] }).premergeCarry = premergeCarry;
+}
+
+/** A resolver that answers every decision the same way, recording what it saw. */
+function constantPremergeCarry(
+  answer: PremergeCarryAnswer,
+  calls?: { readonly decisions: unknown[]; readonly deadlines: string[] },
+): NonNullable<RecordShadowDayDependencies['premergeCarry']> {
+  return async (input) => {
+    if (calls !== undefined) {
+      calls.decisions.push(input.decision);
+      calls.deadlines.push(input.deadlineIso);
+    }
+    return answer;
+  };
+}
+
+/** A resolver that throws on every call: the use case must read that as `unknown`. */
+function throwingPremergeCarry(): NonNullable<RecordShadowDayDependencies['premergeCarry']> {
+  return async () => {
+    throw new Error('resolver failed');
+  };
+}
+
+/**
+ * One shell carry decision as a paired event pair: an update intent naming
+ * the old head, then a `result`/`updated` line whose `detail` classifies the
+ * update as carried or not carried.
+ */
+function shellCarryPair(
+  intentAtIso: string,
+  resultAtIso: string,
+  pr: number,
+  oldHeadOid: string,
+  newHeadOid: string,
+  carried: boolean,
+): readonly [string, string] {
+  return [
+    JSON.stringify({ at: intentAtIso, kind: 'intent', outcome: 'update-branch', pr, headOid: oldHeadOid }),
+    JSON.stringify({
+      at: resultAtIso,
+      kind: 'result',
+      outcome: 'updated',
+      pr,
+      headOid: newHeadOid,
+      detail: carried ? 'premerge carried (success)' : 'not carried: manual conflict',
+    }),
+  ];
+}
+
+/** A clean fixture with one in-day shell carry decision for pr 12 (carried). */
+function carryFixture(): Fixture {
+  const fixture = cleanFixture(DAY);
+  fixture.shellLines.push(...shellCarryPair(`${DAY}T09:04:00Z`, `${DAY}T09:05:00Z`, 12, HEAD_B, HEAD_D, true));
+  return fixture;
 }
 
 /** The fully wired harness for the passing fixture. */
@@ -2418,5 +2494,229 @@ describe('RecordShadowDayUseCase', () => {
     }
     const onTime = await readShadowConformanceRuns(facts, { mergedPullRequests: [7], deadlineIso: requestDeadline });
     expect(onTime.status).toBe('ok');
+  });
+
+  /* -------------------------------------------------------------------------
+   * SH19b: S5' — the shell's premerge carry decisions replayed through the
+   * fleet's answer, over the day-end shell facts shared with S6'.
+   * ------------------------------------------------------------------------- */
+
+  it("records S5 as pass (carry-decisions-equal) when the fleet's carry answers match the shell's", async () => {
+    const calls = { decisions: [] as unknown[], deadlines: [] as string[] };
+    const harness = wiredHarness(carryFixture(), {});
+    setPremergeCarry(harness, constantPremergeCarry('carry', calls));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S5).toBe('pass');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S5).toEqual({
+      verdict: 'pass',
+      reason: 'carry-decisions-equal',
+      digest: expectedS5Digest(DAY, 'pass', 'carry-decisions-equal', 1),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    // The resolver saw the shell decision as fresh facts and the request's own deadline.
+    expect(calls.decisions).toEqual([
+      { pullRequest: 12, oldHeadOid: HEAD_B, newHeadOid: HEAD_D, atIso: `${DAY}T09:05:00Z`, shellCarry: 'carried' },
+    ]);
+    expect(calls.deadlines).toEqual([DEADLINE]);
+  });
+
+  it('records S5 as fail (carry-decision-differs) when fleet and shell carry decisions disagree', async () => {
+    // The shell carried pr 12; a stricter fleet answer that did not carry it
+    // is a disagreement, recorded as a definite fail — never glossed over.
+    const harness = wiredHarness(carryFixture(), {});
+    setPremergeCarry(harness, constantPremergeCarry('no-carry'));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S5).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S5).toEqual({
+      verdict: 'fail',
+      reason: 'carry-decision-differs',
+      digest: expectedS5Digest(DAY, 'fail', 'carry-decision-differs', 1),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+  });
+
+  it('records S5 as pass (carry-decisions-equal) with compared 0 on a day with zero carry decisions', async () => {
+    // The zero-decision policy: the evaluator's pass counts toward the
+    // evidence window, and `compared: 0` is part of the digest.
+    const harness = wiredHarness(cleanFixture(DAY), {});
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S5).toBe('pass');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S5).toEqual({
+      verdict: 'pass',
+      reason: 'carry-decisions-equal',
+      digest: expectedS5Digest(DAY, 'pass', 'carry-decisions-equal', 0),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+  });
+
+  it('reports S5 as not-wired when premergeCarry is absent, leaving other criteria unchanged', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded).toEqual({
+      S1: 'pass', S4: 'pass', S6: 'pass', S7: 'pass', S8: 'pass', S9: 'pass', S12: 'pass',
+    });
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S5')).toBe('not-wired');
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('reports S5 unevaluated (shell-events-unavailable) when shell events are unavailable or have unknown lines', async () => {
+    // The events read itself is unavailable.
+    const unreadable = wiredHarness(cleanFixture(DAY), {});
+    setPremergeCarry(unreadable, constantPremergeCarry('carry'));
+    (unreadable.deps.legacy as { readLegacyTrainEvents?: unknown }).readLegacyTrainEvents = undefined;
+    const unreadableResult = await new RecordShadowDayUseCase(unreadable.deps).execute(makeRequest());
+    expectRecorded(unreadableResult);
+    const unreadableReasons = new Map(unreadableResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(unreadableReasons.get('S5')).toBe('shell-events-unavailable');
+
+    // The log parsed, but a line could not be recognized: an incomplete
+    // shell record is never evidence either way.
+    const fixture = cleanFixture(DAY);
+    fixture.shellLines.push('x'.repeat(5000));
+    const unknownLines = wiredHarness(fixture, {});
+    setPremergeCarry(unknownLines, constantPremergeCarry('carry'));
+    const unknownResult = await new RecordShadowDayUseCase(unknownLines.deps).execute(makeRequest());
+    expectRecorded(unknownResult);
+    const unknownReasons = new Map(unknownResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(unknownReasons.get('S5')).toBe('shell-events-unavailable');
+  });
+
+  it('reports S5 unevaluated (shell-facts-invalid) when shell event timestamps are invalid', async () => {
+    const harness = wiredHarness(cleanFixture(DAY), {});
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    // The use case's extraction is defensive: `parseShellTrainEvents` never
+    // emits an unparseable `atIso`, and the extractor cannot refuse its
+    // output, so the `shell-facts-invalid` path is unreachable through the
+    // real parser. The reason mapping is pinned here by making the shared
+    // day-end extraction refuse once, the way a future parser change would.
+    const prototype = RecordShadowDayUseCase.prototype as unknown as {
+      extractBoundedShellFacts: (context: unknown, shell: unknown) => unknown;
+    };
+    const original = prototype.extractBoundedShellFacts;
+    prototype.extractBoundedShellFacts = () => ({ ok: false, reason: 'shell-facts-invalid' });
+    try {
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+      expect(reasons.get('S5')).toBe('shell-facts-invalid');
+      expect(reasons.get('S6')).toBe('shell-facts-invalid');
+    } finally {
+      prototype.extractBoundedShellFacts = original;
+    }
+  });
+
+  it('keeps closed day D S5 unchanged when a D+1 shell update event would otherwise alter carry facts', async () => {
+    // D's S5 passes on the one carried decision. A D+1 carried update pair
+    // for the same pull request, if not filtered to the day's own end, would
+    // add a second carry decision and a D+1 pairing anomaly to the shared
+    // facts — a digest change on a closed day.
+    const fixture = carryFixture();
+    const harness = wiredHarness(fixture, {});
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    expect(first.recorded.S5).toBe('pass');
+    const before = harness.evidence.stored;
+
+    fixture.shellLines.push(...shellCarryPair('2026-11-17T00:30:00Z', '2026-11-17T01:00:00Z', 12, HEAD_D, HEAD_E, true));
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expectRecorded(result);
+    expect(result.outcome).toBe('unchanged');
+    expect(result.recorded.S5).toBe('pass');
+    expect(result.unevaluated.map((entry) => entry.criterion)).not.toContain('S5');
+    expect(harness.evidence.stored).toEqual(before);
+  });
+
+  it('reports S5 unevaluated (fleet-carry-unknown) when premergeCarry throws or returns unknown', async () => {
+    // The resolver throws.
+    const throwing = wiredHarness(carryFixture(), {});
+    setPremergeCarry(throwing, throwingPremergeCarry());
+    const thrownResult = await new RecordShadowDayUseCase(throwing.deps).execute(makeRequest());
+    expectRecorded(thrownResult);
+    const thrownReasons = new Map(thrownResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(thrownReasons.get('S5')).toBe('fleet-carry-unknown');
+    expect(thrownResult.recorded.S5).toBeUndefined();
+
+    // The resolver answers `unknown`.
+    const unknown = wiredHarness(carryFixture(), {});
+    setPremergeCarry(unknown, constantPremergeCarry('unknown'));
+    const unknownResult = await new RecordShadowDayUseCase(unknown.deps).execute(makeRequest());
+    expectRecorded(unknownResult);
+    const unknownReasons = new Map(unknownResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(unknownReasons.get('S5')).toBe('fleet-carry-unknown');
+
+    // The resolver answers something outside the closed answer set: read as
+    // `unknown`, never as a pass or a fail.
+    const bogus = wiredHarness(carryFixture(), {});
+    setPremergeCarry(bogus, (() => Promise.resolve('bogus' as PremergeCarryAnswer)) as NonNullable<RecordShadowDayDependencies['premergeCarry']>);
+    const bogusResult = await new RecordShadowDayUseCase(bogus.deps).execute(makeRequest());
+    expectRecorded(bogusResult);
+    const bogusReasons = new Map(bogusResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(bogusReasons.get('S5')).toBe('fleet-carry-unknown');
+  });
+
+  it('aborts with deadline-exceeded when the deadline is reached before premergeCarry calls', async () => {
+    const calls = { decisions: [] as unknown[], deadlines: [] as string[] };
+    const harness = wiredHarness(carryFixture(), {});
+    setPremergeCarry(harness, constantPremergeCarry('carry', calls));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ deadlineIso: PAST_DEADLINE }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    // The deadline was already reached, so the resolver was never consulted.
+    expect(calls.decisions).toEqual([]);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('answers unchanged on an S5 rerun with identical facts and answers, without a second CAS', async () => {
+    const harness = wiredHarness(carryFixture(), {});
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+    await useCase.execute(makeRequest());
+    const afterFirst = harness.evidence.stored;
+    const casCallsAfterFirst = harness.evidence.calls.cas;
+
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+    expectRecorded(result);
+    expect(result.outcome).toBe('unchanged');
+    expect(result.recorded.S5).toBe('pass');
+    expect(harness.evidence.calls.cas).toBe(casCallsAfterFirst);
+    expect(harness.evidence.stored).toEqual(afterFirst);
+  });
+
+  it('keeps S1, S4, S6, S7, S8, S9 and S12 digests byte-identical whether premergeCarry is present or absent', async () => {
+    const without = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const withoutResult = await new RecordShadowDayUseCase(without.deps).execute(makeRequest());
+    expectRecorded(withoutResult);
+
+    const withResolver = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setPremergeCarry(withResolver, constantPremergeCarry('carry'));
+    const withResult = await new RecordShadowDayUseCase(withResolver.deps).execute(makeRequest());
+    expectRecorded(withResult);
+    expect(withResult.recorded.S5).toBe('pass');
+
+    const withoutDay = without.evidence.stored?.days.find((entry) => entry.day === DAY);
+    const withDay = withResolver.evidence.stored?.days.find((entry) => entry.day === DAY);
+    for (const criterion of ['S1', 'S4', 'S6', 'S7', 'S8', 'S9', 'S12'] as const) {
+      expect(withDay?.verdicts[criterion]?.digest).toBe(withoutDay?.verdicts[criterion]?.digest);
+    }
   });
 });

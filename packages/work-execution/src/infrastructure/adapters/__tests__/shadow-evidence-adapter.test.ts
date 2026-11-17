@@ -84,6 +84,17 @@ describe('ShadowEvidenceAdapter', () => {
     });
   });
 
+  it('reports a conflict before validating a structurally invalid next, never refused', async () => {
+    const adapter = new ShadowEvidenceAdapter();
+    await adapter.compareAndSet({ expectedRevision: 0, next: dayLedger(1) });
+    expect(
+      await adapter.compareAndSet({
+        expectedRevision: 5,
+        next: { ...dayLedger(2), days: 'nope' } as unknown as ShadowLedger,
+      }),
+    ).toEqual({ outcome: 'conflict', currentRevision: 1 });
+  });
+
   it('refuses a next ledger whose revision is not expectedRevision + 1 or that is structurally invalid', async () => {
     const adapter = new ShadowEvidenceAdapter({ stateDir: tempDir });
     expect(

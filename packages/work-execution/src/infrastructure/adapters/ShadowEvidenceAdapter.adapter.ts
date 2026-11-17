@@ -154,7 +154,10 @@ export class ShadowEvidenceAdapter implements ShadowEvidencePort {
       if (stop !== null) return stop;
       const resolved = this.resolveNext(snapshot.next, expectedRevision);
       if ('outcome' in resolved) return resolved;
-      this.inMemoryLedger = resolved.ledger;
+      // Store a private copy: the ledger handed back to the caller must never
+      // be the same object as the one held here, or a caller mutating its
+      // own result would reach back into the store without a compareAndSet.
+      this.inMemoryLedger = structuredClone(resolved.ledger);
       return { outcome: 'saved', ledger: resolved.ledger };
     }
     return withFileLock(`${target}.lock`, async (): Promise<ShadowLedgerCasResult> => {
@@ -192,8 +195,17 @@ export class ShadowEvidenceAdapter implements ShadowEvidencePort {
     return { ledger: nextRead.ledger };
   }
 
+  /**
+   * The in-memory store's current state, as a fresh copy: the same guarantee
+   * disk mode gets for free from re-reading and re-parsing a file. Without
+   * this, `read()` and the conflict check below would hand out (or compare
+   * against) the live object the store itself holds, and a caller mutating
+   * it would corrupt the store without ever going through `compareAndSet`.
+   */
   private memoryState(): ShadowLedgerReadResult {
-    return this.inMemoryLedger === null ? { status: 'missing' } : { status: 'ok', ledger: this.inMemoryLedger };
+    return this.inMemoryLedger === null
+      ? { status: 'missing' }
+      : { status: 'ok', ledger: structuredClone(this.inMemoryLedger) };
   }
 
   private deadlineReached(deadlineMs: number): boolean {

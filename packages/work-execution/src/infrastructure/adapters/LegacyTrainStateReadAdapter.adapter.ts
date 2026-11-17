@@ -1,5 +1,5 @@
 // Lane CO5: read-only reader for the legacy shell merge-train state directory.
-import { promises as fs, type Dirent } from 'node:fs';
+import { promises as fs, constants as fsConstants, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 
 import type {
@@ -92,28 +92,49 @@ export class LegacyTrainStateReadAdapter implements LegacyTrainStateReadPort {
     return Object.freeze({ queue, parked, chains, batch, inprogress, batchesEnabled });
   }
 
+  /**
+   * Read the events log without racing the legacy writer: the open refuses a
+   * symlink at the final component (O_NOFOLLOW), the size check uses the stat
+   * of the open descriptor, and the read is bounded by `eventsMaxBytes` — so a
+   * concurrent append or replacement can never make more than one extra byte
+   * past the cap be read.
+   */
   async readLegacyTrainEvents(options: LegacyTrainStateReadOptions): Promise<LegacyTrainEventsRead> {
     const eventsPath = join(options.stateDir, this.eventsFileName);
-    let stats: Awaited<ReturnType<typeof fs.lstat>>;
+    let handle: fs.FileHandle;
     try {
-      stats = await fs.lstat(eventsPath);
+      handle = await fs.open(eventsPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (errorCode(error) === 'ENOENT') {
         return { status: 'absent' };
       }
       return { status: 'unreadable' };
     }
-    if (!stats.isFile()) {
-      return { status: 'unreadable' };
-    }
-    if (stats.size > this.eventsMaxBytes) {
-      return { status: 'too-large' };
-    }
     try {
-      const text = await fs.readFile(eventsPath, 'utf8');
-      return { status: 'read', lines: Object.freeze(splitLines(text)) };
+      const stats = await handle.stat();
+      if (!stats.isFile()) {
+        return { status: 'unreadable' };
+      }
+      if (stats.size > this.eventsMaxBytes) {
+        return { status: 'too-large' };
+      }
+      const buffer = Buffer.alloc(this.eventsMaxBytes + 1);
+      let read = 0;
+      while (read < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, read, buffer.length - read, read);
+        if (bytesRead === 0) {
+          break;
+        }
+        read += bytesRead;
+      }
+      if (read > this.eventsMaxBytes) {
+        return { status: 'too-large' };
+      }
+      return { status: 'read', lines: Object.freeze(splitLines(buffer.subarray(0, read).toString('utf8'))) };
     } catch {
       return { status: 'unreadable' };
+    } finally {
+      await handle.close().catch(() => undefined);
     }
   }
 
@@ -162,4 +183,8 @@ function splitLines(text: string): string[] {
     pieces.pop();
   }
   return pieces;
+}
+
+function errorCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code;
 }

@@ -229,6 +229,18 @@ describe('LegacyTrainStateReadAdapter', () => {
       expect(result).toEqual({ status: 'too-large' });
     });
 
+    it('reads an events log of exactly the byte cap', async () => {
+      const dir = await makeTempDir();
+      const text = 'x'.repeat(16);
+      await fs.writeFile(join(dir, 'events.jsonl'), text);
+
+      const result = await new LegacyTrainStateReadAdapter({ eventsMaxBytes: 16 }).readLegacyTrainEvents({
+        stateDir: dir,
+      });
+
+      expect(result).toEqual({ status: 'read', lines: [text] });
+    });
+
     it('refuses an events file-name option that collides with an existing source', () => {
       expect(() => new LegacyTrainStateReadAdapter({ eventsFileName: 'queue' })).toThrow();
     });

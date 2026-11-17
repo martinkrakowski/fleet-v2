@@ -91,6 +91,8 @@ const RUNTIME_ONLY = new Set([
   "YARN_NM_MODE",
   // The speech runtime dir the spd-say adapter forwards to its child at runtime; never a build input.
   "XDG_RUNTIME_DIR",
+  // Operator opt-in for spoken train-health alerts on the operator host; never a build input.
+  "FLEET_AUDIBLE_ALERT",
   // Passed through by the release runner's child allowlist; never a build input.
   "COREPACK_ENABLE_DOWNLOAD_PROMPT",
   "TZ",

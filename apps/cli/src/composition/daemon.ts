@@ -37,6 +37,7 @@ import {
   type MergePolicySource,
   type MergeForgeActionPort,
   MergeQueueRepositoryAdapter,
+  SpdSayHostAudibleAlertAdapter,
   type HostAudibleAlertPort,
   type WatchTrainHealthPort,
   type SetDaemonPausePort,
@@ -108,6 +109,8 @@ export interface ComposedDaemon {
   readonly setDaemonPause: SetDaemonPausePort;
   /** CO-WD5a: one bounded train-health watchdog pass; no schedule, no I/O at construction. */
   readonly watchTrainHealth: WatchTrainHealthPort;
+  /** CO-WD9a: the resolved audible-alert mode; `off` unless the host opts in. */
+  readonly audibleAlertMode: 'off' | 'spd-say' | 'invalid';
   readonly probeForge: (input: { readonly nowIso: string; readonly deadlineIso: string }) => Promise<boolean>;
   readonly now: () => string;
   readonly newUlid: () => string;
@@ -165,6 +168,54 @@ function refusedPause(reasonCode: 'invalid-request' | 'invalid-clock' | 'pause-w
  */
 function resolveChainRefreshMode(source: MergePolicySource): 'shadow' | 'invalid' {
   return source.outcome === 'resolved' && source.daemon.chainRefresh === 'invalid' ? 'invalid' : 'shadow';
+}
+
+/**
+ * Reads one own property by descriptor from an environment-like object.
+ * Never reads a prototype property, never invokes a getter (`'value' in desc`
+ * excludes accessor descriptors) and never throws. The lookup is a single
+ * own-descriptor read: constant cost, one key, no traversal.
+ */
+function ownEnvValue(env: object, key: string): { readonly present: boolean; readonly accessor: boolean; readonly value: unknown } {
+  const desc = Object.getOwnPropertyDescriptor(env, key);
+  if (desc === undefined) {
+    return { present: false, accessor: false, value: undefined };
+  }
+  if (!('value' in desc)) {
+    return { present: true, accessor: true, value: undefined };
+  }
+  return { present: true, accessor: false, value: desc.value };
+}
+
+/**
+ * The audible-alert mode from the environment: `spd-say` only on the exact
+ * own string value `'spd-say'`; `off` when the key is absent, `undefined` or
+ * `''`; `invalid` for everything else (including accessor descriptors).
+ *
+ * Hostile-input safe and never throws: inside `try/catch` it rejects any
+ * non-object source up front and reads a single own data-property descriptor
+ * `'FLEET_AUDIBLE_ALERT'` — never an inherited property, never a getter, never
+ * a `Proxy` `get` trap. Cost is constant: linear in a capped 1-key lookup.
+ */
+export function resolveAudibleAlertMode(env: unknown): 'off' | 'spd-say' | 'invalid' {
+  try {
+    if (typeof env !== 'object' || env === null || Array.isArray(env)) {
+      return 'invalid';
+    }
+    const entry = ownEnvValue(env, 'FLEET_AUDIBLE_ALERT');
+    if (entry.accessor) {
+      return 'invalid';
+    }
+    if (!entry.present || entry.value === undefined || entry.value === '') {
+      return 'off';
+    }
+    if (entry.value === 'spd-say') {
+      return 'spd-say';
+    }
+    return 'invalid';
+  } catch {
+    return 'invalid';
+  }
 }
 
 /** The same source the merge-policy adapter reads, but synchronously and never thrown. */
@@ -344,11 +395,20 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
       input.trainHealthAttention.clearAttentionItem(request, via as 'cli' | 'web' | 'machine', actor),
     listAttentionItems: input.trainHealthAttention.listAttentionItems,
   });
+  // CO-WD9a: the audible alert is opt-in only. An injected port (tests or an
+  // explicit composition input) wins; otherwise the host environment decides
+  // via `FLEET_AUDIBLE_ALERT` (default off). Nothing is spawned or probed
+  // here: the adapter is only constructed, its `speak` runs later in the pass.
+  const injectedAlert = input.trainHealthAlert ?? options?.daemonAudibleAlert;
+  const env = options?.env ?? process.env;
+  const audibleAlertMode = injectedAlert !== undefined ? 'spd-say' : resolveAudibleAlertMode(env);
+  const audibleAlert: Pick<HostAudibleAlertPort, 'speak'> | undefined =
+    injectedAlert ?? (audibleAlertMode === 'spd-say' ? new SpdSayHostAudibleAlertAdapter() : undefined);
   const watchTrainHealth = new WatchTrainHealthUseCase({
     state: trainHealthState,
     attention: trainHealthAttention,
     now,
-    ...(input.trainHealthAlert !== undefined ? { alert: input.trainHealthAlert } : {}),
+    ...(audibleAlert !== undefined ? { alert: audibleAlert } : {}),
   });
 
   return {
@@ -364,6 +424,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     inspectDaemonStatus,
     setDaemonPause,
     watchTrainHealth,
+    audibleAlertMode,
     probeForge,
     now,
     newUlid: () => newUlid(),

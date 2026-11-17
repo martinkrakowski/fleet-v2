@@ -5,7 +5,11 @@
  * coordination's attention store. Every request carries the pass deadline and
  * the caller bounds each await with the remaining call budget. A repeat raise
  * refreshes the open item; a failed raise is reported, never retried blindly.
- * Ids and codes only.
+ * A successful raise returns `previousRaisedAtIso`: the item's `lastRaisedAtIso`
+ * immediately before this raise. It is null when `outcome` is `'raised'`, which
+ * means there was no prior open or closed record. Callers decide whether to
+ * speak from that previous time, because the refresh replaces the stored
+ * timestamp and a later read can no longer see it. Ids and codes only.
  */
 
 export const TRAIN_HEALTH_ATTENTION_RULES = [
@@ -29,7 +33,12 @@ export interface TrainHealthAttentionCommand {
 }
 
 export type RaiseTrainHealthAttentionResult =
-  | { readonly outcome: 'raised' | 'refreshed' | 'reopened'; readonly reasonCode: null }
+  | {
+      readonly outcome: 'raised' | 'refreshed' | 'reopened';
+      readonly reasonCode: null;
+      /** `lastRaisedAtIso` immediately before this raise; null when `outcome` is `'raised'`. */
+      readonly previousRaisedAtIso: string | null;
+    }
   | { readonly outcome: 'refused'; readonly reasonCode: string };
 
 export type ClearTrainHealthAttentionResult =

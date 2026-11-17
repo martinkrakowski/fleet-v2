@@ -44,6 +44,7 @@ export * from "./GatePredicatePort.out-port.js";
 export * from "./GateReceiptPort.out-port.js";
 export * from "./GateReceiptReusePort.out-port.js";
 export * from "./HeldWorkOrderRepositoryPort.out-port.js";
+export * from "./HostAudibleAlertPort.out-port.js";
 export * from "./KillallHaltMarkerPort.out-port.js";
 export * from "./KillallStopAgentPort.out-port.js";
 export * from "./KillallTrainPausePort.out-port.js";

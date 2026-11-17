@@ -67,6 +67,7 @@ export * from "./RunConductorPassUseCase.use-case.js";
 export * from "./RunDaemonTickUseCase.use-case.js";
 export * from "./RunMergePassUseCase.use-case.js";
 export * from "./SaveLaneEditsUseCase.use-case.js";
+export * from "./shadow-day/index.js";
 export * from "./StartChainUseCase.use-case.js";
 export * from "./StartLaneRunUseCase.use-case.js";
 export * from "./StopAttemptUseCase.use-case.js";

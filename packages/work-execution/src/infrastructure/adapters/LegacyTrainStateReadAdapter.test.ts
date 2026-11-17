@@ -4,7 +4,7 @@ import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { LegacyTrainStateReadAdapter } from './LegacyTrainStateReadAdapter.adapter.js';
 
@@ -249,6 +249,55 @@ describe('LegacyTrainStateReadAdapter', () => {
       expect(result.batchesEnabled).toEqual({ status: 'unreadable' });
       expect(JSON.stringify(result)).not.toContain('escaped-1');
       expect(JSON.stringify(result)).not.toContain('escaped-2');
+    });
+
+    it('detects a batches directory swapped to an escaping symlink between the directory check and the read, and discards whatever was read', async () => {
+      const dir = await makeTempDir();
+      const realBatchesDir = join(dir, 'batches');
+      await fs.mkdir(realBatchesDir);
+      await fs.writeFile(join(realBatchesDir, 'enabled'), 'real-1\n');
+
+      const outsideHome = await makeTempDir();
+      const outsideBatchesDir = join(outsideHome, 'escaped-batches');
+      await fs.mkdir(outsideBatchesDir);
+      await fs.writeFile(join(outsideBatchesDir, 'enabled'), 'escaped-1\n');
+
+      // Simulate the race the fix narrows: the directory is still real when
+      // the FIRST lstat (the "before" check) looks at it, but is replaced
+      // with a symlink to an outside directory immediately afterwards —
+      // before the open inside readSourceFile resolves. Without the fix,
+      // that open would follow the symlink and return the escaped content;
+      // this spy reproduces exactly that window by performing the swap as a
+      // side effect of the first lstat call for this path, once, then lets
+      // every call (including the later "after" check) see the real
+      // filesystem state.
+      const realLstat = fs.lstat.bind(fs);
+      let batchesDirLstatCalls = 0;
+      const spy = vi.spyOn(fs, 'lstat').mockImplementation(async (path: Parameters<typeof fs.lstat>[0]) => {
+        const stat = await realLstat(path as string);
+        if (path === realBatchesDir) {
+          batchesDirLstatCalls += 1;
+          if (batchesDirLstatCalls === 1) {
+            await fs.rm(realBatchesDir, { recursive: true, force: true });
+            await fs.symlink(outsideBatchesDir, realBatchesDir);
+          }
+        }
+        return stat;
+      });
+
+      try {
+        const result = await new LegacyTrainStateReadAdapter().readLegacyTrainState({ stateDir: dir });
+
+        // The read inside the race window did reach the escaped file (that is
+        // the part this fix cannot prevent without an openat-style API), but
+        // the post-read directory-identity check catches the swap and the
+        // result reports unreadable rather than returning that content.
+        expect(result.batchesEnabled).toEqual({ status: 'unreadable' });
+        expect(JSON.stringify(result)).not.toContain('escaped-1');
+        expect(batchesDirLstatCalls).toBeGreaterThanOrEqual(2);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 

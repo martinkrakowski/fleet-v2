@@ -6,15 +6,20 @@
  * store adapter reads an empty store and nothing touches the filesystem.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import type {
-  ActionAuthorizationPort,
-  CommandExecutorPort,
-  CommandRunOptions,
-  CommandRunResult,
-  ConductorDriverLeaseRecord,
-  ConductorDriverLeasePort,
+import {
+  ConductorDriverLeaseAdapter,
+  ReleaseStoreAdapter,
+  type ActionAuthorizationPort,
+  type CommandExecutorPort,
+  type CommandRunOptions,
+  type CommandRunResult,
+  type ConductorDriverLeaseRecord,
+  type ConductorDriverLeasePort,
 } from '@fleet/work-execution';
 
 import { CliUsageError } from '../commands/payload.js';
@@ -27,6 +32,7 @@ const SOURCE = '/nonexistent-fleet-v2-source-co14';
 const SHA = 'a'.repeat(40);
 const NOW = '2026-11-06T10:00:00.000Z';
 const PROJECT = 'fleet-v2';
+const DEFAULT_STATE_DIR = '/nonexistent-fleet-v2-driver-state-co14b';
 
 const LIVE_LEASE: ConductorDriverLeaseRecord = {
   version: 1,
@@ -49,12 +55,25 @@ const NO_GRANT: ActionAuthorizationPort = {
   consumeActionAuthorization: async () => ({ outcome: 'refused', reason: 'no grant' }),
 };
 
+/** Every resolve is granted for `root`, and every consumption of that grant succeeds. */
+function grantingAuthorization(root: string): ActionAuthorizationPort {
+  return {
+    resolveActionAuthorization: async (request) => ({
+      outcome: 'granted',
+      authorizationGrantId: `grant-${request.actionId}`,
+      releaseRoot: root,
+    }),
+    consumeActionAuthorization: async (request) => ({ outcome: 'consumed', actionId: request.actionId }),
+  };
+}
+
 function deps(lease: ConductorDriverLeaseRecord | null = null): {
   lease: ConductorDriverLeasePort;
   authorization: ActionAuthorizationPort;
   executor: RecordingExecutor;
   nowIso: () => string;
   env: () => Record<string, string | undefined>;
+  stateDir: string;
 } {
   return {
     lease: { read: async () => lease } as unknown as ConductorDriverLeasePort,
@@ -62,12 +81,208 @@ function deps(lease: ConductorDriverLeaseRecord | null = null): {
     executor: new RecordingExecutor(),
     nowIso: () => NOW,
     env: () => ({ PATH: '/usr/bin' }),
+    stateDir: DEFAULT_STATE_DIR,
   };
 }
 
 const installPayload = { action: 'install', root: ROOT, sha: SHA, source: SOURCE };
 
 describe('release command', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it(
+    'CO14b fix round 8: two different drivers race the SAME unbound root; the loser is still ' +
+      'refused by the binding, but only once BOTH are genuinely authorized -- the original ' +
+      'round 3 race protection, now reached only after authorization (finding 1)',
+    async () => {
+      // Historical note: through round 7, this test went through
+      // `releaseCommands['install']` with NO grant recorded, and witnessed
+      // the race by `ConductorDriverLeaseAdapter.prototype.read`'s call
+      // count: the loser was refused by `releaseHandler`'s own bind-before-
+      // apply write, entirely before `manageReleaseFromPayload` ever ran, so
+      // the lease was never even read for it. Round 8 moved that bind to
+      // AFTER authorization (see the two tests below, and the use-case-level
+      // tests in ManageReleaseUseCase.test.ts): an unauthorized request now
+      // never reaches the bind at all, so two UNAUTHORIZED racers are no
+      // longer distinguishable this way -- both are refused identically
+      // (`authority-refused`), before either's bind is ever attempted. This
+      // test is rewritten to race two GENUINELY authorized callers instead,
+      // which is the only way the binding race remains observable.
+      const root = '/race-fleet-release-root-co14b';
+      const stateDirA = '/race-fleet-release-state-a-co14b';
+      const stateDirB = '/race-fleet-release-state-b-co14b';
+
+      // Both racers read the root as unbound, exactly as they would before either has written
+      // the binding file.
+      const readSpy = vi
+        .spyOn(ReleaseStoreAdapter.prototype, 'readDriverBinding')
+        .mockResolvedValue({ outcome: 'unbound' });
+      // A's bindDriver call wins the exclusive-create. B's own bindDriver call then loses the
+      // race and, as the real adapter's EEXIST-reread does, reports A's stateDir — not B's own.
+      const bindSpy = vi
+        .spyOn(ReleaseStoreAdapter.prototype, 'bindDriver')
+        .mockResolvedValueOnce({ outcome: 'bound', stateDir: stateDirA })
+        .mockResolvedValueOnce({ outcome: 'bound', stateDir: stateDirA });
+
+      const payload = { action: 'install', root, sha: SHA, source: SOURCE, apply: true, project: PROJECT };
+      const depsFor = (stateDir: string): ReturnType<typeof deps> => ({
+        ...deps(),
+        authorization: grantingAuthorization(root),
+        stateDir,
+      });
+
+      const winnerResult = await manageReleaseFromPayload(payload, depsFor(stateDirA));
+      // The winner's bind matched its own state directory, so it is never refused for the
+      // binding reason (whatever it is ultimately refused or applied for afterward).
+      expect(winnerResult).not.toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+
+      const loserResult = await manageReleaseFromPayload(payload, depsFor(stateDirB));
+      // The loser's own bindDriver call lost the race (it saw A's stateDir, not its own).
+      expect(loserResult).toEqual({ outcome: 'refused', reason: 'release-root-state-dir-unknown' });
+
+      expect(readSpy).toHaveBeenCalledTimes(2);
+      expect(bindSpy).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it(
+    'CO14b fix round 8 (finding 1): an unauthorized apply on a fresh, unbound root never ' +
+      'calls bindDriver, and never creates the root directory',
+    async () => {
+      const base = await mkdtemp(join(tmpdir(), 'co14b-r8-no-auth-base-'));
+      const root = join(base, 'release-root');
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14b-r8-no-auth-state-'));
+      const bindSpy = vi.spyOn(ReleaseStoreAdapter.prototype, 'bindDriver');
+      const result = await manageReleaseFromPayload(
+        { action: 'install', root, sha: SHA, source: SOURCE, apply: true, project: PROJECT },
+        { ...deps(), store: new ReleaseStoreAdapter(), stateDir },
+      );
+      // No project / no matching grant: refused for lack of authority, never for a binding reason.
+      expect(result).toEqual({ outcome: 'refused', reason: 'authority-refused' });
+      expect(bindSpy).not.toHaveBeenCalled();
+      // No bind means no `fs.mkdir(root, { recursive: true })` and no `.release-driver` marker:
+      // the root directory itself was never created on disk.
+      await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
+
+  it(
+    'CO14b fix round 8 (finding 1): a genuinely authorized apply on a fresh, unbound root ' +
+      'still binds it correctly',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'co14b-r8-auth-root-'));
+      const stateDir = await mkdtemp(join(tmpdir(), 'co14b-r8-auth-state-'));
+      const store = new ReleaseStoreAdapter();
+      // A pre-seeded verified build, so a swap needs no real build of its own.
+      const staging = await store.prepare({ root, sha: SHA });
+      if (staging.outcome !== 'prepared') throw new Error('prepare failed');
+      const entry = join(staging.buildDir, 'apps', 'cli', 'dist');
+      await mkdir(entry, { recursive: true });
+      await writeFile(join(entry, 'bin.js'), '// built\n');
+      expect(await store.markVerified({ root, sha: SHA, buildId: staging.buildId, builtAtIso: NOW })).toEqual({
+        outcome: 'ok',
+      });
+      expect(await store.readDriverBinding({ root })).toEqual({ outcome: 'unbound' });
+
+      const result = await manageReleaseFromPayload(
+        { action: 'swap', root, sha: SHA, apply: true, project: PROJECT },
+        {
+          // A swap goes through the fenced repoint, which needs a real
+          // acquire/renew/release lease -- `deps()`'s bare `{ read }` stub
+          // (sufficient for every other test in this file, none of which
+          // reaches that path) is not enough here.
+          lease: new ConductorDriverLeaseAdapter({ stateDir }),
+          authorization: grantingAuthorization(root),
+          executor: new RecordingExecutor(),
+          nowIso: () => NOW,
+          env: () => ({ PATH: '/usr/bin' }),
+          store,
+          stateDir,
+        },
+      );
+      expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: SHA });
+      expect(await store.readDriverBinding({ root })).toEqual({ outcome: 'bound', stateDir });
+    },
+  );
+
+  it(
+    'CO14b fix round 4 investigation: two appliers configured with the SAME state directory ' +
+      "cannot both land -- the driver lease's own CAS serializes them, not the binding, which " +
+      'tells both callers they match',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'co14b-same-state-root-'));
+      const sharedStateDir = await mkdtemp(join(tmpdir(), 'co14b-same-state-shared-'));
+      const SHA_X = 'b'.repeat(40);
+      const SHA_Y = 'c'.repeat(40);
+
+      // Two already-verified builds under the same root, so a swap to either needs no build
+      // of its own and the two callers' only shared mutable resource is `current` and the lease
+      // that guards repointing it.
+      const store = new ReleaseStoreAdapter();
+      for (const sha of [SHA_X, SHA_Y]) {
+        const staging = await store.prepare({ root, sha });
+        if (staging.outcome !== 'prepared') throw new Error('prepare failed');
+        const entry = join(staging.buildDir, 'apps', 'cli', 'dist');
+        await mkdir(entry, { recursive: true });
+        await writeFile(join(entry, 'bin.js'), '// built\n');
+        expect(
+          await store.markVerified({ root, sha, buildId: staging.buildId, builtAtIso: NOW }),
+        ).toEqual({ outcome: 'ok' });
+      }
+
+      // Both appliers are configured with the SAME state directory, so once each passes the
+      // (mocked) binding check below with a value that matches its own configuration, the
+      // binding layer alone cannot tell them apart -- A's hypothetical fresh `wx` create and
+      // B's hypothetical EEXIST re-read would report the identical stateDir either way. What
+      // is NOT mocked is the lease: each gets its own real `ConductorDriverLeaseAdapter`
+      // pointed at that one real, shared state directory, exactly as `releaseHandler`
+      // constructs it per call.
+      const depsFor = (): {
+        lease: ConductorDriverLeaseAdapter;
+        authorization: ActionAuthorizationPort;
+        executor: RecordingExecutor;
+        nowIso: () => string;
+        env: () => Record<string, string | undefined>;
+        store: ReleaseStoreAdapter;
+        stateDir: string;
+      } => ({
+        lease: new ConductorDriverLeaseAdapter({ stateDir: sharedStateDir }),
+        authorization: grantingAuthorization(root),
+        executor: new RecordingExecutor(),
+        nowIso: () => NOW,
+        env: () => ({ PATH: '/usr/bin' }),
+        store: new ReleaseStoreAdapter(),
+        // CO14b fix round 8: the bind-when-unbound write now lives in the use
+        // case, keyed off this same field -- both appliers share it here
+        // exactly as they share `sharedStateDir` for their lease adapters
+        // above, so the binding layer still cannot tell them apart (the
+        // point of this test).
+        stateDir: sharedStateDir,
+      });
+
+      const [resultA, resultB] = await Promise.all([
+        manageReleaseFromPayload({ action: 'swap', root, sha: SHA_X, apply: true, project: PROJECT }, depsFor()),
+        manageReleaseFromPayload({ action: 'swap', root, sha: SHA_Y, apply: true, project: PROJECT }, depsFor()),
+      ]);
+
+      // Both callers were configured identically (same shared state directory), so if the
+      // binding's coincidental match were the real safety net, nothing would stop both from
+      // landing. Exactly one actually applies; the other is refused specifically by the
+      // lease's own CAS (decideLeaseAcquire's `lease-held`, read fresh under the state
+      // directory's exclusive lock file), surfaced here as `driver-lease-live` --
+      // proving the lease adapter, not the binding, is what keeps two same-state-dir
+      // appliers from both landing.
+      const results = [resultA, resultB];
+      const applied = results.filter((r) => (r as { outcome: string }).outcome === 'applied');
+      const refused = results.filter((r) => (r as { outcome: string }).outcome === 'refused');
+      expect(applied).toHaveLength(1);
+      expect(refused).toHaveLength(1);
+      expect((refused[0] as { reason: string }).reason).toBe('driver-lease-live');
+    },
+  );
+
   it('install without apply returns the plan and runs no command', async () => {
     const d = deps();
     const result = await manageReleaseFromPayload(installPayload, d);
@@ -111,11 +326,34 @@ describe('release command', () => {
   });
 
   it('the registered release group refuses apply on a runtime with no recorded grant', async () => {
-    const rt = createFleetCliRuntime();
+    const stateDir = await mkdtemp(join(tmpdir(), 'co14-cli-release-'));
+    // A real, writable root (rather than the nonexistent ROOT sentinel under
+    // `/`). CO14b fix round 8: the bind-when-unbound write now happens only
+    // AFTER authorization grants (ManageReleaseUseCase.bindRootIfUnbound), so
+    // this runtime's empty coordination store refuses the apply for lack of
+    // authority before the bind is ever attempted either way; a real root is
+    // kept here only so a future lane that adds a recorded grant to this test
+    // exercises the same bind path the two tests above cover directly.
+    const root = await mkdtemp(join(tmpdir(), 'co14-cli-release-root-'));
+    const rt = createFleetCliRuntime({
+      stateDir,
+      installation: {
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {},
+        daemon: {
+          nodePath: '/usr/bin/node',
+          cliPath: '/usr/bin/fleet-v2',
+          stateDir,
+          unitDir: join(stateDir, 'units'),
+          installationFile: join(stateDir, 'fleet.json'),
+        },
+      } as never,
+    });
     const out: string[] = [];
     const err: string[] = [];
     const code = await runCli(
-      ['release', 'install', '--root', ROOT, '--sha', SHA, '--source', SOURCE, '--project', PROJECT, '--apply'],
+      ['release', 'install', '--root', root, '--sha', SHA, '--source', SOURCE, '--project', PROJECT, '--apply'],
       { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
       rt,
     );

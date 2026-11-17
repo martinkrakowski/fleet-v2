@@ -400,8 +400,32 @@ function expectedS1Digest(day: string, status: string, reason: string, counts: {
   );
 }
 
-function expectedSimpleDigest(criterion: 'S9' | 'S12', day: string, status: string, reason: string): string {
+function expectedSimpleDigest(criterion: 'S9', day: string, status: string, reason: string): string {
   return sha256HexDigest(JSON.stringify({ criterion, day, status, reason }));
+}
+
+/**
+ * The canonical S12 summary digest, rebuilt here exactly as the use case
+ * builds it: S12 carries its evaluator's tick-health counts into the digest,
+ * so two evaluations landing on the same {status, reason} pair are no longer
+ * indistinguishable to it.
+ */
+function expectedS12Digest(day: string, status: string, reason: string, counts: {
+  totalTicks: number;
+  budgetOverruns: number;
+  starvedJobs: number;
+}): string {
+  return sha256HexDigest(
+    JSON.stringify({
+      criterion: 'S12',
+      day,
+      status,
+      reason,
+      totalTicks: counts.totalTicks,
+      budgetOverruns: counts.budgetOverruns,
+      starvedJobs: counts.starvedJobs,
+    }),
+  );
 }
 
 /**
@@ -496,7 +520,11 @@ describe('RecordShadowDayUseCase', () => {
       recordedAtIso: RECORDED_AT_ISO,
     });
     expect(dayRecord?.verdicts.S9?.digest).toBe(expectedSimpleDigest('S9', DAY, 'pass', 'state-consistent'));
-    expect(dayRecord?.verdicts.S12?.digest).toBe(expectedSimpleDigest('S12', DAY, 'pass', 'ticks-within-budget'));
+    expect(dayRecord?.verdicts.S12?.digest).toBe(expectedS12Digest(DAY, 'pass', 'ticks-within-budget', {
+      totalTicks: 800,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    }));
     expectNotImplementedUnevaluated(result.unevaluated);
   });
 
@@ -761,6 +789,62 @@ describe('RecordShadowDayUseCase', () => {
     // evidence like this would wrongly report 'unchanged' (the SH7b fix
     // round 2 finding this fix closes).
     expect(dayRecordA?.verdicts.S8?.digest).not.toBe(dayRecordB?.verdicts.S8?.digest);
+  });
+
+  it('two days with the same S12 pass/ticks-within-budget and different tick counts get different digests', async () => {
+    const fewerDay = DAY;
+    const moreDay = '2026-11-15';
+    const fewerFixture = cleanFixture(fewerDay);
+    const moreFixture = cleanFixture(moreDay);
+    const fewer = { ...fewerFixture, daemonEvents: fewerFixture.daemonEvents.slice(0, 720) };
+    const more = { ...moreFixture, daemonEvents: moreFixture.daemonEvents.slice(0, 721) };
+    const harnessFewer = makeHarness(fewer, NOW);
+    const harnessMore = makeHarness(more, NOW);
+    const resultFewer = await new RecordShadowDayUseCase(harnessFewer.deps).execute(makeRequest({ day: fewerDay }));
+    const resultMore = await new RecordShadowDayUseCase(harnessMore.deps).execute(makeRequest({ day: moreDay }));
+    expectRecorded(resultFewer);
+    expectRecorded(resultMore);
+    expect(resultFewer.recorded.S12).toBe('pass');
+    expect(resultMore.recorded.S12).toBe('pass');
+
+    const digestFewer = harnessFewer.evidence.stored?.days.find((entry) => entry.day === fewerDay)?.verdicts.S12?.digest;
+    const digestMore = harnessMore.evidence.stored?.days.find((entry) => entry.day === moreDay)?.verdicts.S12?.digest;
+    expect(digestFewer).toBe(expectedS12Digest(fewerDay, 'pass', 'ticks-within-budget', {
+      totalTicks: 720,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    }));
+    expect(digestMore).toBe(expectedS12Digest(moreDay, 'pass', 'ticks-within-budget', {
+      totalTicks: 721,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    }));
+    expect(digestFewer).not.toBe(digestMore);
+  });
+
+  it('equivalent S12 event sets in different orders produce the same digest', async () => {
+    const forward = cleanFixture(DAY);
+    const reversed = {
+      ...cleanFixture(DAY),
+      daemonEvents: cleanFixture(DAY).daemonEvents.slice().reverse(),
+    };
+    const harnessForward = makeHarness(forward, NOW);
+    const harnessReversed = makeHarness(reversed, NOW);
+    const resultForward = await new RecordShadowDayUseCase(harnessForward.deps).execute(makeRequest());
+    const resultReversed = await new RecordShadowDayUseCase(harnessReversed.deps).execute(makeRequest());
+    expectRecorded(resultForward);
+    expectRecorded(resultReversed);
+
+    const expected = expectedS12Digest(DAY, 'pass', 'ticks-within-budget', {
+      totalTicks: 800,
+      budgetOverruns: 0,
+      starvedJobs: 0,
+    });
+    const digestForward = harnessForward.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S12?.digest;
+    const digestReversed = harnessReversed.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S12?.digest;
+    expect(digestForward).toBe(expected);
+    expect(digestReversed).toBe(expected);
+    expect(digestForward).toBe(digestReversed);
   });
 
   it('reports S8 unevaluated when the import dry-run is refused, still recording S1, S9 and S12', async () => {

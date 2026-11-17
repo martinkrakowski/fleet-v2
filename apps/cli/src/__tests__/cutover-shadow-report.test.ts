@@ -1,6 +1,7 @@
 // CO32: the `cutover shadow report` command — reads the shell train's queue
 // through the LegacyTrainStateReadAdapter and compares it to the fleet merge
 // queue for one repository, printing one JSON document of ids and codes.
+import { createHash } from 'node:crypto';
 import { mkdtempSync, promises as fs, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -13,6 +14,7 @@ import { runCli, type CliIo } from '../index.js';
 const HEAD_A = '0123456789abcdef0123456789abcdef01234567';
 const HEAD_B = '0123456789abcdef0123456789abcdef01234568';
 const HEAD_C = '0123456789abcdef0123456789abcdef01234569';
+const FLEET_V2_REPO_DIGEST = createHash('sha256').update('fleet/v2', 'utf8').digest('hex').slice(0, 12);
 
 const tempStateDirs: string[] = [];
 
@@ -239,7 +241,7 @@ describe('cutover shadow report (CO32)', () => {
 
     const noSub = await cli(runtime, ['cutover', 'shadow']);
     expect(noSub.code).toBe(2);
-    expect(noSub.err).toContain('cutover shadow requires the report subcommand');
+    expect(noSub.err).toContain('cutover shadow requires a subcommand: fleet-v2 cutover shadow report or fleet-v2 cutover shadow record-day');
   });
 
   it('counts only the live entries of the named repository', async () => {
@@ -281,7 +283,7 @@ describe('cutover shadow report (CO32)', () => {
       version: 1,
       entryId: ulid(1),
       repository: { owner: 'fleet', repo: 'v2' },
-      repoDigest: 'a'.repeat(12),
+      repoDigest: FLEET_V2_REPO_DIGEST,
       pullRequest: 7,
       headOid: HEAD_A,
       state: 'parked',
@@ -544,7 +546,7 @@ describe('cutover shadow report (CO32)', () => {
       version: 2,
       entryId: ulid(1),
       repository: { owner: 'fleet', repo: 'v2' },
-      repoDigest: 'a'.repeat(12),
+      repoDigest: FLEET_V2_REPO_DIGEST,
       pullRequest: 9,
       headOid: HEAD_B,
       state: 'parked',

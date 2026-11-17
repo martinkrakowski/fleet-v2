@@ -21,6 +21,28 @@ import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepository
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
+/**
+ * The repository-ref validation both this use case and the shadow day-writer
+ * (SH7a) share: two owner/repo segments in the legacy shell train's
+ * `owner/repo` shape, never `.` or `..`.
+ */
+export function isValidRepositoryRef(repository: unknown): boolean {
+  if (typeof repository !== 'object' || repository === null) {
+    return false;
+  }
+  const { owner, repo } = repository as { readonly owner?: unknown; readonly repo?: unknown };
+  return (
+    typeof owner === 'string' &&
+    typeof repo === 'string' &&
+    REPOSITORY_SEGMENT_PATTERN.test(owner) &&
+    REPOSITORY_SEGMENT_PATTERN.test(repo) &&
+    owner !== '.' &&
+    owner !== '..' &&
+    repo !== '.' &&
+    repo !== '..'
+  );
+}
+
 /** The three legacy sources this unit imports from, in dedup-priority order. */
 const SOURCES = ['queue', 'inprogress', 'parked'] as const;
 type Source = (typeof SOURCES)[number];
@@ -363,17 +385,6 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
   }
 
   private isValidRepository(repository: ImportTrainStateRequest['repository']): boolean {
-    const { owner, repo } = repository;
-    if (
-      !REPOSITORY_SEGMENT_PATTERN.test(owner) ||
-      !REPOSITORY_SEGMENT_PATTERN.test(repo) ||
-      owner === '.' ||
-      owner === '..' ||
-      repo === '.' ||
-      repo === '..'
-    ) {
-      return false;
-    }
-    return true;
+    return isValidRepositoryRef(repository);
   }
 }

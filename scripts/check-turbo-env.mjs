@@ -89,6 +89,8 @@ const RUNTIME_ONLY = new Set([
   "TMPDIR",
   "SYSTEMROOT",
   "YARN_NM_MODE",
+  // The speech runtime dir the spd-say adapter forwards to its child at runtime; never a build input.
+  "XDG_RUNTIME_DIR",
   // Passed through by the release runner's child allowlist; never a build input.
   "COREPACK_ENABLE_DOWNLOAD_PROMPT",
   "TZ",

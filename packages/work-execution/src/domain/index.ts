@@ -65,6 +65,8 @@ export * from "./seat-selection.js";
 export * from "./shadow-attestations.js";
 export * from "./shadow-comparators.js";
 export * from "./shadow-day-chains-retired.js";
+export * from "./shadow-day-conformance.js";
+export * from "./shadow-day-gate-agreement.js";
 export * from "./shadow-day-health.js";
 export * from "./shadow-day-intake.js";
 export * from "./shadow-day-merge-set.js";

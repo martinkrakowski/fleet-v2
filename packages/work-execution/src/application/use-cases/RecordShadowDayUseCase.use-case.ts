@@ -1,7 +1,8 @@
-// Lane SH7a: the shadow day-writer. For one UTC day it evaluates every
+// Lane SH7b: the shadow day-writer. For one UTC day it evaluates every
 // criterion this chain can currently compute from data that already exists —
-// S1 (merge set, SH5a), S9 (state integrity, yesterday only, SH5b) and S12
-// (daemon tick health, SH5b) — records each definite pass/fail verdict into
+// S1 (merge set, SH5a), S8 (two-sample intake, yesterday only, SH5c), S9
+// (state integrity, yesterday only, SH5b) and S12 (daemon tick health, SH5b)
+// — records each definite pass/fail verdict into
 // the SH1/SH2 shadow-evidence ledger by compare-and-set, and reports every
 // other criterion as unevaluated: never a pass, never a silent fail. Nothing
 // is ever written to the ledger on any refused or unknown outcome. Every
@@ -21,7 +22,10 @@ import {
   type ShadowCriterionVerdict,
   type ShadowLedger,
 } from '../../domain/shadow-evidence-ledger.js';
+import { parseLegacyTrainParkedQueue, parseLegacyTrainQueue } from '../../domain/legacy-train-queue.js';
+import { evaluateShadowIntake, type ShadowIntakeEvaluation } from '../../domain/shadow-day-intake.js';
 import { parseShellTrainEvents, type ShellTrainEvent } from '../../domain/shell-train-events.js';
+import type { ImportTrainStatePort } from '../ports/in/ImportTrainStatePort.in-port.js';
 import type {
   RecordShadowDayPort,
   RecordShadowDayRequest,
@@ -30,7 +34,7 @@ import type {
 } from '../ports/in/RecordShadowDayPort.in-port.js';
 import type { DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
-import type { LegacyTrainStateReadPort } from '../ports/out/LegacyTrainStateReadPort.out-port.js';
+import type { LegacyTrainFileRead, LegacyTrainStateReadPort } from '../ports/out/LegacyTrainStateReadPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { ShadowEvidencePort } from '../ports/out/ShadowEvidencePort.out-port.js';
 import { isValidRepositoryRef } from './ImportTrainStateUseCase.use-case.js';
@@ -42,16 +46,25 @@ const EARLY_GRACE_MS = 15 * 60 * 1000;
 /** A day more than this many calendar days before now's date is too old to record. */
 const MAX_DAY_AGE_DAYS = 7;
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+/**
+ * The default wall-clock gap between S8's two samples: 2.5 minutes,
+ * comfortably above SH5c's `SHADOW_INTAKE_MIN_GAP_MS` floor of 2 minutes.
+ */
+const DEFAULT_SAMPLE_GAP_MS = 150_000;
 
-/** Every criterion no evaluator implements yet; SH7b adds S8, later units the rest. */
+/** Every criterion no evaluator implements yet; later units add the rest. */
 const NOT_IMPLEMENTED_CRITERIA: readonly CutoverShadowCriterion[] = [
-  'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S8', 'S10', 'S11', 'S13',
+  'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S10', 'S11', 'S13',
 ];
 
 export interface RecordShadowDayDependencies {
   readonly evidence: ShadowEvidencePort;
   readonly legacy: LegacyTrainStateReadPort;
   readonly queue: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>;
+  /** The import dry-run seat: S8 never applies, it only asks what would import. */
+  readonly importDryRun: Pick<ImportTrainStatePort, 'importTrainState'>;
+  /** The real wall-clock gap between S8's two samples; faked in tests. */
+  readonly sleep: (ms: number) => Promise<void>;
   readonly journal: Pick<LaneRunJournalPort, 'listForKeyPrefix'>;
   readonly daemonEvents: Pick<DaemonEventProjectionPort, 'readAfterCursor'>;
   readonly checkState: () => Promise<{ readonly checked: number; readonly bad: number } | null>;
@@ -60,7 +73,7 @@ export interface RecordShadowDayDependencies {
   readonly releaseSha: () => Promise<string | null>;
   readonly nowIso: () => string;
   /** The owner-accepted OD-1 default (false, fail-closed) is pinned in composition; this use case only receives it. */
-  readonly settings: { readonly excludeBatchMerges: boolean };
+  readonly settings: { readonly excludeBatchMerges: boolean; readonly sampleGapMs?: number };
 }
 
 /** Thrown by `call` when the deadline is already reached; aborts the whole run. */
@@ -86,6 +99,8 @@ type CriterionOutcome =
       readonly evaluation: ShadowCriterionEvaluation;
       /** Present only for S1: the merge-set evaluation the counts come from. */
       readonly mergeSet?: ShadowDayMergeSetEvaluation;
+      /** Present only for S8: the intake evaluation the comparison counts come from. */
+      readonly intake?: ShadowIntakeEvaluation;
     }
   | { readonly criterion: CutoverShadowCriterion; readonly kind: 'unevaluated'; readonly reason: string };
 
@@ -98,6 +113,80 @@ type LedgerRead =
 type JournalRead =
   | { readonly kind: 'ok'; readonly entries: readonly LaneRunJournalEntryRecord[] }
   | { readonly kind: 'unavailable' };
+
+/** One enqueue key as the SH5c intake evaluator consumes it. */
+interface IntakeKey {
+  readonly pullRequest: number;
+  readonly headOid: string;
+  readonly base: string;
+}
+
+/**
+ * One intake key's identity, matching `shadow-day-intake.ts`'s own `keyOf`
+ * exactly (`${pullRequest}@${headOid}@${base}`): ids only, never echoed.
+ */
+function intakeKeyIdentity(key: IntakeKey): string {
+  return `${key.pullRequest}@${key.headOid}@${key.base}`;
+}
+
+/**
+ * `shellLive`'s `queue` and `inprogress` sources can legitimately name the
+ * same live PR twice: `cutover.ts`'s own doc comment on the `inprogress`
+ * field records the crash-leftover case where a PR has left the queue but
+ * not yet merged, while a stale `queue` line for it lingers from an earlier
+ * crash. That is one live PR, not two — but it is the ONLY documented,
+ * legitimate cross-source overlap, so this collapses exactly that: one
+ * `queue`/`inprogress` pair per shared `(pullRequest, headOid, base)`
+ * identity (`intakeKeyIdentity`), nothing more.
+ *
+ * `parked` keys are never touched here: they pass straight into the result
+ * exactly as parsed, whether or not their identity also appears in `queue`
+ * or `inprogress`, because no doc comment names that combination as a
+ * known, legitimate overlap. A key repeated WITHIN one source alone (two
+ * `queue` lines naming the same PR, say) is likewise never touched, for the
+ * same reason — and that repeat is the genuine anomaly
+ * `compareShadowEnqueueSets`'s own duplicate detection (`invalid-item`)
+ * exists to catch. Collapsing either of those would silently hide a real
+ * divergence and let S8 record a false pass.
+ *
+ * Implemented as a multiset intersection: each `inprogress` key is dropped
+ * only while an as-yet-unmatched `queue` occurrence of the same identity
+ * remains, so a key present N times in each source is collapsed by exactly
+ * N pairs — never more, and never for an identity `queue` does not also
+ * carry.
+ */
+function mergeShellLiveSources(
+  queueKeys: readonly IntakeKey[],
+  parkedKeys: readonly IntakeKey[],
+  inprogressKeys: readonly IntakeKey[],
+): readonly IntakeKey[] {
+  const unmatchedQueueCount = new Map<string, number>();
+  for (const key of queueKeys) {
+    const identity = intakeKeyIdentity(key);
+    unmatchedQueueCount.set(identity, (unmatchedQueueCount.get(identity) ?? 0) + 1);
+  }
+  const keptInprogress: IntakeKey[] = [];
+  for (const key of inprogressKeys) {
+    const identity = intakeKeyIdentity(key);
+    const remaining = unmatchedQueueCount.get(identity) ?? 0;
+    if (remaining > 0) {
+      unmatchedQueueCount.set(identity, remaining - 1);
+      continue;
+    }
+    keptInprogress.push(key);
+  }
+  return [...parkedKeys, ...queueKeys, ...keptInprogress];
+}
+
+/** One S8 intake sample, shaped exactly for `evaluateShadowIntake`. */
+interface IntakeSample {
+  readonly takenAtIso: string;
+  readonly complete: boolean;
+  readonly shellLive: readonly IntakeKey[];
+  readonly fleetLive: readonly IntakeKey[];
+  readonly importPresent: readonly IntakeKey[] | null;
+  readonly importUnknownLines: number;
+}
 
 interface BuiltVerdicts {
   readonly verdicts: Readonly<Partial<Record<CutoverShadowCriterion, ShadowCriterionVerdict>>>;
@@ -170,6 +259,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     const journal = await this.readJournal(context);
     const outcomes = [
       await this.evaluateMergeSetCriterion(context, journal),
+      await this.evaluateIntakeCriterion(context),
       await this.evaluateStateIntegrityCriterion(context, journal),
       await this.evaluateTickHealthCriterion(context),
     ];
@@ -354,6 +444,167 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     return { criterion: 'S1', kind: 'evaluated', evaluation, mergeSet: evaluation };
   }
 
+  /**
+   * One shell train source (queue, parked or inprogress) reduced to the
+   * intake keys it contributes plus whether it was incomplete. A missing
+   * field (`undefined`) or an `'unreadable'` read is genuinely unknown
+   * evidence and counts as incomplete; an `'absent'` read is a confident,
+   * known-empty source (no entries) exactly as `cutover.ts`'s own handling
+   * of these same fields treats it (`status === 'absent' ? 0 : ...`), so it
+   * contributes zero keys and does NOT mark the sample incomplete. An
+   * unparseable line still counts as incomplete, so the sample's `complete`
+   * flag fails closed on real unknowns without fabricating one for the
+   * ordinary "file doesn't exist" case (an idle shell train has no
+   * `inprogress` file; a shell with no batching configured has no
+   * `batches/enabled` file). Parked lines are the shell's 6-field record,
+   * parsed with the parked parser, as the shadow report does; queue and
+   * inprogress lines parse with the queue parser.
+   */
+  private parsedShellSource(
+    read: LegacyTrainFileRead | undefined,
+    parked: boolean,
+  ): { readonly keys: readonly IntakeKey[]; readonly incomplete: boolean } {
+    if (read === undefined || read.status === 'unreadable') {
+      return { keys: [], incomplete: true };
+    }
+    if (read.status === 'absent') {
+      return { keys: [], incomplete: false };
+    }
+    const parsed = parked
+      ? parseLegacyTrainParkedQueue(read.lines.join('\n'))
+      : parseLegacyTrainQueue(read.lines.join('\n'));
+    if (!parsed.ok) {
+      return { keys: [], incomplete: true };
+    }
+    const keys: IntakeKey[] = [];
+    let unknownLines = 0;
+    for (const line of parsed.lines) {
+      if (!line.ok) {
+        unknownLines += 1;
+        continue;
+      }
+      keys.push({ pullRequest: line.entry.pullRequest, headOid: line.entry.headOid, base: line.entry.base });
+    }
+    return { keys, incomplete: unknownLines > 0 };
+  }
+
+  /**
+   * One S8 sample, assembled the same way the shadow-report command
+   * assembles its shell live set: queue, parked and in-progress lines
+   * parsed separately, then combined into `shellLive` by
+   * `mergeShellLiveSources`, which collapses ONLY the one documented
+   * cross-source overlap (`cutover.ts`'s own doc comment on the
+   * `inprogress` field: the same PR/head can legitimately appear in both
+   * `queue` and `inprogress` after a crash — one live PR, not two) and
+   * leaves every other repeat untouched, including a key repeated within a
+   * single source alone and any repeat involving `parked` — those are the
+   * genuine anomalies `compareShadowEnqueueSets`'s own `invalid-item`
+   * detection exists to catch, and collapsing them here would silently hide
+   * that anomaly and let S8 record a false pass. The fleet queue's live
+   * entries for this repository go into `fleetLive` (each under its own
+   * recorded base, `main` when it has none); the import dry-run's
+   * would-import/already-queued keys go into `importPresent`, null when the
+   * dry-run is refused or unavailable. The `complete` flag is false when any
+   * shell source has an unknown line or is genuinely unknown (unreadable, or
+   * the field itself missing), or `batchesEnabled` is unreadable or missing
+   * — never a guessed pass, but also never a false incomplete for the
+   * ordinary case where a source file legitimately does not exist
+   * (`'absent'`): that is a confident, known-empty read, exactly as
+   * `cutover.ts`'s own handling of `shellState.batch.status`/
+   * `batchesEnabled.status` treats it (`status === 'absent' ? 0 : ...`).
+   */
+  private async intakeSample(context: DayContext): Promise<IntakeSample> {
+    const takenAtIso = this.deps.nowIso();
+    let queueKeys: readonly IntakeKey[] = [];
+    let parkedKeys: readonly IntakeKey[] = [];
+    let inprogressKeys: readonly IntakeKey[] = [];
+    let complete = true;
+    const stateRead = await this.call(
+      context.deadlineIso,
+      () => this.deps.legacy.readLegacyTrainState({ stateDir: context.legacyStateDir }),
+    );
+    if (stateRead.kind === 'value') {
+      const queueParsed = this.parsedShellSource(stateRead.value.queue, false);
+      const parkedParsed = this.parsedShellSource(stateRead.value.parked, true);
+      const inprogressParsed = this.parsedShellSource(stateRead.value.inprogress, false);
+      complete = complete && !queueParsed.incomplete && !parkedParsed.incomplete && !inprogressParsed.incomplete;
+      queueKeys = queueParsed.keys;
+      parkedKeys = parkedParsed.keys;
+      inprogressKeys = inprogressParsed.keys;
+      const batchesEnabled = stateRead.value.batchesEnabled;
+      // A deny-list of the one genuinely-unknown status ('unreadable'), not
+      // an allow-list of 'read' alone: 'absent' is a confident known-empty
+      // read for this field too (the field itself still being present, per
+      // its own doc comment, is checked separately by `!== undefined`),
+      // matching `cutover.ts`'s own treatment of this exact field
+      // (`batchesEnabled.status === 'absent' ? 0 : ...`).
+      complete = complete && batchesEnabled !== undefined && batchesEnabled.status !== 'unreadable';
+    } else {
+      complete = false;
+    }
+    const shellLive = mergeShellLiveSources(queueKeys, parkedKeys, inprogressKeys);
+    const fleetRead = await this.call(context.deadlineIso, () =>
+      this.deps.queue.listMergeEntries({ repository: context.repository, deadlineIso: this.queryDeadline(context) }),
+    );
+    if (fleetRead.kind === 'threw') {
+      // A failed fleet-queue read is missing evidence, not a confident
+      // "zero live entries": leaving `complete` true here would let a
+      // divergence against the shell/import sides record a false S8
+      // failure instead of surfacing that the fleet side was unavailable.
+      complete = false;
+    }
+    const fleetLive =
+      fleetRead.kind === 'threw'
+        ? []
+        : fleetRead.value
+            .filter((entry) => entry.repoDigest === context.repoDigest)
+            .filter(isMergeQueueEntryLive)
+            .map((entry) => ({
+              pullRequest: entry.pullRequest,
+              headOid: entry.headOid,
+              base: entry.baseBranch ?? 'main',
+            }));
+    // Dry-run only, never apply; no authority is exercised for a dry run.
+    const importRead = await this.call(context.deadlineIso, () =>
+      this.deps.importDryRun.importTrainState({
+        repository: context.repository,
+        stateDir: context.legacyStateDir,
+        apply: false,
+        authority: null,
+      }),
+    );
+    let importPresent: readonly IntakeKey[] | null = null;
+    let importUnknownLines = 0;
+    if (importRead.kind === 'value' && importRead.value.outcome === 'dry-run') {
+      importPresent = importRead.value.keys
+        .filter((key) => key.disposition === 'would-import' || key.disposition === 'already-queued')
+        .map((key) => ({ pullRequest: key.pullRequest, headOid: key.headOid, base: key.base }));
+      const unknown = importRead.value.unknownBySource;
+      importUnknownLines = unknown.queue.length + unknown.parked.length + unknown.inprogress.length;
+      // A truncated dry-run report's listed keys are not the full live set:
+      // this sample's import evidence cannot be trusted as complete, so it
+      // must not be allowed to manufacture a persistent, false divergence.
+      complete = complete && !importRead.value.keysTruncated;
+    }
+    return { takenAtIso, complete, shellLive, fleetLive, importPresent, importUnknownLines };
+  }
+
+  /** S8: the two-sample intake check, sampled only while the day is still yesterday. */
+  private async evaluateIntakeCriterion(context: DayContext): Promise<CriterionOutcome> {
+    const nowSerial = Math.floor(Date.parse(this.deps.nowIso()) / DAY_MS);
+    if (context.day !== utcDayOfSerial(nowSerial - 1)) {
+      return unevaluatedOutcome('S8', 'snapshot-only-for-yesterday');
+    }
+    const first = await this.intakeSample(context);
+    // A real wall-clock gap, matching SH5c's persistence intent: two
+    // independently-moving systems sampled seconds apart can manufacture a
+    // divergence that resolves itself immediately after.
+    await this.deps.sleep(this.deps.settings.sampleGapMs ?? DEFAULT_SAMPLE_GAP_MS);
+    const second = await this.intakeSample(context);
+    const evaluation = evaluateShadowIntake({ samples: [first, second] });
+    return { criterion: 'S8', kind: 'evaluated', evaluation, intake: evaluation };
+  }
+
   /** The state-check sample, or null when unavailable. */
   private async readStateCheck(deadlineIso: string | undefined): Promise<{ readonly checked: number; readonly bad: number } | null> {
     const read = await this.call(deadlineIso, () => this.deps.checkState());
@@ -409,6 +660,13 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * The canonical summary one verdict's digest is computed over: keys in the
    * fixed order `criterion`, `day`, `status`, `reason`, then the evaluator's
    * own numeric counts — for S1 also `excludeBatchMerges`, after the counts.
+   *
+   * `mergeSet` (S1 only) and `intake` (S8 only) are each set by exactly one
+   * criterion builder (`evaluateMergeSetCriterion`, `evaluateIntakeCriterion`
+   * respectively) and never both on the same outcome, so checking `mergeSet`
+   * first can never silently shadow a real `intake` value: an outcome with
+   * `intake` set always has `mergeSet === undefined`, by construction, not
+   * by this ordering.
    */
   private canonicalSummary(context: DayContext, outcome: Extract<CriterionOutcome, { kind: 'evaluated' }>): string {
     const base = {
@@ -417,17 +675,30 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       status: outcome.evaluation.status,
       reason: outcome.evaluation.reason,
     };
-    if (outcome.mergeSet === undefined) {
-      return JSON.stringify(base);
+    if (outcome.mergeSet !== undefined) {
+      return JSON.stringify({
+        ...base,
+        mergesCompared: outcome.mergeSet.mergesCompared,
+        excludedBatchMerges: outcome.mergeSet.excludedBatchMerges,
+        compared: outcome.mergeSet.compared,
+        divergences: outcome.mergeSet.divergences,
+        excludeBatchMerges: this.deps.settings.excludeBatchMerges,
+      });
     }
-    return JSON.stringify({
-      ...base,
-      mergesCompared: outcome.mergeSet.mergesCompared,
-      excludedBatchMerges: outcome.mergeSet.excludedBatchMerges,
-      compared: outcome.mergeSet.compared,
-      divergences: outcome.mergeSet.divergences,
-      excludeBatchMerges: this.deps.settings.excludeBatchMerges,
-    });
+    if (outcome.intake !== undefined) {
+      return JSON.stringify({
+        ...base,
+        aFleetCount: outcome.intake.aFleetCount,
+        aShellCount: outcome.intake.aShellCount,
+        aCompared: outcome.intake.aCompared,
+        aDivergences: outcome.intake.aDivergences,
+        bFleetCount: outcome.intake.bFleetCount,
+        bShellCount: outcome.intake.bShellCount,
+        bCompared: outcome.intake.bCompared,
+        bDivergences: outcome.intake.bDivergences,
+      });
+    }
+    return JSON.stringify(base);
   }
 
   /** The definite verdicts, the unevaluated reasons and S1's merge count. */

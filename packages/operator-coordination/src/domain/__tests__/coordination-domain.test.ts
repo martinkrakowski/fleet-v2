@@ -689,6 +689,17 @@ describe('CoordinationRequest', () => {
     ).toThrow(/invalid state/);
   });
 
+  it('refuses a shadowImportGrant attached to any non-merge:import-shadow scope', () => {
+    const grant = { repository: { owner: 'octo', repo: 'hello' }, expiresAtIso: '2026-12-16T00:00:00Z' };
+    for (const actionScope of ['forge:merge', 'host:restart', 'release:install'] as const) {
+      expect(() =>
+        CoordinationRequest.fromRecord(
+          requestRecord({ actionScope, shadowImportGrant: grant }),
+        ),
+      ).toThrow(/only recorded for a merge:import-shadow request/);
+    }
+  });
+
   it('records a delivery gap explicitly and nowhere else', () => {
     expect(() => CoordinationRequest.fromRecord(requestRecord({ deliveryStatus: 'delivery-gap' }))).toThrow(
       /delivery gap reason/,

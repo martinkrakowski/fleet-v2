@@ -287,6 +287,7 @@ const fullV2File = {
     stateDir: '/var/lib/fleet',
     unitDir: '/etc/systemd/user',
     installationFile: '/srv/fleet/fleet.json',
+    shadow: { legacyStateDir: '/srv/fleet/legacy-state', grantId: 'grant-1' },
   },
   stateDir: '/srv/fleet/installation-state',
 };

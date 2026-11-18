@@ -10,13 +10,32 @@
 import {
   DAEMON_SERVICE_UNIT_KEY,
   DAEMON_TIMER_UNIT_KEY,
+  SHADOW_INTAKE_SERVICE_UNIT_KEY,
+  SHADOW_INTAKE_TIMER_UNIT_KEY,
 } from '../ports/out/DaemonSchedulerPort.out-port.js';
 import type { DaemonSchedulerPort } from '../ports/out/DaemonSchedulerPort.out-port.js';
+import { containsSecretShape } from '@fleet/shared';
 import type {
   ManageDaemonSchedulerPort,
   ManageDaemonSchedulerRequest,
   ManageDaemonSchedulerResult,
+  ManageDaemonSchedulerUnitLine,
 } from '../ports/in/ManageDaemonSchedulerPort.in-port.js';
+
+/** Cap on the own keys read from one shadow config object; linear cost. */
+export const MAX_SHADOW_CONFIG_KEYS = 8;
+/** Cap on one shadow config value's length before validation; linear cost. */
+export const MAX_SHADOW_CONFIG_VALUE_LENGTH = 4096;
+
+/** Characters a shadow config value never carries: whitespace, `%`, `$`, quotes, backslash. */
+const SHADOW_VALUE_REFUSED_PATTERN = /[\s%$'"\\]/;
+
+/** The own keys a shadow config object never carries (prototype pollution). */
+const SHADOW_PROTOTYPE_KEYS: ReadonlySet<string> = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
 
 export const DAEMON_SERVICE_TEMPLATE = `[Unit]
 Description=Fleet v2 daemon tick
@@ -48,6 +67,136 @@ export interface RenderedDaemonUnits {
   readonly timer: string;
 }
 
+export interface RenderedShadowIntakeUnits {
+  readonly service: string;
+  readonly timer: string;
+}
+
+export const SHADOW_INTAKE_SERVICE_TEMPLATE = `[Unit]
+Description=Fleet v2 shadow intake
+
+[Service]
+Type=oneshot
+ExecStart={{nodePath}} {{cliPath}} --state-dir {{stateDir}} merge import --repository {{repository}} --legacy-state-dir {{legacyStateDir}} --apply --project {{projectId}} --scheduled
+Environment=FLEET_STATE_DIR={{stateDir}}
+Environment=FLEET_INSTALLATION_FILE={{installationFile}}
+Nice=5
+`;
+
+export const SHADOW_INTAKE_TIMER_TEMPLATE = `[Unit]
+Description=Fleet v2 shadow intake timer
+
+[Timer]
+Unit=fleet-v2-shadow-intake.service
+OnBootSec=120s
+OnUnitActiveSec=180s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+`;
+
+/** One validated shadow scheduler config value. */
+export interface ShadowSchedulerConfig {
+  readonly repository: string;
+  readonly legacyStateDir: string;
+  readonly projectId: string;
+}
+
+export type ShadowSchedulerConfigRead =
+  | { readonly ok: true; readonly config: ShadowSchedulerConfig }
+  | { readonly ok: false; readonly reason: 'invalid-shadow-config' };
+
+/**
+ * Pure, hostile-input-safe validation of the shadow scheduler config
+ * (OD7a1). It reads own enumerable data-property descriptors only — a getter
+ * or a Proxy `get` trap never runs — and its cost is linear in the capped
+ * input: at most `MAX_SHADOW_CONFIG_KEYS` own keys, each value at most
+ * `MAX_SHADOW_CONFIG_VALUE_LENGTH` code units, each tested once. It never
+ * throws; every refusal is `{ ok: false, reason: 'invalid-shadow-config' }`
+ * and the input value is never echoed. Each of `repository`, `legacyStateDir`
+ * and `projectId` must be a non-empty string carrying no whitespace, `%`,
+ * `$`, quote or backslash — the ExecStart substitution rule — and must not
+ * match the repository's secret-shaped detector (`containsSecretShape`):
+ * a credential-shaped value is refused, never rendered. The object
+ * must be a plain record with exactly those three own keys. A prototype-
+ * polluting own key, an array, a sparse or array-like input is refused.
+ */
+export function readShadowSchedulerConfig(
+  input: unknown,
+): ShadowSchedulerConfigRead {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    return { ok: false, reason: 'invalid-shadow-config' };
+  }
+  const names = Object.keys(input);
+  if (names.length !== 3) {
+    return { ok: false, reason: 'invalid-shadow-config' };
+  }
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<
+    string,
+    unknown
+  >;
+  for (const name of names) {
+    if (SHADOW_PROTOTYPE_KEYS.has(name)) {
+      return { ok: false, reason: 'invalid-shadow-config' };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(input, name);
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return { ok: false, reason: 'invalid-shadow-config' };
+    }
+    snapshot[name] = descriptor.value;
+  }
+  const config: Record<string, string> = {};
+  for (const key of ['repository', 'legacyStateDir', 'projectId'] as const) {
+    const value = snapshot[key];
+    if (
+      typeof value !== 'string' ||
+      value.length === 0 ||
+      value.length > MAX_SHADOW_CONFIG_VALUE_LENGTH ||
+      SHADOW_VALUE_REFUSED_PATTERN.test(value) ||
+      // A secret-shaped value that avoids the substitution characters would
+      // otherwise be rendered into `ExecStart`; screen every unit text value
+      // (including paths) with the repository's existing detector.
+      containsSecretShape(value)
+    ) {
+      return { ok: false, reason: 'invalid-shadow-config' };
+    }
+    config[key] = value;
+  }
+  return {
+    ok: true,
+    config: {
+      repository: config['repository']!,
+      legacyStateDir: config['legacyStateDir']!,
+      projectId: config['projectId']!,
+    },
+  };
+}
+
+/** Substitute the placeholders of the validated shadow intake config. */
+export function renderShadowIntakeUnits(
+  facts: ManageDaemonSchedulerRequest['daemon'],
+  config: ShadowSchedulerConfig,
+): RenderedShadowIntakeUnits {
+  // Function replacements keep the values literal: string replacements would
+  // run `GetSubstitution` on `$` sequences; the substitution rule already
+  // refuses `$` in the config values, and the facts keep the daemon rule.
+  const service = SHADOW_INTAKE_SERVICE_TEMPLATE
+    .replaceAll('{{nodePath}}', () => facts.nodePath)
+    .replaceAll('{{cliPath}}', () => facts.cliPath)
+    .replaceAll('{{stateDir}}', () => facts.stateDir)
+    .replaceAll('{{installationFile}}', () => facts.installationFile)
+    .replaceAll('{{repository}}', () => config.repository)
+    .replaceAll('{{legacyStateDir}}', () => config.legacyStateDir)
+    .replaceAll('{{projectId}}', () => config.projectId);
+  return { service, timer: SHADOW_INTAKE_TIMER_TEMPLATE };
+}
+
 /** Substitute the five placeholders of the validated `daemon` section. */
 export function renderDaemonUnits(
   facts: ManageDaemonSchedulerRequest['daemon'],
@@ -67,6 +216,9 @@ const INSTALL_OPERATOR_LINES: readonly string[] = [
   'enable: systemctl --user enable fleet-v2-daemon.timer',
   'linger: loginctl enable-linger',
 ];
+
+const SHADOW_ENABLE_OPERATOR_LINE =
+  'enable: systemctl --user enable fleet-v2-shadow-intake.timer';
 
 /** Install without `--apply`: only unchanged stays unchanged. */
 function installDryRunCode(code: string): string {
@@ -92,59 +244,187 @@ export class ManageDaemonSchedulerUseCase implements ManageDaemonSchedulerPort {
   async execute(
     request: ManageDaemonSchedulerRequest,
   ): Promise<ManageDaemonSchedulerResult> {
+    const shadow =
+      request.daemon.shadow !== undefined
+        ? readShadowSchedulerConfig(request.daemon.shadow)
+        : undefined;
+    if (shadow !== undefined && !shadow.ok) {
+      // The typed refusal: no unit is rendered, read, written or removed.
+      return { units: [], operatorLines: null, refusal: shadow.reason };
+    }
+    const config = shadow?.ok === true ? shadow.config : undefined;
     const rendered = renderDaemonUnits(request.daemon);
+    const shadowIntake =
+      config !== undefined
+        ? renderShadowIntakeUnits(request.daemon, config)
+        : undefined;
+    const portInput = {
+      ...rendered,
+      ...(shadowIntake !== undefined ? { shadowIntake } : {}),
+    };
 
     if (request.action === 'install') {
-      const operatorLines = INSTALL_OPERATOR_LINES;
+      const operatorLines =
+        shadowIntake === undefined
+          ? INSTALL_OPERATOR_LINES
+          : [...INSTALL_OPERATOR_LINES, SHADOW_ENABLE_OPERATOR_LINE];
       if (request.apply) {
-        const result = await this.deps.scheduler.write(rendered);
+        const result = await this.safeWrite(portInput);
         return {
-          units: [
-            { key: DAEMON_SERVICE_UNIT_KEY, code: result.service },
-            { key: DAEMON_TIMER_UNIT_KEY, code: result.timer },
-          ],
+          units: shadowUnitLines(result, shadowIntake !== undefined),
           operatorLines,
         };
       }
-      const result = await this.deps.scheduler.read(rendered);
+      const result = await this.safeRead(portInput);
       return {
-        units: [
-          { key: DAEMON_SERVICE_UNIT_KEY, code: installDryRunCode(result.service) },
-          { key: DAEMON_TIMER_UNIT_KEY, code: installDryRunCode(result.timer) },
-        ],
+        units: shadowUnitLines(result, shadowIntake !== undefined, installDryRunCode),
         operatorLines,
       };
     }
 
     if (request.action === 'show') {
-      const result = await this.deps.scheduler.read(rendered);
+      const result = await this.safeRead(portInput);
       return {
-        units: [
-          { key: DAEMON_SERVICE_UNIT_KEY, code: result.service },
-          { key: DAEMON_TIMER_UNIT_KEY, code: result.timer },
-        ],
+        units: shadowUnitLines(result, shadowIntake !== undefined),
         operatorLines: null,
       };
     }
 
     if (request.apply) {
-      const result = await this.deps.scheduler.remove();
+      const result = await this.safeRemove();
+      // OD7a1 fix round 2: the port always removes the intake pair, even when
+      // the rendered facts carried none (shadow off), so its codes are not in
+      // `units` here. An intake removal that is `unreadable` must be surfaced
+      // typed or the command would print two `absent` lines and exit 0.
+      const intakeUnreadable =
+        shadowIntake === undefined &&
+        result.shadowIntake !== undefined &&
+        (result.shadowIntake.service === 'unreadable' ||
+          result.shadowIntake.timer === 'unreadable');
       return {
-        units: [
-          { key: DAEMON_SERVICE_UNIT_KEY, code: result.service },
-          { key: DAEMON_TIMER_UNIT_KEY, code: result.timer },
-        ],
+        units: shadowUnitLines(result, shadowIntake !== undefined),
         operatorLines: null,
+        ...(intakeUnreadable ? { intakeUnreadable: true } : {}),
       };
     }
 
-    const result = await this.deps.scheduler.read(rendered);
+    const result = await this.safeRead(portInput);
     return {
-      units: [
-        { key: DAEMON_SERVICE_UNIT_KEY, code: uninstallDryRunCode(result.service) },
-        { key: DAEMON_TIMER_UNIT_KEY, code: uninstallDryRunCode(result.timer) },
-      ],
+      units: shadowUnitLines(result, shadowIntake !== undefined, uninstallDryRunCode),
       operatorLines: null,
     };
   }
+
+  /**
+   * A port rejection or a missing port method is a typed `'unreadable'` for
+   * every affected unit, never a thrown error and never unknown-as-success.
+   */
+  private async safeRead(
+    input: Parameters<DaemonSchedulerPort['read']>[0],
+  ): Promise<Awaited<ReturnType<DaemonSchedulerPort['read']>>> {
+    if (typeof this.deps.scheduler.read !== 'function') {
+      return unreadableFrom(input);
+    }
+    try {
+      return await this.deps.scheduler.read(input);
+    } catch {
+      return unreadableFrom(input);
+    }
+  }
+
+  private async safeWrite(
+    input: Parameters<DaemonSchedulerPort['write']>[0],
+  ): Promise<Awaited<ReturnType<DaemonSchedulerPort['write']>>> {
+    if (typeof this.deps.scheduler.write !== 'function') {
+      return unreadableFrom(input);
+    }
+    try {
+      return await this.deps.scheduler.write(input);
+    } catch {
+      return unreadableFrom(input);
+    }
+  }
+
+  private async safeRemove(): Promise<
+    Awaited<ReturnType<DaemonSchedulerPort['remove']>>
+  > {
+    if (typeof this.deps.scheduler.remove !== 'function') {
+      return {
+        service: 'unreadable',
+        timer: 'unreadable',
+        shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+      };
+    }
+    try {
+      return await this.deps.scheduler.remove();
+    } catch {
+      return {
+        service: 'unreadable',
+        timer: 'unreadable',
+        shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+      };
+    }
+  }
+}
+
+/** Map a rendered input to the all-unreadable result of its own shape. */
+function unreadableFrom(input: {
+  readonly service: string;
+  readonly timer: string;
+  readonly shadowIntake?:
+    | { readonly service: string; readonly timer: string }
+    | undefined;
+}): {
+  readonly service: 'unreadable';
+  readonly timer: 'unreadable';
+  readonly shadowIntake?:
+    | { readonly service: 'unreadable'; readonly timer: 'unreadable' }
+    | undefined;
+} {
+  return input.shadowIntake === undefined
+    ? { service: 'unreadable', timer: 'unreadable' }
+    : {
+        service: 'unreadable',
+        timer: 'unreadable',
+        shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+      };
+}
+
+/** The main pair's lines, then the shadow intake pair's when present. */
+function shadowUnitLines(
+  result: {
+    readonly service: string;
+    readonly timer: string;
+    readonly shadowIntake?:
+      | { readonly service: string; readonly timer: string }
+      | undefined;
+  },
+  includeShadow: boolean,
+  map?: (code: string) => string,
+): ManageDaemonSchedulerUnitLine[] {
+  const lines: ManageDaemonSchedulerUnitLine[] = [
+    { key: DAEMON_SERVICE_UNIT_KEY, code: map ? map(result.service) : result.service },
+    { key: DAEMON_TIMER_UNIT_KEY, code: map ? map(result.timer) : result.timer },
+  ];
+  if (includeShadow) {
+    // OD7a1 fix round 3: a scheduler that returns only the main pair's codes
+    // (no `shadowIntake` codes) must not let the intake pair be silently
+    // omitted: with shadow requested, any MISSING intake code is reported as
+    // `unreadable` so the CLI exits 1 instead of 0.
+    const intakeService =
+      result.shadowIntake === undefined ? 'unreadable' : result.shadowIntake.service;
+    const intakeTimer =
+      result.shadowIntake === undefined ? 'unreadable' : result.shadowIntake.timer;
+    lines.push(
+      {
+        key: SHADOW_INTAKE_SERVICE_UNIT_KEY,
+        code: map ? map(intakeService) : intakeService,
+      },
+      {
+        key: SHADOW_INTAKE_TIMER_UNIT_KEY,
+        code: map ? map(intakeTimer) : intakeTimer,
+      },
+    );
+  }
+  return lines;
 }

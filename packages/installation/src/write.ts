@@ -21,6 +21,7 @@ import {
   CONDUCTOR_REAPER_REPAIR_KINDS,
   CONDUCTOR_REAPER_WORKTREE_KEYS,
   DAEMON_KEYS,
+  DAEMON_SHADOW_KEYS,
   FORBIDDEN_ROUTE_KEYS,
   GATE_SLOT_KEYS,
   GITHUB_FORGE_KEYS,
@@ -57,6 +58,7 @@ import type {
   ConductorReaperPolicy,
   ConductorReaperWorktreePolicy,
   DaemonSection,
+  DaemonShadowSection,
   DecisionsSectionV2,
   FleetInstallation,
   FleetInstallationV2,
@@ -107,7 +109,11 @@ export function writeInstallationV2(installation: FleetInstallationV2): string {
       serializeVerification(verification as VerificationProceduresSection),
     waves: (waves) => serializeByKeys(waves as WavesSection, WAVES_KEYS),
     decisions: (decisions) => serializeDecisions(decisions as DecisionsSectionV2),
-    daemon: (daemon) => serializeByKeys(daemon as DaemonSection, DAEMON_KEYS),
+    daemon: (daemon) =>
+      serializeByKeys(daemon as DaemonSection, DAEMON_KEYS, {
+        shadow: (shadow) =>
+          serializeByKeys(shadow as DaemonShadowSection, DAEMON_SHADOW_KEYS),
+      }),
   });
   return `${JSON.stringify(document, null, 2)}\n`;
 }

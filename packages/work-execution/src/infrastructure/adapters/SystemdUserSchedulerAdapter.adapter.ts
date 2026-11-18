@@ -15,6 +15,8 @@ import * as path from 'node:path';
 import {
   DAEMON_SERVICE_UNIT_KEY,
   DAEMON_TIMER_UNIT_KEY,
+  SHADOW_INTAKE_SERVICE_UNIT_KEY,
+  SHADOW_INTAKE_TIMER_UNIT_KEY,
 } from '../../application/ports/out/DaemonSchedulerPort.out-port.js';
 import type {
   DaemonSchedulerPort,
@@ -36,7 +38,13 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
 
   async read(input: DaemonSchedulerRendered): Promise<DaemonSchedulerReadResult> {
     if (!(await isUsableUnitDir(this.options.unitDir))) {
-      return { service: 'unreadable', timer: 'unreadable' };
+      return input.shadowIntake === undefined
+        ? { service: 'unreadable', timer: 'unreadable' }
+        : {
+            service: 'unreadable',
+            timer: 'unreadable',
+            shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+          };
     }
     const service = await readUnit(
       this.options.unitDir,
@@ -48,12 +56,31 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
       DAEMON_TIMER_UNIT_KEY,
       input.timer,
     );
-    return { service, timer };
+    if (input.shadowIntake === undefined) {
+      return { service, timer };
+    }
+    const shadowService = await readUnit(
+      this.options.unitDir,
+      SHADOW_INTAKE_SERVICE_UNIT_KEY,
+      input.shadowIntake.service,
+    );
+    const shadowTimer = await readUnit(
+      this.options.unitDir,
+      SHADOW_INTAKE_TIMER_UNIT_KEY,
+      input.shadowIntake.timer,
+    );
+    return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
   }
 
   async write(input: DaemonSchedulerRendered): Promise<DaemonSchedulerWriteResult> {
     if (!(await isUsableUnitDir(this.options.unitDir))) {
-      return { service: 'unreadable', timer: 'unreadable' };
+      return input.shadowIntake === undefined
+        ? { service: 'unreadable', timer: 'unreadable' }
+        : {
+            service: 'unreadable',
+            timer: 'unreadable',
+            shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+          };
     }
     const service = await writeUnit(
       this.options.unitDir,
@@ -65,12 +92,29 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
       DAEMON_TIMER_UNIT_KEY,
       input.timer,
     );
-    return { service, timer };
+    if (input.shadowIntake === undefined) {
+      return { service, timer };
+    }
+    const shadowService = await writeUnit(
+      this.options.unitDir,
+      SHADOW_INTAKE_SERVICE_UNIT_KEY,
+      input.shadowIntake.service,
+    );
+    const shadowTimer = await writeUnit(
+      this.options.unitDir,
+      SHADOW_INTAKE_TIMER_UNIT_KEY,
+      input.shadowIntake.timer,
+    );
+    return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
   }
 
   async remove(): Promise<DaemonSchedulerRemoveResult> {
     if (!(await isUsableUnitDir(this.options.unitDir))) {
-      return { service: 'unreadable', timer: 'unreadable' };
+      return {
+        service: 'unreadable',
+        timer: 'unreadable',
+        shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+      };
     }
     const service = await removeUnit(
       this.options.unitDir,
@@ -80,7 +124,17 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
       this.options.unitDir,
       DAEMON_TIMER_UNIT_KEY,
     );
-    return { service, timer };
+    // Remove always clears the shadow intake units too, so `uninstall --apply`
+    // cleans them up even when shadow was already toggled off in config.
+    const shadowService = await removeUnit(
+      this.options.unitDir,
+      SHADOW_INTAKE_SERVICE_UNIT_KEY,
+    );
+    const shadowTimer = await removeUnit(
+      this.options.unitDir,
+      SHADOW_INTAKE_TIMER_UNIT_KEY,
+    );
+    return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
   }
 }
 

@@ -17,6 +17,7 @@ import {
 } from './commands/payload.js';
 import type { CommandHandler } from './commands/payload.js';
 import type { InspectMergeReadinessResult } from '@fleet/work-execution';
+import type { ImportTrainStateRefusal } from '@fleet/work-execution';
 import type { FleetCliRuntime } from './composition.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
@@ -115,6 +116,8 @@ export interface MergeImportFlags {
   readonly grantId: string | null;
   /** From `--project`; `null` when absent or not a non-empty string. */
   readonly projectId: string | null;
+  /** OD7a1: from `--scheduled`; grant pickup moves to run time. */
+  readonly scheduled: boolean;
 }
 
 /**
@@ -160,6 +163,8 @@ export function parseMergeImportFlags(raw: unknown): MergeImportFlags {
     throw new CliUsageError('merge import requires --legacy-state-dir');
   }
   const apply = snapshot['apply'] === true || snapshot['apply'] === 'true';
+  const scheduled =
+    snapshot['scheduled'] === true || snapshot['scheduled'] === 'true';
   const readId = (key: string): string | null => {
     const value = snapshot[key];
     return typeof value === 'string' && value.trim() !== '' && value.length <= MAX_MERGE_IMPORT_FLAG_LENGTH
@@ -168,13 +173,33 @@ export function parseMergeImportFlags(raw: unknown): MergeImportFlags {
   };
   const grantId = readId('grant');
   const projectId = readId('project');
-  if (apply && (grantId === null || projectId === null)) {
+  if (apply && (projectId === null || (grantId === null && !scheduled))) {
     throw new CliUsageError('merge import --apply requires --grant <id> and --project <id>');
   }
-  return { repository, stateDir, apply, grantId, projectId };
+  return { repository, stateDir, apply, grantId, projectId, scheduled };
 }
 
-export const mergeCommands: Readonly<Record<string, CommandHandler>> = {  enqueue: async (p, rt) => {
+/**
+ * OD7a1: the grant/authorization refusals a scheduled import skips quietly:
+ * the shadow intake timer runs every few minutes, so a missing, expired,
+ * revoked or not-yet-approved grant is the normal idle state, not an error.
+ * Every other `ImportTrainStateRefusal` reason stays loud and exits 1.
+ */
+const QUIET_SCHEDULED_REFUSALS: ReadonlySet<ImportTrainStateRefusal> = new Set([
+  'grant-missing',
+  'grant-expired',
+  'grant-revoked',
+  'grant-not-approved',
+]);
+
+function skippedResult(reason: string): {
+  readonly outcome: 'skipped';
+  readonly lines: readonly string[];
+} {
+  return { outcome: 'skipped', lines: [`shadow-intake skipped ${reason}`] };
+}
+
+export const mergeCommands: Readonly<Record<string, CommandHandler>> = { enqueue: async (p, rt) => {
     const nowIso = new Date().toISOString();
     const deadlineIso = new Date(Date.now() + 60_000).toISOString();
     const repository = repositoryFromPayload(p);
@@ -244,13 +269,39 @@ export const mergeCommands: Readonly<Record<string, CommandHandler>> = {  enqueu
   },
   import: async (p, rt) => {
     const flags = parseMergeImportFlags(p);
-    return rt.execution.importTrainState.importTrainState({
+    let grantId = flags.grantId;
+    // OD7a1: under `--scheduled` the grant handle comes from the loaded
+    // installation's `daemon.shadow.grantId` at run time, never from the unit
+    // file; an absent handle skips quietly (never a usage error).
+    if (flags.scheduled && grantId === null) {
+      const shadow = rt.installation?.daemon?.shadow;
+      const runtimeGrant =
+        typeof shadow?.grantId === 'string' && shadow.grantId.trim() !== ''
+          ? shadow.grantId
+          : null;
+      // OD7a1 fix round 3: the quiet skip must not depend on `flags.apply`.
+      // Under `--scheduled` the grant is checked first, so a call without
+      // `--apply` also skips instead of calling `importTrainState` without a
+      // grant handle.
+      if (runtimeGrant === null) {
+        return skippedResult('grant-missing');
+      }
+      grantId = runtimeGrant;
+    }
+    const result = await rt.execution.importTrainState.importTrainState({
       repository: flags.repository,
       stateDir: flags.stateDir,
       apply: flags.apply,
-      grantId: flags.grantId,
+      grantId,
       projectId: flags.projectId,
     });
+    if (result.outcome === 'refused' && flags.scheduled) {
+      if (QUIET_SCHEDULED_REFUSALS.has(result.reason)) {
+        return skippedResult(result.reason);
+      }
+      // Loud grant/authorization and non-grant refusals stay refused (exit 1).
+    }
+    return result;
   },
   export: async (p, rt) => {
     for (const key of Object.keys(p)) {

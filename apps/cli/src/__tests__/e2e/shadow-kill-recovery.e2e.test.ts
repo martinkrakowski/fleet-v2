@@ -164,7 +164,7 @@ function installation(repos: readonly string[]): FleetInstallation {
   } as unknown as FleetInstallation;
 }
 
-function pullRequestAnswer(conclusion = 'SUCCESS'): string {
+function pullRequestAnswer(conclusion = 'SUCCESS', unresolvedThreads = 0): string {
   return JSON.stringify({
     data: {
       repository: {
@@ -179,7 +179,10 @@ function pullRequestAnswer(conclusion = 'SUCCESS'): string {
               nodes: [{ __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion }],
             },
           },
-          reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+          reviewThreads: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: Array.from({ length: unresolvedThreads }, () => ({ isResolved: false })),
+          },
         },
       },
     },
@@ -191,7 +194,7 @@ interface GhStub {
   run: NonNullable<FleetCliRuntimeOptions['forgeGhRunner']>;
 }
 
-function ghStub(conclusion = 'SUCCESS'): GhStub {
+function ghStub(conclusion = 'SUCCESS', unresolvedThreads = 0): GhStub {
   const stub: GhStub = {
     calls: [],
     run: async (args, timeoutMs) => {
@@ -200,7 +203,7 @@ function ghStub(conclusion = 'SUCCESS'): GhStub {
         return { exitCode: 0, stdout: '{"resources":{}}', stderr: '' };
       }
       if (args[0] === 'api' && args[1] === 'graphql') {
-        return { exitCode: 0, stdout: pullRequestAnswer(conclusion), stderr: '' };
+        return { exitCode: 0, stdout: pullRequestAnswer(conclusion, unresolvedThreads), stderr: '' };
       }
       return { exitCode: 1, stdout: '', stderr: 'unexpected gh call' };
     },
@@ -445,11 +448,12 @@ describe('S10: shadow kill-9 mid-pass recovery', () => {
 
     // Past the expiry but still inside the backoff: lease takeover at fence 2,
     // and the persisted park is preserved untouched: still parked with the
-    // same reason, same attempt, same revision. The takeover's unchanged-entry
-    // half rests on the re-park guard `sameMergeEntryContent` in `recordPark`
-    // (`RunMergePassUseCase.use-case.ts`): a parked entry whose re-park record
-    // carries the same content apart from the revision is answered no-action
-    // and never rewritten.
+    // same reason, same attempt, same revision. Note this unchanged-entry tick
+    // runs INSIDE the recorded backoff (`notBeforeIso` T0 + 30 s), so the
+    // decider defers the parked entry before any park step: `recordPark` is
+    // never reached, and this assertion alone cannot kill an always-false
+    // `sameMergeEntryContent`. The guard itself is pinned at the call site
+    // where it answers true — the `S10 kill-9 #3 guard pin` test below.
     advance(10_000); // clock now T0 + 20_000 ms: past the 15 s lease, before the 30 s backoff
     const recovery = runtimeOver(h.killDir, ghStub('FAILURE'));
     const result = await run(recovery, ['daemon', 'tick']);
@@ -506,6 +510,52 @@ describe('S10: shadow kill-9 mid-pass recovery', () => {
     });
     expect(Date.parse(afterRepark[0].notBeforeIso as string)).toBeGreaterThan(Date.parse(after[0].notBeforeIso as string));
     expect(journalEntriesFor(h.killDir, journalKey(REPO_A)).map((entry) => entry.kind)).toEqual(journalKindsAfterTakeover);
+    // This re-park past the backoff legitimately bumps `attempt`
+    // (`parkOrDrop` answers `nextAttempt: entry.attempt + 1`,
+    // `merge-queue-decider.ts:274`), so the re-park guard
+    // `sameMergeEntryContent` (`RunMergePassUseCase.use-case.ts:570`) does NOT
+    // apply here — the update above is the always-true kill, not the guard's
+    // no-write half. The call site where the guard DOES apply — a no-backoff
+    // re-park with the same reason, which keeps `nextAttempt: entry.attempt`
+    // (`parkNoBackoff`, `merge-queue-decider.ts:248`) — is pinned next.
+  });
+
+  it('S10 kill-9 #3 guard pin: a re-park with identical content writes nothing (sameMergeEntryContent)', async () => {
+    // The guard's no-write half, driven at the input where the built park
+    // record equals the stored one apart from the revision: a `threads` park
+    // is a `parkNoBackoff` decision (`merge-queue-decider.ts:791`), so the
+    // first tick stores `attempt` unchanged with `notBeforeIso: null`, and the
+    // second tick over the same unresolved threads re-parks with the same
+    // reason and the same attempt — `recordPark` answers no-action at
+    // `RunMergePassUseCase.use-case.ts:570-571` without persisting anything.
+    // Byte-comparing the queue file and the journal before and after the
+    // second tick kills an always-false mutation of the guard.
+    const h = killingHarness(() => false, ghStub('SUCCESS', 1));
+    await enqueue(h.runtime, REPO_A);
+
+    const first = await run(h.runtime, ['daemon', 'tick']);
+    expect(first.code, `${first.out}\n${first.err}`).toBe(0);
+    const parked = recordsOf(h.stateDir, 'merge-queue.json');
+    expect(parked).toHaveLength(1);
+    expect(parked[0]).toMatchObject({ state: 'parked', reason: 'threads' });
+
+    // The input the guard answers true at: same failing facts, same reason,
+    // no backoff window to wait out (`notBeforeIso: null`).
+    const queueBefore = readFileSync(path.join(h.stateDir, 'merge-queue.json'));
+    const journalPath = path.join(h.stateDir, 'run-journal.json');
+    const journalBefore = existsSync(journalPath) ? readFileSync(journalPath) : null;
+
+    advance(10_000);
+    const second = await run(h.runtime, ['daemon', 'tick']);
+    expect(second.code, `${second.out}\n${second.err}`).toBe(0);
+    expect(lastJson(second.out)).toMatchObject({ outcome: 'completed', exitCode: 0 });
+
+    // Byte-identical: no queue write, no journal append (or still no journal).
+    expect(readFileSync(path.join(h.stateDir, 'merge-queue.json'))).toEqual(queueBefore);
+    expect(existsSync(journalPath) ? readFileSync(journalPath) : null).toEqual(journalBefore);
+    const after = recordsOf(h.stateDir, 'merge-queue.json');
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ state: 'parked', reason: 'threads', attempt: parked[0].attempt, revision: parked[0].revision });
   });
 
   it('S10 kill-9 #3b: the facts changing after takeover updates the parked entry with an advanced revision', async () => {

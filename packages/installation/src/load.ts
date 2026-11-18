@@ -8,7 +8,7 @@ import {
   realpathSync,
   statSync,
 } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import type {
   FleetInstallation,
@@ -443,15 +443,23 @@ function readThroughSymlinkFallback(file: string, seam: ResolvedSeam): FileRead 
 }
 
 /**
+ * True when `file` lies at or below `root` (or equals it), compared by path
+ * segments via `path.relative`, never by a raw string prefix (a raw
+ * `root + sep` prefix breaks for a root that resolves to `/`, where the
+ * prefix would be `//` and nothing would count as inside it).
+ */
+function isInside(root: string, file: string): boolean {
+  const rel = relative(root, file);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+/**
  * True when the realpath lies at or below the given worktree root. The root
  * is resolved with `realpath` through the seam before comparing, so a
  * symlinked `hosts.*.worktreeRoot` cannot bypass containment: the comparison
  * sees the same target the file's realpath points at. Returns
  * `'malformed'` when the root exists but cannot be resolved (a non-existent
- * root is skipped: it cannot contain the file). The containment test
- * compares path segments: the file is inside the root when it equals
- * `resolvedRoot` or equals `resolvedRoot + sep` plus a remainder, never by
- * a raw string prefix.
+ * root is skipped: it cannot contain the file).
  */
 function isInsideRoot(
   realpath: string,
@@ -467,7 +475,7 @@ function isInsideRoot(
     }
     return 'malformed';
   }
-  return realpath === resolvedRoot || realpath.startsWith(`${resolvedRoot}${sep}`);
+  return isInside(resolvedRoot, realpath);
 }
 
 /**

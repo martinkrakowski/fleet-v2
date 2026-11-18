@@ -601,6 +601,100 @@ describe('loadInstallation owner trust check', () => {
     expectUntrusted(readErrors(load(file)), 'worktreeRoot');
   });
 
+  it('refuses a file when a worktreeRoot resolves to the filesystem root', () => {
+    freshDir();
+    const file = writeInstallation(
+      'fleet.json',
+      JSON.stringify({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          lane: {
+            transport: 'local',
+            worktreeRoot: '/',
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46000 },
+          },
+        },
+        owner: { publicKey: VALID_KEY },
+      }),
+    );
+    expectUntrusted(readErrors(load(file)), 'worktreeRoot');
+  });
+
+  it('accepts a file outside a sibling-named worktreeRoot (/srv/wt vs /srv/wt2)', () => {
+    freshDir();
+    mkdirSync(join(tempDir, 'wt'));
+    const outside = join(tempDir, 'wt2');
+    mkdirSync(outside);
+    const file = join(outside, 'fleet.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          lane: {
+            transport: 'local',
+            worktreeRoot: join(tempDir, 'wt'),
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46000 },
+          },
+        },
+        owner: { publicKey: VALID_KEY },
+      }),
+      { mode: 0o600 },
+    );
+    expect(load(file).status).toBe('loaded');
+  });
+
+  it('refuses a file nested inside a worktreeRoot (/srv/wt/a/f)', () => {
+    freshDir();
+    mkdirSync(join(tempDir, 'wt', 'a'), { recursive: true });
+    const file = join(tempDir, 'wt', 'a', 'fleet.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          lane: {
+            transport: 'local',
+            worktreeRoot: join(tempDir, 'wt'),
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46000 },
+          },
+        },
+        owner: { publicKey: VALID_KEY },
+      }),
+      { mode: 0o600 },
+    );
+    expectUntrusted(readErrors(load(file)), 'worktreeRoot');
+  });
+
+  it('refuses a file whose path equals the worktreeRoot', () => {
+    freshDir();
+    const file = join(tempDir, 'fleet.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          lane: {
+            transport: 'local',
+            worktreeRoot: file,
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46000 },
+          },
+        },
+        owner: { publicKey: VALID_KEY },
+      }),
+      { mode: 0o600 },
+    );
+    expectUntrusted(readErrors(load(file)), 'worktreeRoot');
+  });
+
   it('skips a non-existent hosts.*.worktreeRoot', () => {
     freshDir();
     const file = writeInstallation(

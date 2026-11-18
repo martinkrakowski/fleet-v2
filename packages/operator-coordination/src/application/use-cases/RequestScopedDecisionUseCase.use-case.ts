@@ -53,23 +53,6 @@ function isFilled(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-/**
- * Whether `nowIso` is present as an own key at all, read descriptor-safely so
- * no getter ever runs. The shared plain-record reader collapses an accessor's
- * value to `undefined`, so this presence check is what separates an omitted
- * `nowIso` (clock fallback) from an unreadable one (a typed refusal).
- */
-function nowIsoKeyPresent(request: unknown): boolean {
-  if (typeof request !== 'object' || request === null) {
-    return false;
-  }
-  try {
-    return Object.getOwnPropertyDescriptor(request, 'nowIso') !== undefined;
-  } catch {
-    return true;
-  }
-}
-
 // CO24f: the same control and bidi screen the CoordinationRequest entity
 // applies to a recorded attempt (C0, DEL/C1, U+061C, U+200E/F, U+2028/9,
 // U+202A–E, U+2066–9 and U+FEFF). A value carrying any of them is refused
@@ -148,7 +131,31 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: RequestScopedDecisionUseCase');
     }
-    const request = input as RequestScopedDecisionRequest;
+    // The request is snapshotted once by the domain's shared own-data-descriptor
+    // reader before any field is read, so a throwing getter (an accessor whose
+    // value collapses to `undefined`) or a Proxy trap can only produce a typed
+    // refusal — and no field is ever read off the original afterwards.
+    const snapshot = readPlainObjectWithOptional(
+      input,
+      ['requestId', 'projectId', 'actionScope', 'proposalDigest', 'policyRevision'],
+      [
+        'requestId',
+        'projectId',
+        'actionScope',
+        'proposalDigest',
+        'policyRevision',
+        'kind',
+        'expectedHeadSha',
+        'attemptId',
+        'nowIso',
+        'releaseRoot',
+        'shadowImportGrant',
+      ],
+    );
+    if (snapshot === null) {
+      return { outcome: 'rejected', reason: 'a decision request requires a non-empty requestId' };
+    }
+    const request = snapshot as unknown as RequestScopedDecisionRequest;
     for (const field of ['requestId', 'projectId', 'actionScope', 'proposalDigest', 'policyRevision'] as const) {
       if (!isFilled(request[field])) {
         return { outcome: 'rejected', reason: `a decision request requires a non-empty ${field}` };
@@ -181,7 +188,13 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     // CO14 follow-up: a release decision may bind its grant to the release
     // root it names. A non-path-shaped, oversized or hostile root is a typed
     // rejection, never a record that matches every root.
-    const releaseRoot = readReleaseRoot(request);
+    // A present-but-unreadable `releaseRoot` (an accessor whose descriptor
+    // value collapses to `undefined`) fails closed as invalid, like every
+    // other malformed root; only a genuinely absent key is absent.
+    const releaseRoot =
+      'releaseRoot' in snapshot && snapshot.releaseRoot === undefined
+        ? ({ state: 'invalid' } as const)
+        : readReleaseRoot(request);
     if (releaseRoot.state === 'invalid') {
       return {
         outcome: 'rejected',
@@ -210,6 +223,12 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       };
     }
     // The composition root supplies the clock; no authority depends on it here.
+    // A present-but-unreadable `nowIso` (an accessor whose descriptor value
+    // collapses to `undefined`, or a non-string) is a typed refusal, never a
+    // live property read off the request or a silent clock fallback.
+    if (!isFilled(request.nowIso) && 'nowIso' in snapshot) {
+      return { outcome: 'rejected', reason: 'a decision request nowIso must be a non-empty string when given' };
+    }
     const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
     // Standing shadow import grant (owner decision 2026-11-18): the unattended
     // timer's grant is head-free, bounded by a future expiry within the TTL
@@ -374,8 +393,9 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     }
     // An absent `nowIso` falls back to the clock; a present-but-unreadable
     // one (an accessor whose descriptor value is undefined, or a non-string)
-    // is a typed refusal, never a live property read off the request.
-    if (!isFilled(snapshot.nowIso) && nowIsoKeyPresent(request)) {
+    // is a typed refusal. Presence is read only from the snapshot, so no
+    // property of the original request is touched after it was taken.
+    if (!isFilled(snapshot.nowIso) && 'nowIso' in snapshot) {
       return { outcome: 'refused', reason: 'grant-missing' };
     }
     const nowIso = isFilled(snapshot.nowIso) ? snapshot.nowIso : new Date().toISOString();

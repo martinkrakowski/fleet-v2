@@ -195,6 +195,25 @@ describe('RequestScopedDecisionUseCase shadow import grants (GR1a1)', () => {
     expect(calls).toBe(0);
     expect((await repo.listRequests()).length).toBe(0);
   });
+  it('rejects, never throws, a decision request with a throwing own nowIso getter', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    let calls = 0;
+    const request: Record<string, unknown> = { ...baseRequest() };
+    Object.defineProperty(request, 'nowIso', {
+      get() {
+        calls += 1;
+        throw new Error('hostile nowIso getter ran');
+      },
+      enumerable: true,
+    });
+    const result = await useCaseWith(repo).execute(request as unknown);
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'a decision request nowIso must be a non-empty string when given',
+    });
+    expect(calls).toBe(0);
+    expect((await repo.listRequests()).length).toBe(0);
+  });
 });
 
 describe('RequestScopedDecisionUseCase.revokeOwnerGrant (GR1a1)', () => {
@@ -324,6 +343,26 @@ describe('RequestScopedDecisionUseCase.revokeOwnerGrant (GR1a1)', () => {
     expect(result).toEqual({ outcome: 'refused', reason: 'grant-missing' });
     expect(calls).toBe(0);
     expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
+  });
+
+  it('reads each own key once during the snapshot and never touches the request afterwards', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await seedStandingGrant(repo);
+    const descriptorCalls: Record<string, number> = {};
+    const target: Record<string, unknown> = { grantId: 'grant-shadow' };
+    const proxy = new Proxy(target, {
+      getOwnPropertyDescriptor(t, prop) {
+        const key = String(prop);
+        descriptorCalls[key] = (descriptorCalls[key] ?? 0) + 1;
+        return Reflect.getOwnPropertyDescriptor(t, prop);
+      },
+    });
+    const result = await revoke(useCaseWith(repo), proxy as unknown as RevokeOwnerGrantRequest);
+    expect(result).toEqual({ outcome: 'revoked', grantId: 'grant-shadow' });
+    // Every own key of the request was read through its descriptor exactly
+    // once — the single snapshot — and no read happened after it.
+    expect(descriptorCalls).toEqual({ grantId: 1 });
+    expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('cancelled');
   });
 
   it('is neither constant nor identity: revoked and refused outcomes differ by grant state', async () => {

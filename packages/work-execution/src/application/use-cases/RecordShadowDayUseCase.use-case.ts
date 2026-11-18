@@ -781,6 +781,53 @@ function ownDenseArrayLengthWithinCap(value: unknown): number | null {
 }
 
 /**
+ * OD7a3 fix round: the own `length` of a dense, non-Proxy plain `Array`
+ * within the cap, WITHOUT reading any element value — the shape check only
+ * (the `length` own descriptor plus the own-key count), so an element read
+ * through a descriptor is never spent here. Element values are validated on
+ * the snapshot copy, never on the original. Cost is linear in the array's
+ * capped length (the own-key walk is capped at `SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function readOwnArrayShape(value: unknown): number | null {
+  const lengthDescriptorValue = ownDenseArrayLengthWithinCap(value);
+  if (lengthDescriptorValue === null) {
+    return null;
+  }
+  if (Object.keys(value as object).length !== lengthDescriptorValue) {
+    return null;
+  }
+  return lengthDescriptorValue;
+}
+
+/**
+ * OD7a3 fix round: the ONE copy of a hostile array's elements. Every element
+ * is read EXACTLY ONCE, from its own data descriptor's `.value`
+ * (`ownElement`), into a NEW plain array; nothing on the original is ever
+ * read again, so a Proxy whose index descriptors change between reads (or
+ * whose `get` trap disagrees with its descriptors) can only yield the first
+ * descriptor read's values — the copy IS the validated snapshot's input.
+ * Cost is linear in the array's capped length (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function snapshotOwnArrayElements(value: unknown, length: number): unknown[] {
+  const copy: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    copy.push(ownElement(value as object, String(index)));
+  }
+  return copy;
+}
+
+/**
+ * OD7a3 fix round: whether every copied element is a non-negative safe
+ * integer (the validation the original array's elements would have had).
+ * Cost is linear in the copy's length.
+ */
+function isNonNegativeSafeIntegerArray(copy: readonly unknown[]): copy is readonly number[] {
+  return copy.every(
+    (element) => typeof element === 'number' && Number.isSafeInteger(element) && element >= 0,
+  );
+}
+
+/**
  * OD7a3: the validated own length of a dense, non-Proxy array of
  * non-negative safe integers, or null. Reads only the `length` own
  * descriptor and `Object.keys` (no element values beyond the validated
@@ -881,9 +928,11 @@ function anyPositionWithin(positions: readonly number[], bracket: { readonly fir
  * running a getter or a Proxy `get` trap: `absent` (a missing descriptor or
  * an own `undefined` value, treated as `[]` for backwards compatibility),
  * `empty` (an own array of length 0), `malformed` (an accessor, a
- * sparse/oversized array, or any element that is not a non-negative safe
- * integer — fail closed), or `present` with the validated length. Cost is
- * linear in the array's capped length (`SHADOW_MAX_HEALTH_ITEMS`).
+ * sparse/oversized array — shape only, fail closed), or `present` with the
+ * length. Element values are NOT read here: the snapshot copies each element
+ * exactly once (`snapshotOwnArrayElements`) and validates the COPIED values,
+ * so no element is ever read twice from the original. Cost is linear in the
+ * array's capped length (`SHADOW_MAX_HEALTH_ITEMS`).
  */
 type DroppedLinesField =
   | { readonly kind: 'absent' }
@@ -905,7 +954,7 @@ function readDroppedLinesField(read: object): DroppedLinesField {
   if (droppedLines === undefined) {
     return { kind: 'absent' };
   }
-  const droppedLength = readNonNegativeSafeIntegerOwnArray(droppedLines);
+  const droppedLength = readOwnArrayShape(droppedLines);
   if (droppedLength === null) {
     return { kind: 'malformed' };
   }
@@ -996,8 +1045,9 @@ function ownElement(container: object, key: string): unknown {
  * escape — it is caught and reported as `'malformed'`. The result is
  * `'malformed'` when the raw is not a plain record object, when `events` is
  * missing, an accessor, not a dense array within `SHADOW_MAX_HEALTH_ITEMS`,
- * when `droppedLines`/`eventPositions` are malformed, or when anything
- * throws; `{ ok: false }` when `ok` is missing, an accessor or not `true`.
+ * when `droppedLines`/`eventPositions` are malformed, when `ok` is missing,
+ * an accessor or not a boolean, or when anything throws; `{ ok: false }` only
+ * when `ok` is an own data property whose value is exactly `false`.
  * An event element (or position element) whose own descriptor read throws
  * carries `undefined` (the per-element failure the scheduled/manual event
  * validation later fails closed on), never an escape. Cost is linear in the
@@ -1020,7 +1070,18 @@ function snapshotEventsRead(raw: unknown): EventsReadSnapshot {
       return 'malformed';
     }
     const okDescriptor = Object.getOwnPropertyDescriptor(raw, 'ok');
-    if (okDescriptor === undefined || okDescriptor.get !== undefined || okDescriptor.value !== true) {
+    // OD7a3 fix round: only an own DATA property `ok === false` means
+    // `{ ok: false }` (a failed read). A missing `ok`, an accessor, or a
+    // non-boolean value does not even answer the question, so it is
+    // `'malformed'` — `unknown` / `daemon-events-corrupt` with nothing
+    // written in both modes — never a silent `{ ok: false }`.
+    if (okDescriptor === undefined || okDescriptor.get !== undefined) {
+      return 'malformed';
+    }
+    if (typeof okDescriptor.value !== 'boolean') {
+      return 'malformed';
+    }
+    if (okDescriptor.value === false) {
       return { ok: false };
     }
     const events = ownDataProperty(raw, 'events');
@@ -1037,26 +1098,34 @@ function snapshotEventsRead(raw: unknown): EventsReadSnapshot {
       return 'malformed';
     }
     if (dropped.kind === 'present') {
-      const validatedDropped = validateDroppedLines(dropped.droppedLines, dropped.droppedLength);
-      if (validatedDropped === 'malformed') {
+      // OD7a3 fix round: every element of `droppedLines` is read EXACTLY
+      // ONCE — from its own data descriptor's `.value` — into a new array,
+      // and the COPIED values are what is validated and used. A Proxy whose
+      // index descriptors change between reads (or whose `get` trap
+      // disagrees with them) can therefore never make the validator see one
+      // value and the snapshot another: there is only one read, and it is
+      // the snapshot's.
+      const droppedCopy = snapshotOwnArrayElements(dropped.droppedLines, dropped.droppedLength);
+      if (!isNonNegativeSafeIntegerArray(droppedCopy)) {
         return 'malformed';
       }
       // The corrupt-line bracket needs the positions of the parsed records;
-      // they are read once here, through their own descriptors, so the
-      // snapshot alone answers every later read.
+      // they are read once here, through their own descriptors, and
+      // validated on the copy, so the snapshot alone answers every later
+      // read.
       const eventPositions = ownDataProperty(raw, 'eventPositions');
-      const positionsLength = readNonNegativeSafeIntegerOwnArray(eventPositions);
+      const positionsLength = readOwnArrayShape(eventPositions);
       if (positionsLength !== eventsLength) {
         return 'malformed';
       }
-      const positionsCopy: unknown[] = [];
-      for (let index = 0; index < positionsLength; index += 1) {
-        positionsCopy.push(ownElement(eventPositions as object, String(index)));
+      const positionsCopy = snapshotOwnArrayElements(eventPositions, positionsLength);
+      if (!isNonNegativeSafeIntegerArray(positionsCopy)) {
+        return 'malformed';
       }
       return Object.freeze({
         ok: true,
         events: Object.freeze(eventsCopy),
-        droppedLines: Object.freeze([...validatedDropped]),
+        droppedLines: Object.freeze(droppedCopy),
         eventPositions: Object.freeze(positionsCopy),
       });
     }

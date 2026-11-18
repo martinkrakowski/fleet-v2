@@ -5244,4 +5244,117 @@ describe('RecordShadowDayUseCase S12 coverage guards and corrupt daemon-event li
     expect(guarded.evidence.calls.cas).toBe(0);
     expect(guarded.evidence.stored).toBeNull();
   });
+
+  // OD7a3 fix round 4: only an own DATA property `ok === false` means
+  // `{ ok: false }`. A read whose `ok` is an accessor, which lacks `ok`, or
+  // whose `ok` is not a boolean is `'malformed'` — `unknown` /
+  // `daemon-events-corrupt` with nothing written in both modes — never a
+  // silent "no events" answer.
+  it.each(['scheduled', 'manual'] as const)(
+    'answers unknown daemon-events-corrupt for an accessor ok (%s mode)',
+    async (mode) => {
+      const events = cleanFixture(DAY).daemonEvents;
+      const read: Record<string, unknown> = { ok: true, events, nextCursor: null };
+      Object.defineProperty(read, 'ok', {
+        enumerable: true,
+        get() {
+          return true;
+        },
+      });
+      const harness =
+        mode === 'scheduled' ? scheduledHarness(cleanFixture(DAY)) : makeHarness(cleanFixture(DAY), NOW);
+      const guarded = harnessWithRead(harness, read);
+      const result = await new RecordShadowDayUseCase(guarded.deps).execute(
+        mode === 'scheduled' ? makeRequest({ scheduled: true }) : makeRequest(),
+      );
+      expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+      expect(guarded.evidence.calls.cas).toBe(0);
+      expect(guarded.evidence.stored).toBeNull();
+    },
+  );
+
+  it.each(['scheduled', 'manual'] as const)(
+    'answers unknown daemon-events-corrupt for a read that lacks ok (%s mode)',
+    async (mode) => {
+      const read = { events: cleanFixture(DAY).daemonEvents, nextCursor: null };
+      const harness =
+        mode === 'scheduled' ? scheduledHarness(cleanFixture(DAY)) : makeHarness(cleanFixture(DAY), NOW);
+      const guarded = harnessWithRead(harness, read);
+      const result = await new RecordShadowDayUseCase(guarded.deps).execute(
+        mode === 'scheduled' ? makeRequest({ scheduled: true }) : makeRequest(),
+      );
+      expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+      expect(guarded.evidence.calls.cas).toBe(0);
+      expect(guarded.evidence.stored).toBeNull();
+    },
+  );
+
+  it.each(['scheduled', 'manual'] as const)(
+    "answers unknown daemon-events-corrupt for a read whose ok is 'yes' (%s mode)",
+    async (mode) => {
+      const read = { ok: 'yes', events: cleanFixture(DAY).daemonEvents, nextCursor: null };
+      const harness =
+        mode === 'scheduled' ? scheduledHarness(cleanFixture(DAY)) : makeHarness(cleanFixture(DAY), NOW);
+      const guarded = harnessWithRead(harness, read);
+      const result = await new RecordShadowDayUseCase(guarded.deps).execute(
+        mode === 'scheduled' ? makeRequest({ scheduled: true }) : makeRequest(),
+      );
+      expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+      expect(guarded.evidence.calls.cas).toBe(0);
+      expect(guarded.evidence.stored).toBeNull();
+    },
+  );
+
+  it('still treats an own data ok: false as a failed read (not malformed), leaving S12 unevaluated', async () => {
+    const read = { ok: false, events: [], nextCursor: null };
+    const guarded = harnessWithRead(makeHarness(cleanFixture(DAY), NOW), read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect((result as unknown as { unevaluated: Array<{ criterion: string; reason: string }> }).unevaluated).toContainEqual(
+      expect.objectContaining({ criterion: 'S12', reason: 'daemon-events-unavailable' }),
+    );
+  });
+
+  // OD7a3 fix round 4: each droppedLines/eventPositions element is read
+  // exactly ONCE into the snapshot and the COPIED values are what is
+  // validated, so a Proxy whose index descriptor changes between reads
+  // cannot make the validator see a valid position and the snapshot a
+  // different one: the result must reflect a single read — exactly the plain
+  // data's result.
+  it('answers exactly the plain result for a Proxy whose index descriptor changes between reads (a single read)', async () => {
+    const events = cleanFixture(DAY).daemonEvents;
+    // A dropped line far OUTSIDE the day bracket: the plain read records
+    // normally, so the only way to differ from it is a second read.
+    // `droppedLines` itself is the Proxy: each element's
+    // `getOwnPropertyDescriptor` trap is honest on its FIRST call and
+    // poisoned on every LATER call, so a double read (validate then
+    // snapshot) sees two different values while the fixed single-read
+    // snapshot sees only the honest one.
+    const honest: number[] = [events.length + 5];
+    const perKeyReads = new Map<string, number>();
+    const shifting = new Proxy(honest, {
+      getOwnPropertyDescriptor(target, key) {
+        const keyName = String(key);
+        const seen = perKeyReads.get(keyName) ?? 0;
+        perKeyReads.set(keyName, seen + 1);
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+        // A `Object.keys` shape check probes each key's descriptor once for
+        // enumerability BEFORE any value read. So a single-value-read
+        // implementation spends two descriptor calls per element (probe +
+        // read), while a double-reading implementation spends three — and
+        // the third one is poisoned.
+        if (seen < 2 || descriptor === undefined || !/^\d+$/.test(keyName)) {
+          return descriptor;
+        }
+        return { ...descriptor, value: 'poisoned' };
+      },
+    });
+    const plain = dayRead(events, [events.length + 5], events.map((_, index) => index)) as Record<string, unknown>;
+    const read = { ...plain, droppedLines: shifting };
+    const guarded = harnessWithRead(makeHarness(cleanFixture(DAY), NOW), read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    const plainResult = await new RecordShadowDayUseCase(harnessWithRead(makeHarness(cleanFixture(DAY), NOW), plain).deps).execute(makeRequest());
+    expect(result).toEqual(plainResult);
+    expectRecorded(result);
+    expect((result as { recorded: Record<string, string> }).recorded.S12).toBe('pass');
+  });
 });

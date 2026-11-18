@@ -22,6 +22,16 @@ export interface RecordShadowDayRequest {
   readonly scheduled?: boolean;
 }
 
+/**
+ * OD7a3 note on manual mode: it no longer keeps the historical behaviour
+ * exactly. Two S12 coverage failures — `'late-last-tick'` (the daemon
+ * stopped before the day's close) and `'coverage-gap'` (a hole longer than
+ * `SHADOW_MAX_TICK_GAP_MS`) — now refuse without writing to the ledger
+ * (`{ outcome: 'refused', reason: ... }`), rather than recording a `fail`
+ * verdict; scheduled mode instead stops as `skipped` on the same reasons.
+ * Everything else in manual mode keeps the historical behaviour exactly.
+ */
+
 export type RecordShadowDayRefusalReason =
   | 'invalid-request'
   | 'too-early'
@@ -29,7 +39,9 @@ export type RecordShadowDayRefusalReason =
   | 'day-out-of-order'
   | 'verdict-conflict'
   | 'release-conflict'
-  | 'merges-conflict';
+  | 'merges-conflict'
+  | 'late-last-tick'
+  | 'coverage-gap';
 
 export type RecordShadowDayUnknownReason =
   | 'ledger-unreadable'
@@ -37,6 +49,7 @@ export type RecordShadowDayUnknownReason =
   | 'ledger-busy'
   | 'deadline-exceeded'
   | 'daemon-events-unavailable'
+  | 'daemon-events-corrupt'
   | 's12-unknown'
   | 'scheduled-evaluation-failed';
 
@@ -72,7 +85,13 @@ export type RecordShadowDayResult =
        * operator should simply try again the next day. Exit 0 at the CLI.
        */
       readonly outcome: 'skipped';
-      readonly reason: 'partial-day' | 'too-few-ticks' | 'grant-unavailable' | 'grant-not-covering-day';
+      readonly reason:
+        | 'partial-day'
+        | 'too-few-ticks'
+        | 'grant-unavailable'
+        | 'grant-not-covering-day'
+        | 'late-last-tick'
+        | 'coverage-gap';
     };
 
 export interface RecordShadowDayPort {

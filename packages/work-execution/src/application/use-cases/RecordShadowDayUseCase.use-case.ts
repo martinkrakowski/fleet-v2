@@ -55,6 +55,7 @@ import {
 import {
   evaluateShadowStateIntegrity,
   evaluateShadowTickHealth,
+  SHADOW_MAX_HEALTH_ITEMS,
   type ShadowStateIntegrityEvaluation,
   type ShadowTickHealthEvaluation,
 } from '../../domain/shadow-day-health.js';
@@ -294,7 +295,13 @@ function parseBoundedIsoMs(value: unknown): number | null {
 
 /** A skipped result: a scheduled-mode guard held, nothing was written. */
 function skippedResult(
-  reason: 'partial-day' | 'too-few-ticks' | 'grant-unavailable' | 'grant-not-covering-day',
+  reason:
+    | 'partial-day'
+    | 'too-few-ticks'
+    | 'grant-unavailable'
+    | 'grant-not-covering-day'
+    | 'late-last-tick'
+    | 'coverage-gap',
 ): RecordShadowDayResult {
   return { outcome: 'skipped', reason };
 }
@@ -751,6 +758,151 @@ function snapshotEvent(event: unknown): DaemonEventSnapshot | null {
 }
 
 /**
+ * OD7a3: the validated own length of a dense, non-Proxy array of
+ * non-negative safe integers, or null. Reads only the `length` own
+ * descriptor and `Object.keys` (no element values), so no getter and no
+ * Proxy `get` trap ever runs; an oversized, sparse or accessor-carrying
+ * array is refused from its length alone, before any element is touched.
+ * Cost is linear in the array's capped length (at most
+ * `SHADOW_MAX_HEALTH_ITEMS` keys are walked).
+ */
+function readNonNegativeSafeIntegerOwnArray(value: unknown): number | null {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    return null;
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    typeof lengthDescriptor.value !== 'number' ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value > SHADOW_MAX_HEALTH_ITEMS
+  ) {
+    return null;
+  }
+  if (Object.keys(value).length !== lengthDescriptor.value) {
+    return null;
+  }
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+    const element = ownDataProperty(value as object, String(index));
+    if (typeof element !== 'number' || !Number.isSafeInteger(element) || element < 0) {
+      return null;
+    }
+  }
+  return lengthDescriptor.value;
+}
+
+/**
+ * OD7a3: whether any dropped (corrupt) `events.jsonl` line is bracketed
+ * inside `day`'s parsed records. Policy: `events.jsonl` holds the whole
+ * history, so a dropped line counts against a day ONLY when its file
+ * position lies between the first and the last successfully parsed record
+ * whose time is inside that day; a corrupt line outside every day's bracket
+ * affects no day. Every own key is read through its descriptor (no getter
+ * ever runs); a missing `droppedLines` field is treated as `[]` for
+ * backwards compatibility; a malformed shape, a sparse/oversized array, or
+ * a non-empty `droppedLines` whose `eventPositions` is missing or not a
+ * same-length non-negative-integer array matching `events.length` fails
+ * closed. Cost is linear in the capped `events` array.
+ */
+function corruptLineBracketedInDay(read: unknown, day: string): boolean {
+  try {
+    if (typeof read !== 'object' || read === null || Array.isArray(read)) {
+      return true;
+    }
+    const events = ownDataProperty(read, 'events');
+    if (!Array.isArray(events) || Object.getPrototypeOf(events) !== Array.prototype) {
+      return true;
+    }
+    const eventsLengthDescriptor = Object.getOwnPropertyDescriptor(events, 'length');
+    if (
+      eventsLengthDescriptor === undefined ||
+      eventsLengthDescriptor.get !== undefined ||
+      typeof eventsLengthDescriptor.value !== 'number' ||
+      !Number.isSafeInteger(eventsLengthDescriptor.value) ||
+      eventsLengthDescriptor.value > SHADOW_MAX_HEALTH_ITEMS
+    ) {
+      return true;
+    }
+    const eventsLength = eventsLengthDescriptor.value;
+    const droppedDescriptor = Object.getOwnPropertyDescriptor(read, 'droppedLines');
+    // An accessor (or a missing) `droppedLines` is never read through a
+    // getter: an accessor fails closed, a missing field is treated as `[]`.
+    if (droppedDescriptor === undefined) {
+      return false;
+    }
+    if (droppedDescriptor.get !== undefined || droppedDescriptor.set !== undefined) {
+      return true;
+    }
+    const droppedLines = droppedDescriptor.value;
+    if (droppedLines === undefined) {
+      return false;
+    }
+    const droppedLength = readNonNegativeSafeIntegerOwnArray(droppedLines);
+    if (droppedLength === null) {
+      return true;
+    }
+    if (droppedLength === 0) {
+      return false;
+    }
+    const eventPositions = ownDataProperty(read, 'eventPositions');
+    const positionsLength = readNonNegativeSafeIntegerOwnArray(eventPositions);
+    if (positionsLength === null || positionsLength !== eventsLength) {
+      return true;
+    }
+    let firstPos: number | null = null;
+    let lastPos: number | null = null;
+    for (let index = 0; index < eventsLength; index += 1) {
+      const event = ownDataProperty(events as object, String(index));
+      if (typeof event !== 'object' || event === null) {
+        continue;
+      }
+      const recordedAtIso = ownDataProperty(event, 'recordedAtIso');
+      if (typeof recordedAtIso !== 'string' || recordedAtIso.slice(0, 10) !== day) {
+        continue;
+      }
+      const position = ownDataProperty(eventPositions as object, String(index));
+      if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
+        return true;
+      }
+      if (firstPos === null || position < firstPos) {
+        firstPos = position;
+      }
+      if (lastPos === null || position > lastPos) {
+        lastPos = position;
+      }
+    }
+    // No in-day parsed record: no bracket, so no dropped line affects the day.
+    if (firstPos === null || lastPos === null) {
+      return false;
+    }
+    for (let index = 0; index < droppedLength; index += 1) {
+      const position = ownDataProperty(droppedLines as object, String(index));
+      if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
+        return true;
+      }
+      if (position >= firstPos && position <= lastPos) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * OD7a3: a manual-mode S12 guard that aborts the whole run with a typed
+ * result (a refusal or an unknown), writing nothing to the ledger. Thrown
+ * from `evaluateTickHealthCriterion` and caught in `run`.
+ */
+class S12GuardResult extends Error {
+  constructor(readonly result: RecordShadowDayResult) {
+    super('s12-guard');
+  }
+}
+
+/**
  * Read an outer `attestations.read` result as an EXACT plain record:
  * `status: 'missing'` must carry exactly the own data key `status`, and
  * `status: 'ok'` must carry exactly the own data keys `status` and `ledger`.
@@ -829,11 +981,29 @@ function zipReleaseTests(paths: readonly string[], inspection: unknown): readonl
   }
 }
 
-function unknownResult(reason: 'ledger-unreadable' | 'ledger-unknown-version' | 'ledger-busy' | 'deadline-exceeded'): RecordShadowDayResult {
+function unknownResult(
+  reason:
+    | 'ledger-unreadable'
+    | 'ledger-unknown-version'
+    | 'ledger-busy'
+    | 'deadline-exceeded'
+    | 'daemon-events-corrupt',
+): RecordShadowDayResult {
   return { outcome: 'unknown', reason };
 }
 
-function refusedResult(reason: 'invalid-request' | 'too-early' | 'too-old' | 'day-out-of-order' | 'verdict-conflict' | 'release-conflict' | 'merges-conflict'): RecordShadowDayResult {
+function refusedResult(
+  reason:
+    | 'invalid-request'
+    | 'too-early'
+    | 'too-old'
+    | 'day-out-of-order'
+    | 'verdict-conflict'
+    | 'release-conflict'
+    | 'merges-conflict'
+    | 'late-last-tick'
+    | 'coverage-gap',
+): RecordShadowDayResult {
   return { outcome: 'refused', reason };
 }
 
@@ -976,13 +1146,32 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // reconcile against.
     const mergeSet = await this.evaluateMergeSetCriterion(context, journal, shell);
     const intake = await this.evaluateIntakeCriterion(context, journal);
+    // OD7a3: the S12 outcome is evaluated (or reused from the scheduled
+    // prechecks) OUTSIDE the outcomes literal, because the manual-mode guard
+    // in `evaluateTickHealthCriterion` can abort the whole run — a bracketed
+    // corrupt line is `unknown/daemon-events-corrupt`, and a coverage
+    // failure (`late-last-tick` / `coverage-gap`) is a refusal — each
+    // writing nothing.
+    let s12Outcome: CriterionOutcome;
+    if (scheduled !== null && scheduled.tickHealth !== undefined) {
+      s12Outcome = scheduled.tickHealth;
+    } else {
+      try {
+        s12Outcome = await this.evaluateTickHealthCriterion(context);
+      } catch (error) {
+        if (error instanceof S12GuardResult) {
+          return error.result;
+        }
+        throw error;
+      }
+    }
     const outcomes = [
       mergeSet,
       intake.outcome,
       await this.evaluateStateIntegrityCriterion(context, journal),
       // OD7a2: in scheduled mode the already-evaluated S12 outcome is reused
       // rather than re-reading the daemon events.
-      scheduled?.tickHealth ?? (await this.evaluateTickHealthCriterion(context)),
+      s12Outcome,
       await this.evaluateGateAgreementCriterion(context),
       await this.evaluateConformanceCriterion(context, shellFacts),
       await this.evaluateChainsRetiredCriterion(context, intake.chains),
@@ -1031,6 +1220,11 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (read.kind === 'threw' || !read.value.ok) {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
     }
+    // OD7a3: a dropped line bracketed inside the day's parsed records makes
+    // the day unknown before anything is evaluated or written.
+    if (corruptLineBracketedInDay(read.value, context.day)) {
+      return { stop: { outcome: 'unknown', reason: 'daemon-events-corrupt' } };
+    }
     // OD7a2 fix round: the raw events are validated and snapshotted exactly
     // ONCE, here, by `snapshotEvent`; every later loop and filter below uses
     // the snapshot array only and may dereference `kind`/`recordedAtIso`
@@ -1069,15 +1263,16 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       return { stop: skippedResult('partial-day') };
     }
     // 3. S12 precheck over the windowed events: an unknown evaluation and a
-    // `too-few-ticks` failure each stop the run before anything is written.
+    // `too-few-ticks` / `late-last-tick` / `coverage-gap` failure each stop
+    // the run before anything is written (OD7a3 adds the coverage guards).
     const windowed = validatedEvents.filter((event: DaemonEventSnapshot) => this.inTickWindow(event.recordedAtIso, context.day));
     const evaluation = evaluateShadowTickHealth({ day: context.day, events: windowed });
     const tickHealth: CriterionOutcome = { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
     if (evaluation.status === 'unknown') {
       return { stop: { outcome: 'unknown', reason: 's12-unknown' }, tickHealth };
     }
-    if (evaluation.status === 'fail' && evaluation.reason === 'too-few-ticks') {
-      return { stop: skippedResult('too-few-ticks'), tickHealth };
+    if (evaluation.status === 'fail' && (evaluation.reason === 'too-few-ticks' || evaluation.reason === 'late-last-tick' || evaluation.reason === 'coverage-gap')) {
+      return { stop: skippedResult(evaluation.reason), tickHealth };
     }
     return { stop: null, tickHealth };
   }
@@ -1533,8 +1728,19 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (read.kind === 'threw' || !read.value.ok) {
       return unevaluatedOutcome('S12', 'daemon-events-unavailable');
     }
+    // OD7a3: a dropped line bracketed inside the day's parsed records makes
+    // the day unknown — writing nothing. The typed result is carried out of
+    // the outcomes evaluation by the `S12GuardResult` sentinel.
+    if (corruptLineBracketedInDay(read.value, context.day)) {
+      throw new S12GuardResult(unknownResult('daemon-events-corrupt'));
+    }
     const events = read.value.events.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
     const evaluation = evaluateShadowTickHealth({ day: context.day, events });
+    // OD7a3: manual mode refuses the two S12 coverage failures instead of
+    // recording a `fail` verdict — nothing is written to the ledger.
+    if (evaluation.status === 'fail' && (evaluation.reason === 'late-last-tick' || evaluation.reason === 'coverage-gap')) {
+      throw new S12GuardResult(refusedResult(evaluation.reason));
+    }
     return { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
   }
 

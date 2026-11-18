@@ -159,6 +159,18 @@ const MERGE_STATE_BY_TOKEN: Record<string, 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'DIR
 };
 
 /**
+ * Live mode keeps main's mapping: forge `dirty` reads as UNKNOWN and the
+ * decider waits. The DIRTY mapping applies only under shadow.
+ */
+function shadowMergeStateStatus(
+  mapped: 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'DIRTY' | 'UNKNOWN',
+  shadow: boolean,
+): 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'DIRTY' | 'UNKNOWN' {
+  if (!shadow && mapped === 'DIRTY') return 'UNKNOWN';
+  return mapped;
+}
+
+/**
  * At most MAX_ENTRIES_PER_PASS entries per pass: the queue head always, the
  * rest in queue order rotated by the pass minute, so a long run of parked
  * entries at the front cannot starve the entries behind it.
@@ -1138,7 +1150,12 @@ export class RunMergePassUseCase implements RunMergePassPort {
         pr = {
           status: 'open',
           headOid,
-          mergeStateStatus: MERGE_STATE_BY_TOKEN[read.mergeState] ?? 'UNKNOWN',
+          // Live mode must match main: forge `dirty` maps to UNKNOWN and the
+          // decider waits. Only shadow mode keeps the DIRTY mapping.
+          mergeStateStatus: shadowMergeStateStatus(
+            MERGE_STATE_BY_TOKEN[read.mergeState] ?? 'UNKNOWN',
+            request.policy.shadow === true,
+          ),
         };
       } else if (read.prState === 'merged') {
         pr = { status: 'merged', headOid };

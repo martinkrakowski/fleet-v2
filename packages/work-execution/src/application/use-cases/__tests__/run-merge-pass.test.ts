@@ -1232,14 +1232,16 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
     expect(after[1].reasonCode).toBe('shadow-intent-closed');
   });
 
-  it('a live tick on a DIRTY PR drops with reason conflict through the writer and notifier, as on main', async () => {
-    // Fix round 2 (Fable, minor): the `dirty: 'DIRTY'` drop in updateRowStep
-    // is unchanged from origin/main, so live behaviour must stay
-    // byte-identical: the drop persists and notifies exactly as before.
+  it('a live tick on a forge dirty merge state waits and leaves the queue entry unchanged, as on main', async () => {
+    // Fix round 3: on origin/main `MERGE_STATE_BY_TOKEN` has no `dirty` key,
+    // so a live tick read forge `dirty` as UNKNOWN and waited. This branch
+    // regressed that to DIRTY (an immediate conflict drop). Live mode keeps
+    // main's mapping; only shadow mode keeps the DIRTY mapping.
     const writer = queueWriterSpy();
     const notifier = notifierSpy();
+    const entry = makeEntry();
     const { useCase, deps, request } = makeUseCase(
-      [makeEntry()],
+      [entry],
       { ...greenForge, mergeState: 'dirty' } as unknown as ReadForgeMergeResult,
       { shadow: false },
       haltFake,
@@ -1248,11 +1250,12 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
 
     const result = await useCase.runMergePass(request);
 
-    expect(result.entries[0].decision).toBe('recorded');
-    expect(result.entries[0].reasonCode).toBe('conflict');
-    expect(writer.calls).toBe(1);
-    expect(notifier.calls).toBe(1);
+    expect(result.entries[0].decision).toBe('no-action');
+    expect(writer.calls).toBe(0);
+    expect(notifier.calls).toBe(0);
     expect(await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/would-drop`)).toHaveLength(0);
     expect(await journalOf(deps.journal)).toHaveLength(0);
+    expect(entry.state).toBe('queued');
+    expect(entry.reason).toBeNull();
   });
 });

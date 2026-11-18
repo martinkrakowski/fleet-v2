@@ -104,6 +104,19 @@ describe('resolvePinnedOwnerPublicKey', () => {
     expect(getTrapCalls).toBe(0);
   });
 
+  it('a revoked Proxy as the env object never throws and fails closed as owner-key-env-mismatch', () => {
+    const target = envWith(PINNED);
+    const { proxy, revoke } = Proxy.revocable(target, {});
+    revoke();
+    expect(() =>
+      resolvePinnedOwnerPublicKey(PINNED, proxy),
+    ).not.toThrow();
+    expect(resolvePinnedOwnerPublicKey(PINNED, proxy)).toEqual({
+      status: 'env-mismatch',
+      code: 'owner-key-env-mismatch',
+    });
+  });
+
   it('an own prototype-polluting key produced by JSON.parse is read as an own data property and never trusted through the prototype chain', () => {
     const env: Record<string, unknown> = JSON.parse(
       '{"__proto__": {"FLEET_OWNER_PUBLIC_KEY": "evil"}}',

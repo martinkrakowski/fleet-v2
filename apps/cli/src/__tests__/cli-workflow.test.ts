@@ -31,7 +31,6 @@ import {
   type FleetCliRuntime,
 } from '../composition.js';
 import { runCli, extractStateDirOption, type CliIo } from '../index.js';
-import { loadInstallation } from '@fleet/installation';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 
 /** Canonical decision bytes, written out here so the test pins the signed format independently. */
@@ -2118,47 +2117,83 @@ describe('Fleet CLI workflow', () => {
 });
 
 /**
- * KEY0b: the daemon branch composes its runtime from an already-loaded
- * (possibly invalid) installation result and never reads
- * FLEET_OWNER_PUBLIC_KEY as an authority. This drives the exact composition
- * the daemon branch performs (index.ts ~881: an invalid `loadInstallation()`
- * result through `loadInstallationForMergePolicy`, no installation) and
- * asserts an approval signed with the ambient env key stays blocked.
+ * KEY0b fix round: the daemon branch composes its runtime from the
+ * installation load result and never reads FLEET_OWNER_PUBLIC_KEY as an
+ * authority. The env variable here carries the public key of the ONE keypair
+ * whose private half signed the approval, while the PINNED installation key
+ * is a DIFFERENT keypair, so the approval would verify only if the env
+ * variable were still trusted.
+ *
+ * Driving the refusal through a daemon subcommand is impractical: `pause`,
+ * `resume` and `status` never resolve an action authorization, and `tick`
+ * needs a known merge policy with configured repositories and jobs before it
+ * would reach one, so the refusal reason cannot be observed there. The tests
+ * instead drive `runCli` without an injected runtime, so runCli itself
+ * performs the composition the daemon branch performs for a valid load
+ * result (index.ts ~880: `installation: loadResult.installation`), with the
+ * pinned key read from the trusted installation file and never from the
+ * environment.
  */
-describe('daemon branch composes an unpinned runtime from an invalid installation (KEY0b)', () => {
-  it('an invalid installation load result with FLEET_OWNER_PUBLIC_KEY set resolves blocked owner-key-unpinned and never falls back to the env key', async () => {
+describe('the daemon composition reads the pinned key only from the installation (KEY0b)', () => {
+  function daemonKeyPair(): { publicKeyBase64: string; privateKey: ReturnType<typeof generateKeyPairSync>['privateKey'] } {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    return {
+      publicKeyBase64: publicKey.export({ format: 'der', type: 'spki' }).subarray(12).toString('base64'),
+      privateKey,
+    };
+  }
+
+  const envPair = daemonKeyPair();
+  const pinnedPair = daemonKeyPair();
+
+  const HEAD = 'b'.repeat(40);
+  const PROJECT = 'proj-daemon-key0b';
+  const SCOPE = 'forge:push-and-open-pr';
+  const ATTEMPT = 'attempt-daemon-1';
+
+  const jsonArg = (payload: unknown): string => JSON.stringify(payload);
+
+  function decisionFields(grantId: string): Parameters<typeof canonicalDecisionBytes>[0] {
+    return {
+      requestId: 'req-daemon-key0b',
+      projectId: PROJECT,
+      actionScope: SCOPE,
+      expectedHeadSha: HEAD,
+      decisionRevision: 'dec-1',
+      grantId,
+      state: 'approved',
+    };
+  }
+
+  it('an approval signed with the env keypair refuses as owner-key-env-mismatch when FLEET_OWNER_PUBLIC_KEY differs from the pinned key, and nothing executes', async () => {
     const daemonDir = mkdtempSync(path.join(tmpdir(), 'fleet-daemon-key0b-'));
     const stateDir = path.join(daemonDir, 'state');
-    const stateNested = path.join(stateDir, 'decisions');
-    mkdirSync(stateNested, { recursive: true });
+    mkdirSync(path.join(stateDir, 'decisions'), { recursive: true });
 
-    const { privateKey } = generateKeyPairSync('ed25519');
-    // The ambient env key that must never become an authority.
-    const envPublicKey = generateKeyPairSync('ed25519').publicKey
-      .export({ format: 'der', type: 'spki' })
-      .subarray(12)
-      .toString('base64');
-
-    // An invalid installation file: the daemon branch composes without one.
-    const installationFile = path.join(daemonDir, 'install.json');
-    writeFileSync(installationFile, '{ not an installation');
+    // A trusted installation file (0600 in a plain temporary directory, no
+    // git checkout) pinning a DIFFERENT key than the env variable carries.
+    const installationFile = path.join(daemonDir, 'fleet.json');
+    writeFileSync(
+      installationFile,
+      `${JSON.stringify({ schemaVersion: 1, owner: { publicKey: pinnedPair.publicKeyBase64 } })}\n`,
+      { mode: 0o600 },
+    );
 
     const originalInstallationFile = process.env.FLEET_INSTALLATION_FILE;
     const originalOwnerKey = process.env.FLEET_OWNER_PUBLIC_KEY;
     process.env.FLEET_INSTALLATION_FILE = installationFile;
-    process.env.FLEET_OWNER_PUBLIC_KEY = envPublicKey;
+    process.env.FLEET_OWNER_PUBLIC_KEY = envPair.publicKeyBase64;
     try {
       // Seed an awaiting request with file-backed stores, the way the daemon
       // reads them.
       const seeder = createFleetCliRuntime({ stateDir });
-      const head = 'a'.repeat(40);
       const record: CoordinationRequestRecord = {
         id: 'req-daemon-key0b',
-        projectId: 'proj-daemon-1',
+        projectId: PROJECT,
         kind: 'action-decision',
         state: 'awaiting-decision',
-        actionScope: 'forge:merge-pr',
-        expectedHeadSha: head,
+        actionScope: SCOPE,
+        expectedHeadSha: HEAD,
         proposalDigest: 'prop-1',
         policyRevision: 'pol-1',
         decisionRevision: null,
@@ -2173,47 +2208,175 @@ describe('daemon branch composes an unpinned runtime from an invalid installatio
       };
       await seeder.coordination.coordinationRequestRepository.saveRequest(record);
 
-      // An approval signed with the ambient env key: under the old behaviour
-      // the env variable made this verify and authorize.
-      const signature = sign(
-        null,
-        canonicalDecisionBytes({
-          requestId: record.id,
-          projectId: record.projectId,
-          actionScope: record.actionScope,
-          expectedHeadSha: record.expectedHeadSha,
-          decisionRevision: 'dec-1',
-          grantId: 'grant-daemon-1',
-          state: 'approved',
-        }),
-        privateKey,
-      ).toString('base64');
+      // An approval signed with the private half of the env keypair: under
+      // the old behaviour the env variable made this verify and authorize.
+      const signature = sign(null, canonicalDecisionBytes(decisionFields('grant-daemon-1')), envPair.privateKey)
+        .toString('base64');
       writeFileSync(
-        path.join(stateNested, `${record.id}.json`),
-        `${JSON.stringify({
-          state: 'approved',
-          decisionRevision: 'dec-1',
-          grantId: 'grant-daemon-1',
-          signature,
-        })}\n`,
+        path.join(stateDir, 'decisions', 'req-daemon-key0b.json'),
+        `${JSON.stringify({ ...decisionFields('grant-daemon-1'), signature })}\n`,
       );
 
-      // The daemon branch's exact composition: an invalid load result through
-      // `loadInstallationForMergePolicy`, no `installation`.
-      const loadResult = loadInstallation();
-      expect(loadResult.status).toBe('invalid');
-      const daemonRuntime = createFleetCliRuntime({
-        stateDir,
-        loadInstallationForMergePolicy: () => loadResult,
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        [
+          '--state-dir',
+          stateDir,
+          'coordination',
+          'resolve-auth',
+          '--json',
+          jsonArg({
+            projectId: PROJECT,
+            actionScope: SCOPE,
+            expectedHeadSha: HEAD,
+            attemptId: ATTEMPT,
+          }),
+        ],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+      );
+      // The env keypair signed the approval and the env variable carries its
+      // public key, yet the pinned key differs: the resolve stays blocked.
+      expect(code).toBe(1);
+      expect(jsonOf({ code, text: out.join(''), stderr: err.join('') })).toEqual({
+        outcome: 'blocked',
+        reason: 'owner-key-env-mismatch',
       });
 
-      const resolved = await daemonRuntime.coordination.resolveActionAuthorization.resolveActionAuthorization({
-        projectId: record.projectId,
-        actionScope: record.actionScope,
-        expectedHeadSha: record.expectedHeadSha as string,
+      // Nothing executed: the record is untouched and no grant was issued.
+      const after = await seeder.coordination.coordinationRequestRepository.findRequestByGrantId('grant-daemon-1');
+      expect(after).toBeNull();
+      const stillAwaiting = await seeder.coordination.coordinationRequestRepository.listRequests(PROJECT);
+      expect(stillAwaiting).toHaveLength(1);
+      expect(stillAwaiting[0]?.state).toBe('awaiting-decision');
+      expect(stillAwaiting[0]?.grantId).toBeNull();
+      expect(stillAwaiting[0]?.consumptions).toHaveLength(0);
+    } finally {
+      if (originalInstallationFile !== undefined) {
+        process.env.FLEET_INSTALLATION_FILE = originalInstallationFile;
+      } else {
+        delete process.env.FLEET_INSTALLATION_FILE;
+      }
+      if (originalOwnerKey !== undefined) {
+        process.env.FLEET_OWNER_PUBLIC_KEY = originalOwnerKey;
+      } else {
+        delete process.env.FLEET_OWNER_PUBLIC_KEY;
+      }
+      rmSync(daemonDir, { recursive: true, force: true });
+    }
+  });
+
+  it('the mirror case: an approval signed with the PINNED keypair authorizes through the same composition', async () => {
+    const daemonDir = mkdtempSync(path.join(tmpdir(), 'fleet-daemon-key0b-'));
+    const stateDir = path.join(daemonDir, 'state');
+    mkdirSync(path.join(stateDir, 'decisions'), { recursive: true });
+
+    const installationFile = path.join(daemonDir, 'fleet.json');
+    writeFileSync(
+      installationFile,
+      `${JSON.stringify({ schemaVersion: 1, owner: { publicKey: pinnedPair.publicKeyBase64 } })}\n`,
+      { mode: 0o600 },
+    );
+
+    const originalInstallationFile = process.env.FLEET_INSTALLATION_FILE;
+    const originalOwnerKey = process.env.FLEET_OWNER_PUBLIC_KEY;
+    process.env.FLEET_INSTALLATION_FILE = installationFile;
+    delete process.env.FLEET_OWNER_PUBLIC_KEY;
+    try {
+      const seeder = createFleetCliRuntime({ stateDir });
+      const record: CoordinationRequestRecord = {
+        id: 'req-daemon-key0b',
+        projectId: PROJECT,
+        kind: 'action-decision',
+        state: 'awaiting-decision',
+        actionScope: SCOPE,
+        expectedHeadSha: HEAD,
+        proposalDigest: 'prop-1',
+        policyRevision: 'pol-1',
+        decisionRevision: null,
+        grantId: null,
+        consumptions: [],
+        acknowledgements: [],
+        deliveryStatus: 'pending',
+        deliveryGapReason: null,
+        revision: 1,
+        createdAtIso: '2026-11-18T10:00:00.000Z',
+        updatedAtIso: '2026-11-18T10:00:00.000Z',
+      };
+      await seeder.coordination.coordinationRequestRepository.saveRequest(record);
+
+      // The attempt the resolve binds the grant to (CO24f): it must exist,
+      // belong to the project and be collected at the requested head.
+      await seeder.execution.workOrderRepository.saveWorkOrder({
+        id: 'wo-daemon-1',
+        projectId: PROJECT,
+        taskId: 'task-daemon-1',
+        laneId: 'lane-daemon-1',
+        repository: 'github.com/org/repo',
+        state: 'approved',
+        revision: 1,
+        baseCommit: '0'.repeat(40),
+        ownedPaths: ['src/'],
+        policyRevision: 'pol-1',
+        prerequisiteWorkOrderIds: [],
+        createdAtIso: '2026-11-18T09:00:00.000Z',
+        updatedAtIso: '2026-11-18T09:00:00.000Z',
       });
-      // The env variable is never a fallback: the resolve stays blocked.
-      expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+      await seeder.execution.attemptRepository.saveAttempt({
+        id: ATTEMPT,
+        workOrderId: 'wo-daemon-1',
+        kind: 'initial',
+        fixNumber: 0,
+        priorAttemptId: null,
+        state: 'collected',
+        outcome: 'done',
+        baseCommit: '0'.repeat(40),
+        worktreePath: '/tmp/worktree-daemon',
+        briefDigest: 'digest-1',
+        briefPackagePath: null,
+        sessionId: null,
+        completionReceipt: null,
+        artifacts: {
+          headCommit: HEAD,
+          commitsSinceBase: [HEAD],
+          collectedArtifactPaths: ['/tmp/patch.diff'],
+          notes: 'present',
+        },
+        createdAtIso: '2026-11-18T09:30:00.000Z',
+        updatedAtIso: '2026-11-18T09:30:00.000Z',
+      });
+
+      // The same awaiting request, approved with the PINNED keypair.
+      const signature = sign(null, canonicalDecisionBytes(decisionFields('grant-daemon-2')), pinnedPair.privateKey)
+        .toString('base64');
+      writeFileSync(
+        path.join(stateDir, 'decisions', 'req-daemon-key0b.json'),
+        `${JSON.stringify({ ...decisionFields('grant-daemon-2'), signature })}\n`,
+      );
+
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        [
+          '--state-dir',
+          stateDir,
+          'coordination',
+          'resolve-auth',
+          '--json',
+          jsonArg({
+            projectId: PROJECT,
+            actionScope: SCOPE,
+            expectedHeadSha: HEAD,
+            attemptId: ATTEMPT,
+          }),
+        ],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+      );
+      expect(code).toBe(0);
+      expect(jsonOf({ code, text: out.join(''), stderr: err.join('') })).toMatchObject({
+        outcome: 'authorized',
+        grantId: 'grant-daemon-2',
+      });
     } finally {
       if (originalInstallationFile !== undefined) {
         process.env.FLEET_INSTALLATION_FILE = originalInstallationFile;

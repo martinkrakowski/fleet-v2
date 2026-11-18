@@ -43,30 +43,34 @@ type EnvOwnDataRead =
  * pattern so `FLEET_OWNER_PUBLIC_KEY` stays a reviewed RUNTIME_ONLY read.
  */
 function readEnvOwnData(env: unknown, name: 'FLEET_OWNER_PUBLIC_KEY'): EnvOwnDataRead {
-  if (typeof env !== 'object' || env === null || Array.isArray(env)) {
-    return { state: 'absent' };
-  }
-  let descriptor: PropertyDescriptor | undefined;
+  // Every reflective operation on `env` — including `Array.isArray`, which
+  // consults the target of a Proxy and therefore throws on a revoked Proxy —
+  // stays inside the `try`: nothing here ever throws.
   try {
-    descriptor = Object.getOwnPropertyDescriptor(env, name);
+    if (typeof env !== 'object' || env === null || Array.isArray(env)) {
+      return { state: 'absent' };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(env, name);
+    if (descriptor === undefined) {
+      return { state: 'absent' };
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      // An accessor's value is never read: the getter must never run.
+      return { state: 'hostile' };
+    }
+    if (typeof descriptor.value !== 'string') {
+      return { state: 'hostile' };
+    }
+    if (descriptor.value.length > MAX_OWNER_KEY_ENV_LENGTH) {
+      // Refused before any traversal: no over-long value is even trimmed.
+      return { state: 'hostile' };
+    }
+    return { state: 'value', value: descriptor.value };
   } catch {
+    // A revoked Proxy (or any throwing reflective read) leaves the env
+    // unreadable: fail closed.
     return { state: 'hostile' };
   }
-  if (descriptor === undefined) {
-    return { state: 'absent' };
-  }
-  if (descriptor.get !== undefined || descriptor.set !== undefined) {
-    // An accessor's value is never read: the getter must never run.
-    return { state: 'hostile' };
-  }
-  if (typeof descriptor.value !== 'string') {
-    return { state: 'hostile' };
-  }
-  if (descriptor.value.length > MAX_OWNER_KEY_ENV_LENGTH) {
-    // Refused before any traversal: no over-long value is even trimmed.
-    return { state: 'hostile' };
-  }
-  return { state: 'value', value: descriptor.value };
 }
 
 /** A single-line deprecation notice that never carries a key value. */

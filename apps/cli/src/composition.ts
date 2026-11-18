@@ -26,6 +26,7 @@ import { parseConfiguredCliPath } from './release.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
 import { composeReadOnlyRelaunch } from './composition/relaunch.js';
+import { recordedHostOf } from './relaunch.js';
 import { composeKnowledge } from './composition/knowledge.js';
 import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
@@ -135,6 +136,8 @@ import {
   type ProjectProfileReadPort,
   type AttemptRecord,
   type AttemptReviewLocator,
+  type InventoryRelaunchResult,
+  type RelaunchCloneRef,
   type ExecutionRunnerHost,
   type EvaluateAttemptGatePort,
   type EnqueueMergeUseCase,
@@ -1054,6 +1057,80 @@ function readStoredShadowEvidence(
   };
 }
 
+/**
+ * CO30c: the typed sum the switch lane gate consumes. A non-`inventoried`
+ * inventory (unreadable records, unknown halt or lease bytes, a refused state
+ * probe) is unreadable, never a zero. The sums take only what refuses or
+ * unknowns the gate: the hosts' `unrecorded` population counts (idle
+ * leftovers included — relaunch apply/adopt does not exist yet, so every
+ * unrecorded listed worktree is lane work nothing explains) and the
+ * `unknown-worktree-read` and `unknown-runner-state` flag counts (an unroutable
+ * host or a failed listing or runner read refuses as unknown rather than
+ * failing open when a stale record on a reused path stays `attempt-recorded`
+ * and counts 0 unrecorded). `unproven-lane-records` is deliberately not
+ * counted: an unproven record is listed in the inventory and never refuses
+ * the switch. When `declaredClones` is given, an inventory that inspected
+ * fewer clones than declared is unreadable, never a pass on partial
+ * coverage (CO30c fix round). Exported for the cutover-switch regression
+ * tests. A top-level `driver-lease-live` flag refuses as
+ * `conductor-driver-live`: the driver lease is held right now, so a driver is
+ * still active. The top-level `conductor-halted` flag is different — the code
+ * reads it from the halt marker, which means the conductor is halted, not
+ * that a driver is active — so it does not refuse this gate (an unreadable
+ * halt marker already answers `unreadable` through a non-`inventoried`
+ * outcome).
+ */
+export function summarizeInventoryForCutover(
+  result: InventoryRelaunchResult,
+  declaredClones?: number,
+):
+  | { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number }
+  | { readonly status: 'unreadable' }
+  | { readonly status: 'refused'; readonly reason: 'conductor-driver-live' } {
+  if (result.outcome !== 'inventoried') {
+    return { status: 'unreadable' };
+  }
+  // CO30c fix round: a live driver lease is a driver still active on the
+  // installation, so the switch refuses with its own typed reason. A lease
+  // whose state is unknown already arrives as a non-`inventoried` outcome
+  // (`lease-unreadable`) and answers `unreadable` above.
+  if (result.riskFlags.some((flag) => flag.code === 'driver-lease-live')) {
+    return { status: 'refused', reason: 'conductor-driver-live' };
+  }
+  let unrecorded = 0;
+  let unknownListings = 0;
+  let inspectedClones = 0;
+  for (const host of result.hosts) {
+    inspectedClones += host.cloneCount;
+    // CO30c fix round: the inventory's own counts must account for every
+    // listed worktree. `worktreeCount` is what the clone's listing returned
+    // and `lanes` is what the inventory accounted for; the only difference a
+    // correct read leaves is each clone's own main worktree, one per
+    // `cloneCount` clone. When the listed worktrees outnumber the accounted
+    // lanes beyond that — a worktree listed outside the clone's
+    // `worktreeRoot`, silently dropped by the listing — the inventory cannot
+    // vouch for the leftovers it never saw, so it is unreadable, never a
+    // pass with `unrecorded 0`.
+    if (host.worktreeCount - host.lanes.length > host.cloneCount) {
+      return { status: 'unreadable' };
+    }
+    unrecorded += host.counts.unrecorded;
+    for (const flag of host.riskFlags) {
+      if (flag.code === 'unknown-worktree-read' || flag.code === 'unknown-runner-state') {
+        unknownListings += flag.count;
+      }
+    }
+  }
+  // CO30c fix round: the inventory must have inspected every clone the
+  // active profiles declare. Fewer inspected clones (a dropped host group, a
+  // clone the read skipped) is not fewer lanes to explain: it is unreadable,
+  // never a pass on partial coverage.
+  if (declaredClones !== undefined && inspectedClones < declaredClones) {
+    return { status: 'unreadable' };
+  }
+  return { status: 'ok', unrecorded, unknownListings };
+}
+
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
   const stateDir = options?.stateDir;
   // Taken before any adapter is composed (some create the directory): the relaunch commands refuse
@@ -1442,11 +1519,87 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const daemonPauseRead = durableCutover ? new DaemonPauseAdapter({ stateDir, readOnly: true }) : daemon.pause;
   const trainPauseRead = durableCutover ? new KillallTrainPauseAdapter({ stateDir, readOnly: true }) : killallTrainPause;
   // SH8b: read-only ledger for `cutover switch`. In-memory mode has no durable
-  // ledger, so the reader stays undefined and the use case refuses. This does
-  // not wire `countUnrecordedLanes` and does not start the shadow daemon.
+  // ledger, so the reader stays undefined and the use case refuses. CO30c
+  // wires `countUnrecordedLanes` beside it (below); the shadow daemon still
+  // does not start from here.
   const shadowEvidence = durableCutover ? new ShadowEvidenceAdapter({ stateDir, readOnly: true }) : undefined;
   const readShadowEvidence =
     shadowEvidence === undefined ? undefined : readStoredShadowEvidence(shadowEvidence, daemon.now);
+  // CO30c: the switch's last gate. Only durable state has the stores to
+  // count; in-memory mode leaves it unwired exactly like `readShadowEvidence`.
+  // The count reads ONLY read-only instances already composed: the relaunch
+  // inventory's read-only store adapters (composeReadOnlyRelaunch), the
+  // read-only project-profile listing, and the worktree/runner readers — so
+  // a corrupt store file is a read error answered `unreadable`, never a
+  // quarantine, and no writable daemon, conductor or profile instance is
+  // reachable from here. Zero active project profiles (a missing
+  // `project-profiles.json` reads as empty) is unreadable too: it never
+  // passes 0/0. Nor does partial clone coverage (CO30c fix round): an
+  // active profile with zero clones, zero clones across all profiles, or
+  // an inventory that inspected fewer clones than the profiles declare is
+  // unreadable, never a vacuous pass.
+  const countUnrecordedLanes = durableCutover
+    ? async (): Promise<
+        | { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number }
+        | { readonly status: 'unreadable' }
+        | { readonly status: 'refused'; readonly reason: 'conductor-driver-live' }
+      > => {
+        try {
+          let profiles: Awaited<
+            ReturnType<
+              typeof coordination.listProjectProfilesReadOnly.listProjectProfiles
+            >
+          >;
+          try {
+            profiles = await coordination.listProjectProfilesReadOnly.listProjectProfiles({
+              status: 'active',
+            });
+          } catch {
+            return { status: 'unreadable' };
+          }
+          if (profiles.outcome !== 'listed') {
+            return { status: 'unreadable' };
+          }
+          const active = profiles.profiles.filter((profile) => profile.status === 'active');
+          if (active.length === 0) {
+            return { status: 'unreadable' };
+          }
+          const clones: RelaunchCloneRef[] = [];
+          for (const profile of active) {
+            const entries = Object.entries(profile.clones);
+            // CO30c fix round: an active profile with no clone coverage is
+            // never a pass — the inventory would see nothing and the gate
+            // would pass vacuously. One declared-clone-less profile is as
+            // unreadable as zero profiles.
+            if (entries.length === 0) {
+              return { status: 'unreadable' };
+            }
+            for (const [cloneHost, clone] of entries) {
+              clones.push({
+                projectId: profile.projectId,
+                hostName: cloneHost,
+                clonePath: clone.path,
+                worktreeRoot: clone.worktreeRoot,
+                recordedHost: recordedHostOf(cloneHost, { installation: options?.installation }),
+              });
+            }
+          }
+          // CO30c fix round: zero declared clones across every active
+          // profile is the same vacuous pass, refused before the read.
+          if (clones.length === 0) {
+            return { status: 'unreadable' };
+          }
+          const inventory = await inventoryRelaunch.inventoryRelaunch({
+            nowIso: daemon.now(),
+            hostName: null,
+            clones,
+          });
+          return summarizeInventoryForCutover(inventory, clones.length);
+        } catch {
+          return { status: 'unreadable' };
+        }
+      }
+    : undefined;
   const manageCutover = new ManageCutoverUseCase({
     cutoverRepo: cutoverRecordRepository,
     cutoverJournal,
@@ -1459,6 +1612,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     mintEntryId: daemon.newUlid,
     nowIso: daemon.now,
     ...(readShadowEvidence === undefined ? {} : { readShadowEvidence }),
+    ...(countUnrecordedLanes === undefined ? {} : { countUnrecordedLanes }),
   });
 
   const reviewLocator = reviewLocatorRef.locator;

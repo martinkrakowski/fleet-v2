@@ -1,8 +1,8 @@
 # Runbook: cutover
 
-*Date: 2026-11-17 · Status: operator runbook for this checkout. `cutover switch` and `cutover retire` are mounted. Switch reads the recorded shadow ledger and still cannot complete a switch.*
+*Date: 2026-11-18 · Status: operator runbook for this checkout. `cutover switch` and `cutover retire` are mounted. `countUnrecordedLanes` is wired (CO30c), so a real `switched` record is reachable when every gate passes.*
 
-This runbook covers the cutover commands that exist in this checkout. `cutover switch` and `cutover retire` are mounted in `apps/cli/src/commands/cutover.ts`. Switch reads `<stateDir>/cutover-shadow.json` and still refuses or halts before it writes a `switched` record. Retire writes a retired record only after a stored `switched` record and the 14-day window. Nothing here removes an adapter.
+This runbook covers the cutover commands that exist in this checkout. `cutover switch` and `cutover retire` are mounted in `apps/cli/src/commands/cutover.ts`. Switch reads `<stateDir>/cutover-shadow.json` and, with `countUnrecordedLanes` wired (CO30c), completes a `switched` record when all gates pass. Retire writes a retired record only after a stored `switched` record and the 14-day window. Nothing here removes an adapter.
 
 ## Shadow
 
@@ -27,7 +27,15 @@ Status does not evaluate S1–S13. A completed status is not a shadow pass. Do n
 
 `cutover switch` cannot pass evidence while the recorded days are unpinned or divergent. Since SH20, `record-day` binds each recorded day to the installed `current` verified release sha (or `null` when unpinned, which still composes to `release-changed` / `shadow-evidence-absent`): a day recorded with no verified `current` release installed keeps every recorded window at `release-changed`, and the switch refuses `shadow-evidence-absent`.
 
-A window that does pass the evidence gate still stops at `unknown` / `unrecorded-lanes-unknown` until `countUnrecordedLanes` is wired. That halt writes no `cutover.json` switch record and no `cutover-journal.json` intent. Preflight runs before any intent is appended.
+A window that passes the evidence gate then runs the last closed gate, `countUnrecordedLanes` (CO30c), wired in `apps/cli/src/composition.ts` over the read-only relaunch inventory and the read-only project-profile listing. Gate order: shadow evidence, lanes, daemon status, train pause. The gate:
+
+- refuses `unrecorded-lanes` when any listed worktree of an active profile's clone is unrecorded — idle leftovers included (relaunch apply/adopt does not exist yet, so every unrecorded worktree is lane work nothing explains). Remove leftover worktrees from the clone's `worktreeRoot` (with `git worktree remove`) before running `cutover switch`.
+- refuses `unknown` / `unrecorded-lanes-unknown` when the listed worktrees outnumber the lanes the inventory accounted for beyond each clone's own main worktree: a worktree listed outside the clone's declared `worktreeRoot` is silently dropped by the inventory, so the switch is never performed on an inventory that cannot vouch for what it did not see.
+- refuses `conductor-driver-live` while the driver lease is live: a driver is still active on the installation, so the switch does not proceed under it. (The `conductor-halted` flag is different: it is read from the halt marker, which means the conductor is halted — a pause state, not an active driver — so it does not refuse this gate; an unreadable halt marker is already `unknown`.) An unreadable or unknown driver-lease state refuses as `unknown` / `unrecorded-lanes-unknown`.
+- answers `unknown` / `unrecorded-lanes-unknown` when lane coverage cannot be read: zero active project profiles (a missing `project-profiles.json` reads as empty and never passes 0/0), an unreadable `project-profiles.json`, `lane-runs.json`, `attempts.json`, `conductor-halt.json` or `conductor-driver-lease.json`, a clone whose host is absent from the installation (`unknown-worktree-read`), a failed worktree listing (`unknown-worktree-read`), or a failed runner read or unavailable runner (`unknown-runner-state`).
+- never refuses on `unproven-lane-records`: an unproven record is listed in `relaunch inventory` output and counted there, but it does not block the switch.
+
+The gate reads only read-only store instances, so a corrupt store file is answered `unreadable` and never quarantined, and a refused or `unknown` switch writes no `cutover.json` and no `cutover-journal.json`. When every gate passes, the switch appends its intent, sets the train pause, saves the `switched` record and appends its result — a real `switched` record is reachable.
 
 Fail closed, and never treat an unknown or partial ledger as a pass:
 
@@ -38,10 +46,13 @@ Fail closed, and never treat an unknown or partial ledger as a pass:
 - A newer `schemaVersion`: `unknown` / `shadow-evidence-unknown-version` (exit 1). This is not absence.
 - A deadline already past: `unknown` / `deadline-exceeded` (exit 1).
 
-Two residuals this unit does not close. Both are owner preconditions for the unit that wires `countUnrecordedLanes` (CO30c), which becomes the last closed gate:
+Three residuals, owner-accepted 2026-11-17 and NOT fixed by this unit (CO30c). Do not work around them here:
 
-- Release binding is still equality among the three days only (narrowed by SH20: each day's `releaseSha` is now derived from the installed `current` verified release at `record-day` time). Nothing compares that recorded sha to the installed `current` release again at `cutover switch` time, so a release installed after the last day is not re-checked.
-- Verdict digests are not re-verified, and there is no evaluator or digest-format version, so an older-format or hand-edited day is not detected. Only shape, freshness, and the lanes gate stand behind a passing window.
+- Release vs installed at switch time: release binding is equality among the three days only (narrowed by SH20: each day's `releaseSha` is derived from the installed `current` verified release at `record-day` time). Nothing compares that recorded sha to the installed `current` release again at `cutover switch` time, so a release installed after the last day is not re-checked.
+- Digest re-verify/version: verdict digests are not re-verified, and there is no evaluator or digest-format version, so an older-format or hand-edited day is not detected. Only shape, freshness, and the gates stand behind a passing window.
+- One-sided freshness: real behaviour (fix dated 2026-11-17): `isStale` rejects only days older than the daemon clock, and the future-day check uses the operator's `--now-iso`. There is no reverse freshness signal (nothing proves the ledger was read against the state a relaunch plan was built from); the switch relies on shape, the gates, and those two checks only.
+
+For clarity: "pinned" throughout this runbook means the installed `current` verified release under the release root parsed from the configured `daemon.cliPath` — the release `record-day` binds each day to and the one S2/S10/S11 inspect.
 
 Checks the operator can run today, each of which is not itself a completed switch:
 
@@ -58,7 +69,7 @@ Checks the operator can run today, each of which is not itself a completed switc
 
 The rollback window is 14 days (`CUTOVER_ROLLBACK_WINDOW_DAYS`).
 
-`fleet-v2 cutover rollback --expected-revision <n> --operation-id <id>` exists, with optional `--now-iso` and `--deadline-iso`. It pauses the daemon and lifts only a train pause the cutover itself set, and it requires a stored `switched` record. A record that was never switched is refused `not-switched` (exit 1). `cutover switch` is mounted, but nothing in this checkout writes `switched`: evidence from today's `record-day` composes to `release-changed`, and a window that passed evidence would still stop at `unrecorded-lanes-unknown`. An unreadable store is `unknown` (exit 1), not success.
+`fleet-v2 cutover rollback --expected-revision <n> --operation-id <id>` exists, with optional `--now-iso` and `--deadline-iso`. It pauses the daemon and lifts only a train pause the cutover itself set, and it requires a stored `switched` record. A record that was never switched is refused `not-switched` (exit 1). `cutover switch` is mounted and, with `countUnrecordedLanes` wired (CO30c), can write `switched` when the evidence gate, the lanes gate, the daemon gate and the train-pause gate all pass. An unreadable store is `unknown` (exit 1), not success.
 
 `fleet-v2 daemon pause` exists as its own command.
 

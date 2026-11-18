@@ -125,9 +125,12 @@ function fakeScheduler(results: FakeSchedulerResults = {}): {
       },
       async remove() {
         calls.push("remove");
-        const base = results.remove ?? { service: "absent", timer: "absent" };
-        return {
-          ...base,
+        // OD7a1 fix round 2: a provided remove result passes through whole,
+        // including its intake codes, so a test can drive an unreadable
+        // intake removal; the default still reports the intake pair absent.
+        return results.remove ?? {
+          service: "absent",
+          timer: "absent",
           shadowIntake: { service: "absent", timer: "absent" },
         };
       },
@@ -244,7 +247,7 @@ describe("fleet-v2 hosts daemon", () => {
     expect(code).toBe(2);
   });
 
-  it("uninstall without --apply maps a present unit to would-remove", async () => {
+  it("uninstall without --apply maps a present unit to would-remove and prints exactly two lines", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, { ...validV2, daemon });
@@ -254,13 +257,14 @@ describe("fleet-v2 hosts daemon", () => {
       { read: { service: "unchanged", timer: "absent" } },
     );
     expect(code).toBe(0);
-    expect(stdout).toContain("fleet-v2-daemon.service would-remove\n");
-    expect(stdout).toContain("fleet-v2-daemon.timer absent\n");
-    expect(stdout).not.toContain("enable:");
+    // Luna fix round 2: the dry-run stdout is exactly the two main lines.
+    expect(stdout).toBe(
+      "fleet-v2-daemon.service would-remove\nfleet-v2-daemon.timer absent\n",
+    );
     expect(calls).toEqual(["read"]);
   });
 
-  it("uninstall --apply calls remove and does not print enable:", async () => {
+  it("uninstall --apply calls remove and prints exactly two lines with no enable:", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, { ...validV2, daemon });
@@ -269,9 +273,38 @@ describe("fleet-v2 hosts daemon", () => {
       file,
     );
     expect(code).toBe(0);
-    expect(stdout).toContain("fleet-v2-daemon.service absent\n");
-    expect(stdout).toContain("fleet-v2-daemon.timer absent\n");
-    expect(stdout).not.toContain("enable:");
+    // Luna fix round 2: the applied uninstall stdout is exactly these two
+    // lines — the intake pair's codes are never printed when shadow is off.
+    expect(stdout).toBe(
+      "fleet-v2-daemon.service absent\nfleet-v2-daemon.timer absent\n",
+    );
+    expect(calls).toEqual(["remove"]);
+  });
+
+  it("uninstall --apply with shadow off exits 1 and reports an unreadable intake removal", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, { ...validV2, daemon });
+    const { code, stdout, stderr, calls } = await runDaemon(
+      ["uninstall", "--scheduler", "systemd", "--apply"],
+      file,
+      {
+        remove: {
+          service: "absent",
+          timer: "absent",
+          shadowIntake: { service: "unreadable", timer: "absent" },
+        },
+      },
+    );
+    // Fable fix round 2: the two main lines stay exactly as they are, but an
+    // intake unit that is a symlink or fails unlink is reported and exits 1.
+    expect(code).toBe(1);
+    expect(stdout).toBe(
+      "fleet-v2-daemon.service absent\nfleet-v2-daemon.timer absent\n",
+    );
+    expect(stderr).toContain(
+      "installation.daemon.shadow: shadow-intake-unreadable\n",
+    );
     expect(calls).toEqual(["remove"]);
   });
 
@@ -490,6 +523,36 @@ describe("fleet-v2 hosts daemon", () => {
     // command's own policy resolution ever runs.
     expect(stderr).toContain("policy.merge.repos");
     expect(calls).toEqual([]);
+  });
+
+  it("the daemon command's own policy resolution invalid branch is unreachable through the CLI", async () => {
+    // Fable fix round 2: the `resolvedPolicy.outcome === 'invalid'` branch in
+    // `daemonCommand` has no loader-passing input. The installation loader
+    // validates everything `resolveMergePolicy` re-reads — repo keys, entry
+    // keys, projectId, booleans, integers, bounds, veto, prepare, and the
+    // budgetSeconds < intervalSeconds order — so any input that would fail
+    // `resolveMergePolicy` is refused by the loader first (exit 1 with the
+    // loader's own error, before the daemon command resolves the policy).
+    // These near-miss inputs each fail at the loader, never at the branch.
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    for (const policy of [
+      { merge: { repos: { "bad key!": { projectId: "p" } } } },
+      { merge: { repos: { "owner/repo": { projectId: "p", unknown: 1 } } } },
+      {
+        merge: { repos: { "owner/repo": { projectId: "p" } } },
+        daemon: { intervalSeconds: 60, budgetSeconds: 60 },
+      },
+    ]) {
+      writeJsonFile(file, { ...validV2, daemon, policy });
+      const { code, stderr, calls } = await runDaemon(
+        ["uninstall", "--scheduler", "systemd", "--apply"],
+        file,
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("policy.");
+      expect(calls).toEqual([]);
+    }
   });
 
   it("uninstall with shadow off prints exactly 2 lines and removes 4 units", async () => {

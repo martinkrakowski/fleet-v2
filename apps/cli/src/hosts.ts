@@ -1966,6 +1966,11 @@ async function daemonCommand(
     out.stderr(`installation.daemon.shadow: ${result.refusal}\n`);
     return 1;
   }
+  if (result.intakeUnreadable === true) {
+    // Fable fix round 2: the intake pair's codes are not printed when shadow
+    // is off, so an unreadable intake removal is reported here instead.
+    out.stderr("installation.daemon.shadow: shadow-intake-unreadable\n");
+  }
   for (const unit of result.units) {
     out.stdout(`${unit.key} ${unit.code}\n`);
   }
@@ -1974,7 +1979,10 @@ async function daemonCommand(
       out.stdout(`${line}\n`);
     }
   }
-  return result.units.some((unit) => unit.code === "unreadable") ? 1 : 0;
+  return result.units.some((unit) => unit.code === "unreadable") ||
+    result.intakeUnreadable === true
+    ? 1
+    : 0;
 }
 
 /**

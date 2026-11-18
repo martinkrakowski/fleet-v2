@@ -132,6 +132,19 @@ describe('daemon.shadow (OD7a1)', () => {
     }
   });
 
+  it('refuses a secret-shaped legacyStateDir', () => {
+    // Built at runtime so no secret literal ever lands in this file. The value
+    // is an absolute path carrying none of the refused path characters, so
+    // only the credential screen can refuse it.
+    const legacyStateDir = ['/srv/fleet/', 'ghp', '_', 'A1b2C3'.repeat(4)].join('');
+    expect(legacyStateDir).toMatch(/^\/srv\/fleet\/ghp_[A-Za-z0-9_-]{20,}$/);
+    const result = parseWithShadow({ legacyStateDir });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toContain('daemon.shadow.legacyStateDir: refused');
+    }
+  });
+
   it('refuses an empty, whitespace-only or whitespace-carrying grantId', () => {
     for (const grantId of ['', '   ', 'grant 1', 'grant\t1']) {
       const result = parseWithShadow({ ...SHADOW, grantId });

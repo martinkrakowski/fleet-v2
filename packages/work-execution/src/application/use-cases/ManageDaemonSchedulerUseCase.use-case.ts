@@ -292,9 +292,19 @@ export class ManageDaemonSchedulerUseCase implements ManageDaemonSchedulerPort {
 
     if (request.apply) {
       const result = await this.safeRemove();
+      // OD7a1 fix round 2: the port always removes the intake pair, even when
+      // the rendered facts carried none (shadow off), so its codes are not in
+      // `units` here. An intake removal that is `unreadable` must be surfaced
+      // typed or the command would print two `absent` lines and exit 0.
+      const intakeUnreadable =
+        shadowIntake === undefined &&
+        result.shadowIntake !== undefined &&
+        (result.shadowIntake.service === 'unreadable' ||
+          result.shadowIntake.timer === 'unreadable');
       return {
         units: shadowUnitLines(result, shadowIntake !== undefined),
         operatorLines: null,
+        ...(intakeUnreadable ? { intakeUnreadable: true } : {}),
       };
     }
 

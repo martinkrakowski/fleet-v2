@@ -3,6 +3,8 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { containsSecretShape } from '@fleet/shared';
+
 import {
   DAEMON_SERVICE_TEMPLATE,
   DAEMON_TIMER_TEMPLATE,
@@ -467,6 +469,18 @@ describe('readShadowSchedulerConfig (OD7a1)', () => {
       reason: 'invalid-shadow-config',
     });
   });
+
+  it('refuses a credential-shaped legacyStateDir that avoids the substitution characters', () => {
+    // Built at runtime so no secret literal ever lands in this file. The value
+    // is a legal path (no whitespace, %, $, quotes or backslash), so only the
+    // secret screen can refuse it.
+    const legacyStateDir = ['/srv/fleet/', 'ghp', '_', 'A1b2C3'.repeat(4)].join('');
+    expect(legacyStateDir).toMatch(/^\/srv\/fleet\/ghp_[A-Za-z0-9_-]{20,}$/);
+    expect(containsSecretShape(legacyStateDir)).toBe(true);
+    expect(
+      readShadowSchedulerConfig({ ...SHADOW_CONFIG, legacyStateDir }),
+    ).toEqual({ ok: false, reason: 'invalid-shadow-config' });
+  });
 });
 
 describe('ManageDaemonSchedulerUseCase shadow intake (OD7a1)', () => {
@@ -586,6 +600,52 @@ describe('ManageDaemonSchedulerUseCase shadow intake (OD7a1)', () => {
       { key: DAEMON_SERVICE_UNIT_KEY, code: 'absent' },
       { key: DAEMON_TIMER_UNIT_KEY, code: 'absent' },
     ]);
+  });
+
+  it('uninstall --apply with shadow off surfaces a typed unreadable intake removal without changing the two lines', async () => {
+    const useCase = new ManageDaemonSchedulerUseCase({
+      scheduler: fakeScheduler({
+        remove: {
+          service: 'absent',
+          timer: 'absent',
+          shadowIntake: { service: 'unreadable', timer: 'absent' },
+        },
+      }).scheduler,
+    });
+    const result = await useCase.execute({
+      action: 'uninstall',
+      apply: true,
+      daemon: FACTS,
+    });
+    // The two main lines stay exactly as they are; the intake pair's codes are
+    // not printed, so its unreadable removal is surfaced typed instead.
+    expect(result.units).toEqual([
+      { key: DAEMON_SERVICE_UNIT_KEY, code: 'absent' },
+      { key: DAEMON_TIMER_UNIT_KEY, code: 'absent' },
+    ]);
+    expect(result.intakeUnreadable).toBe(true);
+  });
+
+  it('uninstall --apply with shadow off and an absent intake removal is not typed unreadable', async () => {
+    const useCase = new ManageDaemonSchedulerUseCase({
+      scheduler: fakeScheduler({
+        remove: {
+          service: 'absent',
+          timer: 'absent',
+          shadowIntake: { service: 'absent', timer: 'absent' },
+        },
+      }).scheduler,
+    });
+    const result = await useCase.execute({
+      action: 'uninstall',
+      apply: true,
+      daemon: FACTS,
+    });
+    expect(result.units).toEqual([
+      { key: DAEMON_SERVICE_UNIT_KEY, code: 'absent' },
+      { key: DAEMON_TIMER_UNIT_KEY, code: 'absent' },
+    ]);
+    expect(result.intakeUnreadable).toBeUndefined();
   });
 
   it('uninstall with shadow on prints all 4 unit lines', async () => {

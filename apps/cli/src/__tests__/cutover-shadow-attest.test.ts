@@ -7,16 +7,20 @@ import { existsSync, mkdtempSync, promises as fs, readFileSync, rmSync } from 'n
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { createFleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 import {
   evaluateShadowOneTimeCriteria,
   SHADOW_ATTESTATION_FACTS,
+  SHADOW_ONE_TIME_REQUIREMENTS,
 } from '@fleet/work-execution';
 
 const tempDirs: string[] = [];
+
+/** S2's required e2e path, reported present and unquarantined in the evaluations below. */
+const S2_E2E_PATH = SHADOW_ONE_TIME_REQUIREMENTS.S2.tests[0]!;
 
 afterAll(() => {
   for (const dir of tempDirs) {
@@ -83,8 +87,10 @@ describe('cutover shadow attest (AT1)', () => {
           String(revision),
           '--operation-id',
           `op-${operation}`,
+          // The distinctive authority label, so the never-stored assertion
+          // below actually exercises a value this loop wrote with.
           '--authority',
-          'owner',
+          'ops-lead-7',
         ]),
       );
       expect(result.code).toBe(0);
@@ -94,6 +100,8 @@ describe('cutover shadow attest (AT1)', () => {
     }
     const file = path.join(stateDir, 'cutover-shadow-attestations.json');
     expect(existsSync(file)).toBe(true);
+    const journalFile = path.join(stateDir, 'cutover-journal.json');
+    expect(existsSync(journalFile)).toBe(true);
     const stored = JSON.parse(readFileSync(file, 'utf8')) as {
       revision: number;
       attestations: ReadonlyArray<{ fact: string; observedDay: string; reason: string; digest: string }>;
@@ -101,21 +109,127 @@ describe('cutover shadow attest (AT1)', () => {
     expect(stored.revision).toBe(SHADOW_ATTESTATION_FACTS.length);
     expect(stored.attestations.map((item) => item.fact)).toEqual([...SHADOW_ATTESTATION_FACTS]);
     expect(stored.attestations.every((item) => item.reason === 'owner-attested')).toBe(true);
-    // The note and the authority are hashed, never stored.
+    // The note and the authority are hashed, never stored — in the
+    // attestation ledger or in the cutover journal.
     expect(readFileSync(file, 'utf8')).not.toContain('verified against the release tree');
     expect(readFileSync(file, 'utf8')).not.toContain('ops-lead-7');
+    expect(readFileSync(journalFile, 'utf8')).not.toContain('verified against the release tree');
+    expect(readFileSync(journalFile, 'utf8')).not.toContain('ops-lead-7');
 
-    // The day the facts were recorded on is today (the daemon clock); the
-    // one-time evaluator must read them back as satisfied.
+    // The day the facts were recorded on is today (the daemon clock). The
+    // one-time evaluator must read S2 and S3 back as satisfied: both of S2's
+    // facts are attested AND S2's required e2e path is reported present and
+    // unquarantined, so no `not-yet-observed` or `release-test-unreported`
+    // can mask the facts. The no-attestation control below proves the facts
+    // are what these passes count.
     const day = new Date().toISOString().slice(0, 10);
+    const releaseTests = [
+      {
+        path: S2_E2E_PATH,
+        present: true,
+        quarantined: false,
+      },
+    ];
     const evaluations = evaluateShadowOneTimeCriteria({
       day,
       releaseSha: 'c'.repeat(40),
       attestations: stored,
-      releaseTests: [],
+      releaseTests,
     });
-    expect(evaluations.S2.reason).not.toBe('not-yet-observed');
-    expect(evaluations.S3.reason).not.toBe('not-yet-observed');
+    expect(evaluations.S2).toEqual({ status: 'pass', reason: 'one-time-evidence-present' });
+    expect(evaluations.S3).toEqual({ status: 'pass', reason: 'one-time-evidence-present' });
+  });
+
+  it('does not pass S2 or S3 without the attested facts (no-attestation control)', async () => {
+    // Control for the test above: with NO attestation ledger, S2 (its facts
+    // missing) and S3 must not pass, even with S2's e2e path reported
+    // present and unquarantined — the pass comes from the facts.
+    const day = new Date().toISOString().slice(0, 10);
+    const releaseTests = [
+      {
+        path: S2_E2E_PATH,
+        present: true,
+        quarantined: false,
+      },
+    ];
+    const evaluations = evaluateShadowOneTimeCriteria({
+      day,
+      releaseSha: 'c'.repeat(40),
+      attestations: null,
+      releaseTests,
+    });
+    expect(evaluations.S2.status).not.toBe('pass');
+    expect(evaluations.S2.reason).toBe('not-yet-observed');
+    expect(evaluations.S3).toEqual({ status: 'unknown', reason: 'not-yet-observed' });
+  });
+
+  it('round-trips attest then record-day through the real CLI composition', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await fs.writeFile(path.join(fixtureDir, 'queue'), '');
+    const runtime = runtimeFor(stateDir);
+    // record-day through the same composition, reading the attested facts.
+    // The clock is pinned so the attested day and "yesterday" are stable:
+    // attest on the pinned day, then advance one day so the pinned day is
+    // recordable (record-day refuses today as too-early) and the facts'
+    // observedDay is on or before the evaluation day.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    let revision = 0;
+    let operation = 0;
+    for (const fact of SHADOW_ATTESTATION_FACTS) {
+      operation += 1;
+      const result = await cli(
+        runtime,
+        attestArgs([
+          '--fact',
+          fact,
+          '--note',
+          'round-trip',
+          '--expected-revision',
+          String(revision),
+          '--operation-id',
+          `round-trip-${operation}`,
+          '--authority',
+          'ops-lead-7',
+        ]),
+      );
+      expect(result.code).toBe(0);
+      const body = JSON.parse(result.out) as { outcome: string; ledger: { revision: number } };
+      expect(body.outcome).toBe('attested');
+      revision = body.ledger.revision;
+    }
+    vi.setSystemTime(new Date('2026-06-16T12:00:00.000Z'));
+    try {
+      const day = '2026-06-15';
+      const recorded = await cli(runtime, [
+        'cutover',
+        'shadow',
+        'record-day',
+        '--repository',
+        'fleet/v2',
+        '--legacy-state-dir',
+        fixtureDir,
+        '--day',
+        day,
+      ]);
+      expect(recorded.code).toBe(0);
+      const body = JSON.parse(recorded.out) as {
+        outcome: string;
+        unevaluated: ReadonlyArray<{ criterion: string; reason: string }>;
+      };
+      expect(body.outcome).toBe('recorded');
+      // The attested facts cleared `not-yet-observed` for S2 and S3; with no
+      // release tree wired, the remaining unevaluated reason (if any) is the
+      // release binding, not a missing fact — that is not this use case's
+      // concern.
+      for (const item of body.unevaluated) {
+        if (item.criterion === 'S2' || item.criterion === 'S3') {
+          expect(item.reason).not.toBe('not-yet-observed');
+        }
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('replays the same operation id and payload without bumping the revision', async () => {

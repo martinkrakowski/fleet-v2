@@ -1420,6 +1420,11 @@ describe('parseShadowAttestationCommandInput hostile input (AT1)', () => {
     expect(validParse(baseInputWith({ fact: 's9-unknown-fact' }))).toEqual({ ok: false, reason: 'unknown-fact' });
   });
 
+  it('refuses a non-string fact with invalid-input, not unknown-fact', () => {
+    expect(validParse(baseInputWith({ fact: 7 }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(validParse(baseInputWith({ fact: null }))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
   it('refuses secret-shaped note, evidence and authority with secret-shaped', () => {
     expect(validParse(baseInputWith({ note: SECRET_TEXT }))).toEqual({ ok: false, reason: 'secret-shaped' });
     expect(validParse(baseInputWith({ evidence: SECRET_TEXT }))).toEqual({ ok: false, reason: 'secret-shaped' });

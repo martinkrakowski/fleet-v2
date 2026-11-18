@@ -62,6 +62,15 @@ function unknown(reason: AttestShadowFactUnknownReason): AttestShadowFactResult 
   return { outcome: 'unknown', reason };
 }
 
+/** The UTC day of a journal timestamp, or null when the instant is unusable. */
+function intentDay(recordedAtIso: string): string | null {
+  const parsed = Date.parse(recordedAtIso);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return new Date(parsed).toISOString().slice(0, 10);
+}
+
 /** The outcome of one guarded outbound call. */
 type Guarded<T> =
   | { readonly kind: 'value'; readonly value: T }
@@ -137,12 +146,22 @@ export class AttestShadowFactUseCase implements AttestShadowFactPort {
       if (!written.changed) {
         // Crash recovery: this operation's intent is durable but has no
         // final result, and the ledger already holds this exact fact under
-        // this exact payload digest — the compare-and-set landed before the
-        // crash and only the result append was lost. The intent is completed
-        // as `attested` (`recovered`) without comparing revisions: the
-        // stored revision is the crashed call's own increment, not the
-        // caller's expectation, and the fact is already durably recorded.
-        if (intent !== null && existing !== null && existing.digest === digest) {
+        // this exact payload digest, recorded on the very day this
+        // operation's own intent was made — the compare-and-set landed
+        // before the crash and only the result append was lost. The intent
+        // is completed as `attested` (`recovered`) without comparing
+        // revisions: the stored revision is the crashed call's own
+        // increment, not the caller's expectation, and the fact is already
+        // durably recorded. A different operation with an identical payload
+        // whose write never landed does not own the stored attestation, so
+        // it falls through to the sticky path (and its stale expectation
+        // answers `revision-conflict`).
+        if (
+          intent !== null &&
+          existing !== null &&
+          existing.digest === digest &&
+          existing.observedDay === intentDay(intent.recordedAtIso)
+        ) {
           const resultFailure = await this.appendCompletedResult(
             key,
             digest,

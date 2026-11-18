@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import {
   SHADOW_ATTESTATION_FACTS,
   SHADOW_ATTESTATION_SCHEMA_VERSION,
+  SHADOW_ONE_TIME_REQUIREMENTS,
   type ShadowAttestation,
   type ShadowAttestationLedger,
 } from '../../../domain/shadow-attestations.js';
@@ -405,6 +406,49 @@ describe('AttestShadowFactUseCase (AT1)', () => {
     expect(await attest.execute(baseInput())).toEqual({ outcome: 'refused', reason: 'journal-refused' });
   });
 
+  it('does not recover a different operation onto an attestation recorded on another day: it answers revision-conflict', async () => {
+    // A different operation id with an identical payload, crashed after its
+    // intent: the stored fact was written by an EARLIER operation on an
+    // earlier day, so this operation's own write never landed. Recovery must
+    // not claim it; the sticky path's revision check answers
+    // `revision-conflict` for the caller's stale expectation.
+    const { useCase: attest, deps } = useCase();
+    // `computeDigest` mints DIGEST_A for any payload mentioning 'different',
+    // so the stored attestation below carries this payload's exact digest.
+    deps.attestations.ledger = storedLedger([attestationFor(FORGE, '2026-06-14')]);
+    deps.journal.entries.push({
+      key: 'cutover/attest@attest-2',
+      kind: 'intent',
+      entryId: 'crashed-other-operation',
+      recordedAtIso: '2026-06-16T12:00:00.000Z',
+      digest: DIGEST_A,
+    });
+    const result = await attest.execute(
+      baseInput({ note: 'different note', expectedRevision: 0, operationId: 'attest-2' }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
+    // The refused result is journaled under this operation's own key, and the
+    // stored attestation is untouched.
+    const resultEntry = deps.journal.entries.find((entry) => entry.kind === 'result');
+    expect(resultEntry?.key).toBe('cutover/attest@attest-2');
+    expect(resultEntry?.outcome).toBe('refused');
+    expect(deps.attestations.ledger?.revision).toBe(1);
+  });
+
+  it('answers revision-conflict for an unchanged attest with a stale expectedRevision', async () => {
+    // Sticky-unchanged pin: the fact is already recorded, but the caller's
+    // expected revision does not match the stored ledger, so the sticky path
+    // refuses exactly as a compare-and-set would.
+    const { useCase: attest, deps } = useCase();
+    deps.attestations.ledger = storedLedger([attestationFor(FORGE)]);
+    const result = await attest.execute(baseInput({ expectedRevision: 0, operationId: 'attest-stale' }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
+    expect(deps.attestations.writes).toBe(0);
+    const resultEntry = deps.journal.entries.find((entry) => entry.kind === 'result');
+    expect(resultEntry?.outcome).toBe('refused');
+    expect(resultEntry?.reasonCode).toBe('revision-conflict');
+  });
+
   it('attests every required one-time fact and the evaluator reads them back as satisfied', async () => {
     const { useCase: attest, deps } = useCase();
     let revision = 0;
@@ -421,16 +465,37 @@ describe('AttestShadowFactUseCase (AT1)', () => {
     }
     const { evaluateShadowOneTimeCriteria } = await import('../../../domain/shadow-attestations.js');
     // S2 needs both of its facts and S3 its own; the attested day is on or
-    // before the evaluation day, so neither may still say `not-yet-observed`.
-    // There is no release tree wired here, so S10/S11 stay
+    // before the evaluation day. S2's required e2e path is reported present
+    // and unquarantined so no `release-test-unreported` can mask the facts:
+    // with all three facts attested, S2 AND S3 must actually pass. The
+    // no-attestation control below proves the facts are what these passes
+    // count. There is no release tree wired here, so S10/S11 stay
     // `release-tree-unreadable` — that is not this use case's concern.
+    const releaseTests = [
+      { path: SHADOW_ONE_TIME_REQUIREMENTS.S2.tests[0]!, present: true, quarantined: false },
+    ];
     const evaluations = evaluateShadowOneTimeCriteria({
       day: '2026-06-16',
       releaseSha: RELEASE_SHA,
       attestations: deps.attestations.ledger,
-      releaseTests: [],
+      releaseTests,
     });
-    expect(evaluations.S2.reason).not.toBe('not-yet-observed');
-    expect(evaluations.S3.reason).not.toBe('not-yet-observed');
+    expect(evaluations.S2).toEqual({ status: 'pass', reason: 'one-time-evidence-present' });
+    expect(evaluations.S3).toEqual({ status: 'pass', reason: 'one-time-evidence-present' });
+  });
+
+  it('does not pass S2 or S3 without the attested facts (no-attestation control)', async () => {
+    // Control for the test above: with an EMPTY attestation ledger, S2 (its
+    // facts missing) and S3 must not pass, even with S2's e2e path reported
+    // present and unquarantined.
+    const { evaluateShadowOneTimeCriteria } = await import('../../../domain/shadow-attestations.js');
+    const evaluations = evaluateShadowOneTimeCriteria({
+      day: '2026-06-16',
+      releaseSha: RELEASE_SHA,
+      attestations: null,
+      releaseTests: [{ path: SHADOW_ONE_TIME_REQUIREMENTS.S2.tests[0]!, present: true, quarantined: false }],
+    });
+    expect(evaluations.S2).toEqual({ status: 'unknown', reason: 'not-yet-observed' });
+    expect(evaluations.S3).toEqual({ status: 'unknown', reason: 'not-yet-observed' });
   });
 });

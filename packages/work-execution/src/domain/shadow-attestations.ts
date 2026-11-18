@@ -981,9 +981,15 @@ type CommandFieldRead =
   | { readonly ok: true; readonly value: string }
   | { readonly ok: false; readonly reason: 'invalid-input' | 'secret-shaped' | 'unknown-fact' };
 
-/** The fact id, or `unknown-fact` when it is not one of `SHADOW_ATTESTATION_FACTS`. Cost: O(1). */
+/**
+ * The fact id. A non-string value is malformed (`invalid-input`); a string
+ * that is not one of `SHADOW_ATTESTATION_FACTS` is `unknown-fact`. Cost: O(1).
+ */
 function readCommandFact(value: unknown): CommandFieldRead {
-  if (typeof value !== 'string' || factIndex(value) === null) {
+  if (typeof value !== 'string') {
+    return { ok: false, reason: 'invalid-input' };
+  }
+  if (factIndex(value) === null) {
     return { ok: false, reason: 'unknown-fact' };
   }
   return { ok: true, value };

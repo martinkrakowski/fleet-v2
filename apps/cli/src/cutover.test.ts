@@ -556,7 +556,7 @@ describe('cutover switch reads the recorded shadow ledger (SH8b)', () => {
     expectNoCutoverWrites(result.out);
   });
 
-  it('cutover switch whose newest day is after --now-iso refuses shadow-criteria-failed naming all 13 criteria', async () => {
+  it('cutover switch whose newest day is after --now-iso refuses shadow-criteria-failed naming all 12 criteria', async () => {
     writeLedger(ledgerWith());
     const result = await runSwitch('2026-11-04T12:00:00.000Z');
     expect(result.code).toBe(1);
@@ -564,7 +564,7 @@ describe('cutover switch reads the recorded shadow ledger (SH8b)', () => {
     expectNoCutoverWrites(result.out);
   });
 
-  it('cutover switch with 1 all-pass day under 20 merges refuses shadow-criteria-failed naming all 13 criteria', async () => {
+  it('cutover switch with 1 all-pass day under 20 merges refuses shadow-criteria-failed naming all 12 criteria', async () => {
     writeLedger(ledgerWith({ mergesPerDay: 19 }));
     const result = await runSwitch();
     expect(result.code).toBe(1);
@@ -594,17 +594,28 @@ describe('cutover switch reads the recorded shadow ledger (SH8b)', () => {
     expectNoCutoverWrites(result.out);
   });
 
-  it('cutover switch with S13 omitted on the required shadow day refuses shadow-criteria-failed with failed S13', async () => {
+  it('cutover switch with S1–S12 recorded and no S13 gets past the evidence gate, and omitting S12 refuses shadow-criteria-failed with failed S12', async () => {
+    // SH23: S13 left the shadow window for the retirement gate, so S1–S12
+    // alone (no S13 key on the day) pass the evidence gate — the run then
+    // stops at the later lanes gate, never at S13. Omitting one of the
+    // twelve, S12 here, still refuses with that criterion named.
     writeLedger(ledgerWith({
       days: shadowDays(['2026-11-05'], {
         verdictsFor: (_day, index) =>
-          index === 0 ? makeDayVerdicts(NOW, { S13: undefined }) : makeDayVerdicts(NOW),
+          index === 0 ? makeDayVerdicts(NOW, { S12: undefined }) : makeDayVerdicts(NOW),
       }),
     }));
-    const result = await runSwitch();
-    expect(result.code).toBe(1);
-    expect(result.json).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: ['S13'] });
-    expectNoCutoverWrites(result.out);
+    const missingS12 = await runSwitch();
+    expect(missingS12.code).toBe(1);
+    expect(missingS12.json).toEqual({ outcome: 'refused', reason: 'shadow-criteria-failed', failed: ['S12'] });
+    expectNoCutoverWrites(missingS12.out);
+
+    writeLedger(ledgerWith());
+    const allTwelve = await runSwitch();
+    expect(allTwelve.code).toBe(1);
+    // The evidence gate passed: the refusal is the lanes gate, not S13 or any criterion.
+    expect(allTwelve.json).toEqual({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
+    expectNoCutoverWrites(allTwelve.out);
   });
 
   it('cutover switch with an older all-pass day but no latest closed day refuses shadow-evidence-absent', async () => {

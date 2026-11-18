@@ -636,13 +636,60 @@ describe('shadow evidence ledger (SH1)', () => {
       if (composedFull.status !== 'ok') {
         throw new Error('expected ok');
       }
-      expect(Object.keys(composedFull.evidence.days[0].verdicts).length).toBe(13);
+      expect(Object.keys(composedFull.evidence.days[0].verdicts).length).toBe(12);
       const partial = buildLedger([{ ...dayInput(D3, undefined), verdicts: { S1: passVerdict() } }]);
       const composedPartial = composeCutoverShadowEvidence(partial, NOW, { requireSingleRelease: false });
       if (composedPartial.status !== 'ok') {
         throw new Error('expected ok');
       }
       expect(Object.keys(composedPartial.evidence.days[0].verdicts)).toEqual(['S1']);
+    });
+
+    it('composes S1-S12 passing with no S13 required', () => {
+      // SH23: S13 left the shadow window for the retirement gate, so the
+      // composed document carries exactly the twelve current criteria and no
+      // S13 key is ever needed for a passing day.
+      const composed = composeCutoverShadowEvidence(oneDay(20), NOW, { requireSingleRelease: false });
+      if (composed.status !== 'ok') {
+        throw new Error('expected ok');
+      }
+      expect(Object.keys(composed.evidence.days[0].verdicts)).toEqual([...CUTOVER_SHADOW_CRITERIA]);
+      expect(Object.keys(composed.evidence.days[0].verdicts)).not.toContain('S13');
+    });
+
+    it('parses an old ledger day carrying a passing S13 entry and strips it from the composed evidence', () => {
+      // The legacy criterion still parses via readShadowLedger, but
+      // `evidenceDay` (the single legacy filter) strips it before
+      // `readCutoverShadowEvidence` inspects the composed document.
+      const ledger = buildLedger([dayInput(D3, 20, { ...allPassVerdicts(), S13: passVerdict() })]);
+      const read = readShadowLedger(ledger);
+      if (!read.ok) {
+        throw new Error('expected the legacy day to parse');
+      }
+      expect(Object.keys(read.ledger.days[0].verdicts)).toContain('S13');
+      const composed = composeCutoverShadowEvidence(ledger, NOW, { requireSingleRelease: false });
+      if (composed.status !== 'ok') {
+        throw new Error('expected ok');
+      }
+      expect(Object.keys(composed.evidence.days[0].verdicts)).toEqual([...CUTOVER_SHADOW_CRITERIA]);
+      expect(composed.evidence.days[0].verdicts).not.toHaveProperty('S13');
+    });
+
+    it('strips a failing S13 entry from an old ledger day the same way', () => {
+      const ledger = buildLedger([
+        dayInput(D3, 20, { ...allPassVerdicts(), S13: passVerdict({ verdict: 'fail', reason: 'evidence-link-missing' }) }),
+      ]);
+      const read = readShadowLedger(ledger);
+      if (!read.ok) {
+        throw new Error('expected the legacy day to parse');
+      }
+      expect(read.ledger.days[0].verdicts.S13?.verdict).toBe('fail');
+      const composed = composeCutoverShadowEvidence(ledger, NOW, { requireSingleRelease: false });
+      if (composed.status !== 'ok') {
+        throw new Error('expected ok');
+      }
+      expect(composed.evidence.days[0].verdicts).not.toHaveProperty('S13');
+      expect(Object.keys(composed.evidence.days[0].verdicts)).toEqual([...CUTOVER_SHADOW_CRITERIA]);
     });
 
     it('counts only the newest day: an older all-pass day with 25 merges never lifts the total', () => {
@@ -801,6 +848,11 @@ describe('shadow evidence ledger (SH1)', () => {
       expect(composeCutoverShadowEvidence(ledger, nextDay, { requireSingleRelease: false }).status).toBe('ok');
       const late = new Date(Date.parse(NOW) + 2 * DAY_MS).toISOString();
       expect(feed(ledger, late)).toEqual({ status: 'absent', reason: 'stale' });
+    });
+
+    it('(i) an old ledger day carrying a legacy S13 entry composes and reads with S13 stripped', () => {
+      const ledger = buildLedger([dayInput(D3, 20, { ...allPassVerdicts(), S13: passVerdict() })]);
+      expect(feed(ledger)).toEqual({ ok: true });
     });
   });
 });

@@ -208,7 +208,7 @@ A lane is about 45 minutes. A is the track owning work-execution, `apps/cli` and
 - **Cutover stream:** CO26 → CO27 → CO28 → CO29; CO30; CO31 → CO32.
 - **Gates:**
   - *Switch gate:* merge stream (including chains if kept), CO6, CO14, CO26–CO32.
-  - *Retirement gate:* every ledger row `verified`, including CO15–CO24.
+  - *Retirement gate:* every ledger row `verified`, including CO15–CO24; S13 — every §1 ledger row has an evidence link — moved here from §3.2 per owner decision 2026-11-18.
   - If the owner wants zero shell use on switch day, move CO15–CO24 before the switch (D-CO8).
 
 ### 3.2 Shadow period
@@ -239,7 +239,6 @@ Fleet-v2 runs beside the shell train and compares results.
 | S10 | Three kill-9 tests mid-pass: lease takeover, no duplicate action | DT §4.3(2) |
 | S11 | The brief parser and lint verdicts match the shell split and lint on a golden corpus of at least 5 briefs including exit-3 cases | proposed |
 | S12 | Ticks finish within the 45 s budget on at least 99% of ticks. No job `starved` | DT §3.1 |
-| S13 | Every ledger row has an evidence link | proposed |
 
 Jev stays in shadow. D-JV3 (live) is a separate owner decision on the 20-merge record. The shell's `events.jsonl` Jev log is archived, not discarded.
 
@@ -247,7 +246,7 @@ Jev stays in shadow. D-JV3 (live) is a separate owner decision on the 20-merge r
 
 Steps marked **[A]** need explicit owner authority: host administration, deployment, data migration or live dispatch.
 
-1. `cutover status` is green: S1–S13, no live lane lacking a record, relaunch plan digest recorded.
+1. `cutover status` is green: S1–S12, no live lane lacking a record, relaunch plan digest recorded.
 2. **[A]** `release install` of the pinned build.
 3. Freeze enqueues. Let the in-flight shell pass finish (the train lock must be free).
 4. `merge import` dry-run, review the diff, then **[A]** apply the remainder. Imported entries start `queued`; the decider re-evaluates from facts. Park reasons are not imported.

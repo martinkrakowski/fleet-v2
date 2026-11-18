@@ -19,11 +19,19 @@ export type CutoverState = (typeof CUTOVER_STATES)[number];
 export const CUTOVER_MOVES = ['status', 'switch', 'rollback', 'retire'] as const;
 export type CutoverMove = (typeof CUTOVER_MOVES)[number];
 
-/** The thirteen shadow criteria the switch move demands evidence for (plan §3.2). */
+/**
+ * The twelve shadow criteria the switch move demands evidence for (plan §3.2).
+ * `S13` left this window for the plan §3.1 retirement gate (owner decision
+ * 2026-11-18); it survives only in `LEGACY_SHADOW_CRITERIA` so ledgers that
+ * recorded it still parse.
+ */
 export const CUTOVER_SHADOW_CRITERIA = [
-  'S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S8', 'S9', 'S10', 'S11', 'S12', 'S13',
+  'S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S8', 'S9', 'S10', 'S11', 'S12',
 ] as const;
-export type CutoverShadowCriterion = (typeof CUTOVER_SHADOW_CRITERIA)[number];
+
+/** The twelve current criteria plus the retired `S13` (owner decision 2026-11-18). */
+export const LEGACY_SHADOW_CRITERIA = [...CUTOVER_SHADOW_CRITERIA, 'S13'] as const;
+export type CutoverShadowCriterion = (typeof LEGACY_SHADOW_CRITERIA)[number];
 
 export const CUTOVER_SHADOW_CONSECUTIVE_DAYS = 1;
 export const CUTOVER_SHADOW_MIN_MERGES = 20;
@@ -308,7 +316,7 @@ function utcDayNumber(day: string): number | null {
  * Read one shadow-evidence document without running a single getter. The root is a plain data
  * record whose only own keys are `merges` (a safe integer of at least
  * `CUTOVER_SHADOW_MIN_MERGES`) and `days`: a 1-element array carrying one UTC calendar date not
- * after the UTC date of `nowIso`, carrying the thirteen criteria, every verdict the string
+ * after the UTC date of `nowIso`, carrying the twelve criteria, every verdict the string
  * `pass`. Key counts are checked before any descriptor walk, so a document padded with
  * extra keys costs a constant number of descriptor reads. The `days` array-length and key-count
  * bounds are settled before any serializer probe, so an oversized array is refused without a

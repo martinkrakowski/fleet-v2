@@ -242,6 +242,39 @@ describe('readCutoverShadowEvidence', () => {
     expect(readCutoverShadowEvidence(evidence(NOW, undefined, CUTOVER_SHADOW_MIN_MERGES + 1), NOW)).toEqual({ ok: true });
   });
 
+  it('accepts S1-S12 passing with no S13 present', () => {
+    // SH23: S13 left the shadow window for the retirement gate, so the twelve
+    // passing criteria alone — with no S13 key at all — are enough.
+    expect(Object.keys(passVerdicts())).toEqual([...CUTOVER_SHADOW_CRITERIA]);
+    expect(Object.keys(passVerdicts())).not.toContain('S13');
+    expect(readCutoverShadowEvidence(evidence(NOW), NOW)).toEqual({ ok: true });
+  });
+
+  it('refuses a day carrying an S13 verdict as unknown and never reads its descriptor', () => {
+    const calls = { s13: 0 };
+    const withS13Getter = evidence(NOW, (root) => {
+      const record = (root.days as { day: string; verdicts: Record<string, unknown> }[])[0];
+      Object.defineProperty(record.verdicts, 'S13', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          calls.s13 += 1;
+          return 'pass';
+        },
+      });
+    });
+    expect(readCutoverShadowEvidence(withS13Getter, NOW)).toEqual(ALL_FAILED);
+    expect(calls.s13).toBe(0);
+    // A plain data `S13` entry is refused the same way: an unknown verdict key.
+    const withPlainS13 = evidence(NOW, (root) => {
+      (root.days as { day: string; verdicts: Record<string, unknown> }[])[0].verdicts.S13 = 'pass';
+    });
+    expect(readCutoverShadowEvidence(withPlainS13, NOW)).toEqual(ALL_FAILED);
+    // The fixture is live: read directly, the getter does answer.
+    void (withS13Getter as { days: { verdicts: Record<string, unknown> }[] }).days[0].verdicts.S13;
+    expect(calls.s13).toBe(1);
+  });
+
   it('refuses shadow evidence with fewer merges than the minimum, or an unusable merge count', () => {
     for (const merges of [CUTOVER_SHADOW_MIN_MERGES - 1, 0, -1, 1.5, '20', null, Number.NaN, Infinity]) {
       expect({ merges, verdict: readCutoverShadowEvidence(evidence(NOW, undefined, merges as number), NOW) }).toEqual({
@@ -469,12 +502,12 @@ describe('readCutoverShadowEvidence', () => {
     return root;
   }
 
-  it('refuses a recording Proxy for days after at most 4 trap calls and for verdicts after at most 15, and never fires a get trap', () => {
+  it('refuses a recording Proxy for days after at most 4 trap calls and for verdicts after at most 14, and never fires a get trap', () => {
     // The Proxy forwards every operation to valid data, so only the final serializer probe can
     // refuse it. Before that the walk may look at it through a constant number of traps fixed by
     // the permitted key lists: one prototype read, one key list and one descriptor read per
-    // permitted key (`length`, `0` for days; the thirteen criteria for verdicts).
-    const limits = { days: 4, verdicts: 15 } as const;
+    // permitted key (`length`, `0` for days; the twelve criteria for verdicts).
+    const limits = { days: 4, verdicts: 14 } as const;
     for (const position of ['days', 'verdicts'] as const) {
       const calls: string[] = [];
       const result = readCutoverShadowEvidence(standIn(position, (target) => recordingProxy(target, calls)), NOW);

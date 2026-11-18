@@ -1011,4 +1011,110 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       vi.useRealTimers();
     }
   });
+
+  // RC1: the early warning — `record-day` prints one warning line to stderr
+  // when the lane-run store holds more than 1,500 runs (`SHADOW_FACTS_WARN_RUNS`;
+  // the 2,000-run cap is deferred), read through the same SH19c read-only
+  // `conducted.facts.runs` reader. The warning never changes the JSON result on
+  // stdout, the exit code, or any file.
+  /** One valid stored lane-run record, in the exact `lane-runs.json` shape. */
+  function laneRunRecord(index: number): Record<string, unknown> {
+    return {
+      version: 1,
+      runId: `run-${String(index).padStart(26, '0')}`,
+      workOrderId: `wo-example-${index}`,
+      tier: 2,
+      seatPlanRef: 'a'.repeat(64),
+      cursors: { 'first-pass': null, fix: null, review: null },
+      round: 0,
+      attemptIds: [],
+      prNumber: null,
+      parked: null,
+      parkCount: 0,
+      lease: null,
+      revision: 1,
+      runPolicyRevision: `policy-example-${index}`,
+      schemaVersion: 1,
+    };
+  }
+
+  async function writeLaneRuns(stateDir: string, count: number): Promise<void> {
+    const records: Record<string, unknown>[] = [];
+    for (let index = 0; index < count; index += 1) {
+      records.push(laneRunRecord(index));
+    }
+    await fs.writeFile(path.join(stateDir, 'lane-runs.json'), JSON.stringify(records));
+  }
+
+  function recordDayWithRuns(count: number) {
+    return async () => {
+      const { stateDir, fixtureDir } = newDirs();
+      await shellFixture(fixtureDir);
+      await writeLaneRuns(stateDir, count);
+      const runtime = wiredRuntime(stateDir);
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+      try {
+        const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
+        return { result, stateDir };
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+  }
+
+  it('prints the warning to stderr above the threshold and leaves the result and exit code unchanged', async () => {
+    const { result } = await recordDayWithRuns(1501)();
+    expect(result.code).toBe(0);
+    const body = JSON.parse(result.out) as { outcome: string; unevaluated: unknown[] };
+    expect(body.outcome).toBe('recorded');
+    expect(result.err).toContain('1501');
+    expect(result.err).toContain('1500');
+    expect(result.err).toMatch(/^warning: lane-run store holds 1501 runs/);
+  });
+
+  it('prints no warning at the threshold', async () => {
+    const { result } = await recordDayWithRuns(1500)();
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out).outcome).toBe('recorded');
+    expect(result.err).toBe('');
+  });
+
+  it('prints no warning, and the outcome is the existing unknown, when the lane-run store is unreadable', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const bytes = '{ not json';
+    await fs.writeFile(path.join(stateDir, 'lane-runs.json'), bytes);
+    const runtime = wiredRuntime(stateDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day]));
+      expect(result.err).toBe('');
+      const body = JSON.parse(result.out) as { outcome: string; unevaluated: ReadonlyArray<{ criterion: string; reason: string }> };
+      expect(body.outcome).toBe('recorded');
+      const reasons = Object.fromEntries(body.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+      expect(reasons.S4).toBe('runs-unreadable');
+      expect(reasons.S6).toBe('runs-unreadable');
+      // Never quarantined: the corrupt bytes are exactly as they were, and the
+      // store was never quarantined into a sibling file either.
+      await expect(fs.readFile(path.join(stateDir, 'lane-runs.json'), 'utf8')).resolves.toBe(bytes);
+      expect(readdirSync(stateDir).filter((entry) => entry !== 'lane-runs.json' && entry !== 'cutover-shadow.json')).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+
+  it('exposes shadowRunsRead as the same instance conducted.facts.runs uses, and omits it when conducted is not wired', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    expect(runtime.execution.shadowRunsRead).toBe(recordDayDeps(runtime).conducted?.facts?.runs);
+    expect(readOnlyOf(runtime.execution.shadowRunsRead)).toBe(true);
+    expect(runtime.execution.shadowRunsRead).not.toBe(runtime.conductor.laneRunRepository);
+
+    const unwired = wiredRuntime(newDirs().stateDir, { mode: 'none' });
+    expect(unwired.execution.shadowRunsRead).toBeUndefined();
+  });
 });

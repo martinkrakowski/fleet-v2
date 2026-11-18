@@ -904,6 +904,15 @@ describe('readShadowConformanceRuns hostile input', () => {
     expect(deps.calls.runsList).toBe(0);
   });
 
+  it('refuses a negative index own key on the merged list (runs[-1]) with unknown/invalid-request', async () => {
+    const deps = makeDeps({});
+    const items: number[] = [PR];
+    Object.defineProperty(items, '-1', { enumerable: true, value: {} });
+    const result = await readShadowConformanceRuns(deps, request({ mergedPullRequests: items }));
+    expect(result).toEqual({ status: 'unknown', reason: 'invalid-request' });
+    expect(deps.calls.runsList).toBe(0);
+  });
+
   it('refuses a sparse array (a hole) with unknown/invalid-request', async () => {
     const sparse: number[] = [PR];
     sparse.length = 2;

@@ -79,6 +79,18 @@ function optionalIsoFlag(p: Payload, key: string, flag: string): string | undefi
   return value;
 }
 
+/**
+ * OD7a2: an optional boolean flag. Only `undefined` (absent) or the literal
+ * `true` (from `--scheduled` or `--scheduled true`) is accepted; every other
+ * value is a usage error.
+ */
+function optionalBooleanFlag(p: Payload, key: string, subcommand: string): boolean {
+  const value = p[key];
+  if (value === undefined) return false;
+  if (value === true || value === 'true') return true;
+  throw new CliUsageError(`${subcommand} --${key} accepts only true`);
+}
+
 /** A flag value as a number: a number as given, a string only when it matches `pattern`, else NaN. */
 function revisionFromFlagValue(value: unknown, pattern: RegExp): number {
   if (typeof value === 'number') return value;
@@ -136,23 +148,28 @@ function optionalDayFlag(p: Payload): string | undefined {
 
 /**
  * SH8a: `cutover shadow record-day`. The flags are the report's two plus an
- * optional `--day`; anything else is a usage error. Without a durable state
- * directory the composed use case is undefined and the command refuses with
- * `state-dir-required`; otherwise the use case's result is returned UNCHANGED
- * — `recorded` and `unchanged` complete (0), every other outcome exits 1.
+ * optional `--day` and OD7a2's optional `--scheduled`; anything else is a
+ * usage error. Without a durable state directory the composed use case is
+ * undefined and the command refuses with `state-dir-required`; otherwise the
+ * use case's result is returned UNCHANGED — `recorded` and `unchanged`
+ * complete (0), every other outcome exits 1, malformed flags are usage (2).
+ * OD7a2: a scheduled-mode guard hold (`skipped`) prints one stable line
+ * `record-day skipped <reason>` and exits 0 — nothing was written and the
+ * operator simply retries the next day.
  */
 async function recordShadowDayHandler(
   payload: Payload,
   runtime: CutoverRuntime,
   io?: CommandSideChannel,
 ): Promise<unknown> {
-  rejectUnexpectedInput(payload, 'shadow record-day', ['repository', 'legacyStateDir', 'day'], 1);
+  rejectUnexpectedInput(payload, 'shadow record-day', ['repository', 'legacyStateDir', 'day', 'scheduled'], 1);
   const repository = repositoryFromPayload(payload, 'record-day');
   const stateDir = str(payload, 'legacyStateDir').trim();
   if (stateDir === '') {
     throw new CliUsageError('cutover shadow record-day requires --legacy-state-dir');
   }
   const day = optionalDayFlag(payload);
+  const scheduled = optionalBooleanFlag(payload, 'scheduled', 'cutover shadow record-day');
   const recordShadowDay = runtime.execution.recordShadowDay;
   if (recordShadowDay === undefined) {
     return { outcome: 'refused', reason: 'state-dir-required' };
@@ -161,7 +178,12 @@ async function recordShadowDayHandler(
     repository,
     legacyStateDir: stateDir,
     ...(day === undefined ? {} : { day }),
+    ...(scheduled ? { scheduled: true } : {}),
   });
+  // OD7a2: a scheduled-mode guard hold prints one stable line and exits 0.
+  if (result.outcome === 'skipped') {
+    return { outcome: 'skipped', lines: [`record-day skipped ${result.reason}`] };
+  }
   // RC1: the early warning. Read through the same SH19c read-only runs reader
   // the composition exposed; an unreadable store is no warning, and the
   // result on stdout is returned unchanged — stderr only, never a file, never

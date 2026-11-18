@@ -33,6 +33,7 @@ import type { ShadowLedgerReadResult } from '../../ports/out/ShadowEvidencePort.
 import type { RecordShadowDayRequest, RecordShadowDayResult } from '../../ports/in/RecordShadowDayPort.in-port.js';
 import {
   RecordShadowDayUseCase,
+  evaluateShadowGrantCoverage,
   type RecordShadowDayDependencies,
 } from '../RecordShadowDayUseCase.use-case.js';
 
@@ -2328,7 +2329,7 @@ describe('RecordShadowDayUseCase', () => {
       await useCase.execute(makeRequest({ day: '2026-11-15' })),
     ];
     for (const result of outcomes) {
-      if (result.outcome === 'refused' || result.outcome === 'unknown') {
+      if (result.outcome === 'refused' || result.outcome === 'unknown' || result.outcome === 'skipped') {
         continue;
       }
       expectNotImplementedUnevaluated(result.unevaluated);
@@ -4152,5 +4153,380 @@ describe('RecordShadowDayUseCase', () => {
 
     await run(true);
     await run(false);
+  });
+});
+
+/**
+ * OD7a2: scheduled mode (`--scheduled`) and the pure grant-coverage
+ * evaluator. Scheduled mode fails closed BEFORE anything is written.
+ */
+describe('evaluateShadowGrantCoverage', () => {
+  const DAY_START = '2026-11-16T00:00:00.000Z';
+  const DAY_END = '2026-11-17T00:00:00.000Z';
+
+  /** A minimal stored `merge:import-shadow` request record covering the whole of `DAY`. */
+  function grantRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id: 'shadow-import-test',
+      state: 'approved',
+      decisionRevision: 'rev-3',
+      updatedAtIso: '2026-11-15T20:00:00.000Z',
+      shadowImportGrant: {
+        repository: { owner: OWNER, repo: REPO },
+        expiresAtIso: '2026-11-18T00:00:00.000Z',
+      },
+      ...overrides,
+    };
+  }
+
+  it('returns covered when approved before 00:00Z and expiring after the day end', () => {
+    expect(evaluateShadowGrantCoverage(grantRecord(), DAY_START, DAY_END)).toEqual({ outcome: 'covered' });
+  });
+
+  it('returns not-covering when updatedAtIso is 12:00Z', () => {
+    const evaluation = evaluateShadowGrantCoverage(
+      grantRecord({ updatedAtIso: '2026-11-16T12:00:00.000Z' }),
+      DAY_START,
+      DAY_END,
+    );
+    expect(evaluation.outcome).toBe('not-covering');
+  });
+
+  it('returns not-covering when expiresAtIso is 18:00Z', () => {
+    const evaluation = evaluateShadowGrantCoverage(
+      grantRecord({ shadowImportGrant: { repository: { owner: OWNER, repo: REPO }, expiresAtIso: '2026-11-16T18:00:00.000Z' } }),
+      DAY_START,
+      DAY_END,
+    );
+    expect(evaluation.outcome).toBe('not-covering');
+  });
+
+  it('returns not-covering when revoked or cancelled', () => {
+    for (const state of ['cancelled', 'declined', 'expired']) {
+      const evaluation = evaluateShadowGrantCoverage(grantRecord({ state }), DAY_START, DAY_END);
+      expect(evaluation).toEqual({ outcome: 'not-covering', reason: 'grant-not-approved' });
+    }
+  });
+
+  it('returns unavailable when fields are missing or malformed', () => {
+    expect(evaluateShadowGrantCoverage(null, DAY_START, DAY_END).outcome).toBe('unavailable');
+    expect(evaluateShadowGrantCoverage(undefined, DAY_START, DAY_END).outcome).toBe('unavailable');
+    expect(evaluateShadowGrantCoverage(7, DAY_START, DAY_END).outcome).toBe('unavailable');
+    expect(evaluateShadowGrantCoverage(grantRecord({ state: 7 }), DAY_START, DAY_END).outcome).toBe('unavailable');
+    expect(evaluateShadowGrantCoverage(grantRecord({ updatedAtIso: 'not-a-date' }), DAY_START, DAY_END).outcome).toBe('unavailable');
+    expect(
+      evaluateShadowGrantCoverage(
+        grantRecord({ shadowImportGrant: { repository: { owner: OWNER, repo: REPO }, expiresAtIso: 'nope' } }),
+        DAY_START,
+        DAY_END,
+      ).outcome,
+    ).toBe('unavailable');
+    expect(evaluateShadowGrantCoverage(grantRecord({ shadowImportGrant: undefined }), DAY_START, DAY_END).outcome).toBe('unavailable');
+    expect(evaluateShadowGrantCoverage(grantRecord(), 'not-a-date', DAY_END).outcome).toBe('unavailable');
+    expect(evaluateShadowGrantCoverage(grantRecord({ decisionRevision: 7 }), DAY_START, DAY_END).outcome).toBe('unavailable');
+  });
+
+  it('refuses a sparse array with a hole', () => {
+    // eslint-disable-next-line no-sparse-arrays
+    const sparse: unknown[] = [, ,];
+    expect(evaluateShadowGrantCoverage(sparse, DAY_START, DAY_END)).toEqual({ outcome: 'unavailable', reason: 'invalid-record' });
+  });
+
+  it('refuses an array-like object', () => {
+    const arrayLike = { length: 1, 0: grantRecord() };
+    expect(evaluateShadowGrantCoverage(arrayLike, DAY_START, DAY_END).outcome).toBe('unavailable');
+  });
+
+  it('refuses an enormous-length sparse array before any traversal', () => {
+    const enormous: unknown[] = new Array(2 ** 32 - 2);
+    enormous[0] = grantRecord();
+    expect(evaluateShadowGrantCoverage(enormous, DAY_START, DAY_END).outcome).toBe('unavailable');
+  });
+
+  it('never runs a getter on the root or on shadowImportGrant', () => {
+    let rootCalls = 0;
+    let grantCalls = 0;
+    const record = {
+      get state() {
+        rootCalls += 1;
+        return 'approved';
+      },
+      decisionRevision: 'rev-3',
+      updatedAtIso: '2026-11-15T20:00:00.000Z',
+      get shadowImportGrant() {
+        grantCalls += 1;
+        return { repository: { owner: OWNER, repo: REPO }, expiresAtIso: '2026-11-18T00:00:00.000Z' };
+      },
+    };
+    const evaluation = evaluateShadowGrantCoverage(record, DAY_START, DAY_END);
+    expect(evaluation.outcome).toBe('unavailable');
+    expect(rootCalls).toBe(0);
+    expect(grantCalls).toBe(0);
+  });
+
+  it('runs no get trap on a Proxy over a valid record and yields the plain data verdict', () => {
+    let getCalls = 0;
+    const valid = grantRecord();
+    const proxy = new Proxy(valid, {
+      get(target, key, receiver) {
+        getCalls += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const evaluation = evaluateShadowGrantCoverage(proxy, DAY_START, DAY_END);
+    expect(evaluation).toEqual({ outcome: 'covered' });
+    expect(getCalls).toBe(0);
+  });
+
+  it('refuses prototype-polluting own keys produced by JSON.parse', () => {
+    const polluted: unknown = JSON.parse(
+      JSON.stringify(grantRecord()).replace('"id":"shadow-import-test"', '"__proto__":{"polluted":true},"id":"shadow-import-test"'),
+    );
+    expect(evaluateShadowGrantCoverage(polluted, DAY_START, DAY_END).outcome).toBe('unavailable');
+  });
+
+  it('discriminates covering from non-covering records (a constant verdict would fail)', () => {
+    const before = evaluateShadowGrantCoverage(grantRecord(), DAY_START, DAY_END);
+    const after = evaluateShadowGrantCoverage(grantRecord({ updatedAtIso: '2026-11-16T12:00:00.000Z' }), DAY_START, DAY_END);
+    expect(before).toEqual({ outcome: 'covered' });
+    expect(after.outcome).toBe('not-covering');
+    expect(before).not.toEqual(after);
+  });
+
+  it('returns named reason codes, never an echo of the input (an identity function would fail)', () => {
+    const record = grantRecord({ state: 'declined' });
+    const evaluation = evaluateShadowGrantCoverage(record, DAY_START, DAY_END);
+    expect(evaluation).not.toBe(record as unknown);
+    expect(evaluation).toEqual({ outcome: 'not-covering', reason: 'grant-not-approved' });
+    expect(NAMED_COVERAGE_REASONS.has((evaluation as { reason: string }).reason)).toBe(true);
+  });
+});
+
+/** Every reason code `evaluateShadowGrantCoverage` may ever name. */
+const NAMED_COVERAGE_REASONS: ReadonlySet<string> = new Set([
+  'invalid-day-window',
+  'invalid-record',
+  'invalid-state',
+  'grant-not-approved',
+  'decision-revision-missing',
+  'invalid-decision-revision',
+  'updated-at-unparseable',
+  'approved-after-day-start',
+  'shadow-grant-missing',
+  'expires-at-unparseable',
+  'expires-at-or-before-day-end',
+  'invalid-input',
+]);
+
+/** A clean fixture whose daemon `job` ticks all start at 14:00Z (an arming day). */
+function afternoonFixture(day: string): Fixture {
+  const fixture = cleanFixture(day);
+  (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = fixture.daemonEvents.map((event, index) => ({
+    ...event,
+    recordedAtIso: `${day}T${String(14 + Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}:00Z`,
+  }));
+  return fixture;
+}
+
+/** A scheduled harness: the given fixture plus a `shadowGrantCoverage` reader. */
+function scheduledHarness(
+  fixture: Fixture,
+  coverage: (input: { day: string; repository: { owner: string; repo: string } }) => Promise<
+    | { outcome: 'covered' }
+    | { outcome: 'not-covering'; reason?: string }
+    | { outcome: 'unavailable'; reason?: string }
+  > = async () => ({ outcome: 'covered' }),
+): Harness {
+  const harness = makeHarness(fixture, NOW);
+  const deps: RecordShadowDayDependencies = { ...harness.deps, shadowGrantCoverage: coverage };
+  return { ...harness, deps };
+}
+
+/** Asserts a scheduled-mode guard hold: the typed skip and that nothing was written. */
+function expectSkippedWithoutWrite(result: RecordShadowDayResult, reason: string): void {
+  expect(result).toEqual({ outcome: 'skipped', reason });
+}
+
+describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
+  const ARMING_DAY = '2026-11-15';
+
+  it('scheduled mode skips arming day with first job tick at 14:00Z without writing and records next full day', async () => {
+    const harness = scheduledHarness(afternoonFixture(ARMING_DAY));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(
+      makeRequest({ day: ARMING_DAY, scheduled: true }),
+    );
+    expectSkippedWithoutWrite(result, 'partial-day');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+
+    // The next full day records normally under the same scheduled mode.
+    const nextHarness = scheduledHarness(cleanFixture(DAY));
+    const next = await new RecordShadowDayUseCase(nextHarness.deps).execute(makeRequest({ scheduled: true }));
+    expectRecorded(next);
+    expect(nextHarness.evidence.stored?.days.find((entry) => entry.day === DAY)).toBeDefined();
+  });
+
+  it('scheduled mode ignores status-only early events', async () => {
+    const fixture = afternoonFixture(DAY);
+    const statusEvent: DaemonEventRecord = {
+      ...daemonJobEvent(0, DAY),
+      kind: 'status',
+      jobId: 'status:probe',
+      recordedAtIso: `${DAY}T00:05:00.000Z`,
+    };
+    (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [statusEvent, ...fixture.daemonEvents];
+    const harness = scheduledHarness(fixture);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(result, 'partial-day');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('scheduled mode skips partial-day ticks without writing and records next full day', async () => {
+    const fixture = cleanFixture(DAY);
+    (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [daemonJobEvent(0, DAY), daemonJobEvent(1, DAY)];
+    const harness = scheduledHarness(fixture);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(result, 'too-few-ticks');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+
+    const nextHarness = scheduledHarness(cleanFixture(DAY));
+    const next = await new RecordShadowDayUseCase(nextHarness.deps).execute(makeRequest({ scheduled: true }));
+    expectRecorded(next);
+  });
+
+  it('scheduled mode skips when grant approved mid-day', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY), async () => ({
+      outcome: 'not-covering' as const,
+      reason: 'approved-after-day-start',
+    }));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(result, 'grant-not-covering-day');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+    // The grant guard runs before the daemon events are even read.
+    expect(harness.otherCalls.daemon).toBe(0);
+  });
+
+  it('scheduled mode skips when grant expires mid-day', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY), async () => ({
+      outcome: 'not-covering' as const,
+      reason: 'expires-at-or-before-day-end',
+    }));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(result, 'grant-not-covering-day');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('scheduled mode skips when grant is revoked', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY), async () => ({
+      outcome: 'not-covering' as const,
+      reason: 'grant-not-approved',
+    }));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(result, 'grant-not-covering-day');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('scheduled mode skips when grant is undeterminable', async () => {
+    // (a) the coverage reader is not wired at all.
+    const absent = makeHarness(cleanFixture(DAY), NOW);
+    const absentResult = await new RecordShadowDayUseCase(absent.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(absentResult, 'grant-unavailable');
+    expect(absent.evidence.calls.cas).toBe(0);
+    // (b) the reader reports `unavailable`.
+    const unavailable = scheduledHarness(cleanFixture(DAY), async () => ({ outcome: 'unavailable' as const }));
+    const unavailableResult = await new RecordShadowDayUseCase(unavailable.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(unavailableResult, 'grant-unavailable');
+    expect(unavailable.evidence.calls.cas).toBe(0);
+    // (c) the reader throws.
+    const threw = scheduledHarness(cleanFixture(DAY), async () => {
+      throw new Error('coordination store down');
+    });
+    const threwResult = await new RecordShadowDayUseCase(threw.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(threwResult, 'grant-unavailable');
+    expect(threw.evidence.calls.cas).toBe(0);
+  });
+
+  it('scheduled mode fails closed with unknown when daemon events are unreadable', async () => {
+    for (const mode of ['throws', 'not-ok'] as const) {
+      const harness = scheduledHarness(cleanFixture(DAY));
+      const projection = harness.deps.daemonEvents as {
+        readAfterCursor: () => Promise<unknown>;
+      };
+      projection.readAfterCursor =
+        mode === 'throws'
+          ? async () => {
+              throw new Error('projection unreadable');
+            }
+          : async () => ({ ok: false as const, reason: 'invalid-cursor' as const });
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+      expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-unavailable' });
+      expect(harness.evidence.calls.cas).toBe(0);
+      expect(harness.evidence.stored).toBeNull();
+    }
+  });
+
+  it('scheduled mode fails closed with unknown when S12 evaluates unknown', async () => {
+    const fixture = cleanFixture(DAY);
+    // An event carrying an extra key fails the exact-keys record read, so S12
+    // evaluates `unknown` while the first-tick guard (a valid 00:00Z job tick)
+    // still passes.
+    const malformed = { ...daemonJobEvent(0, DAY), extra: 1 } as unknown as DaemonEventRecord;
+    (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [malformed, ...fixture.daemonEvents];
+    const harness = scheduledHarness(fixture);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 's12-unknown' });
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('refuses non-boolean scheduled', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(
+      makeRequest({ scheduled: 'true' as unknown as boolean }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(harness.evidence.calls.cas).toBe(0);
+  });
+
+  it('refuses a throwing scheduled getter without running the run', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY));
+    const request = {
+      repository: REPOSITORY,
+      legacyStateDir: LEGACY_STATE_DIR,
+      day: DAY,
+      get scheduled(): boolean {
+        throw new Error('hostile getter');
+      },
+    } as unknown as RecordShadowDayRequest;
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(harness.evidence.calls.cas).toBe(0);
+  });
+
+  it('accepts a Proxy over a valid scheduled request and records normally', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY));
+    const proxied = new Proxy(makeRequest({ scheduled: true }), {});
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(proxied);
+    expectRecorded(result);
+  });
+
+  it('returns deadline-exceeded when the deadline is reached during the scheduled tick-health precheck', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY), async (input) => {
+      void input;
+      // The grant read advances the fake clock past the deadline; the very
+      // next precheck port call (the daemon-events read for S12) must then
+      // abort the run with `deadline-exceeded`, never a skip or a write.
+      harness.setNow(DEADLINE);
+      return { outcome: 'covered' as const };
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
   });
 });

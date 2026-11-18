@@ -17,6 +17,8 @@ import {
   DAEMON_TIMER_UNIT_KEY,
   SHADOW_INTAKE_SERVICE_UNIT_KEY,
   SHADOW_INTAKE_TIMER_UNIT_KEY,
+  SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+  SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
 } from '../../application/ports/out/DaemonSchedulerPort.out-port.js';
 import { SystemdUserSchedulerAdapter } from './SystemdUserSchedulerAdapter.adapter.js';
 
@@ -78,6 +80,7 @@ describe('SystemdUserSchedulerAdapter', () => {
       service: 'absent',
       timer: 'absent',
       shadowIntake: { service: 'absent', timer: 'absent' },
+      shadowRecordDay: { service: 'absent', timer: 'absent' },
     });
     expect(existsSync(path.join(dir, DAEMON_SERVICE_UNIT_KEY))).toBe(false);
     expect(existsSync(path.join(dir, DAEMON_TIMER_UNIT_KEY))).toBe(false);
@@ -91,6 +94,7 @@ describe('SystemdUserSchedulerAdapter', () => {
       service: 'absent',
       timer: 'absent',
       shadowIntake: { service: 'absent', timer: 'absent' },
+      shadowRecordDay: { service: 'absent', timer: 'absent' },
     });
   });
 
@@ -110,6 +114,7 @@ describe('SystemdUserSchedulerAdapter', () => {
       service: 'unreadable',
       timer: 'absent',
       shadowIntake: { service: 'absent', timer: 'absent' },
+      shadowRecordDay: { service: 'absent', timer: 'absent' },
     });
     expect(readFileSync(outside, 'utf8')).toBe('outside-content');
   });
@@ -183,8 +188,43 @@ describe('SystemdUserSchedulerAdapter', () => {
       service: 'unreadable',
       timer: 'unreadable',
       shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+      shadowRecordDay: { service: 'unreadable', timer: 'unreadable' },
     });
     expect(existsSync(missing)).toBe(false);
+  });
+
+  it('returns unreadable for all 6 units when unitDir is missing or a symlink (OD7a2)', async () => {
+    const dir = makeTempDir();
+    const missing = path.join(dir, 'missing-units');
+    const adapter = new SystemdUserSchedulerAdapter({ unitDir: missing });
+    const allPairs = {
+      service: SERVICE_TEXT,
+      timer: TIMER_TEXT,
+      shadowIntake: { service: SHADOW_SERVICE_TEXT, timer: SHADOW_TIMER_TEXT },
+      shadowRecordDay: { service: SHADOW_SERVICE_TEXT, timer: SHADOW_TIMER_TEXT },
+    };
+    await expect(adapter.write(allPairs)).resolves.toEqual({
+      service: 'unreadable',
+      timer: 'unreadable',
+      shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+      shadowRecordDay: { service: 'unreadable', timer: 'unreadable' },
+    });
+    await expect(adapter.read(allPairs)).resolves.toEqual({
+      service: 'unreadable',
+      timer: 'unreadable',
+      shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+      shadowRecordDay: { service: 'unreadable', timer: 'unreadable' },
+    });
+    // A symlinked unitDir is equally unusable.
+    const symlinked = path.join(dir, 'symlinked-units');
+    symlinkSync(missing, symlinked);
+    const symlinkAdapter = new SystemdUserSchedulerAdapter({ unitDir: symlinked });
+    await expect(symlinkAdapter.remove()).resolves.toEqual({
+      service: 'unreadable',
+      timer: 'unreadable',
+      shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+      shadowRecordDay: { service: 'unreadable', timer: 'unreadable' },
+    });
   });
 
   it('shadow intake units (OD7a1) write, read back and remove with the daemon units', async () => {
@@ -218,6 +258,7 @@ describe('SystemdUserSchedulerAdapter', () => {
       service: 'absent',
       timer: 'absent',
       shadowIntake: { service: 'absent', timer: 'absent' },
+      shadowRecordDay: { service: 'absent', timer: 'absent' },
     });
     expect(existsSync(path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY))).toBe(false);
     expect(existsSync(path.join(dir, SHADOW_INTAKE_TIMER_UNIT_KEY))).toBe(false);
@@ -270,6 +311,7 @@ describe('SystemdUserSchedulerAdapter', () => {
       service: 'absent',
       timer: 'absent',
       shadowIntake: { service: 'unreadable', timer: 'absent' },
+      shadowRecordDay: { service: 'absent', timer: 'absent' },
     });
     expect(readFileSync(outside, 'utf8')).toBe('outside-content');
   });
@@ -292,8 +334,32 @@ describe('SystemdUserSchedulerAdapter', () => {
       service: 'absent',
       timer: 'absent',
       shadowIntake: { service: 'absent', timer: 'absent' },
+      shadowRecordDay: { service: 'absent', timer: 'absent' },
     });
     expect(existsSync(path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY))).toBe(false);
     expect(existsSync(path.join(dir, SHADOW_INTAKE_TIMER_UNIT_KEY))).toBe(false);
+  });
+
+  it('remove clears the record-day units too, even when shadow is off (OD7a2)', async () => {
+    const dir = makeTempDir();
+    const adapter = new SystemdUserSchedulerAdapter({ unitDir: dir });
+    writeFileSync(
+      path.join(dir, SHADOW_RECORD_DAY_SERVICE_UNIT_KEY),
+      SHADOW_SERVICE_TEXT,
+      'utf8',
+    );
+    writeFileSync(
+      path.join(dir, SHADOW_RECORD_DAY_TIMER_UNIT_KEY),
+      SHADOW_TIMER_TEXT,
+      'utf8',
+    );
+    await expect(adapter.remove()).resolves.toEqual({
+      service: 'absent',
+      timer: 'absent',
+      shadowIntake: { service: 'absent', timer: 'absent' },
+      shadowRecordDay: { service: 'absent', timer: 'absent' },
+    });
+    expect(existsSync(path.join(dir, SHADOW_RECORD_DAY_SERVICE_UNIT_KEY))).toBe(false);
+    expect(existsSync(path.join(dir, SHADOW_RECORD_DAY_TIMER_UNIT_KEY))).toBe(false);
   });
 });

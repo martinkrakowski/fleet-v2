@@ -17,6 +17,8 @@ import {
   DAEMON_TIMER_UNIT_KEY,
   SHADOW_INTAKE_SERVICE_UNIT_KEY,
   SHADOW_INTAKE_TIMER_UNIT_KEY,
+  SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+  SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
 } from '../../application/ports/out/DaemonSchedulerPort.out-port.js';
 import type {
   DaemonSchedulerPort,
@@ -38,13 +40,7 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
 
   async read(input: DaemonSchedulerRendered): Promise<DaemonSchedulerReadResult> {
     if (!(await isUsableUnitDir(this.options.unitDir))) {
-      return input.shadowIntake === undefined
-        ? { service: 'unreadable', timer: 'unreadable' }
-        : {
-            service: 'unreadable',
-            timer: 'unreadable',
-            shadowIntake: { service: 'unreadable', timer: 'unreadable' },
-          };
+      return unreadableAll(input);
     }
     const service = await readUnit(
       this.options.unitDir,
@@ -69,18 +65,30 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
       SHADOW_INTAKE_TIMER_UNIT_KEY,
       input.shadowIntake.timer,
     );
-    return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
+    if (input.shadowRecordDay === undefined) {
+      return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
+    }
+    const recordDayService = await readUnit(
+      this.options.unitDir,
+      SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+      input.shadowRecordDay.service,
+    );
+    const recordDayTimer = await readUnit(
+      this.options.unitDir,
+      SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
+      input.shadowRecordDay.timer,
+    );
+    return {
+      service,
+      timer,
+      shadowIntake: { service: shadowService, timer: shadowTimer },
+      shadowRecordDay: { service: recordDayService, timer: recordDayTimer },
+    };
   }
 
   async write(input: DaemonSchedulerRendered): Promise<DaemonSchedulerWriteResult> {
     if (!(await isUsableUnitDir(this.options.unitDir))) {
-      return input.shadowIntake === undefined
-        ? { service: 'unreadable', timer: 'unreadable' }
-        : {
-            service: 'unreadable',
-            timer: 'unreadable',
-            shadowIntake: { service: 'unreadable', timer: 'unreadable' },
-          };
+      return unreadableAll(input);
     }
     const service = await writeUnit(
       this.options.unitDir,
@@ -105,7 +113,25 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
       SHADOW_INTAKE_TIMER_UNIT_KEY,
       input.shadowIntake.timer,
     );
-    return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
+    if (input.shadowRecordDay === undefined) {
+      return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
+    }
+    const recordDayService = await writeUnit(
+      this.options.unitDir,
+      SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+      input.shadowRecordDay.service,
+    );
+    const recordDayTimer = await writeUnit(
+      this.options.unitDir,
+      SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
+      input.shadowRecordDay.timer,
+    );
+    return {
+      service,
+      timer,
+      shadowIntake: { service: shadowService, timer: shadowTimer },
+      shadowRecordDay: { service: recordDayService, timer: recordDayTimer },
+    };
   }
 
   async remove(): Promise<DaemonSchedulerRemoveResult> {
@@ -114,6 +140,7 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
         service: 'unreadable',
         timer: 'unreadable',
         shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+        shadowRecordDay: { service: 'unreadable', timer: 'unreadable' },
       };
     }
     const service = await removeUnit(
@@ -134,8 +161,42 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
       this.options.unitDir,
       SHADOW_INTAKE_TIMER_UNIT_KEY,
     );
-    return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
+    // OD7a2: the record-day units are removed with the rest, even when shadow
+    // was already toggled off in config.
+    const recordDayService = await removeUnit(
+      this.options.unitDir,
+      SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+    );
+    const recordDayTimer = await removeUnit(
+      this.options.unitDir,
+      SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
+    );
+    return {
+      service,
+      timer,
+      shadowIntake: { service: shadowService, timer: shadowTimer },
+      shadowRecordDay: { service: recordDayService, timer: recordDayTimer },
+    };
   }
+}
+
+/** The all-unreadable result shaped by the rendered input's own pairs (OD7a2). */
+function unreadableAll(input: DaemonSchedulerRendered): {
+  readonly service: 'unreadable';
+  readonly timer: 'unreadable';
+  readonly shadowIntake?: { readonly service: 'unreadable'; readonly timer: 'unreadable' };
+  readonly shadowRecordDay?: { readonly service: 'unreadable'; readonly timer: 'unreadable' };
+} {
+  return {
+    service: 'unreadable',
+    timer: 'unreadable',
+    ...(input.shadowIntake === undefined
+      ? {}
+      : { shadowIntake: { service: 'unreadable', timer: 'unreadable' } }),
+    ...(input.shadowRecordDay === undefined
+      ? {}
+      : { shadowRecordDay: { service: 'unreadable', timer: 'unreadable' } }),
+  };
 }
 
 function isENOENT(error: unknown): boolean {

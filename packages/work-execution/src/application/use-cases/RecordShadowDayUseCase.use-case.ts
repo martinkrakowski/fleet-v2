@@ -109,6 +109,179 @@ const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const DEFAULT_SAMPLE_GAP_MS = 150_000;
 
 /**
+ * OD7a2: the scheduled-mode first-tick grace. In scheduled mode the day's
+ * earliest in-day `job` event must fall at or before `00:15:00.000Z` —
+ * the `fleet-v2-daemon.timer` fires every minute from `00:00Z`, so a day
+ * whose first `job` tick lands later than this was not ticked for the whole
+ * day (an arming day, or a day the daemon was down for its start).
+ */
+export const SHADOW_FIRST_TICK_GRACE_MS = 900_000;
+
+/**
+ * OD7a2: cap on the own keys read from one grant-coverage record or its
+ * nested `shadowImportGrant` object; the pure evaluator's cost is O(1),
+ * bounded by this and `SHADOW_GRANT_MAX_STRING_LENGTH`.
+ */
+export const SHADOW_GRANT_MAX_RECORD_KEYS = 24;
+/** OD7a2: cap on one grant-coverage string's length before parsing. */
+export const SHADOW_GRANT_MAX_STRING_LENGTH = 256;
+
+/** The own keys a grant-coverage record never carries (prototype pollution). */
+const SHADOW_GRANT_PROTOTYPE_KEYS: ReadonlySet<string> = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
+
+/** The typed verdict of the pure grant-coverage evaluation (OD7a2). */
+export type ShadowGrantCoverageEvaluation =
+  | { readonly outcome: 'covered' }
+  | { readonly outcome: 'not-covering'; readonly reason: string }
+  | { readonly outcome: 'unavailable'; readonly reason: string };
+
+/**
+ * OD7a2, pure: whether one stored `merge:import-shadow` grant covered the
+ * whole UTC day `[dayStartIso, dayEndIso)`. Hostile-input-safe by contract:
+ * `record` is read through own data-property descriptors only — a getter or
+ * a Proxy `get` trap never runs — and `null`, primitives, arrays, sparse
+ * arrays, array-likes and prototype-polluting own keys are refused as
+ * `unavailable`. Cost: O(1), bounded by `SHADOW_GRANT_MAX_RECORD_KEYS` own
+ * keys per object and `SHADOW_GRANT_MAX_STRING_LENGTH` code units per string,
+ * each read once; never throws and never echoes an input value (`reason` is
+ * always a named code).
+ *
+ * The coverage rules (fail closed):
+ * - Approval: `state === 'approved'` with a non-null `decisionRevision` and a
+ *   parseable `updatedAtIso` at or before `dayStartIso`. `updatedAtIso` is the
+ *   strongest approval-time evidence on `main` and is stamped at or after the
+ *   true approval, so an approval recorded after `00:00Z` cannot prove the
+ *   grant covered the day's start. Any other state — `cancelled`, `declined`,
+ *   `expired`, `pending` — proves nothing and is `not-covering`.
+ * - Expiry: the nested `shadowImportGrant.expiresAtIso` must parse and be
+ *   strictly after `dayEndIso`.
+ * Every missing or unparseable input is `unavailable`, never a pass.
+ */
+export function evaluateShadowGrantCoverage(
+  record: unknown,
+  dayStartIso: string,
+  dayEndIso: string,
+): ShadowGrantCoverageEvaluation {
+  try {
+    return judgeShadowGrantCoverage(record, dayStartIso, dayEndIso);
+  } catch {
+    // A revoked Proxy can make even descriptor reads throw; the never-throws
+    // contract turns that into a typed refusal.
+    return { outcome: 'unavailable', reason: 'invalid-input' };
+  }
+}
+
+function judgeShadowGrantCoverage(
+  record: unknown,
+  dayStartIso: string,
+  dayEndIso: string,
+): ShadowGrantCoverageEvaluation {
+  const dayStartMs = parseBoundedIsoMs(dayStartIso);
+  const dayEndMs = parseBoundedIsoMs(dayEndIso);
+  if (dayStartMs === null || dayEndMs === null) {
+    return { outcome: 'unavailable', reason: 'invalid-day-window' };
+  }
+  const snapshot = readPlainDataSnapshot(record);
+  if (snapshot === null) {
+    return { outcome: 'unavailable', reason: 'invalid-record' };
+  }
+  const state = readBoundedDataString(snapshot['state']);
+  if (state === null) {
+    return { outcome: 'unavailable', reason: 'invalid-state' };
+  }
+  if (state !== 'approved') {
+    // Any non-approved state (including `cancelled` — a revocation overwrites
+    // `updatedAtIso`, so it can never prove coverage) fails closed.
+    return { outcome: 'not-covering', reason: 'grant-not-approved' };
+  }
+  const decisionRevision = snapshot['decisionRevision'];
+  if (decisionRevision === null) {
+    return { outcome: 'not-covering', reason: 'decision-revision-missing' };
+  }
+  if (readBoundedDataString(decisionRevision) === null) {
+    return { outcome: 'unavailable', reason: 'invalid-decision-revision' };
+  }
+  const updatedAtMs = parseBoundedIsoMs(readBoundedDataString(snapshot['updatedAtIso']));
+  if (updatedAtMs === null) {
+    return { outcome: 'unavailable', reason: 'updated-at-unparseable' };
+  }
+  if (updatedAtMs > dayStartMs) {
+    return { outcome: 'not-covering', reason: 'approved-after-day-start' };
+  }
+  const grant = readPlainDataSnapshot(snapshot['shadowImportGrant']);
+  if (grant === null) {
+    return { outcome: 'unavailable', reason: 'shadow-grant-missing' };
+  }
+  const expiresAtMs = parseBoundedIsoMs(readBoundedDataString(grant['expiresAtIso']));
+  if (expiresAtMs === null) {
+    return { outcome: 'unavailable', reason: 'expires-at-unparseable' };
+  }
+  if (expiresAtMs <= dayEndMs) {
+    return { outcome: 'not-covering', reason: 'expires-at-or-before-day-end' };
+  }
+  return { outcome: 'covered' };
+}
+
+/**
+ * A plain-data snapshot of `input`: null, primitives, functions, arrays and
+ * objects with more than `SHADOW_GRANT_MAX_RECORD_KEYS` own keys are refused,
+ * prototype-polluting own keys are refused, and every own property is read
+ * through its descriptor (accessors are refused, so no getter and no Proxy
+ * `get` trap ever runs). The snapshot is a null-prototype record of the
+ * descriptor values.
+ */
+function readPlainDataSnapshot(input: unknown): Record<string, unknown> | null {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    return null;
+  }
+  const names = Object.keys(input);
+  if (names.length > SHADOW_GRANT_MAX_RECORD_KEYS) {
+    return null;
+  }
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const name of names) {
+    if (SHADOW_GRANT_PROTOTYPE_KEYS.has(name)) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(input, name);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return null;
+    }
+    snapshot[name] = descriptor.value;
+  }
+  return snapshot;
+}
+
+/** A bounded plain string value, or null (wrong type or overlong). */
+function readBoundedDataString(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > SHADOW_GRANT_MAX_STRING_LENGTH) {
+    return null;
+  }
+  return value;
+}
+
+/** A bounded string parsed as an ISO instant, or null. */
+function parseBoundedIsoMs(value: unknown): number | null {
+  const text = readBoundedDataString(value);
+  if (text === null) {
+    return null;
+  }
+  const ms = Date.parse(text);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** A skipped result: a scheduled-mode guard held, nothing was written. */
+function skippedResult(
+  reason: 'partial-day' | 'too-few-ticks' | 'grant-unavailable' | 'grant-not-covering-day',
+): RecordShadowDayResult {
+  return { outcome: 'skipped', reason };
+}
+
+/**
  * SH24b: the `would-*` actions whose journaled `dry-run` result — with
  * `reasonCode` equal to the action itself — makes the keyed queue entry stop
  * being shadow-effectively live for S1/S8. Under `policy.shadow === true`
@@ -184,6 +357,23 @@ export interface RecordShadowDayDependencies {
     readonly releaseStore: Pick<ReleaseStorePort, 'inspectReleaseFiles'>;
     readonly releaseRoot: string;
   };
+  /**
+   * OD7a2: the standing `merge:import-shadow` grant's day-coverage reader,
+   * used only in scheduled mode (`--scheduled`). It resolves the grant named
+   * by the installation's `daemon.shadow.grantId` through the existing
+   * authorization path, fetches the stored request record and evaluates it
+   * with the pure `evaluateShadowGrantCoverage`. Optional until composition
+   * wires it; in scheduled mode an absent reader is `grant-unavailable`
+   * (fail closed), never a pass.
+   */
+  readonly shadowGrantCoverage?: (input: {
+    readonly day: string;
+    readonly repository: { readonly owner: string; readonly repo: string };
+  }) => Promise<
+    | { readonly outcome: 'covered' }
+    | { readonly outcome: 'not-covering'; readonly reason?: string }
+    | { readonly outcome: 'unavailable'; readonly reason?: string }
+  >;
 }
 
 /** Thrown by `call` when the deadline is already reached; aborts the whole run. */
@@ -598,6 +788,25 @@ function serialOfUtcDay(day: string): number {
   return Math.floor(Date.parse(`${day}T00:00:00.000Z`) / DAY_MS);
 }
 
+/**
+ * OD7a2: the scheduled flag read at the boundary. A throwing accessor or an
+ * unreadable Proxy stand-in is `'invalid'` (fail closed), and only `undefined`
+ * (manual mode) or a real boolean is accepted. The read itself is guarded, so
+ * a hostile `scheduled` getter can never throw out of the use case.
+ */
+function readScheduledFlag(request: RecordShadowDayRequest): boolean | 'invalid' {
+  let value: unknown;
+  try {
+    value = request.scheduled;
+  } catch {
+    return 'invalid';
+  }
+  if (value === undefined) {
+    return false;
+  }
+  return typeof value === 'boolean' ? value : 'invalid';
+}
+
 export class RecordShadowDayUseCase implements RecordShadowDayPort {
   constructor(private readonly deps: RecordShadowDayDependencies) {}
 
@@ -624,6 +833,12 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       repoDigest: this.deps.repoDigestOf(request.repository),
       deadlineIso: request.deadlineIso,
     };
+    // OD7a2: in scheduled mode every guard runs BEFORE the ledger/shell reads
+    // and before any other criterion, and a held guard writes nothing.
+    const scheduled = readScheduledFlag(request) === true ? await this.runScheduledPrechecks(context) : null;
+    if (scheduled !== null && scheduled.stop !== null) {
+      return scheduled.stop;
+    }
     const ledger = await this.readLedger(context.deadlineIso);
     if (ledger.kind === 'stop') {
       return ledger.result;
@@ -646,7 +861,9 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       mergeSet,
       intake.outcome,
       await this.evaluateStateIntegrityCriterion(context, journal),
-      await this.evaluateTickHealthCriterion(context),
+      // OD7a2: in scheduled mode the already-evaluated S12 outcome is reused
+      // rather than re-reading the daemon events.
+      scheduled?.tickHealth ?? (await this.evaluateTickHealthCriterion(context)),
       await this.evaluateGateAgreementCriterion(context),
       await this.evaluateConformanceCriterion(context, shellFacts),
       await this.evaluateChainsRetiredCriterion(context, intake.chains),
@@ -655,6 +872,74 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     ];
     const built = this.buildVerdicts(context, outcomes);
     return this.writeDay(context, ledger.ledger, releaseSha, built);
+  }
+
+  /**
+   * OD7a2, scheduled mode: the fail-closed prechecks that run before anything
+   * is written. A held guard returns the typed `stop` result (nothing has
+   * been written at that point); otherwise the already-evaluated S12 outcome
+   * is carried out so `run` never reads the daemon events twice.
+   */
+  private async runScheduledPrechecks(
+    context: DayContext,
+  ): Promise<{
+    readonly stop: RecordShadowDayResult | null;
+    readonly tickHealth?: CriterionOutcome;
+  }> {
+    // 1. Grant-coverage guard: the standing grant must cover the whole day.
+    const coverage = this.deps.shadowGrantCoverage;
+    if (coverage === undefined) {
+      return { stop: skippedResult('grant-unavailable') };
+    }
+    const grant = await this.call(context.deadlineIso, () =>
+      coverage({ day: context.day, repository: context.repository }),
+    );
+    if (grant.kind === 'threw' || grant.value.outcome === 'unavailable') {
+      return { stop: skippedResult('grant-unavailable') };
+    }
+    if (grant.value.outcome === 'not-covering') {
+      return { stop: skippedResult('grant-not-covering-day') };
+    }
+    // 2. Events read and first-tick `job` guard: only `job` events count, and
+    // the earliest in-day one must fall within the first-tick grace window.
+    const read = await this.call(context.deadlineIso, () => this.deps.daemonEvents.readAfterCursor(null));
+    if (read.kind === 'threw' || !read.value.ok) {
+      return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
+    }
+    const events = read.value.events;
+    const dayStartMs = serialOfUtcDay(context.day) * DAY_MS;
+    let earliestInDayMs: number | null = null;
+    for (const event of events) {
+      if (event.kind !== 'job') {
+        continue;
+      }
+      const recordedAtIso = event.recordedAtIso;
+      if (typeof recordedAtIso !== 'string' || recordedAtIso.slice(0, 10) !== context.day) {
+        continue;
+      }
+      const instant = Date.parse(recordedAtIso);
+      if (Number.isNaN(instant)) {
+        continue;
+      }
+      if (earliestInDayMs === null || instant < earliestInDayMs) {
+        earliestInDayMs = instant;
+      }
+    }
+    if (earliestInDayMs === null || earliestInDayMs > dayStartMs + SHADOW_FIRST_TICK_GRACE_MS) {
+      return { stop: skippedResult('partial-day') };
+    }
+    // 3. S12 precheck over the windowed events: an unknown evaluation and a
+    // `too-few-ticks` failure each stop the run before anything is written.
+    const windowed = events.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
+    const evaluation = evaluateShadowTickHealth({ day: context.day, events: windowed });
+    const tickHealth: CriterionOutcome = { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
+    if (evaluation.status === 'unknown') {
+      return { stop: { outcome: 'unknown', reason: 's12-unknown' }, tickHealth };
+    }
+    if (evaluation.status === 'fail' && evaluation.reason === 'too-few-ticks') {
+      return { stop: skippedResult('too-few-ticks'), tickHealth };
+    }
+    return { stop: null, tickHealth };
   }
 
   /** True once `deadlineIso` is reached; an unusable clock counts as reached (fail closed). */
@@ -699,6 +984,9 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
 
   /** The day resolution: the day to record, or the refusal reason. */
   private resolveDay(request: RecordShadowDayRequest): { readonly ok: true; readonly day: string } | { readonly ok: false; readonly reason: 'invalid-request' | 'too-early' | 'too-old' } {
+    if (readScheduledFlag(request) === 'invalid') {
+      return { ok: false, reason: 'invalid-request' };
+    }
     if (!isValidRepositoryRef(request.repository)) {
       return { ok: false, reason: 'invalid-request' };
     }

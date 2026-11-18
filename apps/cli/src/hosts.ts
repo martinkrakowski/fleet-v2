@@ -1969,6 +1969,8 @@ async function daemonCommand(
   if (result.intakeUnreadable === true) {
     // Fable fix round 2: the intake pair's codes are not printed when shadow
     // is off, so an unreadable intake removal is reported here instead.
+    // OD7a2: the record-day pair shares this flag — the port removes it even
+    // when shadow is off, and an unreadable removal must surface the same way.
     out.stderr("installation.daemon.shadow: shadow-intake-unreadable\n");
   }
   for (const unit of result.units) {

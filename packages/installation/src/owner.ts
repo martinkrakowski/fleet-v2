@@ -178,6 +178,14 @@ function readOwnerSectionStrict(value: unknown): OwnerSectionResult {
   if (!isPlainRecord(value)) {
     return { ok: false, code: 'owner-section-invalid' };
   }
+  // Reject the array-like signature (an own numeric `length`) before any
+  // key enumeration, so array-likes and sparse shapes are refused as
+  // `owner-section-invalid` without traversing their keys. The read is
+  // through the own data-property descriptor only: no getter can run.
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (lengthDescriptor !== undefined && typeof lengthDescriptor.value === 'number') {
+    return { ok: false, code: 'owner-section-invalid' };
+  }
   const entries = ownDataEntries(value);
   for (const entry of entries) {
     if (PROTOTYPE_KEYS.includes(entry.key)) {

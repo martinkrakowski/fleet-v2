@@ -147,7 +147,9 @@ function deriveModelFromV2(installation: FleetInstallation): ModelOutcome {
         ? { decisions: copyDecisions(installation.decisions) }
         : {}),
       ...(installation.daemon !== undefined ? { daemon: installation.daemon } : {}),
-      ...(installation.owner !== undefined ? { owner: installation.owner } : {}),
+      ...(installation.owner !== undefined
+        ? { owner: { publicKey: installation.owner.publicKey } }
+        : {}),
       ...(installation.stateDir !== undefined ? { stateDir: installation.stateDir } : {}),
     },
     warnings: [],

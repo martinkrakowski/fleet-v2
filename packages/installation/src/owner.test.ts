@@ -100,6 +100,26 @@ describe('readOwnerSection', () => {
     expect(readOwnerSection(['x'])).toEqual({ ok: false, code: 'owner-section-invalid' });
   });
 
+  it('refuses a sparse array without traversing it', () => {
+    const sparse: string[] = [];
+    sparse[2] = VALID_KEY;
+    expect(readOwnerSection(sparse)).toEqual({ ok: false, code: 'owner-section-invalid' });
+  });
+
+  it('refuses an array-like object', () => {
+    expect(readOwnerSection({ length: 1, 0: VALID_KEY })).toEqual({
+      ok: false,
+      code: 'owner-section-invalid',
+    });
+  });
+
+  it('refuses an enormous sparse array before any key enumeration', () => {
+    const enormous: string[] = [];
+    enormous.length = 2 ** 32 - 1;
+    enormous[0] = VALID_KEY;
+    expect(readOwnerSection(enormous)).toEqual({ ok: false, code: 'owner-section-invalid' });
+  });
+
   it('refuses a prototype-polluting own key', () => {
     const section = JSON.parse('{"__proto__": {}, "publicKey": null}');
     expect(readOwnerSection(section)).toEqual({
@@ -262,6 +282,33 @@ describe('owner parser hostile input', () => {
 describe('derived model owner copy', () => {
   it('does not change the model when the input owner is mutated after derivation', () => {
     const parsed = parseInstallation({ schemaVersion: 1, owner: { publicKey: VALID_KEY } });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    const installation = parsed.installation;
+    const outcome = deriveInstallationModel(installation);
+    expect(outcome.model.owner).toEqual({ publicKey: VALID_KEY });
+    const mutated = Buffer.alloc(32, 9).toString('base64');
+    (installation.owner as { publicKey: string }).publicKey = mutated;
+    expect(outcome.model.owner).toEqual({ publicKey: VALID_KEY });
+    expect(outcome.model.owner).not.toBe(installation.owner);
+  });
+
+  it('does not change the model when a parsed v2 installation owner is mutated after derivation', () => {
+    const parsed = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        lane: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      },
+      owner: { publicKey: VALID_KEY },
+    });
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) {
       return;

@@ -107,6 +107,16 @@ function fakeScheduler(results: FakeSchedulerResults = {}): {
                 service: base.service,
                 timer: base.timer,
               },
+              // OD7a2: the fake echoes the main-pair codes into the
+              // record-day pair too, so a shadow-on command reports 6 units.
+              ...(input.shadowRecordDay === undefined
+                ? {}
+                : {
+                    shadowRecordDay: {
+                      service: base.service,
+                      timer: base.timer,
+                    },
+                  }),
             };
       },
       async write(input) {
@@ -121,6 +131,14 @@ function fakeScheduler(results: FakeSchedulerResults = {}): {
                 service: base.service,
                 timer: base.timer,
               },
+              ...(input.shadowRecordDay === undefined
+                ? {}
+                : {
+                    shadowRecordDay: {
+                      service: base.service,
+                      timer: base.timer,
+                    },
+                  }),
             };
       },
       async remove() {
@@ -128,10 +146,13 @@ function fakeScheduler(results: FakeSchedulerResults = {}): {
         // OD7a1 fix round 2: a provided remove result passes through whole,
         // including its intake codes, so a test can drive an unreadable
         // intake removal; the default still reports the intake pair absent.
+        // OD7a2: the record-day pair is removed with the rest, even when
+        // shadow is off in config.
         return results.remove ?? {
           service: "absent",
           timer: "absent",
           shadowIntake: { service: "absent", timer: "absent" },
+          shadowRecordDay: { service: "absent", timer: "absent" },
         };
       },
     },
@@ -379,7 +400,7 @@ describe("fleet-v2 hosts daemon", () => {
     merge: { repos: { "owner/repo": { projectId: "proj-1" } } },
   };
 
-  it("an entry omitting shadow defaults to true and renders 4 units", async () => {
+  it("an entry omitting shadow defaults to true and renders 6 units", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, {
@@ -395,8 +416,13 @@ describe("fleet-v2 hosts daemon", () => {
     expect(stdout).toContain("fleet-v2-daemon.service written\n");
     expect(stdout).toContain("fleet-v2-shadow-intake.service written\n");
     expect(stdout).toContain("fleet-v2-shadow-intake.timer written\n");
+    expect(stdout).toContain("fleet-v2-shadow-record-day.service written\n");
+    expect(stdout).toContain("fleet-v2-shadow-record-day.timer written\n");
     expect(stdout).toContain(
       "enable: systemctl --user enable fleet-v2-shadow-intake.timer\n",
+    );
+    expect(stdout).toContain(
+      "enable: systemctl --user enable fleet-v2-shadow-record-day.timer\n",
     );
     expect(calls).toEqual(["write"]);
   });
@@ -423,7 +449,7 @@ describe("fleet-v2 hosts daemon", () => {
     expect(stdout).toContain("fleet-v2-daemon.timer written\n");
   });
 
-  it("shadow: true renders 4 units with the exact ExecStart and no baked grant", async () => {
+  it("shadow: true renders 6 units with the exact ExecStart and no baked grant", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, {
@@ -459,6 +485,28 @@ describe("fleet-v2 hosts daemon", () => {
     );
     expect(intake.timer).toContain("OnUnitActiveSec=180s");
     expect(intake.timer).toContain("Unit=fleet-v2-shadow-intake.service");
+    // OD7a2: the record-day pair renders with the exact --scheduled ExecStart.
+    const recordDay = inputs[0]?.shadowRecordDay as
+      | { service: string; timer: string }
+      | undefined;
+    expect(recordDay).toBeDefined();
+    if (recordDay === undefined) {
+      return;
+    }
+    expect(recordDay.service).toContain(
+      "ExecStart=/srv/fleet/node/bin/node /srv/fleet/cli/fleet-v2.mjs --state-dir /srv/fleet/state cutover shadow record-day --repository owner/repo --legacy-state-dir /srv/fleet/legacy-state --scheduled",
+    );
+    expect(recordDay.service).toContain("Type=oneshot");
+    expect(recordDay.service).not.toContain("Restart=");
+    expect(recordDay.service).toContain("Nice=5");
+    expect(recordDay.service).toContain("Environment=FLEET_STATE_DIR=/srv/fleet/state");
+    expect(recordDay.service).toContain(
+      "Environment=FLEET_INSTALLATION_FILE=/srv/fleet/fleet.json",
+    );
+    expect(recordDay.timer).toContain("Unit=fleet-v2-shadow-record-day.service");
+    expect(recordDay.timer).toContain("OnCalendar=*-*-* 00:20:00 UTC");
+    expect(recordDay.timer).toContain("AccuracySec=30s");
+    expect(recordDay.timer).toContain("Persistent=true");
   });
 
   it("refuses multiple shadow repositories", async () => {
@@ -555,7 +603,7 @@ describe("fleet-v2 hosts daemon", () => {
     }
   });
 
-  it("uninstall with shadow off prints exactly 2 lines and removes 4 units", async () => {
+  it("uninstall with shadow off prints exactly 2 lines and removes 6 units", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");
     writeJsonFile(file, {
@@ -577,5 +625,60 @@ describe("fleet-v2 hosts daemon", () => {
     );
     expect(stdout).not.toContain("shadow-intake");
     expect(calls).toEqual(["remove"]);
+  });
+
+  it("uninstall with shadow on prints all 6 unit lines (OD7a2)", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      ...validV2,
+      daemon: daemonWithShadow,
+      policy: policyWithShadowRepo,
+    });
+    const { code, stdout } = await runDaemon(
+      ["uninstall", "--scheduler", "systemd", "--apply"],
+      file,
+    );
+    expect(code).toBe(0);
+    for (const unit of [
+      "fleet-v2-daemon.service",
+      "fleet-v2-daemon.timer",
+      "fleet-v2-shadow-intake.service",
+      "fleet-v2-shadow-intake.timer",
+      "fleet-v2-shadow-record-day.service",
+      "fleet-v2-shadow-record-day.timer",
+    ]) {
+      expect(stdout).toContain(`${unit} absent\n`);
+    }
+  });
+
+  it("exits 1 with the unreadable diagnostic when the record-day removal is unreadable with shadow off (OD7a2)", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      ...validV2,
+      daemon,
+      policy: {
+        merge: {
+          repos: { "owner/repo": { projectId: "proj-1", shadow: false } },
+        },
+      },
+    });
+    const { code, stderr } = await runDaemon(
+      ["uninstall", "--scheduler", "systemd", "--apply"],
+      file,
+      {
+        remove: {
+          service: "absent",
+          timer: "absent",
+          shadowIntake: { service: "absent", timer: "absent" },
+          shadowRecordDay: { service: "absent", timer: "unreadable" },
+        },
+      },
+    );
+    expect(code).toBe(1);
+    expect(stderr).toContain(
+      "installation.daemon.shadow: shadow-intake-unreadable\n",
+    );
   });
 });

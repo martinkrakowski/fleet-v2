@@ -11,16 +11,21 @@ import {
   ManageDaemonSchedulerUseCase,
   SHADOW_INTAKE_SERVICE_TEMPLATE,
   SHADOW_INTAKE_TIMER_TEMPLATE,
+  SHADOW_RECORD_DAY_SERVICE_TEMPLATE,
+  SHADOW_RECORD_DAY_TIMER_TEMPLATE,
   MAX_SHADOW_CONFIG_VALUE_LENGTH,
   readShadowSchedulerConfig,
   renderDaemonUnits,
   renderShadowIntakeUnits,
+  renderShadowRecordDayUnits,
 } from '../ManageDaemonSchedulerUseCase.use-case.js';
 import {
   DAEMON_SERVICE_UNIT_KEY,
   DAEMON_TIMER_UNIT_KEY,
   SHADOW_INTAKE_SERVICE_UNIT_KEY,
   SHADOW_INTAKE_TIMER_UNIT_KEY,
+  SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+  SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
   type DaemonSchedulerPort,
   type DaemonSchedulerReadResult,
   type DaemonSchedulerRemoveResult,
@@ -57,6 +62,9 @@ function fakeScheduler(results: FakeSchedulerResults = {}): {
           : {
               ...base,
               shadowIntake: { service: base.service, timer: base.timer },
+              ...(input.shadowRecordDay === undefined
+                ? {}
+                : { shadowRecordDay: { service: base.service, timer: base.timer } }),
             };
       },
       async write(input) {
@@ -67,6 +75,9 @@ function fakeScheduler(results: FakeSchedulerResults = {}): {
           : {
               ...base,
               shadowIntake: { service: base.service, timer: base.timer },
+              ...(input.shadowRecordDay === undefined
+                ? {}
+                : { shadowRecordDay: { service: base.service, timer: base.timer } }),
             };
       },
       async remove() {
@@ -499,10 +510,13 @@ describe('ManageDaemonSchedulerUseCase shadow intake (OD7a1)', () => {
       { key: DAEMON_TIMER_UNIT_KEY, code: 'written' },
       { key: SHADOW_INTAKE_SERVICE_UNIT_KEY, code: 'written' },
       { key: SHADOW_INTAKE_TIMER_UNIT_KEY, code: 'written' },
+      { key: SHADOW_RECORD_DAY_SERVICE_UNIT_KEY, code: 'written' },
+      { key: SHADOW_RECORD_DAY_TIMER_UNIT_KEY, code: 'written' },
     ]);
     expect(result.operatorLines).toEqual([
       ...OPERATOR_LINES,
       'enable: systemctl --user enable fleet-v2-shadow-intake.timer',
+      'enable: systemctl --user enable fleet-v2-shadow-record-day.timer',
     ]);
     expect(calls).toEqual([expect.stringMatching(/^write:/)]);
     // Assert the exact rendered intake ExecStart through the templates.
@@ -592,6 +606,8 @@ describe('ManageDaemonSchedulerUseCase shadow intake (OD7a1)', () => {
       { key: DAEMON_TIMER_UNIT_KEY, code: 'written' },
       { key: SHADOW_INTAKE_SERVICE_UNIT_KEY, code: 'unreadable' },
       { key: SHADOW_INTAKE_TIMER_UNIT_KEY, code: 'unreadable' },
+      { key: SHADOW_RECORD_DAY_SERVICE_UNIT_KEY, code: 'unreadable' },
+      { key: SHADOW_RECORD_DAY_TIMER_UNIT_KEY, code: 'unreadable' },
     ]);
   });
 
@@ -677,13 +693,14 @@ describe('ManageDaemonSchedulerUseCase shadow intake (OD7a1)', () => {
     expect(result.intakeUnreadable).toBeUndefined();
   });
 
-  it('uninstall with shadow on prints all 4 unit lines', async () => {
+  it('uninstall with shadow on prints all 6 unit lines', async () => {
     const useCase = new ManageDaemonSchedulerUseCase({
       scheduler: fakeScheduler({
         remove: {
           service: 'absent',
           timer: 'absent',
           shadowIntake: { service: 'absent', timer: 'absent' },
+          shadowRecordDay: { service: 'absent', timer: 'absent' },
         },
       }).scheduler,
     });
@@ -697,6 +714,83 @@ describe('ManageDaemonSchedulerUseCase shadow intake (OD7a1)', () => {
       DAEMON_TIMER_UNIT_KEY,
       SHADOW_INTAKE_SERVICE_UNIT_KEY,
       SHADOW_INTAKE_TIMER_UNIT_KEY,
+      SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+      SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
+    ]);
+  });
+
+  it('renders the shadow record-day pair (OD7a2) with Nice=5, exact ExecStart and a 00:20Z timer', async () => {
+    const { scheduler, calls } = fakeScheduler({
+      write: { service: 'written', timer: 'written' },
+    });
+    const useCase = new ManageDaemonSchedulerUseCase({ scheduler });
+    const result = await useCase.execute({
+      action: 'install',
+      apply: true,
+      daemon: SHADOW_FACTS,
+    });
+    expect(result.units).toEqual([
+      { key: DAEMON_SERVICE_UNIT_KEY, code: 'written' },
+      { key: DAEMON_TIMER_UNIT_KEY, code: 'written' },
+      { key: SHADOW_INTAKE_SERVICE_UNIT_KEY, code: 'written' },
+      { key: SHADOW_INTAKE_TIMER_UNIT_KEY, code: 'written' },
+      { key: SHADOW_RECORD_DAY_SERVICE_UNIT_KEY, code: 'written' },
+      { key: SHADOW_RECORD_DAY_TIMER_UNIT_KEY, code: 'written' },
+    ]);
+    expect(SHADOW_RECORD_DAY_SERVICE_TEMPLATE).toContain('Type=oneshot');
+    expect(SHADOW_RECORD_DAY_SERVICE_TEMPLATE).not.toContain('Restart=');
+    expect(SHADOW_RECORD_DAY_SERVICE_TEMPLATE).toContain('Nice=5');
+    expect(SHADOW_RECORD_DAY_SERVICE_TEMPLATE).toContain(
+      'ExecStart={{nodePath}} {{cliPath}} --state-dir {{stateDir}} cutover shadow record-day --repository {{repository}} --legacy-state-dir {{legacyStateDir}} --scheduled',
+    );
+    expect(SHADOW_RECORD_DAY_SERVICE_TEMPLATE).toContain(
+      'Environment=FLEET_STATE_DIR={{stateDir}}',
+    );
+    expect(SHADOW_RECORD_DAY_SERVICE_TEMPLATE).toContain(
+      'Environment=FLEET_INSTALLATION_FILE={{installationFile}}',
+    );
+    expect(SHADOW_RECORD_DAY_TIMER_TEMPLATE).toContain(
+      'Unit=fleet-v2-shadow-record-day.service',
+    );
+    expect(SHADOW_RECORD_DAY_TIMER_TEMPLATE).toContain(
+      'OnCalendar=*-*-* 00:20:00 UTC',
+    );
+    expect(SHADOW_RECORD_DAY_TIMER_TEMPLATE).toContain('AccuracySec=30s');
+    expect(SHADOW_RECORD_DAY_TIMER_TEMPLATE).toContain('Persistent=true');
+    expect(SHADOW_RECORD_DAY_TIMER_TEMPLATE).toContain(
+      'WantedBy=timers.target',
+    );
+    // The rendered substitution follows the same placeholder rule.
+    const rendered = renderShadowRecordDayUnits(SHADOW_FACTS, SHADOW_CONFIG);
+    expect(rendered.service).toContain('cutover shadow record-day');
+    expect(rendered.service).toContain('--scheduled');
+    expect(rendered.service).toContain('Nice=5');
+    expect(rendered.timer).toContain('OnCalendar=*-*-* 00:20:00 UTC');
+    expect(calls).toEqual([expect.stringMatching(/^write:/)]);
+  });
+
+  it('reports intakeUnreadable when the record-day removal is unreadable with shadow off (OD7a2)', async () => {
+    const useCase = new ManageDaemonSchedulerUseCase({
+      scheduler: fakeScheduler({
+        remove: {
+          service: 'absent',
+          timer: 'absent',
+          shadowIntake: { service: 'absent', timer: 'absent' },
+          shadowRecordDay: { service: 'absent', timer: 'unreadable' },
+        },
+      }).scheduler,
+    });
+    const result = await useCase.execute({
+      action: 'uninstall',
+      apply: true,
+      daemon: FACTS,
+    });
+    expect(result.intakeUnreadable).toBe(true);
+    // With shadow off only the main pair's lines print; the record-day
+    // removal's unreadable code surfaces through `intakeUnreadable` instead.
+    expect(result.units.map((unit) => unit.key)).toEqual([
+      DAEMON_SERVICE_UNIT_KEY,
+      DAEMON_TIMER_UNIT_KEY,
     ]);
   });
 

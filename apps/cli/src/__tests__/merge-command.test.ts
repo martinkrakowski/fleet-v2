@@ -400,6 +400,7 @@ describe('merge import (GR1b)', () => {
       apply: false,
       grantId: null,
       projectId: null,
+      scheduled: false,
     });
     expect(getTraps).toBe(0);
   });
@@ -420,6 +421,7 @@ describe('merge import (GR1b)', () => {
       apply: true,
       grantId: 'grant-1',
       projectId: 'project-1',
+      scheduled: false,
     });
     expect(() => parseMergeImportFlags({ ...{ repository: 'fleet/v2', legacyStateDir: '/tmp/legacy', apply: true } })).toThrow(
       CliUsageError,

@@ -25,6 +25,7 @@ import type {
   ConductorReaperWorktreePolicy,
   ConsumerSettings,
   DaemonSection,
+  DaemonShadowSection,
   DecisionConsumers,
   FallbackSeat,
   FleetInstallationV1,
@@ -317,7 +318,12 @@ export const DAEMON_KEYS: readonly string[] = freezeKeys<DaemonSection>()([
   'stateDir',
   'unitDir',
   'installationFile',
+  'shadow',
 ]);
+
+/** The optional `daemon.shadow` block (OD7a1). */
+export const DAEMON_SHADOW_KEYS: readonly string[] =
+  freezeKeys<DaemonShadowSection>()(['legacyStateDir', 'grantId']);
 
 // ---------------------------------------------------------------------------
 // v2 `policy` and sub-blocks

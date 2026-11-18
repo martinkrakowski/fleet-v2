@@ -1738,7 +1738,7 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     expect(answer.err).toContain('watchdog warning: audible-announcement-failed count=1');
   });
 
-  it('(wd1) a healthy train with a successful speak exits 0 with an empty stderr (no warning)', async () => {
+  it('(wd1) healthy train with nothing to announce: exit 0, no warning', async () => {
     const nowIso = new Date().toISOString();
     const spoken: Array<{ readonly sentence: string }> = [];
     const h = harness([REPO_A], {

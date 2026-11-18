@@ -836,13 +836,12 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
               headOid: entry.headOid,
               base: entry.baseBranch ?? 'main',
             }));
-    // Dry-run only, never apply; no authority is exercised for a dry run.
+    // Dry-run only, never apply; no grant is exercised for a dry run.
     const importRead = await this.call(context.deadlineIso, () =>
       this.deps.importDryRun.importTrainState({
         repository: context.repository,
         stateDir: context.legacyStateDir,
         apply: false,
-        authority: null,
       }),
     );
     let importPresent: readonly IntakeKey[] | null = null;

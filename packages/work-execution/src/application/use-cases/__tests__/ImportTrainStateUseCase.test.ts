@@ -1,11 +1,26 @@
 // Lane CO5: import of the legacy shell merge-train state.
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
 
 import { MergeQueueRepositoryAdapter } from '../../../infrastructure/adapters/MergeQueueRepositoryAdapter.adapter.js';
+import { CutoverJournalAdapter } from '../../../infrastructure/adapters/CutoverJournalAdapter.adapter.js';
+import type {
+  ActionAuthorizationPort,
+  AuthorizeShadowImportRequest,
+  AuthorizeShadowImportResult,
+} from '../../ports/out/ActionAuthorizationPort.out-port.js';
+import type { CutoverJournalAppendResult, CutoverJournalEntry, CutoverJournalPort } from '../../ports/out/CutoverJournalPort.out-port.js';
 import type { LegacyTrainStateRead, LegacyTrainStateReadPort } from '../../ports/out/LegacyTrainStateReadPort.out-port.js';
-import { ImportTrainStateUseCase } from '../ImportTrainStateUseCase.use-case.js';
+import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.js';
+import type { MergeQueueListQuery, MergeQueueRepositoryPort } from '../../ports/out/MergeQueueRepositoryPort.out-port.js';
+import { ImportTrainStateUseCase, validateImportTrainStateRequest } from '../ImportTrainStateUseCase.use-case.js';
 
 const REPO = { owner: 'fleet', repo: 'v2' };
+const GRANT_ID = 'shadow-grant-0001';
+const PROJECT_ID = 'project-1';
+const GRANT_DIGEST = 'a'.repeat(64);
 const HEAD_A = '0123456789abcdef0123456789abcdef01234567';
 const HEAD_B = '0123456789abcdef0123456789abcdef01234568';
 const MAIN_A = `42 ${HEAD_A} main`;
@@ -72,12 +87,30 @@ function keyFor(
   return { pullRequest, headOid, base, source, disposition };
 }
 
-function makeUseCase(reader: LegacyTrainStateReadPort, queue: MergeQueueRepositoryAdapter): ImportTrainStateUseCase {
+function makeUseCase(
+  reader: LegacyTrainStateReadPort,
+  queue: MergeQueueRepositoryAdapter,
+  overrides: {
+    readonly authorization?: ActionAuthorizationPort;
+    readonly journal?: CutoverJournalPort;
+    readonly computeDigest?: (payload: string) => string;
+  } = {},
+): ImportTrainStateUseCase {
+  // An explicitly absent dependency (key present with `undefined`) means the
+  // use case really gets none — that is how the `journal-unavailable` and
+  // `authorization-unavailable` paths are tested.
+  const has = <K extends keyof typeof overrides>(key: K): boolean => key in overrides;
+  const defaultAuthorization: ActionAuthorizationPort = {
+    authorizeShadowImport: async () => ({ outcome: 'authorized', grantId: GRANT_ID }),
+  } as unknown as ActionAuthorizationPort;
   return new ImportTrainStateUseCase({
     legacyState: reader,
     queue,
     mintUlid,
     nowIso,
+    authorization: has('authorization') ? overrides.authorization : defaultAuthorization,
+    journal: has('journal') ? overrides.journal : new CutoverJournalAdapter(),
+    computeDigest: has('computeDigest') ? overrides.computeDigest : (() => GRANT_DIGEST),
   });
 }
 
@@ -91,7 +124,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toEqual({
@@ -129,7 +161,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toEqual({
@@ -152,7 +183,7 @@ describe('ImportTrainStateUseCase', () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A, MAIN_B]));
     const useCase = makeUseCase(reader, queue);
-    const request = { repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' } as const;
+    const request = { repository: REPO, stateDir: '/tmp/legacy', apply: true, grantId: GRANT_ID, projectId: PROJECT_ID } as const;
 
     const first = await useCase.importTrainState(request);
     expect(first).toEqual({
@@ -205,7 +236,8 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: 'owner-grant-1',
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
     });
 
     expect(result).toEqual({
@@ -232,7 +264,7 @@ describe('ImportTrainStateUseCase', () => {
     expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toHaveLength(1);
   });
 
-  it('apply without authority is refused before anything is read or written', async () => {
+  it('apply without projectId refuses before anything is read or written', async () => {
     const queue = new MergeQueueRepositoryAdapter();
     const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
     const useCase = makeUseCase(reader, queue);
@@ -241,10 +273,27 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: null,
+      grantId: GRANT_ID,
     });
 
-    expect(result).toEqual({ outcome: 'refused', reason: 'authority-required' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'project-required' });
+    expect(reader.calls).toBe(0);
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('apply without grantId refuses before anything is read or written', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue);
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'grant-missing' });
     expect(reader.calls).toBe(0);
     expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
   });
@@ -259,7 +308,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 1, unknownLineNumbers: [2] });
@@ -276,7 +324,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
@@ -292,7 +339,8 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: 'owner-grant-1',
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
     });
 
     expect(result).toEqual({
@@ -342,7 +390,8 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: 'owner-grant-1',
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
     });
 
     expect(result).toEqual({ outcome: 'refused', reason: 'legacy-unreadable' });
@@ -358,7 +407,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: { owner: '.', repo: 'v2' },
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
     expect(badRepo).toEqual({ outcome: 'refused', reason: 'invalid-repository' });
 
@@ -366,7 +414,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '',
       apply: false,
-      authority: null,
     });
     expect(badDir).toEqual({ outcome: 'refused', reason: 'invalid-state-dir' });
   });
@@ -382,7 +429,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 1, parkedLines: 1 });
@@ -406,7 +452,8 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: 'owner-grant-1',
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
     });
 
     expect(result).toMatchObject({ outcome: 'applied', imported: 0, inprogressLines: 1 });
@@ -428,7 +475,8 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: 'owner-grant-1',
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
     });
 
     // The legacy shell train is actively merging this PR right now (it is
@@ -454,7 +502,8 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: 'owner-grant-1',
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
     });
 
     expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
@@ -482,7 +531,8 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: 'owner-grant-1',
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
     });
 
     expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
@@ -503,7 +553,8 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: 'owner-grant-1',
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
     });
 
     expect(result).toMatchObject({ outcome: 'applied', imported: 1 });
@@ -525,7 +576,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 1 });
@@ -546,7 +596,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     // The queue entry (chain/foo) and the parked entry (main) share the same
@@ -573,7 +622,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 0, notImportableBase: 2 });
@@ -593,7 +641,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 501, keysTruncated: true });
@@ -622,7 +669,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toEqual({ outcome: 'refused', reason: 'legacy-unreadable' });
@@ -640,7 +686,8 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: true,
-      authority: 'owner-grant-1',
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
     });
 
     expect(result).toEqual({ outcome: 'refused', reason: 'legacy-unreadable' });
@@ -658,14 +705,13 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
     expect(parkedRefusal).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
 
     const inprogressRefusal = await makeUseCase(
       new FakeLegacyTrainStateReadPort(readState([MAIN_A], { inprogress: { status: 'read', lines: [secret] } })),
       new MergeQueueRepositoryAdapter(),
-    ).importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false, authority: null });
+    ).importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false });
     expect(inprogressRefusal).toEqual({ outcome: 'refused', reason: 'secret-shaped' });
   });
 
@@ -675,7 +721,7 @@ describe('ImportTrainStateUseCase', () => {
       readState([MAIN_A], { parked: { status: 'read', lines: [PARKED_B] } }),
     );
     const useCase = makeUseCase(reader, queue);
-    const request = { repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' } as const;
+    const request = { repository: REPO, stateDir: '/tmp/legacy', apply: true, grantId: GRANT_ID, projectId: PROJECT_ID } as const;
 
     const first = await useCase.importTrainState(request);
     expect(first).toMatchObject({ outcome: 'applied', imported: 2 });
@@ -707,7 +753,6 @@ describe('ImportTrainStateUseCase', () => {
       repository: REPO,
       stateDir: '/tmp/legacy',
       apply: false,
-      authority: null,
     });
 
     expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 2 });
@@ -731,13 +776,13 @@ describe('ImportTrainStateUseCase', () => {
     );
     const useCase = makeUseCase(reader, queue);
 
-    const dryRun = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false, authority: null });
+    const dryRun = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false });
     expect(dryRun).toMatchObject({ outcome: 'dry-run', wouldImport: 1, unknownBySource: { parked: [] } });
     expect(dryRun.outcome === 'dry-run' && dryRun.keys).toEqual([
       { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'parked', disposition: 'would-import' },
     ]);
 
-    const applied = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' });
+    const applied = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: true, grantId: GRANT_ID, projectId: PROJECT_ID });
     expect(applied).toMatchObject({ outcome: 'applied', imported: 1 });
     const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
     expect(entries).toHaveLength(1);
@@ -766,7 +811,7 @@ describe('ImportTrainStateUseCase', () => {
     );
     const useCase = makeUseCase(reader, queue);
 
-    const result = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false, authority: null });
+    const result = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false });
     expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 0 });
     expect(result.outcome === 'dry-run' && result.unknownBySource).toEqual({
       queue: [],
@@ -787,12 +832,652 @@ describe('ImportTrainStateUseCase', () => {
     );
     const useCase = makeUseCase(reader, queue);
 
-    const result = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: true, authority: 'owner-grant-1' });
+    const result = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: true, grantId: GRANT_ID, projectId: PROJECT_ID });
     expect(result).toMatchObject({ outcome: 'applied', imported: 0 });
     expect(result.outcome === 'applied' && result.keys).toEqual([
       { pullRequest: 7, headOid: HEAD_B, base: 'main', source: 'inprogress', disposition: 'legacy-in-progress' },
     ]);
     const entries = await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() });
     expect(entries).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GR1b: grant verification, the separate shadow-intake journal, and the
+// descriptor-safe request validation.
+// ---------------------------------------------------------------------------
+
+/** A counting authorization fake with an injectable answer or throw. */
+class FakeAuthorization implements ActionAuthorizationPort {
+  calls = 0;
+  lastRequest: AuthorizeShadowImportRequest | null = null;
+
+  constructor(
+    private readonly answer:
+      | { readonly kind: 'authorized' }
+      | { readonly kind: 'blocked'; readonly reason: string }
+      | { readonly kind: 'unknown'; readonly reason: string }
+      | { readonly kind: 'throw' } = { kind: 'authorized' },
+  ) {}
+
+  async resolveActionAuthorization(): Promise<never> {
+    throw new Error('not used in GR1b tests');
+  }
+
+  async consumeActionAuthorization(): Promise<never> {
+    throw new Error('not used in GR1b tests');
+  }
+
+  async authorizeShadowImport(request: AuthorizeShadowImportRequest): Promise<AuthorizeShadowImportResult> {
+    this.calls += 1;
+    this.lastRequest = request;
+    if (this.answer.kind === 'throw') {
+      throw new Error('delegate blew up');
+    }
+    if (this.answer.kind === 'authorized') {
+      return { outcome: 'authorized', grantId: GRANT_ID };
+    }
+    return { outcome: this.answer.kind, reason: this.answer.reason };
+  }
+}
+
+/** A journal fake with per-kind configured outcomes and an optional throw. */
+class FakeJournal implements CutoverJournalPort {
+  readonly entries: CutoverJournalEntry[] = [];
+
+  constructor(
+    private readonly intentOutcome: 'appended' | 'refused' = 'appended',
+    private readonly resultBehaviour:
+      | { readonly kind: 'append' }
+      | { readonly kind: 'refuse' }
+      | { readonly kind: 'throw' } = { kind: 'append' },
+  ) {}
+
+  async append(entry: CutoverJournalEntry): Promise<CutoverJournalAppendResult> {
+    if (entry.kind === 'intent' && this.intentOutcome === 'refused') {
+      return { outcome: 'refused', reason: 'duplicate-intent' };
+    }
+    if (entry.kind === 'result') {
+      if (this.resultBehaviour.kind === 'refuse') {
+        return { outcome: 'refused', reason: 'invalid-entry' };
+      }
+      if (this.resultBehaviour.kind === 'throw') {
+        throw new Error('journal result blew up');
+      }
+    }
+    this.entries.push(entry);
+    return { outcome: 'appended', entry };
+  }
+
+  async listByKeyPrefix(): Promise<{ readonly outcome: 'listed'; readonly entries: readonly CutoverJournalEntry[] }> {
+    return { outcome: 'listed', entries: [...this.entries] };
+  }
+}
+
+/** A queue wrapper whose enqueue always throws; reads delegate to the real adapter. */
+class ThrowingEnqueueQueue implements MergeQueueRepositoryPort {
+  constructor(private readonly inner: MergeQueueRepositoryAdapter) {}
+
+  async enqueueMergeEntry(): Promise<never> {
+    throw new Error('apply blew up');
+  }
+
+  async dropMergeEntry(command: Parameters<MergeQueueRepositoryPort['dropMergeEntry']>[0]) {
+    return this.inner.dropMergeEntry(command);
+  }
+
+  async retryMergeEntry(command: Parameters<MergeQueueRepositoryPort['retryMergeEntry']>[0]) {
+    return this.inner.retryMergeEntry(command);
+  }
+
+  async listMergeEntries(query: MergeQueueListQuery): Promise<readonly MergeQueueEntryRecord[]> {
+    return this.inner.listMergeEntries(query);
+  }
+
+  async applyMergeTransition(command: Parameters<MergeQueueRepositoryPort['applyMergeTransition']>[0]) {
+    return this.inner.applyMergeTransition(command);
+  }
+}
+
+describe('ImportTrainStateUseCase authorization and journaling (GR1b)', () => {
+  it('applies verify the grant before any legacy read, queue read or queue write', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const authorization = new FakeAuthorization();
+    const useCase = makeUseCase(reader, queue, { authorization });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toMatchObject({ outcome: 'applied', imported: 1 });
+    expect(authorization.calls).toBe(1);
+    expect(authorization.lastRequest).toMatchObject({
+      projectId: PROJECT_ID,
+      grantId: GRANT_ID,
+      repository: REPO,
+    });
+    expect(typeof authorization.lastRequest!.nowIso).toBe('string');
+  });
+
+  it('a dry run never calls the authorization, journal or digest', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const authorization = new FakeAuthorization();
+    const useCase = makeUseCase(reader, queue, {
+      authorization,
+      journal: undefined,
+      computeDigest: undefined,
+    });
+
+    const result = await useCase.importTrainState({ repository: REPO, stateDir: '/tmp/legacy', apply: false });
+
+    expect(result).toMatchObject({ outcome: 'dry-run', wouldImport: 1 });
+    expect(authorization.calls).toBe(0);
+  });
+
+  it('maps each grant refusal from authorizeShadowImport before any read or write', async () => {
+    const reasons = [
+      'grant-missing',
+      'grant-expired',
+      'grant-revoked',
+      'grant-wrong-scope',
+      'grant-wrong-repository',
+      'grant-wrong-project',
+      'grant-digest-mismatch',
+      'grant-not-approved',
+      'grant-id-mismatch',
+    ];
+    for (const reason of reasons) {
+      const queue = new MergeQueueRepositoryAdapter();
+      const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+      const useCase = makeUseCase(reader, queue, {
+        authorization: new FakeAuthorization({ kind: 'blocked', reason }),
+      });
+
+      const result = await useCase.importTrainState({
+        repository: REPO,
+        stateDir: '/tmp/legacy',
+        apply: true,
+        grantId: GRANT_ID,
+        projectId: PROJECT_ID,
+      });
+
+      expect(result).toEqual({ outcome: 'refused', reason });
+      expect(reader.calls).toBe(0);
+      expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+    }
+  });
+
+  it('refused grant leaves corrupt merge-queue.json byte-identical without quarantine', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'gr1b-corrupt-'));
+    try {
+      const queueFile = path.join(dir, 'merge-queue.json');
+      const corrupt = '{"entries":[ this is not json';
+      await writeFile(queueFile, corrupt, 'utf8');
+      const queue = new MergeQueueRepositoryAdapter({ stateDir: dir });
+      const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+      const useCase = makeUseCase(reader, queue, {
+        authorization: new FakeAuthorization({ kind: 'blocked', reason: 'grant-expired' }),
+      });
+
+      const result = await useCase.importTrainState({
+        repository: REPO,
+        stateDir: '/tmp/legacy',
+        apply: true,
+        grantId: GRANT_ID,
+        projectId: PROJECT_ID,
+      });
+
+      expect(result).toEqual({ outcome: 'refused', reason: 'grant-expired' });
+      expect(await readFile(queueFile, 'utf8')).toBe(corrupt);
+      expect(await readdir(dir)).toEqual(['merge-queue.json']);
+      expect(reader.calls).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('authorization unavailable refuses', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    // The dependency is present but its port carries no authorizeShadowImport.
+    const useCase = makeUseCase(reader, queue, {
+      authorization: {
+        resolveActionAuthorization: async () => {
+          throw new Error('unused');
+        },
+        consumeActionAuthorization: async () => {
+          throw new Error('unused');
+        },
+      },
+    });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'authorization-unavailable' });
+    expect(reader.calls).toBe(0);
+  });
+
+  it('a throwing delegate maps to authorization-unavailable', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue, { authorization: new FakeAuthorization({ kind: 'throw' }) });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'authorization-unavailable' });
+    expect(reader.calls).toBe(0);
+  });
+
+  it.each([
+    ['project-id-required'],
+    ['clock-unavailable'],
+    ['invalid-now-iso'],
+    ['digest-unavailable'],
+    ['invalid-request'],
+    ['authorization-unreadable'],
+  ])('maps %s from authorizeShadowImport to authorization-unavailable', async (reason) => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue, {
+      authorization: new FakeAuthorization({ kind: 'blocked', reason }),
+    });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'authorization-unavailable' });
+    expect(reader.calls).toBe(0);
+  });
+
+  it('an unrecognized blocked reason maps to authorization-unavailable', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue, {
+      authorization: new FakeAuthorization({ kind: 'blocked', reason: 'something-else' }),
+    });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'authorization-unavailable' });
+  });
+
+  it('missing journal refuses before queue write', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue, { journal: undefined });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'journal-unavailable' });
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('missing computeDigest refuses before queue write', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue, { computeDigest: undefined });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'journal-unavailable' });
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('refused journal intent refuses before queue write', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue, {
+      journal: new FakeJournal('refused') as unknown as CutoverJournalPort,
+    });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'journal-refused' });
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('zero candidates journal nothing', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([]));
+    const journal = new FakeJournal();
+    const useCase = makeUseCase(reader, queue, { journal: journal as unknown as CutoverJournalPort });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({
+      outcome: 'applied',
+      imported: 0,
+      refused: 0,
+      unknownLineNumbers: [],
+      notImportableBase: 0,
+      alreadyQueued: 0,
+      parkedLines: 0,
+      chainFiles: 0,
+      batchLines: 0,
+      ...emptyReportExtras(),
+    });
+    expect(journal.entries).toEqual([]);
+  });
+
+  it('applies journal an intent and an applied result into shadow-intake-journal.json, never cutover-journal.json', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'gr1b-journal-'));
+    try {
+      const queue = new MergeQueueRepositoryAdapter({ stateDir: dir });
+      const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+      const useCase = new ImportTrainStateUseCase({
+        legacyState: reader,
+        queue,
+        mintUlid,
+        nowIso,
+        authorization: new FakeAuthorization(),
+        journal: new CutoverJournalAdapter({ stateDir: dir, fileName: 'shadow-intake-journal.json' }),
+        computeDigest: () => GRANT_DIGEST,
+      });
+
+      const result = await useCase.importTrainState({
+        repository: REPO,
+        stateDir: '/tmp/legacy',
+        apply: true,
+        grantId: GRANT_ID,
+        projectId: PROJECT_ID,
+      });
+
+      expect(result).toMatchObject({ outcome: 'applied', imported: 1 });
+      const stored = JSON.parse(await readFile(path.join(dir, 'shadow-intake-journal.json'), 'utf8')) as {
+        key: string;
+        kind: string;
+        digest?: string | null;
+        outcome?: string | null;
+        reasonCode?: string | null;
+      }[];
+      expect(stored).toHaveLength(2);
+      expect(stored[0]).toMatchObject({ kind: 'intent', digest: GRANT_DIGEST });
+      expect(stored[1]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'applied', digest: GRANT_DIGEST });
+      expect(stored[0]!.key).toMatch(/^shadow-import\/fleet\/v2\/[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+      await expect(readFile(path.join(dir, 'cutover-journal.json'), 'utf8')).rejects.toThrow();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('throw during apply records ambiguous result', async () => {
+    const queue = new ThrowingEnqueueQueue(new MergeQueueRepositoryAdapter());
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const journal = new FakeJournal();
+    const useCase = new ImportTrainStateUseCase({
+      legacyState: reader,
+      queue,
+      mintUlid,
+      nowIso,
+      authorization: new FakeAuthorization(),
+      journal: journal as unknown as CutoverJournalPort,
+      computeDigest: () => GRANT_DIGEST,
+    });
+
+    await expect(
+      useCase.importTrainState({
+        repository: REPO,
+        stateDir: '/tmp/legacy',
+        apply: true,
+        grantId: GRANT_ID,
+        projectId: PROJECT_ID,
+      }),
+    ).rejects.toThrow('apply blew up');
+
+    expect(journal.entries.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(journal.entries[1]).toMatchObject({ outcome: 'ambiguous', reasonCode: 'apply-threw' });
+  });
+
+  it('refused or throwing result append does not mask applied outcome', async () => {
+    for (const behaviour of [{ kind: 'refuse' }, { kind: 'throw' }] as const) {
+      const queue = new MergeQueueRepositoryAdapter();
+      const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+      const journal = new FakeJournal('appended', { kind: behaviour.kind });
+      const useCase = new ImportTrainStateUseCase({
+        legacyState: reader,
+        queue,
+        mintUlid,
+        nowIso,
+        authorization: new FakeAuthorization(),
+        journal: journal as unknown as CutoverJournalPort,
+        computeDigest: () => GRANT_DIGEST,
+      });
+
+      const result = await useCase.importTrainState({
+        repository: REPO,
+        stateDir: '/tmp/legacy',
+        apply: true,
+        grantId: GRANT_ID,
+        projectId: PROJECT_ID,
+      });
+
+      expect(result).toMatchObject({ outcome: 'applied', imported: 1 });
+    }
+  });
+
+  it('refused or throwing result append does not mask apply error', async () => {
+    for (const behaviour of [{ kind: 'refuse' }, { kind: 'throw' }] as const) {
+      const queue = new ThrowingEnqueueQueue(new MergeQueueRepositoryAdapter());
+      const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+      const journal = new FakeJournal('appended', { kind: behaviour.kind });
+      const useCase = new ImportTrainStateUseCase({
+        legacyState: reader,
+        queue,
+        mintUlid,
+        nowIso,
+        authorization: new FakeAuthorization(),
+        journal: journal as unknown as CutoverJournalPort,
+        computeDigest: () => GRANT_DIGEST,
+      });
+
+      await expect(
+        useCase.importTrainState({
+          repository: REPO,
+          stateDir: '/tmp/legacy',
+          apply: true,
+          grantId: GRANT_ID,
+          projectId: PROJECT_ID,
+        }),
+      ).rejects.toThrow('apply blew up');
+    }
+  });
+});
+
+describe('validateImportTrainStateRequest (GR1b)', () => {
+  const valid = (): Record<string, unknown> => ({
+    repository: { owner: 'fleet', repo: 'v2' },
+    stateDir: '/tmp/legacy',
+    apply: true,
+    grantId: GRANT_ID,
+    projectId: PROJECT_ID,
+  });
+
+  it('accepts a plain valid request with its normalized fields (a constant verdict would fail)', () => {
+    const result = validateImportTrainStateRequest(valid());
+    expect(result).toEqual({
+      ok: true,
+      request: { repository: REPO, stateDir: '/tmp/legacy', apply: true, grantId: GRANT_ID, projectId: PROJECT_ID },
+    });
+  });
+
+  it('refuses null and undefined', () => {
+    expect(validateImportTrainStateRequest(null)).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(validateImportTrainStateRequest(undefined)).toEqual({ ok: false, reason: 'invalid-request' });
+  });
+
+  it('refuses a wrong primitive where an object is due', () => {
+    expect(validateImportTrainStateRequest(42)).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(validateImportTrainStateRequest('apply')).toEqual({ ok: false, reason: 'invalid-request' });
+  });
+
+  it('refuses a wrong primitive where a string is due', () => {
+    const request = { ...valid(), stateDir: 42 };
+    expect(validateImportTrainStateRequest(request)).toEqual({ ok: false, reason: 'invalid-state-dir' });
+  });
+
+  it('refuses a non-iterable object where a list is due and arrays', () => {
+    expect(validateImportTrainStateRequest([valid()])).toEqual({ ok: false, reason: 'invalid-request' });
+  });
+
+  it('refuses a sparse array before any traversal', () => {
+    const sparse: unknown[] = [];
+    sparse[10] = valid();
+    expect(validateImportTrainStateRequest(sparse)).toEqual({ ok: false, reason: 'invalid-request' });
+  });
+
+  it('refuses an array-like object', () => {
+    const arrayLike = { length: 1, 0: valid() };
+    expect(validateImportTrainStateRequest(arrayLike)).toEqual({ ok: false, reason: 'invalid-repository' });
+  });
+
+  it('refuses an enormous sparse length before any traversal', () => {
+    const enormous: unknown[] = [];
+    Object.defineProperty(enormous, 'length', { value: 2 ** 32 - 1 });
+    expect(validateImportTrainStateRequest(enormous)).toEqual({ ok: false, reason: 'invalid-request' });
+  });
+
+  it('refuses a getter on the root without ever running it', () => {
+    let getterCalls = 0;
+    const request: Record<string, unknown> = valid();
+    Object.defineProperty(request, 'apply', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return true;
+      },
+    });
+    expect(validateImportTrainStateRequest(request)).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('refuses a getter on a nested field without ever running it', () => {
+    let getterCalls = 0;
+    const request: Record<string, unknown> = { ...valid() };
+    Object.defineProperty(request, 'repository', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return { owner: 'fleet', repo: 'v2' };
+      },
+    });
+    expect(validateImportTrainStateRequest(request)).toEqual({ ok: false, reason: 'invalid-request' });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('refuses a Proxy over a valid input with no get trap run, answering exactly as the plain data', () => {
+    let getTraps = 0;
+    const plain = validateImportTrainStateRequest(valid());
+    const proxy = new Proxy(valid(), {
+      get() {
+        getTraps += 1;
+        return undefined;
+      },
+    });
+    const result = validateImportTrainStateRequest(proxy);
+    // The Proxy's descriptors answer exactly as the plain data would.
+    expect(result).toEqual(plain);
+    expect(result).toEqual({
+      ok: true,
+      request: { repository: REPO, stateDir: '/tmp/legacy', apply: true, grantId: GRANT_ID, projectId: PROJECT_ID },
+    });
+    expect(getTraps).toBe(0);
+  });
+
+  it('refuses a prototype-polluting own key produced by JSON.parse', () => {
+    const request = JSON.parse(JSON.stringify(valid())) as Record<string, unknown>;
+    Object.defineProperty(request, '__proto__', { value: { apply: false }, enumerable: true, configurable: true });
+    expect(validateImportTrainStateRequest(request)).toEqual({ ok: false, reason: 'invalid-request' });
+  });
+
+  it('an identity echo of the input would fail: the answer is a typed verdict, never the input', () => {
+    const request = valid();
+    const result = validateImportTrainStateRequest(request);
+    expect(result).not.toBe(request);
+    expect(result.ok).toBe(true);
+  });
+
+  it('refuses an apply without projectId and without grantId with their named reasons', () => {
+    const noProject = { ...valid(), projectId: undefined };
+    const noGrant = { ...valid(), grantId: null };
+    const blankProject = { ...valid(), projectId: '  ' };
+    expect(validateImportTrainStateRequest(noProject)).toEqual({ ok: false, reason: 'project-required' });
+    expect(validateImportTrainStateRequest(blankProject)).toEqual({ ok: false, reason: 'project-required' });
+    expect(validateImportTrainStateRequest(noGrant)).toEqual({ ok: false, reason: 'grant-missing' });
+  });
+
+  it('a dry run needs neither grantId nor projectId', () => {
+    const dryRun = { repository: REPO, stateDir: '/tmp/legacy', apply: false };
+    expect(validateImportTrainStateRequest(dryRun)).toEqual({
+      ok: true,
+      request: { repository: REPO, stateDir: '/tmp/legacy', apply: false, grantId: null, projectId: null },
+    });
+  });
+
+  it('refuses a hostile repository shape', () => {
+    expect(validateImportTrainStateRequest({ ...valid(), repository: 'fleet/v2' })).toEqual({
+      ok: false,
+      reason: 'invalid-repository',
+    });
+    expect(validateImportTrainStateRequest({ ...valid(), repository: { owner: '.', repo: 'v2' } })).toEqual({
+      ok: false,
+      reason: 'invalid-repository',
+    });
+    expect(validateImportTrainStateRequest({ ...valid(), stateDir: '' })).toEqual({
+      ok: false,
+      reason: 'invalid-state-dir',
+    });
   });
 });

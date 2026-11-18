@@ -21,6 +21,7 @@ import {
   CancelPreparedAttemptUseCase,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
+  CutoverJournalAdapter,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
   ExplainAttemptUseCase,
@@ -468,6 +469,22 @@ export function composeExecution(input: ComposeExecutionInput) {
         ? { outcome: 'consumed', actionId: request.actionId }
         : { outcome: 'refused', reason: result.reason };
     },
+    // GR1b: the standing shadow import grant's head-free resolve, answered
+    // by the coordination use case behind the composition root. `grantId` is
+    // a non-secret handle; no secret-shaped value is ever echoed.
+    authorizeShadowImport: async (request) => {
+      const result = await coordination.resolveActionAuthorization.resolveActionAuthorization({
+        projectId: request.projectId,
+        actionScope: 'merge:import-shadow',
+        expectedHeadSha: '',
+        authorizationGrantId: request.grantId,
+        repository: request.repository,
+      });
+      if (result.outcome === 'authorized') {
+        return { outcome: 'authorized', grantId: result.grantId };
+      }
+      return { outcome: result.outcome, reason: result.reason };
+    },
   });
 
   const executionObservation = new ExecutionObservationAdapter({
@@ -536,11 +553,23 @@ export function composeExecution(input: ComposeExecutionInput) {
   const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository });
   const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
   const legacyTrainState = new LegacyTrainStateReadAdapter();
+  // GR1b: the shadow-intake journal is built here, inside composeExecution,
+  // where `stateDir` is available — the composition root calls composeExecution
+  // before it builds the shared cutover journal. It is a separate journal file
+  // (never cutover-journal.json, whose 10,000-entry cap is shared with
+  // cutover and relaunch); in-memory without a durable state directory.
+  const shadowIntakeJournal =
+    stateDir !== undefined && stateDir.trim().length > 0
+      ? new CutoverJournalAdapter({ stateDir, fileName: 'shadow-intake-journal.json' })
+      : new CutoverJournalAdapter();
   const importTrainState = new ImportTrainStateUseCase({
     legacyState: legacyTrainState,
     queue: mergeQueueRepository,
     mintUlid: () => newUlid(),
     nowIso: () => new Date().toISOString(),
+    authorization: actionAuthorization,
+    journal: shadowIntakeJournal,
+    computeDigest: sha256HexDigest,
   });
 
   // WB4a: the lane-plan store — one adapter is both stores (in-memory when

@@ -7,6 +7,8 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { createFleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
+import { parseMergeImportFlags } from '../merge.js';
+import { CliUsageError } from '../commands/payload.js';
 
 const HEAD_A = '0123456789abcdef0123456789abcdef01234567';
 const HEAD_B = '0123456789abcdef0123456789abcdef01234568';
@@ -288,5 +290,211 @@ describe('merge commands (DT4)', () => {
     expect(view.entries.map((entry) => entry.entryId)).toEqual([ulid(4)]);
     expect(view.entries.some((entry) => entry.state === 'superseded')).toBe(false);
     expect(view.heads[0]?.headEntryId).toBe(ulid(4));
+  });
+});
+
+describe('merge import (GR1b)', () => {
+  it('--authority is a usage error, with or without --apply', async () => {
+    const runtime = createFleetCliRuntime({});
+    const withoutApply = await cli(runtime, [
+      'merge',
+      'import',
+      '--repository',
+      'fleet/v2',
+      '--legacy-state-dir',
+      '/tmp/legacy',
+      '--authority',
+      'owner-said-yes',
+    ]);
+    expect(withoutApply.code).toBe(2);
+    expect(withoutApply.err).toContain('merge import does not accept --authority; use --grant and --project');
+
+    const withApply = await cli(runtime, [
+      'merge',
+      'import',
+      '--repository',
+      'fleet/v2',
+      '--legacy-state-dir',
+      '/tmp/legacy',
+      '--apply',
+      '--authority',
+      'owner-said-yes',
+    ]);
+    expect(withApply.code).toBe(2);
+    expect(withApply.err).toContain('merge import does not accept --authority; use --grant and --project');
+  });
+
+  it('--apply without --grant and --project is a usage error', async () => {
+    const runtime = createFleetCliRuntime({});
+    const noFlags = await cli(runtime, [
+      'merge',
+      'import',
+      '--repository',
+      'fleet/v2',
+      '--legacy-state-dir',
+      '/tmp/legacy',
+      '--apply',
+    ]);
+    expect(noFlags.code).toBe(2);
+    expect(noFlags.err).toContain('merge import --apply requires --grant <id> and --project <id>');
+
+    const onlyGrant = await cli(runtime, [
+      'merge',
+      'import',
+      '--repository',
+      'fleet/v2',
+      '--legacy-state-dir',
+      '/tmp/legacy',
+      '--apply',
+      '--grant',
+      'grant-1',
+    ]);
+    expect(onlyGrant.code).toBe(2);
+    expect(onlyGrant.err).toContain('merge import --apply requires --grant <id> and --project <id>');
+  });
+
+  it('refuses a getter-carrying payload without ever running the getter', () => {
+    let getterCalls = 0;
+    const payload: Record<string, unknown> = {
+      repository: 'fleet/v2',
+      legacyStateDir: '/tmp/legacy',
+      apply: false,
+    };
+    Object.defineProperty(payload, 'grant', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return 'grant-1';
+      },
+    });
+    expect(() => parseMergeImportFlags(payload)).toThrow(CliUsageError);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('refuses a prototype-polluting own key', () => {
+    const payload = JSON.parse('{"repository":"fleet/v2","legacyStateDir":"/tmp/legacy","apply":false}') as Record<string, unknown>;
+    Object.defineProperty(payload, '__proto__', { value: { apply: true }, enumerable: true, configurable: true });
+    expect(() => parseMergeImportFlags(payload)).toThrow(CliUsageError);
+  });
+
+  it('a Proxy over a valid dry-run payload yields exactly the plain-data flags with no get trap', () => {
+    let getTraps = 0;
+    const plain = parseMergeImportFlags({
+      repository: 'fleet/v2',
+      legacyStateDir: '/tmp/legacy',
+      apply: false,
+    });
+    const proxy = new Proxy({ repository: 'fleet/v2', legacyStateDir: '/tmp/legacy', apply: false }, {
+      get() {
+        getTraps += 1;
+        return undefined;
+      },
+    });
+    expect(parseMergeImportFlags(proxy)).toEqual(plain);
+    expect(plain).toEqual({
+      repository: { owner: 'fleet', repo: 'v2' },
+      stateDir: '/tmp/legacy',
+      apply: false,
+      grantId: null,
+      projectId: null,
+    });
+    expect(getTraps).toBe(0);
+  });
+
+  it('a constant or identity parse would fail: apply flags are read from grant and project', () => {
+    const dryRun = parseMergeImportFlags({ repository: 'fleet/v2', legacyStateDir: '/tmp/legacy', apply: false });
+    expect(dryRun.apply).toBe(false);
+    const applied = parseMergeImportFlags({
+      repository: 'fleet/v2',
+      legacyStateDir: '/tmp/legacy',
+      apply: 'true',
+      grant: 'grant-1',
+      project: 'project-1',
+    });
+    expect(applied).toEqual({
+      repository: { owner: 'fleet', repo: 'v2' },
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: 'grant-1',
+      projectId: 'project-1',
+    });
+    expect(() => parseMergeImportFlags({ ...{ repository: 'fleet/v2', legacyStateDir: '/tmp/legacy', apply: true } })).toThrow(
+      CliUsageError,
+    );
+  });
+
+  it('real-chain unknown grant returns grant-missing exit 1 without queue or journal writes', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-merge-import-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    const legacyStateDir = path.join(stateDir, 'legacy');
+
+    const result = await cli(runtime, [
+      'merge',
+      'import',
+      '--repository',
+      'fleet/v2',
+      '--legacy-state-dir',
+      legacyStateDir,
+      '--apply',
+      '--grant',
+      'grant-1',
+      '--project',
+      'project-1',
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.out)).toEqual({ outcome: 'refused', reason: 'grant-missing' });
+    // Nothing was written: no queue file, no shadow-intake journal, and the
+    // never-read legacy state dir was never created.
+    expect(fs.access(path.join(stateDir, 'merge-queue.json'))).rejects.toThrow();
+    expect(fs.access(path.join(stateDir, 'shadow-intake-journal.json'))).rejects.toThrow();
+    expect(fs.access(legacyStateDir)).rejects.toThrow();
+  });
+
+  it('an approved apply returns applied and exits 0 (injected runtime)', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-merge-import-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    // One injected runtime for the approved path: the authorization chain is
+    // exercised end to end in the refused case above and in the use-case
+    // tests; here only the CLI's applied plumbing is under test.
+    const appliedResult = {
+      outcome: 'applied',
+      imported: 1,
+      refused: 0,
+      unknownLineNumbers: [],
+      notImportableBase: 0,
+      alreadyQueued: 0,
+      parkedLines: 0,
+      chainFiles: 0,
+      batchLines: 0,
+      inprogressLines: 0,
+      unknownBySource: { queue: [], parked: [], inprogress: [] },
+      keys: [
+        { pullRequest: 42, headOid: HEAD_A, base: 'main', source: 'queue', disposition: 'would-import' },
+      ],
+      keysTruncated: false,
+    };
+    (runtime.execution as { importTrainState: unknown }).importTrainState = {
+      importTrainState: async () => appliedResult,
+    };
+
+    const result = await cli(runtime, [
+      'merge',
+      'import',
+      '--repository',
+      'fleet/v2',
+      '--legacy-state-dir',
+      '/tmp/legacy',
+      '--apply',
+      '--grant',
+      'grant-1',
+      '--project',
+      'project-1',
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toEqual(appliedResult);
   });
 });

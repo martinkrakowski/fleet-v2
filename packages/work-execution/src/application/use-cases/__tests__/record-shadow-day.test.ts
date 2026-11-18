@@ -5013,6 +5013,65 @@ describe('RecordShadowDayUseCase S12 coverage guards and corrupt daemon-event li
     expect(guarded.evidence.calls.cas).toBe(0);
   });
 
+  // OD7a3 fix round: a malformed `droppedLines` fails closed BEFORE any
+  // bracketing logic, so it stays `unknown` even when the day has no in-day
+  // parsed records (no bracket) — in BOTH modes, writing nothing.
+  it.each([
+    ['a negative position', [-1]],
+    ['a non-integer position', [1.5]],
+    ['a wrong primitive position element', ['x']],
+    ['a non-array droppedLines', 'nope'],
+  ])('answers unknown daemon-events-corrupt for %s with no in-day records (manual mode)', async (_title, droppedLines) => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    const prevEvents = [1380, 1381, 1382].map((index) => daemonJobEvent(index, PREV_DAY));
+    const read = dayRead(prevEvents, droppedLines as readonly number[]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
+
+  it.each([
+    ['a negative position', [-1]],
+    ['a non-integer position', [1.5]],
+  ])('answers unknown daemon-events-corrupt for %s with no in-day records (scheduled mode)', async (_title, droppedLines) => {
+    const harness = scheduledHarness(cleanFixture(DAY));
+    const prevEvents = [1380, 1381, 1382].map((index) => daemonJobEvent(index, PREV_DAY));
+    const read = dayRead(prevEvents, droppedLines as readonly number[]);
+    const guarded = harnessWithRead(harness, read);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
+
+  it('answers unknown daemon-events-corrupt for a Proxy over a read with a malformed droppedLines and no in-day records', async () => {
+    const harness = makeHarness(cleanFixture(DAY), NOW);
+    let getTrapCalls = 0;
+    const trapKeys: string[] = [];
+    const prevEvents = [1380, 1381, 1382].map((index) => daemonJobEvent(index, PREV_DAY));
+    const plain = dayRead(prevEvents, [-1]) as Record<string, unknown>;
+    const proxy = new Proxy(plain, {
+      get(target, key, receiver) {
+        // Awaiting the port result makes the promise protocol probe `then`
+        // on the resolved value; that is not a data read, so it is not
+        // counted — every data key must stay trap-free.
+        if (key !== 'then') {
+          getTrapCalls += 1;
+          trapKeys.push(String(key));
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const guarded = harnessWithRead(harness, proxy);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+    expect(getTrapCalls, trapKeys.join()).toBe(0);
+  });
+
   it('answers unknown daemon-events-corrupt for a sparse droppedLines array (an array hole)', async () => {
     const harness = makeHarness(cleanFixture(DAY), NOW);
     const sparse: number[] = [0];
@@ -5090,19 +5149,24 @@ describe('RecordShadowDayUseCase S12 coverage guards and corrupt daemon-event li
     let getTrapCalls = 0;
     const proxy = new Proxy(plain, {
       get(target, key, receiver) {
-        getTrapCalls += 1;
+        // Awaiting the port result makes the promise protocol probe `then`
+        // on the resolved value; that is not a data read, so it is not
+        // counted — every data key must stay trap-free.
+        if (key !== 'then') {
+          getTrapCalls += 1;
+        }
         return Reflect.get(target, key, receiver);
       },
     });
     const guarded = harnessWithRead(harness, proxy);
     const result = await new RecordShadowDayUseCase(guarded.deps).execute(makeRequest());
-    // The Proxy must yield exactly the plain data's verdict (a get trap may
-    // run only on the use case's own later plain `.events` read, never to
-    // change what the corrupt-line inspection saw).
+    // The Proxy must yield exactly the plain data's verdict, and no `get`
+    // trap may run for a data key: the inspection and the `ok` check read
+    // only through own data descriptors.
     expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
     const plainResult = await new RecordShadowDayUseCase(harnessWithRead(makeHarness(cleanFixture(DAY), NOW), plain).deps).execute(makeRequest());
     expect(result).toEqual(plainResult);
-    expect(getTrapCalls).toBeGreaterThanOrEqual(0);
+    expect(getTrapCalls).toBe(0);
   });
 
   it('is not satisfiable by a constant refusal: a clean read without dropped lines records normally', async () => {

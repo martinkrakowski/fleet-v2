@@ -83,7 +83,7 @@ import type {
   RecordShadowDayUnevaluated,
 } from '../ports/in/RecordShadowDayPort.in-port.js';
 import type { ChainListResult, ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
-import type { DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
+import type { DaemonEventCursorRead, DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type {
   LegacyTrainChainsRead,
@@ -1217,12 +1217,22 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // 2. Events read and first-tick `job` guard: only `job` events count, and
     // the earliest in-day one must fall within the first-tick grace window.
     const read = await this.call(context.deadlineIso, () => this.deps.daemonEvents.readAfterCursor(null));
-    if (read.kind === 'threw' || !read.value.ok) {
+    // OD7a3 fix round: the `ok` flag is read through its own data descriptor,
+    // so a Proxy over the read never runs a `get` trap for it.
+    const okDescriptor =
+      read.kind === 'threw' ? undefined : Object.getOwnPropertyDescriptor(read.value, 'ok');
+    if (
+      read.kind === 'threw' ||
+      okDescriptor === undefined ||
+      okDescriptor.get !== undefined ||
+      okDescriptor.value !== true
+    ) {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
     }
+    const okRead = read.value as Extract<DaemonEventCursorRead, { ok: true }>;
     // OD7a3: a dropped line bracketed inside the day's parsed records makes
     // the day unknown before anything is evaluated or written.
-    if (corruptLineBracketedInDay(read.value, context.day)) {
+    if (corruptLineBracketedInDay(okRead, context.day)) {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-corrupt' } };
     }
     // OD7a2 fix round: the raw events are validated and snapshotted exactly
@@ -1234,7 +1244,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // could pass), so any event whose snapshot is null stops the run as
     // `s12-unknown` before anything is written.
     const validatedEvents: DaemonEventSnapshot[] = [];
-    for (const event of read.value.events) {
+    for (const event of okRead.events) {
       const snapshot = snapshotEvent(event);
       if (snapshot === null) {
         return { stop: { outcome: 'unknown', reason: 's12-unknown' } };
@@ -1725,16 +1735,26 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
   /** S12: daemon tick health over the whole day's window of projected events. */
   private async evaluateTickHealthCriterion(context: DayContext): Promise<CriterionOutcome> {
     const read = await this.call(context.deadlineIso, () => this.deps.daemonEvents.readAfterCursor(null));
-    if (read.kind === 'threw' || !read.value.ok) {
+    // OD7a3 fix round: the `ok` flag is read through its own data descriptor,
+    // so a Proxy over the read never runs a `get` trap for it.
+    const okDescriptor =
+      read.kind === 'threw' ? undefined : Object.getOwnPropertyDescriptor(read.value, 'ok');
+    if (
+      read.kind === 'threw' ||
+      okDescriptor === undefined ||
+      okDescriptor.get !== undefined ||
+      okDescriptor.value !== true
+    ) {
       return unevaluatedOutcome('S12', 'daemon-events-unavailable');
     }
+    const okRead = read.value as Extract<DaemonEventCursorRead, { ok: true }>;
     // OD7a3: a dropped line bracketed inside the day's parsed records makes
     // the day unknown — writing nothing. The typed result is carried out of
     // the outcomes evaluation by the `S12GuardResult` sentinel.
-    if (corruptLineBracketedInDay(read.value, context.day)) {
+    if (corruptLineBracketedInDay(okRead, context.day)) {
       throw new S12GuardResult(unknownResult('daemon-events-corrupt'));
     }
-    const events = read.value.events.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
+    const events = okRead.events.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
     const evaluation = evaluateShadowTickHealth({ day: context.day, events });
     // OD7a3: manual mode refuses the two S12 coverage failures instead of
     // recording a `fail` verdict — nothing is written to the ledger.

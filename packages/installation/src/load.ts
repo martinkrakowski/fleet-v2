@@ -4,7 +4,6 @@ import {
   existsSync,
   fstatSync,
   openSync,
-  readFileSync,
   readSync,
   realpathSync,
 } from 'node:fs';
@@ -29,7 +28,12 @@ import { validateSeatPolicy, v1FamilyWarnings } from './policy.js';
  * the identity check and the parse.
  */
 export interface InstallationFileSeam {
-  /** Open the file `O_RDONLY | O_NOFOLLOW`; a symlink is `ELOOP`. */
+  /**
+   * Open the file `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`; a symlink is
+   * `ELOOP`. `O_NONBLOCK` keeps a FIFO with no writer from blocking in
+   * `open`: the handle is `fstat`-ed immediately and anything that is not
+   * a regular file is refused before a single byte is read.
+   */
   open?: (path: string) => number;
   /** `fstat` the open handle: uid, full mode, and regular-file-ness. */
   fstat?: (fd: number) => { uid: number; mode: number; isFile: () => boolean };
@@ -131,6 +135,39 @@ const OWNER_TRUST_REMEDY =
   'move the installation file out of every checkout to ~/.config/fleet-v2/fleet.json ' +
   '(0600 in a 0700 directory) and set FLEET_INSTALLATION_FILE to that path';
 
+/**
+ * The most bytes the installation file may hold. No larger cap exists in the
+ * parser, so 1 MiB bounds every read: a device such as `/dev/zero` (or any
+ * endless source) can never make `readAll` loop forever.
+ */
+const MAX_INSTALLATION_FILE_BYTES = 1024 * 1024;
+
+/** Error code thrown when a read passes `MAX_INSTALLATION_FILE_BYTES`. */
+const FILE_CAP_ERROR_CODE = 'EFLEETFILECAP';
+
+/** Read the whole file from the open handle, refusing anything over the cap. */
+function readCapped(fd: number): string {
+  const chunks: Buffer[] = [];
+  const buffer = Buffer.alloc(64 * 1024);
+  let total = 0;
+  for (;;) {
+    const read = readSync(fd, buffer, 0, buffer.length, null);
+    if (read <= 0) {
+      break;
+    }
+    total += read;
+    if (total > MAX_INSTALLATION_FILE_BYTES) {
+      const error = new Error(
+        'installation file exceeds the size cap',
+      ) as NodeJS.ErrnoException;
+      error.code = FILE_CAP_ERROR_CODE;
+      throw error;
+    }
+    chunks.push(Buffer.from(buffer.subarray(0, read)));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 /** The seam with every member filled in: the given overrides over `node:fs`. */
 interface ResolvedSeam {
   open: (path: string) => number;
@@ -146,7 +183,11 @@ function resolveSeam(seam: InstallationFileSeam | undefined): ResolvedSeam {
   return {
     open:
       seam?.open ??
-      ((path: string) => openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)),
+      ((path: string) =>
+        openSync(
+          path,
+          fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+        )),
     fstat: seam?.fstat ?? ((fd: number) => {
       const stats = fstatSync(fd);
       return { uid: stats.uid, mode: stats.mode, isFile: () => stats.isFile() };
@@ -154,16 +195,7 @@ function resolveSeam(seam: InstallationFileSeam | undefined): ResolvedSeam {
     readAll:
       seam?.readAll ??
       ((fd: number) => {
-        const chunks: Buffer[] = [];
-        const buffer = Buffer.alloc(64 * 1024);
-        for (;;) {
-          const read = readSync(fd, buffer, 0, buffer.length, null);
-          if (read <= 0) {
-            break;
-          }
-          chunks.push(Buffer.from(buffer.subarray(0, read)));
-        }
-        return Buffer.concat(chunks).toString('utf8');
+        return readCapped(fd);
       }),
     close: seam?.close ?? closeSync,
     getuid: seam?.getuid ?? (() => process.getuid?.() ?? -1),
@@ -177,6 +209,15 @@ type FileRead =
   | { kind: 'absent' }
   | { kind: 'unreadable' }
   | {
+      /**
+       * The file was refused before any byte was read: it is not a regular
+       * file, its handle could not be `fstat`-ed, or it exceeds
+       * `MAX_INSTALLATION_FILE_BYTES`.
+       */
+      kind: 'refused';
+      reason: string;
+    }
+  | {
       kind: 'bytes';
       raw: string;
       /** True when the path is a symlink, read through the fallback. */
@@ -186,11 +227,58 @@ type FileRead =
     };
 
 /**
- * Read the installation file. The bytes always come from the handle `open`
- * returned and `fstat` runs on that same handle, so the trust decision and
- * the parse see the same bytes. A symlinked path is read through the plain
- * fallback (the behaviour of an ownerless file is unchanged) and refused
- * later when the file carries an `owner` section.
+ * `fstat` the open handle, or undefined when the handle cannot be statted.
+ */
+function statHandle(
+  fd: number,
+  seam: ResolvedSeam,
+): { uid: number; mode: number; isFile: () => boolean } | undefined {
+  try {
+    return seam.fstat(fd);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Read from an already-open handle after its `fstat` proved it a regular
+ * file, capped at `MAX_INSTALLATION_FILE_BYTES`. `'refused'` when the cap
+ * is exceeded, `'error'` on any other read failure.
+ */
+function readRegularFile(
+  fd: number,
+  seam: ResolvedSeam,
+): { kind: 'raw'; raw: string } | { kind: 'refused'; reason: string } | { kind: 'error' } {
+  try {
+    const raw = seam.readAll(fd);
+    if (Buffer.byteLength(raw) > MAX_INSTALLATION_FILE_BYTES) {
+      return {
+        kind: 'refused',
+        reason: 'the installation file exceeds the 1 MiB size cap',
+      };
+    }
+    return { kind: 'raw', raw };
+  } catch (error) {
+    if (readErrorCode(error) === FILE_CAP_ERROR_CODE) {
+      return {
+        kind: 'refused',
+        reason: 'the installation file exceeds the 1 MiB size cap',
+      };
+    }
+    return { kind: 'error' };
+  }
+}
+
+/**
+ * Read the installation file. Every path opens with
+ * `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` and `fstat`s the handle immediately,
+ * refusing anything that is not a regular file before any byte is read, so
+ * a FIFO with no writer cannot block in `open` and a device such as
+ * `/dev/zero` cannot make the read loop forever. The total bytes read are
+ * capped at `MAX_INSTALLATION_FILE_BYTES`. A symlinked path is read through
+ * the plain fallback — which opens the target without `O_NOFOLLOW` but
+ * applies the same immediate `fstat` and size cap before reading anything —
+ * and refused later when the file carries an `owner` section.
  */
 function readInstallationFile(file: string, seam: ResolvedSeam): FileRead {
   let fd: number;
@@ -202,22 +290,54 @@ function readInstallationFile(file: string, seam: ResolvedSeam): FileRead {
       return { kind: 'absent' };
     }
     if (code === 'ELOOP') {
+      let targetFd: number;
       try {
-        return { kind: 'bytes', raw: readFileSync(file, 'utf8'), symlinked: true };
+        targetFd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
       } catch {
         return { kind: 'unreadable' };
+      }
+      try {
+        const stats = statHandle(targetFd, seam);
+        if (stats === undefined) {
+          return { kind: 'refused', reason: 'the file handle could not be fstat-ed' };
+        }
+        if (!stats.isFile()) {
+          return { kind: 'refused', reason: 'not-a-regular-file' };
+        }
+        const read = readRegularFile(targetFd, seam);
+        if (read.kind === 'error') {
+          return { kind: 'unreadable' };
+        }
+        if (read.kind === 'refused') {
+          return read;
+        }
+        return { kind: 'bytes', raw: read.raw, symlinked: true, stats };
+      } finally {
+        try {
+          closeSync(targetFd);
+        } catch {
+          // The read outcome is already decided; a failed close changes nothing.
+        }
       }
     }
     return { kind: 'unreadable' };
   }
   try {
-    let stats: { uid: number; mode: number; isFile: () => boolean } | undefined;
-    try {
-      stats = seam.fstat(fd);
-    } catch {
-      stats = undefined;
+    const stats = statHandle(fd, seam);
+    if (stats === undefined) {
+      return { kind: 'refused', reason: 'the file handle could not be fstat-ed' };
     }
-    return { kind: 'bytes', raw: seam.readAll(fd), symlinked: false, stats };
+    if (!stats.isFile()) {
+      return { kind: 'refused', reason: 'not-a-regular-file' };
+    }
+    const read = readRegularFile(fd, seam);
+    if (read.kind === 'error') {
+      return { kind: 'unreadable' };
+    }
+    if (read.kind === 'refused') {
+      return read;
+    }
+    return { kind: 'bytes', raw: read.raw, symlinked: false, stats };
   } catch {
     return { kind: 'unreadable' };
   } finally {
@@ -442,12 +562,15 @@ function applyEnvironmentOverrides(
  *
  * When the parsed file carries an `owner` section, the loader proves the file
  * trusted before returning the pinned `owner.publicKey` (see
- * `ownerTrustReason`): the bytes are read from an `O_NOFOLLOW` handle that is
- * `fstat`-ed on the spot, and a file that is a symlink, not a regular file,
- * not owned by the process uid, group/other-writable, inside any
- * `hosts.*.worktreeRoot`, or inside a git checkout or worktree is refused
- * with `owner-key-installation-untrusted` and the remedy. A file without an
- * `owner` section is read exactly as before, with no checks.
+ * `ownerTrustReason`): the bytes are read from an `O_NOFOLLOW | O_NONBLOCK`
+ * handle that is `fstat`-ed on the spot, and a file that is a symlink, not a
+ * regular file, not owned by the process uid, group/other-writable, inside
+ * any `hosts.*.worktreeRoot`, or inside a git checkout or worktree is
+ * refused with `owner-key-installation-untrusted` and the remedy. Before any
+ * byte is read — with or without an `owner` section — a handle that is not a
+ * regular file (a FIFO, a device) or a read past `MAX_INSTALLATION_FILE_BYTES`
+ * is refused the same way. A file without an `owner` section is otherwise
+ * read exactly as before, with no checks.
  */
 export function loadInstallation(options: LoadOptions = {}): LoadResult {
   const cwd = options.cwd ?? process.cwd();
@@ -464,6 +587,14 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
     source = 'absent';
   } else if (read.kind === 'unreadable') {
     return { status: 'invalid', file, errors: [`${file}: unreadable`] };
+  } else if (read.kind === 'refused') {
+    return {
+      status: 'invalid',
+      file,
+      errors: [
+        `${file}: owner-key-installation-untrusted (${read.reason}); ${OWNER_TRUST_REMEDY}`,
+      ],
+    };
   } else {
     let parsed: unknown;
     try {

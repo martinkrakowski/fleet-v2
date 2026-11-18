@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -511,7 +518,7 @@ describe('loadInstallation owner trust check', () => {
     const seam = {
       fstat: () => ({ uid: process.getuid?.() ?? -1, mode: 0o100644, isFile: () => false }),
     };
-    expectUntrusted(readErrors(load(file, seam)), 'regular file');
+    expectUntrusted(readErrors(load(file, seam)), 'not-a-regular-file');
   });
 
   it('refuses a group- or other-writable file', () => {
@@ -620,5 +627,56 @@ describe('loadInstallation owner trust check', () => {
     freshDir();
     const result = load(join(tempDir, 'missing.json'));
     expect(result.status).toBe('absent');
+  });
+
+  function mkfifoAvailable(): boolean {
+    try {
+      execFileSync('sh', ['-c', 'command -v mkfifo'], { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const HAS_MKFIFO = mkfifoAvailable();
+
+  it('refuses a FIFO promptly, before any read', (ctx) => {
+    if (!HAS_MKFIFO) {
+      ctx.skip();
+    }
+    freshDir();
+    const file = join(tempDir, 'fleet.json');
+    execFileSync('mkfifo', [file]);
+    const start = Date.now();
+    expectUntrusted(readErrors(load(file)), 'not-a-regular-file');
+    // A blocking open would hang far longer than this; a prompt refusal is
+    // well under a second on any supported host.
+    expect(Date.now() - start).toBeLessThan(5000);
+  });
+
+  it('refuses a directory', () => {
+    freshDir();
+    const file = join(tempDir, 'fleet.json');
+    mkdirSync(file);
+    expectUntrusted(readErrors(load(file)), 'not-a-regular-file');
+  });
+
+  it('refuses an oversized regular file', () => {
+    freshDir();
+    const file = join(tempDir, 'fleet.json');
+    // Just over the 1 MiB cap: a valid JSON prefix followed by padding so a
+    // naive uncapped read would still parse (and a capped read must refuse).
+    const content = `{"schemaVersion":1}${' '.repeat(1024 * 1024 + 1)}`;
+    writeFileSync(file, content, { mode: 0o600 });
+    expectUntrusted(readErrors(load(file)), 'size cap');
+  });
+
+  it('refuses a symlink whose target is a directory before reading it', () => {
+    freshDir();
+    const dir = join(tempDir, 'target-dir');
+    mkdirSync(dir);
+    const link = join(tempDir, 'fleet.json');
+    symlinkSync(dir, link);
+    expectUntrusted(readErrors(load(link)), 'not-a-regular-file');
   });
 });

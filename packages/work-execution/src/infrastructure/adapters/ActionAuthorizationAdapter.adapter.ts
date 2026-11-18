@@ -19,6 +19,8 @@ import { LANE_DIFF_SECRET_PATTERNS, readPlainRecord, SECRET_PATTERNS } from '@fl
 
 import type {
   ActionAuthorizationPort,
+  AuthorizeShadowImportRequest,
+  AuthorizeShadowImportResult,
   AuthorizeUnsealedWorktreeRemovalRequest,
   AuthorizeUnsealedWorktreeRemovalResult,
   ConsumeActionAuthorizationRequest,
@@ -80,6 +82,13 @@ export interface ActionAuthorizationDelegate {
   readonly authorizeUnsealedWorktreeRemoval?: (
     request: AuthorizeUnsealedWorktreeRemovalRequest,
   ) => Promise<AuthorizeUnsealedWorktreeRemovalResult>;
+  /**
+   * The standing shadow import grant's head-free resolve, answered by the
+   * coordination use case behind the composition root.
+   */
+  readonly authorizeShadowImport?: (
+    request: AuthorizeShadowImportRequest,
+  ) => Promise<AuthorizeShadowImportResult>;
 }
 
 const FORGE_ACTION_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status'] as const;
@@ -98,6 +107,8 @@ const MAX_HEAD_LENGTH = 64;
 const MAX_POLICY_REVISION_LENGTH = 256;
 const MAX_REASON_LENGTH = 300;
 const MAX_ROOT_LENGTH = 4096;
+/** Bounded per repository segment, matching the domain's own grant cap. */
+const MAX_REPOSITORY_SEGMENT_LENGTH = 100;
 
 const PATH_SHAPE = /(?:^|[\s"'(=])(?:\/[A-Za-z0-9._-]+){2,}|[A-Za-z]:\\/;
 const SAFE_HEAD_TOKEN = /^[A-Za-z0-9._-]+$/;
@@ -567,6 +578,77 @@ function readUnsealedRemovalAnswer(answer: unknown): AuthorizeUnsealedWorktreeRe
   };
 }
 
+/**
+ * The standing shadow import grant's resolve request: a bounded,
+ * descriptor-safe read. A non-object, a wrong-typed or oversized field, or a
+ * hostile accessor is refused, never thrown. `grantId` is a non-secret
+ * handle, but it is still bounded and screened so nothing path-shaped or
+ * secret-shaped can pass for it.
+ */
+function readShadowImportRequest(request: unknown): Validated<AuthorizeShadowImportRequest> {
+  const read = readPlainRecord(request, {
+    projectId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
+    grantId: { kind: 'string', maxLength: MAX_GRANT_ID_LENGTH },
+    repository: {
+      kind: 'record',
+      schema: {
+        owner: { kind: 'string', maxLength: MAX_REPOSITORY_SEGMENT_LENGTH },
+        repo: { kind: 'string', maxLength: MAX_REPOSITORY_SEGMENT_LENGTH },
+      },
+    },
+    nowIso: { kind: 'string', maxLength: 64 },
+  });
+  if (!read.ok) {
+    return { ok: false, reason: failureOf(read.reason) };
+  }
+  const value = read.value as unknown as AuthorizeShadowImportRequest;
+  if (
+    !isSafeId(value.projectId, MAX_SCOPE_ID_LENGTH, false) ||
+    !isSafeId(value.grantId, MAX_GRANT_ID_LENGTH, true) ||
+    !isSafeId(value.repository.owner, MAX_REPOSITORY_SEGMENT_LENGTH, false) ||
+    !isSafeId(value.repository.repo, MAX_REPOSITORY_SEGMENT_LENGTH, false) ||
+    typeof value.nowIso !== 'string' ||
+    value.nowIso.trim().length === 0
+  ) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  return { ok: true, value: { ...value } };
+}
+
+/**
+ * The delegate's shadow import answer. Only an authorized answer with a
+ * bounded, secret-free, path-free grant handle (a non-secret id by design)
+ * is passed on; every other shape is unknown, so an unreadable answer is
+ * never authority.
+ */
+function readShadowImportAnswer(answer: unknown): AuthorizeShadowImportResult {
+  const head = readPlainRecord(answer, {
+    outcome: { kind: 'literal', values: ['authorized', 'blocked', 'unknown'] },
+  });
+  if (!head.ok) {
+    return { outcome: 'unknown', reason: 'authorization-unavailable' };
+  }
+  if (head.value.outcome === 'authorized') {
+    const granted = readPlainRecord(answer, {
+      grantId: { kind: 'string', maxLength: MAX_GRANT_ID_LENGTH },
+    });
+    if (!granted.ok || !isSafeId(granted.value.grantId, MAX_GRANT_ID_LENGTH, true)) {
+      return { outcome: 'unknown', reason: 'authorization-unreadable' };
+    }
+    return { outcome: 'authorized', grantId: granted.value.grantId as string };
+  }
+  const withReason = readPlainRecord(answer, {
+    reason: { kind: 'string', maxLength: MAX_REASON_LENGTH },
+  });
+  if (!withReason.ok) {
+    return { outcome: 'unknown', reason: 'authorization-unavailable' };
+  }
+  return {
+    outcome: head.value.outcome as 'blocked' | 'unknown',
+    reason: cleanReason(withReason.value.reason as string, 'delegate-blocked'),
+  };
+}
+
 function readDelegateResolveResult(
   answer: unknown,
 ): ResolveActionAuthorizationResult | null {
@@ -644,6 +726,7 @@ interface ReadDelegate {
   readonly consumeGrant: ActionAuthorizationDelegate['consumeGrant'];
   readonly grants: Map<string, ActionAuthorizationGrantEntry> | undefined;
   readonly authorizeUnsealedWorktreeRemoval: ActionAuthorizationDelegate['authorizeUnsealedWorktreeRemoval'];
+  readonly authorizeShadowImport: ActionAuthorizationDelegate['authorizeShadowImport'];
 }
 
 export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
@@ -662,6 +745,7 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         consumeGrant: this.delegate?.consumeGrant,
         grants: grants instanceof Map ? grants : undefined,
         authorizeUnsealedWorktreeRemoval: this.delegate?.authorizeUnsealedWorktreeRemoval,
+        authorizeShadowImport: this.delegate?.authorizeShadowImport,
       };
     } catch {
       return null;
@@ -740,6 +824,32 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
       return { outcome: 'unknown', reason: 'authorization-unreadable' };
     }
     return readUnsealedRemovalAnswer(answer);
+  }
+
+  /**
+   * The standing shadow import grant's head-free resolve. A malformed or
+   * hostile request is blocked; an absent delegate or delegate method, a
+   * throwing delegate or an unreadable answer is unknown — never authority.
+   * The grant id echoed in an authorized answer is a non-secret handle.
+   */
+  async authorizeShadowImport(
+    request: AuthorizeShadowImportRequest,
+  ): Promise<AuthorizeShadowImportResult> {
+    const delegate = this.readDelegate();
+    if (delegate === null || typeof delegate.authorizeShadowImport !== 'function') {
+      return { outcome: 'unknown', reason: 'authorization-unavailable' };
+    }
+    const validated = readShadowImportRequest(request);
+    if (!validated.ok) {
+      return { outcome: 'blocked', reason: validated.reason };
+    }
+    let answer: unknown;
+    try {
+      answer = await delegate.authorizeShadowImport(validated.value);
+    } catch {
+      return { outcome: 'unknown', reason: 'authorization-unavailable' };
+    }
+    return readShadowImportAnswer(answer);
   }
 
   private async resolveThroughDelegate(

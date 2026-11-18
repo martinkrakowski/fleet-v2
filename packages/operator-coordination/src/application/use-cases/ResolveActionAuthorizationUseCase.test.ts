@@ -1,7 +1,10 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
+import { SHADOW_IMPORT_ACTION_SCOPE } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { ResolveActionAuthorizationUseCase } from './ResolveActionAuthorizationUseCase.use-case.js';
+import type { ResolveActionAuthorizationResult } from '../ports/in/ResolveActionAuthorizationPort.in-port.js';
 
 class InMemoryCoordinationRequestRepository implements CoordinationRequestRepositoryPort {
   private readonly records = new Map<string, CoordinationRequestRecord>();
@@ -222,5 +225,248 @@ describe('ResolveActionAuthorizationUseCase', () => {
       pullRequestNumber: 1,
     });
     expect(result.outcome).toBe('blocked');
+  });
+});
+
+describe('ResolveActionAuthorizationUseCase shadow import resolve (GR1a2)', () => {
+  const NOW_ISO = '2026-11-18T00:00:00Z';
+  // 28 days after NOW_ISO: inside the 30-day TTL cap.
+  const EXPIRES_AT_ISO = '2026-12-16T00:00:00Z';
+  const OWNER = 'octo';
+  const REPO = 'hello';
+  const GRANT_ID = 'grant-shadow';
+
+  function digest(payload: string): string {
+    return createHash('sha256').update(payload).digest('hex');
+  }
+
+  const REQUEST_ID = `shadow-import-${digest(
+    JSON.stringify({ scope: SHADOW_IMPORT_ACTION_SCOPE, owner: OWNER, repo: REPO, expiresAtIso: EXPIRES_AT_ISO }),
+  )}`;
+
+  function createShadowGrantRecord(overrides?: Partial<CoordinationRequestRecord>): CoordinationRequestRecord {
+    return {
+      id: REQUEST_ID,
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+      expectedHeadSha: null,
+      proposalDigest: 'sha256-proposal',
+      policyRevision: 'pol-rev-1',
+      decisionRevision: 'dec-rev-1',
+      grantId: GRANT_ID,
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: NOW_ISO,
+      updatedAtIso: NOW_ISO,
+      shadowImportGrant: { repository: { owner: OWNER, repo: REPO }, expiresAtIso: EXPIRES_AT_ISO },
+      ...overrides,
+    };
+  }
+
+  function shadowUseCase(
+    requestRepo: InMemoryCoordinationRequestRepository,
+    overrides: {
+      computeDigest?: ((payload: string) => string) | null;
+      clock?: { readonly nowIso: () => string } | null;
+    } = {},
+  ): ResolveActionAuthorizationUseCase {
+    // Defaults are the wired composition: the digest and the trusted clock.
+    // `null` unwires either, for the fail-closed tests.
+    return new ResolveActionAuthorizationUseCase({
+      requestRepo,
+      ...(overrides.computeDigest === null ? {} : { computeDigest: overrides.computeDigest ?? digest }),
+      ...(overrides.clock === null ? {} : { shadowImportClock: overrides.clock ?? { nowIso: () => NOW_ISO } }),
+    });
+  }
+
+  function resolve(
+    useCase: ResolveActionAuthorizationUseCase,
+    overrides: Record<string, unknown> = {},
+  ): Promise<ResolveActionAuthorizationResult> {
+    return useCase.resolveActionAuthorization({
+      projectId: 'proj-1',
+      actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+      authorizationGrantId: GRANT_ID,
+      repository: { owner: OWNER, repo: REPO },
+      ...overrides,
+    } as never);
+  }
+
+  it('authorizes a standing grant head-free and never binds an attempt', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord());
+    const result = await resolve(shadowUseCase(requestRepo));
+    expect(result).toEqual({
+      outcome: 'authorized',
+      grantId: GRANT_ID,
+      requestId: REQUEST_ID,
+      expectedHeadSha: '',
+      policyRevision: 'pol-rev-1',
+    });
+  });
+
+  it('blocks with project-id-required on an empty projectId (never Not implemented)', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord());
+    const result = await resolve(shadowUseCase(requestRepo), { projectId: '   ' });
+    expect(result).toEqual({ outcome: 'blocked', reason: 'project-id-required' });
+  });
+
+  it('blocks with grant-missing when the grant id is absent or unknown', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord());
+    const missingId = await resolve(shadowUseCase(requestRepo), { authorizationGrantId: undefined });
+    expect(missingId).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+    const unknown = await resolve(shadowUseCase(requestRepo), { authorizationGrantId: 'grant-unknown' });
+    expect(unknown).toEqual({ outcome: 'blocked', reason: 'grant-missing' });
+  });
+
+  it('blocks with grant-wrong-repository on invalid repository coordinates', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord());
+    const invalid = await resolve(shadowUseCase(requestRepo), { repository: 'no-segment' });
+    expect(invalid).toEqual({ outcome: 'blocked', reason: 'grant-wrong-repository' });
+    const mismatch = await resolve(shadowUseCase(requestRepo), {
+      repository: { owner: 'other', repo: REPO },
+    });
+    expect(mismatch).toEqual({ outcome: 'blocked', reason: 'grant-wrong-repository' });
+  });
+
+  it('fails closed with clock-unavailable when the shadow clock is unwired', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord());
+    const result = await resolve(
+      new ResolveActionAuthorizationUseCase({ requestRepo, computeDigest: digest }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'clock-unavailable' });
+  });
+
+  it('blocks with invalid-now-iso when the clock reads an unparseable instant', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord());
+    const result = await resolve(
+      shadowUseCase(requestRepo, { clock: { nowIso: () => 'not-an-instant' } }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-now-iso' });
+  });
+
+  it('fails closed with digest-unavailable when the digest is unwired', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord());
+    const result = await resolve(
+      new ResolveActionAuthorizationUseCase({
+        requestRepo,
+        shadowImportClock: { nowIso: () => NOW_ISO },
+      }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'digest-unavailable' });
+  });
+
+  it('blocks with grant-digest-mismatch when the stored coordinates no longer match the id', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    // The grant's expiry moved after recording: the recomputed digest of the
+    // stored coordinates no longer matches the request id it is bound by.
+    await requestRepo.saveRequest(
+      createShadowGrantRecord({
+        shadowImportGrant: {
+          repository: { owner: OWNER, repo: REPO },
+          expiresAtIso: '2026-12-20T00:00:00Z',
+        },
+      }),
+    );
+    const result = await resolve(shadowUseCase(requestRepo));
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-digest-mismatch' });
+  });
+
+  it('blocks with grant-not-approved for an unanswered or declined request', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(
+      createShadowGrantRecord({ state: 'awaiting-decision', decisionRevision: null }),
+    );
+    const unanswered = await resolve(shadowUseCase(requestRepo));
+    expect(unanswered).toEqual({ outcome: 'blocked', reason: 'grant-not-approved' });
+    await requestRepo.saveRequest(createShadowGrantRecord({ state: 'declined' }));
+    const declined = await resolve(shadowUseCase(requestRepo));
+    expect(declined).toEqual({ outcome: 'blocked', reason: 'grant-not-approved' });
+  });
+
+  it('blocks with grant-revoked for a cancelled grant', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord({ state: 'cancelled' }));
+    const result = await resolve(shadowUseCase(requestRepo));
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-revoked' });
+  });
+
+  it('blocks with grant-wrong-scope when the recorded request is not a shadow import', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(
+      createShadowGrantRecord({ actionScope: 'forge:merge-pr', expectedHeadSha: 'a'.repeat(40) }),
+    );
+    const result = await resolve(shadowUseCase(requestRepo));
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-wrong-scope' });
+  });
+
+  it('blocks with grant-wrong-project on a project mismatch', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord());
+    const result = await resolve(shadowUseCase(requestRepo), { projectId: 'proj-other' });
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-wrong-project' });
+  });
+
+  it('blocks with grant-expired once the clock passes the expiry', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createShadowGrantRecord());
+    const afterExpiry = await resolve(
+      shadowUseCase(requestRepo, { clock: { nowIso: () => '2026-12-16T00:00:00.001Z' } }),
+    );
+    expect(afterExpiry).toEqual({ outcome: 'blocked', reason: 'grant-expired' });
+    // A backdated nowIso on the request cannot revive the expired grant: the
+    // request field is ignored and the clock alone decides.
+    const revived = await resolve(shadowUseCase(requestRepo, { clock: { nowIso: () => '2026-12-16T00:00:00.001Z' } }), {
+      nowIso: '2026-11-18T00:00:00Z',
+    });
+    expect(revived).toEqual({ outcome: 'blocked', reason: 'grant-expired' });
+  });
+
+  it('keeps every non-shadow path on main behaviour', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest({
+      id: 'req-merge-1',
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      proposalDigest: 'digest-1',
+      policyRevision: 'aaaaaaaaaaaa',
+      decisionRevision: 'policy:merge@aaaaaaaaaaaa',
+      grantId: 'grant-merge-1',
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-02T00:00:00.000Z',
+      updatedAtIso: '2026-11-02T00:00:00.000Z',
+      mergeGrant: {
+        repository: { owner: 'repo-a-owner', repo: 'repo-a' },
+        pullRequestNumber: 1,
+      },
+    });
+    const useCase = new ResolveActionAuthorizationUseCase({ requestRepo });
+    const result = await useCase.resolveActionAuthorization({
+      projectId: 'proj-1',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: '1111111111111111111111111111111111111111',
+      authorizationGrantId: 'grant-merge-1',
+      repository: { owner: 'repo-a-owner', repo: 'repo-a' },
+      pullRequestNumber: 1,
+    });
+    expect(result.outcome).toBe('authorized');
   });
 });

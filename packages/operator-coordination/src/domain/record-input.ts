@@ -51,7 +51,11 @@ export function readPlainObjectLoose(value: unknown): Record<string, unknown> | 
   if (prototype !== Object.prototype && prototype !== null) {
     return null;
   }
-  const out: Record<string, unknown> = {};
+  // The snapshot is built on a null prototype: an own `__proto__` key on the
+  // incoming body (as `JSON.parse('{"__proto__":{...}}')` produces) is copied
+  // as an ordinary data property instead of mutating the snapshot's
+  // prototype, so the snapshot reads exactly like main reads any other body.
+  const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== 'string') {
       return null;

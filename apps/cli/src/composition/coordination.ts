@@ -4,8 +4,14 @@
  * CLI composition root.
  */
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { newUlid } from '../ulid.js';
+
+/** The SHA-256 hex digest a shadow import grant's request id is bound by. */
+function computeSha256HexDigest(payload: string): string {
+  return createHash('sha256').update(payload).digest('hex');
+}
 
 import {
   AcknowledgeOwnerAnswerUseCase,
@@ -214,11 +220,17 @@ export function composeCoordination(input: ComposeCoordinationInput) {
       // The shadow import grant's moment is the composition root's clock
       // alone: no request body ever supplies it.
       shadowImportClock: { nowIso: () => new Date().toISOString() },
+      // The request id a shadow import grant is bound by carries this digest.
+      computeDigest: computeSha256HexDigest,
     }),
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase({
       requestRepo: coordinationRequestRepository,
       decisionTransport,
       ...(input.attemptFactsRead !== undefined ? { attemptFactsRead: input.attemptFactsRead } : {}),
+      // The standing shadow import grant resolves head-free: its digest and
+      // expiry are re-checked here with the root's own clock and digest.
+      shadowImportClock: { nowIso: () => new Date().toISOString() },
+      computeDigest: computeSha256HexDigest,
     }),
     // One-way doors are answered by the coordination request's own
     // authorization rule, through the application layer: the evidence context

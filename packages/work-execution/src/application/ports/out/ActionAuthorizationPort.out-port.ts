@@ -86,7 +86,30 @@ export interface ActionAuthorizationPort {
   authorizeUnsealedWorktreeRemoval?(
     request: AuthorizeUnsealedWorktreeRemovalRequest,
   ): Promise<AuthorizeUnsealedWorktreeRemovalResult>;
+
+  /**
+   * The standing shadow import grant's head-free resolve. The grant is bound
+   * by its digest-bound request id, its exact repository and its capped
+   * expiry — never by a commit — so no head coordinate is carried here. The
+   * caller supplies its own clock reading (`nowIso`); the clock behind it
+   * stays with the caller, never with the request payload.
+   */
+  authorizeShadowImport?(
+    request: AuthorizeShadowImportRequest,
+  ): Promise<AuthorizeShadowImportResult>;
 }
+
+export interface AuthorizeShadowImportRequest {
+  readonly projectId: string;
+  readonly grantId: string;
+  readonly repository: { readonly owner: string; readonly repo: string };
+  readonly nowIso: string;
+}
+
+export type AuthorizeShadowImportResult =
+  | { readonly outcome: 'authorized'; readonly grantId: string }
+  | { readonly outcome: 'blocked'; readonly reason: string }
+  | { readonly outcome: 'unknown'; readonly reason: string };
 
 export interface AuthorizeUnsealedWorktreeRemovalRequest {
   readonly projectId: string;

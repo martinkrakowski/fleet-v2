@@ -535,4 +535,23 @@ describe('RequestScopedDecisionUseCase ordinary decisions stay as on main (GR1a1
       expect(result.request.createdAtIso).not.toBe(NOW_ISO);
     }
   });
+
+  it('handles a body with an own __proto__ key exactly as on main', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    // `JSON.parse` gives the body a real own `__proto__` key, exactly as an
+    // HTTP body carrying one arrives; the spread copies it as data, without
+    // invoking the inherited setter.
+    const hostile = {
+      ...ordinaryRequest({ unknownBodyKey: 'whatever' }),
+      ...(JSON.parse('{"__proto__":{"polluted":true}}') as Record<string, unknown>),
+    };
+    const result = await useCaseWith(repo).execute(hostile);
+    // Main accepted the body and ignored the unknown keys, so the fixed
+    // snapshot must accept it too — and never mutate Object.prototype.
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.actionScope).toBe('host:restart');
+    }
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
 });

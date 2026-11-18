@@ -25,7 +25,13 @@ import {
 } from "@fleet/work-execution";
 import type { LaneRunJournalEntryRecord } from "@fleet/work-execution";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { newUlid } from "../work/ulid.js";
+
+/** The SHA-256 hex digest a shadow import grant's request id is bound by. */
+function computeSha256HexDigest(payload: string): string {
+  return createHash("sha256").update(payload).digest("hex");
+}
 import {
   AcknowledgeOwnerAnswerUseCase,
   AnswerOwnerQuestionUseCase,
@@ -268,12 +274,18 @@ export function createConfiguredOperatorComposition(
       decisionTransport,
       // The shadow import grant's moment is the composition root's clock
       // alone: no request body ever supplies it.
-      shadowImportClock: { nowIso: () => new Date().toISOString() },
+      shadowImportClock: systemClock,
+      // The request id a shadow import grant is bound by carries this digest.
+      computeDigest: computeSha256HexDigest,
     }),
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase({
       requestRepo,
       decisionTransport,
       attemptFactsRead,
+      // The standing shadow import grant resolves head-free: its digest and
+      // expiry are re-checked here with the root's own clock and digest.
+      shadowImportClock: systemClock,
+      computeDigest: computeSha256HexDigest,
     }),
     resolveOwnerItem: new ResolveOwnerItemUseCase({
       itemRepo: ownerItemRepo,

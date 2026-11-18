@@ -21,10 +21,11 @@ import {
   LaneRun,
   SHADOW_LEDGER_SCHEMA_VERSION,
   ShadowEvidenceAdapter,
+  type InventoryRelaunchResult,
   type ManageCutoverResult,
 } from '@fleet/work-execution';
 
-import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
+import { createFleetCliRuntime, summarizeInventoryForCutover, type FleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 
 const execFileAsync = promisify(execFile);
@@ -285,6 +286,27 @@ async function snapshotState(dir: string): Promise<Map<string, string>> {
   return listFileBytes(dir);
 }
 
+/** One raw profile record shaped like the ghost profile below (registration refuses these shapes). */
+function rawProfile(projectId: string, clones: Record<string, unknown>): unknown {
+  return {
+    projectId,
+    displayName: `Project ${projectId}`,
+    repository: 'https://example.com/example.git',
+    designatedDispatcherHost: HOST,
+    policyRevision: 'pol-1',
+    maxConcurrentLanes: 4,
+    runnerCapabilities: { networkEgressRestricted: true },
+    revision: 0,
+    updatedAtIso: NOW,
+    status: 'active',
+    defaultBranch: null,
+    clones,
+    gateProcedures: [],
+    defaultAllowedPathPrefixes: [],
+    lastProbe: null,
+  };
+}
+
 describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
   it('completes the switch when the passing window holds and every listed worktree is a proven recorded lane', async () => {
     const fx = await fixture({ worktrees: [RUN_ID] });
@@ -309,6 +331,71 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     expect(await snapshotState(fx.stateDir)).toEqual(before);
     await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
     await expect(fs.stat(path.join(fx.stateDir, 'cutover-journal.json'))).rejects.toThrow();
+  });
+
+  it('refuses when an active profile declares no clones: no clone coverage is never a pass', async () => {
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await fs.writeFile(
+      path.join(fx.stateDir, 'project-profiles.json'),
+      JSON.stringify([rawProfile('proj-empty', {})]),
+      'utf8',
+    );
+    await seedShadowLedger(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
+    expect(code).toBe(1);
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover-journal.json'))).rejects.toThrow();
+  });
+
+  it('refuses when one active profile among covered ones declares no clones', async () => {
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await registerRealCloneProfile(fx);
+    const profiles = JSON.parse(await fs.readFile(path.join(fx.stateDir, 'project-profiles.json'), 'utf8')) as unknown[];
+    profiles.push(rawProfile('proj-empty', {}));
+    await fs.writeFile(path.join(fx.stateDir, 'project-profiles.json'), JSON.stringify(profiles), 'utf8');
+    await seedShadowLedger(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
+    expect(code).toBe(1);
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover-journal.json'))).rejects.toThrow();
+  });
+
+  it('refuses when the inventory inspects fewer clones than the profiles declare', async () => {
+    // The real inventory counts every requested clone per host, so partial
+    // coverage cannot be produced through the composition without changing
+    // the use case (forbidden). This pins the helper's contract directly:
+    // an inventoried result that inspected 1 of 2 declared clones is
+    // unreadable, and the gate answers `unrecorded-lanes-unknown` for it,
+    // so the switch is never performed on partial coverage.
+    const inventoried: InventoryRelaunchResult = {
+      outcome: 'inventoried',
+      nowIso: NOW,
+      conductor: { halted: false, driverLease: 'absent', runCount: 0 },
+      riskFlags: [],
+      hosts: [
+        {
+          hostName: HOST,
+          cloneCount: 1,
+          worktreeCount: 0,
+          counts: { conducted: 0, attemptRecorded: 0, unrecorded: 0 },
+          riskFlags: [],
+          lanes: [],
+        },
+      ],
+    };
+    expect(summarizeInventoryForCutover(inventoried, 2)).toEqual({ status: 'unreadable' });
+    expect(summarizeInventoryForCutover(inventoried, 1)).toEqual({
+      status: 'ok',
+      unrecorded: 0,
+      unknownListings: 0,
+    });
+    expect(summarizeInventoryForCutover(inventoried)).toEqual({
+      status: 'ok',
+      unrecorded: 0,
+      unknownListings: 0,
+    });
   });
 
   it('refuses unrecorded-lanes on an unrecorded idle leftover worktree and writes nothing', async () => {
@@ -440,9 +527,12 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     });
     await fs.writeFile(path.join(fx.stateDir, 'project-profiles.json'), JSON.stringify(profiles), 'utf8');
     await seedShadowLedger(fx.stateDir);
+    const before = await snapshotState(fx.stateDir);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
     expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
   });
 
   it('answers unknown when the clone listing cannot be read', async () => {
@@ -459,18 +549,24 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     });
     expect(registered.outcome).toBe('registered');
     await seedShadowLedger(fx.stateDir);
+    const before = await snapshotState(fx.stateDir);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
     expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
   });
 
   it('answers unknown when the runner read fails for a worktree', async () => {
     const fx = await fixture({ worktrees: ['broken-lane'] });
     await registerRealCloneProfile(fx);
     await seedShadowLedger(fx.stateDir);
+    const before = await snapshotState(fx.stateDir);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
     expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
   });
 
   it('refuses shadow-evidence-absent when no shadow ledger exists, before the lanes gate', async () => {

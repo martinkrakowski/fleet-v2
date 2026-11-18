@@ -1069,23 +1069,36 @@ function readStoredShadowEvidence(
  * failing open when a stale record on a reused path stays `attempt-recorded`
  * and counts 0 unrecorded). `unproven-lane-records` is deliberately not
  * counted: an unproven record is listed in the inventory and never refuses
- * the switch.
+ * the switch. When `declaredClones` is given, an inventory that inspected
+ * fewer clones than declared is unreadable, never a pass on partial
+ * coverage (CO30c fix round). Exported for the cutover-switch regression
+ * tests.
  */
-function summarizeInventoryForCutover(
+export function summarizeInventoryForCutover(
   result: InventoryRelaunchResult,
+  declaredClones?: number,
 ): { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number } | { readonly status: 'unreadable' } {
   if (result.outcome !== 'inventoried') {
     return { status: 'unreadable' };
   }
   let unrecorded = 0;
   let unknownListings = 0;
+  let inspectedClones = 0;
   for (const host of result.hosts) {
+    inspectedClones += host.cloneCount;
     unrecorded += host.counts.unrecorded;
     for (const flag of host.riskFlags) {
       if (flag.code === 'unknown-worktree-read' || flag.code === 'unknown-runner-state') {
         unknownListings += flag.count;
       }
     }
+  }
+  // CO30c fix round: the inventory must have inspected every clone the
+  // active profiles declare. Fewer inspected clones (a dropped host group, a
+  // clone the read skipped) is not fewer lanes to explain: it is unreadable,
+  // never a pass on partial coverage.
+  if (declaredClones !== undefined && inspectedClones < declaredClones) {
+    return { status: 'unreadable' };
   }
   return { status: 'ok', unrecorded, unknownListings };
 }
@@ -1493,7 +1506,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // quarantine, and no writable daemon, conductor or profile instance is
   // reachable from here. Zero active project profiles (a missing
   // `project-profiles.json` reads as empty) is unreadable too: it never
-  // passes 0/0.
+  // passes 0/0. Nor does partial clone coverage (CO30c fix round): an
+  // active profile with zero clones, zero clones across all profiles, or
+  // an inventory that inspected fewer clones than the profiles declare is
+  // unreadable, never a vacuous pass.
   const countUnrecordedLanes = durableCutover
     ? async (): Promise<
         | { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number }
@@ -1521,7 +1537,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
           }
           const clones: RelaunchCloneRef[] = [];
           for (const profile of active) {
-            for (const [cloneHost, clone] of Object.entries(profile.clones)) {
+            const entries = Object.entries(profile.clones);
+            // CO30c fix round: an active profile with no clone coverage is
+            // never a pass — the inventory would see nothing and the gate
+            // would pass vacuously. One declared-clone-less profile is as
+            // unreadable as zero profiles.
+            if (entries.length === 0) {
+              return { status: 'unreadable' };
+            }
+            for (const [cloneHost, clone] of entries) {
               clones.push({
                 projectId: profile.projectId,
                 hostName: cloneHost,
@@ -1531,12 +1555,17 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
               });
             }
           }
+          // CO30c fix round: zero declared clones across every active
+          // profile is the same vacuous pass, refused before the read.
+          if (clones.length === 0) {
+            return { status: 'unreadable' };
+          }
           const inventory = await inventoryRelaunch.inventoryRelaunch({
             nowIso: daemon.now(),
             hostName: null,
             clones,
           });
-          return summarizeInventoryForCutover(inventory);
+          return summarizeInventoryForCutover(inventory, clones.length);
         } catch {
           return { status: 'unreadable' };
         }

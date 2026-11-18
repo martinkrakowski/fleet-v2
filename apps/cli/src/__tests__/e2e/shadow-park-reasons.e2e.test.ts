@@ -317,7 +317,11 @@ async function enqueue(
   expect(['created', 'supersedes']).toContain(decision.outcome);
 }
 
-function journalKey(action: 'merge-pr' | 'update-branch', pullRequest = 1, head = HEAD): string {
+function journalKey(
+  action: 'merge-pr' | 'update-branch' | 'would-drop',
+  pullRequest = 1,
+  head = HEAD,
+): string {
   const built = buildMergeKey({
     repoDigest: DIGEST,
     pullRequest,
@@ -385,7 +389,9 @@ describe('S2 shadow park-reasons e2e (narrowed per owner decision 2026-11-17)', 
     });
   });
 
-  it('drops `checks` after maxAttempts instead of parking again', async () => {
+  it('journals would-drop for `checks` after maxAttempts and the entry stays live', async () => {
+    // Owner decision A+ (2026-11-18): a shadow drop is never persisted — the
+    // attempt-cap drop is journalled as would-drop and the entry stays live.
     const h = harness();
     await enqueue(h.runtime, 1);
     rewriteAttempt(h.stateDir, 1, 9); // the default maxAttempts is 9
@@ -395,10 +401,13 @@ describe('S2 shadow park-reasons e2e (narrowed per owner decision 2026-11-17)', 
 
     expect(result.code).toBe(0);
     expect(entryFor(h.stateDir, 1)).toMatchObject({
-      state: 'dropped',
-      reason: 'checks',
-      notBeforeIso: null,
+      state: 'queued',
+      reason: null,
+      attempt: 9,
     });
+    const wouldDrop = await h.runtime.conductor.laneRunJournal.listForKey(journalKey('would-drop'));
+    expect(wouldDrop.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(wouldDrop[1]).toMatchObject({ outcome: 'dry-run', reasonCode: 'would-drop', detail: 'checks' });
   });
 
   it('parks `threads` without backoff while review threads are unresolved', async () => {
@@ -817,14 +826,16 @@ describe('S2 refusal paths fail closed', () => {
     expect(stub.calls.filter((call) => call.args[1] === 'graphql').length).toBeGreaterThan(0);
   });
 
-  it('returns skipped or notifier-unavailable when optional queueWriter or notifier port is absent', async () => {
+  it('returns skipped when the queueWriter is absent; a writer persists silently without a notifier', async () => {
     // No queue writer: the pass stays the observer and reports the park as a no-action.
     const skipped = await observerPass({});
     expect(skipped[0]).toMatchObject({ decision: 'no-action', reasonCode: 'checks' });
 
-    // A writer without a notifier refuses the transition: nothing is written.
+    // Owner decision A+ (2026-11-18): a shadow park persists as on main, but
+    // SHADOW IS SILENT — the notification step is skipped and journalled as
+    // would-notify, so a writer without a notifier still records the park.
     let writes = 0;
-    const refused = await observerPass({
+    const recorded = await observerPass({
       queueWriter: {
         applyMergeTransition: async () => {
           writes += 1;
@@ -832,8 +843,8 @@ describe('S2 refusal paths fail closed', () => {
         },
       },
     });
-    expect(refused[0]).toMatchObject({ decision: 'no-action', reasonCode: 'notifier-unavailable' });
-    expect(writes).toBe(0);
+    expect(recorded[0]).toMatchObject({ decision: 'recorded', reasonCode: 'checks' });
+    expect(writes).toBe(1);
   });
 });
 

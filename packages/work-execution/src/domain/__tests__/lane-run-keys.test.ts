@@ -12,6 +12,7 @@ import {
   LANE_RUN_MAX_RETRY,
   MERGE_KEY_ACTIONS,
   MERGE_KEY_ONE_WAY_ACTIONS,
+  MERGE_KEY_SHADOW_MUTATION_ACTIONS,
   MERGE_KEY_TRANSIENT_REFUSAL_REASON,
   MERGE_KEY_TWO_WAY_ACTIONS,
   parseLaneRunKey,
@@ -522,7 +523,11 @@ describe('merge keys', () => {
   };
 
   it('round-trips one-way base keys', () => {
-    expect(MERGE_KEY_ACTIONS).toEqual([...MERGE_KEY_ONE_WAY_ACTIONS, ...MERGE_KEY_TWO_WAY_ACTIONS]);
+    expect(MERGE_KEY_ACTIONS).toEqual([
+      ...MERGE_KEY_ONE_WAY_ACTIONS,
+      ...MERGE_KEY_TWO_WAY_ACTIONS,
+      ...MERGE_KEY_SHADOW_MUTATION_ACTIONS,
+    ]);
     for (const action of MERGE_KEY_ONE_WAY_ACTIONS) {
       const built = buildMergeKey({ ...MERGE_BASE_PARTS, action });
       expect(built).toEqual({ ok: true, key: `merge/${REPO_DIGEST}/42/${HEAD12}/${action}` });

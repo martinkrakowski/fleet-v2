@@ -153,7 +153,7 @@ async function harness(options: {
 }
 
 describe('RunMergePassUseCase (DT9c): audit fields', () => {
-  it('records the verification audit on the entry, still journals only a dry-run, and writes once', async () => {
+  it('in shadow mode the ready entry persists as on main (owner decision A+), with no notification', async () => {
     const h = await harness({ forge: greenForge });
 
     const first = await h.useCase.runMergePass(h.request());
@@ -161,6 +161,28 @@ describe('RunMergePassUseCase (DT9c): audit fields', () => {
     expect(first.outcome).toBe('completed');
     expect(first.entries[0].decision).toBe('journalled');
     expect(first.entries[0].reasonCode).toBe('would-merge');
+    const [entry] = await h.list();
+    // Owner decision A+ (2026-11-18): enter-ready persists as on main, so the
+    // verification audit lands on the entry exactly as under a live policy.
+    expect(entry).toMatchObject({
+      state: 'ready', policyRevision: 'rev-1', verifiedHeadOid: HEAD, verifiedBy: 'contexts',
+      premergeReceiptHeadOid: HEAD, veto: null, mergeCommitOid: null, mergedAtIso: null, revision: 2,
+    });
+
+    await h.useCase.runMergePass(h.request());
+    expect((await h.list())[0].revision).toBe(2); // nothing rewritten
+    expect(h.notifier.requests).toHaveLength(0);
+    expect(h.verificationCalls.count).toBe(0);
+  });
+
+  it('a live pass records the verification audit on the entry and writes once', async () => {
+    const h = await harness({ forge: greenForge, policy: { shadow: false } });
+
+    const first = await h.useCase.runMergePass(h.request());
+
+    expect(first.outcome).toBe('completed');
+    expect(first.entries[0].decision).toBe('live-deferred');
+    expect(first.entries[0].reasonCode).toBe('merge-pr');
     const [entry] = await h.list();
     expect(entry).toMatchObject({
       state: 'ready', policyRevision: 'rev-1', verifiedHeadOid: HEAD, verifiedBy: 'contexts',
@@ -189,7 +211,7 @@ describe('RunMergePassUseCase (DT9c): audit fields', () => {
 
 describe('RunMergePassUseCase (DT9c): successor entries', () => {
   it('a moved head supersedes the entry and writes the successor in one step', async () => {
-    const h = await harness({ forge: { ...greenForge, liveHeadSha: HEAD_MOVED } as ReadForgeMergeResult });
+    const h = await harness({ forge: { ...greenForge, liveHeadSha: HEAD_MOVED } as ReadForgeMergeResult, policy: { shadow: false } });
 
     const result = await h.useCase.runMergePass(h.request());
 
@@ -221,7 +243,7 @@ describe('RunMergePassUseCase (DT9c): successor entries', () => {
         return delegate.target!.applyMergeTransition(command);
       },
     };
-    const h = await harness({ forge: { ...greenForge, liveHeadSha: HEAD_MOVED } as ReadForgeMergeResult, writer: flaky });
+    const h = await harness({ forge: { ...greenForge, liveHeadSha: HEAD_MOVED } as ReadForgeMergeResult, writer: flaky, policy: { shadow: false } });
     delegate.target = h.queue;
 
     const first = await h.useCase.runMergePass(h.request());
@@ -236,7 +258,7 @@ describe('RunMergePassUseCase (DT9c): successor entries', () => {
 
   it('a revision conflict is reported, not retried inside the pass', async () => {
     const writer = { async applyMergeTransition(): Promise<MergeTransitionDecision> { return { outcome: 'refused', reason: 'revision-conflict' }; } };
-    const h = await harness({ forge: greenForge, writer });
+    const h = await harness({ forge: greenForge, writer, policy: { shadow: false } });
     const result = await h.useCase.runMergePass(h.request());
     expect(result.entries[0]).toMatchObject({ decision: 'no-action', reasonCode: 'persist-conflict' });
   });
@@ -244,7 +266,7 @@ describe('RunMergePassUseCase (DT9c): successor entries', () => {
 
 describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
   it('stores a park and notifies once; a later park of the same entry does not notify again', async () => {
-    const h = await harness({ forge: failedGate });
+    const h = await harness({ forge: failedGate, policy: { shadow: false } });
 
     const first = await h.useCase.runMergePass(h.request());
     expect(first.entries[0]).toMatchObject({ decision: 'recorded', reasonCode: 'checks' });
@@ -269,7 +291,7 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
   });
 
   it('a drop notifies before it writes, once, and the dropped entry leaves the live queue', async () => {
-    const h = await harness({ forge: closedForge });
+    const h = await harness({ forge: closedForge, policy: { shadow: false } });
 
     const first = await h.useCase.runMergePass(h.request());
 
@@ -282,7 +304,7 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
   });
 
   it('a notification carries an event, an id and a key only: no path, no title', async () => {
-    const h = await harness({ forge: closedForge });
+    const h = await harness({ forge: closedForge, policy: { shadow: false } });
     await h.useCase.runMergePass(h.request());
     const request = h.notifier.requests[0];
     expect(Object.keys(request).sort()).toEqual(['deadlineIso', 'event', 'id', 'key']);
@@ -293,7 +315,7 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
     for (const mode of ['refuse', 'unavailable', 'throw', 'garbage'] as const) {
       const notifier = new FakeNotifier();
       notifier.mode = mode;
-      const h = await harness({ forge: closedForge, notifier });
+      const h = await harness({ forge: closedForge, notifier, policy: { shadow: false } });
 
       const failed = await h.useCase.runMergePass(h.request());
       expect(failed.entries[0]).toMatchObject({ decision: 'no-action', reasonCode: 'notify-failed' });
@@ -310,7 +332,7 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
   it('a deliberate suppression (notifications switched off) lets the transition through', async () => {
     const notifier = new FakeNotifier();
     notifier.mode = 'suppress';
-    const h = await harness({ forge: closedForge, notifier });
+    const h = await harness({ forge: closedForge, notifier, policy: { shadow: false } });
     const result = await h.useCase.runMergePass(h.request());
     expect(result.entries[0].decision).toBe('recorded');
     expect((await h.list())[0].state).toBe('dropped');
@@ -319,7 +341,7 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
   it('a crash between the notification and the write replays under the same key', async () => {
     const notifier = new FakeNotifier();
     const failingWriter = { async applyMergeTransition(): Promise<MergeTransitionDecision> { throw new Error('crash'); } };
-    const h = await harness({ forge: closedForge, notifier, writer: failingWriter });
+    const h = await harness({ forge: closedForge, notifier, writer: failingWriter, policy: { shadow: false } });
     await h.useCase.runMergePass(h.request());
     expect(notifier.delivered.size).toBe(1);
     expect((await h.list())[0].state).toBe('queued');
@@ -340,7 +362,7 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
   });
 
   it('without a notifier a transition that needs one is not written', async () => {
-    const h = await harness({ forge: closedForge, notifier: 'none' });
+    const h = await harness({ forge: closedForge, notifier: 'none', policy: { shadow: false } });
     const result = await h.useCase.runMergePass(h.request());
     expect(result.entries[0]).toMatchObject({ decision: 'no-action', reasonCode: 'notifier-unavailable' });
     expect((await h.list())[0].state).toBe('queued');
@@ -349,6 +371,7 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
   it('a notification is not started once the budget is spent (D-DT9)', async () => {
     const h = await harness({
       forge: closedForge,
+      policy: { shadow: false },
       journalHook: (clock) => { clock.now += 700_000; }, // past the 600 s deadline after the first journal read
     });
     const result = await h.useCase.runMergePass(h.request());
@@ -423,7 +446,7 @@ describe('RunMergePassUseCase (DT9c): hostile input and bounds', () => {
   });
 
   it('a park that later becomes a veto hold notifies under its own event and key', async () => {
-    const h = await harness({ forge: failedGate, policy: { veto: { mode: 'live', holdConfidence: 0.8 } } });
+    const h = await harness({ forge: failedGate, policy: { shadow: false, veto: { mode: 'live', holdConfidence: 0.8 } } });
     await h.useCase.runMergePass(h.request());
     expect(h.notifier.requests.map((r) => r.event)).toEqual(['parked']);
 
@@ -448,7 +471,7 @@ describe('RunMergePassUseCase (DT9c): hostile input and bounds', () => {
 
   it('reports only fixed lowercase reason tokens', async () => {
     const writer = { async applyMergeTransition(): Promise<MergeTransitionDecision> { return { outcome: 'refused', reason: 'sk-live-0123456789abcdef0123456789' as never }; } };
-    const h = await harness({ forge: closedForge, writer });
+    const h = await harness({ forge: closedForge, writer, policy: { shadow: false } });
     const result = await h.useCase.runMergePass(h.request());
     expect(result.entries[0].reasonCode).toBe('persist-refused');
     expect(JSON.stringify(result)).not.toContain('sk-live');

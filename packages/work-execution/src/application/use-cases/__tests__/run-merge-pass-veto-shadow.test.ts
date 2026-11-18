@@ -1,5 +1,8 @@
-// OG-16a: the advisory merge veto in shadow mode — one recorded row per entry,
-// log-only, and the next pass merges (or would-hold) over the stored answer.
+// OG-16a: the advisory merge veto — one recorded row per entry, log-only, and
+// the next pass merges (or would-hold) over the stored answer. Since SH24a the
+// recording runs under a LIVE policy with `veto.mode === 'shadow'`; per owner
+// decision A+ (2026-11-18) the shadow-veto record also persists under
+// `policy.shadow === true`, exactly as on main.
 import { describe, expect, it } from 'vitest';
 
 import { RunMergePassUseCase } from '../RunMergePassUseCase.use-case.js';
@@ -346,10 +349,30 @@ function factsForGreenHead(entry: MergeQueueEntryRecord) {
   };
 }
 
-describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
-  it('shadow mode records one shadow row per entry', async () => {
+describe('RunMergePassUseCase advisory veto (OG-16a, recorded under a live policy; SH24a)', () => {
+  it('under policy.shadow the veto row persists as on main (owner decision A+)', async () => {
     const entry = makeEntry();
     const w = wire([entry]);
+
+    const result = await w.useCase.runMergePass(w.request);
+
+    expect(result.outcome).toBe('completed');
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({ decision: 'no-action', reasonCode: 'veto' });
+    expect(w.vetoState.calls).toBe(1);
+    expect(w.vetoAdvice.calls).toBe(1);
+    expect(storedVeto(w.queue, entry.entryId)).toEqual({
+      outcome: 'merge-safe',
+      confidence: 0.9,
+      mode: 'shadow',
+      decisionReceiptId: 'receipt-1',
+    });
+    expect(await journalOf(w.journal)).toBe(0); // the veto row stops this pass
+  });
+
+  it('a live policy with an advisory shadow veto records one shadow row per entry', async () => {
+    const entry = makeEntry();
+    const w = wire([entry], greenForge, { policy: { shadow: false } });
 
     const result = await w.useCase.runMergePass(w.request);
 
@@ -370,7 +393,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
 
   it('a second pass over the same entry asks nothing again', async () => {
     const entry = makeEntry();
-    const w = wire([entry]);
+    const w = wire([entry], greenForge, { policy: { shadow: false } });
 
     const first = await w.useCase.runMergePass(w.request);
     expect(first.entries[0].reasonCode).toBe('veto');
@@ -378,13 +401,13 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     expect(w.vetoAdvice.calls).toBe(1);
 
     const second = await w.useCase.runMergePass(w.request);
-    expect(second.entries[0].decision).toBe('journalled');
-    expect(second.entries[0].reasonCode).toBe('would-merge');
+    expect(second.entries[0].decision).toBe('live-deferred');
+    expect(second.entries[0].reasonCode).toBe('merge-pr');
     expect(w.vetoState.calls).toBe(1); // no second ask
     expect(w.vetoAdvice.calls).toBe(1);
   });
 
-  it('an answered hold-for-human at high confidence in shadow mode leaves the merge decision a would-merge, with vetoShadow: would-hold', async () => {
+  it('an answered hold-for-human at high confidence leaves the merge decision a would-merge, with vetoShadow: would-hold', async () => {
     const entry = makeEntry();
     const w = wire([entry], greenForge, {
       vetoAdviceResult: {
@@ -394,7 +417,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
         decisionReceiptId: 'receipt-hold',
         mode: 'shadow',
       },
-      policy: { veto: { mode: 'shadow', holdConfidence: 0.8 } },
+      policy: { veto: { mode: 'shadow', holdConfidence: 0.8 }, shadow: false },
     });
 
     const first = await w.useCase.runMergePass(w.request);
@@ -405,11 +428,11 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
       mode: 'shadow',
     });
 
-    // The next pass still reaches would-merge; the veto is advisory only.
+    // The next pass still reaches the merge act; the veto is advisory only.
     const second = await w.useCase.runMergePass(w.request);
-    expect(second.entries[0].decision).toBe('journalled');
-    expect(second.entries[0].reasonCode).toBe('would-merge');
-    expect(await journalOf(w.journal)).toBeGreaterThanOrEqual(2);
+    expect(second.entries[0].decision).toBe('live-deferred');
+    expect(second.entries[0].reasonCode).toBe('merge-pr');
+    expect(await journalOf(w.journal)).toBe(0);
 
     // The decider, re-run on the persisted entry, carries vetoShadow.
     const persisted = w.queue.records.get(entry.entryId) as MergeQueueEntryRecord;
@@ -429,7 +452,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
   it('a port throw, an unknown advice and an unavailable state each record outcome unknown and block nothing', async () => {
     // vetoState throwing
     const thrown = makeEntry();
-    const wThrow = wire([thrown], greenForge, { vetoStateResult: new Error('state down') });
+    const wThrow = wire([thrown], greenForge, { vetoStateResult: new Error('state down'), policy: { shadow: false } });
     const rThrow = await wThrow.useCase.runMergePass(wThrow.request);
     expect(rThrow.outcome).toBe('completed');
     expect(rThrow.entries[0].reasonCode).toBe('veto');
@@ -440,12 +463,13 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
       mode: 'shadow',
       decisionReceiptId: null,
     });
-    expect((await wThrow.useCase.runMergePass(wThrow.request)).entries[0].reasonCode).toBe('would-merge');
+    expect((await wThrow.useCase.runMergePass(wThrow.request)).entries[0].reasonCode).toBe('merge-pr');
 
     // vetoState unavailable
     const unavailable = makeEntry();
     const wUnavail = wire([unavailable], greenForge, {
       vetoStateResult: { status: 'unavailable', reason: 'not-configured' },
+      policy: { shadow: false },
     });
     const rUnavail = await wUnavail.useCase.runMergePass(wUnavail.request);
     expect(rUnavail.entries[0].reasonCode).toBe('veto');
@@ -454,7 +478,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
 
     // vetoAdvice throwing
     const adviceThrow = makeEntry();
-    const wAdviceThrow = wire([adviceThrow], greenForge, { vetoAdviceResult: new Error('timeout') });
+    const wAdviceThrow = wire([adviceThrow], greenForge, { vetoAdviceResult: new Error('timeout'), policy: { shadow: false } });
     const rAdviceThrow = await wAdviceThrow.useCase.runMergePass(wAdviceThrow.request);
     expect(rAdviceThrow.entries[0].reasonCode).toBe('veto');
     expect(storedVeto(wAdviceThrow.queue, adviceThrow.entryId)).toMatchObject({ outcome: 'unknown' });
@@ -463,14 +487,15 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     const adviceUnknown = makeEntry();
     const wUnknown = wire([adviceUnknown], greenForge, {
       vetoAdviceResult: { status: 'unknown', reason: 'low-confidence' },
+      policy: { shadow: false },
     });
     const rUnknown = await wUnknown.useCase.runMergePass(wUnknown.request);
     expect(rUnknown.entries[0].reasonCode).toBe('veto');
     expect(storedVeto(wUnknown.queue, adviceUnknown.entryId)).toMatchObject({ outcome: 'unknown' });
 
-    // Every unknown row still lets the next pass reach would-merge.
+    // Every unknown row still lets the next pass reach the merge act.
     const again = await wUnknown.useCase.runMergePass(wUnknown.request);
-    expect(again.entries[0].reasonCode).toBe('would-merge');
+    expect(again.entries[0].reasonCode).toBe('merge-pr');
   });
 
   it('live and off modes never call the port', async () => {
@@ -492,7 +517,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
 
   it('the head passed is the verified head, never a moved one', async () => {
     const entry = makeEntry();
-    const w = wire([entry]);
+    const w = wire([entry], greenForge, { policy: { shadow: false } });
 
     await w.useCase.runMergePass(w.request);
 
@@ -502,7 +527,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
   });
 
   it('a moved live head triggers superseded with 0 veto port calls', async () => {
-    const w = wire([makeEntry()], { ...greenForge, liveHeadSha: HEAD_MOVED });
+    const w = wire([makeEntry()], { ...greenForge, liveHeadSha: HEAD_MOVED }, { policy: { shadow: false } });
 
     const result = await w.useCase.runMergePass(w.request);
 
@@ -522,7 +547,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     ];
     for (const [index, bad] of malformed.entries()) {
       const entry = makeEntry({ pullRequest: 100 + index });
-      const w = wire([entry], greenForge, { vetoAdviceResult: bad });
+      const w = wire([entry], greenForge, { vetoAdviceResult: bad, policy: { shadow: false } });
       const result = await w.useCase.runMergePass(w.request);
       expect(result.entries[0].reasonCode).toBe('veto');
       expect(storedVeto(w.queue, entry.entryId)).toEqual({
@@ -541,6 +566,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     };
     const wThrowing = wire([entry], greenForge, {
       vetoAdviceResult: throwing as unknown as MergeVetoAdvice,
+      policy: { shadow: false },
     });
     const result = await wThrowing.useCase.runMergePass(wThrowing.request);
     expect(result.entries[0].reasonCode).toBe('veto');
@@ -554,7 +580,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     ];
     for (const [index, stateResult] of cases.entries()) {
       const entry = makeEntry({ pullRequest: 300 + index });
-      const w = wire([entry], greenForge, { vetoStateResult: stateResult });
+      const w = wire([entry], greenForge, { vetoStateResult: stateResult, policy: { shadow: false } });
       const first = await w.useCase.runMergePass(w.request);
       expect(first.outcome).toBe('completed');
       expect(first.entries[0].reasonCode).toBe('veto');
@@ -567,7 +593,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
         decisionReceiptId: null,
       });
       const second = await w.useCase.runMergePass(w.request);
-      expect(second.entries[0].reasonCode).toBe('would-merge');
+      expect(second.entries[0].reasonCode).toBe('merge-pr');
       expect(w.vetoState.calls).toBe(1);
     }
   });
@@ -582,6 +608,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
         decisionReceiptId: null,
         mode: 'shadow',
       } as unknown as MergeVetoAdvice,
+      policy: { shadow: false },
     });
     await w.useCase.runMergePass(w.request);
     expect(storedVeto(w.queue, entry.entryId)).toEqual({
@@ -616,13 +643,13 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     };
   }
 
-  /** The pass went on to the shadow merge row; nothing was merged or stored as a veto. */
+  /** The pass went on to the merge row; nothing was merged or stored as a veto. */
   function expectUnrecordedVetoReachedWouldMerge(
     w: Wiring,
     entryId: string,
     result: Awaited<ReturnType<RunMergePassUseCase['runMergePass']>>,
     adviceCalls: number,
-    report: { decision: string; reasonCode: string } = { decision: 'journalled', reasonCode: 'would-merge' },
+    report: { decision: string; reasonCode: string } = { decision: 'live-deferred', reasonCode: 'merge-pr' },
   ): void {
     expect(result.outcome).toBe('completed');
     expect(result.entries).toHaveLength(1);
@@ -664,7 +691,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     expect(storedVeto(w.queue, entry.entryId)).toBeNull();
   });
 
-  it('a veto entry the record validation refuses is unknown for the pass and reaches would-merge', async () => {
+  it('a veto entry the record validation refuses is unknown for the pass and reaches the merge act', async () => {
     const entry = makeEntry();
     const w = wire([entry], greenForge, {
       vetoAdviceResult: {
@@ -674,6 +701,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
         decisionReceiptId: `receipt-${'x'.repeat(300)}`,
         mode: 'shadow',
       },
+      policy: { shadow: false },
     });
 
     const result = await w.useCase.runMergePass(w.request);
@@ -691,16 +719,14 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
         decisionReceiptId: `receipt-${'x'.repeat(300)}`,
         mode: 'shadow',
       },
+      policy: { shadow: false },
     });
 
     await w.useCase.runMergePass(w.request);
     expect(w.vetoAdvice.calls).toBe(1);
     const second = await w.useCase.runMergePass(w.request);
 
-    expectUnrecordedVetoReachedWouldMerge(w, entry.entryId, second, 2, {
-      decision: 'no-action',
-      reasonCode: 'already-journalled',
-    });
+    expectUnrecordedVetoReachedWouldMerge(w, entry.entryId, second, 2);
   });
 
   it('a failed veto write returns its reason code and stops the entry for the pass', async () => {
@@ -711,7 +737,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     ];
     for (const [index, [how, code]] of cases.entries()) {
       const entry = makeEntry({ pullRequest: 400 + index });
-      const w = wire([entry]);
+      const w = wire([entry], greenForge, { policy: { shadow: false } });
       failVetoWrite(w.queue, how);
 
       const result = await w.useCase.runMergePass(w.request);
@@ -723,9 +749,9 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     }
   });
 
-  it('a write that lands and then throws reports persist-failed and gives no same-pass would-merge', async () => {
+  it('a write that lands and then throws reports persist-failed and gives no same-pass merge act', async () => {
     const entry = makeEntry();
-    const w = wire([entry]);
+    const w = wire([entry], greenForge, { policy: { shadow: false } });
     failVetoWrite(w.queue, 'lands-then-throws');
 
     const result = await w.useCase.runMergePass(w.request);
@@ -738,7 +764,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     expect(await journalOf(w.journal)).toBe(0);
   });
 
-  it('a recorded hold-for-human is never replaced or re-asked: the next pass keeps it and only would-merges', async () => {
+  it('a recorded hold-for-human is never replaced or re-asked: the next pass keeps it and only merge-acts', async () => {
     const entry = makeEntry();
     const w = wire([entry], greenForge, {
       vetoAdviceResult: {
@@ -748,6 +774,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
         decisionReceiptId: 'receipt-hold',
         mode: 'shadow',
       },
+      policy: { shadow: false },
     });
     const first = await w.useCase.runMergePass(w.request);
     expect(first.entries[0].reasonCode).toBe('veto');
@@ -756,7 +783,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
 
     const second = await w.useCase.runMergePass(w.request);
 
-    expect(second.entries[0]).toMatchObject({ decision: 'journalled', reasonCode: 'would-merge' });
+    expect(second.entries[0]).toMatchObject({ decision: 'live-deferred', reasonCode: 'merge-pr' });
     expect(storedVeto(w.queue, entry.entryId)).toEqual(stored);
     expect(w.vetoAdvice.calls).toBe(1);
     expect(w.vetoState.calls).toBe(1);
@@ -854,6 +881,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
         },
       },
       vetoAdviceResult: { status: 'unknown', reason: 'incomplete-state' },
+      policy: { shadow: false },
     });
 
     const first = await w.useCase.runMergePass(w.request);
@@ -868,7 +896,7 @@ describe('RunMergePassUseCase advisory veto (OG-16a, shadow mode)', () => {
     });
 
     const second = await w.useCase.runMergePass(w.request);
-    expect(second.entries[0].reasonCode).toBe('would-merge');
+    expect(second.entries[0].reasonCode).toBe('merge-pr');
     expect(w.vetoAdvice.calls).toBe(1);
   });
 });

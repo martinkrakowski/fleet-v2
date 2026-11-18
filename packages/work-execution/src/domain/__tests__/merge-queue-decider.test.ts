@@ -8,6 +8,14 @@ import {
 import type { MergeRepoPolicy, MergeStepDecision, MergeStepFacts } from '../merge-queue-decider.js';
 import { MERGE_QUEUE_ENTRY_VERSION, MERGE_QUEUE_ENTRY_V2_VERSION } from '../merge-queue-records.js';
 import type { MergeQueueEntryRecord } from '../merge-queue-records.js';
+import {
+  LANE_RUN_KEY_MAX_LENGTH,
+  MERGE_KEY_SHADOW_MUTATION_ACTIONS,
+  buildMergeKey,
+  parseLaneRunKey,
+  type MergeKeyAction,
+  type MergeKeyShadowMutationAction,
+} from '../lane-run-keys.js';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const HEAD_2 = '0123456789abcdef0123456789abcdef01234568';
@@ -905,5 +913,162 @@ describe('backoff helper', () => {
 describe('defaults', () => {
   it('defaults maxAttempts to the lane retry cap', () => {
     expect(MERGE_QUEUE_DEFAULT_MAX_ATTEMPTS).toBe(9);
+  });
+});
+
+/**
+ * SH24a hostile input at the lane-run-keys boundary. Every case asserts the
+ * specific refusal, never merely that nothing threw.
+ *
+ * Cost bounds (stated per the brief): `buildMergeKey` is constant — it reads a
+ * fixed set of own descriptors over a bounded parts object. `parseLaneRunKey`
+ * is linear in the capped input: it refuses any key longer than the named
+ * constant `LANE_RUN_KEY_MAX_LENGTH` (256) before any traversal.
+ */
+describe('SH24a hostile input (lane-run-keys boundary)', () => {
+  const HEAD12 = '0123456789ab';
+  const ACTION: MergeKeyShadowMutationAction = 'would-drop';
+  const goodParts = {
+    repoDigest: DIGEST,
+    pullRequest: 1,
+    head12: HEAD12,
+    action: ACTION,
+    attemptOrdinal: null,
+    retry: null,
+  };
+  const goodKey = `merge/${DIGEST}/1/${HEAD12}/${ACTION}`;
+
+  it('null and undefined are refused with the plain-object error (buildMergeKey) or parse to null (parseLaneRunKey)', () => {
+    for (const bad of [null, undefined]) {
+      expect(buildMergeKey(bad as unknown as typeof goodParts)).toEqual({
+        ok: false,
+        error: 'LaneRun merge key parts must be a plain object',
+      });
+      expect(parseLaneRunKey(bad)).toBeNull();
+    }
+  });
+
+  it('a wrong primitive where a parts object is due is refused with the plain-object error', () => {
+    expect(buildMergeKey(7 as unknown as typeof goodParts)).toEqual({
+      ok: false,
+      error: 'LaneRun merge key parts must be a plain object',
+    });
+    expect(parseLaneRunKey(7)).toBeNull();
+  });
+
+  it('an array (with a hole) where a parts object is due is refused as a non-object', () => {
+    const holed: unknown = ['merge'];
+    delete (holed as string[])[0]; // a sparse array with a hole
+    expect(buildMergeKey(holed as unknown as typeof goodParts)).toEqual({
+      ok: false,
+      error: 'LaneRun merge key parts must be a plain object',
+    });
+  });
+
+  it('an array-like object yields the repoDigest field error, never a key', () => {
+    const arrayLike = { length: 1, 0: goodParts.repoDigest };
+    expect(buildMergeKey(arrayLike as unknown as typeof goodParts)).toEqual({
+      ok: false,
+      error: 'LaneRun merge key repoDigest must be 12 lowercase hex characters',
+    });
+  });
+
+  it('a non-iterable object where an action token is due is refused with the action error', () => {
+    expect(
+      buildMergeKey({ ...goodParts, action: {} as unknown as MergeKeyAction }),
+    ).toEqual({ ok: false, error: 'LaneRun merge key action is not a known merge action' });
+    expect(
+      buildMergeKey({ ...goodParts, action: ['would-drop'] as unknown as MergeKeyAction }),
+    ).toEqual({ ok: false, error: 'LaneRun merge key action is not a known merge action' });
+  });
+
+  it('an enormous key length is refused before any traversal', () => {
+    const huge = `merge/${DIGEST}/1/${HEAD12}/${ACTION}/${'a'.repeat(LANE_RUN_KEY_MAX_LENGTH + 1)}`;
+    expect(huge.length).toBeGreaterThan(LANE_RUN_KEY_MAX_LENGTH);
+    expect(parseLaneRunKey(huge)).toBeNull();
+  });
+
+  it('a getter on the root parts object never runs: own data descriptors only', () => {
+    let getterCalls = 0;
+    const parts = {
+      ...goodParts,
+      get repoDigest(): string {
+        getterCalls += 1;
+        return DIGEST;
+      },
+    };
+    delete (parts as { repoDigest?: string }).repoDigest;
+    Object.defineProperty(parts, 'repoDigest', {
+      get() {
+        getterCalls += 1;
+        return DIGEST;
+      },
+      enumerable: true,
+    });
+    expect(buildMergeKey(parts)).toEqual({
+      ok: false,
+      error: 'LaneRun merge key repoDigest must be 12 lowercase hex characters',
+    });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('a Proxy over a valid parts object yields exactly the plain-data result and runs no get trap', () => {
+    let getTraps = 0;
+    const proxy = new Proxy(goodParts, {
+      get(target, property, receiver) {
+        getTraps += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const built = buildMergeKey(proxy as typeof goodParts);
+    expect(built).toEqual(buildMergeKey(goodParts));
+    expect(built.ok).toBe(true);
+    expect(getTraps).toBe(0);
+  });
+
+  it('a prototype-polluting own key from JSON.parse is inert and Object.prototype stays clean', () => {
+    const raw: Record<string, unknown> = JSON.parse(
+      `{"__proto__":{"polluted":true},"repoDigest":"${DIGEST}","pullRequest":1,"head12":"${HEAD12}","action":"${ACTION}","attemptOrdinal":null,"retry":null}`,
+    );
+    expect(Object.hasOwn(raw, '__proto__')).toBe(true);
+    const built = buildMergeKey(raw as unknown as typeof goodParts);
+    expect(built).toEqual({ ok: true, key: goodKey });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('a constant verdict would fail: an uppercase action token is refused, not accepted', () => {
+    expect(
+      buildMergeKey({ ...goodParts, action: 'WOULD-DROP' as unknown as MergeKeyAction }),
+    ).toEqual({ ok: false, error: 'LaneRun merge key action is not a known merge action' });
+  });
+
+  it('an identity echo would fail: the shadow action with attempt ordinals is refused, not echoed', () => {
+    // A function that echoed its input would accept the 6-segment shadow key;
+    // the real one refuses ordinals on a shadow-mutation action.
+    expect(
+      buildMergeKey({ ...goodParts, attemptOrdinal: 1 }),
+    ).toEqual({
+      ok: false,
+      error: 'LaneRun merge key ordinals are not allowed for a shadow-mutation action',
+    });
+    expect(parseLaneRunKey(`${goodKey}/a1`)).toBeNull();
+    expect(parseLaneRunKey(`${goodKey}/r1`)).toBeNull();
+  });
+
+  it('every shadow-mutation action round-trips through buildMergeKey and parseLaneRunKey', () => {
+    for (const action of MERGE_KEY_SHADOW_MUTATION_ACTIONS) {
+      const built = buildMergeKey({ ...goodParts, action });
+      expect(built.ok).toBe(true);
+      const parsed = parseLaneRunKey((built as { key: string }).key);
+      expect(parsed).toEqual({
+        kind: 'merge',
+        repoDigest: DIGEST,
+        pullRequest: 1,
+        head12: HEAD12,
+        action,
+        attemptOrdinal: null,
+        retry: null,
+      });
+    }
   });
 });

@@ -68,9 +68,16 @@ export type MergeKeyOneWayAction = (typeof MERGE_KEY_ONE_WAY_ACTIONS)[number];
 export const MERGE_KEY_TWO_WAY_ACTIONS = ['macos-verify', 'veto'] as const;
 export type MergeKeyTwoWayAction = (typeof MERGE_KEY_TWO_WAY_ACTIONS)[number];
 
+/** Shadow-mutation merge actions (SH24a): 5-segment `merge/<repoDigest>/<pr>/<head12>/<action>` keys, no ordinals. */
+export const MERGE_KEY_SHADOW_MUTATION_ACTIONS = [
+  'would-drop', 'would-park', 'would-supersede', 'would-ready', 'would-already-merged', 'would-notify',
+] as const;
+export type MergeKeyShadowMutationAction = (typeof MERGE_KEY_SHADOW_MUTATION_ACTIONS)[number];
+
 export const MERGE_KEY_ACTIONS = [
   ...MERGE_KEY_ONE_WAY_ACTIONS,
   ...MERGE_KEY_TWO_WAY_ACTIONS,
+  ...MERGE_KEY_SHADOW_MUTATION_ACTIONS,
 ] as const;
 export type MergeKeyAction = (typeof MERGE_KEY_ACTIONS)[number];
 
@@ -403,6 +410,10 @@ function isOneWayMergeAction(action: MergeKeyAction): action is MergeKeyOneWayAc
   return (MERGE_KEY_ONE_WAY_ACTIONS as readonly string[]).includes(action);
 }
 
+function isShadowMutationMergeAction(action: MergeKeyAction): action is MergeKeyShadowMutationAction {
+  return (MERGE_KEY_SHADOW_MUTATION_ACTIONS as readonly string[]).includes(action);
+}
+
 function isBoundedPositiveInt(value: unknown, max: number): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= max;
 }
@@ -442,6 +453,12 @@ function mergeKeyOrdinalsError(parts: ParsedMergeKeyParts): string | null {
   if (isOneWayMergeAction(action)) {
     if (attemptOrdinal !== null) {
       return 'LaneRun merge key attemptOrdinal is not allowed for a one-way action';
+    }
+    return null;
+  }
+  if (isShadowMutationMergeAction(action)) {
+    if (attemptOrdinal !== null || retry !== null) {
+      return 'LaneRun merge key ordinals are not allowed for a shadow-mutation action';
     }
     return null;
   }
@@ -734,6 +751,10 @@ function readMergeTailOrdinals(
   action: MergeKeyAction,
   tail: string | undefined,
 ): { readonly attemptOrdinal: number | null; readonly retry: number | null } | null {
+  if (isShadowMutationMergeAction(action)) {
+    // A shadow-mutation key is always the 5-segment form: no ordinals, no retry.
+    return tail === undefined ? { attemptOrdinal: null, retry: null } : null;
+  }
   if (isOneWayMergeAction(action)) {
     if (tail === undefined) {
       return { attemptOrdinal: null, retry: null };

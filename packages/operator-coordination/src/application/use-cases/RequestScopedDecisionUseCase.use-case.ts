@@ -24,6 +24,7 @@ import {
   shadowImportDigestPayload,
 } from '../../domain/coordination-records.js';
 import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
+import { readPlainObjectWithOptional } from '../../domain/record-input.js';
 import { CoordinationKind } from '../../domain/value-objects/CoordinationKind.vo.js';
 import { readReleaseRoot } from '../../domain/coordination-records.js';
 import type {
@@ -50,6 +51,23 @@ export interface RequestScopedDecisionDependencies {
 
 function isFilled(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * Whether `nowIso` is present as an own key at all, read descriptor-safely so
+ * no getter ever runs. The shared plain-record reader collapses an accessor's
+ * value to `undefined`, so this presence check is what separates an omitted
+ * `nowIso` (clock fallback) from an unreadable one (a typed refusal).
+ */
+function nowIsoKeyPresent(request: unknown): boolean {
+  if (typeof request !== 'object' || request === null) {
+    return false;
+  }
+  try {
+    return Object.getOwnPropertyDescriptor(request, 'nowIso') !== undefined;
+  } catch {
+    return true;
+  }
 }
 
 // CO24f: the same control and bidi screen the CoordinationRequest entity
@@ -329,7 +347,15 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (!this.deps) {
       throw new Error('Not implemented: RequestScopedDecisionUseCase');
     }
-    const grantId = typeof request?.grantId === 'string' ? request.grantId.trim() : '';
+    // Hostile input: the request is snapshotted by the domain's shared
+    // plain-record reader (own data descriptors only, no getter is ever run)
+    // before any field is read, so a throwing getter on `grantId` or `nowIso`
+    // yields a typed refusal instead of an exception.
+    const snapshot = readPlainObjectWithOptional(request, ['grantId'], ['grantId', 'nowIso']);
+    if (snapshot === null) {
+      return { outcome: 'refused', reason: 'grant-missing' };
+    }
+    const grantId = typeof snapshot.grantId === 'string' ? snapshot.grantId.trim() : '';
     if (grantId.length === 0) {
       return { outcome: 'refused', reason: 'grant-missing' };
     }
@@ -346,10 +372,13 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (recorded.state === 'declined' || recorded.state === 'expired' || recorded.state === 'completed') {
       return { outcome: 'refused', reason: 'grant-not-revocable' };
     }
-    const nowIso =
-      typeof request.nowIso === 'string' && request.nowIso.trim().length > 0
-        ? request.nowIso
-        : new Date().toISOString();
+    // An absent `nowIso` falls back to the clock; a present-but-unreadable
+    // one (an accessor whose descriptor value is undefined, or a non-string)
+    // is a typed refusal, never a live property read off the request.
+    if (!isFilled(snapshot.nowIso) && nowIsoKeyPresent(request)) {
+      return { outcome: 'refused', reason: 'grant-missing' };
+    }
+    const nowIso = isFilled(snapshot.nowIso) ? snapshot.nowIso : new Date().toISOString();
     try {
       await this.deps.requestRepo.saveRequest({
         ...recorded,

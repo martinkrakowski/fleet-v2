@@ -290,6 +290,42 @@ describe('RequestScopedDecisionUseCase.revokeOwnerGrant (GR1a1)', () => {
     expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
   });
 
+  it('refuses a throwing getter on grantId with a typed refusal, never running it', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await seedStandingGrant(repo);
+    let calls = 0;
+    const request: Record<string, unknown> = {};
+    Object.defineProperty(request, 'grantId', {
+      get() {
+        calls += 1;
+        return 'grant-shadow';
+      },
+      enumerable: true,
+    });
+    const result = await revoke(useCaseWith(repo), request as unknown as RevokeOwnerGrantRequest);
+    expect(result).toEqual({ outcome: 'refused', reason: 'grant-missing' });
+    expect(calls).toBe(0);
+    expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
+  });
+
+  it('refuses a throwing getter on nowIso with a typed refusal, never running it', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await seedStandingGrant(repo);
+    let calls = 0;
+    const request: Record<string, unknown> = { grantId: 'grant-shadow' };
+    Object.defineProperty(request, 'nowIso', {
+      get() {
+        calls += 1;
+        return '2026-11-19T00:00:00Z';
+      },
+      enumerable: true,
+    });
+    const result = await revoke(useCaseWith(repo), request as unknown as RevokeOwnerGrantRequest);
+    expect(result).toEqual({ outcome: 'refused', reason: 'grant-missing' });
+    expect(calls).toBe(0);
+    expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
+  });
+
   it('is neither constant nor identity: revoked and refused outcomes differ by grant state', async () => {
     const standing = new InMemoryCoordinationRequestRepo();
     await seedStandingGrant(standing);

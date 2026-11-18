@@ -175,11 +175,19 @@ describe('parseShadowImportGrant (GR1a1 hostile inputs)', () => {
     });
   });
 
-  it('refuses undefined expiresAtIso with shadow-import-grant-invalid-expiry', () => {
+  it('refuses an omitted expiresAtIso key with shadow-import-grant-unexpected-key', () => {
     const raw = { repository: { ...VALID_REPOSITORY } };
     expect(parseShadowImportGrant(raw)).toEqual({
       ok: false,
       code: 'shadow-import-grant-unexpected-key',
+    });
+  });
+
+  it('refuses an own undefined expiresAtIso with shadow-import-grant-invalid-expiry', () => {
+    const raw = { repository: { ...VALID_REPOSITORY }, expiresAtIso: undefined };
+    expect(parseShadowImportGrant(raw)).toEqual({
+      ok: false,
+      code: 'shadow-import-grant-invalid-expiry',
     });
   });
 

@@ -375,6 +375,7 @@ function readShadowImportSnapshot(raw: object): ShadowImportSnapshot {
   // prefix is reported before any key-set comparison can mask it.
   // No capped own-keys helper exists in the repo (follow-up #4v); this loop
   // enumerates all own keys before the cap.
+  // key enumeration precedes the cap: tracked as follow-up #4v
   for (let index = 0; index < ownKeys.length; index += 1) {
     if (index > MAX_SHADOW_IMPORT_KEYS) {
       return { ok: false, code: forbiddenCode ?? 'shadow-import-grant-unexpected-key' };
@@ -423,23 +424,16 @@ function readShadowImportSnapshot(raw: object): ShadowImportSnapshot {
  * `MAX_SHADOW_IMPORT_KEYS * 2 + MAX_REPOSITORY_SEGMENT_LENGTH * 2 +
  * MAX_EXPIRES_AT_ISO_LENGTH`; nothing else is read.
  */
-export function parseShadowImportGrant(raw: unknown): ShadowImportGrantCheck {
-  const outerShape = isPlainShadowImportObject(raw);
-  if (!outerShape.ok) {
-    return { ok: false, code: outerShape.code };
-  }
-  if (typeof raw !== 'object' || raw === null) {
-    return { ok: false, code: 'shadow-import-grant-not-object' };
-  }
-  const outer = readShadowImportSnapshot(raw);
-  if (!outer.ok) {
-    return outer;
-  }
-  const expectedKeys = ['repository', 'expiresAtIso'];
-  if (outer.keys.length !== expectedKeys.length || !expectedKeys.every((key) => outer.keys.includes(key))) {
-    return { ok: false, code: 'shadow-import-grant-unexpected-key' };
-  }
-  const repositoryRaw = outer.values.repository;
+/**
+ * Validate the `repository` field of a shadow import grant: a plain
+ * `{ owner, repo }` object read by own data descriptors, each segment matching
+ * `SHADOW_IMPORT_REPOSITORY_PATTERN` and neither `.` nor `..`. Cost is linear
+ * in `MAX_SHADOW_IMPORT_KEYS + MAX_REPOSITORY_SEGMENT_LENGTH * 2`; a getter
+ * never runs and nothing throws.
+ */
+function parseShadowImportRepository(
+  repositoryRaw: unknown,
+): { readonly ok: true; readonly owner: string; readonly repo: string } | { readonly ok: false; readonly code: ShadowImportGrantErrorCode } {
   const repositoryShape = isPlainShadowImportObject(repositoryRaw);
   if (!repositoryShape.ok) {
     return {
@@ -482,7 +476,18 @@ export function parseShadowImportGrant(raw: unknown): ShadowImportGrantCheck {
   ) {
     return { ok: false, code: 'shadow-import-grant-invalid-repository' };
   }
-  const expiresAtIso = outer.values.expiresAtIso;
+  return { ok: true, owner, repo };
+}
+
+/**
+ * Validate the `expiresAtIso` field of a shadow import grant: a bounded
+ * ISO-8601 string with an explicit `Z` or `±HH:MM` offset, a finite parsed
+ * instant, real calendar fields and a canonical re-serialization. Cost is
+ * linear in `MAX_EXPIRES_AT_ISO_LENGTH`; nothing throws.
+ */
+function parseShadowImportExpiry(
+  expiresAtIso: unknown,
+): { readonly ok: true; readonly expiresAtIso: string } | { readonly ok: false; readonly code: ShadowImportGrantErrorCode } {
   if (
     typeof expiresAtIso !== 'string' ||
     expiresAtIso.length === 0 ||
@@ -541,11 +546,38 @@ export function parseShadowImportGrant(raw: unknown): ShadowImportGrantCheck {
   ) {
     return { ok: false, code: 'shadow-import-grant-invalid-expiry' };
   }
+  return { ok: true, expiresAtIso };
+}
+
+export function parseShadowImportGrant(raw: unknown): ShadowImportGrantCheck {
+  const outerShape = isPlainShadowImportObject(raw);
+  if (!outerShape.ok) {
+    return { ok: false, code: outerShape.code };
+  }
+  if (typeof raw !== 'object' || raw === null) {
+    return { ok: false, code: 'shadow-import-grant-not-object' };
+  }
+  const outer = readShadowImportSnapshot(raw);
+  if (!outer.ok) {
+    return outer;
+  }
+  const expectedKeys = ['repository', 'expiresAtIso'];
+  if (outer.keys.length !== expectedKeys.length || !expectedKeys.every((key) => outer.keys.includes(key))) {
+    return { ok: false, code: 'shadow-import-grant-unexpected-key' };
+  }
+  const repository = parseShadowImportRepository(outer.values.repository);
+  if (!repository.ok) {
+    return repository;
+  }
+  const expiry = parseShadowImportExpiry(outer.values.expiresAtIso);
+  if (!expiry.ok) {
+    return expiry;
+  }
   return {
     ok: true,
     value: Object.freeze({
-      repository: Object.freeze({ owner, repo }),
-      expiresAtIso,
+      repository: Object.freeze({ owner: repository.owner, repo: repository.repo }),
+      expiresAtIso: expiry.expiresAtIso,
     }),
   };
 }

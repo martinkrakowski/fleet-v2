@@ -35,6 +35,7 @@ import {
   MERGE_REPO_KEYS,
   MERGE_VETO_KEYS,
   NO_FORGE_KEYS,
+  OWNER_KEYS,
   POLICY_DAEMON_KEYS,
   POLICY_KEYS,
   PROCEDURE_COVERAGE_KEYS,
@@ -72,6 +73,7 @@ import type {
   MergePolicySection,
   MergeRepositoryPolicy,
   MergeVetoPolicy,
+  OwnerSection,
   PolicySection,
   ProcedureCoverage,
   RunnerCapabilityDeclaration,
@@ -108,6 +110,7 @@ export function writeInstallationV2(installation: FleetInstallationV2): string {
     verification: (verification) =>
       serializeVerification(verification as VerificationProceduresSection),
     waves: (waves) => serializeByKeys(waves as WavesSection, WAVES_KEYS),
+    owner: (owner) => serializeByKeys(owner as OwnerSection, OWNER_KEYS),
     decisions: (decisions) => serializeDecisions(decisions as DecisionsSectionV2),
     daemon: (daemon) =>
       serializeByKeys(daemon as DaemonSection, DAEMON_KEYS, {

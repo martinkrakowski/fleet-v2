@@ -82,6 +82,16 @@ export interface WavesSection {
   readonly ownerPublicKey?: string;
 }
 
+/**
+ * The `owner` section: the pinned Ed25519 public key of the installation
+ * owner. `publicKey` is the canonical base64 of exactly 32 raw key bytes
+ * (see `parseOwnerPublicKey`); a raw Ed25519 seed is also 32 bytes, so the
+ * secret screen cannot distinguish a seed from a public key.
+ */
+export interface OwnerSection {
+  readonly publicKey: string;
+}
+
 /** The `shelf` section. */
 export interface ShelfSection {
   readonly baseUrl: string;
@@ -101,6 +111,7 @@ export interface FleetInstallationV1 {
   readonly reviewer?: ReviewerSection;
   readonly waves?: WavesSection;
   readonly shelf?: ShelfSection;
+  readonly owner?: OwnerSection;
 }
 
 // ---------------------------------------------------------------------------
@@ -757,6 +768,7 @@ export interface FleetInstallationV2 {
   readonly waves?: WavesSection;
   readonly decisions?: DecisionsSectionV2;
   readonly daemon?: DaemonSection;
+  readonly owner?: OwnerSection;
   /**
    * The absolute installation state directory; absent means the file does not
    * name one; distinct from `daemon.stateDir`; not a default.
@@ -860,6 +872,7 @@ export interface FleetInstallationModel {
   readonly waves?: WavesSection;
   readonly decisions?: DecisionsSectionV2;
   readonly daemon?: DaemonSection;
+  readonly owner?: OwnerSection;
   /** v2 only; copied when present; never defaulted. */
   readonly stateDir?: string;
 }
@@ -907,6 +920,7 @@ export interface FleetInstallation {
   readonly decisions?: DecisionsSectionV2;
   /** v2: the daemon tick's user-scope scheduler unit paths. Never set in v1. */
   readonly daemon?: DaemonSection;
+  readonly owner?: OwnerSection;
   /** v2 only; copied when present; never defaulted. */
   readonly stateDir?: string;
 }

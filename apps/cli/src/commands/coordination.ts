@@ -1,11 +1,16 @@
 /** The `coordination` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { realpath, stat } from 'node:fs/promises';
 
 import {
   COORDINATION_KINDS,
+  RELEASE_GRANT_DIGEST_PREFIX,
   SHADOW_IMPORT_ACTION_SCOPE,
   SHADOW_IMPORT_DIGEST_PREFIX,
+  isReleaseActionScope,
+  isReleaseRootCoordinate,
+  releaseGrantDigestPayload,
   shadowImportDigestPayload,
 } from '@fleet/operator-coordination';
 import { forgeActionScope } from '@fleet/work-execution';
@@ -52,6 +57,18 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
       if (actionScope === SHADOW_IMPORT_ACTION_SCOPE) {
         return shadowImportRequestDecision(p, rt);
       }
+      // RR1: a release grant is requested by its exact root, normalized via
+      // `realpath` exactly like `release.ts` and bound into the derived
+      // `release-grant-<sha256>` request id.
+      if (isReleaseActionScope(actionScope)) {
+        return releaseRequestDecision(p, rt, actionScope);
+      }
+      // RR1: `--release-root` is only ever meaningful for a release scope; on
+      // any other scope it is refused before anything is recorded, even when
+      // empty or not a string.
+      if (Object.hasOwn(p, 'releaseRoot')) {
+        throw new CliUsageError('request-decision: --release-root is only allowed for release:* scopes');
+      }
       return rt.coordination.requestScopedDecision.requestScopedDecision({
         requestId: str(p, 'requestId'),
         projectId: str(p, 'projectId'),
@@ -66,6 +83,9 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
     },
     'resolve-auth': async (p, rt) => {
       const actionScope = str(p, 'actionScope');
+      // RR1: the release root travels with the grant coordinates on a
+      // resolve, so a grant for one root never authorizes another.
+      const releaseRoot = optStr(p, 'releaseRoot');
       // The standing shadow import grant resolves head-free (cutover runbook):
       // it is bound by its digest-bound grant id, its exact repository and its
       // capped expiry, never by a commit, so no `--expected-head-sha` is taken
@@ -77,6 +97,7 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
           expectedHeadSha: optStr(p, 'expectedHeadSha') ?? '',
           authorizationGrantId: optStr(p, 'authorizationGrantId'),
           ...(optStr(p, 'repository') !== undefined ? { repository: optStr(p, 'repository') } : {}),
+          ...(releaseRoot !== undefined ? { releaseRoot } : {}),
         });
       }
       return rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
@@ -85,6 +106,7 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
         expectedHeadSha: str(p, 'expectedHeadSha'),
         authorizationGrantId: optStr(p, 'authorizationGrantId'),
         ...(optStr(p, 'attemptId') !== undefined ? { attemptId: str(p, 'attemptId') } : {}),
+        ...(releaseRoot !== undefined ? { releaseRoot } : {}),
       });
     },
     'consume-auth': async (p, rt) =>
@@ -96,6 +118,7 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
         attemptId: str(p, 'attemptId'),
         expectedHeadSha: str(p, 'expectedHeadSha'),
         nowIso: optStr(p, 'nowIso'),
+        ...(optStr(p, 'releaseRoot') !== undefined ? { releaseRoot: optStr(p, 'releaseRoot') } : {}),
       }),
     'publish-observation': async (p, rt) =>
       rt.coordination.publishProjectObservation.publishProjectObservation({
@@ -219,5 +242,82 @@ function shadowImportRequestDecision(
     policyRevision: str(p, 'policyRevision'),
     ...(optStr(p, 'attemptId') !== undefined ? { attemptId: str(p, 'attemptId') } : {}),
     shadowImportGrant,
+  });
+}
+
+/**
+ * A release grant's request-decision entry (RR1). The request id is the digest
+ * of the grant's exact coordinates ({ scope, projectId, expectedHeadSha,
+ * releaseRoot, nonce }), so the CLI derives it from `--release-root` and the
+ * other flags — plus a fresh per-request nonce — instead of taking it from the operator's hand: a hand-typed
+ * `--request-id` that does not match the derived one is refused, never
+ * silently recorded under a digest it does not carry. `--release-root` is
+ * required, must be a bounded absolute path without `..`, and is normalized
+ * through `realpath` (resolving symlinks) exactly like `release.ts`, so the
+ * grant is bound to the same canonical root `release install --root` resolves
+ * to. A path that cannot be resolved on disk is a usage error that never
+ * echoes the path.
+ */
+async function releaseRequestDecision(
+  p: Payload,
+  rt: FleetCliRuntime,
+  actionScope: string,
+): Promise<RequestScopedDecisionResult> {
+  const releaseRoot = optStr(p, 'releaseRoot');
+  if (releaseRoot === undefined) {
+    throw new CliUsageError('request-decision: --release-root is required for release:* scopes');
+  }
+  if (!isReleaseRootCoordinate(releaseRoot)) {
+    throw new CliUsageError(
+      "request-decision: --release-root must be a bounded absolute path without '..'",
+    );
+  }
+  let normalizedRoot: string;
+  try {
+    normalizedRoot = await realpath(releaseRoot);
+  } catch {
+    throw new CliUsageError('request-decision: --release-root must resolve to an existing directory');
+  }
+  // The root is the directory a release installs from or swaps: an existing
+  // regular file (or any other non-directory) is a usage error, refused before
+  // it can be bound into a grant. The message never echoes the path.
+  if (!(await stat(normalizedRoot)).isDirectory()) {
+    throw new CliUsageError('request-decision: --release-root must resolve to an existing directory');
+  }
+  const expectedHeadSha = strOrNull(p, 'expectedHeadSha');
+  // A fresh per-request nonce (16 random bytes as hex), so the same
+  // coordinates can be requested again after a use, a rollback or a denial.
+  const nonce = randomBytes(16).toString('hex');
+  const payload = releaseGrantDigestPayload({
+    actionScope,
+    projectId: str(p, 'projectId'),
+    expectedHeadSha,
+    releaseRoot: normalizedRoot,
+    nonce,
+  });
+  if (!payload.ok) {
+    throw new CliUsageError('request-decision: invalid release grant coordinates');
+  }
+  const requestId = `${RELEASE_GRANT_DIGEST_PREFIX}${sha256HexDigest(payload.value)}`;
+  const supplied = optStr(p, 'requestId');
+  if (supplied !== undefined && supplied !== requestId) {
+    // The id is a non-secret digest handle, so refusing without echoing the
+    // supplied value keeps no secret and still tells the operator what to do.
+    throw new CliUsageError(
+      "request-decision: the hand-typed '--requestId' does not match the id derived from the grant's coordinates",
+    );
+  }
+  return rt.coordination.requestScopedDecision.requestScopedDecision({
+    requestId,
+    projectId: str(p, 'projectId'),
+    kind: enumOf(p, 'kind', COORDINATION_KINDS, 'coordination kind'),
+    actionScope,
+    expectedHeadSha,
+    proposalDigest: str(p, 'proposalDigest'),
+    policyRevision: str(p, 'policyRevision'),
+    ...(optStr(p, 'attemptId') !== undefined ? { attemptId: str(p, 'attemptId') } : {}),
+    nowIso: optStr(p, 'nowIso'),
+    releaseRoot: normalizedRoot,
+    releaseNonce: nonce,
   });
 }

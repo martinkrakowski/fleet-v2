@@ -433,7 +433,7 @@ describe('release command', () => {
 
   it(
     'CO14c-1: a symlinked --root that resolves to the configured root is accepted, ' +
-      'and request.root is preserved verbatim (never rewritten to its realpath)',
+      'and RR1: the grant coordinates use the realpath-resolved canonical root',
     async () => {
       const base = await mkdtemp(join(tmpdir(), 'co14c-symlink-base-'));
       const root = join(base, 'releases');
@@ -442,8 +442,11 @@ describe('release command', () => {
       await symlink(root, link);
       const stateDir = await mkdtemp(join(tmpdir(), 'co14c-symlink-state-'));
       const rt = await runtimeServingRoot(root, stateDir);
-      // The store sees the symlink path verbatim: the handler never substitutes
-      // the realpath, which would strand a crashed operation's consumed grant.
+      // RR1: the realpath-resolved root travels with the grant coordinates, so
+      // `coordination request-decision --release-root` binds the same canonical
+      // root the release resolves — the store sees the canonical root, never
+      // the symlink path, which would strand a crashed operation's consumed
+      // grant under a path no grant was bound to.
       const listSpy = vi.spyOn(ReleaseStoreAdapter.prototype, 'list');
       const out: string[] = [];
       const err: string[] = [];
@@ -455,7 +458,7 @@ describe('release command', () => {
       expect(err.join('')).toBe('');
       expect(code).toBe(0);
       expect(JSON.parse(out.join('')).outcome).toBe('planned');
-      expect(listSpy).toHaveBeenCalledWith({ root: link });
+      expect(listSpy).toHaveBeenCalledWith({ root });
       listSpy.mockRestore();
     },
   );

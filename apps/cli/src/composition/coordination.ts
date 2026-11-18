@@ -240,6 +240,10 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     }),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({
       requestRepo: coordinationRequestRepository,
+      // RR1: the release grant's request id is verified against the digest of
+      // its recorded coordinates at consumption, with the same digest the
+      // request and resolve use cases are wired with.
+      computeDigest: computeSha256HexDigest,
     }),
     publishProjectObservation: new PublishProjectObservationUseCase({
       publicationPort: observationPublication,

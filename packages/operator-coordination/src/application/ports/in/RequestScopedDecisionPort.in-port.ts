@@ -25,6 +25,8 @@ export interface RequestScopedDecisionRequest {
    * consumption naming another root is refused.
    */
   readonly releaseRoot?: string;
+  /** The release grant's per-request nonce (32 lowercase hex); required for a release scope. */
+  readonly releaseNonce?: string;
   /**
    * The standing shadow import grant's coordinates (owner decision
    * 2026-11-18); only a `merge:import-shadow` request carries one, and it is

@@ -3,9 +3,10 @@ import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { deriveInstallationModel } from './model.js';
 import { loadInstallation, type InstallationFileSeam } from './load.js';
 import { parseInstallation } from './parse.js';
-import { parseOwnerPublicKey, readOwnerSection } from './owner.js';
+import { isCanonicalBase64Of32Bytes, parseOwnerPublicKey, readOwnerSection } from './owner.js';
 
 /** Canonical base64 of exactly 32 bytes (e.g. 32 zero bytes). */
 const VALID_KEY = Buffer.alloc(32, 7).toString('base64');
@@ -27,15 +28,26 @@ describe('parseOwnerPublicKey', () => {
     });
   });
 
-  it('refuses a private-key-shaped string before the length cap', () => {
+  it('refuses an over-long string before the secret screen', () => {
     expect(parseOwnerPublicKey(`-----BEGIN PRIVATE KEY-----${'x'.repeat(200)}`)).toEqual({
+      ok: false,
+      code: 'owner-key-too-long',
+    });
+    expect(parseOwnerPublicKey(`ghp_${'x'.repeat(200)}`)).toEqual({
+      ok: false,
+      code: 'owner-key-too-long',
+    });
+  });
+
+  it('refuses a private-key-shaped string within the length cap', () => {
+    expect(parseOwnerPublicKey(`-----BEGIN PRIVATE KEY-----${'x'.repeat(30)}`)).toEqual({
       ok: false,
       code: 'owner-key-secret-shape',
     });
   });
 
-  it('refuses a credential-shaped string (ghp_) before the length cap', () => {
-    expect(parseOwnerPublicKey(`ghp_${'x'.repeat(200)}`)).toEqual({
+  it('refuses a credential-shaped string (ghp_) within the length cap', () => {
+    expect(parseOwnerPublicKey(`ghp_${'x'.repeat(30)}`)).toEqual({
       ok: false,
       code: 'owner-key-secret-shape',
     });
@@ -61,6 +73,10 @@ describe('parseOwnerPublicKey', () => {
       ok: false,
       code: 'owner-key-invalid-format',
     });
+  });
+
+  it('caps its own input length before any base64 decoding', () => {
+    expect(isCanonicalBase64Of32Bytes(VALID_KEY.repeat(5))).toBe(false);
   });
 
   it('never echoes the offending value in the refusal', () => {
@@ -177,6 +193,86 @@ describe('readOwnerSection', () => {
     const proxy = new Proxy(target, {});
     expect(readOwnerSection(proxy)).toEqual({ ok: false, code: 'owner-key-accessor' });
     expect(getterRuns).toBe(0);
+  });
+});
+
+describe('owner parser hostile input', () => {
+  it('refuses undefined as owner-key-invalid-type / owner-section-invalid', () => {
+    expect(parseOwnerPublicKey(undefined)).toEqual({
+      ok: false,
+      code: 'owner-key-invalid-type',
+    });
+    expect(readOwnerSection(undefined)).toEqual({ ok: false, code: 'owner-section-invalid' });
+  });
+
+  it('refuses null as owner-key-invalid-type / owner-section-invalid', () => {
+    expect(parseOwnerPublicKey(null)).toEqual({
+      ok: false,
+      code: 'owner-key-invalid-type',
+    });
+    expect(readOwnerSection(null)).toEqual({ ok: false, code: 'owner-section-invalid' });
+  });
+
+  it('refuses an array as an invalid type / non-record section', () => {
+    expect(parseOwnerPublicKey([VALID_KEY])).toEqual({
+      ok: false,
+      code: 'owner-key-invalid-type',
+    });
+    expect(readOwnerSection([VALID_KEY])).toEqual({ ok: false, code: 'owner-section-invalid' });
+  });
+
+  it('refuses an own constructor key as prototype pollution', () => {
+    const section = JSON.parse('{"constructor": 1, "publicKey": null}');
+    expect(readOwnerSection(section)).toEqual({
+      ok: false,
+      code: 'owner-section-prototype-pollution',
+    });
+  });
+
+  it('refuses an own prototype key as prototype pollution', () => {
+    const section = JSON.parse('{"prototype": 1, "publicKey": null}');
+    expect(readOwnerSection(section)).toEqual({
+      ok: false,
+      code: 'owner-section-prototype-pollution',
+    });
+  });
+
+  it('accepts a frozen valid section', () => {
+    const section = Object.freeze({ publicKey: VALID_KEY });
+    expect(readOwnerSection(section)).toEqual({ ok: true, value: { publicKey: VALID_KEY } });
+  });
+
+  it('is not a constant verdict on repeated calls', () => {
+    const valid = { publicKey: VALID_KEY };
+    expect(readOwnerSection(valid)).toEqual({ ok: true, value: { publicKey: VALID_KEY } });
+    expect(readOwnerSection(valid)).toEqual({ ok: true, value: { publicKey: VALID_KEY } });
+    expect(readOwnerSection({})).toEqual({ ok: false, code: 'owner-key-required' });
+  });
+
+  it('never returns the input object itself', () => {
+    const input = { publicKey: VALID_KEY };
+    const result = readOwnerSection(input);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).not.toBe(input);
+    }
+  });
+});
+
+describe('derived model owner copy', () => {
+  it('does not change the model when the input owner is mutated after derivation', () => {
+    const parsed = parseInstallation({ schemaVersion: 1, owner: { publicKey: VALID_KEY } });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    const installation = parsed.installation;
+    const outcome = deriveInstallationModel(installation);
+    expect(outcome.model.owner).toEqual({ publicKey: VALID_KEY });
+    const mutated = Buffer.alloc(32, 9).toString('base64');
+    (installation.owner as { publicKey: string }).publicKey = mutated;
+    expect(outcome.model.owner).toEqual({ publicKey: VALID_KEY });
+    expect(outcome.model.owner).not.toBe(installation.owner);
   });
 });
 
@@ -397,6 +493,54 @@ describe('loadInstallation owner trust check', () => {
       }),
     );
     expectUntrusted(readErrors(load(file)), 'worktreeRoot');
+  });
+
+  it('refuses a file inside a symlinked hosts.*.worktreeRoot', () => {
+    freshDir();
+    const realDir = join(tempDir, 'real');
+    mkdirSync(realDir);
+    const link = join(tempDir, 'link');
+    symlinkSync(realDir, link);
+    const file = join(realDir, 'fleet.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          lane: {
+            transport: 'local',
+            worktreeRoot: link,
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46000 },
+          },
+        },
+        owner: { publicKey: VALID_KEY },
+      }),
+      { mode: 0o600 },
+    );
+    expectUntrusted(readErrors(load(file)), 'worktreeRoot');
+  });
+
+  it('skips a non-existent hosts.*.worktreeRoot', () => {
+    freshDir();
+    const file = writeInstallation(
+      'fleet.json',
+      JSON.stringify({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          lane: {
+            transport: 'local',
+            worktreeRoot: join(tempDir, 'does-not-exist'),
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46000 },
+          },
+        },
+        owner: { publicKey: VALID_KEY },
+      }),
+    );
+    expect(load(file).status).toBe('loaded');
   });
 
   it('refuses <repo>/installation/fleet.json inside a git worktree and names the remedy', () => {

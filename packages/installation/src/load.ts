@@ -230,12 +230,30 @@ function readInstallationFile(file: string, seam: ResolvedSeam): FileRead {
 }
 
 /**
- * True when the realpath lies at or below the given worktree root. Both
- * sides are absolute; the root is resolved against the same cwd semantics
- * as the installation file itself.
+ * True when the realpath lies at or below the given worktree root. The root
+ * is resolved with `realpath` through the seam before comparing, so a
+ * symlinked `hosts.*.worktreeRoot` cannot bypass containment: the comparison
+ * sees the same target the file's realpath points at. Returns
+ * `'malformed'` when the root exists but cannot be resolved (a non-existent
+ * root is skipped: it cannot contain the file). The containment test
+ * compares path segments: the file is inside the root when it equals
+ * `resolvedRoot` or equals `resolvedRoot + sep` plus a remainder, never by
+ * a raw string prefix.
  */
-function isInsideRoot(realpath: string, root: string): boolean {
-  const resolvedRoot = resolve(root);
+function isInsideRoot(
+  realpath: string,
+  root: string,
+  seam: ResolvedSeam,
+): boolean | 'malformed' {
+  let resolvedRoot: string;
+  try {
+    resolvedRoot = seam.realpath(resolve(root));
+  } catch (error) {
+    if (readErrorCode(error) === 'ENOENT') {
+      return false;
+    }
+    return 'malformed';
+  }
   return realpath === resolvedRoot || realpath.startsWith(`${resolvedRoot}${sep}`);
 }
 
@@ -306,7 +324,11 @@ function ownerTrustReason(
     return 'its realpath could not be resolved';
   }
   for (const root of worktreeRoots(installation)) {
-    if (isInsideRoot(realpath, root)) {
+    const inside = isInsideRoot(realpath, root, seam);
+    if (inside === 'malformed') {
+      return 'a hosts.*.worktreeRoot is malformed';
+    }
+    if (inside) {
       return 'it lies inside a hosts.*.worktreeRoot';
     }
   }

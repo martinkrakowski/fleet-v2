@@ -4,10 +4,9 @@
  * `unknown` at its boundary and never throws — each refusal is a typed
  * result carrying a named error code, and the input value is never echoed.
  *
- * Cost bounds: `parseOwnerPublicKey` is linear in the input length for the
- * secret screen (which runs before the length cap so a private-key-shaped
- * over-long string is still refused as a secret) and linear in the capped
- * input `MAX_OWNER_PUBLIC_KEY_LENGTH` for everything after the screen;
+ * Cost bounds: `parseOwnerPublicKey` applies the length cap
+ * `MAX_OWNER_PUBLIC_KEY_LENGTH` before the secret screen, so every
+ * subsequent check is linear in the capped input;
  * `readOwnerSection` is linear in the bounded `OWNER_KEYS` and the capped
  * key length. The secret screen cannot distinguish a raw 32-byte Ed25519
  * seed from a public key: both are 32 bytes, so a seed pasted as
@@ -58,11 +57,17 @@ const PROTOTYPE_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototyp
  * Canonical base64 of exactly 32 raw bytes: standard alphabet, no
  * whitespace, `=` padding only at the end in the canonical amount, and a
  * round-trip that proves the decode is 32 bytes and re-encodes to the same
- * string. Linear in the string length; the caller caps it at
- * `MAX_OWNER_PUBLIC_KEY_LENGTH`.
+ * string. Linear in the string length; the validator itself caps the input
+ * at `MAX_OWNER_PUBLIC_KEY_LENGTH`, so it is linear in that cap regardless
+ * of the caller.
  */
 export function isCanonicalBase64Of32Bytes(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0) {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > MAX_OWNER_PUBLIC_KEY_LENGTH ||
+    value.length % 4 !== 0
+  ) {
     return false;
   }
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
@@ -90,21 +95,21 @@ function hasOwnerSecretShape(value: string): boolean {
 
 /**
  * Validate one candidate `owner.publicKey` value. Refusals in order: not a
- * string (`owner-key-invalid-type`), a private-key or credential shape
- * (`owner-key-secret-shape`, screened before the length cap and the format
- * check), over-long (`owner-key-too-long`, refused before any base64
- * decoding), not canonical base64 of exactly 32 bytes
- * (`owner-key-invalid-format`). The input value is never echoed.
+ * string (`owner-key-invalid-type`), over-long (`owner-key-too-long`,
+ * refused before the secret screen and before any base64 decoding), a
+ * private-key or credential shape (`owner-key-secret-shape`), not canonical
+ * base64 of exactly 32 bytes (`owner-key-invalid-format`). The input value
+ * is never echoed.
  */
 export function parseOwnerPublicKey(value: unknown): OwnerPublicKeyResult {
   if (typeof value !== 'string') {
     return { ok: false, code: 'owner-key-invalid-type' };
   }
-  if (hasOwnerSecretShape(value)) {
-    return { ok: false, code: 'owner-key-secret-shape' };
-  }
   if (value.length > MAX_OWNER_PUBLIC_KEY_LENGTH) {
     return { ok: false, code: 'owner-key-too-long' };
+  }
+  if (hasOwnerSecretShape(value)) {
+    return { ok: false, code: 'owner-key-secret-shape' };
   }
   if (!isCanonicalBase64Of32Bytes(value)) {
     return { ok: false, code: 'owner-key-invalid-format' };

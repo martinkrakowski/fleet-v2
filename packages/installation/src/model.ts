@@ -322,7 +322,7 @@ function deriveModelFromV1(installation: FleetInstallation): ModelOutcome {
     ...(forge !== undefined ? { forge: v2ForgeOf(forge) } : {}),
     ...(verification !== undefined ? { verification: { procedures: verification.procedures } } : {}),
     ...(installation.waves !== undefined ? { waves: installation.waves } : {}),
-    ...(installation.owner !== undefined ? { owner: installation.owner } : {}),
+    ...(installation.owner !== undefined ? { owner: { publicKey: installation.owner.publicKey } } : {}),
   };
   return { model, warnings, ...(errors.length > 0 ? { errors } : {}) };
 }

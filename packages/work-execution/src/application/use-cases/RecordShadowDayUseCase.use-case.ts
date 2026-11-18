@@ -238,6 +238,16 @@ function readPlainDataSnapshot(input: unknown): Record<string, unknown> | null {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) {
     return null;
   }
+  // OD7a2 fix round: only PLAIN objects are accepted — the prototype must be
+  // `Object.prototype` or `null`. Any other prototype (a crafted
+  // `Object.create(proto)` carrying valid own fields, a class instance) is
+  // refused as `unavailable` with a named reason by the caller.
+  const prototype = Object.getPrototypeOf(input);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return null;
+  }
+  // Enumerating every own key before the cap below is the documented JS
+  // residual #4v; the refusal happens before any value is read.
   const names = Object.keys(input);
   if (names.length > SHADOW_GRANT_MAX_RECORD_KEYS) {
     return null;
@@ -944,10 +954,28 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     const dayStartMs = serialOfUtcDay(context.day) * DAY_MS;
     let earliestInDayMs: number | null = null;
     for (const event of events) {
-      if (event.kind !== 'job') {
+      // OD7a2 fix round: S12 has not validated the events yet, so this loop
+      // trusts nothing. An event that is not a non-null plain object with an
+      // own data `kind` property is skipped — every property is read through
+      // its own descriptor, so no getter and no Proxy `get` trap ever runs,
+      // and the loop never throws. If every event is malformed the early-tick
+      // guard treats the day as undeterminable and scheduled mode writes
+      // nothing below.
+      if (typeof event !== 'object' || event === null) {
         continue;
       }
-      const recordedAtIso = event.recordedAtIso;
+      const kindDescriptor = Object.getOwnPropertyDescriptor(event, 'kind');
+      if (
+        kindDescriptor === undefined || kindDescriptor.get !== undefined ||
+        kindDescriptor.set !== undefined || kindDescriptor.value !== 'job'
+      ) {
+        continue;
+      }
+      const recordedAtDescriptor = Object.getOwnPropertyDescriptor(event, 'recordedAtIso');
+      if (recordedAtDescriptor === undefined || recordedAtDescriptor.get !== undefined || recordedAtDescriptor.set !== undefined) {
+        continue;
+      }
+      const recordedAtIso = recordedAtDescriptor.value;
       if (typeof recordedAtIso !== 'string' || recordedAtIso.slice(0, 10) !== context.day) {
         continue;
       }

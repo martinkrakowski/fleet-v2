@@ -4208,6 +4208,20 @@ describe('evaluateShadowGrantCoverage', () => {
     }
   });
 
+  it('returns unavailable for a record whose prototype is neither Object.prototype nor null', () => {
+    // OD7a2 fix round: the grant-record snapshot accepts only PLAIN objects
+    // (`Object.prototype` or a `null` prototype). A crafted
+    // `Object.create(customPrototype)` holding valid own fields is
+    // `unavailable`, never `covered`.
+    const customPrototype = { isPlain: false };
+    const record: Record<string, unknown> = Object.create(customPrototype) as Record<string, unknown>;
+    Object.assign(record, grantRecord());
+    expect(evaluateShadowGrantCoverage(record, DAY_START, DAY_END)).toEqual({
+      outcome: 'unavailable',
+      reason: 'invalid-record',
+    });
+  });
+
   it('returns unavailable when fields are missing or malformed', () => {
     expect(evaluateShadowGrantCoverage(null, DAY_START, DAY_END).outcome).toBe('unavailable');
     expect(evaluateShadowGrantCoverage(undefined, DAY_START, DAY_END).outcome).toBe('unavailable');
@@ -4468,6 +4482,23 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
       expect(harness.evidence.calls.cas).toBe(0);
       expect(harness.evidence.stored).toBeNull();
     }
+  });
+
+  it('scheduled mode never throws on malformed daemon events and writes nothing', async () => {
+    // OD7a2 fix round: the first-tick loop dereferences `event.kind` before
+    // S12 validates the events, so `readAfterCursor` may hand it anything.
+    // Every malformed event is skipped (never thrown), the day is treated as
+    // undeterminable by the early-tick guard, and scheduled mode writes
+    // nothing.
+    const harness = scheduledHarness(cleanFixture(DAY));
+    const projection = harness.deps.daemonEvents as {
+      readAfterCursor: () => Promise<unknown>;
+    };
+    projection.readAfterCursor = async () => ({ ok: true as const, events: [null, 42, {}], nextCursor: null });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expect(result.outcome === 'unknown' || result.outcome === 'skipped').toBe(true);
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
   });
 
   it('scheduled mode fails closed with unknown when S12 evaluates unknown', async () => {

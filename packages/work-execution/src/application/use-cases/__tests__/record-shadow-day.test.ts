@@ -2199,6 +2199,67 @@ describe('RecordShadowDayUseCase', () => {
     expect(reasons.get('S4')).toBe('gate-heads-unsettled');
   });
 
+  it('reports S4 unevaluated (no-settled-heads), never pass or fail, when zero conducted heads exist in the window', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: [],
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S4).toBeUndefined();
+    const reasons = new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+    expect(reasons.get('S4')).toBe('no-settled-heads');
+    // Owner decision 2026-11-18: never `pass`, never `fail`. Every other
+    // criterion still records, with byte-identical digests.
+    expect(result.recorded).toEqual({
+      S1: 'pass',
+      S6: 'pass',
+      S7: 'pass',
+      S8: 'pass',
+      S9: 'pass',
+      S12: 'pass',
+    });
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S4).toBeUndefined();
+    // Byte-identical digests: the zero-settled refusal changes nothing for
+    // any other criterion. Compare against a twin run on the same fixture
+    // where 30 settled heads exist and S4 records a pass.
+    const twin = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const twinResult = await new RecordShadowDayUseCase(twin.deps).execute(makeRequest());
+    expectRecorded(twinResult);
+    expect(twinResult.recorded.S4).toBe('pass');
+    const twinRecord = twin.evidence.stored?.days.find((entry) => entry.day === DAY);
+    for (const criterion of ['S1', 'S6', 'S7', 'S8', 'S9', 'S12'] as const) {
+      expect(dayRecord?.verdicts[criterion]?.digest).toBe(twinRecord?.verdicts[criterion]?.digest);
+    }
+  });
+
+  it('reports S4 fail (too-few-agreeing-heads) when one settled agreeing head exists in the window', async () => {
+    const gateHeads = agreeingGateHeads(0, 1);
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads,
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S4).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S4).toEqual({
+      verdict: 'fail',
+      reason: 'too-few-agreeing-heads',
+      digest: expectedS4Digest(DAY, 'fail', 'too-few-agreeing-heads', {
+        compared: 1,
+        agreeing: 1,
+        falsePasses: 0,
+        stricterFails: 0,
+      }, gateHeads),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+  });
+
   it('gives two S4 passes with equal counts but different head oids different digests', async () => {
     const headsA = agreeingGateHeads(0);
     const headsB = agreeingGateHeads(1_000);

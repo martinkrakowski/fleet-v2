@@ -221,16 +221,16 @@ Fleet-v2 runs beside the shell train and compares results.
   - A daily `merge import` dry-run and `cutover shadow report`.
   - The fleet-v2 timer, offset 30 s from the shell tick.
 - **Single writer:** the shell train alone writes to the forge. Fleet-v2 writes only its journal, status and events, and journals one-way actions as `dry-run would-*` (MAP §11 and DT §4.3). The orchestrator enqueues through `merge enqueue` as well as `pr.sh`.
-- **Minimum duration:** 3 calendar days (DT §4.3(1)) and at least 20 merged PRs, whichever is later. At least 2 are Tier 2 and 1 is a chain. The 20-PR floor and the items marked *(proposed)* below are mine; the rest come from DT §4.3 and CON D4.
+- **Minimum duration:** 1 calendar day (owner decision 2026-11-17, amending DT §4.3(1)) and at least 20 merged PRs, whichever is later. At least 2 are Tier 2 and 1 is a chain. The 20-PR floor and the items marked *(proposed)* below are mine; the rest come from DT §4.3 and CON D4.
 
-**Pass criteria** (all must hold, for 3 consecutive days):
+**Pass criteria** (all must hold, on 1 all-pass day — owner decision 2026-11-17):
 
 | # | Criterion | Source |
 |---|---|---|
 | S1 | The set of `(pr, headOid)` the pass would merge equals the shell's merges. A `would-merge` the shell dropped, or a shell merge the pass parked, is a divergence. Zero allowed | DT §4.3(1) |
 | S2 | Narrowed per owner decision 2026-11-17: an e2e test (`apps/cli/src/__tests__/e2e/shadow-park-reasons.e2e.test.ts`) covers the six park reasons reachable on `origin/main` (`checks`, `threads`, `forge-error`, `update-refused`, `update-churn`, `owner-merge`), shadow open-intent completion, and canary isolation — a planted failing PR parks while a healthy sibling still completes. `conflict` drops rather than parks, and an invalid installation refuses the tick with `policy-invalid` before `RunMergePassUseCase` (the `policy-unreadable` fallback in the CLI branch is unreachable for that input). DT9b live intent-without-result reconcile and the four deferred park inputs (`premerge`, `macos`, `disjointness`, `veto-hold`) are deferred past cutover | DT §4.3(2); MAP §10 canary |
 | S3 | A sleep/wake produced a `forge-unreachable` skip and fresh status within two intervals | DT §4.3(4) |
-| S4 | Gate verdicts on the same head agree on at least 30 heads *(proposed)*. A false pass is a blocker. A stricter fail needs a typed reason | proposed |
+| S4 | Gate verdicts on the same head agree on at least 30 heads *(proposed)*. A false pass is a blocker. A stricter fail needs a typed reason. Per owner decision 2026-11-18, a day with zero settled heads records `unevaluated` (`no-settled-heads`) — never `pass` and never `fail` | proposed |
 | S5 | The would-post `premerge` state equals the shell-posted state per head, including carries | proposed; DT7 |
 | S6 | At least 5 shadow conducted lanes (3 Tier 1, 2 Tier 2) show the same decision sequence as the shell lane. No skipped review, diff check or `premerge` hold. No unexplained extra one-way action | CON D4; proposed |
 | S7 | If chains are kept: one full chain (start, 2 or more refreshes, landing dry-run) reproduces the shell's member set and integration PR evidence | proposed |
@@ -277,7 +277,7 @@ All steps after the window, with owner sign-off:
 4. CO33 removes the legacy adapters and adds the reference guard; CO1 second pass edits `AGENTS.md`.
 5. Mark MAP TR1–TR4 dropped and DT §4.2 retired in the plans.
 
-**Estimate (unmeasured):** about 5–7 working days to shadow start, 3+ days of shadow, switch around day 10, retirement at or after day 24.
+**Estimate (unmeasured):** about 5–7 working days to shadow start, 1+ all-pass day of shadow (owner decision 2026-11-17), switch around day 10, retirement at or after day 24.
 
 ---
 
@@ -341,7 +341,7 @@ Goal: stop every running lane and relaunch it on fleet-v2's rails without losing
 | D-CO6 | Local merges in `merge-main.sh`, `lane-rebase.sh`, `push-fix.sh` and `land-mc.sh` are retired under D22/D24 | Confirm | Decided 2026-11-03: as recommended |
 | D-CO7 | Keep chains (CO7–CO11) or retire them in favour of MC batches and KS5 | Keep until MC batching is proven | Decided 2026-11-03: as recommended |
 | D-CO8 | Switch scope | Staged: switch gate then retirement gate | Decided 2026-11-03: as recommended |
-| D-CO9 | Shadow length and rollback window | 3 days and 20 merges; 14 days | Decided 2026-11-03: as recommended |
+| D-CO9 | Shadow length and rollback window | 1 all-pass day and 20 merges (amended 2026-11-17); 14 days | Decided 2026-11-03: as recommended; amended 2026-11-17 to 1 all-pass day |
 | D-CO10 | Relaunch conducted runs by driver swap, not stop | Yes | Decided 2026-11-03: as recommended |
 
 ### Hard to undo

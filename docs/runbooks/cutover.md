@@ -6,13 +6,13 @@ This runbook covers the cutover commands that exist in this checkout. `cutover s
 
 ## Shadow
 
-The shadow record requires 3 consecutive shadow days (`CUTOVER_SHADOW_CONSECUTIVE_DAYS`) and at least 20 merged PRs (`CUTOVER_SHADOW_MIN_MERGES`).
+The shadow record requires 1 all-pass shadow day (`CUTOVER_SHADOW_CONSECUTIVE_DAYS`, owner decision 2026-11-17) and at least 20 merged PRs on that day (`CUTOVER_SHADOW_MIN_MERGES`).
 
 Commands that exist today:
 
 - `fleet-v2 cutover status` is read-only. With no cutover record it exits 0 with `outcome` `completed`, `state` `shadow`, `revision` 0, and `record` null. `withinRollbackWindow` is null when the record is missing or `switchedAtIso` is null.
 - `fleet-v2 cutover shadow report --repository <owner>/<repo> --legacy-state-dir <path>` counts the shell side's queue, parked and in-progress lines, and keys fleet entries by their own recorded base branch rather than assuming `main`. It still compares enqueue sets only, writes nothing, and is still not an S1–S13 verdict. A complete comparison with divergent enqueue sets returns `outcome` `completed` with `equal` false and exits 0, so the exit code alone never signals a divergence — check `equal` and `complete`. Exit 1 means the report is not a pass: `outcome` `unknown` (`shell-state-incomplete`, including a missing `inprogress` in the port's answer), or `refused` (`shell-queue-absent`, `shell-queue-unreadable`, `secret-shaped`), or `complete` false.
-- `fleet-v2 cutover shadow record-day --repository <owner>/<repo> --legacy-state-dir <path> [--day YYYY-MM-DD]` (SH8a) records one UTC day into `<stateDir>/cutover-shadow.json`. Those days are what `cutover switch` reads. `record-day` derives each day's `releaseSha` from the installed `current` verified release under the release root parsed from the configured `daemon.cliPath` (SH20), returning `null` — and `release-unpinned` for S2/S10/S11 — when that path is unconfigured, not a served release path, or the installed release is missing, unverified, or unreadable.
+- `fleet-v2 cutover shadow record-day --repository <owner>/<repo> --legacy-state-dir <path> [--day YYYY-MM-DD]` (SH8a) records one UTC day into `<stateDir>/cutover-shadow.json`. Those days are what `cutover switch` reads. `record-day` derives each day's `releaseSha` from the installed `current` verified release under the release root parsed from the configured `daemon.cliPath` (SH20), returning `null` — and `release-unpinned` for S2/S10/S11 — when that path is unconfigured, not a served release path, or the installed release is missing, unverified, or unreadable. When the lane-run store holds more than 1,500 runs (`SHADOW_FACTS_WARN_RUNS`, owner decision 2026-11-18; the 2,000-run cap `SHADOW_FACTS_MAX_RUNS` is deferred), `record-day` prints an early warning to `stderr` without changing the outcome, the exit code, or writing anything.
 - `fleet-v2 merge import --repository <owner>/<repo> --legacy-state-dir <path>` is a dry-run unless `--apply` is paired with `--authority`.
 - `fleet-v2 state check` and `fleet-v2 daemon status` are read-only.
 - `fleet-v2 conductor status` is the status read.
@@ -23,9 +23,9 @@ Status does not evaluate S1–S13. A completed status is not a shadow pass. Do n
 
 `cutover switch` is mounted. It requires `--expected-revision`, `--operation-id`, and `--relaunch-plan-digest` (64 lowercase hex), with optional `--now-iso` and `--deadline-iso`. A bare `fleet-v2 cutover switch` exits 2 as a usage error. It does not print `move-not-implemented`.
 
-`cutover switch` reads `<stateDir>/cutover-shadow.json` via `composeCutoverShadowEvidence`: the newest 3 consecutive UTC days, each bound to one shared non-null `releaseSha`, summed for the 20-merge floor, all S1–S13 recorded as `pass`. `cutover shadow record-day` (SH8a) produces the days this reads. The composer's staleness check uses the daemon clock (`daemon.now()`). It never takes the operator's `--now-iso`. `--now-iso` is the clock the criterion reader uses for its future-day check.
+`cutover switch` reads `<stateDir>/cutover-shadow.json` via `composeCutoverShadowEvidence`: the newest UTC day — 1 all-pass day with at least 20 merges and a non-null `releaseSha` (owner decision 2026-11-17) — all S1–S13 recorded as `pass`. `cutover shadow record-day` (SH8a) produces the day this reads. The composer's staleness check uses the daemon clock (`daemon.now()`). It never takes the operator's `--now-iso`. `--now-iso` is the clock the criterion reader uses for its future-day check.
 
-`cutover switch` cannot pass evidence while the recorded days are unpinned or divergent. Since SH20, `record-day` binds each recorded day to the installed `current` verified release sha (or `null` when unpinned, which still composes to `release-changed` / `shadow-evidence-absent`): a day recorded with no verified `current` release installed keeps every recorded window at `release-changed`, and the switch refuses `shadow-evidence-absent`.
+`cutover switch` cannot pass evidence while the recorded day is unpinned. Since SH20, `record-day` binds the recorded day to the installed `current` verified release sha (or `null` when unpinned, which still composes to `release-changed` / `shadow-evidence-absent`): a day recorded with no verified `current` release installed keeps the recorded window at `release-changed`, and the switch refuses `shadow-evidence-absent`.
 
 A window that passes the evidence gate then runs the last closed gate, `countUnrecordedLanes` (CO30c), wired in `apps/cli/src/composition.ts` over the read-only relaunch inventory and the read-only project-profile listing. Gate order: shadow evidence, lanes, daemon status, train pause. The gate:
 
@@ -40,15 +40,15 @@ The gate reads only read-only store instances, so a corrupt store file is answer
 Fail closed, and never treat an unknown or partial ledger as a pass:
 
 - No durable state directory, or no `cutover-shadow.json`: `shadow-evidence-absent` (exit 1), naming every criterion S1–S13.
-- Fewer than 3 days, a stale newest day (more than one UTC day before the daemon clock), or a null or varying `releaseSha`: `shadow-evidence-absent` (exit 1), naming every criterion.
-- Non-consecutive UTC days, a newest day after `--now-iso`, fewer than 20 total merges, or any S1–S13 recorded `fail` or missing: `shadow-criteria-failed` (exit 1), naming the failed criteria (every criterion when the window shape or the merge floor fails).
+- Fewer than 1 day, a stale newest day (more than one UTC day before the daemon clock), or a null `releaseSha`: `shadow-evidence-absent` (exit 1), naming every criterion.
+- A newest day after `--now-iso`, fewer than 20 merges on the required shadow day, or any S1–S13 recorded `fail` or missing: `shadow-criteria-failed` (exit 1), naming the failed criteria (every criterion when the window shape or the merge floor fails).
 - Unreadable, malformed, null, or corrupt `cutover-shadow.json`, including a verdict other than `pass` or `fail`, or duplicate or non-array days: `unknown` / `shadow-evidence-unreadable` (exit 1). This is not absence.
 - A newer `schemaVersion`: `unknown` / `shadow-evidence-unknown-version` (exit 1). This is not absence.
 - A deadline already past: `unknown` / `deadline-exceeded` (exit 1).
 
 Three residuals, owner-accepted 2026-11-17 and NOT fixed by this unit (CO30c). Do not work around them here:
 
-- Release vs installed at switch time: release binding is equality among the three days only (narrowed by SH20: each day's `releaseSha` is derived from the installed `current` verified release at `record-day` time). Nothing compares that recorded sha to the installed `current` release again at `cutover switch` time, so a release installed after the last day is not re-checked.
+- Release vs installed at switch time: release binding is weakened — with 1 all-pass day (owner decision 2026-11-17) it means only that the newest day's `releaseSha` is non-null, and `release-changed` now means unpinned (narrowed by SH20: each day's `releaseSha` is derived from the installed `current` verified release at `record-day` time). Nothing compares that recorded sha to the installed `current` release again at `cutover switch` time, so a release installed after the last day is not re-checked.
 - Digest re-verify/version: verdict digests are not re-verified, and there is no evaluator or digest-format version, so an older-format or hand-edited day is not detected. Only shape, freshness, and the gates stand behind a passing window.
 - One-sided freshness: real behaviour (fix dated 2026-11-17): `isStale` rejects only days older than the daemon clock, and the future-day check uses the operator's `--now-iso`. There is no reverse freshness signal (nothing proves the ledger was read against the state a relaunch plan was built from); the switch relies on shape, the gates, and those two checks only.
 

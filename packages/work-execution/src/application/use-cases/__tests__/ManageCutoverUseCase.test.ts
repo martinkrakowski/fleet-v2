@@ -300,16 +300,16 @@ function retireRequest(overrides: Record<string, unknown> = {}): Record<string, 
   return { move: 'retire', expectedRevision: 1, operationId: 'op-1', nowIso: AT_WINDOW_NOW, ...overrides };
 }
 
-/** Three consecutive pass days ending on the UTC date of `nowIso`. */
+/** One all-pass day on the UTC date of `nowIso`. */
 function shadowEvidence(nowIso: string, verdictOverrides: Record<string, string> = {}): Record<string, unknown> {
   const base = Date.parse(nowIso);
-  const days = [2, 1, 0].map((back) => {
+  const days = [0].map((back) => {
     const verdicts: Record<string, string> = {};
     for (const id of CUTOVER_SHADOW_CRITERIA) verdicts[id] = 'pass';
     return { day: new Date(base - back * 86_400_000).toISOString().slice(0, 10), verdicts };
   });
   for (const [id, verdict] of Object.entries(verdictOverrides)) {
-    (days[2].verdicts as Record<string, string>)[id] = verdict;
+    (days[0].verdicts as Record<string, string>)[id] = verdict;
   }
   return { merges: CUTOVER_SHADOW_MIN_MERGES, days };
 }

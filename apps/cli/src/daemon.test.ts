@@ -1685,6 +1685,77 @@ describe('daemon watchdog CLI (CO-WD5b)', () => {
     ]);
   });
 
+  // --- WD1: a failed speech on a healthy train warns on stderr, exits 0 ----
+
+  it('(wd1) a healthy train with a failing speak exits 0 with announceFailures 1 and the fixed warning on stderr in JSON mode, with no path or error text leaked', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(
+      withWatch(h, async () => ({ ...VALID_ANSWER, announceFailures: 1 })),
+      ['daemon', 'watchdog', '--json'],
+    );
+    expect(answer.code).toBe(0);
+    expect(lastJson(answer.out)).toMatchObject({ outcome: 'completed', exitCode: 0, audibleAlert: 'off' });
+    expect(lastJson(answer.out).repositories).toMatchObject([
+      { outcome: 'evaluated', healthy: true, exitCode: 0, announceFailures: 1 },
+    ]);
+    expect(answer.err).toContain('watchdog warning: audible-announcement-failed count=1');
+    expect(answer.err).not.toContain('/');
+    expect(answer.err).not.toContain('Error');
+  });
+
+  it('(wd1) a healthy train with a failing speak exits 0 with the fixed warning on stderr in text mode', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(
+      withWatch(h, async () => ({ ...VALID_ANSWER, announceFailures: 1 })),
+      ['daemon', 'watchdog'],
+    );
+    expect(answer.code).toBe(0);
+    const lines = answer.out.trim().split('\n');
+    expect(lines[0]).toBe('watchdog audible-alert=off');
+    expect(answer.out).toContain(`watchdog ${digestOf(REPO_A)} healthy findings=0`);
+    expect(answer.err).toBe('watchdog warning: audible-announcement-failed count=1\n');
+  });
+
+  it('(wd1) a healthy evaluated answer with announceFailures 1 normalizes to exitCode 0 and an unhealthy one to exitCode 1', () => {
+    expect(watchdogRepositoryReport('d0', { ...VALID_ANSWER, announceFailures: 1 }).exitCode).toBe(0);
+    expect(watchdogRepositoryReport('d0', { ...UNHEALTHY_ANSWER, announceFailures: 1 }).exitCode).toBe(1);
+  });
+
+  it('(wd1) an unhealthy train with a failing speak still exits 1 with the warning on stderr', async () => {
+    const nowIso = new Date().toISOString();
+    const h = watchdogHarness(nowIso);
+    const answer = await run(
+      withWatch(h, async () => ({ ...UNHEALTHY_ANSWER, announceFailures: 1 })),
+      ['daemon', 'watchdog', '--json'],
+    );
+    expect(answer.code).toBe(1);
+    expect(lastJson(answer.out)).toMatchObject({ outcome: 'completed', exitCode: 1 });
+    expect(lastJson(answer.out).repositories).toMatchObject([
+      { outcome: 'evaluated', healthy: false, exitCode: 1, announceFailures: 1 },
+    ]);
+    expect(answer.err).toContain('watchdog warning: audible-announcement-failed count=1');
+  });
+
+  it('(wd1) healthy train with nothing to announce: exit 0, no warning', async () => {
+    const nowIso = new Date().toISOString();
+    const spoken: Array<{ readonly sentence: string }> = [];
+    const h = harness([REPO_A], {
+      daemonNow: () => nowIso,
+      daemonAudibleAlert: {
+        speak: async (request: { readonly sentence: string }) => {
+          spoken.push(request);
+          return { outcome: 'spoken' as const };
+        },
+      },
+    });
+    const answer = await run(withWatch(h, async () => VALID_ANSWER), ['daemon', 'watchdog', '--json']);
+    expect(answer.code).toBe(0);
+    expect(answer.err).toBe('');
+    expect(spoken, 'a healthy train speaks nothing').toEqual([]);
+  });
+
   it('(g) with FLEET_AUDIBLE_ALERT=banana a healthy train still exits 1 with reasonCode audible-alert-invalid and never echoes the value', async () => {
     vi.stubEnv('FLEET_AUDIBLE_ALERT', 'banana');
     const nowIso = new Date().toISOString();

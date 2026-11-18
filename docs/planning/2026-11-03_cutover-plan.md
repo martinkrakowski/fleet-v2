@@ -228,7 +228,7 @@ Fleet-v2 runs beside the shell train and compares results.
 | # | Criterion | Source |
 |---|---|---|
 | S1 | The set of `(pr, headOid)` the pass would merge equals the shell's merges. A `would-merge` the shell dropped, or a shell merge the pass parked, is a divergence. Zero allowed | DT §4.3(1) |
-| S2 | Every park reason and the intent-without-result reconcile has an e2e test. A live `forge-error` backoff was observed. A planted failing PR (checks, thread, conflict, forge error) isolates correctly | DT §4.3(2); MAP §10 canary |
+| S2 | Narrowed per owner decision 2026-11-17: an e2e test (`apps/cli/src/__tests__/e2e/shadow-park-reasons.e2e.test.ts`) covers the six park reasons reachable on `origin/main` (`checks`, `threads`, `forge-error`, `update-refused`, `update-churn`, `owner-merge`), shadow open-intent completion, and canary isolation — a planted failing PR parks while a healthy sibling still completes. `conflict` drops rather than parks, and an invalid installation refuses the tick with `policy-invalid` before `RunMergePassUseCase` (the `policy-unreadable` fallback in the CLI branch is unreachable for that input). DT9b live intent-without-result reconcile and the four deferred park inputs (`premerge`, `macos`, `disjointness`, `veto-hold`) are deferred past cutover | DT §4.3(2); MAP §10 canary |
 | S3 | A sleep/wake produced a `forge-unreachable` skip and fresh status within two intervals | DT §4.3(4) |
 | S4 | Gate verdicts on the same head agree on at least 30 heads *(proposed)*. A false pass is a blocker. A stricter fail needs a typed reason | proposed |
 | S5 | The would-post `premerge` state equals the shell-posted state per head, including carries | proposed; DT7 |

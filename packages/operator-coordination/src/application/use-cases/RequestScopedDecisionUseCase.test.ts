@@ -258,7 +258,7 @@ describe('RequestScopedDecisionUseCase shadow import grants (GR1a1)', () => {
     expect(calls).toBe(0);
     expect((await repo.listRequests()).length).toBe(0);
   });
-  it('rejects, never throws, a decision request with a throwing own nowIso getter', async () => {
+  it('never runs a throwing own nowIso getter and records the trusted clock (main behaviour)', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
     let calls = 0;
     const request: Record<string, unknown> = { ...baseRequest() };
@@ -270,12 +270,12 @@ describe('RequestScopedDecisionUseCase shadow import grants (GR1a1)', () => {
       enumerable: true,
     });
     const result = await useCaseWith(repo).execute(request as unknown);
-    expect(result).toEqual({
-      outcome: 'rejected',
-      reason: 'a decision request nowIso must be a non-empty string when given',
-    });
+    expect(result.outcome).toBe('requested');
     expect(calls).toBe(0);
-    expect((await repo.listRequests()).length).toBe(0);
+    if (result.outcome === 'requested') {
+      expect(result.request.createdAtIso).toBe(NOW_ISO);
+    }
+    expect((await repo.listRequests()).length).toBe(1);
   });
 });
 
@@ -315,7 +315,38 @@ describe('RequestScopedDecisionUseCase.revokeOwnerGrant (GR1a1)', () => {
     const stored = await repo.findRequestById('shadow-req-1');
     expect(stored?.state).toBe('cancelled');
     expect(stored?.revision).toBe(2);
-    expect(stored?.updatedAtIso).toBe('2026-11-19T00:00:00Z');
+    // The revoke moment is the injected trusted clock, never the
+    // request-supplied nowIso.
+    expect(stored?.updatedAtIso).toBe(NOW_ISO);
+  });
+
+  it('records the injected clock time, ignoring a request nowIso of 2099', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await seedStandingGrant(repo);
+    const result = await revoke(useCaseWith(repo), {
+      grantId: 'grant-shadow',
+      nowIso: '2099-01-01T00:00:00Z',
+    });
+    expect(result).toEqual({ outcome: 'revoked', grantId: 'grant-shadow' });
+    expect((await repo.findRequestById('shadow-req-1'))?.updatedAtIso).toBe(NOW_ISO);
+  });
+
+  it('still revokes with a request nowIso of "not-a-date", stamping the injected clock', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await seedStandingGrant(repo);
+    const result = await revoke(useCaseWith(repo), { grantId: 'grant-shadow', nowIso: 'not-a-date' });
+    expect(result).toEqual({ outcome: 'revoked', grantId: 'grant-shadow' });
+    expect((await repo.findRequestById('shadow-req-1'))?.updatedAtIso).toBe(NOW_ISO);
+  });
+
+  it('refuses with shadow-import-clock-unavailable when the trusted clock is not injected', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await seedStandingGrant(repo);
+    expect(await revoke(useCaseWith(repo, digest, null), { grantId: 'grant-shadow' })).toEqual({
+      outcome: 'refused',
+      reason: 'shadow-import-clock-unavailable',
+    });
+    expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
   });
 
   it('refuses a missing grant with grant-missing', async () => {
@@ -390,7 +421,7 @@ describe('RequestScopedDecisionUseCase.revokeOwnerGrant (GR1a1)', () => {
     expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
   });
 
-  it('refuses a throwing getter on nowIso with a typed refusal, never running it', async () => {
+  it('ignores a throwing getter on nowIso — revoked from the clock, getter never run', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
     await seedStandingGrant(repo);
     let calls = 0;
@@ -403,18 +434,18 @@ describe('RequestScopedDecisionUseCase.revokeOwnerGrant (GR1a1)', () => {
       enumerable: true,
     });
     const result = await revoke(useCaseWith(repo), request as unknown as RevokeOwnerGrantRequest);
-    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-now-iso' });
+    expect(result).toEqual({ outcome: 'revoked', grantId: 'grant-shadow' });
     expect(calls).toBe(0);
-    expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
+    expect((await repo.findRequestById('shadow-req-1'))?.updatedAtIso).toBe(NOW_ISO);
   });
 
-  it('refuses a present non-string nowIso as invalid-now-iso, not grant-missing', async () => {
+  it('ignores a present non-string nowIso (42) and stamps the injected clock', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
     await seedStandingGrant(repo);
     expect(
       await revoke(useCaseWith(repo), { grantId: 'grant-shadow', nowIso: 42 as unknown as string }),
-    ).toEqual({ outcome: 'refused', reason: 'invalid-now-iso' });
-    expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
+    ).toEqual({ outcome: 'revoked', grantId: 'grant-shadow' });
+    expect((await repo.findRequestById('shadow-req-1'))?.updatedAtIso).toBe(NOW_ISO);
   });
 
   it('reads each own key once during the snapshot and never touches the request afterwards', async () => {
@@ -476,6 +507,28 @@ describe('RequestScopedDecisionUseCase ordinary decisions stay as on main (GR1a1
     const repo = new InMemoryCoordinationRequestRepo();
     const before = new Date().toISOString();
     const result = await useCaseWith(repo).execute(ordinaryRequest({ nowIso: null }));
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.createdAtIso >= before).toBe(true);
+      expect(result.request.createdAtIso).not.toBe(NOW_ISO);
+    }
+  });
+
+  it('falls back to the clock for nowIso: \'\' exactly as main does (host:restart)', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const before = new Date().toISOString();
+    const result = await useCaseWith(repo).execute(ordinaryRequest({ nowIso: '' }));
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.createdAtIso >= before).toBe(true);
+      expect(result.request.createdAtIso).not.toBe(NOW_ISO);
+    }
+  });
+
+  it('falls back to the clock for nowIso: 42 exactly as main does (host:restart)', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const before = new Date().toISOString();
+    const result = await useCaseWith(repo).execute(ordinaryRequest({ nowIso: 42 }));
     expect(result.outcome).toBe('requested');
     if (result.outcome === 'requested') {
       expect(result.request.createdAtIso >= before).toBe(true);

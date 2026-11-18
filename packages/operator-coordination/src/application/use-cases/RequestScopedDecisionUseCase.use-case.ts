@@ -157,8 +157,6 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     // two are told apart here, at snapshot time, by inspecting the own
     // descriptors: descriptor inspection never runs a getter or a Proxy `get`
     // trap, and no property of the input is read after the snapshot.
-    const nowIsoDescriptor = Object.getOwnPropertyDescriptor(input, 'nowIso');
-    const nowIsoIsAccessor = nowIsoDescriptor !== undefined && nowIsoDescriptor.get !== undefined;
     const releaseRootDescriptor = Object.getOwnPropertyDescriptor(input, 'releaseRoot');
     const releaseRootIsAccessor =
       releaseRootDescriptor !== undefined && releaseRootDescriptor.get !== undefined;
@@ -227,20 +225,6 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         outcome: 'rejected',
         reason: 'a forge action decision requires an attemptId',
       };
-    }
-    // An unreadable `nowIso` (an accessor, or a present non-string data value)
-    // is a typed refusal, never a live property read off the request or a
-    // silent clock fallback; an explicit `undefined` or `null` data value is
-    // an omitted optional field and falls back to the clock, exactly as on
-    // main.
-    if (
-      nowIsoIsAccessor ||
-      (nowIsoDescriptor !== undefined &&
-        nowIsoDescriptor.value !== undefined &&
-        nowIsoDescriptor.value !== null &&
-        !isFilled(request.nowIso))
-    ) {
-      return { outcome: 'rejected', reason: 'a decision request nowIso must be a non-empty string when given' };
     }
     // Standing shadow import grant (owner decision 2026-11-18): the unattended
     // timer's grant is head-free, bounded by a future expiry within the TTL
@@ -435,15 +419,16 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (recorded.state === 'declined' || recorded.state === 'expired' || recorded.state === 'completed') {
       return { outcome: 'refused', reason: 'grant-not-revocable' };
     }
-    // An absent `nowIso` falls back to the clock; a present-but-unreadable
-    // one (an accessor whose descriptor value is undefined, or a non-string)
-    // is reported as `invalid-now-iso`, never as `grant-missing`. Presence
-    // is read only from the snapshot, so no property of the original request
-    // is touched after it was taken.
-    if (!isFilled(snapshot.nowIso) && 'nowIso' in snapshot) {
-      return { outcome: 'refused', reason: 'invalid-now-iso' };
+    // The revoke moment is the composition root's trusted clock alone, the
+    // same injected clock round 5 added for the shadow scope: any
+    // request-supplied `nowIso` is ignored, so a requester can never stamp a
+    // chosen (for example far-future) `updatedAtIso` onto the record. A
+    // runtime without the injected clock refuses, typed, rather than falling
+    // back to the requester's value or an ad-hoc clock here.
+    if (this.deps.shadowImportClock === undefined) {
+      return { outcome: 'refused', reason: 'shadow-import-clock-unavailable' };
     }
-    const nowIso = isFilled(snapshot.nowIso) ? snapshot.nowIso : new Date().toISOString();
+    const nowIso = this.deps.shadowImportClock.nowIso();
     try {
       await this.deps.requestRepo.saveRequest({
         ...recorded,

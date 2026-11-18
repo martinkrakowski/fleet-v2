@@ -51,6 +51,7 @@ export type RevokeOwnerGrantRefusal =
   | 'grant-already-revoked'
   | 'grant-not-revocable'
   | 'invalid-now-iso'
+  | 'shadow-import-clock-unavailable'
   | 'revision-conflict';
 
 export interface RevokeOwnerGrantRequest {

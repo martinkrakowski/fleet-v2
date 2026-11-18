@@ -220,6 +220,24 @@ function queueWriterSpy(): { calls: number; adapter: Pick<MergeQueueRepositoryPo
   return spy;
 }
 
+function recordingQueueWriter(): {
+  transitions: Array<{ next: MergeQueueEntryRecord; successor: MergeQueueEntryRecord | null }>;
+  adapter: Pick<MergeQueueRepositoryPort, 'applyMergeTransition'>;
+} {
+  type TransitionInput = Parameters<Pick<MergeQueueRepositoryPort, 'applyMergeTransition'>['applyMergeTransition']>[0];
+  type TransitionResult = Awaited<ReturnType<Pick<MergeQueueRepositoryPort, 'applyMergeTransition'>['applyMergeTransition']>>;
+  const recorder = {
+    transitions: [] as Array<{ next: MergeQueueEntryRecord; successor: MergeQueueEntryRecord | null }>,
+    adapter: {
+      async applyMergeTransition(input: TransitionInput): Promise<TransitionResult> {
+        recorder.transitions.push({ next: input.next, successor: input.successor });
+        return { outcome: 'applied', entries: [input.next], record: input.next, successor: null };
+      },
+    },
+  };
+  return recorder;
+}
+
 function notifierSpy(): { calls: number; adapter: { notifyMergeEvent(): Promise<{ outcome: 'notified' }> } } {
   const spy = {
     calls: 0,
@@ -478,14 +496,22 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     // SH24a: the supersession is never persisted; the in-memory successor
     // re-runs the decider in the same pass and reaches would-merge, whose
     // result carries the successor's own 40-hex head as its linkedId.
+    // Fix round 2 (Fable): asserted against a RECORDING queue writer — on
+    // main the supersession went through `applyMergeTransition`, so this
+    // test fails there and passes here only because nothing is written.
     const moved: ReadForgeMergeResult = { ...greenForge, liveHeadSha: HEAD3 };
-    const { useCase, deps, request } = makeUseCase([makeEntry()], moved);
+    const writer = recordingQueueWriter();
+    const { useCase, deps, request } = makeUseCase([makeEntry()], moved, {}, haltFake, {
+      queueWriter: writer.adapter,
+    });
 
     const result = await useCase.runMergePass(request);
 
     expect(result.entries[0].decision).toBe('journalled');
     expect(result.entries[0].reasonCode).toBe('would-merge');
     expect(result.entries[0].journalKey).toBe(`merge/${DIGEST}/1/${HEAD3_12}/merge-pr`);
+    // The writer received no drop and no supersede — in fact nothing at all.
+    expect(writer.transitions).toEqual([]);
     const superseded = await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/would-supersede`);
     expect(superseded.map((entry) => entry.kind)).toEqual(['intent', 'result']);
     expect(superseded[1].outcome).toBe('dry-run');
@@ -494,7 +520,12 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     const merged = await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD3_12}/merge-pr`);
     expect(merged.map((entry) => entry.kind)).toEqual(['intent', 'result']);
     expect(merged[1].reasonCode).toBe('would-merge');
+    // Fix round 2 (Fable): the journaled record names the SUCCESSOR, not the
+    // original entry — its key carries the successor's head12 and its
+    // linkedId is the successor's own 40-hex head.
+    expect(merged[0].key).toBe(`merge/${DIGEST}/1/${HEAD3_12}/merge-pr`);
     expect(merged[1].linkedId).toBe(HEAD3);
+    expect(merged[1].linkedId).not.toBe(HEAD);
     expect(deps.forgeRead.calls).toBe(2);
   });
 
@@ -1025,18 +1056,203 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
     expect(await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD3_12}/merge-pr`)).toHaveLength(0);
   });
 
-  it('after a shadow tick on a closed or exhausted PR the live conductor reads no dropped entry', async () => {
-    // The merge-enqueue step (advance-lane-run/merge-enqueue.ts) journals
-    // `merge-dropped` as final when it reads `state === 'dropped'`; shadow
-    // mode must never hand it one.
-    for (const entry of [makeEntry(), makeEntry({ attempt: 9 })]) {
-      const records = [entry];
-      const { useCase, request } = makeUseCase(records, exhaustedForge());
+  it('after a shadow tick on a CLOSED PR the live conductor reads no dropped entry', async () => {
+    // Fix round 2 (Fable): rewritten against a RECORDING queue writer (on
+    // main this scenario wired no writer and asserted only on the input
+    // array, so it asserted nothing). The merge-enqueue step
+    // (advance-lane-run/merge-enqueue.ts) journals `merge-dropped` as final
+    // when it reads `state === 'dropped'`; shadow mode must never hand it
+    // one, and the writer must have received no drop.
+    const records = [makeEntry()];
+    const writer = recordingQueueWriter();
+    const { useCase, deps, request } = makeUseCase(records, closedForge(), {}, haltFake, {
+      queueWriter: writer.adapter,
+    });
 
-      await useCase.runMergePass(request);
+    await useCase.runMergePass(request);
 
-      expect(records).toHaveLength(1);
-      expect(records[0].state).toBe('queued');
+    expect(writer.transitions).toEqual([]);
+    expect(records).toHaveLength(1);
+    expect(records[0].state).toBe('queued');
+    const dropped = await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/would-drop`);
+    expect(dropped.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(dropped[1].outcome).toBe('dry-run');
+    expect(dropped[1].reasonCode).toBe('would-drop');
+    expect(dropped[1].detail).toBe('closed');
+  });
+
+  it('after a shadow tick on an EXHAUSTED PR the live conductor reads no dropped entry', async () => {
+    // Fix round 2 (Fable): the exhausted case is covered separately from the
+    // closed one, against the same recording writer.
+    const records = [makeEntry({ attempt: 9 })];
+    const writer = recordingQueueWriter();
+    const { useCase, deps, request } = makeUseCase(records, exhaustedForge(), {}, haltFake, {
+      queueWriter: writer.adapter,
+    });
+
+    await useCase.runMergePass(request);
+
+    expect(writer.transitions).toEqual([]);
+    expect(records).toHaveLength(1);
+    expect(records[0].state).toBe('queued');
+    const dropped = await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/would-drop`);
+    expect(dropped.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(dropped[1].outcome).toBe('dry-run');
+    expect(dropped[1].reasonCode).toBe('would-drop');
+    expect(dropped[1].detail).toBe('forge-error-exhausted');
+  });
+
+  it('a moved head whose in-memory successor PARKS journals would-park and never persists (real queue adapter)', async () => {
+    // Fix round 2 (Fable, major): with the real file-backed queue adapter as
+    // BOTH the reader and the writer, a shadow supersede whose successor then
+    // parks must not call `persist` on the unpersisted successor id (the real
+    // adapter refuses it with `unknown-entry`); the park is journalled as
+    // `would-park` on the successor's own head, and the queue file's bytes
+    // are exactly what the tick found.
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-merge-queue-successor-park-'));
+    try {
+      const entry = makeEntry();
+      const queue = new MergeQueueRepositoryAdapter({ stateDir });
+      const repoDigest = mergeQueueRepositoryDigest({ owner: OWNER, repo: REPO });
+      const freshDeadline = new Date(Date.now() + 60_000).toISOString();
+      const enqueued = await queue.enqueueMergeEntry({
+        repository: { owner: OWNER, repo: REPO },
+        pullRequest: entry.pullRequest,
+        headOid: entry.headOid,
+        tier: entry.tier,
+        enqueuedBy: 'conductor',
+        runId: null,
+        entryId: entry.entryId,
+        successorEntryId: '01JB0000000000000000000000',
+        enqueuedAtIso: entry.enqueuedAtIso,
+        deadlineIso: freshDeadline,
+      });
+      expect(enqueued.outcome).toBe('created');
+      const queueFile = path.join(stateDir, 'merge-queue.json');
+      const before = await fs.readFile(queueFile, 'utf8');
+
+      // The head moved (supersede) and the moved head has unresolved threads
+      // (park), read twice in one pass: once for the predecessor, once for
+      // the in-memory successor.
+      const movedWithThreads: ReadForgeMergeResult = {
+        ...greenForge,
+        liveHeadSha: HEAD3,
+        unresolvedThreads: 2,
+      };
+      const journal = new LaneRunJournalAdapter();
+      let ulid = 0;
+      const useCase = new RunMergePassUseCase({
+        queue,
+        queueWriter: queue, // the real adapter, not a spy-only fake
+        forgeRead: forgeReadFake(movedWithThreads),
+        verification: verificationFake(),
+        journal: journal as LaneRunJournalPort,
+        halt: haltFake,
+        newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
+        nowIso: () => NOW,
+      });
+      const request: RunMergePassRequest = {
+        repository: { owner: OWNER, repo: REPO },
+        repoDigest,
+        projectId: 'proj-1',
+        policy: makePolicy(),
+        deadlineIso: freshDeadline,
+      };
+
+      const result = await useCase.runMergePass(request);
+
+      expect(result.outcome).toBe('completed');
+      expect(result.entries[0].decision).toBe('journalled');
+      expect(result.entries[0].reasonCode).toBe('would-park');
+      // Keyed on the in-memory SUCCESSOR's head (the mutation-gap pin), with
+      // the successor's own park reason.
+      expect(result.entries[0].journalKey).toBe(`merge/${repoDigest}/1/${HEAD3_12}/would-park`);
+      const parked = await journal.listForKey(`merge/${repoDigest}/1/${HEAD3_12}/would-park`);
+      expect(parked.map((record) => record.kind)).toEqual(['intent', 'result']);
+      expect(parked[1].outcome).toBe('dry-run');
+      expect(parked[1].reasonCode).toBe('would-park');
+      expect(parked[1].detail).toBe('threads');
+      const superseded = await journal.listForKey(`merge/${repoDigest}/1/${HEAD12}/would-supersede`);
+      expect(superseded.map((record) => record.kind)).toEqual(['intent', 'result']);
+      // No `persist-refused` anywhere in the report, no `would-notify` for a
+      // park that was never stored, and a byte-identical merge-queue.json.
+      for (const reported of result.entries) {
+        expect(reported.reasonCode).not.toBe('persist-refused');
+        expect(reported.reasonCode).not.toBe('persist-failed');
+      }
+      for (const head12 of [HEAD12, HEAD3_12]) {
+        expect(await journal.listForKey(`merge/${repoDigest}/1/${head12}/would-notify`)).toHaveLength(0);
+      }
+      expect(await fs.readFile(queueFile, 'utf8')).toBe(before);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true });
     }
+  });
+
+  it('a shadow supersede closes the PREDECESSOR head\'s open shadow intents', async () => {
+    // Fix round 2 (Fable, mutation gap): an open intent seeded on the
+    // predecessor's head is closed by the shadow supersede, which closes the
+    // predecessor's open intents before acting on the successor.
+    const moved: ReadForgeMergeResult = { ...greenForge, liveHeadSha: HEAD3 };
+    const { useCase, deps, request } = makeUseCase([makeEntry()], moved);
+    const key = `merge/${DIGEST}/1/${HEAD12}/would-park`;
+    await deps.journal.append({
+      version: 1, entryId: '01JB0000000000000000000098', kind: 'intent', key, runId: null,
+      recordedAtIso: NOW, mode: null, expectedRevision: null, mintedId: null, outcome: null,
+      reasonCode: null, detail: null, grantId: null, state: null,
+    } as LaneRunJournalEntryRecord);
+
+    await useCase.runMergePass(request);
+
+    const after = await deps.journal.listForKey(key);
+    expect(after.map((record) => record.kind)).toEqual(['intent', 'result']);
+    expect(after[1].outcome).toBe('dry-run');
+    expect(after[1].reasonCode).toBe('shadow-intent-closed');
+  });
+
+  it('a refused result append cannot leave an open would-notify intent: it is closed', async () => {
+    // Fix round 2 (Fable, minor): `closeOpenShadowIntents` now includes
+    // `would-notify`, so an interrupted silent-notification intent from a
+    // prior tick gets its result instead of staying open forever.
+    const { useCase, deps, request } = makeUseCase([makeEntry()], closedForge());
+    const key = `merge/${DIGEST}/1/${HEAD12}/would-notify`;
+    await deps.journal.append({
+      version: 1, entryId: '01JB0000000000000000000097', kind: 'intent', key, runId: null,
+      recordedAtIso: NOW, mode: null, expectedRevision: null, mintedId: null, outcome: null,
+      reasonCode: null, detail: null, grantId: null, state: null,
+    } as LaneRunJournalEntryRecord);
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-drop');
+    const after = await deps.journal.listForKey(key);
+    expect(after.map((record) => record.kind)).toEqual(['intent', 'result']);
+    expect(after[1].outcome).toBe('dry-run');
+    expect(after[1].reasonCode).toBe('shadow-intent-closed');
+  });
+
+  it('a live tick on a DIRTY PR drops with reason conflict through the writer and notifier, as on main', async () => {
+    // Fix round 2 (Fable, minor): the `dirty: 'DIRTY'` drop in updateRowStep
+    // is unchanged from origin/main, so live behaviour must stay
+    // byte-identical: the drop persists and notifies exactly as before.
+    const writer = queueWriterSpy();
+    const notifier = notifierSpy();
+    const { useCase, deps, request } = makeUseCase(
+      [makeEntry()],
+      { ...greenForge, mergeState: 'dirty' } as unknown as ReadForgeMergeResult,
+      { shadow: false },
+      haltFake,
+      { queueWriter: writer.adapter, notifier: notifier.adapter },
+    );
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('recorded');
+    expect(result.entries[0].reasonCode).toBe('conflict');
+    expect(writer.calls).toBe(1);
+    expect(notifier.calls).toBe(1);
+    expect(await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/would-drop`)).toHaveLength(0);
+    expect(await journalOf(deps.journal)).toHaveLength(0);
   });
 });

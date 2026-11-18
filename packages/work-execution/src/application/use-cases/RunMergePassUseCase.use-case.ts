@@ -537,6 +537,16 @@ export class RunMergePassUseCase implements RunMergePassPort {
       next = second;
       acting = ready.record;
     }
+    if (request.policy.shadow === true && next.kind === 'park') {
+      // Fix round 2 (Fable): the successor lives only in memory, so a park
+      // here would call `persist` on an UNPERSISTED entry id — the real
+      // adapter refuses it (`unknown-entry`), every tick would report
+      // `persist-refused`, and a `would-notify` would be journalled for a
+      // park that was never stored. Any decision reached on an in-memory
+      // successor is journal-only: the park is journalled as `would-park`
+      // with its reason, keyed on the successor's own head.
+      return this.journalShadowOutcome(request, acting, 'would-park', next.reason);
+    }
     if (request.policy.shadow === true) {
       await this.closeOpenShadowIntents(request, acting, this.actingShadowAction(next));
     }
@@ -1003,7 +1013,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       return;
     }
     for (const action of [
-      'merge-pr', 'update-branch', 'post-status',
+      'merge-pr', 'update-branch', 'post-status', 'would-notify',
       'would-drop', 'would-park', 'would-supersede', 'would-ready', 'would-already-merged',
     ] as const) {
       if (action === except) {

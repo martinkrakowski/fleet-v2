@@ -509,6 +509,11 @@ function parseOwnerSection(
   if (!Object.hasOwn(value, 'owner')) {
     return undefined;
   }
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'owner');
+  if (descriptor !== undefined && !('value' in descriptor)) {
+    errors.push(ownerSectionError('owner-key-accessor'));
+    return undefined;
+  }
   const result = readOwnerSection(readOwnDataProperty(value, 'owner'));
   if (!result.ok) {
     errors.push(ownerSectionError(result.code));

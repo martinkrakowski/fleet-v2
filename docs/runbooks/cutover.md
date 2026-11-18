@@ -41,7 +41,7 @@ To issue a fresh grant after a revocation, record different coordinates — for 
 
 A release grant (`release:install`, `release:swap`, `release:rollback`) is bound to the release root it names:
 
-- Create one with `fleet-v2 coordination request-decision --kind action-decision --action-scope release:install|release:swap --project-id <id> --expected-head-sha <sha> --proposal-digest <digest> --policy-revision <rev> --release-root <path>`. `--release-root` is required for every `release:*` scope and refused for all other scopes. It is normalized via `realpath` (symlinks resolved; a path that does not resolve to an existing directory is a usage error, exit 2, never echoing the path) and bound into the request id: `release-grant-<sha256 of { scope, projectId, expectedHeadSha, releaseRoot }>`. A hand-typed `--request-id` that does not match the derived one is refused (exit 2) instead of recorded. The owner's Ed25519 decision signature covers `{ requestId, projectId, actionScope, expectedHeadSha, decisionRevision, grantId, state }` and not `releaseRoot` itself — the root is covered because the signed `requestId` is its digest.
+- Create one with `fleet-v2 coordination request-decision --kind action-decision --action-scope release:install|release:swap --project-id <id> --expected-head-sha <sha> --proposal-digest <digest> --policy-revision <rev> --release-root <path>`. `--release-root` is required for every `release:*` scope and refused for all other scopes. It is normalized via `realpath` (symlinks resolved; a path that does not resolve to an existing directory is a usage error, exit 2, never echoing the path) and bound into the request id: `release-grant-<sha256 of { scope, projectId, expectedHeadSha, releaseRoot, nonce }>` (the CLI generates the per-request nonce; a repeat request with the same coordinates is a new record, not a replay). A hand-typed `--request-id` that does not match the derived one is refused (exit 2) instead of recorded. The owner's Ed25519 decision signature covers `{ requestId, projectId, actionScope, expectedHeadSha, decisionRevision, grantId, state }` and not `releaseRoot` itself — the root is covered because the signed `requestId` is its digest.
 - Resolve one with `coordination resolve-auth --project-id <id> --action-scope release:<action> --expected-head-sha <sha> --release-root <path>` (or through `fleet-v2 release install|swap|rollback`, which forwards the realpath-resolved root). The resolve re-checks the digest of the stored coordinates on every call: a record whose id does not carry the `release-grant-` prefix (a pre-RR1 unsigned root) fails closed, and a mismatched or tampered root is refused `release-grant-digest-mismatch`. A grant bound to one root never authorizes an operation on another (`release-grant-root-mismatch`).
 
   The release root named in the grant (`--release-root`) is the same path the operation runs on: `fleet-v2 release install --root <path>` and `fleet-v2 release swap --root <path>` each take `--root <path>`, and that path is realpath-normalized the same way before use, so it must match the grant's `--release-root` (their digests must be equal). A `--root` that normalizes to a different directory — a different checkout, a moved tree, or a symlink resolving elsewhere — does not satisfy the grant and is refused before any mutation.
@@ -127,8 +127,44 @@ string that is not canonical base64 of 32 bytes; it never echoes the offending
 value. A raw Ed25519 seed is also 32 bytes, so the screen cannot distinguish a
 seed from a public key — never paste a seed there. A file that pins
 `owner.publicKey` and also carries `waves.ownerPublicKey` is refused unless the
-two agree, so a file cannot name two different owner keys. Rotation is
-out of scope for this runbook until a live rotation command exists.
+two agree, so a file cannot name two different owner keys.
+
+### Moving the installation file out of every checkout
+
+`loadInstallation` refuses to return a pinned `owner.publicKey` from an
+installation file that lies inside a git checkout or worktree — including the
+repository's own `<repo>/installation/fleet.json`, because the repo checkout is
+exactly where local agents work — or inside any `hosts.*.worktreeRoot`, or
+carried by a symlink, a non-regular file, a file the process uid does not own,
+or a group/other-writable file (`owner-key-installation-untrusted`). Arming
+step: move the installation file out of every checkout to
+`~/.config/fleet-v2/fleet.json` (`0600` in a `0700` directory) and point
+`FLEET_INSTALLATION_FILE` at that path in the CLI shell profile and in the
+systemd user `EnvironmentFile` drop-in shared by the daemon, train, and
+conductor units.
+
+### Pinning and rotating the key
+
+Pin `owner.publicKey` by editing the installation file directly — no `hosts`
+or `policy` subcommand writes the `owner` section — with the canonical base64
+encoding of the 32-byte raw Ed25519 public key. A raw Ed25519 seed is also
+32 bytes, so the secret screen cannot distinguish a seed from a public key:
+never paste a seed. `waves.ownerPublicKey` is non-authoritative; it is
+accepted only when it equals `owner.publicKey`.
+
+Rotate by replacing `owner.publicKey` in the installation file, then
+re-signing any pending decisions so they carry the new key, and restarting the
+API and the daemon so the new key is what every consumer reads. Rotation is a
+file edit plus a restart, not a command.
+
+### The same-uid limit
+
+`~/.config/fleet-v2/fleet.json` (`0600`, in a `0700` directory) keeps remote
+lanes and repo-checkout agents from writing the installation file or the
+pinned key via the worktree check. It does not keep a local process safe: any
+process running as the owner's uid can still read and write these files. The
+follow-up that closes this is to run local agents under a separate system
+user.
 
 ## Not this runbook
 

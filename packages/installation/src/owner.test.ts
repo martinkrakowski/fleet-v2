@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { loadInstallation, type InstallationFileSeam } from './load.js';
 import { parseInstallation } from './parse.js';
 import { parseOwnerPublicKey, readOwnerSection } from './owner.js';
 
@@ -117,6 +121,63 @@ describe('readOwnerSection', () => {
       code: 'owner-key-invalid-type',
     });
   });
+
+  it('refuses a Proxy whose getPrototypeOf trap throws', () => {
+    const target = { publicKey: VALID_KEY };
+    const proxy = new Proxy(target, {
+      getPrototypeOf(): never {
+        throw new Error('boom');
+      },
+    });
+    expect(readOwnerSection(proxy)).toEqual({ ok: false, code: 'owner-section-invalid' });
+  });
+
+  it('refuses a Proxy whose ownKeys trap throws', () => {
+    const target = { publicKey: VALID_KEY };
+    const proxy = new Proxy(target, {
+      ownKeys(): never {
+        throw new Error('boom');
+      },
+    });
+    expect(readOwnerSection(proxy)).toEqual({ ok: false, code: 'owner-section-invalid' });
+  });
+
+  it('refuses a Proxy whose getOwnPropertyDescriptor trap throws', () => {
+    const target = { publicKey: VALID_KEY };
+    const proxy = new Proxy(target, {
+      getOwnPropertyDescriptor(): never {
+        throw new Error('boom');
+      },
+    });
+    expect(readOwnerSection(proxy)).toEqual({ ok: false, code: 'owner-section-invalid' });
+  });
+
+  it('reads a Proxy over a valid section through no get trap', () => {
+    let getTraps = 0;
+    const target = { publicKey: VALID_KEY };
+    const proxy = new Proxy(target, {
+      get(): never {
+        getTraps += 1;
+        throw new Error('get trap must never run');
+      },
+    });
+    const result = readOwnerSection(proxy);
+    expect(result).toEqual({ ok: true, value: { publicKey: VALID_KEY } });
+    expect(getTraps).toBe(0);
+  });
+
+  it('never runs a getter on the section root through a Proxy', () => {
+    let getterRuns = 0;
+    const target = {
+      get publicKey(): string {
+        getterRuns += 1;
+        return VALID_KEY;
+      },
+    };
+    const proxy = new Proxy(target, {});
+    expect(readOwnerSection(proxy)).toEqual({ ok: false, code: 'owner-key-accessor' });
+    expect(getterRuns).toBe(0);
+  });
 });
 
 describe('parseInstallation owner section', () => {
@@ -208,5 +269,165 @@ describe('parseInstallation owner section', () => {
     if (result.ok) {
       expect(result.installation.owner).toEqual({ publicKey: VALID_KEY });
     }
+  });
+});
+
+describe('parseInstallation accessor owner section', () => {
+  const V2_BASE = {
+    schemaVersion: 2,
+    forge: { mode: 'none' },
+  };
+
+  it('refuses an accessor on the root owner property as owner-key-accessor', () => {
+    let getterRuns = 0;
+    const doc: Record<string, unknown> = { ...V2_BASE };
+    Object.defineProperty(doc, 'owner', {
+      enumerable: true,
+      get() {
+        getterRuns += 1;
+        return { publicKey: VALID_KEY };
+      },
+    });
+    const result = parseInstallation(doc);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toContain('owner.publicKey: owner-key-accessor');
+    }
+    expect(getterRuns).toBe(0);
+  });
+});
+
+describe('loadInstallation owner trust check', () => {
+  const OWNER_V1 = { schemaVersion: 1, owner: { publicKey: VALID_KEY } };
+  const OWNER_JSON = JSON.stringify(OWNER_V1);
+  const REMEDY = '~/.config/fleet-v2/fleet.json';
+
+  let tempDir: string;
+
+  function writeInstallation(name: string, content: string): string {
+    const file = join(tempDir, name);
+    writeFileSync(file, content, { mode: 0o600 });
+    return file;
+  }
+
+  function expectUntrusted(errors: readonly string[], reasonPart: string): void {
+    const message = errors.find((error) => error.includes('owner-key-installation-untrusted'));
+    expect(message, JSON.stringify(errors)).toBeDefined();
+    if (message === undefined) {
+      return;
+    }
+    expect(message).toContain(reasonPart);
+    expect(message).toContain(REMEDY);
+    expect(message).toContain('FLEET_INSTALLATION_FILE');
+  }
+
+  function gitCheckout(dir: string): void {
+    mkdirSync(join(dir, '.git'), { recursive: true });
+  }
+
+  function readErrors(result: ReturnType<typeof loadInstallation>): readonly string[] {
+    expect(result.status).toBe('invalid');
+    return result.status === 'invalid' ? result.errors : [];
+  }
+
+  function load(file: string, seam?: InstallationFileSeam) {
+    return loadInstallation({ file, cwd: tempDir, seam });
+  }
+
+  function freshDir(): void {
+    tempDir = mkdtempSync(join(tmpdir(), 'fleet-owner-trust-'));
+  }
+
+  it('loads the pinned key from a trusted installation file', () => {
+    freshDir();
+    const file = writeInstallation('fleet.json', OWNER_JSON);
+    const result = load(file);
+    expect(result.status).toBe('loaded');
+    if (result.status === 'loaded') {
+      expect(result.installation.owner).toEqual({ publicKey: VALID_KEY });
+    }
+  });
+
+  it('refuses a symlinked installation file (O_NOFOLLOW)', () => {
+    freshDir();
+    const target = writeInstallation('real.json', OWNER_JSON);
+    const link = join(tempDir, 'link.json');
+    symlinkSync(target, link);
+    expectUntrusted(readErrors(load(link)), 'symlink');
+  });
+
+  it('refuses a file the process uid does not own (injectable seam)', () => {
+    freshDir();
+    const file = writeInstallation('fleet.json', OWNER_JSON);
+    expectUntrusted(readErrors(load(file, { getuid: () => 12345 })), 'process uid');
+  });
+
+  it('refuses a non-regular file (injectable fstat seam)', () => {
+    freshDir();
+    const file = writeInstallation('fleet.json', OWNER_JSON);
+    const seam = {
+      fstat: () => ({ uid: process.getuid?.() ?? -1, mode: 0o100644, isFile: () => false }),
+    };
+    expectUntrusted(readErrors(load(file, seam)), 'regular file');
+  });
+
+  it('refuses a group- or other-writable file', () => {
+    freshDir();
+    const file = writeInstallation('fleet.json', OWNER_JSON);
+    chmodSync(file, 0o662);
+    expectUntrusted(readErrors(load(file)), 'write bit');
+  });
+
+  it('refuses a file inside a hosts.*.worktreeRoot', () => {
+    freshDir();
+    const file = writeInstallation(
+      'fleet.json',
+      JSON.stringify({
+        schemaVersion: 2,
+        forge: { mode: 'none' },
+        hosts: {
+          lane: {
+            transport: 'local',
+            worktreeRoot: tempDir,
+            roles: ['orchestrator', 'lane-runner'],
+            runner: { kind: 'opencode', port: 46000 },
+          },
+        },
+        owner: { publicKey: VALID_KEY },
+      }),
+    );
+    expectUntrusted(readErrors(load(file)), 'worktreeRoot');
+  });
+
+  it('refuses <repo>/installation/fleet.json inside a git worktree and names the remedy', () => {
+    freshDir();
+    gitCheckout(tempDir);
+    mkdirSync(join(tempDir, 'installation'));
+    const file = writeInstallation(join('installation', 'fleet.json'), OWNER_JSON);
+    expectUntrusted(readErrors(load(file)), 'git checkout or worktree');
+  });
+
+  it('refuses an installation file whose parent is a git checkout (explicit file)', () => {
+    freshDir();
+    gitCheckout(tempDir);
+    const file = writeInstallation('fleet.json', OWNER_JSON);
+    expectUntrusted(readErrors(load(file)), 'git checkout or worktree');
+  });
+
+  it('applies no trust check when the file carries no owner section', () => {
+    freshDir();
+    gitCheckout(tempDir);
+    const file = writeInstallation('fleet.json', JSON.stringify({ schemaVersion: 1 }));
+    const result = load(file, { getuid: () => 12345 });
+    expect(result.status).toBe('loaded');
+    if (result.status === 'loaded') {
+      expect(result.installation.owner).toBeUndefined();
+    }
+  });
+
+  it('still loads an ownerless file as absent when no file exists', () => {
+    freshDir();
+    const result = load(join(tempDir, 'missing.json'));
+    expect(result.status).toBe('absent');
   });
 });

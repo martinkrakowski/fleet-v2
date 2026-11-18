@@ -1,15 +1,60 @@
-import { readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+} from 'node:fs';
+import { dirname, join, resolve, sep } from 'node:path';
 
-import type { FleetInstallation, FleetInstallationModel, RunnerSection } from './types.js';
+import type {
+  FleetInstallation,
+  FleetInstallationModel,
+  HostSection,
+  RunnerSection,
+} from './types.js';
 import { deriveInstallationModel } from './model.js';
 import { parseInstallation, parsePrepareArgv } from './parse.js';
 import { validateSeatPolicy, v1FamilyWarnings } from './policy.js';
+
+/**
+ * The filesystem seam the installation-file trust check reads through. Every
+ * member defaults to the real `node:fs` behaviour; a test (or an embedding
+ * host) may override any member alone, so a uid-mismatch refusal can be
+ * exercised without root. The bytes are read from the handle `open` returned
+ * and `fstat` runs on that same handle, so no TOCTOU window exists between
+ * the identity check and the parse.
+ */
+export interface InstallationFileSeam {
+  /** Open the file `O_RDONLY | O_NOFOLLOW`; a symlink is `ELOOP`. */
+  open?: (path: string) => number;
+  /** `fstat` the open handle: uid, full mode, and regular-file-ness. */
+  fstat?: (fd: number) => { uid: number; mode: number; isFile: () => boolean };
+  /** Read the whole file from the open handle. */
+  readAll?: (fd: number) => string;
+  /** Close the open handle. */
+  close?: (fd: number) => void;
+  /** The process uid the file must be owned by. */
+  getuid?: () => number;
+  /** The realpath used for the worktree and checkout checks. */
+  realpath?: (path: string) => string;
+  /** Whether a `.git` entry (directory or worktree file) exists at a path. */
+  hasGitEntry?: (path: string) => boolean;
+}
 
 export interface LoadOptions {
   file?: string;
   env?: Record<string, string | undefined>;
   cwd?: string;
+  /**
+   * Filesystem seam overrides for the `owner.publicKey` trust check. Absent
+   * members default to the real `node:fs` behaviour; the checks run only
+   * when the parsed installation carries an `owner` section.
+   */
+  seam?: InstallationFileSeam;
   /**
    * Additional policy rule hook. The loader calls it with the derived model
    * after mapping; every returned string is a load error. Shape validation
@@ -79,6 +124,196 @@ export function resolveInstallationFile(file: string | undefined, env: EnvRecord
     return resolve(cwd, fromEnvironment);
   }
   return join(cwd, 'installation', 'fleet.json');
+}
+
+/** The remedy named by every `owner-key-installation-untrusted` refusal. */
+const OWNER_TRUST_REMEDY =
+  'move the installation file out of every checkout to ~/.config/fleet-v2/fleet.json ' +
+  '(0600 in a 0700 directory) and set FLEET_INSTALLATION_FILE to that path';
+
+/** The seam with every member filled in: the given overrides over `node:fs`. */
+interface ResolvedSeam {
+  open: (path: string) => number;
+  fstat: (fd: number) => { uid: number; mode: number; isFile: () => boolean };
+  readAll: (fd: number) => string;
+  close: (fd: number) => void;
+  getuid: () => number;
+  realpath: (path: string) => string;
+  hasGitEntry: (path: string) => boolean;
+}
+
+function resolveSeam(seam: InstallationFileSeam | undefined): ResolvedSeam {
+  return {
+    open:
+      seam?.open ??
+      ((path: string) => openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)),
+    fstat: seam?.fstat ?? ((fd: number) => {
+      const stats = fstatSync(fd);
+      return { uid: stats.uid, mode: stats.mode, isFile: () => stats.isFile() };
+    }),
+    readAll:
+      seam?.readAll ??
+      ((fd: number) => {
+        const chunks: Buffer[] = [];
+        const buffer = Buffer.alloc(64 * 1024);
+        for (;;) {
+          const read = readSync(fd, buffer, 0, buffer.length, null);
+          if (read <= 0) {
+            break;
+          }
+          chunks.push(Buffer.from(buffer.subarray(0, read)));
+        }
+        return Buffer.concat(chunks).toString('utf8');
+      }),
+    close: seam?.close ?? closeSync,
+    getuid: seam?.getuid ?? (() => process.getuid?.() ?? -1),
+    realpath: seam?.realpath ?? realpathSync,
+    hasGitEntry: seam?.hasGitEntry ?? ((path: string) => existsSync(join(path, '.git'))),
+  };
+}
+
+/** The outcome of reading the installation file through the seam. */
+type FileRead =
+  | { kind: 'absent' }
+  | { kind: 'unreadable' }
+  | {
+      kind: 'bytes';
+      raw: string;
+      /** True when the path is a symlink, read through the fallback. */
+      symlinked: boolean;
+      /** `fstat` of the open handle, when one could be taken. */
+      stats?: { uid: number; mode: number; isFile: () => boolean };
+    };
+
+/**
+ * Read the installation file. The bytes always come from the handle `open`
+ * returned and `fstat` runs on that same handle, so the trust decision and
+ * the parse see the same bytes. A symlinked path is read through the plain
+ * fallback (the behaviour of an ownerless file is unchanged) and refused
+ * later when the file carries an `owner` section.
+ */
+function readInstallationFile(file: string, seam: ResolvedSeam): FileRead {
+  let fd: number;
+  try {
+    fd = seam.open(file);
+  } catch (error) {
+    const code = readErrorCode(error);
+    if (code === 'ENOENT') {
+      return { kind: 'absent' };
+    }
+    if (code === 'ELOOP') {
+      try {
+        return { kind: 'bytes', raw: readFileSync(file, 'utf8'), symlinked: true };
+      } catch {
+        return { kind: 'unreadable' };
+      }
+    }
+    return { kind: 'unreadable' };
+  }
+  try {
+    let stats: { uid: number; mode: number; isFile: () => boolean } | undefined;
+    try {
+      stats = seam.fstat(fd);
+    } catch {
+      stats = undefined;
+    }
+    return { kind: 'bytes', raw: seam.readAll(fd), symlinked: false, stats };
+  } catch {
+    return { kind: 'unreadable' };
+  } finally {
+    try {
+      seam.close(fd);
+    } catch {
+      // The read outcome is already decided; a failed close changes nothing.
+    }
+  }
+}
+
+/**
+ * True when the realpath lies at or below the given worktree root. Both
+ * sides are absolute; the root is resolved against the same cwd semantics
+ * as the installation file itself.
+ */
+function isInsideRoot(realpath: string, root: string): boolean {
+  const resolvedRoot = resolve(root);
+  return realpath === resolvedRoot || realpath.startsWith(`${resolvedRoot}${sep}`);
+}
+
+/**
+ * Every configured `hosts.*.worktreeRoot` of the installation, v1 or v2.
+ */
+function worktreeRoots(installation: FleetInstallation): readonly string[] {
+  const hosts = installation.hosts as Readonly<Record<string, HostSection>> | undefined;
+  if (hosts === undefined) {
+    return [];
+  }
+  return Object.values(hosts)
+    .map((host) => host?.worktreeRoot)
+    .filter((root): root is string => typeof root === 'string');
+}
+
+/**
+ * True when any parent directory of the path carries a `.git` entry: the
+ * file lives inside a git checkout or worktree, where local agents write.
+ */
+function insideGitCheckout(realpath: string, seam: ResolvedSeam): boolean {
+  let dir = dirname(realpath);
+  for (;;) {
+    if (seam.hasGitEntry(dir)) {
+      return true;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) {
+      return false;
+    }
+    dir = parent;
+  }
+}
+
+/**
+ * The reason the installation file cannot be trusted to carry the pinned
+ * `owner.publicKey`, or undefined when every check passes. The checks are:
+ * a non-symlink regular file, owned by the process uid, with no group or
+ * other write bit, outside every `hosts.*.worktreeRoot`, and outside any
+ * git checkout or worktree (including the repository checkout the file may
+ * sit in — the repo checkout is exactly where local agents work).
+ */
+function ownerTrustReason(
+  file: string,
+  installation: FleetInstallation,
+  read: Extract<FileRead, { kind: 'bytes' }>,
+  seam: ResolvedSeam,
+): string | undefined {
+  if (read.symlinked) {
+    return 'the path is a symlink';
+  }
+  if (read.stats === undefined) {
+    return 'the file handle could not be fstat-ed';
+  }
+  if (!read.stats.isFile()) {
+    return 'it is not a regular file';
+  }
+  if (read.stats.uid !== seam.getuid()) {
+    return 'it is not owned by the process uid';
+  }
+  if ((read.stats.mode & 0o022) !== 0) {
+    return 'the group or other write bit is set';
+  }
+  let realpath: string;
+  try {
+    realpath = seam.realpath(resolve(file));
+  } catch {
+    return 'its realpath could not be resolved';
+  }
+  for (const root of worktreeRoots(installation)) {
+    if (isInsideRoot(realpath, root)) {
+      return 'it lies inside a hosts.*.worktreeRoot';
+    }
+  }
+  if (insideGitCheckout(realpath, seam)) {
+    return 'it lies inside a git checkout or worktree';
+  }
+  return undefined;
 }
 
 const REMOTE_PORT_PATTERN = /^\d+$/;
@@ -182,20 +417,35 @@ function applyEnvironmentOverrides(
  * `policy.daemon.chainRefresh` mode, CO8a). When a `validatePolicy` hook is
  * provided the loader calls it with the model and treats every returned string
  * as a load error.
+ *
+ * When the parsed file carries an `owner` section, the loader proves the file
+ * trusted before returning the pinned `owner.publicKey` (see
+ * `ownerTrustReason`): the bytes are read from an `O_NOFOLLOW` handle that is
+ * `fstat`-ed on the spot, and a file that is a symlink, not a regular file,
+ * not owned by the process uid, group/other-writable, inside any
+ * `hosts.*.worktreeRoot`, or inside a git checkout or worktree is refused
+ * with `owner-key-installation-untrusted` and the remedy. A file without an
+ * `owner` section is read exactly as before, with no checks.
  */
 export function loadInstallation(options: LoadOptions = {}): LoadResult {
   const cwd = options.cwd ?? process.cwd();
   const env: EnvRecord = options.env ?? process.env;
   const file = resolveInstallationFile(options.file, env, cwd);
+  const seam = resolveSeam(options.seam);
 
   let installation: FleetInstallation;
   let source: 'absent' | 'loaded';
   let parseWarnings: string[] = [];
-  try {
-    const raw = readFileSync(file, 'utf8');
+  const read = readInstallationFile(file, seam);
+  if (read.kind === 'absent') {
+    installation = { schemaVersion: 1 };
+    source = 'absent';
+  } else if (read.kind === 'unreadable') {
+    return { status: 'invalid', file, errors: [`${file}: unreadable`] };
+  } else {
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      parsed = JSON.parse(read.raw);
     } catch {
       return { status: 'invalid', file, errors: [`${file}: invalid JSON`] };
     }
@@ -206,12 +456,17 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
     installation = result.installation;
     parseWarnings = result.warnings ?? [];
     source = 'loaded';
-  } catch (error) {
-    if (readErrorCode(error) === 'ENOENT') {
-      installation = { schemaVersion: 1 };
-      source = 'absent';
-    } else {
-      return { status: 'invalid', file, errors: [`${file}: unreadable`] };
+    if (installation.owner !== undefined) {
+      const reason = ownerTrustReason(file, installation, read, seam);
+      if (reason !== undefined) {
+        return {
+          status: 'invalid',
+          file,
+          errors: [
+            `${file}: owner-key-installation-untrusted (${reason}); ${OWNER_TRUST_REMEDY}`,
+          ],
+        };
+      }
     }
   }
 

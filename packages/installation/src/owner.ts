@@ -147,8 +147,29 @@ function ownDataEntries(
  * (`owner-key-accessor`), or a `publicKey` refused by
  * `parseOwnerPublicKey` (its code passes through). Linear in the bounded
  * `OWNER_KEYS` and the capped key length.
+ *
+ * Never throws: the reflective reads (prototype, own keys, descriptors) are
+ * wrapped so a hostile Proxy whose traps throw yields the typed
+ * `owner-section-invalid` refusal. Enumerating the own keys before any
+ * length cap is the documented JavaScript limit for the whole record shape
+ * (residual #4v): the key set is bounded by the file size the caller already
+ * read, and no work is done per value before enumeration; this is stated,
+ * not solved.
  */
 export function readOwnerSection(value: unknown): OwnerSectionResult {
+  // Every reflective read below is wrapped: a hostile Proxy whose
+  // `getPrototypeOf`, `ownKeys` or `getOwnPropertyDescriptor` trap throws
+  // yields the typed `owner-section-invalid` refusal instead of an
+  // exception. The reads never invoke a `get` trap, so a `get` trap's
+  // counter stays 0 for any input.
+  try {
+    return readOwnerSectionStrict(value);
+  } catch {
+    return { ok: false, code: 'owner-section-invalid' };
+  }
+}
+
+function readOwnerSectionStrict(value: unknown): OwnerSectionResult {
   if (!isPlainRecord(value)) {
     return { ok: false, code: 'owner-section-invalid' };
   }

@@ -5187,4 +5187,61 @@ describe('RecordShadowDayUseCase S12 coverage guards and corrupt daemon-event li
     expect(result).not.toHaveProperty('droppedLines');
     expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
   });
+
+  // OD7a3 fix round: the read result is snapshotted once through its own data
+  // descriptors (`snapshotEventsRead`), so a Proxy whose `get` trap lies
+  // about `events` while its descriptors describe a valid full-day read must
+  // yield exactly the plain read's result — never a shortened list, and
+  // never `too-few-ticks`. Tested in scheduled AND manual mode.
+  it.each(['scheduled', 'manual'] as const)('a Proxy whose get returns events: [] over a valid full-day read gives the plain read result, never too-few-ticks (%s mode)', async (mode) => {
+    const plain = dayRead(cleanFixture(DAY).daemonEvents) as Record<string, unknown>;
+    const lying = new Proxy(plain, {
+      get(target, key, receiver) {
+        // The promise protocol probes `then` on the awaited value; that is
+        // not a data read. Every data key goes through this trap, which lies
+        // about `events` — the snapshot must never consult it.
+        if (key === 'events') {
+          return [];
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const proxiedResult =
+      mode === 'scheduled'
+        ? await new RecordShadowDayUseCase(harnessWithRead(scheduledHarness(cleanFixture(DAY)), lying).deps).execute(
+            makeRequest({ scheduled: true }),
+          )
+        : await new RecordShadowDayUseCase(harnessWithRead(makeHarness(cleanFixture(DAY), NOW), lying).deps).execute(makeRequest());
+    const plainResult =
+      mode === 'scheduled'
+        ? await new RecordShadowDayUseCase(harnessWithRead(scheduledHarness(cleanFixture(DAY)), plain).deps).execute(
+            makeRequest({ scheduled: true }),
+          )
+        : await new RecordShadowDayUseCase(harnessWithRead(makeHarness(cleanFixture(DAY), NOW), plain).deps).execute(makeRequest());
+    expect(proxiedResult).toEqual(plainResult);
+    expect(proxiedResult).toHaveProperty('recorded');
+    expect((proxiedResult as { recorded: Record<string, string> }).recorded.S12).toBe('pass');
+  });
+
+  // OD7a3 fix round: a Proxy whose `getOwnPropertyDescriptor` trap throws is
+  // caught by `snapshotEventsRead` and fails closed as
+  // `unknown/daemon-events-corrupt`, writing nothing, and `execute()`
+  // resolves without throwing. Tested in scheduled AND manual mode.
+  it.each(['scheduled', 'manual'] as const)('a Proxy with a throwing getOwnPropertyDescriptor trap gives unknown daemon-events-corrupt and writes nothing (%s mode)', async (mode) => {
+    const plain = dayRead(cleanFixture(DAY).daemonEvents) as Record<string, unknown>;
+    const explosive = new Proxy(plain, {
+      getOwnPropertyDescriptor() {
+        throw new Error('descriptor trap');
+      },
+    });
+    const harness =
+      mode === 'scheduled' ? scheduledHarness(cleanFixture(DAY)) : makeHarness(cleanFixture(DAY), NOW);
+    const guarded = harnessWithRead(harness, explosive);
+    const result = await new RecordShadowDayUseCase(guarded.deps).execute(
+      mode === 'scheduled' ? makeRequest({ scheduled: true }) : makeRequest(),
+    );
+    expect(result).toEqual({ outcome: 'unknown', reason: 'daemon-events-corrupt' });
+    expect(guarded.evidence.calls.cas).toBe(0);
+    expect(guarded.evidence.stored).toBeNull();
+  });
 });

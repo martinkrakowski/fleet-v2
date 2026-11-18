@@ -19,7 +19,6 @@
 // compare.
 
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
-import { type DaemonEventRecord } from '../../domain/daemon-events.js';
 import { CUTOVER_SHADOW_CRITERIA, type CutoverShadowCriterion } from '../../domain/cutover-records.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { isMergeQueueEntryLive, type MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
@@ -83,7 +82,7 @@ import type {
   RecordShadowDayUnevaluated,
 } from '../ports/in/RecordShadowDayPort.in-port.js';
 import type { ChainListResult, ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
-import type { DaemonEventCursorRead, DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
+import type { DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type {
   LegacyTrainChainsRead,
@@ -969,6 +968,110 @@ function corruptLineBracketedInDay(read: unknown, day: string): boolean {
 }
 
 /**
+ * OD7a3 fix round: one own data property of a possibly hostile container,
+ * read through its descriptor inside a try/catch — a descriptor read that
+ * throws (a hostile Proxy trap) carries `undefined` instead of escaping.
+ * Cost is constant (one descriptor read).
+ */
+function ownElement(container: object, key: string): unknown {
+  try {
+    return Object.getOwnPropertyDescriptor(container, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * OD7a3 fix round: the ONE snapshot of an events read result. The raw read
+ * is inspected through own data descriptors ONLY — `ok`, `events`,
+ * `droppedLines` (and `eventPositions`, which the corrupt-line bracket needs
+ * whenever `droppedLines` is non-empty) are each read exactly ONCE, from
+ * their own data descriptor's `.value`, never through a getter, inside a
+ * try/catch — and every value is copied into a NEW frozen plain structure:
+ * a frozen `{ ok: true, events, droppedLines, eventPositions }` record whose
+ * `events` and `droppedLines` are frozen array copies. Every later read uses
+ * only this snapshot, so a Proxy whose descriptors and `get` trap disagree
+ * can only yield the descriptor's values (a `get` trap that lies about
+ * `events` is never consulted), and a throwing descriptor trap can never
+ * escape — it is caught and reported as `'malformed'`. The result is
+ * `'malformed'` when the raw is not a plain record object, when `events` is
+ * missing, an accessor, not a dense array within `SHADOW_MAX_HEALTH_ITEMS`,
+ * when `droppedLines`/`eventPositions` are malformed, or when anything
+ * throws; `{ ok: false }` when `ok` is missing, an accessor or not `true`.
+ * An event element (or position element) whose own descriptor read throws
+ * carries `undefined` (the per-element failure the scheduled/manual event
+ * validation later fails closed on), never an escape. Cost is linear in the
+ * capped `events` length (`SHADOW_MAX_HEALTH_ITEMS`) plus the capped
+ * `droppedLines`/`eventPositions` lengths.
+ */
+type EventsReadSnapshot =
+  | {
+      readonly ok: true;
+      readonly events: readonly unknown[];
+      readonly droppedLines: readonly number[];
+      readonly eventPositions: readonly unknown[] | null;
+    }
+  | { readonly ok: false }
+  | 'malformed';
+
+function snapshotEventsRead(raw: unknown): EventsReadSnapshot {
+  try {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      return 'malformed';
+    }
+    const okDescriptor = Object.getOwnPropertyDescriptor(raw, 'ok');
+    if (okDescriptor === undefined || okDescriptor.get !== undefined || okDescriptor.value !== true) {
+      return { ok: false };
+    }
+    const events = ownDataProperty(raw, 'events');
+    const eventsLength = ownDenseArrayLengthWithinCap(events);
+    if (eventsLength === null) {
+      return 'malformed';
+    }
+    const eventsCopy: unknown[] = [];
+    for (let index = 0; index < eventsLength; index += 1) {
+      eventsCopy.push(ownElement(events as object, String(index)));
+    }
+    const dropped = readDroppedLinesField(raw);
+    if (dropped.kind === 'malformed') {
+      return 'malformed';
+    }
+    if (dropped.kind === 'present') {
+      const validatedDropped = validateDroppedLines(dropped.droppedLines, dropped.droppedLength);
+      if (validatedDropped === 'malformed') {
+        return 'malformed';
+      }
+      // The corrupt-line bracket needs the positions of the parsed records;
+      // they are read once here, through their own descriptors, so the
+      // snapshot alone answers every later read.
+      const eventPositions = ownDataProperty(raw, 'eventPositions');
+      const positionsLength = readNonNegativeSafeIntegerOwnArray(eventPositions);
+      if (positionsLength !== eventsLength) {
+        return 'malformed';
+      }
+      const positionsCopy: unknown[] = [];
+      for (let index = 0; index < positionsLength; index += 1) {
+        positionsCopy.push(ownElement(eventPositions as object, String(index)));
+      }
+      return Object.freeze({
+        ok: true,
+        events: Object.freeze(eventsCopy),
+        droppedLines: Object.freeze([...validatedDropped]),
+        eventPositions: Object.freeze(positionsCopy),
+      });
+    }
+    return Object.freeze({
+      ok: true,
+      events: Object.freeze(eventsCopy),
+      droppedLines: Object.freeze([]),
+      eventPositions: null,
+    });
+  } catch {
+    return 'malformed';
+  }
+}
+
+/**
  * OD7a3: a manual-mode S12 guard that aborts the whole run with a typed
  * result (a refusal or an unknown), writing nothing to the ledger. Thrown
  * from `evaluateTickHealthCriterion` and caught in `run`.
@@ -1294,22 +1397,26 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // 2. Events read and first-tick `job` guard: only `job` events count, and
     // the earliest in-day one must fall within the first-tick grace window.
     const read = await this.call(context.deadlineIso, () => this.deps.daemonEvents.readAfterCursor(null));
-    // OD7a3 fix round: the `ok` flag is read through its own data descriptor,
-    // so a Proxy over the read never runs a `get` trap for it.
-    const okDescriptor =
-      read.kind === 'threw' ? undefined : Object.getOwnPropertyDescriptor(read.value, 'ok');
-    if (
-      read.kind === 'threw' ||
-      okDescriptor === undefined ||
-      okDescriptor.get !== undefined ||
-      okDescriptor.value !== true
-    ) {
+    if (read.kind === 'threw') {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
     }
-    const okRead = read.value as Extract<DaemonEventCursorRead, { ok: true }>;
+    // OD7a3 fix round: the read result is snapshotted EXACTLY ONCE by
+    // `snapshotEventsRead` — `ok`, `events`, `droppedLines` (and
+    // `eventPositions` when dropped lines are present) are each read a single
+    // time through their own data descriptors, so a Proxy can never disagree
+    // with itself and a throwing trap can never escape. Every later read in
+    // this precheck uses ONLY the snapshot.
+    const snapshot = snapshotEventsRead(read.value);
+    if (snapshot === 'malformed') {
+      return { stop: { outcome: 'unknown', reason: 'daemon-events-corrupt' } };
+    }
+    if (!snapshot.ok) {
+      return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
+    }
     // OD7a3: a dropped line bracketed inside the day's parsed records makes
-    // the day unknown before anything is evaluated or written.
-    if (corruptLineBracketedInDay(okRead, context.day)) {
+    // the day unknown before anything is evaluated or written. The bracket
+    // runs against the snapshot, never the raw read.
+    if (corruptLineBracketedInDay(snapshot, context.day)) {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-corrupt' } };
     }
     // OD7a2 fix round: the raw events are validated and snapshotted exactly
@@ -1321,7 +1428,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // could pass), so any event whose snapshot is null stops the run as
     // `s12-unknown` before anything is written.
     const validatedEvents: DaemonEventSnapshot[] = [];
-    for (const event of okRead.events) {
+    for (const event of snapshot.events) {
       const snapshot = snapshotEvent(event);
       if (snapshot === null) {
         return { stop: { outcome: 'unknown', reason: 's12-unknown' } };
@@ -1812,26 +1919,44 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
   /** S12: daemon tick health over the whole day's window of projected events. */
   private async evaluateTickHealthCriterion(context: DayContext): Promise<CriterionOutcome> {
     const read = await this.call(context.deadlineIso, () => this.deps.daemonEvents.readAfterCursor(null));
-    // OD7a3 fix round: the `ok` flag is read through its own data descriptor,
-    // so a Proxy over the read never runs a `get` trap for it.
-    const okDescriptor =
-      read.kind === 'threw' ? undefined : Object.getOwnPropertyDescriptor(read.value, 'ok');
-    if (
-      read.kind === 'threw' ||
-      okDescriptor === undefined ||
-      okDescriptor.get !== undefined ||
-      okDescriptor.value !== true
-    ) {
+    if (read.kind === 'threw') {
       return unevaluatedOutcome('S12', 'daemon-events-unavailable');
     }
-    const okRead = read.value as Extract<DaemonEventCursorRead, { ok: true }>;
-    // OD7a3: a dropped line bracketed inside the day's parsed records makes
-    // the day unknown — writing nothing. The typed result is carried out of
-    // the outcomes evaluation by the `S12GuardResult` sentinel.
-    if (corruptLineBracketedInDay(okRead, context.day)) {
+    // OD7a3 fix round: the read result is snapshotted EXACTLY ONCE by
+    // `snapshotEventsRead` — `ok`, `events`, `droppedLines` (and
+    // `eventPositions` when dropped lines are present) are each read a single
+    // time through their own data descriptors, so a Proxy can never disagree
+    // with itself and a throwing trap can never escape `execute()`. A
+    // malformed read (or anything that threw) fails closed as
+    // `daemon-events-corrupt`, writing nothing. Every later read in this
+    // criterion uses ONLY the snapshot.
+    const snapshot = snapshotEventsRead(read.value);
+    if (snapshot === 'malformed') {
       throw new S12GuardResult(unknownResult('daemon-events-corrupt'));
     }
-    const events = okRead.events.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
+    if (!snapshot.ok) {
+      return unevaluatedOutcome('S12', 'daemon-events-unavailable');
+    }
+    // OD7a3: a dropped line bracketed inside the day's parsed records makes
+    // the day unknown — writing nothing. The typed result is carried out of
+    // the outcomes evaluation by the `S12GuardResult` sentinel. The bracket
+    // runs against the snapshot, never the raw read.
+    if (corruptLineBracketedInDay(snapshot, context.day)) {
+      throw new S12GuardResult(unknownResult('daemon-events-corrupt'));
+    }
+    // OD7a3 fix round: the snapshot's events are validated and snapshotted
+    // once each by `snapshotEvent` (as in scheduled mode), so a malformed
+    // event fails closed as `s12-unknown` instead of silently shortening the
+    // list the filter would walk.
+    const validatedEvents: DaemonEventSnapshot[] = [];
+    for (const event of snapshot.events) {
+      const eventSnapshot = snapshotEvent(event);
+      if (eventSnapshot === null) {
+        throw new S12GuardResult({ outcome: 'unknown', reason: 's12-unknown' });
+      }
+      validatedEvents.push(eventSnapshot);
+    }
+    const events = validatedEvents.filter((event) => this.inTickWindow(event.recordedAtIso, context.day));
     const evaluation = evaluateShadowTickHealth({ day: context.day, events });
     // OD7a3: manual mode refuses the two S12 coverage failures instead of
     // recording a `fail` verdict — nothing is written to the ledger.

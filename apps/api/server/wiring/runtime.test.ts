@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -6,6 +6,7 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import {
   configureFleetApiRuntime,
 } from './runtime.js';
+import { bootstrapFleetApiFromEnv } from '../plugins/runtime.js';
 import { workComposition } from './work/composition.js';
 import { getOperatorComposition } from './operator/composition.js';
 import { getEvidenceUseCases } from './evidence/composition.js';
@@ -898,4 +899,77 @@ describe('KEY0b: pinned owner public key in the API composition root', () => {
     const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
     expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
   }));
+
+  // End-to-end through `bootstrapFleetApiFromEnv`: the pinned key comes from a
+  // real (trusted) installation file on disk, never from the environment. An
+  // approval signed by the ambient env key is refused as a mismatch; the same
+  // approval signed by the pinned key authorizes.
+  it('(f) bootstrapFleetApiFromEnv pins the key from the installation file: an approval signed by the env key refuses and one signed by the pinned key authorizes', async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'fleet-api-key0b-e2e-'));
+    try {
+      const stateDir = join(rootDir, 'state');
+      mkdirSync(stateDir, { recursive: true });
+      const tokenFile = join(rootDir, 'api-token');
+      writeFileSync(tokenFile, `e2etoken${'x'.repeat(40)}\n`, { mode: 0o600 });
+      const installationFile = join(rootDir, 'fleet.json');
+      writeFileSync(
+        installationFile,
+        `${JSON.stringify({ schemaVersion: 1, owner: { publicKey: pinned.publicKeyBase64 } }, null, 2)}\n`,
+        { mode: 0o600 },
+      );
+      const baseEnv = {
+        FLEET_STATE_DIR: stateDir,
+        FLEET_API_TOKEN_FILE: tokenFile,
+        FLEET_INSTALLATION_FILE: installationFile,
+      };
+      const record = seedMergeGrant('grant-api-e2e');
+      const operator = (() => {
+        const ok = bootstrapFleetApiFromEnv({ ...baseEnv, FLEET_OWNER_PUBLIC_KEY: other.publicKeyBase64 });
+        expect(ok).toBe(true);
+        return getOperatorComposition();
+      })();
+      await operator.coordinationRequestRepository.saveRequest(record);
+      await writeDecision(stateDir, {
+        requestId: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-1',
+        grantId: 'grant-api-e2e',
+        state: 'approved',
+      }, other.privateKey);
+
+      // The env key never verifies: the mismatch refusal leaves the grant
+      // exactly where it was (nothing authorized).
+      const refused = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+      expect(refused).toEqual({ outcome: 'blocked', reason: 'owner-key-env-mismatch' });
+      const untouched = await operator.coordinationRequestRepository.findRequestById(record.id);
+      expect(untouched).toMatchObject({
+        state: 'awaiting-decision',
+        decisionRevision: null,
+        grantId: null,
+      });
+
+      // Mirror: with the environment variable gone, the pinned key from the
+      // same installation file verifies the approval signed by key A.
+      configureFleetApiRuntime(null);
+      expect(bootstrapFleetApiFromEnv({ ...baseEnv })).toBe(true);
+      const pinnedOperator = getOperatorComposition();
+      await pinnedOperator.coordinationRequestRepository.saveRequest(record);
+      await writeDecision(stateDir, {
+        requestId: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-1',
+        grantId: 'grant-api-e2e',
+        state: 'approved',
+      }, pinned.privateKey);
+      const authorized = await pinnedOperator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+      expect(authorized.outcome).toBe('authorized');
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+      configureFleetApiRuntime(null);
+    }
+  });
 });

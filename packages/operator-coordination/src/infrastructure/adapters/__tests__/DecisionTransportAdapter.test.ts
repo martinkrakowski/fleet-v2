@@ -377,6 +377,9 @@ describe('DecisionTransportAdapter signature verification', () => {
       decisionRevision: null,
       grantId: null,
     });
+    // The unconfigured AWAITING shape must carry no refusalReason at all,
+    // not even an undefined one.
+    expect('refusalReason' in result).toBe(false);
   });
 
   it('ownerKeyRefusal set + approved answer with blank grantId -> refusal reason', async () => {

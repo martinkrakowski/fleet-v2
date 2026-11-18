@@ -295,13 +295,13 @@ export interface FleetCliRuntimeOptions {
    * environment carries the variables.
    */
   readonly env?: Record<string, string | undefined>;
-  /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
-  readonly ownerPublicKey?: string;
   /**
    * KEY0b: the fallback pinned owner key when `installation.owner.publicKey`
    * is absent (tests inject one here). `FLEET_OWNER_PUBLIC_KEY` is never an
    * authority; the pinned key is resolved by `resolvePinnedOwnerPublicKey`.
    */
+  readonly ownerPublicKey?: string;
+  /** The one-line deprecation warning is emitted here exactly once. */
   readonly onOwnerKeyWarning?: (message: string) => void;
   /** Deterministic subprocess execution for runner tests. */
   readonly runSubprocess?: SubprocessRunner;

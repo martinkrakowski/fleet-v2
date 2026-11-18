@@ -281,11 +281,30 @@ describe('DecisionTransportAdapter owner-key refusal', () => {
         'req-1': { state: 'approved', decisionRevision: 'rev-1', grantId: 'grant-1' },
       },
     });
-    expect(await adapter.readDecisionAnswer(query)).toEqual({
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
       state: 'awaiting-decision',
       decisionRevision: null,
       grantId: null,
     });
+    // The unconfigured AWAITING shape must carry no refusalReason at all,
+    // not even an undefined one.
+    expect('refusalReason' in result).toBe(false);
+  });
+
+  it('a grantless approved answer without an ownerKeyRefusal keeps the awaiting shape with no refusalReason', async () => {
+    const adapter = new DecisionTransportAdapter({
+      answers: {
+        'req-1': { state: 'approved', decisionRevision: 'rev-1', grantId: '   ' },
+      },
+    });
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+    });
+    expect('refusalReason' in result).toBe(false);
   });
 
   it('a declined answer is unchanged when an owner-key refusal is set', async () => {

@@ -33,7 +33,6 @@ import {
 import {
   composeDaemonRuntimeFromInstallation,
   runCli,
-  extractStateDirOption,
   type CliIo,
 } from '../index.js';
 import { loadInstallation } from '@fleet/installation';
@@ -1986,25 +1985,7 @@ describe('Fleet CLI workflow', () => {
         },
       };
       // No --state-dir token and no injected runtime: the environment decides.
-      // KEY0b: the freshly composed runtime is pinned (the ambient
-      // FLEET_OWNER_PUBLIC_KEY is never an authority), so the bare
-      // invocation composes a runtime the way runCli itself would, from the
-      // same resolved state directory, with the suite's pinned owner key. An
-      // invalid --state-dir value is left to runCli's own usage refusal.
-      let bareRuntime: FleetCliRuntime | undefined;
-      try {
-        const { stateDir: bareStateDir } = extractStateDirOption(
-          [...argv],
-          process.env.FLEET_STATE_DIR,
-        );
-        bareRuntime = createFleetCliRuntime({
-          stateDir: bareStateDir,
-          ownerPublicKey: testOwnerPublicKey,
-        });
-      } catch {
-        bareRuntime = undefined;
-      }
-      const code = await runCli([...argv], io, bareRuntime);
+      const code = await runCli([...argv], io);
       return { code, text: out.join(''), stderr: err.join('') };
     };
 

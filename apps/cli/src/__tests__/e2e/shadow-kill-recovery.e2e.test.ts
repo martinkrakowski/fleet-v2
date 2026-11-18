@@ -32,6 +32,24 @@ import type { FleetInstallation } from '@fleet/installation';
 import { createFleetCliRuntime, type FleetCliRuntime, type FleetCliRuntimeOptions } from '../../composition.js';
 import { runCli, type CliIo } from '../../index.js';
 
+/**
+ * The composed notifier fails closed (`MergeNotificationAdapter` refuses with
+ * `not-implemented`), which would leave every park transition unwritten: the
+ * pass refuses to record a transition it could not announce. The notification
+ * contract lets the pass write its transition once the answer is `notified`,
+ * so this file's fake accepts: a park is announced once and then persisted by
+ * `recordPark` (see `RunMergePassUseCase.persist`). No other export changes.
+ */
+vi.mock('@fleet/work-execution', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@fleet/work-execution')>();
+  class AcceptingMergeNotificationAdapter {
+    async notifyMergeEvent(): Promise<{ readonly outcome: 'notified' }> {
+      return { outcome: 'notified' };
+    }
+  }
+  return { ...actual, MergeNotificationAdapter: AcceptingMergeNotificationAdapter };
+});
+
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const HEAD12 = HEAD.slice(0, 12);
 const OWNER = 'fleet-org';
@@ -254,6 +272,11 @@ function journalHasKinds(stateDir: string, key: string, kinds: readonly string[]
   return observed.length === kinds.length && kinds.every((kind, index) => observed[index] === kind);
 }
 
+/** True once the merge-queue store holds an entry PARKED with the given reason. */
+function queueHasParkedEntry(stateDir: string, reason: string): boolean {
+  return recordsOf(stateDir, 'merge-queue.json').some((entry) => entry.state === 'parked' && entry.reason === reason);
+}
+
 /** A fresh composition over an existing (often copied) state directory. */
 function runtimeOver(stateDir: string, gh = ghStub()): FleetCliRuntime {
   return createFleetCliRuntime({
@@ -382,34 +405,33 @@ describe('S10: shadow kill-9 mid-pass recovery', () => {
   });
 
   it('S10 kill-9 #3: lease takeover preserves park transition without incrementing attempt or revision', async () => {
-    // A failing `gate` check decides a `checks` park; the kill lands mid-pass,
-    // after the decision and before the lease release: the copy is taken at
-    // the first clock read after the forge read, with the lease file still on
-    // disk. Today the composed notification transport refuses every park
-    // notice, so the park transition itself is not persisted by this tick;
-    // the invariant the takeover must keep is the same either way: the queue
-    // entry's attempt and revision never move (the `sameMergeEntryContent`
-    // guard of `recordPark`).
-    const gh = ghStub('FAILURE');
-    let sawGraphql = false;
-    const base = gh.run;
-    gh.run = (args, timeoutMs) => {
-      if (args[0] === 'api' && args[1] === 'graphql') {
-        sawGraphql = true;
-      }
-      return base(args, timeoutMs);
-    };
-    const h = killingHarness(() => sawGraphql, gh);
+    // A failing `gate` check decides a `checks` park; the notifier fake of
+    // this file accepts, so `recordPark` PERSISTS the parked transition. The
+    // kill lands AFTER that persistence and BEFORE the lease release: the copy
+    // is taken at the first clock read that observes the parked entry in
+    // `merge-queue.json` — the lease-release clock read of the killed tick —
+    // with the lease file still on disk and no `status.json` for that tick.
+    const h = killingHarness((stateDir) => queueHasParkedEntry(stateDir, 'checks'), ghStub('FAILURE'));
     await enqueue(h.runtime, REPO_A);
 
-    const first = await run(h.runtime, ['daemon', 'tick']);
-    expect(first.code).toBe(0);
-    expect(existsSync(h.killDir)).toBe(true);
+    // `--budget-seconds 5` keeps the killed tick's lease short (15 s), so the
+    // recovery tick can take over inside the 30 s park backoff window the
+    // killed park recorded: the takeover must then leave the entry untouched.
+    const first = await run(h.runtime, ['daemon', 'tick', '--budget-seconds', '5']);
+    expect(first.code, `${first.out}\n${first.err}`).toBe(0);
+    expect(existsSync(h.killDir), readFileSync(path.join(h.stateDir, 'merge-queue.json'), 'utf8')).toBe(true);
 
+    // The killed state really is a persisted park: if the park had not been
+    // written, no copy would exist at all, so this scenario cannot pass
+    // vacuously.
+    const killedRecords = recordsOf(h.killDir, 'merge-queue.json');
+    expect(killedRecords).toHaveLength(1);
+    expect(killedRecords[0]).toMatchObject({ state: 'parked', reason: 'checks' });
     const query = { repository: { owner: OWNER, repo: REPO_A }, deadlineIso: clockIsoPlus(60_000) };
     const beforeRecovery = await runtimeOver(h.killDir, ghStub('FAILURE')).execution.mergeQueueRepository.listMergeEntries(query);
     expect(beforeRecovery).toHaveLength(1);
     const killedEntry = beforeRecovery[0];
+    expect(killedEntry).toMatchObject({ state: 'parked', reason: 'checks' });
 
     // Before the lease expires: refused takeover.
     advance(10_000);
@@ -421,9 +443,10 @@ describe('S10: shadow kill-9 mid-pass recovery', () => {
       reasonCode: 'lease-held',
     });
 
-    // Past the expiry: lease takeover at fence 2, and the entry is preserved:
-    // same state, same attempt, same revision.
-    advance(110_000);
+    // Past the expiry but still inside the backoff: lease takeover at fence 2,
+    // and the persisted park is preserved untouched: still parked with the
+    // same reason, same attempt, same revision.
+    advance(10_000); // clock now T0 + 20_000 ms: past the 15 s lease, before the 30 s backoff
     const recovery = runtimeOver(h.killDir, ghStub('FAILURE'));
     const result = await run(recovery, ['daemon', 'tick']);
     expect(result.code).toBe(0);
@@ -435,7 +458,8 @@ describe('S10: shadow kill-9 mid-pass recovery', () => {
     const after = await recovery.execution.mergeQueueRepository.listMergeEntries(query);
     expect(after).toHaveLength(1);
     expect(after[0]).toMatchObject({
-      state: killedEntry.state,
+      state: 'parked',
+      reason: 'checks',
       attempt: killedEntry.attempt,
       revision: killedEntry.revision,
     });

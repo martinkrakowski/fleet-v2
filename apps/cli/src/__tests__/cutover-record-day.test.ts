@@ -14,6 +14,7 @@ import { runCli, type CliIo } from '../index.js';
 import type { FleetInstallation } from '@fleet/installation';
 import {
   AttemptRepositoryAdapter,
+  ChainRepositoryAdapter,
   ForgeReadAdapter,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
@@ -251,6 +252,23 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     return Object.fromEntries(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
   }
 
+  /** Every regular file under a directory, recursively, mapped to its bytes as text. */
+  async function listFileBytes(root: string): Promise<Map<string, string>> {
+    const files = new Map<string, string>();
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(full);
+        } else if (entry.isFile()) {
+          files.set(full, await fs.readFile(full, 'utf8'));
+        }
+      }
+    };
+    await walk(root);
+    return files;
+  }
+
   it('wires every reader and records the day: every wired criterion moves off not-wired, S13 stays not-implemented, S3 not-yet-observed and S2/S10/S11 release-unpinned while cutover-shadow-attestations.json is missing', async () => {
     const { stateDir, fixtureDir } = newDirs();
     await shellFixture(fixtureDir);
@@ -388,6 +406,94 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     return (useCase as unknown as { deps: RecordShadowDayDependencies }).deps;
   }
 
+  // Luna's fix round 2: the adapters hold their read-only mode in a private
+  // field or constructor-options bag and expose no public getter, so the flag
+  // is read safely through a structural cast — never by mutating or writing
+  // anything. A reader with no flag anywhere fails the assertion loudly.
+  function readOnlyOf(adapter: unknown): boolean {
+    const candidate = adapter as {
+      readonly options?: { readonly readOnly?: unknown };
+      readonly readOnly?: unknown;
+      readonly store?: { readonly options?: { readonly readOnly?: unknown } };
+    };
+    if (candidate.options?.readOnly !== undefined) return candidate.options.readOnly === true;
+    if (candidate.store?.options?.readOnly !== undefined) return candidate.store.options.readOnly === true;
+    if (candidate.readOnly !== undefined) return candidate.readOnly === true;
+    throw new Error('adapter exposes no readable read-only flag');
+  }
+
+  // Luna's fix round 2: every reader the record-day composition builds is
+  // asserted read-only AND a fresh instance, not the daemon/conductor's
+  // writable one. Readers the composition reuses rather than builds (receipts,
+  // forge, the shell-train reader) have no read-only mode at all — each says
+  // so in a comment and relies on the corrupt-file backstop below.
+  it('wires conducted.facts.runs as a fresh read-only LaneRunRepositoryAdapter, not the conductor\'s writable instance', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const facts = recordDayDeps(runtime).conducted?.facts;
+    expect(facts?.runs).toBeInstanceOf(LaneRunRepositoryAdapter);
+    expect(readOnlyOf(facts?.runs)).toBe(true);
+    expect(facts?.runs).not.toBe(runtime.conductor.laneRunRepository);
+  });
+
+  it('wires conducted.facts.journal as a fresh read-only LaneRunJournalAdapter, not the conductor\'s writable instance', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    const facts = deps.conducted?.facts;
+    expect(facts?.journal).toBeInstanceOf(LaneRunJournalAdapter);
+    expect(readOnlyOf(facts?.journal)).toBe(true);
+    expect(facts?.journal).not.toBe(runtime.conductor.laneRunJournal);
+  });
+
+  it('wires the top-level journal reader as a fresh read-only LaneRunJournalAdapter, not the conductor\'s writable instance', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    expect(deps.journal).toBeInstanceOf(LaneRunJournalAdapter);
+    expect(readOnlyOf(deps.journal)).toBe(true);
+    expect(deps.journal).not.toBe(runtime.conductor.laneRunJournal);
+  });
+
+  it('wires conducted.facts.attempts as a fresh read-only AttemptRepositoryAdapter, not the conductor\'s writable instance', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const facts = recordDayDeps(runtime).conducted?.facts;
+    expect(facts?.attempts).toBeInstanceOf(AttemptRepositoryAdapter);
+    expect(readOnlyOf(facts?.attempts)).toBe(true);
+    expect(facts?.attempts).not.toBe(runtime.execution.attemptRepository);
+  });
+
+  it('wires conducted.facts.chains as a fresh read-only ChainRepositoryAdapter', () => {
+    const deps = recordDayDeps(wiredRuntime(newDirs().stateDir));
+    expect(deps.chains).toBeInstanceOf(ChainRepositoryAdapter);
+    expect(readOnlyOf(deps.chains)).toBe(true);
+    // The daemon's own chain store is not exposed on the runtime, so no
+    // identity comparison is possible; the read-only flag is the guarantee.
+  });
+
+  it('wires conducted.facts.receipts to the same acceptance-receipt reader the telemetry seat exposes', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const facts = recordDayDeps(runtime).conducted?.facts;
+    expect(facts?.receipts).toBe(runtime.telemetry.acceptanceReceiptRead);
+    // AcceptanceReceiptReadAdapter has no read-only mode at all: it is a pure
+    // projection over the evidence context's own inspection seat and holds no
+    // flag. The corrupt-file backstop below covers it.
+  });
+
+  it('wires conducted.facts.forge as the ForgeReadAdapter', () => {
+    const facts = recordDayDeps(wiredRuntime(newDirs().stateDir)).conducted?.facts;
+    expect(facts?.forge).toBeInstanceOf(ForgeReadAdapter);
+    // ForgeReadAdapter has no read-only mode at all: it is a `gh` read
+    // projection with no write path and holds no flag. The corrupt-file
+    // backstop below covers it.
+  });
+
+  it('wires the legacy shell-train reader the composition reuses, which is read-only by construction', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    // LegacyTrainStateReadAdapter has no read-only mode at all: it only ever
+    // reads the shell fixture files and never writes or quarantines, so it
+    // holds no flag. The corrupt-file backstop below covers it.
+    expect(deps.legacy).toBe(runtime.execution.legacyTrainState);
+  });
+
   // Luna's pre-merge fix 1: the composition's `premergeCarry` must give the
   // resolver `unknown` (owner decision), so S5' records `unknown` and never
   // `pass` when there are carry decisions. If the composition were mutated to
@@ -428,36 +534,6 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     }
   });
 
-  // Luna's pre-merge fix 2: each conducted-facts reader is pinned
-  // individually, so unwiring any ONE of them alone fails its own titled test
-  // — the composed dependency graph must carry the expected adapter instance
-  // (or the exact wired reference) for each of the five readers.
-  it('wires conducted.facts.runs as the read-only LaneRunRepositoryAdapter', () => {
-    const facts = recordDayDeps(wiredRuntime(newDirs().stateDir)).conducted?.facts;
-    expect(facts?.runs).toBeInstanceOf(LaneRunRepositoryAdapter);
-  });
-
-  it('wires conducted.facts.journal as the LaneRunJournalAdapter', () => {
-    const facts = recordDayDeps(wiredRuntime(newDirs().stateDir)).conducted?.facts;
-    expect(facts?.journal).toBeInstanceOf(LaneRunJournalAdapter);
-  });
-
-  it('wires conducted.facts.attempts as the AttemptRepositoryAdapter', () => {
-    const facts = recordDayDeps(wiredRuntime(newDirs().stateDir)).conducted?.facts;
-    expect(facts?.attempts).toBeInstanceOf(AttemptRepositoryAdapter);
-  });
-
-  it('wires conducted.facts.receipts to the same acceptance-receipt reader the telemetry seat exposes', () => {
-    const runtime = wiredRuntime(newDirs().stateDir);
-    const facts = recordDayDeps(runtime).conducted?.facts;
-    expect(facts?.receipts).toBe(runtime.telemetry.acceptanceReceiptRead);
-  });
-
-  it('wires conducted.facts.forge as the ForgeReadAdapter', () => {
-    const facts = recordDayDeps(wiredRuntime(newDirs().stateDir)).conducted?.facts;
-    expect(facts?.forge).toBeInstanceOf(ForgeReadAdapter);
-  });
-
   // Luna's pre-merge fix 4: the composed attestation reader must be
   // read-only. A writable `ShadowAttestationAdapter` in the composition would
   // answer a write request with anything but the `read-only` refusal (an
@@ -467,9 +543,75 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
   it('wires the one-time attestation reader read-only: the composed ShadowAttestationAdapter refuses a write with read-only', async () => {
     const deps = recordDayDeps(wiredRuntime(newDirs().stateDir));
     expect(deps.oneTime?.attestations).toBeInstanceOf(ShadowAttestationAdapter);
+    // Fix round 2: the flag itself is read-only, and the composed reader is a
+    // fresh instance (the composition builds exactly one adapter here, so the
+    // flag plus the behavioural refusal below is the guarantee).
+    expect(readOnlyOf(deps.oneTime?.attestations)).toBe(true);
     const attestations = deps.oneTime!.attestations as unknown as {
       compareAndSet(request: unknown): Promise<{ outcome: string; reason: string }>;
     };
     expect(await attestations.compareAndSet({})).toEqual({ outcome: 'refused', reason: 'read-only' });
+  });
+
+  // Luna's fix round 2, behaviour backstop: one corrupt state file per
+  // readable store the record-day readers touch. After `record-day` every
+  // seeded file must be byte-identical and no quarantine sibling may exist —
+  // the composition's read-only wiring is what makes this hold, so reverting
+  // any reader to a writable instance that quarantines fails here.
+  it('never quarantines: every corrupt readable store is byte-identical after record-day, with no quarantine sibling', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    // One corrupt file per reader store the record-day readers read:
+    // runs -> lane-runs.json, journal -> run-journal.json, attempts ->
+    // attempts.json, receipts -> evidence-assessments.json, chains ->
+    // chains/<sha>.json, attestations -> cutover-shadow-attestations.json;
+    // shell events -> the fixture's events.jsonl. The forge reader has no
+    // state file. cutover-shadow.json is deliberately NOT seeded: the ledger
+    // is the one store the use case owns and writes, not a reader.
+    const corruptFiles: ReadonlyArray<readonly [string, string]> = [
+      ['lane-runs.json', '{ not json'],
+      ['run-journal.json', '{ not json'],
+      ['attempts.json', '{ not json'],
+      ['evidence-assessments.json', '{ not json'],
+      ['cutover-shadow-attestations.json', '{ not json'],
+      [path.join('chains', 'c'.repeat(64) + '.json'), '{ not json'],
+    ];
+    for (const [name, bytes] of corruptFiles) {
+      await fs.mkdir(path.join(stateDir, path.dirname(name)), { recursive: true });
+      await fs.writeFile(path.join(stateDir, name), bytes);
+    }
+    // One corrupt shell-events line in the legacy fixture.
+    await fs.writeFile(path.join(fixtureDir, 'events.jsonl'), '{ not json\n');
+    const seededStateFiles = await listFileBytes(stateDir);
+    const seededFixtureBytes = await fs.readFile(path.join(fixtureDir, 'events.jsonl'), 'utf8');
+    const runtime = wiredRuntime(stateDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      if (result.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      }
+      // Every seeded file is byte-identical; the only new entry in the state
+      // dir is the shadow ledger the use case itself compares-and-sets.
+      const afterStateFiles = await listFileBytes(stateDir);
+      for (const [name, bytes] of corruptFiles) {
+        expect(afterStateFiles.get(path.join(stateDir, name))).toBe(bytes);
+      }
+      await expect(fs.readFile(path.join(fixtureDir, 'events.jsonl'), 'utf8')).resolves.toBe(seededFixtureBytes);
+      for (const [name] of corruptFiles) {
+        expect(seededStateFiles.has(path.join(stateDir, `${name}.quarantined`))).toBe(false);
+        expect(afterStateFiles.has(path.join(stateDir, `${name}.quarantined`))).toBe(false);
+      }
+      // And no quarantine-shaped sibling anywhere under either directory.
+      expect([...afterStateFiles.keys()].filter((file) => file.includes('quarantine'))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1491,7 +1491,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         sleep:
           options?.daemonSleep ??
           ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
-        journal: conductor.laneRunJournal,
+        // SH19c fix round: a fresh read-only journal reader, never the
+        // conductor's writable instance — a corrupt run-journal.json is a
+        // read error here, never a quarantine.
+        journal: new LaneRunJournalAdapter({ stateDir, readOnly: true }),
         daemonEvents: daemon.events,
         // S9's state integrity sample: the same four-context check the
         // `state check` logic in state.ts runs, over each package's own

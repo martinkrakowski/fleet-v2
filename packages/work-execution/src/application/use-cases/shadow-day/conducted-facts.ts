@@ -215,7 +215,7 @@ function ownKeysAreIndices(value: readonly unknown[], length: number): boolean {
       continue;
     }
     const asNumber = Number(key);
-    if (!Number.isSafeInteger(asNumber) || String(asNumber) !== key || asNumber >= length) {
+    if (!Number.isSafeInteger(asNumber) || String(asNumber) !== key || asNumber < 0 || asNumber >= length) {
       return false;
     }
   }

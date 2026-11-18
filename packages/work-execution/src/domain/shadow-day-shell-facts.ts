@@ -360,7 +360,7 @@ function evaluateCarry(input: unknown): ShadowPremergeCarryEvaluation {
   const unresolved = deduped.filter((decision) => decision.fleetCarry === 'unknown');
   const unresolvedIds = unresolved
     .map((decision) => `${decision.pullRequest}@${decision.newHeadOid.slice(0, 12)}`)
-    .sort()
+    .sort(compareCodeUnitOrder)
     .slice(0, SHADOW_CARRY_MAX_UNRESOLVED_IDS);
   return compareCarries(resolved, unresolved.length, unresolvedIds);
 }
@@ -512,6 +512,21 @@ function readCarryAnomaly(raw: unknown): ShadowShellAnomaly | null {
 function inDayWindow(atIso: string, start: number, end: number): boolean {
   const instant = new Date(atIso).getTime();
   return instant >= start && instant < end;
+}
+
+/**
+ * Locale-independent, deterministic code-unit order. `String.localeCompare`
+ * depends on the host locale and would make `unresolvedIds` (pinned by the CLI
+ * output and the tests) vary by host, so the comparison uses raw code units.
+ */
+function compareCodeUnitOrder(a: string, b: string): -1 | 0 | 1 {
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
 }
 
 /**

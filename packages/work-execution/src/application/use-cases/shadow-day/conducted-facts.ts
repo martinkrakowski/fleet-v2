@@ -200,8 +200,10 @@ function readPullRequestId(items: readonly unknown[], index: number): number | n
 }
 
 /**
- * Every own key is `length` or a canonical index inside `length`; anything
- * else — a symbol, a named key, an index beyond `length` — is refused.
+ * Every own key is `length` or a canonical array index inside `length`: the
+ * key's `String(Number(k))` form, a safe integer, below `length`. Anything
+ * else — a symbol, a named key, a non-canonical digit string such as `"01"`,
+ * an index beyond `length` — is refused.
  * Cost: linear in the array's own-key count (capped by the caller).
  */
 function ownKeysAreIndices(value: readonly unknown[], length: number): boolean {
@@ -212,7 +214,8 @@ function ownKeysAreIndices(value: readonly unknown[], length: number): boolean {
     if (key === 'length') {
       continue;
     }
-    if (!/^\d+$/.test(key) || Number(key) >= length) {
+    const asNumber = Number(key);
+    if (!Number.isSafeInteger(asNumber) || String(asNumber) !== key || asNumber >= length) {
       return false;
     }
   }
@@ -321,10 +324,17 @@ function checkLaneRunWarnCountOrThrow(value: unknown): LaneRunWarnCountRead {
     return { status: 'unknown', reason: 'runs-unreadable' };
   }
   // Descriptors are read, never invoked: a hole (no descriptor) or an
-  // accessor (a getter) is refused without evaluating any element.
+  // accessor — a getter or a setter-only slot, which has no `get` — is
+  // refused without evaluating any element. A data descriptor (`value`, no
+  // accessor pair) is required.
   for (let index = 0; index < length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
-    if (descriptor === undefined || descriptor.get !== undefined) {
+    if (
+      descriptor === undefined ||
+      !('value' in descriptor) ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
       return { status: 'unknown', reason: 'runs-unreadable' };
     }
   }

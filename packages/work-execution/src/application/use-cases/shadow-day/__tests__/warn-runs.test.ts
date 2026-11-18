@@ -120,6 +120,34 @@ describe('checkLaneRunWarnCount (RC1)', () => {
     expect(getterCalls).toBe(0);
   });
 
+  it('refuses a setter-only accessor at an item index (no data descriptor)', () => {
+    let setterCalls = 0;
+    const items: unknown[] = denseArray(2);
+    Object.defineProperty(items, 1, {
+      set() {
+        setterCalls += 1;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    // A setter-only slot has no `get`, so a getter-only check would accept it
+    // as a valid run slot; the read requires a data descriptor.
+    expect(checkLaneRunWarnCount(items)).toEqual(UNKNOWN);
+    expect(setterCalls).toBe(0);
+  });
+
+  it('refuses a non-canonical digit own key ("01") on a real array', () => {
+    const items: unknown[] = denseArray(2);
+    Object.defineProperty(items, '01', {
+      value: { runId: 'sneaky' },
+      enumerable: true,
+      configurable: true,
+    });
+    // "01" is not a canonical array index (`String(Number("01"))` is "1"), so
+    // the own-key scan refuses it instead of reading past the real elements.
+    expect(checkLaneRunWarnCount(items)).toEqual(UNKNOWN);
+  });
+
   it('yields exactly the plain-data verdict for a Proxy over a valid input, with no get trap run', () => {
     let getTraps = 0;
     const valid = denseArray(1501);

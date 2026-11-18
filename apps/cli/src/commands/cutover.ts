@@ -18,8 +18,7 @@
  */
 
 import { firstPositional, str, CliUsageError, type Payload } from './payload.js';
-import type { CommandHandler } from './payload.js';
-import type { CliIo } from '../index.js';
+import type { CommandHandler, CommandSideChannel } from './payload.js';
 import {
   checkLaneRunWarnCount,
   compareShadowEnqueueSets,
@@ -141,7 +140,11 @@ function optionalDayFlag(p: Payload): string | undefined {
  * `state-dir-required`; otherwise the use case's result is returned UNCHANGED
  * — `recorded` and `unchanged` complete (0), every other outcome exits 1.
  */
-async function recordShadowDayHandler(payload: Payload, runtime: CutoverRuntime, io?: CliIo): Promise<unknown> {
+async function recordShadowDayHandler(
+  payload: Payload,
+  runtime: CutoverRuntime,
+  io?: CommandSideChannel,
+): Promise<unknown> {
   rejectUnexpectedInput(payload, 'shadow record-day', ['repository', 'legacyStateDir', 'day'], 1);
   const repository = repositoryFromPayload(payload, 'record-day');
   const stateDir = str(payload, 'legacyStateDir').trim();

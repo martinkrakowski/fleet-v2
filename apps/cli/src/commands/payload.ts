@@ -18,21 +18,27 @@ import {
 } from '@fleet/installation';
 
 import type { FleetCliRuntime } from '../composition.js';
-// Type-only: erased at runtime, so no cycle is created between the CLI root
-// and the command-table modules.
-import type { CliIo } from '../index.js';
 
 /** Signalled for argument-shape problems; reported as exit code 2. */
 export class CliUsageError extends Error {}
 
 export type Payload = Record<string, unknown>;
 
+/**
+ * RC1: the optional line-oriented side channel a command handler may receive
+ * (e.g. record-day's stderr early warning); the JSON result on stdout is the
+ * contract. Defined locally — never imported from the CLI root, even as a
+ * type — so a typecheck program that reaches this module (such as
+ * `@fleet/api`'s) is not pulled into the CLI root and its TUI.
+ */
+export interface CommandSideChannel {
+  stderr(text: string): void;
+}
+
 export type CommandHandler = (
   payload: Payload,
   runtime: FleetCliRuntime,
-  // RC1: optional line-oriented side channel (e.g. record-day's stderr
-  // early warning); the JSON result on stdout is the contract.
-  io?: CliIo,
+  io?: CommandSideChannel,
 ) => Promise<unknown>;
 
 // ---------------------------------------------------------------------------

@@ -30,7 +30,12 @@ import {
   createFleetCliRuntime,
   type FleetCliRuntime,
 } from '../composition.js';
-import { runCli, extractStateDirOption, type CliIo } from '../index.js';
+import {
+  composeDaemonRuntimeFromInstallation,
+  runCli,
+  extractStateDirOption,
+  type CliIo,
+} from '../index.js';
 import { loadInstallation } from '@fleet/installation';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 
@@ -2508,13 +2513,11 @@ describe('the daemon composition reads the pinned key only from the installation
       process.env.FLEET_INSTALLATION_FILE = installationFile;
       const loadResult = loadInstallation();
       expect(loadResult.status).toBe('invalid');
-      // index.ts ~880: for an invalid load result the daemon branch composes
-      // WITHOUT an installation, so no pinned key exists at all.
-      return createFleetCliRuntime({
-        stateDir,
-        loadInstallationForMergePolicy: () => loadResult,
-        onOwnerKeyWarning: () => {},
-      });
+      // The daemon branch's own load-and-compose step performs the load
+      // itself: `composeDaemonRuntimeFromInstallation` (called by index.ts
+      // ~880) reads the real installation file, sees the invalid load result,
+      // and composes WITHOUT an installation, so no pinned key exists at all.
+      return composeDaemonRuntimeFromInstallation(stateDir, () => {});
     });
   });
 
@@ -2532,15 +2535,14 @@ describe('the daemon composition reads the pinned key only from the installation
       process.env.FLEET_INSTALLATION_FILE = installationFile;
       const loadResult = loadInstallation();
       expect(loadResult.status).toBe('invalid');
-      expect(loadResult.errors.join(' ')).toContain('owner-key-installation-untrusted');
+      expect(
+        loadResult.status === 'invalid' ? loadResult.errors.join(' ') : '',
+      ).toContain('owner-key-installation-untrusted');
       // index.ts ~880: an untrusted load result is still `invalid`, so the
-      // daemon branch composes WITHOUT an installation and the untrusted
-      // file's owner key is never parsed as the pinned key.
-      return createFleetCliRuntime({
-        stateDir,
-        loadInstallationForMergePolicy: () => loadResult,
-        onOwnerKeyWarning: () => {},
-      });
+      // daemon branch's own load-and-compose step composes WITHOUT an
+      // installation and the untrusted file's owner key is never parsed as
+      // the pinned key.
+      return composeDaemonRuntimeFromInstallation(stateDir, () => {});
     });
   });
 
@@ -2557,13 +2559,9 @@ describe('the daemon composition reads the pinned key only from the installation
         throw new Error('the no-owner installation file must load');
       }
       // index.ts ~887: a valid load result composes WITH the installation,
-      // whose owner section (and therefore pinned key) is absent.
-      return createFleetCliRuntime({
-        stateDir,
-        installation: loadResult.installation,
-        loadInstallationForMergePolicy: () => loadInstallation(),
-        onOwnerKeyWarning: () => {},
-      });
+      // whose owner section (and therefore pinned key) is absent; the daemon
+      // branch's own load-and-compose step performs that load itself.
+      return composeDaemonRuntimeFromInstallation(stateDir, () => {});
     });
   });
 });

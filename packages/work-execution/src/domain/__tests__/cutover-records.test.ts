@@ -212,7 +212,7 @@ describe('readCutoverShadowEvidence', () => {
   function evidence(nowIso: string, mutate?: (root: Record<string, unknown>) => void, merges: number = CUTOVER_SHADOW_MIN_MERGES): unknown {
     const base = Date.parse(nowIso);
     const root: Record<string, unknown> = {
-      days: [2, 1, 0].map((back) => ({
+      days: [0].map((back) => ({
         day: new Date(base - back * DAY_MS).toISOString().slice(0, 10),
         verdicts: passVerdicts(),
       })),
@@ -235,9 +235,9 @@ describe('readCutoverShadowEvidence', () => {
     });
   }
 
-  it('accepts three consecutive pass days', () => {
+  it('accepts a single all-pass day', () => {
     expect(readCutoverShadowEvidence(evidence(NOW), NOW)).toEqual({ ok: true });
-    // The last day may equal the UTC date of nowIso but not follow it.
+    // The day may equal the UTC date of nowIso but not follow it.
     expect(readCutoverShadowEvidence(evidence('2026-11-05T00:00:00.000Z'), NOW)).toEqual({ ok: true });
     expect(readCutoverShadowEvidence(evidence(NOW, undefined, CUTOVER_SHADOW_MIN_MERGES + 1), NOW)).toEqual({ ok: true });
   });
@@ -286,27 +286,26 @@ describe('readCutoverShadowEvidence', () => {
   });
 
   it('names only S4 when that verdict is unknown', () => {
-    expect(readCutoverShadowEvidence(withVerdict(2, 'S4', { value: 'unknown' }), NOW)).toEqual(onlyFailed('S4'));
+    expect(readCutoverShadowEvidence(withVerdict(0, 'S4', { value: 'unknown' }), NOW)).toEqual(onlyFailed('S4'));
   });
 
-  it('refuses a future, gapped, duplicate or non-calendar day with every criterion named', () => {
+  it('refuses a future, wrong-length or non-calendar day with every criterion named', () => {
     const base = Date.parse(NOW);
     type DayRecord = { day: string; verdicts: Record<string, unknown> };
     const future = evidence(NOW, (root) => {
       const days = root.days as DayRecord[];
-      days[2] = { day: new Date(base + DAY_MS).toISOString().slice(0, 10), verdicts: passVerdicts() };
+      days[0] = { day: new Date(base + DAY_MS).toISOString().slice(0, 10), verdicts: passVerdicts() };
     });
     expect(readCutoverShadowEvidence(future, NOW)).toEqual(ALL_FAILED);
-    const gapped = evidence(NOW, (root) => {
-      const days = root.days as DayRecord[];
-      days[1] = { day: new Date(base - 5 * DAY_MS).toISOString().slice(0, 10), verdicts: passVerdicts() };
+    const empty = evidence(NOW, (root) => {
+      root.days = [];
     });
-    expect(readCutoverShadowEvidence(gapped, NOW)).toEqual(ALL_FAILED);
-    const duplicate = evidence(NOW, (root) => {
+    expect(readCutoverShadowEvidence(empty, NOW)).toEqual(ALL_FAILED);
+    const twoDays = evidence(NOW, (root) => {
       const days = root.days as DayRecord[];
-      days[1] = { ...days[2] };
+      root.days = [days[0], days[0]];
     });
-    expect(readCutoverShadowEvidence(duplicate, NOW)).toEqual(ALL_FAILED);
+    expect(readCutoverShadowEvidence(twoDays, NOW)).toEqual(ALL_FAILED);
     const nonCalendar = evidence(NOW, (root) => {
       const days = root.days as DayRecord[];
       days[0] = { day: '2026-02-31', verdicts: passVerdicts() };
@@ -329,7 +328,7 @@ describe('readCutoverShadowEvidence', () => {
     holed.length = 3; // holes at indices 1 and 2
     expect(readCutoverShadowEvidence(docWith(holed), NOW)).toEqual(ALL_FAILED);
 
-    expect(readCutoverShadowEvidence(withVerdict(1, 'S7', { value: 7 }), NOW)).toEqual(onlyFailed('S7'));
+    expect(readCutoverShadowEvidence(withVerdict(0, 'S7', { value: 7 }), NOW)).toEqual(onlyFailed('S7'));
     expect(readCutoverShadowEvidence(withVerdict(0, 'S2', { value: true }), NOW)).toEqual(onlyFailed('S2'));
 
     const throwingRoot: Record<string, unknown> = {};
@@ -369,7 +368,7 @@ describe('readCutoverShadowEvidence', () => {
     ).toEqual(onlyFailed('S5'));
     expect(
       readCutoverShadowEvidence(
-        withVerdict(2, 'S6', {
+        withVerdict(0, 'S6', {
           get() {
             throw new DOMException('unread', 'DataCloneError');
           },
@@ -415,7 +414,7 @@ describe('readCutoverShadowEvidence', () => {
 
     const dayRecord = validDays[0];
     expect(
-      readCutoverShadowEvidence(docWith([new Proxy(dayRecord, {}), validDays[1], validDays[2]]), NOW),
+      readCutoverShadowEvidence(docWith([new Proxy(dayRecord, {})]), NOW),
     ).toEqual(ALL_FAILED);
 
     expect(readCutoverShadowEvidence(new Proxy(evidence(NOW) as object, {}), NOW)).toEqual(ALL_FAILED);
@@ -470,12 +469,12 @@ describe('readCutoverShadowEvidence', () => {
     return root;
   }
 
-  it('refuses a recording Proxy for days after at most 6 trap calls and for verdicts after at most 15, and never fires a get trap', () => {
+  it('refuses a recording Proxy for days after at most 4 trap calls and for verdicts after at most 15, and never fires a get trap', () => {
     // The Proxy forwards every operation to valid data, so only the final serializer probe can
     // refuse it. Before that the walk may look at it through a constant number of traps fixed by
     // the permitted key lists: one prototype read, one key list and one descriptor read per
-    // permitted key (`length`, `0`, `1`, `2` for days; the thirteen criteria for verdicts).
-    const limits = { days: 6, verdicts: 15 } as const;
+    // permitted key (`length`, `0` for days; the thirteen criteria for verdicts).
+    const limits = { days: 4, verdicts: 15 } as const;
     for (const position of ['days', 'verdicts'] as const) {
       const calls: string[] = [];
       const result = readCutoverShadowEvidence(standIn(position, (target) => recordingProxy(target, calls)), NOW);
@@ -530,7 +529,7 @@ describe('readCutoverShadowEvidence', () => {
     expect(readCutoverShadowEvidence(indexGetter, NOW)).toEqual(ALL_FAILED);
 
     const dayGetter = evidence(NOW, (root) => {
-      const record = (root.days as DayRecord[])[1];
+      const record = (root.days as DayRecord[])[0];
       const value = record.day;
       Object.defineProperty(record, 'day', {
         enumerable: true,
@@ -543,7 +542,7 @@ describe('readCutoverShadowEvidence', () => {
     });
     expect(readCutoverShadowEvidence(dayGetter, NOW)).toEqual(ALL_FAILED);
 
-    const verdictGetter = withVerdict(2, 'S3', {
+    const verdictGetter = withVerdict(0, 'S3', {
       configurable: true,
       get() {
         calls.verdict += 1;
@@ -555,8 +554,8 @@ describe('readCutoverShadowEvidence', () => {
     expect(calls).toEqual({ index: 0, day: 0, verdict: 0 });
     // The fixtures are live: read directly, each getter does answer.
     void (indexGetter as { days: unknown[] }).days[0];
-    void (dayGetter as { days: DayRecord[] }).days[1].day;
-    void (verdictGetter as { days: DayRecord[] }).days[2].verdicts.S3;
+    void (dayGetter as { days: DayRecord[] }).days[0].day;
+    void (verdictGetter as { days: DayRecord[] }).days[0].verdicts.S3;
     expect(calls).toEqual({ index: 1, day: 1, verdict: 1 });
   });
 

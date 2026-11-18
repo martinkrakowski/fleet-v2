@@ -25,7 +25,7 @@ export const CUTOVER_SHADOW_CRITERIA = [
 ] as const;
 export type CutoverShadowCriterion = (typeof CUTOVER_SHADOW_CRITERIA)[number];
 
-export const CUTOVER_SHADOW_CONSECUTIVE_DAYS = 3;
+export const CUTOVER_SHADOW_CONSECUTIVE_DAYS = 1;
 export const CUTOVER_SHADOW_MIN_MERGES = 20;
 export const CUTOVER_ROLLBACK_WINDOW_DAYS = 14;
 export const CUTOVER_ROLLBACK_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
@@ -307,9 +307,9 @@ function utcDayNumber(day: string): number | null {
 /**
  * Read one shadow-evidence document without running a single getter. The root is a plain data
  * record whose only own keys are `merges` (a safe integer of at least
- * `CUTOVER_SHADOW_MIN_MERGES`) and `days`: exactly three consecutive ascending UTC calendar dates,
- * none after the UTC date of `nowIso`, each carrying the thirteen criteria, every verdict the
- * string `pass`. Key counts are checked before any descriptor walk, so a document padded with
+ * `CUTOVER_SHADOW_MIN_MERGES`) and `days`: a 1-element array carrying one UTC calendar date not
+ * after the UTC date of `nowIso`, carrying the thirteen criteria, every verdict the string
+ * `pass`. Key counts are checked before any descriptor walk, so a document padded with
  * extra keys costs a constant number of descriptor reads. The `days` array-length and key-count
  * bounds are settled before any serializer probe, so an oversized array is refused without a
  * traversal, and no probe ever meets a getter: the only serializer probe is the final one on
@@ -339,7 +339,7 @@ export function readCutoverShadowEvidence(raw: unknown, nowIso: string): Cutover
       return allCriteriaFailed();
     }
     const walk = walkEvidenceDays(days);
-    if (walk === null || !isAscendingConsecutive(walk.dayNumbers) || walk.dayNumbers[2] > Math.floor(nowMs / DAY_MS)) {
+    if (walk === null || walk.dayNumbers[0] > Math.floor(nowMs / DAY_MS)) {
       return allCriteriaFailed();
     }
     if (walk.failed.size > 0) {
@@ -360,7 +360,7 @@ function isSufficientMergeCount(merges: unknown): boolean {
   );
 }
 
-const ALLOWED_DAY_KEYS: ReadonlySet<string> = new Set(['0', '1', '2', 'length']);
+const ALLOWED_DAY_KEYS: ReadonlySet<string> = new Set(['0', 'length']);
 
 /** The `days` array when it is a real, bounded array of exactly the permitted shape, else null. */
 function readBoundedDaysArray(days: unknown): readonly unknown[] | null {
@@ -398,7 +398,7 @@ function readBoundedDaysArray(days: unknown): readonly unknown[] | null {
   return days;
 }
 
-/** The UTC day serials and failed criteria of the three day records, or null when any shape is unusable. */
+/** The UTC day serial and failed criteria of the single day record, or null when any shape is unusable. */
 function walkEvidenceDays(
   days: readonly unknown[],
 ): { readonly dayNumbers: readonly number[]; readonly failed: ReadonlySet<string> } | null {
@@ -438,10 +438,6 @@ function readEvidenceDay(element: unknown, failed: Set<string>): number | null {
     }
   }
   return dayNumber;
-}
-
-function isAscendingConsecutive(dayNumbers: readonly number[]): boolean {
-  return dayNumbers[0] < dayNumbers[1] && dayNumbers[1] < dayNumbers[2] && dayNumbers[2] - dayNumbers[0] === 2;
 }
 
 /**

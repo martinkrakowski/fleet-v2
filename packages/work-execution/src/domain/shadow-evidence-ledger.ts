@@ -1,15 +1,15 @@
 // Lane SH1: the pure shadow-evidence ledger and the evidence composer. The
 // day-writer use case (SH7) keeps a `ShadowLedger` per cutover, appends
 // per-day, per-criterion verdicts with `recordShadowVerdicts`, and composes
-// the document `readCutoverShadowEvidence` (cutover-records.ts, untouched)
-// checks with `composeCutoverShadowEvidence`. Pure: no filesystem, no
+// the document `readCutoverShadowEvidence` checks with
+// `composeCutoverShadowEvidence`. Pure: no filesystem, no
 // subprocess, no clock. Never throws, never echoes an input value; every
 // exported function takes `unknown` at its boundary and returns a typed
 // refusal with a named code.
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from './conductor-halt.js';
-import { CUTOVER_SHADOW_CRITERIA, type CutoverShadowCriterion } from './cutover-records.js';
+import { CUTOVER_SHADOW_CONSECUTIVE_DAYS, CUTOVER_SHADOW_CRITERIA, type CutoverShadowCriterion } from './cutover-records.js';
 import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
@@ -64,7 +64,7 @@ export const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
 export const MAX_REVISION = 1_000_000_000;
 const CRITERION_SET: ReadonlySet<string> = new Set(CUTOVER_SHADOW_CRITERIA);
-const EVIDENCE_DAYS = 3;
+const EVIDENCE_DAYS = CUTOVER_SHADOW_CONSECUTIVE_DAYS;
 const LEDGER_DAY_KEYS: readonly string[] = ['day', 'releaseSha', 'mergesCompared', 'verdicts'];
 const VERDICT_KEYS: readonly string[] = ['verdict', 'reason', 'digest', 'recordedAtIso'];
 
@@ -621,9 +621,9 @@ export type ShadowEvidenceCompose =
 
 /**
  * Compose the shadow-evidence document the switch move checks. Only the
- * document shape is composed here: `readCutoverShadowEvidence` (already
- * built, untouched) checks consecutiveness, the thirteen-criterion floor and
- * the twenty-merge floor from the returned evidence. Cost: linear in the
+ * document shape is composed here: `readCutoverShadowEvidence` checks the
+ * single required shadow day, the thirteen-criterion floor and the
+ * twenty-merge floor from the returned evidence. Cost: linear in the
  * capped ledger. Never throws, never echoes an input value; the evidence is
  * freshly built, never a reference into the input ledger.
  */
@@ -656,7 +656,7 @@ export function composeCutoverShadowEvidence(
   return composeEvidence(read.ledger, nowIso, optionSnapshot.requireSingleRelease);
 }
 
-/** The newest three days composed, after the shapes were accepted. */
+/** The single required shadow day composed, after the shapes were accepted. */
 function composeEvidence(ledger: ShadowLedger, nowIso: string, requireSingleRelease: boolean): ShadowEvidenceCompose {
   const days = ledger.days;
   if (days.length < EVIDENCE_DAYS) {
@@ -679,7 +679,7 @@ function isStale(newestDay: string, nowIso: string): boolean {
   return newest < now - 1;
 }
 
-/** True when all three days carry the same non-null release sha. */
+/** True when the single day's release sha is non-null (with one day there is no equality check). */
 function singleRelease(days: readonly ShadowDayRecord[]): boolean {
   const first = days[0].releaseSha;
   return (
@@ -688,7 +688,7 @@ function singleRelease(days: readonly ShadowDayRecord[]): boolean {
   );
 }
 
-/** The sum of the three days' merge counts, with `null` counted as 0. */
+/** The single day's merge count, with `null` counted as 0. */
 function totalMerges(days: readonly ShadowDayRecord[]): number {
   return days.reduce((sum, day) => sum + (day.mergesCompared ?? 0), 0);
 }

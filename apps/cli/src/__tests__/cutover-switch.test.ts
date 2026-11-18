@@ -199,18 +199,18 @@ function dayString(offsetDays: number): string {
 }
 
 /**
- * Seeds a passing 3-day shadow ledger (every criterion `pass`, 20+ merges, one
- * shared non-null release sha, the newest day today) through the real store,
+ * Seeds a passing 1-day shadow ledger (every criterion `pass`, 20 merges, one
+ * pinned non-null release sha, the day yesterday) through the real store,
  * or a ledger with one criterion failed when `failCriterion` is given.
  */
 async function seedShadowLedger(
   stateDir: string,
   failCriterion?: string,
 ): Promise<void> {
-  const days = [dayString(2), dayString(1), dayString(0)].map((day) => ({
+  const days = [dayString(1)].map((day) => ({
     day,
     releaseSha: RELEASE_SHA,
-    mergesCompared: 10,
+    mergesCompared: 20,
     verdicts: Object.fromEntries(
       CUTOVER_SHADOW_CRITERIA.map((criterion) => [
         criterion,

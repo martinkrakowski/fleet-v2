@@ -1035,7 +1035,7 @@ type ShadowEvidenceRead =
  * SH8b: the reader `cutover switch` binds when a durable state directory
  * exists. The stored ledger is composed here and judged by
  * `readCutoverShadowEvidence` inside the use case; this function does not
- * re-implement the 3-day, 20-merge, or S1–S13 rules. `nowIso` is the daemon
+ * re-implement the 1-day, 20-merge, or S1–S13 rules. `nowIso` is the daemon
  * clock and is read when the switch runs, never the operator's `--now-iso`.
  * Unreadable and unknown-version stay unknown. Every other non-ok result is
  * absence. A throw from the store propagates so the use case reports
@@ -1050,7 +1050,7 @@ function readStoredShadowEvidence(
     if (read.status === 'unreadable') return { status: 'unreadable' };
     if (read.status === 'unknown-version') return { status: 'unknown-version' };
     if (read.status !== 'ok') return { status: 'absent' };
-    // OD-4: each 3-day window must be bound to one pinned non-null release sha.
+    // OD-4: the 1-day window must be bound to one pinned non-null release sha.
     const composed = composeCutoverShadowEvidence(read.ledger, nowIso(), {
       requireSingleRelease: true,
     });

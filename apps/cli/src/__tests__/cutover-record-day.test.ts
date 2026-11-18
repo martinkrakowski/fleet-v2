@@ -335,14 +335,15 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       // status/reason per criterion for this seeded state — never "anything
       // other than not-wired", which would also accept `not-implemented` or
       // an undefined reason. Pinned exactly:
-      // - recorded S1/S4/S5/S6/S7/S9/S12 at their seeded-state verdicts;
-      // - unevaluated S2/S10/S11 `release-unpinned` (releaseSha null, SH20 not
+      // - recorded S1/S5/S6/S7/S9/S12 at their seeded-state verdicts;
+      // - unevaluated S4 `no-settled-heads` (owner decision 2026-11-18: the
+      //   seeded state has no conducted heads, so S4 is never a pass and
+      //   never a fail), S2/S10/S11 `release-unpinned` (releaseSha null, SH20 not
       //   landed: UNPINNED_RANK 2 beats NOT_YET_RANK 6), S3 `not-yet-observed`
       //   (the attestations ledger is missing), S8 `samples-invalid` (no
       //   daemon events to sample), S13 `not-implemented`.
       expect(result.recorded).toEqual({
         S1: 'pass',
-        S4: 'fail',
         S5: 'pass',
         S6: 'fail',
         S7: 'pass',
@@ -352,6 +353,7 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       expect(reasons).toEqual({
         S2: 'release-unpinned',
         S3: 'not-yet-observed',
+        S4: 'no-settled-heads',
         S8: 'samples-invalid',
         S10: 'release-unpinned',
         S11: 'release-unpinned',

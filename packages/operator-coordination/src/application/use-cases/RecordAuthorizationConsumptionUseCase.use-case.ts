@@ -20,9 +20,11 @@ import type {
 import { AuthorizationConsumption } from '../../domain/entities/AuthorizationConsumption.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import {
+  RELEASE_GRANT_DIGEST_PREFIX,
   SHADOW_IMPORT_ACTION_SCOPE,
   isReleaseActionScope,
   readReleaseRoot,
+  releaseGrantDigestPayload,
   releaseRootsAgree,
 } from '../../domain/coordination-records.js';
 import type {
@@ -34,6 +36,12 @@ import type { CoordinationRequestRepositoryPort } from '../ports/out/Coordinatio
 
 export interface RecordAuthorizationConsumptionDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
+  /**
+   * The SHA-256 digest a release grant's request id is bound by (RR1).
+   * Injected, so the application layer stays free of `node:crypto`; a
+   * release consumption without it is a typed refusal, never a silent skip.
+   */
+  readonly computeDigest?: (payload: string) => string;
 }
 
 const REQUIRED_TEXT_FIELDS = [
@@ -138,6 +146,35 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     const requestedRoot = readReleaseRoot(request);
     if (!releaseRootsAgree(recordedRoot, requestedRoot)) {
       return refused('release-grant-root-mismatch');
+    }
+    // RR1: a release grant's root is bound into its request id. A record
+    // whose id does not carry the prefix carries an unsigned (pre-RR1) root
+    // and fails closed; a prefixed record is re-verified against the digest
+    // of its recorded coordinates. The check runs before the idempotent
+    // replay return below, so a moved root is refused even when the receipt
+    // already exists.
+    if (isReleaseActionScope(recorded.actionScope)) {
+      if (
+        recordedRoot.state !== 'valid' ||
+        !recorded.id.startsWith(RELEASE_GRANT_DIGEST_PREFIX)
+      ) {
+        return refused('release-grant-digest-mismatch');
+      }
+      if (this.deps.computeDigest === undefined) {
+        return refused('digest-unavailable');
+      }
+      const payloadResult = releaseGrantDigestPayload({
+        actionScope: recorded.actionScope,
+        projectId: recorded.projectId,
+        expectedHeadSha: recorded.expectedHeadSha ?? '',
+        releaseRoot: recordedRoot.value,
+      });
+      const expectedRequestId = payloadResult.ok
+        ? `${RELEASE_GRANT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`
+        : null;
+      if (!payloadResult.ok || recorded.id !== expectedRequestId) {
+        return refused('release-grant-digest-mismatch');
+      }
     }
     // Idempotent replay of the same action: the durable receipt is returned
     // unchanged and nothing is recorded twice, so a release that crashed

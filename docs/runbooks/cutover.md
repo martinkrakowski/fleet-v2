@@ -37,6 +37,16 @@ The unattended timer's standing grant is recorded, resolved and revoked through 
 
 To issue a fresh grant after a revocation, record different coordinates — for example a different `--expires-at-iso` — because identical coordinates hash to the already-recorded request id.
 
+### Release grants (RR1)
+
+A release grant (`release:install`, `release:swap`, `release:rollback`) is bound to the release root it names:
+
+- Create one with `fleet-v2 coordination request-decision --kind action-decision --action-scope release:install|release:swap --project-id <id> --expected-head-sha <sha> --proposal-digest <digest> --policy-revision <rev> --release-root <path>`. `--release-root` is required for every `release:*` scope and refused for all other scopes. It is normalized via `realpath` (symlinks resolved; a path that does not resolve to an existing directory is a usage error, exit 2, never echoing the path) and bound into the request id: `release-grant-<sha256 of { scope, projectId, expectedHeadSha, releaseRoot }>`. A hand-typed `--request-id` that does not match the derived one is refused (exit 2) instead of recorded. The owner's Ed25519 decision signature covers `{ requestId, projectId, actionScope, expectedHeadSha, decisionRevision, grantId, state }` and not `releaseRoot` itself — the root is covered because the signed `requestId` is its digest.
+- Resolve one with `coordination resolve-auth --project-id <id> --action-scope release:<action> --expected-head-sha <sha> --release-root <path>` (or through `fleet-v2 release install|swap|rollback`, which forwards the realpath-resolved root). The resolve re-checks the digest of the stored coordinates on every call: a record whose id does not carry the `release-grant-` prefix (a pre-RR1 unsigned root) fails closed, and a mismatched or tampered root is refused `release-grant-digest-mismatch`. A grant bound to one root never authorizes an operation on another (`release-grant-root-mismatch`).
+
+  The release root named in the grant (`--release-root`) is the same path the operation runs on: `fleet-v2 release install --root <path>` and `fleet-v2 release swap --root <path>` each take `--root <path>`, and that path is realpath-normalized the same way before use, so it must match the grant's `--release-root` (their digests must be equal). A `--root` that normalizes to a different directory — a different checkout, a moved tree, or a symlink resolving elsewhere — does not satisfy the grant and is refused before any mutation.
+- The consumption re-checks the same digest before the idempotent replay return, so a moved root is refused even when a receipt already exists.
+
 Status does not evaluate S1–S12. A completed status is not a shadow pass. Do not start `conductor run --live` from this runbook.
 
 ## Switch preconditions

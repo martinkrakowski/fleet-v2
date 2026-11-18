@@ -8,6 +8,7 @@
  */
 
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,6 +29,15 @@ import { CoordinationRequestRepositoryAdapter } from '../../../../../operator-co
 import { RecordAuthorizationConsumptionUseCase } from '../../../../../operator-coordination/src/application/use-cases/RecordAuthorizationConsumptionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../../../../../operator-coordination/src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
 import type { CoordinationRequestRecord } from '../../../../../operator-coordination/src/domain/coordination-records.js';
+import { RELEASE_GRANT_DIGEST_PREFIX } from '../../../../../operator-coordination/src/domain/coordination-records.js';
+
+// RR1: a release grant's request id carries the digest of its coordinates
+// ({ scope, projectId, expectedHeadSha, releaseRoot }), so a recorded grant
+// must be saved under that id and the resolve/consume use cases must be given
+// the same digest function the request id was derived with.
+const digest = (payload: string): string => createHash('sha256').update(payload).digest('hex');
+const releaseGrantId = (scope: string, projectId: string, sha: string, root: string): string =>
+  `${RELEASE_GRANT_DIGEST_PREFIX}${digest(JSON.stringify({ scope, projectId, expectedHeadSha: sha, releaseRoot: root }))}`;
 
 const NOW = '2026-11-10T10:00:00.000Z';
 
@@ -72,9 +82,9 @@ class ScriptedBuildExecutor implements CommandExecutorPort {
 }
 
 /** A recorded, approved, unconsumed owner grant for one release scope at one head, bound to one root. */
-function releaseGrant(grantId: string, scope: string, sha: string, root: string): CoordinationRequestRecord {
+function releaseGrant(_grantId: string, scope: string, sha: string, root: string): CoordinationRequestRecord {
   return {
-    id: `req-${grantId}`,
+    id: releaseGrantId(scope, 'p', sha, root),
     projectId: 'p',
     kind: 'action-decision',
     state: 'approved',
@@ -83,7 +93,7 @@ function releaseGrant(grantId: string, scope: string, sha: string, root: string)
     proposalDigest: 'prop-1',
     policyRevision: 'pol-1',
     decisionRevision: 'dec-1',
-    grantId,
+    grantId: _grantId,
     consumptions: [],
     acknowledgements: [],
     deliveryStatus: 'delivered',
@@ -117,7 +127,7 @@ async function harness(storeOverride?: ReleaseStoreAdapter): Promise<Harness> {
       if (actionScope === null) {
         return { outcome: 'blocked', reason: 'not a release action' };
       }
-      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants }).resolveActionAuthorization({
+      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants, computeDigest: digest }).resolveActionAuthorization({
         projectId: request.projectId,
         actionScope,
         expectedHeadSha: request.expectedHeadSha,
@@ -138,7 +148,7 @@ async function harness(storeOverride?: ReleaseStoreAdapter): Promise<Harness> {
       if (actionScope === null || request.expectedHeadSha === undefined) {
         return { outcome: 'refused', reason: 'not a release grant consumption' };
       }
-      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants }).recordAuthorizationConsumption({
+      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants, computeDigest: digest }).recordAuthorizationConsumption({
         consumptionId: consumptionId(request.actionId),
         grantId: request.authorizationGrantId,
         actionId: request.actionId,
@@ -315,7 +325,15 @@ describe('release install and swap end to end (CO14 follow-up, real grant, real 
     expect((await apply('swap', shaC)).outcome).toBe('applied');
     expect((await apply('rollback', null)).outcome).toBe('applied');
     expect(await readlinkSha(h.root)).toBe(shaB);
-    await h.grants.saveRequest(releaseGrant('grant-swap-c2', 'release:swap', shaC, h.root));
+    // RR1: identical grant coordinates hash to the same `release-grant-<sha256>`
+    // request id, so a fresh grant for the same swap supersedes the spent one by
+    // revision (the repository refuses a stale revision, never an equal-or-newer
+    // re-record of the same id).
+    const spent = await h.grants.findRequestByGrantId('grant-swap-c');
+    await h.grants.saveRequest({
+      ...releaseGrant('grant-swap-c2', 'release:swap', shaC, h.root),
+      revision: (spent?.revision ?? 1) + 1,
+    });
     expect((await apply('swap', shaC)).outcome).toBe('applied');
     expect(await readlinkSha(h.root)).toBe(shaC);
     // The same rollback again, with the grant already spent: refused, current unmoved.

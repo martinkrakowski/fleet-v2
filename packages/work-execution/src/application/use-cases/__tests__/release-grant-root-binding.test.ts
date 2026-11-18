@@ -7,6 +7,7 @@
  * to another root after it was issued.
  */
 
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,10 +27,19 @@ import type { CoordinationRequestRecord } from '../../../../../operator-coordina
 import { CoordinationRequestRepositoryAdapter } from '../../../../../operator-coordination/src/infrastructure/adapters/CoordinationRequestRepositoryAdapter.adapter.js';
 import { RecordAuthorizationConsumptionUseCase } from '../../../../../operator-coordination/src/application/use-cases/RecordAuthorizationConsumptionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../../../../../operator-coordination/src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
+import { RELEASE_GRANT_DIGEST_PREFIX } from '../../../../../operator-coordination/src/domain/coordination-records.js';
 
 const NOW = '2026-11-10T10:00:00.000Z';
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
+
+// RR1: a release grant's request id carries the digest of its coordinates
+// ({ scope, projectId, expectedHeadSha, releaseRoot }), so a recorded grant
+// must be saved under that id and the resolve/consume use cases must be given
+// the same digest function the request id was derived with.
+const digest = (payload: string): string => createHash('sha256').update(payload).digest('hex');
+const releaseGrantId = (scope: string, projectId: string, sha: string, root: string): string =>
+  `${RELEASE_GRANT_DIGEST_PREFIX}${digest(JSON.stringify({ scope, projectId, expectedHeadSha: sha, releaseRoot: root }))}`;
 
 let dirs: string[] = [];
 
@@ -67,7 +77,7 @@ class NoBuildExecutor implements CommandExecutorPort {
 /** A recorded, approved owner grant for `release:install` at SHA_A, bound to `root`. */
 function grantFor(root: string): CoordinationRequestRecord {
   return {
-    id: 'req-owner',
+    id: releaseGrantId('release:install', 'p', SHA_A, root),
     projectId: 'p',
     kind: 'action-decision',
     state: 'approved',
@@ -91,7 +101,7 @@ function grantFor(root: string): CoordinationRequestRecord {
 function releaseUseCase(grants: CoordinationRequestRepositoryAdapter): ManageReleaseUseCase {
   const authorization: ActionAuthorizationPort = {
     resolveActionAuthorization: async (request) => {
-      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants }).resolveActionAuthorization({
+      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants, computeDigest: digest }).resolveActionAuthorization({
         projectId: request.projectId,
         actionScope: 'release:install',
         expectedHeadSha: request.expectedHeadSha,
@@ -107,7 +117,7 @@ function releaseUseCase(grants: CoordinationRequestRepositoryAdapter): ManageRel
         : { outcome: 'blocked', reason: result.reason };
     },
     consumeActionAuthorization: async (request) => {
-      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants }).recordAuthorizationConsumption({
+      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants, computeDigest: digest }).recordAuthorizationConsumption({
         consumptionId: `c-${request.actionId}`,
         grantId: request.authorizationGrantId,
         actionId: request.actionId,

@@ -1,9 +1,14 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../src/domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../src/application/ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { RequestScopedDecisionUseCase } from '../src/application/use-cases/RequestScopedDecisionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
 import { RecordAuthorizationConsumptionUseCase } from '../src/application/use-cases/RecordAuthorizationConsumptionUseCase.use-case.js';
+
+function digest(payload: string): string {
+  return createHash('sha256').update(payload).digest('hex');
+}
 
 class InMemoryCoordinationRequestRepo implements CoordinationRequestRepositoryPort {
   private requests = new Map<string, CoordinationRequestRecord>();
@@ -102,8 +107,16 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
   it('records and persists the release root a release decision names, and resolves it only for that root', async () => {
     // The ordinary decision flow: the request records the proposal first, then
     // the verified answer approves it; the recorded grant carries the release
-    // root the decision named.
+    // root the decision named. RR1: the request id is the digest of the
+    // grant's exact coordinates, and the digest is supplied to every use case.
     const repo = new InMemoryCoordinationRequestRepo();
+    const head = '3333333333333333333333333333333333333333';
+    const root = '/srv/fleet/releases';
+    const requestId = `release-grant-${createHash('sha256')
+      .update(
+        JSON.stringify({ scope: 'release:install', projectId: 'proj-1', expectedHeadSha: head, releaseRoot: root }),
+      )
+      .digest('hex')}`;
     const useCase = new RequestScopedDecisionUseCase({
       requestRepo: repo,
       decisionTransport: {
@@ -113,35 +126,36 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
           grantId: 'grant-root-1',
         }),
       },
+      computeDigest: digest,
     });
     const requested = await useCase.requestScopedDecision({
-      requestId: 'req-root-1',
+      requestId,
       projectId: 'proj-1',
       kind: 'action-decision',
       actionScope: 'release:install',
-      expectedHeadSha: '3333333333333333333333333333333333333333',
+      expectedHeadSha: head,
       proposalDigest: 'digest-root',
       policyRevision: 'pol-1',
-      releaseRoot: '/srv/fleet/releases',
+      releaseRoot: root,
     });
     expect(requested.outcome).toBe('requested');
-    const recorded = await repo.findRequestById('req-root-1');
-    expect(recorded?.releaseRoot).toBe('/srv/fleet/releases');
+    const recorded = await repo.findRequestById(requestId);
+    expect(recorded?.releaseRoot).toBe(root);
     expect(recorded?.state).toBe('approved');
     expect(recorded?.grantId).toBe('grant-root-1');
     // The recorded grant resolves for the root it names and for no other.
-    const resolver = new ResolveActionAuthorizationUseCase({ requestRepo: repo });
+    const resolver = new ResolveActionAuthorizationUseCase({ requestRepo: repo, computeDigest: digest });
     const resolve = await resolver.resolveActionAuthorization({
       projectId: 'proj-1',
       actionScope: 'release:install',
-      expectedHeadSha: '3333333333333333333333333333333333333333',
-      releaseRoot: '/srv/fleet/releases',
+      expectedHeadSha: head,
+      releaseRoot: root,
     });
     expect(resolve.outcome).toBe('authorized');
     const otherRoot = await resolver.resolveActionAuthorization({
       projectId: 'proj-1',
       actionScope: 'release:install',
-      expectedHeadSha: '3333333333333333333333333333333333333333',
+      expectedHeadSha: head,
       releaseRoot: '/srv/fleet/other',
     });
     expect(otherRoot).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });

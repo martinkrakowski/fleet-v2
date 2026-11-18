@@ -4,6 +4,7 @@
  * temp directory, so a stored grant is written to and read back from disk.
  */
 
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -441,24 +442,57 @@ describe('grant attempt binding (CO24e)', () => {
   describe('release grants are attempt-less by design (CO24g)', () => {
     const RELEASE_SCOPE = 'release:install';
     const ACTION_ID = `release-install-${HEAD}`;
+    // RR1: a release grant's root is bound into its request id, so every
+    // seeded release record here carries a root and a digest-bound id, and
+    // the resolver/consumer are wired with the same digest.
+    const RELEASE_ROOT = '/srv/fleet/releases';
 
-    const releaseGrant = (overrides: Record<string, unknown> = {}) =>
-      ownerGrant({ actionScope: RELEASE_SCOPE, ...overrides });
+    const digest = (payload: string) => createHash('sha256').update(payload).digest('hex');
+
+    const releaseGrantId = (grant: { actionScope: string; projectId?: string; expectedHeadSha?: string; releaseRoot?: string }): string =>
+      `release-grant-${digest(
+        JSON.stringify({
+          scope: grant.actionScope,
+          projectId: grant.projectId ?? 'project-1',
+          expectedHeadSha: grant.expectedHeadSha ?? HEAD,
+          releaseRoot: grant.releaseRoot ?? RELEASE_ROOT,
+        }),
+      )}`;
+
+    const releaseGrant = (overrides: Record<string, unknown> = {}) => {
+      const grant = { actionScope: RELEASE_SCOPE, ...overrides };
+      // Only the three exact release scopes are digest-bound release grants
+      // (RR1); an unknown `release:*` scope stays an ordinary owner grant
+      // with no root, and a forge scope stays untouched.
+      const isExactReleaseScope = ['release:install', 'release:swap', 'release:rollback'].includes(
+        grant.actionScope as string,
+      );
+      return ownerGrant({
+        ...(isExactReleaseScope ? { id: releaseGrantId(grant), releaseRoot: RELEASE_ROOT } : {}),
+        actionScope: grant.actionScope,
+        ...overrides,
+      });
+    };
     const resolveRelease = (attemptId?: string) => ({
       projectId: 'project-1',
       actionScope: RELEASE_SCOPE,
       expectedHeadSha: HEAD,
+      releaseRoot: RELEASE_ROOT,
       ...(attemptId !== undefined ? { attemptId } : {}),
     });
+    const releaseResolver = (facts = attemptFacts({ attemptId: 'att-A', projectId: 'project-1', collectedHeadSha: HEAD }, { attemptId: 'att-B', projectId: 'project-1', collectedHeadSha: HEAD })) =>
+      new ResolveActionAuthorizationUseCase({ requestRepo: repo, attemptFactsRead: facts, computeDigest: digest });
+    const releaseConsumer = () => new RecordAuthorizationConsumptionUseCase({ requestRepo: repo, computeDigest: digest });
 
     it('resolves a fresh release owner grant without an attempt, binding and consuming nothing', async () => {
       await repo.saveRequest(releaseGrant());
-      expect(await resolver().resolveActionAuthorization(resolveRelease())).toEqual({
+      expect(await releaseResolver().resolveActionAuthorization(resolveRelease())).toEqual({
         outcome: 'authorized',
         grantId: 'grant-owner',
-        requestId: 'req-owner',
+        requestId: releaseGrant().id,
         expectedHeadSha: HEAD,
         policyRevision: 'pol-1',
+        releaseRoot: RELEASE_ROOT,
       });
       const stored = await repo.findRequestByGrantId('grant-owner');
       expect(stored?.grantAttemptId).toBeUndefined();
@@ -468,7 +502,7 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('resolves the same grant with its deterministic action id and still never binds', async () => {
       await repo.saveRequest(releaseGrant());
-      expect((await resolver().resolveActionAuthorization(resolveRelease(ACTION_ID))).outcome).toBe('authorized');
+      expect((await releaseResolver().resolveActionAuthorization(resolveRelease(ACTION_ID))).outcome).toBe('authorized');
       const stored = await repo.findRequestByGrantId('grant-owner');
       expect(stored?.grantAttemptId).toBeUndefined();
       expect(stored?.revision).toBe(1);
@@ -477,10 +511,10 @@ describe('grant attempt binding (CO24e)', () => {
     it('still refuses a release grant at another head or scope', async () => {
       await repo.saveRequest(releaseGrant());
       expect(
-        await resolver().resolveActionAuthorization({ ...resolveRelease(), expectedHeadSha: 'd'.repeat(40) }),
+        await releaseResolver().resolveActionAuthorization({ ...resolveRelease(), expectedHeadSha: 'd'.repeat(40) }),
       ).toMatchObject({ outcome: 'blocked' });
       expect(
-        await resolver().resolveActionAuthorization({ ...resolveRelease(ACTION_ID), actionScope: 'release:swap' }),
+        await releaseResolver().resolveActionAuthorization({ ...resolveRelease(ACTION_ID), actionScope: 'release:swap' }),
       ).toMatchObject({ outcome: 'blocked' });
       expect((await repo.findRequestByGrantId('grant-owner'))?.consumptions).toHaveLength(0);
     });
@@ -519,9 +553,10 @@ describe('grant attempt binding (CO24e)', () => {
 
     it('consumes a release grant once for its deterministic action id', async () => {
       await repo.saveRequest(releaseGrant());
-      const result = await consumer().recordAuthorizationConsumption({
+      const result = await releaseConsumer().recordAuthorizationConsumption({
         ...consume('grant-owner', ACTION_ID),
         actionScope: RELEASE_SCOPE,
+        releaseRoot: RELEASE_ROOT,
       });
       expect(result.outcome).toBe('consumed');
       const stored = await repo.findRequestByGrantId('grant-owner');
@@ -538,52 +573,58 @@ describe('grant attempt binding (CO24e)', () => {
     });
 
     it('refuses a release:swap grant bound to attempt A when resolved with attempt B', async () => {
-      await repo.saveRequest(ownerGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
-      expect(await resolver().resolveActionAuthorization({
+      await repo.saveRequest(releaseGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      expect(await releaseResolver().resolveActionAuthorization({
         projectId: 'project-1',
         actionScope: 'release:swap',
         expectedHeadSha: HEAD,
+        releaseRoot: RELEASE_ROOT,
         attemptId: 'att-B',
       })).toEqual({ outcome: 'blocked', reason: 'grant-attempt-mismatch' });
     });
 
     it('refuses a release:swap grant bound to attempt A when resolved with no attempt', async () => {
-      await repo.saveRequest(ownerGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
-      expect(await resolver().resolveActionAuthorization({
+      await repo.saveRequest(releaseGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      expect(await releaseResolver().resolveActionAuthorization({
         projectId: 'project-1',
         actionScope: 'release:swap',
         expectedHeadSha: HEAD,
+        releaseRoot: RELEASE_ROOT,
       })).toEqual({ outcome: 'blocked', reason: 'attempt-required' });
     });
 
     it('authorizes a release:swap grant bound to attempt A when resolved with attempt A', async () => {
-      await repo.saveRequest(ownerGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
-      expect(await resolver().resolveActionAuthorization({
+      await repo.saveRequest(releaseGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      expect(await releaseResolver().resolveActionAuthorization({
         projectId: 'project-1',
         actionScope: 'release:swap',
         expectedHeadSha: HEAD,
+        releaseRoot: RELEASE_ROOT,
         attemptId: 'att-A',
       })).toEqual({
         outcome: 'authorized',
         grantId: 'grant-owner',
-        requestId: 'req-owner',
+        requestId: releaseGrant({ actionScope: 'release:swap' }).id,
         expectedHeadSha: HEAD,
         policyRevision: 'pol-1',
+        releaseRoot: RELEASE_ROOT,
       });
     });
 
     it('resolves an unbound release:swap grant without an attempt', async () => {
-      await repo.saveRequest(ownerGrant({ actionScope: 'release:swap' }));
-      expect(await resolver().resolveActionAuthorization({
+      await repo.saveRequest(releaseGrant({ actionScope: 'release:swap' }));
+      expect(await releaseResolver().resolveActionAuthorization({
         projectId: 'project-1',
         actionScope: 'release:swap',
         expectedHeadSha: HEAD,
+        releaseRoot: RELEASE_ROOT,
       })).toEqual({
         outcome: 'authorized',
         grantId: 'grant-owner',
-        requestId: 'req-owner',
+        requestId: releaseGrant({ actionScope: 'release:swap' }).id,
         expectedHeadSha: HEAD,
         policyRevision: 'pol-1',
+        releaseRoot: RELEASE_ROOT,
       });
     });
   });

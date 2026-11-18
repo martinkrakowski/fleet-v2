@@ -20,6 +20,8 @@ import {
   readReleaseRoot,
   releaseRootsAgree,
   isShadowImportActionScope,
+  releaseGrantDigestPayload,
+  RELEASE_GRANT_DIGEST_PREFIX,
   SHADOW_IMPORT_ACTION_SCOPE,
   SHADOW_IMPORT_DIGEST_PREFIX,
   shadowImportDigestPayload,
@@ -239,6 +241,34 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     const requestedRoot = readReleaseRoot(request);
     if (!releaseRootsAgree(recordedRoot, requestedRoot)) {
       return blocked('release-grant-root-mismatch');
+    }
+    // RR1: a release grant's root is bound into its request id. A record
+    // whose id does not carry the prefix carries an unsigned (pre-RR1) root
+    // and fails closed; a prefixed record is re-verified against the digest
+    // of its recorded coordinates, so a tampered root can never masquerade
+    // behind a valid-looking id.
+    if (isReleaseActionScope(candidate.getActionScope())) {
+      if (
+        recordedRoot.state !== 'valid' ||
+        !candidate.getId().startsWith(RELEASE_GRANT_DIGEST_PREFIX)
+      ) {
+        return blocked('release-grant-digest-mismatch');
+      }
+      if (this.deps?.computeDigest === undefined) {
+        return blocked('digest-unavailable');
+      }
+      const payloadResult = releaseGrantDigestPayload({
+        actionScope: candidate.getActionScope(),
+        projectId: refreshed.projectId,
+        expectedHeadSha: refreshed.expectedHeadSha ?? '',
+        releaseRoot: recordedRoot.value,
+      });
+      const expectedRequestId = payloadResult.ok
+        ? `${RELEASE_GRANT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`
+        : null;
+      if (!payloadResult.ok || candidate.getId() !== expectedRequestId) {
+        return blocked('release-grant-digest-mismatch');
+      }
     }
     const mergeGrant = candidate.getMergeGrant();
     if (mergeGrant !== null) {

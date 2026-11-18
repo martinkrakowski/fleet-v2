@@ -620,3 +620,149 @@ describe('RequestScopedDecisionUseCase ordinary decisions stay as on main (GR1a1
     });
   });
 });
+
+describe('RequestScopedDecisionUseCase release grants (RR1)', () => {
+  const HEAD = '1111111111111111111111111111111111111111';
+  const ROOT = '/srv/fleet/releases';
+
+  function releaseGrantPayload(grant: Record<string, unknown>): string {
+    return JSON.stringify({
+      scope: grant.actionScope,
+      projectId: grant.projectId,
+      expectedHeadSha: grant.expectedHeadSha,
+      releaseRoot: grant.releaseRoot,
+    });
+  }
+
+  function releaseRequestId(grant: Record<string, unknown>): string {
+    return `release-grant-${digest(releaseGrantPayload(grant))}`;
+  }
+
+  function releaseRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    const grant = {
+      actionScope: 'release:install',
+      projectId: 'proj-alpha',
+      expectedHeadSha: HEAD,
+      releaseRoot: ROOT,
+      ...overrides,
+    };
+    return {
+      requestId: releaseRequestId(grant),
+      projectId: grant.projectId,
+      kind: 'action-decision',
+      actionScope: grant.actionScope,
+      expectedHeadSha: grant.expectedHeadSha,
+      proposalDigest: 'sha256-proposal',
+      policyRevision: 'pol-rev-1',
+      releaseRoot: grant.releaseRoot,
+      nowIso: NOW_ISO,
+      ...overrides,
+    };
+  }
+
+  it('accepts a valid digest-bound release request and records its root', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const result = await useCaseWith(repo).execute(releaseRequest());
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.releaseRoot).toBe(ROOT);
+      expect(result.request.expectedHeadSha).toBe(HEAD);
+    }
+  });
+
+  it('rejects a release scope without a releaseRoot with release-root-required', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const request = releaseRequest();
+    delete request.releaseRoot;
+    const result = await useCaseWith(repo).execute(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: 'release-root-required' });
+    expect((await repo.listRequests()).length).toBe(0);
+  });
+
+  it('rejects a release scope with an invalid releaseRoot (accessor included)', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const invalid = await useCaseWith(repo).execute(releaseRequest({ releaseRoot: '/srv/../etc' }));
+    expect(invalid).toEqual({
+      outcome: 'rejected',
+      reason: 'a decision request releaseRoot must be a bounded absolute path without ".." when given',
+    });
+    let calls = 0;
+    const accessor = releaseRequest();
+    Object.defineProperty(accessor, 'releaseRoot', {
+      get() {
+        calls += 1;
+        return ROOT;
+      },
+      enumerable: true,
+    });
+    const accessorResult = await useCaseWith(repo).execute(accessor);
+    expect(accessorResult).toEqual({
+      outcome: 'rejected',
+      reason: 'a decision request releaseRoot must be a bounded absolute path without ".." when given',
+    });
+    expect(calls).toBe(0);
+    expect((await repo.listRequests()).length).toBe(0);
+  });
+
+  it(`rejects a non-release scope carrying releaseRoot with release-root-forbidden-for-scope (NEW, RR1)`, async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const request = releaseRequest({ actionScope: 'forge:merge-pr', attemptId: 'att-1' });
+    request.requestId = 'req-ordinary-release-root';
+    const result = await useCaseWith(repo).execute(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: 'release-root-forbidden-for-scope' });
+    // An accessor carrying the root is refused the same way, and never runs.
+    let calls = 0;
+    const accessor = releaseRequest({ actionScope: 'forge:merge-pr', attemptId: 'att-1' });
+    accessor.requestId = 'req-ordinary-accessor';
+    Object.defineProperty(accessor, 'releaseRoot', {
+      get() {
+        calls += 1;
+        return ROOT;
+      },
+      enumerable: true,
+    });
+    const accessorResult = await useCaseWith(repo).execute(accessor);
+    expect(accessorResult).toEqual({ outcome: 'rejected', reason: 'release-root-forbidden-for-scope' });
+    expect(calls).toBe(0);
+    expect((await repo.listRequests()).length).toBe(0);
+  });
+
+  it('rejects a release scope without an expected head with release-expected-head-required', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const result = await useCaseWith(repo).execute(releaseRequest({ expectedHeadSha: null }));
+    expect(result).toEqual({ outcome: 'rejected', reason: 'release-expected-head-required' });
+    expect((await repo.listRequests()).length).toBe(0);
+  });
+
+  it('rejects a release scope without computeDigest with release-grant-digest-unavailable', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const result = await useCaseWith(repo, null).execute(releaseRequest());
+    expect(result).toEqual({ outcome: 'rejected', reason: 'release-grant-digest-unavailable' });
+    expect((await repo.listRequests()).length).toBe(0);
+  });
+
+  it('rejects a release request whose id does not carry the digest with release-grant-request-digest-mismatch', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const result = await useCaseWith(repo).execute(releaseRequest({ requestId: 'release-grant-not-the-digest' }));
+    expect(result).toEqual({ outcome: 'rejected', reason: 'release-grant-request-digest-mismatch' });
+    expect((await repo.listRequests()).length).toBe(0);
+  });
+
+  it('is neither constant nor identity: accepted and refused release requests differ, and the digest moves with the root', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    expect((await useCaseWith(repo).execute(releaseRequest())).outcome).toBe('requested');
+    const refused = await useCaseWith(repo).execute(releaseRequest({ requestId: 'hand-typed' }));
+    expect(refused).toEqual({ outcome: 'rejected', reason: 'release-grant-request-digest-mismatch' });
+    // A different root hashes to a different id: the same hand-typed id for
+    // another root is refused too, never accepted as the first grant.
+    const otherRootRequest = releaseRequest({ releaseRoot: '/srv/fleet/other' });
+    otherRootRequest.requestId = releaseRequestId({
+      actionScope: 'release:install',
+      projectId: 'proj-alpha',
+      expectedHeadSha: HEAD,
+      releaseRoot: ROOT,
+    });
+    const otherRoot = await useCaseWith(repo).execute(otherRootRequest);
+    expect(otherRoot).toEqual({ outcome: 'rejected', reason: 'release-grant-request-digest-mismatch' });
+  });
+});

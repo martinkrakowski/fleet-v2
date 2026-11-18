@@ -668,3 +668,124 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     expect(result).toEqual({ outcome: 'blocked', reason: 'project-id-required' });
   });
 });
+
+describe('ResolveActionAuthorizationUseCase release grants (RR1)', () => {
+  const HEAD = '1111111111111111111111111111111111111111';
+  const ROOT = '/srv/fleet/releases';
+  const GRANT_ID = 'grant-release';
+
+  function digest(payload: string): string {
+    return createHash('sha256').update(payload).digest('hex');
+  }
+
+  function releaseRequestId(grant: {
+    actionScope: string;
+    projectId: string;
+    expectedHeadSha: string;
+    releaseRoot: string;
+  }): string {
+    return `release-grant-${digest(
+      JSON.stringify({
+        scope: grant.actionScope,
+        projectId: grant.projectId,
+        expectedHeadSha: grant.expectedHeadSha,
+        releaseRoot: grant.releaseRoot,
+      }),
+    )}`;
+  }
+
+  function createReleaseRecord(overrides?: Partial<CoordinationRequestRecord>): CoordinationRequestRecord {
+    const grant = {
+      actionScope: 'release:install',
+      projectId: 'proj-1',
+      expectedHeadSha: HEAD,
+      releaseRoot: ROOT,
+    };
+    return {
+      id: releaseRequestId(grant),
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'release:install',
+      expectedHeadSha: HEAD,
+      proposalDigest: 'digest-1',
+      policyRevision: 'p1',
+      decisionRevision: 'dec-1',
+      grantId: GRANT_ID,
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-02T00:00:00.000Z',
+      updatedAtIso: '2026-11-02T00:00:00.000Z',
+      releaseRoot: ROOT,
+      ...overrides,
+    };
+  }
+
+  function resolveRelease(
+    useCase: ResolveActionAuthorizationUseCase,
+    overrides: Record<string, unknown> = {},
+  ): Promise<ResolveActionAuthorizationResult> {
+    return useCase.resolveActionAuthorization({
+      projectId: 'proj-1',
+      actionScope: 'release:install',
+      expectedHeadSha: HEAD,
+      releaseRoot: ROOT,
+      ...overrides,
+    } as never);
+  }
+
+  it('authorizes a digest-bound release record whose root matches', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createReleaseRecord());
+    const result = await resolveRelease(
+      new ResolveActionAuthorizationUseCase({ requestRepo, computeDigest: digest }),
+    );
+    expect(result).toMatchObject({ outcome: 'authorized', grantId: GRANT_ID, releaseRoot: ROOT });
+  });
+
+  it('blocks a matching root whose stored coordinates no longer hash to the id (tampered)', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    // The stored root was moved after recording: the request names the same
+    // (moved) root, so the root check passes, but the recomputed digest no
+    // longer matches the request id the grant is bound by.
+    await requestRepo.saveRequest(
+      createReleaseRecord({ releaseRoot: '/srv/fleet/moved' }),
+    );
+    const result = await resolveRelease(
+      new ResolveActionAuthorizationUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: '/srv/fleet/moved' },
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'release-grant-digest-mismatch' });
+  });
+
+  it('blocks a pre-RR1 unprefixed release record (unsigned root) even when the root matches', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createReleaseRecord({ id: 'req-unprefixed-1' }));
+    const result = await resolveRelease(
+      new ResolveActionAuthorizationUseCase({ requestRepo, computeDigest: digest }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'release-grant-digest-mismatch' });
+  });
+
+  it('fails closed with digest-unavailable when the digest is unwired on a release record', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createReleaseRecord());
+    const result = await resolveRelease(
+      new ResolveActionAuthorizationUseCase({ requestRepo }),
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'digest-unavailable' });
+  });
+
+  it('still blocks a different root with release-grant-root-mismatch before the digest runs', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createReleaseRecord());
+    const result = await resolveRelease(
+      new ResolveActionAuthorizationUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: '/srv/fleet/other' },
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
+  });
+});

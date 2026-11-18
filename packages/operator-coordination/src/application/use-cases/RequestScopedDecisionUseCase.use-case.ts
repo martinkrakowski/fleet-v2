@@ -16,11 +16,14 @@
 import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord, ShadowImportGrantRecord } from '../../domain/coordination-records.js';
 import {
+  RELEASE_GRANT_DIGEST_PREFIX,
   SHADOW_IMPORT_ACTION_SCOPE,
   SHADOW_IMPORT_DIGEST_PREFIX,
   SHADOW_IMPORT_GRANT_MAX_TTL_DAYS,
+  isReleaseActionScope,
   isShadowImportActionScope,
   parseShadowImportGrant,
+  releaseGrantDigestPayload,
   shadowImportDigestPayload,
 } from '../../domain/coordination-records.js';
 import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
@@ -205,15 +208,31 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     // A present-but-unreadable `releaseRoot` (an accessor) fails closed as
     // invalid, like every other malformed root; an explicit `undefined` data
     // value is an omitted optional field, so it stays absent (as on main).
+    // RR1: the two directions are now scope-symmetric and fail closed both
+    // ways. A release scope REQUIRES a valid root, and any non-release scope
+    // (ordinary or accessor) carrying one — or an accessor on any scope — is
+    // refused, so a root can never be smuggled past its digest binding.
     const releaseRoot = releaseRootIsAccessor
       ? ({ state: 'invalid' } as const)
       : readReleaseRoot(request);
-    if (releaseRoot.state === 'invalid') {
-      return {
-        outcome: 'rejected',
-        reason: 'a decision request releaseRoot must be a bounded absolute path without ".." when given',
-      };
+    const isReleaseScope = isReleaseActionScope(request.actionScope.trim());
+    if (isReleaseScope) {
+      if (releaseRoot.state !== 'valid') {
+        return {
+          outcome: 'rejected',
+          reason:
+            releaseRoot.state === 'invalid'
+              ? 'a decision request releaseRoot must be a bounded absolute path without ".." when given'
+              : 'release-root-required',
+        };
+      }
+    } else if (releaseRootIsAccessor || releaseRoot.state !== 'absent') {
+      return { outcome: 'rejected', reason: 'release-root-forbidden-for-scope' };
     }
+    // The plain root value when one is present (only a release scope reaches
+    // the digest below with one): TypeScript cannot carry the scope-correlated
+    // narrowing across the two blocks, so the value is read once, here.
+    const releaseRootValue = releaseRoot.state === 'valid' ? releaseRoot.value : undefined;
     const kind = CoordinationKind.create(request.kind);
     if (!kind.success || kind.value === undefined) {
       return {
@@ -265,6 +284,33 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         return { outcome: 'rejected', reason: grantEvaluation.reason };
       }
       shadowImportGrant = grantEvaluation.grant;
+    }
+    // RR1: a release grant is bound to its root by the request id itself. The
+    // owner's Ed25519 decision signature covers `{ requestId, ... }` but not
+    // `releaseRoot`, so the root is covered only when the request id carries
+    // the digest of the exact coordinates it names. Every failure here is a
+    // typed rejection before anything is recorded, mirroring the shadow
+    // import grant's binding (GR1a1).
+    if (isReleaseScope) {
+      if (request.expectedHeadSha === null || !isFilled(request.expectedHeadSha)) {
+        return { outcome: 'rejected', reason: 'release-expected-head-required' };
+      }
+      if (this.deps.computeDigest === undefined) {
+        return { outcome: 'rejected', reason: 'release-grant-digest-unavailable' };
+      }
+      const payloadResult = releaseGrantDigestPayload({
+        actionScope: request.actionScope.trim(),
+        projectId: request.projectId.trim(),
+        expectedHeadSha: request.expectedHeadSha.trim(),
+        releaseRoot: releaseRootValue,
+      });
+      if (!payloadResult.ok) {
+        return { outcome: 'rejected', reason: payloadResult.code };
+      }
+      const expectedRequestId = `${RELEASE_GRANT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`;
+      if (request.requestId.trim() !== expectedRequestId) {
+        return { outcome: 'rejected', reason: 'release-grant-request-digest-mismatch' };
+      }
     }
     const existing = await this.deps.requestRepo.findRequestById(request.requestId.trim());
     if (existing !== null) {

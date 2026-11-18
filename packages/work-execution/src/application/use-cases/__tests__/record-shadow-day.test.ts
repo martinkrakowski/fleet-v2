@@ -4299,6 +4299,22 @@ describe('evaluateShadowGrantCoverage', () => {
     expect(evaluateShadowGrantCoverage(polluted, DAY_START, DAY_END).outcome).toBe('unavailable');
   });
 
+  it('refuses a non-enumerable own constructor key', () => {
+    // OD7a2 fix round 6: `Reflect.ownKeys` sees non-enumerable and symbol own
+    // keys that `Object.keys` would miss, so a hidden `constructor` is refused
+    // as outside the allowed key set.
+    const record: Record<string, unknown> = grantRecord();
+    Object.defineProperty(record, 'constructor', {
+      value: { polluted: true },
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    expect(Object.keys(record).includes('constructor')).toBe(false);
+    const evaluation = evaluateShadowGrantCoverage(record, DAY_START, DAY_END);
+    expect(evaluation).toEqual({ outcome: 'unavailable', reason: 'invalid-record' });
+  });
+
   it('discriminates covering from non-covering records (a constant verdict would fail)', () => {
     const before = evaluateShadowGrantCoverage(grantRecord(), DAY_START, DAY_END);
     const after = evaluateShadowGrantCoverage(grantRecord({ updatedAtIso: '2026-11-16T12:00:00.000Z' }), DAY_START, DAY_END);
@@ -4543,16 +4559,33 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
   it('scheduled mode never throws on malformed daemon events and writes nothing', async () => {
     // OD7a2 fix round: the first-tick loop dereferences `event.kind` before
     // S12 validates the events, so `readAfterCursor` may hand it anything.
-    // Every malformed event is skipped (never thrown), the day is treated as
-    // undeterminable by the early-tick guard, and scheduled mode writes
-    // nothing.
+    // OD7a2 fix round 6: a malformed event FAILS CLOSED — `snapshotEvent`
+    // returning null stops the run as `s12-unknown` before anything is
+    // written, never as a silently shortened event list.
     const harness = scheduledHarness(cleanFixture(DAY));
     const projection = harness.deps.daemonEvents as {
       readAfterCursor: () => Promise<unknown>;
     };
     projection.readAfterCursor = async () => ({ ok: true as const, events: [null, 42, {}], nextCursor: null });
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
-    expect(result.outcome === 'unknown' || result.outcome === 'skipped').toBe(true);
+    expect(result).toEqual({ outcome: 'unknown', reason: 's12-unknown' });
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('scheduled mode fails closed with unknown when one null event joins 800 valid in-day job ticks', async () => {
+    // OD7a2 fix round 6: 800 good ticks plus ONE null must not pass S12 on a
+    // shortened list — a single un-snapshotable event makes the whole S12
+    // evaluation unknown, and nothing is written.
+    const fixture = cleanFixture(DAY);
+    const valid = Array.from({ length: 800 }, (_, index) => daemonJobEvent(index, DAY));
+    (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [
+      ...valid,
+      null as unknown as DaemonEventRecord,
+    ];
+    const harness = scheduledHarness(fixture);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 's12-unknown' });
     expect(harness.evidence.calls.cas).toBe(0);
     expect(harness.evidence.stored).toBeNull();
   });
@@ -4640,14 +4673,14 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
   });
 
   it('never rejects when the events are a null entry and one valid 00:00Z job tick, and writes nothing', async () => {
-    // The validator drops the null entry, the 00:00Z job tick passes the
-    // first-tick grace, and S12 then refuses the day as too-few-ticks — the
-    // run resolves to a typed skip, never a rejection, and writes nothing.
+    // OD7a2 fix round 6: a null entry FAILS CLOSED. The un-snapshotable event
+    // stops the run as `s12-unknown` before the first-tick guard or S12 runs,
+    // never as a silently shortened event list, and nothing is written.
     const fixture = cleanFixture(DAY);
     (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [null, daemonJobEvent(0, DAY)] as unknown as DaemonEventRecord[];
     const harness = scheduledHarness(fixture);
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
-    expect(result).toEqual({ outcome: 'skipped', reason: 'too-few-ticks' });
+    expect(result).toEqual({ outcome: 'unknown', reason: 's12-unknown' });
     expect(harness.evidence.calls.cas).toBe(0);
     expect(harness.evidence.stored).toBeNull();
   });

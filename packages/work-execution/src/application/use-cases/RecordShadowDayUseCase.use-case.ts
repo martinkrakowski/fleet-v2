@@ -248,12 +248,20 @@ function readPlainDataSnapshot(input: unknown): Record<string, unknown> | null {
   }
   // Enumerating every own key before the cap below is the documented JS
   // residual #4v; the refusal happens before any value is read.
-  const names = Object.keys(input);
+  // OD7a2 fix round: `Reflect.ownKeys` (not `Object.keys`) so that
+  // non-enumerable own keys and symbol keys are also seen — a
+  // non-enumerable `constructor` or `__proto__` must be refused, and any
+  // own key outside the allowed set (non-string, symbol, or one of
+  // `SHADOW_GRANT_PROTOTYPE_KEYS`) is refused outright.
+  const names = Reflect.ownKeys(input);
   if (names.length > SHADOW_GRANT_MAX_RECORD_KEYS) {
     return null;
   }
   const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   for (const name of names) {
+    if (typeof name !== 'string') {
+      return null;
+    }
     if (SHADOW_GRANT_PROTOTYPE_KEYS.has(name)) {
       return null;
     }
@@ -1027,13 +1035,17 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // ONCE, here, by `snapshotEvent`; every later loop and filter below uses
     // the snapshot array only and may dereference `kind`/`recordedAtIso`
     // directly, never the original (which a Proxy could make disagree).
-    // A malformed event is dropped, never thrown on.
+    // OD7a2 fix round: a malformed event FAILS CLOSED. Dropping it silently
+    // would let S12 evaluate a shortened list (800 good ticks plus one null
+    // could pass), so any event whose snapshot is null stops the run as
+    // `s12-unknown` before anything is written.
     const validatedEvents: DaemonEventSnapshot[] = [];
     for (const event of read.value.events) {
       const snapshot = snapshotEvent(event);
-      if (snapshot !== null) {
-        validatedEvents.push(snapshot);
+      if (snapshot === null) {
+        return { stop: { outcome: 'unknown', reason: 's12-unknown' } };
       }
+      validatedEvents.push(snapshot);
     }
     const dayStartMs = serialOfUtcDay(context.day) * DAY_MS;
     let earliestInDayMs: number | null = null;

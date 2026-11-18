@@ -357,6 +357,26 @@ describe('release grants through the CLI (RR1)', () => {
     expect(refused.stderr.join('')).not.toContain('does-not-exist');
   });
 
+  it('refuses --release-root pointing at an existing regular file with a usage error (exit 2)', async () => {
+    const stateDir = tempDir('rr1-regular-file-state-');
+    const fileRoot = join(tempDir('rr1-regular-file-dir-'), 'release-root.txt');
+    writeFileSync(fileRoot, 'not a directory\n');
+    const { ownerPublicKey } = ownerKeys();
+    const runtime = createFleetCliRuntime({ stateDir, ownerPublicKey });
+    const refused = await runArgs(runtime, [
+      'coordination', 'request-decision',
+      '--kind', 'action-decision',
+      '--action-scope', 'release:install',
+      '--project-id', PROJECT,
+      '--expected-head-sha', SHA,
+      '--proposal-digest', PROPOSAL_DIGEST,
+      '--policy-revision', POLICY_REVISION,
+      '--release-root', fileRoot,
+    ]);
+    expect(refused.code).toBe(2);
+    expect(refused.stderr.join('')).toContain('--release-root must resolve to an existing directory');
+  });
+
   it("refuses a hand-typed --request-id that does not match the digest (exit 2)", async () => {
     const stateDir = tempDir('rr1-hand-typed-state-');
     const rootDir = realRootOf(tempDir('rr1-hand-typed-root-'));

@@ -1,7 +1,7 @@
 /** The `coordination` command group of the CLI driver; its entries moved verbatim from the command table. */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
+import { realpath, stat } from 'node:fs/promises';
 
 import {
   COORDINATION_KINDS,
@@ -248,8 +248,8 @@ function shadowImportRequestDecision(
 /**
  * A release grant's request-decision entry (RR1). The request id is the digest
  * of the grant's exact coordinates ({ scope, projectId, expectedHeadSha,
- * releaseRoot }), so the CLI derives it from `--release-root` and the other
- * flags instead of taking it from the operator's hand: a hand-typed
+ * releaseRoot, nonce }), so the CLI derives it from `--release-root` and the
+ * other flags — plus a fresh per-request nonce — instead of taking it from the operator's hand: a hand-typed
  * `--request-id` that does not match the derived one is refused, never
  * silently recorded under a digest it does not carry. `--release-root` is
  * required, must be a bounded absolute path without `..`, and is normalized
@@ -276,6 +276,12 @@ async function releaseRequestDecision(
   try {
     normalizedRoot = await realpath(releaseRoot);
   } catch {
+    throw new CliUsageError('request-decision: --release-root must resolve to an existing directory');
+  }
+  // The root is the directory a release installs from or swaps: an existing
+  // regular file (or any other non-directory) is a usage error, refused before
+  // it can be bound into a grant. The message never echoes the path.
+  if (!(await stat(normalizedRoot)).isDirectory()) {
     throw new CliUsageError('request-decision: --release-root must resolve to an existing directory');
   }
   const expectedHeadSha = strOrNull(p, 'expectedHeadSha');

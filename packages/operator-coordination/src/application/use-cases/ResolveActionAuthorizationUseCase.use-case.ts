@@ -18,6 +18,7 @@ import {
   GRANT_RECORD_VERSION,
   isReleaseActionScope,
   readReleaseRoot,
+  readReleaseNonce,
   releaseRootsAgree,
   isShadowImportActionScope,
   releaseGrantDigestPayload,
@@ -262,6 +263,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         projectId: refreshed.projectId,
         expectedHeadSha: refreshed.expectedHeadSha ?? '',
         releaseRoot: recordedRoot.value,
+        nonce: readReleaseNonce(refreshed),
       });
       const expectedRequestId = payloadResult.ok
         ? `${RELEASE_GRANT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`

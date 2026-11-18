@@ -29,7 +29,7 @@ import {
 import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
 import { readPlainObjectLoose, readPlainObjectWithOptional } from '../../domain/record-input.js';
 import { CoordinationKind } from '../../domain/value-objects/CoordinationKind.vo.js';
-import { readReleaseRoot } from '../../domain/coordination-records.js';
+import { readReleaseNonce, readReleaseRoot } from '../../domain/coordination-records.js';
 import type {
   RevokeOwnerGrantRequest,
   RevokeOwnerGrantResult,
@@ -303,6 +303,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         projectId: request.projectId.trim(),
         expectedHeadSha: request.expectedHeadSha.trim(),
         releaseRoot: releaseRootValue,
+        nonce: readReleaseNonce(request),
       });
       if (!payloadResult.ok) {
         return { outcome: 'rejected', reason: payloadResult.code };
@@ -344,6 +345,9 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         ? { grantRecordVersion: GRANT_RECORD_VERSION, grantAttemptId: request.attemptId.trim() }
         : {}),
       ...(releaseRoot.state === 'valid' ? { releaseRoot: releaseRoot.value } : {}),
+      ...(isReleaseScope && readReleaseNonce(request) !== undefined
+        ? { releaseNonce: readReleaseNonce(request) }
+        : {}),
       ...(shadowImportGrant !== undefined ? { shadowImportGrant } : {}),
     }).toRecord();
     // The proposal is durable before any decider is asked. A duplicate that

@@ -1,6 +1,6 @@
 /** The `coordination` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 
 import {
@@ -279,11 +279,15 @@ async function releaseRequestDecision(
     throw new CliUsageError('request-decision: --release-root must resolve to an existing directory');
   }
   const expectedHeadSha = strOrNull(p, 'expectedHeadSha');
+  // A fresh per-request nonce (16 random bytes as hex), so the same
+  // coordinates can be requested again after a use, a rollback or a denial.
+  const nonce = randomBytes(16).toString('hex');
   const payload = releaseGrantDigestPayload({
     actionScope,
     projectId: str(p, 'projectId'),
     expectedHeadSha,
     releaseRoot: normalizedRoot,
+    nonce,
   });
   if (!payload.ok) {
     throw new CliUsageError('request-decision: invalid release grant coordinates');
@@ -308,5 +312,6 @@ async function releaseRequestDecision(
     ...(optStr(p, 'attemptId') !== undefined ? { attemptId: str(p, 'attemptId') } : {}),
     nowIso: optStr(p, 'nowIso'),
     releaseRoot: normalizedRoot,
+    releaseNonce: nonce,
   });
 }

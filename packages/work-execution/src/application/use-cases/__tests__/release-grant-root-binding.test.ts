@@ -34,12 +34,13 @@ const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
 
 // RR1: a release grant's request id carries the digest of its coordinates
-// ({ scope, projectId, expectedHeadSha, releaseRoot }), so a recorded grant
+// ({ scope, projectId, expectedHeadSha, releaseRoot, nonce }), so a recorded grant
 // must be saved under that id and the resolve/consume use cases must be given
 // the same digest function the request id was derived with.
 const digest = (payload: string): string => createHash('sha256').update(payload).digest('hex');
-const releaseGrantId = (scope: string, projectId: string, sha: string, root: string): string =>
-  `${RELEASE_GRANT_DIGEST_PREFIX}${digest(JSON.stringify({ scope, projectId, expectedHeadSha: sha, releaseRoot: root }))}`;
+const NONCE = '0123456789abcdef0123456789abcdef';
+const releaseGrantId = (scope: string, projectId: string, sha: string, root: string, nonce: string = NONCE): string =>
+  `${RELEASE_GRANT_DIGEST_PREFIX}${digest(JSON.stringify({ scope, projectId, expectedHeadSha: sha, releaseRoot: root, nonce }))}`;
 
 let dirs: string[] = [];
 
@@ -95,6 +96,7 @@ function grantFor(root: string): CoordinationRequestRecord {
     createdAtIso: NOW,
     updatedAtIso: NOW,
     releaseRoot: root,
+    releaseNonce: NONCE,
   } as CoordinationRequestRecord;
 }
 

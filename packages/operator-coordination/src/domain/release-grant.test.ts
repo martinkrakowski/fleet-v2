@@ -11,9 +11,10 @@ const SCOPE = 'release:install';
 const PROJECT = 'proj-1';
 const HEAD = '1111111111111111111111111111111111111111';
 const ROOT = '/srv/fleet/releases';
+const NONCE = '0123456789abcdef0123456789abcdef';
 
 function validGrant(): Record<string, unknown> {
-  return { actionScope: SCOPE, projectId: PROJECT, expectedHeadSha: HEAD, releaseRoot: ROOT };
+  return { actionScope: SCOPE, projectId: PROJECT, expectedHeadSha: HEAD, releaseRoot: ROOT, nonce: NONCE };
 }
 
 describe('parseReleaseGrantCoordinates (RR1 hostile inputs)', () => {
@@ -78,7 +79,7 @@ describe('parseReleaseGrantCoordinates (RR1 hostile inputs)', () => {
   it('refuses a getter on the root without ever running it', () => {
     let calls = 0;
     const raw: Record<string, unknown> = {};
-    for (const key of ['projectId', 'expectedHeadSha', 'releaseRoot']) {
+    for (const key of ['projectId', 'expectedHeadSha', 'releaseRoot', 'nonce']) {
       Object.defineProperty(raw, key, {
         get() {
           calls += 1;
@@ -144,7 +145,7 @@ describe('parseReleaseGrantCoordinates (RR1 hostile inputs)', () => {
   for (const key of ['__proto__', 'constructor', 'prototype']) {
     it(`refuses an own ${key} key from JSON.parse as a forbidden key`, () => {
       const hostile = JSON.parse(
-        `{"actionScope":"${SCOPE}","projectId":"${PROJECT}","expectedHeadSha":"${HEAD}","releaseRoot":"${ROOT}","${key}":{"polluted":true}}`,
+        `{"actionScope":"${SCOPE}","projectId":"${PROJECT}","expectedHeadSha":"${HEAD}","releaseRoot":"${ROOT}","nonce":"${NONCE}","${key}":{"polluted":true}}`,
       ) as Record<string, unknown>;
       expect(parseReleaseGrantCoordinates(hostile)).toEqual({
         ok: false,
@@ -239,7 +240,7 @@ describe('parseReleaseGrantCoordinates (RR1 hostile inputs)', () => {
     const parsed = parseReleaseGrantCoordinates(validGrant());
     expect(parsed).toEqual({
       ok: true,
-      value: { actionScope: SCOPE, projectId: PROJECT, expectedHeadSha: HEAD, releaseRoot: ROOT },
+      value: { actionScope: SCOPE, projectId: PROJECT, expectedHeadSha: HEAD, releaseRoot: ROOT, nonce: NONCE },
     });
   });
 });
@@ -257,6 +258,7 @@ describe('releaseGrantDigestPayload (RR1)', () => {
           projectId: parsed.value.projectId,
           expectedHeadSha: parsed.value.expectedHeadSha,
           releaseRoot: parsed.value.releaseRoot,
+          nonce: parsed.value.nonce,
         }),
       )
       .digest('hex');
@@ -269,6 +271,7 @@ describe('releaseGrantDigestPayload (RR1)', () => {
       projectId: PROJECT,
       expectedHeadSha: HEAD,
       releaseRoot: ROOT,
+      nonce: NONCE,
     }) });
     expect(`${RELEASE_GRANT_DIGEST_PREFIX}${digestOf(validGrant())}`).toBe(
       `${RELEASE_GRANT_DIGEST_PREFIX}${createHash('sha256').update((result as { value: string }).value).digest('hex')}`,
@@ -300,6 +303,29 @@ describe('releaseGrantDigestPayload (RR1)', () => {
       code: 'release-grant-accessor-forbidden',
     });
     expect(calls).toBe(0);
+  });
+
+  it('refuses a missing or malformed nonce with release-grant-invalid-nonce', () => {
+    const withoutNonce = validGrant();
+    delete withoutNonce.nonce;
+    // A missing nonce is a missing key, refused as an unexpected key set.
+    expect(parseReleaseGrantCoordinates(withoutNonce)).toEqual({
+      ok: false,
+      code: 'release-grant-unexpected-key',
+    });
+    for (const bad of ['', 'short', NONCE.toUpperCase(), `${NONCE}0`, 'g'.repeat(32), 42, null]) {
+      expect(parseReleaseGrantCoordinates({ ...validGrant(), nonce: bad })).toEqual({
+        ok: false,
+        code: 'release-grant-invalid-nonce',
+      });
+    }
+  });
+
+  it('changes with the nonce: identical coordinates with a new nonce carry a new payload', () => {
+    const a = releaseGrantDigestPayload(validGrant());
+    const b = releaseGrantDigestPayload({ ...validGrant(), nonce: 'fedcba9876543210fedcba9876543210' });
+    expect(a.ok && b.ok).toBe(true);
+    expect(a).not.toEqual(b);
   });
 
   it('changes with the coordinates: two different roots carry different payloads', () => {

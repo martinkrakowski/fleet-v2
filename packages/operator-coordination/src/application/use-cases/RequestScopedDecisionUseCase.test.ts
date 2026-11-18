@@ -624,6 +624,8 @@ describe('RequestScopedDecisionUseCase ordinary decisions stay as on main (GR1a1
 describe('RequestScopedDecisionUseCase release grants (RR1)', () => {
   const HEAD = '1111111111111111111111111111111111111111';
   const ROOT = '/srv/fleet/releases';
+  const NONCE = '0123456789abcdef0123456789abcdef';
+  const NONCE_2 = 'fedcba9876543210fedcba9876543210';
 
   function releaseGrantPayload(grant: Record<string, unknown>): string {
     return JSON.stringify({
@@ -631,6 +633,7 @@ describe('RequestScopedDecisionUseCase release grants (RR1)', () => {
       projectId: grant.projectId,
       expectedHeadSha: grant.expectedHeadSha,
       releaseRoot: grant.releaseRoot,
+      nonce: grant.nonce,
     });
   }
 
@@ -644,6 +647,7 @@ describe('RequestScopedDecisionUseCase release grants (RR1)', () => {
       projectId: 'proj-alpha',
       expectedHeadSha: HEAD,
       releaseRoot: ROOT,
+      nonce: NONCE,
       ...overrides,
     };
     return {
@@ -655,6 +659,7 @@ describe('RequestScopedDecisionUseCase release grants (RR1)', () => {
       proposalDigest: 'sha256-proposal',
       policyRevision: 'pol-rev-1',
       releaseRoot: grant.releaseRoot,
+      releaseNonce: grant.nonce,
       nowIso: NOW_ISO,
       ...overrides,
     };
@@ -666,6 +671,7 @@ describe('RequestScopedDecisionUseCase release grants (RR1)', () => {
     expect(result.outcome).toBe('requested');
     if (result.outcome === 'requested') {
       expect(result.request.releaseRoot).toBe(ROOT);
+      expect(result.request.releaseNonce).toBe(NONCE);
       expect(result.request.expectedHeadSha).toBe(HEAD);
     }
   });
@@ -761,8 +767,37 @@ describe('RequestScopedDecisionUseCase release grants (RR1)', () => {
       projectId: 'proj-alpha',
       expectedHeadSha: HEAD,
       releaseRoot: ROOT,
+      nonce: NONCE,
     });
     const otherRoot = await useCaseWith(repo).execute(otherRootRequest);
     expect(otherRoot).toEqual({ outcome: 'rejected', reason: 'release-grant-request-digest-mismatch' });
+  });
+
+  it('accepts a second request for identical coordinates under a new nonce, with a new id', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const first = releaseRequest();
+    const second = releaseRequest({ nonce: NONCE_2, releaseNonce: NONCE_2 });
+    expect(second.requestId).not.toBe(first.requestId);
+    const a = await useCaseWith(repo).execute(first);
+    const b = await useCaseWith(repo).execute(second);
+    expect(a.outcome).toBe('requested');
+    expect(b.outcome).toBe('requested');
+    // The same nonce replays to the same id, which stays refused as already recorded.
+    const replay = await useCaseWith(repo).execute(first);
+    expect(replay.outcome).toBe('rejected');
+  });
+
+  it('rejects a release request with a missing or malformed nonce with release-grant-invalid-nonce', async () => {
+    for (const bad of [undefined, '', 'short', NONCE.toUpperCase(), `${NONCE}0`]) {
+      const repo = new InMemoryCoordinationRequestRepo();
+      const request = releaseRequest();
+      if (bad === undefined) {
+        delete request.releaseNonce;
+      } else {
+        request.releaseNonce = bad;
+      }
+      const result = await useCaseWith(repo).execute(request);
+      expect(result).toEqual({ outcome: 'rejected', reason: 'release-grant-invalid-nonce' });
+    }
   });
 });

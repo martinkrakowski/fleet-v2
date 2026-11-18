@@ -446,6 +446,7 @@ describe('grant attempt binding (CO24e)', () => {
     // seeded release record here carries a root and a digest-bound id, and
     // the resolver/consumer are wired with the same digest.
     const RELEASE_ROOT = '/srv/fleet/releases';
+    const RELEASE_NONCE = '0123456789abcdef0123456789abcdef';
 
     const digest = (payload: string) => createHash('sha256').update(payload).digest('hex');
 
@@ -456,6 +457,7 @@ describe('grant attempt binding (CO24e)', () => {
           projectId: grant.projectId ?? 'project-1',
           expectedHeadSha: grant.expectedHeadSha ?? HEAD,
           releaseRoot: grant.releaseRoot ?? RELEASE_ROOT,
+          nonce: RELEASE_NONCE,
         }),
       )}`;
 
@@ -468,7 +470,7 @@ describe('grant attempt binding (CO24e)', () => {
         grant.actionScope as string,
       );
       return ownerGrant({
-        ...(isExactReleaseScope ? { id: releaseGrantId(grant), releaseRoot: RELEASE_ROOT } : {}),
+        ...(isExactReleaseScope ? { id: releaseGrantId(grant), releaseRoot: RELEASE_ROOT, releaseNonce: RELEASE_NONCE } : {}),
         actionScope: grant.actionScope,
         ...overrides,
       });

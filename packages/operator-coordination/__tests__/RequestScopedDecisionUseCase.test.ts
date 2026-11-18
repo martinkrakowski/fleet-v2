@@ -114,7 +114,7 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
     const root = '/srv/fleet/releases';
     const requestId = `release-grant-${createHash('sha256')
       .update(
-        JSON.stringify({ scope: 'release:install', projectId: 'proj-1', expectedHeadSha: head, releaseRoot: root }),
+        JSON.stringify({ scope: 'release:install', projectId: 'proj-1', expectedHeadSha: head, releaseRoot: root, nonce: '0123456789abcdef0123456789abcdef' }),
       )
       .digest('hex')}`;
     const useCase = new RequestScopedDecisionUseCase({
@@ -137,6 +137,7 @@ describe('RequestScopedDecisionUseCase (Appendix A)', () => {
       proposalDigest: 'digest-root',
       policyRevision: 'pol-1',
       releaseRoot: root,
+      releaseNonce: '0123456789abcdef0123456789abcdef',
     });
     expect(requested.outcome).toBe('requested');
     const recorded = await repo.findRequestById(requestId);

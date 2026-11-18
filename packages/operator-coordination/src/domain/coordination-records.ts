@@ -256,7 +256,29 @@ export const RELEASE_GRANT_DIGEST_PREFIX = 'release-grant-' as const;
  * and at most `MAX_RELEASE_ROOT_LENGTH` characters of release root.
  */
 export const MAX_RELEASE_ROOT_LENGTH = 4096 as const;
-export const MAX_RELEASE_GRANT_KEYS = 4 as const;
+export const MAX_RELEASE_GRANT_KEYS = 5 as const;
+
+/** A release grant's per-request nonce: exactly 32 lowercase hex characters (16 random bytes). */
+export function isReleaseNonce(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
+}
+
+/**
+ * Reads `releaseNonce` from a record through its own property descriptor. A
+ * missing, accessor or malformed value is `undefined`, so a release record
+ * without a valid nonce fails closed at the digest recompute.
+ */
+export function readReleaseNonce(record: object): string | undefined {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(record, 'releaseNonce');
+    if (descriptor === undefined || !('value' in descriptor)) {
+      return undefined;
+    }
+    return isReleaseNonce(descriptor.value) ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Every typed way a release grant coordinate read can fail closed. */
 export type ReleaseGrantErrorCode =
@@ -268,6 +290,7 @@ export type ReleaseGrantErrorCode =
   | 'release-grant-invalid-project'
   | 'release-grant-invalid-head'
   | 'release-grant-invalid-root'
+  | 'release-grant-invalid-nonce'
   | 'release-grant-invalid-input';
 
 /** The outcome of one release grant coordinate read: the coordinates, or a named refusal code. */
@@ -279,11 +302,12 @@ export type ReleaseGrantCheck =
         readonly projectId: string;
         readonly expectedHeadSha: string;
         readonly releaseRoot: string;
+        readonly nonce: string;
       };
     }
   | { readonly ok: false; readonly code: ReleaseGrantErrorCode };
 
-const RELEASE_GRANT_KEYS = ['actionScope', 'projectId', 'expectedHeadSha', 'releaseRoot'] as const;
+const RELEASE_GRANT_KEYS = ['actionScope', 'projectId', 'expectedHeadSha', 'releaseRoot', 'nonce'] as const;
 const RELEASE_GRANT_FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
 
 /**
@@ -398,7 +422,7 @@ function isBoundedTextField(value: unknown): value is string {
  * never runs, a Proxy with a `get` trap is never invoked by it), arrays are
  * refused before any indexing (so a sparse array of length 2**32 - 1 is
  * refused in O(1)), the key set is exactly
- * `['actionScope', 'projectId', 'expectedHeadSha', 'releaseRoot']`, and the
+ * `['actionScope', 'projectId', 'expectedHeadSha', 'releaseRoot', 'nonce']`, and the
  * fields are bounded: the action scope is one of `RELEASE_ACTION_SCOPES`, the
  * project id and expected head are non-empty trimmed strings of at most 256
  * characters with no control character, and the release root passes
@@ -424,7 +448,7 @@ export function parseReleaseGrantCoordinates(raw: unknown): ReleaseGrantCheck {
   ) {
     return { ok: false, code: 'release-grant-unexpected-key' };
   }
-  const { actionScope, projectId, expectedHeadSha, releaseRoot } = snapshot.values;
+  const { actionScope, projectId, expectedHeadSha, releaseRoot, nonce } = snapshot.values;
   if (typeof actionScope !== 'string' || !isReleaseActionScope(actionScope)) {
     return { ok: false, code: 'release-grant-invalid-scope' };
   }
@@ -437,6 +461,9 @@ export function parseReleaseGrantCoordinates(raw: unknown): ReleaseGrantCheck {
   if (!isReleaseRootCoordinate(releaseRoot)) {
     return { ok: false, code: 'release-grant-invalid-root' };
   }
+  if (!isReleaseNonce(nonce)) {
+    return { ok: false, code: 'release-grant-invalid-nonce' };
+  }
   return {
     ok: true,
     value: Object.freeze({
@@ -444,6 +471,7 @@ export function parseReleaseGrantCoordinates(raw: unknown): ReleaseGrantCheck {
       projectId,
       expectedHeadSha,
       releaseRoot,
+      nonce,
     }),
   };
 }
@@ -472,6 +500,7 @@ export function releaseGrantDigestPayload(
       projectId: parsed.value.projectId,
       expectedHeadSha: parsed.value.expectedHeadSha,
       releaseRoot: parsed.value.releaseRoot,
+      nonce: parsed.value.nonce,
     }),
   };
 }
@@ -884,6 +913,13 @@ export interface CoordinationRequestRecord {
    * refused, so a grant for one root never authorizes another.
    */
   readonly releaseRoot?: string;
+  /**
+   * The per-request nonce of a release grant (RR1 fix round): 32 lowercase hex
+   * characters, digested into the request id so the same coordinates can be
+   * requested again after a use, a rollback or a denial. Required on a release
+   * record; a missing or malformed one fails the digest recompute closed.
+   */
+  readonly releaseNonce?: string;
   /**
    * The standing shadow import grant's coordinates (owner decision
    * 2026-11-18); only a `merge:import-shadow` request carries one, and it is

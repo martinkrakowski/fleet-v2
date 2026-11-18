@@ -321,6 +321,7 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
   const HEAD = '1111111111111111111111111111111111111111';
   const ROOT = '/srv/fleet/releases';
   const GRANT_ID = 'grant-release';
+  const NONCE = '0123456789abcdef0123456789abcdef';
 
   function digest(payload: string): string {
     return createHash('sha256').update(payload).digest('hex');
@@ -331,6 +332,7 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
     projectId: string;
     expectedHeadSha: string;
     releaseRoot: string;
+    nonce: string;
   }): string {
     return `release-grant-${digest(
       JSON.stringify({
@@ -338,6 +340,7 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
         projectId: grant.projectId,
         expectedHeadSha: grant.expectedHeadSha,
         releaseRoot: grant.releaseRoot,
+        nonce: grant.nonce,
       }),
     )}`;
   }
@@ -349,6 +352,7 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
         projectId: 'proj-1',
         expectedHeadSha: HEAD,
         releaseRoot: ROOT,
+        nonce: NONCE,
       }),
       projectId: 'proj-1',
       kind: 'action-decision',
@@ -367,6 +371,7 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
       createdAtIso: '2026-11-02T00:00:00.000Z',
       updatedAtIso: '2026-11-02T00:00:00.000Z',
       releaseRoot: ROOT,
+      releaseNonce: NONCE,
       ...overrides,
     };
   }
@@ -400,6 +405,7 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
         projectId: 'proj-1',
         expectedHeadSha: HEAD,
         releaseRoot: ROOT,
+        nonce: NONCE,
       }),
     );
     expect(stored?.consumptions).toHaveLength(1);
@@ -419,6 +425,28 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
       { releaseRoot: '/srv/fleet/moved' },
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+  });
+
+  it('refuses a record whose nonce was tampered with (the digest recompute no longer matches the id)', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(
+      createReleaseRecord({ releaseNonce: 'fedcba9876543210fedcba9876543210' }),
+    );
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+  });
+
+  it('fails closed on a release record with a missing or malformed nonce', async () => {
+    for (const bad of [undefined, 'short']) {
+      const requestRepo = new InMemoryCoordinationRequestRepo();
+      await requestRepo.saveRequest(createReleaseRecord({ releaseNonce: bad }));
+      const result = await consumeRelease(
+        new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      );
+      expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+    }
   });
 
   it('refuses a pre-RR1 unprefixed release record (unsigned root) even when the root matches', async () => {

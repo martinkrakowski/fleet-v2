@@ -24,6 +24,7 @@ import {
   SHADOW_IMPORT_ACTION_SCOPE,
   isReleaseActionScope,
   readReleaseRoot,
+  readReleaseNonce,
   releaseGrantDigestPayload,
   releaseRootsAgree,
 } from '../../domain/coordination-records.js';
@@ -168,6 +169,7 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
         projectId: recorded.projectId,
         expectedHeadSha: recorded.expectedHeadSha ?? '',
         releaseRoot: recordedRoot.value,
+        nonce: readReleaseNonce(recorded),
       });
       const expectedRequestId = payloadResult.ok
         ? `${RELEASE_GRANT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`

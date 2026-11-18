@@ -3,7 +3,8 @@
  *
  * `coordination request-decision --action-scope release:install --release-root <path>`
  * derives the request id from the grant's exact coordinates ({ scope,
- * projectId, expectedHeadSha, releaseRoot }), requires and normalizes the root
+ * projectId, expectedHeadSha, releaseRoot, nonce }; the nonce is random per
+ * request, so the id is read back from the recorded request), requires and normalizes the root
  * through `realpath` exactly like `release.ts`, and refuses `--release-root`
  * on every non-release scope. `release install --apply` passes the
  * realpath-resolved root to the grant resolution, so a grant bound to one root
@@ -17,7 +18,7 @@
  */
 
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -69,18 +70,17 @@ const PROJECT = 'proj-release';
 const PROPOSAL_DIGEST = 'sha256-proposal';
 const POLICY_REVISION = 'pol-rev-1';
 
-/** The digest-bound request id the release grant's coordinates hash to. */
-function releaseRequestId(grant: {
-  actionScope: string;
-  projectId: string;
-  expectedHeadSha: string;
-  releaseRoot: string;
-}): string {
+/**
+ * The digest-bound id of a recorded release request, recomputed from its
+ * recorded coordinates including the per-request nonce the CLI generated.
+ */
+function recomputedRequestId(request: Record<string, unknown>): string {
   const payload = JSON.stringify({
-    scope: grant.actionScope,
-    projectId: grant.projectId,
-    expectedHeadSha: grant.expectedHeadSha,
-    releaseRoot: grant.releaseRoot,
+    scope: request.actionScope,
+    projectId: request.projectId,
+    expectedHeadSha: request.expectedHeadSha,
+    releaseRoot: request.releaseRoot,
+    nonce: request.releaseNonce,
   });
   return `${RELEASE_GRANT_DIGEST_PREFIX}${createHash('sha256').update(payload).digest('hex')}`;
 }
@@ -140,27 +140,34 @@ function signedDecision(requestId: string, grantId: string, privateKey: ReturnTy
   return sign(null, bytes, privateKey).toString('base64');
 }
 
+function placeDecision(
+  stateDir: string,
+  requestId: string,
+  grantId: string,
+  privateKey: ReturnType<typeof generateKeyPairSync>['privateKey'],
+): void {
+  mkdirSync(join(stateDir, 'decisions'), { recursive: true });
+  writeFileSync(
+    join(stateDir, 'decisions', `${requestId}.json`),
+    JSON.stringify({
+      state: 'approved',
+      decisionRevision: 'dec-1',
+      grantId,
+      signature: signedDecision(requestId, grantId, privateKey),
+    }),
+  );
+}
+
 describe('release grants through the CLI (RR1)', () => {
   it('records a digest-bound release grant and reaches the AUTHORIZED outcome for its root', async () => {
     const stateDir = tempDir('rr1-round-state-');
     const rootDir = realRootOf(tempDir('rr1-round-root-'));
     const { ownerPublicKey, privateKey } = ownerKeys();
     const runtime = runtimeServingRoot(rootDir, stateDir, ownerPublicKey);
-    const requestId = releaseRequestId({
-      actionScope: 'release:install',
-      projectId: PROJECT,
-      expectedHeadSha: SHA,
-      releaseRoot: rootDir,
-    });
     const grantId = 'grant-rr1-round';
-    // The owner's signed approval is in place before the decision is asked,
-    // so `request-decision` records the request and binds the answer's grant
-    // in one call, exactly as an owner's pre-recorded answer would.
-    mkdirSync(join(stateDir, 'decisions'), { recursive: true });
-    writeFileSync(
-      join(stateDir, 'decisions', `${requestId}.json`),
-      JSON.stringify({ state: 'approved', decisionRevision: 'dec-1', grantId, signature: signedDecision(requestId, grantId, privateKey) }),
-    );
+    // The request is recorded first (the nonce, hence the id, is the CLI's
+    // own); the owner's signed approval over that id is then placed and read
+    // back when the grant resolves.
     const recorded = await runArgs(runtime, [
       'coordination', 'request-decision',
       '--kind', 'action-decision',
@@ -175,10 +182,11 @@ describe('release grants through the CLI (RR1)', () => {
     expect(recorded.code).toBe(0);
     const doc = parseDocument(recorded.stdout);
     const request = doc.request as Record<string, unknown>;
-    expect(request.id).toBe(requestId);
-    expect(request.state).toBe('approved');
-    expect(request.grantId).toBe(grantId);
+    const requestId = request.id as string;
     expect(request.releaseRoot).toBe(rootDir);
+    expect(request.releaseNonce).toMatch(/^[0-9a-f]{32}$/);
+    expect(requestId).toBe(recomputedRequestId(request));
+    placeDecision(stateDir, requestId, grantId, privateKey);
 
     // The same authorization port `ManageReleaseUseCase` resolves through:
     // the matching root reaches AUTHORIZED, and the consumption of that
@@ -216,22 +224,6 @@ describe('release grants through the CLI (RR1)', () => {
     const { ownerPublicKey, privateKey } = ownerKeys();
     const runtime = runtimeServingRoot(configuredRoot, stateDir, ownerPublicKey);
     // The grant is recorded for ANOTHER existing root.
-    const requestId = releaseRequestId({
-      actionScope: 'release:install',
-      projectId: PROJECT,
-      expectedHeadSha: SHA,
-      releaseRoot: otherRoot,
-    });
-    mkdirSync(join(stateDir, 'decisions'), { recursive: true });
-    writeFileSync(
-      join(stateDir, 'decisions', `${requestId}.json`),
-      JSON.stringify({
-        state: 'approved',
-        decisionRevision: 'dec-1',
-        grantId: 'grant-rr1-mismatch',
-        signature: signedDecision(requestId, 'grant-rr1-mismatch', privateKey),
-      }),
-    );
     const recorded = await runArgs(runtime, [
       'coordination', 'request-decision',
       '--kind', 'action-decision',
@@ -243,6 +235,8 @@ describe('release grants through the CLI (RR1)', () => {
       '--release-root', otherRoot,
     ]);
     expect(recorded.code).toBe(0);
+    const requestId = (parseDocument(recorded.stdout).request as Record<string, unknown>).id as string;
+    placeDecision(stateDir, requestId, 'grant-rr1-mismatch', privateKey);
     // The install names the configured root: the grant for the other root
     // never authorizes it.
     const install = await runArgs(runtime, [
@@ -257,6 +251,50 @@ describe('release grants through the CLI (RR1)', () => {
     expect(parseDocument(install.stdout)).toEqual({
       outcome: 'refused',
       reason: 'release-grant-root-mismatch',
+    });
+  });
+
+  it('authorizes a release install through the REAL handler when --root is a symlink to the configured root', async () => {
+    const stateDir = tempDir('rr1-symlink-state-');
+    const rootDir = realRootOf(tempDir('rr1-symlink-root-'));
+    const linkBase = realRootOf(tempDir('rr1-symlink-link-'));
+    const link = join(linkBase, 'root-link');
+    symlinkSync(rootDir, link);
+    const { ownerPublicKey, privateKey } = ownerKeys();
+    const runtime = runtimeServingRoot(rootDir, stateDir, ownerPublicKey);
+    // The grant is requested by the symlink: the CLI normalizes it through
+    // realpath, so the recorded root is the configured one.
+    const recorded = await runArgs(runtime, [
+      'coordination', 'request-decision',
+      '--kind', 'action-decision',
+      '--action-scope', 'release:install',
+      '--project-id', PROJECT,
+      '--expected-head-sha', SHA,
+      '--proposal-digest', PROPOSAL_DIGEST,
+      '--policy-revision', POLICY_REVISION,
+      '--release-root', link,
+    ]);
+    expect(recorded.code).toBe(0);
+    const request = parseDocument(recorded.stdout).request as Record<string, unknown>;
+    expect(request.releaseRoot).toBe(rootDir);
+    placeDecision(stateDir, request.id as string, 'grant-rr1-symlink', privateKey);
+    // The install itself is driven by the symlink too. The real handler
+    // resolves the symlink to the configured root, finds the grant recorded
+    // for that root and consumes it. The stand-in source is not a repository,
+    // so the build then fails: `build-failed-grant-spent` is the AUTHORIZED
+    // outcome (the grant was granted and spent before the build ran), never
+    // `release-grant-root-mismatch` or `authority-refused`.
+    const install = await runArgs(runtime, [
+      'release', 'install', '--apply',
+      '--root', link,
+      '--sha', SHA,
+      '--source', rootDir,
+      '--project', PROJECT,
+    ]);
+    expect(install.stderr.join('')).toBe('');
+    expect(parseDocument(install.stdout)).toEqual({
+      outcome: 'refused',
+      reason: 'build-failed-grant-spent',
     });
   });
 

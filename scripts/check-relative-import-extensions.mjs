@@ -4,11 +4,19 @@
 // it after the build. Vitest resolves extensionless imports, unit tests
 // miss this class of breakage; the built CLI does not.
 //
+// Which workspaces are checked is an EXPLICIT workspace list, never inferred
+// from tsconfig files: the workspaces are enumerated read-only from the root
+// package.json `workspaces` globs, then classified as CHECKED or EXCLUDED.
+// CHECKED: every `packages/*` workspace, plus `apps/cli`, `apps/api` and
+// `apps/mcp` (the last is tsc-emitted like the CLI, not bundler-built).
+// EXCLUDED: only bundler-built apps, each named with a one-line reason.
+// Any enumerated workspace in neither list is an error, never a silent skip.
+//
 // Usage:
 //   node scripts/check-relative-import-extensions.mjs [--root <dir>]
 //   node scripts/check-relative-import-extensions.mjs -h | --help
 //
-// Exit codes: 0 clean, 1 at least one extensionless relative import found,
+// Exit codes: 0 clean, 1 at least one finding (or an unclassified workspace),
 // 2 usage error or unreadable file/directory.
 //
 // Only node:fs and node:path are used; no shell, no child process.
@@ -24,16 +32,30 @@ const TEST_SUFFIX = /(\.test\.|\.spec\.)[^/]*$/;
 // Static imports, re-exports and dynamic imports with a relative specifier.
 // `from '<spec>'` covers `import ... from`, `import type ... from` and
 // `export ... from`; `import( '<spec>'` and `import '<spec>'` cover dynamic
-// and bare-form imports. Block comments between `(` and the specifier
-// (`import(/* webpackChunkName: "lazy" */ './lazy')`) are allowed through.
-// Specifiers are single-line by syntax.
+// and bare-form imports. Matching runs on comment-stripped source (see
+// stripComments), so comments before or between the keywords and the
+// specifier cannot hide one. Specifiers are single-line by syntax.
 const FROM_SPECIFIER =
-  /(?:\bfrom\s+|\bimport\s*\(\s*(?:\/\*[^*]*\*+(?:[^/*][^*]*\*+)*\/\s*)*|\bimport\s+)(["'])((?:\.\.?)\/[^"']+)\1/g;
+  /(?:\bfrom\s+|\bimport\s*\(\s*|\bimport\s+)(["'])((?:\.\.?)\/[^"']+)\1/g;
+// Bundler-built workspaces, excluded with a reason each. This list is the
+// only way out of the check; a workspace absent from both lists is an error.
+const EXCLUDED = new Map([
+  ["apps/web", "bundler-built Next.js app, never resolved by plain Node ESM"],
+  [
+    "packages/ui",
+    "noEmit component library consumed only through the bundler-built apps/web",
+  ],
+]);
+// Workspaces always checked, besides every `packages/*` workspace.
+const CHECKED_APPS = new Set(["apps/cli", "apps/api", "apps/mcp"]);
 const HELP = `Usage: node ${NAME}.mjs [--root <dir>]
-Checks every packages/*/src and apps/*/src TypeScript source for relative
-imports missing an explicit file extension (plain Node ESM resolution).
+Checks every CHECKED workspace's TypeScript source for relative imports
+missing an explicit file extension (plain Node ESM resolution). CHECKED is
+the explicit list in the script (every packages/* workspace plus the
+tsc-emitted apps); only bundler-built apps are excluded by name.
 
-Exit codes: 0 clean, 1 findings, 2 usage or unreadable input.`;
+Exit codes: 0 clean, 1 findings or unclassified workspace, 2 usage or
+unreadable input.`;
 
 function usageError(message) {
   console.error(`${NAME}: ${message}`);
@@ -62,9 +84,10 @@ function parseArgs(argv) {
   return root;
 }
 
-// Walk the tree depth-first; unreadable entries are usage errors (exit 2),
+// Walk the tree depth-first; unreadable entries are errors (exit 2),
 // never silent skips.
-function collectSources(dir, root, out) {  let entries;
+function collectSources(dir, root, out) {
+  let entries;
   try {
     entries = readdirSync(dir);
   } catch {
@@ -93,6 +116,75 @@ function collectSources(dir, root, out) {  let entries;
   }
 }
 
+// Strip block and line comments from source while preserving every
+// character position (comments become spaces, newlines are kept), so
+// match indexes still map to the original line numbers. Strings are
+// tracked so a quote inside a comment or a comment marker inside a
+// string does not derail the scan.
+//
+// Known limitation, accepted deliberately: this is a string-aware single
+// pass, not a parser. Comment markers (`//`, `/*`) that appear inside a
+// string or template literal are handled (the string state consumes them),
+// but a quote inside a comment is consumed as part of the comment, and a
+// regular-expression literal containing a quote or a comment marker can
+// still confuse the strip. Real source files that trip this would need a
+// real parser; the check prefers loud over silent either way.
+function stripComments(text) {
+  let out = "";
+  let i = 0;
+  const n = text.length;
+  // 0 code, 1 line comment, 2 block comment, 3 'string, 4 "string, 5 template
+  let state = 0;
+  while (i < n) {
+    const c = text[i];
+    const d = i + 1 < n ? text[i + 1] : "";
+    if (state === 0) {
+      if (c === "/" && d === "/") {
+        state = 1;
+        out += "  ";
+        i += 2;
+      } else if (c === "/" && d === "*") {
+        state = 2;
+        out += "  ";
+        i += 2;
+      } else {
+        if (c === "'" || c === '"' || c === "`") state = c === "'" ? 3 : c === '"' ? 4 : 5;
+        out += c;
+        i++;
+      }
+    } else if (state === 1) {
+      if (c === "\n") {
+        state = 0;
+        out += c;
+      } else {
+        out += " ";
+      }
+      i++;
+    } else if (state === 2) {
+      if (c === "*" && d === "/") {
+        state = 0;
+        out += "  ";
+        i += 2;
+      } else {
+        out += c === "\n" ? "\n" : " ";
+        i++;
+      }
+    } else {
+      // Inside a string: escapes skip the next character verbatim.
+      if (c === "\\") {
+        out += c + d;
+        i += 2;
+        continue;
+      }
+      const close = state === 3 ? "'" : state === 4 ? '"' : "`";
+      if (c === close) state = 0;
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
 // One pass per source file: every static `import ... from`, `export ... from`
 // and `import(...)` whose specifier starts with `./` or `../` and carries no
 // resolvable suffix is a finding. Linear in the file length.
@@ -104,6 +196,7 @@ function scanFile(file, root, findings) {
     console.error(`${NAME}: cannot read file ${path.relative(root, file)}`);
     process.exit(2);
   }
+  text = stripComments(text);
   const rel = path.relative(root, file);
   const lines = text.split("\n");
   const hits = [];
@@ -127,42 +220,58 @@ function scanFile(file, root, findings) {
   }
 }
 
-// Resolve whether a workspace's TypeScript is emitted (its tsconfig carries
-// an outDir), following relative `extends` links. `extends` targets are
-// resolved as relative paths only (package-specifier extends cannot be
-// resolved with node:fs alone and end the chain). A config that exists but
-// cannot be read or parsed is refused loudly (exit 2), never a silent skip;
-// a missing link simply ends the chain, and a chain with no outDir anywhere
-// means the workspace emits nothing under plain Node (out of scope).
-function resolveOutDir(configPath, root) {
-  let current = configPath;
-  const visited = new Set();
-  for (let depth = 0; depth < 32; depth++) {
-    if (visited.has(current)) {
-      console.error(`${NAME}: extends cycle at ${path.relative(root, current)}`);
-      process.exit(2);
-    }
-    visited.add(current);
-    let text;
-    try {
-      text = readFileSync(current, "utf8");
-    } catch (error) {
-      if (error && error.code === "ENOENT") return undefined;
-      console.error(`${NAME}: cannot read tsconfig ${path.relative(root, current)}`);
-      process.exit(2);
-    }
-    if (/"outDir"\s*:/.test(text)) return true;
-    const extendsMatch = /"extends"\s*:\s*"([^"]+)"/.exec(text);
-    if (!extendsMatch) return undefined;
-    const target = extendsMatch[1];
-    if (!target.startsWith(".")) return undefined;
-    let next = path.resolve(path.dirname(current), target);
-    if (path.extname(next) === "") next += ".json";
-    if (path.extname(next) !== ".json") return undefined;
-    current = next;
+// Enumerate the workspaces named by the root package.json `workspaces`
+// globs, read-only. Only `<dir>/*` globs are supported; anything else is
+// refused loudly rather than guessed at.
+function enumerateWorkspaces(root) {
+  let text;
+  try {
+    text = readFileSync(path.join(root, "package.json"), "utf8");
+  } catch {
+    console.error(`${NAME}: cannot read ${path.join("package.json")} under --root ${root}`);
+    process.exit(2);
   }
-  console.error(`${NAME}: extends chain too deep at ${path.relative(root, configPath)}`);
-  process.exit(2);
+  let manifest;
+  try {
+    manifest = JSON.parse(text);
+  } catch {
+    console.error(`${NAME}: cannot parse package.json under --root ${root}`);
+    process.exit(2);
+  }
+  const globs = manifest?.workspaces;
+  if (!Array.isArray(globs)) {
+    console.error(`${NAME}: package.json has no workspaces array under --root ${root}`);
+    process.exit(2);
+  }
+  const workspaces = [];
+  for (const glob of globs) {
+    if (typeof glob !== "string") continue;
+    const star = glob.indexOf("/*");
+    if (star === -1 || star !== glob.length - 2) {
+      console.error(`${NAME}: unsupported workspaces glob ${glob} (only <dir>/* is supported)`);
+      process.exit(2);
+    }
+    const base = path.join(root, glob.slice(0, star));
+    let entries;
+    try {
+      entries = readdirSync(base);
+    } catch (error) {
+      if (error && error.code === "ENOENT") continue; // glob matches nothing
+      console.error(`${NAME}: cannot read workspaces directory ${path.relative(root, base)}`);
+      process.exit(2);
+    }
+    for (const entry of entries.sort()) {
+      try {
+        if (statSync(path.join(base, entry)).isDirectory()) {
+          workspaces.push(`${glob.slice(0, star)}/${entry}`);
+        }
+      } catch {
+        console.error(`${NAME}: cannot read ${path.relative(root, path.join(base, entry))}`);
+        process.exit(2);
+      }
+    }
+  }
+  return workspaces;
 }
 
 function main() {
@@ -177,30 +286,32 @@ function main() {
     usageError(`--root ${root} is not a directory`);
   }
 
+  const workspaces = enumerateWorkspaces(root);
+  const checked = [];
+  for (const workspace of workspaces) {
+    if (EXCLUDED.has(workspace)) continue;
+    if (workspace.startsWith("packages/") || CHECKED_APPS.has(workspace)) {
+      checked.push(workspace);
+      continue;
+    }
+    // Neither checked nor excluded: fail loudly, name the workspace.
+    console.error(
+      `${NAME}: unclassified workspace ${workspace}: add it to CHECKED or EXCLUDED with a reason`
+    );
+    process.exit(1);
+  }
+
   const files = [];
-  for (const top of ["packages", "apps"]) {
-    const topDir = path.join(root, top);
-    let tops;
+  for (const workspace of checked) {
+    const src = path.join(root, workspace, "src");
     try {
-      tops = statSync(topDir).isDirectory() ? readdirSync(topDir) : [];
+      if (!statSync(src).isDirectory()) continue;
     } catch {
-      tops = [];
+      continue; // no src directory in this workspace
     }
-    for (const pkg of tops.sort()) {
-      const src = path.join(topDir, pkg, "src");
-      try {
-        if (!statSync(src).isDirectory()) continue;
-      } catch {
-        continue; // no src directory in this workspace
-      }
-      // Only workspaces whose TypeScript is EMITTED (tsconfig outDir, found
-      // locally or inherited through the relative `extends` chain) run their
-      // built files under plain Node ESM; trees that are never emitted
-      // (Next.js app, bundled server, component library) resolve through a
-      // bundler and are out of scope for this check.
-      const emitted = resolveOutDir(path.join(topDir, pkg, "tsconfig.json"), root);
-      if (emitted) collectSources(src, root, files);
-    }
+    // A listed workspace is checked regardless of its tsconfig: emission is
+    // decided by the explicit list above, never inferred from tsconfig.
+    collectSources(src, root, files);
   }
 
   const findings = [];

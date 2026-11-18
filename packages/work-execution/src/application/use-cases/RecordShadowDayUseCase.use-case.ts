@@ -789,18 +789,46 @@ function serialOfUtcDay(day: string): number {
 }
 
 /**
- * OD7a2: the scheduled flag read at the boundary. A throwing accessor or an
- * unreadable Proxy stand-in is `'invalid'` (fail closed), and only `undefined`
- * (manual mode) or a real boolean is accepted. The read itself is guarded, so
- * a hostile `scheduled` getter can never throw out of the use case.
+ * OD7a2 fix round: the request is SNAPSHOT ONCE at entry. Each field is read
+ * exactly once through its own data-property descriptor
+ * (`Object.getOwnPropertyDescriptor` never runs a getter and, on a plain
+ * record, never a Proxy `get` trap), an accessor property is refused, and a
+ * non-plain prototype (or a non-object, or a throwing Proxy descriptor trap)
+ * is refused. `resolveDay` and every later use receive the snapshot — never
+ * the raw request — so a `scheduled` getter that flips between reads cannot
+ * pass validation and then skip the scheduled guards. Cost is O(1): a fixed
+ * five-field list, one prototype check, five own-descriptor reads.
+ */
+function snapshotRequest(request: unknown): RecordShadowDayRequest | null {
+  try {
+    if (!isPlainRecordObject(request)) {
+      return null;
+    }
+    const snapshot: Record<string, unknown> = {};
+    for (const key of ['repository', 'legacyStateDir', 'day', 'deadlineIso', 'scheduled']) {
+      const descriptor = Object.getOwnPropertyDescriptor(request, key);
+      if (descriptor === undefined) {
+        continue;
+      }
+      if (descriptor.get !== undefined || descriptor.set !== undefined) {
+        return null;
+      }
+      snapshot[key] = descriptor.value;
+    }
+    return snapshot as unknown as RecordShadowDayRequest;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * OD7a2: the scheduled flag read at the boundary, from the entry snapshot (a
+ * plain record of data properties, so this read is stable across repeats).
+ * A hostile value is `'invalid'` (fail closed), and only `undefined`
+ * (manual mode) or a real boolean is accepted.
  */
 function readScheduledFlag(request: RecordShadowDayRequest): boolean | 'invalid' {
-  let value: unknown;
-  try {
-    value = request.scheduled;
-  } catch {
-    return 'invalid';
-  }
+  const value = ownDataProperty(request as unknown as object, 'scheduled');
   if (value === undefined) {
     return false;
   }
@@ -821,7 +849,13 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     }
   }
 
-  private async run(request: RecordShadowDayRequest): Promise<RecordShadowDayResult> {
+  private async run(rawRequest: RecordShadowDayRequest): Promise<RecordShadowDayResult> {
+    // OD7a2 fix round: the request is read once, at entry, into a plain
+    // snapshot; the raw request is never touched again.
+    const request = snapshotRequest(rawRequest);
+    if (request === null) {
+      return refusedResult('invalid-request');
+    }
     const resolved = this.resolveDay(request);
     if (!resolved.ok) {
       return refusedResult(resolved.reason);

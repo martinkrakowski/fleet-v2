@@ -4508,6 +4508,28 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
     expect(harness.evidence.calls.cas).toBe(0);
   });
 
+  it('refuses a scheduled getter that flips from true to false between reads, writing nothing', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY));
+    let reads = 0;
+    const request = {
+      repository: REPOSITORY,
+      legacyStateDir: LEGACY_STATE_DIR,
+      day: DAY,
+      get scheduled(): boolean {
+        reads += 1;
+        return reads === 1;
+      },
+    } as unknown as RecordShadowDayRequest;
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    // OD7a2 fix round: the request is snapshotted once at entry and an
+    // accessor is refused, so the flip-flop getter never runs twice and can
+    // never pass validation and then skip the scheduled guards.
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(reads).toBe(0);
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
   it('accepts a Proxy over a valid scheduled request and records normally', async () => {
     const harness = scheduledHarness(cleanFixture(DAY));
     const proxied = new Proxy(makeRequest({ scheduled: true }), {});

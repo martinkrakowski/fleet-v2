@@ -15,11 +15,15 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import {
   DAEMON_SERVICE_UNIT_KEY,
   DAEMON_TIMER_UNIT_KEY,
+  SHADOW_INTAKE_SERVICE_UNIT_KEY,
+  SHADOW_INTAKE_TIMER_UNIT_KEY,
 } from '../../application/ports/out/DaemonSchedulerPort.out-port.js';
 import { SystemdUserSchedulerAdapter } from './SystemdUserSchedulerAdapter.adapter.js';
 
 const SERVICE_TEXT = '[Service]\nType=oneshot\n';
 const TIMER_TEXT = '[Timer]\nOnBootSec=60s\n';
+const SHADOW_SERVICE_TEXT = '[Service]\nType=oneshot\nExecStart=x\n';
+const SHADOW_TIMER_TEXT = '[Timer]\nOnBootSec=120s\n';
 
 const createdDirs: string[] = [];
 
@@ -73,6 +77,7 @@ describe('SystemdUserSchedulerAdapter', () => {
     await expect(adapter.remove()).resolves.toEqual({
       service: 'absent',
       timer: 'absent',
+      shadowIntake: { service: 'absent', timer: 'absent' },
     });
     expect(existsSync(path.join(dir, DAEMON_SERVICE_UNIT_KEY))).toBe(false);
     expect(existsSync(path.join(dir, DAEMON_TIMER_UNIT_KEY))).toBe(false);
@@ -85,6 +90,7 @@ describe('SystemdUserSchedulerAdapter', () => {
     await expect(adapter.remove()).resolves.toEqual({
       service: 'absent',
       timer: 'absent',
+      shadowIntake: { service: 'absent', timer: 'absent' },
     });
   });
 
@@ -103,6 +109,7 @@ describe('SystemdUserSchedulerAdapter', () => {
     await expect(adapter.remove()).resolves.toEqual({
       service: 'unreadable',
       timer: 'absent',
+      shadowIntake: { service: 'absent', timer: 'absent' },
     });
     expect(readFileSync(outside, 'utf8')).toBe('outside-content');
   });
@@ -175,7 +182,118 @@ describe('SystemdUserSchedulerAdapter', () => {
     await expect(adapter.remove()).resolves.toEqual({
       service: 'unreadable',
       timer: 'unreadable',
+      shadowIntake: { service: 'unreadable', timer: 'unreadable' },
     });
     expect(existsSync(missing)).toBe(false);
+  });
+
+  it('shadow intake units (OD7a1) write, read back and remove with the daemon units', async () => {
+    const dir = makeTempDir();
+    const adapter = new SystemdUserSchedulerAdapter({ unitDir: dir });
+    const shadowIntake = {
+      service: SHADOW_SERVICE_TEXT,
+      timer: SHADOW_TIMER_TEXT,
+    };
+    await expect(
+      adapter.write({ service: SERVICE_TEXT, timer: TIMER_TEXT, shadowIntake }),
+    ).resolves.toEqual({
+      service: 'written',
+      timer: 'written',
+      shadowIntake: { service: 'written', timer: 'written' },
+    });
+    expect(
+      readFileSync(path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY), 'utf8'),
+    ).toBe(SHADOW_SERVICE_TEXT);
+    expect(
+      readFileSync(path.join(dir, SHADOW_INTAKE_TIMER_UNIT_KEY), 'utf8'),
+    ).toBe(SHADOW_TIMER_TEXT);
+    await expect(
+      adapter.read({ service: SERVICE_TEXT, timer: TIMER_TEXT, shadowIntake }),
+    ).resolves.toEqual({
+      service: 'unchanged',
+      timer: 'unchanged',
+      shadowIntake: { service: 'unchanged', timer: 'unchanged' },
+    });
+    await expect(adapter.remove()).resolves.toEqual({
+      service: 'absent',
+      timer: 'absent',
+      shadowIntake: { service: 'absent', timer: 'absent' },
+    });
+    expect(existsSync(path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY))).toBe(false);
+    expect(existsSync(path.join(dir, SHADOW_INTAKE_TIMER_UNIT_KEY))).toBe(false);
+  });
+
+  it('read and write without shadowIntake never touch the intake units', async () => {
+    const dir = makeTempDir();
+    const adapter = new SystemdUserSchedulerAdapter({ unitDir: dir });
+    writeFileSync(
+      path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY),
+      SHADOW_SERVICE_TEXT,
+      'utf8',
+    );
+    await expect(
+      adapter.write({ service: SERVICE_TEXT, timer: TIMER_TEXT }),
+    ).resolves.toEqual({ service: 'written', timer: 'written' });
+    expect(readFileSync(path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY), 'utf8')).toBe(
+      SHADOW_SERVICE_TEXT,
+    );
+    await expect(
+      adapter.read({ service: SERVICE_TEXT, timer: TIMER_TEXT }),
+    ).resolves.toEqual({ service: 'unchanged', timer: 'unchanged' });
+  });
+
+  it('a symlink at a shadow intake unit is unreadable and never followed (OD7a1)', async () => {
+    const dir = makeTempDir();
+    const outside = path.join(dir, 'outside');
+    writeFileSync(outside, 'outside-content', 'utf8');
+    symlinkSync(outside, path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY));
+    const adapter = new SystemdUserSchedulerAdapter({ unitDir: dir });
+    const shadowIntake = {
+      service: SHADOW_SERVICE_TEXT,
+      timer: SHADOW_TIMER_TEXT,
+    };
+    await expect(
+      adapter.write({ service: SERVICE_TEXT, timer: TIMER_TEXT, shadowIntake }),
+    ).resolves.toEqual({
+      service: 'written',
+      timer: 'written',
+      shadowIntake: { service: 'unreadable', timer: 'written' },
+    });
+    await expect(
+      adapter.read({ service: SERVICE_TEXT, timer: TIMER_TEXT, shadowIntake }),
+    ).resolves.toEqual({
+      service: 'unchanged',
+      timer: 'unchanged',
+      shadowIntake: { service: 'unreadable', timer: 'unchanged' },
+    });
+    await expect(adapter.remove()).resolves.toEqual({
+      service: 'absent',
+      timer: 'absent',
+      shadowIntake: { service: 'unreadable', timer: 'absent' },
+    });
+    expect(readFileSync(outside, 'utf8')).toBe('outside-content');
+  });
+
+  it('remove clears the intake units even though remove takes no shadowIntake input (OD7a1)', async () => {
+    const dir = makeTempDir();
+    writeFileSync(
+      path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY),
+      SHADOW_SERVICE_TEXT,
+      'utf8',
+    );
+    writeFileSync(
+      path.join(dir, SHADOW_INTAKE_TIMER_UNIT_KEY),
+      SHADOW_TIMER_TEXT,
+      'utf8',
+    );
+    const adapter = new SystemdUserSchedulerAdapter({ unitDir: dir });
+    // No daemon units exist at all: still exactly one remove call.
+    await expect(adapter.remove()).resolves.toEqual({
+      service: 'absent',
+      timer: 'absent',
+      shadowIntake: { service: 'absent', timer: 'absent' },
+    });
+    expect(existsSync(path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY))).toBe(false);
+    expect(existsSync(path.join(dir, SHADOW_INTAKE_TIMER_UNIT_KEY))).toBe(false);
   });
 });

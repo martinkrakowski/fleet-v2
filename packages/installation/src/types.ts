@@ -717,6 +717,17 @@ export type DecisionsSectionV2 =
   | JevDecisionsSection
   | AnswerFileDecisionsSection;
 
+/**
+ * The optional v2 `daemon.shadow` section (OD7a1): the shadow intake's legacy
+ * state directory plus the non-secret grant handle. `legacyStateDir` is
+ * required; `grantId` is a non-secret handle validated as secret-screened and
+ * is read at run time by `merge import --scheduled`, never baked into a unit.
+ */
+export interface DaemonShadowSection {
+  readonly legacyStateDir: string;
+  readonly grantId?: string;
+}
+
 /** The optional v2 `daemon` section: paths for the user-scope scheduler units. */
 export interface DaemonSection {
   readonly nodePath: string;
@@ -724,6 +735,7 @@ export interface DaemonSection {
   readonly stateDir: string;
   readonly unitDir: string;
   readonly installationFile: string;
+  readonly shadow?: DaemonShadowSection;
 }
 
 /** The v2 file shape (plan section 1). */

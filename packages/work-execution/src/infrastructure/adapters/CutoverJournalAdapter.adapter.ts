@@ -65,6 +65,12 @@ const CUTOVER_KEY = new RegExp(`^cutover/${SEGMENT}@${SEGMENT}$`);
 const STEP = '[a-z][a-z0-9-]{0,31}';
 // `relaunch/<planDigest>/<lane>/<step>`, and `.../adopt/<step>` for the four keyed AdoptLane steps (CO28).
 const RELAUNCH_KEY = new RegExp(`^relaunch/[0-9a-f]{7,64}/${SEGMENT}/${STEP}(/${STEP})?$`);
+/**
+ * GR1b: `shadow-import/<owner>/<repo>/<runEntryId>` keys in the separate
+ * shadow-intake journal. Segments are bounded like the CLI repository
+ * segments and the entry id is a canonical ULID.
+ */
+export const SHADOW_IMPORT_KEY = /^shadow-import\/[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}\/[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 const ENTRY_ID = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 const REASON_CODE = /^[a-z][a-z0-9-]{0,63}$/;
 const HEX_DIGEST = /^[0-9a-f]{40,64}$/;
@@ -78,7 +84,7 @@ const MAX_JOURNAL_ENTRIES = 10_000;
 const MAX_JOURNAL_BYTES = 16 * 1024 * 1024;
 
 export function isCutoverJournalKey(key: unknown): key is string {
-  return typeof key === 'string' && (CUTOVER_KEY.test(key) || RELAUNCH_KEY.test(key));
+  return typeof key === 'string' && (CUTOVER_KEY.test(key) || RELAUNCH_KEY.test(key) || SHADOW_IMPORT_KEY.test(key));
 }
 
 export type CutoverJournalEntryRead =

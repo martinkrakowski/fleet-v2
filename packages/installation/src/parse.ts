@@ -26,6 +26,7 @@ import type {
   CoverageReaderName,
   CoverageUnitKind,
   DaemonSection,
+  DaemonShadowSection,
   DecisionConsumers,
   DecisionsSectionV2,
   FallbackSeat,
@@ -93,6 +94,7 @@ import {
   CONDUCTOR_REAPER_REPAIR_KINDS,
   CONDUCTOR_REAPER_WORKTREE_KEYS,
   DAEMON_KEYS,
+  DAEMON_SHADOW_KEYS,
   DECISION_CONSUMERS_KEYS,
   FORBIDDEN_ROUTE_KEYS,
   FORGE_KEYS,
@@ -3607,7 +3609,70 @@ function parseV2Daemon(
   ) {
     return undefined;
   }
-  return { nodePath, cliPath, stateDir, unitDir, installationFile };
+  const shadow = parseV2DaemonShadow(section, errors);
+  if (shadow === undefined) {
+    // An absent `shadow` returns undefined only with no error pushed; a
+    // malformed one already pushed its message.
+    return errors.length === 0
+      ? { nodePath, cliPath, stateDir, unitDir, installationFile }
+      : undefined;
+  }
+  return { nodePath, cliPath, stateDir, unitDir, installationFile, shadow };
+}
+
+/**
+ * The optional `daemon.shadow` block (OD7a1): a plain object with only
+ * `legacyStateDir` (required absolute path, same rules as the daemon paths)
+ * and `grantId` (optional non-secret handle: non-empty, trimmed, no
+ * whitespace or unit/shell metacharacter, no credential shape). Unknown keys
+ * are refused; messages name only the field, never a value. Cost is linear in
+ * the capped section size (the daemon section's own key cap).
+ */
+function parseV2DaemonShadow(
+  section: JsonObject,
+  errors: string[],
+): DaemonShadowSection | undefined {
+  if (!Object.hasOwn(section, 'shadow')) {
+    return undefined;
+  }
+  const raw = readOwnDataProperty(section, 'shadow');
+  if (!isJsonObject(raw)) {
+    errors.push('daemon.shadow: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(raw, DAEMON_SHADOW_KEYS, 'daemon.shadow', errors);
+  const legacyStateDir = readRequiredDaemonPath(
+    raw,
+    'legacyStateDir',
+    'daemon.shadow.legacyStateDir',
+    errors,
+  );
+  let grantId: string | undefined;
+  if (Object.hasOwn(raw, 'grantId')) {
+    const value = readOwnDataProperty(raw, 'grantId');
+    if (typeof value !== 'string') {
+      errors.push('daemon.shadow.grantId: must be a non-empty id');
+    } else {
+      const trimmed = value.trim();
+      if (
+        trimmed === '' ||
+        /[\s\\%"'`$&|<>^{}*?#[\]!;,()]/.test(trimmed)
+      ) {
+        errors.push('daemon.shadow.grantId: must be a non-empty id');
+      } else if (
+        containsSecretShape(trimmed) ||
+        DAEMON_CREDENTIAL_PATTERN.test(trimmed)
+      ) {
+        errors.push('daemon.shadow.grantId: refused');
+      } else {
+        grantId = trimmed;
+      }
+    }
+  }
+  if (legacyStateDir === undefined) {
+    return undefined;
+  }
+  return grantId !== undefined ? { legacyStateDir, grantId } : { legacyStateDir };
 }
 
 function parseV2Verification(

@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import type { CutoverJournalEntry } from '../../../application/ports/out/CutoverJournalPort.out-port.js';
-import { CutoverJournalAdapter, prepareCutoverJournalAppend, readCutoverJournalEntry } from '../CutoverJournalAdapter.adapter.js';
+import { CutoverJournalAdapter, isCutoverJournalKey, prepareCutoverJournalAppend, readCutoverJournalEntry, SHADOW_IMPORT_KEY } from '../CutoverJournalAdapter.adapter.js';
 
 const KEY = 'relaunch/abcdef0123456789/lane-1/save';
 const NOW = '2026-11-06T10:00:00Z';
@@ -341,5 +341,86 @@ describe('CutoverJournalAdapter', () => {
     expect(prepareCutoverJournalAppend([flaky()], intent(KEY))).toEqual({ ok: false, reason: 'duplicate-intent' });
     const alwaysThrows = { get key(): string { throw new Error('boom'); }, kind: 'intent', entryId: 'x' } as unknown as CutoverJournalEntry;
     expect(prepareCutoverJournalAppend([alwaysThrows], intent(KEY))).toEqual({ ok: false, reason: 'invalid-entry' });
+  });
+});
+
+describe('isCutoverJournalKey and SHADOW_IMPORT_KEY (GR1b)', () => {
+  const validShadowKey = (entryId = ulid()): string => `shadow-import/fleet/v2/${entryId}`;
+  // A hostile accessor key: isCutoverJournalKey reads only the string value.
+  const getterString = (): unknown => {
+    let calls = 0;
+    return {
+      toString(): string {
+        calls += 1;
+        return validShadowKey();
+      },
+      valueOf(): string {
+        calls += 1;
+        return validShadowKey();
+      },
+      get callCount(): number {
+        return calls;
+      },
+    };
+  };
+
+  it('accepts the cutover, relaunch and shadow-import key shapes', () => {
+    expect(isCutoverJournalKey('cutover/move-1@rev.2')).toBe(true);
+    expect(isCutoverJournalKey('relaunch/abcdef0123456789/lane-1/save')).toBe(true);
+    expect(isCutoverJournalKey(validShadowKey())).toBe(true);
+    expect(SHADOW_IMPORT_KEY.test(validShadowKey())).toBe(true);
+  });
+
+  it('refuses hostile and near-miss shadow keys', () => {
+    for (const key of [
+      null,
+      undefined,
+      42,
+      {},
+      [],
+      '',
+      'shadow-import/fleet/v2',
+      'shadow-import/fleet/v2/',
+      'shadow-import//v2/01ARZ3NDEKTSV4RRFFAT69F9QQ',
+      'shadow-import/fleet//01ARZ3NDEKTSV4RRFFAT69F9QQ',
+      'shadow-import/fleet/v2/01ARZ3NDEKTSV4RRFFAT69F9', // 24 chars, one short
+      `shadow-import/fleet/v2/${ulid()}0`, // 26 chars, one long
+      'shadow-import/fleet/v2/01ARZ3NDEKTSV4RRFFAT69F9I', // I is not a Crockford digit
+      'shadow-import/fleet/v2/01arz3ndektsv4rrffat69f9qq', // lowercase is not a ULID
+      `shadow-import/fleet/v2/../${ulid()}`,
+      `shadow-import/fleet a/v2/${ulid()}`,
+      `shadow-import/${'f'.repeat(101)}/v2/${ulid()}`,
+      `shadow-import/fleet/v2/${ulid()}/extra`,
+      `other/fleet/v2/${ulid()}`,
+    ]) {
+      expect(isCutoverJournalKey(key)).toBe(false);
+      expect(SHADOW_IMPORT_KEY.test(key as string)).toBe(false);
+    }
+  });
+
+  it('refuses a non-string without ever coercing it', () => {
+    const hostile = getterString();
+    expect(isCutoverJournalKey(hostile)).toBe(false);
+    expect((hostile as { callCount: number }).callCount).toBe(0);
+  });
+
+  it('a constant true key test would fail: at least one refusal is asserted', () => {
+    expect(isCutoverJournalKey('shadow-import/fleet/v2/not-a-ulid')).toBe(false);
+  });
+
+  it('an identity echo would fail: the predicate answers a boolean, never the input', () => {
+    const key = validShadowKey();
+    const verdict: unknown = isCutoverJournalKey(key);
+    expect(verdict).toBe(true);
+    expect(verdict).not.toBe(key);
+  });
+
+  it('a shadow-intake entry appends and lists under its key prefix', async () => {
+    const journal = new CutoverJournalAdapter();
+    const key = validShadowKey();
+    expect(await refusal(journal, intent(key))).toBe('appended');
+    const listed = await journal.listByKeyPrefix('shadow-import/');
+    expect(listed.outcome).toBe('listed');
+    if (listed.outcome === 'listed') expect(listed.entries.map((entry) => entry.key)).toEqual([key]);
   });
 });

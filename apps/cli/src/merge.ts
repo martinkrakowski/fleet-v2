@@ -17,6 +17,7 @@ import {
 } from './commands/payload.js';
 import type { CommandHandler } from './commands/payload.js';
 import type { InspectMergeReadinessResult } from '@fleet/work-execution';
+import type { ImportTrainStateRefusal } from '@fleet/work-execution';
 import type { FleetCliRuntime } from './composition.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
@@ -99,8 +100,106 @@ function requiredContextsOf(p: Payload, subcommand: string): string[] {
   return contexts;
 }
 
-export const mergeCommands: Readonly<Record<string, CommandHandler>> = {
-  enqueue: async (p, rt) => {
+/** Cap on how many own flags `parseMergeImportFlags` reads; linear cost. */
+const MAX_MERGE_IMPORT_OWN_KEYS = 64;
+/** Cap on one string flag's length before validation; linear cost. */
+const MAX_MERGE_IMPORT_FLAG_LENGTH = 4096;
+
+const PROTOTYPE_POLLUTING_FLAGS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+/** The parsed, validated `merge import` flags (GR1b). */
+export interface MergeImportFlags {
+  readonly repository: { readonly owner: string; readonly repo: string };
+  readonly stateDir: string;
+  readonly apply: boolean;
+  /** From `--grant`; `null` when absent or not a non-empty string. */
+  readonly grantId: string | null;
+  /** From `--project`; `null` when absent or not a non-empty string. */
+  readonly projectId: string | null;
+  /** OD7a1: from `--scheduled`; grant pickup moves to run time. */
+  readonly scheduled: boolean;
+}
+
+/**
+ * Pure, descriptor-safe parse of the `merge import` flags (GR1b). It reads
+ * own enumerable data-property descriptors only — a getter or a Proxy `get`
+ * trap never runs — and its cost is linear in the capped input (see
+ * `MAX_MERGE_IMPORT_OWN_KEYS` / `MAX_MERGE_IMPORT_FLAG_LENGTH`). It throws
+ * `CliUsageError` (CLI exit 2) by design for: a non-plain-object payload, a
+ * getter-carrying or prototype-polluting own key, `--authority` in any form,
+ * a malformed `--repository`, a missing `--legacy-state-dir`, or `--apply`
+ * without both `--grant <id>` and `--project <id>`. `grantId` and
+ * `projectId` are read from the `grant` and `project` payload keys; a grant
+ * id is a non-secret handle and may be printed, never a secret.
+ */
+export function parseMergeImportFlags(raw: unknown): MergeImportFlags {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new CliUsageError('merge import requires --repository owner/repo and --legacy-state-dir <path>');
+  }
+  const names = Object.keys(raw);
+  if (names.length > MAX_MERGE_IMPORT_OWN_KEYS) {
+    throw new CliUsageError('merge import received too many flags');
+  }
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const name of names) {
+    if (PROTOTYPE_POLLUTING_FLAGS.has(name)) {
+      throw new CliUsageError('merge import does not accept that flag');
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(raw, name);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      throw new CliUsageError('merge import does not accept that flag');
+    }
+    if (name === 'authority' && descriptor.value !== undefined) {
+      throw new CliUsageError('merge import does not accept --authority; use --grant and --project');
+    }
+    snapshot[name] = descriptor.value;
+  }
+  const repository = repositoryFromPayload(snapshot as Payload);
+  if (repository === undefined) {
+    throw new CliUsageError('merge import requires --repository owner/repo');
+  }
+  const stateDir = str(snapshot as Payload, 'legacyStateDir').trim();
+  if (stateDir === '' || stateDir.length > MAX_MERGE_IMPORT_FLAG_LENGTH) {
+    throw new CliUsageError('merge import requires --legacy-state-dir');
+  }
+  const apply = snapshot['apply'] === true || snapshot['apply'] === 'true';
+  const scheduled =
+    snapshot['scheduled'] === true || snapshot['scheduled'] === 'true';
+  const readId = (key: string): string | null => {
+    const value = snapshot[key];
+    return typeof value === 'string' && value.trim() !== '' && value.length <= MAX_MERGE_IMPORT_FLAG_LENGTH
+      ? value
+      : null;
+  };
+  const grantId = readId('grant');
+  const projectId = readId('project');
+  if (apply && (projectId === null || (grantId === null && !scheduled))) {
+    throw new CliUsageError('merge import --apply requires --grant <id> and --project <id>');
+  }
+  return { repository, stateDir, apply, grantId, projectId, scheduled };
+}
+
+/**
+ * OD7a1: the grant/authorization refusals a scheduled import skips quietly:
+ * the shadow intake timer runs every few minutes, so a missing, expired,
+ * revoked or not-yet-approved grant is the normal idle state, not an error.
+ * Every other `ImportTrainStateRefusal` reason stays loud and exits 1.
+ */
+const QUIET_SCHEDULED_REFUSALS: ReadonlySet<ImportTrainStateRefusal> = new Set([
+  'grant-missing',
+  'grant-expired',
+  'grant-revoked',
+  'grant-not-approved',
+]);
+
+function skippedResult(reason: string): {
+  readonly outcome: 'skipped';
+  readonly lines: readonly string[];
+} {
+  return { outcome: 'skipped', lines: [`shadow-intake skipped ${reason}`] };
+}
+
+export const mergeCommands: Readonly<Record<string, CommandHandler>> = { enqueue: async (p, rt) => {
     const nowIso = new Date().toISOString();
     const deadlineIso = new Date(Date.now() + 60_000).toISOString();
     const repository = repositoryFromPayload(p);
@@ -169,20 +268,40 @@ export const mergeCommands: Readonly<Record<string, CommandHandler>> = {
     });
   },
   import: async (p, rt) => {
-    const repository = repositoryFromPayload(p);
-    if (repository === undefined) {
-      throw new CliUsageError('merge import requires --repository owner/repo');
+    const flags = parseMergeImportFlags(p);
+    let grantId = flags.grantId;
+    // OD7a1: under `--scheduled` the grant handle comes from the loaded
+    // installation's `daemon.shadow.grantId` at run time, never from the unit
+    // file; an absent handle skips quietly (never a usage error).
+    if (flags.scheduled && grantId === null) {
+      const shadow = rt.installation?.daemon?.shadow;
+      const runtimeGrant =
+        typeof shadow?.grantId === 'string' && shadow.grantId.trim() !== ''
+          ? shadow.grantId
+          : null;
+      // OD7a1 fix round 3: the quiet skip must not depend on `flags.apply`.
+      // Under `--scheduled` the grant is checked first, so a call without
+      // `--apply` also skips instead of calling `importTrainState` without a
+      // grant handle.
+      if (runtimeGrant === null) {
+        return skippedResult('grant-missing');
+      }
+      grantId = runtimeGrant;
     }
-    const stateDir = str(p, 'legacyStateDir').trim();
-    if (stateDir === '') {
-      throw new CliUsageError('merge import requires --legacy-state-dir');
+    const result = await rt.execution.importTrainState.importTrainState({
+      repository: flags.repository,
+      stateDir: flags.stateDir,
+      apply: flags.apply,
+      grantId,
+      projectId: flags.projectId,
+    });
+    if (result.outcome === 'refused' && flags.scheduled) {
+      if (QUIET_SCHEDULED_REFUSALS.has(result.reason)) {
+        return skippedResult(result.reason);
+      }
+      // Loud grant/authorization and non-grant refusals stay refused (exit 1).
     }
-    const apply = p['apply'] === true || p['apply'] === 'true';
-    const authority = optStr(p, 'authority') ?? null;
-    if (apply && authority === null) {
-      throw new CliUsageError('merge import --apply requires --authority');
-    }
-    return rt.execution.importTrainState.importTrainState({ repository, stateDir, apply, authority });
+    return result;
   },
   export: async (p, rt) => {
     for (const key of Object.keys(p)) {

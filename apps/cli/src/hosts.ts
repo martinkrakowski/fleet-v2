@@ -54,6 +54,7 @@ import {
   isValidHostName,
   parseInstallation,
   resolveInstallationFile,
+  resolveMergePolicy,
   screenErrorLine,
   screenHostKey,
   type FleetInstallation,
@@ -1912,6 +1913,43 @@ async function daemonCommand(
     out.stderr("installation.daemon: absent\n");
     return 1;
   }
+  const resolvedPolicy = resolveMergePolicy(state.installation.policy ?? {});
+  if (resolvedPolicy.outcome === "invalid") {
+    out.stderr(`installation.policy: ${resolvedPolicy.reason}\n`);
+    return 1;
+  }
+  // OD7a1: the shadow intake repository comes from the resolved merge policy,
+  // never from CLI flags; `resolveMergePolicy` defaults `shadow` to true, so
+  // an entry omitting the key counts.
+  const shadowEntries = resolvedPolicy.repositories.filter(
+    (entry) => entry.shadow === true,
+  );
+  if (shadowEntries.length > 1) {
+    out.stderr(
+      "installation.policy.merge.repos: at most one shadow repository is supported\n",
+    );
+    return 1;
+  }
+  let shadow: {
+    readonly repository: string;
+    readonly legacyStateDir: string;
+    readonly projectId: string;
+  } | undefined;
+  if (shadowEntries.length === 1) {
+    const legacyStateDir = daemon.shadow?.legacyStateDir;
+    if (legacyStateDir === undefined) {
+      out.stderr(
+        "installation.daemon.shadow: required when shadow is enabled\n",
+      );
+      return 1;
+    }
+    const entry = shadowEntries[0]!;
+    shadow = {
+      repository: entry.repositoryKey,
+      legacyStateDir,
+      projectId: entry.projectId,
+    };
+  }
   const scheduler =
     options.scheduler ??
     new SystemdUserSchedulerAdapter({ unitDir: daemon.unitDir });
@@ -1919,8 +1957,20 @@ async function daemonCommand(
   const result = await useCase.execute({
     action: args.action,
     apply: args.apply,
-    daemon,
+    daemon:
+      shadow === undefined
+        ? { ...daemon, shadow: undefined }
+        : { ...daemon, shadow },
   });
+  if (result.refusal !== undefined) {
+    out.stderr(`installation.daemon.shadow: ${result.refusal}\n`);
+    return 1;
+  }
+  if (result.intakeUnreadable === true) {
+    // Fable fix round 2: the intake pair's codes are not printed when shadow
+    // is off, so an unreadable intake removal is reported here instead.
+    out.stderr("installation.daemon.shadow: shadow-intake-unreadable\n");
+  }
   for (const unit of result.units) {
     out.stdout(`${unit.key} ${unit.code}\n`);
   }
@@ -1929,7 +1979,10 @@ async function daemonCommand(
       out.stdout(`${line}\n`);
     }
   }
-  return result.units.some((unit) => unit.code === "unreadable") ? 1 : 0;
+  return result.units.some((unit) => unit.code === "unreadable") ||
+    result.intakeUnreadable === true
+    ? 1
+    : 0;
 }
 
 /**

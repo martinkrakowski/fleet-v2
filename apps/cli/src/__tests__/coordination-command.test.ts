@@ -6,8 +6,8 @@
  * handle. Nothing here dispatches or touches the network.
  */
 
-import { createHash } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -86,7 +86,7 @@ function derivedRequestId(expiresAtIso: string): string {
 }
 
 describe('coordination request-decision and revoke-grant (GR1a2)', () => {
-  it('records a shadow import grant with its derived request id', async () => {
+  it('derives the request id from the grant coordinates when none is supplied', async () => {
     const stateDir = tempStateDir();
     const runtime = createFleetCliRuntime({ stateDir });
     const expiresAtIso = futureExpiry();
@@ -95,7 +95,6 @@ describe('coordination request-decision and revoke-grant (GR1a2)', () => {
       runtime,
       [
         'request-decision',
-        '--request-id', requestId,
         '--project-id', 'proj-alpha',
         '--kind', 'action-decision',
         '--action-scope', SHADOW_IMPORT_ACTION_SCOPE,
@@ -141,5 +140,95 @@ describe('coordination request-decision and revoke-grant (GR1a2)', () => {
     const doc = parseDocument(refused.stdout);
     expect(doc.outcome).toBe('refused');
     expect(doc.reason).toBe('grant-missing');
+  });
+
+  it('runs the documented head-free resolve-auth command end to end', async () => {
+    const stateDir = tempStateDir();
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const ownerPublicKey = publicKey
+      .export({ format: 'der', type: 'spki' })
+      .subarray(12)
+      .toString('base64');
+    const runtime = createFleetCliRuntime({ stateDir, ownerPublicKey });
+    const expiresAtIso = futureExpiry();
+    const requestId = derivedRequestId(expiresAtIso);
+    const grantId = 'grant-shadow-e2e';
+    const decisionRevision = 'rev-e2e-1';
+    // The owner's signed approval is in place before the decision is asked,
+    // so `request-decision` records the request and binds the answer's grant
+    // in one call, exactly as an owner's pre-recorded answer would.
+    const bytes = Buffer.from(
+      JSON.stringify({
+        requestId,
+        projectId: 'proj-alpha',
+        actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+        expectedHeadSha: null,
+        decisionRevision,
+        grantId,
+        state: 'approved',
+      }),
+      'utf8',
+    );
+    const signature = sign(null, bytes, privateKey).toString('base64');
+    mkdirSync(join(stateDir, 'decisions'), { recursive: true });
+    writeFileSync(
+      join(stateDir, 'decisions', `${requestId}.json`),
+      JSON.stringify({ state: 'approved', decisionRevision, grantId, signature }),
+    );
+    const recorded = await runCoordination(
+      runtime,
+      [
+        'request-decision',
+        '--project-id', 'proj-alpha',
+        '--kind', 'action-decision',
+        '--action-scope', SHADOW_IMPORT_ACTION_SCOPE,
+        '--proposal-digest', 'sha256-proposal',
+        '--policy-revision', 'pol-rev-1',
+        '--repository', 'octo/hello',
+        '--expires-at-iso', expiresAtIso,
+      ],
+      stateDir,
+    );
+    expect(recorded.code).toBe(0);
+    const decided = parseDocument(recorded.stdout);
+    expect((decided.request as Record<string, unknown>).state).toBe('approved');
+    expect((decided.request as Record<string, unknown>).grantId).toBe(grantId);
+
+    // The documented command (cutover runbook): project, scope, grant id and
+    // repository — no `--expected-head-sha` is taken.
+    const resolved = await runCoordination(
+      runtime,
+      [
+        'resolve-auth',
+        '--project-id', 'proj-alpha',
+        '--action-scope', SHADOW_IMPORT_ACTION_SCOPE,
+        '--authorization-grant-id', grantId,
+        '--repository', 'octo/hello',
+      ],
+      stateDir,
+    );
+    expect(resolved.code).toBe(0);
+    const doc = parseDocument(resolved.stdout);
+    expect(doc.outcome).toBe('authorized');
+    expect(doc.grantId).toBe(grantId);
+    expect(doc.requestId).toBe(requestId);
+    expect(doc.expectedHeadSha).toBe('');
+  });
+
+  it('keeps the head requirement for a non-shadow resolve-auth scope', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const refused = await runCoordination(
+      runtime,
+      [
+        'resolve-auth',
+        '--project-id', 'proj-alpha',
+        '--action-scope', 'forge:merge-pr',
+        '--authorization-grant-id', 'grant-1',
+        '--repository', 'octo/hello',
+      ],
+      stateDir,
+    );
+    expect(refused.code).not.toBe(0);
   });
 });

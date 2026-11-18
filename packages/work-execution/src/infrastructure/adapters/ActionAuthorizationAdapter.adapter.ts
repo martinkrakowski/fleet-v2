@@ -195,6 +195,33 @@ function isCleanText(value: unknown, maxLength: number): value is string {
   );
 }
 
+/**
+ * The delegate's shadow import answer is waited for at most this long; past
+ * it the call is a typed `authorization-unavailable`, never a hang.
+ */
+export const SHADOW_IMPORT_DELEGATE_DEADLINE_MS = 15_000 as const;
+
+/**
+ * The deadline guard, the `withBudget` pattern of `ReapLaneWorktreesUseCase`:
+ * the call's own answer, or a rejection once it runs past `deadlineMs`, so a
+ * delegate whose promise never settles cannot hang the adapter. The timer is
+ * always cleared, and the losing promise's later rejection is handled by the
+ * race, so nothing is left dangling.
+ */
+async function withDelegateDeadline<T>(call: () => Promise<T>, deadlineMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      call(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('delegate call exceeded its deadline')), deadlineMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function ownDataDescriptor(
   source: object,
   key: string,
@@ -729,11 +756,30 @@ interface ReadDelegate {
   readonly authorizeShadowImport: ActionAuthorizationDelegate['authorizeShadowImport'];
 }
 
+/** Adapter construction options; every member is optional. */
+export interface ActionAuthorizationAdapterOptions {
+  /**
+   * The shadow import delegate call's deadline in milliseconds. Overrides
+   * `SHADOW_IMPORT_DELEGATE_DEADLINE_MS` only with a positive safe integer;
+   * anything else falls back to the default, never to an unbounded wait.
+   */
+  readonly shadowImportDelegateDeadlineMs?: number;
+}
+
+function shadowImportDelegateDeadlineMs(options: ActionAuthorizationAdapterOptions): number {
+  const value = options.shadowImportDelegateDeadlineMs;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : SHADOW_IMPORT_DELEGATE_DEADLINE_MS;
+}
+
 export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
   private readonly delegate?: ActionAuthorizationDelegate;
+  private readonly options: ActionAuthorizationAdapterOptions;
 
-  constructor(delegate?: ActionAuthorizationDelegate) {
+  constructor(delegate?: ActionAuthorizationDelegate, options?: ActionAuthorizationAdapterOptions) {
     this.delegate = delegate;
+    this.options = { ...options };
   }
 
   /** The delegate's members read once; null when reading them throws. */
@@ -829,8 +875,10 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
   /**
    * The standing shadow import grant's head-free resolve. A malformed or
    * hostile request is blocked; an absent delegate or delegate method, a
-   * throwing delegate or an unreadable answer is unknown — never authority.
-   * The grant id echoed in an authorized answer is a non-secret handle.
+   * throwing delegate, a delegate whose answer never settles (bounded by
+   * `withDelegateDeadline`) or an unreadable answer is unknown — never
+   * authority. The grant id echoed in an authorized answer is a non-secret
+   * handle.
    */
   async authorizeShadowImport(
     request: AuthorizeShadowImportRequest,
@@ -844,8 +892,14 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
       return { outcome: 'blocked', reason: validated.reason };
     }
     let answer: unknown;
+    const authorize = delegate.authorizeShadowImport;
     try {
-      answer = await delegate.authorizeShadowImport(validated.value);
+      // Bounded: a delegate whose promise never settles is an expired
+      // deadline, a typed `authorization-unavailable`, never a hang.
+      answer = await withDelegateDeadline(
+        () => authorize(validated.value),
+        shadowImportDelegateDeadlineMs(this.options),
+      );
     } catch {
       return { outcome: 'unknown', reason: 'authorization-unavailable' };
     }

@@ -64,14 +64,29 @@ export const coordinationCommands: Readonly<Record<string, CommandHandler>> = {
         nowIso: optStr(p, 'nowIso'),
       });
     },
-    'resolve-auth': async (p, rt) =>
-      rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
+    'resolve-auth': async (p, rt) => {
+      const actionScope = str(p, 'actionScope');
+      // The standing shadow import grant resolves head-free (cutover runbook):
+      // it is bound by its digest-bound grant id, its exact repository and its
+      // capped expiry, never by a commit, so no `--expected-head-sha` is taken
+      // or required. Every other scope keeps main's exact head requirement.
+      if (actionScope === SHADOW_IMPORT_ACTION_SCOPE) {
+        return rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
+          projectId: str(p, 'projectId'),
+          actionScope,
+          expectedHeadSha: optStr(p, 'expectedHeadSha') ?? '',
+          authorizationGrantId: optStr(p, 'authorizationGrantId'),
+          ...(optStr(p, 'repository') !== undefined ? { repository: optStr(p, 'repository') } : {}),
+        });
+      }
+      return rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
         projectId: str(p, 'projectId'),
-        actionScope: str(p, 'actionScope'),
+        actionScope,
         expectedHeadSha: str(p, 'expectedHeadSha'),
         authorizationGrantId: optStr(p, 'authorizationGrantId'),
         ...(optStr(p, 'attemptId') !== undefined ? { attemptId: str(p, 'attemptId') } : {}),
-      }),
+      });
+    },
     'consume-auth': async (p, rt) =>
       rt.coordination.recordAuthorizationConsumption.recordAuthorizationConsumption({
         consumptionId: str(p, 'consumptionId'),

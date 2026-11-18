@@ -74,6 +74,17 @@ describe('ActionAuthorizationAdapter.authorizeShadowImport (GR1a2)', () => {
     expect(result).toEqual({ outcome: 'blocked', reason: 'delegate-blocked' });
   });
 
+  it('bounds a delegate that never settles: an expired deadline answers authorization-unavailable', async () => {
+    const adapter = new ActionAuthorizationAdapter(
+      {
+        authorizeShadowImport: () => new Promise<AuthorizeShadowImportResult>(() => {}),
+      },
+      { shadowImportDelegateDeadlineMs: 20 },
+    );
+    const result = await adapter.authorizeShadowImport(shadowRequest());
+    expect(result).toEqual({ outcome: 'unknown', reason: 'authorization-unavailable' });
+  });
+
   it('refuses a null request as invalid-request without throwing', async () => {
     const adapter = new ActionAuthorizationAdapter({
       authorizeShadowImport: async () => ({ outcome: 'authorized', grantId: 'grant-shadow-1' }),

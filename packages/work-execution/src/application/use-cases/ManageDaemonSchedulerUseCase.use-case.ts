@@ -406,15 +406,23 @@ function shadowUnitLines(
     { key: DAEMON_SERVICE_UNIT_KEY, code: map ? map(result.service) : result.service },
     { key: DAEMON_TIMER_UNIT_KEY, code: map ? map(result.timer) : result.timer },
   ];
-  if (includeShadow && result.shadowIntake !== undefined) {
+  if (includeShadow) {
+    // OD7a1 fix round 3: a scheduler that returns only the main pair's codes
+    // (no `shadowIntake` codes) must not let the intake pair be silently
+    // omitted: with shadow requested, any MISSING intake code is reported as
+    // `unreadable` so the CLI exits 1 instead of 0.
+    const intakeService =
+      result.shadowIntake === undefined ? 'unreadable' : result.shadowIntake.service;
+    const intakeTimer =
+      result.shadowIntake === undefined ? 'unreadable' : result.shadowIntake.timer;
     lines.push(
       {
         key: SHADOW_INTAKE_SERVICE_UNIT_KEY,
-        code: map ? map(result.shadowIntake.service) : result.shadowIntake.service,
+        code: map ? map(intakeService) : intakeService,
       },
       {
         key: SHADOW_INTAKE_TIMER_UNIT_KEY,
-        code: map ? map(result.shadowIntake.timer) : result.shadowIntake.timer,
+        code: map ? map(intakeTimer) : intakeTimer,
       },
     );
   }

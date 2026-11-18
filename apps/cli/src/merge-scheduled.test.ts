@@ -112,6 +112,19 @@ describe('merge import --scheduled (OD7a1)', () => {
     expect(calls).toEqual([]);
   });
 
+  it('an absent daemon.shadow.grantId under --scheduled without --apply skips quietly and never calls importTrainState (OD7a1 fix round 3)', async () => {
+    const { runtime, calls } = runtimeWithStub(
+      installationWithShadowGrant(undefined),
+      () => {
+        throw new Error('importTrainState must not be called');
+      },
+    );
+    const result = await runScheduledImport(runtime, ['--scheduled', '--project', 'project-1']);
+    expect(result.code).toBe(0);
+    expect(result.out).toBe('shadow-intake skipped grant-missing\n');
+    expect(calls).toEqual([]);
+  });
+
   it('picks the grant up at run time from daemon.shadow.grantId when --grant is omitted', async () => {
     const { runtime, calls } = runtimeWithStub(
       installationWithShadowGrant('grant-9'),

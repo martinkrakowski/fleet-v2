@@ -566,6 +566,35 @@ describe('ManageDaemonSchedulerUseCase shadow intake (OD7a1)', () => {
     expect(calls).toEqual([]);
   });
 
+  it('install --apply with shadow on reports a MISSING intake code as unreadable when the scheduler omits the intake codes', async () => {
+    // OD7a1 fix round 3: a scheduler returning only `{ service, timer }` with
+    // no intake codes must not let the CLI exit 0 when shadow was requested.
+    const scheduler: DaemonSchedulerPort = {
+      async write(input) {
+        expect(input.shadowIntake).toBeDefined();
+        return { service: 'written', timer: 'written' };
+      },
+      async read() {
+        return { service: 'unchanged', timer: 'unchanged' };
+      },
+      async remove() {
+        return { service: 'absent', timer: 'absent' };
+      },
+    };
+    const useCase = new ManageDaemonSchedulerUseCase({ scheduler });
+    const result = await useCase.execute({
+      action: 'install',
+      apply: true,
+      daemon: SHADOW_FACTS,
+    });
+    expect(result.units).toEqual([
+      { key: DAEMON_SERVICE_UNIT_KEY, code: 'written' },
+      { key: DAEMON_TIMER_UNIT_KEY, code: 'written' },
+      { key: SHADOW_INTAKE_SERVICE_UNIT_KEY, code: 'unreadable' },
+      { key: SHADOW_INTAKE_TIMER_UNIT_KEY, code: 'unreadable' },
+    ]);
+  });
+
   it('uninstall with shadow off prints exactly the 2 main lines on dry-run and --apply', async () => {
     const dryRun = new ManageDaemonSchedulerUseCase({
       scheduler: fakeScheduler({

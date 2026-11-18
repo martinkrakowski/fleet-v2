@@ -279,7 +279,11 @@ export const mergeCommands: Readonly<Record<string, CommandHandler>> = { enqueue
         typeof shadow?.grantId === 'string' && shadow.grantId.trim() !== ''
           ? shadow.grantId
           : null;
-      if (runtimeGrant === null && flags.apply) {
+      // OD7a1 fix round 3: the quiet skip must not depend on `flags.apply`.
+      // Under `--scheduled` the grant is checked first, so a call without
+      // `--apply` also skips instead of calling `importTrainState` without a
+      // grant handle.
+      if (runtimeGrant === null) {
         return skippedResult('grant-missing');
       }
       grantId = runtimeGrant;

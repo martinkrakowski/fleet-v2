@@ -181,13 +181,26 @@ describe('cutover shadow record-day (SH8a)', () => {
 // throw and never a quarantined file.
 describe('cutover shadow record-day wiring (SH19c)', () => {
   /**
+   * Fix round 2: a sentinel meaning "`daemon.cliPath` is deliberately left
+   * unset". The previous default parameter turned an explicitly passed
+   * `undefined` into the default configured path, so the "unconfigured"
+   * integration test actually ran with a configured path whose release root
+   * happened to be missing. Now callers omit `cliPath` to get the default
+   * served release path, and pass the sentinel alone to preserve a truly
+   * unconfigured installation.
+   */
+  const UNCONFIGURED_CLI_PATH = Symbol('daemon.cliPath unconfigured');
+  const DEFAULT_SERVED_CLI_PATH = '/srv/fleet/current/apps/cli/dist/bin.js';
+
+  /**
    * A minimal valid v2 installation: github forge, a daemon section, no env.
    * SH20: `cliPath` defaults to a served release path (`<root>/current/...`)
-   * and may be overridden (a custom path, or `undefined` when unconfigured).
+   * and may be overridden (a custom path, or the `UNCONFIGURED_CLI_PATH`
+   * sentinel when unconfigured).
    */
   function installationFor(
     forge: FleetInstallation['forge'],
-    cliPath: string | undefined = '/srv/fleet/current/apps/cli/dist/bin.js',
+    cliPath: string | typeof UNCONFIGURED_CLI_PATH = DEFAULT_SERVED_CLI_PATH,
   ): FleetInstallation {
     return {
       schemaVersion: 2,
@@ -231,9 +244,10 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
         unitDir: '/srv/fleet/units',
         installationFile: '/srv/fleet/fleet.json',
         // SH20: `cliPath` is the configured entry point under a release root,
-        // a custom path, or unconfigured — the composition's lexical parse
-        // decides which release root (if any) the day binds to.
-        ...(cliPath !== undefined ? { cliPath } : {}),
+        // a custom path, or unset (the `UNCONFIGURED_CLI_PATH` sentinel) —
+        // the composition's lexical parse decides which release root (if
+        // any) the day binds to.
+        ...(cliPath !== UNCONFIGURED_CLI_PATH ? { cliPath } : {}),
       },
       ...(forge !== undefined ? { forge } : {}),
     } as FleetInstallation;
@@ -243,8 +257,9 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     stateDir: string,
     forge: FleetInstallation['forge'] = { mode: 'github', owner: 'fleet', repo: 'v2' },
     // SH20: an optional custom `daemon.cliPath` — a custom served-release
-    // path, a non-served path, or `undefined` when unconfigured.
-    cliPath?: string,
+    // path, a non-served path, or the `UNCONFIGURED_CLI_PATH` sentinel when
+    // unconfigured.
+    cliPath: string | typeof UNCONFIGURED_CLI_PATH = DEFAULT_SERVED_CLI_PATH,
   ): ReturnType<typeof createFleetCliRuntime> {
     return createFleetCliRuntime({
       stateDir,
@@ -828,7 +843,7 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     const { stateDir, fixtureDir } = newDirs();
     await shellFixture(fixtureDir);
     const cliPath =
-      releaseRoot !== null ? path.join(releaseRoot, 'current/apps/cli/dist/bin.js') : undefined;
+      releaseRoot !== null ? path.join(releaseRoot, 'current/apps/cli/dist/bin.js') : UNCONFIGURED_CLI_PATH;
     return {
       stateDir,
       fixtureDir,
@@ -918,7 +933,24 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
 
   it('refuses when daemon.cliPath is unconfigured (undefined)', async () => {
     const { stateDir, fixtureDir, runtime } = await sh20Runtime(null);
+    // Fix round 2: the installation must TRULY leave `daemon.cliPath` unset —
+    // the sentinel (not a swallowed `undefined`) guarantees it.
+    const daemon = installationFor({ mode: 'github', owner: 'fleet', repo: 'v2' }, UNCONFIGURED_CLI_PATH).daemon;
+    expect(daemon !== undefined && 'cliPath' in daemon ? 'set' : 'unset').toBe('unset');
+    // And the release store must never be asked to list anything: no release
+    // root is configured, so no `list` call can be legitimate.
+    const deps = recordDayDeps(runtime);
+    const store = deps.oneTime?.releaseStore;
+    if (store === undefined) throw new Error('oneTime.releaseStore is not wired');
+    let listCalls = 0;
+    const spied = store as { list(input: { readonly root: string }): Promise<unknown> };
+    const original = spied.list.bind(store);
+    spied.list = async (input: { readonly root: string }) => {
+      listCalls += 1;
+      return await original(input);
+    };
     await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot: null });
+    expect(listCalls).toBe(0);
   });
 
   it('refuses when daemon.cliPath is not a served release path', async () => {

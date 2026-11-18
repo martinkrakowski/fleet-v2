@@ -24,8 +24,11 @@ const TEST_SUFFIX = /(\.test\.|\.spec\.)[^/]*$/;
 // Static imports, re-exports and dynamic imports with a relative specifier.
 // `from '<spec>'` covers `import ... from`, `import type ... from` and
 // `export ... from`; `import( '<spec>'` and `import '<spec>'` cover dynamic
-// and bare-form imports. Specifiers are single-line by syntax.
-const FROM_SPECIFIER = /(?:\bfrom\s+|\bimport\s*\(\s*|\bimport\s+)(["'])((?:\.\.?)\/[^"']+)\1/g;
+// and bare-form imports. Block comments between `(` and the specifier
+// (`import(/* webpackChunkName: "lazy" */ './lazy')`) are allowed through.
+// Specifiers are single-line by syntax.
+const FROM_SPECIFIER =
+  /(?:\bfrom\s+|\bimport\s*\(\s*(?:\/\*[^*]*\*+(?:[^/*][^*]*\*+)*\/\s*)*|\bimport\s+)(["'])((?:\.\.?)\/[^"']+)\1/g;
 const HELP = `Usage: node ${NAME}.mjs [--root <dir>]
 Checks every packages/*/src and apps/*/src TypeScript source for relative
 imports missing an explicit file extension (plain Node ESM resolution).
@@ -124,6 +127,44 @@ function scanFile(file, root, findings) {
   }
 }
 
+// Resolve whether a workspace's TypeScript is emitted (its tsconfig carries
+// an outDir), following relative `extends` links. `extends` targets are
+// resolved as relative paths only (package-specifier extends cannot be
+// resolved with node:fs alone and end the chain). A config that exists but
+// cannot be read or parsed is refused loudly (exit 2), never a silent skip;
+// a missing link simply ends the chain, and a chain with no outDir anywhere
+// means the workspace emits nothing under plain Node (out of scope).
+function resolveOutDir(configPath, root) {
+  let current = configPath;
+  const visited = new Set();
+  for (let depth = 0; depth < 32; depth++) {
+    if (visited.has(current)) {
+      console.error(`${NAME}: extends cycle at ${path.relative(root, current)}`);
+      process.exit(2);
+    }
+    visited.add(current);
+    let text;
+    try {
+      text = readFileSync(current, "utf8");
+    } catch (error) {
+      if (error && error.code === "ENOENT") return undefined;
+      console.error(`${NAME}: cannot read tsconfig ${path.relative(root, current)}`);
+      process.exit(2);
+    }
+    if (/"outDir"\s*:/.test(text)) return true;
+    const extendsMatch = /"extends"\s*:\s*"([^"]+)"/.exec(text);
+    if (!extendsMatch) return undefined;
+    const target = extendsMatch[1];
+    if (!target.startsWith(".")) return undefined;
+    let next = path.resolve(path.dirname(current), target);
+    if (path.extname(next) === "") next += ".json";
+    if (path.extname(next) !== ".json") return undefined;
+    current = next;
+  }
+  console.error(`${NAME}: extends chain too deep at ${path.relative(root, configPath)}`);
+  process.exit(2);
+}
+
 function main() {
   const root = parseArgs(process.argv.slice(2));
   let rootStats;
@@ -148,16 +189,17 @@ function main() {
     for (const pkg of tops.sort()) {
       const src = path.join(topDir, pkg, "src");
       try {
-        // Only workspaces whose TypeScript is EMITTED (tsconfig outDir) run
-        // their built files under plain Node ESM; trees that are never
-        // emitted (Next.js app, bundled server, component library) resolve
-        // through a bundler and are out of scope for this check.
-        const tsconfig = path.join(topDir, pkg, "tsconfig.json");
-        const emitted = /"outDir"\s*:/.test(readFileSync(tsconfig, "utf8"));
-        if (emitted && statSync(src).isDirectory()) collectSources(src, root, files);
+        if (!statSync(src).isDirectory()) continue;
       } catch {
-        /* no src directory or no tsconfig in this workspace */
+        continue; // no src directory in this workspace
       }
+      // Only workspaces whose TypeScript is EMITTED (tsconfig outDir, found
+      // locally or inherited through the relative `extends` chain) run their
+      // built files under plain Node ESM; trees that are never emitted
+      // (Next.js app, bundled server, component library) resolve through a
+      // bundler and are out of scope for this check.
+      const emitted = resolveOutDir(path.join(topDir, pkg, "tsconfig.json"), root);
+      if (emitted) collectSources(src, root, files);
     }
   }
 

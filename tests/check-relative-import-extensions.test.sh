@@ -121,15 +121,51 @@ else
   if [ "$rc" -eq 2 ] && [ -n "$err" ]; then ok 'unreadable source file exits 2 naming the path'; else bad "unreadable source file exits 2 (rc=$rc)"; fi
 fi
 
-# 9. A workspace whose tsconfig has no outDir (never emitted) is out of scope.
-R=$T/notemitted
+# 9. A workspace whose outDir is INHERITED through `extends` is emitted, so
+#    an extensionless import there is a finding, not a silent skip.
+R=$T/inherited
+mkdir -p "$R/packages/a/src"
+printf '{\n  "compilerOptions": { "outDir": "dist" }\n}\n' >"$R/tsconfig.base.json"
+printf '{\n  "extends": "../../tsconfig.base.json",\n  "compilerOptions": { "strict": true }\n}\n' >"$R/packages/a/tsconfig.json"
+fixture "$R/packages/a/src/index.ts" <<'EOF'
+import { one } from './one';
+EOF
+run --root "$R"
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q 'packages/a/src/index.ts:1 ./one'; then
+  ok 'outDir inherited through extends is still checked'
+else
+  bad 'outDir inherited through extends is still checked'; printf '%s\n' "$out"; printf '%s\n' "$err"
+fi
+
+# 9b. A package with no outDir at all (nothing emitted under plain Node) is
+#     out of scope; the extends chain simply ends without one.
+R=$T/nooutdir
 mkdir -p "$R/packages/a/src"
 printf '{\n  "compilerOptions": { "strict": true }\n}\n' >"$R/packages/a/tsconfig.json"
 fixture "$R/packages/a/src/index.ts" <<'EOF'
 import { one } from './one';
 EOF
 run --root "$R"
-if [ "$rc" -eq 0 ]; then ok 'never-emitted workspace out of scope'; else bad "never-emitted workspace out of scope (rc=$rc)"; printf '%s\n' "$out"; fi
+if [ "$rc" -eq 0 ]; then ok 'workspace with no outDir at all is out of scope'; else bad "workspace with no outDir at all is out of scope (rc=$rc)"; printf '%s\n' "$out"; fi
+
+# 9c. A tsconfig that exists but cannot be read is refused loudly (exit 2),
+#     never a silent skip.
+R=$T/badtscfg
+mk_tsconfig "$R/packages/a"
+fixture "$R/packages/a/src/index.ts" <<'EOF'
+import { one } from './one.js';
+EOF
+chmod 000 "$R/packages/a/tsconfig.json"
+if [ "$(id -u)" -eq 0 ]; then
+  ok 'unreadable tsconfig skipped: running as root cannot make a file unreadable'
+else
+  run --root "$R"
+  if [ "$rc" -eq 2 ] && printf '%s\n' "$err" | grep -q 'tsconfig'; then
+    ok 'unreadable tsconfig exits 2 naming the path'
+  else
+    bad 'unreadable tsconfig exits 2 naming the path'; printf '%s\n' "$err"
+  fi
+fi
 
 # 10. .tsx, .mts, .cts sources are checked too.
 R=$T/variants
@@ -145,6 +181,20 @@ if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q 'comp.tsx:1 ./tone' && prin
   ok '.tsx and .mts sources are checked'
 else
   bad '.tsx and .mts sources are checked'; printf '%s\n' "$out"
+fi
+
+# 11. A block comment between `(` and the specifier of a dynamic import does
+#     not hide an extensionless relative specifier.
+R=$T/commented
+mk_tsconfig "$R/packages/a"
+fixture "$R/packages/a/src/index.ts" <<'EOF'
+const lazy = import(/* webpackChunkName: "lazy" */ './lazy');
+EOF
+run --root "$R"
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q 'packages/a/src/index.ts:1 ./lazy'; then
+  ok 'dynamic import with leading block comment flagged'
+else
+  bad 'dynamic import with leading block comment flagged'; printf '%s\n' "$out"
 fi
 
 printf '\n'

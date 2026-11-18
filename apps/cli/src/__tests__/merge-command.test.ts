@@ -5,7 +5,6 @@ import * as path from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import { SHADOW_IMPORT_DIGEST_PREFIX, shadowImportDigestPayload } from '@fleet/operator-coordination';
 import { sha256HexDigest } from '@fleet/work-execution';
 

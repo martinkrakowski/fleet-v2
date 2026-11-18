@@ -263,52 +263,93 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
     // read or queue write, so a refused grant leaves the writable queue
     // untouched — a corrupt merge-queue.json is never even read, let alone
     // quarantined.
-    if (request_.apply) {
-      const authorization = this.deps.authorization;
-      if (
-        authorization === undefined ||
-        typeof authorization.authorizeShadowImport !== 'function'
-      ) {
-        return { outcome: 'refused', reason: 'authorization-unavailable' };
-      }
-      let answer: AuthorizeShadowImportResult;
-      try {
-        answer = await authorization.authorizeShadowImport({
-          projectId: request_.projectId ?? '',
-          grantId: request_.grantId ?? '',
-          repository: request_.repository,
-          nowIso: this.deps.nowIso(),
-        });
-      } catch {
-        return { outcome: 'refused', reason: 'authorization-unavailable' };
-      }
-      if (answer.outcome !== 'authorized') {
-        return { outcome: 'refused', reason: refusalFromShadowImportAnswer(answer) };
-      }
+    const authorizationRefusal = await this.verifyShadowImportAuthorization(request_);
+    if (authorizationRefusal !== null) {
+      return { outcome: 'refused', reason: authorizationRefusal };
     }
 
-    const state = await this.deps.legacyState.readLegacyTrainState({ stateDir: request_.stateDir });
-    const parsed = this.parseLegacyState(state);
-    if (!parsed.ok) {
-      return { outcome: 'refused', reason: parsed.refusal };
+    const plan = await this.planCandidates(request_);
+    if (!plan.ok) {
+      return { outcome: 'refused', reason: plan.refusal };
     }
-
-    const deadlineIso = new Date(Date.parse(this.deps.nowIso()) + 60_000).toISOString();
-    const liveEntries = (
-      await this.deps.queue.listMergeEntries({ repository: request_.repository, deadlineIso })
-    ).filter(isMergeQueueEntryLive);
-
-    const classified = this.classifyEntries(parsed.parsedBySource, liveEntries, request_.repository);
-    const report = this.buildReport(parsed, classified);
 
     if (!request_.apply) {
-      return { outcome: 'dry-run', wouldImport: classified.candidates.length, ...report };
+      return { outcome: 'dry-run', wouldImport: plan.classified.candidates.length, ...plan.report };
     }
 
-    if (classified.candidates.length === 0) {
-      return { outcome: 'applied', imported: 0, refused: 0, ...report };
+    if (plan.classified.candidates.length === 0) {
+      return { outcome: 'applied', imported: 0, refused: 0, ...plan.report };
     }
 
+    return this.applyWithShadowJournal(request_, plan);
+  }
+
+  /**
+   * Fix-round split of `importTrainState` (behaviour-free): the grant
+   * verification step. Returns the refusal reason to answer with, or `null`
+   * when the apply run is authorized (a dry run never authorizes).
+   */
+  private async verifyShadowImportAuthorization(
+    request: ImportTrainStateRequest,
+  ): Promise<ImportTrainStateRefusal | null> {
+    if (!request.apply) {
+      return null;
+    }
+    const authorization = this.deps.authorization;
+    if (authorization === undefined || typeof authorization.authorizeShadowImport !== 'function') {
+      return 'authorization-unavailable';
+    }
+    let answer: AuthorizeShadowImportResult;
+    try {
+      answer = await authorization.authorizeShadowImport({
+        projectId: request.projectId ?? '',
+        grantId: request.grantId ?? '',
+        repository: request.repository,
+        nowIso: this.deps.nowIso(),
+      });
+    } catch {
+      return 'authorization-unavailable';
+    }
+    if (answer.outcome !== 'authorized') {
+      return refusalFromShadowImportAnswer(answer);
+    }
+    return null;
+  }
+
+  /** Fix-round split of `importTrainState` (behaviour-free): read, parse, classify and build the report. */
+  private async planCandidates(
+    request: ImportTrainStateRequest,
+  ): Promise<
+    | { readonly ok: false; readonly refusal: ImportTrainStateRefusal }
+    | {
+        readonly ok: true;
+        readonly classified: ClassifiedEntries;
+        readonly report: ImportTrainStateReport;
+        readonly deadlineIso: string;
+      }
+  > {
+    const state = await this.deps.legacyState.readLegacyTrainState({ stateDir: request.stateDir });
+    const parsed = this.parseLegacyState(state);
+    if (!parsed.ok) {
+      return { ok: false, refusal: parsed.refusal };
+    }
+    const deadlineIso = new Date(Date.parse(this.deps.nowIso()) + 60_000).toISOString();
+    const liveEntries = (
+      await this.deps.queue.listMergeEntries({ repository: request.repository, deadlineIso })
+    ).filter(isMergeQueueEntryLive);
+    const classified = this.classifyEntries(parsed.parsedBySource, liveEntries, request.repository);
+    return { ok: true, classified, report: this.buildReport(parsed, classified), deadlineIso };
+  }
+
+  /** Fix-round split of `importTrainState` (behaviour-free): the journal-intent-then-apply step. */
+  private async applyWithShadowJournal(
+    request: ImportTrainStateRequest,
+    plan: {
+      readonly classified: ClassifiedEntries;
+      readonly report: ImportTrainStateReport;
+      readonly deadlineIso: string;
+    },
+  ): Promise<ImportTrainStateResult> {
     // GR1b: the separate shadow-intake journal (never cutover-journal.json).
     // No digest fallback: the adapter refuses a non-hex digest, so a missing
     // journal or digest refuses BEFORE any queue write.
@@ -317,22 +358,21 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
     if (journal === undefined || computeDigest === undefined) {
       return { outcome: 'refused', reason: 'journal-unavailable' };
     }
-    const grantId = request_.grantId ?? '';
-    // GR1b fix round: `computeDigest`, `nowIso` and the intent append sit
-    // before any queue write, so any throw from them is mapped to a typed
-    // refusal instead of escaping untyped: a digest failure means the digest
-    // dependency is unavailable; a clock or journal-store failure refuses the
-    // journal.
+    // GR1b fix round: `computeDigest`, `nowIso`, `mintUlid` and the intent
+    // append sit before any queue write, so any throw from them is mapped to a
+    // typed refusal instead of escaping untyped: a digest failure means the
+    // digest dependency is unavailable; a clock, id or journal-store failure
+    // refuses the journal.
     let grantDigest: string;
     try {
-      grantDigest = computeDigest(grantId);
+      grantDigest = computeDigest(request.grantId ?? '');
     } catch {
       return { outcome: 'refused', reason: 'journal-unavailable' };
     }
-    const runEntryId = this.deps.mintUlid();
-    const key = `shadow-import/${request_.repository.owner}/${request_.repository.repo}/${runEntryId}`;
     let intentAppend: CutoverJournalAppendResult;
     try {
+      const runEntryId = this.deps.mintUlid();
+      const key = `shadow-import/${request.repository.owner}/${request.repository.repo}/${runEntryId}`;
       intentAppend = await journal.append({
         key,
         kind: 'intent',
@@ -346,12 +386,26 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
     if (intentAppend.outcome === 'refused') {
       return { outcome: 'refused', reason: 'journal-refused' };
     }
+    return this.applyAndJournalResult(journal, intentAppend.entry.key, grantDigest, request, plan);
+  }
 
+  /** Fix-round split of `importTrainState` (behaviour-free): apply, then journal the result best-effort. */
+  private async applyAndJournalResult(
+    journal: CutoverJournalPort,
+    key: string,
+    grantDigest: string,
+    request: ImportTrainStateRequest,
+    plan: {
+      readonly classified: ClassifiedEntries;
+      readonly report: ImportTrainStateReport;
+      readonly deadlineIso: string;
+    },
+  ): Promise<ImportTrainStateResult> {
     try {
       const { imported, refused, appliedDuplicates } = await this.applyCandidates(
-        classified.candidates,
-        request_,
-        deadlineIso,
+        plan.classified.candidates,
+        request,
+        plan.deadlineIso,
       );
       // Best-effort result append: a refused or throwing result append never
       // masks the applied answer.
@@ -372,8 +426,8 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
         outcome: 'applied',
         imported,
         refused,
-        ...report,
-        alreadyQueued: classified.alreadyQueued + appliedDuplicates,
+        ...plan.report,
+        alreadyQueued: plan.classified.alreadyQueued + appliedDuplicates,
       };
     } catch (error) {
       // Best-effort ambiguous result append: it never masks the original error.

@@ -99,6 +99,7 @@ function makeUseCase(
     readonly journal?: CutoverJournalPort;
     readonly computeDigest?: (payload: string) => string;
     readonly nowIso?: () => string;
+    readonly mintUlid?: () => string;
   } = {},
 ): ImportTrainStateUseCase {
   // An explicitly absent dependency (key present with `undefined`) means the
@@ -117,6 +118,7 @@ function makeUseCase(
     journal: has('journal') ? overrides.journal : new CutoverJournalAdapter(),
     computeDigest: has('computeDigest') ? overrides.computeDigest : (() => GRANT_DIGEST),
     ...(has('nowIso') ? { nowIso: overrides.nowIso } : {}),
+    ...(has('mintUlid') ? { mintUlid: overrides.mintUlid } : {}),
   });
 }
 
@@ -1270,6 +1272,27 @@ describe('ImportTrainStateUseCase authorization and journaling (GR1b)', () => {
         },
         listByKeyPrefix: async () => ({ outcome: 'listed', entries: [] }),
       } as unknown as CutoverJournalPort,
+    });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'journal-refused' });
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('a throwing mintUlid while creating the intent id refuses journal-refused before queue write', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue, {
+      mintUlid: () => {
+        throw new Error('id mint blew up');
+      },
     });
 
     const result = await useCase.importTrainState({

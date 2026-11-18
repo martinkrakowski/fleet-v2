@@ -758,15 +758,13 @@ function snapshotEvent(event: unknown): DaemonEventSnapshot | null {
 }
 
 /**
- * OD7a3: the validated own length of a dense, non-Proxy array of
- * non-negative safe integers, or null. Reads only the `length` own
- * descriptor and `Object.keys` (no element values), so no getter and no
- * Proxy `get` trap ever runs; an oversized, sparse or accessor-carrying
- * array is refused from its length alone, before any element is touched.
- * Cost is linear in the array's capped length (at most
- * `SHADOW_MAX_HEALTH_ITEMS` keys are walked).
+ * OD7a3: the own `length` of a dense, non-Proxy plain `Array`, or null.
+ * Reads only the `length` own descriptor (no element values), so no getter
+ * and no Proxy `get` trap ever runs; an oversized, sparse or
+ * accessor-carrying array is refused from its length alone, before any
+ * element is touched. Cost is constant (the length descriptor only).
  */
-function readNonNegativeSafeIntegerOwnArray(value: unknown): number | null {
+function ownDenseArrayLengthWithinCap(value: unknown): number | null {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     return null;
   }
@@ -780,16 +778,142 @@ function readNonNegativeSafeIntegerOwnArray(value: unknown): number | null {
   ) {
     return null;
   }
-  if (Object.keys(value).length !== lengthDescriptor.value) {
+  return lengthDescriptor.value;
+}
+
+/**
+ * OD7a3: the validated own length of a dense, non-Proxy array of
+ * non-negative safe integers, or null. Reads only the `length` own
+ * descriptor and `Object.keys` (no element values beyond the validated
+ * indices), so no getter and no Proxy `get` trap ever runs. Cost is linear
+ * in the array's capped length (at most `SHADOW_MAX_HEALTH_ITEMS` keys are
+ * walked).
+ */
+function readNonNegativeSafeIntegerOwnArray(value: unknown): number | null {
+  const lengthDescriptorValue = ownDenseArrayLengthWithinCap(value);
+  if (lengthDescriptorValue === null) {
     return null;
   }
-  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+  if (Object.keys(value as object).length !== lengthDescriptorValue) {
+    return null;
+  }
+  for (let index = 0; index < lengthDescriptorValue; index += 1) {
     const element = ownDataProperty(value as object, String(index));
     if (typeof element !== 'number' || !Number.isSafeInteger(element) || element < 0) {
       return null;
     }
   }
-  return lengthDescriptor.value;
+  return lengthDescriptorValue;
+}
+
+/**
+ * OD7a3: the `[first, last]` bracket of file positions among the parsed
+ * records whose `recordedAtIso` falls inside `day`, or null when the day has
+ * no in-day parsed record (no bracket, so no dropped line affects the day),
+ * or `'malformed'` when an in-day record's position is not a non-negative
+ * safe integer (fail closed). Every own key is read through its descriptor,
+ * so no getter and no Proxy `get` trap ever runs. Cost is linear in the
+ * capped `events` array (`eventsLength` at most `SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function inDayRecordBracket(
+  events: unknown,
+  eventPositions: unknown,
+  eventsLength: number,
+  day: string,
+): { readonly first: number; readonly last: number } | 'malformed' | null {
+  let firstPos: number | null = null;
+  let lastPos: number | null = null;
+  for (let index = 0; index < eventsLength; index += 1) {
+    const event = ownDataProperty(events as object, String(index));
+    if (typeof event !== 'object' || event === null) {
+      continue;
+    }
+    const recordedAtIso = ownDataProperty(event, 'recordedAtIso');
+    if (typeof recordedAtIso !== 'string' || recordedAtIso.slice(0, 10) !== day) {
+      continue;
+    }
+    const position = ownDataProperty(eventPositions as object, String(index));
+    if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
+      return 'malformed';
+    }
+    if (firstPos === null || position < firstPos) {
+      firstPos = position;
+    }
+    if (lastPos === null || position > lastPos) {
+      lastPos = position;
+    }
+  }
+  if (firstPos === null || lastPos === null) {
+    return null;
+  }
+  return { first: firstPos, last: lastPos };
+}
+
+/**
+ * OD7a3: the validated dropped-line positions of a non-empty `droppedLines`
+ * own array of non-negative safe integers, or `'malformed'` (fail closed).
+ * The array's shape has already been validated by
+ * `readNonNegativeSafeIntegerOwnArray`; this reads each element through its
+ * own descriptor (no getter ever runs). Cost is linear in the array's
+ * capped length (`droppedLength` at most `SHADOW_MAX_HEALTH_ITEMS`).
+ */
+function validateDroppedLines(droppedLines: unknown, droppedLength: number): readonly number[] | 'malformed' {
+  const positions: number[] = [];
+  for (let index = 0; index < droppedLength; index += 1) {
+    const position = ownDataProperty(droppedLines as object, String(index));
+    if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
+      return 'malformed';
+    }
+    positions.push(position);
+  }
+  return positions;
+}
+
+/**
+ * OD7a3: whether any of the validated dropped-line positions lies within a
+ * `[first, last]` bracket. Cost is linear in the positions array's length.
+ */
+function anyPositionWithin(positions: readonly number[], bracket: { readonly first: number; readonly last: number }): boolean {
+  return positions.some((position) => position >= bracket.first && position <= bracket.last);
+}
+
+/**
+ * OD7a3: the `droppedLines` field of an events read, classified without ever
+ * running a getter or a Proxy `get` trap: `absent` (a missing descriptor or
+ * an own `undefined` value, treated as `[]` for backwards compatibility),
+ * `empty` (an own array of length 0), `malformed` (an accessor, a
+ * sparse/oversized array, or any element that is not a non-negative safe
+ * integer — fail closed), or `present` with the validated length. Cost is
+ * linear in the array's capped length (`SHADOW_MAX_HEALTH_ITEMS`).
+ */
+type DroppedLinesField =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'empty' }
+  | { readonly kind: 'malformed' }
+  | { readonly kind: 'present'; readonly droppedLines: unknown; readonly droppedLength: number };
+
+function readDroppedLinesField(read: object): DroppedLinesField {
+  const droppedDescriptor = Object.getOwnPropertyDescriptor(read, 'droppedLines');
+  // An accessor (or a missing) `droppedLines` is never read through a
+  // getter: an accessor fails closed, a missing field is treated as `[]`.
+  if (droppedDescriptor === undefined) {
+    return { kind: 'absent' };
+  }
+  if (droppedDescriptor.get !== undefined || droppedDescriptor.set !== undefined) {
+    return { kind: 'malformed' };
+  }
+  const droppedLines = droppedDescriptor.value;
+  if (droppedLines === undefined) {
+    return { kind: 'absent' };
+  }
+  const droppedLength = readNonNegativeSafeIntegerOwnArray(droppedLines);
+  if (droppedLength === null) {
+    return { kind: 'malformed' };
+  }
+  if (droppedLength === 0) {
+    return { kind: 'empty' };
+  }
+  return { kind: 'present', droppedLines, droppedLength };
 }
 
 /**
@@ -811,81 +935,34 @@ function corruptLineBracketedInDay(read: unknown, day: string): boolean {
       return true;
     }
     const events = ownDataProperty(read, 'events');
-    if (!Array.isArray(events) || Object.getPrototypeOf(events) !== Array.prototype) {
+    const eventsLength = ownDenseArrayLengthWithinCap(events);
+    if (eventsLength === null) {
       return true;
     }
-    const eventsLengthDescriptor = Object.getOwnPropertyDescriptor(events, 'length');
-    if (
-      eventsLengthDescriptor === undefined ||
-      eventsLengthDescriptor.get !== undefined ||
-      typeof eventsLengthDescriptor.value !== 'number' ||
-      !Number.isSafeInteger(eventsLengthDescriptor.value) ||
-      eventsLengthDescriptor.value > SHADOW_MAX_HEALTH_ITEMS
-    ) {
-      return true;
-    }
-    const eventsLength = eventsLengthDescriptor.value;
-    const droppedDescriptor = Object.getOwnPropertyDescriptor(read, 'droppedLines');
-    // An accessor (or a missing) `droppedLines` is never read through a
-    // getter: an accessor fails closed, a missing field is treated as `[]`.
-    if (droppedDescriptor === undefined) {
+    const dropped = readDroppedLinesField(read);
+    if (dropped.kind === 'absent' || dropped.kind === 'empty') {
       return false;
     }
-    if (droppedDescriptor.get !== undefined || droppedDescriptor.set !== undefined) {
+    if (dropped.kind === 'malformed') {
       return true;
-    }
-    const droppedLines = droppedDescriptor.value;
-    if (droppedLines === undefined) {
-      return false;
-    }
-    const droppedLength = readNonNegativeSafeIntegerOwnArray(droppedLines);
-    if (droppedLength === null) {
-      return true;
-    }
-    if (droppedLength === 0) {
-      return false;
     }
     const eventPositions = ownDataProperty(read, 'eventPositions');
     const positionsLength = readNonNegativeSafeIntegerOwnArray(eventPositions);
-    if (positionsLength === null || positionsLength !== eventsLength) {
+    if (positionsLength !== eventsLength) {
       return true;
     }
-    let firstPos: number | null = null;
-    let lastPos: number | null = null;
-    for (let index = 0; index < eventsLength; index += 1) {
-      const event = ownDataProperty(events as object, String(index));
-      if (typeof event !== 'object' || event === null) {
-        continue;
-      }
-      const recordedAtIso = ownDataProperty(event, 'recordedAtIso');
-      if (typeof recordedAtIso !== 'string' || recordedAtIso.slice(0, 10) !== day) {
-        continue;
-      }
-      const position = ownDataProperty(eventPositions as object, String(index));
-      if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
-        return true;
-      }
-      if (firstPos === null || position < firstPos) {
-        firstPos = position;
-      }
-      if (lastPos === null || position > lastPos) {
-        lastPos = position;
-      }
+    const positions = validateDroppedLines(dropped.droppedLines, dropped.droppedLength);
+    if (positions === 'malformed') {
+      return true;
     }
-    // No in-day parsed record: no bracket, so no dropped line affects the day.
-    if (firstPos === null || lastPos === null) {
+    const bracket = inDayRecordBracket(events, eventPositions, eventsLength, day);
+    if (bracket === null) {
       return false;
     }
-    for (let index = 0; index < droppedLength; index += 1) {
-      const position = ownDataProperty(droppedLines as object, String(index));
-      if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
-        return true;
-      }
-      if (position >= firstPos && position <= lastPos) {
-        return true;
-      }
+    if (bracket === 'malformed') {
+      return true;
     }
-    return false;
+    return anyPositionWithin(positions, bracket);
   } catch {
     return true;
   }

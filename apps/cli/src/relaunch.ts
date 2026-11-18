@@ -24,8 +24,13 @@ import type { HostSection } from '@fleet/installation';
  * The host's recorded runner block, or null when the host is not in the
  * installation. A null block routes no read: the inventory reports that
  * host as unknown instead of inspecting the path on the local executor.
+ * Exported for CO30c so the cutover wiring in composition.ts reuses this
+ * one derivation instead of copying it.
  */
-function recordedHostOf(hostName: string, rt: FleetCliRuntime): AttemptRunnerRecord | null {
+export function recordedHostOf(
+  hostName: string,
+  rt: Pick<FleetCliRuntime, 'installation'>,
+): AttemptRunnerRecord | null {
   const host: HostSection | undefined = rt.installation?.hosts?.[hostName];
   if (host === undefined) return null;
   const kind = host.runner?.kind ?? 'opencode';

@@ -26,6 +26,7 @@ import { parseConfiguredCliPath } from './release.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
 import { composeReadOnlyRelaunch } from './composition/relaunch.js';
+import { recordedHostOf } from './relaunch.js';
 import { composeKnowledge } from './composition/knowledge.js';
 import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
@@ -135,6 +136,8 @@ import {
   type ProjectProfileReadPort,
   type AttemptRecord,
   type AttemptReviewLocator,
+  type InventoryRelaunchResult,
+  type RelaunchCloneRef,
   type ExecutionRunnerHost,
   type EvaluateAttemptGatePort,
   type EnqueueMergeUseCase,
@@ -1054,6 +1057,39 @@ function readStoredShadowEvidence(
   };
 }
 
+/**
+ * CO30c: the typed sum the switch lane gate consumes. A non-`inventoried`
+ * inventory (unreadable records, unknown halt or lease bytes, a refused state
+ * probe) is unreadable, never a zero. The sums take only what refuses or
+ * unknowns the gate: the hosts' `unrecorded` population counts (idle
+ * leftovers included — relaunch apply/adopt does not exist yet, so every
+ * unrecorded listed worktree is lane work nothing explains) and the
+ * `unknown-worktree-read` and `unknown-runner-state` flag counts (an unroutable
+ * host or a failed listing or runner read refuses as unknown rather than
+ * failing open when a stale record on a reused path stays `attempt-recorded`
+ * and counts 0 unrecorded). `unproven-lane-records` is deliberately not
+ * counted: an unproven record is listed in the inventory and never refuses
+ * the switch.
+ */
+function summarizeInventoryForCutover(
+  result: InventoryRelaunchResult,
+): { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number } | { readonly status: 'unreadable' } {
+  if (result.outcome !== 'inventoried') {
+    return { status: 'unreadable' };
+  }
+  let unrecorded = 0;
+  let unknownListings = 0;
+  for (const host of result.hosts) {
+    unrecorded += host.counts.unrecorded;
+    for (const flag of host.riskFlags) {
+      if (flag.code === 'unknown-worktree-read' || flag.code === 'unknown-runner-state') {
+        unknownListings += flag.count;
+      }
+    }
+  }
+  return { status: 'ok', unrecorded, unknownListings };
+}
+
 export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCliRuntime {
   const stateDir = options?.stateDir;
   // Taken before any adapter is composed (some create the directory): the relaunch commands refuse
@@ -1442,11 +1478,70 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const daemonPauseRead = durableCutover ? new DaemonPauseAdapter({ stateDir, readOnly: true }) : daemon.pause;
   const trainPauseRead = durableCutover ? new KillallTrainPauseAdapter({ stateDir, readOnly: true }) : killallTrainPause;
   // SH8b: read-only ledger for `cutover switch`. In-memory mode has no durable
-  // ledger, so the reader stays undefined and the use case refuses. This does
-  // not wire `countUnrecordedLanes` and does not start the shadow daemon.
+  // ledger, so the reader stays undefined and the use case refuses. CO30c
+  // wires `countUnrecordedLanes` beside it (below); the shadow daemon still
+  // does not start from here.
   const shadowEvidence = durableCutover ? new ShadowEvidenceAdapter({ stateDir, readOnly: true }) : undefined;
   const readShadowEvidence =
     shadowEvidence === undefined ? undefined : readStoredShadowEvidence(shadowEvidence, daemon.now);
+  // CO30c: the switch's last gate. Only durable state has the stores to
+  // count; in-memory mode leaves it unwired exactly like `readShadowEvidence`.
+  // The count reads ONLY read-only instances already composed: the relaunch
+  // inventory's read-only store adapters (composeReadOnlyRelaunch), the
+  // read-only project-profile listing, and the worktree/runner readers — so
+  // a corrupt store file is a read error answered `unreadable`, never a
+  // quarantine, and no writable daemon, conductor or profile instance is
+  // reachable from here. Zero active project profiles (a missing
+  // `project-profiles.json` reads as empty) is unreadable too: it never
+  // passes 0/0.
+  const countUnrecordedLanes = durableCutover
+    ? async (): Promise<
+        | { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number }
+        | { readonly status: 'unreadable' }
+      > => {
+        try {
+          let profiles: Awaited<
+            ReturnType<
+              typeof coordination.listProjectProfilesReadOnly.listProjectProfiles
+            >
+          >;
+          try {
+            profiles = await coordination.listProjectProfilesReadOnly.listProjectProfiles({
+              status: 'active',
+            });
+          } catch {
+            return { status: 'unreadable' };
+          }
+          if (profiles.outcome !== 'listed') {
+            return { status: 'unreadable' };
+          }
+          const active = profiles.profiles.filter((profile) => profile.status === 'active');
+          if (active.length === 0) {
+            return { status: 'unreadable' };
+          }
+          const clones: RelaunchCloneRef[] = [];
+          for (const profile of active) {
+            for (const [cloneHost, clone] of Object.entries(profile.clones)) {
+              clones.push({
+                projectId: profile.projectId,
+                hostName: cloneHost,
+                clonePath: clone.path,
+                worktreeRoot: clone.worktreeRoot,
+                recordedHost: recordedHostOf(cloneHost, { installation: options?.installation }),
+              });
+            }
+          }
+          const inventory = await inventoryRelaunch.inventoryRelaunch({
+            nowIso: daemon.now(),
+            hostName: null,
+            clones,
+          });
+          return summarizeInventoryForCutover(inventory);
+        } catch {
+          return { status: 'unreadable' };
+        }
+      }
+    : undefined;
   const manageCutover = new ManageCutoverUseCase({
     cutoverRepo: cutoverRecordRepository,
     cutoverJournal,
@@ -1459,6 +1554,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     mintEntryId: daemon.newUlid,
     nowIso: daemon.now,
     ...(readShadowEvidence === undefined ? {} : { readShadowEvidence }),
+    ...(countUnrecordedLanes === undefined ? {} : { countUnrecordedLanes }),
   });
 
   const reviewLocator = reviewLocatorRef.locator;

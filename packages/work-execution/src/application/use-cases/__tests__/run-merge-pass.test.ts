@@ -516,7 +516,7 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     expect(superseded.map((entry) => entry.kind)).toEqual(['intent', 'result']);
     expect(superseded[1].outcome).toBe('dry-run');
     expect(superseded[1].reasonCode).toBe('would-supersede');
-    expect(superseded[1].detail).toBe(null);
+    expect(superseded[1].detail).toBeNull();
     const merged = await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD3_12}/merge-pr`);
     expect(merged.map((entry) => entry.kind)).toEqual(['intent', 'result']);
     expect(merged[1].reasonCode).toBe('would-merge');
@@ -770,6 +770,80 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
 });
 
 describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () => {
+  // SH24a fix round: the real-writer wiring below is shared by every test that
+  // pins byte-identity against the real file-backed queue adapter; each test
+  // only adds its own forge result and any spying ports.
+  interface FileQueueFixture {
+    readonly stateDir: string;
+    readonly queue: MergeQueueRepositoryAdapter;
+    readonly repoDigest: string;
+    readonly queueFile: string;
+    readonly before: string;
+    readonly freshDeadline: string;
+    readonly entry: MergeQueueEntryRecord;
+  }
+
+  /** A real file-backed queue with one entry enqueued, its file bytes snapshotted. */
+  async function makeFileQueue(prefix: string): Promise<FileQueueFixture> {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `${prefix}-`));
+    const entry = makeEntry();
+    const queue = new MergeQueueRepositoryAdapter({ stateDir });
+    // The file-backed adapter computes the repoDigest from the repository,
+    // so the pass's request must carry the same digest to select the entry.
+    const repoDigest = mergeQueueRepositoryDigest({ owner: OWNER, repo: REPO });
+    // The file-backed adapter refuses a stale deadline, so the enqueue and
+    // the pass both carry a fresh one (the fake queue in `makeUseCase`
+    // never checks it).
+    const freshDeadline = new Date(Date.now() + 60_000).toISOString();
+    const enqueued = await queue.enqueueMergeEntry({
+      repository: { owner: OWNER, repo: REPO },
+      pullRequest: entry.pullRequest,
+      headOid: entry.headOid,
+      tier: entry.tier,
+      enqueuedBy: 'conductor',
+      runId: null,
+      entryId: entry.entryId,
+      successorEntryId: '01JB0000000000000000000000',
+      enqueuedAtIso: entry.enqueuedAtIso,
+      deadlineIso: freshDeadline,
+    });
+    expect(enqueued.outcome).toBe('created');
+    const queueFile = path.join(stateDir, 'merge-queue.json');
+    const before = await fs.readFile(queueFile, 'utf8');
+    return { stateDir, queue, repoDigest, queueFile, before, freshDeadline, entry };
+  }
+
+  /** The use case wired against a real file-backed queue fixture, with optional spying ports. */
+  function makeFileQueueUseCase(
+    fixture: FileQueueFixture,
+    forgeResult: ReadForgeMergeResult,
+    extras: {
+      queueWriter?: Pick<MergeQueueRepositoryPort, 'applyMergeTransition'>;
+      notifier?: Pick<MergeNotificationPort, 'notifyMergeEvent'>;
+    } = {},
+  ): { useCase: RunMergePassUseCase; journal: LaneRunJournalAdapter; request: RunMergePassRequest } {
+    const journal = new LaneRunJournalAdapter();
+    let ulid = 0;
+    const useCase = new RunMergePassUseCase({
+      queue: fixture.queue,
+      forgeRead: forgeReadFake(forgeResult),
+      verification: verificationFake(),
+      journal: journal as LaneRunJournalPort,
+      halt: haltFake,
+      newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
+      nowIso: () => NOW,
+      ...extras,
+    });
+    const request: RunMergePassRequest = {
+      repository: { owner: OWNER, repo: REPO },
+      repoDigest: fixture.repoDigest,
+      projectId: 'proj-1',
+      policy: makePolicy(),
+      deadlineIso: fixture.freshDeadline,
+    };
+    return { useCase, journal, request };
+  }
+
   function exhaustedForge(): ReadForgeMergeResult {
     return {
       outcome: 'unavailable',
@@ -796,73 +870,32 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
   ) => {
     // Luna (minor): the byte-identity check reads the queue FILE's bytes, not
     // an in-memory copy, so a persisted shadow drop can never hide here.
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-merge-queue-bytes-'));
+    const fixture = await makeFileQueue('fleet-merge-queue-bytes');
     try {
-      const entry = makeEntry();
-      const queue = new MergeQueueRepositoryAdapter({ stateDir });
-      // The file-backed adapter computes the repoDigest from the repository,
-      // so the pass's request must carry the same digest to select the entry.
-      const repoDigest = mergeQueueRepositoryDigest({ owner: OWNER, repo: REPO });
-      // The file-backed adapter refuses a stale deadline, so the enqueue and
-      // the pass both carry a fresh one (the fake queue in `makeUseCase`
-      // never checks it).
-      const freshDeadline = new Date(Date.now() + 60_000).toISOString();
-      const enqueued = await queue.enqueueMergeEntry({
-        repository: { owner: OWNER, repo: REPO },
-        pullRequest: entry.pullRequest,
-        headOid: entry.headOid,
-        tier: entry.tier,
-        enqueuedBy: 'conductor',
-        runId: null,
-        entryId: entry.entryId,
-        successorEntryId: '01JB0000000000000000000000',
-        enqueuedAtIso: entry.enqueuedAtIso,
-        deadlineIso: freshDeadline,
-      });
-      expect(enqueued.outcome).toBe('created');
-      const queueFile = path.join(stateDir, 'merge-queue.json');
-      const before = await fs.readFile(queueFile, 'utf8');
-
       const writer = queueWriterSpy();
       const notifier = notifierSpy();
-      const journal = new LaneRunJournalAdapter();
-      let ulid = 0;
-      const useCase = new RunMergePassUseCase({
-        queue,
-        forgeRead: forgeReadFake(forgeResult),
-        verification: verificationFake(),
-        journal: journal as LaneRunJournalPort,
-        halt: haltFake,
-        newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
-        nowIso: () => NOW,
+      const { useCase, journal, request } = makeFileQueueUseCase(fixture, forgeResult, {
         queueWriter: writer.adapter,
         notifier: notifier.adapter,
       });
-      const request: RunMergePassRequest = {
-        repository: { owner: OWNER, repo: REPO },
-        repoDigest,
-        projectId: 'proj-1',
-        policy: makePolicy(),
-        deadlineIso: freshDeadline,
-      };
 
       const result = await useCase.runMergePass(request);
 
       expect(result.outcome).toBe('completed');
       expect(result.entries[0].decision).toBe('journalled');
       expect(result.entries[0].reasonCode).toBe('would-drop');
-      expect(result.entries[0].journalKey).toBe(`merge/${repoDigest}/1/${HEAD12}/would-drop`);
+      expect(result.entries[0].journalKey).toBe(`merge/${fixture.repoDigest}/1/${HEAD12}/would-drop`);
       expect(writer.calls).toBe(0);
       expect(notifier.calls).toBe(0);
       // The queue file's bytes are exactly what the tick found.
-      expect(await fs.readFile(queueFile, 'utf8')).toBe(before);
-      const after = await journal.listForKey(`merge/${repoDigest}/1/${HEAD12}/would-drop`);
+      expect(await fs.readFile(fixture.queueFile, 'utf8')).toBe(fixture.before);
+      const after = await journal.listForKey(`merge/${fixture.repoDigest}/1/${HEAD12}/would-drop`);
       expect(after.map((entry) => entry.kind)).toEqual(['intent', 'result']);
       expect(after[1].outcome).toBe('dry-run');
       expect(after[1].reasonCode).toBe('would-drop');
       expect(after[1].detail).toBe(detail);
     } finally {
-      await fs.rm(stateDir, { recursive: true, force: true });
+      await fs.rm(fixture.stateDir, { recursive: true, force: true });
     }
   });
 
@@ -881,7 +914,7 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
     expect(after.map((entry) => entry.kind)).toEqual(['intent', 'result']);
     expect(after[1].outcome).toBe('dry-run');
     expect(after[1].reasonCode).toBe('would-already-merged');
-    expect(after[1].detail).toBe(null);
+    expect(after[1].detail).toBeNull();
   });
 
   it('a shadow tick on a green entry with a macOS procedure persists the ready entry as on main', async () => {
@@ -1109,28 +1142,8 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
     // adapter refuses it with `unknown-entry`); the park is journalled as
     // `would-park` on the successor's own head, and the queue file's bytes
     // are exactly what the tick found.
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-merge-queue-successor-park-'));
+    const fixture = await makeFileQueue('fleet-merge-queue-successor-park');
     try {
-      const entry = makeEntry();
-      const queue = new MergeQueueRepositoryAdapter({ stateDir });
-      const repoDigest = mergeQueueRepositoryDigest({ owner: OWNER, repo: REPO });
-      const freshDeadline = new Date(Date.now() + 60_000).toISOString();
-      const enqueued = await queue.enqueueMergeEntry({
-        repository: { owner: OWNER, repo: REPO },
-        pullRequest: entry.pullRequest,
-        headOid: entry.headOid,
-        tier: entry.tier,
-        enqueuedBy: 'conductor',
-        runId: null,
-        entryId: entry.entryId,
-        successorEntryId: '01JB0000000000000000000000',
-        enqueuedAtIso: entry.enqueuedAtIso,
-        deadlineIso: freshDeadline,
-      });
-      expect(enqueued.outcome).toBe('created');
-      const queueFile = path.join(stateDir, 'merge-queue.json');
-      const before = await fs.readFile(queueFile, 'utf8');
-
       // The head moved (supersede) and the moved head has unresolved threads
       // (park), read twice in one pass: once for the predecessor, once for
       // the in-memory successor.
@@ -1139,28 +1152,13 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
         liveHeadSha: HEAD3,
         unresolvedThreads: 2,
       };
-      const journal = new LaneRunJournalAdapter();
-      let ulid = 0;
-      const useCase = new RunMergePassUseCase({
-        queue,
-        queueWriter: queue, // the real adapter, not a spy-only fake
-        forgeRead: forgeReadFake(movedWithThreads),
-        verification: verificationFake(),
-        journal: journal as LaneRunJournalPort,
-        halt: haltFake,
-        newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
-        nowIso: () => NOW,
+      const { useCase, journal, request } = makeFileQueueUseCase(fixture, movedWithThreads, {
+        queueWriter: fixture.queue, // the real adapter, not a spy-only fake
       });
-      const request: RunMergePassRequest = {
-        repository: { owner: OWNER, repo: REPO },
-        repoDigest,
-        projectId: 'proj-1',
-        policy: makePolicy(),
-        deadlineIso: freshDeadline,
-      };
 
       const result = await useCase.runMergePass(request);
 
+      const { repoDigest } = fixture;
       expect(result.outcome).toBe('completed');
       expect(result.entries[0].decision).toBe('journalled');
       expect(result.entries[0].reasonCode).toBe('would-park');
@@ -1183,9 +1181,9 @@ describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () =
       for (const head12 of [HEAD12, HEAD3_12]) {
         expect(await journal.listForKey(`merge/${repoDigest}/1/${head12}/would-notify`)).toHaveLength(0);
       }
-      expect(await fs.readFile(queueFile, 'utf8')).toBe(before);
+      expect(await fs.readFile(fixture.queueFile, 'utf8')).toBe(fixture.before);
     } finally {
-      await fs.rm(stateDir, { recursive: true, force: true });
+      await fs.rm(fixture.stateDir, { recursive: true, force: true });
     }
   });
 

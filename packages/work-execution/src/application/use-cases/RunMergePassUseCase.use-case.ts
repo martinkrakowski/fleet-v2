@@ -150,7 +150,9 @@ const CONTEXT_FAILED_TOKENS = new Set([
   'ACTION_REQUIRED', 'STALE',
 ]);
 
-const MERGE_STATE_BY_TOKEN: Record<string, 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'DIRTY' | 'UNKNOWN'> = {
+type MergeStateStatus = 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'DIRTY' | 'UNKNOWN';
+
+const MERGE_STATE_BY_TOKEN: Record<string, MergeStateStatus> = {
   clean: 'CLEAN',
   behind: 'BEHIND',
   blocked: 'BLOCKED',
@@ -163,11 +165,31 @@ const MERGE_STATE_BY_TOKEN: Record<string, 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'DIR
  * decider waits. The DIRTY mapping applies only under shadow.
  */
 function shadowMergeStateStatus(
-  mapped: 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'DIRTY' | 'UNKNOWN',
+  mapped: MergeStateStatus,
   shadow: boolean,
-): 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'DIRTY' | 'UNKNOWN' {
+): MergeStateStatus {
   if (!shadow && mapped === 'DIRTY') return 'UNKNOWN';
   return mapped;
+}
+
+/**
+ * The entry-scoped context the shadow supersede path needs to re-decide and
+ * report: the selected entry, the predecessor record it journals against, and
+ * the pass context needed to re-gather facts for the in-memory successor.
+ */
+interface ShadowSupersedeContext {
+  /** The originally selected queue entry, used for reporting. */
+  readonly entry: MergeQueueEntryRecord;
+  /** The predecessor record the supersession journals against. */
+  readonly predecessor: MergeQueueEntryRecord;
+  /** The predecessor's already-gathered facts (its `isQueueHead` is preserved). */
+  readonly facts: MergeStepFacts;
+  /** The current queue head, passed through to fact gathering. */
+  readonly head: MergeQueueEntryRecord | null;
+  /** The pass's halt state, re-checked during fact gathering. */
+  readonly halted: boolean;
+  /** The pass's full record set, passed through to fact gathering. */
+  readonly repoRecords: readonly MergeQueueEntryRecord[];
 }
 
 /**
@@ -388,7 +410,14 @@ export class RunMergePassUseCase implements RunMergePassPort {
     if (request.policy.shadow === true && decision.kind === 'supersede') {
       // SH24a: the supersession is never persisted; the successor lives only in
       // memory for this pass, so a green moved head still reaches `would-merge`.
-      return this.shadowSupersedeThenAct(request, entry, current, facts, head, halted, repoRecords, decision);
+      return this.shadowSupersedeThenAct(request, {
+        entry,
+        predecessor: current,
+        facts,
+        head,
+        halted,
+        repoRecords,
+      }, decision);
     }
 
     if (request.policy.shadow === true) {
@@ -504,14 +533,10 @@ export class RunMergePassUseCase implements RunMergePassPort {
    */
   private async shadowSupersedeThenAct(
     request: RunMergePassRequest,
-    entry: MergeQueueEntryRecord,
-    predecessor: MergeQueueEntryRecord,
-    facts: MergeStepFacts,
-    head: MergeQueueEntryRecord | null,
-    halted: boolean,
-    repoRecords: readonly MergeQueueEntryRecord[],
+    context: ShadowSupersedeContext,
     decision: Extract<MergeStepDecision, { kind: 'supersede' }>,
   ): Promise<MergePassEntryReport> {
+    const { entry, predecessor, facts, head, halted, repoRecords } = context;
     await this.journalShadowOutcome(request, predecessor, 'would-supersede', null);
     // Luna (minor): the predecessor head's own open intents are closed here —
     // the head is superseded, so nothing keyed on it can act again this pass.

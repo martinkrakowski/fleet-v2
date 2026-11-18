@@ -828,57 +828,35 @@ function isNonNegativeSafeIntegerArray(copy: readonly unknown[]): copy is readon
 }
 
 /**
- * OD7a3: the validated own length of a dense, non-Proxy array of
- * non-negative safe integers, or null. Reads only the `length` own
- * descriptor and `Object.keys` (no element values beyond the validated
- * indices), so no getter and no Proxy `get` trap ever runs. Cost is linear
- * in the array's capped length (at most `SHADOW_MAX_HEALTH_ITEMS` keys are
- * walked).
- */
-function readNonNegativeSafeIntegerOwnArray(value: unknown): number | null {
-  const lengthDescriptorValue = ownDenseArrayLengthWithinCap(value);
-  if (lengthDescriptorValue === null) {
-    return null;
-  }
-  if (Object.keys(value as object).length !== lengthDescriptorValue) {
-    return null;
-  }
-  for (let index = 0; index < lengthDescriptorValue; index += 1) {
-    const element = ownDataProperty(value as object, String(index));
-    if (typeof element !== 'number' || !Number.isSafeInteger(element) || element < 0) {
-      return null;
-    }
-  }
-  return lengthDescriptorValue;
-}
-
-/**
- * OD7a3: the `[first, last]` bracket of file positions among the parsed
- * records whose `recordedAtIso` falls inside `day`, or null when the day has
- * no in-day parsed record (no bracket, so no dropped line affects the day),
- * or `'malformed'` when an in-day record's position is not a non-negative
- * safe integer (fail closed). Every own key is read through its descriptor,
- * so no getter and no Proxy `get` trap ever runs. Cost is linear in the
- * capped `events` array (`eventsLength` at most `SHADOW_MAX_HEALTH_ITEMS`).
+ * OD7a3 fix round: the `[first, last]` bracket of file positions among the
+ * SNAPSHOT records whose `recordedAtIso` falls inside `day`, or null when
+ * the day has no in-day parsed record (no bracket, so no dropped line
+ * affects the day). The input is the typed snapshot only — each event is the
+ * frozen plain copy `snapshotEvent` produced and each position an already
+ * validated non-negative safe integer — so no raw event and no `unknown`
+ * ever reaches the bracket, and a Proxy's `recordedAtIso` can never be read
+ * a second time here. Cost is linear in the snapshot's capped `events` array
+ * (at most `SHADOW_MAX_HEALTH_ITEMS` entries).
  */
 function inDayRecordBracket(
-  events: unknown,
-  eventPositions: unknown,
-  eventsLength: number,
+  events: ReadonlyArray<DaemonEventSnapshot>,
+  eventPositions: ReadonlyArray<number>,
   day: string,
 ): { readonly first: number; readonly last: number } | 'malformed' | null {
   let firstPos: number | null = null;
   let lastPos: number | null = null;
-  for (let index = 0; index < eventsLength; index += 1) {
-    const event = ownDataProperty(events as object, String(index));
-    if (typeof event !== 'object' || event === null) {
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    if (event === undefined) {
       continue;
     }
-    const recordedAtIso = ownDataProperty(event, 'recordedAtIso');
-    if (typeof recordedAtIso !== 'string' || recordedAtIso.slice(0, 10) !== day) {
+    if (event.recordedAtIso.slice(0, 10) !== day) {
       continue;
     }
-    const position = ownDataProperty(eventPositions as object, String(index));
+    // The snapshot invariant (validated in `snapshotEventsRead`) makes every
+    // position a non-negative safe integer; the type checker enforces it,
+    // and the runtime check below only backs that invariant fail-closed.
+    const position = eventPositions[index];
     if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
       return 'malformed';
     }
@@ -893,26 +871,6 @@ function inDayRecordBracket(
     return null;
   }
   return { first: firstPos, last: lastPos };
-}
-
-/**
- * OD7a3: the validated dropped-line positions of a non-empty `droppedLines`
- * own array of non-negative safe integers, or `'malformed'` (fail closed).
- * The array's shape has already been validated by
- * `readNonNegativeSafeIntegerOwnArray`; this reads each element through its
- * own descriptor (no getter ever runs). Cost is linear in the array's
- * capped length (`droppedLength` at most `SHADOW_MAX_HEALTH_ITEMS`).
- */
-function validateDroppedLines(droppedLines: unknown, droppedLength: number): readonly number[] | 'malformed' {
-  const positions: number[] = [];
-  for (let index = 0; index < droppedLength; index += 1) {
-    const position = ownDataProperty(droppedLines as object, String(index));
-    if (typeof position !== 'number' || !Number.isSafeInteger(position) || position < 0) {
-      return 'malformed';
-    }
-    positions.push(position);
-  }
-  return positions;
 }
 
 /**
@@ -965,52 +923,38 @@ function readDroppedLinesField(read: object): DroppedLinesField {
 }
 
 /**
- * OD7a3: whether any dropped (corrupt) `events.jsonl` line is bracketed
- * inside `day`'s parsed records. Policy: `events.jsonl` holds the whole
- * history, so a dropped line counts against a day ONLY when its file
+ * OD7a3 fix round: whether any dropped (corrupt) `events.jsonl` line is
+ * bracketed inside `day`'s parsed records. Policy: `events.jsonl` holds the
+ * whole history, so a dropped line counts against a day ONLY when its file
  * position lies between the first and the last successfully parsed record
  * whose time is inside that day; a corrupt line outside every day's bracket
- * affects no day. Every own key is read through its descriptor (no getter
- * ever runs); a missing `droppedLines` field is treated as `[]` for
- * backwards compatibility; a malformed shape, a sparse/oversized array, or
- * a non-empty `droppedLines` whose `eventPositions` is missing or not a
- * same-length non-negative-integer array matching `events.length` fails
- * closed. Cost is linear in the capped `events` array.
+ * affects no day. The input is the typed OK snapshot only (`EventsReadOk`):
+ * every event is the frozen plain copy `snapshotEvent` produced, the
+ * dropped-line positions are already validated non-negative safe integers,
+ * and the in-day positions were validated against `events.length` at
+ * snapshot time — so no raw read and no `unknown` ever reaches this helper,
+ * and a Proxy cannot disagree with the snapshot here. A non-empty
+ * `droppedLines` whose snapshot carries no positions (impossible by the
+ * snapshot invariant) fails closed. Cost is linear in the snapshot's capped
+ * `events` array (at most `SHADOW_MAX_HEALTH_ITEMS` entries).
  */
-function corruptLineBracketedInDay(read: unknown, day: string): boolean {
+function corruptLineBracketedInDay(snapshot: EventsReadOk, day: string): boolean {
   try {
-    if (typeof read !== 'object' || read === null || Array.isArray(read)) {
-      return true;
-    }
-    const events = ownDataProperty(read, 'events');
-    const eventsLength = ownDenseArrayLengthWithinCap(events);
-    if (eventsLength === null) {
-      return true;
-    }
-    const dropped = readDroppedLinesField(read);
-    if (dropped.kind === 'absent' || dropped.kind === 'empty') {
+    if (snapshot.droppedLines.length === 0) {
       return false;
     }
-    if (dropped.kind === 'malformed') {
+    const eventPositions = snapshot.eventPositions;
+    if (eventPositions === null) {
       return true;
     }
-    const eventPositions = ownDataProperty(read, 'eventPositions');
-    const positionsLength = readNonNegativeSafeIntegerOwnArray(eventPositions);
-    if (positionsLength !== eventsLength) {
-      return true;
-    }
-    const positions = validateDroppedLines(dropped.droppedLines, dropped.droppedLength);
-    if (positions === 'malformed') {
-      return true;
-    }
-    const bracket = inDayRecordBracket(events, eventPositions, eventsLength, day);
+    const bracket = inDayRecordBracket(snapshot.events, eventPositions, day);
     if (bracket === null) {
       return false;
     }
     if (bracket === 'malformed') {
       return true;
     }
-    return anyPositionWithin(positions, bracket);
+    return anyPositionWithin(snapshot.droppedLines, bracket);
   } catch {
     return true;
   }
@@ -1038,31 +982,36 @@ function ownElement(container: object, key: string): unknown {
  * their own data descriptor's `.value`, never through a getter, inside a
  * try/catch — and every value is copied into a NEW frozen plain structure:
  * a frozen `{ ok: true, events, droppedLines, eventPositions }` record whose
- * `events` and `droppedLines` are frozen array copies. Every later read uses
+ * `events` are frozen per-event snapshots (each the plain copy `snapshotEvent`
+ * produces) and whose `droppedLines`/`eventPositions` are frozen validated
+ * number-array copies. Every later read uses
  * only this snapshot, so a Proxy whose descriptors and `get` trap disagree
  * can only yield the descriptor's values (a `get` trap that lies about
  * `events` is never consulted), and a throwing descriptor trap can never
  * escape — it is caught and reported as `'malformed'`. The result is
  * `'malformed'` when the raw is not a plain record object, when `events` is
  * missing, an accessor, not a dense array within `SHADOW_MAX_HEALTH_ITEMS`,
- * when `droppedLines`/`eventPositions` are malformed, when `ok` is missing,
+ * when ANY event fails to snapshot (OD7a3 fix round 6 — the whole read is
+ * malformed, never a shortened list), when
+ * `droppedLines`/`eventPositions` are malformed, when `ok` is missing,
  * an accessor or not a boolean, or when anything throws; `{ ok: false }` only
  * when `ok` is an own data property whose value is exactly `false`.
- * An event element (or position element) whose own descriptor read throws
- * carries `undefined` (the per-element failure the scheduled/manual event
- * validation later fails closed on), never an escape. Cost is linear in the
+ * Cost is linear in the
  * capped `events` length (`SHADOW_MAX_HEALTH_ITEMS`) plus the capped
  * `droppedLines`/`eventPositions` lengths.
  */
 type EventsReadSnapshot =
   | {
       readonly ok: true;
-      readonly events: readonly unknown[];
-      readonly droppedLines: readonly number[];
-      readonly eventPositions: readonly unknown[] | null;
+      readonly events: ReadonlyArray<DaemonEventSnapshot>;
+      readonly droppedLines: ReadonlyArray<number>;
+      readonly eventPositions: ReadonlyArray<number> | null;
     }
   | { readonly ok: false }
   | 'malformed';
+
+/** The OK branch of `EventsReadSnapshot` — the only shape a downstream helper accepts. */
+type EventsReadOk = Extract<EventsReadSnapshot, { ok: true }>;
 
 function snapshotEventsRead(raw: unknown): EventsReadSnapshot {
   try {
@@ -1089,9 +1038,23 @@ function snapshotEventsRead(raw: unknown): EventsReadSnapshot {
     if (eventsLength === null) {
       return 'malformed';
     }
-    const eventsCopy: unknown[] = [];
+    // OD7a3 fix round 6: EVERY event is snapshotted exactly ONCE, here, by
+    // `snapshotEvent` — the container is read once per element (through the
+    // element's own data descriptor) and each element's own keys are read
+    // once each by `snapshotEvent`. The snapshot array is the ONLY event
+    // list any downstream code (bracket, first-tick guard, S12 inputs, tick
+    // health, coverage) ever sees, so a Proxy event whose descriptors
+    // change between reads can never show one value to the bracket and
+    // another to the validator. An event that fails to snapshot (not a
+    // non-null object, or `kind`/`recordedAtIso` not strings) makes the
+    // WHOLE read `'malformed'` — fail closed — never a shortened list.
+    const eventsCopy: DaemonEventSnapshot[] = [];
     for (let index = 0; index < eventsLength; index += 1) {
-      eventsCopy.push(ownElement(events as object, String(index)));
+      const eventSnapshot = snapshotEvent(ownElement(events as object, String(index)));
+      if (eventSnapshot === null) {
+        return 'malformed';
+      }
+      eventsCopy.push(eventSnapshot);
     }
     const dropped = readDroppedLinesField(raw);
     if (dropped.kind === 'malformed') {
@@ -1488,25 +1451,15 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (corruptLineBracketedInDay(snapshot, context.day)) {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-corrupt' } };
     }
-    // OD7a2 fix round: the raw events are validated and snapshotted exactly
-    // ONCE, here, by `snapshotEvent`; every later loop and filter below uses
-    // the snapshot array only and may dereference `kind`/`recordedAtIso`
-    // directly, never the original (which a Proxy could make disagree).
-    // OD7a2 fix round: a malformed event FAILS CLOSED. Dropping it silently
-    // would let S12 evaluate a shortened list (800 good ticks plus one null
-    // could pass), so any event whose snapshot is null stops the run as
-    // `s12-unknown` before anything is written.
-    const validatedEvents: DaemonEventSnapshot[] = [];
-    for (const event of snapshot.events) {
-      const snapshot = snapshotEvent(event);
-      if (snapshot === null) {
-        return { stop: { outcome: 'unknown', reason: 's12-unknown' } };
-      }
-      validatedEvents.push(snapshot);
-    }
+    // OD7a3 fix round 6: the events in the snapshot are ALREADY frozen
+    // per-event snapshots (`snapshotEvent` ran once each inside
+    // `snapshotEventsRead`, and an event that failed to snapshot made the
+    // whole read malformed), so this loop and every later one use the
+    // snapshot array only and may dereference `kind`/`recordedAtIso`
+    // directly — never the raw read, which a Proxy could make disagree.
     const dayStartMs = serialOfUtcDay(context.day) * DAY_MS;
     let earliestInDayMs: number | null = null;
-    for (const event of validatedEvents) {
+    for (const event of snapshot.events) {
       if (event.kind !== 'job') {
         continue;
       }
@@ -1528,7 +1481,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // 3. S12 precheck over the windowed events: an unknown evaluation and a
     // `too-few-ticks` / `late-last-tick` / `coverage-gap` failure each stop
     // the run before anything is written (OD7a3 adds the coverage guards).
-    const windowed = validatedEvents.filter((event: DaemonEventSnapshot) => this.inTickWindow(event.recordedAtIso, context.day));
+    const windowed = snapshot.events.filter((event) => this.inTickWindow(event.recordedAtIso, context.day));
     const evaluation = evaluateShadowTickHealth({ day: context.day, events: windowed });
     const tickHealth: CriterionOutcome = { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
     if (evaluation.status === 'unknown') {
@@ -2013,19 +1966,11 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (corruptLineBracketedInDay(snapshot, context.day)) {
       throw new S12GuardResult(unknownResult('daemon-events-corrupt'));
     }
-    // OD7a3 fix round: the snapshot's events are validated and snapshotted
-    // once each by `snapshotEvent` (as in scheduled mode), so a malformed
-    // event fails closed as `s12-unknown` instead of silently shortening the
-    // list the filter would walk.
-    const validatedEvents: DaemonEventSnapshot[] = [];
-    for (const event of snapshot.events) {
-      const eventSnapshot = snapshotEvent(event);
-      if (eventSnapshot === null) {
-        throw new S12GuardResult({ outcome: 'unknown', reason: 's12-unknown' });
-      }
-      validatedEvents.push(eventSnapshot);
-    }
-    const events = validatedEvents.filter((event) => this.inTickWindow(event.recordedAtIso, context.day));
+    // OD7a3 fix round 6: the snapshot's events are ALREADY frozen per-event
+    // snapshots (`snapshotEvent` ran once each inside `snapshotEventsRead`),
+    // so the filter below uses the snapshot only — no second snapshot pass
+    // and no raw event ever reaches S12.
+    const events = snapshot.events.filter((event) => this.inTickWindow(event.recordedAtIso, context.day));
     const evaluation = evaluateShadowTickHealth({ day: context.day, events });
     // OD7a3: manual mode refuses the two S12 coverage failures instead of
     // recording a `fail` verdict — nothing is written to the ledger.

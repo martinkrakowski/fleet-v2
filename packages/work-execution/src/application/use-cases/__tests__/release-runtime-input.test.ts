@@ -8,6 +8,7 @@
  */
 
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,16 +29,26 @@ import { CoordinationRequestRepositoryAdapter } from '../../../../../operator-co
 import { RecordAuthorizationConsumptionUseCase } from '../../../../../operator-coordination/src/application/use-cases/RecordAuthorizationConsumptionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../../../../../operator-coordination/src/application/use-cases/ResolveActionAuthorizationUseCase.use-case.js';
 import type { CoordinationRequestRecord } from '../../../../../operator-coordination/src/domain/coordination-records.js';
+import { RELEASE_GRANT_DIGEST_PREFIX } from '../../../../../operator-coordination/src/domain/coordination-records.js';
 
 const NOW = '2026-11-10T10:00:00.000Z';
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
 const ROOT = '/nonexistent-co14b-robustness-root';
 
+// RR1: a release grant's request id carries the digest of its coordinates
+// ({ scope, projectId, expectedHeadSha, releaseRoot, nonce }), so a recorded grant
+// must be saved under that id and the resolve/consume use cases must be given
+// the same digest function the request id was derived with.
+const digest = (payload: string): string => createHash('sha256').update(payload).digest('hex');
+const NONCE = '0123456789abcdef0123456789abcdef';
+const releaseGrantId = (scope: string, projectId: string, sha: string, root: string, nonce: string = NONCE): string =>
+  `${RELEASE_GRANT_DIGEST_PREFIX}${digest(JSON.stringify({ scope, projectId, expectedHeadSha: sha, releaseRoot: root, nonce }))}`;
+
 /** A recorded, approved, unconsumed owner grant for one release scope at one head, bound to one root. */
-function releaseGrant(grantId: string, scope: string, sha: string, root: string): CoordinationRequestRecord {
+function releaseGrant(_grantId: string, scope: string, sha: string, root: string): CoordinationRequestRecord {
   return {
-    id: `req-${grantId}`,
+    id: releaseGrantId(scope, 'p', sha, root),
     projectId: 'p',
     kind: 'action-decision',
     state: 'approved',
@@ -46,7 +57,7 @@ function releaseGrant(grantId: string, scope: string, sha: string, root: string)
     proposalDigest: 'prop-1',
     policyRevision: 'pol-1',
     decisionRevision: 'dec-1',
-    grantId,
+    grantId: _grantId,
     consumptions: [],
     acknowledgements: [],
     deliveryStatus: 'pending',
@@ -55,6 +66,7 @@ function releaseGrant(grantId: string, scope: string, sha: string, root: string)
     createdAtIso: NOW,
     updatedAtIso: NOW,
     releaseRoot: root,
+    releaseNonce: NONCE,
   } as CoordinationRequestRecord;
 }
 
@@ -258,7 +270,7 @@ describe('release robustness bar (CO14 follow-up)', () => {
     // the grant is already consumed and `current` is unmoved.
     let crashed = true;
     const resolve = async (request: ResolveActionAuthorizationRequest) => {
-      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants }).resolveActionAuthorization({
+      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: grants, computeDigest: digest }).resolveActionAuthorization({
         projectId: request.projectId,
         actionScope: 'release:swap',
         expectedHeadSha: request.expectedHeadSha,
@@ -274,7 +286,7 @@ describe('release robustness bar (CO14 follow-up)', () => {
         : { outcome: 'blocked' as const, reason: result.reason };
     };
     const consume = async (request: ConsumeActionAuthorizationRequest) => {
-      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants }).recordAuthorizationConsumption({
+      const result = await new RecordAuthorizationConsumptionUseCase({ requestRepo: grants, computeDigest: digest }).recordAuthorizationConsumption({
         consumptionId: `c-${request.actionId}`,
         grantId: request.authorizationGrantId,
         actionId: request.actionId,

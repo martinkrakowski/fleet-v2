@@ -168,12 +168,18 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     // trusted as a string. The failure is a typed refusal that never echoes a
     // path (the missing-root refusal's message points to the runbook step
     // instead — see the fix-round-2 note below).
+    // RR1: the realpath-resolved root is hoisted out of the `checkable` block
+    // and travels with the payload, so the grant the release resolves and
+    // consumes is bound to the same canonical root that
+    // `coordination request-decision --release-root` binds. A root that
+    // cannot be checked is passed through unchanged, keeping the uncheckable
+    // refusal path below exactly as it was.
+    let realRoot = root;
     if (checkable) {
       const configuredRoot = configuredReleaseRoot(rt.installation as ReleaseDriverConfiguration | undefined);
       if (configuredRoot === null) {
         return { outcome: 'refused', reason: 'release-root-state-dir-unknown' as const };
       }
-      let realRoot: string;
       try {
         realRoot = await realpath(root);
       } catch (error) {
@@ -232,7 +238,7 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
     // checks above (the unresolvable-state-dir refusal and the already-
     // bound-mismatch refusal), which write nothing either way.
     return await manageReleaseFromPayload(
-      { ...payload, action },
+      { ...payload, action, root: realRoot },
       {
         lease: new ConductorDriverLeaseAdapter({ stateDir }),
         authorization: releaseAuthorization(rt),

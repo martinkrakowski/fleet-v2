@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { RecordAuthorizationConsumptionResult } from '../ports/in/RecordAuthorizationConsumptionPort.in-port.js';
 import { RecordAuthorizationConsumptionUseCase } from './RecordAuthorizationConsumptionUseCase.use-case.js';
 
 class InMemoryCoordinationRequestRepo implements CoordinationRequestRepositoryPort {
@@ -312,5 +314,237 @@ describe('RecordAuthorizationConsumptionUseCase standing shadow import grant (GR
     const stored = await repo.findRequestByGrantId('grant-push');
     expect(stored?.state).toBe('approved');
     expect(stored?.consumptions).toHaveLength(0);
+  });
+});
+
+describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
+  const HEAD = '1111111111111111111111111111111111111111';
+  const ROOT = '/srv/fleet/releases';
+  const GRANT_ID = 'grant-release';
+  const NONCE = '0123456789abcdef0123456789abcdef';
+
+  function digest(payload: string): string {
+    return createHash('sha256').update(payload).digest('hex');
+  }
+
+  function releaseRequestId(grant: {
+    actionScope: string;
+    projectId: string;
+    expectedHeadSha: string;
+    releaseRoot: string;
+    nonce: string;
+  }): string {
+    return `release-grant-${digest(
+      JSON.stringify({
+        scope: grant.actionScope,
+        projectId: grant.projectId,
+        expectedHeadSha: grant.expectedHeadSha,
+        releaseRoot: grant.releaseRoot,
+        nonce: grant.nonce,
+      }),
+    )}`;
+  }
+
+  function createReleaseRecord(overrides?: Partial<CoordinationRequestRecord>): CoordinationRequestRecord {
+    return {
+      id: releaseRequestId({
+        actionScope: 'release:install',
+        projectId: 'proj-1',
+        expectedHeadSha: HEAD,
+        releaseRoot: ROOT,
+        nonce: NONCE,
+      }),
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: 'release:install',
+      expectedHeadSha: HEAD,
+      proposalDigest: 'sha256-proposal',
+      policyRevision: 'pol-rev-1',
+      decisionRevision: 'dec-rev-1',
+      grantId: GRANT_ID,
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: '2026-11-02T00:00:00.000Z',
+      updatedAtIso: '2026-11-02T00:00:00.000Z',
+      releaseRoot: ROOT,
+      releaseNonce: NONCE,
+      ...overrides,
+    };
+  }
+
+  function consumeRelease(
+    useCase: RecordAuthorizationConsumptionUseCase,
+    overrides: Record<string, unknown> = {},
+  ): Promise<RecordAuthorizationConsumptionResult> {
+    return useCase.recordAuthorizationConsumption({
+      consumptionId: 'c-1',
+      grantId: GRANT_ID,
+      actionId: 'action-install-1',
+      actionScope: 'release:install',
+      attemptId: 'att-1',
+      expectedHeadSha: HEAD,
+      releaseRoot: ROOT,
+      ...overrides,
+    } as never);
+  }
+
+  it('consumes a digest-bound release record whose root matches', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(createReleaseRecord());
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+    );
+    expect(result.outcome).toBe('consumed');
+    const stored = await requestRepo.findRequestById(
+      releaseRequestId({
+        actionScope: 'release:install',
+        projectId: 'proj-1',
+        expectedHeadSha: HEAD,
+        releaseRoot: ROOT,
+        nonce: NONCE,
+      }),
+    );
+    expect(stored?.consumptions).toHaveLength(1);
+    expect(stored?.consumptions[0]?.actionId).toBe('action-install-1');
+  });
+
+  it('refuses a matching root whose stored coordinates no longer hash to the id (tampered)', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    // The stored root was moved after recording: the request names the same
+    // (moved) root, so the root check passes, but the recomputed digest no
+    // longer matches the request id the grant is bound by. The idempotent
+    // replay return is never reached, so a moved root cannot be excused by an
+    // already-recorded receipt.
+    await requestRepo.saveRequest(createReleaseRecord({ releaseRoot: '/srv/fleet/moved' }));
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: '/srv/fleet/moved' },
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+  });
+
+  it('refuses a record whose nonce was tampered with (the digest recompute no longer matches the id)', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(
+      createReleaseRecord({ releaseNonce: 'fedcba9876543210fedcba9876543210' }),
+    );
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+  });
+
+  it('fails closed on a release record with a missing or malformed nonce', async () => {
+    for (const bad of [undefined, 'short']) {
+      const requestRepo = new InMemoryCoordinationRequestRepo();
+      await requestRepo.saveRequest(createReleaseRecord({ releaseNonce: bad }));
+      const result = await consumeRelease(
+        new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      );
+      expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+    }
+  });
+
+  it('refuses a pre-RR1 unprefixed release record (unsigned root) even when the root matches', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(createReleaseRecord({ id: 'req-unprefixed-1' }));
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+  });
+
+  it('fails closed with digest-unavailable when the digest is unwired on a release record', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(createReleaseRecord());
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'digest-unavailable' });
+  });
+
+  it('still refuses a different root with release-grant-root-mismatch before the digest runs', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(createReleaseRecord());
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: '/srv/fleet/other' },
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+  });
+
+  // RR1 fix round: `releaseRootsAgree` is pinned to exact string equality on
+  // the normalized roots. A case-insensitive comparison or a `startsWith`
+  // prefix comparison must fail these near-miss cases, not authorize them.
+  it.each([
+    { recorded: '/srv/rel', requested: '/srv/rel2' },
+    { recorded: '/srv/rel2', requested: '/srv/rel' },
+    { recorded: '/srv/Rel', requested: '/srv/rel' },
+  ])('refuses a near-miss root $recorded vs $requested with release-grant-root-mismatch (no prefix or case folding)', async ({ recorded, requested }) => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(createReleaseRecord({ releaseRoot: recorded }));
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: requested },
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+  });
+
+  // RR1 fix round: the idempotent replay return sits after the digest
+  // recompute, so a record whose stored coordinates were tampered with after
+  // consumption is refused on replay instead of replaying the receipt.
+  it('refuses a replay of an already-consumed release record whose stored root was tampered with after consumption', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    // The grant was consumed legitimately; afterwards its stored root was
+    // moved. The replay carries the same action and consumption ids and names
+    // the moved root, so the root check passes, but the recomputed digest no
+    // longer matches the id the grant is bound by.
+    await requestRepo.saveRequest(
+      createReleaseRecord({
+        releaseRoot: '/srv/fleet/moved',
+        state: 'completed',
+        consumptions: [{
+          consumptionId: 'c-1',
+          grantId: GRANT_ID,
+          requestId: 'req-earlier',
+          actionId: 'action-install-1',
+          attemptId: 'att-1',
+          expectedHeadSha: HEAD,
+          consumedAtIso: '2026-11-02T00:00:00.000Z',
+        }],
+      }),
+    );
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: '/srv/fleet/moved' },
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+  });
+
+  it('refuses a replay of an already-consumed release record whose stored nonce was tampered with after consumption', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(
+      createReleaseRecord({
+        releaseNonce: 'fedcba9876543210fedcba9876543210',
+        state: 'completed',
+        consumptions: [{
+          consumptionId: 'c-1',
+          grantId: GRANT_ID,
+          requestId: 'req-earlier',
+          actionId: 'action-install-1',
+          attemptId: 'att-1',
+          expectedHeadSha: HEAD,
+          consumedAtIso: '2026-11-02T00:00:00.000Z',
+        }],
+      }),
+    );
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
   });
 });

@@ -243,6 +243,269 @@ export function releaseRootsAgree(a: ReleaseRootRead, b: ReleaseRootRead): boole
 }
 
 /**
+ * The prefix of the request id a release grant is bound by (a digest of its
+ * coordinates, RR1). A release record whose id does not start with it carries
+ * an unsigned root (pre-RR1) and fails closed on resolve and consumption.
+ */
+export const RELEASE_GRANT_DIGEST_PREFIX = 'release-grant-' as const;
+
+/**
+ * Bounded-input caps for release grant coordinate parsing. Every parser here
+ * is linear in these caps and never traverses more than they allow: at most
+ * `MAX_RELEASE_GRANT_KEYS` own keys per object (exactly four are accepted)
+ * and at most `MAX_RELEASE_ROOT_LENGTH` characters of release root.
+ */
+export const MAX_RELEASE_ROOT_LENGTH = 4096 as const;
+export const MAX_RELEASE_GRANT_KEYS = 5 as const;
+
+/** A release grant's per-request nonce: exactly 32 lowercase hex characters (16 random bytes). */
+export function isReleaseNonce(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
+}
+
+/**
+ * Reads `releaseNonce` from a record through its own property descriptor. A
+ * missing, accessor or malformed value is `undefined`, so a release record
+ * without a valid nonce fails closed at the digest recompute.
+ */
+export function readReleaseNonce(record: object): string | undefined {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(record, 'releaseNonce');
+    if (descriptor === undefined || !('value' in descriptor)) {
+      return undefined;
+    }
+    return isReleaseNonce(descriptor.value) ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Every typed way a release grant coordinate read can fail closed. */
+export type ReleaseGrantErrorCode =
+  | 'release-grant-not-object'
+  | 'release-grant-unexpected-key'
+  | 'release-grant-accessor-forbidden'
+  | 'release-grant-forbidden-key'
+  | 'release-grant-invalid-scope'
+  | 'release-grant-invalid-project'
+  | 'release-grant-invalid-head'
+  | 'release-grant-invalid-root'
+  | 'release-grant-invalid-nonce'
+  | 'release-grant-invalid-input';
+
+/** The outcome of one release grant coordinate read: the coordinates, or a named refusal code. */
+export type ReleaseGrantCheck =
+  | {
+      readonly ok: true;
+      readonly value: {
+        readonly actionScope: string;
+        readonly projectId: string;
+        readonly expectedHeadSha: string;
+        readonly releaseRoot: string;
+        readonly nonce: string;
+      };
+    }
+  | { readonly ok: false; readonly code: ReleaseGrantErrorCode };
+
+const RELEASE_GRANT_KEYS = ['actionScope', 'projectId', 'expectedHeadSha', 'releaseRoot', 'nonce'] as const;
+const RELEASE_GRANT_FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
+
+/**
+ * True only for a plain object (no array, no function, prototype
+ * `Object.prototype` or null). Prototype and type checks never read the
+ * object's own properties, so no accessor or trap can run here. A revoked
+ * Proxy (whose target is gone) can make even `Array.isArray` or
+ * `Object.getPrototypeOf` throw; every such throw is a typed refusal, never
+ * an exception.
+ */
+function isPlainReleaseGrantObject(
+  value: unknown,
+): { readonly ok: true } | { readonly ok: false; readonly code: ReleaseGrantErrorCode } {
+  if (typeof value !== 'object' || value === null) {
+    return { ok: false, code: 'release-grant-not-object' };
+  }
+  let isArray: boolean;
+  try {
+    isArray = Array.isArray(value);
+  } catch {
+    return { ok: false, code: 'release-grant-invalid-input' };
+  }
+  if (isArray) {
+    return { ok: false, code: 'release-grant-not-object' };
+  }
+  let proto: unknown;
+  try {
+    proto = Object.getPrototypeOf(value);
+  } catch {
+    return { ok: false, code: 'release-grant-invalid-input' };
+  }
+  if (proto === Object.prototype || proto === null) {
+    return { ok: true };
+  }
+  return { ok: false, code: 'release-grant-not-object' };
+}
+
+type ReleaseGrantSnapshot =
+  | { readonly ok: true; readonly keys: string[]; readonly values: Record<string, unknown> }
+  | { readonly ok: false; readonly code: ReleaseGrantErrorCode };
+
+/**
+ * Snapshot a plain object's own enumerable data properties through their
+ * descriptors only. Cost is linear in `MAX_RELEASE_GRANT_KEYS` plus the
+ * bounded values copied; accessors are never invoked, symbol keys and
+ * non-enumerable data keys are refused, and a prototype-polluting key
+ * (`__proto__`, `constructor`, `prototype`) is refused before any key-set
+ * comparison so a polluting key can never masquerade as a field.
+ */
+function readReleaseGrantSnapshot(raw: object): ReleaseGrantSnapshot {
+  let ownKeys: PropertyKey[];
+  try {
+    ownKeys = Reflect.ownKeys(raw);
+  } catch {
+    return { ok: false, code: 'release-grant-not-object' };
+  }
+  const keys: string[] = [];
+  const values: Record<string, unknown> = {};
+  let forbiddenCode: ReleaseGrantErrorCode | undefined;
+  // A bounded prefix of `MAX_RELEASE_GRANT_KEYS + 1` keys is inspected, so the
+  // cost never grows past the cap; a prototype-polluting key seen inside that
+  // prefix is reported before any key-set comparison can mask it.
+  for (let index = 0; index < ownKeys.length; index += 1) {
+    if (index > MAX_RELEASE_GRANT_KEYS) {
+      return { ok: false, code: forbiddenCode ?? 'release-grant-unexpected-key' };
+    }
+    const key = ownKeys[index];
+    if (typeof key !== 'string' || key.length === 0) {
+      return { ok: false, code: 'release-grant-unexpected-key' };
+    }
+    if ((RELEASE_GRANT_FORBIDDEN_KEYS as readonly string[]).includes(key)) {
+      forbiddenCode = 'release-grant-forbidden-key';
+      continue;
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(raw, key);
+    } catch {
+      return { ok: false, code: 'release-grant-accessor-forbidden' };
+    }
+    if (descriptor === undefined) {
+      return { ok: false, code: 'release-grant-unexpected-key' };
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { ok: false, code: 'release-grant-accessor-forbidden' };
+    }
+    if (descriptor.enumerable !== true) {
+      return { ok: false, code: 'release-grant-unexpected-key' };
+    }
+    keys.push(key);
+    values[key] = descriptor.value;
+  }
+  if (forbiddenCode !== undefined) {
+    return { ok: false, code: forbiddenCode };
+  }
+  return { ok: true, keys, values };
+}
+
+/** A bounded non-empty string of at most 256 characters with no control character. */
+function isBoundedTextField(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.trim().length > 0 &&
+    value.length <= 256 &&
+    !/[\p{C}]/u.test(value)
+  );
+}
+
+/**
+ * Read a release grant's coordinates from hostile runtime data and never
+ * throw. Only own data-property descriptors are read (an accessor's getter
+ * never runs, a Proxy with a `get` trap is never invoked by it), arrays are
+ * refused before any indexing (so a sparse array of length 2**32 - 1 is
+ * refused in O(1)), the key set is exactly
+ * `['actionScope', 'projectId', 'expectedHeadSha', 'releaseRoot', 'nonce']`, and the
+ * fields are bounded: the action scope is one of `RELEASE_ACTION_SCOPES`, the
+ * project id and expected head are non-empty trimmed strings of at most 256
+ * characters with no control character, and the release root passes
+ * `isReleaseRootCoordinate` (at most `MAX_RELEASE_ROOT_LENGTH` characters).
+ * Cost is linear in `MAX_RELEASE_GRANT_KEYS * 2 + MAX_RELEASE_ROOT_LENGTH`;
+ * nothing else is read.
+ */
+export function parseReleaseGrantCoordinates(raw: unknown): ReleaseGrantCheck {
+  const shape = isPlainReleaseGrantObject(raw);
+  if (!shape.ok) {
+    return shape;
+  }
+  if (typeof raw !== 'object' || raw === null) {
+    return { ok: false, code: 'release-grant-not-object' };
+  }
+  const snapshot = readReleaseGrantSnapshot(raw);
+  if (!snapshot.ok) {
+    return snapshot;
+  }
+  if (
+    snapshot.keys.length !== RELEASE_GRANT_KEYS.length ||
+    !RELEASE_GRANT_KEYS.every((key) => snapshot.keys.includes(key))
+  ) {
+    return { ok: false, code: 'release-grant-unexpected-key' };
+  }
+  const { actionScope, projectId, expectedHeadSha, releaseRoot, nonce } = snapshot.values;
+  if (typeof actionScope !== 'string' || !isReleaseActionScope(actionScope)) {
+    return { ok: false, code: 'release-grant-invalid-scope' };
+  }
+  if (!isBoundedTextField(projectId)) {
+    return { ok: false, code: 'release-grant-invalid-project' };
+  }
+  if (!isBoundedTextField(expectedHeadSha)) {
+    return { ok: false, code: 'release-grant-invalid-head' };
+  }
+  if (!isReleaseRootCoordinate(releaseRoot)) {
+    return { ok: false, code: 'release-grant-invalid-root' };
+  }
+  if (!isReleaseNonce(nonce)) {
+    return { ok: false, code: 'release-grant-invalid-nonce' };
+  }
+  return {
+    ok: true,
+    value: Object.freeze({
+      actionScope,
+      projectId,
+      expectedHeadSha,
+      releaseRoot,
+      nonce,
+    }),
+  };
+}
+
+/**
+ * The canonical digest payload a release grant is bound by: the exact scope,
+ * project, expected head and release root, in a frozen key order. The request
+ * id carries its digest (computed by the injected dependency, never by this
+ * module), so the owner's Ed25519 decision signature — which does not name
+ * the release root — still covers it through the request id it approves.
+ * Delegates to `parseReleaseGrantCoordinates`, so the cost bound (linear in
+ * `MAX_RELEASE_GRANT_KEYS` and `MAX_RELEASE_ROOT_LENGTH`) and the
+ * never-throw, never-run-accessors guarantees are the same.
+ */
+export function releaseGrantDigestPayload(
+  raw: unknown,
+): { readonly ok: true; readonly value: string } | { readonly ok: false; readonly code: ReleaseGrantErrorCode } {
+  const parsed = parseReleaseGrantCoordinates(raw);
+  if (!parsed.ok) {
+    return parsed;
+  }
+  return {
+    ok: true,
+    value: JSON.stringify({
+      scope: parsed.value.actionScope,
+      projectId: parsed.value.projectId,
+      expectedHeadSha: parsed.value.expectedHeadSha,
+      releaseRoot: parsed.value.releaseRoot,
+      nonce: parsed.value.nonce,
+    }),
+  };
+}
+
+/**
  * The exact scope of a standing shadow import grant (owner decision
  * 2026-11-18): the unattended shadow-intake timer authorizes
  * `fleet-v2 merge import --apply` with it. It is a standing owner grant:
@@ -650,6 +913,13 @@ export interface CoordinationRequestRecord {
    * refused, so a grant for one root never authorizes another.
    */
   readonly releaseRoot?: string;
+  /**
+   * The per-request nonce of a release grant (RR1 fix round): 32 lowercase hex
+   * characters, digested into the request id so the same coordinates can be
+   * requested again after a use, a rollback or a denial. Required on a release
+   * record; a missing or malformed one fails the digest recompute closed.
+   */
+  readonly releaseNonce?: string;
   /**
    * The standing shadow import grant's coordinates (owner decision
    * 2026-11-18); only a `merge:import-shadow` request carries one, and it is

@@ -692,35 +692,53 @@ function ownDataProperty(value: object, key: string): unknown {
   return Object.getOwnPropertyDescriptor(value, key)?.value;
 }
 
+/** A frozen plain-object copy of one daemon event's fields (see `snapshotEvent`). */
+type DaemonEventSnapshot = { readonly kind: string; readonly recordedAtIso: string } & { readonly [field: string]: unknown };
+
 /**
- * OD7a2 fix round: the ONE validator for the raw daemon events handed back
- * by `readAfterCursor`. An event is well-formed only when it is a non-null
- * plain object with own data properties `kind` and `recordedAtIso`, both
- * strings — no accessor (getter/setter) ever satisfies it, and every
- * reflective read is wrapped so a Proxy with throwing traps yields `false`
- * instead of a throw. It is applied exactly once, where the events are read;
- * every later loop and filter uses the validated array only. Cost is O(1)
- * per event.
+ * OD7a2 fix round: the ONE validator and snapshotter for the raw daemon
+ * events handed back by `readAfterCursor`. Every own key is read exactly
+ * once, from its own data descriptor's `value` (which never runs a getter),
+ * and copied into a NEW frozen plain object with the same key set; nothing
+ * is read a second time through the original, so a Proxy whose descriptors
+ * and `get` trap disagree can only yield the descriptor's values. The event
+ * is malformed — `null` — only when it is not a non-null object or when the
+ * descriptor-read of `kind`/`recordedAtIso` did not yield a string; a
+ * descriptor read that throws or reports an accessor carries `undefined`
+ * for that key (which `evaluateShadowTickHealth` later rejects), so the
+ * domain evaluator stays the ONE full-record validator and the verdicts are
+ * unchanged. Cost is O(1) per event (linear in the event's capped key set —
+ * a fixed 10-field projection record).
  */
-function isWellFormedEvent(event: unknown): boolean {
+function snapshotEvent(event: unknown): DaemonEventSnapshot | null {
   try {
     if (typeof event !== 'object' || event === null) {
-      return false;
+      return null;
     }
-    const kind = Object.getOwnPropertyDescriptor(event, 'kind');
-    if (kind === undefined || kind.get !== undefined || kind.set !== undefined || typeof kind.value !== 'string') {
-      return false;
+    const snapshot = {} as Record<PropertyKey, unknown>;
+    for (const key of Reflect.ownKeys(event as object)) {
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(event as object, key);
+      } catch {
+        descriptor = undefined;
+      }
+      // The key set mirrors the original (even for a read that failed), so
+      // the domain evaluator sees exactly the keys it would have seen; the
+      // carried value is whatever the one descriptor read returned.
+      Object.defineProperty(snapshot, key, {
+        value: descriptor === undefined ? undefined : descriptor.value,
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      });
     }
-    const recordedAt = Object.getOwnPropertyDescriptor(event, 'recordedAtIso');
-    if (
-      recordedAt === undefined || recordedAt.get !== undefined || recordedAt.set !== undefined ||
-      typeof recordedAt.value !== 'string'
-    ) {
-      return false;
+    if (typeof snapshot.kind !== 'string' || typeof snapshot.recordedAtIso !== 'string') {
+      return null;
     }
-    return true;
+    return Object.freeze(snapshot) as DaemonEventSnapshot;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1005,11 +1023,18 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (read.kind === 'threw' || !read.value.ok) {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
     }
-    // OD7a2 fix round: the raw events are validated exactly ONCE, here, by
-    // `isWellFormedEvent`; every later loop and filter below uses the
-    // validated array only and may dereference `kind`/`recordedAtIso`
-    // directly. A malformed event is dropped, never thrown on.
-    const validatedEvents = read.value.events.filter((event: unknown) => isWellFormedEvent(event));
+    // OD7a2 fix round: the raw events are validated and snapshotted exactly
+    // ONCE, here, by `snapshotEvent`; every later loop and filter below uses
+    // the snapshot array only and may dereference `kind`/`recordedAtIso`
+    // directly, never the original (which a Proxy could make disagree).
+    // A malformed event is dropped, never thrown on.
+    const validatedEvents: DaemonEventSnapshot[] = [];
+    for (const event of read.value.events) {
+      const snapshot = snapshotEvent(event);
+      if (snapshot !== null) {
+        validatedEvents.push(snapshot);
+      }
+    }
     const dayStartMs = serialOfUtcDay(context.day) * DAY_MS;
     let earliestInDayMs: number | null = null;
     for (const event of validatedEvents) {
@@ -1033,7 +1058,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     }
     // 3. S12 precheck over the windowed events: an unknown evaluation and a
     // `too-few-ticks` failure each stop the run before anything is written.
-    const windowed = validatedEvents.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
+    const windowed = validatedEvents.filter((event: DaemonEventSnapshot) => this.inTickWindow(event.recordedAtIso, context.day));
     const evaluation = evaluateShadowTickHealth({ day: context.day, events: windowed });
     const tickHealth: CriterionOutcome = { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
     if (evaluation.status === 'unknown') {

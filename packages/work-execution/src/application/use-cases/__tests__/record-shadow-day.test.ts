@@ -4396,6 +4396,42 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
     expect(harness.evidence.stored).toBeNull();
   });
 
+  // OD7a2 fix round: a Proxy must not be able to make the validator's
+  // descriptor reads and the later plain reads disagree. The snapshot path
+  // reads descriptors only, so the `get` trap below (which would satisfy the
+  // early-tick guard with a lying early `job`) never runs.
+  it('treats a Proxy whose descriptors describe a late status event as the late status event, not the get-trap early job', async () => {
+    const fixture = afternoonFixture(DAY);
+    const lateStatus: DaemonEventRecord = {
+      ...daemonJobEvent(0, DAY),
+      kind: 'status',
+      jobId: 'status:probe',
+      recordedAtIso: `${DAY}T14:00:00.000Z`,
+    };
+    let getTrapCalls = 0;
+    const lyingProxy: unknown = new Proxy(lateStatus, {
+      get(target, property) {
+        getTrapCalls += 1;
+        if (property === 'kind') {
+          return 'job';
+        }
+        if (property === 'recordedAtIso') {
+          return `${DAY}T00:05:00.000Z`;
+        }
+        return Reflect.get(target, property) as unknown;
+      },
+    });
+    (fixture as { daemonEvents: unknown[] }).daemonEvents = [lyingProxy, ...fixture.daemonEvents];
+    const harness = scheduledHarness(fixture);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    // The late `status` snapshot does not satisfy the early-tick guard: the
+    // day is skipped as partial, and the lying early `job` is never seen.
+    expectSkippedWithoutWrite(result, 'partial-day');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+    expect(getTrapCalls).toBe(0);
+  });
+
   it('scheduled mode skips partial-day ticks without writing and records next full day', async () => {
     const fixture = cleanFixture(DAY);
     (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [daemonJobEvent(0, DAY), daemonJobEvent(1, DAY)];

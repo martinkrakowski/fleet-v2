@@ -241,14 +241,32 @@ function readUpdatedEvent(
  */
 export const SHADOW_CARRY_MAX_DECISIONS = SHADOW_SHELL_FACTS_MAX_EVENTS / 2;
 
-/** The S5' evaluation adds the replay counters to the shared criterion shape. */
+/**
+ * The cap on the unresolved-decision ids echoed in S5''s non-digested
+ * diagnostics: `unresolvedCount` always holds the full deduped unresolved
+ * count, while `unresolvedIds` holds at most this many ids, so the result
+ * stays bounded however many decisions a day carried (2026-11-18 owner
+ * decision).
+ */
+export const SHADOW_CARRY_MAX_UNRESOLVED_IDS = 50;
+
+/**
+ * The S5' evaluation adds the replay counters to the shared criterion shape,
+ * plus the non-digested unresolved diagnostics: `unresolvedCount` is the full
+ * deduped count of day-scoped decisions the fleet resolver left `unknown`, and
+ * `unresolvedIds` holds at most `SHADOW_CARRY_MAX_UNRESOLVED_IDS` sorted,
+ * bounded ids for them. Neither field is ever part of the S5' digest.
+ */
 export type ShadowPremergeCarryEvaluation = ShadowCriterionEvaluation & {
   readonly compared: number;
   readonly laxCarries: number;
   readonly stricterNoCarries: number;
+  readonly unresolvedCount: number;
+  readonly unresolvedIds: readonly string[];
 };
 
 interface ScopedDecision {
+  readonly pullRequest: number;
   readonly newHeadOid: string;
   readonly atIso: string;
   readonly shellCarry: 'carried' | 'not-carried';
@@ -281,19 +299,29 @@ const REFUSAL = (reason: string): ShadowPremergeCarryEvaluation => ({
   compared: 0,
   laxCarries: 0,
   stricterNoCarries: 0,
+  unresolvedCount: 0,
+  unresolvedIds: [],
 });
 const INVALID_PARSE = { ok: false, reason: 'invalid' } as const;
 const SHELL_INCOMPLETE_PARSE = { ok: false, reason: 'shell-incomplete' } as const;
 
 /**
  * S5' (OD-3b): replay the shell train's premerge carry decisions through
- * fleet-v2's answer and require the two to agree. Cost: linear in the capped
- * input — at most `SHADOW_CARRY_MAX_DECISIONS` decisions plus
- * `SHADOW_SHELL_FACTS_MAX_EVENTS` anomalies, each read through its own data
- * property descriptors, so no getter and no Proxy `get` trap ever runs; the
- * list caps are checked from the length descriptors before any element is
- * read. Never throws; every refusal is the typed unknown result with the
- * named reason, and no input value is ever echoed into the result.
+ * fleet-v2's answer and require the two to agree on every decision the
+ * resolver could answer (`carry`/`no-carry`). A decision the resolver left
+ * `unknown` is never compared: per the 2026-11-18 owner decision it is
+ * reported in the non-digested diagnostics `unresolvedCount` (the full
+ * deduped unresolved count) and `unresolvedIds` (at most
+ * `SHADOW_CARRY_MAX_UNRESOLVED_IDS` ids, each
+ * `${pullRequest}@${newHeadOid.slice(0, 12)}`, sorted) instead — the PR ids
+ * with head prefixes are echoed deliberately there, and only there, bounded
+ * by the caps. Cost: linear in the capped input — at most
+ * `SHADOW_CARRY_MAX_DECISIONS` decisions plus `SHADOW_SHELL_FACTS_MAX_EVENTS`
+ * anomalies, each read through its own data property descriptors, so no
+ * getter and no Proxy `get` trap ever runs; the list caps are checked from
+ * the length descriptors before any element is read — plus an O(u log u)
+ * sort over at most `SHADOW_CARRY_MAX_DECISIONS` unresolved ids. Never
+ * throws; every refusal is the typed unknown result with the named reason.
  */
 export function evaluateShadowPremergeCarry(input: unknown): ShadowPremergeCarryEvaluation {
   try {
@@ -316,14 +344,25 @@ function evaluateCarry(input: unknown): ShadowPremergeCarryEvaluation {
   if (dayAnomalies.some((anomaly) => PAIRING_ANOMALY_CODES.includes(anomaly.code))) {
     return REFUSAL('carry-pairing-incomplete');
   }
-  if (dayDecisions.some((decision) => decision.fleetCarry === 'unknown')) {
-    return REFUSAL('fleet-carry-unknown');
-  }
   const deduped = dedupeByNewHead(dayDecisions);
   if (deduped === null) {
     return REFUSAL('carry-facts-conflicting');
   }
-  return compareCarries(deduped);
+  // 2026-11-18 owner decision: S5' compares only the decisions fleet-v2 can
+  // resolve. An `unknown` answer is never treated as a success or a failure —
+  // it is recorded in the non-digested diagnostics instead of refusing the
+  // day, and a lax carry whose decision is unresolved is missed by design.
+  // When every deduped in-day decision is unresolved the day still passes
+  // with `compared: 0` plus the unresolved count (owner acceptance:
+  // while the composition pins the resolver to `'unknown'`, S5' compares
+  // nothing on any day with a complete, paired shell log).
+  const resolved = deduped.filter((decision) => decision.fleetCarry !== 'unknown');
+  const unresolved = deduped.filter((decision) => decision.fleetCarry === 'unknown');
+  const unresolvedIds = unresolved
+    .map((decision) => `${decision.pullRequest}@${decision.newHeadOid.slice(0, 12)}`)
+    .sort()
+    .slice(0, SHADOW_CARRY_MAX_UNRESOLVED_IDS);
+  return compareCarries(resolved, unresolved.length, unresolvedIds);
 }
 
 /** The whole input, validated down to typed decisions and anomalies. */
@@ -450,7 +489,7 @@ function readCarryDecision(raw: unknown): ScopedDecision | null {
   if (fleetCarry !== 'carry' && fleetCarry !== 'no-carry' && fleetCarry !== 'unknown') {
     return null;
   }
-  return { newHeadOid, atIso, shellCarry, fleetCarry };
+  return { pullRequest, newHeadOid, atIso, shellCarry, fleetCarry };
 }
 
 /** One anomaly as S5' reads it, or null when out of shape. */
@@ -478,7 +517,9 @@ function inDayWindow(atIso: string, start: number, end: number): boolean {
 /**
  * Decisions sharing a `newHeadOid` collapse into one when both the shell and
  * the fleet carry agree; any disagreement is a conflict, since the same head
- * cannot carry two different answers.
+ * cannot carry two different answers. A resolved answer and an `'unknown'`
+ * answer for the same head disagree on `fleetCarry` too, so they refuse the
+ * same way — an unresolved decision never overrides a resolved one.
  */
 function dedupeByNewHead(decisions: readonly ScopedDecision[]): readonly ScopedDecision[] | null {
   const byHead = new Map<string, ScopedDecision>();
@@ -496,11 +537,18 @@ function dedupeByNewHead(decisions: readonly ScopedDecision[]): readonly ScopedD
 }
 
 /**
- * The equality check itself: one linear pass over the deduped decisions, in
- * which the fleet is lax (carrying where the shell did not) or stricter
- * (not carrying where the shell did) — either breaks the equality criterion.
+ * The equality check itself: one linear pass over the deduped, resolved
+ * decisions, in which the fleet is lax (carrying where the shell did not) or
+ * stricter (not carrying where the shell did) — either breaks the equality
+ * criterion. `compared` counts resolved decisions only (2026-11-18 owner
+ * decision), so it is resolver-dependent; the unresolved decisions ride along
+ * only as the non-digested diagnostics.
  */
-function compareCarries(decisions: readonly ScopedDecision[]): ShadowPremergeCarryEvaluation {
+function compareCarries(
+  decisions: readonly ScopedDecision[],
+  unresolvedCount: number,
+  unresolvedIds: readonly string[],
+): ShadowPremergeCarryEvaluation {
   let laxCarries = 0;
   let stricterNoCarries = 0;
   for (const decision of decisions) {
@@ -518,6 +566,8 @@ function compareCarries(decisions: readonly ScopedDecision[]): ShadowPremergeCar
       compared: decisions.length,
       laxCarries,
       stricterNoCarries,
+      unresolvedCount,
+      unresolvedIds,
     };
   }
   return {
@@ -526,5 +576,7 @@ function compareCarries(decisions: readonly ScopedDecision[]): ShadowPremergeCar
     compared: decisions.length,
     laxCarries: 0,
     stricterNoCarries: 0,
+    unresolvedCount,
+    unresolvedIds,
   };
 }

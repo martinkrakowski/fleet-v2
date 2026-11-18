@@ -10,7 +10,13 @@
 // other criterion as unevaluated: never a pass, never a silent fail. Nothing
 // is ever written to the ledger on any refused or unknown outcome. Every
 // outbound call is deadline-guarded with the same pattern
-// ManageCutoverUseCase uses; no path or raw input value is ever echoed.
+// ManageCutoverUseCase uses; no path or raw input value is ever echoed. The
+// one deliberate exception is S5''s bounded `unresolvedIds` (PR ids with
+// 12-hex head prefixes, capped by `SHADOW_CARRY_MAX_UNRESOLVED_IDS`, sorted):
+// per the 2026-11-18 owner decision the ids of the carry decisions the
+// resolver left `unknown` are echoed on `RecordShadowDayResult` as
+// non-digested diagnostics so the CLI output shows what S5' could not
+// compare.
 
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { type DaemonEventRecord } from '../../domain/daemon-events.js';
@@ -309,6 +315,14 @@ interface BuiltVerdicts {
   readonly verdicts: Readonly<Partial<Record<CutoverShadowCriterion, ShadowCriterionVerdict>>>;
   readonly unevaluated: ReadonlyMap<CutoverShadowCriterion, string>;
   readonly mergesCompared: number | null;
+  /**
+   * Present only when S5' was evaluated: its non-digested unresolved
+   * diagnostics, carried onto `RecordShadowDayResult` for CLI observability.
+   */
+  readonly premergeCarry?: {
+    readonly unresolvedCount: number;
+    readonly unresolvedIds: readonly string[];
+  };
 }
 
 function unevaluatedOutcome(criterion: CutoverShadowCriterion, reason: string): CriterionOutcome {
@@ -1098,10 +1112,14 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * `run()` from the events bounded to the day's own end) and the optional
    * `premergeCarry` resolver. Only the day's own decisions are resolved: a
    * decision the resolver throws on, or answers with anything but
-   * `carry`/`no-carry`, counts as `unknown`, which the evaluator refuses
-   * with `fleet-carry-unknown` rather than guessing. The decisions and
-   * anomalies handed to the evaluator are fresh plain objects built from the
-   * extracted facts, never caller-supplied structures.
+   * `carry`/`no-carry`, counts as `unknown` — per the 2026-11-18 owner
+   * decision the evaluator no longer refuses such a day as
+   * `fleet-carry-unknown`; it records the unresolved decisions in its
+   * non-digested diagnostics (`unresolvedCount`/`unresolvedIds`) and compares
+   * only the resolvable decisions, failing the day on any resolvable lax
+   * carry or stricter no-carry. The decisions and anomalies handed to the
+   * evaluator are fresh plain objects built from the extracted facts, never
+   * caller-supplied structures.
    */
   private async evaluatePremergeCarryCriterion(
     context: DayContext,
@@ -1416,16 +1434,23 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       return JSON.stringify(base);
     }
     /**
-     * S5' hashes `compared` with the base: it is the count of deduped,
-     * day-scoped carry decisions the evaluator compared, so it is closed-day
-     * deterministic — a day with zero carry decisions records `pass`
-     * (`carry-decisions-equal`) with `compared: 0` and counts toward the
-     * evidence window. `laxCarries` and `stricterNoCarries` depend on the
-     * (possibly absent) `premergeCarry` resolver's answers between two runs
-     * and stay on `outcome.premergeCarry` as non-digested diagnostics, so a
-     * resolver-less rerun of an evaluated day cannot silently become a
-     * verdict conflict. This is a new digest format (allowed because no live
-     * shadow day has been recorded yet).
+     * S5' hashes `compared` with the base. Per the 2026-11-18 owner decision
+     * `compared` counts only the deduped, day-scoped carry decisions the
+     * resolver answered (`carry`/`no-carry`), so it is resolver-dependent:
+     * deterministic at `0` while the composition pins the resolver to
+     * `'unknown'` (S5' then compares nothing and is a constant pass on any
+     * day with a complete, paired shell log — owner-accepted), but if a real
+     * resolver later answers differently on a rerun the digest changes and
+     * `verdict-conflict` refuses that day; earlier recorded days are not
+     * comparable to days recorded after this change. A lax carry is missed
+     * whenever its decision is unresolved, including on a transient resolver
+     * throw — by design. The unresolved decisions stay on
+     * `outcome.premergeCarry` (and on `RecordShadowDayResult`) as
+     * non-digested diagnostics: `unresolvedCount` and the bounded
+     * `unresolvedIds` are never digested, so a rerun whose only difference is
+     * which decisions stayed unresolved cannot silently become a verdict
+     * conflict. This is a new digest format (allowed because no live shadow
+     * day has been recorded yet).
      */
     if (outcome.premergeCarry !== undefined) {
       return JSON.stringify({ ...base, compared: outcome.premergeCarry.compared });
@@ -1461,6 +1486,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     const verdicts: Partial<Record<CutoverShadowCriterion, ShadowCriterionVerdict>> = {};
     const unevaluated = new Map<CutoverShadowCriterion, string>();
     let mergesCompared: number | null = null;
+    let premergeCarry: BuiltVerdicts['premergeCarry'] = undefined;
     const recordedAtIso = this.deps.nowIso();
     for (const outcome of outcomes) {
       if (outcome.kind === 'unevaluated') {
@@ -1480,11 +1506,20 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       if (outcome.mergeSet !== undefined) {
         mergesCompared = outcome.mergeSet.mergesCompared;
       }
+      // S5''s unresolved diagnostics ride along to the result as non-digested
+      // diagnostics (never digested), so `cutover shadow record-day` prints
+      // what the day's replay could not compare.
+      if (outcome.premergeCarry !== undefined) {
+        premergeCarry = {
+          unresolvedCount: outcome.premergeCarry.unresolvedCount,
+          unresolvedIds: outcome.premergeCarry.unresolvedIds,
+        };
+      }
     }
     for (const criterion of NOT_IMPLEMENTED_CRITERIA) {
       unevaluated.set(criterion, 'not-implemented');
     }
-    return { verdicts, unevaluated, mergesCompared };
+    return { verdicts, unevaluated, mergesCompared, ...(premergeCarry === undefined ? {} : { premergeCarry }) };
   }
 
   /** The use-case answer for a `recordShadowVerdicts` refusal code. */
@@ -1539,6 +1574,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       revision: ledger.revision,
       recorded,
       unevaluated,
+      ...(built.premergeCarry === undefined ? {} : { premergeCarry: built.premergeCarry }),
     };
   }
 

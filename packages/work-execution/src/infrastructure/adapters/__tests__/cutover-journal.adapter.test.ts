@@ -410,8 +410,9 @@ describe('isCutoverJournalKey and SHADOW_IMPORT_KEY (GR1b)', () => {
 
   it('an identity echo would fail: the predicate answers a boolean, never the input', () => {
     const key = validShadowKey();
-    expect(isCutoverJournalKey(key)).toBe(true);
-    expect(isCutoverJournalKey(key)).not.toBe(key);
+    const verdict: unknown = isCutoverJournalKey(key);
+    expect(verdict).toBe(true);
+    expect(verdict).not.toBe(key);
   });
 
   it('a shadow-intake entry appends and lists under its key prefix', async () => {

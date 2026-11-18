@@ -155,6 +155,45 @@ function boundedString(value: unknown): string | null {
  * requires both, non-empty, before any read or write. Cost: linear in the
  * capped input (see `MAX_REQUEST_OWN_KEYS` / `MAX_REQUEST_FIELD_LENGTH`).
  */
+/**
+ * Resolves the `repository` field of an already-snapshotted request into a
+ * valid `{ owner, repo }` ref, or `null` when anything about it is invalid.
+ */
+function resolveRepository(raw: unknown): { owner: string; repo: string } | null {
+  const snapshot = snapshotPlainObject(raw);
+  if (snapshot === null) {
+    return null;
+  }
+  const owner = boundedString(snapshot['owner']);
+  const repo = boundedString(snapshot['repo']);
+  if (owner === null || repo === null) {
+    return null;
+  }
+  const repository = { owner, repo };
+  return isValidRepositoryRef(repository) ? repository : null;
+}
+
+/**
+ * The apply-only credential checks: an apply requires a non-empty `projectId`
+ * and then a non-empty `grantId`; a dry run needs neither.
+ */
+function applyCredentialRefusal(
+  apply: boolean,
+  grantId: string | null,
+  projectId: string | null,
+): 'project-required' | 'grant-missing' | null {
+  if (!apply) {
+    return null;
+  }
+  if (projectId === null || projectId.trim() === '') {
+    return 'project-required';
+  }
+  if (grantId === null || grantId.trim() === '') {
+    return 'grant-missing';
+  }
+  return null;
+}
+
 export function validateImportTrainStateRequest(raw: unknown): ImportTrainStateRequestValidation {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     return { ok: false, reason: 'invalid-request' };
@@ -163,15 +202,8 @@ export function validateImportTrainStateRequest(raw: unknown): ImportTrainStateR
   if (snapshot === null) {
     return { ok: false, reason: 'invalid-request' };
   }
-  const repositorySnapshot = snapshotPlainObject(snapshot['repository']);
-  if (repositorySnapshot === null) {
-    return { ok: false, reason: 'invalid-repository' };
-  }
-  const owner = boundedString(repositorySnapshot['owner']);
-  const repo = boundedString(repositorySnapshot['repo']);
-  const repository =
-    owner !== null && repo !== null ? { owner, repo } : null;
-  if (repository === null || !isValidRepositoryRef(repository)) {
+  const repository = resolveRepository(snapshot['repository']);
+  if (repository === null) {
     return { ok: false, reason: 'invalid-repository' };
   }
   const stateDir = boundedString(snapshot['stateDir']);
@@ -187,13 +219,9 @@ export function validateImportTrainStateRequest(raw: unknown): ImportTrainStateR
   const grantId = typeof rawGrantId === 'string' && rawGrantId.length <= MAX_REQUEST_FIELD_LENGTH ? rawGrantId : null;
   const projectId =
     typeof rawProjectId === 'string' && rawProjectId.length <= MAX_REQUEST_FIELD_LENGTH ? rawProjectId : null;
-  if (apply) {
-    if (projectId === null || projectId.trim() === '') {
-      return { ok: false, reason: 'project-required' };
-    }
-    if (grantId === null || grantId.trim() === '') {
-      return { ok: false, reason: 'grant-missing' };
-    }
+  const credentialRefusal = applyCredentialRefusal(apply, grantId, projectId);
+  if (credentialRefusal !== null) {
+    return { ok: false, reason: credentialRefusal };
   }
   return { ok: true, request: { repository, stateDir, apply, grantId, projectId } };
 }

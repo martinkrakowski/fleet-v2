@@ -16,8 +16,11 @@ import {
   AttemptRepositoryAdapter,
   ChainRepositoryAdapter,
   ForgeReadAdapter,
+  ImportTrainStateUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  MergeQueueRepositoryAdapter,
+  ReadOnlyStateStoreError,
   ShadowAttestationAdapter,
   type RecordShadowDayDependencies,
 } from '@fleet/work-execution';
@@ -494,6 +497,44 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     expect(deps.legacy).toBe(runtime.execution.legacyTrainState);
   });
 
+  // SH19d: the queue seat must be a fresh read-only MergeQueueRepositoryAdapter,
+  // never the shared writable execution.mergeQueueRepository — a corrupt
+  // merge-queue.json is a read error here, never a quarantine.
+  it('wires queue as a fresh read-only MergeQueueRepositoryAdapter, not execution.mergeQueueRepository, and refuses writes with ReadOnlyStateStoreError', async () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    expect(deps.queue).toBeInstanceOf(MergeQueueRepositoryAdapter);
+    expect(readOnlyOf(deps.queue)).toBe(true);
+    expect(deps.queue).not.toBe(runtime.execution.mergeQueueRepository);
+    await expect(
+      (deps.queue as unknown as MergeQueueRepositoryAdapter).enqueueMergeEntry({
+        repository: { owner: 'fleet', repo: 'v2' },
+        pullRequest: 1,
+        headOid: 'a'.repeat(40),
+        tier: 1,
+        enqueuedBy: 'cli',
+        runId: null,
+        entryId: '01HW1Q1Q1Q1Q1Q1Q1Q1Q1Q1Q1Q',
+        successorEntryId: '01HW1Q1Q1Q1Q1Q1Q1Q1Q1Q1Q1R',
+        enqueuedAtIso: new Date().toISOString(),
+        deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    ).rejects.toThrow(ReadOnlyStateStoreError);
+  });
+
+  // SH19d: the dry-run seat is a fresh ImportTrainStateUseCase over the same
+  // read-only queue — listMergeEntries runs before the apply check, so the
+  // read-only wiring covers S8's dry run too.
+  it('wires importDryRun as a fresh ImportTrainStateUseCase over the same read-only queue, not execution.importTrainState', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    expect(deps.importDryRun).toBeInstanceOf(ImportTrainStateUseCase);
+    expect(deps.importDryRun).not.toBe(runtime.execution.importTrainState);
+    const dryRunQueue = (deps.importDryRun as unknown as { deps: { queue: unknown } }).deps.queue;
+    expect(dryRunQueue).toBe(deps.queue);
+    expect(dryRunQueue).not.toBe(runtime.execution.mergeQueueRepository);
+  });
+
   // Luna's pre-merge fix 1: the composition's `premergeCarry` must give the
   // resolver `unknown` (owner decision), so S5' records `unknown` and never
   // `pass` when there are carry decisions. If the composition were mutated to
@@ -596,16 +637,18 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     // One corrupt file per reader store the record-day readers read:
     // runs -> lane-runs.json, journal -> run-journal.json, attempts ->
     // attempts.json, receipts -> evidence-assessments.json, chains ->
-    // chains/<sha>.json, attestations -> cutover-shadow-attestations.json;
-    // shell events -> the fixture's events.jsonl. The forge reader has no
-    // state file. cutover-shadow.json is deliberately NOT seeded: the ledger
-    // is the one store the use case owns and writes, not a reader.
+    // chains/<sha>.json, attestations -> cutover-shadow-attestations.json,
+    // queue -> merge-queue.json; shell events -> the fixture's events.jsonl.
+    // The forge reader has no state file. cutover-shadow.json is deliberately
+    // NOT seeded: the ledger is the one store the use case owns and writes,
+    // not a reader.
     const corruptFiles: ReadonlyArray<readonly [string, string]> = [
       ['lane-runs.json', '{ not json'],
       ['run-journal.json', '{ not json'],
       ['attempts.json', '{ not json'],
       ['evidence-assessments.json', '{ not json'],
       ['cutover-shadow-attestations.json', '{ not json'],
+      ['merge-queue.json', '{ not json'],
       [path.join('chains', 'c'.repeat(64) + '.json'), '{ not json'],
     ];
     for (const [name, bytes] of corruptFiles) {
@@ -642,6 +685,9 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       }
       // And no quarantine-shaped sibling anywhere under either directory.
       expect([...afterStateFiles.keys()].filter((file) => file.includes('quarantine'))).toEqual([]);
+      // SH19d: no quarantine directory either — the read-only queue reader
+      // and the read-only dry-run import never quarantine anything.
+      await expect(fs.access(path.join(stateDir, 'quarantine'))).rejects.toThrow();
     } finally {
       vi.useRealTimers();
     }

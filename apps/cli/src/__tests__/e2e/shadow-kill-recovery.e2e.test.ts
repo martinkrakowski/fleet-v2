@@ -445,7 +445,11 @@ describe('S10: shadow kill-9 mid-pass recovery', () => {
 
     // Past the expiry but still inside the backoff: lease takeover at fence 2,
     // and the persisted park is preserved untouched: still parked with the
-    // same reason, same attempt, same revision.
+    // same reason, same attempt, same revision. The takeover's unchanged-entry
+    // half rests on the re-park guard `sameMergeEntryContent` in `recordPark`
+    // (`RunMergePassUseCase.use-case.ts`): a parked entry whose re-park record
+    // carries the same content apart from the revision is answered no-action
+    // and never rewritten.
     advance(10_000); // clock now T0 + 20_000 ms: past the 15 s lease, before the 30 s backoff
     const recovery = runtimeOver(h.killDir, ghStub('FAILURE'));
     const result = await run(recovery, ['daemon', 'tick']);
@@ -464,6 +468,120 @@ describe('S10: shadow kill-9 mid-pass recovery', () => {
       revision: killedEntry.revision,
     });
     const lease = await recovery.daemon.lease.read(leaseScope(REPO_A));
+    expect(lease === null || Date.parse(lease.leaseUntilIso) <= Date.parse(clockIso())).toBe(true);
+
+    // One more tick over the same unchanged facts, still inside the killed
+    // park's backoff window. The entry is byte-identical: same attempt, same
+    // revision, same park reason, same recorded backoff — no extra journal row
+    // was appended, and the queue file's revision did not advance. This pins
+    // the unchanged-entry half of the takeover across a second full tick.
+    const journalKindsAfterTakeover = journalEntriesFor(h.killDir, journalKey(REPO_A)).map((entry) => entry.kind);
+    const stationary = await run(runtimeOver(h.killDir, ghStub('FAILURE')), ['daemon', 'tick']);
+    expect(stationary.code).toBe(0);
+    expect(lastJson(stationary.out)).toMatchObject({ outcome: 'completed', exitCode: 0 });
+    const afterStationary = await runtimeOver(h.killDir, ghStub('FAILURE')).execution.mergeQueueRepository.listMergeEntries(query);
+    expect(afterStationary).toHaveLength(1);
+    expect(afterStationary[0]).toEqual(after[0]); // byte-identical: attempt, revision, park reason unchanged
+    expect(afterStationary[0]).toMatchObject({ state: 'parked', reason: 'checks', revision: killedEntry.revision });
+    expect(journalEntriesFor(h.killDir, journalKey(REPO_A)).map((entry) => entry.kind)).toEqual(journalKindsAfterTakeover);
+
+    // One more tick over the same unchanged facts, now PAST the killed park's
+    // backoff window. This tick reaches `recordPark` with the entry parked, so
+    // the re-park guard `sameMergeEntryContent` actually runs: the built park
+    // record carries the next attempt and a fresh backoff, the guard answers
+    // "not the same content", and the update IS written. An always-true
+    // mutation of the guard would freeze the entry at the killed park's
+    // attempt and revision instead.
+    advance(20_000); // clock now T0 + 40_000 ms: past the killed park's T0 + 30 s backoff
+    const reparked = await run(runtimeOver(h.killDir, ghStub('FAILURE')), ['daemon', 'tick']);
+    expect(reparked.code).toBe(0);
+    expect(lastJson(reparked.out)).toMatchObject({ outcome: 'completed', exitCode: 0 });
+    const afterRepark = await runtimeOver(h.killDir, ghStub('FAILURE')).execution.mergeQueueRepository.listMergeEntries(query);
+    expect(afterRepark).toHaveLength(1);
+    expect(afterRepark[0]).toMatchObject({
+      state: 'parked',
+      reason: 'checks',
+      attempt: killedEntry.attempt + 1,
+      revision: killedEntry.revision + 1,
+    });
+    expect(Date.parse(afterRepark[0].notBeforeIso as string)).toBeGreaterThan(Date.parse(after[0].notBeforeIso as string));
+    expect(journalEntriesFor(h.killDir, journalKey(REPO_A)).map((entry) => entry.kind)).toEqual(journalKindsAfterTakeover);
+  });
+
+  it('S10 kill-9 #3b: the facts changing after takeover updates the parked entry with an advanced revision', async () => {
+    // The same killed checks park as kill-9 #3, but after the takeover the
+    // facts DO change: the `gate` check goes green. The parked entry is then
+    // NOT frozen: the decider re-enters it ready, the entry is updated with
+    // its revision advanced, and the shadow merge act is journalled. This is
+    // the update half that the takeover's unchanged-entry half must be weighed
+    // against: the entry's revision advance here proves a parked entry still
+    // moves when the facts move, while the re-park phase of kill-9 #3 is the
+    // direct kill of an always-true `sameMergeEntryContent` guard.
+    const h = killingHarness((stateDir) => queueHasParkedEntry(stateDir, 'checks'), ghStub('FAILURE'));
+    await enqueue(h.runtime, REPO_A);
+
+    const first = await run(h.runtime, ['daemon', 'tick', '--budget-seconds', '5']);
+    expect(first.code, `${first.out}\n${first.err}`).toBe(0);
+    expect(existsSync(h.killDir)).toBe(true);
+    const query = { repository: { owner: OWNER, repo: REPO_A }, deadlineIso: clockIsoPlus(60_000) };
+    const beforeRecovery = await runtimeOver(h.killDir, ghStub('FAILURE')).execution.mergeQueueRepository.listMergeEntries(query);
+    expect(beforeRecovery).toHaveLength(1);
+    const killedEntry = beforeRecovery[0];
+    expect(killedEntry).toMatchObject({ state: 'parked', reason: 'checks', attempt: 1 });
+
+    // Before the lease expires: refused takeover.
+    advance(10_000);
+    const whileHeld = runtimeOver(h.killDir, ghStub('FAILURE'));
+    const held = await run(whileHeld, ['daemon', 'tick']);
+    expect(held.code).toBe(0);
+    expect(jobOf(lastJson(held.out), mergePassJobId(REPO_A))).toMatchObject({
+      outcome: 'skipped',
+      reasonCode: 'lease-held',
+    });
+
+    // Past the expiry, still inside the backoff: the takeover leaves the park
+    // untouched (the unchanged-entry half, pinned by kill-9 #3).
+    advance(10_000); // clock now T0 + 20_000 ms: past the 15 s lease, before the 30 s backoff
+    const recovery = runtimeOver(h.killDir, ghStub('FAILURE'));
+    const takeover = await run(recovery, ['daemon', 'tick']);
+    expect(takeover.code).toBe(0);
+    const afterTakeover = await recovery.execution.mergeQueueRepository.listMergeEntries(query);
+    expect(afterTakeover).toHaveLength(1);
+    expect(afterTakeover[0]).toMatchObject({
+      state: 'parked',
+      reason: 'checks',
+      attempt: killedEntry.attempt,
+      revision: killedEntry.revision,
+    });
+
+    // The facts change: the `gate` check goes green. Past the killed park's
+    // backoff window the decider re-enters the parked entry ready, and the
+    // entry IS updated with its revision advanced.
+    advance(20_000); // clock now T0 + 40_000 ms: past the killed park's T0 + 30 s backoff
+    const recovered = runtimeOver(h.killDir, ghStub('SUCCESS'));
+    const green = await run(recovered, ['daemon', 'tick']);
+    expect(green.code).toBe(0);
+    expect(lastJson(green.out)).toMatchObject({ outcome: 'completed', exitCode: 0 });
+    const afterGreen = await recovered.execution.mergeQueueRepository.listMergeEntries(query);
+    expect(afterGreen).toHaveLength(1);
+    expect(afterGreen[0]).toMatchObject({
+      state: 'ready',
+      reason: null,
+      verifiedHeadOid: HEAD,
+      verifiedBy: 'contexts',
+      revision: killedEntry.revision + 1,
+    });
+    // The shadow merge act is journalled for the ready entry: exactly one
+    // intent and one `dry-run` result, no duplicate.
+    const journal = await recovered.conductor.laneRunJournal.listForKey(journalKey(REPO_A));
+    expect(journal.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(journal[1]).toMatchObject({ outcome: 'dry-run', reasonCode: 'would-merge' });
+    const status = readStatus(h.killDir);
+    expect(status.jobs.find((job) => job.jobId === mergePassJobId(REPO_A))).toMatchObject({
+      outcome: 'completed',
+      leaseFence: 3,
+    });
+    const lease = await recovered.daemon.lease.read(leaseScope(REPO_A));
     expect(lease === null || Date.parse(lease.leaseUntilIso) <= Date.parse(clockIso())).toBe(true);
   });
 });

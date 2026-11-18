@@ -815,4 +815,21 @@ describe('ResolveActionAuthorizationUseCase release grants (RR1)', () => {
     );
     expect(result).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
   });
+
+  // RR1 fix round: `releaseRootsAgree` is pinned to exact string equality on
+  // the normalized roots. A case-insensitive comparison or a `startsWith`
+  // prefix comparison must fail these near-miss cases, not authorize them.
+  it.each([
+    { recorded: '/srv/rel', requested: '/srv/rel2' },
+    { recorded: '/srv/rel2', requested: '/srv/rel' },
+    { recorded: '/srv/Rel', requested: '/srv/rel' },
+  ])('blocks a near-miss root $recorded vs $requested with release-grant-root-mismatch (no prefix or case folding)', async ({ recorded, requested }) => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createReleaseRecord({ releaseRoot: recorded }));
+    const result = await resolveRelease(
+      new ResolveActionAuthorizationUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: requested },
+    );
+    expect(result).toEqual({ outcome: 'blocked', reason: 'release-grant-root-mismatch' });
+  });
 });

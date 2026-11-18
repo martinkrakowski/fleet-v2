@@ -476,4 +476,75 @@ describe('RecordAuthorizationConsumptionUseCase release grants (RR1)', () => {
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
   });
+
+  // RR1 fix round: `releaseRootsAgree` is pinned to exact string equality on
+  // the normalized roots. A case-insensitive comparison or a `startsWith`
+  // prefix comparison must fail these near-miss cases, not authorize them.
+  it.each([
+    { recorded: '/srv/rel', requested: '/srv/rel2' },
+    { recorded: '/srv/rel2', requested: '/srv/rel' },
+    { recorded: '/srv/Rel', requested: '/srv/rel' },
+  ])('refuses a near-miss root $recorded vs $requested with release-grant-root-mismatch (no prefix or case folding)', async ({ recorded, requested }) => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(createReleaseRecord({ releaseRoot: recorded }));
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: requested },
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-root-mismatch' });
+  });
+
+  // RR1 fix round: the idempotent replay return sits after the digest
+  // recompute, so a record whose stored coordinates were tampered with after
+  // consumption is refused on replay instead of replaying the receipt.
+  it('refuses a replay of an already-consumed release record whose stored root was tampered with after consumption', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    // The grant was consumed legitimately; afterwards its stored root was
+    // moved. The replay carries the same action and consumption ids and names
+    // the moved root, so the root check passes, but the recomputed digest no
+    // longer matches the id the grant is bound by.
+    await requestRepo.saveRequest(
+      createReleaseRecord({
+        releaseRoot: '/srv/fleet/moved',
+        state: 'completed',
+        consumptions: [{
+          consumptionId: 'c-1',
+          grantId: GRANT_ID,
+          requestId: 'req-earlier',
+          actionId: 'action-install-1',
+          attemptId: 'att-1',
+          expectedHeadSha: HEAD,
+          consumedAtIso: '2026-11-02T00:00:00.000Z',
+        }],
+      }),
+    );
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+      { releaseRoot: '/srv/fleet/moved' },
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+  });
+
+  it('refuses a replay of an already-consumed release record whose stored nonce was tampered with after consumption', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepo();
+    await requestRepo.saveRequest(
+      createReleaseRecord({
+        releaseNonce: 'fedcba9876543210fedcba9876543210',
+        state: 'completed',
+        consumptions: [{
+          consumptionId: 'c-1',
+          grantId: GRANT_ID,
+          requestId: 'req-earlier',
+          actionId: 'action-install-1',
+          attemptId: 'att-1',
+          expectedHeadSha: HEAD,
+          consumedAtIso: '2026-11-02T00:00:00.000Z',
+        }],
+      }),
+    );
+    const result = await consumeRelease(
+      new RecordAuthorizationConsumptionUseCase({ requestRepo, computeDigest: digest }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-grant-digest-mismatch' });
+  });
 });

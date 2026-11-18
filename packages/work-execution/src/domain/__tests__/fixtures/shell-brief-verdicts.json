@@ -1,0 +1,344 @@
+{
+ "provenance": {
+  "capturedAt": "2026-11-17T23:38:57Z",
+  "tools": [
+   {
+    "name": "fleet:orchestrator/brief-lint.sh",
+    "sourcePath": "fleet:orchestrator/brief-lint.sh (installed copy)",
+    "sha256": "bbe902438437ede2be893c718354c2db83ba972775cb80897736fb86dd092002"
+   },
+   {
+    "name": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+    "sourcePath": "fleet:orchestrator/sol-brief-run.sh (second python heredoc, run verbatim via python3 -I)",
+    "sha256": "4a8bdaca8d32024e8668b1b9ce1ebfff1c6b622c059fc5172143e2e2d5c7975d"
+   },
+   {
+    "name": "fleet:tools/fleet-v2-orchestrator/lane/split-agy-brief.py",
+    "sourcePath": "fleet:tools/fleet-v2-orchestrator/lane/split-agy-brief.py",
+    "sha256": "19028449982d2612cf176036dd9d938dad0f2ef436368bed6852723df6f7e867"
+   }
+  ],
+  "note": "No S11 corpus file exists on fleet-v2 origin/main (shadow-brief-corpus.test.ts is referenced but absent). The corpus here is the 13 parseBriefAnswer and 14 lintBrief case inputs from packages/work-execution/src/domain/__tests__/brief-answer.test.ts, reconstructed verbatim; fleetVerdict is the outcome that test asserts (reason or rule list after \"refuse:\"). Lint inputs run as *.dispatch.md in dispatch mode. Split uses the sol-brief-run.sh inline splitter, the ===NOTES===/===DISPATCH=== counterpart; split-agy-brief.py uses a different =====BRIEF id===== format and exits 3 (contract missing) on every parse input checked (parse-01), so it is not entered per-case. lintBrief(42) (not-a-brief) is not file-representable and is omitted."
+ },
+ "entries": [
+  {
+   "id": "lint-01-full",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "accept",
+   "agrees": false
+  },
+  {
+   "id": "lint-02-missing-hard-to-undo",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:missing-hard-to-undo",
+   "agrees": true
+  },
+  {
+   "id": "lint-03-four-missing",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:missing-file-list,missing-tier,missing-validity-block,missing-assumptions",
+   "agrees": true
+  },
+  {
+   "id": "lint-04-tier-empty-body",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:missing-tier",
+   "agrees": true
+  },
+  {
+   "id": "lint-05-lowercase-heading",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "accept",
+   "agrees": false
+  },
+  {
+   "id": "lint-06-secret-ghp",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:secret-shaped",
+   "agrees": true
+  },
+  {
+   "id": "lint-07-inline-lines",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "accept",
+   "agrees": false
+  },
+  {
+   "id": "lint-08-avoid-commit-prose",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-commit-line",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:missing-commit-line",
+   "agrees": true
+  },
+  {
+   "id": "lint-09-imperative-prose-1",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-commit-line",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:missing-commit-line",
+   "agrees": true
+  },
+  {
+   "id": "lint-10-imperative-prose-2",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-commit-line",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:missing-commit-line",
+   "agrees": true
+  },
+  {
+   "id": "lint-11-imperative-prose-3",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-commit-line",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:missing-commit-line",
+   "agrees": true
+  },
+  {
+   "id": "lint-12-imperative-prose-4",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:missing-commit-line",
+   "agrees": true
+  },
+  {
+   "id": "lint-13-imperative-prose-5",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-tier",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "refuse:missing-commit-line",
+   "agrees": true
+  },
+  {
+   "id": "lint-15-compact-line",
+   "tool": "fleet:orchestrator/brief-lint.sh",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "missing-file-list",
+    "missing-refusals",
+    "missing-affected-workspace-tests"
+   ],
+   "fleetVerdict": "accept",
+   "agrees": false
+  },
+  {
+   "id": "parse-01-wellformed",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "accept",
+   "agrees": true
+  },
+  {
+   "id": "parse-02-notes-not-in-dispatch",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "accept",
+   "agrees": true
+  },
+  {
+   "id": "parse-03-missing-notes-marker",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "refuse:missing-notes-marker",
+   "agrees": false
+  },
+  {
+   "id": "parse-04-missing-dispatch-marker",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "no-dispatch-marker"
+   ],
+   "fleetVerdict": "refuse:missing-dispatch-marker",
+   "agrees": true
+  },
+  {
+   "id": "parse-05-duplicate-notes",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "refuse:duplicate-notes-marker",
+   "agrees": false
+  },
+  {
+   "id": "parse-06-duplicate-dispatch",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "refuse:duplicate-dispatch-marker",
+   "agrees": false
+  },
+  {
+   "id": "parse-07-text-before-notes",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "refuse:text-before-notes-marker",
+   "agrees": false
+  },
+  {
+   "id": "parse-08-dispatch-first",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "refuse:text-before-notes-marker",
+   "agrees": false
+  },
+  {
+   "id": "parse-09-github-pat",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "refuse:secret-shaped",
+   "agrees": false
+  },
+  {
+   "id": "parse-10-empty-dispatch",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "refuse:empty-dispatch",
+   "agrees": false
+  },
+  {
+   "id": "parse-11-empty-answer",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 1,
+   "verdict": "refuse",
+   "rules": [
+    "no-dispatch-marker"
+   ],
+   "fleetVerdict": "refuse:empty-answer",
+   "agrees": true
+  },
+  {
+   "id": "parse-12-ghp-secret",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "refuse:secret-shaped",
+   "agrees": false
+  },
+  {
+   "id": "parse-13-fine-grained-pat",
+   "tool": "fleet:orchestrator/sol-brief-run.sh#inline-splitter",
+   "exitCode": 0,
+   "verdict": "accept",
+   "rules": [],
+   "fleetVerdict": "refuse:secret-shaped",
+   "agrees": false
+  }
+ ]
+}

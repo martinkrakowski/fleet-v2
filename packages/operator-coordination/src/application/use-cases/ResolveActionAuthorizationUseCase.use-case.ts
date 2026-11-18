@@ -14,8 +14,18 @@
  */
 
 import { isPolicyGrantRecord } from '../../domain/policy-grants.js';
-import { GRANT_RECORD_VERSION, isReleaseActionScope, readReleaseRoot, releaseRootsAgree } from '../../domain/coordination-records.js';
+import {
+  GRANT_RECORD_VERSION,
+  isReleaseActionScope,
+  readReleaseRoot,
+  releaseRootsAgree,
+  isShadowImportActionScope,
+  SHADOW_IMPORT_ACTION_SCOPE,
+  SHADOW_IMPORT_DIGEST_PREFIX,
+  shadowImportDigestPayload,
+} from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
+import { readPlainObjectLoose } from '../../domain/record-input.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type {
   ResolveActionAuthorizationPort,
@@ -32,6 +42,20 @@ export interface ResolveActionAuthorizationDependencies {
   readonly decisionTransport?: DecisionTransportPort;
   /** CO24f: reads the attempt facts a first bind validates against; binding fails closed without it. */
   readonly attemptFactsRead?: AttemptFactsReadPort;
+  /**
+   * The SHA-256 digest a shadow import grant's request id is bound by.
+   * Injected, so the application layer stays free of `node:crypto`; a shadow
+   * resolve without it fails closed, never silently skips the digest check.
+   */
+  readonly computeDigest?: (payload: string) => string;
+  /**
+   * The trusted clock the shadow import grant's expiry is measured against.
+   * Injected by the composition root, never taken from the resolve request:
+   * a caller-supplied `nowIso` could backdate the clock past expiry. Ordinary
+   * (non-shadow) resolves keep exactly their main behaviour and never
+   * consult this clock or the digest.
+   */
+  readonly shadowImportClock?: { readonly nowIso: () => string };
 }
 
 function isFilled(value: unknown): value is string {
@@ -40,6 +64,26 @@ function isFilled(value: unknown): value is string {
 
 function blocked(reason: string): ResolveActionAuthorizationResult {
   return { outcome: 'blocked', reason };
+}
+
+/**
+ * A descriptor-safe snapshot of the request's nested `repository`. A nested
+ * plain object is copied with own data descriptors only (no getter ever runs,
+ * so an accessor on `repository.owner` or `repository.repo` collapses to
+ * `undefined` and is refused later as an invalid repository); anything the
+ * reader cannot snapshot descriptor-safely becomes `null`, which
+ * `resolveTargetRepository` refuses. A string `owner/repo` coordinate is not
+ * an object and passes through for the later validation.
+ */
+function snapshotRepository(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  try {
+    return readPlainObjectLoose(value);
+  } catch {
+    return null;
+  }
 }
 
 export class ResolveActionAuthorizationUseCase implements ResolveActionAuthorizationPort {
@@ -60,6 +104,53 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // inventing one; the HTTP boundary always supplies an object body.
     if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
+    }
+    // Standing shadow import grant (owner decision 2026-11-18): the resolve
+    // is head-free — the grant is bound by its digest-bound request id, its
+    // exact repository and its capped expiry, never by a commit. Its clock is
+    // the composition root's alone: any `nowIso` on the request is ignored,
+    // and an unwired clock or digest fails closed. Every non-shadow path
+    // below keeps exactly its main behaviour.
+    // The shadow path reads the request through a descriptor-safe snapshot
+    // (no getter ever runs, a hostile accessor or proxy is a typed refusal),
+    // so a hostile object can never throw out of the shadow branch.
+    // The snapshot is taken FIRST, before any field — including `actionScope` —
+    // is read, so no getter on any field (not even the one that routes the
+    // request) can run before the request is frozen. A throwing trap during
+    // the snapshot is a hostile proxy: a typed refusal, never an exception.
+    let snapshot: Record<string, unknown> | null = null;
+    try {
+      snapshot = readPlainObjectLoose(input);
+    } catch {
+      return blocked('invalid-request');
+    }
+    // An accessor field snapshots to `undefined` (its value is never read), but
+    // its presence is still visible through its own property descriptor, and
+    // inspecting a descriptor never runs a getter. A getter-carrying
+    // `actionScope` therefore cannot be resolved head-free at all: it is a
+    // typed refusal with a getter-call count of 0. A plain-data `actionScope`
+    // — every ordinary request — reads exactly as before from the snapshot.
+    const actionScopeDescriptor = Object.getOwnPropertyDescriptor(input, 'actionScope');
+    if (actionScopeDescriptor !== undefined && actionScopeDescriptor.get !== undefined) {
+      return blocked('invalid-request');
+    }
+    const scope =
+      snapshot !== null && typeof snapshot['actionScope'] === 'string'
+        ? (snapshot['actionScope'] as string).trim()
+        : '';
+    if (isShadowImportActionScope(scope)) {
+      if (snapshot === null) {
+        return blocked('invalid-request');
+      }
+      // The nested `repository` is snapshotted with own data descriptors too,
+      // so a getter on `repository.owner` or `repository.repo` never runs
+      // later in `resolveTargetRepository`: the resolve reads only from the
+      // snapshots, never from the original request or its nested object.
+      const shadowRequest = {
+        ...snapshot,
+        repository: snapshotRepository(snapshot['repository']),
+      };
+      return this.resolveShadowImport(shadowRequest as unknown as ResolveActionAuthorizationRequest);
     }
     const request = input as ResolveActionAuthorizationRequest;
     if (Object.keys(request).length === 0) {
@@ -179,6 +270,99 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       expectedHeadSha: request.expectedHeadSha.trim(),
       policyRevision: candidate.getPolicyRevision(),
       ...(recordedRoot.state === 'valid' ? { releaseRoot: recordedRoot.value } : {}),
+    };
+  }
+
+  /**
+   * The explicit head-free resolve path for a standing `merge:import-shadow`
+   * grant. The grant is re-checked against its stored coordinates on every
+   * resolve: the request-id digest is recomputed from
+   * `candidate.getShadowImportGrant()` with the injected digest (a mismatch
+   * means the stored coordinates no longer match the id the grant was bound
+   * by), and the expiry is measured with the injected clock alone — never a
+   * request field, so a caller cannot backdate the clock past expiry. An
+   * unwired clock or digest fails closed. Nothing is bound and no
+   * consumption is checked: a standing grant resolves until it expires or is
+   * revoked.
+   */
+  private async resolveShadowImport(
+    request: ResolveActionAuthorizationRequest,
+  ): Promise<ResolveActionAuthorizationResult> {
+    if (!isFilled(request.projectId)) {
+      return blocked('project-id-required');
+    }
+    if (!isFilled(request.authorizationGrantId)) {
+      return blocked('grant-missing');
+    }
+    const grantId = request.authorizationGrantId.trim();
+    const requestedRepository = this.resolveTargetRepository(request);
+    if (requestedRepository === null) {
+      return blocked('grant-wrong-repository');
+    }
+    if (this.deps?.shadowImportClock === undefined) {
+      return blocked('clock-unavailable');
+    }
+    const nowIso = this.deps.shadowImportClock.nowIso();
+    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+      return blocked('invalid-now-iso');
+    }
+    if (this.deps.computeDigest === undefined) {
+      return blocked('digest-unavailable');
+    }
+    const recorded = await this.deps.requestRepo.findRequestByGrantId(grantId);
+    if (recorded === null) {
+      return blocked('grant-missing');
+    }
+    const refreshed = await this.refreshFromVerifiedAnswer(recorded);
+    if (refreshed.state === 'cancelled') {
+      return blocked('grant-revoked');
+    }
+    if (refreshed.state !== 'approved' || refreshed.decisionRevision === null) {
+      return blocked('grant-not-approved');
+    }
+    let candidate: CoordinationRequest;
+    try {
+      candidate = CoordinationRequest.fromRecord(refreshed);
+    } catch {
+      return blocked('grant-wrong-scope');
+    }
+    if (
+      candidate.getActionScope() !== SHADOW_IMPORT_ACTION_SCOPE ||
+      !candidate.canAuthorizeShadowImport(SHADOW_IMPORT_ACTION_SCOPE)
+    ) {
+      return blocked('grant-wrong-scope');
+    }
+    const shadowGrant = candidate.getShadowImportGrant();
+    if (shadowGrant === null) {
+      return blocked('grant-wrong-scope');
+    }
+    const payloadResult = shadowImportDigestPayload(shadowGrant);
+    const expectedRequestId = payloadResult.ok
+      ? `${SHADOW_IMPORT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`
+      : null;
+    if (!payloadResult.ok || candidate.getId() !== expectedRequestId) {
+      return blocked('grant-digest-mismatch');
+    }
+    if (refreshed.projectId !== request.projectId.trim()) {
+      return blocked('grant-wrong-project');
+    }
+    if (
+      shadowGrant.repository.owner !== requestedRepository.owner ||
+      shadowGrant.repository.repo !== requestedRepository.repo
+    ) {
+      return blocked('grant-wrong-repository');
+    }
+    // The expiry is measured with the trusted clock alone: a request-supplied
+    // `nowIso` can never revive an expired grant.
+    if (Date.parse(nowIso) >= Date.parse(shadowGrant.expiresAtIso)) {
+      return blocked('grant-expired');
+    }
+    return {
+      outcome: 'authorized',
+      grantId,
+      requestId: candidate.getId(),
+      expectedHeadSha: '',
+      policyRevision: candidate.getPolicyRevision(),
     };
   }
 

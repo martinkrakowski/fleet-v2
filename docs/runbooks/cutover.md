@@ -27,6 +27,16 @@ Commands that exist today:
 - `fleet-v2 state check` and `fleet-v2 daemon status` are read-only.
 - `fleet-v2 conductor status` is the status read.
 
+### Standing `merge:import-shadow` grants (GR1a2)
+
+The unattended timer's standing grant is recorded, resolved and revoked through `coordination`:
+
+- Create one with `fleet-v2 coordination request-decision --kind action-decision --action-scope merge:import-shadow --project-id <id> --proposal-digest <digest> --policy-revision <rev> --repository <owner>/<repo> --expires-at-iso <iso>`. The CLI derives the request id — `shadow-import-<sha256 of { scope, owner, repo, expiresAtIso }>` — from those coordinates, so a hand-typed `--request-id` that does not match is refused (exit 2) instead of recorded. The grant is head-free: no `--expected-head-sha` is taken. The grant's moment is the composition root's clock alone; a request-supplied `nowIso` is ignored.
+- Resolve one with `coordination resolve-auth --project-id <id> --action-scope merge:import-shadow --authorization-grant-id <grantId> --repository <owner>/<repo>`. The resolve re-checks the digest of the stored coordinates and the expiry against the server clock on every call, and never names a commit.
+- Revoke one with `fleet-v2 coordination revoke-grant --grant-id <grantId>`. The result is typed (`revoked` with the `grantId`, or `refused` with a reason such as `grant-missing`, `grant-wrong-scope` or `grant-already-revoked`); the grant id is a non-secret handle and may be printed, while secret-shaped values never are.
+
+To issue a fresh grant after a revocation, record different coordinates — for example a different `--expires-at-iso` — because identical coordinates hash to the already-recorded request id.
+
 Status does not evaluate S1–S12. A completed status is not a shadow pass. Do not start `conductor run --live` from this runbook.
 
 ## Switch preconditions

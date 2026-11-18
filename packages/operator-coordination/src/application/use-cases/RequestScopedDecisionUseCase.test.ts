@@ -535,4 +535,88 @@ describe('RequestScopedDecisionUseCase ordinary decisions stay as on main (GR1a1
       expect(result.request.createdAtIso).not.toBe(NOW_ISO);
     }
   });
+
+  it('handles a body with an own __proto__ key exactly as on main', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    // `JSON.parse` gives the body a real own `__proto__` key, exactly as an
+    // HTTP body carrying one arrives; the spread copies it as data, without
+    // invoking the inherited setter.
+    const hostile = {
+      ...ordinaryRequest({ unknownBodyKey: 'whatever' }),
+      ...(JSON.parse('{"__proto__":{"polluted":true}}') as Record<string, unknown>),
+    };
+    const result = await useCaseWith(repo).execute(hostile);
+    // Main accepted the body and ignored the unknown keys, so the fixed
+    // snapshot must accept it too — and never mutate Object.prototype.
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.actionScope).toBe('host:restart');
+    }
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('does not inherit decision fields from an own __proto__ key (GR1a2 fix round)', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    // `JSON.parse` gives the body a real own `__proto__` key, here carrying
+    // decision fields. On main the body is accepted and its own fields decide;
+    // nothing inside `__proto__` is inherited into the request — a snapshot
+    // built on `{}` would set its prototype and let `nowIso` be inherited.
+    const withoutClock: Record<string, unknown> = { ...ordinaryRequest() };
+    delete withoutClock.nowIso;
+    const hostile = {
+      ...withoutClock,
+      ...(JSON.parse(
+        '{"__proto__":{"nowIso":"2099-01-01T00:00:00.000Z","state":"approved"}}',
+      ) as Record<string, unknown>),
+    };
+    const before = new Date().toISOString();
+    const result = await useCaseWith(repo).execute(hostile);
+    // Handled exactly as on main: `nowIso` is absent from the body itself, so
+    // the wall clock falls back in — the `__proto__`-carried value never does.
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.createdAtIso).not.toBe('2099-01-01T00:00:00.000Z');
+      expect(result.request.createdAtIso >= before).toBe(true);
+    }
+    expect(({} as Record<string, unknown>).state).toBeUndefined();
+  });
+
+  it('maps a throwing getPrototypeOf trap to the invalid-request refusal', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const proxy = new Proxy(ordinaryRequest(), {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf trap');
+      },
+    });
+    await expect(useCaseWith(repo).execute(proxy)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'invalid-request',
+    });
+  });
+
+  it('maps a throwing ownKeys trap to the invalid-request refusal', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const proxy = new Proxy(ordinaryRequest(), {
+      ownKeys() {
+        throw new Error('hostile ownKeys trap');
+      },
+    });
+    await expect(useCaseWith(repo).execute(proxy)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'invalid-request',
+    });
+  });
+
+  it('maps a throwing getOwnPropertyDescriptor trap to the invalid-request refusal', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const proxy = new Proxy(ordinaryRequest(), {
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile getOwnPropertyDescriptor trap');
+      },
+    });
+    await expect(useCaseWith(repo).execute(proxy)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'invalid-request',
+    });
+  });
 });

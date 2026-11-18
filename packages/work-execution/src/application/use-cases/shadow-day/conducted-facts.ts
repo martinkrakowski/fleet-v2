@@ -53,6 +53,20 @@ export const SHADOW_FACTS_MAX_MERGED_PULL_REQUESTS = 10_000;
 export const SHADOW_FACTS_MAX_RUNS = SHADOW_CONFORMANCE_MAX_RUNS;
 
 /**
+ * RC1 (owner decision 2026-11-18): the early-warning threshold of
+ * `cutover shadow record-day`. The lane-run store holding more than this many
+ * runs prints a warning to `stderr`; the hard cap (`SHADOW_FACTS_MAX_RUNS`)
+ * is deferred and this warning never changes the command's result.
+ */
+export const SHADOW_FACTS_WARN_RUNS = 1500;
+
+/**
+ * RC1: the scan cap of `checkLaneRunWarnCount`. Cost is bounded linearly in
+ * the input; a length past this cap is refused before any traversal.
+ */
+export const SHADOW_FACTS_WARN_MAX_SCAN = 100_000;
+
+/**
  * Cap on one run's `attemptIds` walk. An over-cap list is refused before any
  * attempt is read.
  */
@@ -186,8 +200,10 @@ function readPullRequestId(items: readonly unknown[], index: number): number | n
 }
 
 /**
- * Every own key is `length` or a canonical index inside `length`; anything
- * else — a symbol, a named key, an index beyond `length` — is refused.
+ * Every own key is `length` or a canonical array index inside `length`: the
+ * key's `String(Number(k))` form, a safe integer, below `length`. Anything
+ * else — a symbol, a named key, a non-canonical digit string such as `"01"`,
+ * an index beyond `length` — is refused.
  * Cost: linear in the array's own-key count (capped by the caller).
  */
 function ownKeysAreIndices(value: readonly unknown[], length: number): boolean {
@@ -198,7 +214,8 @@ function ownKeysAreIndices(value: readonly unknown[], length: number): boolean {
     if (key === 'length') {
       continue;
     }
-    if (!/^\d+$/.test(key) || Number(key) >= length) {
+    const asNumber = Number(key);
+    if (!Number.isSafeInteger(asNumber) || String(asNumber) !== key || asNumber < 0 || asNumber >= length) {
       return false;
     }
   }
@@ -253,6 +270,75 @@ function readMergedPullRequestIdsOrThrow(value: unknown): ReadonlySet<number> | 
     ids.add(id);
   }
   return ids;
+}
+
+/** The typed outcome of `checkLaneRunWarnCount`. */
+export type LaneRunWarnCountRead =
+  | { readonly status: 'ok'; readonly count: number; readonly warn: boolean }
+  | { readonly status: 'unknown'; readonly reason: 'runs-unreadable' };
+
+/**
+ * RC1: the pure early-warning count read behind `cutover shadow record-day`.
+ * It validates the raw lane-run array as a real, dense data array — a wrong
+ * primitive, a non-iterable object, an array-like, a hole, an accessor, a
+ * foreign own key (including prototype-polluting names), an over-cap length
+ * or a hostile container is refused — and reports the store's run count with
+ * the early-warning verdict.
+ *
+ * Cost: linear in the capped input; the caps (`SHADOW_FACTS_WARN_MAX_SCAN`,
+ * `MAX_ARRAY_LENGTH`) are named constants. Every failure path is fail-closed:
+ * the typed `{ status: 'unknown', reason: 'runs-unreadable' }` refusal, never
+ * a throw — a throwing `Proxy` trap reads as an unreadable source. Getters
+ * are never invoked: descriptors are inspected, not evaluated.
+ */
+export function checkLaneRunWarnCount(value: unknown): LaneRunWarnCountRead {
+  try {
+    return checkLaneRunWarnCountOrThrow(value);
+  } catch {
+    return { status: 'unknown', reason: 'runs-unreadable' };
+  }
+}
+
+function checkLaneRunWarnCountOrThrow(value: unknown): LaneRunWarnCountRead {
+  if (!Array.isArray(value)) {
+    return { status: 'unknown', reason: 'runs-unreadable' };
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    typeof lengthDescriptor.value !== 'number'
+  ) {
+    return { status: 'unknown', reason: 'runs-unreadable' };
+  }
+  const length = lengthDescriptor.value;
+  if (
+    !Number.isSafeInteger(length) ||
+    length < 0 ||
+    length >= MAX_ARRAY_LENGTH ||
+    length > SHADOW_FACTS_WARN_MAX_SCAN
+  ) {
+    return { status: 'unknown', reason: 'runs-unreadable' };
+  }
+  if (!ownKeysAreIndices(value, length)) {
+    return { status: 'unknown', reason: 'runs-unreadable' };
+  }
+  // Descriptors are read, never invoked: a hole (no descriptor) or an
+  // accessor — a getter or a setter-only slot, which has no `get` — is
+  // refused without evaluating any element. A data descriptor (`value`, no
+  // accessor pair) is required.
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    if (
+      descriptor === undefined ||
+      !('value' in descriptor) ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return { status: 'unknown', reason: 'runs-unreadable' };
+    }
+  }
+  return { status: 'ok', count: length, warn: length > SHADOW_FACTS_WARN_RUNS };
 }
 
 /** The candidate runs: every run whose `prNumber` is in the merged set. Cost: O(runs). */

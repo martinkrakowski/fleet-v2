@@ -979,7 +979,7 @@ export async function runCli(
         ? { repeatableKeys: new Set(['ref']) }
         : {}),
     });
-    const result = await handler(payload, activeRuntime);
+    const result = await handler(payload, activeRuntime, io);
     // Line-oriented outputs (`knowledge candidates`, `decisions report`)
     // print one line per record instead of one JSON document; a refusal
     // carries no lines and falls back to the JSON document that names it.

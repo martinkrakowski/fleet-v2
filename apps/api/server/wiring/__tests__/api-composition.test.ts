@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -664,6 +665,59 @@ describe("configured compositions execute real operations", () => {
       projectId: PROFILE_REQUEST.projectId,
     });
     expect(persisted.outcome).toBe("inspected");
+  });
+
+  it("wires shadowImportClock and computeDigest into the resolve (GR1a2 fix round)", async () => {
+    const stateDir = await makeTempDir();
+    const operator = createConfiguredOperatorComposition({ stateDir });
+    // The shadow resolve checks the composition-root clock and digest before
+    // it looks the grant up: with the clock unwired it fails closed with
+    // 'clock-unavailable', with the digest unwired with 'digest-unavailable'.
+    // Only a wired composition reaches the grant lookup, so the refusal for an
+    // unknown grant id proves both are injected.
+    const blocked = await operator.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: PROFILE_REQUEST.projectId,
+      actionScope: "merge:import-shadow",
+      expectedHeadSha: "",
+      authorizationGrantId: "grant-composition-probe",
+      repository: { owner: "octo", repo: "hello" },
+    });
+    expect(blocked).toEqual({ outcome: "blocked", reason: "grant-missing" });
+  });
+
+  it("wires shadowImportClock and computeDigest into the request decision (GR1a2 fix round)", async () => {
+    const stateDir = await makeTempDir();
+    const operator = createConfiguredOperatorComposition({ stateDir });
+    const expiresAtIso = new Date(Date.now() + 28 * 86_400_000).toISOString();
+    const payload = JSON.stringify({
+      scope: "merge:import-shadow",
+      owner: "octo",
+      repo: "hello",
+      expiresAtIso,
+    });
+    const requestId = `shadow-import-${createHash("sha256").update(payload).digest("hex")}`;
+    // A backdated nowIso on the request body is ignored: only the wired
+    // composition-root clock stamps the record, and the wired digest binds
+    // the request id. An unwired clock ('shadow-import-clock-unavailable') or
+    // digest ('shadow-import-digest-unavailable') would refuse instead.
+    const decided = await operator.requestScopedDecision.execute({
+      requestId,
+      projectId: PROFILE_REQUEST.projectId,
+      kind: "action-decision",
+      actionScope: "merge:import-shadow",
+      expectedHeadSha: null,
+      proposalDigest: "sha256-proposal",
+      policyRevision: PROFILE_REQUEST.policyRevision,
+      nowIso: "2099-01-01T00:00:00.000Z",
+      shadowImportGrant: {
+        repository: { owner: "octo", repo: "hello" },
+        expiresAtIso,
+      },
+    });
+    expect(decided.outcome).toBe("requested");
+    if (decided.outcome === "requested") {
+      expect(decided.request.createdAtIso).not.toBe("2099-01-01T00:00:00.000Z");
+    }
   });
 
   it("configure*(options) serves requests and configure*(null) restores refusals", async () => {

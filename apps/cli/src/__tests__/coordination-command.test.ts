@@ -232,6 +232,31 @@ describe('coordination request-decision and revoke-grant (GR1a2)', () => {
     expect(refused.code).not.toBe(0);
   });
 
+  it('never resolves a non-shadow scope head-free (host:restart without a head, GR1a2 fix round)', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const refused = await runCoordination(
+      runtime,
+      [
+        'resolve-auth',
+        '--project-id', 'proj-alpha',
+        '--action-scope', 'host:restart',
+        '--authorization-grant-id', 'grant-1',
+        '--repository', 'octo/hello',
+      ],
+      stateDir,
+    );
+    // Main throws 'Not implemented' for the missing head, so the error reaches
+    // stderr and nothing is printed as a resolve result. If the head-free
+    // branch were applied to every scope, this resolve would come back as a
+    // typed (or even authorized) result on stdout instead — never allowed.
+    expect(refused.code).not.toBe(0);
+    expect(refused.stderr.join('\n')).toContain(
+      'Not implemented: ResolveActionAuthorizationUseCase',
+    );
+    expect(refused.stdout.join('\n')).not.toContain('"authorized"');
+  });
+
   it('refuses a hostile repository value on request-decision (non-zero exit, no throw)', async () => {
     const stateDir = tempStateDir();
     const runtime = createFleetCliRuntime({ stateDir });

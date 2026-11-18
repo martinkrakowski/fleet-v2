@@ -469,6 +469,25 @@ describe('ResolveActionAuthorizationUseCase shadow import resolve (GR1a2)', () =
     });
     expect(result.outcome).toBe('authorized');
   });
+
+  it('never resolves a non-shadow scope head-free (main throws for a missing head, GR1a2 fix round)', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(
+      createShadowGrantRecord({
+        actionScope: 'host:restart',
+        expectedHeadSha: 'b'.repeat(40),
+      }),
+    );
+    // A non-shadow scope invoked without an expected head keeps main's exact
+    // behaviour: the head-free path is the shadow import scope's alone. If it
+    // were made unconditional, this resolve would come back as a typed
+    // blocked result (or authorize) instead of throwing.
+    await expect(
+      resolve(shadowUseCase(requestRepo), {
+        actionScope: 'host:restart',
+      }),
+    ).rejects.toThrow('Not implemented: ResolveActionAuthorizationUseCase');
+  });
 });
 
 describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)', () => {

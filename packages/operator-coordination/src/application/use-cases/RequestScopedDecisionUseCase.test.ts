@@ -555,6 +555,32 @@ describe('RequestScopedDecisionUseCase ordinary decisions stay as on main (GR1a1
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
+  it('does not inherit decision fields from an own __proto__ key (GR1a2 fix round)', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    // `JSON.parse` gives the body a real own `__proto__` key, here carrying
+    // decision fields. On main the body is accepted and its own fields decide;
+    // nothing inside `__proto__` is inherited into the request — a snapshot
+    // built on `{}` would set its prototype and let `nowIso` be inherited.
+    const withoutClock: Record<string, unknown> = { ...ordinaryRequest() };
+    delete withoutClock.nowIso;
+    const hostile = {
+      ...withoutClock,
+      ...(JSON.parse(
+        '{"__proto__":{"nowIso":"2099-01-01T00:00:00.000Z","state":"approved"}}',
+      ) as Record<string, unknown>),
+    };
+    const before = new Date().toISOString();
+    const result = await useCaseWith(repo).execute(hostile);
+    // Handled exactly as on main: `nowIso` is absent from the body itself, so
+    // the wall clock falls back in — the `__proto__`-carried value never does.
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.createdAtIso).not.toBe('2099-01-01T00:00:00.000Z');
+      expect(result.request.createdAtIso >= before).toBe(true);
+    }
+    expect(({} as Record<string, unknown>).state).toBeUndefined();
+  });
+
   it('maps a throwing getPrototypeOf trap to the invalid-request refusal', async () => {
     const repo = new InMemoryCoordinationRequestRepo();
     const proxy = new Proxy(ordinaryRequest(), {

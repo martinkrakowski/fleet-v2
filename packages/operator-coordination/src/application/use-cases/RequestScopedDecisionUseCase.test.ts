@@ -80,10 +80,15 @@ function baseRequest(overrides: Record<string, unknown> = {}): Record<string, un
 function useCaseWith(
   repo: CoordinationRequestRepositoryPort,
   computeDigest: ((payload: string) => string) | null = digest,
+  // Every shadow expiry and TTL test measures against this injected clock,
+  // never against the request's own nowIso. `null` omits the clock, for the
+  // refusal test.
+  clock: { readonly nowIso: () => string } | null = { nowIso: () => NOW_ISO },
 ): RequestScopedDecisionUseCase {
   return new RequestScopedDecisionUseCase({
     requestRepo: repo,
     ...(computeDigest === null ? {} : { computeDigest }),
+    ...(clock === null ? {} : { shadowImportClock: clock }),
   });
 }
 
@@ -160,6 +165,64 @@ describe('RequestScopedDecisionUseCase shadow import grants (GR1a1)', () => {
       }),
     );
     expect(result).toEqual({ outcome: 'rejected', reason: 'shadow-import-grant-ttl-exceeded' });
+    expect((await repo.listRequests()).length).toBe(0);
+  });
+
+  it('ignores a request-supplied nowIso of 2099 and caps the grant against the injected clock', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    // 73 years past the injected clock: a requester-supplied nowIso of 2099
+    // must not mint this grant. The TTL is measured against the clock.
+    const expiresAtIso = '2099-01-20T00:00:00Z';
+    const result = await useCaseWith(repo).execute(
+      baseRequest({
+        requestId: `shadow-import-${digestOf(OWNER, REPO, expiresAtIso)}`,
+        shadowImportGrant: { repository: { ...VALID_GRANT.repository }, expiresAtIso },
+        nowIso: '2099-01-01T00:00:00Z',
+      }),
+    );
+    expect(result).toEqual({ outcome: 'rejected', reason: 'shadow-import-grant-ttl-exceeded' });
+    expect((await repo.listRequests()).length).toBe(0);
+  });
+
+  it('records createdAtIso from the injected clock, ignoring a request-supplied nowIso', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    // The grant is inside the TTL from the clock, but the request claims a
+    // 2099 now: the request-supplied nowIso is ignored for both the expiry
+    // check and the recorded createdAtIso.
+    const expiresAtIso = '2026-12-16T00:00:00Z';
+    const result = await useCaseWith(repo).execute(
+      baseRequest({
+        requestId: `shadow-import-${digestOf(OWNER, REPO, expiresAtIso)}`,
+        shadowImportGrant: { repository: { ...VALID_GRANT.repository }, expiresAtIso },
+        nowIso: '2099-01-01T00:00:00Z',
+      }),
+    );
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.createdAtIso).toBe(NOW_ISO);
+      expect(result.request.updatedAtIso).toBe(NOW_ISO);
+    }
+  });
+
+  it('measures expiry against the injected clock, not the request-supplied nowIso', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    // The grant is in the future of the request's own nowIso but already
+    // past the injected clock: it must be refused as expired.
+    const expiresAtIso = '2026-12-16T00:00:00Z';
+    const result = await useCaseWith(repo, digest, { nowIso: () => '2027-01-01T00:00:00Z' }).execute(
+      baseRequest({
+        requestId: `shadow-import-${digestOf(OWNER, REPO, expiresAtIso)}`,
+        shadowImportGrant: { repository: { ...VALID_GRANT.repository }, expiresAtIso },
+      }),
+    );
+    expect(result).toEqual({ outcome: 'rejected', reason: 'shadow-import-grant-expired' });
+    expect((await repo.listRequests()).length).toBe(0);
+  });
+
+  it('refuses a shadow request when the trusted clock is not injected', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const result = await useCaseWith(repo, digest, null).execute(baseRequest());
+    expect(result).toEqual({ outcome: 'rejected', reason: 'shadow-import-clock-unavailable' });
     expect((await repo.listRequests()).length).toBe(0);
   });
 
@@ -340,8 +403,17 @@ describe('RequestScopedDecisionUseCase.revokeOwnerGrant (GR1a1)', () => {
       enumerable: true,
     });
     const result = await revoke(useCaseWith(repo), request as unknown as RevokeOwnerGrantRequest);
-    expect(result).toEqual({ outcome: 'refused', reason: 'grant-missing' });
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-now-iso' });
     expect(calls).toBe(0);
+    expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
+  });
+
+  it('refuses a present non-string nowIso as invalid-now-iso, not grant-missing', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await seedStandingGrant(repo);
+    expect(
+      await revoke(useCaseWith(repo), { grantId: 'grant-shadow', nowIso: 42 as unknown as string }),
+    ).toEqual({ outcome: 'refused', reason: 'invalid-now-iso' });
     expect((await repo.findRequestById('shadow-req-1'))?.state).toBe('approved');
   });
 
@@ -373,5 +445,41 @@ describe('RequestScopedDecisionUseCase.revokeOwnerGrant (GR1a1)', () => {
     const missing = new InMemoryCoordinationRequestRepo();
     const refused = await revoke(useCaseWith(missing), { grantId: 'grant-shadow' });
     expect(refused.outcome).toBe('refused');
+  });
+});
+
+describe('RequestScopedDecisionUseCase ordinary decisions stay as on main (GR1a1 fix round)', () => {
+  function ordinaryRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      requestId: 'req-ordinary-1',
+      projectId: 'proj-alpha',
+      kind: 'action-decision',
+      actionScope: 'host:restart',
+      expectedHeadSha: 'abc123',
+      proposalDigest: 'sha256-proposal',
+      policyRevision: 'pol-rev-1',
+      nowIso: NOW_ISO,
+      ...overrides,
+    };
+  }
+
+  it('ignores an unknown body key exactly as main does (no new rejection)', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const result = await useCaseWith(repo).execute(ordinaryRequest({ unknownBodyKey: 'whatever' }));
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.actionScope).toBe('host:restart');
+    }
+  });
+
+  it('falls back to the clock for nowIso: null exactly as main does', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const before = new Date().toISOString();
+    const result = await useCaseWith(repo).execute(ordinaryRequest({ nowIso: null }));
+    expect(result.outcome).toBe('requested');
+    if (result.outcome === 'requested') {
+      expect(result.request.createdAtIso >= before).toBe(true);
+      expect(result.request.createdAtIso).not.toBe(NOW_ISO);
+    }
   });
 });

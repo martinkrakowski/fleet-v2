@@ -211,6 +211,9 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     requestScopedDecision: new RequestScopedDecisionUseCase({
       requestRepo: coordinationRequestRepository,
       decisionTransport,
+      // The shadow import grant's moment is the composition root's clock
+      // alone: no request body ever supplies it.
+      shadowImportClock: { nowIso: () => new Date().toISOString() },
     }),
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase({
       requestRepo: coordinationRequestRepository,

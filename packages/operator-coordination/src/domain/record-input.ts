@@ -35,6 +35,36 @@ export function readPlainObject(value: unknown, keys: readonly string[]): Record
   return out;
 }
 
+/**
+ * A plain object's own enumerable string keys with values read through their
+ * own property descriptors (no getter ever runs). Unlike `readPlainObject`
+ * the key set is not restricted: unknown keys are copied too and the caller
+ * simply ignores them, so an unknown body key is never a rejection — the
+ * ordinary-decision behaviour on main. A non-object, a prototype outside
+ * Object.prototype/null, or a symbol own key returns null.
+ */
+export function readPlainObjectLoose(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return null;
+  }
+  const out: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable) {
+      return null;
+    }
+    out[key] = descriptor.value;
+  }
+  return out;
+}
+
 /** A fresh plain array copied by index (no iterator, no species); a non-array is returned unchanged. */
 export function plainArrayCopy(value: unknown): unknown {
   if (!Array.isArray(value)) {

@@ -50,6 +50,7 @@ export type RevokeOwnerGrantRefusal =
   | 'grant-wrong-scope'
   | 'grant-already-revoked'
   | 'grant-not-revocable'
+  | 'invalid-now-iso'
   | 'revision-conflict';
 
 export interface RevokeOwnerGrantRequest {
@@ -74,6 +75,14 @@ export interface RequestScopedDecisionPort {
    * Revoke one standing owner grant by its id. Scoped strictly to the
    * standing `merge:import-shadow` grant: every other recorded grant is
    * refused, and a refusal never prints secret-shaped values.
+   *
+   * Re-request rule: a revoked or declined grant blocks identical
+   * coordinates — the request id is the digest of the grant's exact
+   * coordinates ({ scope, owner, repo, expiresAtIso }), so re-recording them
+   * is refused as an already-recorded request. To issue a fresh grant the
+   * owner records a request with a different coordinate, for example a
+   * different `expiresAtIso`, which yields a different digest and a new
+   * request id.
    */
   revokeOwnerGrant?(request: RevokeOwnerGrantRequest): Promise<RevokeOwnerGrantResult>;
 }

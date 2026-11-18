@@ -24,7 +24,7 @@ import {
   shadowImportDigestPayload,
 } from '../../domain/coordination-records.js';
 import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
-import { readPlainObjectWithOptional } from '../../domain/record-input.js';
+import { readPlainObjectLoose, readPlainObjectWithOptional } from '../../domain/record-input.js';
 import { CoordinationKind } from '../../domain/value-objects/CoordinationKind.vo.js';
 import { readReleaseRoot } from '../../domain/coordination-records.js';
 import type {
@@ -47,6 +47,15 @@ export interface RequestScopedDecisionDependencies {
    * request without it is a typed rejection, never a silent skip.
    */
   readonly computeDigest?: (payload: string) => string;
+  /**
+   * The trusted clock the shadow import grant's expiry and TTL are measured
+   * against and its `createdAtIso` is recorded from. Injected by the
+   * composition root, never taken from the request: a shadow import request
+   * without it is a typed rejection, so a requester-supplied `nowIso` of
+   * 2099 can never mint a 73-year grant. Ordinary (non-shadow) decisions
+   * keep exactly their main behaviour and never consult this clock.
+   */
+  readonly shadowImportClock?: { readonly nowIso: () => string };
 }
 
 function isFilled(value: unknown): value is string {
@@ -134,24 +143,11 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     // The request is snapshotted once by the domain's shared own-data-descriptor
     // reader before any field is read, so a throwing getter (an accessor whose
     // value collapses to `undefined`) or a Proxy trap can only produce a typed
-    // refusal — and no field is ever read off the original afterwards.
-    const snapshot = readPlainObjectWithOptional(
-      input,
-      ['requestId', 'projectId', 'actionScope', 'proposalDigest', 'policyRevision'],
-      [
-        'requestId',
-        'projectId',
-        'actionScope',
-        'proposalDigest',
-        'policyRevision',
-        'kind',
-        'expectedHeadSha',
-        'attemptId',
-        'nowIso',
-        'releaseRoot',
-        'shadowImportGrant',
-      ],
-    );
+    // refusal — and no field is ever read off the original afterwards. The
+    // loose reader ignores unknown keys: an ordinary decision carrying an
+    // unknown body key behaves exactly as on main, where it was never a
+    // rejection and never produced a misleading field message.
+    const snapshot = readPlainObjectLoose(input);
     if (snapshot === null) {
       return { outcome: 'rejected', reason: 'a decision request requires a non-empty requestId' };
     }
@@ -232,25 +228,45 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         reason: 'a forge action decision requires an attemptId',
       };
     }
-    // The composition root supplies the clock; no authority depends on it here.
     // An unreadable `nowIso` (an accessor, or a present non-string data value)
     // is a typed refusal, never a live property read off the request or a
-    // silent clock fallback; an explicit `undefined` data value is an omitted
-    // optional field and falls back to the clock, exactly as on main.
+    // silent clock fallback; an explicit `undefined` or `null` data value is
+    // an omitted optional field and falls back to the clock, exactly as on
+    // main.
     if (
       nowIsoIsAccessor ||
-      (!isFilled(request.nowIso) && nowIsoDescriptor !== undefined && nowIsoDescriptor.value !== undefined)
+      (nowIsoDescriptor !== undefined &&
+        nowIsoDescriptor.value !== undefined &&
+        nowIsoDescriptor.value !== null &&
+        !isFilled(request.nowIso))
     ) {
       return { outcome: 'rejected', reason: 'a decision request nowIso must be a non-empty string when given' };
     }
-    const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
     // Standing shadow import grant (owner decision 2026-11-18): the unattended
     // timer's grant is head-free, bounded by a future expiry within the TTL
     // cap, and bound to its request id by a digest of its exact coordinates
     // ({ scope, owner, repo, expiresAtIso }). Every failure here is a typed
     // rejection before anything is recorded.
+    // The grant's moment is the composition root's trusted clock alone: for
+    // this scope the request-supplied `nowIso` is ignored, and `createdAtIso`
+    // is recorded from the same clock. The composition root supplies the
+    // clock — the authority that caps the grant's lifetime depends on it
+    // here — so a shadow request without the injected clock is a typed
+    // rejection, never a grant measured against the requester's own clock.
+    // GR1a2: the digest and expiry are re-checked on resolve against the real
+    // clock; recording-time checks alone do not establish the guarantee.
+    const isShadowScope = isShadowImportActionScope(request.actionScope.trim());
+    let nowIso: string;
+    if (isShadowScope) {
+      if (this.deps.shadowImportClock === undefined) {
+        return { outcome: 'rejected', reason: 'shadow-import-clock-unavailable' };
+      }
+      nowIso = this.deps.shadowImportClock.nowIso();
+    } else {
+      nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
+    }
     let shadowImportGrant: ShadowImportGrantRecord | undefined;
-    if (isShadowImportActionScope(request.actionScope.trim())) {
+    if (isShadowScope) {
       const grantEvaluation = evaluateShadowImportGrant(request, nowIso, this.deps.computeDigest);
       if (!grantEvaluation.ok) {
         return { outcome: 'rejected', reason: grantEvaluation.reason };
@@ -315,7 +331,13 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       decisionRevision: answer.decisionRevision,
       grantId: answer.grantId,
       revision: recorded.revision + 1,
-      updatedAtIso: isFilled(request.nowIso) ? request.nowIso : new Date().toISOString(),
+      // A shadow request's moment is the trusted clock's, never the
+      // request-supplied one; ordinary decisions keep main's behaviour.
+      updatedAtIso: isShadowScope
+        ? nowIso
+        : isFilled(request.nowIso)
+          ? request.nowIso
+          : new Date().toISOString(),
     };
     const persisted = await this.recordOrReject(this.deps.requestRepo, decided);
     if (persisted === undefined) {
@@ -375,6 +397,14 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
    * import grant is revocable here: a missing grant, a grant of another
    * scope, one already revoked, or one in another terminal state is a typed
    * refusal, and a revision race is reported as `revision-conflict`.
+   *
+   * Re-request rule: a revoked or declined grant blocks identical
+   * coordinates — the request id is the digest of the grant's exact
+   * coordinates ({ scope, owner, repo, expiresAtIso }), so re-recording them
+   * is refused as an already-recorded request. To issue a fresh grant the
+   * owner records a request with a different coordinate, for example a
+   * different `expiresAtIso`, which yields a different digest and a new
+   * request id.
    */
   async revokeOwnerGrant(request: RevokeOwnerGrantRequest): Promise<RevokeOwnerGrantResult> {
     if (!this.deps) {
@@ -407,10 +437,11 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     }
     // An absent `nowIso` falls back to the clock; a present-but-unreadable
     // one (an accessor whose descriptor value is undefined, or a non-string)
-    // is a typed refusal. Presence is read only from the snapshot, so no
-    // property of the original request is touched after it was taken.
+    // is reported as `invalid-now-iso`, never as `grant-missing`. Presence
+    // is read only from the snapshot, so no property of the original request
+    // is touched after it was taken.
     if (!isFilled(snapshot.nowIso) && 'nowIso' in snapshot) {
-      return { outcome: 'refused', reason: 'grant-missing' };
+      return { outcome: 'refused', reason: 'invalid-now-iso' };
     }
     const nowIso = isFilled(snapshot.nowIso) ? snapshot.nowIso : new Date().toISOString();
     try {

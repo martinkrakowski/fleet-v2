@@ -21,6 +21,7 @@ import {
   LaneRunRepositoryAdapter,
   MergeQueueRepositoryAdapter,
   ReadOnlyStateStoreError,
+  ReleaseStoreAdapter,
   SHADOW_ONE_TIME_REQUIREMENTS,
   ShadowAttestationAdapter,
   type RecordShadowDayDependencies,
@@ -269,21 +270,33 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     return Object.fromEntries(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
   }
 
-  /** Every regular file under a directory, recursively, mapped to its bytes as text. */
+  /**
+   * Every entry under a directory, recursively, mapped to a text snapshot:
+   * regular files to their bytes, directories to `<dir>`, symlinks to
+   * `link -> <readlink target>` (the target is recorded, never followed), and
+   * any other entry kind to `<other>` — so the no-write snapshot notices a
+   * created directory, a created or retargeted symlink, or a changed file,
+   * not only regular-file writes.
+   */
   async function listFileBytes(root: string): Promise<Map<string, string>> {
-    const files = new Map<string, string>();
+    const entries = new Map<string, string>();
     const walk = async (dir: string): Promise<void> => {
       for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
         const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
+        if (entry.isSymbolicLink()) {
+          entries.set(full, `link -> ${await fs.readlink(full)}`);
+        } else if (entry.isDirectory()) {
+          entries.set(full, '<dir>');
           await walk(full);
         } else if (entry.isFile()) {
-          files.set(full, await fs.readFile(full, 'utf8'));
+          entries.set(full, await fs.readFile(full, 'utf8'));
+        } else {
+          entries.set(full, '<other>');
         }
       }
     };
     await walk(root);
-    return files;
+    return entries;
   }
 
   it('wires every reader and records the day: every wired criterion moves off not-wired, S13 stays not-implemented, S3 not-yet-observed and S2/S10/S11 release-unpinned while cutover-shadow-attestations.json is missing', async () => {
@@ -547,6 +560,35 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     const dryRunQueue = (deps.importDryRun as unknown as { deps: { queue: unknown } }).deps.queue;
     expect(dryRunQueue).toBe(deps.queue);
     expect(dryRunQueue).not.toBe(runtime.execution.mergeQueueRepository);
+  });
+
+  // Fix round 1: the composition builds ONE `ReleaseStoreAdapter` and reuses
+  // it in BOTH seats — the one-time criteria's `oneTime.releaseStore` and the
+  // `releaseSha` source. A second adapter for `releaseSha` would let the sha
+  // recorded for the day diverge from the tree `inspectReleaseFiles` inspects,
+  // so this test spies on the wired instance's `list` and asserts the
+  // `releaseSha` source answered through it. It fails if the composition wires
+  // a second adapter: the spy stays uncalled while a fresh instance answers.
+  it('wires releaseSha through the SAME ReleaseStoreAdapter instance oneTime.releaseStore uses', async () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    const store = deps.oneTime?.releaseStore;
+    if (store === undefined) throw new Error('oneTime.releaseStore is not wired');
+    expect(store).toBeInstanceOf(ReleaseStoreAdapter);
+    const calls: Array<{ root: string }> = [];
+    const spied = store as { list(input: { readonly root: string }): Promise<unknown> };
+    const original = spied.list.bind(store);
+    spied.list = async (input: { readonly root: string }) => {
+      calls.push(input);
+      return await original(input);
+    };
+    // The default wired `daemon.cliPath` (`/srv/fleet/current/apps/cli/dist/bin.js`)
+    // parses to release root `/srv/fleet`, which does not exist here, so the
+    // listing is `read` with `current: null` and the sha is `null` — but the
+    // spy call proves WHICH adapter the `releaseSha` source went through.
+    const sha = await deps.releaseSha();
+    expect(sha).toBeNull();
+    expect(calls).toEqual([{ root: '/srv/fleet' }]);
   });
 
   // Luna's pre-merge fix 1: the composition's `premergeCarry` must give the
@@ -843,11 +885,19 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot });
   });
 
-  it('refuses when the release root is missing (ENOENT)', async () => {    const releaseRoot = newReleaseRoot();
-    const { stateDir, fixtureDir, runtime } = await sh20Runtime(releaseRoot);
-    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot });
-    // The root was never created into: it stays empty.
-    expect(await fs.readdir(releaseRoot)).toEqual([]);
+  // Fix round 1: the root must genuinely not exist (not an existing empty
+  // directory), the day must still record as `release-unpinned`, and an
+  // explicit assertion pins that `record-day` did not create the release
+  // root — not an incidental failure of some other step.
+  it('refuses when the release root does not exist (ENOENT) and never creates it', async () => {
+    const parent = newReleaseRoot();
+    const missingRoot = path.join(parent, 'does-not-exist');
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(missingRoot);
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot: null });
+    // Explicit: `record-day` did not create the missing release root, and it
+    // did not even touch the parent directory that holds it.
+    await expect(fs.access(missingRoot)).rejects.toThrow();
+    expect(await fs.readdir(parent)).toEqual([]);
   });
 
   it('refuses when the release root is unreadable (chmod 0o000)', async () => {

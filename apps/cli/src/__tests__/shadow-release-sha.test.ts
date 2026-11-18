@@ -71,6 +71,30 @@ describe('readCurrentReleaseSha (SH20)', () => {
     expect(sha).toBeNull();
   });
 
+  // Fix round 1: without the `SHADOW_RELEASE_SHA_PATTERN` check the helper
+  // would return any `current` that names a verified build, so a non-pattern
+  // value present in `builds` must still refuse. This test fails on the
+  // mutation that drops the pattern check.
+  it('returns null when current is a non-pattern value that is present in builds', async () => {
+    const sha = await readCurrentReleaseSha({
+      releaseStore: storeOf(() => ({ outcome: 'read', current: 'not-a-sha', builds: [build('not-a-sha')] })),
+      releaseRoot: '/srv/fleet',
+    });
+    expect(sha).toBeNull();
+  });
+
+  // Fix round 1: without the `outcome === 'read'` check the helper would
+  // accept an `unreadable` listing that happens to carry a `current`, so an
+  // unreadable root that reports one must still refuse. This test fails on
+  // the mutation that accepts `unreadable` with a `current`.
+  it('returns null when an unreadable listing carries a valid current and builds', async () => {
+    const sha = await readCurrentReleaseSha({
+      releaseStore: storeOf(() => ({ outcome: 'unreadable', current: SHA, builds: [build(SHA)] }) as unknown as ReleaseStoreListing),
+      releaseRoot: '/srv/fleet',
+    });
+    expect(sha).toBeNull();
+  });
+
   it('returns null when current names a sha absent from the verified builds', async () => {
     const sha = await readCurrentReleaseSha({
       releaseStore: storeOf(() => ({ outcome: 'read', current: SHA, builds: [build(OTHER_SHA)] })),

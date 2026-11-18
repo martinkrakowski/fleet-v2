@@ -741,9 +741,11 @@ describe('S2 refusal paths fail closed', () => {
       stateDir,
       installation: installation(),
       forgeGhRunner: async (args, timeoutMs) => {
-        // The probe outlasts the whole budget, so the pass starts spent.
-        if (args[1] === 'rate_limit') {
-          skewMs += 60_000;
+        // The probe consumes the budget down to the 2 s safety margin: the
+        // clock ends about 1.5 s from the deadline, inside the margin the
+        // D-DT9 guard refuses, so removing the margin would make this fail.
+        if (args[1] === 'rate_limit' && skewMs === 0) {
+          skewMs += 8_500;
         }
         return baseRunner(args, timeoutMs);
       },
@@ -758,6 +760,34 @@ describe('S2 refusal paths fail closed', () => {
     expect(mergePassJob(lastJson(result.out))).toMatchObject({ outcome: 'budget-exhausted' });
     expect(stub.calls.filter((call) => call.args[1] === 'graphql')).toHaveLength(0);
     expect(entryFor(stateDir, 1)).toMatchObject({ state: 'queued', reason: null });
+  });
+
+  it('proceeds when about 3 seconds remain above the 2-second margin', async () => {
+    const stateDir = tempDir();
+    const stub = ghStub();
+    let skewMs = 0;
+    const baseRunner = runnerOf(stub);
+    const runtime = createFleetCliRuntime({
+      stateDir,
+      installation: installation(),
+      forgeGhRunner: async (args, timeoutMs) => {
+        // Same probe, but the clock ends about 3 s from the deadline: above
+        // the margin, so the pass makes its outbound calls as usual.
+        if (args[1] === 'rate_limit' && skewMs === 0) {
+          skewMs += 7_000;
+        }
+        return baseRunner(args, timeoutMs);
+      },
+      daemonNow: () => new Date(Date.now() + skewMs).toISOString(),
+      daemonSleep: async () => {},
+    });
+    await enqueue(runtime, 1);
+
+    const result = await run(runtime, ['daemon', 'tick', '--budget-seconds', '10']);
+
+    expect(result.code).toBe(0);
+    expect(mergePassJob(lastJson(result.out)).outcome).not.toBe('budget-exhausted');
+    expect(stub.calls.filter((call) => call.args[1] === 'graphql').length).toBeGreaterThan(0);
   });
 
   it('returns skipped or notifier-unavailable when optional queueWriter or notifier port is absent', async () => {

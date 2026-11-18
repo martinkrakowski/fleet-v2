@@ -65,6 +65,51 @@ const MAX_GRANT_ATTEMPT_ID_LENGTH = 256;
 
 const FORGE_SCOPE_PREFIX = 'forge:';
 
+type ShadowImportGrantEvaluation =
+  | { readonly ok: true; readonly grant: ShadowImportGrantRecord }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Every standing shadow import grant check (owner decision 2026-11-18),
+ * extracted from `execute` to keep it readable. The grant must be head-free,
+ * its expiry strictly in the future and within the TTL cap from now, and its
+ * request id must carry the digest of its exact coordinates
+ * ({ scope, owner, repo, expiresAtIso }). Pure: nothing is recorded here.
+ */
+function evaluateShadowImportGrant(
+  request: RequestScopedDecisionRequest,
+  nowIso: string,
+  computeDigest: ((payload: string) => string) | undefined,
+): ShadowImportGrantEvaluation {
+  if (request.expectedHeadSha !== null) {
+    return { ok: false, reason: 'shadow-import-expected-head-not-null' };
+  }
+  const parsedGrant = parseShadowImportGrant(request.shadowImportGrant);
+  if (!parsedGrant.ok) {
+    return { ok: false, reason: parsedGrant.code };
+  }
+  const expiresMs = Date.parse(parsedGrant.value.expiresAtIso);
+  const nowMs = Date.parse(nowIso);
+  if (!Number.isFinite(nowMs) || !Number.isFinite(expiresMs) || expiresMs <= nowMs) {
+    return { ok: false, reason: 'shadow-import-grant-expired' };
+  }
+  if (expiresMs - nowMs > SHADOW_IMPORT_GRANT_MAX_TTL_DAYS * 86_400_000) {
+    return { ok: false, reason: 'shadow-import-grant-ttl-exceeded' };
+  }
+  if (computeDigest === undefined) {
+    return { ok: false, reason: 'shadow-import-digest-unavailable' };
+  }
+  const payloadResult = shadowImportDigestPayload(parsedGrant.value);
+  if (!payloadResult.ok) {
+    return { ok: false, reason: payloadResult.code };
+  }
+  const expectedRequestId = `${SHADOW_IMPORT_DIGEST_PREFIX}${computeDigest(payloadResult.value)}`;
+  if (request.requestId.trim() !== expectedRequestId) {
+    return { ok: false, reason: 'shadow-import-request-digest-mismatch' };
+  }
+  return { ok: true, grant: parsedGrant.value };
+}
+
 export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
   constructor(private readonly deps?: RequestScopedDecisionDependencies) {}
 
@@ -155,36 +200,11 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     // rejection before anything is recorded.
     let shadowImportGrant: ShadowImportGrantRecord | undefined;
     if (isShadowImportActionScope(request.actionScope.trim())) {
-      if (request.expectedHeadSha !== null) {
-        return {
-          outcome: 'rejected',
-          reason: 'shadow-import-expected-head-not-null',
-        };
+      const grantEvaluation = evaluateShadowImportGrant(request, nowIso, this.deps.computeDigest);
+      if (!grantEvaluation.ok) {
+        return { outcome: 'rejected', reason: grantEvaluation.reason };
       }
-      const parsedGrant = parseShadowImportGrant(request.shadowImportGrant);
-      if (!parsedGrant.ok) {
-        return { outcome: 'rejected', reason: parsedGrant.code };
-      }
-      const expiresMs = Date.parse(parsedGrant.value.expiresAtIso);
-      const nowMs = Date.parse(nowIso);
-      if (!Number.isFinite(nowMs) || !Number.isFinite(expiresMs) || expiresMs <= nowMs) {
-        return { outcome: 'rejected', reason: 'shadow-import-grant-expired' };
-      }
-      if (expiresMs - nowMs > SHADOW_IMPORT_GRANT_MAX_TTL_DAYS * 86_400_000) {
-        return { outcome: 'rejected', reason: 'shadow-import-grant-ttl-exceeded' };
-      }
-      if (this.deps.computeDigest === undefined) {
-        return { outcome: 'rejected', reason: 'shadow-import-digest-unavailable' };
-      }
-      const payloadResult = shadowImportDigestPayload(parsedGrant.value);
-      if (!payloadResult.ok) {
-        return { outcome: 'rejected', reason: payloadResult.code };
-      }
-      const expectedRequestId = `${SHADOW_IMPORT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`;
-      if (request.requestId.trim() !== expectedRequestId) {
-        return { outcome: 'rejected', reason: 'shadow-import-request-digest-mismatch' };
-      }
-      shadowImportGrant = parsedGrant.value;
+      shadowImportGrant = grantEvaluation.grant;
     }
     const existing = await this.deps.requestRepo.findRequestById(request.requestId.trim());
     if (existing !== null) {

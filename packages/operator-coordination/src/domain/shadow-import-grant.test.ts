@@ -127,6 +127,16 @@ describe('parseShadowImportGrant (GR1a1 hostile inputs)', () => {
     }
   });
 
+  it('refuses a revoked Proxy around a valid grant with shadow-import-grant-invalid-input', () => {
+    const { proxy, revoke } = Proxy.revocable(validGrant(), {});
+    const proxyTargets = [proxy, { repository: proxy, expiresAtIso: VALID_EXPIRES_AT_ISO }];
+    for (const target of proxyTargets) {
+      revoke();
+      const result = parseShadowImportGrant(target);
+      expect(result).toEqual({ ok: false, code: 'shadow-import-grant-invalid-input' });
+    }
+  });
+
   it('refuses a JSON.parse __proto__ own key with shadow-import-grant-forbidden-key', () => {
     const raw = JSON.parse(
       `{"repository":{"owner":"octo","repo":"hello"},"expiresAtIso":"${VALID_EXPIRES_AT_ISO}","__proto__":{}}`,
@@ -199,6 +209,22 @@ describe('parseShadowImportGrant (GR1a1 hostile inputs)', () => {
     });
   });
 
+  it('refuses an impossible calendar date (February 30) that Date.parse would normalize', () => {
+    const raw = { repository: { ...VALID_REPOSITORY }, expiresAtIso: '2026-02-30T00:00:00Z' };
+    expect(parseShadowImportGrant(raw)).toEqual({
+      ok: false,
+      code: 'shadow-import-grant-invalid-expiry',
+    });
+  });
+
+  it('refuses month 13, which Date.parse would roll into the next year', () => {
+    const raw = { repository: { ...VALID_REPOSITORY }, expiresAtIso: '2026-13-01T00:00:00Z' };
+    expect(parseShadowImportGrant(raw)).toEqual({
+      ok: false,
+      code: 'shadow-import-grant-invalid-expiry',
+    });
+  });
+
   it('refuses an expiresAtIso that is a sparse-array hole carrier', () => {
     const holey: unknown[] = new Array(1);
     const raw = { repository: { ...VALID_REPOSITORY }, expiresAtIso: holey };
@@ -233,8 +259,8 @@ describe('parseShadowImportGrant (GR1a1 hostile inputs)', () => {
     if (result.ok) {
       expect(result.value).toEqual({ repository: { owner: 'octo', repo: 'hello' }, expiresAtIso: VALID_EXPIRES_AT_ISO });
       expect(result.value).not.toBe(raw);
-      expect(Object.isFrozen(result.value));
-      expect(Object.isFrozen(result.value.repository));
+      expect(Object.isFrozen(result.value)).toBe(true);
+      expect(Object.isFrozen(result.value.repository)).toBe(true);
     }
   });
 

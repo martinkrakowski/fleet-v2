@@ -104,7 +104,7 @@ These values belong to the operator's installation, never to this repository.
 | `FLEET_API_TOKEN_FILE` | File holding the API's bearer token, read by the API, the MCP server and the web client. |
 | `FLEET_API_ALLOWED_ORIGINS` | Origins the API accepts. |
 | `FLEET_API_ALLOW_REMOTE` | `1` lets the API listen on a non-loopback host. |
-| `FLEET_OWNER_PUBLIC_KEY` | Public key that verifies signed decisions. |
+| Owner key | The key that verifies signed decisions is pinned as `owner.publicKey` in the installation file (see the cutover runbook). `FLEET_OWNER_PUBLIC_KEY` is never an authority: when it is set it must equal the pinned key or the composition refuses. |
 | `OCM_HOST` | SSH target `bin/ocm-run` uses for its tunnel to the lane server. |
 | `FLEET_OCM_RUN_BIN`, `FLEET_USAGE_NODE_BIN` | Overrides for the runner binary and for the node binary that reads usage on the runner host. |
 | `AGY_BIN` | The agy binary `bin/agy-run` runs, set on the lane host. |

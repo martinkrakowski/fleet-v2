@@ -242,6 +242,7 @@ import {
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
   UpdateProjectProfileUseCase,
+  resolvePinnedOwnerPublicKey,
   OPERATOR_COORDINATION_STATE_FILES,
 } from '@fleet/operator-coordination';
 import {
@@ -297,8 +298,14 @@ export interface FleetCliRuntimeOptions {
    * environment carries the variables.
    */
   readonly env?: Record<string, string | undefined>;
-  /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
+  /**
+   * KEY0b: the fallback pinned owner key when `installation.owner.publicKey`
+   * is absent (tests inject one here). `FLEET_OWNER_PUBLIC_KEY` is never an
+   * authority; the pinned key is resolved by `resolvePinnedOwnerPublicKey`.
+   */
   readonly ownerPublicKey?: string;
+  /** The one-line deprecation warning is emitted here exactly once. */
+  readonly onOwnerKeyWarning?: (message: string) => void;
   /** Deterministic subprocess execution for runner tests. */
   readonly runSubprocess?: SubprocessRunner;
   /**
@@ -1181,8 +1188,20 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const roleExecutors = resolveRoleExecutors(options?.installation, {
     worktreeSshHost,
   });
-  const ownerPublicKey =
-    options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
+  // KEY0b: the owner public key is read ONLY from the pinned
+  // installation.owner.publicKey (or the test-injected pinned fallback when
+  // the installation carries none). FLEET_OWNER_PUBLIC_KEY is never an
+  // authority: a mismatching value refuses, an equal value only warns once.
+  const resolvedOwnerKey = resolvePinnedOwnerPublicKey(
+    options?.installation?.owner?.publicKey ?? options?.ownerPublicKey,
+    options?.env ?? process.env,
+  );
+  const ownerPublicKey = resolvedOwnerKey.status === 'pinned' ? resolvedOwnerKey.publicKey : undefined;
+  const ownerKeyRefusal =
+    resolvedOwnerKey.status === 'pinned' ? undefined : resolvedOwnerKey.code;
+  if (resolvedOwnerKey.status === 'pinned' && resolvedOwnerKey.deprecationWarning !== undefined) {
+    options?.onOwnerKeyWarning?.(resolvedOwnerKey.deprecationWarning);
+  }
 
   // CO24f: the authorization resolve binds owner grants to the attempt that
   // resolves them, and validates that attempt through the execution stack's
@@ -1199,7 +1218,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     profileRead,
     probeRecord,
     executorForHostName,
-  } = composeCoordination({ stateDir, ownerPublicKey, options, attemptFactsRead });
+  } = composeCoordination({ stateDir, ownerPublicKey, ownerKeyRefusal, options, attemptFactsRead });
 
   const { knowledge } = composeKnowledge({ stateDir, options });
 

@@ -789,6 +789,34 @@ function groupHelp(group: string): string {
 // Driver
 // ---------------------------------------------------------------------------
 
+/**
+ * The daemon branch's own load-and-compose step: `loadInstallation()` runs
+ * inside this function, an invalid load result composes WITHOUT an
+ * installation (so no pinned owner key exists at all), and a valid one
+ * composes WITH the installation's owner section. Exported so the daemon
+ * branch and its tests share one real code path.
+ */
+export function composeDaemonRuntimeFromInstallation(
+  stateDir: string | undefined,
+  onOwnerKeyWarning: (message: string) => void,
+): FleetCliRuntime {
+  const loadResult = loadInstallation();
+  return createFleetCliRuntime(
+    loadResult.status === 'invalid'
+      ? {
+          stateDir,
+          loadInstallationForMergePolicy: () => loadResult,
+          onOwnerKeyWarning,
+        }
+      : {
+          stateDir,
+          installation: loadResult.installation,
+          loadInstallationForMergePolicy: () => loadInstallation(),
+          onOwnerKeyWarning,
+        },
+  );
+}
+
 export async function runCli(
   argv: readonly string[],
   io: CliIo = processIo,
@@ -876,15 +904,8 @@ export async function runCli(
       if (runtime !== undefined) {
         daemonRuntime = runtime;
       } else {
-        const loadResult = loadInstallation();
-        daemonRuntime = createFleetCliRuntime(
-          loadResult.status === 'invalid'
-            ? { stateDir, loadInstallationForMergePolicy: () => loadResult }
-            : {
-                stateDir,
-                installation: loadResult.installation,
-                loadInstallationForMergePolicy: () => loadInstallation(),
-              },
+        daemonRuntime = composeDaemonRuntimeFromInstallation(stateDir, (message) =>
+          io.stderr(`${message}\n`),
         );
       }
       return await daemonCommand(restArgv.slice(1), io, daemonRuntime, {
@@ -919,6 +940,7 @@ export async function runCli(
       activeRuntime = createFleetCliRuntime({
         stateDir,
         installation: loadResult.installation,
+        onOwnerKeyWarning: (message) => io.stderr(`${message}\n`),
       });
     }
     // The projects group manages its profiles through the composed runtime

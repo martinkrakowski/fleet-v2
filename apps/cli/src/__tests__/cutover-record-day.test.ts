@@ -314,7 +314,7 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     return entries;
   }
 
-  it('wires every reader and records the day: every wired criterion moves off not-wired, S13 stays not-implemented, S3 not-yet-observed and S2/S10/S11 release-unpinned while cutover-shadow-attestations.json is missing', async () => {
+  it('wires every reader and records the day: every wired criterion moves off not-wired, S13 is no longer recorded, S3 not-yet-observed and S2/S10/S11 release-unpinned while cutover-shadow-attestations.json is missing', async () => {
     const { stateDir, fixtureDir } = newDirs();
     await shellFixture(fixtureDir);
     const runtime = wiredRuntime(stateDir);
@@ -341,7 +341,9 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       //   never a fail), S2/S10/S11 `release-unpinned` (releaseSha null, SH20 not
       //   landed: UNPINNED_RANK 2 beats NOT_YET_RANK 6), S3 `not-yet-observed`
       //   (the attestations ledger is missing), S8 `samples-invalid` (no
-      //   daemon events to sample), S13 `not-implemented`.
+      //   daemon events to sample). S13 is absent everywhere: since SH23
+      //   (owner decision 2026-11-18) it is no longer a shadow criterion —
+      //   not recorded and not unevaluated.
       expect(result.recorded).toEqual({
         S1: 'pass',
         S5: 'pass',
@@ -350,6 +352,7 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
         S9: 'pass',
         S12: 'fail',
       });
+      expect(Object.keys(result.recorded)).not.toContain('S13');
       expect(reasons).toEqual({
         S2: 'release-unpinned',
         S3: 'not-yet-observed',
@@ -357,7 +360,6 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
         S8: 'samples-invalid',
         S10: 'release-unpinned',
         S11: 'release-unpinned',
-        S13: 'not-implemented',
       });
     } finally {
       vi.useRealTimers();

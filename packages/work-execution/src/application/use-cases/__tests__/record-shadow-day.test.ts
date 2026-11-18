@@ -58,9 +58,8 @@ const PAST_DEADLINE = '2026-11-17T11:00:00.000Z';
  * `NOW` plus 150 real seconds is `2026-11-17T12:02:30.000Z`.
  */
 const RECORDED_AT_ISO = '2026-11-17T12:02:30.000Z';
-const NOT_IMPLEMENTED: readonly CutoverShadowCriterion[] = [
-  'S13',
-];
+/** Empty since SH23: S13 left the shadow window for the retirement gate, so no criterion is stubbed. */
+const NOT_IMPLEMENTED: readonly CutoverShadowCriterion[] = [];
 
 /** A valid ULID-shaped id carrying `n` (O1b-1 pattern: `[0-7][Crockford]{25}`). */
 function ulid(n: number): string {
@@ -1093,7 +1092,7 @@ function wiredHarness(fixture: Fixture, options: ConductedOptions = {}, chainSta
   return harness;
 }
 
-/** Every not-yet-built criterion is always in `unevaluated`, exactly once. */
+/** Every not-yet-built criterion is always in `unevaluated`, exactly once, and S13 is never listed. */
 function expectNotImplementedUnevaluated(
   unevaluated: readonly { criterion: CutoverShadowCriterion; reason: string }[],
 ): void {
@@ -1102,6 +1101,8 @@ function expectNotImplementedUnevaluated(
     expect(reasons.get(criterion)).toBe('not-implemented');
   }
   expect(unevaluated.filter((entry) => entry.reason === 'not-implemented')).toHaveLength(NOT_IMPLEMENTED.length);
+  // SH23: S13 moved to the retirement gate, so it is never recorded and never unevaluated.
+  expect(reasons.has('S13')).toBe(false);
 }
 
 describe('RecordShadowDayUseCase', () => {
@@ -1997,6 +1998,8 @@ describe('RecordShadowDayUseCase', () => {
       for (const criterion of NOT_IMPLEMENTED) {
         expect(evaluated.has(criterion)).toBe(false);
       }
+      // SH23: S13 is no longer recorded on any day.
+      expect(evaluated.has('S13')).toBe(false);
     }
   });
 

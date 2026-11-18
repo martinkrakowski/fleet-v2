@@ -107,11 +107,6 @@ const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
  */
 const DEFAULT_SAMPLE_GAP_MS = 150_000;
 
-/** Every criterion no evaluator implements yet; later units add the rest. */
-const NOT_IMPLEMENTED_CRITERIA: readonly CutoverShadowCriterion[] = [
-  'S13',
-];
-
 export interface RecordShadowDayDependencies {
   readonly evidence: ShadowEvidencePort;
   readonly legacy: LegacyTrainStateReadPort;
@@ -1216,7 +1211,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * S2, S3, S10 and S11: the one-time criteria, judged from the sticky
    * attestation ledger plus the day's pinned release tree. Re-evaluated and
    * recorded on EVERY day with no "already passed" shortcut, because
-   * `readCutoverShadowEvidence` requires all thirteen criteria to pass on
+   * `readCutoverShadowEvidence` requires all twelve criteria to pass on
    * the required shadow day. The ledger read and the release
    * inspection both go through `call`, so a reached deadline — before or
    * after the awaited value — aborts the whole run.
@@ -1515,9 +1510,6 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
           unresolvedIds: outcome.premergeCarry.unresolvedIds,
         };
       }
-    }
-    for (const criterion of NOT_IMPLEMENTED_CRITERIA) {
-      unevaluated.set(criterion, 'not-implemented');
     }
     return { verdicts, unevaluated, mergesCompared, ...(premergeCarry === undefined ? {} : { premergeCarry }) };
   }

@@ -66,6 +66,26 @@ function blocked(reason: string): ResolveActionAuthorizationResult {
   return { outcome: 'blocked', reason };
 }
 
+/**
+ * A descriptor-safe snapshot of the request's nested `repository`. A nested
+ * plain object is copied with own data descriptors only (no getter ever runs,
+ * so an accessor on `repository.owner` or `repository.repo` collapses to
+ * `undefined` and is refused later as an invalid repository); anything the
+ * reader cannot snapshot descriptor-safely becomes `null`, which
+ * `resolveTargetRepository` refuses. A string `owner/repo` coordinate is not
+ * an object and passes through for the later validation.
+ */
+function snapshotRepository(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  try {
+    return readPlainObjectLoose(value);
+  } catch {
+    return null;
+  }
+}
+
 export class ResolveActionAuthorizationUseCase implements ResolveActionAuthorizationPort {
   constructor(private readonly deps?: ResolveActionAuthorizationDependencies) {}
 
@@ -94,23 +114,43 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // The shadow path reads the request through a descriptor-safe snapshot
     // (no getter ever runs, a hostile accessor or proxy is a typed refusal),
     // so a hostile object can never throw out of the shadow branch.
-    let scope = '';
+    // The snapshot is taken FIRST, before any field — including `actionScope` —
+    // is read, so no getter on any field (not even the one that routes the
+    // request) can run before the request is frozen. A throwing trap during
+    // the snapshot is a hostile proxy: a typed refusal, never an exception.
+    let snapshot: Record<string, unknown> | null = null;
     try {
-      scope = (input as ResolveActionAuthorizationRequest).actionScope?.trim?.() ?? '';
+      snapshot = readPlainObjectLoose(input);
     } catch {
       return blocked('invalid-request');
     }
+    // An accessor field snapshots to `undefined` (its value is never read), but
+    // its presence is still visible through its own property descriptor, and
+    // inspecting a descriptor never runs a getter. A getter-carrying
+    // `actionScope` therefore cannot be resolved head-free at all: it is a
+    // typed refusal with a getter-call count of 0. A plain-data `actionScope`
+    // — every ordinary request — reads exactly as before from the snapshot.
+    const actionScopeDescriptor = Object.getOwnPropertyDescriptor(input, 'actionScope');
+    if (actionScopeDescriptor !== undefined && actionScopeDescriptor.get !== undefined) {
+      return blocked('invalid-request');
+    }
+    const scope =
+      snapshot !== null && typeof snapshot['actionScope'] === 'string'
+        ? (snapshot['actionScope'] as string).trim()
+        : '';
     if (isShadowImportActionScope(scope)) {
-      let snapshot: Record<string, unknown> | null = null;
-      try {
-        snapshot = readPlainObjectLoose(input);
-      } catch {
-        snapshot = null;
-      }
       if (snapshot === null) {
         return blocked('invalid-request');
       }
-      return this.resolveShadowImport(snapshot as unknown as ResolveActionAuthorizationRequest);
+      // The nested `repository` is snapshotted with own data descriptors too,
+      // so a getter on `repository.owner` or `repository.repo` never runs
+      // later in `resolveTargetRepository`: the resolve reads only from the
+      // snapshots, never from the original request or its nested object.
+      const shadowRequest = {
+        ...snapshot,
+        repository: snapshotRepository(snapshot['repository']),
+      };
+      return this.resolveShadowImport(shadowRequest as unknown as ResolveActionAuthorizationRequest);
     }
     const request = input as ResolveActionAuthorizationRequest;
     if (Object.keys(request).length === 0) {

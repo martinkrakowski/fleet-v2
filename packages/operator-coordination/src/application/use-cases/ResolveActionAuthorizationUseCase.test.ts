@@ -571,6 +571,45 @@ describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)
     expect(calls).toBe(0);
   });
 
+  it('never runs an accessor on actionScope and refuses the request as invalid-request', async () => {
+    const requestRepo = seededRepo();
+    let calls = 0;
+    const hostile = { ...validRequest() };
+    Object.defineProperty(hostile, 'actionScope', {
+      get() {
+        calls += 1;
+        throw new Error('hostile actionScope getter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(requestRepo), hostile);
+    // The routing field itself is snapshotted before it is read: the accessor
+    // is visible through its own descriptor (which runs no getter), so the
+    // request is refused without ever calling the getter.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+    expect(calls).toBe(0);
+  });
+
+  it('never runs an accessor on repository.owner and refuses the repository', async () => {
+    const requestRepo = seededRepo();
+    let calls = 0;
+    const repository: Record<string, unknown> = { owner: 'octo', repo: 'hello' };
+    Object.defineProperty(repository, 'owner', {
+      get() {
+        calls += 1;
+        throw new Error('hostile repository.owner getter ran');
+      },
+      enumerable: true,
+    });
+    const hostile = { ...validRequest(), repository };
+    const result = await resolveRaw(useCase(requestRepo), hostile);
+    // The nested repository is snapshotted with own data descriptors before
+    // resolveTargetRepository runs, so the accessor never fires and the
+    // snapshot's undefined owner is a typed repository refusal.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'grant-wrong-repository' });
+    expect(calls).toBe(0);
+  });
+
   it('handles an own __proto__ key on a shadow resolve request as an ordinary field', async () => {
     const requestRepo = seededRepo();
     const hostile = JSON.parse(

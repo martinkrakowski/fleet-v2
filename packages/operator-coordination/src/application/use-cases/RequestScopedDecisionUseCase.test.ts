@@ -554,4 +554,43 @@ describe('RequestScopedDecisionUseCase ordinary decisions stay as on main (GR1a1
     }
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
+
+  it('maps a throwing getPrototypeOf trap to the invalid-request refusal', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const proxy = new Proxy(ordinaryRequest(), {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf trap');
+      },
+    });
+    await expect(useCaseWith(repo).execute(proxy)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'invalid-request',
+    });
+  });
+
+  it('maps a throwing ownKeys trap to the invalid-request refusal', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const proxy = new Proxy(ordinaryRequest(), {
+      ownKeys() {
+        throw new Error('hostile ownKeys trap');
+      },
+    });
+    await expect(useCaseWith(repo).execute(proxy)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'invalid-request',
+    });
+  });
+
+  it('maps a throwing getOwnPropertyDescriptor trap to the invalid-request refusal', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    const proxy = new Proxy(ordinaryRequest(), {
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile getOwnPropertyDescriptor trap');
+      },
+    });
+    await expect(useCaseWith(repo).execute(proxy)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'invalid-request',
+    });
+  });
 });

@@ -147,7 +147,16 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     // loose reader ignores unknown keys: an ordinary decision carrying an
     // unknown body key behaves exactly as on main, where it was never a
     // rejection and never produced a misleading field message.
-    const snapshot = readPlainObjectLoose(input);
+    // A Proxy's `getPrototypeOf`, `ownKeys` and `getOwnPropertyDescriptor`
+    // traps can throw while the snapshot is taken. Any such throw is a hostile
+    // body, mapped to the typed `invalid-request` refusal — never an exception
+    // out of `execute`. Ordinary inputs snapshot exactly as before.
+    let snapshot: Record<string, unknown> | null;
+    try {
+      snapshot = readPlainObjectLoose(input);
+    } catch {
+      return { outcome: 'rejected', reason: 'invalid-request' };
+    }
     if (snapshot === null) {
       return { outcome: 'rejected', reason: 'a decision request requires a non-empty requestId' };
     }

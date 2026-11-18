@@ -267,22 +267,23 @@ type JournalRead =
  * stay live.
  *
  * The exclusion is bound to THIS queue entry, not to the key alone: the
- * record only excludes when its own `recordedAtIso` is STRICTLY after the
- * entry's `enqueuedAtIso` (both fields the entry and the journal reliably
- * carry), or when the result carries the entry's own identity — its `runId`
- * matches the entry's non-null `runId`. An equal timestamp cannot establish
- * which incarnation of the key the result belongs to, so without the
- * identity it leaves the entry LIVE: a would-terminal record that predates
- * the entry's enqueue, or one recorded at exactly the entry's enqueue time,
- * belongs to an earlier incarnation of the same key and a later re-enqueue
- * at the same head is LIVE again. When either timestamp is missing or
- * unparseable the record cannot be bound to the entry, so the entry stays
- * live — staying live can only cost a divergence, never a false pass.
+ * record only excludes when BOTH timestamps parse and its own
+ * `recordedAtIso` is STRICTLY after the entry's `enqueuedAtIso` (both fields
+ * the entry and the journal reliably carry). An equal timestamp cannot
+ * establish which incarnation of the key the result belongs to, so it leaves
+ * the entry LIVE: a would-terminal record that predates the entry's enqueue,
+ * or one recorded at exactly the entry's enqueue time, belongs to an earlier
+ * incarnation of the same key and a later re-enqueue at the same head is
+ * LIVE again. A `runId` binds nothing and is never used as identity here: a
+ * re-enqueue can carry the same `runId`, so it cannot tie a result to an
+ * entry. When either timestamp is missing or unparseable the record cannot
+ * be bound to the entry, so the entry stays live — staying live can only
+ * cost a divergence, never a false pass.
  * Cost: linear in the journal entries; the entry's own fields are plain
  * reads.
  */
 function isShadowEffectivelyLive(
-  entry: Pick<MergeQueueEntryRecord, 'repoDigest' | 'pullRequest' | 'headOid' | 'state' | 'enqueuedAtIso' | 'runId'>,
+  entry: Pick<MergeQueueEntryRecord, 'repoDigest' | 'pullRequest' | 'headOid' | 'state' | 'enqueuedAtIso'>,
   journalEntries: readonly LaneRunJournalEntryRecord[],
 ): boolean {
   if (!isMergeQueueEntryLive(entry)) {
@@ -307,17 +308,17 @@ function isShadowEffectivelyLive(
       && SHADOW_TERMINAL_WOULD_ACTIONS.includes(parsed.action)
       && record.reasonCode === parsed.action
     ) {
+      // A terminal result excludes the entry ONLY when both timestamps parse
+      // and the result was recorded strictly after the enqueue. An
+      // unparseable timestamp (either side) cannot bind the record to the
+      // entry, so the entry stays LIVE — fail-closed. An equal timestamp is
+      // ambiguous in the same way. A `runId` binds nothing: a re-enqueue can
+      // carry the same `runId`, so it is never used as identity here.
       const recordedMs = Date.parse(record.recordedAtIso);
       if (Number.isNaN(enqueuedMs) || Number.isNaN(recordedMs)) {
-        return false;
+        continue;
       }
-      // Strictly after binds the record to this entry; an equal timestamp is
-      // ambiguous, so it only excludes when the result carries the entry's
-      // own identity (its non-null `runId`).
       if (recordedMs > enqueuedMs) {
-        return false;
-      }
-      if (record.runId !== null && record.runId !== undefined && entry.runId !== null && entry.runId !== undefined && record.runId === entry.runId) {
         return false;
       }
     }

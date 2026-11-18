@@ -100,6 +100,8 @@ interface JournalEntryInit {
   readonly reasonCode?: string;
   /** SH24b: a result's linked head oid (a `would-merge`/`would-supersede` successor head). */
   readonly linkedId?: string;
+  /** SH24b fix: the journal record's `runId` (a run identity, not an entry identity). */
+  readonly runId?: string;
   readonly recordedAtIso: string;
 }
 
@@ -109,7 +111,7 @@ function journalEntry(init: JournalEntryInit): LaneRunJournalEntryRecord {
     entryId: ulid(1),
     kind: init.kind,
     key: init.key,
-    runId: null,
+    runId: init.runId ?? null,
     recordedAtIso: init.recordedAtIso,
     mode: null,
     expectedRevision: null,
@@ -170,6 +172,7 @@ function shadowOutcome(
   reasonCode: string,
   atIso: string,
   linkedId?: string,
+  runId?: string,
 ): LaneRunJournalEntryRecord[] {
   return [
     journalEntry({ kind: 'intent', key: shadowMergeKey(pr, headOid, action), recordedAtIso: atIso }),
@@ -179,6 +182,7 @@ function shadowOutcome(
       outcome: 'dry-run',
       reasonCode,
       ...(linkedId === undefined ? {} : { linkedId }),
+      ...(runId === undefined ? {} : { runId }),
       recordedAtIso: atIso,
     }),
   ];
@@ -1577,14 +1581,16 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
   });
 
-  it('SH24b: an equal timestamp between the would-drop result and the entry enqueue keeps the entry live — S8 diverges, never falsely passes', async () => {
+  it('SH24b fix: an equal timestamp with the SAME runId on entry and result keeps the entry live — a runId binds nothing, S8 diverges, never falsely passes', async () => {
     const fixture = cleanFixture(DAY);
     // The drop was journaled at EXACTLY this entry's `enqueuedAtIso`: an
     // equal timestamp cannot establish which incarnation of the key the
-    // result belongs to, and the result carries no identity (both `runId`s
-    // are null), so the entry must stay LIVE — S8 must diverge, not pass.
-    fixture.queueEntries.push(queuedEntry(3, 9, HEAD_D, `${DAY}T10:01:00.000Z`));
-    fixture.journalEntries.push(...shadowOutcome(9, HEAD_D, 'would-drop', 'would-drop', `${DAY}T10:01:00.000Z`));
+    // result belongs to. Even though the result carries the entry's own
+    // (non-null) `runId`, a re-enqueue can reuse a `runId`, so it is not an
+    // entry identity and must not exclude — the entry stays LIVE and S8
+    // must diverge, not pass.
+    fixture.queueEntries.push({ ...queuedEntry(3, 9, HEAD_D, `${DAY}T10:01:00.000Z`), runId: 'run-eq-1' } as unknown as MergeQueueEntryRecord);
+    fixture.journalEntries.push(...shadowOutcome(9, HEAD_D, 'would-drop', 'would-drop', `${DAY}T10:01:00.000Z`, undefined, 'run-eq-1'));
     const harness = makeHarness(fixture, NOW);
     const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
     expectRecorded(result);
@@ -1607,6 +1613,45 @@ describe('RecordShadowDayUseCase', () => {
     expect(result.recorded.S8).toBe('pass');
     const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
     expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'pass' });
+  });
+
+  it('SH24b fix: an unparseable enqueue timestamp keeps the entry live even though the result parses — S8 diverges, never falsely passes', async () => {
+    const fixture = cleanFixture(DAY);
+    // The entry's `enqueuedAtIso` does not parse: the record cannot be bound
+    // to the entry via the strictly-after rule (fail-closed), so the entry
+    // stays LIVE — S8 must diverge, not pass, even though the result's own
+    // timestamp is a valid instant strictly after the enqueue instant.
+    fixture.queueEntries.push(queuedEntry(3, 9, HEAD_D, 'not-a-timestamp'));
+    fixture.journalEntries.push(...shadowOutcome(9, HEAD_D, 'would-drop', 'would-drop', `${DAY}T10:01:00.001Z`));
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S1).toBe('pass');
+    expect(result.recorded.S8).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
+  });
+
+  it('SH24b fix: an unparseable result timestamp keeps the entry live even though the enqueue timestamp parses — S8 diverges, never falsely passes', async () => {
+    const fixture = cleanFixture(DAY);
+    // The result's `recordedAtIso` does not parse: the strictly-after rule
+    // cannot bind the record to the entry (fail-closed), so the entry stays
+    // LIVE — S8 must diverge, not pass, and no timestamp arithmetic on an
+    // unparsable value may silently exclude it.
+    fixture.queueEntries.push(queuedEntry(3, 9, HEAD_D, `${DAY}T10:01:00.000Z`));
+    fixture.journalEntries.push(...shadowOutcome(9, HEAD_D, 'would-drop', 'would-drop', 'not-a-timestamp'));
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    // The unparseable result timestamp also makes S1's merge-set input
+    // structurally invalid (a fleet result must carry a zoned ISO
+    // `recordedAtIso`), so S1 is refused as unevaluated — itself a
+    // fail-closed outcome, never a false pass.
+    expect(result.unevaluated).toContainEqual({ criterion: 'S1', reason: 'invalid-input' });
+    expect(result.recorded.S1).toBeUndefined();
+    expect(result.recorded.S8).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
   });
 
   it('SH24b: a real parked entry (state parked, no would-park result) stays live in S1 and S8', async () => {

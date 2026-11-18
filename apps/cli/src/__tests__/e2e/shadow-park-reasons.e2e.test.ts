@@ -511,6 +511,33 @@ describe('S2 shadow park-reasons e2e (narrowed per owner decision 2026-11-17)', 
     expect(sibling[1]).toMatchObject({ outcome: 'dry-run', reasonCode: 'would-merge' });
   });
 
+  it('holds a DIRTY PR fail-closed end to end while a healthy sibling still merges (e2e)', async () => {
+    // The forge read adapter maps GitHub's `DIRTY` to the domain token
+    // `blocked` (ForgeReadAdapter.adapter.ts:108-113), so through the CLI a
+    // DIRTY merge state never reaches the decider's `DIRTY → drop conflict`
+    // row (merge-queue-decider.ts:1071-1073): it fail-closes as a wait and the
+    // pass persists nothing. The decider-level drop is proved in the next
+    // test; this case proves the e2e isolation: the held PR is never acted
+    // on while the healthy sibling completes.
+    const siblingHead = '0fedcba9876543210fedcba9876543210fedcba9';
+    const h = harness();
+    await enqueue(h.runtime, 1);
+    await enqueue(h.runtime, 2, { headOid: siblingHead });
+    h.stub.graphql = (pullRequest) =>
+      pullRequest === 1
+        ? pullRequestPayload({ mergeStateStatus: 'DIRTY' })
+        : pullRequestPayload({ headOid: siblingHead });
+
+    const result = await tick(h);
+
+    expect(result.code).toBe(0);
+    expect(entryFor(h.stateDir, 1)).toMatchObject({ state: 'queued', reason: null });
+    expect(await h.runtime.conductor.laneRunJournal.listForKey(journalKey('merge-pr', 1))).toHaveLength(0);
+    const sibling = await h.runtime.conductor.laneRunJournal.listForKey(journalKey('merge-pr', 2, siblingHead));
+    expect(sibling.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(sibling[1]).toMatchObject({ outcome: 'dry-run', reasonCode: 'would-merge' });
+  });
+
   it('completes a shadow open intent left without a result by an earlier pass', async () => {
     const h = harness();
     await enqueue(h.runtime, 1);
@@ -708,7 +735,7 @@ describe('S2 refusal paths fail closed', () => {
     }
   });
 
-  it('catches throwing getter on daemonNow or forgeGhRunner without uncaught exception', async () => {
+  it('catches a throwing function on daemonNow or forgeGhRunner without uncaught exception', async () => {
     const clockDown = harness({}, {
       daemonNow: (): string => {
         throw new Error('clock down');

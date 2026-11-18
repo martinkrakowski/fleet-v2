@@ -1399,6 +1399,13 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * is written. A held guard returns the typed `stop` result (nothing has
    * been written at that point); otherwise the already-evaluated S12 outcome
    * is carried out so `run` never reads the daemon events twice.
+   *
+   * OD7a3 fix round: the prechecks are split into ordered helpers —
+   * `precheckEventsRead`, `precheckFirstTick`, `precheckTickHealth` and
+   * `precheckCoverage` — each returning `stop: <result> | null` where
+   * `null` means "continue". The grant-coverage guard stays here because it
+   * must run before any daemon-event read. Behaviour is identical: the same
+   * guards run in the same order and the same reasons are returned.
    */
   private async runScheduledPrechecks(
     context: DayContext,
@@ -1426,8 +1433,50 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
         ),
       };
     }
-    // 2. Events read and first-tick `job` guard: only `job` events count, and
-    // the earliest in-day one must fall within the first-tick grace window.
+    // 2. Events read: the whole successful read is snapshotted once and a
+    // dropped line bracketed inside the day stops the run before anything
+    // is evaluated or written.
+    const eventsRead = await this.precheckEventsRead(context);
+    if (eventsRead.stop !== null) {
+      return { stop: eventsRead.stop };
+    }
+    const snapshot = eventsRead.snapshot;
+    // 3. First-tick `job` guard: only `job` events count, and the earliest
+    // in-day one must fall within the first-tick grace window.
+    const firstTick = this.precheckFirstTick(context, snapshot);
+    if (firstTick.stop !== null) {
+      return { stop: firstTick.stop };
+    }
+    // 4. S12 evaluation over the windowed events: the evaluation is computed
+    // once here and the two S12 stop guards (`precheckTickHealth` and
+    // `precheckCoverage`) both see that single evaluation.
+    const windowed = snapshot.events.filter((event) => this.inTickWindow(event.recordedAtIso, context.day));
+    const evaluation = evaluateShadowTickHealth({ day: context.day, events: windowed });
+    const tickHealth: CriterionOutcome = { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
+    const tickHealthStop = this.precheckTickHealth(evaluation);
+    if (tickHealthStop.stop !== null) {
+      return { stop: tickHealthStop.stop, tickHealth };
+    }
+    const coverageStop = this.precheckCoverage(evaluation);
+    if (coverageStop.stop !== null) {
+      return { stop: coverageStop.stop, tickHealth };
+    }
+    return { stop: null, tickHealth };
+  }
+
+  /**
+   * OD7a3 fix round: the events-read precheck — read the daemon events once,
+   * snapshot the result exactly once through own data descriptors, and stop
+   * on a failed/unavailable read, a malformed snapshot, or a dropped line
+   * bracketed inside the day's parsed records. Returns the OK snapshot on
+   * continuation.
+   */
+  private async precheckEventsRead(
+    context: DayContext,
+  ): Promise<
+    | { readonly stop: RecordShadowDayResult; readonly snapshot?: undefined }
+    | { readonly stop: null; readonly snapshot: EventsReadOk }
+  > {
     const read = await this.call(context.deadlineIso, () => this.deps.daemonEvents.readAfterCursor(null));
     if (read.kind === 'threw') {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
@@ -1451,12 +1500,23 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (corruptLineBracketedInDay(snapshot, context.day)) {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-corrupt' } };
     }
-    // OD7a3 fix round 6: the events in the snapshot are ALREADY frozen
-    // per-event snapshots (`snapshotEvent` ran once each inside
-    // `snapshotEventsRead`, and an event that failed to snapshot made the
-    // whole read malformed), so this loop and every later one use the
-    // snapshot array only and may dereference `kind`/`recordedAtIso`
-    // directly — never the raw read, which a Proxy could make disagree.
+    return { stop: null, snapshot };
+  }
+
+  /**
+   * OD7a3 fix round: the first-tick precheck — the earliest in-day `job`
+   * event in the (already-snapshotted) read must exist and fall within the
+   * first-tick grace window of the day start. The events are ALREADY frozen
+   * per-event snapshots (`snapshotEvent` ran once each inside
+   * `snapshotEventsRead`, and an event that failed to snapshot made the
+   * whole read malformed), so this loop and every later one use the
+   * snapshot array only and may dereference `kind`/`recordedAtIso`
+   * directly — never the raw read, which a Proxy could make disagree.
+   */
+  private precheckFirstTick(
+    context: DayContext,
+    snapshot: EventsReadOk,
+  ): { readonly stop: RecordShadowDayResult | null } {
     const dayStartMs = serialOfUtcDay(context.day) * DAY_MS;
     let earliestInDayMs: number | null = null;
     for (const event of snapshot.events) {
@@ -1478,19 +1538,43 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (earliestInDayMs === null || earliestInDayMs > dayStartMs + SHADOW_FIRST_TICK_GRACE_MS) {
       return { stop: skippedResult('partial-day') };
     }
-    // 3. S12 precheck over the windowed events: an unknown evaluation and a
-    // `too-few-ticks` / `late-last-tick` / `coverage-gap` failure each stop
-    // the run before anything is written (OD7a3 adds the coverage guards).
-    const windowed = snapshot.events.filter((event) => this.inTickWindow(event.recordedAtIso, context.day));
-    const evaluation = evaluateShadowTickHealth({ day: context.day, events: windowed });
-    const tickHealth: CriterionOutcome = { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
+    return { stop: null };
+  }
+
+  /**
+   * OD7a3 fix round: the S12 tick-health precheck — an unknown evaluation
+   * (the events could not be trusted) and a `too-few-ticks` failure each
+   * stop the run before anything is written. The remaining S12 failure
+   * reasons (`late-last-tick`, `coverage-gap`) are the coverage guards in
+   * `precheckCoverage`.
+   */
+  private precheckTickHealth(evaluation: ShadowTickHealthEvaluation): {
+    readonly stop: RecordShadowDayResult | null;
+  } {
     if (evaluation.status === 'unknown') {
-      return { stop: { outcome: 'unknown', reason: 's12-unknown' }, tickHealth };
+      return { stop: { outcome: 'unknown', reason: 's12-unknown' } };
     }
-    if (evaluation.status === 'fail' && (evaluation.reason === 'too-few-ticks' || evaluation.reason === 'late-last-tick' || evaluation.reason === 'coverage-gap')) {
-      return { stop: skippedResult(evaluation.reason), tickHealth };
+    if (evaluation.status === 'fail' && evaluation.reason === 'too-few-ticks') {
+      return { stop: skippedResult(evaluation.reason) };
     }
-    return { stop: null, tickHealth };
+    return { stop: null };
+  }
+
+  /**
+   * OD7a3 fix round: the S12 coverage precheck — a `late-last-tick` or
+   * `coverage-gap` failure (OD7a3's coverage guards) stops the run as
+   * `skipped` before anything is written.
+   */
+  private precheckCoverage(evaluation: ShadowTickHealthEvaluation): {
+    readonly stop: RecordShadowDayResult | null;
+  } {
+    if (
+      evaluation.status === 'fail' &&
+      (evaluation.reason === 'late-last-tick' || evaluation.reason === 'coverage-gap')
+    ) {
+      return { stop: skippedResult(evaluation.reason) };
+    }
+    return { stop: null };
   }
 
   /** True once `deadlineIso` is reached; an unusable clock counts as reached (fail closed). */

@@ -242,6 +242,251 @@ export function releaseRootsAgree(a: ReleaseRootRead, b: ReleaseRootRead): boole
   return a.state === 'absent' ? b.state === 'absent' : b.state === 'valid' && a.value === b.value;
 }
 
+/**
+ * The exact scope of a standing shadow import grant (owner decision
+ * 2026-11-18): the unattended shadow-intake timer authorizes
+ * `fleet-v2 merge import --apply` with it. It is a standing owner grant:
+ * bounded by the exact repository and a capped expiry, bound to its request
+ * by a digest of its own coordinates, revocable and never consumable.
+ */
+export const SHADOW_IMPORT_ACTION_SCOPE = 'merge:import-shadow' as const;
+
+/** The longest time a shadow import grant may live from its creation instant. */
+export const SHADOW_IMPORT_GRANT_MAX_TTL_DAYS = 30 as const;
+
+/** The prefix of the request id a shadow import grant is bound to (a digest of its coordinates). */
+export const SHADOW_IMPORT_DIGEST_PREFIX = 'shadow-import-' as const;
+
+/**
+ * Bounded-input caps for shadow import grant parsing. Every parser is linear
+ * in these caps and never traverses more than they allow: at most
+ * `MAX_SHADOW_IMPORT_KEYS` own keys per object, at most
+ * `MAX_REPOSITORY_SEGMENT_LENGTH` characters per repository segment and at
+ * most `MAX_EXPIRES_AT_ISO_LENGTH` characters of expiry text.
+ */
+export const MAX_SHADOW_IMPORT_KEYS = 2 as const;
+export const MAX_REPOSITORY_SEGMENT_LENGTH = 100 as const;
+export const MAX_EXPIRES_AT_ISO_LENGTH = 64 as const;
+
+/** Every typed way a shadow import grant read can fail closed. */
+export type ShadowImportGrantErrorCode =
+  | 'shadow-import-grant-not-object'
+  | 'shadow-import-grant-unexpected-key'
+  | 'shadow-import-grant-accessor-forbidden'
+  | 'shadow-import-grant-forbidden-key'
+  | 'shadow-import-grant-invalid-repository'
+  | 'shadow-import-grant-invalid-expiry';
+
+/** The outcome of one shadow import grant read: the normalized grant, or a named refusal code. */
+export type ShadowImportGrantCheck =
+  | { readonly ok: true; readonly value: ShadowImportGrantRecord }
+  | { readonly ok: false; readonly code: ShadowImportGrantErrorCode };
+
+/**
+ * The standing coordinates of a shadow import grant: the exact repository it
+ * serves and the instant it stops being valid. Never a credential or secret.
+ */
+export interface ShadowImportGrantRecord {
+  readonly repository: MergeGrantRepositoryRef;
+  readonly expiresAtIso: string;
+}
+
+/** True only for the exact shadow import scope; any other scope is not a shadow import. */
+export function isShadowImportActionScope(actionScope: string): boolean {
+  return actionScope === SHADOW_IMPORT_ACTION_SCOPE;
+}
+
+const SHADOW_IMPORT_FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'] as const;
+const SHADOW_IMPORT_REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
+const SHADOW_IMPORT_EXPIRES_AT_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * True only for a plain object (no array, no function, prototype
+ * `Object.prototype` or null). Prototype and type checks never read the
+ * object's own properties, so no accessor or trap can run here.
+ */
+function isPlainShadowImportObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  let proto: unknown;
+  try {
+    proto = Object.getPrototypeOf(value);
+  } catch {
+    return false;
+  }
+  return proto === Object.prototype || proto === null;
+}
+
+type ShadowImportSnapshot =
+  | { readonly ok: true; readonly keys: string[]; readonly values: Record<string, unknown> }
+  | { readonly ok: false; readonly code: ShadowImportGrantErrorCode };
+
+/**
+ * Snapshot a plain object's own enumerable data properties through their
+ * descriptors only. Cost is linear in `MAX_SHADOW_IMPORT_KEYS` plus the
+ * bounded values copied; accessors are never invoked, symbol keys and
+ * non-enumerable data keys are refused, and a prototype-polluting key
+ * (`__proto__`, `constructor`, `prototype`) is refused before any key-set
+ * comparison so a polluting key can never masquerade as a field.
+ */
+function readShadowImportSnapshot(raw: object): ShadowImportSnapshot {
+  let ownKeys: PropertyKey[];
+  try {
+    ownKeys = Reflect.ownKeys(raw);
+  } catch {
+    return { ok: false, code: 'shadow-import-grant-not-object' };
+  }
+  const keys: string[] = [];
+  const values: Record<string, unknown> = {};
+  let forbiddenCode: ShadowImportGrantErrorCode | undefined;
+  // A bounded prefix of `MAX_SHADOW_IMPORT_KEYS + 1` keys is inspected, so the
+  // cost never grows past the cap; a prototype-polluting key seen inside that
+  // prefix is reported before any key-set comparison can mask it.
+  for (let index = 0; index < ownKeys.length; index += 1) {
+    if (index > MAX_SHADOW_IMPORT_KEYS) {
+      return { ok: false, code: forbiddenCode ?? 'shadow-import-grant-unexpected-key' };
+    }
+    const key = ownKeys[index];
+    if (typeof key !== 'string' || key.length === 0) {
+      return { ok: false, code: 'shadow-import-grant-unexpected-key' };
+    }
+    if ((SHADOW_IMPORT_FORBIDDEN_KEYS as readonly string[]).includes(key)) {
+      forbiddenCode = 'shadow-import-grant-forbidden-key';
+      continue;
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(raw, key);
+    } catch {
+      return { ok: false, code: 'shadow-import-grant-accessor-forbidden' };
+    }
+    if (descriptor === undefined) {
+      return { ok: false, code: 'shadow-import-grant-unexpected-key' };
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      return { ok: false, code: 'shadow-import-grant-accessor-forbidden' };
+    }
+    if (descriptor.enumerable !== true) {
+      return { ok: false, code: 'shadow-import-grant-unexpected-key' };
+    }
+    keys.push(key);
+    values[key] = descriptor.value;
+  }
+  if (forbiddenCode !== undefined) {
+    return { ok: false, code: forbiddenCode };
+  }
+  return { ok: true, keys, values };
+}
+
+/**
+ * Read a shadow import grant from hostile runtime data and never throw. Only
+ * own data-property descriptors are read (an accessor's getter never runs, a
+ * Proxy with a `get` trap is never invoked by it), arrays are refused before
+ * any indexing (so a sparse array of length 2**32 - 1 is refused in O(1)),
+ * the key sets are exact, and the fields are bounded: a repository segment at
+ * most `MAX_REPOSITORY_SEGMENT_LENGTH` characters and expiry text at most
+ * `MAX_EXPIRES_AT_ISO_LENGTH` characters, ISO-8601 with an explicit `Z` or
+ * `±HH:MM` offset and a finite parsed instant. Cost is linear in
+ * `MAX_SHADOW_IMPORT_KEYS * 2 + MAX_REPOSITORY_SEGMENT_LENGTH * 2 +
+ * MAX_EXPIRES_AT_ISO_LENGTH`; nothing else is read.
+ */
+export function parseShadowImportGrant(raw: unknown): ShadowImportGrantCheck {
+  if (!isPlainShadowImportObject(raw)) {
+    return { ok: false, code: 'shadow-import-grant-not-object' };
+  }
+  const outer = readShadowImportSnapshot(raw);
+  if (!outer.ok) {
+    return outer;
+  }
+  const expectedKeys = ['repository', 'expiresAtIso'];
+  if (outer.keys.length !== expectedKeys.length || !expectedKeys.every((key) => outer.keys.includes(key))) {
+    return { ok: false, code: 'shadow-import-grant-unexpected-key' };
+  }
+  const repositoryRaw = outer.values.repository;
+  if (!isPlainShadowImportObject(repositoryRaw)) {
+    return { ok: false, code: 'shadow-import-grant-invalid-repository' };
+  }
+  const repository = readShadowImportSnapshot(repositoryRaw);
+  if (!repository.ok) {
+    return repository;
+  }
+  const repositoryKeys = ['owner', 'repo'];
+  if (
+    repository.keys.length !== repositoryKeys.length ||
+    !repositoryKeys.every((key) => repository.keys.includes(key))
+  ) {
+    return { ok: false, code: 'shadow-import-grant-invalid-repository' };
+  }
+  const owner = repository.values.owner;
+  const repo = repository.values.repo;
+  if (
+    typeof owner !== 'string' ||
+    !SHADOW_IMPORT_REPOSITORY_PATTERN.test(owner) ||
+    owner === '.' ||
+    owner === '..'
+  ) {
+    return { ok: false, code: 'shadow-import-grant-invalid-repository' };
+  }
+  if (
+    typeof repo !== 'string' ||
+    !SHADOW_IMPORT_REPOSITORY_PATTERN.test(repo) ||
+    repo === '.' ||
+    repo === '..'
+  ) {
+    return { ok: false, code: 'shadow-import-grant-invalid-repository' };
+  }
+  const expiresAtIso = outer.values.expiresAtIso;
+  if (
+    typeof expiresAtIso !== 'string' ||
+    expiresAtIso.length === 0 ||
+    expiresAtIso.length > MAX_EXPIRES_AT_ISO_LENGTH ||
+    !SHADOW_IMPORT_EXPIRES_AT_PATTERN.test(expiresAtIso) ||
+    !Number.isFinite(Date.parse(expiresAtIso))
+  ) {
+    return { ok: false, code: 'shadow-import-grant-invalid-expiry' };
+  }
+  return {
+    ok: true,
+    value: Object.freeze({
+      repository: Object.freeze({ owner, repo }),
+      expiresAtIso,
+    }),
+  };
+}
+
+/** The same bounded, non-throwing grant check under its validation name. */
+export function validateShadowImportGrantCheck(raw: unknown): ShadowImportGrantCheck {
+  return parseShadowImportGrant(raw);
+}
+
+/**
+ * The canonical digest payload a shadow import grant is bound by: the exact
+ * scope, repository and expiry. The request id carries its digest (computed
+ * by the injected dependency, never by this module), so a grant's coordinates
+ * are covered even though the signed decision itself does not name them.
+ * Delegates to `parseShadowImportGrant`, so the cost bound and the
+ * never-throw, never-run-accessors guarantees are the same.
+ */
+export function shadowImportDigestPayload(
+  raw: unknown,
+): { readonly ok: true; readonly value: string } | { readonly ok: false; readonly code: ShadowImportGrantErrorCode } {
+  const parsed = parseShadowImportGrant(raw);
+  if (!parsed.ok) {
+    return parsed;
+  }
+  return {
+    ok: true,
+    value: JSON.stringify({
+      scope: SHADOW_IMPORT_ACTION_SCOPE,
+      owner: parsed.value.repository.owner,
+      repo: parsed.value.repository.repo,
+      expiresAtIso: parsed.value.expiresAtIso,
+    }),
+  };
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;
@@ -279,6 +524,12 @@ export interface CoordinationRequestRecord {
    * refused, so a grant for one root never authorizes another.
    */
   readonly releaseRoot?: string;
+  /**
+   * The standing shadow import grant's coordinates (owner decision
+   * 2026-11-18); only a `merge:import-shadow` request carries one, and it is
+   * required there. Bound to the request id by a digest of its coordinates.
+   */
+  readonly shadowImportGrant?: ShadowImportGrantRecord;
 }
 
 /** Bounded attention and staleness summary; reading it rewrites nothing. */

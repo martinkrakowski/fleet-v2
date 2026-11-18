@@ -255,3 +255,62 @@ describe('RecordAuthorizationConsumptionUseCase attempt binding (CO24d)', () => 
     expect(result.outcome).toBe('consumed');
   });
 });
+
+describe('RecordAuthorizationConsumptionUseCase standing shadow import grant (GR1a1)', () => {
+  it('refuses shadow import scope without mutating the standing grant', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await repo.saveRequest(
+      makeApprovedGrantRecord({
+        grantId: 'grant-shadow',
+        actionScope: 'merge:import-shadow',
+        expectedHeadSha: null,
+        shadowImportGrant: {
+          repository: { owner: 'octo', repo: 'hello' },
+          expiresAtIso: '2026-12-16T00:00:00Z',
+        },
+      }),
+    );
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+
+    const result = await useCase.recordAuthorizationConsumption({
+      consumptionId: 'c-1',
+      grantId: 'grant-shadow',
+      actionId: 'action-import',
+      actionScope: 'merge:import-shadow',
+      attemptId: 'att-1',
+      expectedHeadSha: 'head-H',
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'shadow-import-grant-not-consumable' });
+    const stored = await repo.findRequestByGrantId('grant-shadow');
+    expect(stored?.state).toBe('approved');
+    expect(stored?.consumptions).toHaveLength(0);
+    expect(stored?.revision).toBe(1);
+  });
+
+  it('refuses a consumption naming the shadow scope even when the recorded scope differs', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await repo.saveRequest(
+      makeApprovedGrantRecord({
+        grantId: 'grant-push',
+        actionScope: 'forge:push-and-open-pr',
+        expectedHeadSha: 'head-H',
+      }),
+    );
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+
+    const result = await useCase.recordAuthorizationConsumption({
+      consumptionId: 'c-1',
+      grantId: 'grant-push',
+      actionId: 'action-import',
+      actionScope: 'merge:import-shadow',
+      attemptId: 'att-1',
+      expectedHeadSha: 'head-H',
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'shadow-import-grant-not-consumable' });
+    const stored = await repo.findRequestByGrantId('grant-push');
+    expect(stored?.state).toBe('approved');
+    expect(stored?.consumptions).toHaveLength(0);
+  });
+});

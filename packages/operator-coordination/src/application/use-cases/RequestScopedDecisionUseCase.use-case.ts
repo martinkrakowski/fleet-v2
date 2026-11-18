@@ -14,11 +14,21 @@
  */
 
 import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
-import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
+import type { CoordinationRequestRecord, ShadowImportGrantRecord } from '../../domain/coordination-records.js';
+import {
+  SHADOW_IMPORT_ACTION_SCOPE,
+  SHADOW_IMPORT_DIGEST_PREFIX,
+  SHADOW_IMPORT_GRANT_MAX_TTL_DAYS,
+  isShadowImportActionScope,
+  parseShadowImportGrant,
+  shadowImportDigestPayload,
+} from '../../domain/coordination-records.js';
 import { CoordinationRequest, CONTROL_CHARACTER } from '../../domain/entities/CoordinationRequest.js';
 import { CoordinationKind } from '../../domain/value-objects/CoordinationKind.vo.js';
 import { readReleaseRoot } from '../../domain/coordination-records.js';
 import type {
+  RevokeOwnerGrantRequest,
+  RevokeOwnerGrantResult,
   RequestScopedDecisionPort,
   RequestScopedDecisionRequest,
   RequestScopedDecisionResult,
@@ -30,6 +40,12 @@ import type { DecisionAnswer, DecisionTransportPort } from '../ports/out/Decisio
 export interface RequestScopedDecisionDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
   readonly decisionTransport?: DecisionTransportPort;
+  /**
+   * The SHA-256 digest the shadow import request id is bound by. Injected, so
+   * the application layer stays free of `node:crypto`; a shadow import
+   * request without it is a typed rejection, never a silent skip.
+   */
+  readonly computeDigest?: (payload: string) => string;
 }
 
 function isFilled(value: unknown): value is string {
@@ -130,6 +146,46 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         reason: 'a forge action decision requires an attemptId',
       };
     }
+    // The composition root supplies the clock; no authority depends on it here.
+    const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
+    // Standing shadow import grant (owner decision 2026-11-18): the unattended
+    // timer's grant is head-free, bounded by a future expiry within the TTL
+    // cap, and bound to its request id by a digest of its exact coordinates
+    // ({ scope, owner, repo, expiresAtIso }). Every failure here is a typed
+    // rejection before anything is recorded.
+    let shadowImportGrant: ShadowImportGrantRecord | undefined;
+    if (isShadowImportActionScope(request.actionScope.trim())) {
+      if (request.expectedHeadSha !== null) {
+        return {
+          outcome: 'rejected',
+          reason: 'shadow-import-expected-head-not-null',
+        };
+      }
+      const parsedGrant = parseShadowImportGrant(request.shadowImportGrant);
+      if (!parsedGrant.ok) {
+        return { outcome: 'rejected', reason: parsedGrant.code };
+      }
+      const expiresMs = Date.parse(parsedGrant.value.expiresAtIso);
+      const nowMs = Date.parse(nowIso);
+      if (!Number.isFinite(nowMs) || !Number.isFinite(expiresMs) || expiresMs <= nowMs) {
+        return { outcome: 'rejected', reason: 'shadow-import-grant-expired' };
+      }
+      if (expiresMs - nowMs > SHADOW_IMPORT_GRANT_MAX_TTL_DAYS * 86_400_000) {
+        return { outcome: 'rejected', reason: 'shadow-import-grant-ttl-exceeded' };
+      }
+      if (this.deps.computeDigest === undefined) {
+        return { outcome: 'rejected', reason: 'shadow-import-digest-unavailable' };
+      }
+      const payloadResult = shadowImportDigestPayload(parsedGrant.value);
+      if (!payloadResult.ok) {
+        return { outcome: 'rejected', reason: payloadResult.code };
+      }
+      const expectedRequestId = `${SHADOW_IMPORT_DIGEST_PREFIX}${this.deps.computeDigest(payloadResult.value)}`;
+      if (request.requestId.trim() !== expectedRequestId) {
+        return { outcome: 'rejected', reason: 'shadow-import-request-digest-mismatch' };
+      }
+      shadowImportGrant = parsedGrant.value;
+    }
     const existing = await this.deps.requestRepo.findRequestById(request.requestId.trim());
     if (existing !== null) {
       return {
@@ -137,8 +193,9 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         reason: `a coordination request with id ${request.requestId.trim()} is already recorded`,
       };
     }
-    // The composition root supplies the clock; no authority depends on it here.
-    const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();
+    // The proposal is durable before any decider is asked. A duplicate that
+    // raced past the lookup above is refused by the store's revision check and
+    // surfaces as a typed rejection, not as an adapter error.
     const proposal: CoordinationRequestRecord = CoordinationRequest.fromRecord({
       id: request.requestId.trim(),
       projectId: request.projectId.trim(),
@@ -161,6 +218,7 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         ? { grantRecordVersion: GRANT_RECORD_VERSION, grantAttemptId: request.attemptId.trim() }
         : {}),
       ...(releaseRoot.state === 'valid' ? { releaseRoot: releaseRoot.value } : {}),
+      ...(shadowImportGrant !== undefined ? { shadowImportGrant } : {}),
     }).toRecord();
     // The proposal is durable before any decider is asked. A duplicate that
     // raced past the lookup above is refused by the store's revision check and
@@ -237,5 +295,54 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       return undefined;
     }
     return answer;
+  }
+
+  /**
+   * Revoke one standing `merge:import-shadow` owner grant by its id. The
+   * grant id is a non-secret handle and is the only value echoed back;
+   * refusals never print secret-shaped values. Only the standing shadow
+   * import grant is revocable here: a missing grant, a grant of another
+   * scope, one already revoked, or one in another terminal state is a typed
+   * refusal, and a revision race is reported as `revision-conflict`.
+   */
+  async revokeOwnerGrant(request: RevokeOwnerGrantRequest): Promise<RevokeOwnerGrantResult> {
+    if (!this.deps) {
+      throw new Error('Not implemented: RequestScopedDecisionUseCase');
+    }
+    const grantId = typeof request?.grantId === 'string' ? request.grantId.trim() : '';
+    if (grantId.length === 0) {
+      return { outcome: 'refused', reason: 'grant-missing' };
+    }
+    const recorded = await this.deps.requestRepo.findRequestByGrantId(grantId);
+    if (recorded === null) {
+      return { outcome: 'refused', reason: 'grant-missing' };
+    }
+    if (recorded.actionScope !== SHADOW_IMPORT_ACTION_SCOPE) {
+      return { outcome: 'refused', reason: 'grant-wrong-scope' };
+    }
+    if (recorded.state === 'cancelled') {
+      return { outcome: 'refused', reason: 'grant-already-revoked' };
+    }
+    if (recorded.state === 'declined' || recorded.state === 'expired' || recorded.state === 'completed') {
+      return { outcome: 'refused', reason: 'grant-not-revocable' };
+    }
+    const nowIso =
+      typeof request.nowIso === 'string' && request.nowIso.trim().length > 0
+        ? request.nowIso
+        : new Date().toISOString();
+    try {
+      await this.deps.requestRepo.saveRequest({
+        ...recorded,
+        state: 'cancelled',
+        revision: recorded.revision + 1,
+        updatedAtIso: nowIso,
+      });
+      return { outcome: 'revoked', grantId };
+    } catch (error: unknown) {
+      if (error instanceof CoordinationRequestRevisionConflictError) {
+        return { outcome: 'refused', reason: 'revision-conflict' };
+      }
+      throw error;
+    }
   }
 }

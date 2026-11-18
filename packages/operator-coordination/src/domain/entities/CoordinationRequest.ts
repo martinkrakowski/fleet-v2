@@ -18,6 +18,12 @@ import type {
   MergeGrantRecord,
   PolicyGrantRecord,
   RelayAcknowledgementRecord,
+  ShadowImportGrantRecord,
+} from '../coordination-records.js';
+import {
+  SHADOW_IMPORT_ACTION_SCOPE,
+  isShadowImportActionScope,
+  parseShadowImportGrant,
 } from '../coordination-records.js';
 import {
   POLICY_GRANT_HEAD_PATTERN,
@@ -36,12 +42,13 @@ const DELIVERY_STATUSES: readonly string[] = ['delivered', 'pending', 'delivery-
 /** The record with writable optional policyGrant/mergeGrant so normalization can omit the keys. */
 type MutableCoordinationRequestRecord = Omit<
   CoordinationRequestRecord,
-  'policyGrant' | 'mergeGrant' | 'grantRecordVersion' | 'grantAttemptId'
+  'policyGrant' | 'mergeGrant' | 'grantRecordVersion' | 'grantAttemptId' | 'shadowImportGrant'
 > & {
   policyGrant?: PolicyGrantRecord;
   mergeGrant?: MergeGrantRecord;
   grantRecordVersion?: typeof GRANT_RECORD_VERSION;
   grantAttemptId?: string;
+  shadowImportGrant?: ShadowImportGrantRecord;
 };
 
 const MAX_GRANT_ATTEMPT_ID_LENGTH = 256;
@@ -66,14 +73,19 @@ function readOwnDataValue(record: object, key: string): unknown {
 
 function readGrantProperty(
   record: CoordinationRequestRecord,
-  propertyName: 'policyGrant' | 'mergeGrant',
+  propertyName: 'policyGrant' | 'mergeGrant' | 'shadowImportGrant',
   expectedShape: string,
 ): object | undefined {
   let descriptor: PropertyDescriptor | undefined;
   try {
     descriptor = Object.getOwnPropertyDescriptor(record, propertyName);
   } catch {
-    const trapPrefix = propertyName === 'policyGrant' ? 'PolicyGrant' : 'MergeGrant';
+    const trapPrefix =
+      propertyName === 'policyGrant'
+        ? 'PolicyGrant'
+        : propertyName === 'mergeGrant'
+          ? 'MergeGrant'
+          : 'ShadowImportGrant';
     throw new Error(`${trapPrefix} validation failed due to a prohibited Proxy trap execution.`);
   }
   if (descriptor === undefined) {
@@ -131,6 +143,26 @@ export class CoordinationRequest {
     }
     const policyGrant = CoordinationRequest.readPolicyGrant(record);
     const mergeGrant = CoordinationRequest.readMergeGrant(record);
+    const shadowImportGrant = CoordinationRequest.readShadowImportGrant(record);
+    // A standing shadow import grant (owner decision 2026-11-18) is head-free
+    // by design: the timer names no commit. It is required on the exact shadow
+    // import scope and forbidden everywhere else, so it can never ride a
+    // different grant's request.
+    if (isShadowImportActionScope(record.actionScope)) {
+      if (shadowImportGrant === undefined) {
+        throw new Error('CoordinationRequest merge:import-shadow requires a shadowImportGrant');
+      }
+      if (record.kind !== 'action-decision') {
+        throw new Error('CoordinationRequest merge:import-shadow grant must be an action-decision');
+      }
+      if (record.expectedHeadSha !== null) {
+        throw new Error('CoordinationRequest merge:import-shadow grant must be head-free');
+      }
+    } else if (shadowImportGrant !== undefined) {
+      throw new Error(
+        `CoordinationRequest shadowImportGrant is only recorded for a ${SHADOW_IMPORT_ACTION_SCOPE} request`,
+      );
+    }
     const binding = CoordinationRequest.readGrantBinding(record, policyGrant);
     if (!DELIVERY_STATUSES.includes(record.deliveryStatus)) {
       throw new Error(`CoordinationRequest has an invalid delivery status: ${String(record.deliveryStatus)}`);
@@ -161,6 +193,11 @@ export class CoordinationRequest {
       delete normalized.mergeGrant;
     } else {
       normalized.mergeGrant = mergeGrant;
+    }
+    if (shadowImportGrant === undefined) {
+      delete normalized.shadowImportGrant;
+    } else {
+      normalized.shadowImportGrant = shadowImportGrant;
     }
     delete normalized.grantRecordVersion;
     delete normalized.grantAttemptId;
@@ -425,6 +462,26 @@ export class CoordinationRequest {
     return { keys, values };
   }
 
+  /**
+   * The standing shadow import grant's coordinates, read through the same
+   * descriptor-safe path as the other grant properties and normalized by the
+   * domain parser. A malformed grant makes the whole record unreadable: it is
+   * never read as "no grant".
+   */
+  private static readShadowImportGrant(
+    record: CoordinationRequestRecord,
+  ): ShadowImportGrantRecord | undefined {
+    const raw = readGrantProperty(record, 'shadowImportGrant', '{ repository, expiresAtIso }');
+    if (raw === undefined) {
+      return undefined;
+    }
+    const parsed = parseShadowImportGrant(raw);
+    if (!parsed.ok) {
+      throw new Error(`CoordinationRequest shadowImportGrant is invalid: ${parsed.code}`);
+    }
+    return parsed.value;
+  }
+
   getId(): string {
     return this.record.id;
   }
@@ -444,6 +501,12 @@ export class CoordinationRequest {
       record.mergeGrant = {
         ...this.record.mergeGrant,
         repository: { ...this.record.mergeGrant.repository },
+      };
+    }
+    if (this.record.shadowImportGrant !== undefined) {
+      record.shadowImportGrant = {
+        repository: { ...this.record.shadowImportGrant.repository },
+        expiresAtIso: this.record.shadowImportGrant.expiresAtIso,
       };
     }
     return record;
@@ -500,8 +563,36 @@ export class CoordinationRequest {
         };
   }
 
+  /** The standing shadow import grant's coordinates, deep-copied; null elsewhere. */
+  getShadowImportGrant(): ShadowImportGrantRecord | null {
+    return this.record.shadowImportGrant === undefined
+      ? null
+      : {
+          repository: { ...this.record.shadowImportGrant.repository },
+          expiresAtIso: this.record.shadowImportGrant.expiresAtIso,
+        };
+  }
+
   isPolicyGrant(): boolean {
     return isPolicyGrantRecord(this.record);
+  }
+
+  /**
+   * A standing shadow import grant authorizes its exact scope without naming
+   * a commit (head-free): it is bound by its digest-bound request id, its
+   * exact repository and its capped expiry instead. True only for an approved
+   * request with a recorded grant and decision revision, the exact shadow
+   * import scope, no expected head and recorded grant coordinates.
+   */
+  canAuthorizeShadowImport(actionScope: string): boolean {
+    return (
+      this.isApproved() &&
+      this.record.grantId !== null &&
+      this.record.decisionRevision !== null &&
+      actionScope === SHADOW_IMPORT_ACTION_SCOPE &&
+      this.record.expectedHeadSha === null &&
+      this.record.shadowImportGrant !== undefined
+    );
   }
 
   isApproved(): boolean {

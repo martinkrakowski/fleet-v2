@@ -19,7 +19,12 @@ import type {
 } from '../../domain/coordination-records.js';
 import { AuthorizationConsumption } from '../../domain/entities/AuthorizationConsumption.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
-import { isReleaseActionScope, readReleaseRoot, releaseRootsAgree } from '../../domain/coordination-records.js';
+import {
+  SHADOW_IMPORT_ACTION_SCOPE,
+  isReleaseActionScope,
+  readReleaseRoot,
+  releaseRootsAgree,
+} from '../../domain/coordination-records.js';
 import type {
   RecordAuthorizationConsumptionPort,
   RecordAuthorizationConsumptionRequest,
@@ -89,6 +94,15 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     if (recorded === null) {
       return refused(`no recorded request holds grant ${grantId}`);
     }
+    // A standing shadow import grant (owner decision 2026-11-18) is never
+    // consumable: it authorizes the timer's recurring import until it is
+    // revoked or expires. Consuming it would set `state: 'completed'` and
+    // close the standing grant, so the guard fires before any state write,
+    // whichever side names the shadow scope.
+    const suppliedScope = request.actionScope.trim();
+    if (suppliedScope === SHADOW_IMPORT_ACTION_SCOPE || recorded.actionScope === SHADOW_IMPORT_ACTION_SCOPE) {
+      return refused('shadow-import-grant-not-consumable');
+    }
     const existing = recorded.consumptions[0];
     if (existing !== undefined) {
       // One grant, one action: a second, unrelated action is never recorded,
@@ -107,7 +121,6 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     } else if (recorded.state !== 'approved') {
       return refused(`grant ${grantId} is ${recorded.state}, which authorizes no action`);
     }
-    const suppliedScope = request.actionScope.trim();
     if (recorded.actionScope !== suppliedScope) {
       return refused(
         `grant ${grantId} was recorded for scope ${recorded.actionScope}, not ${suppliedScope}`,

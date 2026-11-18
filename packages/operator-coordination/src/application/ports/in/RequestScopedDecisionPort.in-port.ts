@@ -7,6 +7,7 @@
 
 import type { CoordinationRequestRecord } from '../../../domain/coordination-records.js';
 import type { CoordinationKindValue } from '../../../domain/value-objects/CoordinationKind.vo.js';
+import type { ShadowImportGrantRecord } from '../../../domain/coordination-records.js';
 
 export interface RequestScopedDecisionRequest {
   readonly requestId: string;
@@ -24,6 +25,12 @@ export interface RequestScopedDecisionRequest {
    * consumption naming another root is refused.
    */
   readonly releaseRoot?: string;
+  /**
+   * The standing shadow import grant's coordinates (owner decision
+   * 2026-11-18); only a `merge:import-shadow` request carries one, and it is
+   * required there. Bound to the request id by a digest of its coordinates.
+   */
+  readonly shadowImportGrant?: ShadowImportGrantRecord;
   readonly nowIso?: string;
 }
 
@@ -37,6 +44,36 @@ export type RequestScopedDecisionResult =
       readonly reason: string;
     };
 
+/** Every typed way revoking a standing owner grant can be refused. */
+export type RevokeOwnerGrantRefusal =
+  | 'grant-missing'
+  | 'grant-wrong-scope'
+  | 'grant-already-revoked'
+  | 'grant-not-revocable'
+  | 'revision-conflict';
+
+export interface RevokeOwnerGrantRequest {
+  /** The non-secret grant handle the owner wants to revoke. */
+  readonly grantId: string;
+  readonly nowIso?: string;
+}
+
+export type RevokeOwnerGrantResult =
+  | {
+      readonly outcome: 'revoked';
+      readonly grantId: string;
+    }
+  | {
+      readonly outcome: 'refused';
+      readonly reason: RevokeOwnerGrantRefusal;
+    };
+
 export interface RequestScopedDecisionPort {
   requestScopedDecision(request: RequestScopedDecisionRequest): Promise<RequestScopedDecisionResult>;
+  /**
+   * Revoke one standing owner grant by its id. Scoped strictly to the
+   * standing `merge:import-shadow` grant: every other recorded grant is
+   * refused, and a refusal never prints secret-shaped values.
+   */
+  revokeOwnerGrant?(request: RevokeOwnerGrantRequest): Promise<RevokeOwnerGrantResult>;
 }

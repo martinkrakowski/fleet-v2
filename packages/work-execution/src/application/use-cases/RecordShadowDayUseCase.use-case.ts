@@ -22,7 +22,8 @@ import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { type DaemonEventRecord } from '../../domain/daemon-events.js';
 import { CUTOVER_SHADOW_CRITERIA, type CutoverShadowCriterion } from '../../domain/cutover-records.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
-import { isMergeQueueEntryLive } from '../../domain/merge-queue-records.js';
+import { isMergeQueueEntryLive, type MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
+import { head12Of, parseLaneRunKey } from '../../domain/lane-run-keys.js';
 import { evaluateShadowMergeSet, type ShadowDayMergeSetEvaluation } from '../../domain/shadow-day-merge-set.js';
 import {
   evaluateShadowGateAgreement,
@@ -106,6 +107,27 @@ const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
  * comfortably above SH5c's `SHADOW_INTAKE_MIN_GAP_MS` floor of 2 minutes.
  */
 const DEFAULT_SAMPLE_GAP_MS = 150_000;
+
+/**
+ * SH24b: the `would-*` actions whose journaled `dry-run` result — with
+ * `reasonCode` equal to the action itself — makes the keyed queue entry stop
+ * being shadow-effectively live for S1/S8. Under `policy.shadow === true`
+ * (Owner Decision A+, 2026-11-18) these are the only shadow mutations: a
+ * journaled `would-drop`, `would-supersede` or `would-already-merged` means
+ * the entry left the shadow-effective live set even though it stays
+ * unmutated in `merge-queue.json`. `would-park` is deliberately absent (an
+ * ordinary park stays live, exactly as on main), and a `dry-run` result with
+ * `reasonCode: 'shadow-intent-closed'` on one of these keys is a closed
+ * interrupted intent, never an executed one, so it never excludes.
+ */
+const SHADOW_TERMINAL_WOULD_ACTIONS: readonly string[] = ['would-drop', 'would-supersede', 'would-already-merged'];
+
+/**
+ * SH24b: a `would-merge`/`would-supersede` result's `linkedId` — the full
+ * lowercase 40-hex head oid a superseded entry's unpersisted in-memory
+ * successor resolves against.
+ */
+const LINKED_HEAD_OID_PATTERN = /^[0-9a-f]{40}$/;
 
 export interface RecordShadowDayDependencies {
   readonly evidence: ShadowEvidencePort;
@@ -231,6 +253,127 @@ type LedgerRead =
 type JournalRead =
   | { readonly kind: 'ok'; readonly entries: readonly LaneRunJournalEntryRecord[] }
   | { readonly kind: 'unavailable' };
+
+/**
+ * SH24b: shadow-effective liveness of one merge-queue entry against the
+ * day's journal prefix read. An entry is shadow-effectively live iff
+ * `isMergeQueueEntryLive` holds AND `journalEntries` has no `result`
+ * (`outcome: 'dry-run'`) on the entry's own
+ * `merge/<repoDigest>/<pr>/<head12>/<action>` key for a shadow-terminal
+ * action (`would-drop`, `would-supersede`, `would-already-merged`) whose
+ * `reasonCode === action`. A `dry-run` result with
+ * `reasonCode: 'shadow-intent-closed'` on such a key never excludes (the
+ * interrupted intent was closed, not executed), and ordinary parked entries
+ * stay live.
+ *
+ * The exclusion is bound to THIS queue entry, not to the key alone: the
+ * record only excludes when BOTH timestamps parse and its own
+ * `recordedAtIso` is STRICTLY after the entry's `enqueuedAtIso` (both fields
+ * the entry and the journal reliably carry). An equal timestamp cannot
+ * establish which incarnation of the key the result belongs to, so it leaves
+ * the entry LIVE: a would-terminal record that predates the entry's enqueue,
+ * or one recorded at exactly the entry's enqueue time, belongs to an earlier
+ * incarnation of the same key and a later re-enqueue at the same head is
+ * LIVE again. A `runId` binds nothing and is never used as identity here: a
+ * re-enqueue can carry the same `runId`, so it cannot tie a result to an
+ * entry. When either timestamp is missing or unparseable the record cannot
+ * be bound to the entry, so the entry stays live — staying live can only
+ * cost a divergence, never a false pass.
+ * Cost: linear in the journal entries; the entry's own fields are plain
+ * reads.
+ */
+function isShadowEffectivelyLive(
+  entry: Pick<MergeQueueEntryRecord, 'repoDigest' | 'pullRequest' | 'headOid' | 'state' | 'enqueuedAtIso'>,
+  journalEntries: readonly LaneRunJournalEntryRecord[],
+): boolean {
+  if (!isMergeQueueEntryLive(entry)) {
+    return false;
+  }
+  const head12 = head12Of(entry.headOid);
+  if (head12 === null) {
+    return true;
+  }
+  const enqueuedMs = Date.parse(entry.enqueuedAtIso);
+  for (const record of journalEntries) {
+    if (record.kind !== 'result' || record.outcome !== 'dry-run') {
+      continue;
+    }
+    const parsed = parseLaneRunKey(record.key);
+    if (
+      parsed !== null
+      && parsed.kind === 'merge'
+      && parsed.repoDigest === entry.repoDigest
+      && parsed.pullRequest === entry.pullRequest
+      && parsed.head12 === head12
+      && SHADOW_TERMINAL_WOULD_ACTIONS.includes(parsed.action)
+      && record.reasonCode === parsed.action
+    ) {
+      // A terminal result excludes the entry ONLY when both timestamps parse
+      // and the result was recorded strictly after the enqueue. An
+      // unparseable timestamp (either side) cannot bind the record to the
+      // entry, so the entry stays LIVE — fail-closed. An equal timestamp is
+      // ambiguous in the same way. A `runId` binds nothing: a re-enqueue can
+      // carry the same `runId`, so it is never used as identity here.
+      const recordedMs = Date.parse(record.recordedAtIso);
+      if (Number.isNaN(enqueuedMs) || Number.isNaN(recordedMs)) {
+        continue;
+      }
+      if (recordedMs > enqueuedMs) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * SH24b: the heads the journaled supersessions and in-memory merges name.
+ * Every journaled `dry-run` result on a `merge-pr` or `would-supersede`
+ * merge key with reason `would-merge` or `would-supersede` whose `linkedId`
+ * is a valid 40-hex head oid matching the key's own head12 contributes
+ * `{ pullRequest, headOid: linkedId }` — the 40-hex head a superseded
+ * entry's unpersisted in-memory successor resolves against, so S1 never
+ * reports `fleet-head-unresolved` for it. Deduplicated by
+ * `${pullRequest}:${headOid}`. Cost: linear in the journal entries.
+ */
+function shadowLinkedHeads(
+  journalEntries: readonly LaneRunJournalEntryRecord[],
+): readonly { readonly pullRequest: number; readonly headOid: string }[] {
+  const heads: { pullRequest: number; headOid: string }[] = [];
+  const seen = new Set<string>();
+  for (const record of journalEntries) {
+    if (record.kind !== 'result' || record.outcome !== 'dry-run') {
+      continue;
+    }
+    if (record.reasonCode !== 'would-merge' && record.reasonCode !== 'would-supersede') {
+      continue;
+    }
+    const parsed = parseLaneRunKey(record.key);
+    if (
+      parsed === null
+      || parsed.kind !== 'merge'
+      // `would-supersede` stays accepted here even though SH24a currently
+      // writes no `linkedId` on a `would-supersede` result (so the branch
+      // is dead in production today): the S1 contract this helper serves
+      // names `would-supersede` results as a legitimate `linkedId` source,
+      // so a writer that starts carrying one must be honoured, not dropped.
+      || (parsed.action !== 'merge-pr' && parsed.action !== 'would-supersede')
+    ) {
+      continue;
+    }
+    const linkedId = record.linkedId;
+    if (typeof linkedId !== 'string' || !LINKED_HEAD_OID_PATTERN.test(linkedId) || head12Of(linkedId) !== parsed.head12) {
+      continue;
+    }
+    const identity = `${parsed.pullRequest}:${linkedId}`;
+    if (seen.has(identity)) {
+      continue;
+    }
+    seen.add(identity);
+    heads.push({ pullRequest: parsed.pullRequest, headOid: linkedId });
+  }
+  return heads;
+}
 
 /** One enqueue key as the SH5c intake evaluator consumes it. */
 interface IntakeKey {
@@ -498,7 +641,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // 150 s settle sleep cannot push them minutes past the evidence they
     // reconcile against.
     const mergeSet = await this.evaluateMergeSetCriterion(context, journal, shell);
-    const intake = await this.evaluateIntakeCriterion(context);
+    const intake = await this.evaluateIntakeCriterion(context, journal);
     const outcomes = [
       mergeSet,
       intake.outcome,
@@ -645,9 +788,14 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     return { events: parsed.events, unknownLines: parsed.unknownLines.length };
   }
 
-  /** Every live merge-queue entry for this repository, or the reason S1 is unevaluated. */
+  /**
+   * Every shadow-effectively live merge-queue entry for this repository,
+   * plus the heads the journaled supersessions and in-memory merges name
+   * (SH24b), or the reason S1 is unevaluated.
+   */
   private async readLiveEntries(
     context: DayContext,
+    journal: JournalRead,
   ): Promise<readonly { readonly pullRequest: number; readonly headOid: string }[] | string> {
     const read = await this.call(context.deadlineIso, () =>
       this.deps.queue.listMergeEntries({ repository: context.repository, deadlineIso: this.queryDeadline(context) }),
@@ -661,13 +809,21 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     // of the query. Filter here by `repoDigest` so a call scoped to this
     // repository is never contaminated by another repository's live
     // entries in S1's merge-set comparison.
-    return read.value
-      .filter((entry) => entry.repoDigest === context.repoDigest)
-      .filter(isMergeQueueEntryLive)
-      .map((entry) => ({
-        pullRequest: entry.pullRequest,
-        headOid: entry.headOid,
-      }));
+    const journalEntries = journal.kind === 'ok' ? journal.entries : [];
+    return [
+      ...read.value
+        .filter((entry) => entry.repoDigest === context.repoDigest)
+        .filter((entry) => isShadowEffectivelyLive(entry, journalEntries))
+        .map((entry) => ({
+          pullRequest: entry.pullRequest,
+          headOid: entry.headOid,
+        })),
+      // SH24b: a superseded entry's unpersisted in-memory successor resolves
+      // its 40-hex head from the `would-supersede`/`would-merge` result's
+      // `linkedId`, avoiding `fleet-head-unresolved` without changing
+      // `shadow-day-merge-set.ts`'s input schema.
+      ...shadowLinkedHeads(journalEntries),
+    ];
   }
 
   /** S1: the day's merge set, shell events against the fleet's journaled would-merges. */
@@ -682,7 +838,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (journal.kind === 'unavailable') {
       return unevaluatedOutcome('S1', 'fleet-journal-unavailable');
     }
-    const liveEntries = await this.readLiveEntries(context);
+    const liveEntries = await this.readLiveEntries(context, journal);
     if (typeof liveEntries === 'string') {
       return unevaluatedOutcome('S1', liveEntries);
     }
@@ -783,6 +939,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    */
   private async intakeSample(
     context: DayContext,
+    journal: JournalRead,
   ): Promise<{ readonly sample: IntakeSample; readonly chains: LegacyTrainChainsRead | undefined }> {
     const takenAtIso = this.deps.nowIso();
     let chains: LegacyTrainChainsRead | undefined;
@@ -825,12 +982,24 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
       // failure instead of surfacing that the fleet side was unavailable.
       complete = false;
     }
+    if (journal.kind === 'unavailable') {
+      // SH24b: without the journal prefix read the shadow-terminal
+      // exclusions below cannot be evaluated, so the sample is incomplete —
+      // S8 reports incomplete/unevaluated and never manufactures a pass or
+      // a false divergence off unevaluable evidence.
+      complete = false;
+    }
+    const journalEntries = journal.kind === 'ok' ? journal.entries : [];
     const fleetLive =
       fleetRead.kind === 'threw'
         ? []
         : fleetRead.value
             .filter((entry) => entry.repoDigest === context.repoDigest)
-            .filter(isMergeQueueEntryLive)
+            // SH24b: shadow-effective liveness — entries a journaled
+            // `would-drop`, `would-supersede` or `would-already-merged`
+            // result named are no longer shadow-effectively live even
+            // though they stay unmutated in `merge-queue.json`.
+            .filter((entry) => isShadowEffectivelyLive(entry, journalEntries))
             .map((entry) => ({
               pullRequest: entry.pullRequest,
               headOid: entry.headOid,
@@ -869,17 +1038,18 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    */
   private async evaluateIntakeCriterion(
     context: DayContext,
+    journal: JournalRead,
   ): Promise<{ readonly outcome: CriterionOutcome; readonly chains: LegacyTrainChainsRead | undefined }> {
     const nowSerial = Math.floor(Date.parse(this.deps.nowIso()) / DAY_MS);
     if (context.day !== utcDayOfSerial(nowSerial - 1)) {
       return { outcome: unevaluatedOutcome('S8', 'snapshot-only-for-yesterday'), chains: undefined };
     }
-    const first = await this.intakeSample(context);
+    const first = await this.intakeSample(context, journal);
     // A real wall-clock gap, matching SH5c's persistence intent: two
     // independently-moving systems sampled seconds apart can manufacture a
     // divergence that resolves itself immediately after.
     await this.deps.sleep(this.deps.settings.sampleGapMs ?? DEFAULT_SAMPLE_GAP_MS);
-    const second = await this.intakeSample(context);
+    const second = await this.intakeSample(context, journal);
     const evaluation = evaluateShadowIntake({ samples: [first.sample, second.sample] });
     return {
       outcome: { criterion: 'S8', kind: 'evaluated', evaluation, intake: evaluation },

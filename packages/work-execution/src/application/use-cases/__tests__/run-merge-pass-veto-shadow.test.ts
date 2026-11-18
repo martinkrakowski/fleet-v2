@@ -1,8 +1,8 @@
 // OG-16a: the advisory merge veto — one recorded row per entry, log-only, and
 // the next pass merges (or would-hold) over the stored answer. Since SH24a the
-// recording runs under a LIVE policy with `veto.mode === 'shadow'`: under
-// `policy.shadow === true` the pass never mutates the queue, never calls
-// either veto port, and reaches `would-merge` straight away.
+// recording runs under a LIVE policy with `veto.mode === 'shadow'`; per owner
+// decision A+ (2026-11-18) the shadow-veto record also persists under
+// `policy.shadow === true`, exactly as on main.
 import { describe, expect, it } from 'vitest';
 
 import { RunMergePassUseCase } from '../RunMergePassUseCase.use-case.js';
@@ -350,7 +350,7 @@ function factsForGreenHead(entry: MergeQueueEntryRecord) {
 }
 
 describe('RunMergePassUseCase advisory veto (OG-16a, recorded under a live policy; SH24a)', () => {
-  it('under policy.shadow the veto ports are never called and the pass reaches would-merge with no row stored', async () => {
+  it('under policy.shadow the veto row persists as on main (owner decision A+)', async () => {
     const entry = makeEntry();
     const w = wire([entry]);
 
@@ -358,11 +358,16 @@ describe('RunMergePassUseCase advisory veto (OG-16a, recorded under a live polic
 
     expect(result.outcome).toBe('completed');
     expect(result.entries).toHaveLength(1);
-    expect(result.entries[0]).toMatchObject({ decision: 'journalled', reasonCode: 'would-merge' });
-    expect(w.vetoState.calls).toBe(0);
-    expect(w.vetoAdvice.calls).toBe(0);
-    expect(storedVeto(w.queue, entry.entryId)).toBeNull();
-    expect(await journalOf(w.journal)).toBe(2); // the merge-pr dry-run pair
+    expect(result.entries[0]).toMatchObject({ decision: 'no-action', reasonCode: 'veto' });
+    expect(w.vetoState.calls).toBe(1);
+    expect(w.vetoAdvice.calls).toBe(1);
+    expect(storedVeto(w.queue, entry.entryId)).toEqual({
+      outcome: 'merge-safe',
+      confidence: 0.9,
+      mode: 'shadow',
+      decisionReceiptId: 'receipt-1',
+    });
+    expect(await journalOf(w.journal)).toBe(0); // the veto row stops this pass
   });
 
   it('a live policy with an advisory shadow veto records one shadow row per entry', async () => {

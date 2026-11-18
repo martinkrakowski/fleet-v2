@@ -153,7 +153,7 @@ async function harness(options: {
 }
 
 describe('RunMergePassUseCase (DT9c): audit fields', () => {
-  it('in shadow mode the audit is never persisted: the queue stays queued and only a dry-run is journalled', async () => {
+  it('in shadow mode the ready entry persists as on main (owner decision A+), with no notification', async () => {
     const h = await harness({ forge: greenForge });
 
     const first = await h.useCase.runMergePass(h.request());
@@ -162,14 +162,15 @@ describe('RunMergePassUseCase (DT9c): audit fields', () => {
     expect(first.entries[0].decision).toBe('journalled');
     expect(first.entries[0].reasonCode).toBe('would-merge');
     const [entry] = await h.list();
-    // SH24a: shadow mode never writes merge-queue.json, so no audit lands.
+    // Owner decision A+ (2026-11-18): enter-ready persists as on main, so the
+    // verification audit lands on the entry exactly as under a live policy.
     expect(entry).toMatchObject({
-      state: 'queued', policyRevision: null, verifiedHeadOid: null, verifiedBy: null,
-      premergeReceiptHeadOid: null, veto: null, mergeCommitOid: null, mergedAtIso: null, revision: 1,
+      state: 'ready', policyRevision: 'rev-1', verifiedHeadOid: HEAD, verifiedBy: 'contexts',
+      premergeReceiptHeadOid: HEAD, veto: null, mergeCommitOid: null, mergedAtIso: null, revision: 2,
     });
 
     await h.useCase.runMergePass(h.request());
-    expect((await h.list())[0].revision).toBe(1); // nothing rewritten
+    expect((await h.list())[0].revision).toBe(2); // nothing rewritten
     expect(h.notifier.requests).toHaveLength(0);
     expect(h.verificationCalls.count).toBe(0);
   });

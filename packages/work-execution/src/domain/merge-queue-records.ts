@@ -63,7 +63,7 @@ export type MergeDropReason = (typeof MERGE_DROP_REASONS)[number];
 
 export const MERGE_SHADOW_REASONS = [
   'would-update-branch', 'would-post-status', 'would-merge',
-  'would-drop', 'would-park', 'would-supersede', 'would-ready', 'would-already-merged',
+  'would-drop', 'would-park', 'would-supersede', 'would-ready', 'would-already-merged', 'would-notify',
 ] as const;
 export type MergeShadowReason = (typeof MERGE_SHADOW_REASONS)[number];
 

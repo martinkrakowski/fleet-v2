@@ -70,7 +70,7 @@ export type MergeKeyTwoWayAction = (typeof MERGE_KEY_TWO_WAY_ACTIONS)[number];
 
 /** Shadow-mutation merge actions (SH24a): 5-segment `merge/<repoDigest>/<pr>/<head12>/<action>` keys, no ordinals. */
 export const MERGE_KEY_SHADOW_MUTATION_ACTIONS = [
-  'would-drop', 'would-park', 'would-supersede', 'would-ready', 'would-already-merged',
+  'would-drop', 'would-park', 'would-supersede', 'would-ready', 'would-already-merged', 'would-notify',
 ] as const;
 export type MergeKeyShadowMutationAction = (typeof MERGE_KEY_SHADOW_MUTATION_ACTIONS)[number];
 

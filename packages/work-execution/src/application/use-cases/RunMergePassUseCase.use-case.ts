@@ -150,10 +150,11 @@ const CONTEXT_FAILED_TOKENS = new Set([
   'ACTION_REQUIRED', 'STALE',
 ]);
 
-const MERGE_STATE_BY_TOKEN: Record<string, 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'UNKNOWN'> = {
+const MERGE_STATE_BY_TOKEN: Record<string, 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'DIRTY' | 'UNKNOWN'> = {
   clean: 'CLEAN',
   behind: 'BEHIND',
   blocked: 'BLOCKED',
+  dirty: 'DIRTY',
   unknown: 'UNKNOWN',
 };
 
@@ -360,11 +361,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
       current = persisted.status === 'written' ? persisted.record : built.record;
       const second = decideMergeStep(current, facts, request.policy, this.deps.nowIso());
       if (second.kind === 'enter' && second.state === 'ready') {
-        if (request.policy.shadow === true) {
-          // SH24a: shadow mode never persists the ready entry; journal the
-          // dry-run instead of reporting the persisted recording.
-          return this.journalShadowOutcome(request, entry, 'would-ready', null);
-        }
+        // Owner decision A+ (2026-11-18): enter-ready persists as on main,
+        // also under a shadow policy; the queue write goes through `persist`.
         return this.report(
           entry,
           persisted.status === 'written' ? 'recorded' : 'no-action',
@@ -412,19 +410,19 @@ export class RunMergePassUseCase implements RunMergePassPort {
     if (decision.kind === 'act' && decision.execution === 'shadow') {
       return decision.action === 'premerge-carry' ? 'post-status' : decision.action;
     }
-    // SH24a: the non-act shadow outcomes journal their own `would-*` keys, so an
-    // interrupted intent from a prior tick is completed, never closed.
+    // Owner decision A+ (2026-11-18): only the suppressed set journals its own
+    // `would-*` key — every drop, the `veto-hold` park, supersede and the
+    // forge-confirmed already-merged wait. Ordinary parks and enter-ready
+    // persist as on main, so an interrupted intent from a prior tick is
+    // closed (not completed) when the head now persists again.
     if (decision.kind === 'drop') {
       return 'would-drop';
     }
-    if (decision.kind === 'park') {
+    if (decision.kind === 'park' && decision.reason === 'veto-hold') {
       return 'would-park';
     }
     if (decision.kind === 'supersede') {
       return 'would-supersede';
-    }
-    if (decision.kind === 'enter') {
-      return 'would-ready';
     }
     if (decision.kind === 'wait' && decision.reason === 'already-merged') {
       return 'would-already-merged';
@@ -480,10 +478,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
     if (decision.kind === 'supersede') {
       return this.recordSupersession(request, entry, decision.liveHeadOid);
     }
-    if (request.policy.shadow === true) {
-      // SH24a: the fallback enter-ready branch never persists in shadow mode.
-      return this.journalShadowOutcome(request, entry, 'would-ready', null);
-    }
+    // Owner decision A+ (2026-11-18): enter-ready persists as on main; the
+    // write above (`persist` in `actOnEntry`) already recorded it.
     return this.report(entry, 'no-action', 'enter-ready', null);
   }
 
@@ -505,6 +501,9 @@ export class RunMergePassUseCase implements RunMergePassPort {
     decision: Extract<MergeStepDecision, { kind: 'supersede' }>,
   ): Promise<MergePassEntryReport> {
     await this.journalShadowOutcome(request, predecessor, 'would-supersede', null);
+    // Luna (minor): the predecessor head's own open intents are closed here —
+    // the head is superseded, so nothing keyed on it can act again this pass.
+    await this.closeOpenShadowIntents(request, predecessor, 'would-supersede');
     const built = buildSupersession(predecessor, decision.liveHeadOid, this.deps.newUlid());
     if (!built.ok) {
       return this.report(entry, 'no-action', 'entry-refused', null);
@@ -528,7 +527,10 @@ export class RunMergePassUseCase implements RunMergePassPort {
       }
       const second = decideMergeStep(ready.record, successorFacts, request.policy, this.deps.nowIso());
       if (second.kind === 'enter' && second.state === 'ready') {
-        return this.journalShadowOutcome(request, entry, 'would-ready', null);
+        // Luna (major): the moved successor lives only in memory, so the
+        // `would-ready` dry-run is journalled against the successor's own
+        // head, never against the original (predecessor) entry.
+        return this.journalShadowOutcome(request, ready.record, 'would-ready', null);
       }
       // The in-memory ready advance stands in for the persist the shadow mode
       // never performs; the act below keys on the advanced record's own head.
@@ -560,13 +562,9 @@ export class RunMergePassUseCase implements RunMergePassPort {
     entry: MergeQueueEntryRecord,
     verifiedHeadOid: string,
   ): Promise<MergePassEntryReport | null> {
-    // SH24a: shadow mode never mutates the queue, and a recorded-but-unstored
-    // veto answer would re-enter this row on every tick and never reach
-    // `would-merge`; returning `null` lets the pass fall through with an
-    // unknown veto instead. Neither veto port is called.
-    if (request.policy.shadow === true) {
-      return null;
-    }
+    // Owner decision A+ (2026-11-18): the shadow-veto record persists as on
+    // main, also under a shadow policy; only the drop, the `veto-hold` park
+    // and the supersession are suppressed.
     const unknownRecord: MergeQueueVetoRecord = {
       outcome: 'unknown',
       confidence: null,
@@ -663,10 +661,11 @@ export class RunMergePassUseCase implements RunMergePassPort {
     entry: MergeQueueEntryRecord,
     decision: Extract<MergeStepDecision, { kind: 'park' }>,
   ): Promise<MergePassEntryReport> {
-    if (request.policy.shadow === true) {
-      // SH24a: shadow mode never parks the entry; the first park reason per
-      // head is journalled (the 5-segment `would-park` key), later park ticks
-      // for the same head see the stored result and are already journalled.
+    if (request.policy.shadow === true && decision.reason === 'veto-hold') {
+      // Owner decision A+ (2026-11-18): the `veto-hold` park is the only park
+      // the conductor treats as final, so it is suppressed and journalled as
+      // `would-park` (the first park reason per head). Every other park
+      // persists as on main through the compare-and-set write below.
       return this.journalShadowOutcome(request, entry, 'would-park', decision.reason);
     }
     const built = buildParkedEntry(entry, {
@@ -754,17 +753,24 @@ export class RunMergePassUseCase implements RunMergePassPort {
     successor: MergeQueueEntryRecord | null,
     notify: { readonly event: MergeNotificationEvent; readonly id: string } | null,
   ): Promise<PersistResult> {
-    // SH24a: defense in depth — under a shadow policy the shared merge queue is
-    // never written and no merge notification is ever sent, whatever caller
-    // reaches this method.
-    if (request.policy.shadow === true) {
-      return { status: 'skipped' };
-    }
+    // Owner decision A+ (2026-11-18): the queue write persists as on main.
+    // The suppressed transitions (every drop, the `veto-hold` park, the
+    // supersession) never reach this method; their callers journal the
+    // matching `would-*` key instead.
     const writer = this.deps.queueWriter;
     if (writer === undefined) {
       return { status: 'skipped' };
     }
-    if (notify !== null) {
+    // SHADOW IS SILENT (owner decision 2026-11-18): under a shadow policy the
+    // notification step is skipped and journalled as `would-notify`, so a
+    // persisted shadow park never notifies anyone. Live mode notifies as
+    // designed.
+    let effectiveNotify = notify;
+    if (effectiveNotify !== null && request.policy.shadow === true) {
+      await this.journalShadowOutcome(request, entry, 'would-notify', effectiveNotify.event);
+      effectiveNotify = null;
+    }
+    if (effectiveNotify !== null) {
       const notifier = this.deps.notifier;
       if (notifier === undefined) {
         return { status: 'failed', reasonCode: 'notifier-unavailable' };
@@ -772,9 +778,9 @@ export class RunMergePassUseCase implements RunMergePassPort {
       this.ensureBudget(request);
       try {
         const sent = await notifier.notifyMergeEvent({
-          event: notify.event,
-          id: notify.id,
-          key: mergeNotificationKey(notify.event, notify.id),
+          event: effectiveNotify.event,
+          id: effectiveNotify.id,
+          key: mergeNotificationKey(effectiveNotify.event, effectiveNotify.id),
           deadlineIso: request.deadlineIso,
         });
         const outcome: unknown = sent?.outcome;
@@ -873,7 +879,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
 
   /**
    * SH24a: the keyed dry-run journal for a shadow *mutation* outcome (drop,
-   * park, supersede, ready, already-merged). One `would-*` intent and one
+   * park, supersede, ready, already-merged) and for the silent shadow
+   * notification (`would-notify`). One `would-*` intent and one
    * `dry-run` result per `(pr, head12, action)` key, exactly like
    * `journalShadowAct`; nothing is written to the queue and nothing notifies.
    */

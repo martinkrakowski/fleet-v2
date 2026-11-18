@@ -43,6 +43,7 @@ import {
   AutoMergeAttemptUseCase,
   AttemptArtifactAdapter,
   AttemptRepositoryAdapter,
+  AttestShadowFactUseCase,
   AuthorBriefUseCase,
   BriefAuthoringAdapter,
   BriefKnowledgeAdapter,
@@ -884,6 +885,8 @@ export interface FleetCliRuntime {
     readonly manageCutover: ManageCutoverUseCase;
     /** SH8a: the shadow day-writer behind `cutover shadow record-day`; undefined without a durable state directory. */
     readonly recordShadowDay?: RecordShadowDayUseCase;
+    /** AT1: the owner attestation writer behind `cutover shadow attest`; undefined without a durable state directory. */
+    readonly attestShadowFact?: AttestShadowFactUseCase;
     /** RC1: the read-only lane-run reader record-day's early warning reads; the same instance `conducted.facts.runs` uses, undefined when conducted is not wired or not durable. */
     readonly shadowRunsRead?: Pick<LaneRunRepositoryPort, 'list'>;
     /** CO24comp: PR-feedback fix round preparation and grant-scoped push-to-pr. */
@@ -1763,6 +1766,23 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         });
       })()
     : undefined;
+  // AT1: `cutover shadow attest` — the owner attestation writer. Durable-state
+  // only, like record-day. The attestation adapter here is the one WRITABLE
+  // instance over `cutover-shadow-attestations.json`; RecordShadowDayUseCase
+  // keeps its own read-only instance above, so record-day can never write the
+  // attestation store. The journal intent and result go through the same
+  // `cutoverJournal` every cutover move shares.
+  const attestShadowFact =
+    durableCutover && stateDir !== undefined && stateDir.trim().length > 0
+      ? new AttestShadowFactUseCase({
+          attestations: new ShadowAttestationAdapter({ stateDir }),
+          cutoverJournal,
+          releaseSha: () => readCurrentReleaseSha({ releaseStore, releaseRoot }),
+          computeDigest: sha256HexDigest,
+          mintEntryId: () => newUlid(),
+          nowIso: daemon.now,
+        })
+      : undefined;
   return {
     installation: options?.installation,
     reviewLocator,
@@ -1789,6 +1809,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       preparePullRequestFeedbackFix,
       /** SH8a: `cutover shadow record-day`; undefined without a durable state directory. */
       ...(recordShadowDay !== undefined ? { recordShadowDay } : {}),
+      /** AT1: `cutover shadow attest`; undefined without a durable state directory. */
+      ...(attestShadowFact !== undefined ? { attestShadowFact } : {}),
       /** RC1: the same read-only lane-run reader `conducted.facts.runs` uses, for record-day's early warning; undefined when conducted is not wired or the composition is not durable. */
       ...(recordShadowDay !== undefined && shadowRunsRead !== undefined ? { shadowRunsRead } : {}),
       reviewThreadHelper,

@@ -708,6 +708,28 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     expect(await attestations.compareAndSet({})).toEqual({ outcome: 'refused', reason: 'read-only' });
   });
 
+  // AT1 fix round 2: the record-day attestation reader must be the read-only
+  // instance and never the WRITABLE `ShadowAttestationAdapter` the composition
+  // builds for `AttestShadowFactUseCase` — following the SH19c/SH19d
+  // identity-test pattern.
+  it('wires oneTime.attestations as the read-only instance, not the writable adapter attestShadowFact holds', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    const attestUseCase = runtime.execution.attestShadowFact;
+    if (attestUseCase === undefined) throw new Error('attestShadowFact is not wired');
+    const writable = (attestUseCase as unknown as {
+      deps: { attestations: unknown };
+    }).deps.attestations;
+    expect(deps.oneTime?.attestations).toBeInstanceOf(ShadowAttestationAdapter);
+    expect(writable).toBeInstanceOf(ShadowAttestationAdapter);
+    expect(readOnlyOf(deps.oneTime?.attestations)).toBe(true);
+    // The writable one is constructed without the read-only flag (its store
+    // options bag omits it), so it is a genuinely different configuration.
+    const writableOptions = (writable as { store?: { options?: { readOnly?: unknown } } }).store?.options;
+    expect(writableOptions?.readOnly).not.toBe(true);
+    expect(deps.oneTime?.attestations).not.toBe(writable);
+  });
+
   // Luna's fix round 2, behaviour backstop: one corrupt state file per
   // readable store the record-day readers touch. After `record-day` every
   // seeded file must be byte-identical and no quarantine sibling may exist —

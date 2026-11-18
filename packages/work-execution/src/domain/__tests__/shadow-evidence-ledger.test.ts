@@ -626,37 +626,39 @@ describe('shadow evidence ledger (SH1)', () => {
   });
 
   describe('composeCutoverShadowEvidence', () => {
-    function threeDays(merges: [number, number, number], day2Verdicts = allPassVerdicts(), thirdDay = D3): ShadowLedger {
-      return buildLedger([
-        dayInput(D1, merges[0]),
-        dayInput(D2, merges[1], day2Verdicts),
-        dayInput(thirdDay, merges[2]),
-      ]);
+    function oneDay(merges: number | undefined, verdicts = allPassVerdicts(), releaseSha: string | null = RELEASE_SHA): ShadowLedger {
+      return buildLedger([dayInput(D3, merges, verdicts, releaseSha)]);
     }
 
-    it('composes the newest three days with only the recorded criteria, unpadded', () => {
-      const full = buildLedger([dayInput(D1, 7), dayInput(D2, 7), dayInput(D3, 6)]);
+    it('composes the newest day with only the recorded criteria, unpadded', () => {
+      const full = oneDay(20);
       const composedFull = composeCutoverShadowEvidence(full, NOW, { requireSingleRelease: false });
       if (composedFull.status !== 'ok') {
         throw new Error('expected ok');
       }
       expect(Object.keys(composedFull.evidence.days[0].verdicts).length).toBe(13);
-      const partial = buildLedger([dayInput(D1, 7), dayInput(D2, 7), { ...dayInput(D3, undefined), verdicts: { S1: passVerdict() } }]);
+      const partial = buildLedger([{ ...dayInput(D3, undefined), verdicts: { S1: passVerdict() } }]);
       const composedPartial = composeCutoverShadowEvidence(partial, NOW, { requireSingleRelease: false });
       if (composedPartial.status !== 'ok') {
         throw new Error('expected ok');
       }
-      expect(Object.keys(composedPartial.evidence.days[2].verdicts)).toEqual(['S1']);
+      expect(Object.keys(composedPartial.evidence.days[0].verdicts)).toEqual(['S1']);
     });
 
-    it('treats a null mergesCompared as 0 in the sum', () => {
-      const ledger = buildLedger([dayInput(D1, 7), dayInput(D2, 13), dayInput(D3, undefined)]);
+    it('counts only the newest day: an older all-pass day with 25 merges never lifts the total', () => {
+      const ledger = buildLedger([dayInput(D1, 25), dayInput(D2, 19)]);
+      const composed = composeCutoverShadowEvidence(ledger, `${D2}T23:59:59Z`, { requireSingleRelease: false });
+      expect(composed.status === 'ok' && composed.evidence.merges).toBe(19);
+    });
+
+    it('treats a null mergesCompared on the newest day as 0', () => {
+      const ledger = oneDay(undefined);
       const composed = composeCutoverShadowEvidence(ledger, NOW, { requireSingleRelease: false });
-      expect(composed.status === 'ok' && composed.evidence.merges).toBe(20);
+      expect(composed.status === 'ok' && composed.evidence.merges).toBe(0);
     });
 
     it('returns freshly built objects, never a reference into the ledger', () => {
-      const ledger = threeDays([7, 7, 6]);
+      const ledger = oneDay(20);
       const composed = composeCutoverShadowEvidence(ledger, NOW, { requireSingleRelease: false });
       if (composed.status !== 'ok') {
         throw new Error('expected ok');
@@ -673,32 +675,32 @@ describe('shadow evidence ledger (SH1)', () => {
     });
 
     it('refuses a number clock with invalid-clock', () => {
-      const ledger = threeDays([7, 7, 6]);
+      const ledger = oneDay(20);
       expect(composeCutoverShadowEvidence(ledger, 42, { requireSingleRelease: false })).toEqual({ status: 'absent', reason: 'invalid-clock' });
     });
 
     it('refuses a naive (non-zoned) clock with invalid-clock', () => {
-      const ledger = threeDays([7, 7, 6]);
+      const ledger = oneDay(20);
       expect(composeCutoverShadowEvidence(ledger, `${D3}T23:59:59`, { requireSingleRelease: false })).toEqual({ status: 'absent', reason: 'invalid-clock' });
     });
 
     it('refuses missing options with invalid-options', () => {
-      const ledger = threeDays([7, 7, 6]);
+      const ledger = oneDay(20);
       expect(composeCutoverShadowEvidence(ledger, NOW, null)).toEqual({ status: 'absent', reason: 'invalid-options' });
     });
 
     it('refuses options with an extra key with invalid-options', () => {
-      const ledger = threeDays([7, 7, 6]);
+      const ledger = oneDay(20);
       expect(composeCutoverShadowEvidence(ledger, NOW, { requireSingleRelease: false, extra: true })).toEqual({ status: 'absent', reason: 'invalid-options' });
     });
 
     it('refuses options whose requireSingleRelease is not a boolean with invalid-options', () => {
-      const ledger = threeDays([7, 7, 6]);
+      const ledger = oneDay(20);
       expect(composeCutoverShadowEvidence(ledger, NOW, { requireSingleRelease: 'no' })).toEqual({ status: 'absent', reason: 'invalid-options' });
     });
 
     it('refuses a Proxy over the options whose ownKeys trap throws with invalid-options', () => {
-      const ledger = threeDays([7, 7, 6]);
+      const ledger = oneDay(20);
       const proxy = new Proxy({ requireSingleRelease: false }, {
         ownKeys() {
           throw new Error('trap');
@@ -707,77 +709,98 @@ describe('shadow evidence ledger (SH1)', () => {
       expect(composeCutoverShadowEvidence(ledger, NOW, proxy)).toEqual({ status: 'absent', reason: 'invalid-options' });
     });
 
-    it('refuses fewer than three stored days with too-few-days', () => {
-      const ledger = buildLedger([dayInput(D1, 7), dayInput(D2, 7)]);
-      expect(composeCutoverShadowEvidence(ledger, NOW, { requireSingleRelease: false })).toEqual({ status: 'absent', reason: 'too-few-days' });
+    it('refuses fewer than one stored day with too-few-days', () => {
+      expect(composeCutoverShadowEvidence({ revision: 1, days: [] }, NOW, { requireSingleRelease: false })).toEqual({ status: 'absent', reason: 'too-few-days' });
     });
 
-    it('refuses a ledger not updated within the last day with stale', () => {
-      const ledger = threeDays([7, 7, 6]);
-      const late = new Date(Date.parse(NOW) + 3 * DAY_MS).toISOString();
+    it('refuses a ledger whose newest day is two UTC days before the clock with stale', () => {
+      const ledger = oneDay(20);
+      const late = new Date(Date.parse(NOW) + 2 * DAY_MS).toISOString();
       expect(composeCutoverShadowEvidence(ledger, late, { requireSingleRelease: false })).toEqual({ status: 'absent', reason: 'stale' });
     });
 
     it('accepts a clock exactly one UTC day after the newest day (not stale)', () => {
-      const ledger = threeDays([7, 7, 6]);
+      const ledger = oneDay(20);
       const nextDay = new Date(Date.parse(NOW) + DAY_MS).toISOString();
       expect(composeCutoverShadowEvidence(ledger, nextDay, { requireSingleRelease: false }).status).toBe('ok');
     });
 
-    it('refuses differing release shas under requireSingleRelease with release-changed', () => {
-      const changed = buildLedger([dayInput(D1, 7), dayInput(D2, 7), dayInput(D3, 6, allPassVerdicts(), OTHER_RELEASE_SHA)]);
-      expect(composeCutoverShadowEvidence(changed, NOW, { requireSingleRelease: true })).toEqual({ status: 'absent', reason: 'release-changed' });
-    });
-
-    it('refuses a null release sha under requireSingleRelease with release-changed', () => {
-      const nulled = buildLedger([dayInput(D1, 7, allPassVerdicts(), null), dayInput(D2, 7), dayInput(D3, 6)]);
+    it('refuses a null release sha on the newest day under requireSingleRelease with release-changed', () => {
+      const nulled = oneDay(20, allPassVerdicts(), null);
       expect(composeCutoverShadowEvidence(nulled, NOW, { requireSingleRelease: true })).toEqual({ status: 'absent', reason: 'release-changed' });
     });
 
-    it('accepts equal release shas under requireSingleRelease', () => {
-      const ledger = threeDays([7, 7, 6]);
+    it('accepts a non-null release sha on the newest day even when an earlier day had null or a different one', () => {
+      const mixed = buildLedger([
+        dayInput(D1, 7, allPassVerdicts(), null),
+        dayInput(D2, 7, allPassVerdicts(), OTHER_RELEASE_SHA),
+        dayInput(D3, 20),
+      ]);
+      expect(composeCutoverShadowEvidence(mixed, NOW, { requireSingleRelease: true }).status).toBe('ok');
+    });
+
+    it('accepts a pinned release sha under requireSingleRelease', () => {
+      const ledger = oneDay(20);
       expect(composeCutoverShadowEvidence(ledger, NOW, { requireSingleRelease: true }).status).toBe('ok');
     });
   });
 
   describe('end-to-end with readCutoverShadowEvidence', () => {
-    function feed(ledger: ShadowLedger, now = NOW): ReturnType<typeof readCutoverShadowEvidence> {
+    function feed(ledger: ShadowLedger, now = NOW): ReturnType<typeof readCutoverShadowEvidence> | { status: 'absent'; reason: string } {
       const composed = composeCutoverShadowEvidence(ledger, now, { requireSingleRelease: false });
       if (composed.status !== 'ok') {
-        throw new Error(`expected a composed evidence, got ${composed.reason}`);
+        return composed;
       }
       return readCutoverShadowEvidence(composed.evidence, now);
     }
 
-    it('(a) three consecutive all-pass days with merges 7, 7, 6 are accepted', () => {
-      const ledger = buildLedger([dayInput(D1, 7), dayInput(D2, 7), dayInput(D3, 6)]);
+    const ALL_FAILED = { ok: false, reason: 'invalid-evidence', failed: [...CUTOVER_SHADOW_CRITERIA] };
+
+    it('(a) one all-pass day with 20 merges is accepted', () => {
+      const ledger = buildLedger([dayInput(D3, 20)]);
       expect(feed(ledger)).toEqual({ ok: true });
     });
 
-    it('(b) merges summing to 19 instead of 20 report every criterion failed', () => {
-      const ledger = buildLedger([dayInput(D1, 6), dayInput(D2, 6), dayInput(D3, 7)]);
-      const result = feed(ledger);
-      expect(result).toEqual({ ok: false, reason: 'invalid-evidence', failed: [...CUTOVER_SHADOW_CRITERIA] });
+    it('(b) a qualifying older day never substitutes for the newest day: 25 then 19 fails everything', () => {
+      const ledger = buildLedger([dayInput(D1, 25), dayInput(D2, 19)]);
+      expect(feed(ledger, `${D2}T23:59:59Z`)).toEqual(ALL_FAILED);
     });
 
-    it('(c) a never-recorded S7 on one day is the only failed criterion', () => {
-      const ledger = buildLedger([dayInput(D1, 7), dayInput(D2, 7, verdictsMissing('S7')), dayInput(D3, 6)]);
-      const result = feed(ledger);
-      expect(result).toEqual({ ok: false, reason: 'invalid-evidence', failed: ['S7'] });
+    it('(c) a newest day with a null mergesCompared composes merges 0 and fails everything', () => {
+      const ledger = buildLedger([dayInput(D3, undefined)]);
+      expect(feed(ledger)).toEqual(ALL_FAILED);
     });
 
-    it('(d) a calendar gap between the three days reports every criterion failed', () => {
-      const ledger = buildLedger([dayInput(D1, 7), dayInput(D2, 7), dayInput('2026-02-04', 6)]);
-      const result = feed(ledger, '2026-02-04T12:00:00Z');
-      expect(result).toEqual({ ok: false, reason: 'invalid-evidence', failed: [...CUTOVER_SHADOW_CRITERIA] });
+    it('(d) a never-recorded S7 on the single day is the only failed criterion', () => {
+      const ledger = buildLedger([dayInput(D3, 20, verdictsMissing('S7'))]);
+      expect(feed(ledger)).toEqual({ ok: false, reason: 'invalid-evidence', failed: ['S7'] });
     });
 
-    it('(e) a failing S4 on the middle day is the only failed criterion', () => {
+    it('(e) an older all-pass day with 25 merges does not pass when the latest closed day fails S4', () => {
       const verdicts = allPassVerdicts();
       verdicts.S4 = passVerdict({ verdict: 'fail', reason: 'drift' });
-      const ledger = buildLedger([dayInput(D1, 7), dayInput(D2, 7, verdicts), dayInput(D3, 6)]);
-      const result = feed(ledger);
-      expect(result).toEqual({ ok: false, reason: 'invalid-evidence', failed: ['S4'] });
+      const ledger = buildLedger([dayInput(D1, 25), dayInput(D2, 25, verdicts)]);
+      expect(feed(ledger, `${D2}T23:59:59Z`)).toEqual({ ok: false, reason: 'invalid-evidence', failed: ['S4'] });
+    });
+
+    it('(f) an older all-pass day never passes when the latest closed day is missing (too-few-days)', () => {
+      const ledger: ShadowLedger = { schemaVersion: 1, revision: 1, days: [] };
+      expect(feed(ledger)).toEqual({ status: 'absent', reason: 'too-few-days' });
+    });
+
+    it('(g) a failing S4 on the single day is the only failed criterion', () => {
+      const verdicts = allPassVerdicts();
+      verdicts.S4 = passVerdict({ verdict: 'fail', reason: 'drift' });
+      const ledger = buildLedger([dayInput(D3, 20, verdicts)]);
+      expect(feed(ledger)).toEqual({ ok: false, reason: 'invalid-evidence', failed: ['S4'] });
+    });
+
+    it('(h) freshness at both boundaries: one day behind composes, two days behind is stale', () => {
+      const ledger = buildLedger([dayInput(D3, 20)]);
+      const nextDay = new Date(Date.parse(NOW) + DAY_MS).toISOString();
+      expect(composeCutoverShadowEvidence(ledger, nextDay, { requireSingleRelease: false }).status).toBe('ok');
+      const late = new Date(Date.parse(NOW) + 2 * DAY_MS).toISOString();
+      expect(feed(ledger, late)).toEqual({ status: 'absent', reason: 'stale' });
     });
   });
 });

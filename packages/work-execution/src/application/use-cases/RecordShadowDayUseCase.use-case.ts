@@ -1192,7 +1192,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * attestation ledger plus the day's pinned release tree. Re-evaluated and
    * recorded on EVERY day with no "already passed" shortcut, because
    * `readCutoverShadowEvidence` requires all thirteen criteria to pass on
-   * each of the three consecutive days. The ledger read and the release
+   * the required shadow day. The ledger read and the release
    * inspection both go through `call`, so a reached deadline — before or
    * after the awaited value — aborts the whole run.
    *

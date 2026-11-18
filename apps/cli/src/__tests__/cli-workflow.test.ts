@@ -31,6 +31,7 @@ import {
   type FleetCliRuntime,
 } from '../composition.js';
 import { runCli, extractStateDirOption, type CliIo } from '../index.js';
+import { loadInstallation } from '@fleet/installation';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 
 /** Canonical decision bytes, written out here so the test pins the signed format independently. */
@@ -2390,5 +2391,179 @@ describe('the daemon composition reads the pinned key only from the installation
       }
       rmSync(daemonDir, { recursive: true, force: true });
     }
+  });
+
+  /**
+   * KEY0b fix round 3: drives the daemon branch's composition
+   * (index.ts ~879-893) for the three load results the brief names, with
+   * FLEET_OWNER_PUBLIC_KEY set to a REAL key and an approval signed with that
+   * env key's matching private key. In every case the load result must stop
+   * the env key from ever becoming the pinned key, so the resolve refuses as
+   * `owner-key-unpinned`, the env-signed approval is never verified, and
+   * nothing executes. The `prepare` callback writes the installation file and
+   * composes the runtime exactly as the daemon branch composes it for that
+   * load result.
+   */
+  async function daemonBranchUnpinnedCase(
+    grantId: string,
+    prepare: (daemonDir: string, stateDir: string) => Promise<FleetCliRuntime>,
+  ): Promise<void> {
+    const daemonDir = mkdtempSync(path.join(tmpdir(), 'fleet-daemon-key0b-'));
+    const stateDir = path.join(daemonDir, 'state');
+    mkdirSync(path.join(stateDir, 'decisions'), { recursive: true });
+
+    const originalInstallationFile = process.env.FLEET_INSTALLATION_FILE;
+    const originalOwnerKey = process.env.FLEET_OWNER_PUBLIC_KEY;
+    process.env.FLEET_OWNER_PUBLIC_KEY = envPair.publicKeyBase64;
+    try {
+      // Seed an awaiting request, the way the daemon would find one.
+      const seeder = createFleetCliRuntime({ stateDir });
+      const record: CoordinationRequestRecord = {
+        id: 'req-daemon-key0b',
+        projectId: PROJECT,
+        kind: 'action-decision',
+        state: 'awaiting-decision',
+        actionScope: SCOPE,
+        expectedHeadSha: HEAD,
+        proposalDigest: 'prop-1',
+        policyRevision: 'pol-1',
+        decisionRevision: null,
+        grantId: null,
+        consumptions: [],
+        acknowledgements: [],
+        deliveryStatus: 'pending',
+        deliveryGapReason: null,
+        revision: 1,
+        createdAtIso: '2026-11-18T10:00:00.000Z',
+        updatedAtIso: '2026-11-18T10:00:00.000Z',
+      };
+      await seeder.coordination.coordinationRequestRepository.saveRequest(record);
+
+      // An approval signed with the private half of the env keypair: under the
+      // old behaviour the env variable made this verify and authorize.
+      const signature = sign(null, canonicalDecisionBytes(decisionFields(grantId)), envPair.privateKey)
+        .toString('base64');
+      writeFileSync(
+        path.join(stateDir, 'decisions', 'req-daemon-key0b.json'),
+        `${JSON.stringify({ ...decisionFields(grantId), signature })}\n`,
+      );
+
+      const daemonRuntime = await prepare(daemonDir, stateDir);
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(
+        [
+          '--state-dir',
+          stateDir,
+          'coordination',
+          'resolve-auth',
+          '--json',
+          jsonArg({
+            projectId: PROJECT,
+            actionScope: SCOPE,
+            expectedHeadSha: HEAD,
+            attemptId: ATTEMPT,
+          }),
+        ],
+        { stdout: (text) => out.push(text), stderr: (text) => err.push(text) },
+        daemonRuntime,
+      );
+      // The env variable carries a real key and it signed the approval, yet
+      // the env key is NEVER an authority: the resolve stays blocked as
+      // unpinned.
+      expect(code).toBe(1);
+      expect(jsonOf({ code, text: out.join(''), stderr: err.join('') })).toEqual({
+        outcome: 'blocked',
+        reason: 'owner-key-unpinned',
+      });
+
+      // Nothing executed: no grant was issued and the record is untouched.
+      const after = await seeder.coordination.coordinationRequestRepository.findRequestByGrantId(grantId);
+      expect(after).toBeNull();
+      const stillAwaiting = await seeder.coordination.coordinationRequestRepository.listRequests(PROJECT);
+      expect(stillAwaiting).toHaveLength(1);
+      expect(stillAwaiting[0]?.state).toBe('awaiting-decision');
+      expect(stillAwaiting[0]?.grantId).toBeNull();
+      expect(stillAwaiting[0]?.consumptions).toHaveLength(0);
+    } finally {
+      if (originalInstallationFile !== undefined) {
+        process.env.FLEET_INSTALLATION_FILE = originalInstallationFile;
+      } else {
+        delete process.env.FLEET_INSTALLATION_FILE;
+      }
+      if (originalOwnerKey !== undefined) {
+        process.env.FLEET_OWNER_PUBLIC_KEY = originalOwnerKey;
+      } else {
+        delete process.env.FLEET_OWNER_PUBLIC_KEY;
+      }
+      rmSync(daemonDir, { recursive: true, force: true });
+    }
+  }
+
+  it('an invalid installation load result composes without a pinned key: the env-signed approval refuses as owner-key-unpinned and nothing executes', async () => {
+    await daemonBranchUnpinnedCase('grant-daemon-a', async (daemonDir, stateDir) => {
+      // (a) loadInstallation() returns `invalid`: malformed JSON.
+      const installationFile = path.join(daemonDir, 'fleet.json');
+      writeFileSync(installationFile, '{ not json\n', { mode: 0o600 });
+      process.env.FLEET_INSTALLATION_FILE = installationFile;
+      const loadResult = loadInstallation();
+      expect(loadResult.status).toBe('invalid');
+      // index.ts ~880: for an invalid load result the daemon branch composes
+      // WITHOUT an installation, so no pinned key exists at all.
+      return createFleetCliRuntime({
+        stateDir,
+        loadInstallationForMergePolicy: () => loadResult,
+        onOwnerKeyWarning: () => {},
+      });
+    });
+  });
+
+  it('an untrusted installation load result composes without a pinned key: the env-signed approval refuses as owner-key-unpinned and nothing executes', async () => {
+    await daemonBranchUnpinnedCase('grant-daemon-b', async (daemonDir, stateDir) => {
+      // (b) loadInstallation() returns `invalid` with
+      // `owner-key-installation-untrusted`: a group-writable installation file
+      // carrying an owner section.
+      const installationFile = path.join(daemonDir, 'fleet.json');
+      writeFileSync(
+        installationFile,
+        `${JSON.stringify({ schemaVersion: 1, owner: { publicKey: envPair.publicKeyBase64 } })}\n`,
+      );
+      chmodSync(installationFile, 0o664);
+      process.env.FLEET_INSTALLATION_FILE = installationFile;
+      const loadResult = loadInstallation();
+      expect(loadResult.status).toBe('invalid');
+      expect(loadResult.errors.join(' ')).toContain('owner-key-installation-untrusted');
+      // index.ts ~880: an untrusted load result is still `invalid`, so the
+      // daemon branch composes WITHOUT an installation and the untrusted
+      // file's owner key is never parsed as the pinned key.
+      return createFleetCliRuntime({
+        stateDir,
+        loadInstallationForMergePolicy: () => loadResult,
+        onOwnerKeyWarning: () => {},
+      });
+    });
+  });
+
+  it('a valid installation with NO owner section composes with no pinned key: the env-signed approval refuses as owner-key-unpinned and nothing executes', async () => {
+    await daemonBranchUnpinnedCase('grant-daemon-c', async (daemonDir, stateDir) => {
+      // (c) a valid installation file that carries NO owner section: the env
+      // variable is set, but there is no pinned key to compare it against.
+      const installationFile = path.join(daemonDir, 'fleet.json');
+      writeFileSync(installationFile, `${JSON.stringify({ schemaVersion: 1 })}\n`, { mode: 0o600 });
+      process.env.FLEET_INSTALLATION_FILE = installationFile;
+      const loadResult = loadInstallation();
+      expect(loadResult.status === 'invalid' ? loadResult.errors : []).toEqual([]);
+      if (loadResult.status === 'invalid') {
+        throw new Error('the no-owner installation file must load');
+      }
+      // index.ts ~887: a valid load result composes WITH the installation,
+      // whose owner section (and therefore pinned key) is absent.
+      return createFleetCliRuntime({
+        stateDir,
+        installation: loadResult.installation,
+        loadInstallationForMergePolicy: () => loadInstallation(),
+        onOwnerKeyWarning: () => {},
+      });
+    });
   });
 });

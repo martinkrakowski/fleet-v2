@@ -9,7 +9,11 @@
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { readExactPlainRecord, readPlainRecordWithOptionalKeys, snapshotPlainDataRecord } from './plain-record-reads.js';
-import { INITIAL_RECORD_SCHEMA_VERSION, readRecordSchemaVersion } from './record-schema-version.js';
+import {
+  INITIAL_RECORD_SCHEMA_VERSION,
+  isPlainRecordObject,
+  readRecordSchemaVersion,
+} from './record-schema-version.js';
 import {
   DAY_PATTERN,
   MAX_REVISION,
@@ -826,10 +830,12 @@ export const MAX_ATTESTATION_EVIDENCE_LENGTH = 256;
 export const MAX_ATTESTATION_AUTHORITY_LENGTH = 128;
 /** `operationId` becomes the journal key segment `cutover/attest@<operationId>`, so it respects `CUTOVER_KEY`'s 64-char SEGMENT. */
 export const MAX_ATTESTATION_OPERATION_ID_LENGTH = 64;
+/** `deadlineIso` is bounded so a malformed or oversized deadline is refused at the boundary. */
+export const MAX_ATTESTATION_DEADLINE_LENGTH = 64;
 
 const ATTESTATION_OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
-/** The keys `cutover shadow attest` accepts. No `nowIso`: the daemon clock supplies the timestamp, so a fact cannot be backdated. `deadlineIso` is passed through unvalidated; the use case owns it. */
+/** The keys `cutover shadow attest` accepts. No `nowIso`: the daemon clock supplies the timestamp, so a fact cannot be backdated. A present `deadlineIso` must be a bounded zoned ISO instant. */
 const COMMAND_KEYS: readonly string[] = ['fact', 'note', 'evidence', 'expectedRevision', 'operationId', 'authority', 'deadlineIso'];
 const COMMAND_REQUIRED_KEYS: readonly string[] = ['fact', 'note', 'expectedRevision', 'operationId'];
 
@@ -842,6 +848,8 @@ export interface ShadowAttestationCommandInput {
   readonly operationId: string;
   /** The caller's label. Absent or blank reads as `''`; the use case refuses `authority-required`. */
   readonly authority: string;
+  /** The caller's deadline, validated here; absent when the request carries none. */
+  readonly deadlineIso?: string;
 }
 
 export type ShadowAttestationCommandInputParse =
@@ -861,9 +869,11 @@ const COMMAND_INVALID: ShadowAttestationCommandInputParse = { ok: false, reason:
  * `Object.prototype`) and every over-cap string are refused before any field
  * is traversed. Cost: linear in the capped input; the caps are the named
  * constants `MAX_ATTESTATION_NOTE_LENGTH`, `MAX_ATTESTATION_EVIDENCE_LENGTH`,
- * `MAX_ATTESTATION_AUTHORITY_LENGTH`, `MAX_ATTESTATION_OPERATION_ID_LENGTH`
- * and `MAX_REVISION`, and the key set is capped at
- * `COMMAND_KEYS.length`. Never throws, never echoes an input value.
+ * `MAX_ATTESTATION_AUTHORITY_LENGTH`, `MAX_ATTESTATION_OPERATION_ID_LENGTH`,
+ * `MAX_ATTESTATION_DEADLINE_LENGTH` and `MAX_REVISION`, and the key set is
+ * capped at `COMMAND_KEYS.length` — the key count is read before any field is
+ * traversed, so an oversized object is refused without snapshotting a single
+ * field. Never throws, never echoes an input value.
  */
 export function parseShadowAttestationCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
   try {
@@ -874,6 +884,12 @@ export function parseShadowAttestationCommandInput(raw: unknown): ShadowAttestat
 }
 
 function parseCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
+  // The key count is read before any traversal: once the cheap plain-record
+  // shape check passes, an object carrying more own enumerable keys than the
+  // capped key set is refused without snapshotting a single field.
+  if (!isPlainRecordObject(raw) || Object.keys(raw).length > COMMAND_KEYS.length) {
+    return COMMAND_INVALID;
+  }
   const snapshot = snapshotPlainDataRecord(raw);
   if (snapshot === null) {
     return COMMAND_INVALID;
@@ -900,11 +916,15 @@ function parseCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
   if (!note.ok) {
     return note as ShadowAttestationCommandInputParse;
   }
-  if (snapshot['evidence'] !== undefined) {
-    const evidence = readBoundedCommandText(snapshot['evidence'], MAX_ATTESTATION_EVIDENCE_LENGTH);
-    if (!evidence.ok) {
-      return evidence as ShadowAttestationCommandInputParse;
+  // A present `evidence` key must carry a non-empty string: an own
+  // `evidence: undefined` is a present key with no value, not an absent one.
+  let evidence: string | undefined;
+  if (Object.hasOwn(snapshot, 'evidence')) {
+    const read = readBoundedCommandText(snapshot['evidence'], MAX_ATTESTATION_EVIDENCE_LENGTH);
+    if (!read.ok) {
+      return read as ShadowAttestationCommandInputParse;
     }
+    evidence = read.value;
   }
   // Authority is checked for presence and shape here, but a missing or blank
   // value passes through as `''`: the use case owns the `authority-required`
@@ -931,15 +951,28 @@ function parseCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
   if (typeof operationId !== 'string' || !ATTESTATION_OPERATION_ID_PATTERN.test(operationId)) {
     return COMMAND_INVALID;
   }
+  // The deadline is validated here so the use case never has to reach back
+  // into the raw request object: every field it reads comes from this
+  // snapshot, so no getter or Proxy `get` trap can run after parsing.
+  const deadlineIso = snapshot['deadlineIso'];
+  if (
+    deadlineIso !== undefined &&
+    (typeof deadlineIso !== 'string' ||
+      deadlineIso.length > MAX_ATTESTATION_DEADLINE_LENGTH ||
+      !isZonedIsoDateTime(deadlineIso))
+  ) {
+    return COMMAND_INVALID;
+  }
   return {
     ok: true,
     value: {
       fact: fact.value as ShadowAttestationFact,
       note: note.value,
-      ...(snapshot['evidence'] === undefined ? {} : { evidence: snapshot['evidence'] as string }),
+      ...(evidence === undefined ? {} : { evidence }),
       expectedRevision,
       operationId,
       authority,
+      ...(deadlineIso === undefined ? {} : { deadlineIso: deadlineIso as string }),
     },
   };
 }

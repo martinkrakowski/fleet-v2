@@ -347,6 +347,58 @@ describe('AttestShadowFactUseCase (AT1)', () => {
     });
   });
 
+  it('completes a crashed intent as attested (recovered) when the fact is already stored with a matching digest', async () => {
+    // Crash after the compare-and-set landed but before the completed result
+    // was appended: the intent has no result, the ledger holds the fact, and
+    // the stored revision (1) no longer equals the caller's expectation (0).
+    const { useCase: attest, deps } = useCase();
+    expect((await attest.execute(baseInput())).outcome).toBe('attested');
+    const writesAfterSave = deps.attestations.writes;
+    const resultIndex = deps.journal.entries.findIndex((entry) => entry.kind === 'result');
+    expect(resultIndex).toBeGreaterThanOrEqual(0);
+    deps.journal.entries.splice(resultIndex, 1);
+    const recovered = await attest.execute(baseInput());
+    expect(recovered.outcome).toBe('attested');
+    if (recovered.outcome !== 'attested') return;
+    expect(recovered.attestation.fact).toBe(FORGE);
+    expect(deps.attestations.writes).toBe(writesAfterSave);
+    const result = deps.journal.entries.find((entry) => entry.kind === 'result');
+    expect(result?.outcome).toBe('completed');
+    expect(result?.reasonCode).toBe('recovered');
+  });
+
+  it('reads every field from the parsed snapshot: a Proxy get trap on the request never runs', async () => {
+    const { useCase: attest } = useCase();
+    let getTraps = 0;
+    const target = baseInput({ deadlineIso: '2026-07-01T00:00:00.000Z' });
+    const request = new Proxy(target, {
+      get(inner, key, receiver) {
+        getTraps += 1;
+        return Reflect.get(inner, key, receiver);
+      },
+    });
+    const result = await attest.execute(request);
+    expect(result.outcome).toBe('attested');
+    expect(getTraps).toBe(0);
+  });
+
+  it('replays a completed unchanged operation as unchanged, carrying the stored outcome and reason', async () => {
+    const { useCase: attest, deps } = useCase();
+    deps.attestations.ledger = storedLedger([attestationFor(FORGE)]);
+    const first = await attest.execute(baseInput({ expectedRevision: 1 }));
+    expect(first.outcome).toBe('unchanged');
+    const second = await attest.execute(baseInput({ expectedRevision: 1 }));
+    expect(second.outcome).toBe('unchanged');
+    if (second.outcome !== 'unchanged' || first.outcome !== 'unchanged') return;
+    expect(second.ledger).toEqual(first.ledger);
+    expect(second.attestation).toEqual(first.attestation);
+    const result = deps.journal.entries.filter((entry) => entry.kind === 'result');
+    expect(result).toHaveLength(1);
+    expect(result[0]?.outcome).toBe('completed');
+    expect(result[0]?.reasonCode).toBe('unchanged');
+    expect(deps.attestations.writes).toBe(0);
+  });
+
   it('maps intent-after-result to journal-refused', async () => {
     const { useCase: attest, deps } = useCase();
     deps.journal.nextRefusal = 'intent-after-result';

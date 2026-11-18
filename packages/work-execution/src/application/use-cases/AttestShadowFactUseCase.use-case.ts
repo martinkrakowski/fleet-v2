@@ -37,8 +37,6 @@ export interface AttestShadowFactDependencies {
   readonly nowIso: () => string;
 }
 
-const MAX_ISO_LENGTH = 64;
-
 /** The canonical payload the intent digest and the attestation digest hash. `note`, `evidence` and `authority` live here only. */
 function canonicalAttestationPayload(input: {
   readonly fact: string;
@@ -86,10 +84,11 @@ export class AttestShadowFactUseCase implements AttestShadowFactPort {
       if (input.authority.trim() === '') {
         return refuse('authority-required');
       }
-      const deadlineIso = this.readDeadline(request);
-      if (deadlineIso === null) {
-        return refuse('invalid-input');
-      }
+      // Every field, including the deadline, is read from the parsed
+      // snapshot the domain parser produced, never from the raw request
+      // object: a Proxy `get` trap on the caller's input must never run
+      // after parsing.
+      const deadlineIso = input.deadlineIso;
       const digest = this.deps.computeDigest(canonicalAttestationPayload(input));
       const key = `cutover/attest@${input.operationId}`;
 
@@ -136,6 +135,26 @@ export class AttestShadowFactUseCase implements AttestShadowFactPort {
 
       const existing = current.ledger?.attestations.find((item) => item.fact === input.fact) ?? null;
       if (!written.changed) {
+        // Crash recovery: this operation's intent is durable but has no
+        // final result, and the ledger already holds this exact fact under
+        // this exact payload digest — the compare-and-set landed before the
+        // crash and only the result append was lost. The intent is completed
+        // as `attested` (`recovered`) without comparing revisions: the
+        // stored revision is the crashed call's own increment, not the
+        // caller's expectation, and the fact is already durably recorded.
+        if (intent !== null && existing !== null && existing.digest === digest) {
+          const resultFailure = await this.appendCompletedResult(
+            key,
+            digest,
+            'recovered',
+            recordedAtIso,
+            deadlineIso,
+          );
+          if (resultFailure !== null) {
+            return resultFailure;
+          }
+          return { outcome: 'attested', ledger: written.ledger, attestation: existing };
+        }
         // Sticky facts: a fact already recorded is never rewritten. The
         // caller's revision must still match the stored ledger (0 when
         // nothing is stored), exactly as a compare-and-set would demand; the
@@ -218,21 +237,6 @@ export class AttestShadowFactUseCase implements AttestShadowFactPort {
     }
   }
 
-  /** A syntactically valid `deadlineIso`, `undefined` when absent, or null when malformed. */
-  private readDeadline(request: unknown): string | null | undefined {
-    if (request === null || typeof request !== 'object') {
-      return undefined;
-    }
-    const value = (request as Record<string, unknown>)['deadlineIso'];
-    if (value === undefined) {
-      return undefined;
-    }
-    if (typeof value !== 'string' || value.length > MAX_ISO_LENGTH || !isZonedIsoDateTime(value)) {
-      return null;
-    }
-    return value;
-  }
-
   /** The current ledger, or the `unknown` result that stops the attestation. */
   private async readLedger(
     deadlineIso: string | undefined,
@@ -306,7 +310,7 @@ export class AttestShadowFactUseCase implements AttestShadowFactPort {
   private async appendCompletedResult(
     key: string,
     digest: string,
-    reasonCode: 'attested' | 'unchanged',
+    reasonCode: 'attested' | 'unchanged' | 'recovered',
     recordedAtIso: string,
     deadlineIso: string | undefined,
   ): Promise<AttestShadowFactResult | null> {
@@ -385,7 +389,9 @@ export class AttestShadowFactUseCase implements AttestShadowFactPort {
   /**
    * A prior final result under this exact key: a `refused` result stays
    * refused (`journal-refused` — a retry needs a new operation id); a
-   * `completed` result returns the stored record without writing. A
+   * `completed` result returns the stored record without writing, with the
+   * stored outcome (`attested`, `unchanged` or a `recovered` crash
+   * completion) carried through exactly as the journal recorded it. A
    * completed result whose fact is missing from the stored ledger is an
    * interrupted attestation this use case does not guess its way out of.
    */
@@ -409,6 +415,6 @@ export class AttestShadowFactUseCase implements AttestShadowFactPort {
     if (attestation === null) {
       return refuse('journal-incomplete');
     }
-    return { outcome: 'attested', ledger, attestation };
+    return { outcome: final.reasonCode === 'unchanged' ? 'unchanged' : 'attested', ledger, attestation };
   }
 }

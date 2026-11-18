@@ -1405,6 +1405,17 @@ describe('parseShadowAttestationCommandInput hostile input (AT1)', () => {
     expect(validParse(baseInputWith({ nowIso: '2026-06-15T00:00:00Z' }))).toEqual({ ok: false, reason: 'invalid-input' });
   });
 
+  it('refuses a present evidence key holding undefined with invalid-input', () => {
+    expect(validParse(baseInputWith({ evidence: undefined }))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses an object with more own keys than the capped key set before any traversal with invalid-input', () => {
+    // Nine own keys against a capped key set of eight: the count is read
+    // first, so no field is ever snapshotted.
+    const oversized: Record<string, unknown> = { ...VALID, extraA: 1, extraB: 2, extraC: 3, extraD: 4 };
+    expect(validParse(oversized)).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
   it('refuses an unknown fact id with unknown-fact', () => {
     expect(validParse(baseInputWith({ fact: 's9-unknown-fact' }))).toEqual({ ok: false, reason: 'unknown-fact' });
   });

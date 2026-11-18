@@ -155,6 +155,17 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     if (snapshot === null) {
       return { outcome: 'rejected', reason: 'a decision request requires a non-empty requestId' };
     }
+    // The reader copies `descriptor.value`, which is `undefined` for an
+    // accessor — the same value an explicitly-omitted optional field carries
+    // (`{ nowIso: undefined }`, as the CLI and HTTP boundaries send it). The
+    // two are told apart here, at snapshot time, by inspecting the own
+    // descriptors: descriptor inspection never runs a getter or a Proxy `get`
+    // trap, and no property of the input is read after the snapshot.
+    const nowIsoDescriptor = Object.getOwnPropertyDescriptor(input, 'nowIso');
+    const nowIsoIsAccessor = nowIsoDescriptor !== undefined && nowIsoDescriptor.get !== undefined;
+    const releaseRootDescriptor = Object.getOwnPropertyDescriptor(input, 'releaseRoot');
+    const releaseRootIsAccessor =
+      releaseRootDescriptor !== undefined && releaseRootDescriptor.get !== undefined;
     const request = snapshot as unknown as RequestScopedDecisionRequest;
     for (const field of ['requestId', 'projectId', 'actionScope', 'proposalDigest', 'policyRevision'] as const) {
       if (!isFilled(request[field])) {
@@ -188,13 +199,12 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
     // CO14 follow-up: a release decision may bind its grant to the release
     // root it names. A non-path-shaped, oversized or hostile root is a typed
     // rejection, never a record that matches every root.
-    // A present-but-unreadable `releaseRoot` (an accessor whose descriptor
-    // value collapses to `undefined`) fails closed as invalid, like every
-    // other malformed root; only a genuinely absent key is absent.
-    const releaseRoot =
-      'releaseRoot' in snapshot && snapshot.releaseRoot === undefined
-        ? ({ state: 'invalid' } as const)
-        : readReleaseRoot(request);
+    // A present-but-unreadable `releaseRoot` (an accessor) fails closed as
+    // invalid, like every other malformed root; an explicit `undefined` data
+    // value is an omitted optional field, so it stays absent (as on main).
+    const releaseRoot = releaseRootIsAccessor
+      ? ({ state: 'invalid' } as const)
+      : readReleaseRoot(request);
     if (releaseRoot.state === 'invalid') {
       return {
         outcome: 'rejected',
@@ -223,10 +233,14 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       };
     }
     // The composition root supplies the clock; no authority depends on it here.
-    // A present-but-unreadable `nowIso` (an accessor whose descriptor value
-    // collapses to `undefined`, or a non-string) is a typed refusal, never a
-    // live property read off the request or a silent clock fallback.
-    if (!isFilled(request.nowIso) && 'nowIso' in snapshot) {
+    // An unreadable `nowIso` (an accessor, or a present non-string data value)
+    // is a typed refusal, never a live property read off the request or a
+    // silent clock fallback; an explicit `undefined` data value is an omitted
+    // optional field and falls back to the clock, exactly as on main.
+    if (
+      nowIsoIsAccessor ||
+      (!isFilled(request.nowIso) && nowIsoDescriptor !== undefined && nowIsoDescriptor.value !== undefined)
+    ) {
       return { outcome: 'rejected', reason: 'a decision request nowIso must be a non-empty string when given' };
     }
     const nowIso = isFilled(request.nowIso) ? request.nowIso : new Date().toISOString();

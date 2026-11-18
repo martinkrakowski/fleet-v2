@@ -8,7 +8,7 @@
 // returns a typed refusal.
 
 import { isZonedIsoDateTime } from './conductor-halt.js';
-import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
+import { readExactPlainRecord, readPlainRecordWithOptionalKeys, snapshotPlainDataRecord } from './plain-record-reads.js';
 import { INITIAL_RECORD_SCHEMA_VERSION, readRecordSchemaVersion } from './record-schema-version.js';
 import {
   DAY_PATTERN,
@@ -811,4 +811,158 @@ function failRank(reason: string): number {
     return ABSENT_RANK;
   }
   return QUARANTINE_RANK;
+}
+
+// Lane AT1: the command-input boundary for `cutover shadow attest`. The
+// operator's flags arrive as one unknown; this parser is the pure gate the
+// use case (and, transitively, the CLI) shares. It validates shape and
+// bounds only — the use case owns the ledger, journal and clock semantics.
+
+/** `note` is bounded so the hashed digest stays over a bounded input. */
+export const MAX_ATTESTATION_NOTE_LENGTH = 512;
+/** `evidence` is optional and bounded. */
+export const MAX_ATTESTATION_EVIDENCE_LENGTH = 256;
+/** `authority` is a bounded label; it is hashed, never stored. */
+export const MAX_ATTESTATION_AUTHORITY_LENGTH = 128;
+/** `operationId` becomes the journal key segment `cutover/attest@<operationId>`, so it respects `CUTOVER_KEY`'s 64-char SEGMENT. */
+export const MAX_ATTESTATION_OPERATION_ID_LENGTH = 64;
+
+const ATTESTATION_OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/** The keys `cutover shadow attest` accepts. No `nowIso`: the daemon clock supplies the timestamp, so a fact cannot be backdated. `deadlineIso` is passed through unvalidated; the use case owns it. */
+const COMMAND_KEYS: readonly string[] = ['fact', 'note', 'evidence', 'expectedRevision', 'operationId', 'authority', 'deadlineIso'];
+const COMMAND_REQUIRED_KEYS: readonly string[] = ['fact', 'note', 'expectedRevision', 'operationId'];
+
+export interface ShadowAttestationCommandInput {
+  readonly fact: ShadowAttestationFact;
+  readonly note: string;
+  readonly evidence?: string;
+  /** Safe integer in `[0, MAX_REVISION]`. */
+  readonly expectedRevision: number;
+  readonly operationId: string;
+  /** The caller's label. Absent or blank reads as `''`; the use case refuses `authority-required`. */
+  readonly authority: string;
+}
+
+export type ShadowAttestationCommandInputParse =
+  | { readonly ok: true; readonly value: ShadowAttestationCommandInput }
+  | { readonly ok: false; readonly reason: 'invalid-input' | 'unknown-fact' | 'secret-shaped' };
+
+const COMMAND_INVALID: ShadowAttestationCommandInputParse = { ok: false, reason: 'invalid-input' };
+
+/**
+ * Parse one `cutover shadow attest` request. Own enumerable data properties
+ * only, read through `snapshotPlainDataRecord` (`Reflect.ownKeys` plus each
+ * key's own descriptor), so no getter ever runs and a Proxy stand-in either
+ * is refused by the plain-record checks or yields exactly the result of the
+ * plain data it wraps. `__proto__`, `constructor` and `prototype` own keys
+ * are outside `COMMAND_KEYS` and refused. A non-plain object (including an
+ * array, a class instance or a Proxy whose prototype is not
+ * `Object.prototype`) and every over-cap string are refused before any field
+ * is traversed. Cost: linear in the capped input; the caps are the named
+ * constants `MAX_ATTESTATION_NOTE_LENGTH`, `MAX_ATTESTATION_EVIDENCE_LENGTH`,
+ * `MAX_ATTESTATION_AUTHORITY_LENGTH`, `MAX_ATTESTATION_OPERATION_ID_LENGTH`
+ * and `MAX_REVISION`, and the key set is capped at
+ * `COMMAND_KEYS.length`. Never throws, never echoes an input value.
+ */
+export function parseShadowAttestationCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
+  try {
+    return parseCommandInput(raw);
+  } catch {
+    return COMMAND_INVALID;
+  }
+}
+
+function parseCommandInput(raw: unknown): ShadowAttestationCommandInputParse {
+  const snapshot = snapshotPlainDataRecord(raw);
+  if (snapshot === null) {
+    return COMMAND_INVALID;
+  }
+  const keys = Object.keys(snapshot);
+  if (keys.length > COMMAND_KEYS.length) {
+    return COMMAND_INVALID;
+  }
+  for (const key of keys) {
+    if (!COMMAND_KEYS.includes(key)) {
+      return COMMAND_INVALID;
+    }
+  }
+  for (const key of COMMAND_REQUIRED_KEYS) {
+    if (!Object.hasOwn(snapshot, key)) {
+      return COMMAND_INVALID;
+    }
+  }
+  const fact = readCommandFact(snapshot['fact']);
+  if (!fact.ok) {
+    return fact as ShadowAttestationCommandInputParse;
+  }
+  const note = readBoundedCommandText(snapshot['note'], MAX_ATTESTATION_NOTE_LENGTH);
+  if (!note.ok) {
+    return note as ShadowAttestationCommandInputParse;
+  }
+  if (snapshot['evidence'] !== undefined) {
+    const evidence = readBoundedCommandText(snapshot['evidence'], MAX_ATTESTATION_EVIDENCE_LENGTH);
+    if (!evidence.ok) {
+      return evidence as ShadowAttestationCommandInputParse;
+    }
+  }
+  // Authority is checked for presence and shape here, but a missing or blank
+  // value passes through as `''`: the use case owns the `authority-required`
+  // refusal, so the CLI can hand the flag through and still get the typed
+  // exit-1 refusal rather than a usage error.
+  let authority = '';
+  if (snapshot['authority'] !== undefined) {
+    const read = readBoundedCommandText(snapshot['authority'], MAX_ATTESTATION_AUTHORITY_LENGTH);
+    if (!read.ok) {
+      return read;
+    }
+    authority = read.value;
+  }
+  const expectedRevision = snapshot['expectedRevision'];
+  if (
+    typeof expectedRevision !== 'number' ||
+    !Number.isSafeInteger(expectedRevision) ||
+    expectedRevision < 0 ||
+    expectedRevision > MAX_REVISION
+  ) {
+    return COMMAND_INVALID;
+  }
+  const operationId = snapshot['operationId'];
+  if (typeof operationId !== 'string' || !ATTESTATION_OPERATION_ID_PATTERN.test(operationId)) {
+    return COMMAND_INVALID;
+  }
+  return {
+    ok: true,
+    value: {
+      fact: fact.value as ShadowAttestationFact,
+      note: note.value,
+      ...(snapshot['evidence'] === undefined ? {} : { evidence: snapshot['evidence'] as string }),
+      expectedRevision,
+      operationId,
+      authority,
+    },
+  };
+}
+
+type CommandFieldRead =
+  | { readonly ok: true; readonly value: string }
+  | { readonly ok: false; readonly reason: 'invalid-input' | 'secret-shaped' | 'unknown-fact' };
+
+/** The fact id, or `unknown-fact` when it is not one of `SHADOW_ATTESTATION_FACTS`. Cost: O(1). */
+function readCommandFact(value: unknown): CommandFieldRead {
+  if (typeof value !== 'string' || factIndex(value) === null) {
+    return { ok: false, reason: 'unknown-fact' };
+  }
+  return { ok: true, value };
+}
+
+/** A non-empty string within `cap` that carries no secret shape. Cost: linear in the capped string. */
+function readBoundedCommandText(value: unknown, cap: number): CommandFieldRead {
+  if (typeof value !== 'string' || value.length === 0 || value.length > cap) {
+    return { ok: false, reason: 'invalid-input' };
+  }
+  if (isSecretShaped(value)) {
+    return { ok: false, reason: 'secret-shaped' };
+  }
+  return { ok: true, value };
 }

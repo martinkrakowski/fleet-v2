@@ -4,6 +4,7 @@ export * from "./AdoptLanePort.in-port.js";
 export * from "./AdvanceLaneRunPort.in-port.js";
 export * from "./AppendScorecardPort.in-port.js";
 export * from "./ApplyRelaunchPort.in-port.js";
+export * from "./AttestShadowFactPort.in-port.js";
 export * from "./AuthorBriefPort.in-port.js";
 export * from "./AutoMergeAttemptPort.in-port.js";
 export * from "./BuildFactPackPort.in-port.js";

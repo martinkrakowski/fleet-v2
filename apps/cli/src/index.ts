@@ -754,6 +754,7 @@ Commands:
   release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
   cutover shadow record-day --repository owner/repo --legacy-state-dir <path> [--day YYYY-MM-DD]
+  cutover shadow attest --fact <id> --note <text> --expected-revision <n> --operation-id <id> --authority <label> [--evidence <text>] [--deadline-iso <iso>]
   cutover switch --expected-revision <n> --operation-id <id> --relaunch-plan-digest <64 hex> [--now-iso <iso>] [--deadline-iso <iso>]
   cutover retire --expected-revision <n> --operation-id <id> [--now-iso <iso>] [--deadline-iso <iso>]
   lane diff-check <worktree> --allowed-path-prefixes '<json array>' [--base <value>]

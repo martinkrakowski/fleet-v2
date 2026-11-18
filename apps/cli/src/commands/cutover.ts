@@ -25,6 +25,7 @@ import {
   isMergeQueueEntryLive,
   parseLegacyTrainParkedQueue,
   parseLegacyTrainQueue,
+  SHADOW_ATTESTATION_FACTS,
   SHADOW_FACTS_WARN_RUNS,
   type LegacyTrainQueueLine,
 } from '@fleet/work-execution';
@@ -180,6 +181,70 @@ async function recordShadowDayHandler(
     }
   }
   return result;
+}
+
+/**
+ * AT1: `cutover shadow attest`. Flags: `--fact`, `--note`, `[--evidence]`,
+ * `--expected-revision`, `--operation-id`, `[--authority]`,
+ * `[--deadline-iso]`. There is deliberately no `--now-iso`: the daemon clock
+ * supplies the timestamp, so a fact cannot be backdated. Unknown `--fact`,
+ * a missing/malformed `--note`, `--expected-revision` or `--operation-id`
+ * are usage errors (exit 2); a missing or blank `--authority` is passed
+ * through so the use case refuses with `authority-required` (exit 1). The
+ * use case's result is returned UNCHANGED: `attested` and `unchanged`
+ * complete (0), every other outcome exits 1.
+ */
+const ATTEST_OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+async function attestShadowFactHandler(payload: Payload, runtime: CutoverRuntime): Promise<unknown> {
+  rejectUnexpectedInput(
+    payload,
+    'shadow attest',
+    ['fact', 'note', 'evidence', 'expectedRevision', 'operationId', 'authority', 'deadlineIso'],
+    1,
+  );
+  const fact = payload['fact'];
+  if (typeof fact !== 'string' || !(SHADOW_ATTESTATION_FACTS as readonly string[]).includes(fact)) {
+    throw new CliUsageError(
+      `cutover shadow attest requires --fact as one of: ${SHADOW_ATTESTATION_FACTS.join(', ')}`,
+    );
+  }
+  const note = payload['note'];
+  if (typeof note !== 'string' || note.trim() === '') {
+    throw new CliUsageError('cutover shadow attest requires --note');
+  }
+  const evidence = payload['evidence'];
+  if (evidence !== undefined && (typeof evidence !== 'string' || evidence.trim() === '')) {
+    throw new CliUsageError('--evidence requires a value');
+  }
+  const expectedRevision = revisionFromFlagValue(payload['expectedRevision'], /^\d{1,10}$/);
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision > 1_000_000_000) {
+    throw new CliUsageError('cutover shadow attest requires --expected-revision as a non-negative integer');
+  }
+  const operationId = payload['operationId'];
+  if (typeof operationId !== 'string' || !ATTEST_OPERATION_ID_PATTERN.test(operationId)) {
+    throw new CliUsageError(
+      'cutover shadow attest requires --operation-id as 1-64 characters of letters, digits, dots, underscores or dashes, starting with a letter or digit',
+    );
+  }
+  const authority = payload['authority'];
+  if (authority !== undefined && typeof authority !== 'string') {
+    throw new CliUsageError('--authority requires a value');
+  }
+  const deadlineIso = optionalIsoFlag(payload, 'deadlineIso', 'deadline-iso');
+  const attestShadowFact = runtime.execution.attestShadowFact;
+  if (attestShadowFact === undefined) {
+    return { outcome: 'refused', reason: 'state-dir-required' };
+  }
+  return attestShadowFact.execute({
+    fact,
+    note,
+    ...(evidence === undefined ? {} : { evidence }),
+    expectedRevision,
+    operationId,
+    ...(authority === undefined ? {} : { authority }),
+    ...(deadlineIso === undefined ? {} : { deadlineIso }),
+  });
 }
 
 /** Reads the shared flags of a revisioned move and runs it; the use case result is returned unchanged. */
@@ -393,15 +458,18 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
 
   shadow: async (payload, runtime, io) => {
     const sub = firstPositional(payload);
-    if (sub !== 'report' && sub !== 'record-day') {
+    if (sub !== 'report' && sub !== 'record-day' && sub !== 'attest') {
       throw new CliUsageError(
         sub === ''
-          ? 'cutover shadow requires a subcommand: fleet-v2 cutover shadow report or fleet-v2 cutover shadow record-day'
-          : 'cutover shadow has no such subcommand: the two shadow subcommands are report and record-day',
+          ? 'cutover shadow requires a subcommand: fleet-v2 cutover shadow report, fleet-v2 cutover shadow record-day or fleet-v2 cutover shadow attest'
+          : 'cutover shadow has no such subcommand: the shadow subcommands are report, record-day and attest',
       );
     }
     if (sub === 'record-day') {
       return recordShadowDayHandler(payload, runtime, io);
+    }
+    if (sub === 'attest') {
+      return attestShadowFactHandler(payload, runtime);
     }
     return reportShadowHandler(payload, runtime);
   },

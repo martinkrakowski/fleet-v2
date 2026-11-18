@@ -11,8 +11,10 @@ import {
   SHADOW_ONE_TIME_MAX_TESTS,
   SHADOW_ONE_TIME_REQUIREMENTS,
   evaluateShadowOneTimeCriteria,
+  parseShadowAttestationCommandInput,
   readShadowAttestations,
   recordShadowAttestation,
+  type ShadowAttestationCommandInputParse,
   type ShadowAttestationLedger,
   type ShadowAttestationRead,
   type ShadowAttestationWrite,
@@ -1291,3 +1293,154 @@ describe('evaluateShadowOneTimeCriteria (SH15b)', () => {
     expect(Object.getOwnPropertyDescriptor(Object.prototype, 'polluted')).toBeUndefined();
   });
 });
+
+// Lane AT1: hostile-input tests for `parseShadowAttestationCommandInput`.
+// Every case asserts the specific refusal code, never merely that nothing
+// threw.
+describe('parseShadowAttestationCommandInput hostile input (AT1)', () => {
+  const VALID: Record<string, unknown> = {
+    fact: 's2-forge-error-backoff',
+    note: 'verified',
+    expectedRevision: 0,
+    operationId: 'op-1',
+    authority: 'ops-lead-7',
+  };
+
+  function validParse(raw: unknown): ShadowAttestationCommandInputParse {
+    return parseShadowAttestationCommandInput(raw);
+  }
+
+  it('accepts the valid command input and echoes none of it back', () => {
+    const parsed = validParse(VALID);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value).toEqual({
+      fact: 's2-forge-error-backoff',
+      note: 'verified',
+      expectedRevision: 0,
+      operationId: 'op-1',
+      authority: 'ops-lead-7',
+    });
+    expect(parsed.value).not.toBe(VALID);
+  });
+
+  it('refuses null with invalid-input', () => {
+    expect(validParse(null)).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses undefined with invalid-input', () => {
+    expect(validParse(undefined)).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses a wrong primitive (a number where the command object is due) with invalid-input', () => {
+    expect(validParse(7)).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(validParse(baseInputWith({ note: 42 }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(validParse(baseInputWith({ expectedRevision: '0' }))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses a non-iterable object where a list is due (an array root) with invalid-input', () => {
+    expect(validParse([VALID])).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses a sparse array root (a hole) with invalid-input', () => {
+    const sparse: unknown[] = new Array(3);
+    sparse[1] = VALID;
+    expect(validParse(sparse)).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses an array-like object with invalid-input', () => {
+    expect(validParse({ length: 1, 0: VALID })).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses an enormous sparse length before any traversal with invalid-input', () => {
+    const enormous: unknown[] = [];
+    Object.defineProperty(enormous, 'length', { value: 2 ** 32 - 1 });
+    expect(validParse(enormous)).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('never runs a getter on the root or on a value (the counter stays 0)', () => {
+    let calls = 0;
+    const input: Record<string, unknown> = {
+      ...VALID,
+      get note(): string {
+        calls += 1;
+        return 'never';
+      },
+    };
+    const parsed = validParse(input);
+    expect(parsed).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(calls).toBe(0);
+  });
+
+  it('accepts a Proxy over a valid input as exactly the plain data, with no get trap run', () => {
+    let getTraps = 0;
+    const proxy = new Proxy({ ...VALID }, {
+      get(target, key, receiver) {
+        getTraps += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const parsed = validParse(proxy);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.fact).toBe('s2-forge-error-backoff');
+    expect(getTraps).toBe(0);
+  });
+
+  it('refuses prototype-polluting constructor and prototype keys produced by JSON.parse with invalid-input', () => {
+    for (const key of ['__proto__', 'constructor', 'prototype']) {
+      const raw = JSON.parse(`{"${key}":{"polluted":true},"fact":"s2-forge-error-backoff","note":"n","expectedRevision":0,"operationId":"op-1","authority":"a"}`);
+      expect(validParse(raw)).toEqual({ ok: false, reason: 'invalid-input' });
+    }
+    expect(Object.getOwnPropertyDescriptor(Object.prototype, 'polluted')).toBeUndefined();
+  });
+
+  it('refuses a missing optional field only when a present one is malformed, and an over-cap note with invalid-input', () => {
+    expect(validParse(baseInputWith({ note: 'x'.repeat(513) }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(validParse(baseInputWith({ evidence: '' }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(validParse(baseInputWith({ evidence: 'x'.repeat(257) }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(validParse(baseInputWith({ authority: 'x'.repeat(129) }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(validParse(baseInputWith({ operationId: 'x'.repeat(65) }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(validParse(baseInputWith({ expectedRevision: 1.5 }))).toEqual({ ok: false, reason: 'invalid-input' });
+    expect(validParse(baseInputWith({ nowIso: '2026-06-15T00:00:00Z' }))).toEqual({ ok: false, reason: 'invalid-input' });
+  });
+
+  it('refuses an unknown fact id with unknown-fact', () => {
+    expect(validParse(baseInputWith({ fact: 's9-unknown-fact' }))).toEqual({ ok: false, reason: 'unknown-fact' });
+  });
+
+  it('refuses secret-shaped note, evidence and authority with secret-shaped', () => {
+    expect(validParse(baseInputWith({ note: SECRET_TEXT }))).toEqual({ ok: false, reason: 'secret-shaped' });
+    expect(validParse(baseInputWith({ evidence: SECRET_TEXT }))).toEqual({ ok: false, reason: 'secret-shaped' });
+    expect(validParse(baseInputWith({ authority: SECRET_TEXT }))).toEqual({ ok: false, reason: 'secret-shaped' });
+  });
+
+  it('is not a constant verdict: different inputs give different typed results', () => {
+    // A parser that always returned { ok: false, reason: 'invalid-input' }
+    // would fail the valid case; one that always refused with one code would
+    // fail the unknown-fact and secret-shaped cases above.
+    expect(validParse(VALID).ok).toBe(true);
+    expect(validParse(baseInputWith({ fact: 'nope' }))).toEqual({ ok: false, reason: 'unknown-fact' });
+    expect(validParse(baseInputWith({ note: SECRET_TEXT }))).toEqual({ ok: false, reason: 'secret-shaped' });
+  });
+
+  it('is not an identity echo: the parsed value is a fresh, typed structure', () => {
+    const parsed = validParse(VALID);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value).not.toBe(VALID);
+    expect(Object.keys(parsed.value).sort()).toEqual(['authority', 'expectedRevision', 'fact', 'note', 'operationId']);
+    expect('deadlineIso' in parsed.value).toBe(false);
+  });
+});
+
+function baseInputWith(overrides: Record<string, unknown>): Record<string, unknown> {
+  return {
+    fact: 's2-forge-error-backoff',
+    note: 'verified',
+    expectedRevision: 0,
+    operationId: 'op-1',
+    authority: 'ops-lead-7',
+    ...overrides,
+  };
+}

@@ -256,8 +256,17 @@ function judgeDayTickHealth(input: unknown): ShadowTickHealthEvaluation {
   return judgeTickHealth(jobEvents, day);
 }
 
-/** The S12 rules, over already-validated job events. All three counts are computed before any verdict return. */
-function judgeTickHealth(jobEvents: readonly DaemonEventRecord[], day: string): ShadowTickHealthEvaluation {
+/** The per-day tallies `judgeTickHealth` needs before any verdict. */
+interface TickHealthTallies {
+  readonly inDayTicks: Set<string>;
+  readonly overBudgetTicks: Set<string>;
+  readonly byJob: Map<string, JobSequence[]>;
+  /** Every in-day tick instant, ascending, for the coverage checks. */
+  readonly inDayTimestamps: number[];
+}
+
+/** Collect the day's tick ids, over-budget tick ids, per-job sequences and ascending in-day instants. */
+function collectDayJobTicks(jobEvents: readonly DaemonEventRecord[], day: string): TickHealthTallies {
   const inDayTicks = new Set<string>();
   const overBudgetTicks = new Set<string>();
   const byJob = new Map<string, JobSequence[]>();
@@ -274,13 +283,22 @@ function judgeTickHealth(jobEvents: readonly DaemonEventRecord[], day: string): 
     pushJobEvent(byJob, event, day);
   }
   inDayTimestamps.sort((a, b) => a - b);
-  const totalTicks = inDayTicks.size;
+  return { inDayTicks, overBudgetTicks, byJob, inDayTimestamps };
+}
+
+/** In-day ticks that carried a `budget-exhausted` job. */
+function countDayBudgetOverruns(inDayTicks: ReadonlySet<string>, overBudgetTicks: ReadonlySet<string>): number {
   let budgetOverruns = 0;
   for (const tickId of overBudgetTicks) {
     if (inDayTicks.has(tickId)) {
       budgetOverruns += 1;
     }
   }
+  return budgetOverruns;
+}
+
+/** Jobs whose time-ordered sequence carries a starved run touching the day. */
+function countStarvedJobs(byJob: ReadonlyMap<string, JobSequence[]>): number {
   let starvedJobs = 0;
   for (const sequence of byJob.values()) {
     sequence.sort((a, b) => (a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : 0));
@@ -288,24 +306,47 @@ function judgeTickHealth(jobEvents: readonly DaemonEventRecord[], day: string): 
       starvedJobs += 1;
     }
   }
-  const counts: TickHealthCounts = { totalTicks, budgetOverruns, starvedJobs };
-  if (totalTicks < SHADOW_MIN_TICKS_PER_DAY) {
-    return withTickHealthCounts(FAIL('too-few-ticks'), counts);
-  }
-  // OD7a3: the day's last in-day tick must fall within the grace window of
-  // day end (the exact boundary `dayEndMs - SHADOW_LAST_TICK_GRACE_MS`
-  // passes). A dead daemon leaves the tail of the day unticked.
+  return starvedJobs;
+}
+
+/**
+ * The three S12 counts, from the collected tallies. As in the original
+ * single loop, all three are computed before any verdict is chosen.
+ */
+function tickHealthCounts(tallies: TickHealthTallies): TickHealthCounts {
+  return {
+    totalTicks: tallies.inDayTicks.size,
+    budgetOverruns: countDayBudgetOverruns(tallies.inDayTicks, tallies.overBudgetTicks),
+    starvedJobs: countStarvedJobs(tallies.byJob),
+  };
+}
+
+/**
+ * The day's last in-day tick must fall within the grace window of day end
+ * (the exact boundary `dayEndMs - SHADOW_LAST_TICK_GRACE_MS` passes). A dead
+ * daemon leaves the tail of the day unticked. Returns the failing reason, or
+ * null when the coverage of the day's close is acceptable.
+ */
+function lastTickVerdict(inDayTimestamps: readonly number[], day: string): string | null {
   const dayStartMs = Date.parse(`${day}T00:00:00.000Z`);
   const dayEndMs = dayStartMs + 24 * 60 * 60 * 1_000;
   if (inDayTimestamps.length === 0 || inDayTimestamps[inDayTimestamps.length - 1] < dayEndMs - SHADOW_LAST_TICK_GRACE_MS) {
-    return withTickHealthCounts(FAIL('late-last-tick'), counts);
+    return 'late-last-tick';
   }
-  // OD7a3: the day must be continuously covered — the largest hole from day
-  // start to the first tick, between consecutive ticks, and from the last
-  // tick to day end must not exceed `SHADOW_MAX_TICK_GAP_MS` (the exact
-  // boundary `=== SHADOW_MAX_TICK_GAP_MS` passes). Paused ticks emit
-  // `jobs: []`, so a pause longer than this limit fails the day here (see
-  // the policy note on the constant).
+  return null;
+}
+
+/**
+ * The day must be continuously covered — the largest hole from day start to
+ * the first tick, between consecutive ticks, and from the last tick to day
+ * end must not exceed `SHADOW_MAX_TICK_GAP_MS` (the exact boundary
+ * `=== SHADOW_MAX_TICK_GAP_MS` passes). Paused ticks emit `jobs: []`, so a
+ * pause longer than this limit fails the day here (see the policy note on
+ * the constant). Returns the failing reason, or null when the gaps hold.
+ */
+function maxGapVerdict(inDayTimestamps: readonly number[], day: string): string | null {
+  const dayStartMs = Date.parse(`${day}T00:00:00.000Z`);
+  const dayEndMs = dayStartMs + 24 * 60 * 60 * 1_000;
   let maxGapMs = inDayTimestamps[0] - dayStartMs;
   for (let index = 1; index < inDayTimestamps.length; index += 1) {
     const gap = inDayTimestamps[index] - inDayTimestamps[index - 1];
@@ -318,12 +359,34 @@ function judgeTickHealth(jobEvents: readonly DaemonEventRecord[], day: string): 
     maxGapMs = tailGap;
   }
   if (maxGapMs > SHADOW_MAX_TICK_GAP_MS) {
-    return withTickHealthCounts(FAIL('coverage-gap'), counts);
+    return 'coverage-gap';
   }
-  if (budgetOverruns * 100 > totalTicks) {
+  return null;
+}
+
+/** The S12 rules, over already-validated job events. All three counts are computed before any verdict return. */
+function judgeTickHealth(jobEvents: readonly DaemonEventRecord[], day: string): ShadowTickHealthEvaluation {
+  const tallies = collectDayJobTicks(jobEvents, day);
+  const counts = tickHealthCounts(tallies);
+  if (counts.totalTicks < SHADOW_MIN_TICKS_PER_DAY) {
+    return withTickHealthCounts(FAIL('too-few-ticks'), counts);
+  }
+  // OD7a3: the day's last in-day tick must fall within the grace window of
+  // day end (the exact boundary `dayEndMs - SHADOW_LAST_TICK_GRACE_MS`
+  // passes). A dead daemon leaves the tail of the day unticked.
+  const lastTick = lastTickVerdict(tallies.inDayTimestamps, day);
+  if (lastTick !== null) {
+    return withTickHealthCounts(FAIL(lastTick), counts);
+  }
+  // OD7a3: the day must be continuously covered — see `maxGapVerdict`.
+  const maxGap = maxGapVerdict(tallies.inDayTimestamps, day);
+  if (maxGap !== null) {
+    return withTickHealthCounts(FAIL(maxGap), counts);
+  }
+  if (counts.budgetOverruns * 100 > counts.totalTicks) {
     return withTickHealthCounts(FAIL('tick-budget-overrun'), counts);
   }
-  if (starvedJobs > 0) {
+  if (counts.starvedJobs > 0) {
     return withTickHealthCounts(FAIL('job-starved'), counts);
   }
   return withTickHealthCounts(PASS('ticks-within-budget'), counts);

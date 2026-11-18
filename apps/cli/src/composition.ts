@@ -144,6 +144,7 @@ import {
   type ListMergeQueueUseCase,
   ImportTrainStateUseCase,
   type LegacyTrainStateReadAdapter,
+  type LaneRunRepositoryPort,
   MergeQueueRepositoryAdapter,
   type ForgeActionDelegate,
   type GhInvocationResult,
@@ -883,6 +884,8 @@ export interface FleetCliRuntime {
     readonly manageCutover: ManageCutoverUseCase;
     /** SH8a: the shadow day-writer behind `cutover shadow record-day`; undefined without a durable state directory. */
     readonly recordShadowDay?: RecordShadowDayUseCase;
+    /** RC1: the read-only lane-run reader record-day's early warning reads; the same instance `conducted.facts.runs` uses, undefined when conducted is not wired or not durable. */
+    readonly shadowRunsRead?: Pick<LaneRunRepositoryPort, 'list'>;
     /** CO24comp: PR-feedback fix round preparation and grant-scoped push-to-pr. */
     readonly preparePullRequestFeedbackFix: PreparePullRequestFeedbackFixUseCase;
     /** OG-8b: the operator-only review thread helper; bound in forge mode github only, never given to the daemon. */
@@ -1638,6 +1641,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // only: without a state directory there is no ledger to write and no fleet
   // stores to check, so the use case stays undefined exactly like every other
   // durable-only use case in this composition (in-memory mode is disposable).
+  // RC1: the same SH19c read-only lane-run reader `conducted.facts.runs`
+  // binds — one instance, never a second adapter or writable handle — also
+  // exposed on the runtime so `recordShadowDayHandler` can read the store's
+  // run count for the early warning. Undefined without a durable state
+  // directory or a conducted (github forge) repository.
+  const shadowRunsRead: LaneRunRepositoryAdapter | undefined =
+    durableCutover && stateDir !== undefined && stateDir.trim().length > 0 && forgeGithubSection !== undefined
+      ? new LaneRunRepositoryAdapter({ stateDir, readOnly: true })
+      : undefined;
   const recordShadowDay =
     durableCutover && stateDir !== undefined && stateDir.trim().length > 0
       ? (() => {
@@ -1713,7 +1725,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
             conducted: {
               repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo },
               facts: {
-                runs: new LaneRunRepositoryAdapter({ stateDir, readOnly: true }),
+                // RC1: the gated spread above guarantees the wired reader here.
+                runs: shadowRunsRead!,
                 journal: new LaneRunJournalAdapter({ stateDir, readOnly: true }),
                 attempts: new AttemptRepositoryAdapter({ stateDir, readOnly: true }),
                 receipts: telemetry.acceptanceReceiptRead,
@@ -1776,6 +1789,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
       preparePullRequestFeedbackFix,
       /** SH8a: `cutover shadow record-day`; undefined without a durable state directory. */
       ...(recordShadowDay !== undefined ? { recordShadowDay } : {}),
+      /** RC1: the same read-only lane-run reader `conducted.facts.runs` uses, for record-day's early warning; undefined when conducted is not wired or the composition is not durable. */
+      ...(recordShadowDay !== undefined && shadowRunsRead !== undefined ? { shadowRunsRead } : {}),
       reviewThreadHelper,
       exportLegacyTrainState: new ExportLegacyTrainStateUseCase({
         listMergeQueue: execution.listMergeQueue,

@@ -19,11 +19,14 @@
 
 import { firstPositional, str, CliUsageError, type Payload } from './payload.js';
 import type { CommandHandler } from './payload.js';
+import type { CliIo } from '../index.js';
 import {
+  checkLaneRunWarnCount,
   compareShadowEnqueueSets,
   isMergeQueueEntryLive,
   parseLegacyTrainParkedQueue,
   parseLegacyTrainQueue,
+  SHADOW_FACTS_WARN_RUNS,
   type LegacyTrainQueueLine,
 } from '@fleet/work-execution';
 
@@ -138,7 +141,7 @@ function optionalDayFlag(p: Payload): string | undefined {
  * `state-dir-required`; otherwise the use case's result is returned UNCHANGED
  * — `recorded` and `unchanged` complete (0), every other outcome exits 1.
  */
-async function recordShadowDayHandler(payload: Payload, runtime: CutoverRuntime): Promise<unknown> {
+async function recordShadowDayHandler(payload: Payload, runtime: CutoverRuntime, io?: CliIo): Promise<unknown> {
   rejectUnexpectedInput(payload, 'shadow record-day', ['repository', 'legacyStateDir', 'day'], 1);
   const repository = repositoryFromPayload(payload, 'record-day');
   const stateDir = str(payload, 'legacyStateDir').trim();
@@ -150,11 +153,30 @@ async function recordShadowDayHandler(payload: Payload, runtime: CutoverRuntime)
   if (recordShadowDay === undefined) {
     return { outcome: 'refused', reason: 'state-dir-required' };
   }
-  return recordShadowDay.execute({
+  const result = await recordShadowDay.execute({
     repository,
     legacyStateDir: stateDir,
     ...(day === undefined ? {} : { day }),
   });
+  // RC1: the early warning. Read through the same SH19c read-only runs reader
+  // the composition exposed; an unreadable store is no warning, and the
+  // result on stdout is returned unchanged — stderr only, never a file, never
+  // an exit-code change.
+  const runsReader = runtime.execution.shadowRunsRead;
+  if (runsReader !== undefined && io !== undefined) {
+    try {
+      const rawRuns = await runsReader.list();
+      const verdict = checkLaneRunWarnCount(rawRuns);
+      if (verdict.status === 'ok' && verdict.warn) {
+        io.stderr(
+          `warning: lane-run store holds ${verdict.count} runs (above early-warning threshold ${SHADOW_FACTS_WARN_RUNS}; 2000-run cap deferred)\n`,
+        );
+      }
+    } catch {
+      // Unreadable source: fail-closed, no warning, result unchanged.
+    }
+  }
+  return result;
 }
 
 /** Reads the shared flags of a revisioned move and runs it; the use case result is returned unchanged. */
@@ -366,7 +388,7 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
 
   retire: revisionMoveHandler('retire'),
 
-  shadow: async (payload, runtime) => {
+  shadow: async (payload, runtime, io) => {
     const sub = firstPositional(payload);
     if (sub !== 'report' && sub !== 'record-day') {
       throw new CliUsageError(
@@ -376,7 +398,7 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
       );
     }
     if (sub === 'record-day') {
-      return recordShadowDayHandler(payload, runtime);
+      return recordShadowDayHandler(payload, runtime, io);
     }
     return reportShadowHandler(payload, runtime);
   },

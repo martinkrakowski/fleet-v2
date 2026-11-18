@@ -4,6 +4,9 @@ export {
   SHADOW_FACTS_MAX_RUNS,
   SHADOW_FACTS_MAX_ATTEMPTS_PER_RUN,
   SHADOW_FACTS_MAX_RECEIPTS_PER_HEAD,
+  SHADOW_FACTS_WARN_RUNS,
+  SHADOW_FACTS_WARN_MAX_SCAN,
+  checkLaneRunWarnCount,
   FactsRefusal,
   isPastDeadline,
   readMergedPullRequestIds,
@@ -15,6 +18,7 @@ export type {
   ShadowConformanceRunsDependencies,
   ShadowConformanceRunsRead,
   ShadowConformanceRunsUnknown,
+  LaneRunWarnCountRead,
 } from './conducted-facts.js';
 export {
   readShadowGateHeads,

@@ -752,6 +752,7 @@ Commands:
   report weekly
   relaunch inventory [--host <name>]
   release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
+  merge import --repository owner/repo --legacy-state-dir <path> [--apply --grant <id> --project <id>] (no --authority)
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
   cutover shadow record-day --repository owner/repo --legacy-state-dir <path> [--day YYYY-MM-DD]
   cutover shadow attest --fact <id> --note <text> --expected-revision <n> --operation-id <id> --authority <label> [--evidence <text>] [--deadline-iso <iso>]

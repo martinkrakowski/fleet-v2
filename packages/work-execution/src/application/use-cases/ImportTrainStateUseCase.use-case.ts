@@ -18,8 +18,36 @@ import type {
 import { IMPORT_KEYS_MAX } from '../ports/in/ImportTrainStatePort.in-port.js';
 import type { LegacyTrainStateRead, LegacyTrainStateReadPort } from '../ports/out/LegacyTrainStateReadPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
+import type { ActionAuthorizationPort, AuthorizeShadowImportResult } from '../ports/out/ActionAuthorizationPort.out-port.js';
+import type { CutoverJournalAppendResult, CutoverJournalPort } from '../ports/out/CutoverJournalPort.out-port.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
+
+/**
+ * The grant-refusal reasons `authorizeShadowImport` may answer that pass
+ * through to the caller as the same named refusal; every other blocked or
+ * unknown answer (and any throw) is `authorization-unavailable`.
+ */
+const GRANT_REFUSALS: ReadonlySet<string> = new Set([
+  'grant-missing',
+  'grant-expired',
+  'grant-revoked',
+  'grant-wrong-scope',
+  'grant-wrong-repository',
+  'grant-wrong-project',
+  'grant-digest-mismatch',
+  'grant-not-approved',
+  'grant-id-mismatch',
+]);
+
+/**
+ * Validation caps. The validator's cost is linear in the capped input: at
+ * most `MAX_REQUEST_OWN_KEYS` own data properties are read (one descriptor
+ * read each, never a getter) and each string field is bounded by
+ * `MAX_REQUEST_FIELD_LENGTH` before any pattern test runs.
+ */
+const MAX_REQUEST_OWN_KEYS = 32;
+const MAX_REQUEST_FIELD_LENGTH = 4096;
 
 /**
  * The repository-ref validation both this use case and the shadow day-writer
@@ -52,6 +80,165 @@ export interface ImportTrainStateDependencies {
   readonly queue: MergeQueueRepositoryPort;
   readonly mintUlid: () => string;
   readonly nowIso: () => string;
+  /**
+   * GR1b: the shadow import grant verifier. Required for `apply: true`
+   * (`authorization-unavailable` without it); never read on a dry run.
+   */
+  readonly authorization?: ActionAuthorizationPort;
+  /**
+   * The separate shadow-intake journal (never `cutover-journal.json`).
+   * Required for `apply: true` when there are candidates.
+   */
+  readonly journal?: CutoverJournalPort;
+  /** Hex digest of the grant handle journaled with each intent and result. */
+  readonly computeDigest?: (payload: string) => string;
+}
+
+export type ImportTrainStateRequestValidation =
+  | { readonly ok: true; readonly request: ImportTrainStateRequest }
+  | {
+      readonly ok: false;
+      readonly reason:
+        | 'invalid-request'
+        | 'invalid-repository'
+        | 'invalid-state-dir'
+        | 'project-required'
+        | 'grant-missing';
+    };
+
+const PROTOTYPE_POLLUTING_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Snapshot one plain nested object with own enumerable data-property
+ * descriptors only: a getter, setter, symbol key or hostile prototype never
+ * runs and never survives.
+ */
+function snapshotPlainObject(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const proto: unknown = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    return null;
+  }
+  const names = Object.keys(value);
+  if (names.length > MAX_REQUEST_OWN_KEYS) {
+    return null;
+  }
+  const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const name of names) {
+    if (PROTOTYPE_POLLUTING_KEYS.has(name)) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return null;
+    }
+    snapshot[name] = descriptor.value;
+  }
+  return snapshot;
+}
+
+function boundedString(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > MAX_REQUEST_FIELD_LENGTH) {
+    return null;
+  }
+  return value;
+}
+
+/**
+ * Pure, descriptor-safe request validation, run at the very start of
+ * `importTrainState` (GR1b). It reads own enumerable data-property
+ * descriptors only — a getter or Proxy `get` trap never runs, a
+ * prototype-polluting own key and a non-plain object are refused — and it
+ * never throws. A dry run needs no `grantId` and no `projectId`; an apply
+ * requires both, non-empty, before any read or write. Cost: linear in the
+ * capped input (see `MAX_REQUEST_OWN_KEYS` / `MAX_REQUEST_FIELD_LENGTH`).
+ */
+/**
+ * Resolves the `repository` field of an already-snapshotted request into a
+ * valid `{ owner, repo }` ref, or `null` when anything about it is invalid.
+ */
+function resolveRepository(raw: unknown): { owner: string; repo: string } | null {
+  const snapshot = snapshotPlainObject(raw);
+  if (snapshot === null) {
+    return null;
+  }
+  const owner = boundedString(snapshot['owner']);
+  const repo = boundedString(snapshot['repo']);
+  if (owner === null || repo === null) {
+    return null;
+  }
+  const repository = { owner, repo };
+  return isValidRepositoryRef(repository) ? repository : null;
+}
+
+/**
+ * The apply-only credential checks: an apply requires a non-empty `projectId`
+ * and then a non-empty `grantId`; a dry run needs neither.
+ */
+function applyCredentialRefusal(
+  apply: boolean,
+  grantId: string | null,
+  projectId: string | null,
+): 'project-required' | 'grant-missing' | null {
+  if (!apply) {
+    return null;
+  }
+  if (projectId === null || projectId.trim() === '') {
+    return 'project-required';
+  }
+  if (grantId === null || grantId.trim() === '') {
+    return 'grant-missing';
+  }
+  return null;
+}
+
+export function validateImportTrainStateRequest(raw: unknown): ImportTrainStateRequestValidation {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  const snapshot = snapshotPlainObject(raw);
+  if (snapshot === null) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  const repository = resolveRepository(snapshot['repository']);
+  if (repository === null) {
+    return { ok: false, reason: 'invalid-repository' };
+  }
+  const stateDir = boundedString(snapshot['stateDir']);
+  if (stateDir === null || stateDir.trim() === '') {
+    return { ok: false, reason: 'invalid-state-dir' };
+  }
+  if (typeof snapshot['apply'] !== 'boolean') {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  const apply = snapshot['apply'];
+  const rawGrantId = snapshot['grantId'];
+  const rawProjectId = snapshot['projectId'];
+  const grantId = typeof rawGrantId === 'string' && rawGrantId.length <= MAX_REQUEST_FIELD_LENGTH ? rawGrantId : null;
+  const projectId =
+    typeof rawProjectId === 'string' && rawProjectId.length <= MAX_REQUEST_FIELD_LENGTH ? rawProjectId : null;
+  const credentialRefusal = applyCredentialRefusal(apply, grantId, projectId);
+  if (credentialRefusal !== null) {
+    return { ok: false, reason: credentialRefusal };
+  }
+  return { ok: true, request: { repository, stateDir, apply, grantId, projectId } };
+}
+
+/**
+ * Maps one `authorizeShadowImport` answer to a refusal, before any read or
+ * write: a known grant refusal keeps its name; every other blocked or
+ * unknown reason is `authorization-unavailable`.
+ */
+function refusalFromShadowImportAnswer(answer: AuthorizeShadowImportResult): ImportTrainStateRefusal {
+  if (answer.outcome === 'authorized') {
+    return 'authorization-unavailable';
+  }
+  const reason = answer.reason;
+  return typeof reason === 'string' && GRANT_REFUSALS.has(reason)
+    ? (reason as ImportTrainStateRefusal)
+    : 'authorization-unavailable';
 }
 
 /** The parsed, per-source lines once every source is confirmed readable. Queue and inprogress use the 3-field parser; parked uses its own 6-field one (SH4d/SH4f). */
@@ -94,57 +281,198 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
   constructor(private readonly deps: ImportTrainStateDependencies) {}
 
   async importTrainState(request: ImportTrainStateRequest): Promise<ImportTrainStateResult> {
-    const requestRefusal = this.validateRequest(request);
-    if (requestRefusal !== null) {
-      return { outcome: 'refused', reason: requestRefusal };
+    const validated = validateImportTrainStateRequest(request);
+    if (!validated.ok) {
+      return { outcome: 'refused', reason: validated.reason };
+    }
+    const request_ = validated.request;
+
+    // GR1b: the shadow import grant is verified BEFORE any legacy read, queue
+    // read or queue write, so a refused grant leaves the writable queue
+    // untouched — a corrupt merge-queue.json is never even read, let alone
+    // quarantined.
+    const authorizationRefusal = await this.verifyShadowImportAuthorization(request_);
+    if (authorizationRefusal !== null) {
+      return { outcome: 'refused', reason: authorizationRefusal };
     }
 
+    const plan = await this.planCandidates(request_);
+    if (!plan.ok) {
+      return { outcome: 'refused', reason: plan.refusal };
+    }
+
+    if (!request_.apply) {
+      return { outcome: 'dry-run', wouldImport: plan.classified.candidates.length, ...plan.report };
+    }
+
+    if (plan.classified.candidates.length === 0) {
+      return { outcome: 'applied', imported: 0, refused: 0, ...plan.report };
+    }
+
+    return this.applyWithShadowJournal(request_, plan);
+  }
+
+  /**
+   * Fix-round split of `importTrainState` (behaviour-free): the grant
+   * verification step. Returns the refusal reason to answer with, or `null`
+   * when the apply run is authorized (a dry run never authorizes).
+   */
+  private async verifyShadowImportAuthorization(
+    request: ImportTrainStateRequest,
+  ): Promise<ImportTrainStateRefusal | null> {
+    if (!request.apply) {
+      return null;
+    }
+    const authorization = this.deps.authorization;
+    if (authorization === undefined || typeof authorization.authorizeShadowImport !== 'function') {
+      return 'authorization-unavailable';
+    }
+    let answer: AuthorizeShadowImportResult;
+    try {
+      answer = await authorization.authorizeShadowImport({
+        projectId: request.projectId ?? '',
+        grantId: request.grantId ?? '',
+        repository: request.repository,
+        nowIso: this.deps.nowIso(),
+      });
+    } catch {
+      return 'authorization-unavailable';
+    }
+    if (answer.outcome !== 'authorized') {
+      return refusalFromShadowImportAnswer(answer);
+    }
+    return null;
+  }
+
+  /** Fix-round split of `importTrainState` (behaviour-free): read, parse, classify and build the report. */
+  private async planCandidates(
+    request: ImportTrainStateRequest,
+  ): Promise<
+    | { readonly ok: false; readonly refusal: ImportTrainStateRefusal }
+    | {
+        readonly ok: true;
+        readonly classified: ClassifiedEntries;
+        readonly report: ImportTrainStateReport;
+        readonly deadlineIso: string;
+      }
+  > {
     const state = await this.deps.legacyState.readLegacyTrainState({ stateDir: request.stateDir });
     const parsed = this.parseLegacyState(state);
     if (!parsed.ok) {
-      return { outcome: 'refused', reason: parsed.refusal };
+      return { ok: false, refusal: parsed.refusal };
     }
-
     const deadlineIso = new Date(Date.parse(this.deps.nowIso()) + 60_000).toISOString();
     const liveEntries = (
       await this.deps.queue.listMergeEntries({ repository: request.repository, deadlineIso })
     ).filter(isMergeQueueEntryLive);
-
     const classified = this.classifyEntries(parsed.parsedBySource, liveEntries, request.repository);
-    const report = this.buildReport(parsed, classified);
-
-    if (!request.apply) {
-      return { outcome: 'dry-run', wouldImport: classified.candidates.length, ...report };
-    }
-
-    const { imported, refused, appliedDuplicates } = await this.applyCandidates(
-      classified.candidates,
-      request,
-      deadlineIso,
-    );
-    return {
-      outcome: 'applied',
-      imported,
-      refused,
-      ...report,
-      alreadyQueued: classified.alreadyQueued + appliedDuplicates,
-    };
+    return { ok: true, classified, report: this.buildReport(parsed, classified), deadlineIso };
   }
 
-  private validateRequest(request: ImportTrainStateRequest): ImportTrainStateRefusal | null {
-    if (!this.isValidRepository(request.repository)) {
-      return 'invalid-repository';
+  /** Fix-round split of `importTrainState` (behaviour-free): the journal-intent-then-apply step. */
+  private async applyWithShadowJournal(
+    request: ImportTrainStateRequest,
+    plan: {
+      readonly classified: ClassifiedEntries;
+      readonly report: ImportTrainStateReport;
+      readonly deadlineIso: string;
+    },
+  ): Promise<ImportTrainStateResult> {
+    // GR1b: the separate shadow-intake journal (never cutover-journal.json).
+    // No digest fallback: the adapter refuses a non-hex digest, so a missing
+    // journal or digest refuses BEFORE any queue write.
+    const journal = this.deps.journal;
+    const computeDigest = this.deps.computeDigest;
+    if (journal === undefined || computeDigest === undefined) {
+      return { outcome: 'refused', reason: 'journal-unavailable' };
     }
-    if (request.stateDir.trim() === '') {
-      return 'invalid-state-dir';
+    // GR1b fix round: `computeDigest`, `nowIso`, `mintUlid` and the intent
+    // append sit before any queue write, so any throw from them is mapped to a
+    // typed refusal instead of escaping untyped: a digest failure means the
+    // digest dependency is unavailable; a clock, id or journal-store failure
+    // refuses the journal.
+    let grantDigest: string;
+    try {
+      grantDigest = computeDigest(request.grantId ?? '');
+    } catch {
+      return { outcome: 'refused', reason: 'journal-unavailable' };
     }
-    if (
-      request.apply &&
-      (typeof request.authority !== 'string' || request.authority.trim() === '')
-    ) {
-      return 'authority-required';
+    let intentAppend: CutoverJournalAppendResult;
+    try {
+      const runEntryId = this.deps.mintUlid();
+      const key = `shadow-import/${request.repository.owner}/${request.repository.repo}/${runEntryId}`;
+      intentAppend = await journal.append({
+        key,
+        kind: 'intent',
+        entryId: runEntryId,
+        recordedAtIso: this.deps.nowIso(),
+        digest: grantDigest,
+      });
+    } catch {
+      return { outcome: 'refused', reason: 'journal-refused' };
     }
-    return null;
+    if (intentAppend.outcome === 'refused') {
+      return { outcome: 'refused', reason: 'journal-refused' };
+    }
+    return this.applyAndJournalResult(journal, intentAppend.entry.key, grantDigest, request, plan);
+  }
+
+  /** Fix-round split of `importTrainState` (behaviour-free): apply, then journal the result best-effort. */
+  private async applyAndJournalResult(
+    journal: CutoverJournalPort,
+    key: string,
+    grantDigest: string,
+    request: ImportTrainStateRequest,
+    plan: {
+      readonly classified: ClassifiedEntries;
+      readonly report: ImportTrainStateReport;
+      readonly deadlineIso: string;
+    },
+  ): Promise<ImportTrainStateResult> {
+    try {
+      const { imported, refused, appliedDuplicates } = await this.applyCandidates(
+        plan.classified.candidates,
+        request,
+        plan.deadlineIso,
+      );
+      // Best-effort result append: a refused or throwing result append never
+      // masks the applied answer.
+      try {
+        await journal.append({
+          key,
+          kind: 'result',
+          entryId: this.deps.mintUlid(),
+          recordedAtIso: this.deps.nowIso(),
+          outcome: 'completed',
+          reasonCode: 'applied',
+          digest: grantDigest,
+        });
+      } catch {
+        /* the applied result stands */
+      }
+      return {
+        outcome: 'applied',
+        imported,
+        refused,
+        ...plan.report,
+        alreadyQueued: plan.classified.alreadyQueued + appliedDuplicates,
+      };
+    } catch (error) {
+      // Best-effort ambiguous result append: it never masks the original error.
+      try {
+        await journal.append({
+          key,
+          kind: 'result',
+          entryId: this.deps.mintUlid(),
+          recordedAtIso: this.deps.nowIso(),
+          outcome: 'ambiguous',
+          reasonCode: 'apply-threw',
+        });
+      } catch {
+        /* the original error stands */
+      }
+      throw error;
+    }
   }
 
   /**
@@ -382,9 +710,5 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       }
     }
     return { imported, refused, appliedDuplicates };
-  }
-
-  private isValidRepository(repository: ImportTrainStateRequest['repository']): boolean {
-    return isValidRepositoryRef(repository);
   }
 }

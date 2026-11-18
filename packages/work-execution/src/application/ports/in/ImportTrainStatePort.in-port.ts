@@ -4,13 +4,32 @@ export interface ImportTrainStateRequest {
   readonly repository: { readonly owner: string; readonly repo: string };
   readonly stateDir: string;
   readonly apply: boolean;
-  readonly authority: string | null;
+  /**
+   * The standing `merge:import-shadow` grant handle and the project it was
+   * issued for. Both are required only when `apply` is true; a dry run needs
+   * neither. `grantId` is a non-secret handle and may be printed.
+   */
+  readonly grantId?: string | null;
+  readonly projectId?: string | null;
 }
 
 export type ImportTrainStateRefusal =
+  | 'invalid-request'
   | 'invalid-repository'
   | 'invalid-state-dir'
-  | 'authority-required'
+  | 'project-required'
+  | 'grant-missing'
+  | 'grant-expired'
+  | 'grant-revoked'
+  | 'grant-wrong-scope'
+  | 'grant-wrong-repository'
+  | 'grant-wrong-project'
+  | 'grant-digest-mismatch'
+  | 'grant-not-approved'
+  | 'grant-id-mismatch'
+  | 'authorization-unavailable'
+  | 'journal-unavailable'
+  | 'journal-refused'
   | 'legacy-unreadable'
   | 'secret-shaped';
 

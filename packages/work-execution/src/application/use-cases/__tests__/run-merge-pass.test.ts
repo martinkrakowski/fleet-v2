@@ -15,6 +15,9 @@ import type {
 import type { MergeQueueRepositoryPort } from '../../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
 import type { ConductorHaltState } from '../../../domain/conductor-halt.js';
+import type { MergeNotificationPort } from '../../ports/out/MergeNotificationPort.out-port.js';
+import type { MergeVetoPort } from '../../ports/out/MergeVetoPort.out-port.js';
+import type { MergeVetoStatePort } from '../../ports/out/MergeVetoStatePort.out-port.js';
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import {
@@ -29,7 +32,8 @@ const OWNER = 'fleet';
 const REPO = 'v2';
 const DIGEST = '0123456789ab';
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
-const HEAD_MOVED = '0123456789abcdef0123456789abcdef01234599';
+const HEAD3 = 'fedcba987654ef0123456789abcdef0123456789';
+const HEAD3_12 = 'fedcba987654';
 const HEAD12 = '0123456789ab';
 const NOW = '2026-11-01T12:00:00.000Z';
 const DEADLINE = '2026-11-01T12:10:00.000Z';
@@ -163,6 +167,12 @@ function makeUseCase(
   forgeResult: ReadForgeMergeResult,
   policyOverrides: Record<string, unknown> = {},
   halt: Pick<ConductorHaltPort, 'read'> = haltFake,
+  extras: {
+    queueWriter?: Pick<MergeQueueRepositoryPort, 'applyMergeTransition'>;
+    notifier?: Pick<MergeNotificationPort, 'notifyMergeEvent'>;
+    vetoState?: Pick<MergeVetoStatePort, 'readMergeVetoState'>;
+    vetoAdvice?: Pick<MergeVetoPort, 'adviseMergeVeto'>;
+  } = {},
 ): { useCase: RunMergePassUseCase; deps: Deps; request: RunMergePassRequest } {
   const journal = new LaneRunJournalAdapter();
   const forgeRead = forgeReadFake(forgeResult);
@@ -176,6 +186,7 @@ function makeUseCase(
     halt,
     newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
     nowIso: () => NOW,
+    ...extras,
   });
   return {
     useCase,
@@ -188,6 +199,59 @@ function makeUseCase(
       deadlineIso: DEADLINE,
     },
   };
+}
+
+function queueWriterSpy(): { calls: number; adapter: Pick<MergeQueueRepositoryPort, 'applyMergeTransition'> } {
+  type TransitionInput = Parameters<Pick<MergeQueueRepositoryPort, 'applyMergeTransition'>['applyMergeTransition']>[0];
+  type TransitionResult = Awaited<ReturnType<Pick<MergeQueueRepositoryPort, 'applyMergeTransition'>['applyMergeTransition']>>;
+  const spy = {
+    calls: 0,
+    adapter: {
+      async applyMergeTransition(input: TransitionInput): Promise<TransitionResult> {
+        spy.calls += 1;
+        return { outcome: 'applied', entries: [input.next], record: input.next, successor: null };
+      },
+    },
+  };
+  return spy;
+}
+
+function notifierSpy(): { calls: number; adapter: { notifyMergeEvent(): Promise<{ outcome: 'notified' }> } } {
+  const spy = {
+    calls: 0,
+    adapter: {
+      async notifyMergeEvent() {
+        spy.calls += 1;
+        return { outcome: 'notified' as const };
+      },
+    },
+  };
+  return spy;
+}
+
+function vetoPortSpies(): {
+  stateCalls: number;
+  adviceCalls: number;
+  vetoState: { readMergeVetoState(): Promise<never> };
+  vetoAdvice: { adviseMergeVeto(): Promise<never> };
+} {
+  const spy = {
+    stateCalls: 0,
+    adviceCalls: 0,
+    vetoState: {
+      async readMergeVetoState(): Promise<never> {
+        spy.stateCalls += 1;
+        throw new Error('vetoState must never be called in shadow mode (SH24a)');
+      },
+    },
+    vetoAdvice: {
+      async adviseMergeVeto(): Promise<never> {
+        spy.adviceCalls += 1;
+        throw new Error('vetoAdvice must never be called in shadow mode (SH24a)');
+      },
+    },
+  };
+  return spy;
 }
 
 async function journalOf(journal: LaneRunJournalAdapter): Promise<LaneRunJournalEntryRecord[]> {
@@ -355,18 +419,29 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     expect(await journalOf(deps.journal)).toHaveLength(0);
   });
 
-  it('journals nothing and parks forge-error when the forge read is unavailable', async () => {
+  it('journals would-park when the forge read is unavailable, and only the first park reason per head', async () => {
     const { useCase, deps, request } = makeUseCase([makeEntry()], {
       outcome: 'unavailable',
       code: 'forge-error',
       reason: 'gh failed',
     });
 
-    const result = await useCase.runMergePass(request);
+    const first = await useCase.runMergePass(request);
+    expect(first.entries[0].decision).toBe('journalled');
+    expect(first.entries[0].reasonCode).toBe('would-park');
+    const key = `merge/${DIGEST}/1/${HEAD12}/would-park`;
+    const afterFirst = await deps.journal.listForKey(key);
+    expect(afterFirst.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(afterFirst[1].outcome).toBe('dry-run');
+    expect(afterFirst[1].reasonCode).toBe('would-park');
+    expect(afterFirst[1].detail).toBe('forge-error');
 
-    expect(result.entries[0].decision).toBe('no-action');
-    expect(result.entries[0].reasonCode).toBe('forge-error');
-    expect(await journalOf(deps.journal)).toHaveLength(0);
+    // A later tick that parks again for another reason sees the stored result:
+    // only the first park reason per head is recorded.
+    const second = await useCase.runMergePass(request);
+    expect(second.entries[0].decision).toBe('no-action');
+    expect(second.entries[0].reasonCode).toBe('already-journalled');
+    expect(await deps.journal.listForKey(key)).toHaveLength(2);
   });
 
   it('journals would-update-branch for a behind branch', async () => {
@@ -390,15 +465,28 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     expect(entries.every((entry) => entry.key === `merge/${DIGEST}/1/${HEAD12}/update-branch`)).toBe(true);
   });
 
-  it('journals nothing when the live head moved', async () => {
-    const moved: ReadForgeMergeResult = { ...greenForge, liveHeadSha: HEAD_MOVED };
+  it('a moved live head is superseded in memory only: would-supersede then would-merge on the new head', async () => {
+    // SH24a: the supersession is never persisted; the in-memory successor
+    // re-runs the decider in the same pass and reaches would-merge, whose
+    // result carries the successor's own 40-hex head as its linkedId.
+    const moved: ReadForgeMergeResult = { ...greenForge, liveHeadSha: HEAD3 };
     const { useCase, deps, request } = makeUseCase([makeEntry()], moved);
 
     const result = await useCase.runMergePass(request);
 
-    expect(result.entries[0].decision).toBe('no-action');
-    expect(result.entries[0].reasonCode).toBe('superseded');
-    expect(await journalOf(deps.journal)).toHaveLength(0);
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-merge');
+    expect(result.entries[0].journalKey).toBe(`merge/${DIGEST}/1/${HEAD3_12}/merge-pr`);
+    const superseded = await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/would-supersede`);
+    expect(superseded.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(superseded[1].outcome).toBe('dry-run');
+    expect(superseded[1].reasonCode).toBe('would-supersede');
+    expect(superseded[1].detail).toBe(null);
+    const merged = await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD3_12}/merge-pr`);
+    expect(merged.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(merged[1].reasonCode).toBe('would-merge');
+    expect(merged[1].linkedId).toBe(HEAD3);
+    expect(deps.forgeRead.calls).toBe(2);
   });
 
   it('journals nothing under a live policy and reports the action as deferred', async () => {
@@ -638,5 +726,198 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     expect(result.entries).toHaveLength(1);
     expect(result.entries[0].decision).toBe('no-action');
     expect(result.entries[0].reasonCode).toBe('halted');
+  });
+});
+
+describe('RunMergePassUseCase shadow mode never mutates the queue (SH24a)', () => {
+  function exhaustedForge(): ReadForgeMergeResult {
+    return {
+      outcome: 'unavailable',
+      code: 'forge-error',
+      reason: 'gh failed',
+    } as ReadForgeMergeResult;
+  }
+
+  function closedForge(): ReadForgeMergeResult {
+    return { ...greenForge, prState: 'closed' } as ReadForgeMergeResult;
+  }
+
+  function mergedForge(): ReadForgeMergeResult {
+    return { ...greenForge, prState: 'merged' } as ReadForgeMergeResult;
+  }
+
+  it.each([
+    ['a PR at its last attempt with the forge unavailable', exhaustedForge(), makeEntry({ attempt: 9 }), 'would-drop', 'forge-error-exhausted'],
+    ['a closed PR', closedForge(), makeEntry(), 'would-drop', 'closed'],
+  ])('a shadow tick on %s journals would-drop and leaves merge-queue.json byte-identical', async (
+    _label,
+    forgeResult,
+    entry,
+    reasonCode,
+    detail,
+  ) => {
+    const records = [entry];
+    const writer = queueWriterSpy();
+    const notifier = notifierSpy();
+    const { useCase, deps, request } = makeUseCase(records, forgeResult, {}, haltFake, {
+      queueWriter: writer.adapter,
+      notifier: notifier.adapter,
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.outcome).toBe('completed');
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe(reasonCode);
+    expect(result.entries[0].journalKey).toBe(`merge/${DIGEST}/1/${HEAD12}/${reasonCode}`);
+    expect(writer.calls).toBe(0);
+    expect(notifier.calls).toBe(0);
+    // The queue records are untouched: the live conductor can never read a
+    // dropped entry that shadow mode never wrote.
+    expect(records[0].state).toBe('queued');
+    const after = await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/${reasonCode}`);
+    expect(after.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(after[1].outcome).toBe('dry-run');
+    expect(after[1].reasonCode).toBe(reasonCode);
+    expect(after[1].detail).toBe(detail);
+  });
+
+  it('a shadow tick on a forge-confirmed merged PR journals would-already-merged', async () => {
+    const writer = queueWriterSpy();
+    const { useCase, deps, request } = makeUseCase([makeEntry()], mergedForge(), {}, haltFake, {
+      queueWriter: writer.adapter,
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-already-merged');
+    expect(writer.calls).toBe(0);
+    const after = await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/would-already-merged`);
+    expect(after.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(after[1].outcome).toBe('dry-run');
+    expect(after[1].reasonCode).toBe('would-already-merged');
+    expect(after[1].detail).toBe(null);
+  });
+
+  it('a shadow tick on a green entry with a macOS procedure journals would-ready, never persisting the ready entry', async () => {
+    // The first decision is enter ready ('contexts'); the in-memory ready
+    // record still owes the procedure row, so the second decision is enter
+    // ready ('procedure') and the pass journals would-ready instead of writing.
+    const journal = new LaneRunJournalAdapter();
+    const writer = queueWriterSpy();
+    const verification = {
+      calls: 0,
+      async readVerification() {
+        return { outcome: 'verified', receiptHeadOid: HEAD } as MergeVerificationResult;
+      },
+      async runVerification(): Promise<MergeVerificationResult> {
+        throw new Error('runVerification must never be called in DT9a');
+      },
+    };
+    let ulid = 0;
+    const useCase = new RunMergePassUseCase({
+      queue: queueFake([makeEntry()]),
+      forgeRead: forgeReadFake(greenForge),
+      verification: verification as unknown as MergeVerificationPort & { calls: number },
+      journal: journal as LaneRunJournalPort,
+      halt: haltFake,
+      newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
+      nowIso: () => NOW,
+      queueWriter: writer.adapter,
+    });
+    const request: RunMergePassRequest = {
+      repository: { owner: OWNER, repo: REPO },
+      repoDigest: DIGEST,
+      projectId: 'proj-1',
+      policy: makePolicy({ macosProcedure: 'macos-procedure' }),
+      deadlineIso: DEADLINE,
+    };
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-ready');
+    expect(result.entries[0].journalKey).toBe(`merge/${DIGEST}/1/${HEAD12}/would-ready`);
+    expect(writer.calls).toBe(0);
+    const after = await journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/would-ready`);
+    expect(after.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(after[1].outcome).toBe('dry-run');
+    expect(after[1].reasonCode).toBe('would-ready');
+  });
+
+  it('a shadow tick with an advisory veto never calls the veto ports and still reaches would-merge', async () => {
+    const writer = queueWriterSpy();
+    const veto = vetoPortSpies();
+    const { useCase, deps, request } = makeUseCase([makeEntry()], greenForge, { veto: { mode: 'shadow' } }, haltFake, {
+      queueWriter: writer.adapter,
+      vetoState: veto.vetoState,
+      vetoAdvice: veto.vetoAdvice,
+    });
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-merge');
+    expect(veto.stateCalls).toBe(0);
+    expect(veto.adviceCalls).toBe(0);
+    expect(writer.calls).toBe(0);
+    expect(await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/merge-pr`)).toHaveLength(2);
+  });
+
+  it('an interrupted would-drop intent is completed, not closed as shadow-intent-closed', async () => {
+    const { useCase, deps, request } = makeUseCase([makeEntry()], closedForge());
+    const key = `merge/${DIGEST}/1/${HEAD12}/would-drop`;
+    await deps.journal.append({
+      version: 1, entryId: '01JB0000000000000000000099', kind: 'intent', key, runId: null,
+      recordedAtIso: NOW, mode: null, expectedRevision: null, mintedId: null, outcome: null,
+      reasonCode: null, detail: null, grantId: null, state: null,
+    } as LaneRunJournalEntryRecord);
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('journalled');
+    expect(result.entries[0].reasonCode).toBe('would-drop');
+    const after = await deps.journal.listForKey(key);
+    expect(after.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(after[1].outcome).toBe('dry-run');
+    expect(after[1].reasonCode).toBe('would-drop');
+    expect(after[1].detail).toBe('closed');
+  });
+
+  it('a live tick on an exhausted PR still drops through the queue writer and the notifier', async () => {
+    const writer = queueWriterSpy();
+    const notifier = notifierSpy();
+    const { useCase, deps, request } = makeUseCase(
+      [makeEntry({ attempt: 9 })],
+      exhaustedForge(),
+      { shadow: false },
+      haltFake,
+      { queueWriter: writer.adapter, notifier: notifier.adapter },
+    );
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.entries[0].decision).toBe('recorded');
+    expect(result.entries[0].reasonCode).toBe('forge-error-exhausted');
+    expect(writer.calls).toBe(1);
+    expect(notifier.calls).toBe(1);
+    expect(await deps.journal.listForKey(`merge/${DIGEST}/1/${HEAD12}/would-drop`)).toHaveLength(0);
+    expect(await journalOf(deps.journal)).toHaveLength(0);
+  });
+
+  it('after a shadow tick on a closed or exhausted PR the live conductor reads no dropped entry', async () => {
+    // The merge-enqueue step (advance-lane-run/merge-enqueue.ts) journals
+    // `merge-dropped` as final when it reads `state === 'dropped'`; shadow
+    // mode must never hand it one.
+    for (const entry of [makeEntry(), makeEntry({ attempt: 9 })]) {
+      const records = [entry];
+      const { useCase, request } = makeUseCase(records, exhaustedForge());
+
+      await useCase.runMergePass(request);
+
+      expect(records).toHaveLength(1);
+      expect(records[0].state).toBe('queued');
+    }
   });
 });

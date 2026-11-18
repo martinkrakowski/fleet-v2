@@ -61,7 +61,10 @@ export const MERGE_DROP_REASONS = [
 ] as const;
 export type MergeDropReason = (typeof MERGE_DROP_REASONS)[number];
 
-export const MERGE_SHADOW_REASONS = ['would-update-branch', 'would-post-status', 'would-merge'] as const;
+export const MERGE_SHADOW_REASONS = [
+  'would-update-branch', 'would-post-status', 'would-merge',
+  'would-drop', 'would-park', 'would-supersede', 'would-ready', 'would-already-merged',
+] as const;
 export type MergeShadowReason = (typeof MERGE_SHADOW_REASONS)[number];
 
 export interface MergeQueueRepositoryRef {

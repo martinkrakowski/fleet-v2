@@ -147,6 +147,7 @@ function deriveModelFromV2(installation: FleetInstallation): ModelOutcome {
         ? { decisions: copyDecisions(installation.decisions) }
         : {}),
       ...(installation.daemon !== undefined ? { daemon: installation.daemon } : {}),
+      ...(installation.owner !== undefined ? { owner: installation.owner } : {}),
       ...(installation.stateDir !== undefined ? { stateDir: installation.stateDir } : {}),
     },
     warnings: [],
@@ -321,6 +322,7 @@ function deriveModelFromV1(installation: FleetInstallation): ModelOutcome {
     ...(forge !== undefined ? { forge: v2ForgeOf(forge) } : {}),
     ...(verification !== undefined ? { verification: { procedures: verification.procedures } } : {}),
     ...(installation.waves !== undefined ? { waves: installation.waves } : {}),
+    ...(installation.owner !== undefined ? { owner: installation.owner } : {}),
   };
   return { model, warnings, ...(errors.length > 0 ? { errors } : {}) };
 }

@@ -117,6 +117,19 @@ S13 (every §1 cutover-plan ledger row has an evidence link / `verified`) moved 
 
 Deleting `tools/fleet-v2-orchestrator/` is a change in the other repository, not a command here.
 
+## Owner key pinning and rotation
+
+The installation file pins the owner's Ed25519 public key in the optional `owner`
+section: `owner.publicKey` is the canonical base64 encoding of exactly 32 raw key
+bytes. The parser (`packages/installation/src/owner.ts`) refuses non-strings,
+over-long values, anything carrying a private-key or credential shape, and any
+string that is not canonical base64 of 32 bytes; it never echoes the offending
+value. A raw Ed25519 seed is also 32 bytes, so the screen cannot distinguish a
+seed from a public key — never paste a seed there. A file that pins
+`owner.publicKey` and also carries `waves.ownerPublicKey` is refused unless the
+two agree, so a file cannot name two different owner keys. Rotation is
+out of scope for this runbook until a live rotation command exists.
+
 ## Not this runbook
 
 Removing adapters, adding `merge export`, starting `conductor run --live`, printing secrets, treating exit 1 `unknown` as an empty shadow, or starting, scheduling, or arming the live shadow daemon (OD-7).

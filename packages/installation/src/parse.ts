@@ -9,6 +9,8 @@ import {
 
 import { AGY_SECURITY_TEXT_VERSION } from './agy-security.js';
 
+import { isCanonicalBase64Of32Bytes, readOwnerSection } from './owner.js';
+
 import type {
   AutoMergePolicy,
   BoardPolicySection,
@@ -45,6 +47,7 @@ import type {
   MergeRepositoryPolicy,
   MergeVetoConsumerSettings,
   MergeVetoPolicy,
+  OwnerSection,
   PolicySection,
   ProcedureCoverage,
   ReviewerSection,
@@ -460,14 +463,6 @@ function readOptionalInstallationStateDir(
   return trimmed;
 }
 
-function isCanonicalBase64Of32Bytes(value: string): boolean {
-  if (typeof value !== 'string' || value.length === 0) {
-    return false;
-  }
-  const buffer = Buffer.from(value, 'base64');
-  return buffer.length === 32 && buffer.toString('base64') === value;
-}
-
 function readOptionalOwnerPublicKey(
   record: JsonObject,
   key: string,
@@ -483,6 +478,72 @@ function readOptionalOwnerPublicKey(
     return undefined;
   }
   return value;
+}
+
+/**
+ * Error text for one `readOwnerSection` refusal. The offending value is
+ * never echoed — only the named code.
+ */
+function ownerSectionError(code: string): string {
+  if (
+    code === 'owner-key-invalid-type' ||
+    code === 'owner-key-too-long' ||
+    code === 'owner-key-secret-shape' ||
+    code === 'owner-key-invalid-format' ||
+    code === 'owner-key-accessor'
+  ) {
+    return `owner.publicKey: ${code}`;
+  }
+  return `owner: ${code}`;
+}
+
+/**
+ * Parse the optional `owner` section (the pinned Ed25519 owner public key)
+ * through `readOwnerSection`, which reads own data properties only so a
+ * getter never runs. Absent when the file does not carry `owner`.
+ */
+function parseOwnerSection(
+  value: JsonObject,
+  errors: string[],
+): OwnerSection | undefined {
+  if (!Object.hasOwn(value, 'owner')) {
+    return undefined;
+  }
+  const result = readOwnerSection(readOwnDataProperty(value, 'owner'));
+  if (!result.ok) {
+    errors.push(ownerSectionError(result.code));
+    return undefined;
+  }
+  return result.value;
+}
+
+/**
+ * `waves.ownerPublicKey` is non-authoritative: it is accepted (it predates
+ * the `owner` section) but when both it and the pinned `owner.publicKey`
+ * are present they must agree, or the file is refused — a file that pins
+ * two different owner keys is ambiguous about who arms the installation.
+ */
+function parseOwnerConsistency(
+  owner: OwnerSection | undefined,
+  waves: WavesSection | undefined,
+  errors: string[],
+): void {
+  if (owner === undefined || waves === undefined) {
+    return;
+  }
+  const wavesOwnerPublicKey = readOwnDataProperty(
+    waves as unknown as Record<string, unknown>,
+    'ownerPublicKey',
+  );
+  if (
+    typeof wavesOwnerPublicKey === 'string' &&
+    isCanonicalBase64Of32Bytes(wavesOwnerPublicKey) &&
+    wavesOwnerPublicKey !== owner.publicKey
+  ) {
+    errors.push(
+      'waves.ownerPublicKey: must equal owner.publicKey when both are present',
+    );
+  }
 }
 
 function readOptionalStringArray(
@@ -3751,6 +3812,8 @@ function parseInstallationV1(value: JsonObject): ParseResult {
   const reviewer = parseReviewerSection(value, errors);
   const waves = parseWavesSection(value, errors);
   const shelf = parseShelfSection(value, errors);
+  const owner = parseOwnerSection(value, errors);
+  parseOwnerConsistency(owner, waves, errors);
 
   if (errors.length > 0) {
     return { ok: false, errors };
@@ -3778,6 +3841,9 @@ function parseInstallationV1(value: JsonObject): ParseResult {
   if (shelf !== undefined) {
     installation.shelf = shelf;
   }
+  if (owner !== undefined) {
+    installation.owner = owner;
+  }
   return { ok: true, installation };
 }
 
@@ -3798,6 +3864,8 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   const waves = parseWavesSection(value, errors);
   const decisions = parseV2Decisions(value, errors);
   const daemon = parseV2Daemon(value, errors);
+  const owner = parseOwnerSection(value, errors);
+  parseOwnerConsistency(owner, waves, errors);
   const stateDir = readOptionalInstallationStateDir(value, errors);
 
   if (errors.length > 0) {
@@ -3840,6 +3908,9 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   }
   if (daemon !== undefined) {
     installation.daemon = daemon;
+  }
+  if (owner !== undefined) {
+    installation.owner = owner;
   }
   if (stateDir !== undefined) {
     installation.stateDir = stateDir;

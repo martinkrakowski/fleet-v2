@@ -252,7 +252,7 @@ export const RELEASE_GRANT_DIGEST_PREFIX = 'release-grant-' as const;
 /**
  * Bounded-input caps for release grant coordinate parsing. Every parser here
  * is linear in these caps and never traverses more than they allow: at most
- * `MAX_RELEASE_GRANT_KEYS` own keys per object (exactly four are accepted)
+ * `MAX_RELEASE_GRANT_KEYS` own keys per object (exactly five are accepted)
  * and at most `MAX_RELEASE_ROOT_LENGTH` characters of release root.
  */
 export const MAX_RELEASE_ROOT_LENGTH = 4096 as const;
@@ -478,7 +478,8 @@ export function parseReleaseGrantCoordinates(raw: unknown): ReleaseGrantCheck {
 
 /**
  * The canonical digest payload a release grant is bound by: the exact scope,
- * project, expected head and release root, in a frozen key order. The request
+ * project, expected head, release root and per-request nonce (the CLI
+ * generates the nonce for each request), in a frozen key order. The request
  * id carries its digest (computed by the injected dependency, never by this
  * module), so the owner's Ed25519 decision signature — which does not name
  * the release root — still covers it through the request id it approves.

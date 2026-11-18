@@ -289,6 +289,7 @@ const fullV2File = {
     installationFile: '/srv/fleet/fleet.json',
     shadow: { legacyStateDir: '/srv/fleet/legacy-state', grantId: 'grant-1' },
   },
+  owner: { publicKey: Buffer.alloc(32, 7).toString('base64') },
   stateDir: '/srv/fleet/installation-state',
 };
 

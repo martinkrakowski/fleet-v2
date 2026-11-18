@@ -48,6 +48,7 @@ import type {
   NoDecisionsSection,
   NoForgeSection,
   OpencodeHostRunnerSection,
+  OwnerSection,
   PolicySection,
   ProcedureCoverage,
   ReviewerSection,
@@ -86,6 +87,7 @@ export const V1_ROOT_KEYS: readonly string[] = freezeKeys<FleetInstallationV1>()
   'reviewer',
   'waves',
   'shelf',
+  'owner',
 ]);
 
 export const RUNNER_KEYS: readonly string[] = freezeKeys<RunnerSection>()([
@@ -129,6 +131,9 @@ export const WAVES_KEYS: readonly string[] = freezeKeys<WavesSection>()([
   'ownerPublicKey',
 ]);
 
+/** `owner` keys in the writer's stable order. */
+export const OWNER_KEYS: readonly string[] = freezeKeys<OwnerSection>()(['publicKey']);
+
 // ---------------------------------------------------------------------------
 // v2 root and non-policy blocks
 // ---------------------------------------------------------------------------
@@ -146,6 +151,7 @@ export const V2_ROOT_KEYS: readonly string[] = freezeKeys<FleetInstallationV2>()
   'waves',
   'decisions',
   'daemon',
+  'owner',
   'stateDir',
 ]);
 

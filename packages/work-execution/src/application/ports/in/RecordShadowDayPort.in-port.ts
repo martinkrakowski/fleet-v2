@@ -40,6 +40,17 @@ export type RecordShadowDayResult =
       readonly revision: number;
       readonly recorded: Partial<Record<CutoverShadowCriterion, 'pass' | 'fail'>>;
       readonly unevaluated: readonly RecordShadowDayUnevaluated[];
+      /**
+       * Present only when S5' was evaluated (absent when it is unevaluated
+       * or `not-wired`): S5''s non-digested unresolved diagnostics — the
+       * full deduped count of day-scoped carry decisions the resolver left
+       * `unknown`, plus at most `SHADOW_CARRY_MAX_UNRESOLVED_IDS` bounded
+       * ids for them. Never part of any verdict digest.
+       */
+      readonly premergeCarry?: {
+        readonly unresolvedCount: number;
+        readonly unresolvedIds: readonly string[];
+      };
     }
   | { readonly outcome: 'refused'; readonly reason: RecordShadowDayRefusalReason }
   | { readonly outcome: 'unknown'; readonly reason: RecordShadowDayUnknownReason };

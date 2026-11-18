@@ -608,12 +608,15 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     expect(calls).toEqual([{ root: '/srv/fleet' }]);
   });
 
-  // Luna's pre-merge fix 1: the composition's `premergeCarry` must give the
-  // resolver `unknown` (owner decision), so S5' records `unknown` and never
-  // `pass` when there are carry decisions. If the composition were mutated to
-  // answer `agree` (mirroring the shell's answer), S5' would record `pass`
-  // (`carry-decisions-equal`) and this test would fail on the pinned reason.
-  it("records S5 as fleet-carry-unknown, never pass, for one shell carry decision: the composition's premergeCarry answers unknown", async () => {
+  // 2026-11-18 owner decision: with the composed `premergeCarry` resolver
+  // pinned to `unknown`, S5' compares nothing (there is nothing resolvable)
+  // and records `pass` (`carry-decisions-equal`) with `compared: 0` — never a
+  // refusal. The unresolved decision is surfaced instead in the CLI JSON
+  // output's non-digested diagnostics: `unresolvedCount` 1 plus the bounded
+  // `unresolvedIds` (`12@` + the 12-hex head prefix). If the composition were
+  // mutated to answer `agree` (mirroring the shell's answer), S5' would
+  // compare 1 and this test would fail on `compared` and the diagnostics.
+  it('records S5 as pass with compared 0 and the unresolved diagnostics when the composed premergeCarry answers unknown', async () => {
     const { stateDir, fixtureDir } = newDirs();
     await shellFixture(fixtureDir);
     // One paired shell carry decision inside the recorded day: an update
@@ -639,10 +642,14 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       if (result.outcome !== 'recorded') {
         throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
       }
-      // The day is recorded, but S5' is unevaluated with the unknown-fleet
-      // reason: `unknown` is never resolved into a pass or a fail.
-      expect(result.recorded.S5).toBeUndefined();
-      expect(reasonsOf(result).S5).toBe('fleet-carry-unknown');
+      // The day records S5 as a pass over an empty resolvable set, with the
+      // unresolved decision printed in the `record-day` JSON output.
+      expect(result.recorded.S5).toBe('pass');
+      expect(reasonsOf(result).S5).toBeUndefined();
+      expect(result.premergeCarry).toEqual({
+        unresolvedCount: 1,
+        unresolvedIds: [`12@${newHead.slice(0, 12)}`],
+      });
     } finally {
       vi.useRealTimers();
     }

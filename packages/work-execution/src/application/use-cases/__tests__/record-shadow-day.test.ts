@@ -569,11 +569,15 @@ function expectedS7Digest(day: string, status: string, reason: string): string {
 }
 
 /**
- * The canonical S5' summary digest: the base plus `compared` only — the count
- * of deduped, day-scoped carry decisions the evaluator compared, which is
- * closed-day deterministic (zero on a day with no carry decisions).
- * `laxCarries` and `stricterNoCarries` depend on the resolver's answers
- * between runs and stay on the outcome as non-digested diagnostics.
+ * The canonical S5' summary digest: the base plus `compared` only. Per the
+ * 2026-11-18 owner decision `compared` counts the resolved (`carry`/
+ * `no-carry`) day-scoped decisions only, so it is resolver-dependent —
+ * deterministic at `0` while the composition pins the resolver to
+ * `'unknown'`. The unresolved diagnostics (`unresolvedCount`,
+ * `unresolvedIds`) and the per-decision answers (`laxCarries`,
+ * `stricterNoCarries`) stay on the outcome as non-digested diagnostics, so a
+ * rerun whose only difference is which decisions stayed unresolved cannot
+ * silently become a verdict conflict.
  */
 function expectedS5Digest(day: string, status: string, reason: string, compared: number): string {
   return sha256HexDigest(JSON.stringify({ criterion: 'S5', day, status, reason, compared }));
@@ -931,6 +935,13 @@ function constantPremergeCarry(
     }
     return answer;
   };
+}
+
+/** A resolver answering per pull request; an unlisted PR reads as `unknown`. */
+function prMapPremergeCarry(
+  answers: Readonly<Record<number, PremergeCarryAnswer>>,
+): NonNullable<RecordShadowDayDependencies['premergeCarry']> {
+  return async (input) => answers[input.decision.pullRequest] ?? 'unknown';
 }
 
 /** A resolver that throws on every call: the use case must read that as `unknown`. */
@@ -2864,32 +2875,110 @@ describe('RecordShadowDayUseCase', () => {
     expect((calls.decisions[0] as { atIso: string }).atIso).toBe(`${DAY}T09:05:00Z`);
   });
 
-  it('reports S5 unevaluated (fleet-carry-unknown) when premergeCarry throws or returns unknown', async () => {
+  it('records S5 as pass (compared 0) with the unresolved diagnostics when premergeCarry throws, answers unknown, or answers out of set', async () => {
+    // 2026-11-18 owner decision: a resolver throw, an `unknown` answer and an
+    // out-of-set answer all map to `fleetCarry: 'unknown'` per decision —
+    // recorded in the non-digested unresolved diagnostics, never refused as
+    // `fleet-carry-unknown`, and the resolvable set is empty so the day
+    // passes with `compared: 0` (while the composition pins the resolver to
+    // `'unknown'` this is every day with a paired shell log).
+    const expectedUnresolved = { unresolvedCount: 1, unresolvedIds: [`12@${HEAD_D.slice(0, 12)}`] };
+    const expectedVerdict = {
+      verdict: 'pass',
+      reason: 'carry-decisions-equal',
+      digest: expectedS5Digest(DAY, 'pass', 'carry-decisions-equal', 0),
+      recordedAtIso: RECORDED_AT_ISO,
+    };
+
     // The resolver throws.
     const throwing = wiredHarness(carryFixture(), {});
     setPremergeCarry(throwing, throwingPremergeCarry());
     const thrownResult = await new RecordShadowDayUseCase(throwing.deps).execute(makeRequest());
     expectRecorded(thrownResult);
-    const thrownReasons = new Map(thrownResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
-    expect(thrownReasons.get('S5')).toBe('fleet-carry-unknown');
-    expect(thrownResult.recorded.S5).toBeUndefined();
+    expect(thrownResult.recorded.S5).toBe('pass');
+    expect(thrownResult.premergeCarry).toEqual(expectedUnresolved);
+    expect(throwing.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S5).toEqual(expectedVerdict);
 
     // The resolver answers `unknown`.
     const unknown = wiredHarness(carryFixture(), {});
     setPremergeCarry(unknown, constantPremergeCarry('unknown'));
     const unknownResult = await new RecordShadowDayUseCase(unknown.deps).execute(makeRequest());
     expectRecorded(unknownResult);
-    const unknownReasons = new Map(unknownResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
-    expect(unknownReasons.get('S5')).toBe('fleet-carry-unknown');
+    expect(unknownResult.recorded.S5).toBe('pass');
+    expect(unknownResult.premergeCarry).toEqual(expectedUnresolved);
+    expect(unknown.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S5).toEqual(expectedVerdict);
 
     // The resolver answers something outside the closed answer set: read as
-    // `unknown`, never as a pass or a fail.
+    // `unknown`, never as a pass or a fail on the decision itself.
     const bogus = wiredHarness(carryFixture(), {});
     setPremergeCarry(bogus, (() => Promise.resolve('bogus' as PremergeCarryAnswer)) as NonNullable<RecordShadowDayDependencies['premergeCarry']>);
     const bogusResult = await new RecordShadowDayUseCase(bogus.deps).execute(makeRequest());
     expectRecorded(bogusResult);
-    const bogusReasons = new Map(bogusResult.unevaluated.map((entry) => [entry.criterion, entry.reason]));
-    expect(bogusReasons.get('S5')).toBe('fleet-carry-unknown');
+    expect(bogusResult.recorded.S5).toBe('pass');
+    expect(bogusResult.premergeCarry).toEqual(expectedUnresolved);
+    expect(bogus.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S5).toEqual(expectedVerdict);
+  });
+
+  it('records S5 as pass (compared 1) when one decision is resolved and three are unresolved, digest unchanged from the all-resolved day', async () => {
+    // The mixed day: pr 12 resolves to `carry`; prs 13-15 stay `unknown`.
+    // `compared` counts the resolved decision only, so the S5' digest is the
+    // exact digest of a day with the same single resolved decision and no
+    // unresolved ones — the unresolved diagnostics are never digested.
+    const HEAD_1 = '1'.repeat(40);
+    const HEAD_2 = '2'.repeat(40);
+    const HEAD_3 = '3'.repeat(40);
+    const mixedFixture = carryFixture();
+    mixedFixture.shellLines.push(
+      ...shellCarryPair(`${DAY}T10:04:00Z`, `${DAY}T10:05:00Z`, 13, HEAD_A, HEAD_1, true),
+      ...shellCarryPair(`${DAY}T11:04:00Z`, `${DAY}T11:05:00Z`, 14, HEAD_E, HEAD_2, true),
+      ...shellCarryPair(`${DAY}T14:04:00Z`, `${DAY}T14:05:00Z`, 15, HEAD_B, HEAD_3, false),
+    );
+    const mixed = wiredHarness(mixedFixture, {});
+    setPremergeCarry(mixed, prMapPremergeCarry({ 12: 'carry' }));
+    const mixedResult = await new RecordShadowDayUseCase(mixed.deps).execute(makeRequest());
+    expectRecorded(mixedResult);
+    expect(mixedResult.recorded.S5).toBe('pass');
+    expect(mixedResult.premergeCarry).toEqual({
+      unresolvedCount: 3,
+      unresolvedIds: [`13@${HEAD_1.slice(0, 12)}`, `14@${HEAD_2.slice(0, 12)}`, `15@${HEAD_3.slice(0, 12)}`],
+    });
+    const mixedDigest = mixed.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S5?.digest;
+    expect(mixedDigest).toBe(expectedS5Digest(DAY, 'pass', 'carry-decisions-equal', 1));
+
+    // The all-resolved twin: one resolved agree, zero unresolved — same digest.
+    const allResolved = wiredHarness(carryFixture(), {});
+    setPremergeCarry(allResolved, constantPremergeCarry('carry'));
+    const allResolvedResult = await new RecordShadowDayUseCase(allResolved.deps).execute(makeRequest());
+    expectRecorded(allResolvedResult);
+    expect(allResolvedResult.premergeCarry).toEqual({ unresolvedCount: 0, unresolvedIds: [] });
+    const allResolvedDigest = allResolved.evidence.stored?.days.find((entry) => entry.day === DAY)?.verdicts.S5?.digest;
+    expect(allResolvedDigest).toBe(expectedS5Digest(DAY, 'pass', 'carry-decisions-equal', 1));
+    expect(allResolvedDigest).toBe(mixedDigest);
+  });
+
+  it('records S5 as fail (carry-decision-differs) when a resolvable lax carry sits next to unresolved decisions', async () => {
+    // Any resolvable lax carry still fails the day even when other decisions
+    // are unresolved; the unresolved ones ride along as diagnostics only.
+    const mixedFixture = carryFixture();
+    mixedFixture.shellLines.push(
+      ...shellCarryPair(`${DAY}T10:04:00Z`, `${DAY}T10:05:00Z`, 13, HEAD_A, '1'.repeat(40), true),
+    );
+    const harness = wiredHarness(mixedFixture, {});
+    setPremergeCarry(harness, prMapPremergeCarry({ 12: 'no-carry', 13: 'unknown' }));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S5).toBe('fail');
+    expect(result.premergeCarry).toEqual({
+      unresolvedCount: 1,
+      unresolvedIds: [`13@${'1'.repeat(12)}`],
+    });
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S5).toEqual({
+      verdict: 'fail',
+      reason: 'carry-decision-differs',
+      digest: expectedS5Digest(DAY, 'fail', 'carry-decision-differs', 1),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
   });
 
   it('aborts with deadline-exceeded when the deadline is reached before premergeCarry calls', async () => {
@@ -2939,8 +3028,8 @@ describe('RecordShadowDayUseCase', () => {
 
   it('aborts with deadline-exceeded when the premergeCarry resolver rejects after the deadline passes', async () => {
     // The rejection path: `call` must re-check the deadline even when the
-    // awaited operation REJECTS, otherwise S5 would become unevaluated
-    // (`fleet-carry-unknown`) and a rerun could answer `unchanged` instead
+    // awaited operation REJECTS, otherwise S5 would treat the thrown answer
+    // as an unresolved decision and a rerun could answer `unchanged` instead
     // of aborting with `deadline-exceeded`. The rerun uses the later 12:20
     // deadline (see the fulfilled twin above): with the default 12:05 one,
     // the rerun's S8 sample sleep lands the clock exactly on the deadline

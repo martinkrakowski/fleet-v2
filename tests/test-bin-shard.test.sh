@@ -97,7 +97,9 @@ check '--shard=<i>/<n> is the same as --shard <i>/<n>' '[ "$(rc)" = 0 ] && expec
 # not among the tests, so every real test file is unknown) still yields a deterministic balanced
 # split where every unknown file counts as the 60-second default.
 HEAVY=tests/agy-run.test.sh
-printf '# one known row, everything else falls back to 60s\n%s 999 999\n' "$HEAVY" > "$T/tim"
+# 9999 leaves headroom: every unknown file counts 60, so the fixture stays
+# "heavy alone" while the tests/ directory grows (n x 60 must stay under it).
+printf '# one known row, everything else falls back to 60s\n%s 9999 9999\n' "$HEAVY" > "$T/tim"
 : > "$T/union"
 n=2
 i=1
@@ -125,7 +127,7 @@ check 'a missing FLEET_TEST_BIN_TIMINGS file is the fallback, never an error' '[
 
 # Comments and blank lines in the timings file are ignored: the same rows stripped of them give the
 # identical assignment.
-printf '# header\n\n%s 999 999   # trailing comment\n# another\n' "$HEAVY" > "$T/commented"
+printf '# header\n\n%s 9999 9999   # trailing comment\n# another\n' "$HEAVY" > "$T/commented"
 FLEET_TEST_BIN_TIMINGS=$T/commented
 export FLEET_TEST_BIN_TIMINGS
 run --shard 1/2 --list

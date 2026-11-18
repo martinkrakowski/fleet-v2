@@ -14,6 +14,7 @@ import {
   SHADOW_INTAKE_TIMER_UNIT_KEY,
 } from '../ports/out/DaemonSchedulerPort.out-port.js';
 import type { DaemonSchedulerPort } from '../ports/out/DaemonSchedulerPort.out-port.js';
+import { containsSecretShape } from '@fleet/shared';
 import type {
   ManageDaemonSchedulerPort,
   ManageDaemonSchedulerRequest,
@@ -116,7 +117,9 @@ export type ShadowSchedulerConfigRead =
  * throws; every refusal is `{ ok: false, reason: 'invalid-shadow-config' }`
  * and the input value is never echoed. Each of `repository`, `legacyStateDir`
  * and `projectId` must be a non-empty string carrying no whitespace, `%`,
- * `$`, quote or backslash — the ExecStart substitution rule — and the object
+ * `$`, quote or backslash — the ExecStart substitution rule — and must not
+ * match the repository's secret-shaped detector (`containsSecretShape`):
+ * a credential-shaped value is refused, never rendered. The object
  * must be a plain record with exactly those three own keys. A prototype-
  * polluting own key, an array, a sparse or array-like input is refused.
  */
@@ -155,7 +158,11 @@ export function readShadowSchedulerConfig(
       typeof value !== 'string' ||
       value.length === 0 ||
       value.length > MAX_SHADOW_CONFIG_VALUE_LENGTH ||
-      SHADOW_VALUE_REFUSED_PATTERN.test(value)
+      SHADOW_VALUE_REFUSED_PATTERN.test(value) ||
+      // A secret-shaped value that avoids the substitution characters would
+      // otherwise be rendered into `ExecStart`; screen every unit text value
+      // (including paths) with the repository's existing detector.
+      containsSecretShape(value)
     ) {
       return { ok: false, reason: 'invalid-shadow-config' };
     }

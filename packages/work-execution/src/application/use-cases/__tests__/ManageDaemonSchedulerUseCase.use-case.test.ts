@@ -447,6 +447,26 @@ describe('readShadowSchedulerConfig (OD7a1)', () => {
       }).ok,
     ).toBe(false);
   });
+
+  it('refuses a credential-shaped projectId that avoids the substitution characters', () => {
+    // Built at runtime so no secret literal ever lands in this file.
+    const token = ['sk', '-Ab1', 'xY2zW3'.repeat(4)].join('');
+    expect(token).toMatch(/[A-Za-z0-9_-]{20,}/);
+    expect(readShadowSchedulerConfig({ ...SHADOW_CONFIG, projectId: token })).toEqual({
+      ok: false,
+      reason: 'invalid-shadow-config',
+    });
+  });
+
+  it('refuses a credential-shaped repository that avoids the substitution characters', () => {
+    // Built at runtime so no secret literal ever lands in this file.
+    const token = ['ghp', '_', 'A1b2C3'.repeat(4)].join('');
+    expect(token).toMatch(/[A-Za-z0-9_-]{20,}/);
+    expect(readShadowSchedulerConfig({ ...SHADOW_CONFIG, repository: token })).toEqual({
+      ok: false,
+      reason: 'invalid-shadow-config',
+    });
+  });
 });
 
 describe('ManageDaemonSchedulerUseCase shadow intake (OD7a1)', () => {

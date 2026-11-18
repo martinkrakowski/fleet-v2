@@ -12,7 +12,7 @@ Commands that exist today:
 
 - `fleet-v2 cutover status` is read-only. With no cutover record it exits 0 with `outcome` `completed`, `state` `shadow`, `revision` 0, and `record` null. `withinRollbackWindow` is null when the record is missing or `switchedAtIso` is null.
 - `fleet-v2 cutover shadow report --repository <owner>/<repo> --legacy-state-dir <path>` counts the shell side's queue, parked and in-progress lines, and keys fleet entries by their own recorded base branch rather than assuming `main`. It still compares enqueue sets only, writes nothing, and is still not an S1–S13 verdict. A complete comparison with divergent enqueue sets returns `outcome` `completed` with `equal` false and exits 0, so the exit code alone never signals a divergence — check `equal` and `complete`. Exit 1 means the report is not a pass: `outcome` `unknown` (`shell-state-incomplete`, including a missing `inprogress` in the port's answer), or `refused` (`shell-queue-absent`, `shell-queue-unreadable`, `secret-shaped`), or `complete` false.
-- `fleet-v2 cutover shadow record-day --repository <owner>/<repo> --legacy-state-dir <path> [--day YYYY-MM-DD]` (SH8a) records one UTC day into `<stateDir>/cutover-shadow.json`. Those days are what `cutover switch` reads. `record-day` passes `releaseSha: async () => null` today.
+- `fleet-v2 cutover shadow record-day --repository <owner>/<repo> --legacy-state-dir <path> [--day YYYY-MM-DD]` (SH8a) records one UTC day into `<stateDir>/cutover-shadow.json`. Those days are what `cutover switch` reads. `record-day` derives each day's `releaseSha` from the installed `current` verified release under the release root parsed from the configured `daemon.cliPath` (SH20), returning `null` — and `release-unpinned` for S2/S10/S11 — when that path is unconfigured, not a served release path, or the installed release is missing, unverified, or unreadable.
 - `fleet-v2 merge import --repository <owner>/<repo> --legacy-state-dir <path>` is a dry-run unless `--apply` is paired with `--authority`.
 - `fleet-v2 state check` and `fleet-v2 daemon status` are read-only.
 - `fleet-v2 conductor status` is the status read.
@@ -25,7 +25,7 @@ Status does not evaluate S1–S13. A completed status is not a shadow pass. Do n
 
 `cutover switch` reads `<stateDir>/cutover-shadow.json` via `composeCutoverShadowEvidence`: the newest 3 consecutive UTC days, each bound to one shared non-null `releaseSha`, summed for the 20-merge floor, all S1–S13 recorded as `pass`. `cutover shadow record-day` (SH8a) produces the days this reads. The composer's staleness check uses the daemon clock (`daemon.now()`). It never takes the operator's `--now-iso`. `--now-iso` is the clock the criterion reader uses for its future-day check.
 
-`cutover switch` cannot pass evidence until a release-sha source lands. `record-day` passes `releaseSha: async () => null` today, so every recorded window composes to `release-changed` and the switch refuses `shadow-evidence-absent`. SH20 records the pinned release.
+`cutover switch` cannot pass evidence while the recorded days are unpinned or divergent. Since SH20, `record-day` binds each recorded day to the installed `current` verified release sha (or `null` when unpinned, which still composes to `release-changed` / `shadow-evidence-absent`): a day recorded with no verified `current` release installed keeps every recorded window at `release-changed`, and the switch refuses `shadow-evidence-absent`.
 
 A window that does pass the evidence gate still stops at `unknown` / `unrecorded-lanes-unknown` until `countUnrecordedLanes` is wired. That halt writes no `cutover.json` switch record and no `cutover-journal.json` intent. Preflight runs before any intent is appended.
 
@@ -40,7 +40,7 @@ Fail closed, and never treat an unknown or partial ledger as a pass:
 
 Two residuals this unit does not close. Both are owner preconditions for the unit that wires `countUnrecordedLanes` (CO30c), which becomes the last closed gate:
 
-- Release binding is equality among the three days only. Nothing compares that sha to the installed release.
+- Release binding is still equality among the three days only (narrowed by SH20: each day's `releaseSha` is now derived from the installed `current` verified release at `record-day` time). Nothing compares that recorded sha to the installed `current` release again at `cutover switch` time, so a release installed after the last day is not re-checked.
 - Verdict digests are not re-verified, and there is no evaluator or digest-format version, so an older-format or hand-edited day is not detected. Only shape, freshness, and the lanes gate stand behind a passing window.
 
 Checks the operator can run today, each of which is not itself a completed switch:

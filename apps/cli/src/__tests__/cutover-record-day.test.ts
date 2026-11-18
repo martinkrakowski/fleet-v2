@@ -18,6 +18,7 @@ import {
   ForgeReadAdapter,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  SHADOW_ONE_TIME_REQUIREMENTS,
   ShadowAttestationAdapter,
   type RecordShadowDayDependencies,
 } from '@fleet/work-execution';
@@ -175,8 +176,15 @@ describe('cutover shadow record-day (SH8a)', () => {
 // read-only, and every failure path is a typed unevaluated reason, never a
 // throw and never a quarantined file.
 describe('cutover shadow record-day wiring (SH19c)', () => {
-  /** A minimal valid v2 installation: github forge, a daemon section, no env. */
-  function installationFor(forge: FleetInstallation['forge']): FleetInstallation {
+  /**
+   * A minimal valid v2 installation: github forge, a daemon section, no env.
+   * SH20: `cliPath` defaults to a served release path (`<root>/current/...`)
+   * and may be overridden (a custom path, or `undefined` when unconfigured).
+   */
+  function installationFor(
+    forge: FleetInstallation['forge'],
+    cliPath: string | undefined = '/srv/fleet/current/apps/cli/dist/bin.js',
+  ): FleetInstallation {
     return {
       schemaVersion: 2,
       hosts: {
@@ -215,10 +223,13 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       decisions: { provider: 'none' },
       daemon: {
         nodePath: '/usr/bin/node',
-        cliPath: '/srv/fleet/current/apps/cli/dist/bin.js',
         stateDir: '/srv/fleet/state',
         unitDir: '/srv/fleet/units',
         installationFile: '/srv/fleet/fleet.json',
+        // SH20: `cliPath` is the configured entry point under a release root,
+        // a custom path, or unconfigured — the composition's lexical parse
+        // decides which release root (if any) the day binds to.
+        ...(cliPath !== undefined ? { cliPath } : {}),
       },
       ...(forge !== undefined ? { forge } : {}),
     } as FleetInstallation;
@@ -227,11 +238,14 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
   function wiredRuntime(
     stateDir: string,
     forge: FleetInstallation['forge'] = { mode: 'github', owner: 'fleet', repo: 'v2' },
+    // SH20: an optional custom `daemon.cliPath` — a custom served-release
+    // path, a non-served path, or `undefined` when unconfigured.
+    cliPath?: string,
   ): ReturnType<typeof createFleetCliRuntime> {
     return createFleetCliRuntime({
       stateDir,
       daemonSleep: async () => {},
-      installation: installationFor(forge),
+      installation: installationFor(forge, cliPath),
       // A forge read must never run for an empty day; the stub refuses loudly.
       forgeGhRunner: async () => {
         throw new Error('forge read must not run for an empty day');
@@ -642,6 +656,227 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       }
       // And no quarantine-shaped sibling anywhere under either directory.
       expect([...afterStateFiles.keys()].filter((file) => file.includes('quarantine'))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ---------------------------------------------------------------- SH20 ---
+  // The day's `releaseSha` is derived from the installed `current` verified
+  // release under the release root parsed from `daemon.cliPath`. Every
+  // refusal case below returns `release-unpinned` for S2/S10/S11, creates
+  // nothing under the release root, and leaves the state dir with only the
+  // ledger the use case itself owns.
+
+  /** The three required test paths S2/S10/S11 reserve, from the domain. */
+  const REQUIRED_TEST_PATHS = [
+    ...SHADOW_ONE_TIME_REQUIREMENTS.S2.tests,
+    ...SHADOW_ONE_TIME_REQUIREMENTS.S10.tests,
+    ...SHADOW_ONE_TIME_REQUIREMENTS.S11.tests,
+  ];
+
+  /** One throwaway release root; registered for cleanup like every temp dir. */
+  function newReleaseRoot(): string {
+    const root = mkdtempSync(path.join(tmpdir(), 'fleet-cli-record-day-release-'));
+    tempDirs.push(root);
+    return root;
+  }
+
+  /** One verified build: a sha-named directory with a valid marker file. */
+  async function seedVerifiedBuild(root: string, sha: string): Promise<void> {
+    await fs.mkdir(path.join(root, sha), { recursive: true });
+    await fs.writeFile(
+      path.join(root, sha, '.fleet-release-verified'),
+      JSON.stringify({ version: 1, sha, builtAtIso: '2026-06-01T00:00:00.000Z' }),
+    );
+  }
+
+  /**
+   * Every refusal case shares this: the day still records, S2, S10 and S11
+   * are all unevaluated `release-unpinned`, nothing was created under the
+   * release root (when one exists), and the state dir gained exactly the
+   * ledger `record-day` owns.
+   */
+  async function expectRefusedPinned(options: {
+    readonly runtime: ReturnType<typeof createFleetCliRuntime>;
+    readonly stateDir: string;
+    readonly fixtureDir: string;
+    readonly releaseRoot: string | null;
+  }): Promise<void> {
+    const beforeState = await listFileBytes(options.stateDir);
+    const beforeRoot = options.releaseRoot !== null ? await listFileBytes(options.releaseRoot) : null;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await options.runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: options.fixtureDir,
+        day,
+      });
+      if (result.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      }
+      const reasons = reasonsOf(result);
+      expect(reasons.S2).toBe('release-unpinned');
+      expect(reasons.S10).toBe('release-unpinned');
+      expect(reasons.S11).toBe('release-unpinned');
+      // Nothing was created under the release root.
+      if (options.releaseRoot !== null) {
+        expect(await listFileBytes(options.releaseRoot)).toEqual(beforeRoot);
+      }
+      // And the state dir gained exactly the one ledger file.
+      const afterState = await listFileBytes(options.stateDir);
+      expect(
+        [...afterState.keys()].filter((key) => !beforeState.has(key)),
+      ).toEqual([path.join(options.stateDir, 'cutover-shadow.json')]);
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  /** The SH20 runtime: a state dir, a shell fixture, one `daemon.cliPath`. */
+  async function sh20Runtime(releaseRoot: string | null) {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const cliPath =
+      releaseRoot !== null ? path.join(releaseRoot, 'current/apps/cli/dist/bin.js') : undefined;
+    return {
+      stateDir,
+      fixtureDir,
+      runtime: wiredRuntime(stateDir, undefined, cliPath),
+    };
+  }
+
+  it('refuses when releaseRoot holds only a verified build and no current symlink', async () => {
+    const releaseRoot = newReleaseRoot();
+    await seedVerifiedBuild(releaseRoot, 'a'.repeat(40));
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(releaseRoot);
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot });
+  });
+
+  it('refuses when current is a regular file', async () => {
+    const releaseRoot = newReleaseRoot();
+    await seedVerifiedBuild(releaseRoot, 'a'.repeat(40));
+    await fs.writeFile(path.join(releaseRoot, 'current'), 'not a link');
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(releaseRoot);
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot });
+  });
+
+  it('refuses when current is a directory', async () => {
+    const releaseRoot = newReleaseRoot();
+    await seedVerifiedBuild(releaseRoot, 'a'.repeat(40));
+    await fs.mkdir(path.join(releaseRoot, 'current'));
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(releaseRoot);
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot });
+  });
+
+  it('refuses when current points outside the release root', async () => {
+    const releaseRoot = newReleaseRoot();
+    await seedVerifiedBuild(releaseRoot, 'a'.repeat(40));
+    await fs.writeFile(path.join(releaseRoot, 'outside'), 'x');
+    await fs.symlink('../outside', path.join(releaseRoot, 'current'));
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(releaseRoot);
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot });
+  });
+
+  it('refuses when current points at a non-sha name inside the release root', async () => {
+    const releaseRoot = newReleaseRoot();
+    await seedVerifiedBuild(releaseRoot, 'a'.repeat(40));
+    await fs.mkdir(path.join(releaseRoot, 'some-dir'));
+    await fs.symlink('some-dir', path.join(releaseRoot, 'current'));
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(releaseRoot);
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot });
+  });
+
+  it('refuses when current points at an unverified directory (no marker)', async () => {
+    const releaseRoot = newReleaseRoot();
+    await fs.mkdir(path.join(releaseRoot, 'a'.repeat(40)), { recursive: true });
+    await fs.symlink('a'.repeat(40), path.join(releaseRoot, 'current'));
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(releaseRoot);
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot });
+  });
+
+  it('refuses when the release root is missing (ENOENT)', async () => {    const releaseRoot = newReleaseRoot();
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(releaseRoot);
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot });
+    // The root was never created into: it stays empty.
+    expect(await fs.readdir(releaseRoot)).toEqual([]);
+  });
+
+  it('refuses when the release root is unreadable (chmod 0o000)', async () => {
+    const releaseRoot = newReleaseRoot();
+    await seedVerifiedBuild(releaseRoot, 'a'.repeat(40));
+    await fs.symlink('a'.repeat(40), path.join(releaseRoot, 'current'));
+    const beforeRoot = await listFileBytes(releaseRoot);
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(releaseRoot);
+    await fs.chmod(releaseRoot, 0o000);
+    try {
+      await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot: null });
+    } finally {
+      await fs.chmod(releaseRoot, 0o755);
+    }
+    // The unreadable root itself was never touched.
+    expect(await listFileBytes(releaseRoot)).toEqual(beforeRoot);
+  });
+
+  it('refuses when daemon.cliPath is unconfigured (undefined)', async () => {
+    const { stateDir, fixtureDir, runtime } = await sh20Runtime(null);
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot: null });
+  });
+
+  it('refuses when daemon.cliPath is not a served release path', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const runtime = wiredRuntime(stateDir, undefined, '/srv/fleet/apps/cli/dist/bin.js');
+    await expectRefusedPinned({ runtime, stateDir, fixtureDir, releaseRoot: null });
+  });
+
+  it('binds the day to the installed current verified release sha and moves S2 to not-yet-observed and S10/S11 to pass', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const releaseRoot = newReleaseRoot();
+    const otherSha = 'c'.repeat(40);
+    const currentSha = 'd'.repeat(40);
+    await seedVerifiedBuild(releaseRoot, otherSha);
+    await seedVerifiedBuild(releaseRoot, currentSha);
+    // ONLY current's target tree holds the three required test files.
+    for (const relative of REQUIRED_TEST_PATHS) {
+      await fs.mkdir(path.join(releaseRoot, currentSha, path.dirname(relative)), { recursive: true });
+      await fs.writeFile(path.join(releaseRoot, currentSha, relative), '// required by SHADOW_ONE_TIME_REQUIREMENTS\n');
+    }
+    await fs.symlink(currentSha, path.join(releaseRoot, 'current'));
+    const runtime = wiredRuntime(
+      stateDir,
+      undefined,
+      path.join(releaseRoot, 'current/apps/cli/dist/bin.js'),
+    );
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      if (result.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      }
+      // S2 and S3 move off release-unpinned to not-yet-observed (the
+      // attestations ledger is absent); S10 and S11 record pass.
+      const reasons = reasonsOf(result);
+      expect(reasons.S2).toBe('not-yet-observed');
+      expect(reasons.S3).toBe('not-yet-observed');
+      expect(result.recorded.S10).toBe('pass');
+      expect(result.recorded.S11).toBe('pass');
+      // And the ledger binds the day to current's verified sha.
+      const ledger = JSON.parse(await fs.readFile(path.join(stateDir, 'cutover-shadow.json'), 'utf8')) as {
+        readonly days: readonly { readonly day: string; readonly releaseSha: string | null }[];
+      };
+      expect(ledger.days).toHaveLength(1);
+      expect(ledger.days[0].releaseSha).toBe(currentSha);
+      expect(ledger.days[0].day).toBe(day);
     } finally {
       vi.useRealTimers();
     }

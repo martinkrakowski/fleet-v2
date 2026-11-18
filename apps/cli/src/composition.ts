@@ -155,6 +155,7 @@ import {
   type RunTelemetryMarkPort,
   type HostAudibleAlertPort,
 } from '@fleet/work-execution';
+import { readCurrentReleaseSha } from './shadow-release-sha.js';
 
 import {
   AssessHeadAcceptanceUseCase,
@@ -1472,6 +1473,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const parsedCliPath = parseConfiguredCliPath(installationModel?.daemon?.cliPath);
   const releaseRoot = parsedCliPath.outcome === 'ok' ? parsedCliPath.root : '';
 
+  // SH20: the one release-store reader the record-day composition builds.
+  // Reused in BOTH places below — the one-time criteria's verified-build
+  // inspector and the day's `releaseSha` source — so the sha recorded for the
+  // day is the one `inspectReleaseFiles` inspects.
+  const releaseStore = new ReleaseStoreAdapter();
+
   // SH8a: `cutover shadow record-day` — the shadow day-writer. Durable-state
   // only: without a state directory there is no ledger to write and no fleet
   // stores to check, so the use case stays undefined exactly like every other
@@ -1555,13 +1562,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         // served release path).
         oneTime: {
           attestations: new ShadowAttestationAdapter({ stateDir, readOnly: true }),
-          releaseStore: new ReleaseStoreAdapter(),
+          releaseStore,
           releaseRoot,
         },
-        // OD-4: release binding is not yet built; SH20 (the pinned release sha
-        // source) is not landed on origin/main, so the sha stays null and the
-        // one-time criteria report `release-unpinned` until it lands.
-        releaseSha: async () => null,
+        // SH20: the day's sha is the installed `current` verified release
+        // under the parsed release root — read through the same adapter
+        // instance above — or `null` (S2/S10/S11 `release-unpinned`) when
+        // unconfigured, missing, unverified, or unreadable.
+        releaseSha: () => readCurrentReleaseSha({ releaseStore, releaseRoot }),
         nowIso: daemon.now,
         // OD-1: the owner-accepted default is false, fail-closed; this use case
         // only receives it.

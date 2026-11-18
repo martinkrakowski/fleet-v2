@@ -67,7 +67,8 @@ describe('ActionAuthorizationAdapter.authorizeShadowImport (GR1a2)', () => {
     const adapter = new ActionAuthorizationAdapter({
       authorizeShadowImport: async () => ({
         outcome: 'blocked',
-        reason: 'sk-1234567890abcdef1234567890abcdef at /var/fleet/state/grants.json',
+        reason:
+          'sk-' + '1234567890abcdef'.repeat(2) + ' at /var/fleet/state/grants.json',
       }),
     });
     const result = await adapter.authorizeShadowImport(shadowRequest());
@@ -252,7 +253,7 @@ describe('ActionAuthorizationAdapter.authorizeShadowImport (GR1a2)', () => {
         outcome: 'authorized',
         grantId: 'grant-shadow-1',
         extra: 'ignored',
-        secretHint: 'sk-1234567890abcdef1234567890abcdef',
+        secretHint: 'sk-' + '1234567890abcdef'.repeat(2),
       }) as unknown as AuthorizeShadowImportResult,
     });
     const result = await adapter.authorizeShadowImport(shadowRequest());

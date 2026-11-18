@@ -37,7 +37,8 @@ export type RecordShadowDayUnknownReason =
   | 'ledger-busy'
   | 'deadline-exceeded'
   | 'daemon-events-unavailable'
-  | 's12-unknown';
+  | 's12-unknown'
+  | 'scheduled-evaluation-failed';
 
 export interface RecordShadowDayUnevaluated {
   readonly criterion: CutoverShadowCriterion;

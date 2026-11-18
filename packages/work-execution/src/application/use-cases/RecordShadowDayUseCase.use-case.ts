@@ -693,6 +693,38 @@ function ownDataProperty(value: object, key: string): unknown {
 }
 
 /**
+ * OD7a2 fix round: the ONE validator for the raw daemon events handed back
+ * by `readAfterCursor`. An event is well-formed only when it is a non-null
+ * plain object with own data properties `kind` and `recordedAtIso`, both
+ * strings — no accessor (getter/setter) ever satisfies it, and every
+ * reflective read is wrapped so a Proxy with throwing traps yields `false`
+ * instead of a throw. It is applied exactly once, where the events are read;
+ * every later loop and filter uses the validated array only. Cost is O(1)
+ * per event.
+ */
+function isWellFormedEvent(event: unknown): boolean {
+  try {
+    if (typeof event !== 'object' || event === null) {
+      return false;
+    }
+    const kind = Object.getOwnPropertyDescriptor(event, 'kind');
+    if (kind === undefined || kind.get !== undefined || kind.set !== undefined || typeof kind.value !== 'string') {
+      return false;
+    }
+    const recordedAt = Object.getOwnPropertyDescriptor(event, 'recordedAtIso');
+    if (
+      recordedAt === undefined || recordedAt.get !== undefined || recordedAt.set !== undefined ||
+      typeof recordedAt.value !== 'string'
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Read an outer `attestations.read` result as an EXACT plain record:
  * `status: 'missing'` must carry exactly the own data key `status`, and
  * `status: 'ok'` must carry exactly the own data keys `status` and `ledger`.
@@ -879,7 +911,24 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     };
     // OD7a2: in scheduled mode every guard runs BEFORE the ledger/shell reads
     // and before any other criterion, and a held guard writes nothing.
-    const scheduled = readScheduledFlag(request) === true ? await this.runScheduledPrechecks(context) : null;
+    // OD7a2 fix round: a backstop wraps the whole scheduled evaluation path —
+    // any unexpected exception fails closed as `unknown` and writes nothing.
+    // Deadline handling is untouched: a reached deadline keeps aborting the
+    // run with `deadline-exceeded`.
+    let scheduled: {
+      readonly stop: RecordShadowDayResult | null;
+      readonly tickHealth?: CriterionOutcome;
+    } | null = null;
+    if (readScheduledFlag(request) === true) {
+      try {
+        scheduled = await this.runScheduledPrechecks(context);
+      } catch (error) {
+        if (error instanceof DeadlineReachedError) {
+          throw error;
+        }
+        return { outcome: 'unknown', reason: 'scheduled-evaluation-failed' };
+      }
+    }
     if (scheduled !== null && scheduled.stop !== null) {
       return scheduled.stop;
     }
@@ -950,33 +999,19 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (read.kind === 'threw' || !read.value.ok) {
       return { stop: { outcome: 'unknown', reason: 'daemon-events-unavailable' } };
     }
-    const events = read.value.events;
+    // OD7a2 fix round: the raw events are validated exactly ONCE, here, by
+    // `isWellFormedEvent`; every later loop and filter below uses the
+    // validated array only and may dereference `kind`/`recordedAtIso`
+    // directly. A malformed event is dropped, never thrown on.
+    const validatedEvents = read.value.events.filter((event: unknown) => isWellFormedEvent(event));
     const dayStartMs = serialOfUtcDay(context.day) * DAY_MS;
     let earliestInDayMs: number | null = null;
-    for (const event of events) {
-      // OD7a2 fix round: S12 has not validated the events yet, so this loop
-      // trusts nothing. An event that is not a non-null plain object with an
-      // own data `kind` property is skipped — every property is read through
-      // its own descriptor, so no getter and no Proxy `get` trap ever runs,
-      // and the loop never throws. If every event is malformed the early-tick
-      // guard treats the day as undeterminable and scheduled mode writes
-      // nothing below.
-      if (typeof event !== 'object' || event === null) {
+    for (const event of validatedEvents) {
+      if (event.kind !== 'job') {
         continue;
       }
-      const kindDescriptor = Object.getOwnPropertyDescriptor(event, 'kind');
-      if (
-        kindDescriptor === undefined || kindDescriptor.get !== undefined ||
-        kindDescriptor.set !== undefined || kindDescriptor.value !== 'job'
-      ) {
-        continue;
-      }
-      const recordedAtDescriptor = Object.getOwnPropertyDescriptor(event, 'recordedAtIso');
-      if (recordedAtDescriptor === undefined || recordedAtDescriptor.get !== undefined || recordedAtDescriptor.set !== undefined) {
-        continue;
-      }
-      const recordedAtIso = recordedAtDescriptor.value;
-      if (typeof recordedAtIso !== 'string' || recordedAtIso.slice(0, 10) !== context.day) {
+      const recordedAtIso = event.recordedAtIso;
+      if (recordedAtIso.slice(0, 10) !== context.day) {
         continue;
       }
       const instant = Date.parse(recordedAtIso);
@@ -992,7 +1027,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     }
     // 3. S12 precheck over the windowed events: an unknown evaluation and a
     // `too-few-ticks` failure each stop the run before anything is written.
-    const windowed = events.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
+    const windowed = validatedEvents.filter((event: DaemonEventRecord) => this.inTickWindow(event.recordedAtIso, context.day));
     const evaluation = evaluateShadowTickHealth({ day: context.day, events: windowed });
     const tickHealth: CriterionOutcome = { criterion: 'S12', kind: 'evaluated', evaluation, tickHealth: evaluation };
     if (evaluation.status === 'unknown') {

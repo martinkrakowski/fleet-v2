@@ -4582,4 +4582,69 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
     expect(harness.evidence.calls.cas).toBe(0);
     expect(harness.evidence.stored).toBeNull();
   });
+
+  it('never rejects when the events are a null entry and one valid 00:00Z job tick, and writes nothing', async () => {
+    // The validator drops the null entry, the 00:00Z job tick passes the
+    // first-tick grace, and S12 then refuses the day as too-few-ticks — the
+    // run resolves to a typed skip, never a rejection, and writes nothing.
+    const fixture = cleanFixture(DAY);
+    (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [null, daemonJobEvent(0, DAY)] as unknown as DaemonEventRecord[];
+    const harness = scheduledHarness(fixture);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'skipped', reason: 'too-few-ticks' });
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('resolves to unknown and writes nothing when an event is a Proxy with a throwing getOwnPropertyDescriptor trap', async () => {
+    // The event survives the own-data validator (its `kind`/`recordedAtIso`
+    // are plain own data strings, so the validator's two probes succeed), but
+    // the same trap throws for every projection key S12's exact-keys reader
+    // requests. S12's reader catches the throw as malformed, the day is
+    // undeterminable, and the scheduled run fails closed as unknown writing
+    // nothing — never a sticky verdict, never a rejection.
+    const fixture = cleanFixture(DAY);
+    const poisoned = new Proxy(daemonJobEvent(0, DAY), {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'kind' || key === 'recordedAtIso') {
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        }
+        throw new Error('descriptor trap');
+      },
+    });
+    (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = [poisoned] as unknown as DaemonEventRecord[];
+    const harness = scheduledHarness(fixture);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 's12-unknown' });
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
+  it('resolves to unknown and writes nothing when a stubbed dependency throws inside the scheduled path', async () => {
+    // A stub whose throw is swallowed by `call` would be a typed `threw`
+    // (skip or unknown-daemon-events), so the backstop is exercised by a stub
+    // that throws when the scheduled path READS its returned value, outside
+    // the awaited call: any unexpected exception on that path must fail
+    // closed as `scheduled-evaluation-failed` and write nothing.
+    const harness = scheduledHarness(cleanFixture(DAY), async () => {
+      return new Proxy(
+        { outcome: 'covered' },
+        {
+          get(_target, key) {
+            // `await` probes `.then` on the resolved value; letting that one
+            // through lets the stub reach the caller, whose `.outcome` read
+            // is what explodes.
+            if (key === 'then') {
+              return undefined;
+            }
+            throw new Error('coverage result exploded');
+          },
+        },
+      ) as unknown as { outcome: 'covered' };
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expect(result).toEqual({ outcome: 'unknown', reason: 'scheduled-evaluation-failed' });
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
 });

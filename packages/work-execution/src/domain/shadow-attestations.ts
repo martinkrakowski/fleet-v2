@@ -43,6 +43,13 @@ export interface ShadowAttestation {
   readonly reason: string;
   readonly digest: string;
   readonly recordedAtIso: string;
+  /**
+   * The digest of the operation id that attested this fact (absent in records
+   * written before this field existed). Crash recovery is bound to it: only
+   * the operation that wrote the record may complete its own crashed intent
+   * as `recovered`; any other operation takes the normal attest path.
+   */
+  readonly operationDigest?: string;
 }
 
 export interface ShadowAttestationLedger {
@@ -69,6 +76,7 @@ const ATTESTATION_KEYS: readonly string[] = [
   'digest',
   'recordedAtIso',
 ];
+const ATTESTATION_OPTIONAL_KEYS: readonly string[] = ['operationDigest'];
 
 const INVALID_LEDGER: ShadowAttestationRead = { ok: false, reason: 'invalid-ledger' };
 const UNKNOWN_VERSION: ShadowAttestationRead = { ok: false, reason: 'unknown-version' };
@@ -231,6 +239,7 @@ function copyAttestation(attestation: ShadowAttestation): ShadowAttestation {
     reason: attestation.reason,
     digest: attestation.digest,
     recordedAtIso: attestation.recordedAtIso,
+    ...(attestation.operationDigest === undefined ? {} : { operationDigest: attestation.operationDigest }),
   };
 }
 
@@ -322,7 +331,7 @@ function readNextAttestation(
 }
 
 function readAttestation(raw: unknown): ShadowAttestation | null {
-  const snapshot = readExactPlainRecord(raw, ATTESTATION_KEYS);
+  const snapshot = readPlainRecordWithOptionalKeys(raw, ATTESTATION_KEYS, ATTESTATION_OPTIONAL_KEYS);
   if (snapshot === null) {
     return null;
   }
@@ -336,13 +345,18 @@ function attestationFromSnapshot(snapshot: Record<string, unknown>): ShadowAttes
   const reason = readReason(snapshot.reason);
   const digest = readDigest(snapshot.digest);
   const recordedAtIso = readRecordedAt(snapshot.recordedAtIso);
+  // The operation binding is optional (records written before it existed lack
+  // it); a present but malformed one refuses, and an enumerable getter on it
+  // reads as `undefined`, which refuses too.
+  const operationDigest = Object.hasOwn(snapshot, 'operationDigest') ? readDigest(snapshot.operationDigest) : undefined;
   if (
     fact === null ||
     observedDay === null ||
     release === null ||
     reason === null ||
     digest === null ||
-    recordedAtIso === null
+    recordedAtIso === null ||
+    operationDigest === null
   ) {
     return null;
   }
@@ -353,6 +367,7 @@ function attestationFromSnapshot(snapshot: Record<string, unknown>): ShadowAttes
     reason,
     digest,
     recordedAtIso,
+    ...(operationDigest === undefined ? {} : { operationDigest }),
   };
 }
 

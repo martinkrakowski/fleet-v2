@@ -435,6 +435,32 @@ describe('AttestShadowFactUseCase (AT1)', () => {
     expect(deps.attestations.ledger?.revision).toBe(1);
   });
 
+  it('does not recover a different operation with an identical payload onto the record op A stored: it answers revision-conflict', async () => {
+    // Op A succeeds and stores the fact. Then op B arrives with an IDENTICAL
+    // payload (so the same request digest: the digest excludes the operation
+    // id) under a NEW operation id, with a crashed intent of its own. The
+    // stored record belongs to op A, not to op B, so recovery must not claim
+    // it: op B takes the normal attest path and its stale expectation
+    // answers `revision-conflict`, never `recovered`.
+    const { useCase: attest, deps } = useCase();
+    expect((await attest.execute(baseInput())).outcome).toBe('attested');
+    const digestA = deps.journal.entries.find((entry) => entry.kind === 'intent')?.digest;
+    expect(typeof digestA).toBe('string');
+    // The two operation ids differ in length so the fake length-based
+    // digest gives their bindings different values, as a real hash would.
+    deps.journal.entries.push({
+      key: 'cutover/attest@op-b-retry',
+      kind: 'intent',
+      entryId: 'crashed-operation-B',
+      recordedAtIso: NOW,
+      digest: digestA!,
+    });
+    const result = await attest.execute(baseInput({ operationId: 'op-b-retry' }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
+    expect(deps.journal.entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'recovered')).toBe(false);
+    expect(deps.attestations.ledger?.revision).toBe(1);
+  });
+
   it('answers revision-conflict for an unchanged attest with a stale expectedRevision', async () => {
     // Sticky-unchanged pin: the fact is already recorded, but the caller's
     // expected revision does not match the stored ledger, so the sticky path

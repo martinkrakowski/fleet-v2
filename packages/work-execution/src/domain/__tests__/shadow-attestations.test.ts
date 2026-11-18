@@ -416,6 +416,19 @@ describe('shadow attestation ledger (SH15a)', () => {
       expectReadFailure(ledgerWith([{ ...rawAttestation(), extra: true }]), 'invalid-ledger');
     });
 
+    it('reads an attestation that carries a well-formed operationDigest', () => {
+      const read = readShadowAttestations(ledgerWith([rawAttestation({ operationDigest: OTHER_DIGEST })]));
+      expect(read.ok).toBe(true);
+      if (!read.ok) {
+        throw new Error('expected ok');
+      }
+      expect(read.ledger.attestations[0]?.operationDigest).toBe(OTHER_DIGEST);
+    });
+
+    it('refuses a malformed operationDigest with invalid-ledger', () => {
+      expectReadFailure(ledgerWith([rawAttestation({ operationDigest: 'nothex' })]), 'invalid-ledger');
+    });
+
     it('refuses an attestation missing a key with invalid-ledger', () => {
       const item = rawAttestation();
       delete item.digest;
@@ -745,6 +758,15 @@ describe('shadow attestation ledger (SH15a)', () => {
 
     it('refuses an attestation with an extra key with invalid-input', () => {
       expectWriteFailure(null, { ...rawAttestation(), extra: true }, 'invalid-input');
+    });
+
+    it('records an attestation that carries an operationDigest', () => {
+      const stored = requireLedger(recordShadowAttestation(null, rawAttestation({ operationDigest: OTHER_DIGEST })));
+      expect(stored.attestations[0]?.operationDigest).toBe(OTHER_DIGEST);
+    });
+
+    it('refuses a malformed operationDigest with invalid-input', () => {
+      expectWriteFailure(null, rawAttestation({ operationDigest: 'nothex' }), 'invalid-input');
     });
 
     it('refuses a new fact when the revision is already at MAX_REVISION with invalid-ledger', () => {

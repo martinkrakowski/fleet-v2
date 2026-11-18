@@ -6,7 +6,9 @@
 // without writing again. `note`, `evidence` and `authority` are hashed into
 // the canonical request digest and never stored in any file. `observedDay`
 // and `recordedAtIso` come from the daemon clock, never from the request, so
-// a fact cannot be backdated. Every failure path is a typed refusal or
+// a fact cannot be backdated. The ledger record also carries a digest of the
+// attesting operation id, so crash recovery is bound to the operation that
+// actually wrote the record. Every failure path is a typed refusal or
 // unknown; nothing is written on any refused or unknown outcome before the
 // journal intent is durable. No path or raw input value is ever echoed.
 
@@ -15,7 +17,9 @@ import {
   parseShadowAttestationCommandInput,
   recordShadowAttestation,
   type ShadowAttestation,
+  type ShadowAttestationCommandInput,
   type ShadowAttestationLedger,
+  type ShadowAttestationWrite,
 } from '../../domain/shadow-attestations.js';
 import type {
   AttestShadowFactPort,
@@ -54,6 +58,15 @@ function canonicalAttestationPayload(input: {
   });
 }
 
+/**
+ * The ledger-side binding of an operation id: a digest over the id alone, so
+ * a stored record can be attributed to the operation that wrote it even
+ * though the request digest itself deliberately excludes the id.
+ */
+function operationDigestOf(computeDigest: (text: string) => string, operationId: string): string {
+  return computeDigest(JSON.stringify({ operationId }));
+}
+
 function refuse(reason: AttestShadowFactRefusalReason): AttestShadowFactResult {
   return { outcome: 'refused', reason };
 }
@@ -62,174 +75,240 @@ function unknown(reason: AttestShadowFactUnknownReason): AttestShadowFactResult 
   return { outcome: 'unknown', reason };
 }
 
-/** The UTC day of a journal timestamp, or null when the instant is unusable. */
-function intentDay(recordedAtIso: string): string | null {
-  const parsed = Date.parse(recordedAtIso);
-  if (!Number.isFinite(parsed)) {
-    return null;
-  }
-  return new Date(parsed).toISOString().slice(0, 10);
-}
-
 /** The outcome of one guarded outbound call. */
 type Guarded<T> =
   | { readonly kind: 'value'; readonly value: T }
   | { readonly kind: 'deadline' }
   | { readonly kind: 'threw' };
 
+/** The request as parsed, plus the derived values fixed before any outbound call. */
+interface ParsedAttestation {
+  readonly input: ShadowAttestationCommandInput;
+  /** The canonical request digest (excludes the operation id by design). */
+  readonly digest: string;
+  /** The digest of the operation id alone: the ledger record's operation binding. */
+  readonly operationDigest: string;
+  readonly key: string;
+}
+
+/** The exact-key journal view taken before any write. */
+interface ReplayLookup {
+  readonly intent: CutoverJournalEntry | null;
+  readonly final: CutoverJournalEntry | null;
+}
+
+/** Everything the write and settle helpers need, fixed after replay is ruled out. */
+interface AttestationContext {
+  readonly parsed: ParsedAttestation;
+  readonly intent: CutoverJournalEntry | null;
+  readonly ledger: ShadowAttestationLedger | null;
+  readonly recordedAtIso: string;
+  readonly existing: ShadowAttestation | null;
+  /** The record this operation would write (the stored one when the fact is sticky). */
+  readonly attestation: ShadowAttestation;
+  readonly written: Extract<ShadowAttestationWrite, { readonly ok: true }>;
+}
+
+type Step<T> = { readonly value: T } | { readonly result: AttestShadowFactResult };
+
 export class AttestShadowFactUseCase implements AttestShadowFactPort {
   constructor(private readonly deps: AttestShadowFactDependencies) {}
 
   async execute(request: unknown): Promise<AttestShadowFactResult> {
     try {
-      const parsed = parseShadowAttestationCommandInput(request);
-      if (!parsed.ok) {
-        return refuse(parsed.reason);
+      const parsed = this.parseRequest(request);
+      if ('result' in parsed) {
+        return parsed.result;
       }
-      const input = parsed.value;
-      // `--authority` is only a non-empty label (it is not an owner-only
-      // gate: switch, rollback and retire take none), but it is required:
-      // a missing or blank label is refused before anything is read.
-      if (input.authority.trim() === '') {
-        return refuse('authority-required');
+      const replay = await this.lookupReplay(parsed.value);
+      if ('result' in replay) {
+        return replay.result;
       }
-      // Every field, including the deadline, is read from the parsed
-      // snapshot the domain parser produced, never from the raw request
-      // object: a Proxy `get` trap on the caller's input must never run
-      // after parsing.
-      const deadlineIso = input.deadlineIso;
-      const digest = this.deps.computeDigest(canonicalAttestationPayload(input));
-      const key = `cutover/attest@${input.operationId}`;
-
-      // Idempotency by operation id: the journal's exact-key view decides
-      // between replay, crash recovery and a fresh attestation.
-      const listed = await this.guarded(deadlineIso, () => this.deps.cutoverJournal.listByKeyPrefix(key));
-      if (listed.kind === 'deadline') return unknown('deadline-exceeded');
-      if (listed.kind === 'threw' || listed.value.outcome !== 'listed' || !Array.isArray(listed.value.entries)) {
-        return unknown('journal-unreadable');
+      const context = await this.loadContext(parsed.value, replay.value.intent);
+      if ('result' in context) {
+        return context.result;
       }
-      const entries = listed.value.entries.filter((entry) => entry.key === key);
-      const intent = entries.find((entry) => entry.kind === 'intent') ?? null;
-      const final = entries.find((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous') ?? null;
-      if (intent !== null && intent.digest !== digest) {
-        return refuse('operation-id-conflict');
+      if (!context.value.written.changed) {
+        return this.settleAlreadyRecorded(context.value);
       }
-      if (final !== null) {
-        return this.replayFinal(final, input.fact, deadlineIso);
-      }
-
-      const current = await this.readLedger(deadlineIso);
-      if ('stop' in current) {
-        return current.stop;
-      }
-
-      const daemonNow = this.daemonNow();
-      if (daemonNow === null) {
-        return unknown('clock-unreadable');
-      }
-      const { recordedAtIso, observedDay } = daemonNow;
-
-      const attestation: ShadowAttestation = {
-        fact: input.fact,
-        observedDay,
-        releaseSha: await this.readReleaseSha(),
-        reason: 'owner-attested',
-        digest,
-        recordedAtIso,
-      };
-      const written = recordShadowAttestation(current.ledger, attestation);
-      if (!written.ok) {
-        return unknown('attestations-unreadable');
-      }
-
-      const existing = current.ledger?.attestations.find((item) => item.fact === input.fact) ?? null;
-      if (!written.changed) {
-        // Crash recovery: this operation's intent is durable but has no
-        // final result, and the ledger already holds this exact fact under
-        // this exact payload digest, recorded on the very day this
-        // operation's own intent was made — the compare-and-set landed
-        // before the crash and only the result append was lost. The intent
-        // is completed as `attested` (`recovered`) without comparing
-        // revisions: the stored revision is the crashed call's own
-        // increment, not the caller's expectation, and the fact is already
-        // durably recorded. A different operation with an identical payload
-        // whose write never landed does not own the stored attestation, so
-        // it falls through to the sticky path (and its stale expectation
-        // answers `revision-conflict`).
-        if (
-          intent !== null &&
-          existing !== null &&
-          existing.digest === digest &&
-          existing.observedDay === intentDay(intent.recordedAtIso)
-        ) {
-          const resultFailure = await this.appendCompletedResult(
-            key,
-            digest,
-            'recovered',
-            recordedAtIso,
-            deadlineIso,
-          );
-          if (resultFailure !== null) {
-            return resultFailure;
-          }
-          return { outcome: 'attested', ledger: written.ledger, attestation: existing };
-        }
-        // Sticky facts: a fact already recorded is never rewritten. The
-        // caller's revision must still match the stored ledger (0 when
-        // nothing is stored), exactly as a compare-and-set would demand; the
-        // intent is durable first so the refused result always pairs with one.
-        const intentFailure = await this.appendIntentUnlessRecorded(intent, key, digest, recordedAtIso, deadlineIso);
-        if (intentFailure !== null) {
-          return intentFailure;
-        }
-        if ((current.ledger?.revision ?? 0) !== input.expectedRevision) {
-          return this.refusedOutcome(key, digest, 'revision-conflict', recordedAtIso, deadlineIso);
-        }
-        const resultFailure = await this.appendCompletedResult(
-          key,
-          digest,
-          'unchanged',
-          recordedAtIso,
-          deadlineIso,
-        );
-        if (resultFailure !== null) {
-          return resultFailure;
-        }
-        return {
-          outcome: 'unchanged',
-          ledger: written.ledger,
-          attestation: existing ?? attestation,
-        };
-      }
-
-      const intentFailure = await this.appendIntentUnlessRecorded(intent, key, digest, recordedAtIso, deadlineIso);
-      if (intentFailure !== null) {
-        return intentFailure;
-      }
-
-      const saved = await this.guarded(deadlineIso, () =>
-        this.deps.attestations.compareAndSet({
-          expectedRevision: input.expectedRevision,
-          next: written.ledger,
-          deadlineIso,
-        }),
-      );
-      if (saved.kind === 'deadline') return unknown('deadline-exceeded');
-      if (saved.kind === 'threw') return unknown('attestations-write-refused');
-      if (saved.value.outcome === 'conflict') {
-        return this.refusedOutcome(key, digest, 'revision-conflict', recordedAtIso, deadlineIso);
-      }
-      if (saved.value.outcome === 'refused') {
-        return this.casRefusal(key, digest, saved.value.reason, recordedAtIso, deadlineIso);
-      }
-      const resultFailure = await this.appendCompletedResult(key, digest, 'attested', recordedAtIso, deadlineIso);
-      if (resultFailure !== null) {
-        return resultFailure;
-      }
-      return { outcome: 'attested', ledger: saved.value.ledger, attestation };
+      return this.writeNewAttestation(context.value);
     } catch {
       return refuse('invalid-input');
     }
+  }
+
+  /** Parses and validates the request; nothing outbound has run yet. */
+  private parseRequest(request: unknown): Step<ParsedAttestation> {
+    const parsed = parseShadowAttestationCommandInput(request);
+    if (!parsed.ok) {
+      return { result: refuse(parsed.reason) };
+    }
+    // `--authority` is only a non-empty label (it is not an owner-only
+    // gate: switch, rollback and retire take none), but it is required:
+    // a missing or blank label is refused before anything is read.
+    if (parsed.value.authority.trim() === '') {
+      return { result: refuse('authority-required') };
+    }
+    return { value: this.withDerivedValues(parsed.value) };
+  }
+
+  /** Freezes the digest, operation binding and journal key from the parsed snapshot. */
+  private withDerivedValues(input: ShadowAttestationCommandInput): ParsedAttestation {
+    // Every field, including the deadline, is read from the parsed snapshot
+    // the domain parser produced, never from the raw request object: a
+    // Proxy `get` trap on the caller's input must never run after parsing.
+    const digest = this.deps.computeDigest(canonicalAttestationPayload(input));
+    return {
+      input,
+      digest,
+      operationDigest: operationDigestOf(this.deps.computeDigest, input.operationId),
+      key: `cutover/attest@${input.operationId}`,
+    };
+  }
+
+  /**
+   * Idempotency by operation id: the journal's exact-key view decides
+   * between replay, crash recovery and a fresh attestation. A mismatching
+   * intent digest under this operation's own key is a conflict; a final
+   * result replays without writing.
+   */
+  private async lookupReplay(parsed: ParsedAttestation): Promise<Step<ReplayLookup>> {
+    const listed = await this.guarded(parsed.input.deadlineIso, () =>
+      this.deps.cutoverJournal.listByKeyPrefix(parsed.key),
+    );
+    if (listed.kind === 'deadline') return { result: unknown('deadline-exceeded') };
+    if (listed.kind === 'threw' || listed.value.outcome !== 'listed' || !Array.isArray(listed.value.entries)) {
+      return { result: unknown('journal-unreadable') };
+    }
+    const entries = listed.value.entries.filter((entry) => entry.key === parsed.key);
+    const intent = entries.find((entry) => entry.kind === 'intent') ?? null;
+    if (intent !== null && intent.digest !== parsed.digest) {
+      return { result: refuse('operation-id-conflict') };
+    }
+    const final = entries.find((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous') ?? null;
+    if (final !== null) {
+      return { result: await this.replayFinal(final, parsed.input.fact, parsed.input.deadlineIso) };
+    }
+    return { value: { intent, final: null } };
+  }
+
+  /** Reads the ledger and clock, and computes what this operation would write. */
+  private async loadContext(parsed: ParsedAttestation, intent: CutoverJournalEntry | null): Promise<Step<AttestationContext>> {
+    const current = await this.readLedger(parsed.input.deadlineIso);
+    if ('stop' in current) {
+      return { result: current.stop };
+    }
+    const clock = this.daemonNow();
+    if (clock === null) {
+      return { result: unknown('clock-unreadable') };
+    }
+    const attestation = await this.attestationFor(parsed, clock);
+    const written = recordShadowAttestation(current.ledger, attestation);
+    if (!written.ok) {
+      return { result: unknown('attestations-unreadable') };
+    }
+    const existing = current.ledger?.attestations.find((item) => item.fact === parsed.input.fact) ?? null;
+    return {
+      value: {
+        parsed,
+        intent,
+        ledger: current.ledger,
+        recordedAtIso: clock.recordedAtIso,
+        existing,
+        attestation,
+        written,
+      },
+    };
+  }
+
+  /**
+   * The fact is already in the ledger. Crash recovery first: this
+   * operation's own intent is durable but has no final result, AND the
+   * stored record belongs to this very operation (its `operationDigest`
+   * names it) under this exact payload digest — the compare-and-set landed
+   * before the crash and only the result append was lost. The intent is
+   * completed as `attested` (`recovered`) without comparing revisions. Any
+   * other match — a record another operation wrote, or no intent of this
+   * operation's own — is the normal attest path: the sticky `unchanged`, or
+   * `revision-conflict` per the compare-and-set rules. Never `recovered`.
+   */
+  private async settleAlreadyRecorded(context: AttestationContext): Promise<AttestShadowFactResult> {
+    const { parsed, intent, recordedAtIso, existing } = context;
+    const deadlineIso = parsed.input.deadlineIso;
+    if (
+      intent !== null &&
+      existing !== null &&
+      existing.digest === parsed.digest &&
+      existing.operationDigest === parsed.operationDigest
+    ) {
+      const resultFailure = await this.appendCompletedResult(parsed.key, parsed.digest, 'recovered', recordedAtIso, deadlineIso);
+      if (resultFailure !== null) {
+        return resultFailure;
+      }
+      return { outcome: 'attested', ledger: context.written.ledger, attestation: existing };
+    }
+    // Sticky facts: a fact already recorded is never rewritten. The caller's
+    // revision must still match the stored ledger (0 when nothing is
+    // stored), exactly as a compare-and-set would demand; the intent is
+    // durable first so the refused result always pairs with one.
+    const intentFailure = await this.appendIntentUnlessRecorded(intent, parsed.key, parsed.digest, recordedAtIso, deadlineIso);
+    if (intentFailure !== null) {
+      return intentFailure;
+    }
+    if ((context.ledger?.revision ?? 0) !== parsed.input.expectedRevision) {
+      return this.refusedOutcome(parsed.key, parsed.digest, 'revision-conflict', recordedAtIso, deadlineIso);
+    }
+    const resultFailure = await this.appendCompletedResult(parsed.key, parsed.digest, 'unchanged', recordedAtIso, deadlineIso);
+    if (resultFailure !== null) {
+      return resultFailure;
+    }
+    return { outcome: 'unchanged', ledger: context.written.ledger, attestation: existing ?? context.attestation };
+  }
+
+  /** The compare-and-set write path for a fact not yet recorded. */
+  private async writeNewAttestation(context: AttestationContext): Promise<AttestShadowFactResult> {
+    const { parsed, recordedAtIso } = context;
+    const deadlineIso = parsed.input.deadlineIso;
+    const intentFailure = await this.appendIntentUnlessRecorded(context.intent, parsed.key, parsed.digest, recordedAtIso, deadlineIso);
+    if (intentFailure !== null) {
+      return intentFailure;
+    }
+    const saved = await this.guarded(deadlineIso, () =>
+      this.deps.attestations.compareAndSet({
+        expectedRevision: parsed.input.expectedRevision,
+        next: context.written.ledger,
+        deadlineIso,
+      }),
+    );
+    if (saved.kind === 'deadline') return unknown('deadline-exceeded');
+    if (saved.kind === 'threw') return unknown('attestations-write-refused');
+    if (saved.value.outcome === 'conflict') {
+      return this.refusedOutcome(parsed.key, parsed.digest, 'revision-conflict', recordedAtIso, deadlineIso);
+    }
+    if (saved.value.outcome === 'refused') {
+      return this.casRefusal(parsed.key, parsed.digest, saved.value.reason, recordedAtIso, deadlineIso);
+    }
+    const resultFailure = await this.appendCompletedResult(parsed.key, parsed.digest, 'attested', recordedAtIso, deadlineIso);
+    if (resultFailure !== null) {
+      return resultFailure;
+    }
+    return { outcome: 'attested', ledger: saved.value.ledger, attestation: context.attestation };
+  }
+
+  /** The record this operation writes: the request digest plus this operation's binding. */
+  private async attestationFor(
+    parsed: ParsedAttestation,
+    clock: { readonly recordedAtIso: string; readonly observedDay: string },
+  ): Promise<ShadowAttestation> {
+    return {
+      fact: parsed.input.fact,
+      observedDay: clock.observedDay,
+      releaseSha: await this.readReleaseSha(),
+      reason: 'owner-attested',
+      digest: parsed.digest,
+      recordedAtIso: clock.recordedAtIso,
+      operationDigest: parsed.operationDigest,
+    };
   }
 
   /** True once `deadlineIso` is reached; an unusable clock counts as reached (fail closed). */

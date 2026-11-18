@@ -4465,6 +4465,26 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
     expect(threw.evidence.calls.cas).toBe(0);
   });
 
+  // OD7a2 fix round: the grant guard is an allow-list — recording may proceed
+  // ONLY when the reader returns exactly `{ outcome: 'covered' }`. Every other
+  // value (an unrecognized outcome, a malformed object, `null`) is skipped and
+  // writes nothing.
+  it.each([
+    ['{ outcome: bogus }', { outcome: 'bogus' }],
+    ['{ outcome: unknown }', { outcome: 'unknown' }],
+    ['{}', {}],
+    ['null', null],
+  ])('scheduled mode writes nothing when the coverage reader returns %s', async (_name, value) => {
+    const harness = scheduledHarness(
+      cleanFixture(DAY),
+      async () => value as { outcome: 'covered' },
+    );
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(result, 'grant-unavailable');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
+  });
+
   it('scheduled mode fails closed with unknown when daemon events are unreadable', async () => {
     for (const mode of ['throws', 'not-ok'] as const) {
       const harness = scheduledHarness(cleanFixture(DAY));

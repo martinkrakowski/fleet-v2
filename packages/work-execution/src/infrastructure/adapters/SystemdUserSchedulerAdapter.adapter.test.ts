@@ -283,6 +283,33 @@ describe('SystemdUserSchedulerAdapter', () => {
     ).resolves.toEqual({ service: 'unchanged', timer: 'unchanged' });
   });
 
+  // OD7a2 fix round: the shadowRecordDay pair is handled independently of
+  // shadowIntake — a render may carry it without any intake units.
+  it('read and write handle shadowRecordDay with no shadowIntake', async () => {
+    const dir = makeTempDir();
+    const adapter = new SystemdUserSchedulerAdapter({ unitDir: dir });
+    const shadowRecordDay = {
+      service: SHADOW_SERVICE_TEXT,
+      timer: SHADOW_TIMER_TEXT,
+    };
+    await expect(
+      adapter.write({ service: SERVICE_TEXT, timer: TIMER_TEXT, shadowRecordDay }),
+    ).resolves.toEqual({
+      service: 'written',
+      timer: 'written',
+      shadowRecordDay: { service: 'written', timer: 'written' },
+    });
+    expect(existsSync(path.join(dir, SHADOW_INTAKE_SERVICE_UNIT_KEY))).toBe(false);
+    expect(existsSync(path.join(dir, SHADOW_INTAKE_TIMER_UNIT_KEY))).toBe(false);
+    await expect(
+      adapter.read({ service: SERVICE_TEXT, timer: TIMER_TEXT, shadowRecordDay }),
+    ).resolves.toEqual({
+      service: 'unchanged',
+      timer: 'unchanged',
+      shadowRecordDay: { service: 'unchanged', timer: 'unchanged' },
+    });
+  });
+
   it('a symlink at a shadow intake unit is unreadable and never followed (OD7a1)', async () => {
     const dir = makeTempDir();
     const outside = path.join(dir, 'outside');

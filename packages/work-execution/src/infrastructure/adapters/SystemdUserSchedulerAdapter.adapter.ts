@@ -52,37 +52,45 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
       DAEMON_TIMER_UNIT_KEY,
       input.timer,
     );
-    if (input.shadowIntake === undefined) {
-      return { service, timer };
-    }
-    const shadowService = await readUnit(
-      this.options.unitDir,
-      SHADOW_INTAKE_SERVICE_UNIT_KEY,
-      input.shadowIntake.service,
-    );
-    const shadowTimer = await readUnit(
-      this.options.unitDir,
-      SHADOW_INTAKE_TIMER_UNIT_KEY,
-      input.shadowIntake.timer,
-    );
-    if (input.shadowRecordDay === undefined) {
-      return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
-    }
-    const recordDayService = await readUnit(
-      this.options.unitDir,
-      SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
-      input.shadowRecordDay.service,
-    );
-    const recordDayTimer = await readUnit(
-      this.options.unitDir,
-      SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
-      input.shadowRecordDay.timer,
-    );
+    // OD7a2 fix round: the shadowIntake and shadowRecordDay pairs are handled
+    // independently — a render may carry either without the other.
+    const intakeService = input.shadowIntake === undefined
+      ? undefined
+      : await readUnit(
+        this.options.unitDir,
+        SHADOW_INTAKE_SERVICE_UNIT_KEY,
+        input.shadowIntake.service,
+      );
+    const intakeTimer = input.shadowIntake === undefined
+      ? undefined
+      : await readUnit(
+        this.options.unitDir,
+        SHADOW_INTAKE_TIMER_UNIT_KEY,
+        input.shadowIntake.timer,
+      );
+    const recordDayService = input.shadowRecordDay === undefined
+      ? undefined
+      : await readUnit(
+        this.options.unitDir,
+        SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+        input.shadowRecordDay.service,
+      );
+    const recordDayTimer = input.shadowRecordDay === undefined
+      ? undefined
+      : await readUnit(
+        this.options.unitDir,
+        SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
+        input.shadowRecordDay.timer,
+      );
     return {
       service,
       timer,
-      shadowIntake: { service: shadowService, timer: shadowTimer },
-      shadowRecordDay: { service: recordDayService, timer: recordDayTimer },
+      ...(intakeService === undefined || intakeTimer === undefined
+        ? {}
+        : { shadowIntake: { service: intakeService, timer: intakeTimer } }),
+      ...(recordDayService === undefined || recordDayTimer === undefined
+        ? {}
+        : { shadowRecordDay: { service: recordDayService, timer: recordDayTimer } }),
     };
   }
 
@@ -100,37 +108,45 @@ export class SystemdUserSchedulerAdapter implements DaemonSchedulerPort {
       DAEMON_TIMER_UNIT_KEY,
       input.timer,
     );
-    if (input.shadowIntake === undefined) {
-      return { service, timer };
-    }
-    const shadowService = await writeUnit(
-      this.options.unitDir,
-      SHADOW_INTAKE_SERVICE_UNIT_KEY,
-      input.shadowIntake.service,
-    );
-    const shadowTimer = await writeUnit(
-      this.options.unitDir,
-      SHADOW_INTAKE_TIMER_UNIT_KEY,
-      input.shadowIntake.timer,
-    );
-    if (input.shadowRecordDay === undefined) {
-      return { service, timer, shadowIntake: { service: shadowService, timer: shadowTimer } };
-    }
-    const recordDayService = await writeUnit(
-      this.options.unitDir,
-      SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
-      input.shadowRecordDay.service,
-    );
-    const recordDayTimer = await writeUnit(
-      this.options.unitDir,
-      SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
-      input.shadowRecordDay.timer,
-    );
+    // OD7a2 fix round: the shadowIntake and shadowRecordDay pairs are handled
+    // independently — a render may carry either without the other.
+    const intakeService = input.shadowIntake === undefined
+      ? undefined
+      : await writeUnit(
+        this.options.unitDir,
+        SHADOW_INTAKE_SERVICE_UNIT_KEY,
+        input.shadowIntake.service,
+      );
+    const intakeTimer = input.shadowIntake === undefined
+      ? undefined
+      : await writeUnit(
+        this.options.unitDir,
+        SHADOW_INTAKE_TIMER_UNIT_KEY,
+        input.shadowIntake.timer,
+      );
+    const recordDayService = input.shadowRecordDay === undefined
+      ? undefined
+      : await writeUnit(
+        this.options.unitDir,
+        SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+        input.shadowRecordDay.service,
+      );
+    const recordDayTimer = input.shadowRecordDay === undefined
+      ? undefined
+      : await writeUnit(
+        this.options.unitDir,
+        SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
+        input.shadowRecordDay.timer,
+      );
     return {
       service,
       timer,
-      shadowIntake: { service: shadowService, timer: shadowTimer },
-      shadowRecordDay: { service: recordDayService, timer: recordDayTimer },
+      ...(intakeService === undefined || intakeTimer === undefined
+        ? {}
+        : { shadowIntake: { service: intakeService, timer: intakeTimer } }),
+      ...(recordDayService === undefined || recordDayTimer === undefined
+        ? {}
+        : { shadowRecordDay: { service: recordDayService, timer: recordDayTimer } }),
     };
   }
 

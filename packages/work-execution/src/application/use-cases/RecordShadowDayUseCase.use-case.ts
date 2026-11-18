@@ -984,14 +984,20 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
     if (coverage === undefined) {
       return { stop: skippedResult('grant-unavailable') };
     }
+    // OD7a2 fix round: allow-list check — recording may proceed ONLY when the
+    // coverage result is exactly `{ outcome: 'covered' }`. Every other value
+    // (`not-covering`, `unavailable`, `unknown`, an unrecognized outcome, a
+    // malformed object) or a thrown error fails closed and writes nothing.
     const grant = await this.call(context.deadlineIso, () =>
       coverage({ day: context.day, repository: context.repository }),
     );
-    if (grant.kind === 'threw' || grant.value.outcome === 'unavailable') {
-      return { stop: skippedResult('grant-unavailable') };
-    }
-    if (grant.value.outcome === 'not-covering') {
-      return { stop: skippedResult('grant-not-covering-day') };
+    const grantOutcome = grant.kind === 'threw' ? undefined : grant.value?.outcome;
+    if (grantOutcome !== 'covered') {
+      return {
+        stop: skippedResult(
+          grantOutcome === 'not-covering' ? 'grant-not-covering-day' : 'grant-unavailable',
+        ),
+      };
     }
     // 2. Events read and first-tick `job` guard: only `job` events count, and
     // the earliest in-day one must fall within the first-tick grace window.

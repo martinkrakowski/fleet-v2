@@ -11,15 +11,15 @@
 import { accessSync, constants, statSync } from 'node:fs';
 import { types } from 'node:util';
 
-import type { SpawnRunOptions, SpawnRunOutcome } from './spawn-run';
-import { allowListedChildEnv, runSpawnOutcome } from './spawn-run';
-import { isPlainRecordObject } from '../../domain/record-schema-version';
-import { TRAIN_HEALTH_SENTENCE_MAX_LENGTH } from '../../domain/train-health-announcements';
+import type { SpawnRunOptions, SpawnRunOutcome } from './spawn-run.js';
+import { allowListedChildEnv, runSpawnOutcome } from './spawn-run.js';
+import { isPlainRecordObject } from '../../domain/record-schema-version.js';
+import { TRAIN_HEALTH_SENTENCE_MAX_LENGTH } from '../../domain/train-health-announcements.js';
 import type {
   HostAudibleAlertPort,
   HostAudibleAlertRequest,
   HostAudibleAlertResult,
-} from '../../application/ports/out/HostAudibleAlertPort.out-port';
+} from '../../application/ports/out/HostAudibleAlertPort.out-port.js';
 
 /** Fixed absolute candidate paths for the speech client binary. */
 export const SPD_SAY_BINARY_CANDIDATES: readonly string[] = ['/usr/bin/spd-say', '/usr/local/bin/spd-say'];

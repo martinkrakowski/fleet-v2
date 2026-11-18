@@ -25,6 +25,7 @@ import {
   shadowImportDigestPayload,
 } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
+import { readPlainObjectLoose } from '../../domain/record-input.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type {
   ResolveActionAuthorizationPort,
@@ -84,6 +85,33 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (typeof input !== 'object' || input === null) {
       throw new Error('Not implemented: ResolveActionAuthorizationUseCase');
     }
+    // Standing shadow import grant (owner decision 2026-11-18): the resolve
+    // is head-free — the grant is bound by its digest-bound request id, its
+    // exact repository and its capped expiry, never by a commit. Its clock is
+    // the composition root's alone: any `nowIso` on the request is ignored,
+    // and an unwired clock or digest fails closed. Every non-shadow path
+    // below keeps exactly its main behaviour.
+    // The shadow path reads the request through a descriptor-safe snapshot
+    // (no getter ever runs, a hostile accessor or proxy is a typed refusal),
+    // so a hostile object can never throw out of the shadow branch.
+    let scope = '';
+    try {
+      scope = (input as ResolveActionAuthorizationRequest).actionScope?.trim?.() ?? '';
+    } catch {
+      return blocked('invalid-request');
+    }
+    if (isShadowImportActionScope(scope)) {
+      let snapshot: Record<string, unknown> | null = null;
+      try {
+        snapshot = readPlainObjectLoose(input);
+      } catch {
+        snapshot = null;
+      }
+      if (snapshot === null) {
+        return blocked('invalid-request');
+      }
+      return this.resolveShadowImport(snapshot as unknown as ResolveActionAuthorizationRequest);
+    }
     const request = input as ResolveActionAuthorizationRequest;
     if (Object.keys(request).length === 0) {
       // The HTTP boundary's empty body object: the resolve is blocked with
@@ -92,15 +120,6 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
       return blocked(
         'an authorization resolve requires a non-empty projectId, actionScope and expectedHeadSha',
       );
-    }
-    // Standing shadow import grant (owner decision 2026-11-18): the resolve
-    // is head-free — the grant is bound by its digest-bound request id, its
-    // exact repository and its capped expiry, never by a commit. Its clock is
-    // the composition root's alone: any `nowIso` on the request is ignored,
-    // and an unwired clock or digest fails closed. Every non-shadow path
-    // below keeps exactly its main behaviour.
-    if (isShadowImportActionScope(request.actionScope?.trim?.() ?? '')) {
-      return this.resolveShadowImport(request);
     }
     for (const field of ['projectId', 'actionScope', 'expectedHeadSha'] as const) {
       if (!isFilled(request[field])) {

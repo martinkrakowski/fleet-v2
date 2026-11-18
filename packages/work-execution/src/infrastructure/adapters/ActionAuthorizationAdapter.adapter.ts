@@ -645,10 +645,14 @@ function readShadowImportRequest(request: unknown): Validated<AuthorizeShadowImp
 /**
  * The delegate's shadow import answer. Only an authorized answer with a
  * bounded, secret-free, path-free grant handle (a non-secret id by design)
- * is passed on; every other shape is unknown, so an unreadable answer is
- * never authority.
+ * that matches the requested grant id is passed on; every other shape is
+ * unknown, so an unreadable answer is never authority. An authorized answer
+ * naming a different grant is a typed refusal, never a pass-through.
  */
-function readShadowImportAnswer(answer: unknown): AuthorizeShadowImportResult {
+function readShadowImportAnswer(
+  answer: unknown,
+  requestedGrantId: string,
+): AuthorizeShadowImportResult {
   const head = readPlainRecord(answer, {
     outcome: { kind: 'literal', values: ['authorized', 'blocked', 'unknown'] },
   });
@@ -661,6 +665,9 @@ function readShadowImportAnswer(answer: unknown): AuthorizeShadowImportResult {
     });
     if (!granted.ok || !isSafeId(granted.value.grantId, MAX_GRANT_ID_LENGTH, true)) {
       return { outcome: 'unknown', reason: 'authorization-unreadable' };
+    }
+    if (granted.value.grantId !== requestedGrantId) {
+      return { outcome: 'blocked', reason: 'grant-id-mismatch' };
     }
     return { outcome: 'authorized', grantId: granted.value.grantId as string };
   }
@@ -903,7 +910,7 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
     } catch {
       return { outcome: 'unknown', reason: 'authorization-unavailable' };
     }
-    return readShadowImportAnswer(answer);
+    return readShadowImportAnswer(answer, validated.value.grantId);
   }
 
   private async resolveThroughDelegate(

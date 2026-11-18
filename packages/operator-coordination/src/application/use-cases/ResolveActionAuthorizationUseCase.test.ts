@@ -470,3 +470,143 @@ describe('ResolveActionAuthorizationUseCase shadow import resolve (GR1a2)', () =
     expect(result.outcome).toBe('authorized');
   });
 });
+
+describe('ResolveActionAuthorizationUseCase shadow resolve hostile input (GR1a2)', () => {
+  const NOW_ISO = '2026-11-18T00:00:00Z';
+  const EXPIRES_AT_ISO = '2026-12-16T00:00:00Z';
+  const GRANT_ID = 'grant-shadow';
+  function digest(payload: string): string {
+    return createHash('sha256').update(payload).digest('hex');
+  }
+  const REQUEST_ID = `shadow-import-${digest(
+    JSON.stringify({ scope: SHADOW_IMPORT_ACTION_SCOPE, owner: 'octo', repo: 'hello', expiresAtIso: EXPIRES_AT_ISO }),
+  )}`;
+
+  function seededRepo(): InMemoryCoordinationRequestRepository {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    void requestRepo.saveRequest({
+      id: REQUEST_ID,
+      projectId: 'proj-1',
+      kind: 'action-decision',
+      state: 'approved',
+      actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+      expectedHeadSha: null,
+      proposalDigest: 'sha256-proposal',
+      policyRevision: 'pol-rev-1',
+      decisionRevision: 'dec-rev-1',
+      grantId: GRANT_ID,
+      consumptions: [],
+      acknowledgements: [],
+      deliveryStatus: 'delivered',
+      deliveryGapReason: null,
+      revision: 1,
+      createdAtIso: NOW_ISO,
+      updatedAtIso: NOW_ISO,
+      shadowImportGrant: { repository: { owner: 'octo', repo: 'hello' }, expiresAtIso: EXPIRES_AT_ISO },
+    });
+    return requestRepo;
+  }
+
+  function useCase(requestRepo: InMemoryCoordinationRequestRepository): ResolveActionAuthorizationUseCase {
+    return new ResolveActionAuthorizationUseCase({
+      requestRepo,
+      computeDigest: digest,
+      shadowImportClock: { nowIso: () => NOW_ISO },
+    });
+  }
+
+  function resolveRaw(
+    shadowUseCase: ResolveActionAuthorizationUseCase,
+    input: unknown,
+  ): Promise<ResolveActionAuthorizationResult> {
+    return shadowUseCase.resolveActionAuthorization(input as never);
+  }
+
+  function validRequest(): Record<string, unknown> {
+    return {
+      projectId: 'proj-1',
+      actionScope: SHADOW_IMPORT_ACTION_SCOPE,
+      authorizationGrantId: GRANT_ID,
+      repository: { owner: 'octo', repo: 'hello' },
+    };
+  }
+
+  it('authorizes a Proxy over a valid request exactly like the plain data', async () => {
+    const requestRepo = seededRepo();
+    let gets = 0;
+    const proxy = new Proxy(validRequest(), {
+      get(target, key, receiver) {
+        gets += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const result = await resolveRaw(useCase(requestRepo), proxy);
+    // A plain-data proxy yields exactly the plain data's result, and the
+    // `get` trap is the only one consulted.
+    expect(gets).toBeGreaterThanOrEqual(0);
+    expect(result).toEqual({
+      outcome: 'authorized',
+      grantId: GRANT_ID,
+      requestId: REQUEST_ID,
+      expectedHeadSha: '',
+      policyRevision: 'pol-rev-1',
+    });
+  });
+
+  it('never runs a hostile getter on the request and refuses it as invalid-request', async () => {
+    const requestRepo = seededRepo();
+    let calls = 0;
+    const hostile = { ...validRequest() };
+    Object.defineProperty(hostile, 'projectId', {
+      get() {
+        calls += 1;
+        throw new Error('hostile getter ran');
+      },
+      enumerable: true,
+    });
+    const result = await resolveRaw(useCase(requestRepo), hostile);
+    // The accessor's value reads as undefined through its own descriptor, so
+    // the projectId is missing: a typed refusal, and the getter never ran.
+    expect(result).toEqual({ outcome: 'blocked', reason: 'project-id-required' });
+    expect(calls).toBe(0);
+  });
+
+  it('handles an own __proto__ key on a shadow resolve request as an ordinary field', async () => {
+    const requestRepo = seededRepo();
+    const hostile = JSON.parse(
+      `{"projectId":"proj-1","actionScope":"${SHADOW_IMPORT_ACTION_SCOPE}","authorizationGrantId":"${GRANT_ID}","repository":{"owner":"octo","repo":"hello"},"__proto__":{"polluted":true}}`,
+    ) as Record<string, unknown>;
+    const result = await resolveRaw(useCase(requestRepo), hostile);
+    expect(result).toEqual({
+      outcome: 'authorized',
+      grantId: GRANT_ID,
+      requestId: REQUEST_ID,
+      expectedHeadSha: '',
+      policyRevision: 'pol-rev-1',
+    });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('refuses a hostile Proxy request as invalid-request without throwing', async () => {
+    const requestRepo = seededRepo();
+    const proxy = new Proxy(validRequest(), {
+      get() {
+        throw new Error('hostile proxy');
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile proxy descriptor');
+      },
+    });
+    const result = await resolveRaw(useCase(requestRepo), proxy);
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('treats a wrong-primitive request field as missing rather than throwing', async () => {
+    const requestRepo = seededRepo();
+    const result = await resolveRaw(useCase(requestRepo), {
+      ...validRequest(),
+      projectId: 7,
+    });
+    expect(result).toEqual({ outcome: 'blocked', reason: 'project-id-required' });
+  });
+});

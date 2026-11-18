@@ -231,4 +231,74 @@ describe('coordination request-decision and revoke-grant (GR1a2)', () => {
     );
     expect(refused.code).not.toBe(0);
   });
+
+  it('refuses a hostile repository value on request-decision (non-zero exit, no throw)', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const refused = await runCoordination(
+      runtime,
+      [
+        'request-decision',
+        '--project-id', 'proj-alpha',
+        '--kind', 'action-decision',
+        '--action-scope', SHADOW_IMPORT_ACTION_SCOPE,
+        '--proposal-digest', 'sha256-proposal',
+        '--policy-revision', 'pol-rev-1',
+        '--repository', 'octo//hello',
+        '--expires-at-iso', futureExpiry(),
+      ],
+      stateDir,
+    );
+    expect(refused.code).not.toBe(0);
+    expect(refused.stderr.join('\n')).toContain('--repository');
+  });
+
+  it('refuses a non-instant expires-at-iso on request-decision (non-zero exit, no throw)', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const refused = await runCoordination(
+      runtime,
+      [
+        'request-decision',
+        '--project-id', 'proj-alpha',
+        '--kind', 'action-decision',
+        '--action-scope', SHADOW_IMPORT_ACTION_SCOPE,
+        '--proposal-digest', 'sha256-proposal',
+        '--policy-revision', 'pol-rev-1',
+        '--repository', 'octo/hello',
+        '--expires-at-iso', 'not-an-instant',
+      ],
+      stateDir,
+    );
+    expect(refused.code).not.toBe(0);
+  });
+
+  it('resolves a hostile repository on shadow resolve-auth to a typed blocked result', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const blocked = await runCoordination(
+      runtime,
+      [
+        'resolve-auth',
+        '--project-id', 'proj-alpha',
+        '--action-scope', SHADOW_IMPORT_ACTION_SCOPE,
+        '--authorization-grant-id', 'grant-shadow-hostile',
+        '--repository', 'no-segment',
+      ],
+      stateDir,
+    );
+    expect(blocked.code).toBe(1);
+    const doc = parseDocument(blocked.stdout);
+    expect(doc.outcome).toBe('blocked');
+    expect(doc.reason).toBe('grant-wrong-repository');
+  });
+
+  it('refuses revoke-grant with an empty grant id as a typed refused result (exit 1)', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    const refused = await runCoordination(runtime, ['revoke-grant', '--grant-id', ''], stateDir);
+    expect(refused.code).toBe(1);
+    const doc = parseDocument(refused.stdout);
+    expect(doc.outcome).toBe('refused');
+  });
 });

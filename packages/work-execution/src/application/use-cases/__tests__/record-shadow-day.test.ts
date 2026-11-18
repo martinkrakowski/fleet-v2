@@ -7,11 +7,19 @@ import type { DaemonEventRecord } from '../../../domain/daemon-events.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { buildLaneRunStepKey, buildMergeKey, laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
 import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.js';
+import {
+  recordShadowAttestation,
+  SHADOW_ATTESTATION_FACTS,
+  SHADOW_ONE_TIME_REQUIREMENTS,
+  type ShadowAttestationLedger,
+} from '../../../domain/shadow-attestations.js';
 import type { ShadowLedger } from '../../../domain/shadow-evidence-ledger.js';
 import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifactAdapter.adapter.js';
 import type { ImportTrainStateKey, ImportTrainStateResult } from '../../ports/in/ImportTrainStatePort.in-port.js';
 import type { ChainListCommand, ChainRepositoryPort } from '../../ports/out/ChainRepositoryPort.out-port.js';
 import type { LegacyTrainEventsRead, LegacyTrainStateRead } from '../../ports/out/LegacyTrainStateReadPort.out-port.js';
+import type { ShadowAttestationPort } from '../../ports/out/ShadowAttestationPort.out-port.js';
+import type { ReleaseStorePort } from '../../ports/out/ReleaseStorePort.out-port.js';
 import type {
   ShadowConformanceRunsDependencies,
   ShadowGateHeadsDependencies,
@@ -51,7 +59,7 @@ const PAST_DEADLINE = '2026-11-17T11:00:00.000Z';
  */
 const RECORDED_AT_ISO = '2026-11-17T12:02:30.000Z';
 const NOT_IMPLEMENTED: readonly CutoverShadowCriterion[] = [
-  'S2', 'S3', 'S10', 'S11', 'S13',
+  'S13',
 ];
 
 /** A valid ULID-shaped id carrying `n` (O1b-1 pattern: `[0-7][Crockford]{25}`). */
@@ -930,6 +938,107 @@ function throwingPremergeCarry(): NonNullable<RecordShadowDayDependencies['preme
   return async () => {
     throw new Error('resolver failed');
   };
+}
+
+/* -------------------------------------------------------------------------
+ * SH19b2: fakes for the one-time shadow criteria's sources — the sticky
+ * attestation ledger store (SH16's read) and SH17's release-file inspector.
+ * ------------------------------------------------------------------------- */
+
+/** The deduplicated required test paths, in the criteria's own fixed order. */
+const REQUIRED_TEST_PATHS: readonly string[] = [
+  ...new Set(Object.values(SHADOW_ONE_TIME_REQUIREMENTS).flatMap((requirement) => [...requirement.tests])),
+];
+
+/** The canonical one-time summary digest: base only, like S8. */
+function expectedOneTimeDigest(criterion: 'S2' | 'S3' | 'S10' | 'S11', day: string, status: string, reason: string): string {
+  return sha256HexDigest(JSON.stringify({ criterion, day, status, reason }));
+}
+
+/** A valid attestation ledger carrying every one-time fact, observed on `observedDay`. */
+function attestationLedger(observedDay: string = DAY): ShadowAttestationLedger {
+  let ledger: unknown = null;
+  for (const fact of SHADOW_ATTESTATION_FACTS) {
+    const write = recordShadowAttestation(ledger, {
+      fact,
+      observedDay,
+      releaseSha: RELEASE,
+      reason: 'one-time-evidence',
+      digest: 'e'.repeat(64),
+      recordedAtIso: `${observedDay}T09:00:00.000Z`,
+    });
+    if (!write.ok) {
+      throw new Error(`fixture attestation refused for ${fact.length} char fact`);
+    }
+    ledger = write.ledger;
+  }
+  return ledger as ShadowAttestationLedger;
+}
+
+/** Every required test present under the verified build, never quarantined.
+ *
+ * SH17's real `files` items are POSITIONAL and carry no `path`, so the fake's
+ * items must not carry one either — the use case zips `files[i]` onto
+ * `paths[i]` itself.
+ */
+function presentReleaseFiles(): { readonly present: boolean; readonly quarantined: boolean | null }[] {
+  return REQUIRED_TEST_PATHS.map(() => ({ present: true, quarantined: false }));
+}
+
+interface OneTimeCalls {
+  read: number;
+  inspect: number;
+  inputs: unknown[];
+}
+
+interface OneTimeOptions {
+  /** The attestations store's `read` result; may throw or return anything. */
+  read?: () => unknown;
+  /** The release store's `inspectReleaseFiles` result; may throw or return anything. */
+  inspect?: (input: { root: string; sha: string; paths: readonly string[] }) => unknown;
+  /** The one release root the day's pinned sha is verified under. */
+  releaseRoot?: string;
+  /** Omits `inspectReleaseFiles` entirely (the optional method is absent). */
+  omitInspect?: boolean;
+}
+
+/** The default one-time dependency set: a missing ledger store and a fully present release tree. */
+function makeOneTime(options: OneTimeOptions = {}): NonNullable<RecordShadowDayDependencies['oneTime']> & { calls: OneTimeCalls } {
+  const calls: OneTimeCalls = { read: 0, inspect: 0, inputs: [] };
+  return {
+    calls,
+    attestations: {
+      read: (async () => {
+        calls.read += 1;
+        if (options.read !== undefined) {
+          return options.read() as Awaited<ReturnType<Pick<ShadowAttestationPort, 'read'>['read']>>;
+        }
+        return { status: 'missing' as const };
+      }) as Pick<ShadowAttestationPort, 'read'>['read'],
+    },
+    releaseStore: (options.omitInspect === true
+      ? {}
+      : {
+          inspectReleaseFiles: (async (input: { root: string; sha: string; paths: readonly string[] }) => {
+            calls.inspect += 1;
+            calls.inputs.push(input);
+            if (options.inspect !== undefined) {
+              return options.inspect(input);
+            }
+            return { outcome: 'read' as const, files: presentReleaseFiles() };
+          }) as unknown as NonNullable<Pick<ReleaseStorePort, 'inspectReleaseFiles'>['inspectReleaseFiles']>,
+        }) as Pick<ReleaseStorePort, 'inspectReleaseFiles'>,
+    releaseRoot: options.releaseRoot ?? '/state/releases',
+  };
+}
+
+function setOneTime(harness: Harness, oneTime: RecordShadowDayDependencies['oneTime']): void {
+  (harness.deps as { oneTime?: RecordShadowDayDependencies['oneTime'] }).oneTime = oneTime;
+}
+
+/** The reasons map every one-time criterion is reported under. */
+function unevaluatedReasons(result: RecordedResult): Map<CutoverShadowCriterion, string> {
+  return new Map(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
 }
 
 /**
@@ -2876,5 +2985,681 @@ describe('RecordShadowDayUseCase', () => {
     for (const criterion of ['S1', 'S4', 'S6', 'S7', 'S8', 'S9', 'S12'] as const) {
       expect(withDay?.verdicts[criterion]?.digest).toBe(withoutDay?.verdicts[criterion]?.digest);
     }
+  });
+
+  /* -------------------------------------------------------------------------
+   * SH19b2: S2, S3, S10, S11 — the one-time shadow criteria, judged from the
+   * sticky attestation ledger plus the day's pinned release tree, recorded
+   * again on every day with no already-passed shortcut.
+   * ------------------------------------------------------------------------- */
+
+  it("records S2, S3, S10, S11 as pass (one-time-evidence-present) when the ledger has every fact and every required test is present", async () => {
+    const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }) });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S2).toBe('pass');
+    expect(result.recorded.S3).toBe('pass');
+    expect(result.recorded.S10).toBe('pass');
+    expect(result.recorded.S11).toBe('pass');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    for (const criterion of ['S2', 'S3', 'S10', 'S11'] as const) {
+      expect(dayRecord?.verdicts[criterion]).toEqual({
+        verdict: 'pass',
+        reason: 'one-time-evidence-present',
+        digest: expectedOneTimeDigest(criterion, DAY, 'pass', 'one-time-evidence-present'),
+        recordedAtIso: RECORDED_AT_ISO,
+      });
+    }
+    // The store was read once and the inspector saw the SAME pinned sha the
+    // day records, over exactly the deduplicated required test paths.
+    expect(oneTime.calls.read).toBe(1);
+    expect(oneTime.calls.inspect).toBe(1);
+    expect(oneTime.calls.inputs).toEqual([
+      { root: '/state/releases', sha: RELEASE, paths: REQUIRED_TEST_PATHS },
+    ]);
+  });
+
+  it('reports S2, S3, S10, S11 as not-wired when oneTime is absent, leaving other criteria unchanged', async () => {
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setPremergeCarry(harness, constantPremergeCarry('carry'));
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded).toEqual({
+      S1: 'pass', S4: 'pass', S5: 'pass', S6: 'pass', S7: 'pass', S8: 'pass', S9: 'pass', S12: 'pass',
+    });
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('not-wired');
+    expect(reasons.get('S3')).toBe('not-wired');
+    expect(reasons.get('S10')).toBe('not-wired');
+    expect(reasons.get('S11')).toBe('not-wired');
+    expectNotImplementedUnevaluated(result.unevaluated);
+  });
+
+  it('reports S2, S3, S10, S11 unevaluated (attestations-unreadable) on unknown-version, unreadable, or throwing attestation store', async () => {
+    const statuses = [
+      { status: 'unknown-version' },
+      { status: 'unreadable' },
+    ] as const;
+    for (const readResult of [...statuses, 'throws']) {
+      const oneTime = makeOneTime({
+        read: () => {
+          if (readResult === 'throws') {
+            throw new Error('attestation store failed');
+          }
+          return readResult;
+        },
+      });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      expect(result.recorded.S2).toBeUndefined();
+      expect(result.recorded.S3).toBeUndefined();
+      expect(result.recorded.S10).toBeUndefined();
+      expect(result.recorded.S11).toBeUndefined();
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('attestations-unreadable');
+      expect(reasons.get('S3')).toBe('attestations-unreadable');
+      expect(reasons.get('S10')).toBe('attestations-unreadable');
+      expect(reasons.get('S11')).toBe('attestations-unreadable');
+    }
+  });
+
+  it('reports S2, S3, S10, S11 unevaluated (attestations-unreadable) when attestations.read returns null, a primitive, or a getter-bearing object', async () => {
+    const getterBearing: Record<string, unknown> = {};
+    Object.defineProperty(getterBearing, 'status', { value: 'ok', enumerable: true });
+    Object.defineProperty(getterBearing, 'ledger', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    const trappedProxy = new Proxy(
+      { status: 'missing' },
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('boom');
+        },
+      },
+    );
+    const badResults: unknown[] = [null, 42, 'nope', getterBearing, trappedProxy];
+    for (const readResult of badResults) {
+      const oneTime = makeOneTime({ read: () => readResult });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      // execute must not throw out of any of these hostile reads.
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('attestations-unreadable');
+      expect(reasons.get('S3')).toBe('attestations-unreadable');
+      expect(reasons.get('S10')).toBe('attestations-unreadable');
+      expect(reasons.get('S11')).toBe('attestations-unreadable');
+    }
+  });
+
+  it('reports all four one-time criteria attestations-unreadable with a getter count of 0 when a missing attestation result carries a getter', async () => {
+    let getterCalls = 0;
+    const getterBearingMissing: Record<string, unknown> = {
+      status: 'missing',
+      get ledger() {
+        getterCalls += 1;
+        return {};
+      },
+    };
+    const oneTime = makeOneTime({ read: () => getterBearingMissing });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('attestations-unreadable');
+    expect(reasons.get('S3')).toBe('attestations-unreadable');
+    expect(reasons.get('S10')).toBe('attestations-unreadable');
+    expect(reasons.get('S11')).toBe('attestations-unreadable');
+    expect(getterCalls).toBe(0);
+  });
+
+  it('reports all four one-time criteria attestations-unreadable when a missing attestation result carries an extra key', async () => {
+    const extraKey: Record<string, unknown> = { status: 'missing', extra: 'nope' };
+    const oneTime = makeOneTime({ read: () => extraKey });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('attestations-unreadable');
+    expect(reasons.get('S3')).toBe('attestations-unreadable');
+    expect(reasons.get('S10')).toBe('attestations-unreadable');
+    expect(reasons.get('S11')).toBe('attestations-unreadable');
+  });
+
+  it('reports S2 and S3 unevaluated (not-yet-observed) when attestations are missing or observed after the day', async () => {
+    // The store reports nothing stored.
+    const missing = makeOneTime();
+    const missingHarness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(missingHarness, missing);
+    const missingResult = await new RecordShadowDayUseCase(missingHarness.deps).execute(makeRequest());
+    expectRecorded(missingResult);
+    const missingReasons = unevaluatedReasons(missingResult);
+    expect(missingReasons.get('S2')).toBe('not-yet-observed');
+    expect(missingReasons.get('S3')).toBe('not-yet-observed');
+    // S10 and S11 have no required facts, so they still judge their release tests.
+    expect(missingResult.recorded.S10).toBe('pass');
+    expect(missingResult.recorded.S11).toBe('pass');
+
+    // Every fact observed AFTER the recorded day is not yet observed either.
+    const future = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger('2026-11-20') }) });
+    const futureHarness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(futureHarness, future);
+    const futureResult = await new RecordShadowDayUseCase(futureHarness.deps).execute(makeRequest());
+    expectRecorded(futureResult);
+    const futureReasons = unevaluatedReasons(futureResult);
+    expect(futureReasons.get('S2')).toBe('not-yet-observed');
+    expect(futureReasons.get('S3')).toBe('not-yet-observed');
+    expect(futureResult.recorded.S10).toBe('pass');
+    expect(futureResult.recorded.S11).toBe('pass');
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-unpinned) when releaseSha is null', async () => {
+    const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }) });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    (harness.deps as { releaseSha: () => Promise<string | null> }).releaseSha = async () => null;
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('release-unpinned');
+    expect(reasons.get('S10')).toBe('release-unpinned');
+    expect(reasons.get('S11')).toBe('release-unpinned');
+    // S3 has no required tests, so its ledger facts still count.
+    expect(result.recorded.S3).toBe('pass');
+    // The inspector is never consulted for an unpinned day.
+    expect(oneTime.calls.inspect).toBe(0);
+  });
+
+  it('refuses the request and records nothing when releaseSha is malformed', async () => {
+    const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }) });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    (harness.deps as { releaseSha: () => Promise<string | null> }).releaseSha = async () => 'not-a-sha';
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    // The malformed sha is refused by writeDay's verdict write —
+    // `recordShadowVerdicts` rejects the input as invalid-input — so nothing
+    // is recorded at all and the inspector is never consulted.
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(harness.evidence.stored).toBeNull();
+    expect(oneTime.calls.inspect).toBe(0);
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) when inspectReleaseFiles is missing, throws, or returns not-found/unreadable', async () => {
+    const cases: { label: string; options: OneTimeOptions }[] = [
+      { label: 'method absent', options: { omitInspect: true } },
+      {
+        label: 'throws',
+        options: {
+          inspect: () => {
+            throw new Error('release store failed');
+          },
+        },
+      },
+      { label: 'not-found', options: { inspect: () => ({ outcome: 'not-found' }) } },
+      { label: 'unreadable', options: { inspect: () => ({ outcome: 'unreadable' }) } },
+    ];
+    for (const { options } of cases) {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }), ...options });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('release-tree-unreadable');
+      expect(reasons.get('S10')).toBe('release-tree-unreadable');
+      expect(reasons.get('S11')).toBe('release-tree-unreadable');
+      // S3 requires no tests, so it still passes on the ledger facts.
+      expect(result.recorded.S3).toBe('pass');
+    }
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) when inspectReleaseFiles returns null, a primitive, or a getter-bearing outer result', async () => {
+    const getterBearing: Record<string, unknown> = {};
+    Object.defineProperty(getterBearing, 'outcome', { value: 'read', enumerable: true });
+    Object.defineProperty(getterBearing, 'files', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    const badResults: unknown[] = [null, 7, 'nope', getterBearing];
+    for (const inspectResult of badResults) {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }), inspect: () => inspectResult });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('release-tree-unreadable');
+      expect(reasons.get('S10')).toBe('release-tree-unreadable');
+      expect(reasons.get('S11')).toBe('release-tree-unreadable');
+    }
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) when inspectReleaseFiles returns non-array, length mismatch, null, non-plain item, or throwing getter', async () => {
+    const nonPlainItem: object = Object.create({ isPlain: false }) as object;
+    const getterItem: Record<string, unknown> = {};
+    Object.defineProperty(getterItem, 'present', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    const cases: unknown[] = [
+      { outcome: 'read', files: 'nope' },
+      { outcome: 'read', files: [{ present: true, quarantined: false }] },
+      { outcome: 'read', files: [null, null, null] },
+      { outcome: 'read', files: [nonPlainItem, nonPlainItem, nonPlainItem] },
+      { outcome: 'read', files: [getterItem, getterItem, getterItem] },
+    ];
+    for (const inspectResult of cases) {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }), inspect: () => inspectResult });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('release-tree-unreadable');
+      expect(reasons.get('S10')).toBe('release-tree-unreadable');
+      expect(reasons.get('S11')).toBe('release-tree-unreadable');
+    }
+  });
+
+  it('records S2, S10, S11 fail on absent or quarantined test and unevaluated on null quarantine', async () => {
+    const oneTime = makeOneTime({
+      read: () => ({ status: 'ok', ledger: attestationLedger() }),
+      inspect: () => ({
+        outcome: 'read',
+        files: [
+          { present: false, quarantined: false },
+          { present: true, quarantined: true },
+          { present: true, quarantined: null },
+        ],
+      }),
+    });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S2).toBe('fail');
+    expect(result.recorded.S10).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S2).toEqual({
+      verdict: 'fail',
+      reason: 'required-test-absent',
+      digest: expectedOneTimeDigest('S2', DAY, 'fail', 'required-test-absent'),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    expect(dayRecord?.verdicts.S10).toEqual({
+      verdict: 'fail',
+      reason: 'required-test-quarantined',
+      digest: expectedOneTimeDigest('S10', DAY, 'fail', 'required-test-quarantined'),
+      recordedAtIso: RECORDED_AT_ISO,
+    });
+    // A present file whose quarantine flag cannot be judged is unevaluated, never a pass.
+    expect(result.recorded.S11).toBeUndefined();
+    expect(unevaluatedReasons(result).get('S11')).toBe('release-test-unreadable');
+    expect(result.recorded.S3).toBe('pass');
+  });
+
+  it('aborts with deadline-exceeded when deadline expires before or during oneTime reads', async () => {
+    // Before: the deadline is already reached, so the store is never consulted.
+    const before = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }) });
+    const beforeHarness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(beforeHarness, before);
+    const beforeResult = await new RecordShadowDayUseCase(beforeHarness.deps).execute(makeRequest({ deadlineIso: PAST_DEADLINE }));
+    expect(beforeResult).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    expect(before.calls.read).toBe(0);
+    expect(before.calls.inspect).toBe(0);
+    expect(beforeHarness.evidence.stored).toBeNull();
+
+    // During: the rerun's deadline (12:20) is still ahead when the store is
+    // called, and passes while it is awaited — `call`'s post-await re-check
+    // must abort the run instead of answering from the value.
+    const during = makeOneTime();
+    const duringHarness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(duringHarness, during);
+    const useCase = new RecordShadowDayUseCase(duringHarness.deps);
+    const first = await useCase.execute(makeRequest());
+    expectRecorded(first);
+    const afterFirst = duringHarness.evidence.stored;
+
+    during.attestations.read = (async () => {
+      duringHarness.setNow(new Date(Date.parse('2026-11-17T12:20:00.000Z') + 60_000).toISOString());
+      return { status: 'missing' } as const;
+    }) as Pick<ShadowAttestationPort, 'read'>['read'];
+    const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+    expect(duringHarness.evidence.stored).toEqual(afterFirst);
+  });
+
+  it('re-evaluates and records S2, S3, S10, S11 on two consecutive days without an already-passed shortcut', async () => {
+    const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger('2026-11-14') }) });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const useCase = new RecordShadowDayUseCase(harness.deps);
+
+    const first = await useCase.execute(makeRequest({ day: '2026-11-15' }));
+    expectRecorded(first);
+    expect(first.recorded.S2).toBe('pass');
+    expect(first.recorded.S3).toBe('pass');
+    expect(first.recorded.S10).toBe('pass');
+    expect(first.recorded.S11).toBe('pass');
+
+    const second = await useCase.execute(makeRequest({ day: DAY }));
+    expectRecorded(second);
+    expect(second.recorded.S2).toBe('pass');
+    expect(second.recorded.S3).toBe('pass');
+    expect(second.recorded.S10).toBe('pass');
+    expect(second.recorded.S11).toBe('pass');
+
+    const days = harness.evidence.stored?.days ?? [];
+    expect(days).toHaveLength(2);
+    for (const dayRecord of days) {
+      for (const criterion of ['S2', 'S3', 'S10', 'S11'] as const) {
+        expect(dayRecord.verdicts[criterion]?.verdict).toBe('pass');
+      }
+    }
+    // No already-passed shortcut also means the sources were read again:
+    // one store read and one release inspection per recorded day.
+    expect(oneTime.calls.read).toBe(2);
+    expect(oneTime.calls.inspect).toBe(2);
+  });
+
+  it('keeps S1, S4, S5, S6, S7, S8, S9 and S12 digests byte-identical whether oneTime is present or absent', async () => {
+    const options = {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    };
+    const without = wiredHarness(conformingFixture(), options);
+    setPremergeCarry(without, constantPremergeCarry('carry'));
+    const withoutResult = await new RecordShadowDayUseCase(without.deps).execute(makeRequest());
+    expectRecorded(withoutResult);
+
+    const withOneTime = wiredHarness(conformingFixture(), options);
+    setPremergeCarry(withOneTime, constantPremergeCarry('carry'));
+    setOneTime(withOneTime, makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }) }));
+    const withResult = await new RecordShadowDayUseCase(withOneTime.deps).execute(makeRequest());
+    expectRecorded(withResult);
+    expect(withResult.recorded.S2).toBe('pass');
+
+    const withoutDay = without.evidence.stored?.days.find((entry) => entry.day === DAY);
+    const withDay = withOneTime.evidence.stored?.days.find((entry) => entry.day === DAY);
+    for (const criterion of ['S1', 'S4', 'S5', 'S6', 'S7', 'S8', 'S9', 'S12'] as const) {
+      expect(withDay?.verdicts[criterion]?.digest).toBe(withoutDay?.verdicts[criterion]?.digest);
+    }
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) when files is too LONG, array-like but not an array, or the outcome is not read despite valid files', async () => {
+    const present = presentReleaseFiles();
+    const arrayLike = {
+      length: present.length,
+      ...Object.fromEntries(present.map((item, index) => [String(index), item])),
+    };
+    const cases: unknown[] = [
+      // One extra item: a too-long array must be refused exactly like a too-short one.
+      { outcome: 'read', files: [...present, { present: true, quarantined: false }] },
+      // Array-like ({length, 0, 1, ...}) that is not a real array is refused.
+      { outcome: 'read', files: arrayLike },
+      // A non-'read' outcome carrying valid-looking files is refused.
+      { outcome: 'unreadable', files: present },
+    ];
+    for (const inspectResult of cases) {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }), inspect: () => inspectResult });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('release-tree-unreadable');
+      expect(reasons.get('S10')).toBe('release-tree-unreadable');
+      expect(reasons.get('S11')).toBe('release-tree-unreadable');
+    }
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) when an item is a class instance or a proxy whose own present/quarantined are accessors', async () => {
+    class ReleaseFile {}
+    const classItem = new ReleaseFile();
+    Object.defineProperty(classItem, 'present', { value: true, enumerable: true, writable: true, configurable: true });
+    Object.defineProperty(classItem, 'quarantined', { value: false, enumerable: true, writable: true, configurable: true });
+
+    let getterCalls = 0;
+    const accessorTarget: Record<string, unknown> = {};
+    Object.defineProperty(accessorTarget, 'present', {
+      get() {
+        getterCalls += 1;
+        return true;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(accessorTarget, 'quarantined', {
+      get() {
+        getterCalls += 1;
+        return false;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const proxyItem: unknown = new Proxy(accessorTarget, {});
+
+    const cases: unknown[] = [
+      { outcome: 'read', files: [classItem, classItem, classItem] },
+      { outcome: 'read', files: [proxyItem, proxyItem, proxyItem] },
+    ];
+    for (const inspectResult of cases) {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }), inspect: () => inspectResult });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('release-tree-unreadable');
+      expect(reasons.get('S10')).toBe('release-tree-unreadable');
+      expect(reasons.get('S11')).toBe('release-tree-unreadable');
+      // The proxy's own getters must never have run.
+      expect(getterCalls).toBe(0);
+    }
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) with a getter count of 0 when the outer inspection result is non-plain or its outcome/files are accessors returning valid values', async () => {
+    class InspectionResult {}
+    const nonPlain = new InspectionResult();
+    Object.defineProperty(nonPlain, 'outcome', { value: 'read', enumerable: true, writable: true, configurable: true });
+    Object.defineProperty(nonPlain, 'files', { value: presentReleaseFiles(), enumerable: true, writable: true, configurable: true });
+
+    let getterCalls = 0;
+    const getterBearing: Record<string, unknown> = { outcome: 'read' };
+    Object.defineProperty(getterBearing, 'files', {
+      get() {
+        getterCalls += 1;
+        return presentReleaseFiles();
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    for (const inspectResult of [nonPlain as unknown, getterBearing as unknown]) {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }), inspect: () => inspectResult });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+      expectRecorded(result);
+      const reasons = unevaluatedReasons(result);
+      expect(reasons.get('S2')).toBe('release-tree-unreadable');
+      expect(reasons.get('S10')).toBe('release-tree-unreadable');
+      expect(reasons.get('S11')).toBe('release-tree-unreadable');
+      // The files getter returned a fully valid list, so only the accessor
+      // guard can explain the refusal — and it must never have run it.
+      expect(getterCalls).toBe(0);
+    }
+  });
+
+  it('reports all four one-time criteria attestations-unreadable when an ok attestation result carries an extra key', async () => {
+    const extraKey = { status: 'ok', ledger: attestationLedger(), extra: 'nope' };
+    const oneTime = makeOneTime({ read: () => extraKey });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('attestations-unreadable');
+    expect(reasons.get('S3')).toBe('attestations-unreadable');
+    expect(reasons.get('S10')).toBe('attestations-unreadable');
+    expect(reasons.get('S11')).toBe('attestations-unreadable');
+  });
+
+  it('never calls inspectReleaseFiles and reports S2, S10, S11 unevaluated (release-tree-unreadable) when the release root is empty', async () => {
+    const oneTime = makeOneTime({ releaseRoot: '   ' });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('release-tree-unreadable');
+    expect(reasons.get('S10')).toBe('release-tree-unreadable');
+    expect(reasons.get('S11')).toBe('release-tree-unreadable');
+    // An empty root is a misconfiguration, never a readable tree: the
+    // inspector must not be consulted at all.
+    expect(oneTime.calls.inspect).toBe(0);
+  });
+
+  it('reports S2, S10, S11 unevaluated (release-tree-unreadable) when an item carries a non-boolean quarantined flag such as a string', async () => {
+    const oneTime = makeOneTime({
+      read: () => ({ status: 'ok', ledger: attestationLedger() }),
+      inspect: () => ({
+        outcome: 'read',
+        files: presentReleaseFiles().map((item, index) =>
+          index === 0 ? { present: true, quarantined: 'yes' } : item,
+        ),
+      }),
+    });
+    const harness = wiredHarness(conformingFixture(), {
+      gateHeads: agreeingGateHeads(0),
+      conformanceRuns: conformanceRunSpecs(),
+    });
+    setOneTime(harness, oneTime);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    // One bad flag poisons the whole zip: releaseTests is null, so every
+    // test-dependent criterion is unevaluated, never partially judged.
+    const reasons = unevaluatedReasons(result);
+    expect(reasons.get('S2')).toBe('release-tree-unreadable');
+    expect(reasons.get('S10')).toBe('release-tree-unreadable');
+    expect(reasons.get('S11')).toBe('release-tree-unreadable');
+  });
+
+  it('aborts with deadline-exceeded when the deadline expires during inspectReleaseFiles, fulfilled or rejected', async () => {
+    const run = async (fulfilled: boolean): Promise<void> => {
+      const oneTime = makeOneTime({ read: () => ({ status: 'ok', ledger: attestationLedger() }) });
+      const harness = wiredHarness(conformingFixture(), {
+        gateHeads: agreeingGateHeads(0),
+        conformanceRuns: conformanceRunSpecs(),
+      });
+      setOneTime(harness, oneTime);
+      const useCase = new RecordShadowDayUseCase(harness.deps);
+      const first = await useCase.execute(makeRequest());
+      expectRecorded(first);
+      const afterFirst = harness.evidence.stored;
+
+      // The clock is still on time when the inspector is called, and advances
+      // past the deadline before its value settles. The call counter keeps
+      // counting, so the test proves the inspector WAS consulted.
+      const inspect = oneTime.calls.inspect;
+      (oneTime.releaseStore as { inspectReleaseFiles: unknown }).inspectReleaseFiles = async () => {
+        oneTime.calls.inspect += 1;
+        harness.setNow(new Date(Date.parse('2026-11-17T12:20:00.000Z') + 60_000).toISOString());
+        if (fulfilled) {
+          return { outcome: 'read', files: presentReleaseFiles() };
+        }
+        throw new Error('release store failed');
+      };
+      const result = await useCase.execute(makeRequest({ deadlineIso: '2026-11-17T12:20:00.000Z' }));
+
+      expect(result).toEqual({ outcome: 'unknown', reason: 'deadline-exceeded' });
+      expect(oneTime.calls.inspect).toBe(inspect + 1);
+      expect(harness.evidence.stored).toEqual(afterFirst);
+    };
+
+    await run(true);
+    await run(false);
   });
 });

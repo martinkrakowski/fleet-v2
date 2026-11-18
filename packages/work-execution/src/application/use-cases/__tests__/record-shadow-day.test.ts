@@ -1577,6 +1577,38 @@ describe('RecordShadowDayUseCase', () => {
     expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
   });
 
+  it('SH24b: an equal timestamp between the would-drop result and the entry enqueue keeps the entry live — S8 diverges, never falsely passes', async () => {
+    const fixture = cleanFixture(DAY);
+    // The drop was journaled at EXACTLY this entry's `enqueuedAtIso`: an
+    // equal timestamp cannot establish which incarnation of the key the
+    // result belongs to, and the result carries no identity (both `runId`s
+    // are null), so the entry must stay LIVE — S8 must diverge, not pass.
+    fixture.queueEntries.push(queuedEntry(3, 9, HEAD_D, `${DAY}T10:01:00.000Z`));
+    fixture.journalEntries.push(...shadowOutcome(9, HEAD_D, 'would-drop', 'would-drop', `${DAY}T10:01:00.000Z`));
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S1).toBe('pass');
+    expect(result.recorded.S8).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
+  });
+
+  it('SH24b: a would-drop result recorded 1 ms after the entry enqueue excludes the entry — S8 passes', async () => {
+    const fixture = cleanFixture(DAY);
+    // The drop was journaled strictly after this entry's `enqueuedAtIso` by
+    // exactly 1 ms: the record is bound to THIS entry, the entry is
+    // excluded from `fleetLive`, and S8 passes against the clean shell.
+    fixture.queueEntries.push(queuedEntry(3, 9, HEAD_D, `${DAY}T10:01:00.000Z`));
+    fixture.journalEntries.push(...shadowOutcome(9, HEAD_D, 'would-drop', 'would-drop', `${DAY}T10:01:00.001Z`));
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S8).toBe('pass');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'pass' });
+  });
+
   it('SH24b: a real parked entry (state parked, no would-park result) stays live in S1 and S8', async () => {
     const fixture = cleanFixture(DAY);
     // A genuinely `parked` queue entry — not a queued entry carrying a

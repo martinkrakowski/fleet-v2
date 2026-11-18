@@ -267,9 +267,13 @@ type JournalRead =
  * stay live.
  *
  * The exclusion is bound to THIS queue entry, not to the key alone: the
- * record only excludes when its own `recordedAtIso` is at or after the
+ * record only excludes when its own `recordedAtIso` is STRICTLY after the
  * entry's `enqueuedAtIso` (both fields the entry and the journal reliably
- * carry), so a would-terminal record that predates the entry's enqueue
+ * carry), or when the result carries the entry's own identity — its `runId`
+ * matches the entry's non-null `runId`. An equal timestamp cannot establish
+ * which incarnation of the key the result belongs to, so without the
+ * identity it leaves the entry LIVE: a would-terminal record that predates
+ * the entry's enqueue, or one recorded at exactly the entry's enqueue time,
  * belongs to an earlier incarnation of the same key and a later re-enqueue
  * at the same head is LIVE again. When either timestamp is missing or
  * unparseable the record cannot be bound to the entry, so the entry stays
@@ -278,7 +282,7 @@ type JournalRead =
  * reads.
  */
 function isShadowEffectivelyLive(
-  entry: Pick<MergeQueueEntryRecord, 'repoDigest' | 'pullRequest' | 'headOid' | 'state' | 'enqueuedAtIso'>,
+  entry: Pick<MergeQueueEntryRecord, 'repoDigest' | 'pullRequest' | 'headOid' | 'state' | 'enqueuedAtIso' | 'runId'>,
   journalEntries: readonly LaneRunJournalEntryRecord[],
 ): boolean {
   if (!isMergeQueueEntryLive(entry)) {
@@ -304,7 +308,16 @@ function isShadowEffectivelyLive(
       && record.reasonCode === parsed.action
     ) {
       const recordedMs = Date.parse(record.recordedAtIso);
-      if (Number.isNaN(enqueuedMs) || Number.isNaN(recordedMs) || recordedMs >= enqueuedMs) {
+      if (Number.isNaN(enqueuedMs) || Number.isNaN(recordedMs)) {
+        return false;
+      }
+      // Strictly after binds the record to this entry; an equal timestamp is
+      // ambiguous, so it only excludes when the result carries the entry's
+      // own identity (its non-null `runId`).
+      if (recordedMs > enqueuedMs) {
+        return false;
+      }
+      if (record.runId !== null && record.runId !== undefined && entry.runId !== null && entry.runId !== undefined && record.runId === entry.runId) {
         return false;
       }
     }

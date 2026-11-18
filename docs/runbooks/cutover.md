@@ -49,6 +49,28 @@ A release grant (`release:install`, `release:swap`, `release:rollback`) is bound
 
 Status does not evaluate S1–S12. A completed status is not a shadow pass. Do not start `conductor run --live` from this runbook.
 
+### Arming the scheduled record-day (OD7a2)
+
+In scheduled mode (`--scheduled`, the flag the rendered `fleet-v2-shadow-record-day.timer` passes), `cutover shadow record-day` fails closed and writes NOTHING before any of these hold: the standing `merge:import-shadow` grant does not provably cover the whole UTC day, the day's first `job` tick lands after `00:15Z` (or only non-`job` events precede it), the day has fewer than 720 in-day ticks, or S12 cannot decide. A held guard prints one line `record-day skipped <reason>` (`partial-day`, `too-few-ticks`, `grant-unavailable`, `grant-not-covering-day`) and exits 0; an unreadable daemon-events projection or an `unknown` S12 exits 1. This is what keeps the arming day from recording a sticky `too-few-ticks` failure or mixing pre-arming shell merges into S1.
+
+The complete arming sequence, in order:
+
+1. **Stop the conductor before the release swap**: inspect active runs with `fleet-v2 conductor status`, halt with `fleet-v2 conductor halt`, and stop any active run with `fleet-v2 conductor stop <runId>`.
+2. **Install and swap the release**:
+   - `fleet-v2 release install --root <path> --sha <40 hex> --source <path> --apply --project <id>`
+   - `fleet-v2 release swap --root <path> --sha <40 hex> --apply --project <id>`
+3. **Request, approve, and resolve the standing `merge:import-shadow` grant**:
+   - Request: `fleet-v2 coordination request-decision --kind action-decision --action-scope merge:import-shadow --project-id <id> --proposal-digest <digest> --policy-revision <rev> --repository <owner>/<repo> --expires-at-iso <iso>` (prints `<requestId>` = `shadow-import-<sha256>`).
+   - Approve: record the owner's Ed25519-signed decision answer for `<requestId>` through the decision transport (`<stateDir>/decisions/<requestId>.json` or Waves `/api/v1/decisions/<requestId>`) with `state: "approved"`, `grantId`, `decisionRevision`, and `signature` over `{ requestId, projectId, actionScope, expectedHeadSha: null, decisionRevision, grantId, state }`.
+   - Resolve: `fleet-v2 coordination resolve-auth --project-id <id> --action-scope merge:import-shadow --authorization-grant-id <grantId> --repository <owner>/<repo>` (must resolve `authorized` **before** enabling `fleet-v2-daemon.timer`).
+4. **Install and enable the systemd user units and linger (only AFTER the grant resolves approved)**:
+   - `fleet-v2 hosts daemon install --scheduler systemd --apply`
+   - `loginctl enable-linger`
+   - `systemctl --user enable --now fleet-v2-daemon.timer fleet-v2-shadow-intake.timer fleet-v2-shadow-record-day.timer`
+5. **First recordable day rule**: the first recordable shadow day is the **first full UTC day after arming** whose entire `[00:00Z, 24:00Z)` window is covered by the approved, unrevoked, unexpired `merge:import-shadow` grant. On the arming day itself, either the grant was approved after `00:00Z`, the first `job` tick falls after `00:15Z`, or `totalTicks < 720`, so `cutover shadow record-day --scheduled` prints `record-day skipped <reason>`, writes nothing, and exits 0, preventing a sticky `S12` failure or mixed pre-arming `S1` merges.
+
+When turning shadow off, disable `fleet-v2-shadow-record-day.timer` alongside `fleet-v2-shadow-intake.timer` (the rendered pair is removed by `hosts daemon uninstall --scheduler systemd --apply`).
+
 ## Switch preconditions
 
 `cutover switch` is mounted. It requires `--expected-revision`, `--operation-id`, and `--relaunch-plan-digest` (64 lowercase hex), with optional `--now-iso` and `--deadline-iso`. A bare `fleet-v2 cutover switch` exits 2 as a usage error. It does not print `move-not-implemented`.

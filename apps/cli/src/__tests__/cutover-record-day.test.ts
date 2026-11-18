@@ -26,6 +26,7 @@ import {
   ShadowAttestationAdapter,
   type RecordShadowDayDependencies,
 } from '@fleet/work-execution';
+import type { DaemonEventRecord } from '@fleet/work-execution';
 
 const tempDirs: string[] = [];
 
@@ -1147,5 +1148,216 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
 
     const unwired = wiredRuntime(newDirs().stateDir, { mode: 'none' });
     expect(unwired.execution.shadowRunsRead).toBeUndefined();
+  });
+
+  // ------------------------------------------------------------------
+  // OD7a2: `--scheduled` — the guards hold at the CLI boundary: a skip
+  // prints one stable line and exits 0, an unknown exits 1, and nothing
+  // is ever written on a guard hold.
+  // ------------------------------------------------------------------
+  type CoverageReader = NonNullable<RecordShadowDayDependencies['shadowGrantCoverage']>;
+
+  function scheduledRuntime(
+    stateDir: string,
+    coverage: CoverageReader,
+    events?: readonly DaemonEventRecord[],
+    daemonThrows = false,
+  ): ReturnType<typeof createFleetCliRuntime> {
+    const runtime = wiredRuntime(stateDir);
+    const deps = recordDayDeps(runtime) as {
+      shadowGrantCoverage?: CoverageReader;
+      daemonEvents: { readAfterCursor: (cursor: string | null) => Promise<unknown> };
+    };
+    deps.shadowGrantCoverage = coverage;
+    if (daemonThrows) {
+      deps.daemonEvents = {
+        readAfterCursor: async () => {
+          throw new Error('projection unreadable');
+        },
+      };
+    } else if (events !== undefined) {
+      deps.daemonEvents = {
+        readAfterCursor: async () => ({ ok: true as const, events, nextCursor: null }),
+      };
+    }
+    return runtime;
+  }
+
+  /** One in-day daemon `job` event, `index` minutes past 00:00Z. */
+  function cliJobEvent(index: number, day: string): DaemonEventRecord {
+    return {
+      version: 1,
+      eventId: cliUlid(10_000 + index),
+      tickId: `tick-${cliUlid(index + 1)}`,
+      jobId: 'merge-pass:0123456789ab',
+      kind: 'job',
+      key: null,
+      entryId: null,
+      outcome: 'completed',
+      reasonCode: null,
+      recordedAtIso: `${day}T${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}:00Z`,
+    } as DaemonEventRecord;
+  }
+
+  /** A valid ULID-shaped id carrying `n` (the O1b-1 pattern). */
+  function cliUlid(n: number): string {
+    const alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+    let rest = n;
+    let id = '0';
+    for (let i = 0; i < 25; i += 1) {
+      id += alphabet[rest % alphabet.length];
+      rest = Math.floor(rest / alphabet.length);
+    }
+    return id;
+  }
+
+  it('prints `record-day skipped partial-day` and exits 0 when the first job tick is late, writing nothing', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const runtime = scheduledRuntime(
+        stateDir,
+        async () => ({ outcome: 'covered' }),
+        [cliJobEvent(840, day)],
+      );
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day, '--scheduled']));
+      expect(result.code).toBe(0);
+      expect(result.out).toBe('record-day skipped partial-day\n');
+      await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('prints `record-day skipped too-few-ticks` and exits 0, writing nothing', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const runtime = scheduledRuntime(
+        stateDir,
+        async () => ({ outcome: 'covered' }),
+        [cliJobEvent(0, day), cliJobEvent(1, day)],
+      );
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day, '--scheduled']));
+      expect(result.code, `out=${result.out} err=${result.err}`).toBe(0);
+      expect(result.out).toBe('record-day skipped too-few-ticks\n');
+      await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('prints `record-day skipped grant-unavailable` and exits 0 when the grant cannot be resolved', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      // The wired installation carries no `daemon.shadow.grantId`, so the
+      // composed coverage reader is `unavailable` — the exact production path.
+      const runtime = wiredRuntime(stateDir);
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day, '--scheduled']));
+      expect(result.code).toBe(0);
+      expect(result.out).toBe('record-day skipped grant-unavailable\n');
+      await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('prints `record-day skipped grant-not-covering-day` and exits 0 when the grant does not cover the day', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const runtime = scheduledRuntime(stateDir, async () => ({ outcome: 'not-covering', reason: 'approved-after-day-start' }));
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day, '--scheduled']));
+      expect(result.code).toBe(0);
+      expect(result.out).toBe('record-day skipped grant-not-covering-day\n');
+      await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('exits 1 with daemon-events-unavailable and writes nothing when the projection is unreadable', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const runtime = scheduledRuntime(stateDir, async () => ({ outcome: 'covered' }), undefined, true);
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day, '--scheduled']));
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.out)).toEqual({ outcome: 'unknown', reason: 'daemon-events-unavailable' });
+      await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('exits 1 with s12-unknown and writes nothing when S12 cannot decide', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      // A valid 00:00Z job tick passes the first-tick guard; a malformed
+      // event (an extra key) makes S12 evaluate `unknown`.
+      const malformed = { ...cliJobEvent(0, day), extra: 1 } as unknown as DaemonEventRecord;
+      const runtime = scheduledRuntime(stateDir, async () => ({ outcome: 'covered' }), [
+        cliJobEvent(0, day),
+        malformed,
+      ]);
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day, '--scheduled']));
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.out)).toEqual({ outcome: 'unknown', reason: 's12-unknown' });
+      await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('records normally at exit 0 on a full covered day under --scheduled', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const events: DaemonEventRecord[] = [];
+      for (let index = 0; index < 800; index += 1) {
+        events.push(cliJobEvent(index, day));
+      }
+      const runtime = scheduledRuntime(stateDir, async () => ({ outcome: 'covered' }), events);
+      const result = await cli(runtime, recordDayArgs(fixtureDir, ['--day', day, '--scheduled']));
+      expect(result.code).toBe(0);
+      const body = JSON.parse(result.out) as { outcome: string; recorded: Record<string, string> };
+      expect(body.outcome).toBe('recorded');
+      expect(body.recorded.S12).toBeDefined();
+      await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('is a usage error (exit 2) for a non-boolean --scheduled value', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const runtime = wiredRuntime(stateDir);
+    const result = await cli(runtime, recordDayArgs(fixtureDir, ['--scheduled=maybe']));
+    expect(result.code).toBe(2);
+    expect(result.err).toContain('--scheduled accepts only true');
   });
 });

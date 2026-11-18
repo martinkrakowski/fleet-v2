@@ -123,6 +123,7 @@ import {
   ListConductorPassesUseCase,
   ListLaneRunsUseCase,
   RecordShadowDayUseCase,
+  evaluateShadowGrantCoverage,
   ShadowAttestationAdapter,
   ShadowEvidenceAdapter,
   WORK_EXECUTION_STATE_FILES,
@@ -245,7 +246,9 @@ import {
 } from '@fleet/operator-coordination';
 import {
   loadInstallation,
+  parseMergeRepositoryKey,
   requireValidInstallationModel,
+  resolveMergePolicy,
   resolveTelemetryPolicy,
   type FleetInstallation,
   type FleetInstallationModel,
@@ -1760,6 +1763,65 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         // unconfigured, missing, unverified, or unreadable.
         releaseSha: () => readCurrentReleaseSha({ releaseStore, releaseRoot }),
         nowIso: daemon.now,
+        // OD7a2: the standing `merge:import-shadow` grant's day-coverage
+        // reader for scheduled mode. Fail closed: a missing `grantId` or
+        // `projectId`, a blocked or thrown resolve, an unreadable request
+        // store and every unparseable timestamp are `unavailable` — never a
+        // pass. The grant must be `approved` before the day's `00:00Z` and
+        // expire strictly after the day's `24:00Z` to cover it.
+        shadowGrantCoverage: async (input) => {
+          const grantId = installationModel?.daemon?.shadow?.grantId?.trim() ?? '';
+          if (grantId === '') {
+            return { outcome: 'unavailable' as const };
+          }
+          const policy = resolveMergePolicy(options?.installation?.policy ?? {});
+          const entry =
+            policy.outcome === 'resolved'
+              ? policy.repositories.find((candidate) => {
+                  if (candidate.shadow !== true) {
+                    return false;
+                  }
+                  const parsed = parseMergeRepositoryKey(candidate.repositoryKey);
+                  return (
+                    parsed !== undefined &&
+                    parsed.owner === input.repository.owner &&
+                    parsed.repo === input.repository.repo
+                  );
+                })
+              : undefined;
+          const projectId = entry?.projectId?.trim() ?? '';
+          if (projectId === '') {
+            return { outcome: 'unavailable' as const };
+          }
+          try {
+            const resolved =
+              await coordination.resolveActionAuthorization.resolveActionAuthorization({
+                projectId,
+                actionScope: 'merge:import-shadow',
+                expectedHeadSha: '',
+                authorizationGrantId: grantId,
+                repository: input.repository,
+              });
+            if (resolved.outcome !== 'authorized') {
+              return { outcome: 'not-covering' as const };
+            }
+            const record = await coordinationRequestRepository.findRequestByGrantId(grantId);
+            if (record === null) {
+              return { outcome: 'unavailable' as const };
+            }
+            const dayStartMs = Date.parse(`${input.day}T00:00:00.000Z`);
+            if (Number.isNaN(dayStartMs)) {
+              return { outcome: 'unavailable' as const };
+            }
+            return evaluateShadowGrantCoverage(
+              record,
+              new Date(dayStartMs).toISOString(),
+              new Date(dayStartMs + 24 * 60 * 60 * 1000).toISOString(),
+            );
+          } catch {
+            return { outcome: 'unavailable' as const };
+          }
+        },
         // OD-1: the owner-accepted default is false, fail-closed; this use case
         // only receives it.
         settings: { excludeBatchMerges: false },

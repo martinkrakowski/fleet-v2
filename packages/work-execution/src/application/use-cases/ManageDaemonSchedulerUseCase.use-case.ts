@@ -12,6 +12,8 @@ import {
   DAEMON_TIMER_UNIT_KEY,
   SHADOW_INTAKE_SERVICE_UNIT_KEY,
   SHADOW_INTAKE_TIMER_UNIT_KEY,
+  SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+  SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
 } from '../ports/out/DaemonSchedulerPort.out-port.js';
 import type { DaemonSchedulerPort } from '../ports/out/DaemonSchedulerPort.out-port.js';
 import { containsSecretShape } from '@fleet/shared';
@@ -72,6 +74,11 @@ export interface RenderedShadowIntakeUnits {
   readonly timer: string;
 }
 
+export interface RenderedShadowRecordDayUnits {
+  readonly service: string;
+  readonly timer: string;
+}
+
 export const SHADOW_INTAKE_SERVICE_TEMPLATE = `[Unit]
 Description=Fleet v2 shadow intake
 
@@ -91,6 +98,30 @@ Unit=fleet-v2-shadow-intake.service
 OnBootSec=120s
 OnUnitActiveSec=180s
 AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+`;
+
+export const SHADOW_RECORD_DAY_SERVICE_TEMPLATE = `[Unit]
+Description=Fleet v2 shadow record-day
+
+[Service]
+Type=oneshot
+ExecStart={{nodePath}} {{cliPath}} --state-dir {{stateDir}} cutover shadow record-day --repository {{repository}} --legacy-state-dir {{legacyStateDir}} --scheduled
+Environment=FLEET_STATE_DIR={{stateDir}}
+Environment=FLEET_INSTALLATION_FILE={{installationFile}}
+Nice=5
+`;
+
+export const SHADOW_RECORD_DAY_TIMER_TEMPLATE = `[Unit]
+Description=Fleet v2 shadow record-day timer
+
+[Timer]
+Unit=fleet-v2-shadow-record-day.service
+OnCalendar=*-*-* 00:20:00 UTC
+AccuracySec=30s
 Persistent=true
 
 [Install]
@@ -197,6 +228,23 @@ export function renderShadowIntakeUnits(
   return { service, timer: SHADOW_INTAKE_TIMER_TEMPLATE };
 }
 
+/** Substitute the placeholders of the validated shadow record-day config (OD7a2). */
+export function renderShadowRecordDayUnits(
+  facts: ManageDaemonSchedulerRequest['daemon'],
+  config: ShadowSchedulerConfig,
+): RenderedShadowRecordDayUnits {
+  // The same function-replacement rule as the intake units: values stay
+  // literal and the substitution rule already refuses `$` in them.
+  const service = SHADOW_RECORD_DAY_SERVICE_TEMPLATE
+    .replaceAll('{{nodePath}}', () => facts.nodePath)
+    .replaceAll('{{cliPath}}', () => facts.cliPath)
+    .replaceAll('{{stateDir}}', () => facts.stateDir)
+    .replaceAll('{{installationFile}}', () => facts.installationFile)
+    .replaceAll('{{repository}}', () => config.repository)
+    .replaceAll('{{legacyStateDir}}', () => config.legacyStateDir);
+  return { service, timer: SHADOW_RECORD_DAY_TIMER_TEMPLATE };
+}
+
 /** Substitute the five placeholders of the validated `daemon` section. */
 export function renderDaemonUnits(
   facts: ManageDaemonSchedulerRequest['daemon'],
@@ -219,6 +267,10 @@ const INSTALL_OPERATOR_LINES: readonly string[] = [
 
 const SHADOW_ENABLE_OPERATOR_LINE =
   'enable: systemctl --user enable fleet-v2-shadow-intake.timer';
+
+/** OD7a2: the record-day timer is enabled alongside the intake timer. */
+const SHADOW_RECORD_DAY_ENABLE_OPERATOR_LINE =
+  'enable: systemctl --user enable fleet-v2-shadow-record-day.timer';
 
 /** Install without `--apply`: only unchanged stays unchanged. */
 function installDryRunCode(code: string): string {
@@ -258,26 +310,36 @@ export class ManageDaemonSchedulerUseCase implements ManageDaemonSchedulerPort {
       config !== undefined
         ? renderShadowIntakeUnits(request.daemon, config)
         : undefined;
+    const shadowRecordDay =
+      config !== undefined
+        ? renderShadowRecordDayUnits(request.daemon, config)
+        : undefined;
     const portInput = {
       ...rendered,
       ...(shadowIntake !== undefined ? { shadowIntake } : {}),
+      ...(shadowRecordDay !== undefined ? { shadowRecordDay } : {}),
     };
 
     if (request.action === 'install') {
       const operatorLines =
         shadowIntake === undefined
           ? INSTALL_OPERATOR_LINES
-          : [...INSTALL_OPERATOR_LINES, SHADOW_ENABLE_OPERATOR_LINE];
+          : [
+              ...INSTALL_OPERATOR_LINES,
+              SHADOW_ENABLE_OPERATOR_LINE,
+              // OD7a2: the record-day timer is enabled with the intake timer.
+              SHADOW_RECORD_DAY_ENABLE_OPERATOR_LINE,
+            ];
       if (request.apply) {
         const result = await this.safeWrite(portInput);
         return {
-          units: shadowUnitLines(result, shadowIntake !== undefined),
+          units: shadowUnitLines(result, config !== undefined),
           operatorLines,
         };
       }
       const result = await this.safeRead(portInput);
       return {
-        units: shadowUnitLines(result, shadowIntake !== undefined, installDryRunCode),
+        units: shadowUnitLines(result, config !== undefined, installDryRunCode),
         operatorLines,
       };
     }
@@ -285,7 +347,7 @@ export class ManageDaemonSchedulerUseCase implements ManageDaemonSchedulerPort {
     if (request.action === 'show') {
       const result = await this.safeRead(portInput);
       return {
-        units: shadowUnitLines(result, shadowIntake !== undefined),
+        units: shadowUnitLines(result, config !== undefined),
         operatorLines: null,
       };
     }
@@ -296,13 +358,19 @@ export class ManageDaemonSchedulerUseCase implements ManageDaemonSchedulerPort {
       // the rendered facts carried none (shadow off), so its codes are not in
       // `units` here. An intake removal that is `unreadable` must be surfaced
       // typed or the command would print two `absent` lines and exit 0.
+      // OD7a2: the same holds for the record-day pair, which the port also
+      // always removes.
       const intakeUnreadable =
-        shadowIntake === undefined &&
-        result.shadowIntake !== undefined &&
-        (result.shadowIntake.service === 'unreadable' ||
-          result.shadowIntake.timer === 'unreadable');
+        (shadowIntake === undefined &&
+          result.shadowIntake !== undefined &&
+          (result.shadowIntake.service === 'unreadable' ||
+            result.shadowIntake.timer === 'unreadable')) ||
+        (shadowRecordDay === undefined &&
+          result.shadowRecordDay !== undefined &&
+          (result.shadowRecordDay.service === 'unreadable' ||
+            result.shadowRecordDay.timer === 'unreadable'));
       return {
-        units: shadowUnitLines(result, shadowIntake !== undefined),
+        units: shadowUnitLines(result, config !== undefined),
         operatorLines: null,
         ...(intakeUnreadable ? { intakeUnreadable: true } : {}),
       };
@@ -310,7 +378,7 @@ export class ManageDaemonSchedulerUseCase implements ManageDaemonSchedulerPort {
 
     const result = await this.safeRead(portInput);
     return {
-      units: shadowUnitLines(result, shadowIntake !== undefined, uninstallDryRunCode),
+      units: shadowUnitLines(result, config !== undefined, uninstallDryRunCode),
       operatorLines: null,
     };
   }
@@ -348,21 +416,19 @@ export class ManageDaemonSchedulerUseCase implements ManageDaemonSchedulerPort {
   private async safeRemove(): Promise<
     Awaited<ReturnType<DaemonSchedulerPort['remove']>>
   > {
+    const allUnreadable = {
+      service: 'unreadable',
+      timer: 'unreadable',
+      shadowIntake: { service: 'unreadable', timer: 'unreadable' },
+      shadowRecordDay: { service: 'unreadable', timer: 'unreadable' },
+    } as const;
     if (typeof this.deps.scheduler.remove !== 'function') {
-      return {
-        service: 'unreadable',
-        timer: 'unreadable',
-        shadowIntake: { service: 'unreadable', timer: 'unreadable' },
-      };
+      return allUnreadable;
     }
     try {
       return await this.deps.scheduler.remove();
     } catch {
-      return {
-        service: 'unreadable',
-        timer: 'unreadable',
-        shadowIntake: { service: 'unreadable', timer: 'unreadable' },
-      };
+      return allUnreadable;
     }
   }
 }
@@ -374,28 +440,40 @@ function unreadableFrom(input: {
   readonly shadowIntake?:
     | { readonly service: string; readonly timer: string }
     | undefined;
+  readonly shadowRecordDay?:
+    | { readonly service: string; readonly timer: string }
+    | undefined;
 }): {
   readonly service: 'unreadable';
   readonly timer: 'unreadable';
   readonly shadowIntake?:
     | { readonly service: 'unreadable'; readonly timer: 'unreadable' }
     | undefined;
+  readonly shadowRecordDay?:
+    | { readonly service: 'unreadable'; readonly timer: 'unreadable' }
+    | undefined;
 } {
-  return input.shadowIntake === undefined
-    ? { service: 'unreadable', timer: 'unreadable' }
-    : {
-        service: 'unreadable',
-        timer: 'unreadable',
-        shadowIntake: { service: 'unreadable', timer: 'unreadable' },
-      };
+  return {
+    service: 'unreadable',
+    timer: 'unreadable',
+    ...(input.shadowIntake === undefined
+      ? {}
+      : { shadowIntake: { service: 'unreadable', timer: 'unreadable' } }),
+    ...(input.shadowRecordDay === undefined
+      ? {}
+      : { shadowRecordDay: { service: 'unreadable', timer: 'unreadable' } }),
+  };
 }
 
-/** The main pair's lines, then the shadow intake pair's when present. */
+/** The main pair's lines, then the shadow pairs' when present (OD7a2 adds the record-day pair). */
 function shadowUnitLines(
   result: {
     readonly service: string;
     readonly timer: string;
     readonly shadowIntake?:
+      | { readonly service: string; readonly timer: string }
+      | undefined;
+    readonly shadowRecordDay?:
       | { readonly service: string; readonly timer: string }
       | undefined;
   },
@@ -410,11 +488,16 @@ function shadowUnitLines(
     // OD7a1 fix round 3: a scheduler that returns only the main pair's codes
     // (no `shadowIntake` codes) must not let the intake pair be silently
     // omitted: with shadow requested, any MISSING intake code is reported as
-    // `unreadable` so the CLI exits 1 instead of 0.
+    // `unreadable` so the CLI exits 1 instead of 0. OD7a2 applies the same
+    // rule to the record-day pair.
     const intakeService =
       result.shadowIntake === undefined ? 'unreadable' : result.shadowIntake.service;
     const intakeTimer =
       result.shadowIntake === undefined ? 'unreadable' : result.shadowIntake.timer;
+    const recordDayService =
+      result.shadowRecordDay === undefined ? 'unreadable' : result.shadowRecordDay.service;
+    const recordDayTimer =
+      result.shadowRecordDay === undefined ? 'unreadable' : result.shadowRecordDay.timer;
     lines.push(
       {
         key: SHADOW_INTAKE_SERVICE_UNIT_KEY,
@@ -423,6 +506,14 @@ function shadowUnitLines(
       {
         key: SHADOW_INTAKE_TIMER_UNIT_KEY,
         code: map ? map(intakeTimer) : intakeTimer,
+      },
+      {
+        key: SHADOW_RECORD_DAY_SERVICE_UNIT_KEY,
+        code: map ? map(recordDayService) : recordDayService,
+      },
+      {
+        key: SHADOW_RECORD_DAY_TIMER_UNIT_KEY,
+        code: map ? map(recordDayTimer) : recordDayTimer,
       },
     );
   }

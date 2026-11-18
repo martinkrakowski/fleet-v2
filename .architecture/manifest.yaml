@@ -399,6 +399,7 @@ bounded_contexts:
           - ApplyRelaunchUseCase
           - ManageCutoverUseCase
           - RecordShadowDayUseCase
+          - AttestShadowFactUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -458,6 +459,7 @@ bounded_contexts:
             - ApplyRelaunchPort
             - ManageCutoverPort
             - RecordShadowDayPort
+            - AttestShadowFactPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -686,6 +688,8 @@ bounded_contexts:
       ManageCutoverPort: "Read and move the cutover record v1 (status, switch, rollback, retire) by CAS on its revision: status is read-only; switch reads the recorded shadow evidence and refuses unless every comparison kind has a passing verdict on the required shadow day, no live lane lacks a record, a relaunch plan digest is recorded and the daemon status and train-pause record are readable, then sets the train-pause record so the shell train stops and records the switch; rollback pauses the daemon and lifts only that train-pause record; retire refuses inside the rollback window or without the owner's recorded grant; each move is keyed cutover/<move>@<revision> with intent before action and a repeat returns the recorded outcome; it installs, starts or stops no host unit and moves no credential; an unknown or unreadable day is never a pass; ids and codes only."
 
       RecordShadowDayPort: "Evaluate one completed UTC day of the cutover shadow period for one repository and record, in the shadow-evidence ledger by compare-and-set, each criterion that reached a definite pass or fail verdict; a criterion whose sources are unreadable, incomplete or not yet built is reported as unevaluated and recorded nowhere; it refuses the current day, a future day, a day whose grace period has not ended and a day older than seven days; it reads the shell train state and the fleet stores read-only and writes only the ledger; ids, digests and codes only."
+
+      AttestShadowFactPort: "Record one owner-attested one-time shadow fact (s2-forge-error-backoff, s2-canary-parks, s3-wake-after-outage) into the installation's shadow-attestation ledger by compare-and-set on the caller's expected revision: the first attestation of a fact is kept and a later one is a no-op, nothing is removed and no revoke exists; the observed day and timestamp come from the daemon clock and never from the request, so a fact cannot be backdated and must be attested on or before the shadow day it counts for; the request's note, evidence and authority are hashed into the canonical digest and never stored; the write is keyed cutover/attest@<operationId> in the cutover journal with the intent durable before the compare-and-set and one final result after, so a replay with the same operation id and payload returns the stored record without writing, a replay with a different payload or after a refused result is refused, and a crash between intent and result is completed idempotently on a matching digest; a missing or blank authority label is refused; an unreadable or unknown-version ledger or journal is reported and nothing is written; ids, digests and codes only."
       CutoverRecordRepositoryPort: "Store and read the one CutoverRecord v1 of an installation with compare-and-set on its revision; an absent version reads as 1, and an unknown version or an unreadable record is reported, never treated as absent; it performs no forge, host or git action."
       ShadowEvidencePort: "Store and read the one cutover shadow-evidence ledger v1 of an installation with compare-and-set on its revision: per UTC day the release sha, the merges compared and at most one verdict per criterion S1-S13 (pass or fail, a reason code and an input digest); a recorded day-and-criterion verdict is never changed, an identical repeat is a no-op and any other is refused; the newest 31 days are kept; an absent ledger is known absence, and an unknown version or an unreadable ledger is reported, never treated as absent and never overwritten; ids, digests and codes only."
       ShadowAttestationPort: "Store and read the one cutover shadow attestation ledger v1 of an installation with compare-and-set on its revision: at most one sticky observation per named one-time fact (the UTC day observed, the release sha then current or null, a reason code and an input digest); the first attestation of a fact is kept and a later one for the same fact is a no-op; nothing is removed; an absent ledger is known absence, and an unknown version or an unreadable ledger is reported, never treated as absent and never overwritten; ids, digests and codes only."

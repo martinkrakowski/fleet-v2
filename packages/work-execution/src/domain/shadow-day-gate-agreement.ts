@@ -460,6 +460,12 @@ function verdictFromComparison(
 /** Cost: linear in the deduped heads, bounded by `SHADOW_GATE_MAX_HEADS`, plus the comparator's own linear walk. */
 function compareKept(kept: ReadonlyMap<string, ValidHead>, day: CalendarDay): ShadowGateAgreementEvaluation {
   const { settled, unsettled } = splitSettled(kept);
+  // Owner decision 2026-11-18: a day with zero settled heads is never a
+  // `fail` (`too-few-agreeing-heads`) nor a `pass` — nothing was compared,
+  // so the day records `unknown/no-settled-heads` regardless of `unsettled`.
+  if (settled.length === 0) {
+    return evaluation('unknown', 'no-settled-heads', { ...ZERO_COUNTS, unsettled });
+  }
   const comparison = compareShadowGateVerdicts({
     fleet: settled.map(toFleetItem),
     shell: settled.map(toShellItem),
@@ -499,7 +505,11 @@ function judgeShadowGateAgreement(input: unknown): ShadowGateAgreementEvaluation
  * no head pushed on D is a false pass (conductor `pass`, CI `failure`). A
  * stricter conductor (`fail` against CI `success`) does not fail the day.
  * Unsettled CI states are counted and never compared. Heads pushed outside
- * [D-2 00:00Z, D+1 00:00Z) are ignored.
+ * [D-2 00:00Z, D+1 00:00Z) are ignored. With zero settled heads in the
+ * window — an empty `heads`, or every head unsettled or outside
+ * [D-2 00:00Z, D+1 00:00Z) — the result is `unknown` with reason
+ * `no-settled-heads` (owner decision 2026-11-18): never `fail`
+ * (`too-few-agreeing-heads`) and never `pass`.
  *
  * Cost: linear in the capped input — at most `SHADOW_GATE_MAX_HEADS` heads
  * are read, deduplicated and compared, and an oversized, sparse or non-dense

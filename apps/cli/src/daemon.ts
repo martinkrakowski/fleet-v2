@@ -10,6 +10,9 @@
  * command never throws.
  *
  * Exit codes: 0 completed or healthy, 1 refused, unhealthy or unknown, 2 usage.
+ * Watchdog (owner decision 2026-11-18): when only the audible announcement
+ * fails on an otherwise healthy train, `daemon watchdog` exits 0 and prints a
+ * warning to stderr; an unhealthy train still exits 1.
  */
 import {
   DAEMON_MAX_BUDGET_SECONDS,
@@ -29,7 +32,7 @@ export const DAEMON_HELP = `Usage: fleet-v2 daemon <subcommand> (state: --state-
   daemon watchdog [--budget-seconds <n>] [--json]         check merge-train health once and raise attention items
   daemon pause                                         pause the daemon
   daemon resume                                        resume the daemon
-Exit codes: 0 completed or healthy, 1 refused, unhealthy or unknown, 2 usage error.`;
+Exit codes: 0 completed or healthy, 1 refused, unhealthy or unknown, 2 usage error. When only the audible announcement fails on a healthy train, watchdog exits 0 with a stderr warning.`;
 
 export interface DaemonCliOptions {
   readonly stateDir?: string;
@@ -508,7 +511,7 @@ export interface WatchdogRepositoryReport {
   readonly reasonCode?: string;
   /** CO-WD9a: sentences the alert port spoke (0 when no alert is wired). */
   readonly announced: number;
-  /** CO-WD9a: speak calls that failed; > 0 forces exit code 1. */
+  /** CO-WD9a: speak calls that failed; on a healthy train these only warn (owner decision 2026-11-18), never force exit code 1. */
   readonly announceFailures: number;
   /** CO-WD9a: sentences the decision suppressed. */
   readonly announceSuppressed: number;
@@ -624,15 +627,15 @@ export function watchdogRepositoryReport(repoDigest: unknown, answer: unknown): 
     const report: WatchdogRepositoryReport = {
       repoDigest: safeDigest,
       outcome,
-      // Exit 0 requires ALL of: evaluated, own exitCode 0, healthy true, zero
-      // findings and zero announce failures (a failure to speak is a failure
-      // to alert; it must never be reported as healthy).
+      // Exit 0 requires ALL of: evaluated, own exitCode 0, healthy true and
+      // zero findings. Failed speak calls do not force exit 1 on a healthy
+      // train (owner decision 2026-11-18): `runWatchdog` warns on stderr
+      // instead, and an unhealthy train still exits 1.
       exitCode:
         outcome === 'evaluated' &&
         ownValue(answer, 'exitCode') === 0 &&
         ownValue(answer, 'healthy') === true &&
-        findings.length === 0 &&
-        announceFailures === 0
+        findings.length === 0
           ? 0
           : 1,
       findings,
@@ -714,7 +717,17 @@ async function runWatchdog(
   const alertInvalid = audibleAlert === 'invalid';
   const exitCode = alertInvalid || repositories.some((r) => r.exitCode === 1) ? 1 : 0;
 
+  // WD1 (owner decision 2026-11-18): on a healthy train a failed `speak` call
+  // only warns. The warning is a fixed line with a count — never paths or
+  // error text.
+  const totalAnnounceFailures = repositories.reduce((sum, r) => sum + r.announceFailures, 0);
+  const speechWarning =
+    totalAnnounceFailures > 0 ? `watchdog warning: audible-announcement-failed count=${totalAnnounceFailures}\n` : '';
+
   if (parsed.json) {
+    if (speechWarning !== '') {
+      io.stderr(speechWarning);
+    }
     io.stdout(
       `${JSON.stringify({
         outcome: 'completed',
@@ -735,5 +748,8 @@ async function runWatchdog(
     }
   }
   io.stdout(text);
+  if (speechWarning !== '') {
+    io.stderr(speechWarning);
+  }
   return exitCode;
 }

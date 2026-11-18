@@ -950,6 +950,13 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * pending heads is not closed-day stable — `too-few-agreeing-heads` can
    * flip to pass and a `gate-false-pass` would carry a different
    * `headsDigest`, each a permanent day-wide `verdict-conflict`.
+   *
+   * Owner decision 2026-11-18: a day with zero settled heads — an empty
+   * conducted-head set, or every head unsettled or outside the window —
+   * records `unevaluated` (`no-settled-heads`), never `pass` and never
+   * `fail`. The evaluator returns `unknown/no-settled-heads`, which the
+   * `status === 'unknown'` guard below turns into the typed refusal; the
+   * `unsettled > 0` guard above keeps `gate-heads-unsettled` first.
    */
   private async evaluateGateAgreementCriterion(context: DayContext): Promise<CriterionOutcome> {
     const conducted = this.deps.conducted;
@@ -1192,7 +1199,7 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * attestation ledger plus the day's pinned release tree. Re-evaluated and
    * recorded on EVERY day with no "already passed" shortcut, because
    * `readCutoverShadowEvidence` requires all thirteen criteria to pass on
-   * each of the three consecutive days. The ledger read and the release
+   * the required shadow day. The ledger read and the release
    * inspection both go through `call`, so a reached deadline — before or
    * after the awaited value — aborts the whole run.
    *

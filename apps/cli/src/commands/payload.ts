@@ -24,7 +24,22 @@ export class CliUsageError extends Error {}
 
 export type Payload = Record<string, unknown>;
 
-export type CommandHandler = (payload: Payload, runtime: FleetCliRuntime) => Promise<unknown>;
+/**
+ * RC1: the optional line-oriented side channel a command handler may receive
+ * (e.g. record-day's stderr early warning); the JSON result on stdout is the
+ * contract. Defined locally — never imported from the CLI root, even as a
+ * type — so a typecheck program that reaches this module (such as
+ * `@fleet/api`'s) is not pulled into the CLI root and its TUI.
+ */
+export interface CommandSideChannel {
+  stderr(text: string): void;
+}
+
+export type CommandHandler = (
+  payload: Payload,
+  runtime: FleetCliRuntime,
+  io?: CommandSideChannel,
+) => Promise<unknown>;
 
 // ---------------------------------------------------------------------------
 // Payload coercion helpers. Values arrive from `--json` (typed JSON) or from

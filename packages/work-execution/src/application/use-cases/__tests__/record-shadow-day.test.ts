@@ -145,15 +145,21 @@ function shadowMergeKey(
 }
 
 /** A still-live (`queued`) merge-queue entry the shadow pass never mutated. */
-function queuedEntry(entryId: number, pr: number, headOid: string): MergeQueueEntryRecord {
+function queuedEntry(entryId: number, pr: number, headOid: string, enqueuedAtIso = `${DAY}T09:00:00.000Z`): MergeQueueEntryRecord {
   return {
     entryId: ulid(entryId),
     pullRequest: pr,
     headOid,
     state: 'queued',
+    enqueuedAtIso,
     repository: REPOSITORY,
     repoDigest: REPO_DIGEST,
   } as unknown as MergeQueueEntryRecord;
+}
+
+/** A real parked (`state: 'parked'`) merge-queue entry, not a would-park result carrier. */
+function parkedEntry(entryId: number, pr: number, headOid: string, enqueuedAtIso = `${DAY}T09:00:00.000Z`): MergeQueueEntryRecord {
+  return { ...queuedEntry(entryId, pr, headOid, enqueuedAtIso), state: 'parked' } as unknown as MergeQueueEntryRecord;
 }
 
 /** An intent/result pair journaled for one shadow `would-*` key inside day `DAY`. */
@@ -1538,7 +1544,10 @@ describe('RecordShadowDayUseCase', () => {
       // The pass later recorded a real `would-merge` for the still-live
       // entry; the shell merged it, so S1 can only pass if the entry stayed
       // live in the head-resolution index (else `fleet-head-unresolved`).
-      ...shadowOutcome(8, HEAD_B, 'merge-pr', 'would-merge', `${DAY}T10:02:00Z`, HEAD_B),
+      // The result deliberately carries NO `linkedId`: with one, S1 would
+      // resolve the head through the supplement and the S1 half would be
+      // vacuous — here S1 depends on liveness itself.
+      ...shadowOutcome(8, HEAD_B, 'merge-pr', 'would-merge', `${DAY}T10:02:00Z`),
     );
     fixture.shellLines.push(shellResultLine(`${DAY}T10:03:00Z`, 8, HEAD_B));
     const harness = makeHarness(fixture, NOW);
@@ -1547,6 +1556,100 @@ describe('RecordShadowDayUseCase', () => {
     // S1 pass proves S1 liveness (head resolution), and S8's divergence
     // proves S8 liveness: HEAD_B is still in fleetLive while the shell
     // never enqueued it — wrongly excluding it would make S8 pass.
+    expect(result.recorded.S1).toBe('pass');
+    expect(result.recorded.S8).toBe('fail');
+  });
+
+  it('SH24b: a would-drop exclusion is bound to its own queue entry — a re-enqueue at the same head after the drop is live again', async () => {
+    const fixture = cleanFixture(DAY);
+    // The drop was journaled BEFORE this entry was enqueued: the record
+    // predates the entry's `enqueuedAtIso`, so it cannot belong to THIS
+    // entry (it named an earlier incarnation of the same key) and the
+    // re-enqueued entry must be LIVE again — S8 must diverge, not pass.
+    fixture.queueEntries.push(queuedEntry(3, 9, HEAD_D, `${DAY}T10:30:00.000Z`));
+    fixture.journalEntries.push(...shadowOutcome(9, HEAD_D, 'would-drop', 'would-drop', `${DAY}T10:01:00Z`));
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S1).toBe('pass');
+    expect(result.recorded.S8).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
+  });
+
+  it('SH24b: a real parked entry (state parked, no would-park result) stays live in S1 and S8', async () => {
+    const fixture = cleanFixture(DAY);
+    // A genuinely `parked` queue entry — not a queued entry carrying a
+    // would-park result. `would-park` is not shadow-terminal and ordinary
+    // parks never exclude, so the entry counts as live in both criteria:
+    // S8 sees it in `fleetLive` (divergence against a shell that never
+    // enqueued it), and S1 resolves the journaled would-merge's head12
+    // against it — the result carries no `linkedId`, so S1 can only pass
+    // through the live-entry index (else `fleet-head-unresolved`).
+    fixture.queueEntries.push(parkedEntry(3, 9, HEAD_D));
+    fixture.journalEntries.push(...shadowOutcome(9, HEAD_D, 'merge-pr', 'would-merge', `${DAY}T10:02:00Z`));
+    fixture.shellLines.push(shellResultLine(`${DAY}T10:03:00Z`, 9, HEAD_D));
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S1).toBe('pass');
+    expect(result.recorded.S8).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S8).toMatchObject({ verdict: 'fail', reason: 'enqueue-coverage-divergence' });
+  });
+
+  it("SH24b: readLiveEntries' would-terminal exclusion keeps a dropped entry out of S1's head-resolution index — the stale would-merge cannot resolve", async () => {
+    const fixture = cleanFixture(DAY);
+    // One entry, dropped after a same-day would-merge dry-run was already
+    // journaled for its head: the pass recorded `would-merge` at 10:00 and
+    // the entry was then dropped at 10:01 (its `would-drop` is at or after
+    // the entry's enqueue, so the exclusion binds to THIS entry). The
+    // correct shadow rule keeps the dropped entry out of `readLiveEntries`'s
+    // index, so the stale `would-merge` cannot resolve its head12 and S1
+    // refuses with `fleet-head-unresolved`. If `readLiveEntries` ignored the
+    // would-terminal exclusion, the dropped entry would stay in the index,
+    // the stale result would resolve, and S1 would answer
+    // `merge-set-divergence` (extra-in-fleet against a shell that never
+    // merged) instead — so the pinned reason fails under that mutation.
+    fixture.queueEntries.push(queuedEntry(3, 8, HEAD_B));
+    fixture.journalEntries.push(
+      ...shadowOutcome(8, HEAD_B, 'merge-pr', 'would-merge', `${DAY}T10:00:00Z`),
+      ...shadowOutcome(8, HEAD_B, 'would-drop', 'would-drop', `${DAY}T10:01:00Z`),
+    );
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    expect(result.recorded.S1).toBe('fail');
+    const dayRecord = harness.evidence.stored?.days.find((entry) => entry.day === DAY);
+    expect(dayRecord?.verdicts.S1).toMatchObject({ verdict: 'fail', reason: 'fleet-head-unresolved' });
+  });
+
+  it('SH24b: interrupted would-supersede and would-already-merged intents closed as dry-run/shadow-intent-closed keep their entries live in S1 and S8', async () => {
+    const fixture = cleanFixture(DAY);
+    fixture.queueEntries.push(queuedEntry(3, 8, HEAD_B), queuedEntry(4, 9, HEAD_D));
+    fixture.journalEntries.push(
+      // Closed interrupted intents on the other two shadow-terminal keys:
+      // same keys an executed mutation would carry, but reason
+      // `shadow-intent-closed` — never an executed shadow mutation, so
+      // both entries stay live. Each entry also has a real `would-merge`
+      // with NO `linkedId`, so S1's pass depends on the entry staying in
+      // the head-resolution index (else `fleet-head-unresolved`).
+      ...shadowOutcome(8, HEAD_B, 'would-supersede', 'shadow-intent-closed', `${DAY}T10:01:00Z`),
+      ...shadowOutcome(8, HEAD_B, 'merge-pr', 'would-merge', `${DAY}T10:02:00Z`),
+      ...shadowOutcome(9, HEAD_D, 'would-already-merged', 'shadow-intent-closed', `${DAY}T10:01:00Z`),
+      ...shadowOutcome(9, HEAD_D, 'merge-pr', 'would-merge', `${DAY}T10:02:00Z`),
+    );
+    fixture.shellLines.push(
+      shellResultLine(`${DAY}T10:03:00Z`, 8, HEAD_B),
+      shellResultLine(`${DAY}T10:03:00Z`, 9, HEAD_D),
+    );
+    const harness = makeHarness(fixture, NOW);
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(makeRequest());
+    expectRecorded(result);
+    // S1 pass proves S1 liveness (head resolution through the index), and
+    // S8's divergence proves S8 liveness: both entries stay in `fleetLive`
+    // while the shell never enqueued them — wrongly excluding them would
+    // make S1 fail and S8 pass.
     expect(result.recorded.S1).toBe('pass');
     expect(result.recorded.S8).toBe('fail');
   });

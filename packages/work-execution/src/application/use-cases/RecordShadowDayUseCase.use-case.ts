@@ -264,11 +264,21 @@ type JournalRead =
  * `reasonCode === action`. A `dry-run` result with
  * `reasonCode: 'shadow-intent-closed'` on such a key never excludes (the
  * interrupted intent was closed, not executed), and ordinary parked entries
- * stay live. Cost: linear in the journal entries; the entry's own fields
- * are plain reads.
+ * stay live.
+ *
+ * The exclusion is bound to THIS queue entry, not to the key alone: the
+ * record only excludes when its own `recordedAtIso` is at or after the
+ * entry's `enqueuedAtIso` (both fields the entry and the journal reliably
+ * carry), so a would-terminal record that predates the entry's enqueue
+ * belongs to an earlier incarnation of the same key and a later re-enqueue
+ * at the same head is LIVE again. When either timestamp is missing or
+ * unparseable the record cannot be bound to the entry, so the entry stays
+ * live — staying live can only cost a divergence, never a false pass.
+ * Cost: linear in the journal entries; the entry's own fields are plain
+ * reads.
  */
 function isShadowEffectivelyLive(
-  entry: Pick<MergeQueueEntryRecord, 'repoDigest' | 'pullRequest' | 'headOid' | 'state'>,
+  entry: Pick<MergeQueueEntryRecord, 'repoDigest' | 'pullRequest' | 'headOid' | 'state' | 'enqueuedAtIso'>,
   journalEntries: readonly LaneRunJournalEntryRecord[],
 ): boolean {
   if (!isMergeQueueEntryLive(entry)) {
@@ -278,6 +288,7 @@ function isShadowEffectivelyLive(
   if (head12 === null) {
     return true;
   }
+  const enqueuedMs = Date.parse(entry.enqueuedAtIso);
   for (const record of journalEntries) {
     if (record.kind !== 'result' || record.outcome !== 'dry-run') {
       continue;
@@ -292,7 +303,10 @@ function isShadowEffectivelyLive(
       && SHADOW_TERMINAL_WOULD_ACTIONS.includes(parsed.action)
       && record.reasonCode === parsed.action
     ) {
-      return false;
+      const recordedMs = Date.parse(record.recordedAtIso);
+      if (Number.isNaN(enqueuedMs) || Number.isNaN(recordedMs) || recordedMs >= enqueuedMs) {
+        return false;
+      }
     }
   }
   return true;
@@ -324,6 +338,11 @@ function shadowLinkedHeads(
     if (
       parsed === null
       || parsed.kind !== 'merge'
+      // `would-supersede` stays accepted here even though SH24a currently
+      // writes no `linkedId` on a `would-supersede` result (so the branch
+      // is dead in production today): the S1 contract this helper serves
+      // names `would-supersede` results as a legitimate `linkedId` source,
+      // so a writer that starts carrying one must be honoured, not dropped.
       || (parsed.action !== 'merge-pr' && parsed.action !== 'would-supersede')
     ) {
       continue;

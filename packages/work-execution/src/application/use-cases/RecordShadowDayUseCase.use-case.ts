@@ -950,6 +950,13 @@ export class RecordShadowDayUseCase implements RecordShadowDayPort {
    * pending heads is not closed-day stable — `too-few-agreeing-heads` can
    * flip to pass and a `gate-false-pass` would carry a different
    * `headsDigest`, each a permanent day-wide `verdict-conflict`.
+   *
+   * Owner decision 2026-11-18: a day with zero settled heads — an empty
+   * conducted-head set, or every head unsettled or outside the window —
+   * records `unevaluated` (`no-settled-heads`), never `pass` and never
+   * `fail`. The evaluator returns `unknown/no-settled-heads`, which the
+   * `status === 'unknown'` guard below turns into the typed refusal; the
+   * `unsettled > 0` guard above keeps `gate-heads-unsettled` first.
    */
   private async evaluateGateAgreementCriterion(context: DayContext): Promise<CriterionOutcome> {
     const conducted = this.deps.conducted;

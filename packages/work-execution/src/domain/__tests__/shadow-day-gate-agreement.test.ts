@@ -138,7 +138,7 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
     const states: readonly ShadowGateCiState[] = ['pending', 'missing', 'other', 'ambiguous'];
     const heads = states.map((ciGate, index) => head(index + 1, { ciGate }));
     expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(
-      verdict('fail', 'too-few-agreeing-heads', { unsettled: states.length }),
+      verdict('unknown', 'no-settled-heads', { unsettled: states.length }),
     );
   });
 
@@ -298,9 +298,19 @@ describe('evaluateShadowGateAgreement (S4 prime)', () => {
     expect(fewer).not.toEqual(more);
   });
 
-  it('an empty heads list is fail/too-few-agreeing-heads', () => {
+  it('an empty heads list is unknown/no-settled-heads', () => {
     expect(evaluateShadowGateAgreement(gateInput([]))).toEqual(
-      verdict('fail', 'too-few-agreeing-heads'),
+      verdict('unknown', 'no-settled-heads'),
+    );
+  });
+
+  it('heads only outside D-2..D give unknown/no-settled-heads', () => {
+    const heads = [
+      head(101, { pushedAtIso: at(D_MINUS_3) }),
+      head(102, { pushedAtIso: at(D_PLUS_1, '00:00:00') }),
+    ];
+    expect(evaluateShadowGateAgreement(gateInput(heads))).toEqual(
+      verdict('unknown', 'no-settled-heads'),
     );
   });
 

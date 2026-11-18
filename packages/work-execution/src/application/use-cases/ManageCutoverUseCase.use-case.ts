@@ -1083,6 +1083,7 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     const { record } = cutover;
 
     const normalizedNowIso = normalizeIso(nowIso);
+    // TODO(retirement-ledger): verify §1 cutover-plan ledger rows (S13) in a follow-up unit.
     // The record, clock and window preconditions run on every pass: `nowIso` is
     // not part of the intent digest, so a retry must re-decide the rollback
     // window against the request's own clock, never trust the earlier pass.

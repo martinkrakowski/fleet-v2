@@ -5,6 +5,7 @@ export * from "./advance-lane-run/index.js";
 export * from "./AdvanceLaneRunUseCase.use-case.js";
 export * from "./AppendScorecardUseCase.use-case.js";
 export * from "./ApplyRelaunchUseCase.use-case.js";
+export * from "./AttestShadowFactUseCase.use-case.js";
 export * from "./AuthorBriefUseCase.use-case.js";
 export * from "./AutoMergeAttemptUseCase.use-case.js";
 export * from "./BuildFactPackUseCase.use-case.js";

@@ -314,7 +314,7 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     return entries;
   }
 
-  it('wires every reader and records the day: every wired criterion moves off not-wired, S13 stays not-implemented, S3 not-yet-observed and S2/S10/S11 release-unpinned while cutover-shadow-attestations.json is missing', async () => {
+  it('wires every reader and records the day: every wired criterion moves off not-wired, S13 is no longer recorded, S3 not-yet-observed and S2/S10/S11 release-unpinned while cutover-shadow-attestations.json is missing', async () => {
     const { stateDir, fixtureDir } = newDirs();
     await shellFixture(fixtureDir);
     const runtime = wiredRuntime(stateDir);
@@ -341,7 +341,9 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       //   never a fail), S2/S10/S11 `release-unpinned` (releaseSha null, SH20 not
       //   landed: UNPINNED_RANK 2 beats NOT_YET_RANK 6), S3 `not-yet-observed`
       //   (the attestations ledger is missing), S8 `samples-invalid` (no
-      //   daemon events to sample), S13 `not-implemented`.
+      //   daemon events to sample). S13 is absent everywhere: since SH23
+      //   (owner decision 2026-11-18) it is no longer a shadow criterion —
+      //   not recorded and not unevaluated.
       expect(result.recorded).toEqual({
         S1: 'pass',
         S5: 'pass',
@@ -350,6 +352,7 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
         S9: 'pass',
         S12: 'fail',
       });
+      expect(Object.keys(result.recorded)).not.toContain('S13');
       expect(reasons).toEqual({
         S2: 'release-unpinned',
         S3: 'not-yet-observed',
@@ -357,7 +360,6 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
         S8: 'samples-invalid',
         S10: 'release-unpinned',
         S11: 'release-unpinned',
-        S13: 'not-implemented',
       });
     } finally {
       vi.useRealTimers();
@@ -608,12 +610,15 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     expect(calls).toEqual([{ root: '/srv/fleet' }]);
   });
 
-  // Luna's pre-merge fix 1: the composition's `premergeCarry` must give the
-  // resolver `unknown` (owner decision), so S5' records `unknown` and never
-  // `pass` when there are carry decisions. If the composition were mutated to
-  // answer `agree` (mirroring the shell's answer), S5' would record `pass`
-  // (`carry-decisions-equal`) and this test would fail on the pinned reason.
-  it("records S5 as fleet-carry-unknown, never pass, for one shell carry decision: the composition's premergeCarry answers unknown", async () => {
+  // 2026-11-18 owner decision: with the composed `premergeCarry` resolver
+  // pinned to `unknown`, S5' compares nothing (there is nothing resolvable)
+  // and records `pass` (`carry-decisions-equal`) with `compared: 0` — never a
+  // refusal. The unresolved decision is surfaced instead in the CLI JSON
+  // output's non-digested diagnostics: `unresolvedCount` 1 plus the bounded
+  // `unresolvedIds` (`12@` + the 12-hex head prefix). If the composition were
+  // mutated to answer `agree` (mirroring the shell's answer), S5' would
+  // compare 1 and this test would fail on `compared` and the diagnostics.
+  it('records S5 as pass with compared 0 and the unresolved diagnostics when the composed premergeCarry answers unknown', async () => {
     const { stateDir, fixtureDir } = newDirs();
     await shellFixture(fixtureDir);
     // One paired shell carry decision inside the recorded day: an update
@@ -639,10 +644,14 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       if (result.outcome !== 'recorded') {
         throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
       }
-      // The day is recorded, but S5' is unevaluated with the unknown-fleet
-      // reason: `unknown` is never resolved into a pass or a fail.
-      expect(result.recorded.S5).toBeUndefined();
-      expect(reasonsOf(result).S5).toBe('fleet-carry-unknown');
+      // The day records S5 as a pass over an empty resolvable set, with the
+      // unresolved decision printed in the `record-day` JSON output.
+      expect(result.recorded.S5).toBe('pass');
+      expect(reasonsOf(result).S5).toBeUndefined();
+      expect(result.premergeCarry).toEqual({
+        unresolvedCount: 1,
+        unresolvedIds: [`12@${newHead.slice(0, 12)}`],
+      });
     } finally {
       vi.useRealTimers();
     }
@@ -697,6 +706,28 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
       compareAndSet(request: unknown): Promise<{ outcome: string; reason: string }>;
     };
     expect(await attestations.compareAndSet({})).toEqual({ outcome: 'refused', reason: 'read-only' });
+  });
+
+  // AT1 fix round 2: the record-day attestation reader must be the read-only
+  // instance and never the WRITABLE `ShadowAttestationAdapter` the composition
+  // builds for `AttestShadowFactUseCase` — following the SH19c/SH19d
+  // identity-test pattern.
+  it('wires oneTime.attestations as the read-only instance, not the writable adapter attestShadowFact holds', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    const attestUseCase = runtime.execution.attestShadowFact;
+    if (attestUseCase === undefined) throw new Error('attestShadowFact is not wired');
+    const writable = (attestUseCase as unknown as {
+      deps: { attestations: unknown };
+    }).deps.attestations;
+    expect(deps.oneTime?.attestations).toBeInstanceOf(ShadowAttestationAdapter);
+    expect(writable).toBeInstanceOf(ShadowAttestationAdapter);
+    expect(readOnlyOf(deps.oneTime?.attestations)).toBe(true);
+    // The writable one is constructed without the read-only flag (its store
+    // options bag omits it), so it is a genuinely different configuration.
+    const writableOptions = (writable as { store?: { options?: { readOnly?: unknown } } }).store?.options;
+    expect(writableOptions?.readOnly).not.toBe(true);
+    expect(deps.oneTime?.attestations).not.toBe(writable);
   });
 
   // Luna's fix round 2, behaviour backstop: one corrupt state file per

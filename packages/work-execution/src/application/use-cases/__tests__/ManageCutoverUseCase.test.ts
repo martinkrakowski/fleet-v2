@@ -567,7 +567,7 @@ describe('ManageCutoverUseCase switch', () => {
     expect(totalWriteCalls(h)).toBe(0);
   });
 
-  it('a missing readShadowEvidence method refuses shadow-evidence-absent and names S1 through S13', async () => {
+  it('a missing readShadowEvidence method refuses shadow-evidence-absent and names S1 through S12', async () => {
     const h = await harness({ seed: null });
     resetSpies(h);
     const result = await h.useCase.execute(switchRequest());

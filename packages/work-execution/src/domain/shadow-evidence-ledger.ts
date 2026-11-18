@@ -9,7 +9,7 @@
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { isZonedIsoDateTime } from './conductor-halt.js';
-import { CUTOVER_SHADOW_CONSECUTIVE_DAYS, CUTOVER_SHADOW_CRITERIA, type CutoverShadowCriterion } from './cutover-records.js';
+import { CUTOVER_SHADOW_CONSECUTIVE_DAYS, CUTOVER_SHADOW_CRITERIA, LEGACY_SHADOW_CRITERIA, type CutoverShadowCriterion } from './cutover-records.js';
 import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
@@ -63,7 +63,11 @@ export interface ShadowLedger {
 export const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
 export const MAX_REVISION = 1_000_000_000;
-const CRITERION_SET: ReadonlySet<string> = new Set(CUTOVER_SHADOW_CRITERIA);
+// The legacy criterion set: old ledger days may still carry an `S13` entry
+// (retired to the plan §3.1 retirement gate, owner decision 2026-11-18), so
+// the reader and the day-writer keep accepting it while the composed
+// evidence (`evidenceDay`) strips it.
+const CRITERION_SET: ReadonlySet<string> = new Set<string>(LEGACY_SHADOW_CRITERIA);
 const EVIDENCE_DAYS = CUTOVER_SHADOW_CONSECUTIVE_DAYS;
 const LEDGER_DAY_KEYS: readonly string[] = ['day', 'releaseSha', 'mergesCompared', 'verdicts'];
 const VERDICT_KEYS: readonly string[] = ['verdict', 'reason', 'digest', 'recordedAtIso'];
@@ -622,7 +626,7 @@ export type ShadowEvidenceCompose =
 /**
  * Compose the shadow-evidence document the switch move checks. Only the
  * document shape is composed here: `readCutoverShadowEvidence` checks the
- * single required shadow day, the thirteen-criterion floor and the
+ * single required shadow day, the twelve-criterion floor and the
  * twenty-merge floor from the returned evidence. Cost: linear in the
  * capped ledger. Never throws, never echoes an input value; the evidence is
  * freshly built, never a reference into the input ledger.
@@ -693,11 +697,19 @@ function totalMerges(days: readonly ShadowDayRecord[]): number {
   return days.reduce((sum, day) => sum + (day.mergesCompared ?? 0), 0);
 }
 
-/** One composed day: only the criteria actually recorded, unpadded. */
+/**
+ * One composed day: only the twelve criteria the switch window still
+ * requires, unpadded. A legacy `S13` entry on an old ledger day is stripped
+ * here — the single legacy filter — so the composed document never carries
+ * a criterion `readCutoverShadowEvidence` would refuse as unknown.
+ */
 function evidenceDay(day: ShadowDayRecord): { day: string; verdicts: Record<string, 'pass' | 'fail'> } {
   const verdicts: Record<string, 'pass' | 'fail'> = {};
-  for (const [criterion, verdict] of Object.entries(day.verdicts)) {
-    verdicts[criterion] = verdict.verdict;
+  for (const criterion of CUTOVER_SHADOW_CRITERIA) {
+    const verdict = day.verdicts[criterion];
+    if (verdict !== undefined) {
+      verdicts[criterion] = verdict.verdict;
+    }
   }
   return { day: day.day, verdicts };
 }

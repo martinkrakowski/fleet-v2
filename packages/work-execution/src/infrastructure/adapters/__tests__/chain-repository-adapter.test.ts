@@ -590,3 +590,50 @@ describe('ChainRepositoryAdapter (file store)', () => {
     await expect(fs.stat(path.join(stateDir, 'chains'))).rejects.toThrow();
   });
 });
+
+// SH19c: the read-only no-create list path the record-day composition uses —
+// the constructor never creates the state directory, `listChains` never takes
+// the exclusive lock (no `chains` mkdir, no `.store.lock`, no temp cleanup),
+// and a missing store lists as empty rather than creating anything.
+describe('ChainRepositoryAdapter read-only list path', () => {
+  let stateDir: string;
+
+  beforeEach(async () => {
+    stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-chains-readonly-'));
+  });
+  afterEach(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('creates nothing in the constructor when readOnly is true', async () => {
+    const missing = path.join(stateDir, 'absent-state');
+    new ChainRepositoryAdapter({ stateDir: missing, readOnly: true });
+    expect(await fs.access(missing).then(() => true, () => false)).toBe(false);
+  });
+
+  it('lists a missing state directory as empty without creating it', async () => {
+    const missing = path.join(stateDir, 'absent-state');
+    const readOnly = new ChainRepositoryAdapter({ stateDir: missing, readOnly: true });
+    expect(await readOnly.listChains({ repository: REPO, deadlineIso: deadline() })).toEqual({ status: 'ok', records: [] });
+    expect(await fs.access(missing).then(() => true, () => false)).toBe(false);
+  });
+
+  it('lists a missing chains directory as empty with no mkdir, no lock file, and no temp cleanup', async () => {
+    const readOnly = new ChainRepositoryAdapter({ stateDir, readOnly: true });
+    expect(await readOnly.listChains({ repository: REPO, deadlineIso: deadline() })).toEqual({ status: 'ok', records: [] });
+    expect(await fs.readdir(stateDir)).toEqual([]);
+  });
+
+  it('lists existing chains read-only and leaves the directory byte-identical', async () => {
+    const writable = new ChainRepositoryAdapter({ stateDir });
+    const record = recordOf();
+    expect(await writable.recordChainIntent({ record, deadlineIso: deadline() })).toEqual({ outcome: 'recorded' });
+    const chainsDir = path.join(stateDir, 'chains');
+    const before = await fs.readdir(chainsDir);
+    const readOnly = new ChainRepositoryAdapter({ stateDir, readOnly: true });
+    const listed = await readOnly.listChains({ repository: REPO, deadlineIso: deadline() });
+    expect(listed.status).toBe('ok');
+    expect(listed.status === 'ok' && listed.records).toHaveLength(1);
+    expect(await fs.readdir(chainsDir)).toEqual(before);
+  });
+});

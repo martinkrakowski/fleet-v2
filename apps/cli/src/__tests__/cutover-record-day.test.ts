@@ -11,6 +11,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { createFleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
+import type { FleetInstallation } from '@fleet/installation';
 
 const tempDirs: string[] = [];
 
@@ -157,5 +158,201 @@ describe('cutover shadow record-day (SH8a)', () => {
     expect(JSON.parse(result.out)).toEqual({ outcome: 'refused', reason: 'too-early' });
     // Nothing is ever written on a refusal.
     await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).rejects.toThrow();
+  });
+});
+
+// SH19c: the composition wiring — the conducted-facts, chains, premerge-carry
+// and one-time readers are wired into `record-day`, every one of them
+// read-only, and every failure path is a typed unevaluated reason, never a
+// throw and never a quarantined file.
+describe('cutover shadow record-day wiring (SH19c)', () => {
+  /** A minimal valid v2 installation: github forge, a daemon section, no env. */
+  function installationFor(forge: FleetInstallation['forge']): FleetInstallation {
+    return {
+      schemaVersion: 2,
+      hosts: {
+        'lane-host': {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: {
+            kind: 'opencode',
+            port: 46000,
+            capabilities: {
+              networkEgressRestricted: true,
+              cpuAndMemoryLimited: true,
+              processTreeTermination: true,
+              filesystemScope: 'scoped-worktree',
+            },
+            maxLanes: 2,
+          },
+        },
+      },
+      tools: ['opencode'],
+      seats: [
+        {
+          id: 'implementer',
+          tool: 'opencode',
+          model: 'example-provider/example-model',
+          roles: ['implementer'],
+          costClass: 'plan-quota',
+        },
+      ],
+      chains: { implementer: [{ seatId: 'implementer' }] },
+      policy: { forbiddenRoutes: [{ tool: 'example-tool', modelPattern: 'example-*' }] },
+      shelf: { provider: 'local' },
+      verification: { procedures: { gate: { command: 'true', args: [] } } },
+      waves: { baseUrl: 'https://waves.example', tokenFile: '/home/operator/.config/fleet/waves-token' },
+      decisions: { provider: 'none' },
+      daemon: {
+        nodePath: '/usr/bin/node',
+        cliPath: '/srv/fleet/current/apps/cli/dist/bin.js',
+        stateDir: '/srv/fleet/state',
+        unitDir: '/srv/fleet/units',
+        installationFile: '/srv/fleet/fleet.json',
+      },
+      ...(forge !== undefined ? { forge } : {}),
+    } as FleetInstallation;
+  }
+
+  function wiredRuntime(
+    stateDir: string,
+    forge: FleetInstallation['forge'] = { mode: 'github', owner: 'fleet', repo: 'v2' },
+  ): ReturnType<typeof createFleetCliRuntime> {
+    return createFleetCliRuntime({
+      stateDir,
+      daemonSleep: async () => {},
+      installation: installationFor(forge),
+      // A forge read must never run for an empty day; the stub refuses loudly.
+      forgeGhRunner: async () => {
+        throw new Error('forge read must not run for an empty day');
+      },
+      env: {},
+    });
+  }
+
+  /** A clean shell fixture: the queue, parked, inprogress and events files all exist and hold nothing. */
+  async function shellFixture(fixtureDir: string): Promise<void> {
+    await fs.writeFile(path.join(fixtureDir, 'queue'), '');
+    await fs.writeFile(path.join(fixtureDir, 'parked'), '');
+    await fs.writeFile(path.join(fixtureDir, 'inprogress'), '');
+    await fs.writeFile(path.join(fixtureDir, 'events.jsonl'), '');
+  }
+
+  function reasonsOf(result: { readonly unevaluated: ReadonlyArray<{ criterion: string; reason: string }> }): Record<string, string> {
+    return Object.fromEntries(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+  }
+
+  it('wires every reader and records the day: every wired criterion moves off not-wired, S13 stays not-implemented, S3 not-yet-observed and S2/S10/S11 release-unpinned while cutover-shadow-attestations.json is missing', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const runtime = wiredRuntime(stateDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      if (result.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      }
+      const reasons = reasonsOf(result);
+      for (const criterion of ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S8', 'S9', 'S10', 'S11', 'S12']) {
+        expect(reasons[criterion], criterion).not.toBe('not-wired');
+      }
+      expect(reasons.S13).toBe('not-implemented');
+      // releaseSha is null (SH20 is not landed), so UNPINNED_RANK beats NOT_YET_RANK.
+      expect(reasons.S2).toBe('release-unpinned');
+      expect(reasons.S10).toBe('release-unpinned');
+      expect(reasons.S11).toBe('release-unpinned');
+      expect(reasons.S3).toBe('not-yet-observed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves the state directory with no entries beyond the ledger it owns after record-day over an empty state dir', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const runtime = wiredRuntime(stateDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      expect(result.outcome).toBe('recorded');
+      // The read-only readers (chains, lane runs, journal, attempts,
+      // attestations) must have created no directory, no lock file and no
+      // store: the only new entry is the shadow ledger the use case itself
+      // compares-and-sets.
+      expect(readdirSync(stateDir).sort()).toEqual(['cutover-shadow.json']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports attestations-unreadable for S2, S3, S10 and S11 when cutover-shadow-attestations.json is corrupt or null, without throwing or quarantining', async () => {
+    for (const bytes of ['{ not json', 'null', '{"attestations":{}}']) {
+      const { stateDir, fixtureDir } = newDirs();
+      await shellFixture(fixtureDir);
+      await fs.writeFile(path.join(stateDir, 'cutover-shadow-attestations.json'), bytes);
+      const runtime = wiredRuntime(stateDir);
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+      try {
+        const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const result = await runtime.execution.recordShadowDay!.execute({
+          repository: { owner: 'fleet', repo: 'v2' },
+          legacyStateDir: fixtureDir,
+          day,
+        });
+        if (result.outcome !== 'recorded') {
+          throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+        }
+        const reasons = reasonsOf(result);
+        expect(reasons.S2).toBe('attestations-unreadable');
+        expect(reasons.S3).toBe('attestations-unreadable');
+        expect(reasons.S10).toBe('attestations-unreadable');
+        expect(reasons.S11).toBe('attestations-unreadable');
+        // Never quarantined: the corrupt bytes are exactly as they were.
+        await expect(fs.readFile(path.join(stateDir, 'cutover-shadow-attestations.json'), 'utf8')).resolves.toBe(bytes);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  });
+
+  it('omits conducted and leaves S4 and S6 not-wired when forge mode is not github', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const runtime = wiredRuntime(stateDir, { mode: 'none' });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      if (result.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      }
+      const reasons = reasonsOf(result);
+      expect(reasons.S4).toBe('not-wired');
+      expect(reasons.S6).toBe('not-wired');
+      // The one-time and chains readers are still wired.
+      expect(reasons.S3).toBe('not-yet-observed');
+      expect(reasons.S7).not.toBe('not-wired');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -54,6 +54,10 @@ const OTHER_STORE_FILE_NAMES = [
   'cutover-journal.json',
   'merge-queue.json',
   'merge-records.json',
+  // SH19c: the shadow ledger and its attestation ledger are other stores'
+  // files, never this one's.
+  'cutover-shadow.json',
+  'cutover-shadow-attestations.json',
 ];
 const SAFE_FILE_NAME = /^[A-Za-z0-9._-]{1,128}$/;
 const CAS_KEYS = ['expectedRevision', 'next', 'deadlineIso'];

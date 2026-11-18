@@ -512,13 +512,15 @@ describe('loadInstallation owner trust check', () => {
     expectUntrusted(readErrors(load(file, { getuid: () => 12345 })), 'process uid');
   });
 
-  it('refuses a non-regular file (injectable fstat seam)', () => {
+  it('reports a non-regular file as unreadable (injectable fstat seam)', () => {
+    // A refusal that happens BEFORE the content is parsed cannot know whether
+    // an owner section exists, so it keeps main's label, not the untrusted one.
     freshDir();
     const file = writeInstallation('fleet.json', OWNER_JSON);
     const seam = {
       fstat: () => ({ uid: process.getuid?.() ?? -1, mode: 0o100644, isFile: () => false }),
     };
-    expectUntrusted(readErrors(load(file, seam)), 'not-a-regular-file');
+    expect(readErrors(load(file, seam))).toEqual([`${file}: unreadable`]);
   });
 
   it('refuses a group- or other-writable file', () => {
@@ -731,6 +733,23 @@ describe('loadInstallation owner trust check', () => {
     expectUntrusted(readErrors(load(file)), 'git checkout or worktree');
   });
 
+  it('refuses a load through FLEET_INSTALLATION_FILE naming an untrusted location', () => {
+    freshDir();
+    gitCheckout(tempDir);
+    const file = writeInstallation('fleet.json', OWNER_JSON);
+    const result = loadInstallation({ env: { FLEET_INSTALLATION_FILE: file }, cwd: tempDir });
+    expectUntrusted(readErrors(result), 'git checkout or worktree');
+  });
+
+  it('refuses a file whose parent holds .git as a FILE (a linked worktree)', () => {
+    freshDir();
+    // A linked worktree's `.git` is a file containing `gitdir: ...`, not a
+    // directory; it still marks a checkout, so the file is refused.
+    writeFileSync(join(tempDir, '.git'), 'gitdir: /srv/fleet/worktrees/lane/.git\n');
+    const file = writeInstallation('fleet.json', OWNER_JSON);
+    expectUntrusted(readErrors(load(file)), 'git checkout or worktree');
+  });
+
   it('applies no trust check when the file carries no owner section', () => {
     freshDir();
     gitCheckout(tempDir);
@@ -767,35 +786,36 @@ describe('loadInstallation owner trust check', () => {
     const file = join(tempDir, 'fleet.json');
     execFileSync('mkfifo', [file]);
     const start = Date.now();
-    expectUntrusted(readErrors(load(file)), 'not-a-regular-file');
+    // A FIFO is refused before the content is parsed, so main's label applies.
+    expect(readErrors(load(file))).toEqual([`${file}: unreadable`]);
     // A blocking open would hang far longer than this; a prompt refusal is
     // well under a second on any supported host.
     expect(Date.now() - start).toBeLessThan(5000);
   });
 
-  it('refuses a directory', () => {
+  it('reports a directory as unreadable', () => {
     freshDir();
     const file = join(tempDir, 'fleet.json');
     mkdirSync(file);
-    expectUntrusted(readErrors(load(file)), 'not-a-regular-file');
+    expect(readErrors(load(file))).toEqual([`${file}: unreadable`]);
   });
 
-  it('refuses an oversized regular file', () => {
+  it('reports an oversized regular file as unreadable', () => {
     freshDir();
     const file = join(tempDir, 'fleet.json');
     // Just over the 1 MiB cap: a valid JSON prefix followed by padding so a
     // naive uncapped read would still parse (and a capped read must refuse).
     const content = `{"schemaVersion":1}${' '.repeat(1024 * 1024 + 1)}`;
     writeFileSync(file, content, { mode: 0o600 });
-    expectUntrusted(readErrors(load(file)), 'size cap');
+    expect(readErrors(load(file))).toEqual([`${file}: unreadable`]);
   });
 
-  it('refuses a symlink whose target is a directory before reading it', () => {
+  it('reports a symlink whose target is a directory as unreadable', () => {
     freshDir();
     const dir = join(tempDir, 'target-dir');
     mkdirSync(dir);
     const link = join(tempDir, 'fleet.json');
     symlinkSync(dir, link);
-    expectUntrusted(readErrors(load(link)), 'not-a-regular-file');
+    expect(readErrors(load(link))).toEqual([`${link}: unreadable`]);
   });
 });

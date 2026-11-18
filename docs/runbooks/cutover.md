@@ -141,7 +141,8 @@ step: move the installation file out of every checkout to
 `~/.config/fleet-v2/fleet.json` (`0600` in a `0700` directory) and point
 `FLEET_INSTALLATION_FILE` at that path in the CLI shell profile and in the
 systemd user `EnvironmentFile` drop-in shared by the daemon, train, and
-conductor units.
+conductor units. One line of warning: a git-tracked `$HOME` (or `~/.config`)
+defeats this move remedy, so keep `~/.config/fleet-v2` outside any repository.
 
 ### Pinning and rotating the key
 
@@ -152,10 +153,10 @@ encoding of the 32-byte raw Ed25519 public key. A raw Ed25519 seed is also
 never paste a seed. `waves.ownerPublicKey` is non-authoritative; it is
 accepted only when it equals `owner.publicKey`.
 
-Rotate by replacing `owner.publicKey` in the installation file, then
-re-signing any pending decisions so they carry the new key, and restarting the
-API and the daemon so the new key is what every consumer reads. Rotation is a
-file edit plus a restart, not a command.
+Rotate by replacing `owner.publicKey` in the installation file, and restarting the
+API and the daemon so the new key is what every consumer reads. Pending decisions
+signed under the old key will fail verification and must be re-requested.
+Rotation is a file edit plus a restart, not a command.
 
 ### The same-uid limit
 

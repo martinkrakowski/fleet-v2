@@ -716,11 +716,13 @@ function applyEnvironmentOverrides(
  * is a symlink, not a regular file, not owned by the process uid,
  * group/other-writable, identity-swapped, inside any `hosts.*.worktreeRoot`,
  * or inside a git checkout or worktree is refused with
- * `owner-key-installation-untrusted` and the remedy. Before any
- * byte is read — with or without an `owner` section — a handle that is not a
- * regular file (a FIFO, a device) or a read past `MAX_INSTALLATION_FILE_BYTES`
- * is refused the same way. A file without an `owner` section is otherwise
- * read exactly as before, with no checks.
+ * `owner-key-installation-untrusted` and the remedy. Before any byte is read —
+ * without parsing content — a handle that is not a regular file (a FIFO, a
+ * device), a handle without an `fstat`, or a read past
+ * `MAX_INSTALLATION_FILE_BYTES` is refused with main's `<path>: unreadable`
+ * label: such refusals cannot know whether an `owner` section exists, so they
+ * never carry the untrusted label. A file without an `owner` section is
+ * otherwise read exactly as before, with no checks.
  */
 export function loadInstallation(options: LoadOptions = {}): LoadResult {
   const cwd = options.cwd ?? process.cwd();
@@ -738,13 +740,12 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
   } else if (read.kind === 'unreadable') {
     return { status: 'invalid', file, errors: [`${file}: unreadable`] };
   } else if (read.kind === 'refused') {
-    return {
-      status: 'invalid',
-      file,
-      errors: [
-        `${file}: owner-key-installation-untrusted (${read.reason}); ${OWNER_TRUST_REMEDY}`,
-      ],
-    };
+    // A refusal decided before any content was parsed (non-regular file,
+    // handle without an `fstat`, size cap, read failure) cannot know whether
+    // an `owner` section exists, so it keeps main's label: the same text an
+    // unreadable file reports. `owner-key-installation-untrusted` is only
+    // for trust failures on a file whose parsed content HAS an owner section.
+    return { status: 'invalid', file, errors: [`${file}: unreadable`] };
   } else {
     let parsed: unknown;
     try {

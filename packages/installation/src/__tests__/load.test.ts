@@ -1,4 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -376,6 +377,51 @@ describe('loadInstallation', () => {
     if (result.status === 'invalid') {
       expect(result.errors).toEqual([`${directory}: unreadable`]);
     }
+  });
+
+  function mkfifoAvailable(): boolean {
+    try {
+      execFileSync('sh', ['-c', 'command -v mkfifo'], { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const HAS_MKFIFO = mkfifoAvailable();
+
+  it('reports a real directory as invalid and unreadable, promptly', () => {
+    // The promptness and the real objects make this fail when the
+    // regular-file check is skipped: a directory must be refused before any
+    // read is attempted, with main's `unreadable` label.
+    const directory = makeTempDirectory();
+    const file = join(directory, 'fleet-directory');
+    mkdirSync(file);
+    const start = Date.now();
+    const result = loadInstallation({ file, env: {} });
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') {
+      expect(result.errors).toEqual([`${file}: unreadable`]);
+    }
+    expect(Date.now() - start).toBeLessThan(5000);
+  });
+
+  it('reports a real FIFO as invalid and unreadable, promptly, without blocking', (ctx) => {
+    if (!HAS_MKFIFO) {
+      ctx.skip();
+    }
+    const directory = makeTempDirectory();
+    const file = join(directory, 'fleet-fifo');
+    execFileSync('mkfifo', [file]);
+    const start = Date.now();
+    const result = loadInstallation({ file, env: {} });
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') {
+      expect(result.errors).toEqual([`${file}: unreadable`]);
+    }
+    // A FIFO with no writer would block forever in an uncapped read: the
+    // promptness bound is what fails if the regular-file check is skipped.
+    expect(Date.now() - start).toBeLessThan(5000);
   });
 
   it('reports schema errors from the file as invalid', () => {

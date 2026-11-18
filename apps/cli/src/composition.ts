@@ -32,6 +32,7 @@ import { composeExecutionHosts } from './composition/work-execution-hosts.js';
 import { composeExecution } from './composition/work-execution.js';
 import { composeConductor } from './composition/conductor.js';
 import { composeDaemon, type ComposedDaemon } from './composition/daemon.js';
+import { newUlid } from './ulid.js';
 import { composeTelemetry, type TelemetryConfiguredState, type TelemetryPolicyView } from './composition/telemetry.js';
 
 import {
@@ -138,9 +139,9 @@ import {
   type EvaluateAttemptGatePort,
   type EnqueueMergeUseCase,
   type ListMergeQueueUseCase,
-  type ImportTrainStateUseCase,
+  ImportTrainStateUseCase,
   type LegacyTrainStateReadAdapter,
-  type MergeQueueRepositoryAdapter,
+  MergeQueueRepositoryAdapter,
   type ForgeActionDelegate,
   type GhInvocationResult,
   type SubprocessRunner,
@@ -1478,16 +1479,34 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   // durable-only use case in this composition (in-memory mode is disposable).
   const recordShadowDay =
     durableCutover && stateDir !== undefined && stateDir.trim().length > 0
-      ? new RecordShadowDayUseCase({
+      ? (() => {
+        // SH19d: one fresh read-only merge-queue reader for both the record-day
+        // queue seat and S8's dry-run import use case. Read-only so a corrupt
+        // merge-queue.json is a read error, never a quarantine.
+        const readOnlyQueue = new MergeQueueRepositoryAdapter({ stateDir, readOnly: true });
+        return new RecordShadowDayUseCase({
         // SH2's composition created no ShadowEvidenceAdapter elsewhere, so this
         // is the one writable instance over the ledger store it owns.
         evidence: new ShadowEvidenceAdapter({ stateDir }),
         // The same read-only shell-train reader the shadow report composes:
         // reuse the instance rather than point a second one at the same files.
+        // LegacyTrainStateReadAdapter is genuinely read-only — it opens with
+        // O_RDONLY | O_NOFOLLOW | O_NONBLOCK and uses lstat/readdir — so it
+        // never writes or quarantines anything.
         legacy: execution.legacyTrainState,
-        queue: execution.mergeQueueRepository,
-        // S8's dry-run seat: the existing import use case, apply never set.
-        importDryRun: execution.importTrainState,
+        // SH19d: a fresh read-only queue reader (never the shared
+        // execution.mergeQueueRepository), so a corrupt merge-queue.json
+        // throws StateFileUnreadableReadOnlyError rather than quarantining.
+        queue: readOnlyQueue,
+        // S8's dry-run seat: a fresh import use case over the same read-only
+        // queue, apply never set — listMergeEntries runs before the apply
+        // check, so the read-only wiring covers the dry run too.
+        importDryRun: new ImportTrainStateUseCase({
+          legacyState: execution.legacyTrainState,
+          queue: readOnlyQueue,
+          mintUlid: () => newUlid(),
+          nowIso: daemon.now,
+        }),
         sleep:
           options?.daemonSleep ??
           ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
@@ -1566,7 +1585,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         // OD-1: the owner-accepted default is false, fail-closed; this use case
         // only receives it.
         settings: { excludeBatchMerges: false },
-      })
+        });
+      })()
     : undefined;
   return {
     installation: options?.installation,

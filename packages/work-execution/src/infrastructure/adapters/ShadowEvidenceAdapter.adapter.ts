@@ -52,6 +52,8 @@ const OTHER_STORE_FILE_NAMES = [
   'cutover-journal.json',
   'merge-queue.json',
   'merge-records.json',
+  // SH19c: the shadow attestation ledger is another store's file, never this one's.
+  'cutover-shadow-attestations.json',
 ];
 
 const STORE_CONFIG: SingleRecordCasStoreConfig<ShadowLedger> = {

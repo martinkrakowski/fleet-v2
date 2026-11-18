@@ -590,3 +590,90 @@ describe('ChainRepositoryAdapter (file store)', () => {
     await expect(fs.stat(path.join(stateDir, 'chains'))).rejects.toThrow();
   });
 });
+
+// SH19c: the read-only no-create list path the record-day composition uses —
+// the constructor never creates the state directory, `listChains` never takes
+// the exclusive lock (no `chains` mkdir, no `.store.lock`, no temp cleanup),
+// and a missing store lists as empty rather than creating anything.
+describe('ChainRepositoryAdapter read-only list path', () => {
+  let stateDir: string;
+
+  beforeEach(async () => {
+    stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-chains-readonly-'));
+  });
+  afterEach(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('creates nothing in the constructor when readOnly is true', async () => {
+    const missing = path.join(stateDir, 'absent-state');
+    new ChainRepositoryAdapter({ stateDir: missing, readOnly: true });
+    expect(await fs.access(missing).then(() => true, () => false)).toBe(false);
+  });
+
+  it('lists a missing state directory as empty without creating it', async () => {
+    const missing = path.join(stateDir, 'absent-state');
+    const readOnly = new ChainRepositoryAdapter({ stateDir: missing, readOnly: true });
+    expect(await readOnly.listChains({ repository: REPO, deadlineIso: deadline() })).toEqual({ status: 'ok', records: [] });
+    expect(await fs.access(missing).then(() => true, () => false)).toBe(false);
+  });
+
+  it('lists a missing chains directory as empty with no mkdir, no lock file, and no temp cleanup', async () => {
+    const readOnly = new ChainRepositoryAdapter({ stateDir, readOnly: true });
+    expect(await readOnly.listChains({ repository: REPO, deadlineIso: deadline() })).toEqual({ status: 'ok', records: [] });
+    expect(await fs.readdir(stateDir)).toEqual([]);
+  });
+
+  it('lists existing chains read-only and leaves the directory byte-identical', async () => {
+    const writable = new ChainRepositoryAdapter({ stateDir });
+    const record = recordOf();
+    expect(await writable.recordChainIntent({ record, deadlineIso: deadline() })).toEqual({ outcome: 'recorded' });
+    const chainsDir = path.join(stateDir, 'chains');
+    const before = await fs.readdir(chainsDir);
+    const readOnly = new ChainRepositoryAdapter({ stateDir, readOnly: true });
+    const listed = await readOnly.listChains({ repository: REPO, deadlineIso: deadline() });
+    expect(listed.status).toBe('ok');
+    expect(listed.status === 'ok' && listed.records).toHaveLength(1);
+    expect(await fs.readdir(chainsDir)).toEqual(before);
+  });
+
+  // Luna's pre-merge fix: a planted store lock and an orphan temp from a
+  // crashed writer must survive a read-only list byte-identical — the path
+  // through `exclusive` would unlink the lock (or wait on it) and sweep the
+  // orphan temp, so both surviving proves `listChains` never reaches it.
+  it('leaves a planted store lock and an orphan temp byte-identical after a read-only list', async () => {
+    const writable = new ChainRepositoryAdapter({ stateDir });
+    const record = recordOf();
+    expect(await writable.recordChainIntent({ record, deadlineIso: deadline() })).toEqual({ outcome: 'recorded' });
+    const chainsDir = path.join(stateDir, 'chains');
+    const lock = path.join(chainsDir, '.store.lock');
+    await fs.writeFile(lock, 'planted-holder');
+    const recordFile = (await fs.readdir(chainsDir)).find((entry) => entry.endsWith('.json')) ?? '';
+    const orphan = path.join(chainsDir, `${recordFile.replace(/\.json$/, '')}.99999-deadbeef0123.tmp`);
+    const orphanBytes = '{"half":';
+    await fs.writeFile(orphan, orphanBytes);
+    const readOnly = new ChainRepositoryAdapter({ stateDir, readOnly: true });
+    expect(await readOnly.listChains({ repository: REPO, deadlineIso: deadline() })).toEqual({
+      status: 'ok',
+      records: [record],
+    });
+    expect(await fs.readFile(lock, 'utf8')).toBe('planted-holder');
+    expect(await fs.readFile(orphan, 'utf8')).toBe(orphanBytes);
+  });
+
+  // Luna's pre-merge fix: a state dir that is a regular file resolves `root`
+  // to null at construction (not a directory), and the read-only list answers
+  // `ok []` through the no-create path instead of throwing. This documents
+  // that `record-day`'s own ledger write fails in that state anyway (the CAS
+  // store refuses to create beside a regular file); the chains reader stays a
+  // typed empty answer either way.
+  it('lists ok [] through the read-only path when the state dir is a regular file, so root resolves null', async () => {
+    const blocker = path.join(stateDir, 'a-regular-file');
+    await fs.writeFile(blocker, 'x');
+    const readOnly = new ChainRepositoryAdapter({ stateDir: blocker, readOnly: true });
+    expect(await readOnly.listChains({ repository: REPO, deadlineIso: deadline() })).toEqual({
+      status: 'ok',
+      records: [],
+    });
+  });
+});

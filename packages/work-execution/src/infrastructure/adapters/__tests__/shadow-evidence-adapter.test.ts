@@ -249,7 +249,7 @@ describe('ShadowEvidenceAdapter', () => {
   });
 
   it('refuses a file name that is unsafe or collides with another store', () => {
-    for (const fileName of ['cutover.json', 'cutover-journal.json', 'killall-train-pause.json', '../x.json', 'a/b.json', '']) {
+    for (const fileName of ['cutover.json', 'cutover-journal.json', 'killall-train-pause.json', '../x.json', 'a/b.json', '', 'cutover-shadow-attestations.json']) {
       expect(() => new ShadowEvidenceAdapter({ stateDir: tempDir, fileName })).toThrow();
     }
     expect(() => new ShadowEvidenceAdapter({ stateDir: tempDir, fileName: 'cutover-shadow-alt.json' })).not.toThrow();

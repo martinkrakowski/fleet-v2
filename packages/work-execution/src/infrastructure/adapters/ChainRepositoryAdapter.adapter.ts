@@ -372,6 +372,21 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
       if (deadline !== 'ok') return { status: 'unreadable', reason: deadline };
       const repository = parseChainRepository(own(command, 'repository'));
       if (repository === undefined) return { status: 'unreadable', reason: 'invalid-request' };
+      if (this.readOnly) {
+        // The read-only no-create list path: never `exclusive`, so no
+        // `mkdir` of `chains`, no `.store.lock` create/unlink, and no
+        // `removeOrphanTemps`. A missing `chains` directory — or a missing
+        // state directory, which leaves `root` null — lists as empty rather
+        // than creating anything.
+        if (this.root === null) return { status: 'ok', records: [] };
+        try {
+          const listed = await this.withChainsDir(false, (dir) => this.fileSection(dir).list(repository));
+          if (listed === 'absent') return { status: 'ok', records: [] };
+          return listed.ok ? { status: 'ok', records: listed.records } : { status: 'unreadable', reason: listed.reason };
+        } catch {
+          return { status: 'unreadable', reason: 'store-unavailable' };
+        }
+      }
       const listed = await this.exclusive(own(command, 'deadlineIso') as string, (section) => section.list(repository));
       return listed.ok ? { status: 'ok', records: listed.records } : { status: 'unreadable', reason: listed.reason };
     } catch {

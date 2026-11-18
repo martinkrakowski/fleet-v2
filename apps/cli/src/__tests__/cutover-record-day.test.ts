@@ -11,6 +11,16 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { createFleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
+import type { FleetInstallation } from '@fleet/installation';
+import {
+  AttemptRepositoryAdapter,
+  ChainRepositoryAdapter,
+  ForgeReadAdapter,
+  LaneRunJournalAdapter,
+  LaneRunRepositoryAdapter,
+  ShadowAttestationAdapter,
+  type RecordShadowDayDependencies,
+} from '@fleet/work-execution';
 
 const tempDirs: string[] = [];
 
@@ -157,5 +167,483 @@ describe('cutover shadow record-day (SH8a)', () => {
     expect(JSON.parse(result.out)).toEqual({ outcome: 'refused', reason: 'too-early' });
     // Nothing is ever written on a refusal.
     await expect(fs.access(path.join(stateDir, 'cutover-shadow.json'))).rejects.toThrow();
+  });
+});
+
+// SH19c: the composition wiring — the conducted-facts, chains, premerge-carry
+// and one-time readers are wired into `record-day`, every one of them
+// read-only, and every failure path is a typed unevaluated reason, never a
+// throw and never a quarantined file.
+describe('cutover shadow record-day wiring (SH19c)', () => {
+  /** A minimal valid v2 installation: github forge, a daemon section, no env. */
+  function installationFor(forge: FleetInstallation['forge']): FleetInstallation {
+    return {
+      schemaVersion: 2,
+      hosts: {
+        'lane-host': {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: {
+            kind: 'opencode',
+            port: 46000,
+            capabilities: {
+              networkEgressRestricted: true,
+              cpuAndMemoryLimited: true,
+              processTreeTermination: true,
+              filesystemScope: 'scoped-worktree',
+            },
+            maxLanes: 2,
+          },
+        },
+      },
+      tools: ['opencode'],
+      seats: [
+        {
+          id: 'implementer',
+          tool: 'opencode',
+          model: 'example-provider/example-model',
+          roles: ['implementer'],
+          costClass: 'plan-quota',
+        },
+      ],
+      chains: { implementer: [{ seatId: 'implementer' }] },
+      policy: { forbiddenRoutes: [{ tool: 'example-tool', modelPattern: 'example-*' }] },
+      shelf: { provider: 'local' },
+      verification: { procedures: { gate: { command: 'true', args: [] } } },
+      waves: { baseUrl: 'https://waves.example', tokenFile: '/home/operator/.config/fleet/waves-token' },
+      decisions: { provider: 'none' },
+      daemon: {
+        nodePath: '/usr/bin/node',
+        cliPath: '/srv/fleet/current/apps/cli/dist/bin.js',
+        stateDir: '/srv/fleet/state',
+        unitDir: '/srv/fleet/units',
+        installationFile: '/srv/fleet/fleet.json',
+      },
+      ...(forge !== undefined ? { forge } : {}),
+    } as FleetInstallation;
+  }
+
+  function wiredRuntime(
+    stateDir: string,
+    forge: FleetInstallation['forge'] = { mode: 'github', owner: 'fleet', repo: 'v2' },
+  ): ReturnType<typeof createFleetCliRuntime> {
+    return createFleetCliRuntime({
+      stateDir,
+      daemonSleep: async () => {},
+      installation: installationFor(forge),
+      // A forge read must never run for an empty day; the stub refuses loudly.
+      forgeGhRunner: async () => {
+        throw new Error('forge read must not run for an empty day');
+      },
+      env: {},
+    });
+  }
+
+  /** A clean shell fixture: the queue, parked, inprogress and events files all exist and hold nothing. */
+  async function shellFixture(fixtureDir: string): Promise<void> {
+    await fs.writeFile(path.join(fixtureDir, 'queue'), '');
+    await fs.writeFile(path.join(fixtureDir, 'parked'), '');
+    await fs.writeFile(path.join(fixtureDir, 'inprogress'), '');
+    await fs.writeFile(path.join(fixtureDir, 'events.jsonl'), '');
+  }
+
+  function reasonsOf(result: { readonly unevaluated: ReadonlyArray<{ criterion: string; reason: string }> }): Record<string, string> {
+    return Object.fromEntries(result.unevaluated.map((entry) => [entry.criterion, entry.reason]));
+  }
+
+  /** Every regular file under a directory, recursively, mapped to its bytes as text. */
+  async function listFileBytes(root: string): Promise<Map<string, string>> {
+    const files = new Map<string, string>();
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(full);
+        } else if (entry.isFile()) {
+          files.set(full, await fs.readFile(full, 'utf8'));
+        }
+      }
+    };
+    await walk(root);
+    return files;
+  }
+
+  it('wires every reader and records the day: every wired criterion moves off not-wired, S13 stays not-implemented, S3 not-yet-observed and S2/S10/S11 release-unpinned while cutover-shadow-attestations.json is missing', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const runtime = wiredRuntime(stateDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      if (result.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      }
+      const reasons = reasonsOf(result);
+      // Luna's pre-merge fix: the e2e loop must accept only the exact expected
+      // status/reason per criterion for this seeded state — never "anything
+      // other than not-wired", which would also accept `not-implemented` or
+      // an undefined reason. Pinned exactly:
+      // - recorded S1/S4/S5/S6/S7/S9/S12 at their seeded-state verdicts;
+      // - unevaluated S2/S10/S11 `release-unpinned` (releaseSha null, SH20 not
+      //   landed: UNPINNED_RANK 2 beats NOT_YET_RANK 6), S3 `not-yet-observed`
+      //   (the attestations ledger is missing), S8 `samples-invalid` (no
+      //   daemon events to sample), S13 `not-implemented`.
+      expect(result.recorded).toEqual({
+        S1: 'pass',
+        S4: 'fail',
+        S5: 'pass',
+        S6: 'fail',
+        S7: 'pass',
+        S9: 'pass',
+        S12: 'fail',
+      });
+      expect(reasons).toEqual({
+        S2: 'release-unpinned',
+        S3: 'not-yet-observed',
+        S8: 'samples-invalid',
+        S10: 'release-unpinned',
+        S11: 'release-unpinned',
+        S13: 'not-implemented',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves the state directory with no entries beyond the ledger it owns after record-day over an empty state dir', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const runtime = wiredRuntime(stateDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      expect(result.outcome).toBe('recorded');
+      // The read-only readers (chains, lane runs, journal, attempts,
+      // attestations) must have created no directory, no lock file and no
+      // store: the only new entry is the shadow ledger the use case itself
+      // compares-and-sets.
+      expect(readdirSync(stateDir).sort()).toEqual(['cutover-shadow.json']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports attestations-unreadable for S2, S3, S10 and S11 when cutover-shadow-attestations.json is corrupt or null, without throwing or quarantining', async () => {
+    for (const bytes of ['{ not json', 'null', '{"attestations":{}}']) {
+      const { stateDir, fixtureDir } = newDirs();
+      await shellFixture(fixtureDir);
+      await fs.writeFile(path.join(stateDir, 'cutover-shadow-attestations.json'), bytes);
+      const runtime = wiredRuntime(stateDir);
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+      try {
+        const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const result = await runtime.execution.recordShadowDay!.execute({
+          repository: { owner: 'fleet', repo: 'v2' },
+          legacyStateDir: fixtureDir,
+          day,
+        });
+        if (result.outcome !== 'recorded') {
+          throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+        }
+        const reasons = reasonsOf(result);
+        expect(reasons.S2).toBe('attestations-unreadable');
+        expect(reasons.S3).toBe('attestations-unreadable');
+        expect(reasons.S10).toBe('attestations-unreadable');
+        expect(reasons.S11).toBe('attestations-unreadable');
+        // Never quarantined: the corrupt bytes are exactly as they were.
+        await expect(fs.readFile(path.join(stateDir, 'cutover-shadow-attestations.json'), 'utf8')).resolves.toBe(bytes);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  });
+
+  it('omits conducted and leaves S4 and S6 not-wired when forge mode is not github', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    const runtime = wiredRuntime(stateDir, { mode: 'none' });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      if (result.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      }
+      const reasons = reasonsOf(result);
+      expect(reasons.S4).toBe('not-wired');
+      expect(reasons.S6).toBe('not-wired');
+      // The one-time and chains readers are still wired.
+      expect(reasons.S3).toBe('not-yet-observed');
+      expect(reasons.S7).not.toBe('not-wired');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** The composition's private dependency bag, read back out of the use case. */
+  function recordDayDeps(runtime: ReturnType<typeof createFleetCliRuntime>): RecordShadowDayDependencies {
+    const useCase = runtime.execution.recordShadowDay;
+    if (useCase === undefined) throw new Error('record-day is not wired');
+    return (useCase as unknown as { deps: RecordShadowDayDependencies }).deps;
+  }
+
+  // Luna's fix round 2: the adapters hold their read-only mode in a private
+  // field or constructor-options bag and expose no public getter, so the flag
+  // is read safely through a structural cast — never by mutating or writing
+  // anything. A reader with no flag anywhere fails the assertion loudly.
+  function readOnlyOf(adapter: unknown): boolean {
+    const candidate = adapter as {
+      readonly options?: { readonly readOnly?: unknown };
+      readonly readOnly?: unknown;
+      readonly store?: { readonly options?: { readonly readOnly?: unknown } };
+    };
+    if (candidate.options?.readOnly !== undefined) return candidate.options.readOnly === true;
+    if (candidate.store?.options?.readOnly !== undefined) return candidate.store.options.readOnly === true;
+    if (candidate.readOnly !== undefined) return candidate.readOnly === true;
+    throw new Error('adapter exposes no readable read-only flag');
+  }
+
+  // Luna's fix round 2: every reader the record-day composition builds is
+  // asserted read-only AND a fresh instance, not the daemon/conductor's
+  // writable one. Readers the composition reuses rather than builds (receipts,
+  // forge, the shell-train reader) have no read-only mode at all — each says
+  // so in a comment and relies on the corrupt-file backstop below.
+  it('wires conducted.facts.runs as a fresh read-only LaneRunRepositoryAdapter, not the conductor\'s writable instance', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const facts = recordDayDeps(runtime).conducted?.facts;
+    expect(facts?.runs).toBeInstanceOf(LaneRunRepositoryAdapter);
+    expect(readOnlyOf(facts?.runs)).toBe(true);
+    expect(facts?.runs).not.toBe(runtime.conductor.laneRunRepository);
+  });
+
+  it('wires conducted.facts.journal as a fresh read-only LaneRunJournalAdapter, not the conductor\'s writable instance', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    const facts = deps.conducted?.facts;
+    expect(facts?.journal).toBeInstanceOf(LaneRunJournalAdapter);
+    expect(readOnlyOf(facts?.journal)).toBe(true);
+    expect(facts?.journal).not.toBe(runtime.conductor.laneRunJournal);
+  });
+
+  it('wires the top-level journal reader as a fresh read-only LaneRunJournalAdapter, not the conductor\'s writable instance', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    expect(deps.journal).toBeInstanceOf(LaneRunJournalAdapter);
+    expect(readOnlyOf(deps.journal)).toBe(true);
+    expect(deps.journal).not.toBe(runtime.conductor.laneRunJournal);
+  });
+
+  it('wires conducted.facts.attempts as a fresh read-only AttemptRepositoryAdapter, not the conductor\'s writable instance', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const facts = recordDayDeps(runtime).conducted?.facts;
+    expect(facts?.attempts).toBeInstanceOf(AttemptRepositoryAdapter);
+    expect(readOnlyOf(facts?.attempts)).toBe(true);
+    expect(facts?.attempts).not.toBe(runtime.execution.attemptRepository);
+  });
+
+  it('wires conducted.facts.chains as a fresh read-only ChainRepositoryAdapter', () => {
+    const deps = recordDayDeps(wiredRuntime(newDirs().stateDir));
+    expect(deps.chains).toBeInstanceOf(ChainRepositoryAdapter);
+    expect(readOnlyOf(deps.chains)).toBe(true);
+    // The daemon's own chain store is not exposed on the runtime, so no
+    // identity comparison is possible; the read-only flag is the guarantee.
+  });
+
+  it('wires conducted.facts.receipts to the same acceptance-receipt reader the telemetry seat exposes', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const facts = recordDayDeps(runtime).conducted?.facts;
+    expect(facts?.receipts).toBe(runtime.telemetry.acceptanceReceiptRead);
+    // AcceptanceReceiptReadAdapter has no read-only mode at all: it is a pure
+    // projection over the evidence context's own inspection seat and holds no
+    // flag. The corrupt-file backstop below covers it.
+  });
+
+  it('wires conducted.facts.forge as the ForgeReadAdapter', () => {
+    const facts = recordDayDeps(wiredRuntime(newDirs().stateDir)).conducted?.facts;
+    expect(facts?.forge).toBeInstanceOf(ForgeReadAdapter);
+    // ForgeReadAdapter has no read-only mode at all: it is a `gh` read
+    // projection with no write path and holds no flag. The corrupt-file
+    // backstop below covers it.
+  });
+
+  it('wires the legacy shell-train reader the composition reuses, which is read-only by construction', () => {
+    const runtime = wiredRuntime(newDirs().stateDir);
+    const deps = recordDayDeps(runtime);
+    // LegacyTrainStateReadAdapter has no read-only mode at all: it only ever
+    // reads the shell fixture files and never writes or quarantines, so it
+    // holds no flag. The corrupt-file backstop below covers it.
+    expect(deps.legacy).toBe(runtime.execution.legacyTrainState);
+  });
+
+  // Luna's pre-merge fix 1: the composition's `premergeCarry` must give the
+  // resolver `unknown` (owner decision), so S5' records `unknown` and never
+  // `pass` when there are carry decisions. If the composition were mutated to
+  // answer `agree` (mirroring the shell's answer), S5' would record `pass`
+  // (`carry-decisions-equal`) and this test would fail on the pinned reason.
+  it("records S5 as fleet-carry-unknown, never pass, for one shell carry decision: the composition's premergeCarry answers unknown", async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    // One paired shell carry decision inside the recorded day: an update
+    // intent, then the result/updated event carrying detail 'premerge carried
+    // (success)' — the pairing S5' replays through the fleet's answer.
+    const oldHead = 'a'.repeat(40);
+    const newHead = 'b'.repeat(40);
+    await fs.writeFile(
+      path.join(fixtureDir, 'events.jsonl'),
+      `${JSON.stringify({ at: '2026-06-14T09:00:00Z', kind: 'intent', outcome: 'update-branch', pr: 12, headOid: oldHead })}\n` +
+        `${JSON.stringify({ at: '2026-06-14T09:05:00Z', kind: 'result', outcome: 'updated', pr: 12, headOid: newHead, detail: 'premerge carried (success)' })}\n`,
+    );
+    const runtime = wiredRuntime(stateDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      if (result.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      }
+      // The day is recorded, but S5' is unevaluated with the unknown-fleet
+      // reason: `unknown` is never resolved into a pass or a fail.
+      expect(result.recorded.S5).toBeUndefined();
+      expect(reasonsOf(result).S5).toBe('fleet-carry-unknown');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Fix round 3: the composed `premergeCarry` resolver must answer exactly
+  // `unknown` — the owner decision is that it stays `unknown` until a real
+  // resolver exists. The exact `unknown` shape on main is the bare string
+  // `'unknown'`: the resolver contract is
+  // `Promise<'carry' | 'no-carry' | 'unknown'>`
+  // (`packages/work-execution/src/application/use-cases/RecordShadowDayUseCase.use-case.ts`
+  // lines 147–151, `RecordShadowDayDependencies.premergeCarry`), so there is no
+  // `{ status: 'unknown' }` wrapper. This test reaches the composed resolver
+  // directly the same way the wiring tests above inspect the composed
+  // dependencies, and fails if the composition is mutated to answer `'agree'`
+  // (mirroring the shell's answer) — `'agree'` is not even a contract member,
+  // and any non-`unknown` answer fails the strict equality below.
+  it("the composed premergeCarry resolver answers exactly 'unknown' for a representative carry decision", async () => {
+    const deps = recordDayDeps(wiredRuntime(newDirs().stateDir));
+    const resolver = deps.premergeCarry;
+    if (resolver === undefined) throw new Error('premergeCarry is not wired');
+    // A representative paired shell carry decision (S5' input shape), and the
+    // deadline the use case passes from its query window.
+    const result = await resolver({
+      repository: { owner: 'fleet', repo: 'v2' },
+      decision: {
+        pullRequest: 12,
+        oldHeadOid: 'a'.repeat(40),
+        newHeadOid: 'b'.repeat(40),
+        atIso: '2026-06-14T09:05:00Z',
+        shellCarry: 'carried',
+      },
+      deadlineIso: '2026-06-15T12:00:00.000Z',
+    });
+    expect(result).toBe('unknown');
+  });
+
+  // Luna's pre-merge fix 4: the composed attestation reader must be
+  // read-only. A writable `ShadowAttestationAdapter` in the composition would
+  // answer a write request with anything but the `read-only` refusal (an
+  // invalid request there is refused `invalid-request` only after the
+  // writability check), so this test fails if the composition swaps in the
+  // writable adapter it also uses for the ledger itself.
+  it('wires the one-time attestation reader read-only: the composed ShadowAttestationAdapter refuses a write with read-only', async () => {
+    const deps = recordDayDeps(wiredRuntime(newDirs().stateDir));
+    expect(deps.oneTime?.attestations).toBeInstanceOf(ShadowAttestationAdapter);
+    // Fix round 2: the flag itself is read-only, and the composed reader is a
+    // fresh instance (the composition builds exactly one adapter here, so the
+    // flag plus the behavioural refusal below is the guarantee).
+    expect(readOnlyOf(deps.oneTime?.attestations)).toBe(true);
+    const attestations = deps.oneTime!.attestations as unknown as {
+      compareAndSet(request: unknown): Promise<{ outcome: string; reason: string }>;
+    };
+    expect(await attestations.compareAndSet({})).toEqual({ outcome: 'refused', reason: 'read-only' });
+  });
+
+  // Luna's fix round 2, behaviour backstop: one corrupt state file per
+  // readable store the record-day readers touch. After `record-day` every
+  // seeded file must be byte-identical and no quarantine sibling may exist —
+  // the composition's read-only wiring is what makes this hold, so reverting
+  // any reader to a writable instance that quarantines fails here.
+  it('never quarantines: every corrupt readable store is byte-identical after record-day, with no quarantine sibling', async () => {
+    const { stateDir, fixtureDir } = newDirs();
+    await shellFixture(fixtureDir);
+    // One corrupt file per reader store the record-day readers read:
+    // runs -> lane-runs.json, journal -> run-journal.json, attempts ->
+    // attempts.json, receipts -> evidence-assessments.json, chains ->
+    // chains/<sha>.json, attestations -> cutover-shadow-attestations.json;
+    // shell events -> the fixture's events.jsonl. The forge reader has no
+    // state file. cutover-shadow.json is deliberately NOT seeded: the ledger
+    // is the one store the use case owns and writes, not a reader.
+    const corruptFiles: ReadonlyArray<readonly [string, string]> = [
+      ['lane-runs.json', '{ not json'],
+      ['run-journal.json', '{ not json'],
+      ['attempts.json', '{ not json'],
+      ['evidence-assessments.json', '{ not json'],
+      ['cutover-shadow-attestations.json', '{ not json'],
+      [path.join('chains', 'c'.repeat(64) + '.json'), '{ not json'],
+    ];
+    for (const [name, bytes] of corruptFiles) {
+      await fs.mkdir(path.join(stateDir, path.dirname(name)), { recursive: true });
+      await fs.writeFile(path.join(stateDir, name), bytes);
+    }
+    // One corrupt shell-events line in the legacy fixture.
+    await fs.writeFile(path.join(fixtureDir, 'events.jsonl'), '{ not json\n');
+    const seededStateFiles = await listFileBytes(stateDir);
+    const seededFixtureBytes = await fs.readFile(path.join(fixtureDir, 'events.jsonl'), 'utf8');
+    const runtime = wiredRuntime(stateDir);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00.000Z'));
+    try {
+      const day = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const result = await runtime.execution.recordShadowDay!.execute({
+        repository: { owner: 'fleet', repo: 'v2' },
+        legacyStateDir: fixtureDir,
+        day,
+      });
+      if (result.outcome !== 'recorded') {
+        throw new Error(`expected recorded, got ${result.outcome} ${JSON.stringify(result)}`);
+      }
+      // Every seeded file is byte-identical; the only new entry in the state
+      // dir is the shadow ledger the use case itself compares-and-sets.
+      const afterStateFiles = await listFileBytes(stateDir);
+      for (const [name, bytes] of corruptFiles) {
+        expect(afterStateFiles.get(path.join(stateDir, name))).toBe(bytes);
+      }
+      await expect(fs.readFile(path.join(fixtureDir, 'events.jsonl'), 'utf8')).resolves.toBe(seededFixtureBytes);
+      for (const [name] of corruptFiles) {
+        expect(seededStateFiles.has(path.join(stateDir, `${name}.quarantined`))).toBe(false);
+        expect(afterStateFiles.has(path.join(stateDir, `${name}.quarantined`))).toBe(false);
+      }
+      // And no quarantine-shaped sibling anywhere under either directory.
+      expect([...afterStateFiles.keys()].filter((file) => file.includes('quarantine'))).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

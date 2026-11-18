@@ -22,6 +22,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { SSH_BINARY_CANDIDATES, resolveSshBinary } from './ssh-binary.js';
+import { parseConfiguredCliPath } from './release.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
 import { composeReadOnlyRelaunch } from './composition/relaunch.js';
@@ -46,6 +47,7 @@ import {
   BuildFactPackUseCase,
   CiStateAdapter,
   CloseWorkOrderUseCase,
+  ChainRepositoryAdapter,
   CutoverJournalAdapter,
   CutoverRecordRepositoryAdapter,
   DaemonPauseAdapter,
@@ -77,6 +79,7 @@ import {
   InventoryRelaunchUseCase,
   PlanRelaunchUseCase,
   RelaunchPlanRepositoryAdapter,
+  ReleaseStoreAdapter,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
   OpencodeApiUsageAdapter,
@@ -117,6 +120,7 @@ import {
   ListConductorPassesUseCase,
   ListLaneRunsUseCase,
   RecordShadowDayUseCase,
+  ShadowAttestationAdapter,
   ShadowEvidenceAdapter,
   WORK_EXECUTION_STATE_FILES,
   ReapLaneWorktreesUseCase,
@@ -1460,6 +1464,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     throw new Error('The work context is not wired for review location');
   }
 
+  // SH19c: the one release root the one-time criteria (S2, S3, S10, S11)
+  // inspect verified build files under — parsed lexically from the configured
+  // `daemon.cliPath` (CO14c-1); empty when unconfigured or not a served
+  // release path. `requireValidInstallationModel` above already validated the
+  // installation this parse reads.
+  const parsedCliPath = parseConfiguredCliPath(installationModel?.daemon?.cliPath);
+  const releaseRoot = parsedCliPath.outcome === 'ok' ? parsedCliPath.root : '';
+
   // SH8a: `cutover shadow record-day` — the shadow day-writer. Durable-state
   // only: without a state directory there is no ledger to write and no fleet
   // stores to check, so the use case stays undefined exactly like every other
@@ -1479,7 +1491,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         sleep:
           options?.daemonSleep ??
           ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
-        journal: conductor.laneRunJournal,
+        // SH19c fix round: a fresh read-only journal reader, never the
+        // conductor's writable instance — a corrupt run-journal.json is a
+        // read error here, never a quarantine.
+        journal: new LaneRunJournalAdapter({ stateDir, readOnly: true }),
         daemonEvents: daemon.events,
         // S9's state integrity sample: the same four-context check the
         // `state check` logic in state.ts runs, over each package's own
@@ -1507,8 +1522,45 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         // The same repository derivation MergeQueueRepositoryAdapter and the
         // daemon's mergePolicySource use — never a second formula.
         repoDigestOf: mergeQueueRepositoryDigest,
-        // OD-4: release binding is not yet built; SH8b and a later unit revisit
-        // this constant once a release sha source exists.
+        // SH19c: the conducted-facts readers, wired only when a GitHub
+        // repository is configured as conducted; every reader is read-only so
+        // a corrupt state file is never quarantined and no directory or lock
+        // is created. Without the forge section there is no conducted
+        // repository and S4/S6 stay `not-wired`.
+        ...(forgeGithubSection === undefined
+          ? {}
+          : {
+            conducted: {
+              repository: { owner: forgeGithubSection.owner, repo: forgeGithubSection.repo },
+              facts: {
+                runs: new LaneRunRepositoryAdapter({ stateDir, readOnly: true }),
+                journal: new LaneRunJournalAdapter({ stateDir, readOnly: true }),
+                attempts: new AttemptRepositoryAdapter({ stateDir, readOnly: true }),
+                receipts: telemetry.acceptanceReceiptRead,
+                forge: forgeRead,
+                nowIso: daemon.now,
+              },
+            },
+          }),
+        // S7's chain-record store: read-only, so a missing `chains` directory
+        // lists as empty and nothing is ever created or locked.
+        chains: new ChainRepositoryAdapter({ stateDir, readOnly: true }),
+        // S5's fleet answer to one shell premerge-carry decision: owner
+        // decision, hardcoded `unknown` for now.
+        premergeCarry: async () => 'unknown',
+        // S2, S3, S10 and S11: the sticky attestation ledger (read-only, so a
+        // corrupt or missing file is reported, never quarantined) and the
+        // verified-build file inspector over the one release root parsed from
+        // the configured `daemon.cliPath` (empty when unconfigured or not a
+        // served release path).
+        oneTime: {
+          attestations: new ShadowAttestationAdapter({ stateDir, readOnly: true }),
+          releaseStore: new ReleaseStoreAdapter(),
+          releaseRoot,
+        },
+        // OD-4: release binding is not yet built; SH20 (the pinned release sha
+        // source) is not landed on origin/main, so the sha stays null and the
+        // one-time criteria report `release-unpinned` until it lands.
         releaseSha: async () => null,
         nowIso: daemon.now,
         // OD-1: the owner-accepted default is false, fail-closed; this use case

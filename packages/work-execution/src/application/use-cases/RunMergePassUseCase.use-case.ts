@@ -866,6 +866,45 @@ export class RunMergePassUseCase implements RunMergePassPort {
     decision: Extract<MergeStepDecision, { kind: 'act' }>,
   ): Promise<MergePassEntryReport> {
     const action: MergeKeyAction = decision.action === 'premerge-carry' ? 'post-status' : decision.action;
+    // SH24a (S1): a `would-merge` result names the head it would merge, so
+    // the head12 of an unpersisted in-memory successor stays resolvable.
+    return this.journalWould(request, entry, action, decision.shadowReason, null,
+      decision.action === 'merge-pr' ? entry.headOid : undefined);
+  }
+
+  /**
+   * SH24a: the keyed dry-run journal for a shadow *mutation* outcome (drop,
+   * park, supersede, ready, already-merged) and for the silent shadow
+   * notification (`would-notify`). One `would-*` intent and one
+   * `dry-run` result per `(pr, head12, action)` key, exactly like
+   * `journalShadowAct`; nothing is written to the queue and nothing notifies.
+   */
+  private async journalShadowOutcome(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    action: MergeKeyAction,
+    detail: string | null,
+  ): Promise<MergePassEntryReport> {
+    return this.journalWould(request, entry, action, action, detail);
+  }
+
+  /**
+   * The one `would-*` journal helper every shadow path shares (SH24a fix
+   * round): build the 5-segment key, honour the keyed idempotence (a result
+   * present reports `already-journalled`; an open intent from a pass whose
+   * budget ran out between the appends is completed, never re-intented), then
+   * append the `dry-run` result. Nothing is written to the queue and nothing
+   * notifies. `reasonCode` is both the result's reason and the report's; the
+   * optional `linkedId` names the head a `would-merge` would merge.
+   */
+  private async journalWould(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    action: MergeKeyAction,
+    reasonCode: string | null,
+    detail: string | null,
+    linkedId?: string | null,
+  ): Promise<MergePassEntryReport> {
     const head12 = head12Of(entry.headOid);
     const built = buildMergeKey({
       repoDigest: request.repoDigest,
@@ -891,7 +930,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       // the intent open: this pass completes the pair instead of reporting
       // it journalled forever. A dry-run has no external effect, so only
       // the result is written; no second intent.
-      return this.appendShadowResult(request, entry, decision, key, openIntent.runId);
+      return this.appendDryRunResult(request, entry, key, openIntent.runId, reasonCode, detail, linkedId);
     }
 
     const intent: LaneRunJournalEntryRecord = {
@@ -921,84 +960,23 @@ export class RunMergePassUseCase implements RunMergePassPort {
       );
     }
 
-    return this.appendShadowResult(request, entry, decision, key, entry.runId);
+    return this.appendDryRunResult(request, entry, key, entry.runId, reasonCode, detail, linkedId);
   }
 
   /**
-   * SH24a: the keyed dry-run journal for a shadow *mutation* outcome (drop,
-   * park, supersede, ready, already-merged) and for the silent shadow
-   * notification (`would-notify`). One `would-*` intent and one
-   * `dry-run` result per `(pr, head12, action)` key, exactly like
-   * `journalShadowAct`; nothing is written to the queue and nothing notifies.
+   * The `dry-run` result record shared by `journalWould` (mutation outcomes
+   * and shadow acts) and `closeOpenShadowIntents`: one append, guarded by
+   * D-DT9, with the refused append mapped to its typed report. If the budget
+   * is spent the intent stays open and the next pass completes it.
    */
-  private async journalShadowOutcome(
+  private async appendDryRunResult(
     request: RunMergePassRequest,
     entry: MergeQueueEntryRecord,
-    action: MergeKeyAction,
-    detail: string | null,
-  ): Promise<MergePassEntryReport> {
-    const head12 = head12Of(entry.headOid);
-    const built = buildMergeKey({
-      repoDigest: request.repoDigest,
-      pullRequest: entry.pullRequest,
-      head12: head12 ?? '',
-      action,
-      attemptOrdinal: null,
-      retry: null,
-    });
-    if (!built.ok) {
-      return this.report(entry, 'no-action', 'key-refused', null);
-    }
-    const key = built.key;
-
-    this.ensureBudget(request); // D-DT9: guard before the journal read
-    const existing = await this.deps.journal.listForKey(key);
-    if (existing.some((candidate) => candidate.kind === 'result')) {
-      return this.report(entry, 'no-action', 'already-journalled', null);
-    }
-    const openIntent = existing.find((candidate) => candidate.kind === 'intent');
-    if (openIntent !== undefined) {
-      return this.appendShadowOutcomeResult(request, entry, action, detail, key, openIntent.runId);
-    }
-
-    const intent: LaneRunJournalEntryRecord = {
-      version: LANE_RUN_JOURNAL_ENTRY_VERSION,
-      entryId: this.deps.newUlid(),
-      kind: 'intent',
-      key,
-      runId: entry.runId,
-      recordedAtIso: this.deps.nowIso(),
-      mode: null,
-      expectedRevision: null,
-      mintedId: null,
-      outcome: null,
-      reasonCode: null,
-      detail: null,
-      grantId: null,
-      state: null,
-    };
-    this.ensureBudget(request); // D-DT9: guard before the intent append
-    const appended = await this.deps.journal.append(intent);
-    if (appended.outcome === 'refused') {
-      return this.report(
-        entry,
-        'no-action',
-        appended.reason === 'duplicate-key' ? 'already-journalled' : appended.reason,
-        null,
-      );
-    }
-
-    return this.appendShadowOutcomeResult(request, entry, action, detail, key, entry.runId);
-  }
-
-  /** The `dry-run` result that completes a shadow mutation outcome's intent. */
-  private async appendShadowOutcomeResult(
-    request: RunMergePassRequest,
-    entry: MergeQueueEntryRecord,
-    action: MergeKeyAction,
-    detail: string | null,
     key: string,
     runId: string | null,
+    reasonCode: string | null,
+    detail: string | null,
+    linkedId?: string | null,
   ): Promise<MergePassEntryReport> {
     const result: LaneRunJournalEntryRecord = {
       version: LANE_RUN_JOURNAL_ENTRY_VERSION,
@@ -1011,13 +989,13 @@ export class RunMergePassUseCase implements RunMergePassPort {
       expectedRevision: null,
       mintedId: null,
       outcome: 'dry-run',
-      reasonCode: action,
+      reasonCode,
       detail,
       grantId: null,
       state: null,
+      ...(linkedId !== undefined ? { linkedId } : {}),
     };
-    // D-DT9: guard before the result append too. If the budget is spent the
-    // intent stays open and the next pass completes it (see journalShadowOutcome).
+    // D-DT9: guard before the result append too.
     this.ensureBudget(request);
     const appendedResult = await this.deps.journal.append(result);
     if (appendedResult.outcome === 'refused') {
@@ -1028,7 +1006,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
         null,
       );
     }
-    return this.report(entry, 'journalled', action, key);
+    return this.report(entry, 'journalled', reasonCode, key);
   }
 
   /**
@@ -1074,66 +1052,16 @@ export class RunMergePassUseCase implements RunMergePassPort {
         continue;
       }
       this.ensureBudget(request); // D-DT9: guard before the result append
-      await this.deps.journal.append({
-        version: LANE_RUN_JOURNAL_ENTRY_VERSION,
-        entryId: this.deps.newUlid(),
-        kind: 'result',
-        key: built.key,
-        // The key has no run in it: the result names the intent's own run.
-        runId: openIntent.runId,
-        recordedAtIso: this.deps.nowIso(),
-        mode: null,
-        expectedRevision: null,
-        mintedId: null,
-        outcome: 'dry-run',
-        reasonCode: 'shadow-intent-closed',
-        detail: null,
-        grantId: null,
-        state: null,
-      });
-    }
-  }
-
-  /** The `dry-run` result that completes a shadow act's intent. */
-  private async appendShadowResult(
-    request: RunMergePassRequest,
-    entry: MergeQueueEntryRecord,
-    decision: Extract<MergeStepDecision, { kind: 'act' }>,
-    key: string,
-    runId: string | null,
-  ): Promise<MergePassEntryReport> {
-    const result: LaneRunJournalEntryRecord = {
-      version: LANE_RUN_JOURNAL_ENTRY_VERSION,
-      entryId: this.deps.newUlid(),
-      kind: 'result',
-      key,
-      runId,
-      recordedAtIso: this.deps.nowIso(),
-      mode: null,
-      expectedRevision: null,
-      mintedId: null,
-      outcome: 'dry-run',
-      reasonCode: decision.shadowReason,
-      detail: null,
-      grantId: null,
-      state: null,
-      // SH24a (S1): a `would-merge` result names the head it would merge, so
-      // the head12 of an unpersisted in-memory successor stays resolvable.
-      ...(decision.action === 'merge-pr' ? { linkedId: entry.headOid } : {}),
-    };
-    // D-DT9: guard before the result append too. If the budget is spent the
-    // intent stays open and the next pass completes it (see journalShadowAct).
-    this.ensureBudget(request);
-    const appendedResult = await this.deps.journal.append(result);
-    if (appendedResult.outcome === 'refused') {
-      return this.report(
+      // The key has no run in it: the result names the intent's own run.
+      await this.appendDryRunResult(
+        request,
         entry,
-        'no-action',
-        appendedResult.reason === 'duplicate-key' ? 'already-journalled' : appendedResult.reason,
+        built.key,
+        openIntent.runId,
+        'shadow-intent-closed',
         null,
       );
     }
-    return this.report(entry, 'journalled', decision.shadowReason, key);
   }
 
   /** D-DT9: no outbound call may start with under 2 s left on the pass budget. */

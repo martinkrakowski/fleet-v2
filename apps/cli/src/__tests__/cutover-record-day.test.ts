@@ -534,6 +534,38 @@ describe('cutover shadow record-day wiring (SH19c)', () => {
     }
   });
 
+  // Fix round 3: the composed `premergeCarry` resolver must answer exactly
+  // `unknown` — the owner decision is that it stays `unknown` until a real
+  // resolver exists. The exact `unknown` shape on main is the bare string
+  // `'unknown'`: the resolver contract is
+  // `Promise<'carry' | 'no-carry' | 'unknown'>`
+  // (`packages/work-execution/src/application/use-cases/RecordShadowDayUseCase.use-case.ts`
+  // lines 147–151, `RecordShadowDayDependencies.premergeCarry`), so there is no
+  // `{ status: 'unknown' }` wrapper. This test reaches the composed resolver
+  // directly the same way the wiring tests above inspect the composed
+  // dependencies, and fails if the composition is mutated to answer `'agree'`
+  // (mirroring the shell's answer) — `'agree'` is not even a contract member,
+  // and any non-`unknown` answer fails the strict equality below.
+  it("the composed premergeCarry resolver answers exactly 'unknown' for a representative carry decision", async () => {
+    const deps = recordDayDeps(wiredRuntime(newDirs().stateDir));
+    const resolver = deps.premergeCarry;
+    if (resolver === undefined) throw new Error('premergeCarry is not wired');
+    // A representative paired shell carry decision (S5' input shape), and the
+    // deadline the use case passes from its query window.
+    const result = await resolver({
+      repository: { owner: 'fleet', repo: 'v2' },
+      decision: {
+        pullRequest: 12,
+        oldHeadOid: 'a'.repeat(40),
+        newHeadOid: 'b'.repeat(40),
+        atIso: '2026-06-14T09:05:00Z',
+        shellCarry: 'carried',
+      },
+      deadlineIso: '2026-06-15T12:00:00.000Z',
+    });
+    expect(result).toBe('unknown');
+  });
+
   // Luna's pre-merge fix 4: the composed attestation reader must be
   // read-only. A writable `ShadowAttestationAdapter` in the composition would
   // answer a write request with anything but the `read-only` refusal (an

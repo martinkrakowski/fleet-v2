@@ -528,6 +528,31 @@ describe('loadInstallation owner trust check', () => {
     expectUntrusted(readErrors(load(file)), 'write bit');
   });
 
+  it('refuses when the path identity no longer matches the opened handle (injectable stat seam)', () => {
+    freshDir();
+    const file = writeInstallation('fleet.json', OWNER_JSON);
+    // The real `fstat` of the opened handle reports the real dev/ino; a
+    // `stat` seam reporting a different identity stands in for a path swapped
+    // in after the O_NOFOLLOW open. It must be refused before the containment
+    // checks run.
+    const seam: InstallationFileSeam = { stat: () => ({ dev: -1, ino: -1 }) };
+    expectUntrusted(readErrors(load(file, seam)), 'identity-changed');
+  });
+
+  it('runs the trust check before the owner section is parsed for its key', () => {
+    freshDir();
+    gitCheckout(tempDir);
+    // An invalid key inside an untrusted file must be refused as untrusted,
+    // not as an owner-key parse error: the owner section is never parsed.
+    const file = writeInstallation(
+      'fleet.json',
+      JSON.stringify({ schemaVersion: 1, owner: { publicKey: 'ghp_notakey' } }),
+    );
+    const errors = readErrors(load(file));
+    expectUntrusted(errors, 'git checkout or worktree');
+    expect(errors.some((error) => error.includes('owner-key-secret-shape'))).toBe(false);
+  });
+
   it('refuses a file inside a hosts.*.worktreeRoot', () => {
     freshDir();
     const file = writeInstallation(

@@ -6,6 +6,7 @@ import {
   openSync,
   readSync,
   realpathSync,
+  statSync,
 } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 
@@ -35,8 +36,19 @@ export interface InstallationFileSeam {
    * a regular file is refused before a single byte is read.
    */
   open?: (path: string) => number;
-  /** `fstat` the open handle: uid, full mode, and regular-file-ness. */
-  fstat?: (fd: number) => { uid: number; mode: number; isFile: () => boolean };
+  /**
+   * `fstat` the open handle: uid, full mode, and regular-file-ness. `dev` and
+   * `ino` bind the handle's identity; when the default seam is used they are
+   * always present, and a test seam may omit them (an omitted identity
+   * compares equal only to an omitted one).
+   */
+  fstat?: (fd: number) => {
+    uid: number;
+    mode: number;
+    isFile: () => boolean;
+    dev?: number;
+    ino?: number;
+  };
   /** Read the whole file from the open handle. */
   readAll?: (fd: number) => string;
   /** Close the open handle. */
@@ -45,6 +57,12 @@ export interface InstallationFileSeam {
   getuid?: () => number;
   /** The realpath used for the worktree and checkout checks. */
   realpath?: (path: string) => string;
+  /**
+   * `stat` a resolved path's identity (`dev` and `ino`). The trust check
+   * requires it to match the `fstat` identity of the opened handle, so a
+   * path that was swapped after the `O_NOFOLLOW` open cannot pass.
+   */
+  stat?: (path: string) => { dev: number; ino: number };
   /** Whether a `.git` entry (directory or worktree file) exists at a path. */
   hasGitEntry?: (path: string) => boolean;
 }
@@ -171,11 +189,18 @@ function readCapped(fd: number): string {
 /** The seam with every member filled in: the given overrides over `node:fs`. */
 interface ResolvedSeam {
   open: (path: string) => number;
-  fstat: (fd: number) => { uid: number; mode: number; isFile: () => boolean };
+  fstat: (fd: number) => {
+    uid: number;
+    mode: number;
+    isFile: () => boolean;
+    dev?: number;
+    ino?: number;
+  };
   readAll: (fd: number) => string;
   close: (fd: number) => void;
   getuid: () => number;
   realpath: (path: string) => string;
+  stat: (path: string) => { dev: number; ino: number };
   hasGitEntry: (path: string) => boolean;
 }
 
@@ -190,7 +215,13 @@ function resolveSeam(seam: InstallationFileSeam | undefined): ResolvedSeam {
         )),
     fstat: seam?.fstat ?? ((fd: number) => {
       const stats = fstatSync(fd);
-      return { uid: stats.uid, mode: stats.mode, isFile: () => stats.isFile() };
+      return {
+        uid: stats.uid,
+        mode: stats.mode,
+        isFile: () => stats.isFile(),
+        dev: stats.dev,
+        ino: stats.ino,
+      };
     }),
     readAll:
       seam?.readAll ??
@@ -200,6 +231,11 @@ function resolveSeam(seam: InstallationFileSeam | undefined): ResolvedSeam {
     close: seam?.close ?? closeSync,
     getuid: seam?.getuid ?? (() => process.getuid?.() ?? -1),
     realpath: seam?.realpath ?? realpathSync,
+    stat: seam?.stat ??
+      ((path: string) => {
+        const stats = statSync(path);
+        return { dev: stats.dev, ino: stats.ino };
+      }),
     hasGitEntry: seam?.hasGitEntry ?? ((path: string) => existsSync(join(path, '.git'))),
   };
 }
@@ -223,20 +259,71 @@ type FileRead =
       /** True when the path is a symlink, read through the fallback. */
       symlinked: boolean;
       /** `fstat` of the open handle, when one could be taken. */
-      stats?: { uid: number; mode: number; isFile: () => boolean };
+      stats?: {
+        uid: number;
+        mode: number;
+        isFile: () => boolean;
+        dev?: number;
+        ino?: number;
+      };
     };
 
 /**
- * `fstat` the open handle, or undefined when the handle cannot be statted.
+ * Resolve the identity of an already-open handle: `fstat` it, or undefined
+ * when the handle cannot be statted.
  */
-function statHandle(
+function resolveIdentity(
   fd: number,
   seam: ResolvedSeam,
-): { uid: number; mode: number; isFile: () => boolean } | undefined {
+): { uid: number; mode: number; isFile: () => boolean; dev?: number; ino?: number } | undefined {
   try {
     return seam.fstat(fd);
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Require the resolved handle identity to describe a regular file. Returns
+ * the refusal reason when it does not, undefined when it does.
+ */
+function requireRegularFile(
+  stats: { isFile: () => boolean } | undefined,
+): string | undefined {
+  if (stats === undefined) {
+    return 'the file handle could not be fstat-ed';
+  }
+  if (!stats.isFile()) {
+    return 'not-a-regular-file';
+  }
+  return undefined;
+}
+
+/** The outcome of opening the installation path without following symlinks. */
+type OpenOutcome =
+  | { kind: 'absent' }
+  | { kind: 'unreadable' }
+  | { kind: 'opened'; fd: number }
+  | { kind: 'symlink' };
+
+/**
+ * Open the installation path `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` through the
+ * seam, mapping the error codes: `ENOENT` is `'absent'`, `ELOOP` marks a
+ * symlink (`'symlink'`, refused later when the file carries an `owner`
+ * section), and anything else is `'unreadable'`.
+ */
+function openNoFollow(file: string, seam: ResolvedSeam): OpenOutcome {
+  try {
+    return { kind: 'opened', fd: seam.open(file) };
+  } catch (error) {
+    const code = readErrorCode(error);
+    if (code === 'ENOENT') {
+      return { kind: 'absent' };
+    }
+    if (code === 'ELOOP') {
+      return { kind: 'symlink' };
+    }
+    return { kind: 'unreadable' };
   }
 }
 
@@ -278,57 +365,27 @@ function readRegularFile(
  * capped at `MAX_INSTALLATION_FILE_BYTES`. A symlinked path is read through
  * the plain fallback — which opens the target without `O_NOFOLLOW` but
  * applies the same immediate `fstat` and size cap before reading anything —
- * and refused later when the file carries an `owner` section.
+ * and refused later when the file carries an `owner` section. The work is
+ * split across `openNoFollow`, `resolveIdentity`, `requireRegularFile` and
+ * `readCapped`; this function only sequences them.
  */
 function readInstallationFile(file: string, seam: ResolvedSeam): FileRead {
-  let fd: number;
-  try {
-    fd = seam.open(file);
-  } catch (error) {
-    const code = readErrorCode(error);
-    if (code === 'ENOENT') {
-      return { kind: 'absent' };
-    }
-    if (code === 'ELOOP') {
-      let targetFd: number;
-      try {
-        targetFd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
-      } catch {
-        return { kind: 'unreadable' };
-      }
-      try {
-        const stats = statHandle(targetFd, seam);
-        if (stats === undefined) {
-          return { kind: 'refused', reason: 'the file handle could not be fstat-ed' };
-        }
-        if (!stats.isFile()) {
-          return { kind: 'refused', reason: 'not-a-regular-file' };
-        }
-        const read = readRegularFile(targetFd, seam);
-        if (read.kind === 'error') {
-          return { kind: 'unreadable' };
-        }
-        if (read.kind === 'refused') {
-          return read;
-        }
-        return { kind: 'bytes', raw: read.raw, symlinked: true, stats };
-      } finally {
-        try {
-          closeSync(targetFd);
-        } catch {
-          // The read outcome is already decided; a failed close changes nothing.
-        }
-      }
-    }
+  const opened = openNoFollow(file, seam);
+  if (opened.kind === 'absent') {
+    return { kind: 'absent' };
+  }
+  if (opened.kind === 'unreadable') {
     return { kind: 'unreadable' };
   }
+  if (opened.kind === 'symlink') {
+    return readThroughSymlinkFallback(file, seam);
+  }
+  const fd = opened.fd;
   try {
-    const stats = statHandle(fd, seam);
-    if (stats === undefined) {
-      return { kind: 'refused', reason: 'the file handle could not be fstat-ed' };
-    }
-    if (!stats.isFile()) {
-      return { kind: 'refused', reason: 'not-a-regular-file' };
+    const stats = resolveIdentity(fd, seam);
+    const notRegular = requireRegularFile(stats);
+    if (notRegular !== undefined) {
+      return { kind: 'refused', reason: notRegular };
     }
     const read = readRegularFile(fd, seam);
     if (read.kind === 'error') {
@@ -343,6 +400,42 @@ function readInstallationFile(file: string, seam: ResolvedSeam): FileRead {
   } finally {
     try {
       seam.close(fd);
+    } catch {
+      // The read outcome is already decided; a failed close changes nothing.
+    }
+  }
+}
+
+/**
+ * Read a symlinked path through the plain fallback: open the target without
+ * `O_NOFOLLOW`, then apply the same immediate regular-file check and size
+ * cap before reading anything. The `symlinked` mark makes the read refused
+ * later when the file carries an `owner` section.
+ */
+function readThroughSymlinkFallback(file: string, seam: ResolvedSeam): FileRead {
+  let targetFd: number;
+  try {
+    targetFd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+  } catch {
+    return { kind: 'unreadable' };
+  }
+  try {
+    const stats = resolveIdentity(targetFd, seam);
+    const notRegular = requireRegularFile(stats);
+    if (notRegular !== undefined) {
+      return { kind: 'refused', reason: notRegular };
+    }
+    const read = readRegularFile(targetFd, seam);
+    if (read.kind === 'error') {
+      return { kind: 'unreadable' };
+    }
+    if (read.kind === 'refused') {
+      return read;
+    }
+    return { kind: 'bytes', raw: read.raw, symlinked: true, stats };
+  } finally {
+    try {
+      closeSync(targetFd);
     } catch {
       // The read outcome is already decided; a failed close changes nothing.
     }
@@ -409,12 +502,46 @@ function insideGitCheckout(realpath: string, seam: ResolvedSeam): boolean {
 }
 
 /**
+ * True when the parsed JSON is a plain object carrying an own `owner` key.
+ * Only own data properties are inspected; a getter or Proxy trap never runs.
+ */
+function hasOwnOwnerKey(parsed: unknown): boolean {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return false;
+  }
+  return Object.prototype.hasOwnProperty.call(parsed, 'owner');
+}
+
+/**
+ * A shallow copy of the parsed JSON without its `owner` key, used as the
+ * trust-check context before the `owner` section may be parsed. The copy is
+ * made with `Object.assign`, whose semantics define own enumerable keys as
+ * data properties, so a hostile `__proto__` key from `JSON.parse` stays an
+ * own key and is never applied as a prototype.
+ */
+function withoutOwnerKey(parsed: unknown): unknown {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return parsed;
+  }
+  const copy: Record<string, unknown> = Object.assign(
+    {} as Record<string, unknown>,
+    parsed as Record<string, unknown>,
+  );
+  delete copy.owner;
+  return copy;
+}
+
+/**
  * The reason the installation file cannot be trusted to carry the pinned
  * `owner.publicKey`, or undefined when every check passes. The checks are:
  * a non-symlink regular file, owned by the process uid, with no group or
- * other write bit, outside every `hosts.*.worktreeRoot`, and outside any
- * git checkout or worktree (including the repository checkout the file may
- * sit in — the repo checkout is exactly where local agents work).
+ * other write bit, an identity that still binds the resolved path to the
+ * opened handle (`fstat` dev/ino versus `stat` of the realpath, closing the
+ * TOCTOU window between the open and the containment checks), outside every
+ * `hosts.*.worktreeRoot`, and outside any git checkout or worktree
+ * (including the repository checkout the file may sit in — the repo checkout
+ * is exactly where local agents work). The containment checks run on the
+ * realpath only after the identity matches.
  */
 function ownerTrustReason(
   file: string,
@@ -442,6 +569,19 @@ function ownerTrustReason(
     realpath = seam.realpath(resolve(file));
   } catch {
     return 'its realpath could not be resolved';
+  }
+  // Bind the pathname to the handle the bytes were read from: the identity
+  // `fstat`-ed on the opened descriptor must still be the identity the path
+  // resolves to now. Without this, a path swapped in after the `O_NOFOLLOW`
+  // open could have contents read from a checkout file approved here.
+  let identity: { dev: number; ino: number };
+  try {
+    identity = seam.stat(realpath);
+  } catch {
+    return 'its identity could not be statted';
+  }
+  if (identity.dev !== read.stats.dev || identity.ino !== read.stats.ino) {
+    return 'identity-changed';
   }
   for (const root of worktreeRoots(installation)) {
     const inside = isInsideRoot(realpath, root, seam);
@@ -561,12 +701,14 @@ function applyEnvironmentOverrides(
  * as a load error.
  *
  * When the parsed file carries an `owner` section, the loader proves the file
- * trusted before returning the pinned `owner.publicKey` (see
- * `ownerTrustReason`): the bytes are read from an `O_NOFOLLOW | O_NONBLOCK`
- * handle that is `fstat`-ed on the spot, and a file that is a symlink, not a
- * regular file, not owned by the process uid, group/other-writable, inside
- * any `hosts.*.worktreeRoot`, or inside a git checkout or worktree is
- * refused with `owner-key-installation-untrusted` and the remedy. Before any
+ * trusted before the `owner` section is parsed or its pinned `owner.publicKey`
+ * returned (see `ownerTrustReason`): the bytes are read from an
+ * `O_NOFOLLOW | O_NONBLOCK` handle that is `fstat`-ed on the spot, the path's
+ * identity is re-statted and required to match the handle's, and a file that
+ * is a symlink, not a regular file, not owned by the process uid,
+ * group/other-writable, identity-swapped, inside any `hosts.*.worktreeRoot`,
+ * or inside a git checkout or worktree is refused with
+ * `owner-key-installation-untrusted` and the remedy. Before any
  * byte is read — with or without an `owner` section — a handle that is not a
  * regular file (a FIFO, a device) or a read past `MAX_INSTALLATION_FILE_BYTES`
  * is refused the same way. A file without an `owner` section is otherwise
@@ -601,6 +743,26 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
       parsed = JSON.parse(read.raw);
     } catch {
       return { status: 'invalid', file, errors: [`${file}: invalid JSON`] };
+    }
+    // An untrusted file's `owner` section is never parsed for its key: when
+    // the raw JSON carries an `owner` key, the trust check runs first, on a
+    // parse of the file with the `owner` key omitted (which still supplies
+    // the `hosts.*.worktreeRoot` values the containment check reads). Only a
+    // file that passes trust has its `owner` section parsed and validated.
+    if (hasOwnOwnerKey(parsed)) {
+      const context = parseInstallation(withoutOwnerKey(parsed));
+      if (context.ok) {
+        const reason = ownerTrustReason(file, context.installation, read, seam);
+        if (reason !== undefined) {
+          return {
+            status: 'invalid',
+            file,
+            errors: [
+              `${file}: owner-key-installation-untrusted (${reason}); ${OWNER_TRUST_REMEDY}`,
+            ],
+          };
+        }
+      }
     }
     const result = parseInstallation(parsed);
     if (!result.ok) {

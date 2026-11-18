@@ -419,6 +419,7 @@ describe('isCutoverJournalKey and SHADOW_IMPORT_KEY (GR1b)', () => {
     const key = validShadowKey();
     expect(await refusal(journal, intent(key))).toBe('appended');
     const listed = await journal.listByKeyPrefix('shadow-import/');
+    expect(listed.outcome).toBe('listed');
     if (listed.outcome === 'listed') expect(listed.entries.map((entry) => entry.key)).toEqual([key]);
   });
 });

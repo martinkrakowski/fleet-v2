@@ -48,10 +48,14 @@ const futureDeadline = (): string => new Date(Date.now() + 60_000).toISOString()
 class FakeLegacyTrainStateReadPort implements LegacyTrainStateReadPort {
   calls = 0;
 
-  constructor(private readonly state: LegacyTrainStateRead) {}
+  constructor(
+    private readonly state: LegacyTrainStateRead,
+    private readonly log?: string[],
+  ) {}
 
   async readLegacyTrainState(): Promise<LegacyTrainStateRead> {
     this.calls += 1;
+    this.log?.push('read-legacy');
     return this.state;
   }
 }
@@ -94,6 +98,7 @@ function makeUseCase(
     readonly authorization?: ActionAuthorizationPort;
     readonly journal?: CutoverJournalPort;
     readonly computeDigest?: (payload: string) => string;
+    readonly nowIso?: () => string;
   } = {},
 ): ImportTrainStateUseCase {
   // An explicitly absent dependency (key present with `undefined`) means the
@@ -111,6 +116,7 @@ function makeUseCase(
     authorization: has('authorization') ? overrides.authorization : defaultAuthorization,
     journal: has('journal') ? overrides.journal : new CutoverJournalAdapter(),
     computeDigest: has('computeDigest') ? overrides.computeDigest : (() => GRANT_DIGEST),
+    ...(has('nowIso') ? { nowIso: overrides.nowIso } : {}),
   });
 }
 
@@ -858,6 +864,7 @@ class FakeAuthorization implements ActionAuthorizationPort {
       | { readonly kind: 'blocked'; readonly reason: string }
       | { readonly kind: 'unknown'; readonly reason: string }
       | { readonly kind: 'throw' } = { kind: 'authorized' },
+    private readonly log?: string[],
   ) {}
 
   async resolveActionAuthorization(): Promise<never> {
@@ -870,6 +877,7 @@ class FakeAuthorization implements ActionAuthorizationPort {
 
   async authorizeShadowImport(request: AuthorizeShadowImportRequest): Promise<AuthorizeShadowImportResult> {
     this.calls += 1;
+    this.log?.push('authorize');
     this.lastRequest = request;
     if (this.answer.kind === 'throw') {
       throw new Error('delegate blew up');
@@ -939,11 +947,26 @@ class ThrowingEnqueueQueue implements MergeQueueRepositoryPort {
   }
 }
 
+/** A queue wrapper that records each list call on a shared call log. */
+class LoggingListQueue extends MergeQueueRepositoryAdapter {
+  constructor(private readonly log: string[]) {
+    super();
+  }
+
+  override async listMergeEntries(query: MergeQueueListQuery): Promise<readonly MergeQueueEntryRecord[]> {
+    this.log.push('list-queue');
+    return super.listMergeEntries(query);
+  }
+}
+
 describe('ImportTrainStateUseCase authorization and journaling (GR1b)', () => {
   it('applies verify the grant before any legacy read, queue read or queue write', async () => {
-    const queue = new MergeQueueRepositoryAdapter();
-    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
-    const authorization = new FakeAuthorization();
+    // A shared call log pins the ORDER, not merely that each call happens:
+    // authorize must come before the legacy read and before the queue read.
+    const log: string[] = [];
+    const queue = new LoggingListQueue(log);
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]), log);
+    const authorization = new FakeAuthorization({ kind: 'authorized' }, log);
     const useCase = makeUseCase(reader, queue, { authorization });
 
     const result = await useCase.importTrainState({
@@ -955,6 +978,11 @@ describe('ImportTrainStateUseCase authorization and journaling (GR1b)', () => {
     });
 
     expect(result).toMatchObject({ outcome: 'applied', imported: 1 });
+    expect(log[0]).toBe('authorize');
+    expect(log).toContain('read-legacy');
+    expect(log).toContain('list-queue');
+    expect(log.indexOf('authorize')).toBeLessThan(log.indexOf('read-legacy'));
+    expect(log.indexOf('authorize')).toBeLessThan(log.indexOf('list-queue'));
     expect(authorization.calls).toBe(1);
     expect(authorization.lastRequest).toMatchObject({
       projectId: PROJECT_ID,
@@ -1169,6 +1197,79 @@ describe('ImportTrainStateUseCase authorization and journaling (GR1b)', () => {
     const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
     const useCase = makeUseCase(reader, queue, {
       journal: new FakeJournal('refused') as unknown as CutoverJournalPort,
+    });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'journal-refused' });
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('a throwing computeDigest refuses journal-unavailable before queue write', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue, {
+      computeDigest: () => {
+        throw new Error('digest blew up');
+      },
+    });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'journal-unavailable' });
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('a throwing nowIso during journaling refuses journal-refused before queue write', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    // Call 1 authorizes, call 2 mints the deadline, call 3 stamps the intent:
+    // the clock blows up exactly at the journaling step.
+    let clockCalls = 0;
+    const useCase = makeUseCase(reader, queue, {
+      nowIso: () => {
+        clockCalls += 1;
+        if (clockCalls >= 3) {
+          throw new Error('clock blew up');
+        }
+        return new Date().toISOString();
+      },
+    });
+
+    const result = await useCase.importTrainState({
+      repository: REPO,
+      stateDir: '/tmp/legacy',
+      apply: true,
+      grantId: GRANT_ID,
+      projectId: PROJECT_ID,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'journal-refused' });
+    expect(await queue.listMergeEntries({ repository: REPO, deadlineIso: futureDeadline() })).toEqual([]);
+  });
+
+  it('a throwing intent append refuses journal-refused before queue write', async () => {
+    const queue = new MergeQueueRepositoryAdapter();
+    const reader = new FakeLegacyTrainStateReadPort(readState([MAIN_A]));
+    const useCase = makeUseCase(reader, queue, {
+      journal: {
+        append: async () => {
+          throw new Error('journal store blew up');
+        },
+        listByKeyPrefix: async () => ({ outcome: 'listed', entries: [] }),
+      } as unknown as CutoverJournalPort,
     });
 
     const result = await useCase.importTrainState({

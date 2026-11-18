@@ -19,7 +19,7 @@ import { IMPORT_KEYS_MAX } from '../ports/in/ImportTrainStatePort.in-port.js';
 import type { LegacyTrainStateRead, LegacyTrainStateReadPort } from '../ports/out/LegacyTrainStateReadPort.out-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { ActionAuthorizationPort, AuthorizeShadowImportResult } from '../ports/out/ActionAuthorizationPort.out-port.js';
-import type { CutoverJournalPort } from '../ports/out/CutoverJournalPort.out-port.js';
+import type { CutoverJournalAppendResult, CutoverJournalPort } from '../ports/out/CutoverJournalPort.out-port.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
@@ -318,16 +318,31 @@ export class ImportTrainStateUseCase implements ImportTrainStatePort {
       return { outcome: 'refused', reason: 'journal-unavailable' };
     }
     const grantId = request_.grantId ?? '';
-    const grantDigest = computeDigest(grantId);
+    // GR1b fix round: `computeDigest`, `nowIso` and the intent append sit
+    // before any queue write, so any throw from them is mapped to a typed
+    // refusal instead of escaping untyped: a digest failure means the digest
+    // dependency is unavailable; a clock or journal-store failure refuses the
+    // journal.
+    let grantDigest: string;
+    try {
+      grantDigest = computeDigest(grantId);
+    } catch {
+      return { outcome: 'refused', reason: 'journal-unavailable' };
+    }
     const runEntryId = this.deps.mintUlid();
     const key = `shadow-import/${request_.repository.owner}/${request_.repository.repo}/${runEntryId}`;
-    const intentAppend = await journal.append({
-      key,
-      kind: 'intent',
-      entryId: runEntryId,
-      recordedAtIso: this.deps.nowIso(),
-      digest: grantDigest,
-    });
+    let intentAppend: CutoverJournalAppendResult;
+    try {
+      intentAppend = await journal.append({
+        key,
+        kind: 'intent',
+        entryId: runEntryId,
+        recordedAtIso: this.deps.nowIso(),
+        digest: grantDigest,
+      });
+    } catch {
+      return { outcome: 'refused', reason: 'journal-refused' };
+    }
     if (intentAppend.outcome === 'refused') {
       return { outcome: 'refused', reason: 'journal-refused' };
     }

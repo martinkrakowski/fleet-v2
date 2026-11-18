@@ -5,6 +5,10 @@ import * as path from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
+import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
+import { SHADOW_IMPORT_DIGEST_PREFIX, shadowImportDigestPayload } from '@fleet/operator-coordination';
+import { sha256HexDigest } from '@fleet/work-execution';
+
 import { createFleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 import { parseMergeImportFlags } from '../merge.js';
@@ -447,9 +451,9 @@ describe('merge import (GR1b)', () => {
     expect(JSON.parse(result.out)).toEqual({ outcome: 'refused', reason: 'grant-missing' });
     // Nothing was written: no queue file, no shadow-intake journal, and the
     // never-read legacy state dir was never created.
-    expect(fs.access(path.join(stateDir, 'merge-queue.json'))).rejects.toThrow();
-    expect(fs.access(path.join(stateDir, 'shadow-intake-journal.json'))).rejects.toThrow();
-    expect(fs.access(legacyStateDir)).rejects.toThrow();
+    await expect(fs.access(path.join(stateDir, 'merge-queue.json'))).rejects.toThrow();
+    await expect(fs.access(path.join(stateDir, 'shadow-intake-journal.json'))).rejects.toThrow();
+    await expect(fs.access(legacyStateDir)).rejects.toThrow();
   });
 
   it('an approved apply returns applied and exits 0 (injected runtime)', async () => {
@@ -496,5 +500,68 @@ describe('merge import (GR1b)', () => {
 
     expect(result.code).toBe(0);
     expect(JSON.parse(result.out)).toEqual(appliedResult);
+  });
+
+  it('a real grant-backed apply journals into shadow-intake-journal.json, never cutover-journal.json', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-merge-import-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    const legacyStateDir = path.join(stateDir, 'legacy');
+    await fs.mkdir(legacyStateDir, { recursive: true });
+    await fs.writeFile(path.join(legacyStateDir, 'queue'), `42 ${HEAD_A} main\n`, 'utf8');
+    // The in-progress file must exist and be readable, even empty.
+    await fs.writeFile(path.join(legacyStateDir, 'inprogress'), '', 'utf8');
+
+    // Seed an approved standing shadow-import grant bound to its digest of
+    // its exact coordinates, through the real composition's repositories.
+    const shadowImportGrant = { repository: { owner: 'fleet', repo: 'v2' }, expiresAtIso: futureDeadline() };
+    const payload = shadowImportDigestPayload(shadowImportGrant);
+    if (!payload.ok) {
+      throw new Error('fixture grant coordinates must be valid');
+    }
+    const requestId = `${SHADOW_IMPORT_DIGEST_PREFIX}${sha256HexDigest(payload.value)}`;
+    await runtime.coordination.coordinationRequestRepository.saveRequest({
+      id: requestId,
+      projectId: 'project-1',
+      kind: 'action-decision',
+      actionScope: 'merge:import-shadow',
+      expectedHeadSha: null,
+      proposalDigest: 'prop-1',
+      policyRevision: 'pol-1',
+      decisionRevision: 'dec-1',
+      grantId: 'grant-1',
+      state: 'approved',
+      deliveryStatus: 'pending',
+      deliveryGapReason: null,
+      revision: 1,
+      consumptions: [],
+      acknowledgements: [],
+      createdAtIso: new Date().toISOString(),
+      updatedAtIso: new Date().toISOString(),
+      shadowImportGrant,
+    });
+
+    const result = await cli(runtime, [
+      'merge',
+      'import',
+      '--repository',
+      'fleet/v2',
+      '--legacy-state-dir',
+      legacyStateDir,
+      '--apply',
+      '--grant',
+      'grant-1',
+      '--project',
+      'project-1',
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toMatchObject({ outcome: 'applied', imported: 1 });
+    // The separate shadow-intake journal exists with the intent and result.
+    const shadowJournal = await fs.readFile(path.join(stateDir, 'shadow-intake-journal.json'), 'utf8');
+    const entries = JSON.parse(shadowJournal) as Array<{ kind: string }>;
+    expect(entries.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    // The shared cutover journal was never touched by a shadow intake.
+    await expect(fs.access(path.join(stateDir, 'cutover-journal.json'))).rejects.toThrow();
   });
 });

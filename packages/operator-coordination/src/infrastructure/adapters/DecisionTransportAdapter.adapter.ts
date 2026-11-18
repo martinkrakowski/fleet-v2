@@ -147,26 +147,26 @@ function normalizeAnswer(
     typeof answer.grantId === 'string' && answer.grantId.trim().length > 0
       ? answer.grantId.trim()
       : null;
-  if (state === 'approved' && grantId === null) {
-    // An approval without a recorded grant authorizes nothing.
-    return { ...AWAITING };
-  }
   if (state === 'declined') {
     return { state, decisionRevision, grantId: null };
   }
   if (state === 'approved') {
+    // The pinned-key refusal is checked before the grantless-answer
+    // fallback so its named reason is surfaced, not lost to AWAITING.
     if (
       ownerKeyRefusal === 'owner-key-env-mismatch' ||
       ownerKeyRefusal === 'owner-key-unpinned'
     ) {
-      // A pinned-key refusal blocks every approval: the answer stays
-      // awaiting and carries the named reason, never an approval.
       return {
         state: 'awaiting-decision',
         decisionRevision: null,
         grantId: null,
         refusalReason: ownerKeyRefusal,
       };
+    }
+    if (grantId === null) {
+      // An approval without a recorded grant authorizes nothing.
+      return { ...AWAITING };
     }
     if (
       ownerPublicKey === undefined ||

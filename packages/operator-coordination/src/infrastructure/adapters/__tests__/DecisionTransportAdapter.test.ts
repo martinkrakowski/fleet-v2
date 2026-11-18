@@ -379,6 +379,26 @@ describe('DecisionTransportAdapter signature verification', () => {
     });
   });
 
+  it('ownerKeyRefusal set + approved answer with blank grantId -> refusal reason', async () => {
+    const adapter = new DecisionTransportAdapter({
+      ownerKeyRefusal: 'owner-key-unpinned',
+      answers: {
+        'req-1': {
+          state: 'approved',
+          decisionRevision: 'rev-1',
+          grantId: '   ',
+        },
+      },
+    });
+    const result = await adapter.readDecisionAnswer(query);
+    expect(result).toEqual({
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+      refusalReason: 'owner-key-unpinned',
+    });
+  });
+
   it('key of 31 bytes -> awaiting', async () => {
     const { privateKey } = createOwnerKeyPair();
     const signature = signDecision(

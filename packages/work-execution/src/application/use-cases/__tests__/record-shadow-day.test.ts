@@ -4201,6 +4201,40 @@ describe('evaluateShadowGrantCoverage', () => {
     expect(evaluation.outcome).toBe('not-covering');
   });
 
+  // OD7a2 fix round 7: the approval cutoff is inclusive at the day start —
+  // `updatedAtIso` exactly at `00:00:00.000Z` is covered; one millisecond
+  // later is not. Catches `> dayStart + 1ms` and other loosenings.
+  it('treats updatedAtIso exactly at 00:00:00.000Z as covered and one millisecond later as not-covering', () => {
+    expect(evaluateShadowGrantCoverage(grantRecord({ updatedAtIso: DAY_START }), DAY_START, DAY_END)).toEqual({
+      outcome: 'covered',
+    });
+    expect(
+      evaluateShadowGrantCoverage(grantRecord({ updatedAtIso: '2026-11-16T00:00:00.001Z' }), DAY_START, DAY_END),
+    ).toEqual({ outcome: 'not-covering', reason: 'approved-after-day-start' });
+  });
+
+  // OD7a2 fix round 7: the grant must expire strictly AFTER the day ends —
+  // `expiresAtIso` exactly at the day end is not-covering; one millisecond
+  // after is covered. Catches `<=` becoming `<` and vice versa.
+  it('treats expiresAtIso exactly at the day end as not-covering and one millisecond after as covered', () => {
+    expect(
+      evaluateShadowGrantCoverage(
+        grantRecord({ shadowImportGrant: { repository: { owner: OWNER, repo: REPO }, expiresAtIso: DAY_END } }),
+        DAY_START,
+        DAY_END,
+      ),
+    ).toEqual({ outcome: 'not-covering', reason: 'expires-at-or-before-day-end' });
+    expect(
+      evaluateShadowGrantCoverage(
+        grantRecord({
+          shadowImportGrant: { repository: { owner: OWNER, repo: REPO }, expiresAtIso: '2026-11-17T00:00:00.001Z' },
+        }),
+        DAY_START,
+        DAY_END,
+      ),
+    ).toEqual({ outcome: 'covered' });
+  });
+
   it('returns not-covering when revoked or cancelled', () => {
     for (const state of ['cancelled', 'declined', 'expired']) {
       const evaluation = evaluateShadowGrantCoverage(grantRecord({ state }), DAY_START, DAY_END);
@@ -4358,6 +4392,26 @@ function afternoonFixture(day: string): Fixture {
   return fixture;
 }
 
+/**
+ * OD7a2 fix round 7: a fixture whose in-day `job` ticks start exactly at
+ * `firstRecordedAtIso` (millisecond precision) and continue once per minute
+ * after it — 800 ticks, the clean fixture's count, so S12's tick count passes
+ * and only the first-tick guard can hold the day.
+ */
+function fixtureWithFirstJobTick(day: string, firstRecordedAtIso: string): Fixture {
+  const fixture = cleanFixture(day);
+  function tickIso(minuteOffset: number): string {
+    const hour = String(Math.floor(minuteOffset / 60)).padStart(2, '0');
+    const minute = String(minuteOffset % 60).padStart(2, '0');
+    return `${day}T${hour}:${minute}:00.000Z`;
+  }
+  (fixture as { daemonEvents: DaemonEventRecord[] }).daemonEvents = fixture.daemonEvents.map((event, index) => ({
+    ...event,
+    recordedAtIso: index === 0 ? firstRecordedAtIso : tickIso(15 + index),
+  }));
+  return fixture;
+}
+
 /** A scheduled harness: the given fixture plus a `shadowGrantCoverage` reader. */
 function scheduledHarness(
   fixture: Fixture,
@@ -4446,6 +4500,69 @@ describe('RecordShadowDayUseCase scheduled mode (OD7a2)', () => {
     expect(harness.evidence.calls.cas).toBe(0);
     expect(harness.evidence.stored).toBeNull();
     expect(getTrapCalls).toBe(0);
+  });
+
+  // OD7a2 fix round 7: the first-tick grace boundary is inclusive — the
+  // earliest `job` tick at exactly `00:00Z + SHADOW_FIRST_TICK_GRACE_MS`
+  // (`00:15:00.000Z`) passes the guard and the day records; one millisecond
+  // later is refused as `partial-day`. Catches widening the grace.
+  it('accepts a first job tick exactly at 00:15:00.000Z and refuses one at 00:15:00.001Z', async () => {
+    const exactHarness = scheduledHarness(fixtureWithFirstJobTick(DAY, `${DAY}T00:15:00.000Z`));
+    const exactResult = await new RecordShadowDayUseCase(exactHarness.deps).execute(makeRequest({ scheduled: true }));
+    expectRecorded(exactResult);
+    expect(exactHarness.evidence.stored?.days.find((entry) => entry.day === DAY)).toBeDefined();
+
+    const lateHarness = scheduledHarness(fixtureWithFirstJobTick(DAY, `${DAY}T00:15:00.001Z`));
+    const lateResult = await new RecordShadowDayUseCase(lateHarness.deps).execute(makeRequest({ scheduled: true }));
+    expectSkippedWithoutWrite(lateResult, 'partial-day');
+    expect(lateHarness.evidence.calls.cas).toBe(0);
+    expect(lateHarness.evidence.stored).toBeNull();
+  });
+
+  // OD7a2 fix round 7: the request is snapshotted once at entry — a data
+  // property `scheduled: true` redefined to `false` (from inside the coverage
+  // reader stub, after `execute()` began) must not change the mode. If any
+  // code path re-read the raw request, the day would silently drop out of
+  // scheduled mode and record an arming day.
+  // OD7a2 fix round 7: the raw request's `scheduled` property is read exactly
+  // ONCE across the whole `execute()` — through its own data descriptor at the
+  // entry snapshot — and never again afterwards. A second read would let a
+  // later re-read see a redefined value and silently drop out of scheduled
+  // mode; the descriptor-read counter below fails if any code path re-reads
+  // the raw request.
+  it('reads scheduled on the raw request exactly once across execute()', async () => {
+    const harness = scheduledHarness(cleanFixture(DAY));
+    const scheduledDescriptorReads: string[] = [];
+    const proxied: RecordShadowDayRequest = new Proxy(makeRequest({ scheduled: true }), {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'scheduled') {
+          scheduledDescriptorReads.push('scheduled');
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(proxied);
+    expectRecorded(result);
+    expect(scheduledDescriptorReads).toEqual(['scheduled']);
+    expect(harness.evidence.stored?.days.find((entry) => entry.day === DAY)).toBeDefined();
+  });
+
+  it('still treats the day as scheduled when the raw request scheduled data property is redefined to false after execute() begins', async () => {
+    const request = makeRequest({ day: ARMING_DAY, scheduled: true });
+    const harness = scheduledHarness(afternoonFixture(ARMING_DAY), async (input) => {
+      void input;
+      Object.defineProperty(request, 'scheduled', {
+        value: false,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      return { outcome: 'covered' as const };
+    });
+    const result = await new RecordShadowDayUseCase(harness.deps).execute(request);
+    expectSkippedWithoutWrite(result, 'partial-day');
+    expect(harness.evidence.calls.cas).toBe(0);
+    expect(harness.evidence.stored).toBeNull();
   });
 
   it('scheduled mode skips partial-day ticks without writing and records next full day', async () => {

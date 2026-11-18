@@ -879,11 +879,16 @@ export async function runCli(
         const loadResult = loadInstallation();
         daemonRuntime = createFleetCliRuntime(
           loadResult.status === 'invalid'
-            ? { stateDir, loadInstallationForMergePolicy: () => loadResult }
+            ? {
+                stateDir,
+                loadInstallationForMergePolicy: () => loadResult,
+                onOwnerKeyWarning: (message) => io.stderr(`${message}\n`),
+              }
             : {
                 stateDir,
                 installation: loadResult.installation,
                 loadInstallationForMergePolicy: () => loadInstallation(),
+                onOwnerKeyWarning: (message) => io.stderr(`${message}\n`),
               },
         );
       }
@@ -919,6 +924,7 @@ export async function runCli(
       activeRuntime = createFleetCliRuntime({
         stateDir,
         installation: loadResult.installation,
+        onOwnerKeyWarning: (message) => io.stderr(`${message}\n`),
       });
     }
     // The projects group manages its profiles through the composed runtime

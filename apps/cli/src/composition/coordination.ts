@@ -98,6 +98,8 @@ export class DeferredAttemptFactsRead implements AttemptFactsReadPort {
 export interface ComposeCoordinationInput {
   readonly stateDir?: string;
   readonly ownerPublicKey?: string;
+  /** KEY0b: a resolved pinned-key refusal the decision transport enforces. */
+  readonly ownerKeyRefusal?: 'owner-key-env-mismatch' | 'owner-key-unpinned';
   readonly options?: FleetCliRuntimeOptions;
   /**
    * CO24f: the attempt-facts reader the authorization resolve binds grants
@@ -110,7 +112,7 @@ export interface ComposeCoordinationInput {
 }
 
 export function composeCoordination(input: ComposeCoordinationInput) {
-  const { stateDir, ownerPublicKey, options } = input;
+  const { stateDir, ownerPublicKey, ownerKeyRefusal, options } = input;
 
   // --- operator-coordination -------------------------------------------------
 
@@ -131,6 +133,7 @@ export function composeCoordination(input: ComposeCoordinationInput) {
   const decisionTransport = new DecisionTransportAdapter({
     decisionsDir: stateDir === undefined ? undefined : join(stateDir, 'decisions'),
     ownerPublicKey,
+    ...(ownerKeyRefusal !== undefined ? { ownerKeyRefusal } : {}),
   });
   const observationPublication = new ObservationPublicationAdapter({
     outboxDir: stateDir === undefined ? undefined : join(stateDir, 'observation-outbox'),

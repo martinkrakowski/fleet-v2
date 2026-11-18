@@ -1,7 +1,7 @@
-import { describe, expect, it, afterAll } from 'vitest';
+import { describe, expect, it, afterAll, afterEach, beforeEach } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, promises as fs, rmSync } from 'node:fs';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, promises as fs, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
@@ -2230,5 +2230,266 @@ describe('CO18a3b brief-verify attempt resolution', () => {
     await expect(findAttemptForReview(attempt.id, lookup.attempts, lookup.orders)).resolves.toBe(attempt);
     expect(lookup.log.findIds).toEqual([attempt.id]);
     expect(lookup.log.listed).toBe(0);
+  });
+});
+
+/**
+ * KEY0b: the CLI composition reads the owner public key only from the pinned
+ * installation key (or the test-injected pinned fallback). FLEET_OWNER_PUBLIC_KEY
+ * is never an authority: a mismatching value refuses, an equal value only warns.
+ */
+describe('KEY0b: pinned owner public key in the CLI composition root', () => {
+  const HEAD = makeHeadH();
+
+  function keyPair(): { publicKeyBase64: string; privateKey: ReturnType<typeof generateKeyPairSync>['privateKey'] } {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    return {
+      publicKeyBase64: publicKey.export({ format: 'der', type: 'spki' }).subarray(12).toString('base64'),
+      privateKey,
+    };
+  }
+
+  const pinned = keyPair();
+  const other = keyPair();
+  // The ambient env key that must never become an authority on its own.
+  const envOnly = keyPair();
+
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(path.join(tmpdir(), 'fleet-key0b-comp-'));
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function awaitingRecord(
+    grantId: string,
+    scope: string,
+    overrides: Partial<CoordinationRequestRecord> = {},
+  ): CoordinationRequestRecord {
+    return {
+      ...makeApprovedGrant(grantId, scope, HEAD),
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+      ...overrides,
+    };
+  }
+
+  async function writeDecision(
+    fields: {
+      requestId: string;
+      projectId: string;
+      actionScope: string;
+      expectedHeadSha: string | null;
+      decisionRevision: string | null;
+      grantId: string | null;
+      state: string;
+    },
+    privateKey: ReturnType<typeof generateKeyPairSync>['privateKey'],
+  ): Promise<void> {
+    const signature = sign(null, canonicalDecisionBytes(fields), privateKey).toString('base64');
+    const decisionsDir = path.join(tempDir, 'decisions');
+    if (!existsSync(decisionsDir)) {
+      mkdirSync(decisionsDir);
+    }
+    writeFileSync(
+      path.join(decisionsDir, `${fields.requestId}.json`),
+      `${JSON.stringify({ ...fields, signature }, null, 2)}\n`,
+    );
+  }
+
+  function canonicalDecisionBytes(fields: {
+    requestId: string;
+    projectId: string;
+    actionScope: string;
+    expectedHeadSha: string | null;
+    decisionRevision: string | null;
+    grantId: string | null;
+    state: string;
+  }): Buffer {
+    return Buffer.from(
+      JSON.stringify({
+        requestId: fields.requestId,
+        projectId: fields.projectId,
+        actionScope: fields.actionScope,
+        expectedHeadSha: fields.expectedHeadSha ?? null,
+        decisionRevision: fields.decisionRevision ?? null,
+        grantId: fields.grantId ?? null,
+        state: fields.state,
+      }),
+      'utf8',
+    );
+  }
+
+  /** Seeds an awaiting merge grant for org/repo PR 7 with its approved answer on disk. */
+  async function seedMergeGrant(
+    grantId: string,
+    signingKey: ReturnType<typeof generateKeyPairSync>['privateKey'],
+  ): Promise<CoordinationRequestRecord> {
+    const record = awaitingRecord(grantId, 'forge:merge-pr', {
+      mergeGrant: { repository: { owner: 'org', repo: 'repo' }, pullRequestNumber: 7 },
+    });
+    const runtime = createFleetCliRuntime({ stateDir: tempDir });
+    await runtime.coordination.coordinationRequestRepository.saveRequest(record);
+    await writeDecision(
+      {
+        requestId: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-1',
+        grantId,
+        state: 'approved',
+      },
+      signingKey,
+    );
+    return record;
+  }
+
+  it('(a) only FLEET_OWNER_PUBLIC_KEY set: a signed approval refuses as owner-key-unpinned', async () => {
+    await seedMergeGrant('grant-env-only', envOnly.privateKey);
+    const rt = createFleetCliRuntime({
+      stateDir: tempDir,
+      env: { FLEET_OWNER_PUBLIC_KEY: envOnly.publicKeyBase64 },
+    });
+    const resolved = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'proj-cli-test',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: HEAD,
+      repository: 'org/repo',
+      pullRequestNumber: 7,
+    });
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  });
+
+  it('(b) FLEET_OWNER_PUBLIC_KEY differs from the pinned key: refuses as owner-key-env-mismatch', async () => {
+    await seedMergeGrant('grant-mismatch', other.privateKey);
+    const rt = createFleetCliRuntime({
+      stateDir: tempDir,
+      ownerPublicKey: pinned.publicKeyBase64,
+      env: { FLEET_OWNER_PUBLIC_KEY: other.publicKeyBase64 },
+    });
+    const resolved = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'proj-cli-test',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: HEAD,
+      repository: 'org/repo',
+      pullRequestNumber: 7,
+    });
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-env-mismatch' });
+  });
+
+  it('(c) FLEET_OWNER_PUBLIC_KEY equals the pinned key: verifies and emits exactly one deprecation warning', async () => {
+    await seedMergeGrant('grant-equal', pinned.privateKey);
+    const warnings: string[] = [];
+    const rt = createFleetCliRuntime({
+      stateDir: tempDir,
+      ownerPublicKey: pinned.publicKeyBase64,
+      env: { FLEET_OWNER_PUBLIC_KEY: pinned.publicKeyBase64 },
+      onOwnerKeyWarning: (message) => warnings.push(message),
+    });
+    const resolved = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'proj-cli-test',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: HEAD,
+      repository: 'org/repo',
+      pullRequestNumber: 7,
+    });
+    expect(resolved.outcome).toBe('authorized');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.split('\n')).toHaveLength(1);
+    expect(warnings[0]).not.toContain(pinned.publicKeyBase64);
+  });
+
+  it('(d) the pinned key verifies a correctly signed decision with no env variable', async () => {
+    await seedMergeGrant('grant-pinned', pinned.privateKey);
+    const rt = createFleetCliRuntime({
+      stateDir: tempDir,
+      ownerPublicKey: pinned.publicKeyBase64,
+      env: {},
+    });
+    const resolved = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'proj-cli-test',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: HEAD,
+      repository: 'org/repo',
+      pullRequestNumber: 7,
+    });
+    expect(resolved.outcome).toBe('authorized');
+  });
+
+  it('(e) no pinned key fails closed as owner-key-unpinned for a release grant', async () => {
+    const record = awaitingRecord('grant-release', 'release:install');
+    const runtime = createFleetCliRuntime({ stateDir: tempDir, env: {} });
+    await runtime.coordination.coordinationRequestRepository.saveRequest(record);
+    // An approving answer is recorded: the unpinned refusal must surface as
+    // the resolve's block reason, not the ordinary awaiting state.
+    await writeDecision(
+      {
+        requestId: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-1',
+        grantId: 'grant-release',
+        state: 'approved',
+      },
+      other.privateKey,
+    );
+    const resolved = await runtime.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'proj-cli-test',
+      actionScope: 'release:install',
+      expectedHeadSha: HEAD,
+    });
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  });
+
+  it('(e) no pinned key fails closed as owner-key-unpinned for a shadow-import grant', async () => {
+    const record = awaitingRecord('grant-shadow', 'merge:import-shadow', {
+      grantId: 'grant-shadow',
+      shadowImportGrant: {
+        repository: { owner: 'org', repo: 'repo' },
+        expiresAtIso: '2036-11-18T00:00:00.000Z',
+      },
+      expectedHeadSha: null,
+    });
+    const runtime = createFleetCliRuntime({ stateDir: tempDir, env: {} });
+    await runtime.coordination.coordinationRequestRepository.saveRequest(record);
+    await writeDecision(
+      {
+        requestId: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-1',
+        grantId: 'grant-shadow',
+        state: 'approved',
+      },
+      other.privateKey,
+    );
+    const resolved = await runtime.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'proj-cli-test',
+      actionScope: 'merge:import-shadow',
+      expectedHeadSha: '',
+      authorizationGrantId: 'grant-shadow',
+      repository: 'org/repo',
+    });
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  });
+
+  it('(e) no pinned key fails closed as owner-key-unpinned for a scoped grant', async () => {
+    await seedMergeGrant('grant-scoped', pinned.privateKey);
+    const rt = createFleetCliRuntime({ stateDir: tempDir, env: {} });
+    const resolved = await rt.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'proj-cli-test',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: HEAD,
+      repository: 'org/repo',
+      pullRequestNumber: 7,
+    });
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
   });
 });

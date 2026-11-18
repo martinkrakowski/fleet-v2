@@ -32,6 +32,11 @@ export interface DecisionTransportAdapterOptions {
   readonly fileExtension?: string;
   /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
   readonly ownerPublicKey?: string;
+  /**
+   * A named owner-key refusal resolved by the composition root: when set, no
+   * answer may be approved, whatever its signature.
+   */
+  readonly ownerKeyRefusal?: 'owner-key-env-mismatch' | 'owner-key-unpinned';
   /** Optional Waves HTTP client for fetching decision answers. */
   readonly client?: WavesHttpClient;
 }
@@ -68,7 +73,7 @@ export class DecisionTransportAdapter implements DecisionTransportPort {
     }
     const injected = this.options.answers?.[requestId];
     if (injected !== undefined) {
-      return normalizeAnswer(injected, query, this.options.ownerPublicKey);
+      return normalizeAnswer(injected, query, this.options.ownerPublicKey, this.options.ownerKeyRefusal);
     }
     if (this.options.client !== undefined) {
       let candidate: unknown = null;
@@ -84,7 +89,7 @@ export class DecisionTransportAdapter implements DecisionTransportPort {
         // network error, timeout, JSON parse error -> candidate remains null
       }
       if (candidate !== null) {
-        return normalizeAnswer(candidate, query, this.options.ownerPublicKey);
+        return normalizeAnswer(candidate, query, this.options.ownerPublicKey, this.options.ownerKeyRefusal);
       }
     }
     const path = this.decisionPath(requestId);
@@ -104,7 +109,7 @@ export class DecisionTransportAdapter implements DecisionTransportPort {
     } catch {
       return { ...AWAITING };
     }
-    return normalizeAnswer(parsed, query, this.options.ownerPublicKey);
+    return normalizeAnswer(parsed, query, this.options.ownerPublicKey, this.options.ownerKeyRefusal);
   }
 
   private decisionPath(requestId: string): string | null {
@@ -124,6 +129,7 @@ function normalizeAnswer(
   candidate: unknown,
   query: DecisionAnswerQuery,
   ownerPublicKey?: string,
+  ownerKeyRefusal?: 'owner-key-env-mismatch' | 'owner-key-unpinned',
 ): DecisionAnswer {
   if (typeof candidate !== 'object' || candidate === null) {
     return { ...AWAITING };
@@ -149,6 +155,19 @@ function normalizeAnswer(
     return { state, decisionRevision, grantId: null };
   }
   if (state === 'approved') {
+    if (
+      ownerKeyRefusal === 'owner-key-env-mismatch' ||
+      ownerKeyRefusal === 'owner-key-unpinned'
+    ) {
+      // A pinned-key refusal blocks every approval: the answer stays
+      // awaiting and carries the named reason, never an approval.
+      return {
+        state: 'awaiting-decision',
+        decisionRevision: null,
+        grantId: null,
+        refusalReason: ownerKeyRefusal,
+      };
+    }
     if (
       ownerPublicKey === undefined ||
       ownerPublicKey.trim().length === 0 ||

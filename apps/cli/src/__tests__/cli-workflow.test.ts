@@ -30,7 +30,9 @@ import {
   createFleetCliRuntime,
   type FleetCliRuntime,
 } from '../composition.js';
-import { runCli, type CliIo } from '../index.js';
+import { runCli, extractStateDirOption, type CliIo } from '../index.js';
+import { loadInstallation } from '@fleet/installation';
+import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 
 /** Canonical decision bytes, written out here so the test pins the signed format independently. */
 function canonicalDecisionBytes(fields: {
@@ -131,7 +133,6 @@ describe('Fleet CLI workflow', () => {
   let originalOcmRunBin: string | undefined;
   let testOwnerPublicKey: string;
   let testOwnerPrivateKey: KeyObject;
-  let originalOwnerKey: string | undefined;
   let originalOcmRemotePort: string | undefined;
 
   function signDecisionForWorkflow(fields: {
@@ -147,18 +148,13 @@ describe('Fleet CLI workflow', () => {
   }
 
   beforeEach(() => {
-    originalOwnerKey = process.env.FLEET_OWNER_PUBLIC_KEY;
-    process.env.FLEET_OWNER_PUBLIC_KEY = testOwnerPublicKey;
+    // KEY0b: FLEET_OWNER_PUBLIC_KEY is never an authority, so the suite no
+    // longer plants it; every runtime composes from its pinned key.
     originalOcmRemotePort = process.env.OCM_REMOTE_PORT;
     process.env.OCM_REMOTE_PORT = String(RUNNER_PORT);
   });
 
   afterEach(() => {
-    if (originalOwnerKey !== undefined) {
-      process.env.FLEET_OWNER_PUBLIC_KEY = originalOwnerKey;
-    } else {
-      delete process.env.FLEET_OWNER_PUBLIC_KEY;
-    }
     if (originalOcmRemotePort !== undefined) {
       process.env.OCM_REMOTE_PORT = originalOcmRemotePort;
     } else {
@@ -1516,6 +1512,7 @@ describe('Fleet CLI workflow', () => {
       // pass.
       const mpRuntime = createFleetCliRuntime({
         stateDir: multiProcStateDir,
+        ownerPublicKey: testOwnerPublicKey,
         ghBinaryCandidates: [path.join(binDir, 'gh')],
       });
       prepare?.(mpRuntime);
@@ -1984,7 +1981,25 @@ describe('Fleet CLI workflow', () => {
         },
       };
       // No --state-dir token and no injected runtime: the environment decides.
-      const code = await runCli([...argv], io);
+      // KEY0b: the freshly composed runtime is pinned (the ambient
+      // FLEET_OWNER_PUBLIC_KEY is never an authority), so the bare
+      // invocation composes a runtime the way runCli itself would, from the
+      // same resolved state directory, with the suite's pinned owner key. An
+      // invalid --state-dir value is left to runCli's own usage refusal.
+      let bareRuntime: FleetCliRuntime | undefined;
+      try {
+        const { stateDir: bareStateDir } = extractStateDirOption(
+          [...argv],
+          process.env.FLEET_STATE_DIR,
+        );
+        bareRuntime = createFleetCliRuntime({
+          stateDir: bareStateDir,
+          ownerPublicKey: testOwnerPublicKey,
+        });
+      } catch {
+        bareRuntime = undefined;
+      }
+      const code = await runCli([...argv], io, bareRuntime);
       return { code, text: out.join(''), stderr: err.join('') };
     };
 
@@ -2099,5 +2114,118 @@ describe('Fleet CLI workflow', () => {
     const emptyInlineValue = await bareCli(['--state-dir=']);
     expect(emptyInlineValue.code).toBe(2);
     expect(emptyInlineValue.stderr).toContain('Invalid --state-dir value');
+  });
+});
+
+/**
+ * KEY0b: the daemon branch composes its runtime from an already-loaded
+ * (possibly invalid) installation result and never reads
+ * FLEET_OWNER_PUBLIC_KEY as an authority. This drives the exact composition
+ * the daemon branch performs (index.ts ~881: an invalid `loadInstallation()`
+ * result through `loadInstallationForMergePolicy`, no installation) and
+ * asserts an approval signed with the ambient env key stays blocked.
+ */
+describe('daemon branch composes an unpinned runtime from an invalid installation (KEY0b)', () => {
+  it('an invalid installation load result with FLEET_OWNER_PUBLIC_KEY set resolves blocked owner-key-unpinned and never falls back to the env key', async () => {
+    const daemonDir = mkdtempSync(path.join(tmpdir(), 'fleet-daemon-key0b-'));
+    const stateDir = path.join(daemonDir, 'state');
+    const stateNested = path.join(stateDir, 'decisions');
+    mkdirSync(stateNested, { recursive: true });
+
+    const { privateKey } = generateKeyPairSync('ed25519');
+    // The ambient env key that must never become an authority.
+    const envPublicKey = generateKeyPairSync('ed25519').publicKey
+      .export({ format: 'der', type: 'spki' })
+      .subarray(12)
+      .toString('base64');
+
+    // An invalid installation file: the daemon branch composes without one.
+    const installationFile = path.join(daemonDir, 'install.json');
+    writeFileSync(installationFile, '{ not an installation');
+
+    const originalInstallationFile = process.env.FLEET_INSTALLATION_FILE;
+    const originalOwnerKey = process.env.FLEET_OWNER_PUBLIC_KEY;
+    process.env.FLEET_INSTALLATION_FILE = installationFile;
+    process.env.FLEET_OWNER_PUBLIC_KEY = envPublicKey;
+    try {
+      // Seed an awaiting request with file-backed stores, the way the daemon
+      // reads them.
+      const seeder = createFleetCliRuntime({ stateDir });
+      const head = 'a'.repeat(40);
+      const record: CoordinationRequestRecord = {
+        id: 'req-daemon-key0b',
+        projectId: 'proj-daemon-1',
+        kind: 'action-decision',
+        state: 'awaiting-decision',
+        actionScope: 'forge:merge-pr',
+        expectedHeadSha: head,
+        proposalDigest: 'prop-1',
+        policyRevision: 'pol-1',
+        decisionRevision: null,
+        grantId: null,
+        consumptions: [],
+        acknowledgements: [],
+        deliveryStatus: 'pending',
+        deliveryGapReason: null,
+        revision: 1,
+        createdAtIso: '2026-11-18T10:00:00.000Z',
+        updatedAtIso: '2026-11-18T10:00:00.000Z',
+      };
+      await seeder.coordination.coordinationRequestRepository.saveRequest(record);
+
+      // An approval signed with the ambient env key: under the old behaviour
+      // the env variable made this verify and authorize.
+      const signature = sign(
+        null,
+        canonicalDecisionBytes({
+          requestId: record.id,
+          projectId: record.projectId,
+          actionScope: record.actionScope,
+          expectedHeadSha: record.expectedHeadSha,
+          decisionRevision: 'dec-1',
+          grantId: 'grant-daemon-1',
+          state: 'approved',
+        }),
+        privateKey,
+      ).toString('base64');
+      writeFileSync(
+        path.join(stateNested, `${record.id}.json`),
+        `${JSON.stringify({
+          state: 'approved',
+          decisionRevision: 'dec-1',
+          grantId: 'grant-daemon-1',
+          signature,
+        })}\n`,
+      );
+
+      // The daemon branch's exact composition: an invalid load result through
+      // `loadInstallationForMergePolicy`, no `installation`.
+      const loadResult = loadInstallation();
+      expect(loadResult.status).toBe('invalid');
+      const daemonRuntime = createFleetCliRuntime({
+        stateDir,
+        loadInstallationForMergePolicy: () => loadResult,
+      });
+
+      const resolved = await daemonRuntime.coordination.resolveActionAuthorization.resolveActionAuthorization({
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha as string,
+      });
+      // The env variable is never a fallback: the resolve stays blocked.
+      expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+    } finally {
+      if (originalInstallationFile !== undefined) {
+        process.env.FLEET_INSTALLATION_FILE = originalInstallationFile;
+      } else {
+        delete process.env.FLEET_INSTALLATION_FILE;
+      }
+      if (originalOwnerKey !== undefined) {
+        process.env.FLEET_OWNER_PUBLIC_KEY = originalOwnerKey;
+      } else {
+        delete process.env.FLEET_OWNER_PUBLIC_KEY;
+      }
+      rmSync(daemonDir, { recursive: true, force: true });
+    }
   });
 });

@@ -1,7 +1,8 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { generateKeyPairSync, sign } from 'node:crypto';
 import {
   configureFleetApiRuntime,
 } from './runtime.js';
@@ -630,4 +631,271 @@ describe('CO24d: the API composition binds a grant to its resolved attempt', () 
       configureFleetApiRuntime(null);
     }
   });
+});
+
+/**
+ * KEY0b: the API composition reads the owner public key only from the pinned
+ * installation.owner.publicKey. FLEET_OWNER_PUBLIC_KEY is never an authority:
+ * a mismatching value refuses, an equal value only warns once.
+ */
+describe('KEY0b: pinned owner public key in the API composition root', () => {
+  function keyPair(): { publicKeyBase64: string; privateKey: ReturnType<typeof generateKeyPairSync>['privateKey'] } {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    return {
+      publicKeyBase64: publicKey.export({ format: 'der', type: 'spki' }).subarray(12).toString('base64'),
+      privateKey,
+    };
+  }
+
+  const pinned = keyPair();
+  const other = keyPair();
+  // The ambient env key that must never become an authority on its own.
+  const envOnly = keyPair();
+
+  function canonicalDecisionBytes(fields: {
+    requestId: string;
+    projectId: string;
+    actionScope: string;
+    expectedHeadSha: string | null;
+    decisionRevision: string | null;
+    grantId: string | null;
+    state: string;
+  }): Buffer {
+    return Buffer.from(
+      JSON.stringify({
+        requestId: fields.requestId,
+        projectId: fields.projectId,
+        actionScope: fields.actionScope,
+        expectedHeadSha: fields.expectedHeadSha ?? null,
+        decisionRevision: fields.decisionRevision ?? null,
+        grantId: fields.grantId ?? null,
+        state: fields.state,
+      }),
+      'utf8',
+    );
+  }
+
+  function awaitingRecord(
+    grantId: string,
+    scope: string,
+    overrides: Partial<CoordinationRequestRecord> = {},
+  ): CoordinationRequestRecord {
+    return {
+      ...makeApprovedGrant(grantId, scope, makeHeadH()),
+      state: 'awaiting-decision',
+      decisionRevision: null,
+      grantId: null,
+      ...overrides,
+    };
+  }
+
+  /** Seeds an awaiting merge grant for org/repo PR 7 with its approved answer on disk. */
+  function seedMergeGrant(grantId: string): CoordinationRequestRecord {
+    return awaitingRecord(grantId, forgeActionScope('merge-pr'), {
+      mergeGrant: { repository: { owner: 'org', repo: 'repo' }, pullRequestNumber: 7 },
+    });
+  }
+
+  async function writeDecision(
+    stateDir: string,
+    fields: Parameters<typeof canonicalDecisionBytes>[0],
+    privateKey: ReturnType<typeof generateKeyPairSync>['privateKey'],
+  ): Promise<void> {
+    const signature = sign(null, canonicalDecisionBytes(fields), privateKey).toString('base64');
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    mkdirSync(join(stateDir, 'decisions'), { recursive: true });
+    writeFileSync(
+      join(stateDir, 'decisions', `${fields.requestId}.json`),
+      `${JSON.stringify({ ...fields, signature }, null, 2)}\n`,
+    );
+  }
+
+  function withStateDir(body: (stateDir: string) => Promise<void>): () => Promise<void> {
+    return async () => {
+      const { mkdtempSync, rmSync } = await import('node:fs');
+      const stateDir = mkdtempSync(join(tmpdir(), 'fleet-api-key0b-'));
+      try {
+        await body(stateDir);
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+        configureFleetApiRuntime(null);
+      }
+    };
+  }
+
+  const resolveRequest = {
+    projectId: 'proj-api-test',
+    actionScope: forgeActionScope('merge-pr'),
+    expectedHeadSha: makeHeadH(),
+    repository: 'org/repo',
+    pullRequestNumber: 7,
+  };
+
+  it('(a) only FLEET_OWNER_PUBLIC_KEY set: a signed approval refuses as owner-key-unpinned', withStateDir(async (stateDir) => {
+    const record = seedMergeGrant('grant-api-env-only');
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    configureFleetApiRuntime({
+      stateDir,
+      env: { FLEET_OWNER_PUBLIC_KEY: envOnly.publicKeyBase64 },
+    });
+    const operator = getOperatorComposition();
+    await operator.coordinationRequestRepository.saveRequest(record);
+    mkdirSync(join(stateDir, 'decisions'), { recursive: true });
+    writeFileSync(
+      join(stateDir, 'decisions', `${record.id}.json`),
+      `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-1', grantId: record.id.replace('req-', 'grant-') })}\n`,
+    );
+    const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  }));
+
+  it('(b) FLEET_OWNER_PUBLIC_KEY differs from the pinned key: refuses as owner-key-env-mismatch', withStateDir(async (stateDir) => {
+    const record = seedMergeGrant('grant-api-mismatch');
+    configureFleetApiRuntime({
+      stateDir,
+      installation: { owner: { publicKey: pinned.publicKeyBase64 } } as never,
+      env: { FLEET_OWNER_PUBLIC_KEY: other.publicKeyBase64 },
+    });
+    const operator = getOperatorComposition();
+    await operator.coordinationRequestRepository.saveRequest(record);
+    await writeDecision(stateDir, {
+      requestId: record.id,
+      projectId: record.projectId,
+      actionScope: record.actionScope,
+      expectedHeadSha: record.expectedHeadSha,
+      decisionRevision: 'dec-1',
+      grantId: 'grant-api-mismatch',
+      state: 'approved',
+    }, other.privateKey);
+    const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-env-mismatch' });
+  }));
+
+  it('(c) FLEET_OWNER_PUBLIC_KEY equals the pinned key: verifies and emits exactly one deprecation warning', withStateDir(async (stateDir) => {
+    const record = seedMergeGrant('grant-api-equal');
+    // The warning is written while the runtime composes, so the spy is in
+    // place before `configureFleetApiRuntime`.
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    configureFleetApiRuntime({
+      stateDir,
+      installation: { owner: { publicKey: pinned.publicKeyBase64 } } as never,
+      env: { FLEET_OWNER_PUBLIC_KEY: pinned.publicKeyBase64 },
+    });
+    try {
+      const operator = getOperatorComposition();
+      await operator.coordinationRequestRepository.saveRequest(record);
+      await writeDecision(stateDir, {
+        requestId: record.id,
+        projectId: record.projectId,
+        actionScope: record.actionScope,
+        expectedHeadSha: record.expectedHeadSha,
+        decisionRevision: 'dec-1',
+        grantId: 'grant-api-equal',
+        state: 'approved',
+      }, pinned.privateKey);
+      const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+      expect(resolved.outcome).toBe('authorized');
+      const warnings = stderrSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((text) => text.includes('FLEET_OWNER_PUBLIC_KEY is deprecated'));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.split('\n')).toHaveLength(2);
+      expect(warnings[0]).not.toContain(pinned.publicKeyBase64);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  }));
+
+  it('(d) the pinned key verifies a correctly signed decision with no env variable', withStateDir(async (stateDir) => {
+    const record = seedMergeGrant('grant-api-pinned');
+    configureFleetApiRuntime({
+      stateDir,
+      installation: { owner: { publicKey: pinned.publicKeyBase64 } } as never,
+      env: {},
+    });
+    const operator = getOperatorComposition();
+    await operator.coordinationRequestRepository.saveRequest(record);
+    await writeDecision(stateDir, {
+      requestId: record.id,
+      projectId: record.projectId,
+      actionScope: record.actionScope,
+      expectedHeadSha: record.expectedHeadSha,
+      decisionRevision: 'dec-1',
+      grantId: 'grant-api-pinned',
+      state: 'approved',
+    }, pinned.privateKey);
+    const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+    expect(resolved.outcome).toBe('authorized');
+  }));
+
+  it('(e) no pinned key fails closed as owner-key-unpinned for a release grant', withStateDir(async (stateDir) => {
+    const record = awaitingRecord('grant-api-release', 'release:install');
+    configureFleetApiRuntime({ stateDir, env: {} });
+    const operator = getOperatorComposition();
+    await operator.coordinationRequestRepository.saveRequest(record);
+    await writeDecision(stateDir, {
+      requestId: record.id,
+      projectId: record.projectId,
+      actionScope: record.actionScope,
+      expectedHeadSha: record.expectedHeadSha,
+      decisionRevision: 'dec-1',
+      grantId: 'grant-api-release',
+      state: 'approved',
+    }, other.privateKey);
+    const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'proj-api-test',
+      actionScope: 'release:install',
+      expectedHeadSha: makeHeadH(),
+    });
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  }));
+
+  it('(e) no pinned key fails closed as owner-key-unpinned for a shadow-import grant', withStateDir(async (stateDir) => {
+    const record = awaitingRecord('grant-api-shadow', 'merge:import-shadow', {
+      grantId: 'grant-api-shadow',
+      shadowImportGrant: {
+        repository: { owner: 'org', repo: 'repo' },
+        expiresAtIso: '2036-11-18T00:00:00.000Z',
+      },
+      expectedHeadSha: null,
+    });
+    configureFleetApiRuntime({ stateDir, env: {} });
+    const operator = getOperatorComposition();
+    await operator.coordinationRequestRepository.saveRequest(record);
+    await writeDecision(stateDir, {
+      requestId: record.id,
+      projectId: record.projectId,
+      actionScope: record.actionScope,
+      expectedHeadSha: record.expectedHeadSha,
+      decisionRevision: 'dec-1',
+      grantId: 'grant-api-shadow',
+      state: 'approved',
+    }, other.privateKey);
+    const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'proj-api-test',
+      actionScope: 'merge:import-shadow',
+      expectedHeadSha: '',
+      authorizationGrantId: 'grant-api-shadow',
+      repository: 'org/repo',
+    });
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  }));
+
+  it('(e) no pinned key fails closed as owner-key-unpinned for a scoped grant', withStateDir(async (stateDir) => {
+    const record = seedMergeGrant('grant-api-scoped');
+    configureFleetApiRuntime({ stateDir, env: {} });
+    const operator = getOperatorComposition();
+    await operator.coordinationRequestRepository.saveRequest(record);
+    await writeDecision(stateDir, {
+      requestId: record.id,
+      projectId: record.projectId,
+      actionScope: record.actionScope,
+      expectedHeadSha: record.expectedHeadSha,
+      decisionRevision: 'dec-1',
+      grantId: 'grant-api-scoped',
+      state: 'approved',
+    }, pinned.privateKey);
+    const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization(resolveRequest);
+    expect(resolved).toEqual({ outcome: 'blocked', reason: 'owner-key-unpinned' });
+  }));
 });

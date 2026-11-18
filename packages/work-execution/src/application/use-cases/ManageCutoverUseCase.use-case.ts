@@ -75,7 +75,9 @@ export interface ManageCutoverDependencies {
   >;
   /** CO30b, optional: how many lanes hold work no attempt record explains. */
   readonly countUnrecordedLanes?: () => Promise<
-    { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number } | { readonly status: 'unreadable' }
+    | { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number }
+    | { readonly status: 'unreadable' }
+    | { readonly status: 'refused'; readonly reason: 'conductor-driver-live' }
   >;
 }
 
@@ -912,7 +914,11 @@ export class ManageCutoverUseCase implements ManageCutoverPort {
     }
     const counted = await this.guarded(deadlineIso, counter);
     if (counted.kind === 'deadline') return unknown('deadline-exceeded');
-    if (counted.kind === 'threw' || counted.value.status !== 'ok') {
+    if (counted.kind === 'threw') return unknown('unrecorded-lanes-unknown');
+    if (counted.value.status === 'refused') {
+      return refuse(counted.value.reason);
+    }
+    if (counted.value.status !== 'ok') {
       return unknown('unrecorded-lanes-unknown');
     }
     if (counted.value.unknownListings > 0) {

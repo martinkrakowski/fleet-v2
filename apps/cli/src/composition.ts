@@ -1072,20 +1072,48 @@ function readStoredShadowEvidence(
  * the switch. When `declaredClones` is given, an inventory that inspected
  * fewer clones than declared is unreadable, never a pass on partial
  * coverage (CO30c fix round). Exported for the cutover-switch regression
- * tests.
+ * tests. A top-level `driver-lease-live` flag refuses as
+ * `conductor-driver-live`: the driver lease is held right now, so a driver is
+ * still active. The top-level `conductor-halted` flag is different — the code
+ * reads it from the halt marker, which means the conductor is halted, not
+ * that a driver is active — so it does not refuse this gate (an unreadable
+ * halt marker already answers `unreadable` through a non-`inventoried`
+ * outcome).
  */
 export function summarizeInventoryForCutover(
   result: InventoryRelaunchResult,
   declaredClones?: number,
-): { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number } | { readonly status: 'unreadable' } {
+):
+  | { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number }
+  | { readonly status: 'unreadable' }
+  | { readonly status: 'refused'; readonly reason: 'conductor-driver-live' } {
   if (result.outcome !== 'inventoried') {
     return { status: 'unreadable' };
+  }
+  // CO30c fix round: a live driver lease is a driver still active on the
+  // installation, so the switch refuses with its own typed reason. A lease
+  // whose state is unknown already arrives as a non-`inventoried` outcome
+  // (`lease-unreadable`) and answers `unreadable` above.
+  if (result.riskFlags.some((flag) => flag.code === 'driver-lease-live')) {
+    return { status: 'refused', reason: 'conductor-driver-live' };
   }
   let unrecorded = 0;
   let unknownListings = 0;
   let inspectedClones = 0;
   for (const host of result.hosts) {
     inspectedClones += host.cloneCount;
+    // CO30c fix round: the inventory's own counts must account for every
+    // listed worktree. `worktreeCount` is what the clone's listing returned
+    // and `lanes` is what the inventory accounted for; the only difference a
+    // correct read leaves is each clone's own main worktree, one per
+    // `cloneCount` clone. When the listed worktrees outnumber the accounted
+    // lanes beyond that — a worktree listed outside the clone's
+    // `worktreeRoot`, silently dropped by the listing — the inventory cannot
+    // vouch for the leftovers it never saw, so it is unreadable, never a
+    // pass with `unrecorded 0`.
+    if (host.worktreeCount - host.lanes.length > host.cloneCount) {
+      return { status: 'unreadable' };
+    }
     unrecorded += host.counts.unrecorded;
     for (const flag of host.riskFlags) {
       if (flag.code === 'unknown-worktree-read' || flag.code === 'unknown-runner-state') {
@@ -1514,6 +1542,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     ? async (): Promise<
         | { readonly status: 'ok'; readonly unrecorded: number; readonly unknownListings: number }
         | { readonly status: 'unreadable' }
+        | { readonly status: 'refused'; readonly reason: 'conductor-driver-live' }
       > => {
         try {
           let profiles: Awaited<

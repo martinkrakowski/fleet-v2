@@ -103,6 +103,7 @@ export type ManageCutoverRefusalReason =
   | 'shadow-evidence-absent'
   | 'shadow-criteria-failed'
   | 'unrecorded-lanes'
+  | 'conductor-driver-live'
   | 'inside-rollback-window';
 
 export type ManageCutoverUnknownReason =

@@ -341,9 +341,11 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
       'utf8',
     );
     await seedShadowLedger(fx.stateDir);
+    const before = await snapshotState(fx.stateDir);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
     expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
     await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
     await expect(fs.stat(path.join(fx.stateDir, 'cutover-journal.json'))).rejects.toThrow();
   });
@@ -355,9 +357,11 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     profiles.push(rawProfile('proj-empty', {}));
     await fs.writeFile(path.join(fx.stateDir, 'project-profiles.json'), JSON.stringify(profiles), 'utf8');
     await seedShadowLedger(fx.stateDir);
+    const before = await snapshotState(fx.stateDir);
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
     expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
     await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
     await expect(fs.stat(path.join(fx.stateDir, 'cutover-journal.json'))).rejects.toThrow();
   });
@@ -396,6 +400,19 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
       unrecorded: 0,
       unknownListings: 0,
     });
+    // The real switch itself: through the production composition the declared
+    // clones are always all inspected (the inventory counts every requested
+    // clone per host), so the real-switch refusal for a declared-clone-less
+    // profile is exercised by the two tests above. This run pins that full
+    // clone coverage through the real composition passes the lanes gate and
+    // performs the switch.
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await registerRealCloneProfile(fx);
+    await seedProvenLane(fx, RUN_ID);
+    await seedShadowLedger(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'completed', move: 'switch', state: 'switched' });
+    expect(code).toBe(0);
   });
 
   it('refuses unrecorded-lanes on an unrecorded idle leftover worktree and writes nothing', async () => {
@@ -599,5 +616,148 @@ describe('cutover switch with countUnrecordedLanes wired (CO30c)', () => {
     const { code, result } = await runSwitch(fx.runtime);
     expect(result).toMatchObject({ outcome: 'unknown', reason: 'train-pause-unreadable' });
     expect(code).toBe(1);
+  });
+
+  it('refuses as unknown when a listed worktree sits outside the clone worktree root', async () => {
+    const fx = await fixture({});
+    await registerRealCloneProfile(fx);
+    await seedShadowLedger(fx.stateDir);
+    // A worktree linked outside the clone's declared worktree root: the clone
+    // lists it, the inventory accounts no lane for it, and the difference is
+    // more than each clone's own main worktree — the silent drop the gate
+    // must never read as `unrecorded 0`.
+    await git(
+      fx.clonePath,
+      'worktree',
+      'add',
+      '--quiet',
+      '-b',
+      'fleet/outside',
+      path.join(fx.root, 'outside-root-wt'),
+    );
+    const before = await snapshotState(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
+    expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
+  });
+
+  it('refuses conductor-driver-live while a driver lease is live', async () => {
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await registerRealCloneProfile(fx);
+    await seedProvenLane(fx, RUN_ID);
+    await seedShadowLedger(fx.stateDir);
+    await fs.writeFile(
+      path.join(fx.stateDir, 'conductor-driver-lease.json'),
+      JSON.stringify([{ version: 1, holderId: 'driver-1', fence: 1, leaseUntilIso: '2030-01-01T00:00:00.000Z' }]),
+      'utf8',
+    );
+    const before = await snapshotState(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'conductor-driver-live' });
+    expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
+    await expect(fs.stat(path.join(fx.stateDir, 'cutover.json'))).rejects.toThrow();
+  });
+
+  it('answers unknown when the driver lease file is unreadable', async () => {
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await registerRealCloneProfile(fx);
+    await seedShadowLedger(fx.stateDir);
+    await fs.writeFile(path.join(fx.stateDir, 'conductor-driver-lease.json'), CORRUPT, 'utf8');
+    const before = await snapshotState(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
+    expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
+  });
+
+  it('passes the lanes gate when no driver lease exists', async () => {
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await registerRealCloneProfile(fx);
+    await seedProvenLane(fx, RUN_ID);
+    await seedShadowLedger(fx.stateDir);
+    await expect(fs.stat(path.join(fx.stateDir, 'conductor-driver-lease.json'))).rejects.toThrow();
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'completed', move: 'switch', state: 'switched' });
+    expect(code).toBe(0);
+  });
+
+  it('answers unknown when the daemon status is unreadable', async () => {
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await registerRealCloneProfile(fx);
+    await seedProvenLane(fx, RUN_ID);
+    await seedShadowLedger(fx.stateDir);
+    await fs.mkdir(path.join(fx.stateDir, 'daemon'), { recursive: true });
+    await fs.writeFile(path.join(fx.stateDir, 'daemon', 'status.json'), CORRUPT, 'utf8');
+    const before = await snapshotState(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'unknown', reason: 'daemon-status-unreadable' });
+    expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
+  });
+
+  it('answers unknown when the runner cannot be resolved for a worktree attempt', async () => {
+    const fx = await fixture({ worktrees: [RUN_ID] });
+    await registerRealCloneProfile(fx);
+    // The attempt is recorded against the same host at a different port: the
+    // confirm-or-unknown rule refuses the runner instead of falling back, so
+    // the inventory cannot tell the worktree's state and reports
+    // `unknown-runner-state`.
+    await fx.runtime.execution.attemptRepository.saveAttempt({
+      id: 'attempt-1',
+      workOrderId: 'wo-1',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: path.join(fx.worktreeRoot, RUN_ID),
+      baseCommit: COMMIT,
+      state: 'running',
+      outcome: null,
+      briefDigest: 'b'.repeat(64),
+      briefPackagePath: '.lane/brief-package',
+      sessionId: fakeSessionOf(RUN_ID),
+      completionReceipt: null,
+      artifacts: null,
+      runner: {
+        kind: 'opencode',
+        remotePort: RUNNER_PORT + 1,
+        host: null,
+        hostName: HOST,
+        agent: null,
+        model: null,
+        variant: null,
+      },
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    const created = LaneRun.create({
+      version: 1,
+      runId: RUN_ID,
+      workOrderId: 'wo-1',
+      tier: 2,
+      seatPlanRef: 'e'.repeat(64),
+      cursors: { 'first-pass': 0, fix: null, review: null },
+      round: 0,
+      attemptIds: ['attempt-1'],
+      prNumber: null,
+      parked: null,
+      parkCount: 0,
+      lease: null,
+      revision: 1,
+      runPolicyRevision: 'pol-1',
+      branchName: `fleet/${RUN_ID}`,
+    });
+    if (!created.success) throw new Error('fixture must be a valid LaneRun record');
+    expect(await fx.runtime.conductor.laneRunRepository.create(created.value.toRecord())).toMatchObject({
+      outcome: 'saved',
+    });
+    await seedShadowLedger(fx.stateDir);
+    const before = await snapshotState(fx.stateDir);
+    const { code, result } = await runSwitch(fx.runtime);
+    expect(result).toMatchObject({ outcome: 'unknown', reason: 'unrecorded-lanes-unknown' });
+    expect(code).toBe(1);
+    expect(await snapshotState(fx.stateDir)).toEqual(before);
   });
 });

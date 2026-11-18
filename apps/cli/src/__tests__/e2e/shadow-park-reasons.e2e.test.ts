@@ -2,8 +2,11 @@
  * S2 shadow park-reasons e2e (lane SHT1), narrowed per owner decision
  * 2026-11-17: the merge-pass park reasons reachable on `origin/main` are
  * `checks`, `threads`, `forge-error`, `update-refused`, `update-churn` and
- * `owner-merge`; `conflict` drops rather than parks and `policy-unreadable`
- * refuses the tick before the pass. DT9b live intent-without-result
+ * `owner-merge`; `conflict` drops rather than parks and an unreadable or
+ * invalid installation refuses the tick before the pass (as
+ * `installation-unreadable` / `policy-invalid`; the reason code
+ * `policy-unreadable` itself is unreachable through the CLI). DT9b live
+ * intent-without-result
  * reconcile and the deferred park inputs (`premerge`, `macos`,
  * `disjointness`, `veto-hold`) stay deferred past cutover.
  *
@@ -132,6 +135,8 @@ function pullRequestPayload(input: {
   failingGate?: boolean;
   unresolved?: number;
   withoutPullRequest?: boolean;
+  contextsNodesNotArray?: boolean;
+  threadsNodesNotArray?: boolean;
 }): string {
   if (input.withoutPullRequest === true) {
     return JSON.stringify({ data: { repository: {} } });
@@ -147,19 +152,23 @@ function pullRequestPayload(input: {
           statusCheckRollup: {
             contexts: {
               pageInfo: { hasNextPage: false, endCursor: null },
-              nodes: [
-                {
-                  __typename: 'CheckRun',
-                  name: 'gate',
-                  status: 'COMPLETED',
-                  conclusion: input.failingGate === true ? 'FAILURE' : 'SUCCESS',
-                },
-              ],
+              nodes: input.contextsNodesNotArray === true
+                ? { count: 1 }
+                : [
+                    {
+                      __typename: 'CheckRun',
+                      name: 'gate',
+                      status: 'COMPLETED',
+                      conclusion: input.failingGate === true ? 'FAILURE' : 'SUCCESS',
+                    },
+                  ],
             },
           },
           reviewThreads: {
             pageInfo: { hasNextPage: false, endCursor: null },
-            nodes: Array.from({ length: input.unresolved ?? 0 }, () => ({ isResolved: false })),
+            nodes: input.threadsNodesNotArray === true
+              ? { count: 0 }
+              : Array.from({ length: input.unresolved ?? 0 }, () => ({ isResolved: false })),
           },
         },
       },
@@ -525,9 +534,11 @@ describe('S2 shadow park-reasons e2e (narrowed per owner decision 2026-11-17)', 
       'owner-merge',
     ];
     // Not reachable as a park on origin/main today: `conflict` drops rather
-    // than parks, `policy-unreadable` refuses the tick before the pass, and
-    // `premerge`, `macos`, `disjointness` and `veto-hold` are deferred past
-    // cutover with DT9b.
+    // than parks, an unreadable or invalid installation refuses the tick
+    // before the pass (as `installation-unreadable` / `policy-invalid`; the
+    // reason code `policy-unreadable` itself is unreachable through the CLI),
+    // and `premerge`, `macos`, `disjointness` and `veto-hold` are deferred
+    // past cutover with DT9b.
     const deferredOrDropping: readonly string[] = [
       'premerge',
       'macos',
@@ -546,7 +557,7 @@ describe('S2 shadow park-reasons e2e (narrowed per owner decision 2026-11-17)', 
 });
 
 describe('S2 refusal paths fail closed', () => {
-  it('refuses daemon tick with policy-unreadable when installation is invalid', async () => {
+  it('refuses the tick with installation-unreadable when the installation load throws', async () => {
     const h = harness({}, {
       loadInstallationForMergePolicy: (): never => {
         throw new Error('installation file unreadable');
@@ -567,8 +578,44 @@ describe('S2 refusal paths fail closed', () => {
     expect(await h.runtime.conductor.laneRunJournal.listForKey(journalKey('merge-pr'))).toHaveLength(0);
   });
 
-  it('waits without acting on malformed GraphQL payload', async () => {
-    // A missing pullRequest object fails closed to a forge-error park, never green.
+  it('refuses the tick on an invalid installation with policy-invalid (policy-unreadable is unreachable through the CLI)', async () => {
+    // The brief's `policy-unreadable` reason code is not reachable through
+    // `daemon tick`: MergePolicyAdapter.readMergePolicy never rejects
+    // (MergePolicyAdapter.adapter.ts:351-363, a rejected readInstallation is
+    // caught and returned as an answer), so `runTick`'s `policyAnswer === null`
+    // branch that prints `policy-unreadable` (apps/cli/src/daemon.ts:347-350)
+    // can never fire. An invalid installation load reaches the decider as
+    // `{ outcome: 'invalid', reason: 'installation-invalid' }`
+    // (apps/cli/src/composition/daemon.ts:123-128) and answers
+    // `policy-invalid` — the real fail-closed refusal for this input.
+    const h = harness({}, {
+      loadInstallationForMergePolicy: () => ({ status: 'invalid', file: '/private/install.json', errors: ['bad'] }),
+    });
+
+    const result = await tick(h);
+
+    expect(result.code).toBe(1);
+    expect(lastJson(result.out)).toMatchObject({
+      outcome: 'refused',
+      exitCode: 1,
+      reasonCode: 'policy-invalid',
+    });
+    // The invalid file's path and errors are never forwarded to the output.
+    expect(result.out).not.toContain('/private');
+    expect(h.stub.calls.some((call) => call.args[1] === 'graphql')).toBe(false);
+    expect(await h.runtime.conductor.laneRunJournal.listForKey(journalKey('merge-pr'))).toHaveLength(0);
+  });
+
+  it('parks forge-error on malformed GraphQL answers and waits on genuinely unknown facts', async () => {
+    // Malformed GraphQL is fail-closed BY DESIGN as a forge-error park, not a
+    // wait: `readPullRequest` returns undefined for a payload with no
+    // pullRequest object (GhForgeMergeReadAdapter.adapter.ts:144-168), so
+    // `parseMergePrMeta` answers `unreadable` (:312-316), `runPage` maps that
+    // to `unavailable`/`unreadable` (:588-593), and `gatherFacts` maps every
+    // non-ok, non-not-found read to `pr: { status: 'forge-error', code:
+    // 'gh-error' }` (RunMergePassUseCase.use-case.ts:908-914), which
+    // `readPathForgeStep` parks with backoff (merge-queue-decider.ts:608-627).
+    // The entry is never treated as green and never acted on.
     const missing = harness();
     await enqueue(missing.runtime, 1);
     missing.stub.graphql = () => pullRequestPayload({ withoutPullRequest: true });
@@ -596,6 +643,33 @@ describe('S2 refusal paths fail closed', () => {
     unknownState.stub.graphql = () => pullRequestPayload({ mergeStateStatus: 'WIBBLE' });
     expect((await tick(unknownState)).code).toBe(0);
     expect(entryFor(unknownState.stateDir, 1)).toMatchObject({ state: 'queued', reason: null, attempt: 0 });
+  });
+
+  it('parks forge-error when contexts.nodes is not an array and waits threads-unknown when reviewThreads.nodes is not an array', async () => {
+    // A non-array `contexts.nodes` makes the contexts page unreadable
+    // (GhForgeMergeReadAdapter.adapter.ts:259-262), so the whole read is
+    // `unavailable`/`unreadable` (:594-599) and the entry parks forge-error —
+    // the same fail-closed mapping as a missing pullRequest.
+    const contexts = harness();
+    await enqueue(contexts.runtime, 1);
+    contexts.stub.graphql = () => pullRequestPayload({ contextsNodesNotArray: true });
+    expect((await tick(contexts)).code).toBe(0);
+    expectParked(contexts.stateDir, 1, 'forge-error', {
+      attempt: 1,
+      notBeforeIso: computeMergeBackoffIso(NOW, 0),
+    });
+
+    // A non-array `reviewThreads.nodes` only makes the thread count unknown
+    // (GhForgeMergeReadAdapter.adapter.ts:291-294): the page still reads, the
+    // use case carries `unresolvedThreads: { status: 'unknown' }`
+    // (RunMergePassUseCase.use-case.ts:899-902), and the decider waits
+    // `threads-unknown` without acting (merge-queue-decider.ts:779-792).
+    const threads = harness();
+    await enqueue(threads.runtime, 1);
+    threads.stub.graphql = () => pullRequestPayload({ threadsNodesNotArray: true });
+    expect((await tick(threads)).code).toBe(0);
+    expect(entryFor(threads.stateDir, 1)).toMatchObject({ state: 'queued', reason: null, attempt: 0 });
+    expect(await threads.runtime.conductor.laneRunJournal.listForKey(journalKey('merge-pr'))).toHaveLength(0);
   });
 
   it('refuses merge pass with queue-unreadable when merge queue file is non-array or corrupt', async () => {
